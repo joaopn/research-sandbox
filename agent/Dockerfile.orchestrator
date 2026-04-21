@@ -1,0 +1,101 @@
+FROM continuumio/miniconda3:latest
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Core tools: byobu, ssh, git, utilities; PLUS DIND support deps + crun.
+# `crun` is the OCI runtime we'll point the inner dockerd at (see below).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl jq nano ca-certificates gnupg \
+    byobu \
+    openssh-server \
+    iputils-ping \
+    sudo \
+    locales \
+    btop \
+    tini \
+    iptables \
+    fuse-overlayfs \
+    uidmap \
+    crun \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Docker CE from Docker's official installer, pinned to a specific
+# version. Baking the version into the image means every orchestrator built
+# from `research setup` uses the same docker — no version drift between
+# projects created on different days. Upgrade is explicit: bump DOCKER_VERSION,
+# re-run `research setup`, destroy/create affected projects.
+#
+# crun (installed above) is configured below as dockerd's default OCI runtime
+# so worker containers don't hit sysbox's procfs incompatibility with
+# docker's bundled runc.
+ARG DOCKER_VERSION=29.4.0
+RUN curl -fsSL https://get.docker.com | VERSION=${DOCKER_VERSION} sh && \
+    rm -rf /var/lib/apt/lists/*
+
+# Point the inner dockerd at crun as the default OCI runtime. /etc/docker/ is
+# root-owned; the file is read by dockerd each time it starts.
+RUN mkdir -p /etc/docker && cat > /etc/docker/daemon.json <<'JSON'
+{
+  "default-runtime": "crun",
+  "runtimes": {
+    "crun": {
+      "path": "/usr/bin/crun"
+    }
+  }
+}
+JSON
+
+# Locale (many tools expect UTF-8).
+RUN sed -i '/en_US.UTF-8/s/^# //' /etc/locale.gen && locale-gen
+ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+
+# SSH server setup.
+RUN mkdir -p /run/sshd && \
+    sed -i 's/#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config && \
+    sed -i 's/#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
+    echo "AllowAgentForwarding no" >> /etc/ssh/sshd_config
+
+# Non-root user at UID 1000. The `docker` group was already created by
+# docker.io's postinst above; research just joins it. NOPASSWD:ALL because
+# the container is the security boundary (sandboxed inside research-sandbox
+# network + router egress policy).
+RUN useradd -m -s /bin/bash -G sudo,docker -u 1000 research && \
+    echo "research ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/research
+
+# Initialize conda hooks in the research user's shell.
+RUN su - research -c "/opt/conda/bin/conda init bash"
+
+# Install Claude Code CLI into the research user's home at build time.
+# Network access happens during build via the host's docker daemon (not via the
+# project-network router), so this does not depend on any runtime egress policy.
+RUN su - research -c 'curl -fsSL https://claude.ai/install.sh | bash' && \
+    su - research -c 'echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.bashrc'
+
+# rs-worker CLI runtime deps — docker-py + pyyaml installed into the conda
+# base env (one Python, no separate venv).
+RUN /opt/conda/bin/pip install --no-cache-dir 'docker>=7.1' 'pyyaml>=6'
+
+# rs-worker is the worker-lifecycle CLI, mirroring research.py's shape one
+# level in. Invoked by the orchestrator's Claude Code via its Bash tool.
+COPY cli/rs_worker.py /usr/local/bin/rs-worker
+RUN chmod +x /usr/local/bin/rs-worker
+
+# Stash home directory — volume mount on /home/research hides image contents.
+RUN cp -a /home/research /etc/research-skel
+
+# Claude Code settings templates (written into /workspace/.claude/ by entrypoint
+# on first boot). Kept as image artifacts to stay declarative.
+RUN mkdir -p /opt/claude-templates
+COPY container/orchestrator/setup.sh /opt/claude-templates/setup.sh
+COPY container/orchestrator/CLAUDE.md /opt/claude-templates/CLAUDE.md
+COPY container/analysis/CLAUDE.md.template /opt/claude-templates/worker.CLAUDE.md.template
+RUN chmod +x /opt/claude-templates/setup.sh
+
+# Entrypoint.
+COPY agent/entrypoint.orchestrator.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+USER research
+WORKDIR /home/research
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]

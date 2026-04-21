@@ -1,0 +1,26 @@
+services:
+  router:
+    build: ./router
+    container_name: research-router
+    networks:
+      - research-sandbox
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    sysctls:
+      - net.ipv4.ip_forward=1
+    volumes:
+      - research-router-rules:/etc/sandbox/rules
+    restart: unless-stopped
+
+
+volumes:
+  research-router-rules:
+
+networks:
+  # Shared infrastructure network: has internet via Docker gateway.
+  # Per-project networks (research-net-<name>) are created by research.py as
+  # --internal and routed through research-router.
+  research-sandbox:
+    name: research-sandbox
+    driver: bridge

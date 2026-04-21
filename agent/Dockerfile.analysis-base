@@ -1,0 +1,52 @@
+FROM continuumio/miniconda3:latest
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Minimal system tools. NO git (structural requirement — later stages depend on
+# this). No sshd either; workers are attached via `docker exec` from the
+# orchestrator. Byobu stays so `worker_attach_command` can drop the user into
+# a preserved session.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl jq nano \
+    byobu \
+    sudo \
+    locales \
+    tini \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN sed -i '/en_US.UTF-8/s/^# //' /etc/locale.gen && locale-gen
+ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+
+# Non-root user at UID 1000 (matches orchestrator's `research` UID so
+# bind-mounted workspace subdirs are read/writable).
+RUN useradd -m -s /bin/bash -G sudo -u 1000 worker && \
+    echo "worker ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/worker
+
+RUN su - worker -c "/opt/conda/bin/conda init bash"
+
+# Data-science stack via conda — pandas, numpy, polars, duckdb, matplotlib,
+# seaborn, plotly, scikit-learn, scipy, statsmodels, jupyter, papermill, tqdm.
+# Installed into the base env so `python` and `jupyter` are on PATH for all
+# users without activation gymnastics.
+RUN /opt/conda/bin/conda install -n base -y -c conda-forge \
+        pandas numpy polars pyarrow duckdb \
+        matplotlib seaborn plotly \
+        scikit-learn scipy statsmodels \
+        jupyter ipykernel nbformat papermill tqdm \
+    && /opt/conda/bin/conda clean -afy
+
+# Claude Code CLI for the worker user. As with the orchestrator, Docker build
+# gets the host's network, so this doesn't depend on runtime router egress.
+RUN su - worker -c 'curl -fsSL https://claude.ai/install.sh | bash' && \
+    su - worker -c 'echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.bashrc'
+
+# Home skel for volume-mount first-boot restore.
+RUN cp -a /home/worker /etc/worker-skel
+
+COPY agent/entrypoint.worker.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+USER worker
+WORKDIR /workspace
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]
