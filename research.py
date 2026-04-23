@@ -18,10 +18,11 @@ Stdlib only. Subcommand layout:
     research project ssh     <name>
 
 State is stored in ``.env`` beside this script, plus Docker labels on the
-orchestrator container (``sandbox.project=<name>``). Per-project named volume
-``rs-workspace-<name>`` holds /workspace; named volume ``rs-docker-<name>``
-holds the inner Docker daemon state when ``--dind privileged`` is used (sysbox
-keeps it internal to the container).
+orchestrator container (``sandbox.project=<name>``). Per-project host
+directory ``<PROJECTS_DIR>/<name>/workspace/`` is bind-mounted into the
+orchestrator's ``/workspace``; named volume ``rs-docker-<name>`` holds the
+inner Docker daemon state when ``--dind privileged`` is used (sysbox keeps
+it internal to the container).
 """
 
 from __future__ import annotations
@@ -46,7 +47,6 @@ ANALYSIS_IMAGE = "research-analysis-base:latest"
 ROUTER_CONTAINER = "research-router"
 ROUTER_NETWORK = "research-sandbox"
 CONTAINER_PREFIX = "research-orch-"
-VOLUME_PREFIX = "rs-workspace-"
 DOCKER_VOLUME_PREFIX = "rs-docker-"
 PROJECT_NETWORK_PREFIX = "research-net-"
 PROJECT_LABEL = "research.project"
@@ -91,7 +91,9 @@ def confirm(prompt: str) -> bool:
 
 class Config:
     def __init__(self) -> None:
-        self.projects_dir: str = os.environ.get("PROJECTS_DIR", "")
+        self.projects_dir: str = (
+            os.environ.get("PROJECTS_DIR") or str(SCRIPT_DIR / "container_volumes")
+        )
         self.sandbox_dns: list[str] = [
             s.strip()
             for s in os.environ.get("SANDBOX_DNS", "9.9.9.9,149.112.112.112").split(",")
@@ -204,12 +206,16 @@ def container_name_for(project: str) -> str:
     return f"{CONTAINER_PREFIX}{project}"
 
 
-def volume_name_for(project: str) -> str:
-    return f"{VOLUME_PREFIX}{project}"
-
-
 def docker_volume_name_for(project: str) -> str:
     return f"{DOCKER_VOLUME_PREFIX}{project}"
+
+
+def project_root_for(project: str, cfg: "Config") -> Path:
+    return Path(cfg.projects_dir).expanduser().resolve() / project
+
+
+def workspace_path_for(project: str, cfg: "Config") -> Path:
+    return project_root_for(project, cfg) / "workspace"
 
 
 def project_network_for(project: str) -> str:
@@ -358,7 +364,7 @@ def build_orchestrator_docker_args(
     container_name: str,
     project: str,
     network: str,
-    volume_name: str,
+    workspace_path: Path,
     ssh_port: int,
     ssh_pass: str,
     dns_servers: list[str],
@@ -372,7 +378,7 @@ def build_orchestrator_docker_args(
         "--name", container_name,
         "--hostname", project,
         "--network", network,
-        "-v", f"{volume_name}:/workspace",
+        "-v", f"{workspace_path}:/workspace",
         "-p", f"{ssh_port}:22",
         "-e", f"PROJECT={project}",
         "-e", f"SSH_PASSWORD={ssh_pass}",
@@ -465,7 +471,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         die("project name must be alphanumeric (plus '-' or '_')")
 
     container_name = container_name_for(project)
-    volume_name = volume_name_for(project)
+    workspace_path = workspace_path_for(project, cfg)
 
     if container_exists(container_name):
         die(f"project {project!r} already exists (container {container_name}). "
@@ -499,9 +505,12 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     ssh_port = args.ssh_port or find_free_port()
     ssh_pass = gen_password()
 
-    # 1. Volume(s).
-    if not volume_exists(volume_name):
-        run_check(["docker", "volume", "create", volume_name])
+    # 1. Workspace dir (host bind-mount) + optional privileged-DIND volume.
+    # setgid bit (2xxx) makes new files inherit the host user's primary GID;
+    # combined with HOST_GID remap in the orchestrator entrypoint, host user
+    # and container's `research` user share rw access through the shared GID.
+    workspace_path.mkdir(parents=True, exist_ok=True)
+    os.chmod(workspace_path, 0o2770)
     if dind_mode == "privileged" and not volume_exists(docker_volume_name_for(project)):
         run_check(["docker", "volume", "create", docker_volume_name_for(project)])
 
@@ -513,7 +522,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         container_name=container_name,
         project=project,
         network=network,
-        volume_name=volume_name,
+        workspace_path=workspace_path,
         ssh_port=ssh_port,
         ssh_pass=ssh_pass,
         dns_servers=cfg.sandbox_dns,
@@ -542,7 +551,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
 Project '{project}' is running.
 
   Container: {container_name}
-  Volume:    {volume_name}
+  Workspace: {workspace_path}
   Network:   {network} (egress: {egress})
   DIND mode: {dind_mode}
   SSH:       research@localhost -p {ssh_port}   password: {ssh_pass}
@@ -591,6 +600,7 @@ def cmd_project_list(_: argparse.Namespace) -> None:
 
 
 def cmd_project_status(args: argparse.Namespace) -> None:
+    cfg = load_config()
     container = container_name_for(args.name)
     if not container_exists(container):
         die(f"project {args.name!r} does not exist")
@@ -603,19 +613,8 @@ def cmd_project_status(args: argparse.Namespace) -> None:
     print(f"State:     {state}")
     if ssh_port:
         print(f"SSH:       localhost:{ssh_port}")
-    # Disk usage of the project volume.
-    vol = volume_name_for(args.name)
-    if volume_exists(vol):
-        r = run(["docker", "system", "df", "-v", "--format", "{{json .Volumes}}"],
-                capture_output=True)
-        try:
-            vols = json.loads(r.stdout)
-            for v in vols:
-                if v.get("Name") == vol:
-                    print(f"Volume:    {vol}  ({v.get('Size', '?')})")
-                    break
-        except json.JSONDecodeError:
-            print(f"Volume:    {vol}")
+    workspace = workspace_path_for(args.name, cfg)
+    print(f"Workspace: {workspace}")
 
     # Inner workers (best-effort — requires the container to be running).
     if state == "running":
@@ -686,19 +685,21 @@ def cmd_project_start(args: argparse.Namespace) -> None:
 
 
 def cmd_project_destroy(args: argparse.Namespace) -> None:
+    cfg = load_config()
     project = args.name
     container = container_name_for(project)
     if not container_exists(container):
         die(f"project {project!r} does not exist")
 
-    volume = volume_name_for(project)
+    project_root = project_root_for(project, cfg)
     docker_volume = docker_volume_name_for(project)
     network = project_network_for(project)
 
     print(f"=== Destroy: {project} ===\n")
     print("This will permanently delete:")
     print(f"  - orchestrator container ({container})")
-    print(f"  - workspace volume ({volume}) and all its contents")
+    print(f"  - workspace directory on host: {project_root}")
+    print(f"      (includes .claude/ creds snapshot, plans, all worker outputs)")
     if volume_exists(docker_volume):
         print(f"  - DIND volume ({docker_volume})")
     print(f"  - per-project network ({network})")
@@ -708,7 +709,8 @@ def cmd_project_destroy(args: argparse.Namespace) -> None:
         return
 
     run(["docker", "rm", "-f", container], capture_output=True)
-    run(["docker", "volume", "rm", volume], capture_output=True)
+    if project_root.exists():
+        shutil.rmtree(project_root, ignore_errors=True)
     if volume_exists(docker_volume):
         run(["docker", "volume", "rm", docker_volume], capture_output=True)
     remove_project_network(project)

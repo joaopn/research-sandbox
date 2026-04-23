@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -46,6 +47,22 @@ LABEL_TYPE = "research.worker_type"
 LABEL_MOUNTS = "research.data_mounts"
 LABEL_CREATED = "research.created_at"
 LABEL_INTERACTIVE = "research.interactive"
+
+# Plan / accept / finalize contract.
+PLAN_SECTIONS = ("Question", "Inputs", "Deliverables", "Verification")
+OUTPUT_WHITELIST_SUFFIXES = (
+    ".ipynb", ".py", ".sh", ".sql",
+    ".csv", ".parquet", ".feather",
+    ".png", ".jpg", ".svg", ".pdf",
+    ".md",
+)
+OUTPUT_DENYLIST_SUFFIXES = (".pyc", ".tmp")
+OUTPUT_DENYLIST_DIRS = ("__pycache__", ".ipynb_checkpoints")
+
+TERMINAL_STATES = frozenset({"done", "waiting", "failed"})
+ACCEPTED_STATES = frozenset({"done", "waiting"})
+POLL_INTERVAL_SEC = 2.0
+DEFAULT_WAIT_TIMEOUT = 540
 
 
 def container_name(name: str) -> str:
@@ -85,6 +102,37 @@ def _get_container(name: str):
         die(f"no such worker: {name!r}")
 
 
+def _skeleton_research_log(name: str) -> str:
+    return f"# Research log — {name}\n\n(Worker will populate this during the run.)\n"
+
+
+def _resolve_state(container, wdir: Path) -> str:
+    """Map docker container.status + sentinel files to a worker state.
+
+    Returns one of: running, created, restarting, paused, done, waiting, failed.
+    """
+    state = container.status
+    if state == "exited":
+        if (wdir / "DONE").exists():
+            return "done"
+        if (wdir / "WAITING").exists():
+            return "waiting"
+        return "failed"
+    return state
+
+
+def _is_accepted(wdir: Path) -> bool:
+    return (wdir / ".accepted.json").is_file()
+
+
+def _validate_plan(text: str) -> list[str]:
+    """Return list of missing required section names (empty = plan is well-formed)."""
+    return [
+        s for s in PLAN_SECTIONS
+        if not re.search(rf"^##\s+{re.escape(s)}\b", text, re.MULTILINE)
+    ]
+
+
 # ---------------------------------------------------------------------------
 # spawn
 # ---------------------------------------------------------------------------
@@ -101,11 +149,18 @@ def cmd_spawn(args: argparse.Namespace) -> None:
             "retry."
         )
 
-    # Resolve task text.
-    if args.task_file:
-        task_text = sys.stdin.read() if args.task_file == "-" else Path(args.task_file).read_text()
-    else:
-        task_text = args.task
+    # --- resolve + validate plan ---
+    plan_src = Path(args.plan).expanduser()
+    if not plan_src.is_file():
+        die(f"plan file not found: {plan_src}")
+    plan_text = plan_src.read_text()
+    missing = _validate_plan(plan_text)
+    if missing:
+        die(
+            "plan is missing required top-level section(s): "
+            + ", ".join(f"## {s}" for s in missing)
+            + f" (in {plan_src})"
+        )
 
     cli = _client()
     cname = container_name(args.name)
@@ -131,10 +186,16 @@ def cmd_spawn(args: argparse.Namespace) -> None:
     # --- stage workdir ---
     wdir = worker_dir(args.name)
     wdir.mkdir(parents=True, exist_ok=True)
-    for sub in ("inbox", "outbox", "outputs", ".claude"):
+    for sub in ("inbox", "outbox", "outputs", "scratch", ".claude"):
         (wdir / sub).mkdir(exist_ok=True)
 
-    (wdir / "task.md").write_text(task_text.rstrip() + "\n")
+    # Worker task is the plan, verbatim.
+    (wdir / "task.md").write_text(plan_text.rstrip() + "\n")
+
+    # Canonical plan copy, durable beyond worker lifetime.
+    canonical_plan = WORKSPACE / "plan" / f"{args.name}.md"
+    canonical_plan.parent.mkdir(parents=True, exist_ok=True)
+    canonical_plan.write_text(plan_text.rstrip() + "\n")
 
     if WORKER_CLAUDE_MD_TEMPLATE.is_file():
         (wdir / "CLAUDE.md").write_text(WORKER_CLAUDE_MD_TEMPLATE.read_text())
@@ -145,11 +206,12 @@ def cmd_spawn(args: argparse.Namespace) -> None:
             "/workspace/DONE when finished.\n"
         )
 
+    # Write skeleton to both research_log.md (for the worker) and .claude/
+    # (a hidden reference copy the accept gate compares against).
+    skeleton = _skeleton_research_log(args.name)
     if not (wdir / "research_log.md").exists():
-        (wdir / "research_log.md").write_text(
-            f"# Research log — {args.name}\n\n"
-            "(Worker will populate this during the run.)\n"
-        )
+        (wdir / "research_log.md").write_text(skeleton)
+    (wdir / ".claude" / "skeleton_research_log.md").write_text(skeleton)
 
     # Creds + settings snapshot. Mirror the CLI's hidden-file naming inside
     # the worker's staging dir so the worker entrypoint copies them into
@@ -160,7 +222,7 @@ def cmd_spawn(args: argparse.Namespace) -> None:
         shutil.copy2(ORCH_SETTINGS, wdir / ".claude" / "settings.json")
 
     # Remove stale sentinels from a previous run under the same name.
-    for sentinel in ("DONE", "WAITING"):
+    for sentinel in ("DONE", "WAITING", ".accepted.json"):
         p = wdir / sentinel
         if p.exists():
             p.unlink()
@@ -169,7 +231,16 @@ def cmd_spawn(args: argparse.Namespace) -> None:
     mounts = [
         docker.types.Mount(
             target="/workspace", source=str(wdir), type="bind", read_only=False
-        )
+        ),
+        # Project shared/ is RO-mounted into every worker by default. This is
+        # the project's canonical input-data location (populated by --data-dir
+        # at project-create time) and every data-using worker needs it. Making
+        # it implicit eliminates the "supervisor forgot --data-mount" class of
+        # silent failure. --data-mount remains for paths outside /workspace/shared/.
+        docker.types.Mount(
+            target="/workspace/shared", source=str(WORKSPACE / "shared"),
+            type="bind", read_only=True,
+        ),
     ]
     for src in args.data_mount:
         mounts.append(
@@ -214,6 +285,7 @@ def cmd_spawn(args: argparse.Namespace) -> None:
         "container": cname,
         "container_id": container.id,
         "image": image,
+        "plan": str(canonical_plan),
         "data_mounts": args.data_mount,
         "interactive": bool(args.interactive),
         "created_at": labels[LABEL_CREATED],
@@ -230,10 +302,12 @@ def cmd_list(_args: argparse.Namespace) -> None:
     for c in _client().containers.list(all=True, filters={"label": LABEL_WORKER}):
         bare = c.name.removeprefix(CONTAINER_PREFIX) if c.name.startswith(CONTAINER_PREFIX) else c.name
         dm = c.labels.get(LABEL_MOUNTS, "")
+        wdir = worker_dir(bare)
         result.append({
             "name": bare,
             "container": c.name,
-            "state": c.status,
+            "state": _resolve_state(c, wdir),
+            "accepted": _is_accepted(wdir),
             "worker_type": c.labels.get(LABEL_TYPE, ""),
             "data_mounts": [s for s in dm.split(",") if s],
             "created_at": c.labels.get(LABEL_CREATED, ""),
@@ -270,19 +344,13 @@ def cmd_status(args: argparse.Namespace) -> None:
                 pass
             break
 
-    state = c.status
-    if state == "exited":
-        if (wdir / "DONE").exists():
-            state = "done"
-        elif (wdir / "WAITING").exists():
-            state = "waiting"
-        else:
-            state = "failed"
+    state = _resolve_state(c, wdir)
 
     _print_json({
         "name": args.name,
         "container": c.name,
         "state": state,
+        "accepted": _is_accepted(wdir),
         "exit_code": c.attrs.get("State", {}).get("ExitCode"),
         "done_sentinel": (wdir / "DONE").exists(),
         "waiting_sentinel": (wdir / "WAITING").exists(),
@@ -406,6 +474,239 @@ def cmd_tail(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# wait
+# ---------------------------------------------------------------------------
+
+
+_WAIT_TERMINAL = TERMINAL_STATES | frozenset({"missing"})
+
+
+def _snapshot(names: list[str]) -> dict[str, dict]:
+    """Return {name -> {state, exit_code}} for each requested worker.
+
+    Missing workers (destroyed / never existed) get state='missing', exit_code=None.
+    """
+    cli = _client()
+    out: dict[str, dict] = {}
+    for name in names:
+        try:
+            c = cli.containers.get(container_name(name))
+        except NotFound:
+            out[name] = {"state": "missing", "exit_code": None}
+            continue
+        c.reload()
+        wdir = worker_dir(name)
+        out[name] = {
+            "state": _resolve_state(c, wdir),
+            "exit_code": c.attrs.get("State", {}).get("ExitCode"),
+        }
+    return out
+
+
+def cmd_wait(args: argparse.Namespace) -> None:
+    for n in args.name:
+        if not _valid_name(n):
+            die(f"invalid worker name: {n!r}")
+
+    # Pre-flight: every named worker must exist right now.
+    snap = _snapshot(args.name)
+    missing = [n for n, s in snap.items() if s["state"] == "missing"]
+    if missing:
+        die(f"no such worker(s): {', '.join(missing)}")
+
+    deadline = time.monotonic() + args.timeout
+    while True:
+        snap = _snapshot(args.name)
+        terminal = [n for n in args.name if snap[n]["state"] in _WAIT_TERMINAL]
+        if args.all:
+            if len(terminal) == len(args.name):
+                results = [
+                    {"name": n, "state": snap[n]["state"],
+                     "exit_code": snap[n]["exit_code"]}
+                    for n in args.name
+                ]
+                _print_json(results)
+                any_failed = any(
+                    snap[n]["state"] in ("failed", "missing") for n in args.name
+                )
+                sys.exit(1 if any_failed else 0)
+        else:
+            if terminal:
+                first = terminal[0]
+                _print_json({
+                    "name": first,
+                    "state": snap[first]["state"],
+                    "exit_code": snap[first]["exit_code"],
+                })
+                sys.exit(0)
+
+        if time.monotonic() >= deadline:
+            in_flight = [n for n in args.name if snap[n]["state"] not in _WAIT_TERMINAL]
+            _print_json({"timeout": True, "in_flight": in_flight})
+            sys.exit(3)
+
+        time.sleep(POLL_INTERVAL_SEC)
+
+
+# ---------------------------------------------------------------------------
+# finalize
+# ---------------------------------------------------------------------------
+
+
+def _is_denied(path: Path) -> bool:
+    if any(part in OUTPUT_DENYLIST_DIRS for part in path.parts):
+        return True
+    return path.suffix.lower() in OUTPUT_DENYLIST_SUFFIXES
+
+
+def _is_whitelisted(path: Path) -> bool:
+    return path.suffix.lower() in OUTPUT_WHITELIST_SUFFIXES
+
+
+def cmd_finalize(args: argparse.Namespace) -> None:
+    _get_container(args.name)  # existence check
+    wdir = worker_dir(args.name)
+    outputs = wdir / "outputs"
+    scratch = wdir / "scratch"
+    if not outputs.is_dir():
+        die(f"no outputs/ directory for worker {args.name!r}")
+
+    moved: list[dict] = []
+    removed: list[str] = []
+    kept = 0
+
+    # Walk outputs/ top-down so we can prune deny-dirs early.
+    for root, dirs, files in os.walk(outputs, topdown=True):
+        root_p = Path(root)
+        # Remove deny-listed subdirectories in place.
+        for d in list(dirs):
+            if d in OUTPUT_DENYLIST_DIRS:
+                target = root_p / d
+                rel = target.relative_to(outputs)
+                removed.append(str(rel))
+                if not args.dry_run:
+                    shutil.rmtree(target, ignore_errors=True)
+                dirs.remove(d)
+
+        for f in files:
+            src = root_p / f
+            rel = src.relative_to(outputs)
+            if _is_denied(src):
+                removed.append(str(rel))
+                if not args.dry_run:
+                    src.unlink(missing_ok=True)
+                continue
+            if _is_whitelisted(src):
+                kept += 1
+                continue
+            dst = scratch / rel
+            moved.append({"from": f"outputs/{rel}", "to": f"scratch/{rel}"})
+            if not args.dry_run:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(src), str(dst))
+
+    _print_json({
+        "name": args.name,
+        "dry_run": bool(args.dry_run),
+        "moved": moved,
+        "removed": removed,
+        "kept": kept,
+    })
+
+
+# ---------------------------------------------------------------------------
+# accept
+# ---------------------------------------------------------------------------
+
+
+def _accept_checks(wdir: Path, container) -> list[str]:
+    """Return list of failure messages (empty = all checks pass)."""
+    failures: list[str] = []
+
+    state = _resolve_state(container, wdir)
+    if state not in ACCEPTED_STATES:
+        failures.append(
+            f"state is {state!r}; must be 'done' or 'waiting' (run `rs-worker wait` "
+            "first, or investigate a failed run)"
+        )
+        # Everything below assumes the worker had a chance to write outputs.
+        return failures
+
+    outputs = wdir / "outputs"
+    if not outputs.is_dir() or not any(p.is_file() for p in outputs.rglob("*")):
+        failures.append("outputs/ is empty")
+
+    rl = wdir / "research_log.md"
+    skel = wdir / ".claude" / "skeleton_research_log.md"
+    if not rl.is_file():
+        failures.append("research_log.md is missing")
+    elif skel.is_file() and rl.read_bytes() == skel.read_bytes():
+        failures.append("research_log.md is unchanged from the skeleton")
+
+    if outputs.is_dir():
+        # Whitelist: at least one output must match.
+        has_whitelisted = any(
+            _is_whitelisted(p) for p in outputs.rglob("*") if p.is_file()
+        )
+        if not has_whitelisted:
+            failures.append(
+                "no files in outputs/ match the deliverable whitelist "
+                f"({', '.join(OUTPUT_WHITELIST_SUFFIXES)})"
+            )
+        # Denylist: no output may match.
+        denied = sorted(
+            str(p.relative_to(outputs))
+            for p in outputs.rglob("*") if p.is_file() and _is_denied(p)
+        )
+        if denied:
+            failures.append(f"outputs/ contains denied files: {', '.join(denied)}")
+
+    return failures
+
+
+def cmd_accept(args: argparse.Namespace) -> None:
+    c = _get_container(args.name)
+    wdir = worker_dir(args.name)
+
+    if _is_accepted(wdir):
+        die(f"worker {args.name!r} is already accepted")
+
+    failures: list[str] = []
+    if not args.waived:
+        failures = _accept_checks(wdir, c)
+        if failures:
+            for msg in failures:
+                print(f"rs-worker: accept check failed: {msg}", file=sys.stderr)
+            sys.exit(1)
+
+    sentinel = wdir / ".accepted.json"
+    sentinel.write_text(json.dumps({
+        "name": args.name,
+        "accepted_at": _iso_now(),
+        "waived": args.waived,
+    }, indent=2, sort_keys=True) + "\n")
+
+    # Archive the plan: move /workspace/plan/<name>.md → plan/archive/<name>.md.
+    # Keeps plan/ as the active briefs list; archive/ is provenance.
+    archive_dir = WORKSPACE / "plan" / "archive"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    plan_file = WORKSPACE / "plan" / f"{args.name}.md"
+    archived_to: str | None = None
+    if plan_file.is_file():
+        dst = archive_dir / f"{args.name}.md"
+        shutil.move(str(plan_file), str(dst))
+        archived_to = str(dst)
+
+    _print_json({
+        "name": args.name,
+        "accepted": True,
+        "waived": args.waived,
+        "accepted_at": json.loads(sentinel.read_text())["accepted_at"],
+        "plan_archived_to": archived_to,
+    })
+
+
+# ---------------------------------------------------------------------------
 # argparse
 # ---------------------------------------------------------------------------
 
@@ -419,9 +720,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("spawn", help="stage a worker workdir and start its container")
     sp.add_argument("name")
-    g = sp.add_mutually_exclusive_group(required=True)
-    g.add_argument("--task", help="task text (literal)")
-    g.add_argument("--task-file", help="path to task.md, or '-' for stdin")
+    sp.add_argument("--plan", required=True,
+                    help="path to a plan file with required top-level sections: "
+                         "## Question, ## Inputs, ## Deliverables, ## Verification")
     sp.add_argument("--image", default=DEFAULT_IMAGE, help=f"worker image (default: {DEFAULT_IMAGE})")
     sp.add_argument("--data-mount", action="append", default=[],
                     help="absolute path to bind-mount RO into the worker; repeatable")
@@ -466,6 +767,34 @@ def build_parser() -> argparse.ArgumentParser:
     slg.add_argument("-n", "--lines", type=int, default=20)
     slg.add_argument("-f", "--follow", action="store_true")
     slg.set_defaults(func=cmd_tail)
+
+    sw = sub.add_parser("wait",
+                        help="block until one (or all, with --all) named worker(s) "
+                             "reach a terminal state")
+    sw.add_argument("name", nargs="+")
+    sw.add_argument("--all", action="store_true",
+                    help="wait until every named worker is terminal (default: any)")
+    sw.add_argument("--timeout", type=int, default=DEFAULT_WAIT_TIMEOUT,
+                    help=f"hard upper bound in seconds (default: {DEFAULT_WAIT_TIMEOUT}, "
+                         "under Claude Code's Bash tool timeout)")
+    sw.set_defaults(func=cmd_wait)
+
+    sf = sub.add_parser("finalize",
+                        help="move non-deliverable files out of outputs/ into scratch/; "
+                             "prune denied files (__pycache__, .ipynb_checkpoints, *.pyc)")
+    sf.add_argument("name")
+    sf.add_argument("--dry-run", action="store_true",
+                    help="print actions without mutating the workdir")
+    sf.set_defaults(func=cmd_finalize)
+
+    sac = sub.add_parser("accept",
+                         help="mark a worker accepted after shape checks pass "
+                              "(terminal state, non-empty outputs/ with whitelisted "
+                              "files, research_log.md past skeleton)")
+    sac.add_argument("name")
+    sac.add_argument("--waived", default=None, metavar="REASON",
+                     help="skip shape checks and accept with an explicit logged reason")
+    sac.set_defaults(func=cmd_accept)
 
     return p
 

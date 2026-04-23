@@ -11,3 +11,6 @@ __pycache__/
 .idea/
 *.swp
 *.swo
+
+container_volumes/
+.claude/

@@ -77,17 +77,22 @@ RUN /opt/conda/bin/pip install --no-cache-dir 'docker>=7.1' 'pyyaml>=6'
 
 # rs-worker is the worker-lifecycle CLI, mirroring research.py's shape one
 # level in. Invoked by the orchestrator's Claude Code via its Bash tool.
+# rs-audit-stop is the supervision-audit Stop hook, wired into ~/.claude/
+# settings.json by setup.sh on first boot.
 COPY cli/rs_worker.py /usr/local/bin/rs-worker
-RUN chmod +x /usr/local/bin/rs-worker
+COPY cli/rs_audit_stop.py /usr/local/bin/rs-audit-stop
+RUN chmod +x /usr/local/bin/rs-worker /usr/local/bin/rs-audit-stop
 
 # Stash home directory — volume mount on /home/research hides image contents.
 RUN cp -a /home/research /etc/research-skel
 
 # Claude Code settings templates (written into /workspace/.claude/ by entrypoint
 # on first boot). Kept as image artifacts to stay declarative.
-RUN mkdir -p /opt/claude-templates
+RUN mkdir -p /opt/claude-templates /opt/claude-templates/commands
 COPY container/orchestrator/setup.sh /opt/claude-templates/setup.sh
 COPY container/orchestrator/CLAUDE.md /opt/claude-templates/CLAUDE.md
+COPY container/orchestrator/commands/ /opt/claude-templates/commands/
+COPY container/orchestrator/logbook_template.md /opt/claude-templates/logbook_template.md
 COPY container/analysis/CLAUDE.md.template /opt/claude-templates/worker.CLAUDE.md.template
 RUN chmod +x /opt/claude-templates/setup.sh
 

@@ -17,7 +17,19 @@ if [[ ! -f ~/.claude/settings.json ]]; then
   "permissions": {
     "defaultMode": "bypassPermissions"
   },
-  "theme": "dark"
+  "theme": "dark",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/rs-audit-stop"
+          }
+        ]
+      }
+    ]
+  }
 }
 SETTINGS
 fi

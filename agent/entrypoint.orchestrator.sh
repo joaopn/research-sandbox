@@ -37,19 +37,33 @@ if ! grep -q 'umask 002' ~/.bashrc 2>/dev/null; then
 fi
 
 # --- Workspace first-boot staging ---
-# Named volumes mount root-owned by default. Claim /workspace (non-recursive) so
-# the research user can create subdirs; RO bind-mounts under /workspace/shared/
-# must not be chowned, so we avoid -R.
+# Under host bind-mount, /workspace is owned by the host user. Under sysbox's
+# user namespace the chown may fail (host uid outside the ns-uid range); under
+# named volumes it lands root-owned and must be reclaimed. Either way: try
+# once, ignore failure, rely on HOST_GID + setgid bit for shared access.
 if [[ "$(stat -c %U /workspace)" != "research" ]]; then
-    sudo chown research:research /workspace
+    sudo chown research:research /workspace 2>/dev/null || true
 fi
 mkdir -p /workspace/.claude /workspace/.orchestrator/logs /workspace/plan \
-         /workspace/shared /workspace/workers
+         /workspace/episodes /workspace/shared /workspace/workers
 # /workspace/shared/data may be a RO bind-mount; only create it if missing.
 [[ -d /workspace/shared/data ]] || mkdir -p /workspace/shared/data
 
 if [[ ! -f /workspace/.claude/CLAUDE.md ]]; then
     cp /opt/claude-templates/CLAUDE.md /workspace/.claude/CLAUDE.md
+fi
+
+# Slash commands (project-level). The supervisor's `/log` lives here.
+mkdir -p /workspace/.claude/commands
+for src in /opt/claude-templates/commands/*.md; do
+    [[ -f "$src" ]] || continue
+    dst="/workspace/.claude/commands/$(basename "$src")"
+    [[ -f "$dst" ]] || cp "$src" "$dst"
+done
+
+# Logbook entry template, referenced by /workspace/.claude/commands/log.md.
+if [[ ! -f /workspace/.claude/logbook_template.md ]]; then
+    cp /opt/claude-templates/logbook_template.md /workspace/.claude/logbook_template.md
 fi
 
 # The /workspace/CLAUDE.md is what Claude Code auto-discovers when started from
