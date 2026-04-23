@@ -4,7 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Minimal system tools. NO git (structural requirement — later stages depend on
 # this). No sshd either; workers are attached via `docker exec` from the
-# orchestrator. Byobu stays so `worker_attach_command` can drop the user into
+# supervisor. Byobu stays so `worker_attach_command` can drop the user into
 # a preserved session.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl jq nano \
@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN sed -i '/en_US.UTF-8/s/^# //' /etc/locale.gen && locale-gen
 ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 
-# Non-root user at UID 1000 (matches orchestrator's `research` UID so
+# Non-root user at UID 1000 (matches supervisor's `research` UID so
 # bind-mounted workspace subdirs are read/writable).
 RUN useradd -m -s /bin/bash -G sudo -u 1000 worker && \
     echo "worker ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/worker
@@ -35,7 +35,7 @@ RUN /opt/conda/bin/conda install -n base -y -c conda-forge \
         jupyter ipykernel nbformat papermill tqdm \
     && /opt/conda/bin/conda clean -afy
 
-# Claude Code CLI for the worker user. As with the orchestrator, Docker build
+# Claude Code CLI for the worker user. As with the supervisor, Docker build
 # gets the host's network, so this doesn't depend on runtime router egress.
 RUN su - worker -c 'curl -fsSL https://claude.ai/install.sh | bash' && \
     su - worker -c 'echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.bashrc'

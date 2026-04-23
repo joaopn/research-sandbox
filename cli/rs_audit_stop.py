@@ -1,7 +1,7 @@
 #!/opt/conda/bin/python
 """rs-audit-stop — supervision audit hook.
 
-Claude Code Stop hook. Runs every time the orchestrator's claude session
+Claude Code Stop hook. Runs every time the supervisor's claude session
 is about to return control to the PI. Blocks the stop (exit 2) if any
 terminated-but-unaccepted worker's research_log.md has not been Read in
 this session's transcript.
@@ -9,7 +9,7 @@ this session's transcript.
 Reads JSON on stdin (standard Claude Code hook payload):
     { "transcript_path": "/path/to/session.jsonl", ... }
 
-Scope: all terminated-unaccepted workers in the orchestrator's inner
+Scope: all terminated-unaccepted workers in the supervisor's inner
 docker daemon, not just this session's spawns. Strictly stricter than
 session-scoped and avoids propagating session_id through container labels.
 """
@@ -25,7 +25,7 @@ import docker
 from docker.errors import NotFound
 
 WORKSPACE = Path("/workspace")
-CONTAINER_PREFIX = "research-worker-"
+CONTAINER_PREFIX = "rs-worker-"
 LABEL_WORKER = "research.worker"
 
 TERMINAL_STATES = frozenset({"done", "waiting", "failed"})
@@ -77,7 +77,7 @@ def main() -> None:
     if not transcript.is_file():
         sys.exit(0)
 
-    # Enumerate workers via the orchestrator's inner docker daemon.
+    # Enumerate workers via the supervisor's inner docker daemon.
     try:
         cli = docker.from_env()
         containers = cli.containers.list(all=True, filters={"label": LABEL_WORKER})

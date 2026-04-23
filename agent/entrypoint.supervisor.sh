@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# entrypoint.orchestrator.sh — Research Sandbox orchestrator container entrypoint.
+# entrypoint.supervisor.sh — Research Sandbox supervisor container entrypoint.
 #
 # Expected environment variables:
 #   PROJECT          — project name (used for labels / byobu title)
@@ -19,7 +19,7 @@
 
 set -euo pipefail
 
-echo "=== Orchestrator starting${PROJECT:+ for project '${PROJECT}'} ==="
+echo "=== Supervisor starting${PROJECT:+ for project '${PROJECT}'} ==="
 
 # --- GID remap so host user (shared GID) can rw bind-mounted files ---
 if [[ -n "${HOST_GID:-}" ]]; then
@@ -45,7 +45,7 @@ if [[ "$(stat -c %U /workspace)" != "research" ]]; then
     sudo chown research:research /workspace 2>/dev/null || true
 fi
 mkdir -p /workspace/.claude /workspace/.orchestrator/logs /workspace/plan \
-         /workspace/episodes /workspace/shared /workspace/workers
+         /workspace/logbook /workspace/shared /workspace/workers
 # /workspace/shared/data may be a RO bind-mount; only create it if missing.
 [[ -d /workspace/shared/data ]] || mkdir -p /workspace/shared/data
 
@@ -109,7 +109,7 @@ fi
 # predates `usermod -aG docker research` (docker-ce is installed at project
 # create time), so the attached shell would lack the docker group.
 
-echo "=== Orchestrator ready ==="
+echo "=== Supervisor ready ==="
 echo "Workspace: /workspace"
 echo "Attach:    docker exec -it <container> byobu attach -t main"
 echo "SSH:       $( [[ -n "${SSH_PASSWORD:-}" ]] && echo "research@<host>:<published-port>" || echo "not configured" )"

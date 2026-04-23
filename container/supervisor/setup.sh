@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Claude Code configuration — sourced by entrypoint.orchestrator.sh on first boot.
+# Claude Code configuration — sourced by entrypoint.supervisor.sh on first boot.
 # Sets bypassPermissions so Claude Code never prompts. Credentials are NOT
 # staged here — the user authenticates once per project via VSCode CC
 # extension OAuth or `claude` in byobu.

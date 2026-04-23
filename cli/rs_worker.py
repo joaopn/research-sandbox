@@ -1,13 +1,13 @@
 #!/opt/conda/bin/python
-"""rs-worker — worker lifecycle, inside the orchestrator.
+"""rs-worker — worker lifecycle, inside the supervisor.
 
 Mirrors research.py's shape but operates one level in: against the
-orchestrator's inner Docker daemon, on a per-project basis.
+supervisor's inner Docker daemon, on a per-project basis.
 
 State: workers are identified entirely by docker labels + filesystem
 structure. No separate registry file.
 
-  - container name:  research-worker-<name>
+  - container name:  rs-worker-<name>
   - workdir:         /workspace/workers/<name>/work/
   - labels:          research.worker=1
                      research.worker_type=analysis
@@ -35,8 +35,8 @@ from docker.errors import APIError, ImageNotFound, NotFound
 # ---------------------------------------------------------------------------
 
 WORKSPACE = Path(os.environ.get("RS_WORKSPACE", "/workspace"))
-CONTAINER_PREFIX = "research-worker-"
-DEFAULT_IMAGE = "research-analysis-base:latest"
+CONTAINER_PREFIX = "rs-worker-"
+DEFAULT_IMAGE = "rs-analysis-base:latest"
 # Claude Code CLI writes OAuth creds to a HIDDEN file (leading dot).
 ORCH_CREDS = Path.home() / ".claude" / ".credentials.json"
 ORCH_SETTINGS = Path.home() / ".claude" / "settings.json"
@@ -144,7 +144,7 @@ def cmd_spawn(args: argparse.Namespace) -> None:
 
     if not ORCH_CREDS.is_file():
         die(
-            "orchestrator is not authenticated. Run `claude` once (via the "
+            "supervisor is not authenticated. Run `claude` once (via the "
             "VSCode CC extension or `claude` in byobu) to complete OAuth, then "
             "retry."
         )
@@ -175,7 +175,7 @@ def cmd_spawn(args: argparse.Namespace) -> None:
         cli.images.get(image)
     except ImageNotFound:
         die(
-            f"image {image!r} is not available in the orchestrator's inner "
+            f"image {image!r} is not available in the supervisor's inner "
             f"Docker daemon. Re-stage via `research project destroy <proj> && "
             f"research project create <proj> …`, or rebuild with `research setup`."
         )
@@ -714,7 +714,7 @@ def cmd_accept(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="rs-worker",
-        description="Worker lifecycle inside the orchestrator.",
+        description="Worker lifecycle inside the supervisor.",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 

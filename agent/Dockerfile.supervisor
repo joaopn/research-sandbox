@@ -20,7 +20,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Docker CE from Docker's official installer, pinned to a specific
-# version. Baking the version into the image means every orchestrator built
+# version. Baking the version into the image means every supervisor built
 # from `research setup` uses the same docker — no version drift between
 # projects created on different days. Upgrade is explicit: bump DOCKER_VERSION,
 # re-run `research setup`, destroy/create affected projects.
@@ -57,7 +57,7 @@ RUN mkdir -p /run/sshd && \
 
 # Non-root user at UID 1000. The `docker` group was already created by
 # docker.io's postinst above; research just joins it. NOPASSWD:ALL because
-# the container is the security boundary (sandboxed inside research-sandbox
+# the container is the security boundary (sandboxed inside rs-sandbox
 # network + router egress policy).
 RUN useradd -m -s /bin/bash -G sudo,docker -u 1000 research && \
     echo "research ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/research
@@ -76,7 +76,7 @@ RUN su - research -c 'curl -fsSL https://claude.ai/install.sh | bash' && \
 RUN /opt/conda/bin/pip install --no-cache-dir 'docker>=7.1' 'pyyaml>=6'
 
 # rs-worker is the worker-lifecycle CLI, mirroring research.py's shape one
-# level in. Invoked by the orchestrator's Claude Code via its Bash tool.
+# level in. Invoked by the supervisor's Claude Code via its Bash tool.
 # rs-audit-stop is the supervision-audit Stop hook, wired into ~/.claude/
 # settings.json by setup.sh on first boot.
 COPY cli/rs_worker.py /usr/local/bin/rs-worker
@@ -89,15 +89,15 @@ RUN cp -a /home/research /etc/research-skel
 # Claude Code settings templates (written into /workspace/.claude/ by entrypoint
 # on first boot). Kept as image artifacts to stay declarative.
 RUN mkdir -p /opt/claude-templates /opt/claude-templates/commands
-COPY container/orchestrator/setup.sh /opt/claude-templates/setup.sh
-COPY container/orchestrator/CLAUDE.md /opt/claude-templates/CLAUDE.md
-COPY container/orchestrator/commands/ /opt/claude-templates/commands/
-COPY container/orchestrator/logbook_template.md /opt/claude-templates/logbook_template.md
+COPY container/supervisor/setup.sh /opt/claude-templates/setup.sh
+COPY container/supervisor/CLAUDE.md /opt/claude-templates/CLAUDE.md
+COPY container/supervisor/commands/ /opt/claude-templates/commands/
+COPY container/supervisor/logbook_template.md /opt/claude-templates/logbook_template.md
 COPY container/analysis/CLAUDE.md.template /opt/claude-templates/worker.CLAUDE.md.template
 RUN chmod +x /opt/claude-templates/setup.sh
 
 # Entrypoint.
-COPY agent/entrypoint.orchestrator.sh /entrypoint.sh
+COPY agent/entrypoint.supervisor.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 USER research

@@ -18,9 +18,9 @@ Stdlib only. Subcommand layout:
     research project ssh     <name>
 
 State is stored in ``.env`` beside this script, plus Docker labels on the
-orchestrator container (``sandbox.project=<name>``). Per-project host
+supervisor container (``sandbox.project=<name>``). Per-project host
 directory ``<PROJECTS_DIR>/<name>/workspace/`` is bind-mounted into the
-orchestrator's ``/workspace``; named volume ``rs-docker-<name>`` holds the
+supervisor's ``/workspace``; named volume ``rs-docker-<name>`` holds the
 inner Docker daemon state when ``--dind privileged`` is used (sysbox keeps
 it internal to the container).
 """
@@ -42,13 +42,13 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-ORCHESTRATOR_IMAGE = "research-orchestrator:latest"
-ANALYSIS_IMAGE = "research-analysis-base:latest"
-ROUTER_CONTAINER = "research-router"
-ROUTER_NETWORK = "research-sandbox"
-CONTAINER_PREFIX = "research-orch-"
+SUPERVISOR_IMAGE = "rs-supervisor:latest"
+ANALYSIS_IMAGE = "rs-analysis-base:latest"
+ROUTER_CONTAINER = "rs-router"
+ROUTER_NETWORK = "rs-sandbox"
+CONTAINER_PREFIX = "rs-project-"
 DOCKER_VOLUME_PREFIX = "rs-docker-"
-PROJECT_NETWORK_PREFIX = "research-net-"
+PROJECT_NETWORK_PREFIX = "rs-net-"
 PROJECT_LABEL = "research.project"
 DIND_MODE_LABEL = "research.dind"
 
@@ -187,7 +187,7 @@ def select_dind_mode(mode: str) -> str:
     return mode
 
 
-def get_orchestrator_containers() -> list[dict]:
+def get_supervisor_containers() -> list[dict]:
     fmt = "{{.Names}}\t{{.State}}\t{{.Label \"" + PROJECT_LABEL + "\"}}"
     r = run_check([
         "docker", "ps", "-a",
@@ -237,7 +237,7 @@ def wait_for_inner_dockerd(container: str, timeout: int = 60) -> None:
 
 
 def stage_worker_image(container: str, image: str) -> None:
-    """Push the host-built image into the orchestrator's inner Docker daemon."""
+    """Push the host-built image into the supervisor's inner Docker daemon."""
     if not run_quiet(["docker", "image", "inspect", image]):
         die(f"host image {image} not found; run `research setup`.")
     # Skip if already present inside.
@@ -245,7 +245,7 @@ def stage_worker_image(container: str, image: str) -> None:
             capture_output=True)
     if r.returncode == 0:
         return
-    print(f"staging {image} into the orchestrator (this can take a minute)...")
+    print(f"staging {image} into the supervisor (this can take a minute)...")
     save = subprocess.Popen(
         ["docker", "save", image],
         stdout=subprocess.PIPE,
@@ -359,7 +359,7 @@ def remove_project_network(project: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def build_orchestrator_docker_args(
+def build_supervisor_docker_args(
     *,
     container_name: str,
     project: str,
@@ -429,9 +429,9 @@ def _preflight() -> None:
 
 
 def _build_images(force: bool) -> None:
-    """Build orchestrator + worker images. Skip existing ones unless --rebuild."""
+    """Build supervisor + worker images. Skip existing ones unless --rebuild."""
     specs = [
-        (ORCHESTRATOR_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.orchestrator"),
+        (SUPERVISOR_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.supervisor"),
         (ANALYSIS_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.analysis-base"),
     ]
     for tag, dockerfile in specs:
@@ -478,8 +478,8 @@ def cmd_project_create(args: argparse.Namespace) -> None:
             f"Use destroy first.")
 
     # Verify prerequisites.
-    if not run_quiet(["docker", "image", "inspect", ORCHESTRATOR_IMAGE]):
-        die(f"image {ORCHESTRATOR_IMAGE} not found. Run `research setup` first.")
+    if not run_quiet(["docker", "image", "inspect", SUPERVISOR_IMAGE]):
+        die(f"image {SUPERVISOR_IMAGE} not found. Run `research setup` first.")
     if not container_running(ROUTER_CONTAINER):
         die(f"{ROUTER_CONTAINER} is not running. Run `research setup` first.")
 
@@ -488,7 +488,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     if egress not in ("open", "locked"):
         die(f"invalid --egress value: {egress!r} (expected open|locked)")
 
-    # Optional data-dir bind-mount (read-only inside orchestrator). Created
+    # Optional data-dir bind-mount (read-only inside supervisor). Created
     # if missing, like `mkdir -p` — typical use is an empty dir for a fresh
     # project that data will be dropped into afterward.
     extra_mounts: list[str] = []
@@ -507,7 +507,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
 
     # 1. Workspace dir (host bind-mount) + optional privileged-DIND volume.
     # setgid bit (2xxx) makes new files inherit the host user's primary GID;
-    # combined with HOST_GID remap in the orchestrator entrypoint, host user
+    # combined with HOST_GID remap in the supervisor entrypoint, host user
     # and container's `research` user share rw access through the shared GID.
     workspace_path.mkdir(parents=True, exist_ok=True)
     os.chmod(workspace_path, 0o2770)
@@ -518,7 +518,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     network, router_ip = ensure_project_network(project, egress)
 
     # 3. Build docker run argv.
-    docker_args = build_orchestrator_docker_args(
+    docker_args = build_supervisor_docker_args(
         container_name=container_name,
         project=project,
         network=network,
@@ -528,7 +528,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         dns_servers=cfg.sandbox_dns,
         memory=args.memory or cfg.default_memory,
         cpus=args.cpus or "",
-        image=ORCHESTRATOR_IMAGE,
+        image=SUPERVISOR_IMAGE,
         dind_mode=dind_mode,
     )
     # Inject data-dir (and any future --mount) into argv just before the image name.
@@ -557,14 +557,14 @@ Project '{project}' is running.
   SSH:       research@localhost -p {ssh_port}   password: {ssh_pass}
 
 Next steps:
-  1. Authenticate Claude Code inside the orchestrator (once per project).
+  1. Authenticate Claude Code inside the supervisor (once per project).
      Either:
        (a) Connect via VSCode Remote-SSH (localhost:{ssh_port}, user 'research',
            password as above), then click the Claude Code extension — it will
            trigger OAuth via a port-forwarded localhost callback.
        (b) `research project attach {project}`, then in byobu run `claude` and
            complete the device-code flow in a local browser.
-  2. Once authenticated, ask the orchestrator to spawn workers.
+  2. Once authenticated, ask the supervisor to spawn workers.
 """)
 
 
@@ -584,7 +584,7 @@ def cmd_project_attach(args: argparse.Namespace) -> None:
 
 
 def cmd_project_list(_: argparse.Namespace) -> None:
-    containers = get_orchestrator_containers()
+    containers = get_supervisor_containers()
     if not containers:
         print("no projects")
         return
@@ -641,7 +641,7 @@ def cmd_project_status(args: argparse.Namespace) -> None:
 
 def _for_containers(op: str, target: str | None) -> None:
     if target == "__ALL__":
-        containers = [c["name"] for c in get_orchestrator_containers()]
+        containers = [c["name"] for c in get_supervisor_containers()]
     elif target:
         containers = [container_name_for(target)]
     else:
@@ -664,7 +664,7 @@ def cmd_project_stop(args: argparse.Namespace) -> None:
 def cmd_project_start(args: argparse.Namespace) -> None:
     target = "__ALL__" if args.all else args.name
     if target == "__ALL__":
-        containers = get_orchestrator_containers()
+        containers = get_supervisor_containers()
     else:
         containers = [{"name": container_name_for(args.name), "project": args.name}]
     for c in containers:
@@ -697,7 +697,7 @@ def cmd_project_destroy(args: argparse.Namespace) -> None:
 
     print(f"=== Destroy: {project} ===\n")
     print("This will permanently delete:")
-    print(f"  - orchestrator container ({container})")
+    print(f"  - supervisor container ({container})")
     print(f"  - workspace directory on host: {project_root}")
     print(f"      (includes .claude/ creds snapshot, plans, all worker outputs)")
     if volume_exists(docker_volume):
@@ -741,7 +741,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     st = sub.add_parser("start", help="start shared infra (router); build images if missing")
     st.add_argument("--rebuild", action="store_true",
-                    help="force-rebuild orchestrator + worker images even if they exist")
+                    help="force-rebuild supervisor + worker images even if they exist")
     st.set_defaults(func=cmd_start)
 
     sp = sub.add_parser("stop", help="stop shared infra (router)")
@@ -753,7 +753,7 @@ def build_parser() -> argparse.ArgumentParser:
     c = proj_sub.add_parser("create", help="create a new project")
     c.add_argument("name")
     c.add_argument("--data-dir", help="host path mounted RO at /workspace/shared/data")
-    c.add_argument("--profile", default="python", help="orchestrator image profile")
+    c.add_argument("--profile", default="python", help="supervisor image profile")
     c.add_argument("--dind", choices=["auto", "sysbox", "privileged"],
                    help="DIND mode (default: auto — sysbox if available, else privileged)")
     c.add_argument("--memory", help="memory limit (e.g. 8g)")
@@ -775,7 +775,7 @@ def build_parser() -> argparse.ArgumentParser:
     st.set_defaults(func=cmd_project_status)
 
     for op in ("stop", "start"):
-        sp = proj_sub.add_parser(op, help=f"{op} the orchestrator")
+        sp = proj_sub.add_parser(op, help=f"{op} the supervisor")
         g = sp.add_mutually_exclusive_group(required=True)
         g.add_argument("name", nargs="?")
         g.add_argument("--all", action="store_true")
