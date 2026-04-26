@@ -92,7 +92,8 @@ RUN mkdir -p /opt/claude-templates /opt/claude-templates/commands
 COPY container/supervisor/setup.sh /opt/claude-templates/setup.sh
 COPY container/supervisor/CLAUDE.md /opt/claude-templates/CLAUDE.md
 COPY container/supervisor/commands/ /opt/claude-templates/commands/
-COPY container/supervisor/logbook_template.md /opt/claude-templates/logbook_template.md
+COPY container/supervisor/logbook_supervisor_template.md /opt/claude-templates/logbook_supervisor_template.md
+COPY container/supervisor/logbook_pi_template.md /opt/claude-templates/logbook_pi_template.md
 COPY container/analysis/CLAUDE.md.template /opt/claude-templates/worker.CLAUDE.md.template
 RUN chmod +x /opt/claude-templates/setup.sh
 

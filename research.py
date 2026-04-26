@@ -626,16 +626,16 @@ def cmd_project_status(args: argparse.Namespace) -> None:
             for line in r.stdout.strip().splitlines():
                 print(f"  {line}")
 
-        # workers.json snapshot.
-        reg = run(["docker", "exec", container, "cat",
-                   "/workspace/.orchestrator/workers.json"], capture_output=True)
+        # Registry snapshot (Stage 1.7: per-worker JSONs under .workers/).
+        reg = run(["docker", "exec", container, "sh", "-c",
+                   "ls /workspace/.workers/*.json 2>/dev/null | wc -l"],
+                  capture_output=True)
         if reg.returncode == 0:
             try:
-                data = json.loads(reg.stdout)
-                wdict = data.get("workers", {})
-                if wdict:
-                    print(f"\nRegistry: {len(wdict)} worker(s)")
-            except json.JSONDecodeError:
+                n = int(reg.stdout.strip() or "0")
+                if n:
+                    print(f"\nRegistry: {n} worker entry(ies) (see /workspace/.workers/)")
+            except ValueError:
                 pass
 
 

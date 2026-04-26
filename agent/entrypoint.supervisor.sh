@@ -44,8 +44,11 @@ fi
 if [[ "$(stat -c %U /workspace)" != "research" ]]; then
     sudo chown research:research /workspace 2>/dev/null || true
 fi
-mkdir -p /workspace/.claude /workspace/.orchestrator/logs /workspace/plan \
-         /workspace/logbook /workspace/shared /workspace/workers
+mkdir -p /workspace/.claude /workspace/.orchestrator/logs \
+         /workspace/plan /workspace/plan/archive \
+         /workspace/logbook/supervisor /workspace/logbook/pi \
+         /workspace/shared /workspace/workers \
+         /workspace/.workers /workspace/staging /workspace/results
 # /workspace/shared/data may be a RO bind-mount; only create it if missing.
 [[ -d /workspace/shared/data ]] || mkdir -p /workspace/shared/data
 
@@ -61,10 +64,12 @@ for src in /opt/claude-templates/commands/*.md; do
     [[ -f "$dst" ]] || cp "$src" "$dst"
 done
 
-# Logbook entry template, referenced by /workspace/.claude/commands/log.md.
-if [[ ! -f /workspace/.claude/logbook_template.md ]]; then
-    cp /opt/claude-templates/logbook_template.md /workspace/.claude/logbook_template.md
-fi
+# Two-stream logbook templates, referenced by /workspace/.claude/commands/log.md.
+for tmpl in logbook_supervisor_template.md logbook_pi_template.md; do
+    src="/opt/claude-templates/$tmpl"
+    dst="/workspace/.claude/$tmpl"
+    [[ -f "$src" && ! -f "$dst" ]] && cp "$src" "$dst" || true
+done
 
 # The /workspace/CLAUDE.md is what Claude Code auto-discovers when started from
 # /workspace. Symlink into .claude/CLAUDE.md to keep the single source of truth.

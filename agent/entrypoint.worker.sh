@@ -1,29 +1,37 @@
 #!/usr/bin/env bash
-# entrypoint.worker.sh — analysis worker container entrypoint.
+# entrypoint.worker.sh — session-scoped persistent analysis worker.
 #
-# Contract with the supervisor (spawn_worker):
-#   /workspace/task.md            the task brief
-#   /workspace/CLAUDE.md          worker role doc (template fill from supervisor)
-#   /workspace/.claude/credentials.json   copied from supervisor at spawn time
-#   /workspace/.claude/settings.json      bypassPermissions
-#   /workspace/inbox/             empty at start; supervisor writes here
-#   /workspace/outputs/           empty at start; worker produces deliverables
-#   /workspace/research_log.md    worker log
+# Lifecycle:
+#   - The bind-mount at /workspace persists across container incarnations
+#     (down → live → down). summary.md, outputs/<slug>/, research_log.md,
+#     scratch/ all survive between sessions; the container does not.
+#   - On start: (re)run the initial task from /workspace/task.md, then poll
+#     /workspace/inbox/ for follow-up messages.
+#   - On SIGTERM (from `rs-worker shutdown` / docker stop): trap fires,
+#     touches /workspace/DONE, exits 0 — the supervisor's registry moves
+#     this worker to `state: down`.
 #
-# On exit, we touch /workspace/DONE as a sentinel for the supervisor.
+# Contract with the supervisor (set up by rs-worker spawn):
+#   /workspace/task.md            current-session brief
+#   /workspace/CLAUDE.md          worker role doc (persistent contract)
+#   /workspace/.claude/           creds + settings, staged at spawn
+#   /workspace/summary.md         prior-session memory (absent on first spawn)
+#   /workspace/inbox/             follow-up messages: msg_<unix_ts>.md
+#   /workspace/outputs/<slug>/    per-cycle deliverables, accumulate
+#   /workspace/research_log.md    accumulating narrative
+#   /workspace/scratch/           accumulating working memory
+#   /workspace/WAITING            set while idle; cleared while working
+#   /workspace/DONE               set on clean shutdown
 
 set -euo pipefail
 
-trap 'touch /workspace/DONE 2>/dev/null || true' EXIT
-
-# Restore home skel if volume hides image contents (first boot after docker cp).
+# Restore home skel if the worker's /home was shadowed by a first-boot volume.
 if [[ ! -f ~/.bashrc ]]; then
     cp -a /etc/worker-skel/. ~/
 fi
 
-# Copy creds from supervisor-staged location into the worker user's home.
-# Creds were placed by rs-worker spawn in /workspace/.claude/ before the
-# container was started. Claude Code's OAuth file is hidden (leading dot).
+# Stage creds + settings from the supervisor-written drop at /workspace/.claude/
+# into the worker user's home. Claude Code's OAuth file is a hidden file.
 if [[ -f /workspace/.claude/.credentials.json ]]; then
     mkdir -p ~/.claude
     cp /workspace/.claude/.credentials.json ~/.claude/.credentials.json
@@ -35,32 +43,52 @@ if [[ -f /workspace/.claude/settings.json ]]; then
 fi
 
 cd /workspace
+export PATH="$HOME/.local/bin:/opt/conda/bin:$PATH"
 
-# Fail loudly if the supervisor didn't stage a task.
+# Clear stale sentinels from a prior incarnation on this same bind-mount.
+rm -f /workspace/WAITING /workspace/DONE
+
+# Clean shutdown on SIGTERM / SIGINT: drop WAITING, leave DONE for the
+# supervisor's shutdown CLI to observe.
+trap 'rm -f /workspace/WAITING; touch /workspace/DONE; exit 0' TERM INT
+
+MCP_ARG=()
+if [[ -f /workspace/.mcp.json ]]; then
+    MCP_ARG=(--mcp-config /workspace/.mcp.json)
+fi
+
+run_claude() {
+    claude --print "$(cat "$1")" \
+        --output-format stream-json \
+        --verbose \
+        --permission-mode bypassPermissions \
+        "${MCP_ARG[@]}" \
+        >> /workspace/log.jsonl 2>&1 || true
+}
+
 if [[ ! -f /workspace/task.md ]]; then
-    echo "error: /workspace/task.md missing; spawn_worker did not stage the task." >&2
+    echo "error: /workspace/task.md missing; spawn did not stage the task." >&2
+    touch /workspace/DONE
     exit 2
 fi
 
 echo "=== Worker starting ==="
 echo "Task: $(head -n 1 /workspace/task.md)"
 
-# MCP config is optional — present only when the supervisor plumbed MCPs in
-# (Stage 2+). Stage 1 workers run without --mcp-config.
-MCP_ARG=()
-if [[ -f /workspace/.mcp.json ]]; then
-    MCP_ARG=(--mcp-config /workspace/.mcp.json)
-fi
+# Initial cycle: run the task from task.md, then enter the inbox poll loop.
+run_claude /workspace/task.md
+touch /workspace/WAITING
 
-# Execute Claude Code headless against the task. stream-json output goes to
-# log.jsonl for supervisor-side parsing. conda base env is on PATH so that
-# any subprocess Claude spawns (python, jupyter, papermill) resolves.
-export PATH="$HOME/.local/bin:/opt/conda/bin:$PATH"
-claude --print "$(cat /workspace/task.md)" \
-    --output-format stream-json \
-    --verbose \
-    --permission-mode bypassPermissions \
-    "${MCP_ARG[@]}" \
-    > /workspace/log.jsonl 2>&1 || true
-
-echo "=== Worker finished ==="
+# Poll inbox FIFO. File names are msg_<unix_ts>.md so lexical sort = temporal.
+# Process one at a time, serial only.
+mkdir -p /workspace/inbox
+while true; do
+    msg="$(ls /workspace/inbox/msg_*.md 2>/dev/null | sort | head -n 1 || true)"
+    if [[ -n "${msg:-}" ]]; then
+        rm -f /workspace/WAITING
+        run_claude "$msg"
+        rm -f "$msg"
+        touch /workspace/WAITING
+    fi
+    sleep 2
+done

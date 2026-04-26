@@ -3,15 +3,16 @@
 
 Claude Code Stop hook. Runs every time the supervisor's claude session
 is about to return control to the PI. Blocks the stop (exit 2) if any
-terminated-but-unaccepted worker's research_log.md has not been Read in
-this session's transcript.
+worker currently in a terminal runtime state (waiting / done / failed)
+has zero accepted cycles AND the session transcript shows no Read on
+its research_log.md.
+
+Scope: workers with a live container in the supervisor's inner docker
+daemon. Registry `down` / `destroyed_*` workers have no container and
+are naturally excluded.
 
 Reads JSON on stdin (standard Claude Code hook payload):
     { "transcript_path": "/path/to/session.jsonl", ... }
-
-Scope: all terminated-unaccepted workers in the supervisor's inner
-docker daemon, not just this session's spawns. Strictly stricter than
-session-scoped and avoids propagating session_id through container labels.
 """
 
 from __future__ import annotations
@@ -37,6 +38,20 @@ def _worker_dir(name: str) -> Path:
     return WORKSPACE / "workers" / name / "work"
 
 
+def _registry_path(name: str) -> Path:
+    return WORKSPACE / ".workers" / f"{name}.json"
+
+
+def _cycles_accepted(name: str) -> int:
+    p = _registry_path(name)
+    if not p.is_file():
+        return 0
+    try:
+        return len(json.loads(p.read_text()).get("cycles", []))
+    except json.JSONDecodeError:
+        return 0
+
+
 def _resolve_state(container, wdir: Path) -> str:
     state = container.status
     if state == "exited":
@@ -45,6 +60,10 @@ def _resolve_state(container, wdir: Path) -> str:
         if (wdir / "WAITING").exists():
             return "waiting"
         return "failed"
+    if state == "running":
+        if (wdir / "WAITING").exists():
+            return "waiting"
+        return "working"
     return state
 
 
@@ -64,7 +83,6 @@ def _read_in_transcript(transcript: Path, worker_name: str) -> bool:
 
 
 def main() -> None:
-    # Parse the hook payload. Be permissive: any parse error = no-op.
     try:
         payload = json.load(sys.stdin)
     except json.JSONDecodeError:
@@ -77,7 +95,6 @@ def main() -> None:
     if not transcript.is_file():
         sys.exit(0)
 
-    # Enumerate workers via the supervisor's inner docker daemon.
     try:
         cli = docker.from_env()
         containers = cli.containers.list(all=True, filters={"label": LABEL_WORKER})
@@ -96,7 +113,8 @@ def main() -> None:
         state = _resolve_state(c, wdir)
         if state not in TERMINAL_STATES:
             continue
-        if (wdir / ".accepted.json").is_file():
+        # Skip if the worker has ≥1 accepted cycle — first-cycle audit only.
+        if _cycles_accepted(bare) > 0:
             continue
         if not _read_in_transcript(transcript, bare):
             unread.append(bare)
@@ -104,10 +122,11 @@ def main() -> None:
     if unread:
         names = ", ".join(sorted(unread))
         print(
-            f"Unread research_log for terminated worker(s): {names}. "
+            f"Unread research_log for worker(s) in terminal state without any "
+            f"accepted cycle: {names}. "
             f"`cat /workspace/workers/<name>/work/research_log.md` for each, "
-            f"then `rs-worker finalize` + `rs-worker accept` (or `rs-worker message` / "
-            f"`rs-worker destroy + spawn` to iterate) before returning to the PI.",
+            f"then `rs-worker finalize --slug <slug>` + `rs-worker accept --slug <slug>` "
+            f"(or `rs-worker message` / `rs-worker destroy + spawn`) before returning to the PI.",
             file=sys.stderr,
         )
         sys.exit(2)
