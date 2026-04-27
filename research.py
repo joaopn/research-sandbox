@@ -37,6 +37,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Make cli/ helpers importable.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "cli"))
+import mcp_registry  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -51,6 +55,10 @@ DOCKER_VOLUME_PREFIX = "rs-docker-"
 PROJECT_NETWORK_PREFIX = "rs-net-"
 PROJECT_LABEL = "research.project"
 DIND_MODE_LABEL = "research.dind"
+MCP_CONTAINER_PREFIX = "rs-mcp-"
+MCP_LABEL = "research.mcp"
+MCP_NAME_LABEL = "research.mcp_name"
+PROBE_IMAGE = "busybox:1.36"
 
 # ---------------------------------------------------------------------------
 # Generic helpers
@@ -735,6 +743,264 @@ def cmd_project_ssh(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# MCP registry CLI (Stage 2.1)
+# ---------------------------------------------------------------------------
+
+
+def mcp_container_name_for(name: str) -> str:
+    return f"{MCP_CONTAINER_PREFIX}{name}"
+
+
+def projects_using_mcp(mcp_name: str) -> list[str]:
+    """Scan per-project allowlists for projects that allow this MCP. Stage 2.2
+    writes these files under ``<projects_dir>/<proj>/.mcp-allow.json``; in 2.1
+    they don't exist yet, so this returns []. Future-proof guard for `remove`."""
+    cfg = load_config()
+    root = Path(cfg.projects_dir).expanduser().resolve()
+    if not root.is_dir():
+        return []
+    out: list[str] = []
+    for p in sorted(root.iterdir()):
+        allow_file = p / ".mcp-allow.json"
+        if not allow_file.is_file():
+            continue
+        try:
+            data = json.loads(allow_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if isinstance(data, list) and mcp_name in data:
+            out.append(p.name)
+    return out
+
+
+def _parse_kv(items: list[str], flag: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for item in items:
+        if "=" not in item:
+            die(f"{flag} entry must be K=V, got {item!r}")
+        k, _, v = item.partition("=")
+        if not k:
+            die(f"{flag} entry has empty key: {item!r}")
+        out[k] = v
+    return out
+
+
+def _build_mcp_entry(args: argparse.Namespace) -> dict:
+    entry: dict = {"kind": args.kind, "transport": args.transport}
+    if args.kind == "external":
+        if args.host_port is None:
+            die("--host-port is required for --kind external")
+        entry["host_port"] = args.host_port
+        if args.host_address != "host.docker.internal":
+            entry["host_address"] = args.host_address
+        if args.header:
+            entry["headers"] = _parse_kv(args.header, "--header")
+    else:  # shared
+        if not args.image:
+            die("--image is required for --kind shared")
+        if args.port is None:
+            die("--port is required for --kind shared")
+        entry["image"] = args.image
+        entry["port"] = args.port
+        if args.env:
+            entry["env"] = _parse_kv(args.env, "--env")
+    return entry
+
+
+def _ensure_router_running() -> None:
+    if not container_running(ROUTER_CONTAINER):
+        die(f"{ROUTER_CONTAINER} is not running. Run `research start` first.")
+
+
+def _spawn_shared_mcp(name: str, entry: dict) -> None:
+    """Run the shared MCP container on rs-sandbox. Idempotent: skips if running."""
+    cname = mcp_container_name_for(name)
+    if container_running(cname):
+        return
+    if container_exists(cname):
+        run(["docker", "rm", "-f", cname], capture_output=True)
+    if not run_quiet(["docker", "image", "inspect", entry["image"]]):
+        print(f"pulling {entry['image']}...")
+        run_check(["docker", "pull", entry["image"]])
+    cmd = [
+        "docker", "run", "-d",
+        "--name", cname,
+        "--network", ROUTER_NETWORK,
+        "--restart", "unless-stopped",
+        "--label", f"{MCP_LABEL}=1",
+        "--label", f"{MCP_NAME_LABEL}={name}",
+    ]
+    for k, v in entry.get("env", {}).items():
+        cmd += ["-e", f"{k}={v}"]
+    cmd += [entry["image"]]
+    run_check(cmd)
+    print(f"started {cname}")
+
+
+def cmd_mcp_add(args: argparse.Namespace) -> None:
+    entry = _build_mcp_entry(args)
+    with mcp_registry.lock():
+        try:
+            data = mcp_registry.load(expand=False)
+        except mcp_registry.RegistryError as e:
+            die(str(e))
+        if args.name in data["mcps"]:
+            die(f"MCP {args.name!r} already registered; remove first")
+        data["mcps"][args.name] = entry
+        try:
+            mcp_registry.save_atomic(data)
+        except mcp_registry.RegistryError as e:
+            die(str(e))
+    if entry["kind"] == "shared":
+        _ensure_router_running()
+        try:
+            resolved = mcp_registry.entry_for(args.name)  # expanded
+        except mcp_registry.RegistryError as e:
+            die(f"failed to resolve env vars for {args.name!r}: {e}\n"
+                f"(registry entry saved; set the variable then run "
+                f"`research mcp spawn {args.name}`)")
+        assert resolved is not None
+        _spawn_shared_mcp(args.name, resolved)
+    print(f"added MCP {args.name!r} ({entry['kind']})")
+
+
+def cmd_mcp_list(args: argparse.Namespace) -> None:
+    try:
+        data = mcp_registry.load(expand=False)
+    except mcp_registry.RegistryError as e:
+        die(str(e))
+    if args.json:
+        out: dict = {"version": data["version"], "mcps": {}}
+        for name, e in data["mcps"].items():
+            row = dict(e)
+            if e["kind"] == "shared":
+                row["running"] = container_running(mcp_container_name_for(name))
+            out["mcps"][name] = row
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return
+    rows: list[tuple[str, ...]] = []
+    for name, e in sorted(data["mcps"].items()):
+        kind = e["kind"]
+        if kind == "external":
+            target = f"{e.get('host_address', 'host.docker.internal')}:{e['host_port']}"
+            status = "-"
+        else:
+            cname = mcp_container_name_for(name)
+            target = f"{cname}:{e['port']}"
+            status = "running" if container_running(cname) else "stopped"
+        rows.append((name, kind, e["transport"], target, status))
+    if not rows:
+        print("(no MCPs registered)")
+        return
+    headers = ("NAME", "KIND", "TRANSPORT", "TARGET", "STATUS")
+    cols = list(zip(*([headers] + rows)))
+    widths = [max(len(str(v)) for v in col) for col in cols]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    print(fmt.format(*headers))
+    for r in rows:
+        print(fmt.format(*r))
+
+
+def cmd_mcp_remove(args: argparse.Namespace) -> None:
+    in_use = projects_using_mcp(args.name)
+    if in_use and not args.force:
+        die(f"MCP {args.name!r} is currently allowed for projects: "
+            f"{', '.join(in_use)}.\n"
+            f"  Run `research project mcp-deny <proj> {args.name}` for each, "
+            f"or pass --force.")
+    with mcp_registry.lock():
+        try:
+            data = mcp_registry.load(expand=False)
+        except mcp_registry.RegistryError as e:
+            die(str(e))
+        if args.name not in data["mcps"]:
+            die(f"no MCP named {args.name!r}")
+        entry = data["mcps"].pop(args.name)
+        try:
+            mcp_registry.save_atomic(data)
+        except mcp_registry.RegistryError as e:
+            die(str(e))
+    if entry["kind"] == "shared":
+        cname = mcp_container_name_for(args.name)
+        if container_exists(cname):
+            run(["docker", "rm", "-f", cname], capture_output=True)
+    print(f"removed MCP {args.name!r}")
+
+
+def cmd_mcp_spawn(args: argparse.Namespace) -> None:
+    try:
+        entry = mcp_registry.entry_for(args.name)
+    except mcp_registry.RegistryError as e:
+        die(str(e))
+    if entry is None:
+        die(f"no MCP named {args.name!r}")
+    if entry["kind"] != "shared":
+        die(f"`spawn` only applies to shared MCPs (got kind={entry['kind']!r})")
+    _ensure_router_running()
+    _spawn_shared_mcp(args.name, entry)
+
+
+def cmd_mcp_stop(args: argparse.Namespace) -> None:
+    try:
+        entry = mcp_registry.entry_for(args.name, expand=False)
+    except mcp_registry.RegistryError as e:
+        die(str(e))
+    if entry is None:
+        die(f"no MCP named {args.name!r}")
+    if entry["kind"] != "shared":
+        die(f"`stop` only applies to shared MCPs (got kind={entry['kind']!r})")
+    cname = mcp_container_name_for(args.name)
+    if not container_running(cname):
+        print(f"{cname} not running")
+        return
+    run_check(["docker", "stop", cname])
+    print(f"stopped {cname}")
+
+
+def cmd_mcp_test(args: argparse.Namespace) -> None:
+    try:
+        entry = mcp_registry.entry_for(args.name)
+    except mcp_registry.RegistryError as e:
+        die(str(e))
+    if entry is None:
+        die(f"no MCP named {args.name!r}")
+    _ensure_router_running()
+    if entry["kind"] == "external":
+        host = entry.get("host_address", "host.docker.internal")
+        port = entry["host_port"]
+        cmd = [
+            "docker", "run", "--rm",
+            "--network", ROUTER_NETWORK,
+            "--add-host", "host.docker.internal:host-gateway",
+            PROBE_IMAGE,
+            "nc", "-z", "-w", "5", host, str(port),
+        ]
+    else:
+        cname = mcp_container_name_for(args.name)
+        if not container_running(cname):
+            die(f"shared MCP container {cname} not running "
+                f"(try: research mcp spawn {args.name})")
+        cmd = [
+            "docker", "run", "--rm",
+            "--network", ROUTER_NETWORK,
+            PROBE_IMAGE,
+            "nc", "-z", "-w", "5", cname, str(entry["port"]),
+        ]
+    r = run(cmd, capture_output=True)
+    if r.returncode == 0:
+        print(f"{args.name}: reachable")
+        return
+    msg = (r.stderr or r.stdout).strip()
+    print(f"{args.name}: unreachable" + (f"\n{msg}" if msg else ""), file=sys.stderr)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="research", description="Research Sandbox CLI")
     sub = p.add_subparsers(dest="command", required=True)
@@ -788,6 +1054,52 @@ def build_parser() -> argparse.ArgumentParser:
     sh = proj_sub.add_parser("ssh", help="print SSH connection info")
     sh.add_argument("name")
     sh.set_defaults(func=cmd_project_ssh)
+
+    # ----- MCP registry (Stage 2.1) -------------------------------------
+    mcp = sub.add_parser("mcp", help="MCP registry operations")
+    mcp_sub = mcp.add_subparsers(dest="subcommand", required=True)
+
+    a = mcp_sub.add_parser("add", help="register an MCP and (for shared) start its container")
+    a.add_argument("name")
+    a.add_argument("--kind", choices=("external", "shared"), required=True)
+    a.add_argument("--transport", choices=("http", "sse"), default="http")
+    a.add_argument("--host-port", type=int,
+                   help="(external) port on the host the supervisor will reach via host.docker.internal")
+    a.add_argument("--host-address", default="host.docker.internal",
+                   help="(external) override host_address (default: host.docker.internal)")
+    a.add_argument("--header", action="append", default=[],
+                   metavar="K=V",
+                   help="(external) HTTP header to inject (repeatable)")
+    a.add_argument("--image",
+                   help="(shared) docker image of the MCP server")
+    a.add_argument("--port", type=int,
+                   help="(shared) port the MCP listens on inside its container")
+    a.add_argument("--env", action="append", default=[],
+                   metavar="K=V",
+                   help="(shared) env var passed to the MCP container (repeatable)")
+    a.set_defaults(func=cmd_mcp_add)
+
+    ml = mcp_sub.add_parser("list", help="list registered MCPs")
+    ml.add_argument("--json", action="store_true")
+    ml.set_defaults(func=cmd_mcp_list)
+
+    mr = mcp_sub.add_parser("remove", help="remove MCP from registry (and stop its container)")
+    mr.add_argument("name")
+    mr.add_argument("--force", action="store_true",
+                    help="remove even if projects currently allow it (Stage 2.2 state)")
+    mr.set_defaults(func=cmd_mcp_remove)
+
+    msp = mcp_sub.add_parser("spawn", help="(shared) start the MCP container")
+    msp.add_argument("name")
+    msp.set_defaults(func=cmd_mcp_spawn)
+
+    mst = mcp_sub.add_parser("stop", help="(shared) stop the MCP container without removing the registry entry")
+    mst.add_argument("name")
+    mst.set_defaults(func=cmd_mcp_stop)
+
+    mts = mcp_sub.add_parser("test", help="probe reachability of an MCP")
+    mts.add_argument("name")
+    mts.set_defaults(func=cmd_mcp_test)
 
     return p
 
