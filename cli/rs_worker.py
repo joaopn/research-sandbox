@@ -126,6 +126,16 @@ def _skeleton_research_log(name: str) -> str:
     return f"# Research log — {name}\n\n(Worker will populate this during the run.)\n"
 
 
+def _inbox_has_unread(wdir: Path) -> bool:
+    inbox = wdir / "inbox"
+    if not inbox.is_dir():
+        return False
+    return any(
+        p.name.startswith("msg_") and p.suffix == ".md"
+        for p in inbox.iterdir()
+    )
+
+
 def _resolve_state(container, wdir: Path) -> str:
     """Map docker container.status + sentinel files to a runtime state.
 
@@ -140,6 +150,11 @@ def _resolve_state(container, wdir: Path) -> str:
             return "waiting"
         return "failed"
     if state == "running":
+        # A pending inbox message means work is in flight (or imminent), even
+        # if WAITING is still up from the prior cycle. Without this, `wait`
+        # called immediately after `message` can return prematurely.
+        if _inbox_has_unread(wdir):
+            return "working"
         if (wdir / "WAITING").exists():
             return "waiting"
         return "working"
@@ -418,6 +433,16 @@ def cmd_spawn(args: argparse.Namespace) -> None:
         else:
             registry_write_atomic(args.name, existing)  # type: ignore[arg-type]
         die(f"docker run failed: {e}")
+
+    # Promote: a draft proposal at plan/draft/<name>.md has now been promoted
+    # to the canonical plan/<name>.md by the write above. Remove the draft so
+    # `ls plan/draft/` only shows un-spawned proposals.
+    draft_plan = WORKSPACE / "plan" / "draft" / f"{args.name}.md"
+    if draft_plan.is_file():
+        try:
+            draft_plan.unlink()
+        except OSError:
+            pass
 
     _print_json({
         "name": args.name,
@@ -1028,6 +1053,24 @@ def cmd_accept(args: argparse.Namespace) -> None:
                 print(f"rs-worker: accept check failed: {msg}", file=sys.stderr)
             sys.exit(1)
 
+    # Plan must exist before any state mutation: every accepted cycle gets a
+    # snapshot alongside its deliverable so plans aren't lost on respawn.
+    canonical_plan = WORKSPACE / "plan" / f"{args.name}.md"
+    if not canonical_plan.is_file():
+        die(
+            f"canonical plan {canonical_plan} is missing; cannot snapshot it "
+            f"into the cycle bundle. Restore the plan or rewrite it before "
+            f"retrying accept."
+        )
+
+    # Reserve plan.md at the cycle root for the snapshot.
+    if (slug_dir / "plan.md").is_file():
+        die(
+            f"outputs/{args.slug}/plan.md is reserved for the harness-written "
+            f"plan snapshot; rename the worker's file (e.g. cycle_plan.md) and "
+            f"retry."
+        )
+
     # Copy deliverable into results/<name>/<NNN>_<slug>/.
     ordinal = len(reg.get("cycles", [])) + 1
     result_subdir = results_dir(args.name) / f"{ordinal:03d}_{args.slug}"
@@ -1036,6 +1079,7 @@ def cmd_accept(args: argparse.Namespace) -> None:
         # Should not happen (ordinal/slug pair unique by construction); still fail loud.
         die(f"results path already exists: {result_subdir}")
     shutil.copytree(slug_dir, result_subdir)
+    shutil.copy2(canonical_plan, result_subdir / "plan.md")
 
     # Drop the staging symlink.
     sl.unlink()

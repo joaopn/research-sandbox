@@ -52,6 +52,16 @@ def _cycles_accepted(name: str) -> int:
         return 0
 
 
+def _inbox_has_unread(wdir: Path) -> bool:
+    inbox = wdir / "inbox"
+    if not inbox.is_dir():
+        return False
+    return any(
+        p.name.startswith("msg_") and p.suffix == ".md"
+        for p in inbox.iterdir()
+    )
+
+
 def _resolve_state(container, wdir: Path) -> str:
     state = container.status
     if state == "exited":
@@ -61,6 +71,10 @@ def _resolve_state(container, wdir: Path) -> str:
             return "waiting"
         return "failed"
     if state == "running":
+        # Mirror rs_worker._resolve_state: a queued inbox message means the
+        # worker is about to be `working`, even if WAITING is still up.
+        if _inbox_has_unread(wdir):
+            return "working"
         if (wdir / "WAITING").exists():
             return "waiting"
         return "working"

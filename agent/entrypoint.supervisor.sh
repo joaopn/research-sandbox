@@ -45,7 +45,7 @@ if [[ "$(stat -c %U /workspace)" != "research" ]]; then
     sudo chown research:research /workspace 2>/dev/null || true
 fi
 mkdir -p /workspace/.claude /workspace/.orchestrator/logs \
-         /workspace/plan /workspace/plan/archive \
+         /workspace/plan /workspace/plan/draft /workspace/plan/archive \
          /workspace/logbook/supervisor /workspace/logbook/pi \
          /workspace/shared /workspace/workers \
          /workspace/.workers /workspace/staging /workspace/results

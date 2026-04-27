@@ -37,10 +37,11 @@ Worker names are **project-permanent** once used, including after `rs-worker des
 ## Filesystem conventions
 
 - `/workspace/shared/data/` — project input data, read-only. Never write here.
-- `/workspace/plan/<name>.md` — the active plan for worker `<name>`. Authored by you, reviewed by the PI, copied verbatim into the worker's `task.md` at spawn time. Rewritten on each respawn. Archived to `plan/archive/<name>.md` only on `rs-worker destroy`.
+- `/workspace/plan/draft/<name>.md` — proposal you wrote, **not yet PI-approved**. The only place you ever write a worker's plan. Auto-removed by `rs-worker spawn` once the plan has been promoted to canonical.
+- `/workspace/plan/<name>.md` — canonical plan for live or down workers, reflecting what the worker is currently doing. **Written only by `rs-worker spawn`** (from the file you pass to `--plan`). Never edit by hand: rewriting this file before approval destroys the prior canonical plan with no undo. Archived to `plan/archive/<name>.md` only on `rs-worker destroy`.
 - `/workspace/.workers/<name>.json` — registry entry. Read-only for you. See *Worker registry schema* below.
 - `/workspace/staging/<name>` — symlink into `workers/<name>/work/outputs/<slug>/` when a cycle is pending PI review. Created by `rs-worker finalize`, removed by `rs-worker accept` or `rs-worker unstage`.
-- `/workspace/results/<name>/<NNN>_<slug>/` — the PI-visible, accepted deliverables. Ordinals count accepted cycles (zero-padded, 3 digits). Created by `rs-worker accept`.
+- `/workspace/results/<name>/<NNN>_<slug>/` — the PI-visible, accepted deliverables. Ordinals count accepted cycles (zero-padded, 3 digits). Created by `rs-worker accept`. Each cycle bundle includes a `plan.md` snapshot (the canonical plan as it was at spawn time) so the PI can drill into a single dir and see both the question and its deliverable.
 - `/workspace/logbook/supervisor/<YYYY-MM-DD>-<HHMM>.md` — one per `/log` invocation. Chronological, detailed; this is your cold-resume memory.
 - `/workspace/logbook/pi/<YYYY-MM-DD>-<slug>.md` — one per coherent topic covered in a session. Executive; what the PI reads.
 - `/workspace/workers/<name>/work/` — a worker's sandbox, bind-mounted as `/workspace` inside the worker. You read these directly; you do not write into them by hand except via `rs-worker message`.
@@ -97,7 +98,21 @@ These are derived at query time from docker + sentinels; they are **not** stored
 
 ## Planning protocol
 
-For each worker, write `/workspace/plan/<name>.md` with four required top-level sections (the harness validates them; `rs-worker spawn` refuses a plan that is missing any):
+Plans are author-then-approve-then-spawn. There are two states:
+
+- **Draft** — `plan/draft/<name>.md`. Where every plan you write goes first. Drafts are PI-visible but not yet authoritative.
+- **Canonical** — `plan/<name>.md`. The plan a live or down worker is bound to. Only `rs-worker spawn` writes here; you never do.
+
+Flow:
+
+1. Write the proposal to `/workspace/plan/draft/<name>.md` with the four required sections below.
+2. Show the PI the path. Wait for an explicit "go", "yes", "approved", or equivalent. Do not infer approval from silence.
+3. On approval: `rs-worker spawn <name> --plan /workspace/plan/draft/<name>.md`. The harness reads the draft, copies it to `plan/<name>.md`, copies it again into the worker's `task.md`, then deletes the draft.
+4. On rejection: edit or delete `plan/draft/<name>.md` and revise. The canonical plan (if any — for a `down` worker awaiting respawn) is untouched.
+
+**Never write directly to `plan/<name>.md`.** That path is harness-owned. Editing it bypasses the approval gate and overwrites the prior canonical plan with no undo. The `accept` command snapshots `plan/<name>.md` into `results/<name>/<NNN>_<slug>/plan.md` — accepted cycle bundles preserve the plan that produced them, so respawn-overwrites of the canonical plan no longer lose history.
+
+The four required top-level sections (the harness validates them; `rs-worker spawn` refuses a plan that is missing any):
 
 ```
 ## Question
@@ -125,8 +140,6 @@ before returning to WAITING.
 
 Extra sections are allowed. The four above are mandatory.
 
-**Show the plan to the PI before spawning.** Paste the file path and let the PI open it. Wait for an explicit "go", "yes", "approved", or equivalent. Do not infer approval from silence.
-
 ## Slug choice
 
 Each cycle needs a **slug** — a kebab-case identifier (`column-summary-recovered`, `median-iqr-followup`, `distribution-shape`) that names this cycle's facet. The slug appears in three places:
@@ -145,12 +158,12 @@ Rules:
 ## Spawning
 
 ```bash
-rs-worker spawn <name> --plan /workspace/plan/<name>.md \
+rs-worker spawn <name> --plan /workspace/plan/draft/<name>.md \
     [--image rs-analysis-base:latest] \
     [--data-mount /some/extra/path]
 ```
 
-`--plan` is **mandatory**. `/workspace/shared/` is auto-mounted RO into every worker — `--data-mount` is only for paths outside `/workspace/shared/` (rare).
+`--plan` is **mandatory** and points at the PI-approved draft (see *Planning protocol*); the harness promotes it to canonical and removes the draft. `/workspace/shared/` is auto-mounted RO into every worker — `--data-mount` is only for paths outside `/workspace/shared/` (rare).
 
 **One worker per thematic question.** Parallel facets of one PI question → multiple workers, all spawned before the first `rs-worker wait`. They run in parallel in the inner docker daemon.
 
@@ -255,7 +268,7 @@ Each PI topic log's header must include:
 ## Worker-lifecycle cheat sheet
 
 ```bash
-rs-worker spawn <name> --plan <path> [--image IMAGE] [--data-mount PATH]…   # implicit respawn on `down`
+rs-worker spawn <name> --plan plan/draft/<name>.md [--image IMAGE] [--data-mount PATH]…   # promotes draft → canonical; implicit respawn on `down`
 rs-worker list [--all]                          # default: live only; --all: include down/destroyed
 rs-worker history                               # dump every registry entry by created_at
 rs-worker status <name>                         # container + registry + log tail
@@ -294,6 +307,7 @@ At the start of each new session, skim the most-recent `logbook/supervisor/*.md`
 
 - **You do not do analysis yourself.** Writing briefs, reading deliverables, judging, synthesizing — yes. Running `pandas`, computing statistics, training models — no; that's for workers.
 - **You do not edit `/workspace/workers/<name>/work/` by hand.** Exceptions: `rs-worker message` (writes to `inbox/`). No manual edits to `summary.md`, `research_log.md`, `outputs/*`.
+- **You do not write to `/workspace/plan/<name>.md` directly.** Drafts go in `plan/draft/<name>.md`; `rs-worker spawn` is the only writer of canonical plans.
 - **You do not manipulate `/workspace/.workers/*.json` by hand.** The harness owns the registry.
 - **You do not invoke raw `docker` commands for workers** — use `rs-worker`.
 - No git, no direct web access from this container.
