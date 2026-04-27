@@ -48,6 +48,7 @@ import mcp_registry  # noqa: E402
 SCRIPT_DIR = Path(__file__).resolve().parent
 SUPERVISOR_IMAGE = "rs-supervisor:latest"
 ANALYSIS_IMAGE = "rs-analysis-base:latest"
+MCP_PROXY_IMAGE = "rs-mcp-proxy:latest"
 ROUTER_CONTAINER = "rs-router"
 ROUTER_NETWORK = "rs-sandbox"
 CONTAINER_PREFIX = "rs-project-"
@@ -386,6 +387,7 @@ def build_supervisor_docker_args(
         "--name", container_name,
         "--hostname", project,
         "--network", network,
+        "--add-host", "host.docker.internal:host-gateway",
         "-v", f"{workspace_path}:/workspace",
         "-p", f"{ssh_port}:22",
         "-e", f"PROJECT={project}",
@@ -437,10 +439,11 @@ def _preflight() -> None:
 
 
 def _build_images(force: bool) -> None:
-    """Build supervisor + worker images. Skip existing ones unless --rebuild."""
+    """Build supervisor + worker + mcp-proxy images. Skip existing ones unless --rebuild."""
     specs = [
         (SUPERVISOR_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.supervisor"),
         (ANALYSIS_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.analysis-base"),
+        (MCP_PROXY_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.mcp-proxy"),
     ]
     for tag, dockerfile in specs:
         if not force and run_quiet(["docker", "image", "inspect", tag]):
@@ -460,8 +463,15 @@ def cmd_start(args: argparse.Namespace) -> None:
     _preflight()
     _build_images(force=args.rebuild)
     print("starting router...")
-    run_check(["docker", "compose", "-f", str(SCRIPT_DIR / "docker-compose.yml"),
-               "up", "-d", "router"])
+    compose_up = ["docker", "compose", "-f", str(SCRIPT_DIR / "docker-compose.yml"),
+                  "up", "-d"]
+    # When the user asks for a rebuild, force-rebuild the router image too —
+    # otherwise compose reuses the cached image and edits to router/scripts/
+    # or router/Dockerfile silently don't reach the running container.
+    if args.rebuild:
+        compose_up.append("--build")
+    compose_up.append("router")
+    run_check(compose_up)
     print("up.")
 
 
@@ -522,6 +532,10 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     if dind_mode == "privileged" and not volume_exists(docker_volume_name_for(project)):
         run_check(["docker", "volume", "create", docker_volume_name_for(project)])
 
+    # 1b. Materialize the MCP bind-mount sources so docker doesn't auto-create
+    #     directories where the supervisor expects JSON files.
+    ensure_mcp_files(project, cfg)
+
     # 2. Per-project network + router wiring.
     network, router_ip = ensure_project_network(project, egress)
 
@@ -550,9 +564,16 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     inject_route(container_name, router_ip)
 
     # 6. Wait for inner dockerd (started by the entrypoint), then push the
-    #    analysis worker image.
+    #    analysis worker image and the mcp-proxy image into it.
     wait_for_inner_dockerd(container_name)
     stage_worker_image(container_name, ANALYSIS_IMAGE)
+    stage_worker_image(container_name, MCP_PROXY_IMAGE)
+
+    # 6b. The supervisor entrypoint runs mcp-reload at boot, but on first
+    #     create that fires before stage_worker_image has staged the proxy
+    #     image. Re-run it now so the proxy actually comes up.
+    run(["docker", "exec", container_name, "/usr/local/bin/mcp-reload"],
+        capture_output=True)
 
     # 7. Report.
     print(f"""
@@ -716,6 +737,21 @@ def cmd_project_destroy(args: argparse.Namespace) -> None:
         print("aborted.")
         return
 
+    # Clean up any per-project MCP rules in the router so iptables doesn't
+    # accumulate orphan ACCEPTs after the project network is gone.
+    if network_exists(network) and container_running(ROUTER_CONTAINER):
+        try:
+            subnet = get_network_subnet(network)
+        except SystemExit:
+            subnet = ""
+        for ent in load_project_allowlist(project, cfg):
+            ip = ent.get("ip")
+            port = ent.get("port")
+            if subnet and isinstance(ip, str) and isinstance(port, int):
+                run(["docker", "exec", ROUTER_CONTAINER,
+                     "/scripts/mcp-deny.sh", subnet, ip, str(port)],
+                    capture_output=True)
+
     run(["docker", "rm", "-f", container], capture_output=True)
     if project_root.exists():
         shutil.rmtree(project_root, ignore_errors=True)
@@ -753,9 +789,7 @@ def mcp_container_name_for(name: str) -> str:
 
 
 def projects_using_mcp(mcp_name: str) -> list[str]:
-    """Scan per-project allowlists for projects that allow this MCP. Stage 2.2
-    writes these files under ``<projects_dir>/<proj>/.mcp-allow.json``; in 2.1
-    they don't exist yet, so this returns []. Future-proof guard for `remove`."""
+    """Scan per-project allowlists for projects that allow this MCP."""
     cfg = load_config()
     root = Path(cfg.projects_dir).expanduser().resolve()
     if not root.is_dir():
@@ -769,9 +803,85 @@ def projects_using_mcp(mcp_name: str) -> list[str]:
             data = json.loads(allow_file.read_text())
         except (json.JSONDecodeError, OSError):
             continue
-        if isinstance(data, list) and mcp_name in data:
-            out.append(p.name)
+        if not isinstance(data, list):
+            continue
+        for e in data:
+            if isinstance(e, dict) and e.get("name") == mcp_name:
+                out.append(p.name)
+                break
     return out
+
+
+def project_allowlist_path(project: str, cfg: "Config") -> Path:
+    """Per-project MCP allowlist. Lives INSIDE the workspace (which is the
+    only thing the supervisor bind-mounts) so atomic-rename writes by
+    research.py are visible to the supervisor immediately. A single-file
+    bind-mount would pin the original inode and silently make replacements
+    invisible to the container."""
+    return workspace_path_for(project, cfg) / ".orchestrator" / "mcp-allow.json"
+
+
+def ensure_mcp_files(project: str, cfg: "Config") -> None:
+    """Initialize the host-side mcp registry (if missing) and an empty
+    per-project allowlist. The registry is host-only state; the supervisor
+    never reads it directly — every datum it needs lives in the allowlist
+    entry written at `mcp-allow` time."""
+    if not mcp_registry.REGISTRY_PATH.is_file():
+        mcp_registry.REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
+        mcp_registry.save_atomic(mcp_registry.empty())
+    allow = project_allowlist_path(project, cfg)
+    if not allow.is_file():
+        allow.parent.mkdir(parents=True, exist_ok=True)
+        allow.write_text("[]\n")
+
+
+def resolve_host_gateway() -> str:
+    """Numeric IP for `host.docker.internal` from a container on the host's
+    docker daemon. Used to translate `external` MCP destinations to numeric
+    IPs in per-project allowlists, so the supervisor's inner-daemon proxy
+    can reach them via the existing rs-router path."""
+    r = run_check([
+        "docker", "run", "--rm",
+        "--add-host=host.docker.internal:host-gateway",
+        "alpine:3.20", "getent", "hosts", "host.docker.internal",
+    ])
+    out = r.stdout.strip()
+    if not out:
+        die("could not resolve host.docker.internal via host-gateway")
+    return out.split()[0]
+
+
+def mcp_container_ip(name: str) -> str:
+    cname = mcp_container_name_for(name)
+    r = run_check([
+        "docker", "inspect", cname, "-f",
+        '{{(index .NetworkSettings.Networks "' + ROUTER_NETWORK + '").IPAddress}}',
+    ])
+    ip = r.stdout.strip()
+    if not ip:
+        die(f"could not resolve {cname}'s IP on {ROUTER_NETWORK}")
+    return ip
+
+
+def load_project_allowlist(project: str, cfg: "Config") -> list[dict]:
+    p = project_allowlist_path(project, cfg)
+    if not p.is_file():
+        return []
+    try:
+        data = json.loads(p.read_text())
+    except json.JSONDecodeError as e:
+        die(f"allowlist {p} is invalid JSON: {e}")
+    if not isinstance(data, list):
+        die(f"allowlist {p} must be a JSON array")
+    return [e for e in data if isinstance(e, dict)]
+
+
+def save_project_allowlist(project: str, cfg: "Config", entries: list[dict]) -> None:
+    p = project_allowlist_path(project, cfg)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(entries, indent=2, sort_keys=True) + "\n")
+    tmp.replace(p)
 
 
 def _parse_kv(items: list[str], flag: str) -> dict[str, str]:
@@ -996,6 +1106,100 @@ def cmd_mcp_test(args: argparse.Namespace) -> None:
     sys.exit(1)
 
 
+def _supervisor_mcp_reload(container_name: str) -> None:
+    """Re-render the supervisor's proxy config and SIGHUP the proxy."""
+    if not container_running(container_name):
+        return
+    r = run(["docker", "exec", container_name, "/usr/local/bin/mcp-reload"],
+            capture_output=True)
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout).strip()
+        print(f"warning: mcp-reload in {container_name} failed: {msg}",
+              file=sys.stderr)
+
+
+def cmd_project_mcp_allow(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    project = args.project
+    mcp_name = args.mcp
+
+    container_name = container_name_for(project)
+    if not container_exists(container_name):
+        die(f"project {project!r} does not exist")
+    if not container_running(ROUTER_CONTAINER):
+        die(f"{ROUTER_CONTAINER} is not running. Run `research start` first.")
+
+    try:
+        entry = mcp_registry.entry_for(mcp_name)
+    except mcp_registry.RegistryError as e:
+        die(str(e))
+    if entry is None:
+        die(f"no MCP named {mcp_name!r}; register with `research mcp add` first")
+
+    if entry["kind"] == "external":
+        host_addr = entry.get("host_address", "host.docker.internal")
+        ip = resolve_host_gateway() if host_addr == "host.docker.internal" else host_addr
+        port = entry["host_port"]
+    else:  # shared
+        cname = mcp_container_name_for(mcp_name)
+        if not container_running(cname):
+            die(f"shared MCP container {cname} not running; "
+                f"run `research mcp spawn {mcp_name}` first")
+        ip = mcp_container_ip(mcp_name)
+        port = entry["port"]
+
+    network = project_network_for(project)
+    subnet = get_network_subnet(network)
+    run_check(["docker", "exec", ROUTER_CONTAINER,
+               "/scripts/mcp-allow.sh", subnet, ip, str(port)])
+
+    allowlist = load_project_allowlist(project, cfg)
+    allowlist = [e for e in allowlist if e.get("name") != mcp_name]
+    new_entry = {
+        "name": mcp_name,
+        "kind": entry["kind"],
+        "transport": entry.get("transport", "http"),
+        "ip": ip,
+        "port": port,
+    }
+    if entry.get("headers"):
+        new_entry["headers"] = entry["headers"]
+    allowlist.append(new_entry)
+    save_project_allowlist(project, cfg, allowlist)
+
+    _supervisor_mcp_reload(container_name)
+    print(f"allowed {mcp_name!r} for project {project!r} -> {ip}:{port}")
+
+
+def cmd_project_mcp_deny(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    project = args.project
+    mcp_name = args.mcp
+
+    container_name = container_name_for(project)
+    if not container_exists(container_name):
+        die(f"project {project!r} does not exist")
+
+    allowlist = load_project_allowlist(project, cfg)
+    target = next((e for e in allowlist if e.get("name") == mcp_name), None)
+    if target is None:
+        die(f"{mcp_name!r} is not currently allowed for project {project!r}")
+
+    network = project_network_for(project)
+    if network_exists(network) and container_running(ROUTER_CONTAINER):
+        subnet = get_network_subnet(network)
+        run(["docker", "exec", ROUTER_CONTAINER,
+             "/scripts/mcp-deny.sh", subnet,
+             str(target.get("ip", "")), str(target.get("port", ""))],
+            capture_output=True)
+
+    allowlist = [e for e in allowlist if e.get("name") != mcp_name]
+    save_project_allowlist(project, cfg, allowlist)
+
+    _supervisor_mcp_reload(container_name)
+    print(f"denied {mcp_name!r} for project {project!r}")
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -1054,6 +1258,18 @@ def build_parser() -> argparse.ArgumentParser:
     sh = proj_sub.add_parser("ssh", help="print SSH connection info")
     sh.add_argument("name")
     sh.set_defaults(func=cmd_project_ssh)
+
+    pma = proj_sub.add_parser("mcp-allow",
+                              help="grant a project access to a registered MCP")
+    pma.add_argument("project")
+    pma.add_argument("mcp")
+    pma.set_defaults(func=cmd_project_mcp_allow)
+
+    pmd = proj_sub.add_parser("mcp-deny",
+                              help="revoke a project's access to a registered MCP")
+    pmd.add_argument("project")
+    pmd.add_argument("mcp")
+    pmd.set_defaults(func=cmd_project_mcp_deny)
 
     # ----- MCP registry (Stage 2.1) -------------------------------------
     mcp = sub.add_parser("mcp", help="MCP registry operations")

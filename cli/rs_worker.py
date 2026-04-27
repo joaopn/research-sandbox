@@ -45,6 +45,10 @@ LABEL_TYPE = "research.worker_type"
 LABEL_MOUNTS = "research.data_mounts"
 LABEL_CREATED = "research.created_at"
 LABEL_INTERACTIVE = "research.interactive"
+LABEL_MCPS = "research.mcps"
+
+INNER_NETWORK = "rs-inner"
+ALLOWLIST_PATH = Path("/workspace/.orchestrator/mcp-allow.json")
 
 # Plan / accept / finalize contract.
 PLAN_SECTIONS = ("Question", "Inputs", "Deliverables", "Verification")
@@ -228,6 +232,57 @@ def registry_all() -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 
 
+def _parse_mcps_arg(raw: str) -> list[str]:
+    return [m.strip() for m in (raw or "").split(",") if m.strip()]
+
+
+def _write_mcp_config(wdir: Path, requested: list[str]) -> str:
+    """Validate `requested` against the per-project allowlist, write the
+    worker's .mcp.json (each entry pointed at the supervisor's mcp-proxy on
+    rs-inner), and return a label-friendly comma-joined name list. With no
+    requested MCPs we leave any pre-existing .mcp.json alone (a respawn may
+    have one already). Each allowlist entry already carries `transport`, so
+    we don't need to read the host registry."""
+    if not requested:
+        return ""
+
+    if not ALLOWLIST_PATH.is_file():
+        die(f"--mcps requested but {ALLOWLIST_PATH} missing; "
+            "this project predates Stage 2.2 — destroy and recreate it.")
+
+    try:
+        allow_entries = json.loads(ALLOWLIST_PATH.read_text())
+    except json.JSONDecodeError as e:
+        die(f"{ALLOWLIST_PATH} invalid JSON: {e}")
+    if not isinstance(allow_entries, list):
+        die(f"{ALLOWLIST_PATH} must be a JSON array")
+
+    by_name: dict[str, dict] = {}
+    for e in allow_entries:
+        if isinstance(e, dict) and isinstance(e.get("name"), str):
+            by_name[e["name"]] = e
+
+    unknown = [n for n in requested if n not in by_name]
+    if unknown:
+        die(
+            f"these MCPs are not allowed for this project: {', '.join(unknown)}\n"
+            f"  allowed: {', '.join(sorted(by_name)) or '(none)'}\n"
+            f"  fix: run `research project mcp-allow <project> <mcp>` on the host."
+        )
+
+    cfg = {
+        "mcpServers": {
+            name: {
+                "type": by_name[name].get("transport", "http"),
+                "url": f"http://mcp-proxy:8888/{name}",
+            }
+            for name in requested
+        }
+    }
+    (wdir / ".mcp.json").write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
+    return ",".join(requested)
+
+
 def _stage_workdir(name: str, plan_text: str, fresh: bool) -> Path:
     """Stage workdir for (fresh or respawned) worker. Returns workdir path."""
     wdir = worker_dir(name)
@@ -357,6 +412,11 @@ def cmd_spawn(args: argparse.Namespace) -> None:
     canonical_plan.parent.mkdir(parents=True, exist_ok=True)
     canonical_plan.write_text(plan_text.rstrip() + "\n")
 
+    # --- mcp wiring: validate requested names against the per-project
+    #     allowlist and write <wdir>/.mcp.json before container start ---
+    requested_mcps = _parse_mcps_arg(getattr(args, "mcps", "") or "")
+    mcps_label = _write_mcp_config(wdir, requested_mcps)
+
     # --- write/update registry BEFORE docker run so a crash leaves a discoverable state ---
     now = _iso_now()
     if fresh:
@@ -409,6 +469,8 @@ def cmd_spawn(args: argparse.Namespace) -> None:
     }
     if args.interactive:
         labels[LABEL_INTERACTIVE] = "1"
+    if mcps_label:
+        labels[LABEL_MCPS] = mcps_label
 
     # --- run ---
     try:
@@ -419,6 +481,7 @@ def cmd_spawn(args: argparse.Namespace) -> None:
             mounts=mounts,
             environment=env,
             labels=labels,
+            network=INNER_NETWORK,
         )
     except APIError as e:
         # Rollback so spawn is re-invokable. Fresh: drop workdir + registry.
@@ -1127,6 +1190,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--data-mount", action="append", default=[],
                     help="absolute path to bind-mount RO into the worker; repeatable")
     sp.add_argument("--env", action="append", default=[], help="K=V; repeatable")
+    sp.add_argument("--mcps", default="",
+                    help="comma-separated MCP names from `research mcp list`; "
+                         "each must already be granted via "
+                         "`research project mcp-allow <project> <mcp>`")
     sp.add_argument("--interactive", action="store_true",
                     help="(reserved) run claude interactively in byobu instead of headless")
     sp.set_defaults(func=cmd_spawn)

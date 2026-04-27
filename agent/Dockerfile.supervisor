@@ -83,6 +83,14 @@ COPY cli/rs_worker.py /usr/local/bin/rs-worker
 COPY cli/rs_audit_stop.py /usr/local/bin/rs-audit-stop
 RUN chmod +x /usr/local/bin/rs-worker /usr/local/bin/rs-audit-stop
 
+# MCP proxy support — config renderer (run from entrypoint at boot, and by
+# mcp-reload after `research project mcp-allow|mcp-deny` mutations) plus the
+# reload helper itself, which SIGHUPs the inner-daemon mcp-proxy container.
+RUN mkdir -p /opt/mcp-proxy-tools
+COPY container/supervisor/mcp_render_config.py /opt/mcp-proxy-tools/mcp_render_config.py
+COPY container/supervisor/mcp-reload.sh /usr/local/bin/mcp-reload
+RUN chmod +x /usr/local/bin/mcp-reload
+
 # Stash home directory — volume mount on /home/research hides image contents.
 RUN cp -a /home/research /etc/research-skel
 

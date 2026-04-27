@@ -96,6 +96,14 @@ if [[ "${DOCKER_DIND:-}" == "true" ]] && command -v dockerd >/dev/null 2>&1; the
     fi
 fi
 
+# --- MCP proxy: rs-inner bridge + proxy container in the inner dockerd ----
+# Workers spawned by `rs-worker spawn --mcps ...` join rs-inner and resolve
+# the proxy by DNS as `mcp-proxy:8888`. mcp-reload is idempotent: it renders
+# config, ensures rs-inner exists, and either SIGHUPs a running proxy or
+# spawns one. Same script `research project mcp-allow` invokes via
+# `docker exec` after a per-project allowlist mutation.
+/usr/local/bin/mcp-reload || echo "WARNING: mcp-reload failed at boot" >&2
+
 # --- SSH ---
 if [[ -n "${SSH_PASSWORD:-}" ]]; then
     echo "research:${SSH_PASSWORD}" | sudo chpasswd

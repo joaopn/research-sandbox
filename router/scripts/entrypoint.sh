@@ -19,12 +19,25 @@ iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
 if [ -d /etc/sandbox/rules ] && [ "$(ls -A /etc/sandbox/rules 2>/dev/null)" ]; then
     echo "Re-applying persisted firewall rules..."
     for rulefile in /etc/sandbox/rules/*; do
-        SUBNET=$(awk '{print $1}' "$rulefile")
-        MODE=$(awk '{print $2}' "$rulefile")
-        if [ -n "$SUBNET" ] && [ -n "$MODE" ]; then
-            echo "  $SUBNET ($MODE)"
-            /scripts/apply-rules.sh "$SUBNET" "$MODE"
-        fi
+        case "$(basename "$rulefile")" in
+            mcp-*)
+                SUBNET=$(awk '{print $1}' "$rulefile")
+                IP=$(awk '{print $2}' "$rulefile")
+                PORT=$(awk '{print $3}' "$rulefile")
+                if [ -n "$SUBNET" ] && [ -n "$IP" ] && [ -n "$PORT" ]; then
+                    echo "  mcp $SUBNET -> $IP:$PORT"
+                    /scripts/mcp-allow.sh "$SUBNET" "$IP" "$PORT"
+                fi
+                ;;
+            *)
+                SUBNET=$(awk '{print $1}' "$rulefile")
+                MODE=$(awk '{print $2}' "$rulefile")
+                if [ -n "$SUBNET" ] && [ -n "$MODE" ]; then
+                    echo "  $SUBNET ($MODE)"
+                    /scripts/apply-rules.sh "$SUBNET" "$MODE"
+                fi
+                ;;
+        esac
     done
 fi
 

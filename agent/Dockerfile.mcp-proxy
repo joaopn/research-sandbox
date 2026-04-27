@@ -1,0 +1,7 @@
+FROM python:3.12-alpine
+
+RUN mkdir -p /opt/mcp-proxy /etc/mcp-proxy /var/log/mcp-proxy
+COPY container/supervisor/mcp_proxy.py /opt/mcp-proxy/proxy.py
+
+EXPOSE 8888
+ENTRYPOINT ["python3", "-u", "/opt/mcp-proxy/proxy.py"]

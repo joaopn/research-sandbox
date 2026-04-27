@@ -11,6 +11,11 @@ services:
       - net.ipv4.ip_forward=1
     volumes:
       - rs-router-rules:/etc/sandbox/rules
+    extra_hosts:
+      # Lets the router resolve host.docker.internal so external MCPs
+      # registered with `research mcp add --kind external` can be reached
+      # from project subnets via per-project FORWARD ACCEPT rules.
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
 
