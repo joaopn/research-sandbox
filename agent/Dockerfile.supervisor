@@ -91,6 +91,12 @@ COPY container/supervisor/mcp_render_config.py /opt/mcp-proxy-tools/mcp_render_c
 COPY container/supervisor/mcp-reload.sh /usr/local/bin/mcp-reload
 RUN chmod +x /usr/local/bin/mcp-reload
 
+# Stage 2.3 inner-netns firewall (opt-in). Defense-in-depth ACL applied to
+# the supervisor's rs-inner bridge when RS_INNER_FIREWALL=1 is set on the
+# supervisor container. Does nothing otherwise — no host change, no overhead.
+COPY container/supervisor/inner-firewall.sh /usr/local/bin/rs-inner-firewall
+RUN chmod +x /usr/local/bin/rs-inner-firewall
+
 # Stash home directory — volume mount on /home/research hides image contents.
 RUN cp -a /home/research /etc/research-skel
 

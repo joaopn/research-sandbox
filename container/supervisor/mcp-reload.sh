@@ -29,9 +29,14 @@ if ! docker image inspect rs-mcp-proxy:latest >/dev/null 2>&1; then
     exit 0
 fi
 
+# Pin mcp-proxy to a known IP on rs-inner so the inner-firewall (Stage 2.3,
+# opt-in) can distinguish proxy-originated egress from worker egress without
+# depending on br_netfilter. Workers spawn later and get auto-allocated IPs
+# from .3 onward.
 docker run -d \
     --name mcp-proxy \
     --network rs-inner \
+    --ip 192.168.99.2 \
     --restart unless-stopped \
     -v /workspace/.orchestrator/mcp-proxy:/etc/mcp-proxy:ro \
     -v /workspace/.orchestrator/logs:/var/log/mcp-proxy:rw \

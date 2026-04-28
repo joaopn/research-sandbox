@@ -381,6 +381,7 @@ def build_supervisor_docker_args(
     cpus: str,
     image: str,
     dind_mode: str,
+    inner_firewall: bool = False,
 ) -> list[str]:
     args = [
         "run", "-d",
@@ -397,6 +398,8 @@ def build_supervisor_docker_args(
         "--label", f"{PROJECT_LABEL}={project}",
         "--label", f"{DIND_MODE_LABEL}={dind_mode}",
     ]
+    if inner_firewall:
+        args += ["-e", "RS_INNER_FIREWALL=1"]
     for s in dns_servers:
         args += ["--dns", s]
 
@@ -552,6 +555,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         cpus=args.cpus or "",
         image=SUPERVISOR_IMAGE,
         dind_mode=dind_mode,
+        inner_firewall=bool(getattr(args, "inner_firewall", False)),
     )
     # Inject data-dir (and any future --mount) into argv just before the image name.
     if extra_mounts:
@@ -576,6 +580,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         capture_output=True)
 
     # 7. Report.
+    inner_fw = "on" if getattr(args, "inner_firewall", False) else "off"
     print(f"""
 Project '{project}' is running.
 
@@ -583,6 +588,7 @@ Project '{project}' is running.
   Workspace: {workspace_path}
   Network:   {network} (egress: {egress})
   DIND mode: {dind_mode}
+  Inner FW:  {inner_fw}
   SSH:       research@localhost -p {ssh_port}   password: {ssh_pass}
 
 Next steps:
@@ -1231,6 +1237,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--egress", choices=["open", "locked"],
                    help="router egress policy (default from .env, usually open)")
     c.add_argument("--ssh-port", type=int, help="explicit SSH host port")
+    c.add_argument("--inner-firewall", action="store_true",
+                   help="enable defense-in-depth iptables ACL on the supervisor's "
+                        "rs-inner bridge (workers can only reach mcp-proxy + DNS)")
     c.set_defaults(func=cmd_project_create)
 
     a = proj_sub.add_parser("attach", help="docker exec + byobu attach")

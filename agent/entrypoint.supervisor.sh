@@ -104,6 +104,15 @@ fi
 # `docker exec` after a per-project allowlist mutation.
 /usr/local/bin/mcp-reload || echo "WARNING: mcp-reload failed at boot" >&2
 
+# --- Optional inner-netns firewall (Stage 2.3, defense-in-depth) ----------
+# Restricts rs-inner egress to mcp-proxy + Docker embedded DNS. Off by default
+# until we've dogfooded the proxy path; opt-in via `research project create
+# --inner-firewall` (sets RS_INNER_FIREWALL=1 on the supervisor).
+if [[ "${RS_INNER_FIREWALL:-0}" == "1" ]]; then
+    /usr/local/bin/rs-inner-firewall || \
+        echo "WARNING: inner-firewall failed to apply" >&2
+fi
+
 # --- SSH ---
 if [[ -n "${SSH_PASSWORD:-}" ]]; then
     echo "research:${SSH_PASSWORD}" | sudo chpasswd
