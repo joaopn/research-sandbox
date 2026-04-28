@@ -274,7 +274,7 @@ def _write_mcp_config(wdir: Path, requested: list[str]) -> str:
         "mcpServers": {
             name: {
                 "type": by_name[name].get("transport", "http"),
-                "url": f"http://mcp-proxy:8888/{name}",
+                "url": f"http://mcp-proxy:8888/{name}{by_name[name].get('path', '/mcp')}",
             }
             for name in requested
         }

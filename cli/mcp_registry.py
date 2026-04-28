@@ -23,7 +23,9 @@ LOCK_PATH = REGISTRY_DIR / "mcp-registry.lock"
 VERSION = 1
 KINDS = ("external", "shared")
 TRANSPORTS = ("http", "sse")
+DEFAULT_PATH = "/mcp"
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+PATH_RE = re.compile(r"^/[A-Za-z0-9/_.-]*$")
 _VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
 
@@ -108,6 +110,11 @@ def _validate_entry(name: str, e: Any) -> list[str]:
         return [p(f"kind must be one of {KINDS}, got {kind!r}")]
     if e.get("transport") not in TRANSPORTS:
         out.append(p(f"transport must be one of {TRANSPORTS}, got {e.get('transport')!r}"))
+    if "path" in e:
+        path = e["path"]
+        if not isinstance(path, str) or not PATH_RE.match(path) \
+                or any(seg == ".." for seg in path.split("/")):
+            out.append(p(f"path must match {PATH_RE.pattern!r} and contain no '..' segments, got {path!r}"))
 
     if kind == "external":
         if not isinstance(e.get("host_port"), int) or isinstance(e.get("host_port"), bool):
@@ -122,7 +129,7 @@ def _validate_entry(name: str, e: Any) -> list[str]:
             for k, v in headers.items():
                 if not isinstance(v, str):
                     out.append(p(f"header {k!r}: value must be a string"))
-        allowed = {"kind", "transport", "host_port", "host_address", "headers"}
+        allowed = {"kind", "transport", "host_port", "host_address", "headers", "path"}
     else:  # shared
         img = e.get("image")
         if not isinstance(img, str) or not img:
@@ -136,7 +143,7 @@ def _validate_entry(name: str, e: Any) -> list[str]:
             for k, v in env.items():
                 if not isinstance(v, str):
                     out.append(p(f"env {k!r}: value must be a string"))
-        allowed = {"kind", "transport", "image", "port", "env"}
+        allowed = {"kind", "transport", "image", "port", "env", "path"}
 
     extras = set(e) - allowed
     if extras:

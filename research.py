@@ -28,6 +28,7 @@ it internal to the container).
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
 import secrets
@@ -864,8 +865,16 @@ def mcp_container_ip(name: str) -> str:
         '{{(index .NetworkSettings.Networks "' + ROUTER_NETWORK + '").IPAddress}}',
     ])
     ip = r.stdout.strip()
-    if not ip:
-        die(f"could not resolve {cname}'s IP on {ROUTER_NETWORK}")
+    # A crash-looping container reports "running" between restarts but has an
+    # empty IPAddress; docker's template renders that as the literal string
+    # "invalid IP" rather than empty — non-empty would silently propagate to
+    # iptables. Parse with ipaddress to catch both.
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        die(f"could not resolve {cname}'s IP on {ROUTER_NETWORK} "
+            f"(docker inspect returned {ip!r}); the container may be "
+            f"crash-looping. Check `docker logs {cname}`.")
     return ip
 
 
@@ -904,6 +913,8 @@ def _parse_kv(items: list[str], flag: str) -> dict[str, str]:
 
 def _build_mcp_entry(args: argparse.Namespace) -> dict:
     entry: dict = {"kind": args.kind, "transport": args.transport}
+    if args.path and args.path != mcp_registry.DEFAULT_PATH:
+        entry["path"] = args.path
     if args.kind == "external":
         if args.host_port is None:
             die("--host-port is required for --kind external")
@@ -1167,6 +1178,7 @@ def cmd_project_mcp_allow(args: argparse.Namespace) -> None:
         "transport": entry.get("transport", "http"),
         "ip": ip,
         "port": port,
+        "path": entry.get("path", mcp_registry.DEFAULT_PATH),
     }
     if entry.get("headers"):
         new_entry["headers"] = entry["headers"]
@@ -1302,6 +1314,9 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--env", action="append", default=[],
                    metavar="K=V",
                    help="(shared) env var passed to the MCP container (repeatable)")
+    a.add_argument("--path", default=mcp_registry.DEFAULT_PATH,
+                   help=f"upstream URL path the MCP listens on "
+                        f"(default {mcp_registry.DEFAULT_PATH!r}, the SDK convention)")
     a.set_defaults(func=cmd_mcp_add)
 
     ml = mcp_sub.add_parser("list", help="list registered MCPs")

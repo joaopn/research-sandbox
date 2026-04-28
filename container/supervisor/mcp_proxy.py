@@ -37,6 +37,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -45,6 +46,11 @@ AUDIT_LOG = os.environ.get("MCP_PROXY_AUDIT", "/var/log/mcp-proxy/mcp-proxy.json
 LISTEN_HOST = os.environ.get("MCP_PROXY_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("MCP_PROXY_PORT", "8888"))
 UPSTREAM_TIMEOUT = float(os.environ.get("MCP_PROXY_TIMEOUT", "86400"))  # 1 day
+# Host header pinned on outgoing upstream requests. Stable, predictable,
+# can't be spoofed by a worker — gives MCP servers a value they can put in
+# their DNS-rebinding-protection allowlist. The default matches the proxy's
+# rs-inner DNS name + listen port.
+PROXY_HOSTNAME = os.environ.get("MCP_PROXY_HOSTNAME", "mcp-proxy:8888")
 
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -88,7 +94,12 @@ def audit(record: dict) -> None:
 
 def split_route(raw_path: str):
     """Split ``/<name>/<rest>`` (rest may include query-string). Returns
-    (name, upstream_path) or None on malformed input."""
+    (name, upstream_path) or None on malformed input.
+
+    Rejects path traversal (``..`` segments, including URL-encoded variants):
+    a worker could otherwise reach adjacent endpoints on the upstream MCP
+    that weren't intended. Defense-in-depth — workers are sandboxed but the
+    proxy shouldn't blindly forward."""
     if not raw_path.startswith("/"):
         return None
     rest = raw_path[1:]
@@ -107,6 +118,12 @@ def split_route(raw_path: str):
         tail = rest[sep_idx:]
         upstream_path = tail if tail.startswith("/") else "/" + tail
     if not name:
+        return None
+    # Strip query-string before traversal check; decode %xx to catch
+    # %2e%2e and similar encodings.
+    path_only = upstream_path.split("?", 1)[0]
+    decoded = urllib.parse.unquote(path_only)
+    if any(seg == ".." for seg in decoded.split("/")):
         return None
     return name, upstream_path
 
@@ -144,6 +161,9 @@ class Handler(BaseHTTPRequestHandler):
             if h.lower() in HOP_BY_HOP or h.lower() == "host":
                 continue
             out_headers[h] = v
+        # Pin Host so upstream MCPs see a stable value (matches the proxy's
+        # canonical rs-inner DNS name) regardless of what the client sent.
+        out_headers["Host"] = PROXY_HOSTNAME
         for h, v in extra_headers.items():
             out_headers[h] = v
 
