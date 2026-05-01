@@ -707,8 +707,16 @@ def cmd_project_stop(args: argparse.Namespace) -> None:
 
 
 def cmd_project_start(args: argparse.Namespace) -> None:
-    target = "__ALL__" if args.all else args.name
-    if target == "__ALL__":
+    """Start a stopped project. On sysbox, plain `docker start` after
+    `docker stop` fails (sysbox-mgr's per-container volume bindings are
+    'already exists' on second mount), so we route through
+    `_recreate_supervisor`: fresh container ID, fresh bindings, workspace
+    + creds + network preserved. Same shape as `project update` minus the
+    image rebuild."""
+    cfg = load_config()
+    if not container_running(ROUTER_CONTAINER):
+        die(f"{ROUTER_CONTAINER} is not running. Run `research start` first.")
+    if args.all:
         containers = get_supervisor_containers()
     else:
         containers = [{"name": container_name_for(args.name), "project": args.name}]
@@ -716,17 +724,12 @@ def cmd_project_start(args: argparse.Namespace) -> None:
         if not container_exists(c["name"]):
             print(f"skip: {c['name']} does not exist")
             continue
-        run_check(["docker", "start", c["name"]])
-        # Re-inject default route — docker forgets it on start.
-        network = project_network_for(c["project"])
-        if network_exists(network):
-            try:
-                router_ip = get_router_ip(network)
-                inject_route(c["name"], router_ip)
-            except SystemExit:
-                # Non-fatal: container starts, but egress may not traverse the router.
-                print(f"warning: could not reinject route for {c['name']}", file=sys.stderr)
-        print(f"start: {c['name']}")
+        if container_running(c["name"]):
+            print(f"skip: {c['project']} already running")
+            continue
+        print(f"=== Starting project: {c['project']} ===")
+        _recreate_supervisor(c["project"], cfg)
+        print(f"start: {c['project']}")
 
 
 def cmd_project_destroy(args: argparse.Namespace) -> None:
@@ -939,40 +942,32 @@ def _stash_creds_for_rebuild(
             capture_output=True)
 
 
-def cmd_project_update(args: argparse.Namespace) -> None:
-    """Push edited code into a project. Always recreates the supervisor
-    container (rm + create + start) instead of stop+start — the latter
-    deadlocks on sysbox-mgr's per-container volume bindings (it loses track
-    on stop and refuses to re-create on start with 'volume dir already
-    exists'). Recreate sidesteps that bug; sysbox sees a fresh container ID
-    and allocates fresh bindings. Workspace + creds + network survive
-    because the bind-mount, the stash, and the per-project bridge are all
-    independent of the container itself."""
-    cfg = load_config()
-    project = args.name
+def _recreate_supervisor(
+    project: str,
+    cfg: "Config",
+    *,
+    force_restage: bool = False,
+    post_create_hook=None,
+) -> None:
+    """Stash creds → stop+rm → create new container from SUPERVISOR_IMAGE
+    → optional post-create hook → start → re-inject route → re-stage inner
+    images → respawn mcp-proxy. The only safe shape on sysbox: stop+start
+    of the same container ID hits sysbox-mgr's `volume dir for container
+    <id> already exists` bug. A fresh container ID gets fresh bindings.
+
+    Workspace, network, SSH port, env, mounts, memory/CPU limits all
+    survive because they're recovered from the existing container's
+    metadata before rm. Creds move through /workspace/.creds-stash, never
+    via /tmp.
+
+    The post-create hook runs against the not-yet-started container —
+    used by `cmd_project_update` to docker-cp edited files in before the
+    entrypoint reads them."""
     container = container_name_for(project)
-
-    if not container_exists(container):
-        die(f"project {project!r} does not exist")
-    if not container_running(ROUTER_CONTAINER):
-        die(f"{ROUTER_CONTAINER} is not running. Run `research start` first.")
-
-    print(f"=== Updating project: {project} ===")
-
-    if args.rebuild:
-        print("rebuilding images...")
-        _build_images(force=True)
-
     was_running = container_running(container)
     workspace_path = workspace_path_for(project, cfg)
 
-    # Stash creds via the workspace bind-mount before destroying the old
-    # container. Entrypoint of the new container will move them back on
-    # boot. Path: ~research/.claude → /workspace/.creds-stash → ~research/.claude
-    # Never via /tmp.
     _stash_creds_for_rebuild(container, was_running, workspace_path)
-
-    # Read metadata BEFORE removing the old container.
     md = _read_supervisor_metadata(container)
 
     if was_running:
@@ -981,10 +976,6 @@ def cmd_project_update(args: argparse.Namespace) -> None:
     print(f"removing old container {container}...")
     run_check(["docker", "rm", container])
 
-    # Build docker run argv, then convert it into a `docker create` argv —
-    # we want the new container to exist (with sysbox volumes allocated)
-    # but NOT yet started, so we can docker cp the edited files into its
-    # filesystem before the entrypoint runs.
     network = project_network_for(project)
     docker_args = build_supervisor_docker_args(
         container_name=container,
@@ -1002,45 +993,92 @@ def cmd_project_update(args: argparse.Namespace) -> None:
     )
     if md["extra_mounts"]:
         docker_args = docker_args[:-1] + md["extra_mounts"] + [docker_args[-1]]
-    # build_supervisor_docker_args emits ["run", "-d", ...]; drop both for create.
+    # build_supervisor_docker_args emits ["run", "-d", ...]; convert to create.
     assert docker_args[0] == "run" and docker_args[1] == "-d"
     create_args = ["create"] + docker_args[2:]
 
     print(f"creating new container from {SUPERVISOR_IMAGE}...")
     run_check(["docker", *create_args])
 
-    # File-only mode: docker cp edited supervisor-baked files into the
-    # not-yet-started container. The entrypoint will read the new copies on
-    # first start. In --rebuild mode the new image already has the latest
-    # files baked in, so skip the cp.
-    if not args.rebuild:
-        print(f"copying edited files into {container}...")
-        copied = _docker_cp_supervisor_files(container)
-        for rel in copied:
-            print(f"  {rel}")
+    if post_create_hook is not None:
+        post_create_hook(container)
 
     print(f"starting {container}...")
     run_check(["docker", "start", container])
 
-    # Fresh netns: re-inject the default route via rs-router.
     router_ip = get_router_ip(network)
     inject_route(container, router_ip)
 
-    # Inner-dockerd state. In sysbox mode /var/lib/docker is a fresh
-    # sysbox-allocated dir, so worker + proxy images need staging again.
-    # In privileged DIND it's a named volume that persists across rm, so
-    # stage_worker_image is a no-op unless --rebuild forced new image SHAs.
+    # Inner-dockerd state. In sysbox mode /var/lib/docker is fresh, so
+    # worker + proxy images need staging. Privileged DIND has a named
+    # volume that survives rm; stage_worker_image is a no-op there
+    # unless `force_restage` (i.e. images were rebuilt on the host).
     wait_for_inner_dockerd(container)
-    # mcp-proxy auto-starts via `--restart unless-stopped` in privileged
-    # mode; drop it so we can refresh its image cleanly either way.
     run(["docker", "exec", container, "docker", "rm", "-f", "mcp-proxy"],
         capture_output=True)
-    stage_worker_image(container, ANALYSIS_IMAGE, force=args.rebuild)
-    stage_worker_image(container, MCP_PROXY_IMAGE, force=args.rebuild)
+    stage_worker_image(container, ANALYSIS_IMAGE, force=force_restage)
+    stage_worker_image(container, MCP_PROXY_IMAGE, force=force_restage)
     run(["docker", "exec", container, "/usr/local/bin/mcp-reload"],
         capture_output=True)
 
+
+def cmd_project_update(args: argparse.Namespace) -> None:
+    """Push edited code into a project. Always recreates the supervisor
+    via `_recreate_supervisor`; file-only mode injects edited files into
+    the freshly-created container before its first start, --rebuild mode
+    rebuilds all images first and the new container is created from the
+    rebuilt image."""
+    cfg = load_config()
+    project = args.name
+    container = container_name_for(project)
+
+    if not container_exists(container):
+        die(f"project {project!r} does not exist")
+    if not container_running(ROUTER_CONTAINER):
+        die(f"{ROUTER_CONTAINER} is not running. Run `research start` first.")
+
+    print(f"=== Updating project: {project} ===")
+
+    if args.rebuild:
+        print("rebuilding images...")
+        _build_images(force=True)
+
+    hook = None
+    if not args.rebuild:
+        def hook(c: str) -> None:
+            print(f"copying edited files into {c}...")
+            for rel in _docker_cp_supervisor_files(c):
+                print(f"  {rel}")
+
+    _recreate_supervisor(
+        project, cfg,
+        force_restage=args.rebuild,
+        post_create_hook=hook,
+    )
+
+    if not args.keep_claude:
+        print(f"refreshing /workspace/.claude/ from templates...")
+        _refresh_workspace_claude_templates(container)
+
     print(f"\nproject {project!r} updated.")
+
+
+def _refresh_workspace_claude_templates(container: str) -> None:
+    """Overwrite /workspace/.claude/{CLAUDE.md, logbook_*_template.md,
+    commands/} from /opt/claude-templates/. The entrypoint's first-boot
+    `if-not-present` guard means existing projects never see template
+    edits otherwise — this closes that loop. Slash-commands dir is
+    rebuilt from scratch (so removed slash commands actually disappear),
+    not merged."""
+    run_check(["docker", "exec", container, "sh", "-eu", "-c", r"""
+        cp -f /opt/claude-templates/CLAUDE.md /workspace/.claude/CLAUDE.md
+        cp -f /opt/claude-templates/logbook_supervisor_template.md \
+              /workspace/.claude/logbook_supervisor_template.md
+        cp -f /opt/claude-templates/logbook_pi_template.md \
+              /workspace/.claude/logbook_pi_template.md
+        rm -rf /workspace/.claude/commands
+        cp -a /opt/claude-templates/commands /workspace/.claude/commands
+    """])
 
 
 # ---------------------------------------------------------------------------
@@ -1541,21 +1579,28 @@ def build_parser() -> argparse.ArgumentParser:
     u = proj_sub.add_parser(
         "update",
         help="push edited code into a project; preserves workspace + creds",
-        description="Bundles a stop, file/image refresh, and start. Without "
-                    "--rebuild, copies edited supervisor-baked files (cli/, "
+        description="Recreates the supervisor container (rm + create + start; "
+                    "the only safe shape on sysbox), preserving workspace, "
+                    "creds, network, SSH port, env, mounts, memory/CPU limits. "
+                    "Without --rebuild, edited supervisor-baked files (cli/, "
                     "container/supervisor/*, container/analysis/CLAUDE.md.template, "
-                    "agent/entrypoint.supervisor.sh) into the stopped container "
-                    "and starts it. With --rebuild, additionally rebuilds all "
-                    "three images on the host and replaces the supervisor "
-                    "container with a fresh one from the new image (creds are "
-                    "moved through /workspace/.creds-stash, never via /tmp). "
-                    "Either way: workspace, results, logbook, plans, .workers/ "
-                    "registry are untouched.",
+                    "agent/entrypoint.supervisor.sh) are docker-cp'd into the "
+                    "freshly-created container before its first start. With "
+                    "--rebuild, all three images are rebuilt first and the "
+                    "new container comes from the rebuilt image. After the "
+                    "recreate, /workspace/.claude/ template copies (CLAUDE.md, "
+                    "slash commands, logbook templates) are refreshed from "
+                    "/opt/claude-templates/* unless --keep-claude is given.",
     )
     u.add_argument("name")
     u.add_argument("--rebuild", action="store_true",
-                   help="rebuild images and replace the supervisor container "
-                        "(required for Dockerfile / mcp-proxy / worker-image changes)")
+                   help="rebuild images first (required for Dockerfile / "
+                        "mcp-proxy / worker-image changes)")
+    u.add_argument("--keep-claude", action="store_true",
+                   help="preserve the project's /workspace/.claude/* files "
+                        "instead of overwriting them with the latest "
+                        "templates (default: refresh, so role-doc and "
+                        "slash-command edits propagate)")
     u.set_defaults(func=cmd_project_update)
 
     sh = proj_sub.add_parser("ssh", help="print SSH connection info")
