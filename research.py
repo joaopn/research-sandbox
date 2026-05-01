@@ -36,6 +36,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # Make cli/ helpers importable.
@@ -246,15 +247,23 @@ def wait_for_inner_dockerd(container: str, timeout: int = 60) -> None:
         f"(check `docker logs {container}` and `docker exec {container} sudo cat /tmp/dockerd.log`)")
 
 
-def stage_worker_image(container: str, image: str) -> None:
-    """Push the host-built image into the supervisor's inner Docker daemon."""
+def stage_worker_image(container: str, image: str, force: bool = False) -> None:
+    """Push the host-built image into the supervisor's inner Docker daemon.
+
+    With ``force=True`` the inner daemon's existing copy of the tag (if any)
+    is removed first, so the load brings in the rebuilt content rather than
+    being a no-op when the tag points at a stale image (the case when
+    `research project update --rebuild` re-stages after a host rebuild)."""
     if not run_quiet(["docker", "image", "inspect", image]):
         die(f"host image {image} not found; run `research setup`.")
-    # Skip if already present inside.
-    r = run(["docker", "exec", container, "docker", "image", "inspect", image],
-            capture_output=True)
-    if r.returncode == 0:
+    # Skip if already present inside, unless --force.
+    present = run(["docker", "exec", container, "docker", "image", "inspect", image],
+                  capture_output=True).returncode == 0
+    if present and not force:
         return
+    if present:
+        run(["docker", "exec", container, "docker", "image", "rm", "-f", image],
+            capture_output=True)
     print(f"staging {image} into the supervisor (this can take a minute)...")
     save = subprocess.Popen(
         ["docker", "save", image],
@@ -782,6 +791,259 @@ def cmd_project_ssh(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# project update — push edited code into a running project
+# ---------------------------------------------------------------------------
+
+
+# Files baked into the supervisor image at build time. `update` (no --rebuild)
+# `docker cp`s each into the stopped supervisor; the next start runs the new
+# code. Pairs are (host-relative source, container target, executable bit).
+_SUPERVISOR_FILE_MAP: list[tuple[str, str, bool]] = [
+    ("cli/rs_worker.py",                                "/usr/local/bin/rs-worker",                          True),
+    ("cli/rs_audit_stop.py",                            "/usr/local/bin/rs-audit-stop",                      True),
+    ("container/supervisor/mcp_render_config.py",       "/opt/mcp-proxy-tools/mcp_render_config.py",         False),
+    ("container/supervisor/mcp-reload.sh",              "/usr/local/bin/mcp-reload",                         True),
+    ("container/supervisor/inner-firewall.sh",          "/usr/local/bin/rs-inner-firewall",                  True),
+    ("container/supervisor/CLAUDE.md",                  "/opt/claude-templates/CLAUDE.md",                   False),
+    ("container/supervisor/setup.sh",                   "/opt/claude-templates/setup.sh",                    True),
+    ("container/supervisor/logbook_supervisor_template.md", "/opt/claude-templates/logbook_supervisor_template.md", False),
+    ("container/supervisor/logbook_pi_template.md",     "/opt/claude-templates/logbook_pi_template.md",      False),
+    ("container/analysis/CLAUDE.md.template",           "/opt/claude-templates/worker.CLAUDE.md.template",   False),
+    ("agent/entrypoint.supervisor.sh",                  "/entrypoint.sh",                                    True),
+]
+
+_SUPERVISOR_DIR_MAP: list[tuple[str, str]] = [
+    ("container/supervisor/commands", "/opt/claude-templates/commands"),
+]
+
+
+def _docker_cp_with_mode(src: Path, container: str, dst: str, mode: int) -> None:
+    """`docker cp` a file with an explicit mode bit, via a tempdir staging
+    step (the source files in the working tree may be 0664; baked scripts
+    need 0755). Tempdir is cleaned up on return; never persists."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        staged = Path(tmpdir) / src.name
+        shutil.copy2(src, staged)
+        os.chmod(staged, mode)
+        run_check(["docker", "cp", str(staged), f"{container}:{dst}"])
+
+
+def _docker_cp_supervisor_files(container: str) -> list[str]:
+    """Copy the edited supervisor-baked files into the container. Returns
+    the list of host-relative paths that were actually copied."""
+    copied: list[str] = []
+    for rel, dst, exe in _SUPERVISOR_FILE_MAP:
+        src = SCRIPT_DIR / rel
+        if not src.is_file():
+            continue
+        if exe:
+            _docker_cp_with_mode(src, container, dst, 0o755)
+        else:
+            run_check(["docker", "cp", str(src), f"{container}:{dst}"])
+        copied.append(rel)
+    for rel, dst in _SUPERVISOR_DIR_MAP:
+        src = SCRIPT_DIR / rel
+        if not src.is_dir():
+            continue
+        # Trailing /. on src copies the contents into the existing target dir
+        # (instead of nesting). Doesn't delete files removed from the source.
+        run_check(["docker", "cp", f"{src}/.", f"{container}:{dst}/"])
+        copied.append(rel + "/")
+    return copied
+
+
+def _read_supervisor_metadata(container: str) -> dict:
+    """Inspect the existing supervisor; return the params needed to recreate
+    it with `build_supervisor_docker_args` (used by `update --rebuild`)."""
+    r = run_check(["docker", "inspect", container])
+    data = json.loads(r.stdout)[0]
+
+    # Published SSH host port.
+    port_bindings = (data.get("HostConfig") or {}).get("PortBindings") or {}
+    ssh_b = port_bindings.get("22/tcp") or []
+    ssh_port = int(ssh_b[0]["HostPort"]) if ssh_b else 0
+
+    # Env: SSH_PASSWORD, RS_INNER_FIREWALL.
+    env: dict[str, str] = {}
+    for entry in (data.get("Config") or {}).get("Env") or []:
+        if "=" in entry:
+            k, v = entry.split("=", 1)
+            env[k] = v
+
+    labels = (data.get("Config") or {}).get("Labels") or {}
+
+    # Bind-mounts other than /workspace and the privileged-DIND volume —
+    # i.e. user-supplied --data-dir paths.
+    extra_mounts: list[str] = []
+    for m in data.get("Mounts") or []:
+        dst_in = m.get("Destination", "")
+        if dst_in in ("/workspace", "/var/lib/docker"):
+            continue
+        if m.get("Type") != "bind":
+            continue
+        ro = ":ro" if m.get("RW") is False else ""
+        extra_mounts += ["-v", f"{m['Source']}:{dst_in}{ro}"]
+
+    hc = data.get("HostConfig") or {}
+    mem_bytes = hc.get("Memory") or 0
+    if mem_bytes and mem_bytes % (1024 ** 3) == 0:
+        memory = f"{mem_bytes // (1024 ** 3)}g"
+    elif mem_bytes:
+        memory = str(mem_bytes)
+    else:
+        memory = ""
+    nano_cpus = hc.get("NanoCpus") or 0
+    cpus = f"{nano_cpus / 1e9:g}" if nano_cpus else ""
+
+    return {
+        "ssh_port": ssh_port,
+        "ssh_pass": env.get("SSH_PASSWORD", ""),
+        "dind_mode": labels.get(DIND_MODE_LABEL, "privileged"),
+        "inner_firewall": env.get("RS_INNER_FIREWALL") == "1",
+        "memory": memory,
+        "cpus": cpus,
+        "extra_mounts": extra_mounts,
+    }
+
+
+def _stash_creds_for_rebuild(
+    container: str, was_running: bool, workspace_path: Path
+) -> None:
+    """Move ~research/.claude into /workspace/.creds-stash so the bind-mount
+    preserves it across container removal. Two paths:
+
+    - Running supervisor: `docker exec mv` (no copy, atomic, never leaves
+      the container's filesystem until the bind-mount writeback hits the
+      host workspace dir).
+    - Stopped supervisor: `docker cp` from the stopped container directly
+      into the host's workspace bind-mount path. The container is about to
+      be destroyed, so this is functionally a move; creds never touch /tmp.
+
+    Idempotent: if the stash already exists from a prior failed update,
+    skips. The entrypoint will move it back at next start either way."""
+    host_stash = workspace_path / ".creds-stash"
+    if host_stash.exists():
+        return
+    if was_running:
+        run(["docker", "exec", container, "sh", "-c",
+             "if [ -d /home/research/.claude ] && "
+             "[ ! -d /workspace/.creds-stash ]; then "
+             "mv /home/research/.claude /workspace/.creds-stash; "
+             "fi"],
+            capture_output=True)
+    else:
+        # docker cp on a stopped container works for files in its filesystem.
+        run(["docker", "cp",
+             f"{container}:/home/research/.claude",
+             str(host_stash)],
+            capture_output=True)
+
+
+def cmd_project_update(args: argparse.Namespace) -> None:
+    """Push edited code into a project. Always recreates the supervisor
+    container (rm + create + start) instead of stop+start — the latter
+    deadlocks on sysbox-mgr's per-container volume bindings (it loses track
+    on stop and refuses to re-create on start with 'volume dir already
+    exists'). Recreate sidesteps that bug; sysbox sees a fresh container ID
+    and allocates fresh bindings. Workspace + creds + network survive
+    because the bind-mount, the stash, and the per-project bridge are all
+    independent of the container itself."""
+    cfg = load_config()
+    project = args.name
+    container = container_name_for(project)
+
+    if not container_exists(container):
+        die(f"project {project!r} does not exist")
+    if not container_running(ROUTER_CONTAINER):
+        die(f"{ROUTER_CONTAINER} is not running. Run `research start` first.")
+
+    print(f"=== Updating project: {project} ===")
+
+    if args.rebuild:
+        print("rebuilding images...")
+        _build_images(force=True)
+
+    was_running = container_running(container)
+    workspace_path = workspace_path_for(project, cfg)
+
+    # Stash creds via the workspace bind-mount before destroying the old
+    # container. Entrypoint of the new container will move them back on
+    # boot. Path: ~research/.claude → /workspace/.creds-stash → ~research/.claude
+    # Never via /tmp.
+    _stash_creds_for_rebuild(container, was_running, workspace_path)
+
+    # Read metadata BEFORE removing the old container.
+    md = _read_supervisor_metadata(container)
+
+    if was_running:
+        print(f"stopping {container}...")
+        run_check(["docker", "stop", container])
+    print(f"removing old container {container}...")
+    run_check(["docker", "rm", container])
+
+    # Build docker run argv, then convert it into a `docker create` argv —
+    # we want the new container to exist (with sysbox volumes allocated)
+    # but NOT yet started, so we can docker cp the edited files into its
+    # filesystem before the entrypoint runs.
+    network = project_network_for(project)
+    docker_args = build_supervisor_docker_args(
+        container_name=container,
+        project=project,
+        network=network,
+        workspace_path=workspace_path,
+        ssh_port=md["ssh_port"],
+        ssh_pass=md["ssh_pass"],
+        dns_servers=cfg.sandbox_dns,
+        memory=md["memory"],
+        cpus=md["cpus"],
+        image=SUPERVISOR_IMAGE,
+        dind_mode=md["dind_mode"],
+        inner_firewall=md["inner_firewall"],
+    )
+    if md["extra_mounts"]:
+        docker_args = docker_args[:-1] + md["extra_mounts"] + [docker_args[-1]]
+    # build_supervisor_docker_args emits ["run", "-d", ...]; drop both for create.
+    assert docker_args[0] == "run" and docker_args[1] == "-d"
+    create_args = ["create"] + docker_args[2:]
+
+    print(f"creating new container from {SUPERVISOR_IMAGE}...")
+    run_check(["docker", *create_args])
+
+    # File-only mode: docker cp edited supervisor-baked files into the
+    # not-yet-started container. The entrypoint will read the new copies on
+    # first start. In --rebuild mode the new image already has the latest
+    # files baked in, so skip the cp.
+    if not args.rebuild:
+        print(f"copying edited files into {container}...")
+        copied = _docker_cp_supervisor_files(container)
+        for rel in copied:
+            print(f"  {rel}")
+
+    print(f"starting {container}...")
+    run_check(["docker", "start", container])
+
+    # Fresh netns: re-inject the default route via rs-router.
+    router_ip = get_router_ip(network)
+    inject_route(container, router_ip)
+
+    # Inner-dockerd state. In sysbox mode /var/lib/docker is a fresh
+    # sysbox-allocated dir, so worker + proxy images need staging again.
+    # In privileged DIND it's a named volume that persists across rm, so
+    # stage_worker_image is a no-op unless --rebuild forced new image SHAs.
+    wait_for_inner_dockerd(container)
+    # mcp-proxy auto-starts via `--restart unless-stopped` in privileged
+    # mode; drop it so we can refresh its image cleanly either way.
+    run(["docker", "exec", container, "docker", "rm", "-f", "mcp-proxy"],
+        capture_output=True)
+    stage_worker_image(container, ANALYSIS_IMAGE, force=args.rebuild)
+    stage_worker_image(container, MCP_PROXY_IMAGE, force=args.rebuild)
+    run(["docker", "exec", container, "/usr/local/bin/mcp-reload"],
+        capture_output=True)
+
+    print(f"\nproject {project!r} updated.")
+
+
+# ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 
@@ -1275,6 +1537,26 @@ def build_parser() -> argparse.ArgumentParser:
     d = proj_sub.add_parser("destroy", help="remove container + volume + network")
     d.add_argument("name")
     d.set_defaults(func=cmd_project_destroy)
+
+    u = proj_sub.add_parser(
+        "update",
+        help="push edited code into a project; preserves workspace + creds",
+        description="Bundles a stop, file/image refresh, and start. Without "
+                    "--rebuild, copies edited supervisor-baked files (cli/, "
+                    "container/supervisor/*, container/analysis/CLAUDE.md.template, "
+                    "agent/entrypoint.supervisor.sh) into the stopped container "
+                    "and starts it. With --rebuild, additionally rebuilds all "
+                    "three images on the host and replaces the supervisor "
+                    "container with a fresh one from the new image (creds are "
+                    "moved through /workspace/.creds-stash, never via /tmp). "
+                    "Either way: workspace, results, logbook, plans, .workers/ "
+                    "registry are untouched.",
+    )
+    u.add_argument("name")
+    u.add_argument("--rebuild", action="store_true",
+                   help="rebuild images and replace the supervisor container "
+                        "(required for Dockerfile / mcp-proxy / worker-image changes)")
+    u.set_defaults(func=cmd_project_update)
 
     sh = proj_sub.add_parser("ssh", help="print SSH connection info")
     sh.add_argument("name")

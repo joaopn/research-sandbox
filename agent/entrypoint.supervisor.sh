@@ -36,6 +36,17 @@ if ! grep -q 'umask 002' ~/.bashrc 2>/dev/null; then
     echo 'umask 002' >> ~/.bashrc
 fi
 
+# --- Restore Claude credentials stashed by `research project update --rebuild`
+#     (which `mv`s ~research/.claude into the workspace bind-mount before
+#     destroying the old container, so the creds survive the swap without
+#     ever touching the host outside the project's own workspace dir). ---
+if [[ -d /workspace/.creds-stash ]]; then
+    sudo rm -rf /home/research/.claude
+    sudo mv /workspace/.creds-stash /home/research/.claude
+    sudo chown -R research:research /home/research/.claude
+    echo "restored Claude creds from /workspace/.creds-stash"
+fi
+
 # --- Workspace first-boot staging ---
 # Under host bind-mount, /workspace is owned by the host user. Under sysbox's
 # user namespace the chown may fail (host uid outside the ns-uid range); under
