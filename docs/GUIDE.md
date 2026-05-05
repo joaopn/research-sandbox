@@ -186,22 +186,34 @@ Register and use:
 
 ```bash
 docker build -t my-mcp:latest .
-python research.py mcp add mymcp --kind shared --image my-mcp:latest --port 8000
+python research.py mcp add    mymcp --kind shared --image my-mcp:latest --port 8000
+python research.py mcp enable mymcp        # required before mcp-allow; also flags auto-start
+python research.py mcp start  mymcp        # launch now (or `research start` brings up enabled)
 python research.py project mcp-allow myproj mymcp
 # inside supervisor, in your plan, ask the worker to use mymcp; spawn with --mcps mymcp
 ```
 
+`mcp add` only registers. `mcp enable` is the gate: `project mcp-allow`
+refuses to grant a disabled MCP. For shared MCPs, `mcp enable` additionally
+arms auto-start — `research start` launches every enabled shared MCP after
+the router comes up. External MCPs have no container lifecycle, so `mcp
+start`/`stop` skip them; `enable` for an external is just the visibility
+gate before `project mcp-allow`.
+
 External (already-running) MCPs:
 
 ```bash
-python research.py mcp add mymcp --kind external --host-port 9000
-# host service must be reachable from host.docker.internal:9000
+# Service running on the docker host
+python research.py mcp add mymcp --kind external --host host.docker.internal:9000
+
+# Service reachable at a remote IP or DNS name
+python research.py mcp add mymcp --kind external --host 10.0.5.42:8443
 ```
 
 Auth headers (e.g. for hosted MCPs):
 
 ```bash
-python research.py mcp add api --kind external --host-port 9000 \
+python research.py mcp add api --kind external --host host.docker.internal:9000 \
     --header "Authorization=Bearer ${API_TOKEN}"
 ```
 

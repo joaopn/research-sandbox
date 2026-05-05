@@ -116,6 +116,9 @@ def _validate_entry(name: str, e: Any) -> list[str]:
                 or any(seg == ".." for seg in path.split("/")):
             out.append(p(f"path must match {PATH_RE.pattern!r} and contain no '..' segments, got {path!r}"))
 
+    if "enabled" in e and not isinstance(e["enabled"], bool):
+        out.append(p("enabled must be a boolean"))
+
     if kind == "external":
         if not isinstance(e.get("host_port"), int) or isinstance(e.get("host_port"), bool):
             out.append(p("external entry needs integer host_port"))
@@ -129,7 +132,7 @@ def _validate_entry(name: str, e: Any) -> list[str]:
             for k, v in headers.items():
                 if not isinstance(v, str):
                     out.append(p(f"header {k!r}: value must be a string"))
-        allowed = {"kind", "transport", "host_port", "host_address", "headers", "path"}
+        allowed = {"kind", "transport", "host_port", "host_address", "headers", "path", "enabled"}
     else:  # shared
         img = e.get("image")
         if not isinstance(img, str) or not img:
@@ -143,7 +146,7 @@ def _validate_entry(name: str, e: Any) -> list[str]:
             for k, v in env.items():
                 if not isinstance(v, str):
                     out.append(p(f"env {k!r}: value must be a string"))
-        allowed = {"kind", "transport", "image", "port", "env", "path"}
+        allowed = {"kind", "transport", "image", "port", "env", "path", "enabled"}
 
     extras = set(e) - allowed
     if extras:

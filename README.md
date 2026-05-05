@@ -205,16 +205,33 @@ If a worker needs to do more than crunch your local data — search arxiv, query
 python research.py mcp add arxiv --kind shared \
     --image ghcr.io/blazickjp/arxiv-mcp-server:latest --port 8000
 
-# Or an external one already running on the host (any port)
-python research.py mcp add notes --kind external --host-port 9000
+# Or register an external one already running on the host (any port)
+python research.py mcp add notes --kind external --host host.docker.internal:9000
 
-# Allow it for a specific project
+# Or one running on a remote machine
+python research.py mcp add remote --kind external --host 10.0.5.42:8443
+
+# Enable each MCP you intend to use (gate for `project mcp-allow`)
+python research.py mcp enable arxiv
+python research.py mcp enable notes
+
+# Launch shared MCP containers (externals have nothing to launch)
+python research.py mcp start arxiv
+
+# Allow an enabled MCP for a specific project
 python research.py project mcp-allow myproj arxiv
 
 # Now the supervisor can spawn workers that have access to it
 # (inside the supervisor):
 #   rs-worker spawn libworker --plan ... --mcps arxiv
 ```
+
+`mcp add` only writes to the registry. `mcp enable` flips a per-MCP flag;
+`project mcp-allow` refuses to grant a disabled MCP, and `research start`
+auto-launches every enabled *shared* MCP after the router comes up.
+`mcp start [<name>]` and `mcp stop [<name>]` manage shared-container
+lifecycle on demand — bare invocation operates on all enabled / all running.
+External MCPs have no container lifecycle, so `mcp start`/`stop` skip them.
 
 The MCP must speak streamable-HTTP and follow a small contract; see [docs/GUIDE.md#authoring-an-mcp-server](docs/GUIDE.md#-authoring-an-mcp-server) for a 10-line example. Workers can't reach MCPs they weren't granted — see [docs/SECURITY.md](docs/SECURITY.md) for the gating layers.
 
@@ -248,8 +265,10 @@ MCP registry:
   mcp add <name> --kind {external,shared} [opts]   Register an MCP
   mcp list [--json]                  Show all registered MCPs
   mcp remove <name> [--force]        Unregister (refuses if any project allows it)
-  mcp spawn|stop <name>              Manual lifecycle for shared MCPs
-  mcp test <name>                    Probe reachability
+  mcp enable|disable <name>          Toggle the per-MCP enabled flag (required for mcp-allow)
+  mcp start [<name>]                 Start a shared MCP container (or all enabled shared)
+  mcp stop  [<name>]                 Stop a shared MCP container (or all running)
+  mcp test  [<name>]                 Probe reachability (or all)
 
 project create options:
   --data-dir <path>                  Host path mounted RO at /workspace/shared/data
@@ -262,8 +281,7 @@ project create options:
 
 mcp add options:
   --transport {http,sse}             Default http
-  --host-port <port>                 (external) port on the host
-  --host-address <addr>              (external) override host.docker.internal
+  --host HOST:PORT                   (external) where the supervisor reaches the MCP
   --header K=V (repeatable)          (external) HTTP header to inject
   --image <image>                    (shared) Docker image
   --port <port>                      (shared) port the MCP listens on inside
