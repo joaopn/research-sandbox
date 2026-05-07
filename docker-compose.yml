@@ -18,9 +18,33 @@ services:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
+  webui:
+    # Optional browser UI; opt-in via `research webui start` (which does
+    # `docker compose --profile webui up -d webui`). Lives on rs-sandbox
+    # and is `docker network connect`'d to every rs-net-<project> by
+    # `wire_webui_to_projects()` so it can SSH to each supervisor by
+    # container DNS without going through the host's published port.
+    profiles: ["webui"]
+    build: ./webui
+    image: rs-webui:latest
+    container_name: rs-webui
+    networks:
+      - rs-sandbox
+    ports:
+      # WEBUI_PORT is the *host* port; container always listens on 7777
+      # internally (matches EXPOSE in webui/Dockerfile). Only WEBUI_BIND
+      # crosses the boundary because the TLS cert SAN needs to cover it.
+      - "${WEBUI_BIND:-127.0.0.1}:${WEBUI_PORT:-7777}:7777"
+    environment:
+      - WEBUI_BIND=${WEBUI_BIND:-127.0.0.1}
+    volumes:
+      - rs-webui-tls:/app/tls
+    restart: unless-stopped
+
 
 volumes:
   rs-router-rules:
+  rs-webui-tls:
 
 networks:
   # Shared infrastructure network: has internet via Docker gateway.

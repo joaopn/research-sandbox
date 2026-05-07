@@ -28,6 +28,7 @@ it internal to the container).
 from __future__ import annotations
 
 import argparse
+import base64
 import ipaddress
 import json
 import os
@@ -51,6 +52,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SUPERVISOR_IMAGE = "rs-supervisor:latest"
 ANALYSIS_IMAGE = "rs-analysis-base:latest"
 MCP_PROXY_IMAGE = "rs-mcp-proxy:latest"
+WEBUI_IMAGE = "rs-webui:latest"
+WEBUI_CONTAINER = "rs-webui"
 ROUTER_CONTAINER = "rs-router"
 ROUTER_NETWORK = "rs-sandbox"
 CONTAINER_PREFIX = "rs-project-"
@@ -62,6 +65,16 @@ MCP_CONTAINER_PREFIX = "rs-mcp-"
 MCP_LABEL = "research.mcp"
 MCP_NAME_LABEL = "research.mcp_name"
 PROBE_IMAGE = "busybox:1.36"
+
+# Per-supervisor service registry. KNOWN_SERVICES lists every kind the webui
+# might render; --enable / --disable on `project create|update` flips
+# `research.service.<id>` labels and `RS_SERVICE_<ID>` env vars in lockstep.
+# ALWAYS_ON_SERVICES can't be disabled — xterm is the substrate for
+# `research project ssh`. New service kinds extend both lists in the same
+# commit that ships the entrypoint conditional and the registry entry.
+KNOWN_SERVICES: list[str] = ["xterm"]
+ALWAYS_ON_SERVICES: set[str] = {"xterm"}
+SERVICE_LABEL_PREFIX = "research.service."
 
 # ---------------------------------------------------------------------------
 # Generic helpers
@@ -127,6 +140,50 @@ def load_config() -> Config:
             if k and k not in os.environ:
                 os.environ[k] = v
     return Config()
+
+
+def read_env_value(key: str) -> str:
+    """Read a single key from .env (commented lines ignored)."""
+    env_file = SCRIPT_DIR / ".env"
+    if not env_file.exists():
+        return ""
+    for line in env_file.read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or not stripped:
+            continue
+        if "=" in stripped:
+            k, _, v = stripped.partition("=")
+            if k.strip() == key:
+                return v.strip()
+    return ""
+
+
+def update_env_key(key: str, value: str) -> None:
+    """Set or append KEY=VALUE in .env. Replaces a commented `# KEY=` line
+    in place if present, so .env stays diffable across edits."""
+    env_file = SCRIPT_DIR / ".env"
+    if not env_file.exists():
+        env_file.write_text(f"{key}={value}\n")
+        return
+    lines = env_file.read_text().splitlines()
+    found = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith(f"{key}=") or stripped.startswith(f"# {key}="):
+            lines[i] = f"{key}={value}"
+            found = True
+            break
+    if not found:
+        lines.append(f"{key}={value}")
+    env_file.write_text("\n".join(lines) + "\n")
+
+
+def docker_compose(*compose_args: str) -> None:
+    run_check([
+        "docker", "compose",
+        "-f", str(SCRIPT_DIR / "docker-compose.yml"),
+        *compose_args,
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -368,8 +425,14 @@ def ensure_project_network(project: str, mode: str) -> tuple[str, str]:
 def remove_project_network(project: str) -> None:
     network = project_network_for(project)
     remove_firewall_rules(network)
-    run(["docker", "network", "disconnect", network, ROUTER_CONTAINER],
-        capture_output=True)
+    # Disconnect every container research.py knows might be attached. The
+    # webui (if running) was wired in by `wire_webui_to_projects()` at
+    # create time; without an explicit disconnect, `network rm` fails with
+    # "endpoints remain". Both calls are idempotent — they exit non-zero
+    # silently when the container isn't on this network.
+    for svc in (ROUTER_CONTAINER, WEBUI_CONTAINER):
+        run(["docker", "network", "disconnect", network, svc],
+            capture_output=True)
     run(["docker", "network", "rm", network], capture_output=True)
 
 
@@ -392,6 +455,7 @@ def build_supervisor_docker_args(
     image: str,
     dind_mode: str,
     inner_firewall: bool = False,
+    service_flags: dict[str, bool] | None = None,
 ) -> list[str]:
     args = [
         "run", "-d",
@@ -410,6 +474,14 @@ def build_supervisor_docker_args(
     ]
     if inner_firewall:
         args += ["-e", "RS_INNER_FIREWALL=1"]
+    # Per-service flags: webui reads the labels (outside-the-container truth);
+    # entrypoint reads the env vars (inside-the-container truth). Both must
+    # land on the same container in lockstep.
+    flags = service_flags if service_flags is not None else {sid: True for sid in KNOWN_SERVICES}
+    for sid in sorted(flags):
+        ena = "enabled" if flags[sid] else "disabled"
+        args += ["--label", f"{SERVICE_LABEL_PREFIX}{sid}={ena}"]
+        args += ["-e", f"RS_SERVICE_{sid.upper()}={ena}"]
     for s in dns_servers:
         args += ["--dns", s]
 
@@ -563,7 +635,14 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     # 2. Per-project network + router wiring.
     network, router_ip = ensure_project_network(project, egress)
 
+    # Webui (if running) joins the new per-project net so it can SSH to the
+    # supervisor by container DNS. Idempotent + a no-op when webui is off.
+    wire_webui_to_projects()
+
     # 3. Build docker run argv.
+    service_flags = _compute_service_flags(
+        getattr(args, "enable", None), getattr(args, "disable", None),
+    )
     docker_args = build_supervisor_docker_args(
         container_name=container_name,
         project=project,
@@ -577,6 +656,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         image=SUPERVISOR_IMAGE,
         dind_mode=dind_mode,
         inner_firewall=bool(getattr(args, "inner_firewall", False)),
+        service_flags=service_flags,
     )
     # Inject data-dir (and any future --mount) into argv just before the image name.
     if extra_mounts:
@@ -909,6 +989,15 @@ def _read_supervisor_metadata(container: str) -> dict:
     nano_cpus = hc.get("NanoCpus") or 0
     cpus = f"{nano_cpus / 1e9:g}" if nano_cpus else ""
 
+    service_flags: dict[str, bool] = {}
+    for sid in KNOWN_SERVICES:
+        v = labels.get(f"{SERVICE_LABEL_PREFIX}{sid}")
+        # Missing label (legacy projects) defaults to enabled, which matches
+        # the on-create default. ALWAYS_ON_SERVICES are forced True regardless.
+        service_flags[sid] = (v != "disabled")
+    for sid in ALWAYS_ON_SERVICES:
+        service_flags[sid] = True
+
     return {
         "ssh_port": ssh_port,
         "ssh_pass": env.get("SSH_PASSWORD", ""),
@@ -917,6 +1006,7 @@ def _read_supervisor_metadata(container: str) -> dict:
         "memory": memory,
         "cpus": cpus,
         "extra_mounts": extra_mounts,
+        "service_flags": service_flags,
     }
 
 
@@ -959,6 +1049,7 @@ def _recreate_supervisor(
     *,
     force_restage: bool = False,
     post_create_hook=None,
+    service_flags: dict[str, bool] | None = None,
 ) -> None:
     """Stash creds → stop+rm → create new container from SUPERVISOR_IMAGE
     → optional post-create hook → start → re-inject route → re-stage inner
@@ -988,6 +1079,7 @@ def _recreate_supervisor(
     run_check(["docker", "rm", container])
 
     network = project_network_for(project)
+    flags = service_flags if service_flags is not None else md["service_flags"]
     docker_args = build_supervisor_docker_args(
         container_name=container,
         project=project,
@@ -1001,6 +1093,7 @@ def _recreate_supervisor(
         image=SUPERVISOR_IMAGE,
         dind_mode=md["dind_mode"],
         inner_firewall=md["inner_firewall"],
+        service_flags=flags,
     )
     if md["extra_mounts"]:
         docker_args = docker_args[:-1] + md["extra_mounts"] + [docker_args[-1]]
@@ -1061,10 +1154,16 @@ def cmd_project_update(args: argparse.Namespace) -> None:
             for rel in _docker_cp_supervisor_files(c):
                 print(f"  {rel}")
 
+    flags_override: dict[str, bool] | None = None
+    if getattr(args, "enable", None) or getattr(args, "disable", None):
+        base = _read_service_flags(container)
+        flags_override = _compute_service_flags(args.enable, args.disable, base=base)
+
     _recreate_supervisor(
         project, cfg,
         force_restage=args.rebuild,
         post_create_hook=hook,
+        service_flags=flags_override,
     )
 
     if not args.keep_claude:
@@ -1636,6 +1735,207 @@ def cmd_project_mcp_deny(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-supervisor service flags
+# ---------------------------------------------------------------------------
+
+
+def _parse_service_list(s: str | None) -> set[str]:
+    if not s:
+        return set()
+    return {tok for tok in (t.strip() for t in s.split(",")) if tok}
+
+
+def _compute_service_flags(
+    enable_arg: str | None,
+    disable_arg: str | None,
+    base: dict[str, bool] | None = None,
+) -> dict[str, bool]:
+    """Resolve per-service enabled flags from --enable / --disable args.
+
+    Default = every known service enabled (or `base` if updating, so missing
+    flags inherit the supervisor's prior choices). xterm is always-on and
+    cannot be disabled. Unknown service ids are a hard error."""
+    enable = _parse_service_list(enable_arg)
+    disable = _parse_service_list(disable_arg)
+    unknown = (enable | disable) - set(KNOWN_SERVICES)
+    if unknown:
+        die(f"unknown service id(s): {sorted(unknown)} "
+            f"(known: {KNOWN_SERVICES})")
+    bad = disable & ALWAYS_ON_SERVICES
+    if bad:
+        die(f"cannot disable always-on service(s): {sorted(bad)}")
+
+    flags: dict[str, bool] = dict(base) if base else {}
+    for sid in KNOWN_SERVICES:
+        flags.setdefault(sid, True)
+    for sid in disable:
+        flags[sid] = False
+    for sid in enable:
+        flags[sid] = True
+    for sid in ALWAYS_ON_SERVICES:
+        flags[sid] = True
+    return flags
+
+
+def _read_service_flags(container: str) -> dict[str, bool]:
+    """Recover per-service flags from a supervisor's existing labels.
+    Missing labels (legacy projects) default to enabled. Used by
+    `_recreate_supervisor` so a bare `project update` preserves prior
+    --enable/--disable choices."""
+    if not container_exists(container):
+        return {sid: True for sid in KNOWN_SERVICES}
+    r = run(["docker", "inspect", container, "-f",
+             "{{json .Config.Labels}}"], capture_output=True)
+    try:
+        labels = json.loads(r.stdout) or {}
+    except json.JSONDecodeError:
+        labels = {}
+    out: dict[str, bool] = {}
+    for sid in KNOWN_SERVICES:
+        v = labels.get(f"{SERVICE_LABEL_PREFIX}{sid}")
+        out[sid] = (v != "disabled")  # missing or "enabled" => True
+    for sid in ALWAYS_ON_SERVICES:
+        out[sid] = True
+    return out
+
+
+# ---------------------------------------------------------------------------
+# webui (browser SSH multiplexer + service-aware proxy host)
+# ---------------------------------------------------------------------------
+
+
+def _supervisor_ssh_pass(container: str) -> str | None:
+    """Read SSH_PASSWORD from a supervisor container's env. Returns None
+    when the container is missing or the password isn't published."""
+    if not container_exists(container):
+        return None
+    r = run(["docker", "inspect", container, "-f",
+             "{{range .Config.Env}}{{println .}}{{end}}"],
+            capture_output=True)
+    if r.returncode != 0:
+        return None
+    for line in r.stdout.splitlines():
+        if line.startswith("SSH_PASSWORD="):
+            return line.split("=", 1)[1]
+    return None
+
+
+def _webui_import_string(project: str, ssh_pass: str) -> str:
+    """Build the base64 import string for the webui SPA. Webui reaches the
+    supervisor via container DNS on the per-project network (rs-webui is
+    `docker network connect`'d to every rs-net-<proj>), not via the
+    published host SSH port."""
+    return base64.b64encode(json.dumps({
+        "name": project,
+        "host": container_name_for(project),
+        "port": 22,
+        "username": "research",
+        "password": ssh_pass,
+    }).encode()).decode()
+
+
+def wire_webui_to_projects() -> None:
+    """Connect rs-webui to every existing per-project network. Idempotent;
+    no-op when the webui isn't running. Called at webui start and after
+    every `project create` so the webui sees fresh projects without a
+    restart."""
+    if not container_exists(WEBUI_CONTAINER):
+        return
+    r = run(["docker", "network", "ls",
+             "--filter", f"name=^{PROJECT_NETWORK_PREFIX}",
+             "--format", "{{.Name}}"],
+            capture_output=True)
+    for net in r.stdout.strip().splitlines():
+        if net:
+            run(["docker", "network", "connect", net, WEBUI_CONTAINER],
+                capture_output=True)
+
+
+def cmd_webui(args: argparse.Namespace) -> None:
+    """Manage the optional webui container (start | stop | status | import)."""
+    action = args.webui_action
+    port = read_env_value("WEBUI_PORT") or "7777"
+    bind = read_env_value("WEBUI_BIND") or "127.0.0.1"
+
+    if action == "import":
+        target = getattr(args, "project", None)
+        if target:
+            container = container_name_for(target)
+            if not container_exists(container):
+                die(f"project {target!r} does not exist")
+            ssh_pass = _supervisor_ssh_pass(container)
+            if not ssh_pass:
+                die(f"could not read SSH password from {container}")
+            print(_webui_import_string(target, ssh_pass))
+            return
+        rows: list[tuple[str, str]] = []
+        for c in get_supervisor_containers():
+            sp = _supervisor_ssh_pass(c["name"])
+            if sp:
+                rows.append((c["project"], _webui_import_string(c["project"], sp)))
+        if not rows:
+            print("no projects with SSH info available.")
+            return
+        name_w = max(len(p) for p, _ in rows)
+        for p, s in rows:
+            print(f"{p.ljust(name_w)}  {s}")
+        return
+
+    if action == "start":
+        new_bind = getattr(args, "bind", None)
+        new_port = getattr(args, "port", None)
+        recreate = False
+        if new_bind and new_bind != bind:
+            update_env_key("WEBUI_BIND", new_bind)
+            bind = new_bind
+            recreate = True
+        if new_port and new_port != port:
+            update_env_key("WEBUI_PORT", new_port)
+            port = new_port
+            recreate = True
+        os.environ["WEBUI_BIND"] = bind
+        os.environ["WEBUI_PORT"] = port
+        if recreate and container_exists(WEBUI_CONTAINER):
+            print(f"bind/port changed; recreating webui...")
+            run(["docker", "rm", "-f", WEBUI_CONTAINER], capture_output=True)
+
+        if container_running(WEBUI_CONTAINER):
+            wire_webui_to_projects()
+            print(f"webui already running at https://{bind}:{port}")
+            return
+        if container_exists(WEBUI_CONTAINER):
+            run(["docker", "rm", "-f", WEBUI_CONTAINER], capture_output=True)
+        if not run_quiet(["docker", "image", "inspect", WEBUI_IMAGE]):
+            print("building webui image...")
+            docker_compose("--profile", "webui", "build", "webui")
+        print(f"starting webui (bind {bind}:{port})...")
+        docker_compose("--profile", "webui", "up", "-d", "webui")
+        wire_webui_to_projects()
+        print(f"webui:  https://{bind}:{port}")
+        print(f"  (self-signed cert — your browser will warn on first visit; click through)")
+        return
+
+    if action == "stop":
+        if not container_exists(WEBUI_CONTAINER):
+            print("webui not running.")
+            return
+        print("stopping webui...")
+        run(["docker", "rm", "-f", WEBUI_CONTAINER], capture_output=True)
+        print("webui stopped.")
+        return
+
+    if action == "status":
+        if container_running(WEBUI_CONTAINER):
+            print(f"webui: running")
+            print(f"  https://{bind}:{port}")
+        elif container_exists(WEBUI_CONTAINER):
+            print("webui: stopped (container exists)")
+        else:
+            print(f"webui: not running  (configured bind {bind}:{port})")
+        return
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -1669,6 +1969,13 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--inner-firewall", action="store_true",
                    help="enable defense-in-depth iptables ACL on the supervisor's "
                         "rs-inner bridge (workers can only reach mcp-proxy + DNS)")
+    c.add_argument("--enable", metavar="IDS",
+                   help=f"comma-separated service ids to force-enable "
+                        f"(known: {','.join(KNOWN_SERVICES)})")
+    c.add_argument("--disable", metavar="IDS",
+                   help="comma-separated service ids to disable "
+                        "(default: all known services enabled; xterm is "
+                        "always-on and cannot be disabled)")
     c.set_defaults(func=cmd_project_create)
 
     a = proj_sub.add_parser("attach", help="docker exec + byobu attach")
@@ -1718,6 +2025,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "instead of overwriting them with the latest "
                         "templates (default: refresh, so role-doc and "
                         "slash-command edits propagate)")
+    u.add_argument("--enable", metavar="IDS",
+                   help=f"comma-separated service ids to enable "
+                        f"(known: {','.join(KNOWN_SERVICES)})")
+    u.add_argument("--disable", metavar="IDS",
+                   help="comma-separated service ids to disable "
+                        "(xterm is always-on and cannot be disabled)")
     u.set_defaults(func=cmd_project_update)
 
     sh = proj_sub.add_parser("ssh", help="print SSH connection info")
@@ -1797,6 +2110,34 @@ def build_parser() -> argparse.ArgumentParser:
     mts.add_argument("name", nargs="?",
                      help="MCP name; omit to test every registered MCP")
     mts.set_defaults(func=cmd_mcp_test)
+
+    # ----- webui (browser SSH multiplexer) ------------------------------
+    wu = sub.add_parser("webui", help="manage the optional browser UI container")
+    wu_sub = wu.add_subparsers(dest="webui_action", required=True)
+
+    wus = wu_sub.add_parser("start",
+                            help="start the webui (builds image if missing)")
+    wus.add_argument("--bind",
+                     help="host IP to bind to (default 127.0.0.1; set to 0.0.0.0 "
+                          "to expose on LAN; updates .env, regenerates TLS cert SAN)")
+    wus.add_argument("--port",
+                     help="host port to bind to (default 7777; updates .env). "
+                          "Container always listens on 7777 internally")
+    wus.set_defaults(func=cmd_webui)
+
+    wup = wu_sub.add_parser("stop", help="remove the webui container")
+    wup.set_defaults(func=cmd_webui)
+
+    wut = wu_sub.add_parser("status", help="show webui status")
+    wut.set_defaults(func=cmd_webui)
+
+    wui = wu_sub.add_parser(
+        "import",
+        help="print the base64 import string the SPA's add-project form auto-fills from",
+    )
+    wui.add_argument("project", nargs="?",
+                     help="project name; omit to list every project that has SSH info")
+    wui.set_defaults(func=cmd_webui)
 
     return p
 

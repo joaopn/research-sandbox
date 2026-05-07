@@ -7,6 +7,19 @@
 #   HOST_GID         — host user's GID, for shared bind-mount access (optional)
 #   DOCKER_DIND      — set to "true" when sysbox or --privileged is providing DIND
 #
+# Per-service env vars (RS_SERVICE_<ID>):
+#   `research project create|update --enable/--disable <ids>` flips both
+#   `research.service.<id>` labels (read by the webui) and `RS_SERVICE_<ID>`
+#   env vars (read here) in lockstep. Conditional service start blocks
+#   wrap themselves in:
+#       if [[ "${RS_SERVICE_FOO:-enabled}" == "enabled" ]]; then
+#           ...start foo...
+#       fi
+#   xterm (sshd + byobu) is implicit always-on — it's the substrate for
+#   `research project ssh` — and is NOT gated by an env var. W1 ships no
+#   conditional blocks; the pattern lands when the first toggleable
+#   service (jupyter) arrives in W2.
+#
 # Startup order:
 #   1. GID remap (for bind mounts from host).
 #   2. Home-skel restore (volume hides image contents on first boot).
