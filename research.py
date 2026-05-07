@@ -1439,7 +1439,17 @@ def cmd_mcp_start(args: argparse.Namespace) -> None:
         return
     targets = _shared_mcps(only_enabled=True)
     if not targets:
-        print("(no enabled shared MCPs)")
+        try:
+            data = mcp_registry.load()
+        except mcp_registry.RegistryError as e:
+            die(str(e))
+        ext = [n for n, e in data["mcps"].items()
+               if e.get("enabled", False) and e["kind"] == "external"]
+        if ext:
+            print(f"(nothing to start: {len(ext)} enabled MCP(s) are "
+                  f"external and have no container lifecycle)")
+        else:
+            print("(no enabled MCPs)")
         return
     for name, entry in targets:
         _spawn_shared_mcp(name, entry)
@@ -1509,10 +1519,9 @@ def cmd_mcp_test(args: argparse.Namespace) -> None:
             die(f"no MCP named {args.name!r}")
         names = [args.name]
     else:
-        names = sorted(n for n, e in data["mcps"].items()
-                       if e.get("enabled", False))
+        names = sorted(data["mcps"].keys())
         if not names:
-            print("(no enabled MCPs)")
+            print("(no MCPs registered)")
             return
     _ensure_router_running()
     failed = False
@@ -1784,9 +1793,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="MCP name; omit to stop every running shared MCP")
     mst.set_defaults(func=cmd_mcp_stop)
 
-    mts = mcp_sub.add_parser("test", help="probe reachability of MCPs (defaults to all enabled)")
+    mts = mcp_sub.add_parser("test", help="probe reachability of MCPs (defaults to every registered MCP)")
     mts.add_argument("name", nargs="?",
-                     help="MCP name; omit to test every enabled MCP")
+                     help="MCP name; omit to test every registered MCP")
     mts.set_defaults(func=cmd_mcp_test)
 
     return p
