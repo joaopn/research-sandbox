@@ -800,12 +800,7 @@ function activateService(serviceId) {
     if (svc.kind === "ssh") {
         openSshTerminal(project, serviceId, svc);
     } else if (svc.kind === "http") {
-        // TODO(W2): mount the iframe + cookie session for http kinds.
-        const termArea = document.getElementById("terminal-area");
-        const placeholder = el("div", { class: "welcome" }, [
-            `Service kind "${svc.kind}" not supported in W1.`,
-        ]);
-        termArea.appendChild(placeholder);
+        openHttpService(project, serviceId, svc);
     } else {
         const termArea = document.getElementById("terminal-area");
         const placeholder = el("div", { class: "welcome" }, [
@@ -938,6 +933,112 @@ function openSshTerminal(project, serviceId, svc) {
             fitAddon.fit();
         }
     });
+}
+
+// ---- http-kind iframe ------------------------------------------------------
+
+async function openHttpService(project, serviceId, svc) {
+    const termArea = document.getElementById("terminal-area");
+    const container = el("div", { class: "terminal-instance http-instance" });
+    const status = el("div", { class: "http-status" }, ["Authenticating…"]);
+    container.appendChild(status);
+    termArea.appendChild(container);
+
+    const key = tkey(project.name, serviceId);
+    state.terminals[key] = {
+        kind: "http", container, project, service: serviceId,
+    };
+
+    // POST /session/<project> to mint the cookie before mounting the iframe.
+    // The fingerprint, if any, is included so the server's TOFU check
+    // mirrors the SSH path; on mismatch the user gets the same
+    // accept-the-new-key prompt as xterm.
+    const credentials = {
+        host: project.host,
+        port: project.port || 22,
+        username: project.username || "research",
+        password: project.password,
+        fingerprint: project.host_key_fingerprint || null,
+    };
+
+    let resp;
+    try {
+        resp = await fetch(`/session/${encodeURIComponent(project.name)}`, {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(credentials),
+        });
+    } catch (e) {
+        status.textContent = `Connect failed: ${e.message || e}`;
+        return;
+    }
+
+    if (resp.status === 401) {
+        let body = {};
+        try { body = await resp.json(); } catch (_) {}
+        if (body.type === "fingerprint_mismatch") {
+            const accept = confirm(
+                `Host key for "${project.name}" has CHANGED.\n\n` +
+                `Stored: ${project.host_key_fingerprint}\n` +
+                `Actual: ${body.actual}\n\n` +
+                `Accept the new key?\n\n` +
+                `Click OK only if you intentionally recreated the supervisor.`,
+            );
+            if (accept) {
+                project.host_key_fingerprint = body.actual;
+                await persistVault();
+                // Tear down this placeholder; user clicks the tab again to retry.
+                delete state.terminals[key];
+                container.remove();
+                status.textContent = "Host key updated — click the tab to reconnect.";
+                return;
+            }
+            status.textContent = "Host key mismatch — connection rejected.";
+            return;
+        }
+        if (body.type === "auth_failed") {
+            status.textContent = "Auth failed — check the saved password.";
+            return;
+        }
+        status.textContent = `Auth error (${resp.status}).`;
+        return;
+    }
+
+    if (!resp.ok) {
+        const text = await resp.text().catch(() => "");
+        status.textContent = `Session error: ${resp.status} ${text}`;
+        return;
+    }
+
+    let body;
+    try { body = await resp.json(); } catch (_) { body = {}; }
+    if (body.fingerprint && !project.host_key_fingerprint) {
+        project.host_key_fingerprint = body.fingerprint;
+        await persistVault();
+    }
+
+    // Mount the iframe. Trailing slash on the URL is load-bearing for
+    // code-server's relative-URL discipline; the server-side proxy 301s
+    // the no-slash form, but pre-emptively constructing the slash form
+    // avoids an extra round-trip.
+    const iframe = el("iframe", {
+        class: "http-iframe",
+        src: `/proxy/${encodeURIComponent(project.name)}/${encodeURIComponent(serviceId)}/`,
+        // Only the absolute minimum sandbox the upstream needs. code-server
+        // needs scripts, same-origin (cookies), forms, popups (its
+        // command-palette opens windows for some commands), modals, and
+        // clipboard. Drop top-navigation: prevents iframe-escape.
+        sandbox: [
+            "allow-scripts", "allow-same-origin", "allow-forms",
+            "allow-popups", "allow-popups-to-escape-sandbox",
+            "allow-modals", "allow-downloads",
+        ].join(" "),
+    });
+    container.removeChild(status);
+    container.appendChild(iframe);
+
+    state.terminals[key].iframe = iframe;
 }
 
 async function handleControl(project, serviceId, term, ws, ctrl) {

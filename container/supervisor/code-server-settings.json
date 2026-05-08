@@ -1,0 +1,47 @@
+{
+  "telemetry.telemetryLevel": "off",
+  "update.mode": "none",
+  "extensions.autoCheckUpdates": false,
+  "extensions.autoUpdate": false,
+
+  "workbench.startupEditor": "none",
+  "workbench.enableExperiments": false,
+  "workbench.settings.enableNaturalLanguageSearch": false,
+  "workbench.tips.enabled": false,
+  "workbench.welcomePage.walkthroughs.openOnInstall": false,
+
+  "git.enabled": false,
+  "git.autoRepositoryDetection": false,
+  "scm.diffDecorations": "none",
+
+  "security.workspace.trust.enabled": false,
+
+  "editor.minimap.enabled": false,
+  "editor.formatOnSave": false,
+  "editor.linkedEditing": true,
+  "editor.bracketPairColorization.enabled": true,
+
+  "files.watcherExclude": {
+    "**/.git/**": true,
+    "**/node_modules/**": true,
+    "**/.venv/**": true,
+    "**/__pycache__/**": true,
+    "**/.ipynb_checkpoints/**": true,
+    "**/data/**": true,
+    "**/results/**": true,
+    "**/staging/**": true,
+    "**/workers/**/work/outputs/**": true
+  },
+  "search.exclude": {
+    "**/.venv": true,
+    "**/__pycache__": true,
+    "**/.ipynb_checkpoints": true,
+    "**/data": true,
+    "**/results": true,
+    "**/staging": true,
+    "**/workers/**/work/outputs": true
+  },
+  "search.followSymlinks": false,
+
+  "terminal.integrated.scrollback": 5000
+}

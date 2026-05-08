@@ -72,9 +72,17 @@ PROBE_IMAGE = "busybox:1.36"
 # ALWAYS_ON_SERVICES can't be disabled — xterm is the substrate for
 # `research project ssh`. New service kinds extend both lists in the same
 # commit that ships the entrypoint conditional and the registry entry.
-KNOWN_SERVICES: list[str] = ["xterm"]
+KNOWN_SERVICES: list[str] = ["xterm", "code-server"]
 ALWAYS_ON_SERVICES: set[str] = {"xterm"}
 SERVICE_LABEL_PREFIX = "research.service."
+
+# In-supervisor ports for code-server's lazy-start stub. The stub listens on
+# CODE_SERVER_STUB_PORT (the port the webui reverse-proxy hits via container
+# DNS) and spawns code-server on CODE_SERVER_UPSTREAM_PORT, which never
+# leaves 127.0.0.1. Ports are constants — supervisors are single-tenant
+# inside their own network namespace, no contention possible.
+CODE_SERVER_STUB_PORT = 8443
+CODE_SERVER_UPSTREAM_PORT = 8444
 
 # ---------------------------------------------------------------------------
 # Generic helpers
@@ -482,6 +490,14 @@ def build_supervisor_docker_args(
         ena = "enabled" if flags[sid] else "disabled"
         args += ["--label", f"{SERVICE_LABEL_PREFIX}{sid}={ena}"]
         args += ["-e", f"RS_SERVICE_{sid.upper()}={ena}"]
+    # code-server lazy-reap idle window. Optional — entrypoint defaults to
+    # 1800s (30 min) when unset; .env can override per-host. Survives
+    # _recreate_supervisor by being re-passed from the host's env on every
+    # create, which is what we want (a host-side tweak should propagate to
+    # the next project lifecycle, not require per-project state).
+    idle = os.environ.get("CODE_SERVER_IDLE_SECONDS")
+    if idle:
+        args += ["-e", f"CODE_SERVER_IDLE_SECONDS={idle}"]
     for s in dns_servers:
         args += ["--dns", s]
 
@@ -939,6 +955,8 @@ _SUPERVISOR_FILE_MAP: list[tuple[str, str, bool]] = [
     ("container/supervisor/setup.sh",                   "/opt/claude-templates/setup.sh",                    True),
     ("container/supervisor/logbook_supervisor_template.md", "/opt/claude-templates/logbook_supervisor_template.md", False),
     ("container/supervisor/logbook_pi_template.md",     "/opt/claude-templates/logbook_pi_template.md",      False),
+    ("container/supervisor/code-server-stub.py",        "/opt/code-server-tools/code-server-stub.py",        True),
+    ("container/supervisor/code-server-settings.json",  "/opt/code-server-templates/User/settings.json",     False),
     ("container/analysis/CLAUDE.md.template",           "/opt/claude-templates/worker.CLAUDE.md.template",   False),
     ("agent/entrypoint.supervisor.sh",                  "/entrypoint.sh",                                    True),
 ]

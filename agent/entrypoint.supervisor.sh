@@ -150,6 +150,73 @@ if [[ -f /opt/claude-templates/setup.sh ]]; then
     source /opt/claude-templates/setup.sh
 fi
 
+# --- code-server (lazy-start via stub) -------------------------------------
+# Only runs if RS_SERVICE_CODE_SERVER=enabled (default at create time;
+# `research project create|update --disable code-server` flips this to
+# disabled in lockstep with the matching label). The stub itself is
+# lightweight (~15 MB Python); code-server only spawns when the editor
+# tab is actually opened in the webui.
+if [[ "${RS_SERVICE_CODE_SERVER:-enabled}" == "enabled" ]]; then
+    # Entrypoint runs as `research` (USER directive); /workspace is
+    # research-owned by the time we get here (the chown earlier in this
+    # script handled that). No sudo needed for mkdir/cp/code-server below.
+    CS_USER_DIR=/workspace/.local/share/code-server
+    CS_EXT_DIR="${CS_USER_DIR}/extensions"
+    mkdir -p "${CS_USER_DIR}/User" "${CS_EXT_DIR}"
+
+    # Pre-baked settings.json: stage if absent. Don't overwrite — PI
+    # customisations under /workspace/.local/share/.../User/settings.json
+    # win on subsequent boots. Deliberately omitted from
+    # _refresh_workspace_claude_templates: that function force-overwrites,
+    # which is correct for CLAUDE.md / slash commands but wrong for a
+    # user-customisable settings file. To pick up a newer template after
+    # an image bump, manually `rm` the stale settings.json and reboot.
+    if [[ ! -f "${CS_USER_DIR}/User/settings.json" ]] && \
+       [[ -f /opt/code-server-templates/User/settings.json ]]; then
+        cp /opt/code-server-templates/User/settings.json \
+           "${CS_USER_DIR}/User/settings.json"
+    fi
+
+    # Install pre-staged .vsix files (Microsoft-marketplace-only extensions
+    # like Data Wrangler that aren't on Open VSX) once per workspace.
+    # Idempotent: if any directory matching <ext-id>-* already exists,
+    # skip — bumping a version requires removing the old dir manually.
+    if [[ -d /opt/code-server-templates/extensions ]]; then
+        for vsix in /opt/code-server-templates/extensions/*.vsix; do
+            [[ -f "$vsix" ]] || continue
+            base=$(basename "$vsix" .vsix)
+            # Most .vsix unpacks to <publisher>.<name>-<version>; skip if
+            # any matching dir is present. Glob may not expand cleanly when
+            # there are no matches — bash's nullglob protects us.
+            shopt -s nullglob
+            existing=( "${CS_EXT_DIR}/"*"${base}"* )
+            shopt -u nullglob
+            if (( ${#existing[@]} > 0 )); then
+                continue
+            fi
+            echo "installing code-server extension: ${base}"
+            code-server \
+                --install-extension "$vsix" \
+                --extensions-dir "${CS_EXT_DIR}" \
+                --user-data-dir "${CS_USER_DIR}" \
+                || echo "WARNING: failed to install ${base}" >&2
+        done
+    fi
+
+    # Launch the stub. The reap interval (CODE_SERVER_IDLE_SECONDS) lives
+    # in the supervisor's env and is set by `research project create` from
+    # the host .env (defaulting to 1800s = 30 min if unset).
+    : "${CODE_SERVER_STUB_PORT:=8443}"
+    : "${CODE_SERVER_UPSTREAM_PORT:=8444}"
+    : "${CODE_SERVER_IDLE_SECONDS:=1800}"
+    export CODE_SERVER_STUB_PORT CODE_SERVER_UPSTREAM_PORT \
+           CODE_SERVER_IDLE_SECONDS
+    nohup /opt/code-server-tools/code-server-stub.py \
+        > /tmp/code-server-stub.log 2>&1 &
+    echo "code-server stub launched on :${CODE_SERVER_STUB_PORT}; "\
+"upstream :${CODE_SERVER_UPSTREAM_PORT}; idle reap ${CODE_SERVER_IDLE_SECONDS}s"
+fi
+
 # Byobu is NOT pre-started here. `research project attach` creates the "main"
 # session lazily if needed. Pre-starting would freeze a bash process that
 # predates `usermod -aG docker research` (docker-ce is installed at project

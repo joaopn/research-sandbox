@@ -1,23 +1,25 @@
 """Research Sandbox webui — service-aware browser front for project supervisors.
 
-W1 exposes the `xterm` service only; the registry abstraction in services.py
-locks the API shape so W2 (jupyter, http kind) drops in without churning the
-SPA contract. No docker socket, no host mounts: connectivity to each
-supervisor is via `docker network connect` of this container to every
-`rs-net-<project>`.
+Two service kinds: `ssh` (WS-wrapped, browser xterm.js terminal) and `http`
+(reverse-proxied with a per-project session cookie issued by /session/<proj>).
+The supervisor's container DNS name (`rs-project-<proj>`) is the only handle
+the webui has on each project — no docker socket, no host mounts; connectivity
+is via `docker network connect` of this container to every `rs-net-<project>`.
 """
 import asyncio
 import ipaddress
 import json
 import logging
 import os
+import secrets
 import ssl
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
 import asyncssh
-from aiohttp import web, WSMsgType
+from aiohttp import web, ClientSession, ClientTimeout, WSMsgType
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -38,6 +40,37 @@ LISTEN_HOST = os.environ.get("WEBUI_HOST", "0.0.0.0")
 # never the in-container listen port.
 LISTEN_PORT = 7777
 HOST_BIND = os.environ.get("WEBUI_BIND", "127.0.0.1")
+
+# Container DNS prefix — the webui reaches each supervisor at
+# `rs-project-<name>` over the per-project bridge it's been network-connected
+# to. Mirrors `container_name_for(project)` in research.py.
+PROJECT_CONTAINER_PREFIX = "rs-project-"
+
+# Session TTL for the /session/<proj>-issued cookie. Eight hours = one full
+# work day; cookies expire silently and the SPA re-POSTs /session on the
+# next service-tab open. Not user-visible until expiry; no re-prompt for
+# the master password (the SPA still has the SSH credential in the vault).
+SESSION_TTL_SECONDS = 8 * 60 * 60
+
+# How long a TCP probe waits before declaring a per-project service down.
+# Used both by the legacy /probe endpoint and by project_services_handler's
+# enumeration. 3s is the number /probe shipped with in W1; kept consistent.
+TCP_PROBE_TIMEOUT_SECONDS = 3.0
+
+# HTTP hop-by-hop headers that must NOT be forwarded across a proxy boundary
+# per RFC 7230 §6.1. Stripped both inbound (request → upstream) and outbound
+# (upstream → response). aiohttp ClientSession adds its own connection
+# management; copying these would confuse it.
+HOP_BY_HOP_HEADERS = frozenset({
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade", "host",
+    "content-length",
+})
+
+# In-memory session map: cookie token → {"project": str, "expires": float}.
+# Single-process webui; no cross-process sharing needed. Stale entries get
+# garbage-collected lazily on lookup.
+SESSIONS: dict[str, dict] = {}
 
 
 class HostKeyValidator(asyncssh.SSHClient):
@@ -198,6 +231,22 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
     return ws
 
 
+async def tcp_probe(host: str, port: int,
+                    timeout: float = TCP_PROBE_TIMEOUT_SECONDS) -> bool:
+    """Single TCP-connect probe: True iff the kernel completed handshake."""
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True
+    except (OSError, asyncio.TimeoutError):
+        return False
+
+
 async def probe_handler(request: web.Request) -> web.Response:
     """TCP-connect probe used to color tabs as up/down."""
     host = request.query.get("host", "")
@@ -207,18 +256,7 @@ async def probe_handler(request: web.Request) -> web.Response:
         return web.json_response({"up": False, "error": "invalid port"})
     if not host or port < 1 or port > 65535:
         return web.json_response({"up": False, "error": "host/port required"})
-
-    try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port), timeout=3)
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
-        return web.json_response({"up": True})
-    except (OSError, asyncio.TimeoutError):
-        return web.json_response({"up": False})
+    return web.json_response({"up": await tcp_probe(host, port)})
 
 
 async def services_handler(request: web.Request) -> web.Response:
@@ -228,14 +266,277 @@ async def services_handler(request: web.Request) -> web.Response:
 
 
 async def project_services_handler(request: web.Request) -> web.Response:
-    """Per-project enabled-set. W1 returns the always-on subset (xterm only).
-    W2 will read `research.service.<id>` labels from the supervisor container
-    via the docker socket; until then we trust the registry's `always_on`
-    flag, which is correct because xterm is the only kind and `--disable
-    xterm` is rejected at the CLI."""
-    enabled = {sid: svc for sid, svc in services.SERVICES.items()
-               if svc.get("always_on")}
-    return web.json_response(enabled)
+    """Per-project enabled-set. always_on services are always included;
+    kind=http services are included iff their default port is currently
+    listening on `rs-project-<proj>`. Probe-driven rather than label-
+    driven: this avoids granting the webui a docker socket while
+    preserving the property that disabled services don't surface a tab.
+    A crashed (enabled-but-not-listening) service also drops off, which
+    is the correct UX — a tab that 502s on click is worse than no tab."""
+    project = request.match_info.get("project", "")
+    upstream = f"{PROJECT_CONTAINER_PREFIX}{project}"
+    out: dict[str, dict] = {}
+    probe_jobs: list[tuple[str, dict]] = []
+    for sid, svc in services.SERVICES.items():
+        if svc.get("always_on"):
+            out[sid] = svc
+            continue
+        if svc.get("kind") == "http":
+            probe_jobs.append((sid, svc))
+    if probe_jobs:
+        results = await asyncio.gather(*[
+            tcp_probe(upstream, int(svc.get("default_port", 0)))
+            for _, svc in probe_jobs
+        ])
+        for (sid, svc), up in zip(probe_jobs, results):
+            if up:
+                out[sid] = svc
+    return web.json_response(out)
+
+
+# ---- /session/<project> — issue a per-project session cookie -----------
+
+def _session_valid(token: str, project: str) -> bool:
+    """Look up `token` in SESSIONS, validate project + TTL. Garbage-collects
+    expired entries on lookup."""
+    s = SESSIONS.get(token)
+    if not s:
+        return False
+    if s["project"] != project:
+        return False
+    if time.time() > s["expires"]:
+        SESSIONS.pop(token, None)
+        return False
+    return True
+
+
+async def session_handler(request: web.Request) -> web.Response:
+    """POST /session/<project> — validate the project's SSH credentials
+    by attempting an SSH connect, then issue an HttpOnly session cookie
+    scoped to /proxy/<project>/. The credential is the same one the
+    vault holds for the xterm tab; this hands it through to gate the
+    iframe-rendered http-kind services without inventing a second auth.
+
+    Body: JSON `{host, port?, username?, password, fingerprint?}` (the
+    same shape the SSH `connect` message uses on /ws). On success the
+    response sets `Set-Cookie: rs_session_<proj>=<token>; Path=/proxy/
+    <proj>/; Secure; HttpOnly; SameSite=Strict`."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+
+    project = request.match_info.get("project", "")
+    if not project:
+        return web.Response(status=400, text="project required")
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.Response(status=400, text="invalid JSON")
+
+    host = body.get("host")
+    port = int(body.get("port", 22))
+    username = body.get("username") or "research"
+    password = body.get("password")
+    expected_fp = body.get("fingerprint")
+
+    if not host or not password:
+        return web.Response(status=400, text="host and password required")
+
+    validator = HostKeyValidator(expected_fp)
+    try:
+        conn = await asyncssh.connect(
+            host=host, port=port,
+            username=username, password=password,
+            client_factory=lambda: validator,
+            known_hosts=None, client_keys=None,
+            connect_timeout=10,
+        )
+        conn.close()
+    except asyncssh.HostKeyNotVerifiable:
+        return web.json_response(
+            {"type": "fingerprint_mismatch", "actual": validator.actual_fp},
+            status=401)
+    except asyncssh.PermissionDenied:
+        return web.json_response({"type": "auth_failed"}, status=401)
+    except Exception as e:
+        log.warning(f"/session/{project}: SSH connect failed: {e}")
+        return web.json_response({"type": "error", "msg": str(e)}, status=502)
+
+    token = secrets.token_urlsafe(32)
+    SESSIONS[token] = {
+        "project": project,
+        "expires": time.time() + SESSION_TTL_SECONDS,
+    }
+    response = web.json_response(
+        {"ok": True, "fingerprint": validator.actual_fp})
+    response.set_cookie(
+        f"rs_session_{project}", token,
+        path=f"/proxy/{project}/",
+        httponly=True, secure=True, samesite="Strict",
+        max_age=SESSION_TTL_SECONDS,
+    )
+    return response
+
+
+# ---- /proxy/<project>/<service>/<path> — kind=http reverse proxy --------
+
+def _filter_headers(headers, drop: frozenset[str]) -> dict[str, str]:
+    return {k: v for k, v in headers.items() if k.lower() not in drop}
+
+
+async def _proxy_ws(request: web.Request,
+                    upstream_url: str) -> web.StreamResponse:
+    """WS pass-through. Opens upstream first so a failure returns a clean
+    502 to the browser instead of a bare close frame after handshake."""
+    client_subprotocols: list[str] = []
+    sec_proto = request.headers.get("Sec-WebSocket-Protocol")
+    if sec_proto:
+        client_subprotocols = [
+            p.strip() for p in sec_proto.split(",") if p.strip()
+        ]
+
+    timeout = ClientTimeout(total=None, sock_read=None)
+    sess = ClientSession(timeout=timeout)
+    try:
+        try:
+            upstream_ws = await sess.ws_connect(
+                upstream_url,
+                protocols=client_subprotocols,
+                heartbeat=30,
+                max_msg_size=0,
+            )
+        except Exception as e:
+            await sess.close()
+            log.info(f"WS upstream connect failed: {e}")
+            return web.Response(status=502, text=f"upstream WS failed: {e}")
+
+        chosen = upstream_ws.protocol
+        client_ws = web.WebSocketResponse(
+            protocols=[chosen] if chosen else (),
+            heartbeat=30,
+            max_msg_size=0,
+        )
+        await client_ws.prepare(request)
+
+        async def c2u():
+            async for msg in client_ws:
+                if msg.type == WSMsgType.TEXT:
+                    await upstream_ws.send_str(msg.data)
+                elif msg.type == WSMsgType.BINARY:
+                    await upstream_ws.send_bytes(msg.data)
+                elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING,
+                                  WSMsgType.CLOSED, WSMsgType.ERROR):
+                    break
+
+        async def u2c():
+            async for msg in upstream_ws:
+                if msg.type == WSMsgType.TEXT:
+                    await client_ws.send_str(msg.data)
+                elif msg.type == WSMsgType.BINARY:
+                    await client_ws.send_bytes(msg.data)
+                elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING,
+                                  WSMsgType.CLOSED, WSMsgType.ERROR):
+                    break
+
+        try:
+            _, pending = await asyncio.wait(
+                [asyncio.create_task(c2u()), asyncio.create_task(u2c())],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+        finally:
+            if not upstream_ws.closed:
+                await upstream_ws.close()
+            if not client_ws.closed:
+                await client_ws.close()
+        return client_ws
+    finally:
+        await sess.close()
+
+
+async def _proxy_http(request: web.Request,
+                      upstream_url: str) -> web.StreamResponse:
+    """HTTP pass-through. Streams body both directions; preserves status,
+    headers (minus hop-by-hop), and any Set-Cookie from upstream."""
+    headers_in = _filter_headers(request.headers, HOP_BY_HOP_HEADERS)
+
+    # Stream the body upstream rather than buffering — code-server's
+    # editor saves (an .ipynb, a large prose file) need to flow through
+    # without an intermediate read into memory. GET/HEAD have no body.
+    data = None
+    if request.method not in ("GET", "HEAD"):
+        data = request.content
+
+    # No request timeout — code-server's WS workbench traffic and long polls
+    # need to live as long as the user holds the tab. Connection close is
+    # the source of truth for "done", not a wall clock.
+    timeout = ClientTimeout(total=None, sock_read=None)
+    async with ClientSession(timeout=timeout, auto_decompress=False) as sess:
+        async with sess.request(
+            request.method,
+            upstream_url,
+            headers=headers_in,
+            data=data,
+            allow_redirects=False,
+        ) as upstream_resp:
+            headers_out = _filter_headers(
+                upstream_resp.headers, HOP_BY_HOP_HEADERS)
+            response = web.StreamResponse(
+                status=upstream_resp.status,
+                reason=upstream_resp.reason,
+                headers=headers_out,
+            )
+            await response.prepare(request)
+            async for chunk in upstream_resp.content.iter_any():
+                if not chunk:
+                    break
+                await response.write(chunk)
+            await response.write_eof()
+            return response
+
+
+async def proxy_handler(request: web.Request) -> web.StreamResponse:
+    """`/proxy/<project>/<service>/<tail>` — reverse-proxy kind=http
+    services. Validates the project session cookie issued by /session,
+    then forwards HTTP or WS upgrades to `rs-project-<proj>:<port>/<tail>`,
+    stripping the proxy prefix so the upstream sees its own root.
+
+    Trailing-slash discipline: if hit at `/proxy/<proj>/<svc>` (no slash),
+    redirect to the slash form. code-server's relative-URL resolution
+    requires the trailing slash for asset paths to come out correct."""
+    project = request.match_info.get("project", "")
+    service_id = request.match_info.get("service", "")
+    tail = request.match_info.get("tail", "")
+
+    cookie = request.cookies.get(f"rs_session_{project}")
+    if not cookie or not _session_valid(cookie, project):
+        return web.Response(status=401, text="session required")
+
+    svc = services.get(service_id)
+    if svc is None or svc.get("kind") != "http":
+        return web.Response(
+            status=404, text=f"unknown http service {service_id!r}")
+
+    # No-trailing-slash edge: /proxy/<proj>/<svc> → 301 to /proxy/<proj>/<svc>/
+    if request.path == f"/proxy/{project}/{service_id}":
+        new = request.path + "/"
+        if request.query_string:
+            new += "?" + request.query_string
+        raise web.HTTPMovedPermanently(location=new)
+
+    upstream_host = f"{PROJECT_CONTAINER_PREFIX}{project}"
+    upstream_port = int(svc.get("default_port", 0))
+
+    is_ws = (request.headers.get("Upgrade", "").lower() == "websocket")
+    scheme = "ws" if is_ws else "http"
+    upstream_url = f"{scheme}://{upstream_host}:{upstream_port}/{tail}"
+    if request.query_string:
+        upstream_url += "?" + request.query_string
+
+    if is_ws:
+        return await _proxy_ws(request, upstream_url)
+    return await _proxy_http(request, upstream_url)
 
 
 async def index_handler(request: web.Request) -> web.Response:
@@ -318,12 +619,27 @@ def main() -> None:
     key_path = TLS_DIR / "key.pem"
     ssl_ctx = ensure_tls(cert_path, key_path, HOST_BIND)
 
-    app = web.Application()
+    # client_max_size=0 disables aiohttp's default 1 MiB request-body cap.
+    # The default would silently reject realistic uploads (saving an .ipynb,
+    # writing a large file from code-server's editor). This webui is single-
+    # user behind self-signed TLS on a user-chosen bind, so the DoS posture
+    # the cap was protecting against doesn't apply. Upstream services
+    # (code-server, future jupyter) impose their own bounds.
+    app = web.Application(client_max_size=0)
     app.router.add_get("/", index_handler)
     app.router.add_get("/probe", probe_handler)
     app.router.add_get("/services", services_handler)
     app.router.add_get("/services/{project}", project_services_handler)
+    app.router.add_post("/session/{project}", session_handler)
     app.router.add_get("/ws/{project}/{service}", ws_handler)
+    # Proxy: trailing-slash form catches /proxy/<proj>/<svc>/ + everything
+    # below. The no-slash form is also routed (matched by proxy_handler's
+    # 301 path) so we can redirect inbound /proxy/<proj>/<svc> requests
+    # rather than 404'ing them.
+    app.router.add_route(
+        "*", "/proxy/{project}/{service}/{tail:.*}", proxy_handler)
+    app.router.add_route(
+        "*", "/proxy/{project}/{service}", proxy_handler)
     app.router.add_static("/static", STATIC_DIR)
 
     log.info(f"Research Sandbox webui listening on https://{LISTEN_HOST}:{LISTEN_PORT}")
