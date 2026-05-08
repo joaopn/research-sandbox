@@ -16,3 +16,4 @@ container_volumes/
 .claude/
 data/
 PLAN/
+.mcp.json

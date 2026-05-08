@@ -13,6 +13,12 @@ and rs-router's iptables gates network reachability). It only does:
   - URL rewrite ``/<name>/<rest>`` → ``http://<ip>:<port>/<rest>``
   - Header injection (e.g. Authorization) from config
   - SSE pass-through (line-flushed) when upstream emits text/event-stream
+  - Transparent 3xx redirect-following with method+body preserved, so a
+    worker hitting ``/<name>/mcp`` against an upstream that 307s to
+    ``/mcp/`` (Starlette ``redirect_slashes=True`` default) sees only
+    the final response. Worker-side following can't work — relative
+    ``Location`` headers resolve into the proxy's URL space, not the
+    upstream's.
   - Audit log to /var/log/mcp-proxy/mcp-proxy.jsonl, one JSON line per request
   - SIGHUP reload of /etc/mcp-proxy/config.json
 
@@ -56,6 +62,57 @@ HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade",
 }
+
+
+class _TransparentRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow 3xx redirects transparently, preserving method and body,
+    and rewrite proxy-pointing absolute Locations back to the upstream.
+
+    urllib's default handler refuses 307/308 + non-GET (raises HTTPError)
+    and silently downgrades 301/302/303 + POST to GET. Both are wrong
+    for a forwarding proxy: the worker can't see redirects (a relative
+    ``Location`` resolves into the proxy's URL space and 404s under the
+    name-prefix router), and 307/308 are *defined* to preserve method.
+
+    There's a second failure mode caused by our Host pinning. We send
+    every upstream request with ``Host: mcp-proxy:8888`` so the upstream
+    has a stable value to whitelist for DNS-rebinding-protection. But
+    any framework that builds absolute ``Location`` URLs from the
+    request's ``Host`` (Starlette's ``redirect_slashes`` is the one we
+    hit in practice — sdp-jobs/FastMCP) emits ``Location:
+    http://mcp-proxy:8888/<rest>``, which points back at us. Naively
+    following that loops into the proxy and 404s as MCP name ``mcp``.
+    We detect this by netloc-matching the proposed ``newurl`` against
+    ``PROXY_HOSTNAME`` and rewriting the authority to the original
+    upstream's authority, so the redirect actually lands on the real
+    server.
+
+    Loop detection still lives in ``HTTPRedirectHandler.http_error_302``
+    (capped at 4 repeats); we only override the per-step request-rewrite
+    policy. Cross-host redirects to *other* upstreams are safe-by-
+    default: the rs-router only opens firewall holes for the registered
+    ``(ip, port)``, so any redirect to an unregistered destination fails
+    at the network layer."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new_parsed = urllib.parse.urlsplit(newurl)
+        if new_parsed.netloc and new_parsed.netloc == PROXY_HOSTNAME:
+            orig_parsed = urllib.parse.urlsplit(req.full_url)
+            new_parsed = new_parsed._replace(
+                scheme=orig_parsed.scheme, netloc=orig_parsed.netloc,
+            )
+            newurl = urllib.parse.urlunsplit(new_parsed)
+        return urllib.request.Request(
+            newurl.replace(" ", "%20"),
+            data=req.data,
+            headers=dict(req.headers),
+            origin_req_host=req.origin_req_host,
+            unverifiable=True,
+            method=req.get_method(),
+        )
+
+
+_OPENER = urllib.request.build_opener(_TransparentRedirect())
 
 config_lock = threading.RLock()
 config: dict = {}
@@ -172,7 +229,7 @@ class Handler(BaseHTTPRequestHandler):
         )
         client_ip = self.client_address[0]
         try:
-            with urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT) as resp:
+            with _OPENER.open(req, timeout=UPSTREAM_TIMEOUT) as resp:
                 self._stream_response(resp, name, method, upstream_path,
                                       client_ip, body_len)
         except urllib.error.HTTPError as e:

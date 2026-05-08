@@ -119,6 +119,11 @@ def _validate_entry(name: str, e: Any) -> list[str]:
     if "enabled" in e and not isinstance(e["enabled"], bool):
         out.append(p("enabled must be a boolean"))
 
+    if "description" in e:
+        d = e["description"]
+        if not isinstance(d, str) or not d.strip():
+            out.append(p("description must be a non-empty string"))
+
     if kind == "external":
         if not isinstance(e.get("host_port"), int) or isinstance(e.get("host_port"), bool):
             out.append(p("external entry needs integer host_port"))
@@ -132,7 +137,7 @@ def _validate_entry(name: str, e: Any) -> list[str]:
             for k, v in headers.items():
                 if not isinstance(v, str):
                     out.append(p(f"header {k!r}: value must be a string"))
-        allowed = {"kind", "transport", "host_port", "host_address", "headers", "path", "enabled"}
+        allowed = {"kind", "transport", "host_port", "host_address", "headers", "path", "enabled", "description"}
     else:  # shared
         img = e.get("image")
         if not isinstance(img, str) or not img:
@@ -146,7 +151,7 @@ def _validate_entry(name: str, e: Any) -> list[str]:
             for k, v in env.items():
                 if not isinstance(v, str):
                     out.append(p(f"env {k!r}: value must be a string"))
-        allowed = {"kind", "transport", "image", "port", "env", "path", "enabled"}
+        allowed = {"kind", "transport", "image", "port", "env", "path", "enabled", "description"}
 
     extras = set(e) - allowed
     if extras:

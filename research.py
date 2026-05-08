@@ -578,6 +578,28 @@ def cmd_stop(_: argparse.Namespace) -> None:
     print("stopped.")
 
 
+def _resolve_create_mcp_arg(value: str | None) -> list[str]:
+    """Resolve ``project create --mcp`` into a list of registry names. The
+    helper validates membership only — enabled-state and reachability are
+    checked per-MCP by ``_allow_mcp_for_project`` so a single misbehaving
+    entry can be skipped without aborting the create."""
+    v = (value or "all-enabled").strip()
+    try:
+        data = mcp_registry.load(expand=False)
+    except mcp_registry.RegistryError as e:
+        die(str(e))
+    if v == "all-enabled":
+        return sorted(n for n, e in data["mcps"].items()
+                      if e.get("enabled", False))
+    if v == "none":
+        return []
+    names = [n.strip() for n in v.split(",") if n.strip()]
+    unknown = [n for n in names if n not in data["mcps"]]
+    if unknown:
+        die(f"--mcp: unknown MCP name(s): {', '.join(unknown)}")
+    return names
+
+
 def cmd_project_create(args: argparse.Namespace) -> None:
     cfg = load_config()
     project = args.name
@@ -680,8 +702,22 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     run(["docker", "exec", container_name, "/usr/local/bin/mcp-reload"],
         capture_output=True)
 
+    # 6c. Auto-allow MCPs per --mcp.
+    requested = _resolve_create_mcp_arg(args.mcp)
+    granted: list[str] = []
+    for mcp_name in requested:
+        ok, msg = _allow_mcp_for_project(project, cfg, mcp_name, do_reload=False)
+        if ok:
+            granted.append(mcp_name)
+        else:
+            print(f"warning: skip auto-allow {mcp_name!r}: {msg}",
+                  file=sys.stderr)
+    if granted:
+        _supervisor_mcp_reload(container_name)
+
     # 7. Report.
     inner_fw = "on" if getattr(args, "inner_firewall", False) else "off"
+    mcps_line = ", ".join(granted) if granted else "(none)"
     print(f"""
 Project '{project}' is running.
 
@@ -690,6 +726,7 @@ Project '{project}' is running.
   Network:   {network} (egress: {egress})
   DIND mode: {dind_mode}
   Inner FW:  {inner_fw}
+  MCPs:      {mcps_line}
   SSH:       research@localhost -p {ssh_port}   password: {ssh_pass}
 
 Next steps:
@@ -1206,14 +1243,19 @@ def mcp_container_name_for(name: str) -> str:
 
 
 def projects_using_mcp(mcp_name: str) -> list[str]:
-    """Scan per-project allowlists for projects that allow this MCP."""
+    """Scan per-project allowlists for projects that allow this MCP. The
+    allowlist lives at ``<workspace>/.orchestrator/mcp-allow.json`` (see
+    project_allowlist_path) — looking at the project root directly would
+    silently miss every project."""
     cfg = load_config()
     root = Path(cfg.projects_dir).expanduser().resolve()
     if not root.is_dir():
         return []
     out: list[str] = []
     for p in sorted(root.iterdir()):
-        allow_file = p / ".mcp-allow.json"
+        if not p.is_dir():
+            continue
+        allow_file = project_allowlist_path(p.name, cfg)
         if not allow_file.is_file():
             continue
         try:
@@ -1242,7 +1284,7 @@ def ensure_mcp_files(project: str, cfg: "Config") -> None:
     """Initialize the host-side mcp registry (if missing) and an empty
     per-project allowlist. The registry is host-only state; the supervisor
     never reads it directly — every datum it needs lives in the allowlist
-    entry written at `mcp-allow` time."""
+    entry written at `project mcp allow` time."""
     if not mcp_registry.REGISTRY_PATH.is_file():
         mcp_registry.REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
         mcp_registry.save_atomic(mcp_registry.empty())
@@ -1353,6 +1395,9 @@ def _build_mcp_entry(args: argparse.Namespace) -> dict:
         entry["port"] = args.port
         if args.env:
             entry["env"] = _parse_kv(args.env, "--env")
+    desc = (getattr(args, "description", None) or "").strip()
+    if desc:
+        entry["description"] = desc
     return entry
 
 
@@ -1407,6 +1452,32 @@ def cmd_mcp_add(args: argparse.Namespace) -> None:
     print(hint)
 
 
+def cmd_mcp_describe(args: argparse.Namespace) -> None:
+    new_desc = "" if args.clear else (args.text or "").strip()
+    if not args.clear and not new_desc:
+        die("description text is required (or pass --clear to remove)")
+    with mcp_registry.lock():
+        try:
+            data = mcp_registry.load(expand=False)
+        except mcp_registry.RegistryError as e:
+            die(str(e))
+        entry = data["mcps"].get(args.name)
+        if entry is None:
+            die(f"no MCP named {args.name!r}")
+        if new_desc:
+            entry["description"] = new_desc
+        else:
+            entry.pop("description", None)
+        try:
+            mcp_registry.save_atomic(data)
+        except mcp_registry.RegistryError as e:
+            die(str(e))
+    if new_desc:
+        print(f"set description for {args.name!r}")
+    else:
+        print(f"cleared description for {args.name!r}")
+
+
 def cmd_mcp_list(args: argparse.Namespace) -> None:
     try:
         data = mcp_registry.load(expand=False)
@@ -1422,6 +1493,7 @@ def cmd_mcp_list(args: argparse.Namespace) -> None:
         print(json.dumps(out, indent=2, sort_keys=True))
         return
     rows: list[tuple[str, ...]] = []
+    descs: list[str] = []
     for name, e in sorted(data["mcps"].items()):
         kind = e["kind"]
         enabled = "yes" if e.get("enabled", False) else "no"
@@ -1433,6 +1505,7 @@ def cmd_mcp_list(args: argparse.Namespace) -> None:
             target = f"{cname}:{e['port']}"
             status = "running" if container_running(cname) else "stopped"
         rows.append((name, kind, e["transport"], target, enabled, status))
+        descs.append(e.get("description", ""))
     if not rows:
         print("(no MCPs registered)")
         return
@@ -1441,8 +1514,10 @@ def cmd_mcp_list(args: argparse.Namespace) -> None:
     widths = [max(len(str(v)) for v in col) for col in cols]
     fmt = "  ".join(f"{{:<{w}}}" for w in widths)
     print(fmt.format(*headers))
-    for r in rows:
+    for r, d in zip(rows, descs):
         print(fmt.format(*r))
+        if d:
+            print(f"    {d}")
 
 
 def cmd_mcp_remove(args: argparse.Namespace) -> None:
@@ -1450,7 +1525,7 @@ def cmd_mcp_remove(args: argparse.Namespace) -> None:
     if in_use and not args.force:
         die(f"MCP {args.name!r} is currently allowed for projects: "
             f"{', '.join(in_use)}.\n"
-            f"  Run `research project mcp-deny <proj> {args.name}` for each, "
+            f"  Run `research project mcp deny <proj> {args.name}` for each, "
             f"or pass --force.")
     with mcp_registry.lock():
         try:
@@ -1498,14 +1573,38 @@ def cmd_mcp_enable(args: argparse.Namespace) -> None:
 
 
 def cmd_mcp_disable(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    affected = projects_using_mcp(args.name)
+    if affected and not args.keep_projects:
+        denied: list[str] = []
+        for project in affected:
+            ok, msg = _deny_mcp_for_project(project, cfg, args.name)
+            if ok:
+                denied.append(project)
+            else:
+                print(f"warning: deny {args.name!r} from {project!r}: {msg}",
+                      file=sys.stderr)
+    else:
+        denied = []
+
     entry = _set_enabled(args.name, False)
+    suffix = ""
     if entry["kind"] == "shared":
         cname = mcp_container_name_for(args.name)
         if container_running(cname):
             run_check(["docker", "stop", cname])
-            print(f"disabled {args.name!r}; stopped {cname}")
-            return
-    print(f"disabled {args.name!r}")
+            suffix = f"; stopped {cname}"
+
+    if affected:
+        if args.keep_projects:
+            print(f"disabled {args.name!r}{suffix}; --keep-projects: "
+                  f"{len(affected)} project(s) still allow it: "
+                  f"{', '.join(affected)}")
+        else:
+            print(f"disabled {args.name!r}{suffix}; denied from "
+                  f"{len(denied)} project(s): {', '.join(denied)}")
+    else:
+        print(f"disabled {args.name!r}{suffix}")
 
 
 def _shared_mcps(only_enabled: bool = False) -> list[tuple[str, dict]]:
@@ -1648,26 +1747,26 @@ def _supervisor_mcp_reload(container_name: str) -> None:
               file=sys.stderr)
 
 
-def cmd_project_mcp_allow(args: argparse.Namespace) -> None:
-    cfg = load_config()
-    project = args.project
-    mcp_name = args.mcp
-
+def _allow_mcp_for_project(project: str, cfg: "Config", mcp_name: str,
+                           *, do_reload: bool = True) -> tuple[bool, str]:
+    """Open the router hole, append (or replace) the per-project allowlist
+    entry, and optionally reload the supervisor's mcp-proxy. Returns
+    ``(ok, message)`` so callers can iterate batches without aborting.
+    The caller owns project-existence checks; this helper validates
+    router + registry + (shared) container state."""
     container_name = container_name_for(project)
-    if not container_exists(container_name):
-        die(f"project {project!r} does not exist")
+
     if not container_running(ROUTER_CONTAINER):
-        die(f"{ROUTER_CONTAINER} is not running. Run `research start` first.")
+        return False, f"{ROUTER_CONTAINER} is not running"
 
     try:
         entry = mcp_registry.entry_for(mcp_name)
     except mcp_registry.RegistryError as e:
-        die(str(e))
+        return False, str(e)
     if entry is None:
-        die(f"no MCP named {mcp_name!r}; register with `research mcp add` first")
+        return False, f"no MCP named {mcp_name!r}"
     if not entry.get("enabled", False):
-        die(f"MCP {mcp_name!r} is not enabled; "
-            f"run `research mcp enable {mcp_name}` first")
+        return False, f"MCP {mcp_name!r} is not enabled"
 
     if entry["kind"] == "external":
         host_addr = entry.get("host_address", "host.docker.internal")
@@ -1676,15 +1775,17 @@ def cmd_project_mcp_allow(args: argparse.Namespace) -> None:
     else:  # shared
         cname = mcp_container_name_for(mcp_name)
         if not container_running(cname):
-            die(f"shared MCP container {cname} not running; "
-                f"run `research mcp start {mcp_name}` first")
+            return False, f"shared MCP container {cname} not running"
         ip = mcp_container_ip(mcp_name)
         port = entry["port"]
 
     network = project_network_for(project)
     subnet = get_network_subnet(network)
-    run_check(["docker", "exec", ROUTER_CONTAINER,
-               "/scripts/mcp-allow.sh", subnet, ip, str(port)])
+    r = run(["docker", "exec", ROUTER_CONTAINER,
+             "/scripts/mcp-allow.sh", subnet, ip, str(port)],
+            capture_output=True)
+    if r.returncode != 0:
+        return False, (r.stderr or r.stdout).strip() or "mcp-allow.sh failed"
 
     allowlist = load_project_allowlist(project, cfg)
     allowlist = [e for e in allowlist if e.get("name") != mcp_name]
@@ -1698,26 +1799,28 @@ def cmd_project_mcp_allow(args: argparse.Namespace) -> None:
     }
     if entry.get("headers"):
         new_entry["headers"] = entry["headers"]
+    if entry.get("description"):
+        new_entry["description"] = entry["description"]
     allowlist.append(new_entry)
     save_project_allowlist(project, cfg, allowlist)
 
-    _supervisor_mcp_reload(container_name)
-    print(f"allowed {mcp_name!r} for project {project!r} -> {ip}:{port}")
+    if do_reload:
+        _supervisor_mcp_reload(container_name)
+    return True, f"-> {ip}:{port}"
 
 
-def cmd_project_mcp_deny(args: argparse.Namespace) -> None:
-    cfg = load_config()
-    project = args.project
-    mcp_name = args.mcp
-
+def _deny_mcp_for_project(project: str, cfg: "Config", mcp_name: str,
+                          *, do_reload: bool = True) -> tuple[bool, str]:
+    """Close the router hole, drop the entry from the per-project
+    allowlist, optionally reload the supervisor's mcp-proxy. Returns
+    ``(ok, message)``. Tolerates a torn-down project network / stopped
+    router (skips the firewall step in that case)."""
     container_name = container_name_for(project)
-    if not container_exists(container_name):
-        die(f"project {project!r} does not exist")
 
     allowlist = load_project_allowlist(project, cfg)
     target = next((e for e in allowlist if e.get("name") == mcp_name), None)
     if target is None:
-        die(f"{mcp_name!r} is not currently allowed for project {project!r}")
+        return False, f"{mcp_name!r} is not currently allowed"
 
     network = project_network_for(project)
     if network_exists(network) and container_running(ROUTER_CONTAINER):
@@ -1730,8 +1833,152 @@ def cmd_project_mcp_deny(args: argparse.Namespace) -> None:
     allowlist = [e for e in allowlist if e.get("name") != mcp_name]
     save_project_allowlist(project, cfg, allowlist)
 
-    _supervisor_mcp_reload(container_name)
-    print(f"denied {mcp_name!r} for project {project!r}")
+    if do_reload:
+        _supervisor_mcp_reload(container_name)
+    return True, ""
+
+
+def _require_project(project: str) -> str:
+    container_name = container_name_for(project)
+    if not container_exists(container_name):
+        die(f"project {project!r} does not exist")
+    return container_name
+
+
+def _batch_apply(project: str, cfg: "Config", names: list[str],
+                 helper, action: str) -> tuple[list[str], list[str]]:
+    """Run ``helper`` (allow or deny) for each name with reload deferred.
+    Returns ``(succeeded, failed)`` lists. Caller is responsible for the
+    one-shot reload at the end."""
+    succeeded: list[str] = []
+    failed: list[str] = []
+    for name in names:
+        ok, msg = helper(project, cfg, name, do_reload=False)
+        if ok:
+            succeeded.append(name)
+            print(f"{action} {name!r}{(' ' + msg) if msg else ''}")
+        else:
+            failed.append(name)
+            print(f"warning: {action} {name!r} skipped: {msg}",
+                  file=sys.stderr)
+    return succeeded, failed
+
+
+def cmd_project_mcp_list(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    project = args.project
+    _require_project(project)
+
+    allow_entries = load_project_allowlist(project, cfg)
+    try:
+        registry = mcp_registry.load(expand=False)
+    except mcp_registry.RegistryError as e:
+        die(str(e))
+    reg_mcps = registry["mcps"]
+
+    if args.json:
+        out = []
+        for e in allow_entries:
+            name = e.get("name", "")
+            r = reg_mcps.get(name, {})
+            row = dict(e)
+            row["enabled"] = bool(r.get("enabled", False))
+            row["registered"] = name in reg_mcps
+            if r.get("kind") == "shared":
+                row["running"] = container_running(mcp_container_name_for(name))
+            out.append(row)
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return
+
+    if not allow_entries:
+        print(f"(project {project!r} allows no MCPs)")
+        return
+
+    rows: list[tuple[str, ...]] = []
+    descs: list[str] = []
+    for e in sorted(allow_entries, key=lambda x: x.get("name", "")):
+        name = e.get("name", "")
+        r = reg_mcps.get(name, {})
+        kind = e.get("kind") or r.get("kind") or "?"
+        if name not in reg_mcps:
+            enabled = "missing"
+        else:
+            enabled = "yes" if r.get("enabled", False) else "no"
+        if kind == "shared":
+            running = "yes" if container_running(mcp_container_name_for(name)) else "no"
+        else:
+            running = "-"
+        ok, _err = (False, "") if not container_running(ROUTER_CONTAINER) \
+            else _probe_mcp(name, r) if name in reg_mcps else (False, "")
+        reachable = "yes" if ok else "no"
+        rows.append((name, kind, enabled, running, reachable))
+        descs.append(e.get("description", "") or r.get("description", ""))
+
+    headers = ("NAME", "KIND", "ENABLED", "RUNNING", "REACHABLE")
+    cols = list(zip(*([headers] + rows)))
+    widths = [max(len(str(v)) for v in col) for col in cols]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    print(fmt.format(*headers))
+    for r, d in zip(rows, descs):
+        print(fmt.format(*r))
+        if d:
+            print(f"    {d}")
+
+
+def cmd_project_mcp_allow(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    project = args.project
+    container_name = _require_project(project)
+    if not container_running(ROUTER_CONTAINER):
+        die(f"{ROUTER_CONTAINER} is not running. Run `research start` first.")
+    succeeded, failed = _batch_apply(project, cfg, args.mcp,
+                                     _allow_mcp_for_project, "allowed")
+    if succeeded:
+        _supervisor_mcp_reload(container_name)
+    if failed:
+        sys.exit(1)
+
+
+def cmd_project_mcp_deny(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    project = args.project
+    container_name = _require_project(project)
+    succeeded, failed = _batch_apply(project, cfg, args.mcp,
+                                     _deny_mcp_for_project, "denied")
+    if succeeded:
+        _supervisor_mcp_reload(container_name)
+    if failed:
+        sys.exit(1)
+
+
+def cmd_project_mcp_sync(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    project = args.project
+    container_name = _require_project(project)
+    try:
+        registry = mcp_registry.load(expand=False)
+    except mcp_registry.RegistryError as e:
+        die(str(e))
+    reg_mcps = registry["mcps"]
+    enabled = {n for n, e in reg_mcps.items() if e.get("enabled", False)}
+    allowed = {e.get("name") for e in load_project_allowlist(project, cfg)
+               if e.get("name")}
+
+    to_add = sorted(enabled - allowed)
+    # Drop entries that are no longer enabled OR no longer in the registry.
+    to_remove = sorted(n for n in allowed
+                       if n not in enabled or n not in reg_mcps)
+
+    if not to_add and not to_remove:
+        print(f"(project {project!r} already in sync with the registry)")
+        return
+
+    added, _ = _batch_apply(project, cfg, to_add,
+                            _allow_mcp_for_project, "allowed")
+    removed, _ = _batch_apply(project, cfg, to_remove,
+                              _deny_mcp_for_project, "denied")
+    if added or removed:
+        _supervisor_mcp_reload(container_name)
 
 
 # ---------------------------------------------------------------------------
@@ -1976,6 +2223,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="comma-separated service ids to disable "
                         "(default: all known services enabled; xterm is "
                         "always-on and cannot be disabled)")
+    c.add_argument("--mcp", metavar="NAMES", default="all-enabled",
+                   help="MCPs to auto-allow at create time: 'all-enabled' "
+                        "(default — every currently-enabled MCP), 'none', or a "
+                        "comma-separated list of registry names. Per-MCP failures "
+                        "(disabled, container not running, host unreachable) print "
+                        "a warning and skip; the project still comes up. Add or "
+                        "remove later with `research project mcp allow|deny|sync`.")
     c.set_defaults(func=cmd_project_create)
 
     a = proj_sub.add_parser("attach", help="docker exec + byobu attach")
@@ -2037,17 +2291,36 @@ def build_parser() -> argparse.ArgumentParser:
     sh.add_argument("name")
     sh.set_defaults(func=cmd_project_ssh)
 
-    pma = proj_sub.add_parser("mcp-allow",
-                              help="grant a project access to a registered MCP")
+    pm = proj_sub.add_parser("mcp",
+                             help="per-project MCP allowlist (list / allow / deny / sync)")
+    pm_sub = pm.add_subparsers(dest="mcp_action", required=True)
+
+    pml = pm_sub.add_parser("list",
+                            help="show every MCP allowed for the project, "
+                                 "with kind / enabled / running / reachable / description")
+    pml.add_argument("project")
+    pml.add_argument("--json", action="store_true")
+    pml.set_defaults(func=cmd_project_mcp_list)
+
+    pma = pm_sub.add_parser("allow",
+                            help="grant the project access to one or more registered MCPs "
+                                 "(per-MCP failures warn + skip; supervisor reload runs once)")
     pma.add_argument("project")
-    pma.add_argument("mcp")
+    pma.add_argument("mcp", nargs="+")
     pma.set_defaults(func=cmd_project_mcp_allow)
 
-    pmd = proj_sub.add_parser("mcp-deny",
-                              help="revoke a project's access to a registered MCP")
+    pmd = pm_sub.add_parser("deny",
+                            help="revoke the project's access to one or more allowed MCPs")
     pmd.add_argument("project")
-    pmd.add_argument("mcp")
+    pmd.add_argument("mcp", nargs="+")
     pmd.set_defaults(func=cmd_project_mcp_deny)
+
+    pms = pm_sub.add_parser("sync",
+                            help="reconcile the project's allowlist against the registry: "
+                                 "add every newly-enabled MCP, remove any that are no longer "
+                                 "enabled or have been deregistered")
+    pms.add_argument("project")
+    pms.set_defaults(func=cmd_project_mcp_sync)
 
     # ----- MCP registry (Stage 2.1) -------------------------------------
     mcp = sub.add_parser("mcp", help="MCP registry operations")
@@ -2073,7 +2346,21 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--path", default=mcp_registry.DEFAULT_PATH,
                    help=f"upstream URL path the MCP listens on "
                         f"(default {mcp_registry.DEFAULT_PATH!r}, the SDK convention)")
+    a.add_argument("--description",
+                   help="PI-authored project-level intent for what this MCP "
+                        "gives access to (e.g. 'parsed event aggregates'); "
+                        "propagates into per-project allowlists and into each "
+                        "worker's CLAUDE.md when granted")
     a.set_defaults(func=cmd_mcp_add)
+
+    md_d = mcp_sub.add_parser("describe",
+                              help="set or clear an MCP's description")
+    md_d.add_argument("name")
+    g = md_d.add_mutually_exclusive_group(required=True)
+    g.add_argument("text", nargs="?", help="new description text")
+    g.add_argument("--clear", action="store_true",
+                   help="remove the existing description")
+    md_d.set_defaults(func=cmd_mcp_describe)
 
     ml = mcp_sub.add_parser("list", help="list registered MCPs")
     ml.add_argument("--json", action="store_true")
@@ -2086,14 +2373,20 @@ def build_parser() -> argparse.ArgumentParser:
     mr.set_defaults(func=cmd_mcp_remove)
 
     me = mcp_sub.add_parser("enable",
-                            help="mark an MCP as enabled (required for `project mcp-allow`; "
+                            help="mark an MCP as enabled (required for `project mcp allow`; "
                                  "shared MCPs auto-start on `research start`)")
     me.add_argument("name")
     me.set_defaults(func=cmd_mcp_enable)
 
     md = mcp_sub.add_parser("disable",
-                            help="clear the enabled flag (also stops the container if shared and running)")
+                            help="clear the enabled flag, deny from every project that "
+                                 "currently allows it, and (if shared and running) stop "
+                                 "the container")
     md.add_argument("name")
+    md.add_argument("--keep-projects", action="store_true",
+                    help="leave per-project allowlists untouched; project workers "
+                         "keep the stale wiring until you `project mcp deny` or "
+                         "`project mcp sync` them yourself")
     md.set_defaults(func=cmd_mcp_disable)
 
     msp = mcp_sub.add_parser("start", help="(shared) start MCP containers (defaults to all enabled)")

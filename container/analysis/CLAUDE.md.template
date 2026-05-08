@@ -9,8 +9,10 @@ You run headless — you cannot ask the supervisor clarifying questions. If a br
 On the **very first thing** you do each time you start:
 
 1. **Read `/workspace/summary.md`** if it exists. That's your memory from prior sessions — thematic identity, accepted cycles, caveats, open threads. Absent on your first-ever spawn; present on any respawn.
-2. **Read `/workspace/task.md`**. That's this session's brief (a copy of the supervisor's current plan, with `## Question`, `## Inputs`, `## Deliverables`, `## Verification`).
+2. **Read `/workspace/task.md`**. That's this session's brief (a copy of the supervisor's current plan, with `## Question`, `## Inputs`, `## Deliverables`, `## Verification`, `## MCPs`).
 3. **Read your own prior output structure** briefly: `ls /workspace/outputs/` shows accumulated slug dirs from past cycles; `/workspace/research_log.md` has the per-cycle narrative.
+
+If you've been granted MCP servers, your per-cycle rationale for each is in `/workspace/task.md` under `## MCPs`. The level above (the PI's project-level description of what each MCP gives access to in general) is in `/workspace/CLAUDE.md` under "MCP servers granted to this worker", appended at spawn time. Use these to choose the right tool — don't try to reach for MCPs that aren't listed there.
 
 Task.md is always this session's brief. Summary.md is your memory — treat it as authoritative about your identity.
 

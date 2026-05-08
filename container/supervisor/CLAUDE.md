@@ -105,14 +105,14 @@ Plans are author-then-approve-then-spawn. There are two states:
 
 Flow:
 
-1. Write the proposal to `/workspace/plan/draft/<name>.md` with the four required sections below.
+1. Write the proposal to `/workspace/plan/draft/<name>.md` with the five required sections below.
 2. Show the PI the path. Wait for an explicit "go", "yes", "approved", or equivalent. Do not infer approval from silence.
 3. On approval: `rs-worker spawn <name> --plan /workspace/plan/draft/<name>.md`. The harness reads the draft, copies it to `plan/<name>.md`, copies it again into the worker's `task.md`, then deletes the draft.
 4. On rejection: edit or delete `plan/draft/<name>.md` and revise. The canonical plan (if any — for a `down` worker awaiting respawn) is untouched.
 
 **Never write directly to `plan/<name>.md`.** That path is harness-owned. Editing it bypasses the approval gate and overwrites the prior canonical plan with no undo. The `accept` command snapshots `plan/<name>.md` into `results/<name>/<NNN>_<slug>/plan.md` — accepted cycle bundles preserve the plan that produced them, so respawn-overwrites of the canonical plan no longer lose history.
 
-The four required top-level sections (the harness validates them; `rs-worker spawn` refuses a plan that is missing any):
+The five required top-level sections (the harness validates them; `rs-worker spawn` refuses a plan that is missing any):
 
 ```
 ## Question
@@ -136,9 +136,16 @@ Explicitly name the slug you chose (see Slug choice below).
 How *you* will know the deliverable is correct. Concrete: expected row counts,
 numeric ranges, shape of the output, sanity checks the worker itself must run
 before returning to WAITING.
+
+## MCPs
+One bullet per MCP this worker should be granted, with a one-line per-cycle
+rationale ("for this cycle: read daily aggregates over A–B; read-only").
+If no MCPs are needed, write `(none)`. See *MCP servers* below — this is
+the section the PI uses to audit per-worker tool grants, and it must
+match the names you pass to `--mcps` at spawn time.
 ```
 
-Extra sections are allowed. The four above are mandatory.
+Extra sections are allowed. The five above are mandatory.
 
 ## Slug choice
 
@@ -155,15 +162,30 @@ Rules:
 - **Don't repeat the worker name in the slug.** `stats/basic-stats` is tautological; `stats/per-language` is not.
 - Lowercase, letters + digits + single dashes, 2–80 chars.
 
+## MCP servers
+
+**MCPs in this project are tools for workers, not for you.** Your own Claude session has no MCP wiring — you will never see `mcp__<server>__<tool>` tools in your own tool list, and `claude mcp list` from inside the supervisor reports unrelated upstream registrations (Microsoft 365, Canva, etc.) that have nothing to do with this project. Don't go looking for MCP tools to call directly; you orchestrate, workers consume.
+
+To see what MCPs are available to grant to workers, read `/workspace/.orchestrator/mcp-allow.json`. Each entry has a `name` and an optional `description` — the **PI's project-level intent** for what the MCP gives access to (e.g. "postgres-mcp serves parsed aggregates; mongo-mcp serves raw event logs"). That file is the project's source of truth — every MCP listed there is wired into the supervisor's mcp-proxy and ready to be passed via `rs-worker spawn --mcps`. Read it before spawning a worker that needs external tools so you understand what's actually available and why.
+
+Workers do **not** automatically receive MCPs. `rs-worker spawn` defaults to none. Pass `--mcps name1,name2` with the **minimum** set this worker needs — least-privilege, both for token cost and for blast radius.
+
+The plan's `## MCPs` section is **your** layer on top of the PI's global descriptions. List only the MCPs the worker needs and write a one-line per-worker rationale ("for this cycle: read daily aggregates over A–B; read-only"). The PI reviews this section as part of plan approval — it's how they audit per-worker tool grants.
+
+**Keep `--mcps` and `## MCPs` in sync.** `--mcps` is what actually gets wired; `## MCPs` is what the PI audits. If they diverge, the worker's behavior reflects `--mcps` (the wiring) but the PI is auditing against `## MCPs` — so a mismatch means either the worker has unaudited tools or the PI approved tools the worker didn't get. Always pass `--mcps` immediately after writing the plan, with the same names as the bullets in `## MCPs`.
+
+Allowlist changes after spawn (`research project mcp sync` etc. on the host) do **not** retrofit into running workers — they take effect on the next spawn. If the user asks for a new tool mid-session, plan for it on the next worker spawn rather than restarting current workers.
+
 ## Spawning
 
 ```bash
 rs-worker spawn <name> --plan /workspace/plan/draft/<name>.md \
+    [--mcps postgres,arxiv] \
     [--image rs-analysis-base:latest] \
     [--data-mount /some/extra/path]
 ```
 
-`--plan` is **mandatory** and points at the PI-approved draft (see *Planning protocol*); the harness promotes it to canonical and removes the draft. `/workspace/shared/` is auto-mounted RO into every worker — `--data-mount` is only for paths outside `/workspace/shared/` (rare).
+`--plan` is **mandatory** and points at the PI-approved draft (see *Planning protocol*); the harness promotes it to canonical and removes the draft. `/workspace/shared/` is auto-mounted RO into every worker — `--data-mount` is only for paths outside `/workspace/shared/` (rare). `--mcps` is the structured truth for tool wiring (see *MCP servers* above); pass it whenever the plan's `## MCPs` lists anything other than `(none)`.
 
 **One worker per thematic question.** Parallel facets of one PI question → multiple workers, all spawned before the first `rs-worker wait`. They run in parallel in the inner docker daemon.
 

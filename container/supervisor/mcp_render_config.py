@@ -1,6 +1,6 @@
 """mcp_render_config — translate the project's MCP allowlist into the
 proxy's config.json, then exit. Called once by entrypoint.supervisor.sh
-and again by mcp-reload after `research project mcp-allow/deny`.
+and again by mcp-reload after `research project mcp allow/deny/sync`.
 
 Stdlib only. Reads:
     /workspace/.orchestrator/mcp-allow.json

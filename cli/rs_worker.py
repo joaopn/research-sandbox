@@ -51,7 +51,7 @@ INNER_NETWORK = "rs-inner"
 ALLOWLIST_PATH = Path("/workspace/.orchestrator/mcp-allow.json")
 
 # Plan / accept / finalize contract.
-PLAN_SECTIONS = ("Question", "Inputs", "Deliverables", "Verification")
+PLAN_SECTIONS = ("Question", "Inputs", "Deliverables", "Verification", "MCPs")
 OUTPUT_WHITELIST_SUFFIXES = (
     ".ipynb", ".py", ".sh", ".sql",
     ".csv", ".parquet", ".feather",
@@ -236,15 +236,47 @@ def _parse_mcps_arg(raw: str) -> list[str]:
     return [m.strip() for m in (raw or "").split(",") if m.strip()]
 
 
-def _write_mcp_config(wdir: Path, requested: list[str]) -> str:
-    """Validate `requested` against the per-project allowlist, write the
+def _load_allowlist_by_name() -> dict[str, dict]:
+    """Best-effort read of the per-project allowlist into a name→entry dict.
+    Returns ``{}`` if the file is missing or malformed; callers that need to
+    fail hard (e.g. validating ``--mcps``) should check separately."""
+    if not ALLOWLIST_PATH.is_file():
+        return {}
+    try:
+        entries = json.loads(ALLOWLIST_PATH.read_text())
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(entries, list):
+        return {}
+    out: dict[str, dict] = {}
+    for e in entries:
+        if isinstance(e, dict) and isinstance(e.get("name"), str):
+            out[e["name"]] = e
+    return out
+
+
+def _write_mcp_config(wdir: Path, requested: list[str]) -> tuple[str, list[tuple[str, str]]]:
+    """Validate ``requested`` against the per-project allowlist, write the
     worker's .mcp.json (each entry pointed at the supervisor's mcp-proxy on
-    rs-inner), and return a label-friendly comma-joined name list. With no
-    requested MCPs we leave any pre-existing .mcp.json alone (a respawn may
-    have one already). Each allowlist entry already carries `transport`, so
-    we don't need to read the host registry."""
+    rs-inner), and return ``(label, granted)`` where ``granted`` is a list
+    of ``(name, description)`` pairs used to render the worker CLAUDE.md
+    block. With no requested MCPs we leave any pre-existing .mcp.json alone
+    (a respawn may have one already) and surface its current contents in
+    ``granted`` so the rendered block stays in sync with the actual wiring."""
     if not requested:
-        return ""
+        existing = wdir / ".mcp.json"
+        if not existing.is_file():
+            return "", []
+        try:
+            cfg = json.loads(existing.read_text())
+        except json.JSONDecodeError:
+            return "", []
+        names = sorted((cfg.get("mcpServers") or {}).keys())
+        if not names:
+            return "", []
+        by_name = _load_allowlist_by_name()
+        granted = [(n, by_name.get(n, {}).get("description", "")) for n in names]
+        return ",".join(names), granted
 
     if not ALLOWLIST_PATH.is_file():
         die(f"--mcps requested but {ALLOWLIST_PATH} missing; "
@@ -267,7 +299,7 @@ def _write_mcp_config(wdir: Path, requested: list[str]) -> str:
         die(
             f"these MCPs are not allowed for this project: {', '.join(unknown)}\n"
             f"  allowed: {', '.join(sorted(by_name)) or '(none)'}\n"
-            f"  fix: run `research project mcp-allow <project> <mcp>` on the host."
+            f"  fix: run `research project mcp allow <project> <mcp>` on the host."
         )
 
     cfg = {
@@ -280,7 +312,30 @@ def _write_mcp_config(wdir: Path, requested: list[str]) -> str:
         }
     }
     (wdir / ".mcp.json").write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
-    return ",".join(requested)
+    granted = [(n, by_name[n].get("description", "")) for n in requested]
+    return ",".join(requested), granted
+
+
+def _append_worker_mcp_block(wdir: Path, granted: list[tuple[str, str]]) -> None:
+    """Append the rendered MCP block to the worker's CLAUDE.md. No-op when
+    no MCPs are granted. Names without a description render as bare bullets;
+    descriptions land verbatim after an em-dash."""
+    if not granted:
+        return
+    bullets = []
+    for name, desc in granted:
+        bullets.append(f"- **{name}** — {desc}" if desc else f"- **{name}**")
+    block = (
+        "\n## MCP servers granted to this worker\n\n"
+        + "\n".join(bullets)
+        + "\n\nThe PI's project-level intent for each MCP is shown above. "
+        "Your per-cycle rationale (what to use them for in *this* cycle) "
+        "is in `/workspace/task.md` under `## MCPs`. If a tool you need "
+        "isn't listed here, ask the supervisor — don't try to import "
+        "other MCPs.\n"
+    )
+    claude_md = wdir / "CLAUDE.md"
+    claude_md.write_text(claude_md.read_text() + block)
 
 
 def _stage_workdir(name: str, plan_text: str, fresh: bool) -> Path:
@@ -413,9 +468,12 @@ def cmd_spawn(args: argparse.Namespace) -> None:
     canonical_plan.write_text(plan_text.rstrip() + "\n")
 
     # --- mcp wiring: validate requested names against the per-project
-    #     allowlist and write <wdir>/.mcp.json before container start ---
+    #     allowlist, write <wdir>/.mcp.json before container start, and
+    #     append the per-worker MCP block to the staged CLAUDE.md so the
+    #     worker can see what each granted MCP is for ---
     requested_mcps = _parse_mcps_arg(getattr(args, "mcps", "") or "")
-    mcps_label = _write_mcp_config(wdir, requested_mcps)
+    mcps_label, granted_mcps = _write_mcp_config(wdir, requested_mcps)
+    _append_worker_mcp_block(wdir, granted_mcps)
 
     # --- write/update registry BEFORE docker run so a crash leaves a discoverable state ---
     now = _iso_now()
@@ -1185,7 +1243,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("name")
     sp.add_argument("--plan", required=True,
                     help="path to a plan file with required top-level sections: "
-                         "## Question, ## Inputs, ## Deliverables, ## Verification")
+                         "## Question, ## Inputs, ## Deliverables, ## Verification, ## MCPs")
     sp.add_argument("--image", default=DEFAULT_IMAGE, help=f"worker image (default: {DEFAULT_IMAGE})")
     sp.add_argument("--data-mount", action="append", default=[],
                     help="absolute path to bind-mount RO into the worker; repeatable")
@@ -1193,7 +1251,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--mcps", default="",
                     help="comma-separated MCP names from `research mcp list`; "
                          "each must already be granted via "
-                         "`research project mcp-allow <project> <mcp>`")
+                         "`research project mcp allow <project> <mcp>`")
     sp.add_argument("--interactive", action="store_true",
                     help="(reserved) run claude interactively in byobu instead of headless")
     sp.set_defaults(func=cmd_spawn)
