@@ -104,8 +104,11 @@ body {
 .hint { color: var(--fg-faint); font-size: 12px; margin-top: 4px; }
 
 /* Dashboard — 2D layout: vertical project rail × horizontal service tabs.
-   Outer dashboard is a row (rail | main); main is a column (tabstrip / content). */
-.dashboard { display: flex; flex-direction: row; height: 100%; }
+   Outer dashboard is a row (tab | rail | main); main is a column
+   (tabstrip / content). The rail can be pinned (in flex flow, push layout)
+   or unpinned (absolute, overlay on top of main when expanded; hidden when
+   collapsed). The tab handle is always visible on the far left. */
+.dashboard { display: flex; flex-direction: row; height: 100%; position: relative; }
 
 .project-rail {
     width: 200px;
@@ -116,6 +119,34 @@ body {
     flex-direction: column;
     overflow-y: auto;
 }
+
+/* Collapsed: rail is hidden entirely. */
+.dashboard:not(.expanded) .project-rail { display: none; }
+
+/* Unpinned + expanded: rail floats below the service-tabs strip (36px tall)
+   so the Projects tab triggering it stays visible. */
+.dashboard.expanded:not(.pinned) .project-rail {
+    position: absolute;
+    top: 36px;
+    bottom: 0;
+    left: 0;
+    z-index: 3;
+    box-shadow: 4px 0 12px rgba(0, 0, 0, 0.4);
+}
+
+/* The Projects tab lives in the service-tabs strip alongside service tabs.
+   It's a control, not a service — toggles rail visibility, never gets the
+   .active service-underline. */
+.service-tabs .projects-tab {
+    color: var(--fg-muted);
+    border-right: 1px solid var(--border-strong);
+}
+.service-tabs .projects-tab:hover { background: var(--border); color: var(--fg-base); }
+.service-tabs .projects-tab .projects-chevron {
+    font-size: 11px;
+    color: var(--fg-faint);
+}
+
 .project-rail .rail-header {
     padding: 10px 14px;
     font-size: 11px;
@@ -123,7 +154,30 @@ body {
     letter-spacing: 0.6px;
     color: var(--fg-muted);
     border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
 }
+.project-rail .rail-header .pin-btn {
+    background: transparent;
+    border: none;
+    color: var(--fg-faint);
+    cursor: pointer;
+    padding: 2px 4px;
+    display: flex;
+    align-items: center;
+    line-height: 1;
+}
+.project-rail .rail-header .pin-btn:hover { color: var(--fg-base); }
+.project-rail .rail-header .pin-btn.pinned { color: var(--fg-accent); }
+.project-rail .rail-header .pin-btn svg {
+    width: 14px;
+    height: 14px;
+    transition: transform 120ms ease;
+    transform: rotate(45deg);
+}
+.project-rail .rail-header .pin-btn.pinned svg { transform: rotate(0deg); }
 .project-rail .project {
     display: flex;
     align-items: center;

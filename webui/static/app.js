@@ -10,6 +10,7 @@
 
 const VAULT_KEY = "rs-webui-vault";
 const THEME_KEY = "rs-webui-theme";
+const RAIL_PINNED_KEY = "rs-webui-rail-pinned";
 const PBKDF2_ITERATIONS = 600000;
 const PROBE_INTERVAL_MS = 15000;
 
@@ -182,6 +183,8 @@ const state = {
     terminals: {},           // "${project}:${service}" -> { term, fitAddon, ws, container, project, service }
     probeTimer: null,
     theme: null,
+    railPinned: false,       // persisted: keep rail in flex flow (push layout)
+    railExpanded: false,     // in-memory: rail visible (overlay when unpinned)
 };
 
 // ---- utilities -------------------------------------------------------------
@@ -367,17 +370,20 @@ async function renderDashboard() {
     await fetchServiceRegistry();
 
     const rail = makeProjectRail();
-    const tabStrip = el("div", { class: "service-tabs", id: "service-tabs" });
+    const tabStrip = el("div", { class: "service-tabs", id: "service-tabs" }, [
+        makeProjectsTab(),
+    ]);
     const termArea = el("div", { class: "terminal-area", id: "terminal-area" });
     const welcomeText = state.vault.projects.length === 0
-        ? "No projects yet. Click + Add project on the left."
-        : "Click a project to attach.";
+        ? "No projects yet. Click the Projects tab to add one."
+        : "Click the Projects tab to attach.";
     termArea.appendChild(el("div", { class: "welcome", id: "welcome" }, [welcomeText]));
 
     const main = el("div", { class: "main-area" }, [tabStrip, termArea]);
     const dashboard = el("div", { class: "dashboard" }, [rail, main]);
     document.body.appendChild(el("div", { id: "app" }, [dashboard]));
 
+    applyRailState();
     schedulePolling();
 
     if (state.activeProject) {
@@ -385,11 +391,88 @@ async function renderDashboard() {
     }
 }
 
+// ---- rail expand / pin -----------------------------------------------------
+
+function loadRailPinned() {
+    return localStorage.getItem(RAIL_PINNED_KEY) === "1";
+}
+
+function makeProjectsTab() {
+    const expanded = state.railPinned || state.railExpanded;
+    const chev = el("span", {
+        class: "projects-chevron",
+        id: "projects-chevron",
+    }, [expanded ? "◀" : "▶"]);
+    const tab = el("div", {
+        class: "tab projects-tab",
+        title: expanded ? "Hide projects" : "Show projects",
+    }, [chev, el("span", {}, ["Projects"])]);
+    tab.onclick = (ev) => { ev.stopPropagation(); toggleRailExpanded(); };
+    return tab;
+}
+
+function makePinButton() {
+    const btn = el("button", { class: "pin-btn", title: "Pin sidebar" });
+    btn.innerHTML = '<svg viewBox="0 0 16 16" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M9.828.722a.5.5 0 0 1 .354.146l4.95 4.95a.5.5 0 0 1 0 .707c-.48.48-1.072.588-1.503.588-.177 0-.335-.018-.46-.039l-3.134 3.134a5.927 5.927 0 0 1 .16 1.013c.046.702-.032 1.687-.72 2.375a.5.5 0 0 1-.707 0l-2.829-2.828-3.182 3.182c-.195.195-1.219.902-1.414.707-.195-.195.512-1.22.707-1.414l3.182-3.182-2.828-2.829a.5.5 0 0 1 0-.707c.688-.688 1.673-.767 2.375-.72a5.922 5.922 0 0 1 1.013.16l3.134-3.133a2.772 2.772 0 0 1-.04-.461c0-.43.108-1.022.589-1.503A.5.5 0 0 1 9.828.722z"/></svg>';
+    btn.onclick = (ev) => { ev.stopPropagation(); togglePinned(); };
+    return btn;
+}
+
+function applyRailState() {
+    const dashboard = document.querySelector(".dashboard");
+    if (!dashboard) return;
+    const expanded = state.railPinned || state.railExpanded;
+    dashboard.classList.toggle("pinned", state.railPinned);
+    dashboard.classList.toggle("expanded", expanded);
+
+    const pinBtn = dashboard.querySelector(".rail-header .pin-btn");
+    if (pinBtn) {
+        pinBtn.classList.toggle("pinned", state.railPinned);
+        pinBtn.title = state.railPinned ? "Unpin sidebar" : "Pin sidebar";
+    }
+    const chevron = document.getElementById("projects-chevron");
+    if (chevron) chevron.textContent = expanded ? "◀" : "▶";
+    const projectsTab = dashboard.querySelector(".projects-tab");
+    if (projectsTab) projectsTab.title = expanded ? "Hide projects" : "Show projects";
+
+    // Layout shift only happens when pinned toggles; refit the active terminal.
+    const t = activeTerminal();
+    if (t && t.fitAddon) {
+        setTimeout(() => { try { t.fitAddon.fit(); } catch (_) {} }, 0);
+    }
+}
+
+function toggleRailExpanded() {
+    // Tab handle is the universal show/hide control. If pinned, collapsing
+    // also unpins — keeping pinned-but-collapsed is incoherent.
+    if (state.railPinned) {
+        state.railPinned = false;
+        localStorage.setItem(RAIL_PINNED_KEY, "0");
+        state.railExpanded = false;
+    } else {
+        state.railExpanded = !state.railExpanded;
+    }
+    applyRailState();
+}
+
+function togglePinned() {
+    state.railPinned = !state.railPinned;
+    localStorage.setItem(RAIL_PINNED_KEY, state.railPinned ? "1" : "0");
+    // Pinning auto-expands; unpinning auto-collapses so the user
+    // recovers horizontal space in a single click.
+    state.railExpanded = state.railPinned;
+    applyRailState();
+}
+
 // ---- project rail ----------------------------------------------------------
 
 function makeProjectRail() {
     const rail = el("aside", { class: "project-rail" });
-    rail.appendChild(el("div", { class: "rail-header" }, ["Projects"]));
+    const header = el("div", { class: "rail-header" }, [
+        el("span", {}, ["Projects"]),
+        makePinButton(),
+    ]);
+    rail.appendChild(header);
     for (const p of state.vault.projects) {
         rail.appendChild(makeProjectRow(p));
     }
@@ -461,6 +544,7 @@ function lockVault() {
     state.activeProject = null;
     state.activeService = null;
     state.projectServices = {};
+    state.railExpanded = state.railPinned;
     renderUnlock();
 }
 
@@ -632,6 +716,14 @@ async function activateProject(name) {
     const row = document.querySelector(`.project[data-name="${CSS.escape(name)}"]`);
     if (row) row.classList.add("active");
 
+    // Unpinned + expanded means "I just opened the rail to switch projects" —
+    // collapse it again now that the switch is done so the user gets their
+    // horizontal space back. Pinned rail stays put.
+    if (!state.railPinned && state.railExpanded) {
+        state.railExpanded = false;
+        applyRailState();
+    }
+
     state.activeProject = name;
     const enabled = await fetchProjectServices(name);
     renderServiceTabs(name, enabled);
@@ -656,6 +748,7 @@ function renderServiceTabs(projectName, enabled) {
     const strip = document.getElementById("service-tabs");
     if (!strip) return;
     strip.innerHTML = "";
+    strip.appendChild(makeProjectsTab());
     const ids = Object.keys(enabled);
     if (ids.length === 0) {
         strip.appendChild(el("div", { class: "empty" }, [
@@ -888,6 +981,8 @@ async function handleControl(project, serviceId, term, ws, ctrl) {
 
 window.addEventListener("DOMContentLoaded", () => {
     applyTheme(loadStoredTheme());
+    state.railPinned = loadRailPinned();
+    state.railExpanded = state.railPinned;
     if (loadStored()) renderUnlock();
     else renderSetup();
 });
