@@ -180,21 +180,25 @@ body {
 .project-rail .rail-header .pin-btn.pinned svg { transform: rotate(0deg); }
 .project-rail .project {
     display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 10px 14px;
+    flex-direction: column;
+    gap: 2px;
+    padding: 8px 14px;
     border-bottom: 1px solid var(--border);
     cursor: pointer;
     font-size: 13px;
     color: var(--fg-base);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
 }
 .project-rail .project:hover:not(.active) { background: var(--border); }
 .project-rail .project.active {
     background: var(--bg-active);
     box-shadow: -3px 0 0 var(--fg-accent) inset;
+}
+.project-rail .project .project-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    white-space: nowrap;
+    overflow: hidden;
 }
 .project-rail .project .name {
     flex: 1;
@@ -208,6 +212,22 @@ body {
     line-height: 1;
 }
 .project-rail .project .close-x:hover { color: var(--fg-base); }
+
+/* Status sub-lines: hide when empty so unprobed rows don't reserve
+   visual space, and indent past the status dot's slot. */
+.project-rail .project .project-status-line,
+.project-rail .project .project-status-meta {
+    font-size: 11px;
+    margin-left: 16px;
+    line-height: 1.3;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.project-rail .project .project-status-line { color: var(--fg-muted); }
+.project-rail .project .project-status-meta { color: var(--fg-faint); }
+.project-rail .project .project-status-line:empty,
+.project-rail .project .project-status-meta:empty { display: none; }
 
 .project-rail .project.up .status-dot { background: var(--status-up); }
 .project-rail .project.down .status-dot { background: var(--status-down); }
@@ -298,6 +318,19 @@ body {
     align-items: center;
     color: var(--fg-faint);
     font-size: 12px;
+}
+/* Active-project label sits between the Projects toggle and the service
+   tabs. Static text — not clickable, no hover. Same 13px as rail rows,
+   bold so it reads as a heading for the strip rather than a tab. */
+.service-tabs .active-project {
+    padding: 0 14px;
+    display: flex;
+    align-items: center;
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--fg-base);
+    white-space: nowrap;
+    border-right: 1px solid var(--border);
 }
 
 .status-dot {

@@ -11,6 +11,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 import ssl
 import time
@@ -56,6 +57,17 @@ SESSION_TTL_SECONDS = 8 * 60 * 60
 # Used both by the legacy /probe endpoint and by project_services_handler's
 # enumeration. 3s is the number /probe shipped with in W1; kept consistent.
 TCP_PROBE_TIMEOUT_SECONDS = 3.0
+
+# Read-side mount of the host PROJECTS_DIR. The rail's per-project status
+# sub-line is computed from this tree — workers/<n>/work/, logbook/, file
+# mtimes, total size. Compose mounts it `:ro`; the server further enforces
+# project names match a strict regex and resolve inside this root.
+PROJECTS_ROOT = Path(os.environ.get("RS_PROJECTS_ROOT", "/projects"))
+
+# Project-name regex mirrors the host-side validator's character class.
+# Passed straight from a query string, so the regex is the only barrier
+# between client input and a Path join.
+PROJECT_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 # HTTP hop-by-hop headers that must NOT be forwarded across a proxy boundary
 # per RFC 7230 §6.1. Stripped both inbound (request → upstream) and outbound
@@ -292,6 +304,144 @@ async def project_services_handler(request: web.Request) -> web.Response:
             if up:
                 out[sid] = svc
     return web.json_response(out)
+
+
+# ---- /projects/status — per-project rail sub-line data ----------------
+
+def _project_workspace(name: str) -> Path | None:
+    """Resolve a vault-supplied project name to its `<root>/<name>/workspace`
+    path, returning None if the name fails validation, escapes the root,
+    or doesn't exist on disk."""
+    if not PROJECT_NAME_RE.match(name):
+        return None
+    try:
+        root_real = PROJECTS_ROOT.resolve()
+    except OSError:
+        return None
+    candidate = (PROJECTS_ROOT / name).resolve()
+    try:
+        candidate.relative_to(root_real)
+    except ValueError:
+        return None
+    workspace = candidate / "workspace"
+    if not workspace.is_dir():
+        return None
+    return workspace
+
+
+def _compute_status(name: str) -> dict:
+    """Walk a project's workspace and produce {workers_running, workers_done,
+    disk_bytes, latest}. `latest` carries the freshest mtime across event-
+    bearing paths (log.jsonl → active, DONE → done, outputs/* → output,
+    research_log.md → notes, logbook/* → logbook, plus the worker dir's
+    own mtime → spawn) AND the workspace-relative path that produced it,
+    so the rail can name the actual file the user might want to open
+    rather than a generic kind label.
+
+    Walks the tree once: disk_bytes accumulates st_size for every file
+    encountered and the path discriminator picks event-kinds off the same
+    pass. Uncached on purpose — start simple, add a TTL cache only when
+    profiling shows a real cost."""
+    workspace = _project_workspace(name)
+    if workspace is None:
+        return {"error": "not_found"}
+
+    workers_running = 0
+    workers_done = 0
+    latest_ts: float = 0.0
+    latest_kind: str | None = None
+    latest_path: str | None = None
+
+    def bump(kind: str, path: str, ts: float) -> None:
+        nonlocal latest_ts, latest_kind, latest_path
+        if ts > latest_ts:
+            latest_ts = ts
+            latest_kind = kind
+            latest_path = path
+
+    workers_dir = workspace / "workers"
+    if workers_dir.is_dir():
+        try:
+            for entry in os.scandir(workers_dir):
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                done_marker = Path(entry.path) / "work" / "DONE"
+                if done_marker.is_file():
+                    workers_done += 1
+                else:
+                    workers_running += 1
+                try:
+                    bump("spawn",
+                         f"workers/{entry.name}/",
+                         entry.stat(follow_symlinks=False).st_mtime)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    disk_bytes = 0
+    for dirpath, _dirnames, filenames in os.walk(workspace, followlinks=False):
+        try:
+            rel_parts = Path(dirpath).relative_to(workspace).parts
+        except ValueError:
+            rel_parts = ()
+        in_worker_work = (
+            len(rel_parts) >= 3
+            and rel_parts[0] == "workers"
+            and rel_parts[2] == "work"
+        )
+        worker_tail = rel_parts[3:] if in_worker_work else ()
+        in_logbook = rel_parts == ("logbook",)
+        for fname in filenames:
+            try:
+                st = os.stat(os.path.join(dirpath, fname), follow_symlinks=False)
+            except OSError:
+                continue
+            disk_bytes += st.st_size
+            rel_path = "/".join((*rel_parts, fname)) if rel_parts else fname
+            if in_worker_work:
+                if not worker_tail:
+                    if fname == "log.jsonl":
+                        bump("active", rel_path, st.st_mtime)
+                    elif fname == "DONE":
+                        bump("done", rel_path, st.st_mtime)
+                    elif fname == "research_log.md":
+                        bump("notes", rel_path, st.st_mtime)
+                elif worker_tail[0] == "outputs":
+                    bump("output", rel_path, st.st_mtime)
+            elif in_logbook:
+                bump("logbook", rel_path, st.st_mtime)
+
+    out: dict = {
+        "workers_running": workers_running,
+        "workers_done": workers_done,
+        "disk_bytes": disk_bytes,
+        "latest": None,
+    }
+    if latest_kind is not None:
+        out["latest"] = {
+            "kind": latest_kind,
+            "path": latest_path,
+            "ts_ms": int(latest_ts * 1000),
+        }
+    return out
+
+
+async def projects_status_handler(request: web.Request) -> web.Response:
+    """GET /projects/status?names=foo,bar — batched per-project status lookup.
+
+    Names are client-supplied (the SPA's vault drives the rail) and
+    validated against PROJECT_NAME_RE before any filesystem access. Each
+    name's compute runs in a worker thread so a deep walk on one project
+    can't stall the event loop for the others."""
+    raw = request.query.get("names", "")
+    names = [n.strip() for n in raw.split(",") if n.strip()]
+    if not names:
+        return web.json_response({})
+    results = await asyncio.gather(*[
+        asyncio.to_thread(_compute_status, n) for n in names
+    ])
+    return web.json_response(dict(zip(names, results)))
 
 
 # ---- /session/<project> — issue a per-project session cookie -----------
@@ -630,6 +780,7 @@ def main() -> None:
     app.router.add_get("/probe", probe_handler)
     app.router.add_get("/services", services_handler)
     app.router.add_get("/services/{project}", project_services_handler)
+    app.router.add_get("/projects/status", projects_status_handler)
     app.router.add_post("/session/{project}", session_handler)
     app.router.add_get("/ws/{project}/{service}", ws_handler)
     # Proxy: trailing-slash form catches /proxy/<proj>/<svc>/ + everything

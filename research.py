@@ -2149,6 +2149,7 @@ def cmd_webui(args: argparse.Namespace) -> None:
     if action == "start":
         new_bind = getattr(args, "bind", None)
         new_port = getattr(args, "port", None)
+        rebuild = getattr(args, "rebuild", False)
         recreate = False
         if new_bind and new_bind != bind:
             update_env_key("WEBUI_BIND", new_bind)
@@ -2160,17 +2161,18 @@ def cmd_webui(args: argparse.Namespace) -> None:
             recreate = True
         os.environ["WEBUI_BIND"] = bind
         os.environ["WEBUI_PORT"] = port
-        if recreate and container_exists(WEBUI_CONTAINER):
-            print(f"bind/port changed; recreating webui...")
+        if (recreate or rebuild) and container_exists(WEBUI_CONTAINER):
+            reason = "bind/port changed" if recreate else "rebuild requested"
+            print(f"{reason}; recreating webui...")
             run(["docker", "rm", "-f", WEBUI_CONTAINER], capture_output=True)
 
-        if container_running(WEBUI_CONTAINER):
+        if not rebuild and container_running(WEBUI_CONTAINER):
             wire_webui_to_projects()
             print(f"webui already running at https://{bind}:{port}")
             return
         if container_exists(WEBUI_CONTAINER):
             run(["docker", "rm", "-f", WEBUI_CONTAINER], capture_output=True)
-        if not run_quiet(["docker", "image", "inspect", WEBUI_IMAGE]):
+        if rebuild or not run_quiet(["docker", "image", "inspect", WEBUI_IMAGE]):
             print("building webui image...")
             docker_compose("--profile", "webui", "build", "webui")
         print(f"starting webui (bind {bind}:{port})...")
@@ -2434,6 +2436,9 @@ def build_parser() -> argparse.ArgumentParser:
     wus.add_argument("--port",
                      help="host port to bind to (default 7777; updates .env). "
                           "Container always listens on 7777 internally")
+    wus.add_argument("--rebuild", action="store_true",
+                     help="rebuild the webui image and recreate the container "
+                          "(use after editing webui/server.py, app.js, etc.)")
     wus.set_defaults(func=cmd_webui)
 
     wup = wu_sub.add_parser("stop", help="remove the webui container")

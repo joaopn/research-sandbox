@@ -37,8 +37,14 @@ services:
       - "${WEBUI_BIND:-127.0.0.1}:${WEBUI_PORT:-7777}:7777"
     environment:
       - WEBUI_BIND=${WEBUI_BIND:-127.0.0.1}
+      - RS_PROJECTS_ROOT=/projects
     volumes:
       - rs-webui-tls:/app/tls
+      # RO read-side onto the same host directory `research project create`
+      # writes to. Enables the rail's per-project status sub-line (worker
+      # counts, disk, last activity) without granting docker socket access
+      # or running a sidecar. Filesystem is the only data plane.
+      - ${PROJECTS_DIR:-./container_volumes}:/projects:ro
     restart: unless-stopped
 
 

@@ -13,6 +13,10 @@ const THEME_KEY = "rs-webui-theme";
 const RAIL_PINNED_KEY = "rs-webui-rail-pinned";
 const PBKDF2_ITERATIONS = 600000;
 const PROBE_INTERVAL_MS = 15000;
+// Status polling cadence — only runs while the rail is open. Higher than
+// PROBE_INTERVAL_MS because the data is filesystem-derived and changes on
+// human / worker timescales (minutes), not network-up timescales (seconds).
+const STATUS_INTERVAL_MS = 20000;
 
 // ---- themes -----------------------------------------------------------------
 
@@ -182,6 +186,7 @@ const state = {
     projectServices: {},     // { [projectName]: { [serviceId]: spec } }
     terminals: {},           // "${project}:${service}" -> { term, fitAddon, ws, container, project, service }
     probeTimer: null,
+    statusTimer: null,
     theme: null,
     railPinned: false,       // persisted: keep rail in flex flow (push layout)
     railExpanded: false,     // in-memory: rail visible (overlay when unpinned)
@@ -385,6 +390,8 @@ async function renderDashboard() {
 
     applyRailState();
     schedulePolling();
+    // Rail-visibility-gated status polling is started inside applyRailState;
+    // no separate kickoff needed here.
 
     if (state.activeProject) {
         await activateProject(state.activeProject);
@@ -434,6 +441,10 @@ function applyRailState() {
     if (chevron) chevron.textContent = expanded ? "◀" : "▶";
     const projectsTab = dashboard.querySelector(".projects-tab");
     if (projectsTab) projectsTab.title = expanded ? "Hide projects" : "Show projects";
+
+    // Status polling lifecycle is tied to rail visibility — no point
+    // walking project trees while the rail's hidden.
+    scheduleStatusPolling();
 
     // Layout shift only happens when pinned toggles; refit the active terminal.
     const t = activeTerminal();
@@ -500,11 +511,16 @@ function makeProjectRow(project) {
             removeProject(project.name);
         }
     };
+    const head = el("div", { class: "project-head" }, [dot, name, closeX]);
+    // Sub-lines start empty; populated by fetchProjectsStatus. CSS hides
+    // empty children so rows stay compact until data lands.
+    const statusLine = el("div", { class: "project-status-line" });
+    const statusMeta = el("div", { class: "project-status-meta" });
     const row = el("div", {
         class: "project",
         "data-name": project.name,
         onclick: () => activateProject(project.name),
-    }, [dot, name, closeX]);
+    }, [head, statusLine, statusMeta]);
     return row;
 }
 
@@ -531,8 +547,116 @@ async function probeProject(project) {
     }
 }
 
+// Per-project status sub-lines — only polled while the rail is open.
+// Server reads from a RO bind-mount of PROJECTS_DIR; no per-supervisor
+// HTTP, no docker socket. See PLAN/STAGE_WEBUI_W3_status_rail.md.
+function scheduleStatusPolling() {
+    if (state.statusTimer) {
+        clearInterval(state.statusTimer);
+        state.statusTimer = null;
+    }
+    if (!state.vault || state.vault.projects.length === 0) return;
+    const expanded = state.railPinned || state.railExpanded;
+    if (!expanded) return;
+    fetchProjectsStatus();
+    state.statusTimer = setInterval(fetchProjectsStatus, STATUS_INTERVAL_MS);
+}
+
+async function fetchProjectsStatus() {
+    if (!state.vault || state.vault.projects.length === 0) return;
+    const names = state.vault.projects.map((p) => p.name).join(",");
+    try {
+        const res = await fetch(`/projects/status?names=${encodeURIComponent(names)}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        for (const [name, status] of Object.entries(data)) {
+            applyProjectStatus(name, status);
+        }
+    } catch (_) {
+        // ignore — next tick will retry
+    }
+}
+
+function applyProjectStatus(name, status) {
+    const row = document.querySelector(`.project[data-name="${CSS.escape(name)}"]`);
+    if (!row) return;
+    const line1 = row.querySelector(".project-status-line");
+    const line2 = row.querySelector(".project-status-meta");
+    if (!line1 || !line2) return;
+    if (status.error === "not_found") {
+        line1.textContent = "";
+        line2.textContent = "missing on disk";
+        line2.removeAttribute("title");
+        return;
+    }
+    line1.textContent = formatStatusLine1(status);
+    line2.textContent = formatStatusLine2(status);
+    if (status.latest && status.latest.path) {
+        line2.title = status.latest.path;
+    } else {
+        line2.removeAttribute("title");
+    }
+}
+
+// ▶️ = workers currently running (no DONE marker yet).
+// ⏹ = workers that have stopped (DONE was touched on exit; this says
+// nothing about success vs failure — the worker entrypoint touches
+// DONE on every exit path).
+function formatStatusLine1(s) {
+    const parts = [];
+    if ((s.workers_running || 0) > 0) parts.push(`▶️ ${s.workers_running}`);
+    if ((s.workers_done || 0) > 0) parts.push(`⏹ ${s.workers_done}`);
+    const workers = parts.join("  ");
+    const disk = formatBytes(s.disk_bytes || 0);
+    return workers ? `${workers}  │  ${disk}` : disk;
+}
+
+function formatStatusLine2(s) {
+    if (!s.latest) return "";
+    const ageSec = Math.max(0, Math.floor((Date.now() - s.latest.ts_ms) / 1000));
+    if (ageSec > 7 * 86400) return "idle";
+    const display = displayLatestPath(s.latest.path);
+    return display ? `${display} ${formatAgo(ageSec)}` : formatAgo(ageSec);
+}
+
+// Workspace-relative path → short, rail-friendly label. The full path is
+// preserved in the element's `title` (hover tooltip) for users who want
+// to see exactly which file the timestamp came from.
+function displayLatestPath(path) {
+    if (!path) return "";
+    let m = /^workers\/([^/]+)\/work\/(.+)$/.exec(path);
+    if (m) {
+        const basename = m[2].split("/").pop();
+        return `${m[1]} · ${basename}`;
+    }
+    m = /^workers\/([^/]+)\/?$/.exec(path);
+    if (m) return m[1];
+    m = /^logbook\/(.+)$/.exec(path);
+    if (m) return m[1];
+    return path;
+}
+
+function formatBytes(n) {
+    if (n < 1024) return `${n} B`;
+    const units = ["kB", "MB", "GB", "TB"];
+    let v = n / 1024;
+    let i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return v >= 10 ? `${Math.round(v)} ${units[i]}` : `${v.toFixed(1)} ${units[i]}`;
+}
+
+function formatAgo(sec) {
+    if (sec < 60) return `${sec}s`;
+    const mins = Math.floor(sec / 60);
+    if (mins < 60) return `${mins}m`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours}h`;
+    return `${Math.floor(hours / 24)}d`;
+}
+
 function lockVault() {
     if (state.probeTimer) { clearInterval(state.probeTimer); state.probeTimer = null; }
+    if (state.statusTimer) { clearInterval(state.statusTimer); state.statusTimer = null; }
     for (const t of Object.values(state.terminals)) {
         try { if (t.ws) t.ws.close(); } catch (_) {}
         try { if (t.term) t.term.dispose(); } catch (_) {}
@@ -749,6 +873,10 @@ function renderServiceTabs(projectName, enabled) {
     if (!strip) return;
     strip.innerHTML = "";
     strip.appendChild(makeProjectsTab());
+    // Active-project label — visual anchor so the user can tell at a
+    // glance which project the visible service tabs belong to. Same
+    // font-size as the rail rows, weighted bold.
+    strip.appendChild(el("div", { class: "active-project" }, [projectName]));
     const ids = Object.keys(enabled);
     if (ids.length === 0) {
         strip.appendChild(el("div", { class: "empty" }, [
