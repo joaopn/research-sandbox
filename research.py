@@ -2116,9 +2116,157 @@ def wire_webui_to_projects() -> None:
                 capture_output=True)
 
 
+def _detect_tailscale_fqdn() -> str | None:
+    """Read the host's tailnet FQDN from `tailscale status --json`. Returns
+    None if tailscale isn't installed, the daemon isn't running, or the
+    host hasn't joined a tailnet."""
+    if shutil.which("tailscale") is None:
+        return None
+    r = run(["tailscale", "status", "--json"], capture_output=True)
+    if r.returncode != 0:
+        return None
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return None
+    fqdn = (data.get("Self") or {}).get("DNSName", "")
+    return fqdn.rstrip(".") or None
+
+
+def _webui_tls_volume() -> str:
+    """Resolve the docker volume name actually mounted at /app/tls in
+    rs-webui. Falls back to the literal name pinned in docker-compose.yml
+    when rs-webui isn't running yet. This avoids a previous bug where the
+    helper wrote to a bare `rs-webui-tls` volume while compose mounted a
+    project-prefixed one (`research-sandbox_rs-webui-tls`)."""
+    if container_exists(WEBUI_CONTAINER):
+        r = run(["docker", "inspect", WEBUI_CONTAINER, "-f",
+                 "{{range .Mounts}}{{if eq .Destination \"/app/tls\"}}"
+                 "{{.Name}}{{end}}{{end}}"], capture_output=True)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    return "rs-webui-tls"
+
+
+def _stage_webui_cert(cert_pem: bytes, key_pem: bytes,
+                      provider: str) -> None:
+    """Write cert+key+`.custom` marker into the webui's TLS volume. The
+    marker tells the in-container ensure_tls() to skip its auto-regenerate-
+    self-signed path so the user-provided cert sticks even when WEBUI_BIND
+    doesn't appear in the cert's SAN."""
+    volume = _webui_tls_volume()
+    if not run_quiet(["docker", "volume", "inspect", volume]):
+        run_check(["docker", "volume", "create", volume])
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        (td_path / "cert.pem").write_bytes(cert_pem)
+        (td_path / "key.pem").write_bytes(key_pem)
+        (td_path / ".custom").write_text(f"{provider}\n")
+        # chown to UID 1000 — the in-container webui user. Without this
+        # the busybox-written files are root-owned, and any regen attempt
+        # (e.g. server.py falling back to self-signed when the marker is
+        # absent) hits Permission denied on the cert.pem write and the
+        # container restart-loops. chmod 644/600 then matches what the
+        # auto-generated cert flow uses.
+        run_check([
+            "docker", "run", "--rm",
+            "-v", f"{volume}:/tls",
+            "-v", f"{td_path}:/src:ro",
+            "busybox", "sh", "-c",
+            "cp /src/cert.pem /tls/cert.pem && "
+            "cp /src/key.pem  /tls/key.pem && "
+            "cp /src/.custom  /tls/.custom && "
+            "chown 1000:1000 /tls/cert.pem /tls/key.pem /tls/.custom && "
+            "chmod 644 /tls/cert.pem /tls/.custom && "
+            "chmod 600 /tls/key.pem"
+        ])
+
+
+def _webui_recreate_in_place() -> None:
+    """Tear down + bring up the webui container so it re-reads the TLS
+    volume on next start. No image rebuild; preserves WEBUI_BIND/PORT."""
+    bind = read_env_value("WEBUI_BIND") or "127.0.0.1"
+    port = read_env_value("WEBUI_PORT") or "7777"
+    os.environ["WEBUI_BIND"] = bind
+    os.environ["WEBUI_PORT"] = port
+    if container_exists(WEBUI_CONTAINER):
+        run(["docker", "rm", "-f", WEBUI_CONTAINER], capture_output=True)
+    docker_compose("--profile", "webui", "up", "-d", "webui")
+    wire_webui_to_projects()
+
+
+def cmd_webui_cert_tailscale() -> None:
+    """Stage a Tailscale-issued Let's Encrypt cert into rs-webui-tls,
+    replacing the auto-generated self-signed cert. Browser ServiceWorker
+    registration (markdown preview, notebook output rendering, Data
+    Wrangler webview, …) requires a publicly-trusted cert; Tailscale
+    serves this for free on tailnet names with zero per-device CA
+    install."""
+    if shutil.which("tailscale") is None:
+        die("tailscale CLI not on PATH. Install Tailscale first: "
+            "https://tailscale.com/download")
+    fqdn = _detect_tailscale_fqdn()
+    if not fqdn:
+        die("could not detect tailnet FQDN. Verify with `tailscale status` "
+            "that the daemon is running and the host is registered.")
+
+    print(f"requesting Tailscale cert for {fqdn}...")
+    with tempfile.TemporaryDirectory() as td:
+        cert_path = Path(td) / "cert.pem"
+        key_path = Path(td) / "key.pem"
+        r = run([
+            "tailscale", "cert",
+            "--cert-file", str(cert_path),
+            "--key-file", str(key_path),
+            fqdn,
+        ], capture_output=True)
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout).strip()
+            low = err.lower()
+            if "https" in low and ("not enabled" in low or "not configured" in low):
+                die("HTTPS is not enabled for your tailnet. Toggle it on at "
+                    "https://login.tailscale.com/admin/dns then re-run.\n"
+                    f"  tailscale: {err}")
+            if "operator" in low or "permission" in low or "denied" in low:
+                die("`tailscale cert` requires sudo unless you're the "
+                    "configured tailscaled operator. One-time fix:\n"
+                    "  sudo tailscale up --operator=$USER\n"
+                    f"(raw error: {err})")
+            die(f"tailscale cert failed: {err}")
+        cert_pem = cert_path.read_bytes()
+        key_pem = key_path.read_bytes()
+
+    _stage_webui_cert(cert_pem, key_pem, provider=f"tailscale:{fqdn}")
+    print(f"staged Tailscale cert for {fqdn} into rs-webui-tls")
+
+    if container_running(WEBUI_CONTAINER):
+        print("recreating webui to pick up new cert...")
+        _webui_recreate_in_place()
+
+    bind = read_env_value("WEBUI_BIND") or "127.0.0.1"
+    port = read_env_value("WEBUI_PORT") or "7777"
+    print()
+    if bind in ("127.0.0.1", "::1", "localhost"):
+        print(f"  note: WEBUI_BIND={bind} only accepts loopback connections")
+        print(f"  to reach via tailnet, run:")
+        print(f"    research webui start --bind 0.0.0.0")
+        print(f"  then open https://{fqdn}:{port}/")
+    elif bind == "0.0.0.0":
+        print(f"  open https://{fqdn}:{port}/ — cert is publicly trusted")
+    else:
+        print(f"  webui bound to {bind}; open https://{fqdn}:{port}/ to use "
+              "the trusted cert")
+        print(f"  (connections via {bind} directly will see a name-mismatch "
+              f"warning — the cert covers {fqdn} only)")
+
+
 def cmd_webui(args: argparse.Namespace) -> None:
-    """Manage the optional webui container (start | stop | status | import)."""
+    """Manage the optional webui container (start | stop | status | import |
+    cert-tailscale)."""
     action = args.webui_action
+    if action == "cert-tailscale":
+        cmd_webui_cert_tailscale()
+        return
     port = read_env_value("WEBUI_PORT") or "7777"
     bind = read_env_value("WEBUI_BIND") or "127.0.0.1"
 
@@ -2454,6 +2602,20 @@ def build_parser() -> argparse.ArgumentParser:
     wui.add_argument("project", nargs="?",
                      help="project name; omit to list every project that has SSH info")
     wui.set_defaults(func=cmd_webui)
+
+    wct = wu_sub.add_parser(
+        "cert-tailscale",
+        help="replace the self-signed cert with a Tailscale-issued "
+             "Let's Encrypt cert (fixes browser ServiceWorker / webview)",
+        description="Auto-detects the host's tailnet FQDN, runs "
+                    "`tailscale cert <fqdn>`, stages the resulting "
+                    "cert+key into the rs-webui-tls volume, and recreates "
+                    "the webui container so the new cert takes effect. "
+                    "Requires HTTPS enabled in your tailnet's admin UI "
+                    "(login.tailscale.com/admin/dns) and either sudo or "
+                    "`sudo tailscale up --operator=$USER` set once.",
+    )
+    wct.set_defaults(func=cmd_webui)
 
     return p
 

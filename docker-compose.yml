@@ -50,7 +50,13 @@ services:
 
 volumes:
   rs-router-rules:
+  # Pin the literal volume name (no compose project-name prefix), so
+  # `research webui cert-tailscale` and similar host-side helpers that
+  # write into this volume by name agree with what rs-webui actually
+  # mounts. Without `name:`, compose uses `<project>_rs-webui-tls`
+  # which silently diverges from the helper's target.
   rs-webui-tls:
+    name: rs-webui-tls
 
 networks:
   # Shared infrastructure network: has internet via Docker gateway.

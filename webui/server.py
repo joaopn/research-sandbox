@@ -757,7 +757,23 @@ def generate_self_signed(cert_path: Path, key_path: Path, bind: str) -> None:
 
 
 def ensure_tls(cert_path: Path, key_path: Path, bind: str) -> ssl.SSLContext:
-    if not (cert_path.exists() and key_path.exists()) or not cert_covers_bind(cert_path, bind):
+    # `.custom` marker — written by `research webui cert-tailscale` (and any
+    # future cert helpers) — opts out of the auto-regenerate path. The
+    # user-provided cert's SAN may not cover `bind` (e.g. cert covers an FQDN,
+    # WEBUI_BIND is the IP the FQDN resolves to), and that's a valid
+    # configuration: the browser sees the trusted cert when accessing via
+    # the FQDN, which is the URL the user actually navigates to.
+    custom = cert_path.parent / ".custom"
+    if custom.exists():
+        provider = custom.read_text().strip() or "user-supplied"
+        log.info(f"using {provider} cert (skipping self-signed regen)")
+        if not (cert_path.exists() and key_path.exists()):
+            log.error(
+                f".custom marker present but cert/key missing at "
+                f"{cert_path.parent} — falling back to self-signed")
+            generate_self_signed(cert_path, key_path, bind)
+    elif not (cert_path.exists() and key_path.exists()) or \
+            not cert_covers_bind(cert_path, bind):
         generate_self_signed(cert_path, key_path, bind)
     ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
