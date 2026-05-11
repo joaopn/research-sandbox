@@ -49,6 +49,12 @@ LABEL_MCPS = "research.mcps"
 
 INNER_NETWORK = "rs-inner"
 ALLOWLIST_PATH = Path("/workspace/.orchestrator/mcp-allow.json")
+# Sibling registry for role-MCPs (echo-mcp, wrangler, librarian, ...). Workers
+# reach role-MCPs through the same proxy URL pattern as external MCPs
+# (mcp-proxy:8888/<name>/mcp); the distinction is purely management-surface.
+# `_write_mcp_config` merges both files into one by_name lookup, matching the
+# proxy config renderer's merge policy.
+ROLE_MCPS_PATH = Path("/workspace/.orchestrator/role-mcps.json")
 
 # Plan / accept / finalize contract.
 PLAN_SECTIONS = ("Question", "Inputs", "Deliverables", "Verification", "MCPs")
@@ -255,14 +261,45 @@ def _load_allowlist_by_name() -> dict[str, dict]:
     return out
 
 
+def _load_role_mcps_by_name() -> dict[str, dict]:
+    """Best-effort read of the per-project role-MCP registry, shaped to feed
+    `_write_mcp_config`'s by_name lookup directly. Entries are intentionally
+    minimal — role-MCPs don't carry the external-MCP fields (host_port,
+    headers, etc.) and the URL rendering only needs `transport` and `path`,
+    both of which fall back to their MCP-server-contract defaults
+    (`http` and `/mcp`). An empty dict per entry suffices and keeps the
+    surface stable if future role-MCP fields appear in role-mcps.json
+    without rs_worker needing to learn them."""
+    if not ROLE_MCPS_PATH.is_file():
+        return {}
+    try:
+        data = json.loads(ROLE_MCPS_PATH.read_text())
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for name, entry in data.items():
+        if isinstance(name, str) and isinstance(entry, dict):
+            out[name] = {}
+    return out
+
+
 def _write_mcp_config(wdir: Path, requested: list[str]) -> tuple[str, list[tuple[str, str]]]:
-    """Validate ``requested`` against the per-project allowlist, write the
-    worker's .mcp.json (each entry pointed at the supervisor's mcp-proxy on
-    rs-inner), and return ``(label, granted)`` where ``granted`` is a list
-    of ``(name, description)`` pairs used to render the worker CLAUDE.md
-    block. With no requested MCPs we leave any pre-existing .mcp.json alone
-    (a respawn may have one already) and surface its current contents in
-    ``granted`` so the rendered block stays in sync with the actual wiring."""
+    """Validate ``requested`` against the per-project allowlist + role-MCP
+    registry, write the worker's .mcp.json (each entry pointed at the
+    supervisor's mcp-proxy on rs-inner), and return ``(label, granted)``
+    where ``granted`` is a list of ``(name, description)`` pairs used to
+    render the worker CLAUDE.md block. With no requested MCPs we leave
+    any pre-existing .mcp.json alone (a respawn may have one already) and
+    surface its current contents in ``granted`` so the rendered block stays
+    in sync with the actual wiring.
+
+    The two registries (external in mcp-allow.json, role in role-mcps.json)
+    are merged into one by_name lookup with role-MCPs overlaying — this
+    mirrors `mcp_render_config.py`'s merge policy so the worker's view of
+    "what MCPs exist" matches the proxy's view of "what URLs route". From
+    the worker's POV both are reachable at mcp-proxy:8888/<name>/mcp."""
     if not requested:
         existing = wdir / ".mcp.json"
         if not existing.is_file():
@@ -274,7 +311,11 @@ def _write_mcp_config(wdir: Path, requested: list[str]) -> tuple[str, list[tuple
         names = sorted((cfg.get("mcpServers") or {}).keys())
         if not names:
             return "", []
+        # role-MCPs don't carry descriptions in v1 — overlay returns
+        # empty-dict entries, so `.get("description", "")` yields "" for
+        # them and the CLAUDE.md block renders bare bullets.
         by_name = _load_allowlist_by_name()
+        by_name.update(_load_role_mcps_by_name())
         granted = [(n, by_name.get(n, {}).get("description", "")) for n in names]
         return ",".join(names), granted
 
@@ -293,13 +334,20 @@ def _write_mcp_config(wdir: Path, requested: list[str]) -> tuple[str, list[tuple
     for e in allow_entries:
         if isinstance(e, dict) and isinstance(e.get("name"), str):
             by_name[e["name"]] = e
+    role_by_name = _load_role_mcps_by_name()
+    by_name.update(role_by_name)  # role-MCPs win on name collision
 
     unknown = [n for n in requested if n not in by_name]
     if unknown:
+        ext_names = sorted(n for n in by_name if n not in role_by_name)
+        role_names = sorted(role_by_name)
         die(
-            f"these MCPs are not allowed for this project: {', '.join(unknown)}\n"
-            f"  allowed: {', '.join(sorted(by_name)) or '(none)'}\n"
-            f"  fix: run `research project mcp allow <project> <mcp>` on the host."
+            f"these MCPs are not granted to this project: {', '.join(unknown)}\n"
+            f"  external (mcp-allow.json):  {', '.join(ext_names) or '(none)'}\n"
+            f"  role-MCPs (role-mcps.json): {', '.join(role_names) or '(none)'}\n"
+            f"  fix: `research project mcp allow <project> <mcp>` for external MCPs,\n"
+            f"       `research project role-mcp enable <project> <role>` for role-MCPs.\n"
+            f"       Both run on the host."
         )
 
     cfg = {
