@@ -18,7 +18,10 @@
 #   2. Stage creds from the supervisor's stash mount.
 #   3. Render /etc/role-mcp/spawn-mcp.json from role-mcps.json ∩ mcp-allow.json
 #      (the .mcp.json passed to every spawned `claude -p`).
-#   4. Exec daemon.py.
+#   4. Render /workspace/.tools-inventory.md from the same intersection
+#      (human-readable inventory the role-worker reads at call start to
+#      know what tools it has + each one's description).
+#   5. Exec daemon.py.
 
 set -euo pipefail
 
@@ -48,23 +51,32 @@ if [[ -f /workspace/.creds/settings.json ]]; then
     cp /workspace/.creds/settings.json ~/.claude/settings.json
 fi
 
-# --- Render spawn-mcp.json -------------------------------------------------
-# The spawned claude -p for each call needs an .mcp.json that exposes the
-# role's allowed upstream MCPs through the supervisor's mcp-proxy. The
-# upstream list lives in /etc/orchestrator/role-mcps.json under this role's
-# entry; the URL/headers per upstream live in /etc/orchestrator/mcp-allow.json.
-# We render the intersection.
+# --- Render spawn-mcp.json + tools-inventory.md ----------------------------
+# Two siblings rendered from the same intersection:
+#   /etc/role-mcp/spawn-mcp.json    machine-facing .mcp.json for `claude -p`
+#   /workspace/.tools-inventory.md  human-facing inventory the role-worker
+#                                   reads at call start to learn what tools
+#                                   this project gives it + each one's
+#                                   `description` from mcp-allow.json
+# The upstream list lives in /etc/orchestrator/role-mcps.json under this
+# role's entry; URL/headers/description per upstream live in
+# /etc/orchestrator/mcp-allow.json. The two outputs are derived from the
+# same data so they cannot drift.
 #
-# Empty result ({}) => spawned claude has no MCP wiring (echo's case).
-python3 - <<PYEOF
+# Empty intersection => spawn-mcp.json is "{}" (spawn.sh's empty-config
+# skip), and the inventory writes a configuration-problem note for the
+# role-worker to flag in its per-call log.
+python3 - <<'PYEOF'
 import json
 import os
 from pathlib import Path
 
 role = os.environ["RS_ROLE_NAME"]
 orch = Path("/etc/orchestrator")
-out_path = Path("/etc/role-mcp/spawn-mcp.json")
-out_path.parent.mkdir(parents=True, exist_ok=True)
+spawn_cfg_path = Path("/etc/role-mcp/spawn-mcp.json")
+inventory_path = Path("/workspace/.tools-inventory.md")
+spawn_cfg_path.parent.mkdir(parents=True, exist_ok=True)
+inventory_path.parent.mkdir(parents=True, exist_ok=True)
 
 role_mcps_path = orch / "role-mcps.json"
 allow_path = orch / "mcp-allow.json"
@@ -96,11 +108,16 @@ if allow_path.is_file():
 # the same path workers use. The /<name>/ prefix is the proxy's routing
 # key; the proxy strips it and forwards.
 cfg: dict = {"mcpServers": {}}
+inventory_rows: list[tuple[str, str, str]] = []  # (name, path, description)
 for name in upstream_names:
     e = allow_by_name.get(name)
     if not e:
         # Validation should prevent this at enable time; tolerate at boot
-        # by skipping the entry so the daemon still comes up.
+        # by skipping the entry so the daemon still comes up. Surface the
+        # missing-allow in the inventory so the role-worker can flag it.
+        inventory_rows.append(
+            (name, "(?)", "(NOT in mcp-allow.json — operator must allow it)")
+        )
         continue
     path = e.get("path") or "/mcp"
     url = f"http://mcp-proxy:8888/{name}{path}"
@@ -109,15 +126,50 @@ for name in upstream_names:
     if isinstance(headers, dict) and headers:
         server["headers"] = headers
     cfg["mcpServers"][name] = server
+    desc = e.get("description") or "(no description — ask operator to set one)"
+    inventory_rows.append((name, path, desc))
 
 # Empty mcpServers => write "{}" so spawn.sh's empty-config skip kicks in.
 if not cfg["mcpServers"]:
-    out_path.write_text("{}\n")
+    spawn_cfg_path.write_text("{}\n")
 else:
-    out_path.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
+    spawn_cfg_path.write_text(
+        json.dumps(cfg, indent=2, sort_keys=True) + "\n")
+
+# Render the human-facing inventory.
+lines: list[str] = [
+    f"# Tools available to {role} in this project",
+    "",
+    "Rendered at container start by entrypoint.role-mcp.sh from the project's",
+    "mcp-allow.json. Reach each tool via the supervisor's mcp-proxy at",
+    "`http://mcp-proxy:8888/<name>/...` — claude -p's MCP config wires this",
+    "automatically; you call them by their tool name like any other MCP.",
+    "",
+]
+if not inventory_rows:
+    lines += [
+        "**No upstream MCPs allowlisted for this role in this project.**",
+        "",
+        "Surface this as a configuration problem in your per-call log",
+        "(`outcome: needs_human`, naming the operator action required",
+        "— `research project role-mcp enable <project> <role> --upstream <mcp,...>`).",
+        "",
+    ]
+else:
+    lines += [
+        "| Name | Path | Description |",
+        "|---|---|---|",
+    ]
+    for name, path, desc in inventory_rows:
+        # Escape pipes in the description so the markdown table stays valid.
+        safe_desc = desc.replace("|", "\\|").replace("\n", " ").strip()
+        lines.append(f"| `{name}` | `{path}` | {safe_desc} |")
+    lines.append("")
+
+inventory_path.write_text("\n".join(lines))
 PYEOF
 
-echo "role-mcp[${RS_ROLE_NAME}]: spawn-mcp.json written"
+echo "role-mcp[${RS_ROLE_NAME}]: spawn-mcp.json + tools-inventory.md written"
 
 # --- Exec daemon ------------------------------------------------------------
 export RS_ROLE_WORKSPACE="${RS_ROLE_WORKSPACE:-/workspace}"

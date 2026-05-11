@@ -43,9 +43,19 @@ ROLE_IPS: dict[str, str] = {
 
 # Per-role docker image tags built by research.py's _build_images. Each
 # entry's image FROMs rs-role-mcp-base:latest and bakes the role-specific
-# role.md + summarize.md under /opt/role-mcp/role/.
+# role.md + summarize.md (+ optionally skills/) under /opt/role-mcp/role/.
+#
+# Naming inconsistency: echo-mcp carries the `-mcp` suffix in its key
+# because it was the protocol's no-op test target — the suffix made it
+# read as "the echo MCP" rather than the name of an actual research role.
+# Real roles (wrangler, librarian, websearcher) drop the suffix: the role
+# IS the name. New roles follow the no-suffix pattern.
+#
+# _build_images derives the Dockerfile name from the key: role `wrangler`
+# -> `agent/Dockerfile.wrangler`. role `echo-mcp` -> `agent/Dockerfile.echo-mcp`.
 ROLE_IMAGES: dict[str, str] = {
     "echo-mcp":     "rs-echo-mcp:latest",
+    "wrangler":     "rs-wrangler:latest",
 }
 
 # Fixed listen port inside every role-MCP container. Each container is

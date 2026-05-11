@@ -2110,22 +2110,36 @@ def cmd_project_mcp_sync(args: argparse.Namespace) -> None:
 
 def _role_mcp_stage_creds(supervisor: str, role: str) -> None:
     """Snapshot the supervisor's current Claude credentials into the
-    per-role workspace so the role-MCP container can stage them at boot.
-    Idempotent: overwrites any previous snapshot. Errors are fatal — a
-    role-MCP without creds is useless (spawned `claude -p` fails)."""
+    per-role daemon-state dir so the role-MCP container can stage them at
+    boot. Idempotent: overwrites any previous snapshot. Errors are fatal —
+    a role-MCP without creds is useless (spawned `claude -p` fails).
+
+    Path note: creds land under .role-mcps/<role>/.creds/ (the daemon-state
+    location), NOT under shared/<role>/ which is reserved for the role's
+    public publish surface. Mixing them would expose creds to any future
+    cross-role RO consumer of shared/<role>/."""
+    # mkdir -p does double duty: stages creds, AND pre-creates the publish
+    # source dir (/workspace/shared/{role}) and daemon-state dir
+    # (/workspace/.role-mcps/{role}) with the supervisor user's ownership
+    # (uid 1000) BEFORE docker tries to bind-mount them. If we don't,
+    # docker auto-creates missing bind-mount sources as root-owned 755,
+    # and the role-MCP container's worker user (also uid 1000 but
+    # different namespace) can't write to them. Failure mode is
+    # silent until the daemon tries its first write.
     script = f"""
         set -e
         if [ ! -f /home/research/.claude/.credentials.json ]; then
             echo "supervisor is not authenticated (no ~/.claude/.credentials.json)" >&2
             exit 2
         fi
-        mkdir -p /workspace/shared/{role}/.creds
+        mkdir -p /workspace/.role-mcps/{role}/.creds
+        mkdir -p /workspace/shared/{role}
         cp /home/research/.claude/.credentials.json \
-           /workspace/shared/{role}/.creds/.credentials.json
-        chmod 600 /workspace/shared/{role}/.creds/.credentials.json
+           /workspace/.role-mcps/{role}/.creds/.credentials.json
+        chmod 600 /workspace/.role-mcps/{role}/.creds/.credentials.json
         if [ -f /home/research/.claude/settings.json ]; then
             cp /home/research/.claude/settings.json \
-               /workspace/shared/{role}/.creds/settings.json
+               /workspace/.role-mcps/{role}/.creds/settings.json
         fi
     """
     r = run(["docker", "exec", supervisor, "bash", "-eu", "-c", script],
@@ -2133,6 +2147,41 @@ def _role_mcp_stage_creds(supervisor: str, role: str) -> None:
     if r.returncode != 0:
         die((r.stderr or r.stdout).strip()
             or f"failed to stage creds for role-mcp {role!r}")
+
+
+def _role_mcp_migrate_state(supervisor: str, role: str) -> None:
+    """One-shot move of daemon-state subdirs from the B.0 layout
+    (/workspace/shared/<role>/{jobs,memories,...}) to the B.3 layout
+    (/workspace/.role-mcps/<role>/{jobs,memories,...}).
+
+    Idempotent: only moves entries when the source exists and the
+    destination doesn't. Safe to call on every role-mcp start; on
+    already-migrated workspaces every check short-circuits.
+
+    The publish surface at /workspace/shared/<role>/ is preserved (the
+    non-daemon-state files there, if any, stay put — they're the role's
+    public artifact dir going forward). Daemon-state names are explicit
+    (no glob) so we don't accidentally sweep a future publish artifact
+    a user dropped in there."""
+    daemon_state_names = [
+        "jobs", "memories", ".calls", ".creds",
+        "global.md", ".summarize-watermark",
+    ]
+    moves = " ".join(daemon_state_names)
+    script = f"""
+        set -e
+        src=/workspace/shared/{role}
+        dst=/workspace/.role-mcps/{role}
+        mkdir -p "$dst"
+        for name in {moves}; do
+            if [ -e "$src/$name" ] && [ ! -e "$dst/$name" ]; then
+                mv "$src/$name" "$dst/$name"
+                echo "migrated $src/$name -> $dst/$name" >&2
+            fi
+        done
+    """
+    run(["docker", "exec", supervisor, "bash", "-eu", "-c", script],
+        capture_output=True)
 
 
 def _role_mcp_inner_exists(supervisor: str, role: str) -> bool:
@@ -2166,23 +2215,34 @@ def _role_mcp_start(supervisor: str, project: str, cfg: "Config",
         die(f"no role-mcps.json entry for role {role!r}; call enable first")
 
     role_mcp.validate_role(role)
+
+    cname = role_mcp.role_container_name(role)
+    # rm any prior container BEFORE migrating state, so the move can't race
+    # a running daemon that's still writing into /workspace/shared/<role>/.
+    run(["docker", "exec", supervisor, "docker", "rm", "-f", cname],
+        capture_output=True)
+    _role_mcp_migrate_state(supervisor, role)
     _role_mcp_stage_creds(supervisor, role)
 
     image = entry.get("image") or role_mcp.ROLE_IMAGES[role]
     stage_worker_image(supervisor, image, force=force_restage)
 
-    cname = role_mcp.role_container_name(role)
-    run(["docker", "exec", supervisor, "docker", "rm", "-f", cname],
-        capture_output=True)
-
     # Bind-mount layout:
-    #   /workspace                  ← <supervisor>/workspace/shared/<role>
-    #     RW; daemon writes jobs/, memories/, global.md, .calls/, .creds/.
+    #   /workspace                  ← <supervisor>/workspace/.role-mcps/<role>
+    #     RW. Daemon-private state: jobs/, memories/, global.md, .calls/,
+    #     .creds/, .summarize-watermark, .tools-inventory.md. Hidden under
+    #     a leading-dot dir on the project volume so casual `ls /shared/`
+    #     doesn't surface internals.
+    #   /workspace/published        ← <supervisor>/workspace/shared/<role>
+    #     RW from this role-MCP. The role's PUBLIC artifact surface —
+    #     intended to be cross-role-RO-consumable later. Wrangler writes
+    #     extracts/<topic>/<slug>.{parquet,sql,metadata.json} here;
+    #     librarian (B.2) will write refs/<topic>/; echo and (likely)
+    #     websearcher leave it empty.
     #   /etc/orchestrator           ← <supervisor>/workspace/.orchestrator (RO)
-    #     parent-dir bind-mount so atomic-rename writes by the host stay
-    #     visible (single-file-bind-mount rule); entrypoint reads role-mcps.json
-    #     and mcp-allow.json from here.
-    image = entry.get("image") or role_mcp.ROLE_IMAGES[role]
+    #     Parent-dir bind-mount so atomic-rename writes by the host stay
+    #     visible (single-file-bind-mount rule); entrypoint reads
+    #     role-mcps.json and mcp-allow.json from here.
     ip = entry["ip"]
     docker_args = [
         "docker", "exec", supervisor,
@@ -2191,7 +2251,8 @@ def _role_mcp_start(supervisor: str, project: str, cfg: "Config",
         "--network", INNER_NETWORK,
         "--ip", ip,
         "--restart", "unless-stopped",
-        "-v", f"/workspace/shared/{role}:/workspace",
+        "-v", f"/workspace/.role-mcps/{role}:/workspace",
+        "-v", f"/workspace/shared/{role}:/workspace/published",
         "-v", "/workspace/.orchestrator:/etc/orchestrator:ro",
         "-e", f"RS_ROLE_NAME={role}",
         "-e", f"RS_ROLE_MCP_PORT={role_mcp.ROLE_MCP_PORT}",
@@ -2239,8 +2300,10 @@ def _role_mcp_enable(project: str, cfg: "Config", role: str,
 
 def _role_mcp_disable(project: str, cfg: "Config", role: str) -> None:
     """Stop the container, drop the role-mcps.json entry, reload the
-    proxy. Workspace state under /workspace/shared/<role>/ survives — the
-    bind-mount is on the project volume and unaffected by docker rm."""
+    proxy. Workspace state under /workspace/.role-mcps/<role>/ (daemon
+    state: jobs, memories, global.md, creds) and under
+    /workspace/shared/<role>/ (publish surface) both survive — the
+    bind-mounts are on the project volume and unaffected by docker rm."""
     supervisor = container_name_for(project)
     workspace_path = workspace_path_for(project, cfg)
     entries = role_mcp.load_role_mcps(workspace_path)
@@ -2335,9 +2398,11 @@ def cmd_project_role_mcp_status(args: argparse.Namespace) -> None:
         state["running"] = _role_mcp_inner_running(supervisor, args.role)
 
     # Per-caller watermark + memory counts. Useful for spotting whether a
-    # role-MCP has actually processed any traffic since enable.
-    shared_dir = workspace_path / "shared" / args.role
-    wm = shared_dir / ".summarize-watermark"
+    # role-MCP has actually processed any traffic since enable. State lives
+    # under .role-mcps/<role>/ (daemon-private); the publish surface at
+    # shared/<role>/ is a separate concern surfaced below.
+    state_dir = workspace_path / ".role-mcps" / args.role
+    wm = state_dir / ".summarize-watermark"
     if wm.is_file():
         try:
             state["watermarks"] = json.loads(wm.read_text())
@@ -2345,7 +2410,7 @@ def cmd_project_role_mcp_status(args: argparse.Namespace) -> None:
             state["watermarks"] = "(invalid json)"
     else:
         state["watermarks"] = {}
-    memories = shared_dir / "memories"
+    memories = state_dir / "memories"
     if memories.is_dir():
         state["calls_by_caller"] = {
             p.name: sum(1 for _ in p.glob("*.md"))
@@ -2353,6 +2418,15 @@ def cmd_project_role_mcp_status(args: argparse.Namespace) -> None:
         }
     else:
         state["calls_by_caller"] = {}
+
+    # Publish-surface presence. Empty dir is normal (echo, possibly
+    # websearcher); non-empty (wrangler's extracts/, librarian's refs/)
+    # indicates the role is producing artifacts.
+    publish_dir = workspace_path / "shared" / args.role
+    state["publish_dir"] = str(publish_dir)
+    state["publish_present"] = (
+        publish_dir.is_dir() and any(publish_dir.iterdir())
+    )
 
     if args.json:
         print(json.dumps(state, indent=2, sort_keys=True))
@@ -2370,6 +2444,8 @@ def cmd_project_role_mcp_status(args: argparse.Namespace) -> None:
     print(f"upstreams:   {', '.join(upstreams) or '(none)'}")
     print(f"watermarks:  {json.dumps(state['watermarks'], sort_keys=True)}")
     print(f"calls:       {json.dumps(state['calls_by_caller'], sort_keys=True)}")
+    print(f"publish_dir: {state['publish_dir']}"
+          f" ({'has artifacts' if state['publish_present'] else 'empty'})")
 
 
 def _split_role_mcp_tokens(enable_arg: str | None) -> tuple[str | None, list[str]]:

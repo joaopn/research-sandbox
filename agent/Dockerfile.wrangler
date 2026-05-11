@@ -1,0 +1,20 @@
+FROM rs-role-mcp-base:latest
+
+# wrangler — data-extraction role-MCP. Bakes in wrangler's role.md
+# (workflow + retry-memory discipline), summarize.md (skill distillation),
+# and two methodology skill docs the spawned `claude -p` reads at call
+# start. The base image's daemon, spawn.sh, and entrypoint do everything
+# else; the wrangler is MCP-agnostic — upstream DB MCPs (postgres-mcp,
+# mongo-mcp, query schedulers, etc.) come from the per-project
+# `research project role-mcp enable <project> wrangler --upstream ...`
+# choice, surfaced to the spawned claude through tools-inventory.md
+# rendered by the entrypoint at container start.
+
+USER root
+COPY container/role-mcp/wrangler/role.md       /opt/role-mcp/role/role.md
+COPY container/role-mcp/wrangler/summarize.md  /opt/role-mcp/role/summarize.md
+COPY container/role-mcp/wrangler/skills/       /opt/role-mcp/role/skills/
+RUN chown -R worker:worker /opt/role-mcp/role
+
+USER worker
+WORKDIR /workspace
