@@ -43,6 +43,7 @@ from pathlib import Path
 # Make cli/ helpers importable.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "cli"))
 import mcp_registry  # noqa: E402
+import role_mcp  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -52,6 +53,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SUPERVISOR_IMAGE = "rs-supervisor:latest"
 ANALYSIS_IMAGE = "rs-analysis-base:latest"
 MCP_PROXY_IMAGE = "rs-mcp-proxy:latest"
+ROLE_MCP_BASE_IMAGE = "rs-role-mcp-base:latest"
+INNER_NETWORK = "rs-inner"
 WEBUI_IMAGE = "rs-webui:latest"
 WEBUI_CONTAINER = "rs-webui"
 ROUTER_CONTAINER = "rs-router"
@@ -540,12 +543,25 @@ def _preflight() -> None:
 
 
 def _build_images(force: bool) -> None:
-    """Build supervisor + worker + mcp-proxy images. Skip existing ones unless --rebuild."""
+    """Build supervisor + worker + mcp-proxy + role-mcp images. Skip
+    existing ones unless --rebuild. Build order matters: rs-role-mcp-base
+    FROMs rs-analysis-base, per-role images (rs-echo-mcp etc.) FROM
+    rs-role-mcp-base — keep the list bottom-up so each FROM resolves to
+    the just-built layer rather than a stale cached copy."""
     specs = [
         (SUPERVISOR_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.supervisor"),
         (ANALYSIS_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.analysis-base"),
         (MCP_PROXY_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.mcp-proxy"),
+        (ROLE_MCP_BASE_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.role-mcp-base"),
     ]
+    for role, image in sorted(role_mcp.ROLE_IMAGES.items()):
+        dockerfile = SCRIPT_DIR / "agent" / f"Dockerfile.{role}"
+        if not dockerfile.is_file():
+            print(f"warning: role-mcp image {image} has no Dockerfile at "
+                  f"{dockerfile.name}; skipping (add it in the per-role stage)",
+                  file=sys.stderr)
+            continue
+        specs.append((image, dockerfile))
     for tag, dockerfile in specs:
         if not force and run_quiet(["docker", "image", "inspect", tag]):
             print(f"image {tag} already present (use --rebuild to force)")
@@ -678,8 +694,21 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     wire_webui_to_projects()
 
     # 3. Build docker run argv.
+    # --enable tokens of the form role-mcp-<role> are sugar for
+    # `research project role-mcp enable` post-creation. Peel them off
+    # before computing service flags so _compute_service_flags doesn't
+    # die on the unknown id; defer role-mcp activation to step 6d below
+    # (after the supervisor + mcp-proxy are up and creds are ready).
+    enable_arg = getattr(args, "enable", None)
+    enable_services, enable_role_mcps = _split_role_mcp_tokens(enable_arg)
+    if enable_role_mcps:
+        for role in enable_role_mcps:
+            try:
+                role_mcp.validate_role(role)
+            except ValueError as e:
+                die(str(e))
     service_flags = _compute_service_flags(
-        getattr(args, "enable", None), getattr(args, "disable", None),
+        enable_services, getattr(args, "disable", None),
     )
     docker_args = build_supervisor_docker_args(
         container_name=container_name,
@@ -731,9 +760,38 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     if granted:
         _supervisor_mcp_reload(container_name)
 
+    # 6d. role-mcp sugar (--enable role-mcp-<role>). Skipped silently if
+    #     the supervisor is not yet authenticated — the user must run
+    #     `claude` once and then `research project role-mcp enable …`
+    #     manually, because we need creds to stage at start time. This
+    #     mirrors the rs-worker creds requirement.
+    role_mcps_enabled: list[str] = []
+    if enable_role_mcps:
+        creds_present = run(["docker", "exec", container_name, "test", "-f",
+                             "/home/research/.claude/.credentials.json"],
+                            capture_output=True).returncode == 0
+        if not creds_present:
+            print("note: --enable role-mcp-* requires supervisor auth; "
+                  "skipping role-mcp activation. After authenticating "
+                  "(see Next steps below), run:", file=sys.stderr)
+            for role in enable_role_mcps:
+                print(f"   research project role-mcp enable {project} {role}",
+                      file=sys.stderr)
+        else:
+            for role in enable_role_mcps:
+                try:
+                    _role_mcp_enable(project, cfg, role, [])
+                    role_mcps_enabled.append(role)
+                except SystemExit:
+                    print(f"warning: failed to enable role-mcp {role!r}; "
+                          "retry manually with "
+                          f"`research project role-mcp enable {project} {role}`",
+                          file=sys.stderr)
+
     # 7. Report.
     inner_fw = "on" if getattr(args, "inner_firewall", False) else "off"
     mcps_line = ", ".join(granted) if granted else "(none)"
+    role_mcps_line = ", ".join(role_mcps_enabled) if role_mcps_enabled else "(none)"
     print(f"""
 Project '{project}' is running.
 
@@ -743,6 +801,7 @@ Project '{project}' is running.
   DIND mode: {dind_mode}
   Inner FW:  {inner_fw}
   MCPs:      {mcps_line}
+  Role-MCPs: {role_mcps_line}
   SSH:       research@localhost -p {ssh_port}   password: {ssh_pass}
 
 Next steps:
@@ -1169,16 +1228,35 @@ def _recreate_supervisor(
     inject_route(container, router_ip)
 
     # Inner-dockerd state. In sysbox mode /var/lib/docker is fresh, so
-    # worker + proxy images need staging. Privileged DIND has a named
-    # volume that survives rm; stage_worker_image is a no-op there
+    # worker + proxy + role-mcp images need staging. Privileged DIND has a
+    # named volume that survives rm; stage_worker_image is a no-op there
     # unless `force_restage` (i.e. images were rebuilt on the host).
     wait_for_inner_dockerd(container)
     run(["docker", "exec", container, "docker", "rm", "-f", "mcp-proxy"],
         capture_output=True)
     stage_worker_image(container, ANALYSIS_IMAGE, force=force_restage)
     stage_worker_image(container, MCP_PROXY_IMAGE, force=force_restage)
+
     run(["docker", "exec", container, "/usr/local/bin/mcp-reload"],
         capture_output=True)
+
+    # Bring previously-enabled role-MCPs back up. The inner dockerd is
+    # fresh under sysbox; each role-MCP container is gone and must be
+    # re-created from the role-mcps.json snapshot. _role_mcp_start lazy-
+    # stages each per-role image into the inner dockerd before running
+    # it, with force_restage threaded through so a host-side rebuild
+    # propagates inward.
+    workspace_path = workspace_path_for(project, cfg)
+    role_entries = role_mcp.load_role_mcps(workspace_path)
+    for role in sorted(role_entries):
+        try:
+            _role_mcp_start(container, project, cfg, role,
+                            force_restage=force_restage)
+        except SystemExit:
+            print(f"warning: failed to restart role-mcp {role!r}; "
+                  f"the entry in role-mcps.json is intact, retry with "
+                  f"`research project role-mcp enable {project} {role}`",
+                  file=sys.stderr)
 
 
 def cmd_project_update(args: argparse.Namespace) -> None:
@@ -1198,6 +1276,16 @@ def cmd_project_update(args: argparse.Namespace) -> None:
 
     print(f"=== Updating project: {project} ===")
 
+    # Validate --enable role-mcp tokens up front so a typo doesn't waste a
+    # rebuild before failing.
+    enable_arg = getattr(args, "enable", None)
+    enable_services, enable_role_mcps = _split_role_mcp_tokens(enable_arg)
+    for role in enable_role_mcps:
+        try:
+            role_mcp.validate_role(role)
+        except ValueError as e:
+            die(str(e))
+
     if args.rebuild:
         print("rebuilding images...")
         _build_images(force=True)
@@ -1210,9 +1298,9 @@ def cmd_project_update(args: argparse.Namespace) -> None:
                 print(f"  {rel}")
 
     flags_override: dict[str, bool] | None = None
-    if getattr(args, "enable", None) or getattr(args, "disable", None):
+    if enable_services or getattr(args, "disable", None):
         base = _read_service_flags(container)
-        flags_override = _compute_service_flags(args.enable, args.disable, base=base)
+        flags_override = _compute_service_flags(enable_services, args.disable, base=base)
 
     _recreate_supervisor(
         project, cfg,
@@ -1224,6 +1312,17 @@ def cmd_project_update(args: argparse.Namespace) -> None:
     if not args.keep_claude:
         print(f"refreshing /workspace/.claude/ from templates...")
         _refresh_workspace_claude_templates(container)
+
+    # role-mcp sugar via --enable. Mirrors cmd_project_create: on a project
+    # that already has the role enabled, this is idempotent (validates +
+    # rewrites entry + restarts the container with empty upstreams).
+    for role in enable_role_mcps:
+        try:
+            _role_mcp_enable(project, cfg, role, [])
+        except SystemExit:
+            print(f"warning: failed to enable role-mcp {role!r}; retry "
+                  f"with `research project role-mcp enable {project} {role}`",
+                  file=sys.stderr)
 
     print(f"\nproject {project!r} updated.")
 
@@ -2000,6 +2099,297 @@ def cmd_project_mcp_sync(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Per-project role-MCP lifecycle (B.0)
+# ---------------------------------------------------------------------------
+
+
+def _role_mcp_stage_creds(supervisor: str, role: str) -> None:
+    """Snapshot the supervisor's current Claude credentials into the
+    per-role workspace so the role-MCP container can stage them at boot.
+    Idempotent: overwrites any previous snapshot. Errors are fatal — a
+    role-MCP without creds is useless (spawned `claude -p` fails)."""
+    script = f"""
+        set -e
+        if [ ! -f /home/research/.claude/.credentials.json ]; then
+            echo "supervisor is not authenticated (no ~/.claude/.credentials.json)" >&2
+            exit 2
+        fi
+        mkdir -p /workspace/shared/{role}/.creds
+        cp /home/research/.claude/.credentials.json \
+           /workspace/shared/{role}/.creds/.credentials.json
+        chmod 600 /workspace/shared/{role}/.creds/.credentials.json
+        if [ -f /home/research/.claude/settings.json ]; then
+            cp /home/research/.claude/settings.json \
+               /workspace/shared/{role}/.creds/settings.json
+        fi
+    """
+    r = run(["docker", "exec", supervisor, "bash", "-eu", "-c", script],
+            capture_output=True)
+    if r.returncode != 0:
+        die((r.stderr or r.stdout).strip()
+            or f"failed to stage creds for role-mcp {role!r}")
+
+
+def _role_mcp_inner_exists(supervisor: str, role: str) -> bool:
+    cname = role_mcp.role_container_name(role)
+    r = run(["docker", "exec", supervisor,
+             "docker", "inspect", cname], capture_output=True)
+    return r.returncode == 0
+
+
+def _role_mcp_inner_running(supervisor: str, role: str) -> bool:
+    cname = role_mcp.role_container_name(role)
+    r = run(["docker", "exec", supervisor,
+             "docker", "inspect", "-f", "{{.State.Running}}", cname],
+            capture_output=True)
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def _role_mcp_start(supervisor: str, project: str, cfg: "Config",
+                    role: str, *, force_restage: bool = False) -> None:
+    """Run the role-MCP container in the supervisor's inner dockerd.
+    Idempotent: tears down any prior instance with the same name first so
+    a stale crashed container doesn't block start. Lazy-stages the
+    per-role image into the inner dockerd on first use; project create
+    doesn't pre-stage role-MCP images (most projects won't use them).
+    Pass force_restage=True after a host-side image rebuild to push the
+    new content through."""
+    workspace_path = workspace_path_for(project, cfg)
+    entries = role_mcp.load_role_mcps(workspace_path)
+    entry = entries.get(role)
+    if entry is None:
+        die(f"no role-mcps.json entry for role {role!r}; call enable first")
+
+    role_mcp.validate_role(role)
+    _role_mcp_stage_creds(supervisor, role)
+
+    image = entry.get("image") or role_mcp.ROLE_IMAGES[role]
+    stage_worker_image(supervisor, image, force=force_restage)
+
+    cname = role_mcp.role_container_name(role)
+    run(["docker", "exec", supervisor, "docker", "rm", "-f", cname],
+        capture_output=True)
+
+    # Bind-mount layout:
+    #   /workspace                  ← <supervisor>/workspace/shared/<role>
+    #     RW; daemon writes jobs/, memories/, global.md, .calls/, .creds/.
+    #   /etc/orchestrator           ← <supervisor>/workspace/.orchestrator (RO)
+    #     parent-dir bind-mount so atomic-rename writes by the host stay
+    #     visible (single-file-bind-mount rule); entrypoint reads role-mcps.json
+    #     and mcp-allow.json from here.
+    image = entry.get("image") or role_mcp.ROLE_IMAGES[role]
+    ip = entry["ip"]
+    docker_args = [
+        "docker", "exec", supervisor,
+        "docker", "run", "-d",
+        "--name", cname,
+        "--network", INNER_NETWORK,
+        "--ip", ip,
+        "--restart", "unless-stopped",
+        "-v", f"/workspace/shared/{role}:/workspace",
+        "-v", "/workspace/.orchestrator:/etc/orchestrator:ro",
+        "-e", f"RS_ROLE_NAME={role}",
+        "-e", f"RS_ROLE_MCP_PORT={role_mcp.ROLE_MCP_PORT}",
+        "--label", f"research.role_mcp={role}",
+        "--label", f"research.project={project}",
+        image,
+    ]
+    run_check(docker_args)
+    print(f"role-mcp {role!r}: running at {ip}:{role_mcp.ROLE_MCP_PORT}")
+
+
+def _role_mcp_stop(supervisor: str, role: str) -> None:
+    """Stop + remove the role-MCP container in the inner dockerd. Tolerates
+    absence — caller may have already removed it via _recreate_supervisor."""
+    cname = role_mcp.role_container_name(role)
+    run(["docker", "exec", supervisor, "docker", "rm", "-f", cname],
+        capture_output=True)
+
+
+def _role_mcp_enable(project: str, cfg: "Config", role: str,
+                     upstreams: list[str]) -> None:
+    """Validate + write the per-project role-mcps.json entry + start the
+    container + reload the supervisor's mcp-proxy so its config includes
+    the role-MCP route. Idempotent — re-running with a different upstream
+    list updates the entry and restarts the container."""
+    role_mcp.validate_role(role)
+    supervisor = container_name_for(project)
+    if not container_running(supervisor):
+        die(f"project {project!r} is not running; bring it up first")
+
+    workspace_path = workspace_path_for(project, cfg)
+    allow_entries = load_project_allowlist(project, cfg)
+    try:
+        role_mcp.validate_upstreams(upstreams, allow_entries)
+    except ValueError as e:
+        die(str(e))
+
+    entries = role_mcp.load_role_mcps(workspace_path)
+    entries[role] = role_mcp.build_entry(role, upstreams)
+    role_mcp.save_role_mcps(workspace_path, entries)
+
+    _role_mcp_start(supervisor, project, cfg, role)
+    _supervisor_mcp_reload(supervisor)
+
+
+def _role_mcp_disable(project: str, cfg: "Config", role: str) -> None:
+    """Stop the container, drop the role-mcps.json entry, reload the
+    proxy. Workspace state under /workspace/shared/<role>/ survives — the
+    bind-mount is on the project volume and unaffected by docker rm."""
+    supervisor = container_name_for(project)
+    workspace_path = workspace_path_for(project, cfg)
+    entries = role_mcp.load_role_mcps(workspace_path)
+    if role not in entries:
+        die(f"role-mcp {role!r} is not enabled for project {project!r}")
+    if container_running(supervisor):
+        _role_mcp_stop(supervisor, role)
+    del entries[role]
+    role_mcp.save_role_mcps(workspace_path, entries)
+    if container_running(supervisor):
+        _supervisor_mcp_reload(supervisor)
+
+
+def _parse_csv_list(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [t.strip() for t in value.split(",") if t.strip()]
+
+
+def cmd_project_role_mcp_enable(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    _require_project(args.project)
+    upstreams = _parse_csv_list(getattr(args, "upstream", None))
+    _role_mcp_enable(args.project, cfg, args.role, upstreams)
+
+
+def cmd_project_role_mcp_disable(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    _require_project(args.project)
+    _role_mcp_disable(args.project, cfg, args.role)
+    print(f"role-mcp {args.role!r}: disabled")
+
+
+def cmd_project_role_mcp_list(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    supervisor = _require_project(args.project)
+    workspace_path = workspace_path_for(args.project, cfg)
+    entries = role_mcp.load_role_mcps(workspace_path)
+
+    if args.json:
+        out = []
+        for role, e in sorted(entries.items()):
+            row = dict(e)
+            row["role"] = role
+            row["running"] = (container_running(supervisor)
+                              and _role_mcp_inner_running(supervisor, role))
+            out.append(row)
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return
+
+    if not entries:
+        print(f"(project {args.project!r} has no role-MCPs enabled)")
+        return
+
+    rows: list[tuple[str, ...]] = []
+    for role, e in sorted(entries.items()):
+        running = "no"
+        if container_running(supervisor):
+            running = "yes" if _role_mcp_inner_running(supervisor, role) else "no"
+        upstreams = ",".join(e.get("upstream_mcps", []) or []) or "-"
+        rows.append((role, e.get("ip", "?"), str(e.get("port", "?")),
+                     running, upstreams))
+    headers = ("ROLE", "IP", "PORT", "RUNNING", "UPSTREAMS")
+    cols = list(zip(*([headers] + rows)))
+    widths = [max(len(str(v)) for v in col) for col in cols]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    print(fmt.format(*headers))
+    for r in rows:
+        print(fmt.format(*r))
+
+
+def cmd_project_role_mcp_status(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    supervisor = _require_project(args.project)
+    workspace_path = workspace_path_for(args.project, cfg)
+    entries = role_mcp.load_role_mcps(workspace_path)
+    entry = entries.get(args.role)
+    if entry is None:
+        die(f"role-mcp {args.role!r} is not enabled for project "
+            f"{args.project!r}")
+
+    state = {
+        "role": args.role,
+        "project": args.project,
+        "entry": entry,
+        "container": role_mcp.role_container_name(args.role),
+        "exists": False,
+        "running": False,
+    }
+    if container_running(supervisor):
+        state["exists"] = _role_mcp_inner_exists(supervisor, args.role)
+        state["running"] = _role_mcp_inner_running(supervisor, args.role)
+
+    # Per-caller watermark + memory counts. Useful for spotting whether a
+    # role-MCP has actually processed any traffic since enable.
+    shared_dir = workspace_path / "shared" / args.role
+    wm = shared_dir / ".summarize-watermark"
+    if wm.is_file():
+        try:
+            state["watermarks"] = json.loads(wm.read_text())
+        except json.JSONDecodeError:
+            state["watermarks"] = "(invalid json)"
+    else:
+        state["watermarks"] = {}
+    memories = shared_dir / "memories"
+    if memories.is_dir():
+        state["calls_by_caller"] = {
+            p.name: sum(1 for _ in p.glob("*.md"))
+            for p in sorted(memories.iterdir()) if p.is_dir()
+        }
+    else:
+        state["calls_by_caller"] = {}
+
+    if args.json:
+        print(json.dumps(state, indent=2, sort_keys=True))
+        return
+
+    print(f"role:        {state['role']}")
+    print(f"project:     {state['project']}")
+    print(f"container:   {state['container']}")
+    print(f"  exists:    {state['exists']}")
+    print(f"  running:   {state['running']}")
+    print(f"ip:          {entry.get('ip')}")
+    print(f"port:        {entry.get('port')}")
+    print(f"image:       {entry.get('image')}")
+    upstreams = entry.get("upstream_mcps") or []
+    print(f"upstreams:   {', '.join(upstreams) or '(none)'}")
+    print(f"watermarks:  {json.dumps(state['watermarks'], sort_keys=True)}")
+    print(f"calls:       {json.dumps(state['calls_by_caller'], sort_keys=True)}")
+
+
+def _split_role_mcp_tokens(enable_arg: str | None) -> tuple[str | None, list[str]]:
+    """Split ``--enable`` value into (service_csv, role_mcp_roles).
+    Tokens of the form ``role-mcp-<role>`` peel off into the role list;
+    everything else is left for `_compute_service_flags` to interpret as
+    service ids. Empty service set returns None to keep the default (all
+    services enabled / inherit prior flags) intact."""
+    if not enable_arg:
+        return None, []
+    services: list[str] = []
+    roles: list[str] = []
+    for tok in enable_arg.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok.startswith("role-mcp-"):
+            roles.append(tok[len("role-mcp-"):])
+        else:
+            services.append(tok)
+    svc_csv = ",".join(services) if services else None
+    return svc_csv, roles
+
+
+# ---------------------------------------------------------------------------
 # Per-supervisor service flags
 # ---------------------------------------------------------------------------
 
@@ -2386,7 +2776,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "rs-inner bridge (workers can only reach mcp-proxy + DNS)")
     c.add_argument("--enable", metavar="IDS",
                    help=f"comma-separated service ids to force-enable "
-                        f"(known: {','.join(KNOWN_SERVICES)})")
+                        f"(known services: {','.join(KNOWN_SERVICES)}). "
+                        f"Also accepts role-mcp-<role> tokens as sugar "
+                        f"for `research project role-mcp enable` "
+                        f"(known role-mcps: "
+                        f"{','.join(sorted(role_mcp.ROLE_IMAGES))})")
     c.add_argument("--disable", metavar="IDS",
                    help="comma-separated service ids to disable "
                         "(default: all known services enabled; xterm is "
@@ -2449,7 +2843,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "slash-command edits propagate)")
     u.add_argument("--enable", metavar="IDS",
                    help=f"comma-separated service ids to enable "
-                        f"(known: {','.join(KNOWN_SERVICES)})")
+                        f"(known services: {','.join(KNOWN_SERVICES)}). "
+                        f"Also accepts role-mcp-<role> tokens (known: "
+                        f"{','.join(sorted(role_mcp.ROLE_IMAGES))})")
     u.add_argument("--disable", metavar="IDS",
                    help="comma-separated service ids to disable "
                         "(xterm is always-on and cannot be disabled)")
@@ -2489,6 +2885,55 @@ def build_parser() -> argparse.ArgumentParser:
                                  "enabled or have been deregistered")
     pms.add_argument("project")
     pms.set_defaults(func=cmd_project_mcp_sync)
+
+    # ----- Role-MCP lifecycle (B.0) --------------------------------------
+    rm = proj_sub.add_parser(
+        "role-mcp",
+        help="per-project role-MCP lifecycle "
+             "(enable / disable / list / status). Role-MCPs are project-"
+             "internal orchestration containers, distinct from the general "
+             "MCP registry — they route through the same mcp-proxy but "
+             "live in role-mcps.json, not mcp-allow.json.",
+    )
+    rm_sub = rm.add_subparsers(dest="role_action", required=True)
+
+    rme = rm_sub.add_parser("enable",
+                            help="bring up a role-MCP container in the "
+                                 "supervisor's inner dockerd")
+    rme.add_argument("project")
+    rme.add_argument("role",
+                     help="role name (e.g. echo-mcp). Must be one "
+                          "research.py knows about — see cli/role_mcp.py "
+                          "ROLE_IPS / ROLE_IMAGES.")
+    rme.add_argument("--upstream",
+                     help="comma-separated upstream MCP names the role-"
+                          "worker's spawned `claude -p` will see (must "
+                          "already be allowed via `project mcp allow`)")
+    rme.set_defaults(func=cmd_project_role_mcp_enable)
+
+    rmd = rm_sub.add_parser("disable",
+                            help="stop + remove the role-MCP container "
+                                 "(workspace state under shared/<role> "
+                                 "survives)")
+    rmd.add_argument("project")
+    rmd.add_argument("role")
+    rmd.set_defaults(func=cmd_project_role_mcp_disable)
+
+    rml = rm_sub.add_parser("list",
+                            help="show every role-MCP enabled for the "
+                                 "project, with running state + upstreams")
+    rml.add_argument("project")
+    rml.add_argument("--json", action="store_true")
+    rml.set_defaults(func=cmd_project_role_mcp_list)
+
+    rms = rm_sub.add_parser("status",
+                            help="deep-print one role-MCP's container "
+                                 "state, watermarks, and per-caller call "
+                                 "counts")
+    rms.add_argument("project")
+    rms.add_argument("role")
+    rms.add_argument("--json", action="store_true")
+    rms.set_defaults(func=cmd_project_role_mcp_status)
 
     # ----- MCP registry (Stage 2.1) -------------------------------------
     mcp = sub.add_parser("mcp", help="MCP registry operations")

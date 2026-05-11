@@ -21,6 +21,16 @@ set -euo pipefail
 
 SUBNET="${RS_INNER_SUBNET:-192.168.99.0/24}"
 PROXY_IP="${RS_INNER_PROXY_IP:-192.168.99.2}"
+# Role-MCP containers (echo-mcp, wrangler, librarian, websearcher, …) live
+# in 192.168.99.4-99.11 (a /29 — eight addresses, covers the four B.0-B.3
+# role-MCPs plus a small reservation). Their containers spawn `claude -p`
+# subprocesses that talk directly to api.anthropic.com — L3 egress that
+# crosses the bridge boundary and hits FORWARD. Without an ACCEPT, the
+# spawned claude can't reach Anthropic and every send_job stalls.
+#
+# Role-MCP↔mcp-proxy traffic stays on the rs-inner bridge (L2) and bypasses
+# FORWARD entirely, so the proxy path doesn't need a hole here.
+ROLE_MCP_RANGE="${RS_INNER_ROLE_MCP_RANGE:-192.168.99.4/29}"
 CHAIN="RS-INNER-FW"
 
 if ! command -v iptables >/dev/null 2>&1; then
@@ -44,8 +54,9 @@ fi
 
 sudo iptables -A "$CHAIN" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 sudo iptables -A "$CHAIN" -s "$PROXY_IP" -j ACCEPT
+sudo iptables -A "$CHAIN" -s "$ROLE_MCP_RANGE" -j ACCEPT
 sudo iptables -A "$CHAIN" -m limit --limit 10/min --limit-burst 5 \
     -j LOG --log-prefix "rs-inner-fw drop: " --log-level warning
 sudo iptables -A "$CHAIN" -j DROP
 
-echo "inner-firewall: applied (subnet=$SUBNET proxy_ip=$PROXY_IP)"
+echo "inner-firewall: applied (subnet=$SUBNET proxy_ip=$PROXY_IP role_mcp_range=$ROLE_MCP_RANGE)"

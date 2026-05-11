@@ -1,0 +1,14 @@
+FROM rs-role-mcp-base:latest
+
+# echo-mcp — the no-op test target for the role-MCP protocol. Bakes in
+# echo's role.md (instructs the spawned claude to echo the task verbatim)
+# and summarize.md (no-op summary stamp). The base image's daemon /
+# spawn.sh / entrypoint do everything else.
+
+USER root
+COPY container/role-mcp/echo/role.md       /opt/role-mcp/role/role.md
+COPY container/role-mcp/echo/summarize.md  /opt/role-mcp/role/summarize.md
+RUN chown worker:worker /opt/role-mcp/role/role.md /opt/role-mcp/role/summarize.md
+
+USER worker
+WORKDIR /workspace

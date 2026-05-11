@@ -1,0 +1,34 @@
+FROM rs-analysis-base:latest
+
+# Role-MCP base layer. Adds the daemon + spawn helper + entrypoint on top
+# of analysis-base (which already ships claude-code CLI + python +
+# conda-forge data stack). Per-role images (rs-echo-mcp, rs-wrangler-mcp,
+# etc.) FROM this and only bake in the role-specific role.md /
+# summarize.md under /opt/role-mcp/role/.
+
+USER root
+
+# aiohttp for the daemon's HTTP server. Pinned via ARG so bumps are
+# deliberate, same dance as DOCKER_VERSION in Dockerfile.supervisor.
+ARG AIOHTTP_VERSION=3.10.10
+RUN /opt/conda/bin/pip install --no-cache-dir "aiohttp==${AIOHTTP_VERSION}"
+
+# Daemon + spawn helper. /opt/role-mcp/role/ is left empty here; each
+# per-role image populates it with role.md + summarize.md.
+RUN mkdir -p /opt/role-mcp /opt/role-mcp/role /etc/role-mcp
+COPY container/role-mcp/daemon.py /opt/role-mcp/daemon.py
+COPY container/role-mcp/spawn.sh  /opt/role-mcp/spawn.sh
+RUN chmod +x /opt/role-mcp/spawn.sh
+
+COPY agent/entrypoint.role-mcp.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Make /etc/role-mcp writable by the worker user — the entrypoint writes
+# spawn-mcp.json there at start. /opt is read-only-ish (image-baked).
+RUN chown -R worker:worker /etc/role-mcp /opt/role-mcp/role
+
+USER worker
+WORKDIR /workspace
+
+# tini comes from analysis-base. PID 1 is tini; entrypoint is daemon.py.
+ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]
