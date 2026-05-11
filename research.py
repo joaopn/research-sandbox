@@ -589,6 +589,11 @@ def cmd_start(args: argparse.Namespace) -> None:
         compose_up.append("--build")
     compose_up.append("router")
     run_check(compose_up)
+    # If the router was recreated (compose --build, or simply a fresh `up`
+    # after `stop`), it lost its `docker network connect` attachments to
+    # every per-project network. Re-attach so subsequent `project update`
+    # calls find rs-router on rs-net-<project>.
+    wire_router_to_projects()
     _start_enabled_mcps()
     print("up.")
 
@@ -2503,6 +2508,35 @@ def wire_webui_to_projects() -> None:
     for net in r.stdout.strip().splitlines():
         if net:
             run(["docker", "network", "connect", net, WEBUI_CONTAINER],
+                capture_output=True)
+
+
+def wire_router_to_projects() -> None:
+    """Connect rs-router to every existing per-project network. Idempotent;
+    no-op when the router isn't running.
+
+    `cmd_project_create` is the original wire-er (via ensure_project_network).
+    This re-wirer exists for the case where the router container was rebuilt
+    or recreated — compose's `up -d --build router` does `rm` + `run`, which
+    drops every `docker network connect` to rs-net-<project> that prior
+    creates set up. Without this, the next `project update` against an
+    existing project dies at `get_router_ip` because the recreated rs-router
+    isn't attached to that project's network.
+
+    iptables state on the router IS recovered on its own: the router's
+    entrypoint replays `/etc/sandbox/rules/*` on startup, and that directory
+    lives on the named volume `rs-router-rules` which survives `docker rm`.
+    So this helper only handles the network-attachment side of the recreate;
+    the firewall side is self-healing."""
+    if not container_running(ROUTER_CONTAINER):
+        return
+    r = run(["docker", "network", "ls",
+             "--filter", f"name=^{PROJECT_NETWORK_PREFIX}",
+             "--format", "{{.Name}}"],
+            capture_output=True)
+    for net in r.stdout.strip().splitlines():
+        if net:
+            run(["docker", "network", "connect", net, ROUTER_CONTAINER],
                 capture_output=True)
 
 
