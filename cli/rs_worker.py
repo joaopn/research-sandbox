@@ -38,6 +38,10 @@ DEFAULT_IMAGE = "rs-analysis-base:latest"
 # Claude Code CLI writes OAuth creds to a HIDDEN file (leading dot).
 ORCH_CREDS = Path.home() / ".claude" / ".credentials.json"
 ORCH_SETTINGS = Path.home() / ".claude" / "settings.json"
+# Sibling of ~/.claude/ — carries oauthAccount + onboarding state. Without
+# it, claude inside the worker treats the user as logged-out even when
+# .credentials.json is valid.
+ORCH_HOME_JSON = Path.home() / ".claude.json"
 WORKER_CLAUDE_MD_TEMPLATE = Path("/opt/claude-templates/worker.CLAUDE.md.template")
 
 LABEL_WORKER = "research.worker"
@@ -419,7 +423,24 @@ def _stage_workdir(name: str, plan_text: str, fresh: bool) -> Path:
     shutil.copy2(ORCH_CREDS, wdir / ".claude" / ".credentials.json")
     os.chmod(wdir / ".claude" / ".credentials.json", 0o600)
     if ORCH_SETTINGS.is_file():
-        shutil.copy2(ORCH_SETTINGS, wdir / ".claude" / "settings.json")
+        # Strip the `hooks` key — the supervisor's Stop hook calls
+        # /usr/local/bin/rs-audit-stop, which is supervisor-image-only.
+        # Propagating it would break every worker's claude --print run
+        # with a "command not found" Stop hook error on every turn.
+        try:
+            data = json.loads(ORCH_SETTINGS.read_text())
+        except json.JSONDecodeError:
+            data = {}
+        data.pop("hooks", None)
+        dest = wdir / ".claude" / "settings.json"
+        dest.write_text(json.dumps(data, indent=2) + "\n")
+        os.chmod(dest, 0o600)
+    # ~/.claude.json sibling: staged into .claude/ under the sentinel
+    # name `home_claude.json` so the worker entrypoint can extract it to
+    # ~/.claude.json (NOT into ~/.claude/). Tolerant of absence.
+    if ORCH_HOME_JSON.is_file():
+        shutil.copy2(ORCH_HOME_JSON, wdir / ".claude" / "home_claude.json")
+        os.chmod(wdir / ".claude" / "home_claude.json", 0o600)
 
     # Clear stale runtime sentinels. Entrypoint does this too (belt+braces).
     for sentinel in ("DONE", "WAITING"):

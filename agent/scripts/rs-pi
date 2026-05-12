@@ -47,6 +47,7 @@ cmd_list() {
 
 cmd_sync_creds() {
     local src=/home/research/.claude/.credentials.json
+    local home_src=/home/research/.claude.json
     if [[ ! -s "$src" ]]; then
         echo "rs-pi sync-creds: supervisor not authenticated (missing $src)" >&2
         exit 1
@@ -57,28 +58,51 @@ cmd_sync_creds() {
         echo "rs-pi sync-creds: no pi containers running"
         return 0
     fi
-    local touched=0 unchanged=0
+    local touched_creds=0 unchanged_creds=0 touched_home=0 unchanged_home=0
+    local sup_hash sup_home_hash
+    sup_hash=$(sha256sum "$src" | cut -d' ' -f1)
+    if [[ -s "$home_src" ]]; then
+        sup_home_hash=$(sha256sum "$home_src" | cut -d' ' -f1)
+    else
+        sup_home_hash=""
+    fi
     while IFS= read -r cn; do
         [[ -z "$cn" ]] && continue
-        local sup_hash
-        sup_hash=$(sha256sum "$src" | cut -d' ' -f1)
+        # ----- .credentials.json -----
         local pi_hash
         pi_hash=$(docker exec "$cn" sha256sum /home/research/.claude/.credentials.json 2>/dev/null | cut -d' ' -f1 || true)
         if [[ "$sup_hash" == "$pi_hash" ]]; then
-            echo "$cn: creds match supervisor (no-op)"
-            unchanged=$((unchanged+1))
+            echo "$cn: .credentials.json matches (no-op)"
+            unchanged_creds=$((unchanged_creds+1))
+        else
+            # docker cp into a staging path then install with the right
+            # ownership and mode inside the container — `docker cp` doesn't
+            # preserve those cleanly across uid namespaces.
+            docker cp "$src" "$cn:/tmp/.credentials.json.new"
+            docker exec "$cn" sh -c \
+                'install -o worker -g worker -m 0600 /tmp/.credentials.json.new ~/.claude/.credentials.json && rm /tmp/.credentials.json.new'
+            echo "$cn: .credentials.json updated"
+            touched_creds=$((touched_creds+1))
+        fi
+        # ----- ~/.claude.json (sibling, oauthAccount claim) -----
+        if [[ -z "$sup_home_hash" ]]; then
+            continue   # supervisor doesn't have ~/.claude.json; nothing to push
+        fi
+        local pi_home_hash
+        pi_home_hash=$(docker exec "$cn" sha256sum /home/worker/.claude.json 2>/dev/null | cut -d' ' -f1 || true)
+        if [[ "$sup_home_hash" == "$pi_home_hash" ]]; then
+            echo "$cn: ~/.claude.json matches (no-op)"
+            unchanged_home=$((unchanged_home+1))
             continue
         fi
-        # docker cp into a staging path then install with the right ownership
-        # and mode inside the container — `docker cp` doesn't preserve those
-        # cleanly across uid namespaces.
-        docker cp "$src" "$cn:/tmp/.credentials.json.new"
+        docker cp "$home_src" "$cn:/tmp/.claude.json.new"
         docker exec "$cn" sh -c \
-            'install -o worker -g worker -m 0600 /tmp/.credentials.json.new ~/.claude/.credentials.json && rm /tmp/.credentials.json.new'
-        echo "$cn: creds updated"
-        touched=$((touched+1))
+            'install -o worker -g worker -m 0600 /tmp/.claude.json.new ~/.claude.json && rm /tmp/.claude.json.new'
+        echo "$cn: ~/.claude.json updated"
+        touched_home=$((touched_home+1))
     done <<< "$names"
-    echo "rs-pi sync-creds: $touched updated, $unchanged unchanged"
+    echo "rs-pi sync-creds: .credentials.json — $touched_creds updated, $unchanged_creds unchanged"
+    echo "rs-pi sync-creds: ~/.claude.json   — $touched_home updated, $unchanged_home unchanged"
 }
 
 cmd_attach() {

@@ -46,6 +46,15 @@ fi
 if [[ -f /creds/settings.json ]]; then
     cp /creds/settings.json ~/.claude/settings.json
 fi
+# Restore ~/.claude.json (sibling of ~/.claude/, carrying `oauthAccount`
+# + onboarding state). Without it, interactive `claude` inside this PI
+# tab prompts for /login on every attach. The supervisor stages it
+# under the sentinel name `home_claude.json` in /creds/ to avoid
+# colliding with the ~/.claude/-dir convention.
+if [[ -f /creds/home_claude.json ]]; then
+    cp /creds/home_claude.json ~/.claude.json
+    chmod 600 ~/.claude.json
+fi
 
 # --- Stage role.md from template if absent ---------------------------------
 # Workspace-template-refresh idiom: copy on first boot only; PI's edits to

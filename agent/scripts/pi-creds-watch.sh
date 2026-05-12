@@ -70,11 +70,45 @@ propagate() {
     done <<< "$names"
 }
 
+# Sibling propagation: ~/.claude.json (at $HOME root, NOT under .claude/).
+# Carries `oauthAccount` + onboarding state. Without it, interactive claude
+# in the PI tab prompts for /login even though .credentials.json is valid.
+# This file rotates rarely (mostly account-claim + preferences), so we
+# don't watch it live — startup propagate + manual `rs-pi sync-creds`
+# covers it. Skipped silently if absent.
+propagate_home_json() {
+    local src="/home/research/.claude.json"
+    [[ -s "$src" ]] || return 0
+    local names
+    names=$(docker ps --filter 'label=research.pi_role' --format '{{.Names}}' 2>/dev/null || true)
+    [[ -z "$names" ]] && return 0
+    local sup_hash
+    sup_hash=$(sha256sum "$src" | cut -d' ' -f1)
+    while IFS= read -r cn; do
+        [[ -z "$cn" ]] && continue
+        local pi_hash
+        pi_hash=$(docker exec "$cn" sha256sum /home/worker/.claude.json 2>/dev/null | cut -d' ' -f1 || true)
+        if [[ "$sup_hash" == "$pi_hash" ]]; then
+            continue
+        fi
+        if docker cp "$src" "$cn:/tmp/.claude.json.new" 2>/dev/null; then
+            docker exec "$cn" sh -c \
+                'install -o worker -g worker -m 0600 /tmp/.claude.json.new ~/.claude.json && rm /tmp/.claude.json.new' \
+                2>/dev/null || \
+                echo "pi-creds-watch: install ~/.claude.json failed in $cn" >&2
+            echo "pi-creds-watch: propagated ~/.claude.json to $cn" >&2
+        else
+            echo "pi-creds-watch: docker cp ~/.claude.json to $cn failed" >&2
+        fi
+    done <<< "$names"
+}
+
 echo "pi-creds-watch: watching $WATCH_DIR/$WATCH_FILE" >&2
 
 # Run once at startup to catch the case where the file already exists +
 # any pi container was started before the watcher came up.
 propagate
+propagate_home_json
 
 # Then watch for changes. -m streams events; we filter for our file in
 # bash rather than via --include because the regex syntax differs by

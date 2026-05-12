@@ -17,3 +17,4 @@ container_volumes/
 data/
 PLAN/
 .mcp.json
+.cache/

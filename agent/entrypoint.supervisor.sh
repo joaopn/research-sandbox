@@ -53,12 +53,28 @@ fi
 # --- Restore Claude credentials stashed by `research project update --rebuild`
 #     (which `mv`s ~research/.claude into the workspace bind-mount before
 #     destroying the old container, so the creds survive the swap without
-#     ever touching the host outside the project's own workspace dir). ---
+#     ever touching the host outside the project's own workspace dir).
+#     Also handles host-side cache stages from `research auth cache`.
+#
+#     Two stash points, restored independently:
+#       /workspace/.creds-stash/        → ~/.claude/  (dir contents)
+#       /workspace/.creds-stash-home.json → ~/.claude.json  (sibling file)
+#
+#     `.claude.json` is a $HOME-root dotfile, NOT under .claude/. It
+#     carries the `oauthAccount` claim; without it, interactive claude
+#     treats the user as logged-out even when .credentials.json is
+#     valid.  ---
 if [[ -d /workspace/.creds-stash ]]; then
     sudo rm -rf /home/research/.claude
     sudo mv /workspace/.creds-stash /home/research/.claude
     sudo chown -R research:research /home/research/.claude
     echo "restored Claude creds from /workspace/.creds-stash"
+fi
+if [[ -f /workspace/.creds-stash-home.json ]]; then
+    sudo mv /workspace/.creds-stash-home.json /home/research/.claude.json
+    sudo chown research:research /home/research/.claude.json
+    sudo chmod 600 /home/research/.claude.json
+    echo "restored ~/.claude.json from /workspace/.creds-stash-home.json"
 fi
 
 # --- Workspace first-boot staging ---
@@ -80,6 +96,14 @@ mkdir -p /workspace/.claude /workspace/.orchestrator/logs \
 # it here only when no --data was passed, so the worker bind-mount of the
 # whole shared/ tree doesn't trip over a missing path.
 [[ -d /workspace/shared/data ]] || mkdir -p /workspace/shared/data
+# Same reclaim as /workspace above: `--data` bind-mounts force docker to
+# auto-create /workspace/shared root-owned BEFORE the entrypoint runs,
+# which breaks role-MCP enable (it mkdirs /workspace/shared/<role>/ as
+# the research user). Idempotent: if research.py's host-side pre-create
+# already won the race (newer projects), this is a no-op.
+if [[ "$(stat -c %U /workspace/shared)" != "research" ]]; then
+    sudo chown research:research /workspace/shared 2>/dev/null || true
+fi
 
 if [[ ! -f /workspace/.claude/CLAUDE.md ]]; then
     cp /opt/claude-templates/CLAUDE.md /workspace/.claude/CLAUDE.md
