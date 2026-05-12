@@ -93,7 +93,7 @@ When the supervisor sends a summarize-and-shutdown message (you'll recognize it 
    - Prior deliverables: outputs/<slug>/
    ```
 
-3. The **top line** is your thematic identity — this is the single most important line in `summary.md`. Make it a specific sentence naming what you're **for**, not a bullet list, not a title-case label. Example: *"Per-column descriptive statistics worker for /workspace/shared/data/sample.csv (mean/median/IQR/min/max, with per-language stratification where applicable)."* Generic titles like *"Stats worker"* are not acceptable.
+3. The **top line** is your thematic identity — this is the single most important line in `summary.md`. Make it a specific sentence naming what you're **for**, not a bullet list, not a title-case label. Example: *"Per-column descriptive statistics worker for /workspace/shared/data/raw/sample.csv (mean/median/IQR/min/max, with per-language stratification where applicable)."* Generic titles like *"Stats worker"* are not acceptable.
 
 4. After writing, return to WAITING. The supervisor's `/log` flow will shut you down shortly — the SIGTERM trap in your entrypoint will touch `/workspace/DONE` and exit cleanly. Your bind-mount is preserved; the next session may respawn you.
 

@@ -19,7 +19,7 @@ An agentic sandbox for research and data analysis and modeled as a research lab:
 python research.py start
 
 # 2. Create a project pointing at your dataset
-python research.py project create myproj --data-dir /path/to/dataset
+python research.py project create myproj --data /path/to/dataset
 
 # 3. Sign in to Claude inside the supervisor (once per project)
 python research.py project attach myproj
@@ -123,10 +123,10 @@ Builds the container images on first run; starts a small router container that h
 #### 2. Create a project
 
 ```bash
-python research.py project create myproj --data-dir /path/to/your/data
+python research.py project create myproj --data /path/to/your/data
 ```
 
-Creates a per-project workspace at `container_volumes/myproj/workspace/`, brings up the supervisor, and prints an SSH password. Your `--data-dir` is mounted read-only at `/workspace/shared/data/` — workers can read it but never write.
+Creates a per-project workspace at `container_volumes/myproj/workspace/`, brings up the supervisor, and prints an SSH password. Each `--data` path is mounted read-only at `/workspace/shared/data/<basename>/` — workers can read it but never write. `--data` is comma-separated for multiple paths (e.g. `--data /home/me/raw,/srv/parsed` lands as `/workspace/shared/data/raw/` and `.../parsed/`).
 
 Useful flags: `--memory 16g`, `--cpus 4`, `--egress locked` (HTTPS/DNS only), `--inner-firewall` (tighter network isolation between workers and the proxy). See `project create --help`.
 
@@ -155,7 +155,7 @@ Credentials are stored inside the supervisor (not on the host) and are copied in
 
 #### 4. Run a research thread
 
-In your Claude Code session, just describe what you want in plain English. *"Look at the dataset in `/workspace/shared/data`. Tell me whether the response-time distribution is heavy-tailed and what the typical user looks like."*
+In your Claude Code session, just describe what you want in plain English. *"Look at the dataset in `/workspace/shared/data/<your-data-name>/`. Tell me whether the response-time distribution is heavy-tailed and what the typical user looks like."*
 
 What you'll see, paraphrased:
 
@@ -271,7 +271,7 @@ MCP registry:
   mcp test  [<name>]                 Probe reachability (or all)
 
 project create options:
-  --data-dir <path>                  Host path mounted RO at /workspace/shared/data
+  --data <paths>                     Comma-separated host paths, each mounted RO at /workspace/shared/data/<basename>
   --memory <limit>                   Docker memory limit (e.g. 8g)
   --cpus <limit>                     Docker CPU limit
   --egress {open,locked}             Network egress policy (default open)
@@ -358,7 +358,7 @@ workers/<name>/work/             Worker's own /workspace inside its container
 ├── research_log.md              Worker's narrative
 ├── summary.md                   Cross-session memory
 └── log.jsonl                    Stream-json log
-shared/data/                     Read-only pass-through to your --data-dir
+shared/data/<basename>/          One RO subdir per --data path (basename → subdir)
 staging/<name>                   Symlink during your review
 results/<name>/<NNN>_<slug>/     PI-visible accepted deliverables
 logbook/

@@ -5,7 +5,7 @@ Stdlib only. Subcommand layout:
 
     research start                     # start shared infra (router)
     research stop                      # stop shared infra
-    research project create <name> [--data-dir PATH] [--profile python]
+    research project create <name> [--data PATHS] [--profile python]
                                    [--dind auto|sysbox|privileged]
                                    [--memory SIZE] [--cpus N]
                                    [--egress open|locked] [--ssh-port N]
@@ -677,18 +677,35 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     if egress not in ("open", "locked"):
         die(f"invalid --egress value: {egress!r} (expected open|locked)")
 
-    # Optional data-dir bind-mount (read-only inside supervisor). Created
-    # if missing, like `mkdir -p` — typical use is an empty dir for a fresh
-    # project that data will be dropped into afterward.
+    # Optional --data bind-mounts (read-only inside supervisor). Comma-
+    # separated host paths each land at /workspace/shared/data/<basename>/.
+    # Missing paths are mkdir -p'd (typical use is empty placeholder dirs
+    # that data is dropped into post-create). Basename collisions are a
+    # hard error because the container destinations would clash.
     extra_mounts: list[str] = []
-    if args.data_dir:
-        data_dir = Path(args.data_dir).expanduser().resolve()
-        if data_dir.exists() and not data_dir.is_dir():
-            die(f"--data-dir exists but is not a directory: {data_dir}")
-        if not data_dir.exists():
-            data_dir.mkdir(parents=True, exist_ok=True)
-            print(f"created data directory: {data_dir}")
-        extra_mounts += ["-v", f"{data_dir}:/workspace/shared/data:ro"]
+    data_basenames: dict[str, Path] = {}
+    if args.data:
+        seen_basenames = data_basenames
+        for raw in args.data.split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            p = Path(raw).expanduser().resolve()
+            if p.exists() and not p.is_dir():
+                die(f"--data path exists but is not a directory: {p}")
+            if not p.exists():
+                p.mkdir(parents=True, exist_ok=True)
+                print(f"created data directory: {p}")
+            base = p.name
+            if not base:
+                die(f"--data path has no basename (refusing to mount root): {p}")
+            if base in seen_basenames:
+                die(f"--data basename collision: {base!r} appears in both "
+                    f"{seen_basenames[base]} and {p}. Rename or symlink "
+                    "one of the host paths so the container destinations "
+                    "stay distinct.")
+            seen_basenames[base] = p
+            extra_mounts += ["-v", f"{p}:/workspace/shared/data/{base}:ro"]
 
     print(f"=== Creating project: {project} ===")
     ssh_port = args.ssh_port or find_free_port()
@@ -715,12 +732,13 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     wire_webui_to_projects()
 
     # 3. Build docker run argv.
-    # --enable tokens of the form role-mcp-<role> are sugar for
-    # `research project role-mcp enable` post-creation; tokens of the form
-    # pi-<role> are sugar for `research project pi enable`. Peel both off
-    # before computing service flags so _compute_service_flags doesn't
-    # die on the unknown id; defer activation to step 6d/6e below
-    # (after the supervisor is up and creds are ready).
+    # --enable tokens that match a role-MCP image key (e.g. `wrangler`)
+    # are sugar for `research project role-mcp enable` post-creation;
+    # tokens that match a PI image key (e.g. `pi-wrangler`) are sugar
+    # for `research project pi enable`. Peel both off before computing
+    # service flags so _compute_service_flags doesn't die on the
+    # unknown id; defer activation to step 6d/6e below (after the
+    # supervisor is up and creds are ready).
     enable_arg = getattr(args, "enable", None)
     disable_arg = getattr(args, "disable", None)
     enable_services, enable_role_mcps, enable_pi_roles, enable_no_pi_mirror = \
@@ -764,7 +782,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         inner_firewall=bool(getattr(args, "inner_firewall", False)),
         service_flags=service_flags,
     )
-    # Inject data-dir (and any future --mount) into argv just before the image name.
+    # Inject --data mounts (and any future --mount) into argv just before the image name.
     if extra_mounts:
         docker_args = docker_args[:-1] + extra_mounts + [docker_args[-1]]
 
@@ -799,8 +817,8 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     if granted:
         _supervisor_mcp_reload(container_name)
 
-    # 6d. role-mcp sugar (--enable role-mcp-<role>). Skipped silently if
-    #     the supervisor is not yet authenticated — the user must run
+    # 6d. role-mcp sugar (--enable <role>). Skipped silently if the
+    #     supervisor is not yet authenticated — the user must run
     #     `claude` once and then `research project role-mcp enable …`
     #     manually, because we need creds to stage at start time. This
     #     mirrors the rs-worker creds requirement.
@@ -810,7 +828,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
                         capture_output=True).returncode == 0
     if enable_role_mcps:
         if not creds_present:
-            print("note: --enable role-mcp-* requires supervisor auth; "
+            print("note: --enable <role-mcp-name> requires supervisor auth; "
                   "skipping role-mcp activation. After authenticating "
                   "(see Next steps below), run:", file=sys.stderr)
             for role in enable_role_mcps:
@@ -858,6 +876,58 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     mcps_line = ", ".join(granted) if granted else "(none)"
     role_mcps_line = ", ".join(role_mcps_enabled) if role_mcps_enabled else "(none)"
     pi_roles_line = ", ".join(pi_roles_enabled) if pi_roles_enabled else "(none)"
+    if data_basenames:
+        data_lines = "\n".join(
+            f"             /workspace/shared/data/{b}/  ←  {src}"
+            for b, src in sorted(data_basenames.items())
+        )
+        data_block = f"  Data (RO):\n{data_lines}\n"
+    else:
+        data_block = ""
+
+    # Webui block — show URL + import string only when rs-webui is up.
+    # Import string is the base64 the SPA's add-project modal accepts to
+    # auto-fill SSH credentials; same payload as `research webui import`.
+    if container_running(WEBUI_CONTAINER):
+        webui_bind = read_env_value("WEBUI_BIND") or "127.0.0.1"
+        webui_port = read_env_value("WEBUI_PORT") or "7777"
+        import_str = _webui_import_string(project, ssh_pass)
+        webui_block = (
+            f"  Webui:     https://{webui_bind}:{webui_port}\n"
+            f"  Import:    {import_str}\n"
+        )
+    else:
+        webui_block = ""
+
+    # Pending activations (role-MCPs / PI roles requested via --enable but
+    # skipped because the supervisor wasn't yet authenticated at create
+    # time). Surfaced as their own "Next steps" entry so the operator
+    # doesn't have to scroll up to find the deferred commands.
+    pending_role_mcps = [r for r in enable_role_mcps if r not in role_mcps_enabled]
+    pending_pi_roles = [r for r in enable_pi_roles if r not in pi_roles_enabled]
+
+    steps: list[str] = []
+    steps.append(
+        "  1. Authenticate Claude Code inside the supervisor (once per project):\n"
+        f"     `python research.py project attach {project}`, then in byobu run\n"
+        "     `claude` and complete the device-code flow in a local browser."
+    )
+    if pending_role_mcps or pending_pi_roles:
+        cmds: list[str] = []
+        for r in pending_role_mcps:
+            cmds.append(f"       python research.py project role-mcp enable {project} {r}")
+        for r in pending_pi_roles:
+            cmds.append(f"       python research.py project pi enable {project} {r}")
+        steps.append(
+            f"  {len(steps)+1}. Finish activating the deferred role-MCPs / PI roles\n"
+            "     (skipped at create because the supervisor wasn't authed yet):\n"
+            + "\n".join(cmds)
+        )
+    steps.append(
+        f"  {len(steps)+1}. Start working on a problem with the supervisor."
+    )
+    next_steps = "\n".join(steps)
+
     print(f"""
 Project '{project}' is running.
 
@@ -869,17 +939,10 @@ Project '{project}' is running.
   MCPs:      {mcps_line}
   Role-MCPs: {role_mcps_line}
   PI roles:  {pi_roles_line}
-  SSH:       research@localhost -p {ssh_port}   password: {ssh_pass}
-
+{data_block}  SSH:       research@localhost -p {ssh_port}   password: {ssh_pass}
+{webui_block}
 Next steps:
-  1. Authenticate Claude Code inside the supervisor (once per project).
-     Either:
-       (a) Connect via VSCode Remote-SSH (localhost:{ssh_port}, user 'research',
-           password as above), then click the Claude Code extension — it will
-           trigger OAuth via a port-forwarded localhost callback.
-       (b) `research project attach {project}`, then in byobu run `claude` and
-           complete the device-code flow in a local browser.
-  2. Once authenticated, ask the supervisor to spawn workers.
+{next_steps}
 """)
 
 
@@ -1148,7 +1211,7 @@ def _read_supervisor_metadata(container: str) -> dict:
     labels = (data.get("Config") or {}).get("Labels") or {}
 
     # Bind-mounts other than /workspace and the privileged-DIND volume —
-    # i.e. user-supplied --data-dir paths.
+    # i.e. user-supplied --data paths under /workspace/shared/data/<basename>/.
     extra_mounts: list[str] = []
     for m in data.get("Mounts") or []:
         dst_in = m.get("Destination", "")
@@ -3068,16 +3131,28 @@ def _split_enable_tokens(
     """Split ``--enable`` value into (service_csv, role_mcp_roles,
     pi_roles, no_pi_mirror).
 
-    Tokens of the form ``role-mcp-<role>`` peel off into the role-mcp list;
-    tokens of the form ``pi-<role>`` peel off into the pi list (where
-    ``pi-<role>`` is the full container-key, e.g. ``pi-echo``). The bare
-    token ``no-pi-mirror`` is a sentinel that suppresses PI-mirror
-    auto-enable for every role-mcp-* token in the same ``--enable`` value
-    (it applies to all roles, not per-role — per-role granularity is
-    available via the direct CLI ``research project role-mcp enable
-    --no-pi-mirror``). Anything else stays for ``_compute_service_flags``
-    to interpret as a service id. Empty service set returns None to keep
-    the default (all services enabled / inherit prior flags) intact."""
+    Tokens are matched against three sets in order, all using their
+    canonical short names (no prefix sugar):
+      - a key in ``role_mcp.ROLE_IMAGES`` (e.g. ``wrangler``,
+        ``echo-mcp``) peels into the role-mcp list,
+      - a key in ``pi_roles.PI_IMAGES`` (e.g. ``pi-wrangler``,
+        ``pi-echo``) peels into the pi list,
+      - the bare sentinel ``no-pi-mirror`` suppresses PI-mirror auto-
+        enable for every role-mcp token in the same ``--enable`` value
+        (it applies to all roles, not per-role — per-role granularity is
+        available via ``research project role-mcp enable --no-pi-mirror``),
+      - anything else stays for ``_compute_service_flags`` to interpret
+        as a service id.
+
+    A name that lives in BOTH ``role_mcp.ROLE_IMAGES`` and
+    ``KNOWN_SERVICES`` (or both registries — role-MCP vs PI) is a
+    configuration error in this codebase, not an operator problem; the
+    image-registry tables (cli/role_mcp.py, cli/pi.py) are the source of
+    truth and authors must keep names disjoint. The parser doesn't try
+    to disambiguate.
+
+    Empty service set returns None to keep the default (all services
+    enabled / inherit prior flags) intact."""
     if not enable_arg:
         return None, [], [], False
     services: list[str] = []
@@ -3090,9 +3165,9 @@ def _split_enable_tokens(
             continue
         if tok == "no-pi-mirror":
             no_pi_mirror = True
-        elif tok.startswith("role-mcp-"):
-            role_mcps.append(tok[len("role-mcp-"):])
-        elif tok.startswith("pi-"):
+        elif tok in role_mcp.ROLE_IMAGES:
+            role_mcps.append(tok)
+        elif tok in pi_roles.PI_IMAGES:
             pi.append(tok)
         else:
             services.append(tok)
@@ -3105,7 +3180,7 @@ def _parse_role_mcp_upstream(
 ) -> dict[str, list[str]]:
     """Parse repeated ``--role-mcp-upstream <role>=<csv>`` flags into
     ``{role: [mcp_name, ...]}``. Each role must appear in the same
-    ``--enable role-mcp-<role>`` set, so a typo or stray role-mcp
+    ``--enable`` set as a role-MCP token, so a typo or stray role-mcp
     surfaces here rather than as an orphan upstream override.
 
     An entry with empty CSV (``--role-mcp-upstream wrangler=``) means
@@ -3120,7 +3195,7 @@ def _parse_role_mcp_upstream(
         if not role:
             die(f"--role-mcp-upstream missing role name in {item!r}")
         if role not in valid_roles:
-            die(f"--role-mcp-upstream {role!r} not in --enable role-mcp-* "
+            die(f"--role-mcp-upstream {role!r} not in --enable role-mcp "
                 f"set {sorted(valid_roles)}")
         out[role] = _parse_csv_list(csv)
     return out
@@ -3553,7 +3628,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     c = proj_sub.add_parser("create", help="create a new project")
     c.add_argument("name")
-    c.add_argument("--data-dir", help="host path mounted RO at /workspace/shared/data")
+    c.add_argument("--data", metavar="PATHS",
+                   help="comma-separated host paths, each mounted RO at "
+                        "/workspace/shared/data/<basename>/ (e.g. "
+                        "`--data /home/me/raw,/srv/parsed` lands as "
+                        "/workspace/shared/data/raw and .../parsed). "
+                        "Missing paths are mkdir -p'd. Basename collisions "
+                        "across the list are a hard error.")
     c.add_argument("--profile", default="python", help="supervisor image profile")
     c.add_argument("--dind", choices=["auto", "sysbox", "privileged"],
                    help="DIND mode (default: auto — sysbox if available, else privileged)")
@@ -3566,24 +3647,23 @@ def build_parser() -> argparse.ArgumentParser:
                    help="enable defense-in-depth iptables ACL on the supervisor's "
                         "rs-inner bridge (workers can only reach mcp-proxy + DNS)")
     c.add_argument("--enable", metavar="IDS",
-                   help=f"comma-separated service ids to force-enable "
-                        f"(known services: {','.join(KNOWN_SERVICES)}). "
-                        f"Also accepts role-mcp-<role> tokens as sugar "
-                        f"for `research project role-mcp enable` "
-                        f"(known role-mcps: "
-                        f"{','.join(sorted(role_mcp.ROLE_IMAGES))}); the "
-                        f"bare sentinel `no-pi-mirror` in this list "
-                        f"suppresses the matching pi-<role> auto-enable "
-                        f"for every role-mcp-* token; and pi-<role> "
-                        f"tokens as sugar for `research project pi enable` "
-                        f"(known pi roles: "
-                        f"{','.join(sorted(pi_roles.PI_IMAGES))})")
+                   help=f"comma-separated tokens to force-enable. Tokens "
+                        f"are matched by name against three registries: "
+                        f"services ({','.join(KNOWN_SERVICES)}), role-MCPs "
+                        f"({','.join(sorted(role_mcp.ROLE_IMAGES))}), and "
+                        f"PI roles ({','.join(sorted(pi_roles.PI_IMAGES))}). "
+                        f"Role-MCP tokens are sugar for `research project "
+                        f"role-mcp enable`; PI-role tokens are sugar for "
+                        f"`research project pi enable`. The bare sentinel "
+                        f"`no-pi-mirror` in this list suppresses the "
+                        f"matching `pi-<role>` auto-enable for every "
+                        f"role-MCP token.")
     c.add_argument("--role-mcp-upstream", metavar="ROLE=CSV",
                    action="append",
                    help="repeatable: pin an explicit upstream list for a "
-                        "role-mcp activated via `--enable role-mcp-<role>` "
+                        "role-mcp activated via `--enable <role>` "
                         "(e.g. `--role-mcp-upstream wrangler=postgres-mcp"
-                        ",mongo-mcp`). Without this flag, role-mcp-<role> "
+                        ",mongo-mcp`). Without this flag, the role-mcp "
                         "auto-derives upstreams from the registry × allow "
                         "intersection. Empty CSV (e.g. `wrangler=`) means "
                         "explicit no-upstreams.")
@@ -3650,18 +3730,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "templates (default: refresh, so role-doc and "
                         "slash-command edits propagate)")
     u.add_argument("--enable", metavar="IDS",
-                   help=f"comma-separated service ids to enable "
-                        f"(known services: {','.join(KNOWN_SERVICES)}). "
-                        f"Also accepts role-mcp-<role> tokens (known: "
-                        f"{','.join(sorted(role_mcp.ROLE_IMAGES))}); the "
-                        f"bare sentinel `no-pi-mirror` suppresses the "
-                        f"matching pi-<role> auto-enable for every "
-                        f"role-mcp-* token; and pi-<role> tokens (known: "
-                        f"{','.join(sorted(pi_roles.PI_IMAGES))})")
+                   help=f"comma-separated tokens to enable. Matched by "
+                        f"name against services ({','.join(KNOWN_SERVICES)}), "
+                        f"role-MCPs ({','.join(sorted(role_mcp.ROLE_IMAGES))}), "
+                        f"and PI roles ({','.join(sorted(pi_roles.PI_IMAGES))}). "
+                        f"Bare sentinel `no-pi-mirror` suppresses the "
+                        f"matching `pi-<role>` auto-enable for every "
+                        f"role-MCP token.")
     u.add_argument("--role-mcp-upstream", metavar="ROLE=CSV",
                    action="append",
                    help="repeatable: pin an explicit upstream list for a "
-                        "role-mcp activated via `--enable role-mcp-<role>` "
+                        "role-mcp activated via `--enable <role>` "
                         "(see `project create --help` for full semantics).")
     u.add_argument("--disable", metavar="IDS",
                    help="comma-separated service ids to disable "
@@ -3854,9 +3933,10 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--roles", metavar="CSV",
                    help=f"comma-separated role-MCP affinities — declares "
                         f"that this MCP serves the named role-MCP(s) as an "
-                        f"upstream. Used by `--enable role-mcp-<role>` and "
-                        f"`project mcp sync` to auto-wire the per-project "
-                        f"upstream set. Known roles: "
+                        f"upstream. Used by `--enable <role>` (sugar for "
+                        f"`project role-mcp enable`) and `project mcp sync` "
+                        f"to auto-wire the per-project upstream set. Known "
+                        f"roles: "
                         f"{','.join(sorted(role_mcp.ROLE_IMAGES)) or '(none)'}")
     a.set_defaults(func=cmd_mcp_add)
 

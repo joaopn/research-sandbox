@@ -67,7 +67,7 @@ What specifically is this worker answering this cycle?
 as prior-session memory.)
 
 ## Inputs
-Explicit paths the worker needs (e.g. /workspace/shared/data/...).
+Explicit paths the worker needs (e.g. /workspace/shared/data/<name>/...).
 Any assumptions about format, schema, size.
 
 ## Deliverables

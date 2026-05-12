@@ -74,7 +74,11 @@ mkdir -p /workspace/.claude /workspace/.orchestrator/logs \
          /workspace/logbook/supervisor /workspace/logbook/pi \
          /workspace/shared /workspace/workers \
          /workspace/.workers /workspace/staging /workspace/results
-# /workspace/shared/data may be a RO bind-mount; only create it if missing.
+# /workspace/shared/data is the parent dir for `--data PATHS` bind-mounts
+# (one RO mount per host path at /workspace/shared/data/<basename>/).
+# Docker auto-creates it root-owned when any --data mount lands; we mkdir
+# it here only when no --data was passed, so the worker bind-mount of the
+# whole shared/ tree doesn't trip over a missing path.
 [[ -d /workspace/shared/data ]] || mkdir -p /workspace/shared/data
 
 if [[ ! -f /workspace/.claude/CLAUDE.md ]]; then
