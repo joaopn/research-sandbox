@@ -59,6 +59,34 @@ SERVICES = {
             "byobu new-session -s pi -- bash -l'"
         ),
     },
+    # pi-wrangler — interactive DB-extraction tab (P.3). Command runs
+    # `claude` in byobu (NOT `bash -l` like pi-echo) — pi-wrangler is a
+    # real role and the PI expects framing on tab open. claude
+    # auto-discovers `/workspace/CLAUDE.md` (symlinked to role.md by the
+    # pi entrypoint) and `/workspace/.mcp.json` (rendered from the
+    # project's worker-facing wrangler upstream set).
+    #
+    # `byobu new-session -c /workspace` pins the session cwd so claude's
+    # auto-discovery finds both files. Without -c, byobu inherits the
+    # exec's cwd which is the docker default — claude would look for
+    # CLAUDE.md / .mcp.json in /home/worker and miss them.
+    #
+    # always_on=True: same OQ-5 deferral as pi-echo. Tab shows on every
+    # project; clicking on a project that hasn't enabled pi-wrangler
+    # fails at the docker exec step with a clear `No such container:
+    # rs-pi-wrangler` message.
+    "pi-wrangler": {
+        "label": "PI Wrangler",
+        "kind": "ssh",
+        "always_on": True,
+        "renderer": "xterm.js",
+        "default_port": 22,
+        "command": (
+            "docker exec -it rs-pi-wrangler bash -lc "
+            "'byobu attach -t pi 2>/dev/null || "
+            "byobu new-session -s pi -c /workspace -- claude'"
+        ),
+    },
 }
 
 

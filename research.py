@@ -2664,6 +2664,16 @@ def _pi_start(supervisor: str, project: str, cfg: "Config",
         "--restart", "unless-stopped",
         "-v", f"/workspace/pi/{short}:/workspace",
         "-v", f"/workspace/.pi/{short}/.creds:/creds:ro",
+        # /etc/orchestrator is the supervisor's per-project state dir
+        # (role-mcps.json, mcp-allow.json). PI containers that mirror a
+        # worker-facing role-MCP (pi-wrangler, pi-librarian, …) read
+        # this at entrypoint time to render their .mcp.json +
+        # .tools-inventory.md from the same source the worker-facing
+        # role uses. pi-echo (substrate fixture) skips that branch and
+        # ignores the mount. Parent-dir bind-mount, same shape as the
+        # role-MCP containers — atomic-rename writes by the host stay
+        # visible (single-file-bind-mount rule).
+        "-v", "/workspace/.orchestrator:/etc/orchestrator:ro",
         "-e", f"RS_PI_ROLE={short}",
         "--label", f"research.pi_role={role}",
         "--label", f"research.project={project}",
@@ -2685,16 +2695,46 @@ def _pi_stop(supervisor: str, role: str) -> None:
 def _pi_enable(project: str, cfg: "Config", role: str) -> None:
     """Write the per-project pi-roles.json entry + start the container.
     Idempotent — re-running on an already-enabled role rewrites the entry
-    and restarts the container. Unlike role-mcps, PI roles have no
-    upstream-MCP allowlist of their own (per-role plans P.1+ will wire
-    that from the matching role-MCP's upstream set); P.0's pi-echo has
-    no MCPs at all."""
+    and restarts the container.
+
+    PI roles whose short name matches a worker-facing role-MCP key
+    (pi-wrangler ↔ wrangler, pi-librarian ↔ librarian, pi-websearcher ↔
+    websearcher) MIRROR that role-MCP's upstream set — they read
+    `role-mcps.json[<short>].upstream_mcps` at container start to render
+    their `.mcp.json` + `.tools-inventory.md`. Such PI roles refuse to
+    enable if the worker-facing role-MCP isn't enabled for the project:
+    PI mode without a matching worker-facing entry would mean PI's claude
+    sees an empty MCP list, which is a configuration error, not a usable
+    PI tab. pi-echo (whose short name "echo" matches no role-MCP key)
+    bypasses this gate — substrate-only fixture, no upstreams expected.
+    """
     pi_roles.validate_role(role)
     supervisor = container_name_for(project)
     if not container_running(supervisor):
         die(f"project {project!r} is not running; bring it up first")
 
     workspace_path = workspace_path_for(project, cfg)
+
+    # W10 (P.3 plan): if this PI role mirrors a worker-facing role-MCP,
+    # require that role-MCP to be enabled per-project first. Failure
+    # mode without this gate: pi-wrangler comes up with an empty
+    # .tools-inventory.md, and the PI's claude session has no DB MCPs
+    # to call — which feels like a bug in pi-wrangler but is actually
+    # a missing dependency in the project's worker-facing wiring.
+    short = pi_roles.role_short(role)
+    if short in role_mcp.ROLE_IMAGES:
+        role_mcp_entries = role_mcp.load_role_mcps(workspace_path)
+        if short not in role_mcp_entries:
+            die(
+                f"pi role {role!r} mirrors worker-facing role-MCP "
+                f"{short!r}, which is not enabled for project "
+                f"{project!r}. Run `research project role-mcp enable "
+                f"{project} {short} --upstream <mcp,...>` first, then "
+                f"re-run this command. (PI mode reads its upstream set "
+                f"from role-mcps.json so both surfaces share one source "
+                f"of truth.)"
+            )
+
     entries = pi_roles.load_pi_roles(workspace_path)
     entries[role] = pi_roles.build_entry(role)
     pi_roles.save_pi_roles(workspace_path, entries)

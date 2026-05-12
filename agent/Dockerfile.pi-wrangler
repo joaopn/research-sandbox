@@ -1,0 +1,15 @@
+FROM rs-pi-base:latest
+
+# pi-wrangler — interactive DB-extraction tab for the PI. FROMs rs-pi-base
+# (analysis-base + byobu + entrypoint.pi.sh). Image is MCP-agnostic; the
+# spawned claude reads its upstream set from `/workspace/.tools-inventory.md`
+# (rendered by entrypoint.pi.sh from the project's `role-mcps.json`
+# wrangler entry — same source of truth as the worker-facing B.3 wrangler,
+# so PI mode and worker mode see the same DBs).
+
+USER root
+COPY container/pi-wrangler/role.md /opt/pi-templates/wrangler/role.md
+RUN chown -R worker:worker /opt/pi-templates/wrangler
+
+USER worker
+WORKDIR /workspace
