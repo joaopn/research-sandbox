@@ -1,0 +1,27 @@
+FROM rs-analysis-base:latest
+
+# PI-role base layer. Adds byobu (session persistence across webui tab
+# close/reopen) on top of analysis-base, plus the generic PI entrypoint.
+# Per-role images (rs-pi-echo, rs-pi-wrangler, etc.) FROM this and only
+# bake in the role-specific role.md under /opt/pi-templates/<role>/.
+
+USER root
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        byobu \
+    && rm -rf /var/lib/apt/lists/*
+
+# Generic PI entrypoint: cred copy, workspace-template staging, then
+# `tail -f /dev/null` to keep the container up. Per-role images do not
+# override; they bake role.md only.
+COPY agent/entrypoint.pi.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# /opt/pi-templates/<role>/role.md staged in per-role layer images.
+RUN mkdir -p /opt/pi-templates && chown -R worker:worker /opt/pi-templates
+
+USER worker
+WORKDIR /workspace
+
+# tini comes from analysis-base. PID 1 is tini; entrypoint is /entrypoint.sh.
+ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]

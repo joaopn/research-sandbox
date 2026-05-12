@@ -43,6 +43,7 @@ from pathlib import Path
 # Make cli/ helpers importable.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "cli"))
 import mcp_registry  # noqa: E402
+import pi as pi_roles  # noqa: E402
 import role_mcp  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -54,6 +55,7 @@ SUPERVISOR_IMAGE = "rs-supervisor:latest"
 ANALYSIS_IMAGE = "rs-analysis-base:latest"
 MCP_PROXY_IMAGE = "rs-mcp-proxy:latest"
 ROLE_MCP_BASE_IMAGE = "rs-role-mcp-base:latest"
+PI_BASE_IMAGE = "rs-pi-base:latest"
 INNER_NETWORK = "rs-inner"
 WEBUI_IMAGE = "rs-webui:latest"
 WEBUI_CONTAINER = "rs-webui"
@@ -553,11 +555,23 @@ def _build_images(force: bool) -> None:
         (ANALYSIS_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.analysis-base"),
         (MCP_PROXY_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.mcp-proxy"),
         (ROLE_MCP_BASE_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.role-mcp-base"),
+        (PI_BASE_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.pi-base"),
     ]
     for role, image in sorted(role_mcp.ROLE_IMAGES.items()):
         dockerfile = SCRIPT_DIR / "agent" / f"Dockerfile.{role}"
         if not dockerfile.is_file():
             print(f"warning: role-mcp image {image} has no Dockerfile at "
+                  f"{dockerfile.name}; skipping (add it in the per-role stage)",
+                  file=sys.stderr)
+            continue
+        specs.append((image, dockerfile))
+    # PI per-role images (rs-pi-echo, rs-pi-wrangler, …) FROM rs-pi-base.
+    # Build order is bottom-up so each FROM resolves to the freshly-built
+    # layer, same discipline as role-mcp-base.
+    for role, image in sorted(pi_roles.PI_IMAGES.items()):
+        dockerfile = SCRIPT_DIR / "agent" / f"Dockerfile.{role}"
+        if not dockerfile.is_file():
+            print(f"warning: pi image {image} has no Dockerfile at "
                   f"{dockerfile.name}; skipping (add it in the per-role stage)",
                   file=sys.stderr)
             continue
@@ -700,20 +714,34 @@ def cmd_project_create(args: argparse.Namespace) -> None:
 
     # 3. Build docker run argv.
     # --enable tokens of the form role-mcp-<role> are sugar for
-    # `research project role-mcp enable` post-creation. Peel them off
+    # `research project role-mcp enable` post-creation; tokens of the form
+    # pi-<role> are sugar for `research project pi enable`. Peel both off
     # before computing service flags so _compute_service_flags doesn't
-    # die on the unknown id; defer role-mcp activation to step 6d below
-    # (after the supervisor + mcp-proxy are up and creds are ready).
+    # die on the unknown id; defer activation to step 6d/6e below
+    # (after the supervisor is up and creds are ready).
     enable_arg = getattr(args, "enable", None)
-    enable_services, enable_role_mcps = _split_role_mcp_tokens(enable_arg)
+    disable_arg = getattr(args, "disable", None)
+    enable_services, enable_role_mcps, enable_pi_roles = \
+        _split_enable_tokens(enable_arg)
+    disable_services, disable_pi_roles = _split_disable_tokens(disable_arg)
     if enable_role_mcps:
         for role in enable_role_mcps:
             try:
                 role_mcp.validate_role(role)
             except ValueError as e:
                 die(str(e))
+    for role in enable_pi_roles:
+        try:
+            pi_roles.validate_role(role)
+        except ValueError as e:
+            die(str(e))
+    for role in disable_pi_roles:
+        try:
+            pi_roles.validate_role(role)
+        except ValueError as e:
+            die(str(e))
     service_flags = _compute_service_flags(
-        enable_services, getattr(args, "disable", None),
+        enable_services, disable_services,
     )
     docker_args = build_supervisor_docker_args(
         container_name=container_name,
@@ -771,10 +799,10 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     #     manually, because we need creds to stage at start time. This
     #     mirrors the rs-worker creds requirement.
     role_mcps_enabled: list[str] = []
+    creds_present = run(["docker", "exec", container_name, "test", "-f",
+                         "/home/research/.claude/.credentials.json"],
+                        capture_output=True).returncode == 0
     if enable_role_mcps:
-        creds_present = run(["docker", "exec", container_name, "test", "-f",
-                             "/home/research/.claude/.credentials.json"],
-                            capture_output=True).returncode == 0
         if not creds_present:
             print("note: --enable role-mcp-* requires supervisor auth; "
                   "skipping role-mcp activation. After authenticating "
@@ -793,10 +821,33 @@ def cmd_project_create(args: argparse.Namespace) -> None:
                           f"`research project role-mcp enable {project} {role}`",
                           file=sys.stderr)
 
+    # 6e. pi-role sugar (--enable pi-<role>). Same auth requirement as
+    #     role-mcps — PI containers stage the supervisor's creds at start.
+    pi_roles_enabled: list[str] = []
+    if enable_pi_roles:
+        if not creds_present:
+            print("note: --enable pi-* requires supervisor auth; "
+                  "skipping pi-role activation. After authenticating "
+                  "(see Next steps below), run:", file=sys.stderr)
+            for role in enable_pi_roles:
+                print(f"   research project pi enable {project} {role}",
+                      file=sys.stderr)
+        else:
+            for role in enable_pi_roles:
+                try:
+                    _pi_enable(project, cfg, role)
+                    pi_roles_enabled.append(role)
+                except SystemExit:
+                    print(f"warning: failed to enable pi role {role!r}; "
+                          "retry manually with "
+                          f"`research project pi enable {project} {role}`",
+                          file=sys.stderr)
+
     # 7. Report.
     inner_fw = "on" if getattr(args, "inner_firewall", False) else "off"
     mcps_line = ", ".join(granted) if granted else "(none)"
     role_mcps_line = ", ".join(role_mcps_enabled) if role_mcps_enabled else "(none)"
+    pi_roles_line = ", ".join(pi_roles_enabled) if pi_roles_enabled else "(none)"
     print(f"""
 Project '{project}' is running.
 
@@ -807,6 +858,7 @@ Project '{project}' is running.
   Inner FW:  {inner_fw}
   MCPs:      {mcps_line}
   Role-MCPs: {role_mcps_line}
+  PI roles:  {pi_roles_line}
   SSH:       research@localhost -p {ssh_port}   password: {ssh_pass}
 
 Next steps:
@@ -1263,6 +1315,22 @@ def _recreate_supervisor(
                   f"`research project role-mcp enable {project} {role}`",
                   file=sys.stderr)
 
+    # Same idea for PI-role containers (STAGE_BACKEND_PI P.0). The
+    # pi-roles.json snapshot is the source of truth; _pi_start re-stages
+    # the per-role image into the (potentially fresh) inner dockerd and
+    # restarts the container. Workspace + creds-stash survive because
+    # they're on the project volume.
+    pi_entries = pi_roles.load_pi_roles(workspace_path)
+    for role in sorted(pi_entries):
+        try:
+            _pi_start(container, project, cfg, role,
+                      force_restage=force_restage)
+        except SystemExit:
+            print(f"warning: failed to restart pi role {role!r}; "
+                  f"the entry in pi-roles.json is intact, retry with "
+                  f"`research project pi enable {project} {role}`",
+                  file=sys.stderr)
+
 
 def cmd_project_update(args: argparse.Namespace) -> None:
     """Push edited code into a project. Always recreates the supervisor
@@ -1281,13 +1349,26 @@ def cmd_project_update(args: argparse.Namespace) -> None:
 
     print(f"=== Updating project: {project} ===")
 
-    # Validate --enable role-mcp tokens up front so a typo doesn't waste a
-    # rebuild before failing.
+    # Validate --enable role-mcp + pi tokens up front so a typo doesn't
+    # waste a rebuild before failing.
     enable_arg = getattr(args, "enable", None)
-    enable_services, enable_role_mcps = _split_role_mcp_tokens(enable_arg)
+    disable_arg = getattr(args, "disable", None)
+    enable_services, enable_role_mcps, enable_pi_roles = \
+        _split_enable_tokens(enable_arg)
+    disable_services, disable_pi_roles = _split_disable_tokens(disable_arg)
     for role in enable_role_mcps:
         try:
             role_mcp.validate_role(role)
+        except ValueError as e:
+            die(str(e))
+    for role in enable_pi_roles:
+        try:
+            pi_roles.validate_role(role)
+        except ValueError as e:
+            die(str(e))
+    for role in disable_pi_roles:
+        try:
+            pi_roles.validate_role(role)
         except ValueError as e:
             die(str(e))
 
@@ -1303,9 +1384,22 @@ def cmd_project_update(args: argparse.Namespace) -> None:
                 print(f"  {rel}")
 
     flags_override: dict[str, bool] | None = None
-    if enable_services or getattr(args, "disable", None):
+    if enable_services or disable_services:
         base = _read_service_flags(container)
-        flags_override = _compute_service_flags(enable_services, args.disable, base=base)
+        flags_override = _compute_service_flags(
+            enable_services, disable_services, base=base)
+
+    # PI disables run BEFORE _recreate_supervisor: the recreate's PI
+    # restart loop reads pi-roles.json, and a role removed there should
+    # not come back up after recreate. The stop helper is tolerant of a
+    # missing container (the recreate is about to nuke the inner dockerd
+    # anyway under sysbox).
+    for role in disable_pi_roles:
+        try:
+            _pi_disable(project, cfg, role)
+        except SystemExit:
+            print(f"warning: failed to disable pi role {role!r}",
+                  file=sys.stderr)
 
     _recreate_supervisor(
         project, cfg,
@@ -1327,6 +1421,15 @@ def cmd_project_update(args: argparse.Namespace) -> None:
         except SystemExit:
             print(f"warning: failed to enable role-mcp {role!r}; retry "
                   f"with `research project role-mcp enable {project} {role}`",
+                  file=sys.stderr)
+
+    # pi-role sugar via --enable. Same pattern: idempotent on re-enable.
+    for role in enable_pi_roles:
+        try:
+            _pi_enable(project, cfg, role)
+        except SystemExit:
+            print(f"warning: failed to enable pi role {role!r}; retry "
+                  f"with `research project pi enable {project} {role}`",
                   file=sys.stderr)
 
     print(f"\nproject {project!r} updated.")
@@ -2448,26 +2551,337 @@ def cmd_project_role_mcp_status(args: argparse.Namespace) -> None:
           f" ({'has artifacts' if state['publish_present'] else 'empty'})")
 
 
-def _split_role_mcp_tokens(enable_arg: str | None) -> tuple[str | None, list[str]]:
-    """Split ``--enable`` value into (service_csv, role_mcp_roles).
-    Tokens of the form ``role-mcp-<role>`` peel off into the role list;
-    everything else is left for `_compute_service_flags` to interpret as
-    service ids. Empty service set returns None to keep the default (all
-    services enabled / inherit prior flags) intact."""
+# ---------------------------------------------------------------------------
+# Per-project PI-role lifecycle (STAGE_BACKEND_PI P.0)
+# ---------------------------------------------------------------------------
+
+
+def _pi_stage_creds(supervisor: str, role: str) -> None:
+    """Snapshot the supervisor's current Claude credentials into the
+    per-role creds-stash dir so the PI container can stage them at boot.
+    Idempotent: overwrites any previous snapshot. Errors are fatal — a PI
+    container with no creds is non-functional (claude inside refuses to
+    start with `Not logged in`).
+
+    Path note: paths use the *short* role name (the ``pi-`` prefix
+    stripped — e.g. ``pi-echo`` → ``echo``). The role key keeps the
+    ``pi-`` prefix only because it disambiguates from worker-facing
+    role-MCPs at the registry level; once inside the project volume's
+    ``pi/`` directory grouping, the prefix is redundant. Creds land
+    under ``.pi/<short>/.creds/`` (hidden tree, parallel to
+    ``.role-mcps/<role>/``). The workspace bind-mount source at
+    ``pi/<short>/`` is pre-created uid-1000-owned by the same script
+    so docker's auto-create doesn't land it root-owned and break the
+    worker user's writes inside the container."""
+    short = pi_roles.role_short(role)
+    script = f"""
+        set -e
+        if [ ! -f /home/research/.claude/.credentials.json ]; then
+            echo "supervisor is not authenticated (no ~/.claude/.credentials.json)" >&2
+            exit 2
+        fi
+        mkdir -p /workspace/.pi/{short}/.creds
+        mkdir -p /workspace/pi/{short}
+        cp /home/research/.claude/.credentials.json \
+           /workspace/.pi/{short}/.creds/.credentials.json
+        chmod 600 /workspace/.pi/{short}/.creds/.credentials.json
+        if [ -f /home/research/.claude/settings.json ]; then
+            cp /home/research/.claude/settings.json \
+               /workspace/.pi/{short}/.creds/settings.json
+        fi
+    """
+    r = run(["docker", "exec", supervisor, "bash", "-eu", "-c", script],
+            capture_output=True)
+    if r.returncode != 0:
+        die((r.stderr or r.stdout).strip()
+            or f"failed to stage creds for pi role {role!r}")
+
+
+def _pi_inner_exists(supervisor: str, role: str) -> bool:
+    cname = pi_roles.role_container_name(role)
+    r = run(["docker", "exec", supervisor,
+             "docker", "inspect", cname], capture_output=True)
+    return r.returncode == 0
+
+
+def _pi_inner_running(supervisor: str, role: str) -> bool:
+    cname = pi_roles.role_container_name(role)
+    r = run(["docker", "exec", supervisor,
+             "docker", "inspect", "-f", "{{.State.Running}}", cname],
+            capture_output=True)
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def _pi_start(supervisor: str, project: str, cfg: "Config",
+              role: str, *, force_restage: bool = False) -> None:
+    """Run the PI container in the supervisor's inner dockerd. Idempotent:
+    tears down any prior instance with the same name first so a stale
+    crashed container doesn't block start. Lazy-stages the per-role image
+    into the inner dockerd on first use; project create doesn't pre-stage
+    PI images (most projects won't use them). Pass force_restage=True
+    after a host-side image rebuild to push new content through."""
+    workspace_path = workspace_path_for(project, cfg)
+    entries = pi_roles.load_pi_roles(workspace_path)
+    entry = entries.get(role)
+    if entry is None:
+        die(f"no pi-roles.json entry for role {role!r}; call enable first")
+
+    pi_roles.validate_role(role)
+
+    cname = pi_roles.role_container_name(role)
+    run(["docker", "exec", supervisor, "docker", "rm", "-f", cname],
+        capture_output=True)
+    _pi_stage_creds(supervisor, role)
+
+    image = entry.get("image") or pi_roles.PI_IMAGES[role]
+    stage_worker_image(supervisor, image, force=force_restage)
+
+    # Bind-mount layout (single-mount, RW):
+    #   /workspace  ← <supervisor>/workspace/pi/<short>
+    #     The PI's role workspace. role.md staged here on first boot
+    #     by the entrypoint; PI's curated skills.md, sessions/, and
+    #     per-role artifacts live here. NEVER includes the supervisor's
+    #     /workspace/ contents — structural isolation by construction.
+    #   /creds      ← <supervisor>/workspace/.pi/<short>/.creds (RO)
+    #     Parent-dir bind-mount so the inotify watcher's atomic-rename
+    #     writes (replacing .credentials.json) stay visible inside the
+    #     container without re-mounting. The container's entrypoint
+    #     copies /creds/.credentials.json into ~/.claude/ on first
+    #     boot; later cred refreshes are propagated by pi-creds-watch
+    #     using `docker cp` + `install` directly into the container's
+    #     ~/.claude/ (the /creds RO mount is the seed, not the live
+    #     view).
+    # ``<short>`` is the role key with the ``pi-`` prefix stripped
+    # (see ``_pi_stage_creds``'s path note).
+    ip = entry["ip"]
+    short = pi_roles.role_short(role)
+    docker_args = [
+        "docker", "exec", supervisor,
+        "docker", "run", "-d",
+        "--name", cname,
+        "--network", INNER_NETWORK,
+        "--ip", ip,
+        "--restart", "unless-stopped",
+        "-v", f"/workspace/pi/{short}:/workspace",
+        "-v", f"/workspace/.pi/{short}/.creds:/creds:ro",
+        "-e", f"RS_PI_ROLE={short}",
+        "--label", f"research.pi_role={role}",
+        "--label", f"research.project={project}",
+        image,
+    ]
+    run_check(docker_args)
+    print(f"pi role {role!r}: running at {ip}")
+
+
+def _pi_stop(supervisor: str, role: str) -> None:
+    """Stop + remove the PI container in the inner dockerd. Tolerates
+    absence — caller may have already removed it via _recreate_supervisor
+    or the supervisor itself may be down."""
+    cname = pi_roles.role_container_name(role)
+    run(["docker", "exec", supervisor, "docker", "rm", "-f", cname],
+        capture_output=True)
+
+
+def _pi_enable(project: str, cfg: "Config", role: str) -> None:
+    """Write the per-project pi-roles.json entry + start the container.
+    Idempotent — re-running on an already-enabled role rewrites the entry
+    and restarts the container. Unlike role-mcps, PI roles have no
+    upstream-MCP allowlist of their own (per-role plans P.1+ will wire
+    that from the matching role-MCP's upstream set); P.0's pi-echo has
+    no MCPs at all."""
+    pi_roles.validate_role(role)
+    supervisor = container_name_for(project)
+    if not container_running(supervisor):
+        die(f"project {project!r} is not running; bring it up first")
+
+    workspace_path = workspace_path_for(project, cfg)
+    entries = pi_roles.load_pi_roles(workspace_path)
+    entries[role] = pi_roles.build_entry(role)
+    pi_roles.save_pi_roles(workspace_path, entries)
+
+    _pi_start(supervisor, project, cfg, role)
+
+
+def _pi_disable(project: str, cfg: "Config", role: str) -> None:
+    """Stop the container, drop the pi-roles.json entry. Workspace state
+    under /workspace/pi/<role>/ (role.md, skills.md, sessions/, …) and
+    cred-stash under /workspace/.pi/<role>/ both survive — bind-mounts
+    on the project volume are unaffected by docker rm. Re-enable picks
+    up the preserved workspace."""
+    supervisor = container_name_for(project)
+    workspace_path = workspace_path_for(project, cfg)
+    entries = pi_roles.load_pi_roles(workspace_path)
+    if role not in entries:
+        die(f"pi role {role!r} is not enabled for project {project!r}")
+    if container_running(supervisor):
+        _pi_stop(supervisor, role)
+    del entries[role]
+    pi_roles.save_pi_roles(workspace_path, entries)
+
+
+def cmd_project_pi_enable(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    _require_project(args.project)
+    _pi_enable(args.project, cfg, args.role)
+
+
+def cmd_project_pi_disable(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    _require_project(args.project)
+    _pi_disable(args.project, cfg, args.role)
+    print(f"pi role {args.role!r}: disabled")
+
+
+def cmd_project_pi_list(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    supervisor = _require_project(args.project)
+    workspace_path = workspace_path_for(args.project, cfg)
+    entries = pi_roles.load_pi_roles(workspace_path)
+
+    if args.json:
+        out = []
+        for role, e in sorted(entries.items()):
+            row = dict(e)
+            row["role"] = role
+            row["running"] = (container_running(supervisor)
+                              and _pi_inner_running(supervisor, role))
+            out.append(row)
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return
+
+    if not entries:
+        print(f"(project {args.project!r} has no pi roles enabled)")
+        return
+
+    rows: list[tuple[str, ...]] = []
+    for role, e in sorted(entries.items()):
+        running = "no"
+        if container_running(supervisor):
+            running = "yes" if _pi_inner_running(supervisor, role) else "no"
+        rows.append((role, e.get("ip", "?"),
+                     e.get("image", "?"), running))
+    headers = ("ROLE", "IP", "IMAGE", "RUNNING")
+    cols = list(zip(*([headers] + rows)))
+    widths = [max(len(str(v)) for v in col) for col in cols]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    print(fmt.format(*headers))
+    for r in rows:
+        print(fmt.format(*r))
+
+
+def cmd_project_pi_status(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    supervisor = _require_project(args.project)
+    workspace_path = workspace_path_for(args.project, cfg)
+    entries = pi_roles.load_pi_roles(workspace_path)
+    entry = entries.get(args.role)
+    if entry is None:
+        die(f"pi role {args.role!r} is not enabled for project "
+            f"{args.project!r}")
+
+    state = {
+        "role": args.role,
+        "project": args.project,
+        "entry": entry,
+        "container": pi_roles.role_container_name(args.role),
+        "exists": False,
+        "running": False,
+    }
+    if container_running(supervisor):
+        state["exists"] = _pi_inner_exists(supervisor, args.role)
+        state["running"] = _pi_inner_running(supervisor, args.role)
+
+    role_workspace = workspace_path / "pi" / pi_roles.role_short(args.role)
+    state["workspace"] = str(role_workspace)
+    state["workspace_present"] = role_workspace.is_dir()
+    if role_workspace.is_dir():
+        state["workspace_files"] = sorted(
+            p.name for p in role_workspace.iterdir() if not p.name.startswith(".")
+        )
+    else:
+        state["workspace_files"] = []
+
+    if args.json:
+        print(json.dumps(state, indent=2, sort_keys=True))
+        return
+
+    print(f"role:        {state['role']}")
+    print(f"project:     {state['project']}")
+    print(f"container:   {state['container']}")
+    print(f"  exists:    {state['exists']}")
+    print(f"  running:   {state['running']}")
+    print(f"ip:          {entry.get('ip')}")
+    print(f"image:       {entry.get('image')}")
+    print(f"workspace:   {state['workspace']}"
+          f" ({'present' if state['workspace_present'] else 'absent'})")
+    if state['workspace_files']:
+        print(f"  files:     {', '.join(state['workspace_files'])}")
+
+
+def cmd_project_pi_sync_creds(args: argparse.Namespace) -> None:
+    """Manual fallback for the inotify watcher: invoke the supervisor-side
+    rs-pi CLI to re-stage the supervisor's current creds into every
+    running PI container. The watcher is best-effort; this command is the
+    explicit alternative when re-auth happened while the watcher was
+    down, or to verify state."""
+    supervisor = _require_project(args.project)
+    r = run(["docker", "exec", supervisor, "rs-pi", "sync-creds"],
+            capture_output=False)
+    if r.returncode != 0:
+        sys.exit(r.returncode)
+
+
+def _split_enable_tokens(
+    enable_arg: str | None,
+) -> tuple[str | None, list[str], list[str]]:
+    """Split ``--enable`` value into (service_csv, role_mcp_roles, pi_roles).
+    Tokens of the form ``role-mcp-<role>`` peel off into the role-mcp list;
+    tokens of the form ``pi-<role>`` peel off into the pi list (where
+    ``pi-<role>`` is the full container-key, e.g. ``pi-echo``). Anything
+    else is left for `_compute_service_flags` to interpret as a service
+    id. Empty service set returns None to keep the default (all services
+    enabled / inherit prior flags) intact."""
     if not enable_arg:
-        return None, []
+        return None, [], []
     services: list[str] = []
-    roles: list[str] = []
+    role_mcps: list[str] = []
+    pi: list[str] = []
     for tok in enable_arg.split(","):
         tok = tok.strip()
         if not tok:
             continue
         if tok.startswith("role-mcp-"):
-            roles.append(tok[len("role-mcp-"):])
+            role_mcps.append(tok[len("role-mcp-"):])
+        elif tok.startswith("pi-"):
+            pi.append(tok)
         else:
             services.append(tok)
     svc_csv = ",".join(services) if services else None
-    return svc_csv, roles
+    return svc_csv, role_mcps, pi
+
+
+def _split_disable_tokens(
+    disable_arg: str | None,
+) -> tuple[str | None, list[str]]:
+    """Mirror of `_split_enable_tokens` for the disable side, but PI-only.
+    Tokens of the form ``pi-<role>`` peel off into the pi list; everything
+    else stays for `_compute_service_flags` to handle. role-mcps are not
+    disabled via ``--disable`` (they have their own ``role-mcp disable``
+    subcommand), so no role-mcp branch here."""
+    if not disable_arg:
+        return None, []
+    services: list[str] = []
+    pi: list[str] = []
+    for tok in disable_arg.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok.startswith("pi-"):
+            pi.append(tok)
+        else:
+            services.append(tok)
+    svc_csv = ",".join(services) if services else None
+    return svc_csv, pi
 
 
 # ---------------------------------------------------------------------------
@@ -2890,11 +3304,16 @@ def build_parser() -> argparse.ArgumentParser:
                         f"Also accepts role-mcp-<role> tokens as sugar "
                         f"for `research project role-mcp enable` "
                         f"(known role-mcps: "
-                        f"{','.join(sorted(role_mcp.ROLE_IMAGES))})")
+                        f"{','.join(sorted(role_mcp.ROLE_IMAGES))}), "
+                        f"and pi-<role> tokens as sugar for `research "
+                        f"project pi enable` (known pi roles: "
+                        f"{','.join(sorted(pi_roles.PI_IMAGES))})")
     c.add_argument("--disable", metavar="IDS",
                    help="comma-separated service ids to disable "
                         "(default: all known services enabled; xterm is "
-                        "always-on and cannot be disabled)")
+                        "always-on and cannot be disabled). Also "
+                        "accepts pi-<role> tokens for `research project "
+                        "pi disable`")
     c.add_argument("--mcp", metavar="NAMES", default="all-enabled",
                    help="MCPs to auto-allow at create time: 'all-enabled' "
                         "(default — every currently-enabled MCP), 'none', or a "
@@ -2955,10 +3374,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"comma-separated service ids to enable "
                         f"(known services: {','.join(KNOWN_SERVICES)}). "
                         f"Also accepts role-mcp-<role> tokens (known: "
-                        f"{','.join(sorted(role_mcp.ROLE_IMAGES))})")
+                        f"{','.join(sorted(role_mcp.ROLE_IMAGES))}) and "
+                        f"pi-<role> tokens (known: "
+                        f"{','.join(sorted(pi_roles.PI_IMAGES))})")
     u.add_argument("--disable", metavar="IDS",
                    help="comma-separated service ids to disable "
-                        "(xterm is always-on and cannot be disabled)")
+                        "(xterm is always-on and cannot be disabled). "
+                        "Also accepts pi-<role> tokens to disable a "
+                        "PI role container (workspace preserved).")
     u.set_defaults(func=cmd_project_update)
 
     sh = proj_sub.add_parser("ssh", help="print SSH connection info")
@@ -3044,6 +3467,57 @@ def build_parser() -> argparse.ArgumentParser:
     rms.add_argument("role")
     rms.add_argument("--json", action="store_true")
     rms.set_defaults(func=cmd_project_role_mcp_status)
+
+    # ----- PI-role lifecycle (STAGE_BACKEND_PI P.0) ----------------------
+    pi = proj_sub.add_parser(
+        "pi",
+        help="per-project PI-role container lifecycle "
+             "(enable / disable / list / status / sync-creds). PI roles "
+             "are interactive per-project containers accessed via webui "
+             "tabs (or xterm+byobu via `rs-pi` in the supervisor); they "
+             "live in pi-roles.json, distinct from role-mcps.json.",
+    )
+    pi_sub = pi.add_subparsers(dest="pi_action", required=True)
+
+    pie = pi_sub.add_parser("enable",
+                            help="bring up a PI role container in the "
+                                 "supervisor's inner dockerd")
+    pie.add_argument("project")
+    pie.add_argument("role",
+                     help="pi role name (e.g. pi-echo). Must be one "
+                          "research.py knows about — see cli/pi.py "
+                          "PI_IPS / PI_IMAGES.")
+    pie.set_defaults(func=cmd_project_pi_enable)
+
+    pid = pi_sub.add_parser("disable",
+                            help="stop + remove the PI role container "
+                                 "(workspace under pi/<role>/ survives)")
+    pid.add_argument("project")
+    pid.add_argument("role")
+    pid.set_defaults(func=cmd_project_pi_disable)
+
+    pil = pi_sub.add_parser("list",
+                            help="show every PI role enabled for the "
+                                 "project, with running state")
+    pil.add_argument("project")
+    pil.add_argument("--json", action="store_true")
+    pil.set_defaults(func=cmd_project_pi_list)
+
+    pis = pi_sub.add_parser("status",
+                            help="deep-print one PI role's container "
+                                 "state + workspace presence")
+    pis.add_argument("project")
+    pis.add_argument("role")
+    pis.add_argument("--json", action="store_true")
+    pis.set_defaults(func=cmd_project_pi_status)
+
+    pisc = pi_sub.add_parser("sync-creds",
+                             help="manually re-propagate supervisor "
+                                  "creds into every running PI role "
+                                  "container (fallback for the inotify "
+                                  "watcher)")
+    pisc.add_argument("project")
+    pisc.set_defaults(func=cmd_project_pi_sync_creds)
 
     # ----- MCP registry (Stage 2.1) -------------------------------------
     mcp = sub.add_parser("mcp", help="MCP registry operations")

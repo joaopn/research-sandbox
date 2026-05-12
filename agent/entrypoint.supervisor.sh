@@ -137,6 +137,22 @@ if [[ "${RS_INNER_FIREWALL:-0}" == "1" ]]; then
         echo "WARNING: inner-firewall failed to apply" >&2
 fi
 
+# --- PI cred propagation watcher (STAGE_BACKEND_PI P.0) -------------------
+# Spawn a supervised loop running pi-creds-watch: inotifywait on
+# ~/.claude/.credentials.json, copy each write into every running
+# rs-pi-* container in the inner dockerd. The loop restarts the watcher
+# within ~10 s if it crashes (e.g. inotifywait dies). Side-effect-free
+# when no PI containers are running — the propagate step early-exits
+# on an empty container list. nohup + background so the entrypoint
+# proceeds to the rest of the boot sequence; tini reaps zombies.
+nohup bash -c '
+    while true; do
+        /usr/local/bin/pi-creds-watch || true
+        sleep 10
+    done
+' > /tmp/pi-creds-watch.log 2>&1 &
+echo "pi-creds-watch supervised loop launched (logs: /tmp/pi-creds-watch.log)"
+
 # --- SSH ---
 if [[ -n "${SSH_PASSWORD:-}" ]]; then
     echo "research:${SSH_PASSWORD}" | sudo chpasswd

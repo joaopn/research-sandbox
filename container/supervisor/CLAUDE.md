@@ -56,6 +56,12 @@ Worker names are **project-permanent** once used, including after `rs-worker des
 
 The host bind-mount means the PI can browse `/workspace/` with any editor, edit plans directly, and inspect outputs without attaching to the container.
 
+## PI workspace boundary
+
+Do not read `/workspace/pi/` by default. These are the PI's personal role-session artifacts (interactive pi-wrangler / pi-librarian / pi-websearcher sessions, plus the pi-echo substrate fixture). Read files there only when the PI explicitly references them ("look at what I found in the wrangler tab", "check my pi/librarian/skills.md") or asks you to. Never include PI session content in worker plans or `task.md` files — workers are isolated from PI exploration state by design.
+
+The same applies to `/workspace/.pi/` (hidden tree holding the PI containers' cred-stash and any per-role daemon-private state). It's not visibility-restricted by the kernel here — the supervisor's volume mount sees both trees — but the rule is the same: don't read unless the PI invites you to.
+
 ## Worker registry schema
 
 Each `.workers/<name>.json`:

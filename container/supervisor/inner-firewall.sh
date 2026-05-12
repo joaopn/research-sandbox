@@ -31,6 +31,18 @@ PROXY_IP="${RS_INNER_PROXY_IP:-192.168.99.2}"
 # Role-MCP↔mcp-proxy traffic stays on the rs-inner bridge (L2) and bypasses
 # FORWARD entirely, so the proxy path doesn't need a hole here.
 ROLE_MCP_RANGE="${RS_INNER_ROLE_MCP_RANGE:-192.168.99.4/29}"
+# PI role containers (pi-echo, pi-wrangler, pi-librarian, pi-websearcher,
+# …) live in 192.168.99.10-99.25 — sixteen addresses to fit the four v1
+# PI roles plus a generous reservation. They run interactive `claude`
+# sessions inside byobu, which talk directly to api.anthropic.com (L3
+# egress, FORWARD path), so they need the same ACCEPT shape as role-MCPs.
+# Using `iprange` rather than a CIDR because .10-.25 does not align to a
+# clean prefix; iprange avoids the CIDR-canonicalization ambiguity that
+# `192.168.99.4/29` has (the comment claims .4-.11, but the canonical
+# prefix is .0-.7 — a known tracking item in BUG_BUCKET for the role-MCP
+# range, not re-introduced here).
+PI_RANGE_LO="${RS_INNER_PI_RANGE_LO:-192.168.99.10}"
+PI_RANGE_HI="${RS_INNER_PI_RANGE_HI:-192.168.99.25}"
 CHAIN="RS-INNER-FW"
 
 if ! command -v iptables >/dev/null 2>&1; then
@@ -55,8 +67,9 @@ fi
 sudo iptables -A "$CHAIN" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
 sudo iptables -A "$CHAIN" -s "$PROXY_IP" -j ACCEPT
 sudo iptables -A "$CHAIN" -s "$ROLE_MCP_RANGE" -j ACCEPT
+sudo iptables -A "$CHAIN" -m iprange --src-range "$PI_RANGE_LO-$PI_RANGE_HI" -j ACCEPT
 sudo iptables -A "$CHAIN" -m limit --limit 10/min --limit-burst 5 \
     -j LOG --log-prefix "rs-inner-fw drop: " --log-level warning
 sudo iptables -A "$CHAIN" -j DROP
 
-echo "inner-firewall: applied (subnet=$SUBNET proxy_ip=$PROXY_IP role_mcp_range=$ROLE_MCP_RANGE)"
+echo "inner-firewall: applied (subnet=$SUBNET proxy_ip=$PROXY_IP role_mcp_range=$ROLE_MCP_RANGE pi_range=$PI_RANGE_LO-$PI_RANGE_HI)"

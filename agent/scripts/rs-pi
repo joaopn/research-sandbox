@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# rs-pi — supervisor-side CLI for PI-role containers.
+#
+# Dual-surface companion to the webui PI tabs. Webui is the primary
+# surface; rs-pi is for power users who prefer xterm+byobu, plus carries
+# the `sync-creds` belt-and-braces helper for the case where the
+# pi-creds-watch.sh inotify propagator failed or hasn't run yet.
+#
+# Subcommands:
+#   rs-pi <role>          docker exec into rs-pi-<role>; byobu attach
+#                         (or new-session). Same chain as the webui's
+#                         `kind=ssh` tab command. Role-specific tabs
+#                         decide whether to start `claude` (real roles)
+#                         or `bash -l` (pi-echo).
+#   rs-pi list            list running pi containers + their IPs.
+#   rs-pi sync-creds      manually re-stage supervisor creds into every
+#                         running pi container. Same idempotent path the
+#                         inotify watcher uses.
+#
+# This script is baked into the supervisor image and lives at
+# /usr/local/bin/rs-pi. PI containers themselves don't need rs-pi — they
+# are managed from the supervisor, never from inside themselves.
+
+set -euo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+usage: rs-pi <subcommand> [args]
+
+  rs-pi <role>        attach to rs-pi-<role>'s byobu session
+  rs-pi list          list running pi containers
+  rs-pi sync-creds    propagate supervisor creds to every running pi container
+EOF
+    exit 2
+}
+
+if [[ $# -eq 0 ]]; then
+    usage
+fi
+
+cmd_list() {
+    # Inner-dockerd ps filtered by the research.pi_role label set on every
+    # pi container by _pi_start.
+    docker ps --filter 'label=research.pi_role' \
+              --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
+}
+
+cmd_sync_creds() {
+    local src=/home/research/.claude/.credentials.json
+    if [[ ! -s "$src" ]]; then
+        echo "rs-pi sync-creds: supervisor not authenticated (missing $src)" >&2
+        exit 1
+    fi
+    local names
+    names=$(docker ps --filter 'label=research.pi_role' --format '{{.Names}}')
+    if [[ -z "$names" ]]; then
+        echo "rs-pi sync-creds: no pi containers running"
+        return 0
+    fi
+    local touched=0 unchanged=0
+    while IFS= read -r cn; do
+        [[ -z "$cn" ]] && continue
+        local sup_hash
+        sup_hash=$(sha256sum "$src" | cut -d' ' -f1)
+        local pi_hash
+        pi_hash=$(docker exec "$cn" sha256sum /home/research/.claude/.credentials.json 2>/dev/null | cut -d' ' -f1 || true)
+        if [[ "$sup_hash" == "$pi_hash" ]]; then
+            echo "$cn: creds match supervisor (no-op)"
+            unchanged=$((unchanged+1))
+            continue
+        fi
+        # docker cp into a staging path then install with the right ownership
+        # and mode inside the container — `docker cp` doesn't preserve those
+        # cleanly across uid namespaces.
+        docker cp "$src" "$cn:/tmp/.credentials.json.new"
+        docker exec "$cn" sh -c \
+            'install -o worker -g worker -m 0600 /tmp/.credentials.json.new ~/.claude/.credentials.json && rm /tmp/.credentials.json.new'
+        echo "$cn: creds updated"
+        touched=$((touched+1))
+    done <<< "$names"
+    echo "rs-pi sync-creds: $touched updated, $unchanged unchanged"
+}
+
+cmd_attach() {
+    local role="$1"
+    local cn="rs-pi-${role}"
+    if ! docker inspect "$cn" >/dev/null 2>&1; then
+        echo "rs-pi: container $cn not found (is the role enabled?)" >&2
+        exit 1
+    fi
+    # The webui's `command` field is the canonical attach chain. We
+    # replicate it here so rs-pi and the webui tab land in the same byobu
+    # session. byobu's session name is fixed at `pi` per Q10 lean in the
+    # plan (one byobu session per role; multi via windows inside it).
+    exec docker exec -it "$cn" bash -lc \
+        'byobu attach -t pi 2>/dev/null || byobu new-session -s pi -- bash -l'
+}
+
+case "$1" in
+    list)        shift; cmd_list "$@" ;;
+    sync-creds)  shift; cmd_sync_creds "$@" ;;
+    -h|--help)   usage ;;
+    *)           cmd_attach "$1" ;;
+esac

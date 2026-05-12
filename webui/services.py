@@ -35,6 +35,30 @@ SERVICES = {
         "default_port": 8443,
         "upstream_path": "/",
     },
+    # pi-echo — STAGE_BACKEND_PI P.0 substrate test fixture. always_on=True
+    # because per-project visibility filtering for kind=ssh services would
+    # require a probe path the webui doesn't have (no docker socket; the
+    # only port to probe is the supervisor's SSH 22, which is universal).
+    # Tab shows on every project; clicking on a project that hasn't run
+    # `research project pi enable <p> pi-echo` errors at the `docker exec`
+    # step with a clear message. A real per-project filter is OQ-5 work
+    # (would need a supervisor-side endpoint the webui can query).
+    #
+    # Command opens `bash -l` not `claude` — pi-echo is the substrate
+    # fixture, not a production role. Real PI roles (P.1+) register their
+    # own entries with `byobu new-session -s pi -- claude`.
+    "pi-echo": {
+        "label": "PI Echo",
+        "kind": "ssh",
+        "always_on": True,
+        "renderer": "xterm.js",
+        "default_port": 22,
+        "command": (
+            "docker exec -it rs-pi-echo bash -lc "
+            "'byobu attach -t pi 2>/dev/null || "
+            "byobu new-session -s pi -- bash -l'"
+        ),
+    },
 }
 
 
