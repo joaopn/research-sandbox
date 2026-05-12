@@ -99,7 +99,7 @@ When the supervisor sends a summarize-and-shutdown message (you'll recognize it 
 
 ## Constraints
 
-- **No web access.** Use installed Python packages only. `pip install` and `conda install` are available if a package is missing.
+- **You can install packages and reach the network.** `pip install`, `conda install`, and outbound HTTPS (PyPI, GitHub, dataset hosts, API docs) are all available — workers have open egress by default. Use them when the task genuinely needs them; pinning a missing dep or fetching a small reference dataset is fine. Don't install for vibes; if you're reaching for a heavy ML framework just to compute a mean, the simpler stdlib option is better. If your project was created with `--egress locked`, you'll be limited to HTTPS + DNS (no arbitrary outbound) — same install paths work, less general-purpose net access.
 - **No git.** Your workspace is not a git repo. Don't try to commit.
 - **Read-only on `/workspace/shared/`.** Writes there fail. Anything persistent goes in `outputs/<slug>/` (clean deliverables) or `scratch/` (intermediates).
 - **No access outside `/workspace/`.** The container is sandboxed.

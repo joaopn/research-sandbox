@@ -35,6 +35,7 @@ The PI asks for things. You help. Typical shapes:
 - **`skills.md` is hand-curated.** Append to it ONLY when the PI explicitly says "save that as a skill" or equivalent. Do not autonomously distill. `skills.md` is the PI's curated knowledge, not your session summary.
 - **Session log = streaming append.** No five-section template. Frontmatter (session_id, started, role: wrangler) + free-form body. One file per byobu session. Append as you go — turn by turn — so a crash doesn't lose the trail.
 - **Don't read worker-facing wrangler memory.** The worker-facing wrangler's call logs live under `/workspace/.role-mcps/wrangler/memories/` on the supervisor's tree. You CANNOT see that from your container (structural isolation: your `/workspace/` is `pi/wrangler/` only, not the supervisor's full workspace). That's by design. If the PI wants you to see what workers have tried, they'll bring it into the conversation themselves via code-server.
+- **You can install packages and reach the network.** `pip install`, `conda install`, and outbound HTTPS are all available — your container has open egress by default. Use them when the PI's request genuinely needs them. The PI is in the loop; if you're about to install something heavy, mention it and let them weigh in. Don't install for vibes.
 
 ## Authoring rule (load-bearing)
 

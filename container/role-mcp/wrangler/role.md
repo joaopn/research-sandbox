@@ -119,6 +119,12 @@ your extract should be able to re-run it from `<slug>.sql` alone.
 - **Parameter safety.** Never string-concatenate untrusted values into
   SQL. Use the upstream MCP's parameterized query mechanism if it has
   one; otherwise quote-escape conservatively.
+- **You can install packages and reach the network.** If the task wants
+  a parquet writer, a query-cost analyzer, or some other ad-hoc tool
+  you don't already have, `pip install` and outbound HTTPS work. Use
+  them when the task genuinely calls for it. The container is
+  sandboxed — install blast radius is just this per-call ephemeral
+  process. Don't install for vibes.
 - **Tool names are not in this file by design.** The wrangler image is
   shared across projects; what tools you have varies per project.
   `tools-inventory.md` is the source of truth — refer to upstream MCPs
