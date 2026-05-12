@@ -297,28 +297,36 @@ async def project_services_handler(request: web.Request) -> web.Response:
     expand the webui's trust posture."""
     project = request.match_info.get("project", "")
     upstream = f"{PROJECT_CONTAINER_PREFIX}{project}"
-    out: dict[str, dict] = {}
-    probe_jobs: list[tuple[str, dict]] = []
-    pi_roles_for_project: set[str] | None = None
-    for sid, svc in services.SERVICES.items():
-        if svc.get("always_on"):
-            out[sid] = svc
-            continue
-        if svc.get("kind") == "http":
-            probe_jobs.append((sid, svc))
-            continue
-        if svc.get("kind") == "ssh" and sid.startswith("pi-"):
-            if pi_roles_for_project is None:
-                pi_roles_for_project = _read_project_pi_roles(project)
-            if sid in pi_roles_for_project:
-                out[sid] = svc
+
+    # Probe every kind=http service in parallel up-front, then iterate
+    # SERVICES once in insertion order to assemble the response. The
+    # insertion order is the SPA's tab order — Editor (code-server) must
+    # land before Supervisor, and the prior "always_on first, http after
+    # probes" pass inverted that.
+    probe_jobs: list[tuple[str, dict]] = [
+        (sid, svc) for sid, svc in services.SERVICES.items()
+        if svc.get("kind") == "http" and not svc.get("always_on")
+    ]
+    probe_up: dict[str, bool] = {}
     if probe_jobs:
         results = await asyncio.gather(*[
             tcp_probe(upstream, int(svc.get("default_port", 0)))
             for _, svc in probe_jobs
         ])
-        for (sid, svc), up in zip(probe_jobs, results):
-            if up:
+        probe_up = {sid: up for (sid, _), up in zip(probe_jobs, results)}
+
+    out: dict[str, dict] = {}
+    pi_roles_for_project: set[str] | None = None
+    for sid, svc in services.SERVICES.items():
+        if svc.get("always_on"):
+            out[sid] = svc
+        elif svc.get("kind") == "http":
+            if probe_up.get(sid):
+                out[sid] = svc
+        elif svc.get("kind") == "ssh" and sid.startswith("pi-"):
+            if pi_roles_for_project is None:
+                pi_roles_for_project = _read_project_pi_roles(project)
+            if sid in pi_roles_for_project:
                 out[sid] = svc
     return web.json_response(out)
 

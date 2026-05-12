@@ -153,7 +153,7 @@ const THEMES = {
     },
 };
 
-const DEFAULT_THEME = "dark";
+const DEFAULT_THEME = "nord";
 
 function loadStoredTheme() {
     const id = localStorage.getItem(THEME_KEY);
