@@ -74,11 +74,13 @@ PROBE_IMAGE = "busybox:1.36"
 # Per-supervisor service registry. KNOWN_SERVICES lists every kind the webui
 # might render; --enable / --disable on `project create|update` flips
 # `research.service.<id>` labels and `RS_SERVICE_<ID>` env vars in lockstep.
-# ALWAYS_ON_SERVICES can't be disabled — xterm is the substrate for
-# `research project ssh`. New service kinds extend both lists in the same
-# commit that ships the entrypoint conditional and the registry entry.
-KNOWN_SERVICES: list[str] = ["xterm", "code-server"]
-ALWAYS_ON_SERVICES: set[str] = {"xterm"}
+# ALWAYS_ON_SERVICES can't be disabled — `supervisor` (the SSH + byobu
+# substrate, formerly `xterm`) is what `research project ssh` rides on;
+# disabling it would brick the project. New service kinds extend both
+# lists in the same commit that ships the entrypoint conditional and the
+# registry entry.
+KNOWN_SERVICES: list[str] = ["supervisor", "code-server"]
+ALWAYS_ON_SERVICES: set[str] = {"supervisor"}
 SERVICE_LABEL_PREFIX = "research.service."
 
 # In-supervisor ports for code-server's lazy-start stub. The stub listens on
@@ -721,9 +723,13 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     # (after the supervisor is up and creds are ready).
     enable_arg = getattr(args, "enable", None)
     disable_arg = getattr(args, "disable", None)
-    enable_services, enable_role_mcps, enable_pi_roles = \
+    enable_services, enable_role_mcps, enable_pi_roles, enable_no_pi_mirror = \
         _split_enable_tokens(enable_arg)
     disable_services, disable_pi_roles = _split_disable_tokens(disable_arg)
+    role_mcp_explicit = _parse_role_mcp_upstream(
+        getattr(args, "role_mcp_upstream", None) or [],
+        valid_roles=set(enable_role_mcps),
+    )
     if enable_role_mcps:
         for role in enable_role_mcps:
             try:
@@ -812,8 +818,12 @@ def cmd_project_create(args: argparse.Namespace) -> None:
                       file=sys.stderr)
         else:
             for role in enable_role_mcps:
+                upstreams_for_role = role_mcp_explicit.get(role)
                 try:
-                    _role_mcp_enable(project, cfg, role, [])
+                    _role_mcp_enable(
+                        project, cfg, role, upstreams_for_role,
+                        no_pi_mirror=enable_no_pi_mirror,
+                    )
                     role_mcps_enabled.append(role)
                 except SystemExit:
                     print(f"warning: failed to enable role-mcp {role!r}; "
@@ -1353,9 +1363,13 @@ def cmd_project_update(args: argparse.Namespace) -> None:
     # waste a rebuild before failing.
     enable_arg = getattr(args, "enable", None)
     disable_arg = getattr(args, "disable", None)
-    enable_services, enable_role_mcps, enable_pi_roles = \
+    enable_services, enable_role_mcps, enable_pi_roles, enable_no_pi_mirror = \
         _split_enable_tokens(enable_arg)
     disable_services, disable_pi_roles = _split_disable_tokens(disable_arg)
+    role_mcp_explicit = _parse_role_mcp_upstream(
+        getattr(args, "role_mcp_upstream", None) or [],
+        valid_roles=set(enable_role_mcps),
+    )
     for role in enable_role_mcps:
         try:
             role_mcp.validate_role(role)
@@ -1413,11 +1427,16 @@ def cmd_project_update(args: argparse.Namespace) -> None:
         _refresh_workspace_claude_templates(container)
 
     # role-mcp sugar via --enable. Mirrors cmd_project_create: on a project
-    # that already has the role enabled, this is idempotent (validates +
-    # rewrites entry + restarts the container with empty upstreams).
+    # that already has the role enabled, this is idempotent — _role_mcp_enable
+    # preserves the existing upstream_source + upstreams when no --upstream
+    # / --auto signal is given (no silent flips on a re-run of `update`).
     for role in enable_role_mcps:
+        upstreams_for_role = role_mcp_explicit.get(role)
         try:
-            _role_mcp_enable(project, cfg, role, [])
+            _role_mcp_enable(
+                project, cfg, role, upstreams_for_role,
+                no_pi_mirror=enable_no_pi_mirror,
+            )
         except SystemExit:
             print(f"warning: failed to enable role-mcp {role!r}; retry "
                   f"with `research project role-mcp enable {project} {role}`",
@@ -1623,6 +1642,9 @@ def _build_mcp_entry(args: argparse.Namespace) -> dict:
     desc = (getattr(args, "description", None) or "").strip()
     if desc:
         entry["description"] = desc
+    roles = _parse_csv_list(getattr(args, "roles", None))
+    if roles:
+        entry["roles"] = roles
     return entry
 
 
@@ -1658,16 +1680,17 @@ def _spawn_shared_mcp(name: str, entry: dict) -> None:
 
 def cmd_mcp_add(args: argparse.Namespace) -> None:
     entry = _build_mcp_entry(args)
+    known_roles = set(role_mcp.ROLE_IMAGES.keys())
     with mcp_registry.lock():
         try:
-            data = mcp_registry.load(expand=False)
+            data = mcp_registry.load(expand=False, known_roles=known_roles)
         except mcp_registry.RegistryError as e:
             die(str(e))
         if args.name in data["mcps"]:
             die(f"MCP {args.name!r} already registered; remove first")
         data["mcps"][args.name] = entry
         try:
-            mcp_registry.save_atomic(data)
+            mcp_registry.save_atomic(data, known_roles=known_roles)
         except mcp_registry.RegistryError as e:
             die(str(e))
     print(f"added MCP {args.name!r} ({entry['kind']})")
@@ -1703,6 +1726,38 @@ def cmd_mcp_describe(args: argparse.Namespace) -> None:
         print(f"cleared description for {args.name!r}")
 
 
+def cmd_mcp_set_roles(args: argparse.Namespace) -> None:
+    """Replace the MCP's roles list. Empty CSV (``""``) clears it. Roles
+    are validated against role_mcp.ROLE_IMAGES at save time, so a typo
+    surfaces here rather than as a silent miss in auto-wire derivation."""
+    new_roles = _parse_csv_list(args.csv)
+    known_roles = set(role_mcp.ROLE_IMAGES.keys())
+    unknown = [r for r in new_roles if r not in known_roles]
+    if unknown:
+        die(f"unknown role(s) {sorted(unknown)}; known: "
+            f"{sorted(known_roles) or '(none)'}")
+    with mcp_registry.lock():
+        try:
+            data = mcp_registry.load(expand=False, known_roles=known_roles)
+        except mcp_registry.RegistryError as e:
+            die(str(e))
+        entry = data["mcps"].get(args.name)
+        if entry is None:
+            die(f"no MCP named {args.name!r}")
+        if new_roles:
+            entry["roles"] = new_roles
+        else:
+            entry.pop("roles", None)
+        try:
+            mcp_registry.save_atomic(data, known_roles=known_roles)
+        except mcp_registry.RegistryError as e:
+            die(str(e))
+    if new_roles:
+        print(f"set roles for {args.name!r}: {','.join(new_roles)}")
+    else:
+        print(f"cleared roles for {args.name!r}")
+
+
 def cmd_mcp_list(args: argparse.Namespace) -> None:
     try:
         data = mcp_registry.load(expand=False)
@@ -1729,12 +1784,13 @@ def cmd_mcp_list(args: argparse.Namespace) -> None:
             cname = mcp_container_name_for(name)
             target = f"{cname}:{e['port']}"
             status = "running" if container_running(cname) else "stopped"
-        rows.append((name, kind, e["transport"], target, enabled, status))
+        roles_cell = ",".join(sorted(e.get("roles") or [])) or "-"
+        rows.append((name, kind, e["transport"], target, enabled, status, roles_cell))
         descs.append(e.get("description", ""))
     if not rows:
         print("(no MCPs registered)")
         return
-    headers = ("NAME", "KIND", "TRANSPORT", "TARGET", "ENABLED", "STATUS")
+    headers = ("NAME", "KIND", "TRANSPORT", "TARGET", "ENABLED", "STATUS", "ROLES")
     cols = list(zip(*([headers] + rows)))
     widths = [max(len(str(v)) for v in col) for col in cols]
     fmt = "  ".join(f"{{:<{w}}}" for w in widths)
@@ -2194,16 +2250,57 @@ def cmd_project_mcp_sync(args: argparse.Namespace) -> None:
     to_remove = sorted(n for n in allowed
                        if n not in enabled or n not in reg_mcps)
 
-    if not to_add and not to_remove:
+    allow_changed = bool(to_add or to_remove)
+
+    if to_add or to_remove:
+        added, _ = _batch_apply(project, cfg, to_add,
+                                _allow_mcp_for_project, "allowed")
+        removed, _ = _batch_apply(project, cfg, to_remove,
+                                  _deny_mcp_for_project, "denied")
+        if added or removed:
+            _supervisor_mcp_reload(container_name)
+
+    # Phase 3 — re-derive auto-wired role-MCP upstreams against the updated
+    # allow list and restart any role-MCP whose upstream set actually
+    # changed. PI mirror (if enabled) restarts in lockstep. Skip entries
+    # marked `upstream_source=explicit` (operator override). Phase runs
+    # AFTER phase 1+2 so _derive_auto_upstreams sees the current allow set.
+    workspace_path = workspace_path_for(project, cfg)
+    role_entries = role_mcp.load_role_mcps(workspace_path)
+    pi_entries = pi_roles.load_pi_roles(workspace_path)
+    role_changes: list[str] = []
+    for role, entry in list(role_entries.items()):
+        if entry.get("upstream_source") != "auto":
+            continue
+        old = list(entry.get("upstream_mcps") or [])
+        new = _derive_auto_upstreams(role, project, cfg)
+        if set(old) == set(new):
+            continue
+        entry["upstream_mcps"] = new
+        role_mcp.save_role_mcps(workspace_path, role_entries)
+        _role_mcp_start(container_name, project, cfg, role)
+        added_up = sorted(set(new) - set(old))
+        removed_up = sorted(set(old) - set(new))
+        diff = []
+        if added_up:
+            diff.append("+" + ",".join(added_up))
+        if removed_up:
+            diff.append("-" + ",".join(removed_up))
+        role_changes.append(f"restarted role-mcp {role!r} ({' '.join(diff)})")
+        pi_role = f"pi-{role}"
+        if pi_role in pi_entries:
+            _pi_start(container_name, project, cfg, pi_role)
+            role_changes.append(f"restarted pi mirror {pi_role!r} in lockstep")
+
+    if not allow_changed and not role_changes:
         print(f"(project {project!r} already in sync with the registry)")
         return
-
-    added, _ = _batch_apply(project, cfg, to_add,
-                            _allow_mcp_for_project, "allowed")
-    removed, _ = _batch_apply(project, cfg, to_remove,
-                              _deny_mcp_for_project, "denied")
-    if added or removed:
+    if role_changes:
+        # mcp-proxy already routes by role-mcp name; restart doesn't
+        # change the route table, but reload is cheap and re-affirms.
         _supervisor_mcp_reload(container_name)
+        for line in role_changes:
+            print(line)
 
 
 # ---------------------------------------------------------------------------
@@ -2375,30 +2472,106 @@ def _role_mcp_stop(supervisor: str, role: str) -> None:
         capture_output=True)
 
 
+def _derive_auto_upstreams(role: str, project: str, cfg: "Config") -> list[str]:
+    """Auto-wired upstream set for ``role``: every registered MCP whose
+    ``roles`` field lists ``role`` AND that is currently allowed for the
+    project. Sorted alphabetically so role-mcps.json diffs across sync
+    runs are minimal."""
+    try:
+        registry = mcp_registry.load(expand=False)
+    except mcp_registry.RegistryError as e:
+        die(str(e))
+    allowed = {e.get("name") for e in load_project_allowlist(project, cfg)
+               if e.get("name")}
+    return sorted(
+        name for name, entry in registry["mcps"].items()
+        if role in (entry.get("roles") or [])
+        and name in allowed
+    )
+
+
 def _role_mcp_enable(project: str, cfg: "Config", role: str,
-                     upstreams: list[str]) -> None:
+                     upstreams: list[str] | None,
+                     *, force_auto: bool = False,
+                     no_pi_mirror: bool = False) -> None:
     """Validate + write the per-project role-mcps.json entry + start the
     container + reload the supervisor's mcp-proxy so its config includes
-    the role-MCP route. Idempotent — re-running with a different upstream
-    list updates the entry and restarts the container."""
+    the role-MCP route. Also auto-enables the matching PI mirror
+    (``pi-<role>``) unless ``no_pi_mirror`` is set or no such image
+    exists. Idempotent.
+
+    Upstream-source state machine:
+      - ``upstreams=list, force_auto=False``: explicit pin. Survives sync.
+      - ``upstreams=None, force_auto=True``: re-derive from registry × allow,
+        write ``upstream_source=auto``. The re-mark path.
+      - ``upstreams=None, force_auto=False``:
+          - if no existing entry: first-time enable — auto-derive, write
+            ``upstream_source=auto``. Empty result emits the M8 warning.
+          - if an entry exists: idempotent re-run — preserve current
+            ``upstream_source`` and ``upstream_mcps``. No silent flips."""
     role_mcp.validate_role(role)
     supervisor = container_name_for(project)
     if not container_running(supervisor):
         die(f"project {project!r} is not running; bring it up first")
 
     workspace_path = workspace_path_for(project, cfg)
+    entries = role_mcp.load_role_mcps(workspace_path)
+    existing = entries.get(role)
+
+    if upstreams is not None:
+        chosen_upstreams = list(upstreams)
+        chosen_source = "explicit"
+    elif force_auto or existing is None:
+        chosen_upstreams = _derive_auto_upstreams(role, project, cfg)
+        chosen_source = "auto"
+        if not chosen_upstreams:
+            print(
+                f"warning: no registered MCPs claim role {role!r}; "
+                f"role-mcp {role!r} starting with empty inventory. "
+                f"Add a registry entry with `research mcp add ... "
+                f"--roles {role}` (then `research project mcp sync "
+                f"{project}`), or pin explicit upstreams with "
+                f"`research project role-mcp enable {project} {role} "
+                f"--upstream <csv>`.",
+                file=sys.stderr,
+            )
+    else:
+        # Preserve-on-reenable: idempotent re-run, no silent flips.
+        chosen_upstreams = list(existing.get("upstream_mcps") or [])
+        chosen_source = existing.get("upstream_source") or "explicit"
+
     allow_entries = load_project_allowlist(project, cfg)
     try:
-        role_mcp.validate_upstreams(upstreams, allow_entries)
+        role_mcp.validate_upstreams(chosen_upstreams, allow_entries)
     except ValueError as e:
         die(str(e))
 
-    entries = role_mcp.load_role_mcps(workspace_path)
-    entries[role] = role_mcp.build_entry(role, upstreams)
+    entries[role] = role_mcp.build_entry(
+        role, chosen_upstreams, upstream_source=chosen_source,
+    )
     role_mcp.save_role_mcps(workspace_path, entries)
 
     _role_mcp_start(supervisor, project, cfg, role)
     _supervisor_mcp_reload(supervisor)
+
+    # PI mirror auto-enable: M4. Skipped if (a) operator opted out, or
+    # (b) no image exists for pi-<role> (e.g. echo-mcp has no PI mirror).
+    if not no_pi_mirror:
+        pi_role = f"pi-{role}"
+        if pi_role in pi_roles.PI_IMAGES:
+            try:
+                _pi_enable(project, cfg, pi_role)
+            except SystemExit:
+                # _pi_enable die()s on its own paths (image-stage, start
+                # error). W10 can't fire — we just wrote role-mcps.json
+                # above. Surface as a warning and continue; operator can
+                # retry with `research project pi enable`.
+                print(
+                    f"warning: pi mirror {pi_role!r} failed to enable; "
+                    f"retry with `research project pi enable {project} "
+                    f"{pi_role}`",
+                    file=sys.stderr,
+                )
 
 
 def _role_mcp_disable(project: str, cfg: "Config", role: str) -> None:
@@ -2427,10 +2600,27 @@ def _parse_csv_list(value: str | None) -> list[str]:
 
 
 def cmd_project_role_mcp_enable(args: argparse.Namespace) -> None:
+    """Three-state upstream semantics:
+      --upstream <csv>  → explicit list (survives sync)
+      --upstream ""     → explicit empty (survives sync; daemon comes up
+                          with no DB MCPs)
+      --auto            → re-derive from registry × allow intersection,
+                          mark as ``upstream_source: auto``
+      (no flag)         → first enable: auto-derive; re-enable: preserve
+                          existing source + upstreams (idempotent re-run,
+                          no silent flips)
+    --upstream and --auto are mutually exclusive (argparse-enforced)."""
     cfg = load_config()
     _require_project(args.project)
-    upstreams = _parse_csv_list(getattr(args, "upstream", None))
-    _role_mcp_enable(args.project, cfg, args.role, upstreams)
+    raw_upstream = getattr(args, "upstream", None)
+    force_auto = bool(getattr(args, "auto", False))
+    if raw_upstream is not None:
+        upstreams: list[str] | None = _parse_csv_list(raw_upstream)
+    else:
+        upstreams = None
+    _role_mcp_enable(args.project, cfg, args.role, upstreams,
+                     force_auto=force_auto,
+                     no_pi_mirror=bool(getattr(args, "no_pi_mirror", False)))
 
 
 def cmd_project_role_mcp_disable(args: argparse.Namespace) -> None:
@@ -2545,6 +2735,7 @@ def cmd_project_role_mcp_status(args: argparse.Namespace) -> None:
     print(f"image:       {entry.get('image')}")
     upstreams = entry.get("upstream_mcps") or []
     print(f"upstreams:   {', '.join(upstreams) or '(none)'}")
+    print(f"  source:    {entry.get('upstream_source', 'explicit (legacy)')}")
     print(f"watermarks:  {json.dumps(state['watermarks'], sort_keys=True)}")
     print(f"calls:       {json.dumps(state['calls_by_caller'], sort_keys=True)}")
     print(f"publish_dir: {state['publish_dir']}"
@@ -2873,31 +3064,66 @@ def cmd_project_pi_sync_creds(args: argparse.Namespace) -> None:
 
 def _split_enable_tokens(
     enable_arg: str | None,
-) -> tuple[str | None, list[str], list[str]]:
-    """Split ``--enable`` value into (service_csv, role_mcp_roles, pi_roles).
+) -> tuple[str | None, list[str], list[str], bool]:
+    """Split ``--enable`` value into (service_csv, role_mcp_roles,
+    pi_roles, no_pi_mirror).
+
     Tokens of the form ``role-mcp-<role>`` peel off into the role-mcp list;
     tokens of the form ``pi-<role>`` peel off into the pi list (where
-    ``pi-<role>`` is the full container-key, e.g. ``pi-echo``). Anything
-    else is left for `_compute_service_flags` to interpret as a service
-    id. Empty service set returns None to keep the default (all services
-    enabled / inherit prior flags) intact."""
+    ``pi-<role>`` is the full container-key, e.g. ``pi-echo``). The bare
+    token ``no-pi-mirror`` is a sentinel that suppresses PI-mirror
+    auto-enable for every role-mcp-* token in the same ``--enable`` value
+    (it applies to all roles, not per-role — per-role granularity is
+    available via the direct CLI ``research project role-mcp enable
+    --no-pi-mirror``). Anything else stays for ``_compute_service_flags``
+    to interpret as a service id. Empty service set returns None to keep
+    the default (all services enabled / inherit prior flags) intact."""
     if not enable_arg:
-        return None, [], []
+        return None, [], [], False
     services: list[str] = []
     role_mcps: list[str] = []
     pi: list[str] = []
+    no_pi_mirror = False
     for tok in enable_arg.split(","):
         tok = tok.strip()
         if not tok:
             continue
-        if tok.startswith("role-mcp-"):
+        if tok == "no-pi-mirror":
+            no_pi_mirror = True
+        elif tok.startswith("role-mcp-"):
             role_mcps.append(tok[len("role-mcp-"):])
         elif tok.startswith("pi-"):
             pi.append(tok)
         else:
             services.append(tok)
     svc_csv = ",".join(services) if services else None
-    return svc_csv, role_mcps, pi
+    return svc_csv, role_mcps, pi, no_pi_mirror
+
+
+def _parse_role_mcp_upstream(
+    raw: list[str], *, valid_roles: set[str],
+) -> dict[str, list[str]]:
+    """Parse repeated ``--role-mcp-upstream <role>=<csv>`` flags into
+    ``{role: [mcp_name, ...]}``. Each role must appear in the same
+    ``--enable role-mcp-<role>`` set, so a typo or stray role-mcp
+    surfaces here rather than as an orphan upstream override.
+
+    An entry with empty CSV (``--role-mcp-upstream wrangler=``) means
+    'explicit empty' — daemon comes up with no upstreams — distinct from
+    the absence of the flag entirely (which falls through to auto-derive)."""
+    out: dict[str, list[str]] = {}
+    for item in raw:
+        if "=" not in item:
+            die(f"--role-mcp-upstream value must be 'role=csv', got {item!r}")
+        role, _, csv = item.partition("=")
+        role = role.strip()
+        if not role:
+            die(f"--role-mcp-upstream missing role name in {item!r}")
+        if role not in valid_roles:
+            die(f"--role-mcp-upstream {role!r} not in --enable role-mcp-* "
+                f"set {sorted(valid_roles)}")
+        out[role] = _parse_csv_list(csv)
+    return out
 
 
 def _split_disable_tokens(
@@ -2943,8 +3169,9 @@ def _compute_service_flags(
     """Resolve per-service enabled flags from --enable / --disable args.
 
     Default = every known service enabled (or `base` if updating, so missing
-    flags inherit the supervisor's prior choices). xterm is always-on and
-    cannot be disabled. Unknown service ids are a hard error."""
+    flags inherit the supervisor's prior choices). `supervisor` (the
+    SSH + byobu substrate) is always-on and cannot be disabled. Unknown
+    service ids are a hard error."""
     enable = _parse_service_list(enable_arg)
     disable = _parse_service_list(disable_arg)
     unknown = (enable | disable) - set(KNOWN_SERVICES)
@@ -3344,14 +3571,26 @@ def build_parser() -> argparse.ArgumentParser:
                         f"Also accepts role-mcp-<role> tokens as sugar "
                         f"for `research project role-mcp enable` "
                         f"(known role-mcps: "
-                        f"{','.join(sorted(role_mcp.ROLE_IMAGES))}), "
-                        f"and pi-<role> tokens as sugar for `research "
-                        f"project pi enable` (known pi roles: "
+                        f"{','.join(sorted(role_mcp.ROLE_IMAGES))}); the "
+                        f"bare sentinel `no-pi-mirror` in this list "
+                        f"suppresses the matching pi-<role> auto-enable "
+                        f"for every role-mcp-* token; and pi-<role> "
+                        f"tokens as sugar for `research project pi enable` "
+                        f"(known pi roles: "
                         f"{','.join(sorted(pi_roles.PI_IMAGES))})")
+    c.add_argument("--role-mcp-upstream", metavar="ROLE=CSV",
+                   action="append",
+                   help="repeatable: pin an explicit upstream list for a "
+                        "role-mcp activated via `--enable role-mcp-<role>` "
+                        "(e.g. `--role-mcp-upstream wrangler=postgres-mcp"
+                        ",mongo-mcp`). Without this flag, role-mcp-<role> "
+                        "auto-derives upstreams from the registry × allow "
+                        "intersection. Empty CSV (e.g. `wrangler=`) means "
+                        "explicit no-upstreams.")
     c.add_argument("--disable", metavar="IDS",
                    help="comma-separated service ids to disable "
-                        "(default: all known services enabled; xterm is "
-                        "always-on and cannot be disabled). Also "
+                        "(default: all known services enabled; supervisor "
+                        "is always-on and cannot be disabled). Also "
                         "accepts pi-<role> tokens for `research project "
                         "pi disable`")
     c.add_argument("--mcp", metavar="NAMES", default="all-enabled",
@@ -3414,14 +3653,22 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"comma-separated service ids to enable "
                         f"(known services: {','.join(KNOWN_SERVICES)}). "
                         f"Also accepts role-mcp-<role> tokens (known: "
-                        f"{','.join(sorted(role_mcp.ROLE_IMAGES))}) and "
-                        f"pi-<role> tokens (known: "
+                        f"{','.join(sorted(role_mcp.ROLE_IMAGES))}); the "
+                        f"bare sentinel `no-pi-mirror` suppresses the "
+                        f"matching pi-<role> auto-enable for every "
+                        f"role-mcp-* token; and pi-<role> tokens (known: "
                         f"{','.join(sorted(pi_roles.PI_IMAGES))})")
+    u.add_argument("--role-mcp-upstream", metavar="ROLE=CSV",
+                   action="append",
+                   help="repeatable: pin an explicit upstream list for a "
+                        "role-mcp activated via `--enable role-mcp-<role>` "
+                        "(see `project create --help` for full semantics).")
     u.add_argument("--disable", metavar="IDS",
                    help="comma-separated service ids to disable "
-                        "(xterm is always-on and cannot be disabled). "
-                        "Also accepts pi-<role> tokens to disable a "
-                        "PI role container (workspace preserved).")
+                        "(supervisor is always-on and cannot be "
+                        "disabled). Also accepts pi-<role> tokens to "
+                        "disable a PI role container (workspace "
+                        "preserved).")
     u.set_defaults(func=cmd_project_update)
 
     sh = proj_sub.add_parser("ssh", help="print SSH connection info")
@@ -3478,10 +3725,26 @@ def build_parser() -> argparse.ArgumentParser:
                      help="role name (e.g. echo-mcp). Must be one "
                           "research.py knows about — see cli/role_mcp.py "
                           "ROLE_IPS / ROLE_IMAGES.")
-    rme.add_argument("--upstream",
-                     help="comma-separated upstream MCP names the role-"
-                          "worker's spawned `claude -p` will see (must "
-                          "already be allowed via `project mcp allow`)")
+    rme_src = rme.add_mutually_exclusive_group()
+    rme_src.add_argument("--upstream",
+                         help="comma-separated upstream MCP names the role-"
+                              "worker's spawned `claude -p` will see (must "
+                              "already be allowed via `project mcp allow`). "
+                              "Pins the entry as `upstream_source=explicit` "
+                              "so `project mcp sync` leaves it alone. Pass "
+                              "an empty string ('') for an explicit no-"
+                              "upstreams entry.")
+    rme_src.add_argument("--auto", action="store_true",
+                         help="(re-)derive the upstream set from the "
+                              "registry × allow intersection (MCPs with "
+                              "matching `roles`) and mark the entry as "
+                              "`upstream_source=auto` so `project mcp sync` "
+                              "keeps it current. Use this to flip a pinned "
+                              "entry back to auto-derive.")
+    rme.add_argument("--no-pi-mirror", action="store_true",
+                     help="suppress the matching PI mirror's auto-enable. "
+                          "Default: when a `pi-<role>` image exists, the "
+                          "matching PI-role container is enabled in lockstep.")
     rme.set_defaults(func=cmd_project_role_mcp_enable)
 
     rmd = rm_sub.add_parser("disable",
@@ -3514,7 +3777,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="per-project PI-role container lifecycle "
              "(enable / disable / list / status / sync-creds). PI roles "
              "are interactive per-project containers accessed via webui "
-             "tabs (or xterm+byobu via `rs-pi` in the supervisor); they "
+             "tabs (or via the Supervisor tab + `rs-pi` CLI); they "
              "live in pi-roles.json, distinct from role-mcps.json.",
     )
     pi_sub = pi.add_subparsers(dest="pi_action", required=True)
@@ -3588,6 +3851,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "gives access to (e.g. 'parsed event aggregates'); "
                         "propagates into per-project allowlists and into each "
                         "worker's CLAUDE.md when granted")
+    a.add_argument("--roles", metavar="CSV",
+                   help=f"comma-separated role-MCP affinities — declares "
+                        f"that this MCP serves the named role-MCP(s) as an "
+                        f"upstream. Used by `--enable role-mcp-<role>` and "
+                        f"`project mcp sync` to auto-wire the per-project "
+                        f"upstream set. Known roles: "
+                        f"{','.join(sorted(role_mcp.ROLE_IMAGES)) or '(none)'}")
     a.set_defaults(func=cmd_mcp_add)
 
     md_d = mcp_sub.add_parser("describe",
@@ -3598,6 +3868,14 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--clear", action="store_true",
                    help="remove the existing description")
     md_d.set_defaults(func=cmd_mcp_describe)
+
+    sr = mcp_sub.add_parser("set-roles",
+                            help="replace an MCP's role-MCP affinities "
+                                 "(comma-separated; empty CSV clears)")
+    sr.add_argument("name")
+    sr.add_argument("csv", help="comma-separated role names, or empty string "
+                                "to clear")
+    sr.set_defaults(func=cmd_mcp_set_roles)
 
     ml = mcp_sub.add_parser("list", help="list registered MCPs")
     ml.add_argument("--json", action="store_true")

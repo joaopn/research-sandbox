@@ -137,10 +137,30 @@ def validate_upstreams(upstreams: list[str], allow_entries: list[dict]) -> None:
         )
 
 
-def build_entry(role: str, upstreams: list[str]) -> dict[str, Any]:
+UPSTREAM_SOURCES = ("auto", "explicit")
+
+
+def build_entry(role: str, upstreams: list[str], *,
+                upstream_source: str = "auto") -> dict[str, Any]:
+    """Render a per-project role-mcps.json entry.
+
+    ``upstream_source`` discriminates how ``upstream_mcps`` was chosen:
+      - ``"auto"``: derived from the registry's ``roles`` field. Re-derived
+        by ``project mcp sync`` whenever the registry/allow set changes.
+      - ``"explicit"``: operator-pinned via ``--upstream <csv>``. Survives
+        sync untouched.
+
+    Opaque to the role-MCP container (only ``upstream_mcps`` is read by
+    the entrypoint); the field is a registry-management discriminator."""
+    if upstream_source not in UPSTREAM_SOURCES:
+        raise ValueError(
+            f"upstream_source must be one of {UPSTREAM_SOURCES}, "
+            f"got {upstream_source!r}"
+        )
     return {
         "ip": ROLE_IPS[role],
         "port": ROLE_MCP_PORT,
         "image": ROLE_IMAGES[role],
         "upstream_mcps": list(upstreams),
+        "upstream_source": upstream_source,
     }

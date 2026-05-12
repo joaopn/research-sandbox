@@ -284,17 +284,34 @@ async def project_services_handler(request: web.Request) -> web.Response:
     driven: this avoids granting the webui a docker socket while
     preserving the property that disabled services don't surface a tab.
     A crashed (enabled-but-not-listening) service also drops off, which
-    is the correct UX — a tab that 502s on click is worse than no tab."""
+    is the correct UX — a tab that 502s on click is worse than no tab.
+
+    kind=ssh non-always-on services whose id starts with `pi-` are
+    gated on the project's per-supervisor pi-roles.json: tab shows iff
+    the role is listed there. Read directly off the existing
+    `/projects:ro` bind-mount — same data plane that powers the rail's
+    status sub-line; no cache, no SSH, no docker socket. Lifecycle
+    changes (`research project pi enable / disable`) reflect on the
+    next page load. RO mount surface is wider than this filter
+    (covers `.creds/` etc.), so adding new file reads here doesn't
+    expand the webui's trust posture."""
     project = request.match_info.get("project", "")
     upstream = f"{PROJECT_CONTAINER_PREFIX}{project}"
     out: dict[str, dict] = {}
     probe_jobs: list[tuple[str, dict]] = []
+    pi_roles_for_project: set[str] | None = None
     for sid, svc in services.SERVICES.items():
         if svc.get("always_on"):
             out[sid] = svc
             continue
         if svc.get("kind") == "http":
             probe_jobs.append((sid, svc))
+            continue
+        if svc.get("kind") == "ssh" and sid.startswith("pi-"):
+            if pi_roles_for_project is None:
+                pi_roles_for_project = _read_project_pi_roles(project)
+            if sid in pi_roles_for_project:
+                out[sid] = svc
     if probe_jobs:
         results = await asyncio.gather(*[
             tcp_probe(upstream, int(svc.get("default_port", 0)))
@@ -304,6 +321,29 @@ async def project_services_handler(request: web.Request) -> web.Response:
             if up:
                 out[sid] = svc
     return web.json_response(out)
+
+
+def _read_project_pi_roles(project: str) -> set[str]:
+    """Return the set of pi-role keys enabled for ``project``, read from
+    its `.orchestrator/pi-roles.json` off the `/projects:ro` bind-mount.
+    Tolerates: missing project workspace (legacy / not yet created),
+    missing pi-roles.json (no PI roles ever enabled), invalid JSON — all
+    return an empty set so the tab strip silently omits the PI tabs.
+    No cache: the file read is cheap and lifecycle changes propagate on
+    the next page load."""
+    workspace = _project_workspace(project)
+    if workspace is None:
+        return set()
+    pi_file = workspace / ".orchestrator" / "pi-roles.json"
+    if not pi_file.is_file():
+        return set()
+    try:
+        data = json.loads(pi_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if not isinstance(data, dict):
+        return set()
+    return set(data.keys())
 
 
 # ---- /projects/status — per-project rail sub-line data ----------------

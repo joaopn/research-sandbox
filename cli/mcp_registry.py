@@ -37,25 +37,33 @@ def empty() -> dict[str, Any]:
     return {"version": VERSION, "mcps": {}}
 
 
-def load(expand: bool = True, path: Path = REGISTRY_PATH) -> dict[str, Any]:
+def load(expand: bool = True, path: Path = REGISTRY_PATH,
+         known_roles: set[str] | None = None) -> dict[str, Any]:
     """Read + validate the registry. Returns an empty registry if the file
     is missing. With ``expand=True`` (default), ${VAR} and $VAR placeholders
     in string values are resolved against ``os.environ``; an unset variable
-    raises RegistryError. Pass ``expand=False`` for cosmetic ops (list/show)."""
+    raises RegistryError. Pass ``expand=False`` for cosmetic ops (list/show).
+
+    ``known_roles`` gates the per-entry ``roles`` field: if provided, each
+    role string must be a member; if ``None``, role-name validation is
+    skipped (caller doesn't care, or doesn't have the role surface loaded).
+    Kept as a caller-supplied set rather than imported from ``role_mcp``
+    to preserve this module's stdlib-only posture."""
     if not path.is_file():
         return empty()
     try:
         data = json.loads(path.read_text())
     except json.JSONDecodeError as e:
         raise RegistryError(f"registry not valid JSON: {path}: {e}") from e
-    errs = validate(data)
+    errs = validate(data, known_roles=known_roles)
     if errs:
         raise RegistryError("registry validation failed:\n  " + "\n  ".join(errs))
     return _expand(data) if expand else data
 
 
-def save_atomic(data: dict[str, Any], path: Path = REGISTRY_PATH) -> None:
-    errs = validate(data)
+def save_atomic(data: dict[str, Any], path: Path = REGISTRY_PATH,
+                known_roles: set[str] | None = None) -> None:
+    errs = validate(data, known_roles=known_roles)
     if errs:
         raise RegistryError("registry validation failed:\n  " + "\n  ".join(errs))
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -64,8 +72,9 @@ def save_atomic(data: dict[str, Any], path: Path = REGISTRY_PATH) -> None:
     tmp.replace(path)
 
 
-def entry_for(name: str, expand: bool = True) -> dict[str, Any] | None:
-    return load(expand=expand)["mcps"].get(name)
+def entry_for(name: str, expand: bool = True,
+              known_roles: set[str] | None = None) -> dict[str, Any] | None:
+    return load(expand=expand, known_roles=known_roles)["mcps"].get(name)
 
 
 @contextlib.contextmanager
@@ -83,7 +92,7 @@ def lock() -> Iterator[None]:
             os.close(fd)
 
 
-def validate(data: Any) -> list[str]:
+def validate(data: Any, known_roles: set[str] | None = None) -> list[str]:
     errs: list[str] = []
     if not isinstance(data, dict):
         return ["registry root must be a JSON object"]
@@ -96,11 +105,12 @@ def validate(data: Any) -> list[str]:
     for name, entry in mcps.items():
         if not isinstance(name, str) or not NAME_RE.match(name):
             errs.append(f"{name!r}: invalid name (must match {NAME_RE.pattern!r})")
-        errs.extend(_validate_entry(name, entry))
+        errs.extend(_validate_entry(name, entry, known_roles=known_roles))
     return errs
 
 
-def _validate_entry(name: str, e: Any) -> list[str]:
+def _validate_entry(name: str, e: Any,
+                    known_roles: set[str] | None = None) -> list[str]:
     p = lambda m: f"{name!r}: {m}"
     if not isinstance(e, dict):
         return [p("entry must be an object")]
@@ -124,6 +134,16 @@ def _validate_entry(name: str, e: Any) -> list[str]:
         if not isinstance(d, str) or not d.strip():
             out.append(p("description must be a non-empty string"))
 
+    if "roles" in e:
+        roles = e["roles"]
+        if not isinstance(roles, list) or not all(isinstance(r, str) for r in roles):
+            out.append(p("roles must be a list of strings"))
+        elif known_roles is not None:
+            unknown = [r for r in roles if r not in known_roles]
+            if unknown:
+                out.append(p(f"roles contains unknown role(s) {sorted(unknown)}; "
+                             f"known: {sorted(known_roles) or '(none)'}"))
+
     if kind == "external":
         if not isinstance(e.get("host_port"), int) or isinstance(e.get("host_port"), bool):
             out.append(p("external entry needs integer host_port"))
@@ -137,7 +157,7 @@ def _validate_entry(name: str, e: Any) -> list[str]:
             for k, v in headers.items():
                 if not isinstance(v, str):
                     out.append(p(f"header {k!r}: value must be a string"))
-        allowed = {"kind", "transport", "host_port", "host_address", "headers", "path", "enabled", "description"}
+        allowed = {"kind", "transport", "host_port", "host_address", "headers", "path", "enabled", "description", "roles"}
     else:  # shared
         img = e.get("image")
         if not isinstance(img, str) or not img:
@@ -151,7 +171,7 @@ def _validate_entry(name: str, e: Any) -> list[str]:
             for k, v in env.items():
                 if not isinstance(v, str):
                     out.append(p(f"env {k!r}: value must be a string"))
-        allowed = {"kind", "transport", "image", "port", "env", "path", "enabled", "description"}
+        allowed = {"kind", "transport", "image", "port", "env", "path", "enabled", "description", "roles"}
 
     extras = set(e) - allowed
     if extras:

@@ -15,10 +15,11 @@
 #       if [[ "${RS_SERVICE_FOO:-enabled}" == "enabled" ]]; then
 #           ...start foo...
 #       fi
-#   xterm (sshd + byobu) is implicit always-on — it's the substrate for
-#   `research project ssh` — and is NOT gated by an env var. W1 ships no
-#   conditional blocks; the pattern lands when the first toggleable
-#   service (jupyter) arrives in W2.
+#   `supervisor` (sshd + byobu, formerly named `xterm`) is implicit
+#   always-on — it's the substrate for `research project ssh` — and is
+#   NOT gated by an env var. The first toggleable service is code-
+#   server; conditional `if [[ "${RS_SERVICE_CODE_SERVER:-enabled}" ==
+#   "enabled" ]]` block lives further down in this file.
 #
 # Startup order:
 #   1. GID remap (for bind mounts from host).
