@@ -154,6 +154,30 @@ class Config:
         ]
         self.default_profile: str = os.environ.get("DEFAULT_PROFILE", "python")
         self.default_memory: str = os.environ.get("DEFAULT_MEMORY", "")
+        # Per-role-MCP container memory cap. Blast-radius backstop: if a
+        # runaway claude -p / Chromium / DB-MCP child triggers OOM, the
+        # killer takes the role container, not the supervisor. Default 2g:
+        # at 1g, a single browser-bearing call (Chromium ~400MB resident +
+        # daemon ~500MB + renderer/GPU subprocesses) leaves no headroom
+        # and risks OOM on real loads. At 4g, value is wasteful for non-
+        # browser roles (wrangler peaks <500MB) but harmless. Pair with
+        # default_role_mcp_max_concurrent_calls — bumping memory should
+        # bump concurrency proportionally. Override per .env or per-role
+        # at enable: `--memory 4g`.
+        self.default_role_mcp_memory: str = os.environ.get(
+            "DEFAULT_ROLE_MCP_MEMORY", "2g")
+        # Per-role-MCP daemon-side concurrency cap. send_job calls beyond
+        # this return an MCP tool error with structured payload
+        # {reason: "concurrency_limit", ...} immediately — no spawn, no
+        # Chromium / DB connection wasted on a refused call. Default 3:
+        # each browser-bearing concurrent call is ~400MB resident; 3 fits
+        # the 2g default_role_mcp_memory comfortably with daemon overhead.
+        # Non-browser roles (wrangler, echo-mcp) effectively uncapped in
+        # practice — their per-call footprint is tiny. Set to 0 to disable
+        # the cap entirely. Override per .env or per-role at enable:
+        # `--max-concurrent-calls 6`.
+        self.default_role_mcp_max_concurrent_calls: int = int(
+            os.environ.get("DEFAULT_ROLE_MCP_MAX_CONCURRENT_CALLS", "3"))
         self.default_dind: str = os.environ.get("DEFAULT_DIND", "auto")
         self.default_egress: str = os.environ.get("DEFAULT_EGRESS", "open")
 
@@ -2673,6 +2697,13 @@ def _role_mcp_start(supervisor: str, project: str, cfg: "Config",
     #     visible (single-file-bind-mount rule); entrypoint reads
     #     role-mcps.json and mcp-allow.json from here.
     ip = entry["ip"]
+    # Substrate (B.1-substrate) resource flags + concurrency env. Persisted
+    # in role-mcps.json so they survive _recreate_supervisor without
+    # re-consulting Config (operator's enable-time intent is captured).
+    memory = entry.get("memory") or cfg.default_role_mcp_memory
+    mcc = entry.get("max_concurrent_calls")
+    if mcc is None:
+        mcc = cfg.default_role_mcp_max_concurrent_calls
     docker_args = [
         "docker", "exec", supervisor,
         "docker", "run", "-d",
@@ -2680,11 +2711,22 @@ def _role_mcp_start(supervisor: str, project: str, cfg: "Config",
         "--network", INNER_NETWORK,
         "--ip", ip,
         "--restart", "unless-stopped",
+        # tini at PID 1 reaps zombies. Belt-and-suspenders with per-MCP
+        # `dumb-init` wrappers in image-baked extras (B.1) — if a wrapped
+        # stdio MCP dies uncleanly, grandchildren reparent to container
+        # PID 1 and tini reaps them.
+        "--init",
+        # Blast-radius backstop. OOM-killer takes the role container,
+        # not the supervisor. See Config.default_role_mcp_memory comment
+        # for the size reasoning.
+        f"--memory={memory}",
         "-v", f"/workspace/.role-mcps/{role}:/workspace",
         "-v", f"/workspace/shared/{role}:/workspace/published",
         "-v", "/workspace/.orchestrator:/etc/orchestrator:ro",
         "-e", f"RS_ROLE_NAME={role}",
         "-e", f"RS_ROLE_MCP_PORT={role_mcp.ROLE_MCP_PORT}",
+        # Daemon reads this to enforce the cap on send_job. 0 = uncapped.
+        "-e", f"RS_ROLE_MAX_CONCURRENT_CALLS={int(mcc)}",
         "--label", f"research.role_mcp={role}",
         "--label", f"research.project={project}",
         # Project --data paths, propagated RO at the same mount points
@@ -2725,7 +2767,9 @@ def _derive_auto_upstreams(role: str, project: str, cfg: "Config") -> list[str]:
 def _role_mcp_enable(project: str, cfg: "Config", role: str,
                      upstreams: list[str] | None,
                      *, force_auto: bool = False,
-                     no_pi_mirror: bool = False) -> None:
+                     no_pi_mirror: bool = False,
+                     memory: str | None = None,
+                     max_concurrent_calls: int | None = None) -> None:
     """Validate + write the per-project role-mcps.json entry + start the
     container + reload the supervisor's mcp-proxy so its config includes
     the role-MCP route. Also auto-enables the matching PI mirror
@@ -2778,8 +2822,29 @@ def _role_mcp_enable(project: str, cfg: "Config", role: str,
     except ValueError as e:
         die(str(e))
 
+    # Resource caps: explicit flag > existing entry > cfg default. The
+    # entry always carries a concrete value so _recreate_supervisor and
+    # `role-mcp status` reads don't need access to Config — the persisted
+    # state is the source of truth. A bump to DEFAULT_ROLE_MCP_* only
+    # affects NEW enables; existing entries keep their captured values
+    # until disable+enable (predictable across recreates).
+    if memory is not None:
+        chosen_memory = memory
+    elif existing is not None and existing.get("memory"):
+        chosen_memory = str(existing["memory"])
+    else:
+        chosen_memory = cfg.default_role_mcp_memory
+
+    if max_concurrent_calls is not None:
+        chosen_mcc = max_concurrent_calls
+    elif existing is not None and existing.get("max_concurrent_calls") is not None:
+        chosen_mcc = int(existing["max_concurrent_calls"])
+    else:
+        chosen_mcc = cfg.default_role_mcp_max_concurrent_calls
+
     entries[role] = role_mcp.build_entry(
         role, chosen_upstreams, upstream_source=chosen_source,
+        memory=chosen_memory, max_concurrent_calls=chosen_mcc,
     )
     role_mcp.save_role_mcps(workspace_path, entries)
 
@@ -2850,9 +2915,14 @@ def cmd_project_role_mcp_enable(args: argparse.Namespace) -> None:
         upstreams: list[str] | None = _parse_csv_list(raw_upstream)
     else:
         upstreams = None
+    memory = getattr(args, "memory", None)
+    mcc_raw = getattr(args, "max_concurrent_calls", None)
+    max_concurrent_calls = int(mcc_raw) if mcc_raw is not None else None
     _role_mcp_enable(args.project, cfg, args.role, upstreams,
                      force_auto=force_auto,
-                     no_pi_mirror=bool(getattr(args, "no_pi_mirror", False)))
+                     no_pi_mirror=bool(getattr(args, "no_pi_mirror", False)),
+                     memory=memory,
+                     max_concurrent_calls=max_concurrent_calls)
 
 
 def cmd_project_role_mcp_disable(args: argparse.Namespace) -> None:
@@ -4160,6 +4230,18 @@ def build_parser() -> argparse.ArgumentParser:
                      help="suppress the matching PI mirror's auto-enable. "
                           "Default: when a `pi-<role>` image exists, the "
                           "matching PI-role container is enabled in lockstep.")
+    rme.add_argument("--memory",
+                     help="per-role-MCP container memory cap (docker syntax, "
+                          "e.g. 4g). Persists in role-mcps.json and survives "
+                          "_recreate_supervisor. Default from "
+                          "DEFAULT_ROLE_MCP_MEMORY in .env (2g if unset).")
+    rme.add_argument("--max-concurrent-calls", type=int,
+                     help="daemon-side cap on in-flight send_job calls; "
+                          "beyond this the daemon returns an MCP tool "
+                          "error with structured concurrency_limit payload "
+                          "immediately (no spawn). 0 disables the cap. "
+                          "Default from DEFAULT_ROLE_MCP_MAX_CONCURRENT_CALLS "
+                          "in .env (3 if unset).")
     rme.set_defaults(func=cmd_project_role_mcp_enable)
 
     rmd = rm_sub.add_parser("disable",

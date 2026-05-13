@@ -74,6 +74,21 @@ SPAWN_MCP_CONFIG = Path(os.environ.get("RS_ROLE_SPAWN_MCP_CONFIG",
 SPAWN_SH = Path(os.environ.get("RS_ROLE_SPAWN_SH",
                                 "/opt/role-mcp/spawn.sh"))
 
+# Substrate (B.1-substrate) concurrency cap. Daemon-side counter refuses
+# send_job calls beyond this with a structured `concurrency_limit` tool
+# error — no spawn, no resource waste on calls that wouldn't run. 0
+# disables the cap. Set by _role_mcp_start from the persisted role-mcps.json
+# entry; see Config.default_role_mcp_max_concurrent_calls for size
+# reasoning.
+MAX_CONCURRENT_CALLS = int(os.environ.get("RS_ROLE_MAX_CONCURRENT_CALLS", "0"))
+
+# Retry-hint floor returned in the concurrency_limit payload. Typical
+# send_job in a browser-bearing role takes 20-60s; 30 gives the caller a
+# back-off that's likely to find an open slot without thrashing. Not
+# load-bearing (the caller's role.md teaches its own retry shape); a
+# hint only.
+RETRY_AFTER_HINT_SECONDS = 30
+
 # Directories the daemon owns on the workspace bind-mount.
 JOBS_DIR = WORKSPACE / "jobs"
 MEMORIES_DIR = WORKSPACE / "memories"
@@ -113,10 +128,22 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 def _pid_alive(pid: int) -> bool:
+    """Signal-0 existence check. ProcessLookupError means the process is
+    gone. PermissionError means the process EXISTS but the daemon (uid
+    1000 / worker) lacks signaling rights — typically a root-owned
+    process like docker-init at PID 1. For the "is the process alive"
+    semantic, PermissionError is alive: signal 0 doesn't deliver, it
+    just probes existence, and the kernel checked permission only after
+    confirming the process exists. Treating PermissionError as "not
+    alive" would also incorrectly orphan-clean any cross-uid running
+    job, although in normal operation the daemon's children are
+    same-uid so the case doesn't arise."""
     try:
         os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError):
+    except ProcessLookupError:
         return False
+    except PermissionError:
+        return True
     except OSError:
         return False
     return True
@@ -127,20 +154,53 @@ def _pid_alive(pid: int) -> bool:
 # ---------------------------------------------------------------------------
 
 
+class ConcurrencyLimitError(Exception):
+    """Raised by JobTable.register when the daemon is at MAX_CONCURRENT_CALLS.
+    Carries the structured fields the caller's role.md teaches to parse
+    (reason, in_flight, limit, retry_after_hint_seconds). Surfaces as an
+    MCP tool error with `isError: true` and the structured JSON in the
+    text content — survives the MCP SDK's error-propagation path more
+    reliably than a JSON-RPC level error code (which some SDKs collapse
+    to a transport failure)."""
+
+    def __init__(self, in_flight: int, limit: int) -> None:
+        self.in_flight = in_flight
+        self.limit = limit
+        super().__init__(
+            f"concurrency_limit: in_flight={in_flight} limit={limit}"
+        )
+
+    def to_payload(self) -> dict:
+        return {
+            "reason": "concurrency_limit",
+            "in_flight": self.in_flight,
+            "limit": self.limit,
+            "retry_after_hint_seconds": RETRY_AFTER_HINT_SECONDS,
+        }
+
+
 class JobTable:
     """File-backed job state. Each job is one JSON file under jobs/. State
     survives daemon restart; in-memory cache is for hot access only and is
     rebuilt from disk on startup. On restart, jobs marked `running` whose
     pid is gone get flipped to `failed` with reason `daemon_restart_orphan`
-    — otherwise a polling caller would block forever."""
+    — otherwise a polling caller would block forever.
+
+    Concurrency counter: an in-memory count of running jobs gates new
+    registrations against MAX_CONCURRENT_CALLS (substrate B.1-substrate).
+    Counter is incremented at register, decremented at mark_done /
+    mark_failed. The lock serializes the at-limit check + increment so
+    parallel send_jobs can't both pass the check and exceed the cap."""
 
     def __init__(self) -> None:
         JOBS_DIR.mkdir(parents=True, exist_ok=True)
         self._lock = asyncio.Lock()
+        self._running_count = 0
 
     async def register(self, caller: str, mode: str) -> tuple[str, str]:
         """Allocate (job_id, call_id). job_id == call_id in v1 (no retries
-        means one allocation per call)."""
+        means one allocation per call). Raises ConcurrencyLimitError if
+        MAX_CONCURRENT_CALLS > 0 and in-flight count is at the cap."""
         call_id = _new_call_id()
         entry = {
             "job_id": call_id,
@@ -155,7 +215,13 @@ class JobTable:
             "error": None,
         }
         async with self._lock:
+            if MAX_CONCURRENT_CALLS > 0 and self._running_count >= MAX_CONCURRENT_CALLS:
+                raise ConcurrencyLimitError(
+                    in_flight=self._running_count,
+                    limit=MAX_CONCURRENT_CALLS,
+                )
             _atomic_write_json(JOBS_DIR / f"{call_id}.json", entry)
+            self._running_count += 1
         return call_id, call_id
 
     async def mark_pid(self, job_id: str, pid: int) -> None:
@@ -171,20 +237,26 @@ class JobTable:
             entry = self._read(job_id)
             if entry is None:
                 return
+            was_running = entry.get("status") == "running"
             entry["status"] = "done"
             entry["completed"] = _iso_now()
             entry["result"] = result
             _atomic_write_json(JOBS_DIR / f"{job_id}.json", entry)
+            if was_running and self._running_count > 0:
+                self._running_count -= 1
 
     async def mark_failed(self, job_id: str, error: str) -> None:
         async with self._lock:
             entry = self._read(job_id)
             if entry is None:
                 return
+            was_running = entry.get("status") == "running"
             entry["status"] = "failed"
             entry["completed"] = _iso_now()
             entry["error"] = error
             _atomic_write_json(JOBS_DIR / f"{job_id}.json", entry)
+            if was_running and self._running_count > 0:
+                self._running_count -= 1
 
     async def query(self, job_id: str) -> dict | None:
         async with self._lock:
@@ -202,8 +274,15 @@ class JobTable:
     def reconcile_on_startup(self) -> int:
         """Scan jobs/; for any `running` entry whose pid is gone, flip it to
         `failed`. Returns the number of orphans cleaned. Run synchronously
-        before the event loop starts so no caller can poll a stale state."""
+        before the event loop starts so no caller can poll a stale state.
+
+        Also seeds `_running_count` from any surviving `running` entries
+        (pid still alive — rare; typically zero after the orphan sweep)
+        so the concurrency cap accounts for them. Without this seed, a
+        restart with a healthy in-flight job would let MAX_CONCURRENT_CALLS
+        new calls through before refusing — effectively cap+1."""
         cleaned = 0
+        surviving_running = 0
         if not JOBS_DIR.is_dir():
             return 0
         for path in JOBS_DIR.glob("*.json"):
@@ -220,6 +299,9 @@ class JobTable:
                 entry["error"] = "daemon_restart_orphan"
                 _atomic_write_json(path, entry)
                 cleaned += 1
+            else:
+                surviving_running += 1
+        self._running_count = surviving_running
         return cleaned
 
 
@@ -675,6 +757,18 @@ async def handle_mcp(request: web.Request) -> web.Response:
                 payload = await tool_summarize_memories(memory, spawner)
             else:
                 return web.json_response(_rpc_error(rid, -32601, f"unknown tool {name!r}"))
+        except ConcurrencyLimitError as e:
+            # Structured tool error. Log too — caller's role.md may not
+            # surface the payload cleanly and the daemon log is the
+            # diagnostic surface in that case.
+            print(
+                f"role-mcp[{ROLE}]: refused send_job — concurrency_limit "
+                f"in_flight={e.in_flight} limit={e.limit}",
+                file=sys.stderr,
+            )
+            return web.json_response(_rpc_result(rid, _tool_text_result(
+                e.to_payload(),
+            ) | {"isError": True}))
         except ValueError as e:
             return web.json_response(_rpc_result(rid, _tool_text_result({
                 "error": str(e),
@@ -721,6 +815,12 @@ def build_app() -> web.Application:
     if cleaned:
         print(f"role-mcp[{ROLE}]: marked {cleaned} orphan job(s) as failed",
               file=sys.stderr)
+    cap_label = (
+        f"max_concurrent_calls={MAX_CONCURRENT_CALLS}"
+        if MAX_CONCURRENT_CALLS > 0
+        else "max_concurrent_calls=uncapped"
+    )
+    print(f"role-mcp[{ROLE}]: {cap_label}", file=sys.stderr)
     app["jobs"] = jobs
     app["spawner"] = Spawner(jobs)
     app["memory"] = Memory()

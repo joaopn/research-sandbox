@@ -141,7 +141,9 @@ UPSTREAM_SOURCES = ("auto", "explicit")
 
 
 def build_entry(role: str, upstreams: list[str], *,
-                upstream_source: str = "auto") -> dict[str, Any]:
+                upstream_source: str = "auto",
+                memory: str = "",
+                max_concurrent_calls: int = 0) -> dict[str, Any]:
     """Render a per-project role-mcps.json entry.
 
     ``upstream_source`` discriminates how ``upstream_mcps`` was chosen:
@@ -150,8 +152,19 @@ def build_entry(role: str, upstreams: list[str], *,
       - ``"explicit"``: operator-pinned via ``--upstream <csv>``. Survives
         sync untouched.
 
+    ``memory`` is the per-role-MCP container memory cap (docker syntax,
+    e.g. ``"2g"``). Always present in persisted entries so `_recreate_supervisor`
+    re-applies the same cap without consulting Config defaults — the value
+    is captured at enable time. Operator overrides via `--memory` at enable.
+
+    ``max_concurrent_calls`` is the daemon-side cap on in-flight send_job
+    calls. Beyond it, send_job returns an MCP tool error with structured
+    `concurrency_limit` payload immediately. 0 disables the cap. Same
+    "captured at enable time" semantics as ``memory``.
+
     Opaque to the role-MCP container (only ``upstream_mcps`` is read by
-    the entrypoint); the field is a registry-management discriminator."""
+    the entrypoint); the upstream_source field is a registry-management
+    discriminator."""
     if upstream_source not in UPSTREAM_SOURCES:
         raise ValueError(
             f"upstream_source must be one of {UPSTREAM_SOURCES}, "
@@ -163,4 +176,6 @@ def build_entry(role: str, upstreams: list[str], *,
         "image": ROLE_IMAGES[role],
         "upstream_mcps": list(upstreams),
         "upstream_source": upstream_source,
+        "memory": memory,
+        "max_concurrent_calls": max_concurrent_calls,
     }

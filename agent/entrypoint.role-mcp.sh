@@ -78,6 +78,8 @@ fi
 python3 - <<'PYEOF'
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 role = os.environ["RS_ROLE_NAME"]
@@ -86,6 +88,65 @@ spawn_cfg_path = Path("/etc/role-mcp/spawn-mcp.json")
 inventory_path = Path("/workspace/.tools-inventory.md")
 spawn_cfg_path.parent.mkdir(parents=True, exist_ok=True)
 inventory_path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def query_image_baked_tools(command, cmd_args, timeout=5):
+    """Spawn an image-baked stdio MCP, send initialize + tools/list, parse
+    the response. Returns (tool_dicts, err_message). On any failure
+    (spawn, timeout, parse) returns (None, "<why>") — the entrypoint
+    renders a placeholder in the inventory and logs the failure, but does
+    NOT hard-fail the container (a buggy stdio MCP shouldn't block the
+    daemon from starting; the role-worker may still know the tools from
+    role.md). Timeout is per-MCP; 5s is generous for a local stdio
+    roundtrip — most servers respond in <100 ms."""
+    try:
+        proc = subprocess.Popen(
+            [command, *list(cmd_args)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except (OSError, FileNotFoundError) as e:
+        return None, f"spawn failed: {e}"
+
+    # MCP wire: initialize (request) + notifications/initialized + tools/list.
+    requests = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+         "params": {"protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "rs-entrypoint", "version": "0"}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+    ]
+    payload = "\n".join(json.dumps(r) for r in requests) + "\n"
+
+    try:
+        stdout, stderr = proc.communicate(input=payload, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        return None, f"tools/list timed out after {timeout}s"
+
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("id") == 2 and isinstance(obj.get("result"), dict):
+            tools = obj["result"].get("tools")
+            if isinstance(tools, list):
+                return tools, ""
+
+    stderr_tail = (stderr or "")[-200:].replace("\n", " ").strip()
+    return None, f"no tools/list result (stderr tail: {stderr_tail!r})"
+
 
 role_mcps_path = orch / "role-mcps.json"
 allow_path = orch / "mcp-allow.json"
@@ -113,18 +174,18 @@ if allow_path.is_file():
     except json.JSONDecodeError:
         pass
 
-# Every spawned claude -p reaches its upstreams through mcp-proxy:8888,
-# the same path workers use. The /<name>/ prefix is the proxy's routing
-# key; the proxy strips it and forwards.
+# Every spawned claude -p reaches its proxy-routed upstreams through
+# mcp-proxy:8888, the same path workers use. The /<name>/ prefix is the
+# proxy's routing key; the proxy strips it and forwards.
 cfg: dict = {"mcpServers": {}}
-inventory_rows: list[tuple[str, str, str]] = []  # (name, path, description)
+proxy_inventory_rows: list[tuple[str, str, str]] = []  # (name, path, description)
 for name in upstream_names:
     e = allow_by_name.get(name)
     if not e:
         # Validation should prevent this at enable time; tolerate at boot
         # by skipping the entry so the daemon still comes up. Surface the
         # missing-allow in the inventory so the role-worker can flag it.
-        inventory_rows.append(
+        proxy_inventory_rows.append(
             (name, "(?)", "(NOT in mcp-allow.json — operator must allow it)")
         )
         continue
@@ -136,8 +197,71 @@ for name in upstream_names:
         server["headers"] = headers
     cfg["mcpServers"][name] = server
     desc = e.get("description") or "(no description — ask operator to set one)"
-    inventory_rows.append((name, path, desc))
+    proxy_inventory_rows.append((name, path, desc))
 
+# --- Image-baked extras (substrate B.1-substrate SB1 + SB2) ----------------
+# /opt/role-mcp/role/extra-mcps.json declares per-role stdio MCPs bundled
+# with the image (e.g. Playwright in B.1's websearcher). Merged into
+# spawn-mcp.json so each spawned claude sees them through the same
+# --mcp-config path as proxy upstreams. Collisions with proxy-routed
+# names are hard-failures — an operator can't silently shadow an image-
+# baked tool with a proxy one. Tool names rendered into the inventory
+# come from a live tools/list query (NOT a static template), so they
+# stay current across pre-1.0 MCP server renames.
+extras_path = Path("/opt/role-mcp/role/extra-mcps.json")
+image_baked_inventory: list[tuple[str, list[str], str]] = []  # (name, tool_names, note)
+if extras_path.is_file():
+    try:
+        extras_data = json.loads(extras_path.read_text())
+    except json.JSONDecodeError as e:
+        print(f"role-mcp[{role}]: extra-mcps.json invalid JSON: {e}",
+              file=sys.stderr)
+        sys.exit(1)
+
+    extras_servers = extras_data.get("mcpServers") if isinstance(extras_data, dict) else None
+    if extras_servers is None:
+        extras_servers = {}
+    if not isinstance(extras_servers, dict):
+        print(f"role-mcp[{role}]: extra-mcps.json mcpServers must be an object",
+              file=sys.stderr)
+        sys.exit(1)
+
+    collisions = sorted(n for n in extras_servers if n in cfg["mcpServers"])
+    if collisions:
+        names_csv = ", ".join(repr(n) for n in collisions)
+        print(f"role-mcp[{role}]: image-baked / proxy-routed name collision: "
+              f"{names_csv} is both image-baked AND proxy-routed; refusing "
+              f"to start. Rename or remove the operator-registered MCP, "
+              f"then re-enable the role-MCP.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    for name, server_cfg in extras_servers.items():
+        if not isinstance(server_cfg, dict):
+            image_baked_inventory.append((name, [], "(invalid server config in extra-mcps.json)"))
+            continue
+        cfg["mcpServers"][name] = server_cfg
+        command = server_cfg.get("command")
+        cmd_args = server_cfg.get("args") or []
+        if not isinstance(command, str) or not command:
+            image_baked_inventory.append((name, [], "(missing 'command' in server config)"))
+            continue
+        if not isinstance(cmd_args, list):
+            image_baked_inventory.append((name, [], "(invalid 'args' in server config)"))
+            continue
+        tools, err = query_image_baked_tools(command, cmd_args, timeout=5)
+        if tools is None:
+            image_baked_inventory.append(
+                (name, [], f"(tools/list failed: {err})")
+            )
+            print(f"role-mcp[{role}]: image-baked MCP {name!r} tools/list "
+                  f"failed: {err}", file=sys.stderr)
+        else:
+            tool_names = [t.get("name") for t in tools if isinstance(t, dict)
+                          and isinstance(t.get("name"), str)]
+            image_baked_inventory.append((name, tool_names, ""))
+
+# --- Write spawn-mcp.json -----------------------------------------------
 # Empty mcpServers => write "{}" so spawn.sh's empty-config skip kicks in.
 if not cfg["mcpServers"]:
     spawn_cfg_path.write_text("{}\n")
@@ -145,34 +269,75 @@ else:
     spawn_cfg_path.write_text(
         json.dumps(cfg, indent=2, sort_keys=True) + "\n")
 
-# Render the human-facing inventory.
+# --- Render the human-facing inventory ----------------------------------
 lines: list[str] = [
     f"# Tools available to {role} in this project",
     "",
     "Rendered at container start by entrypoint.role-mcp.sh from the project's",
-    "mcp-allow.json. Reach each tool via the supervisor's mcp-proxy at",
-    "`http://mcp-proxy:8888/<name>/...` — claude -p's MCP config wires this",
-    "automatically; you call them by their tool name like any other MCP.",
+    "mcp-allow.json and (if present) /opt/role-mcp/role/extra-mcps.json.",
+    "Proxy-routed upstreams reach via the supervisor's mcp-proxy; image-",
+    "baked stdio MCPs are launched directly by each spawned claude session.",
     "",
 ]
-if not inventory_rows:
+
+proxy_header = "## Proxy-routed upstreams"
+if not proxy_inventory_rows:
+    proxy_header += " (none allowlisted)"
+lines += [proxy_header, ""]
+
+if not proxy_inventory_rows:
     lines += [
-        "**No upstream MCPs allowlisted for this role in this project.**",
-        "",
-        "Surface this as a configuration problem in your per-call log",
-        "(`outcome: needs_human`, naming the operator action required",
-        "— `research project role-mcp enable <project> <role> --upstream <mcp,...>`).",
+        "No upstream MCPs allowlisted for this role in this project.",
         "",
     ]
+    if not image_baked_inventory:
+        lines += [
+            "Surface this as a configuration problem in your per-call log",
+            "(`outcome: needs_human`, naming the operator action required",
+            "— `research project role-mcp enable <project> <role> "
+            "--upstream <mcp,...>`).",
+            "",
+        ]
+    else:
+        lines += [
+            "This may be normal — if this role's primary tools are image-",
+            "baked (see below), the absence of proxy upstreams is expected.",
+            "",
+        ]
 else:
     lines += [
+        "Reach each tool via `http://mcp-proxy:8888/<name>/...` — your MCP",
+        "config wires this automatically; call by tool name like any MCP.",
+        "",
         "| Name | Path | Description |",
         "|---|---|---|",
     ]
-    for name, path, desc in inventory_rows:
-        # Escape pipes in the description so the markdown table stays valid.
+    for name, path, desc in proxy_inventory_rows:
         safe_desc = desc.replace("|", "\\|").replace("\n", " ").strip()
         lines.append(f"| `{name}` | `{path}` | {safe_desc} |")
+    lines.append("")
+
+if image_baked_inventory:
+    lines += [
+        "## Image-baked tools",
+        "",
+        "Stdio MCPs bundled with this role's image. Launched directly by",
+        "each spawned claude session (no proxy involved). Tool names below",
+        "come from a live tools/list query at container start — they",
+        "reflect the actual API of the installed MCP version, not a static",
+        "template.",
+        "",
+        "| Name | Transport | Tools |",
+        "|---|---|---|",
+    ]
+    for name, tool_names, note in image_baked_inventory:
+        if note:
+            tools_cell = note.replace("|", "\\|")
+        elif not tool_names:
+            tools_cell = "(no tools reported)"
+        else:
+            tools_cell = ", ".join(f"`{n}`" for n in tool_names)
+        lines.append(f"| `{name}` | stdio (image-baked) | {tools_cell} |")
     lines.append("")
 
 inventory_path.write_text("\n".join(lines))
