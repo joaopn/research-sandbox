@@ -196,6 +196,14 @@ COPY container/supervisor/code-server-stub.py \
      /opt/code-server-tools/code-server-stub.py
 RUN chmod +x /opt/code-server-tools/code-server-stub.py
 
+# Minimal byobu status line — only the time widget on the right, nothing
+# extra crowding the bar. Must be staged before the skel snapshot below
+# so the supervisor's first-boot skel-restore picks it up.
+RUN install -d -o research -g research /home/research/.byobu /home/research/.byobu/bin
+COPY --chown=research:research agent/byobu-status      /home/research/.byobu/status
+COPY --chown=research:research agent/byobu-bin-rolename /home/research/.byobu/bin/60_rolename
+RUN chmod +x /home/research/.byobu/bin/60_rolename
+
 # Stash home directory — volume mount on /home/research hides image contents.
 RUN cp -a /home/research /etc/research-skel
 

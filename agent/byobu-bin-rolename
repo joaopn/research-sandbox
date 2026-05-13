@@ -1,0 +1,26 @@
+#!/bin/bash
+# Byobu custom-widget plugin: render this container's role label
+# (supervisor, wrangler, librarian, …) on the status bar's left side,
+# before the tmux window list.
+#
+# Filename convention: byobu runs scripts in ~/.byobu/bin/<NN>_<name>
+# at NN-second intervals; 60s is a comfortable cadence for a value
+# that effectively doesn't change. Installed by each image's Dockerfile
+# at ~/.byobu/bin/60_rolename.
+#
+# Source of truth: ~/.rs-role, a one-line file written by each
+# container's entrypoint at boot (supervisor → "supervisor"; PI
+# containers → $RS_PI_ROLE). A file rather than an env var because the
+# supervisor's byobu session is launched via SSH, which strips the
+# container's environment — the marker file is the lowest-common-
+# denominator path that survives both `docker exec` (PI) and ssh
+# (supervisor) attach modes.
+[ -r "$HOME/.rs-role" ] || exit 0
+role=$(cat "$HOME/.rs-role" 2>/dev/null)
+[ -n "$role" ] || exit 0
+# Trailing newline is load-bearing: byobu's __custom plugin reads cache
+# files via a `while read` loop that drops any final line lacking \n
+# (the read builtin returns non-zero on EOF-without-newline and the
+# loop exits before appending). Plain `printf '%s' "$role"` would write
+# the role to disk but render as empty in the status bar.
+printf '[%s]\n' "$role"

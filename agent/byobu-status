@@ -1,0 +1,25 @@
+# Minimal byobu status line — only the time widget on the right, nothing
+# extra crowding the bar. The tmux window list (the "tabs" along the
+# bottom) is built in and stays visible regardless of this file. Every
+# widget below is byobu's full vocabulary; `#` prefix disables. Keep the
+# full key list so a byobu version bump that adds new widgets doesn't
+# silently re-enable them — every name is explicitly opted in or out.
+#
+# Baked into the supervisor, pi-base, and analysis-base images at build
+# time via COPY into ~/.byobu/status. Image-level change — picking it up
+# requires `python research.py start --rebuild` plus destroy/recreate of
+# affected projects.
+
+status_session=tmux
+
+screen_upper_left="color"
+screen_upper_right="color #whoami #hostname #ip_address #menu"
+screen_lower_left="color #logo #distro #release #arch #session"
+screen_lower_right="color #network #disk_io #custom #entropy #raid #reboot_required #updates_available #apport #services #mail #users #uptime #ec2_cost #rcs_cost #fan_speed #cpu_temp #battery #wifi_quality #processes #load_average #cpu_count #cpu_freq #memory #swap #disk #whoami #hostname #ip_address #time_utc #date time"
+
+# `custom` here renders the output of every executable under
+# ~/.byobu/bin/<NN>_<name>; the rs-role plugin writes the container's
+# role label (supervisor, wrangler, …) into this slot before tmux's
+# built-in window list.
+tmux_left="custom #logo #distro #release #arch #session"
+tmux_right="#network #disk_io #custom #entropy #raid #reboot_required #updates_available #apport #services #mail #users #uptime #ec2_cost #rcs_cost #fan_speed #cpu_temp #battery #wifi_quality #processes #load_average #cpu_count #cpu_freq #memory #swap #disk #whoami #hostname #ip_address #time_utc #date time"

@@ -40,6 +40,14 @@ RUN /opt/conda/bin/conda install -n base -y -c conda-forge \
 RUN su - worker -c 'curl -fsSL https://claude.ai/install.sh | bash' && \
     su - worker -c 'echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.bashrc'
 
+# Minimal byobu status line — only the time widget on the right, nothing
+# extra crowding the bar. Must be staged before the skel snapshot below.
+# Inherited unchanged by rs-pi-base (FROM rs-analysis-base).
+RUN install -d -o worker -g worker /home/worker/.byobu /home/worker/.byobu/bin
+COPY --chown=worker:worker agent/byobu-status      /home/worker/.byobu/status
+COPY --chown=worker:worker agent/byobu-bin-rolename /home/worker/.byobu/bin/60_rolename
+RUN chmod +x /home/worker/.byobu/bin/60_rolename
+
 # Home skel for volume-mount first-boot restore.
 RUN cp -a /home/worker /etc/worker-skel
 

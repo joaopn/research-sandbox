@@ -26,6 +26,10 @@ if [[ ! -f ~/.bashrc ]]; then
     cp -a /etc/worker-skel/. ~/
 fi
 
+# Role marker for the byobu status-bar plugin (~/.byobu/bin/60_rolename).
+# Written every boot — see entrypoint.supervisor.sh for the rationale.
+echo "${RS_PI_ROLE}" > ~/.rs-role
+
 # --- Stage creds (in-container claude needs OAuth) -------------------------
 # The supervisor stages its current ~/.claude/.credentials.json into the
 # per-role creds bind-mount source at /workspace/.pi/<role>/.creds/ on

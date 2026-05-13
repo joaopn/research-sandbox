@@ -111,13 +111,35 @@ body {
 .dashboard { display: flex; flex-direction: row; height: 100%; position: relative; }
 
 .project-rail {
-    width: 200px;
+    width: var(--rail-width, 200px);
     flex-shrink: 0;
     background: var(--bg-card);
     border-right: 1px solid var(--border);
     display: flex;
     flex-direction: column;
     overflow-y: auto;
+    position: relative;  /* anchor for .rail-splitter */
+}
+
+/* Drag handle on the rail's right edge. Transparent by default (so it
+   doesn't crowd the rail visually) but a 6px-wide hit area; the cursor
+   changes to col-resize when hovering and the bar tints to the theme
+   accent during hover/drag. Sits inside the rail's content area (not
+   overhanging) because overflow-y: auto on the parent implicitly clips
+   overflow-x in modern browsers. */
+.project-rail .rail-splitter {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 6px;
+    height: 100%;
+    cursor: col-resize;
+    z-index: 5;
+    background: transparent;
+}
+.project-rail .rail-splitter:hover,
+.project-rail .rail-splitter.dragging {
+    background: var(--fg-accent);
 }
 
 /* Collapsed: rail is hidden entirely. */
@@ -350,21 +372,116 @@ body {
 .terminal-instance {
     position: absolute;
     inset: 0;
-    padding: 4px;
+}
+/* Visual padding around xterm. Two interlocking concerns:
+   1. Padding on .terminal-instance breaks xterm-addon-fit, which measures
+      `parentElement.height` (border-box, includes padding) but subtracts
+      only the xterm element's own padding — so xterm over-estimates rows
+      and draws its last row outside the visible area, eating byobu.
+   2. xterm sizes its element to exactly rows × cellHeight, always ≤
+      available height; the row-rounding remainder would otherwise leave
+      empty terminal-bg below byobu, "comically hanging in mid air."
+   Solution: this inset wrapper has no padding (xterm-fit sees a clean
+   rectangle), uses flex column with justify-content: flex-end so the
+   row-rounding remainder is absorbed at the top, and uses a small bottom
+   inset so byobu sits a few px above the container's bottom edge. */
+.terminal-pad {
+    position: absolute;
+    inset: 2px 2px 4px;
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+    /* xterm.element has an explicit pixel width = cols × cellWidth (always
+       ≤ pad width — the cellWidth remainder is up to ~one char wide). The
+       flex default `align-items: stretch` doesn't stretch an item with a
+       definite cross-size, so the item would otherwise pin to cross-start
+       (left) and dump the entire remainder on the right. Centering splits
+       it evenly so left/right padding reads as symmetric. */
+    align-items: center;
+}
+
+/* xterm's viewport ships with `overflow-y: scroll` (always-visible track),
+   not `auto`. Hide it — mouse wheel + tmux/byobu's own scrollback keys
+   (Shift+PgUp etc.) still work without a visible track. */
+.terminal-pad .xterm-viewport {
+    scrollbar-width: none;        /* Firefox */
+}
+.terminal-pad .xterm-viewport::-webkit-scrollbar {
+    display: none;                /* Chromium, Safari */
 }
 .terminal-instance.hidden { display: none; }
+
+/* Split-pane (W8) — when .terminal-area gets .split, it becomes a flex row
+   with .main-pane | .pane-splitter | .side-pane. Each pane is itself
+   position: relative so the existing .terminal-instance absolute children
+   anchor inside their parent pane rather than the whole area. */
+.terminal-area.split {
+    display: flex;
+    flex-direction: row;
+}
+.terminal-area.split .pane {
+    position: relative;
+    overflow: hidden;
+    min-width: 0;
+}
+.terminal-area.split .main-pane {
+    flex: 0 0 var(--split-ratio, 70%);
+}
+.terminal-area.split .side-pane {
+    flex: 1 1 auto;
+}
+.terminal-area.split .pane-splitter {
+    flex: 0 0 6px;
+    background: var(--border);
+    cursor: col-resize;
+    z-index: 4;
+}
+.terminal-area.split .pane-splitter:hover,
+.terminal-area.split .pane-splitter.dragging {
+    background: var(--fg-accent);
+}
+
+/* Pin button — lives on the right edge of each service tab. Always
+   visible but muted; switches to the theme accent when its tab is the
+   pinned one. */
+.service-tabs .tab .pin-tab-btn {
+    background: transparent;
+    border: none;
+    color: var(--fg-faint);
+    cursor: pointer;
+    padding: 0 2px;
+    margin-left: 4px;
+    font-size: 13px;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+}
+.service-tabs .tab .pin-tab-btn:hover { color: var(--fg-base); }
+.service-tabs .tab.pinned .pin-tab-btn { color: var(--fg-accent); }
+.service-tabs .tab.pinned {
+    box-shadow: 0 -2px 0 var(--fg-accent) inset, inset 0 0 0 9999px rgba(127, 127, 127, 0.05);
+}
 
 .http-instance {
     padding: 0;
     display: flex;
     flex-direction: column;
+    overflow: hidden;  /* clip the oversized iframe used by the zoom hack */
 }
+/* The iframe is laid out at (100 / iframe-zoom)% and then transform-scaled
+   back down by `--iframe-zoom`. Net effect: the upstream (code-server,
+   etc.) thinks it has a viewport wider than the pane and lays its chrome
+   out for that wider canvas; the user sees more file tree / more tab
+   labels at smaller pixel sizes. Defaults to 1 so the un-zoomed path is
+   identical to before this change. */
 .http-iframe {
-    flex: 1;
-    width: 100%;
-    height: 100%;
+    flex: none;
+    width: calc(100% / var(--iframe-zoom, 1));
+    height: calc(100% / var(--iframe-zoom, 1));
     border: 0;
     background: var(--terminal-bg);
+    transform: scale(var(--iframe-zoom, 1));
+    transform-origin: top left;
 }
 .http-status {
     padding: 16px;

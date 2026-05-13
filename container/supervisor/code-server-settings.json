@@ -9,7 +9,7 @@
   "workbench.settings.enableNaturalLanguageSearch": false,
   "workbench.tips.enabled": false,
   "workbench.welcomePage.walkthroughs.openOnInstall": false,
-  "workbench.colorTheme": "Default Dark Modern",
+  "workbench.colorTheme": "Monokai Dimmed",
   "workbench.editorAssociations": {
     "*.md": "vscode.markdown.preview.editor"
   },
@@ -24,10 +24,13 @@
 
   "security.workspace.trust.enabled": false,
 
+  "editor.fontSize": 13,
   "editor.minimap.enabled": false,
   "editor.formatOnSave": false,
   "editor.linkedEditing": true,
   "editor.bracketPairColorization.enabled": true,
+  "editor.mouseWheelZoom": false,
+  "terminal.integrated.fontSize": 13,
 
   "files.watcherExclude": {
     "**/.git/**": true,

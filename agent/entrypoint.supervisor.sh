@@ -50,6 +50,11 @@ if ! grep -q 'umask 002' ~/.bashrc 2>/dev/null; then
     echo 'umask 002' >> ~/.bashrc
 fi
 
+# Role marker for the byobu status-bar plugin (~/.byobu/bin/60_rolename).
+# Written every boot to survive image swaps; SSH login sessions strip the
+# container's env, so a file is the lowest-common-denominator carrier.
+echo supervisor > ~/.rs-role
+
 # --- Restore Claude credentials stashed by `research project update --rebuild`
 #     (which `mv`s ~research/.claude into the workspace bind-mount before
 #     destroying the old container, so the creds survive the swap without

@@ -10,13 +10,31 @@
 
 const VAULT_KEY = "rs-webui-vault";
 const THEME_KEY = "rs-webui-theme";
+const IFRAME_ZOOM_KEY = "rs-webui-iframe-zoom";
+const IFRAME_ZOOMS = [0.7, 0.8, 0.9, 1.0, 1.1, 1.2];
+const IFRAME_ZOOM_DEFAULT = 0.9;
 const RAIL_PINNED_KEY = "rs-webui-rail-pinned";
+const RAIL_WIDTH_KEY = "rs-webui-rail-width";
+const RAIL_WIDTH_DEFAULT = 200;
+// Max prevents the rail from swallowing the terminal area on narrow
+// viewports. Min is intentionally permissive — at 80px the footer
+// dropdowns clip but project names + status dots stay legible, which
+// is the only thing the rail actually has to show when shrunk to a
+// status strip. Same posture as SPLIT_RATIO_MIN/MAX.
+const RAIL_WIDTH_MIN = 80;
+const RAIL_WIDTH_MAX = 480;
 const PBKDF2_ITERATIONS = 600000;
 const PROBE_INTERVAL_MS = 15000;
 // Status polling cadence — only runs while the rail is open. Higher than
 // PROBE_INTERVAL_MS because the data is filesystem-derived and changes on
 // human / worker timescales (minutes), not network-up timescales (seconds).
 const STATUS_INTERVAL_MS = 20000;
+// Split-pane (W8): main-pane fraction bounds. 0.5 keeps the main pane at
+// least half (below that, pin a different service); 0.9 leaves the side
+// pane ~10% — enough room for a slim agent strip on widescreen monitors.
+const SPLIT_RATIO_DEFAULT = 0.7;
+const SPLIT_RATIO_MIN = 0.5;
+const SPLIT_RATIO_MAX = 0.9;
 
 // ---- themes -----------------------------------------------------------------
 
@@ -190,6 +208,10 @@ const state = {
     theme: null,
     railPinned: false,       // persisted: keep rail in flex flow (push layout)
     railExpanded: false,     // in-memory: rail visible (overlay when unpinned)
+    railWidth: RAIL_WIDTH_DEFAULT,  // persisted: rail width in px
+    pinnedService: null,     // service id pinned to side pane for active project, or null
+    splitRatio: SPLIT_RATIO_DEFAULT,  // main-pane fraction when split
+    iframeZoom: IFRAME_ZOOM_DEFAULT,  // CSS transform scale applied to http-kind iframes
 };
 
 // ---- utilities -------------------------------------------------------------
@@ -404,6 +426,67 @@ function loadRailPinned() {
     return localStorage.getItem(RAIL_PINNED_KEY) === "1";
 }
 
+function loadRailWidth() {
+    const v = parseInt(localStorage.getItem(RAIL_WIDTH_KEY) || "", 10);
+    if (!isFinite(v)) return RAIL_WIDTH_DEFAULT;
+    return Math.max(RAIL_WIDTH_MIN, Math.min(RAIL_WIDTH_MAX, v));
+}
+
+function applyRailWidth(px) {
+    document.documentElement.style.setProperty("--rail-width", `${px}px`);
+}
+
+// Splitter on the rail's right edge — same pointer-capture pattern as
+// the W8 terminal-area splitter so the drag survives moving the cursor
+// across iframes / xterm canvases.
+function installRailSplitterDrag(splitter) {
+    let dragging = false;
+    let pointerId = null;
+    const onMove = (ev) => {
+        if (!dragging) return;
+        const rail = splitter.parentElement;
+        if (!rail) return;
+        const rect = rail.getBoundingClientRect();
+        let w = ev.clientX - rect.left;
+        w = Math.max(RAIL_WIDTH_MIN, Math.min(RAIL_WIDTH_MAX, w));
+        applyRailWidth(w);
+        state.railWidth = w;
+    };
+    const onUp = () => {
+        if (!dragging) return;
+        dragging = false;
+        splitter.classList.remove("dragging");
+        try { if (pointerId != null) splitter.releasePointerCapture(pointerId); } catch (_) {}
+        pointerId = null;
+        splitter.removeEventListener("pointermove", onMove);
+        splitter.removeEventListener("pointerup", onUp);
+        splitter.removeEventListener("pointercancel", onUp);
+        document.body.style.userSelect = "";
+        localStorage.setItem(RAIL_WIDTH_KEY, String(Math.round(state.railWidth)));
+        // Pinned rail shifts the terminal area's width — refit xterms.
+        setTimeout(() => {
+            for (const t of Object.values(state.terminals)) {
+                if (t.fitAddon) { try { t.fitAddon.fit(); } catch (_) {} }
+            }
+        }, 0);
+    };
+    splitter.onpointerdown = (ev) => {
+        ev.preventDefault();
+        // Don't bubble — the rail itself doesn't have a click handler, but
+        // the dashboard-level toggle on the Projects tab is right next to
+        // the splitter in overlay mode; stop here to be defensive.
+        ev.stopPropagation();
+        dragging = true;
+        pointerId = ev.pointerId;
+        splitter.classList.add("dragging");
+        try { splitter.setPointerCapture(ev.pointerId); } catch (_) {}
+        splitter.addEventListener("pointermove", onMove);
+        splitter.addEventListener("pointerup", onUp);
+        splitter.addEventListener("pointercancel", onUp);
+        document.body.style.userSelect = "none";
+    };
+}
+
 function makeProjectsTab() {
     const expanded = state.railPinned || state.railExpanded;
     const chev = el("span", {
@@ -466,6 +549,47 @@ function toggleRailExpanded() {
     applyRailState();
 }
 
+// Auto-collapse the floating rail on any interaction outside it. Two
+// fire paths because iframe clicks don't bubble out of the iframe:
+//   - pointerdown on the parent document handles clicks on xterm /
+//     service tabs / terminal area chrome.
+//   - window blur + document.activeElement === IFRAME handles the case
+//     where the click landed inside code-server (or any http tab).
+// Pinned rail is excluded — pinning is the explicit "keep it open"
+// affordance and stays put regardless of where the user clicks.
+function installRailOutsideClickHandlers() {
+    document.addEventListener("pointerdown", (ev) => {
+        if (!state.railExpanded || state.railPinned) return;
+        // Modal in front owns the interaction; don't collapse behind it.
+        if (document.querySelector(".modal-backdrop")) return;
+        const path = ev.composedPath ? ev.composedPath() : [];
+        for (const node of path) {
+            if (!node || !node.classList) continue;
+            // Click inside the rail itself — let inner handlers run.
+            if (node.classList.contains("project-rail")) return;
+            // Click on the Projects tab — its own onclick toggles the
+            // rail. Letting our outside handler also fire here would
+            // double-toggle (tab opens, then we close).
+            if (node.classList.contains("projects-tab")) return;
+        }
+        state.railExpanded = false;
+        applyRailState();
+    });
+
+    window.addEventListener("blur", () => {
+        if (!state.railExpanded || state.railPinned) return;
+        // Give the browser a tick to settle focus into the iframe before
+        // we check activeElement. Without the timeout, blur fires while
+        // the active element is still the parent body.
+        setTimeout(() => {
+            if (document.activeElement && document.activeElement.tagName === "IFRAME") {
+                state.railExpanded = false;
+                applyRailState();
+            }
+        }, 0);
+    });
+}
+
 function togglePinned() {
     state.railPinned = !state.railPinned;
     localStorage.setItem(RAIL_PINNED_KEY, state.railPinned ? "1" : "0");
@@ -479,6 +603,9 @@ function togglePinned() {
 
 function makeProjectRail() {
     const rail = el("aside", { class: "project-rail" });
+    const splitter = el("div", { class: "rail-splitter", title: "Drag to resize" });
+    installRailSplitterDrag(splitter);
+    rail.appendChild(splitter);
     const header = el("div", { class: "rail-header" }, [
         el("span", {}, ["Projects"]),
         makePinButton(),
@@ -494,6 +621,7 @@ function makeProjectRail() {
     rail.appendChild(el("div", { class: "rail-spacer" }));
 
     const footer = el("div", { class: "rail-footer" }, [
+        makeIframeZoomSelector(),
         makeThemeSelector(),
         el("button", { class: "lock-btn", onclick: lockVault }, ["Lock vault"]),
     ]);
@@ -668,6 +796,8 @@ function lockVault() {
     state.activeProject = null;
     state.activeService = null;
     state.projectServices = {};
+    state.pinnedService = null;
+    state.splitRatio = SPLIT_RATIO_DEFAULT;
     state.railExpanded = state.railPinned;
     renderUnlock();
 }
@@ -725,6 +855,39 @@ function closeSearchBar() {
     if (searchBarEl) searchBarEl.classList.add("hidden");
     const t = activeTerminal();
     if (t && t.term) t.term.focus();
+}
+
+// ---- iframe zoom (rail footer dropdown) ------------------------------------
+
+function loadIframeZoom() {
+    const v = parseFloat(localStorage.getItem(IFRAME_ZOOM_KEY) || "");
+    return IFRAME_ZOOMS.includes(v) ? v : IFRAME_ZOOM_DEFAULT;
+}
+
+function applyIframeZoomVar(z) {
+    document.documentElement.style.setProperty("--iframe-zoom", String(z));
+}
+
+function setIframeZoom(z) {
+    state.iframeZoom = z;
+    applyIframeZoomVar(z);
+    localStorage.setItem(IFRAME_ZOOM_KEY, String(z));
+}
+
+function makeIframeZoomSelector() {
+    const sel = document.createElement("select");
+    // Shares the .theme-select styling (footer dropdowns look uniform).
+    sel.className = "theme-select";
+    sel.title = "Editor zoom (affects code-server / any iframe tab)";
+    for (const z of IFRAME_ZOOMS) {
+        const opt = document.createElement("option");
+        opt.value = String(z);
+        opt.textContent = `Editor ${Math.round(z * 100)}%`;
+        if (Math.abs(z - state.iframeZoom) < 1e-6) opt.selected = true;
+        sel.appendChild(opt);
+    }
+    sel.onchange = () => setIframeZoom(parseFloat(sel.value));
+    return sel;
 }
 
 function makeThemeSelector() {
@@ -833,6 +996,185 @@ async function removeProject(name) {
     await renderDashboard();
 }
 
+// ---- split pane (W8) -------------------------------------------------------
+
+// Where a new .terminal-instance should be appended given the current pin
+// state. The unsplit case returns .terminal-area itself — preserves today's
+// DOM exactly.
+function paneFor(serviceId) {
+    const area = document.getElementById("terminal-area");
+    if (!area) return null;
+    if (state.pinnedService && serviceId === state.pinnedService) {
+        return area.querySelector(".side-pane") || area;
+    }
+    return area.querySelector(".main-pane") || area;
+}
+
+// Mutate .terminal-area between unsplit and split shapes idempotently.
+// Called whenever pin state changes or a project becomes active. Existing
+// .terminal-instance children get re-parented into the right pane; .hidden
+// classes are recomputed for the active project's terminals so the pinned
+// one stays visible and the active one shows in the main pane.
+function applySplitLayout() {
+    const area = document.getElementById("terminal-area");
+    if (!area) return;
+    const pinned = state.pinnedService;
+    const isSplit = area.classList.contains("split");
+
+    if (!pinned && isSplit) {
+        // Collapse: hoist pane children back up to .terminal-area, drop wrappers.
+        const main = area.querySelector(".main-pane");
+        const side = area.querySelector(".side-pane");
+        const splitter = area.querySelector(".pane-splitter");
+        if (main) while (main.firstChild) area.appendChild(main.firstChild);
+        if (side) while (side.firstChild) area.appendChild(side.firstChild);
+        if (main) main.remove();
+        if (side) side.remove();
+        if (splitter) splitter.remove();
+        area.classList.remove("split");
+        area.style.removeProperty("--split-ratio");
+    } else if (pinned && !isSplit) {
+        // Expand: wrap existing children into .main-pane, attach splitter + .side-pane.
+        const main = el("div", { class: "pane main-pane" });
+        const splitter = el("div", { class: "pane-splitter" });
+        const side = el("div", { class: "pane side-pane" });
+        // Move all area children into main-pane except the floating search bar,
+        // which is absolutely positioned and stays at area level.
+        const movable = Array.from(area.children).filter(
+            (c) => !c.classList.contains("search-bar"),
+        );
+        for (const c of movable) main.appendChild(c);
+        area.appendChild(main);
+        area.appendChild(splitter);
+        area.appendChild(side);
+        area.classList.add("split");
+        installSplitterDrag(splitter);
+    }
+
+    if (pinned) {
+        area.style.setProperty("--split-ratio", `${state.splitRatio * 100}%`);
+        const main = area.querySelector(".main-pane");
+        const side = area.querySelector(".side-pane");
+        const pinnedKey = tkey(state.activeProject, pinned);
+        const pinnedT = state.terminals[pinnedKey];
+        if (pinnedT && pinnedT.container && side && pinnedT.container.parentElement !== side) {
+            side.appendChild(pinnedT.container);
+        }
+        // Ensure non-pinned containers for the active project live in main-pane.
+        for (const [k, t] of Object.entries(state.terminals)) {
+            if (k === pinnedKey || !t.container) continue;
+            if (!k.startsWith(`${state.activeProject}:`)) continue;
+            if (main && t.container.parentElement !== main) main.appendChild(t.container);
+        }
+    }
+
+    // Recompute .hidden: pinned terminal always visible, plus the active one.
+    const activeKey = state.activeService ? tkey(state.activeProject, state.activeService) : null;
+    const pinnedKey = pinned ? tkey(state.activeProject, pinned) : null;
+    for (const [k, t] of Object.entries(state.terminals)) {
+        if (!t.container) continue;
+        if (!state.activeProject || !k.startsWith(`${state.activeProject}:`)) continue;
+        if (k === pinnedKey || k === activeKey) t.container.classList.remove("hidden");
+        else t.container.classList.add("hidden");
+    }
+
+    // xterm needs an explicit refit after its container changes size.
+    // Iframes reflow via their own ResizeObservers.
+    setTimeout(() => {
+        for (const t of Object.values(state.terminals)) {
+            if (t.fitAddon) { try { t.fitAddon.fit(); } catch (_) {} }
+        }
+    }, 0);
+}
+
+function installSplitterDrag(splitter) {
+    // Pointer capture is load-bearing: without it, a pointermove that
+    // crosses into an iframe (code-server) gets delivered to the iframe's
+    // browsing context instead of bubbling to the document, and the drag
+    // appears to freeze until the cursor re-enters the top-bar. Capturing
+    // the pointer to the splitter element routes every subsequent move /
+    // up for that pointer id to the splitter regardless of what's under
+    // the cursor.
+    let dragging = false;
+    let pointerId = null;
+    const onMove = (ev) => {
+        if (!dragging) return;
+        const area = document.getElementById("terminal-area");
+        if (!area) return;
+        const rect = area.getBoundingClientRect();
+        if (rect.width <= 0) return;
+        let ratio = (ev.clientX - rect.left) / rect.width;
+        ratio = Math.max(SPLIT_RATIO_MIN, Math.min(SPLIT_RATIO_MAX, ratio));
+        area.style.setProperty("--split-ratio", `${ratio * 100}%`);
+        state.splitRatio = ratio;
+    };
+    const onUp = async (ev) => {
+        if (!dragging) return;
+        dragging = false;
+        splitter.classList.remove("dragging");
+        try { if (pointerId != null) splitter.releasePointerCapture(pointerId); } catch (_) {}
+        pointerId = null;
+        splitter.removeEventListener("pointermove", onMove);
+        splitter.removeEventListener("pointerup", onUp);
+        splitter.removeEventListener("pointercancel", onUp);
+        document.body.style.userSelect = "";
+        // Refit on drag-end only; per-frame refits during the drag would
+        // thrash xterm's measurements.
+        setTimeout(() => {
+            for (const t of Object.values(state.terminals)) {
+                if (t.fitAddon) { try { t.fitAddon.fit(); } catch (_) {} }
+            }
+        }, 0);
+        await persistPinForActiveProject();
+    };
+    splitter.onpointerdown = (ev) => {
+        ev.preventDefault();
+        dragging = true;
+        pointerId = ev.pointerId;
+        splitter.classList.add("dragging");
+        try { splitter.setPointerCapture(ev.pointerId); } catch (_) {}
+        splitter.addEventListener("pointermove", onMove);
+        splitter.addEventListener("pointerup", onUp);
+        splitter.addEventListener("pointercancel", onUp);
+        document.body.style.userSelect = "none";
+    };
+}
+
+async function persistPinForActiveProject() {
+    if (!state.activeProject) return;
+    const project = state.vault.projects.find((p) => p.name === state.activeProject);
+    if (!project) return;
+    if (state.pinnedService) project.pinned_service = state.pinnedService;
+    else delete project.pinned_service;
+    if (Math.abs(state.splitRatio - SPLIT_RATIO_DEFAULT) > 1e-6) {
+        project.split_ratio = state.splitRatio;
+    } else {
+        delete project.split_ratio;
+    }
+    await persistVault();
+}
+
+async function togglePin(serviceId) {
+    state.pinnedService = state.pinnedService === serviceId ? null : serviceId;
+    // Pinning the currently-active service means main pane has nothing
+    // to show. Fall back to the first remaining service.
+    if (state.pinnedService && state.activeService === state.pinnedService) {
+        const enabled = state.projectServices[state.activeProject] || {};
+        const fallback = Object.keys(enabled).find((id) => id !== state.pinnedService);
+        state.activeService = fallback || null;
+    }
+    applySplitLayout();
+    const enabled = state.projectServices[state.activeProject] || {};
+    renderServiceTabs(state.activeProject, enabled);
+    if (state.activeService) activateService(state.activeService);
+    // Auto-open the pinned service so the side pane isn't empty.
+    if (state.pinnedService) {
+        const pinnedKey = tkey(state.activeProject, state.pinnedService);
+        if (!state.terminals[pinnedKey]) activateService(state.pinnedService);
+    }
+    await persistPinForActiveProject();
+}
+
 // ---- project / service activation ------------------------------------------
 
 async function activateProject(name) {
@@ -850,11 +1192,23 @@ async function activateProject(name) {
 
     state.activeProject = name;
     const enabled = await fetchProjectServices(name);
+
+    // Load per-project pin state from the vault entry. Missing fields
+    // decode cleanly to "no pin, default ratio" — vault schema stays v1.
+    const project = state.vault.projects.find((p) => p.name === name);
+    const desiredPin = project?.pinned_service || null;
+    // Drop the pin if its service is no longer enabled — e.g. operator
+    // disabled it between sessions. Cheaper than a vault migration.
+    state.pinnedService = desiredPin && enabled[desiredPin] ? desiredPin : null;
+    const ratio = project?.split_ratio;
+    state.splitRatio = typeof ratio === "number" ? ratio : SPLIT_RATIO_DEFAULT;
+
     renderServiceTabs(name, enabled);
+    applySplitLayout();
 
     // Pick a default service: keep the previous one if it's still in the
-    // enabled set, else use the first always-on (xterm), else the first
-    // entry. activateService handles re-rendering the content area.
+    // enabled set and not pinned, else first always-on (xterm), else first
+    // non-pinned entry.
     const ids = Object.keys(enabled);
     if (ids.length === 0) {
         state.activeService = null;
@@ -862,10 +1216,19 @@ async function activateProject(name) {
         return;
     }
     let next = state.activeService;
-    if (!enabled[next]) {
-        next = ids.find((id) => enabled[id].always_on) || ids[0];
+    if (!enabled[next] || next === state.pinnedService) {
+        next = ids.find((id) => id !== state.pinnedService && enabled[id].always_on)
+            || ids.find((id) => id !== state.pinnedService)
+            || ids[0];
     }
     activateService(next);
+
+    // Auto-open the pinned service so the side pane isn't empty after
+    // a fresh page load with a pin already persisted.
+    if (state.pinnedService && state.pinnedService !== next) {
+        const pinnedKey = tkey(name, state.pinnedService);
+        if (!state.terminals[pinnedKey]) activateService(state.pinnedService);
+    }
 }
 
 function renderServiceTabs(projectName, enabled) {
@@ -886,11 +1249,17 @@ function renderServiceTabs(projectName, enabled) {
     }
     for (const id of ids) {
         const svc = enabled[id];
+        const isPinned = id === state.pinnedService;
+        const pinBtn = el("button", {
+            class: "pin-tab-btn",
+            title: isPinned ? "Unpin from side" : "Pin to side",
+        }, ["⇥"]);
+        pinBtn.onclick = (ev) => { ev.stopPropagation(); togglePin(id); };
         const tab = el("div", {
-            class: "tab",
+            class: isPinned ? "tab pinned" : "tab",
             "data-service": id,
             onclick: () => activateService(id),
-        }, [svc.label || id]);
+        }, [el("span", {}, [svc.label || id]), pinBtn]);
         strip.appendChild(tab);
     }
 }
@@ -898,31 +1267,49 @@ function renderServiceTabs(projectName, enabled) {
 function activateService(serviceId) {
     if (!state.activeProject) return;
 
-    document.querySelectorAll(".service-tabs .tab").forEach((t) => t.classList.remove("active"));
-    const tabEl = document.querySelector(`.service-tabs .tab[data-service="${CSS.escape(serviceId)}"]`);
-    if (tabEl) tabEl.classList.add("active");
-
-    state.activeService = serviceId;
-
-    for (const t of Object.values(state.terminals)) {
-        if (t.container) t.container.classList.add("hidden");
-    }
-    const welcome = document.getElementById("welcome");
-    if (welcome) welcome.style.display = "none";
-
     const project = state.vault.projects.find((p) => p.name === state.activeProject);
     if (!project) return;
     const enabled = state.projectServices[state.activeProject] || {};
     const svc = enabled[serviceId];
     if (!svc) return;
 
+    const isPinned = serviceId === state.pinnedService;
+
+    // The pinned tab represents the side pane, not main-pane activation,
+    // so it never gets the .active underline.
+    if (!isPinned) {
+        document.querySelectorAll(".service-tabs .tab").forEach((t) => t.classList.remove("active"));
+        const tabEl = document.querySelector(`.service-tabs .tab[data-service="${CSS.escape(serviceId)}"]`);
+        if (tabEl) tabEl.classList.add("active");
+        state.activeService = serviceId;
+    }
+
+    // Hide everything except the active and the pinned terminal.
+    const activeKey = state.activeService ? tkey(state.activeProject, state.activeService) : null;
+    const pinnedKey = state.pinnedService ? tkey(state.activeProject, state.pinnedService) : null;
+    for (const [k, t] of Object.entries(state.terminals)) {
+        if (!t.container) continue;
+        if (k === activeKey || k === pinnedKey) t.container.classList.remove("hidden");
+        else t.container.classList.add("hidden");
+    }
+    const welcome = document.getElementById("welcome");
+    if (welcome) welcome.style.display = "none";
+
     const key = tkey(state.activeProject, serviceId);
-    if (state.terminals[key]) {
-        const t = state.terminals[key];
-        if (t.container) t.container.classList.remove("hidden");
-        if (t.fitAddon) t.fitAddon.fit();
-        if (t.term) t.term.focus();
+    const existing = state.terminals[key];
+    if (existing && !existing.disconnected) {
+        if (existing.container) existing.container.classList.remove("hidden");
+        if (existing.fitAddon) existing.fitAddon.fit();
+        if (existing.term) existing.term.focus();
         return;
+    }
+    if (existing && existing.disconnected) {
+        // Tear down the dead terminal so the open path below creates a
+        // fresh one. Scroll buffer is lost on reconnect — acceptable.
+        try { if (existing.ws) existing.ws.close(); } catch (_) {}
+        try { if (existing.term) existing.term.dispose(); } catch (_) {}
+        try { if (existing.container) existing.container.remove(); } catch (_) {}
+        delete state.terminals[key];
     }
 
     if (svc.kind === "ssh") {
@@ -930,11 +1317,11 @@ function activateService(serviceId) {
     } else if (svc.kind === "http") {
         openHttpService(project, serviceId, svc);
     } else {
-        const termArea = document.getElementById("terminal-area");
+        const parent = paneFor(serviceId) || document.getElementById("terminal-area");
         const placeholder = el("div", { class: "welcome" }, [
             `Unknown service kind: ${svc.kind}`,
         ]);
-        termArea.appendChild(placeholder);
+        parent.appendChild(placeholder);
     }
 }
 
@@ -952,7 +1339,12 @@ function showWelcome() {
 
 function openSshTerminal(project, serviceId, svc) {
     const container = el("div", { class: "terminal-instance" });
-    document.getElementById("terminal-area").appendChild(container);
+    // Inset wrapper: gives the visual breathing room WITHOUT putting
+    // padding on the element xterm-fit measures. See style.css comment
+    // on .terminal-pad for the fit-addon quirk this works around.
+    const pad = el("div", { class: "terminal-pad" });
+    container.appendChild(pad);
+    (paneFor(serviceId) || document.getElementById("terminal-area")).appendChild(container);
 
     const term = new Terminal({
         cursorBlink: true,
@@ -968,7 +1360,7 @@ function openSshTerminal(project, serviceId, svc) {
     ));
     const searchAddon = new SearchAddon.SearchAddon();
     term.loadAddon(searchAddon);
-    term.open(container);
+    term.open(pad);
     try {
         const webgl = new WebglAddon.WebglAddon();
         webgl.onContextLoss(() => webgl.dispose());
@@ -1042,6 +1434,11 @@ function openSshTerminal(project, serviceId, svc) {
 
     ws.onclose = () => {
         term.writeln("\r\n\x1b[90m[disconnected — click the tab again to reconnect]\x1b[0m");
+        const k = tkey(project.name, serviceId);
+        // Mark for teardown on the next activateService(serviceId) — the
+        // fast-path early-return would otherwise just re-show the stale,
+        // disconnected terminal without reopening the WS.
+        if (state.terminals[k]) state.terminals[k].disconnected = true;
     };
 
     term.onData((d) => {
@@ -1066,11 +1463,10 @@ function openSshTerminal(project, serviceId, svc) {
 // ---- http-kind iframe ------------------------------------------------------
 
 async function openHttpService(project, serviceId, svc) {
-    const termArea = document.getElementById("terminal-area");
     const container = el("div", { class: "terminal-instance http-instance" });
     const status = el("div", { class: "http-status" }, ["Authenticating…"]);
     container.appendChild(status);
-    termArea.appendChild(container);
+    (paneFor(serviceId) || document.getElementById("terminal-area")).appendChild(container);
 
     const key = tkey(project.name, serviceId);
     state.terminals[key] = {
@@ -1212,6 +1608,11 @@ window.addEventListener("DOMContentLoaded", () => {
     applyTheme(loadStoredTheme());
     state.railPinned = loadRailPinned();
     state.railExpanded = state.railPinned;
+    state.railWidth = loadRailWidth();
+    applyRailWidth(state.railWidth);
+    state.iframeZoom = loadIframeZoom();
+    applyIframeZoomVar(state.iframeZoom);
+    installRailOutsideClickHandlers();
     if (loadStored()) renderUnlock();
     else renderSetup();
 });
