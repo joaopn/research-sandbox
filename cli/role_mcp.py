@@ -55,6 +55,7 @@ ROLE_IPS: dict[str, str] = {
 # -> `agent/Dockerfile.wrangler`. role `echo-mcp` -> `agent/Dockerfile.echo-mcp`.
 ROLE_IMAGES: dict[str, str] = {
     "echo-mcp":     "rs-echo-mcp:latest",
+    "websearcher":  "rs-websearcher:latest",
     "wrangler":     "rs-wrangler:latest",
 }
 

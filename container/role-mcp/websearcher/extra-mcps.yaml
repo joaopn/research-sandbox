@@ -1,0 +1,126 @@
+# Playwright MCP launch + tool-restriction spec for the websearcher role.
+#
+# Single source-of-truth: this YAML drives THREE derived artifacts at
+# image build by render-extra-mcps.py:
+#
+#   /opt/role-mcp/role/extra-mcps.json
+#       — substrate's image-baked merge hook reads this and merges
+#         the entry into the spawned claude's --mcp-config.
+#
+#   /opt/role-mcp/role/playwright-mcp-config.json
+#       — referenced via `--config <path>` from the MCP CLI args.
+#         Carries Chromium pass-through flags via
+#         browser.launchOptions.args (the schema-supported plumbing
+#         for command-line flags that aren't exposed at the MCP CLI).
+#
+#   /etc/claude-code/managed-settings.json
+#       — Claude Code managed settings (highest-precedence permission
+#         scope; cannot be overridden by user/project/CLI). Carries
+#         a `permissions.deny` array derived from `denied_tools` below.
+#
+# Two placeholders are resolved in the rendered extra-mcps.json:
+#   __PLAYWRIGHT_MCP_BIN__  -> $(command -v mcp-server-playwright)
+#   __CONFIG_PATH__         -> the --out-config path passed to the
+#                              renderer (matches where the config
+#                              JSON is actually written).
+#
+# --- WS2 (source-level tool restriction) — canonical mechanism --------
+#
+# The upstream Playwright MCP README explicitly states "Playwright MCP
+# is not a security boundary" — tool restriction is the MCP CLIENT's
+# responsibility. In our deployment the client is the spawned
+# `claude -p`, which is Claude Code; Claude Code's managed-settings
+# permission system is the documented mechanism.
+#
+# Deny rules in `/etc/claude-code/managed-settings.json` take ABSOLUTE
+# precedence: not overridable by `--allowedTools`, not bypassable by
+# `--permission-mode bypassPermissions`. The MCP tool name format is
+# `mcp__<server>__<tool>` — for this role's `playwright` server entry
+# in spawn-mcp.json, the prefix is `mcp__playwright__`.
+#
+# Earlier attempts that didn't pan out, documented for future maintainers:
+#   - @playwright/mcp's `--allowed-tools` CLI flag — removed in 0.0.41+.
+#   - The schema's `capabilities` field — additive, not replacement;
+#     `core` is always exposed and includes browser_evaluate.
+#   - A stdio JSON-RPC passthrough wrapper — over-engineered; the
+#     upstream README points at the client (Claude Code) as the
+#     correct restriction layer.
+#
+# Verification: PLAN/stage_b1_test.sh Phase 6 asserts the managed-
+# settings file is in place with the expected deny rules. The full
+# end-to-end check (a spawned claude calling browser_evaluate gets
+# denied) costs Claude tokens and stays in the manual runbook
+# (PLAN/STAGE_BACKEND_MCP_B1_test.md Phase 7 second half).
+
+mcpServers:
+  playwright:
+    # dumb-init subreaper for the Playwright -> Chromium -> renderer
+    # subprocess tree. Pairs with the substrate's container-level --init
+    # flag (which reaps at PID 1) as belt-and-suspenders.
+    command: dumb-init
+    args:
+      - "--"
+      # The npm-globally-installed binary, resolved at image build.
+      # Per substrate SB3: install-at-build, never `npx -y`.
+      - "__PLAYWRIGHT_MCP_BIN__"
+      # MCP-level CLI flags (verified against 0.0.41 --help).
+      - "--headless"                    # no display server
+      - "--browser=chromium"            # pin explicitly even though it's default
+      - "--no-sandbox"                  # Chromium under nested sysbox+crun:
+                                        #   user-ns sandbox can't initialize
+      - "--isolated"                    # in-memory profile, no disk persistence.
+                                        #   Reinforces WS4: cross-call cache
+                                        #   poisoning is structurally impossible.
+      - "--image-responses=omit"        # don't include screenshot bytes in
+                                        #   tool responses; AT consumer doesn't
+                                        #   need them.
+      # Chromium-level flags ride in via the config file.
+      - "--config=__CONFIG_PATH__"
+
+# Chromium command-line flags. Rendered into the MCP config file's
+# browser.launchOptions.args array. The MCP CLI in 0.0.41 does NOT
+# accept these directly — `--config <path>` is the supported plumbing.
+chromium_args:
+  - "--disable-dev-shm-usage"               # use regular tmpfile for shm
+                                             #   (avoids supervisor shm pressure)
+  - "--blink-settings=imagesEnabled=false"  # don't decode images
+                                             #   (AT consumer doesn't need them)
+
+# Tools denied at the Claude-Code client level. Rendered into
+# /etc/claude-code/managed-settings.json's `permissions.deny` array as
+# `mcp__playwright__<name>`. Deny rules at managed-settings precedence
+# cannot be overridden — they fire even with --permission-mode
+# bypassPermissions, which is what the substrate's spawn.sh uses.
+#
+# Rationale stays inline so future maintainers see WHY each tool is
+# denied without having to git-blame.
+#
+# Note on tools-inventory.md: the substrate's live tools/list query
+# (SB2) is direct to the Playwright MCP and does NOT pass through
+# Claude Code's permission layer — so denied tools STILL appear in
+# tools-inventory.md. role.md notes this so the spawned claude
+# doesn't try to call them.
+denied_tools:
+  browser_evaluate: >-
+    Runs arbitrary JavaScript in page context. Prompt-injection via
+    fetched HTML / accessibility-tree text -> arbitrary JS execution
+    -> cred exfil / lateral movement. Load-bearing WS2 exclusion.
+  browser_handle_dialog: >-
+    Auto-confirms native dialogs. AT-based workflows read dialog text
+    and navigate around. Programmatic confirmation is an injection
+    vector ("the page asked to confirm — claude said yes").
+  browser_drag: >-
+    UI-interaction primitive of last resort. AT-driven research
+    workflows don't need drag; pages requiring it are unsuitable.
+  browser_file_upload: >-
+    Out of scope for AT-driven web RESEARCH. Re-evaluate if a future
+    task body shape demands form-attachment workflows.
+  browser_pdf_save: >-
+    Out of v1 publish-surface scope (WS3 — log-only v1). Re-enable
+    if a B.1.1 follow-on adds a snapshots/ publish surface.
+  browser_install: >-
+    Chromium is installed at image build time (SB3). A runtime
+    browser-fetch tool contradicts install-at-build and pulls a
+    third-party binary into the live container.
+  browser_resize: >-
+    Viewport changes don't help an accessibility-tree consumer.

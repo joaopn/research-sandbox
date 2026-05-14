@@ -1,0 +1,128 @@
+FROM rs-role-mcp-base:latest
+
+# websearcher — browser-driven web-research role-MCP. Bakes in:
+#   - role.md / summarize.md / skills/                  (per-call methodology)
+#   - extra-mcps.json (rendered from extra-mcps.yaml)   (substrate SB1 hook)
+#   - dump-tools.sh                                     (Phase 7 token-free verify)
+#   - Node + @playwright/mcp + Chromium runtime         (the actual tool)
+#
+# The substrate's entrypoint.role-mcp.sh discovers /opt/role-mcp/role/
+# extra-mcps.json at boot, merges it into spawn-mcp.json, and renders
+# the "Image-baked tools" section of tools-inventory.md via a live
+# tools/list query against the launched Playwright server. Every spawned
+# `claude -p` sees the Playwright tools through the standard --mcp-config
+# path — no daemon code change needed.
+
+USER root
+
+# --- Pinned versions ---------------------------------------------------------
+# Bumps are deliberate: edit the ARG, `python research.py start --rebuild`,
+# destroy + recreate affected projects. Same discipline as DOCKER_VERSION
+# and CODE_SERVER_VERSION in Dockerfile.supervisor.
+ARG NODE_MAJOR=22
+ARG PLAYWRIGHT_MCP_VERSION=0.0.41
+ARG PYYAML_VERSION=6.0.2
+
+# --- Node.js + dumb-init -----------------------------------------------------
+# Node is required for @playwright/mcp (an npm package whose bundled
+# Playwright runtime drives Chromium). NodeSource lets us pin a major
+# version cleanly, rather than rely on whatever Debian ships.
+#
+# dumb-init wraps the Playwright stdio server at runtime (see
+# extra-mcps.yaml's command field) so the Playwright -> Chromium ->
+# renderer subprocess tree reaps cleanly when the spawned claude exits.
+# Belt-and-suspenders with the substrate's container-level --init flag.
+RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends nodejs dumb-init && \
+    rm -rf /var/lib/apt/lists/* && \
+    node --version && npm --version && dumb-init --version
+
+# --- pyyaml for the render step ---------------------------------------------
+# extra-mcps.yaml is the source-of-truth for the Playwright launch spec.
+# render-extra-mcps.py reads it at image build and emits extra-mcps.json.
+# pyyaml is build-time-only but harmless to leave installed.
+RUN /opt/conda/bin/pip install --no-cache-dir "pyyaml==${PYYAML_VERSION}"
+
+# --- @playwright/mcp + Chromium runtime --------------------------------------
+# Install at image-build per substrate SB3 — never `npx -y` at runtime.
+# PLAYWRIGHT_BROWSERS_PATH puts the downloaded Chromium binary in a
+# system-wide location instead of $HOME/.cache (default), so the runtime
+# `worker` user reads from the same path the build-time root install
+# wrote to.
+#
+# `--with-deps` runs apt-get to install Chromium's required system
+# libraries (libnss3, libnspr4, libatk1.0, libcups2, libxkbcommon0,
+# libgbm1, libasound2, etc.) — Playwright maintains the list per
+# version. cd into the global @playwright/mcp dir so its bundled
+# playwright (a peer of mcp-server-playwright) drives the install,
+# guaranteeing the Chromium version matches what the MCP will launch.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
+RUN npm install -g "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" && \
+    mkdir -p ${PLAYWRIGHT_BROWSERS_PATH} && \
+    cd "$(npm root -g)/@playwright/mcp" && \
+    PATH="$PWD/node_modules/.bin:$PATH" \
+        playwright install --with-deps chromium && \
+    chmod -R a+rX ${PLAYWRIGHT_BROWSERS_PATH} && \
+    rm -rf /var/lib/apt/lists/*
+
+# --- Role files --------------------------------------------------------------
+COPY container/role-mcp/websearcher/role.md         /opt/role-mcp/role/role.md
+COPY container/role-mcp/websearcher/summarize.md    /opt/role-mcp/role/summarize.md
+COPY container/role-mcp/websearcher/skills/         /opt/role-mcp/role/skills/
+COPY container/role-mcp/websearcher/dump-tools.sh   /opt/role-mcp/role/dump-tools.sh
+
+# --- Render the three image-baked JSON artifacts ----------------------------
+# The YAML carries the declarative launch spec AND the tool-restriction
+# deny list. The renderer emits three derived artifacts:
+#
+#   /opt/role-mcp/role/extra-mcps.json
+#       Substrate's image-baked merge hook input.
+#
+#   /opt/role-mcp/role/playwright-mcp-config.json
+#       Playwright MCP config (referenced via `--config <path>` from
+#       the MCP CLI args). Carries browser.launchOptions.args because
+#       @playwright/mcp@0.0.41+ does not accept Chromium-level flags
+#       on the CLI directly.
+#
+#   /etc/claude-code/managed-settings.json
+#       Claude Code managed settings — the highest-precedence permission
+#       scope. Carries permissions.deny derived from YAML's denied_tools
+#       mapping. Per the Claude Code docs, deny rules at this scope
+#       cannot be overridden by --allowedTools, project settings, or
+#       --permission-mode bypassPermissions. This is the canonical
+#       client-side mechanism the upstream Playwright MCP README points
+#       at: "Playwright MCP is not a security boundary — tool-level
+#       sandboxing must be enforced at the MCP client level."
+#
+# Two placeholders resolved in the rendered extra-mcps.json:
+#   __PLAYWRIGHT_MCP_BIN__  -> $(command -v mcp-server-playwright)
+#   __CONFIG_PATH__         -> the --out-config path below
+COPY container/role-mcp/websearcher/extra-mcps.yaml         /tmp/extra-mcps.yaml
+COPY container/role-mcp/websearcher/render-extra-mcps.py    /tmp/render-extra-mcps.py
+RUN mkdir -p /etc/claude-code && \
+    /opt/conda/bin/python3 /tmp/render-extra-mcps.py \
+        --yaml                 /tmp/extra-mcps.yaml \
+        --bin                  "$(command -v mcp-server-playwright)" \
+        --out-extra            /opt/role-mcp/role/extra-mcps.json \
+        --out-config           /opt/role-mcp/role/playwright-mcp-config.json \
+        --out-managed-settings /etc/claude-code/managed-settings.json && \
+    chmod 644 /etc/claude-code/managed-settings.json && \
+    rm /tmp/extra-mcps.yaml /tmp/render-extra-mcps.py
+
+# --- Version marker ---------------------------------------------------------
+# Acceptance runbook Phase 15 cats this file and compares against the
+# installed binary's --version output. Keeps drift between the ARG pin
+# and the actual installed package visible.
+RUN echo "${PLAYWRIGHT_MCP_VERSION}" > /opt/role-mcp/role/.playwright-mcp-version
+
+# --- Permissions ------------------------------------------------------------
+RUN chmod +x /opt/role-mcp/role/dump-tools.sh && \
+    chown -R worker:worker /opt/role-mcp/role
+
+# Surface the pinned version on the image's ENV so the runbook Phase 1
+# `docker image inspect` check finds it without needing a running container.
+ENV PLAYWRIGHT_MCP_VERSION=${PLAYWRIGHT_MCP_VERSION}
+
+USER worker
+WORKDIR /workspace
