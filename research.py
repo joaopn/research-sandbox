@@ -53,18 +53,6 @@ import role_mcp  # noqa: E402
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-# Host-side cache of an authed supervisor's Claude auth state. Two files,
-# gitignored, populated by `research auth cache <project>` and consumed
-# by `cmd_project_create` to pre-stage into the new project. Both files
-# are needed because claude's auth lives in two places: the OAuth token
-# at ~/.claude/.credentials.json, and the `oauthAccount` claim (plus
-# onboarding state, default model, etc.) at ~/.claude.json. With only
-# the former, claude treats the user as logged-out and prompts for
-# /login on interactive UI startup even though headless `claude -p`
-# calls work fine.
-CREDS_CACHE_PATH = SCRIPT_DIR / ".cache" / "credentials_claude.json"
-CLAUDE_JSON_CACHE_PATH = SCRIPT_DIR / ".cache" / "claude.json"
-
 SUPERVISOR_IMAGE = "rs-supervisor:latest"
 ANALYSIS_IMAGE = "rs-analysis-base:latest"
 MCP_PROXY_IMAGE = "rs-mcp-proxy:latest"
@@ -832,40 +820,6 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     if extra_mounts:
         docker_args = docker_args[:-1] + extra_mounts + [docker_args[-1]]
 
-    # 3b. Pre-stage cached Claude auth state into the workspace so the
-    #     supervisor's entrypoint can restore it on first boot. Two
-    #     drop points, one per cache file:
-    #       <workspace>/.creds-stash/.credentials.json → ~/.claude/.credentials.json
-    #       <workspace>/.creds-stash-home.json         → ~/.claude.json
-    #     `.claude.json` lives at $HOME root, NOT under .claude/, so it
-    #     needs its own stash sibling rather than nesting inside the dir
-    #     stash. With both staged, deferred role-MCP / PI activations
-    #     run inline (step 6d/6e) AND interactive `claude` in the
-    #     supervisor's byobu skips the /login prompt.
-    #     Opt-out: --no-creds-cache or `research auth clear`.
-    no_creds_cache = bool(getattr(args, "no_creds_cache", False))
-    creds_staged_from_cache = False
-    home_json_staged = False
-    if not no_creds_cache and CREDS_CACHE_PATH.is_file():
-        stash = workspace_path / ".creds-stash"
-        stash.mkdir(parents=True, exist_ok=True)
-        target = stash / ".credentials.json"
-        shutil.copy2(CREDS_CACHE_PATH, target)
-        os.chmod(target, 0o600)
-        creds_staged_from_cache = True
-        rel = CREDS_CACHE_PATH.relative_to(SCRIPT_DIR)
-        print(f"staged cached creds from {rel}")
-        if CLAUDE_JSON_CACHE_PATH.is_file():
-            home_target = workspace_path / ".creds-stash-home.json"
-            shutil.copy2(CLAUDE_JSON_CACHE_PATH, home_target)
-            os.chmod(home_target, 0o600)
-            home_json_staged = True
-            rel_h = CLAUDE_JSON_CACHE_PATH.relative_to(SCRIPT_DIR)
-            print(f"staged ~/.claude.json from {rel_h}")
-        else:
-            print("warning: ~/.claude.json not in cache; interactive `claude` "
-                  "in this project will prompt for /login on first run")
-
     # 4. Create container.
     run_check(["docker", *docker_args])
 
@@ -990,28 +944,16 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     pending = bool(pending_role_mcps or pending_pi_roles)
 
     steps: list[str] = []
-    # Step 1 — auth. Conditionalized on whether the cache staged usable
-    # creds. If yes, the supervisor SHOULD already be authed (the entry-
-    # point restored .creds-stash on first boot); operator only needs to
-    # re-OAuth if the cached refresh token has expired (claude says
-    # "Not logged in" on first use).
-    if creds_staged_from_cache and creds_present:
-        steps.append(
-            "  1. Cached Claude creds were staged into the supervisor; "
-            "no OAuth needed.\n"
-            "     If `claude` later prints `Not logged in` (cached refresh "
-            "token expired),\n"
-            f"     `python research.py project attach {project}` to re-"
-            "OAuth, then\n"
-            f"     `python research.py auth cache {project}` to refresh "
-            "the cache."
-        )
-    else:
-        steps.append(
-            "  1. Authenticate Claude Code inside the supervisor (once per project):\n"
-            f"     `python research.py project attach {project}`, then in byobu run\n"
-            "     `claude` and complete the device-code flow in a local browser."
-        )
+    # Step 1 — interactive auth. Each project's supervisor is the source
+    # of truth for its own credentials; there is no host-side cache and
+    # no cross-project sharing. Operator runs `claude` once per project,
+    # completes the device-code flow, and the supervisor holds those
+    # creds for every downstream surface in this project from then on.
+    steps.append(
+        "  1. Authenticate Claude Code inside the supervisor (once per project):\n"
+        f"     `python research.py project attach {project}`, then in byobu run\n"
+        "     `claude` and complete the device-code flow in a local browser."
+    )
 
     if pending:
         cmds: list[str] = []
@@ -1030,15 +972,6 @@ def cmd_project_create(args: argparse.Namespace) -> None:
             f"     {reason}",
             "\n".join(cmds),
         ]
-        # Discoverability: if the operator doesn't have a host-side creds
-        # cache yet, point at the one-time `auth cache` that would skip
-        # this whole step on every future project.
-        if not CREDS_CACHE_PATH.is_file():
-            step_lines.append(
-                f"     tip: run `python research.py auth cache {project}` "
-                "after authenticating\n"
-                "          to skip OAuth on future `project create` invocations."
-            )
         steps.append("\n".join(step_lines))
     steps.append(
         f"  {len(steps)+1}. Start working on a problem with the supervisor."
@@ -2527,12 +2460,8 @@ def _role_mcp_stage_creds(supervisor: str, role: str) -> None:
     # different namespace) can't write to them. Failure mode is
     # silent until the daemon tries its first write.
     #
-    # `.claude.json` (sibling of ~/.claude/, at $HOME root) is staged
-    # under the sentinel name `home_claude.json` inside .creds/; the
-    # role-MCP entrypoint extracts it to ~/.claude.json (NOT into
-    # ~/.claude/). Without this, claude inside the role-MCP container
-    # has no `oauthAccount` claim and `claude -p` invocations fail
-    # auth even though `.credentials.json` is valid.
+    # Role-MCPs only spawn headless `claude -p`, which works from
+    # `.credentials.json` alone — no `~/.claude.json` propagation here.
     script = f"""
         set -e
         if [ ! -f /home/research/.claude/.credentials.json ]; then
@@ -2553,11 +2482,6 @@ def _role_mcp_stage_creds(supervisor: str, role: str) -> None:
             jq 'del(.hooks)' /home/research/.claude/settings.json \
                > /workspace/.role-mcps/{role}/.creds/settings.json
             chmod 600 /workspace/.role-mcps/{role}/.creds/settings.json
-        fi
-        if [ -f /home/research/.claude.json ]; then
-            cp /home/research/.claude.json \
-               /workspace/.role-mcps/{role}/.creds/home_claude.json
-            chmod 600 /workspace/.role-mcps/{role}/.creds/home_claude.json
         fi
     """
     r = run(["docker", "exec", supervisor, "bash", "-eu", "-c", script],
@@ -3089,8 +3013,16 @@ def _pi_stage_creds(supervisor: str, role: str) -> None:
             chmod 600 /workspace/.pi/{short}/.creds/settings.json
         fi
         if [ -f /home/research/.claude.json ]; then
-            cp /home/research/.claude.json \
-               /workspace/.pi/{short}/.creds/home_claude.json
+            # Filter ~/.claude.json to the PI allowlist before staging.
+            # The supervisor's raw file carries `projects[<cwd>]` — per-
+            # cwd prompt history, allowedTools, mcpContextUris — which
+            # would leak into the PI's claude /resume UI if propagated
+            # whole. Keep only the keys interactive `claude` needs to
+            # skip /login. Same expression used by pi-creds-watch.sh
+            # and rs-pi sync-creds at live-refresh time.
+            jq '{{oauthAccount, userID, hasCompletedOnboarding, lastOnboardingVersion}} | with_entries(select(.value != null))' \
+               /home/research/.claude.json \
+               > /workspace/.pi/{short}/.creds/home_claude.json
             chmod 600 /workspace/.pi/{short}/.creds/home_claude.json
         fi
     """
@@ -3771,150 +3703,6 @@ def cmd_webui_cert_tailscale() -> None:
               f"warning — the cert covers {fqdn} only)")
 
 
-# ---------------------------------------------------------------------------
-# Host-side Claude creds cache (CREDS_CACHE_PATH)
-# ---------------------------------------------------------------------------
-
-
-def _format_iso_utc(epoch: float) -> str:
-    """ISO-8601 UTC with second precision, no microseconds."""
-    return (
-        datetime.datetime.fromtimestamp(epoch, tz=datetime.timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-
-
-def _atomic_write_bytes(path: Path, payload: bytes, mode: int = 0o600) -> None:
-    """Atomic-rename write with explicit perms on the temp file before
-    rename, mirroring the mcp_registry.save_atomic pattern."""
-    tmp = path.with_suffix(path.suffix + ".tmp") if path.suffix else \
-          path.with_name(path.name + ".tmp")
-    tmp.write_bytes(payload)
-    os.chmod(tmp, mode)
-    tmp.replace(path)
-
-
-def _docker_exec_cat(container: str, path: str) -> bytes | None:
-    """Read a file from inside a running container. Returns None if the
-    file is absent or empty (does NOT die — caller decides)."""
-    r = run(["docker", "exec", container, "test", "-s", path],
-            capture_output=True)
-    if r.returncode != 0:
-        return None
-    r = run(["docker", "exec", container, "cat", path], capture_output=True)
-    if r.returncode != 0 or not r.stdout:
-        return None
-    return r.stdout.encode() if isinstance(r.stdout, str) else r.stdout
-
-
-def cmd_auth_cache(args: argparse.Namespace) -> None:
-    """Snapshot a running project's supervisor Claude auth state into the
-    host cache. Captures BOTH:
-      - ~/.claude/.credentials.json (OAuth tokens)
-      - ~/.claude.json (oauthAccount claim, onboarding state, default model)
-
-    Both are required for interactive `claude` to skip the /login prompt
-    on a freshly-staged supervisor. Headless `claude -p` only needs the
-    first; orchestration (role-MCP enable, worker spawn) works without
-    the second.
-
-    Uses `docker exec cat` rather than `docker cp` because the latter has
-    a known sysbox-runc issue with dotfile sources. Atomic-rename writes
-    so concurrent `project create` invocations always see consistent
-    snapshots."""
-    supervisor = _require_project(args.project)
-    if not container_running(supervisor):
-        die(f"project {args.project!r} is not running; bring it up first")
-
-    creds_bytes = _docker_exec_cat(
-        supervisor, "/home/research/.claude/.credentials.json")
-    if creds_bytes is None:
-        die(f"project {args.project!r} has no supervisor creds yet; "
-            f"run `claude` inside its supervisor first to complete OAuth, "
-            f"then re-run this command")
-
-    home_json_bytes = _docker_exec_cat(supervisor, "/home/research/.claude.json")
-
-    CREDS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    os.chmod(CREDS_CACHE_PATH.parent, 0o700)
-
-    _atomic_write_bytes(CREDS_CACHE_PATH, creds_bytes)
-    rel_creds = CREDS_CACHE_PATH.relative_to(SCRIPT_DIR)
-    print(f"cached creds from project {args.project!r} -> {rel_creds} "
-          f"({len(creds_bytes)} bytes)")
-
-    if home_json_bytes is not None:
-        _atomic_write_bytes(CLAUDE_JSON_CACHE_PATH, home_json_bytes)
-        rel_home = CLAUDE_JSON_CACHE_PATH.relative_to(SCRIPT_DIR)
-        print(f"cached ~/.claude.json -> {rel_home} "
-              f"({len(home_json_bytes)} bytes)")
-    else:
-        # ~/.claude.json missing is unusual for a project that's been
-        # OAuth'd interactively. Warn but don't die — the cache is still
-        # useful for headless orchestration.
-        CLAUDE_JSON_CACHE_PATH.unlink(missing_ok=True)
-        print(f"warning: ~/.claude.json absent in supervisor {args.project!r}; "
-              "cache will skip the oauthAccount claim and the next staged "
-              "supervisor will prompt for /login on interactive `claude` "
-              "even though headless `claude -p` will work")
-    print(f"  to refresh: re-run this command. to disable: "
-          f"`research auth clear` or `project create --no-creds-cache`.")
-
-
-def cmd_auth_status(args: argparse.Namespace) -> None:
-    """Show cache presence + mtime + byte length for both cache files
-    (.credentials.json and ~/.claude.json). Warns if any cache file is
-    more permissive than 0600."""
-    if not CREDS_CACHE_PATH.is_file():
-        print("(no cache)")
-        return
-
-    def _report(path: Path, label: str, required: bool) -> None:
-        rel = path.relative_to(SCRIPT_DIR)
-        if not path.is_file():
-            tag = "MISSING (required)" if required else "(not cached)"
-            print(f"  {label}: {tag}")
-            return
-        st = path.stat()
-        print(f"  {label}: {rel}")
-        print(f"    mtime: {_format_iso_utc(st.st_mtime)}")
-        print(f"    bytes: {st.st_size}")
-        perm = st.st_mode & 0o777
-        if perm & 0o077:
-            print(f"    WARNING: permissions {oct(perm)} are looser than 0600; "
-                  f"`chmod 600 {rel}` to tighten")
-
-    print("cache present:")
-    _report(CREDS_CACHE_PATH, ".credentials.json", required=True)
-    _report(CLAUDE_JSON_CACHE_PATH, "~/.claude.json", required=False)
-    if not CLAUDE_JSON_CACHE_PATH.is_file():
-        print("  note: missing ~/.claude.json means interactive `claude` "
-              "will prompt for /login on freshly-staged projects;")
-        print("  re-cache from a supervisor that has both files via "
-              "`research auth cache <project>`.")
-
-
-def cmd_auth_clear(args: argparse.Namespace) -> None:
-    """Remove both cache files. Leaves the parent dir intact in case
-    future co-tenants land in `.cache/`. Idempotent when absent."""
-    targets = [p for p in (CREDS_CACHE_PATH, CLAUDE_JSON_CACHE_PATH)
-               if p.is_file()]
-    if not targets:
-        print("(no cache; nothing to clear)")
-        return
-    if not args.yes:
-        rels = ", ".join(str(p.relative_to(SCRIPT_DIR)) for p in targets)
-        reply = input(f"remove {rels}? [y/N] ").strip().lower()
-        if reply not in ("y", "yes"):
-            print("aborted")
-            return
-    for p in targets:
-        p.unlink(missing_ok=True)
-    print("cache cleared")
-
-
 def cmd_webui(args: argparse.Namespace) -> None:
     """Manage the optional webui container (start | stop | status | import |
     cert-tailscale)."""
@@ -4079,13 +3867,6 @@ def build_parser() -> argparse.ArgumentParser:
                         "(disabled, container not running, host unreachable) print "
                         "a warning and skip; the project still comes up. Add or "
                         "remove later with `research project mcp allow|deny|sync`.")
-    c.add_argument("--no-creds-cache", action="store_true",
-                   help="skip the host-side Claude creds cache for this "
-                        "project even if a cache is populated. Default: "
-                        "if `.cache/credentials_claude.json` exists, "
-                        "pre-stage it so the supervisor boots authed and "
-                        "deferred role-MCP / PI activations run inline. "
-                        "See `research auth cache --help`.")
     c.set_defaults(func=cmd_project_create)
 
     a = proj_sub.add_parser("attach", help="docker exec + byobu attach")
@@ -4461,37 +4242,6 @@ def build_parser() -> argparse.ArgumentParser:
                     "`sudo tailscale up --operator=$USER` set once.",
     )
     wct.set_defaults(func=cmd_webui)
-
-    # ----- auth (host-side Claude creds cache) --------------------------
-    au = sub.add_parser(
-        "auth",
-        help="manage the host-side Claude creds cache (cache / status / "
-             "clear). The cache pre-stages an authed supervisor's "
-             "`.credentials.json` so future `project create` invocations "
-             "boot the new supervisor already authenticated and run "
-             "deferred role-MCP / PI activations inline.",
-    )
-    au_sub = au.add_subparsers(dest="auth_action", required=True)
-
-    aus = au_sub.add_parser(
-        "cache",
-        help="snapshot a running project's supervisor creds to the host "
-             "cache (overwrites any prior cache)",
-    )
-    aus.add_argument("project")
-    aus.set_defaults(func=cmd_auth_cache)
-
-    aut = au_sub.add_parser("status",
-                            help="show cache presence, mtime, and "
-                                 "redacted byte length")
-    aut.set_defaults(func=cmd_auth_status)
-
-    auc = au_sub.add_parser("clear",
-                            help="remove the cache file (interactive "
-                                 "confirm unless --yes)")
-    auc.add_argument("--yes", action="store_true",
-                     help="skip the interactive confirmation")
-    auc.set_defaults(func=cmd_auth_clear)
 
     return p
 

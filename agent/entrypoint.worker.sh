@@ -41,14 +41,6 @@ if [[ -f /workspace/.claude/settings.json ]]; then
     mkdir -p ~/.claude
     cp /workspace/.claude/settings.json ~/.claude/settings.json
 fi
-# ~/.claude.json (sibling of ~/.claude/, carrying `oauthAccount` claim).
-# Staged by rs-worker spawn under the sentinel name `home_claude.json`
-# inside .claude/ to avoid colliding with the dir convention. Without
-# this, the worker's claude treats the user as logged-out.
-if [[ -f /workspace/.claude/home_claude.json ]]; then
-    cp /workspace/.claude/home_claude.json ~/.claude.json
-    chmod 600 ~/.claude.json
-fi
 
 cd /workspace
 export PATH="$HOME/.local/bin:/opt/conda/bin:$PATH"

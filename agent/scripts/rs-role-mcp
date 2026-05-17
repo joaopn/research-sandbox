@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# rs-role-mcp — supervisor-side CLI for role-MCP containers.
+#
+# Dual-surface companion to `research project role-mcp` (host-side).
+# rs-role-mcp lives inside the supervisor image and exposes:
+#
+#   rs-role-mcp list          list running role-MCP containers + their IPs.
+#   rs-role-mcp sync-creds    manually re-stage supervisor creds into every
+#                             running role-MCP container. Mirrors the
+#                             `rs-pi sync-creds` shape exactly.
+#
+# Why this script exists: role-MCP containers stage Claude creds at boot
+# from a bind-mounted source and never refresh them mid-life. When the
+# supervisor re-OAuths (refresh-token rotation, manual /login), every
+# running role-MCP keeps its frozen-in-time ~/.claude/.credentials.json
+# and the next `send_job` fails with HTTP 401 from api.anthropic.com.
+# sync-creds is the manual fallback. There is no inotify-driven watcher
+# for role-MCP creds (deliberate; see STAGE_ROLE_MCP_SYNC_CREDS.md RS6
+# for the rationale).
+#
+# This script is baked into the supervisor image and lives at
+# /usr/local/bin/rs-role-mcp. Role-MCP containers themselves don't need
+# rs-role-mcp — they are managed from the supervisor, never from inside.
+
+set -euo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+usage: rs-role-mcp <subcommand>
+
+  rs-role-mcp list          list running role-MCP containers
+  rs-role-mcp sync-creds    propagate supervisor creds to every running
+                            role-MCP container (~/.claude/.credentials.json)
+EOF
+    exit 2
+}
+
+if [[ $# -eq 0 ]]; then
+    usage
+fi
+
+cmd_list() {
+    # Inner-dockerd ps filtered by the research.role_mcp label set on every
+    # role-MCP container by _role_mcp_start.
+    docker ps --filter 'label=research.role_mcp' \
+              --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
+}
+
+cmd_sync_creds() {
+    local src=/home/research/.claude/.credentials.json
+    if [[ ! -s "$src" ]]; then
+        echo "rs-role-mcp sync-creds: supervisor not authenticated (missing $src)" >&2
+        exit 1
+    fi
+    local names
+    names=$(docker ps --filter 'label=research.role_mcp' --format '{{.Names}}')
+    if [[ -z "$names" ]]; then
+        echo "rs-role-mcp sync-creds: no role-MCP containers running"
+        return 0
+    fi
+    local touched_creds=0 unchanged_creds=0
+    local sup_hash
+    sup_hash=$(sha256sum "$src" | cut -d' ' -f1)
+    while IFS= read -r cn; do
+        [[ -z "$cn" ]] && continue
+        local rmc_hash
+        rmc_hash=$(docker exec "$cn" sha256sum /home/worker/.claude/.credentials.json 2>/dev/null | cut -d' ' -f1 || true)
+        if [[ "$sup_hash" == "$rmc_hash" ]]; then
+            echo "$cn: .credentials.json matches (no-op)"
+            unchanged_creds=$((unchanged_creds+1))
+            continue
+        fi
+        # docker cp into a staging path then install with the right
+        # ownership and mode inside the container — `docker cp` doesn't
+        # preserve those cleanly across uid namespaces. Tolerate per-
+        # container failure (next role-MCP, not whole-batch abort).
+        if docker cp "$src" "$cn:/tmp/.credentials.json.new" 2>/dev/null; then
+            if docker exec "$cn" sh -c \
+                    'mkdir -p ~/.claude && install -o worker -g worker -m 0600 /tmp/.credentials.json.new ~/.claude/.credentials.json && rm /tmp/.credentials.json.new' 2>/dev/null; then
+                echo "$cn: .credentials.json updated"
+                touched_creds=$((touched_creds+1))
+            else
+                echo "rs-role-mcp sync-creds: install failed in $cn" >&2
+            fi
+        else
+            echo "rs-role-mcp sync-creds: docker cp to $cn failed" >&2
+        fi
+    done <<< "$names"
+    echo "rs-role-mcp sync-creds: .credentials.json — $touched_creds updated, $unchanged_creds unchanged"
+}
+
+case "$1" in
+    list)        shift; cmd_list "$@" ;;
+    sync-creds)  shift; cmd_sync_creds "$@" ;;
+    -h|--help)   usage ;;
+    *)           echo "rs-role-mcp: unknown subcommand $1" >&2; usage ;;
+esac

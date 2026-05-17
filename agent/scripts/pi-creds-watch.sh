@@ -76,14 +76,30 @@ propagate() {
 # This file rotates rarely (mostly account-claim + preferences), so we
 # don't watch it live — startup propagate + manual `rs-pi sync-creds`
 # covers it. Skipped silently if absent.
+#
+# The supervisor's raw ~/.claude.json carries `projects[<cwd>]` — per-cwd
+# prompt history, allowedTools decisions, mcpContextUris — which would
+# leak into the PI's claude UI if propagated whole. Filter via jq to the
+# four-key allowlist below before docker-cp'ing. Same expression used by
+# rs-pi sync-creds and research.py's `_pi_stage_creds`.
+HOME_JSON_ALLOWLIST_JQ='{oauthAccount, userID, hasCompletedOnboarding, lastOnboardingVersion} | with_entries(select(.value != null))'
+
 propagate_home_json() {
     local src="/home/research/.claude.json"
     [[ -s "$src" ]] || return 0
     local names
     names=$(docker ps --filter 'label=research.pi_role' --format '{{.Names}}' 2>/dev/null || true)
     [[ -z "$names" ]] && return 0
+    local filtered
+    filtered=$(mktemp)
+    if ! jq "$HOME_JSON_ALLOWLIST_JQ" "$src" > "$filtered" 2>/dev/null; then
+        echo "pi-creds-watch: ~/.claude.json jq filter failed; skipping" >&2
+        rm -f "$filtered"
+        return 0
+    fi
+    chmod 600 "$filtered"
     local sup_hash
-    sup_hash=$(sha256sum "$src" | cut -d' ' -f1)
+    sup_hash=$(sha256sum "$filtered" | cut -d' ' -f1)
     while IFS= read -r cn; do
         [[ -z "$cn" ]] && continue
         local pi_hash
@@ -91,16 +107,17 @@ propagate_home_json() {
         if [[ "$sup_hash" == "$pi_hash" ]]; then
             continue
         fi
-        if docker cp "$src" "$cn:/tmp/.claude.json.new" 2>/dev/null; then
+        if docker cp "$filtered" "$cn:/tmp/.claude.json.new" 2>/dev/null; then
             docker exec "$cn" sh -c \
                 'install -o worker -g worker -m 0600 /tmp/.claude.json.new ~/.claude.json && rm /tmp/.claude.json.new' \
                 2>/dev/null || \
                 echo "pi-creds-watch: install ~/.claude.json failed in $cn" >&2
-            echo "pi-creds-watch: propagated ~/.claude.json to $cn" >&2
+            echo "pi-creds-watch: propagated ~/.claude.json to $cn (filtered)" >&2
         else
             echo "pi-creds-watch: docker cp ~/.claude.json to $cn failed" >&2
         fi
     done <<< "$names"
+    rm -f "$filtered"
 }
 
 echo "pi-creds-watch: watching $WATCH_DIR/$WATCH_FILE" >&2

@@ -16,6 +16,7 @@ a destroyed worker's name is tombstoned and can never be reused.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -38,10 +39,6 @@ DEFAULT_IMAGE = "rs-analysis-base:latest"
 # Claude Code CLI writes OAuth creds to a HIDDEN file (leading dot).
 ORCH_CREDS = Path.home() / ".claude" / ".credentials.json"
 ORCH_SETTINGS = Path.home() / ".claude" / "settings.json"
-# Sibling of ~/.claude/ — carries oauthAccount + onboarding state. Without
-# it, claude inside the worker treats the user as logged-out even when
-# .credentials.json is valid.
-ORCH_HOME_JSON = Path.home() / ".claude.json"
 WORKER_CLAUDE_MD_TEMPLATE = Path("/opt/claude-templates/worker.CLAUDE.md.template")
 
 LABEL_WORKER = "research.worker"
@@ -435,12 +432,8 @@ def _stage_workdir(name: str, plan_text: str, fresh: bool) -> Path:
         dest = wdir / ".claude" / "settings.json"
         dest.write_text(json.dumps(data, indent=2) + "\n")
         os.chmod(dest, 0o600)
-    # ~/.claude.json sibling: staged into .claude/ under the sentinel
-    # name `home_claude.json` so the worker entrypoint can extract it to
-    # ~/.claude.json (NOT into ~/.claude/). Tolerant of absence.
-    if ORCH_HOME_JSON.is_file():
-        shutil.copy2(ORCH_HOME_JSON, wdir / ".claude" / "home_claude.json")
-        os.chmod(wdir / ".claude" / "home_claude.json", 0o600)
+    # No ~/.claude.json staged: workers only run headless `claude --print`,
+    # which authenticates from `.credentials.json` alone.
 
     # Clear stale runtime sentinels. Entrypoint does this too (belt+braces).
     for sentinel in ("DONE", "WAITING"):
@@ -970,6 +963,111 @@ def cmd_destroy(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# sync-creds — agentic auth refresh for running workers
+#
+# The supervisor's claude calls this when it observes a worker returning
+# HTTP 401 from api.anthropic.com (or "Not logged in") — typically after
+# a supervisor re-OAuth invalidates the creds the worker staged at spawn
+# time. Mirrors the rs-pi / rs-role-mcp sync-creds shape: hash-compare,
+# docker cp + install on mismatch, idempotent.
+#
+# Updates BOTH the bind-mount source (so a respawn / restart of this
+# worker reads fresh creds) AND the in-container ~/.claude/ (so the
+# live session's next turn uses fresh creds).
+# ---------------------------------------------------------------------------
+
+
+def _docker_cp_install_in(container, src: Path, dest_in_container: str,
+                          owner: str = "worker") -> bool:
+    """Stage `src` into `container:/tmp/<basename>.new` then `install`
+    with the right owner/mode inside the container's namespace and
+    delete the staging file. Pre-creates the destination's parent dir
+    so a worker container that hasn't run its entrypoint yet (e.g.
+    test-fixture sleep-only containers) doesn't fail on a missing
+    `~/.claude/`. Returns True on success, False on any docker failure
+    (tolerant; per-container failures don't abort a batch invocation,
+    mirroring rs-pi sync-creds)."""
+    staging = f"/tmp/{src.name}.new"
+    parent = os.path.dirname(dest_in_container)
+    try:
+        if subprocess.run(
+                ["docker", "cp", str(src), f"{container.name}:{staging}"],
+                check=False).returncode != 0:
+            return False
+        cmd = (f"mkdir -p {parent} && "
+               f"install -o {owner} -g {owner} -m 0600 "
+               f"{staging} {dest_in_container} && rm {staging}")
+        if container.exec_run(["sh", "-c", cmd]).exit_code != 0:
+            return False
+    except APIError:
+        return False
+    return True
+
+
+def cmd_sync_creds(args: argparse.Namespace) -> None:
+    """Push the supervisor's current Claude creds into one running
+    worker (`--name`) or every running worker (no arg). Hash-compares
+    first; updates only stale containers."""
+    if not ORCH_CREDS.is_file():
+        die(f"supervisor not authenticated (missing {ORCH_CREDS}); "
+            f"run `claude` inside the supervisor and complete /login first.")
+    sup_hash = hashlib.sha256(ORCH_CREDS.read_bytes()).hexdigest()
+
+    targets: list = []
+    if args.name:
+        c = _get_container(args.name)
+        if c.status != "running":
+            die(f"worker {args.name!r} is not running "
+                f"(state: {c.status}). sync-creds operates on running "
+                f"workers only; for a down worker, `rs-worker spawn "
+                f"<name> --plan ...` re-stages from the supervisor at "
+                f"spawn time.")
+        targets.append((args.name, c))
+    else:
+        for c in _client().containers.list(
+                all=False, filters={"label": LABEL_WORKER}):
+            bare = c.name.removeprefix(CONTAINER_PREFIX) \
+                if c.name.startswith(CONTAINER_PREFIX) else c.name
+            targets.append((bare, c))
+
+    if not targets:
+        print("rs-worker sync-creds: no running workers")
+        return
+
+    touched_creds = unchanged_creds = 0
+    for name, c in sorted(targets, key=lambda x: x[0]):
+        wdir = worker_dir(name)
+        # Always refresh the bind-mount source so future respawn/restart
+        # reads fresh. Cheap host-side copy.
+        (wdir / ".claude").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ORCH_CREDS, wdir / ".claude" / ".credentials.json")
+        os.chmod(wdir / ".claude" / ".credentials.json", 0o600)
+
+        # In-container refresh (the live session reads the in-container
+        # ~/.claude/.credentials.json, NOT the bind-mount source).
+        try:
+            in_hash = c.exec_run(
+                ["sh", "-c", "sha256sum /home/worker/.claude/.credentials.json "
+                             "2>/dev/null | cut -d' ' -f1"],
+            ).output.decode("utf-8", errors="replace").strip()
+        except APIError:
+            in_hash = ""
+        if in_hash == sup_hash:
+            print(f"{name}: .credentials.json matches (no-op)")
+            unchanged_creds += 1
+        else:
+            if _docker_cp_install_in(
+                    c, ORCH_CREDS, "/home/worker/.claude/.credentials.json"):
+                print(f"{name}: .credentials.json updated")
+                touched_creds += 1
+            else:
+                print(f"rs-worker sync-creds: install failed in {name}",
+                      file=sys.stderr)
+    print(f"rs-worker sync-creds: .credentials.json — {touched_creds} updated, "
+          f"{unchanged_creds} unchanged")
+
+
+# ---------------------------------------------------------------------------
 # attach
 # ---------------------------------------------------------------------------
 
@@ -1363,6 +1461,18 @@ def build_parser() -> argparse.ArgumentParser:
     sd.add_argument("name")
     sd.add_argument("--yes", action="store_true", help="confirm destruction")
     sd.set_defaults(func=cmd_destroy)
+
+    ssc = sub.add_parser(
+        "sync-creds",
+        help="refresh a running worker's Claude creds from the "
+             "supervisor's current ~/.claude/ (idempotent, "
+             "hash-compare). Use after the supervisor re-OAuths, "
+             "or when a worker is failing with HTTP 401 / 'Not "
+             "logged in' against api.anthropic.com. No name -> all "
+             "running workers.")
+    ssc.add_argument("name", nargs="?",
+                     help="worker name (omit to refresh all running workers)")
+    ssc.set_defaults(func=cmd_sync_creds)
 
     sa = sub.add_parser("attach", help="exec into the worker's byobu session")
     sa.add_argument("name")

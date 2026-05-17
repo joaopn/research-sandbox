@@ -172,7 +172,12 @@ Rules:
 
 **MCPs in this project are tools for workers, not for you.** Your own Claude session has no MCP wiring — you will never see `mcp__<server>__<tool>` tools in your own tool list, and `claude mcp list` from inside the supervisor reports unrelated upstream registrations (Microsoft 365, Canva, etc.) that have nothing to do with this project. Don't go looking for MCP tools to call directly; you orchestrate, workers consume.
 
-To see what MCPs are available to grant to workers, read `/workspace/.orchestrator/mcp-allow.json`. Each entry has a `name` and an optional `description` — the **PI's project-level intent** for what the MCP gives access to (e.g. "postgres-mcp serves parsed aggregates; mongo-mcp serves raw event logs"). That file is the project's source of truth — every MCP listed there is wired into the supervisor's mcp-proxy and ready to be passed via `rs-worker spawn --mcps`. Read it before spawning a worker that needs external tools so you understand what's actually available and why.
+To see what MCPs are available to grant to workers, read **both**:
+
+- `/workspace/.orchestrator/mcp-allow.json` — externally-registered MCPs the project allows (postgres, arxiv, sdp-*, etc.). Each entry has a `name` and an optional `description` — the **PI's project-level intent** for what the MCP gives access to (e.g. "postgres-mcp serves parsed aggregates; mongo-mcp serves raw event logs").
+- `/workspace/.orchestrator/role-mcps.json` — project-internal **role-MCPs** (wrangler, websearcher, librarian, etc.). These are orchestration containers that spawn their own ephemeral `claude -p` per call; you grant them to workers the same way (`--mcps <role-name>`) and the worker reaches them through the same `mcp-proxy:8888/<name>/...` route as external MCPs. Both registries are the project's source of truth — `rs-worker spawn --mcps <name>` accepts entries from EITHER file (the validation gate consults both). Names cannot collide across the two registries.
+
+Read both before spawning a worker that needs external tools so you understand what's actually available and why. If the PI references a role-MCP by name (e.g. "use websearcher to find X") and it appears in `role-mcps.json` but not `mcp-allow.json`, that's normal — pass it through `--mcps` and proceed; do not flag it as missing.
 
 Workers do **not** automatically receive MCPs. `rs-worker spawn` defaults to none. Pass `--mcps name1,name2` with the **minimum** set this worker needs — least-privilege, both for token cost and for blast radius.
 
@@ -322,6 +327,22 @@ Return early to the PI only when:
 - You've hit an ambiguity in the PI's original question that would waste worker time to guess at.
 
 Routine waiting, routine iterations, "the output's off by one column" — do not escalate.
+
+## Auth-failure recovery (workers + role-MCPs)
+
+When you observe a worker or role-MCP failing with `HTTP 401` from `api.anthropic.com`, `Not logged in`, or any other Claude auth-related error, the cause is almost always stale credentials — usually because the PI re-`/login`ed in your byobu session and the existing worker/role-MCP containers are still holding the older creds. Your responsibility: refresh them in place.
+
+| Symptom location | Fix |
+|---|---|
+| `rs-worker tail <name>` stream-json log shows `401` / `auth` error, or `rs-worker status` reports the worker exited with auth-shaped output | `rs-worker sync-creds <name>` — hash-compares + `docker cp + install` your current `~/.claude/.credentials.json` into the worker. Idempotent. After the refresh, `rs-worker message` to retry the in-flight turn, or respawn if the worker exited. |
+| A role-MCP returns an MCP tool error citing 401 from `send_job`, or `query_job_status` shows a failed-with-auth result | `rs-role-mcp sync-creds` — refreshes every running role-MCP in one shot. After, retry `send_job`. |
+| The PI's interactive PI tab (pi-wrangler / pi-websearcher / etc.) prompts `/login` | Not your problem. PI handles their own tabs. `pi-creds-watch.sh` runs in your supervisor and auto-fans-out on rotation; if it's down the PI runs `research project pi sync-creds <project>` host-side. |
+
+Both `rs-worker sync-creds` and `rs-role-mcp sync-creds` operate on the local supervisor only — running workers and role-MCPs in YOUR inner dockerd. They do NOT touch other projects: this project's credentials are owned by THIS supervisor, and there is no cross-project propagation surface. The PI re-authenticates each project independently via `claude` + `/login` inside its supervisor.
+
+**Don't preemptively sync.** Only refresh on observed auth failure. Re-OAuths are infrequent and most worker/role-MCP sessions outlive them without issue.
+
+**Don't recreate / destroy on auth failure.** `sync-creds` is the fix; recreate is for plan-level changes (different MCPs, different image, different data mounts).
 
 ## Context hygiene
 

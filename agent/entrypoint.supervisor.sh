@@ -59,7 +59,9 @@ echo supervisor > ~/.rs-role
 #     (which `mv`s ~research/.claude into the workspace bind-mount before
 #     destroying the old container, so the creds survive the swap without
 #     ever touching the host outside the project's own workspace dir).
-#     Also handles host-side cache stages from `research auth cache`.
+#     The stash is purely internal to the recreate/restart machinery —
+#     it's NOT populated by any host-side flow; each project's credentials
+#     are owned by its own supervisor and never cross project boundaries.
 #
 #     Two stash points, restored independently:
 #       /workspace/.creds-stash/        → ~/.claude/  (dir contents)

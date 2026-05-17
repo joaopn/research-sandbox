@@ -50,15 +50,6 @@ fi
 if [[ -f /workspace/.creds/settings.json ]]; then
     cp /workspace/.creds/settings.json ~/.claude/settings.json
 fi
-# Restore ~/.claude.json (the supervisor's sibling-of-.claude/ dotfile,
-# carrying `oauthAccount` + onboarding state). Without it claude treats
-# the spawned process as logged-out and `claude -p` calls fail auth.
-# The supervisor stages it under the sentinel name `home_claude.json`
-# inside .creds/ to avoid colliding with the .claude/-dir convention.
-if [[ -f /workspace/.creds/home_claude.json ]]; then
-    cp /workspace/.creds/home_claude.json ~/.claude.json
-    chmod 600 ~/.claude.json
-fi
 
 # --- Render spawn-mcp.json + tools-inventory.md ----------------------------
 # Two siblings rendered from the same intersection:

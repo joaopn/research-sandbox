@@ -108,6 +108,14 @@ COPY agent/scripts/rs-pi              /usr/local/bin/rs-pi
 COPY agent/scripts/pi-creds-watch.sh  /usr/local/bin/pi-creds-watch
 RUN chmod +x /usr/local/bin/rs-pi /usr/local/bin/pi-creds-watch
 
+# role-MCP-side companion to `rs-pi`. Exposes `list` and `sync-creds`
+# for the worker-facing role-MCP containers. No inotify watcher
+# (deliberate, see STAGE_ROLE_MCP_SYNC_CREDS.md RS6); sync-creds is the
+# manual fallback when a supervisor re-OAuth leaves running role-MCPs
+# with stale ~/.claude/.credentials.json.
+COPY agent/scripts/rs-role-mcp        /usr/local/bin/rs-role-mcp
+RUN chmod +x /usr/local/bin/rs-role-mcp
+
 # --- code-server (browser IDE, second http-kind tab) -----------------------
 #
 # Pinned via ARG, mirroring DOCKER_VERSION discipline. Bumps are deliberate:
