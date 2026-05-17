@@ -51,7 +51,7 @@ propagate() {
     while IFS= read -r cn; do
         [[ -z "$cn" ]] && continue
         local pi_hash
-        pi_hash=$(docker exec "$cn" sha256sum /home/research/.claude/.credentials.json 2>/dev/null | cut -d' ' -f1 || true)
+        pi_hash=$(docker exec "$cn" sha256sum /home/worker/.claude/.credentials.json 2>/dev/null | cut -d' ' -f1 || true)
         if [[ "$sup_hash" == "$pi_hash" ]]; then
             continue
         fi
