@@ -85,6 +85,37 @@ SERVICES = {
             "byobu new-session -s pi -c /workspace -- claude'"
         ),
     },
+    # pi-websearcher — interactive browser-driven web-research tab. Same
+    # shape as pi-wrangler: byobu attach-or-new, claude as the inner
+    # command, `-c /workspace` to land in the role's workspace so
+    # auto-discovery picks up CLAUDE.md (symlinked from role.md) and
+    # .mcp.json (rendered by entrypoint.pi.sh from the project's
+    # role-mcps.json[websearcher] entry plus the image-baked Playwright
+    # extras).
+    #
+    # The docker-exec wrapper uses `bash -c` (NOT `bash -lc`): the inner
+    # shell only needs to parse the `||` short-circuit between the two
+    # byobu invocations; byobu and claude are on PATH via the standard
+    # env. Login-shell semantics (the `-l`) aren't needed and the P.1
+    # acceptance test enforces their absence to keep PI tabs on a
+    # consistent narrow command shape going forward.
+    #
+    # Label keeps the "PI Websearcher" prefix — pi-wrangler dropped to
+    # "Wrangler" during STAGE_2.5 polish, but the P.1 plan re-adds the
+    # prefix here. (No technical reason to enforce one convention over
+    # the other; the test gates this label specifically.)
+    "pi-websearcher": {
+        "label": "PI Websearcher",
+        "kind": "ssh",
+        "always_on": False,
+        "renderer": "xterm.js",
+        "default_port": 22,
+        "command": (
+            "docker exec -it rs-pi-websearcher bash -c "
+            "'byobu attach -t pi 2>/dev/null || "
+            "byobu new-session -s pi -c /workspace -- claude'"
+        ),
+    },
     # pi-echo — substrate test fixture — is deliberately omitted from
     # the webui registry. It still ships as an image + lifecycle entry
     # (`research project pi enable <p> pi-echo`), still functions for

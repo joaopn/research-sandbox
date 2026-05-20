@@ -59,8 +59,9 @@ PI_IPS: dict[str, str] = {
 # _build_images derives the Dockerfile name from the key: role
 # `pi-echo` -> `agent/Dockerfile.pi-echo`.
 PI_IMAGES: dict[str, str] = {
-    "pi-echo":     "rs-pi-echo:latest",
-    "pi-wrangler": "rs-pi-wrangler:latest",
+    "pi-echo":         "rs-pi-echo:latest",
+    "pi-wrangler":     "rs-pi-wrangler:latest",
+    "pi-websearcher":  "rs-pi-websearcher:latest",
 }
 
 # Container-name idiom — same prefix-with-role-name pattern as role-MCPs.

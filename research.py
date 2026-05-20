@@ -3127,10 +3127,27 @@ def _pi_start(supervisor: str, project: str, cfg: "Config",
 def _pi_stop(supervisor: str, role: str) -> None:
     """Stop + remove the PI container in the inner dockerd. Tolerates
     absence — caller may have already removed it via _recreate_supervisor
-    or the supervisor itself may be down."""
+    or the supervisor itself may be down. Verifies removal before
+    returning so the disable contract ("container is gone after this
+    returns") holds even if a future docker version regresses `rm -f`."""
     cname = pi_roles.role_container_name(role)
-    run(["docker", "exec", supervisor, "docker", "rm", "-f", cname],
-        capture_output=True)
+    rm = run(["docker", "exec", supervisor, "docker", "rm", "-f", cname],
+             capture_output=True)
+    # `docker container inspect` (not bare `docker inspect`) — the bare
+    # form falls through to image lookup when no container matches, and
+    # the inner dockerd has an image tagged with the same name as the
+    # container (`rs-pi-<role>:latest` vs `rs-pi-<role>` container), so
+    # bare-inspect would always succeed and falsely report the container
+    # as still present.
+    check = run(["docker", "exec", supervisor,
+                 "docker", "container", "inspect", cname],
+                capture_output=True)
+    if check.returncode == 0:
+        rm_tail = (rm.stderr or rm.stdout or "").strip()[-200:]
+        die(f"PI container {cname!r} still present after disable; "
+            f"docker rm -f tail: {rm_tail!r}. Inspect "
+            f"`docker exec {supervisor} docker container inspect {cname}` "
+            f"manually and retry `research project pi disable`.")
 
 
 def _pi_enable(project: str, cfg: "Config", role: str) -> None:
