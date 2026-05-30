@@ -45,6 +45,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent / "cli"))
 import mcp_registry  # noqa: E402
 import pi as pi_roles  # noqa: E402
+import pi_isolated  # noqa: E402
+import pi_isolated_registry  # noqa: E402
 import role_mcp  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -58,6 +60,7 @@ ANALYSIS_IMAGE = "rs-analysis-base:latest"
 MCP_PROXY_IMAGE = "rs-mcp-proxy:latest"
 ROLE_MCP_BASE_IMAGE = "rs-role-mcp-base:latest"
 PI_BASE_IMAGE = "rs-pi-base:latest"
+PI_ISOLATED_IMAGE = "rs-pi-isolated:latest"
 INNER_NETWORK = "rs-inner"
 WEBUI_IMAGE = "rs-webui:latest"
 WEBUI_CONTAINER = "rs-webui"
@@ -584,6 +587,10 @@ def _build_images(force: bool) -> None:
         (MCP_PROXY_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.mcp-proxy"),
         (ROLE_MCP_BASE_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.role-mcp-base"),
         (PI_BASE_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.pi-base"),
+        # Generic PI-isolated image — FROM rs-pi-base, adds git + the
+        # clone/setup entrypoint. One image for every isolated type; no
+        # per-type Dockerfile (type behavior comes from the cloned repo).
+        (PI_ISOLATED_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.pi-isolated"),
     ]
     for role, image in sorted(role_mcp.ROLE_IMAGES.items()):
         dockerfile = SCRIPT_DIR / "agent" / f"Dockerfile.{role}"
@@ -775,9 +782,10 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     # supervisor is up and creds are ready).
     enable_arg = getattr(args, "enable", None)
     disable_arg = getattr(args, "disable", None)
-    enable_services, enable_role_mcps, enable_pi_roles, enable_no_pi_mirror = \
-        _split_enable_tokens(enable_arg)
-    disable_services, disable_pi_roles = _split_disable_tokens(disable_arg)
+    enable_services, enable_role_mcps, enable_pi_roles, enable_pi_isolated, \
+        enable_no_pi_mirror = _split_enable_tokens(enable_arg)
+    disable_services, disable_pi_roles, disable_pi_isolated = \
+        _split_disable_tokens(disable_arg)
     role_mcp_explicit = _parse_role_mcp_upstream(
         getattr(args, "role_mcp_upstream", None) or [],
         valid_roles=set(enable_role_mcps),
@@ -819,6 +827,14 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     # Inject --data mounts (and any future --mount) into argv just before the image name.
     if extra_mounts:
         docker_args = docker_args[:-1] + extra_mounts + [docker_args[-1]]
+
+    # Pre-wire every registered PI-isolated type's external folder
+    # (<root>/<project>/ → /external/<type>). Computed fresh from the host
+    # registry so enabling a known type later is a pure inner-container op
+    # (no supervisor recreate). See STAGE_PI_ISOLATED "two-hop mount".
+    ext_mounts = _pi_isolated_external_mounts(project)
+    if ext_mounts:
+        docker_args = docker_args[:-1] + ext_mounts + [docker_args[-1]]
 
     # 4. Create container.
     run_check(["docker", *docker_args])
@@ -905,6 +921,26 @@ def cmd_project_create(args: argparse.Namespace) -> None:
                           f"`research project pi enable {project} {role}`",
                           file=sys.stderr)
 
+    # 6f. pi-isolated sugar (--enable <type>). UNLIKE role-MCPs / baked PI
+    #     roles, a PI-isolated agent does NOT require supervisor auth to come
+    #     up: it's a plain sandbox — the entrypoint clones the repo, runs
+    #     setup, and idles, and the tab is a login shell (not claude). The PI
+    #     starts claude / authenticates / pulls skills there, in any order.
+    #     So we always enable, regardless of creds_present. Each type's
+    #     external folder was pre-wired into the supervisor at create (the
+    #     build args above enumerate the registry), so enable is a pure
+    #     inner-container start with no recreate. Creds are still staged if
+    #     present (so a later `claude` skips /login) and tolerated if absent.
+    pi_isolated_enabled: list[str] = []
+    for name in enable_pi_isolated:
+        try:
+            _pi_isolated_enable(project, cfg, name)
+            pi_isolated_enabled.append(name)
+        except SystemExit:
+            print(f"warning: failed to enable pi-isolated {name!r}; "
+                  "retry manually with `research project pi-isolated "
+                  f"enable {project} {name}`", file=sys.stderr)
+
     # 7. Report.
     inner_fw = "on" if getattr(args, "inner_firewall", False) else "off"
     mcps_line = ", ".join(granted) if granted else "(none)"
@@ -941,7 +977,9 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     # The "Next steps" wording reflects the actual cause.
     pending_role_mcps = [r for r in enable_role_mcps if r not in role_mcps_enabled]
     pending_pi_roles = [r for r in enable_pi_roles if r not in pi_roles_enabled]
-    pending = bool(pending_role_mcps or pending_pi_roles)
+    pending_pi_isolated = [n for n in enable_pi_isolated
+                           if n not in pi_isolated_enabled]
+    pending = bool(pending_role_mcps or pending_pi_roles or pending_pi_isolated)
 
     steps: list[str] = []
     # Step 1 — interactive auth. Each project's supervisor is the source
@@ -961,6 +999,8 @@ def cmd_project_create(args: argparse.Namespace) -> None:
             cmds.append(f"       python research.py project role-mcp enable {project} {r}")
         for r in pending_pi_roles:
             cmds.append(f"       python research.py project pi enable {project} {r}")
+        for n in pending_pi_isolated:
+            cmds.append(f"       python research.py project pi-isolated enable {project} {n}")
         # Two failure modes: "creds weren't present" vs "enable raised
         # despite creds present" — different actionable guidance.
         if not creds_present:
@@ -1262,10 +1302,16 @@ def _read_supervisor_metadata(container: str) -> dict:
 
     # Bind-mounts other than /workspace and the privileged-DIND volume —
     # i.e. user-supplied --data paths under /workspace/shared/data/<basename>/.
+    # /external/* (PI-isolated external folders) are deliberately EXCLUDED:
+    # they're recomputed fresh from the host registry on every recreate
+    # (_pi_isolated_external_mounts), so recovering them here would both
+    # double-add and pin stale roots after a registry edit.
     extra_mounts: list[str] = []
     for m in data.get("Mounts") or []:
         dst_in = m.get("Destination", "")
         if dst_in in ("/workspace", "/var/lib/docker"):
+            continue
+        if dst_in.startswith("/external/"):
             continue
         if m.get("Type") != "bind":
             continue
@@ -1411,6 +1457,12 @@ def _recreate_supervisor(
     )
     if md["extra_mounts"]:
         docker_args = docker_args[:-1] + md["extra_mounts"] + [docker_args[-1]]
+    # PI-isolated external folders are recomputed fresh from the host
+    # registry (excluded from md["extra_mounts"]) so the recreate tracks
+    # the current registry — newly-added types appear, removed ones drop.
+    ext_mounts = _pi_isolated_external_mounts(project)
+    if ext_mounts:
+        docker_args = docker_args[:-1] + ext_mounts + [docker_args[-1]]
     # build_supervisor_docker_args emits ["run", "-d", ...]; convert to create.
     assert docker_args[0] == "run" and docker_args[1] == "-d"
     create_args = ["create"] + docker_args[2:]
@@ -1474,6 +1526,21 @@ def _recreate_supervisor(
                   f"`research project pi enable {project} {role}`",
                   file=sys.stderr)
 
+    # Same for PI-isolated agents (STAGE_PI_ISOLATED). The supervisor's
+    # /external/<type> mounts were just recomputed from the registry above,
+    # so every enabled agent's external folder is wired before its inner
+    # container restarts.
+    iso_entries = pi_isolated.load(workspace_path)
+    for name in sorted(iso_entries):
+        try:
+            _pi_isolated_start(container, project, cfg, name,
+                               force_restage=force_restage)
+        except SystemExit:
+            print(f"warning: failed to restart pi-isolated {name!r}; "
+                  f"the entry in pi-isolated.json is intact, retry with "
+                  f"`research project pi-isolated enable {project} {name}`",
+                  file=sys.stderr)
+
 
 def cmd_project_update(args: argparse.Namespace) -> None:
     """Push edited code into a project. Always recreates the supervisor
@@ -1496,9 +1563,10 @@ def cmd_project_update(args: argparse.Namespace) -> None:
     # waste a rebuild before failing.
     enable_arg = getattr(args, "enable", None)
     disable_arg = getattr(args, "disable", None)
-    enable_services, enable_role_mcps, enable_pi_roles, enable_no_pi_mirror = \
-        _split_enable_tokens(enable_arg)
-    disable_services, disable_pi_roles = _split_disable_tokens(disable_arg)
+    enable_services, enable_role_mcps, enable_pi_roles, enable_pi_isolated, \
+        enable_no_pi_mirror = _split_enable_tokens(enable_arg)
+    disable_services, disable_pi_roles, disable_pi_isolated = \
+        _split_disable_tokens(disable_arg)
     role_mcp_explicit = _parse_role_mcp_upstream(
         getattr(args, "role_mcp_upstream", None) or [],
         valid_roles=set(enable_role_mcps),
@@ -1548,6 +1616,16 @@ def cmd_project_update(args: argparse.Namespace) -> None:
             print(f"warning: failed to disable pi role {role!r}",
                   file=sys.stderr)
 
+    # Same ordering rationale for PI-isolated disables: drop the
+    # pi-isolated.json entry before the recreate so its restart loop
+    # doesn't bring the agent back up.
+    for name in disable_pi_isolated:
+        try:
+            _pi_isolated_disable(project, cfg, name)
+        except SystemExit:
+            print(f"warning: failed to disable pi-isolated {name!r}",
+                  file=sys.stderr)
+
     _recreate_supervisor(
         project, cfg,
         force_restage=args.rebuild,
@@ -1582,6 +1660,18 @@ def cmd_project_update(args: argparse.Namespace) -> None:
         except SystemExit:
             print(f"warning: failed to enable pi role {role!r}; retry "
                   f"with `research project pi enable {project} {role}`",
+                  file=sys.stderr)
+
+    # pi-isolated sugar via --enable. The recreate above already enumerated
+    # the registry and mounted every type's /external/<type> folder, so
+    # _pi_isolated_enable here finds the mount present and just starts the
+    # inner container (no second recreate). Idempotent on re-enable.
+    for name in enable_pi_isolated:
+        try:
+            _pi_isolated_enable(project, cfg, name)
+        except SystemExit:
+            print(f"warning: failed to enable pi-isolated {name!r}; retry "
+                  f"with `research project pi-isolated enable {project} {name}`",
                   file=sys.stderr)
 
     print(f"\nproject {project!r} updated.")
@@ -2019,6 +2109,202 @@ def cmd_mcp_disable(args: argparse.Namespace) -> None:
                   f"{len(denied)} project(s): {', '.join(denied)}")
     else:
         print(f"disabled {args.name!r}{suffix}")
+
+
+# ---------------------------------------------------------------------------
+# PI-isolated type registry CLI (STAGE_PI_ISOLATED)
+# ---------------------------------------------------------------------------
+# Host-side registry of reusable PI-isolated agent *types* (repo + root
+# folder + setup). Mirrors the general MCP registry's host+project split:
+# types are defined once here and referenced by name at
+# `project create|update --enable <type>`. The registry ships empty — RS
+# pre-bakes no types.
+
+
+def projects_using_pi_isolated(name: str) -> list[str]:
+    """Scan per-project pi-isolated.json snapshots for projects that enable
+    this type — the gate for a safe `pi-isolated remove`."""
+    cfg = load_config()
+    root = Path(cfg.projects_dir).expanduser().resolve()
+    if not root.is_dir():
+        return []
+    out: list[str] = []
+    for p in sorted(root.iterdir()):
+        if not p.is_dir():
+            continue
+        entries = pi_isolated.load(workspace_path_for(p.name, cfg))
+        if name in entries:
+            out.append(p.name)
+    return out
+
+
+def _verify_pi_isolated_repo(repo: str, ref: str) -> None:
+    """Best-effort `git ls-remote` check that repo+ref resolve, so a typo
+    surfaces at `add` time rather than inside the supervisor at first
+    enable (bad failure-distance — STAGE_PI_ISOLATED Q6). Skipped with a
+    warning if git isn't on the host PATH; the operator can pass
+    --no-verify to skip deliberately."""
+    if not shutil.which("git"):
+        print("warning: git not on PATH; skipping repo/ref verification "
+              "(pass --no-verify to silence)", file=sys.stderr)
+        return
+    r = run(["git", "ls-remote", "--exit-code", repo, ref],
+            capture_output=True)
+    if r.returncode != 0:
+        die(f"could not resolve ref {ref!r} in {repo!r} via git ls-remote "
+            f"(pass --no-verify to skip this check):\n"
+            f"  {(r.stderr or r.stdout).strip()}")
+
+
+def _resolve_pi_isolated_ref(repo: str) -> str:
+    """Resolve the repo's default-branch HEAD to a concrete commit SHA so a
+    `--ref`-less `add` still pins (no silent upstream drift — the invariant
+    holds, the operator just doesn't have to look the SHA up). Requires git
+    on the host: pinning is non-negotiable, so if we can't resolve we fail
+    rather than store an unpinned entry."""
+    if not shutil.which("git"):
+        die("git not on PATH: cannot resolve the latest commit to pin "
+            "(--ref omitted). Install git, or pass --ref <sha> explicitly.")
+    r = run(["git", "ls-remote", repo, "HEAD"], capture_output=True)
+    if r.returncode != 0 or not r.stdout.split():
+        die(f"could not resolve default-branch HEAD of {repo!r} via "
+            f"git ls-remote:\n  {(r.stderr or r.stdout).strip()}")
+    return r.stdout.split()[0]
+
+
+def cmd_pi_isolated_add(args: argparse.Namespace) -> None:
+    entry: dict = {"root": args.root}
+    if args.repo:
+        ref = args.ref
+        if ref:
+            # Explicit ref: verify it resolves (unless suppressed).
+            if not args.no_verify:
+                _verify_pi_isolated_repo(args.repo, ref)
+        else:
+            # No ref: resolve the default-branch HEAD now and pin it.
+            ref = _resolve_pi_isolated_ref(args.repo)
+            print(f"  no --ref given; pinned {args.repo} default-branch HEAD "
+                  f"to {ref}")
+        entry["repo"] = args.repo
+        entry["ref"] = ref
+    if args.setup:
+        entry["setup"] = args.setup
+    if args.mount:
+        entry["mount"] = args.mount
+    if args.description:
+        entry["description"] = args.description.strip()
+
+    with pi_isolated_registry.lock():
+        try:
+            data = pi_isolated_registry.load(expand=False)
+        except pi_isolated_registry.RegistryError as e:
+            die(str(e))
+        if args.name in data["types"]:
+            die(f"pi-isolated type {args.name!r} already registered; "
+                f"remove first or use `pi-isolated set-root`/`describe`")
+        data["types"][args.name] = entry
+        try:
+            pi_isolated_registry.save_atomic(data)
+        except pi_isolated_registry.RegistryError as e:
+            die(str(e))
+    print(f"added pi-isolated type {args.name!r} (root {args.root})")
+    print(f"  next: `research project create <p> --enable {args.name}` "
+          f"(or `project update <p> --enable {args.name}`)")
+
+
+def cmd_pi_isolated_list(args: argparse.Namespace) -> None:
+    try:
+        data = pi_isolated_registry.load(expand=False)
+    except pi_isolated_registry.RegistryError as e:
+        die(str(e))
+    if args.json:
+        print(json.dumps(data, indent=2, sort_keys=True))
+        return
+    types = data["types"]
+    if not types:
+        print("(no pi-isolated types registered)")
+        return
+    rows: list[tuple[str, ...]] = []
+    descs: list[str] = []
+    for name, e in sorted(types.items()):
+        repo = e.get("repo") or "-"
+        ref = e.get("ref") or "-"
+        rows.append((name, e["root"],
+                     pi_isolated_registry.mount_for(e), repo, ref))
+        descs.append(e.get("description", ""))
+    headers = ("NAME", "ROOT", "MOUNT", "REPO", "REF")
+    cols = list(zip(*([headers] + rows)))
+    widths = [max(len(str(v)) for v in col) for col in cols]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    print(fmt.format(*headers))
+    for r, d in zip(rows, descs):
+        print(fmt.format(*r))
+        if d:
+            print(f"    {d}")
+
+
+def cmd_pi_isolated_remove(args: argparse.Namespace) -> None:
+    in_use = projects_using_pi_isolated(args.name)
+    if in_use and not args.force:
+        die(f"pi-isolated type {args.name!r} is enabled for projects: "
+            f"{', '.join(in_use)}.\n"
+            f"  Run `research project pi-isolated disable <proj> {args.name}` "
+            f"for each, or pass --force.")
+    with pi_isolated_registry.lock():
+        try:
+            data = pi_isolated_registry.load(expand=False)
+        except pi_isolated_registry.RegistryError as e:
+            die(str(e))
+        if args.name not in data["types"]:
+            die(f"no pi-isolated type named {args.name!r}")
+        data["types"].pop(args.name)
+        try:
+            pi_isolated_registry.save_atomic(data)
+        except pi_isolated_registry.RegistryError as e:
+            die(str(e))
+    print(f"removed pi-isolated type {args.name!r}")
+    if in_use:
+        print(f"  note: {len(in_use)} project(s) still have a stale "
+              f"pi-isolated.json entry; they keep running until "
+              f"`project pi-isolated disable`.")
+
+
+def _pi_isolated_registry_edit(name: str, mutate) -> None:
+    with pi_isolated_registry.lock():
+        try:
+            data = pi_isolated_registry.load(expand=False)
+        except pi_isolated_registry.RegistryError as e:
+            die(str(e))
+        entry = data["types"].get(name)
+        if entry is None:
+            die(f"no pi-isolated type named {name!r}")
+        mutate(entry)
+        try:
+            pi_isolated_registry.save_atomic(data)
+        except pi_isolated_registry.RegistryError as e:
+            die(str(e))
+
+
+def cmd_pi_isolated_set_root(args: argparse.Namespace) -> None:
+    _pi_isolated_registry_edit(args.name, lambda e: e.__setitem__("root", args.root))
+    print(f"set root for {args.name!r}: {args.root}")
+    print("  (existing projects pick up the new root on next "
+          "`project update`/recreate)")
+
+
+def cmd_pi_isolated_describe(args: argparse.Namespace) -> None:
+    new_desc = "" if args.clear else (args.text or "").strip()
+    if not args.clear and not new_desc:
+        die("description text is required (or pass --clear to remove)")
+
+    def mutate(e: dict) -> None:
+        if new_desc:
+            e["description"] = new_desc
+        else:
+            e.pop("description", None)
+
+    _pi_isolated_registry_edit(args.name, mutate)
+    print(f"{'set' if new_desc else 'cleared'} description for {args.name!r}")
 
 
 def _shared_mcps(only_enabled: bool = False) -> list[tuple[str, dict]]:
@@ -3329,18 +3615,358 @@ def cmd_project_pi_sync_creds(args: argparse.Namespace) -> None:
         sys.exit(r.returncode)
 
 
+# ---------------------------------------------------------------------------
+# PI-isolated container lifecycle (STAGE_PI_ISOLATED)
+# ---------------------------------------------------------------------------
+
+
+def _pi_isolated_external_mounts(project: str) -> list[str]:
+    """``-v`` args mounting each registered type's ``<root>/<project>/`` host
+    folder at the supervisor's ``/external/<type>``. Computed fresh from the
+    host registry at every supervisor create/recreate, so the supervisor's
+    external mount set always tracks the current registry (a removed type
+    drops out; a newly-added type appears on the next recreate). The per-
+    project subdir is created host-side so docker doesn't auto-create it
+    root-owned. ``~`` is expanded here; ``${VAR}`` was expanded by the
+    registry loader."""
+    try:
+        data = pi_isolated_registry.load(expand=True)
+    except pi_isolated_registry.RegistryError as e:
+        die(str(e))
+    mounts: list[str] = []
+    for name, entry in sorted(data["types"].items()):
+        root = Path(entry["root"]).expanduser()
+        host_dir = root / project
+        host_dir.mkdir(parents=True, exist_ok=True)
+        mounts += ["-v", f"{host_dir}:/external/{name}"]
+    return mounts
+
+
+def _supervisor_has_external_mount(supervisor: str, name: str) -> bool:
+    """True if the supervisor container currently bind-mounts
+    ``/external/<name>``. Drives the enable path's decide-to-recreate: a
+    type registered after the supervisor's last create/recreate isn't
+    mounted yet, so enable must recreate (re-enumerating the registry)
+    before it can start the inner container against that source path."""
+    r = run(["docker", "inspect", "-f",
+             "{{range .Mounts}}{{.Destination}}\n{{end}}", supervisor],
+            capture_output=True)
+    if r.returncode != 0:
+        return False
+    return f"/external/{name}" in r.stdout.split("\n")
+
+
+def _pi_isolated_stage_creds(supervisor: str, name: str) -> None:
+    """Snapshot supervisor creds into ``.pi-isolated/<name>/.creds`` if the
+    supervisor is authenticated, so a `claude` the PI later starts in the
+    tab is already authed (skips /login). UNLIKE ``_pi_stage_creds``, a
+    missing supervisor credential is NOT fatal here: an isolated agent is a
+    plain sandbox that boots fine un-authed (it just clones + idles, and the
+    tab is a login shell), and the PI can `/login` when they start claude,
+    or rely on pi-creds-watch.sh propagating creds once the supervisor
+    authenticates. The ``.creds`` dir is created either way so the RO
+    bind-mount has a source. Four-key ~/.claude.json filter matches
+    ``_pi_stage_creds``."""
+    script = f"""
+        set -e
+        mkdir -p /workspace/.pi-isolated/{name}/.creds
+        mkdir -p /workspace/pi-isolated/{name}
+        if [ -f /home/research/.claude/.credentials.json ]; then
+            cp /home/research/.claude/.credentials.json \
+               /workspace/.pi-isolated/{name}/.creds/.credentials.json
+            chmod 600 /workspace/.pi-isolated/{name}/.creds/.credentials.json
+        else
+            echo "pi-isolated[{name}]: supervisor unauthenticated; container "\
+                 "will boot without creds (use /login in the tab, or "\
+                 "authenticate the supervisor and re-sync)." >&2
+        fi
+        if [ -f /home/research/.claude/settings.json ]; then
+            jq 'del(.hooks)' /home/research/.claude/settings.json \
+               > /workspace/.pi-isolated/{name}/.creds/settings.json
+            chmod 600 /workspace/.pi-isolated/{name}/.creds/settings.json
+        fi
+        if [ -f /home/research/.claude.json ]; then
+            jq '{{oauthAccount, userID, hasCompletedOnboarding, lastOnboardingVersion}} | with_entries(select(.value != null))' \
+               /home/research/.claude.json \
+               > /workspace/.pi-isolated/{name}/.creds/home_claude.json
+            chmod 600 /workspace/.pi-isolated/{name}/.creds/home_claude.json
+        fi
+    """
+    r = run(["docker", "exec", supervisor, "bash", "-eu", "-c", script],
+            capture_output=True)
+    if r.returncode != 0:
+        die((r.stderr or r.stdout).strip()
+            or f"failed to stage creds for pi-isolated {name!r}")
+
+
+def _pi_isolated_inner_running(supervisor: str, name: str) -> bool:
+    cname = pi_isolated.container_name(name)
+    r = run(["docker", "exec", supervisor,
+             "docker", "inspect", "-f", "{{.State.Running}}", cname],
+            capture_output=True)
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def _pi_isolated_inner_exists(supervisor: str, name: str) -> bool:
+    cname = pi_isolated.container_name(name)
+    r = run(["docker", "exec", supervisor,
+             "docker", "container", "inspect", cname], capture_output=True)
+    return r.returncode == 0
+
+
+def _pi_isolated_start(supervisor: str, project: str, cfg: "Config",
+                       name: str, *, force_restage: bool = False) -> None:
+    """Run the PI-isolated container in the supervisor's inner dockerd.
+    Idempotent: tears down any prior same-named container first. Requires
+    the supervisor to already mount ``/external/<name>`` (the enable path
+    guarantees this by recreating when absent) — the external folder is
+    bind-mounted from there into the container at the type's configured
+    mount."""
+    workspace_path = workspace_path_for(project, cfg)
+    entries = pi_isolated.load(workspace_path)
+    entry = entries.get(name)
+    if entry is None:
+        die(f"no pi-isolated.json entry for {name!r}; call enable first")
+
+    cname = pi_isolated.container_name(name)
+    run(["docker", "exec", supervisor, "docker", "rm", "-f", cname],
+        capture_output=True)
+    _pi_isolated_stage_creds(supervisor, name)
+    stage_worker_image(supervisor, PI_ISOLATED_IMAGE, force=force_restage)
+
+    mount = entry.get("mount") or pi_isolated_registry.DEFAULT_MOUNT
+    docker_args = [
+        "docker", "exec", supervisor,
+        "docker", "run", "-d",
+        "--name", cname,
+        "--network", INNER_NETWORK,
+        "--ip", entry["ip"],
+        "--restart", "unless-stopped",
+        # Pi tree (RW) — the container's /workspace root. Structurally
+        # isolated from the supervisor's /workspace by construction (separate
+        # bind source).
+        "-v", f"/workspace/pi-isolated/{name}:/workspace",
+        # Cred seed (RO parent-dir mount; pi-creds-watch.sh refreshes live).
+        "-v", f"/workspace/.pi-isolated/{name}/.creds:/creds:ro",
+        # External host folder (<root>/<project>/) at the configured mount —
+        # the PI's own content folder (e.g. a vault), kept clean. The repo is
+        # cloned to /workspace/<repo-name>, NOT here. RS_PI_ISO_MOUNT (below)
+        # exports this path so a SETUP command can point the harness at it.
+        "-v", f"/external/{name}:{mount}",
+        "-e", f"RS_PI_ISO_NAME={name}",
+        "-e", f"RS_PI_ISO_REPO={entry.get('repo') or ''}",
+        "-e", f"RS_PI_ISO_REF={entry.get('ref') or ''}",
+        "-e", f"RS_PI_ISO_SETUP={entry.get('setup') or ''}",
+        "-e", f"RS_PI_ISO_MOUNT={mount}",
+        # research.pi_role label is the cred-propagation opt-in marker
+        # (pi-creds-watch.sh + rs-pi sync-creds filter on this label key,
+        # not a name glob), so isolated containers get cred fan-out free.
+        "--label", f"research.pi_role=iso-{name}",
+        "--label", f"research.pi_isolated={name}",
+        "--label", f"research.project={project}",
+        *_data_mount_args_from_supervisor(supervisor),
+        PI_ISOLATED_IMAGE,
+    ]
+    run_check(docker_args)
+    print(f"pi-isolated {name!r}: running at {entry['ip']}")
+
+
+def _pi_isolated_stop(supervisor: str, name: str) -> None:
+    """Stop + remove the inner container. Tolerates absence. Verifies removal
+    with `docker container inspect` (not bare inspect, which falls through to
+    the same-named image)."""
+    cname = pi_isolated.container_name(name)
+    rm = run(["docker", "exec", supervisor, "docker", "rm", "-f", cname],
+             capture_output=True)
+    check = run(["docker", "exec", supervisor,
+                 "docker", "container", "inspect", cname], capture_output=True)
+    if check.returncode == 0:
+        rm_tail = (rm.stderr or rm.stdout or "").strip()[-200:]
+        die(f"pi-isolated container {cname!r} still present after disable; "
+            f"docker rm -f tail: {rm_tail!r}.")
+
+
+def _pi_isolated_enable(project: str, cfg: "Config", name: str) -> None:
+    """Snapshot the registry type into pi-isolated.json + start the
+    container. Idempotent. Recreates the supervisor first if it doesn't yet
+    mount ``/external/<name>`` (type registered after the project's last
+    create/recreate) — the recreate re-enumerates the registry, adds the
+    mount, and its restart loop brings up this agent. Otherwise starts the
+    inner container directly (no recreate)."""
+    supervisor = container_name_for(project)
+    if not container_running(supervisor):
+        die(f"project {project!r} is not running; bring it up first")
+
+    type_entry = pi_isolated_registry.entry_for(name, expand=True)
+    if type_entry is None:
+        die(f"no pi-isolated type named {name!r} in the host registry. "
+            f"Register it first: `research pi-isolated add {name} "
+            f"--root <host-dir> [--repo <url> --ref <sha>]`")
+
+    workspace_path = workspace_path_for(project, cfg)
+    entries = pi_isolated.load(workspace_path)
+    try:
+        ip = pi_isolated.allocate_ip(entries, name)
+    except ValueError as e:
+        die(str(e))
+    entries[name] = pi_isolated.build_entry(name, type_entry, ip)
+    pi_isolated.save(workspace_path, entries)
+
+    if not _supervisor_has_external_mount(supervisor, name):
+        print(f"pi-isolated {name!r}: supervisor not yet mounting "
+              f"/external/{name}; recreating supervisor to wire the external "
+              f"folder (creds + workspace survive)...")
+        _recreate_supervisor(project, cfg)
+        return  # recreate's restart loop starts the container
+
+    _pi_isolated_start(supervisor, project, cfg, name)
+
+
+def _pi_isolated_disable(project: str, cfg: "Config", name: str) -> None:
+    """Stop the container, drop the pi-isolated.json entry. The external
+    host folder (<root>/<project>/, which holds the cloned repo), the pi
+    tree workspace, and the creds stash all survive. The supervisor's
+    /external/<name> mount stays (recomputed from the registry at each
+    recreate); harmless when the type is still registered."""
+    supervisor = container_name_for(project)
+    workspace_path = workspace_path_for(project, cfg)
+    entries = pi_isolated.load(workspace_path)
+    if name not in entries:
+        die(f"pi-isolated {name!r} is not enabled for project {project!r}")
+    if container_running(supervisor):
+        _pi_isolated_stop(supervisor, name)
+    del entries[name]
+    pi_isolated.save(workspace_path, entries)
+
+
+def cmd_project_pi_isolated_enable(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    _require_project(args.project)
+    _pi_isolated_enable(args.project, cfg, args.name)
+
+
+def cmd_project_pi_isolated_disable(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    _require_project(args.project)
+    _pi_isolated_disable(args.project, cfg, args.name)
+    print(f"pi-isolated {args.name!r}: disabled")
+
+
+def cmd_project_pi_isolated_list(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    supervisor = _require_project(args.project)
+    entries = pi_isolated.load(workspace_path_for(args.project, cfg))
+    if args.json:
+        out = []
+        for name, e in sorted(entries.items()):
+            row = dict(e)
+            row["name"] = name
+            row["running"] = (container_running(supervisor)
+                              and _pi_isolated_inner_running(supervisor, name))
+            out.append(row)
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return
+    if not entries:
+        print(f"(project {args.project!r} has no pi-isolated agents enabled)")
+        return
+    rows: list[tuple[str, ...]] = []
+    for name, e in sorted(entries.items()):
+        running = "no"
+        if container_running(supervisor):
+            running = "yes" if _pi_isolated_inner_running(supervisor, name) else "no"
+        rows.append((name, e.get("ip", "?"), e.get("mount", "?"),
+                     e.get("repo") or "-", running))
+    headers = ("NAME", "IP", "MOUNT", "REPO", "RUNNING")
+    cols = list(zip(*([headers] + rows)))
+    widths = [max(len(str(v)) for v in col) for col in cols]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    print(fmt.format(*headers))
+    for r in rows:
+        print(fmt.format(*r))
+
+
+def cmd_project_pi_isolated_status(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    supervisor = _require_project(args.project)
+    workspace_path = workspace_path_for(args.project, cfg)
+    entries = pi_isolated.load(workspace_path)
+    entry = entries.get(args.name)
+    if entry is None:
+        die(f"pi-isolated {args.name!r} is not enabled for project "
+            f"{args.project!r}")
+    state = {
+        "name": args.name,
+        "project": args.project,
+        "entry": entry,
+        "container": pi_isolated.container_name(args.name),
+        "exists": False,
+        "running": False,
+        "supervisor_external_mount": False,
+    }
+    if container_running(supervisor):
+        state["exists"] = _pi_isolated_inner_exists(supervisor, args.name)
+        state["running"] = _pi_isolated_inner_running(supervisor, args.name)
+        state["supervisor_external_mount"] = _supervisor_has_external_mount(
+            supervisor, args.name)
+    ws = workspace_path / "pi-isolated" / args.name
+    state["workspace"] = str(ws)
+    state["workspace_present"] = ws.is_dir()
+    # The repo is cloned visibly into the pi tree root as
+    # /workspace/<repo-name> (container view) = <ws>/<repo-name> (host view).
+    repo = entry.get("repo")
+    clone_dir = None
+    if repo:
+        repo_name = repo.rstrip("/").rsplit("/", 1)[-1]
+        if repo_name.endswith(".git"):
+            repo_name = repo_name[:-4]
+        clone_dir = ws / repo_name
+    state["clone_dir"] = str(clone_dir) if clone_dir else None
+    state["repo_cloned"] = bool(clone_dir and (clone_dir / ".git").is_dir())
+
+    if args.json:
+        print(json.dumps(state, indent=2, sort_keys=True))
+        return
+    print(f"name:        {state['name']}")
+    print(f"project:     {state['project']}")
+    print(f"container:   {state['container']}")
+    print(f"  exists:    {state['exists']}")
+    print(f"  running:   {state['running']}")
+    print(f"ip:          {entry.get('ip')}")
+    print(f"repo:        {entry.get('repo') or '(none)'}")
+    print(f"ref:         {entry.get('ref') or '(none)'}")
+    print(f"mount:       {entry.get('mount')}")
+    print(f"root:        {entry.get('root')}")
+    print(f"external mount on supervisor: {state['supervisor_external_mount']}")
+    print(f"workspace:   {state['workspace']}"
+          f" ({'present' if state['workspace_present'] else 'absent'})")
+    print(f"clone dir:   {state['clone_dir']}")
+    print(f"  repo cloned: {state['repo_cloned']}")
+
+
+def _registered_pi_isolated_types() -> set[str]:
+    """Names in the host PI-isolated registry, or empty on load failure (a
+    malformed registry shouldn't break `project create`; the dedicated
+    `pi-isolated` subcommands surface the error)."""
+    try:
+        return set(pi_isolated_registry.load(expand=False)["types"])
+    except pi_isolated_registry.RegistryError:
+        return set()
+
+
 def _split_enable_tokens(
     enable_arg: str | None,
-) -> tuple[str | None, list[str], list[str], bool]:
+) -> tuple[str | None, list[str], list[str], list[str], bool]:
     """Split ``--enable`` value into (service_csv, role_mcp_roles,
-    pi_roles, no_pi_mirror).
+    pi_roles, pi_isolated_types, no_pi_mirror).
 
-    Tokens are matched against three sets in order, all using their
-    canonical short names (no prefix sugar):
+    Tokens are matched against four sets in order, all using their
+    canonical names (no prefix sugar):
       - a key in ``role_mcp.ROLE_IMAGES`` (e.g. ``wrangler``,
         ``echo-mcp``) peels into the role-mcp list,
       - a key in ``pi_roles.PI_IMAGES`` (e.g. ``pi-wrangler``,
         ``pi-echo``) peels into the pi list,
+      - a name in the host PI-isolated registry peels into the
+        pi-isolated list,
       - the bare sentinel ``no-pi-mirror`` suppresses PI-mirror auto-
         enable for every role-mcp token in the same ``--enable`` value
         (it applies to all roles, not per-role — per-role granularity is
@@ -3348,20 +3974,21 @@ def _split_enable_tokens(
       - anything else stays for ``_compute_service_flags`` to interpret
         as a service id.
 
-    A name that lives in BOTH ``role_mcp.ROLE_IMAGES`` and
-    ``KNOWN_SERVICES`` (or both registries — role-MCP vs PI) is a
-    configuration error in this codebase, not an operator problem; the
-    image-registry tables (cli/role_mcp.py, cli/pi.py) are the source of
-    truth and authors must keep names disjoint. The parser doesn't try
-    to disambiguate.
+    A name that lives in more than one of these surfaces (role-MCP / PI /
+    PI-isolated / service) is a configuration error in this codebase, not
+    an operator problem; the registry tables are the source of truth and
+    authors/operators must keep names disjoint. The parser doesn't try to
+    disambiguate.
 
     Empty service set returns None to keep the default (all services
     enabled / inherit prior flags) intact."""
     if not enable_arg:
-        return None, [], [], False
+        return None, [], [], [], False
+    iso_types = _registered_pi_isolated_types()
     services: list[str] = []
     role_mcps: list[str] = []
     pi: list[str] = []
+    pi_isolated_types: list[str] = []
     no_pi_mirror = False
     for tok in enable_arg.split(","):
         tok = tok.strip()
@@ -3373,10 +4000,12 @@ def _split_enable_tokens(
             role_mcps.append(tok)
         elif tok in pi_roles.PI_IMAGES:
             pi.append(tok)
+        elif tok in iso_types:
+            pi_isolated_types.append(tok)
         else:
             services.append(tok)
     svc_csv = ",".join(services) if services else None
-    return svc_csv, role_mcps, pi, no_pi_mirror
+    return svc_csv, role_mcps, pi, pi_isolated_types, no_pi_mirror
 
 
 def _parse_role_mcp_upstream(
@@ -3407,26 +4036,31 @@ def _parse_role_mcp_upstream(
 
 def _split_disable_tokens(
     disable_arg: str | None,
-) -> tuple[str | None, list[str]]:
-    """Mirror of `_split_enable_tokens` for the disable side, but PI-only.
-    Tokens of the form ``pi-<role>`` peel off into the pi list; everything
-    else stays for `_compute_service_flags` to handle. role-mcps are not
-    disabled via ``--disable`` (they have their own ``role-mcp disable``
-    subcommand), so no role-mcp branch here."""
+) -> tuple[str | None, list[str], list[str]]:
+    """Mirror of `_split_enable_tokens` for the disable side: (service_csv,
+    pi_roles, pi_isolated_types). Tokens of the form ``pi-<role>`` peel off
+    into the pi list; tokens in the host PI-isolated registry peel into the
+    pi-isolated list; everything else stays for `_compute_service_flags`.
+    role-mcps are not disabled via ``--disable`` (they have their own
+    ``role-mcp disable`` subcommand), so no role-mcp branch here."""
     if not disable_arg:
-        return None, []
+        return None, [], []
+    iso_types = _registered_pi_isolated_types()
     services: list[str] = []
     pi: list[str] = []
+    pi_isolated_types: list[str] = []
     for tok in disable_arg.split(","):
         tok = tok.strip()
         if not tok:
             continue
         if tok.startswith("pi-"):
             pi.append(tok)
+        elif tok in iso_types:
+            pi_isolated_types.append(tok)
         else:
             services.append(tok)
     svc_csv = ",".join(services) if services else None
-    return svc_csv, pi
+    return svc_csv, pi, pi_isolated_types
 
 
 # ---------------------------------------------------------------------------
@@ -4117,6 +4751,50 @@ def build_parser() -> argparse.ArgumentParser:
     pisc.add_argument("project")
     pisc.set_defaults(func=cmd_project_pi_sync_creds)
 
+    # ----- per-project PI-isolated lifecycle (STAGE_PI_ISOLATED) --------
+    piso = proj_sub.add_parser(
+        "pi-isolated",
+        help="per-project PI-isolated agent lifecycle "
+             "(enable / disable / list / status). Isolated agents clone a "
+             "skill repo defined in the host `pi-isolated` registry and mount "
+             "<root>/<project>/ from the host; they live in pi-isolated.json, "
+             "distinct from pi-roles.json and role-mcps.json.",
+    )
+    piso_sub = piso.add_subparsers(dest="pi_isolated_action", required=True)
+
+    pie2 = piso_sub.add_parser("enable",
+                               help="snapshot a registered type into the "
+                                    "project + start its container (recreates "
+                                    "the supervisor if the external folder "
+                                    "isn't mounted yet)")
+    pie2.add_argument("project")
+    pie2.add_argument("name", help="pi-isolated type name (see "
+                                   "`research pi-isolated list`)")
+    pie2.set_defaults(func=cmd_project_pi_isolated_enable)
+
+    pid2 = piso_sub.add_parser("disable",
+                               help="stop + remove the container (the external "
+                                    "folder with the cloned repo, and the pi "
+                                    "workspace, survive)")
+    pid2.add_argument("project")
+    pid2.add_argument("name")
+    pid2.set_defaults(func=cmd_project_pi_isolated_disable)
+
+    pil2 = piso_sub.add_parser("list",
+                               help="show every pi-isolated agent enabled for "
+                                    "the project, with running state")
+    pil2.add_argument("project")
+    pil2.add_argument("--json", action="store_true")
+    pil2.set_defaults(func=cmd_project_pi_isolated_list)
+
+    pis2 = piso_sub.add_parser("status",
+                               help="deep-print one agent's container state + "
+                                    "workspace/clone presence")
+    pis2.add_argument("project")
+    pis2.add_argument("name")
+    pis2.add_argument("--json", action="store_true")
+    pis2.set_defaults(func=cmd_project_pi_isolated_status)
+
     # ----- MCP registry (Stage 2.1) -------------------------------------
     mcp = sub.add_parser("mcp", help="MCP registry operations")
     mcp_sub = mcp.add_subparsers(dest="subcommand", required=True)
@@ -4214,6 +4892,62 @@ def build_parser() -> argparse.ArgumentParser:
     mts.add_argument("name", nargs="?",
                      help="MCP name; omit to test every registered MCP")
     mts.set_defaults(func=cmd_mcp_test)
+
+    # ----- PI-isolated type registry (STAGE_PI_ISOLATED) ----------------
+    piso_reg = sub.add_parser(
+        "pi-isolated",
+        help="host registry of PI-isolated agent types (reusable repo + "
+             "root-folder definitions enabled per-project with "
+             "`project create|update --enable <type>`)")
+    piso_reg_sub = piso_reg.add_subparsers(dest="subcommand", required=True)
+
+    pa = piso_reg_sub.add_parser("add", help="register a PI-isolated type")
+    pa.add_argument("name")
+    pa.add_argument("--root", required=True, metavar="HOST_DIR",
+                    help="host folder for this type; the per-project subdir "
+                         "<root>/<project>/ is the RW external mount. May use "
+                         "~ and ${VAR}.")
+    pa.add_argument("--repo", help="git URL cloned into the container at "
+                                   "enable time (omit for a pure-folder agent)")
+    pa.add_argument("--ref", help="commit/tag to check out. Optional: if "
+                                  "omitted, the repo's default-branch HEAD is "
+                                  "resolved and pinned now (still no drift — "
+                                  "you just don't supply the SHA). Requires "
+                                  "git on the host when omitted.")
+    pa.add_argument("--setup", help="shell command run in the clone dir after "
+                                    "checkout (e.g. 'bash setup.sh'); runs on "
+                                    "every boot, must be idempotent")
+    pa.add_argument("--mount", metavar="CONTAINER_PATH",
+                    help=f"absolute container path the external folder lands "
+                         f"at (default {pi_isolated_registry.DEFAULT_MOUNT!r}; "
+                         f"keep under /workspace/)")
+    pa.add_argument("--description",
+                    help="operator note surfaced in `pi-isolated list`")
+    pa.add_argument("--no-verify", action="store_true",
+                    help="skip the `git ls-remote` repo/ref check at add time")
+    pa.set_defaults(func=cmd_pi_isolated_add)
+
+    pl = piso_reg_sub.add_parser("list", help="list registered PI-isolated types")
+    pl.add_argument("--json", action="store_true")
+    pl.set_defaults(func=cmd_pi_isolated_list)
+
+    pr = piso_reg_sub.add_parser("remove", help="remove a type from the registry")
+    pr.add_argument("name")
+    pr.add_argument("--force", action="store_true",
+                    help="remove even if projects currently enable it")
+    pr.set_defaults(func=cmd_pi_isolated_remove)
+
+    psr = piso_reg_sub.add_parser("set-root", help="change a type's host root folder")
+    psr.add_argument("name")
+    psr.add_argument("root", metavar="HOST_DIR")
+    psr.set_defaults(func=cmd_pi_isolated_set_root)
+
+    pds = piso_reg_sub.add_parser("describe", help="set or clear a type's description")
+    pds.add_argument("name")
+    pdg = pds.add_mutually_exclusive_group(required=True)
+    pdg.add_argument("text", nargs="?", help="new description text")
+    pdg.add_argument("--clear", action="store_true", help="remove the description")
+    pds.set_defaults(func=cmd_pi_isolated_describe)
 
     # ----- webui (browser SSH multiplexer) ------------------------------
     wu = sub.add_parser("webui", help="manage the optional browser UI container")

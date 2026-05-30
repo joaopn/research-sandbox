@@ -121,7 +121,11 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
         return web.Response(status=403, text="Origin rejected")
 
     service_id = request.match_info.get("service", "")
-    svc = services.get(service_id)
+    # resolve() (not get()) so per-project PI-isolated tabs (`pi-iso-<name>`,
+    # not in the static registry) resolve to a synthesized spec. The
+    # synthesizer validates the name before building the docker-exec command,
+    # so a malformed id returns None → 404 rather than executing.
+    svc = services.resolve(service_id)
     if svc is None or svc.get("kind") != "ssh":
         return web.Response(status=404, text=f"unknown ssh service {service_id!r}")
 
@@ -328,6 +332,15 @@ async def project_services_handler(request: web.Request) -> web.Response:
                 pi_roles_for_project = _read_project_pi_roles(project)
             if sid in pi_roles_for_project:
                 out[sid] = svc
+
+    # PI-isolated agents (STAGE_PI_ISOLATED): one synthesized tab per agent
+    # listed in the project's pi-isolated.json. Same data-plane discipline
+    # as _read_project_pi_roles — read off the /projects:ro bind-mount, no
+    # SSH/docker socket, lifecycle changes reflect on next page load.
+    for name in sorted(_read_project_pi_isolated(project)):
+        spec = services.pi_isolated_service(name)
+        if spec is not None:
+            out[f"{services.PI_ISOLATED_ID_PREFIX}{name}"] = spec
     return web.json_response(out)
 
 
@@ -347,6 +360,25 @@ def _read_project_pi_roles(project: str) -> set[str]:
         return set()
     try:
         data = json.loads(pi_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if not isinstance(data, dict):
+        return set()
+    return set(data.keys())
+
+
+def _read_project_pi_isolated(project: str) -> set[str]:
+    """Set of PI-isolated agent names enabled for ``project``, read from its
+    `.orchestrator/pi-isolated.json` off the `/projects:ro` mount. Same
+    tolerance + no-cache posture as `_read_project_pi_roles`."""
+    workspace = _project_workspace(project)
+    if workspace is None:
+        return set()
+    iso_file = workspace / ".orchestrator" / "pi-isolated.json"
+    if not iso_file.is_file():
+        return set()
+    try:
+        data = json.loads(iso_file.read_text())
     except (OSError, json.JSONDecodeError):
         return set()
     if not isinstance(data, dict):

@@ -62,6 +62,8 @@ Do not read `/workspace/pi/` by default. These are the PI's personal role-sessio
 
 The same applies to `/workspace/.pi/` (hidden tree holding the PI containers' cred-stash and any per-role daemon-private state). It's not visibility-restricted by the kernel here — the supervisor's volume mount sees both trees — but the rule is the same: don't read unless the PI invites you to.
 
+The boundary extends to two more trees that belong to **PI-isolated agents** (the PI's bring-your-own skill-repo containers): `/workspace/pi-isolated/<name>/` (the agent's workspace + cloned `.skillrepo`) and `/workspace/.pi-isolated/` (their cred-stash). It also covers `/external/<name>/` — these are the PI's own host folders (Obsidian vaults, Overleaf working copies, etc.) bind-mounted in for the isolated agents. All of it is supervisor-visible for code-server browsing, none of it is yours to read or fold into worker context unless the PI explicitly points you at it.
+
 ## Worker registry schema
 
 Each `.workers/<name>.json`:

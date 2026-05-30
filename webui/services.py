@@ -125,5 +125,59 @@ SERVICES = {
 }
 
 
+# PI-isolated agents (STAGE_PI_ISOLATED) are per-project and arbitrarily
+# named, so they can't be static SERVICES entries. Their tab id is
+# `pi-iso-<name>` and the tab is synthesized on demand: project_services_
+# handler adds one per agent listed in the project's pi-isolated.json, and
+# `resolve()` reconstructs the command server-side for the ssh handler.
+import re as _re
+
+PI_ISOLATED_ID_PREFIX = "pi-iso-"
+# Same grammar as the host registry's NAME_RE. Validated before the name is
+# interpolated into the docker-exec command string — a non-matching id is
+# rejected (404) rather than executed, closing shell-injection via the URL.
+_PI_ISOLATED_NAME_RE = _re.compile(r"^[a-z][a-z0-9-]*$")
+
+
+def pi_isolated_service(name: str) -> dict | None:
+    """Synthesize the tab/service spec for PI-isolated agent ``name``, or
+    None if the name fails validation.
+
+    Unlike the baked PI roles (pi-wrangler / pi-websearcher), the inner
+    command is a **login shell**, NOT ``claude`` — pi-isolated is a plain
+    per-project sandbox (cloned repo + folder mount, no MCPs). Starting
+    claude, authenticating, pulling skills from the marketplace, etc. are
+    all the PI's to do, in whatever order — auto-launching claude would
+    pre-empt that. This mirrors pi-echo's `bash -l` tab. ``-c /workspace``
+    lands the shell where the clone + external folder live; ``bash -l`` so
+    the user's interactive shell has the full PATH (claude included)."""
+    if not _PI_ISOLATED_NAME_RE.match(name):
+        return None
+    return {
+        "label": name,
+        "kind": "ssh",
+        "always_on": False,
+        "renderer": "xterm.js",
+        "default_port": 22,
+        "command": (
+            f"docker exec -it rs-pi-iso-{name} bash -c "
+            "'byobu attach -t pi 2>/dev/null || "
+            "byobu new-session -s pi -c /workspace -- bash -l'"
+        ),
+    }
+
+
+def resolve(service_id: str) -> dict | None:
+    """Static registry lookup, falling back to a synthesized PI-isolated
+    spec for `pi-iso-<name>` ids. Used by the ssh handler so it can run the
+    command for a per-project agent that isn't in the static registry."""
+    svc = SERVICES.get(service_id)
+    if svc is not None:
+        return svc
+    if service_id.startswith(PI_ISOLATED_ID_PREFIX):
+        return pi_isolated_service(service_id[len(PI_ISOLATED_ID_PREFIX):])
+    return None
+
+
 def get(service_id: str) -> dict | None:
     return SERVICES.get(service_id)
