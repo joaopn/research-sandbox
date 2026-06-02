@@ -17,8 +17,10 @@
 #                       the PI's OWN content folder — the repo is NOT cloned
 #                       here (that would pollute it). Exported so a SETUP
 #                       command can point the harness at it (e.g. as a vault).
-#   /creds            — RO snapshot of supervisor creds (parent-dir bind-mount;
-#                       atomic-rename writes stay visible).
+#
+# Auth: PI-owned and boots un-authed — no creds staged here. The PI runs
+# `/login` in the tab, or the operator pushes the supervisor's creds in via
+# `rs-pi sync-creds`. bypassPermissions config is baked into rs-pi-base.
 #
 # Expected environment:
 #   RS_PI_ISO_NAME   — type name (e.g. obsidian-wiki); used for log prefixes.
@@ -29,9 +31,8 @@
 #
 # Startup order:
 #   1. Restore home skel (volume hides image contents).
-#   2. Stage creds from /creds → ~/.claude/ (optional; not fatal if absent).
-#   3. Clone repo to /workspace/<repo-name> (once), checkout REF, run SETUP.
-#   4. tail -f /dev/null — byobu (a login shell) on first webui tab connect.
+#   2. Clone repo to /workspace/<repo-name> (once), checkout REF, run SETUP.
+#   3. tail -f /dev/null — byobu (a login shell) on first webui tab connect.
 
 set -euo pipefail
 
@@ -49,33 +50,12 @@ fi
 # Role marker for the byobu status-bar plugin (~/.byobu/bin/60_rolename).
 echo "${RS_PI_ISO_NAME}" > ~/.rs-role
 
-# --- Stage creds (optional — isolated agents boot fine un-authed) ----------
-# UNLIKE entrypoint.pi.sh, missing creds are NOT fatal here. An isolated
-# agent is a plain sandbox: it clones + idles at boot, and the tab is a
-# login shell — claude only runs if/when the PI starts it there, and they
-# can `/login` at that point. If the supervisor is authenticated, its creds
-# are staged here (and pi-creds-watch.sh keeps them fresh on re-auth — this
-# container carries the research.pi_role label the watcher selects on), so a
-# `claude` the PI later starts is already authed. If not, we just proceed.
-if [[ -f /creds/.credentials.json ]]; then
-    mkdir -p ~/.claude
-    cp /creds/.credentials.json ~/.claude/.credentials.json
-    chmod 600 ~/.claude/.credentials.json
-else
-    echo "${LOG}: no /creds/.credentials.json — booting without creds; " \
-         "run /login in the tab, or authenticate the supervisor and " \
-         "re-sync (rs-pi sync-creds)." >&2
-fi
-if [[ -f /creds/settings.json ]]; then
-    cp /creds/settings.json ~/.claude/settings.json
-fi
-# ~/.claude.json (sibling of ~/.claude/) carries oauthAccount + onboarding
-# state; without it interactive claude prompts for /login on every attach.
-# Staged filtered (four-key allowlist) host-side under the sentinel name.
-if [[ -f /creds/home_claude.json ]]; then
-    cp /creds/home_claude.json ~/.claude.json
-    chmod 600 ~/.claude.json
-fi
+# --- Auth: PI-owned, no staging --------------------------------------------
+# Isolated agents boot un-authed. The tab is a login shell — claude only runs
+# if/when the PI starts it there, and they `/login` at that point (or the
+# operator pushes the supervisor's creds in via `rs-pi sync-creds`, which
+# targets this container by its research.pi_role label). settings.json
+# (bypassPermissions) is baked into rs-pi-base, so claude doesn't prompt.
 
 # --- Clone / checkout / setup the harness repo -----------------------------
 # Clone VISIBLY into the workspace root as /workspace/<repo-name> — NOT inside

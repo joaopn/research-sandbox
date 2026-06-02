@@ -13,10 +13,11 @@ Three things this module owns:
     ``_recreate_supervisor`` to restart enabled agents, by the webui to
     filter tabs). Distinct from pi-roles.json (baked roles) and
     role-mcps.json (worker-facing roles).
-  - container naming: ``rs-pi-iso-<name>``. The ``rs-pi-`` prefix is
-    deliberate — pi-creds-watch.sh selects its fan-out targets by
-    ``rs-pi-*``, so cred propagation covers isolated containers with no
-    watcher change.
+  - container naming: ``rs-pi-iso-<name>``. The ``rs-pi-`` prefix keeps it
+    in the PI container family; ``_pi_isolated_start`` sets the
+    ``research.pi_role=iso-<name>`` label, which is what the manual
+    ``rs-pi sync-creds`` bridge selects on (by label, not name glob), so it
+    reaches isolated containers too.
   - inner-bridge IP allocation from the PI range reserved for these agents
     (``.14-.25``; the firewall already ACCEPTs the whole PI range, so no
     inner-firewall.sh change is needed — see ``.claude/CLAUDE.md`` IP table).
@@ -40,9 +41,10 @@ IP_PREFIX = "192.168.99."
 
 
 def container_name(name: str) -> str:
-    """``rs-pi-iso-<name>``. Keeps the ``rs-pi-`` prefix so pi-creds-watch.sh
-    fans creds in unchanged, and the ``-iso-`` infix avoids colliding with a
-    baked PI role's ``rs-pi-<role>`` name."""
+    """``rs-pi-iso-<name>``. Keeps the ``rs-pi-`` prefix to stay in the PI
+    container family, and the ``-iso-`` infix avoids colliding with a baked
+    PI role's ``rs-pi-<role>`` name. (Manual `rs-pi sync-creds` targets these
+    by the ``research.pi_role`` label, not by name.)"""
     return f"rs-pi-iso-{name}"
 
 

@@ -899,27 +899,24 @@ def cmd_project_create(args: argparse.Namespace) -> None:
                           f"`research project role-mcp enable {project} {role}`",
                           file=sys.stderr)
 
-    # 6e. pi-role sugar (--enable pi-<role>). Same auth requirement as
-    #     role-mcps — PI containers stage the supervisor's creds at start.
+    # 6e. pi-role sugar (--enable pi-<role>). UNLIKE role-MCPs, PI roles do
+    #     NOT require supervisor auth to come up: PI containers are PI-owned
+    #     and boot un-authed (no creds staged), the PI authenticating in-tab
+    #     (`/login`) or via the manual `rs-pi sync-creds` bridge. So we always
+    #     enable, regardless of creds_present — same posture as pi-isolated
+    #     below. (`_pi_enable` may still refuse for a mirror role whose
+    #     worker-facing role-MCP isn't enabled — the W10 gate, unrelated to
+    #     auth.)
     pi_roles_enabled: list[str] = []
-    if enable_pi_roles:
-        if not creds_present:
-            print("note: --enable pi-* requires supervisor auth; "
-                  "skipping pi-role activation. After authenticating "
-                  "(see Next steps below), run:", file=sys.stderr)
-            for role in enable_pi_roles:
-                print(f"   research project pi enable {project} {role}",
-                      file=sys.stderr)
-        else:
-            for role in enable_pi_roles:
-                try:
-                    _pi_enable(project, cfg, role)
-                    pi_roles_enabled.append(role)
-                except SystemExit:
-                    print(f"warning: failed to enable pi role {role!r}; "
-                          "retry manually with "
-                          f"`research project pi enable {project} {role}`",
-                          file=sys.stderr)
+    for role in enable_pi_roles:
+        try:
+            _pi_enable(project, cfg, role)
+            pi_roles_enabled.append(role)
+        except SystemExit:
+            print(f"warning: failed to enable pi role {role!r}; "
+                  "retry manually with "
+                  f"`research project pi enable {project} {role}`",
+                  file=sys.stderr)
 
     # 6f. pi-isolated sugar (--enable <type>). UNLIKE role-MCPs / baked PI
     #     roles, a PI-isolated agent does NOT require supervisor auth to come
@@ -3259,64 +3256,29 @@ def cmd_project_role_mcp_status(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _pi_stage_creds(supervisor: str, role: str) -> None:
-    """Snapshot the supervisor's current Claude credentials into the
-    per-role creds-stash dir so the PI container can stage them at boot.
-    Idempotent: overwrites any previous snapshot. Errors are fatal — a PI
-    container with no creds is non-functional (claude inside refuses to
-    start with `Not logged in`).
+def _pi_ensure_workspace(supervisor: str, role: str) -> None:
+    """Pre-create the PI role's workspace bind-mount source dir as the
+    uid-1000 supervisor user, so dockerd's auto-create on ``docker run -v``
+    doesn't land it root-owned and lock out the container's worker user.
 
-    Path note: paths use the *short* role name (the ``pi-`` prefix
+    No credentials are staged. PI containers are PI-owned: they boot
+    un-authed and the PI authenticates in-tab (``/login``) or pulls the
+    supervisor's creds via the manual ``rs-pi sync-creds`` bridge. There is
+    no automatic supervisor→PI credential propagation — see the
+    auth-by-ownership rule in ``.claude/CLAUDE.md``.
+
+    Path note: the dir uses the *short* role name (the ``pi-`` prefix
     stripped — e.g. ``pi-echo`` → ``echo``). The role key keeps the
     ``pi-`` prefix only because it disambiguates from worker-facing
     role-MCPs at the registry level; once inside the project volume's
-    ``pi/`` directory grouping, the prefix is redundant. Creds land
-    under ``.pi/<short>/.creds/`` (hidden tree, parallel to
-    ``.role-mcps/<role>/``). The workspace bind-mount source at
-    ``pi/<short>/`` is pre-created uid-1000-owned by the same script
-    so docker's auto-create doesn't land it root-owned and break the
-    worker user's writes inside the container."""
+    ``pi/`` directory grouping, the prefix is redundant."""
     short = pi_roles.role_short(role)
-    script = f"""
-        set -e
-        if [ ! -f /home/research/.claude/.credentials.json ]; then
-            echo "supervisor is not authenticated (no ~/.claude/.credentials.json)" >&2
-            exit 2
-        fi
-        mkdir -p /workspace/.pi/{short}/.creds
-        mkdir -p /workspace/pi/{short}
-        cp /home/research/.claude/.credentials.json \
-           /workspace/.pi/{short}/.creds/.credentials.json
-        chmod 600 /workspace/.pi/{short}/.creds/.credentials.json
-        if [ -f /home/research/.claude/settings.json ]; then
-            # Strip the `hooks` key — supervisor's Stop hook calls
-            # /usr/local/bin/rs-audit-stop which exists only in the
-            # supervisor image; propagating it breaks every claude
-            # session in the PI tab with a "command not found" Stop
-            # hook error.
-            jq 'del(.hooks)' /home/research/.claude/settings.json \
-               > /workspace/.pi/{short}/.creds/settings.json
-            chmod 600 /workspace/.pi/{short}/.creds/settings.json
-        fi
-        if [ -f /home/research/.claude.json ]; then
-            # Filter ~/.claude.json to the PI allowlist before staging.
-            # The supervisor's raw file carries `projects[<cwd>]` — per-
-            # cwd prompt history, allowedTools, mcpContextUris — which
-            # would leak into the PI's claude /resume UI if propagated
-            # whole. Keep only the keys interactive `claude` needs to
-            # skip /login. Same expression used by pi-creds-watch.sh
-            # and rs-pi sync-creds at live-refresh time.
-            jq '{{oauthAccount, userID, hasCompletedOnboarding, lastOnboardingVersion}} | with_entries(select(.value != null))' \
-               /home/research/.claude.json \
-               > /workspace/.pi/{short}/.creds/home_claude.json
-            chmod 600 /workspace/.pi/{short}/.creds/home_claude.json
-        fi
-    """
+    script = f"mkdir -p /workspace/pi/{short}"
     r = run(["docker", "exec", supervisor, "bash", "-eu", "-c", script],
             capture_output=True)
     if r.returncode != 0:
         die((r.stderr or r.stdout).strip()
-            or f"failed to stage creds for pi role {role!r}")
+            or f"failed to ensure workspace dir for pi role {role!r}")
 
 
 def _pi_inner_exists(supervisor: str, role: str) -> bool:
@@ -3353,7 +3315,7 @@ def _pi_start(supervisor: str, project: str, cfg: "Config",
     cname = pi_roles.role_container_name(role)
     run(["docker", "exec", supervisor, "docker", "rm", "-f", cname],
         capture_output=True)
-    _pi_stage_creds(supervisor, role)
+    _pi_ensure_workspace(supervisor, role)
 
     image = entry.get("image") or pi_roles.PI_IMAGES[role]
     stage_worker_image(supervisor, image, force=force_restage)
@@ -3364,17 +3326,12 @@ def _pi_start(supervisor: str, project: str, cfg: "Config",
     #     by the entrypoint; PI's curated skills.md, sessions/, and
     #     per-role artifacts live here. NEVER includes the supervisor's
     #     /workspace/ contents — structural isolation by construction.
-    #   /creds      ← <supervisor>/workspace/.pi/<short>/.creds (RO)
-    #     Parent-dir bind-mount so the inotify watcher's atomic-rename
-    #     writes (replacing .credentials.json) stay visible inside the
-    #     container without re-mounting. The container's entrypoint
-    #     copies /creds/.credentials.json into ~/.claude/ on first
-    #     boot; later cred refreshes are propagated by pi-creds-watch
-    #     using `docker cp` + `install` directly into the container's
-    #     ~/.claude/ (the /creds RO mount is the seed, not the live
-    #     view).
+    # No /creds mount: PI containers are PI-owned and boot un-authed.
+    # The PI authenticates in-tab (`/login`) or pulls the supervisor's
+    # creds via the manual `rs-pi sync-creds` bridge (docker cp + install,
+    # no mount needed). bypassPermissions config is baked into rs-pi-base.
     # ``<short>`` is the role key with the ``pi-`` prefix stripped
-    # (see ``_pi_stage_creds``'s path note).
+    # (see ``_pi_ensure_workspace``'s path note).
     ip = entry["ip"]
     short = pi_roles.role_short(role)
     docker_args = [
@@ -3385,7 +3342,6 @@ def _pi_start(supervisor: str, project: str, cfg: "Config",
         "--ip", ip,
         "--restart", "unless-stopped",
         "-v", f"/workspace/pi/{short}:/workspace",
-        "-v", f"/workspace/.pi/{short}/.creds:/creds:ro",
         # /etc/orchestrator is the supervisor's per-project state dir
         # (role-mcps.json, mcp-allow.json). PI containers that mirror a
         # worker-facing role-MCP (pi-wrangler, pi-librarian, …) read
@@ -3603,11 +3559,12 @@ def cmd_project_pi_status(args: argparse.Namespace) -> None:
 
 
 def cmd_project_pi_sync_creds(args: argparse.Namespace) -> None:
-    """Manual fallback for the inotify watcher: invoke the supervisor-side
-    rs-pi CLI to re-stage the supervisor's current creds into every
-    running PI container. The watcher is best-effort; this command is the
-    explicit alternative when re-auth happened while the watcher was
-    down, or to verify state."""
+    """The supervisor→PI credential bridge: invoke the supervisor-side
+    rs-pi CLI to push the supervisor's current creds into every running PI
+    container. Operator-initiated only — PI containers are PI-owned and boot
+    un-authed; nothing propagates creds automatically. Run this when the PI
+    wants to inherit the supervisor's identity instead of `/login`-ing in
+    each tab themselves."""
     supervisor = _require_project(args.project)
     r = run(["docker", "exec", supervisor, "rs-pi", "sync-creds"],
             capture_output=False)
@@ -3656,47 +3613,20 @@ def _supervisor_has_external_mount(supervisor: str, name: str) -> bool:
     return f"/external/{name}" in r.stdout.split("\n")
 
 
-def _pi_isolated_stage_creds(supervisor: str, name: str) -> None:
-    """Snapshot supervisor creds into ``.pi-isolated/<name>/.creds`` if the
-    supervisor is authenticated, so a `claude` the PI later starts in the
-    tab is already authed (skips /login). UNLIKE ``_pi_stage_creds``, a
-    missing supervisor credential is NOT fatal here: an isolated agent is a
-    plain sandbox that boots fine un-authed (it just clones + idles, and the
-    tab is a login shell), and the PI can `/login` when they start claude,
-    or rely on pi-creds-watch.sh propagating creds once the supervisor
-    authenticates. The ``.creds`` dir is created either way so the RO
-    bind-mount has a source. Four-key ~/.claude.json filter matches
-    ``_pi_stage_creds``."""
-    script = f"""
-        set -e
-        mkdir -p /workspace/.pi-isolated/{name}/.creds
-        mkdir -p /workspace/pi-isolated/{name}
-        if [ -f /home/research/.claude/.credentials.json ]; then
-            cp /home/research/.claude/.credentials.json \
-               /workspace/.pi-isolated/{name}/.creds/.credentials.json
-            chmod 600 /workspace/.pi-isolated/{name}/.creds/.credentials.json
-        else
-            echo "pi-isolated[{name}]: supervisor unauthenticated; container "\
-                 "will boot without creds (use /login in the tab, or "\
-                 "authenticate the supervisor and re-sync)." >&2
-        fi
-        if [ -f /home/research/.claude/settings.json ]; then
-            jq 'del(.hooks)' /home/research/.claude/settings.json \
-               > /workspace/.pi-isolated/{name}/.creds/settings.json
-            chmod 600 /workspace/.pi-isolated/{name}/.creds/settings.json
-        fi
-        if [ -f /home/research/.claude.json ]; then
-            jq '{{oauthAccount, userID, hasCompletedOnboarding, lastOnboardingVersion}} | with_entries(select(.value != null))' \
-               /home/research/.claude.json \
-               > /workspace/.pi-isolated/{name}/.creds/home_claude.json
-            chmod 600 /workspace/.pi-isolated/{name}/.creds/home_claude.json
-        fi
-    """
+def _pi_isolated_ensure_workspace(supervisor: str, name: str) -> None:
+    """Pre-create the PI-isolated agent's workspace bind-mount source dir as
+    the uid-1000 supervisor user (same root-owned-auto-create guard as
+    ``_pi_ensure_workspace``). No credentials are staged — PI-isolated agents
+    are PI-owned; they boot un-authed and the PI runs ``/login`` in the tab
+    (or pulls the supervisor's creds via the manual ``rs-pi sync-creds``
+    bridge). bypassPermissions config is baked into ``rs-pi-base``, the
+    isolated image's ancestor."""
+    script = f"mkdir -p /workspace/pi-isolated/{name}"
     r = run(["docker", "exec", supervisor, "bash", "-eu", "-c", script],
             capture_output=True)
     if r.returncode != 0:
         die((r.stderr or r.stdout).strip()
-            or f"failed to stage creds for pi-isolated {name!r}")
+            or f"failed to ensure workspace dir for pi-isolated {name!r}")
 
 
 def _pi_isolated_inner_running(supervisor: str, name: str) -> bool:
@@ -3731,7 +3661,7 @@ def _pi_isolated_start(supervisor: str, project: str, cfg: "Config",
     cname = pi_isolated.container_name(name)
     run(["docker", "exec", supervisor, "docker", "rm", "-f", cname],
         capture_output=True)
-    _pi_isolated_stage_creds(supervisor, name)
+    _pi_isolated_ensure_workspace(supervisor, name)
     stage_worker_image(supervisor, PI_ISOLATED_IMAGE, force=force_restage)
 
     mount = entry.get("mount") or pi_isolated_registry.DEFAULT_MOUNT
@@ -3746,8 +3676,9 @@ def _pi_isolated_start(supervisor: str, project: str, cfg: "Config",
         # isolated from the supervisor's /workspace by construction (separate
         # bind source).
         "-v", f"/workspace/pi-isolated/{name}:/workspace",
-        # Cred seed (RO parent-dir mount; pi-creds-watch.sh refreshes live).
-        "-v", f"/workspace/.pi-isolated/{name}/.creds:/creds:ro",
+        # No /creds mount: PI-isolated agents are PI-owned and boot un-authed.
+        # The PI runs `/login` in the tab, or the operator pulls the
+        # supervisor's creds via `rs-pi sync-creds` (docker cp + install).
         # External host folder (<root>/<project>/) at the configured mount —
         # the PI's own content folder (e.g. a vault), kept clean. The repo is
         # cloned to /workspace/<repo-name>, NOT here. RS_PI_ISO_MOUNT (below)
@@ -3758,9 +3689,9 @@ def _pi_isolated_start(supervisor: str, project: str, cfg: "Config",
         "-e", f"RS_PI_ISO_REF={entry.get('ref') or ''}",
         "-e", f"RS_PI_ISO_SETUP={entry.get('setup') or ''}",
         "-e", f"RS_PI_ISO_MOUNT={mount}",
-        # research.pi_role label is the cred-propagation opt-in marker
-        # (pi-creds-watch.sh + rs-pi sync-creds filter on this label key,
-        # not a name glob), so isolated containers get cred fan-out free.
+        # research.pi_role label is the manual-sync target marker
+        # (rs-pi sync-creds filters on this label key, not a name glob),
+        # so `rs-pi sync-creds` reaches isolated containers too.
         "--label", f"research.pi_role=iso-{name}",
         "--label", f"research.pi_isolated={name}",
         "--label", f"research.project={project}",
@@ -4744,10 +4675,10 @@ def build_parser() -> argparse.ArgumentParser:
     pis.set_defaults(func=cmd_project_pi_status)
 
     pisc = pi_sub.add_parser("sync-creds",
-                             help="manually re-propagate supervisor "
-                                  "creds into every running PI role "
-                                  "container (fallback for the inotify "
-                                  "watcher)")
+                             help="push the supervisor's creds into every "
+                                  "running PI container (operator-initiated; "
+                                  "PI containers are otherwise PI-authed via "
+                                  "in-tab /login)")
     pisc.add_argument("project")
     pisc.set_defaults(func=cmd_project_pi_sync_creds)
 

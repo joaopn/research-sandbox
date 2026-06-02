@@ -17,7 +17,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fuse-overlayfs \
     uidmap \
     crun \
-    inotify-tools \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Docker CE from Docker's official installer, pinned to a specific
@@ -99,14 +98,13 @@ COPY container/supervisor/inner-firewall.sh /usr/local/bin/rs-inner-firewall
 RUN chmod +x /usr/local/bin/rs-inner-firewall
 
 # PI-role substrate (STAGE_BACKEND_PI P.0): supervisor-side CLI for
-# attaching to PI containers + inotify watcher that propagates supervisor
-# cred writes into running PI containers. Both are baked into the
-# supervisor image (PI containers themselves are managed from the
-# supervisor, never from inside themselves). The watcher is launched by
-# entrypoint.supervisor.sh in a supervised loop.
+# attaching to PI containers and the manual `rs-pi sync-creds` cred bridge
+# (PI containers are PI-owned and otherwise PI-authed via in-tab /login;
+# there is no automatic cred propagation — STAGE_PI_AUTH_OWNERSHIP). Baked
+# into the supervisor image since PI containers are managed from the
+# supervisor, never from inside themselves.
 COPY agent/scripts/rs-pi              /usr/local/bin/rs-pi
-COPY agent/scripts/pi-creds-watch.sh  /usr/local/bin/pi-creds-watch
-RUN chmod +x /usr/local/bin/rs-pi /usr/local/bin/pi-creds-watch
+RUN chmod +x /usr/local/bin/rs-pi
 
 # role-MCP-side companion to `rs-pi`. Exposes `list` and `sync-creds`
 # for the worker-facing role-MCP containers. No inotify watcher

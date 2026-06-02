@@ -3,18 +3,19 @@
 #
 # Expected mounts (provided by the supervisor's `pi enable` call):
 #   /workspace          — per-role RW state (role.md, .claude/, sessions/, …)
-#   /creds              — RO snapshot of supervisor creds (.credentials.json,
-#                         optional settings.json). Parent-dir bind-mount so
-#                         atomic-rename writes by the supervisor stay visible.
+#
+# Auth: PI containers are PI-owned and boot un-authed. No creds are staged
+# here — the PI authenticates in the tab (`/login`), or the operator pushes
+# the supervisor's creds in via `rs-pi sync-creds` (docker cp + install, no
+# mount). bypassPermissions config is baked into rs-pi-base's settings.json.
 #
 # Expected environment:
 #   RS_PI_ROLE          — e.g. echo, wrangler, librarian, websearcher
 #
 # Startup order:
 #   1. Restore home skel (volume hides image contents).
-#   2. Stage creds from /creds → ~/.claude/.
-#   3. Stage role.md from /opt/pi-templates/<role>/role.md if absent.
-#   4. tail -f /dev/null — keep the container up; byobu sessions are
+#   2. Stage role.md from /opt/pi-templates/<role>/role.md if absent.
+#   3. tail -f /dev/null — keep the container up; byobu sessions are
 #      created on first webui tab connect.
 
 set -euo pipefail
@@ -30,35 +31,11 @@ fi
 # Written every boot — see entrypoint.supervisor.sh for the rationale.
 echo "${RS_PI_ROLE}" > ~/.rs-role
 
-# --- Stage creds (in-container claude needs OAuth) -------------------------
-# The supervisor stages its current ~/.claude/.credentials.json into the
-# per-role creds bind-mount source at /workspace/.pi/<role>/.creds/ on
-# enable, and the inotify watcher on the supervisor re-stages on re-auth.
-# We copy it into the runtime user's home so the inner claude picks it up.
-# Failure is fatal — claude won't work without creds, and we'd rather fail
-# loud at boot than silent in a session.
-if [[ -f /creds/.credentials.json ]]; then
-    mkdir -p ~/.claude
-    cp /creds/.credentials.json ~/.claude/.credentials.json
-    chmod 600 ~/.claude/.credentials.json
-else
-    echo "pi[${RS_PI_ROLE}]: missing /creds/.credentials.json" >&2
-    echo "pi[${RS_PI_ROLE}]: refusing to start — supervisor staging step was skipped or supervisor is unauthenticated" >&2
-    exit 2
-fi
-# Optional: settings (theme, verbosity). Tolerant of absence.
-if [[ -f /creds/settings.json ]]; then
-    cp /creds/settings.json ~/.claude/settings.json
-fi
-# Restore ~/.claude.json (sibling of ~/.claude/, carrying `oauthAccount`
-# + onboarding state). Without it, interactive `claude` inside this PI
-# tab prompts for /login on every attach. The supervisor stages it
-# under the sentinel name `home_claude.json` in /creds/ to avoid
-# colliding with the ~/.claude/-dir convention.
-if [[ -f /creds/home_claude.json ]]; then
-    cp /creds/home_claude.json ~/.claude.json
-    chmod 600 ~/.claude.json
-fi
+# --- Auth: PI-owned, no staging --------------------------------------------
+# Nothing to do here. PI containers boot un-authed; the PI runs `/login` in
+# the tab, or the operator pushes the supervisor's creds in via
+# `rs-pi sync-creds`. settings.json (bypassPermissions) is baked into the
+# rs-pi-base image, so interactive claude doesn't permission-prompt.
 
 # --- Stage role.md from template if absent ---------------------------------
 # Workspace-template-refresh idiom: copy on first boot only; PI's edits to
@@ -365,7 +342,7 @@ if [[ -f /workspace/.tools-inventory.md ]]; then
     echo "pi[${RS_PI_ROLE}]: .mcp.json + .tools-inventory.md rendered"
 fi
 
-echo "pi[${RS_PI_ROLE}]: ready (workspace at /workspace, creds staged)"
+echo "pi[${RS_PI_ROLE}]: ready (workspace at /workspace; PI-authed via /login or rs-pi sync-creds)"
 
 # --- Keep the container alive ----------------------------------------------
 # byobu sessions get created on first webui tab connect via the registered

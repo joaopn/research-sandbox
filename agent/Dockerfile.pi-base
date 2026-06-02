@@ -23,5 +23,25 @@ RUN mkdir -p /opt/pi-templates && chown -R worker:worker /opt/pi-templates
 USER worker
 WORKDIR /workspace
 
+# Bake the PI's claude config (NOT auth). PI containers are PI-owned and boot
+# un-authed — creds arrive via in-tab /login or `rs-pi sync-creds`
+# (STAGE_PI_AUTH_OWNERSHIP). But config still ships from the image: interactive
+# `claude` in a PI tab runs WITHOUT a --permission-mode flag (unlike the
+# headless worker/role-MCP paths), so it reads defaultMode from settings.json.
+# Without this, every PI tab would permission-prompt on every tool call. No
+# `hooks` key — the supervisor's rs-audit-stop Stop hook doesn't exist here.
+# /home/worker is image-resident (only /workspace is bind-mounted; ~/.bashrc
+# is present so entrypoint's skel-restore is skipped), so this persists at
+# runtime for both pi-roles and pi-isolated (rs-pi-base is their ancestor).
+RUN mkdir -p /home/worker/.claude && \
+    printf '%s\n' \
+      '{' \
+      '  "permissions": {' \
+      '    "defaultMode": "bypassPermissions"' \
+      '  },' \
+      '  "theme": "dark"' \
+      '}' > /home/worker/.claude/settings.json && \
+    chmod 600 /home/worker/.claude/settings.json
+
 # tini comes from analysis-base. PID 1 is tini; entrypoint is /entrypoint.sh.
 ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]

@@ -3,8 +3,10 @@
 #
 # Dual-surface companion to the webui PI tabs. Webui is the primary
 # surface; rs-pi is for power users who prefer xterm+byobu, plus carries
-# the `sync-creds` belt-and-braces helper for the case where the
-# pi-creds-watch.sh inotify propagator failed or hasn't run yet.
+# `sync-creds` — the supervisor→PI credential bridge. PI containers are
+# PI-owned and otherwise authenticate themselves (in-tab /login); nothing
+# propagates creds automatically, so this is the one operator-initiated way
+# to hand a PI the supervisor's identity (STAGE_PI_AUTH_OWNERSHIP).
 #
 # Subcommands:
 #   rs-pi <role>          docker exec into rs-pi-<role>; byobu attach
@@ -13,9 +15,10 @@
 #                         decide whether to start `claude` (real roles)
 #                         or `bash -l` (pi-echo).
 #   rs-pi list            list running pi containers + their IPs.
-#   rs-pi sync-creds      manually re-stage supervisor creds into every
-#                         running pi container. Same idempotent path the
-#                         inotify watcher uses.
+#   rs-pi sync-creds      push supervisor creds into every running pi
+#                         container. Idempotent (hash-compare + docker cp +
+#                         install). Operator-initiated; auth only, never
+#                         settings.json (config is baked into rs-pi-base).
 #
 # This script is baked into the supervisor image and lives at
 # /usr/local/bin/rs-pi. PI containers themselves don't need rs-pi — they
@@ -51,8 +54,9 @@ cmd_list() {
 # mcpContextUris. Propagating the latter leaks supervisor state into the
 # PI's claude /resume UI (visible as foreign prompts and inherited tool
 # trust). Keep only the keys the PI's interactive `claude` actually needs
-# to skip /login. Same key set used by pi-creds-watch.sh and the boot-
-# time stage in research.py's `_pi_stage_creds`.
+# to skip /login. This is the only place the four-key allowlist still
+# lives — the boot-time staging and the inotify watcher that also used it
+# were removed (STAGE_PI_AUTH_OWNERSHIP).
 HOME_JSON_ALLOWLIST_JQ='{oauthAccount, userID, hasCompletedOnboarding, lastOnboardingVersion} | with_entries(select(.value != null))'
 
 cmd_sync_creds() {
