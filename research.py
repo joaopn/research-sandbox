@@ -871,37 +871,29 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     if granted:
         _supervisor_mcp_reload(container_name)
 
-    # 6d. worker sugar (--enable <worker>). A worker (role-MCP service) is
-    #     skipped silently if the supervisor is not yet authenticated — it
-    #     stages creds at start time. Enabling a worker auto-enables its
-    #     baked sandbox mirror (wrangler / websearcher) in lockstep unless
+    # 6d. worker sugar (--enable <worker>). Enablement is independent of auth
+    #     (the worker-side twin of the PI auth-ownership model): a worker
+    #     (role-MCP service) is always brought up, authed or not. When the
+    #     supervisor is un-authed the daemon boots idle and refuses send_job
+    #     with a structured `needs_credentials` envelope; the supervisor's
+    #     claude runs `rs-role-mcp sync-creds` (after `/login`) to stage its
+    #     own creds before first use. Enabling a worker auto-enables its baked
+    #     sandbox mirror (wrangler / websearcher) in lockstep unless
     #     --no-sandbox-mirror was passed.
     workers_enabled: list[str] = []
-    creds_present = run(["docker", "exec", container_name, "test", "-f",
-                         "/home/research/.claude/.credentials.json"],
-                        capture_output=True).returncode == 0
-    if enable_workers:
-        if not creds_present:
-            print("note: --enable <worker> requires supervisor auth; "
-                  "skipping worker activation. After authenticating "
-                  "(see Next steps below), run:", file=sys.stderr)
-            for role in enable_workers:
-                print(f"   research project worker enable {project} {role}",
-                      file=sys.stderr)
-        else:
-            for role in enable_workers:
-                upstreams_for_role = role_mcp_explicit.get(role)
-                try:
-                    _role_mcp_enable(
-                        project, cfg, role, upstreams_for_role,
-                        no_pi_mirror=enable_no_sandbox_mirror,
-                    )
-                    workers_enabled.append(role)
-                except SystemExit:
-                    print(f"warning: failed to enable worker {role!r}; "
-                          "retry manually with "
-                          f"`research project worker enable {project} {role}`",
-                          file=sys.stderr)
+    for role in enable_workers:
+        upstreams_for_role = role_mcp_explicit.get(role)
+        try:
+            _role_mcp_enable(
+                project, cfg, role, upstreams_for_role,
+                no_pi_mirror=enable_no_sandbox_mirror,
+            )
+            workers_enabled.append(role)
+        except SystemExit:
+            print(f"warning: failed to enable worker {role!r}; "
+                  "retry manually with "
+                  f"`research project worker enable {project} {role}`",
+                  file=sys.stderr)
 
     # 6e. sandbox sugar (--enable <sandbox>). UNLIKE workers, sandboxes do
     #     NOT require supervisor auth: they're PI-owned and boot un-authed
@@ -951,12 +943,12 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     else:
         webui_block = ""
 
-    # Pending activations (role-MCPs / PI roles requested via --enable
-    # but not successfully enabled). Two distinct reasons:
-    #   (a) creds not present at create time → activation skipped silently
-    #   (b) creds present but _role_mcp_enable / _sandbox_enable raised → catch
-    #       block above appended to the warnings; the role didn't land.
-    # The "Next steps" wording reflects the actual cause.
+    # Pending activations (workers / sandboxes requested via --enable but not
+    # successfully enabled). Workers are no longer auth-gated at create — they
+    # boot idle un-authed — so the only way one lands here is an actual enable
+    # failure (`_role_mcp_enable` / `_sandbox_enable` raised; e.g. a sandbox's
+    # W10 mirror-twin gate). The catch blocks above already emitted a warning;
+    # the "Next steps" footer just points at the manual retry.
     pending_workers = [r for r in enable_workers if r not in workers_enabled]
     pending_sandboxes = [n for n in enable_sandboxes
                          if n not in sandboxes_enabled]
@@ -980,12 +972,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
             cmds.append(f"       python research.py project worker enable {project} {r}")
         for n in pending_sandboxes:
             cmds.append(f"       python research.py project sandbox enable {project} {n}")
-        # Two failure modes: "creds weren't present" vs "enable raised
-        # despite creds present" — different actionable guidance.
-        if not creds_present:
-            reason = "(skipped at create because the supervisor wasn't authed yet):"
-        else:
-            reason = "(enable failed at create — see the warnings above for the cause, fix it, then re-run):"
+        reason = "(enable failed at create — see the warnings above for the cause, fix it, then re-run):"
         step_lines = [
             f"  {len(steps)+1}. Finish activating the deferred workers / sandboxes",
             f"     {reason}",
@@ -2789,8 +2776,17 @@ def cmd_project_mcp_sync(args: argparse.Namespace) -> None:
 def _role_mcp_stage_creds(supervisor: str, role: str) -> None:
     """Snapshot the supervisor's current Claude credentials into the
     per-role daemon-state dir so the role-MCP container can stage them at
-    boot. Idempotent: overwrites any previous snapshot. Errors are fatal —
-    a role-MCP without creds is useless (spawned `claude -p` fails).
+    boot. Idempotent: overwrites any previous snapshot.
+
+    Tolerant of an un-authed supervisor: if the supervisor has no
+    `.credentials.json` yet, this stages nothing and returns cleanly — it
+    does NOT fail. Enablement is independent of auth (the worker-side twin
+    of the PI auth-ownership model): the daemon boots idle and the
+    supervisor's claude copies its own creds in later via
+    `rs-role-mcp sync-creds`, prompted by the `needs_credentials` send_job
+    envelope. The `mkdir -p` below is kept unconditionally — it is the
+    load-bearing root-owned-bind-source guard, needed whether or not creds
+    exist.
 
     Path note: creds land under .role-mcps/<role>/.creds/ (the daemon-state
     location), NOT under shared/<role>/ which is reserved for the role's
@@ -2809,12 +2805,12 @@ def _role_mcp_stage_creds(supervisor: str, role: str) -> None:
     # `.credentials.json` alone — no `~/.claude.json` propagation here.
     script = f"""
         set -e
-        if [ ! -f /home/research/.claude/.credentials.json ]; then
-            echo "supervisor is not authenticated (no ~/.claude/.credentials.json)" >&2
-            exit 2
-        fi
         mkdir -p /workspace/.role-mcps/{role}/.creds
         mkdir -p /workspace/shared/{role}
+        if [ ! -f /home/research/.claude/.credentials.json ]; then
+            echo "supervisor not yet authenticated; role-mcp {role} will boot idle (run rs-role-mcp sync-creds after /login)" >&2
+            exit 0
+        fi
         cp /home/research/.claude/.credentials.json \
            /workspace/.role-mcps/{role}/.creds/.credentials.json
         chmod 600 /workspace/.role-mcps/{role}/.creds/.credentials.json

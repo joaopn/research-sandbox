@@ -34,17 +34,23 @@ fi
 
 # --- Stage creds (per-call spawned claude -p needs OAuth) -----------------
 # The supervisor copies its current ~/.claude/.credentials.json into the
-# per-role workspace at /workspace/.creds/.credentials.json on each
-# `role-mcp enable`. Stage that into the runtime user's home so claude -p
-# picks it up. Failure is fatal — the daemon is useless without creds.
+# per-role workspace at /workspace/.creds/.credentials.json (at enable time
+# if it was already authed, otherwise later via `rs-role-mcp sync-creds`).
+# Stage that into the runtime user's home so claude -p picks it up.
+#
+# Boot is NOT gated on creds (enablement is independent of auth — the
+# worker-side twin of the PI auth-ownership model). When the supervisor is
+# still un-authed the file is simply absent: the daemon boots idle and
+# refuses send_job with a structured `needs_credentials` envelope until the
+# supervisor runs `rs-role-mcp sync-creds`. This MUST stay a tolerant copy
+# with no `exit` on the missing-file path — a fatal block here would
+# crash-loop every role-MCP on every un-authed boot.
 if [[ -f /workspace/.creds/.credentials.json ]]; then
     mkdir -p ~/.claude
     cp /workspace/.creds/.credentials.json ~/.claude/.credentials.json
     chmod 600 ~/.claude/.credentials.json
 else
-    echo "role-mcp[${RS_ROLE_NAME}]: missing /workspace/.creds/.credentials.json" >&2
-    echo "role-mcp[${RS_ROLE_NAME}]: refusing to start — run \`research project role-mcp enable\` to stage creds" >&2
-    exit 2
+    echo "role-mcp[${RS_ROLE_NAME}]: no creds staged yet — booting idle; run \`rs-role-mcp sync-creds\` from the supervisor before send_job" >&2
 fi
 # Optional: settings (theme, verbosity). Tolerant of absence.
 if [[ -f /workspace/.creds/settings.json ]]; then

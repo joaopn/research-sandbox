@@ -334,15 +334,18 @@ Routine waiting, routine iterations, "the output's off by one column" — do not
 
 When you observe a worker or role-MCP failing with `HTTP 401` from `api.anthropic.com`, `Not logged in`, or any other Claude auth-related error, the cause is almost always stale credentials — usually because the PI re-`/login`ed in your byobu session and the existing worker/role-MCP containers are still holding the older creds. Your responsibility: refresh them in place.
 
+A role-MCP service container also boots **un-authed and idle** on a freshly-created project: enabling a worker is independent of auth, so the container comes up before you've `/login`ed. It needs no creds to idle — it only needs them when it actually spawns `claude -p` on a `send_job`. The first `send_job` to such a worker returns a structured `needs_credentials` envelope (not a 401) telling you to sync first; see the row below.
+
 | Symptom location | Fix |
 |---|---|
 | `rs-worker tail <name>` stream-json log shows `401` / `auth` error, or `rs-worker status` reports the worker exited with auth-shaped output | `rs-worker sync-creds <name>` — hash-compares + `docker cp + install` your current `~/.claude/.credentials.json` into the worker. Idempotent. After the refresh, `rs-worker message` to retry the in-flight turn, or respawn if the worker exited. |
 | A role-MCP returns an MCP tool error citing 401 from `send_job`, or `query_job_status` shows a failed-with-auth result | `rs-role-mcp sync-creds` — refreshes every running role-MCP in one shot. After, retry `send_job`. |
+| A role-MCP `send_job` returns the tool-error envelope `{"reason": "needs_credentials", ...}` (the worker is enabled but has no creds staged yet — typical right after `project create` on a still-un-authed supervisor) | First make sure you've authenticated this supervisor (`claude` + `/login` in byobu) if you haven't. Then `rs-role-mcp sync-creds` to copy your creds into every running role-MCP, and retry `send_job`. No job was registered or spawned — the refusal is free. |
 | The PI's interactive PI tab (pi-wrangler / pi-websearcher / etc.) prompts `/login` | Not your problem, and by design. PI containers are PI-owned — they boot un-authed and the PI authenticates in their own tab (`/login`). Nothing propagates your creds automatically. If the PI would rather inherit your identity than log in themselves, the operator runs `research project pi sync-creds <project>` host-side (one-shot, operator-initiated). |
 
 Both `rs-worker sync-creds` and `rs-role-mcp sync-creds` operate on the local supervisor only — running workers and role-MCPs in YOUR inner dockerd. They do NOT touch other projects: this project's credentials are owned by THIS supervisor, and there is no cross-project propagation surface. The PI re-authenticates each project independently via `claude` + `/login` inside its supervisor.
 
-**Don't preemptively sync.** Only refresh on observed auth failure. Re-OAuths are infrequent and most worker/role-MCP sessions outlive them without issue.
+**Don't preemptively sync.** Refresh on a signal, not on a schedule: an observed `401`/auth failure, or a `needs_credentials` envelope on first use of an un-authed worker. Both are the daemon telling you it needs creds — that's the cue to `sync-creds`, not a reason to push creds into every container speculatively. Re-OAuths are infrequent and most worker/role-MCP sessions outlive them without issue.
 
 **Don't recreate / destroy on auth failure.** `sync-creds` is the fix; recreate is for plan-level changes (different MCPs, different image, different data mounts).
 

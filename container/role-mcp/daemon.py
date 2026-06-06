@@ -89,6 +89,18 @@ MAX_CONCURRENT_CALLS = int(os.environ.get("RS_ROLE_MAX_CONCURRENT_CALLS", "0"))
 # hint only.
 RETRY_AFTER_HINT_SECONDS = 30
 
+# OAuth credentials the spawned `claude -p` authenticates from. Staged by the
+# entrypoint at boot (if the supervisor was already authed) or copied in later
+# by `rs-role-mcp sync-creds`. Enablement is independent of auth: the daemon
+# boots and idles without this file present, and refuses send_job with a
+# structured `needs_credentials` envelope until it appears. Checked fresh per
+# send_job (not cached at boot) so a later sync-creds is picked up with no
+# daemon restart. HOME is /home/worker inside every role-MCP container.
+CREDENTIALS_PATH = Path(
+    os.environ.get("RS_ROLE_CREDENTIALS_PATH",
+                   str(Path.home() / ".claude" / ".credentials.json"))
+)
+
 # Directories the daemon owns on the workspace bind-mount.
 JOBS_DIR = WORKSPACE / "jobs"
 MEMORIES_DIR = WORKSPACE / "memories"
@@ -176,6 +188,25 @@ class ConcurrencyLimitError(Exception):
             "in_flight": self.in_flight,
             "limit": self.limit,
             "retry_after_hint_seconds": RETRY_AFTER_HINT_SECONDS,
+        }
+
+
+class NeedsCredentialsError(Exception):
+    """Raised by tool_send_job when no usable `.credentials.json` is staged —
+    the supervisor enabled this worker but hasn't run `rs-role-mcp sync-creds`
+    yet (enablement is independent of auth). Surfaces as the same MCP
+    tool-error envelope shape as ConcurrencyLimitError (`isError: true` +
+    structured JSON text), so the caller's role.md / the supervisor's claude
+    can parse `reason: "needs_credentials"` and run sync-creds, instead of
+    letting the spawned `claude -p` fail with an opaque 401."""
+
+    def __init__(self) -> None:
+        super().__init__("needs_credentials: no .credentials.json staged")
+
+    def to_payload(self) -> dict:
+        return {
+            "reason": "needs_credentials",
+            "remedy": "run `rs-role-mcp sync-creds` from the supervisor, then retry",
         }
 
 
@@ -597,6 +628,14 @@ async def tool_send_job(jobs: JobTable, spawner: Spawner,
     if not isinstance(task, str) or not task:
         raise ValueError("'task' is required")
 
+    # Enablement is independent of auth — the daemon may be running idle on a
+    # supervisor that hasn't synced creds yet. Refuse before registering a job
+    # or spawning, so the caller gets a structured remedy instead of a 401
+    # from a doomed `claude -p`. Checked per-call so a later sync-creds is
+    # picked up live.
+    if not CREDENTIALS_PATH.is_file():
+        raise NeedsCredentialsError()
+
     job_id, call_id = await jobs.register(caller, mode)
 
     if mode == "sync":
@@ -764,6 +803,15 @@ async def handle_mcp(request: web.Request) -> web.Response:
             print(
                 f"role-mcp[{ROLE}]: refused send_job — concurrency_limit "
                 f"in_flight={e.in_flight} limit={e.limit}",
+                file=sys.stderr,
+            )
+            return web.json_response(_rpc_result(rid, _tool_text_result(
+                e.to_payload(),
+            ) | {"isError": True}))
+        except NeedsCredentialsError as e:
+            print(
+                f"role-mcp[{ROLE}]: refused send_job — needs_credentials "
+                f"(no creds staged; run rs-role-mcp sync-creds)",
                 file=sys.stderr,
             )
             return web.json_response(_rpc_result(rid, _tool_text_result(
