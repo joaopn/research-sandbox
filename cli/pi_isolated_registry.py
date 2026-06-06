@@ -45,8 +45,11 @@ from pathlib import Path
 from typing import Any, Iterator
 
 REGISTRY_DIR = Path.home() / ".research-sandbox"
-REGISTRY_PATH = REGISTRY_DIR / "pi-isolated-registry.json"
-LOCK_PATH = REGISTRY_DIR / "pi-isolated-registry.lock"
+# The BYO sandbox type registry. Renamed from pi-isolated-registry.json with
+# the CLI-taxonomy refactor (greenfield — no existing registry to migrate);
+# this module is now the BYO sub-component of cli/sandbox.py.
+REGISTRY_PATH = REGISTRY_DIR / "sandbox-registry.json"
+LOCK_PATH = REGISTRY_DIR / "sandbox-registry.lock"
 
 VERSION = 1
 DEFAULT_MOUNT = "/workspace/external"

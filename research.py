@@ -44,10 +44,9 @@ from pathlib import Path
 # Make cli/ helpers importable.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "cli"))
 import mcp_registry  # noqa: E402
-import pi as pi_roles  # noqa: E402
-import pi_isolated  # noqa: E402
-import pi_isolated_registry  # noqa: E402
+import pi_isolated_registry  # noqa: E402  (BYO sandbox type registry; sub-component of sandbox)
 import role_mcp  # noqa: E402
+import sandbox  # noqa: E402  (unified PI-driven container surface; absorbs former pi + pi_isolated)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -603,10 +602,10 @@ def _build_images(force: bool) -> None:
     # PI per-role images (rs-pi-echo, rs-pi-wrangler, …) FROM rs-pi-base.
     # Build order is bottom-up so each FROM resolves to the freshly-built
     # layer, same discipline as role-mcp-base.
-    for role, image in sorted(pi_roles.PI_IMAGES.items()):
-        dockerfile = SCRIPT_DIR / "agent" / f"Dockerfile.{role}"
+    for role, image in sorted(sandbox.BAKED_IMAGES.items()):
+        dockerfile = SCRIPT_DIR / "agent" / f"Dockerfile.pi-{role}"
         if not dockerfile.is_file():
-            print(f"warning: pi image {image} has no Dockerfile at "
+            print(f"warning: sandbox image {image} has no Dockerfile at "
                   f"{dockerfile.name}; skipping (add it in the per-role stage)",
                   file=sys.stderr)
             continue
@@ -782,28 +781,16 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     # supervisor is up and creds are ready).
     enable_arg = getattr(args, "enable", None)
     disable_arg = getattr(args, "disable", None)
-    enable_services, enable_role_mcps, enable_pi_roles, enable_pi_isolated, \
-        enable_no_pi_mirror = _split_enable_tokens(enable_arg)
-    disable_services, disable_pi_roles, disable_pi_isolated = \
-        _split_disable_tokens(disable_arg)
+    enable_services, enable_workers, enable_sandboxes, \
+        enable_no_sandbox_mirror = _split_enable_tokens(enable_arg)
+    disable_services, disable_sandboxes = _split_disable_tokens(disable_arg)
     role_mcp_explicit = _parse_role_mcp_upstream(
         getattr(args, "role_mcp_upstream", None) or [],
-        valid_roles=set(enable_role_mcps),
+        valid_roles=set(enable_workers),
     )
-    if enable_role_mcps:
-        for role in enable_role_mcps:
-            try:
-                role_mcp.validate_role(role)
-            except ValueError as e:
-                die(str(e))
-    for role in enable_pi_roles:
+    for role in enable_workers:
         try:
-            pi_roles.validate_role(role)
-        except ValueError as e:
-            die(str(e))
-    for role in disable_pi_roles:
-        try:
-            pi_roles.validate_role(role)
+            role_mcp.validate_role(role)
         except ValueError as e:
             die(str(e))
     service_flags = _compute_service_flags(
@@ -832,7 +819,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     # (<root>/<project>/ → /external/<type>). Computed fresh from the host
     # registry so enabling a known type later is a pure inner-container op
     # (no supervisor recreate). See STAGE_PI_ISOLATED "two-hop mount".
-    ext_mounts = _pi_isolated_external_mounts(project)
+    ext_mounts = _sandbox_external_mounts(project)
     if ext_mounts:
         docker_args = docker_args[:-1] + ext_mounts + [docker_args[-1]]
 
@@ -867,82 +854,61 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     if granted:
         _supervisor_mcp_reload(container_name)
 
-    # 6d. role-mcp sugar (--enable <role>). Skipped silently if the
-    #     supervisor is not yet authenticated — the user must run
-    #     `claude` once and then `research project role-mcp enable …`
-    #     manually, because we need creds to stage at start time. This
-    #     mirrors the rs-worker creds requirement.
-    role_mcps_enabled: list[str] = []
+    # 6d. worker sugar (--enable <worker>). A worker (role-MCP service) is
+    #     skipped silently if the supervisor is not yet authenticated — it
+    #     stages creds at start time. Enabling a worker auto-enables its
+    #     baked sandbox mirror (wrangler / websearcher) in lockstep unless
+    #     --no-sandbox-mirror was passed.
+    workers_enabled: list[str] = []
     creds_present = run(["docker", "exec", container_name, "test", "-f",
                          "/home/research/.claude/.credentials.json"],
                         capture_output=True).returncode == 0
-    if enable_role_mcps:
+    if enable_workers:
         if not creds_present:
-            print("note: --enable <role-mcp-name> requires supervisor auth; "
-                  "skipping role-mcp activation. After authenticating "
+            print("note: --enable <worker> requires supervisor auth; "
+                  "skipping worker activation. After authenticating "
                   "(see Next steps below), run:", file=sys.stderr)
-            for role in enable_role_mcps:
-                print(f"   research project role-mcp enable {project} {role}",
+            for role in enable_workers:
+                print(f"   research project worker enable {project} {role}",
                       file=sys.stderr)
         else:
-            for role in enable_role_mcps:
+            for role in enable_workers:
                 upstreams_for_role = role_mcp_explicit.get(role)
                 try:
                     _role_mcp_enable(
                         project, cfg, role, upstreams_for_role,
-                        no_pi_mirror=enable_no_pi_mirror,
+                        no_pi_mirror=enable_no_sandbox_mirror,
                     )
-                    role_mcps_enabled.append(role)
+                    workers_enabled.append(role)
                 except SystemExit:
-                    print(f"warning: failed to enable role-mcp {role!r}; "
+                    print(f"warning: failed to enable worker {role!r}; "
                           "retry manually with "
-                          f"`research project role-mcp enable {project} {role}`",
+                          f"`research project worker enable {project} {role}`",
                           file=sys.stderr)
 
-    # 6e. pi-role sugar (--enable pi-<role>). UNLIKE role-MCPs, PI roles do
-    #     NOT require supervisor auth to come up: PI containers are PI-owned
-    #     and boot un-authed (no creds staged), the PI authenticating in-tab
-    #     (`/login`) or via the manual `rs-pi sync-creds` bridge. So we always
-    #     enable, regardless of creds_present — same posture as pi-isolated
-    #     below. (`_pi_enable` may still refuse for a mirror role whose
-    #     worker-facing role-MCP isn't enabled — the W10 gate, unrelated to
-    #     auth.)
-    pi_roles_enabled: list[str] = []
-    for role in enable_pi_roles:
+    # 6e. sandbox sugar (--enable <sandbox>). UNLIKE workers, sandboxes do
+    #     NOT require supervisor auth: they're PI-owned and boot un-authed
+    #     (no creds staged), the PI authenticating in-tab (`/login`) or via
+    #     the manual `rs-pi sync-creds` bridge. So we always enable. A baked
+    #     mirror sandbox may still be refused by the W10 gate if its worker
+    #     twin isn't enabled — unrelated to auth. (Twin sandboxes auto-enabled
+    #     by 6d above are skipped here to avoid a redundant start.)
+    sandboxes_enabled: list[str] = []
+    for name in enable_sandboxes:
         try:
-            _pi_enable(project, cfg, role)
-            pi_roles_enabled.append(role)
+            _sandbox_enable(project, cfg, name)
+            sandboxes_enabled.append(name)
         except SystemExit:
-            print(f"warning: failed to enable pi role {role!r}; "
+            print(f"warning: failed to enable sandbox {name!r}; "
                   "retry manually with "
-                  f"`research project pi enable {project} {role}`",
+                  f"`research project sandbox enable {project} {name}`",
                   file=sys.stderr)
-
-    # 6f. pi-isolated sugar (--enable <type>). UNLIKE role-MCPs / baked PI
-    #     roles, a PI-isolated agent does NOT require supervisor auth to come
-    #     up: it's a plain sandbox — the entrypoint clones the repo, runs
-    #     setup, and idles, and the tab is a login shell (not claude). The PI
-    #     starts claude / authenticates / pulls skills there, in any order.
-    #     So we always enable, regardless of creds_present. Each type's
-    #     external folder was pre-wired into the supervisor at create (the
-    #     build args above enumerate the registry), so enable is a pure
-    #     inner-container start with no recreate. Creds are still staged if
-    #     present (so a later `claude` skips /login) and tolerated if absent.
-    pi_isolated_enabled: list[str] = []
-    for name in enable_pi_isolated:
-        try:
-            _pi_isolated_enable(project, cfg, name)
-            pi_isolated_enabled.append(name)
-        except SystemExit:
-            print(f"warning: failed to enable pi-isolated {name!r}; "
-                  "retry manually with `research project pi-isolated "
-                  f"enable {project} {name}`", file=sys.stderr)
 
     # 7. Report.
     inner_fw = "on" if getattr(args, "inner_firewall", False) else "off"
     mcps_line = ", ".join(granted) if granted else "(none)"
-    role_mcps_line = ", ".join(role_mcps_enabled) if role_mcps_enabled else "(none)"
-    pi_roles_line = ", ".join(pi_roles_enabled) if pi_roles_enabled else "(none)"
+    role_mcps_line = ", ".join(workers_enabled) if workers_enabled else "(none)"
+    pi_roles_line = ", ".join(sandboxes_enabled) if sandboxes_enabled else "(none)"
     if data_basenames:
         data_lines = "\n".join(
             f"             /workspace/shared/data/{b}/  ←  {src}"
@@ -969,14 +935,13 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     # Pending activations (role-MCPs / PI roles requested via --enable
     # but not successfully enabled). Two distinct reasons:
     #   (a) creds not present at create time → activation skipped silently
-    #   (b) creds present but _role_mcp_enable / _pi_enable raised → catch
+    #   (b) creds present but _role_mcp_enable / _sandbox_enable raised → catch
     #       block above appended to the warnings; the role didn't land.
     # The "Next steps" wording reflects the actual cause.
-    pending_role_mcps = [r for r in enable_role_mcps if r not in role_mcps_enabled]
-    pending_pi_roles = [r for r in enable_pi_roles if r not in pi_roles_enabled]
-    pending_pi_isolated = [n for n in enable_pi_isolated
-                           if n not in pi_isolated_enabled]
-    pending = bool(pending_role_mcps or pending_pi_roles or pending_pi_isolated)
+    pending_workers = [r for r in enable_workers if r not in workers_enabled]
+    pending_sandboxes = [n for n in enable_sandboxes
+                         if n not in sandboxes_enabled]
+    pending = bool(pending_workers or pending_sandboxes)
 
     steps: list[str] = []
     # Step 1 — interactive auth. Each project's supervisor is the source
@@ -992,12 +957,10 @@ def cmd_project_create(args: argparse.Namespace) -> None:
 
     if pending:
         cmds: list[str] = []
-        for r in pending_role_mcps:
-            cmds.append(f"       python research.py project role-mcp enable {project} {r}")
-        for r in pending_pi_roles:
-            cmds.append(f"       python research.py project pi enable {project} {r}")
-        for n in pending_pi_isolated:
-            cmds.append(f"       python research.py project pi-isolated enable {project} {n}")
+        for r in pending_workers:
+            cmds.append(f"       python research.py project worker enable {project} {r}")
+        for n in pending_sandboxes:
+            cmds.append(f"       python research.py project sandbox enable {project} {n}")
         # Two failure modes: "creds weren't present" vs "enable raised
         # despite creds present" — different actionable guidance.
         if not creds_present:
@@ -1005,7 +968,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         else:
             reason = "(enable failed at create — see the warnings above for the cause, fix it, then re-run):"
         step_lines = [
-            f"  {len(steps)+1}. Finish activating the deferred role-MCPs / PI roles",
+            f"  {len(steps)+1}. Finish activating the deferred workers / sandboxes",
             f"     {reason}",
             "\n".join(cmds),
         ]
@@ -1301,7 +1264,7 @@ def _read_supervisor_metadata(container: str) -> dict:
     # i.e. user-supplied --data paths under /workspace/shared/data/<basename>/.
     # /external/* (PI-isolated external folders) are deliberately EXCLUDED:
     # they're recomputed fresh from the host registry on every recreate
-    # (_pi_isolated_external_mounts), so recovering them here would both
+    # (_sandbox_external_mounts), so recovering them here would both
     # double-add and pin stale roots after a registry edit.
     extra_mounts: list[str] = []
     for m in data.get("Mounts") or []:
@@ -1457,7 +1420,7 @@ def _recreate_supervisor(
     # PI-isolated external folders are recomputed fresh from the host
     # registry (excluded from md["extra_mounts"]) so the recreate tracks
     # the current registry — newly-added types appear, removed ones drop.
-    ext_mounts = _pi_isolated_external_mounts(project)
+    ext_mounts = _sandbox_external_mounts(project)
     if ext_mounts:
         docker_args = docker_args[:-1] + ext_mounts + [docker_args[-1]]
     # build_supervisor_docker_args emits ["run", "-d", ...]; convert to create.
@@ -1507,35 +1470,22 @@ def _recreate_supervisor(
                   f"`research project role-mcp enable {project} {role}`",
                   file=sys.stderr)
 
-    # Same idea for PI-role containers (STAGE_BACKEND_PI P.0). The
-    # pi-roles.json snapshot is the source of truth; _pi_start re-stages
-    # the per-role image into the (potentially fresh) inner dockerd and
-    # restarts the container. Workspace + creds-stash survive because
-    # they're on the project volume.
-    pi_entries = pi_roles.load_pi_roles(workspace_path)
-    for role in sorted(pi_entries):
+    # Same idea for sandbox containers (baked PI roles + BYO isolated agents,
+    # STAGE_CLI_TAXONOMY). The sandbox.json snapshot is the source of truth;
+    # _sandbox_start re-stages the image into the (potentially fresh) inner
+    # dockerd and restarts the container. For BYO entries the supervisor's
+    # /external/<type> mounts were just recomputed from the registry above, so
+    # every agent's external folder is wired before its container restarts.
+    # Workspace state survives because it's on the project volume.
+    sandbox_entries = sandbox.load(workspace_path)
+    for name in sorted(sandbox_entries):
         try:
-            _pi_start(container, project, cfg, role,
-                      force_restage=force_restage)
+            _sandbox_start(container, project, cfg, name,
+                           force_restage=force_restage)
         except SystemExit:
-            print(f"warning: failed to restart pi role {role!r}; "
-                  f"the entry in pi-roles.json is intact, retry with "
-                  f"`research project pi enable {project} {role}`",
-                  file=sys.stderr)
-
-    # Same for PI-isolated agents (STAGE_PI_ISOLATED). The supervisor's
-    # /external/<type> mounts were just recomputed from the registry above,
-    # so every enabled agent's external folder is wired before its inner
-    # container restarts.
-    iso_entries = pi_isolated.load(workspace_path)
-    for name in sorted(iso_entries):
-        try:
-            _pi_isolated_start(container, project, cfg, name,
-                               force_restage=force_restage)
-        except SystemExit:
-            print(f"warning: failed to restart pi-isolated {name!r}; "
-                  f"the entry in pi-isolated.json is intact, retry with "
-                  f"`research project pi-isolated enable {project} {name}`",
+            print(f"warning: failed to restart sandbox {name!r}; "
+                  f"the entry in sandbox.json is intact, retry with "
+                  f"`research project sandbox enable {project} {name}`",
                   file=sys.stderr)
 
 
@@ -1556,31 +1506,22 @@ def cmd_project_update(args: argparse.Namespace) -> None:
 
     print(f"=== Updating project: {project} ===")
 
-    # Validate --enable role-mcp + pi tokens up front so a typo doesn't
-    # waste a rebuild before failing.
+    # Validate --enable worker tokens up front so a typo doesn't waste a
+    # rebuild before failing. (Sandbox tokens are pre-validated by the token
+    # splitter — only names that resolve to a baked role or BYO type land in
+    # the sandbox list.)
     enable_arg = getattr(args, "enable", None)
     disable_arg = getattr(args, "disable", None)
-    enable_services, enable_role_mcps, enable_pi_roles, enable_pi_isolated, \
-        enable_no_pi_mirror = _split_enable_tokens(enable_arg)
-    disable_services, disable_pi_roles, disable_pi_isolated = \
-        _split_disable_tokens(disable_arg)
+    enable_services, enable_workers, enable_sandboxes, \
+        enable_no_sandbox_mirror = _split_enable_tokens(enable_arg)
+    disable_services, disable_sandboxes = _split_disable_tokens(disable_arg)
     role_mcp_explicit = _parse_role_mcp_upstream(
         getattr(args, "role_mcp_upstream", None) or [],
-        valid_roles=set(enable_role_mcps),
+        valid_roles=set(enable_workers),
     )
-    for role in enable_role_mcps:
+    for role in enable_workers:
         try:
             role_mcp.validate_role(role)
-        except ValueError as e:
-            die(str(e))
-    for role in enable_pi_roles:
-        try:
-            pi_roles.validate_role(role)
-        except ValueError as e:
-            die(str(e))
-    for role in disable_pi_roles:
-        try:
-            pi_roles.validate_role(role)
         except ValueError as e:
             die(str(e))
 
@@ -1601,26 +1542,16 @@ def cmd_project_update(args: argparse.Namespace) -> None:
         flags_override = _compute_service_flags(
             enable_services, disable_services, base=base)
 
-    # PI disables run BEFORE _recreate_supervisor: the recreate's PI
-    # restart loop reads pi-roles.json, and a role removed there should
+    # Sandbox disables run BEFORE _recreate_supervisor: the recreate's
+    # restart loop reads sandbox.json, and a sandbox removed there should
     # not come back up after recreate. The stop helper is tolerant of a
     # missing container (the recreate is about to nuke the inner dockerd
     # anyway under sysbox).
-    for role in disable_pi_roles:
+    for name in disable_sandboxes:
         try:
-            _pi_disable(project, cfg, role)
+            _sandbox_disable(project, cfg, name)
         except SystemExit:
-            print(f"warning: failed to disable pi role {role!r}",
-                  file=sys.stderr)
-
-    # Same ordering rationale for PI-isolated disables: drop the
-    # pi-isolated.json entry before the recreate so its restart loop
-    # doesn't bring the agent back up.
-    for name in disable_pi_isolated:
-        try:
-            _pi_isolated_disable(project, cfg, name)
-        except SystemExit:
-            print(f"warning: failed to disable pi-isolated {name!r}",
+            print(f"warning: failed to disable sandbox {name!r}",
                   file=sys.stderr)
 
     _recreate_supervisor(
@@ -1634,41 +1565,33 @@ def cmd_project_update(args: argparse.Namespace) -> None:
         print(f"refreshing /workspace/.claude/ from templates...")
         _refresh_workspace_claude_templates(container)
 
-    # role-mcp sugar via --enable. Mirrors cmd_project_create: on a project
-    # that already has the role enabled, this is idempotent — _role_mcp_enable
+    # worker sugar via --enable. Mirrors cmd_project_create: on a project
+    # that already has the worker enabled, this is idempotent — _role_mcp_enable
     # preserves the existing upstream_source + upstreams when no --upstream
     # / --auto signal is given (no silent flips on a re-run of `update`).
-    for role in enable_role_mcps:
+    # Enabling a worker auto-enables its baked sandbox mirror in lockstep.
+    for role in enable_workers:
         upstreams_for_role = role_mcp_explicit.get(role)
         try:
             _role_mcp_enable(
                 project, cfg, role, upstreams_for_role,
-                no_pi_mirror=enable_no_pi_mirror,
+                no_pi_mirror=enable_no_sandbox_mirror,
             )
         except SystemExit:
-            print(f"warning: failed to enable role-mcp {role!r}; retry "
-                  f"with `research project role-mcp enable {project} {role}`",
+            print(f"warning: failed to enable worker {role!r}; retry "
+                  f"with `research project worker enable {project} {role}`",
                   file=sys.stderr)
 
-    # pi-role sugar via --enable. Same pattern: idempotent on re-enable.
-    for role in enable_pi_roles:
+    # sandbox sugar via --enable. The recreate above already enumerated the
+    # BYO registry and mounted every type's /external/<type> folder, so a BYO
+    # sandbox enable here finds the mount present and just starts the inner
+    # container (no second recreate). Idempotent on re-enable.
+    for name in enable_sandboxes:
         try:
-            _pi_enable(project, cfg, role)
+            _sandbox_enable(project, cfg, name)
         except SystemExit:
-            print(f"warning: failed to enable pi role {role!r}; retry "
-                  f"with `research project pi enable {project} {role}`",
-                  file=sys.stderr)
-
-    # pi-isolated sugar via --enable. The recreate above already enumerated
-    # the registry and mounted every type's /external/<type> folder, so
-    # _pi_isolated_enable here finds the mount present and just starts the
-    # inner container (no second recreate). Idempotent on re-enable.
-    for name in enable_pi_isolated:
-        try:
-            _pi_isolated_enable(project, cfg, name)
-        except SystemExit:
-            print(f"warning: failed to enable pi-isolated {name!r}; retry "
-                  f"with `research project pi-isolated enable {project} {name}`",
+            print(f"warning: failed to enable sandbox {name!r}; retry "
+                  f"with `research project sandbox enable {project} {name}`",
                   file=sys.stderr)
 
     print(f"\nproject {project!r} updated.")
@@ -2118,9 +2041,10 @@ def cmd_mcp_disable(args: argparse.Namespace) -> None:
 # pre-bakes no types.
 
 
-def projects_using_pi_isolated(name: str) -> list[str]:
-    """Scan per-project pi-isolated.json snapshots for projects that enable
-    this type — the gate for a safe `pi-isolated remove`."""
+def projects_using_sandbox_type(name: str) -> list[str]:
+    """Scan per-project sandbox.json snapshots for projects that enable this
+    BYO type — the gate for a safe `sandbox remove`. A BYO sandbox entry is
+    keyed by its type name, so membership is the test."""
     cfg = load_config()
     root = Path(cfg.projects_dir).expanduser().resolve()
     if not root.is_dir():
@@ -2129,8 +2053,9 @@ def projects_using_pi_isolated(name: str) -> list[str]:
     for p in sorted(root.iterdir()):
         if not p.is_dir():
             continue
-        entries = pi_isolated.load(workspace_path_for(p.name, cfg))
-        if name in entries:
+        entries = sandbox.load(workspace_path_for(p.name, cfg))
+        e = entries.get(name)
+        if isinstance(e, dict) and e.get("kind") == "byo":
             out.append(p.name)
     return out
 
@@ -2169,7 +2094,36 @@ def _resolve_pi_isolated_ref(repo: str) -> str:
     return r.stdout.split()[0]
 
 
-def cmd_pi_isolated_add(args: argparse.Namespace) -> None:
+def cmd_worker_list(args: argparse.Namespace) -> None:
+    """Host catalog of worker *types*: the always-available analysis worker
+    (spawned per-task by the supervisor) + the built-in role-MCP service types
+    (enable-able per project). Visibility surface; per-project lifecycle is
+    `research project worker`."""
+    cat = [{"name": "analysis", "kind": "task",
+            "detail": "headless analysis worker (spawned per question by the "
+                      "supervisor; no per-project enable)"}]
+    for name, image in sorted(role_mcp.ROLE_IMAGES.items()):
+        cat.append({"name": name, "kind": "service", "detail": image})
+    if args.json:
+        print(json.dumps(cat, indent=2, sort_keys=True))
+        return
+    rows = [(c["name"], c["kind"], c["detail"]) for c in cat]
+    headers = ("NAME", "KIND", "DETAIL")
+    cols = list(zip(*([headers] + rows)))
+    widths = [max(len(str(v)) for v in col) for col in cols]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    print(fmt.format(*headers))
+    for r in rows:
+        print(fmt.format(*r))
+
+
+def cmd_sandbox_add(args: argparse.Namespace) -> None:
+    """Register a BYO sandbox type in the host registry. Baked roles
+    (echo / wrangler / websearcher) are built-in and need no registration —
+    a BYO type may not shadow one."""
+    if args.name in sandbox.baked_names():
+        die(f"{args.name!r} is a built-in baked sandbox; BYO types can't "
+            f"shadow it. Pick a different name.")
     entry: dict = {"root": args.root}
     if args.repo:
         ref = args.ref
@@ -2197,39 +2151,47 @@ def cmd_pi_isolated_add(args: argparse.Namespace) -> None:
         except pi_isolated_registry.RegistryError as e:
             die(str(e))
         if args.name in data["types"]:
-            die(f"pi-isolated type {args.name!r} already registered; "
-                f"remove first or use `pi-isolated set-root`/`describe`")
+            die(f"sandbox type {args.name!r} already registered; "
+                f"remove first or use `sandbox set-root`/`describe`")
         data["types"][args.name] = entry
         try:
             pi_isolated_registry.save_atomic(data)
         except pi_isolated_registry.RegistryError as e:
             die(str(e))
-    print(f"added pi-isolated type {args.name!r} (root {args.root})")
+    print(f"added sandbox type {args.name!r} (root {args.root})")
     print(f"  next: `research project create <p> --enable {args.name}` "
           f"(or `project update <p> --enable {args.name}`)")
 
 
-def cmd_pi_isolated_list(args: argparse.Namespace) -> None:
-    try:
-        data = pi_isolated_registry.load(expand=False)
-    except pi_isolated_registry.RegistryError as e:
-        die(str(e))
+def cmd_sandbox_list(args: argparse.Namespace) -> None:
+    """Full host catalog of sandbox *types*: built-in baked roles + BYO
+    registry types. The visibility surface — what can be enabled per project."""
+    cat = sandbox.catalog()
     if args.json:
-        print(json.dumps(data, indent=2, sort_keys=True))
+        print(json.dumps(cat, indent=2, sort_keys=True))
         return
-    types = data["types"]
-    if not types:
-        print("(no pi-isolated types registered)")
+    if not cat:
+        print("(no sandbox types available)")
         return
+    # BYO descriptions, fetched once for the annotation lines.
+    try:
+        byo = pi_isolated_registry.load(expand=False).get("types", {})
+    except pi_isolated_registry.RegistryError:
+        byo = {}
     rows: list[tuple[str, ...]] = []
     descs: list[str] = []
-    for name, e in sorted(types.items()):
-        repo = e.get("repo") or "-"
-        ref = e.get("ref") or "-"
-        rows.append((name, e["root"],
-                     pi_isolated_registry.mount_for(e), repo, ref))
-        descs.append(e.get("description", ""))
-    headers = ("NAME", "ROOT", "MOUNT", "REPO", "REF")
+    for c in cat:
+        nm = c["name"]
+        if c["kind"] == "baked":
+            src = c.get("image") or "-"
+            mirror = c.get("mirror_of") or "-"
+        else:
+            src = c.get("repo") or "(folder-only)"
+            mirror = "-"
+        rows.append((nm, c["kind"], src, mirror))
+        descs.append(byo.get(nm, {}).get("description", "")
+                     if c["kind"] == "byo" else "")
+    headers = ("NAME", "KIND", "IMAGE/REPO", "MIRRORS")
     cols = list(zip(*([headers] + rows)))
     widths = [max(len(str(v)) for v in col) for col in cols]
     fmt = "  ".join(f"{{:<{w}}}" for w in widths)
@@ -2240,12 +2202,14 @@ def cmd_pi_isolated_list(args: argparse.Namespace) -> None:
             print(f"    {d}")
 
 
-def cmd_pi_isolated_remove(args: argparse.Namespace) -> None:
-    in_use = projects_using_pi_isolated(args.name)
+def cmd_sandbox_remove(args: argparse.Namespace) -> None:
+    if args.name in sandbox.baked_names():
+        die(f"{args.name!r} is a built-in baked sandbox; it can't be removed.")
+    in_use = projects_using_sandbox_type(args.name)
     if in_use and not args.force:
-        die(f"pi-isolated type {args.name!r} is enabled for projects: "
+        die(f"sandbox type {args.name!r} is enabled for projects: "
             f"{', '.join(in_use)}.\n"
-            f"  Run `research project pi-isolated disable <proj> {args.name}` "
+            f"  Run `research project sandbox disable <proj> {args.name}` "
             f"for each, or pass --force.")
     with pi_isolated_registry.lock():
         try:
@@ -2253,20 +2217,20 @@ def cmd_pi_isolated_remove(args: argparse.Namespace) -> None:
         except pi_isolated_registry.RegistryError as e:
             die(str(e))
         if args.name not in data["types"]:
-            die(f"no pi-isolated type named {args.name!r}")
+            die(f"no sandbox type named {args.name!r}")
         data["types"].pop(args.name)
         try:
             pi_isolated_registry.save_atomic(data)
         except pi_isolated_registry.RegistryError as e:
             die(str(e))
-    print(f"removed pi-isolated type {args.name!r}")
+    print(f"removed sandbox type {args.name!r}")
     if in_use:
         print(f"  note: {len(in_use)} project(s) still have a stale "
-              f"pi-isolated.json entry; they keep running until "
-              f"`project pi-isolated disable`.")
+              f"sandbox.json entry; they keep running until "
+              f"`project sandbox disable`.")
 
 
-def _pi_isolated_registry_edit(name: str, mutate) -> None:
+def _sandbox_registry_edit(name: str, mutate) -> None:
     with pi_isolated_registry.lock():
         try:
             data = pi_isolated_registry.load(expand=False)
@@ -2274,7 +2238,7 @@ def _pi_isolated_registry_edit(name: str, mutate) -> None:
             die(str(e))
         entry = data["types"].get(name)
         if entry is None:
-            die(f"no pi-isolated type named {name!r}")
+            die(f"no sandbox type named {name!r}")
         mutate(entry)
         try:
             pi_isolated_registry.save_atomic(data)
@@ -2282,14 +2246,14 @@ def _pi_isolated_registry_edit(name: str, mutate) -> None:
             die(str(e))
 
 
-def cmd_pi_isolated_set_root(args: argparse.Namespace) -> None:
-    _pi_isolated_registry_edit(args.name, lambda e: e.__setitem__("root", args.root))
+def cmd_sandbox_set_root(args: argparse.Namespace) -> None:
+    _sandbox_registry_edit(args.name, lambda e: e.__setitem__("root", args.root))
     print(f"set root for {args.name!r}: {args.root}")
     print("  (existing projects pick up the new root on next "
           "`project update`/recreate)")
 
 
-def cmd_pi_isolated_describe(args: argparse.Namespace) -> None:
+def cmd_sandbox_describe(args: argparse.Namespace) -> None:
     new_desc = "" if args.clear else (args.text or "").strip()
     if not args.clear and not new_desc:
         die("description text is required (or pass --clear to remove)")
@@ -2300,7 +2264,7 @@ def cmd_pi_isolated_describe(args: argparse.Namespace) -> None:
         else:
             e.pop("description", None)
 
-    _pi_isolated_registry_edit(args.name, mutate)
+    _sandbox_registry_edit(args.name, mutate)
     print(f"{'set' if new_desc else 'cleared'} description for {args.name!r}")
 
 
@@ -2683,7 +2647,7 @@ def cmd_project_mcp_sync(args: argparse.Namespace) -> None:
     # AFTER phase 1+2 so _derive_auto_upstreams sees the current allow set.
     workspace_path = workspace_path_for(project, cfg)
     role_entries = role_mcp.load_role_mcps(workspace_path)
-    pi_entries = pi_roles.load_pi_roles(workspace_path)
+    sandbox_entries = sandbox.load(workspace_path)
     role_changes: list[str] = []
     for role, entry in list(role_entries.items()):
         if entry.get("upstream_source") != "auto":
@@ -2702,11 +2666,12 @@ def cmd_project_mcp_sync(args: argparse.Namespace) -> None:
             diff.append("+" + ",".join(added_up))
         if removed_up:
             diff.append("-" + ",".join(removed_up))
-        role_changes.append(f"restarted role-mcp {role!r} ({' '.join(diff)})")
-        pi_role = f"pi-{role}"
-        if pi_role in pi_entries:
-            _pi_start(container_name, project, cfg, pi_role)
-            role_changes.append(f"restarted pi mirror {pi_role!r} in lockstep")
+        role_changes.append(f"restarted worker {role!r} ({' '.join(diff)})")
+        # The sandbox mirror (if enabled) shares the worker's name; restart
+        # it in lockstep so its rendered .mcp.json tracks the new upstreams.
+        if role in sandbox_entries:
+            _sandbox_start(container_name, project, cfg, role)
+            role_changes.append(f"restarted sandbox mirror {role!r} in lockstep")
 
     if not allow_changed and not role_changes:
         print(f"(project {project!r} already in sync with the registry)")
@@ -3058,24 +3023,23 @@ def _role_mcp_enable(project: str, cfg: "Config", role: str,
     _role_mcp_start(supervisor, project, cfg, role)
     _supervisor_mcp_reload(supervisor)
 
-    # PI mirror auto-enable: M4. Skipped if (a) operator opted out, or
-    # (b) no image exists for pi-<role> (e.g. echo-mcp has no PI mirror).
-    if not no_pi_mirror:
-        pi_role = f"pi-{role}"
-        if pi_role in pi_roles.PI_IMAGES:
-            try:
-                _pi_enable(project, cfg, pi_role)
-            except SystemExit:
-                # _pi_enable die()s on its own paths (image-stage, start
-                # error). W10 can't fire — we just wrote role-mcps.json
-                # above. Surface as a warning and continue; operator can
-                # retry with `research project pi enable`.
-                print(
-                    f"warning: pi mirror {pi_role!r} failed to enable; "
-                    f"retry with `research project pi enable {project} "
-                    f"{pi_role}`",
-                    file=sys.stderr,
-                )
+    # Sandbox mirror auto-enable (M4). Skipped if (a) operator opted out
+    # (no_pi_mirror — the flag kept its internal name), or (b) no baked
+    # sandbox shares this worker's name (e.g. echo-mcp has no mirror; only
+    # wrangler / websearcher do). The mirror's name IS the worker's name.
+    if not no_pi_mirror and sandbox.is_baked(role):
+        try:
+            _sandbox_enable(project, cfg, role)
+        except SystemExit:
+            # _sandbox_enable die()s on its own paths (image-stage, start
+            # error). W10 can't fire — we just wrote role-mcps.json above.
+            # Surface as a warning; operator can retry with sandbox enable.
+            print(
+                f"warning: sandbox mirror {role!r} failed to enable; "
+                f"retry with `research project sandbox enable {project} "
+                f"{role}`",
+                file=sys.stderr,
+            )
 
 
 def _role_mcp_disable(project: str, cfg: "Config", role: str) -> None:
@@ -3139,42 +3103,78 @@ def cmd_project_role_mcp_disable(args: argparse.Namespace) -> None:
     print(f"role-mcp {args.role!r}: disabled")
 
 
-def cmd_project_role_mcp_list(args: argparse.Namespace) -> None:
+def cmd_project_worker_list(args: argparse.Namespace) -> None:
+    """Comprehensive worker listing: the enable-able **services** (role-MCPs,
+    with upstreams + state) AND the spawned **analysis instances** (ephemeral
+    task containers, any state — running / exited / dead). Reads service config
+    from the project's host bind-mount so it renders even with the supervisor
+    **down**; enriches with live `docker ps -a` state when it's up. The two
+    halves are different kinds under one umbrella (see STAGE_CLI_TAXONOMY)."""
     cfg = load_config()
     supervisor = _require_project(args.project)
     workspace_path = workspace_path_for(args.project, cfg)
-    entries = role_mcp.load_role_mcps(workspace_path)
+    services = role_mcp.load_role_mcps(workspace_path)
+    up = container_running(supervisor)
+    states = _inner_container_states(supervisor)
+
+    def svc_state(role: str) -> str:
+        if not up:
+            return "unknown"
+        return states.get(f"rs-{role}", "absent")
+
+    # Analysis instances: ephemeral, label-tracked (research.worker=1), no
+    # registry. Enumerated live from `docker ps -a` (all states) when up.
+    instances: list[tuple[str, str]] = []  # (name, state)
+    if up:
+        r = run(["docker", "exec", supervisor, "docker", "ps", "-a",
+                 "--filter", "label=research.worker",
+                 "--format", "{{.Names}}\t{{.State}}"], capture_output=True)
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                if "\t" in line:
+                    n, _, s = line.partition("\t")
+                    instances.append((n.strip(), s.strip()))
 
     if args.json:
-        out = []
-        for role, e in sorted(entries.items()):
-            row = dict(e)
-            row["role"] = role
-            row["running"] = (container_running(supervisor)
-                              and _role_mcp_inner_running(supervisor, role))
-            out.append(row)
+        out = {
+            "services": [
+                {**e, "name": role, "kind": "service", "state": svc_state(role)}
+                for role, e in sorted(services.items())
+            ],
+            "analysis_instances": [
+                {"name": n, "kind": "analysis", "state": s}
+                for n, s in sorted(instances)
+            ],
+            "supervisor_up": up,
+        }
         print(json.dumps(out, indent=2, sort_keys=True))
         return
 
-    if not entries:
-        print(f"(project {args.project!r} has no role-MCPs enabled)")
-        return
+    print("Services (enable-able worker-facing role-MCPs):")
+    if services:
+        rows = []
+        for role, e in sorted(services.items()):
+            upstreams = ",".join(e.get("upstream_mcps", []) or []) or "-"
+            rows.append((role, e.get("ip", "?"), str(e.get("port", "?")),
+                         svc_state(role), upstreams))
+        headers = ("NAME", "IP", "PORT", "STATE", "UPSTREAMS")
+        cols = list(zip(*([headers] + rows)))
+        widths = [max(len(str(v)) for v in col) for col in cols]
+        fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+        print("  " + fmt.format(*headers))
+        for r in rows:
+            print("  " + fmt.format(*r))
+    else:
+        print("  (none enabled)")
 
-    rows: list[tuple[str, ...]] = []
-    for role, e in sorted(entries.items()):
-        running = "no"
-        if container_running(supervisor):
-            running = "yes" if _role_mcp_inner_running(supervisor, role) else "no"
-        upstreams = ",".join(e.get("upstream_mcps", []) or []) or "-"
-        rows.append((role, e.get("ip", "?"), str(e.get("port", "?")),
-                     running, upstreams))
-    headers = ("ROLE", "IP", "PORT", "RUNNING", "UPSTREAMS")
-    cols = list(zip(*([headers] + rows)))
-    widths = [max(len(str(v)) for v in col) for col in cols]
-    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
-    print(fmt.format(*headers))
-    for r in rows:
-        print(fmt.format(*r))
+    print("\nAnalysis instances (ephemeral, supervisor-spawned):")
+    if not up:
+        print("  (supervisor stopped — start the project to list running tasks)")
+    elif instances:
+        for n, s in sorted(instances):
+            print(f"  {n}  [{s}]")
+    else:
+        print("  (none)")
 
 
 def cmd_project_role_mcp_status(args: argparse.Namespace) -> None:
@@ -3256,315 +3256,368 @@ def cmd_project_role_mcp_status(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _pi_ensure_workspace(supervisor: str, role: str) -> None:
-    """Pre-create the PI role's workspace bind-mount source dir as the
+def _sandbox_ensure_workspace(supervisor: str, name: str, kind: str) -> None:
+    """Pre-create the sandbox's workspace bind-mount source dir as the
     uid-1000 supervisor user, so dockerd's auto-create on ``docker run -v``
     doesn't land it root-owned and lock out the container's worker user.
 
-    No credentials are staged. PI containers are PI-owned: they boot
-    un-authed and the PI authenticates in-tab (``/login``) or pulls the
-    supervisor's creds via the manual ``rs-pi sync-creds`` bridge. There is
-    no automatic supervisor→PI credential propagation — see the
-    auth-by-ownership rule in ``.claude/CLAUDE.md``.
-
-    Path note: the dir uses the *short* role name (the ``pi-`` prefix
-    stripped — e.g. ``pi-echo`` → ``echo``). The role key keeps the
-    ``pi-`` prefix only because it disambiguates from worker-facing
-    role-MCPs at the registry level; once inside the project volume's
-    ``pi/`` directory grouping, the prefix is redundant."""
-    short = pi_roles.role_short(role)
-    script = f"mkdir -p /workspace/pi/{short}"
-    r = run(["docker", "exec", supervisor, "bash", "-eu", "-c", script],
-            capture_output=True)
+    No credentials are staged — sandboxes are PI-owned: they boot un-authed
+    and the PI authenticates in-tab (``/login``) or pulls the supervisor's
+    creds via the manual ``rs-pi sync-creds`` bridge. bypassPermissions
+    config is baked into rs-pi-base. Source path differs by kind (baked:
+    ``pi/<name>``; byo: ``pi-isolated/<name>``) — see sandbox.workspace_subdir."""
+    sub = sandbox.workspace_subdir(name, kind)
+    r = run(["docker", "exec", supervisor, "bash", "-eu", "-c",
+             f"mkdir -p /workspace/{sub}"], capture_output=True)
     if r.returncode != 0:
         die((r.stderr or r.stdout).strip()
-            or f"failed to ensure workspace dir for pi role {role!r}")
+            or f"failed to ensure workspace dir for sandbox {name!r}")
 
 
-def _pi_inner_exists(supervisor: str, role: str) -> bool:
-    cname = pi_roles.role_container_name(role)
+def _sandbox_inner_exists(supervisor: str, name: str, kind: str) -> bool:
+    # `docker container inspect` (not bare inspect, which falls through to the
+    # same-named image — the inner dockerd tags per-role images with the
+    # container's unqualified name).
+    cname = sandbox.container_name(name, kind)
     r = run(["docker", "exec", supervisor,
-             "docker", "inspect", cname], capture_output=True)
+             "docker", "container", "inspect", cname], capture_output=True)
     return r.returncode == 0
 
 
-def _pi_inner_running(supervisor: str, role: str) -> bool:
-    cname = pi_roles.role_container_name(role)
+def _sandbox_inner_running(supervisor: str, name: str, kind: str) -> bool:
+    cname = sandbox.container_name(name, kind)
     r = run(["docker", "exec", supervisor,
              "docker", "inspect", "-f", "{{.State.Running}}", cname],
             capture_output=True)
     return r.returncode == 0 and r.stdout.strip() == "true"
 
 
-def _pi_start(supervisor: str, project: str, cfg: "Config",
-              role: str, *, force_restage: bool = False) -> None:
-    """Run the PI container in the supervisor's inner dockerd. Idempotent:
-    tears down any prior instance with the same name first so a stale
-    crashed container doesn't block start. Lazy-stages the per-role image
-    into the inner dockerd on first use; project create doesn't pre-stage
-    PI images (most projects won't use them). Pass force_restage=True
-    after a host-side image rebuild to push new content through."""
+def _inner_container_states(supervisor: str) -> dict[str, str]:
+    """Map inner-container name → docker state (running/exited/created/dead/…)
+    via a single ``docker ps -a``. Empty dict when the supervisor is down, so
+    callers fall back to config-only listings (the comprehensive-list rule:
+    every subcontainer visible, supervisor up *or* down)."""
+    if not container_running(supervisor):
+        return {}
+    r = run(["docker", "exec", supervisor, "docker", "ps", "-a",
+             "--format", "{{.Names}}\t{{.State}}"], capture_output=True)
+    if r.returncode != 0:
+        return {}
+    out: dict[str, str] = {}
+    for line in r.stdout.splitlines():
+        if "\t" in line:
+            n, _, s = line.partition("\t")
+            out[n.strip()] = s.strip()
+    return out
+
+
+def _sandbox_start(supervisor: str, project: str, cfg: "Config",
+                   name: str, *, force_restage: bool = False) -> None:
+    """Run a sandbox container in the supervisor's inner dockerd. Idempotent:
+    tears down any prior same-named container first. Branches on the entry's
+    ``kind`` — baked roles stage a per-role image + mirror MCP wiring; BYO
+    agents stage the generic image + clone an external repo. Lazy-stages the
+    image; pass force_restage after a host-side rebuild."""
     workspace_path = workspace_path_for(project, cfg)
-    entries = pi_roles.load_pi_roles(workspace_path)
-    entry = entries.get(role)
+    entries = sandbox.load(workspace_path)
+    entry = entries.get(name)
     if entry is None:
-        die(f"no pi-roles.json entry for role {role!r}; call enable first")
+        die(f"no sandbox.json entry for {name!r}; call enable first")
+    kind = entry.get("kind")
 
-    pi_roles.validate_role(role)
-
-    cname = pi_roles.role_container_name(role)
+    cname = sandbox.container_name(name, kind)
     run(["docker", "exec", supervisor, "docker", "rm", "-f", cname],
         capture_output=True)
-    _pi_ensure_workspace(supervisor, role)
-
-    image = entry.get("image") or pi_roles.PI_IMAGES[role]
-    stage_worker_image(supervisor, image, force=force_restage)
-
-    # Bind-mount layout (single-mount, RW):
-    #   /workspace  ← <supervisor>/workspace/pi/<short>
-    #     The PI's role workspace. role.md staged here on first boot
-    #     by the entrypoint; PI's curated skills.md, sessions/, and
-    #     per-role artifacts live here. NEVER includes the supervisor's
-    #     /workspace/ contents — structural isolation by construction.
-    # No /creds mount: PI containers are PI-owned and boot un-authed.
-    # The PI authenticates in-tab (`/login`) or pulls the supervisor's
-    # creds via the manual `rs-pi sync-creds` bridge (docker cp + install,
-    # no mount needed). bypassPermissions config is baked into rs-pi-base.
-    # ``<short>`` is the role key with the ``pi-`` prefix stripped
-    # (see ``_pi_ensure_workspace``'s path note).
+    _sandbox_ensure_workspace(supervisor, name, kind)
     ip = entry["ip"]
-    short = pi_roles.role_short(role)
-    docker_args = [
-        "docker", "exec", supervisor,
-        "docker", "run", "-d",
-        "--name", cname,
-        "--network", INNER_NETWORK,
-        "--ip", ip,
-        "--restart", "unless-stopped",
-        "-v", f"/workspace/pi/{short}:/workspace",
-        # /etc/orchestrator is the supervisor's per-project state dir
-        # (role-mcps.json, mcp-allow.json). PI containers that mirror a
-        # worker-facing role-MCP (pi-wrangler, pi-librarian, …) read
-        # this at entrypoint time to render their .mcp.json +
-        # .tools-inventory.md from the same source the worker-facing
-        # role uses. pi-echo (substrate fixture) skips that branch and
-        # ignores the mount. Parent-dir bind-mount, same shape as the
-        # role-MCP containers — atomic-rename writes by the host stay
-        # visible (single-file-bind-mount rule).
-        "-v", "/workspace/.orchestrator:/etc/orchestrator:ro",
-        "-e", f"RS_PI_ROLE={short}",
-        "--label", f"research.pi_role={role}",
-        "--label", f"research.project={project}",
-        # Project --data paths, propagated RO at the same mount points
-        # the supervisor + workers see them at. Lets interactive
-        # PI claude inspect project inputs without the supervisor
-        # boundary punching extra holes elsewhere.
-        *_data_mount_args_from_supervisor(supervisor),
-        image,
-    ]
-    run_check(docker_args)
-    print(f"pi role {role!r}: running at {ip}")
+
+    if kind == "baked":
+        image = entry.get("image") or sandbox.BAKED_IMAGES[name]
+        stage_worker_image(supervisor, image, force=force_restage)
+        # Single RW workspace mount + RO orchestrator mount. The latter lets a
+        # mirror role render .mcp.json + .tools-inventory.md at entrypoint time
+        # from the same role-mcps.json the worker service uses (pi-echo-style
+        # roles with no worker twin simply ignore it). No /creds mount —
+        # PI-owned; bypassPermissions baked into rs-pi-base.
+        docker_args = [
+            "docker", "exec", supervisor,
+            "docker", "run", "-d",
+            "--name", cname,
+            "--network", INNER_NETWORK,
+            "--ip", ip,
+            "--restart", "unless-stopped",
+            "-v", f"/workspace/pi/{name}:/workspace",
+            "-v", "/workspace/.orchestrator:/etc/orchestrator:ro",
+            "-e", f"RS_PI_ROLE={name}",
+            "--label", f"research.pi_role={sandbox.pi_role_label(name, kind)}",
+            "--label", f"research.project={project}",
+            # Project --data paths, propagated RO at the same mount points the
+            # supervisor + workers see them at.
+            *_data_mount_args_from_supervisor(supervisor),
+            image,
+        ]
+        run_check(docker_args)
+        print(f"sandbox {name!r} (baked): running at {ip}")
+    else:  # byo
+        stage_worker_image(supervisor, PI_ISOLATED_IMAGE, force=force_restage)
+        mount = entry.get("mount") or pi_isolated_registry.DEFAULT_MOUNT
+        # RW workspace (repo cloned to /workspace/<repo> by the entrypoint) +
+        # the external host folder at the configured mount. No /creds mount.
+        docker_args = [
+            "docker", "exec", supervisor,
+            "docker", "run", "-d",
+            "--name", cname,
+            "--network", INNER_NETWORK,
+            "--ip", ip,
+            "--restart", "unless-stopped",
+            "-v", f"/workspace/pi-isolated/{name}:/workspace",
+            "-v", f"/external/{name}:{mount}",
+            "-e", f"RS_PI_ISO_NAME={name}",
+            "-e", f"RS_PI_ISO_REPO={entry.get('repo') or ''}",
+            "-e", f"RS_PI_ISO_REF={entry.get('ref') or ''}",
+            "-e", f"RS_PI_ISO_SETUP={entry.get('setup') or ''}",
+            "-e", f"RS_PI_ISO_MOUNT={mount}",
+            "--label", f"research.pi_role={sandbox.pi_role_label(name, kind)}",
+            "--label", f"research.pi_isolated={name}",
+            "--label", f"research.project={project}",
+            *_data_mount_args_from_supervisor(supervisor),
+            PI_ISOLATED_IMAGE,
+        ]
+        run_check(docker_args)
+        print(f"sandbox {name!r} (byo): running at {ip}")
 
 
-def _pi_stop(supervisor: str, role: str) -> None:
-    """Stop + remove the PI container in the inner dockerd. Tolerates
-    absence — caller may have already removed it via _recreate_supervisor
-    or the supervisor itself may be down. Verifies removal before
-    returning so the disable contract ("container is gone after this
-    returns") holds even if a future docker version regresses `rm -f`."""
-    cname = pi_roles.role_container_name(role)
+def _sandbox_stop(supervisor: str, name: str, kind: str) -> None:
+    """Stop + remove the sandbox container in the inner dockerd. Tolerates
+    absence. Verifies removal with `docker container inspect` (not bare
+    inspect, which falls through to the same-named image)."""
+    cname = sandbox.container_name(name, kind)
     rm = run(["docker", "exec", supervisor, "docker", "rm", "-f", cname],
              capture_output=True)
-    # `docker container inspect` (not bare `docker inspect`) — the bare
-    # form falls through to image lookup when no container matches, and
-    # the inner dockerd has an image tagged with the same name as the
-    # container (`rs-pi-<role>:latest` vs `rs-pi-<role>` container), so
-    # bare-inspect would always succeed and falsely report the container
-    # as still present.
     check = run(["docker", "exec", supervisor,
                  "docker", "container", "inspect", cname],
                 capture_output=True)
     if check.returncode == 0:
         rm_tail = (rm.stderr or rm.stdout or "").strip()[-200:]
-        die(f"PI container {cname!r} still present after disable; "
+        die(f"sandbox container {cname!r} still present after disable; "
             f"docker rm -f tail: {rm_tail!r}. Inspect "
             f"`docker exec {supervisor} docker container inspect {cname}` "
-            f"manually and retry `research project pi disable`.")
+            f"manually and retry `research project sandbox disable`.")
 
 
-def _pi_enable(project: str, cfg: "Config", role: str) -> None:
-    """Write the per-project pi-roles.json entry + start the container.
-    Idempotent — re-running on an already-enabled role rewrites the entry
-    and restarts the container.
+def _sandbox_enable(project: str, cfg: "Config", name: str) -> None:
+    """Resolve the sandbox kind (baked role vs BYO registry type), write the
+    per-project sandbox.json entry, and start the container. Idempotent.
 
-    PI roles whose short name matches a worker-facing role-MCP key
-    (pi-wrangler ↔ wrangler, pi-librarian ↔ librarian, pi-websearcher ↔
-    websearcher) MIRROR that role-MCP's upstream set — they read
-    `role-mcps.json[<short>].upstream_mcps` at container start to render
-    their `.mcp.json` + `.tools-inventory.md`. Such PI roles refuse to
-    enable if the worker-facing role-MCP isn't enabled for the project:
-    PI mode without a matching worker-facing entry would mean PI's claude
-    sees an empty MCP list, which is a configuration error, not a usable
-    PI tab. pi-echo (whose short name "echo" matches no role-MCP key)
-    bypasses this gate — substrate-only fixture, no upstreams expected.
-    """
-    pi_roles.validate_role(role)
+    Baked roles that mirror a worker service (same short name — wrangler,
+    websearcher) refuse to enable unless that worker service is enabled
+    first (the W10 gate: a mirror with no worker twin renders an empty MCP
+    list). ``echo`` has no worker twin and bypasses the gate. BYO agents
+    recreate the supervisor first if it doesn't yet mount /external/<name>."""
     supervisor = container_name_for(project)
     if not container_running(supervisor):
         die(f"project {project!r} is not running; bring it up first")
-
     workspace_path = workspace_path_for(project, cfg)
+    entries = sandbox.load(workspace_path)
 
-    # W10 (P.3 plan): if this PI role mirrors a worker-facing role-MCP,
-    # require that role-MCP to be enabled per-project first. Failure
-    # mode without this gate: pi-wrangler comes up with an empty
-    # .tools-inventory.md, and the PI's claude session has no DB MCPs
-    # to call — which feels like a bug in pi-wrangler but is actually
-    # a missing dependency in the project's worker-facing wiring.
-    short = pi_roles.role_short(role)
-    if short in role_mcp.ROLE_IMAGES:
-        role_mcp_entries = role_mcp.load_role_mcps(workspace_path)
-        if short not in role_mcp_entries:
-            die(
-                f"pi role {role!r} mirrors worker-facing role-MCP "
-                f"{short!r}, which is not enabled for project "
-                f"{project!r}. Run `research project role-mcp enable "
-                f"{project} {short} --upstream <mcp,...>` first, then "
-                f"re-run this command. (PI mode reads its upstream set "
-                f"from role-mcps.json so both surfaces share one source "
-                f"of truth.)"
-            )
+    if sandbox.is_baked(name):
+        mirror = sandbox.mirror_of(name)
+        if mirror is not None:
+            worker_entries = role_mcp.load_role_mcps(workspace_path)
+            if mirror not in worker_entries:
+                die(f"sandbox {name!r} mirrors worker service {mirror!r}, "
+                    f"which is not enabled for project {project!r}. Run "
+                    f"`research project worker enable {project} {mirror} "
+                    f"--upstream <mcp,...>` first, then re-run this command. "
+                    f"(Sandbox mode reads its upstream set from the worker "
+                    f"service so both surfaces share one source of truth.)")
+        entries[name] = sandbox.build_baked_entry(name)
+        sandbox.save(workspace_path, entries)
+        _sandbox_start(supervisor, project, cfg, name)
+        return
 
-    entries = pi_roles.load_pi_roles(workspace_path)
-    entries[role] = pi_roles.build_entry(role)
-    pi_roles.save_pi_roles(workspace_path, entries)
+    # BYO: look up the host registry type, allocate an IP, snapshot the entry.
+    type_entry = pi_isolated_registry.entry_for(name, expand=True)
+    if type_entry is None:
+        die(f"no sandbox named {name!r} (not a baked role, not in the host "
+            f"BYO registry). Register a BYO type first: `research sandbox add "
+            f"{name} --root <host-dir> [--repo <url> --ref <sha>]`")
+    try:
+        ip = sandbox.allocate_byo_ip(entries, name)
+    except ValueError as e:
+        die(str(e))
+    entries[name] = sandbox.build_byo_entry(name, type_entry, ip)
+    sandbox.save(workspace_path, entries)
 
-    _pi_start(supervisor, project, cfg, role)
+    if not _supervisor_has_external_mount(supervisor, name):
+        print(f"sandbox {name!r}: supervisor not yet mounting /external/{name}; "
+              f"recreating supervisor to wire the external folder (creds + "
+              f"workspace survive)...")
+        _recreate_supervisor(project, cfg)
+        return  # recreate's restart loop starts the container
+    _sandbox_start(supervisor, project, cfg, name)
 
 
-def _pi_disable(project: str, cfg: "Config", role: str) -> None:
-    """Stop the container, drop the pi-roles.json entry. Workspace state
-    under /workspace/pi/<role>/ (role.md, skills.md, sessions/, …) and
-    cred-stash under /workspace/.pi/<role>/ both survive — bind-mounts
-    on the project volume are unaffected by docker rm. Re-enable picks
-    up the preserved workspace."""
+def _sandbox_disable(project: str, cfg: "Config", name: str) -> None:
+    """Stop the container, drop the sandbox.json entry. Workspace state (and,
+    for BYO, the external host folder with the cloned repo) survives — they're
+    on the project volume / host root, unaffected by docker rm."""
     supervisor = container_name_for(project)
     workspace_path = workspace_path_for(project, cfg)
-    entries = pi_roles.load_pi_roles(workspace_path)
-    if role not in entries:
-        die(f"pi role {role!r} is not enabled for project {project!r}")
+    entries = sandbox.load(workspace_path)
+    if name not in entries:
+        die(f"sandbox {name!r} is not enabled for project {project!r}")
+    kind = entries[name].get("kind")
     if container_running(supervisor):
-        _pi_stop(supervisor, role)
-    del entries[role]
-    pi_roles.save_pi_roles(workspace_path, entries)
+        _sandbox_stop(supervisor, name, kind)
+    del entries[name]
+    sandbox.save(workspace_path, entries)
 
 
-def cmd_project_pi_enable(args: argparse.Namespace) -> None:
+def cmd_project_sandbox_enable(args: argparse.Namespace) -> None:
     cfg = load_config()
     _require_project(args.project)
-    _pi_enable(args.project, cfg, args.role)
+    _sandbox_enable(args.project, cfg, args.name)
 
 
-def cmd_project_pi_disable(args: argparse.Namespace) -> None:
+def cmd_project_sandbox_disable(args: argparse.Namespace) -> None:
     cfg = load_config()
     _require_project(args.project)
-    _pi_disable(args.project, cfg, args.role)
-    print(f"pi role {args.role!r}: disabled")
+    _sandbox_disable(args.project, cfg, args.name)
+    print(f"sandbox {args.name!r}: disabled")
 
 
-def cmd_project_pi_list(args: argparse.Namespace) -> None:
+def cmd_project_sandbox_list(args: argparse.Namespace) -> None:
+    """Comprehensive listing: every enabled sandbox with its container state
+    in any condition (running / exited / dead / absent). Reads config from the
+    project's host bind-mount, so it renders even when the supervisor is
+    stopped (state shows 'unknown' then); enriches with live `docker ps -a`
+    state when the supervisor is up."""
     cfg = load_config()
     supervisor = _require_project(args.project)
     workspace_path = workspace_path_for(args.project, cfg)
-    entries = pi_roles.load_pi_roles(workspace_path)
+    entries = sandbox.load(workspace_path)
+    up = container_running(supervisor)
+    states = _inner_container_states(supervisor)
+
+    def state_of(nm: str, e: dict) -> str:
+        cname = e.get("container") or sandbox.container_name(nm, e.get("kind"))
+        if not up:
+            return "unknown"
+        return states.get(cname, "absent")
 
     if args.json:
         out = []
-        for role, e in sorted(entries.items()):
+        for nm, e in sorted(entries.items()):
             row = dict(e)
-            row["role"] = role
-            row["running"] = (container_running(supervisor)
-                              and _pi_inner_running(supervisor, role))
+            row["name"] = nm
+            row["state"] = state_of(nm, e)
             out.append(row)
         print(json.dumps(out, indent=2, sort_keys=True))
         return
 
     if not entries:
-        print(f"(project {args.project!r} has no pi roles enabled)")
+        print(f"(project {args.project!r} has no sandboxes enabled)")
         return
 
     rows: list[tuple[str, ...]] = []
-    for role, e in sorted(entries.items()):
-        running = "no"
-        if container_running(supervisor):
-            running = "yes" if _pi_inner_running(supervisor, role) else "no"
-        rows.append((role, e.get("ip", "?"),
-                     e.get("image", "?"), running))
-    headers = ("ROLE", "IP", "IMAGE", "RUNNING")
+    for nm, e in sorted(entries.items()):
+        src = e.get("repo") or e.get("image") or "-"
+        rows.append((nm, e.get("kind", "?"), e.get("ip", "?"),
+                     src, state_of(nm, e)))
+    headers = ("NAME", "KIND", "IP", "IMAGE/REPO", "STATE")
     cols = list(zip(*([headers] + rows)))
     widths = [max(len(str(v)) for v in col) for col in cols]
     fmt = "  ".join(f"{{:<{w}}}" for w in widths)
     print(fmt.format(*headers))
     for r in rows:
         print(fmt.format(*r))
+    if not up:
+        print("  (supervisor stopped — STATE is config-only; start the "
+              "project for live container state)")
 
 
-def cmd_project_pi_status(args: argparse.Namespace) -> None:
+def cmd_project_sandbox_status(args: argparse.Namespace) -> None:
     cfg = load_config()
     supervisor = _require_project(args.project)
     workspace_path = workspace_path_for(args.project, cfg)
-    entries = pi_roles.load_pi_roles(workspace_path)
-    entry = entries.get(args.role)
+    entries = sandbox.load(workspace_path)
+    entry = entries.get(args.name)
     if entry is None:
-        die(f"pi role {args.role!r} is not enabled for project "
+        die(f"sandbox {args.name!r} is not enabled for project "
             f"{args.project!r}")
-
+    kind = entry.get("kind")
     state = {
-        "role": args.role,
+        "name": args.name,
         "project": args.project,
+        "kind": kind,
         "entry": entry,
-        "container": pi_roles.role_container_name(args.role),
+        "container": sandbox.container_name(args.name, kind),
         "exists": False,
         "running": False,
     }
     if container_running(supervisor):
-        state["exists"] = _pi_inner_exists(supervisor, args.role)
-        state["running"] = _pi_inner_running(supervisor, args.role)
+        state["exists"] = _sandbox_inner_exists(supervisor, args.name, kind)
+        state["running"] = _sandbox_inner_running(supervisor, args.name, kind)
+        if kind == "byo":
+            state["supervisor_external_mount"] = _supervisor_has_external_mount(
+                supervisor, args.name)
 
-    role_workspace = workspace_path / "pi" / pi_roles.role_short(args.role)
-    state["workspace"] = str(role_workspace)
-    state["workspace_present"] = role_workspace.is_dir()
-    if role_workspace.is_dir():
+    ws = workspace_path / sandbox.workspace_subdir(args.name, kind)
+    state["workspace"] = str(ws)
+    state["workspace_present"] = ws.is_dir()
+    if ws.is_dir():
         state["workspace_files"] = sorted(
-            p.name for p in role_workspace.iterdir() if not p.name.startswith(".")
-        )
+            p.name for p in ws.iterdir() if not p.name.startswith("."))
     else:
         state["workspace_files"] = []
+
+    if kind == "byo":
+        repo = entry.get("repo")
+        clone_dir = None
+        if repo:
+            repo_name = repo.rstrip("/").rsplit("/", 1)[-1]
+            if repo_name.endswith(".git"):
+                repo_name = repo_name[:-4]
+            clone_dir = ws / repo_name
+        state["clone_dir"] = str(clone_dir) if clone_dir else None
+        state["repo_cloned"] = bool(clone_dir and (clone_dir / ".git").is_dir())
 
     if args.json:
         print(json.dumps(state, indent=2, sort_keys=True))
         return
 
-    print(f"role:        {state['role']}")
+    print(f"name:        {state['name']}")
     print(f"project:     {state['project']}")
+    print(f"kind:        {state['kind']}")
     print(f"container:   {state['container']}")
     print(f"  exists:    {state['exists']}")
     print(f"  running:   {state['running']}")
     print(f"ip:          {entry.get('ip')}")
-    print(f"image:       {entry.get('image')}")
+    if kind == "baked":
+        print(f"image:       {entry.get('image')}")
+        print(f"mirror_of:   {entry.get('mirror_of') or '(none)'}")
+    else:
+        print(f"repo:        {entry.get('repo') or '(none)'}")
+        print(f"ref:         {entry.get('ref') or '(none)'}")
+        print(f"mount:       {entry.get('mount')}")
+        print(f"root:        {entry.get('root')}")
+        print(f"external mount on supervisor: "
+              f"{state.get('supervisor_external_mount', False)}")
     print(f"workspace:   {state['workspace']}"
           f" ({'present' if state['workspace_present'] else 'absent'})")
-    if state['workspace_files']:
+    if state.get("workspace_files"):
         print(f"  files:     {', '.join(state['workspace_files'])}")
+    if kind == "byo":
+        print(f"clone dir:   {state['clone_dir']}")
+        print(f"  repo cloned: {state['repo_cloned']}")
 
 
-def cmd_project_pi_sync_creds(args: argparse.Namespace) -> None:
-    """The supervisor→PI credential bridge: invoke the supervisor-side
-    rs-pi CLI to push the supervisor's current creds into every running PI
-    container. Operator-initiated only — PI containers are PI-owned and boot
-    un-authed; nothing propagates creds automatically. Run this when the PI
-    wants to inherit the supervisor's identity instead of `/login`-ing in
-    each tab themselves."""
+def cmd_project_sandbox_sync_creds(args: argparse.Namespace) -> None:
+    """The supervisor→sandbox credential bridge: invoke the supervisor-side
+    rs-pi CLI to push the supervisor's current creds into every running
+    sandbox container. Operator-initiated only — sandboxes are PI-owned and
+    boot un-authed; nothing propagates creds automatically."""
     supervisor = _require_project(args.project)
     r = run(["docker", "exec", supervisor, "rs-pi", "sync-creds"],
             capture_output=False)
@@ -3573,19 +3626,18 @@ def cmd_project_pi_sync_creds(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
-# PI-isolated container lifecycle (STAGE_PI_ISOLATED)
+# Sandbox external-folder mounts (BYO sandboxes only — baked roles have none)
 # ---------------------------------------------------------------------------
 
 
-def _pi_isolated_external_mounts(project: str) -> list[str]:
-    """``-v`` args mounting each registered type's ``<root>/<project>/`` host
-    folder at the supervisor's ``/external/<type>``. Computed fresh from the
-    host registry at every supervisor create/recreate, so the supervisor's
-    external mount set always tracks the current registry (a removed type
-    drops out; a newly-added type appears on the next recreate). The per-
-    project subdir is created host-side so docker doesn't auto-create it
-    root-owned. ``~`` is expanded here; ``${VAR}`` was expanded by the
-    registry loader."""
+def _sandbox_external_mounts(project: str) -> list[str]:
+    """``-v`` args mounting each registered BYO type's ``<root>/<project>/``
+    host folder at the supervisor's ``/external/<type>``. Computed fresh from
+    the host BYO registry at every supervisor create/recreate, so the mount
+    set always tracks the current registry (a removed type drops out; a newly-
+    added type appears on the next recreate). The per-project subdir is created
+    host-side so docker doesn't auto-create it root-owned. ``~`` is expanded
+    here; ``${VAR}`` was expanded by the registry loader."""
     try:
         data = pi_isolated_registry.load(expand=True)
     except pi_isolated_registry.RegistryError as e:
@@ -3613,271 +3665,11 @@ def _supervisor_has_external_mount(supervisor: str, name: str) -> bool:
     return f"/external/{name}" in r.stdout.split("\n")
 
 
-def _pi_isolated_ensure_workspace(supervisor: str, name: str) -> None:
-    """Pre-create the PI-isolated agent's workspace bind-mount source dir as
-    the uid-1000 supervisor user (same root-owned-auto-create guard as
-    ``_pi_ensure_workspace``). No credentials are staged — PI-isolated agents
-    are PI-owned; they boot un-authed and the PI runs ``/login`` in the tab
-    (or pulls the supervisor's creds via the manual ``rs-pi sync-creds``
-    bridge). bypassPermissions config is baked into ``rs-pi-base``, the
-    isolated image's ancestor."""
-    script = f"mkdir -p /workspace/pi-isolated/{name}"
-    r = run(["docker", "exec", supervisor, "bash", "-eu", "-c", script],
-            capture_output=True)
-    if r.returncode != 0:
-        die((r.stderr or r.stdout).strip()
-            or f"failed to ensure workspace dir for pi-isolated {name!r}")
-
-
-def _pi_isolated_inner_running(supervisor: str, name: str) -> bool:
-    cname = pi_isolated.container_name(name)
-    r = run(["docker", "exec", supervisor,
-             "docker", "inspect", "-f", "{{.State.Running}}", cname],
-            capture_output=True)
-    return r.returncode == 0 and r.stdout.strip() == "true"
-
-
-def _pi_isolated_inner_exists(supervisor: str, name: str) -> bool:
-    cname = pi_isolated.container_name(name)
-    r = run(["docker", "exec", supervisor,
-             "docker", "container", "inspect", cname], capture_output=True)
-    return r.returncode == 0
-
-
-def _pi_isolated_start(supervisor: str, project: str, cfg: "Config",
-                       name: str, *, force_restage: bool = False) -> None:
-    """Run the PI-isolated container in the supervisor's inner dockerd.
-    Idempotent: tears down any prior same-named container first. Requires
-    the supervisor to already mount ``/external/<name>`` (the enable path
-    guarantees this by recreating when absent) — the external folder is
-    bind-mounted from there into the container at the type's configured
-    mount."""
-    workspace_path = workspace_path_for(project, cfg)
-    entries = pi_isolated.load(workspace_path)
-    entry = entries.get(name)
-    if entry is None:
-        die(f"no pi-isolated.json entry for {name!r}; call enable first")
-
-    cname = pi_isolated.container_name(name)
-    run(["docker", "exec", supervisor, "docker", "rm", "-f", cname],
-        capture_output=True)
-    _pi_isolated_ensure_workspace(supervisor, name)
-    stage_worker_image(supervisor, PI_ISOLATED_IMAGE, force=force_restage)
-
-    mount = entry.get("mount") or pi_isolated_registry.DEFAULT_MOUNT
-    docker_args = [
-        "docker", "exec", supervisor,
-        "docker", "run", "-d",
-        "--name", cname,
-        "--network", INNER_NETWORK,
-        "--ip", entry["ip"],
-        "--restart", "unless-stopped",
-        # Pi tree (RW) — the container's /workspace root. Structurally
-        # isolated from the supervisor's /workspace by construction (separate
-        # bind source).
-        "-v", f"/workspace/pi-isolated/{name}:/workspace",
-        # No /creds mount: PI-isolated agents are PI-owned and boot un-authed.
-        # The PI runs `/login` in the tab, or the operator pulls the
-        # supervisor's creds via `rs-pi sync-creds` (docker cp + install).
-        # External host folder (<root>/<project>/) at the configured mount —
-        # the PI's own content folder (e.g. a vault), kept clean. The repo is
-        # cloned to /workspace/<repo-name>, NOT here. RS_PI_ISO_MOUNT (below)
-        # exports this path so a SETUP command can point the harness at it.
-        "-v", f"/external/{name}:{mount}",
-        "-e", f"RS_PI_ISO_NAME={name}",
-        "-e", f"RS_PI_ISO_REPO={entry.get('repo') or ''}",
-        "-e", f"RS_PI_ISO_REF={entry.get('ref') or ''}",
-        "-e", f"RS_PI_ISO_SETUP={entry.get('setup') or ''}",
-        "-e", f"RS_PI_ISO_MOUNT={mount}",
-        # research.pi_role label is the manual-sync target marker
-        # (rs-pi sync-creds filters on this label key, not a name glob),
-        # so `rs-pi sync-creds` reaches isolated containers too.
-        "--label", f"research.pi_role=iso-{name}",
-        "--label", f"research.pi_isolated={name}",
-        "--label", f"research.project={project}",
-        *_data_mount_args_from_supervisor(supervisor),
-        PI_ISOLATED_IMAGE,
-    ]
-    run_check(docker_args)
-    print(f"pi-isolated {name!r}: running at {entry['ip']}")
-
-
-def _pi_isolated_stop(supervisor: str, name: str) -> None:
-    """Stop + remove the inner container. Tolerates absence. Verifies removal
-    with `docker container inspect` (not bare inspect, which falls through to
-    the same-named image)."""
-    cname = pi_isolated.container_name(name)
-    rm = run(["docker", "exec", supervisor, "docker", "rm", "-f", cname],
-             capture_output=True)
-    check = run(["docker", "exec", supervisor,
-                 "docker", "container", "inspect", cname], capture_output=True)
-    if check.returncode == 0:
-        rm_tail = (rm.stderr or rm.stdout or "").strip()[-200:]
-        die(f"pi-isolated container {cname!r} still present after disable; "
-            f"docker rm -f tail: {rm_tail!r}.")
-
-
-def _pi_isolated_enable(project: str, cfg: "Config", name: str) -> None:
-    """Snapshot the registry type into pi-isolated.json + start the
-    container. Idempotent. Recreates the supervisor first if it doesn't yet
-    mount ``/external/<name>`` (type registered after the project's last
-    create/recreate) — the recreate re-enumerates the registry, adds the
-    mount, and its restart loop brings up this agent. Otherwise starts the
-    inner container directly (no recreate)."""
-    supervisor = container_name_for(project)
-    if not container_running(supervisor):
-        die(f"project {project!r} is not running; bring it up first")
-
-    type_entry = pi_isolated_registry.entry_for(name, expand=True)
-    if type_entry is None:
-        die(f"no pi-isolated type named {name!r} in the host registry. "
-            f"Register it first: `research pi-isolated add {name} "
-            f"--root <host-dir> [--repo <url> --ref <sha>]`")
-
-    workspace_path = workspace_path_for(project, cfg)
-    entries = pi_isolated.load(workspace_path)
-    try:
-        ip = pi_isolated.allocate_ip(entries, name)
-    except ValueError as e:
-        die(str(e))
-    entries[name] = pi_isolated.build_entry(name, type_entry, ip)
-    pi_isolated.save(workspace_path, entries)
-
-    if not _supervisor_has_external_mount(supervisor, name):
-        print(f"pi-isolated {name!r}: supervisor not yet mounting "
-              f"/external/{name}; recreating supervisor to wire the external "
-              f"folder (creds + workspace survive)...")
-        _recreate_supervisor(project, cfg)
-        return  # recreate's restart loop starts the container
-
-    _pi_isolated_start(supervisor, project, cfg, name)
-
-
-def _pi_isolated_disable(project: str, cfg: "Config", name: str) -> None:
-    """Stop the container, drop the pi-isolated.json entry. The external
-    host folder (<root>/<project>/, which holds the cloned repo), the pi
-    tree workspace, and the creds stash all survive. The supervisor's
-    /external/<name> mount stays (recomputed from the registry at each
-    recreate); harmless when the type is still registered."""
-    supervisor = container_name_for(project)
-    workspace_path = workspace_path_for(project, cfg)
-    entries = pi_isolated.load(workspace_path)
-    if name not in entries:
-        die(f"pi-isolated {name!r} is not enabled for project {project!r}")
-    if container_running(supervisor):
-        _pi_isolated_stop(supervisor, name)
-    del entries[name]
-    pi_isolated.save(workspace_path, entries)
-
-
-def cmd_project_pi_isolated_enable(args: argparse.Namespace) -> None:
-    cfg = load_config()
-    _require_project(args.project)
-    _pi_isolated_enable(args.project, cfg, args.name)
-
-
-def cmd_project_pi_isolated_disable(args: argparse.Namespace) -> None:
-    cfg = load_config()
-    _require_project(args.project)
-    _pi_isolated_disable(args.project, cfg, args.name)
-    print(f"pi-isolated {args.name!r}: disabled")
-
-
-def cmd_project_pi_isolated_list(args: argparse.Namespace) -> None:
-    cfg = load_config()
-    supervisor = _require_project(args.project)
-    entries = pi_isolated.load(workspace_path_for(args.project, cfg))
-    if args.json:
-        out = []
-        for name, e in sorted(entries.items()):
-            row = dict(e)
-            row["name"] = name
-            row["running"] = (container_running(supervisor)
-                              and _pi_isolated_inner_running(supervisor, name))
-            out.append(row)
-        print(json.dumps(out, indent=2, sort_keys=True))
-        return
-    if not entries:
-        print(f"(project {args.project!r} has no pi-isolated agents enabled)")
-        return
-    rows: list[tuple[str, ...]] = []
-    for name, e in sorted(entries.items()):
-        running = "no"
-        if container_running(supervisor):
-            running = "yes" if _pi_isolated_inner_running(supervisor, name) else "no"
-        rows.append((name, e.get("ip", "?"), e.get("mount", "?"),
-                     e.get("repo") or "-", running))
-    headers = ("NAME", "IP", "MOUNT", "REPO", "RUNNING")
-    cols = list(zip(*([headers] + rows)))
-    widths = [max(len(str(v)) for v in col) for col in cols]
-    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
-    print(fmt.format(*headers))
-    for r in rows:
-        print(fmt.format(*r))
-
-
-def cmd_project_pi_isolated_status(args: argparse.Namespace) -> None:
-    cfg = load_config()
-    supervisor = _require_project(args.project)
-    workspace_path = workspace_path_for(args.project, cfg)
-    entries = pi_isolated.load(workspace_path)
-    entry = entries.get(args.name)
-    if entry is None:
-        die(f"pi-isolated {args.name!r} is not enabled for project "
-            f"{args.project!r}")
-    state = {
-        "name": args.name,
-        "project": args.project,
-        "entry": entry,
-        "container": pi_isolated.container_name(args.name),
-        "exists": False,
-        "running": False,
-        "supervisor_external_mount": False,
-    }
-    if container_running(supervisor):
-        state["exists"] = _pi_isolated_inner_exists(supervisor, args.name)
-        state["running"] = _pi_isolated_inner_running(supervisor, args.name)
-        state["supervisor_external_mount"] = _supervisor_has_external_mount(
-            supervisor, args.name)
-    ws = workspace_path / "pi-isolated" / args.name
-    state["workspace"] = str(ws)
-    state["workspace_present"] = ws.is_dir()
-    # The repo is cloned visibly into the pi tree root as
-    # /workspace/<repo-name> (container view) = <ws>/<repo-name> (host view).
-    repo = entry.get("repo")
-    clone_dir = None
-    if repo:
-        repo_name = repo.rstrip("/").rsplit("/", 1)[-1]
-        if repo_name.endswith(".git"):
-            repo_name = repo_name[:-4]
-        clone_dir = ws / repo_name
-    state["clone_dir"] = str(clone_dir) if clone_dir else None
-    state["repo_cloned"] = bool(clone_dir and (clone_dir / ".git").is_dir())
-
-    if args.json:
-        print(json.dumps(state, indent=2, sort_keys=True))
-        return
-    print(f"name:        {state['name']}")
-    print(f"project:     {state['project']}")
-    print(f"container:   {state['container']}")
-    print(f"  exists:    {state['exists']}")
-    print(f"  running:   {state['running']}")
-    print(f"ip:          {entry.get('ip')}")
-    print(f"repo:        {entry.get('repo') or '(none)'}")
-    print(f"ref:         {entry.get('ref') or '(none)'}")
-    print(f"mount:       {entry.get('mount')}")
-    print(f"root:        {entry.get('root')}")
-    print(f"external mount on supervisor: {state['supervisor_external_mount']}")
-    print(f"workspace:   {state['workspace']}"
-          f" ({'present' if state['workspace_present'] else 'absent'})")
-    print(f"clone dir:   {state['clone_dir']}")
-    print(f"  repo cloned: {state['repo_cloned']}")
-
-
-def _registered_pi_isolated_types() -> set[str]:
-    """Names in the host PI-isolated registry, or empty on load failure (a
-    malformed registry shouldn't break `project create`; the dedicated
-    `pi-isolated` subcommands surface the error)."""
+def _registered_sandbox_byo_types() -> set[str]:
+    """BYO sandbox type names in the host registry, or empty on load failure
+    (a malformed registry shouldn't break `project create`; the dedicated
+    `sandbox` subcommands surface the error). Baked role names are constants
+    (sandbox.baked_names()), not in this set."""
     try:
         return set(pi_isolated_registry.load(expand=False)["types"])
     except pi_isolated_registry.RegistryError:
@@ -3886,57 +3678,47 @@ def _registered_pi_isolated_types() -> set[str]:
 
 def _split_enable_tokens(
     enable_arg: str | None,
-) -> tuple[str | None, list[str], list[str], list[str], bool]:
-    """Split ``--enable`` value into (service_csv, role_mcp_roles,
-    pi_roles, pi_isolated_types, no_pi_mirror).
+) -> tuple[str | None, list[str], list[str], bool]:
+    """Split ``--enable`` value into (service_csv, worker_roles, sandboxes,
+    no_sandbox_mirror).
 
-    Tokens are matched against four sets in order, all using their
-    canonical names (no prefix sugar):
-      - a key in ``role_mcp.ROLE_IMAGES`` (e.g. ``wrangler``,
-        ``echo-mcp``) peels into the role-mcp list,
-      - a key in ``pi_roles.PI_IMAGES`` (e.g. ``pi-wrangler``,
-        ``pi-echo``) peels into the pi list,
-      - a name in the host PI-isolated registry peels into the
-        pi-isolated list,
-      - the bare sentinel ``no-pi-mirror`` suppresses PI-mirror auto-
-        enable for every role-mcp token in the same ``--enable`` value
-        (it applies to all roles, not per-role — per-role granularity is
-        available via ``research project role-mcp enable --no-pi-mirror``),
-      - anything else stays for ``_compute_service_flags`` to interpret
-        as a service id.
+    Tokens are matched against the registries in order, by canonical name:
+      - the bare sentinel ``no-sandbox-mirror`` suppresses the sandbox-mirror
+        auto-enable for every worker token in the same ``--enable`` value,
+      - a key in ``role_mcp.ROLE_IMAGES`` (e.g. ``wrangler``, ``websearcher``,
+        ``echo-mcp``) peels into the worker list. A worker whose name also
+        names a baked sandbox (wrangler / websearcher) auto-enables that
+        sandbox mirror downstream — so a bare twin name means "enable both",
+      - a name resolving to a sandbox type (baked ``echo`` or a BYO registry
+        type) that is NOT also a worker peels into the sandbox list,
+      - anything else stays for ``_compute_service_flags`` as a service id.
 
-    A name that lives in more than one of these surfaces (role-MCP / PI /
-    PI-isolated / service) is a configuration error in this codebase, not
-    an operator problem; the registry tables are the source of truth and
-    authors/operators must keep names disjoint. The parser doesn't try to
-    disambiguate.
+    Worker-first ordering resolves the twin overlap (``wrangler`` is both a
+    worker and a baked sandbox): the bare name enables the worker (+ mirror),
+    while a sandbox-only enable goes through ``project sandbox enable``.
 
-    Empty service set returns None to keep the default (all services
-    enabled / inherit prior flags) intact."""
+    Empty service set returns None to keep the default intact."""
     if not enable_arg:
-        return None, [], [], [], False
-    iso_types = _registered_pi_isolated_types()
+        return None, [], [], False
+    sandbox_types = sandbox.known_type_names()
     services: list[str] = []
-    role_mcps: list[str] = []
-    pi: list[str] = []
-    pi_isolated_types: list[str] = []
-    no_pi_mirror = False
+    workers: list[str] = []
+    sandboxes: list[str] = []
+    no_sandbox_mirror = False
     for tok in enable_arg.split(","):
         tok = tok.strip()
         if not tok:
             continue
-        if tok == "no-pi-mirror":
-            no_pi_mirror = True
+        if tok == "no-sandbox-mirror":
+            no_sandbox_mirror = True
         elif tok in role_mcp.ROLE_IMAGES:
-            role_mcps.append(tok)
-        elif tok in pi_roles.PI_IMAGES:
-            pi.append(tok)
-        elif tok in iso_types:
-            pi_isolated_types.append(tok)
+            workers.append(tok)
+        elif tok in sandbox_types:
+            sandboxes.append(tok)
         else:
             services.append(tok)
     svc_csv = ",".join(services) if services else None
-    return svc_csv, role_mcps, pi, pi_isolated_types, no_pi_mirror
+    return svc_csv, workers, sandboxes, no_sandbox_mirror
 
 
 def _parse_role_mcp_upstream(
@@ -3967,31 +3749,27 @@ def _parse_role_mcp_upstream(
 
 def _split_disable_tokens(
     disable_arg: str | None,
-) -> tuple[str | None, list[str], list[str]]:
+) -> tuple[str | None, list[str]]:
     """Mirror of `_split_enable_tokens` for the disable side: (service_csv,
-    pi_roles, pi_isolated_types). Tokens of the form ``pi-<role>`` peel off
-    into the pi list; tokens in the host PI-isolated registry peel into the
-    pi-isolated list; everything else stays for `_compute_service_flags`.
-    role-mcps are not disabled via ``--disable`` (they have their own
-    ``role-mcp disable`` subcommand), so no role-mcp branch here."""
+    sandboxes). Tokens resolving to a sandbox type (baked or BYO) peel into
+    the sandbox list; everything else stays for `_compute_service_flags`.
+    Workers are not disabled via ``--disable`` (they have their own
+    ``project worker disable`` subcommand), so no worker branch here."""
     if not disable_arg:
-        return None, [], []
-    iso_types = _registered_pi_isolated_types()
+        return None, []
+    sandbox_types = sandbox.known_type_names()
     services: list[str] = []
-    pi: list[str] = []
-    pi_isolated_types: list[str] = []
+    sandboxes: list[str] = []
     for tok in disable_arg.split(","):
         tok = tok.strip()
         if not tok:
             continue
-        if tok.startswith("pi-"):
-            pi.append(tok)
-        elif tok in iso_types:
-            pi_isolated_types.append(tok)
+        if tok in sandbox_types:
+            sandboxes.append(tok)
         else:
             services.append(tok)
     svc_csv = ",".join(services) if services else None
-    return svc_csv, pi, pi_isolated_types
+    return svc_csv, sandboxes
 
 
 # ---------------------------------------------------------------------------
@@ -4418,15 +4196,15 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--enable", metavar="IDS",
                    help=f"comma-separated tokens to force-enable. Tokens "
                         f"are matched by name against three registries: "
-                        f"services ({','.join(KNOWN_SERVICES)}), role-MCPs "
+                        f"services ({','.join(KNOWN_SERVICES)}), workers "
                         f"({','.join(sorted(role_mcp.ROLE_IMAGES))}), and "
-                        f"PI roles ({','.join(sorted(pi_roles.PI_IMAGES))}). "
-                        f"Role-MCP tokens are sugar for `research project "
-                        f"role-mcp enable`; PI-role tokens are sugar for "
-                        f"`research project pi enable`. The bare sentinel "
-                        f"`no-pi-mirror` in this list suppresses the "
-                        f"matching `pi-<role>` auto-enable for every "
-                        f"role-MCP token.")
+                        f"sandboxes ({','.join(sandbox.baked_names())} + BYO "
+                        f"types). Worker tokens sugar for `project worker "
+                        f"enable`; sandbox tokens for `project sandbox "
+                        f"enable`. A worker that has a baked sandbox twin "
+                        f"(wrangler / websearcher) auto-enables that mirror; "
+                        f"the bare sentinel `no-sandbox-mirror` suppresses "
+                        f"that for every worker token.")
     c.add_argument("--role-mcp-upstream", metavar="ROLE=CSV",
                    action="append",
                    help="repeatable: pin an explicit upstream list for a "
@@ -4501,21 +4279,21 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--enable", metavar="IDS",
                    help=f"comma-separated tokens to enable. Matched by "
                         f"name against services ({','.join(KNOWN_SERVICES)}), "
-                        f"role-MCPs ({','.join(sorted(role_mcp.ROLE_IMAGES))}), "
-                        f"and PI roles ({','.join(sorted(pi_roles.PI_IMAGES))}). "
-                        f"Bare sentinel `no-pi-mirror` suppresses the "
-                        f"matching `pi-<role>` auto-enable for every "
-                        f"role-MCP token.")
+                        f"workers ({','.join(sorted(role_mcp.ROLE_IMAGES))}), "
+                        f"and sandboxes ({','.join(sandbox.baked_names())} + "
+                        f"BYO types). Bare sentinel `no-sandbox-mirror` "
+                        f"suppresses the baked-sandbox-mirror auto-enable for "
+                        f"every worker token.")
     u.add_argument("--role-mcp-upstream", metavar="ROLE=CSV",
                    action="append",
                    help="repeatable: pin an explicit upstream list for a "
-                        "role-mcp activated via `--enable <role>` "
+                        "worker activated via `--enable <role>` "
                         "(see `project create --help` for full semantics).")
     u.add_argument("--disable", metavar="IDS",
                    help="comma-separated service ids to disable "
                         "(supervisor is always-on and cannot be "
-                        "disabled). Also accepts pi-<role> tokens to "
-                        "disable a PI role container (workspace "
+                        "disabled). Also accepts sandbox names to "
+                        "disable a sandbox container (workspace "
                         "preserved).")
     u.set_defaults(func=cmd_project_update)
 
@@ -4556,23 +4334,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ----- Role-MCP lifecycle (B.0) --------------------------------------
     rm = proj_sub.add_parser(
-        "role-mcp",
-        help="per-project role-MCP lifecycle "
-             "(enable / disable / list / status). Role-MCPs are project-"
-             "internal orchestration containers, distinct from the general "
-             "MCP registry — they route through the same mcp-proxy but "
-             "live in role-mcps.json, not mcp-allow.json.",
+        "worker",
+        help="per-project worker lifecycle (enable / disable / list / "
+             "status). Workers are pipeline-side agents: the role-MCP "
+             "services workers call via the proxy, plus (in `list`) the "
+             "ephemeral analysis containers the supervisor spawns. Not "
+             "PI-driven — see `project sandbox` for those.",
     )
     rm_sub = rm.add_subparsers(dest="role_action", required=True)
 
     rme = rm_sub.add_parser("enable",
-                            help="bring up a role-MCP container in the "
+                            help="bring up a worker service container in the "
                                  "supervisor's inner dockerd")
     rme.add_argument("project")
     rme.add_argument("role",
-                     help="role name (e.g. echo-mcp). Must be one "
-                          "research.py knows about — see cli/role_mcp.py "
-                          "ROLE_IPS / ROLE_IMAGES.")
+                     help="worker service name (e.g. echo-mcp, wrangler, "
+                          "websearcher) — see `research worker list`.")
     rme_src = rme.add_mutually_exclusive_group()
     rme_src.add_argument("--upstream",
                          help="comma-separated upstream MCP names the role-"
@@ -4589,12 +4366,14 @@ def build_parser() -> argparse.ArgumentParser:
                               "`upstream_source=auto` so `project mcp sync` "
                               "keeps it current. Use this to flip a pinned "
                               "entry back to auto-derive.")
-    rme.add_argument("--no-pi-mirror", action="store_true",
-                     help="suppress the matching PI mirror's auto-enable. "
-                          "Default: when a `pi-<role>` image exists, the "
-                          "matching PI-role container is enabled in lockstep.")
+    rme.add_argument("--no-sandbox-mirror", dest="no_pi_mirror",
+                     action="store_true",
+                     help="suppress the matching sandbox mirror's auto-enable. "
+                          "Default: when a baked sandbox shares this worker's "
+                          "name (wrangler / websearcher), its container is "
+                          "enabled in lockstep.")
     rme.add_argument("--memory",
-                     help="per-role-MCP container memory cap (docker syntax, "
+                     help="per-worker-service container memory cap (docker syntax, "
                           "e.g. 4g). Persists in role-mcps.json and survives "
                           "_recreate_supervisor. Default from "
                           "DEFAULT_ROLE_MCP_MEMORY in .env (2g if unset).")
@@ -4608,7 +4387,7 @@ def build_parser() -> argparse.ArgumentParser:
     rme.set_defaults(func=cmd_project_role_mcp_enable)
 
     rmd = rm_sub.add_parser("disable",
-                            help="stop + remove the role-MCP container "
+                            help="stop + remove the worker service container "
                                  "(workspace state under shared/<role> "
                                  "survives)")
     rmd.add_argument("project")
@@ -4616,14 +4395,16 @@ def build_parser() -> argparse.ArgumentParser:
     rmd.set_defaults(func=cmd_project_role_mcp_disable)
 
     rml = rm_sub.add_parser("list",
-                            help="show every role-MCP enabled for the "
-                                 "project, with running state + upstreams")
+                            help="show worker services (running state + "
+                                 "upstreams) AND, with --instances would be "
+                                 "implicit, the spawned analysis containers "
+                                 "in every state; works supervisor up or down")
     rml.add_argument("project")
     rml.add_argument("--json", action="store_true")
-    rml.set_defaults(func=cmd_project_role_mcp_list)
+    rml.set_defaults(func=cmd_project_worker_list)
 
     rms = rm_sub.add_parser("status",
-                            help="deep-print one role-MCP's container "
+                            help="deep-print one worker service's container "
                                  "state, watermarks, and per-caller call "
                                  "counts")
     rms.add_argument("project")
@@ -4631,100 +4412,62 @@ def build_parser() -> argparse.ArgumentParser:
     rms.add_argument("--json", action="store_true")
     rms.set_defaults(func=cmd_project_role_mcp_status)
 
-    # ----- PI-role lifecycle (STAGE_BACKEND_PI P.0) ----------------------
-    pi = proj_sub.add_parser(
-        "pi",
-        help="per-project PI-role container lifecycle "
-             "(enable / disable / list / status / sync-creds). PI roles "
-             "are interactive per-project containers accessed via webui "
-             "tabs (or via the Supervisor tab + `rs-pi` CLI); they "
-             "live in pi-roles.json, distinct from role-mcps.json.",
+    # ----- per-project sandbox lifecycle (STAGE_CLI_TAXONOMY) -----------
+    # Merges the former `project pi` (baked roles) + `project pi-isolated`
+    # (BYO agents) into one surface: PI-driven, webui-tab-able containers.
+    sb = proj_sub.add_parser(
+        "sandbox",
+        help="per-project sandbox lifecycle (enable / disable / list / "
+             "status / sync-creds). Sandboxes are PI-driven containers with "
+             "webui tabs: baked roles (echo / wrangler / websearcher) and "
+             "BYO skill-repo agents (see `research sandbox list`). They live "
+             "in sandbox.json. PI-owned auth (in-tab /login or sync-creds).",
     )
-    pi_sub = pi.add_subparsers(dest="pi_action", required=True)
+    sb_sub = sb.add_subparsers(dest="sandbox_action", required=True)
 
-    pie = pi_sub.add_parser("enable",
-                            help="bring up a PI role container in the "
-                                 "supervisor's inner dockerd")
-    pie.add_argument("project")
-    pie.add_argument("role",
-                     help="pi role name (e.g. pi-echo). Must be one "
-                          "research.py knows about — see cli/pi.py "
-                          "PI_IPS / PI_IMAGES.")
-    pie.set_defaults(func=cmd_project_pi_enable)
+    sbe = sb_sub.add_parser("enable",
+                            help="bring up a sandbox container in the "
+                                 "supervisor's inner dockerd (recreates the "
+                                 "supervisor first if a BYO external folder "
+                                 "isn't mounted yet)")
+    sbe.add_argument("project")
+    sbe.add_argument("name", help="sandbox name: a baked role (echo / "
+                                  "wrangler / websearcher) or a BYO type "
+                                  "(see `research sandbox list`)")
+    sbe.set_defaults(func=cmd_project_sandbox_enable)
 
-    pid = pi_sub.add_parser("disable",
-                            help="stop + remove the PI role container "
-                                 "(workspace under pi/<role>/ survives)")
-    pid.add_argument("project")
-    pid.add_argument("role")
-    pid.set_defaults(func=cmd_project_pi_disable)
+    sbd = sb_sub.add_parser("disable",
+                            help="stop + remove the sandbox container "
+                                 "(workspace, and any BYO external folder, "
+                                 "survive)")
+    sbd.add_argument("project")
+    sbd.add_argument("name")
+    sbd.set_defaults(func=cmd_project_sandbox_disable)
 
-    pil = pi_sub.add_parser("list",
-                            help="show every PI role enabled for the "
-                                 "project, with running state")
-    pil.add_argument("project")
-    pil.add_argument("--json", action="store_true")
-    pil.set_defaults(func=cmd_project_pi_list)
+    sbl = sb_sub.add_parser("list",
+                            help="show every sandbox enabled for the project "
+                                 "with its container state in any condition "
+                                 "(running / stopped / dead); works "
+                                 "supervisor up or down")
+    sbl.add_argument("project")
+    sbl.add_argument("--json", action="store_true")
+    sbl.set_defaults(func=cmd_project_sandbox_list)
 
-    pis = pi_sub.add_parser("status",
-                            help="deep-print one PI role's container "
-                                 "state + workspace presence")
-    pis.add_argument("project")
-    pis.add_argument("role")
-    pis.add_argument("--json", action="store_true")
-    pis.set_defaults(func=cmd_project_pi_status)
+    sbs = sb_sub.add_parser("status",
+                            help="deep-print one sandbox's container state + "
+                                 "workspace (and, for BYO, clone) presence")
+    sbs.add_argument("project")
+    sbs.add_argument("name")
+    sbs.add_argument("--json", action="store_true")
+    sbs.set_defaults(func=cmd_project_sandbox_status)
 
-    pisc = pi_sub.add_parser("sync-creds",
+    sbsc = sb_sub.add_parser("sync-creds",
                              help="push the supervisor's creds into every "
-                                  "running PI container (operator-initiated; "
-                                  "PI containers are otherwise PI-authed via "
+                                  "running sandbox (operator-initiated; "
+                                  "sandboxes are otherwise PI-authed via "
                                   "in-tab /login)")
-    pisc.add_argument("project")
-    pisc.set_defaults(func=cmd_project_pi_sync_creds)
-
-    # ----- per-project PI-isolated lifecycle (STAGE_PI_ISOLATED) --------
-    piso = proj_sub.add_parser(
-        "pi-isolated",
-        help="per-project PI-isolated agent lifecycle "
-             "(enable / disable / list / status). Isolated agents clone a "
-             "skill repo defined in the host `pi-isolated` registry and mount "
-             "<root>/<project>/ from the host; they live in pi-isolated.json, "
-             "distinct from pi-roles.json and role-mcps.json.",
-    )
-    piso_sub = piso.add_subparsers(dest="pi_isolated_action", required=True)
-
-    pie2 = piso_sub.add_parser("enable",
-                               help="snapshot a registered type into the "
-                                    "project + start its container (recreates "
-                                    "the supervisor if the external folder "
-                                    "isn't mounted yet)")
-    pie2.add_argument("project")
-    pie2.add_argument("name", help="pi-isolated type name (see "
-                                   "`research pi-isolated list`)")
-    pie2.set_defaults(func=cmd_project_pi_isolated_enable)
-
-    pid2 = piso_sub.add_parser("disable",
-                               help="stop + remove the container (the external "
-                                    "folder with the cloned repo, and the pi "
-                                    "workspace, survive)")
-    pid2.add_argument("project")
-    pid2.add_argument("name")
-    pid2.set_defaults(func=cmd_project_pi_isolated_disable)
-
-    pil2 = piso_sub.add_parser("list",
-                               help="show every pi-isolated agent enabled for "
-                                    "the project, with running state")
-    pil2.add_argument("project")
-    pil2.add_argument("--json", action="store_true")
-    pil2.set_defaults(func=cmd_project_pi_isolated_list)
-
-    pis2 = piso_sub.add_parser("status",
-                               help="deep-print one agent's container state + "
-                                    "workspace/clone presence")
-    pis2.add_argument("project")
-    pis2.add_argument("name")
-    pis2.add_argument("--json", action="store_true")
-    pis2.set_defaults(func=cmd_project_pi_isolated_status)
+    sbsc.add_argument("project")
+    sbsc.set_defaults(func=cmd_project_sandbox_sync_creds)
 
     # ----- MCP registry (Stage 2.1) -------------------------------------
     mcp = sub.add_parser("mcp", help="MCP registry operations")
@@ -4774,12 +4517,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="remove the existing description")
     md_d.set_defaults(func=cmd_mcp_describe)
 
-    sr = mcp_sub.add_parser("set-roles",
-                            help="replace an MCP's role-MCP affinities "
-                                 "(comma-separated; empty CSV clears)")
+    sr = mcp_sub.add_parser("set-workers",
+                            help="replace an MCP's worker affinities — which "
+                                 "worker services auto-wire this MCP as an "
+                                 "upstream (comma-separated; empty CSV clears)")
     sr.add_argument("name")
-    sr.add_argument("csv", help="comma-separated role names, or empty string "
-                                "to clear")
+    sr.add_argument("csv", help="comma-separated worker service names, or "
+                                "empty string to clear")
     sr.set_defaults(func=cmd_mcp_set_roles)
 
     ml = mcp_sub.add_parser("list", help="list registered MCPs")
@@ -4824,15 +4568,29 @@ def build_parser() -> argparse.ArgumentParser:
                      help="MCP name; omit to test every registered MCP")
     mts.set_defaults(func=cmd_mcp_test)
 
-    # ----- PI-isolated type registry (STAGE_PI_ISOLATED) ----------------
-    piso_reg = sub.add_parser(
-        "pi-isolated",
-        help="host registry of PI-isolated agent types (reusable repo + "
-             "root-folder definitions enabled per-project with "
-             "`project create|update --enable <type>`)")
-    piso_reg_sub = piso_reg.add_subparsers(dest="subcommand", required=True)
+    # ----- worker catalog (host visibility) -----------------------------
+    wk = sub.add_parser(
+        "worker",
+        help="worker-side agents: catalog of built-in service types "
+             "(role-MCPs) the supervisor can run, plus the analysis worker "
+             "baseline. Per-project lifecycle is `research project worker`.")
+    wk_sub = wk.add_subparsers(dest="subcommand", required=True)
+    wkl = wk_sub.add_parser("list", help="list available worker types")
+    wkl.add_argument("--json", action="store_true")
+    wkl.set_defaults(func=cmd_worker_list)
 
-    pa = piso_reg_sub.add_parser("add", help="register a PI-isolated type")
+    # ----- sandbox type registry (STAGE_CLI_TAXONOMY) -------------------
+    # Host catalog of sandbox types: built-in baked roles (constants) +
+    # operator-registered BYO skill-repo types (the host registry, formerly
+    # `pi-isolated`). Per-project lifecycle is `research project sandbox`.
+    sbr = sub.add_parser(
+        "sandbox",
+        help="host catalog of sandbox types: built-in baked roles + BYO "
+             "skill-repo agents (reusable repo + root-folder definitions "
+             "enabled per-project with `project create|update --enable`)")
+    sbr_sub = sbr.add_subparsers(dest="subcommand", required=True)
+
+    pa = sbr_sub.add_parser("add", help="register a BYO sandbox type")
     pa.add_argument("name")
     pa.add_argument("--root", required=True, metavar="HOST_DIR",
                     help="host folder for this type; the per-project subdir "
@@ -4853,32 +4611,33 @@ def build_parser() -> argparse.ArgumentParser:
                          f"at (default {pi_isolated_registry.DEFAULT_MOUNT!r}; "
                          f"keep under /workspace/)")
     pa.add_argument("--description",
-                    help="operator note surfaced in `pi-isolated list`")
+                    help="operator note surfaced in `sandbox list`")
     pa.add_argument("--no-verify", action="store_true",
                     help="skip the `git ls-remote` repo/ref check at add time")
-    pa.set_defaults(func=cmd_pi_isolated_add)
+    pa.set_defaults(func=cmd_sandbox_add)
 
-    pl = piso_reg_sub.add_parser("list", help="list registered PI-isolated types")
+    pl = sbr_sub.add_parser("list",
+                            help="list all sandbox types (built-in baked + BYO)")
     pl.add_argument("--json", action="store_true")
-    pl.set_defaults(func=cmd_pi_isolated_list)
+    pl.set_defaults(func=cmd_sandbox_list)
 
-    pr = piso_reg_sub.add_parser("remove", help="remove a type from the registry")
+    pr = sbr_sub.add_parser("remove", help="remove a BYO type from the registry")
     pr.add_argument("name")
     pr.add_argument("--force", action="store_true",
                     help="remove even if projects currently enable it")
-    pr.set_defaults(func=cmd_pi_isolated_remove)
+    pr.set_defaults(func=cmd_sandbox_remove)
 
-    psr = piso_reg_sub.add_parser("set-root", help="change a type's host root folder")
+    psr = sbr_sub.add_parser("set-root", help="change a BYO type's host root folder")
     psr.add_argument("name")
     psr.add_argument("root", metavar="HOST_DIR")
-    psr.set_defaults(func=cmd_pi_isolated_set_root)
+    psr.set_defaults(func=cmd_sandbox_set_root)
 
-    pds = piso_reg_sub.add_parser("describe", help="set or clear a type's description")
+    pds = sbr_sub.add_parser("describe", help="set or clear a BYO type's description")
     pds.add_argument("name")
     pdg = pds.add_mutually_exclusive_group(required=True)
     pdg.add_argument("text", nargs="?", help="new description text")
     pdg.add_argument("--clear", action="store_true", help="remove the description")
-    pds.set_defaults(func=cmd_pi_isolated_describe)
+    pds.set_defaults(func=cmd_sandbox_describe)
 
     # ----- webui (browser SSH multiplexer) ------------------------------
     wu = sub.add_parser("webui", help="manage the optional browser UI container")

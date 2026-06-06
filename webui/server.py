@@ -291,11 +291,12 @@ async def project_services_handler(request: web.Request) -> web.Response:
     is the correct UX — a tab that 502s on click is worse than no tab.
 
     kind=ssh non-always-on services whose id starts with `pi-` are
-    gated on the project's per-supervisor pi-roles.json: tab shows iff
-    the role is listed there. Read directly off the existing
+    gated on the project's per-supervisor sandbox.json: a `pi-<short>`
+    tab shows iff the baked sandbox `<short>` is enabled there (plus one
+    synthesized tab per BYO sandbox). Read directly off the existing
     `/projects:ro` bind-mount — same data plane that powers the rail's
     status sub-line; no cache, no SSH, no docker socket. Lifecycle
-    changes (`research project pi enable / disable`) reflect on the
+    changes (`research project sandbox enable / disable`) reflect on the
     next page load. RO mount surface is wider than this filter
     (covers `.creds/` etc.), so adding new file reads here doesn't
     expand the webui's trust posture."""
@@ -320,7 +321,7 @@ async def project_services_handler(request: web.Request) -> web.Response:
         probe_up = {sid: up for (sid, _), up in zip(probe_jobs, results)}
 
     out: dict[str, dict] = {}
-    pi_roles_for_project: set[str] | None = None
+    sandbox_map: dict[str, str] | None = None
     for sid, svc in services.SERVICES.items():
         if svc.get("always_on"):
             out[sid] = svc
@@ -328,62 +329,49 @@ async def project_services_handler(request: web.Request) -> web.Response:
             if probe_up.get(sid):
                 out[sid] = svc
         elif svc.get("kind") == "ssh" and sid.startswith("pi-"):
-            if pi_roles_for_project is None:
-                pi_roles_for_project = _read_project_pi_roles(project)
-            if sid in pi_roles_for_project:
+            if sandbox_map is None:
+                sandbox_map = _read_project_sandbox(project)
+            # A baked-sandbox SERVICES tab `pi-<short>` shows iff the project
+            # enables baked sandbox `<short>` (sandbox.json key, no prefix).
+            if sandbox_map.get(sid[len("pi-"):]) == "baked":
                 out[sid] = svc
 
-    # PI-isolated agents (STAGE_PI_ISOLATED): one synthesized tab per agent
-    # listed in the project's pi-isolated.json. Same data-plane discipline
-    # as _read_project_pi_roles — read off the /projects:ro bind-mount, no
+    # BYO sandboxes (STAGE_CLI_TAXONOMY, formerly pi-isolated): one
+    # synthesized tab per BYO entry in the project's sandbox.json. Same
+    # data-plane discipline — read off the /projects:ro bind-mount, no
     # SSH/docker socket, lifecycle changes reflect on next page load.
-    for name in sorted(_read_project_pi_isolated(project)):
+    if sandbox_map is None:
+        sandbox_map = _read_project_sandbox(project)
+    for name, kind in sorted(sandbox_map.items()):
+        if kind != "byo":
+            continue
         spec = services.pi_isolated_service(name)
         if spec is not None:
             out[f"{services.PI_ISOLATED_ID_PREFIX}{name}"] = spec
     return web.json_response(out)
 
 
-def _read_project_pi_roles(project: str) -> set[str]:
-    """Return the set of pi-role keys enabled for ``project``, read from
-    its `.orchestrator/pi-roles.json` off the `/projects:ro` bind-mount.
-    Tolerates: missing project workspace (legacy / not yet created),
-    missing pi-roles.json (no PI roles ever enabled), invalid JSON — all
-    return an empty set so the tab strip silently omits the PI tabs.
-    No cache: the file read is cheap and lifecycle changes propagate on
-    the next page load."""
+def _read_project_sandbox(project: str) -> dict[str, str]:
+    """Return ``{name: kind}`` for the sandboxes enabled for ``project``,
+    read from its `.orchestrator/sandbox.json` off the `/projects:ro`
+    bind-mount (kind is "baked" or "byo"). Tolerates: missing workspace,
+    missing sandbox.json (no sandboxes enabled), invalid JSON — all return
+    an empty dict so the tab strip silently omits the sandbox tabs. No
+    cache: the read is cheap and lifecycle changes propagate on next load."""
     workspace = _project_workspace(project)
     if workspace is None:
-        return set()
-    pi_file = workspace / ".orchestrator" / "pi-roles.json"
-    if not pi_file.is_file():
-        return set()
+        return {}
+    f = workspace / ".orchestrator" / "sandbox.json"
+    if not f.is_file():
+        return {}
     try:
-        data = json.loads(pi_file.read_text())
+        data = json.loads(f.read_text())
     except (OSError, json.JSONDecodeError):
-        return set()
+        return {}
     if not isinstance(data, dict):
-        return set()
-    return set(data.keys())
-
-
-def _read_project_pi_isolated(project: str) -> set[str]:
-    """Set of PI-isolated agent names enabled for ``project``, read from its
-    `.orchestrator/pi-isolated.json` off the `/projects:ro` mount. Same
-    tolerance + no-cache posture as `_read_project_pi_roles`."""
-    workspace = _project_workspace(project)
-    if workspace is None:
-        return set()
-    iso_file = workspace / ".orchestrator" / "pi-isolated.json"
-    if not iso_file.is_file():
-        return set()
-    try:
-        data = json.loads(iso_file.read_text())
-    except (OSError, json.JSONDecodeError):
-        return set()
-    if not isinstance(data, dict):
-        return set()
-    return set(data.keys())
+        return {}
+    return {n: e.get("kind") for n, e in data.items()
+            if isinstance(e, dict)}
 
 
 # ---- /projects/status — per-project rail sub-line data ----------------

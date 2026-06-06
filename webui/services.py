@@ -57,22 +57,24 @@ SERVICES = {
     # CLAUDE.md / .mcp.json in /home/worker and miss them.
     #
     # always_on=False — visibility is per-project, gated on whether the
-    # project's pi-roles.json lists `pi-wrangler`. The filter is in
+    # project enables the baked sandbox `wrangler`. The filter is in
     # `project_services_handler` in server.py; it reads the per-project
-    # `.orchestrator/pi-roles.json` directly off the `/projects:ro`
-    # bind-mount that already serves the rail's status sub-line. No
-    # SSH, no cache: lifecycle changes (`research project pi enable/
+    # `.orchestrator/sandbox.json` directly off the `/projects:ro`
+    # bind-mount that already serves the rail's status sub-line, and maps
+    # this `pi-wrangler` tab id to the baked sandbox key `wrangler`. No
+    # SSH, no cache: lifecycle changes (`research project sandbox enable/
     # disable`) reflect on the next page load.
     #
-    # New `pi-<role>` entries follow the same shape — always_on=False
+    # New baked `pi-<short>` tabs follow the same shape — always_on=False
     # is the correct default; the filter generalizes across every
-    # `kind=ssh` non-always-on service whose id starts with `pi-`.
+    # `kind=ssh` non-always-on service whose id starts with `pi-` (it
+    # strips the prefix and looks up the baked sandbox of that name).
     #
     # Label is "Wrangler" without the "PI" prefix — from the PI's
     # perspective everything here IS PI mode; the prefix would be noise.
-    # The underlying container is still `rs-pi-wrangler` and the role
-    # key in pi-roles.json is still `pi-wrangler`; only the user-facing
-    # label drops the prefix.
+    # The underlying container is still `rs-pi-wrangler` and the baked
+    # sandbox key in sandbox.json is `wrangler`; only the user-facing
+    # tab id keeps the `pi-` prefix.
     "pi-wrangler": {
         "label": "Wrangler",
         "kind": "ssh",
@@ -128,8 +130,8 @@ SERVICES = {
 # PI-isolated agents (STAGE_PI_ISOLATED) are per-project and arbitrarily
 # named, so they can't be static SERVICES entries. Their tab id is
 # `pi-iso-<name>` and the tab is synthesized on demand: project_services_
-# handler adds one per agent listed in the project's pi-isolated.json, and
-# `resolve()` reconstructs the command server-side for the ssh handler.
+# handler adds one per BYO (kind="byo") entry in the project's sandbox.json,
+# and `resolve()` reconstructs the command server-side for the ssh handler.
 import re as _re
 
 PI_ISOLATED_ID_PREFIX = "pi-iso-"
