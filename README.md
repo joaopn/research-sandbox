@@ -46,6 +46,7 @@ python research.py project destroy myproj
 [◾ Quick Start](#-quick-start)
 [◾ What you get on disk](#-what-you-get-on-disk)
 [◾ MCP servers](#-mcp-servers)
+[◾ Agents & registries](#-agents--registries)
 [◾ CLI Reference](#-cli-reference)
 [◾ File Structure](#-file-structure)
 [◾ Roadmap](#-roadmap)
@@ -211,7 +212,7 @@ python research.py mcp add notes --kind external --host host.docker.internal:900
 # Or one running on a remote machine
 python research.py mcp add remote --kind external --host 10.0.5.42:8443
 
-# Enable each MCP you intend to use (gate for `project mcp-allow`)
+# Enable each MCP you intend to use (gate for `project mcp allow`)
 python research.py mcp enable arxiv
 python research.py mcp enable notes
 
@@ -219,7 +220,7 @@ python research.py mcp enable notes
 python research.py mcp start arxiv
 
 # Allow an enabled MCP for a specific project
-python research.py project mcp-allow myproj arxiv
+python research.py project mcp allow myproj arxiv
 
 # Now the supervisor can spawn workers that have access to it
 # (inside the supervisor):
@@ -227,13 +228,51 @@ python research.py project mcp-allow myproj arxiv
 ```
 
 `mcp add` only writes to the registry. `mcp enable` flips a per-MCP flag;
-`project mcp-allow` refuses to grant a disabled MCP, and `research start`
+`project mcp allow` refuses to grant a disabled MCP, and `research start`
 auto-launches every enabled *shared* MCP after the router comes up.
 `mcp start [<name>]` and `mcp stop [<name>]` manage shared-container
 lifecycle on demand — bare invocation operates on all enabled / all running.
 External MCPs have no container lifecycle, so `mcp start`/`stop` skip them.
 
 The MCP must speak streamable-HTTP and follow a small contract; see [docs/GUIDE.md#authoring-an-mcp-server](docs/GUIDE.md#-authoring-an-mcp-server) for a 10-line example. Workers can't reach MCPs they weren't granted — see [docs/SECURITY.md](docs/SECURITY.md) for the gating layers.
+
+---
+
+## ◾ Agents & registries
+
+Everything you can give a project falls into **three registries**, keyed by *who drives the thing*. Each has a host-level catalog (`research <reg> list`) and a per-project enable surface (`research project <reg> …`):
+
+| Registry | What it holds | Driven by | Has a webui tab? |
+|---|---|---|---|
+| **`mcp`** | external tool/data capabilities (arxiv, DBs, search) reached through the per-project proxy | workers **and** sandboxes consume them | no |
+| **`worker`** | pipeline-side agents: the **analysis** worker (spawned per question, headless) + **service** workers (role-MCPs like `wrangler`/`websearcher` that workers call) | the supervisor | no |
+| **`sandbox`** | PI-driven interactive containers: **baked** roles (`echo`/`wrangler`/`websearcher`) and **BYO** skill-repo agents you register | you, in a terminal/webui tab | yes |
+
+The split is the mental model: **`mcp` = tools, `worker` = pipeline agents, `sandbox` = your agents.** A worker and a sandbox can share a name (`wrangler` is both a service workers call *and* an interactive tab you open) — enabling the worker auto-enables its sandbox mirror, so the two never drift (`--no-sandbox-mirror` opts out). See the analysis-worker flow above for the day-to-day path; `worker`/`sandbox` are for when you want a long-lived service or your own interactive agent.
+
+**Defaults for new projects.** All three registries share one model: a host-level *enabled* flag auto-applies the entry to every new project at `project create`, and `--disable` overrules it per-project. Out of the box, the **`websearcher` worker service is default-on** (an image-baked browser useful everywhere; its interactive sandbox tab comes along automatically via the worker→sandbox mirror — so `sandbox list` shows it as `DEFAULT: same as worker`). `wrangler` and the `echo` fixture are **not** default-on. MCPs default via `mcp enable <name>` (+ the `--mcp all-enabled` create default).
+
+```bash
+# See what's auto-enabled in new projects (DEFAULT column)
+python research.py worker list      # websearcher → ✓ ; wrangler, echo-mcp → -
+python research.py sandbox list     # websearcher → "same as worker" ; echo → -
+
+# Turn the built-in default off everywhere:
+python research.py worker disable websearcher
+
+# Flag your own additions on by default:
+python research.py worker enable librarian              # a service worker
+python research.py sandbox add wiki --repo https://github.com/me/obsidian-kit --root ~/vaults
+python research.py sandbox enable wiki                  # a BYO agent
+
+# Opt a single project out of a default:
+python research.py project create myproj --disable websearcher
+
+# Or enable ad-hoc for one project without touching the defaults:
+python research.py project sandbox enable myproj wiki
+```
+
+(Mirror sandboxes like `wrangler`/`websearcher` can't be default-flagged on the sandbox surface directly — they follow their worker twin, so use `worker enable/disable` for those.)
 
 ---
 
@@ -255,23 +294,49 @@ Project lifecycle:
   project list                       Show all projects
   project status <name>              Detailed state + worker registry summary
   project stop|start <name|--all>    Stop/start the supervisor without destroying
+  project update <name> [--rebuild] [--enable IDS] [--disable IDS]
+                                     Push code/flags into a running project (recreates supervisor)
   project destroy <name>             Remove container + workspace + network + creds
   project ssh <name>                 Print SSH connection string
 
-  project mcp-allow <proj> <mcp>     Grant a project access to a registered MCP
-  project mcp-deny  <proj> <mcp>     Revoke access
-
-MCP registry:
+mcp registry — external tools (reached through the per-project proxy):
   mcp add <name> --kind {external,shared} [opts]   Register an MCP
   mcp list [--json]                  Show all registered MCPs
   mcp remove <name> [--force]        Unregister (refuses if any project allows it)
-  mcp enable|disable <name>          Toggle the per-MCP enabled flag (required for mcp-allow)
-  mcp start [<name>]                 Start a shared MCP container (or all enabled shared)
-  mcp stop  [<name>]                 Stop a shared MCP container (or all running)
-  mcp test  [<name>]                 Probe reachability (or all)
+  mcp enable|disable <name>          Toggle the per-MCP enabled flag (gate for `project mcp allow`)
+  mcp set-workers <name> <csv>       Which worker services auto-wire this MCP as an upstream
+  mcp start|stop [<name>]            Shared-container lifecycle (or all enabled / all running)
+  mcp test [<name>]                  Probe reachability (or all)
+  project mcp allow|deny <proj> <mcp>   Grant / revoke a project's access to an MCP
+  project mcp list|sync <proj>          List the project's allowlist / reconcile with the registry
+
+worker registry — pipeline agents (analysis worker + service role-MCPs):
+  worker list [--json]               Catalog of worker types (DEFAULT col = auto-enabled in new projects)
+  worker enable|disable <name>       Flag / unflag a service for auto-enable in new projects
+  project worker enable <proj> <name> [--upstream csv] [--no-sandbox-mirror]
+                                     Bring up a service worker (e.g. wrangler, websearcher)
+  project worker disable <proj> <name>   Stop + remove a service worker
+  project worker list <proj> [--json]    Services + running analysis instances, any state, up or down
+  project worker status <proj> <name>    Deep state of one service worker
+  (analysis workers themselves are spawned by the supervisor via `rs-worker` — see below)
+
+sandbox registry — PI-driven agents (baked roles + bring-your-own):
+  sandbox list [--json]              Catalog of sandbox types (DEFAULT col = auto-enabled in new projects)
+  sandbox enable|disable <name>      Flag / unflag a sandbox (baked or BYO) for auto-enable in new projects
+  sandbox add <name> --root DIR [--repo URL --ref SHA --setup CMD --mount PATH]
+                                     Register a bring-your-own skill-repo agent type
+  sandbox remove <name> [--force]    Unregister a BYO type
+  sandbox set-root <name> <dir>      Change a BYO type's host root folder
+  sandbox describe <name> <text>|--clear   Set / clear a BYO type's note
+  project sandbox enable <proj> <name>     Bring up a baked role or BYO sandbox (gets a webui tab)
+  project sandbox disable <proj> <name>    Stop + remove (workspace + external folder survive)
+  project sandbox list <proj> [--json]     Enabled sandboxes + container state, up or down
+  project sandbox status <proj> <name>     Deep state of one sandbox
+  project sandbox sync-creds <proj>        Push supervisor creds into running sandboxes (opt-in)
 
 project create options:
   --data <paths>                     Comma-separated host paths, each mounted RO at /workspace/shared/data/<basename>
+  --enable <ids>                     Comma-separated workers/sandboxes/services to enable at create
   --memory <limit>                   Docker memory limit (e.g. 8g)
   --cpus <limit>                     Docker CPU limit
   --egress {open,locked}             Network egress policy (default open)

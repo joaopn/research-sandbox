@@ -43,6 +43,7 @@ from pathlib import Path
 
 # Make cli/ helpers importable.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "cli"))
+import defaults  # noqa: E402  (host-side default-enablement for worker + sandbox)
 import mcp_registry  # noqa: E402
 import pi_isolated_registry  # noqa: E402  (BYO sandbox type registry; sub-component of sandbox)
 import role_mcp  # noqa: E402
@@ -783,7 +784,23 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     disable_arg = getattr(args, "disable", None)
     enable_services, enable_workers, enable_sandboxes, \
         enable_no_sandbox_mirror = _split_enable_tokens(enable_arg)
-    disable_services, disable_sandboxes = _split_disable_tokens(disable_arg)
+    disable_services, disable_workers, disable_sandboxes = \
+        _split_disable_tokens(disable_arg)
+    # Fold the host default-enable sets in (mirrors `--mcp all-enabled`): a
+    # worker/sandbox flagged via `research worker|sandbox enable` is on by
+    # default in new projects, with `--enable` adding more and `--disable`
+    # overruling. Stale defaults (a removed BYO type) are dropped with a note.
+    _dis_w, _dis_s = set(disable_workers), set(disable_sandboxes)
+    enable_workers = [w for w in _ordered_union(defaults.enabled("worker"), enable_workers)
+                      if w not in _dis_w]
+    _known_sb = sandbox.known_type_names()
+    enable_sandboxes = [s for s in _ordered_union(defaults.enabled("sandbox"), enable_sandboxes)
+                        if s not in _dis_s]
+    for s in list(enable_sandboxes):
+        if s not in _known_sb:
+            print(f"note: default sandbox {s!r} is no longer a known type; "
+                  f"skipping its auto-enable", file=sys.stderr)
+            enable_sandboxes.remove(s)
     role_mcp_explicit = _parse_role_mcp_upstream(
         getattr(args, "role_mcp_upstream", None) or [],
         valid_roles=set(enable_workers),
@@ -895,6 +912,8 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     #     by 6d above are skipped here to avoid a redundant start.)
     sandboxes_enabled: list[str] = []
     for name in enable_sandboxes:
+        if name in workers_enabled:
+            continue  # already brought up as the worker's sandbox mirror
         try:
             _sandbox_enable(project, cfg, name)
             sandboxes_enabled.append(name)
@@ -1514,7 +1533,11 @@ def cmd_project_update(args: argparse.Namespace) -> None:
     disable_arg = getattr(args, "disable", None)
     enable_services, enable_workers, enable_sandboxes, \
         enable_no_sandbox_mirror = _split_enable_tokens(enable_arg)
-    disable_services, disable_sandboxes = _split_disable_tokens(disable_arg)
+    disable_services, disable_workers, disable_sandboxes = \
+        _split_disable_tokens(disable_arg)
+    # `update` does NOT fold in the host default-enable sets — defaults are a
+    # create-time convenience; re-applying them here would resurrect anything
+    # a project deliberately disabled. Explicit --enable/--disable only.
     role_mcp_explicit = _parse_role_mcp_upstream(
         getattr(args, "role_mcp_upstream", None) or [],
         valid_roles=set(enable_workers),
@@ -1542,11 +1565,17 @@ def cmd_project_update(args: argparse.Namespace) -> None:
         flags_override = _compute_service_flags(
             enable_services, disable_services, base=base)
 
-    # Sandbox disables run BEFORE _recreate_supervisor: the recreate's
-    # restart loop reads sandbox.json, and a sandbox removed there should
-    # not come back up after recreate. The stop helper is tolerant of a
-    # missing container (the recreate is about to nuke the inner dockerd
-    # anyway under sysbox).
+    # Worker + sandbox disables run BEFORE _recreate_supervisor: the
+    # recreate's restart loops read role-mcps.json / sandbox.json, and an
+    # entry removed there should not come back up after recreate. The stop
+    # helpers tolerate a missing container (the recreate nukes the inner
+    # dockerd anyway under sysbox).
+    for role in disable_workers:
+        try:
+            _role_mcp_disable(project, cfg, role)
+        except SystemExit:
+            print(f"warning: failed to disable worker {role!r}",
+                  file=sys.stderr)
     for name in disable_sandboxes:
         try:
             _sandbox_disable(project, cfg, name)
@@ -2097,24 +2126,47 @@ def _resolve_pi_isolated_ref(repo: str) -> str:
 def cmd_worker_list(args: argparse.Namespace) -> None:
     """Host catalog of worker *types*: the always-available analysis worker
     (spawned per-task by the supervisor) + the built-in role-MCP service types
-    (enable-able per project). Visibility surface; per-project lifecycle is
-    `research project worker`."""
-    cat = [{"name": "analysis", "kind": "task",
+    (enable-able per project). The DEFAULT column marks services flagged for
+    auto-enable in new projects (`research worker enable <name>`). Per-project
+    lifecycle is `research project worker`."""
+    default_on = set(defaults.enabled("worker"))
+    cat = [{"name": "analysis", "kind": "task", "default": False,
             "detail": "headless analysis worker (spawned per question by the "
                       "supervisor; no per-project enable)"}]
     for name, image in sorted(role_mcp.ROLE_IMAGES.items()):
-        cat.append({"name": name, "kind": "service", "detail": image})
+        cat.append({"name": name, "kind": "service",
+                    "default": name in default_on, "detail": image})
     if args.json:
         print(json.dumps(cat, indent=2, sort_keys=True))
         return
-    rows = [(c["name"], c["kind"], c["detail"]) for c in cat]
-    headers = ("NAME", "KIND", "DETAIL")
+    rows = [(c["name"], c["kind"], "✓" if c["default"] else "-", c["detail"])
+            for c in cat]
+    headers = ("NAME", "KIND", "DEFAULT", "DETAIL")
     cols = list(zip(*([headers] + rows)))
     widths = [max(len(str(v)) for v in col) for col in cols]
     fmt = "  ".join(f"{{:<{w}}}" for w in widths)
     print(fmt.format(*headers))
     for r in rows:
         print(fmt.format(*r))
+
+
+def cmd_worker_default_enable(args: argparse.Namespace) -> None:
+    """Flag a worker service for auto-enable in NEW projects (mirrors
+    `mcp enable`). Validates the name is a known service; the always-on
+    analysis worker isn't a service and can't be flagged."""
+    if args.name not in role_mcp.ROLE_IMAGES:
+        die(f"unknown worker service {args.name!r}. Known services: "
+            f"{', '.join(sorted(role_mcp.ROLE_IMAGES))}. (The analysis worker "
+            f"is always available and isn't a default-enable target.)")
+    defaults.set_enabled("worker", args.name, True)
+    print(f"worker {args.name!r}: default-enabled (auto-enabled in new "
+          f"projects; override per-project with `project create --disable`)")
+
+
+def cmd_worker_default_disable(args: argparse.Namespace) -> None:
+    defaults.set_enabled("worker", args.name, False)
+    print(f"worker {args.name!r}: default-disabled (not auto-enabled in new "
+          f"projects)")
 
 
 def cmd_sandbox_add(args: argparse.Namespace) -> None:
@@ -2165,9 +2217,14 @@ def cmd_sandbox_add(args: argparse.Namespace) -> None:
 
 def cmd_sandbox_list(args: argparse.Namespace) -> None:
     """Full host catalog of sandbox *types*: built-in baked roles + BYO
-    registry types. The visibility surface — what can be enabled per project."""
+    registry types. The DEFAULT column marks types flagged for auto-enable in
+    new projects (`research sandbox enable <name>`). Visibility surface — what
+    can be enabled per project."""
     cat = sandbox.catalog()
+    default_on = set(defaults.enabled("sandbox"))
     if args.json:
+        for c in cat:
+            c["default"] = c["name"] in default_on
         print(json.dumps(cat, indent=2, sort_keys=True))
         return
     if not cat:
@@ -2188,10 +2245,16 @@ def cmd_sandbox_list(args: argparse.Namespace) -> None:
         else:
             src = c.get("repo") or "(folder-only)"
             mirror = "-"
-        rows.append((nm, c["kind"], src, mirror))
+        # A baked mirror sandbox has no independent default — it comes up iff
+        # its worker twin does. echo (no twin) + BYO use the sandbox default set.
+        if c["kind"] == "baked" and c.get("mirror_of"):
+            default_col = "same as worker"
+        else:
+            default_col = "✓" if nm in default_on else "-"
+        rows.append((nm, c["kind"], default_col, src, mirror))
         descs.append(byo.get(nm, {}).get("description", "")
                      if c["kind"] == "byo" else "")
-    headers = ("NAME", "KIND", "IMAGE/REPO", "MIRRORS")
+    headers = ("NAME", "KIND", "DEFAULT", "IMAGE/REPO", "MIRRORS")
     cols = list(zip(*([headers] + rows)))
     widths = [max(len(str(v)) for v in col) for col in cols]
     fmt = "  ".join(f"{{:<{w}}}" for w in widths)
@@ -2200,6 +2263,39 @@ def cmd_sandbox_list(args: argparse.Namespace) -> None:
         print(fmt.format(*r))
         if d:
             print(f"    {d}")
+
+
+def _reject_mirror_sandbox_default(name: str) -> None:
+    """A baked mirror sandbox (wrangler/websearcher) has no independent default
+    — its enablement follows its worker twin. Point the operator there."""
+    if sandbox.is_baked(name) and sandbox.mirror_of(name):
+        die(f"sandbox {name!r} mirrors the worker service of the same name — "
+            f"its default follows the worker, not a separate flag. Use "
+            f"`research worker enable {name}` / `disable {name}` instead "
+            f"(that auto-enables/disables this sandbox in lockstep).")
+
+
+def cmd_sandbox_default_enable(args: argparse.Namespace) -> None:
+    """Flag a sandbox for auto-enable in NEW projects (mirrors `mcp enable`).
+    Only echo and BYO types are targets — baked mirror roles follow their
+    worker twin (see `worker enable`)."""
+    known = sandbox.known_type_names()
+    if args.name not in known:
+        die(f"unknown sandbox {args.name!r}. Known: "
+            f"{', '.join(sorted(known)) or '(none)'} "
+            f"(baked roles + registered BYO types; add a BYO type with "
+            f"`research sandbox add`).")
+    _reject_mirror_sandbox_default(args.name)
+    defaults.set_enabled("sandbox", args.name, True)
+    print(f"sandbox {args.name!r}: default-enabled (auto-enabled in new "
+          f"projects; override per-project with `project create --disable`)")
+
+
+def cmd_sandbox_default_disable(args: argparse.Namespace) -> None:
+    _reject_mirror_sandbox_default(args.name)
+    defaults.set_enabled("sandbox", args.name, False)
+    print(f"sandbox {args.name!r}: default-disabled (not auto-enabled in new "
+          f"projects)")
 
 
 def cmd_sandbox_remove(args: argparse.Namespace) -> None:
@@ -2223,6 +2319,7 @@ def cmd_sandbox_remove(args: argparse.Namespace) -> None:
             pi_isolated_registry.save_atomic(data)
         except pi_isolated_registry.RegistryError as e:
             die(str(e))
+    defaults.set_enabled("sandbox", args.name, False)  # drop any default flag
     print(f"removed sandbox type {args.name!r}")
     if in_use:
         print(f"  note: {len(in_use)} project(s) still have a stale "
@@ -3747,29 +3844,45 @@ def _parse_role_mcp_upstream(
     return out
 
 
+def _ordered_union(*lists: list[str]) -> list[str]:
+    """Concatenate lists preserving first-seen order, dropping duplicates."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for lst in lists:
+        for x in lst:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+    return out
+
+
 def _split_disable_tokens(
     disable_arg: str | None,
-) -> tuple[str | None, list[str]]:
+) -> tuple[str | None, list[str], list[str]]:
     """Mirror of `_split_enable_tokens` for the disable side: (service_csv,
-    sandboxes). Tokens resolving to a sandbox type (baked or BYO) peel into
-    the sandbox list; everything else stays for `_compute_service_flags`.
-    Workers are not disabled via ``--disable`` (they have their own
-    ``project worker disable`` subcommand), so no worker branch here."""
+    workers, sandboxes). Same worker-first resolution order so a token that
+    names both a worker service and a baked sandbox (wrangler / websearcher)
+    disables the worker (whose mirror then isn't enabled either). `--disable`
+    overrules the default-enable set at `project create`, and disables an
+    enabled worker/sandbox at `project update`."""
     if not disable_arg:
-        return None, []
+        return None, [], []
     sandbox_types = sandbox.known_type_names()
     services: list[str] = []
+    workers: list[str] = []
     sandboxes: list[str] = []
     for tok in disable_arg.split(","):
         tok = tok.strip()
         if not tok:
             continue
-        if tok in sandbox_types:
+        if tok in role_mcp.ROLE_IMAGES:
+            workers.append(tok)
+        elif tok in sandbox_types:
             sandboxes.append(tok)
         else:
             services.append(tok)
     svc_csv = ",".join(services) if services else None
-    return svc_csv, sandboxes
+    return svc_csv, workers, sandboxes
 
 
 # ---------------------------------------------------------------------------
@@ -4215,11 +4328,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "intersection. Empty CSV (e.g. `wrangler=`) means "
                         "explicit no-upstreams.")
     c.add_argument("--disable", metavar="IDS",
-                   help="comma-separated service ids to disable "
-                        "(default: all known services enabled; supervisor "
-                        "is always-on and cannot be disabled). Also "
-                        "accepts pi-<role> tokens for `research project "
-                        "pi disable`")
+                   help="comma-separated tokens to disable for this project, "
+                        "overruling the host default-enable sets: service ids "
+                        "(supervisor is always-on), worker services, and "
+                        "sandboxes. e.g. `--disable websearcher` skips a "
+                        "default-enabled worker for this one project.")
     c.add_argument("--mcp", metavar="NAMES", default="all-enabled",
                    help="MCPs to auto-allow at create time: 'all-enabled' "
                         "(default — every currently-enabled MCP), 'none', or a "
@@ -4578,6 +4691,15 @@ def build_parser() -> argparse.ArgumentParser:
     wkl = wk_sub.add_parser("list", help="list available worker types")
     wkl.add_argument("--json", action="store_true")
     wkl.set_defaults(func=cmd_worker_list)
+    wke = wk_sub.add_parser("enable",
+                            help="flag a worker service for auto-enable in new "
+                                 "projects (like `mcp enable`)")
+    wke.add_argument("name")
+    wke.set_defaults(func=cmd_worker_default_enable)
+    wkd = wk_sub.add_parser("disable",
+                            help="clear a worker service's default-enable flag")
+    wkd.add_argument("name")
+    wkd.set_defaults(func=cmd_worker_default_disable)
 
     # ----- sandbox type registry (STAGE_CLI_TAXONOMY) -------------------
     # Host catalog of sandbox types: built-in baked roles (constants) +
@@ -4626,6 +4748,16 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--force", action="store_true",
                     help="remove even if projects currently enable it")
     pr.set_defaults(func=cmd_sandbox_remove)
+
+    sbe = sbr_sub.add_parser("enable",
+                             help="flag a sandbox (baked or BYO) for auto-enable "
+                                  "in new projects (like `mcp enable`)")
+    sbe.add_argument("name")
+    sbe.set_defaults(func=cmd_sandbox_default_enable)
+    sbd = sbr_sub.add_parser("disable",
+                             help="clear a sandbox's default-enable flag")
+    sbd.add_argument("name")
+    sbd.set_defaults(func=cmd_sandbox_default_disable)
 
     psr = sbr_sub.add_parser("set-root", help="change a BYO type's host root folder")
     psr.add_argument("name")
