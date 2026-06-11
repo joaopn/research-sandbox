@@ -1297,9 +1297,38 @@ def _accept_checks(wdir: Path, container, slug_dir: Path) -> list[str]:
     return failures
 
 
+def _results_manifest_record(name: str, key: str, one_liner: str, ts: str) -> Path:
+    """Record an identify-level entry in the worker's results manifest
+    (results/<name>/manifest.json), the same {version, entries:{key:{id,ts}}}
+    shape the sandbox publish surface uses (STAGE_SANDBOX_ARTIFACTS) so the
+    supervisor reads one inventory across workers and sandboxes. Written
+    supervisor-side at accept; the worker never touches it (no worker hook)."""
+    mpath = results_dir(name) / "manifest.json"
+    mpath.parent.mkdir(parents=True, exist_ok=True)
+    entries: dict = {}
+    if mpath.is_file():
+        try:
+            data = json.loads(mpath.read_text())
+            if isinstance(data, dict) and isinstance(data.get("entries"), dict):
+                entries = dict(data["entries"])
+        except json.JSONDecodeError:
+            pass
+    entries[key] = {"id": one_liner, "ts": ts}
+    tmp = mpath.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"version": 1, "entries": entries},
+                              indent=2, sort_keys=True) + "\n")
+    tmp.replace(mpath)
+    return mpath
+
+
 def cmd_accept(args: argparse.Namespace) -> None:
     if not _valid_slug(args.slug):
         die(f"invalid slug {args.slug!r}; use kebab-case (lowercase, '-' separators)")
+
+    one_liner = " ".join((args.id or "").split()).strip()
+    if not one_liner:
+        die('accept requires --id "<one line: what this deliverable is>" — the '
+            "inventory entry; nothing is promoted to results/ undescribed")
 
     c = _get_container(args.name)
     wdir = worker_dir(args.name)
@@ -1369,11 +1398,20 @@ def cmd_accept(args: argparse.Namespace) -> None:
     shutil.copytree(slug_dir, result_subdir)
     shutil.copy2(canonical_plan, result_subdir / "plan.md")
 
+    now = _iso_now()
+
+    # Record the identify-level inventory entry (STAGE_SANDBOX_ARTIFACTS): keyed
+    # by the cycle bundle dir, same manifest shape as the sandbox surface so the
+    # supervisor reads one inventory across workers + sandboxes. Written here,
+    # supervisor-side — the worker has no hook and never touches it.
+    results_manifest = _results_manifest_record(
+        args.name, result_subdir.name, one_liner, now
+    )
+
     # Drop the staging symlink.
     sl.unlink()
 
     # Append the cycle to the registry.
-    now = _iso_now()
     cycle = {"ordinal": ordinal, "slug": args.slug, "accepted_at": now}
     if args.waived:
         cycle["waived"] = args.waived
@@ -1389,6 +1427,8 @@ def cmd_accept(args: argparse.Namespace) -> None:
         "waived": args.waived,
         "accepted_at": now,
         "promoted_to": str(result_subdir),
+        "described_as": one_liner,
+        "results_manifest": str(results_manifest),
     })
 
 
@@ -1514,6 +1554,10 @@ def build_parser() -> argparse.ArgumentParser:
                               "after shape checks pass; append the cycle to the registry")
     sac.add_argument("name")
     sac.add_argument("--slug", required=True, help="kebab-case slug matching the staged cycle")
+    sac.add_argument("--id", required=True, metavar="ONE_LINER",
+                     help="one-line identification of the deliverable, recorded in "
+                          "results/<name>/manifest.json (the project inventory); "
+                          "nothing is promoted to results/ undescribed")
     sac.add_argument("--waived", default=None, metavar="REASON",
                      help="skip shape checks and accept with an explicit logged reason")
     sac.set_defaults(func=cmd_accept)

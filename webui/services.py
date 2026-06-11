@@ -95,12 +95,14 @@ SERVICES = {
     # role-mcps.json[websearcher] entry plus the image-baked Playwright
     # extras).
     #
-    # The docker-exec wrapper uses `bash -c` (NOT `bash -lc`): the inner
-    # shell only needs to parse the `||` short-circuit between the two
-    # byobu invocations; byobu and claude are on PATH via the standard
-    # env. Login-shell semantics (the `-l`) aren't needed and the P.1
-    # acceptance test enforces their absence to keep PI tabs on a
-    # consistent narrow command shape going forward.
+    # The docker-exec wrapper MUST use `bash -lc` (login shell), matching
+    # pi-wrangler. claude installs to ~/.local/bin and is added to PATH only
+    # via ~/.bashrc (see Dockerfile.analysis-base); a non-login,
+    # non-interactive `bash -c` never sources it, so the tmux server it
+    # starts — and the pane that runs `claude` — inherit a PATH without
+    # ~/.local/bin and die with `claude: command not found` (RC 127). bash
+    # tabs (supervisor, pi-echo) don't hit this because /bin/bash is on the
+    # default PATH; only the auto-`claude` tabs do. See BUG_BUCKET B6.
     #
     # Label keeps the "PI Websearcher" prefix — pi-wrangler dropped to
     # "Wrangler" during STAGE_2.5 polish, but the P.1 plan re-adds the
@@ -113,7 +115,7 @@ SERVICES = {
         "renderer": "xterm.js",
         "default_port": 22,
         "command": (
-            "docker exec -it rs-pi-websearcher bash -c "
+            "docker exec -it rs-pi-websearcher bash -lc "
             "'byobu attach -t pi 2>/dev/null || "
             "byobu new-session -s pi -c /workspace -- claude'"
         ),

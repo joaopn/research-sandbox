@@ -31,6 +31,13 @@ fi
 # Written every boot — see entrypoint.supervisor.sh for the rationale.
 echo "${RS_PI_ROLE}" > ~/.rs-role
 
+# Artifact-contract surface (STAGE_SANDBOX_ARTIFACTS): published/ is what the
+# supervisor reads; internal/ is private scratch. Created every boot (idempotent);
+# both are subdirs of the project-volume /workspace bind-mount, so published/ is
+# visible to the supervisor for free. The Stop-hook gate (baked into rs-pi-base's
+# settings.json) reconciles published/ against the manifest on idle.
+mkdir -p /workspace/published /workspace/internal
+
 # --- Auth: PI-owned, no staging --------------------------------------------
 # Nothing to do here. PI containers boot un-authed; the PI runs `/login` in
 # the tab, or the operator pushes the supervisor's creds in via

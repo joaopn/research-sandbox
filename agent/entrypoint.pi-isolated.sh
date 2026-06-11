@@ -50,6 +50,13 @@ fi
 # Role marker for the byobu status-bar plugin (~/.byobu/bin/60_rolename).
 echo "${RS_PI_ISO_NAME}" > ~/.rs-role
 
+# Artifact-contract surface (STAGE_SANDBOX_ARTIFACTS): same uniform overlay as
+# baked roles — published/ (supervisor-readable) + internal/ (private). Created
+# alongside the harness clone; the gate + manifest verb are inherited from
+# rs-pi-base. If a harness ignores published/ entirely, the gate is simply inert
+# (no files → no block).
+mkdir -p /workspace/published /workspace/internal
+
 # --- Auth: PI-owned, no staging --------------------------------------------
 # Isolated agents boot un-authed. The tab is a login shell — claude only runs
 # if/when the PI starts it there, and they `/login` at that point (or the

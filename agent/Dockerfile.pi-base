@@ -20,6 +20,16 @@ RUN chmod +x /entrypoint.sh
 # /opt/pi-templates/<role>/role.md staged in per-role layer images.
 RUN mkdir -p /opt/pi-templates && chown -R worker:worker /opt/pi-templates
 
+# Bake the artifact-manifest verb (STAGE_SANDBOX_ARTIFACTS). Stdlib-only, so it
+# runs in every sandbox descendant — baked roles AND rs-pi-isolated, which is
+# FROM this image — regardless of the agent runtime. Invoked by the agent
+# (`manifest describe <file> "..."`) and by the baked Stop-hook gate
+# (`manifest gate`). Shebang is pinned to `/opt/conda/bin/python` (repo
+# convention for baked CLIs) so it runs PATH-independently from both the
+# hook exec context and a bare `docker exec`.
+COPY cli/rs_manifest.py /usr/local/bin/manifest
+RUN chmod +x /usr/local/bin/manifest
+
 USER worker
 WORKDIR /workspace
 
@@ -28,8 +38,11 @@ WORKDIR /workspace
 # (STAGE_PI_AUTH_OWNERSHIP). But config still ships from the image: interactive
 # `claude` in a PI tab runs WITHOUT a --permission-mode flag (unlike the
 # headless worker/role-MCP paths), so it reads defaultMode from settings.json.
-# Without this, every PI tab would permission-prompt on every tool call. No
-# `hooks` key — the supervisor's rs-audit-stop Stop hook doesn't exist here.
+# Without this, every PI tab would permission-prompt on every tool call. It
+# also carries ONE `hooks` key: a Stop hook running `manifest gate` — the
+# artifact-contract gate (STAGE_SANDBOX_ARTIFACTS) that won't let a session end
+# while a file in published/ is undescribed. This is OUR gate, distinct from the
+# supervisor's rs-audit-stop, which is NOT present here.
 # /home/worker is image-resident (only /workspace is bind-mounted; ~/.bashrc
 # is present so entrypoint's skel-restore is skipped), so this persists at
 # runtime for both pi-roles and pi-isolated (rs-pi-base is their ancestor).
@@ -39,9 +52,22 @@ RUN mkdir -p /home/worker/.claude && \
       '  "permissions": {' \
       '    "defaultMode": "bypassPermissions"' \
       '  },' \
-      '  "theme": "dark"' \
+      '  "theme": "dark",' \
+      '  "hooks": {' \
+      '    "Stop": [' \
+      '      { "hooks": [ { "type": "command", "command": "/usr/local/bin/manifest gate" } ] }' \
+      '    ]' \
+      '  }' \
       '}' > /home/worker/.claude/settings.json && \
     chmod 600 /home/worker/.claude/settings.json
+
+# Bake the uniform artifact-contract overlay as user memory. Auto-discovered by
+# every interactive claude session in this container (and descendants) REGARDLESS
+# of cwd — so it reaches baked roles and rs-pi-isolated alike, on top of the
+# role/repo prompt, teaching the published/ vs internal/ split and the verb. This
+# is the one RS convention deliberately imposed on isolated agents (the uniform
+# overlay constraint); it stays minimal so it doesn't crowd the role/repo voice.
+COPY --chown=worker:worker container/pi/artifact-contract.md /home/worker/.claude/CLAUDE.md
 
 # tini comes from analysis-base. PID 1 is tini; entrypoint is /entrypoint.sh.
 ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]

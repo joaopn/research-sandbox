@@ -60,9 +60,24 @@ The host bind-mount means the PI can browse `/workspace/` with any editor, edit 
 
 Do not read `/workspace/pi/` by default. These are the PI's personal role-session artifacts (interactive pi-wrangler / pi-librarian / pi-websearcher sessions, plus the pi-echo substrate fixture). Read files there only when the PI explicitly references them ("look at what I found in the wrangler tab", "check my pi/librarian/skills.md") or asks you to. Never include PI session content in worker plans or `task.md` files — workers are isolated from PI exploration state by design.
 
+**Exception — the publish surface.** Each sandbox has a `published/` subtree (`/workspace/pi/<role>/published/` and `/workspace/pi-isolated/<name>/published/`, each with a `manifest.json`) that IS yours to read routinely — it is the deliberate one-way channel by which sandboxes hand you finished work. Read the *rest* of each PI tree only on invitation (above); `published/` and its manifest you read freely, as the project's inventory. The reverse never holds: nothing of yours flows into a sandbox, and your own logbook never goes onto a publish surface.
+
 The same applies to `/workspace/.pi/` (hidden tree holding the PI containers' cred-stash and any per-role daemon-private state). It's not visibility-restricted by the kernel here — the supervisor's volume mount sees both trees — but the rule is the same: don't read unless the PI invites you to.
 
 The boundary extends to two more trees that belong to **PI-isolated agents** (the PI's bring-your-own skill-repo containers): `/workspace/pi-isolated/<name>/` (the agent's workspace + cloned `.skillrepo`) and `/workspace/.pi-isolated/` (their cred-stash). It also covers `/external/<name>/` — these are the PI's own host folders (Obsidian vaults, Overleaf working copies, etc.) bind-mounted in for the isolated agents. All of it is supervisor-visible for code-server browsing, none of it is yours to read or fold into worker context unless the PI explicitly points you at it.
+
+## Project inventory (sandboxes + workers)
+
+You are the project's single integrator. Every publishable artifact lives on one of two surfaces, both carrying a `manifest.json` in the same shape — `{ key → { "id": "one line: what it is", "ts": <when> } }`:
+
+- **Sandboxes:** `/workspace/pi/<role>/published/manifest.json` and `/workspace/pi-isolated/<name>/published/manifest.json` — each sandbox describes its own files as it works.
+- **Workers:** `/workspace/results/<name>/manifest.json` — written by `rs-worker accept --id` (you supply the one-liner at accept).
+
+To answer "what does the project contain?", read these manifests — they are the executive layer. Open an actual artifact only when its one-liner isn't enough (drill-down). Synthesize from the lean index; don't re-ingest every artifact wholesale — reading the index, not the corpus, is what keeps you from becoming the bottleneck.
+
+**You integrate; you do not control.** You read sandbox output to track project state and to reuse it — e.g. mount a sandbox's `published/` file into a worker you spawn. You do NOT start, stop, or drive sandboxes; their lifecycle is the PI's. Don't assume you can spawn or command one.
+
+**Surface absence; don't hide it.** A sandbox can be enabled yet silent — it died, or has produced nothing — which is indistinguishable from a missing manifest alone. The enabled set is in `/workspace/.orchestrator/sandbox.json`. If an enabled sandbox has no `published/manifest.json` (or only a stale one), report it as a gap ("websearcher is enabled but has published nothing yet") rather than dropping it from the overview.
 
 ## Worker registry schema
 
@@ -246,6 +261,8 @@ When a worker is `waiting`, `done`, or `failed`:
 
 On accept: `workers/<name>/work/outputs/<slug>/` is copied to `results/<name>/<NNN>_<slug>/`. The staging symlink is removed. The registry's `cycles` array gains an entry. The worker stays `live`, ready for the next message.
 
+Accept **requires** `--id "<one line: what this deliverable is>"` — it is recorded into `results/<name>/manifest.json` (the project inventory; see *Project inventory*), and accept refuses without it. Write the one-liner from your review — you've read the cycle to judge it — at the same altitude as a sandbox's published entry: what the deliverable *is*, not a full summary.
+
 ## /log (session end)
 
 The PI triggers `/log`. Follow the slash command at `/workspace/.claude/commands/log.md` exactly. In brief:
@@ -311,7 +328,7 @@ rs-worker wait <name>... [--all] [--timeout S]  # block until terminal
 rs-worker message <name> "<text>"               # queue a follow-up task in the inbox
 rs-worker finalize <name> --slug <slug>         # stage staging/<name> → outputs/<slug>/
 rs-worker unstage <name>                        # remove staging symlink (PI rejected)
-rs-worker accept <name> --slug <slug> [--waived REASON]  # promote to results/<name>/<NNN>_<slug>/
+rs-worker accept <name> --slug <slug> --id "<one-liner>" [--waived REASON]  # promote to results/<name>/<NNN>_<slug>/ + record inventory entry
 rs-worker shutdown <name>                       # graceful stop+rm; registry → down (used by /log)
 rs-worker destroy <name> --yes                  # tombstone the name; wipe workdir; archive plan
 rs-worker attach <name>                         # human-only; byobu exec
