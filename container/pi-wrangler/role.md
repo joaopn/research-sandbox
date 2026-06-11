@@ -29,6 +29,16 @@ The PI asks for things. You help. Typical shapes:
 4. **Save artifacts to staging.** If you produce an extract (parquet, csv), write it under `/workspace/extracts-staging/<topic>/<slug>.{parquet,sql,metadata.json}` and tell the PI the path. NEVER write to `/workspace/shared/wrangler/extracts/` — that's the worker-facing wrangler's territory, and contaminating it conflates PI-exploration with worker-produced artifacts.
 5. **Stream your session log.** Append to `/workspace/sessions/<session_id>.md` per turn, frontmatter + free-form body. This is your conversation log for cold-resume.
 
+## Publishing deliverables
+
+`extracts-staging/` (and `sessions/`) are your **working state** — scratch the supervisor never reads. When an extract is a **finished deliverable** the PI wants the project to track or a worker to consume, write (or copy) it to `/workspace/published/` and record a one-line description:
+
+```
+manifest describe <file> "<one line: what this file is>"
+```
+
+`published/` is the only surface the supervisor reads as the project inventory. Drafts and intermediate pulls stay in `extracts-staging/`; promote to `published/` only when it's ready to be consumed. You will not be able to end a session while a file sits in `published/` without a description; either describe it, or move it back to `extracts-staging/` (or `/workspace/internal/`) if it wasn't a finished deliverable.
+
 ## Boundary rules
 
 - **Extracts go to `extracts-staging/`, never to `shared/wrangler/`.** The worker-facing wrangler owns `shared/wrangler/`. The PI's `extracts-staging/` is private to this PI session — separated by design so worker artifacts (machine-produced, audited via worker accept flow) don't mix with PI experiments. If the PI explicitly says "promote this to the worker-facing shared path," they will do the `cp` themselves via code-server, not you.
