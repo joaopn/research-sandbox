@@ -64,7 +64,23 @@ BYO_IP_LO = 14
 BYO_IP_HI = 25  # inclusive
 IP_PREFIX = "192.168.99."
 
-VALID_KINDS = ("baked", "byo")
+# --- Sandbox-project boxes (kind="sandbox") -------------------------------
+# Agent-less "sandbox project" flavor (STAGE_SANDBOX_PROJECT.md): blank
+# rs-sandbox-box containers the PI spins up from the in-supervisor `rs-sandbox`
+# CLI for running un-vetted code in isolation. They draw from the SAME .14-.25
+# pool as BYO and reuse the iso- container/tab conventions (see
+# container_name/workspace_subdir), so they need no new firewall rule — the
+# whole PI range is already ACCEPTed. Egress is NOT gated per box; it is
+# controlled project-wide at the router (a sandbox project defaults to
+# `--egress locked` → 80/443/53/ICMP only, RFC1918 blocked — usable for an LLM
+# / pip while staying contained).
+#
+# kind value for sandbox-flavor boxes (owned by the in-supervisor rs-sandbox
+# CLI, not the host baked/byo enable path). The host references this in the
+# _recreate_supervisor restart loop to delegate restarts to rs-sandbox.
+SANDBOX_KIND = "sandbox"
+
+VALID_KINDS = ("baked", "byo", "sandbox")
 
 
 def baked_names() -> list[str]:
@@ -79,7 +95,9 @@ def is_baked(name: str) -> bool:
 def container_name(name: str, kind: str) -> str:
     """``rs-pi-<name>`` for baked (preserves the firewall/IP/webui-tab
     conventions + the ``rs-pi-`` family prefix the ``rs-pi sync-creds`` label
-    selection relies on); ``rs-pi-iso-<name>`` for BYO."""
+    selection relies on); ``rs-pi-iso-<name>`` for BYO *and* sandbox-flavor
+    boxes (kind="sandbox") — both ride the iso- family so the webui tab
+    synthesis + iso- label selection work without a new branch."""
     return f"rs-pi-{name}" if kind == "baked" else f"rs-pi-iso-{name}"
 
 

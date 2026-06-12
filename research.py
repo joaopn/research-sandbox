@@ -55,12 +55,26 @@ import sandbox  # noqa: E402  (unified PI-driven container surface; absorbs form
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-SUPERVISOR_IMAGE = "rs-supervisor:latest"
+# Shared per-project substrate (DIND + ssh + byobu + code-server). Both
+# per-project container images FROM it (STAGE_SANDBOX_PROJECT.md image split).
+SUBSTRATE_BASE_IMAGE = "rs-substrate-base:latest"
+SUPERVISOR_IMAGE = "rs-supervisor:latest"          # research flavor (agent leaf)
+MANAGEMENT_IMAGE = "rs-management:latest"           # --type sandbox flavor (agent-less)
 ANALYSIS_IMAGE = "rs-analysis-base:latest"
 MCP_PROXY_IMAGE = "rs-mcp-proxy:latest"
 ROLE_MCP_BASE_IMAGE = "rs-role-mcp-base:latest"
 PI_BASE_IMAGE = "rs-pi-base:latest"
 PI_ISOLATED_IMAGE = "rs-pi-isolated:latest"
+# Disposable box image for the agent-less sandbox-project flavor
+# (STAGE_SANDBOX_PROJECT.md). FROM rs-analysis-base (NOT rs-pi-base) — clean,
+# no artifact-contract baggage. Staged into a sandbox project's inner dockerd
+# in place of the analysis worker.
+SANDBOX_BOX_IMAGE = "rs-sandbox-box:latest"
+# Browser variant — FROM rs-sandbox-box + @playwright/mcp + Chromium, wired
+# into the box's claude as a stdio MCP (the playwright bundle lifted from the
+# websearcher image, WITHOUT its role.md harness). Opt-in per box via
+# `rs-sandbox create --browser`.
+SANDBOX_BOX_BROWSER_IMAGE = "rs-sandbox-box-browser:latest"
 INNER_NETWORK = "rs-inner"
 WEBUI_IMAGE = "rs-webui:latest"
 WEBUI_CONTAINER = "rs-webui"
@@ -71,6 +85,14 @@ DOCKER_VOLUME_PREFIX = "rs-docker-"
 PROJECT_NETWORK_PREFIX = "rs-net-"
 PROJECT_LABEL = "research.project"
 DIND_MODE_LABEL = "research.dind"
+# Project flavor: "research" (default — supervisor agent + workers) or
+# "sandbox" (agent-less collection of isolated boxes, STAGE_SANDBOX_PROJECT.md).
+# Mirrored into .orchestrator/project.json so the webui (which reads only the
+# project volume, no docker socket) and the in-supervisor rs-sandbox CLI can
+# branch on it.
+PROJECT_TYPE_LABEL = "research.project_type"
+PROJECT_TYPE_RESEARCH = "research"
+PROJECT_TYPE_SANDBOX = "sandbox"
 MCP_CONTAINER_PREFIX = "rs-mcp-"
 MCP_LABEL = "research.mcp"
 MCP_NAME_LABEL = "research.mcp_name"
@@ -499,6 +521,7 @@ def build_supervisor_docker_args(
     image: str,
     dind_mode: str,
     inner_firewall: bool = False,
+    project_type: str = PROJECT_TYPE_RESEARCH,
     service_flags: dict[str, bool] | None = None,
 ) -> list[str]:
     args = [
@@ -515,6 +538,11 @@ def build_supervisor_docker_args(
         "-e", "DOCKER_DIND=true",
         "--label", f"{PROJECT_LABEL}={project}",
         "--label", f"{DIND_MODE_LABEL}={dind_mode}",
+        # Flavor marker for the host (_container_project_type / recreate
+        # metadata) and the webui. The per-flavor *image* (selected by the
+        # caller's `image=`) is what actually differs at runtime; the entrypoints
+        # no longer branch on a flavor env.
+        "--label", f"{PROJECT_TYPE_LABEL}={project_type}",
     ]
     if inner_firewall:
         args += ["-e", "RS_INNER_FIREWALL=1"]
@@ -582,7 +610,11 @@ def _build_images(force: bool) -> None:
     rs-role-mcp-base — keep the list bottom-up so each FROM resolves to
     the just-built layer rather than a stale cached copy."""
     specs = [
+        # Shared substrate base MUST build before the two leaf images that
+        # FROM it (rs-supervisor, rs-management) — keep it first.
+        (SUBSTRATE_BASE_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.substrate-base"),
         (SUPERVISOR_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.supervisor"),
+        (MANAGEMENT_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.management"),
         (ANALYSIS_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.analysis-base"),
         (MCP_PROXY_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.mcp-proxy"),
         (ROLE_MCP_BASE_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.role-mcp-base"),
@@ -591,6 +623,12 @@ def _build_images(force: bool) -> None:
         # clone/setup entrypoint. One image for every isolated type; no
         # per-type Dockerfile (type behavior comes from the cloned repo).
         (PI_ISOLATED_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.pi-isolated"),
+        # Disposable sandbox-project box image — FROM rs-analysis-base, clean
+        # of the PI artifact-contract (STAGE_SANDBOX_PROJECT.md). The browser
+        # variant FROMs it, so it must build first (bottom-up).
+        (SANDBOX_BOX_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.sandbox-box"),
+        (SANDBOX_BOX_BROWSER_IMAGE,
+         SCRIPT_DIR / "agent" / "Dockerfile.sandbox-box-browser"),
     ]
     for role, image in sorted(role_mcp.ROLE_IMAGES.items()):
         dockerfile = SCRIPT_DIR / "agent" / f"Dockerfile.{role}"
@@ -699,14 +737,31 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         die(f"project {project!r} already exists (container {container_name}). "
             f"Use destroy first.")
 
+    # Project flavor (STAGE_SANDBOX_PROJECT.md). The "sandbox" flavor is an
+    # agent-less collection of isolated boxes (the rs-management image) managed
+    # from the in-supervisor rs-sandbox CLI; "research" is the agent supervisor
+    # (rs-supervisor). The per-flavor image is the substrate; the inner box
+    # images stage separately.
+    project_type = (PROJECT_TYPE_SANDBOX
+                    if getattr(args, "type", PROJECT_TYPE_RESEARCH) == PROJECT_TYPE_SANDBOX
+                    else PROJECT_TYPE_RESEARCH)
+    substrate_image = (MANAGEMENT_IMAGE if project_type == PROJECT_TYPE_SANDBOX
+                       else SUPERVISOR_IMAGE)
+
     # Verify prerequisites.
-    if not run_quiet(["docker", "image", "inspect", SUPERVISOR_IMAGE]):
-        die(f"image {SUPERVISOR_IMAGE} not found. Run `research setup` first.")
+    if not run_quiet(["docker", "image", "inspect", substrate_image]):
+        die(f"image {substrate_image} not found. Run `research setup` first.")
     if not container_running(ROUTER_CONTAINER):
         die(f"{ROUTER_CONTAINER} is not running. Run `research setup` first.")
 
     dind_mode = select_dind_mode(args.dind or cfg.default_dind)
-    egress = args.egress or cfg.default_egress
+
+    # Egress. Containment for a sandbox project is the ROUTER egress mode, not
+    # a per-box firewall: a sandbox flavor defaults to `locked` (80/443/53 +
+    # ICMP, RFC1918 blocked) so boxes can reach an LLM / pip / apt but not
+    # arbitrary ports or the host LAN. Overridable with an explicit --egress.
+    egress = args.egress or (
+        "locked" if project_type == PROJECT_TYPE_SANDBOX else cfg.default_egress)
     if egress not in ("open", "locked"):
         die(f"invalid --egress value: {egress!r} (expected open|locked)")
 
@@ -765,6 +820,15 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     #     directories where the supervisor expects JSON files.
     ensure_mcp_files(project, cfg)
 
+    # 1c. Project-flavor marker. Read by the webui (which sees only the project
+    #     volume, no docker socket) to pick the Management vs supervisor tab set,
+    #     and by the in-supervisor rs-sandbox CLI to refuse outside a sandbox
+    #     project. Lives on the volume, so it survives _recreate_supervisor.
+    orch_dir = workspace_path / ".orchestrator"
+    orch_dir.mkdir(parents=True, exist_ok=True)
+    (orch_dir / "project.json").write_text(
+        json.dumps({"type": project_type}, indent=2) + "\n")
+
     # 2. Per-project network + router wiring.
     network, router_ip = ensure_project_network(project, egress)
 
@@ -791,11 +855,23 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     # default in new projects, with `--enable` adding more and `--disable`
     # overruling. Stale defaults (a removed BYO type) are dropped with a note.
     _dis_w, _dis_s = set(disable_workers), set(disable_sandboxes)
-    enable_workers = [w for w in _ordered_union(defaults.enabled("worker"), enable_workers)
-                      if w not in _dis_w]
+    if project_type == PROJECT_TYPE_SANDBOX:
+        # Agent-less flavor: NO worker layer, NO host default-enable fold-in.
+        # Worker tokens (including `websearcher`, which is a worker token) are
+        # dropped — browser capability is a BOX flag (`rs-sandbox create
+        # --browser`), not the websearcher role/harness.
+        for w in enable_workers:
+            print(f"note: --enable {w!r}: sandbox projects have no worker layer; "
+                  f"ignoring (for a browser box use `rs-sandbox create --browser`)",
+                  file=sys.stderr)
+        enable_workers = []
+        enable_sandboxes = [s for s in enable_sandboxes if s not in _dis_s]
+    else:
+        enable_workers = [w for w in _ordered_union(defaults.enabled("worker"), enable_workers)
+                          if w not in _dis_w]
+        enable_sandboxes = [s for s in _ordered_union(defaults.enabled("sandbox"), enable_sandboxes)
+                            if s not in _dis_s]
     _known_sb = sandbox.known_type_names()
-    enable_sandboxes = [s for s in _ordered_union(defaults.enabled("sandbox"), enable_sandboxes)
-                        if s not in _dis_s]
     for s in list(enable_sandboxes):
         if s not in _known_sb:
             print(f"note: default sandbox {s!r} is no longer a known type; "
@@ -823,9 +899,10 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         dns_servers=cfg.sandbox_dns,
         memory=args.memory or cfg.default_memory,
         cpus=args.cpus or "",
-        image=SUPERVISOR_IMAGE,
+        image=substrate_image,
         dind_mode=dind_mode,
         inner_firewall=bool(getattr(args, "inner_firewall", False)),
+        project_type=project_type,
         service_flags=service_flags,
     )
     # Inject --data mounts (and any future --mount) into argv just before the image name.
@@ -849,7 +926,16 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     # 6. Wait for inner dockerd (started by the entrypoint), then push the
     #    analysis worker image and the mcp-proxy image into it.
     wait_for_inner_dockerd(container_name)
-    stage_worker_image(container_name, ANALYSIS_IMAGE)
+    # Sandbox flavor needs the clean box images, not the analysis worker (there
+    # are no workers). Both the plain and the browser box images are staged so
+    # `rs-sandbox create [--browser]` works at runtime without a host round-trip
+    # (the browser image is heavy — Chromium — but staging is a one-time create
+    # cost the image-availability follow-up, STAGE_SUPERVISOR_CLI_SPLIT, removes).
+    if project_type == PROJECT_TYPE_SANDBOX:
+        stage_worker_image(container_name, SANDBOX_BOX_IMAGE)
+        stage_worker_image(container_name, SANDBOX_BOX_BROWSER_IMAGE)
+    else:
+        stage_worker_image(container_name, ANALYSIS_IMAGE)
     stage_worker_image(container_name, MCP_PROXY_IMAGE)
 
     # 6b. The supervisor entrypoint runs mcp-reload at boot, but on first
@@ -955,16 +1041,29 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     pending = bool(pending_workers or pending_sandboxes)
 
     steps: list[str] = []
-    # Step 1 — interactive auth. Each project's supervisor is the source
-    # of truth for its own credentials; there is no host-side cache and
-    # no cross-project sharing. Operator runs `claude` once per project,
-    # completes the device-code flow, and the supervisor holds those
-    # creds for every downstream surface in this project from then on.
-    steps.append(
-        "  1. Authenticate Claude Code inside the supervisor (once per project):\n"
-        f"     `python research.py project attach {project}`, then in byobu run\n"
-        "     `claude` and complete the device-code flow in a local browser."
-    )
+    if project_type == PROJECT_TYPE_SANDBOX:
+        # Sandbox flavor: no supervisor agent, no central credential. The
+        # operator manages boxes from the non-agent Management shell; each box
+        # is auth-free (run `claude` + /login inside one if needed).
+        steps.append(
+            "  1. Open the Management shell and spin a box:\n"
+            f"     `python research.py project attach {project}`, then run\n"
+            "     `rs-sandbox create` (auto-named) — see `rs-sandbox` for the "
+            "cheatsheet.\n"
+            "     Boxes are auth-free; run `claude` + /login inside one if you "
+            "want an LLM. Management runs no agent by design."
+        )
+    else:
+        # Step 1 — interactive auth. Each project's supervisor is the source
+        # of truth for its own credentials; there is no host-side cache and
+        # no cross-project sharing. Operator runs `claude` once per project,
+        # completes the device-code flow, and the supervisor holds those
+        # creds for every downstream surface in this project from then on.
+        steps.append(
+            "  1. Authenticate Claude Code inside the supervisor (once per project):\n"
+            f"     `python research.py project attach {project}`, then in byobu run\n"
+            "     `claude` and complete the device-code flow in a local browser."
+        )
 
     if pending:
         cmds: list[str] = []
@@ -1006,6 +1105,14 @@ def cmd_project_attach(args: argparse.Namespace) -> None:
     container = container_name_for(args.name)
     if not container_running(container):
         die(f"project {args.name!r} is not running (use `research project start` first)")
+    # Sandbox-flavor projects: attach lands in the Management console (no
+    # agent). Print the rs-sandbox cheatsheet first so SSH/attach matches the
+    # webui Management tab. Read the flavor off the container label.
+    ptype = run(["docker", "inspect", "-f",
+                 f"{{{{index .Config.Labels \"{PROJECT_TYPE_LABEL}\"}}}}", container],
+                capture_output=True)
+    if ptype.returncode == 0 and ptype.stdout.strip() == PROJECT_TYPE_SANDBOX:
+        run(["docker", "exec", container, "rs-sandbox"], capture_output=False)
     # Ensure a session exists (entrypoint creates one, but if byobu was closed…).
     run(["docker", "exec", container, "bash", "-lc",
          "byobu list-sessions 2>/dev/null | grep -q '^main:' || "
@@ -1210,6 +1317,15 @@ _SUPERVISOR_DIR_MAP: list[tuple[str, str]] = [
     ("container/supervisor/commands", "/opt/claude-templates/commands"),
 ]
 
+# The rs-management leaf has none of the supervisor's agent files — its
+# file-only-update surface is just rs-sandbox + its own entrypoint. (code-server
+# / byobu live in the shared base, so changes there are a base rebuild, not a
+# file-copy.)
+_MANAGEMENT_FILE_MAP: list[tuple[str, str, bool]] = [
+    ("cli/rs_sandbox.py",              "/usr/local/bin/rs-sandbox", True),
+    ("agent/entrypoint.management.sh", "/entrypoint.sh",            True),
+]
+
 
 def _docker_cp_with_mode(src: Path, container: str, dst: str, mode: int) -> None:
     """`docker cp` a file with an explicit mode bit, via a tempdir staging
@@ -1223,10 +1339,15 @@ def _docker_cp_with_mode(src: Path, container: str, dst: str, mode: int) -> None
 
 
 def _docker_cp_supervisor_files(container: str) -> list[str]:
-    """Copy the edited supervisor-baked files into the container. Returns
-    the list of host-relative paths that were actually copied."""
+    """Copy the edited per-project-substrate files into the container (file-only
+    `project update`). Flavor-aware: a sandbox project's rs-management container
+    has none of the supervisor's agent paths, so it gets the management map.
+    Returns the list of host-relative paths that were actually copied."""
+    is_sandbox = _container_project_type(container) == PROJECT_TYPE_SANDBOX
+    file_map = _MANAGEMENT_FILE_MAP if is_sandbox else _SUPERVISOR_FILE_MAP
+    dir_map: list[tuple[str, str]] = [] if is_sandbox else _SUPERVISOR_DIR_MAP
     copied: list[str] = []
-    for rel, dst, exe in _SUPERVISOR_FILE_MAP:
+    for rel, dst, exe in file_map:
         src = SCRIPT_DIR / rel
         if not src.is_file():
             continue
@@ -1235,7 +1356,7 @@ def _docker_cp_supervisor_files(container: str) -> list[str]:
         else:
             run_check(["docker", "cp", str(src), f"{container}:{dst}"])
         copied.append(rel)
-    for rel, dst in _SUPERVISOR_DIR_MAP:
+    for rel, dst in dir_map:
         src = SCRIPT_DIR / rel
         if not src.is_dir():
             continue
@@ -1309,6 +1430,7 @@ def _read_supervisor_metadata(container: str) -> dict:
         "ssh_pass": env.get("SSH_PASSWORD", ""),
         "dind_mode": labels.get(DIND_MODE_LABEL, "privileged"),
         "inner_firewall": env.get("RS_INNER_FIREWALL") == "1",
+        "project_type": labels.get(PROJECT_TYPE_LABEL, PROJECT_TYPE_RESEARCH),
         "memory": memory,
         "cpus": cpus,
         "extra_mounts": extra_mounts,
@@ -1406,6 +1528,9 @@ def _recreate_supervisor(
 
     network = project_network_for(project)
     flags = service_flags if service_flags is not None else md["service_flags"]
+    md_ptype = md.get("project_type", PROJECT_TYPE_RESEARCH)
+    substrate_image = (MANAGEMENT_IMAGE if md_ptype == PROJECT_TYPE_SANDBOX
+                       else SUPERVISOR_IMAGE)
     docker_args = build_supervisor_docker_args(
         container_name=container,
         project=project,
@@ -1416,9 +1541,10 @@ def _recreate_supervisor(
         dns_servers=cfg.sandbox_dns,
         memory=md["memory"],
         cpus=md["cpus"],
-        image=SUPERVISOR_IMAGE,
+        image=substrate_image,
         dind_mode=md["dind_mode"],
         inner_firewall=md["inner_firewall"],
+        project_type=md_ptype,
         service_flags=flags,
     )
     if md["extra_mounts"]:
@@ -1433,7 +1559,7 @@ def _recreate_supervisor(
     assert docker_args[0] == "run" and docker_args[1] == "-d"
     create_args = ["create"] + docker_args[2:]
 
-    print(f"creating new container from {SUPERVISOR_IMAGE}...")
+    print(f"creating new container from {substrate_image}...")
     run_check(["docker", *create_args])
 
     if post_create_hook is not None:
@@ -1452,7 +1578,13 @@ def _recreate_supervisor(
     wait_for_inner_dockerd(container)
     run(["docker", "exec", container, "docker", "rm", "-f", "mcp-proxy"],
         capture_output=True)
-    stage_worker_image(container, ANALYSIS_IMAGE, force=force_restage)
+    # Sandbox flavor stages the blank box image (no analysis workers); see
+    # cmd_project_create's matching branch.
+    if md.get("project_type") == PROJECT_TYPE_SANDBOX:
+        stage_worker_image(container, SANDBOX_BOX_IMAGE, force=force_restage)
+        stage_worker_image(container, SANDBOX_BOX_BROWSER_IMAGE, force=force_restage)
+    else:
+        stage_worker_image(container, ANALYSIS_IMAGE, force=force_restage)
     stage_worker_image(container, MCP_PROXY_IMAGE, force=force_restage)
 
     run(["docker", "exec", container, "/usr/local/bin/mcp-reload"],
@@ -1485,6 +1617,18 @@ def _recreate_supervisor(
     # Workspace state survives because it's on the project volume.
     sandbox_entries = sandbox.load(workspace_path)
     for name in sorted(sandbox_entries):
+        # kind="sandbox" boxes (the agent-less flavor) are owned by the
+        # in-supervisor rs-sandbox CLI, not the host baked/byo start path —
+        # _sandbox_start only knows baked/byo and would wrongly treat a box as
+        # byo (external mount + repo env). Delegate the restart to rs-sandbox
+        # so the docker-run logic lives in one place.
+        if sandbox_entries[name].get("kind") == sandbox.SANDBOX_KIND:
+            r = run(["docker", "exec", container, "rs-sandbox", "restart", name],
+                    capture_output=True)
+            if r.returncode != 0:
+                print(f"warning: failed to restart sandbox box {name!r}: "
+                      f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
+            continue
         try:
             _sandbox_start(container, project, cfg, name,
                            force_restage=force_restage)
@@ -1493,6 +1637,16 @@ def _recreate_supervisor(
                   f"the entry in sandbox.json is intact, retry with "
                   f"`research project sandbox enable {project} {name}`",
                   file=sys.stderr)
+
+
+def _container_project_type(container: str) -> str:
+    """Project flavor from the supervisor's research.project_type label
+    (defaults to "research" for legacy containers without it)."""
+    r = run(["docker", "inspect", "-f",
+             f'{{{{index .Config.Labels "{PROJECT_TYPE_LABEL}"}}}}', container],
+            capture_output=True)
+    t = r.stdout.strip() if r.returncode == 0 else ""
+    return t or PROJECT_TYPE_RESEARCH
 
 
 def cmd_project_update(args: argparse.Namespace) -> None:
@@ -1577,7 +1731,11 @@ def cmd_project_update(args: argparse.Namespace) -> None:
         service_flags=flags_override,
     )
 
-    if not args.keep_claude:
+    # Sandbox projects have no /workspace/.claude/ and no research-supervisor
+    # framing by design (agent-less Management substrate). Refreshing templates
+    # would both fail (the cp targets a dir that doesn't exist) AND re-stage the
+    # research CLAUDE.md/logbook tree the flavor deliberately omits — skip it.
+    if not args.keep_claude and _container_project_type(container) != PROJECT_TYPE_SANDBOX:
         print(f"refreshing /workspace/.claude/ from templates...")
         _refresh_workspace_claude_templates(container)
 
@@ -4284,6 +4442,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     c = proj_sub.add_parser("create", help="create a new project")
     c.add_argument("name")
+    c.add_argument("--type", choices=[PROJECT_TYPE_RESEARCH, PROJECT_TYPE_SANDBOX],
+                   default=PROJECT_TYPE_RESEARCH,
+                   help="project flavor. 'research' (default): supervisor agent "
+                        "+ workers. 'sandbox': agent-less collection of isolated "
+                        "boxes managed from the in-supervisor `rs-sandbox` CLI "
+                        "(inner firewall on by default; egress-OFF boxes get no "
+                        "outbound network).")
     c.add_argument("--data", metavar="PATHS",
                    help="comma-separated host paths, each mounted RO at "
                         "/workspace/shared/data/<basename>/ (e.g. "
