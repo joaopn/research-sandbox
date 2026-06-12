@@ -39,6 +39,8 @@ import socket
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 # Make cli/ helpers importable.
@@ -97,6 +99,41 @@ MCP_CONTAINER_PREFIX = "rs-mcp-"
 MCP_LABEL = "research.mcp"
 MCP_NAME_LABEL = "research.mcp_name"
 PROBE_IMAGE = "busybox:1.36"
+
+# Image version pins live in a visible root-level manifest, not scattered as
+# Dockerfile ARG defaults. `_build_images` threads them as `docker build
+# --build-arg`; see versions.env for the workflow + per-pin caveats.
+VERSIONS_FILE = SCRIPT_DIR / "versions.env"
+
+# Upstream datasource per pin, consumed by `research images outdated`. Kept here
+# rather than annotated into versions.env so the manifest stays a clean
+# KEY=VALUE file. Two ecosystems are stdlib-awkward to query honestly — the
+# docker-ce static repo (HTML dir listing) and the VS Code Marketplace gallery
+# (POST query API) — so they're marked "manual" with a URL instead of a faked
+# check. A pin present in versions.env but absent here prints "no source"; a
+# source whose key isn't pinned is skipped. Keep in sync when adding a pin.
+VERSION_SOURCES: dict[str, dict[str, str]] = {
+    "CODE_SERVER_VERSION": {
+        "kind": "github-releases",
+        "repo": "coder/code-server",
+        # The tag is the code-server version; the extension-compat gate is the
+        # *bundled* VS Code version, which this check does NOT resolve — open
+        # the release to confirm before bumping for an engines.vscode reason.
+        "note": "verify bundled VS Code in the release notes before bumping",
+    },
+    "PLAYWRIGHT_MCP_VERSION": {"kind": "npm", "pkg": "@playwright/mcp"},
+    "PYYAML_VERSION": {"kind": "pypi", "pkg": "PyYAML"},
+    "AIOHTTP_VERSION": {"kind": "pypi", "pkg": "aiohttp"},
+    "DOCKER_VERSION": {
+        "kind": "manual",
+        "url": "https://download.docker.com/linux/static/stable/x86_64/",
+    },
+    "DATA_WRANGLER_VERSION": {
+        "kind": "manual",
+        "url": "https://marketplace.visualstudio.com/items"
+               "?itemName=ms-toolsai.datawrangler",
+    },
+}
 
 # Per-supervisor service registry. KNOWN_SERVICES lists every kind the webui
 # might render; --enable / --disable on `project create|update` flips
@@ -603,6 +640,25 @@ def _preflight() -> None:
             print(f"created empty {env_path.name}")
 
 
+def load_versions() -> dict[str, str]:
+    """Parse the root-level versions.env (KEY=VALUE, `#`-comment lines) into a
+    dict of image-version pins. Mirrors load_config()'s .env parsing — stdlib
+    only, no quote/inline-comment handling (pins are bare tokens). Missing file
+    yields {} so every Dockerfile ARG default still applies."""
+    pins: dict[str, str] = {}
+    if not VERSIONS_FILE.exists():
+        return pins
+    for line in VERSIONS_FILE.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        k, _, v = line.partition("=")
+        k, v = k.strip(), v.strip()
+        if k:
+            pins[k] = v
+    return pins
+
+
 def _build_images(force: bool) -> None:
     """Build supervisor + worker + mcp-proxy + role-mcp images. Skip
     existing ones unless --rebuild. Build order matters: rs-role-mcp-base
@@ -649,17 +705,110 @@ def _build_images(force: bool) -> None:
                   file=sys.stderr)
             continue
         specs.append((image, dockerfile))
+    pins = load_versions()
     for tag, dockerfile in specs:
         if not force and run_quiet(["docker", "image", "inspect", tag]):
             print(f"image {tag} already present (use --rebuild to force)")
             continue
+        # Pass only the pins this Dockerfile declares an `ARG` for, so docker
+        # doesn't warn about unconsumed build-args. The ARG default in the
+        # Dockerfile stays the fallback for standalone `docker build` outside
+        # this CLI; here the manifest value wins.
+        text = dockerfile.read_text()
+        build_args: list[str] = []
+        for key, value in pins.items():
+            if f"ARG {key}" in text:
+                build_args += ["--build-arg", f"{key}={value}"]
         print(f"building {tag}...")
         run_check([
             "docker", "build",
             "-f", str(dockerfile),
             "-t", tag,
+            *build_args,
             str(SCRIPT_DIR),
         ])
+
+
+def _http_json(url: str, timeout: float = 10.0) -> dict:
+    """GET a JSON document with the stdlib. A User-Agent is required by the
+    GitHub API (it 403s anonymous requests without one) and harmless elsewhere."""
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "research-sandbox/images-outdated"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode())
+
+
+def _latest_version(source: dict[str, str]) -> str:
+    """Resolve the latest published version for a non-manual datasource. Raises
+    on network/parse failure; the caller renders that as 'unreachable'."""
+    kind = source["kind"]
+    if kind == "github-releases":
+        data = _http_json(
+            f"https://api.github.com/repos/{source['repo']}/releases/latest")
+        return str(data["tag_name"]).lstrip("v")
+    if kind == "npm":
+        # %2F-encode the scope so the scoped-package GET resolves cleanly.
+        pkg = source["pkg"].replace("/", "%2F")
+        data = _http_json(f"https://registry.npmjs.org/{pkg}")
+        return str(data["dist-tags"]["latest"])
+    if kind == "pypi":
+        data = _http_json(f"https://pypi.org/pypi/{source['pkg']}/json")
+        return str(data["info"]["version"])
+    raise ValueError(f"unknown datasource kind: {kind}")
+
+
+def cmd_images_versions(args: argparse.Namespace) -> None:
+    """Print the current image version pins from versions.env."""
+    pins = load_versions()
+    if not pins:
+        die(f"no pins found at {VERSIONS_FILE}")
+    width = max(len(k) for k in pins)
+    for key, value in pins.items():
+        print(f"{key.ljust(width)}  {value}")
+
+
+def cmd_images_outdated(args: argparse.Namespace) -> None:
+    """Query each pin's upstream and report current vs latest. Pull-model
+    freshness check — no PR noise, run when a bump is being considered."""
+    pins = load_versions()
+    if not pins:
+        die(f"no pins found at {VERSIONS_FILE}")
+    width = max(len(k) for k in pins)
+    cur_w = max((len(v) for v in pins.values()), default=7)
+    print(f"{'PIN'.ljust(width)}  {'CURRENT'.ljust(cur_w)}  "
+          f"{'LATEST'.ljust(cur_w)}  STATUS")
+    any_update = False
+    for key, current in pins.items():
+        source = VERSION_SOURCES.get(key)
+        if source is None:
+            print(f"{key.ljust(width)}  {current.ljust(cur_w)}  "
+                  f"{'?'.ljust(cur_w)}  no source configured")
+            continue
+        if source["kind"] == "manual":
+            print(f"{key.ljust(width)}  {current.ljust(cur_w)}  "
+                  f"{'manual'.ljust(cur_w)}  check: {source['url']}")
+            continue
+        try:
+            latest = _latest_version(source)
+        except (urllib.error.URLError, OSError, KeyError, ValueError) as e:
+            print(f"{key.ljust(width)}  {current.ljust(cur_w)}  "
+                  f"{'?'.ljust(cur_w)}  unreachable: {e}")
+            continue
+        if latest == current:
+            status = "up to date"
+        else:
+            status = "UPDATE AVAILABLE"
+            any_update = True
+            note = source.get("note")
+            if note:
+                status += f"  ({note})"
+        print(f"{key.ljust(width)}  {current.ljust(cur_w)}  "
+              f"{latest.ljust(cur_w)}  {status}")
+    if any_update:
+        print("\nbump a pin in versions.env, then propagate:")
+        print("  new projects:      `research start --rebuild`")
+        print("  running projects:  `research project update --rebuild <name>` "
+              "(recreates the supervisor + re-stages inner images)")
 
 
 def cmd_start(args: argparse.Namespace) -> None:
@@ -4436,6 +4585,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("stop", help="stop shared infra (router)")
     sp.set_defaults(func=cmd_stop)
+
+    img = sub.add_parser("images", help="image version pins (manifest + freshness)")
+    img_sub = img.add_subparsers(dest="subcommand", required=True)
+    iv = img_sub.add_parser("versions", help="print current image version pins")
+    iv.set_defaults(func=cmd_images_versions)
+    io = img_sub.add_parser(
+        "outdated", help="query upstreams for newer versions of each pin")
+    io.set_defaults(func=cmd_images_outdated)
 
     proj = sub.add_parser("project", help="per-project operations")
     proj_sub = proj.add_subparsers(dest="subcommand", required=True)
