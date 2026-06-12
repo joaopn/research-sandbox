@@ -46,6 +46,27 @@ SERVICES = {
             "byobu new-session -s main -c /workspace -- bash"
         ),
     },
+    # management — the default tab for `--type sandbox` projects
+    # (STAGE_SANDBOX_PROJECT.md), REPLACING the Supervisor + Editor tabs.
+    # Authority-without-agency: this surface can create/discard every box and
+    # read their artifacts, so it deliberately runs no agent — a plain login
+    # shell, never `claude`. It prints the `rs-sandbox` cheatsheet on a fresh
+    # byobu session (bare `rs-sandbox` → usage), then drops to bash. The
+    # flavor gate is in `project_services_handler` (server.py): management
+    # shows iff project.json type == "sandbox", and supervisor/code-server are
+    # omitted there. always_on so it surfaces without a port probe.
+    "management": {
+        "label": "Management",
+        "kind": "ssh",
+        "always_on": True,
+        "renderer": "xterm.js",
+        "default_port": 22,
+        "command": (
+            "byobu attach -t main 2>/dev/null || "
+            "byobu new-session -s main -c /workspace -- "
+            "bash -lc 'rs-sandbox; exec bash -l'"
+        ),
+    },
     # pi-wrangler — interactive DB-extraction tab. Command runs `claude`
     # in byobu — claude auto-discovers `/workspace/CLAUDE.md` (symlinked
     # to role.md by the pi entrypoint) and `/workspace/.mcp.json`

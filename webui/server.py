@@ -320,9 +320,22 @@ async def project_services_handler(request: web.Request) -> web.Response:
         ])
         probe_up = {sid: up for (sid, _), up in zip(probe_jobs, results)}
 
+    # Project flavor (STAGE_SANDBOX_PROJECT.md). "sandbox" projects swap the
+    # agentic Supervisor + Editor tabs for the non-agent Management tab; their
+    # box tabs come from kind="sandbox" sandbox.json entries. Read off the same
+    # /projects:ro bind-mount as everything else here.
+    is_sandbox = _read_project_type(project) == "sandbox"
+
     out: dict[str, dict] = {}
     sandbox_map: dict[str, str] | None = None
     for sid, svc in services.SERVICES.items():
+        # Flavor gate: Management only in sandbox projects; the Supervisor
+        # (claude agent) tab only in research projects. The Editor (code-server)
+        # IS kept for sandbox projects — it's the artifact-management surface.
+        if sid == "management" and not is_sandbox:
+            continue
+        if sid == "supervisor" and is_sandbox:
+            continue
         if svc.get("always_on"):
             out[sid] = svc
         elif svc.get("kind") == "http":
@@ -336,14 +349,15 @@ async def project_services_handler(request: web.Request) -> web.Response:
             if sandbox_map.get(sid[len("pi-"):]) == "baked":
                 out[sid] = svc
 
-    # BYO sandboxes (STAGE_CLI_TAXONOMY, formerly pi-isolated): one
-    # synthesized tab per BYO entry in the project's sandbox.json. Same
-    # data-plane discipline — read off the /projects:ro bind-mount, no
-    # SSH/docker socket, lifecycle changes reflect on next page load.
+    # Synthesized per-box tabs: BYO sandboxes (STAGE_CLI_TAXONOMY) and
+    # sandbox-flavor boxes (kind="sandbox", STAGE_SANDBOX_PROJECT.md). Both
+    # ride the rs-pi-iso-<name> container/tab conventions, so one synth path
+    # serves both. Same data-plane discipline — read off the /projects:ro
+    # bind-mount, no SSH/docker socket, lifecycle reflects on next page load.
     if sandbox_map is None:
         sandbox_map = _read_project_sandbox(project)
     for name, kind in sorted(sandbox_map.items()):
-        if kind != "byo":
+        if kind not in ("byo", "sandbox"):
             continue
         spec = services.pi_isolated_service(name)
         if spec is not None:
@@ -372,6 +386,26 @@ def _read_project_sandbox(project: str) -> dict[str, str]:
         return {}
     return {n: e.get("kind") for n, e in data.items()
             if isinstance(e, dict)}
+
+
+def _read_project_type(project: str) -> str:
+    """Project flavor from `.orchestrator/project.json` off the `/projects:ro`
+    bind-mount ("research" or "sandbox"). Same no-cache, no-socket discipline
+    as _read_project_sandbox. Defaults to "research" when the marker is
+    missing (legacy projects) or unreadable."""
+    workspace = _project_workspace(project)
+    if workspace is None:
+        return "research"
+    f = workspace / ".orchestrator" / "project.json"
+    if not f.is_file():
+        return "research"
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError):
+        return "research"
+    if isinstance(data, dict) and data.get("type") == "sandbox":
+        return "sandbox"
+    return "research"
 
 
 # ---- /projects/status — per-project rail sub-line data ----------------
