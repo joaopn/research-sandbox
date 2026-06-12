@@ -1,0 +1,28 @@
+FROM rs-analysis-base:latest
+
+# rs-sandbox-box — the disposable box image for the agent-less sandbox-project
+# flavor (--type sandbox, STAGE_SANDBOX_PROJECT.md). A clean, blank container
+# for running un-vetted code in isolation.
+#
+# Deliberately FROM rs-analysis-base, NOT rs-pi-base: a sandbox box must carry
+# NONE of the PI artifact-contract stack (the `manifest` verb, the Stop-hook
+# gate, the publish overlay user-memory, the published/ + internal/ dirs). It
+# inherits only what analysis-base gives — python, the claude CLI, byobu, tini,
+# the worker skel — and adds:
+#   - git: to clone a repo you want to inspect before trusting it.
+#   - iputils-ping: basic reachability checks from inside the box.
+# Plus a minimal idle entrypoint (no clone, no creds, no artifact surfaces).
+
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git iputils-ping \
+    && rm -rf /var/lib/apt/lists/*
+
+# Minimal idle entrypoint — overrides analysis-base's worker entrypoint.
+COPY agent/entrypoint.sandbox-box.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+USER worker
+WORKDIR /workspace
+# tini (PID 1) comes from analysis-base.
+ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]

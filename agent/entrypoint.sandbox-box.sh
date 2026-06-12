@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# entrypoint.sandbox-box.sh — disposable sandbox box boot (STAGE_SANDBOX_PROJECT).
+#
+# A blank, isolated box for running un-vetted code. Deliberately minimal and
+# clean: NO artifact-contract (no published/ or internal/ dirs, no manifest
+# verb, no Stop-hook gate, no publish overlay), NO repo clone, NO credentials.
+# Just restore the home skel, set the byobu role marker, ensure a hook-free
+# bypassPermissions settings.json, and idle. The PI drives the box from the
+# webui tab / `project attach`; if they want an LLM in the box they run
+# `claude` and `/login` (boxes are auth-free by design).
+#
+# Environment:
+#   RS_SANDBOX_NAME — box name (e.g. box-1); used for the role marker + logs.
+
+set -euo pipefail
+
+: "${RS_SANDBOX_NAME:?RS_SANDBOX_NAME must be set}"
+
+# Restore home from skel on first boot (the volume mount hides image contents).
+if [[ ! -f ~/.bashrc ]]; then
+    cp -a /etc/worker-skel/. ~/
+fi
+
+# Role marker for the byobu status-bar plugin (~/.byobu/bin/60_rolename).
+echo "${RS_SANDBOX_NAME}" > ~/.rs-role
+
+# bypassPermissions so an in-box `claude` doesn't prompt (the container is the
+# security boundary). Crucially NO `hooks` key — the artifact-contract gate is
+# deliberately absent here, unlike rs-pi-base. analysis-base ships no
+# settings.json, so this write is the only source.
+mkdir -p ~/.claude
+if [[ ! -f ~/.claude/settings.json ]]; then
+    printf '%s\n' '{"permissions": {"defaultMode": "bypassPermissions"}, "theme": "dark"}' \
+        > ~/.claude/settings.json
+fi
+
+# Browser variant (rs-sandbox-box-browser) bakes the playwright MCP server
+# declaration at /opt/sandbox-box/extra-mcps.json. Copy it to /workspace/.mcp.json
+# so the box's claude (launched from /workspace) auto-discovers the browser
+# tools. Plain boxes don't have the file — the step is skipped. Don't clobber a
+# PI-edited .mcp.json.
+if [[ -f /opt/sandbox-box/extra-mcps.json && ! -f /workspace/.mcp.json ]]; then
+    cp /opt/sandbox-box/extra-mcps.json /workspace/.mcp.json
+    echo "sandbox-box[${RS_SANDBOX_NAME}]: wired playwright MCP into /workspace/.mcp.json"
+fi
+
+echo "sandbox-box[${RS_SANDBOX_NAME}]: ready (workspace at /workspace)"
+
+# Idle. byobu sessions are created on first webui-tab / attach connect.
+exec tail -f /dev/null
