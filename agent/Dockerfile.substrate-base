@@ -1,0 +1,147 @@
+FROM continuumio/miniconda3:latest
+
+# rs-substrate-base — the shared per-project substrate for BOTH project
+# flavors. Holds everything common: the DIND stack (docker-ce + crun +
+# daemon.json), sshd, byobu, the `research` user, and code-server (the Editor
+# tab). The two leaf images add only their flavor-specific layer:
+#
+#   rs-supervisor  (research projects) = base + claude + rs-worker/rs-pi/
+#                  rs-role-mcp + mcp-proxy tooling + inner-firewall + the
+#                  CLAUDE.md/setup.sh templates + entrypoint.supervisor.sh
+#   rs-management  (--type sandbox)    = base + rs-sandbox + entrypoint.management.sh
+#
+# The split is the point: editing the supervisor's AGENT layer can never touch
+# Management, and Management simply does not contain claude/rs-worker at all
+# (authority-without-agency by construction, not by a runtime guard).
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Core tools: byobu, ssh, git, utilities; PLUS DIND support deps + crun.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl jq nano ca-certificates gnupg \
+    byobu \
+    openssh-server \
+    iputils-ping \
+    sudo \
+    locales \
+    btop \
+    tini \
+    iptables \
+    fuse-overlayfs \
+    uidmap \
+    crun \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Docker CE from Docker's official installer, pinned to a specific
+# version. Upgrade is explicit: bump DOCKER_VERSION, re-run `research setup`,
+# destroy/create affected projects. crun (above) is configured below as
+# dockerd's default OCI runtime so inner containers don't hit sysbox's procfs
+# incompatibility with docker's bundled runc.
+ARG DOCKER_VERSION=29.4.0
+RUN curl -fsSL https://get.docker.com | VERSION=${DOCKER_VERSION} sh && \
+    rm -rf /var/lib/apt/lists/*
+
+# Point the inner dockerd at crun as the default OCI runtime.
+RUN mkdir -p /etc/docker && cat > /etc/docker/daemon.json <<'JSON'
+{
+  "default-runtime": "crun",
+  "runtimes": {
+    "crun": {
+      "path": "/usr/bin/crun"
+    }
+  }
+}
+JSON
+
+# Locale (many tools expect UTF-8).
+RUN sed -i '/en_US.UTF-8/s/^# //' /etc/locale.gen && locale-gen
+ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+
+# SSH server setup.
+RUN mkdir -p /run/sshd && \
+    sed -i 's/#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config && \
+    sed -i 's/#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
+    echo "AllowAgentForwarding no" >> /etc/ssh/sshd_config
+
+# Non-root user at UID 1000. NOPASSWD:ALL because the container is the security
+# boundary (sandboxed inside rs-sandbox network + router egress policy).
+RUN useradd -m -s /bin/bash -G sudo,docker -u 1000 research && \
+    echo "research ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/research
+
+# Initialize conda hooks in the research user's shell.
+RUN su - research -c "/opt/conda/bin/conda init bash"
+
+# --- code-server (browser IDE; the Editor tab, shared by both flavors) ------
+#
+# Pinned via ARG, mirroring DOCKER_VERSION discipline. Bumps are deliberate:
+# update the version, `research start --rebuild`, recreate affected projects.
+ARG CODE_SERVER_VERSION=4.91.1
+RUN curl -fsSL https://code-server.dev/install.sh \
+      | sh -s -- --version "${CODE_SERVER_VERSION}"
+
+# Strip built-in extensions per PLAN/STAGE_WEBUI_W2_code_server.md Tier 2:
+# keep grammar/syntax + themes + markdown + notebook viewers; drop heavy
+# language-server features, git stack, JS build/debug tooling.
+RUN set -eux; \
+    EXT_DIR=$(find /usr/lib/code-server -maxdepth 5 -type d -name extensions \
+                | head -n 1); \
+    [ -d "$EXT_DIR" ] || (echo "code-server extensions dir not found" && exit 1); \
+    cd "$EXT_DIR"; \
+    for ext in \
+        typescript-language-features \
+        html-language-features \
+        css-language-features \
+        json-language-features \
+        php-language-features \
+        git \
+        git-base \
+        github \
+        github-authentication \
+        microsoft-authentication \
+        merge-conflict \
+        npm \
+        grunt \
+        gulp \
+        jake \
+        node-debug \
+        node-debug2 \
+        debug-auto-launch \
+        debug-server-ready \
+        references-view \
+        extension-editing \
+        simple-browser \
+    ; do \
+        rm -rf "$ext" || true; \
+    done
+
+# Pre-stage Microsoft-marketplace-only extensions (.vsix) for first-boot
+# install. Vendored here because the runtime never touches MS marketplace.
+ARG DATA_WRANGLER_VERSION=1.18.0
+RUN mkdir -p /opt/code-server-templates/extensions \
+ && curl -fsSL --compressed \
+        -o /opt/code-server-templates/extensions/datawrangler.vsix \
+        "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-toolsai/vsextensions/datawrangler/${DATA_WRANGLER_VERSION}/vspackage"
+
+# Pre-baked code-server user settings (staged onto the workspace on first boot
+# by each entrypoint if absent).
+RUN mkdir -p /opt/code-server-templates/User
+COPY container/supervisor/code-server-settings.json \
+     /opt/code-server-templates/User/settings.json
+
+# Lazy-start TCP proxy for code-server (the slim-RAM strategy: spawn on first
+# connect, reap after idle). Used by both entrypoints.
+RUN mkdir -p /opt/code-server-tools
+COPY container/supervisor/code-server-stub.py \
+     /opt/code-server-tools/code-server-stub.py
+RUN chmod +x /opt/code-server-tools/code-server-stub.py
+
+# Minimal byobu status line. Staged into the research user's home so each
+# leaf's first-boot skel snapshot (cp -a /home/research /etc/research-skel,
+# done in the LEAF after its own home additions) picks it up.
+RUN install -d -o research -g research /home/research/.byobu /home/research/.byobu/bin
+COPY --chown=research:research agent/byobu-status      /home/research/.byobu/status
+COPY --chown=research:research agent/byobu-bin-rolename /home/research/.byobu/bin/60_rolename
+RUN chmod +x /home/research/.byobu/bin/60_rolename
+
+# No skel snapshot, no USER switch, no ENTRYPOINT here — the leaf images add
+# their flavor layer, snapshot the home, and set the entrypoint.

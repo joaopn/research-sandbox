@@ -1,0 +1,28 @@
+FROM rs-substrate-base:latest
+
+# rs-management — the agent-less substrate for a `--type sandbox` project
+# (STAGE_SANDBOX_PROJECT.md). The Management leaf on top of rs-substrate-base:
+# it adds ONLY rs-sandbox (the box-lifecycle CLI) and a lean entrypoint.
+#
+# Crucially it does NOT install claude, rs-worker, rs-pi, the mcp-proxy tooling,
+# or the supervisor CLAUDE.md/setup templates — none of that exists in this
+# image. That is the authority-without-agency invariant enforced by Docker
+# layering rather than a runtime guard: the surface with authority over every
+# box (the Management shell + the Editor's terminal) physically cannot run an
+# agent because no agent is installed.
+
+# rs-sandbox is the single owner of sandbox-box lifecycle (create/discard/
+# stop/start/list), driven by a human in the non-agent Management tab.
+COPY cli/rs_sandbox.py /usr/local/bin/rs-sandbox
+RUN chmod +x /usr/local/bin/rs-sandbox
+
+# Snapshot the home (byobu from the base, NO claude) for first-boot restore.
+RUN cp -a /home/research /etc/research-skel
+
+COPY agent/entrypoint.management.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+USER research
+WORKDIR /home/research
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]

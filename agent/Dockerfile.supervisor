@@ -1,220 +1,44 @@
-FROM continuumio/miniconda3:latest
+FROM rs-substrate-base:latest
 
-ENV DEBIAN_FRONTEND=noninteractive
-
-# Core tools: byobu, ssh, git, utilities; PLUS DIND support deps + crun.
-# `crun` is the OCI runtime we'll point the inner dockerd at (see below).
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl jq nano ca-certificates gnupg \
-    byobu \
-    openssh-server \
-    iputils-ping \
-    sudo \
-    locales \
-    btop \
-    tini \
-    iptables \
-    fuse-overlayfs \
-    uidmap \
-    crun \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Docker CE from Docker's official installer, pinned to a specific
-# version. Baking the version into the image means every supervisor built
-# from `research setup` uses the same docker — no version drift between
-# projects created on different days. Upgrade is explicit: bump DOCKER_VERSION,
-# re-run `research setup`, destroy/create affected projects.
-#
-# crun (installed above) is configured below as dockerd's default OCI runtime
-# so worker containers don't hit sysbox's procfs incompatibility with
-# docker's bundled runc.
-ARG DOCKER_VERSION=29.4.0
-RUN curl -fsSL https://get.docker.com | VERSION=${DOCKER_VERSION} sh && \
-    rm -rf /var/lib/apt/lists/*
-
-# Point the inner dockerd at crun as the default OCI runtime. /etc/docker/ is
-# root-owned; the file is read by dockerd each time it starts.
-RUN mkdir -p /etc/docker && cat > /etc/docker/daemon.json <<'JSON'
-{
-  "default-runtime": "crun",
-  "runtimes": {
-    "crun": {
-      "path": "/usr/bin/crun"
-    }
-  }
-}
-JSON
-
-# Locale (many tools expect UTF-8).
-RUN sed -i '/en_US.UTF-8/s/^# //' /etc/locale.gen && locale-gen
-ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
-
-# SSH server setup.
-RUN mkdir -p /run/sshd && \
-    sed -i 's/#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config && \
-    sed -i 's/#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
-    echo "AllowAgentForwarding no" >> /etc/ssh/sshd_config
-
-# Non-root user at UID 1000. The `docker` group was already created by
-# docker.io's postinst above; research just joins it. NOPASSWD:ALL because
-# the container is the security boundary (sandboxed inside rs-sandbox
-# network + router egress policy).
-RUN useradd -m -s /bin/bash -G sudo,docker -u 1000 research && \
-    echo "research ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/research
-
-# Initialize conda hooks in the research user's shell.
-RUN su - research -c "/opt/conda/bin/conda init bash"
+# rs-supervisor — research-project substrate. The agent leaf on top of
+# rs-substrate-base: claude + the worker/PI/role-MCP management CLIs + the
+# mcp-proxy tooling + the inner firewall + the supervisor's CLAUDE.md / setup
+# templates. The shared DIND/ssh/byobu/code-server substrate lives in the base.
 
 # Install Claude Code CLI into the research user's home at build time.
-# Network access happens during build via the host's docker daemon (not via the
-# project-network router), so this does not depend on any runtime egress policy.
 RUN su - research -c 'curl -fsSL https://claude.ai/install.sh | bash' && \
     su - research -c 'echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.bashrc'
 
-# rs-worker CLI runtime deps — docker-py + pyyaml installed into the conda
-# base env (one Python, no separate venv).
+# rs-worker CLI runtime deps — docker-py + pyyaml into the conda base env.
 RUN /opt/conda/bin/pip install --no-cache-dir 'docker>=7.1' 'pyyaml>=6'
 
-# rs-worker is the worker-lifecycle CLI, mirroring research.py's shape one
-# level in. Invoked by the supervisor's Claude Code via its Bash tool.
-# rs-audit-stop is the supervision-audit Stop hook, wired into ~/.claude/
-# settings.json by setup.sh on first boot.
+# rs-worker is the worker-lifecycle CLI; rs-audit-stop is the supervision-audit
+# Stop hook, wired into ~/.claude/settings.json by setup.sh on first boot.
 COPY cli/rs_worker.py /usr/local/bin/rs-worker
 COPY cli/rs_audit_stop.py /usr/local/bin/rs-audit-stop
 RUN chmod +x /usr/local/bin/rs-worker /usr/local/bin/rs-audit-stop
 
-# MCP proxy support — config renderer (run from entrypoint at boot, and by
-# mcp-reload after `research project mcp-allow|mcp-deny` mutations) plus the
-# reload helper itself, which SIGHUPs the inner-daemon mcp-proxy container.
+# MCP proxy support — config renderer + the reload helper that SIGHUPs the
+# inner-daemon mcp-proxy container.
 RUN mkdir -p /opt/mcp-proxy-tools
 COPY container/supervisor/mcp_render_config.py /opt/mcp-proxy-tools/mcp_render_config.py
 COPY container/supervisor/mcp-reload.sh /usr/local/bin/mcp-reload
 RUN chmod +x /usr/local/bin/mcp-reload
 
-# Stage 2.3 inner-netns firewall (opt-in). Defense-in-depth ACL applied to
-# the supervisor's rs-inner bridge when RS_INNER_FIREWALL=1 is set on the
-# supervisor container. Does nothing otherwise — no host change, no overhead.
+# Stage 2.3 inner-netns firewall (opt-in via RS_INNER_FIREWALL=1).
 COPY container/supervisor/inner-firewall.sh /usr/local/bin/rs-inner-firewall
 RUN chmod +x /usr/local/bin/rs-inner-firewall
 
-# PI-role substrate (STAGE_BACKEND_PI P.0): supervisor-side CLI for
-# attaching to PI containers and the manual `rs-pi sync-creds` cred bridge
-# (PI containers are PI-owned and otherwise PI-authed via in-tab /login;
-# there is no automatic cred propagation — STAGE_PI_AUTH_OWNERSHIP). Baked
-# into the supervisor image since PI containers are managed from the
-# supervisor, never from inside themselves.
+# PI-role substrate CLI (attach + manual `rs-pi sync-creds` cred bridge).
 COPY agent/scripts/rs-pi              /usr/local/bin/rs-pi
 RUN chmod +x /usr/local/bin/rs-pi
 
-# role-MCP-side companion to `rs-pi`. Exposes `list` and `sync-creds`
-# for the worker-facing role-MCP containers. No inotify watcher
-# (deliberate, see STAGE_ROLE_MCP_SYNC_CREDS.md RS6); sync-creds is the
-# manual fallback when a supervisor re-OAuth leaves running role-MCPs
-# with stale ~/.claude/.credentials.json.
+# role-MCP-side companion to rs-pi (`list` + `sync-creds`).
 COPY agent/scripts/rs-role-mcp        /usr/local/bin/rs-role-mcp
 RUN chmod +x /usr/local/bin/rs-role-mcp
 
-# --- code-server (browser IDE, second http-kind tab) -----------------------
-#
-# Pinned via ARG, mirroring DOCKER_VERSION discipline. Bumps are deliberate:
-# update the version, `research start --rebuild`, recreate affected projects.
-# code-server's standalone install script supports --version; we use it
-# rather than the upstream apt repo so the version pin is verbatim.
-ARG CODE_SERVER_VERSION=4.91.1
-RUN curl -fsSL https://code-server.dev/install.sh \
-      | sh -s -- --version "${CODE_SERVER_VERSION}"
-
-# Strip built-in extensions per PLAN/STAGE_WEBUI_W2_code_server.md Tier 2:
-# keep grammar/syntax basics for every shipped language + all themes +
-# markdown stack + notebook viewers + small utilities; drop heavy
-# language-server `*-language-features` extensions (TS LSP is the headline,
-# 300-500 MB when a .ts/.js file is opened) + git stack + JS build tooling
-# + JS debuggers + LSP-dependent UI helpers.
-#
-# `find` resolves the extensions dir version-agnostically. Each rm is
-# best-effort so a renamed/missing extension doesn't fail the build —
-# new releases are reviewed against the keep/drop policy at version
-# bump time, see the runbook's `ls lib/vscode/extensions/` step.
-RUN set -eux; \
-    EXT_DIR=$(find /usr/lib/code-server -maxdepth 5 -type d -name extensions \
-                | head -n 1); \
-    [ -d "$EXT_DIR" ] || (echo "code-server extensions dir not found" && exit 1); \
-    cd "$EXT_DIR"; \
-    for ext in \
-        typescript-language-features \
-        html-language-features \
-        css-language-features \
-        json-language-features \
-        php-language-features \
-        git \
-        git-base \
-        github \
-        github-authentication \
-        microsoft-authentication \
-        merge-conflict \
-        npm \
-        grunt \
-        gulp \
-        jake \
-        node-debug \
-        node-debug2 \
-        debug-auto-launch \
-        debug-server-ready \
-        references-view \
-        extension-editing \
-        simple-browser \
-    ; do \
-        rm -rf "$ext" || true; \
-    done
-
-# Pre-stage Microsoft-marketplace-only extensions (.vsix files) for
-# install on first project boot. Extensions live on the workspace
-# bind-mount under /workspace/.local/share/code-server/extensions so
-# they survive _recreate_supervisor; the entrypoint runs
-# `code-server --install-extension` once per project. .vsix files
-# are vendored here because the runtime never touches MS marketplace
-# (avoids the ToS gray area for live gallery traffic).
-#
-# Set DATA_WRANGLER_VERSION to the version you want pinned for this
-# image; bumps are deliberate. The endpoint serves a gzipped .vsix —
-# `curl --compressed` handles the decode.
-ARG DATA_WRANGLER_VERSION=1.18.0
-RUN mkdir -p /opt/code-server-templates/extensions \
- && curl -fsSL --compressed \
-        -o /opt/code-server-templates/extensions/datawrangler.vsix \
-        "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-toolsai/vsextensions/datawrangler/${DATA_WRANGLER_VERSION}/vspackage"
-
-# Pre-baked code-server user settings, staged onto the workspace
-# bind-mount on first boot if absent (entrypoint logic). The
-# settings file disables telemetry/git probe, excludes heavy
-# directories from the file watcher, and turns off update prompts.
-RUN mkdir -p /opt/code-server-templates/User
-COPY container/supervisor/code-server-settings.json \
-     /opt/code-server-templates/User/settings.json
-
-# Lazy-start TCP proxy for code-server. Listens on the supervisor's
-# CODE_SERVER_STUB_PORT (the port the webui reverse-proxy hits via
-# container DNS); spawns code-server on CODE_SERVER_UPSTREAM_PORT
-# on first connection; reaps after CODE_SERVER_IDLE_SECONDS of
-# inactivity. This is the centerpiece of the slim-RAM strategy.
-RUN mkdir -p /opt/code-server-tools
-COPY container/supervisor/code-server-stub.py \
-     /opt/code-server-tools/code-server-stub.py
-RUN chmod +x /opt/code-server-tools/code-server-stub.py
-
-# Minimal byobu status line — only the time widget on the right, nothing
-# extra crowding the bar. Must be staged before the skel snapshot below
-# so the supervisor's first-boot skel-restore picks it up.
-RUN install -d -o research -g research /home/research/.byobu /home/research/.byobu/bin
-COPY --chown=research:research agent/byobu-status      /home/research/.byobu/status
-COPY --chown=research:research agent/byobu-bin-rolename /home/research/.byobu/bin/60_rolename
-RUN chmod +x /home/research/.byobu/bin/60_rolename
-
-# Stash home directory — volume mount on /home/research hides image contents.
-RUN cp -a /home/research /etc/research-skel
-
-# Claude Code settings templates (written into /workspace/.claude/ by entrypoint
-# on first boot). Kept as image artifacts to stay declarative.
+# Claude Code settings + role templates (written into /workspace/.claude/ by
+# the entrypoint on first boot). Kept as image artifacts to stay declarative.
 RUN mkdir -p /opt/claude-templates /opt/claude-templates/commands
 COPY container/supervisor/setup.sh /opt/claude-templates/setup.sh
 COPY container/supervisor/CLAUDE.md /opt/claude-templates/CLAUDE.md
@@ -224,7 +48,10 @@ COPY container/supervisor/logbook_pi_template.md /opt/claude-templates/logbook_p
 COPY container/analysis/CLAUDE.md.template /opt/claude-templates/worker.CLAUDE.md.template
 RUN chmod +x /opt/claude-templates/setup.sh
 
-# Entrypoint.
+# Snapshot the (now claude-equipped) home — volume mount on /home/research
+# hides image contents, so the entrypoint restores from this skel on first boot.
+RUN cp -a /home/research /etc/research-skel
+
 COPY agent/entrypoint.supervisor.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
