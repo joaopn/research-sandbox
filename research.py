@@ -1748,6 +1748,12 @@ def _recreate_supervisor(
     workspace_path = workspace_path_for(project, cfg)
     role_entries = role_mcp.load_role_mcps(workspace_path)
     for role in sorted(role_entries):
+        if role_entries[role].get("stopped"):
+            # Deliberately parked via `project worker stop` — do NOT
+            # auto-restart on recreate. Park survives the supervisor swap
+            # (mirrors the worker `down` model); explicit `worker start`
+            # brings it back.
+            continue
         try:
             _role_mcp_start(container, project, cfg, role,
                             force_restage=force_restage)
@@ -3311,10 +3317,56 @@ def _role_mcp_start(supervisor: str, project: str, cfg: "Config",
 
 
 def _role_mcp_stop(supervisor: str, role: str) -> None:
-    """Stop + remove the role-MCP container in the inner dockerd. Tolerates
-    absence — caller may have already removed it via _recreate_supervisor."""
+    """Hard stop + remove the role-MCP container (`docker rm -f` = SIGKILL,
+    no grace, no drain). This is `disable`'s teardown — it pairs with
+    dropping the role-mcps.json entry, so abruptness is acceptable: the role
+    is leaving the project. For a *graceful park that keeps the entry*, use
+    `_role_mcp_park` instead. Tolerates absence — caller may have already
+    removed it via _recreate_supervisor."""
     cname = role_mcp.role_container_name(role)
     run(["docker", "exec", supervisor, "docker", "rm", "-f", cname],
+        capture_output=True)
+
+
+def _role_mcp_in_flight(workspace_path: Path, role: str) -> list[dict]:
+    """Read-only, host-side count of in-flight send_job calls, straight off
+    the project volume (`<workspace>/.role-mcps/<role>/jobs/*.json` — the same
+    files the daemon writes; see daemon.py JobStore). A job still in status
+    `running` is a live `claude -p` call (or a daemon-restart orphan the
+    daemon would reap on its next boot; from the host the file state is the
+    conservative signal — we'd rather refuse a stop than kill a real call).
+    Returns the running entries so the caller can name them in a refusal.
+    Pure read — no docker, no mutation, safe to call as a gate."""
+    jobs_dir = workspace_path / ".role-mcps" / role / "jobs"
+    if not jobs_dir.is_dir():
+        return []
+    running: list[dict] = []
+    for p in sorted(jobs_dir.glob("*.json")):
+        try:
+            entry = json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if isinstance(entry, dict) and entry.get("status") == "running":
+            running.append(entry)
+    return running
+
+
+def _role_mcp_park(supervisor: str, role: str) -> None:
+    """Graceful stop of the role-MCP container WITHOUT removing it and
+    WITHOUT touching role-mcps.json — the role stays registered, just parked.
+    Uses `docker stop` (SIGTERM + grace), not the `rm -f` (SIGKILL) that
+    `disable` uses. The daemon has no SIGTERM drain handler, so gracefulness
+    here comes from *quiescence*, not from the signal: callers gate on
+    `_role_mcp_in_flight` == 0 first, so the daemon is idle (no `claude -p`
+    child, no memory write mid-flight) when the signal lands and a
+    handler-less SIGTERM terminates a process with nothing to tear. The
+    container is left `exited` (name preserved, visible in `docker ps -a`);
+    `_role_mcp_start` rm's and replaces it on unpark, and
+    `_recreate_supervisor` skips parked entries entirely. The
+    `--restart unless-stopped` policy honors a manual stop, so the parked
+    container won't auto-restart within the supervisor's lifetime."""
+    cname = role_mcp.role_container_name(role)
+    run(["docker", "exec", supervisor, "docker", "stop", cname],
         capture_output=True)
 
 
@@ -3414,14 +3466,30 @@ def _role_mcp_enable(project: str, cfg: "Config", role: str,
     else:
         chosen_mcc = cfg.default_role_mcp_max_concurrent_calls
 
-    entries[role] = role_mcp.build_entry(
+    new_entry = role_mcp.build_entry(
         role, chosen_upstreams, upstream_source=chosen_source,
         memory=chosen_memory, max_concurrent_calls=chosen_mcc,
     )
+    # Preserve parked state across re-enable / sync re-derive: a worker the
+    # operator deliberately stopped (`project worker stop`) stays parked
+    # until an explicit `project worker start`. build_entry always renders a
+    # running entry, so without this carry-forward a `project mcp sync`
+    # re-derive would silently resurrect a stopped worker.
+    parked = bool(existing is not None and existing.get("stopped"))
+    if parked:
+        new_entry["stopped"] = True
+    entries[role] = new_entry
     role_mcp.save_role_mcps(workspace_path, entries)
 
-    _role_mcp_start(supervisor, project, cfg, role)
-    _supervisor_mcp_reload(supervisor)
+    if parked:
+        print(
+            f"worker {role!r}: entry updated but left parked — start it with "
+            f"`research project worker start {project} {role}`",
+            file=sys.stderr,
+        )
+    else:
+        _role_mcp_start(supervisor, project, cfg, role)
+        _supervisor_mcp_reload(supervisor)
 
     # Sandbox mirror auto-enable (M4). Skipped if (a) operator opted out
     # (no_pi_mirror — the flag kept its internal name), or (b) no baked
@@ -3503,6 +3571,71 @@ def cmd_project_role_mcp_disable(args: argparse.Namespace) -> None:
     print(f"role-mcp {args.role!r}: disabled")
 
 
+def cmd_project_worker_stop(args: argparse.Namespace) -> None:
+    """Gracefully park a registered worker service: refuse if it has
+    in-flight send_job calls (read-only check), else `docker stop` it and
+    mark the role-mcps.json entry `stopped`. The entry is preserved — the
+    worker stays part of the project and the park survives supervisor
+    recreate — distinct from `disable`, which removes + deregisters."""
+    cfg = load_config()
+    supervisor = _require_project(args.project)
+    role = args.role
+    role_mcp.validate_role(role)
+    workspace_path = workspace_path_for(args.project, cfg)
+    entries = role_mcp.load_role_mcps(workspace_path)
+    if role not in entries:
+        die(f"worker {role!r} is not enabled for project {args.project!r}; "
+            f"nothing to stop.")
+
+    if container_running(supervisor) and _role_mcp_inner_running(supervisor, role):
+        in_flight = _role_mcp_in_flight(workspace_path, role)
+        if in_flight and not args.force:
+            named = ", ".join(
+                f"{e.get('call_id', '?')}({e.get('caller', '?')})"
+                for e in in_flight)
+            die(f"worker {role!r} has {len(in_flight)} in-flight call(s): "
+                f"{named}.\nWait for them to finish (poll with `research "
+                f"project worker status {args.project} {role}`), or re-run "
+                f"with --force to stop anyway — the in-flight call(s) will be "
+                f"lost and marked failed (daemon_restart_orphan) on next "
+                f"start.")
+        _role_mcp_park(supervisor, role)
+
+    # Re-load before mutating: nothing should have raced us, but the park is
+    # a separate process boundary, so read-modify-write the freshest entry.
+    entries = role_mcp.load_role_mcps(workspace_path)
+    if role in entries:
+        entries[role]["stopped"] = True
+        role_mcp.save_role_mcps(workspace_path, entries)
+    print(f"worker {role!r}: stopped (parked; entry preserved). Restart with "
+          f"`research project worker start {args.project} {role}`.")
+
+
+def cmd_project_worker_start(args: argparse.Namespace) -> None:
+    """Restart a parked worker service: respawn the container against its
+    preserved role-mcps.json entry (same upstreams, IP, caps, memory) and
+    clear the `stopped` flag. Idempotent on an already-running worker."""
+    cfg = load_config()
+    supervisor = _require_project(args.project)
+    role = args.role
+    role_mcp.validate_role(role)
+    if not container_running(supervisor):
+        die(f"project {args.project!r} is not running; bring it up first "
+            f"with `research project start {args.project}`.")
+    workspace_path = workspace_path_for(args.project, cfg)
+    entries = role_mcp.load_role_mcps(workspace_path)
+    if role not in entries:
+        die(f"worker {role!r} is not enabled for project {args.project!r}; "
+            f"enable it first with `research project worker enable "
+            f"{args.project} {role}`.")
+    _role_mcp_start(supervisor, args.project, cfg, role)
+    entries = role_mcp.load_role_mcps(workspace_path)
+    if role in entries:
+        entries[role]["stopped"] = False
+        role_mcp.save_role_mcps(workspace_path, entries)
+    print(f"worker {role!r}: started")
+
+
 def cmd_project_worker_list(args: argparse.Namespace) -> None:
     """Comprehensive worker listing: the enable-able **services** (role-MCPs,
     with upstreams + state) AND the spawned **analysis instances** (ephemeral
@@ -3518,6 +3651,11 @@ def cmd_project_worker_list(args: argparse.Namespace) -> None:
     states = _inner_container_states(supervisor)
 
     def svc_state(role: str) -> str:
+        # A deliberately-parked worker (`project worker stop`) reads as
+        # `parked` regardless of supervisor/container state — the flag is the
+        # disambiguator between "operator stopped it" and "crashed / absent".
+        if services.get(role, {}).get("stopped"):
+            return "parked"
         if not up:
             return "unknown"
         return states.get(f"rs-{role}", "absent")
@@ -4824,6 +4962,31 @@ def build_parser() -> argparse.ArgumentParser:
     rmd.add_argument("project")
     rmd.add_argument("role")
     rmd.set_defaults(func=cmd_project_role_mcp_disable)
+
+    rmstop = rm_sub.add_parser(
+        "stop",
+        help="gracefully PARK a running worker service (docker stop, NOT "
+             "remove): the role-mcps.json entry is preserved so the worker "
+             "stays part of the project and the park survives supervisor "
+             "recreate. Refuses if the worker has in-flight send_job calls "
+             "unless --force. Contrast `disable`, which removes + "
+             "deregisters the worker entirely.")
+    rmstop.add_argument("project")
+    rmstop.add_argument("role")
+    rmstop.add_argument(
+        "--force", action="store_true",
+        help="stop even with in-flight calls; the in-flight call(s) are lost "
+             "and marked failed (daemon_restart_orphan) on next start.")
+    rmstop.set_defaults(func=cmd_project_worker_stop)
+
+    rmstart = rm_sub.add_parser(
+        "start",
+        help="restart a PARKED worker service (see `worker stop`). Respawns "
+             "the container against its preserved entry (same upstreams, IP, "
+             "caps) and clears the parked flag.")
+    rmstart.add_argument("project")
+    rmstart.add_argument("role")
+    rmstart.set_defaults(func=cmd_project_worker_start)
 
     rml = rm_sub.add_parser("list",
                             help="show worker services (running state + "

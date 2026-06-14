@@ -165,7 +165,16 @@ def build_entry(role: str, upstreams: list[str], *,
 
     Opaque to the role-MCP container (only ``upstream_mcps`` is read by
     the entrypoint); the upstream_source field is a registry-management
-    discriminator."""
+    discriminator.
+
+    Note: the runtime ``stopped`` field is NOT set here. ``build_entry``
+    always renders a *running* (enabled) entry; absence of ``stopped`` (or
+    ``stopped=False``) means "should be running". ``research project worker
+    stop`` sets ``stopped=True`` to park a registered worker without
+    deregistering it (distinct from ``disable``, which deletes the entry),
+    and ``_recreate_supervisor`` skips parked entries on restart. The flag
+    is managed by the lifecycle layer in research.py and preserved across
+    ``enable``/``sync`` re-derives."""
     if upstream_source not in UPSTREAM_SOURCES:
         raise ValueError(
             f"upstream_source must be one of {UPSTREAM_SOURCES}, "
