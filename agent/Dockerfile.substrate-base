@@ -37,7 +37,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # destroy/create affected projects. crun (above) is configured below as
 # dockerd's default OCI runtime so inner containers don't hit sysbox's procfs
 # incompatibility with docker's bundled runc.
-ARG DOCKER_VERSION=29.4.0
+ARG DOCKER_VERSION=29.5.3
 RUN curl -fsSL https://get.docker.com | VERSION=${DOCKER_VERSION} sh && \
     rm -rf /var/lib/apt/lists/*
 
@@ -75,7 +75,7 @@ RUN su - research -c "/opt/conda/bin/conda init bash"
 #
 # Pinned via ARG, mirroring DOCKER_VERSION discipline. Bumps are deliberate:
 # update the version, `research start --rebuild`, recreate affected projects.
-ARG CODE_SERVER_VERSION=4.91.1
+ARG CODE_SERVER_VERSION=4.123.0
 RUN curl -fsSL https://code-server.dev/install.sh \
       | sh -s -- --version "${CODE_SERVER_VERSION}"
 
@@ -116,7 +116,7 @@ RUN set -eux; \
 
 # Pre-stage Microsoft-marketplace-only extensions (.vsix) for first-boot
 # install. Vendored here because the runtime never touches MS marketplace.
-ARG DATA_WRANGLER_VERSION=1.18.0
+ARG DATA_WRANGLER_VERSION=1.24.2
 RUN mkdir -p /opt/code-server-templates/extensions \
  && curl -fsSL --compressed \
         -o /opt/code-server-templates/extensions/datawrangler.vsix \

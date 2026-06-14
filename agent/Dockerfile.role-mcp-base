@@ -10,7 +10,7 @@ USER root
 
 # aiohttp for the daemon's HTTP server. Pinned via ARG so bumps are
 # deliberate, same dance as DOCKER_VERSION in Dockerfile.supervisor.
-ARG AIOHTTP_VERSION=3.10.10
+ARG AIOHTTP_VERSION=3.14.1
 RUN /opt/conda/bin/pip install --no-cache-dir "aiohttp==${AIOHTTP_VERSION}"
 
 # Daemon + spawn helper. /opt/role-mcp/role/ is left empty here; each

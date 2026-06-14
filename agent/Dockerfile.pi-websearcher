@@ -28,8 +28,8 @@ USER root
 # together; the P.1 test cross-checks the env-exposed version across both
 # images and refuses to pass on drift.
 ARG NODE_MAJOR=22
-ARG PLAYWRIGHT_MCP_VERSION=0.0.41
-ARG PYYAML_VERSION=6.0.2
+ARG PLAYWRIGHT_MCP_VERSION=0.0.76
+ARG PYYAML_VERSION=6.0.3
 
 # --- Node.js + dumb-init -----------------------------------------------------
 # Same install posture as Dockerfile.websearcher. dumb-init wraps the

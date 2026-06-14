@@ -20,8 +20,8 @@ USER root
 # destroy + recreate affected projects. Same discipline as DOCKER_VERSION
 # and CODE_SERVER_VERSION in Dockerfile.supervisor.
 ARG NODE_MAJOR=22
-ARG PLAYWRIGHT_MCP_VERSION=0.0.41
-ARG PYYAML_VERSION=6.0.2
+ARG PLAYWRIGHT_MCP_VERSION=0.0.76
+ARG PYYAML_VERSION=6.0.3
 
 # --- Node.js + dumb-init -----------------------------------------------------
 # Node is required for @playwright/mcp (an npm package whose bundled

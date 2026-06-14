@@ -15,8 +15,8 @@ FROM rs-sandbox-box:latest
 
 USER root
 ARG NODE_MAJOR=22
-ARG PLAYWRIGHT_MCP_VERSION=0.0.41
-ARG PYYAML_VERSION=6.0.2
+ARG PLAYWRIGHT_MCP_VERSION=0.0.76
+ARG PYYAML_VERSION=6.0.3
 
 # Node.js (NodeSource pin) + dumb-init (subreaper for the Playwright ->
 # Chromium subprocess tree, per the websearcher image's reasoning).
