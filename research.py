@@ -4163,6 +4163,57 @@ def cmd_project_sandbox_sync_creds(args: argparse.Namespace) -> None:
         sys.exit(r.returncode)
 
 
+def cmd_project_update_claude(args: argparse.Namespace) -> None:
+    """Interim manual refresh of the supervisor's Claude Code CLI.
+
+    The CLI is baked into the image at build time (Dockerfile.supervisor), so
+    a project's interactive `claude` — and the model list it offers — freezes
+    at the image's build date and only moves on a `start --rebuild` + project
+    recreate. This re-runs the official installer inside the running supervisor
+    to pull the latest stable, no rebuild required.
+
+    Scope is the SUPERVISOR only — the surface the PI interacts with. The inner
+    fleet (workers, role-MCPs, PI containers) still restores the image-baked
+    binary from worker-skel on boot; refreshing those uniformly is the
+    per-project agent-dist work (PLAN/STAGE_AGENT_DIST.md). Sandbox-flavor
+    (`--type sandbox`) projects have no agent and are refused."""
+    supervisor = _require_project(args.name)
+    if _container_project_type(supervisor) == PROJECT_TYPE_SANDBOX:
+        die(f"project {args.name!r} is a sandbox (agent-less) project — its "
+            f"Management console runs no claude to update")
+    if not container_running(supervisor):
+        die(f"project {args.name!r} is not running "
+            f"(use `research project start {args.name}` first)")
+
+    # Login shell + explicit PATH export: install.sh drops claude into
+    # ~/.local/bin, which a non-interactive `su -c` won't have on PATH for the
+    # version probes (the build-time PATH export lives in ~/.bashrc, not the
+    # login profile). Export it inline so before/after checks resolve.
+    def _claude_out(cmd: str) -> str:
+        r = run(["docker", "exec", supervisor, "su", "-", "research", "-c",
+                 f'export PATH="$HOME/.local/bin:$PATH"; {cmd}'],
+                capture_output=True)
+        return r.stdout.strip()
+
+    before = _claude_out("claude --version 2>/dev/null") or "(none)"
+    print(f"current: {before}")
+    print("installing latest Claude Code in the supervisor (needs egress)…")
+    r = run(["docker", "exec", supervisor, "su", "-", "research", "-c",
+             'export PATH="$HOME/.local/bin:$PATH"; '
+             'curl -fsSL https://claude.ai/install.sh | bash'],
+            capture_output=False)
+    if r.returncode != 0:
+        die("claude installer failed inside the supervisor (check the "
+            "project's egress — locked mode still allows 443)")
+    after = _claude_out("claude --version 2>/dev/null") or "(unknown)"
+    print(f"updated: {after}")
+    if before == after:
+        print("(already on the latest stable)")
+    print("note: this refreshes the supervisor's interactive session only; "
+          "open a fresh claude tab to pick it up. Inner workers / role-MCPs / "
+          "PI containers still run the image-baked version.")
+
+
 # ---------------------------------------------------------------------------
 # Sandbox external-folder mounts (BYO sandboxes only — baked roles have none)
 # ---------------------------------------------------------------------------
@@ -4865,6 +4916,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "disable a sandbox container (workspace "
                         "preserved).")
     u.set_defaults(func=cmd_project_update)
+
+    uc = proj_sub.add_parser(
+        "update-claude",
+        help="refresh the supervisor's Claude Code CLI in place (no image "
+             "rebuild) so the interactive session's model list isn't frozen "
+             "at image-build time")
+    uc.add_argument("name")
+    uc.set_defaults(func=cmd_project_update_claude)
 
     sh = proj_sub.add_parser("ssh", help="print SSH connection info")
     sh.add_argument("name")
