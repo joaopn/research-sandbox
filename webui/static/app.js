@@ -238,6 +238,7 @@ function el(tag, attrs = {}, children = []) {
 }
 
 function clearBody() {
+    closeProjectConfigBox();
     document.body.innerHTML = "";
 }
 
@@ -567,6 +568,11 @@ function installRailOutsideClickHandlers() {
             if (!node || !node.classList) continue;
             // Click inside the rail itself — let inner handlers run.
             if (node.classList.contains("project-rail")) return;
+            // The config box is a body child (floats outside the rail) but
+            // is logically part of it — interacting with it must not
+            // collapse the rail. Same for the gear that opens it.
+            if (node.classList.contains("project-config-box")) return;
+            if (node.classList.contains("project-config-btn")) return;
             // Click on the Projects tab — its own onclick toggles the
             // rail. Letting our outside handler also fire here would
             // double-toggle (tab opens, then we close).
@@ -640,9 +646,21 @@ function makeProjectRow(project) {
         }
     };
     const head = el("div", { class: "project-head" }, [dot, name, closeX]);
-    // Sub-lines start empty; populated by fetchProjectsStatus. CSS hides
-    // empty children so rows stay compact until data lands.
-    const statusLine = el("div", { class: "project-status-line" });
+    // Second line: disk/worker figures in a text span (populated by
+    // fetchProjectsStatus) plus the always-present config gear sitting
+    // next to them. The gear opens the per-project floating config box.
+    // The text span starts empty; the gear keeps the line non-empty so it
+    // shows from row construction (config is reachable before status lands).
+    const statusText = el("span", { class: "status-text" });
+    const configBtn = el("span", {
+        class: "project-config-btn",
+        title: "Project settings",
+    }, ["⚙"]);
+    configBtn.onclick = (ev) => {
+        ev.stopPropagation();
+        openProjectConfigBox(project, configBtn);
+    };
+    const statusLine = el("div", { class: "project-status-line" }, [statusText, configBtn]);
     const statusMeta = el("div", { class: "project-status-meta" });
     const row = el("div", {
         class: "project",
@@ -708,7 +726,9 @@ async function fetchProjectsStatus() {
 function applyProjectStatus(name, status) {
     const row = document.querySelector(`.project[data-name="${CSS.escape(name)}"]`);
     if (!row) return;
-    const line1 = row.querySelector(".project-status-line");
+    // Write the disk/worker figures into the text span only — the sibling
+    // config gear in .project-status-line must survive every poll.
+    const line1 = row.querySelector(".project-status-line .status-text");
     const line2 = row.querySelector(".project-status-meta");
     if (!line1 || !line2) return;
     if (status.error === "not_found") {
@@ -1198,8 +1218,11 @@ async function activateProject(name) {
     const project = state.vault.projects.find((p) => p.name === name);
     const desiredPin = project?.pinned_service || null;
     // Drop the pin if its service is no longer enabled — e.g. operator
-    // disabled it between sessions. Cheaper than a vault migration.
-    state.pinnedService = desiredPin && enabled[desiredPin] ? desiredPin : null;
+    // disabled it between sessions — or if the user has hidden that tab.
+    // Cheaper than a vault migration.
+    const hiddenSet = new Set(project?.hidden_services || []);
+    state.pinnedService = desiredPin && enabled[desiredPin] && !hiddenSet.has(desiredPin)
+        ? desiredPin : null;
     const ratio = project?.split_ratio;
     state.splitRatio = typeof ratio === "number" ? ratio : SPLIT_RATIO_DEFAULT;
 
@@ -1209,17 +1232,17 @@ async function activateProject(name) {
     // Pick a default service: keep the previous one if it's still in the
     // enabled set and not pinned, else first always-on (xterm), else first
     // non-pinned entry.
-    const ids = Object.keys(enabled);
-    if (ids.length === 0) {
+    const visible = visibleServiceIds(name, enabled);
+    if (visible.length === 0) {
         state.activeService = null;
         showWelcome();
         return;
     }
     let next = state.activeService;
-    if (!enabled[next] || next === state.pinnedService) {
-        next = ids.find((id) => id !== state.pinnedService && enabled[id].always_on)
-            || ids.find((id) => id !== state.pinnedService)
-            || ids[0];
+    if (!enabled[next] || !visible.includes(next) || next === state.pinnedService) {
+        next = visible.find((id) => id !== state.pinnedService && enabled[id].always_on)
+            || visible.find((id) => id !== state.pinnedService)
+            || visible[0];
     }
     activateService(next);
 
@@ -1228,6 +1251,151 @@ async function activateProject(name) {
     if (state.pinnedService && state.pinnedService !== next) {
         const pinnedKey = tkey(name, state.pinnedService);
         if (!state.terminals[pinnedKey]) activateService(state.pinnedService);
+    }
+}
+
+// ---- per-project config box (tab visibility, future settings) --------------
+
+// `hidden_services` on the vault project entry lists service ids the user
+// hid via the config box. Visibility is a pure client-side filter — the
+// services stay enabled on the supervisor. We intersect against the live
+// enabled set (so stale ids from a since-disabled service are harmless) and
+// enforce a floor of one: a project never presents an empty tab strip.
+function visibleServiceIds(projectName, enabled) {
+    const ids = Object.keys(enabled);
+    const project = state.vault.projects.find((p) => p.name === projectName);
+    const hidden = new Set((project && project.hidden_services) || []);
+    const visible = ids.filter((id) => !hidden.has(id));
+    return visible.length > 0 ? visible : ids;
+}
+
+let projectConfigBox = null;
+
+function closeProjectConfigBox() {
+    if (!projectConfigBox) return;
+    projectConfigBox.remove();
+    projectConfigBox = null;
+    document.removeEventListener("pointerdown", onConfigOutsidePointer, true);
+}
+
+// Capture-phase outside-click dismiss. Excludes the box itself and any
+// config gear (the gear's own click toggles the box; letting this close it
+// first would make the gear a no-op while one is open).
+function onConfigOutsidePointer(ev) {
+    if (!projectConfigBox) return;
+    const path = ev.composedPath ? ev.composedPath() : [];
+    for (const node of path) {
+        if (node === projectConfigBox) return;
+        if (node && node.classList && node.classList.contains("project-config-btn")) return;
+    }
+    closeProjectConfigBox();
+}
+
+function openProjectConfigBox(project, anchorEl) {
+    // Toggle: a second click on the same row's gear closes the box; a click
+    // on a different row's gear swaps to that project's box.
+    const wasForThis = projectConfigBox && projectConfigBox.dataset.project === project.name;
+    closeProjectConfigBox();
+    if (wasForThis) return;
+
+    const box = makeProjectConfigBox(project);
+    box.dataset.project = project.name;
+    document.body.appendChild(box);
+    projectConfigBox = box;
+
+    // position: fixed, anchored under the gear, clamped to the viewport. The
+    // rail can shrink to RAIL_WIDTH_MIN, so the box overlays outside the
+    // rail rather than trying to fit inside it.
+    const r = anchorEl.getBoundingClientRect();
+    const bw = box.offsetWidth;
+    const bh = box.offsetHeight;
+    let left = r.left;
+    let top = r.bottom + 4;
+    if (left + bw > window.innerWidth - 8) left = window.innerWidth - 8 - bw;
+    if (left < 8) left = 8;
+    if (top + bh > window.innerHeight - 8) top = Math.max(8, r.top - 4 - bh);
+    box.style.left = `${Math.round(left)}px`;
+    box.style.top = `${Math.round(top)}px`;
+
+    document.addEventListener("pointerdown", onConfigOutsidePointer, true);
+}
+
+function makeProjectConfigBox(project) {
+    const box = el("div", { class: "project-config-box" });
+    box.appendChild(el("div", { class: "config-title" }, [project.name]));
+
+    const section = el("div", { class: "config-section" });
+    section.appendChild(el("div", { class: "config-section-label" }, ["Tabs"]));
+
+    const enabled = state.projectServices[project.name];
+    if (!enabled || Object.keys(enabled).length === 0) {
+        section.appendChild(el("div", { class: "config-empty" }, [
+            "No tabs yet — open this project once to load its services.",
+        ]));
+        box.appendChild(section);
+        return box;
+    }
+
+    const hidden = new Set(project.hidden_services || []);
+    const rows = [];
+    // Floor: when only one tab is left visible, disable that checkbox so it
+    // can't be unchecked. The others stay enabled so the user can re-show
+    // tabs. A disabled checkbox can't fire change, so the floor is enforced
+    // by construction rather than by reverting after the fact.
+    const refreshFloor = () => {
+        const checked = rows.filter((r) => r.cb.checked).length;
+        for (const r of rows) {
+            r.cb.disabled = checked <= 1 && r.cb.checked;
+            r.label.classList.toggle("floor", r.cb.disabled);
+        }
+    };
+
+    for (const id of Object.keys(enabled)) {
+        const svc = enabled[id];
+        const cb = el("input", { type: "checkbox" });
+        cb.checked = !hidden.has(id);
+        const label = el("label", { class: "config-check" }, [
+            cb, el("span", {}, [svc.label || id]),
+        ]);
+        cb.onchange = async () => {
+            await setServiceHidden(project, id, !cb.checked);
+            refreshFloor();
+        };
+        rows.push({ cb, label });
+        section.appendChild(label);
+    }
+    refreshFloor();
+
+    box.appendChild(section);
+    box.appendChild(el("div", { class: "config-hint" }, [
+        "Hidden tabs stay enabled on the supervisor — this only controls what shows here.",
+    ]));
+    return box;
+}
+
+async function setServiceHidden(project, serviceId, hide) {
+    const hidden = new Set(project.hidden_services || []);
+    if (hide) hidden.add(serviceId);
+    else hidden.delete(serviceId);
+    if (hidden.size > 0) project.hidden_services = Array.from(hidden);
+    else delete project.hidden_services;
+
+    // Hiding the pinned service unpins it — a tab the user just hid
+    // shouldn't keep claiming the side pane.
+    if (hide && state.activeProject === project.name && state.pinnedService === serviceId) {
+        state.pinnedService = null;
+        delete project.pinned_service;
+        applySplitLayout();
+    }
+    await persistVault();
+
+    if (state.activeProject !== project.name) return;
+    const enabled = state.projectServices[project.name] || {};
+    renderServiceTabs(project.name, enabled);
+    // If the active service was just hidden, fall back to a visible one.
+    const visible = visibleServiceIds(project.name, enabled);
+    if (!visible.includes(state.activeService) && visible.length > 0) {
+        activateService(visible[0]);
     }
 }
 
@@ -1240,7 +1408,7 @@ function renderServiceTabs(projectName, enabled) {
     // glance which project the visible service tabs belong to. Same
     // font-size as the rail rows, weighted bold.
     strip.appendChild(el("div", { class: "active-project" }, [projectName]));
-    const ids = Object.keys(enabled);
+    const ids = visibleServiceIds(projectName, enabled);
     if (ids.length === 0) {
         strip.appendChild(el("div", { class: "empty" }, [
             "No services enabled for this project.",

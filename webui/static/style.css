@@ -251,6 +251,78 @@ body {
 .project-rail .project .project-status-line:empty,
 .project-rail .project .project-status-meta:empty { display: none; }
 
+/* Status line carries the disk/worker figures (text span) plus the
+   always-present config gear at its right. Flex so the figures ellipsize
+   and the gear stays pinned. The line is never :empty (the gear keeps it
+   shown), so config is reachable before any status lands. */
+.project-rail .project .project-status-line {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.project-rail .project .project-status-line .status-text {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.project-rail .project .project-config-btn {
+    flex-shrink: 0;
+    color: var(--fg-faint);
+    cursor: pointer;
+    font-size: 12px;
+    line-height: 1;
+    padding: 0 2px;
+}
+.project-rail .project .project-config-btn:hover { color: var(--fg-accent); }
+
+/* Per-project floating config box — position: fixed in JS so it overlays
+   outside the (possibly narrow) rail rather than being clipped by it.
+   Hosts the Tabs visibility checkboxes now; structured for more sections
+   later. */
+.project-config-box {
+    position: fixed;
+    z-index: 200;
+    min-width: 200px;
+    max-width: 280px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+    padding: 10px 12px;
+    font-size: 13px;
+    color: var(--fg-base);
+}
+.project-config-box .config-title {
+    font-weight: 600;
+    margin-bottom: 8px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.project-config-box .config-section-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--fg-muted);
+    margin-bottom: 6px;
+}
+.project-config-box .config-check {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 2px;
+    cursor: pointer;
+}
+.project-config-box .config-check input { cursor: pointer; }
+.project-config-box .config-check.floor { opacity: 0.6; cursor: default; }
+.project-config-box .config-empty { color: var(--fg-faint); font-size: 12px; }
+.project-config-box .config-hint {
+    margin-top: 8px;
+    color: var(--fg-faint);
+    font-size: 11px;
+    line-height: 1.3;
+}
+
 .project-rail .project.up .status-dot { background: var(--status-up); }
 .project-rail .project.down .status-dot { background: var(--status-down); }
 .project-rail .project.error .status-dot { background: var(--status-error); }
