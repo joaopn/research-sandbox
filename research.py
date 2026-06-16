@@ -50,6 +50,7 @@ import mcp_registry  # noqa: E402
 import pi_isolated_registry  # noqa: E402  (BYO sandbox type registry; sub-component of sandbox)
 import role_mcp  # noqa: E402
 import sandbox  # noqa: E402  (unified PI-driven container surface; absorbs former pi + pi_isolated)
+import broker  # noqa: E402  (host-side lifecycle-verb daemon over a unix socket; opt-in)
 
 # --- lifecycle core ---------------------------------------------------------
 # rscore holds the validated request objects + the lifecycle verbs (one
@@ -150,6 +151,22 @@ def cmd_stop(_: argparse.Namespace) -> None:
     run_check(["docker", "compose", "-f", str(SCRIPT_DIR / "docker-compose.yml"),
                "stop", "router"])
     print("stopped.")
+
+
+def cmd_broker_serve(_: argparse.Namespace) -> None:
+    broker.serve()
+
+
+def cmd_broker_start(_: argparse.Namespace) -> None:
+    broker.start()
+
+
+def cmd_broker_stop(_: argparse.Namespace) -> None:
+    broker.stop()
+
+
+def cmd_broker_status(_: argparse.Namespace) -> None:
+    broker.status()
 
 
 def _build(reqcls, **kw):
@@ -1650,6 +1667,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("stop", help="stop shared infra (router)")
     sp.set_defaults(func=cmd_stop)
+
+    brk = sub.add_parser(
+        "broker",
+        help="host-side lifecycle-verb daemon (opt-in; closed verb vocabulary "
+             "over a unix socket, no docker passthrough)")
+    brk_sub = brk.add_subparsers(dest="subcommand", required=True)
+    brk_sub.add_parser(
+        "start", help="start the broker daemon (detached)").set_defaults(
+        func=cmd_broker_start)
+    brk_sub.add_parser(
+        "stop", help="stop the broker daemon").set_defaults(func=cmd_broker_stop)
+    brk_sub.add_parser(
+        "status", help="report whether the broker is running").set_defaults(
+        func=cmd_broker_status)
+    brk_sub.add_parser(
+        "serve", help="run the broker loop in the foreground (what `start` "
+                      "spawns; for debugging)").set_defaults(func=cmd_broker_serve)
 
     img = sub.add_parser("images", help="image version pins (manifest + freshness)")
     img_sub = img.add_subparsers(dest="subcommand", required=True)
