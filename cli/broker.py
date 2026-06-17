@@ -8,16 +8,20 @@ Runs as the user, with the user's existing docker access. Opt-in
 Wire protocol — length-prefixed JSON over a unix socket (no HTTP, no network
 listener). One request per connection:
 
-    →  [4-byte big-endian length] [UTF-8 JSON: {"verb": <str>, "args": {…}}]
+    →  [4-byte big-endian length] [UTF-8 JSON: {"verb": <str>, "args": {…}, "token"?: <str>}]
     ←  [4-byte big-endian length] [UTF-8 JSON reply]
         success:  {"ok": true,  "result": <verb result>}
         failure:  {"ok": false, "error": {"kind": <str>, "message": <str>}}
 
+  `token` is optional and backward-compatible: read verbs (`list`/`status`)
+  omit it; write verbs require it; `login` returns a fresh one.
+
 Containment, by construction:
   * **Closed verb allowlist** (`VERBS`) — a request can only name a verb in
-    this dict; never a docker passthrough. This skeleton serves read-only
-    `list` / `status` only. Write verbs are a deliberate future edit here,
-    behind a login gate (not in this step).
+    this dict; never a docker passthrough. **Deny-by-default gating**: a verb
+    in `VERBS` but not in the `OPEN_VERBS` read allowlist requires a valid
+    session token, so a newly-added verb is gated automatically. `login`
+    (auth, no docker capability) lives outside `VERBS` on a distinct path.
   * **Filesystem-gated** — the socket lives 0600 in the user's own tree; the
     server additionally verifies the peer's uid via SO_PEERCRED (defence in
     depth atop the file perms).
@@ -51,6 +55,7 @@ from pathlib import Path
 # broker lives in cli/; make sibling modules importable when run directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rscore  # noqa: E402
+import broker_auth  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -100,29 +105,97 @@ def _verb_status(args: dict) -> dict:
     return dataclasses.asdict(rscore.status(req))    # may die() → SystemExit
 
 
-# The allowlist. Read-only this step. Adding a write verb is a deliberate edit
-# here (behind a login gate, a later step) — never an accident, never a
-# passthrough.
+def _verb_stop(args: dict) -> list[dict]:
+    req = rscore.StartStopRequest.from_kwargs(**args)  # may raise ValidationError
+    return [dataclasses.asdict(r) for r in rscore.stop(req)]  # may die() → SystemExit
+
+
+def _verb_start(args: dict) -> list[dict]:
+    req = rscore.StartStopRequest.from_kwargs(**args)  # may raise ValidationError
+    return [dataclasses.asdict(r) for r in rscore.start(req)]  # may die() → SystemExit
+
+
+# The closed lifecycle vocabulary — the host-root boundary. Adding a verb here
+# is a deliberate, security-reviewed edit; never a docker passthrough.
 VERBS = {
     "list": _verb_list,
     "status": _verb_status,
+    "stop": _verb_stop,
+    "start": _verb_start,
 }
+
+# Deny-by-default gating: a verb in VERBS but NOT in this read allowlist
+# requires a valid session token. Inverting the set (vs an explicit *gated*
+# set) means any verb added to VERBS is gated automatically unless someone
+# *explicitly* opens it — the safe direction for a host-root-equivalent
+# surface. `list`/`status` expose no SSH password, so they stay open (a
+# same-uid peer already reads them via the CLI).
+OPEN_VERBS = frozenset({"list", "status"})
+
+# Auth verbs live OUTSIDE VERBS — they grant no docker capability, so they are
+# handled on a distinct path in dispatch and never reach rscore.
+AUTH_VERBS = frozenset({"login"})
 
 
 def _err(kind: str, message: str) -> dict:
     return {"ok": False, "error": {"kind": kind, "message": message}}
 
 
-def dispatch(verb, args, verbs: dict | None = None) -> dict:
+def _auth_login(args: dict, tokens) -> dict:
+    """Verify the operator password and issue a session token. Never calls
+    rscore / docker. Absent/wrong password (or no password set, which fails
+    closed) → kind 'auth'."""
+    password = args.get("password")
+    if not isinstance(password, str) or not broker_auth.verify_password(password):
+        return _err("auth", "invalid credentials")
+    token, expires_at = tokens.issue(broker_auth.DEFAULT_PRINCIPAL)
+    return {"ok": True, "result": {
+        "token": token, "expires_at": expires_at,
+        "principal": broker_auth.DEFAULT_PRINCIPAL}}
+
+
+def dispatch(verb, args, token=None, tokens=None, *,
+             verbs: dict | None = None, audit=None) -> dict:
     """Resolve and run one verb, mapping every failure mode to a reply dict.
-    Pure (no socket) so it is unit-testable on its own."""
+    Pure by default (no socket; no file I/O unless an `audit` sink is passed)
+    so it is unit-testable on its own.
+
+    `tokens` is the daemon's TokenStore (needed for `login` + gated verbs).
+    `audit`, if given, is called audit(principal, verb, outcome) for auth +
+    write events; left None in tests to keep dispatch side-effect-free.
+    """
+    def _audited(principal, outcome, reply):
+        if audit is not None:
+            audit(principal, verb, outcome)
+        return reply
+
     table = VERBS if verbs is None else verbs
+
+    # Auth path — distinct from the lifecycle vocabulary, no docker capability.
+    if verb in AUTH_VERBS:
+        if not isinstance(args, dict):
+            return _err("bad_request", "args must be a JSON object")
+        reply = _auth_login(args, tokens)
+        if reply.get("ok"):
+            return _audited(reply["result"]["principal"], "ok", reply)
+        return _audited(None, "auth_fail", reply)
+
     fn = table.get(verb)
     if fn is None:
         return _err("unknown_verb",
                     f"unknown verb {verb!r}; allowed: {sorted(table)}")
     if not isinstance(args, dict):
         return _err("bad_request", "args must be a JSON object")
+
+    # Deny-by-default: anything not explicitly open needs a valid token.
+    principal = None
+    if verb not in OPEN_VERBS:
+        principal = tokens.principal_for(token) if tokens is not None else None
+        if principal is None:
+            return _audited(None, "unauthorized",
+                            _err("unauthorized",
+                                 "a valid session token is required; call login"))
+
     # A verb that calls die() raises SystemExit after printing to stderr; capture
     # that text so the failure message reaches the caller instead of the daemon
     # log. Serial request handling makes the global stderr swap race-free.
@@ -130,13 +203,18 @@ def dispatch(verb, args, verbs: dict | None = None) -> dict:
     try:
         with contextlib.redirect_stderr(buf):
             result = fn(args)
-        return {"ok": True, "result": result}
+        reply, outcome = {"ok": True, "result": result}, "ok"
     except rscore.ValidationError as e:
-        return _err("validation", str(e))
+        reply, outcome = _err("validation", str(e)), "validation"
     except SystemExit:
         msg = buf.getvalue().strip() or "operation failed"
         # die() prints "error: <msg>"; trim the prefix for a clean envelope.
-        return _err("failed", msg.split("error: ", 1)[-1])
+        reply, outcome = _err("failed", msg.split("error: ", 1)[-1]), "failed"
+
+    # Audit write verbs only (reads stay open + low-value/noisy).
+    if verb not in OPEN_VERBS:
+        return _audited(principal, outcome, reply)
+    return reply
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +261,9 @@ class _Handler(socketserver.StreamRequestHandler):
         if not isinstance(msg, dict):
             self._send(_err("bad_request", "request must be a JSON object"))
             return
-        self._send(dispatch(msg.get("verb"), msg.get("args") or {}))
+        self._send(dispatch(msg.get("verb"), msg.get("args") or {},
+                            msg.get("token"), self.server.tokens,
+                            audit=broker_auth.audit_event))
 
     def _send(self, reply: dict) -> None:
         data = json.dumps(reply).encode()
@@ -209,6 +289,9 @@ def serve() -> None:
     with contextlib.suppress(OSError):
         BROKER_DIR.chmod(0o700)
     server = _Server(str(BROKER_SOCKET), _Handler)
+    # In-daemon session-token store: issued on login, never persisted, flushed
+    # by construction on restart. The handler reaches it via self.server.tokens.
+    server.tokens = broker_auth.TokenStore()
 
     def _stop(_signum, _frame):
         # shutdown() must run off the serve_forever() thread to avoid deadlock.
@@ -244,13 +327,18 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 
 
 def client_call(verb: str, args: dict | None = None, *,
+                token: str | None = None,
                 socket_path=None, timeout: float = CLIENT_TIMEOUT_S) -> dict:
-    """Send one framed request and return the parsed reply dict."""
+    """Send one framed request and return the parsed reply dict. `token` is
+    attached only when given (read verbs omit it; write verbs need it)."""
     path = str(socket_path or BROKER_SOCKET)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
         s.settimeout(timeout)
         s.connect(path)
-        req = json.dumps({"verb": verb, "args": args or {}}).encode()
+        payload = {"verb": verb, "args": args or {}}
+        if token is not None:
+            payload["token"] = token
+        req = json.dumps(payload).encode()
         s.sendall(_LEN.pack(len(req)) + req)
         hdr = _recv_exact(s, _LEN_SIZE)
         (length,) = _LEN.unpack(hdr)
@@ -341,3 +429,29 @@ def status() -> None:
         print(f"  socket: {BROKER_SOCKET}{missing}")
     else:
         print("broker not running")
+
+
+def passwd() -> None:
+    """Set/replace the single operator secret (interactive, double-entry).
+    Hashing + storage live in broker_auth; this is the thin terminal wrapper."""
+    import getpass
+    try:
+        pw = getpass.getpass("New broker password: ")
+        pw2 = getpass.getpass("Confirm: ")
+    except (EOFError, KeyboardInterrupt):
+        print("\naborted")
+        return
+    if not pw:
+        print("aborted: empty password")
+        return
+    if pw != pw2:
+        print("aborted: passwords do not match")
+        return
+    broker_auth.set_password(pw)
+    print(f"broker password set ({broker_auth.PASSWD_FILE})")
+    # Tokens live only in the running daemon's memory and are not bound to the
+    # password — rotating the secret does NOT drop sessions already issued.
+    if _running():
+        print("note: the broker is running — existing session tokens stay valid "
+              "until they expire or the broker is restarted. To revoke live "
+              "sessions now: research broker stop && research broker start")

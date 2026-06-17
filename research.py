@@ -169,6 +169,10 @@ def cmd_broker_status(_: argparse.Namespace) -> None:
     broker.status()
 
 
+def cmd_broker_passwd(_: argparse.Namespace) -> None:
+    broker.passwd()
+
+
 def _build(reqcls, **kw):
     """Build a validated rscore request from CLI args, mapping the
     input-validation channel (ValidationError) to the terminal's die()."""
@@ -1681,6 +1685,9 @@ def build_parser() -> argparse.ArgumentParser:
     brk_sub.add_parser(
         "status", help="report whether the broker is running").set_defaults(
         func=cmd_broker_status)
+    brk_sub.add_parser(
+        "passwd", help="set/replace the operator login secret (interactive)"
+        ).set_defaults(func=cmd_broker_passwd)
     brk_sub.add_parser(
         "serve", help="run the broker loop in the foreground (what `start` "
                       "spawns; for debugging)").set_defaults(func=cmd_broker_serve)
