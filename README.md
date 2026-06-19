@@ -47,6 +47,7 @@ python research.py project destroy myproj
 [◾ What you get on disk](#-what-you-get-on-disk)
 [◾ MCP servers](#-mcp-servers)
 [◾ Agents & registries](#-agents--registries)
+[◾ Browser UI](#-browser-ui)
 [◾ CLI Reference](#-cli-reference)
 [◾ File Structure](#-file-structure)
 [◾ Roadmap](#-roadmap)
@@ -276,6 +277,44 @@ python research.py project sandbox enable myproj wiki
 
 ---
 
+## ◾ Browser UI
+
+Everything above is the host CLI. There's also an optional **browser UI** — a single-page app served over HTTPS that gives you in-browser terminals to your supervisors plus a **Management** panel that drives the whole project lifecycle (create / attach / update / destroy) without dropping to a shell. Handy for running the lab from a tablet, a remote machine over Tailscale, or a single window.
+
+Two pieces cooperate:
+
+- **The webui** (`research webui start`) — the browser-facing container. It holds **no docker socket**, so a webui compromise can't touch the host; it reaches supervisors only over per-project SSH.
+- **The broker** (`research broker start`) — an opt-in host daemon that exposes a *closed set of lifecycle verbs* over a local unix socket. It's the only component with docker access; the webui can *ask* it to create/destroy/etc. but never run arbitrary docker. Off by default — with the broker stopped the webui is a read-only terminal surface and the CLI is unchanged.
+
+#### Bring it up (single operator)
+
+```bash
+# 1. Shared infra (if not already up)
+python research.py start
+
+# 2. Set the management password (once) and start the broker
+python research.py broker passwd
+python research.py broker start
+
+# 3. Start the browser UI — HTTPS on 127.0.0.1:7777 by default
+python research.py webui start
+#   --bind 0.0.0.0 to expose on your LAN / Tailscale; --port to change the port
+```
+
+Open **https://localhost:7777** and accept the self-signed certificate (or run `python research.py webui cert-tailscale` for a real cert over your tailnet). The webui and broker run as **you** — same uid — which is the contract that lets the webui reach the broker's socket.
+
+#### Use it
+
+1. **First load:** create a *vault password*. It encrypts the SPA's project bookmarks **in your browser** — never sent to the server. (Separate from the management password by design.)
+2. **Open the ⚙ Management panel** and log in with the *management password* you set via `broker passwd`. You now see the host's live project list.
+3. **+ New project** → name, type (research/sandbox), egress, and any agents to enable → **Create** (~10–30s while it stages container images).
+4. **Per-row actions:** **Attach** opens a browser terminal into the supervisor (its SSH credential is fetched just-in-time from the broker, never stored); **Update** pushes the latest workspace templates; **Destroy** requires typing the project name *and* re-entering the management password.
+
+> [!NOTE]
+> This is the single-operator setup: one shared management password, and `destroy` gated by type-the-name + password re-entry — proportionate for a localhost / private-tailnet box. Multi-user accounts with per-user project ownership, recoverable soft-delete, and a synced cross-browser vault are planned follow-ups. Signing in to **Claude** is still per-project (interactive `/login` inside the supervisor, as in the Quick Start); it's the project *lifecycle* that's now fully browser-driven.
+
+---
+
 <details>
 <summary><h2>◾ CLI Reference</h2></summary>
 
@@ -298,6 +337,13 @@ Project lifecycle:
                                      Push code/flags into a running project (recreates supervisor)
   project destroy <name>             Remove container + workspace + network + creds
   project ssh <name>                 Print SSH connection string
+
+Browser UI + broker (optional — webui-driven lifecycle):
+  webui start [--bind IP] [--port N] [--rebuild]   Start the HTTPS browser UI
+  webui stop|status                  Remove / inspect the webui container
+  webui import [<project>]           Print the SPA add-project import string
+  broker passwd                      Set the single operator (management) password
+  broker start|stop|status           Run the host-side lifecycle-verb daemon
 
 mcp registry — external tools (reached through the per-project proxy):
   mcp add <name> --kind {external,shared} [opts]   Register an MCP

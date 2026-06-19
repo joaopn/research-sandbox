@@ -790,10 +790,14 @@ function renderMgmtTable(view, projects) {
     }
     const rows = [el("div", { class: "mgmt-row mgmt-row-head" }, [
         el("span", {}, ["Project"]), el("span", {}, ["State"]),
-        el("span", {}, ["SSH"]), el("span", {}, ["Actions"]),
+        el("span", {}, ["SSH"]), el("span", {}, ["Size"]), el("span", {}, ["Actions"]),
     ])];
+    const fill = {};   // project name → {badge, size} elements to populate async
     for (const p of projects) {
         const running = p.state === "running";
+        const badge = el("span", { class: "type-badge" });          // filled by mgmtFillStatus
+        const sizeEl = el("span", { class: "mgmt-size" }, ["…"]);
+        fill[p.project] = { badge, size: sizeEl };
         const power = el("button", { class: "btn-small" }, [running ? "Stop" : "Start"]);
         power.onclick = () => mgmtAction(view, p.project, running ? "stop" : "start", power);
         // Attach + Update need a live supervisor (bridge endpoint / recreate);
@@ -810,13 +814,49 @@ function renderMgmtTable(view, projects) {
         destroy.onclick = () => mgmtDestroyDialog(view, p.project);
         actions.push(destroy);
         rows.push(el("div", { class: "mgmt-row" }, [
-            el("span", { class: "mgmt-name" }, [p.project]),
+            el("span", { class: "mgmt-name" }, [el("span", { class: "mgmt-name-text" }, [p.project]), badge]),
             el("span", { class: running ? "state-running" : "state-stopped" }, [p.state]),
             el("span", { class: "mgmt-ssh" }, [p.ssh || "—"]),
+            sizeEl,
             el("span", { class: "mgmt-actions" }, actions),
         ]));
     }
     view.appendChild(el("div", { class: "mgmt-table" }, rows));
+    mgmtFillStatus(fill);
+}
+
+// The broker `list` carries name/state/ssh; the project flavour + disk size come
+// off the same /projects/status data plane the rail uses (read from the
+// /projects:ro mount, joined here by name).
+async function mgmtFillStatus(fill) {
+    const names = Object.keys(fill);
+    if (names.length === 0) return;
+    let data;
+    try {
+        const res = await fetch(`/projects/status?names=${encodeURIComponent(names.join(","))}`);
+        if (!res.ok) return;
+        data = await res.json();
+    } catch (e) { return; }
+    for (const [name, st] of Object.entries(data)) {
+        const ref = fill[name];
+        if (!ref) continue;
+        if (st && st.error === "not_found") {
+            ref.size.textContent = "—";
+            setTypeBadge(ref.badge, null);
+            continue;
+        }
+        ref.size.textContent = formatBytes((st && st.disk_bytes) || 0);
+        setTypeBadge(ref.badge, st && st.flavor);
+    }
+}
+
+// Paint a project-type badge: normal text + a type-coloured border, or empty
+// (collapsed) when the flavour is unknown.
+function setTypeBadge(elm, flavor) {
+    const cls = flavor === "sandbox" ? " type-sandbox"
+        : flavor === "research" ? " type-research" : "";
+    elm.className = "type-badge" + cls;
+    elm.textContent = flavor || "";
 }
 
 async function mgmtAction(view, name, action, btn) {
@@ -1073,11 +1113,13 @@ function makeProjectRow(project) {
         }
     };
     const head = el("div", { class: "project-head" }, [dot, name, closeX]);
-    // Second line: disk/worker figures in a text span (populated by
-    // fetchProjectsStatus) plus the always-present config gear sitting
-    // next to them. The gear opens the per-project floating config box.
-    // The text span starts empty; the gear keeps the line non-empty so it
-    // shows from row construction (config is reachable before status lands).
+    // Second line: a project-type badge (research/sandbox, filled by
+    // fetchProjectsStatus) + the worker-activity figures, plus the always-
+    // present config gear. The gear opens the per-project floating config box.
+    // The badge starts empty (collapsed) until the flavour lands; the gear
+    // keeps the line non-empty so it shows from row construction. Disk size
+    // lives in the broker Management table now, not here.
+    const typeBadge = el("span", { class: "type-badge" });
     const statusText = el("span", { class: "status-text" });
     const configBtn = el("span", {
         class: "project-config-btn",
@@ -1087,7 +1129,7 @@ function makeProjectRow(project) {
         ev.stopPropagation();
         openProjectConfigBox(project, configBtn);
     };
-    const statusLine = el("div", { class: "project-status-line" }, [statusText, configBtn]);
+    const statusLine = el("div", { class: "project-status-line" }, [typeBadge, statusText, configBtn]);
     const statusMeta = el("div", { class: "project-status-meta" });
     const row = el("div", {
         class: "project",
@@ -1157,13 +1199,16 @@ function applyProjectStatus(name, status) {
     // config gear in .project-status-line must survive every poll.
     const line1 = row.querySelector(".project-status-line .status-text");
     const line2 = row.querySelector(".project-status-meta");
+    const badge = row.querySelector(".project-status-line .type-badge");
     if (!line1 || !line2) return;
     if (status.error === "not_found") {
         line1.textContent = "";
         line2.textContent = "missing on disk";
         line2.removeAttribute("title");
+        if (badge) setTypeBadge(badge, null);
         return;
     }
+    if (badge) setTypeBadge(badge, status.flavor);
     line1.textContent = formatStatusLine1(status);
     line2.textContent = formatStatusLine2(status);
     if (status.latest && status.latest.path) {
@@ -1178,12 +1223,11 @@ function applyProjectStatus(name, status) {
 // nothing about success vs failure — the worker entrypoint touches
 // DONE on every exit path).
 function formatStatusLine1(s) {
+    // Worker-activity figures only — disk size moved to the Management table.
     const parts = [];
     if ((s.workers_running || 0) > 0) parts.push(`▶️ ${s.workers_running}`);
     if ((s.workers_done || 0) > 0) parts.push(`⏹ ${s.workers_done}`);
-    const workers = parts.join("  ");
-    const disk = formatBytes(s.disk_bytes || 0);
-    return workers ? `${workers}  │  ${disk}` : disk;
+    return parts.join("  ");
 }
 
 function formatStatusLine2(s) {

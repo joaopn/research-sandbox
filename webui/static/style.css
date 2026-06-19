@@ -22,6 +22,15 @@
     --status-error: #e66;
     --terminal-bg: #000;
     --terminal-fg: #e0e0e0;
+    /* project-type badge borders: dark green = research, cyan = sandbox
+       (the text stays a normal fg colour; only the border carries the type) */
+    --type-research-border: #2e7d32;
+    --type-sandbox-border: #17a2b8;
+    /* management-table actions column: fixed so every per-row grid resolves the
+       same column tracks (header + rows align regardless of how many action
+       buttons a row shows). Sized to fit the 4-button running row
+       (Stop · Attach · Update · Destroy). */
+    --mgmt-actions-w: 300px;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -688,7 +697,7 @@ body {
 .mgmt-table { display: flex; flex-direction: column; gap: 1px; }
 .mgmt-row {
     display: grid;
-    grid-template-columns: 2fr 1fr 1.5fr auto;
+    grid-template-columns: minmax(0, 2.2fr) 84px minmax(0, 1.4fr) 84px var(--mgmt-actions-w);
     align-items: center;
     gap: 12px;
     padding: 8px 10px;
@@ -702,11 +711,35 @@ body {
     text-transform: uppercase;
     letter-spacing: 0.04em;
 }
-.mgmt-name { font-weight: 600; color: var(--fg-base); }
-.mgmt-ssh {
+.mgmt-name {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    font-weight: 600;
+    color: var(--fg-base);
+}
+.mgmt-name-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mgmt-ssh, .mgmt-size {
     font-family: ui-monospace, Menlo, Consolas, monospace;
     color: var(--fg-muted);
 }
+
+/* project-type badge: normal text, type-coloured border (research/sandbox).
+   :empty (before the flavour lands, or unknown) collapses to nothing. */
+.type-badge {
+    display: inline-block;
+    flex: none;
+    padding: 0 6px;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    font-size: 11px;
+    line-height: 15px;
+    color: var(--fg-base);
+}
+.type-badge:empty { display: none; }
+.type-badge.type-research { border-color: var(--type-research-border); }
+.type-badge.type-sandbox { border-color: var(--type-sandbox-border); }
 .state-running { color: var(--status-up); }
 .state-stopped { color: var(--fg-faint); }
 

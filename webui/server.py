@@ -823,6 +823,7 @@ def _compute_status(name: str) -> dict:
         "workers_running": workers_running,
         "workers_done": workers_done,
         "disk_bytes": disk_bytes,
+        "flavor": _read_project_type(name),     # "research" | "sandbox"
         "latest": None,
     }
     if latest_kind is not None:
