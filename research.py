@@ -1565,6 +1565,21 @@ def cmd_webui_cert_tailscale() -> None:
               f"warning — the cert covers {fqdn} only)")
 
 
+WEBUI_IMAGE_UID = 1000   # baked uid in webui/Dockerfile (USER webui)
+
+
+def _ensure_webui_tls_ownership(uid: int, gid: int) -> None:
+    """The rs-webui-tls named volume initializes owned by the image's baked uid
+    (1000). When the webui runs as a different uid (the uid-equality contract on
+    a non-1000 host), it can't write its TLS cert there — chown the volume to the
+    runtime uid first. No-op on the common uid==1000 host."""
+    if (uid, gid) == (WEBUI_IMAGE_UID, WEBUI_IMAGE_UID):
+        return
+    run(["docker", "run", "--rm", "-u", "0",
+         "-v", "rs-webui-tls:/app/tls", WEBUI_IMAGE,
+         "chown", "-R", f"{uid}:{gid}", "/app/tls"], capture_output=True)
+
+
 def cmd_webui(args: argparse.Namespace) -> None:
     """Manage the optional webui container (start | stop | status | import |
     cert-tailscale)."""
@@ -1614,6 +1629,17 @@ def cmd_webui(args: argparse.Namespace) -> None:
             recreate = True
         os.environ["WEBUI_BIND"] = bind
         os.environ["WEBUI_PORT"] = port
+        # Run the webui as the operator's uid so it can connect to the broker's
+        # 0600 socket and pass its SO_PEERCRED check (the uid-equality contract,
+        # value-agnostic — not hardcoded to 1000). Expose only the broker's
+        # socket subdir, never all of ~/.research-sandbox.
+        os.environ["WEBUI_UID"] = str(os.getuid())
+        os.environ["WEBUI_GID"] = str(os.getgid())
+        os.environ["RS_BROKER_DIR"] = str(broker.BROKER_RUN_DIR)
+        # Pre-create the socket subdir operator-owned, so the bind-mount source
+        # exists before `up` — otherwise docker auto-creates it root-owned and
+        # the broker (running as the operator) can't bind its socket there.
+        broker.BROKER_RUN_DIR.mkdir(parents=True, exist_ok=True)
         if (recreate or rebuild) and container_exists(WEBUI_CONTAINER):
             reason = "bind/port changed" if recreate else "rebuild requested"
             print(f"{reason}; recreating webui...")
@@ -1628,6 +1654,7 @@ def cmd_webui(args: argparse.Namespace) -> None:
         if rebuild or not run_quiet(["docker", "image", "inspect", WEBUI_IMAGE]):
             print("building webui image...")
             docker_compose("--profile", "webui", "build", "webui")
+        _ensure_webui_tls_ownership(os.getuid(), os.getgid())
         print(f"starting webui (bind {bind}:{port})...")
         docker_compose("--profile", "webui", "up", "-d", "webui")
         wire_webui_to_projects()

@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import ssl
+import struct
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -107,6 +108,253 @@ def origin_ok(request: web.Request) -> bool:
         return False
     parsed = urlparse(origin)
     return parsed.netloc == request.host
+
+
+# ===========================================================================
+# Broker relay — management lifecycle via the host-side broker daemon.
+#
+# The webui holds NO docker socket and NO standing authority: it relays the
+# operator's password to the broker (which authenticates), then holds the
+# broker-issued session token in *process memory*, keyed by an opaque webui
+# cookie the browser gets. Every relay (reads included) requires that session,
+# so a logged-out / network-reached webui can't enumerate or mutate anything.
+#
+# Wire protocol mirrors cli/broker.py::client_call (length-prefixed JSON over
+# the broker's AF_UNIX socket) — cli/broker.py is the authoritative spec, and
+# the bash acceptance test (this client → real broker) is the conformance check
+# that catches drift between the two implementations.
+# ===========================================================================
+
+# The broker's parent dir (~/.research-sandbox) is bind-mounted into the webui;
+# point this at the socket inside it. Parent-dir mount (not the socket file):
+# the daemon recreates the socket on restart, and a single-file bind-mount pins
+# the original inode.
+RS_BROKER_SOCKET = os.environ.get("RS_BROKER_SOCKET", "/run/rs-broker/broker.sock")
+
+_BROKER_LEN = struct.Struct(">I")
+# A read verb is instant; `start` recreates the supervisor (slow). 30s covers
+# the slowest verb the webui relays while still failing fast on a hung daemon.
+BROKER_CALL_TIMEOUT_S = 30
+
+# Management sessions: opaque webui cookie → {broker_token, expires}. Distinct
+# from the per-project SSH SESSIONS map. Process-memory only; a webui restart
+# drops them (re-login), mirroring the broker's own in-daemon token store.
+BROKER_SESSIONS: dict[str, dict] = {}
+BROKER_COOKIE = "rs_broker"
+
+# Global login rate-limit. NOT per-IP: behind tailscale / a reverse proxy the
+# source IP collapses to one address (per-IP would lock everyone out) or is
+# spoofable; a global cap is unspoofable and simple. The broker's scrypt verify
+# (~tens of ms each) is the real brute-force throttle — this is a bounded
+# backstop. 10 failures within 60s trips a 60s auto-clearing lockout: a human
+# fat-fingering never trips it; a script is throttled to ~10 tries/min atop
+# scrypt's cost. Half (5) risks false-tripping a fumbling human; 10x (100) is
+# too loose to matter.
+LOGIN_MAX_FAILURES = 10
+LOGIN_WINDOW_SECONDS = 60
+LOGIN_LOCKOUT_SECONDS = 60
+
+
+class LoginLimiter:
+    """Global failed-login limiter with a bounded, auto-clearing lockout. `now`
+    is injectable so the cooldown is testable without sleeping."""
+
+    def __init__(self, max_failures=LOGIN_MAX_FAILURES,
+                 window_s=LOGIN_WINDOW_SECONDS, lockout_s=LOGIN_LOCKOUT_SECONDS,
+                 now=time.time):
+        self._max = max_failures
+        self._window = window_s
+        self._lockout = lockout_s
+        self._now = now
+        self._failures: list[float] = []
+        self._locked_until = 0.0
+
+    def retry_after(self) -> int:
+        """Seconds remaining on the lockout, or 0 if not currently locked."""
+        return max(0, int(self._locked_until - self._now()))
+
+    def record_failure(self) -> None:
+        now = self._now()
+        self._failures = [t for t in self._failures if now - t < self._window]
+        self._failures.append(now)
+        if len(self._failures) >= self._max:
+            self._locked_until = now + self._lockout
+            self._failures.clear()
+
+    def record_success(self) -> None:
+        self._failures.clear()
+        self._locked_until = 0.0
+
+
+LOGIN_LIMITER = LoginLimiter()
+
+
+class BrokerUnavailable(Exception):
+    """Broker socket missing / unreachable / mid-frame close."""
+
+
+class BrokerForbidden(Exception):
+    """Broker peer-uid reject — the webui's uid != the broker's (the
+    uid-equality contract). Distinct from unreachable so the SPA can show the
+    'uid match?' message rather than a generic outage."""
+
+
+async def broker_call(verb: str, args: dict | None = None, *,
+                      token: str | None = None,
+                      timeout: float = BROKER_CALL_TIMEOUT_S) -> dict:
+    """Send one framed request to the broker and return the parsed reply.
+    Async mirror of cli/broker.py::client_call. Raises BrokerUnavailable /
+    BrokerForbidden; otherwise returns the reply dict (which may itself be an
+    {ok:false,...} application error such as unauthorized/validation/failed)."""
+    payload = {"verb": verb, "args": args or {}}
+    if token is not None:
+        payload["token"] = token
+    data = json.dumps(payload).encode()
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_unix_connection(RS_BROKER_SOCKET), timeout=timeout)
+    except (FileNotFoundError, ConnectionRefusedError, OSError) as e:
+        raise BrokerUnavailable(str(e))
+    try:
+        writer.write(_BROKER_LEN.pack(len(data)) + data)
+        await writer.drain()
+        hdr = await asyncio.wait_for(
+            reader.readexactly(_BROKER_LEN.size), timeout=timeout)
+        (n,) = _BROKER_LEN.unpack(hdr)
+        body = await asyncio.wait_for(reader.readexactly(n), timeout=timeout)
+    except (asyncio.IncompleteReadError, asyncio.TimeoutError, OSError) as e:
+        raise BrokerUnavailable(str(e))
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+    reply = json.loads(body)
+    if (not reply.get("ok")
+            and reply.get("error", {}).get("kind") == "forbidden"):
+        raise BrokerForbidden(reply["error"].get("message", "forbidden"))
+    return reply
+
+
+def _broker_session(request: web.Request) -> dict | None:
+    """The live management session for this request, or None. GC's an expired
+    entry on lookup."""
+    tok = request.cookies.get(BROKER_COOKIE)
+    if not tok:
+        return None
+    s = BROKER_SESSIONS.get(tok)
+    if not s:
+        return None
+    if time.time() > s["expires"]:
+        BROKER_SESSIONS.pop(tok, None)
+        return None
+    return s
+
+
+async def _relay(request: web.Request, verb: str,
+                 args: dict | None = None) -> tuple[int, dict]:
+    """Gated relay: require a management session, call the broker with its
+    token, map every failure to an (http_status, body) pair."""
+    s = _broker_session(request)
+    if s is None:
+        return 401, {"ok": False, "error": {"kind": "unauthorized"}}
+    try:
+        reply = await broker_call(verb, args, token=s["broker_token"])
+    except BrokerUnavailable:
+        return 503, {"ok": False, "error": {"kind": "broker_unavailable"}}
+    except BrokerForbidden:
+        return 403, {"ok": False, "error": {"kind": "forbidden"}}
+    if (not reply.get("ok")
+            and reply.get("error", {}).get("kind") == "unauthorized"):
+        # Broker token expired/invalid → drop the webui session too.
+        BROKER_SESSIONS.pop(request.cookies.get(BROKER_COOKIE), None)
+        return 401, {"ok": False, "error": {"kind": "unauthorized"}}
+    return 200, reply
+
+
+async def broker_login_handler(request: web.Request) -> web.Response:
+    """POST /broker/login {password} — relay to the broker; on success mint a
+    management session cookie holding the broker token server-side."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    wait = LOGIN_LIMITER.retry_after()
+    if wait > 0:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "rate_limited", "retry_after": wait}},
+            status=429, headers={"Retry-After": str(wait)})
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "bad_request"}}, status=400)
+    password = body.get("password")
+    if not isinstance(password, str):
+        return web.json_response(
+            {"ok": False, "error": {"kind": "bad_request"}}, status=400)
+    try:
+        reply = await broker_call("login", {"password": password})
+    except BrokerUnavailable:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "broker_unavailable"}}, status=503)
+    except BrokerForbidden:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "forbidden"}}, status=403)
+    if not reply.get("ok"):
+        LOGIN_LIMITER.record_failure()
+        return web.json_response(
+            {"ok": False, "error": {"kind": "auth"}}, status=401)
+    LOGIN_LIMITER.record_success()
+    result = reply["result"]
+    cookie = secrets.token_urlsafe(32)
+    expires_at = float(result.get("expires_at", time.time()))
+    BROKER_SESSIONS[cookie] = {
+        "broker_token": result["token"],
+        "expires": expires_at,
+    }
+    max_age = max(0, int(expires_at - time.time()))
+    response = web.json_response({"ok": True})
+    response.set_cookie(
+        BROKER_COOKIE, cookie, path="/broker",
+        httponly=True, secure=True, samesite="Strict", max_age=max_age)
+    return response
+
+
+async def broker_logout_handler(request: web.Request) -> web.Response:
+    """POST /broker/logout — revoke the broker token, drop the session, clear
+    the cookie. Always 200 (idempotent)."""
+    s = _broker_session(request)
+    if s is not None:
+        try:
+            await broker_call("logout", token=s["broker_token"])
+        except (BrokerUnavailable, BrokerForbidden):
+            pass
+    tok = request.cookies.get(BROKER_COOKIE)
+    if tok:
+        BROKER_SESSIONS.pop(tok, None)
+    response = web.json_response({"ok": True})
+    response.del_cookie(BROKER_COOKIE, path="/broker")
+    return response
+
+
+async def broker_projects_handler(request: web.Request) -> web.Response:
+    """GET /broker/projects — the host's authoritative project list (gated).
+    The SameSite=Strict session cookie is the CSRF defense for this read."""
+    status, body = await _relay(request, "list")
+    return web.json_response(body, status=status)
+
+
+async def broker_project_action_handler(request: web.Request) -> web.Response:
+    """POST /broker/project/{name}/{action} — start|stop (gated, origin-checked)."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    name = request.match_info.get("name", "")
+    action = request.match_info.get("action", "")
+    if action not in ("start", "stop"):
+        return web.json_response(
+            {"ok": False, "error": {"kind": "bad_request"}}, status=400)
+    status, body = await _relay(request, action, {"name": name})
+    return web.json_response(body, status=status)
 
 
 async def ws_handler(request: web.Request) -> web.WebSocketResponse:
@@ -900,6 +1148,12 @@ def main() -> None:
     app.router.add_get("/services/{project}", project_services_handler)
     app.router.add_get("/projects/status", projects_status_handler)
     app.router.add_post("/session/{project}", session_handler)
+    # Broker relay (management lifecycle) — login-gated; no docker socket.
+    app.router.add_post("/broker/login", broker_login_handler)
+    app.router.add_post("/broker/logout", broker_logout_handler)
+    app.router.add_get("/broker/projects", broker_projects_handler)
+    app.router.add_post(
+        "/broker/project/{name}/{action}", broker_project_action_handler)
     app.router.add_get("/ws/{project}/{service}", ws_handler)
     # Proxy: trailing-slash form catches /proxy/<proj>/<svc>/ + everything
     # below. The no-slash form is also routed (matched by proxy_handler's

@@ -612,6 +612,9 @@ function makeProjectRail() {
     const splitter = el("div", { class: "rail-splitter", title: "Drag to resize" });
     installRailSplitterDrag(splitter);
     rail.appendChild(splitter);
+    // Management lives ABOVE the bookmarks, divided off: it's the host's live
+    // project list (broker), distinct from the vault bookmarks below it.
+    rail.appendChild(makeManagementSection());
     const header = el("div", { class: "rail-header" }, [
         el("span", {}, ["Projects"]),
         makePinButton(),
@@ -633,6 +636,195 @@ function makeProjectRail() {
     ]);
     rail.appendChild(footer);
     return rail;
+}
+
+// ---- management (broker-driven host lifecycle) -----------------------------
+// A sidebar entry, separated from the vault bookmarks, that opens the host's
+// authoritative project list (via the login-gated broker relay) in the main
+// area. The browser holds only an opaque session cookie; the broker token
+// lives server-side. start/stop are confirm-gated (they recreate / interrupt
+// a supervisor — costly, deliberate).
+
+function makeManagementSection() {
+    const entry = el("div", {
+        class: "management-entry",
+        title: "Host project management (broker)",
+    }, [el("span", { class: "mgmt-gear" }, ["⚙"]), el("span", {}, ["Management"])]);
+    entry.onclick = (ev) => { ev.stopPropagation(); openManagement(); };
+    return el("div", { class: "rail-management" }, [entry]);
+}
+
+function openManagement() {
+    const mainArea = document.querySelector(".main-area");
+    if (!mainArea) return;
+    const term = document.getElementById("terminal-area");
+    if (term) term.style.display = "none";
+    let view = document.getElementById("management-view");
+    if (!view) {
+        view = el("div", { class: "management-view", id: "management-view" });
+        mainArea.appendChild(view);
+    }
+    view.style.display = "";
+    document.querySelectorAll(".management-entry").forEach((e) => e.classList.add("active"));
+    renderManagementInto(view);
+}
+
+function closeManagement() {
+    const view = document.getElementById("management-view");
+    if (view) view.style.display = "none";
+    const term = document.getElementById("terminal-area");
+    if (term) term.style.display = "";
+    document.querySelectorAll(".management-entry").forEach((e) => e.classList.remove("active"));
+}
+
+async function renderManagementInto(view) {
+    view.innerHTML = "";
+    view.appendChild(el("div", { class: "mgmt-loading" }, ["Loading…"]));
+    let res;
+    try {
+        res = await fetch("/broker/projects");
+    } catch (e) {
+        return renderMgmtUnavailable(view);
+    }
+    if (res.status === 401) return renderMgmtLogin(view);
+    if (res.status === 403) return renderMgmtRejected(view);
+    if (res.status === 503) return renderMgmtUnavailable(view);
+    let body;
+    try { body = await res.json(); } catch (e) { return renderMgmtUnavailable(view); }
+    if (!res.ok || !body.ok) return renderMgmtUnavailable(view);
+    renderMgmtTable(view, body.result || []);
+}
+
+function mgmtCard(view, children) {
+    view.innerHTML = "";
+    view.appendChild(el("div", { class: "mgmt-center" }, [
+        el("div", { class: "card mgmt-card" }, children),
+    ]));
+}
+
+function renderMgmtLogin(view) {
+    const pw = el("input", { type: "password", autocomplete: "current-password" });
+    const errEl = el("div", { class: "error" });
+    const submit = el("button", { class: "btn" }, ["Log in"]);
+    const doLogin = async () => {
+        errEl.textContent = "";
+        let res;
+        try {
+            res = await fetch("/broker/login", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ password: pw.value }),
+            });
+        } catch (e) { errEl.textContent = "Broker unreachable."; return; }
+        if (res.status === 200) return renderManagementInto(view);
+        if (res.status === 429) {
+            const ra = res.headers.get("Retry-After");
+            errEl.textContent = `Too many attempts. Wait ${ra || "a moment"}s.`;
+            return;
+        }
+        if (res.status === 401) { errEl.textContent = "Wrong management password."; return; }
+        if (res.status === 403) return renderMgmtRejected(view);
+        errEl.textContent = "Broker unavailable.";
+    };
+    submit.onclick = doLogin;
+    pw.onkeydown = (e) => { if (e.key === "Enter") doLogin(); };
+    mgmtCard(view, [
+        el("h2", {}, ["Log in to management"]),
+        el("div", { class: "field" }, [el("label", {}, ["Management password"]), pw]),
+        el("div", { class: "btn-row" }, [submit]),
+        errEl,
+        el("div", { class: "hint" }, [
+            "Set on the host with ",
+            el("code", {}, ["research broker passwd"]),
+            ". Separate from your vault password.",
+        ]),
+    ]);
+    setTimeout(() => pw.focus(), 50);
+}
+
+function renderMgmtUnavailable(view) {
+    mgmtCard(view, [
+        el("h2", {}, ["Management unavailable"]),
+        el("p", {}, ["The broker isn’t reachable. Start it on the host:"]),
+        el("pre", {}, ["research broker start"]),
+        el("div", { class: "hint" }, [
+            "Management is opt-in; the rest of the webui is unaffected.",
+        ]),
+    ]);
+}
+
+function renderMgmtRejected(view) {
+    mgmtCard(view, [
+        el("h2", {}, ["Broker rejected the webui"]),
+        el("p", {}, [
+            "The broker rejected the webui’s identity. The webui must run as ",
+            "the same user as the broker (uid match). The broker log names the ",
+            "mismatch.",
+        ]),
+    ]);
+}
+
+function renderMgmtTable(view, projects) {
+    view.innerHTML = "";
+    const refresh = el("button", { class: "btn-small" }, ["Refresh"]);
+    refresh.onclick = () => renderManagementInto(view);
+    const logout = el("button", { class: "btn-small" }, ["Log out"]);
+    logout.onclick = () => mgmtLogout(view);
+    view.appendChild(el("div", { class: "mgmt-header" }, [
+        el("h2", {}, ["Management — host projects (live)"]),
+        el("div", { class: "mgmt-toolbar" }, [refresh, logout]),
+    ]));
+    if (projects.length === 0) {
+        view.appendChild(el("div", { class: "mgmt-empty" }, ["No projects on this host."]));
+        return;
+    }
+    const rows = [el("div", { class: "mgmt-row mgmt-row-head" }, [
+        el("span", {}, ["Project"]), el("span", {}, ["State"]),
+        el("span", {}, ["SSH"]), el("span", {}, ["Actions"]),
+    ])];
+    for (const p of projects) {
+        const running = p.state === "running";
+        const btn = el("button", { class: "btn-small" }, [running ? "Stop" : "Start"]);
+        btn.onclick = () => mgmtAction(view, p.project, running ? "stop" : "start", btn);
+        rows.push(el("div", { class: "mgmt-row" }, [
+            el("span", { class: "mgmt-name" }, [p.project]),
+            el("span", { class: running ? "state-running" : "state-stopped" }, [p.state]),
+            el("span", { class: "mgmt-ssh" }, [p.ssh || "—"]),
+            el("span", {}, [btn]),
+        ]));
+    }
+    view.appendChild(el("div", { class: "mgmt-table" }, rows));
+}
+
+async function mgmtAction(view, name, action, btn) {
+    const msg = action === "start"
+        ? `Start "${name}"?\n\nThis recreates the supervisor (fresh container, re-staged images) and takes a moment. Running work is unaffected.`
+        : `Stop "${name}"?\n\nThis interrupts any running work in the supervisor.`;
+    if (!confirm(msg)) return;
+    btn.disabled = true;
+    const orig = btn.textContent;
+    btn.textContent = "…";
+    let res;
+    try {
+        res = await fetch(
+            `/broker/project/${encodeURIComponent(name)}/${action}`,
+            { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    } catch (e) {
+        btn.disabled = false; btn.textContent = orig;
+        alert("Broker unreachable."); return;
+    }
+    if (res.status === 401) return renderMgmtLogin(view);
+    if (res.status === 403) return renderMgmtRejected(view);
+    if (res.status === 503) return renderMgmtUnavailable(view);
+    renderManagementInto(view);   // re-fetch so the new state lands authoritatively
+}
+
+async function mgmtLogout(view) {
+    try {
+        await fetch("/broker/logout",
+            { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    } catch (e) { /* logging out is best-effort */ }
+    renderMgmtLogin(view);
 }
 
 function makeProjectRow(project) {
@@ -1198,6 +1390,7 @@ async function togglePin(serviceId) {
 // ---- project / service activation ------------------------------------------
 
 async function activateProject(name) {
+    closeManagement();   // leaving the management view for a project tab
     document.querySelectorAll(".project-rail .project").forEach((r) => r.classList.remove("active"));
     const row = document.querySelector(`.project[data-name="${CSS.escape(name)}"]`);
     if (row) row.classList.add("active");

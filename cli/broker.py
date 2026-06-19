@@ -63,7 +63,12 @@ import broker_auth  # noqa: E402
 
 # Same host-side tree as the MCP registry (~/.research-sandbox/). User-owned.
 BROKER_DIR = Path.home() / ".research-sandbox"
-BROKER_SOCKET = BROKER_DIR / "broker.sock"
+# The socket lives in a dedicated subdir so the webui can bind-mount *only* the
+# socket (parent-dir mount — inode-safe across daemon restarts) WITHOUT exposing
+# the rest of ~/.research-sandbox (the password hash, MCP/sandbox registries,
+# audit log) to a network-facing container.
+BROKER_RUN_DIR = BROKER_DIR / "run"
+BROKER_SOCKET = BROKER_RUN_DIR / "broker.sock"
 BROKER_PIDFILE = BROKER_DIR / "broker.pid"
 BROKER_LOG = BROKER_DIR / "broker.log"
 
@@ -133,8 +138,9 @@ VERBS = {
 OPEN_VERBS = frozenset({"list", "status"})
 
 # Auth verbs live OUTSIDE VERBS — they grant no docker capability, so they are
-# handled on a distinct path in dispatch and never reach rscore.
-AUTH_VERBS = frozenset({"login"})
+# handled on a distinct path in dispatch and never reach rscore. `logout`
+# revokes the presented token (idempotent; you can only revoke your own).
+AUTH_VERBS = frozenset({"login", "logout"})
 
 
 def _err(kind: str, message: str) -> dict:
@@ -175,10 +181,18 @@ def dispatch(verb, args, token=None, tokens=None, *,
     if verb in AUTH_VERBS:
         if not isinstance(args, dict):
             return _err("bad_request", "args must be a JSON object")
-        reply = _auth_login(args, tokens)
-        if reply.get("ok"):
-            return _audited(reply["result"]["principal"], "ok", reply)
-        return _audited(None, "auth_fail", reply)
+        if verb == "login":
+            reply = _auth_login(args, tokens)
+            if reply.get("ok"):
+                return _audited(reply["result"]["principal"], "ok", reply)
+            return _audited(None, "auth_fail", reply)
+        # logout: revoke the presented token. Idempotent — an absent/unknown
+        # token is a no-op success; you can only revoke the token you hold.
+        principal = tokens.principal_for(token) if tokens is not None else None
+        if tokens is not None and isinstance(token, str):
+            tokens.revoke(token)
+        return _audited(principal, "logout",
+                        {"ok": True, "result": {"logged_out": True}})
 
     fn = table.get(verb)
     if fn is None:
@@ -233,7 +247,13 @@ def _peer_is_self(conn: socket.socket) -> bool:
         return True                      # no SO_PEERCRED here → rely on perms
     except OSError:
         return False                     # supported but unverifiable → deny
-    return uid == os.getuid()
+    if uid == os.getuid():
+        return True
+    # Self-diagnosing: the wire reply stays generic ("forbidden"), but the log
+    # names the mismatch so a host whose webui runs under a different uid (the
+    # uid-equality contract) has a clear signal instead of a silent 503.
+    print(f"peer reject: uid {uid} != owner {os.getuid()}", flush=True)
+    return False
 
 
 class _Handler(socketserver.StreamRequestHandler):
@@ -288,6 +308,9 @@ def serve() -> None:
     BROKER_DIR.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(OSError):
         BROKER_DIR.chmod(0o700)
+    BROKER_RUN_DIR.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        BROKER_RUN_DIR.chmod(0o700)
     server = _Server(str(BROKER_SOCKET), _Handler)
     # In-daemon session-token store: issued on login, never persisted, flushed
     # by construction on restart. The handler reaches it via self.server.tokens.

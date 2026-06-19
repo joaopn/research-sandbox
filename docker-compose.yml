@@ -28,6 +28,10 @@ services:
     build: ./webui
     image: rs-webui:latest
     container_name: rs-webui
+    # Run as the operator's uid (set by `research webui start`) so the webui can
+    # connect to the broker's 0600 socket and pass its SO_PEERCRED check — the
+    # uid-equality contract, value-agnostic (defaults to the baked 1000).
+    user: "${WEBUI_UID:-1000}:${WEBUI_GID:-1000}"
     networks:
       - rs-sandbox
     ports:
@@ -38,6 +42,7 @@ services:
     environment:
       - WEBUI_BIND=${WEBUI_BIND:-127.0.0.1}
       - RS_PROJECTS_ROOT=/projects
+      - RS_BROKER_SOCKET=/run/rs-broker/broker.sock
     volumes:
       - rs-webui-tls:/app/tls
       # RO read-side onto the same host directory `research project create`
@@ -45,6 +50,12 @@ services:
       # counts, disk, last activity) without granting docker socket access
       # or running a sidecar. Filesystem is the only data plane.
       - ${PROJECTS_DIR:-./container_volumes}:/projects:ro
+      # Broker control socket (opt-in management lifecycle). RO mount of ONLY
+      # the broker's socket subdir — not all of ~/.research-sandbox, so the
+      # password hash / registries stay off the network-facing container. The
+      # parent-dir (not socket-file) mount survives the daemon recreating the
+      # socket. Broker off ⇒ the dir is empty/absent and management is inert.
+      - ${RS_BROKER_DIR:-${HOME}/.research-sandbox/run}:/run/rs-broker:ro
     restart: unless-stopped
 
 
