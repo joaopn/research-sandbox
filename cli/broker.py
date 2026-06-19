@@ -120,6 +120,57 @@ def _verb_start(args: dict) -> list[dict]:
     return [dataclasses.asdict(r) for r in rscore.start(req)]  # may die() → SystemExit
 
 
+# The webui-settable subset of CreateRequest fields — the broker's input
+# boundary for `create`. Only these names are forwarded to from_kwargs, so a
+# relayed request can NEVER set a bind-mount source (`data`), pin a host
+# `ssh_port`, toggle `inner_firewall`, supply a `role_mcp_upstream`, or reach
+# any future path/host-shaped field — those stay CLI-only. Deny-by-default,
+# mirroring OPEN_VERBS: a new CreateRequest field is unreachable from the webui
+# until someone explicitly adds it here. from_kwargs still validates these
+# (name regex, type/egress enums, enable/disable token lists).
+CREATE_WEBUI_FIELDS = frozenset({
+    "name", "type", "egress", "enable", "disable", "memory", "cpus",
+})
+
+# The webui-settable subset of UpdateRequest fields. `rebuild`/`keep_claude` are
+# dropped on purpose: a webui update is the fast file-only recreate, and an
+# image rebuild (`rebuild=True`) would block the serially-handled daemon for the
+# whole multi-minute build — a self-inflicted DoS from the browser. Rebuilds
+# stay a deliberate CLI action.
+UPDATE_WEBUI_FIELDS = frozenset({
+    "name", "enable", "disable", "role_mcp_upstream",
+})
+
+
+def _verb_create(args: dict) -> dict:
+    safe = {k: v for k, v in args.items() if k in CREATE_WEBUI_FIELDS}
+    req = rscore.CreateRequest.from_kwargs(**safe)  # may raise ValidationError
+    return dataclasses.asdict(rscore.create(req))   # may die() → SystemExit
+
+
+def _verb_attach(args: dict) -> dict:
+    """JIT keyring: return a running project's SSH coordinates (incl. password,
+    in-memory). Token-gated like a write precisely because it returns the
+    credential."""
+    req = rscore.AttachRequest.from_kwargs(**args)    # may raise ValidationError
+    return dataclasses.asdict(rscore.webui_attach_info(req))  # may die() → SystemExit
+
+
+def _verb_update(args: dict) -> dict:
+    safe = {k: v for k, v in args.items() if k in UPDATE_WEBUI_FIELDS}
+    req = rscore.UpdateRequest.from_kwargs(**safe)   # may raise ValidationError
+    return dataclasses.asdict(rscore.update(req))    # may die() → SystemExit
+
+
+def _verb_destroy(args: dict) -> dict:
+    """Tear a project down. Step-up re-auth (see STEP_UP_VERBS) is enforced in
+    dispatch BEFORE this runs; the request's `password` is consumed there and
+    never reaches rscore (DestroyRequest reads only `name`)."""
+    req = rscore.DestroyRequest.from_kwargs(**args)  # may raise ValidationError
+    rscore.destroy(req)                              # may die() → SystemExit
+    return {"destroyed": req.name}
+
+
 # The closed lifecycle vocabulary — the host-root boundary. Adding a verb here
 # is a deliberate, security-reviewed edit; never a docker passthrough.
 VERBS = {
@@ -127,7 +178,17 @@ VERBS = {
     "status": _verb_status,
     "stop": _verb_stop,
     "start": _verb_start,
+    "create": _verb_create,
+    "attach": _verb_attach,
+    "update": _verb_update,
+    "destroy": _verb_destroy,
 }
+
+# Verbs requiring step-up re-auth: a FRESH password in the request, not just a
+# live session token, so a stolen token alone cannot trigger them. `destroy` is
+# the data-destroying verb; this is the cheap half of its gate (the recoverable
+# soft-delete + rate-limit land before the webui is exposed beyond localhost).
+STEP_UP_VERBS = frozenset({"destroy"})
 
 # Deny-by-default gating: a verb in VERBS but NOT in this read allowlist
 # requires a valid session token. Inverting the set (vs an explicit *gated*
@@ -209,6 +270,17 @@ def dispatch(verb, args, token=None, tokens=None, *,
             return _audited(None, "unauthorized",
                             _err("unauthorized",
                                  "a valid session token is required; call login"))
+
+    # Step-up re-auth for the data-destroying verbs. Checked AFTER the token
+    # gate, so an unauthenticated caller gets a plain 'unauthorized' and never
+    # learns the step-up exists. The fresh password is verified here and not
+    # forwarded to rscore.
+    if verb in STEP_UP_VERBS:
+        step_pw = args.get("password")
+        if not isinstance(step_pw, str) or not broker_auth.verify_password(step_pw):
+            return _audited(principal, "step_up_fail",
+                            _err("step_up_required",
+                                 "this action requires re-entering your password"))
 
     # A verb that calls die() raises SystemExit after printing to stderr; capture
     # that text so the failure message reaches the caller instead of the daemon

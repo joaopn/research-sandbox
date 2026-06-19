@@ -136,6 +136,18 @@ _BROKER_LEN = struct.Struct(">I")
 # the slowest verb the webui relays while still failing fast on a hung daemon.
 BROKER_CALL_TIMEOUT_S = 30
 
+# `create` is the slow outlier: workspace + per-project network + sysbox
+# supervisor run + inner-image staging (docker save|load into the inner dockerd)
+# routinely takes 10–30s cold, and the daemon handles it synchronously. Give the
+# create relay a margin well past the worst observed cold create so a legit one
+# isn't cut off mid-flight, while still bounding a truly hung daemon: 120s is
+# ~4× the worst case (headroom for a loaded host / slow staging). Half (60s)
+# brushes a slow cold create with several inner images; 10× (1200s) is too loose
+# to detect a hang. The serial broker means this also caps how long one create
+# blocks other verbs — a job/poll upgrade is the documented path if creates ever
+# exceed this bound.
+BROKER_CREATE_TIMEOUT_S = 120
+
 # Management sessions: opaque webui cookie → {broker_token, expires}. Distinct
 # from the per-project SSH SESSIONS map. Process-memory only; a webui restart
 # drops them (re-login), mirroring the broker's own in-daemon token store.
@@ -253,14 +265,15 @@ def _broker_session(request: web.Request) -> dict | None:
 
 
 async def _relay(request: web.Request, verb: str,
-                 args: dict | None = None) -> tuple[int, dict]:
+                 args: dict | None = None, *,
+                 timeout: float = BROKER_CALL_TIMEOUT_S) -> tuple[int, dict]:
     """Gated relay: require a management session, call the broker with its
     token, map every failure to an (http_status, body) pair."""
     s = _broker_session(request)
     if s is None:
         return 401, {"ok": False, "error": {"kind": "unauthorized"}}
     try:
-        reply = await broker_call(verb, args, token=s["broker_token"])
+        reply = await broker_call(verb, args, token=s["broker_token"], timeout=timeout)
     except BrokerUnavailable:
         return 503, {"ok": False, "error": {"kind": "broker_unavailable"}}
     except BrokerForbidden:
@@ -344,17 +357,61 @@ async def broker_projects_handler(request: web.Request) -> web.Response:
     return web.json_response(body, status=status)
 
 
+async def broker_create_handler(request: web.Request) -> web.Response:
+    """POST /broker/project {name,type,egress,enable[],disable[],memory,cpus} —
+    create a project (gated, origin-checked). The broker's CREATE_WEBUI_FIELDS
+    allow-list is the real input boundary (it drops `data`/`ssh_port`/any
+    path-shaped field), so the body is forwarded as-is. Uses the longer create
+    timeout — a cold create stages inner images synchronously."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "bad_request"}}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"ok": False, "error": {"kind": "bad_request"}}, status=400)
+    status, reply = await _relay(request, "create", body,
+                                 timeout=BROKER_CREATE_TIMEOUT_S)
+    return web.json_response(reply, status=status)
+
+
+async def broker_attach_handler(request: web.Request) -> web.Response:
+    """POST /broker/project/{name}/attach — JIT keyring: return the project's
+    SSH coordinates incl. password (gated, origin-checked). POST + origin-check
+    because it returns a credential, not a cacheable read. The browser holds the
+    result transiently in memory and never persists it to the vault."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    name = request.match_info.get("name", "")
+    status, reply = await _relay(request, "attach", {"name": name})
+    return web.json_response(reply, status=status)
+
+
 async def broker_project_action_handler(request: web.Request) -> web.Response:
-    """POST /broker/project/{name}/{action} — start|stop (gated, origin-checked)."""
+    """POST /broker/project/{name}/{action} — start|stop|update|destroy (gated,
+    origin-checked). `destroy` carries a step-up `password` in the body that the
+    broker re-verifies; the others ignore the body."""
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")
     name = request.match_info.get("name", "")
     action = request.match_info.get("action", "")
-    if action not in ("start", "stop"):
+    if action not in ("start", "stop", "update", "destroy"):
         return web.json_response(
             {"ok": False, "error": {"kind": "bad_request"}}, status=400)
-    status, body = await _relay(request, action, {"name": name})
-    return web.json_response(body, status=status)
+    args = {"name": name}
+    if action == "destroy":
+        try:
+            req_body = await request.json()
+        except Exception:
+            req_body = {}
+        pw = req_body.get("password") if isinstance(req_body, dict) else None
+        if isinstance(pw, str):
+            args["password"] = pw
+    status, reply = await _relay(request, action, args)
+    return web.json_response(reply, status=status)
 
 
 async def ws_handler(request: web.Request) -> web.WebSocketResponse:
@@ -1152,6 +1209,12 @@ def main() -> None:
     app.router.add_post("/broker/login", broker_login_handler)
     app.router.add_post("/broker/logout", broker_logout_handler)
     app.router.add_get("/broker/projects", broker_projects_handler)
+    app.router.add_post("/broker/project", broker_create_handler)
+    # attach is a fixed segment registered before the {action} variable so it
+    # routes to the keyring handler, not the start|stop|update|destroy dispatcher
+    # (which also rejects "attach" defensively).
+    app.router.add_post(
+        "/broker/project/{name}/attach", broker_attach_handler)
     app.router.add_post(
         "/broker/project/{name}/{action}", broker_project_action_handler)
     app.router.add_get("/ws/{project}/{service}", ws_handler)

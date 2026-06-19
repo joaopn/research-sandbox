@@ -259,6 +259,17 @@ class UpdateRequest:
         )
 
 
+@dataclass(frozen=True)
+class AttachRequest:
+    """The JIT-keyring verb: 'give me the SSH coordinates to reach this
+    project'. Name-only, same regex choke point as the other verbs."""
+    name: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "AttachRequest":
+        return cls(name=_require_name(kw.get("name")))
+
+
 # ---------------------------------------------------------------------------
 # Result objects — what each verb returns. The terminal formats these into its
 # text; the browser serialises them to JSON. The SSH password rides back in the
@@ -320,6 +331,19 @@ class UpdateResult:
     sandboxes_enabled: list[str] = field(default_factory=list)
     workers_disabled: list[str] = field(default_factory=list)
     sandboxes_disabled: list[str] = field(default_factory=list)
+
+
+@dataclass
+class AttachInfo:
+    """SSH coordinates for the webui to reach a RUNNING supervisor over its
+    per-project bridge: container DNS + the internal sshd port — NEVER the
+    published localhost host-port that list/status expose. The password rides
+    back in-memory (browser-transient on the webui side); never logged."""
+    name: str
+    host: str                               # rs-project-<name> (container DNS)
+    port: int                               # the container's internal sshd port
+    username: str
+    password: str                           # in-memory only
 
 
 # ===========================================================================
@@ -3328,6 +3352,34 @@ def _webui_import_string(project: str, ssh_pass: str) -> str:
         "username": "research",
         "password": ssh_pass,
     }).encode()).decode()
+
+
+def webui_attach_info(req: "AttachRequest", cfg: "Config" | None = None) -> AttachInfo:  # type: ignore[name-defined]
+    """The JIT keyring: resolve a project's SSH coordinates so the webui can
+    attach without a host-side `research webui import`. Same target shape as
+    `_webui_import_string` (container DNS + internal sshd port 22 — the webui
+    reaches supervisors over the per-project bridge, not the published host
+    port), but structured rather than base64'd because this is a broker→webui
+    machine path, not a human paste.
+
+    Returns the password in-memory; NEVER prints/logs it (the broker serialises
+    the result over the socket, the audit line records principal/verb/outcome
+    only). die()s if the project is absent or not running — a stopped
+    supervisor has no bridge endpoint to attach to."""
+    if cfg is None:
+        cfg = load_config()
+    container = container_name_for(req.name)
+    if not container_exists(container):
+        die(f"project {req.name!r} does not exist")
+    if not container_running(container):
+        die(f"project {req.name!r} is not running; start it before attaching")
+    ssh_pass = _supervisor_ssh_pass(container)
+    if not ssh_pass:
+        die(f"could not read SSH password for {req.name!r}")
+    # port 22 + user 'research' mirror _webui_import_string above; keep the two
+    # in lockstep (both describe the same per-project-bridge endpoint).
+    return AttachInfo(name=req.name, host=container, port=22,
+                      username="research", password=ssh_pass)
 
 
 def wire_webui_to_projects() -> None:

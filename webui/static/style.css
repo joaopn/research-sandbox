@@ -721,3 +721,18 @@ body {
 }
 .btn-small:hover:not(:disabled) { background: var(--border); }
 .btn-small:disabled { opacity: 0.5; cursor: default; }
+.btn-small.btn-danger { background: var(--btn-danger-bg); }
+.btn-small.btn-danger:hover:not(:disabled) { background: var(--btn-danger-bg-hover); }
+
+/* Multiple per-row management actions (start/stop · attach · update · destroy) */
+.mgmt-actions { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap; }
+
+/* create-form --enable preset checkboxes */
+.mgmt-checks { display: flex; flex-wrap: wrap; gap: 10px; }
+.mgmt-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 13px;
+    color: var(--fg-base);
+}

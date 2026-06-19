@@ -287,7 +287,15 @@ function saveStored(stored) {
 }
 
 async function persistVault() {
-    const enc = await encryptVault(state.derivedKey, state.vault);
+    // JIT-attached projects (broker keyring) are transient: their SSH creds are
+    // held in browser memory only and must NEVER reach the encrypted blob.
+    // Strip them here — the single persist choke point — so the guarantee holds
+    // regardless of what triggered the save.
+    const persistable = {
+        ...state.vault,
+        projects: state.vault.projects.filter((p) => !p._jit),
+    };
+    const enc = await encryptVault(state.derivedKey, persistable);
     saveStored({ salt: b64(state.salt), ...enc });
 }
 
@@ -766,13 +774,15 @@ function renderMgmtRejected(view) {
 
 function renderMgmtTable(view, projects) {
     view.innerHTML = "";
+    const create = el("button", { class: "btn-small" }, ["+ New project"]);
+    create.onclick = () => mgmtCreateDialog(view);
     const refresh = el("button", { class: "btn-small" }, ["Refresh"]);
     refresh.onclick = () => renderManagementInto(view);
     const logout = el("button", { class: "btn-small" }, ["Log out"]);
     logout.onclick = () => mgmtLogout(view);
     view.appendChild(el("div", { class: "mgmt-header" }, [
         el("h2", {}, ["Management — host projects (live)"]),
-        el("div", { class: "mgmt-toolbar" }, [refresh, logout]),
+        el("div", { class: "mgmt-toolbar" }, [create, refresh, logout]),
     ]));
     if (projects.length === 0) {
         view.appendChild(el("div", { class: "mgmt-empty" }, ["No projects on this host."]));
@@ -784,13 +794,26 @@ function renderMgmtTable(view, projects) {
     ])];
     for (const p of projects) {
         const running = p.state === "running";
-        const btn = el("button", { class: "btn-small" }, [running ? "Stop" : "Start"]);
-        btn.onclick = () => mgmtAction(view, p.project, running ? "stop" : "start", btn);
+        const power = el("button", { class: "btn-small" }, [running ? "Stop" : "Start"]);
+        power.onclick = () => mgmtAction(view, p.project, running ? "stop" : "start", power);
+        // Attach + Update need a live supervisor (bridge endpoint / recreate);
+        // only offered while running. Destroy is always available.
+        const actions = [power];
+        if (running) {
+            const attach = el("button", { class: "btn-small" }, ["Attach"]);
+            attach.onclick = () => mgmtAttach(view, p.project, attach);
+            const update = el("button", { class: "btn-small" }, ["Update"]);
+            update.onclick = () => mgmtUpdate(view, p.project, update);
+            actions.push(attach, update);
+        }
+        const destroy = el("button", { class: "btn-small btn-danger" }, ["Destroy"]);
+        destroy.onclick = () => mgmtDestroyDialog(view, p.project);
+        actions.push(destroy);
         rows.push(el("div", { class: "mgmt-row" }, [
             el("span", { class: "mgmt-name" }, [p.project]),
             el("span", { class: running ? "state-running" : "state-stopped" }, [p.state]),
             el("span", { class: "mgmt-ssh" }, [p.ssh || "—"]),
-            el("span", {}, [btn]),
+            el("span", { class: "mgmt-actions" }, actions),
         ]));
     }
     view.appendChild(el("div", { class: "mgmt-table" }, rows));
@@ -825,6 +848,218 @@ async function mgmtLogout(view) {
             { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
     } catch (e) { /* logging out is best-effort */ }
     renderMgmtLogin(view);
+}
+
+// An auth/availability status the caller should defer to (re-render the right
+// card), or null if the response carries a real verb result to handle.
+function mgmtStatusRedirect(view, status) {
+    if (status === 401) return () => renderMgmtLogin(view);
+    if (status === 403) return () => renderMgmtRejected(view);
+    if (status === 503) return () => renderMgmtUnavailable(view);
+    return null;
+}
+
+function mgmtErrText(body) {
+    const e = body && body.error;
+    return (e && (e.message || e.kind)) || "unknown error";
+}
+
+// ---- create -----------------------------------------------------------------
+// Minimal create form: name · type · egress · a few --enable presets. The
+// broker's CREATE_WEBUI_FIELDS allow-list is the real input boundary (it drops
+// any path/host-shaped field); full CLI-flag parity is deliberately deferred.
+
+const MGMT_ENABLE_PRESETS = ["websearcher", "wrangler", "echo"];
+
+function mgmtCreateDialog(view) {
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const nameI = el("input", { type: "text", autocomplete: "off" });
+    const typeS = el("select", {}, [
+        el("option", { value: "research" }, ["research"]),
+        el("option", { value: "sandbox" }, ["sandbox"]),
+    ]);
+    const egressS = el("select", {}, [
+        el("option", { value: "open" }, ["open"]),
+        el("option", { value: "locked" }, ["locked"]),
+    ]);
+    const checks = MGMT_ENABLE_PRESETS.map((p) => {
+        const cb = el("input", { type: "checkbox", value: p });
+        return { p, cb, label: el("label", { class: "mgmt-check" }, [cb, " " + p]) };
+    });
+    const errEl = el("div", { class: "error" });
+    const cancel = el("button", { class: "btn btn-secondary" }, ["Cancel"]);
+    cancel.onclick = () => backdrop.remove();
+    const go = el("button", { class: "btn" }, ["Create"]);
+    go.onclick = async () => {
+        errEl.textContent = "";
+        const name = nameI.value.trim();
+        if (!name) { errEl.textContent = "Project name is required."; return; }
+        const enable = checks.filter((c) => c.cb.checked).map((c) => c.p);
+        go.disabled = true; cancel.disabled = true;
+        go.textContent = "Creating… (up to ~2 min)";
+        let res;
+        try {
+            res = await fetch("/broker/project", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ name, type: typeS.value, egress: egressS.value, enable }),
+            });
+        } catch (e) {
+            go.disabled = false; cancel.disabled = false; go.textContent = "Create";
+            errEl.textContent = "Broker unreachable."; return;
+        }
+        const redirect = mgmtStatusRedirect(view, res.status);
+        if (redirect) { backdrop.remove(); return redirect(); }
+        let body; try { body = await res.json(); } catch (e) { body = {}; }
+        if (!body.ok) {
+            go.disabled = false; cancel.disabled = false; go.textContent = "Create";
+            errEl.textContent = "Create failed: " + mgmtErrText(body); return;
+        }
+        backdrop.remove();
+        renderManagementInto(view);
+    };
+    const card = el("div", { class: "card" }, [
+        el("h2", {}, ["New project"]),
+        el("div", { class: "field" }, [el("label", {}, ["Project name"]), nameI]),
+        el("div", { class: "field" }, [el("label", {}, ["Type"]), typeS]),
+        el("div", { class: "field" }, [el("label", {}, ["Egress"]), egressS]),
+        el("div", { class: "field" }, [
+            el("label", {}, ["Enable"]),
+            el("div", { class: "mgmt-checks" }, checks.map((c) => c.label)),
+        ]),
+        el("div", { class: "hint" }, [
+            "Creating stages container images and can take 10–30s (longer cold).",
+        ]),
+        el("div", { class: "btn-row" }, [cancel, go]),
+        errEl,
+    ]);
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+    setTimeout(() => nameI.focus(), 50);
+}
+
+// ---- JIT keyring attach -----------------------------------------------------
+// Fetch the project's SSH coordinates from the broker on demand and open it as
+// a TRANSIENT project (creds in memory only — persistVault strips _jit entries,
+// so they never reach the encrypted blob). No host-side `research webui import`.
+
+async function mgmtAttach(view, name, btn) {
+    btn.disabled = true; const orig = btn.textContent; btn.textContent = "…";
+    let res;
+    try {
+        res = await fetch(`/broker/project/${encodeURIComponent(name)}/attach`,
+            { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    } catch (e) {
+        btn.disabled = false; btn.textContent = orig; alert("Broker unreachable."); return;
+    }
+    const redirect = mgmtStatusRedirect(view, res.status);
+    if (redirect) return redirect();
+    let body; try { body = await res.json(); } catch (e) { body = {}; }
+    if (!body.ok) {
+        btn.disabled = false; btn.textContent = orig;
+        alert("Attach failed: " + mgmtErrText(body)); return;
+    }
+    const info = body.result;   // {name, host, port, username, password}
+    const existing = state.vault.projects.find((p) => p.name === info.name);
+    if (existing) {
+        // Refresh creds in place; preserve its persisted/transient status.
+        existing.host = info.host; existing.port = info.port;
+        existing.username = info.username; existing.password = info.password;
+    } else {
+        state.vault.projects.push({
+            name: info.name, host: info.host, port: info.port,
+            username: info.username, password: info.password, _jit: true,
+        });
+    }
+    closeManagement();
+    await renderDashboard();
+    await activateProject(info.name);
+}
+
+// ---- update (file-only recreate) -------------------------------------------
+
+async function mgmtUpdate(view, name, btn) {
+    const msg = `Update "${name}"?\n\nThis recreates the supervisor with the latest workspace templates (fresh container, re-staged images). Running work is interrupted. No image rebuild.`;
+    if (!confirm(msg)) return;
+    btn.disabled = true; const orig = btn.textContent; btn.textContent = "…";
+    let res;
+    try {
+        res = await fetch(`/broker/project/${encodeURIComponent(name)}/update`,
+            { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    } catch (e) {
+        btn.disabled = false; btn.textContent = orig; alert("Broker unreachable."); return;
+    }
+    const redirect = mgmtStatusRedirect(view, res.status);
+    if (redirect) return redirect();
+    let body; try { body = await res.json(); } catch (e) { body = {}; }
+    if (!body.ok) {
+        btn.disabled = false; btn.textContent = orig;
+        alert("Update failed: " + mgmtErrText(body)); return;
+    }
+    renderManagementInto(view);
+}
+
+// ---- destroy (type-name confirm + step-up re-auth) -------------------------
+
+function mgmtDestroyDialog(view, name) {
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const nameI = el("input", { type: "text", placeholder: name, autocomplete: "off" });
+    const pwI = el("input", { type: "password", autocomplete: "current-password" });
+    const errEl = el("div", { class: "error" });
+    const cancel = el("button", { class: "btn btn-secondary" }, ["Cancel"]);
+    cancel.onclick = () => backdrop.remove();
+    const go = el("button", { class: "btn btn-danger" }, ["Destroy"]);
+    go.onclick = async () => {
+        errEl.textContent = "";
+        if (nameI.value.trim() !== name) {
+            errEl.textContent = "Type the project name exactly to confirm."; return;
+        }
+        if (!pwI.value) {
+            errEl.textContent = "Re-enter your management password."; return;
+        }
+        go.disabled = true; cancel.disabled = true; go.textContent = "…";
+        let res;
+        try {
+            res = await fetch(`/broker/project/${encodeURIComponent(name)}/destroy`, {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ password: pwI.value }),
+            });
+        } catch (e) {
+            go.disabled = false; cancel.disabled = false; go.textContent = "Destroy";
+            errEl.textContent = "Broker unreachable."; return;
+        }
+        const redirect = mgmtStatusRedirect(view, res.status);
+        if (redirect) { backdrop.remove(); return redirect(); }
+        let body; try { body = await res.json(); } catch (e) { body = {}; }
+        if (!body.ok) {
+            go.disabled = false; cancel.disabled = false; go.textContent = "Destroy";
+            errEl.textContent = (body.error && body.error.kind) === "step_up_required"
+                ? "Wrong password." : "Destroy failed: " + mgmtErrText(body);
+            return;
+        }
+        // Drop any local bookmark/transient entry for the now-gone project.
+        state.vault.projects = state.vault.projects.filter((p) => p.name !== name);
+        try { await persistVault(); } catch (e) { /* best-effort */ }
+        backdrop.remove();
+        renderManagementInto(view);
+    };
+    const card = el("div", { class: "card" }, [
+        el("h2", {}, ["Destroy project"]),
+        el("p", {}, [
+            `This permanently deletes "${name}" — its container, workspace, ` +
+            "volume, and network. This cannot be undone.",
+        ]),
+        el("div", { class: "field" }, [
+            el("label", {}, ["Type the project name to confirm"]), nameI,
+        ]),
+        el("div", { class: "field" }, [
+            el("label", {}, ["Re-enter management password"]), pwI,
+        ]),
+        el("div", { class: "btn-row" }, [cancel, go]),
+        errEl,
+    ]);
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+    setTimeout(() => nameI.focus(), 50);
 }
 
 function makeProjectRow(project) {
