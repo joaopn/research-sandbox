@@ -673,6 +673,10 @@ function openManagement() {
         mainArea.appendChild(view);
     }
     view.style.display = "";
+    // Management and a project tab are mutually exclusive — clear the rail's
+    // active project so focus moves cleanly to Management (activateProject does
+    // the reverse via closeManagement).
+    document.querySelectorAll(".project-rail .project").forEach((r) => r.classList.remove("active"));
     document.querySelectorAll(".management-entry").forEach((e) => e.classList.add("active"));
     renderManagementInto(view);
 }
