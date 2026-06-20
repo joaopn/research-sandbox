@@ -37,7 +37,12 @@ RUN /opt/conda/bin/conda install -n base -y -c conda-forge \
 
 # Claude Code CLI for the worker user. As with the supervisor, Docker build
 # gets the host's network, so this doesn't depend on runtime router egress.
-RUN su - worker -c 'curl -fsSL https://claude.ai/install.sh | bash' && \
+# Version is pinned (versions.env → --build-arg) so a `--rebuild` refetches
+# instead of caching the install layer forever; the install host is
+# downloads.claude.ai. Outer double-quotes so the build ARG expands before
+# `su -` resets the env (a `su - ... 'single-quoted'` body would not see it).
+ARG CLAUDE_CODE_VERSION=stable
+RUN su - worker -c "curl -fsSL https://claude.ai/install.sh | bash -s -- ${CLAUDE_CODE_VERSION}" && \
     su - worker -c 'echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.bashrc'
 
 # Minimal byobu status line — only the time widget on the right, nothing
