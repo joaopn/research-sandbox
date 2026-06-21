@@ -427,6 +427,11 @@ async function renderDashboard() {
     if (state.activeProject) {
         await activateProject(state.activeProject);
     }
+
+    // Repopulate the sidebar from the broker's running set (non-blocking) so a
+    // reload doesn't lose the transient (_jit) create/attach rows. No-ops when
+    // not logged into Management.
+    syncSidebarFromBroker();
 }
 
 // ---- rail expand / pin -----------------------------------------------------
@@ -615,6 +620,72 @@ function togglePinned() {
 
 // ---- project rail ----------------------------------------------------------
 
+// Rebuild the sidebar rail in place after a management op changes the project
+// set (create adds a row, destroy removes one). Targeted — NOT renderDashboard,
+// which clearBody()s and would tear down any open service tabs. A management box,
+// if still open, is a position:fixed overlay above the rail, so refreshing the
+// rail behind it is invisible until the box closes.
+function refreshProjectRail() {
+    const old = document.querySelector(".project-rail");
+    if (!old) return;
+    old.replaceWith(makeProjectRail());
+    applyRailState();
+    schedulePolling();
+}
+
+// Fetch a project's SSH coordinates from the broker (JIT keyring) and add/refresh
+// its sidebar entry as a transient (_jit) bookmark — same shape mgmtAttach uses,
+// but it neither activates nor re-renders. Best-effort: returns true on success,
+// false on any failure (the caller's op already succeeded; the row is a bonus).
+async function attachIntoVault(name) {
+    let res;
+    try {
+        res = await fetch(`/broker/project/${encodeURIComponent(name)}/attach`,
+            { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    } catch (e) { return false; }
+    if (!res.ok) return false;
+    let body; try { body = await res.json(); } catch (e) { return false; }
+    if (!body.ok || !body.result) return false;
+    const info = body.result;   // {name, host, port, username, password}
+    const existing = state.vault.projects.find((p) => p.name === info.name);
+    if (existing) {
+        existing.host = info.host; existing.port = info.port;
+        existing.username = info.username; existing.password = info.password;
+    } else {
+        state.vault.projects.push({
+            name: info.name, host: info.host, port: info.port,
+            username: info.username, password: info.password, _jit: true,
+        });
+    }
+    return true;
+}
+
+// Merge the broker's RUNNING projects into the sidebar. The created/attached
+// rows are transient (_jit — creds in memory only, never persisted, so SSH
+// passwords stay out of localStorage), so a page reload drops them; this re-adds
+// them from the authoritative broker list. Needs a Management session (the
+// cookie survives the reload) — silently no-ops when logged out, leaving the
+// rail as whatever persisted vault bookmarks exist. Best-effort + non-blocking:
+// the rail re-renders once the running set lands.
+async function syncSidebarFromBroker(prefetched) {
+    let list = prefetched;
+    if (!Array.isArray(list)) {
+        let res;
+        try { res = await fetch("/broker/projects"); } catch (e) { return; }
+        if (!res.ok) return;                     // 401/403/503 → no session
+        let body; try { body = await res.json(); } catch (e) { return; }
+        if (!body.ok || !Array.isArray(body.result)) return;
+        list = body.result;
+    }
+    const running = list.filter((p) => p.state === "running");
+    let added = 0;
+    await Promise.all(running.map(async (p) => {
+        if (state.vault.projects.some((v) => v.name === p.project)) return;
+        if (await attachIntoVault(p.project)) added++;
+    }));
+    if (added) refreshProjectRail();
+}
+
 function makeProjectRail() {
     const rail = el("aside", { class: "project-rail" });
     const splitter = el("div", { class: "rail-splitter", title: "Drag to resize" });
@@ -705,6 +776,9 @@ async function renderManagementInto(view) {
     try { body = await res.json(); } catch (e) { return renderMgmtUnavailable(view); }
     if (!res.ok || !body.ok) return renderMgmtUnavailable(view);
     renderMgmtTable(view, body.result || []);
+    // Reuse the authoritative list to repopulate the sidebar's running set
+    // (so opening / logging into Management surfaces running projects there too).
+    syncSidebarFromBroker(body.result || []);
 }
 
 function mgmtCard(view, children) {
@@ -803,7 +877,7 @@ function renderMgmtTable(view, projects) {
         const sizeEl = el("span", { class: "mgmt-size" }, ["…"]);
         fill[p.project] = { badge, size: sizeEl };
         const power = el("button", { class: "btn-small" }, [running ? "Stop" : "Start"]);
-        power.onclick = () => mgmtAction(view, p.project, running ? "stop" : "start", power);
+        power.onclick = () => mgmtAction(view, p.project, running ? "stop" : "start");
         // Attach + Update need a live supervisor (bridge endpoint / recreate);
         // only offered while running. Destroy is always available.
         const actions = [power];
@@ -811,7 +885,7 @@ function renderMgmtTable(view, projects) {
             const attach = el("button", { class: "btn-small" }, ["Attach"]);
             attach.onclick = () => mgmtAttach(view, p.project, attach);
             const update = el("button", { class: "btn-small" }, ["Update"]);
-            update.onclick = () => mgmtUpdate(view, p.project, update);
+            update.onclick = () => mgmtUpdate(view, p.project);
             actions.push(attach, update);
         }
         const destroy = el("button", { class: "btn-small btn-danger" }, ["Destroy"]);
@@ -863,27 +937,19 @@ function setTypeBadge(elm, flavor) {
     elm.textContent = flavor || "";
 }
 
-async function mgmtAction(view, name, action, btn) {
-    const msg = action === "start"
-        ? `Start "${name}"?\n\nThis recreates the supervisor (fresh container, re-staged images) and takes a moment. Running work is unaffected.`
-        : `Stop "${name}"?\n\nThis interrupts any running work in the supervisor.`;
-    if (!confirm(msg)) return;
-    btn.disabled = true;
-    const orig = btn.textContent;
-    btn.textContent = "…";
-    let res;
-    try {
-        res = await fetch(
+function mgmtAction(view, name, action) {
+    const desc = action === "start"
+        ? `Start "${name}". This recreates the supervisor (fresh container, re-staged images) and takes a moment. Running work is unaffected.`
+        : `Stop "${name}". This interrupts any running work in the supervisor.`;
+    mgmtConfirmThenTail(view, {
+        title: `${action === "start" ? "Start" : "Stop"} project ${name}`,
+        verb: action,
+        confirmLabel: action === "start" ? "Start" : "Stop",
+        body: [el("p", {}, [desc])],
+        request: () => fetch(
             `/broker/project/${encodeURIComponent(name)}/${action}`,
-            { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-    } catch (e) {
-        btn.disabled = false; btn.textContent = orig;
-        alert("Broker unreachable."); return;
-    }
-    if (res.status === 401) return renderMgmtLogin(view);
-    if (res.status === 403) return renderMgmtRejected(view);
-    if (res.status === 503) return renderMgmtUnavailable(view);
-    renderManagementInto(view);   // re-fetch so the new state lands authoritatively
+            { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }),
+    });
 }
 
 async function mgmtLogout(view) {
@@ -908,6 +974,219 @@ function mgmtErrText(body) {
     return (e && (e.message || e.kind)) || "unknown error";
 }
 
+// ---- two-phase op box: confirm → live progress tail ------------------------
+// One floating box for every write action (start / stop / update / create /
+// destroy). Phase 1 confirms (and, for destroy, collects the type-name + step-up
+// password). Phase 2 fires the op, gets an op_id, and tails the broker's view
+// log live to a terminal milestone, then shows the result + a Close button.
+// Input validation surfaces in phase 1 (client checks + the broker's synchronous
+// op_id/field validation at the POST); the verb's own execution outcome — incl.
+// destroy's step-up password re-verification, which the broker runs async —
+// surfaces in phase 2.
+
+// Poll cadence for the op view-log tail. Milestones are coarse (≈5–8 per op over
+// a 10–30s lifecycle), so sub-second polling is plenty live without hammering
+// the webui; at 2× (1.2s) progress feels laggy, at ½ (300ms) it's needless load
+// for a single operator driving one op at a time.
+const OP_POLL_INTERVAL_MS = 600;
+
+function opSleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// Expected milestone checklist per verb — rendered UP FRONT (all rows pending)
+// so the operator sees what's still to come, each row flipping to a green ✓ as
+// its milestone lands. Keys match the rscore progress.step() keys. The terminal
+// "done" record is NOT a row — it's the foot button that enables on completion.
+// Conditional stages a verb may or may not emit (e.g. update's enable/disable/
+// refresh on a recreate, or create's data-dir setup) are deliberately NOT
+// pre-listed — they append already-checked as they arrive, so a missing optional
+// stage never leaves a stuck pending row.
+const OP_CHECKLISTS = {
+    create: [
+        { key: "validate", label: "checking prerequisites" },
+        { key: "network", label: "creating project network" },
+        { key: "create-container", label: "creating supervisor container" },
+        { key: "stage-images", label: "staging inner images" },
+        { key: "wire", label: "enabling workers and sandboxes" },
+    ],
+    destroy: [
+        { key: "validate", label: "locating project" },
+        { key: "router", label: "removing router rules" },
+        { key: "remove-container", label: "removing container" },
+        { key: "cleanup", label: "removing workspace, volume and network" },
+    ],
+    start: [
+        { key: "validate", label: "checking project" },
+        { key: "recreate", label: "recreating supervisor" },
+    ],
+    stop: [
+        { key: "validate", label: "checking project" },
+        { key: "stop", label: "stopping container" },
+    ],
+    update: [
+        { key: "validate", label: "validating update" },
+        { key: "recreate", label: "recreating supervisor" },
+    ],
+};
+
+// Human message for a failed op, from its structured result envelope.
+function mgmtOpFailMsg(result) {
+    const err = result && result.error;
+    const kind = err && err.kind;
+    if (kind === "step_up_required") return "Wrong password.";
+    if (kind === "broker_unavailable") return "Broker unreachable.";
+    if (err && err.message) return err.message;
+    return kind || "operation failed";
+}
+
+// Phase 2: swap `card` to the expected-stage CHECKLIST and tail op `opId` to
+// completion, flipping each row to ✓ as its milestone lands. Status
+// (GET /broker/op/<id>) is the source of truth for completion — it covers the
+// no-log failure paths (broker_unavailable, step-up reject, internal) where the
+// broker never wrote a view file. A log terminal is a fallback for the
+// webui-restarted-mid-op case where OP_RUNS was lost (status → "unknown").
+async function mgmtTailOp(view, backdrop, card, opId, title, verb, onDone) {
+    const checklist = OP_CHECKLISTS[verb] || [];
+    const listEl = el("div", { class: "op-checklist" });
+    const items = {};   // stepKey → { row, icon }
+    const addRow = (key, label) => {
+        const icon = el("span", { class: "op-check-icon" }, ["○"]);
+        const row = el("div", { class: "op-check pending" },
+                       [icon, el("span", { class: "op-check-label" }, [label])]);
+        listEl.appendChild(row);
+        items[key] = { row, icon };
+        return items[key];
+    };
+    for (const it of checklist) addRow(it.key, it.label);
+    const markDone = (key) => {
+        // A conditional stage not pre-listed (e.g. update enable/disable) appends
+        // already-checked as it arrives.
+        const ref = items[key] || addRow(key, key);
+        ref.row.classList.remove("pending");
+        ref.row.classList.add("ok");
+        ref.icon.textContent = "✓";
+    };
+
+    // The failure reason — populated ONLY on failure; the running/done state is
+    // conveyed by the checklist + the foot button, with no status chatter above.
+    const failEl = el("div", { class: "op-fail" });
+    // "Done" is the foot button, DISABLED until the op reaches a terminal state,
+    // so the box can't be dismissed mid-op. The _run_op catch-all guarantees the
+    // status reaches a terminal value within the op timeout, so it always enables
+    // in-session.
+    const doneBtn = el("button", { class: "btn", disabled: "" }, ["Working…"]);
+    doneBtn.onclick = () => {
+        if (doneBtn.disabled) return;
+        backdrop.remove();
+        renderManagementInto(view);
+    };
+    card.innerHTML = "";
+    card.appendChild(el("h2", {}, [title]));
+    card.appendChild(listEl);
+    card.appendChild(failEl);
+    card.appendChild(el("div", { class: "btn-row" }, [doneBtn]));
+
+    let from = 0, done = false, result = null, ok = false;
+    let sawTerminal = false, terminalOk = false;
+    const drainLog = async () => {
+        const r = await fetch(`/broker/op/${encodeURIComponent(opId)}/log?from=${from}`);
+        const redirect = mgmtStatusRedirect(view, r.status);
+        if (redirect) return redirect;          // truthy → caller dismisses + redirects
+        const b = await r.json();
+        if (b.started !== false && b.data) {
+            from = b.next;
+            for (const line of b.data.split("\n")) {
+                if (!line.trim()) continue;
+                let rec; try { rec = JSON.parse(line); } catch (e) { continue; }
+                if (rec.status === "done") { sawTerminal = true; terminalOk = true; }
+                else if (rec.status === "failed") { sawTerminal = true; terminalOk = false; }
+                else markDone(rec.step);
+            }
+        }
+        return null;
+    };
+
+    while (!done) {
+        // 1. Drain new view-log bytes, flipping each landed stage to ✓.
+        try {
+            const redirect = await drainLog();
+            if (redirect) { backdrop.remove(); return redirect(); }
+        } catch (e) { /* transient; the status poll below decides completion */ }
+        // 2. Status — authoritative for completion.
+        try {
+            const r = await fetch(`/broker/op/${encodeURIComponent(opId)}`);
+            const redirect = mgmtStatusRedirect(view, r.status);
+            if (redirect) { backdrop.remove(); return redirect(); }
+            const sb = await r.json();
+            if (sb.state === "ok" || sb.state === "failed") {
+                result = sb.result || null;
+                ok = sb.state === "ok";
+                done = true;
+                break;
+            }
+            // state "unknown" → OP_RUNS lost (webui restart); fall back to a log
+            // terminal if we saw one, else keep polling for the file to appear.
+            if (sb.state === "unknown" && sawTerminal) {
+                ok = terminalOk; done = true; break;
+            }
+        } catch (e) { /* transient */ }
+        await opSleep(OP_POLL_INTERVAL_MS);
+    }
+    // Final drain: the terminal milestone may have landed between this tick's
+    // /log and /status fetches, so the trailing stage row is settled.
+    try { await drainLog(); } catch (e) { /* best-effort */ }
+    if (!ok) failEl.textContent = "Failed — " + mgmtOpFailMsg(result);
+    doneBtn.textContent = "Done";
+    doneBtn.disabled = false;
+    if (onDone) { try { await onDone(ok, result); } catch (e) { /* best-effort */ } }
+}
+
+// Build the phase-1 confirm card; on confirm, fire `cfg.request()`, then hand
+// the returned op_id to mgmtTailOp for phase 2. Shared by all five write actions.
+function mgmtConfirmThenTail(view, cfg) {
+    // A dialog is already open — a fast double-click on a row button would
+    // otherwise stack two backdrops (harmless, since the confirm gates
+    // execution, but two to dismiss). Same guard the service-control path uses.
+    if (document.querySelector(".modal-backdrop")) return null;
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const errEl = el("div", { class: "error" });
+    const cancel = el("button", { class: "btn btn-secondary" }, ["Cancel"]);
+    cancel.onclick = () => backdrop.remove();
+    const go = el("button", { class: cfg.danger ? "btn btn-danger" : "btn" },
+                 [cfg.confirmLabel]);
+    const card = el("div", { class: "card" }, [
+        el("h2", {}, [cfg.title]),
+        ...cfg.body,
+        el("div", { class: "btn-row" }, [cancel, go]),
+        errEl,
+    ]);
+    go.onclick = async () => {
+        errEl.textContent = "";
+        const verr = cfg.validate ? cfg.validate() : null;
+        if (verr) { errEl.textContent = verr; return; }
+        go.disabled = true; cancel.disabled = true;
+        const orig = cfg.confirmLabel; go.textContent = "…";
+        let res;
+        try { res = await cfg.request(); }
+        catch (e) {
+            go.disabled = false; cancel.disabled = false; go.textContent = orig;
+            errEl.textContent = "Broker unreachable."; return;
+        }
+        const redirect = mgmtStatusRedirect(view, res.status);
+        if (redirect) { backdrop.remove(); return redirect(); }
+        let body; try { body = await res.json(); } catch (e) { body = {}; }
+        if (!body.ok || !body.op_id) {
+            go.disabled = false; cancel.disabled = false; go.textContent = orig;
+            errEl.textContent = "Failed: " + mgmtErrText(body); return;
+        }
+        await mgmtTailOp(view, backdrop, card, body.op_id,
+                         cfg.tailTitle || cfg.title, cfg.verb, cfg.onDone);
+    };
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+    if (cfg.focus) setTimeout(() => cfg.focus(), 50);
+    return backdrop;
+}
+
 // ---- create -----------------------------------------------------------------
 // Minimal create form: name · type · egress · a few --enable presets. The
 // broker's CREATE_WEBUI_FIELDS allow-list is the real input boundary (it drops
@@ -916,7 +1195,6 @@ function mgmtErrText(body) {
 const MGMT_ENABLE_PRESETS = ["websearcher", "wrangler", "echo"];
 
 function mgmtCreateDialog(view) {
-    const backdrop = el("div", { class: "modal-backdrop" });
     const nameI = el("input", { type: "text", autocomplete: "off" });
     const typeS = el("select", {}, [
         el("option", { value: "research" }, ["research"]),
@@ -930,55 +1208,39 @@ function mgmtCreateDialog(view) {
         const cb = el("input", { type: "checkbox", value: p });
         return { p, cb, label: el("label", { class: "mgmt-check" }, [cb, " " + p]) };
     });
-    const errEl = el("div", { class: "error" });
-    const cancel = el("button", { class: "btn btn-secondary" }, ["Cancel"]);
-    cancel.onclick = () => backdrop.remove();
-    const go = el("button", { class: "btn" }, ["Create"]);
-    go.onclick = async () => {
-        errEl.textContent = "";
-        const name = nameI.value.trim();
-        if (!name) { errEl.textContent = "Project name is required."; return; }
-        const enable = checks.filter((c) => c.cb.checked).map((c) => c.p);
-        go.disabled = true; cancel.disabled = true;
-        go.textContent = "Creating… (up to ~2 min)";
-        let res;
-        try {
-            res = await fetch("/broker/project", {
-                method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ name, type: typeS.value, egress: egressS.value, enable }),
-            });
-        } catch (e) {
-            go.disabled = false; cancel.disabled = false; go.textContent = "Create";
-            errEl.textContent = "Broker unreachable."; return;
-        }
-        const redirect = mgmtStatusRedirect(view, res.status);
-        if (redirect) { backdrop.remove(); return redirect(); }
-        let body; try { body = await res.json(); } catch (e) { body = {}; }
-        if (!body.ok) {
-            go.disabled = false; cancel.disabled = false; go.textContent = "Create";
-            errEl.textContent = "Create failed: " + mgmtErrText(body); return;
-        }
-        backdrop.remove();
-        renderManagementInto(view);
-    };
-    const card = el("div", { class: "card" }, [
-        el("h2", {}, ["New project"]),
-        el("div", { class: "field" }, [el("label", {}, ["Project name"]), nameI]),
-        el("div", { class: "field" }, [el("label", {}, ["Type"]), typeS]),
-        el("div", { class: "field" }, [el("label", {}, ["Egress"]), egressS]),
-        el("div", { class: "field" }, [
-            el("label", {}, ["Enable"]),
-            el("div", { class: "mgmt-checks" }, checks.map((c) => c.label)),
-        ]),
-        el("div", { class: "hint" }, [
-            "Creating stages container images and can take 10–30s (longer cold).",
-        ]),
-        el("div", { class: "btn-row" }, [cancel, go]),
-        errEl,
-    ]);
-    backdrop.appendChild(card);
-    document.body.appendChild(backdrop);
-    setTimeout(() => nameI.focus(), 50);
+    mgmtConfirmThenTail(view, {
+        title: "New project",
+        tailTitle: "Creating project",
+        verb: "create",
+        confirmLabel: "Create",
+        body: [
+            el("div", { class: "field" }, [el("label", {}, ["Project name"]), nameI]),
+            el("div", { class: "field" }, [el("label", {}, ["Type"]), typeS]),
+            el("div", { class: "field" }, [el("label", {}, ["Egress"]), egressS]),
+            el("div", { class: "field" }, [
+                el("label", {}, ["Enable"]),
+                el("div", { class: "mgmt-checks" }, checks.map((c) => c.label)),
+            ]),
+            el("div", { class: "hint" }, [
+                "Creating stages container images and can take 10–30s (longer cold).",
+            ]),
+        ],
+        validate: () => nameI.value.trim() ? null : "Project name is required.",
+        request: () => fetch("/broker/project", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                name: nameI.value.trim(), type: typeS.value, egress: egressS.value,
+                enable: checks.filter((c) => c.cb.checked).map((c) => c.p),
+            }),
+        }),
+        // On success, surface the new (running) project in the sidebar — JIT-fetch
+        // its creds the same way Attach does, then refresh the rail behind the box.
+        onDone: async (ok) => {
+            if (!ok) return;
+            if (await attachIntoVault(nameI.value.trim())) refreshProjectRail();
+        },
+        focus: () => nameI.focus(),
+    });
 }
 
 // ---- JIT keyring attach -----------------------------------------------------
@@ -1021,102 +1283,78 @@ async function mgmtAttach(view, name, btn) {
 
 // ---- update (file-only recreate) -------------------------------------------
 
-async function mgmtUpdate(view, name, btn) {
-    const msg = `Update "${name}"?\n\nThis recreates the supervisor with the latest workspace templates (fresh container, re-staged images). Running work is interrupted. No image rebuild.`;
-    if (!confirm(msg)) return;
-    btn.disabled = true; const orig = btn.textContent; btn.textContent = "…";
-    let res;
-    try {
-        res = await fetch(`/broker/project/${encodeURIComponent(name)}/update`,
-            { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-    } catch (e) {
-        btn.disabled = false; btn.textContent = orig; alert("Broker unreachable."); return;
-    }
-    const redirect = mgmtStatusRedirect(view, res.status);
-    if (redirect) return redirect();
-    let body; try { body = await res.json(); } catch (e) { body = {}; }
-    if (!body.ok) {
-        btn.disabled = false; btn.textContent = orig;
-        alert("Update failed: " + mgmtErrText(body)); return;
-    }
-    renderManagementInto(view);
+function mgmtUpdate(view, name) {
+    mgmtConfirmThenTail(view, {
+        title: `Update project ${name}`,
+        tailTitle: `Updating ${name}`,
+        verb: "update",
+        confirmLabel: "Update",
+        body: [el("p", {}, [
+            `Update "${name}". This recreates the supervisor with the latest ` +
+            "workspace templates (fresh container, re-staged images). Running " +
+            "work is interrupted. No image rebuild.",
+        ])],
+        request: () => fetch(`/broker/project/${encodeURIComponent(name)}/update`,
+            { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }),
+    });
 }
 
 // ---- destroy (type-name confirm + step-up re-auth) -------------------------
 
 function mgmtDestroyDialog(view, name) {
-    const backdrop = el("div", { class: "modal-backdrop" });
     const nameI = el("input", { type: "text", placeholder: name, autocomplete: "off" });
     const pwI = el("input", { type: "password", autocomplete: "current-password" });
-    const errEl = el("div", { class: "error" });
-    const cancel = el("button", { class: "btn btn-secondary" }, ["Cancel"]);
-    cancel.onclick = () => backdrop.remove();
-    const go = el("button", { class: "btn btn-danger" }, ["Destroy"]);
-    go.onclick = async () => {
-        errEl.textContent = "";
-        if (nameI.value.trim() !== name) {
-            errEl.textContent = "Type the project name exactly to confirm."; return;
-        }
-        if (!pwI.value) {
-            errEl.textContent = "Re-enter your management password."; return;
-        }
-        go.disabled = true; cancel.disabled = true; go.textContent = "…";
-        let res;
-        try {
-            res = await fetch(`/broker/project/${encodeURIComponent(name)}/destroy`, {
-                method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ password: pwI.value }),
-            });
-        } catch (e) {
-            go.disabled = false; cancel.disabled = false; go.textContent = "Destroy";
-            errEl.textContent = "Broker unreachable."; return;
-        }
-        const redirect = mgmtStatusRedirect(view, res.status);
-        if (redirect) { backdrop.remove(); return redirect(); }
-        let body; try { body = await res.json(); } catch (e) { body = {}; }
-        if (!body.ok) {
-            go.disabled = false; cancel.disabled = false; go.textContent = "Destroy";
-            errEl.textContent = (body.error && body.error.kind) === "step_up_required"
-                ? "Wrong password." : "Destroy failed: " + mgmtErrText(body);
-            return;
-        }
-        // Drop any local bookmark/transient entry for the now-gone project.
-        state.vault.projects = state.vault.projects.filter((p) => p.name !== name);
-        try { await persistVault(); } catch (e) { /* best-effort */ }
-        backdrop.remove();
-        renderManagementInto(view);
-    };
-    const card = el("div", { class: "card" }, [
-        el("h2", {}, ["Destroy project"]),
-        el("p", {}, [
-            `This permanently deletes "${name}" — its container, workspace, ` +
-            "volume, and network. This cannot be undone.",
-        ]),
-        el("div", { class: "field" }, [
-            el("label", {}, ["Type the project name to confirm"]), nameI,
-        ]),
-        el("div", { class: "field" }, [
-            el("label", {}, ["Re-enter management password"]), pwI,
-        ]),
-        el("div", { class: "btn-row" }, [cancel, go]),
-        errEl,
-    ]);
-    backdrop.appendChild(card);
-    document.body.appendChild(backdrop);
-    setTimeout(() => nameI.focus(), 50);
+    mgmtConfirmThenTail(view, {
+        title: "Destroy project",
+        tailTitle: `Destroying ${name}`,
+        verb: "destroy",
+        confirmLabel: "Destroy",
+        danger: true,
+        body: [
+            el("p", {}, [
+                `This permanently deletes "${name}" — its container, workspace, ` +
+                "volume, and network. This cannot be undone.",
+            ]),
+            el("div", { class: "field" }, [
+                el("label", {}, ["Type the project name to confirm"]), nameI,
+            ]),
+            el("div", { class: "field" }, [
+                el("label", {}, ["Re-enter management password"]), pwI,
+            ]),
+        ],
+        validate: () => {
+            if (nameI.value.trim() !== name) return "Type the project name exactly to confirm.";
+            if (!pwI.value) return "Re-enter your management password.";
+            return null;
+        },
+        // The step-up password rides the request; the broker re-verifies it
+        // async, so a wrong password surfaces as a FAILED op in phase 2
+        // ("Failed — Wrong password."), not an inline phase-1 error.
+        request: () => fetch(`/broker/project/${encodeURIComponent(name)}/destroy`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ password: pwI.value }),
+        }),
+        onDone: async (ok) => {
+            if (!ok) return;
+            // Tear down the gone project's open terminals/websockets (no dead
+            // reconnect spam), drop it from the sidebar + persisted vault, then
+            // refresh the rail behind the box so the row disappears.
+            teardownProjectState(name);
+            state.vault.projects = state.vault.projects.filter((p) => p.name !== name);
+            try { await persistVault(); } catch (e) { /* best-effort */ }
+            refreshProjectRail();
+        },
+        focus: () => nameI.focus(),
+    });
 }
 
 function makeProjectRow(project) {
     const dot = el("span", { class: "status-dot" });
     const name = el("span", { class: "name" }, [project.name]);
-    const closeX = el("span", { class: "close-x", title: "Remove project" }, ["×"]);
-    closeX.onclick = (ev) => {
-        ev.stopPropagation();
-        if (confirm(`Remove project "${project.name}"? (Supervisor and its container are not affected.)`)) {
-            removeProject(project.name);
-        }
-    };
-    const head = el("div", { class: "project-head" }, [dot, name, closeX]);
+    // No per-row remove/destroy: project lifecycle is the Management panel's job
+    // (broker create/destroy). The rail just reflects the running set — create
+    // adds a row, destroy removes it (see mgmtConfirmThenTail onDone hooks).
+    const head = el("div", { class: "project-head" }, [dot, name]);
     // Second line: a project-type badge (research/sandbox, filled by
     // fetchProjectsStatus) + the worker-activity figures, plus the always-
     // present config gear. The gear opens the per-project floating config box.
@@ -1472,7 +1710,11 @@ function openAddProjectModal() {
     document.body.appendChild(backdrop);
 }
 
-async function removeProject(name) {
+// Render-free teardown of a project's in-page state — close its terminals +
+// websockets (so a destroyed container stops drawing reconnect attempts), drop
+// its cached services, and clear it as active if it was. Callers handle the
+// vault entry + re-render. Used when a project is destroyed via Management.
+function teardownProjectState(name) {
     for (const k of Object.keys(state.terminals)) {
         if (k.startsWith(`${name}:`)) {
             const t = state.terminals[k];
@@ -1481,14 +1723,11 @@ async function removeProject(name) {
             delete state.terminals[k];
         }
     }
-    state.vault.projects = state.vault.projects.filter((p) => p.name !== name);
     delete state.projectServices[name];
     if (state.activeProject === name) {
         state.activeProject = null;
         state.activeService = null;
     }
-    await persistVault();
-    await renderDashboard();
 }
 
 // ---- split pane (W8) -------------------------------------------------------

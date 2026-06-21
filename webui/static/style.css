@@ -96,7 +96,8 @@ body {
     font-size: 13px;
     font-weight: 500;
 }
-.btn:hover { background: var(--btn-bg-hover); }
+.btn:hover:not(:disabled) { background: var(--btn-bg-hover); }
+.btn:disabled { opacity: 0.5; cursor: default; }
 .btn-secondary { background: var(--btn-secondary-bg); }
 .btn-secondary:hover { background: var(--btn-secondary-bg-hover); }
 .btn-danger { background: var(--btn-danger-bg); }
@@ -236,13 +237,6 @@ body {
     overflow: hidden;
     text-overflow: ellipsis;
 }
-.project-rail .project .close-x {
-    color: var(--fg-faint);
-    padding: 0 4px;
-    font-size: 16px;
-    line-height: 1;
-}
-.project-rail .project .close-x:hover { color: var(--fg-base); }
 
 /* Status sub-lines: hide when empty so unprobed rows don't reserve
    visual space, and indent past the status dot's slot. */
@@ -636,6 +630,32 @@ body {
     max-height: 90vh;
     overflow-y: auto;
 }
+
+/* Two-phase op box — phase-2 expected-stage checklist (WEBUI_OPLOG). */
+.op-checklist {
+    margin: 0 0 4px;
+    max-height: 50vh;
+    overflow-y: auto;
+}
+.op-fail { color: var(--error-fg); font-size: 13px; margin: 8px 0 0; min-height: 0; }
+.op-check {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 4px 0;
+    font-size: 13px;
+}
+.op-check-icon {
+    flex: 0 0 1.1em;
+    text-align: center;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+}
+.op-check.pending { color: var(--fg-faint); }
+.op-check.pending .op-check-icon { color: var(--fg-faint); }
+.op-check.ok { color: var(--fg-base); }
+.op-check.ok .op-check-icon { color: var(--status-up); }
+.op-check.failed { color: var(--error-fg); }
+.op-check.failed .op-check-icon { color: var(--status-error); }
 
 /* ---- Management (broker-driven host lifecycle) -------------------------- */
 .rail-management {

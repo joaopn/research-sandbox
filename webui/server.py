@@ -148,11 +148,50 @@ BROKER_CALL_TIMEOUT_S = 30
 # exceed this bound.
 BROKER_CREATE_TIMEOUT_S = 120
 
+# Read-timeout for a webui-fired BACKGROUND op (create/start/stop/update/destroy).
+# Unlike the synchronous relays, the HTTP response already returned the op_id, so
+# this timeout no longer bounds a request — its ONLY job is to terminalize an op
+# whose daemon accepted the connection but never replied (a wedged daemon). A
+# genuinely *down* broker still fails instantly at connect (FileNotFoundError /
+# ConnectionRefused), independent of this value, so a large bound never delays
+# real failure detection — it only stops cutting off a legitimately slow op.
+# It must exceed the worst legitimate wall time: a cold create (<=120s, per
+# BROKER_CREATE_TIMEOUT_S) possibly queued behind another slow op on the serial
+# broker. 600s = 5x the single-op cold ceiling — covers a ~2-deep queue of cold
+# creates with loaded-host headroom; a daemon silent for 10 min is wedged. (Half,
+# 300s, still brushes a queued pair on a slow host; 10x, 3600s, would delay
+# wedged-daemon detection to an hour.) The earlier 120s alias was the bug: a cold
+# create occasionally ran past it and the webui reported "broker unreachable"
+# while the serial daemon finished the create — visible on the next refresh.
+BROKER_OP_TIMEOUT_S = 600
+
 # Management sessions: opaque webui cookie → {broker_token, expires}. Distinct
 # from the per-project SSH SESSIONS map. Process-memory only; a webui restart
 # drops them (re-login), mirroring the broker's own in-daemon token store.
 BROKER_SESSIONS: dict[str, dict] = {}
 BROKER_COOKIE = "rs_broker"
+
+# Per-operation progress (WEBUI_OPLOG). The broker writes a per-op view log
+# under run/oplogs/; run/ is RO-mounted at the socket's parent dir, so the
+# webui reads the view file directly — out-of-band from the one-shot socket, so
+# it can poll while the op is still in flight.
+RS_BROKER_OPLOG_DIR = str(Path(RS_BROKER_SOCKET).parent / "oplogs")
+
+# In-process op handles: op_id → {"state","result","task","broker_token"}.
+# state ∈ {"running","ok","failed"}. The browser gets the op_id immediately and
+# polls the log file (durable) + this status (the structured verb result on
+# completion). Add-only for now (mirrors the broker's add-only file retention);
+# a webui restart drops it, after which the browser falls back to the log's
+# terminal milestone. NOTE for the deferred retention work: a completed `create`
+# result carries the project ssh_password, so it lingers here keyed by op_id for
+# the webui's lifetime — when retention lands, evict OP_RUNS entries (and
+# consider dropping entry["result"] once the browser has fetched it).
+OP_RUNS: dict[str, dict] = {}
+
+# op_id names a file on both sides; validate it as a safe basename before it
+# does. Mirror of cli/broker.py::_OP_ID_RE — first char alnum, rest
+# alnum/dot/dash/underscore: no separator, no leading dot, so traversal is out.
+_OP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 # Global login rate-limit. NOT per-IP: behind tailscale / a reverse proxy the
 # source IP collapses to one address (per-IP would lock everyone out) or is
@@ -212,15 +251,19 @@ class BrokerForbidden(Exception):
 
 
 async def broker_call(verb: str, args: dict | None = None, *,
-                      token: str | None = None,
+                      token: str | None = None, op_id: str | None = None,
                       timeout: float = BROKER_CALL_TIMEOUT_S) -> dict:
     """Send one framed request to the broker and return the parsed reply.
     Async mirror of cli/broker.py::client_call. Raises BrokerUnavailable /
     BrokerForbidden; otherwise returns the reply dict (which may itself be an
-    {ok:false,...} application error such as unauthorized/validation/failed)."""
+    {ok:false,...} application error such as unauthorized/validation/failed).
+    `op_id`, optional + backward-compatible like `token`, keys the broker's
+    per-op progress log for a write verb."""
     payload = {"verb": verb, "args": args or {}}
     if token is not None:
         payload["token"] = token
+    if op_id is not None:
+        payload["op_id"] = op_id
     data = json.dumps(payload).encode()
     try:
         reader, writer = await asyncio.wait_for(
@@ -357,12 +400,88 @@ async def broker_projects_handler(request: web.Request) -> web.Response:
     return web.json_response(body, status=status)
 
 
+def _mint_op_id(name: str, action: str) -> str:
+    """A safe-basename op_id embedding project/action/ts for a browsable handle,
+    plus a random suffix for uniqueness. The broker re-validates it against the
+    same charset before it names a file; a project name with valid chars (the
+    broker's name regex is a subset of the op_id charset) always yields a valid
+    op_id. `time.time()` is fine here — the webui is not a resumable workflow."""
+    return f"{name}-{action}-{int(time.time())}-{secrets.token_hex(4)}"
+
+
+async def _run_op(op_id: str, verb: str, args: dict,
+                  broker_token: str, timeout: float) -> None:
+    """Background task: drive one write verb at the (serial) broker, keyed by
+    op_id so the broker writes its progress log. The HTTP handler already
+    returned the op_id; the browser tails the log + polls status. While the
+    serial daemon is busy with an earlier op this call blocks at the socket —
+    no view file yet — which the browser renders as "doing" until milestones
+    start landing."""
+    entry = OP_RUNS[op_id]
+    try:
+        reply = await broker_call(verb, args, token=broker_token,
+                                  op_id=op_id, timeout=timeout)
+    except BrokerUnavailable:
+        entry.update(state="failed",
+                     result={"ok": False, "error": {"kind": "broker_unavailable"}})
+        return
+    except BrokerForbidden:
+        entry.update(state="failed",
+                     result={"ok": False, "error": {"kind": "forbidden"}})
+        return
+    except Exception:
+        # Catch-all: an unexpected error must move the op to a TERMINAL state, or
+        # the background task dies with the entry stuck "running" forever and the
+        # browser polls /status with no terminal milestone in the log either.
+        entry.update(state="failed",
+                     result={"ok": False, "error": {"kind": "internal"}})
+        return
+    if (not reply.get("ok")
+            and reply.get("error", {}).get("kind") == "unauthorized"):
+        # Broker token expired mid-op → drop the webui session too (mirrors
+        # _relay), so the next browser action re-logins instead of silently 401'ing.
+        for cookie, sess in list(BROKER_SESSIONS.items()):
+            if sess.get("broker_token") == broker_token:
+                BROKER_SESSIONS.pop(cookie, None)
+    entry["result"] = reply
+    entry["state"] = "ok" if reply.get("ok") else "failed"
+
+
+async def _start_op(request: web.Request, verb: str, args: dict,
+                    timeout: float) -> web.Response:
+    """Gated + already origin-checked by the caller: mint an op_id, kick the
+    broker verb as a background task, and return the op_id immediately so the
+    browser can start tailing the log before the op completes."""
+    s = _broker_session(request)
+    if s is None:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+    op_id = _mint_op_id(str(args.get("name", "op")), verb)
+    # An invalid project name yields an op_id the GET endpoints (and the broker)
+    # would reject as a non-basename, leaving the browser with an unpollable
+    # handle. Reject it up front as a normal validation error — a valid name (the
+    # broker's name regex ⊂ the op_id charset) always mints a valid op_id.
+    if not _OP_ID_RE.match(op_id):
+        return web.json_response(
+            {"ok": False, "error": {"kind": "validation",
+             "message": "project name has characters not allowed in a project name"}},
+            status=200)
+    OP_RUNS[op_id] = {"state": "running", "result": None,
+                      "broker_token": s["broker_token"]}
+    task = asyncio.create_task(
+        _run_op(op_id, verb, args, s["broker_token"], timeout))
+    OP_RUNS[op_id]["task"] = task
+    return web.json_response({"ok": True, "op_id": op_id})
+
+
 async def broker_create_handler(request: web.Request) -> web.Response:
     """POST /broker/project {name,type,egress,enable[],disable[],memory,cpus} —
-    create a project (gated, origin-checked). The broker's CREATE_WEBUI_FIELDS
-    allow-list is the real input boundary (it drops `data`/`ssh_port`/any
-    path-shaped field), so the body is forwarded as-is. Uses the longer create
-    timeout — a cold create stages inner images synchronously."""
+    create a project (gated, origin-checked). Returns {op_id} immediately and
+    runs the broker `create` as a background task; the browser tails the op log.
+    The broker's CREATE_WEBUI_FIELDS allow-list is the real input boundary (it
+    drops `data`/`ssh_port`/any path-shaped field), so the body is forwarded
+    as-is. The longer create timeout bounds the background broker call (cold
+    create stages inner images synchronously)."""
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")
     try:
@@ -373,9 +492,7 @@ async def broker_create_handler(request: web.Request) -> web.Response:
     if not isinstance(body, dict):
         return web.json_response(
             {"ok": False, "error": {"kind": "bad_request"}}, status=400)
-    status, reply = await _relay(request, "create", body,
-                                 timeout=BROKER_CREATE_TIMEOUT_S)
-    return web.json_response(reply, status=status)
+    return await _start_op(request, "create", body, BROKER_OP_TIMEOUT_S)
 
 
 async def broker_attach_handler(request: web.Request) -> web.Response:
@@ -392,8 +509,12 @@ async def broker_attach_handler(request: web.Request) -> web.Response:
 
 async def broker_project_action_handler(request: web.Request) -> web.Response:
     """POST /broker/project/{name}/{action} — start|stop|update|destroy (gated,
-    origin-checked). `destroy` carries a step-up `password` in the body that the
-    broker re-verifies; the others ignore the body."""
+    origin-checked). Returns {op_id} immediately and runs the verb as a
+    background task; the browser tails the op log. `destroy` carries a step-up
+    `password` in the body that rides the background request and the broker
+    re-verifies; the others ignore the body. The longer timeout bounds the
+    background call with headroom for a recreate queued behind another op on the
+    serial daemon."""
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")
     name = request.match_info.get("name", "")
@@ -410,8 +531,69 @@ async def broker_project_action_handler(request: web.Request) -> web.Response:
         pw = req_body.get("password") if isinstance(req_body, dict) else None
         if isinstance(pw, str):
             args["password"] = pw
-    status, reply = await _relay(request, action, args)
-    return web.json_response(reply, status=status)
+    return await _start_op(request, action, args, BROKER_OP_TIMEOUT_S)
+
+
+async def broker_op_log_handler(request: web.Request) -> web.Response:
+    """GET /broker/op/{op_id}/log?from=<n> — the view-log byte-slice since `n`
+    plus the new EOF. Reads the RO-mounted view file directly (out-of-band from
+    the one-shot socket), gated by the management session cookie — no broker
+    token round-trip, like /broker/projects. The SameSite=Strict cookie is the
+    CSRF defense for this read; origin-check belongs on the firing POST, not
+    here. A not-yet-created file is "0 bytes, not started" (the op is queued at
+    the serial daemon) — never a 404."""
+    if _broker_session(request) is None:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+    op_id = request.match_info.get("op_id", "")
+    if not _OP_ID_RE.match(op_id):
+        return web.json_response(
+            {"ok": False, "error": {"kind": "bad_request"}}, status=400)
+    try:
+        frm = max(0, int(request.query.get("from", "0")))
+    except ValueError:
+        frm = 0
+    path = Path(RS_BROKER_OPLOG_DIR) / f"{op_id}.view.log"
+    if not path.exists():
+        # Op not started yet (queued behind another op on the serial broker), or
+        # never existed. Either way: no bytes, not an error — the browser shows
+        # "doing" and keeps polling from 0.
+        return web.json_response(
+            {"ok": True, "from": frm, "next": 0, "data": "", "started": False})
+    try:
+        with open(path, "rb") as f:
+            f.seek(frm)
+            chunk = f.read()
+            nxt = f.tell()
+    except OSError as e:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "io_error", "message": str(e)}},
+            status=500)
+    # View log is JSONL flushed per whole milestone line, so every EOF is a line
+    # boundary → slicing at a prior `next` never splits a record.
+    return web.json_response({
+        "ok": True, "from": frm, "next": nxt,
+        "data": chunk.decode("utf-8", "replace"), "started": True})
+
+
+async def broker_op_status_handler(request: web.Request) -> web.Response:
+    """GET /broker/op/{op_id} — {state: running|ok|failed, result?}. The
+    in-process handle for an op this webui started; the browser calls it once
+    the log shows a terminal milestone, to render the structured verb result.
+    Unknown op_id (e.g. after a webui restart that dropped OP_RUNS) → state
+    'unknown'; the browser falls back to the log's terminal milestone."""
+    if _broker_session(request) is None:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+    op_id = request.match_info.get("op_id", "")
+    if not _OP_ID_RE.match(op_id):
+        return web.json_response(
+            {"ok": False, "error": {"kind": "bad_request"}}, status=400)
+    entry = OP_RUNS.get(op_id)
+    if entry is None:
+        return web.json_response({"ok": True, "state": "unknown", "result": None})
+    return web.json_response(
+        {"ok": True, "state": entry["state"], "result": entry["result"]})
 
 
 async def ws_handler(request: web.Request) -> web.WebSocketResponse:
@@ -1218,6 +1400,9 @@ def main() -> None:
         "/broker/project/{name}/attach", broker_attach_handler)
     app.router.add_post(
         "/broker/project/{name}/{action}", broker_project_action_handler)
+    # op-log tail + status (GETs, session-gated; the more specific /log first).
+    app.router.add_get("/broker/op/{op_id}/log", broker_op_log_handler)
+    app.router.add_get("/broker/op/{op_id}", broker_op_status_handler)
     app.router.add_get("/ws/{project}/{service}", ws_handler)
     # Proxy: trailing-slash form catches /proxy/<proj>/<svc>/ + everything
     # below. The no-slash form is also routed (matched by proxy_handler's

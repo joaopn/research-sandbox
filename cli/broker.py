@@ -42,6 +42,7 @@ import dataclasses
 import io
 import json
 import os
+import re
 import signal
 import socket
 import socketserver
@@ -72,6 +73,29 @@ BROKER_SOCKET = BROKER_RUN_DIR / "broker.sock"
 BROKER_PIDFILE = BROKER_DIR / "broker.pid"
 BROKER_LOG = BROKER_DIR / "broker.log"
 
+# Per-operation progress logs (WEBUI_OPLOG). Two dirs straddling the webui mount
+# boundary on purpose:
+#   * View log → under run/ (RO-mounted into the webui at /run/rs-broker). Holds
+#     only allowlist-emit milestones (step key + safe description). Webui-visible.
+#   * Full log → under BROKER_DIR (the parent — HOST-ONLY, never mounted). Holds
+#     the verb's raw stdout+stderr, which carries host paths ("created data
+#     directory: <abs path>", "=== Creating project: … ==="). Must stay outside
+#     the mount.
+BROKER_OPLOG_DIR = BROKER_RUN_DIR / "oplogs"        # .view.log — webui-visible
+BROKER_FULLLOG_DIR = BROKER_DIR / "oplogs-full"     # .full.log — host-only
+
+# Verbs that get a per-op progress log: the long-running lifecycle writes. Reads
+# (OPEN_VERBS) and auth verbs never produce one. op_id-driven from the webui.
+PROGRESS_VERBS = frozenset({"create", "update", "destroy", "start", "stop"})
+
+# op_id names a file, so it is validated as a safe basename before it ever does:
+# first char alnum, rest alnum/dot/dash/underscore — no path separator, no
+# leading dot (so "..", "/", absolute paths, and traversal are all rejected).
+# The webui generates "<project>-<action>-<ts>-<rand>"; this is the containment
+# check on that. Length is bounded already (the 64 KiB request frame caps it;
+# the OS caps the filename) so no separate numeric limit is invented here.
+_OP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
 # Max bytes in a single request frame. Lifecycle requests are tiny (a verb name
 # + a handful of short fields/lists); even a create with many --enable tokens
 # and several long --data host paths stays well under a few KiB. 64 KiB leaves
@@ -97,27 +121,129 @@ CLIENT_TIMEOUT_S = 10
 
 
 # ---------------------------------------------------------------------------
+# Per-operation progress logs (WEBUI_OPLOG)
+# ---------------------------------------------------------------------------
+
+
+class _Tee:
+    """Fan one text stream out to several sinks. Used to send the verb's
+    captured stdout/stderr to the host-only full log while stderr also keeps
+    feeding the StringIO the dispatcher reads to build a die() error envelope."""
+
+    def __init__(self, *sinks):
+        self._sinks = sinks
+
+    def write(self, s: str) -> int:
+        for snk in self._sinks:
+            snk.write(s)
+        return len(s)
+
+    def flush(self) -> None:
+        for snk in self._sinks:
+            with contextlib.suppress(Exception):
+                snk.flush()
+
+
+class _Progress:
+    """Allowlist-EMIT milestone sink for one webui-fired op. Writes JSONL
+    milestones to the view log (webui-visible) and flushes after each, so a
+    live tail sees progress without unbuffering the whole daemon.
+
+    Positive-emit by construction: only the fields written here reach the file
+    (op_id, project, action, step key, status, a safe description, ts) — never a
+    host path, inner IP, or credential. That is what makes the view log safe to
+    expose, not a blocklist filter over the firehose."""
+
+    def __init__(self, op_id: str, project, action: str, view_path: Path):
+        self.op_id = op_id
+        self.project = project
+        self.action = action
+        # Truncate: one op per op_id, so a reused handle starts clean.
+        self._f = open(view_path, "w")
+
+    def _emit(self, status: str, key: str, msg: str) -> None:
+        rec = {"op_id": self.op_id, "project": self.project,
+               "action": self.action, "step": key, "status": status,
+               "msg": msg, "ts": time.time()}
+        self._f.write(json.dumps(rec) + "\n")
+        self._f.flush()
+
+    def step(self, key: str, msg: str = "") -> None:
+        self._emit("step", key, msg)
+
+    def done(self, msg: str = "") -> None:
+        self._emit("done", "done", msg)
+
+    def fail(self, msg: str = "") -> None:
+        self._emit("failed", "failed", msg)
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self._f.close()
+
+
+class _OpLog:
+    """Bundles the two log streams for one op: the view sink (`.progress`) and
+    the host-only full-log file handle (`.full`). The dispatcher owns the
+    terminal done()/fail() (so a verb that die()s still lands a terminal record)
+    and closes both in a finally."""
+
+    def __init__(self, op_id: str, action: str, project):
+        BROKER_OPLOG_DIR.mkdir(parents=True, exist_ok=True)
+        BROKER_FULLLOG_DIR.mkdir(parents=True, exist_ok=True)
+        # Open the view sink first; if the full-log open then fails, close it so
+        # the half-built _OpLog leaks no handle (dispatch maps the OSError to
+        # bad_request and never sees an `op` to .close()).
+        self.progress = _Progress(op_id, project, action,
+                                  BROKER_OPLOG_DIR / f"{op_id}.view.log")
+        try:
+            self.full = open(BROKER_FULLLOG_DIR / f"{op_id}.full.log", "w")
+        except OSError:
+            self.progress.close()
+            raise
+
+    def close(self) -> None:
+        self.progress.close()
+        with contextlib.suppress(Exception):
+            self.full.close()
+
+
+def make_oplog(op_id: str, verb: str, args: dict) -> _OpLog:
+    """Real op-log factory the daemon injects into dispatch. Validates op_id as
+    a safe basename (it names a file) before opening anything. Raises ValueError
+    on a malformed op_id so the dispatcher can answer bad_request without
+    creating a file."""
+    if not isinstance(op_id, str) or not _OP_ID_RE.match(op_id):
+        raise ValueError(f"op_id is not a safe basename: {op_id!r}")
+    return _OpLog(op_id, verb, args.get("name"))
+
+
+# ---------------------------------------------------------------------------
 # Verb dispatch (the closed vocabulary)
 # ---------------------------------------------------------------------------
 
 
-def _verb_list(_args: dict) -> list[dict]:
+# Every verb fn takes (args, progress). progress is the op-log milestone sink
+# for write verbs fired with an op_id; the read verbs accept and ignore it
+# (None for CLI/socket-direct callers). The lifecycle verbs forward it to rscore
+# as the optional third arg, which the CLI omits — backward-compatible.
+def _verb_list(_args: dict, _progress=None) -> list[dict]:
     return [dataclasses.asdict(s) for s in rscore.list_projects()]
 
 
-def _verb_status(args: dict) -> dict:
+def _verb_status(args: dict, _progress=None) -> dict:
     req = rscore.StatusRequest.from_kwargs(**args)   # may raise ValidationError
     return dataclasses.asdict(rscore.status(req))    # may die() → SystemExit
 
 
-def _verb_stop(args: dict) -> list[dict]:
+def _verb_stop(args: dict, progress=None) -> list[dict]:
     req = rscore.StartStopRequest.from_kwargs(**args)  # may raise ValidationError
-    return [dataclasses.asdict(r) for r in rscore.stop(req)]  # may die() → SystemExit
+    return [dataclasses.asdict(r) for r in rscore.stop(req, progress=progress)]
 
 
-def _verb_start(args: dict) -> list[dict]:
+def _verb_start(args: dict, progress=None) -> list[dict]:
     req = rscore.StartStopRequest.from_kwargs(**args)  # may raise ValidationError
-    return [dataclasses.asdict(r) for r in rscore.start(req)]  # may die() → SystemExit
+    return [dataclasses.asdict(r) for r in rscore.start(req, progress=progress)]
 
 
 # The webui-settable subset of CreateRequest fields — the broker's input
@@ -142,32 +268,32 @@ UPDATE_WEBUI_FIELDS = frozenset({
 })
 
 
-def _verb_create(args: dict) -> dict:
+def _verb_create(args: dict, progress=None) -> dict:
     safe = {k: v for k, v in args.items() if k in CREATE_WEBUI_FIELDS}
     req = rscore.CreateRequest.from_kwargs(**safe)  # may raise ValidationError
-    return dataclasses.asdict(rscore.create(req))   # may die() → SystemExit
+    return dataclasses.asdict(rscore.create(req, progress=progress))
 
 
-def _verb_attach(args: dict) -> dict:
+def _verb_attach(args: dict, _progress=None) -> dict:
     """JIT keyring: return a running project's SSH coordinates (incl. password,
     in-memory). Token-gated like a write precisely because it returns the
-    credential."""
+    credential. Not in PROGRESS_VERBS — it is a fast keyring fetch, no op log."""
     req = rscore.AttachRequest.from_kwargs(**args)    # may raise ValidationError
     return dataclasses.asdict(rscore.webui_attach_info(req))  # may die() → SystemExit
 
 
-def _verb_update(args: dict) -> dict:
+def _verb_update(args: dict, progress=None) -> dict:
     safe = {k: v for k, v in args.items() if k in UPDATE_WEBUI_FIELDS}
     req = rscore.UpdateRequest.from_kwargs(**safe)   # may raise ValidationError
-    return dataclasses.asdict(rscore.update(req))    # may die() → SystemExit
+    return dataclasses.asdict(rscore.update(req, progress=progress))
 
 
-def _verb_destroy(args: dict) -> dict:
+def _verb_destroy(args: dict, progress=None) -> dict:
     """Tear a project down. Step-up re-auth (see STEP_UP_VERBS) is enforced in
     dispatch BEFORE this runs; the request's `password` is consumed there and
     never reaches rscore (DestroyRequest reads only `name`)."""
     req = rscore.DestroyRequest.from_kwargs(**args)  # may raise ValidationError
-    rscore.destroy(req)                              # may die() → SystemExit
+    rscore.destroy(req, progress=progress)           # may die() → SystemExit
     return {"destroyed": req.name}
 
 
@@ -221,15 +347,19 @@ def _auth_login(args: dict, tokens) -> dict:
         "principal": broker_auth.DEFAULT_PRINCIPAL}}
 
 
-def dispatch(verb, args, token=None, tokens=None, *,
-             verbs: dict | None = None, audit=None) -> dict:
+def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
+             verbs: dict | None = None, audit=None, oplog=None) -> dict:
     """Resolve and run one verb, mapping every failure mode to a reply dict.
-    Pure by default (no socket; no file I/O unless an `audit` sink is passed)
-    so it is unit-testable on its own.
+    Pure by default (no socket; no file I/O unless an `audit` or `oplog` sink is
+    passed) so it is unit-testable on its own.
 
     `tokens` is the daemon's TokenStore (needed for `login` + gated verbs).
     `audit`, if given, is called audit(principal, verb, outcome) for auth +
     write events; left None in tests to keep dispatch side-effect-free.
+    `oplog`, if given, is the op-log factory oplog(op_id, verb, args) → _OpLog;
+    created AFTER the gates so a rejected caller writes no file (and never
+    learns the step-up gate exists), and only for a write verb fired with an
+    `op_id`. Left None in tests for the same side-effect-free reason as `audit`.
     """
     def _audited(principal, outcome, reply):
         if audit is not None:
@@ -282,20 +412,53 @@ def dispatch(verb, args, token=None, tokens=None, *,
                             _err("step_up_required",
                                  "this action requires re-entering your password"))
 
+    # Per-op progress log: write verbs only, and only when the caller supplied
+    # an op_id (the webui does; the CLI/socket-direct callers don't). Created
+    # HERE — after the token + step-up gates — so a rejected caller leaves no
+    # file behind. A malformed op_id (it names a file) → bad_request, no file.
+    op = None
+    if (oplog is not None and op_id is not None
+            and verb in PROGRESS_VERBS and verb not in OPEN_VERBS
+            and verb not in AUTH_VERBS):
+        try:
+            op = oplog(op_id, verb, args)
+        except (ValueError, OSError) as e:
+            return _audited(principal, "bad_request",
+                            _err("bad_request", f"invalid op_id: {e}"))
+    progress = op.progress if op is not None else None
+
     # A verb that calls die() raises SystemExit after printing to stderr; capture
     # that text so the failure message reaches the caller instead of the daemon
-    # log. Serial request handling makes the global stderr swap race-free.
+    # log. When an op log is active, stdout+stderr also tee to the host-only
+    # full log — stderr to BOTH buf (for the die() envelope below) and the full
+    # log, stdout to the full log only. Serial request handling makes the global
+    # stream swap race-free.
     buf = io.StringIO()
+    out_stream = _Tee(op.full) if op is not None else None
+    err_stream = _Tee(buf, op.full) if op is not None else buf
     try:
-        with contextlib.redirect_stderr(buf):
-            result = fn(args)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stderr(err_stream))
+            if out_stream is not None:
+                stack.enter_context(contextlib.redirect_stdout(out_stream))
+            result = fn(args, progress)
         reply, outcome = {"ok": True, "result": result}, "ok"
+        if op is not None:
+            op.progress.done()
     except rscore.ValidationError as e:
         reply, outcome = _err("validation", str(e)), "validation"
+        if op is not None:
+            op.progress.fail(str(e))
     except SystemExit:
         msg = buf.getvalue().strip() or "operation failed"
         # die() prints "error: <msg>"; trim the prefix for a clean envelope.
-        reply, outcome = _err("failed", msg.split("error: ", 1)[-1]), "failed"
+        msg = msg.split("error: ", 1)[-1]
+        reply, outcome = _err("failed", msg), "failed"
+        if op is not None:
+            op.progress.fail(msg)
+    finally:
+        if op is not None:
+            op.close()
 
     # Audit write verbs only (reads stay open + low-value/noisy).
     if verb not in OPEN_VERBS:
@@ -355,7 +518,9 @@ class _Handler(socketserver.StreamRequestHandler):
             return
         self._send(dispatch(msg.get("verb"), msg.get("args") or {},
                             msg.get("token"), self.server.tokens,
-                            audit=broker_auth.audit_event))
+                            op_id=msg.get("op_id"),
+                            audit=broker_auth.audit_event,
+                            oplog=make_oplog))
 
     def _send(self, reply: dict) -> None:
         data = json.dumps(reply).encode()
@@ -383,6 +548,10 @@ def serve() -> None:
     BROKER_RUN_DIR.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(OSError):
         BROKER_RUN_DIR.chmod(0o700)
+    # Pre-create the op-log dirs (the factory also does, lazily). View log lives
+    # under run/ (webui-mounted RO); full log under BROKER_DIR (host-only).
+    BROKER_OPLOG_DIR.mkdir(parents=True, exist_ok=True)
+    BROKER_FULLLOG_DIR.mkdir(parents=True, exist_ok=True)
     server = _Server(str(BROKER_SOCKET), _Handler)
     # In-daemon session-token store: issued on login, never persisted, flushed
     # by construction on restart. The handler reaches it via self.server.tokens.
@@ -422,10 +591,12 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 
 
 def client_call(verb: str, args: dict | None = None, *,
-                token: str | None = None,
+                token: str | None = None, op_id: str | None = None,
                 socket_path=None, timeout: float = CLIENT_TIMEOUT_S) -> dict:
     """Send one framed request and return the parsed reply dict. `token` is
-    attached only when given (read verbs omit it; write verbs need it)."""
+    attached only when given (read verbs omit it; write verbs need it). `op_id`,
+    likewise optional + backward-compatible, keys the per-op progress log for a
+    write verb."""
     path = str(socket_path or BROKER_SOCKET)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
         s.settimeout(timeout)
@@ -433,6 +604,8 @@ def client_call(verb: str, args: dict | None = None, *,
         payload = {"verb": verb, "args": args or {}}
         if token is not None:
             payload["token"] = token
+        if op_id is not None:
+            payload["op_id"] = op_id
         req = json.dumps(payload).encode()
         s.sendall(_LEN.pack(len(req)) + req)
         hdr = _recv_exact(s, _LEN_SIZE)

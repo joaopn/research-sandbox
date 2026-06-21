@@ -351,7 +351,21 @@ class AttachInfo:
 # ===========================================================================
 
 
-def create(req: CreateRequest, cfg: "Config" | None = None) -> CreateResult:  # type: ignore[name-defined]
+class _NullProgress:
+    """No-op milestone sink — the default when a verb is driven from the CLI
+    (no webui op log). The broker passes a real sink (duck-typed: anything with
+    a ``step(key, msg)`` method) for webui-fired ops; rscore never imports the
+    broker, so the contract is structural, not a shared type."""
+
+    def step(self, key: str, msg: str = "") -> None:  # noqa: D401
+        pass
+
+
+_NULL_PROGRESS = _NullProgress()
+
+
+def create(req: CreateRequest, cfg: "Config" | None = None,
+           progress=None) -> CreateResult:  # type: ignore[name-defined]
     """Create a project. ``req`` is already validated (no name re-check).
 
     Failure policy:
@@ -363,11 +377,14 @@ def create(req: CreateRequest, cfg: "Config" | None = None) -> CreateResult:  # 
         granted prints a warning and creation continues (MCPs are external and
         can be transient).
 
-    Progress lines print to stdout for now; a structured progress feed for the
-    browser is an additive front-end concern for later, not a redesign.
+    Raw progress lines keep printing to stdout (captured into the host-only
+    full log). The ``progress`` sink additionally publishes ~5 allowlist-emit
+    milestones at phase boundaries to the webui-visible view log — only the
+    step key + a safe description, never a host path or credential.
     """
     if cfg is None:
         cfg = load_config()
+    progress = progress or _NULL_PROGRESS
     project = req.name
 
     container_name = container_name_for(project)
@@ -382,6 +399,8 @@ def create(req: CreateRequest, cfg: "Config" | None = None) -> CreateResult:  # 
                     else PROJECT_TYPE_RESEARCH)
     substrate_image = (MANAGEMENT_IMAGE if project_type == PROJECT_TYPE_SANDBOX
                        else SUPERVISOR_IMAGE)
+
+    progress.step("validate", "checking prerequisites")
 
     # Verify prerequisites.
     if not run_quiet(["docker", "image", "inspect", substrate_image]):
@@ -445,6 +464,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None) -> CreateResult:  # 
         json.dumps({"type": project_type}, indent=2) + "\n")
 
     # 2. Per-project network + router wiring.
+    progress.step("network", "creating project network")
     network, router_ip = ensure_project_network(project, egress)
     wire_webui_to_projects()
 
@@ -504,12 +524,14 @@ def create(req: CreateRequest, cfg: "Config" | None = None) -> CreateResult:  # 
         docker_args = docker_args[:-1] + ext_mounts + [docker_args[-1]]
 
     # 4. Create container.
+    progress.step("create-container", "creating supervisor container")
     run_check(["docker", *docker_args])
 
     # 5. Inject default route via router (egress traverses iptables).
     inject_route(container_name, router_ip)
 
     # 6. Wait for inner dockerd, then stage the inner images.
+    progress.step("stage-images", "staging inner images")
     wait_for_inner_dockerd(container_name)
     if project_type == PROJECT_TYPE_SANDBOX:
         stage_worker_image(container_name, SANDBOX_BOX_IMAGE)
@@ -537,7 +559,12 @@ def create(req: CreateRequest, cfg: "Config" | None = None) -> CreateResult:  # 
 
     # 6d. worker sugar (--enable <worker>). FAIL-EXPLICIT: a worker that won't
     #     enable aborts the create (no swallow). Enabling a worker auto-enables
-    #     its baked sandbox mirror unless `no-sandbox-mirror` was given.
+    #     its baked sandbox mirror unless `no-sandbox-mirror` was given. This is
+    #     the slow tail — a role-MCP like websearcher builds/starts a Chromium
+    #     container — so the "wire" milestone is emitted AFTER the loops, not
+    #     before: its view-log row stays pending (the UI shows it in-progress)
+    #     until the enabling actually finishes, instead of checking ✓ up front
+    #     while the box then sits on a silent multi-second wait.
     workers_enabled: list[str] = []
     for role in enable_workers:
         _role_mcp_enable(project, cfg, role, role_mcp_explicit.get(role),
@@ -552,6 +579,8 @@ def create(req: CreateRequest, cfg: "Config" | None = None) -> CreateResult:  # 
             continue
         _sandbox_enable(project, cfg, name)
         sandboxes_enabled.append(name)
+
+    progress.step("wire", "enabling workers and sandboxes")
 
     # 7. Return result (the front-end formats the report from this).
     return CreateResult(
@@ -572,16 +601,19 @@ def create(req: CreateRequest, cfg: "Config" | None = None) -> CreateResult:  # 
     )
 
 
-def destroy(req: DestroyRequest, cfg: "Config" | None = None) -> None:  # type: ignore[name-defined]
+def destroy(req: DestroyRequest, cfg: "Config" | None = None,
+            progress=None) -> None:  # type: ignore[name-defined]
     """Tear a project down: container + workspace dir + DIND volume + network,
     plus its router MCP-allow rules. Confirmation is the front-end's job — this
     verb just destroys. die()s if the project doesn't exist."""
     if cfg is None:
         cfg = load_config()
+    progress = progress or _NULL_PROGRESS
     project = req.name
     container = container_name_for(project)
     if not container_exists(container):
         die(f"project {project!r} does not exist")
+    progress.step("validate", "located project")
 
     project_root = project_root_for(project, cfg)
     docker_volume = docker_volume_name_for(project)
@@ -589,6 +621,7 @@ def destroy(req: DestroyRequest, cfg: "Config" | None = None) -> None:  # type: 
 
     # Clean up per-project MCP rules in the router so iptables doesn't
     # accumulate orphan ACCEPTs after the project network is gone.
+    progress.step("router", "removing router rules")
     if network_exists(network) and container_running(ROUTER_CONTAINER):
         try:
             subnet = get_network_subnet(network)
@@ -602,7 +635,9 @@ def destroy(req: DestroyRequest, cfg: "Config" | None = None) -> None:  # type: 
                      "/scripts/mcp-deny.sh", subnet, ip, str(port)],
                     capture_output=True)
 
+    progress.step("remove-container", "removing container")
     run(["docker", "rm", "-f", container], capture_output=True)
+    progress.step("cleanup", "removing workspace, volume and network")
     if project_root.exists():
         shutil.rmtree(project_root, ignore_errors=True)
     if volume_exists(docker_volume):
@@ -610,15 +645,18 @@ def destroy(req: DestroyRequest, cfg: "Config" | None = None) -> None:  # type: 
     remove_project_network(project)
 
 
-def start(req: StartStopRequest, cfg: "Config" | None = None) -> list[ActionResult]:  # type: ignore[name-defined]
+def start(req: StartStopRequest, cfg: "Config" | None = None,
+          progress=None) -> list[ActionResult]:  # type: ignore[name-defined]
     """Start a stopped project (or all). On sysbox a plain `docker start` after
     `docker stop` fails, so we route through _recreate_supervisor: fresh
     container ID + bindings, workspace/creds/network preserved. Fail-explicit:
     a recreate that dies aborts (no swallow)."""
     if cfg is None:
         cfg = load_config()
+    progress = progress or _NULL_PROGRESS
     if not container_running(ROUTER_CONTAINER):
         die(f"{ROUTER_CONTAINER} is not running. Run `research start` first.")
+    progress.step("validate", "checking project")
     if req.all:
         containers = get_supervisor_containers()
     else:
@@ -632,13 +670,17 @@ def start(req: StartStopRequest, cfg: "Config" | None = None) -> list[ActionResu
             results.append(ActionResult(c["name"], c.get("project"), "start", "skip:already"))
             continue
         print(f"=== Starting project: {c['project']} ===")
+        progress.step("recreate", "recreating supervisor")
         _recreate_supervisor(c["project"], cfg)
         results.append(ActionResult(c["name"], c["project"], "start", "ok"))
     return results
 
 
-def stop(req: StartStopRequest, cfg: "Config" | None = None) -> list[ActionResult]:  # type: ignore[name-defined]
+def stop(req: StartStopRequest, cfg: "Config" | None = None,
+         progress=None) -> list[ActionResult]:  # type: ignore[name-defined]
     """Stop a project (or all). Fail-explicit: a `docker stop` that fails dies."""
+    progress = progress or _NULL_PROGRESS
+    progress.step("validate", "checking project")
     if req.all:
         names = [c["name"] for c in get_supervisor_containers()]
     else:
@@ -648,6 +690,7 @@ def stop(req: StartStopRequest, cfg: "Config" | None = None) -> list[ActionResul
         if not container_exists(name):
             results.append(ActionResult(name, None, "stop", "skip:absent"))
             continue
+        progress.step("stop", "stopping container")
         run_check(["docker", "stop", name])
         results.append(ActionResult(name, None, "stop", "ok"))
     return results
@@ -699,7 +742,8 @@ def status(req: StatusRequest, cfg: "Config" | None = None) -> ProjectStatus:  #
         inner_workers=inner, registry_count=reg_count)
 
 
-def update(req: UpdateRequest, cfg: "Config" | None = None) -> UpdateResult:  # type: ignore[name-defined]
+def update(req: UpdateRequest, cfg: "Config" | None = None,
+           progress=None) -> UpdateResult:  # type: ignore[name-defined]
     """Push edited code into a running project. Always recreates the supervisor
     (the only safe shape on sysbox): file-only mode docker-cp's edited files
     into the fresh container before first start; --rebuild rebuilds images
@@ -707,12 +751,14 @@ def update(req: UpdateRequest, cfg: "Config" | None = None) -> UpdateResult:  # 
     Defaults are NOT re-folded (create-time only)."""
     if cfg is None:
         cfg = load_config()
+    progress = progress or _NULL_PROGRESS
     project = req.name
     container = container_name_for(project)
     if not container_exists(container):
         die(f"project {project!r} does not exist")
     if not container_running(ROUTER_CONTAINER):
         die(f"{ROUTER_CONTAINER} is not running. Run `research start` first.")
+    progress.step("validate", "validating update")
 
     print(f"=== Updating project: {project} ===")
 
@@ -730,6 +776,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None) -> UpdateResult:  # 
             die(str(e))
 
     if req.rebuild:
+        progress.step("rebuild", "rebuilding images")
         print("rebuilding images...")
         _build_images(force=True)
 
@@ -751,6 +798,8 @@ def update(req: UpdateRequest, cfg: "Config" | None = None) -> UpdateResult:  # 
     # Fail-explicit: a disable that dies aborts.
     workers_disabled: list[str] = []
     sandboxes_disabled: list[str] = []
+    if disable_workers or disable_sandboxes:
+        progress.step("disable", "applying disables")
     for role in disable_workers:
         _role_mcp_disable(project, cfg, role)
         workers_disabled.append(role)
@@ -758,6 +807,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None) -> UpdateResult:  # 
         _sandbox_disable(project, cfg, name)
         sandboxes_disabled.append(name)
 
+    progress.step("recreate", "recreating supervisor")
     _recreate_supervisor(
         project, cfg,
         force_restage=req.rebuild,
@@ -768,11 +818,14 @@ def update(req: UpdateRequest, cfg: "Config" | None = None) -> UpdateResult:  # 
     # Sandbox projects have no /workspace/.claude/ by design — skip the refresh.
     refreshed = False
     if not req.keep_claude and _container_project_type(container) != PROJECT_TYPE_SANDBOX:
+        progress.step("refresh", "refreshing workspace templates")
         print("refreshing /workspace/.claude/ from templates...")
         _refresh_workspace_claude_templates(container)
         refreshed = True
 
     # worker + sandbox enables (idempotent on re-run). Fail-explicit.
+    if enable_workers or enable_sandboxes:
+        progress.step("enable", "applying enables")
     workers_enabled: list[str] = []
     sandboxes_enabled: list[str] = []
     for role in enable_workers:
