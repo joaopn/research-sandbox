@@ -1,0 +1,20 @@
+FROM rs-minimal-base:latest
+
+# rs-minimal — the runnable leaf for the `docker` containment substrate
+# (WORKFLOW_TAXONOMY_S1.md). A single runc container: ssh + byobu + code-server,
+# NO inner dockerd (it FROMs rs-minimal-base, not rs-substrate-base), so it
+# cannot spawn containers. Agent-less by construction — no claude, no rs-worker,
+# no rs-sandbox. When a docker workflow needs an agent it is delivered
+# per-project as a dist (PLAN/STAGE_AGENT_DIST.md), never baked here.
+
+# Snapshot the home (byobu + code-server config from the base, NO agent) for
+# first-boot restore over the workspace volume.
+RUN cp -a /home/research /etc/research-skel
+
+COPY agent/entrypoint.minimal.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+USER research
+WORKDIR /home/research
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]

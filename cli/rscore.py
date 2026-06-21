@@ -77,6 +77,17 @@ class ProjectType(str, enum.Enum):
     SANDBOX = "sandbox"
 
 
+class Substrate(str, enum.Enum):
+    """Containment runtime — an INTERNAL axis, never a user-facing flag
+    (WORKFLOW_TAXONOMY Q7). ``dind-sysbox`` is today's sysbox DIND host (both
+    research and sandbox flavors run on it); ``docker`` is a single runc
+    container with no inner daemon. Derived from the workflow (slice 1: from the
+    project type via derive_substrate, overridable only through the hidden dev
+    --substrate flag; the workflow manifest becomes the real source later)."""
+    DOCKER = "docker"
+    DIND_SYSBOX = "dind-sysbox"
+
+
 class Egress(str, enum.Enum):
     OPEN = "open"
     LOCKED = "locked"
@@ -162,6 +173,7 @@ def _as_tuple(value: Any) -> tuple[str, ...]:
 class CreateRequest:
     name: str
     type: ProjectType = ProjectType.RESEARCH
+    substrate: Substrate | None = None    # None ⇒ derive_substrate(type); INTERNAL
     egress: Egress | None = None          # None ⇒ config/flavor default at run time
     dind: DindMode | None = None          # None ⇒ cfg.default_dind at run time
     profile: str = "python"               # accepted for CLI parity; currently unused
@@ -180,10 +192,12 @@ class CreateRequest:
         ssh_port = kw.get("ssh_port")
         if ssh_port is not None and not isinstance(ssh_port, int):
             raise ValidationError("ssh_port must be an integer")
-        return cls(
+        obj = cls(
             name=_require_name(kw.get("name")),
             type=_as_enum(ProjectType, kw.get("type"),
                           field_name="--type", default=ProjectType.RESEARCH),
+            substrate=_as_enum(Substrate, kw.get("substrate"),
+                               field_name="--substrate", default=None),
             egress=_as_enum(Egress, kw.get("egress"),
                             field_name="--egress", default=None),
             dind=_as_enum(DindMode, kw.get("dind"),
@@ -199,6 +213,15 @@ class CreateRequest:
             role_mcp_upstream=_as_tuple(kw.get("role_mcp_upstream")),
             mcp=kw.get("mcp") if kw.get("mcp") is not None else "all-enabled",
         )
+        # Cross-field coherence: the docker substrate has no box/rs-sandbox
+        # layer, so the sandbox flavor cannot run on it. Reject before any side
+        # effect rather than build an rs-minimal box stamped project_type=sandbox
+        # (which would offer a Management tab whose rs-sandbox command is absent).
+        if obj.substrate is Substrate.DOCKER and obj.type is ProjectType.SANDBOX:
+            raise ValidationError(
+                "--substrate docker is incompatible with --type sandbox "
+                "(the docker substrate has no box layer)")
+        return obj
 
 
 @dataclass(frozen=True)
@@ -287,6 +310,7 @@ class CreateResult:
     dind_mode: str
     inner_firewall: bool
     project_type: str
+    substrate: str
     ssh_port: int
     ssh_password: str                       # in-memory only
     data_mounts: dict[str, str] = field(default_factory=dict)   # basename → host src
@@ -397,8 +421,13 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     project_type = (PROJECT_TYPE_SANDBOX
                     if req.type is ProjectType.SANDBOX
                     else PROJECT_TYPE_RESEARCH)
-    substrate_image = (MANAGEMENT_IMAGE if project_type == PROJECT_TYPE_SANDBOX
-                       else SUPERVISOR_IMAGE)
+    substrate = req.substrate or derive_substrate(project_type)
+    is_docker = substrate is Substrate.DOCKER
+
+    substrate_image = (
+        MINIMAL_IMAGE if is_docker
+        else MANAGEMENT_IMAGE if project_type == PROJECT_TYPE_SANDBOX
+        else SUPERVISOR_IMAGE)
 
     progress.step("validate", "checking prerequisites")
 
@@ -408,12 +437,20 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     if not container_running(ROUTER_CONTAINER):
         die(f"{ROUTER_CONTAINER} is not running. Run `research setup` first.")
 
-    dind_mode = select_dind_mode(
+    # The `docker` substrate is a single runc container — no sysbox runtime, no
+    # inner dockerd. dind_mode is meaningless there; mark it "none" so the label
+    # is honest and build_supervisor_docker_args skips the runtime block.
+    dind_mode = "none" if is_docker else select_dind_mode(
         (req.dind.value if req.dind is not None else None) or cfg.default_dind)
 
-    # Egress. Sandbox flavor defaults to `locked`; research to cfg default.
+    # No inner dockerd ⇒ no inner-bridge firewall on the docker substrate.
+    inner_firewall = req.inner_firewall and not is_docker
+
+    # Egress. Sandbox flavor and the docker substrate default to `locked`;
+    # research to cfg default.
     egress = (req.egress.value if req.egress is not None else None) or (
-        "locked" if project_type == PROJECT_TYPE_SANDBOX else cfg.default_egress)
+        "locked" if (project_type == PROJECT_TYPE_SANDBOX or is_docker)
+        else cfg.default_egress)
     if egress not in ("open", "locked"):
         die(f"invalid --egress value: {egress!r} (expected open|locked)")
 
@@ -454,14 +491,18 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     if dind_mode == "privileged" and not volume_exists(docker_volume_name_for(project)):
         run_check(["docker", "volume", "create", docker_volume_name_for(project)])
 
-    # 1b. Materialize the MCP bind-mount sources (files, not dirs).
-    ensure_mcp_files(project, cfg)
+    # 1b. Materialize the MCP bind-mount sources (files, not dirs). dind only —
+    #     the docker substrate has no mcp-proxy / worker layer.
+    if not is_docker:
+        ensure_mcp_files(project, cfg)
 
-    # 1c. Project-flavor marker on the volume (survives a supervisor recreate).
+    # 1c. Project-flavor + substrate marker on the volume (survives a supervisor
+    #     recreate; read by the webui off /projects:ro).
     orch_dir = workspace_path / ".orchestrator"
     orch_dir.mkdir(parents=True, exist_ok=True)
     (orch_dir / "project.json").write_text(
-        json.dumps({"type": project_type}, indent=2) + "\n")
+        json.dumps({"type": project_type, "substrate": substrate.value},
+                   indent=2) + "\n")
 
     # 2. Per-project network + router wiring.
     progress.step("network", "creating project network")
@@ -469,37 +510,47 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     wire_webui_to_projects()
 
     # 3. Build docker run argv. Peel --enable/--disable tokens into the three
-    #    registries before computing service flags.
+    #    registries before computing service flags. The docker substrate has no
+    #    worker/sandbox/role-mcp layer, so only service tokens (code-server)
+    #    apply there — worker/sandbox tokens are noted and ignored.
     enable_services, enable_workers, enable_sandboxes, \
         enable_no_sandbox_mirror = _split_enable_tokens(",".join(req.enable))
     disable_services, disable_workers, disable_sandboxes = \
         _split_disable_tokens(",".join(req.disable))
-    _dis_w, _dis_s = set(disable_workers), set(disable_sandboxes)
-    if project_type == PROJECT_TYPE_SANDBOX:
-        for w in enable_workers:
-            print(f"note: --enable {w!r}: sandbox projects have no worker layer; "
-                  f"ignoring (for a browser box use `rs-sandbox create --browser`)",
-                  file=sys.stderr)
-        enable_workers = []
-        enable_sandboxes = [s for s in enable_sandboxes if s not in _dis_s]
+    role_mcp_explicit: dict[str, list[str]] = {}
+    if is_docker:
+        if (enable_workers or enable_sandboxes or disable_workers
+                or disable_sandboxes):
+            print("note: the docker substrate has no worker/sandbox layer; "
+                  "ignoring those --enable/--disable tokens", file=sys.stderr)
+        enable_workers, enable_sandboxes = [], []
     else:
-        enable_workers = [w for w in _ordered_union(defaults.enabled("worker"), enable_workers)
-                          if w not in _dis_w]
-        enable_sandboxes = [s for s in _ordered_union(defaults.enabled("sandbox"), enable_sandboxes)
-                            if s not in _dis_s]
-    _known_sb = sandbox.known_type_names()
-    for s in list(enable_sandboxes):
-        if s not in _known_sb:
-            print(f"note: default sandbox {s!r} is no longer a known type; "
-                  f"skipping its auto-enable", file=sys.stderr)
-            enable_sandboxes.remove(s)
-    role_mcp_explicit = _parse_role_mcp_upstream(
-        list(req.role_mcp_upstream), valid_roles=set(enable_workers))
-    for role in enable_workers:
-        try:
-            role_mcp.validate_role(role)
-        except ValueError as e:
-            die(str(e))
+        _dis_w, _dis_s = set(disable_workers), set(disable_sandboxes)
+        if project_type == PROJECT_TYPE_SANDBOX:
+            for w in enable_workers:
+                print(f"note: --enable {w!r}: sandbox projects have no worker layer; "
+                      f"ignoring (for a browser box use `rs-sandbox create --browser`)",
+                      file=sys.stderr)
+            enable_workers = []
+            enable_sandboxes = [s for s in enable_sandboxes if s not in _dis_s]
+        else:
+            enable_workers = [w for w in _ordered_union(defaults.enabled("worker"), enable_workers)
+                              if w not in _dis_w]
+            enable_sandboxes = [s for s in _ordered_union(defaults.enabled("sandbox"), enable_sandboxes)
+                                if s not in _dis_s]
+        _known_sb = sandbox.known_type_names()
+        for s in list(enable_sandboxes):
+            if s not in _known_sb:
+                print(f"note: default sandbox {s!r} is no longer a known type; "
+                      f"skipping its auto-enable", file=sys.stderr)
+                enable_sandboxes.remove(s)
+        role_mcp_explicit = _parse_role_mcp_upstream(
+            list(req.role_mcp_upstream), valid_roles=set(enable_workers))
+        for role in enable_workers:
+            try:
+                role_mcp.validate_role(role)
+            except ValueError as e:
+                die(str(e))
     service_flags = _compute_service_flags(enable_services, disable_services)
     docker_args = build_supervisor_docker_args(
         container_name=container_name,
@@ -513,74 +564,81 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         cpus=req.cpus or "",
         image=substrate_image,
         dind_mode=dind_mode,
-        inner_firewall=req.inner_firewall,
+        inner_firewall=inner_firewall,
         project_type=project_type,
+        substrate=substrate.value,
         service_flags=service_flags,
     )
     if extra_mounts:
         docker_args = docker_args[:-1] + extra_mounts + [docker_args[-1]]
-    ext_mounts = _sandbox_external_mounts(project)
-    if ext_mounts:
-        docker_args = docker_args[:-1] + ext_mounts + [docker_args[-1]]
+    if not is_docker:
+        ext_mounts = _sandbox_external_mounts(project)
+        if ext_mounts:
+            docker_args = docker_args[:-1] + ext_mounts + [docker_args[-1]]
 
     # 4. Create container.
-    progress.step("create-container", "creating supervisor container")
+    progress.step("create-container", "creating project container")
     run_check(["docker", *docker_args])
 
     # 5. Inject default route via router (egress traverses iptables).
     inject_route(container_name, router_ip)
 
-    # 6. Wait for inner dockerd, then stage the inner images.
-    progress.step("stage-images", "staging inner images")
-    wait_for_inner_dockerd(container_name)
-    if project_type == PROJECT_TYPE_SANDBOX:
-        stage_worker_image(container_name, SANDBOX_BOX_IMAGE)
-        stage_worker_image(container_name, SANDBOX_BOX_BROWSER_IMAGE)
-    else:
-        stage_worker_image(container_name, ANALYSIS_IMAGE)
-    stage_worker_image(container_name, MCP_PROXY_IMAGE)
-
-    # 6b. Re-run mcp-reload now that the proxy image is staged.
-    run(["docker", "exec", container_name, "/usr/local/bin/mcp-reload"],
-        capture_output=True)
-
-    # 6c. Auto-allow MCPs per --mcp. BEST-EFFORT: external MCPs can be
-    #     transient, so a single failure warns and creation continues.
-    requested = _resolve_create_mcp_arg(req.mcp)
     granted: list[str] = []
-    for mcp_name in requested:
-        ok, msg = _allow_mcp_for_project(project, cfg, mcp_name, do_reload=False)
-        if ok:
-            granted.append(mcp_name)
-        else:
-            print(f"warning: skip auto-allow {mcp_name!r}: {msg}", file=sys.stderr)
-    if granted:
-        _supervisor_mcp_reload(container_name)
-
-    # 6d. worker sugar (--enable <worker>). FAIL-EXPLICIT: a worker that won't
-    #     enable aborts the create (no swallow). Enabling a worker auto-enables
-    #     its baked sandbox mirror unless `no-sandbox-mirror` was given. This is
-    #     the slow tail — a role-MCP like websearcher builds/starts a Chromium
-    #     container — so the "wire" milestone is emitted AFTER the loops, not
-    #     before: its view-log row stays pending (the UI shows it in-progress)
-    #     until the enabling actually finishes, instead of checking ✓ up front
-    #     while the box then sits on a silent multi-second wait.
     workers_enabled: list[str] = []
-    for role in enable_workers:
-        _role_mcp_enable(project, cfg, role, role_mcp_explicit.get(role),
-                         no_pi_mirror=enable_no_sandbox_mirror)
-        workers_enabled.append(role)
-
-    # 6e. sandbox sugar (--enable <sandbox>). FAIL-EXPLICIT, same as workers.
-    #     A twin already brought up as a worker's mirror is skipped here.
     sandboxes_enabled: list[str] = []
-    for name in enable_sandboxes:
-        if name in workers_enabled:
-            continue
-        _sandbox_enable(project, cfg, name)
-        sandboxes_enabled.append(name)
 
-    progress.step("wire", "enabling workers and sandboxes")
+    if is_docker:
+        # No inner dockerd: nothing to stage, no proxy, no worker/sandbox cone.
+        progress.step("ready", "project ready")
+    else:
+        # 6. Wait for inner dockerd, then stage the inner images.
+        progress.step("stage-images", "staging inner images")
+        wait_for_inner_dockerd(container_name)
+        if project_type == PROJECT_TYPE_SANDBOX:
+            stage_worker_image(container_name, SANDBOX_BOX_IMAGE)
+            stage_worker_image(container_name, SANDBOX_BOX_BROWSER_IMAGE)
+        else:
+            stage_worker_image(container_name, ANALYSIS_IMAGE)
+        stage_worker_image(container_name, MCP_PROXY_IMAGE)
+
+        # 6b. Re-run mcp-reload now that the proxy image is staged.
+        run(["docker", "exec", container_name, "/usr/local/bin/mcp-reload"],
+            capture_output=True)
+
+        # 6c. Auto-allow MCPs per --mcp. BEST-EFFORT: external MCPs can be
+        #     transient, so a single failure warns and creation continues.
+        requested = _resolve_create_mcp_arg(req.mcp)
+        for mcp_name in requested:
+            ok, msg = _allow_mcp_for_project(project, cfg, mcp_name, do_reload=False)
+            if ok:
+                granted.append(mcp_name)
+            else:
+                print(f"warning: skip auto-allow {mcp_name!r}: {msg}", file=sys.stderr)
+        if granted:
+            _supervisor_mcp_reload(container_name)
+
+        # 6d. worker sugar (--enable <worker>). FAIL-EXPLICIT: a worker that
+        #     won't enable aborts the create (no swallow). Enabling a worker
+        #     auto-enables its baked sandbox mirror unless `no-sandbox-mirror`
+        #     was given. This is the slow tail — a role-MCP like websearcher
+        #     builds/starts a Chromium container — so the "wire" milestone is
+        #     emitted AFTER the loops, not before: its view-log row stays pending
+        #     (the UI shows it in-progress) until the enabling actually finishes,
+        #     instead of checking ✓ up front while the box sits on a silent wait.
+        for role in enable_workers:
+            _role_mcp_enable(project, cfg, role, role_mcp_explicit.get(role),
+                             no_pi_mirror=enable_no_sandbox_mirror)
+            workers_enabled.append(role)
+
+        # 6e. sandbox sugar (--enable <sandbox>). FAIL-EXPLICIT, same as workers.
+        #     A twin already brought up as a worker's mirror is skipped here.
+        for name in enable_sandboxes:
+            if name in workers_enabled:
+                continue
+            _sandbox_enable(project, cfg, name)
+            sandboxes_enabled.append(name)
+
+        progress.step("wire", "enabling workers and sandboxes")
 
     # 7. Return result (the front-end formats the report from this).
     return CreateResult(
@@ -590,8 +648,9 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         network=network,
         egress=egress,
         dind_mode=dind_mode,
-        inner_firewall=req.inner_firewall,
+        inner_firewall=inner_firewall,
         project_type=project_type,
+        substrate=substrate.value,
         ssh_port=int(ssh_port),
         ssh_password=ssh_pass,
         data_mounts={b: str(src) for b, src in data_basenames.items()},
@@ -648,9 +707,11 @@ def destroy(req: DestroyRequest, cfg: "Config" | None = None,
 def start(req: StartStopRequest, cfg: "Config" | None = None,
           progress=None) -> list[ActionResult]:  # type: ignore[name-defined]
     """Start a stopped project (or all). On sysbox a plain `docker start` after
-    `docker stop` fails, so we route through _recreate_supervisor: fresh
-    container ID + bindings, workspace/creds/network preserved. Fail-explicit:
-    a recreate that dies aborts (no swallow)."""
+    `docker stop` fails, so dind-sysbox projects route through
+    _recreate_supervisor: fresh container ID + bindings, workspace/creds/network
+    preserved. A docker-substrate project is a plain runc container with no
+    sysbox bindings — it uses _start_docker_substrate (docker start + route
+    re-inject). Fail-explicit: a recreate/start that dies aborts (no swallow)."""
     if cfg is None:
         cfg = load_config()
     progress = progress or _NULL_PROGRESS
@@ -670,8 +731,12 @@ def start(req: StartStopRequest, cfg: "Config" | None = None,
             results.append(ActionResult(c["name"], c.get("project"), "start", "skip:already"))
             continue
         print(f"=== Starting project: {c['project']} ===")
-        progress.step("recreate", "recreating supervisor")
-        _recreate_supervisor(c["project"], cfg)
+        if _container_substrate(c["name"]) == Substrate.DOCKER.value:
+            progress.step("start", "starting container")
+            _start_docker_substrate(c["project"], cfg)
+        else:
+            progress.step("recreate", "recreating supervisor")
+            _recreate_supervisor(c["project"], cfg)
         results.append(ActionResult(c["name"], c["project"], "start", "ok"))
     return results
 
@@ -756,6 +821,13 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     container = container_name_for(project)
     if not container_exists(container):
         die(f"project {project!r} does not exist")
+    # The docker substrate has no in-container editable surface yet (no
+    # templates, no worker/sandbox cone) and no sysbox store to re-stage — update
+    # is deferred for it (WORKFLOW_TAXONOMY_S1.md). Refuse cleanly rather than
+    # run the dind recreate path against a runc container.
+    if _container_substrate(container) == Substrate.DOCKER.value:
+        die("`update` is not yet supported for the docker substrate; "
+            "destroy + recreate instead")
     if not container_running(ROUTER_CONTAINER):
         die(f"{ROUTER_CONTAINER} is not running. Run `research start` first.")
     progress.step("validate", "validating update")
@@ -857,6 +929,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent.parent  # repo root (rscore lives i
 
 # Shared per-project substrate (DIND + ssh + byobu + code-server). Both
 # per-project container images FROM it (STAGE_SANDBOX_PROJECT.md image split).
+# No-DIND base + its runnable leaf — the `docker` containment substrate
+# (WORKFLOW_TAXONOMY_S1.md). rs-substrate-base now FROMs rs-minimal-base, adding
+# only the sysbox-DIND delta; rs-minimal FROMs rs-minimal-base directly (single
+# runc container, no inner dockerd, no agent — agents are dist-delivered).
+MINIMAL_BASE_IMAGE = "rs-minimal-base:latest"
+MINIMAL_IMAGE = "rs-minimal:latest"                # `docker` substrate leaf
 SUBSTRATE_BASE_IMAGE = "rs-substrate-base:latest"
 SUPERVISOR_IMAGE = "rs-supervisor:latest"          # research flavor (agent leaf)
 MANAGEMENT_IMAGE = "rs-management:latest"           # --type sandbox flavor (agent-less)
@@ -893,6 +971,10 @@ DIND_MODE_LABEL = "research.dind"
 PROJECT_TYPE_LABEL = "research.project_type"
 PROJECT_TYPE_RESEARCH = "research"
 PROJECT_TYPE_SANDBOX = "sandbox"
+# Containment substrate (WORKFLOW_TAXONOMY_S1.md). Mirrored onto the container
+# label so start()/recreate read it back; legacy containers without it default
+# to dind-sysbox. Also recorded in .orchestrator/project.json for the webui.
+SUBSTRATE_LABEL = "research.substrate"
 MCP_CONTAINER_PREFIX = "rs-mcp-"
 MCP_LABEL = "research.mcp"
 MCP_NAME_LABEL = "research.mcp_name"
@@ -1129,6 +1211,16 @@ def sysbox_available() -> bool:
     return '"sysbox-runc"' in r.stdout
 
 
+def derive_substrate(project_type: str) -> Substrate:
+    """Map a project flavor to its containment substrate. Both shipped flavors
+    (research, sandbox) run on dind-sysbox today; the lightweight `docker`
+    substrate is reachable only via CreateRequest.substrate (the hidden dev
+    --substrate flag in slice 1; the workflow manifest later). Substrate is
+    never a user-facing axis (WORKFLOW_TAXONOMY Q7) — this is the single
+    derivation point, so when the manifest lands only its caller changes."""
+    return Substrate.DIND_SYSBOX
+
+
 def select_dind_mode(mode: str) -> str:
     if mode == "auto":
         if sysbox_available():
@@ -1350,8 +1442,10 @@ def build_supervisor_docker_args(
     dind_mode: str,
     inner_firewall: bool = False,
     project_type: str = PROJECT_TYPE_RESEARCH,
+    substrate: str = Substrate.DIND_SYSBOX.value,
     service_flags: dict[str, bool] | None = None,
 ) -> list[str]:
+    is_docker = substrate == Substrate.DOCKER.value
     args = [
         "run", "-d",
         "--name", container_name,
@@ -1363,7 +1457,6 @@ def build_supervisor_docker_args(
         "-e", f"PROJECT={project}",
         "-e", f"SSH_PASSWORD={ssh_pass}",
         "-e", f"HOST_GID={os.getgid()}",
-        "-e", "DOCKER_DIND=true",
         "--label", f"{PROJECT_LABEL}={project}",
         "--label", f"{DIND_MODE_LABEL}={dind_mode}",
         # Flavor marker for the host (_container_project_type / recreate
@@ -1371,7 +1464,14 @@ def build_supervisor_docker_args(
         # caller's `image=`) is what actually differs at runtime; the entrypoints
         # no longer branch on a flavor env.
         "--label", f"{PROJECT_TYPE_LABEL}={project_type}",
+        # Containment substrate marker — read back by start()/recreate to pick
+        # plain docker start vs the sysbox recreate dance. Legacy containers
+        # without it default to dind-sysbox (_container_substrate).
+        "--label", f"{SUBSTRATE_LABEL}={substrate}",
     ]
+    # The docker substrate has no inner dockerd — no DIND boot, no runtime flag.
+    if not is_docker:
+        args += ["-e", "DOCKER_DIND=true"]
     if inner_firewall:
         args += ["-e", "RS_INNER_FIREWALL=1"]
     # Per-service flags: webui reads the labels (outside-the-container truth);
@@ -1457,11 +1557,17 @@ def _build_images(force: bool) -> None:
     rs-role-mcp-base — keep the list bottom-up so each FROM resolves to
     the just-built layer rather than a stale cached copy."""
     specs = [
-        # Shared substrate base MUST build before the two leaf images that
-        # FROM it (rs-supervisor, rs-management) — keep it first.
+        # No-DIND base MUST build first: rs-substrate-base AND rs-minimal both
+        # FROM it (WORKFLOW_TAXONOMY_S1.md carve).
+        (MINIMAL_BASE_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.minimal-base"),
+        # Shared substrate base = rs-minimal-base + sysbox DIND. MUST build
+        # before its two leaf images (rs-supervisor, rs-management).
         (SUBSTRATE_BASE_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.substrate-base"),
         (SUPERVISOR_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.supervisor"),
         (MANAGEMENT_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.management"),
+        # rs-minimal — the runnable `docker`-substrate leaf (FROM rs-minimal-base,
+        # which is already built above). No agent baked in.
+        (MINIMAL_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.minimal"),
         (ANALYSIS_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.analysis-base"),
         (MCP_PROXY_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.mcp-proxy"),
         (ROLE_MCP_BASE_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.role-mcp-base"),
@@ -1740,6 +1846,7 @@ def _read_supervisor_metadata(container: str) -> dict:
         "dind_mode": labels.get(DIND_MODE_LABEL, "privileged"),
         "inner_firewall": env.get("RS_INNER_FIREWALL") == "1",
         "project_type": labels.get(PROJECT_TYPE_LABEL, PROJECT_TYPE_RESEARCH),
+        "substrate": labels.get(SUBSTRATE_LABEL, Substrate.DIND_SYSBOX.value),
         "memory": memory,
         "cpus": cpus,
         "extra_mounts": extra_mounts,
@@ -1829,6 +1936,15 @@ def _recreate_supervisor(
     _stash_creds_for_rebuild(container, was_running, workspace_path)
     md = _read_supervisor_metadata(container)
 
+    # The sysbox recreate dance (rm + create + re-stage) exists because sysbox
+    # loses its volume bindings on stop. A docker-substrate project is a plain
+    # runc container with no inner store to re-stage — it uses docker start/stop
+    # (start() routes it to _start_docker_substrate; update() refuses it). If one
+    # ever reaches here it's a routing bug, not a recoverable state.
+    if md.get("substrate", Substrate.DIND_SYSBOX.value) == Substrate.DOCKER.value:
+        die(f"_recreate_supervisor called for docker-substrate project "
+            f"{project!r}; docker projects use plain start/stop")
+
     if was_running:
         print(f"stopping {container}...")
         run_check(["docker", "stop", container])
@@ -1854,6 +1970,7 @@ def _recreate_supervisor(
         dind_mode=md["dind_mode"],
         inner_firewall=md["inner_firewall"],
         project_type=md_ptype,
+        substrate=md["substrate"],
         service_flags=flags,
     )
     if md["extra_mounts"]:
@@ -1962,6 +2079,30 @@ def _container_project_type(container: str) -> str:
             capture_output=True)
     t = r.stdout.strip() if r.returncode == 0 else ""
     return t or PROJECT_TYPE_RESEARCH
+
+
+def _container_substrate(container: str) -> str:
+    """Containment substrate from the research.substrate label (defaults to
+    dind-sysbox for legacy containers without it). Drives start()'s plain
+    docker-start vs sysbox-recreate fork."""
+    r = run(["docker", "inspect", "-f",
+             f'{{{{index .Config.Labels "{SUBSTRATE_LABEL}"}}}}', container],
+            capture_output=True)
+    s = r.stdout.strip() if r.returncode == 0 else ""
+    return s or Substrate.DIND_SYSBOX.value
+
+
+def _start_docker_substrate(project: str, cfg: "Config") -> None:  # type: ignore[name-defined]
+    """Start a stopped `docker`-substrate project. Unlike a sysbox supervisor
+    (which loses its implicit volume bindings on stop and must be recreated), a
+    plain runc container starts cleanly with `docker start`. Only the router
+    default route — dropped with the container's netns on stop — is re-injected.
+    This is the deliberate exception to the 'sysbox can't stop/start' rule: it is
+    sysbox-specific, and the docker substrate has no sysbox bindings to lose."""
+    container = container_name_for(project)
+    run_check(["docker", "start", container])
+    network = project_network_for(project)
+    inject_route(container, get_router_ip(network))
 
 
 def _refresh_workspace_claude_templates(container: str) -> None:

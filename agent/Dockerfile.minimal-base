@@ -1,0 +1,134 @@
+FROM continuumio/miniconda3:latest
+
+# rs-minimal-base — the no-DIND shared substrate (WORKFLOW_TAXONOMY_S1.md image
+# carve). Holds everything common to a project container EXCEPT the
+# docker-in-docker stack: sshd, byobu, the `research` user, conda, and
+# code-server (the Editor tab). Two things FROM it:
+#
+#   rs-substrate-base = rs-minimal-base + the sysbox-DIND delta (docker-ce +
+#                       crun + daemon.json + the `docker` group) — and ITS two
+#                       leaves rs-supervisor / rs-management are unchanged.
+#   rs-minimal        = rs-minimal-base + an agent-less entrypoint — the runnable
+#                       leaf for the `docker` containment substrate (single runc
+#                       container, no inner dockerd, cannot spawn containers).
+#
+# Image tree:
+#   rs-minimal-base ─┬─ rs-minimal        (docker substrate: ssh + editor, runc)
+#                    └─ rs-substrate-base ─┬─ rs-supervisor  (research flavor)
+#                                          └─ rs-management  (sandbox flavor)
+#
+# No agent is ever baked here or in any leaf — agents are delivered per-project
+# as dists (PLAN/STAGE_AGENT_DIST.md), so the image axis stays substrate-only.
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Core tools: byobu, ssh, git, utilities. NO DIND deps (docker-ce, crun,
+# fuse-overlayfs, uidmap, iptables) — those live in rs-substrate-base. Egress
+# routing needs no in-container `ip`: inject_route runs it from an alpine
+# sidecar sharing this container's netns (research.py).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git curl jq nano ca-certificates gnupg \
+    byobu \
+    openssh-server \
+    iputils-ping \
+    sudo \
+    locales \
+    btop \
+    tini \
+    && rm -rf /var/lib/apt/lists/*
+
+# Locale (many tools expect UTF-8).
+RUN sed -i '/en_US.UTF-8/s/^# //' /etc/locale.gen && locale-gen
+ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+
+# SSH server setup.
+RUN mkdir -p /run/sshd && \
+    sed -i 's/#PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config && \
+    sed -i 's/#PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config && \
+    echo "AllowAgentForwarding no" >> /etc/ssh/sshd_config
+
+# Non-root user at UID 1000. NOPASSWD:ALL because the container is the security
+# boundary (sandboxed inside rs-sandbox network + router egress policy). NOT in
+# the `docker` group: that group only exists once docker-ce is installed
+# (rs-substrate-base adds the membership), and a `docker`-substrate box has no
+# inner docker socket to reach anyway.
+RUN useradd -m -s /bin/bash -G sudo -u 1000 research && \
+    echo "research ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/research
+
+# Initialize conda hooks in the research user's shell.
+RUN su - research -c "/opt/conda/bin/conda init bash"
+
+# --- code-server (browser IDE; the Editor tab, shared by every leaf) --------
+#
+# Pinned via ARG, mirroring DOCKER_VERSION discipline. Bumps are deliberate:
+# update the version, `research start --rebuild`, recreate affected projects.
+ARG CODE_SERVER_VERSION=4.123.0
+RUN curl -fsSL https://code-server.dev/install.sh \
+      | sh -s -- --version "${CODE_SERVER_VERSION}"
+
+# Strip built-in extensions per PLAN/STAGE_WEBUI_W2_code_server.md Tier 2:
+# keep grammar/syntax + themes + markdown + notebook viewers; drop heavy
+# language-server features, git stack, JS build/debug tooling.
+RUN set -eux; \
+    EXT_DIR=$(find /usr/lib/code-server -maxdepth 5 -type d -name extensions \
+                | head -n 1); \
+    [ -d "$EXT_DIR" ] || (echo "code-server extensions dir not found" && exit 1); \
+    cd "$EXT_DIR"; \
+    for ext in \
+        typescript-language-features \
+        html-language-features \
+        css-language-features \
+        json-language-features \
+        php-language-features \
+        git \
+        git-base \
+        github \
+        github-authentication \
+        microsoft-authentication \
+        merge-conflict \
+        npm \
+        grunt \
+        gulp \
+        jake \
+        node-debug \
+        node-debug2 \
+        debug-auto-launch \
+        debug-server-ready \
+        references-view \
+        extension-editing \
+        simple-browser \
+    ; do \
+        rm -rf "$ext" || true; \
+    done
+
+# Pre-stage Microsoft-marketplace-only extensions (.vsix) for first-boot
+# install. Vendored here because the runtime never touches MS marketplace.
+ARG DATA_WRANGLER_VERSION=1.24.2
+RUN mkdir -p /opt/code-server-templates/extensions \
+ && curl -fsSL --compressed \
+        -o /opt/code-server-templates/extensions/datawrangler.vsix \
+        "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-toolsai/vsextensions/datawrangler/${DATA_WRANGLER_VERSION}/vspackage"
+
+# Pre-baked code-server user settings (staged onto the workspace on first boot
+# by each entrypoint if absent).
+RUN mkdir -p /opt/code-server-templates/User
+COPY container/supervisor/code-server-settings.json \
+     /opt/code-server-templates/User/settings.json
+
+# Lazy-start TCP proxy for code-server (the slim-RAM strategy: spawn on first
+# connect, reap after idle). Used by every leaf's entrypoint.
+RUN mkdir -p /opt/code-server-tools
+COPY container/supervisor/code-server-stub.py \
+     /opt/code-server-tools/code-server-stub.py
+RUN chmod +x /opt/code-server-tools/code-server-stub.py
+
+# Minimal byobu status line. Staged into the research user's home so each
+# leaf's first-boot skel snapshot (cp -a /home/research /etc/research-skel,
+# done in the LEAF after its own home additions) picks it up.
+RUN install -d -o research -g research /home/research/.byobu /home/research/.byobu/bin
+COPY --chown=research:research agent/byobu-status      /home/research/.byobu/status
+COPY --chown=research:research agent/byobu-bin-rolename /home/research/.byobu/bin/60_rolename
+RUN chmod +x /home/research/.byobu/bin/60_rolename
+
+# No skel snapshot, no USER switch, no ENTRYPOINT here — the leaf images add
+# their flavor layer, snapshot the home, and set the entrypoint.

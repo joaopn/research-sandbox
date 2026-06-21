@@ -209,8 +209,15 @@ def _print_create_report(res, cfg) -> None:
     else:
         webui_block = ""
 
+    is_docker = res.substrate == rscore.Substrate.DOCKER.value
     steps: list[str] = []
-    if res.project_type == PROJECT_TYPE_SANDBOX:
+    if is_docker:
+        steps.append(
+            "  1. Open the box: `python research.py project attach "
+            f"{res.project}` (a plain shell) or the Editor tab. It runs no\n"
+            "     inner docker and no agent — a single confined container."
+        )
+    elif res.project_type == PROJECT_TYPE_SANDBOX:
         steps.append(
             "  1. Open the Management shell and spin a box:\n"
             f"     `python research.py project attach {res.project}`, then run\n"
@@ -225,7 +232,9 @@ def _print_create_report(res, cfg) -> None:
             f"     `python research.py project attach {res.project}`, then in byobu run\n"
             "     `claude` and complete the device-code flow in a local browser."
         )
-    steps.append(f"  {len(steps)+1}. Start working on a problem with the supervisor.")
+    if not is_docker:
+        steps.append(
+            f"  {len(steps)+1}. Start working on a problem with the supervisor.")
     next_steps = "\n".join(steps)
 
     print(f"""
@@ -234,6 +243,7 @@ Project '{res.project}' is running.
   Container: {res.container}
   Workspace: {res.workspace}
   Network:   {res.network} (egress: {res.egress})
+  Substrate: {res.substrate}
   DIND mode: {res.dind_mode}
   Inner FW:  {inner_fw}
   MCPs:      {mcps_line}
@@ -250,7 +260,8 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     cfg = load_config()
     req = _build(
         rscore.CreateRequest,
-        name=args.name, type=args.type, egress=args.egress, dind=args.dind,
+        name=args.name, type=args.type, substrate=args.substrate,
+        egress=args.egress, dind=args.dind,
         profile=args.profile, data=args.data, memory=args.memory,
         cpus=args.cpus, ssh_port=args.ssh_port,
         inner_firewall=args.inner_firewall, enable=args.enable,
@@ -1739,6 +1750,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "boxes managed from the in-supervisor `rs-sandbox` CLI "
                         "(inner firewall on by default; egress-OFF boxes get no "
                         "outbound network).")
+    # INTERNAL / DEV ONLY — substrate is never a user-facing axis
+    # (WORKFLOW_TAXONOMY Q7). Hidden from --help and never relayed by the broker
+    # (not in CREATE_WEBUI_FIELDS). It exists so the slice-1 acceptance test can
+    # stand up a `docker`-substrate project before the workflow store exists;
+    # the store's `empty`/`empty-dind` entries replace it, then it is deleted.
+    c.add_argument("--substrate", choices=["docker", "dind-sysbox"],
+                   default=None, help=argparse.SUPPRESS)
     c.add_argument("--data", metavar="PATHS",
                    help="comma-separated host paths, each mounted RO at "
                         "/workspace/shared/data/<basename>/ (e.g. "
