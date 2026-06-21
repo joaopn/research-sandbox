@@ -50,6 +50,7 @@ import mcp_registry  # noqa: E402
 import pi_isolated_registry  # noqa: E402  (BYO sandbox type registry; sub-component of sandbox)
 import role_mcp  # noqa: E402
 import sandbox  # noqa: E402  (unified PI-driven container surface; absorbs former pi + pi_isolated)
+import workflow  # noqa: E402  (workflow manifest schema + store catalog; read-only here)
 import broker  # noqa: E402  (host-side lifecycle-verb daemon over a unix socket; opt-in)
 
 # --- lifecycle core ---------------------------------------------------------
@@ -1693,6 +1694,36 @@ def cmd_webui(args: argparse.Namespace) -> None:
         return
 
 
+def cmd_workflow_list(args: argparse.Namespace) -> None:
+    """Render the store catalog: built-in workflows + any host-side BYO entries.
+    Read-only — the workflow surface is not yet wired into `create()` (that, plus
+    the rs-management rename and `--type` removal, is the create-wiring slice)."""
+    try:
+        catalog = workflow.load_catalog()
+    except workflow.WorkflowError as e:
+        die(str(e))
+    if args.json:
+        print(json.dumps(catalog, indent=2, sort_keys=True))
+        return
+    if not catalog:
+        print("no workflows")
+        return
+    rows = [(m["name"], m["substrate"], workflow.payload_kind(m), m["source"])
+            for m in catalog]
+    descs = [m.get("description", "") for m in catalog]
+    w_name = max(len("WORKFLOW"), *(len(r[0]) for r in rows))
+    w_sub = max(len("SUBSTRATE"), *(len(r[1]) for r in rows))
+    w_pay = max(len("PAYLOAD"), *(len(r[2]) for r in rows))
+    w_src = max(len("SOURCE"), *(len(r[3]) for r in rows))
+    header = (f"{'WORKFLOW':<{w_name}}  {'SUBSTRATE':<{w_sub}}  "
+              f"{'PAYLOAD':<{w_pay}}  {'SOURCE':<{w_src}}  DESCRIPTION")
+    print(header)
+    print("-" * len(header))
+    for (name, sub, pay, src), desc in zip(rows, descs):
+        print(f"{name:<{w_name}}  {sub:<{w_sub}}  {pay:<{w_pay}}  "
+              f"{src:<{w_src}}  {desc}")
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -2274,6 +2305,13 @@ def build_parser() -> argparse.ArgumentParser:
     pds.set_defaults(func=cmd_sandbox_describe)
 
     # ----- webui (browser SSH multiplexer) ------------------------------
+    wf = sub.add_parser("workflow",
+                        help="workflow store catalog (substrate + payload definitions)")
+    wf_sub = wf.add_subparsers(dest="subcommand", required=True)
+    wfl = wf_sub.add_parser("list", help="list available workflows (built-in + BYO)")
+    wfl.add_argument("--json", action="store_true")
+    wfl.set_defaults(func=cmd_workflow_list)
+
     wu = sub.add_parser("webui", help="manage the optional browser UI container")
     wu_sub = wu.add_subparsers(dest="webui_action", required=True)
 
