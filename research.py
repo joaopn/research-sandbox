@@ -243,6 +243,7 @@ Project '{res.project}' is running.
 
   Container: {res.container}
   Workspace: {res.workspace}
+  Workflow:  {res.workflow}
   Network:   {res.network} (egress: {res.egress})
   Substrate: {res.substrate}
   DIND mode: {res.dind_mode}
@@ -261,7 +262,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     cfg = load_config()
     req = _build(
         rscore.CreateRequest,
-        name=args.name, type=args.type, substrate=args.substrate,
+        name=args.name, workflow=args.workflow,
         egress=args.egress, dind=args.dind,
         profile=args.profile, data=args.data, memory=args.memory,
         cpus=args.cpus, ssh_port=args.ssh_port,
@@ -1774,20 +1775,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     c = proj_sub.add_parser("create", help="create a new project")
     c.add_argument("name")
-    c.add_argument("--type", choices=[PROJECT_TYPE_RESEARCH, PROJECT_TYPE_SANDBOX],
-                   default=PROJECT_TYPE_RESEARCH,
-                   help="project flavor. 'research' (default): supervisor agent "
-                        "+ workers. 'sandbox': agent-less collection of isolated "
-                        "boxes managed from the in-supervisor `rs-sandbox` CLI "
-                        "(inner firewall on by default; egress-OFF boxes get no "
-                        "outbound network).")
-    # INTERNAL / DEV ONLY — substrate is never a user-facing axis
-    # (WORKFLOW_TAXONOMY Q7). Hidden from --help and never relayed by the broker
-    # (not in CREATE_WEBUI_FIELDS). It exists so the slice-1 acceptance test can
-    # stand up a `docker`-substrate project before the workflow store exists;
-    # the store's `empty`/`empty-dind` entries replace it, then it is deleted.
-    c.add_argument("--substrate", choices=["docker", "dind-sysbox"],
-                   default=None, help=argparse.SUPPRESS)
+    # The user picks a WORKFLOW; the substrate + legacy flavor are derived from
+    # its manifest (CreateRequest.from_kwargs). Free string (NOT choices=catalog:
+    # that would file-read the registry on every CLI call, so a malformed
+    # workflow-registry.json would break the whole CLI — membership is validated
+    # in from_kwargs so a bad registry only fails create). See `research workflow
+    # list`. Default: research (the full lab).
+    c.add_argument("--workflow", default=None,
+                   help="workflow to launch (default: research). See "
+                        "`research workflow list` for the catalog; e.g. "
+                        "'box-host' (agent-less DIND box host), 'empty' (a single "
+                        "confined docker container).")
     c.add_argument("--data", metavar="PATHS",
                    help="comma-separated host paths, each mounted RO at "
                         "/workspace/shared/data/<basename>/ (e.g. "

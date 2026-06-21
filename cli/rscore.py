@@ -64,6 +64,7 @@ import mcp_registry  # noqa: E402
 import pi_isolated_registry  # noqa: E402
 import role_mcp  # noqa: E402
 import sandbox  # noqa: E402
+import workflow  # noqa: E402  (manifest store catalog; from_kwargs resolves --workflow)
 
 
 # ---------------------------------------------------------------------------
@@ -81,9 +82,9 @@ class Substrate(str, enum.Enum):
     """Containment runtime — an INTERNAL axis, never a user-facing flag
     (WORKFLOW_TAXONOMY Q7). ``dind-sysbox`` is today's sysbox DIND host (both
     research and sandbox flavors run on it); ``docker`` is a single runc
-    container with no inner daemon. Derived from the workflow (slice 1: from the
-    project type via derive_substrate, overridable only through the hidden dev
-    --substrate flag; the workflow manifest becomes the real source later)."""
+    container with no inner daemon. Resolved from the user-selected workflow's
+    manifest in ``CreateRequest.from_kwargs`` (via ``_resolve_workflow``) and set
+    on the request, so create() consumes it without re-deriving."""
     DOCKER = "docker"
     DIND_SYSBOX = "dind-sysbox"
 
@@ -169,11 +170,49 @@ def _as_tuple(value: Any) -> tuple[str, ...]:
 # ---------------------------------------------------------------------------
 
 
+# The user-facing create selector is the WORKFLOW. The substrate is internal
+# (never a flag), and the legacy project_type flavor is DERIVED from the
+# resolved manifest — both are set by from_kwargs so create()'s body is unchanged
+# (WORKFLOW_TAXONOMY_S3). A bare `create <name>` defaults to the research lab.
+DEFAULT_WORKFLOW = "research"
+
+
+def _resolve_workflow(workflow_id: str) -> tuple["ProjectType", "Substrate"]:
+    """Resolve a workflow id against the store catalog into the (project_type,
+    substrate) that create() already consumes. Raises ValidationError (the
+    pre-side-effect channel) on an unknown id or a broken catalog.
+
+    The legacy project_type flavor is derived from manifest DATA — NOT a manifest
+    field (which would entrench the very key the deferred refactor removes) and
+    NOT a workflow-name lookup (couples to names): a docker box is the research
+    flavor (matches slice 1's --substrate docker), the rs-management overlay is
+    the agent-less sandbox flavor, everything else is research. Built-in-only for
+    now; BYO-overlay flavor derivation is a later slice."""
+    try:
+        catalog = {m["name"]: m for m in workflow.load_catalog()}
+    except workflow.WorkflowError as e:
+        raise ValidationError(f"workflow catalog error: {e}")
+    m = catalog.get(workflow_id)
+    if m is None:
+        raise ValidationError(
+            f"unknown workflow {workflow_id!r}; see `research workflow list`")
+    substrate = Substrate(m["substrate"])  # manifest substrate is schema-validated
+    mgmt_overlay = MANAGEMENT_IMAGE.split(":", 1)[0]  # "rs-management"
+    if m["substrate"] == Substrate.DOCKER.value:
+        project_type = ProjectType.RESEARCH
+    elif m.get("image_overlay") == mgmt_overlay:
+        project_type = ProjectType.SANDBOX
+    else:
+        project_type = ProjectType.RESEARCH
+    return project_type, substrate
+
+
 @dataclass(frozen=True)
 class CreateRequest:
     name: str
-    type: ProjectType = ProjectType.RESEARCH
-    substrate: Substrate | None = None    # None ⇒ derive_substrate(type); INTERNAL
+    workflow: str = DEFAULT_WORKFLOW      # the USER-facing selector
+    type: ProjectType = ProjectType.RESEARCH   # DERIVED from workflow (internal flavor)
+    substrate: Substrate | None = None    # DERIVED from workflow (internal); never a flag
     egress: Egress | None = None          # None ⇒ config/flavor default at run time
     dind: DindMode | None = None          # None ⇒ cfg.default_dind at run time
     profile: str = "python"               # accepted for CLI parity; currently unused
@@ -192,12 +231,15 @@ class CreateRequest:
         ssh_port = kw.get("ssh_port")
         if ssh_port is not None and not isinstance(ssh_port, int):
             raise ValidationError("ssh_port must be an integer")
-        obj = cls(
+        # Resolve the workflow → (type, substrate) here, the single validation
+        # choke point, so create() consumes the same two fields as before.
+        workflow_id = kw.get("workflow") or DEFAULT_WORKFLOW
+        project_type, substrate = _resolve_workflow(workflow_id)
+        return cls(
             name=_require_name(kw.get("name")),
-            type=_as_enum(ProjectType, kw.get("type"),
-                          field_name="--type", default=ProjectType.RESEARCH),
-            substrate=_as_enum(Substrate, kw.get("substrate"),
-                               field_name="--substrate", default=None),
+            workflow=workflow_id,
+            type=project_type,
+            substrate=substrate,
             egress=_as_enum(Egress, kw.get("egress"),
                             field_name="--egress", default=None),
             dind=_as_enum(DindMode, kw.get("dind"),
@@ -213,15 +255,6 @@ class CreateRequest:
             role_mcp_upstream=_as_tuple(kw.get("role_mcp_upstream")),
             mcp=kw.get("mcp") if kw.get("mcp") is not None else "all-enabled",
         )
-        # Cross-field coherence: the docker substrate has no box/rs-sandbox
-        # layer, so the sandbox flavor cannot run on it. Reject before any side
-        # effect rather than build an rs-minimal box stamped project_type=sandbox
-        # (which would offer a Management tab whose rs-sandbox command is absent).
-        if obj.substrate is Substrate.DOCKER and obj.type is ProjectType.SANDBOX:
-            raise ValidationError(
-                "--substrate docker is incompatible with --type sandbox "
-                "(the docker substrate has no box layer)")
-        return obj
 
 
 @dataclass(frozen=True)
@@ -311,6 +344,7 @@ class CreateResult:
     inner_firewall: bool
     project_type: str
     substrate: str
+    workflow: str
     ssh_port: int
     ssh_password: str                       # in-memory only
     data_mounts: dict[str, str] = field(default_factory=dict)   # basename → host src
@@ -421,7 +455,9 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     project_type = (PROJECT_TYPE_SANDBOX
                     if req.type is ProjectType.SANDBOX
                     else PROJECT_TYPE_RESEARCH)
-    substrate = req.substrate or derive_substrate(project_type)
+    # substrate is always set by CreateRequest.from_kwargs (resolved from the
+    # workflow); no derivation fallback needed here.
+    substrate = req.substrate
     is_docker = substrate is Substrate.DOCKER
 
     substrate_image = (
@@ -496,13 +532,15 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     if not is_docker:
         ensure_mcp_files(project, cfg)
 
-    # 1c. Project-flavor + substrate marker on the volume (survives a supervisor
-    #     recreate; read by the webui off /projects:ro).
+    # 1c. Project-flavor + substrate + workflow marker on the volume (survives a
+    #     supervisor recreate via the bind-mount; "type" is read by the webui off
+    #     /projects:ro). "workflow" is provenance — what the user selected; the
+    #     derived "type"/"substrate" are what the machinery branches on.
     orch_dir = workspace_path / ".orchestrator"
     orch_dir.mkdir(parents=True, exist_ok=True)
     (orch_dir / "project.json").write_text(
-        json.dumps({"type": project_type, "substrate": substrate.value},
-                   indent=2) + "\n")
+        json.dumps({"type": project_type, "substrate": substrate.value,
+                    "workflow": req.workflow}, indent=2) + "\n")
 
     # 2. Per-project network + router wiring.
     progress.step("network", "creating project network")
@@ -651,6 +689,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         inner_firewall=inner_firewall,
         project_type=project_type,
         substrate=substrate.value,
+        workflow=req.workflow,
         ssh_port=int(ssh_port),
         ssh_password=ssh_pass,
         data_mounts={b: str(src) for b, src in data_basenames.items()},
@@ -1209,16 +1248,6 @@ def network_exists(name: str) -> bool:
 def sysbox_available() -> bool:
     r = run(["docker", "info", "--format", "{{json .Runtimes}}"], capture_output=True)
     return '"sysbox-runc"' in r.stdout
-
-
-def derive_substrate(project_type: str) -> Substrate:
-    """Map a project flavor to its containment substrate. Both shipped flavors
-    (research, sandbox) run on dind-sysbox today; the lightweight `docker`
-    substrate is reachable only via CreateRequest.substrate (the hidden dev
-    --substrate flag in slice 1; the workflow manifest later). Substrate is
-    never a user-facing axis (WORKFLOW_TAXONOMY Q7) — this is the single
-    derivation point, so when the manifest lands only its caller changes."""
-    return Substrate.DIND_SYSBOX
 
 
 def select_dind_mode(mode: str) -> str:

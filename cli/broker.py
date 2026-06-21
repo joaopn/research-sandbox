@@ -253,9 +253,11 @@ def _verb_start(args: dict, progress=None) -> list[dict]:
 # any future path/host-shaped field — those stay CLI-only. Deny-by-default,
 # mirroring OPEN_VERBS: a new CreateRequest field is unreachable from the webui
 # until someone explicitly adds it here. from_kwargs still validates these
-# (name regex, type/egress enums, enable/disable token lists).
+# (name regex, workflow membership, egress enum, enable/disable token lists).
+# `workflow` is the user-facing selector (substrate + flavor are derived from its
+# manifest, never relayed); the old `type` flag is gone (WORKFLOW_TAXONOMY_S3).
 CREATE_WEBUI_FIELDS = frozenset({
-    "name", "type", "egress", "enable", "disable", "memory", "cpus",
+    "name", "workflow", "egress", "enable", "disable", "memory", "cpus",
 })
 
 # The webui-settable subset of UpdateRequest fields. `rebuild`/`keep_claude` are

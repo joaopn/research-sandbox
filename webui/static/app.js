@@ -1188,17 +1188,21 @@ function mgmtConfirmThenTail(view, cfg) {
 }
 
 // ---- create -----------------------------------------------------------------
-// Minimal create form: name · type · egress · a few --enable presets. The
+// Minimal create form: name · workflow · egress · a few --enable presets. The
 // broker's CREATE_WEBUI_FIELDS allow-list is the real input boundary (it drops
 // any path/host-shaped field); full CLI-flag parity is deliberately deferred.
+// The user picks a WORKFLOW (substrate + flavor are derived from its manifest,
+// server-side). The options are hardcoded to the built-ins for now; the
+// catalog-driven picker is STAGE_WEBUI_WORKFLOWS.
 
 const MGMT_ENABLE_PRESETS = ["websearcher", "wrangler", "echo"];
 
 function mgmtCreateDialog(view) {
     const nameI = el("input", { type: "text", autocomplete: "off" });
-    const typeS = el("select", {}, [
+    const workflowS = el("select", {}, [
         el("option", { value: "research" }, ["research"]),
-        el("option", { value: "sandbox" }, ["sandbox"]),
+        el("option", { value: "box-host" }, ["box-host"]),
+        el("option", { value: "empty" }, ["empty"]),
     ]);
     const egressS = el("select", {}, [
         el("option", { value: "open" }, ["open"]),
@@ -1215,7 +1219,7 @@ function mgmtCreateDialog(view) {
         confirmLabel: "Create",
         body: [
             el("div", { class: "field" }, [el("label", {}, ["Project name"]), nameI]),
-            el("div", { class: "field" }, [el("label", {}, ["Type"]), typeS]),
+            el("div", { class: "field" }, [el("label", {}, ["Workflow"]), workflowS]),
             el("div", { class: "field" }, [el("label", {}, ["Egress"]), egressS]),
             el("div", { class: "field" }, [
                 el("label", {}, ["Enable"]),
@@ -1229,7 +1233,7 @@ function mgmtCreateDialog(view) {
         request: () => fetch("/broker/project", {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-                name: nameI.value.trim(), type: typeS.value, egress: egressS.value,
+                name: nameI.value.trim(), workflow: workflowS.value, egress: egressS.value,
                 enable: checks.filter((c) => c.cb.checked).map((c) => c.p),
             }),
         }),
