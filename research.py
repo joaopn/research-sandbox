@@ -242,6 +242,9 @@ def _print_create_report(res, cfg) -> None:
     # was actually cloned. Non-secret — the report never carries the PAT.
     clone_block = (f"  Cloned:    {res.repo} → {res.clone_dir}\n"
                    if getattr(res, "clone_dir", "") else "")
+    # Agent dist (STAGE_AGENT_DIST_S1): show only when a docker box deployed one.
+    agent_block = (f"  Agent:     {res.agent} (deployed to ~/.local)\n"
+                   if getattr(res, "agent", "") else "")
 
     print(f"""
 Project '{res.project}' is running.
@@ -249,7 +252,7 @@ Project '{res.project}' is running.
   Container: {res.container}
   Workspace: {res.workspace}
   Workflow:  {res.workflow}
-{clone_block}  Network:   {res.network} (egress: {res.egress})
+{clone_block}{agent_block}  Network:   {res.network} (egress: {res.egress})
   Substrate: {res.substrate}
   DIND mode: {res.dind_mode}
   Inner FW:  {inner_fw}
@@ -276,6 +279,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         mcp=args.mcp,
         repo=args.repo, ref=args.ref, setup=args.setup_script,
         github_pat=os.environ.get("RS_GITHUB_PAT") or "",   # never a CLI flag
+        agent=args.agent,
     )
     try:
         res = rscore.create(req, cfg)
@@ -284,6 +288,46 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         # operator's own terminal is fine (WORKFLOW_TAXONOMY_S4 rule 4).
         die(f"{e.log_msg}: {e.client_detail}" if e.client_detail else e.log_msg)
     _print_create_report(res, cfg)
+
+
+def cmd_agent_pull(args: argparse.Namespace) -> None:
+    res = rscore.agent_pull(agent=args.agent)
+    print(f"pulled {res['agent']} {res['version']} → {res['path']}")
+
+
+def cmd_agent_show(args: argparse.Namespace) -> None:
+    rows = rscore.agent_list()
+    if not rows:
+        print("no agent dists pulled yet — run `research agent pull`")
+        return
+    for r in rows:
+        print(f"  {r.get('agent', '?'):10} {r.get('version', '?'):14} "
+              f"pulled {r.get('pulled_at', '?')}")
+
+
+def cmd_agent_refresh(args: argparse.Namespace) -> None:
+    """HITL: check upstream, offer to bump the versions.env pin + re-pull. The
+    pin (CLAUDE_CODE_VERSION) is shared with the transitional bake, so this moves
+    the fleet's next-rebuild version too (STAGE_AGENT_DIST_S1 coupled pin)."""
+    agent = args.agent
+    current, latest = rscore.agent_refresh_check(agent)
+    if current == latest:
+        print(f"{agent}: up to date (versions.env pin {current} == upstream {latest})")
+        if not rscore.dist_present(agent):
+            print(f"  (no dist cached yet — run `research agent pull --agent {agent}`)")
+        return
+    print(f"{agent}: versions.env pin {current or '(unset)'} → upstream {latest}")
+    print("  (this also moves the fleet's next `start --rebuild` version)")
+    if not args.yes:
+        try:
+            resp = input("bump the pin in versions.env + pull it? [y/N] ").strip().lower()
+        except EOFError:
+            resp = "n"
+        if resp not in ("y", "yes"):
+            print("aborted; versions.env unchanged")
+            return
+    rscore.agent_apply_refresh(agent, latest)
+    print(f"bumped versions.env + pulled {agent} {latest}; review + commit versions.env")
 
 
 def cmd_project_attach(args: argparse.Namespace) -> None:
@@ -1862,6 +1906,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="shell snippet run in the clone dir after checkout (or in "
                         "/workspace when there is no repo). Chain steps with "
                         "&& / newlines. Runs once at create.")
+    c.add_argument("--agent", choices=list(rscore.KNOWN_AGENTS),
+                   help="deploy an agent into a docker-substrate box at boot "
+                        "(cp from the host dist; run `research agent pull` first). "
+                        "Default: none (clean box). Ignored on non-docker workflows.")
     c.set_defaults(func=cmd_project_create)
 
     a = proj_sub.add_parser("attach", help="docker exec + byobu attach")
@@ -2333,6 +2381,22 @@ def build_parser() -> argparse.ArgumentParser:
     wfl = wf_sub.add_parser("list", help="list available workflows (built-in + BYO)")
     wfl.add_argument("--json", action="store_true")
     wfl.set_defaults(func=cmd_workflow_list)
+
+    ag = sub.add_parser("agent",
+                        help="host-cached agent dists (claude, …) deployed into "
+                             "boxes at boot via cp, not baked")
+    ag_sub = ag.add_subparsers(dest="subcommand", required=True)
+    agp = ag_sub.add_parser("pull",
+                            help="build + cache the versions.env-pinned agent dist")
+    agp.add_argument("--agent", default="claude", choices=list(rscore.KNOWN_AGENTS))
+    agp.set_defaults(func=cmd_agent_pull)
+    ags = ag_sub.add_parser("show", help="list cached agent dists + versions")
+    ags.set_defaults(func=cmd_agent_show)
+    agr = ag_sub.add_parser("refresh",
+                            help="check upstream; offer to bump the pin + re-pull")
+    agr.add_argument("--agent", default="claude", choices=list(rscore.KNOWN_AGENTS))
+    agr.add_argument("--yes", action="store_true", help="skip the confirm prompt")
+    agr.set_defaults(func=cmd_agent_refresh)
 
     wu = sub.add_parser("webui", help="manage the optional browser UI container")
     wu_sub = wu.add_subparsers(dest="webui_action", required=True)

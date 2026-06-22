@@ -264,6 +264,9 @@ CREATE_WEBUI_FIELDS = frozenset({
     # github_pat is a SECRET in-box field: forwarded over the request envelope,
     # never logged/persisted off the box, never a CreateResult field.
     "repo", "ref", "setup", "github_pat",
+    # agent: which agent dist a docker box deploys at boot — in-box field
+    # (STAGE_AGENT_DIST_S1); dist-must-exist is enforced in from_kwargs.
+    "agent",
 })
 
 # The webui-settable subset of UpdateRequest fields. `rebuild`/`keep_claude` are

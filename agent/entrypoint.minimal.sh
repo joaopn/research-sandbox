@@ -26,8 +26,24 @@ umask 002
 if [[ ! -f ~/.bashrc ]]; then
     cp -a /etc/research-skel/. ~/
 fi
+# Deploy the agent dist (if --agent RO-mounted it) into our OWN writable ~/.local
+# (STAGE_AGENT_DIST_S1). Guard on the LAUNCHER'S ABSENCE, NOT ~/.bashrc/first-boot:
+# rs-minimal's /home/research is image-resident (not a volume), so ~/.bashrc
+# always exists and the first-boot block above never fires here. The absence
+# guard still deploys exactly once — a later docker-start restart finds the
+# launcher present and skips, so an autoupdater bump is never clobbered. The
+# mount is an inert RO copy-source; the box runs from its own copy.
+if [[ -d /opt/agent-dist && ! -e ~/.local/bin/claude ]]; then
+    mkdir -p ~/.local
+    cp -a /opt/agent-dist/. ~/.local/
+fi
 if ! grep -q 'umask 002' ~/.bashrc 2>/dev/null; then
     echo 'umask 002' >> ~/.bashrc
+fi
+# ~/.local/bin on PATH (where the agent launcher lands) — unconditional +
+# idempotent (self-heals), like the umask line; rs-minimal-base doesn't export it.
+if ! grep -q '\.local/bin' ~/.bashrc 2>/dev/null; then
+    echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 fi
 echo minimal > ~/.rs-role
 

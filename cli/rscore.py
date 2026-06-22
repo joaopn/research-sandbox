@@ -324,6 +324,9 @@ class CreateRequest:
     ref: str = ""
     setup: str = ""
     github_pat: str = field(default="", repr=False)
+    # Which agent dist a docker box deploys at boot (STAGE_AGENT_DIST_S1). In-box
+    # field (selects software run *inside* the box, not host-shaped); "" = clean.
+    agent: str = ""
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "CreateRequest":
@@ -351,6 +354,17 @@ class CreateRequest:
                     "docker box is locked-egress (no ssh/port 22) and a private "
                     "repo clones over https via a PAT")
             _light_clone_basename(repo)   # reject a path-escaping basename early
+        # Agent dist (STAGE_AGENT_DIST_S1): enum, and on the docker substrate the
+        # dist must already be pulled. Non-docker is noted-and-ignored in create()
+        # (slice 1 wires only the docker-box cp-deploy path), so no dist needed.
+        agent = (kw.get("agent") or "").strip()
+        if agent and agent not in KNOWN_AGENTS:
+            raise ValidationError(
+                f"unknown agent {agent!r} (known: {', '.join(KNOWN_AGENTS)})")
+        if agent and substrate is Substrate.DOCKER and not dist_present(agent):
+            raise ValidationError(
+                f"--agent {agent}: no cached dist — run "
+                f"`research agent pull --agent {agent}` first")
         return cls(
             name=_require_name(kw.get("name")),
             workflow=workflow_id,
@@ -371,6 +385,7 @@ class CreateRequest:
             role_mcp_upstream=_as_tuple(kw.get("role_mcp_upstream")),
             mcp=kw.get("mcp") if kw.get("mcp") is not None else "all-enabled",
             repo=repo, ref=ref, setup=setup, github_pat=github_pat,
+            agent=agent,
         )
 
 
@@ -472,6 +487,7 @@ class CreateResult:
     # CreateResult is asdict'd into the broker reply + lingers in webui OP_RUNS.
     repo: str = ""
     clone_dir: str = ""                     # /workspace/<basename> if a repo cloned
+    agent: str = ""                         # agent dist deployed into a docker box
 
 
 @dataclass
@@ -587,6 +603,12 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     if not is_docker and (req.repo or req.setup):
         print("note: --repo/--setup-script apply only to the light-path docker "
               "box; ignoring for this workflow", file=sys.stderr)
+    # --agent deploys an agent dist into the docker box (STAGE_AGENT_DIST_S1). On a
+    # dind/overlay workflow the dist cp-deploy path isn't wired yet (slice 2) and
+    # claude is still baked there, so the flag is noted-and-ignored.
+    if not is_docker and req.agent:
+        print(f"note: --agent {req.agent} applies only to the docker box; "
+              "ignoring for this workflow", file=sys.stderr)
 
     substrate_image = (
         MINIMAL_IMAGE if is_docker
@@ -666,9 +688,11 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     #     derived "type"/"substrate" are what the machinery branches on.
     orch_dir = workspace_path / ".orchestrator"
     orch_dir.mkdir(parents=True, exist_ok=True)
+    deployed_agent = req.agent if (is_docker and req.agent) else ""
     (orch_dir / "project.json").write_text(
         json.dumps({"type": project_type, "substrate": substrate.value,
-                    "workflow": req.workflow}, indent=2) + "\n")
+                    "workflow": req.workflow, "agent": deployed_agent},
+                   indent=2) + "\n")
 
     # 2. Per-project network + router wiring.
     progress.step("network", "creating project network")
@@ -737,6 +761,13 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     )
     if extra_mounts:
         docker_args = docker_args[:-1] + extra_mounts + [docker_args[-1]]
+    # Agent dist: RO-mount the host cache as a copy-source + label the box
+    # (STAGE_AGENT_DIST_S1). docker-substrate only; the entrypoint cp's it into
+    # the box's own ~/.local on first boot. Inserted before the image (last arg).
+    if deployed_agent:
+        agent_args = ["--label", f"{AGENT_LABEL}={deployed_agent}",
+                      "-v", f"{agent_dist_path(deployed_agent)}:/opt/agent-dist:ro"]
+        docker_args = docker_args[:-1] + agent_args + [docker_args[-1]]
     if not is_docker:
         ext_mounts = _sandbox_external_mounts(project)
         if ext_mounts:
@@ -841,6 +872,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         sandboxes=sandboxes_enabled,
         repo=req.repo,
         clone_dir=clone_dir,
+        agent=deployed_agent,
     )
 
 
@@ -1159,6 +1191,7 @@ PROJECT_TYPE_SANDBOX = "sandbox"
 # label so start()/recreate read it back; legacy containers without it default
 # to dind-sysbox. Also recorded in .orchestrator/project.json for the webui.
 SUBSTRATE_LABEL = "research.substrate"
+AGENT_LABEL = "research.agent"   # which agent dist a docker box deployed (S4 Route 2)
 MCP_CONTAINER_PREFIX = "rs-mcp-"
 MCP_LABEL = "research.mcp"
 MCP_NAME_LABEL = "research.mcp_name"
@@ -1722,6 +1755,190 @@ def load_versions() -> dict[str, str]:
         if k:
             pins[k] = v
     return pins
+
+
+# ---------------------------------------------------------------------------
+# Agent dist — host-cached, version-pinned agent software copied into a box at
+# boot (STAGE_AGENT_DIST_S1). The image stays agent-less; the entrypoint deploys
+# the agent via `cp` from a RO mount of this cache. Built INSIDE a throwaway
+# rs-minimal-base container (no host ~/.local pollution, no host-tool dependency).
+# ---------------------------------------------------------------------------
+
+AGENT_DIST_DIR = Path.home() / ".research-sandbox" / "agent-dist"
+
+# Per-agent install recipe. version_key names the versions.env pin — ONE pin for
+# the dist AND (transitionally) the bake build-arg, so `agent refresh` writes the
+# fleet's next-rebuild version too (STAGE_AGENT_DIST_S1 coupled-pin decision).
+# `install` runs IN rs-minimal-base as the `research` user. Adding codex/goose
+# later is one entry here (the N+M seam).
+_AGENT_INSTALL = {
+    "claude": {
+        "version_key": "CLAUDE_CODE_VERSION",
+        "install": "curl -fsSL https://claude.ai/install.sh | bash -s -- {ver}",
+        "bin": "claude",
+        # Upstream version-resolve endpoint (verified against bootstrap.sh: the
+        # installer curls this to turn "latest" into a concrete version; the body
+        # is a bare semver string). `agent refresh` fetches just this — no install.
+        "latest_url": "https://downloads.claude.ai/claude-code-releases/latest",
+    },
+}
+KNOWN_AGENTS = tuple(_AGENT_INSTALL)   # the --agent enum
+
+# A version token safe to interpolate into the in-container install shell — a
+# charset guard (defense-in-depth against a crafted versions.env), not a range.
+_AGENT_VERSION_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+# The dist build is a NETWORK download (install.sh fetches the agent binary), so a
+# transient failure is possible; each attempt is a fresh --rm container and the
+# install is idempotent, so retrying is safe. 3 attempts makes a single transient
+# unlikely to fail the build while bounding wasted time at ~3× a failed download.
+_AGENT_BUILD_ATTEMPTS = 3
+# Tail of the failed-build output surfaced in the die message — enough to see the
+# actual install error without dumping the whole (large) download log.
+_AGENT_ERR_TAIL = 2000
+
+
+def agent_dist_path(agent: str) -> Path:
+    return AGENT_DIST_DIR / agent
+
+
+def _agent_sidecar(agent: str) -> Path:
+    return AGENT_DIST_DIR / f"{agent}.json"
+
+
+def dist_present(agent: str) -> bool:
+    """True iff a usable dist for `agent` is cached (its launcher entry exists).
+    lexists, not exists: the launcher is a symlink to an absolute ~/.local/share
+    path that is dangling on the host but resolves inside a box."""
+    spec = _AGENT_INSTALL.get(agent)
+    return bool(spec) and os.path.lexists(agent_dist_path(agent) / "bin" / spec["bin"])
+
+
+def _agent_build_dist(agent: str, version: str) -> None:
+    """Build agent@version IN a throwaway rs-minimal-base container and swap the
+    captured ~/.local tree into the cache, owned by the operator. Host-side
+    `docker run` (host network → the one download); never pollutes the host's
+    own ~/.local; no host-tool dependency (curl/install run in the image)."""
+    spec = _AGENT_INSTALL[agent]
+    if not _AGENT_VERSION_RE.match(version):
+        die(f"refusing to build {agent!r} with suspicious version {version!r}")
+    if not run_quiet(["docker", "image", "inspect", MINIMAL_BASE_IMAGE]):
+        die(f"{MINIMAL_BASE_IMAGE} not found — run `research start --rebuild` first")
+    AGENT_DIST_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(dir=str(AGENT_DIST_DIR)))   # same fs ⇒ cheap rename
+    try:
+        bin_ = spec["bin"]
+        # pipefail + an in-container `test -x` so a failed `curl | bash` surfaces
+        # the installer's stderr via run_check instead of silently producing an
+        # empty tree (curl|bash masks curl's exit without pipefail). The launcher
+        # is verified IN the container, where an absolute ~/.local/share symlink
+        # resolves. Root container: su to research for the install, then chown the
+        # captured tree to the operator (so a non-1000 host owns its cache).
+        inner = ("set -e; set -o pipefail; "
+                 + spec["install"].format(ver=version)
+                 + f" && test -x ~/.local/bin/{bin_}"
+                 + " && cp -a ~/.local /out/.local")
+        script = (f"set -e; su - research -c {shlex.quote(inner)}; "
+                  f"chown -R {os.getuid()}:{os.getgid()} /out")
+        captured = tmp / ".local"
+        # lexists, NOT exists: the launcher is a symlink to an absolute
+        # ~/.local/share path — dangling on the host, but it resolves once a box
+        # copies the whole tree into its own /home/research/.local.
+        built, last_err = False, ""
+        for _ in range(_AGENT_BUILD_ATTEMPTS):
+            r = run(["docker", "run", "--rm", "-v", f"{tmp}:/out",
+                     MINIMAL_BASE_IMAGE, "sh", "-lc", script], capture_output=True)
+            if r.returncode == 0 and os.path.lexists(captured / "bin" / bin_):
+                built = True
+                break
+            last_err = ((r.stderr or "") + (r.stdout or "")).strip()
+            shutil.rmtree(captured, ignore_errors=True)   # clear a partial /out
+        if not built:
+            die(f"agent {agent} build failed after {_AGENT_BUILD_ATTEMPTS} "
+                f"attempts (version {version}):\n{last_err[-_AGENT_ERR_TAIL:] or 'no output'}")
+        dest = agent_dist_path(agent)
+        if dest.exists():
+            shutil.rmtree(dest)
+        os.replace(captured, dest)            # tmp is under AGENT_DIST_DIR (same fs)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    _agent_sidecar(agent).write_text(json.dumps(
+        {"agent": agent, "version": version,
+         "pulled_at": datetime.datetime.now(datetime.timezone.utc).isoformat()},
+        indent=2) + "\n")
+
+
+def agent_pull(agent: str = "claude", version: str | None = None) -> dict:
+    """Pull agent@(version or the versions.env pin) into the host cache."""
+    if agent not in _AGENT_INSTALL:
+        die(f"unknown agent {agent!r} (known: {', '.join(KNOWN_AGENTS)})")
+    ver = version or load_versions().get(_AGENT_INSTALL[agent]["version_key"])
+    if not ver:
+        die(f"no pinned version for {agent!r} in versions.env "
+            f"({_AGENT_INSTALL[agent]['version_key']})")
+    _agent_build_dist(agent, ver)
+    return {"agent": agent, "version": ver, "path": str(agent_dist_path(agent))}
+
+
+def _agent_resolve_latest(agent: str) -> str:
+    """LIGHT in-container fetch of upstream `latest` → a concrete version string
+    (no install). Honors the no-host-tool rule (curl runs in rs-minimal-base)."""
+    spec = _AGENT_INSTALL[agent]
+    if not run_quiet(["docker", "image", "inspect", MINIMAL_BASE_IMAGE]):
+        die(f"{MINIMAL_BASE_IMAGE} not found — run `research start --rebuild` first")
+    r = run(["docker", "run", "--rm", MINIMAL_BASE_IMAGE, "sh", "-lc",
+             f"curl -fsSL {shlex.quote(spec['latest_url'])}"], capture_output=True)
+    if r.returncode != 0:
+        die(f"could not resolve upstream {agent} version: "
+            f"{(r.stderr or '').strip() or 'fetch failed'}")
+    ver = (r.stdout or "").strip()
+    if not _AGENT_VERSION_RE.match(ver):
+        die(f"upstream returned an unexpected version string: {ver!r}")
+    return ver
+
+
+def agent_refresh_check(agent: str = "claude") -> tuple[str, str]:
+    """Side-effect-free: return (current pin from versions.env, upstream latest)."""
+    if agent not in _AGENT_INSTALL:
+        die(f"unknown agent {agent!r} (known: {', '.join(KNOWN_AGENTS)})")
+    current = load_versions().get(_AGENT_INSTALL[agent]["version_key"], "")
+    return current, _agent_resolve_latest(agent)
+
+
+def _set_version_pin(key: str, value: str) -> None:
+    """Rewrite KEY=… in versions.env in place — the SANCTIONED `agent refresh`
+    write (the file's header sanctions this one bespoke writer)."""
+    lines = VERSIONS_FILE.read_text().splitlines()
+    out, found = [], False
+    for ln in lines:
+        s = ln.strip()
+        if s and not s.startswith("#") and s.split("=", 1)[0].strip() == key:
+            out.append(f"{key}={value}")
+            found = True
+        else:
+            out.append(ln)
+    if not found:
+        out.append(f"{key}={value}")
+    VERSIONS_FILE.write_text("\n".join(out) + "\n")
+
+
+def agent_apply_refresh(agent: str, version: str) -> None:
+    """Bump versions.env's pin to `version` AND (re)build the dist at it. The
+    prompt/confirm is the front-end's job (this just applies)."""
+    _set_version_pin(_AGENT_INSTALL[agent]["version_key"], version)
+    _agent_build_dist(agent, version)
+
+
+def agent_list() -> list[dict]:
+    """Cached agents (read sidecars); empty if none pulled yet."""
+    out: list[dict] = []
+    for agent in KNOWN_AGENTS:
+        if dist_present(agent) and _agent_sidecar(agent).exists():
+            try:
+                out.append(json.loads(_agent_sidecar(agent).read_text()))
+            except Exception:
+                out.append({"agent": agent, "version": "?", "pulled_at": "?"})
+    return out
 
 
 def _build_images(force: bool) -> None:
