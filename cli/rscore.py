@@ -632,28 +632,37 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         # 6. Wait for inner dockerd, then stage the inner images.
         progress.step("stage-images", "staging inner images")
         wait_for_inner_dockerd(container_name)
-        if project_type == PROJECT_TYPE_SANDBOX:
+        is_management = project_type == PROJECT_TYPE_SANDBOX
+        if is_management:
             stage_worker_image(container_name, SANDBOX_BOX_IMAGE)
             stage_worker_image(container_name, SANDBOX_BOX_BROWSER_IMAGE)
         else:
             stage_worker_image(container_name, ANALYSIS_IMAGE)
-        stage_worker_image(container_name, MCP_PROXY_IMAGE)
 
-        # 6b. Re-run mcp-reload now that the proxy image is staged.
-        run(["docker", "exec", container_name, "/usr/local/bin/mcp-reload"],
-            capture_output=True)
+        # 6b/6c. The MCP proxy/reload/auto-allow cone is supervisor-only.
+        #        rs-management ships no mcp-proxy and no /usr/local/bin/mcp-reload
+        #        (the agent-layer split), and box-host boxes never consume the
+        #        proxy — so staging the proxy image, reloading, and populating
+        #        mcp-allow.json are dead work there (the reload exec just warns
+        #        "no such file"). Gate the whole cone on the research flavor.
+        if not is_management:
+            stage_worker_image(container_name, MCP_PROXY_IMAGE)
 
-        # 6c. Auto-allow MCPs per --mcp. BEST-EFFORT: external MCPs can be
-        #     transient, so a single failure warns and creation continues.
-        requested = _resolve_create_mcp_arg(req.mcp)
-        for mcp_name in requested:
-            ok, msg = _allow_mcp_for_project(project, cfg, mcp_name, do_reload=False)
-            if ok:
-                granted.append(mcp_name)
-            else:
-                print(f"warning: skip auto-allow {mcp_name!r}: {msg}", file=sys.stderr)
-        if granted:
-            _supervisor_mcp_reload(container_name)
+            # 6b. Re-run mcp-reload now that the proxy image is staged.
+            run(["docker", "exec", container_name, "/usr/local/bin/mcp-reload"],
+                capture_output=True)
+
+            # 6c. Auto-allow MCPs per --mcp. BEST-EFFORT: external MCPs can be
+            #     transient, so a single failure warns and creation continues.
+            requested = _resolve_create_mcp_arg(req.mcp)
+            for mcp_name in requested:
+                ok, msg = _allow_mcp_for_project(project, cfg, mcp_name, do_reload=False)
+                if ok:
+                    granted.append(mcp_name)
+                else:
+                    print(f"warning: skip auto-allow {mcp_name!r}: {msg}", file=sys.stderr)
+            if granted:
+                _supervisor_mcp_reload(container_name)
 
         # 6d. worker sugar (--enable <worker>). FAIL-EXPLICIT: a worker that
         #     won't enable aborts the create (no swallow). Enabling a worker
