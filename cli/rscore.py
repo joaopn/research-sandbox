@@ -45,6 +45,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import socket
 import subprocess
@@ -107,6 +108,22 @@ class DindMode(str, enum.Enum):
 
 class ValidationError(ValueError):
     """Bad request input. Always raised before any side effect."""
+
+
+class HarnessError(Exception):
+    """A light-path harness step (clone/setup) failed AFTER side effects began
+    (WORKFLOW_TAXONOMY_S4). Distinct from ValidationError (pre-side-effect) and
+    from die()/SystemExit (whose message is teed to the host-only full log by
+    the broker): it carries TWO fields so dispatch can SPLIT the sinks —
+    ``log_msg`` (step name only) → the durable full log + view log, and
+    ``client_detail`` (token-scrubbed git/setup stderr) → the client error
+    envelope ONLY. The command argv (which carries the PAT) is never stringified
+    into either. The partially-built box is left standing for inspection."""
+
+    def __init__(self, log_msg: str, client_detail: str = ""):
+        super().__init__(log_msg)
+        self.log_msg = log_msg
+        self.client_detail = client_detail
 
 
 # ---------------------------------------------------------------------------
@@ -177,10 +194,12 @@ def _as_tuple(value: Any) -> tuple[str, ...]:
 DEFAULT_WORKFLOW = "research"
 
 
-def _resolve_workflow(workflow_id: str) -> tuple["ProjectType", "Substrate"]:
-    """Resolve a workflow id against the store catalog into the (project_type,
-    substrate) that create() already consumes. Raises ValidationError (the
-    pre-side-effect channel) on an unknown id or a broken catalog.
+def _resolve_workflow(workflow_id: str) -> tuple[dict, "ProjectType", "Substrate"]:
+    """Resolve a workflow id against the store catalog into (manifest,
+    project_type, substrate). Raises ValidationError (the pre-side-effect
+    channel) on an unknown id or a broken catalog. The manifest is returned so
+    from_kwargs can read the light-path payload (repo/ref/setup) presets from the
+    same single load (WORKFLOW_TAXONOMY_S4) — no second catalog read.
 
     The legacy project_type flavor is derived from manifest DATA — NOT a manifest
     field (which would entrench the very key the deferred refactor removes) and
@@ -204,7 +223,79 @@ def _resolve_workflow(workflow_id: str) -> tuple["ProjectType", "Substrate"]:
         project_type = ProjectType.SANDBOX
     else:
         project_type = ProjectType.RESEARCH
-    return project_type, substrate
+    return m, project_type, substrate
+
+
+def _light_clone_basename(repo: str) -> str:
+    """Derive the clone-dir basename from a repo URL: the last path segment with
+    a trailing '/' and a trailing '.git' stripped (``…/u/foo.git`` → ``foo``).
+    Reject an empty / '.' / '..' / separator-bearing result so a crafted URL
+    cannot target a clone outside /workspace (WORKFLOW_TAXONOMY_S4, in-box but
+    cheap). Raises ValidationError (pre-side-effect)."""
+    base = repo.rstrip("/").rsplit("/", 1)[-1]
+    if base.endswith(".git"):
+        base = base[: -len(".git")]
+    if base in ("", ".", "..") or "/" in base or "\\" in base:
+        raise ValidationError(
+            f"could not derive a clone directory from repo {repo!r}")
+    return base
+
+
+def _light_exec(container: str, script: str, *, step: str, github_pat: str,
+                workdir: str | None = None) -> None:
+    """Run one harness `script` via ``docker exec -u research [-w workdir] bash
+    -lc`` (the box's unprivileged user). `capture_output=True` so the output
+    NEVER enters the broker's teed stderr → the durable full log. On failure
+    raise HarnessError (NOT die()): step-name only as log_msg, the captured
+    stderr (literal PAT scrubbed) as client_detail — the split-sink contract
+    (WORKFLOW_TAXONOMY_S4 rule 4). The argv (which carries the token in the clone
+    URL) is never stringified into the error."""
+    cmd = ["docker", "exec", "-u", "research"]
+    if workdir:
+        cmd += ["-w", workdir]
+    cmd += [container, "bash", "-lc", script]
+    r = run(cmd, capture_output=True)
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout or "").strip()
+        if github_pat:
+            detail = detail.replace(github_pat, "***")
+        raise HarnessError(f"{step} failed (exit {r.returncode})", detail)
+
+
+def _run_light_harness(container: str, repo: str, ref: str, setup: str,
+                       github_pat: str, progress) -> str:
+    """Light-path harness (WORKFLOW_TAXONOMY_S4): clone ``repo``@``ref`` into
+    /workspace/<basename> and run ``setup`` inside the docker box, as the
+    unprivileged `research` user. No-op when neither repo nor setup is set;
+    returns the clone dir ("" if no repo). Create-time only — the artifacts ride
+    the bind-mount volume, so start/update never re-run it.
+
+    Must run AFTER inject_route (egress). Fail-explicit via HarnessError so the
+    partial box is left standing and the broker can split the diagnostic from the
+    durable log + the token (see _light_exec)."""
+    if not repo and not setup:
+        return ""
+    workdir = "/workspace"
+    if repo:
+        base = _light_clone_basename(repo)        # already validated in from_kwargs
+        workdir = f"/workspace/{base}"
+        clone_url = repo
+        if github_pat:
+            # Token-in-remote so it persists in .git/config for later `git pull`
+            # (PI decision). https-validated; the token reaches git as an argv
+            # element via bash -lc, never a host shell (run() is list-form).
+            clone_url = "https://x-access-token:" + github_pat + "@" + repo[len("https://"):]
+        progress.step("clone-repo", "cloning workflow repo")
+        _light_exec(
+            container,
+            f"git clone {shlex.quote(clone_url)} {shlex.quote(workdir)} && "
+            f"git -C {shlex.quote(workdir)} checkout {shlex.quote(ref)}",
+            step="workflow clone", github_pat=github_pat)
+    if setup:
+        progress.step("run-setup", "running workflow setup")
+        _light_exec(container, setup, step="workflow setup",
+                    github_pat=github_pat, workdir=workdir)
+    return workdir if repo else ""
 
 
 @dataclass(frozen=True)
@@ -225,16 +316,41 @@ class CreateRequest:
     disable: tuple[str, ...] = ()
     role_mcp_upstream: tuple[str, ...] = ()
     mcp: str = "all-enabled"
+    # Light-path harness payload (WORKFLOW_TAXONOMY_S4): clone repo@ref into the
+    # docker box + run setup. Manifest-preset, explicit-overridable; in-box, not
+    # host-shaped (see the boundary note). github_pat is a SECRET — repr=False so
+    # an accidental repr(req)/log masks it; it is also never a CreateResult field.
+    repo: str = ""
+    ref: str = ""
+    setup: str = ""
+    github_pat: str = field(default="", repr=False)
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "CreateRequest":
         ssh_port = kw.get("ssh_port")
         if ssh_port is not None and not isinstance(ssh_port, int):
             raise ValidationError("ssh_port must be an integer")
-        # Resolve the workflow → (type, substrate) here, the single validation
-        # choke point, so create() consumes the same two fields as before.
+        # Resolve the workflow → (manifest, type, substrate) here, the single
+        # validation choke point, so create() consumes the same fields as before.
         workflow_id = kw.get("workflow") or DEFAULT_WORKFLOW
-        project_type, substrate = _resolve_workflow(workflow_id)
+        manifest, project_type, substrate = _resolve_workflow(workflow_id)
+        # Effective light-path payload: manifest PRESET ⊕ explicit input, explicit
+        # wins per field (the store-template-auto-fills-the-create-fields model).
+        # The PAT is explicit-only — never in an operator-curated manifest.
+        repo = (kw.get("repo") or manifest.get("repo") or "").strip()
+        ref = (kw.get("ref") or manifest.get("ref") or "").strip()
+        setup = (kw.get("setup") or manifest.get("setup") or "").strip()
+        github_pat = kw.get("github_pat") or ""
+        if repo:
+            if not ref:
+                raise ValidationError(
+                    "a workflow repo requires a ref (pin the clone — no drift)")
+            if not repo.startswith("https://"):
+                raise ValidationError(
+                    f"workflow repo must be an https:// URL (got {repo!r}); the "
+                    "docker box is locked-egress (no ssh/port 22) and a private "
+                    "repo clones over https via a PAT")
+            _light_clone_basename(repo)   # reject a path-escaping basename early
         return cls(
             name=_require_name(kw.get("name")),
             workflow=workflow_id,
@@ -254,6 +370,7 @@ class CreateRequest:
             disable=_as_tuple(kw.get("disable")),
             role_mcp_upstream=_as_tuple(kw.get("role_mcp_upstream")),
             mcp=kw.get("mcp") if kw.get("mcp") is not None else "all-enabled",
+            repo=repo, ref=ref, setup=setup, github_pat=github_pat,
         )
 
 
@@ -351,6 +468,10 @@ class CreateResult:
     mcps: list[str] = field(default_factory=list)               # granted (best-effort)
     workers: list[str] = field(default_factory=list)            # enabled (all-or-abort)
     sandboxes: list[str] = field(default_factory=list)          # enabled (all-or-abort)
+    # Light-path harness result (non-secret; for the report). NEVER github_pat —
+    # CreateResult is asdict'd into the broker reply + lingers in webui OP_RUNS.
+    repo: str = ""
+    clone_dir: str = ""                     # /workspace/<basename> if a repo cloned
 
 
 @dataclass
@@ -459,6 +580,13 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     # workflow); no derivation fallback needed here.
     substrate = req.substrate
     is_docker = substrate is Substrate.DOCKER
+
+    # Light-path harness is the docker box's capability (WORKFLOW_TAXONOMY_S4);
+    # an effective repo/setup on a dind/overlay workflow is noted-and-ignored,
+    # mirroring the docker-side note for ignored worker/sandbox tokens below.
+    if not is_docker and (req.repo or req.setup):
+        print("note: --repo/--setup-script apply only to the light-path docker "
+              "box; ignoring for this workflow", file=sys.stderr)
 
     substrate_image = (
         MINIMAL_IMAGE if is_docker
@@ -625,8 +753,14 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     workers_enabled: list[str] = []
     sandboxes_enabled: list[str] = []
 
+    clone_dir = ""
     if is_docker:
         # No inner dockerd: nothing to stage, no proxy, no worker/sandbox cone.
+        # 6'. Light-path harness: clone the workflow repo + run setup on the box
+        #     (after inject_route, so egress works). Create-time only; raises
+        #     HarnessError on failure (box left standing).
+        clone_dir = _run_light_harness(
+            container_name, req.repo, req.ref, req.setup, req.github_pat, progress)
         progress.step("ready", "project ready")
     else:
         # 6. Wait for inner dockerd, then stage the inner images.
@@ -705,6 +839,8 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         mcps=granted,
         workers=workers_enabled,
         sandboxes=sandboxes_enabled,
+        repo=req.repo,
+        clone_dir=clone_dir,
     )
 
 

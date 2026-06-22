@@ -238,13 +238,18 @@ def _print_create_report(res, cfg) -> None:
             f"  {len(steps)+1}. Start working on a problem with the supervisor.")
     next_steps = "\n".join(steps)
 
+    # Light-path harness (WORKFLOW_TAXONOMY_S4): show the clone only when a repo
+    # was actually cloned. Non-secret — the report never carries the PAT.
+    clone_block = (f"  Cloned:    {res.repo} → {res.clone_dir}\n"
+                   if getattr(res, "clone_dir", "") else "")
+
     print(f"""
 Project '{res.project}' is running.
 
   Container: {res.container}
   Workspace: {res.workspace}
   Workflow:  {res.workflow}
-  Network:   {res.network} (egress: {res.egress})
+{clone_block}  Network:   {res.network} (egress: {res.egress})
   Substrate: {res.substrate}
   DIND mode: {res.dind_mode}
   Inner FW:  {inner_fw}
@@ -269,8 +274,15 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         inner_firewall=args.inner_firewall, enable=args.enable,
         disable=args.disable, role_mcp_upstream=args.role_mcp_upstream,
         mcp=args.mcp,
+        repo=args.repo, ref=args.ref, setup=args.setup_script,
+        github_pat=os.environ.get("RS_GITHUB_PAT") or "",   # never a CLI flag
     )
-    res = rscore.create(req, cfg)
+    try:
+        res = rscore.create(req, cfg)
+    except rscore.HarnessError as e:
+        # Off-broker there is no durable webui sink, so the diagnostic on the
+        # operator's own terminal is fine (WORKFLOW_TAXONOMY_S4 rule 4).
+        die(f"{e.log_msg}: {e.client_detail}" if e.client_detail else e.log_msg)
     _print_create_report(res, cfg)
 
 
@@ -1838,6 +1850,18 @@ def build_parser() -> argparse.ArgumentParser:
                         "(disabled, container not running, host unreachable) print "
                         "a warning and skip; the project still comes up. Add or "
                         "remove later with `research project mcp allow|deny|sync`.")
+    # Light-path harness (WORKFLOW_TAXONOMY_S4) — docker substrate only. These
+    # override the selected workflow's manifest presets. The PAT is NOT a flag (a
+    # CLI arg leaks via `ps` + shell history); read it from RS_GITHUB_PAT instead.
+    c.add_argument("--repo", help="https git URL to clone into /workspace/<name> "
+                                  "at create (docker-substrate workflows only; "
+                                  "overrides the workflow's manifest repo)")
+    c.add_argument("--ref", help="commit/tag to check out for --repo (required "
+                                 "when --repo is given — pins the clone)")
+    c.add_argument("--setup-script", dest="setup_script", metavar="SNIPPET",
+                   help="shell snippet run in the clone dir after checkout (or in "
+                        "/workspace when there is no repo). Chain steps with "
+                        "&& / newlines. Runs once at create.")
     c.set_defaults(func=cmd_project_create)
 
     a = proj_sub.add_parser("attach", help="docker exec + byobu attach")

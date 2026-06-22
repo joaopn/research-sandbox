@@ -258,6 +258,12 @@ def _verb_start(args: dict, progress=None) -> list[dict]:
 # manifest, never relayed); the old `type` flag is gone (WORKFLOW_TAXONOMY_S3).
 CREATE_WEBUI_FIELDS = frozenset({
     "name", "workflow", "egress", "enable", "disable", "memory", "cpus",
+    # Light-path harness payload (WORKFLOW_TAXONOMY_S4). repo/ref/setup are
+    # in-box fields (they act inside the locked runc box, not on the host — see
+    # the boundary note in rscore), preset by the workflow + overridable here.
+    # github_pat is a SECRET in-box field: forwarded over the request envelope,
+    # never logged/persisted off the box, never a CreateResult field.
+    "repo", "ref", "setup", "github_pat",
 })
 
 # The webui-settable subset of UpdateRequest fields. `rebuild`/`keep_claude` are
@@ -451,6 +457,17 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
         reply, outcome = _err("validation", str(e)), "validation"
         if op is not None:
             op.progress.fail(str(e))
+    except rscore.HarnessError as e:
+        # Split-sink (WORKFLOW_TAXONOMY_S4 rule 4): the light-path clone/setup
+        # failed. client_detail (token-scrubbed git/setup stderr) goes to the
+        # CLIENT envelope ONLY; log_msg (step name only) goes to the DURABLE
+        # full log + view log — NEVER through _Tee (the ExitStack has already
+        # restored the streams here, so op.full.write is an un-redirected plain
+        # write). The command argv (which carries the PAT) is never stringified.
+        reply, outcome = _err("failed", e.client_detail or e.log_msg), "failed"
+        if op is not None:
+            op.full.write(e.log_msg + "\n")
+            op.progress.fail(e.log_msg)
     except SystemExit:
         msg = buf.getvalue().strip() or "operation failed"
         # die() prints "error: <msg>"; trim the prefix for a clean envelope.
