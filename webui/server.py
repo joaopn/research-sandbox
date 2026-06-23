@@ -400,6 +400,17 @@ async def broker_projects_handler(request: web.Request) -> web.Response:
     return web.json_response(body, status=status)
 
 
+async def broker_workflows_handler(request: web.Request) -> web.Response:
+    """GET /broker/workflows — the store catalog (built-ins + BYO), the agent
+    enum, and the default workflow, for the create form's pickers (gated). The
+    webui image has no `cli/`, so this relay to the broker's in-process
+    `workflow.load_catalog()` is the only way the browser learns the catalog.
+    SameSite=Strict cookie is the CSRF defense for this read, mirroring
+    /broker/projects."""
+    status, body = await _relay(request, "workflows")
+    return web.json_response(body, status=status)
+
+
 def _mint_op_id(name: str, action: str) -> str:
     """A safe-basename op_id embedding project/action/ts for a browsable handle,
     plus a random suffix for uniqueness. The broker re-validates it against the
@@ -1392,6 +1403,7 @@ def main() -> None:
     app.router.add_post("/broker/login", broker_login_handler)
     app.router.add_post("/broker/logout", broker_logout_handler)
     app.router.add_get("/broker/projects", broker_projects_handler)
+    app.router.add_get("/broker/workflows", broker_workflows_handler)
     app.router.add_post("/broker/project", broker_create_handler)
     # attach is a fixed segment registered before the {action} variable so it
     # routes to the keyring handler, not the start|stop|update|destroy dispatcher

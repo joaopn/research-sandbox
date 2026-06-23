@@ -57,6 +57,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rscore  # noqa: E402
 import broker_auth  # noqa: E402
+import workflow  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -236,6 +237,27 @@ def _verb_status(args: dict, _progress=None) -> dict:
     return dataclasses.asdict(rscore.status(req))    # may die() → SystemExit
 
 
+def _verb_workflows(_args: dict, _progress=None) -> dict:
+    """The store catalog for the webui create form: built-ins + BYO, plus the
+    agent enum and the default workflow. The webui image carries no `cli/`, so
+    this in-broker read (host python, stdlib-only `workflow`) is its only catalog
+    source. Token-gated (NOT in OPEN_VERBS) — deny-by-default, like every other
+    non-`list`/`status` verb. A malformed BYO registry raises WorkflowError,
+    which dispatch does NOT catch (only Validation/Harness/SystemExit) and would
+    escape into socketserver as a truncated reply — so map it to ValidationError
+    here for a clean envelope."""
+    try:
+        catalog = workflow.load_catalog()
+    except workflow.WorkflowError as e:
+        raise rscore.ValidationError(str(e))
+    return {
+        "workflows": catalog,                     # full manifests (substrate,
+                                                  # repo/ref/setup presets, source)
+        "agents": list(rscore.KNOWN_AGENTS),      # the --agent enum
+        "default_workflow": rscore.DEFAULT_WORKFLOW,
+    }
+
+
 def _verb_stop(args: dict, progress=None) -> list[dict]:
     req = rscore.StartStopRequest.from_kwargs(**args)  # may raise ValidationError
     return [dataclasses.asdict(r) for r in rscore.stop(req, progress=progress)]
@@ -313,6 +335,7 @@ def _verb_destroy(args: dict, progress=None) -> dict:
 VERBS = {
     "list": _verb_list,
     "status": _verb_status,
+    "workflows": _verb_workflows,
     "stop": _verb_stop,
     "start": _verb_start,
     "create": _verb_create,

@@ -789,3 +789,11 @@ body {
     font-size: 13px;
     color: var(--fg-base);
 }
+
+/* Docker-substrate-only field group (agent + light-path). Set off from the
+   common fields with a subtle rule; toggled inline via display:none. */
+.mgmt-docker-group {
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border, #333);
+}

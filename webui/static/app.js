@@ -1188,22 +1188,61 @@ function mgmtConfirmThenTail(view, cfg) {
 }
 
 // ---- create -----------------------------------------------------------------
-// Minimal create form: name · workflow · egress · a few --enable presets. The
-// broker's CREATE_WEBUI_FIELDS allow-list is the real input boundary (it drops
-// any path/host-shaped field); full CLI-flag parity is deliberately deferred.
-// The user picks a WORKFLOW (substrate + flavor are derived from its manifest,
-// server-side). The options are hardcoded to the built-ins for now; the
-// catalog-driven picker is STAGE_WEBUI_WORKFLOWS.
+// Catalog-driven create form (STAGE_WEBUI_WORKFLOWS): name · workflow · egress ·
+// --enable presets, plus a docker-substrate-only group (agent + light-path
+// repo/ref/setup + a github_pat secret). The broker's CREATE_WEBUI_FIELDS
+// allow-list is the real input boundary (it silently DROPS any field not in the
+// set), so every key the payload sends below must be in that set — this is the
+// two-file lockstep. The catalog (workflows + agents + default) comes from the
+// broker's `workflows` verb; the webui image has no cli/ to read it locally.
+//
+// The user picks a WORKFLOW; substrate + flavor are derived from its manifest
+// server-side. The agent + light-path fields only have an effect on the `docker`
+// substrate (create() notes-and-ignores them on dind), so the form shows that
+// group ONLY for a docker-substrate workflow — never offering a field the server
+// would drop. github_pat is a SECRET: never preset, never logged/persisted
+// browser-side (built in the request closure and POSTed once).
 
 const MGMT_ENABLE_PRESETS = ["websearcher", "wrangler", "echo"];
 
-function mgmtCreateDialog(view) {
+// Broker-down / unauth fallback: the built-in names only, no docker group (we
+// have neither presets nor the agent enum without the catalog). Matches the
+// pre-catalog behavior. `substrate` is omitted so the docker group stays hidden.
+const MGMT_FALLBACK_WORKFLOWS = [
+    { name: "research" }, { name: "box-host" }, { name: "empty" },
+];
+
+async function mgmtCreateDialog(view) {
+    // Catalog fetch is the only source (no cli/ in the webui image). Any failure
+    // (broker down, session expired) degrades to the built-in names with no
+    // docker group; a later create POST that 401s is redirected by the confirm
+    // path's own status handling, so no auth redirect is needed here.
+    let hasCatalog = false;
+    let workflows = MGMT_FALLBACK_WORKFLOWS;
+    let agents = [];
+    let defaultWorkflow = "research";
+    try {
+        const res = await fetch("/broker/workflows");
+        if (res.ok) {
+            const body = await res.json();
+            if (body.ok && body.result && Array.isArray(body.result.workflows)
+                    && body.result.workflows.length) {
+                workflows = body.result.workflows;
+                agents = Array.isArray(body.result.agents) ? body.result.agents : [];
+                defaultWorkflow = body.result.default_workflow || "research";
+                hasCatalog = true;
+            }
+        }
+    } catch (e) { /* fall through to the fallback */ }
+
+    const wfByName = {};
+    for (const w of workflows) wfByName[w.name] = w;
+
     const nameI = el("input", { type: "text", autocomplete: "off" });
-    const workflowS = el("select", {}, [
-        el("option", { value: "research" }, ["research"]),
-        el("option", { value: "box-host" }, ["box-host"]),
-        el("option", { value: "empty" }, ["empty"]),
-    ]);
+    const workflowS = el("select", {}, workflows.map((w) =>
+        el("option", { value: w.name, title: w.description || "" },
+           [w.name + (w.source === "byo" ? " (byo)" : "")])));
+    if (wfByName[defaultWorkflow]) workflowS.value = defaultWorkflow;
     const egressS = el("select", {}, [
         el("option", { value: "open" }, ["open"]),
         el("option", { value: "locked" }, ["locked"]),
@@ -1212,6 +1251,54 @@ function mgmtCreateDialog(view) {
         const cb = el("input", { type: "checkbox", value: p });
         return { p, cb, label: el("label", { class: "mgmt-check" }, [cb, " " + p]) };
     });
+
+    // Docker-substrate-only group: agent + light-path payload. Hidden for dind.
+    const agentS = el("select", {}, [
+        el("option", { value: "" }, ["(default)"]),
+        ...agents.map((a) => el("option", { value: a }, [a])),
+    ]);
+    const repoI = el("input", { type: "text", autocomplete: "off",
+                                placeholder: "https://github.com/user/repo.git" });
+    const refI = el("input", { type: "text", autocomplete: "off",
+                               placeholder: "branch / tag / commit" });
+    const setupT = el("textarea", { rows: "3", autocomplete: "off",
+                                    placeholder: "setup commands run inside the box" });
+    const patI = el("input", {
+        type: "password", autocomplete: "off",
+        title: "Optional. An in-box secret used only to clone a private repo over " +
+               "https inside the locked box. Never logged or persisted — sent once " +
+               "with this create and never stored.",
+    });
+    const dockerGroup = el("div", { class: "mgmt-docker-group" }, [
+        el("div", { class: "field" }, [el("label", {}, ["Agent"]), agentS]),
+        el("div", { class: "field" }, [el("label", {}, ["Repo (https)"]), repoI]),
+        el("div", { class: "field" }, [el("label", {}, ["Ref"]), refI]),
+        el("div", { class: "field" }, [el("label", {}, ["Setup"]), setupT]),
+        el("div", { class: "field" }, [
+            el("label", { title: patI.getAttribute("title") }, ["GitHub PAT (secret)"]),
+            patI,
+        ]),
+        el("div", { class: "hint" }, [
+            "Agent + repo/setup apply to the docker-box substrate only.",
+        ]),
+    ]);
+
+    const selectedManifest = () => wfByName[workflowS.value] || {};
+    const isDockerSelected = () =>
+        hasCatalog && selectedManifest().substrate === "docker";
+    function syncDockerGroup() {
+        dockerGroup.style.display = isDockerSelected() ? "" : "none";
+        // Auto-fill the light-path presets from the manifest (explicit-wins is
+        // server-side; here switching workflow resets to that workflow's
+        // presets, then the user can override). PAT is never preset.
+        const m = selectedManifest();
+        repoI.value = m.repo || "";
+        refI.value = m.ref || "";
+        setupT.value = m.setup || "";
+    }
+    workflowS.onchange = syncDockerGroup;
+    syncDockerGroup();
+
     mgmtConfirmThenTail(view, {
         title: "New project",
         tailTitle: "Creating project",
@@ -1225,18 +1312,47 @@ function mgmtCreateDialog(view) {
                 el("label", {}, ["Enable"]),
                 el("div", { class: "mgmt-checks" }, checks.map((c) => c.label)),
             ]),
+            dockerGroup,
             el("div", { class: "hint" }, [
                 "Creating stages container images and can take 10–30s (longer cold).",
             ]),
         ],
-        validate: () => nameI.value.trim() ? null : "Project name is required.",
-        request: () => fetch("/broker/project", {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                name: nameI.value.trim(), workflow: workflowS.value, egress: egressS.value,
+        validate: () => {
+            if (!nameI.value.trim()) return "Project name is required.";
+            // Mirror from_kwargs: a docker repo needs a ref (pin the clone).
+            if (isDockerSelected() && repoI.value.trim() && !refI.value.trim()) {
+                return "A workflow repo requires a ref.";
+            }
+            return null;
+        },
+        request: () => {
+            // Lockstep: every key below is in CREATE_WEBUI_FIELDS. The docker-only
+            // in-box fields are sent ONLY for a docker workflow and only when
+            // non-empty, so a dind create never puts them on the wire and
+            // from_kwargs applies the manifest presets unshadowed.
+            const payload = {
+                name: nameI.value.trim(),
+                workflow: workflowS.value,
+                egress: egressS.value,
                 enable: checks.filter((c) => c.cb.checked).map((c) => c.p),
-            }),
-        }),
+            };
+            if (isDockerSelected()) {
+                const agent = agentS.value.trim();
+                const repo = repoI.value.trim();
+                const ref = refI.value.trim();
+                const setup = setupT.value.trim();
+                const pat = patI.value.trim();
+                if (agent) payload.agent = agent;
+                if (repo) payload.repo = repo;
+                if (ref) payload.ref = ref;
+                if (setup) payload.setup = setup;
+                if (pat) payload.github_pat = pat;
+            }
+            return fetch("/broker/project", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+            });
+        },
         // On success, surface the new (running) project in the sidebar — JIT-fetch
         // its creds the same way Attach does, then refresh the rail behind the box.
         onDone: async (ok) => {
