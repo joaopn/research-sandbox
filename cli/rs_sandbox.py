@@ -40,6 +40,9 @@ SANDBOX_JSON = ORCH / "sandbox.json"
 PROJECT_JSON = ORCH / "project.json"
 
 INNER_NETWORK = "rs-inner"
+# Management supervisor stages the dist here at create; RO copy-source the box's
+# entrypoint cp's into its own ~/.local (no bake; STAGE_AGENT_DIST slice 2).
+AGENT_DIST_MOUNT = "/opt/agent-dist"
 BOX_IMAGE = "rs-sandbox-box:latest"
 # Browser variant: + @playwright/mcp + Chromium, wired into the box's claude.
 BOX_IMAGE_BROWSER = "rs-sandbox-box-browser:latest"
@@ -157,6 +160,10 @@ def _run_box(name: str, ip: str, browser: bool = False) -> None:
     cname = box_container(name)
     image = BOX_IMAGE_BROWSER if browser else BOX_IMAGE
     _docker("rm", "-f", cname)  # idempotent
+    # Guard the mount so a missing source can't turn a box run into a cryptic mount
+    # error; the box's entrypoint absence-guard surfaces it as "claude not found".
+    agent_mount = (["-v", f"{AGENT_DIST_MOUNT}:{AGENT_DIST_MOUNT}:ro"]
+                   if os.path.isdir(AGENT_DIST_MOUNT) else [])
     r = _docker(
         "run", "-d",
         "--name", cname,
@@ -164,6 +171,7 @@ def _run_box(name: str, ip: str, browser: bool = False) -> None:
         "--ip", ip,
         "--restart", "unless-stopped",
         "-v", f"{WORKSPACE}/{sub}:/workspace",
+        *agent_mount,
         "-e", f"RS_SANDBOX_NAME={name}",
         "--label", "research.sandbox=1",
         "--label", f"research.box={name}",

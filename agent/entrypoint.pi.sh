@@ -27,6 +27,18 @@ if [[ ! -f ~/.bashrc ]]; then
     cp -a /etc/worker-skel/. ~/
 fi
 
+# --- Deploy the agent (claude) from the supervisor-staged dist -------------
+# Own writable ~/.local (no bake; STAGE_AGENT_DIST slice 2). Absence-guarded so a
+# restart preserves an autoupdater bump. The PI's interactive `claude` (byobu tab)
+# finds it via ~/.local/bin on PATH — self-heal the .bashrc export below.
+if [[ -d /opt/agent-dist && ! -e ~/.local/bin/claude ]]; then
+    mkdir -p ~/.local
+    cp -a /opt/agent-dist/. ~/.local/
+fi
+if ! grep -q '\.local/bin' ~/.bashrc 2>/dev/null; then
+    echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+fi
+
 # Role marker for the byobu status-bar plugin (~/.byobu/bin/60_rolename).
 # Written every boot — see entrypoint.supervisor.sh for the rationale.
 echo "${RS_PI_ROLE}" > ~/.rs-role

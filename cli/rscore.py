@@ -50,6 +50,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import urllib.error
 import urllib.request
@@ -365,6 +366,16 @@ class CreateRequest:
             raise ValidationError(
                 f"--agent {agent}: no cached dist — run "
                 f"`research agent pull --agent {agent}` first")
+        # Fleet floor (STAGE_AGENT_DIST slice 2): EVERY dind project deploys claude
+        # from the dist (no bake) — research flavor for the supervisor + worker/
+        # role-MCP/PI fleet, box-host flavor for its rs-sandbox-box boxes (FROM
+        # rs-analysis-base). So a dind create needs a pulled dist. (docker boxes use
+        # the explicit --agent path above.) `research start` auto-pulls if absent,
+        # so this floor rarely trips.
+        if substrate is Substrate.DIND_SYSBOX and not dist_present(DEFAULT_AGENT):
+            raise ValidationError(
+                f"no cached {DEFAULT_AGENT} dist — run `research agent pull` first "
+                f"(or `research start`, which auto-pulls)")
         return cls(
             name=_require_name(kw.get("name")),
             workflow=workflow_id,
@@ -801,8 +812,19 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         if is_management:
             stage_worker_image(container_name, SANDBOX_BOX_IMAGE)
             stage_worker_image(container_name, SANDBOX_BOX_BROWSER_IMAGE)
+            # Box-host stages the dist (deploy_local=False — the management
+            # supervisor never runs claude itself) so its rs-sandbox-box boxes
+            # (FROM rs-analysis-base, no bake) can cp claude at boot.
+            _stage_agent_dist(container_name, deploy_local=False)
         else:
             stage_worker_image(container_name, ANALYSIS_IMAGE)
+            # Stage the agent dist into the supervisor (its own ~/.local + the
+            # /opt/agent-dist the worker/role-MCP/PI fleet RO-mounts). No bake
+            # anywhere now (STAGE_AGENT_DIST slice 2). ORDER IS LOAD-BEARING: this
+            # MUST stay before the worker/sandbox enable cone below — a role-MCP or
+            # PI container brought up by that cone mounts /opt/agent-dist and would
+            # boot claude-less (failing only on first send_job) if staged after.
+            _stage_agent_dist(container_name)
 
         # 6b/6c. The MCP proxy/reload/auto-allow cone is supervisor-only.
         #        rs-management ships no mcp-proxy and no /usr/local/bin/mcp-reload
@@ -1766,11 +1788,27 @@ def load_versions() -> dict[str, str]:
 
 AGENT_DIST_DIR = Path.home() / ".research-sandbox" / "agent-dist"
 
-# Per-agent install recipe. version_key names the versions.env pin — ONE pin for
-# the dist AND (transitionally) the bake build-arg, so `agent refresh` writes the
-# fleet's next-rebuild version too (STAGE_AGENT_DIST_S1 coupled-pin decision).
-# `install` runs IN rs-minimal-base as the `research` user. Adding codex/goose
-# later is one entry here (the N+M seam).
+# Where the dist is staged (supervisor: real files) / RO-mounted (every container
+# that deploys an agent) — the single in-container copy-source path. The fleet
+# agent the supervisor + worker homes deploy (no bake; STAGE_AGENT_DIST slice 2).
+AGENT_DIST_MOUNT = "/opt/agent-dist"
+DEFAULT_AGENT = "claude"
+# RO copy-source mount spliced into every inner `docker run` (the source is the
+# supervisor's staged dir — same path, RO). The entrypoint cp's its own copy.
+# Spliced UNCONDITIONALLY at the rscore spawn sites (role-MCP / PI / pi-isolated):
+# the dind floor guarantees the dist is staged, and even on a missing source an
+# inner -v auto-creates an inert empty dir (the entrypoint absence-guard no-ops).
+# rs_worker.py / rs_sandbox.py guard with os.path.isdir instead — a DELIBERATE
+# asymmetry (those modules run in-supervisor and prefer a clear "claude not found"
+# over a cryptic mount error), not an oversight; don't "harmonize" it away.
+AGENT_DIST_MOUNT_ARGS = ["-v", f"{AGENT_DIST_MOUNT}:{AGENT_DIST_MOUNT}:ro"]
+
+# Per-agent install recipe. version_key names the versions.env pin — the host
+# dist pin (the bake is gone, STAGE_AGENT_DIST slice 2; no Dockerfile reads it
+# anymore), so `agent refresh` writing it bumps what every container deploys via
+# `cp` at boot. `install` runs IN rs-minimal-base as the `research` user. Adding
+# codex/goose later is one entry here (the N+M seam — but each needs its own
+# cross-user launcher spike before its relink is trusted; see _relativize_launcher).
 _AGENT_INSTALL = {
     "claude": {
         "version_key": "CLAUDE_CODE_VERSION",
@@ -1812,6 +1850,34 @@ def dist_present(agent: str) -> bool:
     path that is dangling on the host but resolves inside a box."""
     spec = _AGENT_INSTALL.get(agent)
     return bool(spec) and os.path.lexists(agent_dist_path(agent) / "bin" / spec["bin"])
+
+
+def _relativize_launcher(launcher: Path) -> None:
+    """Rewrite the dist's launcher symlink to be $HOME-agnostic (STAGE_AGENT_DIST
+    slice 2). The installer writes ~/.local/bin/<agent> as an ABSOLUTE symlink into
+    /home/research/.local/share/...; dangling once the tree is cp'd into a worker
+    home (/home/worker), so claude won't run there (spike: exit 127). Rewritten to a
+    relative ../share/... target it resolves under ANY user's $HOME, so one dist
+    serves the research box AND the worker fleet (spike phase B: exit 0). The spike
+    also confirmed the launcher is the ONLY /home/research coupling in claude's
+    payload — this relink is the whole fix. Defensive: only rewrite the expected
+    absolute-into-/.local/ symlink; anything else is left untouched with a warning
+    (a layout change / a future agent needs its own cross-user spike before its
+    relink is trusted — do not assume the property generalizes)."""
+    if not os.path.islink(launcher):
+        print(f"warning: {launcher.name} is not a symlink — dist may be "
+              f"non-portable across users (boot may fail in worker homes)",
+              file=sys.stderr)
+        return
+    target = os.readlink(launcher)
+    if not (target.startswith("/") and "/.local/" in target):
+        print(f"warning: {launcher.name} -> {target} is not the expected absolute "
+              f"/.local/ symlink — left as-is (dist may be non-portable)",
+              file=sys.stderr)
+        return
+    suffix = target.split("/.local/", 1)[1]   # share/<agent>/versions/<ver>
+    launcher.unlink()
+    launcher.symlink_to(os.path.join("..", suffix))   # ../share/... from .local/bin/
 
 
 def _agent_build_dist(agent: str, version: str) -> None:
@@ -1856,6 +1922,7 @@ def _agent_build_dist(agent: str, version: str) -> None:
         if not built:
             die(f"agent {agent} build failed after {_AGENT_BUILD_ATTEMPTS} "
                 f"attempts (version {version}):\n{last_err[-_AGENT_ERR_TAIL:] or 'no output'}")
+        _relativize_launcher(captured / "bin" / bin_)
         dest = agent_dist_path(agent)
         if dest.exists():
             shutil.rmtree(dest)
@@ -1878,6 +1945,74 @@ def agent_pull(agent: str = "claude", version: str | None = None) -> dict:
             f"({_AGENT_INSTALL[agent]['version_key']})")
     _agent_build_dist(agent, ver)
     return {"agent": agent, "version": ver, "path": str(agent_dist_path(agent))}
+
+
+def _stage_agent_dist(supervisor: str, agent: str = DEFAULT_AGENT,
+                      *, deploy_local: bool = True) -> None:
+    """Stage the host agent dist into a RUNNING supervisor (STAGE_AGENT_DIST slice
+    2). Real files at AGENT_DIST_MOUNT — the inner fleet (worker / role-MCP / pi /
+    pi-isolated / sandbox-box) RO-mounts that path and cp's its own writable copy
+    at boot. `deploy_local` ALSO (re)deploys the supervisor's OWN ~/.local from the
+    dist — True for the research flavor (the PI's interactive claude + the
+    rs-audit-stop hook live there); False for the rs-management (box-host) flavor,
+    whose supervisor never runs claude itself but DOES stage the dist so its
+    rs-sandbox-box boxes (FROM rs-analysis-base — no bake now) can deploy it.
+
+    Two dragons handled here:
+      • docker-cp-into-existing-dir NESTS (src copied INTO dest → .../claude/bin),
+        silently breaking the mount path on the update-agent / recreate re-stage.
+        So rm the dest first, then `docker cp <cache>/.` to land contents directly.
+      • The supervisor's ~/.local deploy is UNCONDITIONAL (not absence-guarded) so
+        `update-agent` actually refreshes the launcher the PI's interactive claude
+        uses; a version bump leaves the old versions/<oldver>/ as harmless dead
+        weight (the relinked launcher points at the new one).
+    Runs as root (-u 0) to write /opt + /home; chowns to uid:gid 1000:1000
+    numerically (the documented both-leaf uid) so it's user-name-agnostic; absolute
+    /home/research, not ~ (cross-boundary-path rule)."""
+    src = agent_dist_path(agent)
+    if not dist_present(agent):
+        die(f"no cached {agent} dist to stage — run `research agent pull` first")
+    # SYSBOX UID SHIFT: a plain `docker cp` carries the HOST uid/gid of the cache
+    # files; inside the sysbox supervisor those land as a foreign (unmapped) owner
+    # that container-root can neither chown NOR rm NOR overwrite (EPERM — even a
+    # leftover tarball in sticky /tmp can't be unlinked or re-cp'd over), and an
+    # inner `cp -a` can't preserve it either. So never let a foreign uid in AND
+    # never leave an intermediate file: STREAM a uid/gid-0-normalized tar straight
+    # into the container's `tar -x` via stdin. The extracted tree is root-owned
+    # (in-range) → chown→1000 works, as does a future re-stage's `rm -rf`. No host
+    # temp file, no `docker cp`, no in-container leftover. (No host `tar` either —
+    # tarfile is Python stdlib; stdout→DEVNULL so the 150MB stdin write can't
+    # deadlock on backpressure, the quiet extract keeps stderr tiny.)
+    def _root_owned(ti: tarfile.TarInfo) -> tarfile.TarInfo:
+        ti.uid = ti.gid = 0
+        ti.uname = ti.gname = ""
+        return ti
+    extract = (f"rm -rf {AGENT_DIST_MOUNT} && mkdir -p {AGENT_DIST_MOUNT} && "
+               f"tar -C {AGENT_DIST_MOUNT} -x && chown -R 1000:1000 {AGENT_DIST_MOUNT}")
+    proc = subprocess.Popen(
+        ["docker", "exec", "-i", "-u", "0", supervisor, "sh", "-c", extract],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        with tarfile.open(fileobj=proc.stdin, mode="w|") as tf:   # streaming; symlinks preserved
+            for entry in sorted(os.listdir(src)):
+                tf.add(os.path.join(src, entry), arcname=entry, filter=_root_owned)
+    finally:
+        if proc.stdin:
+            proc.stdin.close()
+    _, err = proc.communicate()
+    if proc.returncode != 0:
+        detail = (err.decode(errors="replace") if err else "").strip()
+        die(f"staging {agent} dist into {supervisor} failed: "
+            f"{detail or 'tar extract returned non-zero'}")
+    if deploy_local:
+        # /opt/agent-dist is now research-owned, so cp -a preserves cleanly. -f
+        # (force) is load-bearing for the update-agent RE-deploy: the existing
+        # ~/.local/bin/claude is a symlink, and plain `cp -a` can't overwrite it
+        # ("File exists") — -f unlinks + recreates. chown is belt-and-suspenders.
+        run_check(["docker", "exec", "-u", "0", supervisor, "sh", "-c",
+                   f"mkdir -p /home/research/.local && "
+                   f"cp -af {AGENT_DIST_MOUNT}/. /home/research/.local/ && "
+                   f"chown -R 1000:1000 /home/research/.local"])
 
 
 def _agent_resolve_latest(agent: str) -> str:
@@ -2400,8 +2535,14 @@ def _recreate_supervisor(
     if md.get("project_type") == PROJECT_TYPE_SANDBOX:
         stage_worker_image(container, SANDBOX_BOX_IMAGE, force=force_restage)
         stage_worker_image(container, SANDBOX_BOX_BROWSER_IMAGE, force=force_restage)
+        # Box-host: re-stage the dist for the boxes (deploy_local=False).
+        _stage_agent_dist(container, deploy_local=False)
     else:
         stage_worker_image(container, ANALYSIS_IMAGE, force=force_restage)
+        # Re-stage the agent dist into the fresh container (its own ~/.local + the
+        # /opt/agent-dist the fleet mounts) — no bake, so a recreate must redeploy
+        # it. Before the role-MCP relaunch loop below, which mounts that path.
+        _stage_agent_dist(container)
     stage_worker_image(container, MCP_PROXY_IMAGE, force=force_restage)
 
     run(["docker", "exec", container, "/usr/local/bin/mcp-reload"],
@@ -3218,6 +3359,7 @@ def _role_mcp_start(supervisor: str, project: str, cfg: "Config",
         "-v", f"/workspace/.role-mcps/{role}:/workspace",
         "-v", f"/workspace/shared/{role}:/workspace/published",
         "-v", "/workspace/.orchestrator:/etc/orchestrator:ro",
+        *AGENT_DIST_MOUNT_ARGS,   # claude copy-source (no bake; slice 2)
         "-e", f"RS_ROLE_NAME={role}",
         "-e", f"RS_ROLE_MCP_PORT={role_mcp.ROLE_MCP_PORT}",
         # Daemon reads this to enforce the cap on send_job. 0 = uncapped.
@@ -3549,6 +3691,7 @@ def _sandbox_start(supervisor: str, project: str, cfg: "Config",
             "--restart", "unless-stopped",
             "-v", f"/workspace/pi/{name}:/workspace",
             "-v", "/workspace/.orchestrator:/etc/orchestrator:ro",
+            *AGENT_DIST_MOUNT_ARGS,   # claude copy-source (no bake; slice 2)
             "-e", f"RS_PI_ROLE={name}",
             "--label", f"research.pi_role={sandbox.pi_role_label(name, kind)}",
             "--label", f"research.project={project}",
@@ -3573,6 +3716,7 @@ def _sandbox_start(supervisor: str, project: str, cfg: "Config",
             "--restart", "unless-stopped",
             "-v", f"/workspace/pi-isolated/{name}:/workspace",
             "-v", f"/external/{name}:{mount}",
+            *AGENT_DIST_MOUNT_ARGS,   # claude copy-source (no bake; slice 2)
             "-e", f"RS_PI_ISO_NAME={name}",
             "-e", f"RS_PI_ISO_REPO={entry.get('repo') or ''}",
             "-e", f"RS_PI_ISO_REF={entry.get('ref') or ''}",

@@ -32,6 +32,15 @@ if [[ ! -f ~/.bashrc ]]; then
     cp -a /etc/worker-skel/. ~/
 fi
 
+# --- Deploy the agent (claude) from the supervisor-staged dist ------------
+# Own writable ~/.local (no bake; STAGE_AGENT_DIST slice 2). Absence-guarded
+# (not first-boot) so a restart of this long-lived container preserves an
+# autoupdater bump. Per-call `claude -p` finds it via the PATH export below.
+if [[ -d /opt/agent-dist && ! -e ~/.local/bin/claude ]]; then
+    mkdir -p ~/.local
+    cp -a /opt/agent-dist/. ~/.local/
+fi
+
 # --- Stage creds (per-call spawned claude -p needs OAuth) -----------------
 # The supervisor copies its current ~/.claude/.credentials.json into the
 # per-role workspace at /workspace/.creds/.credentials.json (at enable time

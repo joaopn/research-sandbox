@@ -5,13 +5,10 @@ FROM rs-substrate-base:latest
 # mcp-proxy tooling + the inner firewall + the supervisor's CLAUDE.md / setup
 # templates. The shared DIND/ssh/byobu/code-server substrate lives in the base.
 
-# Install Claude Code CLI into the research user's home at build time. Version
-# pinned (versions.env → --build-arg) so a `--rebuild` refetches rather than
-# caching the install layer forever; install host is downloads.claude.ai. Outer
-# double-quotes so the build ARG expands before `su -` resets the env.
-ARG CLAUDE_CODE_VERSION=stable
-RUN su - research -c "curl -fsSL https://claude.ai/install.sh | bash -s -- ${CLAUDE_CODE_VERSION}" && \
-    su - research -c 'echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.bashrc'
+# Claude Code is NOT baked — it's deployed at boot via `cp` from the host agent
+# dist (no bake anywhere; STAGE_AGENT_DIST slice 2). We keep ~/.local/bin on PATH
+# so the deployed launcher is found; the dist itself arrives post-creation.
+RUN su - research -c 'echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.bashrc'
 
 # rs-worker CLI runtime deps — docker-py + pyyaml into the conda base env.
 RUN /opt/conda/bin/pip install --no-cache-dir 'docker>=7.1' 'pyyaml>=6'

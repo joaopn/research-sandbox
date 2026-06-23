@@ -128,6 +128,14 @@ def cmd_start(args: argparse.Namespace) -> None:
     """Bring up shared infra: ensure images + start the router container."""
     _preflight()
     _build_images(force=args.rebuild)
+    # Ensure the fleet agent dist exists so research projects can deploy claude at
+    # create/boot (no bake; STAGE_AGENT_DIST slice 2). PULL-ONLY-IF-ABSENT — never
+    # every-start (a re-pull is `agent pull`/`refresh`; a multi-minute build on each
+    # `start` is wrong). Needs rs-minimal-base, which _build_images just ensured.
+    if not rscore.dist_present(rscore.DEFAULT_AGENT):
+        print(f"pulling {rscore.DEFAULT_AGENT} agent dist (first run)...")
+        info = rscore.agent_pull(rscore.DEFAULT_AGENT)
+        print(f"pulled {info['agent']} {info['version']}")
     print("starting router...")
     compose_up = ["docker", "compose", "-f", str(SCRIPT_DIR / "docker-compose.yml"),
                   "up", "-d"]
@@ -1518,55 +1526,39 @@ def cmd_project_sandbox_sync_creds(args: argparse.Namespace) -> None:
         sys.exit(r.returncode)
 
 
-def cmd_project_update_claude(args: argparse.Namespace) -> None:
-    """Interim manual refresh of the supervisor's Claude Code CLI.
+def cmd_project_update_agent(args: argparse.Namespace) -> None:
+    """Re-stage the host agent dist into a running project — no image rebuild,
+    no in-supervisor network install.
 
-    The CLI is baked into the image at build time (Dockerfile.supervisor), so
-    a project's interactive `claude` — and the model list it offers — freezes
-    at the image's build date and only moves on a `start --rebuild` + project
-    recreate. This re-runs the official installer inside the running supervisor
-    to pull the latest stable, no rebuild required.
+    The agent (claude) is no longer baked anywhere (STAGE_AGENT_DIST slice 2); it
+    lives in the host cache (`research agent pull`/`refresh`) and every container
+    deploys it via `cp` at boot. This re-`docker cp`s the current host dist into
+    the supervisor's /opt/agent-dist (the copy-source the inner fleet RO-mounts)
+    and force-refreshes the supervisor's OWN ~/.local (research flavor — the PI's
+    interactive claude). NEWLY-spawned workers / role-MCPs / PI / boxes then deploy
+    the re-staged version; already-running long-lived containers keep their copy
+    until their next restart (the entrypoint absence-guard). Pull a new version
+    first with `research agent pull` (or `agent refresh`).
 
-    Scope is the SUPERVISOR only — the surface the PI interacts with. The inner
-    fleet (workers, role-MCPs, PI containers) still restores the image-baked
-    binary from worker-skel on boot; refreshing those uniformly is the
-    per-project agent-dist work (PLAN/STAGE_AGENT_DIST.md). Sandbox-flavor
-    (`--type sandbox`) projects have no agent and are refused."""
+    Box-host (`--type sandbox`) projects ARE supported: their supervisor never runs
+    claude itself (deploy_local=False), but it stages the dist for its boxes."""
     supervisor = _require_project(args.name)
-    if _container_project_type(supervisor) == PROJECT_TYPE_SANDBOX:
-        die(f"project {args.name!r} is a sandbox (agent-less) project — its "
-            f"Management console runs no claude to update")
+    agent = args.agent
+    if not rscore.dist_present(agent):
+        die(f"no cached {agent} dist — run `research agent pull "
+            f"--agent {agent}` first")
     if not container_running(supervisor):
         die(f"project {args.name!r} is not running "
             f"(use `research project start {args.name}` first)")
-
-    # Login shell + explicit PATH export: install.sh drops claude into
-    # ~/.local/bin, which a non-interactive `su -c` won't have on PATH for the
-    # version probes (the build-time PATH export lives in ~/.bashrc, not the
-    # login profile). Export it inline so before/after checks resolve.
-    def _claude_out(cmd: str) -> str:
-        r = run(["docker", "exec", supervisor, "su", "-", "research", "-c",
-                 f'export PATH="$HOME/.local/bin:$PATH"; {cmd}'],
-                capture_output=True)
-        return r.stdout.strip()
-
-    before = _claude_out("claude --version 2>/dev/null") or "(none)"
-    print(f"current: {before}")
-    print("installing latest Claude Code in the supervisor (needs egress)…")
-    r = run(["docker", "exec", supervisor, "su", "-", "research", "-c",
-             'export PATH="$HOME/.local/bin:$PATH"; '
-             'curl -fsSL https://claude.ai/install.sh | bash'],
-            capture_output=False)
-    if r.returncode != 0:
-        die("claude installer failed inside the supervisor (check the "
-            "project's egress — locked mode still allows 443)")
-    after = _claude_out("claude --version 2>/dev/null") or "(unknown)"
-    print(f"updated: {after}")
-    if before == after:
-        print("(already on the latest stable)")
-    print("note: this refreshes the supervisor's interactive session only; "
-          "open a fresh claude tab to pick it up. Inner workers / role-MCPs / "
-          "PI containers still run the image-baked version.")
+    is_sandbox = _container_project_type(supervisor) == PROJECT_TYPE_SANDBOX
+    rscore._stage_agent_dist(supervisor, agent, deploy_local=not is_sandbox)
+    ver = rscore.load_versions().get(
+        rscore._AGENT_INSTALL[agent]["version_key"], "(unknown)")
+    print(f"re-staged {agent} {ver} into {args.name!r}.")
+    print("note: newly-spawned workers / role-MCPs / PI / boxes pick this up; "
+          "already-running long-lived containers keep their copy until restart. "
+          + ("(box-host: the supervisor itself runs no claude.)" if is_sandbox
+             else "Open a fresh claude tab in the supervisor to use the new one."))
 
 
 def cmd_webui_cert_tailscale() -> None:
@@ -1981,12 +1973,16 @@ def build_parser() -> argparse.ArgumentParser:
     u.set_defaults(func=cmd_project_update)
 
     uc = proj_sub.add_parser(
-        "update-claude",
-        help="refresh the supervisor's Claude Code CLI in place (no image "
-             "rebuild) so the interactive session's model list isn't frozen "
-             "at image-build time")
+        "update-agent",
+        help="re-stage the host agent dist into a running project (no image "
+             "rebuild); newly-spawned containers pick up the new version. "
+             "Pull a new version first with `research agent pull`/`refresh`.")
     uc.add_argument("name")
-    uc.set_defaults(func=cmd_project_update_claude)
+    uc.add_argument("--agent", default=rscore.DEFAULT_AGENT,
+                    choices=rscore.KNOWN_AGENTS,
+                    help=f"which agent dist to re-stage (default "
+                         f"{rscore.DEFAULT_AGENT})")
+    uc.set_defaults(func=cmd_project_update_agent)
 
     sh = proj_sub.add_parser("ssh", help="print SSH connection info")
     sh.add_argument("name")

@@ -36,6 +36,8 @@ from docker.errors import APIError, ImageNotFound, NotFound
 WORKSPACE = Path(os.environ.get("RS_WORKSPACE", "/workspace"))
 CONTAINER_PREFIX = "rs-worker-"
 DEFAULT_IMAGE = "rs-analysis-base:latest"
+# Supervisor-staged agent dist; RO copy-source into each worker (no bake; slice 2).
+AGENT_DIST_MOUNT = "/opt/agent-dist"
 # Claude Code CLI writes OAuth creds to a HIDDEN file (leading dot).
 ORCH_CREDS = Path.home() / ".claude" / ".credentials.json"
 ORCH_SETTINGS = Path.home() / ".claude" / "settings.json"
@@ -567,6 +569,16 @@ def cmd_spawn(args: argparse.Namespace) -> None:
             type="bind", read_only=True,
         ),
     ]
+    # Agent dist: RO copy-source the worker entrypoint cp's into its own ~/.local
+    # at boot (no bake; STAGE_AGENT_DIST slice 2). The supervisor stages this at
+    # create, so it's present for every worker; guard anyway so a bind on a missing
+    # source can't turn a spawn into a cryptic mount error (the entrypoint's
+    # absence-guard then surfaces it as a clear "claude not found").
+    if os.path.isdir(AGENT_DIST_MOUNT):
+        mounts.append(
+            docker.types.Mount(target=AGENT_DIST_MOUNT, source=AGENT_DIST_MOUNT,
+                               type="bind", read_only=True)
+        )
     for src in args.data_mount:
         mounts.append(
             docker.types.Mount(target=src, source=src, type="bind", read_only=True)

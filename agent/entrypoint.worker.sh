@@ -30,6 +30,16 @@ if [[ ! -f ~/.bashrc ]]; then
     cp -a /etc/worker-skel/. ~/
 fi
 
+# Deploy the agent (claude) from the supervisor-staged dist into our OWN writable
+# ~/.local (no bake; STAGE_AGENT_DIST slice 2). Guard on the LAUNCHER'S ABSENCE
+# (not first-boot) so a restart preserves any autoupdater bump; for a worker this
+# is a fresh container each spawn, so it always deploys — must land BEFORE the
+# run_claude below, which execs `claude --print` immediately.
+if [[ -d /opt/agent-dist && ! -e ~/.local/bin/claude ]]; then
+    mkdir -p ~/.local
+    cp -a /opt/agent-dist/. ~/.local/
+fi
+
 # Stage creds + settings from the supervisor-written drop at /workspace/.claude/
 # into the worker user's home. Claude Code's OAuth file is a hidden file.
 if [[ -f /workspace/.claude/.credentials.json ]]; then
