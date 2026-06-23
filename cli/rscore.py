@@ -227,6 +227,22 @@ def _resolve_workflow(workflow_id: str) -> tuple[dict, "ProjectType", "Substrate
     return m, project_type, substrate
 
 
+def workflow_has_worker_layer(manifest: dict) -> bool:
+    """True iff a project created from this workflow runs the worker/sandbox
+    enable cone — i.e. its derived flavor is the research lab. create() skips the
+    cone on the docker substrate (no inner daemon) and on the sandbox flavor
+    (box-host: an agent-less management host with no worker layer), so only a
+    dind-sysbox workflow that ISN'T the management overlay qualifies. Derived
+    from manifest DATA, mirroring _resolve_workflow — never a name lookup — so a
+    BYO dind workflow classifies correctly. The webui uses this (surfaced via the
+    broker `workflows` verb) to show the --enable presets only where they take
+    effect, instead of offering a silent no-op on a box with no worker layer."""
+    if manifest.get("substrate") != Substrate.DIND_SYSBOX.value:
+        return False
+    mgmt_overlay = MANAGEMENT_IMAGE.split(":", 1)[0]  # "rs-management"
+    return manifest.get("image_overlay") != mgmt_overlay
+
+
 def _light_clone_basename(repo: str) -> str:
     """Derive the clone-dir basename from a repo URL: the last path segment with
     a trailing '/' and a trailing '.git' stripped (``…/u/foo.git`` → ``foo``).

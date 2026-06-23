@@ -691,9 +691,6 @@ function makeProjectRail() {
     const splitter = el("div", { class: "rail-splitter", title: "Drag to resize" });
     installRailSplitterDrag(splitter);
     rail.appendChild(splitter);
-    // Management lives ABOVE the bookmarks, divided off: it's the host's live
-    // project list (broker), distinct from the vault bookmarks below it.
-    rail.appendChild(makeManagementSection());
     const header = el("div", { class: "rail-header" }, [
         el("span", {}, ["Projects"]),
         makePinButton(),
@@ -707,6 +704,9 @@ function makeProjectRail() {
         onclick: openAddProjectModal,
     }, ["+ Add project"]));
     rail.appendChild(el("div", { class: "rail-spacer" }));
+    // Store + Management sit together at the BOTTOM of the rail — the host-side
+    // create + lifecycle surfaces, distinct from the vault bookmarks above.
+    rail.appendChild(makeBottomNav());
 
     const footer = el("div", { class: "rail-footer" }, [
         makeIframeZoomSelector(),
@@ -724,13 +724,18 @@ function makeProjectRail() {
 // lives server-side. start/stop are confirm-gated (they recreate / interrupt
 // a supervisor — costly, deliberate).
 
-function makeManagementSection() {
-    const entry = el("div", {
-        class: "management-entry",
+function makeBottomNav() {
+    const store = el("div", {
+        class: "nav-entry store-entry",
+        title: "Workflow store — pick a workflow to create a project",
+    }, [el("span", { class: "nav-icon" }, ["🛍"]), el("span", {}, ["Store"])]);
+    store.onclick = (ev) => { ev.stopPropagation(); openStore(); };
+    const mgmt = el("div", {
+        class: "nav-entry management-entry",
         title: "Host project management (broker)",
     }, [el("span", { class: "mgmt-gear" }, ["⚙"]), el("span", {}, ["Management"])]);
-    entry.onclick = (ev) => { ev.stopPropagation(); openManagement(); };
-    return el("div", { class: "rail-management" }, [entry]);
+    mgmt.onclick = (ev) => { ev.stopPropagation(); openManagement(); };
+    return el("div", { class: "rail-nav-group" }, [store, mgmt]);
 }
 
 function openManagement() {
@@ -748,6 +753,7 @@ function openManagement() {
     // active project so focus moves cleanly to Management (activateProject does
     // the reverse via closeManagement).
     document.querySelectorAll(".project-rail .project").forEach((r) => r.classList.remove("active"));
+    document.querySelectorAll(".store-entry").forEach((e) => e.classList.remove("active"));
     document.querySelectorAll(".management-entry").forEach((e) => e.classList.add("active"));
     renderManagementInto(view);
 }
@@ -758,6 +764,7 @@ function closeManagement() {
     const term = document.getElementById("terminal-area");
     if (term) term.style.display = "";
     document.querySelectorAll(".management-entry").forEach((e) => e.classList.remove("active"));
+    document.querySelectorAll(".store-entry").forEach((e) => e.classList.remove("active"));
 }
 
 async function renderManagementInto(view) {
@@ -788,7 +795,7 @@ function mgmtCard(view, children) {
     ]));
 }
 
-function renderMgmtLogin(view) {
+function renderMgmtLogin(view, onSuccess) {
     const pw = el("input", { type: "password", autocomplete: "current-password" });
     const errEl = el("div", { class: "error" });
     const submit = el("button", { class: "btn" }, ["Log in"]);
@@ -802,7 +809,7 @@ function renderMgmtLogin(view) {
                 body: JSON.stringify({ password: pw.value }),
             });
         } catch (e) { errEl.textContent = "Broker unreachable."; return; }
-        if (res.status === 200) return renderManagementInto(view);
+        if (res.status === 200) return (onSuccess || renderManagementInto)(view);
         if (res.status === 429) {
             const ra = res.headers.get("Retry-After");
             errEl.textContent = `Too many attempts. Wait ${ra || "a moment"}s.`;
@@ -852,8 +859,11 @@ function renderMgmtRejected(view) {
 
 function renderMgmtTable(view, projects) {
     view.innerHTML = "";
+    // The store is the create entry point now (the workflow picker is its card
+    // grid); this button just routes there. mgmtCreateDialog is only ever opened
+    // from a store card, with a chosen workflow manifest.
     const create = el("button", { class: "btn-small" }, ["+ New project"]);
-    create.onclick = () => mgmtCreateDialog(view);
+    create.onclick = () => openStore();
     const refresh = el("button", { class: "btn-small" }, ["Refresh"]);
     refresh.onclick = () => renderManagementInto(view);
     const logout = el("button", { class: "btn-small" }, ["Log out"]);
@@ -924,17 +934,21 @@ async function mgmtFillStatus(fill) {
             continue;
         }
         ref.size.textContent = formatBytes((st && st.disk_bytes) || 0);
-        setTypeBadge(ref.badge, st && st.flavor);
+        setTypeBadge(ref.badge, st && st.workflow);
     }
 }
 
-// Paint a project-type badge: normal text + a type-coloured border, or empty
-// (collapsed) when the flavour is unknown.
-function setTypeBadge(elm, flavor) {
-    const cls = flavor === "sandbox" ? " type-sandbox"
-        : flavor === "research" ? " type-research" : "";
+// Paint a project badge: the WORKFLOW the user picked (empty/research/box-host/
+// BYO) + a colour keyed off the label, or empty (collapsed) when unknown. We
+// label by workflow, not the derived flavour, so a docker `empty` box reads
+// "empty" instead of mislabelling as "research" (substrate stays hidden, Q7).
+// Legacy markers without a workflow fall back to the flavour string server-side.
+function setTypeBadge(elm, label) {
+    const cls = label === "research" ? " type-research"
+        : (label === "box-host" || label === "sandbox") ? " type-sandbox"
+        : label ? " type-box" : "";
     elm.className = "type-badge" + cls;
-    elm.textContent = flavor || "";
+    elm.textContent = label || "";
 }
 
 function mgmtAction(view, name, action) {
@@ -1188,71 +1202,49 @@ function mgmtConfirmThenTail(view, cfg) {
 }
 
 // ---- create -----------------------------------------------------------------
-// Catalog-driven create form (STAGE_WEBUI_WORKFLOWS): name · workflow · egress ·
-// --enable presets, plus a docker-substrate-only group (agent + light-path
-// repo/ref/setup + a github_pat secret). The broker's CREATE_WEBUI_FIELDS
-// allow-list is the real input boundary (it silently DROPS any field not in the
-// set), so every key the payload sends below must be in that set — this is the
-// two-file lockstep. The catalog (workflows + agents + default) comes from the
-// broker's `workflows` verb; the webui image has no cli/ to read it locally.
-//
-// The user picks a WORKFLOW; substrate + flavor are derived from its manifest
-// server-side. The agent + light-path fields only have an effect on the `docker`
-// substrate (create() notes-and-ignores them on dind), so the form shows that
-// group ONLY for a docker-substrate workflow — never offering a field the server
-// would drop. github_pat is a SECRET: never preset, never logged/persisted
-// browser-side (built in the request closure and POSTed once).
+// The create form for ONE chosen workflow (the store card is the picker — see
+// renderStoreScreen). The store screen fetched the catalog and passes the
+// selected manifest + the agent enum; this builds the rest of the form. The
+// broker's CREATE_WEBUI_FIELDS allow-list is the real input boundary (it silently
+// DROPS any field not in the set), so every key the payload sends below is in that
+// set — the two-file lockstep. The workflow is FIXED here; substrate /
+// has_worker_layer / light-path presets all come from the manifest (substrate
+// stays hidden, Q7). The --enable presets show only where they take effect
+// (has_worker_layer — a research-flavor workflow); the agent + light-path group
+// only on the docker substrate. github_pat is a SECRET: never preset, never
+// logged/persisted browser-side (built in the request closure and POSTed once).
 
 const MGMT_ENABLE_PRESETS = ["websearcher", "wrangler", "echo"];
 
-// Broker-down / unauth fallback: the built-in names only, no docker group (we
-// have neither presets nor the agent enum without the catalog). Matches the
-// pre-catalog behavior. `substrate` is omitted so the docker group stays hidden.
-const MGMT_FALLBACK_WORKFLOWS = [
-    { name: "research" }, { name: "box-host" }, { name: "empty" },
-];
-
-async function mgmtCreateDialog(view) {
-    // Catalog fetch is the only source (no cli/ in the webui image). Any failure
-    // (broker down, session expired) degrades to the built-in names with no
-    // docker group; a later create POST that 401s is redirected by the confirm
-    // path's own status handling, so no auth redirect is needed here.
-    let hasCatalog = false;
-    let workflows = MGMT_FALLBACK_WORKFLOWS;
-    let agents = [];
-    let defaultWorkflow = "research";
-    try {
-        const res = await fetch("/broker/workflows");
-        if (res.ok) {
-            const body = await res.json();
-            if (body.ok && body.result && Array.isArray(body.result.workflows)
-                    && body.result.workflows.length) {
-                workflows = body.result.workflows;
-                agents = Array.isArray(body.result.agents) ? body.result.agents : [];
-                defaultWorkflow = body.result.default_workflow || "research";
-                hasCatalog = true;
-            }
-        }
-    } catch (e) { /* fall through to the fallback */ }
-
-    const wfByName = {};
-    for (const w of workflows) wfByName[w.name] = w;
+function mgmtCreateDialog(view, manifest, agents) {
+    manifest = manifest || {};
+    agents = Array.isArray(agents) ? agents : [];
+    const workflow = manifest.name || "research";
+    const isDocker = manifest.substrate === "docker";
+    const hasWorkerLayer = !!manifest.has_worker_layer;
 
     const nameI = el("input", { type: "text", autocomplete: "off" });
-    const workflowS = el("select", {}, workflows.map((w) =>
-        el("option", { value: w.name, title: w.description || "" },
-           [w.name + (w.source === "byo" ? " (byo)" : "")])));
-    if (wfByName[defaultWorkflow]) workflowS.value = defaultWorkflow;
     const egressS = el("select", {}, [
         el("option", { value: "open" }, ["open"]),
         el("option", { value: "locked" }, ["locked"]),
     ]);
+
+    // Enable presets — only for a workflow that has a worker/sandbox layer
+    // (research flavor). A bare box / sandbox host has none, so the backend would
+    // silently drop these tokens; gating the group's visibility avoids that
+    // no-op footgun. (CREATE_WEBUI_FIELDS still allows `enable`; we just don't
+    // send it where it does nothing.)
     const checks = MGMT_ENABLE_PRESETS.map((p) => {
         const cb = el("input", { type: "checkbox", value: p });
         return { p, cb, label: el("label", { class: "mgmt-check" }, [cb, " " + p]) };
     });
+    const enableField = el("div", { class: "field" }, [
+        el("label", {}, ["Enable"]),
+        el("div", { class: "mgmt-checks" }, checks.map((c) => c.label)),
+    ]);
+    if (!hasWorkerLayer) enableField.style.display = "none";
 
-    // Docker-substrate-only group: agent + light-path payload. Hidden for dind.
+    // Docker-substrate-only group: agent + light-path payload.
     const agentS = el("select", {}, [
         el("option", { value: "" }, ["(default)"]),
         ...agents.map((a) => el("option", { value: a }, [a])),
@@ -1282,22 +1274,12 @@ async function mgmtCreateDialog(view) {
             "Agent + repo/setup apply to the docker-box substrate only.",
         ]),
     ]);
-
-    const selectedManifest = () => wfByName[workflowS.value] || {};
-    const isDockerSelected = () =>
-        hasCatalog && selectedManifest().substrate === "docker";
-    function syncDockerGroup() {
-        dockerGroup.style.display = isDockerSelected() ? "" : "none";
-        // Auto-fill the light-path presets from the manifest (explicit-wins is
-        // server-side; here switching workflow resets to that workflow's
-        // presets, then the user can override). PAT is never preset.
-        const m = selectedManifest();
-        repoI.value = m.repo || "";
-        refI.value = m.ref || "";
-        setupT.value = m.setup || "";
-    }
-    workflowS.onchange = syncDockerGroup;
-    syncDockerGroup();
+    if (!isDocker) dockerGroup.style.display = "none";
+    // Prefill the light-path presets from the manifest (overridable; the server's
+    // explicit-wins applies the preset if the field is left blank). PAT never preset.
+    repoI.value = manifest.repo || "";
+    refI.value = manifest.ref || "";
+    setupT.value = manifest.setup || "";
 
     mgmtConfirmThenTail(view, {
         title: "New project",
@@ -1305,13 +1287,17 @@ async function mgmtCreateDialog(view) {
         verb: "create",
         confirmLabel: "Create",
         body: [
-            el("div", { class: "field" }, [el("label", {}, ["Project name"]), nameI]),
-            el("div", { class: "field" }, [el("label", {}, ["Workflow"]), workflowS]),
-            el("div", { class: "field" }, [el("label", {}, ["Egress"]), egressS]),
             el("div", { class: "field" }, [
-                el("label", {}, ["Enable"]),
-                el("div", { class: "mgmt-checks" }, checks.map((c) => c.label)),
+                el("label", {}, ["Workflow"]),
+                el("div", { class: "mgmt-selected-workflow" }, [
+                    workflow + (manifest.source === "byo" ? " (byo)" : ""),
+                ]),
+                manifest.description
+                    ? el("div", { class: "hint" }, [manifest.description]) : null,
             ]),
+            el("div", { class: "field" }, [el("label", {}, ["Project name"]), nameI]),
+            el("div", { class: "field" }, [el("label", {}, ["Egress"]), egressS]),
+            enableField,
             dockerGroup,
             el("div", { class: "hint" }, [
                 "Creating stages container images and can take 10–30s (longer cold).",
@@ -1320,23 +1306,26 @@ async function mgmtCreateDialog(view) {
         validate: () => {
             if (!nameI.value.trim()) return "Project name is required.";
             // Mirror from_kwargs: a docker repo needs a ref (pin the clone).
-            if (isDockerSelected() && repoI.value.trim() && !refI.value.trim()) {
+            if (isDocker && repoI.value.trim() && !refI.value.trim()) {
                 return "A workflow repo requires a ref.";
             }
             return null;
         },
         request: () => {
-            // Lockstep: every key below is in CREATE_WEBUI_FIELDS. The docker-only
-            // in-box fields are sent ONLY for a docker workflow and only when
-            // non-empty, so a dind create never puts them on the wire and
-            // from_kwargs applies the manifest presets unshadowed.
+            // Lockstep: every key below is in CREATE_WEBUI_FIELDS. enable rides
+            // only for a workflow with a worker layer; the docker-only in-box
+            // fields only for a docker workflow and only when non-empty — so a
+            // dind create never puts them on the wire and from_kwargs applies the
+            // manifest presets unshadowed.
             const payload = {
                 name: nameI.value.trim(),
-                workflow: workflowS.value,
+                workflow: workflow,
                 egress: egressS.value,
-                enable: checks.filter((c) => c.cb.checked).map((c) => c.p),
             };
-            if (isDockerSelected()) {
+            if (hasWorkerLayer) {
+                payload.enable = checks.filter((c) => c.cb.checked).map((c) => c.p);
+            }
+            if (isDocker) {
                 const agent = agentS.value.trim();
                 const repo = repoI.value.trim();
                 const ref = refI.value.trim();
@@ -1361,6 +1350,68 @@ async function mgmtCreateDialog(view) {
         },
         focus: () => nameI.focus(),
     });
+}
+
+// ---- store screen (clickable workflow cards) -------------------------------
+// The store is the create entry point: a grid of workflow cards. Clicking a card
+// opens mgmtCreateDialog prefilled to that workflow. Gated behind the management
+// session (the broker `workflows` verb is token-gated) — a 401 routes through the
+// same login screen, returning to the store on success. Substrate is never shown
+// (Q7): a card is a workflow, not a containment runtime.
+
+function openStore() {
+    const mainArea = document.querySelector(".main-area");
+    if (!mainArea) return;
+    const term = document.getElementById("terminal-area");
+    if (term) term.style.display = "none";
+    let view = document.getElementById("management-view");
+    if (!view) {
+        view = el("div", { class: "management-view", id: "management-view" });
+        mainArea.appendChild(view);
+    }
+    view.style.display = "";
+    document.querySelectorAll(".project-rail .project").forEach((r) => r.classList.remove("active"));
+    document.querySelectorAll(".management-entry").forEach((e) => e.classList.remove("active"));
+    document.querySelectorAll(".store-entry").forEach((e) => e.classList.add("active"));
+    renderStoreInto(view);
+}
+
+async function renderStoreInto(view) {
+    view.innerHTML = "";
+    view.appendChild(el("div", { class: "mgmt-loading" }, ["Loading store…"]));
+    let res;
+    try {
+        res = await fetch("/broker/workflows");
+    } catch (e) { return renderMgmtUnavailable(view); }
+    if (res.status === 401) return renderMgmtLogin(view, renderStoreInto);
+    if (res.status === 403) return renderMgmtRejected(view);
+    if (res.status === 503) return renderMgmtUnavailable(view);
+    let body;
+    try { body = await res.json(); } catch (e) { return renderMgmtUnavailable(view); }
+    if (!res.ok || !body.ok || !body.result) return renderMgmtUnavailable(view);
+    renderStoreScreen(view, body.result);
+}
+
+function renderStoreScreen(view, result) {
+    view.innerHTML = "";
+    const workflows = Array.isArray(result.workflows) ? result.workflows : [];
+    const agents = Array.isArray(result.agents) ? result.agents : [];
+    const grid = el("div", { class: "store-grid" }, workflows.map((m) => {
+        const card = el("div", { class: "store-card", title: m.description || "" }, [
+            el("div", { class: "store-card-name" }, [
+                m.name,
+                m.source === "byo" ? el("span", { class: "store-byo" }, ["byo"]) : null,
+            ]),
+            el("div", { class: "store-card-desc" }, [m.description || ""]),
+        ]);
+        card.onclick = () => mgmtCreateDialog(view, m, agents);
+        return card;
+    }));
+    view.appendChild(el("div", { class: "store-screen" }, [
+        el("h2", { class: "store-title" }, ["Workflow store"]),
+        el("div", { class: "hint store-sub" }, ["Pick a workflow to create a project."]),
+        grid,
+    ]));
 }
 
 // ---- JIT keyring attach -----------------------------------------------------
@@ -1570,7 +1621,7 @@ function applyProjectStatus(name, status) {
         if (badge) setTypeBadge(badge, null);
         return;
     }
-    if (badge) setTypeBadge(badge, status.flavor);
+    if (badge) setTypeBadge(badge, status.workflow);
     line1.textContent = formatStatusLine1(status);
     line2.textContent = formatStatusLine2(status);
     if (status.latest && status.latest.path) {

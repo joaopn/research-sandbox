@@ -250,9 +250,15 @@ def _verb_workflows(_args: dict, _progress=None) -> dict:
         catalog = workflow.load_catalog()
     except workflow.WorkflowError as e:
         raise rscore.ValidationError(str(e))
+    # Tag each entry with whether it runs the worker/sandbox enable cone, so the
+    # create form can show the --enable presets only where they take effect
+    # (research flavor) instead of offering a silent no-op on a box/sandbox host.
+    for m in catalog:
+        m["has_worker_layer"] = rscore.workflow_has_worker_layer(m)
     return {
         "workflows": catalog,                     # full manifests (substrate,
-                                                  # repo/ref/setup presets, source)
+                                                  # repo/ref/setup presets, source,
+                                                  # has_worker_layer)
         "agents": list(rscore.KNOWN_AGENTS),      # the --agent enum
         "default_workflow": rscore.DEFAULT_WORKFLOW,
     }

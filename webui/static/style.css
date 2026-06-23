@@ -26,6 +26,7 @@
        (the text stays a normal fg colour; only the border carries the type) */
     --type-research-border: #2e7d32;
     --type-sandbox-border: #17a2b8;
+    --type-box-border: #8a8a8a;   /* neutral grey = bare box (empty / BYO) */
     /* management-table actions column: fixed so every per-row grid resolves the
        same column tracks (header + rows align regardless of how many action
        buttons a row shows). Sized to fit the 4-button running row
@@ -658,11 +659,14 @@ body {
 .op-check.failed .op-check-icon { color: var(--status-error); }
 
 /* ---- Management (broker-driven host lifecycle) -------------------------- */
-.rail-management {
-    border-bottom: 1px solid var(--border);
-    margin-bottom: 4px;
+/* Store + Management nav group, pinned at the bottom of the rail. */
+.rail-nav-group {
+    display: flex;
+    gap: 2px;
+    border-top: 1px solid var(--border);
+    margin-top: 4px;
 }
-.management-entry {
+.nav-entry {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -671,13 +675,57 @@ body {
     color: var(--fg-base);
     font-size: 13px;
     font-weight: 600;
+    flex: 1;
 }
-.management-entry:hover { background: var(--border); }
-.management-entry.active {
+.nav-entry:hover { background: var(--border); }
+.nav-entry.active {
     background: var(--bg-active);
     box-shadow: 2px 0 0 var(--fg-accent) inset;
 }
-.management-entry .mgmt-gear { font-size: 14px; }
+.nav-entry .mgmt-gear, .nav-entry .nav-icon { font-size: 14px; }
+
+/* Workflow store screen — clickable workflow cards. */
+.store-screen { max-width: 900px; }
+.store-title { margin: 0 0 4px; }
+.store-sub { margin-bottom: 16px; }
+.store-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 12px;
+}
+.store-card {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px;
+    cursor: pointer;
+    background: var(--bg-base);
+    transition: border-color .1s, background .1s;
+}
+.store-card:hover {
+    border-color: var(--fg-accent);
+    background: var(--bg-active);
+}
+.store-card-name {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--fg-base);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 6px;
+}
+.store-byo {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    border: 1px solid var(--border-strong);
+    border-radius: 3px;
+    padding: 0 4px;
+    color: var(--fg-faint);
+}
+.store-card-desc { font-size: 12px; color: var(--fg-faint); line-height: 1.4; }
+/* Read-only selected-workflow line in the create dialog (the card was the picker). */
+.mgmt-selected-workflow { font-weight: 600; color: var(--fg-base); padding: 6px 0; }
 
 .management-view {
     flex: 1;
@@ -760,6 +808,7 @@ body {
 .type-badge:empty { display: none; }
 .type-badge.type-research { border-color: var(--type-research-border); }
 .type-badge.type-sandbox { border-color: var(--type-sandbox-border); }
+.type-badge.type-box { border-color: var(--type-box-border); }
 .state-running { color: var(--status-up); }
 .state-stopped { color: var(--fg-faint); }
 
