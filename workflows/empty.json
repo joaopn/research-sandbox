@@ -1,5 +1,0 @@
-{
-  "name": "empty",
-  "substrate": "docker",
-  "description": "A single confined runc container (ssh + editor, no inner docker, no agent) — the bare docker substrate."
-}

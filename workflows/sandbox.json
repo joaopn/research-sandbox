@@ -1,0 +1,5 @@
+{
+  "name": "sandbox",
+  "substrate": "docker",
+  "description": "A single confined runc container (ssh + editor, no inner docker, no agent) — a bare sandbox box."
+}

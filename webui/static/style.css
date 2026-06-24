@@ -659,10 +659,11 @@ body {
 .op-check.failed .op-check-icon { color: var(--status-error); }
 
 /* ---- Management (broker-driven host lifecycle) -------------------------- */
-/* Store + Management nav group, pinned at the bottom of the rail. */
+/* Workflows / Management / Settings nav group, pinned at the bottom of the rail —
+   each entry on its own full-width line. */
 .rail-nav-group {
     display: flex;
-    gap: 2px;
+    flex-direction: column;
     border-top: 1px solid var(--border);
     margin-top: 4px;
 }
@@ -675,7 +676,6 @@ body {
     color: var(--fg-base);
     font-size: 13px;
     font-weight: 600;
-    flex: 1;
 }
 .nav-entry:hover { background: var(--border); }
 .nav-entry.active {
@@ -684,16 +684,16 @@ body {
 }
 .nav-entry .mgmt-gear, .nav-entry .nav-icon { font-size: 14px; }
 
-/* Workflow store screen — clickable workflow cards. */
-.store-screen { max-width: 900px; }
-.store-title { margin: 0 0 4px; }
-.store-sub { margin-bottom: 16px; }
-.store-grid {
+/* Workflows screen — clickable workflow cards. */
+.workflows-screen { max-width: 900px; }
+.workflows-title { margin: 0 0 4px; }
+.workflows-sub { margin-bottom: 16px; }
+.workflows-grid {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
     gap: 12px;
 }
-.store-card {
+.workflows-card {
     border: 1px solid var(--border);
     border-radius: 6px;
     padding: 14px;
@@ -701,11 +701,11 @@ body {
     background: var(--bg-base);
     transition: border-color .1s, background .1s;
 }
-.store-card:hover {
+.workflows-card:hover {
     border-color: var(--fg-accent);
     background: var(--bg-active);
 }
-.store-card-name {
+.workflows-card-name {
     font-size: 14px;
     font-weight: 600;
     color: var(--fg-base);
@@ -714,7 +714,7 @@ body {
     gap: 6px;
     margin-bottom: 6px;
 }
-.store-byo {
+.workflows-byo {
     font-size: 10px;
     font-weight: 600;
     text-transform: uppercase;
@@ -723,9 +723,11 @@ body {
     padding: 0 4px;
     color: var(--fg-faint);
 }
-.store-card-desc { font-size: 12px; color: var(--fg-faint); line-height: 1.4; }
+.workflows-card-desc { font-size: 12px; color: var(--fg-faint); line-height: 1.4; }
 /* Read-only selected-workflow line in the create dialog (the card was the picker). */
 .mgmt-selected-workflow { font-weight: 600; color: var(--fg-base); padding: 6px 0; }
+/* Local UI settings page (theme, …). */
+.settings-screen { max-width: 600px; }
 
 .management-view {
     flex: 1;

@@ -199,6 +199,7 @@ const state = {
     salt: null,              // Uint8Array | null
     vault: null,             // { version, projects, settings } | null
     activeProject: null,     // string | null
+    hostPage: null,          // "workflows" | "management" | "settings" | null (open host page)
     activeService: null,     // string | null
     serviceRegistry: null,   // { [serviceId]: spec } from /services
     projectServices: {},     // { [projectName]: { [serviceId]: spec } }
@@ -704,13 +705,13 @@ function makeProjectRail() {
         onclick: openAddProjectModal,
     }, ["+ Add project"]));
     rail.appendChild(el("div", { class: "rail-spacer" }));
-    // Store + Management sit together at the BOTTOM of the rail — the host-side
-    // create + lifecycle surfaces, distinct from the vault bookmarks above.
+    // Workflows + Management + Settings sit together at the BOTTOM of the rail —
+    // the host-side create + lifecycle + UI surfaces, distinct from the vault
+    // bookmarks above.
     rail.appendChild(makeBottomNav());
 
+    // Theme + Editor-zoom moved to the Settings page; the footer keeps Lock vault.
     const footer = el("div", { class: "rail-footer" }, [
-        makeIframeZoomSelector(),
-        makeThemeSelector(),
         el("button", { class: "lock-btn", onclick: lockVault }, ["Lock vault"]),
     ]);
     rail.appendChild(footer);
@@ -724,47 +725,110 @@ function makeProjectRail() {
 // lives server-side. start/stop are confirm-gated (they recreate / interrupt
 // a supervisor — costly, deliberate).
 
+// The bottom rail nav: Workflows / Management / Settings, each on its OWN line
+// (the .rail-nav-group stacks them vertically). Workflows + Management are
+// host-broker surfaces; Settings is a local UI page (theme + editor-zoom).
 function makeBottomNav() {
-    const store = el("div", {
-        class: "nav-entry store-entry",
-        title: "Workflow store — pick a workflow to create a project",
-    }, [el("span", { class: "nav-icon" }, ["🛍"]), el("span", {}, ["Store"])]);
-    store.onclick = (ev) => { ev.stopPropagation(); openStore(); };
-    const mgmt = el("div", {
-        class: "nav-entry management-entry",
-        title: "Host project management (broker)",
-    }, [el("span", { class: "mgmt-gear" }, ["⚙"]), el("span", {}, ["Management"])]);
-    mgmt.onclick = (ev) => { ev.stopPropagation(); openManagement(); };
-    return el("div", { class: "rail-nav-group" }, [store, mgmt]);
+    const mk = (cls, icon, label, title, open) => {
+        const e = el("div", { class: "nav-entry " + cls, title },
+                     [el("span", { class: "nav-icon" }, [icon]), el("span", {}, [label])]);
+        e.onclick = (ev) => { ev.stopPropagation(); open(); };
+        return e;
+    };
+    return el("div", { class: "rail-nav-group" }, [
+        mk("workflows-entry", "🛍", "Workflows",
+           "Workflows — pick a workflow to create a project", openWorkflows),
+        mk("management-entry", "🗂", "Management",
+           "Host project management (broker)", openManagement),
+        mk("settings-entry", "⚙", "Settings", "UI settings", openSettings),
+    ]);
 }
 
-function openManagement() {
+// Shared host-page chrome: a non-project page (Workflows / Management / Settings)
+// takes over the main area — hide the terminal AND the per-project service tabs
+// (there's no active project context), clear the active project row, and reuse
+// the single #management-view pane. closeManagement (called by activateProject)
+// reverses it.
+function setServiceTabsHidden(hidden) {
+    document.querySelectorAll("#service-tabs .tab[data-service]")
+        .forEach((t) => { t.style.display = hidden ? "none" : ""; });
+}
+function setActiveNavEntry(cls) {
+    document.querySelectorAll(".rail-nav-group .nav-entry")
+        .forEach((e) => e.classList.remove("active"));
+    document.querySelectorAll("." + cls).forEach((e) => e.classList.add("active"));
+}
+function enterHostView() {
     const mainArea = document.querySelector(".main-area");
-    if (!mainArea) return;
+    if (!mainArea) return null;
     const term = document.getElementById("terminal-area");
     if (term) term.style.display = "none";
+    setServiceTabsHidden(true);
     let view = document.getElementById("management-view");
     if (!view) {
         view = el("div", { class: "management-view", id: "management-view" });
         mainArea.appendChild(view);
     }
     view.style.display = "";
-    // Management and a project tab are mutually exclusive — clear the rail's
-    // active project so focus moves cleanly to Management (activateProject does
-    // the reverse via closeManagement).
     document.querySelectorAll(".project-rail .project").forEach((r) => r.classList.remove("active"));
-    document.querySelectorAll(".store-entry").forEach((e) => e.classList.remove("active"));
-    document.querySelectorAll(".management-entry").forEach((e) => e.classList.add("active"));
+    return view;
+}
+
+function openManagement() {
+    if (state.hostPage === "management") return leaveHostView();
+    state.hostPage = "management";
+    const view = enterHostView();
+    if (!view) return;
+    setActiveNavEntry("management-entry");
     renderManagementInto(view);
 }
 
+function openSettings() {
+    if (state.hostPage === "settings") return leaveHostView();
+    state.hostPage = "settings";
+    const view = enterHostView();
+    if (!view) return;
+    setActiveNavEntry("settings-entry");
+    renderSettingsInto(view);
+}
+
+// Clicking the already-open host tab deselects it (temporary-tab feel): drop
+// back to the project that was open before, or the welcome area if none.
+function leaveHostView() {
+    state.hostPage = null;
+    if (state.activeProject) {
+        activateProject(state.activeProject);
+    } else {
+        closeManagement();
+    }
+}
+
+// Local UI settings page (no broker; theme + editor-zoom are client-side). These
+// live here now instead of the rail footer.
+function renderSettingsInto(view) {
+    view.innerHTML = "";
+    view.appendChild(el("div", { class: "settings-screen" }, [
+        el("h2", { class: "workflows-title" }, ["Settings"]),
+        el("div", { class: "field" }, [
+            el("label", {}, ["Theme"]),
+            makeThemeSelector(),
+        ]),
+        el("div", { class: "field" }, [
+            el("label", {}, ["Editor zoom"]),
+            makeIframeZoomSelector(),
+        ]),
+    ]));
+}
+
 function closeManagement() {
+    state.hostPage = null;
     const view = document.getElementById("management-view");
     if (view) view.style.display = "none";
     const term = document.getElementById("terminal-area");
     if (term) term.style.display = "";
-    document.querySelectorAll(".management-entry").forEach((e) => e.classList.remove("active"));
-    document.querySelectorAll(".store-entry").forEach((e) => e.classList.remove("active"));
+    setServiceTabsHidden(false);
+    document.querySelectorAll(".rail-nav-group .nav-entry")
+        .forEach((e) => e.classList.remove("active"));
 }
 
 async function renderManagementInto(view) {
@@ -859,11 +923,11 @@ function renderMgmtRejected(view) {
 
 function renderMgmtTable(view, projects) {
     view.innerHTML = "";
-    // The store is the create entry point now (the workflow picker is its card
-    // grid); this button just routes there. mgmtCreateDialog is only ever opened
-    // from a store card, with a chosen workflow manifest.
+    // The Workflows page is the create entry point now (the workflow picker is
+    // its card grid); this button just routes there. mgmtCreateDialog is only
+    // ever opened from a workflows card, with a chosen workflow manifest.
     const create = el("button", { class: "btn-small" }, ["+ New project"]);
-    create.onclick = () => openStore();
+    create.onclick = () => openWorkflows();
     const refresh = el("button", { class: "btn-small" }, ["Refresh"]);
     refresh.onclick = () => renderManagementInto(view);
     const logout = el("button", { class: "btn-small" }, ["Log out"]);
@@ -1202,8 +1266,8 @@ function mgmtConfirmThenTail(view, cfg) {
 }
 
 // ---- create -----------------------------------------------------------------
-// The create form for ONE chosen workflow (the store card is the picker — see
-// renderStoreScreen). The store screen fetched the catalog and passes the
+// The create form for ONE chosen workflow (the workflows card is the picker —
+// see renderWorkflowsScreen). The Workflows page fetched the catalog and passes the
 // selected manifest + the agent enum; this builds the rest of the form. The
 // broker's CREATE_WEBUI_FIELDS allow-list is the real input boundary (it silently
 // DROPS any field not in the set), so every key the payload sends below is in that
@@ -1352,64 +1416,56 @@ function mgmtCreateDialog(view, manifest, agents) {
     });
 }
 
-// ---- store screen (clickable workflow cards) -------------------------------
-// The store is the create entry point: a grid of workflow cards. Clicking a card
-// opens mgmtCreateDialog prefilled to that workflow. Gated behind the management
-// session (the broker `workflows` verb is token-gated) — a 401 routes through the
-// same login screen, returning to the store on success. Substrate is never shown
-// (Q7): a card is a workflow, not a containment runtime.
+// ---- workflows screen (clickable workflow cards) ---------------------------
+// The Workflows page is the create entry point: a grid of workflow cards.
+// Clicking a card opens mgmtCreateDialog prefilled to that workflow. Gated
+// behind the management session (the broker `workflows` verb is token-gated) — a
+// 401 routes through the same login screen, returning here on success. Substrate
+// is never shown (Q7): a card is a workflow, not a containment runtime.
 
-function openStore() {
-    const mainArea = document.querySelector(".main-area");
-    if (!mainArea) return;
-    const term = document.getElementById("terminal-area");
-    if (term) term.style.display = "none";
-    let view = document.getElementById("management-view");
-    if (!view) {
-        view = el("div", { class: "management-view", id: "management-view" });
-        mainArea.appendChild(view);
-    }
-    view.style.display = "";
-    document.querySelectorAll(".project-rail .project").forEach((r) => r.classList.remove("active"));
-    document.querySelectorAll(".management-entry").forEach((e) => e.classList.remove("active"));
-    document.querySelectorAll(".store-entry").forEach((e) => e.classList.add("active"));
-    renderStoreInto(view);
+function openWorkflows() {
+    if (state.hostPage === "workflows") return leaveHostView();
+    state.hostPage = "workflows";
+    const view = enterHostView();
+    if (!view) return;
+    setActiveNavEntry("workflows-entry");
+    renderWorkflowsInto(view);
 }
 
-async function renderStoreInto(view) {
+async function renderWorkflowsInto(view) {
     view.innerHTML = "";
-    view.appendChild(el("div", { class: "mgmt-loading" }, ["Loading store…"]));
+    view.appendChild(el("div", { class: "mgmt-loading" }, ["Loading workflows…"]));
     let res;
     try {
         res = await fetch("/broker/workflows");
     } catch (e) { return renderMgmtUnavailable(view); }
-    if (res.status === 401) return renderMgmtLogin(view, renderStoreInto);
+    if (res.status === 401) return renderMgmtLogin(view, renderWorkflowsInto);
     if (res.status === 403) return renderMgmtRejected(view);
     if (res.status === 503) return renderMgmtUnavailable(view);
     let body;
     try { body = await res.json(); } catch (e) { return renderMgmtUnavailable(view); }
     if (!res.ok || !body.ok || !body.result) return renderMgmtUnavailable(view);
-    renderStoreScreen(view, body.result);
+    renderWorkflowsScreen(view, body.result);
 }
 
-function renderStoreScreen(view, result) {
+function renderWorkflowsScreen(view, result) {
     view.innerHTML = "";
     const workflows = Array.isArray(result.workflows) ? result.workflows : [];
     const agents = Array.isArray(result.agents) ? result.agents : [];
-    const grid = el("div", { class: "store-grid" }, workflows.map((m) => {
-        const card = el("div", { class: "store-card", title: m.description || "" }, [
-            el("div", { class: "store-card-name" }, [
+    const grid = el("div", { class: "workflows-grid" }, workflows.map((m) => {
+        const card = el("div", { class: "workflows-card", title: m.description || "" }, [
+            el("div", { class: "workflows-card-name" }, [
                 m.name,
-                m.source === "byo" ? el("span", { class: "store-byo" }, ["byo"]) : null,
+                m.source === "byo" ? el("span", { class: "workflows-byo" }, ["byo"]) : null,
             ]),
-            el("div", { class: "store-card-desc" }, [m.description || ""]),
+            el("div", { class: "workflows-card-desc" }, [m.description || ""]),
         ]);
         card.onclick = () => mgmtCreateDialog(view, m, agents);
         return card;
     }));
-    view.appendChild(el("div", { class: "store-screen" }, [
-        el("h2", { class: "store-title" }, ["Workflow store"]),
-        el("div", { class: "hint store-sub" }, ["Pick a workflow to create a project."]),
+    view.appendChild(el("div", { class: "workflows-screen" }, [
+        el("h2", { class: "workflows-title" }, ["Workflows"]),
+        el("div", { class: "hint workflows-sub" }, ["Pick a workflow to create a project."]),
         grid,
     ]));
 }
