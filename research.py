@@ -1885,7 +1885,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--workflow", default=None,
                    help="workflow to launch (default: research). See "
                         "`research workflow list` for the catalog; e.g. "
-                        "'box-host' (agent-less DIND box host), 'empty' (a single "
+                        "'box-host' (agent-less DIND box host), 'sandbox' (a single "
                         "confined docker container).")
     c.add_argument("--data", metavar="PATHS",
                    help="comma-separated host paths, each mounted RO at "
