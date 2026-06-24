@@ -2,8 +2,9 @@ FROM continuumio/miniconda3:latest
 
 # rs-minimal-base — the no-DIND shared substrate (WORKFLOW_TAXONOMY_S1.md image
 # carve). Holds everything common to a project container EXCEPT the
-# docker-in-docker stack: sshd, byobu, the `research` user, conda, and
-# code-server (the Editor tab). Two things FROM it:
+# docker-in-docker stack: sshd, byobu, the `research` user, and conda. The editor
+# (code-server) is NO LONGER baked — it is a host-cached dist cp'd in at boot
+# (STAGE_EDITOR_DIST). Two things FROM it:
 #
 #   rs-substrate-base = rs-minimal-base + the sysbox-DIND delta (docker-ce +
 #                       crun + daemon.json + the `docker` group) — and ITS two
@@ -58,69 +59,12 @@ RUN useradd -m -s /bin/bash -G sudo -u 1000 research && \
 # Initialize conda hooks in the research user's shell.
 RUN su - research -c "/opt/conda/bin/conda init bash"
 
-# --- code-server (browser IDE; the Editor tab, shared by every leaf) --------
-#
-# Pinned via ARG, mirroring DOCKER_VERSION discipline. Bumps are deliberate:
-# update the version, `research start --rebuild`, recreate affected projects.
-ARG CODE_SERVER_VERSION=4.123.0
-RUN curl -fsSL https://code-server.dev/install.sh \
-      | sh -s -- --version "${CODE_SERVER_VERSION}"
-
-# Strip built-in extensions per PLAN/STAGE_WEBUI_W2_code_server.md Tier 2:
-# keep grammar/syntax + themes + markdown + notebook viewers; drop heavy
-# language-server features, git stack, JS build/debug tooling.
-RUN set -eux; \
-    EXT_DIR=$(find /usr/lib/code-server -maxdepth 5 -type d -name extensions \
-                | head -n 1); \
-    [ -d "$EXT_DIR" ] || (echo "code-server extensions dir not found" && exit 1); \
-    cd "$EXT_DIR"; \
-    for ext in \
-        typescript-language-features \
-        html-language-features \
-        css-language-features \
-        json-language-features \
-        php-language-features \
-        git \
-        git-base \
-        github \
-        github-authentication \
-        microsoft-authentication \
-        merge-conflict \
-        npm \
-        grunt \
-        gulp \
-        jake \
-        node-debug \
-        node-debug2 \
-        debug-auto-launch \
-        debug-server-ready \
-        references-view \
-        extension-editing \
-        simple-browser \
-    ; do \
-        rm -rf "$ext" || true; \
-    done
-
-# Pre-stage Microsoft-marketplace-only extensions (.vsix) for first-boot
-# install. Vendored here because the runtime never touches MS marketplace.
-ARG DATA_WRANGLER_VERSION=1.24.2
-RUN mkdir -p /opt/code-server-templates/extensions \
- && curl -fsSL --compressed \
-        -o /opt/code-server-templates/extensions/datawrangler.vsix \
-        "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-toolsai/vsextensions/datawrangler/${DATA_WRANGLER_VERSION}/vspackage"
-
-# Pre-baked code-server user settings (staged onto the workspace on first boot
-# by each entrypoint if absent).
-RUN mkdir -p /opt/code-server-templates/User
-COPY container/supervisor/code-server-settings.json \
-     /opt/code-server-templates/User/settings.json
-
-# Lazy-start TCP proxy for code-server (the slim-RAM strategy: spawn on first
-# connect, reap after idle). Used by every leaf's entrypoint.
-RUN mkdir -p /opt/code-server-tools
-COPY container/supervisor/code-server-stub.py \
-     /opt/code-server-tools/code-server-stub.py
-RUN chmod +x /opt/code-server-tools/code-server-stub.py
+# code-server (the Editor tab) is NO LONGER baked here (STAGE_EDITOR_DIST slice
+# 2). It is a host-cached, version-pinned dist (built by `research editor pull`)
+# cp'd into each interactive container's own ~/.local at boot by the editor dist
+# block in every leaf's entrypoint — the same no-bake model as the agent dist.
+# The CODE_SERVER_VERSION / DATA_WRANGLER_VERSION pins live in versions.env and
+# are consumed only by the dist builder now.
 
 # Minimal byobu status line. Staged into the research user's home so each
 # leaf's first-boot skel snapshot (cp -a /home/research /etc/research-skel,

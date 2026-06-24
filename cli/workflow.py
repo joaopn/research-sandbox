@@ -46,6 +46,14 @@ SUBSTRATES = ("docker", "dind-sysbox")
 TAB_KINDS = ("http", "ssh")
 EXPORT_TRANSPORTS = ("http", "sse")
 
+# Per-flavor service defaults (STAGE_EDITOR_DIST slice 2): a manifest may declare
+# `services: {<id>: <bool>}` to override the create-time default for a service —
+# e.g. the `sandbox` workflow sets {"code-server": false} for a lean box. Mirror
+# rscore.KNOWN_SERVICES / ALWAYS_ON_SERVICES (kept here as bare strings to keep
+# this module stdlib-light + independently importable; lockstep with rscore).
+SERVICE_IDS = ("supervisor", "code-server")
+ALWAYS_ON_SERVICE_IDS = ("supervisor",)
+
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 # A surfacing path (tab path, proxy mount): absolute, no '..' segments — the
 # same traversal guard pi_isolated_registry uses for container mount paths.
@@ -54,7 +62,7 @@ PATH_RE = re.compile(r"^/[A-Za-z0-9/_.-]*$")
 PORT_MIN, PORT_MAX = 1, 65535
 
 _ALLOWED_KEYS = {"name", "substrate", "image_overlay", "repo", "ref", "setup",
-                 "tabs", "mcp_exports", "resources", "description"}
+                 "tabs", "mcp_exports", "resources", "services", "description"}
 _TAB_KEYS = {"name", "port", "kind", "path"}
 _EXPORT_KEYS = {"name", "port", "transport"}
 _RESOURCE_KEYS = {"memory", "cpus"}
@@ -140,6 +148,22 @@ def _validate_resources(name: str, res: Any) -> list[str]:
     return out
 
 
+def _validate_services(name: str, services: Any) -> list[str]:
+    """A `services` override map: {<known service id>: <bool>}. Unknown ids and
+    always-on services (which rscore forces True regardless) are config errors."""
+    if not isinstance(services, dict):
+        return [f"{name!r}: 'services' must be an object"]
+    out: list[str] = []
+    for k, v in services.items():
+        if k not in SERVICE_IDS:
+            out.append(f"{name!r}: services unknown id {k!r} (known: {SERVICE_IDS})")
+        elif k in ALWAYS_ON_SERVICE_IDS:
+            out.append(f"{name!r}: services cannot set always-on service {k!r}")
+        if not isinstance(v, bool):
+            out.append(f"{name!r}: services.{k} must be a boolean, got {v!r}")
+    return out
+
+
 def _validate_entry(name: Any, m: Any) -> list[str]:
     """Validate one normalized (name-bearing) manifest dict."""
     if not isinstance(m, dict):
@@ -181,6 +205,8 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
         out += _validate_mcp_exports(nm if isinstance(nm, str) else str(name), m["mcp_exports"])
     if "resources" in m:
         out += _validate_resources(nm if isinstance(nm, str) else str(name), m["resources"])
+    if "services" in m:
+        out += _validate_services(nm if isinstance(nm, str) else str(name), m["services"])
 
     if "description" in m and not _is_str(m["description"]):
         out.append(p("description must be a non-empty string"))

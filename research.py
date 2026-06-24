@@ -136,6 +136,12 @@ def cmd_start(args: argparse.Namespace) -> None:
         print(f"pulling {rscore.DEFAULT_AGENT} agent dist (first run)...")
         info = rscore.agent_pull(rscore.DEFAULT_AGENT)
         print(f"pulled {info['agent']} {info['version']}")
+    # Same model for the editor dist (no bake; STAGE_EDITOR_DIST slice 2) so the
+    # create-time editor floor is satisfied in the common path. PULL-ONLY-IF-ABSENT.
+    if not rscore.editor_dist_present():
+        print("pulling code-server editor dist (first run)...")
+        einfo = rscore.editor_pull()
+        print(f"pulled code-server {einfo['code_server_version']}")
     print("starting router...")
     compose_up = ["docker", "compose", "-f", str(SCRIPT_DIR / "docker-compose.yml"),
                   "up", "-d"]

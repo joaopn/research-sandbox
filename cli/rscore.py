@@ -346,6 +346,12 @@ class CreateRequest:
     # ~/.local launcher per enabled agent. In-box field (selects software run
     # *inside* the box, not host-shaped); () = clean box, no agent.
     agents: tuple[str, ...] = ()
+    # Per-flavor service defaults from the workflow manifest's `services` field
+    # (STAGE_EDITOR_DIST slice 2): e.g. the `sandbox` workflow declares
+    # {"code-server": false} so a bare box is lean. DERIVED in from_kwargs from the
+    # resolved manifest (like type/substrate) — never a user/broker input, so it
+    # stays out of CREATE_WEBUI_FIELDS. Mutable default ⇒ default_factory.
+    service_defaults: dict[str, bool] = field(default_factory=dict)
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "CreateRequest":
@@ -356,6 +362,10 @@ class CreateRequest:
         # validation choke point, so create() consumes the same fields as before.
         workflow_id = kw.get("workflow") or DEFAULT_WORKFLOW
         manifest, project_type, substrate = _resolve_workflow(workflow_id)
+        # Per-flavor service defaults from the manifest (STAGE_EDITOR_DIST slice 2;
+        # validated at catalog-load time): research/box-host omit `services` ⇒ {}
+        # ⇒ editor on; `sandbox` declares {"code-server": false} ⇒ lean box.
+        service_defaults = dict(manifest.get("services") or {})
         # Effective light-path payload: manifest PRESET ⊕ explicit input, explicit
         # wins per field (the store-template-auto-fills-the-create-fields model).
         # The PAT is explicit-only — never in an operator-curated manifest.
@@ -397,6 +407,22 @@ class CreateRequest:
             raise ValidationError(
                 f"no cached {DEFAULT_AGENT} dist — run `research agent pull` first "
                 f"(or `research start`, which auto-pulls)")
+        # Editor floor (STAGE_EDITOR_DIST slice 2 — PI chose fail-fast): a dind
+        # project whose editor will be ENABLED needs a pulled editor dist (no bake
+        # anymore), so you never get a supervisor with a missing Editor tab.
+        # Flag-aware (NOT raw substrate): a `--disable code-server` project
+        # deliberately has no tab, so it must not be blocked. Resolve the effective
+        # flag through the SAME function + manifest base that create() uses at the
+        # service_flags call, so the floor and that flag can't disagree by
+        # construction. `research start` auto-pulls if absent, so this rarely trips.
+        svc_en = _split_enable_tokens(",".join(_as_tuple(kw.get("enable"))))[0]
+        svc_dis = _split_disable_tokens(",".join(_as_tuple(kw.get("disable"))))[0]
+        editor_on = _compute_service_flags(
+            svc_en, svc_dis, base=(service_defaults or None)).get("code-server", True)
+        if substrate is Substrate.DIND_SYSBOX and editor_on and not editor_dist_present():
+            raise ValidationError(
+                "no cached editor dist — run `research editor pull` first "
+                "(or `research start`, which auto-pulls)")
         return cls(
             name=_require_name(kw.get("name")),
             workflow=workflow_id,
@@ -418,6 +444,7 @@ class CreateRequest:
             mcp=kw.get("mcp") if kw.get("mcp") is not None else "all-enabled",
             repo=repo, ref=ref, setup=setup, github_pat=github_pat,
             agents=agents,
+            service_defaults=service_defaults,
         )
 
 
@@ -773,7 +800,10 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
                 role_mcp.validate_role(role)
             except ValueError as e:
                 die(str(e))
-    service_flags = _compute_service_flags(enable_services, disable_services)
+    # base = per-flavor manifest defaults (STAGE_EDITOR_DIST slice 2): the sandbox
+    # workflow declares code-server off so a bare box is lean; --enable flips it on.
+    service_flags = _compute_service_flags(
+        enable_services, disable_services, base=(req.service_defaults or None))
     docker_args = build_supervisor_docker_args(
         container_name=container_name,
         project=project,
@@ -805,6 +835,16 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         for a in deployed_agents:
             agent_args += ["-v", f"{agent_dist_path(a)}:/opt/agent-dist/{a}:ro"]
         docker_args = docker_args[:-1] + agent_args + [docker_args[-1]]
+    # Editor dist for the docker box (STAGE_EDITOR_DIST slice 2): a single runc box
+    # has no inner dockerd to stage into, so it RO-mounts the HOST editor cache
+    # directly (source = EDITOR_DIST_DIR, NOT the supervisor-side EDITOR_DIST_MOUNT).
+    # Flag-gated like the agent mount above — a default-off sandbox mounts nothing
+    # (lean); --enable code-server + a pulled dist wires it, and the entrypoint
+    # dist block cp's it into the box's own ~/.local at first boot.
+    if is_docker and service_flags.get("code-server") and editor_dist_present():
+        docker_args = (docker_args[:-1]
+                       + ["-v", f"{EDITOR_DIST_DIR}:{EDITOR_DIST_MOUNT}:ro"]
+                       + [docker_args[-1]])
     if not is_docker:
         ext_mounts = _sandbox_external_mounts(project)
         if ext_mounts:
@@ -844,10 +884,12 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             _stage_agent_dist(container_name, deploy_local=False)
             # Editor dist (STAGE_EDITOR_DIST): same ordering rationale as the agent
             # dist — staged before the sandbox enable cone so interactive boxes can
-            # RO-mount /opt/editor-dist. If-present (a sandbox project can exist
-            # without the editor pulled); never required at create.
+            # RO-mount /opt/editor-dist. deploy_local = the management supervisor's
+            # OWN editor (no bake now); gated on the resolved code-server flag (the
+            # box-host editor defaults ON, so this is True unless --disable).
             if editor_dist_present():
-                _stage_editor_dist(container_name)
+                _stage_editor_dist(container_name,
+                                   deploy_local=service_flags.get("code-server", True))
         else:
             stage_worker_image(container_name, ANALYSIS_IMAGE)
             # Stage the agent dist into the supervisor (its own ~/.local + the
@@ -858,12 +900,14 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             # boot claude-less (failing only on first send_job) if staged after.
             _stage_agent_dist(container_name)
             # Editor dist (STAGE_EDITOR_DIST): staged before the enable cone too so
-            # interactive PI containers RO-mount a populated /opt/editor-dist. The
-            # supervisor keeps its baked editor in slice 1 (no deploy_local). The
-            # editor is optional (only deployed where RS_SERVICE_CODE_SERVER is on),
-            # so stage if-present; never required at create.
+            # interactive PI containers RO-mount a populated /opt/editor-dist.
+            # deploy_local brings up the supervisor's OWN editor from the dist (no
+            # bake now), gated on the resolved code-server flag so a
+            # --disable code-server project deploys nothing. The create-time floor
+            # already guaranteed a dist is present when the editor is enabled.
             if editor_dist_present():
-                _stage_editor_dist(container_name)
+                _stage_editor_dist(container_name,
+                                   deploy_local=service_flags.get("code-server", True))
 
         # 6b/6c. The MCP proxy/reload/auto-allow cone is supervisor-only.
         #        rs-management ships no mcp-proxy and no /usr/local/bin/mcp-reload
@@ -1744,12 +1788,17 @@ def build_supervisor_docker_args(
         args += ["-e", "RS_INNER_FIREWALL=1"]
     # Per-service flags: webui reads the labels (outside-the-container truth);
     # entrypoint reads the env vars (inside-the-container truth). Both must
-    # land on the same container in lockstep.
+    # land on the same container in lockstep. The env var name normalizes '-' to
+    # '_' (`code-server` → RS_SERVICE_CODE_SERVER): a hyphen is shell-unreadable
+    # (`${RS_SERVICE_CODE-SERVER}` parses as `$RS_SERVICE_CODE` minus `SERVICE`),
+    # and every reader (the entrypoints, rs_sandbox's os.environ lookup) uses the
+    # underscore form. The LABEL keeps the canonical hyphenated id.
     flags = service_flags if service_flags is not None else {sid: True for sid in KNOWN_SERVICES}
     for sid in sorted(flags):
         ena = "enabled" if flags[sid] else "disabled"
+        env_name = "RS_SERVICE_" + sid.upper().replace("-", "_")
         args += ["--label", f"{SERVICE_LABEL_PREFIX}{sid}={ena}"]
-        args += ["-e", f"RS_SERVICE_{sid.upper()}={ena}"]
+        args += ["-e", f"{env_name}={ena}"]
     # code-server lazy-reap idle window. Optional — entrypoint defaults to
     # 1800s (30 min) when unset; .env can override per-host. Survives
     # _recreate_supervisor by being re-passed from the host's env on every
@@ -2319,16 +2368,26 @@ def editor_apply_refresh(cs_version: str) -> None:
     _editor_build_dist(cs_version, dw)
 
 
-def _stage_editor_dist(supervisor: str) -> None:
+def _stage_editor_dist(supervisor: str, *, deploy_local: bool = False) -> None:
     """Stage the host editor dist into a RUNNING supervisor (STAGE_EDITOR_DIST).
     Real files at EDITOR_DIST_MOUNT — interactive inner containers (PI roles,
     sandbox boxes) RO-mount that path and cp their own writable copy at boot.
     Mirrors `_stage_agent_dist`'s uid-0 tar-stream (the sysbox-uid-shift +
     docker-cp-nesting dragons; see that helper) but stages the FLAT editor tree
-    (.local/ + tools/ + templates/), and NEVER deploys into the supervisor's own
-    ~/.local — in slice 1 the supervisor keeps its baked editor (so there is no
-    `deploy_local`); staging exists only to feed the inner-container mount. The
-    supervisor's own dist-cp + bake deletion is slice 2."""
+    (.local/ + tools/ + templates/).
+
+    `deploy_local` ALSO deploys the editor into the supervisor's OWN ~/.local and
+    launches its stub (slice 2 — the minimal-lineage bake is gone, so the
+    supervisor/management editor must come from the dist). The supervisor
+    entrypoint runs at container-START, BEFORE this post-start staging, so its
+    dist block saw an empty /opt/editor-dist and no-op'd — this exec is what
+    actually brings the supervisor's/management's own editor up (mirrors
+    `_stage_agent_dist`'s deploy_local). The caller passes the RESOLVED code-server
+    flag (NOT an unconditional True): the deploy script does not re-check
+    RS_SERVICE_CODE_SERVER, so a `--disable code-server` supervisor must not cp the
+    binary or launch the stub. Note this is the OPPOSITE of the agent's
+    deploy_local=False for box-host — the editor IS on for management (its flag
+    defaults on), so its create site passes True."""
     src = EDITOR_DIST_DIR
     if not editor_dist_present():
         die("no cached editor dist to stage — run `research editor pull` first")
@@ -2354,6 +2413,15 @@ def _stage_editor_dist(supervisor: str) -> None:
         detail = (err.decode(errors="replace") if err else "").strip()
         die(f"staging editor dist into {supervisor} failed: "
             f"{detail or 'tar extract returned non-zero'}")
+    if deploy_local:
+        # Deploy + launch via the shared dist script (single source of truth for
+        # the deploy logic — the same script the interactive leaves' entrypoints
+        # run). Runs as the research user (the supervisor/management container
+        # default USER, uid 1000) with HOME pinned absolute to /home/research (the
+        # cross-boundary-path rule) so the script's $HOME-based cp lands there. The
+        # nohup'd stub reparents under tini when this exec session closes.
+        run_check(["docker", "exec", "-e", "HOME=/home/research", supervisor,
+                   "bash", f"{EDITOR_DIST_MOUNT}/tools/code-server-deploy.sh"])
 
 
 def _build_images(force: bool) -> None:
@@ -2528,8 +2596,10 @@ _SUPERVISOR_FILE_MAP: list[tuple[str, str, bool]] = [
     ("container/supervisor/setup.sh",                   "/opt/claude-templates/setup.sh",                    True),
     ("container/supervisor/logbook_supervisor_template.md", "/opt/claude-templates/logbook_supervisor_template.md", False),
     ("container/supervisor/logbook_pi_template.md",     "/opt/claude-templates/logbook_pi_template.md",      False),
-    ("container/supervisor/code-server-stub.py",        "/opt/code-server-tools/code-server-stub.py",        True),
-    ("container/supervisor/code-server-settings.json",  "/opt/code-server-templates/User/settings.json",     False),
+    # NOTE: code-server stub/settings are NOT file-copied — slice 2 deleted them
+    # from the image; the editor now lives in the host dist (code-server-deploy.sh
+    # reads them from /opt/editor-dist), and its update path is `research editor
+    # refresh/pull` + recreate (re-stages the dist), never a file-only cp.
     ("container/analysis/CLAUDE.md.template",           "/opt/claude-templates/worker.CLAUDE.md.template",   False),
     ("agent/entrypoint.supervisor.sh",                  "/entrypoint.sh",                                    True),
 ]
@@ -2817,8 +2887,11 @@ def _recreate_supervisor(
         stage_worker_image(container, SANDBOX_BOX_BROWSER_IMAGE, force=force_restage)
         # Box-host: re-stage the dist for the boxes (deploy_local=False).
         _stage_agent_dist(container, deploy_local=False)
+        # Editor re-deploys into the management supervisor's OWN ~/.local (no bake
+        # now), gated on its resolved code-server flag.
         if editor_dist_present():
-            _stage_editor_dist(container)
+            _stage_editor_dist(container,
+                               deploy_local=flags.get("code-server", True))
     else:
         stage_worker_image(container, ANALYSIS_IMAGE, force=force_restage)
         # Re-stage the agent dist into the fresh container (its own ~/.local + the
@@ -2827,8 +2900,11 @@ def _recreate_supervisor(
         _stage_agent_dist(container)
         # Editor dist re-staged the same way (STAGE_EDITOR_DIST) so a recreated
         # supervisor's interactive PI/sandbox containers find a populated mount.
+        # deploy_local re-deploys the supervisor's OWN editor (no bake now), gated
+        # on its resolved code-server flag.
         if editor_dist_present():
-            _stage_editor_dist(container)
+            _stage_editor_dist(container,
+                               deploy_local=flags.get("code-server", True))
     stage_worker_image(container, MCP_PROXY_IMAGE, force=force_restage)
 
     run(["docker", "exec", container, "/usr/local/bin/mcp-reload"],

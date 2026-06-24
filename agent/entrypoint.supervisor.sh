@@ -191,80 +191,15 @@ if [[ -f /opt/claude-templates/setup.sh ]]; then
     source /opt/claude-templates/setup.sh
 fi
 
-# --- code-server (lazy-start via stub) -------------------------------------
-# Only runs if RS_SERVICE_CODE_SERVER=enabled (default at create time;
-# `research project create|update --disable code-server` flips this to
-# disabled in lockstep with the matching label). The stub itself is
-# lightweight (~15 MB Python); code-server only spawns when the editor
-# tab is actually opened in the webui.
-if [[ "${RS_SERVICE_CODE_SERVER:-enabled}" == "enabled" ]]; then
-    # Entrypoint runs as `research` (USER directive); /workspace is
-    # research-owned by the time we get here (the chown earlier in this
-    # script handled that). No sudo needed for mkdir/cp/code-server below.
-    CS_USER_DIR=/workspace/.local/share/code-server
-    CS_EXT_DIR="${CS_USER_DIR}/extensions"
-    mkdir -p "${CS_USER_DIR}/User" "${CS_EXT_DIR}"
-
-    # Pre-baked settings.json: stage if absent. Don't overwrite — PI
-    # customisations under /workspace/.local/share/.../User/settings.json
-    # win on subsequent boots. Deliberately omitted from
-    # _refresh_workspace_claude_templates: that function force-overwrites,
-    # which is correct for CLAUDE.md / slash commands but wrong for a
-    # user-customisable settings file. To pick up a newer template after
-    # an image bump, manually `rm` the stale settings.json and reboot.
-    if [[ ! -f "${CS_USER_DIR}/User/settings.json" ]] && \
-       [[ -f /opt/code-server-templates/User/settings.json ]]; then
-        cp /opt/code-server-templates/User/settings.json \
-           "${CS_USER_DIR}/User/settings.json"
-    fi
-
-    # Install pre-staged .vsix files (Microsoft-marketplace-only extensions
-    # like Data Wrangler that aren't on Open VSX) once per workspace.
-    # Idempotent: if any directory matching <ext-id>-* already exists,
-    # skip — bumping a version requires removing the old dir manually.
-    if [[ -d /opt/code-server-templates/extensions ]]; then
-        for vsix in /opt/code-server-templates/extensions/*.vsix; do
-            [[ -f "$vsix" ]] || continue
-            base=$(basename "$vsix" .vsix)
-            # Most .vsix unpacks to <publisher>.<name>-<version>; skip if
-            # any matching dir is present. Glob may not expand cleanly when
-            # there are no matches — bash's nullglob protects us.
-            shopt -s nullglob
-            existing=( "${CS_EXT_DIR}/"*"${base}"* )
-            shopt -u nullglob
-            if (( ${#existing[@]} > 0 )); then
-                continue
-            fi
-            echo "installing code-server extension: ${base}"
-            code-server \
-                --install-extension "$vsix" \
-                --extensions-dir "${CS_EXT_DIR}" \
-                --user-data-dir "${CS_USER_DIR}" \
-                || echo "WARNING: failed to install ${base}" >&2
-        done
-    fi
-
-    # Launch the stub. The reap interval (CODE_SERVER_IDLE_SECONDS) lives
-    # in the supervisor's env and is set by `research project create` from
-    # the host .env (defaulting to 1800s = 30 min if unset).
-    : "${CODE_SERVER_STUB_PORT:=8443}"
-    : "${CODE_SERVER_UPSTREAM_PORT:=8444}"
-    : "${CODE_SERVER_IDLE_SECONDS:=1800}"
-    export CODE_SERVER_STUB_PORT CODE_SERVER_UPSTREAM_PORT \
-           CODE_SERVER_IDLE_SECONDS
-    nohup /opt/code-server-tools/code-server-stub.py \
-        > /tmp/code-server-stub.log 2>&1 &
-    echo "code-server stub launched on :${CODE_SERVER_STUB_PORT}; "\
-"upstream :${CODE_SERVER_UPSTREAM_PORT}; idle reap ${CODE_SERVER_IDLE_SECONDS}s"
-fi
-
-# --- code-server editor (dist) — STAGE_EDITOR_DIST. NO-OP in slice 1: the system
-#     bake above is present (! -e /usr/bin/code-server is false) so this is skipped
-#     and the baked block serves the editor. Present to pre-stage slice 2's flip:
-#     slice 2 deletes BOTH the Dockerfile bake AND the baked launch block above (or
-#     the orphaned block would try to run the now-deleted /opt/code-server-tools
-#     stub), after which this dist block activates — the same shared dist deploy
-#     script the interactive leaves use. Guard is the populated-mount check.
+# --- code-server editor (dist) — STAGE_EDITOR_DIST. The minimal-lineage bake is
+#     gone (slice 2); the editor is a host-cached dist. For the SUPERVISOR this
+#     block is effectively a no-op at first boot: the entrypoint runs at
+#     container-start, BEFORE the post-start `_stage_editor_dist`, so
+#     /opt/editor-dist is empty here. The supervisor's OWN editor is brought up by
+#     that staging's deploy_local (a post-start `docker exec` of this same deploy
+#     script). The block stays for parity with the interactive leaves and to cover
+#     a boot where the mount is already populated. Coexistence + populated-mount
+#     guards keep it safe (no system bake exists now → the `! -e` guard passes).
 if [[ "${RS_SERVICE_CODE_SERVER:-enabled}" == "enabled" ]] \
    && [[ -e /opt/editor-dist/.local/bin/code-server ]] \
    && [[ ! -e /usr/bin/code-server ]]; then

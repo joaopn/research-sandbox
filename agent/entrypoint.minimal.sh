@@ -69,58 +69,15 @@ if [[ -n "${SSH_PASSWORD:-}" ]]; then
 fi
 sudo /usr/sbin/sshd
 
-# --- code-server (lazy-start via stub) — the Editor tab. Same stub every
-#     substrate uses (all from rs-minimal-base). ---
-if [[ "${RS_SERVICE_CODE_SERVER:-enabled}" == "enabled" ]]; then
-    CS_USER_DIR=/workspace/.local/share/code-server
-    CS_EXT_DIR="${CS_USER_DIR}/extensions"
-    mkdir -p "${CS_USER_DIR}/User" "${CS_EXT_DIR}"
-
-    if [[ ! -f "${CS_USER_DIR}/User/settings.json" ]] && \
-       [[ -f /opt/code-server-templates/User/settings.json ]]; then
-        cp /opt/code-server-templates/User/settings.json \
-           "${CS_USER_DIR}/User/settings.json"
-    fi
-
-    if [[ -d /opt/code-server-templates/extensions ]]; then
-        for vsix in /opt/code-server-templates/extensions/*.vsix; do
-            [[ -f "$vsix" ]] || continue
-            base=$(basename "$vsix" .vsix)
-            shopt -s nullglob
-            existing=( "${CS_EXT_DIR}/"*"${base}"* )
-            shopt -u nullglob
-            if (( ${#existing[@]} > 0 )); then
-                continue
-            fi
-            echo "installing code-server extension: ${base}"
-            code-server \
-                --install-extension "$vsix" \
-                --extensions-dir "${CS_EXT_DIR}" \
-                --user-data-dir "${CS_USER_DIR}" \
-                || echo "WARNING: failed to install ${base}" >&2
-        done
-    fi
-
-    : "${CODE_SERVER_STUB_PORT:=8443}"
-    : "${CODE_SERVER_UPSTREAM_PORT:=8444}"
-    : "${CODE_SERVER_IDLE_SECONDS:=1800}"
-    export CODE_SERVER_STUB_PORT CODE_SERVER_UPSTREAM_PORT \
-           CODE_SERVER_IDLE_SECONDS
-    nohup /opt/code-server-tools/code-server-stub.py \
-        > /tmp/code-server-stub.log 2>&1 &
-    echo "code-server stub launched on :${CODE_SERVER_STUB_PORT}; "\
-"upstream :${CODE_SERVER_UPSTREAM_PORT}; idle reap ${CODE_SERVER_IDLE_SECONDS}s"
-fi
-
-# --- code-server editor (dist) — STAGE_EDITOR_DIST. NO-OP in slice 1: the system
-#     bake above is present (! -e /usr/bin/code-server is false) so this is skipped
-#     and the baked block serves the editor. Present to pre-stage slice 2's flip:
-#     slice 2 deletes BOTH the Dockerfile bake AND the baked launch block above (or
-#     the orphaned block would try to run the now-deleted /opt/code-server-tools
-#     stub), after which this dist block activates — the same shared dist deploy
-#     script the interactive leaves use. The docker box stages no /opt/editor-dist,
-#     so the populated-mount guard double-skips it there.
-if [[ "${RS_SERVICE_CODE_SERVER:-enabled}" == "enabled" ]] \
+# --- code-server editor (dist) — STAGE_EDITOR_DIST. The bake is gone (slice 2);
+#     the editor is a host-cached dist. For the docker box this block is the ACTIVE
+#     deploy: when this project enabled the editor, create() RO-mounts the host
+#     editor cache at /opt/editor-dist (a populated mount), and this cp's it into
+#     the box's own ~/.local + launches the stub. The box defaults editor-OFF (the
+#     `sandbox` workflow declares code-server off), so by default RS_SERVICE is
+#     disabled AND no mount is present → double no-op (lean box); `--enable
+#     code-server` flips both on. Coexistence + populated-mount guards.
+if [[ "${RS_SERVICE_CODE_SERVER:-disabled}" == "enabled" ]] \
    && [[ -e /opt/editor-dist/.local/bin/code-server ]] \
    && [[ ! -e /usr/bin/code-server ]]; then
     bash /opt/editor-dist/tools/code-server-deploy.sh || true
