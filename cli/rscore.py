@@ -842,6 +842,12 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             # supervisor never runs claude itself) so its rs-sandbox-box boxes
             # (FROM rs-analysis-base, no bake) can cp claude at boot.
             _stage_agent_dist(container_name, deploy_local=False)
+            # Editor dist (STAGE_EDITOR_DIST): same ordering rationale as the agent
+            # dist — staged before the sandbox enable cone so interactive boxes can
+            # RO-mount /opt/editor-dist. If-present (a sandbox project can exist
+            # without the editor pulled); never required at create.
+            if editor_dist_present():
+                _stage_editor_dist(container_name)
         else:
             stage_worker_image(container_name, ANALYSIS_IMAGE)
             # Stage the agent dist into the supervisor (its own ~/.local + the
@@ -851,6 +857,13 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             # PI container brought up by that cone mounts /opt/agent-dist and would
             # boot claude-less (failing only on first send_job) if staged after.
             _stage_agent_dist(container_name)
+            # Editor dist (STAGE_EDITOR_DIST): staged before the enable cone too so
+            # interactive PI containers RO-mount a populated /opt/editor-dist. The
+            # supervisor keeps its baked editor in slice 1 (no deploy_local). The
+            # editor is optional (only deployed where RS_SERVICE_CODE_SERVER is on),
+            # so stage if-present; never required at create.
+            if editor_dist_present():
+                _stage_editor_dist(container_name)
 
         # 6b/6c. The MCP proxy/reload/auto-allow cone is supervisor-only.
         #        rs-management ships no mcp-proxy and no /usr/local/bin/mcp-reload
@@ -1862,6 +1875,47 @@ _AGENT_BUILD_ATTEMPTS = 3
 _AGENT_ERR_TAIL = 2000
 
 
+# ---------------------------------------------------------------------------
+# Editor dist — host-cached, version-pinned code-server copied into an
+# INTERACTIVE container at boot (STAGE_EDITOR_DIST slice 1). The PI/worker
+# lineage (rs-pi-base / rs-pi-isolated / rs-sandbox-box) has NO baked editor;
+# this delivers it the same way the agent dist delivers claude. The minimal
+# lineage keeps its bake in slice 1 (the coexistence guard skips the dist cp
+# there); slice 2 deletes the bake and flips it to the dist.
+# ---------------------------------------------------------------------------
+
+EDITOR_DIST_DIR = Path.home() / ".research-sandbox" / "editor-dist"
+# Staged (supervisor: real files) / RO-mounted (interactive inner containers).
+EDITOR_DIST_MOUNT = "/opt/editor-dist"
+EDITOR_DIST_MOUNT_ARGS = ["-v", f"{EDITOR_DIST_MOUNT}:{EDITOR_DIST_MOUNT}:ro"]
+_CODE_SERVER_BIN = "code-server"
+_CODE_SERVER_VERSION_KEY = "CODE_SERVER_VERSION"
+_DATA_WRANGLER_VERSION_KEY = "DATA_WRANGLER_VERSION"
+
+# Tier-2 extension prune — MUST mirror agent/Dockerfile.minimal-base's strip list
+# until slice 2 deletes the bake (the dist and the bake should ship the same
+# editor). Keep grammar/themes/markdown/notebook; drop heavy language-servers,
+# the git stack, and JS build/debug tooling.
+_CODE_SERVER_STRIP_EXTS = (
+    "typescript-language-features", "html-language-features",
+    "css-language-features", "json-language-features", "php-language-features",
+    "git", "git-base", "github", "github-authentication",
+    "microsoft-authentication", "merge-conflict", "npm", "grunt", "gulp",
+    "jake", "node-debug", "node-debug2", "debug-auto-launch",
+    "debug-server-ready", "references-view", "extension-editing",
+    "simple-browser",
+)
+# Datawrangler .vsix (MS-marketplace-only) — downloaded fresh in-container at
+# build so the dist is self-contained (doesn't depend on the bake surviving
+# slice 2). Version from versions.env (DATA_WRANGLER_VERSION).
+_DATA_WRANGLER_VSIX_URL = (
+    "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/"
+    "ms-toolsai/vsextensions/datawrangler/{ver}/vspackage")
+# GitHub "latest" redirects to /releases/tag/v<ver>; reading the effective URL
+# resolves the upstream version with curl alone (no in-container JSON parse).
+_CODE_SERVER_LATEST_URL = "https://github.com/coder/code-server/releases/latest"
+
+
 def agent_dist_path(agent: str) -> Path:
     return AGENT_DIST_DIR / agent
 
@@ -2100,6 +2154,206 @@ def agent_list() -> list[dict]:
             except Exception:
                 out.append({"agent": agent, "version": "?", "pulled_at": "?"})
     return out
+
+
+# ---- editor dist (code-server) — the service twin of the agent dist --------
+
+def _editor_sidecar() -> Path:
+    return EDITOR_DIST_DIR.parent / "editor-dist.json"
+
+
+def editor_dist_present() -> bool:
+    """True iff a usable editor dist is cached. lexists, not exists: the launcher
+    is a relativized symlink that dangles on the host but resolves in a box."""
+    return os.path.lexists(EDITOR_DIST_DIR / ".local" / "bin" / _CODE_SERVER_BIN)
+
+
+def _editor_build_dist(cs_version: str, dw_version: str) -> None:
+    """Build the code-server editor dist IN a throwaway rs-minimal-base container
+    and swap it into the host cache (STAGE_EDITOR_DIST). Unlike the agent dist (a
+    bare ~/.local capture), the editor dist is a fixed tree:
+        .local/                              -- `--method standalone` install (Tier-2 stripped)
+        tools/code-server-stub.py            -- the lazy-start stub
+        templates/User/settings.json         -- code-server user settings
+        templates/extensions/datawrangler.vsix
+    The install + the .vsix download run in-container (network); the stub +
+    settings are repo files copied in host-side (so the build is self-contained
+    and survives slice 2's bake deletion). `--method standalone` (NOT the deb
+    method the bake uses — that lands in /usr/bin, leaving ~/.local empty) roots
+    the tree in ~/.local so it cp-deploys like the agent dist; the launcher is
+    relativized for cross-user portability (the spike proved it suffices)."""
+    for v in (cs_version, dw_version):
+        if not _AGENT_VERSION_RE.match(v):
+            die(f"refusing to build editor dist with suspicious version {v!r}")
+    if not run_quiet(["docker", "image", "inspect", MINIMAL_BASE_IMAGE]):
+        die(f"{MINIMAL_BASE_IMAGE} not found — run `research start --rebuild` first")
+    sup_dir = SCRIPT_DIR / "container" / "supervisor"
+    stub_src = sup_dir / "code-server-stub.py"
+    deploy_src = sup_dir / "code-server-deploy.sh"
+    settings_src = sup_dir / "code-server-settings.json"
+    for p in (stub_src, deploy_src, settings_src):
+        if not p.is_file():
+            die(f"editor dist build: missing repo file {p}")
+    EDITOR_DIST_DIR.parent.mkdir(parents=True, exist_ok=True)
+    tmp: Path | None = Path(tempfile.mkdtemp(dir=str(EDITOR_DIST_DIR.parent)))
+    try:
+        # Strip the Tier-2 extensions in the standalone install's extensions dir
+        # (|| true so a missing extension can't abort under set -e).
+        strip = " ".join(f'rm -rf "$EXT_DIR/{e}" || true;' for e in _CODE_SERVER_STRIP_EXTS)
+        vsix_url = _DATA_WRANGLER_VSIX_URL.format(ver=dw_version)
+        # set -e + pipefail (mirror _agent_build_dist) so a `curl | sh` failure or a
+        # missing extensions dir aborts with a NAMED error instead of silently
+        # producing an empty capture that fails opaquely after the retries.
+        inner = (
+            "set -e; set -o pipefail; "
+            "curl -fsSL https://code-server.dev/install.sh "
+            f"| sh -s -- --method standalone --version {cs_version}; "
+            f"test -x ~/.local/bin/{_CODE_SERVER_BIN}; "
+            'EXT_DIR="$(find ~/.local/lib -maxdepth 6 -type d -name extensions | head -n1)"; '
+            '[ -n "$EXT_DIR" ] || { echo "code-server extensions dir not found" >&2; exit 1; }; '
+            f"{strip} "
+            "cp -a ~/.local /out/.local; "
+            f"curl -fsSL --compressed -o /out/datawrangler.vsix {shlex.quote(vsix_url)}")
+        script = (f"set -e; set -o pipefail; su - research -c {shlex.quote(inner)}; "
+                  f"chown -R {os.getuid()}:{os.getgid()} /out")
+        captured_local = tmp / ".local"
+        vsix_tmp = tmp / "datawrangler.vsix"
+        built, last_err = False, ""
+        for _ in range(_AGENT_BUILD_ATTEMPTS):
+            r = run(["docker", "run", "--rm", "-v", f"{tmp}:/out",
+                     MINIMAL_BASE_IMAGE, "sh", "-lc", script], capture_output=True)
+            if (r.returncode == 0
+                    and os.path.lexists(captured_local / "bin" / _CODE_SERVER_BIN)
+                    and vsix_tmp.is_file()):
+                built = True
+                break
+            last_err = ((r.stderr or "") + (r.stdout or "")).strip()
+            shutil.rmtree(captured_local, ignore_errors=True)
+            vsix_tmp.unlink(missing_ok=True)
+        if not built:
+            die(f"editor dist build failed after {_AGENT_BUILD_ATTEMPTS} attempts:\n"
+                f"{last_err[-_AGENT_ERR_TAIL:] or 'no output'}")
+        # Assemble the rest of the tree host-side: the stub + settings are repo
+        # files; the .vsix moves out of the build-output root into templates/.
+        (tmp / "tools").mkdir()
+        for src in (stub_src, deploy_src):
+            dst = tmp / "tools" / src.name
+            shutil.copy2(src, dst)
+            os.chmod(dst, 0o755)   # entrypoint runs the stub + sources the deploy
+        (tmp / "templates" / "User").mkdir(parents=True)
+        shutil.copy2(settings_src, tmp / "templates" / "User" / "settings.json")
+        (tmp / "templates" / "extensions").mkdir(parents=True)
+        os.replace(vsix_tmp, tmp / "templates" / "extensions" / "datawrangler.vsix")
+        _relativize_launcher(captured_local / "bin" / _CODE_SERVER_BIN)
+        if EDITOR_DIST_DIR.exists():
+            shutil.rmtree(EDITOR_DIST_DIR)
+        os.replace(tmp, EDITOR_DIST_DIR)   # same fs (mkdtemp under the parent)
+        tmp = None                         # moved into place; skip the finally rmtree
+    finally:
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
+    _editor_sidecar().write_text(json.dumps(
+        {"code_server_version": cs_version, "data_wrangler_version": dw_version,
+         "pulled_at": datetime.datetime.now(datetime.timezone.utc).isoformat()},
+        indent=2) + "\n")
+
+
+def editor_pull(cs_version: str | None = None,
+                dw_version: str | None = None) -> dict:
+    """Pull the editor dist at (versions or the versions.env pins) into the cache."""
+    v = load_versions()
+    cs = cs_version or v.get(_CODE_SERVER_VERSION_KEY)
+    dw = dw_version or v.get(_DATA_WRANGLER_VERSION_KEY)
+    if not cs:
+        die(f"no pinned {_CODE_SERVER_VERSION_KEY} in versions.env")
+    if not dw:
+        die(f"no pinned {_DATA_WRANGLER_VERSION_KEY} in versions.env")
+    _editor_build_dist(cs, dw)
+    return {"code_server_version": cs, "data_wrangler_version": dw,
+            "path": str(EDITOR_DIST_DIR)}
+
+
+def editor_show() -> dict:
+    """The cached editor dist's sidecar, or {} if none pulled yet."""
+    if not editor_dist_present():
+        return {}
+    try:
+        return json.loads(_editor_sidecar().read_text())
+    except Exception:
+        return {"code_server_version": "?", "data_wrangler_version": "?"}
+
+
+def _editor_resolve_latest() -> str:
+    """LIGHT resolve of code-server's upstream `latest` → a concrete version (no
+    install). GitHub's /releases/latest redirects to /releases/tag/v<ver>; read
+    the effective URL with curl alone (no in-container JSON parse). Honors the
+    no-host-tool rule (curl runs in rs-minimal-base)."""
+    if not run_quiet(["docker", "image", "inspect", MINIMAL_BASE_IMAGE]):
+        die(f"{MINIMAL_BASE_IMAGE} not found — run `research start --rebuild` first")
+    r = run(["docker", "run", "--rm", MINIMAL_BASE_IMAGE, "sh", "-lc",
+             "curl -fsS -o /dev/null -w '%{url_effective}' "
+             + shlex.quote(_CODE_SERVER_LATEST_URL)], capture_output=True)
+    if r.returncode != 0:
+        die(f"could not resolve upstream code-server version: "
+            f"{(r.stderr or '').strip() or 'fetch failed'}")
+    eff = (r.stdout or "").strip()                 # …/releases/tag/v4.123.0
+    ver = eff.rsplit("/", 1)[-1].lstrip("v")
+    if not _AGENT_VERSION_RE.match(ver):
+        die(f"upstream returned an unexpected version string: {ver!r} (from {eff!r})")
+    return ver
+
+
+def editor_refresh_check() -> tuple[str, str]:
+    """Side-effect-free: (current CODE_SERVER_VERSION pin, upstream latest)."""
+    current = load_versions().get(_CODE_SERVER_VERSION_KEY, "")
+    return current, _editor_resolve_latest()
+
+
+def editor_apply_refresh(cs_version: str) -> None:
+    """Bump versions.env's CODE_SERVER_VERSION pin AND rebuild the dist at it
+    (datawrangler stays at its pin). The prompt/confirm is the front-end's job."""
+    _set_version_pin(_CODE_SERVER_VERSION_KEY, cs_version)
+    dw = load_versions().get(_DATA_WRANGLER_VERSION_KEY)
+    if not dw:
+        die(f"no pinned {_DATA_WRANGLER_VERSION_KEY} in versions.env")
+    _editor_build_dist(cs_version, dw)
+
+
+def _stage_editor_dist(supervisor: str) -> None:
+    """Stage the host editor dist into a RUNNING supervisor (STAGE_EDITOR_DIST).
+    Real files at EDITOR_DIST_MOUNT — interactive inner containers (PI roles,
+    sandbox boxes) RO-mount that path and cp their own writable copy at boot.
+    Mirrors `_stage_agent_dist`'s uid-0 tar-stream (the sysbox-uid-shift +
+    docker-cp-nesting dragons; see that helper) but stages the FLAT editor tree
+    (.local/ + tools/ + templates/), and NEVER deploys into the supervisor's own
+    ~/.local — in slice 1 the supervisor keeps its baked editor (so there is no
+    `deploy_local`); staging exists only to feed the inner-container mount. The
+    supervisor's own dist-cp + bake deletion is slice 2."""
+    src = EDITOR_DIST_DIR
+    if not editor_dist_present():
+        die("no cached editor dist to stage — run `research editor pull` first")
+
+    def _root_owned(ti: tarfile.TarInfo) -> tarfile.TarInfo:
+        ti.uid = ti.gid = 0
+        ti.uname = ti.gname = ""
+        return ti
+    extract = (f"rm -rf {EDITOR_DIST_MOUNT} && mkdir -p {EDITOR_DIST_MOUNT} && "
+               f"tar -C {EDITOR_DIST_MOUNT} -x && chown -R 1000:1000 {EDITOR_DIST_MOUNT}")
+    proc = subprocess.Popen(
+        ["docker", "exec", "-i", "-u", "0", supervisor, "sh", "-c", extract],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        with tarfile.open(fileobj=proc.stdin, mode="w|") as tf:   # streaming; symlinks preserved
+            for entry in sorted(os.listdir(src)):
+                tf.add(os.path.join(src, entry), arcname=entry, filter=_root_owned)
+    finally:
+        if proc.stdin:
+            proc.stdin.close()
+    _, err = proc.communicate()
+    if proc.returncode != 0:
+        detail = (err.decode(errors="replace") if err else "").strip()
+        die(f"staging editor dist into {supervisor} failed: "
+            f"{detail or 'tar extract returned non-zero'}")
 
 
 def _build_images(force: bool) -> None:
@@ -2563,12 +2817,18 @@ def _recreate_supervisor(
         stage_worker_image(container, SANDBOX_BOX_BROWSER_IMAGE, force=force_restage)
         # Box-host: re-stage the dist for the boxes (deploy_local=False).
         _stage_agent_dist(container, deploy_local=False)
+        if editor_dist_present():
+            _stage_editor_dist(container)
     else:
         stage_worker_image(container, ANALYSIS_IMAGE, force=force_restage)
         # Re-stage the agent dist into the fresh container (its own ~/.local + the
         # /opt/agent-dist the fleet mounts) — no bake, so a recreate must redeploy
         # it. Before the role-MCP relaunch loop below, which mounts that path.
         _stage_agent_dist(container)
+        # Editor dist re-staged the same way (STAGE_EDITOR_DIST) so a recreated
+        # supervisor's interactive PI/sandbox containers find a populated mount.
+        if editor_dist_present():
+            _stage_editor_dist(container)
     stage_worker_image(container, MCP_PROXY_IMAGE, force=force_restage)
 
     run(["docker", "exec", container, "/usr/local/bin/mcp-reload"],
@@ -3700,6 +3960,20 @@ def _sandbox_start(supervisor: str, project: str, cfg: "Config",
     _sandbox_ensure_workspace(supervisor, name, kind)
     ip = entry["ip"]
 
+    # Editor dist (STAGE_EDITOR_DIST): interactive PI/sandbox containers RO-mount
+    # the supervisor's staged /opt/editor-dist + carry RS_SERVICE_CODE_SERVER from
+    # the PROJECT's code-server service flag (read off the supervisor's label, the
+    # outside-the-container truth). The entrypoint deploys the editor only when the
+    # flag is enabled AND the mount is populated (a project without the editor
+    # pulled stages none → an empty/absent mount → the entrypoint no-ops). The mount
+    # is spliced unconditionally (an inner -v auto-creates an inert empty dir if the
+    # source is absent, exactly like the agent mount); the flag gates the deploy.
+    _editor_on = _read_service_flags(supervisor).get("code-server", True)
+    editor_args = [
+        *EDITOR_DIST_MOUNT_ARGS,
+        "-e", f"RS_SERVICE_CODE_SERVER={'enabled' if _editor_on else 'disabled'}",
+    ]
+
     if kind == "baked":
         image = entry.get("image") or sandbox.BAKED_IMAGES[name]
         stage_worker_image(supervisor, image, force=force_restage)
@@ -3718,6 +3992,7 @@ def _sandbox_start(supervisor: str, project: str, cfg: "Config",
             "-v", f"/workspace/pi/{name}:/workspace",
             "-v", "/workspace/.orchestrator:/etc/orchestrator:ro",
             *AGENT_DIST_MOUNT_ARGS,   # claude copy-source (no bake; slice 2)
+            *editor_args,             # code-server copy-source + flag (STAGE_EDITOR_DIST)
             "-e", f"RS_PI_ROLE={name}",
             "--label", f"research.pi_role={sandbox.pi_role_label(name, kind)}",
             "--label", f"research.project={project}",
@@ -3743,6 +4018,7 @@ def _sandbox_start(supervisor: str, project: str, cfg: "Config",
             "-v", f"/workspace/pi-isolated/{name}:/workspace",
             "-v", f"/external/{name}:{mount}",
             *AGENT_DIST_MOUNT_ARGS,   # claude copy-source (no bake; slice 2)
+            *editor_args,             # code-server copy-source + flag (STAGE_EDITOR_DIST)
             "-e", f"RS_PI_ISO_NAME={name}",
             "-e", f"RS_PI_ISO_REPO={entry.get('repo') or ''}",
             "-e", f"RS_PI_ISO_REF={entry.get('ref') or ''}",

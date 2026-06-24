@@ -258,6 +258,19 @@ if [[ "${RS_SERVICE_CODE_SERVER:-enabled}" == "enabled" ]]; then
 "upstream :${CODE_SERVER_UPSTREAM_PORT}; idle reap ${CODE_SERVER_IDLE_SECONDS}s"
 fi
 
+# --- code-server editor (dist) — STAGE_EDITOR_DIST. NO-OP in slice 1: the system
+#     bake above is present (! -e /usr/bin/code-server is false) so this is skipped
+#     and the baked block serves the editor. Present to pre-stage slice 2's flip:
+#     slice 2 deletes BOTH the Dockerfile bake AND the baked launch block above (or
+#     the orphaned block would try to run the now-deleted /opt/code-server-tools
+#     stub), after which this dist block activates — the same shared dist deploy
+#     script the interactive leaves use. Guard is the populated-mount check.
+if [[ "${RS_SERVICE_CODE_SERVER:-enabled}" == "enabled" ]] \
+   && [[ -e /opt/editor-dist/.local/bin/code-server ]] \
+   && [[ ! -e /usr/bin/code-server ]]; then
+    bash /opt/editor-dist/tools/code-server-deploy.sh || true
+fi
+
 # Byobu is NOT pre-started here. `research project attach` creates the "main"
 # session lazily if needed. Pre-starting would freeze a bash process that
 # predates `usermod -aG docker research` (docker-ce is installed at project

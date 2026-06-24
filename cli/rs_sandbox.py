@@ -43,6 +43,11 @@ INNER_NETWORK = "rs-inner"
 # Management supervisor stages the dist here at create; RO copy-source the box's
 # entrypoint cp's into its own ~/.local (no bake; STAGE_AGENT_DIST slice 2).
 AGENT_DIST_MOUNT = "/opt/agent-dist"
+# Editor (code-server) dist (STAGE_EDITOR_DIST), staged the same way. Re-declared
+# (this in-supervisor CLI can't import rscore — drags docker/yaml in), mirroring
+# AGENT_DIST_MOUNT. The box's entrypoint deploys it only when RS_SERVICE_CODE_SERVER
+# is enabled (forwarded from the project's flag) AND the mount is populated.
+EDITOR_DIST_MOUNT = "/opt/editor-dist"
 BOX_IMAGE = "rs-sandbox-box:latest"
 # Browser variant: + @playwright/mcp + Chromium, wired into the box's claude.
 BOX_IMAGE_BROWSER = "rs-sandbox-box-browser:latest"
@@ -164,6 +169,15 @@ def _run_box(name: str, ip: str, browser: bool = False) -> None:
     # error; the box's entrypoint absence-guard surfaces it as "claude not found".
     agent_mount = (["-v", f"{AGENT_DIST_MOUNT}:{AGENT_DIST_MOUNT}:ro"]
                    if os.path.isdir(AGENT_DIST_MOUNT) else [])
+    # Editor dist mount + the project's code-server flag (STAGE_EDITOR_DIST). The
+    # management supervisor carries RS_SERVICE_CODE_SERVER from the project's flag
+    # (set at create); inherit it so the box deploys the editor iff the project has
+    # it on. The supervisor ALWAYS sets the env (it's a KNOWN_SERVICE), so the
+    # fallback is unreachable; "enabled" matches rscore._read_service_flags' missing
+    # -> enabled default (the research/sandbox editor-on default) — kept in agreement.
+    editor_mount = (["-v", f"{EDITOR_DIST_MOUNT}:{EDITOR_DIST_MOUNT}:ro"]
+                    if os.path.isdir(EDITOR_DIST_MOUNT) else [])
+    editor_flag = os.environ.get("RS_SERVICE_CODE_SERVER", "enabled")
     r = _docker(
         "run", "-d",
         "--name", cname,
@@ -172,6 +186,8 @@ def _run_box(name: str, ip: str, browser: bool = False) -> None:
         "--restart", "unless-stopped",
         "-v", f"{WORKSPACE}/{sub}:/workspace",
         *agent_mount,
+        *editor_mount,
+        "-e", f"RS_SERVICE_CODE_SERVER={editor_flag}",
         "-e", f"RS_SANDBOX_NAME={name}",
         "--label", "research.sandbox=1",
         "--label", f"research.box={name}",

@@ -34,6 +34,17 @@ if ! grep -q '\.local/bin' ~/.bashrc 2>/dev/null; then
     echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 fi
 
+# --- code-server editor (dist) — STAGE_EDITOR_DIST. Deploy + lazy-launch from
+#     /opt/editor-dist when the project enabled the editor (RS_SERVICE_CODE_SERVER
+#     forwarded from its flag), the mount is populated, and no system bake exists
+#     (the coexistence guard). The deploy/launch logic is ONE shared script in the
+#     dist (no per-entrypoint duplication). Non-fatal: the editor is optional.
+if [[ "${RS_SERVICE_CODE_SERVER:-disabled}" == "enabled" ]] \
+   && [[ -e /opt/editor-dist/.local/bin/code-server ]] \
+   && [[ ! -e /usr/bin/code-server ]]; then
+    bash /opt/editor-dist/tools/code-server-deploy.sh || true
+fi
+
 # Role marker for the byobu status-bar plugin (~/.byobu/bin/60_rolename).
 echo "${RS_SANDBOX_NAME}" > ~/.rs-role
 

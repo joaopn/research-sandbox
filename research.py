@@ -350,6 +350,47 @@ def cmd_agent_refresh(args: argparse.Namespace) -> None:
     print(f"bumped versions.env + pulled {agent} {latest}; review + commit versions.env")
 
 
+def cmd_editor_pull(args: argparse.Namespace) -> None:
+    res = rscore.editor_pull()
+    print(f"pulled editor code-server {res['code_server_version']} "
+          f"(datawrangler {res['data_wrangler_version']}) → {res['path']}")
+
+
+def cmd_editor_show(args: argparse.Namespace) -> None:
+    s = rscore.editor_show()
+    if not s:
+        print("no editor dist pulled yet — run `research editor pull`")
+        return
+    print(f"  code-server {s.get('code_server_version', '?')} "
+          f"datawrangler {s.get('data_wrangler_version', '?')} "
+          f"pulled {s.get('pulled_at', '?')}")
+
+
+def cmd_editor_refresh(args: argparse.Namespace) -> None:
+    """HITL: check upstream code-server, offer to bump the versions.env pin +
+    re-pull. The pin (CODE_SERVER_VERSION) is shared with the transitional bake
+    (slice 1), so this moves the fleet's next-rebuild version too."""
+    current, latest = rscore.editor_refresh_check()
+    if current == latest:
+        print(f"editor: up to date (versions.env pin {current} == upstream {latest})")
+        if not rscore.editor_dist_present():
+            print("  (no dist cached yet — run `research editor pull`)")
+        return
+    print(f"editor: versions.env CODE_SERVER_VERSION {current or '(unset)'} → upstream {latest}")
+    print("  (this also moves the fleet's next `start --rebuild` version)")
+    if not args.yes:
+        try:
+            resp = input("bump the pin in versions.env + pull it? [y/N] ").strip().lower()
+        except EOFError:
+            resp = "n"
+        if resp not in ("y", "yes"):
+            print("aborted; versions.env unchanged")
+            return
+    rscore.editor_apply_refresh(latest)
+    print(f"bumped versions.env + pulled editor code-server {latest}; "
+          "review + commit versions.env")
+
+
 def cmd_project_attach(args: argparse.Namespace) -> None:
     container = container_name_for(args.name)
     if not container_running(container):
@@ -2408,6 +2449,20 @@ def build_parser() -> argparse.ArgumentParser:
     agr.add_argument("--agent", default="claude", choices=list(rscore.KNOWN_AGENTS))
     agr.add_argument("--yes", action="store_true", help="skip the confirm prompt")
     agr.set_defaults(func=cmd_agent_refresh)
+
+    ed = sub.add_parser("editor",
+                        help="host-cached code-server (the Editor tab) deployed "
+                             "into interactive containers at boot via cp, not baked")
+    ed_sub = ed.add_subparsers(dest="subcommand", required=True)
+    edp = ed_sub.add_parser("pull",
+                            help="build + cache the versions.env-pinned editor dist")
+    edp.set_defaults(func=cmd_editor_pull)
+    eds = ed_sub.add_parser("show", help="show the cached editor dist + versions")
+    eds.set_defaults(func=cmd_editor_show)
+    edr = ed_sub.add_parser("refresh",
+                            help="check upstream; offer to bump the pin + re-pull")
+    edr.add_argument("--yes", action="store_true", help="skip the confirm prompt")
+    edr.set_defaults(func=cmd_editor_refresh)
 
     wu = sub.add_parser("webui", help="manage the optional browser UI container")
     wu_sub = wu.add_subparsers(dest="webui_action", required=True)
