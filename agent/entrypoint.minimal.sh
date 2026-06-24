@@ -26,16 +26,25 @@ umask 002
 if [[ ! -f ~/.bashrc ]]; then
     cp -a /etc/research-skel/. ~/
 fi
-# Deploy the agent dist (if --agent RO-mounted it) into our OWN writable ~/.local
-# (STAGE_AGENT_DIST_S1). Guard on the LAUNCHER'S ABSENCE, NOT ~/.bashrc/first-boot:
-# rs-minimal's /home/research is image-resident (not a volume), so ~/.bashrc
-# always exists and the first-boot block above never fires here. The absence
-# guard still deploys exactly once — a later docker-start restart finds the
-# launcher present and skips, so an autoupdater bump is never clobbered. The
-# mount is an inert RO copy-source; the box runs from its own copy.
-if [[ -d /opt/agent-dist && ! -e ~/.local/bin/claude ]]; then
+# Deploy each enabled agent dist into our OWN writable ~/.local (STAGE_MULTI_AGENT).
+# create() RO-mounts one copy-source per enabled agent at /opt/agent-dist/<agent>,
+# so the mounts ARE the enabled set — loop over the mounted subdirs (empty set => no
+# mount => /opt/agent-dist absent => this no-ops, a lean box). Guard on the per-agent
+# LAUNCHER'S ABSENCE, NOT ~/.bashrc/first-boot: rs-minimal's /home/research is
+# image-resident (not a volume), so ~/.bashrc always exists and the first-boot block
+# above never fires here. The per-agent absence guard deploys each exactly once — a
+# later docker-start restart finds the launchers present and skips, so an autoupdater
+# bump is never clobbered. The mounts are inert RO copy-sources; the box runs from
+# its own copies.
+if [[ -d /opt/agent-dist ]]; then
     mkdir -p ~/.local
-    cp -a /opt/agent-dist/. ~/.local/
+    for agent_src in /opt/agent-dist/*/; do
+        [[ -d "$agent_src" ]] || continue          # no match => the glob stays literal
+        agent_name="$(basename "$agent_src")"
+        if [[ ! -e ~/.local/bin/"$agent_name" ]]; then
+            cp -a "$agent_src". ~/.local/
+        fi
+    done
 fi
 if ! grep -q 'umask 002' ~/.bashrc 2>/dev/null; then
     echo 'umask 002' >> ~/.bashrc

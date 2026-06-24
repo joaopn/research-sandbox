@@ -250,9 +250,9 @@ def _print_create_report(res, cfg) -> None:
     # was actually cloned. Non-secret — the report never carries the PAT.
     clone_block = (f"  Cloned:    {res.repo} → {res.clone_dir}\n"
                    if getattr(res, "clone_dir", "") else "")
-    # Agent dist (STAGE_AGENT_DIST_S1): show only when a docker box deployed one.
-    agent_block = (f"  Agent:     {res.agent} (deployed to ~/.local)\n"
-                   if getattr(res, "agent", "") else "")
+    # Agent dists (STAGE_MULTI_AGENT): show only when a docker box deployed some.
+    agent_block = (f"  Agents:    {', '.join(res.agents)} (deployed to ~/.local)\n"
+                   if getattr(res, "agents", None) else "")
 
     print(f"""
 Project '{res.project}' is running.
@@ -274,6 +274,18 @@ Next steps:
 """)
 
 
+class _AppendAgents(argparse.Action):
+    """`--agent claude --agent codex` AND `--agents claude,codex` both accumulate
+    into one list (STAGE_MULTI_AGENT). Comma-splits each value and extends.
+    from_kwargs is the validation choke point (per-agent enum + dist-present), so
+    no argparse `choices` here — known agents are named in the help text."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        cur = list(getattr(namespace, self.dest) or [])
+        cur += [v.strip() for v in str(values).split(",") if v.strip()]
+        setattr(namespace, self.dest, cur)
+
+
 def cmd_project_create(args: argparse.Namespace) -> None:
     cfg = load_config()
     req = _build(
@@ -287,7 +299,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         mcp=args.mcp,
         repo=args.repo, ref=args.ref, setup=args.setup_script,
         github_pat=os.environ.get("RS_GITHUB_PAT") or "",   # never a CLI flag
-        agent=args.agent,
+        agents=args.agents,   # repeatable --agent + --agents a,b both feed this list
     )
     try:
         res = rscore.create(req, cfg)
@@ -1898,10 +1910,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="shell snippet run in the clone dir after checkout (or in "
                         "/workspace when there is no repo). Chain steps with "
                         "&& / newlines. Runs once at create.")
-    c.add_argument("--agent", choices=list(rscore.KNOWN_AGENTS),
-                   help="deploy an agent into a docker-substrate box at boot "
-                        "(cp from the host dist; run `research agent pull` first). "
-                        "Default: none (clean box). Ignored on non-docker workflows.")
+    c.add_argument("--agent", "--agents", dest="agents", action=_AppendAgents,
+                   default=None, metavar="AGENT[,AGENT...]",
+                   help="deploy agent dist(s) into a docker-substrate box at boot, "
+                        "one writable ~/.local launcher each (cp from the host dist; "
+                        "run `research agent pull` first). Repeatable, or a comma "
+                        f"list. Known: {', '.join(rscore.KNOWN_AGENTS)}. Default: "
+                        "none (clean box). Ignored on non-docker workflows.")
     c.set_defaults(func=cmd_project_create)
 
     a = proj_sub.add_parser("attach", help="docker exec + byobu attach")

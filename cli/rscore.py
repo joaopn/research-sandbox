@@ -341,9 +341,11 @@ class CreateRequest:
     ref: str = ""
     setup: str = ""
     github_pat: str = field(default="", repr=False)
-    # Which agent dist a docker box deploys at boot (STAGE_AGENT_DIST_S1). In-box
-    # field (selects software run *inside* the box, not host-shaped); "" = clean.
-    agent: str = ""
+    # Which agent dists a docker box deploys at boot (STAGE_MULTI_AGENT; was the
+    # single STAGE_AGENT_DIST_S1 `agent`). An independent on/off set — one writable
+    # ~/.local launcher per enabled agent. In-box field (selects software run
+    # *inside* the box, not host-shaped); () = clean box, no agent.
+    agents: tuple[str, ...] = ()
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "CreateRequest":
@@ -371,17 +373,20 @@ class CreateRequest:
                     "docker box is locked-egress (no ssh/port 22) and a private "
                     "repo clones over https via a PAT")
             _light_clone_basename(repo)   # reject a path-escaping basename early
-        # Agent dist (STAGE_AGENT_DIST_S1): enum, and on the docker substrate the
-        # dist must already be pulled. Non-docker is noted-and-ignored in create()
-        # (slice 1 wires only the docker-box cp-deploy path), so no dist needed.
-        agent = (kw.get("agent") or "").strip()
-        if agent and agent not in KNOWN_AGENTS:
-            raise ValidationError(
-                f"unknown agent {agent!r} (known: {', '.join(KNOWN_AGENTS)})")
-        if agent and substrate is Substrate.DOCKER and not dist_present(agent):
-            raise ValidationError(
-                f"--agent {agent}: no cached dist — run "
-                f"`research agent pull --agent {agent}` first")
+        # Agent dists (STAGE_MULTI_AGENT): an enable-SET. Each must be a known agent,
+        # and on the docker substrate each must already be pulled. Non-docker is
+        # noted-and-ignored in create() (only the docker-box cp-deploy path is wired
+        # for the explicit set; dind uses the DEFAULT_AGENT floor below). Dedup while
+        # preserving order so a box never double-mounts the same agent.
+        agents = tuple(dict.fromkeys(_as_tuple(kw.get("agents"))))
+        for a in agents:
+            if a not in KNOWN_AGENTS:
+                raise ValidationError(
+                    f"unknown agent {a!r} (known: {', '.join(KNOWN_AGENTS)})")
+            if substrate is Substrate.DOCKER and not dist_present(a):
+                raise ValidationError(
+                    f"agent {a!r}: no cached dist — run "
+                    f"`research agent pull --agent {a}` first")
         # Fleet floor (STAGE_AGENT_DIST slice 2): EVERY dind project deploys claude
         # from the dist (no bake) — research flavor for the supervisor + worker/
         # role-MCP/PI fleet, box-host flavor for its rs-sandbox-box boxes (FROM
@@ -412,7 +417,7 @@ class CreateRequest:
             role_mcp_upstream=_as_tuple(kw.get("role_mcp_upstream")),
             mcp=kw.get("mcp") if kw.get("mcp") is not None else "all-enabled",
             repo=repo, ref=ref, setup=setup, github_pat=github_pat,
-            agent=agent,
+            agents=agents,
         )
 
 
@@ -514,7 +519,7 @@ class CreateResult:
     # CreateResult is asdict'd into the broker reply + lingers in webui OP_RUNS.
     repo: str = ""
     clone_dir: str = ""                     # /workspace/<basename> if a repo cloned
-    agent: str = ""                         # agent dist deployed into a docker box
+    agents: list[str] = field(default_factory=list)   # agent dists deployed into a docker box
 
 
 @dataclass
@@ -630,12 +635,12 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     if not is_docker and (req.repo or req.setup):
         print("note: --repo/--setup-script apply only to the light-path docker "
               "box; ignoring for this workflow", file=sys.stderr)
-    # --agent deploys an agent dist into the docker box (STAGE_AGENT_DIST_S1). On a
-    # dind/overlay workflow the dist cp-deploy path isn't wired yet (slice 2) and
-    # claude is still baked there, so the flag is noted-and-ignored.
-    if not is_docker and req.agent:
-        print(f"note: --agent {req.agent} applies only to the docker box; "
-              "ignoring for this workflow", file=sys.stderr)
+    # --agent(s) deploys an agent-dist set into the docker box (STAGE_MULTI_AGENT).
+    # On a dind/overlay workflow the explicit set isn't wired (the dind fleet uses
+    # the DEFAULT_AGENT floor + _stage_agent_dist), so the flag is noted-and-ignored.
+    if not is_docker and req.agents:
+        print(f"note: --agent {','.join(req.agents)} applies only to the docker "
+              "box; ignoring for this workflow", file=sys.stderr)
 
     substrate_image = (
         MINIMAL_IMAGE if is_docker
@@ -715,10 +720,10 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     #     derived "type"/"substrate" are what the machinery branches on.
     orch_dir = workspace_path / ".orchestrator"
     orch_dir.mkdir(parents=True, exist_ok=True)
-    deployed_agent = req.agent if (is_docker and req.agent) else ""
+    deployed_agents = list(req.agents) if is_docker else []
     (orch_dir / "project.json").write_text(
         json.dumps({"type": project_type, "substrate": substrate.value,
-                    "workflow": req.workflow, "agent": deployed_agent},
+                    "workflow": req.workflow, "agents": deployed_agents},
                    indent=2) + "\n")
 
     # 2. Per-project network + router wiring.
@@ -788,12 +793,17 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     )
     if extra_mounts:
         docker_args = docker_args[:-1] + extra_mounts + [docker_args[-1]]
-    # Agent dist: RO-mount the host cache as a copy-source + label the box
-    # (STAGE_AGENT_DIST_S1). docker-substrate only; the entrypoint cp's it into
-    # the box's own ~/.local on first boot. Inserted before the image (last arg).
-    if deployed_agent:
-        agent_args = ["--label", f"{AGENT_LABEL}={deployed_agent}",
-                      "-v", f"{agent_dist_path(deployed_agent)}:/opt/agent-dist:ro"]
+    # Agent dists: one RO copy-source mount per enabled agent at
+    # /opt/agent-dist/<agent> + a comma-joined provenance label (STAGE_MULTI_AGENT).
+    # docker-substrate only; the entrypoint loops over the mounted subdirs and cp's
+    # each into the box's OWN writable ~/.local on first boot. The mounts ARE the
+    # enabled set (the entrypoint reads the mounts, not the label) — empty set => no
+    # mount => /opt/agent-dist absent => the boot loop no-ops (lean box). Inserted
+    # before the image (last arg).
+    if deployed_agents:
+        agent_args = ["--label", f"{AGENT_LABEL}={','.join(deployed_agents)}"]
+        for a in deployed_agents:
+            agent_args += ["-v", f"{agent_dist_path(a)}:/opt/agent-dist/{a}:ro"]
         docker_args = docker_args[:-1] + agent_args + [docker_args[-1]]
     if not is_docker:
         ext_mounts = _sandbox_external_mounts(project)
@@ -910,7 +920,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         sandboxes=sandboxes_enabled,
         repo=req.repo,
         clone_dir=clone_dir,
-        agent=deployed_agent,
+        agents=deployed_agents,
     )
 
 
@@ -1229,7 +1239,7 @@ PROJECT_TYPE_SANDBOX = "sandbox"
 # label so start()/recreate read it back; legacy containers without it default
 # to dind-sysbox. Also recorded in .orchestrator/project.json for the webui.
 SUBSTRATE_LABEL = "research.substrate"
-AGENT_LABEL = "research.agent"   # which agent dist a docker box deployed (S4 Route 2)
+AGENT_LABEL = "research.agents"  # comma-joined agent-dist set a docker box deployed (STAGE_MULTI_AGENT)
 MCP_CONTAINER_PREFIX = "rs-mcp-"
 MCP_LABEL = "research.mcp"
 MCP_NAME_LABEL = "research.mcp_name"

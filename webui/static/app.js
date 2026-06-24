@@ -1308,10 +1308,27 @@ function mgmtCreateDialog(view, manifest, agents) {
     ]);
     if (!hasWorkerLayer) enableField.style.display = "none";
 
-    // Docker-substrate-only group: agent + light-path payload.
-    const agentS = el("select", {}, [
-        el("option", { value: "" }, ["(default)"]),
-        ...agents.map((a) => el("option", { value: a }, [a])),
+    // Docker-substrate-only group: agents + light-path payload.
+    // Staged agents only — one independent on/off box each (STAGE_MULTI_AGENT),
+    // default claude on. Un-staged KNOWN_AGENTS are omitted: the form never offers
+    // an agent the host can't deploy (pull it on the host first), so the POSTed set
+    // always validates in from_kwargs.
+    const stagedAgents = agents
+        .filter((a) => a && a.staged)
+        .map((a) => a.name);
+    const agentChecks = stagedAgents.map((name) => {
+        const cb = el("input", { type: "checkbox", value: name });
+        if (name === "claude") cb.checked = true;   // default {claude} on
+        return { name, cb,
+                 label: el("label", { class: "mgmt-check" }, [cb, " " + name]) };
+    });
+    const agentField = el("div", { class: "field" }, [
+        el("label", {}, ["Agents"]),
+        agentChecks.length
+            ? el("div", { class: "mgmt-checks" }, agentChecks.map((c) => c.label))
+            : el("div", { class: "hint" }, [
+                  "No agents pulled on the host — run `research agent pull`.",
+              ]),
     ]);
     const repoI = el("input", { type: "text", autocomplete: "off",
                                 placeholder: "https://github.com/user/repo.git" });
@@ -1326,7 +1343,7 @@ function mgmtCreateDialog(view, manifest, agents) {
                "with this create and never stored.",
     });
     const dockerGroup = el("div", { class: "mgmt-docker-group" }, [
-        el("div", { class: "field" }, [el("label", {}, ["Agent"]), agentS]),
+        agentField,
         el("div", { class: "field" }, [el("label", {}, ["Repo (https)"]), repoI]),
         el("div", { class: "field" }, [el("label", {}, ["Ref"]), refI]),
         el("div", { class: "field" }, [el("label", {}, ["Setup"]), setupT]),
@@ -1390,12 +1407,13 @@ function mgmtCreateDialog(view, manifest, agents) {
                 payload.enable = checks.filter((c) => c.cb.checked).map((c) => c.p);
             }
             if (isDocker) {
-                const agent = agentS.value.trim();
+                const sel = agentChecks.filter((c) => c.cb.checked)
+                                       .map((c) => c.name);
                 const repo = repoI.value.trim();
                 const ref = refI.value.trim();
                 const setup = setupT.value.trim();
                 const pat = patI.value.trim();
-                if (agent) payload.agent = agent;
+                if (sel.length) payload.agents = sel;   // empty => clean box
                 if (repo) payload.repo = repo;
                 if (ref) payload.ref = ref;
                 if (setup) payload.setup = setup;

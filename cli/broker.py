@@ -259,7 +259,11 @@ def _verb_workflows(_args: dict, _progress=None) -> dict:
         "workflows": catalog,                     # full manifests (substrate,
                                                   # repo/ref/setup presets, source,
                                                   # has_worker_layer)
-        "agents": list(rscore.KNOWN_AGENTS),      # the --agent enum
+        # Each known agent + whether its host dist is pulled (STAGE_MULTI_AGENT). The
+        # create form offers ONLY staged agents as on/off boxes — never an agent it
+        # can't deploy — so a relayed `agents` set always validates in from_kwargs.
+        "agents": [{"name": a, "staged": rscore.dist_present(a)}
+                   for a in rscore.KNOWN_AGENTS],
         "default_workflow": rscore.DEFAULT_WORKFLOW,
     }
 
@@ -292,9 +296,11 @@ CREATE_WEBUI_FIELDS = frozenset({
     # github_pat is a SECRET in-box field: forwarded over the request envelope,
     # never logged/persisted off the box, never a CreateResult field.
     "repo", "ref", "setup", "github_pat",
-    # agent: which agent dist a docker box deploys at boot — in-box field
-    # (STAGE_AGENT_DIST_S1); dist-must-exist is enforced in from_kwargs.
-    "agent",
+    # agents: the agent-dist SET a docker box deploys at boot — in-box field
+    # (STAGE_MULTI_AGENT; was the single `agent`). Per-agent dist-must-exist is
+    # enforced in from_kwargs. The rename is a lockstep boundary edit: the webui
+    # form POSTs `agents:[...]` (a field not in this set is silently dropped).
+    "agents",
 })
 
 # The webui-settable subset of UpdateRequest fields. `rebuild`/`keep_claude` are
