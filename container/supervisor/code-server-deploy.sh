@@ -60,6 +60,35 @@ if [[ -d "${DIST}/templates/extensions" ]]; then
     done
 fi
 
+# 3b. Install agent-bound editor extensions (STAGE_AGENT_EXTENSIONS). The agent
+#     dist tucks its companion .vsix at ~/.local/share/rs-agent-ext/<agent>.vsix
+#     (B-tuck), so this glob is non-empty IFF an agent dist was deployed into
+#     this container's ~/.local — the install gate falls out of file presence,
+#     no launcher check. An agent-less box (e.g. management) has no such dir →
+#     no-op. Same idempotent already-installed skip as step 3; a .vsix version
+#     bump only reaches FRESH / recreated / restarted containers (the installed
+#     folder name carries the old version, so the skip matches), never an
+#     in-place upgrade — identical to the Data Wrangler lane above.
+AGENT_EXT_DIR="$HOME/.local/share/rs-agent-ext"
+if [[ -d "$AGENT_EXT_DIR" ]]; then
+    for vsix in "$AGENT_EXT_DIR"/*.vsix; do
+        [[ -f "$vsix" ]] || continue
+        base=$(basename "$vsix" .vsix)
+        shopt -s nullglob
+        existing=( "${CS_EXT_DIR}/"*"${base}"* )
+        shopt -u nullglob
+        if (( ${#existing[@]} > 0 )); then
+            continue
+        fi
+        echo "installing agent extension: ${base}"
+        code-server \
+            --install-extension "$vsix" \
+            --extensions-dir "${CS_EXT_DIR}" \
+            --user-data-dir "${CS_USER_DIR}" \
+            || echo "WARNING: failed to install ${base}" >&2
+    done
+fi
+
 # 4. Launch the lazy-start stub (spawn code-server on first connect, reap on idle).
 : "${CODE_SERVER_STUB_PORT:=8443}"
 : "${CODE_SERVER_UPSTREAM_PORT:=8444}"

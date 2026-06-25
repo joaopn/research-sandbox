@@ -1352,6 +1352,11 @@ VERSION_SOURCES: dict[str, dict[str, str]] = {
         "url": "https://marketplace.visualstudio.com/items"
                "?itemName=ms-toolsai.datawrangler",
     },
+    "CLAUDE_CODE_EXT_VERSION": {
+        "kind": "manual",
+        # Open VSX item page — eyeball the latest linux-x64 build before bumping.
+        "url": "https://open-vsx.org/extension/Anthropic/claude-code",
+    },
 }
 
 # Per-supervisor service registry. KNOWN_SERVICES lists every kind the webui
@@ -1914,6 +1919,13 @@ AGENT_DIST_MOUNT_ARGS = ["-v", f"{AGENT_DIST_MOUNT}:{AGENT_DIST_MOUNT}:ro"]
 # `cp` at boot. `install` runs IN rs-minimal-base as the `research` user. Adding
 # codex/goose later is one entry here (the N+M seam — but each needs its own
 # cross-user launcher spike before its relink is trusted; see _relativize_launcher).
+# Where an agent's companion VS Code extension .vsix is tucked inside the
+# captured ~/.local (STAGE_AGENT_EXTENSIONS, "B-tuck"): it rides every existing
+# cp into a container's ~/.local for free, so its presence there is exactly the
+# signal "this agent was deployed here" — the install gate falls out of file
+# presence, no launcher check. code-server-deploy.sh step 3b globs this dir.
+AGENT_EXT_SUBDIR = "share/rs-agent-ext"
+
 _AGENT_INSTALL = {
     "claude": {
         "version_key": "CLAUDE_CODE_VERSION",
@@ -1923,6 +1935,21 @@ _AGENT_INSTALL = {
         # installer curls this to turn "latest" into a concrete version; the body
         # is a bare semver string). `agent refresh` fetches just this — no install.
         "latest_url": "https://downloads.claude.ai/claude-code-releases/latest",
+        # OPTIONAL companion editor extension (agent-bound; STAGE_AGENT_EXTENSIONS).
+        # A future agent with no extension omits this whole key → no .vsix, no-op.
+        # version_key is an INDEPENDENT versions.env pin (the CLI + extension move
+        # together upstream but are bumped separately). The url is Open VSX,
+        # platform-pinned linux-x64 (the extension is platform-specific; our
+        # containers are x86_64 linux). file = the saved basename, chosen as the
+        # extension id so code-server-deploy.sh's skip-glob (*<base>*) precisely
+        # matches the installed folder anthropic.claude-code-<ver>.
+        "ext": {
+            "id": "Anthropic.claude-code",
+            "version_key": "CLAUDE_CODE_EXT_VERSION",
+            "url": ("https://open-vsx.org/api/Anthropic/claude-code/linux-x64/"
+                    "{ver}/file/Anthropic.claude-code-{ver}@linux-x64.vsix"),
+            "file": "anthropic.claude-code.vsix",
+        },
     },
 }
 KNOWN_AGENTS = tuple(_AGENT_INSTALL)   # the --agent enum
@@ -2036,6 +2063,26 @@ def _agent_build_dist(agent: str, version: str) -> None:
         die(f"refusing to build {agent!r} with suspicious version {version!r}")
     if not run_quiet(["docker", "image", "inspect", MINIMAL_BASE_IMAGE]):
         die(f"{MINIMAL_BASE_IMAGE} not found — run `research start --rebuild` first")
+    # Companion editor extension (STAGE_AGENT_EXTENSIONS, B-tuck). Resolved here —
+    # not threaded from the caller — so BOTH `agent pull` AND a CLI-version
+    # `agent refresh` re-bundle the .vsix at the CURRENT ext pin (no CLI↔ext skew).
+    # die loud on an unpinned ext version rather than ship an extension-less dist
+    # (wired-but-absent is the worst failure shape); charset-guard before the URL
+    # interpolation reaches an in-container shell (same defense as the CLI version).
+    ext = spec.get("ext")
+    ext_dl = ""
+    if ext:
+        ext_ver = load_versions().get(ext["version_key"])
+        if not ext_ver:
+            die(f"agent {agent!r} declares a companion extension but its pin "
+                f"{ext['version_key']} is unset in versions.env")
+        if not _AGENT_VERSION_RE.match(ext_ver):
+            die(f"refusing to fetch {agent!r} extension with suspicious "
+                f"version {ext_ver!r}")
+        ext_url = ext["url"].format(ver=ext_ver)
+        ext_dl = (f" && mkdir -p ~/.local/{AGENT_EXT_SUBDIR}"
+                  f" && curl -fsSL --compressed -o "
+                  f"~/.local/{AGENT_EXT_SUBDIR}/{ext['file']} {shlex.quote(ext_url)}")
     AGENT_DIST_DIR.mkdir(parents=True, exist_ok=True)
     tmp = Path(tempfile.mkdtemp(dir=str(AGENT_DIST_DIR)))   # same fs ⇒ cheap rename
     try:
@@ -2049,6 +2096,7 @@ def _agent_build_dist(agent: str, version: str) -> None:
         inner = ("set -e; set -o pipefail; "
                  + spec["install"].format(ver=version)
                  + f" && test -x ~/.local/bin/{bin_}"
+                 + ext_dl                       # tuck the .vsix into ~/.local BEFORE the capture
                  + " && cp -a ~/.local /out/.local")
         script = (f"set -e; su - research -c {shlex.quote(inner)}; "
                   f"chown -R {os.getuid()}:{os.getgid()} /out")
@@ -2060,7 +2108,9 @@ def _agent_build_dist(agent: str, version: str) -> None:
         for _ in range(_AGENT_BUILD_ATTEMPTS):
             r = run(["docker", "run", "--rm", "-v", f"{tmp}:/out",
                      MINIMAL_BASE_IMAGE, "sh", "-lc", script], capture_output=True)
-            if r.returncode == 0 and os.path.lexists(captured / "bin" / bin_):
+            if (r.returncode == 0 and os.path.lexists(captured / "bin" / bin_)
+                    and (not ext
+                         or (captured / AGENT_EXT_SUBDIR / ext["file"]).is_file())):
                 built = True
                 break
             last_err = ((r.stderr or "") + (r.stdout or "")).strip()
