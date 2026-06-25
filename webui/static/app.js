@@ -782,7 +782,10 @@ function refreshBottomNav() {
 // the single #management-view pane. closeManagement (called by activateProject)
 // reverses it.
 function setServiceTabsHidden(hidden) {
-    document.querySelectorAll("#service-tabs .tab[data-service]")
+    // Hide the service tabs AND the group divider in the global host view —
+    // the divider is neither a .tab nor data-service-bearing, so without it
+    // a floating rule would strand after the active-project label.
+    document.querySelectorAll("#service-tabs .tab[data-service], #service-tabs .tab-group-divider")
         .forEach((t) => { t.style.display = hidden ? "none" : ""; });
 }
 function setActiveNavEntry(cls) {
@@ -2460,6 +2463,40 @@ async function setServiceHidden(project, serviceId, hide) {
     }
 }
 
+// "Visual vs CLI" is a product grouping, not a transport one, so it's an
+// explicit (optional) `surface` field defaulting to kind-derived: http
+// surfaces (code-server, future exported ports) are visual; ssh surfaces
+// (Supervisor/Management/PI shells) are cli. An entry may override by
+// declaring `surface` in services.py — it rides the whole-dict /services
+// payload to here for free.
+function surfaceOf(id, svc) {
+    return svc.surface || (svc.kind === "http" ? "visual" : "cli");
+}
+
+// Per-tab icon name, default-derived: the editor gets the code glyph, any
+// cli surface gets the terminal glyph, everything else the generic window.
+function iconOf(id, svc) {
+    if (svc.icon) return svc.icon;
+    if (id === "code-server") return "editor";
+    return surfaceOf(id, svc) === "cli" ? "terminal" : "generic";
+}
+
+// Hand-authored inline SVG glyphs (CSP-clean: inline markup, currentColor,
+// no external refs). Built via innerHTML — the makePinButton() precedent —
+// because el() routes through createElement, which makes an inert
+// HTML-namespace <svg> that does not render.
+const TAB_ICON_SVG = {
+    editor: '<svg viewBox="0 0 16 16" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M5.5 3.4 1 8l4.5 4.6L7 11.1 3.9 8 7 4.9zM10.5 3.4 9 4.9 12.1 8 9 11.1l1.5 1.5L15 8z"/></svg>',
+    terminal: '<svg viewBox="0 0 16 16" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M2 2.9 3.4 1.5 9.9 8l-6.5 6.5L2 13.1 7.1 8z"/><path d="M8 12h6v2H8z"/></svg>',
+    generic: '<svg viewBox="0 0 16 16" fill="currentColor" fill-rule="evenodd" xmlns="http://www.w3.org/2000/svg"><path d="M1.5 3h13v10h-13V3zm1.5 1.5v7h10v-7H3z"/></svg>',
+};
+
+function iconSvg(name) {
+    const span = el("span", { class: "tab-icon" });
+    span.innerHTML = TAB_ICON_SVG[name] || TAB_ICON_SVG.generic;
+    return span;
+}
+
 function renderServiceTabs(projectName, enabled) {
     const strip = document.getElementById("service-tabs");
     if (!strip) return;
@@ -2476,7 +2513,16 @@ function renderServiceTabs(projectName, enabled) {
         ]));
         return;
     }
+    // Partition into Visual (editors / iframe surfaces) then CLI (terminals),
+    // preserving SERVICES insertion order within each group. Visual leads —
+    // the editor is the primary work surface. A thin vertical rule separates
+    // the groups, omitted when either is empty so a CLI-only project (e.g. a
+    // bare docker box with no live editor) shows no orphan divider.
+    const visual = [], cli = [];
     for (const id of ids) {
+        (surfaceOf(id, enabled[id]) === "visual" ? visual : cli).push(id);
+    }
+    const makeTab = (id) => {
         const svc = enabled[id];
         const isPinned = id === state.pinnedService;
         const pinBtn = el("button", {
@@ -2484,13 +2530,17 @@ function renderServiceTabs(projectName, enabled) {
             title: isPinned ? "Unpin from side" : "Pin to side",
         }, ["⇥"]);
         pinBtn.onclick = (ev) => { ev.stopPropagation(); togglePin(id); };
-        const tab = el("div", {
+        return el("div", {
             class: isPinned ? "tab pinned" : "tab",
             "data-service": id,
             onclick: () => activateService(id),
-        }, [el("span", {}, [svc.label || id]), pinBtn]);
-        strip.appendChild(tab);
+        }, [iconSvg(iconOf(id, svc)), el("span", {}, [svc.label || id]), pinBtn]);
+    };
+    for (const id of visual) strip.appendChild(makeTab(id));
+    if (visual.length > 0 && cli.length > 0) {
+        strip.appendChild(el("div", { class: "tab-group-divider" }));
     }
+    for (const id of cli) strip.appendChild(makeTab(id));
 }
 
 function activateService(serviceId) {

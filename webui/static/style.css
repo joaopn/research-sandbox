@@ -430,6 +430,30 @@ body {
     white-space: nowrap;
     border-right: 1px solid var(--border);
 }
+/* Thin vertical rule between the Visual (editors / iframe surfaces) and CLI
+   (terminals) tab groups. Rendered by renderServiceTabs only when both
+   groups are non-empty, so it never orphans. */
+.service-tabs .tab-group-divider {
+    align-self: center;
+    width: 1px;
+    height: 18px;
+    margin: 0 6px;
+    background: var(--border);
+    flex-shrink: 0;
+}
+/* Inline-SVG tab icon. Inherits the tab's `color`, so the active/hover
+   states recolor it for free via currentColor. The .tab's flex `gap`
+   spaces it from the label. */
+.service-tabs .tab .tab-icon {
+    display: inline-flex;
+    align-items: center;
+    flex-shrink: 0;
+}
+.service-tabs .tab .tab-icon svg {
+    display: block;
+    width: 14px;
+    height: 14px;
+}
 
 .status-dot {
     width: 8px;
