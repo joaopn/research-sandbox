@@ -20,6 +20,13 @@ RUN chmod +x /entrypoint.sh
 # /opt/pi-templates/<role>/role.md staged in per-role layer images.
 RUN mkdir -p /opt/pi-templates && chown -R worker:worker /opt/pi-templates
 
+# Starting-message helper (STAGE_SPAWN_GREETING): cat a greeting file, then exec
+# a login shell. Called as the byobu new-session command by every PI-style tab
+# (Wrangler/Websearcher/pi-isolated) so the MOTD shows without auto-starting
+# claude and without single-quote nesting in the tab's docker-exec wrapper.
+COPY container/pi/greet-and-shell.sh /opt/pi-templates/greet-and-shell.sh
+RUN chmod +x /opt/pi-templates/greet-and-shell.sh
+
 # Bake the artifact-manifest verb (STAGE_SANDBOX_ARTIFACTS). Stdlib-only, so it
 # runs in every sandbox descendant — baked roles AND rs-pi-isolated, which is
 # FROM this image — regardless of the agent runtime. Invoked by the agent

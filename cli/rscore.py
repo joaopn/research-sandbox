@@ -352,6 +352,14 @@ class CreateRequest:
     # resolved manifest (like type/substrate) — never a user/broker input, so it
     # stays out of CREATE_WEBUI_FIELDS. Mutable default ⇒ default_factory.
     service_defaults: dict[str, bool] = field(default_factory=dict)
+    # The in-container starting message (STAGE_SPAWN_GREETING), printed once on
+    # first open of the workflow's main shell — distinct from the webui card
+    # `description` (which never enters the container). DERIVED in from_kwargs
+    # from the resolved manifest's `greeting` (like service_defaults) — never a
+    # user/broker input, so it stays out of CREATE_WEBUI_FIELDS. Staged to
+    # /workspace/.orchestrator/greeting at create for the management/research
+    # flavor; "" ⇒ no file staged.
+    greeting: str = ""
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "CreateRequest":
@@ -366,6 +374,9 @@ class CreateRequest:
         # validated at catalog-load time): research/box-host omit `services` ⇒ {}
         # ⇒ editor on; `sandbox` declares {"code-server": false} ⇒ lean box.
         service_defaults = dict(manifest.get("services") or {})
+        # Starting message (STAGE_SPAWN_GREETING): manifest-derived, coerced to a
+        # str so an explicit-null manifest never carries None into the typed field.
+        greeting = manifest.get("greeting") or ""
         # Effective light-path payload: manifest PRESET ⊕ explicit input, explicit
         # wins per field (the store-template-auto-fills-the-create-fields model).
         # The PAT is explicit-only — never in an operator-curated manifest.
@@ -445,6 +456,7 @@ class CreateRequest:
             repo=repo, ref=ref, setup=setup, github_pat=github_pat,
             agents=agents,
             service_defaults=service_defaults,
+            greeting=greeting,
         )
 
 
@@ -752,6 +764,11 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         json.dumps({"type": project_type, "substrate": substrate.value,
                     "workflow": req.workflow, "agents": deployed_agents},
                    indent=2) + "\n")
+    # Starting message (STAGE_SPAWN_GREETING) for the workflow's main shell, read
+    # by the Management/Supervisor tab on first byobu new-session. Manifest-
+    # derived; skip on empty so research/docker (no greeting) stage no stray file.
+    if req.greeting:
+        (orch_dir / "greeting").write_text(req.greeting)
 
     # 2. Per-project network + router wiring.
     progress.step("network", "creating project network")

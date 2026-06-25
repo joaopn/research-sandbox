@@ -1,0 +1,12 @@
+Wrangler — interactive DB-extraction (PI mode).
+
+This tab is a login shell. Type `claude` to start the wrangler session.
+
+The session reads the same database upstreams as the worker-facing wrangler
+(from the project's role-mcps.json), so PI mode and worker mode see the same
+DBs. Role + tools are auto-discovered when claude starts:
+
+  /workspace/CLAUDE.md            the wrangler role prompt (symlink to role.md)
+  /workspace/.tools-inventory.md  the live upstream / tool set
+
+Publish finished artifacts to /workspace/published/ via `manifest describe`.

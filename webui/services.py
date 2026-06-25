@@ -29,7 +29,11 @@ SERVICES = {
         "upstream_path": "/",
     },
     # The supervisor's interactive Claude session, attached via SSH +
-    # byobu. The service id was once `xterm` (named after the renderer)
+    # byobu. The new-session lands in bash (NON-login, as before) after
+    # cat-ing the workflow greeting if one was staged (STAGE_SPAWN_GREETING):
+    # the research workflow ships no greeting yet, so this is a clean no-op
+    # today — the mechanism is in place for a later manifest-only add.
+    # The service id was once `xterm` (named after the renderer)
     # and is now `supervisor` (named after what it actually connects
     # to). Existing projects' `research.service.xterm` labels are
     # orphaned by the rename — harmless (label-reading iterates
@@ -43,7 +47,8 @@ SERVICES = {
         "default_port": 22,
         "command": (
             "byobu attach -t main 2>/dev/null || "
-            "byobu new-session -s main -c /workspace -- bash"
+            "byobu new-session -s main -c /workspace -- "
+            "bash -c 'cat /workspace/.orchestrator/greeting 2>/dev/null; exec bash'"
         ),
     },
     # management — the default tab for `--type sandbox` projects
@@ -64,18 +69,25 @@ SERVICES = {
         "command": (
             "byobu attach -t main 2>/dev/null || "
             "byobu new-session -s main -c /workspace -- "
-            "bash -lc 'rs-sandbox; exec bash -l'"
+            "bash -lc 'cat /workspace/.orchestrator/greeting 2>/dev/null; exec bash -l'"
         ),
     },
-    # pi-wrangler — interactive DB-extraction tab. Command runs `claude`
-    # in byobu — claude auto-discovers `/workspace/CLAUDE.md` (symlinked
-    # to role.md by the pi entrypoint) and `/workspace/.mcp.json`
-    # (rendered from the project's worker-facing wrangler upstream set).
+    # pi-wrangler — interactive DB-extraction tab. The tab does NOT auto-start
+    # claude (STAGE_SPAWN_GREETING): new-session runs the greet helper, which
+    # cats the per-role greeting (the MOTD survives because claude's TUI would
+    # clear it) then drops into a login shell. The PI types `claude` to start the
+    # session — claude then auto-discovers `/workspace/CLAUDE.md` (symlinked to
+    # role.md by the pi entrypoint) and `/workspace/.mcp.json` (rendered from the
+    # project's worker-facing wrangler upstream set).
     #
-    # `byobu new-session -c /workspace` pins the session cwd so claude's
-    # auto-discovery finds both files. Without -c, byobu inherits the
-    # exec's cwd which is the docker default — claude would look for
-    # CLAUDE.md / .mcp.json in /home/worker and miss them.
+    # `byobu new-session -c /workspace` pins the session cwd so the PI's claude
+    # auto-discovery finds both files. Without -c, byobu inherits the exec's cwd
+    # which is the docker default — claude would look for CLAUDE.md / .mcp.json
+    # in /home/worker and miss them.
+    #
+    # The greet helper's path arg is per-role (`/opt/pi-templates/wrangler/
+    # greeting`); the helper takes it as $1 so there's no single-quote nesting
+    # inside this tab's `docker exec … bash -lc '…'` wrapper.
     #
     # always_on=False — visibility is per-project, gated on whether the
     # project enables the baked sandbox `wrangler`. The filter is in
@@ -105,25 +117,27 @@ SERVICES = {
         "command": (
             "docker exec -it rs-pi-wrangler bash -lc "
             "'byobu attach -t pi 2>/dev/null || "
-            "byobu new-session -s pi -c /workspace -- claude'"
+            "byobu new-session -s pi -c /workspace -- "
+            "/opt/pi-templates/greet-and-shell.sh /opt/pi-templates/wrangler/greeting'"
         ),
     },
     # pi-websearcher — interactive browser-driven web-research tab. Same
-    # shape as pi-wrangler: byobu attach-or-new, claude as the inner
-    # command, `-c /workspace` to land in the role's workspace so
-    # auto-discovery picks up CLAUDE.md (symlinked from role.md) and
-    # .mcp.json (rendered by entrypoint.pi.sh from the project's
-    # role-mcps.json[websearcher] entry plus the image-baked Playwright
-    # extras).
+    # shape as pi-wrangler: byobu attach-or-new, the greet helper as the
+    # inner command (no auto-claude — STAGE_SPAWN_GREETING), `-c /workspace`
+    # to land in the role's workspace so the PI's claude auto-discovers
+    # CLAUDE.md (symlinked from role.md) and .mcp.json (rendered by
+    # entrypoint.pi.sh from the project's role-mcps.json[websearcher] entry
+    # plus the image-baked Playwright extras).
     #
-    # The docker-exec wrapper MUST use `bash -lc` (login shell), matching
+    # The docker-exec wrapper MUST stay `bash -lc` (login shell), matching
     # pi-wrangler. claude installs to ~/.local/bin and is added to PATH only
     # via ~/.bashrc (see Dockerfile.analysis-base); a non-login,
     # non-interactive `bash -c` never sources it, so the tmux server it
-    # starts — and the pane that runs `claude` — inherit a PATH without
-    # ~/.local/bin and die with `claude: command not found` (RC 127). bash
-    # tabs (supervisor, pi-echo) don't hit this because /bin/bash is on the
-    # default PATH; only the auto-`claude` tabs do. See BUG_BUCKET B6.
+    # starts — and the shell where the PI runs `claude` — would inherit a PATH
+    # without ~/.local/bin and `claude` dies with `command not found` (RC 127).
+    # The greet helper's own `exec bash -l` re-establishes the login PATH too,
+    # so the guarantee is doubly held, but keep the outer -lc (the minimal,
+    # comment-consistent form). See BUG_BUCKET B6.
     #
     # Label keeps the "PI Websearcher" prefix — pi-wrangler dropped to
     # "Wrangler" during STAGE_2.5 polish, but the P.1 plan re-adds the
@@ -138,7 +152,8 @@ SERVICES = {
         "command": (
             "docker exec -it rs-pi-websearcher bash -lc "
             "'byobu attach -t pi 2>/dev/null || "
-            "byobu new-session -s pi -c /workspace -- claude'"
+            "byobu new-session -s pi -c /workspace -- "
+            "/opt/pi-templates/greet-and-shell.sh /opt/pi-templates/websearcher/greeting'"
         ),
     },
     # pi-echo — substrate test fixture — is deliberately omitted from
@@ -174,8 +189,14 @@ def pi_isolated_service(name: str) -> dict | None:
     claude, authenticating, pulling skills from the marketplace, etc. are
     all the PI's to do, in whatever order — auto-launching claude would
     pre-empt that. This mirrors pi-echo's `bash -l` tab. ``-c /workspace``
-    lands the shell where the clone + external folder live; ``bash -l`` so
-    the user's interactive shell has the full PATH (claude included)."""
+    lands the shell where the clone + external folder live.
+
+    The shell is reached via the shared greet helper (STAGE_SPAWN_GREETING),
+    which cats a greeting then `exec bash -l` (full PATH, claude included).
+    The greeting path is the future BYO convention ``/workspace/.rs-greeting``
+    (a cloned skill repo MAY ship one) — a clean no-op until then. Using the
+    helper also keeps the path out of single-quotes, so there's no nesting in
+    this tab's ``docker exec … bash -c '…'`` wrapper."""
     if not _PI_ISOLATED_NAME_RE.match(name):
         return None
     return {
@@ -187,7 +208,8 @@ def pi_isolated_service(name: str) -> dict | None:
         "command": (
             f"docker exec -it rs-pi-iso-{name} bash -c "
             "'byobu attach -t pi 2>/dev/null || "
-            "byobu new-session -s pi -c /workspace -- bash -l'"
+            "byobu new-session -s pi -c /workspace -- "
+            "/opt/pi-templates/greet-and-shell.sh /workspace/.rs-greeting'"
         ),
     }
 

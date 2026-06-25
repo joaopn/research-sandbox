@@ -62,7 +62,8 @@ PATH_RE = re.compile(r"^/[A-Za-z0-9/_.-]*$")
 PORT_MIN, PORT_MAX = 1, 65535
 
 _ALLOWED_KEYS = {"name", "substrate", "image_overlay", "repo", "ref", "setup",
-                 "tabs", "mcp_exports", "resources", "services", "description"}
+                 "tabs", "mcp_exports", "resources", "services", "description",
+                 "greeting"}
 _TAB_KEYS = {"name", "port", "kind", "path"}
 _EXPORT_KEYS = {"name", "port", "transport"}
 _RESOURCE_KEYS = {"memory", "cpus"}
@@ -210,6 +211,13 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
 
     if "description" in m and not _is_str(m["description"]):
         out.append(p("description must be a non-empty string"))
+
+    # greeting — the in-container starting message (STAGE_SPAWN_GREETING),
+    # distinct from `description` (the browser card blurb). Optional; like the
+    # repo/ref/setup payload fields it may be a non-empty string OR null (the
+    # null-allowing form, NOT description's stricter "present ⇒ non-empty").
+    if m.get("greeting") is not None and not _is_str(m.get("greeting")):
+        out.append(p("greeting must be a non-empty string or null"))
 
     extras = set(m) - _ALLOWED_KEYS
     if extras:

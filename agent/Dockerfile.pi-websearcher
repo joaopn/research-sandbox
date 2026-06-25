@@ -63,6 +63,10 @@ RUN npm install -g "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" && \
 # stages this to /workspace/role.md on first boot and symlinks
 # /workspace/CLAUDE.md -> role.md for claude auto-discovery.
 COPY container/pi-websearcher/role.md /opt/pi-templates/websearcher/role.md
+# Starting message (STAGE_SPAWN_GREETING), read by the Websearcher tab's greet
+# helper on first open. Sibling to role.md; covered by the chown at the
+# version-marker step below (chown -R /opt/pi-templates/websearcher).
+COPY container/pi-websearcher/greeting /opt/pi-templates/websearcher/greeting
 
 # --- Render the three image-baked JSON artifacts ----------------------------
 # Reuse the worker-facing websearcher's YAML source-of-truth (PW2). The
