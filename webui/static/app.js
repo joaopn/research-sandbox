@@ -199,7 +199,9 @@ const state = {
     salt: null,              // Uint8Array | null
     vault: null,             // { version, projects, settings } | null
     activeProject: null,     // string | null
-    hostPage: null,          // "workflows" | "management" | "settings" | null (open host page)
+    hostPage: null,          // "workflows" | "management" | "settings" | "explain:<name>" | null
+    openDocs: [],            // [<workflow name>] — open Explain doc tabs (closable rail entries)
+    explainIndex: null,      // string[] of workflows with a rendered Explain doc (/static/explain/index.json); null = unfetched
     activeService: null,     // string | null
     serviceRegistry: null,   // { [serviceId]: spec } from /services
     projectServices: {},     // { [projectName]: { [serviceId]: spec } }
@@ -735,13 +737,43 @@ function makeBottomNav() {
         e.onclick = (ev) => { ev.stopPropagation(); open(); };
         return e;
     };
+    // Open Explain doc tabs (STAGE_WORKFLOW_EXPLAIN): closable rail entries below
+    // the fixed nav. Persistent until ×'d; clicking re-focuses. They render over
+    // the same single host pane (one doc shown at a time) — "persistent" = the
+    // rail entry survives until closed.
+    const docEntries = (state.openDocs || []).map((name) => {
+        const x = el("span", { class: "nav-doc-close", title: "Close" }, ["×"]);
+        x.onclick = (ev) => { ev.stopPropagation(); closeExplain(name); };
+        const e = el("div",
+            { class: "nav-entry explain-entry explain-entry-" + name, title: "Explain: " + name },
+            [el("span", { class: "nav-icon" }, ["📖"]), el("span", {}, [name]), x]);
+        e.onclick = (ev) => { ev.stopPropagation(); openExplain(name); };
+        return e;
+    });
     return el("div", { class: "rail-nav-group" }, [
         mk("workflows-entry", "🛍", "Workflows",
            "Workflows — pick a workflow to create a project", openWorkflows),
         mk("management-entry", "🗂", "Management",
            "Host project management (broker)", openManagement),
         mk("settings-entry", "⚙", "Settings", "UI settings", openSettings),
+        ...docEntries,
     ]);
+}
+
+// Re-render just the bottom nav group in place (no full rail rebuild) so opening
+// or closing an Explain doc tab updates its rail entries immediately.
+function refreshBottomNav() {
+    const existing = document.querySelector(".rail-nav-group");
+    if (existing) existing.replaceWith(makeBottomNav());
+    // makeBottomNav builds every entry inactive; re-derive the active highlight
+    // from the current host page so closing a BACKGROUND doc (while another page
+    // is shown) doesn't blank the still-active entry.
+    const hp = state.hostPage;
+    if (hp === "workflows" || hp === "management" || hp === "settings") {
+        setActiveNavEntry(hp + "-entry");
+    } else if (hp && hp.startsWith("explain:")) {
+        setActiveNavEntry("explain-entry-" + hp.slice("explain:".length));
+    }
 }
 
 // Shared host-page chrome: a non-project page (Workflows / Management / Settings)
@@ -1463,6 +1495,14 @@ async function renderWorkflowsInto(view) {
     let body;
     try { body = await res.json(); } catch (e) { return renderMgmtUnavailable(view); }
     if (!res.ok || !body.ok || !body.result) return renderMgmtUnavailable(view);
+    // Which workflows have a rendered Explain doc (baked static index — built-ins
+    // only). Best-effort + cached: a missing index just means no Explain buttons.
+    if (state.explainIndex === null) {
+        try {
+            const ir = await fetch("/static/explain/index.json");
+            state.explainIndex = ir.ok ? await ir.json() : [];
+        } catch (e) { state.explainIndex = []; }
+    }
     renderWorkflowsScreen(view, body.result);
 }
 
@@ -1470,13 +1510,26 @@ function renderWorkflowsScreen(view, result) {
     view.innerHTML = "";
     const workflows = Array.isArray(result.workflows) ? result.workflows : [];
     const agents = Array.isArray(result.agents) ? result.agents : [];
+    const explain = new Set(state.explainIndex || []);
     const grid = el("div", { class: "workflows-grid" }, workflows.map((m) => {
+        // A built-in with a baked doc → Explain; a BYO with a repo → "Repo ↗".
+        // Both stopPropagation so they don't trigger the card's create dialog.
+        let action = null;
+        if (explain.has(m.name)) {
+            action = el("button", { class: "explain-btn", title: "Open the explainer" }, ["Explain"]);
+            action.onclick = (ev) => { ev.stopPropagation(); openExplain(m.name); };
+        } else if (m.source === "byo" && m.repo) {
+            action = el("a", { class: "explain-repo", href: m.repo,
+                               target: "_blank", rel: "noopener noreferrer" }, ["Repo ↗"]);
+            action.onclick = (ev) => { ev.stopPropagation(); };
+        }
         const card = el("div", { class: "workflows-card", title: m.description || "" }, [
             el("div", { class: "workflows-card-name" }, [
                 m.name,
                 m.source === "byo" ? el("span", { class: "workflows-byo" }, ["byo"]) : null,
             ]),
             el("div", { class: "workflows-card-desc" }, [m.description || ""]),
+            el("div", { class: "workflows-card-actions" }, [action]),
         ]);
         card.onclick = () => mgmtCreateDialog(view, m, agents);
         return card;
@@ -1485,6 +1538,54 @@ function renderWorkflowsScreen(view, result) {
         el("h2", { class: "workflows-title" }, ["Workflows"]),
         el("div", { class: "hint workflows-sub" }, ["Pick a workflow to create a project."]),
         grid,
+    ]));
+}
+
+// ---- Explain doc tabs (STAGE_WORKFLOW_EXPLAIN) ------------------------------
+// A workflow's Explain button opens its baked learning doc (static HTML with an
+// inline interactive SVG) as a persistent, closable tab over the single host pane
+// — same chrome as the Workflows/Management/Settings host pages (enterHostView),
+// never clearBody (which would tear down the whole body).
+
+function openExplain(name) {
+    if (!state.openDocs.includes(name)) state.openDocs.push(name);
+    state.hostPage = "explain:" + name;
+    const view = enterHostView();
+    if (!view) return;
+    refreshBottomNav();   // sets the active highlight from state.hostPage
+    renderExplainInto(view, name);
+}
+
+function closeExplain(name) {
+    const wasActive = state.hostPage === "explain:" + name;
+    state.openDocs = state.openDocs.filter((n) => n !== name);
+    if (wasActive) leaveHostView();   // drop to the prior project / welcome
+    refreshBottomNav();
+}
+
+async function renderExplainInto(view, name) {
+    view.innerHTML = "";
+    view.appendChild(el("div", { class: "mgmt-loading" }, ["Loading…"]));
+    let res;
+    try {
+        res = await fetch("/static/explain/" + encodeURIComponent(name) + ".html");
+    } catch (e) { return renderExplainError(view, name); }
+    if (!res.ok) return renderExplainError(view, name);
+    const html = await res.text();
+    view.innerHTML = "";
+    // Built-in, repo-controlled, script-free fragment (md→HTML + inline SVG at
+    // build). Scoped under .explain-doc so the SVG's self-scoped <style> applies.
+    const doc = el("div", { class: "explain-doc" });
+    doc.innerHTML = html;
+    view.appendChild(doc);
+}
+
+function renderExplainError(view, name) {
+    view.innerHTML = "";
+    view.appendChild(el("div", { class: "mgmt-error explain-error" }, [
+        el("h2", {}, ["Doc unavailable"]),
+        el("p", {}, ["Couldn't load the “" + name + "” explainer. If you just added "
+            + "it, rebuild the webui image so it's rendered into the bundle."]),
     ]));
 }
 

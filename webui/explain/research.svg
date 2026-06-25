@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 460" role="img" aria-label="Research workflow orchestration">
+  <style>
+    .explain-doc svg .node rect { fill: #1f2933; stroke: #5b8def; stroke-width: 1.5; }
+    .explain-doc svg .node text { fill: #e6edf3; font: 13px sans-serif; text-anchor: middle; dominant-baseline: middle; }
+    .explain-doc svg .node:hover rect { fill: #2b3a4a; stroke: #8ab4ff; }
+    .explain-doc svg .edge { stroke: #7a8794; stroke-width: 1.5; fill: none; marker-end: url(#rs-arrow); }
+    .explain-doc svg .edge-label { fill: #9aa7b4; font: 11px sans-serif; text-anchor: middle; }
+    .explain-doc svg a { cursor: pointer; }
+  </style>
+  <defs>
+    <marker id="rs-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#7a8794"/>
+    </marker>
+  </defs>
+
+  <!-- edges first (under the nodes) -->
+  <line class="edge" x1="330" y1="66"  x2="330" y2="104"/>
+  <line class="edge" x1="290" y1="152" x2="170" y2="200"/>
+  <line class="edge" x1="330" y1="152" x2="330" y2="200"/>
+  <line class="edge" x1="370" y1="152" x2="490" y2="200"/>
+  <line class="edge" x1="135" y1="248" x2="190" y2="290"/>
+  <line class="edge" x1="255" y1="290" x2="315" y2="248"/>
+  <path  class="edge" d="M250,140 C30,210 30,330 268,386"/>
+  <text class="edge-label" x="44" y="300">egress</text>
+
+  <a href="#what-it-is">
+    <g class="node"><title>You — the PI. You drive the supervisor; only reviewed results reach you.</title>
+      <rect x="260" y="22" width="140" height="44" rx="8"/>
+      <text x="330" y="44">Researcher</text></g>
+  </a>
+  <a href="#how-it-works">
+    <g class="node"><title>rs-supervisor: the Claude session that plans, spawns workers, reviews, and reports. It does no analysis itself.</title>
+      <rect x="250" y="104" width="160" height="48" rx="8"/>
+      <text x="330" y="128">Supervisor</text></g>
+  </a>
+  <a href="#components">
+    <g class="node"><title>Disposable per-question analysis containers spawned in the supervisor's inner Docker daemon.</title>
+      <rect x="40" y="200" width="160" height="48" rx="8"/>
+      <text x="120" y="224">Analysis workers</text></g>
+  </a>
+  <a href="#components">
+    <g class="node"><title>Service agents (websearcher, wrangler, …) workers call through the mcp-proxy; each spawns its own per-call Claude session.</title>
+      <rect x="250" y="200" width="160" height="48" rx="8"/>
+      <text x="330" y="224">Role-MCPs</text></g>
+  </a>
+  <a href="#components">
+    <g class="node"><title>Long-lived interactive PI-role containers you open directly in the webui, isolated from the worker pipeline.</title>
+      <rect x="460" y="200" width="160" height="48" rx="8"/>
+      <text x="540" y="224">PI-role tabs</text></g>
+  </a>
+  <a href="#components">
+    <g class="node"><title>Routes worker → role-MCP calls inside the inner bridge (mcp-proxy:8888).</title>
+      <rect x="120" y="290" width="170" height="40" rx="8"/>
+      <text x="205" y="310">mcp-proxy</text></g>
+  </a>
+  <a href="#components">
+    <g class="node"><title>Per-project egress filter (open or locked) — all outbound traffic traverses it.</title>
+      <rect x="250" y="384" width="160" height="44" rx="8"/>
+      <text x="330" y="406">rs-router</text></g>
+  </a>
+</svg>

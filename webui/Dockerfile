@@ -29,6 +29,18 @@ COPY static/index.html static/
 COPY static/app.js static/
 COPY static/style.css static/
 
+# Per-workflow Explain docs (STAGE_WORKFLOW_EXPLAIN): render webui/explain/*.md
+# (+ inline interactive SVG) into static HTML at build. Pure-Python (Python-
+# Markdown) — no node, no Chromium. Pinned as an ARG: the webui image is built via
+# `docker compose build webui` (scoped ./webui context), which does NOT thread
+# versions.env, so this ARG is its named home (the XTERM_VERSION precedent). Runs
+# BEFORE the chown below so /app/static/explain/* is webui-owned.
+ARG MD_LIB_VERSION=3.7
+RUN pip install --no-cache-dir markdown==${MD_LIB_VERSION}
+COPY explain/ explain/
+COPY render_explain.py ./
+RUN python render_explain.py explain static/explain
+
 RUN useradd -m -u 1000 webui \
  && mkdir -p /app/tls \
  && chown -R webui:webui /app
