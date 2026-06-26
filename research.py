@@ -157,6 +157,10 @@ def cmd_start(args: argparse.Namespace) -> None:
     # every per-project network. Re-attach so subsequent `project update`
     # calls find rs-router on rs-net-<project>.
     wire_router_to_projects()
+    # Re-attach the extension registry to existing projects after a restart that
+    # recreated it. LAZY: no-op if no project has ever enabled an extension (the
+    # registry is stood up on first `enable`, not here). STAGE_FEATURE_STAGING C1.
+    wire_registry_to_projects()
     _start_enabled_mcps()
     print("up.")
 
@@ -817,7 +821,7 @@ def cmd_sandbox_list(args: argparse.Namespace) -> None:
     registry types. The DEFAULT column marks types flagged for auto-enable in
     new projects (`research sandbox enable <name>`). Visibility surface — what
     can be enabled per project."""
-    cat = sandbox.catalog()
+    cat = sandbox.catalog(rscore.load_versions())
     default_on = set(defaults.enabled("sandbox"))
     if args.json:
         for c in cat:

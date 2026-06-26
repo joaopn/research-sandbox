@@ -1281,6 +1281,11 @@ MCP_PROXY_IMAGE = "rs-mcp-proxy:latest"
 ROLE_MCP_BASE_IMAGE = "rs-role-mcp-base:latest"
 PI_BASE_IMAGE = "rs-pi-base:latest"
 PI_ISOLATED_IMAGE = "rs-pi-isolated:latest"
+# Clean, research-DECOUPLED base for EXTENSION node images (STAGE_FEATURE_STAGING
+# C1). FROM miniconda3 (NOT rs-analysis-base) — sibling of rs-minimal-base, forked
+# on rebuild-blast-radius. Ext leaves (rs-ext-<name>) FROM it; pushed to the local
+# registry, pulled by a project's inner dockerd. See cli/sandbox.py EXT_REGISTRY_REFS.
+EXT_BASE_IMAGE = "rs-ext-base:latest"
 # Disposable box image for the agent-less sandbox-project flavor
 # (STAGE_SANDBOX_PROJECT.md). FROM rs-analysis-base (NOT rs-pi-base) — clean,
 # no artifact-contract baggage. Staged into a sandbox project's inner dockerd
@@ -1296,6 +1301,17 @@ WEBUI_IMAGE = "rs-webui:latest"
 WEBUI_CONTAINER = "rs-webui"
 ROUTER_CONTAINER = "rs-router"
 ROUTER_NETWORK = "rs-sandbox"
+# Local extension-image registry (STAGE_FEATURE_STAGING C1). The in-container
+# listen port is FIXED at 5000 — it is baked into the inner daemon's
+# insecure-registries entry (agent/Dockerfile.substrate-base) AND into
+# sandbox.EXT_REGISTRY ("rs-registry:5000"), the pull locator. ONLY the HOST
+# loopback publish port is configurable (REGISTRY_HOST_PORT in versions.env), used
+# for the host push (loopback = insecure-by-default, no host daemon.json change).
+REGISTRY_CONTAINER = "rs-registry"
+REGISTRY_INNER_PORT = "5000"
+DEFAULT_REGISTRY_VERSION = "2.8.3"
+DEFAULT_REGISTRY_HOST_PORT = "5000"
+REGISTRY_CACHE_DIR = Path.home() / ".research-sandbox" / "registry"
 CONTAINER_PREFIX = "rs-project-"
 DOCKER_VOLUME_PREFIX = "rs-docker-"
 PROJECT_NETWORK_PREFIX = "rs-net-"
@@ -1745,12 +1761,13 @@ def ensure_project_network(project: str, mode: str) -> tuple[str, str]:
 def remove_project_network(project: str) -> None:
     network = project_network_for(project)
     remove_firewall_rules(network)
-    # Disconnect every container research.py knows might be attached. The
-    # webui (if running) was wired in by `wire_webui_to_projects()` at
-    # create time; without an explicit disconnect, `network rm` fails with
-    # "endpoints remain". Both calls are idempotent — they exit non-zero
-    # silently when the container isn't on this network.
-    for svc in (ROUTER_CONTAINER, WEBUI_CONTAINER):
+    # Disconnect every container research.py knows might be attached. The webui
+    # (if running) was wired in by `wire_webui_to_projects()` and the registry
+    # (if the project ever enabled an extension) by
+    # `_connect_registry_to_project_network()`; without an explicit disconnect,
+    # `network rm` fails with "endpoints remain". All calls are idempotent — they
+    # exit non-zero silently when the container isn't on this network.
+    for svc in (ROUTER_CONTAINER, WEBUI_CONTAINER, REGISTRY_CONTAINER):
         run(["docker", "network", "disconnect", network, svc],
             capture_output=True)
     run(["docker", "network", "rm", network], capture_output=True)
@@ -2523,6 +2540,10 @@ def _build_images(force: bool) -> None:
         (SANDBOX_BOX_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.sandbox-box"),
         (SANDBOX_BOX_BROWSER_IMAGE,
          SCRIPT_DIR / "agent" / "Dockerfile.sandbox-box-browser"),
+        # Clean extension base (STAGE_FEATURE_STAGING C1). FROM miniconda3, so it
+        # has no in-tree FROM dependency; the ext leaves below FROM it, so it MUST
+        # precede them (this static list builds before the dynamic ext loop).
+        (EXT_BASE_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.ext-base"),
     ]
     for role, image in sorted(role_mcp.ROLE_IMAGES.items()):
         dockerfile = SCRIPT_DIR / "agent" / f"Dockerfile.{role}"
@@ -2544,6 +2565,23 @@ def _build_images(force: bool) -> None:
             continue
         specs.append((image, dockerfile))
     pins = load_versions()
+    # MIGRATED extension-lane roles (STAGE_FEATURE_STAGING C1): build a clean
+    # rs-ext-<name> image (FROM rs-ext-base, no rs-analysis-base lineage), tagged
+    # with its versions.env pin so the push/pull ref carries the snapshot pin. The
+    # PUSH to the local registry happens lazily at `enable` (_push_extension_image),
+    # not here — `_build_images` only produces the host image.
+    for name, (repo, vkey) in sorted(sandbox.EXT_REGISTRY_REFS.items()):
+        dockerfile = SCRIPT_DIR / "agent" / f"Dockerfile.ext-{name}"
+        if not dockerfile.is_file():
+            print(f"warning: extension {name!r} has no Dockerfile at "
+                  f"{dockerfile.name}; skipping", file=sys.stderr)
+            continue
+        pin = pins.get(vkey)
+        if not pin:
+            print(f"warning: extension {name!r} missing pin {vkey} in "
+                  f"versions.env; skipping", file=sys.stderr)
+            continue
+        specs.append((f"rs-ext-{name}:{pin}", dockerfile))
     for tag, dockerfile in specs:
         if not force and run_quiet(["docker", "image", "inspect", tag]):
             print(f"image {tag} already present (use --rebuild to force)")
@@ -3263,6 +3301,80 @@ def _build_mcp_entry(args: argparse.Namespace) -> dict:
 def _ensure_router_running() -> None:
     if not container_running(ROUTER_CONTAINER):
         die(f"{ROUTER_CONTAINER} is not running. Run `research start` first.")
+
+
+def _ensure_registry_running() -> None:
+    """Idempotent local extension-image registry on rs-sandbox — the artifact
+    store for the extension lane (STAGE_FEATURE_STAGING C1). Triad:
+    running -> no-op; exists-stopped -> docker start; absent -> docker run.
+
+    Published on 127.0.0.1:<REGISTRY_HOST_PORT> for the HOST push (loopback =
+    insecure-by-default), and reachable on rs-sandbox / per-project networks as
+    rs-registry:5000 for the inner-dockerd pull. Stood up lazily (first extension
+    enable), not at `research start`."""
+    if container_running(REGISTRY_CONTAINER):
+        return
+    if container_exists(REGISTRY_CONTAINER):
+        run_check(["docker", "start", REGISTRY_CONTAINER])
+        return
+    pins = load_versions()
+    image = "registry:" + pins.get("REGISTRY_VERSION", DEFAULT_REGISTRY_VERSION)
+    host_port = pins.get("REGISTRY_HOST_PORT", DEFAULT_REGISTRY_HOST_PORT)
+    if not run_quiet(["docker", "image", "inspect", image]):
+        print(f"pulling {image}...")
+        run_check(["docker", "pull", image])
+    REGISTRY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    r = run([
+        "docker", "run", "-d",
+        "--name", REGISTRY_CONTAINER,
+        "--network", ROUTER_NETWORK,
+        "--restart", "unless-stopped",
+        "-p", f"127.0.0.1:{host_port}:{REGISTRY_INNER_PORT}",
+        "-v", f"{REGISTRY_CACHE_DIR}:/var/lib/registry",
+        image,
+    ], capture_output=True)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip()
+        if "already allocated" in err or "address already in use" in err:
+            die(f"host port {host_port} is already in use; set REGISTRY_HOST_PORT "
+                f"in versions.env to a free port and retry. (docker: "
+                f"{err[-200:]})")
+        die(f"failed to start {REGISTRY_CONTAINER}: {err[-300:]}")
+    print(f"started {REGISTRY_CONTAINER} (local extension registry on "
+          f"{ROUTER_NETWORK})")
+
+
+def _connect_registry_to_project_network(network: str) -> None:
+    """Attach the local registry to a per-project network so the project's inner
+    dockerd pulls rs-registry:5000 by container DNS over its OWN subnet (L2) —
+    never crossing the router's RFC1918 DROP. Ensures the registry exists first
+    (lazy stand-up). Idempotent (a re-connect exits non-zero silently)."""
+    _ensure_registry_running()
+    run(["docker", "network", "connect", network, REGISTRY_CONTAINER],
+        capture_output=True)
+
+
+def _push_extension_image(name: str) -> None:
+    """Lazily publish a migrated extension's host-built image into the local
+    registry (STAGE_FEATURE_STAGING C1 lazy-push). Pushes via the loopback port
+    (insecure-by-default, no host daemon.json change). Idempotent — re-pushing an
+    existing tag re-sends only the manifest (layers are skipped)."""
+    pins = load_versions()
+    repo, vkey = sandbox.EXT_REGISTRY_REFS[name]
+    pin = pins.get(vkey)
+    if not pin:
+        die(f"missing version pin {vkey} for extension {name!r}; add it to "
+            f"versions.env and run `research start --rebuild`.")
+    host_tag = f"rs-ext-{name}:{pin}"
+    if not run_quiet(["docker", "image", "inspect", host_tag]):
+        die(f"extension image {host_tag} not built; run `research start "
+            f"--rebuild` first.")
+    _ensure_registry_running()
+    host_port = pins.get("REGISTRY_HOST_PORT", DEFAULT_REGISTRY_HOST_PORT)
+    push_ref = f"127.0.0.1:{host_port}/{repo}:{pin}"
+    run_check(["docker", "tag", host_tag, push_ref])
+    run_check(["docker", "push", push_ref])
+    print(f"published extension {name!r} -> {sandbox.EXT_REGISTRY}/{repo}:{pin}")
 
 
 def _spawn_shared_mcp(name: str, entry: dict) -> None:
@@ -4118,8 +4230,17 @@ def _sandbox_start(supervisor: str, project: str, cfg: "Config",
     ]
 
     if kind == "baked":
-        image = entry.get("image") or sandbox.BAKED_IMAGES[name]
-        stage_worker_image(supervisor, image, force=force_restage)
+        image = entry.get("image") or sandbox.image_ref(name, load_versions())
+        if sandbox.is_ext(name):
+            # MIGRATED extension (STAGE_FEATURE_STAGING C1): the inner dockerd
+            # PULLS the snapshot ref from the local registry (offline — the
+            # registry is attached to this project's own network) instead of a
+            # host save/load stage. force_restage is irrelevant: the pin is
+            # immutable, so a recreate re-pulls the same tag (layer-cached). The
+            # same ref is used for the `docker run` below.
+            run_check(["docker", "exec", supervisor, "docker", "pull", image])
+        else:
+            stage_worker_image(supervisor, image, force=force_restage)
         # Single RW workspace mount + RO orchestrator mount. The latter lets a
         # mirror role render .mcp.json + .tools-inventory.md at entrypoint time
         # from the same role-mcps.json the worker service uses (pi-echo-style
@@ -4221,8 +4342,16 @@ def _sandbox_enable(project: str, cfg: "Config", name: str) -> None:
                     f"--upstream <mcp,...>` first, then re-run this command. "
                     f"(Sandbox mode reads its upstream set from the worker "
                     f"service so both surfaces share one source of truth.)")
-        entries[name] = sandbox.build_baked_entry(name)
+        entries[name] = sandbox.build_baked_entry(name, load_versions())
         sandbox.save(workspace_path, entries)
+        if sandbox.is_ext(name):
+            # MIGRATED extension (STAGE_FEATURE_STAGING C1): publish the host
+            # image to the local registry (lazy push) and attach the registry to
+            # this project's network so the inner dockerd's pull in _sandbox_start
+            # resolves rs-registry:5000 over the project's own subnet. Both are
+            # idempotent.
+            _push_extension_image(name)
+            _connect_registry_to_project_network(project_network_for(project))
         _sandbox_start(supervisor, project, cfg, name)
         return
 
@@ -4599,6 +4728,27 @@ def wire_router_to_projects() -> None:
     for net in r.stdout.strip().splitlines():
         if net:
             run(["docker", "network", "connect", net, ROUTER_CONTAINER],
+                capture_output=True)
+
+
+def wire_registry_to_projects() -> None:
+    """Re-attach rs-registry to every per-project network after a host
+    `start` / registry recreate (mirror of wire_router_to_projects). LAZY: if the
+    registry has never been created (no extension enabled yet) do nothing — it is
+    stood up on first `enable`, not at `start`. If it exists but is stopped, start
+    it, then re-attach. Without this, a `start` that recreated the registry would
+    leave existing projects' inner dockerds unable to pull their extensions."""
+    if not container_exists(REGISTRY_CONTAINER):
+        return
+    if not container_running(REGISTRY_CONTAINER):
+        run_check(["docker", "start", REGISTRY_CONTAINER])
+    r = run(["docker", "network", "ls",
+             "--filter", f"name=^{PROJECT_NETWORK_PREFIX}",
+             "--format", "{{.Name}}"],
+            capture_output=True)
+    for net in r.stdout.strip().splitlines():
+        if net:
+            run(["docker", "network", "connect", net, REGISTRY_CONTAINER],
                 capture_output=True)
 
 

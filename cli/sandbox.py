@@ -48,13 +48,30 @@ BAKED_IPS: dict[str, str] = {
     "echo":        "192.168.99.13",
 }
 
-# Per-role images built by research.py's _build_images (FROM rs-pi-base,
-# baking /opt/pi-templates/<name>/role.md). librarian is IP-reserved but not
-# yet buildable (no image) — baked_names() intersects the two tables.
+# LEGACY save/load baked roles: per-role images built by _build_images (FROM
+# rs-pi-base, baking /opt/pi-templates/<name>/role.md), staged into a project's
+# inner dockerd via `docker save | docker load`. librarian is IP-reserved but not
+# yet buildable (no image). websearcher MIGRATED to the extension lane (below) —
+# it is no longer here, so its Dockerfile.pi-websearcher is no longer built by the
+# loop (the old leaf lingers unused until a later cleanup).
 BAKED_IMAGES: dict[str, str] = {
     "echo":         "rs-pi-echo:latest",
     "wrangler":     "rs-pi-wrangler:latest",
-    "websearcher":  "rs-pi-websearcher:latest",
+}
+
+# MIGRATED extension-lane roles (STAGE_FEATURE_STAGING C1). Same `kind="baked"`
+# entry shape + pinned IP as a legacy baked role — the ONLY difference is image
+# DELIVERY: instead of a per-role rs-pi-<name> leaf staged by save/load, an
+# extension builds a clean rs-ext-<name> image (FROM rs-ext-base, NO
+# rs-analysis-base lineage), is pushed to the local registry, and is PULLED by a
+# project's inner dockerd. Mapping: name -> (registry repo, versions.env pin key).
+# ``EXT_REGISTRY`` is the inner-pull locator and MUST match the inner daemon's
+# insecure-registries entry (agent/Dockerfile.substrate-base). The snapshot ref
+# (rs-registry:5000/<repo>:<pin>) is stamped into sandbox.json at enable
+# (image_ref) and read verbatim at spawn/recreate.
+EXT_REGISTRY = "rs-registry:5000"
+EXT_REGISTRY_REFS: dict[str, tuple[str, str]] = {
+    "websearcher": ("ext-websearcher", "EXT_WEBSEARCHER_VERSION"),
 }
 
 # BYO inner-bridge IP pool (was cli/pi_isolated.py). Disjoint from the baked
@@ -84,12 +101,46 @@ VALID_KINDS = ("baked", "byo", "sandbox")
 
 
 def baked_names() -> list[str]:
-    """Buildable baked roles = roles with both a pinned IP and an image."""
-    return sorted(set(BAKED_IPS) & set(BAKED_IMAGES))
+    """Enableable baked-or-ext roles = roles with a pinned IP AND a buildable
+    image source — either a LEGACY save/load image (BAKED_IMAGES) or a MIGRATED
+    registry-pulled extension (EXT_REGISTRY_REFS). Both present as `kind="baked"`;
+    the only divergence is image delivery (see image_ref / is_ext)."""
+    sources = set(BAKED_IMAGES) | set(EXT_REGISTRY_REFS)
+    return sorted(set(BAKED_IPS) & sources)
 
 
 def is_baked(name: str) -> bool:
     return name in set(baked_names())
+
+
+def is_ext(name: str) -> bool:
+    """A MIGRATED extension-lane role (registry-pulled) vs a legacy save/load
+    baked role. The fork is image delivery, not the entry's ``kind`` (both are
+    ``"baked"``)."""
+    return name in EXT_REGISTRY_REFS
+
+
+def image_ref(name: str, pins: dict[str, str] | None = None) -> str:
+    """Canonical image reference for a baked-or-ext role.
+
+    Legacy baked -> the host image tag (staged via save/load).
+    Ext          -> the local-registry PULL ref with the snapshot pin
+                    (``rs-registry:5000/<repo>:<pin>``), pulled by the inner
+                    dockerd.
+
+    ``pins`` is the versions.env dict (``rscore.load_versions()``), required for
+    ext so the pin can be snapshotted into the sandbox.json entry at enable.
+    Raises ``ValueError`` if an ext role's pin is absent."""
+    if name in EXT_REGISTRY_REFS:
+        repo, key = EXT_REGISTRY_REFS[name]
+        pin = (pins or {}).get(key)
+        if not pin:
+            raise ValueError(
+                f"missing version pin {key} for extension {name!r}; add it to "
+                f"versions.env"
+            )
+        return f"{EXT_REGISTRY}/{repo}:{pin}"
+    return BAKED_IMAGES[name]
 
 
 def container_name(name: str, kind: str) -> str:
@@ -189,12 +240,17 @@ def validate_baked(name: str) -> None:
         )
 
 
-def build_baked_entry(name: str) -> dict[str, Any]:
+def build_baked_entry(name: str, pins: dict[str, str] | None = None) -> dict[str, Any]:
+    """Build the sandbox.json entry for a baked-or-ext role. ``image`` is
+    SNAPSHOTTED here via image_ref — for ext roles that freezes the current
+    versions.env pin into the entry, so spawn/recreate reuse it verbatim and a
+    later pin bump only affects a fresh enable. ``pins`` (load_versions()) is
+    required for ext roles."""
     validate_baked(name)
     return {
         "kind": "baked",
         "ip": BAKED_IPS[name],
-        "image": BAKED_IMAGES[name],
+        "image": image_ref(name, pins),
         "container": container_name(name, "baked"),
         "mirror_of": mirror_of(name),
     }
@@ -220,16 +276,22 @@ def build_byo_entry(name: str, type_entry: dict[str, Any], ip: str) -> dict[str,
 # ---------------------------------------------------------------------------
 
 
-def catalog() -> list[dict[str, Any]]:
-    """All available sandbox *types*: baked (constants) + BYO (host
+def catalog(pins: dict[str, str] | None = None) -> list[dict[str, Any]]:
+    """All available sandbox *types*: baked + ext (constants) + BYO (host
     registry). Drives `research sandbox list`. Tolerates a malformed BYO
-    registry — baked types still list."""
+    registry — baked types still list. ``pins`` (load_versions()) lets ext rows
+    show the real registry ref; without it they fall back to an unpinned display
+    ref so the listing never crashes on a missing pin."""
     out: list[dict[str, Any]] = []
     for n in baked_names():
+        try:
+            img = image_ref(n, pins)
+        except ValueError:
+            img = f"{EXT_REGISTRY}/{EXT_REGISTRY_REFS[n][0]}:<unpinned>"
         out.append({
             "name": n,
             "kind": "baked",
-            "image": BAKED_IMAGES[n],
+            "image": img,
             "mirror_of": mirror_of(n),
             "repo": None,
             "root": None,

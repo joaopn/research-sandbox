@@ -36,7 +36,12 @@ ARG DOCKER_VERSION=29.5.3
 RUN curl -fsSL https://get.docker.com | VERSION=${DOCKER_VERSION} sh && \
     rm -rf /var/lib/apt/lists/*
 
-# Point the inner dockerd at crun as the default OCI runtime.
+# Point the inner dockerd at crun as the default OCI runtime, and trust the local
+# extension registry (STAGE_FEATURE_STAGING C1) as an insecure (plain-HTTP)
+# registry. The registry is reached at rs-registry:5000 over the per-project
+# network (the inner dockerd pulls extension images by container DNS); it must
+# match sandbox.EXT_REGISTRY exactly. Host pushes go via a loopback port, which
+# Docker trusts by default, so ONLY the inner daemon needs this entry.
 RUN mkdir -p /etc/docker && cat > /etc/docker/daemon.json <<'JSON'
 {
   "default-runtime": "crun",
@@ -44,7 +49,8 @@ RUN mkdir -p /etc/docker && cat > /etc/docker/daemon.json <<'JSON'
     "crun": {
       "path": "/usr/bin/crun"
     }
-  }
+  },
+  "insecure-registries": ["rs-registry:5000"]
 }
 JSON
 

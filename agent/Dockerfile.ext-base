@@ -1,0 +1,79 @@
+FROM continuumio/miniconda3:latest
+
+# rs-ext-base — the clean, research-DECOUPLED base for EXTENSION node images
+# (STAGE_FEATURE_STAGING C1). Deliberately NOT FROM rs-analysis-base: that lineage
+# drags in the conda data-science stack + worker tooling that couples today's PI
+# images to the research workflow. An extension carries only what it needs — this
+# base is the generic interactive-container substrate (worker user, conda, byobu,
+# the shared PI entrypoint), and each ext leaf (Dockerfile.ext-<name>) bakes its
+# own deps + its OPT-IN overlay (the artifact-contract verb/gate/config) on top.
+#
+# Forked from rs-minimal-base on the REBUILD-BLAST-RADIUS rationale (not "it bakes
+# code-server" — code-server is a cp-delivery now): rs-minimal-base roots the whole
+# substrate tree (supervisor/management/minimal), so editing it cascade-rebuilds
+# the fleet; this sibling isolates extension-base changes to extension images.
+#
+# Access model matches rs-pi-base: PI/ext containers are reached via the webui
+# kind=ssh dispatcher CHAINING `docker exec` from the supervisor — they run no sshd
+# of their own (same as rs-pi-base / rs-analysis-base); byobu provides the
+# persistent tab session. runc (no DIND). The agent (claude) and editor
+# (code-server) are NOT baked — entrypoint.pi.sh cp's them from the RO-mounted host
+# dists at boot, so this base stays agent-agnostic and small.
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Generic interactive-container tools. NO data-science conda stack (the dropped
+# rs-analysis-base baggage), NO DIND deps. byobu for the persistent tab session;
+# tini as PID 1; small utilities.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl jq nano ca-certificates \
+    byobu \
+    sudo \
+    locales \
+    tini \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN sed -i '/en_US.UTF-8/s/^# //' /etc/locale.gen && locale-gen
+ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+
+# Non-root user at UID 1000 named `worker` (matches the supervisor's UID so
+# bind-mounted /workspace subdirs are read/writable; HOME=/home/worker, which the
+# PI entrypoint + `rs-pi sync-creds` bridge assume). NOPASSWD:ALL — the container
+# is the security boundary.
+RUN useradd -m -s /bin/bash -G sudo -u 1000 worker && \
+    echo "worker ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/worker
+
+RUN su - worker -c "/opt/conda/bin/conda init bash"
+
+# Keep ~/.local/bin on PATH so the boot-deployed agent launcher (cp'd from the
+# agent dist by entrypoint.pi.sh) is found. Same posture as rs-analysis-base.
+RUN su - worker -c 'echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.bashrc'
+
+# Generic PI entrypoint (shared, role-agnostic): agent/editor dist cp, role marker,
+# artifact dirs, .mcp.json/.tools-inventory render, role.md->CLAUDE.md symlink,
+# greeting, then `tail -f /dev/null`. Ext leaves do not override it.
+COPY agent/entrypoint.pi.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Per-role template dir (ext leaves bake /opt/pi-templates/<role>/role.md etc.) +
+# the shared greeting helper (STAGE_SPAWN_GREETING) every PI-style tab invokes.
+RUN mkdir -p /opt/pi-templates && chown -R worker:worker /opt/pi-templates
+COPY container/pi/greet-and-shell.sh /opt/pi-templates/greet-and-shell.sh
+RUN chmod +x /opt/pi-templates/greet-and-shell.sh
+
+# Minimal byobu status line, staged before the skel snapshot.
+RUN install -d -o worker -g worker /home/worker/.byobu /home/worker/.byobu/bin
+COPY --chown=worker:worker agent/byobu-status       /home/worker/.byobu/status
+COPY --chown=worker:worker agent/byobu-bin-rolename /home/worker/.byobu/bin/60_rolename
+RUN chmod +x /home/worker/.byobu/bin/60_rolename
+
+# Home skel for the (rare) volume-mount first-boot restore path. entrypoint.pi.sh
+# guards the dist cp on launcher-absence (not ~/.bashrc-absence), so an
+# image-resident home is fine; the skel only matters if /home/worker is ever
+# volume-mounted.
+RUN cp -a /home/worker /etc/worker-skel
+
+USER worker
+WORKDIR /workspace
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]
