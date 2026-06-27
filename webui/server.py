@@ -459,15 +459,20 @@ async def _run_op(op_id: str, verb: str, args: dict,
 
 
 async def _start_op(request: web.Request, verb: str, args: dict,
-                    timeout: float) -> web.Response:
+                    timeout: float, *, op_seed: str | None = None) -> web.Response:
     """Gated + already origin-checked by the caller: mint an op_id, kick the
     broker verb as a background task, and return the op_id immediately so the
-    browser can start tailing the log before the op completes."""
+    browser can start tailing the log before the op completes. `op_seed` is the
+    string the op_id is built from — defaults to args["name"] (the project, for
+    project verbs); the box verbs pass the PROJECT explicitly because their
+    args["name"] is the BOX name (or None for an auto-named add), which would
+    yield an unscoped "None-…" op_id."""
     s = _broker_session(request)
     if s is None:
         return web.json_response(
             {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
-    op_id = _mint_op_id(str(args.get("name", "op")), verb)
+    seed = op_seed if op_seed is not None else str(args.get("name", "op"))
+    op_id = _mint_op_id(seed, verb)
     # An invalid project name yields an op_id the GET endpoints (and the broker)
     # would reject as a non-basename, leaving the browser with an unpollable
     # handle. Reject it up front as a normal validation error — a valid name (the
@@ -543,6 +548,56 @@ async def broker_project_action_handler(request: web.Request) -> web.Response:
         if isinstance(pw, str):
             args["password"] = pw
     return await _start_op(request, action, args, BROKER_OP_TIMEOUT_S)
+
+
+async def broker_box_add_handler(request: web.Request) -> web.Response:
+    """POST /broker/project/{name}/box {name?,browser?,agent?} — add a sandbox
+    box to a running sandbox-dind project (gated, origin-checked). Returns
+    {op_id} immediately and tails like create/destroy. The broker's
+    BOX_ADD_WEBUI_FIELDS allow-list is the real input boundary; the body is
+    forwarded as box fields under the project name from the URL."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    project = request.match_info.get("name", "")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    args = {"project": project, "name": body.get("name"),
+            "browser": bool(body.get("browser")),
+            "agent": body.get("agent", "none")}
+    return await _start_op(request, "box_add", args, BROKER_OP_TIMEOUT_S,
+                           op_seed=project)
+
+
+async def broker_box_remove_handler(request: web.Request) -> web.Response:
+    """POST /broker/project/{name}/box/{box}/remove {password} — discard a
+    sandbox box (gated, origin-checked, STEP-UP). The step-up `password` rides
+    the background request and the broker re-verifies it; rscore never sees it."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    project = request.match_info.get("name", "")
+    box = request.match_info.get("box", "")
+    args = {"project": project, "name": box}
+    try:
+        req_body = await request.json()
+    except Exception:
+        req_body = {}
+    pw = req_body.get("password") if isinstance(req_body, dict) else None
+    if isinstance(pw, str):
+        args["password"] = pw
+    return await _start_op(request, "box_remove", args, BROKER_OP_TIMEOUT_S,
+                           op_seed=project)
+
+
+async def broker_boxes_handler(request: web.Request) -> web.Response:
+    """GET /broker/project/{name}/boxes — the project's sandbox boxes with live
+    container state (gated). A fast read (no op log); relayed synchronously."""
+    project = request.match_info.get("name", "")
+    status, reply = await _relay(request, "box_list", {"project": project})
+    return web.json_response(reply, status=status)
 
 
 async def broker_op_log_handler(request: web.Request) -> web.Response:
@@ -1442,6 +1497,14 @@ def main() -> None:
     # (which also rejects "attach" defensively).
     app.router.add_post(
         "/broker/project/{name}/attach", broker_attach_handler)
+    # Sandbox-box add/list — the POST .../box fixed segment MUST precede the
+    # {action} variable (same shadowing reason as attach: {action} would match
+    # the literal "box" first and 400 it). The 6-segment remove + the boxes GET
+    # don't collide, but stay grouped here.
+    app.router.add_post("/broker/project/{name}/box", broker_box_add_handler)
+    app.router.add_post(
+        "/broker/project/{name}/box/{box}/remove", broker_box_remove_handler)
+    app.router.add_get("/broker/project/{name}/boxes", broker_boxes_handler)
     app.router.add_post(
         "/broker/project/{name}/{action}", broker_project_action_handler)
     # op-log tail + status (GETs, session-gated; the more specific /log first).

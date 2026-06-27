@@ -1139,6 +1139,16 @@ const OP_CHECKLISTS = {
         { key: "validate", label: "validating update" },
         { key: "recreate", label: "recreating supervisor" },
     ],
+    // Keys are LOCKSTEP with the rscore box_* progress.step() calls.
+    box_add: [
+        { key: "validate", label: "checking the project" },
+        { key: "create-box", label: "creating the box" },
+        { key: "ready", label: "box ready" },
+    ],
+    box_remove: [
+        { key: "validate", label: "checking the project" },
+        { key: "discard", label: "discarding the box" },
+    ],
 };
 
 // Human message for a failed op, from its structured result envelope.
@@ -1694,6 +1704,104 @@ function mgmtDestroyDialog(view, name) {
             refreshProjectRail();
         },
         focus: () => nameI.focus(),
+    });
+}
+
+// ---- sandbox boxes (the config box's Boxes section) ------------------------
+// box add/remove reuse the management op-tail (mgmtConfirmThenTail). Those were
+// built for the Management screen and take a `view` for the on-Done re-render +
+// the 401/403/503 auth redirects. Box ops are launched from the rail config box,
+// which has no such view, so we pass a detached throwaway element: the on-Done
+// `renderManagementInto` renders into nothing (harmless — and it still refreshes
+// the sidebar's running set as a side effect), and the real refresh runs in the
+// op's onDone below. A mid-op auth-expiry redirect lands in the throwaway too,
+// but the box op is short and the session was just used to open the config box.
+function boxOpView() { return el("div"); }
+
+// After a box add/remove: the supervisor updated extensions.json, so the project's
+// tab set changed. Invalidate the cached services and, if the project is open,
+// re-activate it to surface the new / removed pi-iso tab. The box list itself
+// re-loads on the next config-box open (the config box is dismissed when the op
+// modal takes a pointer-down).
+async function refreshAfterBoxChange(project) {
+    delete state.projectServices[project];
+    if (state.activeProject === project) {
+        try { await activateProject(project); } catch (e) { /* best-effort */ }
+    }
+}
+
+function mgmtBoxAddDialog(project) {
+    const nameI = el("input", { type: "text", autocomplete: "off",
+                                placeholder: "auto (box-N)" });
+    const agentS = el("select", {}, [
+        el("option", { value: "none" }, ["none (blank box)"]),
+        el("option", { value: "claude" }, ["claude"]),
+    ]);
+    const browserCb = el("input", { type: "checkbox" });
+    mgmtConfirmThenTail(boxOpView(), {
+        title: `Add a box to ${project}`,
+        tailTitle: `Adding a box to ${project}`,
+        verb: "box_add",
+        confirmLabel: "Add box",
+        body: [
+            el("div", { class: "field" }, [
+                el("label", {}, ["Name (optional)"]), nameI,
+            ]),
+            el("div", { class: "field" }, [
+                el("label", {}, ["Agent"]), agentS,
+            ]),
+            el("label", { class: "mgmt-check" }, [
+                browserCb, " bundle a browser (playwright + Chromium)",
+            ]),
+        ],
+        validate: () => {
+            const n = nameI.value.trim();
+            if (n && !/^[a-z][a-z0-9-]*$/.test(n)) {
+                return "Box name must be lowercase, start with a letter, and use only letters, digits, or '-'.";
+            }
+            return null;
+        },
+        request: () => fetch(`/broker/project/${encodeURIComponent(project)}/box`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                name: nameI.value.trim() || null,
+                agent: agentS.value,
+                browser: browserCb.checked,
+            }),
+        }),
+        onDone: async (ok) => { if (ok) await refreshAfterBoxChange(project); },
+        focus: () => nameI.focus(),
+    });
+}
+
+function mgmtBoxRemoveDialog(project, box) {
+    const pwI = el("input", { type: "password", autocomplete: "current-password" });
+    mgmtConfirmThenTail(boxOpView(), {
+        title: `Remove box "${box}"`,
+        tailTitle: `Removing ${box}`,
+        verb: "box_remove",
+        confirmLabel: "Remove",
+        danger: true,
+        body: [
+            el("p", {}, [
+                `This discards box "${box}" in "${project}" — its container and ` +
+                "workspace are wiped. This cannot be undone.",
+            ]),
+            el("div", { class: "field" }, [
+                el("label", {}, ["Re-enter management password"]), pwI,
+            ]),
+        ],
+        validate: () => (pwI.value ? null : "Re-enter your management password."),
+        // Step-up password rides the request; the broker re-verifies async, so a
+        // wrong password surfaces as a FAILED op in phase 2, like destroy.
+        request: () => fetch(
+            `/broker/project/${encodeURIComponent(project)}/box/${encodeURIComponent(box)}/remove`,
+            {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ password: pwI.value }),
+            }),
+        onDone: async (ok) => { if (ok) await refreshAfterBoxChange(project); },
+        focus: () => pwI.focus(),
     });
 }
 
@@ -2397,6 +2505,7 @@ function makeProjectConfigBox(project) {
             "No tabs yet — open this project once to load its services.",
         ]));
         box.appendChild(section);
+        appendBoxesSection(box, project.name);
         return box;
     }
 
@@ -2434,7 +2543,55 @@ function makeProjectConfigBox(project) {
     box.appendChild(el("div", { class: "config-hint" }, [
         "Hidden tabs stay enabled on the supervisor — this only controls what shows here.",
     ]));
+    appendBoxesSection(box, project.name);
     return box;
+}
+
+// Sandbox-box management (config box → "Boxes" section). The section is
+// flavor-gated by the SERVER: it loads boxes via the broker box_list verb, which
+// die()s for a non-sandbox-dind project (or when logged out / the project is
+// stopped) → a non-ok reply → the section removes itself. So a research project's
+// config box shows no Boxes section, with no client-side flavor check needed.
+function appendBoxesSection(box, projectName) {
+    const section = el("div", { class: "config-section" });
+    section.appendChild(el("div", { class: "config-section-label" }, ["Boxes"]));
+    const bodyEl = el("div", { class: "config-boxes" }, [
+        el("div", { class: "config-empty" }, ["Loading boxes…"]),
+    ]);
+    section.appendChild(bodyEl);
+    box.appendChild(section);
+    loadBoxesInto(bodyEl, section, projectName);
+}
+
+async function loadBoxesInto(bodyEl, section, projectName) {
+    let res;
+    try {
+        res = await fetch(`/broker/project/${encodeURIComponent(projectName)}/boxes`);
+    } catch (e) { section.remove(); return; }            // broker unreachable
+    let body; try { body = await res.json(); } catch (e) { section.remove(); return; }
+    if (!res.ok || !body.ok || !body.result) { section.remove(); return; }  // not sandbox-dind / stopped / logged out
+    const boxes = body.result.boxes || [];
+    bodyEl.innerHTML = "";
+    if (boxes.length === 0) {
+        bodyEl.appendChild(el("div", { class: "config-empty" }, ["No boxes yet."]));
+    }
+    for (const b of boxes) {
+        const meta = [];
+        if (b.agent && b.agent !== "none") meta.push(b.agent);
+        if (b.browser) meta.push("browser");
+        if (b.state) meta.push(b.state);
+        const x = el("button", { class: "btn btn-secondary", title: "Remove box" }, ["✕"]);
+        x.onclick = () => mgmtBoxRemoveDialog(projectName, b.name);
+        bodyEl.appendChild(el("div", { class: "config-box-row" }, [
+            el("span", { class: "config-box-name" }, [b.name]),
+            el("span", { class: "config-box-meta" },
+               [meta.length ? meta.join(" · ") : ""]),
+            x,
+        ]));
+    }
+    const add = el("button", { class: "btn" }, ["+ Add box"]);
+    add.onclick = () => mgmtBoxAddDialog(projectName);
+    bodyEl.appendChild(add);
 }
 
 async function setServiceHidden(project, serviceId, hide) {

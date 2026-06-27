@@ -87,7 +87,8 @@ BROKER_FULLLOG_DIR = BROKER_DIR / "oplogs-full"     # .full.log — host-only
 
 # Verbs that get a per-op progress log: the long-running lifecycle writes. Reads
 # (OPEN_VERBS) and auth verbs never produce one. op_id-driven from the webui.
-PROGRESS_VERBS = frozenset({"create", "update", "destroy", "start", "stop"})
+PROGRESS_VERBS = frozenset({"create", "update", "destroy", "start", "stop",
+                            "box_add", "box_remove"})
 
 # op_id names a file, so it is validated as a safe basename before it ever does:
 # first char alnum, rest alnum/dot/dash/underscore — no path separator, no
@@ -342,6 +343,35 @@ def _verb_destroy(args: dict, progress=None) -> dict:
     return {"destroyed": req.name}
 
 
+# The webui-settable subset of the box verbs' inputs — the input boundary for
+# box add/remove/list, mirroring CREATE_WEBUI_FIELDS. Every field acts INSIDE the
+# locked-egress, credential-free inner box (project is name-regex'd; name is
+# box-regex'd; agent ∈ {claude,none}; browser is a bool) — none is host-shaped, so
+# they are relayable. from_kwargs still validates them. The step-up `password`
+# for box_remove is NOT here: it is verified + consumed in dispatch, never
+# forwarded to rscore.
+BOX_ADD_WEBUI_FIELDS = frozenset({"project", "name", "browser", "agent"})
+BOX_TARGET_WEBUI_FIELDS = frozenset({"project", "name"})
+
+
+def _verb_box_add(args: dict, progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in BOX_ADD_WEBUI_FIELDS}
+    req = rscore.BoxAddRequest.from_kwargs(**safe)   # may raise ValidationError
+    return dataclasses.asdict(rscore.box_add(req, progress=progress))
+
+
+def _verb_box_remove(args: dict, progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in BOX_TARGET_WEBUI_FIELDS}
+    req = rscore.BoxRemoveRequest.from_kwargs(**safe)  # may raise ValidationError
+    return dataclasses.asdict(rscore.box_remove(req, progress=progress))
+
+
+def _verb_box_list(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in BOX_TARGET_WEBUI_FIELDS}
+    req = rscore.BoxListRequest.from_kwargs(**safe)   # may raise ValidationError
+    return dataclasses.asdict(rscore.box_list(req))
+
+
 # The closed lifecycle vocabulary — the host-root boundary. Adding a verb here
 # is a deliberate, security-reviewed edit; never a docker passthrough.
 VERBS = {
@@ -354,13 +384,16 @@ VERBS = {
     "attach": _verb_attach,
     "update": _verb_update,
     "destroy": _verb_destroy,
+    "box_add": _verb_box_add,
+    "box_remove": _verb_box_remove,
+    "box_list": _verb_box_list,
 }
 
 # Verbs requiring step-up re-auth: a FRESH password in the request, not just a
 # live session token, so a stolen token alone cannot trigger them. `destroy` is
 # the data-destroying verb; this is the cheap half of its gate (the recoverable
 # soft-delete + rate-limit land before the webui is exposed beyond localhost).
-STEP_UP_VERBS = frozenset({"destroy"})
+STEP_UP_VERBS = frozenset({"destroy", "box_remove"})
 
 # Deny-by-default gating: a verb in VERBS but NOT in this read allowlist
 # requires a valid session token. Inverting the set (vs an explicit *gated*

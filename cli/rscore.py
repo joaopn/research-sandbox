@@ -137,6 +137,13 @@ class HarnessError(Exception):
 # leading '-' can be read as a flag), with no use case here.
 _PROJECT_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]*\Z")
 
+# Sandbox-box name grammar + agent enum — LOCKSTEP COPIES of rs_sandbox._NAME_RE
+# and the `rs-sandbox create --agent` choices (cli/rs_sandbox.py). rscore cannot
+# import rs_sandbox (it's baked into the supervisor image under conda python), so
+# the box_* verbs re-declare the validation here; keep both in agreement.
+_BOX_NAME_RE = re.compile(r"\A[a-z][a-z0-9-]*\Z")
+_BOX_AGENTS = frozenset({"claude", "none"})
+
 
 def valid_project_name(name: str) -> bool:
     return isinstance(name, str) and bool(_PROJECT_NAME_RE.match(name))
@@ -610,6 +617,82 @@ class AttachInfo:
     port: int                               # the container's internal sshd port
     username: str
     password: str                           # in-memory only
+
+
+@dataclass(frozen=True)
+class BoxAddRequest:
+    """Add a sandbox box to a RUNNING sandbox-dind project (webui-driven). All
+    fields act INSIDE the locked-egress, credential-free inner box — none is
+    host-shaped — so they are broker-relayable (cf. the host-root boundary)."""
+    project: str
+    name: str | None = None                 # None ⇒ rs-sandbox auto-names box-N
+    browser: bool = False
+    agent: str = "none"                     # claude | none
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "BoxAddRequest":
+        name = kw.get("name")
+        if name is not None and not (isinstance(name, str) and _BOX_NAME_RE.match(name)):
+            raise ValidationError(
+                "box name must be lowercase, start with a letter, and contain "
+                "only letters, digits, or '-'")
+        agent = kw.get("agent", "none") or "none"
+        if agent not in _BOX_AGENTS:
+            raise ValidationError(
+                f"invalid agent {agent!r} (expected one of {sorted(_BOX_AGENTS)})")
+        return cls(project=_require_name(kw.get("project")), name=name,
+                   browser=bool(kw.get("browser", False)), agent=agent)
+
+
+@dataclass(frozen=True)
+class BoxRemoveRequest:
+    """Discard a sandbox box (wipes its workspace). Name-only besides the
+    project; the step-up password is verified + consumed in broker dispatch and
+    never reaches here (mirrors DestroyRequest)."""
+    project: str
+    name: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "BoxRemoveRequest":
+        name = kw.get("name")
+        if not (isinstance(name, str) and _BOX_NAME_RE.match(name)):
+            raise ValidationError(
+                "box name must be lowercase, start with a letter, and contain "
+                "only letters, digits, or '-'")
+        return cls(project=_require_name(kw.get("project")), name=name)
+
+
+@dataclass(frozen=True)
+class BoxListRequest:
+    project: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "BoxListRequest":
+        return cls(project=_require_name(kw.get("project")))
+
+
+@dataclass
+class BoxAddResult:
+    project: str
+    name: str
+    ip: str
+    browser: bool
+    agent: str
+    container: str
+
+
+@dataclass
+class BoxRemoveResult:
+    project: str
+    name: str
+
+
+@dataclass
+class BoxListResult:
+    """The project's sandbox boxes with live container state. No credentials in
+    any row — safe to serialise straight into the broker reply."""
+    project: str
+    boxes: list[dict]                       # {name, ip, agent, browser, state}
 
 
 # ===========================================================================
@@ -4682,6 +4765,92 @@ def webui_attach_info(req: "AttachRequest", cfg: "Config" | None = None) -> Atta
     # in lockstep (both describe the same per-project-bridge endpoint).
     return AttachInfo(name=req.name, host=container, port=22,
                       username="research", password=ssh_pass)
+
+
+def _running_sandbox_dind_supervisor(project: str) -> str:
+    """Resolve + validate a RUNNING sandbox-dind supervisor for the box_* verbs,
+    returning its container name. die()s (→ the broker's `failed` envelope) if the
+    project is absent, stopped, or not a sandbox-dind flavor — a research
+    supervisor carries no `rs-sandbox` binary, so reject it with a clear message
+    rather than letting the docker exec fail cryptically. Mirrors the
+    exists/running checks in webui_attach_info."""
+    container = container_name_for(project)
+    if not container_exists(container):
+        die(f"project {project!r} does not exist")
+    if not container_running(container):
+        die(f"project {project!r} is not running; start it before managing boxes")
+    if _container_project_type(container) != PROJECT_TYPE_SANDBOX_DIND:
+        die(f"project {project!r} is not a sandbox-dind project; boxes are only "
+            f"available on `--workflow sandbox-dind` projects")
+    return container
+
+
+def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignore[name-defined]
+    """Create a sandbox box in a running sandbox-dind supervisor by driving its
+    in-box `rs-sandbox create`. Validated fields only reach the list-form argv
+    (no shell); the box itself is the security boundary (locked egress, no
+    creds). Returns the box's recorded coordinates."""
+    progress = progress or _NULL_PROGRESS
+    progress.step("validate", "checking the project")
+    container = _running_sandbox_dind_supervisor(req.project)
+    argv = ["docker", "exec", container, "rs-sandbox", "create"]
+    if req.name:
+        argv.append(req.name)
+    argv += ["--agent", req.agent]
+    if req.browser:
+        argv.append("--browser")
+    progress.step("create-box", "creating the box")
+    r = run(argv, capture_output=True)
+    if r.returncode != 0:
+        die(f"failed to add box: {(r.stderr or r.stdout).strip()}")
+    try:
+        info = json.loads(r.stdout)            # rs-sandbox create prints the entry
+    except (json.JSONDecodeError, TypeError):
+        die(f"could not parse rs-sandbox output: {r.stdout.strip()!r}")
+    # Shape-guard the indexing so a returncode-0-but-wrong-shape output die()s
+    # (→ SystemExit, caught by the broker) rather than raising a KeyError/TypeError
+    # that would escape dispatch's invariant; box_list is already .get()-defensive.
+    if not isinstance(info, dict) or not all(k in info for k in ("name", "ip", "container")):
+        die(f"unexpected rs-sandbox output shape: {r.stdout.strip()!r}")
+    progress.step("ready", "box ready")
+    return BoxAddResult(project=req.project, name=info["name"], ip=info["ip"],
+                        browser=bool(info.get("browser")),
+                        agent=info.get("agent", "none"), container=info["container"])
+
+
+def box_remove(req: "BoxRemoveRequest", progress=None) -> BoxRemoveResult:  # type: ignore[name-defined]
+    """Discard a sandbox box (container + its workspace) via the in-box
+    `rs-sandbox discard`. Step-up re-auth was already enforced by the broker."""
+    progress = progress or _NULL_PROGRESS
+    progress.step("validate", "checking the project")
+    container = _running_sandbox_dind_supervisor(req.project)
+    progress.step("discard", "discarding the box")
+    r = run(["docker", "exec", container, "rs-sandbox", "discard", req.name],
+            capture_output=True)
+    if r.returncode != 0:
+        die(f"failed to remove box {req.name!r}: {(r.stderr or r.stdout).strip()}")
+    return BoxRemoveResult(project=req.project, name=req.name)
+
+
+def box_list(req: "BoxListRequest", _progress=None) -> BoxListResult:  # type: ignore[name-defined]
+    """List a project's sandbox boxes with live container state, via
+    `rs-sandbox list --json`. Filters to kind=="sandbox" (the rs-sandbox-owned
+    boxes); baked/byo extensions are managed via `research project extension`."""
+    container = _running_sandbox_dind_supervisor(req.project)
+    r = run(["docker", "exec", container, "rs-sandbox", "list", "--json"],
+            capture_output=True)
+    if r.returncode != 0:
+        die(f"failed to list boxes: {(r.stderr or r.stdout).strip()}")
+    try:
+        rows = json.loads(r.stdout)
+    except (json.JSONDecodeError, TypeError):
+        die(f"could not parse rs-sandbox output: {r.stdout.strip()!r}")
+    boxes = [{"name": e.get("name"), "ip": e.get("ip"),
+              "agent": e.get("agent", "none"), "browser": bool(e.get("browser")),
+              "state": e.get("state")}
+             for e in rows
+             if isinstance(e, dict) and e.get("kind") == extension.SANDBOX_KIND]
+    return BoxListResult(project=req.project, boxes=boxes)
 
 
 def wire_webui_to_projects() -> None:
