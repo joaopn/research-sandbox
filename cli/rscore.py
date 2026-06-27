@@ -695,6 +695,95 @@ class BoxListResult:
     boxes: list[dict]                       # {name, ip, agent, browser, state}
 
 
+@dataclass(frozen=True)
+class ExtEnableRequest:
+    """Enable a baked/BYO extension on a RUNNING research project (webui-driven).
+    ``name`` is catalog-gated; ``upstreams`` is the extension's explicit
+    proxy-routed MCP set (project-scoped names, allowlist-validated downstream —
+    NOT host-shaped, so relayable) or None for auto. ``force_auto`` re-derives =
+    every allowed MCP. Auto wins if both are supplied."""
+    project: str
+    name: str
+    upstreams: list[str] | None = None
+    force_auto: bool = False
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "ExtEnableRequest":
+        name = kw.get("name")
+        if name not in extension.known_type_names():
+            raise ValidationError(
+                f"unknown extension {name!r} (not a baked role or registered BYO "
+                f"type)")
+        force_auto = bool(kw.get("auto", False))
+        upstreams: list[str] | None
+        if force_auto:
+            upstreams = None
+        else:
+            raw = kw.get("upstream")
+            if raw is None:
+                upstreams = None
+            elif isinstance(raw, list) and all(
+                    isinstance(u, str) and u for u in raw):
+                upstreams = list(raw)
+            else:
+                raise ValidationError(
+                    "upstream must be a list of non-empty MCP-name strings")
+        return cls(project=_require_name(kw.get("project")), name=name,
+                   upstreams=upstreams, force_auto=force_auto)
+
+
+@dataclass(frozen=True)
+class ExtDisableRequest:
+    project: str
+    name: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "ExtDisableRequest":
+        name = kw.get("name")
+        # _BOX_NAME_RE charset (\A[a-z][a-z0-9-]*\Z) ⊇ the extension/BYO name
+        # grammar, so a now-unregistered-but-enabled type can still be disabled.
+        if not (isinstance(name, str) and _BOX_NAME_RE.match(name)):
+            raise ValidationError(
+                "extension name must be lowercase, start with a letter, and "
+                "contain only letters, digits, or '-'")
+        return cls(project=_require_name(kw.get("project")), name=name)
+
+
+@dataclass(frozen=True)
+class ExtListRequest:
+    project: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "ExtListRequest":
+        return cls(project=_require_name(kw.get("project")))
+
+
+@dataclass
+class ExtEnableResult:
+    project: str
+    name: str
+    kind: str
+    upstream_source: str | None
+    upstream_mcps: list[str]
+
+
+@dataclass
+class ExtDisableResult:
+    project: str
+    name: str
+
+
+@dataclass
+class ExtListResult:
+    """A research project's extension catalog + enabled set (with live state) +
+    the project's allowed MCPs (to drive the enable dialog's upstream picker). No
+    secrets — safe to serialise into the broker reply."""
+    project: str
+    catalog: list[dict]
+    enabled: list[dict]
+    allowed_mcps: list[str]
+
+
 # ===========================================================================
 # Verbs
 # ===========================================================================
@@ -5002,6 +5091,85 @@ def box_list(req: "BoxListRequest", _progress=None) -> BoxListResult:  # type: i
              for e in rows
              if isinstance(e, dict) and e.get("kind") == extension.SANDBOX_KIND]
     return BoxListResult(project=req.project, boxes=boxes)
+
+
+def _running_research_supervisor(project: str) -> str:
+    """Resolve + validate a RUNNING research supervisor for the ext_* verbs,
+    returning its container name. die()s (→ the broker's `failed` envelope) if the
+    project is absent, stopped, a sandbox-dind flavor (boxes, not extensions), or
+    the docker containment substrate (no inner dockerd → no extensions). The
+    flavor/substrate die()s make the webui's Extensions section self-hide on those
+    projects, mirroring how box_list gates the Boxes section."""
+    container = container_name_for(project)
+    if not container_exists(container):
+        die(f"project {project!r} does not exist")
+    if not container_running(container):
+        die(f"project {project!r} is not running; start it before managing "
+            f"extensions")
+    if _container_project_type(container) == PROJECT_TYPE_SANDBOX_DIND:
+        die(f"project {project!r} is a sandbox-dind project; it uses boxes, not "
+            f"extensions")
+    if _container_substrate(container) == Substrate.DOCKER.value:
+        die(f"project {project!r} uses the docker containment substrate (no inner "
+            f"dockerd); extensions are unavailable")
+    return container
+
+
+def ext_enable(req: "ExtEnableRequest", progress=None) -> ExtEnableResult:  # type: ignore[name-defined]
+    """Enable a baked/BYO extension on a running research project (webui-driven).
+    Coarse progress wrapper over the shared `_extension_enable` (which owns the
+    upstream state-machine + the BYO-recreate path). For a BYO first-enable the
+    'enable' milestone stays pending through the supervisor recreate — acceptable
+    (the op tails like a slow create; terminals reconnect)."""
+    progress = progress or _NULL_PROGRESS
+    progress.step("validate", "checking the project")
+    _running_research_supervisor(req.project)
+    cfg = load_config()
+    progress.step("enable", "enabling the extension")
+    _extension_enable(req.project, cfg, req.name, req.upstreams,
+                      force_auto=req.force_auto)
+    progress.step("ready", "extension ready")
+    entry = extension.load(workspace_path_for(req.project, cfg)).get(req.name, {})
+    return ExtEnableResult(
+        project=req.project, name=req.name, kind=entry.get("kind", "?"),
+        upstream_source=entry.get("upstream_source"),
+        upstream_mcps=list(entry.get("upstream_mcps") or []))
+
+
+def ext_disable(req: "ExtDisableRequest", progress=None) -> ExtDisableResult:  # type: ignore[name-defined]
+    """Disable an extension on a running research project. Workspace (and, for
+    BYO, the cloned external folder) survive — no step-up needed."""
+    progress = progress or _NULL_PROGRESS
+    progress.step("validate", "checking the project")
+    _running_research_supervisor(req.project)
+    cfg = load_config()
+    progress.step("disable", "disabling the extension")
+    _extension_disable(req.project, cfg, req.name)
+    return ExtDisableResult(project=req.project, name=req.name)
+
+
+def ext_list(req: "ExtListRequest", _progress=None) -> ExtListResult:  # type: ignore[name-defined]
+    """The project's extension catalog + enabled set (live container state) + the
+    project's allowed MCPs (to drive the enable dialog's upstream picker)."""
+    supervisor = _running_research_supervisor(req.project)
+    cfg = load_config()
+    workspace_path = workspace_path_for(req.project, cfg)
+    entries = extension.load(workspace_path)
+    states = _inner_container_states(supervisor)
+    enabled = []
+    for nm, e in sorted(entries.items()):
+        cname = e.get("container") or extension.container_name(nm, e.get("kind"))
+        enabled.append({
+            "name": nm, "kind": e.get("kind"), "ip": e.get("ip"),
+            "state": states.get(cname, "absent"),
+            "upstream_source": e.get("upstream_source"),
+            "upstream_mcps": list(e.get("upstream_mcps") or []),
+        })
+    allowed = sorted(x["name"] for x in load_project_allowlist(req.project, cfg)
+                     if x.get("name"))
+    return ExtListResult(project=req.project,
+                         catalog=extension.catalog(load_versions()),
+                         enabled=enabled, allowed_mcps=allowed)
 
 
 def wire_webui_to_projects() -> None:

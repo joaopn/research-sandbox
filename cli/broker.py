@@ -58,6 +58,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rscore  # noqa: E402
 import broker_auth  # noqa: E402
 import workflow  # noqa: E402
+import pi_isolated_registry  # noqa: E402  (for _verb_ext_enable's RegistryError catch)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -88,7 +89,8 @@ BROKER_FULLLOG_DIR = BROKER_DIR / "oplogs-full"     # .full.log — host-only
 # Verbs that get a per-op progress log: the long-running lifecycle writes. Reads
 # (OPEN_VERBS) and auth verbs never produce one. op_id-driven from the webui.
 PROGRESS_VERBS = frozenset({"create", "update", "destroy", "start", "stop",
-                            "box_add", "box_remove"})
+                            "box_add", "box_remove",
+                            "ext_enable", "ext_disable"})
 
 # op_id names a file, so it is validated as a safe basename before it ever does:
 # first char alnum, rest alnum/dot/dash/underscore — no path separator, no
@@ -372,6 +374,39 @@ def _verb_box_list(args: dict, _progress=None) -> dict:
     return dataclasses.asdict(rscore.box_list(req))
 
 
+# The webui-settable subset of the extension verbs' inputs. `upstream` is a list
+# of project-scoped MCP names (allowlist-validated in _extension_enable, only ever
+# written to extensions.json / rendered as mcp-proxy:8888/<name>) — NOT host-shaped,
+# so relayable; `name` is catalog-gated; `auto` is a bool. No path/host field.
+EXT_ENABLE_WEBUI_FIELDS = frozenset({"project", "name", "upstream", "auto"})
+EXT_TARGET_WEBUI_FIELDS = frozenset({"project", "name"})
+
+
+def _verb_ext_enable(args: dict, progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in EXT_ENABLE_WEBUI_FIELDS}
+    req = rscore.ExtEnableRequest.from_kwargs(**safe)  # may raise ValidationError
+    # The BYO branch reaches pi_isolated_registry.entry_for(expand=True), which can
+    # raise RegistryError (e.g. an unset ${VAR} during expansion). dispatch only
+    # catches ValidationError/HarnessError/SystemExit, so re-raise it as one
+    # (mirrors _verb_workflows' WorkflowError→ValidationError).
+    try:
+        return dataclasses.asdict(rscore.ext_enable(req, progress=progress))
+    except pi_isolated_registry.RegistryError as e:
+        raise rscore.ValidationError(str(e))
+
+
+def _verb_ext_disable(args: dict, progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in EXT_TARGET_WEBUI_FIELDS}
+    req = rscore.ExtDisableRequest.from_kwargs(**safe)  # may raise ValidationError
+    return dataclasses.asdict(rscore.ext_disable(req, progress=progress))
+
+
+def _verb_ext_list(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in EXT_TARGET_WEBUI_FIELDS}
+    req = rscore.ExtListRequest.from_kwargs(**safe)    # may raise ValidationError
+    return dataclasses.asdict(rscore.ext_list(req))
+
+
 # The closed lifecycle vocabulary — the host-root boundary. Adding a verb here
 # is a deliberate, security-reviewed edit; never a docker passthrough.
 VERBS = {
@@ -387,6 +422,9 @@ VERBS = {
     "box_add": _verb_box_add,
     "box_remove": _verb_box_remove,
     "box_list": _verb_box_list,
+    "ext_enable": _verb_ext_enable,
+    "ext_disable": _verb_ext_disable,
+    "ext_list": _verb_ext_list,
 }
 
 # Verbs requiring step-up re-auth: a FRESH password in the request, not just a

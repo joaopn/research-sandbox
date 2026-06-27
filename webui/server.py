@@ -600,6 +600,49 @@ async def broker_boxes_handler(request: web.Request) -> web.Response:
     return web.json_response(reply, status=status)
 
 
+async def broker_ext_enable_handler(request: web.Request) -> web.Response:
+    """POST /broker/project/{name}/extension {name, upstream?, auto?} — enable a
+    baked/BYO extension on a running research project (gated, origin-checked).
+    Returns {op_id} immediately and tails like create/destroy. The broker's
+    EXT_ENABLE_WEBUI_FIELDS allow-list is the real input boundary; the body fields
+    are forwarded under the project name from the URL."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    project = request.match_info.get("name", "")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    args = {"project": project, "name": body.get("name"),
+            "upstream": body.get("upstream"), "auto": bool(body.get("auto"))}
+    return await _start_op(request, "ext_enable", args, BROKER_OP_TIMEOUT_S,
+                           op_seed=project)
+
+
+async def broker_ext_disable_handler(request: web.Request) -> web.Response:
+    """POST /broker/project/{name}/extension/{ext}/disable — disable an extension
+    (gated, origin-checked; no step-up: the workspace + any BYO clone survive)."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    project = request.match_info.get("name", "")
+    ext = request.match_info.get("ext", "")
+    args = {"project": project, "name": ext}
+    return await _start_op(request, "ext_disable", args, BROKER_OP_TIMEOUT_S,
+                           op_seed=project)
+
+
+async def broker_extensions_handler(request: web.Request) -> web.Response:
+    """GET /broker/project/{name}/extensions — the project's extension catalog +
+    enabled set (live state) + allowed MCPs (gated). Fast read; relayed
+    synchronously. die()s (→ non-ok) for a non-research / stopped project, so the
+    webui's Extensions section self-hides there."""
+    project = request.match_info.get("name", "")
+    status, reply = await _relay(request, "ext_list", {"project": project})
+    return web.json_response(reply, status=status)
+
+
 async def broker_op_log_handler(request: web.Request) -> web.Response:
     """GET /broker/op/{op_id}/log?from=<n> — the view-log byte-slice since `n`
     plus the new EOF. Reads the RO-mounted view file directly (out-of-band from
@@ -1505,6 +1548,14 @@ def main() -> None:
     app.router.add_post(
         "/broker/project/{name}/box/{box}/remove", broker_box_remove_handler)
     app.router.add_get("/broker/project/{name}/boxes", broker_boxes_handler)
+    # Extension enable/list — same shadowing rule: the fixed .../extension(s)
+    # segments MUST precede the {action} variable.
+    app.router.add_post(
+        "/broker/project/{name}/extension", broker_ext_enable_handler)
+    app.router.add_post(
+        "/broker/project/{name}/extension/{ext}/disable", broker_ext_disable_handler)
+    app.router.add_get(
+        "/broker/project/{name}/extensions", broker_extensions_handler)
     app.router.add_post(
         "/broker/project/{name}/{action}", broker_project_action_handler)
     # op-log tail + status (GETs, session-gated; the more specific /log first).
