@@ -66,18 +66,19 @@ _AUTO_RE = re.compile(r"^box-(\d+)$")
 CHEATSHEET = """\
 rs-sandbox — isolated boxes for running un-vetted code
 
-  rs-sandbox create [name] [--browser]  spin a blank box (auto-named box-N);
-                                        --browser bundles playwright + Chromium
+  rs-sandbox create [name] [--agent claude] [--browser]
+                              spin a blank box (auto-named box-N); --agent claude
+                              deploys claude inside; --browser adds playwright+Chromium
   rs-sandbox list [--json]    show boxes (+ any baked extensiones) and their state
   rs-sandbox stop <name>      stop a box (keeps its workspace; start to resume)
   rs-sandbox start <name>     (re)start a stopped box from its saved entry
   rs-sandbox discard <name>   stop the box AND wipe its workspace
 
-Boxes carry NO credentials — run `claude` then /login inside one if you need an
-LLM. Outbound network is the project's router policy (sandbox projects default
-to 'locked': 80/443/53 + ping only). This Management shell has authority over
-every box, so it deliberately runs no agent — never paste box artifacts into
-an LLM here.
+Boxes are blank by default (no agent). `--agent claude` deploys the claude
+binary (still NO credentials — run `claude` then /login inside). Outbound
+network is the project's router policy (sandbox projects default to 'locked':
+80/443/53 + ping only). This Management shell has authority over every box, so
+it deliberately runs no agent — never paste box artifacts into an LLM here.
 """
 
 
@@ -154,10 +155,12 @@ def auto_name(entries: dict[str, dict]) -> str:
 # --- run / teardown ---------------------------------------------------------
 
 
-def _run_box(name: str, ip: str, browser: bool = False) -> None:
+def _run_box(name: str, ip: str, browser: bool = False, agent: str = "none") -> None:
     """docker run a blank box in the local inner dockerd. No mounts beyond the
     box's own workspace, no creds, no repo. ``browser`` selects the
-    Chromium-equipped image (the box's claude gets a playwright MCP). The
+    Chromium-equipped image (the box's claude gets a playwright MCP). ``agent``
+    (claude|none) is forwarded as RS_BOX_AGENT — the box's entrypoint deploys the
+    claude binary only for "claude" (still auth-free; no creds either way). The
     workspace dir is pre-created uid-1000-owned so dockerd's auto-create on -v
     doesn't land it root-owned."""
     sub = f"pi-isolated/{name}"
@@ -189,6 +192,7 @@ def _run_box(name: str, ip: str, browser: bool = False) -> None:
         *editor_mount,
         "-e", f"RS_SERVICE_CODE_SERVER={editor_flag}",
         "-e", f"RS_SANDBOX_NAME={name}",
+        "-e", f"RS_BOX_AGENT={agent}",
         "--label", "research.sandbox=1",
         "--label", f"research.box={name}",
         image,
@@ -220,11 +224,12 @@ def cmd_create(args: argparse.Namespace) -> None:
         die(f"sandbox {name!r} already exists; discard it or pick another name")
     ip = allocate_ip(entries)
     entries[name] = {"kind": KIND, "ip": ip, "container": box_container(name),
-                     "browser": bool(args.browser)}
+                     "browser": bool(args.browser), "agent": args.agent}
     save(entries)
-    _run_box(name, ip, browser=bool(args.browser))
+    _run_box(name, ip, browser=bool(args.browser), agent=args.agent)
     print(json.dumps({"name": name, "ip": ip, "browser": bool(args.browser),
-                      "container": box_container(name)}, indent=2))
+                      "agent": args.agent, "container": box_container(name)},
+                     indent=2))
 
 
 def cmd_restart(args: argparse.Namespace) -> None:
@@ -235,7 +240,8 @@ def cmd_restart(args: argparse.Namespace) -> None:
     recreate-loop caller's clarity."""
     _require_sandbox_dind_project()
     entry = _box_entry(load(), args.name)
-    _run_box(args.name, entry["ip"], browser=bool(entry.get("browser")))
+    _run_box(args.name, entry["ip"], browser=bool(entry.get("browser")),
+             agent=entry.get("agent", "none"))
     print(f"box {args.name!r}: restarted at {entry['ip']}")
 
 
@@ -262,7 +268,8 @@ def cmd_start(args: argparse.Namespace) -> None:
             die(f"failed to start box {args.name!r}: "
                 f"{(r.stderr or r.stdout).strip()}")
     else:
-        _run_box(args.name, entry["ip"], browser=bool(entry.get("browser")))
+        _run_box(args.name, entry["ip"], browser=bool(entry.get("browser")),
+                 agent=entry.get("agent", "none"))
     print(f"box {args.name!r}: started at {entry['ip']}")
 
 
@@ -292,20 +299,24 @@ def cmd_list(args: argparse.Namespace) -> None:
     rows = []
     for name, e in sorted(entries.items()):
         cname = e.get("container") or box_container(name)
+        # The agent axis only applies to kind="sandbox" boxes; baked/byo
+        # sandboxes carry no agent key, so render their column as `-`.
+        agent = e.get("agent", "none") if e.get("kind") == KIND else None
         rows.append({"name": name, "kind": e.get("kind"), "ip": e.get("ip"),
-                     "browser": bool(e.get("browser")),
+                     "browser": bool(e.get("browser")), "agent": agent,
                      "state": states.get(cname, "absent")})
     if args.json:
         print(json.dumps(rows, indent=2))
         return
     if not rows:
-        print("no sandboxes. create a box: rs-sandbox create [name] [--browser]")
+        print("no sandboxes. create a box: "
+              "rs-sandbox create [name] [--agent claude] [--browser]")
         return
-    print(f"{'NAME':<16} {'KIND':<9} {'IP':<16} {'BROWSER':<8} STATE")
+    print(f"{'NAME':<16} {'KIND':<9} {'IP':<16} {'BROWSER':<8} {'AGENT':<8} STATE")
     for row in rows:
         print(f"{row['name']:<16} {row['kind'] or '-':<9} "
               f"{row['ip'] or '-':<16} {'yes' if row['browser'] else '-':<8} "
-              f"{row['state']}")
+              f"{row['agent'] or '-':<8} {row['state']}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -320,6 +331,10 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--browser", action="store_true",
                    help="bundle a browser: @playwright/mcp + Chromium wired "
                         "into the box's claude (heavier image)")
+    c.add_argument("--agent", choices=["claude", "none"], default="none",
+                   help="deploy an agent in the box (default none = blank); "
+                        "'claude' cp's the claude binary in (still auth-free — "
+                        "run `claude` + /login inside)")
     c.set_defaults(func=cmd_create)
 
     lst = sub.add_parser("list", help="list sandboxes (boxes + baked)")

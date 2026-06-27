@@ -901,12 +901,12 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             _stage_agent_dist(container_name, deploy_local=False)
             # Editor dist (STAGE_EDITOR_DIST): same ordering rationale as the agent
             # dist — staged before the extension enable cone so interactive boxes can
-            # RO-mount /opt/editor-dist. deploy_local = the management supervisor's
-            # OWN editor (no bake now); gated on the resolved code-server flag (the
-            # sandbox-dind editor defaults ON, so this is True unless --disable).
+            # RO-mount /opt/editor-dist. deploy_local=False: the management supervisor
+            # deploys NO editor of its own (it runs no work surface — the boxes do);
+            # staging still runs so each box can RO-mount /opt/editor-dist and deploy
+            # its own editor.
             if editor_dist_present():
-                _stage_editor_dist(container_name,
-                                   deploy_local=service_flags.get("code-server", True))
+                _stage_editor_dist(container_name, deploy_local=False)
         else:
             stage_worker_image(container_name, ANALYSIS_IMAGE)
             # Stage the agent dist into the supervisor (its own ~/.local + the
@@ -2462,16 +2462,16 @@ def _stage_editor_dist(supervisor: str, *, deploy_local: bool = False) -> None:
 
     `deploy_local` ALSO deploys the editor into the supervisor's OWN ~/.local and
     launches its stub (slice 2 — the minimal-lineage bake is gone, so the
-    supervisor/management editor must come from the dist). The supervisor
+    research supervisor's editor must come from the dist). The supervisor
     entrypoint runs at container-START, BEFORE this post-start staging, so its
     dist block saw an empty /opt/editor-dist and no-op'd — this exec is what
-    actually brings the supervisor's/management's own editor up (mirrors
-    `_stage_agent_dist`'s deploy_local). The caller passes the RESOLVED code-server
-    flag (NOT an unconditional True): the deploy script does not re-check
+    actually brings the supervisor's own editor up (mirrors `_stage_agent_dist`'s
+    deploy_local). The research supervisor passes the RESOLVED code-server flag
+    (NOT an unconditional True): the deploy script does not re-check
     RS_SERVICE_CODE_SERVER, so a `--disable code-server` supervisor must not cp the
-    binary or launch the stub. Note this is the OPPOSITE of the agent's
-    deploy_local=False for sandbox-dind — the editor IS on for management (its flag
-    defaults on), so its create site passes True."""
+    binary or launch the stub. The sandbox-dind management supervisor passes
+    deploy_local=False — it deploys NO editor of its own (its boxes RO-mount the
+    staged dist and deploy theirs); staging still runs so that mount is populated."""
     src = EDITOR_DIST_DIR
     if not editor_dist_present():
         die("no cached editor dist to stage — run `research editor pull` first")
@@ -2992,11 +2992,10 @@ def _recreate_supervisor(
         stage_worker_image(container, SANDBOX_BOX_BROWSER_IMAGE, force=force_restage)
         # Sandbox-dind: re-stage the dist for the boxes (deploy_local=False).
         _stage_agent_dist(container, deploy_local=False)
-        # Editor re-deploys into the management supervisor's OWN ~/.local (no bake
-        # now), gated on its resolved code-server flag.
+        # Editor dist re-staged for the boxes to RO-mount; deploy_local=False — the
+        # management supervisor re-deploys NO editor of its own (the boxes do).
         if editor_dist_present():
-            _stage_editor_dist(container,
-                               deploy_local=flags.get("code-server", True))
+            _stage_editor_dist(container, deploy_local=False)
     else:
         stage_worker_image(container, ANALYSIS_IMAGE, force=force_restage)
         # Re-stage the agent dist into the fresh container (its own ~/.local + the

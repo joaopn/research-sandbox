@@ -4,13 +4,15 @@
 # A blank, isolated box for running un-vetted code. Deliberately minimal and
 # clean: NO artifact-contract (no published/ or internal/ dirs, no manifest
 # verb, no Stop-hook gate, no publish overlay), NO repo clone, NO credentials.
-# Just restore the home skel, set the byobu role marker, ensure a hook-free
-# bypassPermissions settings.json, and idle. The PI drives the box from the
-# webui tab / `project attach`; if they want an LLM in the box they run
-# `claude` and `/login` (boxes are auth-free by design).
+# Just restore the home skel, optionally deploy an agent, set the byobu role
+# marker, ensure a hook-free bypassPermissions settings.json, and idle. The PI
+# drives the box from the webui tab / `project attach`. Boxes are blank by
+# default — no agent at all; a box created with `--agent claude` (RS_BOX_AGENT)
+# gets the claude binary deployed (still auth-free: run `claude` + /login inside).
 #
 # Environment:
 #   RS_SANDBOX_NAME — box name (e.g. box-1); used for the role marker + logs.
+#   RS_BOX_AGENT    — agent to deploy in the box: claude | none (default none).
 
 set -euo pipefail
 
@@ -22,11 +24,12 @@ if [[ ! -f ~/.bashrc ]]; then
 fi
 
 # Deploy the agent (claude) from the management-supervisor-staged dist into our
-# OWN writable ~/.local (no bake; STAGE_AGENT_DIST slice 2). The box is auth-free
-# (run `claude` + /login inside), so the binary must be present even though no
-# creds are. Absence-guarded so a restart preserves an autoupdater bump; the
-# in-box `claude` finds it via ~/.local/bin on PATH (self-healed below).
-if [[ -d /opt/agent-dist && ! -e ~/.local/bin/claude ]]; then
+# OWN writable ~/.local (no bake; STAGE_AGENT_DIST slice 2) — ONLY when the box
+# was created with `--agent claude` (RS_BOX_AGENT). Blank by default (unset/none
+# → no agent binary at all). Even with claude the box is auth-free (run `claude`
+# + /login inside). Absence-guarded so a restart preserves an autoupdater bump;
+# the in-box `claude` finds it via ~/.local/bin on PATH (self-healed below).
+if [[ "${RS_BOX_AGENT:-none}" == "claude" && -d /opt/agent-dist && ! -e ~/.local/bin/claude ]]; then
     mkdir -p ~/.local
     cp -a /opt/agent-dist/. ~/.local/
 fi

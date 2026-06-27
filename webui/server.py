@@ -835,7 +835,9 @@ async def project_services_handler(request: web.Request) -> web.Response:
     for sid, svc in services.SERVICES.items():
         # Flavor gate: Management only in sandbox projects; the Supervisor
         # (claude agent) tab only in research projects. The Editor (code-server)
-        # IS kept for sandbox projects — it's the artifact-management surface.
+        # tab is port-probed below — the sandbox-dind management host deploys no
+        # editor of its own, so its probe fails and the host Editor tab auto-omits;
+        # each box still exposes its own editor via its synthesized pi-iso ssh tab.
         if sid == "management" and not is_sandbox:
             continue
         if sid == "supervisor" and is_sandbox:
