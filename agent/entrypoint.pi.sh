@@ -90,9 +90,9 @@ fi
 # Mirror of entrypoint.role-mcp.sh's render block. Two sources feed the
 # rendered config + inventory:
 #
-#   1. Proxy-routed upstreams from /etc/orchestrator/role-mcps.json ∩
-#      mcp-allow.json — the same intersection the worker-facing role-MCP
-#      uses (single source of truth, no PI/worker drift).
+#   1. Proxy-routed upstreams from /etc/orchestrator/extensions.json ∩
+#      mcp-allow.json — this extension's OWN upstream set, independent of any
+#      worker service of the same name (no PI/worker coupling).
 #   2. Image-baked stdio MCPs from /opt/pi-templates/<short>/extra-mcps.json
 #      — per-role tooling bundled with the image (Playwright in
 #      pi-websearcher; parallel to entrypoint.role-mcp.sh's
@@ -117,7 +117,7 @@ orch = Path("/etc/orchestrator")
 mcp_cfg_path = Path("/workspace/.mcp.json")
 inventory_path = Path("/workspace/.tools-inventory.md")
 
-role_mcps_path = orch / "role-mcps.json"
+extensions_path = orch / "extensions.json"
 allow_path = orch / "mcp-allow.json"
 extras_path = Path(f"/opt/pi-templates/{role}/extra-mcps.json")
 
@@ -176,14 +176,14 @@ def query_image_baked_tools(command, cmd_args, timeout=5):
     return None, f"no tools/list result (stderr tail: {stderr_tail!r})"
 
 
-# --- Source 1: proxy-routed upstreams from role-mcps.json ∩ mcp-allow.json
+# --- Source 1: proxy-routed upstreams from extensions.json ∩ mcp-allow.json
 upstream_names: list[str] = []
-role_mcps_has_entry = False
+ext_has_entry = False
 try:
-    data = json.loads(role_mcps_path.read_text())
+    data = json.loads(extensions_path.read_text())
     entry = data.get(role) if isinstance(data, dict) else None
     if isinstance(entry, dict):
-        role_mcps_has_entry = True
+        ext_has_entry = True
         up = entry.get("upstream_mcps") or []
         if isinstance(up, list):
             upstream_names = [n for n in up if isinstance(n, str)]
@@ -284,7 +284,7 @@ if extras_path.is_file():
             image_baked_inventory.append((name, tool_names, ""))
 
 # --- Nothing to render? Exit clean (pi-echo case) --------------------------
-if not role_mcps_has_entry and not extras_path.is_file():
+if not ext_has_entry and not extras_path.is_file():
     raise SystemExit(0)
 
 # --- Write .mcp.json ------------------------------------------------------
@@ -301,8 +301,8 @@ else:
 lines: list[str] = [
     f"# Tools available to pi-{role} in this project",
     "",
-    "Rendered at container start by entrypoint.pi.sh from the project's",
-    "role-mcps.json and (if present) /opt/pi-templates/<role>/extra-mcps.json.",
+    "Rendered at container start by entrypoint.pi.sh from this extension's",
+    "extensions.json entry and (if present) /opt/pi-templates/<role>/extra-mcps.json.",
     "Proxy-routed upstreams reach via the supervisor's mcp-proxy; image-",
     "baked stdio MCPs are launched directly by this interactive claude",
     "session. claude auto-discovers /workspace/.mcp.json and wires them",
@@ -349,8 +349,8 @@ if not proxy_inventory_rows:
             "**No upstream MCPs allowlisted for this role in this project.**",
             "",
             "Tell the PI to run:",
-            f"  research project role-mcp enable <project> {role} --upstream <mcp,...>",
-            "and then re-enable this PI role to re-render the inventory.",
+            f"  research project extension enable <project> {role} --upstream <mcp,...>",
+            "and then re-enable this extension to re-render the inventory.",
             "",
         ]
 else:

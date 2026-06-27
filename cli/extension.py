@@ -203,15 +203,6 @@ def pi_role_label(name: str, kind: str) -> str:
     return name if kind == "baked" else f"iso-{name}"
 
 
-def mirror_of(name: str) -> str | None:
-    """For a baked extension, the worker role-MCP whose upstream MCP set it
-    mirrors (same short name) — or None. ``echo`` has no worker twin
-    (the worker service key is ``echo-mcp``, not ``echo``), so it bypasses
-    the mirror gate, exactly as pi-echo did."""
-    import role_mcp
-    return name if name in role_mcp.ROLE_IMAGES else None
-
-
 # ---------------------------------------------------------------------------
 # Per-project state file (replaces pi-roles.json + pi-isolated.json)
 # ---------------------------------------------------------------------------
@@ -277,19 +268,27 @@ def validate_baked(name: str) -> None:
         )
 
 
-def build_baked_entry(name: str, pins: dict[str, str] | None = None) -> dict[str, Any]:
+def build_baked_entry(name: str, pins: dict[str, str] | None = None, *,
+                      upstreams: list[str] | None = None,
+                      upstream_source: str = "auto") -> dict[str, Any]:
     """Build the extensions.json entry for a baked-or-ext role. ``image`` is
     SNAPSHOTTED here via image_ref — for ext roles that freezes the current
     versions.env pin into the entry, so spawn/recreate reuse it verbatim and a
     later pin bump only affects a fresh enable. ``pins`` (load_versions()) is
-    required for ext roles."""
+    required for ext roles.
+
+    ``upstream_mcps`` is the extension's OWN proxy-routed MCP set, independent of
+    any worker service (the entrypoint renders .mcp.json from this entry, not
+    role-mcps.json). ``upstream_source`` discriminates auto (re-derivable) vs
+    explicit (operator-pinned), mirroring the worker role-MCP model."""
     validate_baked(name)
     return {
         "kind": "baked",
         "ip": BAKED_IPS[name],
         "image": image_ref(name, pins),
         "container": container_name(name, "baked"),
-        "mirror_of": mirror_of(name),
+        "upstream_mcps": list(upstreams or []),
+        "upstream_source": upstream_source,
     }
 
 
@@ -335,7 +334,6 @@ def catalog(pins: dict[str, str] | None = None) -> list[dict[str, Any]]:
             "name": n,
             "kind": "baked",
             "image": img,
-            "mirror_of": mirror_of(n),
             "repo": None,
             "root": None,
         })
@@ -352,7 +350,6 @@ def catalog(pins: dict[str, str] | None = None) -> list[dict[str, Any]]:
             "name": n,
             "kind": "byo",
             "image": byo_img,
-            "mirror_of": None,
             "repo": e.get("repo"),
             "root": e.get("root"),
         })

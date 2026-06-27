@@ -842,20 +842,15 @@ def cmd_extension_list(args: argparse.Namespace) -> None:
         nm = c["name"]
         if c["kind"] == "baked":
             src = c.get("image") or "-"
-            mirror = c.get("mirror_of") or "-"
         else:
             src = c.get("repo") or "(folder-only)"
-            mirror = "-"
-        # A baked mirror extension has no independent default — it comes up iff
-        # its worker twin does. echo (no twin) + BYO use the extension default set.
-        if c["kind"] == "baked" and c.get("mirror_of"):
-            default_col = "same as worker"
-        else:
-            default_col = "✓" if nm in default_on else "-"
-        rows.append((nm, c["kind"], default_col, src, mirror))
+        # Every extension is an independent default target now (no worker twin
+        # coupling): baked roles and BYO types alike use the extension default set.
+        default_col = "✓" if nm in default_on else "-"
+        rows.append((nm, c["kind"], default_col, src))
         descs.append(byo.get(nm, {}).get("description", "")
                      if c["kind"] == "byo" else "")
-    headers = ("NAME", "KIND", "DEFAULT", "IMAGE/REPO", "MIRRORS")
+    headers = ("NAME", "KIND", "DEFAULT", "IMAGE/REPO")
     cols = list(zip(*([headers] + rows)))
     widths = [max(len(str(v)) for v in col) for col in cols]
     fmt = "  ".join(f"{{:<{w}}}" for w in widths)
@@ -868,22 +863,21 @@ def cmd_extension_list(args: argparse.Namespace) -> None:
 
 def cmd_extension_default_enable(args: argparse.Namespace) -> None:
     """Flag an extension for auto-enable in NEW projects (mirrors `mcp enable`).
-    Only echo and BYO types are targets — baked mirror roles follow their
-    worker twin (see `worker enable`)."""
+    Every extension type is an independent target — baked roles
+    (echo / wrangler / websearcher) and BYO types alike (no worker-twin
+    coupling)."""
     known = extension.known_type_names()
     if args.name not in known:
         die(f"unknown extension {args.name!r}. Known: "
             f"{', '.join(sorted(known)) or '(none)'} "
             f"(baked roles + registered BYO types; add a BYO type with "
             f"`research extension add`).")
-    _reject_mirror_extension_default(args.name)
     defaults.set_enabled("extension", args.name, True)
     print(f"extension {args.name!r}: default-enabled (auto-enabled in new "
           f"projects; override per-project with `project create --disable`)")
 
 
 def cmd_extension_default_disable(args: argparse.Namespace) -> None:
-    _reject_mirror_extension_default(args.name)
     defaults.set_enabled("extension", args.name, False)
     print(f"extension {args.name!r}: default-disabled (not auto-enabled in new "
           f"projects)")
@@ -1147,7 +1141,6 @@ def cmd_project_mcp_sync(args: argparse.Namespace) -> None:
     # AFTER phase 1+2 so _derive_auto_upstreams sees the current allow set.
     workspace_path = workspace_path_for(project, cfg)
     role_entries = role_mcp.load_role_mcps(workspace_path)
-    extension_entries = extension.load(workspace_path)
     role_changes: list[str] = []
     for role, entry in list(role_entries.items()):
         if entry.get("upstream_source") != "auto":
@@ -1167,11 +1160,6 @@ def cmd_project_mcp_sync(args: argparse.Namespace) -> None:
         if removed_up:
             diff.append("-" + ",".join(removed_up))
         role_changes.append(f"restarted worker {role!r} ({' '.join(diff)})")
-        # The extension mirror (if enabled) shares the worker's name; restart
-        # it in lockstep so its rendered .mcp.json tracks the new upstreams.
-        if role in extension_entries:
-            _extension_start(container_name, project, cfg, role)
-            role_changes.append(f"restarted extension mirror {role!r} in lockstep")
 
     if not allow_changed and not role_changes:
         print(f"(project {project!r} already in sync with the registry)")
@@ -1208,7 +1196,6 @@ def cmd_project_role_mcp_enable(args: argparse.Namespace) -> None:
     max_concurrent_calls = int(mcc_raw) if mcc_raw is not None else None
     _role_mcp_enable(args.project, cfg, args.role, upstreams,
                      force_auto=force_auto,
-                     no_pi_mirror=bool(getattr(args, "no_pi_mirror", False)),
                      memory=memory,
                      max_concurrent_calls=max_concurrent_calls)
 
@@ -1439,9 +1426,20 @@ def cmd_project_role_mcp_status(args: argparse.Namespace) -> None:
 
 
 def cmd_project_extension_enable(args: argparse.Namespace) -> None:
+    """Baked extensions own their proxy-routed MCP upstreams (BYO agents are
+    isolated and take none):
+      --upstream <csv>  → explicit list (survives sync)
+      --upstream ""     → explicit empty
+      --auto            → re-derive = every MCP allowed for the project
+      (no flag)         → first enable: auto-derive; re-enable: preserve
+    --upstream and --auto are mutually exclusive (argparse-enforced)."""
     cfg = load_config()
     _require_project(args.project)
-    _extension_enable(args.project, cfg, args.name)
+    raw_upstream = getattr(args, "upstream", None)
+    force_auto = bool(getattr(args, "auto", False))
+    upstreams = _parse_csv_list(raw_upstream) if raw_upstream is not None else None
+    _extension_enable(args.project, cfg, args.name, upstreams,
+                      force_auto=force_auto)
 
 
 def cmd_project_extension_disable(args: argparse.Namespace) -> None:
@@ -1560,7 +1558,8 @@ def cmd_project_extension_status(args: argparse.Namespace) -> None:
     print(f"ip:          {entry.get('ip')}")
     if kind == "baked":
         print(f"image:       {entry.get('image')}")
-        print(f"mirror_of:   {entry.get('mirror_of') or '(none)'}")
+        print(f"upstreams:   {', '.join(entry.get('upstream_mcps') or []) or '(none)'}"
+              f"  [{entry.get('upstream_source') or '?'}]")
     else:
         print(f"repo:        {entry.get('repo') or '(none)'}")
         print(f"ref:         {entry.get('ref') or '(none)'}")
@@ -1923,10 +1922,10 @@ def build_parser() -> argparse.ArgumentParser:
                         f"extensions ({','.join(extension.baked_names())} + BYO "
                         f"types). Worker tokens sugar for `project worker "
                         f"enable`; extension tokens for `project extension "
-                        f"enable`. A worker that has a baked extension twin "
-                        f"(wrangler / websearcher) auto-enables that mirror; "
-                        f"the bare sentinel `no-extension-mirror` suppresses "
-                        f"that for every worker token.")
+                        f"enable`. A bare name that is both a worker and a baked "
+                        f"extension (wrangler / websearcher) enables the WORKER "
+                        f"only — the same-named extension is independent, enable "
+                        f"it with `project extension enable`.")
     c.add_argument("--role-mcp-upstream", metavar="ROLE=CSV",
                    action="append",
                    help="repeatable: pin an explicit upstream list for a "
@@ -2022,9 +2021,8 @@ def build_parser() -> argparse.ArgumentParser:
                         f"name against services ({','.join(KNOWN_SERVICES)}), "
                         f"workers ({','.join(sorted(role_mcp.ROLE_IMAGES))}), "
                         f"and extensions ({','.join(extension.baked_names())} + "
-                        f"BYO types). Bare sentinel `no-extension-mirror` "
-                        f"suppresses the baked-extension-mirror auto-enable for "
-                        f"every worker token.")
+                        f"BYO types). A bare worker/extension twin name enables "
+                        f"the worker only; the extension is independent.")
     u.add_argument("--role-mcp-upstream", metavar="ROLE=CSV",
                    action="append",
                    help="repeatable: pin an explicit upstream list for a "
@@ -2119,12 +2117,6 @@ def build_parser() -> argparse.ArgumentParser:
                               "`upstream_source=auto` so `project mcp sync` "
                               "keeps it current. Use this to flip a pinned "
                               "entry back to auto-derive.")
-    rme.add_argument("--no-extension-mirror", dest="no_pi_mirror",
-                     action="store_true",
-                     help="suppress the matching extension mirror's auto-enable. "
-                          "Default: when a baked extension shares this worker's "
-                          "name (wrangler / websearcher), its container is "
-                          "enabled in lockstep.")
     rme.add_argument("--memory",
                      help="per-worker-service container memory cap (docker syntax, "
                           "e.g. 4g). Persists in role-mcps.json and survives "
@@ -2212,6 +2204,15 @@ def build_parser() -> argparse.ArgumentParser:
     sbe.add_argument("name", help="extension name: a baked role (echo / "
                                   "wrangler / websearcher) or a BYO type "
                                   "(see `research extension list`)")
+    sbe_up = sbe.add_mutually_exclusive_group()
+    sbe_up.add_argument("--upstream", metavar="csv",
+                        help="explicit proxy-routed MCP set for this baked "
+                             "extension (comma-separated; must be allowed for "
+                             "the project). '' = explicit empty. Baked only — "
+                             "BYO agents are isolated and take no upstreams.")
+    sbe_up.add_argument("--auto", action="store_true",
+                        help="(re-)derive upstreams = every MCP allowed for the "
+                             "project, marked upstream_source=auto")
     sbe.set_defaults(func=cmd_project_extension_enable)
 
     sbd = sb_sub.add_parser("disable",

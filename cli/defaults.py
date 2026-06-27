@@ -17,11 +17,12 @@ default-enabled entry is auto-applied to every NEW project at `project create`
 (subject to per-project `--disable`); it's create-time only — `project update`
 does not re-apply it.
 
-**Baked mirror sandboxes follow their worker.** wrangler/websearcher baked
-sandboxes have no independent default flag — they come up iff their worker twin
-does (the worker enable auto-enables the extension mirror). So ``BUILTIN["extension"]``
-is empty and the CLI refuses to default-flag a mirror sandbox, pointing at the
-worker instead. Only echo (no twin) and BYO types are sandbox-default targets.
+**Extensions are opt-in and independent of workers.** A baked extension
+(echo/wrangler/websearcher) owns its own MCP upstream set and has no worker-twin
+coupling — every extension type, baked or BYO, is an independent default target
+flaggable with ``extension enable/disable``. ``BUILTIN["extension"]`` ships
+empty (no extension is default-on out of the box); operators opt a type in
+like any other default.
 
 Stdlib only.
 """
@@ -39,8 +40,8 @@ SURFACES = ("worker", "extension")
 # browser that's useful in every project and needs no allowed upstreams.
 # (wrangler is deliberately NOT default-on: without allowed DB MCPs it's an
 # inert container; enable it per-project or globally with `worker enable`.)
-# The sandbox surface ships none — baked mirror sandboxes ride along via the
-# worker→sandbox auto-mirror, so their default follows the worker.
+# The extension surface ships none — extensions are opt-in (independent of
+# workers); operators opt a type in with `extension enable`.
 BUILTIN: dict[str, tuple[str, ...]] = {
     "worker": ("websearcher",),
     "extension": (),

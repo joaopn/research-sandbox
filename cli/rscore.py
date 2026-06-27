@@ -866,8 +866,8 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     #    registries before computing service flags. The docker substrate has no
     #    worker/extension/role-mcp layer, so only service tokens (code-server)
     #    apply there — worker/extension tokens are noted and ignored.
-    enable_services, enable_workers, enable_extensions, \
-        enable_no_extension_mirror = _split_enable_tokens(",".join(req.enable))
+    enable_services, enable_workers, enable_extensions = \
+        _split_enable_tokens(",".join(req.enable))
     disable_services, disable_workers, disable_extensions = \
         _split_disable_tokens(",".join(req.disable))
     role_mcp_explicit: dict[str, list[str]] = {}
@@ -1044,23 +1044,22 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
                 _supervisor_mcp_reload(container_name)
 
         # 6d. worker sugar (--enable <worker>). FAIL-EXPLICIT: a worker that
-        #     won't enable aborts the create (no swallow). Enabling a worker
-        #     auto-enables its baked extension mirror unless `no-extension-mirror`
-        #     was given. This is the slow tail — a role-MCP like websearcher
-        #     builds/starts a Chromium container — so the "wire" milestone is
-        #     emitted AFTER the loops, not before: its view-log row stays pending
-        #     (the UI shows it in-progress) until the enabling actually finishes,
-        #     instead of checking ✓ up front while the box sits on a silent wait.
+        #     won't enable aborts the create (no swallow). Workers and the
+        #     same-named extension are independent surfaces (no auto-mirror).
+        #     This is the slow tail — a role-MCP like websearcher builds/starts
+        #     a Chromium container — so the "wire" milestone is emitted AFTER
+        #     the loops, not before: its view-log row stays pending (the UI shows
+        #     it in-progress) until the enabling actually finishes, instead of
+        #     checking ✓ up front while the box sits on a silent wait.
         for role in enable_workers:
-            _role_mcp_enable(project, cfg, role, role_mcp_explicit.get(role),
-                             no_pi_mirror=enable_no_extension_mirror)
+            _role_mcp_enable(project, cfg, role, role_mcp_explicit.get(role))
             workers_enabled.append(role)
 
-        # 6e. sandbox sugar (--enable <sandbox>). FAIL-EXPLICIT, same as workers.
-        #     A twin already brought up as a worker's mirror is skipped here.
+        # 6e. extension sugar (--enable <extension>). FAIL-EXPLICIT, same as
+        #     workers. Twin names resolve worker-first in _split_enable_tokens,
+        #     so a name here is never also in enable_workers. Baked extensions
+        #     auto-derive their upstreams (= all allowed MCPs) on first enable.
         for name in enable_extensions:
-            if name in workers_enabled:
-                continue
             _extension_enable(project, cfg, name)
             extensions_enabled.append(name)
 
@@ -1265,8 +1264,8 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     print(f"=== Updating project: {project} ===")
 
     # Validate --enable worker tokens up front so a typo doesn't waste a rebuild.
-    enable_services, enable_workers, enable_extensions, \
-        enable_no_extension_mirror = _split_enable_tokens(",".join(req.enable))
+    enable_services, enable_workers, enable_extensions = \
+        _split_enable_tokens(",".join(req.enable))
     disable_services, disable_workers, disable_extensions = \
         _split_disable_tokens(",".join(req.disable))
     role_mcp_explicit = _parse_role_mcp_upstream(
@@ -1331,8 +1330,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     workers_enabled: list[str] = []
     extensions_enabled: list[str] = []
     for role in enable_workers:
-        _role_mcp_enable(project, cfg, role, role_mcp_explicit.get(role),
-                         no_pi_mirror=enable_no_extension_mirror)
+        _role_mcp_enable(project, cfg, role, role_mcp_explicit.get(role))
         workers_enabled.append(role)
     for name in enable_extensions:
         _extension_enable(project, cfg, name)
@@ -3699,16 +3697,6 @@ def _resolve_pi_isolated_ref(repo: str) -> str:
     return r.stdout.split()[0]
 
 
-def _reject_mirror_extension_default(name: str) -> None:
-    """A baked mirror extension (wrangler/websearcher) has no independent default
-    — its enablement follows its worker twin. Point the operator there."""
-    if extension.is_baked(name) and extension.mirror_of(name):
-        die(f"sandbox {name!r} mirrors the worker service of the same name — "
-            f"its default follows the worker, not a separate flag. Use "
-            f"`research worker enable {name}` / `disable {name}` instead "
-            f"(that auto-enables/disables this sandbox in lockstep).")
-
-
 def _extension_registry_edit(name: str, mutate) -> None:
     with pi_isolated_registry.lock():
         try:
@@ -4205,17 +4193,27 @@ def _derive_auto_upstreams(role: str, project: str, cfg: "Config") -> list[str]:
     )
 
 
+def _derive_extension_auto_upstreams(project: str, cfg: "Config") -> list[str]:
+    """Auto-wired upstream set for a baked extension: EVERY MCP currently
+    allowed for the project. Deliberately wider than the worker's
+    ``_derive_auto_upstreams`` (which filters by the registry ``roles`` claim) —
+    an extension is a PI-facing surface with no role-claim concept, so "auto"
+    means "everything the project can reach." Sorted for minimal diffs."""
+    return sorted(
+        e["name"] for e in load_project_allowlist(project, cfg) if e.get("name")
+    )
+
+
 def _role_mcp_enable(project: str, cfg: "Config", role: str,
                      upstreams: list[str] | None,
                      *, force_auto: bool = False,
-                     no_pi_mirror: bool = False,
                      memory: str | None = None,
                      max_concurrent_calls: int | None = None) -> None:
     """Validate + write the per-project role-mcps.json entry + start the
     container + reload the supervisor's mcp-proxy so its config includes
-    the role-MCP route. Also auto-enables the matching PI mirror
-    (``pi-<role>``) unless ``no_pi_mirror`` is set or no such image
-    exists. Idempotent.
+    the role-MCP route. Idempotent. The worker surface is fully independent
+    of the same-named extension (no auto-mirror) — enable an extension via
+    ``research project extension enable``.
 
     Upstream-source state machine:
       - ``upstreams=list, force_auto=False``: explicit pin. Survives sync.
@@ -4307,24 +4305,6 @@ def _role_mcp_enable(project: str, cfg: "Config", role: str,
     else:
         _role_mcp_start(supervisor, project, cfg, role)
         _supervisor_mcp_reload(supervisor)
-
-    # Sandbox mirror auto-enable (M4). Skipped if (a) operator opted out
-    # (no_pi_mirror — the flag kept its internal name), or (b) no baked
-    # sandbox shares this worker's name (e.g. echo-mcp has no mirror; only
-    # wrangler / websearcher do). The mirror's name IS the worker's name.
-    if not no_pi_mirror and extension.is_baked(role):
-        try:
-            _extension_enable(project, cfg, role)
-        except SystemExit:
-            # _extension_enable die()s on its own paths (image-stage, start
-            # error). W10 can't fire — we just wrote role-mcps.json above.
-            # Surface as a warning; operator can retry with sandbox enable.
-            print(
-                f"warning: extension mirror {role!r} failed to enable; "
-                f"retry with `research project extension enable {project} "
-                f"{role}`",
-                file=sys.stderr,
-            )
 
 
 def _role_mcp_disable(project: str, cfg: "Config", role: str) -> None:
@@ -4549,14 +4529,22 @@ def _extension_stop(supervisor: str, name: str, kind: str) -> None:
             f"manually and retry `research project extension disable`.")
 
 
-def _extension_enable(project: str, cfg: "Config", name: str) -> None:
+def _extension_enable(project: str, cfg: "Config", name: str,
+                      upstreams: list[str] | None = None,
+                      *, force_auto: bool = False) -> None:
     """Resolve the extension kind (baked role vs BYO registry type), write the
     per-project extensions.json entry, and start the container. Idempotent.
 
-    Baked roles that mirror a worker service (same short name — wrangler,
-    websearcher) refuse to enable unless that worker service is enabled
-    first (the W10 gate: a mirror with no worker twin renders an empty MCP
-    list). ``echo`` has no worker twin and bypasses the gate. BYO agents
+    A baked extension owns its own proxy-routed MCP upstream set, independent of
+    any worker service of the same name (the entrypoint renders .mcp.json from
+    this extension's own entry). Upstream-source state machine (mirrors
+    ``_role_mcp_enable``):
+      - ``upstreams=list``: explicit pin (survives sync).
+      - ``upstreams=None, force_auto=True`` OR first enable: auto-derive = every
+        MCP allowed for the project; write ``upstream_source=auto``.
+      - ``upstreams=None, force_auto=False`` with an existing entry: idempotent
+        re-run — preserve the current source + set.
+    BYO agents are isolated (no proxy .mcp.json) so they take no upstreams; they
     recreate the supervisor first if it doesn't yet mount /external/<name>."""
     supervisor = container_name_for(project)
     if not container_running(supervisor):
@@ -4565,17 +4553,24 @@ def _extension_enable(project: str, cfg: "Config", name: str) -> None:
     entries = extension.load(workspace_path)
 
     if extension.is_baked(name):
-        mirror = extension.mirror_of(name)
-        if mirror is not None:
-            worker_entries = role_mcp.load_role_mcps(workspace_path)
-            if mirror not in worker_entries:
-                die(f"sandbox {name!r} mirrors worker service {mirror!r}, "
-                    f"which is not enabled for project {project!r}. Run "
-                    f"`research project worker enable {project} {mirror} "
-                    f"--upstream <mcp,...>` first, then re-run this command. "
-                    f"(Sandbox mode reads its upstream set from the worker "
-                    f"service so both surfaces share one source of truth.)")
-        entries[name] = extension.build_baked_entry(name, load_versions())
+        existing = entries.get(name)
+        if upstreams is not None:
+            chosen_upstreams = list(upstreams)
+            chosen_source = "explicit"
+        elif force_auto or existing is None:
+            chosen_upstreams = _derive_extension_auto_upstreams(project, cfg)
+            chosen_source = "auto"
+        else:
+            chosen_upstreams = list(existing.get("upstream_mcps") or [])
+            chosen_source = existing.get("upstream_source") or "explicit"
+        try:
+            role_mcp.validate_upstreams(
+                chosen_upstreams, load_project_allowlist(project, cfg))
+        except ValueError as e:
+            die(str(e))
+        entries[name] = extension.build_baked_entry(
+            name, load_versions(),
+            upstreams=chosen_upstreams, upstream_source=chosen_source)
         extension.save(workspace_path, entries)
         if extension.is_ext(name):
             # MIGRATED extension (STAGE_FEATURE_STAGING C1): publish the host
@@ -4689,47 +4684,42 @@ def _registered_sandbox_byo_types() -> set[str]:
 
 def _split_enable_tokens(
     enable_arg: str | None,
-) -> tuple[str | None, list[str], list[str], bool]:
-    """Split ``--enable`` value into (service_csv, worker_roles, sandboxes,
-    no_extension_mirror).
+) -> tuple[str | None, list[str], list[str]]:
+    """Split ``--enable`` value into (service_csv, worker_roles, sandboxes).
 
     Tokens are matched against the registries in order, by canonical name:
-      - the bare sentinel ``no-extension-mirror`` suppresses the extension-mirror
-        auto-enable for every worker token in the same ``--enable`` value,
       - a key in ``role_mcp.ROLE_IMAGES`` (e.g. ``wrangler``, ``websearcher``,
-        ``echo-mcp``) peels into the worker list. A worker whose name also
-        names a baked extension (wrangler / websearcher) auto-enables that
-        extension mirror downstream — so a bare twin name means "enable both",
-      - a name resolving to an extension type (baked ``echo`` or a BYO registry
-        type) that is NOT also a worker peels into the extension list,
+        ``echo-mcp``) peels into the worker list,
+      - a name resolving to an extension type (baked ``echo`` / ``wrangler`` /
+        ``websearcher`` or a BYO registry type) that is NOT also a worker peels
+        into the extension list,
       - anything else stays for ``_compute_service_flags`` as a service id.
 
     Worker-first ordering resolves the twin overlap (``wrangler`` is both a
-    worker and a baked extension): the bare name enables the worker (+ mirror),
-    while a sandbox-only enable goes through ``project extension enable``.
+    worker and a baked extension): a bare twin name enables the WORKER only —
+    the worker and the same-named extension are independent surfaces (no
+    auto-mirror), so the extension is enabled separately via
+    ``project extension enable``.
 
     Empty service set returns None to keep the default intact."""
     if not enable_arg:
-        return None, [], [], False
+        return None, [], []
     sandbox_types = extension.known_type_names()
     services: list[str] = []
     workers: list[str] = []
     sandboxes: list[str] = []
-    no_extension_mirror = False
     for tok in enable_arg.split(","):
         tok = tok.strip()
         if not tok:
             continue
-        if tok == "no-extension-mirror":
-            no_extension_mirror = True
-        elif tok in role_mcp.ROLE_IMAGES:
+        if tok in role_mcp.ROLE_IMAGES:
             workers.append(tok)
         elif tok in sandbox_types:
             sandboxes.append(tok)
         else:
             services.append(tok)
     svc_csv = ",".join(services) if services else None
-    return svc_csv, workers, sandboxes, no_extension_mirror
+    return svc_csv, workers, sandboxes
 
 
 def _parse_role_mcp_upstream(
