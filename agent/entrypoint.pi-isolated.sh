@@ -20,7 +20,7 @@
 #
 # Auth: PI-owned and boots un-authed — no creds staged here. The PI runs
 # `/login` in the tab, or the operator pushes the supervisor's creds in via
-# `rs-pi sync-creds`. bypassPermissions config is baked into rs-pi-base.
+# `rs-pi sync-creds`. bypassPermissions config is baked into rs-pi-isolated.
 #
 # Expected environment:
 #   RS_PI_ISO_NAME   — type name (e.g. obsidian-wiki); used for log prefixes.
@@ -73,19 +73,18 @@ fi
 # Role marker for the byobu status-bar plugin (~/.byobu/bin/60_rolename).
 echo "${RS_PI_ISO_NAME}" > ~/.rs-role
 
-# Artifact-contract surface (STAGE_SANDBOX_ARTIFACTS): same uniform overlay as
-# baked roles — published/ (supervisor-readable) + internal/ (private). Created
-# alongside the harness clone; the gate + manifest verb are inherited from
-# rs-pi-base. If a harness ignores published/ entirely, the gate is simply inert
-# (no files → no block).
-mkdir -p /workspace/published /workspace/internal
+# No artifact-contract surface: rebased onto rs-ext-base (lane-3), an isolated
+# agent is FULLY PRIVATE — no published//internal/ dirs, no manifest verb, no
+# Stop-hook gate. Its outputs stay in its own tree; nothing publishes back to the
+# research supervisor.
 
 # --- Auth: PI-owned, no staging --------------------------------------------
 # Isolated agents boot un-authed. The tab is a login shell — claude only runs
 # if/when the PI starts it there, and they `/login` at that point (or the
 # operator pushes the supervisor's creds in via `rs-pi sync-creds`, which
 # targets this container by its research.pi_role label). settings.json
-# (bypassPermissions) is baked into rs-pi-base, so claude doesn't prompt.
+# (hook-free bypassPermissions) is baked into rs-pi-isolated, so claude
+# doesn't prompt.
 
 # --- Clone / checkout / setup the harness repo -----------------------------
 # Clone VISIBLY into the workspace root as /workspace/<repo-name> — NOT inside

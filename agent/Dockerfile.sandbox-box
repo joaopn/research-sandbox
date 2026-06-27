@@ -1,28 +1,33 @@
-FROM rs-analysis-base:latest
+FROM rs-ext-base:latest
 
 # rs-sandbox-box — the disposable box image for the agent-less sandbox-project
-# flavor (--workflow sandbox-dind, STAGE_SANDBOX_PROJECT.md). A clean, blank container
-# for running un-vetted code in isolation.
+# flavor (--workflow sandbox-dind, STAGE_SANDBOX_PROJECT.md). A clean, blank
+# container for running un-vetted code in isolation.
 #
-# Deliberately FROM rs-analysis-base, NOT rs-pi-base: a sandbox box must carry
-# NONE of the PI artifact-contract stack (the `manifest` verb, the Stop-hook
-# gate, the publish overlay user-memory, the published/ + internal/ dirs). It
-# inherits only what analysis-base gives — python, the claude CLI, byobu, tini,
-# the worker skel — and adds:
+# Rebased onto rs-ext-base (STAGE_FEATURE_STAGING lane-3): research-DECOUPLED, so
+# editing rs-analysis-base no longer rebuilds boxes, and the box is registry-
+# delivered (pull, not save/load). LEAN by design — it carries NONE of the
+# rs-analysis-base data-science conda stack (pandas/numpy/jupyter/…); pip-install
+# inside the box as needed. It also carries NONE of the PI artifact-contract
+# (rs-ext-base bakes none). It inherits from rs-ext-base: conda (python), byobu,
+# tini, the worker user + skel, ~/.local/bin on PATH, and /opt/pi-templates/
+# greet-and-shell.sh (so the box's webui tab greet step works). Adds:
 #   - git: to clone a repo you want to inspect before trusting it.
 #   - iputils-ping: basic reachability checks from inside the box.
-# Plus a minimal idle entrypoint (no clone, no creds, no artifact surfaces).
+# Plus a minimal idle entrypoint (no clone, no creds, no artifact surfaces); it
+# writes its own bypassPermissions settings.json + cp's the agent/editor dists at
+# boot, so no claude/editor is baked here.
 
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git iputils-ping \
     && rm -rf /var/lib/apt/lists/*
 
-# Minimal idle entrypoint — overrides analysis-base's worker entrypoint.
+# Minimal idle entrypoint — overrides rs-ext-base's shared entrypoint.pi.sh.
 COPY agent/entrypoint.sandbox-box.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 USER worker
 WORKDIR /workspace
-# tini (PID 1) comes from analysis-base.
+# tini (PID 1) comes from rs-ext-base.
 ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]

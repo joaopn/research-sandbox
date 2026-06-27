@@ -74,6 +74,21 @@ EXT_REGISTRY_REFS: dict[str, tuple[str, str]] = {
     "websearcher": ("ext-websearcher", "EXT_WEBSEARCHER_VERSION"),
 }
 
+# GENERIC registry-delivered images (STAGE_FEATURE_STAGING lane-3) — distinct from
+# EXT_REGISTRY_REFS (which is keyed by ENABLEABLE ROLE name and feeds baked_names).
+# These are generic, non-role images: one rs-pi-isolated for every BYO type, and the
+# two blank-box images the in-supervisor rs-sandbox runs. They are NOT roles — they
+# MUST NOT appear in baked_names() — so they get their own map. Same registry shape
+# as the ext roles: host image base -> (registry repo, versions.env pin key); the
+# snapshot ref (rs-registry:5000/<repo>:<pin>) is pulled by a project's inner
+# dockerd, frozen into extensions.json (pi-isolated) / project.json (boxes) at
+# enable/create. Lockstep: the host build tags rs-<base>:<pin> (rscore._build_images).
+GENERIC_REGISTRY_IMAGES: dict[str, tuple[str, str]] = {
+    "rs-pi-isolated":         ("pi-isolated", "PI_ISOLATED_VERSION"),
+    "rs-sandbox-box":         ("sandbox-box", "SANDBOX_BOX_VERSION"),
+    "rs-sandbox-box-browser": ("sandbox-box-browser", "SANDBOX_BOX_BROWSER_VERSION"),
+}
+
 # BYO inner-bridge IP pool (was cli/pi_isolated.py). Disjoint from the baked
 # .10-.13. The whole .10-.25 range is ACCEPTed by inner-firewall.sh, so a new
 # BYO agent needs no firewall edit.
@@ -141,6 +156,28 @@ def image_ref(name: str, pins: dict[str, str] | None = None) -> str:
             )
         return f"{EXT_REGISTRY}/{repo}:{pin}"
     return BAKED_IMAGES[name]
+
+
+def generic_registry_ref(host_base: str, pin: str) -> str:
+    """The local-registry pull ref for a GENERIC image at an EXPLICIT pin —
+    ``rs-registry:5000/<repo>:<pin>``. The recreate/restart path passes the FROZEN
+    pin (from project.json / extensions.json) here, so a versions.env bump never
+    silently re-pulls a different version on restart."""
+    repo, _ = GENERIC_REGISTRY_IMAGES[host_base]
+    return f"{EXT_REGISTRY}/{repo}:{pin}"
+
+
+def generic_image_ref(host_base: str, pins: dict[str, str] | None = None) -> str:
+    """The MINT-path ref for a GENERIC image: resolve the pin from versions.env
+    (``pins`` = rscore.load_versions()) and format the registry ref. Mirrors
+    ``image_ref``'s pin-or-raise. Used at create/enable (the snapshot site) and as
+    the spawn fallback when a pre-migration entry carries no frozen ``image``."""
+    repo, vkey = GENERIC_REGISTRY_IMAGES[host_base]
+    pin = (pins or {}).get(vkey)
+    if not pin:
+        raise ValueError(
+            f"missing version pin {vkey} for {host_base!r}; add it to versions.env")
+    return f"{EXT_REGISTRY}/{repo}:{pin}"
 
 
 def container_name(name: str, kind: str) -> str:
@@ -256,13 +293,19 @@ def build_baked_entry(name: str, pins: dict[str, str] | None = None) -> dict[str
     }
 
 
-def build_byo_entry(name: str, type_entry: dict[str, Any], ip: str) -> dict[str, Any]:
+def build_byo_entry(name: str, type_entry: dict[str, Any], ip: str,
+                    pins: dict[str, str] | None = None) -> dict[str, Any]:
     """Snapshot the resolved host-registry type config into the per-project
-    entry (same snapshot-don't-re-read posture as mcp-allow.json)."""
+    entry (same snapshot-don't-re-read posture as mcp-allow.json). ``image`` is the
+    SNAPSHOT registry ref for the generic rs-pi-isolated image (lane-3) — frozen at
+    enable via generic_image_ref so spawn/recreate pull it verbatim and a
+    versions.env bump only reaches a fresh re-enable. ``pins`` (load_versions()) is
+    required for the snapshot."""
     return {
         "kind": "byo",
         "ip": ip,
         "container": container_name(name, "byo"),
+        "image": generic_image_ref("rs-pi-isolated", pins),
         "repo": type_entry.get("repo"),
         "ref": type_entry.get("ref"),
         "setup": type_entry.get("setup"),
@@ -300,11 +343,15 @@ def catalog(pins: dict[str, str] | None = None) -> list[dict[str, Any]]:
         reg = byo_registry.load(expand=False)
     except byo_registry.RegistryError:
         reg = {"types": {}}
+    try:
+        byo_img = generic_image_ref("rs-pi-isolated", pins)
+    except ValueError:
+        byo_img = f"{EXT_REGISTRY}/{GENERIC_REGISTRY_IMAGES['rs-pi-isolated'][0]}:<unpinned>"
     for n, e in sorted(reg.get("types", {}).items()):
         out.append({
             "name": n,
             "kind": "byo",
-            "image": "rs-pi-isolated:latest",
+            "image": byo_img,
             "mirror_of": None,
             "repo": e.get("repo"),
             "root": e.get("root"),

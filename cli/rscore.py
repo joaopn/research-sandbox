@@ -843,10 +843,14 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     orch_dir = workspace_path / ".orchestrator"
     orch_dir.mkdir(parents=True, exist_ok=True)
     deployed_agents = list(req.agents) if is_docker else []
-    (orch_dir / "project.json").write_text(
-        json.dumps({"type": project_type, "substrate": substrate.value,
-                    "workflow": req.workflow, "agents": deployed_agents},
-                   indent=2) + "\n")
+    marker = {"type": project_type, "substrate": substrate.value,
+              "workflow": req.workflow, "agents": deployed_agents}
+    if project_type == PROJECT_TYPE_SANDBOX_DIND:
+        # Freeze the box-image pins (lane-3): boxes pull these snapshot refs at
+        # create + recreate, so a versions.env bump reaches a project only on a
+        # fresh box-create, never silently on restart.
+        marker["box_image_pins"] = _box_image_pins(load_versions())
+    (orch_dir / "project.json").write_text(json.dumps(marker, indent=2) + "\n")
     # Starting message (STAGE_SPAWN_GREETING) for the workflow's main shell, read
     # by the Management/Supervisor tab on first byobu new-session. Manifest-
     # derived; skip on empty so research/docker (no greeting) stage no stray file.
@@ -976,11 +980,16 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         wait_for_inner_dockerd(container_name)
         is_management = project_type == PROJECT_TYPE_SANDBOX_DIND
         if is_management:
-            stage_worker_image(container_name, SANDBOX_BOX_IMAGE)
-            stage_worker_image(container_name, SANDBOX_BOX_BROWSER_IMAGE)
+            # Box images are registry-delivered (lane-3): push the host images,
+            # connect the registry to this project's network, pull the pinned refs
+            # into the inner store + retag to the :latest rs-sandbox runs. This is
+            # the MINT site (push=True); recreate is pull-only. The pins were just
+            # frozen into project.json (the marker above).
+            _deliver_box_images(container_name, network,
+                                _box_image_pins(load_versions()), push=True)
             # Sandbox-dind stages the dist (deploy_local=False — the management
             # supervisor never runs claude itself) so its rs-sandbox-box boxes
-            # (FROM rs-analysis-base, no bake) can cp claude at boot.
+            # (FROM rs-ext-base, no bake) can cp claude at boot.
             _stage_agent_dist(container_name, deploy_local=False)
             # Editor dist (STAGE_EDITOR_DIST): same ordering rationale as the agent
             # dist — staged before the extension enable cone so interactive boxes can
@@ -1363,21 +1372,29 @@ ANALYSIS_IMAGE = "rs-analysis-base:latest"
 MCP_PROXY_IMAGE = "rs-mcp-proxy:latest"
 ROLE_MCP_BASE_IMAGE = "rs-role-mcp-base:latest"
 PI_BASE_IMAGE = "rs-pi-base:latest"
+# Generic PI-isolated image (one for every BYO type). FROM rs-ext-base (lane-3) +
+# git + clone/setup entrypoint, fully private (no artifact-contract). The :latest
+# tag is the build output + the GENERIC_REGISTRY_IMAGES host base; the build retags
+# it :<PI_ISOLATED_VERSION> for the registry push, and a project's inner dockerd
+# PULLS the snapshot ref (frozen into extensions.json at enable).
 PI_ISOLATED_IMAGE = "rs-pi-isolated:latest"
 # Clean, research-DECOUPLED base for EXTENSION node images (STAGE_FEATURE_STAGING
 # C1). FROM miniconda3 (NOT rs-analysis-base) — sibling of rs-minimal-base, forked
-# on rebuild-blast-radius. Ext leaves (rs-ext-<name>) FROM it; pushed to the local
-# registry, pulled by a project's inner dockerd. See cli/extension.py EXT_REGISTRY_REFS.
+# on rebuild-blast-radius. Ext leaves (rs-ext-<name>) AND the lane-3 generic images
+# (pi-isolated, sandbox-box) FROM it. See cli/extension.py EXT_REGISTRY_REFS /
+# GENERIC_REGISTRY_IMAGES.
 EXT_BASE_IMAGE = "rs-ext-base:latest"
 # Disposable box image for the agent-less sandbox-project flavor
-# (STAGE_SANDBOX_PROJECT.md). FROM rs-analysis-base (NOT rs-pi-base) — clean,
-# no artifact-contract baggage. Staged into a sandbox-dind project's inner dockerd
-# in place of the analysis worker.
+# (STAGE_SANDBOX_PROJECT.md). FROM rs-ext-base (lane-3) — lean (no data-science
+# stack), no artifact-contract. Registry-delivered: the build retags :latest →
+# :<SANDBOX_BOX_VERSION>, the host pushes it, and a sandbox-dind project's inner
+# dockerd PULLS the snapshot ref (frozen in project.json) + retags it back to this
+# :latest the in-supervisor rs-sandbox runs.
 SANDBOX_BOX_IMAGE = "rs-sandbox-box:latest"
 # Browser variant — FROM rs-sandbox-box + @playwright/mcp + Chromium, wired
 # into the box's claude as a stdio MCP (the playwright bundle lifted from the
 # websearcher image, WITHOUT its role.md harness). Opt-in per box via
-# `rs-sandbox create --browser`.
+# `rs-sandbox create --browser`. Registry-delivered like the plain box.
 SANDBOX_BOX_BROWSER_IMAGE = "rs-sandbox-box-browser:latest"
 INNER_NETWORK = "rs-inner"
 WEBUI_IMAGE = "rs-webui:latest"
@@ -2613,20 +2630,21 @@ def _build_images(force: bool) -> None:
         (MCP_PROXY_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.mcp-proxy"),
         (ROLE_MCP_BASE_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.role-mcp-base"),
         (PI_BASE_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.pi-base"),
-        # Generic PI-isolated image — FROM rs-pi-base, adds git + the
-        # clone/setup entrypoint. One image for every isolated type; no
-        # per-type Dockerfile (type behavior comes from the cloned repo).
+        # Clean extension base (STAGE_FEATURE_STAGING C1). FROM miniconda3, so it
+        # has no in-tree FROM dependency; the ext leaves (dynamic loop below) AND
+        # the lane-3 generic images (pi-isolated + sandbox-box) FROM it, so it MUST
+        # precede them.
+        (EXT_BASE_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.ext-base"),
+        # Generic PI-isolated image — FROM rs-ext-base (lane-3): research-decoupled
+        # + registry-delivered, adds git + the clone/setup entrypoint. One image
+        # for every isolated type (type behavior comes from the cloned repo).
         (PI_ISOLATED_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.pi-isolated"),
-        # Disposable sandbox-project box image — FROM rs-analysis-base, clean
-        # of the PI artifact-contract (STAGE_SANDBOX_PROJECT.md). The browser
+        # Disposable sandbox-project box image — FROM rs-ext-base (lane-3): lean
+        # (no data-science stack) + clean of the PI artifact-contract. The browser
         # variant FROMs it, so it must build first (bottom-up).
         (SANDBOX_BOX_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.sandbox-box"),
         (SANDBOX_BOX_BROWSER_IMAGE,
          SCRIPT_DIR / "agent" / "Dockerfile.sandbox-box-browser"),
-        # Clean extension base (STAGE_FEATURE_STAGING C1). FROM miniconda3, so it
-        # has no in-tree FROM dependency; the ext leaves below FROM it, so it MUST
-        # precede them (this static list builds before the dynamic ext loop).
-        (EXT_BASE_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.ext-base"),
     ]
     for role, image in sorted(role_mcp.ROLE_IMAGES.items()):
         dockerfile = SCRIPT_DIR / "agent" / f"Dockerfile.{role}"
@@ -2686,6 +2704,19 @@ def _build_images(force: bool) -> None:
             *build_args,
             str(SCRIPT_DIR),
         ])
+
+    # Lane-3 generic images (STAGE_FEATURE_STAGING): retag each :latest with its
+    # content-snapshot pin so the registry PUSH ref carries it. :latest stays for
+    # the FROM chains (sandbox-box-browser FROM rs-sandbox-box:latest) + the
+    # SANDBOX_BOX_IMAGE / rs-sandbox BOX_IMAGE constants + the inner retag target.
+    for host_base, (_repo, vkey) in sorted(extension.GENERIC_REGISTRY_IMAGES.items()):
+        pin = pins.get(vkey)
+        if not pin:
+            print(f"warning: {host_base} missing pin {vkey} in versions.env; "
+                  f"skipping snapshot retag", file=sys.stderr)
+            continue
+        if run_quiet(["docker", "image", "inspect", f"{host_base}:latest"]):
+            run_check(["docker", "tag", f"{host_base}:latest", f"{host_base}:{pin}"])
 
 
 def _http_json(url: str, timeout: float = 10.0) -> dict:
@@ -3071,8 +3102,21 @@ def _recreate_supervisor(
     # Sandbox flavor stages the blank box image (no analysis workers); see
     # cmd_project_create's matching branch.
     if md.get("project_type") == PROJECT_TYPE_SANDBOX_DIND:
-        stage_worker_image(container, SANDBOX_BOX_IMAGE, force=force_restage)
-        stage_worker_image(container, SANDBOX_BOX_BROWSER_IMAGE, force=force_restage)
+        # Box images: registry-delivered (lane-3). Read the FROZEN pins from
+        # project.json and PULL them (RF1 — never re-push at recreate: the registry
+        # already holds the frozen pin from create, and re-pushing would die() if a
+        # versions.env bump left the host without the old tag). A pre-migration
+        # project has no pins → greenfield backfill (adopt current pins, push,
+        # connect, pull, backfill project.json) — recreate is the only host hook for
+        # boxes (no enable path). force_restage is moot: sysbox's inner store is
+        # fresh, so the pull always fetches.
+        _box_pins = _read_box_pins(workspace_path)
+        if _box_pins:
+            _deliver_box_images(container, network, _box_pins, push=False)
+        else:
+            _box_pins = _box_image_pins(load_versions())
+            _deliver_box_images(container, network, _box_pins, push=True)
+            _write_box_pins(workspace_path, _box_pins)
         # Sandbox-dind: re-stage the dist for the boxes (deploy_local=False).
         _stage_agent_dist(container, deploy_local=False)
         # Editor dist re-staged for the boxes to RO-mount; deploy_local=False — the
@@ -3457,6 +3501,97 @@ def _push_extension_image(name: str) -> None:
     run_check(["docker", "tag", host_tag, push_ref])
     run_check(["docker", "push", push_ref])
     print(f"published extension {name!r} -> {extension.EXT_REGISTRY}/{repo}:{pin}")
+
+
+def _push_generic_image(host_base: str) -> None:
+    """Lazily publish a GENERIC lane-3 image (rs-pi-isolated / rs-sandbox-box[
+    -browser]) into the local registry. Mirrors _push_extension_image but keys on
+    extension.GENERIC_REGISTRY_IMAGES and the rs-<base>:<pin> host tag the build
+    retag produced. Called at the MINT site only (create for boxes, enable for
+    pi-isolated) — a recreate PULLS the frozen pin, never re-pushes."""
+    pins = load_versions()
+    repo, vkey = extension.GENERIC_REGISTRY_IMAGES[host_base]
+    pin = pins.get(vkey)
+    if not pin:
+        die(f"missing version pin {vkey} for {host_base!r}; add it to "
+            f"versions.env and run `research start --rebuild`.")
+    host_tag = f"{host_base}:{pin}"
+    if not run_quiet(["docker", "image", "inspect", host_tag]):
+        die(f"image {host_tag} not built; run `research start --rebuild` first.")
+    _ensure_registry_running()
+    host_port = pins.get("REGISTRY_HOST_PORT", DEFAULT_REGISTRY_HOST_PORT)
+    push_ref = f"127.0.0.1:{host_port}/{repo}:{pin}"
+    run_check(["docker", "tag", host_tag, push_ref])
+    run_check(["docker", "push", push_ref])
+    print(f"published {host_base} -> {extension.EXT_REGISTRY}/{repo}:{pin}")
+
+
+# The two blank-box images, in build order (browser FROMs the plain box). Each:
+# (host image base, registry repo key in project.json, the :latest tag the
+# in-supervisor rs-sandbox `docker run`s — see cli/rs_sandbox.py BOX_IMAGE).
+_BOX_IMAGES = [
+    ("rs-sandbox-box", "sandbox-box", SANDBOX_BOX_IMAGE),
+    ("rs-sandbox-box-browser", "sandbox-box-browser", SANDBOX_BOX_BROWSER_IMAGE),
+]
+
+
+def _box_image_pins(pins: dict[str, str]) -> dict[str, str]:
+    """{registry-repo: pin} for the two box images, from versions.env. die()s on a
+    missing pin (the mint site — create/greenfield-backfill — needs both)."""
+    out: dict[str, str] = {}
+    for host_base, repo, _latest in _BOX_IMAGES:
+        _, vkey = extension.GENERIC_REGISTRY_IMAGES[host_base]
+        pin = pins.get(vkey)
+        if not pin:
+            die(f"missing version pin {vkey} for {host_base!r}; add it to "
+                f"versions.env and run `research start --rebuild`.")
+        out[repo] = pin
+    return out
+
+
+def _deliver_box_images(supervisor: str, network: str, box_pins: dict[str, str],
+                        *, push: bool) -> None:
+    """Make the two pinned box images available in a sandbox-dind supervisor's
+    inner dockerd, registry-delivered. ``push`` (the MINT path — create, or the
+    greenfield recreate-backfill) first publishes the host images; a normal
+    recreate is PULL-ONLY (push=False) — the registry already holds the frozen pin
+    from create, and re-pushing it would die() if a versions.env bump left the host
+    without the old tag (RF1). Connects the registry to the project network
+    (idempotent — survives recreate), pulls each pinned ref into the inner store,
+    and retags to the :latest the in-supervisor rs-sandbox runs (so rs-sandbox is
+    unchanged)."""
+    if push:
+        for host_base, _repo, _latest in _BOX_IMAGES:
+            _push_generic_image(host_base)
+    _connect_registry_to_project_network(network)
+    for _host_base, repo, latest_tag in _BOX_IMAGES:
+        ref = f"{extension.EXT_REGISTRY}/{repo}:{box_pins[repo]}"
+        run_check(["docker", "exec", supervisor, "docker", "pull", ref])
+        run_check(["docker", "exec", supervisor, "docker", "tag", ref, latest_tag])
+
+
+def _read_box_pins(workspace_path: "Path") -> dict[str, str]:
+    """The frozen box-image pins from .orchestrator/project.json, or {} for a
+    pre-migration project (greenfield → recreate backfills)."""
+    f = workspace_path / ".orchestrator" / "project.json"
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    pins = data.get("box_image_pins")
+    return pins if isinstance(pins, dict) else {}
+
+
+def _write_box_pins(workspace_path: "Path", box_pins: dict[str, str]) -> None:
+    """Backfill the box-image pins into project.json (greenfield recreate), keeping
+    every other marker key intact."""
+    f = workspace_path / ".orchestrator" / "project.json"
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    data["box_image_pins"] = box_pins
+    f.write_text(json.dumps(data, indent=2) + "\n")
 
 
 def _spawn_shared_mcp(name: str, entry: dict) -> None:
@@ -4350,7 +4485,23 @@ def _extension_start(supervisor: str, project: str, cfg: "Config",
         run_check(docker_args)
         print(f"sandbox {name!r} (baked): running at {ip}")
     else:  # byo
-        stage_worker_image(supervisor, PI_ISOLATED_IMAGE, force=force_restage)
+        # Registry-delivered (lane-3): PULL the snapshot rs-pi-isolated ref the
+        # inner dockerd already has access to (the registry was connected to this
+        # project's network at enable, and survives recreate). entry.get("image")
+        # is the frozen pin; the generic_image_ref fallback covers a pre-migration
+        # byo entry with no "image" key — converting a would-be KeyError into a
+        # caught pull-failure (the restart loop's except SystemExit skips it
+        # gracefully; the operator re-enables to push/connect/snapshot) — RF3. The
+        # fallback's missing-pin is mapped to die() (SystemExit) too, so it stays a
+        # graceful per-extension skip in the recreate loop rather than a ValueError
+        # that would escape and abort the whole recreate.
+        image = entry.get("image")
+        if not image:
+            try:
+                image = extension.generic_image_ref("rs-pi-isolated", load_versions())
+            except ValueError as e:
+                die(str(e))
+        run_check(["docker", "exec", supervisor, "docker", "pull", image])
         mount = entry.get("mount") or pi_isolated_registry.DEFAULT_MOUNT
         # RW workspace (repo cloned to /workspace/<repo> by the entrypoint) +
         # the external host folder at the configured mount. No /creds mount.
@@ -4374,7 +4525,7 @@ def _extension_start(supervisor: str, project: str, cfg: "Config",
             "--label", f"research.pi_isolated={name}",
             "--label", f"research.project={project}",
             *_data_mount_args_from_supervisor(supervisor),
-            PI_ISOLATED_IMAGE,
+            image,
         ]
         run_check(docker_args)
         print(f"sandbox {name!r} (byo): running at {ip}")
@@ -4447,8 +4598,18 @@ def _extension_enable(project: str, cfg: "Config", name: str) -> None:
         ip = extension.allocate_byo_ip(entries, name)
     except ValueError as e:
         die(str(e))
-    entries[name] = extension.build_byo_entry(name, type_entry, ip)
+    entries[name] = extension.build_byo_entry(name, type_entry, ip, load_versions())
     extension.save(workspace_path, entries)
+
+    # Registry-deliver the generic rs-pi-isolated image (lane-3): push (lazy) +
+    # connect the registry to this project's network, BEFORE the external-mount
+    # branch — because the first byo enable commonly takes the recreate-and-return
+    # path, where the container is started by the recreate restart loop's
+    # _extension_start (byo branch), which PULLS rs-registry:5000/pi-isolated:<pin>.
+    # If push/connect sat only after this branch, that pull would hit an unconnected
+    # registry / unpushed blob and fail (RF2).
+    _push_generic_image("rs-pi-isolated")
+    _connect_registry_to_project_network(project_network_for(project))
 
     if not _supervisor_has_external_mount(supervisor, name):
         print(f"sandbox {name!r}: supervisor not yet mounting /external/{name}; "
