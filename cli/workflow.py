@@ -5,7 +5,7 @@ Stdlib only (the host CLI imports it; it must not drag docker/yaml deps). A
 payload (+ surfacing)`. This module is the data layer — the JSON schema, its
 validator, and `load_catalog()` that merges the in-repo built-ins with a
 host-side BYO registry. Nothing here touches container lifecycle; `create()`
-wiring + the `--type` replacement + the rs-management rename are a LATER slice
+wiring + the `--type` replacement + the rs-sandbox-dind rename are a LATER slice
 (WORKFLOW_TAXONOMY — the breaking create-wiring pass), and the harness
 (`repo+setup` / `image_overlay` execution), tab/mcp-export surfacing, and the
 BYO `workflow add` writer are later still. So `tabs`/`mcp_exports`/`resources`

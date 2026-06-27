@@ -48,8 +48,8 @@ REGISTRY_DIR = Path.home() / ".research-sandbox"
 # The BYO sandbox type registry. Renamed from pi-isolated-registry.json with
 # the CLI-taxonomy refactor (greenfield — no existing registry to migrate);
 # this module is now the BYO sub-component of cli/sandbox.py.
-REGISTRY_PATH = REGISTRY_DIR / "sandbox-registry.json"
-LOCK_PATH = REGISTRY_DIR / "sandbox-registry.lock"
+REGISTRY_PATH = REGISTRY_DIR / "extension-registry.json"
+LOCK_PATH = REGISTRY_DIR / "extension-registry.lock"
 
 VERSION = 1
 DEFAULT_MOUNT = "/workspace/external"

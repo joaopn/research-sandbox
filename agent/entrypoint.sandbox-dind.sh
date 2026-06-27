@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# entrypoint.management.sh — Management substrate for a --type sandbox project
+# entrypoint.sandbox-dind.sh — Management substrate for a --workflow sandbox-dind project
 # (STAGE_SANDBOX_PROJECT.md).
 #
-# Agent-less by construction: this image (rs-management) contains no claude, no
+# Agent-less by construction: this image (rs-sandbox-dind) contains no claude, no
 # rs-worker, no mcp-proxy/firewall, no research-supervisor templates. It hosts
 # isolated boxes (via rs-sandbox in the inner dockerd) and the Editor; the PI
 # manages boxes from the non-agent Management tab. Authority-without-agency is
@@ -30,7 +30,7 @@ if ! grep -q 'umask 002' ~/.bashrc 2>/dev/null; then
 fi
 echo management > ~/.rs-role
 
-# --- Workspace: only the orchestrator dir (sandbox.json + project.json). No
+# --- Workspace: only the orchestrator dir (extensions.json + project.json). No
 #     plan/logbook/workers tree — there are no workers and no supervisor agent.
 if [[ "$(stat -c %U /workspace)" != "research" ]]; then
     sudo chown research:research /workspace 2>/dev/null || true

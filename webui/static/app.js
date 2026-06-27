@@ -1037,14 +1037,14 @@ async function mgmtFillStatus(fill) {
     }
 }
 
-// Paint a project badge: the WORKFLOW the user picked (sandbox/research/box-host/
+// Paint a project badge: the WORKFLOW the user picked (sandbox/research/sandbox-dind/
 // BYO) + a colour keyed off the label, or empty (collapsed) when unknown. We
 // label by workflow, not the derived flavour, so a docker `sandbox` box reads
 // "sandbox" instead of mislabelling as "research" (substrate stays hidden, Q7).
 // Legacy markers without a workflow fall back to the flavour string server-side.
 function setTypeBadge(elm, label) {
     const cls = label === "research" ? " type-research"
-        : (label === "box-host" || label === "sandbox") ? " type-sandbox"
+        : (label === "sandbox-dind" || label === "sandbox") ? " type-sandbox"
         : label ? " type-box" : "";
     elm.className = "type-badge" + cls;
     elm.textContent = label || "";

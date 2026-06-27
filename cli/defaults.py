@@ -1,4 +1,4 @@
-"""defaults — host-side default-enablement for the worker + sandbox surfaces.
+"""defaults — host-side default-enablement for the worker + extension surfaces.
 
 Mirrors the MCP registry's ``enabled`` → auto-allow model for the two surfaces
 whose catalogs are code constants (worker services in ``role_mcp.ROLE_IMAGES``,
@@ -8,7 +8,7 @@ does. The "enabled flag" lives as a host-level set per surface:
 
     ~/.research-sandbox/defaults.json
     {"worker":  {"on": [...], "off": [...]},
-     "sandbox": {"on": [...], "off": [...]}}
+     "extension": {"on": [...], "off": [...]}}
 
 A name's default-enabled state = ``(BUILTIN ∪ on) − off``. ``BUILTIN`` ships
 some entries on out of the box (the wrangler + websearcher worker services);
@@ -19,7 +19,7 @@ does not re-apply it.
 
 **Baked mirror sandboxes follow their worker.** wrangler/websearcher baked
 sandboxes have no independent default flag — they come up iff their worker twin
-does (the worker enable auto-enables the sandbox mirror). So ``BUILTIN["sandbox"]``
+does (the worker enable auto-enables the extension mirror). So ``BUILTIN["extension"]``
 is empty and the CLI refuses to default-flag a mirror sandbox, pointing at the
 worker instead. Only echo (no twin) and BYO types are sandbox-default targets.
 
@@ -33,7 +33,7 @@ from pathlib import Path
 
 REGISTRY_DIR = Path.home() / ".research-sandbox"
 PATH = REGISTRY_DIR / "defaults.json"
-SURFACES = ("worker", "sandbox")
+SURFACES = ("worker", "extension")
 
 # Entries shipped default-on. Workers: just websearcher — an image-baked
 # browser that's useful in every project and needs no allowed upstreams.
@@ -43,7 +43,7 @@ SURFACES = ("worker", "sandbox")
 # worker→sandbox auto-mirror, so their default follows the worker.
 BUILTIN: dict[str, tuple[str, ...]] = {
     "worker": ("websearcher",),
-    "sandbox": (),
+    "extension": (),
 }
 
 

@@ -16,7 +16,7 @@ filter. By default it boots **un-authed and editor-off** — genuinely minimal.
   package, poke at data — without standing up the whole research lab.
 - You don't need an agent or parallel workers.
 
-Reach for **research** if you want a supervising agent + workers; **box-host** if
+Reach for **research** if you want a supervising agent + workers; **sandbox-dind** if
 you want to spin *several* isolated boxes yourself.
 
 ## How it works

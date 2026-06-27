@@ -51,14 +51,14 @@ SERVICES = {
             "bash -c 'cat /workspace/.orchestrator/greeting 2>/dev/null; exec bash'"
         ),
     },
-    # management — the default tab for `--type sandbox` projects
+    # management — the default tab for sandbox-dind projects
     # (STAGE_SANDBOX_PROJECT.md), REPLACING the Supervisor + Editor tabs.
     # Authority-without-agency: this surface can create/discard every box and
     # read their artifacts, so it deliberately runs no agent — a plain login
     # shell, never `claude`. It prints the `rs-sandbox` cheatsheet on a fresh
     # byobu session (bare `rs-sandbox` → usage), then drops to bash. The
     # flavor gate is in `project_services_handler` (server.py): management
-    # shows iff project.json type == "sandbox", and supervisor/code-server are
+    # shows iff project.json type == "sandbox-dind", and supervisor/code-server are
     # omitted there. always_on so it surfaces without a port probe.
     "management": {
         "label": "Management",
@@ -90,23 +90,23 @@ SERVICES = {
     # inside this tab's `docker exec … bash -lc '…'` wrapper.
     #
     # always_on=False — visibility is per-project, gated on whether the
-    # project enables the baked sandbox `wrangler`. The filter is in
+    # project enables the baked extension `wrangler`. The filter is in
     # `project_services_handler` in server.py; it reads the per-project
-    # `.orchestrator/sandbox.json` directly off the `/projects:ro`
+    # `.orchestrator/extensions.json` directly off the `/projects:ro`
     # bind-mount that already serves the rail's status sub-line, and maps
-    # this `pi-wrangler` tab id to the baked sandbox key `wrangler`. No
-    # SSH, no cache: lifecycle changes (`research project sandbox enable/
+    # this `pi-wrangler` tab id to the baked extension key `wrangler`. No
+    # SSH, no cache: lifecycle changes (`research project extension enable/
     # disable`) reflect on the next page load.
     #
     # New baked `pi-<short>` tabs follow the same shape — always_on=False
     # is the correct default; the filter generalizes across every
     # `kind=ssh` non-always-on service whose id starts with `pi-` (it
-    # strips the prefix and looks up the baked sandbox of that name).
+    # strips the prefix and looks up the baked extension of that name).
     #
     # Label is "Wrangler" without the "PI" prefix — from the PI's
     # perspective everything here IS PI mode; the prefix would be noise.
     # The underlying container is still `rs-pi-wrangler` and the baked
-    # sandbox key in sandbox.json is `wrangler`; only the user-facing
+    # extension key in extensions.json is `wrangler`; only the user-facing
     # tab id keeps the `pi-` prefix.
     "pi-wrangler": {
         "label": "Wrangler",
@@ -168,7 +168,7 @@ SERVICES = {
 # PI-isolated agents (STAGE_PI_ISOLATED) are per-project and arbitrarily
 # named, so they can't be static SERVICES entries. Their tab id is
 # `pi-iso-<name>` and the tab is synthesized on demand: project_services_
-# handler adds one per BYO (kind="byo") entry in the project's sandbox.json,
+# handler adds one per BYO (kind="byo") entry in the project's extensions.json,
 # and `resolve()` reconstructs the command server-side for the ssh handler.
 import re as _re
 
@@ -185,7 +185,7 @@ def pi_isolated_service(name: str) -> dict | None:
 
     Unlike the baked PI roles (pi-wrangler / pi-websearcher), the inner
     command is a **login shell**, NOT ``claude`` — pi-isolated is a plain
-    per-project sandbox (cloned repo + folder mount, no MCPs). Starting
+    per-project extension (cloned repo + folder mount, no MCPs). Starting
     claude, authenticating, pulling skills from the marketplace, etc. are
     all the PI's to do, in whatever order — auto-launching claude would
     pre-empt that. This mirrors pi-echo's `bash -l` tab. ``-c /workspace``

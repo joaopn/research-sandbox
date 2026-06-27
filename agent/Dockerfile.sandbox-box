@@ -1,7 +1,7 @@
 FROM rs-analysis-base:latest
 
 # rs-sandbox-box — the disposable box image for the agent-less sandbox-project
-# flavor (--type sandbox, STAGE_SANDBOX_PROJECT.md). A clean, blank container
+# flavor (--workflow sandbox-dind, STAGE_SANDBOX_PROJECT.md). A clean, blank container
 # for running un-vetted code in isolation.
 #
 # Deliberately FROM rs-analysis-base, NOT rs-pi-base: a sandbox box must carry

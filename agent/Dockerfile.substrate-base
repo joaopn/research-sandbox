@@ -10,7 +10,7 @@ FROM rs-minimal-base:latest
 #   rs-supervisor  (research projects) = base + claude + rs-worker/rs-pi/
 #                  rs-role-mcp + mcp-proxy tooling + inner-firewall + the
 #                  CLAUDE.md/setup.sh templates + entrypoint.supervisor.sh
-#   rs-management  (--type sandbox)    = base + rs-sandbox + entrypoint.management.sh
+#   rs-sandbox-dind  (--workflow sandbox-dind)    = base + rs-sandbox + entrypoint.sandbox-dind.sh
 #
 # The split is the point: editing the supervisor's AGENT layer can never touch
 # Management, and editing the DIND delta here cascades to both leaves but NOT to

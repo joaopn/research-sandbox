@@ -1,6 +1,6 @@
 FROM rs-substrate-base:latest
 
-# rs-management — the agent-less substrate for a `--type sandbox` project
+# rs-sandbox-dind — the agent-less substrate for a `--workflow sandbox-dind` project
 # (STAGE_SANDBOX_PROJECT.md). The Management leaf on top of rs-substrate-base:
 # it adds ONLY rs-sandbox (the box-lifecycle CLI) and a lean entrypoint.
 #
@@ -19,7 +19,7 @@ RUN chmod +x /usr/local/bin/rs-sandbox
 # Snapshot the home (byobu from the base, NO claude) for first-boot restore.
 RUN cp -a /home/research /etc/research-skel
 
-COPY agent/entrypoint.management.sh /entrypoint.sh
+COPY agent/entrypoint.sandbox-dind.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 USER research

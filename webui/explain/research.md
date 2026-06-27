@@ -21,7 +21,7 @@ you (the PI) supervising.
   reviewed before they reach you.
 - A weeks-to-months project that accumulates a logbook and a results inventory.
 
-Reach for **sandbox** instead if you just want one confined shell; **box-host** if
+Reach for **sandbox** instead if you just want one confined shell; **sandbox-dind** if
 you want to run isolated boxes yourself without a supervisor agent.
 
 ## How it works

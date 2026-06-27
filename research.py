@@ -45,11 +45,11 @@ from pathlib import Path
 
 # Make cli/ helpers importable.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "cli"))
-import defaults  # noqa: E402  (host-side default-enablement for worker + sandbox)
+import defaults  # noqa: E402  (host-side default-enablement for worker + extension)
 import mcp_registry  # noqa: E402
-import pi_isolated_registry  # noqa: E402  (BYO sandbox type registry; sub-component of sandbox)
+import pi_isolated_registry  # noqa: E402  (BYO extension type registry; sub-component of extension)
 import role_mcp  # noqa: E402
-import sandbox  # noqa: E402  (unified PI-driven container surface; absorbs former pi + pi_isolated)
+import extension  # noqa: E402  (unified PI-driven container surface; absorbs former pi + pi_isolated)
 import workflow  # noqa: E402  (workflow manifest schema + store catalog; read-only here)
 import broker  # noqa: E402  (host-side lifecycle-verb daemon over a unix socket; opt-in)
 
@@ -207,7 +207,7 @@ def _print_create_report(res, cfg) -> None:
     inner_fw = "on" if res.inner_firewall else "off"
     mcps_line = ", ".join(res.mcps) if res.mcps else "(none)"
     role_mcps_line = ", ".join(res.workers) if res.workers else "(none)"
-    pi_roles_line = ", ".join(res.sandboxes) if res.sandboxes else "(none)"
+    pi_roles_line = ", ".join(res.extensions) if res.extensions else "(none)"
     if res.data_mounts:
         data_lines = "\n".join(
             f"             /workspace/shared/data/{b}/  ←  {src}"
@@ -236,7 +236,7 @@ def _print_create_report(res, cfg) -> None:
             f"{res.project}` (a plain shell) or the Editor tab. It runs no\n"
             "     inner docker and no agent — a single confined container."
         )
-    elif res.project_type == PROJECT_TYPE_SANDBOX:
+    elif res.project_type == PROJECT_TYPE_SANDBOX_DIND:
         steps.append(
             "  1. Open the Management shell and spin a box:\n"
             f"     `python research.py project attach {res.project}`, then run\n"
@@ -405,13 +405,13 @@ def cmd_project_attach(args: argparse.Namespace) -> None:
     container = container_name_for(args.name)
     if not container_running(container):
         die(f"project {args.name!r} is not running (use `research project start` first)")
-    # Sandbox-flavor projects: attach lands in the Management console (no
+    # Sandbox-dind projects: attach lands in the Management console (no
     # agent). Print the rs-sandbox cheatsheet first so SSH/attach matches the
     # webui Management tab. Read the flavor off the container label.
     ptype = run(["docker", "inspect", "-f",
                  f"{{{{index .Config.Labels \"{PROJECT_TYPE_LABEL}\"}}}}", container],
                 capture_output=True)
-    if ptype.returncode == 0 and ptype.stdout.strip() == PROJECT_TYPE_SANDBOX:
+    if ptype.returncode == 0 and ptype.stdout.strip() == PROJECT_TYPE_SANDBOX_DIND:
         run(["docker", "exec", container, "rs-sandbox"], capture_output=False)
     # Ensure a session exists (entrypoint creates one, but if byobu was closed…).
     run(["docker", "exec", container, "bash", "-lc",
@@ -770,12 +770,12 @@ def cmd_worker_default_disable(args: argparse.Namespace) -> None:
           f"projects)")
 
 
-def cmd_sandbox_add(args: argparse.Namespace) -> None:
-    """Register a BYO sandbox type in the host registry. Baked roles
+def cmd_extension_add(args: argparse.Namespace) -> None:
+    """Register a BYO extension type in the host registry. Baked roles
     (echo / wrangler / websearcher) are built-in and need no registration —
     a BYO type may not shadow one."""
-    if args.name in sandbox.baked_names():
-        die(f"{args.name!r} is a built-in baked sandbox; BYO types can't "
+    if args.name in extension.baked_names():
+        die(f"{args.name!r} is a built-in baked extension; BYO types can't "
             f"shadow it. Pick a different name.")
     entry: dict = {"root": args.root}
     if args.repo:
@@ -804,32 +804,32 @@ def cmd_sandbox_add(args: argparse.Namespace) -> None:
         except pi_isolated_registry.RegistryError as e:
             die(str(e))
         if args.name in data["types"]:
-            die(f"sandbox type {args.name!r} already registered; "
-                f"remove first or use `sandbox set-root`/`describe`")
+            die(f"extension type {args.name!r} already registered; "
+                f"remove first or use `extension set-root`/`describe`")
         data["types"][args.name] = entry
         try:
             pi_isolated_registry.save_atomic(data)
         except pi_isolated_registry.RegistryError as e:
             die(str(e))
-    print(f"added sandbox type {args.name!r} (root {args.root})")
+    print(f"added extension type {args.name!r} (root {args.root})")
     print(f"  next: `research project create <p> --enable {args.name}` "
           f"(or `project update <p> --enable {args.name}`)")
 
 
-def cmd_sandbox_list(args: argparse.Namespace) -> None:
+def cmd_extension_list(args: argparse.Namespace) -> None:
     """Full host catalog of sandbox *types*: built-in baked roles + BYO
     registry types. The DEFAULT column marks types flagged for auto-enable in
-    new projects (`research sandbox enable <name>`). Visibility surface — what
+    new projects (`research extension enable <name>`). Visibility surface — what
     can be enabled per project."""
-    cat = sandbox.catalog(rscore.load_versions())
-    default_on = set(defaults.enabled("sandbox"))
+    cat = extension.catalog(rscore.load_versions())
+    default_on = set(defaults.enabled("extension"))
     if args.json:
         for c in cat:
             c["default"] = c["name"] in default_on
         print(json.dumps(cat, indent=2, sort_keys=True))
         return
     if not cat:
-        print("(no sandbox types available)")
+        print("(no extension types available)")
         return
     # BYO descriptions, fetched once for the annotation lines.
     try:
@@ -846,8 +846,8 @@ def cmd_sandbox_list(args: argparse.Namespace) -> None:
         else:
             src = c.get("repo") or "(folder-only)"
             mirror = "-"
-        # A baked mirror sandbox has no independent default — it comes up iff
-        # its worker twin does. echo (no twin) + BYO use the sandbox default set.
+        # A baked mirror extension has no independent default — it comes up iff
+        # its worker twin does. echo (no twin) + BYO use the extension default set.
         if c["kind"] == "baked" and c.get("mirror_of"):
             default_col = "same as worker"
         else:
@@ -866,37 +866,37 @@ def cmd_sandbox_list(args: argparse.Namespace) -> None:
             print(f"    {d}")
 
 
-def cmd_sandbox_default_enable(args: argparse.Namespace) -> None:
-    """Flag a sandbox for auto-enable in NEW projects (mirrors `mcp enable`).
+def cmd_extension_default_enable(args: argparse.Namespace) -> None:
+    """Flag an extension for auto-enable in NEW projects (mirrors `mcp enable`).
     Only echo and BYO types are targets — baked mirror roles follow their
     worker twin (see `worker enable`)."""
-    known = sandbox.known_type_names()
+    known = extension.known_type_names()
     if args.name not in known:
-        die(f"unknown sandbox {args.name!r}. Known: "
+        die(f"unknown extension {args.name!r}. Known: "
             f"{', '.join(sorted(known)) or '(none)'} "
             f"(baked roles + registered BYO types; add a BYO type with "
-            f"`research sandbox add`).")
-    _reject_mirror_sandbox_default(args.name)
-    defaults.set_enabled("sandbox", args.name, True)
-    print(f"sandbox {args.name!r}: default-enabled (auto-enabled in new "
+            f"`research extension add`).")
+    _reject_mirror_extension_default(args.name)
+    defaults.set_enabled("extension", args.name, True)
+    print(f"extension {args.name!r}: default-enabled (auto-enabled in new "
           f"projects; override per-project with `project create --disable`)")
 
 
-def cmd_sandbox_default_disable(args: argparse.Namespace) -> None:
-    _reject_mirror_sandbox_default(args.name)
-    defaults.set_enabled("sandbox", args.name, False)
-    print(f"sandbox {args.name!r}: default-disabled (not auto-enabled in new "
+def cmd_extension_default_disable(args: argparse.Namespace) -> None:
+    _reject_mirror_extension_default(args.name)
+    defaults.set_enabled("extension", args.name, False)
+    print(f"extension {args.name!r}: default-disabled (not auto-enabled in new "
           f"projects)")
 
 
-def cmd_sandbox_remove(args: argparse.Namespace) -> None:
-    if args.name in sandbox.baked_names():
-        die(f"{args.name!r} is a built-in baked sandbox; it can't be removed.")
-    in_use = projects_using_sandbox_type(args.name)
+def cmd_extension_remove(args: argparse.Namespace) -> None:
+    if args.name in extension.baked_names():
+        die(f"{args.name!r} is a built-in baked extension; it can't be removed.")
+    in_use = projects_using_extension_type(args.name)
     if in_use and not args.force:
-        die(f"sandbox type {args.name!r} is enabled for projects: "
+        die(f"extension type {args.name!r} is enabled for projects: "
             f"{', '.join(in_use)}.\n"
-            f"  Run `research project sandbox disable <proj> {args.name}` "
+            f"  Run `research project extension disable <proj> {args.name}` "
             f"for each, or pass --force.")
     with pi_isolated_registry.lock():
         try:
@@ -904,28 +904,28 @@ def cmd_sandbox_remove(args: argparse.Namespace) -> None:
         except pi_isolated_registry.RegistryError as e:
             die(str(e))
         if args.name not in data["types"]:
-            die(f"no sandbox type named {args.name!r}")
+            die(f"no extension type named {args.name!r}")
         data["types"].pop(args.name)
         try:
             pi_isolated_registry.save_atomic(data)
         except pi_isolated_registry.RegistryError as e:
             die(str(e))
-    defaults.set_enabled("sandbox", args.name, False)  # drop any default flag
-    print(f"removed sandbox type {args.name!r}")
+    defaults.set_enabled("extension", args.name, False)  # drop any default flag
+    print(f"removed extension type {args.name!r}")
     if in_use:
         print(f"  note: {len(in_use)} project(s) still have a stale "
-              f"sandbox.json entry; they keep running until "
-              f"`project sandbox disable`.")
+              f"extensions.json entry; they keep running until "
+              f"`project extension disable`.")
 
 
-def cmd_sandbox_set_root(args: argparse.Namespace) -> None:
-    _sandbox_registry_edit(args.name, lambda e: e.__setitem__("root", args.root))
+def cmd_extension_set_root(args: argparse.Namespace) -> None:
+    _extension_registry_edit(args.name, lambda e: e.__setitem__("root", args.root))
     print(f"set root for {args.name!r}: {args.root}")
     print("  (existing projects pick up the new root on next "
           "`project update`/recreate)")
 
 
-def cmd_sandbox_describe(args: argparse.Namespace) -> None:
+def cmd_extension_describe(args: argparse.Namespace) -> None:
     new_desc = "" if args.clear else (args.text or "").strip()
     if not args.clear and not new_desc:
         die("description text is required (or pass --clear to remove)")
@@ -936,7 +936,7 @@ def cmd_sandbox_describe(args: argparse.Namespace) -> None:
         else:
             e.pop("description", None)
 
-    _sandbox_registry_edit(args.name, mutate)
+    _extension_registry_edit(args.name, mutate)
     print(f"{'set' if new_desc else 'cleared'} description for {args.name!r}")
 
 
@@ -1147,7 +1147,7 @@ def cmd_project_mcp_sync(args: argparse.Namespace) -> None:
     # AFTER phase 1+2 so _derive_auto_upstreams sees the current allow set.
     workspace_path = workspace_path_for(project, cfg)
     role_entries = role_mcp.load_role_mcps(workspace_path)
-    sandbox_entries = sandbox.load(workspace_path)
+    extension_entries = extension.load(workspace_path)
     role_changes: list[str] = []
     for role, entry in list(role_entries.items()):
         if entry.get("upstream_source") != "auto":
@@ -1167,11 +1167,11 @@ def cmd_project_mcp_sync(args: argparse.Namespace) -> None:
         if removed_up:
             diff.append("-" + ",".join(removed_up))
         role_changes.append(f"restarted worker {role!r} ({' '.join(diff)})")
-        # The sandbox mirror (if enabled) shares the worker's name; restart
+        # The extension mirror (if enabled) shares the worker's name; restart
         # it in lockstep so its rendered .mcp.json tracks the new upstreams.
-        if role in sandbox_entries:
-            _sandbox_start(container_name, project, cfg, role)
-            role_changes.append(f"restarted sandbox mirror {role!r} in lockstep")
+        if role in extension_entries:
+            _extension_start(container_name, project, cfg, role)
+            role_changes.append(f"restarted extension mirror {role!r} in lockstep")
 
     if not allow_changed and not role_changes:
         print(f"(project {project!r} already in sync with the registry)")
@@ -1438,21 +1438,21 @@ def cmd_project_role_mcp_status(args: argparse.Namespace) -> None:
           f" ({'has artifacts' if state['publish_present'] else 'empty'})")
 
 
-def cmd_project_sandbox_enable(args: argparse.Namespace) -> None:
+def cmd_project_extension_enable(args: argparse.Namespace) -> None:
     cfg = load_config()
     _require_project(args.project)
-    _sandbox_enable(args.project, cfg, args.name)
+    _extension_enable(args.project, cfg, args.name)
 
 
-def cmd_project_sandbox_disable(args: argparse.Namespace) -> None:
+def cmd_project_extension_disable(args: argparse.Namespace) -> None:
     cfg = load_config()
     _require_project(args.project)
-    _sandbox_disable(args.project, cfg, args.name)
-    print(f"sandbox {args.name!r}: disabled")
+    _extension_disable(args.project, cfg, args.name)
+    print(f"extension {args.name!r}: disabled")
 
 
-def cmd_project_sandbox_list(args: argparse.Namespace) -> None:
-    """Comprehensive listing: every enabled sandbox with its container state
+def cmd_project_extension_list(args: argparse.Namespace) -> None:
+    """Comprehensive listing: every enabled extension with its container state
     in any condition (running / exited / dead / absent). Reads config from the
     project's host bind-mount, so it renders even when the supervisor is
     stopped (state shows 'unknown' then); enriches with live `docker ps -a`
@@ -1460,12 +1460,12 @@ def cmd_project_sandbox_list(args: argparse.Namespace) -> None:
     cfg = load_config()
     supervisor = _require_project(args.project)
     workspace_path = workspace_path_for(args.project, cfg)
-    entries = sandbox.load(workspace_path)
+    entries = extension.load(workspace_path)
     up = container_running(supervisor)
     states = _inner_container_states(supervisor)
 
     def state_of(nm: str, e: dict) -> str:
-        cname = e.get("container") or sandbox.container_name(nm, e.get("kind"))
+        cname = e.get("container") or extension.container_name(nm, e.get("kind"))
         if not up:
             return "unknown"
         return states.get(cname, "absent")
@@ -1481,7 +1481,7 @@ def cmd_project_sandbox_list(args: argparse.Namespace) -> None:
         return
 
     if not entries:
-        print(f"(project {args.project!r} has no sandboxes enabled)")
+        print(f"(project {args.project!r} has no extensions enabled)")
         return
 
     rows: list[tuple[str, ...]] = []
@@ -1501,14 +1501,14 @@ def cmd_project_sandbox_list(args: argparse.Namespace) -> None:
               "project for live container state)")
 
 
-def cmd_project_sandbox_status(args: argparse.Namespace) -> None:
+def cmd_project_extension_status(args: argparse.Namespace) -> None:
     cfg = load_config()
     supervisor = _require_project(args.project)
     workspace_path = workspace_path_for(args.project, cfg)
-    entries = sandbox.load(workspace_path)
+    entries = extension.load(workspace_path)
     entry = entries.get(args.name)
     if entry is None:
-        die(f"sandbox {args.name!r} is not enabled for project "
+        die(f"extension {args.name!r} is not enabled for project "
             f"{args.project!r}")
     kind = entry.get("kind")
     state = {
@@ -1516,18 +1516,18 @@ def cmd_project_sandbox_status(args: argparse.Namespace) -> None:
         "project": args.project,
         "kind": kind,
         "entry": entry,
-        "container": sandbox.container_name(args.name, kind),
+        "container": extension.container_name(args.name, kind),
         "exists": False,
         "running": False,
     }
     if container_running(supervisor):
-        state["exists"] = _sandbox_inner_exists(supervisor, args.name, kind)
-        state["running"] = _sandbox_inner_running(supervisor, args.name, kind)
+        state["exists"] = _extension_inner_exists(supervisor, args.name, kind)
+        state["running"] = _extension_inner_running(supervisor, args.name, kind)
         if kind == "byo":
             state["supervisor_external_mount"] = _supervisor_has_external_mount(
                 supervisor, args.name)
 
-    ws = workspace_path / sandbox.workspace_subdir(args.name, kind)
+    ws = workspace_path / extension.workspace_subdir(args.name, kind)
     state["workspace"] = str(ws)
     state["workspace_present"] = ws.is_dir()
     if ws.is_dir():
@@ -1577,10 +1577,10 @@ def cmd_project_sandbox_status(args: argparse.Namespace) -> None:
         print(f"  repo cloned: {state['repo_cloned']}")
 
 
-def cmd_project_sandbox_sync_creds(args: argparse.Namespace) -> None:
-    """The supervisor→sandbox credential bridge: invoke the supervisor-side
+def cmd_project_extension_sync_creds(args: argparse.Namespace) -> None:
+    """The supervisor→extension credential bridge: invoke the supervisor-side
     rs-pi CLI to push the supervisor's current creds into every running
-    sandbox container. Operator-initiated only — sandboxes are PI-owned and
+    extension container. Operator-initiated only — extensions are PI-owned and
     boot un-authed; nothing propagates creds automatically."""
     supervisor = _require_project(args.project)
     r = run(["docker", "exec", supervisor, "rs-pi", "sync-creds"],
@@ -1603,7 +1603,7 @@ def cmd_project_update_agent(args: argparse.Namespace) -> None:
     until their next restart (the entrypoint absence-guard). Pull a new version
     first with `research agent pull` (or `agent refresh`).
 
-    Box-host (`--type sandbox`) projects ARE supported: their supervisor never runs
+    Sandbox-dind (`--workflow sandbox-dind`) projects ARE supported: their supervisor never runs
     claude itself (deploy_local=False), but it stages the dist for its boxes."""
     supervisor = _require_project(args.name)
     agent = args.agent
@@ -1613,14 +1613,14 @@ def cmd_project_update_agent(args: argparse.Namespace) -> None:
     if not container_running(supervisor):
         die(f"project {args.name!r} is not running "
             f"(use `research project start {args.name}` first)")
-    is_sandbox = _container_project_type(supervisor) == PROJECT_TYPE_SANDBOX
+    is_sandbox = _container_project_type(supervisor) == PROJECT_TYPE_SANDBOX_DIND
     rscore._stage_agent_dist(supervisor, agent, deploy_local=not is_sandbox)
     ver = rscore.load_versions().get(
         rscore._AGENT_INSTALL[agent]["version_key"], "(unknown)")
     print(f"re-staged {agent} {ver} into {args.name!r}.")
     print("note: newly-spawned workers / role-MCPs / PI / boxes pick this up; "
           "already-running long-lived containers keep their copy until restart. "
-          + ("(box-host: the supervisor itself runs no claude.)" if is_sandbox
+          + ("(sandbox-dind: the supervisor itself runs no claude.)" if is_sandbox
              else "Open a fresh claude tab in the supervisor to use the new one."))
 
 
@@ -1809,7 +1809,7 @@ def cmd_webui(args: argparse.Namespace) -> None:
 def cmd_workflow_list(args: argparse.Namespace) -> None:
     """Render the store catalog: built-in workflows + any host-side BYO entries.
     Read-only — the workflow surface is not yet wired into `create()` (that, plus
-    the rs-management rename and `--type` removal, is the create-wiring slice)."""
+    the rs-sandbox-dind rename and `--type` removal, is the create-wiring slice)."""
     try:
         catalog = workflow.load_catalog()
     except workflow.WorkflowError as e:
@@ -1895,7 +1895,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--workflow", default=None,
                    help="workflow to launch (default: research). See "
                         "`research workflow list` for the catalog; e.g. "
-                        "'box-host' (agent-less DIND box host), 'sandbox' (a single "
+                        "'sandbox-dind' (agent-less DIND box host), 'sandbox' (a single "
                         "confined docker container).")
     c.add_argument("--data", metavar="PATHS",
                    help="comma-separated host paths, each mounted RO at "
@@ -1920,12 +1920,12 @@ def build_parser() -> argparse.ArgumentParser:
                         f"are matched by name against three registries: "
                         f"services ({','.join(KNOWN_SERVICES)}), workers "
                         f"({','.join(sorted(role_mcp.ROLE_IMAGES))}), and "
-                        f"sandboxes ({','.join(sandbox.baked_names())} + BYO "
+                        f"extensions ({','.join(extension.baked_names())} + BYO "
                         f"types). Worker tokens sugar for `project worker "
-                        f"enable`; sandbox tokens for `project sandbox "
-                        f"enable`. A worker that has a baked sandbox twin "
+                        f"enable`; extension tokens for `project extension "
+                        f"enable`. A worker that has a baked extension twin "
                         f"(wrangler / websearcher) auto-enables that mirror; "
-                        f"the bare sentinel `no-sandbox-mirror` suppresses "
+                        f"the bare sentinel `no-extension-mirror` suppresses "
                         f"that for every worker token.")
     c.add_argument("--role-mcp-upstream", metavar="ROLE=CSV",
                    action="append",
@@ -1940,7 +1940,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="comma-separated tokens to disable for this project, "
                         "overruling the host default-enable sets: service ids "
                         "(supervisor is always-on), worker services, and "
-                        "sandboxes. e.g. `--disable websearcher` skips a "
+                        "extensions. e.g. `--disable websearcher` skips a "
                         "default-enabled worker for this one project.")
     c.add_argument("--mcp", metavar="NAMES", default="all-enabled",
                    help="MCPs to auto-allow at create time: 'all-enabled' "
@@ -2021,9 +2021,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"comma-separated tokens to enable. Matched by "
                         f"name against services ({','.join(KNOWN_SERVICES)}), "
                         f"workers ({','.join(sorted(role_mcp.ROLE_IMAGES))}), "
-                        f"and sandboxes ({','.join(sandbox.baked_names())} + "
-                        f"BYO types). Bare sentinel `no-sandbox-mirror` "
-                        f"suppresses the baked-sandbox-mirror auto-enable for "
+                        f"and extensions ({','.join(extension.baked_names())} + "
+                        f"BYO types). Bare sentinel `no-extension-mirror` "
+                        f"suppresses the baked-extension-mirror auto-enable for "
                         f"every worker token.")
     u.add_argument("--role-mcp-upstream", metavar="ROLE=CSV",
                    action="append",
@@ -2033,8 +2033,8 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--disable", metavar="IDS",
                    help="comma-separated service ids to disable "
                         "(supervisor is always-on and cannot be "
-                        "disabled). Also accepts sandbox names to "
-                        "disable a sandbox container (workspace "
+                        "disabled). Also accepts extension names to "
+                        "disable an extension container (workspace "
                         "preserved).")
     u.set_defaults(func=cmd_project_update)
 
@@ -2092,7 +2092,7 @@ def build_parser() -> argparse.ArgumentParser:
              "status). Workers are pipeline-side agents: the role-MCP "
              "services workers call via the proxy, plus (in `list`) the "
              "ephemeral analysis containers the supervisor spawns. Not "
-             "PI-driven — see `project sandbox` for those.",
+             "PI-driven — see `project extension` for those.",
     )
     rm_sub = rm.add_subparsers(dest="role_action", required=True)
 
@@ -2119,10 +2119,10 @@ def build_parser() -> argparse.ArgumentParser:
                               "`upstream_source=auto` so `project mcp sync` "
                               "keeps it current. Use this to flip a pinned "
                               "entry back to auto-derive.")
-    rme.add_argument("--no-sandbox-mirror", dest="no_pi_mirror",
+    rme.add_argument("--no-extension-mirror", dest="no_pi_mirror",
                      action="store_true",
-                     help="suppress the matching sandbox mirror's auto-enable. "
-                          "Default: when a baked sandbox shares this worker's "
+                     help="suppress the matching extension mirror's auto-enable. "
+                          "Default: when a baked extension shares this worker's "
                           "name (wrangler / websearcher), its container is "
                           "enabled in lockstep.")
     rme.add_argument("--memory",
@@ -2190,62 +2190,62 @@ def build_parser() -> argparse.ArgumentParser:
     rms.add_argument("--json", action="store_true")
     rms.set_defaults(func=cmd_project_role_mcp_status)
 
-    # ----- per-project sandbox lifecycle (STAGE_CLI_TAXONOMY) -----------
+    # ----- per-project extension lifecycle (STAGE_CLI_TAXONOMY) -----------
     # Merges the former `project pi` (baked roles) + `project pi-isolated`
     # (BYO agents) into one surface: PI-driven, webui-tab-able containers.
     sb = proj_sub.add_parser(
-        "sandbox",
-        help="per-project sandbox lifecycle (enable / disable / list / "
-             "status / sync-creds). Sandboxes are PI-driven containers with "
+        "extension",
+        help="per-project extension lifecycle (enable / disable / list / "
+             "status / sync-creds). Extensions are PI-driven containers with "
              "webui tabs: baked roles (echo / wrangler / websearcher) and "
-             "BYO skill-repo agents (see `research sandbox list`). They live "
-             "in sandbox.json. PI-owned auth (in-tab /login or sync-creds).",
+             "BYO skill-repo agents (see `research extension list`). They live "
+             "in extensions.json. PI-owned auth (in-tab /login or sync-creds).",
     )
-    sb_sub = sb.add_subparsers(dest="sandbox_action", required=True)
+    sb_sub = sb.add_subparsers(dest="extension_action", required=True)
 
     sbe = sb_sub.add_parser("enable",
-                            help="bring up a sandbox container in the "
+                            help="bring up an extension container in the "
                                  "supervisor's inner dockerd (recreates the "
                                  "supervisor first if a BYO external folder "
                                  "isn't mounted yet)")
     sbe.add_argument("project")
-    sbe.add_argument("name", help="sandbox name: a baked role (echo / "
+    sbe.add_argument("name", help="extension name: a baked role (echo / "
                                   "wrangler / websearcher) or a BYO type "
-                                  "(see `research sandbox list`)")
-    sbe.set_defaults(func=cmd_project_sandbox_enable)
+                                  "(see `research extension list`)")
+    sbe.set_defaults(func=cmd_project_extension_enable)
 
     sbd = sb_sub.add_parser("disable",
-                            help="stop + remove the sandbox container "
+                            help="stop + remove the extension container "
                                  "(workspace, and any BYO external folder, "
                                  "survive)")
     sbd.add_argument("project")
     sbd.add_argument("name")
-    sbd.set_defaults(func=cmd_project_sandbox_disable)
+    sbd.set_defaults(func=cmd_project_extension_disable)
 
     sbl = sb_sub.add_parser("list",
-                            help="show every sandbox enabled for the project "
+                            help="show every extension enabled for the project "
                                  "with its container state in any condition "
                                  "(running / stopped / dead); works "
                                  "supervisor up or down")
     sbl.add_argument("project")
     sbl.add_argument("--json", action="store_true")
-    sbl.set_defaults(func=cmd_project_sandbox_list)
+    sbl.set_defaults(func=cmd_project_extension_list)
 
     sbs = sb_sub.add_parser("status",
-                            help="deep-print one sandbox's container state + "
+                            help="deep-print one extension's container state + "
                                  "workspace (and, for BYO, clone) presence")
     sbs.add_argument("project")
     sbs.add_argument("name")
     sbs.add_argument("--json", action="store_true")
-    sbs.set_defaults(func=cmd_project_sandbox_status)
+    sbs.set_defaults(func=cmd_project_extension_status)
 
     sbsc = sb_sub.add_parser("sync-creds",
                              help="push the supervisor's creds into every "
-                                  "running sandbox (operator-initiated; "
-                                  "sandboxes are otherwise PI-authed via "
+                                  "running extension (operator-initiated; "
+                                  "extensions are otherwise PI-authed via "
                                   "in-tab /login)")
     sbsc.add_argument("project")
-    sbsc.set_defaults(func=cmd_project_sandbox_sync_creds)
+    sbsc.set_defaults(func=cmd_project_extension_sync_creds)
 
     # ----- MCP registry (Stage 2.1) -------------------------------------
     mcp = sub.add_parser("mcp", help="MCP registry operations")
@@ -2366,18 +2366,18 @@ def build_parser() -> argparse.ArgumentParser:
     wkd.add_argument("name")
     wkd.set_defaults(func=cmd_worker_default_disable)
 
-    # ----- sandbox type registry (STAGE_CLI_TAXONOMY) -------------------
-    # Host catalog of sandbox types: built-in baked roles (constants) +
+    # ----- extension type registry (STAGE_CLI_TAXONOMY) -------------------
+    # Host catalog of extension types: built-in baked roles (constants) +
     # operator-registered BYO skill-repo types (the host registry, formerly
-    # `pi-isolated`). Per-project lifecycle is `research project sandbox`.
+    # `pi-isolated`). Per-project lifecycle is `research project extension`.
     sbr = sub.add_parser(
-        "sandbox",
-        help="host catalog of sandbox types: built-in baked roles + BYO "
+        "extension",
+        help="host catalog of extension types: built-in baked roles + BYO "
              "skill-repo agents (reusable repo + root-folder definitions "
              "enabled per-project with `project create|update --enable`)")
     sbr_sub = sbr.add_subparsers(dest="subcommand", required=True)
 
-    pa = sbr_sub.add_parser("add", help="register a BYO sandbox type")
+    pa = sbr_sub.add_parser("add", help="register a BYO extension type")
     pa.add_argument("name")
     pa.add_argument("--root", required=True, metavar="HOST_DIR",
                     help="host folder for this type; the per-project subdir "
@@ -2398,43 +2398,43 @@ def build_parser() -> argparse.ArgumentParser:
                          f"at (default {pi_isolated_registry.DEFAULT_MOUNT!r}; "
                          f"keep under /workspace/)")
     pa.add_argument("--description",
-                    help="operator note surfaced in `sandbox list`")
+                    help="operator note surfaced in `extension list`")
     pa.add_argument("--no-verify", action="store_true",
                     help="skip the `git ls-remote` repo/ref check at add time")
-    pa.set_defaults(func=cmd_sandbox_add)
+    pa.set_defaults(func=cmd_extension_add)
 
     pl = sbr_sub.add_parser("list",
-                            help="list all sandbox types (built-in baked + BYO)")
+                            help="list all extension types (built-in baked + BYO)")
     pl.add_argument("--json", action="store_true")
-    pl.set_defaults(func=cmd_sandbox_list)
+    pl.set_defaults(func=cmd_extension_list)
 
     pr = sbr_sub.add_parser("remove", help="remove a BYO type from the registry")
     pr.add_argument("name")
     pr.add_argument("--force", action="store_true",
                     help="remove even if projects currently enable it")
-    pr.set_defaults(func=cmd_sandbox_remove)
+    pr.set_defaults(func=cmd_extension_remove)
 
     sbe = sbr_sub.add_parser("enable",
-                             help="flag a sandbox (baked or BYO) for auto-enable "
+                             help="flag an extension (baked or BYO) for auto-enable "
                                   "in new projects (like `mcp enable`)")
     sbe.add_argument("name")
-    sbe.set_defaults(func=cmd_sandbox_default_enable)
+    sbe.set_defaults(func=cmd_extension_default_enable)
     sbd = sbr_sub.add_parser("disable",
-                             help="clear a sandbox's default-enable flag")
+                             help="clear an extension's default-enable flag")
     sbd.add_argument("name")
-    sbd.set_defaults(func=cmd_sandbox_default_disable)
+    sbd.set_defaults(func=cmd_extension_default_disable)
 
     psr = sbr_sub.add_parser("set-root", help="change a BYO type's host root folder")
     psr.add_argument("name")
     psr.add_argument("root", metavar="HOST_DIR")
-    psr.set_defaults(func=cmd_sandbox_set_root)
+    psr.set_defaults(func=cmd_extension_set_root)
 
     pds = sbr_sub.add_parser("describe", help="set or clear a BYO type's description")
     pds.add_argument("name")
     pdg = pds.add_mutually_exclusive_group(required=True)
     pdg.add_argument("text", nargs="?", help="new description text")
     pdg.add_argument("--clear", action="store_true", help="remove the description")
-    pds.set_defaults(func=cmd_sandbox_describe)
+    pds.set_defaults(func=cmd_extension_describe)
 
     # ----- webui (browser SSH multiplexer) ------------------------------
     wf = sub.add_parser("workflow",

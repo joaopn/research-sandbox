@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 420" role="img" aria-label="Box-host workflow orchestration">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 420" role="img" aria-label="Sandbox-dind workflow orchestration">
   <style>
     .explain-doc svg .node rect { fill: #1f2933; stroke: #5b8def; stroke-width: 1.5; }
     .explain-doc svg .node text { fill: #e6edf3; font: 13px sans-serif; text-anchor: middle; dominant-baseline: middle; }
@@ -26,7 +26,7 @@
       <text x="240" y="44">Operator</text></g>
   </a>
   <a href="#components">
-    <g class="node"><title>rs-management: agent-less DIND host. Runs the inner Docker daemon + rs-inner bridge; you drive it via its shell + rs-sandbox.</title>
+    <g class="node"><title>rs-sandbox-dind: agent-less DIND host. Runs the inner Docker daemon + rs-inner bridge; you drive it via its shell + rs-sandbox.</title>
       <rect x="140" y="110" width="200" height="52" rx="8"/>
       <text x="240" y="136">Management host (dind)</text></g>
   </a>

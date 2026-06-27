@@ -8,7 +8,7 @@ FROM continuumio/miniconda3:latest
 #
 #   rs-substrate-base = rs-minimal-base + the sysbox-DIND delta (docker-ce +
 #                       crun + daemon.json + the `docker` group) — and ITS two
-#                       leaves rs-supervisor / rs-management are unchanged.
+#                       leaves rs-supervisor / rs-sandbox-dind are unchanged.
 #   rs-minimal        = rs-minimal-base + an agent-less entrypoint — the runnable
 #                       leaf for the `docker` containment substrate (single runc
 #                       container, no inner dockerd, cannot spawn containers).
@@ -16,7 +16,7 @@ FROM continuumio/miniconda3:latest
 # Image tree:
 #   rs-minimal-base ─┬─ rs-minimal        (docker substrate: ssh + editor, runc)
 #                    └─ rs-substrate-base ─┬─ rs-supervisor  (research flavor)
-#                                          └─ rs-management  (sandbox flavor)
+#                                          └─ rs-sandbox-dind  (sandbox flavor)
 #
 # No agent is ever baked here or in any leaf — agents are delivered per-project
 # as dists (PLAN/STAGE_AGENT_DIST.md), so the image axis stays substrate-only.

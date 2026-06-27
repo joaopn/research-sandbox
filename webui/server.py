@@ -789,12 +789,12 @@ async def project_services_handler(request: web.Request) -> web.Response:
     is the correct UX — a tab that 502s on click is worse than no tab.
 
     kind=ssh non-always-on services whose id starts with `pi-` are
-    gated on the project's per-supervisor sandbox.json: a `pi-<short>`
-    tab shows iff the baked sandbox `<short>` is enabled there (plus one
+    gated on the project's per-supervisor extensions.json: a `pi-<short>`
+    tab shows iff the baked extension `<short>` is enabled there (plus one
     synthesized tab per BYO sandbox). Read directly off the existing
     `/projects:ro` bind-mount — same data plane that powers the rail's
     status sub-line; no cache, no SSH, no docker socket. Lifecycle
-    changes (`research project sandbox enable / disable`) reflect on the
+    changes (`research project extension enable / disable`) reflect on the
     next page load. RO mount surface is wider than this filter
     (covers `.creds/` etc.), so adding new file reads here doesn't
     expand the webui's trust posture."""
@@ -820,9 +820,9 @@ async def project_services_handler(request: web.Request) -> web.Response:
 
     # Project flavor (STAGE_SANDBOX_PROJECT.md). "sandbox" projects swap the
     # agentic Supervisor + Editor tabs for the non-agent Management tab; their
-    # box tabs come from kind="sandbox" sandbox.json entries. Read off the same
+    # box tabs come from kind="sandbox" extensions.json entries. Read off the same
     # /projects:ro bind-mount as everything else here.
-    is_sandbox = _read_project_type(project) == "sandbox"
+    is_sandbox = _read_project_type(project) == "sandbox-dind"
     # A bare docker box (substrate=docker) has no claude-supervisor — its
     # "Supervisor" tab is really a plain login shell (ssh+byobu bash on the
     # rs-minimal image, which still ships ssh+byobu+code-server). Relabel it
@@ -850,9 +850,9 @@ async def project_services_handler(request: web.Request) -> web.Response:
                 out[sid] = svc
         elif svc.get("kind") == "ssh" and sid.startswith("pi-"):
             if sandbox_map is None:
-                sandbox_map = _read_project_sandbox(project)
+                sandbox_map = _read_project_extensions(project)
             # A baked-sandbox SERVICES tab `pi-<short>` shows iff the project
-            # enables baked sandbox `<short>` (sandbox.json key, no prefix).
+            # enables baked extension `<short>` (extensions.json key, no prefix).
             if sandbox_map.get(sid[len("pi-"):]) == "baked":
                 out[sid] = svc
 
@@ -862,7 +862,7 @@ async def project_services_handler(request: web.Request) -> web.Response:
     # serves both. Same data-plane discipline — read off the /projects:ro
     # bind-mount, no SSH/docker socket, lifecycle reflects on next page load.
     if sandbox_map is None:
-        sandbox_map = _read_project_sandbox(project)
+        sandbox_map = _read_project_extensions(project)
     for name, kind in sorted(sandbox_map.items()):
         if kind not in ("byo", "sandbox"):
             continue
@@ -872,17 +872,17 @@ async def project_services_handler(request: web.Request) -> web.Response:
     return web.json_response(out)
 
 
-def _read_project_sandbox(project: str) -> dict[str, str]:
-    """Return ``{name: kind}`` for the sandboxes enabled for ``project``,
-    read from its `.orchestrator/sandbox.json` off the `/projects:ro`
+def _read_project_extensions(project: str) -> dict[str, str]:
+    """Return ``{name: kind}`` for the extensions enabled for ``project``,
+    read from its `.orchestrator/extensions.json` off the `/projects:ro`
     bind-mount (kind is "baked" or "byo"). Tolerates: missing workspace,
-    missing sandbox.json (no sandboxes enabled), invalid JSON — all return
+    missing extensions.json (no extensions enabled), invalid JSON — all return
     an empty dict so the tab strip silently omits the sandbox tabs. No
     cache: the read is cheap and lifecycle changes propagate on next load."""
     workspace = _project_workspace(project)
     if workspace is None:
         return {}
-    f = workspace / ".orchestrator" / "sandbox.json"
+    f = workspace / ".orchestrator" / "extensions.json"
     if not f.is_file():
         return {}
     try:
@@ -900,7 +900,7 @@ def _read_project_marker(project: str) -> dict:
     bind-mount, or {} when missing/unreadable (legacy projects, bad JSON). The
     single read behind _read_project_type / _read_project_substrate and the
     rail's workflow label — same no-cache, no-socket discipline as
-    _read_project_sandbox. The marker carries {type, substrate, workflow, agent}."""
+    _read_project_extensions. The marker carries {type, substrate, workflow, agent}."""
     workspace = _project_workspace(project)
     if workspace is None:
         return {}
@@ -915,11 +915,11 @@ def _read_project_marker(project: str) -> dict:
 
 
 def _read_project_type(project: str) -> str:
-    """Legacy project flavor ("research" | "sandbox"), defaulting to "research"
+    """Legacy project flavor ("research" | "sandbox-dind"), defaulting to "research"
     for missing/unreadable markers. NOTE: a bare docker box derives to
     "research" too — for a user-facing label prefer the marker's `workflow`
     (what the user actually picked), which the rail badge now shows."""
-    return ("sandbox" if _read_project_marker(project).get("type") == "sandbox"
+    return ("sandbox-dind" if _read_project_marker(project).get("type") == "sandbox-dind"
             else "research")
 
 
@@ -1041,9 +1041,9 @@ def _compute_status(name: str) -> dict:
         "workers_running": workers_running,
         "workers_done": workers_done,
         "disk_bytes": disk_bytes,
-        "flavor": _read_project_type(name),     # "research" | "sandbox" (legacy)
+        "flavor": _read_project_type(name),     # "research" | "sandbox-dind" (legacy)
         # The user-facing label: the WORKFLOW the user picked (empty/research/
-        # box-host/BYO), not the derived flavor — so a docker `empty` box stops
+        # sandbox-dind/BYO), not the derived flavor — so a docker `empty` box stops
         # mislabelling as "research". Falls back to the flavor for legacy markers
         # that predate the workflow field. Substrate stays hidden (Q7).
         "workflow": _read_project_marker(name).get("workflow") or _read_project_type(name),

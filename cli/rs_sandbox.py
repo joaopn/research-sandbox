@@ -14,11 +14,11 @@ everything, so it must hold zero agency.
 Boxes run the clean ``rs-sandbox-box`` image (FROM rs-analysis-base — python,
 claude, byobu, git, ping; NO PI artifact-contract). They are auth-free (run
 ``claude`` + ``/login`` inside one if you want an LLM). Egress is NOT gated
-here — it is the project-wide router policy (a sandbox project defaults to
+here — it is the project-wide router policy (a sandbox-dind project defaults to
 ``locked``: 80/443/53 + ICMP, RFC1918 blocked — usable but contained).
 
 Self-contained by necessity (only this file is baked, like rs-worker), so the
-box-pool bounds + sandbox.json shape are duplicated here. Stdlib only; shells
+box-pool bounds + extensions.json shape are duplicated here. Stdlib only; shells
 out to the ``docker`` CLI (static-IP pinning is awkward through docker-py).
 """
 
@@ -36,7 +36,7 @@ from typing import NoReturn
 
 WORKSPACE = Path(os.environ.get("RS_WORKSPACE", "/workspace"))
 ORCH = WORKSPACE / ".orchestrator"
-SANDBOX_JSON = ORCH / "sandbox.json"
+EXTENSIONS_JSON = ORCH / "extensions.json"
 PROJECT_JSON = ORCH / "project.json"
 
 INNER_NETWORK = "rs-inner"
@@ -68,7 +68,7 @@ rs-sandbox — isolated boxes for running un-vetted code
 
   rs-sandbox create [name] [--browser]  spin a blank box (auto-named box-N);
                                         --browser bundles playwright + Chromium
-  rs-sandbox list [--json]    show boxes (+ any baked sandboxes) and their state
+  rs-sandbox list [--json]    show boxes (+ any baked extensiones) and their state
   rs-sandbox stop <name>      stop a box (keeps its workspace; start to resume)
   rs-sandbox start <name>     (re)start a stopped box from its saved entry
   rs-sandbox discard <name>   stop the box AND wipe its workspace
@@ -96,26 +96,26 @@ def _docker(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["docker", *args], capture_output=True, text=True)
 
 
-def _require_sandbox_project() -> None:
-    """rs-sandbox is only meaningful in a --type sandbox project."""
+def _require_sandbox_dind_project() -> None:
+    """rs-sandbox is only meaningful in a --workflow sandbox-dind project."""
     try:
         ptype = json.loads(PROJECT_JSON.read_text()).get("type")
     except (OSError, json.JSONDecodeError):
         ptype = None
-    if ptype != "sandbox":
-        die("not a sandbox-flavor project (.orchestrator/project.json type != "
-            "'sandbox'). Create one with "
-            "`research project create <name> --type sandbox`.")
+    if ptype != "sandbox-dind":
+        die("not a sandbox-dind project (.orchestrator/project.json type != "
+            "'sandbox-dind'). Create one with "
+            "`research project create <name> --workflow sandbox-dind`.")
 
 
-# --- sandbox.json -----------------------------------------------------------
+# --- extensions.json --------------------------------------------------------
 
 
 def load() -> dict[str, dict]:
-    if not SANDBOX_JSON.is_file():
+    if not EXTENSIONS_JSON.is_file():
         return {}
     try:
-        data = json.loads(SANDBOX_JSON.read_text())
+        data = json.loads(EXTENSIONS_JSON.read_text())
     except json.JSONDecodeError:
         return {}
     return data if isinstance(data, dict) else {}
@@ -125,9 +125,9 @@ def save(data: dict[str, dict]) -> None:
     # Atomic-rename; parent dir is bind-mounted, so the write is visible to the
     # host + webui immediately (parent-dir mount, not file).
     ORCH.mkdir(parents=True, exist_ok=True)
-    tmp = SANDBOX_JSON.with_suffix(".json.tmp")
+    tmp = EXTENSIONS_JSON.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    tmp.replace(SANDBOX_JSON)
+    tmp.replace(EXTENSIONS_JSON)
 
 
 # --- allocation -------------------------------------------------------------
@@ -204,12 +204,12 @@ def _box_entry(entries: dict[str, dict], name: str) -> dict:
     entry = entries.get(name)
     if entry is None or entry.get("kind") != KIND:
         die(f"no sandbox box named {name!r} "
-            f"(baked/byo sandboxes are managed with `research project sandbox`)")
+            f"(baked/byo sandboxes are managed with `research project extension`)")
     return entry
 
 
 def cmd_create(args: argparse.Namespace) -> None:
-    _require_sandbox_project()
+    _require_sandbox_dind_project()
     entries = load()
     name = args.name
     if name is None:
@@ -228,19 +228,19 @@ def cmd_create(args: argparse.Namespace) -> None:
 
 
 def cmd_restart(args: argparse.Namespace) -> None:
-    """Re-run a box from its sandbox.json entry. Called by the host
+    """Re-run a box from its extensions.json entry. Called by the host
     _recreate_supervisor restart loop (the inner dockerd is fresh after a
     sysbox recreate) — delegated here so the docker-run logic lives in one
     place. Identical to `start` for a gone container; named `restart` for the
     recreate-loop caller's clarity."""
-    _require_sandbox_project()
+    _require_sandbox_dind_project()
     entry = _box_entry(load(), args.name)
     _run_box(args.name, entry["ip"], browser=bool(entry.get("browser")))
     print(f"box {args.name!r}: restarted at {entry['ip']}")
 
 
 def cmd_stop(args: argparse.Namespace) -> None:
-    _require_sandbox_project()
+    _require_sandbox_dind_project()
     _box_entry(load(), args.name)  # validate it's our box
     r = _docker("stop", box_container(args.name))
     if r.returncode != 0:
@@ -252,7 +252,7 @@ def cmd_stop(args: argparse.Namespace) -> None:
 def cmd_start(args: argparse.Namespace) -> None:
     """Resume a stopped box, or re-run it from its entry if the container is
     gone (e.g. after a recreate)."""
-    _require_sandbox_project()
+    _require_sandbox_dind_project()
     entry = _box_entry(load(), args.name)
     cname = box_container(args.name)
     exists = _docker("container", "inspect", cname).returncode == 0
@@ -267,7 +267,7 @@ def cmd_start(args: argparse.Namespace) -> None:
 
 
 def cmd_discard(args: argparse.Namespace) -> None:
-    _require_sandbox_project()
+    _require_sandbox_dind_project()
     entries = load()
     _box_entry(entries, args.name)
     _docker("rm", "-f", box_container(args.name))

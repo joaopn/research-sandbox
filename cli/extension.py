@@ -12,10 +12,10 @@ Two kinds:
   - ``byo``:   the generic ``rs-pi-isolated`` image cloning an operator-
     registered skill repo. Catalog is the host BYO type registry
     (``cli/pi_isolated_registry.py`` → ``~/.research-sandbox/
-    sandbox-registry.json``), IPs drawn from a dynamic pool.
+    extension-registry.json``), IPs drawn from a dynamic pool.
 
 Per-project enabled state lives in
-``<workspace>/.orchestrator/sandbox.json`` — one entry per enabled sandbox,
+``<workspace>/.orchestrator/extensions.json`` — one entry per enabled extension,
 keyed by name, carrying ``kind`` + resolved runtime fields. It replaces the
 old ``pi-roles.json`` + ``pi-isolated.json`` (greenfield: no migration).
 
@@ -31,13 +31,13 @@ from typing import Any
 
 # The BYO host type registry is reused verbatim as a sub-component (it owns
 # the reusable repo+root type definitions, validation, and locking). Renamed
-# only at the file level (sandbox-registry.json); see pi_isolated_registry.
+# only at the file level (extension-registry.json); see pi_isolated_registry.
 import pi_isolated_registry as byo_registry
 
 # ---------------------------------------------------------------------------
 # Baked catalog (was cli/pi.py) — pinned inner-bridge IPs + per-role images
 # ---------------------------------------------------------------------------
-# Range .10-.25 on rs-inner is reserved for PI/sandbox containers (see the
+# Range .10-.25 on rs-inner is reserved for PI/extension containers (see the
 # load-bearing-IPs rule in .claude/CLAUDE.md). Baked roles claim .10-.13;
 # the BYO pool is .14-.25. Names here are the *short* role names (no ``pi-``
 # prefix) — they double as RS_PI_ROLE and the /opt/pi-templates/<name>/ dir.
@@ -67,7 +67,7 @@ BAKED_IMAGES: dict[str, str] = {
 # project's inner dockerd. Mapping: name -> (registry repo, versions.env pin key).
 # ``EXT_REGISTRY`` is the inner-pull locator and MUST match the inner daemon's
 # insecure-registries entry (agent/Dockerfile.substrate-base). The snapshot ref
-# (rs-registry:5000/<repo>:<pin>) is stamped into sandbox.json at enable
+# (rs-registry:5000/<repo>:<pin>) is stamped into extensions.json at enable
 # (image_ref) and read verbatim at spawn/recreate.
 EXT_REGISTRY = "rs-registry:5000"
 EXT_REGISTRY_REFS: dict[str, tuple[str, str]] = {
@@ -88,7 +88,7 @@ IP_PREFIX = "192.168.99."
 # pool as BYO and reuse the iso- container/tab conventions (see
 # container_name/workspace_subdir), so they need no new firewall rule — the
 # whole PI range is already ACCEPTed. Egress is NOT gated per box; it is
-# controlled project-wide at the router (a sandbox project defaults to
+# controlled project-wide at the router (a sandbox-dind project defaults to
 # `--egress locked` → 80/443/53/ICMP only, RFC1918 blocked — usable for an LLM
 # / pip while staying contained).
 #
@@ -129,7 +129,7 @@ def image_ref(name: str, pins: dict[str, str] | None = None) -> str:
                     dockerd.
 
     ``pins`` is the versions.env dict (``rscore.load_versions()``), required for
-    ext so the pin can be snapshotted into the sandbox.json entry at enable.
+    ext so the pin can be snapshotted into the extensions.json entry at enable.
     Raises ``ValueError`` if an ext role's pin is absent."""
     if name in EXT_REGISTRY_REFS:
         repo, key = EXT_REGISTRY_REFS[name]
@@ -167,7 +167,7 @@ def pi_role_label(name: str, kind: str) -> str:
 
 
 def mirror_of(name: str) -> str | None:
-    """For a baked sandbox, the worker role-MCP whose upstream MCP set it
+    """For a baked extension, the worker role-MCP whose upstream MCP set it
     mirrors (same short name) — or None. ``echo`` has no worker twin
     (the worker service key is ``echo-mcp``, not ``echo``), so it bypasses
     the mirror gate, exactly as pi-echo did."""
@@ -180,15 +180,15 @@ def mirror_of(name: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def sandbox_path(workspace: Path) -> Path:
+def extensions_path(workspace: Path) -> Path:
     """Sibling to role-mcps.json + mcp-allow.json. Read by the host (this
     module), ``_recreate_supervisor`` (restart loop), and the webui
     (per-project tab filter). The containers don't consult it."""
-    return workspace / ".orchestrator" / "sandbox.json"
+    return workspace / ".orchestrator" / "extensions.json"
 
 
 def load(workspace: Path) -> dict[str, dict]:
-    p = sandbox_path(workspace)
+    p = extensions_path(workspace)
     if not p.is_file():
         return {}
     try:
@@ -203,7 +203,7 @@ def save(workspace: Path, data: dict[str, dict]) -> None:
     so the rename is visible to in-supervisor consumers immediately
     (parent-dir mount, not file — the single-file-bind-mount rule doesn't
     apply)."""
-    p = sandbox_path(workspace)
+    p = extensions_path(workspace)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
@@ -235,13 +235,13 @@ def allocate_byo_ip(entries: dict[str, dict], name: str) -> str:
 def validate_baked(name: str) -> None:
     if not is_baked(name):
         raise ValueError(
-            f"unknown baked sandbox {name!r}. Known baked sandboxes: "
+            f"unknown baked extension {name!r}. Known baked extensions: "
             f"{', '.join(baked_names()) or '(none)'}"
         )
 
 
 def build_baked_entry(name: str, pins: dict[str, str] | None = None) -> dict[str, Any]:
-    """Build the sandbox.json entry for a baked-or-ext role. ``image`` is
+    """Build the extensions.json entry for a baked-or-ext role. ``image`` is
     SNAPSHOTTED here via image_ref — for ext roles that freezes the current
     versions.env pin into the entry, so spawn/recreate reuse it verbatim and a
     later pin bump only affects a fresh enable. ``pins`` (load_versions()) is
@@ -278,7 +278,7 @@ def build_byo_entry(name: str, type_entry: dict[str, Any], ip: str) -> dict[str,
 
 def catalog(pins: dict[str, str] | None = None) -> list[dict[str, Any]]:
     """All available sandbox *types*: baked + ext (constants) + BYO (host
-    registry). Drives `research sandbox list`. Tolerates a malformed BYO
+    registry). Drives `research extension list`. Tolerates a malformed BYO
     registry — baked types still list. ``pins`` (load_versions()) lets ext rows
     show the real registry ref; without it they fall back to an unpinned display
     ref so the listing never crashes on a missing pin."""
@@ -313,7 +313,7 @@ def catalog(pins: dict[str, str] | None = None) -> list[dict[str, Any]]:
 
 
 def known_type_names() -> set[str]:
-    """All names that resolve to a sandbox type (baked + BYO). Used by the
+    """All names that resolve to an extension type (baked + BYO). Used by the
     --enable token splitter and disjoint-name checks."""
     names = set(baked_names())
     try:
