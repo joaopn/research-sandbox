@@ -37,7 +37,14 @@ fi
 # run_claude below, which execs `claude --print` immediately.
 if [[ -d /opt/agent-dist && ! -e ~/.local/bin/claude ]]; then
     mkdir -p ~/.local
-    cp -a /opt/agent-dist/. ~/.local/
+    cp -a /opt/agent-dist/local/. ~/.local/
+fi
+# Bundled bypass settings (no hooks) — no-clobber; the supervisor-propagated
+# settings staged below from /workspace/.claude still overrides it
+# (STAGE_AGENT_DIST_SETTINGS; the dist is a fixed tree {local/, claude/}).
+if [[ -f /opt/agent-dist/claude/settings.json && ! -e ~/.claude/settings.json ]]; then
+    mkdir -p ~/.claude
+    cp /opt/agent-dist/claude/settings.json ~/.claude/settings.json
 fi
 
 # Stage creds + settings from the supervisor-written drop at /workspace/.claude/

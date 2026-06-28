@@ -42,7 +42,13 @@ if [[ -d /opt/agent-dist ]]; then
         [[ -d "$agent_src" ]] || continue          # no match => the glob stays literal
         agent_name="$(basename "$agent_src")"
         if [[ ! -e ~/.local/bin/"$agent_name" ]]; then
-            cp -a "$agent_src". ~/.local/
+            cp -a "$agent_src"local/. ~/.local/
+        fi
+        # Bundled bypass settings (no hooks) — no-clobber; first agent wins
+        # (STAGE_AGENT_DIST_SETTINGS). The dist is a fixed tree {local/, claude/}.
+        if [[ -f "$agent_src"claude/settings.json && ! -e ~/.claude/settings.json ]]; then
+            mkdir -p ~/.claude
+            cp "$agent_src"claude/settings.json ~/.claude/settings.json
         fi
     done
 fi

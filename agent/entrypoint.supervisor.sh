@@ -137,6 +137,19 @@ if [[ ! -e /workspace/CLAUDE.md ]]; then
     ln -s .claude/CLAUDE.md /workspace/CLAUDE.md
 fi
 
+# --- Claude Code settings (bypassPermissions + the rs-audit-stop Stop hook).
+#     setup.sh is a template from the image, copied+run once per fresh home.
+#     MUST run BEFORE dockerd starts: the host blocks on dockerd-ready before it
+#     stages the agent dist, whose no-clobber settings install would otherwise
+#     race this write and could drop the hook (STAGE_AGENT_DIST_SETTINGS S1-D2).
+#     Placement window: after the creds-stash restore (so a restored settings.json
+#     wins), before dockerd — do NOT hoist above the skel restore (it would
+#     pre-create ~/.bashrc and skip the home restore). ---
+if [[ -f /opt/claude-templates/setup.sh ]]; then
+    # shellcheck source=/dev/null
+    source /opt/claude-templates/setup.sh
+fi
+
 # --- Start dockerd (DIND) in the background ---
 if [[ "${DOCKER_DIND:-}" == "true" ]] && command -v dockerd >/dev/null 2>&1; then
     echo "Starting dockerd..."
@@ -183,13 +196,6 @@ if [[ -n "${SSH_PASSWORD:-}" ]]; then
     echo "research:${SSH_PASSWORD}" | sudo chpasswd
 fi
 sudo /usr/sbin/sshd
-
-# --- Claude Code settings (bypassPermissions). setup.sh is a template from
-#     the image, copied+run once per fresh home. ---
-if [[ -f /opt/claude-templates/setup.sh ]]; then
-    # shellcheck source=/dev/null
-    source /opt/claude-templates/setup.sh
-fi
 
 # --- code-server editor (dist) — STAGE_EDITOR_DIST. The minimal-lineage bake is
 #     gone (slice 2); the editor is a host-cached dist. For the SUPERVISOR this

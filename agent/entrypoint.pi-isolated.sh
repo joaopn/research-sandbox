@@ -53,7 +53,14 @@ fi
 # ~/.local/bin on PATH (self-healed below).
 if [[ -d /opt/agent-dist && ! -e ~/.local/bin/claude ]]; then
     mkdir -p ~/.local
-    cp -a /opt/agent-dist/. ~/.local/
+    cp -a /opt/agent-dist/local/. ~/.local/
+fi
+# Bundled bypass settings (no hooks) — no-clobber; rs-pi-isolated already bakes a
+# ~/.claude/settings.json, so this skips (STAGE_AGENT_DIST_SETTINGS; the dist is a
+# fixed tree {local/, claude/}).
+if [[ -f /opt/agent-dist/claude/settings.json && ! -e ~/.claude/settings.json ]]; then
+    mkdir -p ~/.claude
+    cp /opt/agent-dist/claude/settings.json ~/.claude/settings.json
 fi
 if ! grep -q '\.local/bin' ~/.bashrc 2>/dev/null; then
     echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc

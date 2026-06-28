@@ -2174,6 +2174,20 @@ _AGENT_BUILD_ATTEMPTS = 3
 # actual install error without dumping the whole (large) download log.
 _AGENT_ERR_TAIL = 2000
 
+# Canonical agent settings.json bundled into the dist (STAGE_AGENT_DIST_SETTINGS):
+# bypassPermissions + dark theme, deliberately NO `hooks` key. Deployed to
+# ~/.claude/settings.json NO-CLOBBER at every dist-deploy site, so any surface that
+# already has its own settings keeps it — chiefly the research supervisor, whose
+# setup.sh writes the SAME content PLUS the rs-audit-stop Stop hook (that hook must
+# never be clobbered; setup.sh is boot-ordered ahead of the staging to win the
+# race). Fresh surfaces (docker box, sandbox-dind) with no settings get bypass.
+# The no-hooks shape is load-bearing for inner surfaces — a `hooks` key there is a
+# `command not found` on every Stop event. Mirror of container/supervisor/setup.sh
+# MINUS hooks; keep the two in sync.
+_AGENT_SETTINGS_JSON = json.dumps(
+    {"permissions": {"defaultMode": "bypassPermissions"}, "theme": "dark"},
+    indent=2) + "\n"
+
 
 # ---------------------------------------------------------------------------
 # Editor dist — host-cached, version-pinned code-server copied into an
@@ -2229,7 +2243,8 @@ def dist_present(agent: str) -> bool:
     lexists, not exists: the launcher is a symlink to an absolute ~/.local/share
     path that is dangling on the host but resolves inside a box."""
     spec = _AGENT_INSTALL.get(agent)
-    return bool(spec) and os.path.lexists(agent_dist_path(agent) / "bin" / spec["bin"])
+    return bool(spec) and os.path.lexists(
+        agent_dist_path(agent) / "local" / "bin" / spec["bin"])
 
 
 def _relativize_launcher(launcher: Path) -> None:
@@ -2329,7 +2344,13 @@ def _agent_build_dist(agent: str, version: str) -> None:
         dest = agent_dist_path(agent)
         if dest.exists():
             shutil.rmtree(dest)
-        os.replace(captured, dest)            # tmp is under AGENT_DIST_DIR (same fs)
+        # Fixed tree (STAGE_AGENT_DIST_SETTINGS): local/ = the captured ~/.local,
+        # claude/settings.json = the bundled bypass settings (no hooks). Mirrors the
+        # editor dist's fixed-tree shape. captured is tmp/.local, same fs as dest.
+        dest.mkdir(parents=True)
+        os.replace(captured, dest / "local")
+        (dest / "claude").mkdir()
+        (dest / "claude" / "settings.json").write_text(_AGENT_SETTINGS_JSON)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     _agent_sidecar(agent).write_text(json.dumps(
@@ -2412,10 +2433,17 @@ def _stage_agent_dist(supervisor: str, agent: str = DEFAULT_AGENT,
         # (force) is load-bearing for the update-agent RE-deploy: the existing
         # ~/.local/bin/claude is a symlink, and plain `cp -a` can't overwrite it
         # ("File exists") — -f unlinks + recreates. chown is belt-and-suspenders.
+        # The ~/.local cp is forced (update-agent re-deploys the launcher symlink);
+        # the settings.json install is NO-CLOBBER so a baked/propagated settings —
+        # chiefly the research supervisor's hook-bearing one from setup.sh, which is
+        # boot-ordered to land first — is preserved (STAGE_AGENT_DIST_SETTINGS).
         run_check(["docker", "exec", "-u", "0", supervisor, "sh", "-c",
-                   f"mkdir -p /home/research/.local && "
-                   f"cp -af {AGENT_DIST_MOUNT}/. /home/research/.local/ && "
-                   f"chown -R 1000:1000 /home/research/.local"])
+                   f"mkdir -p /home/research/.local /home/research/.claude && "
+                   f"cp -af {AGENT_DIST_MOUNT}/local/. /home/research/.local/ && "
+                   f"( [ -e /home/research/.claude/settings.json ] || "
+                   f"cp {AGENT_DIST_MOUNT}/claude/settings.json "
+                   f"/home/research/.claude/settings.json ) && "
+                   f"chown -R 1000:1000 /home/research/.local /home/research/.claude"])
 
 
 def _agent_resolve_latest(agent: str) -> str:

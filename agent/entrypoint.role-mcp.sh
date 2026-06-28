@@ -38,7 +38,14 @@ fi
 # autoupdater bump. Per-call `claude -p` finds it via the PATH export below.
 if [[ -d /opt/agent-dist && ! -e ~/.local/bin/claude ]]; then
     mkdir -p ~/.local
-    cp -a /opt/agent-dist/. ~/.local/
+    cp -a /opt/agent-dist/local/. ~/.local/
+fi
+# Bundled bypass settings (no hooks) — no-clobber; the supervisor-propagated
+# settings staged below from /workspace/.creds still overrides it
+# (STAGE_AGENT_DIST_SETTINGS; the dist is a fixed tree {local/, claude/}).
+if [[ -f /opt/agent-dist/claude/settings.json && ! -e ~/.claude/settings.json ]]; then
+    mkdir -p ~/.claude
+    cp /opt/agent-dist/claude/settings.json ~/.claude/settings.json
 fi
 
 # --- Stage creds (per-call spawned claude -p needs OAuth) -----------------
