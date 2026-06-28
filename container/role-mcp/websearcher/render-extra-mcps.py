@@ -123,6 +123,17 @@ def main(argv: list[str]) -> int:
                    help="Destination for the Claude Code managed-settings JSON")
     args = p.parse_args(argv)
 
+    # Fail LOUD at build if --bin resolved empty. The Dockerfiles pass
+    # `$(command -v playwright-mcp)`, which yields "" (not an error) if the
+    # @playwright/mcp CLI is renamed upstream (it went mcp-server-playwright →
+    # playwright-mcp after 0.0.41). argparse `required` only checks presence, and an
+    # empty value would template into the MCP `args` (a valid string) → a silent
+    # empty command slot → `dumb-init -- "" …` → JSON-RPC -32000 at runtime. Catch
+    # it here, the single choke point both websearcher Dockerfiles call.
+    if not args.bin.strip():
+        p.error("--bin resolved empty; the @playwright/mcp binary name likely "
+                "changed (check `command -v playwright-mcp` in the Dockerfile)")
+
     yaml_text = args.yaml.read_text()
     extra, mcp_config, managed_settings = render(
         yaml_text, args.bin, str(args.out_config))

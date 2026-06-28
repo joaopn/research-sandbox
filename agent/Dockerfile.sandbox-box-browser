@@ -56,7 +56,7 @@ COPY container/role-mcp/websearcher/extra-mcps.yaml      /tmp/extra-mcps.yaml
 COPY container/role-mcp/websearcher/render-extra-mcps.py /tmp/render-extra-mcps.py
 RUN /opt/conda/bin/python3 /tmp/render-extra-mcps.py \
         --yaml                 /tmp/extra-mcps.yaml \
-        --bin                  "$(command -v mcp-server-playwright)" \
+        --bin                  "$(command -v playwright-mcp)" \
         --out-extra            /opt/sandbox-box/extra-mcps.json \
         --out-config           /opt/sandbox-box/playwright-mcp-config.json \
         --out-managed-settings /etc/claude-code/managed-settings.json && \

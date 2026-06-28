@@ -19,7 +19,12 @@
 #         a `permissions.deny` array derived from `denied_tools` below.
 #
 # Two placeholders are resolved in the rendered extra-mcps.json:
-#   __PLAYWRIGHT_MCP_BIN__  -> $(command -v mcp-server-playwright)
+#   __PLAYWRIGHT_MCP_BIN__  -> $(command -v playwright-mcp)
+#                              (the @playwright/mcp CLI; renamed from
+#                              mcp-server-playwright upstream after 0.0.41 —
+#                              render-extra-mcps.py FAILS the build if this
+#                              resolves empty, so a future rename is caught at
+#                              build, not as a runtime -32000)
 #   __CONFIG_PATH__         -> the --out-config path passed to the
 #                              renderer (matches where the config
 #                              JSON is actually written).

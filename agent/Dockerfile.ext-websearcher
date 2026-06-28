@@ -89,7 +89,7 @@ COPY container/role-mcp/websearcher/render-extra-mcps.py /tmp/render-extra-mcps.
 RUN mkdir -p /etc/claude-code /opt/pi-templates/websearcher && \
     /opt/conda/bin/python3 /tmp/render-extra-mcps.py \
         --yaml                 /tmp/extra-mcps.yaml \
-        --bin                  "$(command -v mcp-server-playwright)" \
+        --bin                  "$(command -v playwright-mcp)" \
         --out-extra            /opt/pi-templates/websearcher/extra-mcps.json \
         --out-config           /opt/pi-templates/websearcher/playwright-mcp-config.json \
         --out-managed-settings /etc/claude-code/managed-settings.json && \
