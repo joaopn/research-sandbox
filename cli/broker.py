@@ -355,7 +355,12 @@ def _verb_destroy(args: dict, progress=None) -> dict:
 # they are relayable. from_kwargs still validates them. The step-up `password`
 # for box_remove is NOT here: it is verified + consumed in dispatch, never
 # forwarded to rscore.
-BOX_ADD_WEBUI_FIELDS = frozenset({"project", "name", "browser", "agent"})
+# preset = box TYPE (catalog-gated in box_add); agent overrides the preset default;
+# editor bundles code-server; mcps are project MCP names (⊆ allow, gated in box_add);
+# repo/ref/setup seed a `byo` box and run INSIDE it (in-box, relayable per
+# WORKFLOW_TAXONOMY_S4). `browser` is GONE — folded into the websearcher preset.
+BOX_ADD_WEBUI_FIELDS = frozenset({"project", "name", "preset", "agent", "editor",
+                                  "mcps", "repo", "ref", "setup"})
 BOX_TARGET_WEBUI_FIELDS = frozenset({"project", "name"})
 # box_remove additionally accepts keep_workspace (a bool, not host-shaped): when
 # set the box is removed but its artifacts stay on disk. The step-up `password`

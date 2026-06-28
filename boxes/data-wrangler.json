@@ -1,0 +1,7 @@
+{
+  "name": "data-wrangler",
+  "image": "base",
+  "agent_default": true,
+  "clone": false,
+  "description": "A data-wrangling box: extraction-and-shaping instructions baked in. The agent is on by default; add the project's database/query MCP servers to give it something to wrangle."
+}

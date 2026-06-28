@@ -2,8 +2,8 @@ FROM rs-sandbox-box:latest
 
 # rs-sandbox-box-browser — a disposable sandbox box with a browser bundled in:
 # rs-sandbox-box + @playwright/mcp + Chromium, wired into the box's claude as a
-# stdio MCP. Opt-in (`rs-sandbox create --browser`) because Chromium is heavy —
-# plain boxes stay lean.
+# stdio MCP. Selected by the websearcher box preset (image="browser"); Chromium
+# is heavy, so base-image presets stay lean.
 #
 # This lifts ONLY the playwright tool bundle from the websearcher image (same
 # version pins, same render-extra-mcps.py source-of-truth, same managed-settings

@@ -38,6 +38,14 @@ WORKSPACE = Path(os.environ.get("RS_WORKSPACE", "/workspace"))
 ORCH = WORKSPACE / ".orchestrator"
 EXTENSIONS_JSON = ORCH / "extensions.json"
 PROJECT_JSON = ORCH / "project.json"
+# The host stages the resolved box-preset catalog here (cli/box_catalog.load_catalog,
+# STAGE_BOX_EXT_UX) so this in-supervisor CLI resolves presets offline; refreshed at
+# every box_add (Q1→live: operator-registered types usable on existing projects).
+BOX_CATALOG_JSON = ORCH / "box-catalog.json"
+# The per-project MCP allowlist (rscore.project_allowlist_path) — the supervisor's
+# own .orchestrator/, readable here (rs-sandbox runs in the supervisor). Source for
+# a box's proxy MCP wiring.
+MCP_ALLOW_JSON = ORCH / "mcp-allow.json"
 
 INNER_NETWORK = "rs-inner"
 # Management supervisor stages the dist here at create; RO copy-source the box's
@@ -66,19 +74,23 @@ _AUTO_RE = re.compile(r"^box-(\d+)$")
 CHEATSHEET = """\
 rs-sandbox — isolated boxes for running un-vetted code
 
-  rs-sandbox create [name] [--agent claude] [--browser]
-                              spin a blank box (auto-named box-N); --agent claude
-                              deploys claude inside; --browser adds playwright+Chromium
-  rs-sandbox list [--json]    show boxes (+ any baked extensiones) and their state
+  rs-sandbox create [name] [--preset TYPE] [--agent claude|none] [--editor]
+                           [--mcps a,b] [--repo URL --ref REF --setup CMD]
+                              spin a box (auto-named box-N). --preset picks the box
+                              type (empty, websearcher, data-wrangler, byo, or an
+                              operator-registered type); the agent defaults per
+                              preset; --mcps wires project MCPs (forces the agent on);
+                              --repo/--ref/--setup seed a byo box from a repo.
+  rs-sandbox list [--json]    show boxes (+ any baked extensions) and their state
   rs-sandbox stop <name>      stop a box (keeps its workspace; start to resume)
   rs-sandbox start <name>     (re)start a stopped box from its saved entry
   rs-sandbox discard <name>   stop the box AND wipe its workspace
 
-Boxes are blank by default (no agent). `--agent claude` deploys the claude
-binary (still NO credentials — run `claude` then /login inside). Outbound
-network is the project's router policy (sandbox projects default to 'locked':
-80/443/53 + ping only). This Management shell has authority over every box, so
-it deliberately runs no agent — never paste box artifacts into an LLM here.
+Boxes are auth-free: an agent box still has NO credentials — run `claude` then
+/login inside. Outbound network is the project's router policy (sandbox projects
+default to 'locked': 80/443/53 + ping only). This Management shell has authority
+over every box, so it deliberately runs no agent — never paste box artifacts into
+an LLM here.
 """
 
 
@@ -156,17 +168,109 @@ def auto_name(entries: dict[str, dict]) -> str:
     return f"box-{i}"
 
 
+# --- preset catalog + MCP wiring (STAGE_BOX_EXT_UX) -------------------------
+
+# A box that can always be made blank even if the host never staged a catalog.
+_EMPTY_PRESET = {"name": "empty", "image": "base", "agent_default": False,
+                 "clone": False, "instructions": ""}
+
+
+def load_box_catalog() -> dict[str, dict]:
+    """Resolved box-preset catalog the host stages into .orchestrator/
+    (cli/box_catalog.load_catalog → a list). Keyed by name; {} if absent."""
+    try:
+        data = json.loads(BOX_CATALOG_JSON.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if isinstance(data, list):
+        return {e["name"]: e for e in data
+                if isinstance(e, dict) and isinstance(e.get("name"), str)}
+    return {}
+
+
+def resolve_preset(name: str) -> dict:
+    """Resolve a preset name against the staged catalog. 'empty' always resolves
+    (blank-box floor) even with no staged catalog; anything else must be staged."""
+    catalog = load_box_catalog()
+    if name in catalog:
+        return catalog[name]
+    if name == "empty":
+        return _EMPTY_PRESET
+    die(f"unknown box preset {name!r} (available: {sorted(catalog) or ['empty']})")
+
+
+def _parse_csv(s: str | None) -> list[str]:
+    return [t.strip() for t in (s or "").split(",") if t.strip()]
+
+
+def _build_proxy_mcps(mcps: list[str], *, strict: bool) -> dict:
+    """{name: server-cfg} proxy entries for the selected MCPs, resolved against
+    the supervisor's mcp-allow.json — source-1 for the box's .mcp.json (mirror of
+    entrypoint.pi.sh's proxy block). ``strict`` (create): die on an MCP not in the
+    allowlist; non-strict (restart re-render): skip it with a warning, so a since-
+    de-allowed MCP can't break a recreate."""
+    allow: dict[str, dict] = {}
+    try:
+        rows = json.loads(MCP_ALLOW_JSON.read_text())
+        if isinstance(rows, list):
+            for e in rows:
+                if isinstance(e, dict) and isinstance(e.get("name"), str):
+                    allow[e["name"]] = e
+    except (OSError, json.JSONDecodeError):
+        pass
+    servers: dict[str, dict] = {}
+    for name in mcps:
+        e = allow.get(name)
+        if not e:
+            if strict:
+                die(f"MCP {name!r} is not allowed for this project; allow it "
+                    f"first (`research project mcp allow ...`) or omit it")
+            print(f"rs-sandbox: warning: MCP {name!r} no longer allowed; "
+                  f"dropping it from the box", file=sys.stderr)
+            continue
+        path = e.get("path") or "/mcp"
+        server: dict = {"type": "http", "url": f"http://mcp-proxy:8888/{name}{path}"}
+        headers = e.get("headers")
+        if isinstance(headers, dict) and headers:
+            server["headers"] = headers
+        servers[name] = server
+    return servers
+
+
+def _stage_box_workspace(name: str, preset: dict, mcps: list[str],
+                         *, strict: bool) -> None:
+    """Write the box's CLAUDE.md (instructions) + .mcp-proxy.json (the stable
+    proxy source-1) into the box's workspace dir BEFORE the container starts —
+    the entrypoint reads them at boot. CLAUDE.md is first-boot no-clobber (a PI
+    edit survives a restart); .mcp-proxy.json is overwritten every create/restart
+    so an allowlist change re-renders. The entrypoint regenerates /workspace/.mcp.json
+    wholesale from .mcp-proxy.json + the image-baked stdio MCPs (idempotent across
+    reboots — a fresh proxy-only source each boot)."""
+    ws = WORKSPACE / f"pi-isolated/{name}"
+    ws.mkdir(parents=True, exist_ok=True)
+    instr = (preset.get("instructions") or "").strip()
+    claude_md = ws / "CLAUDE.md"
+    if instr and not claude_md.exists():
+        claude_md.write_text(instr + "\n")
+    servers = _build_proxy_mcps(mcps, strict=strict)
+    (ws / ".mcp-proxy.json").write_text(
+        json.dumps({"mcpServers": servers}, indent=2, sort_keys=True) + "\n")
+
+
 # --- run / teardown ---------------------------------------------------------
 
 
-def _run_box(name: str, ip: str, browser: bool = False, agent: str = "none") -> None:
-    """docker run a blank box in the local inner dockerd. No mounts beyond the
-    box's own workspace, no creds, no repo. ``browser`` selects the
-    Chromium-equipped image (the box's claude gets a playwright MCP). ``agent``
-    (claude|none) is forwarded as RS_BOX_AGENT — the box's entrypoint deploys the
-    claude binary only for "claude" (still auth-free; no creds either way). The
-    workspace dir is pre-created uid-1000-owned so dockerd's auto-create on -v
-    doesn't land it root-owned."""
+def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
+             editor: bool = False, clone_repo: str = "", clone_ref: str = "",
+             clone_setup: str = "") -> None:
+    """docker run a box in the local inner dockerd. ``browser`` selects the
+    Chromium-equipped image; ``agent`` (claude|none) → RS_BOX_AGENT (entrypoint
+    deploys claude only for "claude", still auth-free); ``editor`` → the box's OWN
+    RS_SERVICE_CODE_SERVER (box-level toggle, default off — decoupled from the
+    project's editor); ``clone_*`` (BYO) → RS_BOX_CLONE_* the entrypoint clones +
+    runs (as box-shell env argv, never a host shell). The workspace dir is
+    pre-staged + uid-1000-owned (see _stage_box_workspace) so dockerd's auto-create
+    on -v doesn't land it root-owned."""
     sub = f"pi-isolated/{name}"
     (WORKSPACE / sub).mkdir(parents=True, exist_ok=True)
     cname = box_container(name)
@@ -175,16 +279,16 @@ def _run_box(name: str, ip: str, browser: bool = False, agent: str = "none") -> 
     # Guard the mount so a missing source can't turn a box run into a cryptic mount
     # error; the box's entrypoint absence-guard surfaces it as "claude not found".
     agent_mount = (["-v", f"{AGENT_DIST_MOUNT}:{AGENT_DIST_MOUNT}:ro"]
-                   if os.path.isdir(AGENT_DIST_MOUNT) else [])
-    # Editor dist mount + the project's code-server flag (STAGE_EDITOR_DIST). The
-    # management supervisor carries RS_SERVICE_CODE_SERVER from the project's flag
-    # (set at create); inherit it so the box deploys the editor iff the project has
-    # it on. The supervisor ALWAYS sets the env (it's a KNOWN_SERVICE), so the
-    # fallback is unreachable; "enabled" matches rscore._read_service_flags' missing
-    # -> enabled default (the research/sandbox editor-on default) — kept in agreement.
+                   if (agent == "claude" and os.path.isdir(AGENT_DIST_MOUNT)) else [])
+    # Editor dist mount, gated on the box's OWN editor toggle (STAGE_EDITOR_DIST +
+    # STAGE_BOX_EXT_UX). Only mount when this box opted in AND the dist is staged.
     editor_mount = (["-v", f"{EDITOR_DIST_MOUNT}:{EDITOR_DIST_MOUNT}:ro"]
-                    if os.path.isdir(EDITOR_DIST_MOUNT) else [])
-    editor_flag = os.environ.get("RS_SERVICE_CODE_SERVER", "enabled")
+                    if (editor and os.path.isdir(EDITOR_DIST_MOUNT)) else [])
+    clone_env: list[str] = []
+    if clone_repo:
+        clone_env = ["-e", f"RS_BOX_CLONE_REPO={clone_repo}",
+                     "-e", f"RS_BOX_CLONE_REF={clone_ref}",
+                     "-e", f"RS_BOX_CLONE_SETUP={clone_setup}"]
     r = _docker(
         "run", "-d",
         "--name", cname,
@@ -194,9 +298,10 @@ def _run_box(name: str, ip: str, browser: bool = False, agent: str = "none") -> 
         "-v", f"{WORKSPACE}/{sub}:/workspace",
         *agent_mount,
         *editor_mount,
-        "-e", f"RS_SERVICE_CODE_SERVER={editor_flag}",
+        "-e", f"RS_SERVICE_CODE_SERVER={'enabled' if editor else 'disabled'}",
         "-e", f"RS_SANDBOX_NAME={name}",
         "-e", f"RS_BOX_AGENT={agent}",
+        *clone_env,
         "--label", "research.sandbox=1",
         "--label", f"research.box={name}",
         image,
@@ -204,6 +309,22 @@ def _run_box(name: str, ip: str, browser: bool = False, agent: str = "none") -> 
     if r.returncode != 0:
         die(f"docker run failed for box {name!r}:\n"
             f"{(r.stderr or r.stdout).strip()}")
+
+
+def _rerun_box(name: str, entry: dict) -> None:
+    """Re-run a box from its saved entry (restart/start after a recreate). Re-
+    renders the proxy MCP source (allowlist may have changed) non-strictly, then
+    re-runs from the stored axes. CLAUDE.md persists on the volume (no-clobber)."""
+    mcps = [m for m in (entry.get("upstream_mcps") or []) if isinstance(m, str)]
+    ws = WORKSPACE / f"pi-isolated/{name}"
+    ws.mkdir(parents=True, exist_ok=True)
+    servers = _build_proxy_mcps(mcps, strict=False)
+    (ws / ".mcp-proxy.json").write_text(
+        json.dumps({"mcpServers": servers}, indent=2, sort_keys=True) + "\n")
+    _run_box(name, entry["ip"], browser=bool(entry.get("browser")),
+             agent=entry.get("agent", "none"), editor=bool(entry.get("editor")),
+             clone_repo=entry.get("repo") or "", clone_ref=entry.get("ref") or "",
+             clone_setup=entry.get("setup") or "")
 
 
 def _box_entry(entries: dict[str, dict], name: str) -> dict:
@@ -226,14 +347,37 @@ def cmd_create(args: argparse.Namespace) -> None:
         die(f"invalid box name {name!r} (must match {_NAME_RE.pattern})")
     elif name in entries:
         die(f"sandbox {name!r} already exists; discard it or pick another name")
+    preset = resolve_preset(args.preset)
+    is_clone = bool(preset.get("clone"))
+    repo, ref, setup = (args.repo or "").strip(), (args.ref or "").strip(), \
+        (args.setup or "").strip()
+    if (repo or setup) and not is_clone:
+        die(f"--repo/--setup are only valid for a clone (BYO) preset; "
+            f"preset {args.preset!r} does not clone")
+    # Agent: explicit override, else the preset default; selecting any MCP forces
+    # the agent on (nothing else can reach an MCP — STAGE_BOX_EXT_UX D-B).
+    mcps = _parse_csv(args.mcps)
+    agent = args.agent or ("claude" if preset.get("agent_default") else "none")
+    if mcps:
+        agent = "claude"
+    browser = preset.get("image") == "browser"
+    editor = bool(args.editor)
     ip = allocate_ip(entries)
-    entries[name] = {"kind": KIND, "ip": ip, "container": box_container(name),
-                     "browser": bool(args.browser), "agent": args.agent}
+    # Stage CLAUDE.md + .mcp-proxy.json BEFORE the run (M2: the entrypoint reads
+    # them at boot). strict=True → die on an MCP not in the project allowlist.
+    _stage_box_workspace(name, preset, mcps, strict=True)
+    entry = {"kind": KIND, "ip": ip, "container": box_container(name),
+             "preset": args.preset, "browser": browser, "agent": agent,
+             "editor": editor, "upstream_mcps": mcps}
+    if is_clone:
+        entry.update({"repo": repo, "ref": ref, "setup": setup})
+    entries[name] = entry
     save(entries)
-    _run_box(name, ip, browser=bool(args.browser), agent=args.agent)
-    print(json.dumps({"name": name, "ip": ip, "browser": bool(args.browser),
-                      "agent": args.agent, "container": box_container(name)},
-                     indent=2))
+    _run_box(name, ip, browser=browser, agent=agent, editor=editor,
+             clone_repo=repo if is_clone else "", clone_ref=ref, clone_setup=setup)
+    print(json.dumps({"name": name, "ip": ip, "preset": args.preset,
+                      "browser": browser, "agent": agent, "editor": editor,
+                      "container": box_container(name)}, indent=2))
 
 
 def cmd_restart(args: argparse.Namespace) -> None:
@@ -244,8 +388,7 @@ def cmd_restart(args: argparse.Namespace) -> None:
     recreate-loop caller's clarity."""
     _require_dind_project()
     entry = _box_entry(load(), args.name)
-    _run_box(args.name, entry["ip"], browser=bool(entry.get("browser")),
-             agent=entry.get("agent", "none"))
+    _rerun_box(args.name, entry)
     print(f"box {args.name!r}: restarted at {entry['ip']}")
 
 
@@ -272,8 +415,7 @@ def cmd_start(args: argparse.Namespace) -> None:
             die(f"failed to start box {args.name!r}: "
                 f"{(r.stderr or r.stdout).strip()}")
     else:
-        _run_box(args.name, entry["ip"], browser=bool(entry.get("browser")),
-                 agent=entry.get("agent", "none"))
+        _rerun_box(args.name, entry)
     print(f"box {args.name!r}: started at {entry['ip']}")
 
 
@@ -320,7 +462,7 @@ def cmd_list(args: argparse.Namespace) -> None:
         return
     if not rows:
         print("no sandboxes. create a box: "
-              "rs-sandbox create [name] [--agent claude] [--browser]")
+              "rs-sandbox create [name] [--preset TYPE] [--agent claude]")
         return
     print(f"{'NAME':<16} {'KIND':<9} {'IP':<16} {'BROWSER':<8} {'AGENT':<8} STATE")
     for row in rows:
@@ -335,16 +477,26 @@ def build_parser() -> argparse.ArgumentParser:
         description="Sandbox-project box lifecycle (runs inside the supervisor).")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    c = sub.add_parser("create", help="spin a blank isolated box")
+    c = sub.add_parser("create", help="spin an isolated box")
     c.add_argument("name", nargs="?", default=None,
                    help="box name (default: auto-named box-N)")
-    c.add_argument("--browser", action="store_true",
-                   help="bundle a browser: @playwright/mcp + Chromium wired "
-                        "into the box's claude (heavier image)")
-    c.add_argument("--agent", choices=["claude", "none"], default="none",
-                   help="deploy an agent in the box (default none = blank); "
-                        "'claude' cp's the claude binary in (still auth-free — "
-                        "run `claude` + /login inside)")
+    c.add_argument("--preset", default="empty",
+                   help="box type: empty, websearcher, data-wrangler, byo, or an "
+                        "operator-registered type (default empty)")
+    c.add_argument("--agent", choices=["claude", "none"], default=None,
+                   help="override the preset's agent default; 'claude' cp's the "
+                        "binary in (still auth-free — run `claude` + /login inside)")
+    c.add_argument("--editor", action="store_true",
+                   help="bundle the code-server editor into this box")
+    c.add_argument("--mcps", default="",
+                   help="comma-separated project MCP names to wire into the box "
+                        "(forces the agent on)")
+    c.add_argument("--repo", default="",
+                   help="(byo preset) git repo URL to clone into the box at boot")
+    c.add_argument("--ref", default="",
+                   help="(byo preset) git ref to check out")
+    c.add_argument("--setup", default="",
+                   help="(byo preset) setup command to run in the clone")
     c.set_defaults(func=cmd_create)
 
     lst = sub.add_parser("list", help="list sandboxes (boxes + baked)")

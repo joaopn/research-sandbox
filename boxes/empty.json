@@ -1,0 +1,7 @@
+{
+  "name": "empty",
+  "image": "base",
+  "agent_default": false,
+  "clone": false,
+  "description": "A clean isolated box — no baked instructions, no bundled capability. The blank slate: add an agent, the editor, or MCP servers as you like."
+}

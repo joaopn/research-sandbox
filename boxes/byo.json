@@ -1,0 +1,7 @@
+{
+  "name": "byo",
+  "image": "base",
+  "agent_default": true,
+  "clone": true,
+  "description": "Bring-your-own box: clone a repo (ref-pinned) and run an optional setup command at boot, then drop an agent into it. Supply repo/ref/setup when you add the box."
+}

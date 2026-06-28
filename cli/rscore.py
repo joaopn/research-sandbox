@@ -61,6 +61,7 @@ from typing import Any, Sequence
 # rscore lives in cli/; make sibling helper modules importable even when
 # imported directly (e.g. by the broker), not only via research.py.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import box_catalog  # noqa: E402  (box-preset catalog; staged into the supervisor)
 import defaults  # noqa: E402
 import mcp_registry  # noqa: E402
 import pi_isolated_registry  # noqa: E402
@@ -634,13 +635,23 @@ class AttachInfo:
 
 @dataclass(frozen=True)
 class BoxAddRequest:
-    """Add a sandbox box to a RUNNING sandbox-dind project (webui-driven). All
-    fields act INSIDE the locked-egress, credential-free inner box — none is
-    host-shaped — so they are broker-relayable (cf. the host-root boundary)."""
+    """Add a sandbox box to a RUNNING dind project (webui-driven). All fields act
+    INSIDE the locked-egress, credential-free inner box — none is host-shaped — so
+    they are broker-relayable (cf. the host-root boundary): ``preset`` is the box
+    TYPE (catalog-gated in box_add); ``agent`` overrides the preset's default
+    (None ⇒ rs-sandbox applies it); ``editor`` bundles code-server into the box;
+    ``mcps`` are project MCP names wired into the box (⊆ allow, gated in box_add;
+    a non-empty set forces the agent on); ``repo``/``ref``/``setup`` seed a `byo`
+    box and run INSIDE it (relayable in-box fields per WORKFLOW_TAXONOMY_S4)."""
     project: str
     name: str | None = None                 # None ⇒ rs-sandbox auto-names box-N
-    browser: bool = False
-    agent: str = "none"                     # claude | none
+    preset: str = "empty"
+    agent: str | None = None                # claude | none | None (preset default)
+    editor: bool = False
+    mcps: tuple[str, ...] = ()
+    repo: str = ""
+    ref: str = ""
+    setup: str = ""
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "BoxAddRequest":
@@ -649,12 +660,40 @@ class BoxAddRequest:
             raise ValidationError(
                 "box name must be lowercase, start with a letter, and contain "
                 "only letters, digits, or '-'")
-        agent = kw.get("agent", "none") or "none"
-        if agent not in _BOX_AGENTS:
+        preset = kw.get("preset") or "empty"
+        # Preset names share the box-name charset; ∈-catalog is gated in box_add
+        # (which has the staged catalog). Here only the shape.
+        if not (isinstance(preset, str) and _BOX_NAME_RE.match(preset)):
+            raise ValidationError(
+                "box preset must be lowercase, start with a letter, and contain "
+                "only letters, digits, or '-'")
+        agent = kw.get("agent")
+        if agent is not None and agent not in _BOX_AGENTS:
             raise ValidationError(
                 f"invalid agent {agent!r} (expected one of {sorted(_BOX_AGENTS)})")
-        return cls(project=_require_name(kw.get("project")), name=name,
-                   browser=bool(kw.get("browser", False)), agent=agent)
+        raw_mcps = kw.get("mcps") or ()
+        if isinstance(raw_mcps, str):
+            raw_mcps = [t.strip() for t in raw_mcps.split(",") if t.strip()]
+        if not isinstance(raw_mcps, (list, tuple)):
+            raise ValidationError("mcps must be a list of MCP names")
+        mcps: list[str] = []
+        for m in raw_mcps:
+            if not (isinstance(m, str) and m.strip()):
+                raise ValidationError("each MCP name must be a non-empty string")
+            mcps.append(m.strip())
+        # Selecting any MCP forces the agent on — nothing else can reach an MCP
+        # (STAGE_BOX_EXT_UX D-B). Overrides an explicit agent="none".
+        if mcps:
+            agent = "claude"
+        for fld in ("repo", "ref", "setup"):
+            v = kw.get(fld)
+            if v is not None and not isinstance(v, str):
+                raise ValidationError(f"{fld} must be a string")
+        return cls(
+            project=_require_name(kw.get("project")), name=name, preset=preset,
+            agent=agent, editor=bool(kw.get("editor", False)),
+            mcps=tuple(mcps), repo=(kw.get("repo") or "").strip(),
+            ref=(kw.get("ref") or "").strip(), setup=(kw.get("setup") or ""))
 
 
 @dataclass(frozen=True)
@@ -692,8 +731,10 @@ class BoxAddResult:
     project: str
     name: str
     ip: str
+    preset: str
     browser: bool
     agent: str
+    editor: bool
     container: str
 
 
@@ -994,7 +1035,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         if project_type == PROJECT_TYPE_SANDBOX_DIND:
             for w in enable_workers:
                 print(f"note: --enable {w!r}: sandbox projects have no worker layer; "
-                      f"ignoring (for a browser box use `rs-sandbox create --browser`)",
+                      f"ignoring (for a browser box use the websearcher box preset)",
                       file=sys.stderr)
             enable_workers = []
             enable_extensions = [s for s in enable_extensions if s not in _dis_s]
@@ -1114,6 +1155,10 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             _stage_rs_sandbox(container_name)
             _deliver_box_images(container_name, network,
                                 _box_image_pins(load_versions()), push=True)
+            # Stage the resolved box-preset catalog so the in-supervisor rs-sandbox
+            # can resolve presets for a directly-invoked `rs-sandbox create`
+            # (box_add refreshes it live; STAGE_BOX_EXT_UX). Best-effort.
+            _stage_box_catalog(workspace_path, strict=False)
             # Light-path harness: clone repo@ref + run setup on the supervisor
             # (after inject_route; raises HarnessError on failure, box left standing).
             clone_dir = _run_light_harness(
@@ -1512,8 +1557,8 @@ EXT_BASE_IMAGE = "rs-ext-base:latest"
 SANDBOX_BOX_IMAGE = "rs-sandbox-box:latest"
 # Browser variant — FROM rs-sandbox-box + @playwright/mcp + Chromium, wired
 # into the box's claude as a stdio MCP (the playwright bundle lifted from the
-# websearcher image, WITHOUT its role.md harness). Opt-in per box via
-# `rs-sandbox create --browser`. Registry-delivered like the plain box.
+# websearcher image, WITHOUT its role.md harness). Selected by the websearcher
+# box preset (image="browser"). Registry-delivered like the plain box.
 SANDBOX_BOX_BROWSER_IMAGE = "rs-sandbox-box-browser:latest"
 INNER_NETWORK = "rs-inner"
 WEBUI_IMAGE = "rs-webui:latest"
@@ -3295,6 +3340,9 @@ def _recreate_supervisor(
             _box_pins = _box_image_pins(load_versions())
             _deliver_box_images(container, network, _box_pins, push=True)
             _write_box_pins(workspace_path, _box_pins)
+        # Re-stage the box-preset catalog (best-effort) so a directly-invoked
+        # rs-sandbox resolves presets after a recreate (STAGE_BOX_EXT_UX).
+        _stage_box_catalog(workspace_path, strict=False)
     else:
         stage_worker_image(container, ANALYSIS_IMAGE, force=force_restage)
         # Re-stage the agent dist into the fresh container (its own ~/.local + the
@@ -3798,6 +3846,34 @@ def _write_box_pins(workspace_path: "Path", box_pins: dict[str, str]) -> None:
         data = {}
     data["box_image_pins"] = box_pins
     f.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def _stage_box_catalog(workspace_path: "Path", *, strict: bool) -> list[dict]:
+    """Stage the resolved box-preset catalog into .orchestrator/box-catalog.json
+    (STAGE_BOX_EXT_UX) so the in-supervisor rs-sandbox resolves presets offline,
+    and RETURN it so a caller can gate against the same bytes without a second
+    load (closing the unguarded-second-load-site gap). Host-side write into the
+    bind-mounted workspace dir (atomic-rename → visible to the supervisor
+    immediately; a parent-dir mount, not a single-file mount). Q1→live: box_add
+    refreshes it (strict=True → BoxCatalogError surfaces, the caller maps it to
+    ValidationError); create/recreate stage it best-effort (strict=False → a
+    malformed box-registry.json falls back to built-ins + warns, never blocks the
+    lifecycle verb)."""
+    try:
+        catalog = box_catalog.load_catalog()
+    except box_catalog.BoxCatalogError:
+        if strict:
+            raise
+        print("warning: box-registry.json is malformed; staging built-in box "
+              "presets only until it is fixed", file=sys.stderr)
+        catalog = [{**m, "source": "builtin"}
+                   for m in box_catalog.load_builtins().values()]
+    p = workspace_path / ".orchestrator" / "box-catalog.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(catalog, indent=2, sort_keys=True) + "\n")
+    tmp.replace(p)
+    return catalog
 
 
 def _spawn_shared_mcp(name: str, entry: dict) -> None:
@@ -5156,19 +5232,54 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     progress.step("validate", "checking the project")
     cfg = load_config()
     container = _running_dind_supervisor(req.project)
+    workspace_path = workspace_path_for(req.project, cfg)
+    # Refresh the staged box-preset catalog (Q1→live: an operator-registered type in
+    # box-registry.json becomes usable on this already-created project). strict=True
+    # → a malformed registry surfaces as ValidationError, not a half-built box.
+    try:
+        staged = _stage_box_catalog(workspace_path, strict=True)
+    except box_catalog.BoxCatalogError as e:
+        raise ValidationError(str(e))
+    # Semantic gating against the JUST-STAGED catalog (reuse the returned bytes —
+    # no second load_catalog(), so no unguarded BoxCatalogError escape past
+    # dispatch) + the project allowlist. The in-box rs-sandbox re-gates too; this
+    # yields a clean pre-exec ValidationError.
+    catalog = {e["name"]: e for e in staged}
+    if req.preset != "empty" and req.preset not in catalog:
+        raise ValidationError(
+            f"unknown box preset {req.preset!r} "
+            f"(available: {sorted({'empty', *catalog})})")
+    allowed = {e["name"] for e in load_project_allowlist(req.project, cfg)
+               if e.get("name")}
+    bad = [m for m in req.mcps if m not in allowed]
+    if bad:
+        raise ValidationError(
+            f"MCP(s) {bad} are not allowed for project {req.project!r}; allow them "
+            f"first (`research project mcp allow ...`) or omit them")
     # Lazily stand up the box harness. On research this stages rs-sandbox + delivers
     # the needed box image on first use (research create/recreate never touch boxes
-    # — the frozen lane); on sandbox-dind (eager-staged) it no-ops. Deliver only the
-    # base or browser image the request needs.
+    # — the frozen lane); on sandbox-dind (eager-staged) it no-ops. The image a box
+    # needs is the browser image iff its preset selects it.
+    want_browser = catalog.get(req.preset, {}).get("image") == "browser"
     progress.step("harness", "ensuring the box harness")
     _ensure_box_harness(container, project_network_for(req.project),
-                        workspace_path_for(req.project, cfg), bool(req.browser))
+                        workspace_path, want_browser)
     argv = ["docker", "exec", container, "rs-sandbox", "create"]
     if req.name:
         argv.append(req.name)
-    argv += ["--agent", req.agent]
-    if req.browser:
-        argv.append("--browser")
+    argv += ["--preset", req.preset]
+    if req.agent is not None:
+        argv += ["--agent", req.agent]
+    if req.editor:
+        argv.append("--editor")
+    if req.mcps:
+        argv += ["--mcps", ",".join(req.mcps)]
+    if req.repo:
+        argv += ["--repo", req.repo]
+    if req.ref:
+        argv += ["--ref", req.ref]
+    if req.setup:
+        argv += ["--setup", req.setup]
     progress.step("create-box", "creating the box")
     r = run(argv, capture_output=True)
     if r.returncode != 0:
@@ -5184,8 +5295,11 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         die(f"unexpected rs-sandbox output shape: {r.stdout.strip()!r}")
     progress.step("ready", "box ready")
     return BoxAddResult(project=req.project, name=info["name"], ip=info["ip"],
+                        preset=info.get("preset", req.preset),
                         browser=bool(info.get("browser")),
-                        agent=info.get("agent", "none"), container=info["container"])
+                        agent=info.get("agent", "none"),
+                        editor=bool(info.get("editor", req.editor)),
+                        container=info["container"])
 
 
 def box_remove(req: "BoxRemoveRequest", progress=None) -> BoxRemoveResult:  # type: ignore[name-defined]
