@@ -417,18 +417,24 @@ body {
     color: var(--fg-faint);
     font-size: 12px;
 }
-/* Active-project label sits between the Projects toggle and the service
-   tabs. Static text — not clickable, no hover. Same 13px as rail rows,
-   bold so it reads as a heading for the strip rather than a tab. */
+/* Active-project label sits between the Projects toggle and the service tabs.
+   Static text — not clickable, no hover. A bordered chip (full border + rounded)
+   so it reads as the strip's anchor, visually distinct from the tabs; a
+   tab-group-divider follows it (rendered by renderServiceTabs). */
 .service-tabs .active-project {
-    padding: 0 14px;
+    align-self: center;
+    height: 22px;
+    padding: 0 12px;
+    margin-left: 8px;
     display: flex;
     align-items: center;
     font-size: 13px;
     font-weight: 700;
     color: var(--fg-base);
     white-space: nowrap;
-    border-right: 1px solid var(--border);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-active);
 }
 /* Thin vertical rule between the Visual (editors / iframe surfaces) and CLI
    (terminals) tab groups. Rendered by renderServiceTabs only when both
@@ -760,6 +766,9 @@ body {
     border-color: var(--fg-accent);
     background: var(--bg-active);
 }
+/* Import-an-existing-project card — dashed border marks it as an "add" affordance,
+   distinct from the solid workflow cards. */
+.workflows-card.import-card { border-style: dashed; }
 .workflows-card-name {
     font-size: 14px;
     font-weight: 600;
@@ -813,6 +822,35 @@ body {
 .explain-entry .nav-doc-close:hover { color: var(--fg-base); background: var(--border-strong); }
 
 /* Rendered Explain learning doc (markdown -> HTML + inline interactive SVG). */
+/* Explain floating popover — centered box dismissed on outside click / Escape. */
+.explain-popover {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: min(860px, 92vw);
+    max-height: 86vh;
+    overflow: auto;
+    padding: 18px 22px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
+    z-index: 1000;
+}
+.explain-popover-close {
+    position: sticky;
+    top: 0;
+    float: right;
+    margin: -4px -8px 0 8px;
+    background: transparent;
+    border: none;
+    color: var(--fg-faint);
+    cursor: pointer;
+    font-size: 20px;
+    line-height: 1;
+}
+.explain-popover-close:hover { color: var(--fg-base); }
 .explain-doc { max-width: 820px; line-height: 1.55; color: var(--fg-base); }
 .explain-doc h1 { margin: 0 0 12px; }
 .explain-doc h2 { margin: 22px 0 8px; border-bottom: 1px solid var(--border); padding-bottom: 4px; }

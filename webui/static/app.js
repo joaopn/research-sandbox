@@ -199,8 +199,7 @@ const state = {
     salt: null,              // Uint8Array | null
     vault: null,             // { version, projects, settings } | null
     activeProject: null,     // string | null
-    hostPage: null,          // "workflows" | "management" | "settings" | "explain:<name>" | null
-    openDocs: [],            // [<workflow name>] — open Explain doc tabs (closable rail entries)
+    hostPage: null,          // "workflows" | "management" | "settings" | null
     explainIndex: null,      // string[] of workflows with a rendered Explain doc (/static/explain/index.json); null = unfetched
     activeService: null,     // string | null
     serviceRegistry: null,   // { [serviceId]: spec } from /services
@@ -702,10 +701,8 @@ function makeProjectRail() {
     for (const p of state.vault.projects) {
         rail.appendChild(makeProjectRow(p));
     }
-    rail.appendChild(el("button", {
-        class: "add-project",
-        onclick: openAddProjectModal,
-    }, ["+ Add project"]));
+    // (Import-an-existing-project moved into the New Project page as a box —
+    // openAddProjectModal is reached from there now, not a rail button.)
     rail.appendChild(el("div", { class: "rail-spacer" }));
     // Workflows + Management + Settings sit together at the BOTTOM of the rail —
     // the host-side create + lifecycle + UI surfaces, distinct from the vault
@@ -737,42 +734,27 @@ function makeBottomNav() {
         e.onclick = (ev) => { ev.stopPropagation(); open(); };
         return e;
     };
-    // Open Explain doc tabs (STAGE_WORKFLOW_EXPLAIN): closable rail entries below
-    // the fixed nav. Persistent until ×'d; clicking re-focuses. They render over
-    // the same single host pane (one doc shown at a time) — "persistent" = the
-    // rail entry survives until closed.
-    const docEntries = (state.openDocs || []).map((name) => {
-        const x = el("span", { class: "nav-doc-close", title: "Close" }, ["×"]);
-        x.onclick = (ev) => { ev.stopPropagation(); closeExplain(name); };
-        const e = el("div",
-            { class: "nav-entry explain-entry explain-entry-" + name, title: "Explain: " + name },
-            [el("span", { class: "nav-icon" }, ["📖"]), el("span", {}, [name]), x]);
-        e.onclick = (ev) => { ev.stopPropagation(); openExplain(name); };
-        return e;
-    });
+    // Explain docs are ephemeral floating popovers now (dismissed on outside
+    // click), not persistent rail tabs — so the bottom nav has no doc entries.
     return el("div", { class: "rail-nav-group" }, [
-        mk("workflows-entry", "🛍", "Workflows",
-           "Workflows — pick a workflow to create a project", openWorkflows),
+        mk("workflows-entry", "🛍", "New Project",
+           "New Project — pick a workflow, or import an existing project", openWorkflows),
         mk("management-entry", "🗂", "Management",
            "Host project management (broker)", openManagement),
         mk("settings-entry", "⚙", "Settings", "UI settings", openSettings),
-        ...docEntries,
     ]);
 }
 
-// Re-render just the bottom nav group in place (no full rail rebuild) so opening
-// or closing an Explain doc tab updates its rail entries immediately.
+// Re-render just the bottom nav group in place (no full rail rebuild) so a host
+// page change updates its rail entries immediately.
 function refreshBottomNav() {
     const existing = document.querySelector(".rail-nav-group");
     if (existing) existing.replaceWith(makeBottomNav());
     // makeBottomNav builds every entry inactive; re-derive the active highlight
-    // from the current host page so closing a BACKGROUND doc (while another page
-    // is shown) doesn't blank the still-active entry.
+    // from the current host page.
     const hp = state.hostPage;
     if (hp === "workflows" || hp === "management" || hp === "settings") {
         setActiveNavEntry(hp + "-entry");
-    } else if (hp && hp.startsWith("explain:")) {
-        setActiveNavEntry("explain-entry-" + hp.slice("explain:".length));
     }
 }
 
@@ -1578,59 +1560,88 @@ function renderWorkflowsScreen(view, result) {
         card.onclick = () => mgmtCreateDialog(view, m, agents);
         return card;
     }));
+    // Import an existing project — a box alongside the workflow cards (was the
+    // rail's "+ Add project"). Opens the SSH-coordinates / import-string modal.
+    const importCard = el("div", { class: "workflows-card import-card",
+                                   title: "Add an existing project by its SSH coordinates" }, [
+        el("div", { class: "workflows-card-name" }, ["Import project"]),
+        el("div", { class: "workflows-card-desc" },
+           ["Add an existing project by its SSH coordinates (or an import string)."]),
+        el("div", { class: "workflows-card-actions" }, [null]),
+    ]);
+    importCard.onclick = () => openAddProjectModal();
+    grid.appendChild(importCard);
     view.appendChild(el("div", { class: "workflows-screen" }, [
-        el("h2", { class: "workflows-title" }, ["Workflows"]),
-        el("div", { class: "hint workflows-sub" }, ["Pick a workflow to create a project."]),
+        el("h2", { class: "workflows-title" }, ["New Project"]),
+        el("div", { class: "hint workflows-sub" },
+           ["Pick a workflow to create a project, or import an existing one."]),
         grid,
     ]));
 }
 
-// ---- Explain doc tabs (STAGE_WORKFLOW_EXPLAIN) ------------------------------
+// ---- Explain floating popover (STAGE_WORKFLOW_EXPLAIN) ----------------------
 // A workflow's Explain button opens its baked learning doc (static HTML with an
-// inline interactive SVG) as a persistent, closable tab over the single host pane
-// — same chrome as the Workflows/Management/Settings host pages (enterHostView),
-// never clearBody (which would tear down the whole body).
+// inline interactive SVG) as a FLOATING box centered over the page, dismissed on
+// an outside click or Escape — not a persistent host-page tab. Same outside-click
+// discipline as the project config box (pointerdown capture + composedPath).
 
-function openExplain(name) {
-    if (!state.openDocs.includes(name)) state.openDocs.push(name);
-    state.hostPage = "explain:" + name;
-    const view = enterHostView();
-    if (!view) return;
-    refreshBottomNav();   // sets the active highlight from state.hostPage
-    renderExplainInto(view, name);
+let explainBox = null;
+
+function closeExplainBox() {
+    if (!explainBox) return;
+    explainBox.remove();
+    explainBox = null;
+    document.removeEventListener("pointerdown", onExplainOutsidePointer, true);
+    document.removeEventListener("keydown", onExplainKeydown, true);
 }
 
-function closeExplain(name) {
-    const wasActive = state.hostPage === "explain:" + name;
-    state.openDocs = state.openDocs.filter((n) => n !== name);
-    if (wasActive) leaveHostView();   // drop to the prior project / welcome
-    refreshBottomNav();
+// Keep open when the click is inside the box OR on an Explain button (so the
+// button's own click, which opens/replaces the box, isn't self-cancelled).
+function onExplainOutsidePointer(ev) {
+    if (!explainBox) return;
+    const path = ev.composedPath ? ev.composedPath() : [];
+    for (const node of path) {
+        if (node === explainBox) return;
+        if (node && node.classList && node.classList.contains("explain-btn")) return;
+    }
+    closeExplainBox();
 }
 
-async function renderExplainInto(view, name) {
-    view.innerHTML = "";
-    view.appendChild(el("div", { class: "mgmt-loading" }, ["Loading…"]));
-    let res;
-    try {
-        res = await fetch("/static/explain/" + encodeURIComponent(name) + ".html");
-    } catch (e) { return renderExplainError(view, name); }
-    if (!res.ok) return renderExplainError(view, name);
-    const html = await res.text();
-    view.innerHTML = "";
-    // Built-in, repo-controlled, script-free fragment (md→HTML + inline SVG at
-    // build). Scoped under .explain-doc so the SVG's self-scoped <style> applies.
-    const doc = el("div", { class: "explain-doc" });
-    doc.innerHTML = html;
-    view.appendChild(doc);
-}
+function onExplainKeydown(ev) { if (ev.key === "Escape") closeExplainBox(); }
 
-function renderExplainError(view, name) {
-    view.innerHTML = "";
-    view.appendChild(el("div", { class: "mgmt-error explain-error" }, [
+function explainErrorEl(name) {
+    return el("div", { class: "mgmt-error explain-error" }, [
         el("h2", {}, ["Doc unavailable"]),
         el("p", {}, ["Couldn't load the “" + name + "” explainer. If you just added "
             + "it, rebuild the webui image so it's rendered into the bundle."]),
-    ]));
+    ]);
+}
+
+async function openExplain(name) {
+    closeExplainBox();   // one at a time
+    const closeBtn = el("button", { class: "explain-popover-close", title: "Close" }, ["×"]);
+    closeBtn.onclick = closeExplainBox;
+    // The doc HTML is scoped under .explain-doc so the SVG's self-scoped <style>
+    // applies (same as the prior host-page render).
+    const doc = el("div", { class: "explain-doc" }, [
+        el("div", { class: "mgmt-loading" }, ["Loading…"]),
+    ]);
+    const box = el("div", { class: "explain-popover" }, [closeBtn, doc]);
+    document.body.appendChild(box);
+    explainBox = box;
+    document.addEventListener("pointerdown", onExplainOutsidePointer, true);
+    document.addEventListener("keydown", onExplainKeydown, true);
+
+    let res;
+    try {
+        res = await fetch("/static/explain/" + encodeURIComponent(name) + ".html");
+    } catch (e) { if (explainBox === box) { doc.innerHTML = ""; doc.appendChild(explainErrorEl(name)); } return; }
+    if (explainBox !== box) return;   // dismissed while loading
+    if (!res.ok) { doc.innerHTML = ""; doc.appendChild(explainErrorEl(name)); return; }
+    const html = await res.text();
+    if (explainBox !== box) return;
+    // Built-in, repo-controlled, script-free fragment (md→HTML + inline SVG at build).
+    doc.innerHTML = html;
 }
 
 // ---- JIT keyring attach -----------------------------------------------------
@@ -2247,7 +2258,7 @@ function openAddProjectModal() {
     const cancel = el("button", { class: "btn btn-secondary" }, ["Cancel"]);
     cancel.onclick = () => backdrop.remove();
 
-    const save = el("button", { class: "btn" }, ["Add"]);
+    const save = el("button", { class: "btn" }, ["Import"]);
     save.onclick = async () => {
         const name = nameI.value.trim();
         const host = hostI.value.trim();
@@ -2273,7 +2284,7 @@ function openAddProjectModal() {
     };
 
     const card = el("div", { class: "card" }, [
-        el("h2", {}, ["Add project"]),
+        el("h2", {}, ["Import project"]),
         el("div", { class: "field" }, [
             el("label", {}, ["Import string (optional)"]),
             importTa,
@@ -2793,10 +2804,11 @@ function renderServiceTabs(projectName, enabled) {
     if (!strip) return;
     strip.innerHTML = "";
     strip.appendChild(makeProjectsTab());
-    // Active-project label — visual anchor so the user can tell at a
-    // glance which project the visible service tabs belong to. Same
-    // font-size as the rail rows, weighted bold.
+    // Active-project label — a bordered chip (distinct from the service tabs),
+    // followed by a separator (same rule as the visual/cli divider) so it reads as
+    // an anchor for the strip rather than the first tab.
     strip.appendChild(el("div", { class: "active-project" }, [projectName]));
+    strip.appendChild(el("div", { class: "tab-group-divider" }));
     const ids = visibleServiceIds(projectName, enabled);
     if (ids.length === 0) {
         strip.appendChild(el("div", { class: "empty" }, [
