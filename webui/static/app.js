@@ -1389,13 +1389,6 @@ function mgmtCreateDialog(view, manifest, agents) {
                "https inside the locked box. Never logged or persisted — sent once " +
                "with this create and never stored.",
     });
-    // Opt-in box harness (sandbox-dind only): one toggle that stages rs-sandbox +
-    // the box images so the user/agent can spawn confined sub-boxes.
-    const withBoxesCb = el("input", { type: "checkbox" });
-    const withBoxesField = el("label", { class: "mgmt-check" }, [
-        withBoxesCb, " enable the box harness (rs-sandbox)",
-    ]);
-    if (!boxCapable) withBoxesField.style.display = "none";
     const dockerGroup = el("div", { class: "mgmt-docker-group" }, [
         agentField,
         el("div", { class: "field" }, [el("label", {}, ["Repo (https)"]), repoI]),
@@ -1405,7 +1398,6 @@ function mgmtCreateDialog(view, manifest, agents) {
             el("label", { title: patI.getAttribute("title") }, ["GitHub PAT (secret)"]),
             patI,
         ]),
-        el("div", { class: "field" }, [withBoxesField]),
         el("div", { class: "hint" }, [
             "Agent + repo/setup run inside the box (docker sandbox or sandbox-dind).",
         ]),
@@ -1474,9 +1466,6 @@ function mgmtCreateDialog(view, manifest, agents) {
                 if (setup) payload.setup = setup;
                 if (pat) payload.github_pat = pat;
             }
-            // Opt-in box harness — sandbox-dind only (boxCapable). from_kwargs
-            // rejects with_boxes on any other flavor, so only send it here.
-            if (boxCapable && withBoxesCb.checked) payload.with_boxes = true;
             return fetch("/broker/project", {
                 method: "POST", headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(payload),
@@ -2821,11 +2810,12 @@ function renderServiceTabs(projectName, enabled) {
     // the editor is the primary work surface. A thin vertical rule separates
     // the groups, omitted when either is empty so a CLI-only project (e.g. a
     // bare docker box with no live editor) shows no orphan divider.
-    // Box controls show for a sandbox-dind project with the rs-sandbox harness on
-    // (STAGE_SANDBOX_DIND_AGENT): the server stamps `box_harness` on the always-
-    // present Supervisor tab spec iff the project was created --with-boxes. Only
-    // then are pi-iso-* tabs disposable BOXES (in a research project they're BYO
-    // extensions, managed via the Extensions config section — never the box ✕).
+    // The box harness is a standing dind utility (STAGE_DIND_UNIFY): the server
+    // stamps `box_harness` on the always-present Supervisor tab spec for ANY dind
+    // project (research + sandbox-dind), so the "+ Add box" control shows on both.
+    // A pi-iso-* tab is a disposable BOX (gets the ✕) only when it's a real box
+    // (box_kind === "sandbox"); a BYO extension's pi-iso tab (box_kind === "byo") is
+    // managed via the Extensions config section, never the box ✕.
     const boxHarness = !!(enabled["supervisor"] && enabled["supervisor"].box_harness);
     const visual = [], cli = [];
     for (const id of ids) {
@@ -2840,9 +2830,11 @@ function renderServiceTabs(projectName, enabled) {
         }, ["⇥"]);
         pinBtn.onclick = (ev) => { ev.stopPropagation(); togglePin(id); };
         const kids = [iconSvg(iconOf(id, svc)), el("span", {}, [svc.label || id]), pinBtn];
-        // Box tabs (sandbox-dind only) carry a ✕ that discards the box in place —
-        // box deletion lives on the tab, not in a sidebar settings panel.
-        if (boxHarness && id.startsWith("pi-iso-")) {
+        // A real box tab (box_kind === "sandbox") carries a ✕ that discards the box
+        // in place — box deletion lives on the tab, not in a sidebar settings panel.
+        // A BYO extension's pi-iso tab (box_kind === "byo") is excluded — it's
+        // managed via the Extensions config section.
+        if (boxHarness && id.startsWith("pi-iso-") && svc.box_kind === "sandbox") {
             const boxName = id.slice("pi-iso-".length);
             const closeBtn = el("button", {
                 class: "close-tab-btn", title: `Remove box "${boxName}"`,
@@ -2864,8 +2856,9 @@ function renderServiceTabs(projectName, enabled) {
         strip.appendChild(el("div", { class: "tab-group-divider" }));
     }
     for (const id of cli) strip.appendChild(makeTab(id));
-    // + Add box lives on the strip for a sandbox-dind project with the box harness
-    // on — boxes are created where they appear, not in a sidebar settings panel.
+    // + Add box lives on the strip for ANY dind project (research + sandbox-dind);
+    // boxes are created where they appear, not in a sidebar settings panel. On
+    // research the harness is staged lazily on the first box_add (STAGE_DIND_UNIFY).
     if (boxHarness) {
         const addBox = el("button", {
             class: "add-box-tab-btn", title: "Add a box",

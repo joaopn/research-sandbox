@@ -97,16 +97,20 @@ def _docker(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["docker", *args], capture_output=True, text=True)
 
 
-def _require_sandbox_dind_project() -> None:
-    """rs-sandbox is only meaningful in a --workflow sandbox-dind project."""
+def _require_dind_project() -> None:
+    """rs-sandbox (the box harness) runs in ANY dind supervisor — research OR
+    sandbox-dind (STAGE_DIND_UNIFY, the harness is a standing dind utility now).
+    Only the docker containment substrate has no inner dockerd, so reject just that;
+    a missing/legacy marker defaults to dind (greenfield). Mirrors the host-side
+    `_running_dind_supervisor` gate (substrate, not flavor)."""
     try:
-        ptype = json.loads(PROJECT_JSON.read_text()).get("type")
+        substrate = json.loads(PROJECT_JSON.read_text()).get("substrate")
     except (OSError, json.JSONDecodeError):
-        ptype = None
-    if ptype != "sandbox-dind":
-        die("not a sandbox-dind project (.orchestrator/project.json type != "
-            "'sandbox-dind'). Create one with "
-            "`research project create <name> --workflow sandbox-dind`.")
+        substrate = None
+    if substrate == "docker":
+        die("the docker containment substrate has no inner dockerd; the rs-sandbox "
+            "box harness is unavailable here (it is a dind feature — research or "
+            "sandbox-dind).")
 
 
 # --- extensions.json --------------------------------------------------------
@@ -213,7 +217,7 @@ def _box_entry(entries: dict[str, dict], name: str) -> dict:
 
 
 def cmd_create(args: argparse.Namespace) -> None:
-    _require_sandbox_dind_project()
+    _require_dind_project()
     entries = load()
     name = args.name
     if name is None:
@@ -238,7 +242,7 @@ def cmd_restart(args: argparse.Namespace) -> None:
     sysbox recreate) — delegated here so the docker-run logic lives in one
     place. Identical to `start` for a gone container; named `restart` for the
     recreate-loop caller's clarity."""
-    _require_sandbox_dind_project()
+    _require_dind_project()
     entry = _box_entry(load(), args.name)
     _run_box(args.name, entry["ip"], browser=bool(entry.get("browser")),
              agent=entry.get("agent", "none"))
@@ -246,7 +250,7 @@ def cmd_restart(args: argparse.Namespace) -> None:
 
 
 def cmd_stop(args: argparse.Namespace) -> None:
-    _require_sandbox_dind_project()
+    _require_dind_project()
     _box_entry(load(), args.name)  # validate it's our box
     r = _docker("stop", box_container(args.name))
     if r.returncode != 0:
@@ -258,7 +262,7 @@ def cmd_stop(args: argparse.Namespace) -> None:
 def cmd_start(args: argparse.Namespace) -> None:
     """Resume a stopped box, or re-run it from its entry if the container is
     gone (e.g. after a recreate)."""
-    _require_sandbox_dind_project()
+    _require_dind_project()
     entry = _box_entry(load(), args.name)
     cname = box_container(args.name)
     exists = _docker("container", "inspect", cname).returncode == 0
@@ -274,7 +278,7 @@ def cmd_start(args: argparse.Namespace) -> None:
 
 
 def cmd_discard(args: argparse.Namespace) -> None:
-    _require_sandbox_dind_project()
+    _require_dind_project()
     entries = load()
     _box_entry(entries, args.name)
     _docker("rm", "-f", box_container(args.name))

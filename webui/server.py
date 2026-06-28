@@ -918,11 +918,6 @@ async def project_services_handler(request: web.Request) -> web.Response:
         ])
         probe_up = {sid: up for (sid, _), up in zip(probe_jobs, results)}
 
-    # Project flavor. A sandbox-dind project shows the Supervisor (agent) tab like
-    # research (STAGE_SANDBOX_DIND_AGENT); its box tabs come from kind="sandbox"
-    # extensions.json entries when the rs-sandbox harness is enabled (--with-boxes).
-    # Read off the same /projects:ro bind-mount as everything else here.
-    is_sandbox = _read_project_type(project) == "sandbox-dind"
     # A bare docker box (substrate=docker) has no claude-supervisor — its
     # "Supervisor" tab is really a plain login shell (ssh+byobu bash on the
     # rs-minimal image, which still ships ssh+byobu+code-server). Relabel it
@@ -941,12 +936,13 @@ async def project_services_handler(request: web.Request) -> web.Response:
         if sid == "supervisor" and is_docker:
             out[sid] = {**svc, "label": "Shell"}   # honest label for a bare box
             continue
-        if sid == "supervisor" and is_sandbox:
-            # Stamp box_harness so the SPA shows the box +/✕ controls iff this
-            # project enabled the rs-sandbox harness (--with-boxes). Copy the spec —
-            # never mutate the shared SERVICES dict.
-            out[sid] = {**svc,
-                        "box_harness": bool(_read_project_marker(project).get("with_boxes"))}
+        if sid == "supervisor":
+            # Box harness is a standing dind utility (STAGE_DIND_UNIFY): ANY non-docker
+            # project (research + sandbox-dind) can spawn rs-sandbox boxes, so stamp
+            # box_harness so the SPA shows the box "+" control. (Reached only for
+            # non-docker — the docker case continued above.) Copy the spec — never
+            # mutate the shared SERVICES dict.
+            out[sid] = {**svc, "box_harness": not is_docker}
             continue
         if svc.get("always_on"):
             out[sid] = svc
@@ -973,7 +969,10 @@ async def project_services_handler(request: web.Request) -> web.Response:
             continue
         spec = services.pi_isolated_service(name)
         if spec is not None:
-            out[f"{services.PI_ISOLATED_ID_PREFIX}{name}"] = spec
+            # Stamp box_kind (STAGE_DIND_UNIFY): the SPA shows the per-tab box "✕"
+            # ONLY on a real box (kind="sandbox"); a BYO extension's pi-iso tab
+            # (kind="byo") stays managed via the Extensions config section.
+            out[f"{services.PI_ISOLATED_ID_PREFIX}{name}"] = {**spec, "box_kind": kind}
     return web.json_response(out)
 
 

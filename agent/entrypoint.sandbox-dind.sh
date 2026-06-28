@@ -2,13 +2,15 @@
 # entrypoint.sandbox-dind.sh — substrate for a --workflow sandbox-dind project: the
 # sandbox flavor PLUS inner Docker (DIND) (STAGE_SANDBOX_DIND_AGENT).
 #
-# This boots the inner dockerd + the rs-inner bridge, ssh, and (when enabled) the
-# editor. The agent (claude) and the OPT-IN rs-sandbox box harness are NOT baked
-# into this image — they're staged post-start by the host: _stage_agent_dist
+# This boots the inner dockerd + the rs-inner bridge (via mcp-reload), ssh, and
+# (when enabled) the editor. The agent (claude) and the rs-sandbox box harness are
+# NOT baked into this image — they're staged post-start by the host: _stage_agent_dist
 # (deploy_local=True) deploys claude into ~/.local AND populates /opt/agent-dist for
-# any boxes; _stage_rs_sandbox installs /usr/local/bin/rs-sandbox only when the
-# project was created --with-boxes. So this entrypoint has NO agent-cp block — it
-# mirrors the research supervisor, which also relies on the post-start staging.
+# any boxes; _stage_rs_sandbox installs /usr/local/bin/rs-sandbox (the box harness is
+# a standing dind utility now — STAGE_DIND_UNIFY). So this entrypoint has NO agent-cp
+# block — it mirrors the research supervisor, which also relies on the post-start
+# staging. The MCP proxy tooling (mcp-reload, mcp_render_config.py) IS baked, so
+# extensions get the same proxy-routed upstreams as research.
 #
 # Expected env: PROJECT, SSH_PASSWORD, HOST_GID, DOCKER_DIND, RS_SERVICE_CODE_SERVER.
 
@@ -76,13 +78,15 @@ if [[ "${DOCKER_DIND:-}" == "true" ]] && command -v dockerd >/dev/null 2>&1; the
         echo "WARNING: dockerd did not become ready; see /tmp/dockerd.log" >&2
     fi
 
-    # The boxes join the rs-inner bridge (rs-sandbox pins them at
-    # 192.168.99.14-25). In a research supervisor mcp-reload creates this
-    # network; Management has no proxy/mcp-reload, so create it here. Same
-    # subnet as the supervisor's rs-inner (keep in lockstep with mcp-reload.sh).
-    docker network inspect rs-inner >/dev/null 2>&1 \
-        || docker network create --subnet 192.168.99.0/24 rs-inner >/dev/null \
-        || echo "WARNING: failed to create rs-inner network" >&2
+    # MCP proxy + rs-inner bridge (STAGE_DIND_UNIFY): sandbox-dind now bakes
+    # mcp-reload (Dockerfile.sandbox-dind), so use it instead of the old manual
+    # `docker network create rs-inner`. mcp-reload creates the rs-inner bridge (the
+    # boxes join it; rs-sandbox pins them at 192.168.99.14-25), renders the proxy
+    # config, and spawns the proxy when its image is staged. At FIRST boot the proxy
+    # image isn't staged yet (the host stages it post-start in create()), so the
+    # proxy spawn just warns; create()'s cone re-runs mcp-reload after staging.
+    # Mirrors entrypoint.supervisor.sh.
+    /usr/local/bin/mcp-reload || echo "WARNING: mcp-reload failed at boot" >&2
 fi
 
 # --- SSH ---
@@ -107,7 +111,7 @@ fi
 echo "=== Sandbox-dind ready ==="
 echo "Workspace:    /workspace"
 echo "Agent:        run \`claude\` in this tab (locked egress; inner Docker available)"
-echo "Boxes:        rs-sandbox   (only if created with --with-boxes)"
+echo "Boxes:        rs-sandbox   (box harness staged at create)"
 
 # tini is PID 1 (ENTRYPOINT) and reaps zombies. sleep infinity keeps PID 1 alive.
 exec sleep infinity

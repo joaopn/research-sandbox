@@ -6,10 +6,19 @@ FROM rs-substrate-base:latest
 #
 # The agent (claude) is dist-delivered at boot (cp from the host-staged
 # /opt/agent-dist into ~/.local) — NOT baked. The rs-sandbox box-management CLI is
-# likewise NOT baked: it is the OPT-IN box harness (--with-boxes), staged into
-# /usr/local/bin at create by _stage_rs_sandbox. So this image carries only the
-# substrate + entrypoint; what runs inside (agent, box harness) is delivered
-# per-project.
+# likewise NOT baked: the box harness is a standing dind utility, staged into
+# /usr/local/bin at create by _stage_rs_sandbox (STAGE_DIND_UNIFY). So this image
+# carries the substrate + entrypoint + the MCP proxy tooling (below); what runs
+# inside (agent, box harness) is delivered per-project.
+
+# MCP proxy support (STAGE_DIND_UNIFY): extensions on a sandbox-dind project get the
+# same proxy-routed upstreams as research, so bake the config renderer + the reload
+# helper (which also creates the rs-inner bridge). mcp_render_config.py is stdlib —
+# the shared miniconda3 base ships python3, so NO pip. Mirror of Dockerfile.supervisor.
+RUN mkdir -p /opt/mcp-proxy-tools
+COPY container/supervisor/mcp_render_config.py /opt/mcp-proxy-tools/mcp_render_config.py
+COPY container/supervisor/mcp-reload.sh /usr/local/bin/mcp-reload
+RUN chmod +x /usr/local/bin/mcp-reload
 
 # Keep ~/.local/bin (where the dist-deployed agent launcher lands) on PATH,
 # captured into the skel below so the restored home + every login shell sees it.

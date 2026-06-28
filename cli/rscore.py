@@ -255,8 +255,8 @@ def workflow_is_sandbox_dind(manifest: dict) -> bool:
     (dind-sysbox substrate + the rs-sandbox-dind overlay). Derived from manifest
     DATA, mirroring _resolve_workflow — never a name lookup. The webui uses this
     (surfaced via the broker `workflows` verb as `box_capable`) to show the agents +
-    light-path group and the --with-boxes toggle for sandbox-dind, the same way it
-    keys off `has_worker_layer` for the research --enable presets."""
+    light-path group for sandbox-dind, the same way it keys off `has_worker_layer`
+    for the research --enable presets."""
     if manifest.get("substrate") != Substrate.DIND_SYSBOX.value:
         return False
     mgmt_overlay = SANDBOX_DIND_IMAGE.split(":", 1)[0]  # "rs-sandbox-dind"
@@ -380,13 +380,6 @@ class CreateRequest:
     # /workspace/.orchestrator/greeting at create for the management/research
     # flavor; "" ⇒ no file staged.
     greeting: str = ""
-    # Opt-in box harness (STAGE_SANDBOX_DIND_AGENT): when True a sandbox-dind project
-    # stages the rs-sandbox CLI + delivers the box images so the user/agent can spawn
-    # confined boxes. Default off = a plain agent + inner-Docker box. A bool in-box
-    # toggle (not host-shaped) ⇒ relayable; only valid for sandbox-dind (rejected
-    # elsewhere in from_kwargs). Recorded in the project.json marker so
-    # _recreate_supervisor re-stages the harness.
-    with_boxes: bool = False
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "CreateRequest":
@@ -461,14 +454,6 @@ class CreateRequest:
             raise ValidationError(
                 "no cached editor dist — run `research editor pull` first "
                 "(or `research start`, which auto-pulls)")
-        # Opt-in box harness (STAGE_SANDBOX_DIND_AGENT) — only meaningful for the
-        # sandbox-dind flavor (it stages rs-sandbox + the box images). Reject on any
-        # other flavor so a stray flag can't silently no-op.
-        with_boxes = bool(kw.get("with_boxes", False))
-        if with_boxes and project_type is not ProjectType.SANDBOX_DIND:
-            raise ValidationError(
-                "--with-boxes (the rs-sandbox box harness) is only valid for the "
-                "sandbox-dind workflow")
         return cls(
             name=_require_name(kw.get("name")),
             workflow=workflow_id,
@@ -492,7 +477,6 @@ class CreateRequest:
             agents=agents,
             service_defaults=service_defaults,
             greeting=greeting,
-            with_boxes=with_boxes,
         )
 
 
@@ -971,14 +955,13 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     marker = {"type": project_type, "substrate": substrate.value,
               "workflow": req.workflow, "agents": deployed_agents}
     if project_type == PROJECT_TYPE_SANDBOX_DIND:
-        # Record the opt-in box harness so _recreate_supervisor re-stages rs-sandbox
-        # + re-delivers the box images (STAGE_SANDBOX_DIND_AGENT).
-        marker["with_boxes"] = req.with_boxes
-        if req.with_boxes:
-            # Freeze the box-image pins (lane-3) ONLY when the box harness is on:
-            # boxes pull these snapshot refs at create + recreate, so a versions.env
-            # bump reaches a project only on a fresh box-create, never on restart.
-            marker["box_image_pins"] = _box_image_pins(load_versions())
+        # Freeze the box-image pins (lane-3): sandbox-dind eager-stages the box
+        # harness (STAGE_DIND_UNIFY — the harness is a standing dind utility now,
+        # no --with-boxes opt-in), so its boxes pull these snapshot refs at create +
+        # recreate; a versions.env bump reaches the project only on a fresh
+        # box-create, never on restart. (Research carries no frozen pins — it stages
+        # boxes LAZILY via box_add against the current versions.env pins.)
+        marker["box_image_pins"] = _box_image_pins(load_versions())
     (orch_dir / "project.json").write_text(json.dumps(marker, indent=2) + "\n")
     # Starting message (STAGE_SPAWN_GREETING) for the workflow's main shell, read
     # by the Management/Supervisor tab on first byobu new-session. Manifest-
@@ -1123,13 +1106,14 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             if editor_dist_present():
                 _stage_editor_dist(container_name,
                                    deploy_local=service_flags.get("code-server", True))
-            # Opt-in box harness (--with-boxes): stage the rs-sandbox CLI (no longer
-            # baked) + deliver the box images (MINT site, push=True; pins were frozen
-            # into the marker above). Skipped by default = a plain agent + DIND box.
-            if req.with_boxes:
-                _stage_rs_sandbox(container_name)
-                _deliver_box_images(container_name, network,
-                                    _box_image_pins(load_versions()), push=True)
+            # Box harness (STAGE_DIND_UNIFY — a standing dind utility, no longer an
+            # opt-in): stage the rs-sandbox CLI (no longer baked) + deliver the box
+            # images (MINT site, push=True; pins were frozen into the marker above).
+            # Eager for sandbox-dind; research delivers the same harness LAZILY on
+            # first box_add (research create/recreate never touch boxes — frozen lane).
+            _stage_rs_sandbox(container_name)
+            _deliver_box_images(container_name, network,
+                                _box_image_pins(load_versions()), push=True)
             # Light-path harness: clone repo@ref + run setup on the supervisor
             # (after inject_route; raises HarnessError on failure, box left standing).
             clone_dir = _run_light_harness(
@@ -1153,13 +1137,15 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
                 _stage_editor_dist(container_name,
                                    deploy_local=service_flags.get("code-server", True))
 
-        # 6b/6c. The MCP proxy/reload/auto-allow cone is supervisor-only.
-        #        rs-sandbox-dind ships no mcp-proxy and no /usr/local/bin/mcp-reload
-        #        (the agent-layer split), and sandbox-dind boxes never consume the
-        #        proxy — so staging the proxy image, reloading, and populating
-        #        mcp-allow.json are dead work there (the reload exec just warns
-        #        "no such file"). Gate the whole cone on the research flavor.
-        if not is_management:
+        # 6b/6c. The MCP proxy/reload/auto-allow cone runs for ALL dind now
+        #        (STAGE_DIND_UNIFY): research AND sandbox-dind get the proxy so
+        #        extensions with proxy-routed upstreams (wrangler-style) work on
+        #        both. rs-sandbox-dind bakes mcp-reload + mcp_render_config.py
+        #        (Dockerfile.sandbox-dind) so the reload exec resolves; the proxy
+        #        image is staged just below. The guard is `not is_docker` (always
+        #        true inside this dind branch) so research's executed statements stay
+        #        byte-identical — only the gate widened from `not is_management`.
+        if not is_docker:
             stage_worker_image(container_name, MCP_PROXY_IMAGE)
 
             # 6b. Re-run mcp-reload now that the proxy image is staged.
@@ -2490,11 +2476,12 @@ def _stage_agent_dist(supervisor: str, agent: str = DEFAULT_AGENT,
 
 
 def _stage_rs_sandbox(container: str) -> None:
-    """Stage the rs-sandbox box-management CLI into a RUNNING sandbox-dind supervisor
+    """Stage the rs-sandbox box-management CLI into a RUNNING dind supervisor
     at /usr/local/bin/rs-sandbox (STAGE_SANDBOX_DIND_AGENT). It is no longer baked
-    into the image — it's the OPT-IN box harness (--with-boxes), delivered here at
-    create and re-delivered at recreate (the image carries no copy). A single stdlib
-    file: stream it over `docker exec -i` stdin into `cat`, owned root + chmod 755
+    into the image — the box harness is a standing dind utility (STAGE_DIND_UNIFY):
+    delivered eagerly at create/recreate for sandbox-dind, and lazily on first
+    box_add for research (the image carries no copy). A single stdlib file: stream it
+    over `docker exec -i` stdin into `cat`, owned root + chmod 755
     (it lives in /usr/local/bin and is run by the research user) — exactly what the
     old `COPY … /usr/local/bin/rs-sandbox` bake produced, just at runtime."""
     src = Path(__file__).resolve().parent / "rs_sandbox.py"
@@ -3292,22 +3279,22 @@ def _recreate_supervisor(
         _stage_agent_dist(container)
         if editor_dist_present():
             _stage_editor_dist(container, deploy_local=flags.get("code-server", True))
-        # Box harness is OPT-IN: re-stage rs-sandbox (no bake) + re-deliver the box
-        # images ONLY when this project enabled --with-boxes (the marker flag).
-        if _read_with_boxes(workspace_path):
-            _stage_rs_sandbox(container)
-            # Box images: read FROZEN pins + PULL (RF1 — never re-push at recreate:
-            # the registry already holds the frozen pin from create, and re-pushing
-            # would die() if a versions.env bump left the host without the old tag).
-            # A pre-flag/pre-migration with-boxes project has no pins → greenfield
-            # backfill (adopt current pins, push, pull, backfill project.json).
-            _box_pins = _read_box_pins(workspace_path)
-            if _box_pins:
-                _deliver_box_images(container, network, _box_pins, push=False)
-            else:
-                _box_pins = _box_image_pins(load_versions())
-                _deliver_box_images(container, network, _box_pins, push=True)
-                _write_box_pins(workspace_path, _box_pins)
+        # Box harness is a standing dind utility (STAGE_DIND_UNIFY — no --with-boxes
+        # gate): re-stage rs-sandbox (no bake) + re-deliver the box images for every
+        # sandbox-dind recreate.
+        _stage_rs_sandbox(container)
+        # Box images: read FROZEN pins + PULL (RF1 — never re-push at recreate:
+        # the registry already holds the frozen pin from create, and re-pushing
+        # would die() if a versions.env bump left the host without the old tag).
+        # A pre-pins project has no pins → greenfield backfill (adopt current pins,
+        # push, pull, backfill project.json).
+        _box_pins = _read_box_pins(workspace_path)
+        if _box_pins:
+            _deliver_box_images(container, network, _box_pins, push=False)
+        else:
+            _box_pins = _box_image_pins(load_versions())
+            _deliver_box_images(container, network, _box_pins, push=True)
+            _write_box_pins(workspace_path, _box_pins)
     else:
         stage_worker_image(container, ANALYSIS_IMAGE, force=force_restage)
         # Re-stage the agent dist into the fresh container (its own ~/.local + the
@@ -3365,6 +3352,14 @@ def _recreate_supervisor(
         # byo (external mount + repo env). Delegate the restart to rs-sandbox
         # so the docker-run logic lives in one place.
         if extension_entries[name].get("kind") == extension.SANDBOX_KIND:
+            # Boxes are a first-class standing dind utility (STAGE_DIND_UNIFY): make
+            # the harness available before restarting. On research the box harness is
+            # NOT re-staged by the create/recreate branches above (frozen lane), so
+            # without this a research box's container is gone + rs-sandbox/image
+            # absent → the restart exec fails + dead tab. Inert on sandbox-dind
+            # (eager-staged) and for a box-less project (no kind="sandbox" entries).
+            _ensure_box_harness(container, network, workspace_path,
+                                bool(extension_entries[name].get("browser")))
             r = run(["docker", "exec", container, "rs-sandbox", "restart", name],
                     capture_output=True)
             if r.returncode != 0:
@@ -3735,24 +3730,50 @@ def _box_image_pins(pins: dict[str, str]) -> dict[str, str]:
 
 
 def _deliver_box_images(supervisor: str, network: str, box_pins: dict[str, str],
-                        *, push: bool) -> None:
-    """Make the two pinned box images available in a sandbox-dind supervisor's
-    inner dockerd, registry-delivered. ``push`` (the MINT path — create, or the
-    greenfield recreate-backfill) first publishes the host images; a normal
-    recreate is PULL-ONLY (push=False) — the registry already holds the frozen pin
-    from create, and re-pushing it would die() if a versions.env bump left the host
-    without the old tag (RF1). Connects the registry to the project network
-    (idempotent — survives recreate), pulls each pinned ref into the inner store,
-    and retags to the :latest the in-supervisor rs-sandbox runs (so rs-sandbox is
-    unchanged)."""
+                        *, push: bool, only: "set[str] | None" = None) -> None:
+    """Make the pinned box images available in a dind supervisor's inner dockerd,
+    registry-delivered. ``push`` (the MINT path — create, or the greenfield
+    recreate-backfill) first publishes the host images; a normal recreate is
+    PULL-ONLY (push=False) — the registry already holds the frozen pin from create,
+    and re-pushing it would die() if a versions.env bump left the host without the
+    old tag (RF1). ``only`` restricts delivery to a subset of host-base names
+    (default None = both) — the lazy box-harness path delivers just the image a
+    box actually needs, so a non-browser box never pulls Chromium. Connects the
+    registry to the project network (idempotent — survives recreate), pulls each
+    pinned ref into the inner store, and retags to the :latest the in-supervisor
+    rs-sandbox runs (so rs-sandbox is unchanged)."""
+    images = [t for t in _BOX_IMAGES if only is None or t[0] in only]
     if push:
-        for host_base, _repo, _latest in _BOX_IMAGES:
+        for host_base, _repo, _latest in images:
             _push_generic_image(host_base)
     _connect_registry_to_project_network(network)
-    for _host_base, repo, latest_tag in _BOX_IMAGES:
+    for _host_base, repo, latest_tag in images:
         ref = f"{extension.EXT_REGISTRY}/{repo}:{box_pins[repo]}"
         run_check(["docker", "exec", supervisor, "docker", "pull", ref])
         run_check(["docker", "exec", supervisor, "docker", "tag", ref, latest_tag])
+
+
+def _ensure_box_harness(container: str, network: str, workspace_path: "Path",
+                        want_browser: bool) -> None:
+    """Idempotently make the rs-sandbox box harness usable in a RUNNING dind
+    supervisor: stage the rs-sandbox CLI if absent, and deliver the ONE box image
+    this request needs (base, or browser when ``want_browser``) into the inner
+    store if absent. No-op where both are already present — every sandbox-dind
+    project eager-stages the harness at create/recreate, so this only does work on
+    the frozen research lane, which never touches boxes at create/recreate. This is
+    the SOLE box-delivery path for research (box_add + the recreate relaunch loop);
+    research create/recreate are untouched. Uses the project's frozen pins when
+    present (sandbox-dind) else the current versions.env pins (research has no
+    frozen box_image_pins — a versions.env bump can drift a research box's image,
+    acceptable)."""
+    if not run_quiet(["docker", "exec", container, "test", "-e",
+                      "/usr/local/bin/rs-sandbox"]):
+        _stage_rs_sandbox(container)
+    host_base, _repo, latest_tag = _BOX_IMAGES[1] if want_browser else _BOX_IMAGES[0]
+    if not run_quiet(["docker", "exec", container, "docker", "image", "inspect",
+                      latest_tag]):
+        pins = _read_box_pins(workspace_path) or _box_image_pins(load_versions())
+        _deliver_box_images(container, network, pins, push=True, only={host_base})
 
 
 def _read_box_pins(workspace_path: "Path") -> dict[str, str]:
@@ -3765,18 +3786,6 @@ def _read_box_pins(workspace_path: "Path") -> dict[str, str]:
         return {}
     pins = data.get("box_image_pins")
     return pins if isinstance(pins, dict) else {}
-
-
-def _read_with_boxes(workspace_path: "Path") -> bool:
-    """The opt-in box-harness flag from .orchestrator/project.json
-    (STAGE_SANDBOX_DIND_AGENT), or False for a pre-flag project. Read at recreate
-    so a box-harness project re-stages rs-sandbox + re-delivers the box images."""
-    f = workspace_path / ".orchestrator" / "project.json"
-    try:
-        data = json.loads(f.read_text())
-    except (OSError, json.JSONDecodeError):
-        return False
-    return bool(data.get("with_boxes", False))
 
 
 def _write_box_pins(workspace_path: "Path", box_pins: dict[str, str]) -> None:
@@ -5117,21 +5126,24 @@ def webui_attach_info(req: "AttachRequest", cfg: "Config" | None = None) -> Atta
                       username="research", password=ssh_pass)
 
 
-def _running_sandbox_dind_supervisor(project: str) -> str:
-    """Resolve + validate a RUNNING sandbox-dind supervisor for the box_* verbs,
-    returning its container name. die()s (→ the broker's `failed` envelope) if the
-    project is absent, stopped, or not a sandbox-dind flavor — a research
-    supervisor carries no `rs-sandbox` binary, so reject it with a clear message
-    rather than letting the docker exec fail cryptically. Mirrors the
-    exists/running checks in webui_attach_info."""
+def _running_dind_supervisor(project: str) -> str:
+    """Resolve + validate a RUNNING dind supervisor (research OR sandbox-dind) for
+    the box_* AND ext_* verbs, returning its container name. die()s (→ the broker's
+    `failed` envelope) if the project is absent, stopped, or the docker containment
+    substrate (no inner dockerd → no boxes/extensions). The box harness and
+    extensions are a standing dind utility on BOTH flavors now (STAGE_DIND_UNIFY),
+    so flavor is no longer rejected here — only the substrate is. The substrate
+    die() makes the webui's Boxes/Extensions surfaces self-hide on a docker box,
+    mirroring how those sections gate."""
     container = container_name_for(project)
     if not container_exists(container):
         die(f"project {project!r} does not exist")
     if not container_running(container):
-        die(f"project {project!r} is not running; start it before managing boxes")
-    if _container_project_type(container) != PROJECT_TYPE_SANDBOX_DIND:
-        die(f"project {project!r} is not a sandbox-dind project; boxes are only "
-            f"available on `--workflow sandbox-dind` projects")
+        die(f"project {project!r} is not running; start it before managing "
+            f"boxes or extensions")
+    if _container_substrate(container) == Substrate.DOCKER.value:
+        die(f"project {project!r} uses the docker containment substrate (no inner "
+            f"dockerd); boxes and extensions are unavailable")
     return container
 
 
@@ -5142,7 +5154,15 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     creds). Returns the box's recorded coordinates."""
     progress = progress or _NULL_PROGRESS
     progress.step("validate", "checking the project")
-    container = _running_sandbox_dind_supervisor(req.project)
+    cfg = load_config()
+    container = _running_dind_supervisor(req.project)
+    # Lazily stand up the box harness. On research this stages rs-sandbox + delivers
+    # the needed box image on first use (research create/recreate never touch boxes
+    # — the frozen lane); on sandbox-dind (eager-staged) it no-ops. Deliver only the
+    # base or browser image the request needs.
+    progress.step("harness", "ensuring the box harness")
+    _ensure_box_harness(container, project_network_for(req.project),
+                        workspace_path_for(req.project, cfg), bool(req.browser))
     argv = ["docker", "exec", container, "rs-sandbox", "create"]
     if req.name:
         argv.append(req.name)
@@ -5173,7 +5193,7 @@ def box_remove(req: "BoxRemoveRequest", progress=None) -> BoxRemoveResult:  # ty
     `rs-sandbox discard`. Step-up re-auth was already enforced by the broker."""
     progress = progress or _NULL_PROGRESS
     progress.step("validate", "checking the project")
-    container = _running_sandbox_dind_supervisor(req.project)
+    container = _running_dind_supervisor(req.project)
     progress.step("discard", "discarding the box"
                   + (" (keeping artifacts)" if req.keep_workspace else ""))
     cmd = ["docker", "exec", container, "rs-sandbox", "discard", req.name]
@@ -5189,7 +5209,7 @@ def box_list(req: "BoxListRequest", _progress=None) -> BoxListResult:  # type: i
     """List a project's sandbox boxes with live container state, via
     `rs-sandbox list --json`. Filters to kind=="sandbox" (the rs-sandbox-owned
     boxes); baked/byo extensions are managed via `research project extension`."""
-    container = _running_sandbox_dind_supervisor(req.project)
+    container = _running_dind_supervisor(req.project)
     r = run(["docker", "exec", container, "rs-sandbox", "list", "--json"],
             capture_output=True)
     if r.returncode != 0:
@@ -5206,37 +5226,16 @@ def box_list(req: "BoxListRequest", _progress=None) -> BoxListResult:  # type: i
     return BoxListResult(project=req.project, boxes=boxes)
 
 
-def _running_research_supervisor(project: str) -> str:
-    """Resolve + validate a RUNNING research supervisor for the ext_* verbs,
-    returning its container name. die()s (→ the broker's `failed` envelope) if the
-    project is absent, stopped, a sandbox-dind flavor (boxes, not extensions), or
-    the docker containment substrate (no inner dockerd → no extensions). The
-    flavor/substrate die()s make the webui's Extensions section self-hide on those
-    projects, mirroring how box_list gates the Boxes section."""
-    container = container_name_for(project)
-    if not container_exists(container):
-        die(f"project {project!r} does not exist")
-    if not container_running(container):
-        die(f"project {project!r} is not running; start it before managing "
-            f"extensions")
-    if _container_project_type(container) == PROJECT_TYPE_SANDBOX_DIND:
-        die(f"project {project!r} is a sandbox-dind project; it uses boxes, not "
-            f"extensions")
-    if _container_substrate(container) == Substrate.DOCKER.value:
-        die(f"project {project!r} uses the docker containment substrate (no inner "
-            f"dockerd); extensions are unavailable")
-    return container
-
-
 def ext_enable(req: "ExtEnableRequest", progress=None) -> ExtEnableResult:  # type: ignore[name-defined]
-    """Enable a baked/BYO extension on a running research project (webui-driven).
+    """Enable a baked/BYO extension on a running dind project — research OR
+    sandbox-dind now (STAGE_DIND_UNIFY); webui-driven.
     Coarse progress wrapper over the shared `_extension_enable` (which owns the
     upstream state-machine + the BYO-recreate path). For a BYO first-enable the
     'enable' milestone stays pending through the supervisor recreate — acceptable
     (the op tails like a slow create; terminals reconnect)."""
     progress = progress or _NULL_PROGRESS
     progress.step("validate", "checking the project")
-    _running_research_supervisor(req.project)
+    _running_dind_supervisor(req.project)
     cfg = load_config()
     progress.step("enable", "enabling the extension")
     _extension_enable(req.project, cfg, req.name, req.upstreams,
@@ -5250,11 +5249,12 @@ def ext_enable(req: "ExtEnableRequest", progress=None) -> ExtEnableResult:  # ty
 
 
 def ext_disable(req: "ExtDisableRequest", progress=None) -> ExtDisableResult:  # type: ignore[name-defined]
-    """Disable an extension on a running research project. Workspace (and, for
-    BYO, the cloned external folder) survive — no step-up needed."""
+    """Disable an extension on a running dind project (research or sandbox-dind).
+    Workspace (and, for BYO, the cloned external folder) survive — no step-up
+    needed."""
     progress = progress or _NULL_PROGRESS
     progress.step("validate", "checking the project")
-    _running_research_supervisor(req.project)
+    _running_dind_supervisor(req.project)
     cfg = load_config()
     progress.step("disable", "disabling the extension")
     _extension_disable(req.project, cfg, req.name)
@@ -5264,7 +5264,7 @@ def ext_disable(req: "ExtDisableRequest", progress=None) -> ExtDisableResult:  #
 def ext_list(req: "ExtListRequest", _progress=None) -> ExtListResult:  # type: ignore[name-defined]
     """The project's extension catalog + enabled set (live container state) + the
     project's allowed MCPs (to drive the enable dialog's upstream picker)."""
-    supervisor = _running_research_supervisor(req.project)
+    supervisor = _running_dind_supervisor(req.project)
     cfg = load_config()
     workspace_path = workspace_path_for(req.project, cfg)
     entries = extension.load(workspace_path)

@@ -259,7 +259,7 @@ def _verb_workflows(_args: dict, _progress=None) -> dict:
     for m in catalog:
         m["has_worker_layer"] = rscore.workflow_has_worker_layer(m)
         # box_capable (STAGE_SANDBOX_DIND_AGENT): the sandbox-dind flavor shows the
-        # agents + light-path group and the --with-boxes toggle. Derived from data.
+        # agents + light-path group in the create dialog. Derived from data.
         m["box_capable"] = rscore.workflow_is_sandbox_dind(m)
     return {
         "workflows": catalog,                     # full manifests (substrate,
@@ -307,11 +307,6 @@ CREATE_WEBUI_FIELDS = frozenset({
     # enforced in from_kwargs. The rename is a lockstep boundary edit: the webui
     # form POSTs `agents:[...]` (a field not in this set is silently dropped).
     "agents",
-    # with_boxes: the opt-in rs-sandbox box harness for a sandbox-dind project
-    # (STAGE_SANDBOX_DIND_AGENT). A bool in-box toggle (not host-shaped) ⇒ relayable;
-    # from_kwargs rejects it on any non-sandbox-dind flavor. Lockstep: the webui
-    # create form POSTs `with_boxes` (a field not in this set is silently dropped).
-    "with_boxes",
 })
 
 # The webui-settable subset of UpdateRequest fields. `rebuild`/`keep_claude` are
