@@ -1346,6 +1346,11 @@ function mgmtCreateDialog(view, manifest, agents) {
     const workflow = manifest.name || "research";
     const isDocker = manifest.substrate === "docker";
     const hasWorkerLayer = !!manifest.has_worker_layer;
+    // sandbox-dind is the docker `sandbox` flavor + DIND (STAGE_SANDBOX_DIND_AGENT):
+    // same agents + light-path group as the docker box, plus an opt-in box-harness
+    // toggle. box_capable is manifest-derived (the broker workflows verb).
+    const boxCapable = !!manifest.box_capable;
+    const showInBox = isDocker || boxCapable;
 
     const nameI = el("input", { type: "text", autocomplete: "off" });
     const egressS = el("select", {}, [
@@ -1402,6 +1407,13 @@ function mgmtCreateDialog(view, manifest, agents) {
                "https inside the locked box. Never logged or persisted — sent once " +
                "with this create and never stored.",
     });
+    // Opt-in box harness (sandbox-dind only): one toggle that stages rs-sandbox +
+    // the box images so the user/agent can spawn confined sub-boxes.
+    const withBoxesCb = el("input", { type: "checkbox" });
+    const withBoxesField = el("label", { class: "mgmt-check" }, [
+        withBoxesCb, " enable the box harness (rs-sandbox)",
+    ]);
+    if (!boxCapable) withBoxesField.style.display = "none";
     const dockerGroup = el("div", { class: "mgmt-docker-group" }, [
         agentField,
         el("div", { class: "field" }, [el("label", {}, ["Repo (https)"]), repoI]),
@@ -1411,11 +1423,12 @@ function mgmtCreateDialog(view, manifest, agents) {
             el("label", { title: patI.getAttribute("title") }, ["GitHub PAT (secret)"]),
             patI,
         ]),
+        el("div", { class: "field" }, [withBoxesField]),
         el("div", { class: "hint" }, [
-            "Agent + repo/setup apply to the docker-box substrate only.",
+            "Agent + repo/setup run inside the box (docker sandbox or sandbox-dind).",
         ]),
     ]);
-    if (!isDocker) dockerGroup.style.display = "none";
+    if (!showInBox) dockerGroup.style.display = "none";
     // Prefill the light-path presets from the manifest (overridable; the server's
     // explicit-wins applies the preset if the field is left blank). PAT never preset.
     repoI.value = manifest.repo || "";
@@ -1446,18 +1459,18 @@ function mgmtCreateDialog(view, manifest, agents) {
         ],
         validate: () => {
             if (!nameI.value.trim()) return "Project name is required.";
-            // Mirror from_kwargs: a docker repo needs a ref (pin the clone).
-            if (isDocker && repoI.value.trim() && !refI.value.trim()) {
+            // Mirror from_kwargs: an in-box repo needs a ref (pin the clone).
+            if (showInBox && repoI.value.trim() && !refI.value.trim()) {
                 return "A workflow repo requires a ref.";
             }
             return null;
         },
         request: () => {
             // Lockstep: every key below is in CREATE_WEBUI_FIELDS. enable rides
-            // only for a workflow with a worker layer; the docker-only in-box
-            // fields only for a docker workflow and only when non-empty — so a
-            // dind create never puts them on the wire and from_kwargs applies the
-            // manifest presets unshadowed.
+            // only for a workflow with a worker layer; the in-box fields (agents,
+            // repo/ref/setup/PAT) for a docker box OR sandbox-dind, and only when
+            // non-empty — so a research create never puts them on the wire and
+            // from_kwargs applies the manifest presets unshadowed.
             const payload = {
                 name: nameI.value.trim(),
                 workflow: workflow,
@@ -1466,7 +1479,7 @@ function mgmtCreateDialog(view, manifest, agents) {
             if (hasWorkerLayer) {
                 payload.enable = checks.filter((c) => c.cb.checked).map((c) => c.p);
             }
-            if (isDocker) {
+            if (showInBox) {
                 const sel = agentChecks.filter((c) => c.cb.checked)
                                        .map((c) => c.name);
                 const repo = repoI.value.trim();
@@ -1479,6 +1492,9 @@ function mgmtCreateDialog(view, manifest, agents) {
                 if (setup) payload.setup = setup;
                 if (pat) payload.github_pat = pat;
             }
+            // Opt-in box harness — sandbox-dind only (boxCapable). from_kwargs
+            // rejects with_boxes on any other flavor, so only send it here.
+            if (boxCapable && withBoxesCb.checked) payload.with_boxes = true;
             return fetch("/broker/project", {
                 method: "POST", headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(payload),
@@ -2793,11 +2809,12 @@ function renderServiceTabs(projectName, enabled) {
     // the editor is the primary work surface. A thin vertical rule separates
     // the groups, omitted when either is empty so a CLI-only project (e.g. a
     // bare docker box with no live editor) shows no orphan divider.
-    // Sandbox-dind projects carry a server-gated `management` tab; only there are
-    // pi-iso-* tabs disposable BOXES (in a research project they're BYO extensions,
-    // managed via the Extensions config section). So the per-tab box ✕ and the
-    // strip-level + Add box control appear iff management is present.
-    const isSandboxDind = !!enabled["management"];
+    // Box controls show for a sandbox-dind project with the rs-sandbox harness on
+    // (STAGE_SANDBOX_DIND_AGENT): the server stamps `box_harness` on the always-
+    // present Supervisor tab spec iff the project was created --with-boxes. Only
+    // then are pi-iso-* tabs disposable BOXES (in a research project they're BYO
+    // extensions, managed via the Extensions config section — never the box ✕).
+    const boxHarness = !!(enabled["supervisor"] && enabled["supervisor"].box_harness);
     const visual = [], cli = [];
     for (const id of ids) {
         (surfaceOf(id, enabled[id]) === "visual" ? visual : cli).push(id);
@@ -2813,7 +2830,7 @@ function renderServiceTabs(projectName, enabled) {
         const kids = [iconSvg(iconOf(id, svc)), el("span", {}, [svc.label || id]), pinBtn];
         // Box tabs (sandbox-dind only) carry a ✕ that discards the box in place —
         // box deletion lives on the tab, not in a sidebar settings panel.
-        if (isSandboxDind && id.startsWith("pi-iso-")) {
+        if (boxHarness && id.startsWith("pi-iso-")) {
             const boxName = id.slice("pi-iso-".length);
             const closeBtn = el("button", {
                 class: "close-tab-btn", title: `Remove box "${boxName}"`,
@@ -2835,9 +2852,9 @@ function renderServiceTabs(projectName, enabled) {
         strip.appendChild(el("div", { class: "tab-group-divider" }));
     }
     for (const id of cli) strip.appendChild(makeTab(id));
-    // + Add box lives on the strip for sandbox-dind projects — boxes are the
-    // project's primary surface, so they're created where they appear.
-    if (isSandboxDind) {
+    // + Add box lives on the strip for a sandbox-dind project with the box harness
+    // on — boxes are created where they appear, not in a sidebar settings panel.
+    if (boxHarness) {
         const addBox = el("button", {
             class: "add-box-tab-btn", title: "Add a box",
         }, ["+"]);

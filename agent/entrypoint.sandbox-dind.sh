@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
-# entrypoint.sandbox-dind.sh — Management substrate for a --workflow sandbox-dind project
-# (STAGE_SANDBOX_PROJECT.md).
+# entrypoint.sandbox-dind.sh — substrate for a --workflow sandbox-dind project: the
+# sandbox flavor PLUS inner Docker (DIND) (STAGE_SANDBOX_DIND_AGENT).
 #
-# Agent-less by construction: this image (rs-sandbox-dind) contains no claude, no
-# rs-worker, no mcp-proxy/firewall, no research-supervisor templates. It hosts
-# isolated boxes (via rs-sandbox in the inner dockerd) and the Editor; the PI
-# manages boxes from the non-agent Management tab. Authority-without-agency is
-# enforced by what's NOT in the image, not by a runtime branch.
+# This boots the inner dockerd + the rs-inner bridge, ssh, and (when enabled) the
+# editor. The agent (claude) and the OPT-IN rs-sandbox box harness are NOT baked
+# into this image — they're staged post-start by the host: _stage_agent_dist
+# (deploy_local=True) deploys claude into ~/.local AND populates /opt/agent-dist for
+# any boxes; _stage_rs_sandbox installs /usr/local/bin/rs-sandbox only when the
+# project was created --with-boxes. So this entrypoint has NO agent-cp block — it
+# mirrors the research supervisor, which also relies on the post-start staging.
 #
 # Expected env: PROJECT, SSH_PASSWORD, HOST_GID, DOCKER_DIND, RS_SERVICE_CODE_SERVER.
 
 set -euo pipefail
 
-echo "=== Management substrate starting${PROJECT:+ for project '${PROJECT}'} ==="
+echo "=== Sandbox-dind substrate starting${PROJECT:+ for project '${PROJECT}'} ==="
 
 # --- GID remap so host user (shared GID) can rw bind-mounted files ---
 if [[ -n "${HOST_GID:-}" ]]; then
@@ -28,7 +30,28 @@ fi
 if ! grep -q 'umask 002' ~/.bashrc 2>/dev/null; then
     echo 'umask 002' >> ~/.bashrc
 fi
-echo management > ~/.rs-role
+echo sandbox-dind > ~/.rs-role
+
+# --- Restore Claude creds stashed by a recreate (project update/start) ---
+# The sandbox-dind supervisor now RUNS an agent (STAGE_SANDBOX_DIND_AGENT), so its
+# creds must survive the sysbox recreate dance the same way the research
+# supervisor's do: _recreate_supervisor mv's ~/.claude into the workspace before
+# rm'ing the old container; restore it here (before dockerd / the host's post-start
+# _stage_agent_dist, so a restored settings.json wins the dist's no-clobber install).
+# First create boots un-authed (the PI runs `claude` + /login in the tab); this only
+# fires on a recreate that had creds.
+if [[ -d /workspace/.creds-stash ]]; then
+    sudo rm -rf /home/research/.claude
+    sudo mv /workspace/.creds-stash /home/research/.claude
+    sudo chown -R research:research /home/research/.claude
+    echo "restored Claude creds from /workspace/.creds-stash"
+fi
+if [[ -f /workspace/.creds-stash-home.json ]]; then
+    sudo mv /workspace/.creds-stash-home.json /home/research/.claude.json
+    sudo chown research:research /home/research/.claude.json
+    sudo chmod 600 /home/research/.claude.json
+    echo "restored ~/.claude.json from /workspace/.creds-stash-home.json"
+fi
 
 # --- Workspace: only the orchestrator dir (extensions.json + project.json). No
 #     plan/logbook/workers tree — there are no workers and no supervisor agent.
@@ -81,9 +104,10 @@ if [[ "${RS_SERVICE_CODE_SERVER:-enabled}" == "enabled" ]] \
     bash /opt/editor-dist/tools/code-server-deploy.sh || true
 fi
 
-echo "=== Management ready ==="
+echo "=== Sandbox-dind ready ==="
 echo "Workspace:    /workspace"
-echo "Manage boxes: rs-sandbox   (Management tab, or \`research project attach\`)"
+echo "Agent:        run \`claude\` in this tab (locked egress; inner Docker available)"
+echo "Boxes:        rs-sandbox   (only if created with --with-boxes)"
 
 # tini is PID 1 (ENTRYPOINT) and reaps zombies. sleep infinity keeps PID 1 alive.
 exec sleep infinity

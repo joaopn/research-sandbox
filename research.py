@@ -310,6 +310,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         repo=args.repo, ref=args.ref, setup=args.setup_script,
         github_pat=os.environ.get("RS_GITHUB_PAT") or "",   # never a CLI flag
         agents=args.agents,   # repeatable --agent + --agents a,b both feed this list
+        with_boxes=args.with_boxes,
     )
     try:
         res = rscore.create(req, cfg)
@@ -1967,6 +1968,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "run `research agent pull` first). Repeatable, or a comma "
                         f"list. Known: {', '.join(rscore.KNOWN_AGENTS)}. Default: "
                         "none (clean box). Ignored on non-docker workflows.")
+    c.add_argument("--with-boxes", dest="with_boxes", action="store_true",
+                   help="(sandbox-dind only) stage the rs-sandbox box harness so the "
+                        "user/agent can spin confined sub-boxes. Default off = a plain "
+                        "agent + inner-Docker box. Rejected on other workflows.")
     c.set_defaults(func=cmd_project_create)
 
     a = proj_sub.add_parser("attach", help="docker exec + byobu attach")

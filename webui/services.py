@@ -51,27 +51,8 @@ SERVICES = {
             "bash -c 'cat /workspace/.orchestrator/greeting 2>/dev/null; exec bash'"
         ),
     },
-    # management — the default tab for sandbox-dind projects
-    # (STAGE_SANDBOX_PROJECT.md), REPLACING the Supervisor + Editor tabs.
-    # Authority-without-agency: this surface can create/discard every box and
-    # read their artifacts, so it deliberately runs no agent — a plain login
-    # shell, never `claude`. It prints the `rs-sandbox` cheatsheet on a fresh
-    # byobu session (bare `rs-sandbox` → usage), then drops to bash. The
-    # flavor gate is in `project_services_handler` (server.py): management
-    # shows iff project.json type == "sandbox-dind", and supervisor/code-server are
-    # omitted there. always_on so it surfaces without a port probe.
-    "management": {
-        "label": "Management",
-        "kind": "ssh",
-        "always_on": True,
-        "renderer": "xterm.js",
-        "default_port": 22,
-        "command": (
-            "byobu attach -t main 2>/dev/null || "
-            "byobu new-session -s main -c /workspace -- "
-            "bash -lc 'cat /workspace/.orchestrator/greeting 2>/dev/null; exec bash -l'"
-        ),
-    },
+    # (The agent-less `management` tab was retired in STAGE_SANDBOX_DIND_AGENT —
+    # sandbox-dind now runs an agent and shows the Supervisor tab like research.)
     # pi-wrangler — interactive DB-extraction tab. The tab does NOT auto-start
     # claude (STAGE_SPAWN_GREETING): new-session runs the greet helper, which
     # cats the per-role greeting (the MOTD survives because claude's TUI would

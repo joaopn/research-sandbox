@@ -250,6 +250,19 @@ def workflow_has_worker_layer(manifest: dict) -> bool:
     return manifest.get("image_overlay") != mgmt_overlay
 
 
+def workflow_is_sandbox_dind(manifest: dict) -> bool:
+    """True iff a project created from this workflow is the sandbox-dind flavor
+    (dind-sysbox substrate + the rs-sandbox-dind overlay). Derived from manifest
+    DATA, mirroring _resolve_workflow — never a name lookup. The webui uses this
+    (surfaced via the broker `workflows` verb as `box_capable`) to show the agents +
+    light-path group and the --with-boxes toggle for sandbox-dind, the same way it
+    keys off `has_worker_layer` for the research --enable presets."""
+    if manifest.get("substrate") != Substrate.DIND_SYSBOX.value:
+        return False
+    mgmt_overlay = SANDBOX_DIND_IMAGE.split(":", 1)[0]  # "rs-sandbox-dind"
+    return manifest.get("image_overlay") == mgmt_overlay
+
+
 def _light_clone_basename(repo: str) -> str:
     """Derive the clone-dir basename from a repo URL: the last path segment with
     a trailing '/' and a trailing '.git' stripped (``…/u/foo.git`` → ``foo``).
@@ -367,6 +380,13 @@ class CreateRequest:
     # /workspace/.orchestrator/greeting at create for the management/research
     # flavor; "" ⇒ no file staged.
     greeting: str = ""
+    # Opt-in box harness (STAGE_SANDBOX_DIND_AGENT): when True a sandbox-dind project
+    # stages the rs-sandbox CLI + delivers the box images so the user/agent can spawn
+    # confined boxes. Default off = a plain agent + inner-Docker box. A bool in-box
+    # toggle (not host-shaped) ⇒ relayable; only valid for sandbox-dind (rejected
+    # elsewhere in from_kwargs). Recorded in the project.json marker so
+    # _recreate_supervisor re-stages the harness.
+    with_boxes: bool = False
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "CreateRequest":
@@ -441,6 +461,14 @@ class CreateRequest:
             raise ValidationError(
                 "no cached editor dist — run `research editor pull` first "
                 "(or `research start`, which auto-pulls)")
+        # Opt-in box harness (STAGE_SANDBOX_DIND_AGENT) — only meaningful for the
+        # sandbox-dind flavor (it stages rs-sandbox + the box images). Reject on any
+        # other flavor so a stray flag can't silently no-op.
+        with_boxes = bool(kw.get("with_boxes", False))
+        if with_boxes and project_type is not ProjectType.SANDBOX_DIND:
+            raise ValidationError(
+                "--with-boxes (the rs-sandbox box harness) is only valid for the "
+                "sandbox-dind workflow")
         return cls(
             name=_require_name(kw.get("name")),
             workflow=workflow_id,
@@ -464,6 +492,7 @@ class CreateRequest:
             agents=agents,
             service_defaults=service_defaults,
             greeting=greeting,
+            with_boxes=with_boxes,
         )
 
 
@@ -843,18 +872,22 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     substrate = req.substrate
     is_docker = substrate is Substrate.DOCKER
 
-    # Light-path harness is the docker box's capability (WORKFLOW_TAXONOMY_S4);
-    # an effective repo/setup on a dind/overlay workflow is noted-and-ignored,
-    # mirroring the docker-side note for ignored worker/extension tokens below.
-    if not is_docker and (req.repo or req.setup):
+    # Light-path harness is the docker box's capability (WORKFLOW_TAXONOMY_S4) AND
+    # the sandbox-dind flavor's (STAGE_SANDBOX_DIND_AGENT); on the research/overlay
+    # workflow an effective repo/setup is noted-and-ignored, mirroring the docker-
+    # side note for ignored worker/extension tokens below.
+    if (not is_docker and project_type != PROJECT_TYPE_SANDBOX_DIND
+            and (req.repo or req.setup)):
         print("note: --repo/--setup-script apply only to the light-path docker "
-              "box; ignoring for this workflow", file=sys.stderr)
-    # --agent(s) deploys an agent-dist set into the docker box (STAGE_MULTI_AGENT).
-    # On a dind/overlay workflow the explicit set isn't wired (the dind fleet uses
-    # the DEFAULT_AGENT floor + _stage_agent_dist), so the flag is noted-and-ignored.
-    if not is_docker and req.agents:
+              "box / sandbox-dind; ignoring for this workflow", file=sys.stderr)
+    # --agent(s) deploys an agent-dist set into the docker box (STAGE_MULTI_AGENT);
+    # sandbox-dind shows the same checklist but deploys the DEFAULT_AGENT via
+    # _stage_agent_dist (B1 single-agent). On the research/overlay workflow the
+    # explicit set isn't wired (the fleet uses the floor), so it's noted-and-ignored.
+    if (not is_docker and project_type != PROJECT_TYPE_SANDBOX_DIND
+            and req.agents):
         print(f"note: --agent {','.join(req.agents)} applies only to the docker "
-              "box; ignoring for this workflow", file=sys.stderr)
+              "box / sandbox-dind; ignoring for this workflow", file=sys.stderr)
 
     substrate_image = (
         MINIMAL_IMAGE if is_docker
@@ -938,10 +971,14 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     marker = {"type": project_type, "substrate": substrate.value,
               "workflow": req.workflow, "agents": deployed_agents}
     if project_type == PROJECT_TYPE_SANDBOX_DIND:
-        # Freeze the box-image pins (lane-3): boxes pull these snapshot refs at
-        # create + recreate, so a versions.env bump reaches a project only on a
-        # fresh box-create, never silently on restart.
-        marker["box_image_pins"] = _box_image_pins(load_versions())
+        # Record the opt-in box harness so _recreate_supervisor re-stages rs-sandbox
+        # + re-delivers the box images (STAGE_SANDBOX_DIND_AGENT).
+        marker["with_boxes"] = req.with_boxes
+        if req.with_boxes:
+            # Freeze the box-image pins (lane-3) ONLY when the box harness is on:
+            # boxes pull these snapshot refs at create + recreate, so a versions.env
+            # bump reaches a project only on a fresh box-create, never on restart.
+            marker["box_image_pins"] = _box_image_pins(load_versions())
     (orch_dir / "project.json").write_text(json.dumps(marker, indent=2) + "\n")
     # Starting message (STAGE_SPAWN_GREETING) for the workflow's main shell, read
     # by the Management/Supervisor tab on first byobu new-session. Manifest-
@@ -1072,25 +1109,31 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         wait_for_inner_dockerd(container_name)
         is_management = project_type == PROJECT_TYPE_SANDBOX_DIND
         if is_management:
-            # Box images are registry-delivered (lane-3): push the host images,
-            # connect the registry to this project's network, pull the pinned refs
-            # into the inner store + retag to the :latest rs-sandbox runs. This is
-            # the MINT site (push=True); recreate is pull-only. The pins were just
-            # frozen into project.json (the marker above).
-            _deliver_box_images(container_name, network,
-                                _box_image_pins(load_versions()), push=True)
-            # Sandbox-dind stages the dist (deploy_local=False — the management
-            # supervisor never runs claude itself) so its rs-sandbox-box boxes
-            # (FROM rs-ext-base, no bake) can cp claude at boot.
-            _stage_agent_dist(container_name, deploy_local=False)
-            # Editor dist (STAGE_EDITOR_DIST): same ordering rationale as the agent
-            # dist — staged before the extension enable cone so interactive boxes can
-            # RO-mount /opt/editor-dist. deploy_local=False: the management supervisor
-            # deploys NO editor of its own (it runs no work surface — the boxes do);
-            # staging still runs so each box can RO-mount /opt/editor-dist and deploy
-            # its own editor.
+            # Sandbox-dind is the docker `sandbox` flavor + DIND
+            # (STAGE_SANDBOX_DIND_AGENT): the supervisor RUNS an agent itself and
+            # gets the light-path harness; the rs-sandbox box harness is OPT-IN.
+            # Stage the agent dist into the supervisor's OWN ~/.local
+            # (deploy_local=True) — that staging ALSO populates /opt/agent-dist for
+            # any boxes the harness later spawns.
+            _stage_agent_dist(container_name)
+            # Editor gated on the resolved code-server flag, like research (the
+            # sandbox-dind manifest defaults code-server OFF ⇒ lean box unless
+            # --enable code-server). Staged before any box spawn so a box can
+            # RO-mount /opt/editor-dist.
             if editor_dist_present():
-                _stage_editor_dist(container_name, deploy_local=False)
+                _stage_editor_dist(container_name,
+                                   deploy_local=service_flags.get("code-server", True))
+            # Opt-in box harness (--with-boxes): stage the rs-sandbox CLI (no longer
+            # baked) + deliver the box images (MINT site, push=True; pins were frozen
+            # into the marker above). Skipped by default = a plain agent + DIND box.
+            if req.with_boxes:
+                _stage_rs_sandbox(container_name)
+                _deliver_box_images(container_name, network,
+                                    _box_image_pins(load_versions()), push=True)
+            # Light-path harness: clone repo@ref + run setup on the supervisor
+            # (after inject_route; raises HarnessError on failure, box left standing).
+            clone_dir = _run_light_harness(
+                container_name, req.repo, req.ref, req.setup, req.github_pat, progress)
         else:
             stage_worker_image(container_name, ANALYSIS_IMAGE)
             # Stage the agent dist into the supervisor (its own ~/.local + the
@@ -2446,6 +2489,28 @@ def _stage_agent_dist(supervisor: str, agent: str = DEFAULT_AGENT,
                    f"chown -R 1000:1000 /home/research/.local /home/research/.claude"])
 
 
+def _stage_rs_sandbox(container: str) -> None:
+    """Stage the rs-sandbox box-management CLI into a RUNNING sandbox-dind supervisor
+    at /usr/local/bin/rs-sandbox (STAGE_SANDBOX_DIND_AGENT). It is no longer baked
+    into the image — it's the OPT-IN box harness (--with-boxes), delivered here at
+    create and re-delivered at recreate (the image carries no copy). A single stdlib
+    file: stream it over `docker exec -i` stdin into `cat`, owned root + chmod 755
+    (it lives in /usr/local/bin and is run by the research user) — exactly what the
+    old `COPY … /usr/local/bin/rs-sandbox` bake produced, just at runtime."""
+    src = Path(__file__).resolve().parent / "rs_sandbox.py"
+    if not src.is_file():
+        die(f"rs_sandbox.py not found at {src} — cannot stage the box harness")
+    install = ("cat > /usr/local/bin/rs-sandbox && chmod 755 /usr/local/bin/rs-sandbox")
+    proc = subprocess.Popen(
+        ["docker", "exec", "-i", "-u", "0", container, "sh", "-c", install],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    _, err = proc.communicate(input=src.read_bytes())
+    if proc.returncode != 0:
+        detail = (err.decode(errors="replace") if err else "").strip()
+        die(f"staging rs-sandbox into {container} failed: "
+            f"{detail or 'cat returned non-zero'}")
+
+
 def _agent_resolve_latest(agent: str) -> str:
     """LIGHT in-container fetch of upstream `latest` → a concrete version string
     (no install). Honors the no-host-tool rule (curl runs in rs-minimal-base)."""
@@ -3219,28 +3284,30 @@ def _recreate_supervisor(
         capture_output=True)
     # Sandbox flavor stages the blank box image (no analysis workers); see
     # cmd_project_create's matching branch.
-    if md.get("project_type") == PROJECT_TYPE_SANDBOX_DIND:
-        # Box images: registry-delivered (lane-3). Read the FROZEN pins from
-        # project.json and PULL them (RF1 — never re-push at recreate: the registry
-        # already holds the frozen pin from create, and re-pushing would die() if a
-        # versions.env bump left the host without the old tag). A pre-migration
-        # project has no pins → greenfield backfill (adopt current pins, push,
-        # connect, pull, backfill project.json) — recreate is the only host hook for
-        # boxes (no enable path). force_restage is moot: sysbox's inner store is
-        # fresh, so the pull always fetches.
-        _box_pins = _read_box_pins(workspace_path)
-        if _box_pins:
-            _deliver_box_images(container, network, _box_pins, push=False)
-        else:
-            _box_pins = _box_image_pins(load_versions())
-            _deliver_box_images(container, network, _box_pins, push=True)
-            _write_box_pins(workspace_path, _box_pins)
-        # Sandbox-dind: re-stage the dist for the boxes (deploy_local=False).
-        _stage_agent_dist(container, deploy_local=False)
-        # Editor dist re-staged for the boxes to RO-mount; deploy_local=False — the
-        # management supervisor re-deploys NO editor of its own (the boxes do).
+    if md_ptype == PROJECT_TYPE_SANDBOX_DIND:
+        # Sandbox-dind supervisor RUNS an agent (STAGE_SANDBOX_DIND_AGENT): re-stage
+        # the dist into its OWN ~/.local (deploy_local=True; that staging also
+        # populates /opt/agent-dist for any boxes), editor gated like research. No
+        # bake, so a recreate must redeploy. Before the role-MCP relaunch below.
+        _stage_agent_dist(container)
         if editor_dist_present():
-            _stage_editor_dist(container, deploy_local=False)
+            _stage_editor_dist(container, deploy_local=flags.get("code-server", True))
+        # Box harness is OPT-IN: re-stage rs-sandbox (no bake) + re-deliver the box
+        # images ONLY when this project enabled --with-boxes (the marker flag).
+        if _read_with_boxes(workspace_path):
+            _stage_rs_sandbox(container)
+            # Box images: read FROZEN pins + PULL (RF1 — never re-push at recreate:
+            # the registry already holds the frozen pin from create, and re-pushing
+            # would die() if a versions.env bump left the host without the old tag).
+            # A pre-flag/pre-migration with-boxes project has no pins → greenfield
+            # backfill (adopt current pins, push, pull, backfill project.json).
+            _box_pins = _read_box_pins(workspace_path)
+            if _box_pins:
+                _deliver_box_images(container, network, _box_pins, push=False)
+            else:
+                _box_pins = _box_image_pins(load_versions())
+                _deliver_box_images(container, network, _box_pins, push=True)
+                _write_box_pins(workspace_path, _box_pins)
     else:
         stage_worker_image(container, ANALYSIS_IMAGE, force=force_restage)
         # Re-stage the agent dist into the fresh container (its own ~/.local + the
@@ -3698,6 +3765,18 @@ def _read_box_pins(workspace_path: "Path") -> dict[str, str]:
         return {}
     pins = data.get("box_image_pins")
     return pins if isinstance(pins, dict) else {}
+
+
+def _read_with_boxes(workspace_path: "Path") -> bool:
+    """The opt-in box-harness flag from .orchestrator/project.json
+    (STAGE_SANDBOX_DIND_AGENT), or False for a pre-flag project. Read at recreate
+    so a box-harness project re-stages rs-sandbox + re-delivers the box images."""
+    f = workspace_path / ".orchestrator" / "project.json"
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool(data.get("with_boxes", False))
 
 
 def _write_box_pins(workspace_path: "Path", box_pins: dict[str, str]) -> None:

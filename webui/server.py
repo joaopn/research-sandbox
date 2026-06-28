@@ -918,10 +918,10 @@ async def project_services_handler(request: web.Request) -> web.Response:
         ])
         probe_up = {sid: up for (sid, _), up in zip(probe_jobs, results)}
 
-    # Project flavor (STAGE_SANDBOX_PROJECT.md). "sandbox" projects swap the
-    # agentic Supervisor + Editor tabs for the non-agent Management tab; their
-    # box tabs come from kind="sandbox" extensions.json entries. Read off the same
-    # /projects:ro bind-mount as everything else here.
+    # Project flavor. A sandbox-dind project shows the Supervisor (agent) tab like
+    # research (STAGE_SANDBOX_DIND_AGENT); its box tabs come from kind="sandbox"
+    # extensions.json entries when the rs-sandbox harness is enabled (--with-boxes).
+    # Read off the same /projects:ro bind-mount as everything else here.
     is_sandbox = _read_project_type(project) == "sandbox-dind"
     # A bare docker box (substrate=docker) has no claude-supervisor — its
     # "Supervisor" tab is really a plain login shell (ssh+byobu bash on the
@@ -933,17 +933,20 @@ async def project_services_handler(request: web.Request) -> web.Response:
     out: dict[str, dict] = {}
     sandbox_map: dict[str, str] | None = None
     for sid, svc in services.SERVICES.items():
-        # Flavor gate: Management only in sandbox projects; the Supervisor
-        # (claude agent) tab only in research projects. The Editor (code-server)
-        # tab is port-probed below — the sandbox-dind management host deploys no
-        # editor of its own, so its probe fails and the host Editor tab auto-omits;
-        # each box still exposes its own editor via its synthesized pi-iso ssh tab.
-        if sid == "management" and not is_sandbox:
-            continue
-        if sid == "supervisor" and is_sandbox:
-            continue
+        # Flavor gate (STAGE_SANDBOX_DIND_AGENT): sandbox-dind now runs an agent, so
+        # it shows the Supervisor tab like research — the agent-less Management tab is
+        # retired. The Editor (code-server) tab is port-probed below; sandbox-dind
+        # defaults the editor OFF (lean), so its probe fails and the Editor tab
+        # auto-omits unless --enable code-server.
         if sid == "supervisor" and is_docker:
             out[sid] = {**svc, "label": "Shell"}   # honest label for a bare box
+            continue
+        if sid == "supervisor" and is_sandbox:
+            # Stamp box_harness so the SPA shows the box +/✕ controls iff this
+            # project enabled the rs-sandbox harness (--with-boxes). Copy the spec —
+            # never mutate the shared SERVICES dict.
+            out[sid] = {**svc,
+                        "box_harness": bool(_read_project_marker(project).get("with_boxes"))}
             continue
         if svc.get("always_on"):
             out[sid] = svc

@@ -2,6 +2,7 @@
   "name": "sandbox-dind",
   "substrate": "dind-sysbox",
   "image_overlay": "rs-sandbox-dind",
-  "description": "Agent-less docker-in-docker host: a Management shell that spins isolated boxes via rs-sandbox.",
-  "greeting": "Sandbox-dind — agent-less docker-in-docker host.\n\nThis Management shell runs NO agent: it has the authority to create, discard,\nand inspect isolated boxes, but never runs an LLM itself. Boxes are clean,\nlocked-egress containers for running untrusted code (e.g. security-checking a\nrepo before you clone it into a real project).\n\nManage boxes with the `rs-sandbox` CLI:\n  rs-sandbox            show usage\n  rs-sandbox create     spin a new box (--browser for a Playwright box)\n  rs-sandbox list       list boxes and their state\n  rs-sandbox discard    tear a box down\n\nThe Editor tab is your artifact-management surface for box outputs.\n"
+  "services": {"code-server": false},
+  "description": "A confined agent box with inner Docker (DIND): the sandbox flavor plus a nested Docker daemon. Opt into the rs-sandbox box harness to spin isolated sub-boxes.",
+  "greeting": "Sandbox-dind — a confined agent box with inner Docker.\n\nThis is the sandbox flavor plus a nested Docker daemon (DIND): run `claude` here\n(bypassPermissions, locked egress) and use the inner `docker` for builds, tests,\nor running untrusted images.\n\nIf this project was created with the box harness (--with-boxes), manage isolated\nsub-boxes with the `rs-sandbox` CLI:\n  rs-sandbox            show usage\n  rs-sandbox create     spin a new box (--browser for a Playwright box)\n  rs-sandbox list       list boxes and their state\n  rs-sandbox discard    tear a box down\n"
 }

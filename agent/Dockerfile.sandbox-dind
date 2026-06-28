@@ -1,22 +1,22 @@
 FROM rs-substrate-base:latest
 
-# rs-sandbox-dind — the agent-less substrate for a `--workflow sandbox-dind` project
-# (STAGE_SANDBOX_PROJECT.md). The Management leaf on top of rs-substrate-base:
-# it adds ONLY rs-sandbox (the box-lifecycle CLI) and a lean entrypoint.
+# rs-sandbox-dind — the substrate for a `--workflow sandbox-dind` project: the
+# sandbox flavor PLUS inner Docker (DIND), the leaf on top of rs-substrate-base
+# (STAGE_SANDBOX_DIND_AGENT).
 #
-# Crucially it does NOT install claude, rs-worker, rs-pi, the mcp-proxy tooling,
-# or the supervisor CLAUDE.md/setup templates — none of that exists in this
-# image. That is the authority-without-agency invariant enforced by Docker
-# layering rather than a runtime guard: the surface with authority over every
-# box (the Management shell + the Editor's terminal) physically cannot run an
-# agent because no agent is installed.
+# The agent (claude) is dist-delivered at boot (cp from the host-staged
+# /opt/agent-dist into ~/.local) — NOT baked. The rs-sandbox box-management CLI is
+# likewise NOT baked: it is the OPT-IN box harness (--with-boxes), staged into
+# /usr/local/bin at create by _stage_rs_sandbox. So this image carries only the
+# substrate + entrypoint; what runs inside (agent, box harness) is delivered
+# per-project.
 
-# rs-sandbox is the single owner of sandbox-box lifecycle (create/discard/
-# stop/start/list), driven by a human in the non-agent Management tab.
-COPY cli/rs_sandbox.py /usr/local/bin/rs-sandbox
-RUN chmod +x /usr/local/bin/rs-sandbox
+# Keep ~/.local/bin (where the dist-deployed agent launcher lands) on PATH,
+# captured into the skel below so the restored home + every login shell sees it.
+# rs-substrate-base / rs-minimal-base don't export it (mirrors Dockerfile.supervisor).
+RUN su - research -c 'echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.bashrc'
 
-# Snapshot the home (byobu from the base, NO claude) for first-boot restore.
+# Snapshot the home (byobu from the base + the PATH export) for first-boot restore.
 RUN cp -a /home/research /etc/research-skel
 
 COPY agent/entrypoint.sandbox-dind.sh /entrypoint.sh
