@@ -278,11 +278,17 @@ def cmd_discard(args: argparse.Namespace) -> None:
     entries = load()
     _box_entry(entries, args.name)
     _docker("rm", "-f", box_container(args.name))
-    # Full teardown — a box is disposable: drop the entry AND wipe its workspace.
+    # Drop the entry (box is gone either way). --keep-workspace leaves the
+    # box's artifacts on disk under pi-isolated/<name>/ for later retrieval;
+    # the default is full teardown — a box is disposable.
     del entries[args.name]
     save(entries)
-    shutil.rmtree(WORKSPACE / f"pi-isolated/{args.name}", ignore_errors=True)
-    print(f"box {args.name!r}: discarded")
+    if args.keep_workspace:
+        print(f"box {args.name!r}: discarded (workspace preserved at "
+              f"pi-isolated/{args.name}/)")
+    else:
+        shutil.rmtree(WORKSPACE / f"pi-isolated/{args.name}", ignore_errors=True)
+        print(f"box {args.name!r}: discarded")
 
 
 def cmd_list(args: argparse.Namespace) -> None:
@@ -351,6 +357,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     d = sub.add_parser("discard", help="stop a box and wipe its workspace")
     d.add_argument("name")
+    d.add_argument("--keep-workspace", action="store_true",
+                   help="remove the box but leave its workspace artifacts on disk")
     d.set_defaults(func=cmd_discard)
 
     rt = sub.add_parser("restart", help="re-run a box from its saved entry")

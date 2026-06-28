@@ -588,6 +588,8 @@ async def broker_box_remove_handler(request: web.Request) -> web.Response:
     pw = req_body.get("password") if isinstance(req_body, dict) else None
     if isinstance(pw, str):
         args["password"] = pw
+    if isinstance(req_body, dict):
+        args["keep_workspace"] = bool(req_body.get("keep_workspace"))
     return await _start_op(request, "box_remove", args, BROKER_OP_TIMEOUT_S,
                            op_seed=project)
 

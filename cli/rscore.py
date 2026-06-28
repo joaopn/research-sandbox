@@ -646,11 +646,13 @@ class BoxAddRequest:
 
 @dataclass(frozen=True)
 class BoxRemoveRequest:
-    """Discard a sandbox box (wipes its workspace). Name-only besides the
-    project; the step-up password is verified + consumed in broker dispatch and
-    never reaches here (mirrors DestroyRequest)."""
+    """Discard a sandbox box. Wipes its workspace unless ``keep_workspace`` is
+    set (then the box is removed but its artifacts stay on disk). The step-up
+    password is verified + consumed in broker dispatch and never reaches here
+    (mirrors DestroyRequest)."""
     project: str
     name: str
+    keep_workspace: bool = False
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "BoxRemoveRequest":
@@ -659,7 +661,8 @@ class BoxRemoveRequest:
             raise ValidationError(
                 "box name must be lowercase, start with a letter, and contain "
                 "only letters, digits, or '-'")
-        return cls(project=_require_name(kw.get("project")), name=name)
+        return cls(project=_require_name(kw.get("project")), name=name,
+                   keep_workspace=bool(kw.get("keep_workspace")))
 
 
 @dataclass(frozen=True)
@@ -5064,9 +5067,12 @@ def box_remove(req: "BoxRemoveRequest", progress=None) -> BoxRemoveResult:  # ty
     progress = progress or _NULL_PROGRESS
     progress.step("validate", "checking the project")
     container = _running_sandbox_dind_supervisor(req.project)
-    progress.step("discard", "discarding the box")
-    r = run(["docker", "exec", container, "rs-sandbox", "discard", req.name],
-            capture_output=True)
+    progress.step("discard", "discarding the box"
+                  + (" (keeping artifacts)" if req.keep_workspace else ""))
+    cmd = ["docker", "exec", container, "rs-sandbox", "discard", req.name]
+    if req.keep_workspace:
+        cmd.append("--keep-workspace")
+    r = run(cmd, capture_output=True)
     if r.returncode != 0:
         die(f"failed to remove box {req.name!r}: {(r.stderr or r.stdout).strip()}")
     return BoxRemoveResult(project=req.project, name=req.name)

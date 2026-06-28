@@ -354,6 +354,10 @@ def _verb_destroy(args: dict, progress=None) -> dict:
 # forwarded to rscore.
 BOX_ADD_WEBUI_FIELDS = frozenset({"project", "name", "browser", "agent"})
 BOX_TARGET_WEBUI_FIELDS = frozenset({"project", "name"})
+# box_remove additionally accepts keep_workspace (a bool, not host-shaped): when
+# set the box is removed but its artifacts stay on disk. The step-up `password`
+# stays OUT of the set (verified + consumed in dispatch, never forwarded).
+BOX_REMOVE_WEBUI_FIELDS = BOX_TARGET_WEBUI_FIELDS | {"keep_workspace"}
 
 
 def _verb_box_add(args: dict, progress=None) -> dict:
@@ -363,7 +367,7 @@ def _verb_box_add(args: dict, progress=None) -> dict:
 
 
 def _verb_box_remove(args: dict, progress=None) -> dict:
-    safe = {k: v for k, v in args.items() if k in BOX_TARGET_WEBUI_FIELDS}
+    safe = {k: v for k, v in args.items() if k in BOX_REMOVE_WEBUI_FIELDS}
     req = rscore.BoxRemoveRequest.from_kwargs(**safe)  # may raise ValidationError
     return dataclasses.asdict(rscore.box_remove(req, progress=progress))
 

@@ -558,6 +558,37 @@ body {
 }
 .service-tabs .tab .pin-tab-btn:hover { color: var(--fg-base); }
 .service-tabs .tab.pinned .pin-tab-btn { color: var(--fg-accent); }
+/* Per-box ✕ on a sandbox-dind box tab (pi-iso-*). Mirrors the pin button's
+   ghost-icon styling; reddens on hover to read as a destructive control. */
+.service-tabs .tab .close-tab-btn {
+    background: transparent;
+    border: none;
+    color: var(--fg-faint);
+    cursor: pointer;
+    padding: 0 2px;
+    margin-left: 2px;
+    font-size: 12px;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+}
+.service-tabs .tab .close-tab-btn:hover { color: var(--status-down); }
+/* + Add box: a strip-level control (not a tab) trailing the box tabs on a
+   sandbox-dind project. Same height/padding rhythm as a tab. */
+.service-tabs .add-box-tab-btn {
+    background: transparent;
+    border: none;
+    border-right: 1px solid var(--border);
+    color: var(--fg-faint);
+    cursor: pointer;
+    padding: 0 14px;
+    font-size: 16px;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+}
+.service-tabs .add-box-tab-btn:hover { background: var(--border); color: var(--fg-base); }
 .service-tabs .tab.pinned {
     box-shadow: 0 -2px 0 var(--fg-accent) inset, inset 0 0 0 9999px rgba(127, 127, 127, 0.05);
 }

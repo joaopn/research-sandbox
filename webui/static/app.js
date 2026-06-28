@@ -1333,7 +1333,12 @@ function mgmtConfirmThenTail(view, cfg) {
 // only on the docker substrate. github_pat is a SECRET: never preset, never
 // logged/persisted browser-side (built in the request closure and POSTed once).
 
-const MGMT_ENABLE_PRESETS = ["websearcher", "wrangler", "echo"];
+const MGMT_ENABLE_PRESETS = ["websearcher", "wrangler"];
+
+// Extension types we don't surface in the webui enable dialog (dev/test
+// fixtures that stay reachable via the CLI). echo (pi-echo) is the P.0
+// substrate test fixture.
+const WEBUI_HIDDEN_EXTENSIONS = new Set(["echo"]);
 
 function mgmtCreateDialog(view, manifest, agents) {
     manifest = manifest || {};
@@ -1786,6 +1791,19 @@ function mgmtBoxAddDialog(project) {
 
 function mgmtBoxRemoveDialog(project, box) {
     const pwI = el("input", { type: "password", autocomplete: "current-password" });
+    const keepCb = el("input", { type: "checkbox" });
+    const warn = el("p", {}, [
+        `This discards box "${box}" in "${project}" — its container and ` +
+        "workspace are wiped. This cannot be undone.",
+    ]);
+    // Toggle the warning copy: preserving artifacts is recoverable, wiping is not.
+    keepCb.onchange = () => {
+        warn.textContent = keepCb.checked
+            ? `This removes box "${box}" in "${project}" — its container is torn ` +
+              "down but its workspace artifacts stay on disk."
+            : `This discards box "${box}" in "${project}" — its container and ` +
+              "workspace are wiped. This cannot be undone.";
+    };
     mgmtConfirmThenTail(boxOpView(), {
         title: `Remove box "${box}"`,
         tailTitle: `Removing ${box}`,
@@ -1793,9 +1811,9 @@ function mgmtBoxRemoveDialog(project, box) {
         confirmLabel: "Remove",
         danger: true,
         body: [
-            el("p", {}, [
-                `This discards box "${box}" in "${project}" — its container and ` +
-                "workspace are wiped. This cannot be undone.",
+            warn,
+            el("label", { class: "mgmt-check" }, [
+                keepCb, " preserve artifacts (keep workspace files on disk)",
             ]),
             el("div", { class: "field" }, [
                 el("label", {}, ["Re-enter management password"]), pwI,
@@ -1808,7 +1826,10 @@ function mgmtBoxRemoveDialog(project, box) {
             `/broker/project/${encodeURIComponent(project)}/box/${encodeURIComponent(box)}/remove`,
             {
                 method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ password: pwI.value }),
+                body: JSON.stringify({
+                    password: pwI.value,
+                    keep_workspace: keepCb.checked,
+                }),
             }),
         onDone: async (ok) => { if (ok) await refreshAfterBoxChange(project); },
         focus: () => pwI.focus(),
@@ -2592,7 +2613,6 @@ function makeProjectConfigBox(project) {
             "No tabs yet — open this project once to load its services.",
         ]));
         box.appendChild(section);
-        appendBoxesSection(box, project.name);
         appendExtensionsSection(box, project.name);
         return box;
     }
@@ -2631,56 +2651,8 @@ function makeProjectConfigBox(project) {
     box.appendChild(el("div", { class: "config-hint" }, [
         "Hidden tabs stay enabled on the supervisor — this only controls what shows here.",
     ]));
-    appendBoxesSection(box, project.name);
     appendExtensionsSection(box, project.name);
     return box;
-}
-
-// Sandbox-box management (config box → "Boxes" section). The section is
-// flavor-gated by the SERVER: it loads boxes via the broker box_list verb, which
-// die()s for a non-sandbox-dind project (or when logged out / the project is
-// stopped) → a non-ok reply → the section removes itself. So a research project's
-// config box shows no Boxes section, with no client-side flavor check needed.
-function appendBoxesSection(box, projectName) {
-    const section = el("div", { class: "config-section" });
-    section.appendChild(el("div", { class: "config-section-label" }, ["Boxes"]));
-    const bodyEl = el("div", { class: "config-boxes" }, [
-        el("div", { class: "config-empty" }, ["Loading boxes…"]),
-    ]);
-    section.appendChild(bodyEl);
-    box.appendChild(section);
-    loadBoxesInto(bodyEl, section, projectName);
-}
-
-async function loadBoxesInto(bodyEl, section, projectName) {
-    let res;
-    try {
-        res = await fetch(`/broker/project/${encodeURIComponent(projectName)}/boxes`);
-    } catch (e) { section.remove(); return; }            // broker unreachable
-    let body; try { body = await res.json(); } catch (e) { section.remove(); return; }
-    if (!res.ok || !body.ok || !body.result) { section.remove(); return; }  // not sandbox-dind / stopped / logged out
-    const boxes = body.result.boxes || [];
-    bodyEl.innerHTML = "";
-    if (boxes.length === 0) {
-        bodyEl.appendChild(el("div", { class: "config-empty" }, ["No boxes yet."]));
-    }
-    for (const b of boxes) {
-        const meta = [];
-        if (b.agent && b.agent !== "none") meta.push(b.agent);
-        if (b.browser) meta.push("browser");
-        if (b.state) meta.push(b.state);
-        const x = el("button", { class: "btn btn-secondary", title: "Remove box" }, ["✕"]);
-        x.onclick = () => mgmtBoxRemoveDialog(projectName, b.name);
-        bodyEl.appendChild(el("div", { class: "config-box-row" }, [
-            el("span", { class: "config-box-name" }, [b.name]),
-            el("span", { class: "config-box-meta" },
-               [meta.length ? meta.join(" · ") : ""]),
-            x,
-        ]));
-    }
-    const add = el("button", { class: "btn" }, ["+ Add box"]);
-    add.onclick = () => mgmtBoxAddDialog(projectName);
-    bodyEl.appendChild(add);
 }
 
 // Extension management (config box → "Extensions" section). Server-flavor-gated
@@ -2729,9 +2701,10 @@ async function loadExtensionsInto(bodyEl, section, projectName) {
             x,
         ]));
     }
-    // Enableable = catalog types not already enabled. Only offer "+ Enable" when
-    // there's something to enable.
-    const enableable = catalog.map((c) => c.name).filter((n) => !enabledNames.has(n));
+    // Enableable = catalog types not already enabled, minus the webui-hidden
+    // fixtures. Only offer "+ Enable" when there's something to enable.
+    const enableable = catalog.map((c) => c.name)
+        .filter((n) => !enabledNames.has(n) && !WEBUI_HIDDEN_EXTENSIONS.has(n));
     if (enableable.length) {
         const add = el("button", { class: "btn" }, ["+ Enable extension"]);
         add.onclick = () => mgmtExtEnableDialog(projectName, enableable, allowed);
@@ -2820,6 +2793,11 @@ function renderServiceTabs(projectName, enabled) {
     // the editor is the primary work surface. A thin vertical rule separates
     // the groups, omitted when either is empty so a CLI-only project (e.g. a
     // bare docker box with no live editor) shows no orphan divider.
+    // Sandbox-dind projects carry a server-gated `management` tab; only there are
+    // pi-iso-* tabs disposable BOXES (in a research project they're BYO extensions,
+    // managed via the Extensions config section). So the per-tab box ✕ and the
+    // strip-level + Add box control appear iff management is present.
+    const isSandboxDind = !!enabled["management"];
     const visual = [], cli = [];
     for (const id of ids) {
         (surfaceOf(id, enabled[id]) === "visual" ? visual : cli).push(id);
@@ -2832,17 +2810,40 @@ function renderServiceTabs(projectName, enabled) {
             title: isPinned ? "Unpin from side" : "Pin to side",
         }, ["⇥"]);
         pinBtn.onclick = (ev) => { ev.stopPropagation(); togglePin(id); };
+        const kids = [iconSvg(iconOf(id, svc)), el("span", {}, [svc.label || id]), pinBtn];
+        // Box tabs (sandbox-dind only) carry a ✕ that discards the box in place —
+        // box deletion lives on the tab, not in a sidebar settings panel.
+        if (isSandboxDind && id.startsWith("pi-iso-")) {
+            const boxName = id.slice("pi-iso-".length);
+            const closeBtn = el("button", {
+                class: "close-tab-btn", title: `Remove box "${boxName}"`,
+            }, ["✕"]);
+            closeBtn.onclick = (ev) => {
+                ev.stopPropagation();
+                mgmtBoxRemoveDialog(projectName, boxName);
+            };
+            kids.push(closeBtn);
+        }
         return el("div", {
             class: isPinned ? "tab pinned" : "tab",
             "data-service": id,
             onclick: () => activateService(id),
-        }, [iconSvg(iconOf(id, svc)), el("span", {}, [svc.label || id]), pinBtn]);
+        }, kids);
     };
     for (const id of visual) strip.appendChild(makeTab(id));
     if (visual.length > 0 && cli.length > 0) {
         strip.appendChild(el("div", { class: "tab-group-divider" }));
     }
     for (const id of cli) strip.appendChild(makeTab(id));
+    // + Add box lives on the strip for sandbox-dind projects — boxes are the
+    // project's primary surface, so they're created where they appear.
+    if (isSandboxDind) {
+        const addBox = el("button", {
+            class: "add-box-tab-btn", title: "Add a box",
+        }, ["+"]);
+        addBox.onclick = () => mgmtBoxAddDialog(projectName);
+        strip.appendChild(addBox);
+    }
 }
 
 function activateService(serviceId) {
