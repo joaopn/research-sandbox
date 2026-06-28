@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 380" role="img" aria-label="Boxes orchestration">
+  <style>
+    .explain-doc svg .node rect { fill: #1f2933; stroke: #5b8def; stroke-width: 1.5; }
+    .explain-doc svg .node text { fill: #e6edf3; font: 13px sans-serif; text-anchor: middle; dominant-baseline: middle; }
+    .explain-doc svg .node .sub { fill: #9aa7b4; font: 11px sans-serif; }
+    .explain-doc svg .node:hover rect { fill: #2b3a4a; stroke: #8ab4ff; }
+    .explain-doc svg .edge { stroke: #7a8794; stroke-width: 1.5; fill: none; marker-end: url(#rs-arrow); }
+    .explain-doc svg .edge-label { fill: #9aa7b4; font: 11px sans-serif; text-anchor: middle; }
+    .explain-doc svg a { cursor: pointer; }
+  </style>
+  <defs>
+    <marker id="rs-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#7a8794"/>
+    </marker>
+  </defs>
+
+  <line class="edge" x1="200" y1="62"  x2="200" y2="96"/>
+  <line class="edge" x1="200" y1="166" x2="200" y2="206"/>
+  <line class="edge" x1="200" y1="276" x2="200" y2="316"/>
+  <text class="edge-label" x="200" y="296">selected MCPs</text>
+
+  <a href="#what-it-is">
+    <g class="node"><title>You — open + Add box on a dind project's tab strip and pick a type.</title>
+      <rect x="120" y="22" width="160" height="40" rx="8"/>
+      <text x="200" y="42">Researcher</text></g>
+  </a>
+  <a href="#box-types">
+    <g class="node"><title>Pick a box type (empty / websearcher / data-wrangler / byo) + toggles (agent, editor, MCPs).</title>
+      <rect x="96" y="96" width="208" height="70" rx="8"/>
+      <text x="200" y="122">+ Add box</text>
+      <text class="sub" x="200" y="144">type + agent / editor / MCP toggles</text></g>
+  </a>
+  <a href="#toggles">
+    <g class="node"><title>A container in the project's inner Docker daemon on rs-inner. Credential-free — run claude + /login inside.</title>
+      <rect x="110" y="206" width="180" height="70" rx="8"/>
+      <text x="200" y="232">Box (rs-inner)</text>
+      <text class="sub" x="200" y="254">credential-free; /login inside</text></g>
+  </a>
+  <a href="#how-it-works">
+    <g class="node"><title>The inner MCP proxy — the box's agent reaches the project's allowed MCPs by name through mcp-proxy:8888.</title>
+      <rect x="120" y="316" width="160" height="44" rx="8"/>
+      <text x="200" y="338">mcp-proxy</text></g>
+  </a>
+</svg>

@@ -726,6 +726,15 @@ class BoxListRequest:
         return cls(project=_require_name(kw.get("project")))
 
 
+@dataclass(frozen=True)
+class BoxPresetsRequest:
+    project: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "BoxPresetsRequest":
+        return cls(project=_require_name(kw.get("project")))
+
+
 @dataclass
 class BoxAddResult:
     project: str
@@ -750,6 +759,16 @@ class BoxListResult:
     any row — safe to serialise straight into the broker reply."""
     project: str
     boxes: list[dict]                       # {name, ip, agent, browser, state}
+
+
+@dataclass
+class BoxPresetsResult:
+    """The box-preset catalog (built-ins + operator registry) + the project's
+    allowed MCP names — drives the webui box window's preset cards + MCP picker.
+    No credentials; safe to serialise straight into the broker reply."""
+    project: str
+    presets: list[dict]                     # {name,image,agent_default,clone,description,source}
+    allowed_mcps: list[str]
 
 
 @dataclass(frozen=True)
@@ -5338,6 +5357,31 @@ def box_list(req: "BoxListRequest", _progress=None) -> BoxListResult:  # type: i
              for e in rows
              if isinstance(e, dict) and e.get("kind") == extension.SANDBOX_KIND]
     return BoxListResult(project=req.project, boxes=boxes)
+
+
+def box_presets(req: "BoxPresetsRequest", _progress=None) -> BoxPresetsResult:  # type: ignore[name-defined]
+    """The box-preset catalog (built-ins + the operator box-registry) + the
+    project's allowed MCP names — drives the webui box window (preset cards + MCP
+    picker), the sibling of ext_list for the box lane. Gated on a running dind
+    supervisor (boxes are a dind feature). `box_catalog.load_catalog()` can raise
+    `BoxCatalogError` on a malformed box-registry.json (unlike `extension.catalog`'s
+    tolerant baked-only fallback) — map it to ValidationError so it can't escape
+    `dispatch` (the verb-fn-raise rule)."""
+    _running_dind_supervisor(req.project)
+    cfg = load_config()
+    try:
+        catalog = box_catalog.load_catalog()
+    except box_catalog.BoxCatalogError as e:
+        raise ValidationError(str(e))
+    presets = [{"name": e["name"], "image": e.get("image"),
+                "agent_default": bool(e.get("agent_default")),
+                "clone": bool(e.get("clone")),
+                "description": e.get("description") or "",
+                "source": e.get("source")}
+               for e in catalog]
+    allowed = sorted(x["name"] for x in load_project_allowlist(req.project, cfg)
+                     if x.get("name"))
+    return BoxPresetsResult(project=req.project, presets=presets, allowed_mcps=allowed)
 
 
 def ext_enable(req: "ExtEnableRequest", progress=None) -> ExtEnableResult:  # type: ignore[name-defined]

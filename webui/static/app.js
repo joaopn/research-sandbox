@@ -1761,45 +1761,153 @@ async function refreshAfterBoxChange(project) {
     }
 }
 
-function mgmtBoxAddDialog(project) {
+// The box window (STAGE_BOX_EXT_UX Slice B). Fetches the box-preset catalog +
+// the project's allowed MCPs FIRST (operator-extensible presets + the MCP picker
+// need a read path — the box_presets verb), then opens a New-Project-style modal
+// with preset radio-cards + agent/editor/MCP toggles + BYO clone fields + an
+// Explain button. A non-ok / unreachable read surfaces the error and does NOT
+// open the window — a box can't be added on a stopped/non-dind supervisor anyway,
+// and a malformed box-registry ValidationError must be shown, not swallowed.
+async function mgmtBoxAddDialog(project) {
+    let presets, allowed;
+    try {
+        const res = await fetch(`/broker/project/${encodeURIComponent(project)}/box-presets`);
+        let body; try { body = await res.json(); } catch (e) { body = {}; }
+        if (!res.ok || !body.ok || !body.result) {
+            alert("Can't add a box: " + (mgmtErrText(body)
+                || "the project must be a running dind project."));
+            return;
+        }
+        presets = body.result.presets || [];
+        allowed = body.result.allowed_mcps || [];
+    } catch (e) {
+        alert("Can't add a box: broker unreachable.");
+        return;
+    }
+    if (!presets.length) { alert("No box presets available for this project."); return; }
+
     const nameI = el("input", { type: "text", autocomplete: "off",
                                 placeholder: "auto (box-N)" });
+
+    // Preset radio-cards — selecting one drives the agent-default hint + the BYO
+    // group's visibility.
+    let selectedPreset = presets[0];
+    const cards = presets.map((p) => {
+        const radio = el("input", { type: "radio", name: "box-preset", value: p.name });
+        if (p === presets[0]) radio.checked = true;
+        radio.onchange = () => { if (radio.checked) { selectedPreset = p; applyPreset(); } };
+        return el("label", { class: "box-preset-card" }, [
+            radio,
+            el("span", { class: "box-preset-body" }, [
+                el("span", { class: "box-preset-name" }, [p.name]),
+                el("span", { class: "box-preset-desc" }, [p.description || ""]),
+            ]),
+        ]);
+    });
+
+    // Agent: a "(preset default)" sentinel that OMITS agent from the payload so
+    // rs-sandbox applies the preset default (don't replicate that + the MCP
+    // coupling client-side — see Slice A's agent=None contract).
+    const agentDefaultOpt = el("option", { value: "" }, ["(preset default)"]);
     const agentS = el("select", {}, [
+        agentDefaultOpt,
         el("option", { value: "none" }, ["none (blank box)"]),
         el("option", { value: "claude" }, ["claude"]),
     ]);
-    const browserCb = el("input", { type: "checkbox" });
+    const editorCb = el("input", { type: "checkbox" });   // box-level toggle, default off
+
+    // MCP picker over the project's allowed MCPs. Checking ≥1 forces the agent on
+    // (nothing else reaches an MCP) — reflect the backend coupling by forcing +
+    // disabling the agent select.
+    const mcpBoxes = allowed.map((m) => {
+        const cb = el("input", { type: "checkbox" });
+        cb.onchange = applyMcpCoupling;
+        return { name: m, cb };
+    });
+    const mcpList = el("div", { class: "config-mcp-picker" },
+        mcpBoxes.length
+            ? mcpBoxes.map((b) => el("label", { class: "mgmt-check" }, [b.cb, " " + b.name]))
+            : [el("div", { class: "config-empty" }, ["No MCPs allowed for this project yet."])]);
+
+    // BYO clone fields — shown only for a clone preset.
+    const repoI = el("input", { type: "text", autocomplete: "off",
+                                placeholder: "https://github.com/user/repo.git" });
+    const refI = el("input", { type: "text", autocomplete: "off",
+                               placeholder: "branch / tag / commit" });
+    const setupT = el("textarea", { rows: "2", autocomplete: "off",
+                                    placeholder: "setup command run inside the box" });
+    const byoGroup = el("div", { class: "mgmt-docker-group" }, [
+        el("div", { class: "field" }, [el("label", {}, ["Repo (https)"]), repoI]),
+        el("div", { class: "field" }, [el("label", {}, ["Ref"]), refI]),
+        el("div", { class: "field" }, [el("label", {}, ["Setup"]), setupT]),
+        el("div", { class: "hint" }, ["Cloned + setup-run inside the box at boot."]),
+    ]);
+
+    function applyPreset() {
+        agentDefaultOpt.textContent = "(preset default: "
+            + (selectedPreset.agent_default ? "claude" : "none") + ")";
+        byoGroup.style.display = selectedPreset.clone ? "" : "none";
+    }
+    function applyMcpCoupling() {
+        const any = mcpBoxes.some((b) => b.cb.checked);
+        if (any) { agentS.value = "claude"; agentS.disabled = true; }
+        else { agentS.disabled = false; }
+    }
+    applyPreset();
+    applyMcpCoupling();
+
+    const explainBtn = el("button", { type: "button", class: "btn btn-secondary" },
+                          ["Explain boxes"]);
+    explainBtn.onclick = () => openExplain("box");
+
     mgmtConfirmThenTail(boxOpView(), {
         title: `Add a box to ${project}`,
         tailTitle: `Adding a box to ${project}`,
         verb: "box_add",
         confirmLabel: "Add box",
         body: [
+            el("div", { class: "field" }, [el("label", {}, ["Name (optional)"]), nameI]),
             el("div", { class: "field" }, [
-                el("label", {}, ["Name (optional)"]), nameI,
+                el("label", {}, ["Box type"]),
+                el("div", { class: "box-preset-cards" }, cards),
             ]),
-            el("div", { class: "field" }, [
-                el("label", {}, ["Agent"]), agentS,
-            ]),
-            el("label", { class: "mgmt-check" }, [
-                browserCb, " bundle a browser (playwright + Chromium)",
-            ]),
+            el("div", { class: "field" }, [el("label", {}, ["Agent"]), agentS]),
+            el("label", { class: "mgmt-check" }, [editorCb, " bundle the editor (code-server)"]),
+            el("div", { class: "field" }, [el("label", {}, ["MCP tools"]), mcpList]),
+            byoGroup,
+            el("div", { class: "field" }, [explainBtn]),
         ],
         validate: () => {
             const n = nameI.value.trim();
             if (n && !/^[a-z][a-z0-9-]*$/.test(n)) {
                 return "Box name must be lowercase, start with a letter, and use only letters, digits, or '-'.";
             }
+            if (selectedPreset.clone && repoI.value.trim() && !refI.value.trim()) {
+                return "A repo requires a ref (pin the clone).";
+            }
             return null;
         },
-        request: () => fetch(`/broker/project/${encodeURIComponent(project)}/box`, {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
+        request: () => {
+            const payload = {
                 name: nameI.value.trim() || null,
-                agent: agentS.value,
-                browser: browserCb.checked,
-            }),
-        }),
+                preset: selectedPreset.name,
+                editor: editorCb.checked,
+                mcps: mcpBoxes.filter((b) => b.cb.checked).map((b) => b.name),
+            };
+            // Sentinel "" → omit agent (the preset default applies); no `browser`.
+            if (agentS.value) payload.agent = agentS.value;
+            if (selectedPreset.clone) {
+                const repo = repoI.value.trim(), ref = refI.value.trim(),
+                    setup = setupT.value.trim();
+                if (repo) payload.repo = repo;
+                if (ref) payload.ref = ref;
+                if (setup) payload.setup = setup;
+            }
+            return fetch(`/broker/project/${encodeURIComponent(project)}/box`, {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+            });
+        },
         onDone: async (ok) => { if (ok) await refreshAfterBoxChange(project); },
         focus: () => nameI.focus(),
     });

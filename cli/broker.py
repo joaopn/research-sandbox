@@ -386,6 +386,14 @@ def _verb_box_list(args: dict, _progress=None) -> dict:
     return dataclasses.asdict(rscore.box_list(req))
 
 
+def _verb_box_presets(args: dict, _progress=None) -> dict:
+    # project-only read; box_presets maps a malformed box-registry.json to
+    # ValidationError internally (verb-fn-raise), so nothing extra to catch here.
+    safe = {k: v for k, v in args.items() if k == "project"}
+    req = rscore.BoxPresetsRequest.from_kwargs(**safe)  # may raise ValidationError
+    return dataclasses.asdict(rscore.box_presets(req))
+
+
 # The webui-settable subset of the extension verbs' inputs. `upstream` is a list
 # of project-scoped MCP names (allowlist-validated in _extension_enable, only ever
 # written to extensions.json / rendered as mcp-proxy:8888/<name>) — NOT host-shaped,
@@ -434,6 +442,7 @@ VERBS = {
     "box_add": _verb_box_add,
     "box_remove": _verb_box_remove,
     "box_list": _verb_box_list,
+    "box_presets": _verb_box_presets,
     "ext_enable": _verb_ext_enable,
     "ext_disable": _verb_ext_disable,
     "ext_list": _verb_ext_list,

@@ -986,3 +986,19 @@ body {
     padding-top: 10px;
     border-top: 1px solid var(--border, #333);
 }
+
+/* box window — preset radio-cards (STAGE_BOX_EXT_UX) */
+.box-preset-cards { display: flex; flex-direction: column; gap: 6px; }
+.box-preset-card {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--border, #333);
+    border-radius: 6px;
+    cursor: pointer;
+}
+.box-preset-card:hover { border-color: var(--accent, #4a9eff); }
+.box-preset-body { display: flex; flex-direction: column; gap: 2px; }
+.box-preset-name { font-weight: 600; color: var(--fg-base); font-size: 13px; }
+.box-preset-desc { color: var(--fg-muted); font-size: 12px; }

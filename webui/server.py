@@ -551,11 +551,13 @@ async def broker_project_action_handler(request: web.Request) -> web.Response:
 
 
 async def broker_box_add_handler(request: web.Request) -> web.Response:
-    """POST /broker/project/{name}/box {name?,browser?,agent?} — add a sandbox
-    box to a running sandbox-dind project (gated, origin-checked). Returns
-    {op_id} immediately and tails like create/destroy. The broker's
+    """POST /broker/project/{name}/box {name?,preset?,agent?,editor?,mcps?,repo?,
+    ref?,setup?} — add a box to a running dind project (gated, origin-checked).
+    Returns {op_id} immediately and tails like create/destroy. The broker's
     BOX_ADD_WEBUI_FIELDS allow-list is the real input boundary; the body is
-    forwarded as box fields under the project name from the URL."""
+    forwarded as box fields under the project name from the URL. `browser` is GONE
+    (folded into the websearcher preset); `agent` defaults to None so the box's
+    preset default applies (BoxAddRequest.from_kwargs)."""
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")
     project = request.match_info.get("name", "")
@@ -566,8 +568,10 @@ async def broker_box_add_handler(request: web.Request) -> web.Response:
     if not isinstance(body, dict):
         body = {}
     args = {"project": project, "name": body.get("name"),
-            "browser": bool(body.get("browser")),
-            "agent": body.get("agent", "none")}
+            "preset": body.get("preset"), "agent": body.get("agent"),
+            "editor": bool(body.get("editor")), "mcps": body.get("mcps"),
+            "repo": body.get("repo"), "ref": body.get("ref"),
+            "setup": body.get("setup")}
     return await _start_op(request, "box_add", args, BROKER_OP_TIMEOUT_S,
                            op_seed=project)
 
@@ -599,6 +603,17 @@ async def broker_boxes_handler(request: web.Request) -> web.Response:
     container state (gated). A fast read (no op log); relayed synchronously."""
     project = request.match_info.get("name", "")
     status, reply = await _relay(request, "box_list", {"project": project})
+    return web.json_response(reply, status=status)
+
+
+async def broker_box_presets_handler(request: web.Request) -> web.Response:
+    """GET /broker/project/{name}/box-presets — the box-preset catalog (built-ins
+    + the operator box-registry) + the project's allowed MCPs (gated). Fast read;
+    relayed synchronously. Drives the box window's preset cards + MCP picker.
+    die()s (→ non-ok) for a non-dind / stopped project, so the box window's
+    fetch-then-open path surfaces the error instead of opening."""
+    project = request.match_info.get("name", "")
+    status, reply = await _relay(request, "box_presets", {"project": project})
     return web.json_response(reply, status=status)
 
 
@@ -1552,6 +1567,8 @@ def main() -> None:
     app.router.add_post(
         "/broker/project/{name}/box/{box}/remove", broker_box_remove_handler)
     app.router.add_get("/broker/project/{name}/boxes", broker_boxes_handler)
+    app.router.add_get(
+        "/broker/project/{name}/box-presets", broker_box_presets_handler)
     # Extension enable/list — same shadowing rule: the fixed .../extension(s)
     # segments MUST precede the {action} variable.
     app.router.add_post(
