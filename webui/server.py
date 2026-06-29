@@ -915,7 +915,7 @@ async def project_services_handler(request: web.Request) -> web.Response:
         # defaults the editor OFF (lean), so its probe fails and the Editor tab
         # auto-omits unless --enable code-server.
         if sid == "supervisor" and is_docker:
-            out[sid] = {**svc, "label": "Shell"}   # honest label for a bare box
+            out[sid] = {**svc, "label": "Shell (CLI)"}   # honest label for a bare box
             continue
         if sid == "supervisor":
             # Box harness is a standing dind utility (STAGE_DIND_UNIFY): ANY non-docker
@@ -934,25 +934,44 @@ async def project_services_handler(request: web.Request) -> web.Response:
     # Synthesized per-box tabs: boxes (kind="sandbox", STAGE_SANDBOX_PROJECT.md)
     # ride the rs-pi-iso-<name> container/tab conventions. Same data-plane
     # discipline — read off the /projects:ro bind-mount, no SSH/docker socket,
-    # lifecycle reflects on next page load.
+    # lifecycle reflects on next page load. A box that opted into the editor ALSO
+    # gets an http editor tab — its code-server stub is published onto the
+    # supervisor netns at editor_port, so it's probed like any http tab (a stopped
+    # box → port unbound → probe fails → no dead-iframe tab).
     sandbox_map = _read_project_extensions(project)
-    for name, kind in sorted(sandbox_map.items()):
-        if kind != "sandbox":
+    box_editor_jobs = [
+        (name, int(e["editor_port"]))
+        for name, e in sorted(sandbox_map.items())
+        if e.get("kind") == "sandbox" and e.get("editor") and e.get("editor_port")
+    ]
+    box_editor_up: dict[str, bool] = {}
+    if box_editor_jobs:
+        results = await asyncio.gather(*[
+            tcp_probe(upstream, port) for _, port in box_editor_jobs])
+        box_editor_up = {name: up for (name, _), up in zip(box_editor_jobs, results)}
+
+    for name, entry in sorted(sandbox_map.items()):
+        if entry.get("kind") != "sandbox":
             continue
         spec = services.pi_isolated_service(name)
         if spec is not None:
-            # Stamp box_kind so the SPA shows the per-tab box "✕".
-            out[f"{services.PI_ISOLATED_ID_PREFIX}{name}"] = {**spec, "box_kind": kind}
+            # Stamp box_kind so the SPA shows the per-tab box "✕" (terminal tab only).
+            out[f"{services.PI_ISOLATED_ID_PREFIX}{name}"] = {**spec, "box_kind": "sandbox"}
+        if box_editor_up.get(name):
+            espec = services.pi_isolated_editor_service(name, int(entry["editor_port"]))
+            if espec is not None:
+                out[f"{services.PI_ISOLATED_EDITOR_ID_PREFIX}{name}"] = espec
     return web.json_response(out)
 
 
-def _read_project_extensions(project: str) -> dict[str, str]:
-    """Return ``{name: kind}`` for the boxes recorded for ``project``, read from
-    its `.orchestrator/extensions.json` off the `/projects:ro` bind-mount (kind
-    is "sandbox" for a box). Tolerates: missing workspace, missing
-    extensions.json (no boxes), invalid JSON — all return an empty dict so the
-    tab strip silently omits the box tabs. No cache: the read is cheap and
-    lifecycle changes propagate on next load."""
+def _read_project_extensions(project: str) -> dict[str, dict]:
+    """Return ``{name: entry}`` for the boxes recorded for ``project``, read from
+    its `.orchestrator/extensions.json` off the `/projects:ro` bind-mount (each
+    entry carries `kind` ("sandbox" for a box), and for an editor box `editor` +
+    `editor_port`). Tolerates: missing workspace, missing extensions.json (no
+    boxes), invalid JSON — all return an empty dict so the tab strip silently omits
+    the box tabs. No cache: the read is cheap and lifecycle changes propagate on
+    next load."""
     workspace = _project_workspace(project)
     if workspace is None:
         return {}
@@ -965,8 +984,7 @@ def _read_project_extensions(project: str) -> dict[str, str]:
         return {}
     if not isinstance(data, dict):
         return {}
-    return {n: e.get("kind") for n, e in data.items()
-            if isinstance(e, dict)}
+    return {n: e for n, e in data.items() if isinstance(e, dict)}
 
 
 def _read_project_marker(project: str) -> dict:

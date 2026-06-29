@@ -2760,43 +2760,46 @@ function makeProjectConfigBox(project) {
 // The editor "Extensions" surface (STAGE_BOX_EXT_UX C) — host-container webui
 // surfaces, the unified "Add extension" sense (Editor now; Overleaf-style compose
 // surfaces later). Client-rendered from the services map: `code-server` present ⇒
-// on; `supervisor.box_harness` ⇒ dind. The toggle goes through `update`
-// enable/disable code-server, which RECREATES the supervisor — DIND-only, since
-// `update` refuses the docker substrate; a docker box's editor is a create-time
-// choice ("set at create"). Universal (renders on every flavor).
+// on. The toggle goes through `update` enable/disable code-server, which RECREATES
+// the container — supported on BOTH substrates now (dind via _recreate_supervisor,
+// docker via _recreate_docker_substrate). Universal (renders on every flavor).
 function appendEditorExtensionSection(box, project, enabled) {
     const section = el("div", { class: "config-section" });
     section.appendChild(el("div", { class: "config-section-label" }, ["Extensions"]));
-    const dind = !!(enabled.supervisor && enabled.supervisor.box_harness);
     const editorOn = Object.prototype.hasOwnProperty.call(enabled, "code-server");
     const row = el("div", { class: "config-box-row" }, [
         el("span", { class: "config-box-name" }, ["Editor"]),
         el("span", { class: "config-box-meta" }, [editorOn ? "on" : "off"]),
     ]);
-    if (dind) {
-        const btn = el("button", { class: "btn btn-secondary" },
-                      [editorOn ? "Disable" : "Enable"]);
-        btn.onclick = () => mgmtEditorToggle(project.name, editorOn);
-        row.appendChild(btn);
-    } else {
-        // docker: update refuses it, so the editor is fixed at create time.
-        row.appendChild(el("span", { class: "config-box-meta" }, ["set at create"]));
-    }
+    // A bare docker box has no creds-stash, so the recreate resets its in-box
+    // claude login (dind stashes creds across the supervisor recreate).
+    const isDocker = !(enabled.supervisor && enabled.supervisor.box_harness);
+    const btn = el("button", { class: "btn btn-secondary" },
+                  [editorOn ? "Disable" : "Enable"]);
+    btn.onclick = () => mgmtEditorToggle(project.name, editorOn, isDocker);
+    row.appendChild(btn);
     section.appendChild(row);
     box.appendChild(section);
 }
 
-function mgmtEditorToggle(name, on) {
+function mgmtEditorToggle(name, on, isDocker) {
     const word = on ? "Disable" : "Enable";
+    const body = [el("p", {}, [
+        `${word} the code-server editor on "${name}". This recreates the ` +
+        "project's container (fresh container); running work in it is interrupted.",
+    ])];
+    if (isDocker) {
+        body.push(el("p", { class: "hint" }, [
+            "On a bare docker box this resets the in-box claude login — run " +
+            "`claude` then /login again inside afterwards.",
+        ]));
+    }
     mgmtConfirmThenTail(boxOpView(), {
         title: `${word} the editor on ${name}`,
         tailTitle: `${on ? "Disabling" : "Enabling"} the editor on ${name}`,
         verb: "update",
         confirmLabel: word,
-        body: [el("p", {}, [
-            `${word} the code-server editor on "${name}". This recreates the ` +
-            "supervisor (fresh container); running work in it is interrupted.",
-        ])],
+        body: body,
         request: () => fetch(`/broker/project/${encodeURIComponent(name)}/update`, {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify(on ? { disable: ["code-server"] } : { enable: ["code-server"] }),

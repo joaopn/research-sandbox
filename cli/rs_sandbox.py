@@ -64,6 +64,14 @@ IP_PREFIX = "192.168.99."
 # .10-.25 PI range is ACCEPTed by the inner firewall, so no per-box rule).
 BOX_IP_LO = 14
 BOX_IP_HI = 25  # inclusive
+# Per-box editor host-port pool. When a box opts into the editor, the inner
+# `docker run -p <port>:8443` publishes the box's code-server stub onto the
+# SUPERVISOR's network namespace (the inner dockerd's host), so the webui reaches
+# it at rs-project-<proj>:<port>. Distinct from the box-internal 8443/8444 (those
+# live in the box netns); 100 ports ≫ the 12-IP box ceiling. Allocated
+# sequentially, the same discipline as the IP pool.
+BOX_EDITOR_PORT_LO = 8500
+BOX_EDITOR_PORT_HI = 8599  # inclusive
 KIND = "sandbox"
 
 # Box names: lowercase, must match the webui tab-id regex so the tab
@@ -158,6 +166,15 @@ def allocate_ip(entries: dict[str, dict]) -> str:
             return ip
     die(f"box IP pool exhausted ({IP_PREFIX}{BOX_IP_LO}-{IP_PREFIX}{BOX_IP_HI}); "
         f"discard an unused box first")
+
+
+def allocate_editor_port(entries: dict[str, dict]) -> int:
+    taken = {e.get("editor_port") for e in entries.values() if isinstance(e, dict)}
+    for port in range(BOX_EDITOR_PORT_LO, BOX_EDITOR_PORT_HI + 1):
+        if port not in taken:
+            return port
+    die(f"box editor-port pool exhausted "
+        f"({BOX_EDITOR_PORT_LO}-{BOX_EDITOR_PORT_HI}); discard an unused box first")
 
 
 def auto_name(entries: dict[str, dict]) -> str:
@@ -269,8 +286,8 @@ def _stage_box_workspace(name: str, preset: dict, mcps: list[str],
 
 
 def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
-             editor: bool = False, clone_repo: str = "", clone_ref: str = "",
-             clone_setup: str = "") -> None:
+             editor: bool = False, editor_port: int = 0, clone_repo: str = "",
+             clone_ref: str = "", clone_setup: str = "") -> None:
     """docker run a box in the local inner dockerd. ``browser`` selects the
     Chromium-equipped image; ``agent`` (claude|none) → RS_BOX_AGENT (entrypoint
     deploys claude only for "claude", still auth-free); ``editor`` → the box's OWN
@@ -292,6 +309,10 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     # STAGE_BOX_EXT_UX). Only mount when this box opted in AND the dist is staged.
     editor_mount = (["-v", f"{EDITOR_DIST_MOUNT}:{EDITOR_DIST_MOUNT}:ro"]
                     if (editor and os.path.isdir(EDITOR_DIST_MOUNT)) else [])
+    # Publish the box's code-server stub (8443) onto the supervisor netns at
+    # editor_port so the webui can reach it at rs-project-<proj>:<editor_port>.
+    editor_publish = (["-p", f"{editor_port}:8443"]
+                      if (editor and editor_port) else [])
     clone_env: list[str] = []
     if clone_repo:
         clone_env = ["-e", f"RS_BOX_CLONE_REPO={clone_repo}",
@@ -306,6 +327,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         "-v", f"{WORKSPACE}/{sub}:/workspace",
         *agent_mount,
         *editor_mount,
+        *editor_publish,
         "-e", f"RS_SERVICE_CODE_SERVER={'enabled' if editor else 'disabled'}",
         "-e", f"RS_SANDBOX_NAME={name}",
         "-e", f"RS_BOX_AGENT={agent}",
@@ -331,6 +353,7 @@ def _rerun_box(name: str, entry: dict) -> None:
         json.dumps({"mcpServers": servers}, indent=2, sort_keys=True) + "\n")
     _run_box(name, entry["ip"], browser=bool(entry.get("browser")),
              agent=entry.get("agent", "none"), editor=bool(entry.get("editor")),
+             editor_port=int(entry.get("editor_port") or 0),
              clone_repo=entry.get("repo") or "", clone_ref=entry.get("ref") or "",
              clone_setup=entry.get("setup") or "")
 
@@ -371,20 +394,26 @@ def cmd_create(args: argparse.Namespace) -> None:
     browser = preset.get("image") == "browser"
     editor = bool(args.editor)
     ip = allocate_ip(entries)
+    # A box editor publishes onto a per-box supervisor-netns port (0 = no editor).
+    editor_port = allocate_editor_port(entries) if editor else 0
     # Stage CLAUDE.md + .mcp-proxy.json BEFORE the run (M2: the entrypoint reads
     # them at boot). strict=True → die on an MCP not in the project allowlist.
     _stage_box_workspace(name, preset, mcps, strict=True)
     entry = {"kind": KIND, "ip": ip, "container": box_container(name),
              "preset": args.preset, "browser": browser, "agent": agent,
              "editor": editor, "upstream_mcps": mcps}
+    if editor:
+        entry["editor_port"] = editor_port
     if is_clone:
         entry.update({"repo": repo, "ref": ref, "setup": setup})
     entries[name] = entry
     save(entries)
     _run_box(name, ip, browser=browser, agent=agent, editor=editor,
-             clone_repo=repo if is_clone else "", clone_ref=ref, clone_setup=setup)
+             editor_port=editor_port, clone_repo=repo if is_clone else "",
+             clone_ref=ref, clone_setup=setup)
     print(json.dumps({"name": name, "ip": ip, "preset": args.preset,
                       "browser": browser, "agent": agent, "editor": editor,
+                      "editor_port": editor_port or None,
                       "container": box_container(name)}, indent=2))
 
 

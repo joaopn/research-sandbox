@@ -1320,13 +1320,12 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     container = container_name_for(project)
     if not container_exists(container):
         die(f"project {project!r} does not exist")
-    # The docker substrate has no in-container editable surface yet (no
-    # templates, no worker/extension cone) and no sysbox store to re-stage — update
-    # is deferred for it (WORKFLOW_TAXONOMY_S1.md). Refuse cleanly rather than
-    # run the dind recreate path against a runc container.
+    # The docker substrate has no in-container editable surface (no templates, no
+    # worker/extension cone) and no sysbox store to re-stage. The ONE meaningful
+    # update is toggling the editor (code-server), which recreates the plain runc
+    # box; anything else is still refused (inside _update_docker_substrate).
     if _container_substrate(container) == Substrate.DOCKER.value:
-        die("`update` is not yet supported for the docker substrate; "
-            "destroy + recreate instead")
+        return _update_docker_substrate(req, cfg, project, container, progress)
     if not container_running(ROUTER_CONTAINER):
         die(f"{ROUTER_CONTAINER} is not running. Run `research start` first.")
     progress.step("validate", "validating update")
@@ -3330,6 +3329,99 @@ def _start_docker_substrate(project: str, cfg: "Config") -> None:  # type: ignor
     container = container_name_for(project)
     run_check(["docker", "start", container])
     network = project_network_for(project)
+    inject_route(container, get_router_ip(network))
+
+
+def _without_mount(mounts: list[str], dst: str) -> list[str]:
+    """Drop every ['-v', 'src:dst[:ro]'] pair targeting container path ``dst`` from
+    a flat docker -v arg list (host paths are POSIX, so the dst is the 2nd
+    colon-field)."""
+    out: list[str] = []
+    i = 0
+    while i < len(mounts):
+        if mounts[i] == "-v" and i + 1 < len(mounts):
+            parts = mounts[i + 1].split(":")
+            if len(parts) >= 2 and parts[1] == dst:
+                i += 2
+                continue
+            out += [mounts[i], mounts[i + 1]]
+            i += 2
+        else:
+            out.append(mounts[i])
+            i += 1
+    return out
+
+
+def _update_docker_substrate(req: "UpdateRequest", cfg: "Config",  # type: ignore[name-defined]
+                             project: str, container: str, progress) -> "UpdateResult":  # type: ignore[name-defined]
+    """`update` for a `docker`-substrate box: the only supported change is
+    enabling/disabling the editor (code-server). Anything else (workers,
+    role-mcp wiring, --rebuild, another service) is refused — docker has no
+    inner cone. A pure code-server flip recreates the runc box with the new
+    flag via _recreate_docker_substrate."""
+    # _split_*_tokens return the service part as a CSV string|None (workers peeled
+    # off); _parse_service_list normalizes either to a set.
+    enable_services, enable_workers = _split_enable_tokens(",".join(req.enable))
+    disable_services, disable_workers = _split_disable_tokens(",".join(req.disable))
+    enable_svcs = _parse_service_list(enable_services)
+    disable_svcs = _parse_service_list(disable_services)
+    touched = enable_svcs | disable_svcs
+    if (req.rebuild or enable_workers or disable_workers or req.role_mcp_upstream
+            or touched - {"code-server"} or not touched):
+        die("`update` on the docker substrate only supports enabling or disabling "
+            "the editor (code-server); destroy + recreate for anything else")
+    if enable_svcs and not editor_dist_present():
+        die("no editor dist cached — run `research editor pull` first")
+    base = _read_service_flags(container)
+    flags = _compute_service_flags(enable_services, disable_services, base=base)
+    progress.step("recreate", "recreating box")
+    print(f"=== Updating project: {project} (editor toggle) ===")
+    _recreate_docker_substrate(project, cfg, service_flags=flags)
+    return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
+                        workers_enabled=[], workers_disabled=[])
+
+
+def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[name-defined]
+                               service_flags: dict[str, bool]) -> None:
+    """Recreate a `docker`-substrate (plain runc) box to apply a service-flag
+    change. Far simpler than _recreate_supervisor: no inner dockerd, no image
+    re-staging, no creds-stash dance (the box re-auths in place — greenfield-
+    disposable). Workspace bind-mount, network, SSH port/password, agent-dist
+    mounts, and extra --data mounts all survive (recovered from the container's
+    metadata before rm); the editor-dist mount is re-derived from the NEW
+    code-server flag (host-cache sourced, so it just re-applies)."""
+    container = container_name_for(project)
+    was_running = container_running(container)
+    workspace_path = workspace_path_for(project, cfg)
+    md = _read_supervisor_metadata(container)
+    if md.get("substrate") != Substrate.DOCKER.value:
+        die(f"_recreate_docker_substrate called for non-docker project {project!r}")
+
+    if was_running:
+        print(f"stopping {container}...")
+        run_check(["docker", "stop", container])
+    print(f"removing old container {container}...")
+    run_check(["docker", "rm", container])
+
+    network = project_network_for(project)
+    docker_args = build_supervisor_docker_args(
+        container_name=container, project=project, network=network,
+        workspace_path=workspace_path, ssh_port=md["ssh_port"],
+        ssh_pass=md["ssh_pass"], dns_servers=cfg.sandbox_dns,
+        memory=md["memory"], cpus=md["cpus"], image=MINIMAL_IMAGE,
+        dind_mode=md["dind_mode"], inner_firewall=md["inner_firewall"],
+        project_type=md["project_type"], substrate=md["substrate"],
+        service_flags=service_flags)
+    # Recovered binds minus any prior editor-dist mount (agent-dist + --data mounts
+    # pass through); re-derive the editor mount from the new flag (mirrors create).
+    extra = _without_mount(md["extra_mounts"], EDITOR_DIST_MOUNT)
+    if service_flags.get("code-server") and editor_dist_present():
+        extra += ["-v", f"{EDITOR_DIST_DIR}:{EDITOR_DIST_MOUNT}:ro"]
+    if extra:
+        docker_args = docker_args[:-1] + extra + [docker_args[-1]]
+
+    print(f"creating new container from {MINIMAL_IMAGE}...")
+    run_check(["docker", *docker_args])
     inject_route(container, get_router_ip(network))
 
 

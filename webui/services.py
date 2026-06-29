@@ -41,7 +41,7 @@ SERVICES = {
     # KNOWN_SERVICES, so missing labels default to enabled) and cleared
     # naturally on the next `research project update`.
     "supervisor": {
-        "label": "Supervisor",
+        "label": "Supervisor (CLI)",
         "kind": "ssh",
         "always_on": True,
         "renderer": "xterm.js",
@@ -92,7 +92,7 @@ def pi_isolated_service(name: str) -> dict | None:
     if not _PI_ISOLATED_NAME_RE.match(name):
         return None
     return {
-        "label": name,
+        "label": f"{name} (CLI)",
         "kind": "ssh",
         "always_on": False,
         "renderer": "xterm.js",
@@ -103,6 +103,32 @@ def pi_isolated_service(name: str) -> dict | None:
             "byobu new-session -s pi -c /workspace -- "
             "/opt/pi-templates/greet-and-shell.sh /workspace/.rs-greeting'"
         ),
+    }
+
+
+# A box that opted into the editor publishes its code-server stub onto the
+# supervisor netns (inner `docker run -p <editor_port>:8443`), so the webui reaches
+# it at rs-project-<proj>:<editor_port> like any http service. The editor tab's id
+# uses a DISTINCT prefix (NOT `pi-iso-`): the box-remove ✕ in the SPA is gated on
+# `id.startsWith("pi-iso-")`, which must stay on the terminal tab only, and a
+# `pi-iso-editor-<name>` id would also collide with the terminal-tab id of a box
+# literally named `editor-<name>`. `box-editor-` sidesteps both.
+PI_ISOLATED_EDITOR_ID_PREFIX = "box-editor-"
+
+
+def pi_isolated_editor_service(name: str, port: int) -> dict | None:
+    """Synthesize the http editor tab for box ``name`` (its code-server published
+    at supervisor-netns ``port``), or None if the name fails validation. Labelled
+    with the bare box name — the terminal tab carries the ``(CLI)`` suffix."""
+    if not _PI_ISOLATED_NAME_RE.match(name):
+        return None
+    return {
+        "label": name,
+        "kind": "http",
+        "always_on": False,
+        "renderer": "iframe",
+        "default_port": int(port),
+        "upstream_path": "/",
     }
 
 

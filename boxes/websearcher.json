@@ -3,5 +3,5 @@
   "image": "browser",
   "agent_default": true,
   "clone": false,
-  "description": "A web-research box: Playwright + headless Chromium baked in, with search-oriented instructions. The agent is on by default; add MCP servers for project-specific lookups."
+  "description": "A web-research box: Playwright + headless Chromium baked in, with search-oriented instructions."
 }
