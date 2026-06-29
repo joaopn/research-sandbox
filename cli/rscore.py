@@ -1345,6 +1345,16 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         except ValueError as e:
             die(str(e))
 
+    workspace_path = workspace_path_for(project, cfg)
+    # A code-server-only flip on a dind supervisor is deployed LIVE (docker exec),
+    # skipping the multi-minute _recreate_supervisor. (Docker already returned via
+    # _update_docker_substrate at the gate above.) Same gate shape as that path.
+    touched = _parse_service_list(enable_services) | _parse_service_list(disable_services)
+    if (not req.rebuild and not enable_workers and not disable_workers
+            and not req.role_mcp_upstream and touched == {"code-server"}):
+        enable = "code-server" in _parse_service_list(enable_services)
+        return _live_toggle_editor(project, cfg, container, workspace_path, enable, progress)
+
     if req.rebuild:
         progress.step("rebuild", "rebuilding images")
         print("rebuilding images...")
@@ -1359,7 +1369,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
 
     flags_override: dict[str, bool] | None = None
     if enable_services or disable_services:
-        base = _read_service_flags(container)
+        base = _apply_service_override(_read_service_flags(container), workspace_path)
         flags_override = _compute_service_flags(
             enable_services, disable_services, base=base)
 
@@ -1380,6 +1390,14 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         post_create_hook=hook,
         service_flags=flags_override,
     )
+
+    # The recreate wrote authoritative service labels, so a live-toggle override for
+    # any EXPLICITLY-changed service is now redundant — clear it so a stale override
+    # can't resurrect the just-applied value on the next recreate. A non-explicit
+    # recreate (start, worker-only update) has `touched` empty → the override stays
+    # and carries the live choice (it agrees with the freshly-written label).
+    if touched:
+        _clear_service_override(workspace_path, touched)
 
     # Sandbox projects have no /workspace/.claude/ by design — skip the refresh.
     refreshed = False
@@ -2702,6 +2720,27 @@ def editor_apply_refresh(cs_version: str) -> None:
     _editor_build_dist(cs_version)
 
 
+def _deploy_supervisor_editor(container: str) -> None:
+    """Run the editor deploy script in a RUNNING supervisor (cp the dist into
+    ~/.local, install extensions, launch the lazy-start stub on 8443) — the single
+    source of truth for the deploy, shared by `_stage_editor_dist`'s deploy_local
+    and the live editor toggle. Assumes /opt/editor-dist is already staged. Runs as
+    the research user (uid 1000) with HOME pinned absolute to /home/research (the
+    cross-boundary-path rule); the nohup'd stub reparents under tini when the exec
+    session closes."""
+    run_check(["docker", "exec", "-e", "HOME=/home/research", container,
+               "bash", f"{EDITOR_DIST_MOUNT}/tools/code-server-deploy.sh"])
+
+
+def _editor_dist_staged_in(container: str) -> bool:
+    """True iff the editor dist is already staged in the supervisor (the common
+    case — staged at create regardless of the code-server flag, only the deploy is
+    flag-gated). Lets the live toggle skip the re-stage and deploy-only."""
+    return run(["docker", "exec", container, "test", "-e",
+                f"{EDITOR_DIST_MOUNT}/.local/bin/{_CODE_SERVER_BIN}"],
+               capture_output=True).returncode == 0
+
+
 def _stage_editor_dist(supervisor: str, *, deploy_local: bool = False) -> None:
     """Stage the host editor dist into a RUNNING supervisor (STAGE_EDITOR_DIST).
     Real files at EDITOR_DIST_MOUNT — interactive inner containers (PI roles,
@@ -2748,14 +2787,7 @@ def _stage_editor_dist(supervisor: str, *, deploy_local: bool = False) -> None:
         die(f"staging editor dist into {supervisor} failed: "
             f"{detail or 'tar extract returned non-zero'}")
     if deploy_local:
-        # Deploy + launch via the shared dist script (single source of truth for
-        # the deploy logic — the same script the interactive leaves' entrypoints
-        # run). Runs as the research user (the supervisor/management container
-        # default USER, uid 1000) with HOME pinned absolute to /home/research (the
-        # cross-boundary-path rule) so the script's $HOME-based cp lands there. The
-        # nohup'd stub reparents under tini when this exec session closes.
-        run_check(["docker", "exec", "-e", "HOME=/home/research", supervisor,
-                   "bash", f"{EDITOR_DIST_MOUNT}/tools/code-server-deploy.sh"])
+        _deploy_supervisor_editor(supervisor)
 
 
 def _build_images(force: bool) -> None:
@@ -3157,7 +3189,11 @@ def _recreate_supervisor(
     run_check(["docker", "rm", container])
 
     network = project_network_for(project)
-    flags = service_flags if service_flags is not None else md["service_flags"]
+    # No explicit flags (start, or a worker-only update) → label-derived flags
+    # overlaid with the live-toggle override, so a live editor enable survives the
+    # recreate/restart. update()'s explicit-change path clears the override after.
+    flags = (service_flags if service_flags is not None
+             else _apply_service_override(md["service_flags"], workspace_path))
     md_ptype = md.get("project_type", PROJECT_TYPE_RESEARCH)
     substrate_image = (SANDBOX_DIND_IMAGE if md_ptype == PROJECT_TYPE_SANDBOX_DIND
                        else SUPERVISOR_IMAGE)
@@ -3423,6 +3459,36 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
     print(f"creating new container from {MINIMAL_IMAGE}...")
     run_check(["docker", *docker_args])
     inject_route(container, get_router_ip(network))
+
+
+def _live_toggle_editor(project: str, cfg: "Config", container: str,  # type: ignore[name-defined]
+                        workspace_path: Path, enable: bool, progress) -> "UpdateResult":  # type: ignore[name-defined]
+    """Enable/disable the editor on a RUNNING dind supervisor WITHOUT recreating:
+    deploy code-server live (it's already staged at /opt/editor-dist; only the
+    deploy was skipped when off) or kill its stub. The choice is persisted to the
+    service-override file so a later recreate/start honors it (the docker label is
+    immutable on a running container). Far faster than _recreate_supervisor (no
+    inner-image re-staging, no role-MCP/box relaunch)."""
+    if enable:
+        if not editor_dist_present():
+            die("no editor dist cached — run `research editor pull` first")
+        progress.step("deploy", "deploying the editor")
+        print(f"=== {project}: deploying the editor (live) ===")
+        if _editor_dist_staged_in(container):     # common case: staged at create
+            _deploy_supervisor_editor(container)
+        else:                                     # host had no dist at create
+            _stage_editor_dist(container, deploy_local=True)
+    else:
+        progress.step("disable", "removing the editor")
+        print(f"=== {project}: removing the editor (live) ===")
+        # Kill the lazy-start stub + any spawned code-server (supervisor PID ns
+        # only — boxes' code-servers live in the inner dockerd's separate ns).
+        run(["docker", "exec", container, "sh", "-c",
+             "pkill -f code-server-stub.py; pkill -x code-server || true"],
+            capture_output=True)
+    _write_service_override(workspace_path, "code-server", enable)
+    return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
+                        workers_enabled=[], workers_disabled=[])
 
 
 def _refresh_workspace_claude_templates(container: str) -> None:
@@ -4652,6 +4718,59 @@ def _read_service_flags(container: str) -> dict[str, bool]:
     for sid in KNOWN_SERVICES:
         v = labels.get(f"{SERVICE_LABEL_PREFIX}{sid}")
         out[sid] = (v != "disabled")  # missing or "enabled" => True
+    for sid in ALWAYS_ON_SERVICES:
+        out[sid] = True
+    return out
+
+
+# Live-toggle service-flag overrides. A dind editor toggle (STAGE live-editor)
+# deploys/removes code-server via `docker exec` WITHOUT recreating — but a docker
+# label is immutable on a running container, so the live choice is recorded here
+# and overlaid onto the label-derived flags at the recreate/start paths, so the
+# editor survives a restart. update()'s recreate path clears the override for an
+# explicitly-changed service afterwards (the fresh label is then authoritative).
+def _service_override_path(workspace_path: Path) -> Path:
+    return workspace_path / ".orchestrator" / "service-overrides.json"
+
+
+def _read_service_override(workspace_path: Path) -> dict[str, bool]:
+    f = _service_override_path(workspace_path)
+    if not f.is_file():
+        return {}
+    try:
+        d = json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {k: bool(v) for k, v in d.items()} if isinstance(d, dict) else {}
+
+
+def _write_service_override(workspace_path: Path, sid: str, value: bool) -> None:
+    f = _service_override_path(workspace_path)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    cur = _read_service_override(workspace_path)
+    cur[sid] = bool(value)
+    f.write_text(json.dumps(cur, indent=2, sort_keys=True) + "\n")
+
+
+def _clear_service_override(workspace_path: Path, sids) -> None:
+    cur = _read_service_override(workspace_path)
+    if not any(sid in cur for sid in sids):
+        return
+    for sid in sids:
+        cur.pop(sid, None)
+    f = _service_override_path(workspace_path)
+    if cur:
+        f.write_text(json.dumps(cur, indent=2, sort_keys=True) + "\n")
+    else:
+        f.unlink(missing_ok=True)
+
+
+def _apply_service_override(base: dict[str, bool], workspace_path: Path) -> dict[str, bool]:
+    """Overlay live-toggle overrides onto a label-derived flag set. ALWAYS_ON
+    services are re-forced so a malformed/stale override can't disable the
+    supervisor substrate."""
+    out = dict(base)
+    out.update(_read_service_override(workspace_path))
     for sid in ALWAYS_ON_SERVICES:
         out[sid] = True
     return out

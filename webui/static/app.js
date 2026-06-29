@@ -2784,10 +2784,13 @@ function appendEditorExtensionSection(box, project, enabled) {
 
 function mgmtEditorToggle(name, on, isDocker) {
     const word = on ? "Disable" : "Enable";
-    const body = [el("p", {}, [
-        `${word} the code-server editor on "${name}". This recreates the ` +
-        "project's container (fresh container); running work in it is interrupted.",
-    ])];
+    // dind deploys/removes the editor live (no recreate); docker must recreate the
+    // runc container (its editor is a bind-mount, addable only at create).
+    const body = [el("p", {}, [isDocker
+        ? `${word} the code-server editor on "${name}". This recreates the ` +
+          "project's container (fresh container); running work in it is interrupted."
+        : `${word} the code-server editor on "${name}". This deploys it live ` +
+          "(no recreate) — it takes effect on the next page load."])];
     if (isDocker) {
         body.push(el("p", { class: "hint" }, [
             "On a bare docker box this resets the in-box claude login — run " +
