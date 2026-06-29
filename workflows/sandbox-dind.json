@@ -1,5 +1,7 @@
 {
   "name": "sandbox-dind",
+  "group": "base",
+  "tags": ["dind"],
   "substrate": "dind-sysbox",
   "image_overlay": "rs-sandbox-dind",
   "description": "A confined agent box with inner Docker (DIND): the sandbox flavor plus a nested Docker daemon. Spin isolated sub-boxes with the rs-sandbox box harness.",

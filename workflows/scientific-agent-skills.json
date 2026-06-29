@@ -1,0 +1,11 @@
+{
+  "name": "scientific-agent-skills",
+  "title": "k-dense-ai/scientific-agent-skills",
+  "group": "store",
+  "tags": ["research"],
+  "substrate": "docker",
+  "agents": ["claude"],
+  "repo": "https://github.com/k-dense-ai/scientific-agent-skills.git",
+  "ref": "main",
+  "description": "A collection of scientific-agent Claude skills, cloned into a confined runc box with claude on."
+}

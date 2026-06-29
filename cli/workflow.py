@@ -54,6 +54,14 @@ EXPORT_TRANSPORTS = ("http", "sse")
 SERVICE_IDS = ("supervisor", "code-server")
 ALWAYS_ON_SERVICE_IDS = ("supervisor",)
 
+# Create-window presentation (STAGE_STORE_WORKFLOWS). `group` buckets a workflow
+# under one of the New Project window's section headers; `tags` are the small
+# visual chips on a create card. Both are presentation-only — consumed by the
+# webui, never by the lifecycle. A group-less manifest falls into Store (the
+# webui's catch-all bucket), so `group` is optional, not required.
+GROUPS = ("research", "base", "store")
+TAG_VALUES = ("research", "code", "dind", "data")
+
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 # A surfacing path (tab path, proxy mount): absolute, no '..' segments.
 PATH_RE = re.compile(r"^/[A-Za-z0-9/_.-]*$")
@@ -62,7 +70,7 @@ PORT_MIN, PORT_MAX = 1, 65535
 
 _ALLOWED_KEYS = {"name", "substrate", "image_overlay", "repo", "ref", "setup",
                  "tabs", "mcp_exports", "resources", "services", "description",
-                 "greeting"}
+                 "greeting", "title", "group", "tags", "agents"}
 _TAB_KEYS = {"name", "port", "kind", "path"}
 _EXPORT_KEYS = {"name", "port", "transport"}
 _RESOURCE_KEYS = {"memory", "cpus"}
@@ -178,8 +186,11 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
     if m.get("substrate") not in SUBSTRATES:
         out.append(p(f"substrate must be one of {SUBSTRATES}, got {m.get('substrate')!r}"))
 
-    # Payload: image_overlay (bake) XOR repo/ref/setup (harness); neither is a
-    # bare substrate, both is a configuration error.
+    # Payload: image_overlay (the base image) and repo/ref/setup (the create-time
+    # light-path clone) may COEXIST — the store workflows bake `rs-sandbox-dind`
+    # AND clone a repo onto the supervisor at create (_run_light_harness runs for
+    # the dind branch independent of the overlay). The only structural rule is
+    # that a repo must pin a ref.
     overlay = m.get("image_overlay")
     repo = m.get("repo")
     ref = m.get("ref")
@@ -192,10 +203,6 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
         out.append(p("ref must be a non-empty string or null"))
     if setup is not None and not _is_str(setup):
         out.append(p("setup must be a non-empty string or null"))
-    has_overlay = _is_str(overlay)
-    has_harness = _is_str(repo) or _is_str(setup)
-    if has_overlay and has_harness:
-        out.append(p("declare image_overlay OR repo/setup, not both (bake-vs-harness)"))
     if _is_str(repo) and not _is_str(ref):
         out.append(p("ref is required when repo is set (pin the clone — no drift)"))
 
@@ -217,6 +224,30 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
     # null-allowing form, NOT description's stricter "present ⇒ non-empty").
     if m.get("greeting") is not None and not _is_str(m.get("greeting")):
         out.append(p("greeting must be a non-empty string or null"))
+
+    # title — the create card's display name (STAGE_STORE_WORKFLOWS). `name` is a
+    # slug (file stem, NAME_RE) and can't hold "[user]/[repo]"; `title` carries it.
+    if "title" in m and not _is_str(m["title"]):
+        out.append(p("title must be a non-empty string"))
+
+    # group — the New Project window section; optional (a group-less manifest
+    # buckets into Store webui-side), ∈ GROUPS when present.
+    if "group" in m and m["group"] not in GROUPS:
+        out.append(p(f"group must be one of {GROUPS}, got {m.get('group')!r}"))
+
+    # tags — small create-card chips; optional list drawn from the known set the
+    # webui knows how to color.
+    if "tags" in m and not (isinstance(m["tags"], list)
+                            and all(t in TAG_VALUES for t in m["tags"])):
+        out.append(p(f"tags must be a list of {TAG_VALUES}, got {m.get('tags')!r}"))
+
+    # agents — default agent enable-set preset (mirrors `services`). Shape-checked
+    # here (list of non-empty strings); membership in rscore.KNOWN_AGENTS is
+    # delegated to CreateRequest.from_kwargs, since this module stays stdlib-light
+    # (no rscore import). The docker store workflows carry ["claude"] for claude-on.
+    if "agents" in m and not (isinstance(m["agents"], list)
+                              and all(_is_str(a) for a in m["agents"])):
+        out.append(p(f"agents must be a list of non-empty strings, got {m.get('agents')!r}"))
 
     extras = set(m) - _ALLOWED_KEYS
     if extras:

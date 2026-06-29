@@ -418,8 +418,12 @@ class CreateRequest:
         # and on the docker substrate each must already be pulled. Non-docker is
         # noted-and-ignored in create() (only the docker-box cp-deploy path is wired
         # for the explicit set; dind uses the DEFAULT_AGENT floor below). Dedup while
-        # preserving order so a box never double-mounts the same agent.
-        agents = tuple(dict.fromkeys(_as_tuple(kw.get("agents"))))
+        # preserving order so a box never double-mounts the same agent. An
+        # explicit set wins; otherwise the workflow's `agents` preset applies (the
+        # docker store workflows carry ["claude"] so the box is claude-on by
+        # default — a bare `sandbox` box, with no preset, stays agent-less).
+        agents = tuple(dict.fromkeys(
+            _as_tuple(kw.get("agents")) or _as_tuple(manifest.get("agents"))))
         for a in agents:
             if a not in KNOWN_AGENTS:
                 raise ValidationError(

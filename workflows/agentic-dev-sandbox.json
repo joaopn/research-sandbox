@@ -1,0 +1,11 @@
+{
+  "name": "agentic-dev-sandbox",
+  "title": "joaopn/agentic-dev-sandbox",
+  "group": "store",
+  "tags": ["dind", "code"],
+  "substrate": "dind-sysbox",
+  "image_overlay": "rs-sandbox-dind",
+  "repo": "https://github.com/joaopn/agentic-dev-sandbox.git",
+  "ref": "main",
+  "description": "An agentic software-development sandbox, cloned into a sandbox-dind box (inner Docker + locked egress)."
+}
