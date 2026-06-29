@@ -4,6 +4,6 @@
   "tags": ["dind"],
   "substrate": "dind-sysbox",
   "image_overlay": "rs-sandbox-dind",
-  "description": "A confined agent box with inner Docker (DIND): the sandbox flavor plus a nested Docker daemon. Spin isolated sub-boxes with the rs-sandbox box harness.",
+  "description": "A Docker-In-Docker (DIND) sandbox. Useful for workflows that use isolated internal containers.",
   "greeting": "Sandbox-dind — a confined agent box with inner Docker.\n\nThis is the sandbox flavor plus a nested Docker daemon (DIND): run `claude` here\n(bypassPermissions, locked egress) and use the inner `docker` for builds, tests,\nor running untrusted images.\n\nManage isolated sub-boxes with the `rs-sandbox` CLI:\n  rs-sandbox            show usage\n  rs-sandbox create     spin a new box (--preset websearcher for a Playwright box)\n  rs-sandbox list       list boxes and their state\n  rs-sandbox discard    tear a box down\n"
 }

@@ -4,5 +4,5 @@
   "tags": ["research"],
   "substrate": "dind-sysbox",
   "image_overlay": "rs-supervisor",
-  "description": "The full research lab: supervisor agent + analysis workers + role-MCPs + PI roles."
+  "description": "The full research lab: supervisor agent + analysis workers + specialized workers."
 }

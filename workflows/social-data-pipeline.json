@@ -7,5 +7,5 @@
   "image_overlay": "rs-sandbox-dind",
   "repo": "https://github.com/joaopn/social-data-pipeline.git",
   "ref": "main",
-  "description": "An OLAP pipeline for social-media data, cloned into a sandbox-dind box (inner Docker + locked egress)."
+  "description": "Pipeline for processing, classifying, and ingesting large-scale social data."
 }

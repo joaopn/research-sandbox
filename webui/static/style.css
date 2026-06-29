@@ -27,6 +27,13 @@
     --type-research-border: #2e7d32;
     --type-sandbox-border: #17a2b8;
     --type-box-border: #8a8a8a;   /* neutral grey = bare box (empty / BYO) */
+    --type-store-border: #a371f7; /* violet = imported-repo store workflow */
+    /* New-Project card tag chips (research reuses the research green, dind the
+       sandbox cyan; code/data get their own hues). */
+    --tag-research: #2e7d32;
+    --tag-code: #d29922;
+    --tag-dind: #17a2b8;
+    --tag-data: #db61a2;
     /* management-table actions column: fixed so every per-row grid resolves the
        same column tracks (header + rows align regardless of how many action
        buttons a row shows). Sized to fit the 4-button running row
@@ -761,6 +768,10 @@ body {
     cursor: pointer;
     background: var(--bg-base);
     transition: border-color .1s, background .1s;
+    /* Column so the footer (tags + Explain) pins to the card's bottom edge via
+       margin-top:auto — grid stretches cards to a shared row height. */
+    display: flex;
+    flex-direction: column;
 }
 .workflows-card:hover {
     border-color: var(--fg-accent);
@@ -789,8 +800,19 @@ body {
 }
 .workflows-card-desc { font-size: 12px; color: var(--fg-faint); line-height: 1.4; }
 
-/* Explain button + BYO repo link on a workflow card (STAGE_WORKFLOW_EXPLAIN). */
-.workflows-card-actions { margin-top: 10px; display: flex; gap: 8px; }
+/* Card footer: tag chips on the left, the Explain action on the right
+   (STAGE_WORKFLOW_EXPLAIN + STAGE_STORE_WORKFLOWS). margin-top:auto pins it to the
+   card's bottom edge (cards are equal-height flex columns); padding-top keeps a
+   gap from the text even on the tallest card. An empty .workflow-tags keeps the
+   action right-aligned via space-between. */
+.workflows-card-actions {
+    margin-top: auto;
+    padding-top: 10px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+}
 .explain-btn {
     font-size: 12px;
     font-weight: 600;
@@ -800,16 +822,40 @@ body {
     border-radius: 4px;
     padding: 4px 10px;
     cursor: pointer;
+    text-decoration: none;   /* the store card's Explain is an <a>, not a <button> */
 }
 .explain-btn:hover { filter: brightness(1.12); }
-.explain-repo {
+
+/* New-Project sections (Research / Base / Store) + the per-section card border
+   accent + the per-card tag chips (STAGE_STORE_WORKFLOWS). Each section carries
+   its type colour: research green, base (sandbox / sandbox-dind) the sandbox cyan,
+   store violet — matching the project-list type-badge palette. The import card
+   has no group-* class, so it keeps its neutral dashed border. */
+.workflows-group { margin-bottom: 20px; }
+.workflows-group-title {
     font-size: 12px;
     font-weight: 600;
-    color: var(--fg-accent);
-    text-decoration: none;
-    align-self: center;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    color: var(--fg-faint);
+    margin: 0 0 8px;
 }
-.explain-repo:hover { text-decoration: underline; }
+.workflows-card.group-research { border-color: var(--type-research-border); }
+.workflows-card.group-base { border-color: var(--type-sandbox-border); }
+.workflows-card.group-store { border-color: var(--type-store-border); }
+.workflow-tags { display: flex; gap: 4px; flex-wrap: wrap; }
+.workflow-tag {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    border: 1px solid;
+    border-radius: 3px;
+    padding: 0 5px;
+}
+.workflow-tag.tag-research { border-color: var(--tag-research); color: var(--tag-research); }
+.workflow-tag.tag-code { border-color: var(--tag-code); color: var(--tag-code); }
+.workflow-tag.tag-dind { border-color: var(--tag-dind); color: var(--tag-dind); }
+.workflow-tag.tag-data { border-color: var(--tag-data); color: var(--tag-data); }
 
 /* Closable Explain doc tab in the bottom rail. */
 .explain-entry .nav-doc-close {

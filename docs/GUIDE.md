@@ -15,6 +15,7 @@ Workflow walkthrough, debugging recipes, and FAQ. For threat model and isolation
 [◾ Multiple projects](#-multiple-projects)
 [◾ Image rebuild rules](#-image-rebuild-rules)
 [◾ FAQ](#-faq)
+[◾ CLI reference](#-cli-reference)
 
 ---
 
@@ -384,3 +385,97 @@ Yes — `--dind privileged` falls back to running the supervisor with `--privile
 Destroy + recreate. The supervisor image is staged at `project create` time; existing projects keep their snapshot. There is no live-migration path by design — the workspace is the durable artifact, the container is disposable.
 
 </details>
+
+---
+
+## ◾ CLI reference
+
+The complete `research.py` surface. Every subcommand also has `--help`; this is the map, not a substitute for it.
+
+### Infrastructure
+
+```
+start [--rebuild]                  Build images (if missing) + start the rs-router + cache agent/editor dists
+stop                               Stop the router (projects untouched)
+images versions                    Print current image version pins (from versions.env)
+```
+
+### Project lifecycle
+
+```
+project create <name> [opts]       Create a project (options below)
+project attach <name>              docker exec + byobu attach (sign in to Claude here)
+project ssh <name>                 Print SSH connection info (host port + password)
+project list                       Show all projects
+project status <name>              Detailed state + worker summary
+project stop  <name|--all>         Stop the supervisor without destroying
+project start <name|--all>         Start a stopped supervisor
+project update <name> [--rebuild] [--enable IDS] [--disable IDS]
+project update-agent <name>        Re-stage the cached agent dist into a running project
+project destroy <name|--all>       Remove container + workspace + network + creds (multiple names ok)
+```
+
+**`project create` options:**
+
+```
+--workflow <name>          Workflow selector (default: research). See `workflow list`.
+--data <paths>             Comma-separated host paths, each RO at /workspace/shared/data/<basename>/
+--egress {open,locked}     Egress policy (research→open, sandbox→locked)
+--enable / --disable <ids> Worker services to (de)activate at create
+--mcp <names>              MCPs to auto-allow: 'all-enabled' (default), 'none', or a CSV of registry names
+--memory / --cpus <limit>  Docker resource limits (e.g. 16g / 4)
+--inner-firewall           Defense-in-depth ACL on the supervisor's inner bridge
+--dind {auto,sysbox,privileged}   Container runtime (default: auto)
+--ssh-port <port>          Explicit SSH host port
+--agent / --agents <a[,b]> (docker-substrate boxes) agent dist(s) to deploy at boot
+--repo URL --ref SHA       (docker-substrate boxes) clone repo@ref into /workspace/<name> at create
+--setup-script <snippet>   Shell snippet run once after checkout (RS_GITHUB_PAT for a private clone)
+--role-mcp-upstream ROLE=CSV   Pin an explicit upstream list for a --enable'd role-mcp (repeatable)
+```
+
+### Dists (host-cached, cp-deployed at boot — not baked)
+
+```
+agent  show | pull | refresh [--agent claude]   Manage the agent (Claude Code) dist
+editor show | pull | refresh                      Manage the code-server (editor) dist
+```
+
+### Browser UI + broker (optional)
+
+```
+broker passwd                      Set/replace the operator (management) password
+broker start | stop | status       The host-side lifecycle-verb daemon (owns docker access)
+webui  start [--bind IP] [--port N] [--rebuild]   Start the HTTPS browser UI
+webui  stop | status | import | cert-tailscale
+```
+
+### Workflows
+
+```
+workflow list                      List available workflows (built-in + store + BYO)
+```
+
+### `mcp` registry — external tools (reached through the per-project proxy)
+
+```
+mcp add <name> --kind {external,shared} [--image IMG --port N | --host HOST]
+mcp list | remove | enable | disable | start | stop | test ...
+mcp set-workers <name> <csv>       Which worker services auto-wire this MCP as an upstream
+project mcp allow | deny | list | sync <proj> [<mcp>]
+```
+
+### `worker` registry — pipeline agents (analysis worker + service role-MCPs)
+
+```
+worker list [--json]               Catalog (DEFAULT col = auto-enabled in new projects)
+worker enable | disable <name>     Flag a service for auto-enable in new projects
+project worker enable <proj> <name> [--upstream csv | --auto]
+project worker disable | stop | start | list | status <proj> [<name>]
+```
+
+### In-supervisor CLIs
+
+The supervisor's Claude uses these; you rarely call them directly.
+
+- **`rs-worker`** — analysis-worker lifecycle: `spawn --plan`, `list`, `status`, `wait`, `message`, `finalize`/`accept`/`unstage` (the cycle gates), `shutdown`/`destroy`, `attach`/`tail`.
+- **`rs-sandbox`** — (DIND projects) box lifecycle: `create [name] --preset {empty,websearcher,data-wrangler,byo} [--agent claude|none] [--editor] [--mcps csv] [--repo URL --ref SHA --setup CMD]`, `list [--json]`, `stop`, `start`, `restart`, `discard [--keep-workspace]`.

@@ -7,5 +7,5 @@
   "agents": ["claude"],
   "repo": "https://github.com/Imbad0202/academic-research-skills.git",
   "ref": "main",
-  "description": "A collection of academic-research Claude skills, cloned into a confined runc box with claude on."
+  "description": "Academic Research Skills for Claude Code: research → write → review → revise → finalize"
 }

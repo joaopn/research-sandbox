@@ -7,5 +7,5 @@
   "agents": ["claude"],
   "repo": "https://github.com/k-dense-ai/scientific-agent-skills.git",
   "ref": "main",
-  "description": "A collection of scientific-agent Claude skills, cloned into a confined runc box with claude on."
+  "description": "A comprehensive collection of 148 ready-to-use scientific and research skills."
 }

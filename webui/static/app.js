@@ -1518,31 +1518,45 @@ function renderWorkflowsScreen(view, result) {
     const workflows = Array.isArray(result.workflows) ? result.workflows : [];
     const agents = Array.isArray(result.agents) ? result.agents : [];
     const explain = new Set(state.explainIndex || []);
-    const grid = el("div", { class: "workflows-grid" }, workflows.map((m) => {
-        // A built-in with a baked doc → Explain; a BYO with a repo → "Repo ↗".
-        // Both stopPropagation so they don't trigger the card's create dialog.
+    // A card's section: its declared group, else Store — the catch-all for a
+    // group-less manifest (e.g. a future BYO entry).
+    const bucketOf = (m) =>
+        (["research", "base", "store"].includes(m.group) ? m.group : "store");
+    const buildCard = (m) => {
+        // A built-in with a baked doc → Explain (the in-app explainer); any other
+        // repo-bearing card → Explain opens the repo's GitHub README. Both
+        // stopPropagation so they don't also trigger the card's create dialog.
         let action = null;
         if (explain.has(m.name)) {
             action = el("button", { class: "explain-btn", title: "Open the explainer" }, ["Explain"]);
             action.onclick = (ev) => { ev.stopPropagation(); openExplain(m.name); };
-        } else if (m.source === "byo" && m.repo) {
-            action = el("a", { class: "explain-repo", href: m.repo,
-                               target: "_blank", rel: "noopener noreferrer" }, ["Repo ↗"]);
+        } else if (m.repo) {
+            const url = m.repo.replace(/\.git$/, "") + "#readme";
+            action = el("a", { class: "explain-btn", href: url, target: "_blank",
+                               rel: "noopener noreferrer", title: "Open the repo README" }, ["Explain"]);
             action.onclick = (ev) => { ev.stopPropagation(); };
         }
-        const card = el("div", { class: "workflows-card", title: m.description || "" }, [
+        const tags = Array.isArray(m.tags) ? m.tags : [];
+        const tagsEl = el("div", { class: "workflow-tags" },
+            tags.map((t) => el("span", { class: "workflow-tag tag-" + t }, [t])));
+        const card = el("div", { class: "workflows-card group-" + bucketOf(m),
+                                 title: m.description || "" }, [
             el("div", { class: "workflows-card-name" }, [
-                m.name,
+                m.title || m.name,
                 m.source === "byo" ? el("span", { class: "workflows-byo" }, ["byo"]) : null,
             ]),
             el("div", { class: "workflows-card-desc" }, [m.description || ""]),
-            el("div", { class: "workflows-card-actions" }, [action]),
+            el("div", { class: "workflows-card-actions" }, [tagsEl, action]),
         ]);
         card.onclick = () => mgmtCreateDialog(view, m, agents);
         return card;
-    }));
-    // Import an existing project — a box alongside the workflow cards (was the
-    // rail's "+ Add project"). Opens the SSH-coordinates / import-string modal.
+    };
+    // Partition into the three sections, then render Research → Base → Store —
+    // each non-empty group under its own header.
+    const buckets = { research: [], base: [], store: [] };
+    for (const m of workflows) buckets[bucketOf(m)].push(buildCard(m));
+    // Import an existing project — a card in the Store section (imported things);
+    // was the rail's "+ Add project". Opens the SSH-coordinates / import modal.
     const importCard = el("div", { class: "workflows-card import-card",
                                    title: "Add an existing project by its SSH coordinates" }, [
         el("div", { class: "workflows-card-name" }, ["Import project"]),
@@ -1551,12 +1565,18 @@ function renderWorkflowsScreen(view, result) {
         el("div", { class: "workflows-card-actions" }, [null]),
     ]);
     importCard.onclick = () => openAddProjectModal();
-    grid.appendChild(importCard);
+    buckets.store.push(importCard);
+    const sections = [["research", "Research"], ["base", "Base"], ["store", "Store"]]
+        .filter(([key]) => buckets[key].length)
+        .map(([key, label]) => el("div", { class: "workflows-group" }, [
+            el("div", { class: "workflows-group-title" }, [label]),
+            el("div", { class: "workflows-grid" }, buckets[key]),
+        ]));
     view.appendChild(el("div", { class: "workflows-screen" }, [
         el("h2", { class: "workflows-title" }, ["New Project"]),
         el("div", { class: "hint workflows-sub" },
            ["Pick a workflow to create a project, or import an existing one."]),
-        grid,
+        ...sections,
     ]));
 }
 

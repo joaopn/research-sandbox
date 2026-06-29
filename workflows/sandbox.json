@@ -3,5 +3,5 @@
   "group": "base",
   "tags": [],
   "substrate": "docker",
-  "description": "A single confined runc container (ssh, no inner docker, no agent) — a bare sandbox box. The editor is on by default; disable it with `--disable code-server`."
+  "description": "A bare sandbox box. Use for any generic usecase that doesn't need docker."
 }
