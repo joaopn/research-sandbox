@@ -1905,7 +1905,12 @@ async function mgmtBoxAddDialog(project) {
         // claude on + locked the cards); the operator can still override it.
         if (!agentS.disabled) agentS.value = selectedPreset.agent_default ? "claude" : "none";
         markAgent();
-        byoGroup.style.display = selectedPreset.clone ? "" : "none";
+        // Pre-check the editor toggle from the preset's UI default (still un-checkable).
+        editorCb.checked = !!selectedPreset.editor_default;
+        editorCard.classList.toggle("selected", editorCb.checked);
+        // Show the BYO clone fields only when the preset clones AND the repo isn't
+        // baked into the preset (a baked-repo preset like paper-orchestra hides them).
+        byoGroup.style.display = (selectedPreset.clone && !selectedPreset.repo) ? "" : "none";
     }
     function applyMcpCoupling() {
         const any = mcpBoxes.some((b) => b.cb.checked);

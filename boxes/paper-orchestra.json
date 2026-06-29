@@ -1,0 +1,9 @@
+{
+  "name": "paper-orchestra",
+  "image": "base",
+  "agent_default": true,
+  "clone": true,
+  "editor_default": true,
+  "repo": "https://github.com/Ar9av/PaperOrchestra",
+  "description": "A PaperOrchestra box: clones the PaperOrchestra repo at boot, with Claude and the editor on by default."
+}

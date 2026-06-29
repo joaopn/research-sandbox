@@ -770,7 +770,7 @@ class BoxPresetsResult:
     allowed MCP names — drives the webui box window's preset cards + MCP picker.
     No credentials; safe to serialise straight into the broker reply."""
     project: str
-    presets: list[dict]                     # {name,image,agent_default,clone,description,source}
+    presets: list[dict]                     # {name,image,agent_default,clone,editor_default,repo,description,source}
     allowed_mcps: list[str]
 
 
@@ -4997,6 +4997,8 @@ def box_presets(req: "BoxPresetsRequest", _progress=None) -> BoxPresetsResult:  
     presets = [{"name": e["name"], "image": e.get("image"),
                 "agent_default": bool(e.get("agent_default")),
                 "clone": bool(e.get("clone")),
+                "editor_default": bool(e.get("editor_default")),
+                "repo": e.get("repo") or "",
                 "description": e.get("description") or "",
                 "source": e.get("source")}
                for e in catalog]

@@ -380,8 +380,10 @@ def cmd_create(args: argparse.Namespace) -> None:
         die(f"sandbox {name!r} already exists; discard it or pick another name")
     preset = resolve_preset(args.preset)
     is_clone = bool(preset.get("clone"))
-    repo, ref, setup = (args.repo or "").strip(), (args.ref or "").strip(), \
-        (args.setup or "").strip()
+    # A clone preset may bake its repo URL (e.g. paper-orchestra); an explicit
+    # --repo overrides it. ref/setup stay caller-supplied (no baked-ref presets yet).
+    repo = (args.repo or "").strip() or (preset.get("repo") or "").strip()
+    ref, setup = (args.ref or "").strip(), (args.setup or "").strip()
     if (repo or setup) and not is_clone:
         die(f"--repo/--setup are only valid for a clone (BYO) preset; "
             f"preset {args.preset!r} does not clone")

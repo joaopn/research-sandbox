@@ -50,12 +50,16 @@ NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 # rs-sandbox render the catalog in list order). Built-ins sort by their index
 # here; an unlisted built-in and every BYO operator type fall after, by name.
 # Product order, not operator data — a constant here, not a manifest field.
-_BUILTIN_ORDER = ("empty", "websearcher", "data-wrangler", "byo")
+_BUILTIN_ORDER = ("empty", "websearcher", "data-wrangler", "byo",
+                  "paper-orchestra")
 
 # `instructions` is folded in from the sibling .md (built-ins) or carried inline
 # (BYO), so it is an allowed key on the normalized entry the validator sees.
+# `repo` bakes a clone URL into the preset (clone:true presets only); `editor_default`
+# pre-selects the box's editor toggle in the webui (a UI default — NOT honored by
+# the in-supervisor rs-sandbox, so a box stays opt-out-able).
 _ALLOWED_KEYS = {"name", "image", "agent_default", "clone", "description",
-                 "instructions"}
+                 "instructions", "repo", "editor_default"}
 
 
 class BoxCatalogError(Exception):
@@ -92,6 +96,18 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
     # but it must be a string when present.
     if "instructions" in m and not isinstance(m["instructions"], str):
         out.append(p("instructions must be a string"))
+
+    # editor_default is optional; when present it must be a boolean.
+    if "editor_default" in m and not isinstance(m["editor_default"], bool):
+        out.append(p(f"editor_default must be a boolean, got {m.get('editor_default')!r}"))
+
+    # repo bakes a clone URL into the preset; it must be a non-empty string and is
+    # only meaningful for a clone preset (so a non-empty repo requires clone:true).
+    if "repo" in m:
+        if not _is_str(m["repo"]):
+            out.append(p("repo must be a non-empty string"))
+        elif m.get("clone") is not True:
+            out.append(p("repo requires clone:true (a baked repo only applies to a clone preset)"))
 
     extras = set(m) - _ALLOWED_KEYS
     if extras:
