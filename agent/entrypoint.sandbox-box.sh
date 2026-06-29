@@ -67,11 +67,10 @@ if [[ ! -f ~/.claude/settings.json ]]; then
 fi
 
 # --- BYO clone (byo preset): clone repo@ref + run setup --------------------
-# RS_BOX_CLONE_REPO/REF/SETUP are set only for a `byo` box. Mirrors
-# entrypoint.pi-isolated.sh: clone VISIBLY to /workspace/<repo-name>, pin REF (no
-# drift), run SETUP in the clone (every boot — the container ~ resets on recreate;
-# expected idempotent + cheap). SETUP runs in THIS box shell (the value arrived as
-# host -e argv, never via a host shell).
+# RS_BOX_CLONE_REPO/REF/SETUP are set only for a `byo` box: clone VISIBLY to
+# /workspace/<repo-name>, pin REF (no drift), run SETUP in the clone (every boot —
+# the container ~ resets on recreate; expected idempotent + cheap). SETUP runs in
+# THIS box shell (the value arrived as host -e argv, never via a host shell).
 if [[ -n "${RS_BOX_CLONE_REPO:-}" ]]; then
     REPO_DIR="/workspace/$(basename "${RS_BOX_CLONE_REPO%.git}")"
     if [[ ! -d "${REPO_DIR}/.git" ]]; then

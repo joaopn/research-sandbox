@@ -64,7 +64,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import box_catalog  # noqa: E402  (box-preset catalog; staged into the supervisor)
 import defaults  # noqa: E402
 import mcp_registry  # noqa: E402
-import pi_isolated_registry  # noqa: E402
 import role_mcp  # noqa: E402
 import extension  # noqa: E402
 import workflow  # noqa: E402  (manifest store catalog; from_kwargs resolves --workflow)
@@ -577,7 +576,6 @@ class CreateResult:
     data_mounts: dict[str, str] = field(default_factory=dict)   # basename → host src
     mcps: list[str] = field(default_factory=list)               # granted (best-effort)
     workers: list[str] = field(default_factory=list)            # enabled (all-or-abort)
-    extensions: list[str] = field(default_factory=list)          # enabled (all-or-abort)
     # Light-path harness result (non-secret; for the report). NEVER github_pat —
     # CreateResult is asdict'd into the broker reply + lingers in webui OP_RUNS.
     repo: str = ""
@@ -618,9 +616,7 @@ class UpdateResult:
     rebuilt: bool
     refreshed_claude: bool
     workers_enabled: list[str] = field(default_factory=list)
-    extensions_enabled: list[str] = field(default_factory=list)
     workers_disabled: list[str] = field(default_factory=list)
-    extensions_disabled: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -771,95 +767,6 @@ class BoxPresetsResult:
     No credentials; safe to serialise straight into the broker reply."""
     project: str
     presets: list[dict]                     # {name,image,agent_default,clone,description,source}
-    allowed_mcps: list[str]
-
-
-@dataclass(frozen=True)
-class ExtEnableRequest:
-    """Enable a baked/BYO extension on a RUNNING research project (webui-driven).
-    ``name`` is catalog-gated; ``upstreams`` is the extension's explicit
-    proxy-routed MCP set (project-scoped names, allowlist-validated downstream —
-    NOT host-shaped, so relayable) or None for auto. ``force_auto`` re-derives =
-    every allowed MCP. Auto wins if both are supplied."""
-    project: str
-    name: str
-    upstreams: list[str] | None = None
-    force_auto: bool = False
-
-    @classmethod
-    def from_kwargs(cls, **kw: Any) -> "ExtEnableRequest":
-        name = kw.get("name")
-        if name not in extension.known_type_names():
-            raise ValidationError(
-                f"unknown extension {name!r} (not a baked role or registered BYO "
-                f"type)")
-        force_auto = bool(kw.get("auto", False))
-        upstreams: list[str] | None
-        if force_auto:
-            upstreams = None
-        else:
-            raw = kw.get("upstream")
-            if raw is None:
-                upstreams = None
-            elif isinstance(raw, list) and all(
-                    isinstance(u, str) and u for u in raw):
-                upstreams = list(raw)
-            else:
-                raise ValidationError(
-                    "upstream must be a list of non-empty MCP-name strings")
-        return cls(project=_require_name(kw.get("project")), name=name,
-                   upstreams=upstreams, force_auto=force_auto)
-
-
-@dataclass(frozen=True)
-class ExtDisableRequest:
-    project: str
-    name: str
-
-    @classmethod
-    def from_kwargs(cls, **kw: Any) -> "ExtDisableRequest":
-        name = kw.get("name")
-        # _BOX_NAME_RE charset (\A[a-z][a-z0-9-]*\Z) ⊇ the extension/BYO name
-        # grammar, so a now-unregistered-but-enabled type can still be disabled.
-        if not (isinstance(name, str) and _BOX_NAME_RE.match(name)):
-            raise ValidationError(
-                "extension name must be lowercase, start with a letter, and "
-                "contain only letters, digits, or '-'")
-        return cls(project=_require_name(kw.get("project")), name=name)
-
-
-@dataclass(frozen=True)
-class ExtListRequest:
-    project: str
-
-    @classmethod
-    def from_kwargs(cls, **kw: Any) -> "ExtListRequest":
-        return cls(project=_require_name(kw.get("project")))
-
-
-@dataclass
-class ExtEnableResult:
-    project: str
-    name: str
-    kind: str
-    upstream_source: str | None
-    upstream_mcps: list[str]
-
-
-@dataclass
-class ExtDisableResult:
-    project: str
-    name: str
-
-
-@dataclass
-class ExtListResult:
-    """A research project's extension catalog + enabled set (with live state) +
-    the project's allowed MCPs (to drive the enable dialog's upstream picker). No
-    secrets — safe to serialise into the broker reply."""
-    project: str
-    catalog: list[dict]
-    enabled: list[dict]
     allowed_mcps: list[str]
 
 
@@ -1037,41 +944,31 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     network, router_ip = ensure_project_network(project, egress)
     wire_webui_to_projects()
 
-    # 3. Build docker run argv. Peel --enable/--disable tokens into the three
-    #    registries before computing service flags. The docker substrate has no
-    #    worker/extension/role-mcp layer, so only service tokens (code-server)
-    #    apply there — worker/extension tokens are noted and ignored.
-    enable_services, enable_workers, enable_extensions = \
+    # 3. Build docker run argv. Peel --enable/--disable tokens into service vs
+    #    worker registries before computing service flags. The docker substrate
+    #    has no worker/role-mcp layer, so only service tokens (code-server) apply
+    #    there — worker tokens are noted and ignored.
+    enable_services, enable_workers = \
         _split_enable_tokens(",".join(req.enable))
-    disable_services, disable_workers, disable_extensions = \
+    disable_services, disable_workers = \
         _split_disable_tokens(",".join(req.disable))
     role_mcp_explicit: dict[str, list[str]] = {}
     if is_docker:
-        if (enable_workers or enable_extensions or disable_workers
-                or disable_extensions):
-            print("note: the docker substrate has no worker/extension layer; "
+        if enable_workers or disable_workers:
+            print("note: the docker substrate has no worker layer; "
                   "ignoring those --enable/--disable tokens", file=sys.stderr)
-        enable_workers, enable_extensions = [], []
+        enable_workers = []
     else:
-        _dis_w, _dis_s = set(disable_workers), set(disable_extensions)
+        _dis_w = set(disable_workers)
         if project_type == PROJECT_TYPE_SANDBOX_DIND:
             for w in enable_workers:
                 print(f"note: --enable {w!r}: sandbox projects have no worker layer; "
                       f"ignoring (for a browser box use the websearcher box preset)",
                       file=sys.stderr)
             enable_workers = []
-            enable_extensions = [s for s in enable_extensions if s not in _dis_s]
         else:
             enable_workers = [w for w in _ordered_union(defaults.enabled("worker"), enable_workers)
                               if w not in _dis_w]
-            enable_extensions = [s for s in _ordered_union(defaults.enabled("extension"), enable_extensions)
-                                if s not in _dis_s]
-        _known_sb = extension.known_type_names()
-        for s in list(enable_extensions):
-            if s not in _known_sb:
-                print(f"note: default sandbox {s!r} is no longer a known type; "
-                      f"skipping its auto-enable", file=sys.stderr)
-                enable_extensions.remove(s)
         role_mcp_explicit = _parse_role_mcp_upstream(
             list(req.role_mcp_upstream), valid_roles=set(enable_workers))
         for role in enable_workers:
@@ -1124,10 +1021,6 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         docker_args = (docker_args[:-1]
                        + ["-v", f"{EDITOR_DIST_DIR}:{EDITOR_DIST_MOUNT}:ro"]
                        + [docker_args[-1]])
-    if not is_docker:
-        ext_mounts = _extension_external_mounts(project)
-        if ext_mounts:
-            docker_args = docker_args[:-1] + ext_mounts + [docker_args[-1]]
 
     # 4. Create container.
     progress.step("create-container", "creating project container")
@@ -1138,7 +1031,6 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
 
     granted: list[str] = []
     workers_enabled: list[str] = []
-    extensions_enabled: list[str] = []
 
     clone_dir = ""
     if is_docker:
@@ -1232,26 +1124,17 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
                 _supervisor_mcp_reload(container_name)
 
         # 6d. worker sugar (--enable <worker>). FAIL-EXPLICIT: a worker that
-        #     won't enable aborts the create (no swallow). Workers and the
-        #     same-named extension are independent surfaces (no auto-mirror).
-        #     This is the slow tail — a role-MCP like websearcher builds/starts
-        #     a Chromium container — so the "wire" milestone is emitted AFTER
-        #     the loops, not before: its view-log row stays pending (the UI shows
-        #     it in-progress) until the enabling actually finishes, instead of
-        #     checking ✓ up front while the box sits on a silent wait.
+        #     won't enable aborts the create (no swallow). This is the slow tail
+        #     — a role-MCP like websearcher builds/starts a Chromium container —
+        #     so the "wire" milestone is emitted AFTER the loop, not before: its
+        #     view-log row stays pending (the UI shows it in-progress) until the
+        #     enabling actually finishes, instead of checking ✓ up front while
+        #     the box sits on a silent wait.
         for role in enable_workers:
             _role_mcp_enable(project, cfg, role, role_mcp_explicit.get(role))
             workers_enabled.append(role)
 
-        # 6e. extension sugar (--enable <extension>). FAIL-EXPLICIT, same as
-        #     workers. Twin names resolve worker-first in _split_enable_tokens,
-        #     so a name here is never also in enable_workers. Baked extensions
-        #     auto-derive their upstreams (= all allowed MCPs) on first enable.
-        for name in enable_extensions:
-            _extension_enable(project, cfg, name)
-            extensions_enabled.append(name)
-
-        progress.step("wire", "enabling workers and sandboxes")
+        progress.step("wire", "enabling workers")
 
     # 7. Return result (the front-end formats the report from this).
     return CreateResult(
@@ -1270,7 +1153,6 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         data_mounts={b: str(src) for b, src in data_basenames.items()},
         mcps=granted,
         workers=workers_enabled,
-        extensions=extensions_enabled,
         repo=req.repo,
         clone_dir=clone_dir,
         agents=deployed_agents,
@@ -1452,9 +1334,9 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     print(f"=== Updating project: {project} ===")
 
     # Validate --enable worker tokens up front so a typo doesn't waste a rebuild.
-    enable_services, enable_workers, enable_extensions = \
+    enable_services, enable_workers = \
         _split_enable_tokens(",".join(req.enable))
-    disable_services, disable_workers, disable_extensions = \
+    disable_services, disable_workers = \
         _split_disable_tokens(",".join(req.disable))
     role_mcp_explicit = _parse_role_mcp_upstream(
         list(req.role_mcp_upstream), valid_roles=set(enable_workers))
@@ -1482,19 +1364,15 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         flags_override = _compute_service_flags(
             enable_services, disable_services, base=base)
 
-    # Disables run BEFORE the recreate (the recreate's restart loops read
-    # role-mcps.json / extensions.json; a removed entry must not come back up).
-    # Fail-explicit: a disable that dies aborts.
+    # Disables run BEFORE the recreate (the recreate's restart loop reads
+    # role-mcps.json; a removed entry must not come back up). Fail-explicit:
+    # a disable that dies aborts.
     workers_disabled: list[str] = []
-    extensions_disabled: list[str] = []
-    if disable_workers or disable_extensions:
+    if disable_workers:
         progress.step("disable", "applying disables")
     for role in disable_workers:
         _role_mcp_disable(project, cfg, role)
         workers_disabled.append(role)
-    for name in disable_extensions:
-        _extension_disable(project, cfg, name)
-        extensions_disabled.append(name)
 
     progress.step("recreate", "recreating supervisor")
     _recreate_supervisor(
@@ -1512,22 +1390,17 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         _refresh_workspace_claude_templates(container)
         refreshed = True
 
-    # worker + extension enables (idempotent on re-run). Fail-explicit.
-    if enable_workers or enable_extensions:
+    # worker enables (idempotent on re-run). Fail-explicit.
+    if enable_workers:
         progress.step("enable", "applying enables")
     workers_enabled: list[str] = []
-    extensions_enabled: list[str] = []
     for role in enable_workers:
         _role_mcp_enable(project, cfg, role, role_mcp_explicit.get(role))
         workers_enabled.append(role)
-    for name in enable_extensions:
-        _extension_enable(project, cfg, name)
-        extensions_enabled.append(name)
 
     return UpdateResult(
         project=project, rebuilt=req.rebuild, refreshed_claude=refreshed,
-        workers_enabled=workers_enabled, extensions_enabled=extensions_enabled,
-        workers_disabled=workers_disabled, extensions_disabled=extensions_disabled)
+        workers_enabled=workers_enabled, workers_disabled=workers_disabled)
 
 
 # ===========================================================================
@@ -1557,18 +1430,10 @@ SANDBOX_DIND_IMAGE = "rs-sandbox-dind:latest"        # sandbox-dind flavor (agen
 ANALYSIS_IMAGE = "rs-analysis-base:latest"
 MCP_PROXY_IMAGE = "rs-mcp-proxy:latest"
 ROLE_MCP_BASE_IMAGE = "rs-role-mcp-base:latest"
-PI_BASE_IMAGE = "rs-pi-base:latest"
-# Generic PI-isolated image (one for every BYO type). FROM rs-ext-base (lane-3) +
-# git + clone/setup entrypoint, fully private (no artifact-contract). The :latest
-# tag is the build output + the GENERIC_REGISTRY_IMAGES host base; the build retags
-# it :<PI_ISOLATED_VERSION> for the registry push, and a project's inner dockerd
-# PULLS the snapshot ref (frozen into extensions.json at enable).
-PI_ISOLATED_IMAGE = "rs-pi-isolated:latest"
-# Clean, research-DECOUPLED base for EXTENSION node images (STAGE_FEATURE_STAGING
+# Clean, research-DECOUPLED base for the box node images (STAGE_FEATURE_STAGING
 # C1). FROM miniconda3 (NOT rs-analysis-base) — sibling of rs-minimal-base, forked
-# on rebuild-blast-radius. Ext leaves (rs-ext-<name>) AND the lane-3 generic images
-# (pi-isolated, sandbox-box) FROM it. See cli/extension.py EXT_REGISTRY_REFS /
-# GENERIC_REGISTRY_IMAGES.
+# on rebuild-blast-radius. The lane-3 generic box images (sandbox-box[-browser])
+# FROM it. See cli/extension.py GENERIC_REGISTRY_IMAGES.
 EXT_BASE_IMAGE = "rs-ext-base:latest"
 # Disposable box image for the agent-less sandbox-project flavor
 # (STAGE_SANDBOX_PROJECT.md). FROM rs-ext-base (lane-3) — lean (no data-science
@@ -2208,7 +2073,7 @@ AGENT_DIST_MOUNT = "/opt/agent-dist"
 DEFAULT_AGENT = "claude"
 # RO copy-source mount spliced into every inner `docker run` (the source is the
 # supervisor's staged dir — same path, RO). The entrypoint cp's its own copy.
-# Spliced UNCONDITIONALLY at the rscore spawn sites (role-MCP / PI / pi-isolated):
+# Spliced UNCONDITIONALLY at the rscore role-MCP spawn site:
 # the dind floor guarantees the dist is staged, and even on a missing source an
 # inner -v auto-creates an inert empty dir (the entrypoint absence-guard no-ops).
 # rs_worker.py / rs_sandbox.py guard with os.path.isdir instead — a DELIBERATE
@@ -2287,11 +2152,11 @@ _AGENT_SETTINGS_JSON = json.dumps(
 
 # ---------------------------------------------------------------------------
 # Editor dist — host-cached, version-pinned code-server copied into an
-# INTERACTIVE container at boot (STAGE_EDITOR_DIST slice 1). The PI/worker
-# lineage (rs-pi-base / rs-pi-isolated / rs-sandbox-box) has NO baked editor;
-# this delivers it the same way the agent dist delivers claude. The minimal
-# lineage keeps its bake in slice 1 (the coexistence guard skips the dist cp
-# there); slice 2 deletes the bake and flips it to the dist.
+# INTERACTIVE container at boot (STAGE_EDITOR_DIST slice 1). The box lineage
+# (rs-sandbox-box[-browser]) has NO baked editor; this delivers it the same way
+# the agent dist delivers claude. The minimal lineage keeps its bake in slice 1
+# (the coexistence guard skips the dist cp there); slice 2 deletes the bake and
+# flips it to the dist.
 # ---------------------------------------------------------------------------
 
 EDITOR_DIST_DIR = Path.home() / ".research-sandbox" / "editor-dist"
@@ -2470,9 +2335,9 @@ def agent_pull(agent: str = "claude", version: str | None = None) -> dict:
 def _stage_agent_dist(supervisor: str, agent: str = DEFAULT_AGENT,
                       *, deploy_local: bool = True) -> None:
     """Stage the host agent dist into a RUNNING supervisor (STAGE_AGENT_DIST slice
-    2). Real files at AGENT_DIST_MOUNT — the inner fleet (worker / role-MCP / pi /
-    pi-isolated / sandbox-box) RO-mounts that path and cp's its own writable copy
-    at boot. `deploy_local` ALSO (re)deploys the supervisor's OWN ~/.local from the
+    2). Real files at AGENT_DIST_MOUNT — the inner fleet (worker / role-MCP /
+    sandbox-box) RO-mounts that path and cp's its own writable copy at boot.
+    `deploy_local` ALSO (re)deploys the supervisor's OWN ~/.local from the
     dist — True for the research flavor (the PI's interactive claude + the
     rs-audit-stop hook live there); False for the rs-sandbox-dind (sandbox-dind) flavor,
     whose supervisor never runs claude itself but DOES stage the dist so its
@@ -2866,16 +2731,10 @@ def _build_images(force: bool) -> None:
         (ANALYSIS_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.analysis-base"),
         (MCP_PROXY_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.mcp-proxy"),
         (ROLE_MCP_BASE_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.role-mcp-base"),
-        (PI_BASE_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.pi-base"),
         # Clean extension base (STAGE_FEATURE_STAGING C1). FROM miniconda3, so it
-        # has no in-tree FROM dependency; the ext leaves (dynamic loop below) AND
-        # the lane-3 generic images (pi-isolated + sandbox-box) FROM it, so it MUST
-        # precede them.
+        # has no in-tree FROM dependency; the box images (sandbox-box[-browser])
+        # FROM it, so it MUST precede them.
         (EXT_BASE_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.ext-base"),
-        # Generic PI-isolated image — FROM rs-ext-base (lane-3): research-decoupled
-        # + registry-delivered, adds git + the clone/setup entrypoint. One image
-        # for every isolated type (type behavior comes from the cloned repo).
-        (PI_ISOLATED_IMAGE, SCRIPT_DIR / "agent" / "Dockerfile.pi-isolated"),
         # Disposable sandbox-project box image — FROM rs-ext-base (lane-3): lean
         # (no data-science stack) + clean of the PI artifact-contract. The browser
         # variant FROMs it, so it must build first (bottom-up).
@@ -2891,35 +2750,7 @@ def _build_images(force: bool) -> None:
                   file=sys.stderr)
             continue
         specs.append((image, dockerfile))
-    # PI per-role images (rs-pi-echo, rs-pi-wrangler, …) FROM rs-pi-base.
-    # Build order is bottom-up so each FROM resolves to the freshly-built
-    # layer, same discipline as role-mcp-base.
-    for role, image in sorted(extension.BAKED_IMAGES.items()):
-        dockerfile = SCRIPT_DIR / "agent" / f"Dockerfile.pi-{role}"
-        if not dockerfile.is_file():
-            print(f"warning: sandbox image {image} has no Dockerfile at "
-                  f"{dockerfile.name}; skipping (add it in the per-role stage)",
-                  file=sys.stderr)
-            continue
-        specs.append((image, dockerfile))
     pins = load_versions()
-    # MIGRATED extension-lane roles (STAGE_FEATURE_STAGING C1): build a clean
-    # rs-ext-<name> image (FROM rs-ext-base, no rs-analysis-base lineage), tagged
-    # with its versions.env pin so the push/pull ref carries the snapshot pin. The
-    # PUSH to the local registry happens lazily at `enable` (_push_extension_image),
-    # not here — `_build_images` only produces the host image.
-    for name, (repo, vkey) in sorted(extension.EXT_REGISTRY_REFS.items()):
-        dockerfile = SCRIPT_DIR / "agent" / f"Dockerfile.ext-{name}"
-        if not dockerfile.is_file():
-            print(f"warning: extension {name!r} has no Dockerfile at "
-                  f"{dockerfile.name}; skipping", file=sys.stderr)
-            continue
-        pin = pins.get(vkey)
-        if not pin:
-            print(f"warning: extension {name!r} missing pin {vkey} in "
-                  f"versions.env; skipping", file=sys.stderr)
-            continue
-        specs.append((f"rs-ext-{name}:{pin}", dockerfile))
     for tag, dockerfile in specs:
         if not force and run_quiet(["docker", "image", "inspect", tag]):
             print(f"image {tag} already present (use --rebuild to force)")
@@ -3136,16 +2967,10 @@ def _read_supervisor_metadata(container: str) -> dict:
 
     # Bind-mounts other than /workspace and the privileged-DIND volume —
     # i.e. user-supplied --data paths under /workspace/shared/data/<basename>/.
-    # /external/* (PI-isolated external folders) are deliberately EXCLUDED:
-    # they're recomputed fresh from the host registry on every recreate
-    # (_extension_external_mounts), so recovering them here would both
-    # double-add and pin stale roots after a registry edit.
     extra_mounts: list[str] = []
     for m in data.get("Mounts") or []:
         dst_in = m.get("Destination", "")
         if dst_in in ("/workspace", "/var/lib/docker"):
-            continue
-        if dst_in.startswith("/external/"):
             continue
         if m.get("Type") != "bind":
             continue
@@ -3307,12 +3132,6 @@ def _recreate_supervisor(
     )
     if md["extra_mounts"]:
         docker_args = docker_args[:-1] + md["extra_mounts"] + [docker_args[-1]]
-    # PI-isolated external folders are recomputed fresh from the host
-    # registry (excluded from md["extra_mounts"]) so the recreate tracks
-    # the current registry — newly-added types appear, removed ones drop.
-    ext_mounts = _extension_external_mounts(project)
-    if ext_mounts:
-        docker_args = docker_args[:-1] + ext_mounts + [docker_args[-1]]
     # build_supervisor_docker_args emits ["run", "-d", ...]; convert to create.
     assert docker_args[0] == "run" and docker_args[1] == "-d"
     create_args = ["create"] + docker_args[2:]
@@ -3407,43 +3226,28 @@ def _recreate_supervisor(
                   f"`research project role-mcp enable {project} {role}`",
                   file=sys.stderr)
 
-    # Same idea for extension containers (baked PI roles + BYO isolated agents,
-    # STAGE_CLI_TAXONOMY). The extensions.json snapshot is the source of truth;
-    # _extension_start re-stages the image into the (potentially fresh) inner
-    # dockerd and restarts the container. For BYO entries the supervisor's
-    # /external/<type> mounts were just recomputed from the registry above, so
-    # every agent's external folder is wired before its container restarts.
-    # Workspace state survives because it's on the project volume.
+    # Restart the project's boxes (kind="sandbox", extensions.json). Boxes are
+    # owned by the in-supervisor rs-sandbox CLI; the snapshot is the source of
+    # truth and the workspace state survives on the project volume. Any non-box
+    # entry (a stale baked/byo entry from a pre-overhaul project) is skipped —
+    # the PI-role lineage is retired (greenfield: destroy + recreate).
     extension_entries = extension.load(workspace_path)
     for name in sorted(extension_entries):
-        # kind="sandbox" boxes (the agent-less flavor) are owned by the
-        # in-supervisor rs-sandbox CLI, not the host baked/byo start path —
-        # _extension_start only knows baked/byo and would wrongly treat a box as
-        # byo (external mount + repo env). Delegate the restart to rs-sandbox
-        # so the docker-run logic lives in one place.
-        if extension_entries[name].get("kind") == extension.SANDBOX_KIND:
-            # Boxes are a first-class standing dind utility (STAGE_DIND_UNIFY): make
-            # the harness available before restarting. On research the box harness is
-            # NOT re-staged by the create/recreate branches above (frozen lane), so
-            # without this a research box's container is gone + rs-sandbox/image
-            # absent → the restart exec fails + dead tab. Inert on sandbox-dind
-            # (eager-staged) and for a box-less project (no kind="sandbox" entries).
-            _ensure_box_harness(container, network, workspace_path,
-                                bool(extension_entries[name].get("browser")))
-            r = run(["docker", "exec", container, "rs-sandbox", "restart", name],
-                    capture_output=True)
-            if r.returncode != 0:
-                print(f"warning: failed to restart sandbox box {name!r}: "
-                      f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
+        if extension_entries[name].get("kind") != extension.SANDBOX_KIND:
             continue
-        try:
-            _extension_start(container, project, cfg, name,
-                           force_restage=force_restage)
-        except SystemExit:
-            print(f"warning: failed to restart sandbox {name!r}; "
-                  f"the entry in extensions.json is intact, retry with "
-                  f"`research project extension enable {project} {name}`",
-                  file=sys.stderr)
+        # Boxes are a first-class standing dind utility (STAGE_DIND_UNIFY): make
+        # the harness available before restarting. On research the box harness is
+        # NOT re-staged by the create/recreate branches above (frozen lane), so
+        # without this a research box's container is gone + rs-sandbox/image
+        # absent → the restart exec fails + dead tab. Inert on sandbox-dind
+        # (eager-staged) and for a box-less project (no kind="sandbox" entries).
+        _ensure_box_harness(container, network, workspace_path,
+                            bool(extension_entries[name].get("browser")))
+        r = run(["docker", "exec", container, "rs-sandbox", "restart", name],
+                capture_output=True)
+        if r.returncode != 0:
+            print(f"warning: failed to restart sandbox box {name!r}: "
+                  f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
 
 
 def _container_project_type(container: str) -> str:
@@ -3730,35 +3534,11 @@ def _connect_registry_to_project_network(network: str) -> None:
         capture_output=True)
 
 
-def _push_extension_image(name: str) -> None:
-    """Lazily publish a migrated extension's host-built image into the local
-    registry (STAGE_FEATURE_STAGING C1 lazy-push). Pushes via the loopback port
-    (insecure-by-default, no host daemon.json change). Idempotent — re-pushing an
-    existing tag re-sends only the manifest (layers are skipped)."""
-    pins = load_versions()
-    repo, vkey = extension.EXT_REGISTRY_REFS[name]
-    pin = pins.get(vkey)
-    if not pin:
-        die(f"missing version pin {vkey} for extension {name!r}; add it to "
-            f"versions.env and run `research start --rebuild`.")
-    host_tag = f"rs-ext-{name}:{pin}"
-    if not run_quiet(["docker", "image", "inspect", host_tag]):
-        die(f"extension image {host_tag} not built; run `research start "
-            f"--rebuild` first.")
-    _ensure_registry_running()
-    host_port = pins.get("REGISTRY_HOST_PORT", DEFAULT_REGISTRY_HOST_PORT)
-    push_ref = f"127.0.0.1:{host_port}/{repo}:{pin}"
-    run_check(["docker", "tag", host_tag, push_ref])
-    run_check(["docker", "push", push_ref])
-    print(f"published extension {name!r} -> {extension.EXT_REGISTRY}/{repo}:{pin}")
-
-
 def _push_generic_image(host_base: str) -> None:
-    """Lazily publish a GENERIC lane-3 image (rs-pi-isolated / rs-sandbox-box[
-    -browser]) into the local registry. Mirrors _push_extension_image but keys on
-    extension.GENERIC_REGISTRY_IMAGES and the rs-<base>:<pin> host tag the build
-    retag produced. Called at the MINT site only (create for boxes, enable for
-    pi-isolated) — a recreate PULLS the frozen pin, never re-pushes."""
+    """Lazily publish a GENERIC lane-3 box image (rs-sandbox-box[-browser]) into
+    the local registry. Keys on extension.GENERIC_REGISTRY_IMAGES and the
+    rs-<base>:<pin> host tag the build retag produced. Called at the MINT site
+    only (box create) — a recreate PULLS the frozen pin, never re-pushes."""
     pins = load_versions()
     repo, vkey = extension.GENERIC_REGISTRY_IMAGES[host_base]
     pin = pins.get(vkey)
@@ -3938,85 +3718,6 @@ def _set_enabled(name: str, value: bool) -> dict:
         except mcp_registry.RegistryError as e:
             die(str(e))
     return entry
-
-
-# ---------------------------------------------------------------------------
-# PI-isolated type registry CLI (STAGE_PI_ISOLATED)
-# ---------------------------------------------------------------------------
-# Host-side registry of reusable PI-isolated agent *types* (repo + root
-# folder + setup). Mirrors the general MCP registry's host+project split:
-# types are defined once here and referenced by name at
-# `project create|update --enable <type>`. The registry ships empty — RS
-# pre-bakes no types.
-
-
-def projects_using_extension_type(name: str) -> list[str]:
-    """Scan per-project extensions.json snapshots for projects that enable this
-    BYO type — the gate for a safe `extension remove`. A BYO extension entry is
-    keyed by its type name, so membership is the test."""
-    cfg = load_config()
-    root = Path(cfg.projects_dir).expanduser().resolve()
-    if not root.is_dir():
-        return []
-    out: list[str] = []
-    for p in sorted(root.iterdir()):
-        if not p.is_dir():
-            continue
-        entries = extension.load(workspace_path_for(p.name, cfg))
-        e = entries.get(name)
-        if isinstance(e, dict) and e.get("kind") == "byo":
-            out.append(p.name)
-    return out
-
-
-def _verify_pi_isolated_repo(repo: str, ref: str) -> None:
-    """Best-effort `git ls-remote` check that repo+ref resolve, so a typo
-    surfaces at `add` time rather than inside the supervisor at first
-    enable (bad failure-distance — STAGE_PI_ISOLATED Q6). Skipped with a
-    warning if git isn't on the host PATH; the operator can pass
-    --no-verify to skip deliberately."""
-    if not shutil.which("git"):
-        print("warning: git not on PATH; skipping repo/ref verification "
-              "(pass --no-verify to silence)", file=sys.stderr)
-        return
-    r = run(["git", "ls-remote", "--exit-code", repo, ref],
-            capture_output=True)
-    if r.returncode != 0:
-        die(f"could not resolve ref {ref!r} in {repo!r} via git ls-remote "
-            f"(pass --no-verify to skip this check):\n"
-            f"  {(r.stderr or r.stdout).strip()}")
-
-
-def _resolve_pi_isolated_ref(repo: str) -> str:
-    """Resolve the repo's default-branch HEAD to a concrete commit SHA so a
-    `--ref`-less `add` still pins (no silent upstream drift — the invariant
-    holds, the operator just doesn't have to look the SHA up). Requires git
-    on the host: pinning is non-negotiable, so if we can't resolve we fail
-    rather than store an unpinned entry."""
-    if not shutil.which("git"):
-        die("git not on PATH: cannot resolve the latest commit to pin "
-            "(--ref omitted). Install git, or pass --ref <sha> explicitly.")
-    r = run(["git", "ls-remote", repo, "HEAD"], capture_output=True)
-    if r.returncode != 0 or not r.stdout.split():
-        die(f"could not resolve default-branch HEAD of {repo!r} via "
-            f"git ls-remote:\n  {(r.stderr or r.stdout).strip()}")
-    return r.stdout.split()[0]
-
-
-def _extension_registry_edit(name: str, mutate) -> None:
-    with pi_isolated_registry.lock():
-        try:
-            data = pi_isolated_registry.load(expand=False)
-        except pi_isolated_registry.RegistryError as e:
-            die(str(e))
-        entry = data["types"].get(name)
-        if entry is None:
-            die(f"no extension type named {name!r}")
-        mutate(entry)
-        try:
-            pi_isolated_registry.save_atomic(data)
-        except pi_isolated_registry.RegistryError as e:
-            die(str(e))
 
 
 def _shared_mcps(only_enabled: bool = False) -> list[tuple[str, dict]]:
@@ -4639,44 +4340,8 @@ def _parse_csv_list(value: str | None) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Per-project PI-role lifecycle (STAGE_BACKEND_PI P.0)
+# Inner-container state (shared helper)
 # ---------------------------------------------------------------------------
-
-
-def _extension_ensure_workspace(supervisor: str, name: str, kind: str) -> None:
-    """Pre-create the extension's workspace bind-mount source dir as the
-    uid-1000 supervisor user, so dockerd's auto-create on ``docker run -v``
-    doesn't land it root-owned and lock out the container's worker user.
-
-    No credentials are staged — extensions are PI-owned: they boot un-authed
-    and the PI authenticates in-tab (``/login``) or pulls the supervisor's
-    creds via the manual ``rs-pi sync-creds`` bridge. bypassPermissions
-    config is baked into rs-pi-base. Source path differs by kind (baked:
-    ``pi/<name>``; byo: ``pi-isolated/<name>``) — see extension.workspace_subdir."""
-    sub = extension.workspace_subdir(name, kind)
-    r = run(["docker", "exec", supervisor, "bash", "-eu", "-c",
-             f"mkdir -p /workspace/{sub}"], capture_output=True)
-    if r.returncode != 0:
-        die((r.stderr or r.stdout).strip()
-            or f"failed to ensure workspace dir for sandbox {name!r}")
-
-
-def _extension_inner_exists(supervisor: str, name: str, kind: str) -> bool:
-    # `docker container inspect` (not bare inspect, which falls through to the
-    # same-named image — the inner dockerd tags per-role images with the
-    # container's unqualified name).
-    cname = extension.container_name(name, kind)
-    r = run(["docker", "exec", supervisor,
-             "docker", "container", "inspect", cname], capture_output=True)
-    return r.returncode == 0
-
-
-def _extension_inner_running(supervisor: str, name: str, kind: str) -> bool:
-    cname = extension.container_name(name, kind)
-    r = run(["docker", "exec", supervisor,
-             "docker", "inspect", "-f", "{{.State.Running}}", cname],
-            capture_output=True)
-    return r.returncode == 0 and r.stdout.strip() == "true"
 
 
 def _inner_container_states(supervisor: str) -> dict[str, str]:
@@ -4698,334 +4363,31 @@ def _inner_container_states(supervisor: str) -> dict[str, str]:
     return out
 
 
-def _extension_start(supervisor: str, project: str, cfg: "Config",
-                   name: str, *, force_restage: bool = False) -> None:
-    """Run an extension container in the supervisor's inner dockerd. Idempotent:
-    tears down any prior same-named container first. Branches on the entry's
-    ``kind`` — baked roles stage a per-role image + mirror MCP wiring; BYO
-    agents stage the generic image + clone an external repo. Lazy-stages the
-    image; pass force_restage after a host-side rebuild."""
-    workspace_path = workspace_path_for(project, cfg)
-    entries = extension.load(workspace_path)
-    entry = entries.get(name)
-    if entry is None:
-        die(f"no extensions.json entry for {name!r}; call enable first")
-    kind = entry.get("kind")
-
-    cname = extension.container_name(name, kind)
-    run(["docker", "exec", supervisor, "docker", "rm", "-f", cname],
-        capture_output=True)
-    _extension_ensure_workspace(supervisor, name, kind)
-    ip = entry["ip"]
-
-    # Editor dist (STAGE_EDITOR_DIST): interactive PI/extension containers RO-mount
-    # the supervisor's staged /opt/editor-dist + carry RS_SERVICE_CODE_SERVER from
-    # the PROJECT's code-server service flag (read off the supervisor's label, the
-    # outside-the-container truth). The entrypoint deploys the editor only when the
-    # flag is enabled AND the mount is populated (a project without the editor
-    # pulled stages none → an empty/absent mount → the entrypoint no-ops). The mount
-    # is spliced unconditionally (an inner -v auto-creates an inert empty dir if the
-    # source is absent, exactly like the agent mount); the flag gates the deploy.
-    _editor_on = _read_service_flags(supervisor).get("code-server", True)
-    editor_args = [
-        *EDITOR_DIST_MOUNT_ARGS,
-        "-e", f"RS_SERVICE_CODE_SERVER={'enabled' if _editor_on else 'disabled'}",
-    ]
-
-    if kind == "baked":
-        image = entry.get("image") or extension.image_ref(name, load_versions())
-        if extension.is_ext(name):
-            # MIGRATED extension (STAGE_FEATURE_STAGING C1): the inner dockerd
-            # PULLS the snapshot ref from the local registry (offline — the
-            # registry is attached to this project's own network) instead of a
-            # host save/load stage. force_restage is irrelevant: the pin is
-            # immutable, so a recreate re-pulls the same tag (layer-cached). The
-            # same ref is used for the `docker run` below.
-            run_check(["docker", "exec", supervisor, "docker", "pull", image])
-        else:
-            stage_worker_image(supervisor, image, force=force_restage)
-        # Single RW workspace mount + RO orchestrator mount. The latter lets a
-        # mirror role render .mcp.json + .tools-inventory.md at entrypoint time
-        # from the same role-mcps.json the worker service uses (pi-echo-style
-        # roles with no worker twin simply ignore it). No /creds mount —
-        # PI-owned; bypassPermissions baked into rs-pi-base.
-        docker_args = [
-            "docker", "exec", supervisor,
-            "docker", "run", "-d",
-            "--name", cname,
-            "--network", INNER_NETWORK,
-            "--ip", ip,
-            "--restart", "unless-stopped",
-            "-v", f"/workspace/pi/{name}:/workspace",
-            "-v", "/workspace/.orchestrator:/etc/orchestrator:ro",
-            *AGENT_DIST_MOUNT_ARGS,   # claude copy-source (no bake; slice 2)
-            *editor_args,             # code-server copy-source + flag (STAGE_EDITOR_DIST)
-            "-e", f"RS_PI_ROLE={name}",
-            "--label", f"research.pi_role={extension.pi_role_label(name, kind)}",
-            "--label", f"research.project={project}",
-            # Project --data paths, propagated RO at the same mount points the
-            # supervisor + workers see them at.
-            *_data_mount_args_from_supervisor(supervisor),
-            image,
-        ]
-        run_check(docker_args)
-        print(f"sandbox {name!r} (baked): running at {ip}")
-    else:  # byo
-        # Registry-delivered (lane-3): PULL the snapshot rs-pi-isolated ref the
-        # inner dockerd already has access to (the registry was connected to this
-        # project's network at enable, and survives recreate). entry.get("image")
-        # is the frozen pin; the generic_image_ref fallback covers a pre-migration
-        # byo entry with no "image" key — converting a would-be KeyError into a
-        # caught pull-failure (the restart loop's except SystemExit skips it
-        # gracefully; the operator re-enables to push/connect/snapshot) — RF3. The
-        # fallback's missing-pin is mapped to die() (SystemExit) too, so it stays a
-        # graceful per-extension skip in the recreate loop rather than a ValueError
-        # that would escape and abort the whole recreate.
-        image = entry.get("image")
-        if not image:
-            try:
-                image = extension.generic_image_ref("rs-pi-isolated", load_versions())
-            except ValueError as e:
-                die(str(e))
-        run_check(["docker", "exec", supervisor, "docker", "pull", image])
-        mount = entry.get("mount") or pi_isolated_registry.DEFAULT_MOUNT
-        # RW workspace (repo cloned to /workspace/<repo> by the entrypoint) +
-        # the external host folder at the configured mount. No /creds mount.
-        docker_args = [
-            "docker", "exec", supervisor,
-            "docker", "run", "-d",
-            "--name", cname,
-            "--network", INNER_NETWORK,
-            "--ip", ip,
-            "--restart", "unless-stopped",
-            "-v", f"/workspace/pi-isolated/{name}:/workspace",
-            "-v", f"/external/{name}:{mount}",
-            *AGENT_DIST_MOUNT_ARGS,   # claude copy-source (no bake; slice 2)
-            *editor_args,             # code-server copy-source + flag (STAGE_EDITOR_DIST)
-            "-e", f"RS_PI_ISO_NAME={name}",
-            "-e", f"RS_PI_ISO_REPO={entry.get('repo') or ''}",
-            "-e", f"RS_PI_ISO_REF={entry.get('ref') or ''}",
-            "-e", f"RS_PI_ISO_SETUP={entry.get('setup') or ''}",
-            "-e", f"RS_PI_ISO_MOUNT={mount}",
-            "--label", f"research.pi_role={extension.pi_role_label(name, kind)}",
-            "--label", f"research.pi_isolated={name}",
-            "--label", f"research.project={project}",
-            *_data_mount_args_from_supervisor(supervisor),
-            image,
-        ]
-        run_check(docker_args)
-        print(f"sandbox {name!r} (byo): running at {ip}")
-
-
-def _extension_stop(supervisor: str, name: str, kind: str) -> None:
-    """Stop + remove the extension container in the inner dockerd. Tolerates
-    absence. Verifies removal with `docker container inspect` (not bare
-    inspect, which falls through to the same-named image)."""
-    cname = extension.container_name(name, kind)
-    rm = run(["docker", "exec", supervisor, "docker", "rm", "-f", cname],
-             capture_output=True)
-    check = run(["docker", "exec", supervisor,
-                 "docker", "container", "inspect", cname],
-                capture_output=True)
-    if check.returncode == 0:
-        rm_tail = (rm.stderr or rm.stdout or "").strip()[-200:]
-        die(f"extension container {cname!r} still present after disable; "
-            f"docker rm -f tail: {rm_tail!r}. Inspect "
-            f"`docker exec {supervisor} docker container inspect {cname}` "
-            f"manually and retry `research project extension disable`.")
-
-
-def _extension_enable(project: str, cfg: "Config", name: str,
-                      upstreams: list[str] | None = None,
-                      *, force_auto: bool = False) -> None:
-    """Resolve the extension kind (baked role vs BYO registry type), write the
-    per-project extensions.json entry, and start the container. Idempotent.
-
-    A baked extension owns its own proxy-routed MCP upstream set, independent of
-    any worker service of the same name (the entrypoint renders .mcp.json from
-    this extension's own entry). Upstream-source state machine (mirrors
-    ``_role_mcp_enable``):
-      - ``upstreams=list``: explicit pin (survives sync).
-      - ``upstreams=None, force_auto=True`` OR first enable: auto-derive = every
-        MCP allowed for the project; write ``upstream_source=auto``.
-      - ``upstreams=None, force_auto=False`` with an existing entry: idempotent
-        re-run — preserve the current source + set.
-    BYO agents are isolated (no proxy .mcp.json) so they take no upstreams; they
-    recreate the supervisor first if it doesn't yet mount /external/<name>."""
-    supervisor = container_name_for(project)
-    if not container_running(supervisor):
-        die(f"project {project!r} is not running; bring it up first")
-    workspace_path = workspace_path_for(project, cfg)
-    entries = extension.load(workspace_path)
-
-    if extension.is_baked(name):
-        existing = entries.get(name)
-        if upstreams is not None:
-            chosen_upstreams = list(upstreams)
-            chosen_source = "explicit"
-        elif force_auto or existing is None:
-            chosen_upstreams = _derive_extension_auto_upstreams(project, cfg)
-            chosen_source = "auto"
-        else:
-            chosen_upstreams = list(existing.get("upstream_mcps") or [])
-            chosen_source = existing.get("upstream_source") or "explicit"
-        try:
-            role_mcp.validate_upstreams(
-                chosen_upstreams, load_project_allowlist(project, cfg))
-        except ValueError as e:
-            die(str(e))
-        entries[name] = extension.build_baked_entry(
-            name, load_versions(),
-            upstreams=chosen_upstreams, upstream_source=chosen_source)
-        extension.save(workspace_path, entries)
-        if extension.is_ext(name):
-            # MIGRATED extension (STAGE_FEATURE_STAGING C1): publish the host
-            # image to the local registry (lazy push) and attach the registry to
-            # this project's network so the inner dockerd's pull in _extension_start
-            # resolves rs-registry:5000 over the project's own subnet. Both are
-            # idempotent.
-            _push_extension_image(name)
-            _connect_registry_to_project_network(project_network_for(project))
-        _extension_start(supervisor, project, cfg, name)
-        return
-
-    # BYO: look up the host registry type, allocate an IP, snapshot the entry.
-    type_entry = pi_isolated_registry.entry_for(name, expand=True)
-    if type_entry is None:
-        die(f"no sandbox named {name!r} (not a baked role, not in the host "
-            f"BYO registry). Register a BYO type first: `research extension add "
-            f"{name} --root <host-dir> [--repo <url> --ref <sha>]`")
-    try:
-        ip = extension.allocate_byo_ip(entries, name)
-    except ValueError as e:
-        die(str(e))
-    entries[name] = extension.build_byo_entry(name, type_entry, ip, load_versions())
-    extension.save(workspace_path, entries)
-
-    # Registry-deliver the generic rs-pi-isolated image (lane-3): push (lazy) +
-    # connect the registry to this project's network, BEFORE the external-mount
-    # branch — because the first byo enable commonly takes the recreate-and-return
-    # path, where the container is started by the recreate restart loop's
-    # _extension_start (byo branch), which PULLS rs-registry:5000/pi-isolated:<pin>.
-    # If push/connect sat only after this branch, that pull would hit an unconnected
-    # registry / unpushed blob and fail (RF2).
-    _push_generic_image("rs-pi-isolated")
-    _connect_registry_to_project_network(project_network_for(project))
-
-    if not _supervisor_has_external_mount(supervisor, name):
-        print(f"sandbox {name!r}: supervisor not yet mounting /external/{name}; "
-              f"recreating supervisor to wire the external folder (creds + "
-              f"workspace survive)...")
-        _recreate_supervisor(project, cfg)
-        return  # recreate's restart loop starts the container
-    _extension_start(supervisor, project, cfg, name)
-
-
-def _extension_disable(project: str, cfg: "Config", name: str) -> None:
-    """Stop the container, drop the extensions.json entry. Workspace state (and,
-    for BYO, the external host folder with the cloned repo) survives — they're
-    on the project volume / host root, unaffected by docker rm."""
-    supervisor = container_name_for(project)
-    workspace_path = workspace_path_for(project, cfg)
-    entries = extension.load(workspace_path)
-    if name not in entries:
-        die(f"sandbox {name!r} is not enabled for project {project!r}")
-    kind = entries[name].get("kind")
-    if container_running(supervisor):
-        _extension_stop(supervisor, name, kind)
-    del entries[name]
-    extension.save(workspace_path, entries)
-
-
-# ---------------------------------------------------------------------------
-# Sandbox external-folder mounts (BYO sandboxes only — baked roles have none)
-# ---------------------------------------------------------------------------
-
-
-def _extension_external_mounts(project: str) -> list[str]:
-    """``-v`` args mounting each registered BYO type's ``<root>/<project>/``
-    host folder at the supervisor's ``/external/<type>``. Computed fresh from
-    the host BYO registry at every supervisor create/recreate, so the mount
-    set always tracks the current registry (a removed type drops out; a newly-
-    added type appears on the next recreate). The per-project subdir is created
-    host-side so docker doesn't auto-create it root-owned. ``~`` is expanded
-    here; ``${VAR}`` was expanded by the registry loader."""
-    try:
-        data = pi_isolated_registry.load(expand=True)
-    except pi_isolated_registry.RegistryError as e:
-        die(str(e))
-    mounts: list[str] = []
-    for name, entry in sorted(data["types"].items()):
-        root = Path(entry["root"]).expanduser()
-        host_dir = root / project
-        host_dir.mkdir(parents=True, exist_ok=True)
-        mounts += ["-v", f"{host_dir}:/external/{name}"]
-    return mounts
-
-
-def _supervisor_has_external_mount(supervisor: str, name: str) -> bool:
-    """True if the supervisor container currently bind-mounts
-    ``/external/<name>``. Drives the enable path's decide-to-recreate: a
-    type registered after the supervisor's last create/recreate isn't
-    mounted yet, so enable must recreate (re-enumerating the registry)
-    before it can start the inner container against that source path."""
-    r = run(["docker", "inspect", "-f",
-             "{{range .Mounts}}{{.Destination}}\n{{end}}", supervisor],
-            capture_output=True)
-    if r.returncode != 0:
-        return False
-    return f"/external/{name}" in r.stdout.split("\n")
-
-
-def _registered_sandbox_byo_types() -> set[str]:
-    """BYO extension type names in the host registry, or empty on load failure
-    (a malformed registry shouldn't break `project create`; the dedicated
-    `sandbox` subcommands surface the error). Baked role names are constants
-    (extension.baked_names()), not in this set."""
-    try:
-        return set(pi_isolated_registry.load(expand=False)["types"])
-    except pi_isolated_registry.RegistryError:
-        return set()
-
-
 def _split_enable_tokens(
     enable_arg: str | None,
-) -> tuple[str | None, list[str], list[str]]:
-    """Split ``--enable`` value into (service_csv, worker_roles, sandboxes).
+) -> tuple[str | None, list[str]]:
+    """Split ``--enable`` value into (service_csv, worker_roles).
 
-    Tokens are matched against the registries in order, by canonical name:
+    Tokens are matched by canonical name:
       - a key in ``role_mcp.ROLE_IMAGES`` (e.g. ``wrangler``, ``websearcher``,
         ``echo-mcp``) peels into the worker list,
-      - a name resolving to an extension type (baked ``echo`` / ``wrangler`` /
-        ``websearcher`` or a BYO registry type) that is NOT also a worker peels
-        into the extension list,
       - anything else stays for ``_compute_service_flags`` as a service id.
-
-    Worker-first ordering resolves the twin overlap (``wrangler`` is both a
-    worker and a baked extension): a bare twin name enables the WORKER only —
-    the worker and the same-named extension are independent surfaces (no
-    auto-mirror), so the extension is enabled separately via
-    ``project extension enable``.
 
     Empty service set returns None to keep the default intact."""
     if not enable_arg:
-        return None, [], []
-    sandbox_types = extension.known_type_names()
+        return None, []
     services: list[str] = []
     workers: list[str] = []
-    sandboxes: list[str] = []
     for tok in enable_arg.split(","):
         tok = tok.strip()
         if not tok:
             continue
         if tok in role_mcp.ROLE_IMAGES:
             workers.append(tok)
-        elif tok in sandbox_types:
-            sandboxes.append(tok)
         else:
             services.append(tok)
     svc_csv = ",".join(services) if services else None
-    return svc_csv, workers, sandboxes
+    return svc_csv, workers
 
 
 def _parse_role_mcp_upstream(
@@ -5068,31 +4430,24 @@ def _ordered_union(*lists: list[str]) -> list[str]:
 
 def _split_disable_tokens(
     disable_arg: str | None,
-) -> tuple[str | None, list[str], list[str]]:
+) -> tuple[str | None, list[str]]:
     """Mirror of `_split_enable_tokens` for the disable side: (service_csv,
-    workers, sandboxes). Same worker-first resolution order so a token that
-    names both a worker service and a baked extension (wrangler / websearcher)
-    disables the worker (whose mirror then isn't enabled either). `--disable`
-    overrules the default-enable set at `project create`, and disables an
-    enabled worker/extension at `project update`."""
+    workers). `--disable` overrules the default-enable set at `project create`,
+    and disables an enabled worker at `project update`."""
     if not disable_arg:
-        return None, [], []
-    sandbox_types = extension.known_type_names()
+        return None, []
     services: list[str] = []
     workers: list[str] = []
-    sandboxes: list[str] = []
     for tok in disable_arg.split(","):
         tok = tok.strip()
         if not tok:
             continue
         if tok in role_mcp.ROLE_IMAGES:
             workers.append(tok)
-        elif tok in sandbox_types:
-            sandboxes.append(tok)
         else:
             services.append(tok)
     svc_csv = ",".join(services) if services else None
-    return svc_csv, workers, sandboxes
+    return svc_csv, workers
 
 
 # ---------------------------------------------------------------------------
@@ -5365,11 +4720,10 @@ def box_list(req: "BoxListRequest", _progress=None) -> BoxListResult:  # type: i
 def box_presets(req: "BoxPresetsRequest", _progress=None) -> BoxPresetsResult:  # type: ignore[name-defined]
     """The box-preset catalog (built-ins + the operator box-registry) + the
     project's allowed MCP names — drives the webui box window (preset cards + MCP
-    picker), the sibling of ext_list for the box lane. Gated on a running dind
-    supervisor (boxes are a dind feature). `box_catalog.load_catalog()` can raise
-    `BoxCatalogError` on a malformed box-registry.json (unlike `extension.catalog`'s
-    tolerant baked-only fallback) — map it to ValidationError so it can't escape
-    `dispatch` (the verb-fn-raise rule)."""
+    picker). Gated on a running dind supervisor (boxes are a dind feature).
+    `box_catalog.load_catalog()` can raise `BoxCatalogError` on a malformed
+    box-registry.json — map it to ValidationError so it can't escape `dispatch`
+    (the verb-fn-raise rule)."""
     _running_dind_supervisor(req.project)
     cfg = load_config()
     try:
@@ -5385,65 +4739,6 @@ def box_presets(req: "BoxPresetsRequest", _progress=None) -> BoxPresetsResult:  
     allowed = sorted(x["name"] for x in load_project_allowlist(req.project, cfg)
                      if x.get("name"))
     return BoxPresetsResult(project=req.project, presets=presets, allowed_mcps=allowed)
-
-
-def ext_enable(req: "ExtEnableRequest", progress=None) -> ExtEnableResult:  # type: ignore[name-defined]
-    """Enable a baked/BYO extension on a running dind project — research OR
-    sandbox-dind now (STAGE_DIND_UNIFY); webui-driven.
-    Coarse progress wrapper over the shared `_extension_enable` (which owns the
-    upstream state-machine + the BYO-recreate path). For a BYO first-enable the
-    'enable' milestone stays pending through the supervisor recreate — acceptable
-    (the op tails like a slow create; terminals reconnect)."""
-    progress = progress or _NULL_PROGRESS
-    progress.step("validate", "checking the project")
-    _running_dind_supervisor(req.project)
-    cfg = load_config()
-    progress.step("enable", "enabling the extension")
-    _extension_enable(req.project, cfg, req.name, req.upstreams,
-                      force_auto=req.force_auto)
-    progress.step("ready", "extension ready")
-    entry = extension.load(workspace_path_for(req.project, cfg)).get(req.name, {})
-    return ExtEnableResult(
-        project=req.project, name=req.name, kind=entry.get("kind", "?"),
-        upstream_source=entry.get("upstream_source"),
-        upstream_mcps=list(entry.get("upstream_mcps") or []))
-
-
-def ext_disable(req: "ExtDisableRequest", progress=None) -> ExtDisableResult:  # type: ignore[name-defined]
-    """Disable an extension on a running dind project (research or sandbox-dind).
-    Workspace (and, for BYO, the cloned external folder) survive — no step-up
-    needed."""
-    progress = progress or _NULL_PROGRESS
-    progress.step("validate", "checking the project")
-    _running_dind_supervisor(req.project)
-    cfg = load_config()
-    progress.step("disable", "disabling the extension")
-    _extension_disable(req.project, cfg, req.name)
-    return ExtDisableResult(project=req.project, name=req.name)
-
-
-def ext_list(req: "ExtListRequest", _progress=None) -> ExtListResult:  # type: ignore[name-defined]
-    """The project's extension catalog + enabled set (live container state) + the
-    project's allowed MCPs (to drive the enable dialog's upstream picker)."""
-    supervisor = _running_dind_supervisor(req.project)
-    cfg = load_config()
-    workspace_path = workspace_path_for(req.project, cfg)
-    entries = extension.load(workspace_path)
-    states = _inner_container_states(supervisor)
-    enabled = []
-    for nm, e in sorted(entries.items()):
-        cname = e.get("container") or extension.container_name(nm, e.get("kind"))
-        enabled.append({
-            "name": nm, "kind": e.get("kind"), "ip": e.get("ip"),
-            "state": states.get(cname, "absent"),
-            "upstream_source": e.get("upstream_source"),
-            "upstream_mcps": list(e.get("upstream_mcps") or []),
-        })
-    allowed = sorted(x["name"] for x in load_project_allowlist(req.project, cfg)
-                     if x.get("name"))
-    return ExtListResult(project=req.project,
-                         catalog=extension.catalog(load_versions()),
-                         enabled=enabled, allowed_mcps=allowed)
 
 
 def wire_webui_to_projects() -> None:

@@ -44,7 +44,6 @@ RUN su - worker -c 'echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.bashrc
 
 # Minimal byobu status line — only the time widget on the right, nothing
 # extra crowding the bar. Must be staged before the skel snapshot below.
-# Inherited unchanged by rs-pi-base (FROM rs-analysis-base).
 RUN install -d -o worker -g worker /home/worker/.byobu /home/worker/.byobu/bin
 COPY --chown=worker:worker agent/byobu-status      /home/worker/.byobu/status
 COPY --chown=worker:worker agent/byobu-bin-rolename /home/worker/.byobu/bin/60_rolename

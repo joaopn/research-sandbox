@@ -1,28 +1,18 @@
-"""defaults — host-side default-enablement for the worker + extension surfaces.
+"""defaults — host-side default-enablement for the worker surface.
 
-Mirrors the MCP registry's ``enabled`` → auto-allow model for the two surfaces
-whose catalogs are code constants (worker services in ``role_mcp.ROLE_IMAGES``,
-baked sandboxes in ``sandbox.BAKED_IMAGES``) plus the BYO sandbox types — none
-of which has a per-entry host file to carry a flag the way ``mcp-registry.json``
-does. The "enabled flag" lives as a host-level set per surface:
+Mirrors the MCP registry's ``enabled`` → auto-allow model for the worker
+surface, whose catalog is a code constant (``role_mcp.ROLE_IMAGES``) with no
+per-entry host file to carry a flag the way ``mcp-registry.json`` does. The
+"enabled flag" lives as a host-level set:
 
     ~/.research-sandbox/defaults.json
-    {"worker":  {"on": [...], "off": [...]},
-     "extension": {"on": [...], "off": [...]}}
+    {"worker": {"on": [...], "off": [...]}}
 
 A name's default-enabled state = ``(BUILTIN ∪ on) − off``. ``BUILTIN`` ships
-some entries on out of the box (the wrangler + websearcher worker services);
-``on`` adds operator extras, ``off`` overrides a builtin back off. A
-default-enabled entry is auto-applied to every NEW project at `project create`
-(subject to per-project `--disable`); it's create-time only — `project update`
-does not re-apply it.
-
-**Extensions are opt-in and independent of workers.** A baked extension
-(echo/wrangler/websearcher) owns its own MCP upstream set and has no worker-twin
-coupling — every extension type, baked or BYO, is an independent default target
-flaggable with ``extension enable/disable``. ``BUILTIN["extension"]`` ships
-empty (no extension is default-on out of the box); operators opt a type in
-like any other default.
+some entries on out of the box (the websearcher worker service); ``on`` adds
+operator extras, ``off`` overrides a builtin back off. A default-enabled entry
+is auto-applied to every NEW project at `project create` (subject to per-project
+`--disable`); it's create-time only — `project update` does not re-apply it.
 
 Stdlib only.
 """
@@ -34,17 +24,14 @@ from pathlib import Path
 
 REGISTRY_DIR = Path.home() / ".research-sandbox"
 PATH = REGISTRY_DIR / "defaults.json"
-SURFACES = ("worker", "extension")
+SURFACES = ("worker",)
 
 # Entries shipped default-on. Workers: just websearcher — an image-baked
 # browser that's useful in every project and needs no allowed upstreams.
 # (wrangler is deliberately NOT default-on: without allowed DB MCPs it's an
 # inert container; enable it per-project or globally with `worker enable`.)
-# The extension surface ships none — extensions are opt-in (independent of
-# workers); operators opt a type in with `extension enable`.
 BUILTIN: dict[str, tuple[str, ...]] = {
     "worker": ("websearcher",),
-    "extension": (),
 }
 
 

@@ -630,49 +630,6 @@ async def broker_box_presets_handler(request: web.Request) -> web.Response:
     return web.json_response(reply, status=status)
 
 
-async def broker_ext_enable_handler(request: web.Request) -> web.Response:
-    """POST /broker/project/{name}/extension {name, upstream?, auto?} — enable a
-    baked/BYO extension on a running research project (gated, origin-checked).
-    Returns {op_id} immediately and tails like create/destroy. The broker's
-    EXT_ENABLE_WEBUI_FIELDS allow-list is the real input boundary; the body fields
-    are forwarded under the project name from the URL."""
-    if not origin_ok(request):
-        return web.Response(status=403, text="origin rejected")
-    project = request.match_info.get("name", "")
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    if not isinstance(body, dict):
-        body = {}
-    args = {"project": project, "name": body.get("name"),
-            "upstream": body.get("upstream"), "auto": bool(body.get("auto"))}
-    return await _start_op(request, "ext_enable", args, BROKER_OP_TIMEOUT_S,
-                           op_seed=project)
-
-
-async def broker_ext_disable_handler(request: web.Request) -> web.Response:
-    """POST /broker/project/{name}/extension/{ext}/disable — disable an extension
-    (gated, origin-checked; no step-up: the workspace + any BYO clone survive)."""
-    if not origin_ok(request):
-        return web.Response(status=403, text="origin rejected")
-    project = request.match_info.get("name", "")
-    ext = request.match_info.get("ext", "")
-    args = {"project": project, "name": ext}
-    return await _start_op(request, "ext_disable", args, BROKER_OP_TIMEOUT_S,
-                           op_seed=project)
-
-
-async def broker_extensions_handler(request: web.Request) -> web.Response:
-    """GET /broker/project/{name}/extensions — the project's extension catalog +
-    enabled set (live state) + allowed MCPs (gated). Fast read; relayed
-    synchronously. die()s (→ non-ok) for a non-research / stopped project, so the
-    webui's Extensions section self-hides there."""
-    project = request.match_info.get("name", "")
-    status, reply = await _relay(request, "ext_list", {"project": project})
-    return web.json_response(reply, status=status)
-
-
 async def broker_op_log_handler(request: web.Request) -> web.Response:
     """GET /broker/op/{op_id}/log?from=<n> — the view-log byte-slice since `n`
     plus the new EOF. Reads the RO-mounted view file directly (out-of-band from
@@ -916,16 +873,13 @@ async def project_services_handler(request: web.Request) -> web.Response:
     A crashed (enabled-but-not-listening) service also drops off, which
     is the correct UX — a tab that 502s on click is worse than no tab.
 
-    kind=ssh non-always-on services whose id starts with `pi-` are
-    gated on the project's per-supervisor extensions.json: a `pi-<short>`
-    tab shows iff the baked extension `<short>` is enabled there (plus one
-    synthesized tab per BYO sandbox). Read directly off the existing
+    One tab is synthesized per box (kind="sandbox" in the project's
+    per-supervisor extensions.json), read directly off the existing
     `/projects:ro` bind-mount — same data plane that powers the rail's
-    status sub-line; no cache, no SSH, no docker socket. Lifecycle
-    changes (`research project extension enable / disable`) reflect on the
-    next page load. RO mount surface is wider than this filter
-    (covers `.creds/` etc.), so adding new file reads here doesn't
-    expand the webui's trust posture."""
+    status sub-line; no cache, no SSH, no docker socket. Box lifecycle
+    changes (add / remove a box) reflect on the next page load. RO mount
+    surface is wider than this filter (covers `.creds/` etc.), so adding
+    new file reads here doesn't expand the webui's trust posture."""
     project = request.match_info.get("project", "")
     upstream = f"{PROJECT_CONTAINER_PREFIX}{project}"
 
@@ -954,7 +908,6 @@ async def project_services_handler(request: web.Request) -> web.Response:
     is_docker = _read_project_substrate(project) == "docker"
 
     out: dict[str, dict] = {}
-    sandbox_map: dict[str, str] | None = None
     for sid, svc in services.SERVICES.items():
         # Flavor gate (STAGE_SANDBOX_DIND_AGENT): sandbox-dind now runs an agent, so
         # it shows the Supervisor tab like research — the agent-less Management tab is
@@ -977,40 +930,29 @@ async def project_services_handler(request: web.Request) -> web.Response:
         elif svc.get("kind") == "http":
             if probe_up.get(sid):
                 out[sid] = svc
-        elif svc.get("kind") == "ssh" and sid.startswith("pi-"):
-            if sandbox_map is None:
-                sandbox_map = _read_project_extensions(project)
-            # A baked-sandbox SERVICES tab `pi-<short>` shows iff the project
-            # enables baked extension `<short>` (extensions.json key, no prefix).
-            if sandbox_map.get(sid[len("pi-"):]) == "baked":
-                out[sid] = svc
 
-    # Synthesized per-box tabs: BYO sandboxes (STAGE_CLI_TAXONOMY) and
-    # sandbox-flavor boxes (kind="sandbox", STAGE_SANDBOX_PROJECT.md). Both
-    # ride the rs-pi-iso-<name> container/tab conventions, so one synth path
-    # serves both. Same data-plane discipline — read off the /projects:ro
-    # bind-mount, no SSH/docker socket, lifecycle reflects on next page load.
-    if sandbox_map is None:
-        sandbox_map = _read_project_extensions(project)
+    # Synthesized per-box tabs: boxes (kind="sandbox", STAGE_SANDBOX_PROJECT.md)
+    # ride the rs-pi-iso-<name> container/tab conventions. Same data-plane
+    # discipline — read off the /projects:ro bind-mount, no SSH/docker socket,
+    # lifecycle reflects on next page load.
+    sandbox_map = _read_project_extensions(project)
     for name, kind in sorted(sandbox_map.items()):
-        if kind not in ("byo", "sandbox"):
+        if kind != "sandbox":
             continue
         spec = services.pi_isolated_service(name)
         if spec is not None:
-            # Stamp box_kind (STAGE_DIND_UNIFY): the SPA shows the per-tab box "✕"
-            # ONLY on a real box (kind="sandbox"); a BYO extension's pi-iso tab
-            # (kind="byo") stays managed via the Extensions config section.
+            # Stamp box_kind so the SPA shows the per-tab box "✕".
             out[f"{services.PI_ISOLATED_ID_PREFIX}{name}"] = {**spec, "box_kind": kind}
     return web.json_response(out)
 
 
 def _read_project_extensions(project: str) -> dict[str, str]:
-    """Return ``{name: kind}`` for the extensions enabled for ``project``,
-    read from its `.orchestrator/extensions.json` off the `/projects:ro`
-    bind-mount (kind is "baked" or "byo"). Tolerates: missing workspace,
-    missing extensions.json (no extensions enabled), invalid JSON — all return
-    an empty dict so the tab strip silently omits the sandbox tabs. No
-    cache: the read is cheap and lifecycle changes propagate on next load."""
+    """Return ``{name: kind}`` for the boxes recorded for ``project``, read from
+    its `.orchestrator/extensions.json` off the `/projects:ro` bind-mount (kind
+    is "sandbox" for a box). Tolerates: missing workspace, missing
+    extensions.json (no boxes), invalid JSON — all return an empty dict so the
+    tab strip silently omits the box tabs. No cache: the read is cheap and
+    lifecycle changes propagate on next load."""
     workspace = _project_workspace(project)
     if workspace is None:
         return {}
@@ -1582,14 +1524,6 @@ def main() -> None:
     app.router.add_get("/broker/project/{name}/boxes", broker_boxes_handler)
     app.router.add_get(
         "/broker/project/{name}/box-presets", broker_box_presets_handler)
-    # Extension enable/list — same shadowing rule: the fixed .../extension(s)
-    # segments MUST precede the {action} variable.
-    app.router.add_post(
-        "/broker/project/{name}/extension", broker_ext_enable_handler)
-    app.router.add_post(
-        "/broker/project/{name}/extension/{ext}/disable", broker_ext_disable_handler)
-    app.router.add_get(
-        "/broker/project/{name}/extensions", broker_extensions_handler)
     app.router.add_post(
         "/broker/project/{name}/{action}", broker_project_action_handler)
     # op-log tail + status (GETs, session-gated; the more specific /log first).

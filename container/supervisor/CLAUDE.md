@@ -58,26 +58,17 @@ The host bind-mount means the PI can browse `/workspace/` with any editor, edit 
 
 ## PI workspace boundary
 
-Do not read `/workspace/pi/` by default. These are the PI's personal role-session artifacts (interactive pi-wrangler / pi-librarian / pi-websearcher sessions, plus the pi-echo substrate fixture). Read files there only when the PI explicitly references them ("look at what I found in the wrangler tab", "check my pi/librarian/skills.md") or asks you to. Never include PI session content in worker plans or `task.md` files — workers are isolated from PI exploration state by design.
+Do not read the PI's **box** trees by default. A box is a disposable sandbox container the PI spins up (the floating "Add box" window / the in-supervisor `rs-sandbox` CLI) for running un-vetted code in isolation; its workspace lives at `/workspace/pi-isolated/<name>/`. Read files there only when the PI explicitly references them ("look at what I cloned in the box", "check pi-isolated/scratch/out.csv") or asks you to. Never include box content in worker plans or `task.md` files — workers are isolated from the PI's exploration state by design.
 
-**Exception — the publish surface.** Each extension has a `published/` subtree (`/workspace/pi/<role>/published/` and `/workspace/pi-isolated/<name>/published/`, each with a `manifest.json`) that IS yours to read routinely — it is the deliberate one-way channel by which extensions hand you finished work. Read the *rest* of each PI tree only on invitation (above); `published/` and its manifest you read freely, as the project's inventory. The reverse never holds: nothing of yours flows into an extension, and your own logbook never goes onto a publish surface.
+The same applies to `/workspace/.pi-isolated/` (hidden tree holding any per-box state) and to `/external/<name>/` — the PI's own host folders (Obsidian vaults, Overleaf working copies, etc.) bind-mounted in. All of it is supervisor-visible for code-server browsing; none of it is yours to read or fold into worker context unless the PI explicitly points you at it. Boxes are the PI's; you do not start, stop, or drive them, and nothing of yours flows into a box.
 
-The same applies to `/workspace/.pi/` (hidden tree holding the PI containers' cred-stash and any per-role daemon-private state). It's not visibility-restricted by the kernel here — the supervisor's volume mount sees both trees — but the rule is the same: don't read unless the PI invites you to.
+## Project inventory (workers)
 
-The boundary extends to two more trees that belong to **PI-isolated agents** (the PI's bring-your-own skill-repo containers): `/workspace/pi-isolated/<name>/` (the agent's workspace + cloned `.skillrepo`) and `/workspace/.pi-isolated/` (their cred-stash). It also covers `/external/<name>/` — these are the PI's own host folders (Obsidian vaults, Overleaf working copies, etc.) bind-mounted in for the isolated agents. All of it is supervisor-visible for code-server browsing, none of it is yours to read or fold into worker context unless the PI explicitly points you at it.
+You are the project's single integrator. Your inventory is the **worker** results, each carrying a `manifest.json` in the shape `{ key → { "id": "one line: what it is", "ts": <when> } }`:
 
-## Project inventory (extensions + workers)
-
-You are the project's single integrator. Every publishable artifact lives on one of two surfaces, both carrying a `manifest.json` in the same shape — `{ key → { "id": "one line: what it is", "ts": <when> } }`:
-
-- **Extensions:** `/workspace/pi/<role>/published/manifest.json` and `/workspace/pi-isolated/<name>/published/manifest.json` — each extension describes its own files as it works.
 - **Workers:** `/workspace/results/<name>/manifest.json` — written by `rs-worker accept --id` (you supply the one-liner at accept).
 
-To answer "what does the project contain?", read these manifests — they are the executive layer. Open an actual artifact only when its one-liner isn't enough (drill-down). Synthesize from the lean index; don't re-ingest every artifact wholesale — reading the index, not the corpus, is what keeps you from becoming the bottleneck.
-
-**You integrate; you do not control.** You read extension output to track project state and to reuse it — e.g. mount an extension's `published/` file into a worker you spawn. You do NOT start, stop, or drive extensions; their lifecycle is the PI's. Don't assume you can spawn or command one.
-
-**Surface absence; don't hide it.** An extension can be enabled yet silent — it died, or has produced nothing — which is indistinguishable from a missing manifest alone. The enabled set is in `/workspace/.orchestrator/extensions.json`. If an enabled extension has no `published/manifest.json` (or only a stale one), report it as a gap ("websearcher is enabled but has published nothing yet") rather than dropping it from the overview.
+To answer "what does the project contain?", read these manifests — they are the executive layer. Open an actual artifact only when its one-liner isn't enough (drill-down). Synthesize from the lean index; don't re-ingest every artifact wholesale — reading the index, not the corpus, is what keeps you from becoming the bottleneck. (Boxes do not publish to any inventory surface — they're scratch sandboxes, not deliverable producers.)
 
 ## Worker registry schema
 
@@ -358,7 +349,7 @@ A role-MCP service container also boots **un-authed and idle** on a freshly-crea
 | `rs-worker tail <name>` stream-json log shows `401` / `auth` error, or `rs-worker status` reports the worker exited with auth-shaped output | `rs-worker sync-creds <name>` — hash-compares + `docker cp + install` your current `~/.claude/.credentials.json` into the worker. Idempotent. After the refresh, `rs-worker message` to retry the in-flight turn, or respawn if the worker exited. |
 | A role-MCP returns an MCP tool error citing 401 from `send_job`, or `query_job_status` shows a failed-with-auth result | `rs-role-mcp sync-creds` — refreshes every running role-MCP in one shot. After, retry `send_job`. |
 | A role-MCP `send_job` returns the tool-error envelope `{"reason": "needs_credentials", ...}` (the worker is enabled but has no creds staged yet — typical right after `project create` on a still-un-authed supervisor) | First make sure you've authenticated this supervisor (`claude` + `/login` in byobu) if you haven't. Then `rs-role-mcp sync-creds` to copy your creds into every running role-MCP, and retry `send_job`. No job was registered or spawned — the refusal is free. |
-| The PI's interactive PI tab (pi-wrangler / pi-websearcher / etc.) prompts `/login` | Not your problem, and by design. PI containers are PI-owned — they boot un-authed and the PI authenticates in their own tab (`/login`). Nothing propagates your creds automatically. If the PI would rather inherit your identity than log in themselves, the operator runs `research project pi sync-creds <project>` host-side (one-shot, operator-initiated). |
+| A box (the PI's `rs-sandbox` container) prompts `/login` when the PI runs `claude` in it | Not your problem, and by design. Boxes are PI-owned and boot un-authed; the PI `/login`s inside the box if they want an LLM there. Nothing propagates your creds into a box. |
 
 Both `rs-worker sync-creds` and `rs-role-mcp sync-creds` operate on the local supervisor only — running workers and role-MCPs in YOUR inner dockerd. They do NOT touch other projects: this project's credentials are owned by THIS supervisor, and there is no cross-project propagation surface. The PI re-authenticates each project independently via `claude` + `/login` inside its supervisor.
 

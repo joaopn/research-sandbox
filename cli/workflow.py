@@ -18,7 +18,7 @@ Two on-disk shapes, ONE in-memory validator:
     workflows} envelope keyed by name; entries do NOT repeat the name
 `load_catalog()` normalizes both to one `{name: manifest}` map (injecting the
 registry key as `name` for BYO entries), so `_validate_entry` only ever sees a
-name-bearing dict — mirrors cli/pi_isolated_registry.py's keyed shape.
+name-bearing dict.
 """
 
 from __future__ import annotations
@@ -55,8 +55,7 @@ SERVICE_IDS = ("supervisor", "code-server")
 ALWAYS_ON_SERVICE_IDS = ("supervisor",)
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
-# A surfacing path (tab path, proxy mount): absolute, no '..' segments — the
-# same traversal guard pi_isolated_registry uses for container mount paths.
+# A surfacing path (tab path, proxy mount): absolute, no '..' segments.
 PATH_RE = re.compile(r"^/[A-Za-z0-9/_.-]*$")
 # A TCP port: the kernel's 1–65535 range. Not a tuning knob — the protocol bound.
 PORT_MIN, PORT_MAX = 1, 65535

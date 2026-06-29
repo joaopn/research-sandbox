@@ -1131,16 +1131,6 @@ const OP_CHECKLISTS = {
         { key: "validate", label: "checking the project" },
         { key: "discard", label: "discarding the box" },
     ],
-    // Keys are LOCKSTEP with the rscore ext_* progress.step() calls.
-    ext_enable: [
-        { key: "validate", label: "checking the project" },
-        { key: "enable", label: "enabling the extension" },
-        { key: "ready", label: "extension ready" },
-    ],
-    ext_disable: [
-        { key: "validate", label: "checking the project" },
-        { key: "disable", label: "disabling the extension" },
-    ],
 };
 
 // Human message for a failed op, from its structured result envelope.
@@ -1316,11 +1306,6 @@ function mgmtConfirmThenTail(view, cfg) {
 // logged/persisted browser-side (built in the request closure and POSTed once).
 
 const MGMT_ENABLE_PRESETS = ["websearcher", "wrangler"];
-
-// Extension types we don't surface in the webui enable dialog (dev/test
-// fixtures that stay reachable via the CLI). echo (pi-echo) is the P.0
-// substrate test fixture.
-const WEBUI_HIDDEN_EXTENSIONS = new Set(["echo"]);
 
 function mgmtCreateDialog(view, manifest, agents) {
     manifest = manifest || {};
@@ -1964,83 +1949,6 @@ function mgmtBoxRemoveDialog(project, box) {
             }),
         onDone: async (ok) => { if (ok) await refreshAfterBoxChange(project); },
         focus: () => pwI.focus(),
-    });
-}
-
-// ---- extensions (the config box's Extensions section) ---------------------
-// Same throwaway-view + cache-invalidation pattern as the boxes section: an
-// enable/disable changes the project's extensions.json (and thus its tab set).
-async function refreshAfterExtChange(project) {
-    delete state.projectServices[project];
-    if (state.activeProject === project) {
-        try { await activateProject(project); } catch (e) { /* best-effort */ }
-    }
-}
-
-// names = enableable types (catalog minus already-enabled); allowedMcps = the
-// project's allowed MCP names (drives the upstream picker). Auto on → upstream
-// auto (all-allowed, tracks future allows); Auto off → explicit checked subset.
-function mgmtExtEnableDialog(project, names, allowedMcps) {
-    const nameS = el("select", {}, names.map(n => el("option", { value: n }, [n])));
-    const autoCb = el("input", { type: "checkbox" });
-    autoCb.checked = true;
-    const mcpBoxes = allowedMcps.map((m) => {
-        const cb = el("input", { type: "checkbox" });
-        cb.checked = true;
-        cb.disabled = true;                 // Auto is on by default
-        return { name: m, cb };
-    });
-    const mcpList = el("div", { class: "config-mcp-picker" },
-        mcpBoxes.length
-            ? mcpBoxes.map((b) => el("label", { class: "mgmt-check" }, [b.cb, " " + b.name]))
-            : [el("div", { class: "config-empty" }, ["No MCPs allowed for this project yet."])]);
-    autoCb.onchange = () => { mcpBoxes.forEach((b) => { b.cb.disabled = autoCb.checked; }); };
-    mgmtConfirmThenTail(boxOpView(), {
-        title: `Enable an extension on ${project}`,
-        tailTitle: `Enabling an extension on ${project}`,
-        verb: "ext_enable",
-        confirmLabel: "Enable",
-        body: [
-            el("div", { class: "field" }, [el("label", {}, ["Extension"]), nameS]),
-            el("label", { class: "mgmt-check" }, [
-                autoCb, " Auto — all allowed MCPs (recommended)",
-            ]),
-            el("div", { class: "field" }, [el("label", {}, ["MCP tools"]), mcpList]),
-            el("p", { class: "config-hint" }, [
-                "A first BYO enable can take a few minutes while the supervisor is rewired.",
-            ]),
-        ],
-        validate: () => (nameS.value ? null : "Pick an extension to enable."),
-        request: () => {
-            const payload = { name: nameS.value };
-            if (autoCb.checked) payload.auto = true;
-            else payload.upstream = mcpBoxes.filter((b) => b.cb.checked).map((b) => b.name);
-            return fetch(`/broker/project/${encodeURIComponent(project)}/extension`, {
-                method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(payload),
-            });
-        },
-        onDone: async (ok) => { if (ok) await refreshAfterExtChange(project); },
-        focus: () => nameS.focus(),
-    });
-}
-
-function mgmtExtDisableDialog(project, ext) {
-    mgmtConfirmThenTail(boxOpView(), {
-        title: `Disable extension "${ext}"`,
-        tailTitle: `Disabling ${ext}`,
-        verb: "ext_disable",
-        confirmLabel: "Disable",
-        body: [
-            el("p", {}, [
-                `This stops + removes the "${ext}" container in "${project}". Its ` +
-                "workspace (and any BYO clone) survive — re-enable to bring it back.",
-            ]),
-        ],
-        request: () => fetch(
-            `/broker/project/${encodeURIComponent(project)}/extension/${encodeURIComponent(ext)}/disable`,
-            { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }),
-        onDone: async (ok) => { if (ok) await refreshAfterExtChange(project); },
     });
 }
 
@@ -2744,7 +2652,6 @@ function makeProjectConfigBox(project) {
             "No tabs yet — open this project once to load its services.",
         ]));
         box.appendChild(section);
-        appendExtensionsSection(box, project.name);
         return box;
     }
 
@@ -2782,7 +2689,6 @@ function makeProjectConfigBox(project) {
     box.appendChild(el("div", { class: "config-hint" }, [
         "Hidden tabs stay enabled on the supervisor — this only controls what shows here.",
     ]));
-    appendExtensionsSection(box, project.name);
     appendEditorExtensionSection(box, project, enabled);
     return box;
 }
@@ -2793,8 +2699,7 @@ function makeProjectConfigBox(project) {
 // on; `supervisor.box_harness` ⇒ dind. The toggle goes through `update`
 // enable/disable code-server, which RECREATES the supervisor — DIND-only, since
 // `update` refuses the docker substrate; a docker box's editor is a create-time
-// choice ("set at create"). Universal (renders on every flavor), unlike the
-// research-only "Agent roles" section above.
+// choice ("set at create"). Universal (renders on every flavor).
 function appendEditorExtensionSection(box, project, enabled) {
     const section = el("div", { class: "config-section" });
     section.appendChild(el("div", { class: "config-section-label" }, ["Extensions"]));
@@ -2834,65 +2739,6 @@ function mgmtEditorToggle(name, on) {
         }),
         onDone: async (ok) => { if (ok) await refreshAfterBoxChange(name); },
     });
-}
-
-// PI-role management (config box → "Agent roles" section — relabeled from
-// "Extensions" so it doesn't collide with the new editor "Extensions" section
-// during the C→D window; this whole function is removed in the lineage retirement).
-// Server-flavor-gated exactly like Boxes: ext_list die()s for a sandbox-dind /
-// docker-substrate / stopped project (or when logged out) → non-ok reply → the
-// section removes itself. So a sandbox-dind project shows Boxes (not Agent roles)
-// and a research project shows Agent roles, with no client-side flavor check.
-function appendExtensionsSection(box, projectName) {
-    const section = el("div", { class: "config-section" });
-    section.appendChild(el("div", { class: "config-section-label" }, ["Agent roles"]));
-    const bodyEl = el("div", { class: "config-boxes" }, [
-        el("div", { class: "config-empty" }, ["Loading extensions…"]),
-    ]);
-    section.appendChild(bodyEl);
-    box.appendChild(section);
-    loadExtensionsInto(bodyEl, section, projectName);
-}
-
-async function loadExtensionsInto(bodyEl, section, projectName) {
-    let res;
-    try {
-        res = await fetch(`/broker/project/${encodeURIComponent(projectName)}/extensions`);
-    } catch (e) { section.remove(); return; }            // broker unreachable
-    let body; try { body = await res.json(); } catch (e) { section.remove(); return; }
-    if (!res.ok || !body.ok || !body.result) { section.remove(); return; }  // not research / stopped / logged out
-    const r = body.result;
-    const enabled = r.enabled || [];
-    const catalog = r.catalog || [];
-    const allowed = r.allowed_mcps || [];
-    const enabledNames = new Set(enabled.map((e) => e.name));
-    bodyEl.innerHTML = "";
-    if (enabled.length === 0) {
-        bodyEl.appendChild(el("div", { class: "config-empty" }, ["No extensions enabled."]));
-    }
-    for (const e of enabled) {
-        const meta = [];
-        if (e.kind) meta.push(e.kind);
-        if (e.upstream_source) meta.push(e.upstream_source);
-        if (e.state) meta.push(e.state);
-        const x = el("button", { class: "btn btn-secondary", title: "Disable extension" }, ["✕"]);
-        x.onclick = () => mgmtExtDisableDialog(projectName, e.name);
-        bodyEl.appendChild(el("div", { class: "config-box-row" }, [
-            el("span", { class: "config-box-name" }, [e.name]),
-            el("span", { class: "config-box-meta" },
-               [meta.length ? meta.join(" · ") : ""]),
-            x,
-        ]));
-    }
-    // Enableable = catalog types not already enabled, minus the webui-hidden
-    // fixtures. Only offer "+ Enable" when there's something to enable.
-    const enableable = catalog.map((c) => c.name)
-        .filter((n) => !enabledNames.has(n) && !WEBUI_HIDDEN_EXTENSIONS.has(n));
-    if (enableable.length) {
-        const add = el("button", { class: "btn" }, ["+ Enable extension"]);
-        add.onclick = () => mgmtExtEnableDialog(projectName, enableable, allowed);
-        bodyEl.appendChild(add);
-    }
 }
 
 async function setServiceHidden(project, serviceId, hide) {
@@ -2980,9 +2826,7 @@ function renderServiceTabs(projectName, enabled) {
     // The box harness is a standing dind utility (STAGE_DIND_UNIFY): the server
     // stamps `box_harness` on the always-present Supervisor tab spec for ANY dind
     // project (research + sandbox-dind), so the "+ Add box" control shows on both.
-    // A pi-iso-* tab is a disposable BOX (gets the ✕) only when it's a real box
-    // (box_kind === "sandbox"); a BYO extension's pi-iso tab (box_kind === "byo") is
-    // managed via the Extensions config section, never the box ✕.
+    // A pi-iso-* tab is a disposable BOX (gets the ✕) when box_kind === "sandbox".
     const boxHarness = !!(enabled["supervisor"] && enabled["supervisor"].box_harness);
     const visual = [], cli = [];
     for (const id of ids) {
@@ -2999,8 +2843,6 @@ function renderServiceTabs(projectName, enabled) {
         const kids = [iconSvg(iconOf(id, svc)), el("span", {}, [svc.label || id]), pinBtn];
         // A real box tab (box_kind === "sandbox") carries a ✕ that discards the box
         // in place — box deletion lives on the tab, not in a sidebar settings panel.
-        // A BYO extension's pi-iso tab (box_kind === "byo") is excluded — it's
-        // managed via the Extensions config section.
         if (boxHarness && id.startsWith("pi-iso-") && svc.box_kind === "sandbox") {
             const boxName = id.slice("pi-iso-".length);
             const closeBtn = el("button", {

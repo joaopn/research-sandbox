@@ -13,12 +13,12 @@ FROM continuumio/miniconda3:latest
 # substrate tree (supervisor/management/minimal), so editing it cascade-rebuilds
 # the fleet; this sibling isolates extension-base changes to extension images.
 #
-# Access model matches rs-pi-base: PI/ext containers are reached via the webui
-# kind=ssh dispatcher CHAINING `docker exec` from the supervisor — they run no sshd
-# of their own (same as rs-pi-base / rs-analysis-base); byobu provides the
-# persistent tab session. runc (no DIND). The agent (claude) and editor
-# (code-server) are NOT baked — entrypoint.pi.sh cp's them from the RO-mounted host
-# dists at boot, so this base stays agent-agnostic and small.
+# Access model: box containers are reached via the webui kind=ssh dispatcher
+# CHAINING `docker exec` from the supervisor — they run no sshd of their own
+# (same as rs-analysis-base); byobu provides the persistent tab session. runc
+# (no DIND). The agent (claude) and editor (code-server) are NOT baked — the box
+# entrypoint cp's them from the RO-mounted host dists at boot, so this base stays
+# agent-agnostic and small.
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -46,13 +46,14 @@ RUN useradd -m -s /bin/bash -G sudo -u 1000 worker && \
 RUN su - worker -c "/opt/conda/bin/conda init bash"
 
 # Keep ~/.local/bin on PATH so the boot-deployed agent launcher (cp'd from the
-# agent dist by entrypoint.pi.sh) is found. Same posture as rs-analysis-base.
+# agent dist by the box entrypoint) is found. Same posture as rs-analysis-base.
 RUN su - worker -c 'echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.bashrc'
 
-# Generic PI entrypoint (shared, role-agnostic): agent/editor dist cp, role marker,
-# artifact dirs, .mcp.json/.tools-inventory render, role.md->CLAUDE.md symlink,
-# greeting, then `tail -f /dev/null`. Ext leaves do not override it.
-COPY agent/entrypoint.pi.sh /entrypoint.sh
+# Default box entrypoint (agent/editor dist cp, bypassPermissions settings,
+# greeting, then idle). The only consumers of rs-ext-base are the box images
+# (rs-sandbox-box[-browser]); each re-COPYs this same script as its own
+# /entrypoint.sh. rs-ext-base is never run bare.
+COPY agent/entrypoint.sandbox-box.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 # Per-role template dir (ext leaves bake /opt/pi-templates/<role>/role.md etc.) +
@@ -67,8 +68,8 @@ COPY --chown=worker:worker agent/byobu-status       /home/worker/.byobu/status
 COPY --chown=worker:worker agent/byobu-bin-rolename /home/worker/.byobu/bin/60_rolename
 RUN chmod +x /home/worker/.byobu/bin/60_rolename
 
-# Home skel for the (rare) volume-mount first-boot restore path. entrypoint.pi.sh
-# guards the dist cp on launcher-absence (not ~/.bashrc-absence), so an
+# Home skel for the (rare) volume-mount first-boot restore path. The box
+# entrypoint guards the dist cp on launcher-absence (not ~/.bashrc-absence), so an
 # image-resident home is fine; the skel only matters if /home/worker is ever
 # volume-mounted.
 RUN cp -a /home/worker /etc/worker-skel

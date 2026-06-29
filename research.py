@@ -45,11 +45,10 @@ from pathlib import Path
 
 # Make cli/ helpers importable.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "cli"))
-import defaults  # noqa: E402  (host-side default-enablement for worker + extension)
+import defaults  # noqa: E402  (host-side default-enablement for worker services)
 import mcp_registry  # noqa: E402
-import pi_isolated_registry  # noqa: E402  (BYO extension type registry; sub-component of extension)
 import role_mcp  # noqa: E402
-import extension  # noqa: E402  (unified PI-driven container surface; absorbs former pi + pi_isolated)
+import extension  # noqa: E402  (per-project box surface)
 import workflow  # noqa: E402  (workflow manifest schema + store catalog; read-only here)
 import broker  # noqa: E402  (host-side lifecycle-verb daemon over a unix socket; opt-in)
 
@@ -157,9 +156,9 @@ def cmd_start(args: argparse.Namespace) -> None:
     # every per-project network. Re-attach so subsequent `project update`
     # calls find rs-router on rs-net-<project>.
     wire_router_to_projects()
-    # Re-attach the extension registry to existing projects after a restart that
-    # recreated it. LAZY: no-op if no project has ever enabled an extension (the
-    # registry is stood up on first `enable`, not here). STAGE_FEATURE_STAGING C1.
+    # Re-attach the image registry to existing projects after a restart that
+    # recreated it. LAZY: no-op until a project has stood the registry up (first
+    # box delivery — sandbox-dind create or research box_add). STAGE_FEATURE_STAGING C1.
     wire_registry_to_projects()
     _start_enabled_mcps()
     print("up.")
@@ -207,7 +206,6 @@ def _print_create_report(res, cfg) -> None:
     inner_fw = "on" if res.inner_firewall else "off"
     mcps_line = ", ".join(res.mcps) if res.mcps else "(none)"
     role_mcps_line = ", ".join(res.workers) if res.workers else "(none)"
-    pi_roles_line = ", ".join(res.extensions) if res.extensions else "(none)"
     if res.data_mounts:
         data_lines = "\n".join(
             f"             /workspace/shared/data/{b}/  ←  {src}"
@@ -276,7 +274,6 @@ Project '{res.project}' is running.
   Inner FW:  {inner_fw}
   MCPs:      {mcps_line}
   Role-MCPs: {role_mcps_line}
-  PI roles:  {pi_roles_line}
 {data_block}  SSH:       research@localhost -p {res.ssh_port}   password: {res.ssh_password}
 {webui_block}
 Next steps:
@@ -770,170 +767,6 @@ def cmd_worker_default_disable(args: argparse.Namespace) -> None:
           f"projects)")
 
 
-def cmd_extension_add(args: argparse.Namespace) -> None:
-    """Register a BYO extension type in the host registry. Baked roles
-    (echo / wrangler / websearcher) are built-in and need no registration —
-    a BYO type may not shadow one."""
-    if args.name in extension.baked_names():
-        die(f"{args.name!r} is a built-in baked extension; BYO types can't "
-            f"shadow it. Pick a different name.")
-    entry: dict = {"root": args.root}
-    if args.repo:
-        ref = args.ref
-        if ref:
-            # Explicit ref: verify it resolves (unless suppressed).
-            if not args.no_verify:
-                _verify_pi_isolated_repo(args.repo, ref)
-        else:
-            # No ref: resolve the default-branch HEAD now and pin it.
-            ref = _resolve_pi_isolated_ref(args.repo)
-            print(f"  no --ref given; pinned {args.repo} default-branch HEAD "
-                  f"to {ref}")
-        entry["repo"] = args.repo
-        entry["ref"] = ref
-    if args.setup:
-        entry["setup"] = args.setup
-    if args.mount:
-        entry["mount"] = args.mount
-    if args.description:
-        entry["description"] = args.description.strip()
-
-    with pi_isolated_registry.lock():
-        try:
-            data = pi_isolated_registry.load(expand=False)
-        except pi_isolated_registry.RegistryError as e:
-            die(str(e))
-        if args.name in data["types"]:
-            die(f"extension type {args.name!r} already registered; "
-                f"remove first or use `extension set-root`/`describe`")
-        data["types"][args.name] = entry
-        try:
-            pi_isolated_registry.save_atomic(data)
-        except pi_isolated_registry.RegistryError as e:
-            die(str(e))
-    print(f"added extension type {args.name!r} (root {args.root})")
-    print(f"  next: `research project create <p> --enable {args.name}` "
-          f"(or `project update <p> --enable {args.name}`)")
-
-
-def cmd_extension_list(args: argparse.Namespace) -> None:
-    """Full host catalog of sandbox *types*: built-in baked roles + BYO
-    registry types. The DEFAULT column marks types flagged for auto-enable in
-    new projects (`research extension enable <name>`). Visibility surface — what
-    can be enabled per project."""
-    cat = extension.catalog(rscore.load_versions())
-    default_on = set(defaults.enabled("extension"))
-    if args.json:
-        for c in cat:
-            c["default"] = c["name"] in default_on
-        print(json.dumps(cat, indent=2, sort_keys=True))
-        return
-    if not cat:
-        print("(no extension types available)")
-        return
-    # BYO descriptions, fetched once for the annotation lines.
-    try:
-        byo = pi_isolated_registry.load(expand=False).get("types", {})
-    except pi_isolated_registry.RegistryError:
-        byo = {}
-    rows: list[tuple[str, ...]] = []
-    descs: list[str] = []
-    for c in cat:
-        nm = c["name"]
-        if c["kind"] == "baked":
-            src = c.get("image") or "-"
-        else:
-            src = c.get("repo") or "(folder-only)"
-        # Every extension is an independent default target now (no worker twin
-        # coupling): baked roles and BYO types alike use the extension default set.
-        default_col = "✓" if nm in default_on else "-"
-        rows.append((nm, c["kind"], default_col, src))
-        descs.append(byo.get(nm, {}).get("description", "")
-                     if c["kind"] == "byo" else "")
-    headers = ("NAME", "KIND", "DEFAULT", "IMAGE/REPO")
-    cols = list(zip(*([headers] + rows)))
-    widths = [max(len(str(v)) for v in col) for col in cols]
-    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
-    print(fmt.format(*headers))
-    for r, d in zip(rows, descs):
-        print(fmt.format(*r))
-        if d:
-            print(f"    {d}")
-
-
-def cmd_extension_default_enable(args: argparse.Namespace) -> None:
-    """Flag an extension for auto-enable in NEW projects (mirrors `mcp enable`).
-    Every extension type is an independent target — baked roles
-    (echo / wrangler / websearcher) and BYO types alike (no worker-twin
-    coupling)."""
-    known = extension.known_type_names()
-    if args.name not in known:
-        die(f"unknown extension {args.name!r}. Known: "
-            f"{', '.join(sorted(known)) or '(none)'} "
-            f"(baked roles + registered BYO types; add a BYO type with "
-            f"`research extension add`).")
-    defaults.set_enabled("extension", args.name, True)
-    print(f"extension {args.name!r}: default-enabled (auto-enabled in new "
-          f"projects; override per-project with `project create --disable`)")
-
-
-def cmd_extension_default_disable(args: argparse.Namespace) -> None:
-    defaults.set_enabled("extension", args.name, False)
-    print(f"extension {args.name!r}: default-disabled (not auto-enabled in new "
-          f"projects)")
-
-
-def cmd_extension_remove(args: argparse.Namespace) -> None:
-    if args.name in extension.baked_names():
-        die(f"{args.name!r} is a built-in baked extension; it can't be removed.")
-    in_use = projects_using_extension_type(args.name)
-    if in_use and not args.force:
-        die(f"extension type {args.name!r} is enabled for projects: "
-            f"{', '.join(in_use)}.\n"
-            f"  Run `research project extension disable <proj> {args.name}` "
-            f"for each, or pass --force.")
-    with pi_isolated_registry.lock():
-        try:
-            data = pi_isolated_registry.load(expand=False)
-        except pi_isolated_registry.RegistryError as e:
-            die(str(e))
-        if args.name not in data["types"]:
-            die(f"no extension type named {args.name!r}")
-        data["types"].pop(args.name)
-        try:
-            pi_isolated_registry.save_atomic(data)
-        except pi_isolated_registry.RegistryError as e:
-            die(str(e))
-    defaults.set_enabled("extension", args.name, False)  # drop any default flag
-    print(f"removed extension type {args.name!r}")
-    if in_use:
-        print(f"  note: {len(in_use)} project(s) still have a stale "
-              f"extensions.json entry; they keep running until "
-              f"`project extension disable`.")
-
-
-def cmd_extension_set_root(args: argparse.Namespace) -> None:
-    _extension_registry_edit(args.name, lambda e: e.__setitem__("root", args.root))
-    print(f"set root for {args.name!r}: {args.root}")
-    print("  (existing projects pick up the new root on next "
-          "`project update`/recreate)")
-
-
-def cmd_extension_describe(args: argparse.Namespace) -> None:
-    new_desc = "" if args.clear else (args.text or "").strip()
-    if not args.clear and not new_desc:
-        die("description text is required (or pass --clear to remove)")
-
-    def mutate(e: dict) -> None:
-        if new_desc:
-            e["description"] = new_desc
-        else:
-            e.pop("description", None)
-
-    _extension_registry_edit(args.name, mutate)
-    print(f"{'set' if new_desc else 'cleared'} description for {args.name!r}")
-
-
 def cmd_mcp_start(args: argparse.Namespace) -> None:
     _ensure_router_running()
     if args.name is not None:
@@ -1425,169 +1258,6 @@ def cmd_project_role_mcp_status(args: argparse.Namespace) -> None:
           f" ({'has artifacts' if state['publish_present'] else 'empty'})")
 
 
-def cmd_project_extension_enable(args: argparse.Namespace) -> None:
-    """Baked extensions own their proxy-routed MCP upstreams (BYO agents are
-    isolated and take none):
-      --upstream <csv>  → explicit list (survives sync)
-      --upstream ""     → explicit empty
-      --auto            → re-derive = every MCP allowed for the project
-      (no flag)         → first enable: auto-derive; re-enable: preserve
-    --upstream and --auto are mutually exclusive (argparse-enforced)."""
-    cfg = load_config()
-    _require_project(args.project)
-    raw_upstream = getattr(args, "upstream", None)
-    force_auto = bool(getattr(args, "auto", False))
-    upstreams = _parse_csv_list(raw_upstream) if raw_upstream is not None else None
-    _extension_enable(args.project, cfg, args.name, upstreams,
-                      force_auto=force_auto)
-
-
-def cmd_project_extension_disable(args: argparse.Namespace) -> None:
-    cfg = load_config()
-    _require_project(args.project)
-    _extension_disable(args.project, cfg, args.name)
-    print(f"extension {args.name!r}: disabled")
-
-
-def cmd_project_extension_list(args: argparse.Namespace) -> None:
-    """Comprehensive listing: every enabled extension with its container state
-    in any condition (running / exited / dead / absent). Reads config from the
-    project's host bind-mount, so it renders even when the supervisor is
-    stopped (state shows 'unknown' then); enriches with live `docker ps -a`
-    state when the supervisor is up."""
-    cfg = load_config()
-    supervisor = _require_project(args.project)
-    workspace_path = workspace_path_for(args.project, cfg)
-    entries = extension.load(workspace_path)
-    up = container_running(supervisor)
-    states = _inner_container_states(supervisor)
-
-    def state_of(nm: str, e: dict) -> str:
-        cname = e.get("container") or extension.container_name(nm, e.get("kind"))
-        if not up:
-            return "unknown"
-        return states.get(cname, "absent")
-
-    if args.json:
-        out = []
-        for nm, e in sorted(entries.items()):
-            row = dict(e)
-            row["name"] = nm
-            row["state"] = state_of(nm, e)
-            out.append(row)
-        print(json.dumps(out, indent=2, sort_keys=True))
-        return
-
-    if not entries:
-        print(f"(project {args.project!r} has no extensions enabled)")
-        return
-
-    rows: list[tuple[str, ...]] = []
-    for nm, e in sorted(entries.items()):
-        src = e.get("repo") or e.get("image") or "-"
-        rows.append((nm, e.get("kind", "?"), e.get("ip", "?"),
-                     src, state_of(nm, e)))
-    headers = ("NAME", "KIND", "IP", "IMAGE/REPO", "STATE")
-    cols = list(zip(*([headers] + rows)))
-    widths = [max(len(str(v)) for v in col) for col in cols]
-    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
-    print(fmt.format(*headers))
-    for r in rows:
-        print(fmt.format(*r))
-    if not up:
-        print("  (supervisor stopped — STATE is config-only; start the "
-              "project for live container state)")
-
-
-def cmd_project_extension_status(args: argparse.Namespace) -> None:
-    cfg = load_config()
-    supervisor = _require_project(args.project)
-    workspace_path = workspace_path_for(args.project, cfg)
-    entries = extension.load(workspace_path)
-    entry = entries.get(args.name)
-    if entry is None:
-        die(f"extension {args.name!r} is not enabled for project "
-            f"{args.project!r}")
-    kind = entry.get("kind")
-    state = {
-        "name": args.name,
-        "project": args.project,
-        "kind": kind,
-        "entry": entry,
-        "container": extension.container_name(args.name, kind),
-        "exists": False,
-        "running": False,
-    }
-    if container_running(supervisor):
-        state["exists"] = _extension_inner_exists(supervisor, args.name, kind)
-        state["running"] = _extension_inner_running(supervisor, args.name, kind)
-        if kind == "byo":
-            state["supervisor_external_mount"] = _supervisor_has_external_mount(
-                supervisor, args.name)
-
-    ws = workspace_path / extension.workspace_subdir(args.name, kind)
-    state["workspace"] = str(ws)
-    state["workspace_present"] = ws.is_dir()
-    if ws.is_dir():
-        state["workspace_files"] = sorted(
-            p.name for p in ws.iterdir() if not p.name.startswith("."))
-    else:
-        state["workspace_files"] = []
-
-    if kind == "byo":
-        repo = entry.get("repo")
-        clone_dir = None
-        if repo:
-            repo_name = repo.rstrip("/").rsplit("/", 1)[-1]
-            if repo_name.endswith(".git"):
-                repo_name = repo_name[:-4]
-            clone_dir = ws / repo_name
-        state["clone_dir"] = str(clone_dir) if clone_dir else None
-        state["repo_cloned"] = bool(clone_dir and (clone_dir / ".git").is_dir())
-
-    if args.json:
-        print(json.dumps(state, indent=2, sort_keys=True))
-        return
-
-    print(f"name:        {state['name']}")
-    print(f"project:     {state['project']}")
-    print(f"kind:        {state['kind']}")
-    print(f"container:   {state['container']}")
-    print(f"  exists:    {state['exists']}")
-    print(f"  running:   {state['running']}")
-    print(f"ip:          {entry.get('ip')}")
-    if kind == "baked":
-        print(f"image:       {entry.get('image')}")
-        print(f"upstreams:   {', '.join(entry.get('upstream_mcps') or []) or '(none)'}"
-              f"  [{entry.get('upstream_source') or '?'}]")
-    else:
-        print(f"repo:        {entry.get('repo') or '(none)'}")
-        print(f"ref:         {entry.get('ref') or '(none)'}")
-        print(f"mount:       {entry.get('mount')}")
-        print(f"root:        {entry.get('root')}")
-        print(f"external mount on supervisor: "
-              f"{state.get('supervisor_external_mount', False)}")
-    print(f"workspace:   {state['workspace']}"
-          f" ({'present' if state['workspace_present'] else 'absent'})")
-    if state.get("workspace_files"):
-        print(f"  files:     {', '.join(state['workspace_files'])}")
-    if kind == "byo":
-        print(f"clone dir:   {state['clone_dir']}")
-        print(f"  repo cloned: {state['repo_cloned']}")
-
-
-def cmd_project_extension_sync_creds(args: argparse.Namespace) -> None:
-    """The supervisor→extension credential bridge: invoke the supervisor-side
-    rs-pi CLI to push the supervisor's current creds into every running
-    extension container. Operator-initiated only — extensions are PI-owned and
-    boot un-authed; nothing propagates creds automatically."""
-    supervisor = _require_project(args.project)
-    r = run(["docker", "exec", supervisor, "rs-pi", "sync-creds"],
-            capture_output=False)
-    if r.returncode != 0:
-        sys.exit(r.returncode)
-
-
 def cmd_project_update_agent(args: argparse.Namespace) -> None:
     """Re-stage the host agent dist into a running project — no image rebuild,
     no in-supervisor network install.
@@ -1916,16 +1586,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "rs-inner bridge (workers can only reach mcp-proxy + DNS)")
     c.add_argument("--enable", metavar="IDS",
                    help=f"comma-separated tokens to force-enable. Tokens "
-                        f"are matched by name against three registries: "
-                        f"services ({','.join(KNOWN_SERVICES)}), workers "
-                        f"({','.join(sorted(role_mcp.ROLE_IMAGES))}), and "
-                        f"extensions ({','.join(extension.baked_names())} + BYO "
-                        f"types). Worker tokens sugar for `project worker "
-                        f"enable`; extension tokens for `project extension "
-                        f"enable`. A bare name that is both a worker and a baked "
-                        f"extension (wrangler / websearcher) enables the WORKER "
-                        f"only — the same-named extension is independent, enable "
-                        f"it with `project extension enable`.")
+                        f"are matched by name against two registries: "
+                        f"services ({','.join(KNOWN_SERVICES)}) and workers "
+                        f"({','.join(sorted(role_mcp.ROLE_IMAGES))}). Worker "
+                        f"tokens sugar for `project worker enable`; anything "
+                        f"else is treated as a service id.")
     c.add_argument("--role-mcp-upstream", metavar="ROLE=CSV",
                    action="append",
                    help="repeatable: pin an explicit upstream list for a "
@@ -1938,9 +1603,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--disable", metavar="IDS",
                    help="comma-separated tokens to disable for this project, "
                         "overruling the host default-enable sets: service ids "
-                        "(supervisor is always-on), worker services, and "
-                        "extensions. e.g. `--disable websearcher` skips a "
-                        "default-enabled worker for this one project.")
+                        "(supervisor is always-on) and worker services. "
+                        "e.g. `--disable websearcher` skips a default-enabled "
+                        "worker for this one project.")
     c.add_argument("--mcp", metavar="NAMES", default="all-enabled",
                    help="MCPs to auto-allow at create time: 'all-enabled' "
                         "(default — every currently-enabled MCP), 'none', or a "
@@ -2018,11 +1683,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "slash-command edits propagate)")
     u.add_argument("--enable", metavar="IDS",
                    help=f"comma-separated tokens to enable. Matched by "
-                        f"name against services ({','.join(KNOWN_SERVICES)}), "
-                        f"workers ({','.join(sorted(role_mcp.ROLE_IMAGES))}), "
-                        f"and extensions ({','.join(extension.baked_names())} + "
-                        f"BYO types). A bare worker/extension twin name enables "
-                        f"the worker only; the extension is independent.")
+                        f"name against services ({','.join(KNOWN_SERVICES)}) "
+                        f"and workers ({','.join(sorted(role_mcp.ROLE_IMAGES))}). "
+                        f"Anything else is treated as a service id.")
     u.add_argument("--role-mcp-upstream", metavar="ROLE=CSV",
                    action="append",
                    help="repeatable: pin an explicit upstream list for a "
@@ -2031,9 +1694,8 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--disable", metavar="IDS",
                    help="comma-separated service ids to disable "
                         "(supervisor is always-on and cannot be "
-                        "disabled). Also accepts extension names to "
-                        "disable an extension container (workspace "
-                        "preserved).")
+                        "disabled), plus worker services to disable "
+                        "for this project.")
     u.set_defaults(func=cmd_project_update)
 
     uc = proj_sub.add_parser(
@@ -2089,8 +1751,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="per-project worker lifecycle (enable / disable / list / "
              "status). Workers are pipeline-side agents: the role-MCP "
              "services workers call via the proxy, plus (in `list`) the "
-             "ephemeral analysis containers the supervisor spawns. Not "
-             "PI-driven — see `project extension` for those.",
+             "ephemeral analysis containers the supervisor spawns.",
     )
     rm_sub = rm.add_subparsers(dest="role_action", required=True)
 
@@ -2181,72 +1842,6 @@ def build_parser() -> argparse.ArgumentParser:
     rms.add_argument("role")
     rms.add_argument("--json", action="store_true")
     rms.set_defaults(func=cmd_project_role_mcp_status)
-
-    # ----- per-project extension lifecycle (STAGE_CLI_TAXONOMY) -----------
-    # Merges the former `project pi` (baked roles) + `project pi-isolated`
-    # (BYO agents) into one surface: PI-driven, webui-tab-able containers.
-    sb = proj_sub.add_parser(
-        "extension",
-        help="per-project extension lifecycle (enable / disable / list / "
-             "status / sync-creds). Extensions are PI-driven containers with "
-             "webui tabs: baked roles (echo / wrangler / websearcher) and "
-             "BYO skill-repo agents (see `research extension list`). They live "
-             "in extensions.json. PI-owned auth (in-tab /login or sync-creds).",
-    )
-    sb_sub = sb.add_subparsers(dest="extension_action", required=True)
-
-    sbe = sb_sub.add_parser("enable",
-                            help="bring up an extension container in the "
-                                 "supervisor's inner dockerd (recreates the "
-                                 "supervisor first if a BYO external folder "
-                                 "isn't mounted yet)")
-    sbe.add_argument("project")
-    sbe.add_argument("name", help="extension name: a baked role (echo / "
-                                  "wrangler / websearcher) or a BYO type "
-                                  "(see `research extension list`)")
-    sbe_up = sbe.add_mutually_exclusive_group()
-    sbe_up.add_argument("--upstream", metavar="csv",
-                        help="explicit proxy-routed MCP set for this baked "
-                             "extension (comma-separated; must be allowed for "
-                             "the project). '' = explicit empty. Baked only — "
-                             "BYO agents are isolated and take no upstreams.")
-    sbe_up.add_argument("--auto", action="store_true",
-                        help="(re-)derive upstreams = every MCP allowed for the "
-                             "project, marked upstream_source=auto")
-    sbe.set_defaults(func=cmd_project_extension_enable)
-
-    sbd = sb_sub.add_parser("disable",
-                            help="stop + remove the extension container "
-                                 "(workspace, and any BYO external folder, "
-                                 "survive)")
-    sbd.add_argument("project")
-    sbd.add_argument("name")
-    sbd.set_defaults(func=cmd_project_extension_disable)
-
-    sbl = sb_sub.add_parser("list",
-                            help="show every extension enabled for the project "
-                                 "with its container state in any condition "
-                                 "(running / stopped / dead); works "
-                                 "supervisor up or down")
-    sbl.add_argument("project")
-    sbl.add_argument("--json", action="store_true")
-    sbl.set_defaults(func=cmd_project_extension_list)
-
-    sbs = sb_sub.add_parser("status",
-                            help="deep-print one extension's container state + "
-                                 "workspace (and, for BYO, clone) presence")
-    sbs.add_argument("project")
-    sbs.add_argument("name")
-    sbs.add_argument("--json", action="store_true")
-    sbs.set_defaults(func=cmd_project_extension_status)
-
-    sbsc = sb_sub.add_parser("sync-creds",
-                             help="push the supervisor's creds into every "
-                                  "running extension (operator-initiated; "
-                                  "extensions are otherwise PI-authed via "
-                                  "in-tab /login)")
-    sbsc.add_argument("project")
-    sbsc.set_defaults(func=cmd_project_extension_sync_creds)
 
     # ----- MCP registry (Stage 2.1) -------------------------------------
     mcp = sub.add_parser("mcp", help="MCP registry operations")
@@ -2366,76 +1961,6 @@ def build_parser() -> argparse.ArgumentParser:
                             help="clear a worker service's default-enable flag")
     wkd.add_argument("name")
     wkd.set_defaults(func=cmd_worker_default_disable)
-
-    # ----- extension type registry (STAGE_CLI_TAXONOMY) -------------------
-    # Host catalog of extension types: built-in baked roles (constants) +
-    # operator-registered BYO skill-repo types (the host registry, formerly
-    # `pi-isolated`). Per-project lifecycle is `research project extension`.
-    sbr = sub.add_parser(
-        "extension",
-        help="host catalog of extension types: built-in baked roles + BYO "
-             "skill-repo agents (reusable repo + root-folder definitions "
-             "enabled per-project with `project create|update --enable`)")
-    sbr_sub = sbr.add_subparsers(dest="subcommand", required=True)
-
-    pa = sbr_sub.add_parser("add", help="register a BYO extension type")
-    pa.add_argument("name")
-    pa.add_argument("--root", required=True, metavar="HOST_DIR",
-                    help="host folder for this type; the per-project subdir "
-                         "<root>/<project>/ is the RW external mount. May use "
-                         "~ and ${VAR}.")
-    pa.add_argument("--repo", help="git URL cloned into the container at "
-                                   "enable time (omit for a pure-folder agent)")
-    pa.add_argument("--ref", help="commit/tag to check out. Optional: if "
-                                  "omitted, the repo's default-branch HEAD is "
-                                  "resolved and pinned now (still no drift — "
-                                  "you just don't supply the SHA). Requires "
-                                  "git on the host when omitted.")
-    pa.add_argument("--setup", help="shell command run in the clone dir after "
-                                    "checkout (e.g. 'bash setup.sh'); runs on "
-                                    "every boot, must be idempotent")
-    pa.add_argument("--mount", metavar="CONTAINER_PATH",
-                    help=f"absolute container path the external folder lands "
-                         f"at (default {pi_isolated_registry.DEFAULT_MOUNT!r}; "
-                         f"keep under /workspace/)")
-    pa.add_argument("--description",
-                    help="operator note surfaced in `extension list`")
-    pa.add_argument("--no-verify", action="store_true",
-                    help="skip the `git ls-remote` repo/ref check at add time")
-    pa.set_defaults(func=cmd_extension_add)
-
-    pl = sbr_sub.add_parser("list",
-                            help="list all extension types (built-in baked + BYO)")
-    pl.add_argument("--json", action="store_true")
-    pl.set_defaults(func=cmd_extension_list)
-
-    pr = sbr_sub.add_parser("remove", help="remove a BYO type from the registry")
-    pr.add_argument("name")
-    pr.add_argument("--force", action="store_true",
-                    help="remove even if projects currently enable it")
-    pr.set_defaults(func=cmd_extension_remove)
-
-    sbe = sbr_sub.add_parser("enable",
-                             help="flag an extension (baked or BYO) for auto-enable "
-                                  "in new projects (like `mcp enable`)")
-    sbe.add_argument("name")
-    sbe.set_defaults(func=cmd_extension_default_enable)
-    sbd = sbr_sub.add_parser("disable",
-                             help="clear an extension's default-enable flag")
-    sbd.add_argument("name")
-    sbd.set_defaults(func=cmd_extension_default_disable)
-
-    psr = sbr_sub.add_parser("set-root", help="change a BYO type's host root folder")
-    psr.add_argument("name")
-    psr.add_argument("root", metavar="HOST_DIR")
-    psr.set_defaults(func=cmd_extension_set_root)
-
-    pds = sbr_sub.add_parser("describe", help="set or clear a BYO type's description")
-    pds.add_argument("name")
-    pdg = pds.add_mutually_exclusive_group(required=True)
-    pdg.add_argument("text", nargs="?", help="new description text")
-    pdg.add_argument("--clear", action="store_true", help="remove the description")
-    pds.set_defaults(func=cmd_extension_describe)
 
     # ----- webui (browser SSH multiplexer) ------------------------------
     wf = sub.add_parser("workflow",

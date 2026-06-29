@@ -23,7 +23,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git iputils-ping \
     && rm -rf /var/lib/apt/lists/*
 
-# Minimal idle entrypoint — overrides rs-ext-base's shared entrypoint.pi.sh.
+# Minimal idle entrypoint (also rs-ext-base's default; re-COPYd here so the box
+# image is explicit about what it runs).
 COPY agent/entrypoint.sandbox-box.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

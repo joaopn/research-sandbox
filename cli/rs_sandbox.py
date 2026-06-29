@@ -205,10 +205,9 @@ def _parse_csv(s: str | None) -> list[str]:
 
 def _build_proxy_mcps(mcps: list[str], *, strict: bool) -> dict:
     """{name: server-cfg} proxy entries for the selected MCPs, resolved against
-    the supervisor's mcp-allow.json — source-1 for the box's .mcp.json (mirror of
-    entrypoint.pi.sh's proxy block). ``strict`` (create): die on an MCP not in the
-    allowlist; non-strict (restart re-render): skip it with a warning, so a since-
-    de-allowed MCP can't break a recreate."""
+    the supervisor's mcp-allow.json — source-1 for the box's .mcp.json. ``strict``
+    (create): die on an MCP not in the allowlist; non-strict (restart re-render):
+    skip it with a warning, so a since-de-allowed MCP can't break a recreate."""
     allow: dict[str, dict] = {}
     try:
         rows = json.loads(MCP_ALLOW_JSON.read_text())
