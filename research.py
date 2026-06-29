@@ -481,29 +481,42 @@ def cmd_project_start(args: argparse.Namespace) -> None:
 
 def cmd_project_destroy(args: argparse.Namespace) -> None:
     cfg = load_config()
-    req = _build(rscore.DestroyRequest, name=args.name)
-    container = container_name_for(req.name)
-    if not container_exists(container):
-        die(f"project {req.name!r} does not exist")
+    # De-dup (preserve order) so a repeated name doesn't error on the 2nd pass.
+    names: list[str] = []
+    for nm in args.names:
+        if nm not in names:
+            names.append(nm)
+    # Build + existence-check EVERY project up front: a bad name aborts before
+    # anything is destroyed (no half-done batch).
+    reqs = [_build(rscore.DestroyRequest, name=nm) for nm in names]
+    for req in reqs:
+        if not container_exists(container_name_for(req.name)):
+            die(f"project {req.name!r} does not exist")
 
-    project_root = project_root_for(req.name, cfg)
-    docker_volume = docker_volume_name_for(req.name)
-    network = project_network_for(req.name)
-
-    print(f"=== Destroy: {req.name} ===\n")
-    print("This will permanently delete:")
-    print(f"  - supervisor container ({container})")
-    print(f"  - workspace directory on host: {project_root}")
-    print("      (includes .claude/ creds snapshot, plans, all worker outputs)")
-    if volume_exists(docker_volume):
-        print(f"  - DIND volume ({docker_volume})")
-    print(f"  - per-project network ({network})")
+    print(f"=== Destroy: {', '.join(r.name for r in reqs)} ===\n")
+    print("This will permanently delete, for each project:")
+    for req in reqs:
+        container = container_name_for(req.name)
+        project_root = project_root_for(req.name, cfg)
+        docker_volume = docker_volume_name_for(req.name)
+        network = project_network_for(req.name)
+        print(f"  {req.name}:")
+        print(f"    - supervisor container ({container})")
+        print(f"    - workspace directory on host: {project_root}")
+        print("        (includes .claude/ creds snapshot, plans, all worker outputs)")
+        if volume_exists(docker_volume):
+            print(f"    - DIND volume ({docker_volume})")
+        print(f"    - per-project network ({network})")
     print()
+    # One confirmation for the whole batch.
     if not confirm("Type 'yes' to confirm: "):
         print("aborted.")
         return
-    rscore.destroy(req, cfg)
-    print(f"destroyed {req.name}.")
+    # Fail-fast: if a destroy dies mid-batch, earlier ones are already gone and the
+    # rest stay standing for a re-run.
+    for req in reqs:
+        rscore.destroy(req, cfg)
+        print(f"destroyed {req.name}.")
 
 
 def cmd_project_ssh(args: argparse.Namespace) -> None:
@@ -1654,8 +1667,10 @@ def build_parser() -> argparse.ArgumentParser:
         g.add_argument("--all", action="store_true")
         sp.set_defaults(func=(cmd_project_stop if op == "stop" else cmd_project_start))
 
-    d = proj_sub.add_parser("destroy", help="remove container + volume + network")
-    d.add_argument("name")
+    d = proj_sub.add_parser(
+        "destroy", help="remove one or more projects (container + volume + network)")
+    d.add_argument("names", nargs="+", metavar="name",
+                   help="one or more project names")
     d.set_defaults(func=cmd_project_destroy)
 
     u = proj_sub.add_parser(
