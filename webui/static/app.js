@@ -1258,7 +1258,7 @@ function mgmtConfirmThenTail(view, cfg) {
     cancel.onclick = () => backdrop.remove();
     const go = el("button", { class: cfg.danger ? "btn btn-danger" : "btn" },
                  [cfg.confirmLabel]);
-    const card = el("div", { class: "card" }, [
+    const card = el("div", { class: cfg.cardClass ? "card " + cfg.cardClass : "card" }, [
         el("h2", {}, [cfg.title]),
         ...cfg.body,
         el("div", { class: "btn-row" }, [cancel, go]),
@@ -1781,32 +1781,77 @@ async function mgmtBoxAddDialog(project) {
     const nameI = el("input", { type: "text", autocomplete: "off",
                                 placeholder: "auto (box-N)" });
 
-    // Preset radio-cards — selecting one drives the agent-default hint + the BYO
-    // group's visibility.
+    // Preset cards — no visible control; the selected card is marked by an accent
+    // border (markSelected toggles `.selected`). The radio is a hidden, label-
+    // driven state holder so a click anywhere on the card selects it.
     let selectedPreset = presets[0];
+    const cardEls = [];
     const cards = presets.map((p) => {
         const radio = el("input", { type: "radio", name: "box-preset", value: p.name });
         if (p === presets[0]) radio.checked = true;
-        radio.onchange = () => { if (radio.checked) { selectedPreset = p; applyPreset(); } };
-        return el("label", { class: "box-preset-card" }, [
-            radio,
-            el("span", { class: "box-preset-body" }, [
-                el("span", { class: "box-preset-name" }, [p.name]),
-                el("span", { class: "box-preset-desc" }, [p.description || ""]),
+        radio.onchange = () => { if (radio.checked) { selectedPreset = p; markSelected(); applyPreset(); } };
+        // Per-box explain ⓘ — opens this preset's learning doc (box-<name>.html).
+        // `explain-btn` whitelists it in onExplainOutsidePointer; stopPropagation
+        // keeps the click off the (hidden) radio.
+        const info = el("button", { type: "button", class: "explain-btn box-preset-explain",
+                                    title: "Explain " + p.name }, ["ⓘ"]);
+        info.onclick = (ev) => {
+            ev.preventDefault(); ev.stopPropagation(); openExplain("box-" + p.name);
+        };
+        const card = el("div", { class: "box-preset-card" }, [
+            el("label", { class: "box-preset-pick" }, [
+                radio,
+                el("span", { class: "box-preset-body" }, [
+                    el("span", { class: "box-preset-name" }, [p.name]),
+                    el("span", { class: "box-preset-desc" }, [p.description || ""]),
+                ]),
             ]),
+            info,
         ]);
+        cardEls.push({ preset: p, card });
+        return card;
     });
+    function markSelected() {
+        for (const { preset, card } of cardEls)
+            card.classList.toggle("selected", preset === selectedPreset);
+    }
+    markSelected();
 
-    // Agent: a "(preset default)" sentinel that OMITS agent from the payload so
-    // rs-sandbox applies the preset default (don't replicate that + the MCP
-    // coupling client-side — see Slice A's agent=None contract).
-    const agentDefaultOpt = el("option", { value: "" }, ["(preset default)"]);
+    // Agent + editor are bordered selectable cards (markAgent/editor toggle
+    // `.selected`). `agentS` (detached <select>) and `editorCb` (detached
+    // checkbox) stay the VALUE HOLDERS so the payload + MCP-coupling code below
+    // are byte-unchanged — the cards only drive + reflect them. There is no
+    // "preset default" choice: selecting a preset pre-selects its default agent
+    // (applyPreset), which the operator can then override.
     const agentS = el("select", {}, [
-        agentDefaultOpt,
         el("option", { value: "none" }, ["none (blank box)"]),
         el("option", { value: "claude" }, ["claude"]),
     ]);
+    const agentSpecs = [
+        { value: "none", label: "None" },
+        { value: "claude", label: "Claude" },
+    ];
+    const agentCardEls = [];
+    const agentCards = agentSpecs.map((s) => {
+        const card = el("div", { class: "box-opt-card" },
+                        [el("span", { class: "box-opt-name" }, [s.label])]);
+        card.onclick = () => { if (!agentS.disabled) { agentS.value = s.value; markAgent(); } };
+        agentCardEls.push({ value: s.value, card });
+        return card;
+    });
+    const agentCardsWrap = el("div", { class: "box-opt-cards" }, agentCards);
+    function markAgent() {
+        for (const { value, card } of agentCardEls)
+            card.classList.toggle("selected", value === agentS.value);
+    }
+
     const editorCb = el("input", { type: "checkbox" });   // box-level toggle, default off
+    const editorCard = el("div", { class: "box-opt-card" },
+                          [el("span", { class: "box-opt-name" }, ["Editor"])]);
+    editorCard.onclick = () => {
+        editorCb.checked = !editorCb.checked;
+        editorCard.classList.toggle("selected", editorCb.checked);
+    };
 
     // MCP picker over the project's allowed MCPs. Checking ≥1 forces the agent on
     // (nothing else reaches an MCP) — reflect the backend coupling by forcing +
@@ -1836,38 +1881,56 @@ async function mgmtBoxAddDialog(project) {
     ]);
 
     function applyPreset() {
-        agentDefaultOpt.textContent = "(preset default: "
-            + (selectedPreset.agent_default ? "claude" : "none") + ")";
+        // Pre-select the preset's default agent (unless MCP coupling has forced
+        // claude on + locked the cards); the operator can still override it.
+        if (!agentS.disabled) agentS.value = selectedPreset.agent_default ? "claude" : "none";
+        markAgent();
         byoGroup.style.display = selectedPreset.clone ? "" : "none";
     }
     function applyMcpCoupling() {
         const any = mcpBoxes.some((b) => b.cb.checked);
         if (any) { agentS.value = "claude"; agentS.disabled = true; }
         else { agentS.disabled = false; }
+        markAgent();
+        agentCardsWrap.classList.toggle("disabled", agentS.disabled);
     }
     applyPreset();
     applyMcpCoupling();
 
-    const explainBtn = el("button", { type: "button", class: "btn btn-secondary" },
-                          ["Explain boxes"]);
-    explainBtn.onclick = () => openExplain("box");
+    // The overview explainer (box.md), relegated to a small ⓘ beside the "Box
+    // type" label. `explain-btn` whitelists it in onExplainOutsidePointer.
+    const overviewBtn = el("button", { type: "button", class: "explain-btn box-overview-explain",
+                                       title: "About boxes" }, ["ⓘ"]);
+    overviewBtn.onclick = (ev) => { ev.preventDefault(); openExplain("box"); };
 
     mgmtConfirmThenTail(boxOpView(), {
         title: `Add a box to ${project}`,
         tailTitle: `Adding a box to ${project}`,
         verb: "box_add",
         confirmLabel: "Add box",
+        cardClass: "box-add-card",
         body: [
             el("div", { class: "field" }, [el("label", {}, ["Name (optional)"]), nameI]),
             el("div", { class: "field" }, [
-                el("label", {}, ["Box type"]),
+                el("div", { class: "box-type-label" }, ["Box type", overviewBtn]),
                 el("div", { class: "box-preset-cards" }, cards),
             ]),
-            el("div", { class: "field" }, [el("label", {}, ["Agent"]), agentS]),
-            el("label", { class: "mgmt-check" }, [editorCb, " bundle the editor (code-server)"]),
-            el("div", { class: "field" }, [el("label", {}, ["MCP tools"]), mcpList]),
+            el("div", { class: "field box-settings" }, [
+                el("div", { class: "box-settings-label" }, ["Settings"]),
+                el("div", { class: "box-opt-group" }, [
+                    el("div", { class: "box-opt-caption" }, ["Agent"]),
+                    agentCardsWrap,
+                ]),
+                el("div", { class: "box-opt-group" }, [
+                    el("div", { class: "box-opt-caption" }, ["Extensions"]),
+                    el("div", { class: "box-opt-cards" }, [editorCard]),
+                ]),
+                el("div", { class: "box-opt-group" }, [
+                    el("div", { class: "box-opt-caption" }, ["MCP tools"]),
+                    mcpList,
+                ]),
+            ]),
             byoGroup,
-            el("div", { class: "field" }, [explainBtn]),
         ],
         validate: () => {
             const n = nameI.value.trim();
@@ -1886,7 +1949,8 @@ async function mgmtBoxAddDialog(project) {
                 editor: editorCb.checked,
                 mcps: mcpBoxes.filter((b) => b.cb.checked).map((b) => b.name),
             };
-            // Sentinel "" → omit agent (the preset default applies); no `browser`.
+            // Agent is always explicit now (the preset default is pre-selected,
+            // not a sentinel); no `browser`.
             if (agentS.value) payload.agent = agentS.value;
             if (selectedPreset.clone) {
                 const repo = repoI.value.trim(), ref = refI.value.trim(),

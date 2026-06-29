@@ -46,6 +46,12 @@ IMAGES = ("base", "browser")
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 
+# Curated display order for the "Add box" window (the webui + the in-supervisor
+# rs-sandbox render the catalog in list order). Built-ins sort by their index
+# here; an unlisted built-in and every BYO operator type fall after, by name.
+# Product order, not operator data — a constant here, not a manifest field.
+_BUILTIN_ORDER = ("empty", "websearcher", "data-wrangler", "byo")
+
 # `instructions` is folded in from the sibling .md (built-ins) or carried inline
 # (BYO), so it is an allowed key on the normalized entry the validator sees.
 _ALLOWED_KEYS = {"name", "image", "agent_default", "clone", "description",
@@ -194,4 +200,9 @@ def load_catalog(builtin_dir: Path = BUILTIN_DIR,
         e = dict(m)
         e["source"] = "byo"
         catalog.append(e)
-    return sorted(catalog, key=lambda e: e["name"])
+    def _key(e: dict) -> tuple:
+        name = e["name"]
+        rank = _BUILTIN_ORDER.index(name) if name in _BUILTIN_ORDER else len(_BUILTIN_ORDER)
+        # is_byo first so an unlisted built-in still sorts before any BYO type.
+        return (0 if e.get("source") == "builtin" else 1, rank, name)
+    return sorted(catalog, key=_key)

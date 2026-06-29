@@ -987,18 +987,118 @@ body {
     border-top: 1px solid var(--border, #333);
 }
 
-/* box window — preset radio-cards (STAGE_BOX_EXT_UX) */
-.box-preset-cards { display: flex; flex-direction: column; gap: 6px; }
+/* box window — wider modal + preset radio-cards in a 3-up grid (STAGE_BOX_EXT_UX) */
+.modal-backdrop .card.box-add-card { max-width: min(720px, 94vw); }
+/* Box-window field labels read in normal case, not the global uppercase. */
+.box-add-card .field label { text-transform: none; letter-spacing: normal; }
+.box-preset-cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
 .box-preset-card {
+    position: relative;
     display: flex;
-    align-items: flex-start;
-    gap: 8px;
+    flex-direction: column;
     padding: 8px 10px;
     border: 1px solid var(--border, #333);
     border-radius: 6px;
     cursor: pointer;
 }
 .box-preset-card:hover { border-color: var(--accent, #4a9eff); }
+/* Selection is shown by an accent border ring, not a visible radio control. */
+.box-preset-card.selected {
+    border-color: var(--accent, #4a9eff);
+    box-shadow: inset 0 0 0 1px var(--accent, #4a9eff);
+}
+.box-preset-card input[type="radio"] {
+    position: absolute;
+    width: 0;
+    height: 0;
+    opacity: 0;
+    pointer-events: none;
+}
+.box-preset-pick { display: flex; align-items: flex-start; gap: 8px; cursor: pointer; }
 .box-preset-body { display: flex; flex-direction: column; gap: 2px; }
-.box-preset-name { font-weight: 600; color: var(--fg-base); font-size: 13px; }
+.box-preset-name { font-weight: 600; color: var(--fg-base); font-size: 13px; padding-right: 16px; }
 .box-preset-desc { color: var(--fg-muted); font-size: 12px; }
+.box-preset-explain {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    padding: 2px;
+    background: transparent;
+    border: none;
+    color: var(--fg-faint);
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+}
+.box-preset-explain:hover { color: var(--accent, #4a9eff); }
+
+/* "Box type" caption hosting the overview ⓘ; the Settings group box */
+.box-type-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 8px;
+    font-size: 13px;
+    color: var(--fg-muted);
+}
+.box-overview-explain {
+    padding: 0;
+    background: transparent;
+    border: none;
+    color: var(--fg-faint);
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+}
+.box-overview-explain:hover { color: var(--accent, #4a9eff); }
+.box-settings {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+}
+.box-settings-label { font-weight: 600; color: var(--fg-base); margin-bottom: 8px; }
+.box-opt-group { margin: 8px 0; }
+.box-opt-caption {
+    font-size: 12px;
+    color: var(--fg-muted);
+    margin-bottom: 4px;
+}
+/* Agent / editor as bordered selectable cards (selection = accent border). */
+.box-opt-cards { display: flex; flex-wrap: wrap; gap: 8px; }
+.box-opt-cards.disabled { opacity: 0.55; pointer-events: none; }
+.box-opt-card {
+    padding: 6px 12px;
+    border: 1px solid var(--border, #333);
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--fg-base);
+    user-select: none;
+}
+.box-opt-card:hover { border-color: var(--accent, #4a9eff); }
+.box-opt-card.selected {
+    border-color: var(--accent, #4a9eff);
+    box-shadow: inset 0 0 0 1px var(--accent, #4a9eff);
+}
+.box-opt-name { white-space: nowrap; }
+/* MCP picker checkboxes: undo the .field input/label bleed (width:100%,
+   uppercase block label) so the tickbox sits left of its name. */
+.box-settings .config-mcp-picker { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.box-settings .mgmt-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin: 0;
+    font-size: 13px;
+    color: var(--fg-base);
+    text-transform: none;
+    letter-spacing: normal;
+}
+.box-settings .mgmt-check input[type="checkbox"] {
+    width: auto;
+    flex: none;
+    margin: 0;
+    padding: 0;
+    background: none;
+    border: none;
+}
