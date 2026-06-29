@@ -1,6 +1,5 @@
 {
   "name": "sandbox",
   "substrate": "docker",
-  "services": {"code-server": false},
-  "description": "A single confined runc container (ssh, no inner docker, no agent) — a bare sandbox box. The editor is off by default; add it with `--enable code-server`."
+  "description": "A single confined runc container (ssh, no inner docker, no agent) — a bare sandbox box. The editor is on by default; disable it with `--disable code-server`."
 }

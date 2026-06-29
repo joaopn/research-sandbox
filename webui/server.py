@@ -547,6 +547,19 @@ async def broker_project_action_handler(request: web.Request) -> web.Response:
         pw = req_body.get("password") if isinstance(req_body, dict) else None
         if isinstance(pw, str):
             args["password"] = pw
+    elif action == "update":
+        # The editor extension toggles code-server via `update` enable/disable
+        # (STAGE_BOX_EXT_UX C). The broker's UPDATE_WEBUI_FIELDS ({name, enable,
+        # disable, role_mcp_upstream}) is the real boundary — only those reach the
+        # verb; nothing host-shaped. Forward for `update` only (start/stop ignore them).
+        try:
+            req_body = await request.json()
+        except Exception:
+            req_body = {}
+        if isinstance(req_body, dict):
+            for k in ("enable", "disable"):
+                if req_body.get(k) is not None:
+                    args[k] = req_body[k]
     return await _start_op(request, action, args, BROKER_OP_TIMEOUT_S)
 
 

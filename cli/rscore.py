@@ -439,9 +439,12 @@ class CreateRequest:
             raise ValidationError(
                 f"no cached {DEFAULT_AGENT} dist — run `research agent pull` first "
                 f"(or `research start`, which auto-pulls)")
-        # Editor floor (STAGE_EDITOR_DIST slice 2 — PI chose fail-fast): a dind
+        # Editor floor (STAGE_EDITOR_DIST slice 2 — PI chose fail-fast): ANY
         # project whose editor will be ENABLED needs a pulled editor dist (no bake
-        # anymore), so you never get a supervisor with a missing Editor tab.
+        # anymore), so you never get a supervisor / box with a missing Editor tab.
+        # Covers BOTH substrates now (STAGE_BOX_EXT_UX C — the editor defaults on
+        # uniformly, so a docker box also deploys it: the docker deploy path mounts
+        # the dist guarded on its presence and would silently skip → dead tab).
         # Flag-aware (NOT raw substrate): a `--disable code-server` project
         # deliberately has no tab, so it must not be blocked. Resolve the effective
         # flag through the SAME function + manifest base that create() uses at the
@@ -451,7 +454,7 @@ class CreateRequest:
         svc_dis = _split_disable_tokens(",".join(_as_tuple(kw.get("disable"))))[0]
         editor_on = _compute_service_flags(
             svc_en, svc_dis, base=(service_defaults or None)).get("code-server", True)
-        if substrate is Substrate.DIND_SYSBOX and editor_on and not editor_dist_present():
+        if editor_on and not editor_dist_present():
             raise ValidationError(
                 "no cached editor dist — run `research editor pull` first "
                 "(or `research start`, which auto-pulls)")

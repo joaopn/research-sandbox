@@ -1339,6 +1339,10 @@ function mgmtCreateDialog(view, manifest, agents) {
         el("option", { value: "open" }, ["open"]),
         el("option", { value: "locked" }, ["locked"]),
     ]);
+    // Editor (code-server) is universal + on by default (STAGE_BOX_EXT_UX C).
+    // Unchecking sends disable:["code-server"]; checked sends nothing (default-on).
+    const editorCb = el("input", { type: "checkbox" });
+    editorCb.checked = true;
 
     // Enable presets — only for a workflow that has a worker/sandbox layer
     // (research flavor). A bare box / sandbox host has none, so the backend would
@@ -1425,6 +1429,7 @@ function mgmtCreateDialog(view, manifest, agents) {
             ]),
             el("div", { class: "field" }, [el("label", {}, ["Project name"]), nameI]),
             el("div", { class: "field" }, [el("label", {}, ["Egress"]), egressS]),
+            el("label", { class: "mgmt-check" }, [editorCb, " editor (code-server)"]),
             enableField,
             dockerGroup,
             el("div", { class: "hint" }, [
@@ -1450,6 +1455,8 @@ function mgmtCreateDialog(view, manifest, agents) {
                 workflow: workflow,
                 egress: egressS.value,
             };
+            // Editor on by default; unchecking disables the code-server service.
+            if (!editorCb.checked) payload.disable = ["code-server"];
             if (hasWorkerLayer) {
                 payload.enable = checks.filter((c) => c.cb.checked).map((c) => c.p);
             }
@@ -2776,17 +2783,69 @@ function makeProjectConfigBox(project) {
         "Hidden tabs stay enabled on the supervisor — this only controls what shows here.",
     ]));
     appendExtensionsSection(box, project.name);
+    appendEditorExtensionSection(box, project, enabled);
     return box;
 }
 
-// Extension management (config box → "Extensions" section). Server-flavor-gated
-// exactly like Boxes: ext_list die()s for a sandbox-dind / docker-substrate /
-// stopped project (or when logged out) → non-ok reply → the section removes
-// itself. So a sandbox-dind project shows Boxes (not Extensions) and a research
-// project shows Extensions (not Boxes), with no client-side flavor check.
-function appendExtensionsSection(box, projectName) {
+// The editor "Extensions" surface (STAGE_BOX_EXT_UX C) — host-container webui
+// surfaces, the unified "Add extension" sense (Editor now; Overleaf-style compose
+// surfaces later). Client-rendered from the services map: `code-server` present ⇒
+// on; `supervisor.box_harness` ⇒ dind. The toggle goes through `update`
+// enable/disable code-server, which RECREATES the supervisor — DIND-only, since
+// `update` refuses the docker substrate; a docker box's editor is a create-time
+// choice ("set at create"). Universal (renders on every flavor), unlike the
+// research-only "Agent roles" section above.
+function appendEditorExtensionSection(box, project, enabled) {
     const section = el("div", { class: "config-section" });
     section.appendChild(el("div", { class: "config-section-label" }, ["Extensions"]));
+    const dind = !!(enabled.supervisor && enabled.supervisor.box_harness);
+    const editorOn = Object.prototype.hasOwnProperty.call(enabled, "code-server");
+    const row = el("div", { class: "config-box-row" }, [
+        el("span", { class: "config-box-name" }, ["Editor"]),
+        el("span", { class: "config-box-meta" }, [editorOn ? "on" : "off"]),
+    ]);
+    if (dind) {
+        const btn = el("button", { class: "btn btn-secondary" },
+                      [editorOn ? "Disable" : "Enable"]);
+        btn.onclick = () => mgmtEditorToggle(project.name, editorOn);
+        row.appendChild(btn);
+    } else {
+        // docker: update refuses it, so the editor is fixed at create time.
+        row.appendChild(el("span", { class: "config-box-meta" }, ["set at create"]));
+    }
+    section.appendChild(row);
+    box.appendChild(section);
+}
+
+function mgmtEditorToggle(name, on) {
+    const word = on ? "Disable" : "Enable";
+    mgmtConfirmThenTail(boxOpView(), {
+        title: `${word} the editor on ${name}`,
+        tailTitle: `${on ? "Disabling" : "Enabling"} the editor on ${name}`,
+        verb: "update",
+        confirmLabel: word,
+        body: [el("p", {}, [
+            `${word} the code-server editor on "${name}". This recreates the ` +
+            "supervisor (fresh container); running work in it is interrupted.",
+        ])],
+        request: () => fetch(`/broker/project/${encodeURIComponent(name)}/update`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(on ? { disable: ["code-server"] } : { enable: ["code-server"] }),
+        }),
+        onDone: async (ok) => { if (ok) await refreshAfterBoxChange(name); },
+    });
+}
+
+// PI-role management (config box → "Agent roles" section — relabeled from
+// "Extensions" so it doesn't collide with the new editor "Extensions" section
+// during the C→D window; this whole function is removed in the lineage retirement).
+// Server-flavor-gated exactly like Boxes: ext_list die()s for a sandbox-dind /
+// docker-substrate / stopped project (or when logged out) → non-ok reply → the
+// section removes itself. So a sandbox-dind project shows Boxes (not Agent roles)
+// and a research project shows Agent roles, with no client-side flavor check.
+function appendExtensionsSection(box, projectName) {
+    const section = el("div", { class: "config-section" });
+    section.appendChild(el("div", { class: "config-section-label" }, ["Agent roles"]));
     const bodyEl = el("div", { class: "config-boxes" }, [
         el("div", { class: "config-empty" }, ["Loading extensions…"]),
     ]);
