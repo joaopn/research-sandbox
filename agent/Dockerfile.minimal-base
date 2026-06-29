@@ -63,8 +63,8 @@ RUN su - research -c "/opt/conda/bin/conda init bash"
 # 2). It is a host-cached, version-pinned dist (built by `research editor pull`)
 # cp'd into each interactive container's own ~/.local at boot by the editor dist
 # block in every leaf's entrypoint — the same no-bake model as the agent dist.
-# The CODE_SERVER_VERSION / DATA_WRANGLER_VERSION pins live in versions.env and
-# are consumed only by the dist builder now.
+# The CODE_SERVER_VERSION pin (and the bundled editor-extension pins) live in
+# versions.env and are consumed only by the dist builder now.
 
 # Minimal byobu status line. Staged into the research user's home so each
 # leaf's first-boot skel snapshot (cp -a /home/research /etc/research-skel,

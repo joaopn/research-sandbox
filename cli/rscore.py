@@ -1514,10 +1514,29 @@ VERSION_SOURCES: dict[str, dict[str, str]] = {
         "kind": "manual",
         "url": "https://download.docker.com/linux/static/stable/x86_64/",
     },
-    "DATA_WRANGLER_VERSION": {
+    # Editor-bundled VS Code extensions (Open VSX item pages — eyeball the latest
+    # before bumping the pin in versions.env, then `research editor pull`).
+    "PYTHON_EXT_VERSION": {
+        "kind": "manual", "url": "https://open-vsx.org/extension/ms-python/python",
+    },
+    "JUPYTER_VERSION": {
+        "kind": "manual", "url": "https://open-vsx.org/extension/ms-toolsai/jupyter",
+    },
+    "JUPYTER_CELL_TAGS_VERSION": {
         "kind": "manual",
-        "url": "https://marketplace.visualstudio.com/items"
-               "?itemName=ms-toolsai.datawrangler",
+        "url": "https://open-vsx.org/extension/ms-toolsai/vscode-jupyter-cell-tags",
+    },
+    "JUPYTER_KEYMAP_VERSION": {
+        "kind": "manual",
+        "url": "https://open-vsx.org/extension/ms-toolsai/jupyter-keymap",
+    },
+    "JUPYTER_RENDERERS_VERSION": {
+        "kind": "manual",
+        "url": "https://open-vsx.org/extension/ms-toolsai/jupyter-renderers",
+    },
+    "JUPYTER_SLIDESHOW_VERSION": {
+        "kind": "manual",
+        "url": "https://open-vsx.org/extension/ms-toolsai/vscode-jupyter-slideshow",
     },
     "CLAUDE_CODE_EXT_VERSION": {
         "kind": "manual",
@@ -2165,7 +2184,6 @@ EDITOR_DIST_MOUNT = "/opt/editor-dist"
 EDITOR_DIST_MOUNT_ARGS = ["-v", f"{EDITOR_DIST_MOUNT}:{EDITOR_DIST_MOUNT}:ro"]
 _CODE_SERVER_BIN = "code-server"
 _CODE_SERVER_VERSION_KEY = "CODE_SERVER_VERSION"
-_DATA_WRANGLER_VERSION_KEY = "DATA_WRANGLER_VERSION"
 
 # Tier-2 extension prune — MUST mirror agent/Dockerfile.minimal-base's strip list
 # until slice 2 deletes the bake (the dist and the bake should ship the same
@@ -2180,12 +2198,30 @@ _CODE_SERVER_STRIP_EXTS = (
     "debug-server-ready", "references-view", "extension-editing",
     "simple-browser",
 )
-# Datawrangler .vsix (MS-marketplace-only) — downloaded fresh in-container at
-# build so the dist is self-contained (doesn't depend on the bake surviving
-# slice 2). Version from versions.env (DATA_WRANGLER_VERSION).
-_DATA_WRANGLER_VSIX_URL = (
-    "https://marketplace.visualstudio.com/_apis/public/gallery/publishers/"
-    "ms-toolsai/vsextensions/datawrangler/{ver}/vspackage")
+# Editor-bundled VS Code extensions — downloaded fresh in-container at build so
+# the dist is self-contained. All are UNIVERSAL Open VSX packages (no platform
+# target); code-server-deploy.sh installs every .vsix in templates/extensions/ at
+# boot. Each is saved under its extension id (<ns>.<name>.vsix, no version) so the
+# deploy script's `*<base>*` skip-glob matches the installed folder
+# <ns>.<name>-<ver>. Versions are per-extension `manual` pins in versions.env.
+_OPEN_VSX_VSIX_URL = (
+    "https://open-vsx.org/api/{ns}/{name}/{ver}/file/{ns}.{name}-{ver}.vsix")
+_EDITOR_EXTENSIONS = (
+    {"ns": "ms-python", "name": "python", "version_key": "PYTHON_EXT_VERSION"},
+    {"ns": "ms-toolsai", "name": "jupyter", "version_key": "JUPYTER_VERSION"},
+    {"ns": "ms-toolsai", "name": "vscode-jupyter-cell-tags",
+     "version_key": "JUPYTER_CELL_TAGS_VERSION"},
+    {"ns": "ms-toolsai", "name": "jupyter-keymap",
+     "version_key": "JUPYTER_KEYMAP_VERSION"},
+    {"ns": "ms-toolsai", "name": "jupyter-renderers",
+     "version_key": "JUPYTER_RENDERERS_VERSION"},
+    {"ns": "ms-toolsai", "name": "vscode-jupyter-slideshow",
+     "version_key": "JUPYTER_SLIDESHOW_VERSION"},
+)
+
+
+def _editor_ext_vsix_name(e: dict) -> str:
+    return f"{e['ns']}.{e['name']}.vsix"
 # GitHub "latest" redirects to /releases/tag/v<ver>; reading the effective URL
 # resolves the upstream version with curl alone (no in-container JSON parse).
 _CODE_SERVER_LATEST_URL = "https://github.com/coder/code-server/releases/latest"
@@ -2503,25 +2539,38 @@ def editor_dist_present() -> bool:
     return os.path.lexists(EDITOR_DIST_DIR / ".local" / "bin" / _CODE_SERVER_BIN)
 
 
-def _editor_build_dist(cs_version: str, dw_version: str) -> None:
+def _editor_build_dist(cs_version: str) -> None:
     """Build the code-server editor dist IN a throwaway rs-minimal-base container
     and swap it into the host cache (STAGE_EDITOR_DIST). Unlike the agent dist (a
     bare ~/.local capture), the editor dist is a fixed tree:
         .local/                              -- `--method standalone` install (Tier-2 stripped)
         tools/code-server-stub.py            -- the lazy-start stub
         templates/User/settings.json         -- code-server user settings
-        templates/extensions/datawrangler.vsix
-    The install + the .vsix download run in-container (network); the stub +
-    settings are repo files copied in host-side (so the build is self-contained
-    and survives slice 2's bake deletion). `--method standalone` (NOT the deb
-    method the bake uses — that lands in /usr/bin, leaving ~/.local empty) roots
-    the tree in ~/.local so it cp-deploys like the agent dist; the launcher is
-    relativized for cross-user portability (the spike proved it suffices)."""
-    for v in (cs_version, dw_version):
-        if not _AGENT_VERSION_RE.match(v):
-            die(f"refusing to build editor dist with suspicious version {v!r}")
+        templates/extensions/*.vsix          -- the bundled Open VSX extensions
+    The install + the .vsix downloads run in-container (network); the stub +
+    settings are repo files copied in host-side (so the build is self-contained).
+    `--method standalone` (NOT the deb method — that lands in /usr/bin, leaving
+    ~/.local empty) roots the tree in ~/.local so it cp-deploys like the agent
+    dist; the launcher is relativized for cross-user portability."""
+    if not _AGENT_VERSION_RE.match(cs_version):
+        die(f"refusing to build editor dist with suspicious version {cs_version!r}")
     if not run_quiet(["docker", "image", "inspect", MINIMAL_BASE_IMAGE]):
         die(f"{MINIMAL_BASE_IMAGE} not found — run `research start --rebuild` first")
+    # Resolve + validate the bundled-extension pins (charset-guard before any
+    # value reaches the in-container shell; die loudly on an unset pin so the dist
+    # can never ship silently missing an extension).
+    versions = load_versions()
+    ext_specs: list[tuple[str, str]] = []   # (vsix filename, download url)
+    ext_versions: dict[str, str] = {}
+    for e in _EDITOR_EXTENSIONS:
+        ev = versions.get(e["version_key"])
+        if not ev:
+            die(f"no pinned {e['version_key']} in versions.env")
+        if not _AGENT_VERSION_RE.match(ev):
+            die(f"refusing to build editor dist with suspicious version {ev!r}")
+        ext_specs.append((_editor_ext_vsix_name(e),
+                          _OPEN_VSX_VSIX_URL.format(ns=e["ns"], name=e["name"], ver=ev)))
+        ext_versions[f"{e['ns']}.{e['name']}"] = ev
     sup_dir = SCRIPT_DIR / "container" / "supervisor"
     stub_src = sup_dir / "code-server-stub.py"
     deploy_src = sup_dir / "code-server-deploy.sh"
@@ -2535,7 +2584,9 @@ def _editor_build_dist(cs_version: str, dw_version: str) -> None:
         # Strip the Tier-2 extensions in the standalone install's extensions dir
         # (|| true so a missing extension can't abort under set -e).
         strip = " ".join(f'rm -rf "$EXT_DIR/{e}" || true;' for e in _CODE_SERVER_STRIP_EXTS)
-        vsix_url = _DATA_WRANGLER_VSIX_URL.format(ver=dw_version)
+        ext_dl = "; ".join(
+            f"curl -fsSL --compressed -o /out/ext/{fn} {shlex.quote(url)}"
+            for fn, url in ext_specs)
         # set -e + pipefail (mirror _agent_build_dist) so a `curl | sh` failure or a
         # missing extensions dir aborts with a NAMED error instead of silently
         # producing an empty capture that fails opaquely after the retries.
@@ -2548,28 +2599,29 @@ def _editor_build_dist(cs_version: str, dw_version: str) -> None:
             '[ -n "$EXT_DIR" ] || { echo "code-server extensions dir not found" >&2; exit 1; }; '
             f"{strip} "
             "cp -a ~/.local /out/.local; "
-            f"curl -fsSL --compressed -o /out/datawrangler.vsix {shlex.quote(vsix_url)}")
+            "mkdir -p /out/ext; "
+            f"{ext_dl}")
         script = (f"set -e; set -o pipefail; su - research -c {shlex.quote(inner)}; "
                   f"chown -R {os.getuid()}:{os.getgid()} /out")
         captured_local = tmp / ".local"
-        vsix_tmp = tmp / "datawrangler.vsix"
+        ext_dir = tmp / "ext"
         built, last_err = False, ""
         for _ in range(_AGENT_BUILD_ATTEMPTS):
             r = run(["docker", "run", "--rm", "-v", f"{tmp}:/out",
                      MINIMAL_BASE_IMAGE, "sh", "-lc", script], capture_output=True)
             if (r.returncode == 0
                     and os.path.lexists(captured_local / "bin" / _CODE_SERVER_BIN)
-                    and vsix_tmp.is_file()):
+                    and all((ext_dir / fn).is_file() for fn, _ in ext_specs)):
                 built = True
                 break
             last_err = ((r.stderr or "") + (r.stdout or "")).strip()
             shutil.rmtree(captured_local, ignore_errors=True)
-            vsix_tmp.unlink(missing_ok=True)
+            shutil.rmtree(ext_dir, ignore_errors=True)
         if not built:
             die(f"editor dist build failed after {_AGENT_BUILD_ATTEMPTS} attempts:\n"
                 f"{last_err[-_AGENT_ERR_TAIL:] or 'no output'}")
         # Assemble the rest of the tree host-side: the stub + settings are repo
-        # files; the .vsix moves out of the build-output root into templates/.
+        # files; the .vsix files move out of the build-output ext/ into templates/.
         (tmp / "tools").mkdir()
         for src in (stub_src, deploy_src):
             dst = tmp / "tools" / src.name
@@ -2577,8 +2629,11 @@ def _editor_build_dist(cs_version: str, dw_version: str) -> None:
             os.chmod(dst, 0o755)   # entrypoint runs the stub + sources the deploy
         (tmp / "templates" / "User").mkdir(parents=True)
         shutil.copy2(settings_src, tmp / "templates" / "User" / "settings.json")
-        (tmp / "templates" / "extensions").mkdir(parents=True)
-        os.replace(vsix_tmp, tmp / "templates" / "extensions" / "datawrangler.vsix")
+        exts_out = tmp / "templates" / "extensions"
+        exts_out.mkdir(parents=True)
+        for fn, _ in ext_specs:
+            os.replace(ext_dir / fn, exts_out / fn)
+        ext_dir.rmdir()
         _relativize_launcher(captured_local / "bin" / _CODE_SERVER_BIN)
         if EDITOR_DIST_DIR.exists():
             shutil.rmtree(EDITOR_DIST_DIR)
@@ -2588,24 +2643,20 @@ def _editor_build_dist(cs_version: str, dw_version: str) -> None:
         if tmp is not None:
             shutil.rmtree(tmp, ignore_errors=True)
     _editor_sidecar().write_text(json.dumps(
-        {"code_server_version": cs_version, "data_wrangler_version": dw_version,
+        {"code_server_version": cs_version, "extensions": ext_versions,
          "pulled_at": datetime.datetime.now(datetime.timezone.utc).isoformat()},
         indent=2) + "\n")
 
 
-def editor_pull(cs_version: str | None = None,
-                dw_version: str | None = None) -> dict:
-    """Pull the editor dist at (versions or the versions.env pins) into the cache."""
+def editor_pull(cs_version: str | None = None) -> dict:
+    """Pull the editor dist at (cs_version or the versions.env pin) into the cache
+    (bundled-extension versions come from their own versions.env pins)."""
     v = load_versions()
     cs = cs_version or v.get(_CODE_SERVER_VERSION_KEY)
-    dw = dw_version or v.get(_DATA_WRANGLER_VERSION_KEY)
     if not cs:
         die(f"no pinned {_CODE_SERVER_VERSION_KEY} in versions.env")
-    if not dw:
-        die(f"no pinned {_DATA_WRANGLER_VERSION_KEY} in versions.env")
-    _editor_build_dist(cs, dw)
-    return {"code_server_version": cs, "data_wrangler_version": dw,
-            "path": str(EDITOR_DIST_DIR)}
+    _editor_build_dist(cs)
+    return {"code_server_version": cs, "path": str(EDITOR_DIST_DIR)}
 
 
 def editor_show() -> dict:
@@ -2615,7 +2666,7 @@ def editor_show() -> dict:
     try:
         return json.loads(_editor_sidecar().read_text())
     except Exception:
-        return {"code_server_version": "?", "data_wrangler_version": "?"}
+        return {"code_server_version": "?"}
 
 
 def _editor_resolve_latest() -> str:
@@ -2646,12 +2697,10 @@ def editor_refresh_check() -> tuple[str, str]:
 
 def editor_apply_refresh(cs_version: str) -> None:
     """Bump versions.env's CODE_SERVER_VERSION pin AND rebuild the dist at it
-    (datawrangler stays at its pin). The prompt/confirm is the front-end's job."""
+    (the bundled extensions stay at their own pins). The prompt/confirm is the
+    front-end's job."""
     _set_version_pin(_CODE_SERVER_VERSION_KEY, cs_version)
-    dw = load_versions().get(_DATA_WRANGLER_VERSION_KEY)
-    if not dw:
-        die(f"no pinned {_DATA_WRANGLER_VERSION_KEY} in versions.env")
-    _editor_build_dist(cs_version, dw)
+    _editor_build_dist(cs_version)
 
 
 def _stage_editor_dist(supervisor: str, *, deploy_local: bool = False) -> None:

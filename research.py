@@ -359,8 +359,7 @@ def cmd_agent_refresh(args: argparse.Namespace) -> None:
 
 def cmd_editor_pull(args: argparse.Namespace) -> None:
     res = rscore.editor_pull()
-    print(f"pulled editor code-server {res['code_server_version']} "
-          f"(datawrangler {res['data_wrangler_version']}) → {res['path']}")
+    print(f"pulled editor code-server {res['code_server_version']} → {res['path']}")
 
 
 def cmd_editor_show(args: argparse.Namespace) -> None:
@@ -368,9 +367,12 @@ def cmd_editor_show(args: argparse.Namespace) -> None:
     if not s:
         print("no editor dist pulled yet — run `research editor pull`")
         return
+    exts = s.get("extensions") or {}
     print(f"  code-server {s.get('code_server_version', '?')} "
-          f"datawrangler {s.get('data_wrangler_version', '?')} "
+          f"({len(exts)} bundled extension(s)) "
           f"pulled {s.get('pulled_at', '?')}")
+    for name, ver in sorted(exts.items()):
+        print(f"    {name} {ver}")
 
 
 def cmd_editor_refresh(args: argparse.Namespace) -> None:

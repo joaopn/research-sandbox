@@ -40,13 +40,18 @@ if [[ ! -f "${CS_USER_DIR}/User/settings.json" ]] && \
     cp "${DIST}/templates/User/settings.json" "${CS_USER_DIR}/User/settings.json"
 fi
 
-# 3. Install pre-staged .vsix extensions (datawrangler) if not already present.
+# 3. Install pre-staged .vsix extensions (the bundled editor extensions) if not
+#    already present.
 if [[ -d "${DIST}/templates/extensions" ]]; then
     for vsix in "${DIST}"/templates/extensions/*.vsix; do
         [[ -f "$vsix" ]] || continue
         base=$(basename "$vsix" .vsix)
+        # Anchored + digit-gated: an installed folder is <id>-<semver> (version
+        # starts with a digit), so `<base>-[0-9]*` matches THIS extension's folder
+        # but not a sibling whose id extends <base> with another name segment
+        # (e.g. base ms-toolsai.jupyter must NOT match ms-toolsai.jupyter-keymap-…).
         shopt -s nullglob
-        existing=( "${CS_EXT_DIR}/"*"${base}"* )
+        existing=( "${CS_EXT_DIR}/${base}-"[0-9]* )
         shopt -u nullglob
         if (( ${#existing[@]} > 0 )); then
             continue
@@ -74,8 +79,12 @@ if [[ -d "$AGENT_EXT_DIR" ]]; then
     for vsix in "$AGENT_EXT_DIR"/*.vsix; do
         [[ -f "$vsix" ]] || continue
         base=$(basename "$vsix" .vsix)
+        # Anchored + digit-gated: an installed folder is <id>-<semver> (version
+        # starts with a digit), so `<base>-[0-9]*` matches THIS extension's folder
+        # but not a sibling whose id extends <base> with another name segment
+        # (e.g. base ms-toolsai.jupyter must NOT match ms-toolsai.jupyter-keymap-…).
         shopt -s nullglob
-        existing=( "${CS_EXT_DIR}/"*"${base}"* )
+        existing=( "${CS_EXT_DIR}/${base}-"[0-9]* )
         shopt -u nullglob
         if (( ${#existing[@]} > 0 )); then
             continue

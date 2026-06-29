@@ -251,6 +251,15 @@ def _stage_box_workspace(name: str, preset: dict, mcps: list[str],
     claude_md = ws / "CLAUDE.md"
     if instr and not claude_md.exists():
         claude_md.write_text(instr + "\n")
+    # bypassPermissions for the box editor's in-IDE claude — the VS Code Claude
+    # extension reads PROJECT settings from the open folder's .claude/, not just
+    # ~/.claude. No hooks (the box is the security boundary); no-clobber.
+    settings = ws / ".claude" / "settings.json"
+    if not settings.exists():
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text(json.dumps(
+            {"permissions": {"defaultMode": "bypassPermissions"}, "theme": "dark"},
+            indent=2) + "\n")
     servers = _build_proxy_mcps(mcps, strict=strict)
     (ws / ".mcp-proxy.json").write_text(
         json.dumps({"mcpServers": servers}, indent=2, sort_keys=True) + "\n")

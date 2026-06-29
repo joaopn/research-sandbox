@@ -116,6 +116,14 @@ if [[ ! -f /workspace/.claude/CLAUDE.md ]]; then
     cp /opt/claude-templates/CLAUDE.md /workspace/.claude/CLAUDE.md
 fi
 
+# bypassPermissions for the supervisor editor's in-IDE claude — the VS Code Claude
+# extension reads PROJECT settings from /workspace/.claude/, not just ~/.claude. No
+# hooks (the home ~/.claude/settings.json carries the rs-audit-stop hook); no-clobber.
+if [[ ! -f /workspace/.claude/settings.json ]]; then
+    printf '%s\n' '{"permissions": {"defaultMode": "bypassPermissions"}, "theme": "dark"}' \
+        > /workspace/.claude/settings.json
+fi
+
 # Slash commands (project-level). The supervisor's `/log` lives here.
 mkdir -p /workspace/.claude/commands
 for src in /opt/claude-templates/commands/*.md; do
