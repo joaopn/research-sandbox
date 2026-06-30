@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 
 import asyncssh
 from aiohttp import web, ClientSession, ClientTimeout, WSMsgType
+from multidict import CIMultiDict
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -630,6 +631,50 @@ async def broker_box_presets_handler(request: web.Request) -> web.Response:
     return web.json_response(reply, status=status)
 
 
+async def broker_port_add_handler(request: web.Request) -> web.Response:
+    """POST /broker/project/{name}/port {port,label} — register an exported port
+    (gated, origin-checked). Synchronous relay (an instant file write, not a
+    background op). The broker's PORT_ADD_WEBUI_FIELDS allow-list is the input
+    boundary; port/label come from the body, project from the URL."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    project = request.match_info.get("name", "")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    args = {"project": project, "port": body.get("port"), "label": body.get("label")}
+    status, reply = await _relay(request, "port_add", args)
+    return web.json_response(reply, status=status)
+
+
+async def broker_port_remove_handler(request: web.Request) -> web.Response:
+    """POST /broker/project/{name}/port-remove {port} — unregister an exported port
+    (gated, origin-checked). No step-up: a tab carries no data."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    project = request.match_info.get("name", "")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    args = {"project": project, "port": body.get("port")}
+    status, reply = await _relay(request, "port_remove", args)
+    return web.json_response(reply, status=status)
+
+
+async def broker_ports_handler(request: web.Request) -> web.Response:
+    """GET /broker/project/{name}/ports — the project's registered exported ports
+    (gated). Fast read; relayed synchronously. Drives the config box's Ports list."""
+    project = request.match_info.get("name", "")
+    status, reply = await _relay(request, "port_list", {"project": project})
+    return web.json_response(reply, status=status)
+
+
 async def broker_op_log_handler(request: web.Request) -> web.Response:
     """GET /broker/op/{op_id}/log?from=<n> — the view-log byte-slice since `n`
     plus the new EOF. Reads the RO-mounted view file directly (out-of-band from
@@ -961,6 +1006,21 @@ async def project_services_handler(request: web.Request) -> web.Response:
             espec = services.pi_isolated_editor_service(name, int(entry["editor_port"]))
             if espec is not None:
                 out[f"{services.PI_ISOLATED_EDITOR_ID_PREFIX}{name}"] = espec
+
+    # Operator-registered exported ports (STAGE_EXPORTED_PORTS): one http tab per
+    # port that is currently LISTENING on the supervisor netns — same probe-gated
+    # discipline as the editor (a port the PI hasn't started serving yet shows no
+    # dead-iframe tab). proxy_handler re-checks membership per request.
+    exported = _read_exported_ports(project)
+    if exported:
+        port_up = await asyncio.gather(*[
+            tcp_probe(upstream, int(e["port"])) for e in exported])
+        for e, up in zip(exported, port_up):
+            if not up:
+                continue
+            spec = services.exported_port_service(int(e["port"]), e["label"])
+            if spec is not None:
+                out[f"{services.EXPORTED_PORT_ID_PREFIX}{int(e['port'])}"] = spec
     return web.json_response(out)
 
 
@@ -985,6 +1045,35 @@ def _read_project_extensions(project: str) -> dict[str, dict]:
     if not isinstance(data, dict):
         return {}
     return {n: e for n, e in data.items() if isinstance(e, dict)}
+
+
+def _read_exported_ports(project: str) -> list[dict]:
+    """Return ``[{port:int, label:str}]`` for the ports the operator registered for
+    ``project``, read from its `.orchestrator/exported-ports.json` off the
+    `/projects:ro` bind-mount (STAGE_EXPORTED_PORTS). Tolerant like
+    _read_project_extensions; no cache — `project_services_handler` probes each on
+    every load, and `proxy_handler` re-reads per request so a removed port stops
+    proxying immediately (no stale-allow window)."""
+    workspace = _project_workspace(project)
+    if workspace is None:
+        return []
+    f = workspace / ".orchestrator" / "exported-ports.json"
+    if not f.is_file():
+        return []
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    out: list[dict] = []
+    for e in data:
+        if not isinstance(e, dict):
+            continue
+        port, label = e.get("port"), e.get("label")
+        if isinstance(port, int) and not isinstance(port, bool) and isinstance(label, str):
+            out.append({"port": port, "label": label})
+    return out
 
 
 def _read_project_marker(project: str) -> dict:
@@ -1253,8 +1342,18 @@ async def session_handler(request: web.Request) -> web.Response:
 
 # ---- /proxy/<project>/<service>/<path> — kind=http reverse proxy --------
 
-def _filter_headers(headers, drop: frozenset[str]) -> dict[str, str]:
-    return {k: v for k, v in headers.items() if k.lower() not in drop}
+def _filter_headers(headers, drop: frozenset[str]) -> "CIMultiDict[str]":
+    # Preserve DUPLICATE headers (a plain dict collapses them): an upstream can send
+    # multiple Set-Cookie in one response (Gitea's login emits the session cookie AND
+    # _csrf) — a dict keeps only the last, silently dropping the session cookie so the
+    # login 303-succeeds but never persists. .items() yields each duplicate pair; add()
+    # keeps them all. Both call sites take a CIMultiDict (web.StreamResponse headers,
+    # ClientSession.request headers).
+    out: "CIMultiDict[str]" = CIMultiDict()
+    for k, v in headers.items():
+        if k.lower() not in drop:
+            out.add(k, v)
+    return out
 
 
 async def _proxy_ws(request: web.Request,
@@ -1387,6 +1486,19 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
         return web.Response(status=401, text="session required")
 
     svc = services.get(service_id)
+    if svc is None and service_id.startswith(services.EXPORTED_PORT_ID_PREFIX):
+        # Exported-port tab (STAGE_EXPORTED_PORTS): resolve the upstream port from
+        # the `port-<n>` id, but ONLY if <n> is in THIS project's registry — the
+        # server-side membership gate. Re-read per request (uncached) so a removed
+        # port stops proxying immediately; without it the shared proxy (the webui is
+        # on every project's bridge) would be a general port-forwarder. Parse
+        # defensively — a non-digit / unregistered <n> falls through to the 404, never
+        # an exception. (A sibling box-editor-<name> branch can resolve here later —
+        # the bucketed box-editor 404.)
+        raw = service_id[len(services.EXPORTED_PORT_ID_PREFIX):]
+        registered = {int(e["port"]) for e in _read_exported_ports(project)}
+        if raw.isdigit() and int(raw) in registered:
+            svc = services.exported_port_service(int(raw), service_id)
     if svc is None or svc.get("kind") != "http":
         return web.Response(
             status=404, text=f"unknown http service {service_id!r}")
@@ -1542,6 +1654,13 @@ def main() -> None:
     app.router.add_get("/broker/project/{name}/boxes", broker_boxes_handler)
     app.router.add_get(
         "/broker/project/{name}/box-presets", broker_box_presets_handler)
+    # Exported ports (STAGE_EXPORTED_PORTS). The specific POSTs MUST precede the
+    # `{action}` catch-all below (first-match wins, else `port`/`port-remove` are
+    # swallowed as actions).
+    app.router.add_get("/broker/project/{name}/ports", broker_ports_handler)
+    app.router.add_post("/broker/project/{name}/port", broker_port_add_handler)
+    app.router.add_post(
+        "/broker/project/{name}/port-remove", broker_port_remove_handler)
     app.router.add_post(
         "/broker/project/{name}/{action}", broker_project_action_handler)
     # op-log tail + status (GETs, session-gated; the more specific /log first).

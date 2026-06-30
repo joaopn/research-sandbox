@@ -132,6 +132,32 @@ def pi_isolated_editor_service(name: str, port: int) -> dict | None:
     }
 
 
+# Exported ports (STAGE_EXPORTED_PORTS): a port the PI is serving inside the
+# supervisor, surfaced as an http tab. The id is `port-<n>`; project_services_handler
+# synthesizes one per LISTENING registered port, and proxy_handler resolves the
+# upstream port from `<n>` after confirming it's in the project's registry (the
+# server-side membership gate — the webui is on every project's bridge, so a
+# client-chosen port would otherwise be a general port-forwarder).
+EXPORTED_PORT_ID_PREFIX = "port-"
+
+
+def exported_port_service(port: int, label: str) -> dict | None:
+    """Synthesize the http tab spec for an exported port, or None if the port is
+    outside the valid TCP range. Labelled with the operator-supplied label."""
+    port = int(port)
+    if not (1 <= port <= 65535):
+        return None
+    return {
+        "label": label,
+        "kind": "http",
+        "always_on": False,
+        "renderer": "iframe",
+        "default_port": port,
+        "upstream_path": "/",
+        "surface": "visual",
+    }
+
+
 def resolve(service_id: str) -> dict | None:
     """Static registry lookup, falling back to a synthesized PI-isolated
     spec for `pi-iso-<name>` ids. Used by the ssh handler so it can run the

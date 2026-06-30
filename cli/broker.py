@@ -392,6 +392,33 @@ def _verb_box_presets(args: dict, _progress=None) -> dict:
     return dataclasses.asdict(rscore.box_presets(req))
 
 
+# Exported ports (STAGE_EXPORTED_PORTS): port + label act on the project's own
+# supervisor netns (a port the PI is serving there), so they're relayable — neither
+# is host-shaped (cf. the host-root boundary). Deny-by-default field allowlist,
+# mirroring BOX_ADD_WEBUI_FIELDS. Token-gated (not in OPEN_VERBS), no step-up (a
+# tab carries no data), no progress (instant file write — synchronous relay).
+PORT_ADD_WEBUI_FIELDS = frozenset({"project", "port", "label"})
+PORT_TARGET_WEBUI_FIELDS = frozenset({"project", "port"})
+
+
+def _verb_port_add(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in PORT_ADD_WEBUI_FIELDS}
+    req = rscore.PortAddRequest.from_kwargs(**safe)   # may raise ValidationError
+    return dataclasses.asdict(rscore.port_add(req))
+
+
+def _verb_port_remove(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in PORT_TARGET_WEBUI_FIELDS}
+    req = rscore.PortRemoveRequest.from_kwargs(**safe)  # may raise ValidationError
+    return dataclasses.asdict(rscore.port_remove(req))
+
+
+def _verb_port_list(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k == "project"}
+    req = rscore.PortListRequest.from_kwargs(**safe)  # may raise ValidationError
+    return dataclasses.asdict(rscore.port_list(req))
+
+
 # The closed lifecycle vocabulary — the host-root boundary. Adding a verb here
 # is a deliberate, security-reviewed edit; never a docker passthrough.
 VERBS = {
@@ -408,6 +435,9 @@ VERBS = {
     "box_remove": _verb_box_remove,
     "box_list": _verb_box_list,
     "box_presets": _verb_box_presets,
+    "port_add": _verb_port_add,
+    "port_remove": _verb_port_remove,
+    "port_list": _verb_port_list,
 }
 
 # Verbs requiring step-up re-auth: a FRESH password in the request, not just a

@@ -738,6 +738,83 @@ class BoxPresetsRequest:
         return cls(project=_require_name(kw.get("project")))
 
 
+# Exported-port tabs (STAGE_EXPORTED_PORTS): the webui surfaces a port the PI is
+# serving inside the supervisor (rs-project-<proj>:<port>) as an http tab. A
+# `port`/`label` act on the project's own supervisor netns — neither is
+# host-shaped, so both are broker-relayable. The TCP port space is the OS/protocol
+# bound (1-65535), not an invented cap. Reserved: the supervisor's own ssh (22) +
+# editor-stub (8443) ports and the per-box editor publish range (8500-8599) —
+# registering one would synthesize a confusing duplicate tab onto a netns port the
+# webui already serves. Lockstep: 22 == services.SERVICES["supervisor"].default_port;
+# 8443 == services.SERVICES["code-server"].default_port; 8500-8599 ==
+# rs_sandbox.BOX_EDITOR_PORT_LO/HI.
+_PORT_MIN = 1
+_PORT_MAX = 65535
+_EXPORT_RESERVED_PORTS = frozenset({22, 8443})
+_EXPORT_BOX_EDITOR_PORT_LO = 8500
+_EXPORT_BOX_EDITOR_PORT_HI = 8599  # inclusive
+
+
+def _coerce_export_port(value: Any) -> int:
+    # bool is an int subclass — reject it before the isinstance(int) branch.
+    if isinstance(value, bool):
+        raise ValidationError("port must be an integer")
+    if isinstance(value, int):
+        port = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        port = int(value.strip())
+    else:
+        raise ValidationError("port must be an integer")
+    if not (_PORT_MIN <= port <= _PORT_MAX):
+        raise ValidationError(f"port must be between {_PORT_MIN} and {_PORT_MAX}")
+    if port in _EXPORT_RESERVED_PORTS:
+        raise ValidationError(
+            f"port {port} is reserved (the supervisor's ssh / editor ports)")
+    if _EXPORT_BOX_EDITOR_PORT_LO <= port <= _EXPORT_BOX_EDITOR_PORT_HI:
+        raise ValidationError(
+            f"port {port} is reserved for box editors "
+            f"({_EXPORT_BOX_EDITOR_PORT_LO}-{_EXPORT_BOX_EDITOR_PORT_HI})")
+    return port
+
+
+@dataclass(frozen=True)
+class PortAddRequest:
+    project: str
+    port: int
+    label: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "PortAddRequest":
+        port = _coerce_export_port(kw.get("port"))
+        label = kw.get("label")
+        if not (isinstance(label, str) and label.strip()):
+            raise ValidationError("label must be a non-empty string")
+        return cls(project=_require_name(kw.get("project")), port=port,
+                   label=label.strip())
+
+
+@dataclass(frozen=True)
+class PortRemoveRequest:
+    project: str
+    port: int
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "PortRemoveRequest":
+        # Reuse the same coercion (a reserved port can never be in the list, so
+        # rejecting it on remove is harmless — keeps one validation path).
+        return cls(project=_require_name(kw.get("project")),
+                   port=_coerce_export_port(kw.get("port")))
+
+
+@dataclass(frozen=True)
+class PortListRequest:
+    project: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "PortListRequest":
+        return cls(project=_require_name(kw.get("project")))
+
+
 @dataclass
 class BoxAddResult:
     project: str
@@ -772,6 +849,27 @@ class BoxPresetsResult:
     project: str
     presets: list[dict]                     # {name,image,agent_default,clone,editor_default,repo,description,source}
     allowed_mcps: list[str]
+
+
+@dataclass
+class PortAddResult:
+    project: str
+    port: int
+    label: str
+    ports: list[dict]                       # the full {port,label} list after the add
+
+
+@dataclass
+class PortRemoveResult:
+    project: str
+    port: int
+    ports: list[dict]
+
+
+@dataclass
+class PortListResult:
+    project: str
+    ports: list[dict]                       # [{port, label}] — no secrets
 
 
 # ===========================================================================
@@ -5005,6 +5103,83 @@ def box_presets(req: "BoxPresetsRequest", _progress=None) -> BoxPresetsResult:  
     allowed = sorted(x["name"] for x in load_project_allowlist(req.project, cfg)
                      if x.get("name"))
     return BoxPresetsResult(project=req.project, presets=presets, allowed_mcps=allowed)
+
+
+# --- exported-port registry (STAGE_EXPORTED_PORTS) --------------------------
+# A per-project list of {port,label} the webui surfaces as http tabs. The broker
+# writes it (the webui mount is RO); project_services_handler reads it off the same
+# /projects:ro bind-mount as the box registry. No container action — the tab only
+# appears once the PI is actually listening on the port (webui probe-gated).
+
+
+def exported_ports_path(workspace_path: "Path") -> "Path":  # type: ignore[name-defined]
+    return workspace_path / ".orchestrator" / "exported-ports.json"
+
+
+def read_exported_ports(workspace_path: "Path") -> list[dict]:  # type: ignore[name-defined]
+    """Tolerant read of the exported-port registry → [{port:int, label:str}].
+    Missing/malformed → []. Host-written but webui-read, so never trust the shape
+    (mirrors _read_box_pins's defensive posture)."""
+    f = exported_ports_path(workspace_path)
+    if not f.is_file():
+        return []
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    out: list[dict] = []
+    for e in data:
+        if not isinstance(e, dict):
+            continue
+        port, label = e.get("port"), e.get("label")
+        if isinstance(port, int) and not isinstance(port, bool) \
+                and isinstance(label, str):
+            out.append({"port": port, "label": label})
+    return out
+
+
+def _write_exported_ports(workspace_path: "Path", ports: list[dict]) -> None:  # type: ignore[name-defined]
+    p = exported_ports_path(workspace_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(ports, indent=2, sort_keys=True) + "\n")
+    tmp.replace(p)
+
+
+def port_add(req: "PortAddRequest", _progress=None) -> PortAddResult:  # type: ignore[name-defined]
+    """Register an exported port for a project (writes the workspace registry; no
+    container action). Idempotent on the port — a re-add updates the label."""
+    cfg = load_config()
+    ws = workspace_path_for(req.project, cfg)
+    if not ws.is_dir():
+        die(f"project {req.project!r} has no workspace; create it first")
+    ports = [e for e in read_exported_ports(ws) if e.get("port") != req.port]
+    ports.append({"port": req.port, "label": req.label})
+    ports.sort(key=lambda e: e["port"])
+    _write_exported_ports(ws, ports)
+    return PortAddResult(project=req.project, port=req.port, label=req.label,
+                         ports=ports)
+
+
+def port_remove(req: "PortRemoveRequest", _progress=None) -> PortRemoveResult:  # type: ignore[name-defined]
+    cfg = load_config()
+    ws = workspace_path_for(req.project, cfg)
+    if not ws.is_dir():
+        # Nothing to remove and never auto-create a workspace from a remove.
+        return PortRemoveResult(project=req.project, port=req.port, ports=[])
+    ports = [e for e in read_exported_ports(ws) if e.get("port") != req.port]
+    _write_exported_ports(ws, ports)
+    return PortRemoveResult(project=req.project, port=req.port, ports=ports)
+
+
+def port_list(req: "PortListRequest", _progress=None) -> PortListResult:  # type: ignore[name-defined]
+    cfg = load_config()
+    ws = workspace_path_for(req.project, cfg)
+    if not ws.is_dir():
+        return PortListResult(project=req.project, ports=[])
+    return PortListResult(project=req.project, ports=read_exported_ports(ws))
 
 
 def wire_webui_to_projects() -> None:

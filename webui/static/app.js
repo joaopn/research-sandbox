@@ -1328,6 +1328,14 @@ function mgmtCreateDialog(view, manifest, agents) {
     // Unchecking sends disable:["code-server"]; checked sends nothing (default-on).
     const editorCb = el("input", { type: "checkbox" });
     editorCb.checked = true;
+    // Editor as a bordered selectable card (mirrors the box window): editorCb stays
+    // the detached value-holder, the card only drives + reflects it (.selected ↔ checked).
+    const editorCard = el("div", { class: "box-opt-card selected" },
+                          [el("span", { class: "box-opt-name" }, ["Editor (code-server)"])]);
+    editorCard.onclick = () => {
+        editorCb.checked = !editorCb.checked;
+        editorCard.classList.toggle("selected", editorCb.checked);
+    };
 
     // Enable presets — only for a workflow that has a worker/sandbox layer
     // (research flavor). A bare box / sandbox host has none, so the backend would
@@ -1344,7 +1352,7 @@ function mgmtCreateDialog(view, manifest, agents) {
     ]);
     if (!hasWorkerLayer) enableField.style.display = "none";
 
-    // Docker-substrate-only group: agents + light-path payload.
+    // Docker-substrate-only agents (rendered as cards in the Settings region below).
     // Staged agents only — one independent on/off box each (STAGE_MULTI_AGENT),
     // default claude on. Un-staged KNOWN_AGENTS are omitted: the form never offers
     // an agent the host can't deploy (pull it on the host first), so the POSTed set
@@ -1352,20 +1360,19 @@ function mgmtCreateDialog(view, manifest, agents) {
     const stagedAgents = agents
         .filter((a) => a && a.staged)
         .map((a) => a.name);
+    // Multi-select (independent on/off set) — so each agent is its OWN toggle card
+    // (cb stays the value-holder), NOT the box window's single-select radio agent.
     const agentChecks = stagedAgents.map((name) => {
         const cb = el("input", { type: "checkbox", value: name });
         if (name === "claude") cb.checked = true;   // default {claude} on
-        return { name, cb,
-                 label: el("label", { class: "mgmt-check" }, [cb, " " + name]) };
+        const card = el("div", { class: "box-opt-card" + (cb.checked ? " selected" : "") },
+                        [el("span", { class: "box-opt-name" }, [name])]);
+        card.onclick = () => {
+            cb.checked = !cb.checked;
+            card.classList.toggle("selected", cb.checked);
+        };
+        return { name, cb, card };
     });
-    const agentField = el("div", { class: "field" }, [
-        el("label", {}, ["Agents"]),
-        agentChecks.length
-            ? el("div", { class: "mgmt-checks" }, agentChecks.map((c) => c.label))
-            : el("div", { class: "hint" }, [
-                  "No agents pulled on the host — run `research agent pull`.",
-              ]),
-    ]);
     const repoI = el("input", { type: "text", autocomplete: "off",
                                 placeholder: "https://github.com/user/repo.git" });
     const refI = el("input", { type: "text", autocomplete: "off",
@@ -1378,8 +1385,31 @@ function mgmtCreateDialog(view, manifest, agents) {
                "https inside the locked box. Never logged or persisted — sent once " +
                "with this create and never stored.",
     });
-    const dockerGroup = el("div", { class: "mgmt-docker-group" }, [
-        agentField,
+    // Settings region — agent + editor as bordered cards inside a single bordered
+    // box (mirrors the box window). Editor is universal; agents only showInBox
+    // (docker box / sandbox-dind), preserving today's visibility split. No raw
+    // <input> lives here (only cards), so the .field input{width:100%} bleed doesn't apply.
+    const settingsRegion = el("div", { class: "field box-settings" }, [
+        el("div", { class: "box-settings-label" }, ["Settings"]),
+        ...(showInBox ? [el("div", { class: "box-opt-group" }, [
+            el("div", { class: "box-opt-caption" }, ["Agents"]),
+            agentChecks.length
+                ? el("div", { class: "box-opt-cards" }, agentChecks.map((c) => c.card))
+                : el("div", { class: "hint" }, [
+                      "No agents pulled on the host — run `research agent pull`.",
+                  ]),
+        ])] : []),
+        el("div", { class: "box-opt-group" }, [
+            el("div", { class: "box-opt-caption" }, ["Extensions"]),
+            el("div", { class: "box-opt-cards" }, [editorCard]),
+        ]),
+    ]);
+
+    // Clone-a-repo group: the light-path repo/ref/setup/PAT fields, shown only when
+    // the operator opts in (and only showInBox). Agent moved out to Settings above.
+    const cloneCb = el("input", { type: "checkbox" });
+    const cloneToggle = el("label", { class: "mgmt-check" }, [cloneCb, " clone a git repo"]);
+    const cloneGroup = el("div", { class: "mgmt-docker-group" }, [
         el("div", { class: "field" }, [el("label", {}, ["Repo (https)"]), repoI]),
         el("div", { class: "field" }, [el("label", {}, ["Ref"]), refI]),
         el("div", { class: "field" }, [el("label", {}, ["Setup"]), setupT]),
@@ -1388,15 +1418,20 @@ function mgmtCreateDialog(view, manifest, agents) {
             patI,
         ]),
         el("div", { class: "hint" }, [
-            "Agent + repo/setup run inside the box (docker sandbox or sandbox-dind).",
+            "Repo/setup run inside the box (docker sandbox or sandbox-dind).",
         ]),
     ]);
-    if (!showInBox) dockerGroup.style.display = "none";
     // Prefill the light-path presets from the manifest (overridable; the server's
     // explicit-wins applies the preset if the field is left blank). PAT never preset.
     repoI.value = manifest.repo || "";
     refI.value = manifest.ref || "";
     setupT.value = manifest.setup || "";
+    // Default the clone tickbox on iff the manifest carries a preset repo/ref/setup,
+    // so a preset-repo workflow still POSTs those fields (request gates on cloneCb).
+    const hasClonePreset = !!(manifest.repo || manifest.ref || manifest.setup);
+    cloneCb.checked = hasClonePreset;
+    cloneGroup.style.display = hasClonePreset ? "" : "none";
+    cloneCb.onchange = () => { cloneGroup.style.display = cloneCb.checked ? "" : "none"; };
 
     mgmtConfirmThenTail(view, {
         title: "New project",
@@ -1414,9 +1449,9 @@ function mgmtCreateDialog(view, manifest, agents) {
             ]),
             el("div", { class: "field" }, [el("label", {}, ["Project name"]), nameI]),
             el("div", { class: "field" }, [el("label", {}, ["Egress"]), egressS]),
-            el("label", { class: "mgmt-check" }, [editorCb, " editor (code-server)"]),
             enableField,
-            dockerGroup,
+            settingsRegion,
+            ...(showInBox ? [cloneToggle, cloneGroup] : []),
             el("div", { class: "hint" }, [
                 "Creating stages container images and can take 10–30s (longer cold).",
             ]),
@@ -1424,7 +1459,7 @@ function mgmtCreateDialog(view, manifest, agents) {
         validate: () => {
             if (!nameI.value.trim()) return "Project name is required.";
             // Mirror from_kwargs: an in-box repo needs a ref (pin the clone).
-            if (showInBox && repoI.value.trim() && !refI.value.trim()) {
+            if (showInBox && cloneCb.checked && repoI.value.trim() && !refI.value.trim()) {
                 return "A workflow repo requires a ref.";
             }
             return null;
@@ -1448,15 +1483,20 @@ function mgmtCreateDialog(view, manifest, agents) {
             if (showInBox) {
                 const sel = agentChecks.filter((c) => c.cb.checked)
                                        .map((c) => c.name);
-                const repo = repoI.value.trim();
-                const ref = refI.value.trim();
-                const setup = setupT.value.trim();
-                const pat = patI.value.trim();
                 if (sel.length) payload.agents = sel;   // empty => clean box
-                if (repo) payload.repo = repo;
-                if (ref) payload.ref = ref;
-                if (setup) payload.setup = setup;
-                if (pat) payload.github_pat = pat;
+                // Light-path fields ride only when the operator opts into a clone,
+                // so an unchecked clone POSTs none of them and from_kwargs applies
+                // the manifest presets unshadowed (same as the blank-field path).
+                if (cloneCb.checked) {
+                    const repo = repoI.value.trim();
+                    const ref = refI.value.trim();
+                    const setup = setupT.value.trim();
+                    const pat = patI.value.trim();
+                    if (repo) payload.repo = repo;
+                    if (ref) payload.ref = ref;
+                    if (setup) payload.setup = setup;
+                    if (pat) payload.github_pat = pat;
+                }
             }
             return fetch("/broker/project", {
                 method: "POST", headers: { "Content-Type": "application/json" },
@@ -2741,6 +2781,8 @@ function makeProjectConfigBox(project) {
             "No tabs yet — open this project once to load its services.",
         ]));
         box.appendChild(section);
+        // Ports render even with no tabs loaded — register before you start serving.
+        appendExportedPortsSection(box, project);
         return box;
     }
 
@@ -2778,6 +2820,7 @@ function makeProjectConfigBox(project) {
     box.appendChild(el("div", { class: "config-hint" }, [
         "Hidden tabs stay enabled on the supervisor — this only controls what shows here.",
     ]));
+    appendExportedPortsSection(box, project);
     appendEditorExtensionSection(box, project, enabled);
     return box;
 }
@@ -2805,6 +2848,113 @@ function appendEditorExtensionSection(box, project, enabled) {
     row.appendChild(btn);
     section.appendChild(row);
     box.appendChild(section);
+}
+
+// The exported-ports surface (STAGE_EXPORTED_PORTS): register a port the PI is
+// serving inside the supervisor (rs-project-<proj>:<port>) so it shows as an http
+// tab. Renders REGARDLESS of whether services have loaded — you register a port,
+// THEN start serving it. The list is the broker's port_list; the tab itself only
+// appears once the port is actually listening (server-side probe-gated).
+function appendExportedPortsSection(box, project) {
+    const section = el("div", { class: "config-section" });
+    section.appendChild(el("div", { class: "config-section-label" }, ["Ports"]));
+    const listWrap = el("div", { class: "config-ports-list" });
+    section.appendChild(listWrap);
+
+    const portI = el("input", { type: "number", min: "1", max: "65535",
+                                class: "config-port-num", placeholder: "port" });
+    const labelI = el("input", { type: "text", class: "config-port-label",
+                                 placeholder: "label" });
+    const addBtn = el("button", { class: "btn btn-secondary" }, ["Add"]);
+
+    async function loadPorts() {
+        listWrap.innerHTML = "";
+        let body;
+        try {
+            const res = await fetch(
+                `/broker/project/${encodeURIComponent(project.name)}/ports`);
+            try { body = await res.json(); } catch (e) { body = {}; }
+            if (!res.ok || !body.ok || !body.result) {
+                listWrap.appendChild(el("div", { class: "config-empty" },
+                    [mgmtErrText(body) || "Couldn't load ports."]));
+                return;
+            }
+        } catch (e) {
+            listWrap.appendChild(el("div", { class: "config-empty" },
+                ["Couldn't load ports."]));
+            return;
+        }
+        const ports = body.result.ports || [];
+        if (ports.length === 0) {
+            listWrap.appendChild(el("div", { class: "config-empty" },
+                ["No ports exported yet."]));
+            return;
+        }
+        for (const e of ports) {
+            const rm = el("button", { class: "close-tab-btn",
+                                      title: `Remove port ${e.port}` }, ["✕"]);
+            rm.onclick = () => removePort(e.port);
+            listWrap.appendChild(el("div", { class: "config-box-row" }, [
+                el("span", { class: "config-box-name" }, [`${e.port} — ${e.label}`]),
+                rm,
+            ]));
+        }
+    }
+
+    async function addPort() {
+        const port = parseInt(portI.value, 10);
+        const label = labelI.value.trim();
+        if (!Number.isInteger(port) || port < 1 || port > 65535) {
+            alert("Enter a port between 1 and 65535."); return;
+        }
+        if (!label) { alert("Enter a label for the tab."); return; }
+        addBtn.disabled = true;
+        try {
+            const res = await fetch(
+                `/broker/project/${encodeURIComponent(project.name)}/port`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ port, label }),
+                });
+            let body; try { body = await res.json(); } catch (e) { body = {}; }
+            if (!res.ok || !body.ok) {
+                alert("Couldn't add port: " + (mgmtErrText(body) || res.status));
+                return;
+            }
+            portI.value = ""; labelI.value = "";
+            await loadPorts();
+            await refreshAfterBoxChange(project.name);
+        } finally {
+            addBtn.disabled = false;
+        }
+    }
+
+    async function removePort(port) {
+        try {
+            const res = await fetch(
+                `/broker/project/${encodeURIComponent(project.name)}/port-remove`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ port }),
+                });
+            let body; try { body = await res.json(); } catch (e) { body = {}; }
+            if (!res.ok || !body.ok) {
+                alert("Couldn't remove port: " + (mgmtErrText(body) || res.status));
+                return;
+            }
+            await loadPorts();
+            await refreshAfterBoxChange(project.name);
+        } catch (e) { /* best-effort */ }
+    }
+
+    addBtn.onclick = addPort;
+    section.appendChild(el("div", { class: "config-box-row config-port-add" },
+                           [portI, labelI, addBtn]));
+    section.appendChild(el("div", { class: "config-hint" }, [
+        "The tab appears once something is listening on that port inside the supervisor.",
+    ]));
+    box.appendChild(section);
+    loadPorts();
 }
 
 function mgmtEditorToggle(name, on, isDocker) {
