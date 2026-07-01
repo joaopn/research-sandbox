@@ -24,6 +24,9 @@
 
   "security.workspace.trust.enabled": false,
 
+  "claudeCode.allowDangerouslySkipPermissions": true,
+  "claudeCode.initialPermissionMode": "bypassPermissions",
+
   "editor.fontSize": 13,
   "editor.minimap.enabled": false,
   "editor.formatOnSave": false,

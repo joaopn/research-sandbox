@@ -1238,6 +1238,18 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
 
         progress.step("wire", "enabling workers")
 
+    # 6e. Editor readiness gate: create reports "ready" only when the editor is
+    #     actually listening, so there's no post-create race where the webui probes
+    #     a not-yet-up editor and shows no Editor tab. code-server is the only http
+    #     service in KNOWN_SERVICES, and it's on CODE_SERVER_STUB_PORT inside
+    #     rs-project-<name> for BOTH substrates. Best-effort (warn + proceed) — a
+    #     slow editor must never fail an otherwise-healthy create.
+    if service_flags.get("code-server"):
+        progress.step("editor", "waiting for editor")
+        if not _wait_for_editor_ready(container_name):
+            print(f"warning: editor not listening on :{CODE_SERVER_STUB_PORT} after "
+                  f"{EDITOR_READY_TIMEOUT_S}s; it should come up shortly")
+
     # 7. Return result (the front-end formats the report from this).
     return CreateResult(
         project=project,
@@ -1927,6 +1939,33 @@ def wait_for_inner_dockerd(container: str, timeout: int = 60) -> None:
         time.sleep(1)
     die(f"inner dockerd did not become ready within {timeout}s "
         f"(check `docker logs {container}` and `docker exec {container} sudo cat /tmp/dockerd.log`)")
+
+
+# The editor deploy cp's ~100-150MB into the container's ~/.local and launches the
+# lazy-start stub on first boot; 60s mirrors wait_for_inner_dockerd's bound and is
+# generous for that on a loaded host, while still capping the create UX wait.
+EDITOR_READY_TIMEOUT_S = 60
+
+
+def _wait_for_editor_ready(container: str, timeout: int = EDITOR_READY_TIMEOUT_S) -> bool:
+    """Poll until the code-server stub is LISTENING on CODE_SERVER_STUB_PORT inside
+    ``container``. The stub launches asynchronously to create() — the docker box
+    deploys it in the entrypoint boot (after `docker run` returns), dind via the
+    deploy's `nohup` stub — so create otherwise returns before the editor is up and
+    the webui probes a not-yet-listening port. Best-effort: returns True once it's
+    listening, or False after ``timeout`` (the caller warns and proceeds rather than
+    failing a create over a slow editor; the container is healthy and the webui
+    re-probes on activation)."""
+    import time
+
+    deadline = time.time() + timeout
+    check = f"ss -ltn 2>/dev/null | grep -q ':{CODE_SERVER_STUB_PORT}'"
+    while time.time() < deadline:
+        if run(["docker", "exec", container, "sh", "-c", check],
+               capture_output=True).returncode == 0:
+            return True
+        time.sleep(1)
+    return False
 
 
 def stage_worker_image(container: str, image: str, force: bool = False) -> None:
@@ -2796,14 +2835,23 @@ def _editor_resolve_latest() -> str:
     if not run_quiet(["docker", "image", "inspect", MINIMAL_BASE_IMAGE]):
         die(f"{MINIMAL_BASE_IMAGE} not found — run `research start --rebuild` first")
     r = run(["docker", "run", "--rm", MINIMAL_BASE_IMAGE, "sh", "-lc",
-             "curl -fsS -o /dev/null -w '%{url_effective}' "
+             "curl -fsSL -o /dev/null -w '%{url_effective}' "
              + shlex.quote(_CODE_SERVER_LATEST_URL)], capture_output=True)
     if r.returncode != 0:
         die(f"could not resolve upstream code-server version: "
             f"{(r.stderr or '').strip() or 'fetch failed'}")
     eff = (r.stdout or "").strip()                 # …/releases/tag/v4.123.0
+    # The concrete version rides the /releases/latest → /releases/tag/v<ver>
+    # redirect, so -L above is load-bearing. Gate on the tag path having actually
+    # been reached: without a redirect (upstream layout change, a transient
+    # non-redirecting response) `eff` still ends in "latest", which the permissive
+    # version charset would accept and write as a bogus "latest" pin.
+    tag_marker = "/releases/tag/"
+    if tag_marker not in eff:
+        die(f"could not resolve a concrete upstream code-server version: expected a "
+            f"{tag_marker} redirect, got {eff!r}")
     ver = eff.rsplit("/", 1)[-1].lstrip("v")
-    if not _AGENT_VERSION_RE.match(ver):
+    if not _AGENT_VERSION_RE.match(ver) or not ver[:1].isdigit():
         die(f"upstream returned an unexpected version string: {ver!r} (from {eff!r})")
     return ver
 

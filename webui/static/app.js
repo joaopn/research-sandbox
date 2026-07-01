@@ -2659,6 +2659,12 @@ async function activateProject(name) {
     }
 
     state.activeProject = name;
+    // Bust the per-project service cache on every activation so a service that
+    // came up AFTER the first activation (a box editor's code-server stub takes a
+    // few seconds to boot) surfaces on re-select — without a full page reload.
+    // fetchProjectServices otherwise caches the first probe forever. Idiomatic:
+    // mirrors the delete-then-reactivate busts already used on service toggles.
+    delete state.projectServices[name];
     const enabled = await fetchProjectServices(name);
 
     // Load per-project pin state from the vault entry. Missing fields
