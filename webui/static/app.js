@@ -204,6 +204,7 @@ const state = {
     activeService: null,     // string | null
     serviceRegistry: null,   // { [serviceId]: spec } from /services
     projectServices: {},     // { [projectName]: { [serviceId]: spec } }
+    projectLastService: {},  // { [projectName]: serviceId } — per-project landing memory (in-memory; reload/restart resets to the editor default)
     terminals: {},           // "${project}:${service}" -> { term, fitAddon, ws, container, project, service }
     probeTimer: null,
     statusTimer: null,
@@ -1033,6 +1034,10 @@ function setTypeBadge(elm, label) {
 }
 
 function mgmtAction(view, name, action) {
+    // A stop/start recreates the supervisor (fresh container + re-deployed editor),
+    // so drop the project's remembered tab — it should re-land on the editor default
+    // rather than a now-dead terminal session from before the restart.
+    delete state.projectLastService[name];
     const desc = action === "start"
         ? `Start "${name}". This recreates the supervisor (fresh container, re-staged images) and takes a moment. Running work is unaffected.`
         : `Stop "${name}". This interrupts any running work in the supervisor.`;
@@ -2457,6 +2462,7 @@ function teardownProjectState(name) {
         }
     }
     delete state.projectServices[name];
+    delete state.projectLastService[name];
     if (state.activeProject === name) {
         state.activeProject = null;
         state.activeService = null;
@@ -2683,18 +2689,22 @@ async function activateProject(name) {
     renderServiceTabs(name, enabled);
     applySplitLayout();
 
-    // Pick a default service: keep the previous one if it's still in the
-    // enabled set and not pinned, else first always-on (xterm), else first
-    // non-pinned entry.
+    // Landing tab: a project reopens on whatever it last had open this session
+    // (per-project memory). A project with no remembered tab — never opened, or
+    // reset by a stop/start / destroy — defaults to the editor when enabled, then
+    // the first always-on (CLI), then any. code-server is kind:http so it was never
+    // the always_on default; preferring it here is what makes a fresh project (and
+    // a freshly-restarted one) land on the editor instead of the CLI.
     const visible = visibleServiceIds(name, enabled);
     if (visible.length === 0) {
         state.activeService = null;
         showWelcome();
         return;
     }
-    let next = state.activeService;
-    if (!enabled[next] || !visible.includes(next) || next === state.pinnedService) {
-        next = visible.find((id) => id !== state.pinnedService && enabled[id].always_on)
+    let next = state.projectLastService[name];
+    if (!next || !enabled[next] || !visible.includes(next) || next === state.pinnedService) {
+        next = (visible.includes("code-server") && "code-server" !== state.pinnedService && "code-server")
+            || visible.find((id) => id !== state.pinnedService && enabled[id].always_on)
             || visible.find((id) => id !== state.pinnedService)
             || visible[0];
     }
@@ -3146,6 +3156,9 @@ function activateService(serviceId) {
         const tabEl = document.querySelector(`.service-tabs .tab[data-service="${CSS.escape(serviceId)}"]`);
         if (tabEl) tabEl.classList.add("active");
         state.activeService = serviceId;
+        // Remember this as the project's landing tab (main-pane only; the pinned
+        // side-pane activation below is skipped by the !isPinned guard).
+        state.projectLastService[state.activeProject] = serviceId;
     }
 
     // Hide everything except the active and the pinned terminal.

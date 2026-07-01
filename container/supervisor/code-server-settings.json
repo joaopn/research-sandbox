@@ -27,6 +27,9 @@
   "claudeCode.allowDangerouslySkipPermissions": true,
   "claudeCode.initialPermissionMode": "bypassPermissions",
 
+  "chat.disableAIFeatures": true,
+  "chat.commandCenter.enabled": false,
+
   "editor.fontSize": 13,
   "editor.minimap.enabled": false,
   "editor.formatOnSave": false,
