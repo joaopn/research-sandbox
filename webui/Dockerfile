@@ -41,8 +41,12 @@ COPY explain/ explain/
 COPY render_explain.py ./
 RUN python render_explain.py explain static/explain
 
+# /app/state must exist in the image (before the chown) so the rs-webui-state
+# named volume copy-ups uid-1000 ownership like rs-webui-tls does — a volume
+# mounted at a path absent from the image initializes root-owned and the
+# non-root webui process could never persist its origin-port map.
 RUN useradd -m -u 1000 webui \
- && mkdir -p /app/tls \
+ && mkdir -p /app/tls /app/state \
  && chown -R webui:webui /app
 USER webui
 

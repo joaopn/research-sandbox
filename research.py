@@ -1376,16 +1376,75 @@ def cmd_webui_cert_tailscale() -> None:
 WEBUI_IMAGE_UID = 1000   # baked uid in webui/Dockerfile (USER webui)
 
 
-def _ensure_webui_tls_ownership(uid: int, gid: int) -> None:
-    """The rs-webui-tls named volume initializes owned by the image's baked uid
-    (1000). When the webui runs as a different uid (the uid-equality contract on
-    a non-1000 host), it can't write its TLS cert there — chown the volume to the
-    runtime uid first. No-op on the common uid==1000 host."""
+def _ensure_webui_volume_ownership(uid: int, gid: int) -> None:
+    """The rs-webui-tls / rs-webui-state named volumes initialize owned by the
+    image's baked uid (1000). When the webui runs as a different uid (the
+    uid-equality contract on a non-1000 host), it can't write its TLS cert or
+    persist the origin-port map there — chown both volumes to the runtime uid
+    first. No-op on the common uid==1000 host."""
     if (uid, gid) == (WEBUI_IMAGE_UID, WEBUI_IMAGE_UID):
         return
     run(["docker", "run", "--rm", "-u", "0",
-         "-v", "rs-webui-tls:/app/tls", WEBUI_IMAGE,
-         "chown", "-R", f"{uid}:{gid}", "/app/tls"], capture_output=True)
+         "-v", "rs-webui-tls:/app/tls", "-v", "rs-webui-state:/app/state",
+         WEBUI_IMAGE,
+         "chown", "-R", f"{uid}:{gid}", "/app/tls", "/app/state"],
+        capture_output=True)
+
+
+# Defaults for the per-editor browser-origin port range (see .env.example).
+# 65 ports bounds concurrent editor origins well above a single operator's
+# realistic use (projects × boxes + exported apps) while keeping the squat
+# footprint small; the 101xx block dodges the common dev-tool squatters
+# (3000/8xxx dev servers, 9000 minio/portainer, 9090 prometheus). Exhaustion
+# and busy-port conflicts both fail loudly, never silently.
+WEBUI_ORIGIN_PORT_LO_DEFAULT = 10100
+WEBUI_ORIGIN_PORT_HI_DEFAULT = 10164
+
+
+def _webui_origin_port_range() -> tuple[int, int]:
+    """Resolve WEBUI_ORIGIN_PORT_LO/HI from .env (the same read_env_value
+    pattern as WEBUI_BIND/WEBUI_PORT — the abort message's remedy is 'edit
+    .env', so the read path must honor it). die()s on a malformed range."""
+    try:
+        lo = int(read_env_value("WEBUI_ORIGIN_PORT_LO")
+                 or WEBUI_ORIGIN_PORT_LO_DEFAULT)
+        hi = int(read_env_value("WEBUI_ORIGIN_PORT_HI")
+                 or WEBUI_ORIGIN_PORT_HI_DEFAULT)
+    except ValueError:
+        die("WEBUI_ORIGIN_PORT_LO/HI in .env must be integers")
+    if not (0 < lo <= hi < 65536):
+        die(f"invalid webui origin port range {lo}-{hi} "
+            "(need 0 < LO <= HI < 65536); fix WEBUI_ORIGIN_PORT_LO/HI in .env")
+    return lo, hi
+
+
+def _webui_probe_ports(bind: str, ports: list[int]) -> None:
+    """Fail-loudly preflight for the webui's published ports: bind-probe each
+    on `bind` and die() naming every busy one plus the .env remedy. Runs after
+    any `docker rm -f` of the old webui (so its own docker-proxy binds don't
+    read as squatters) and immediately before `compose up`; docker's own bind
+    at `up` stays the authoritative TOCTOU backstop for the probe→up race."""
+    probe_addr = "" if bind == "0.0.0.0" else bind
+    busy = []
+    for p in ports:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((probe_addr, p))
+        except OSError:
+            busy.append(p)
+        finally:
+            s.close()
+    if busy:
+        lo, hi = _webui_origin_port_range()
+        die(f"webui port(s) already in use on {bind}: "
+            f"{', '.join(str(p) for p in busy)}\n"
+            f"  The webui reserves {lo}-{hi} (WEBUI_ORIGIN_PORT_LO/HI) for "
+            "per-editor browser origins,\n"
+            "  plus WEBUI_PORT for the UI itself. Free those ports, or move "
+            "the range: edit\n"
+            "  WEBUI_ORIGIN_PORT_LO / WEBUI_ORIGIN_PORT_HI in .env, then "
+            "re-run `research webui start`.")
 
 
 def cmd_webui(args: argparse.Namespace) -> None:
@@ -1437,6 +1496,16 @@ def cmd_webui(args: argparse.Namespace) -> None:
             recreate = True
         os.environ["WEBUI_BIND"] = bind
         os.environ["WEBUI_PORT"] = port
+        # Per-editor browser-origin range (origin isolation): resolved from
+        # .env, exported for compose's ports/environment interpolation. The
+        # UI port must sit outside the range — the range is published 1:1
+        # (host port == container port) while 7777 maps from WEBUI_PORT.
+        origin_lo, origin_hi = _webui_origin_port_range()
+        if origin_lo <= int(port) <= origin_hi:
+            die(f"WEBUI_PORT={port} falls inside the origin port range "
+                f"{origin_lo}-{origin_hi}; move one of them in .env")
+        os.environ["WEBUI_ORIGIN_PORT_LO"] = str(origin_lo)
+        os.environ["WEBUI_ORIGIN_PORT_HI"] = str(origin_hi)
         # Run the webui as the operator's uid so it can connect to the broker's
         # 0600 socket and pass its SO_PEERCRED check (the uid-equality contract,
         # value-agnostic — not hardcoded to 1000). Expose only the broker's
@@ -1462,7 +1531,12 @@ def cmd_webui(args: argparse.Namespace) -> None:
         if rebuild or not run_quiet(["docker", "image", "inspect", WEBUI_IMAGE]):
             print("building webui image...")
             docker_compose("--profile", "webui", "build", "webui")
-        _ensure_webui_tls_ownership(os.getuid(), os.getgid())
+        _ensure_webui_volume_ownership(os.getuid(), os.getgid())
+        # Fail-loudly preflight: every published port (UI + origin range) must
+        # be free. Placed after the rm -f above so the old webui's own binds
+        # never read as squatters; the already-running early-return above never
+        # reaches here.
+        _webui_probe_ports(bind, [int(port), *range(origin_lo, origin_hi + 1)])
         print(f"starting webui (bind {bind}:{port})...")
         docker_compose("--profile", "webui", "up", "-d", "webui")
         wire_webui_to_projects()

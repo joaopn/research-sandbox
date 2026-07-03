@@ -39,12 +39,24 @@ services:
       # internally (matches EXPOSE in webui/Dockerfile). Only WEBUI_BIND
       # crosses the boundary because the TLS cert SAN needs to cover it.
       - "${WEBUI_BIND:-127.0.0.1}:${WEBUI_PORT:-7777}:7777"
+      # Per-editor browser-origin range: one listener per port inside the
+      # container, one isolated browser-storage origin per in-project HTTP
+      # surface. Published as a static contiguous range — `research webui
+      # start` pre-probes it and fails loudly on any busy port (no gappy
+      # publish). Docker holds the whole range for the container's lifetime.
+      - "${WEBUI_BIND:-127.0.0.1}:${WEBUI_ORIGIN_PORT_LO:-10100}-${WEBUI_ORIGIN_PORT_HI:-10164}:${WEBUI_ORIGIN_PORT_LO:-10100}-${WEBUI_ORIGIN_PORT_HI:-10164}"
     environment:
       - WEBUI_BIND=${WEBUI_BIND:-127.0.0.1}
+      - WEBUI_ORIGIN_PORT_LO=${WEBUI_ORIGIN_PORT_LO:-10100}
+      - WEBUI_ORIGIN_PORT_HI=${WEBUI_ORIGIN_PORT_HI:-10164}
       - RS_PROJECTS_ROOT=/projects
       - RS_BROKER_SOCKET=/run/rs-broker/broker.sock
     volumes:
       - rs-webui-tls:/app/tls
+      # Persisted (project, service) → origin-port map, so each editor keeps
+      # a stable origin (and thus stable browser state) across webui
+      # restarts. Webui-writable; distinct from the cert-only TLS volume.
+      - rs-webui-state:/app/state
       # RO read-side onto the same host directory `research project create`
       # writes to. Enables the rail's per-project status sub-line (worker
       # counts, disk, last activity) without granting docker socket access
@@ -68,6 +80,10 @@ volumes:
   # which silently diverges from the helper's target.
   rs-webui-tls:
     name: rs-webui-tls
+  # Same literal-name pinning as rs-webui-tls: the ownership helper in
+  # research.py chowns this volume by name pre-start on uid≠1000 hosts.
+  rs-webui-state:
+    name: rs-webui-state
 
 networks:
   # Shared infrastructure network: has internet via Docker gateway.

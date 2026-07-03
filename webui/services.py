@@ -134,10 +134,11 @@ def pi_isolated_editor_service(name: str, port: int) -> dict | None:
 
 # Exported ports (STAGE_EXPORTED_PORTS): a port the PI is serving inside the
 # supervisor, surfaced as an http tab. The id is `port-<n>`; project_services_handler
-# synthesizes one per LISTENING registered port, and proxy_handler resolves the
-# upstream port from `<n>` after confirming it's in the project's registry (the
-# server-side membership gate — the webui is on every project's bridge, so a
-# client-chosen port would otherwise be a general port-forwarder).
+# synthesizes one per LISTENING registered port, and _resolve_origin_upstream_port
+# (origin_proxy_handler) resolves the upstream port from `<n>` after confirming
+# it's in the project's registry (the server-side membership gate — the webui is
+# on every project's bridge, so a client-chosen port would otherwise be a
+# general port-forwarder).
 EXPORTED_PORT_ID_PREFIX = "port-"
 
 

@@ -3419,13 +3419,17 @@ async function openHttpService(project, serviceId, svc) {
         await persistVault();
     }
 
-    // Mount the iframe. Trailing slash on the URL is load-bearing for
-    // code-server's relative-URL discipline; the server-side proxy 301s
-    // the no-slash form, but pre-emptively constructing the slash form
-    // avoids an extra round-trip.
+    // Mount the iframe at the service's own browser origin (a dedicated
+    // webui port per container — /services/<project> allocates it and hands
+    // back origin_url). The session cookie minted above is host-keyed and
+    // port-blind, so it reaches the origin port with no extra handshake.
+    if (!svc || !svc.origin_url) {
+        status.textContent = "No origin port available for this service.";
+        return;
+    }
     const iframe = el("iframe", {
         class: "http-iframe",
-        src: `/proxy/${encodeURIComponent(project.name)}/${encodeURIComponent(serviceId)}/`,
+        src: svc.origin_url,
         // Only the absolute minimum sandbox the upstream needs. code-server
         // needs scripts, same-origin (cookies), forms, popups (its
         // command-palette opens windows for some commands), modals, and
@@ -3435,6 +3439,13 @@ async function openHttpService(project, serviceId, svc) {
             "allow-popups", "allow-popups-to-escape-sandbox",
             "allow-modals", "allow-downloads",
         ].join(" "),
+        // The frame is CROSS-origin now (its own origin port), so Permissions-
+        // Policy features whose default allowlist is 'self' — fullscreen (F11 /
+        // the editor's toggle-fullscreen), clipboard — are denied unless the
+        // embedder delegates them explicitly. Same-origin got these for free
+        // under the retired path proxy.
+        allow: "fullscreen; clipboard-read; clipboard-write",
+        allowfullscreen: "",
     });
     container.removeChild(status);
     container.appendChild(iframe);

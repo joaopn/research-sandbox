@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import secrets
+import signal
 import ssl
 import struct
 import time
@@ -81,10 +82,139 @@ HOP_BY_HOP_HEADERS = frozenset({
     "content-length",
 })
 
+# Response-direction drop set: hop-by-hop PLUS X-Frame-Options. Apps like Gitea
+# send `X-Frame-Options: SAMEORIGIN`; under the retired path proxy the iframe
+# was same-origin with the SPA so it passed, but a per-editor origin port is
+# cross-origin to the SPA and the browser refuses to frame the response
+# ("<host> refused to connect"). The proxied content is session-gated and
+# framed only by our own SPA, so the clickjacking protection XFO provided has
+# no meaning inside that boundary — strip it. Request direction keeps the
+# plain hop-by-hop set.
+RESPONSE_DROP_HEADERS = HOP_BY_HOP_HEADERS | frozenset({"x-frame-options"})
+
 # In-memory session map: cookie token → {"project": str, "expires": float}.
 # Single-process webui; no cross-process sharing needed. Stale entries get
 # garbage-collected lazily on lookup.
 SESSIONS: dict[str, dict] = {}
+
+# ---- per-editor browser-origin ports (origin isolation) -----------------
+#
+# Each in-project HTTP surface (supervisor editor, box editor, exported-port
+# app) is served on its OWN published webui port, giving it an isolated
+# browser-storage origin (an origin is scheme+host+port; code-server keeps
+# layout/Ports-view/recents in origin-scoped storage). Cookies are host-keyed
+# and port-blind, so the root origin's rs_session_<project> cookie reaches
+# these ports with no extra handshake — cookies shared, storage isolated.
+#
+# The LO/HI defaults mirror .env.example / docker-compose.yml (a 3-file
+# lockstep); docker publishes exactly this range at container start, so a
+# drifted value here would listen on unpublished ports. 65 ports bounds
+# concurrent editor origins far above realistic single-operator use; the
+# 101xx block dodges common dev-tool squatters. Exhaustion is loud (the
+# service omits origin_url and logs), never a silent mis-assignment.
+ORIGIN_PORT_LO = int(os.environ.get("WEBUI_ORIGIN_PORT_LO", "10100"))
+ORIGIN_PORT_HI = int(os.environ.get("WEBUI_ORIGIN_PORT_HI", "10164"))
+
+# Webui-writable state (the rs-webui-state named volume; the TLS volume stays
+# cert-only). Holds the persisted origin-port map.
+STATE_DIR = Path(os.environ.get("WEBUI_STATE_DIR", "/app/state"))
+ORIGIN_PORTS_FILE = STATE_DIR / "origin-ports.json"
+
+# In-memory mirror of ORIGIN_PORTS_FILE: port(int) → {"project", "service"}.
+# Loaded once at startup; every mutation persists synchronously. The table
+# stores only the IDENTITY key — the upstream port is re-derived per request
+# from the live registries (services / extensions.json / exported-ports.json),
+# never from here, so a removed box or exported port stops proxying at once.
+ORIGIN_PORTS: dict[int, dict] = {}
+
+
+def _origin_table_load() -> None:
+    """Populate ORIGIN_PORTS from disk (tolerant: missing/invalid file or
+    out-of-range entries → skipped). Called once at startup."""
+    ORIGIN_PORTS.clear()
+    try:
+        data = json.loads(ORIGIN_PORTS_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(data, dict):
+        return
+    for k, v in data.items():
+        if (k.isdigit() and ORIGIN_PORT_LO <= int(k) <= ORIGIN_PORT_HI
+                and isinstance(v, dict)
+                and isinstance(v.get("project"), str)
+                and isinstance(v.get("service"), str)):
+            ORIGIN_PORTS[int(k)] = {"project": v["project"],
+                                    "service": v["service"]}
+
+
+def _origin_table_save() -> None:
+    """Persist ORIGIN_PORTS atomically (tmp + replace; named volume, so no
+    single-file-bind-mount inode concern). A write failure logs loudly —
+    allocation still works in memory, but origins would reshuffle on the
+    next restart, which the operator should know about."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = ORIGIN_PORTS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(
+            {str(p): e for p, e in sorted(ORIGIN_PORTS.items())}, indent=2))
+        tmp.replace(ORIGIN_PORTS_FILE)
+    except OSError as e:
+        log.error(f"origin-port map persist failed: {e} — "
+                  "origins will reshuffle on webui restart")
+
+
+def _origin_port_for(project: str, service_id: str) -> int | None:
+    """Return the stable origin port for (project, service_id), allocating the
+    lowest free port on first sight. MUST stay synchronous end-to-end (no
+    awaits): project_services_handler has await-gather boundaries between its
+    admission sections, and a read-modify-write spanning one would
+    double-allocate under concurrent loads. None on pool exhaustion (caller
+    omits origin_url; the tab shows nothing rather than a wrong origin).
+
+    NOTE this is reachable from the unauthenticated GET /services/<project>
+    (lazy allocation at tab synthesis) — bounded and accepted: only
+    regex-validated, on-disk projects with actually-listening services get
+    here, and the pool is finite + loud on exhaustion."""
+    for port, entry in ORIGIN_PORTS.items():
+        if entry["project"] == project and entry["service"] == service_id:
+            return port
+    for port in range(ORIGIN_PORT_LO, ORIGIN_PORT_HI + 1):
+        if port not in ORIGIN_PORTS:
+            ORIGIN_PORTS[port] = {"project": project, "service": service_id}
+            _origin_table_save()
+            return port
+    log.error(f"origin-port pool {ORIGIN_PORT_LO}-{ORIGIN_PORT_HI} exhausted "
+              f"({project}/{service_id} gets no origin)")
+    return None
+
+
+def _origin_ports_free(project: str) -> None:
+    """Release every port allocated to `project` (called on destroy). A freed
+    port later reassigned inherits the old origin's leftover browser storage —
+    cosmetic (stale layout prefs), never data."""
+    stale = [p for p, e in ORIGIN_PORTS.items() if e["project"] == project]
+    for p in stale:
+        del ORIGIN_PORTS[p]
+    if stale:
+        _origin_table_save()
+
+
+def _origin_table_sweep() -> None:
+    """Startup GC: drop entries whose project no longer exists on disk
+    (covers CLI-side destroys while the webui was down). Skipped entirely
+    when PROJECTS_ROOT is missing/unreadable — a misconfigured mount must
+    not wipe the table and reshuffle every origin."""
+    try:
+        if not PROJECTS_ROOT.is_dir():
+            return
+    except OSError:
+        return
+    stale = [p for p, e in ORIGIN_PORTS.items()
+             if _project_workspace(e["project"]) is None]
+    for p in stale:
+        del ORIGIN_PORTS[p]
+    if stale:
+        _origin_table_save()
 
 
 class HostKeyValidator(asyncssh.SSHClient):
@@ -455,6 +585,10 @@ async def _run_op(op_id: str, verb: str, args: dict,
         for cookie, sess in list(BROKER_SESSIONS.items()):
             if sess.get("broker_token") == broker_token:
                 BROKER_SESSIONS.pop(cookie, None)
+    if verb == "destroy" and reply.get("ok"):
+        # Release the project's per-editor origin ports (the startup sweep
+        # backstops CLI-side destroys that happen while the webui is down).
+        _origin_ports_free(str(args.get("name", "")))
     entry["result"] = reply
     entry["state"] = "ok" if reply.get("ok") else "failed"
 
@@ -909,6 +1043,35 @@ async def services_handler(request: web.Request) -> web.Response:
     return web.json_response(services.SERVICES)
 
 
+def _request_host(request: web.Request) -> str:
+    """The hostname the browser used (Host header sans port), bracketed for
+    IPv6 literals so it can be re-embedded in a URL. Echoing the request's own
+    host back is what makes origin_url correct on every deployment (localhost /
+    LAN IP / Tailscale FQDN) with no hostname config — the browser reached us
+    at a name it can resolve and whose cert it accepted.
+
+    Parse request.host (the raw Host header) by hand — do NOT use
+    request.url.host: building request.url raises ValueError under yarl's
+    strict host validation when the Host header carries an explicit port
+    (aiohttp 3.9.5 + newer transitive yarl; every request has one whenever
+    WEBUI_PORT isn't the scheme default), 500ing the handler."""
+    host = request.host or "localhost"
+    if host.startswith("["):
+        # IPv6 literal is always bracketed in a Host header: [::1] / [::1]:7778
+        return host.split("]", 1)[0] + "]"
+    return host.rsplit(":", 1)[0] if ":" in host else host
+
+
+def _origin_url(request: web.Request, project: str, service_id: str) -> str | None:
+    """Absolute per-container origin for an http service, or None on pool
+    exhaustion. Only ever called for kind=http admissions — allocating for an
+    ssh-kind tab would burn a pool port on a surface that never uses it."""
+    port = _origin_port_for(project, service_id)
+    if port is None:
+        return None
+    return f"https://{_request_host(request)}:{port}/"
+
+
 async def project_services_handler(request: web.Request) -> web.Response:
     """Per-project enabled-set. always_on services are always included;
     kind=http services are included iff their default port is currently
@@ -974,7 +1137,11 @@ async def project_services_handler(request: web.Request) -> web.Response:
             out[sid] = svc
         elif svc.get("kind") == "http":
             if probe_up.get(sid):
-                out[sid] = svc
+                # Copied spec (never mutate the shared SERVICES dict) with the
+                # per-container browser origin the iframe should load. Only
+                # http-kind admissions allocate — see _origin_url.
+                url = _origin_url(request, project, sid)
+                out[sid] = {**svc, **({"origin_url": url} if url else {})}
 
     # Synthesized per-box tabs: boxes (kind="sandbox", STAGE_SANDBOX_PROJECT.md)
     # ride the rs-pi-iso-<name> container/tab conventions. Same data-plane
@@ -1005,12 +1172,14 @@ async def project_services_handler(request: web.Request) -> web.Response:
         if box_editor_up.get(name):
             espec = services.pi_isolated_editor_service(name, int(entry["editor_port"]))
             if espec is not None:
-                out[f"{services.PI_ISOLATED_EDITOR_ID_PREFIX}{name}"] = espec
+                esid = f"{services.PI_ISOLATED_EDITOR_ID_PREFIX}{name}"
+                url = _origin_url(request, project, esid)
+                out[esid] = {**espec, **({"origin_url": url} if url else {})}
 
     # Operator-registered exported ports (STAGE_EXPORTED_PORTS): one http tab per
     # port that is currently LISTENING on the supervisor netns — same probe-gated
     # discipline as the editor (a port the PI hasn't started serving yet shows no
-    # dead-iframe tab). proxy_handler re-checks membership per request.
+    # dead-iframe tab). origin_proxy_handler re-checks membership per request.
     exported = _read_exported_ports(project)
     if exported:
         port_up = await asyncio.gather(*[
@@ -1020,7 +1189,9 @@ async def project_services_handler(request: web.Request) -> web.Response:
                 continue
             spec = services.exported_port_service(int(e["port"]), e["label"])
             if spec is not None:
-                out[f"{services.EXPORTED_PORT_ID_PREFIX}{int(e['port'])}"] = spec
+                psid = f"{services.EXPORTED_PORT_ID_PREFIX}{int(e['port'])}"
+                url = _origin_url(request, project, psid)
+                out[psid] = {**spec, **({"origin_url": url} if url else {})}
     return web.json_response(out)
 
 
@@ -1052,7 +1223,7 @@ def _read_exported_ports(project: str) -> list[dict]:
     ``project``, read from its `.orchestrator/exported-ports.json` off the
     `/projects:ro` bind-mount (STAGE_EXPORTED_PORTS). Tolerant like
     _read_project_extensions; no cache — `project_services_handler` probes each on
-    every load, and `proxy_handler` re-reads per request so a removed port stops
+    every load, and `origin_proxy_handler` re-reads per request so a removed port stops
     proxying immediately (no stale-allow window)."""
     workspace = _project_workspace(project)
     if workspace is None:
@@ -1274,15 +1445,21 @@ def _session_valid(token: str, project: str) -> bool:
 
 async def session_handler(request: web.Request) -> web.Response:
     """POST /session/<project> — validate the project's SSH credentials
-    by attempting an SSH connect, then issue an HttpOnly session cookie
-    scoped to /proxy/<project>/. The credential is the same one the
-    vault holds for the xterm tab; this hands it through to gate the
-    iframe-rendered http-kind services without inventing a second auth.
+    by attempting an SSH connect, then issue an HttpOnly session cookie.
+    The credential is the same one the vault holds for the xterm tab; this
+    hands it through to gate the iframe-rendered http-kind services without
+    inventing a second auth.
+
+    The cookie is host-only with Path=/ : cookies are keyed by host and
+    IGNORE the port (RFC 6265), so this one mint — set by the root origin —
+    is automatically sent to every per-editor origin port on the same host
+    (same-site, so SameSite=Strict flows into the iframes). Per-port
+    validation happens in origin_proxy_handler against the same SESSIONS map.
 
     Body: JSON `{host, port?, username?, password, fingerprint?}` (the
     same shape the SSH `connect` message uses on /ws). On success the
-    response sets `Set-Cookie: rs_session_<proj>=<token>; Path=/proxy/
-    <proj>/; Secure; HttpOnly; SameSite=Strict`."""
+    response sets `Set-Cookie: rs_session_<proj>=<token>; Path=/;
+    Secure; HttpOnly; SameSite=Strict`."""
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")
 
@@ -1333,14 +1510,14 @@ async def session_handler(request: web.Request) -> web.Response:
         {"ok": True, "fingerprint": validator.actual_fp})
     response.set_cookie(
         f"rs_session_{project}", token,
-        path=f"/proxy/{project}/",
+        path="/",
         httponly=True, secure=True, samesite="Strict",
         max_age=SESSION_TTL_SECONDS,
     )
     return response
 
 
-# ---- /proxy/<project>/<service>/<path> — kind=http reverse proxy --------
+# ---- per-editor origin ports — kind=http reverse proxy ------------------
 
 def _filter_headers(headers, drop: frozenset[str]) -> "CIMultiDict[str]":
     # Preserve DUPLICATE headers (a plain dict collapses them): an upstream can send
@@ -1453,7 +1630,7 @@ async def _proxy_http(request: web.Request,
             allow_redirects=False,
         ) as upstream_resp:
             headers_out = _filter_headers(
-                upstream_resp.headers, HOP_BY_HOP_HEADERS)
+                upstream_resp.headers, RESPONSE_DROP_HEADERS)
             response = web.StreamResponse(
                 status=upstream_resp.status,
                 reason=upstream_resp.reason,
@@ -1468,51 +1645,62 @@ async def _proxy_http(request: web.Request,
             return response
 
 
-async def proxy_handler(request: web.Request) -> web.StreamResponse:
-    """`/proxy/<project>/<service>/<tail>` — reverse-proxy kind=http
-    services. Validates the project session cookie issued by /session,
-    then forwards HTTP or WS upgrades to `rs-project-<proj>:<port>/<tail>`,
-    stripping the proxy prefix so the upstream sees its own root.
+def _resolve_origin_upstream_port(project: str, service_id: str) -> int | None:
+    """Re-derive the UPSTREAM port for an origin request from the live
+    registries — never from the ORIGIN_PORTS table, which stores only the
+    identity key. Per-request and uncached (the SSRF membership discipline
+    carried over from the retired path proxy): a removed box or exported
+    port stops proxying on the very next request, and no client-supplied or
+    persisted value ever picks the upstream."""
+    svc = services.get(service_id)
+    if svc is not None:
+        return int(svc.get("default_port", 0)) or None
+    if service_id.startswith(services.PI_ISOLATED_EDITOR_ID_PREFIX):
+        # Box editor: the box must still exist with the editor enabled; its
+        # editor_port is published onto the supervisor netns (rs_sandbox.py).
+        name = service_id[len(services.PI_ISOLATED_EDITOR_ID_PREFIX):]
+        entry = _read_project_extensions(project).get(name)
+        if (entry and entry.get("kind") == "sandbox"
+                and entry.get("editor") and entry.get("editor_port")):
+            return int(entry["editor_port"])
+        return None
+    if service_id.startswith(services.EXPORTED_PORT_ID_PREFIX):
+        # Exported-port tab: membership gate against the project's registry,
+        # re-read per request. Parse defensively — non-digit/unregistered
+        # falls through to None, never an exception.
+        raw = service_id[len(services.EXPORTED_PORT_ID_PREFIX):]
+        registered = {int(e["port"]) for e in _read_exported_ports(project)}
+        if raw.isdigit() and int(raw) in registered:
+            return int(raw)
+        return None
+    return None
 
-    Trailing-slash discipline: if hit at `/proxy/<proj>/<svc>` (no slash),
-    redirect to the slash form. code-server's relative-URL resolution
-    requires the trailing slash for asset paths to come out correct."""
-    project = request.match_info.get("project", "")
-    service_id = request.match_info.get("service", "")
-    tail = request.match_info.get("tail", "")
+
+async def origin_proxy_handler(request: web.Request) -> web.StreamResponse:
+    """Catch-all for the per-editor origin ports (ORIGIN_PORT_LO..HI): resolve
+    WHICH container this port serves from the allocation table, gate on the
+    project's session cookie (host-keyed and port-blind, so the /session mint
+    on the root origin reaches us for free), re-derive the upstream from the
+    live registries, and reverse-proxy at PORT-ROOT — no path prefix, no
+    strip, which is code-server's native deployment shape."""
+    sock = request.transport.get_extra_info("sockname") if request.transport else None
+    arrival_port = int(sock[1]) if sock else 0
+    entry = ORIGIN_PORTS.get(arrival_port)
+    if entry is None:
+        return web.Response(status=404, text="no editor assigned to this port")
+    project, service_id = entry["project"], entry["service"]
 
     cookie = request.cookies.get(f"rs_session_{project}")
     if not cookie or not _session_valid(cookie, project):
         return web.Response(status=401, text="session required")
 
-    svc = services.get(service_id)
-    if svc is None and service_id.startswith(services.EXPORTED_PORT_ID_PREFIX):
-        # Exported-port tab (STAGE_EXPORTED_PORTS): resolve the upstream port from
-        # the `port-<n>` id, but ONLY if <n> is in THIS project's registry — the
-        # server-side membership gate. Re-read per request (uncached) so a removed
-        # port stops proxying immediately; without it the shared proxy (the webui is
-        # on every project's bridge) would be a general port-forwarder. Parse
-        # defensively — a non-digit / unregistered <n> falls through to the 404, never
-        # an exception. (A sibling box-editor-<name> branch can resolve here later —
-        # the bucketed box-editor 404.)
-        raw = service_id[len(services.EXPORTED_PORT_ID_PREFIX):]
-        registered = {int(e["port"]) for e in _read_exported_ports(project)}
-        if raw.isdigit() and int(raw) in registered:
-            svc = services.exported_port_service(int(raw), service_id)
-    if svc is None or svc.get("kind") != "http":
+    upstream_port = _resolve_origin_upstream_port(project, service_id)
+    if upstream_port is None:
         return web.Response(
             status=404, text=f"unknown http service {service_id!r}")
 
-    # No-trailing-slash edge: /proxy/<proj>/<svc> → 301 to /proxy/<proj>/<svc>/
-    if request.path == f"/proxy/{project}/{service_id}":
-        new = request.path + "/"
-        if request.query_string:
-            new += "?" + request.query_string
-        raise web.HTTPMovedPermanently(location=new)
-
+    tail = request.match_info.get("tail", "")
     upstream_host = f"{PROJECT_CONTAINER_PREFIX}{project}"
-    upstream_port = int(svc.get("default_port", 0))
-
     is_ws = (request.headers.get("Upgrade", "").lower() == "websocket")
     scheme = "ws" if is_ws else "http"
     upstream_url = f"{scheme}://{upstream_host}:{upstream_port}/{tail}"
@@ -1525,7 +1713,25 @@ async def proxy_handler(request: web.Request) -> web.StreamResponse:
 
 
 async def index_handler(request: web.Request) -> web.Response:
-    return web.FileResponse(STATIC_DIR / "index.html")
+    # CSP as a computed response header (replaces the old index.html meta):
+    # the frame-src must name the host the browser used — a meta tag can't
+    # vary per request, and header+meta would INTERSECT (most-restrictive
+    # wins), so the meta is gone. `https://<host>:*` (port wildcard, valid
+    # CSP) admits the per-editor origin ports; 'self' compensates for
+    # frame-src no longer falling back to default-src.
+    csp = (
+        "default-src 'self'; "
+        "connect-src 'self' ws: wss:; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self'; "
+        "object-src 'none'; "
+        "base-uri 'self'; "
+        f"frame-src 'self' https://{_request_host(request)}:*"
+    )
+    return web.FileResponse(
+        STATIC_DIR / "index.html",
+        headers={"Content-Security-Policy": csp},
+    )
 
 
 def cert_covers_bind(cert_path: Path, bind: str) -> bool:
@@ -1667,19 +1873,59 @@ def main() -> None:
     app.router.add_get("/broker/op/{op_id}/log", broker_op_log_handler)
     app.router.add_get("/broker/op/{op_id}", broker_op_status_handler)
     app.router.add_get("/ws/{project}/{service}", ws_handler)
-    # Proxy: trailing-slash form catches /proxy/<proj>/<svc>/ + everything
-    # below. The no-slash form is also routed (matched by proxy_handler's
-    # 301 path) so we can redirect inbound /proxy/<proj>/<svc> requests
-    # rather than 404'ing them.
-    app.router.add_route(
-        "*", "/proxy/{project}/{service}/{tail:.*}", proxy_handler)
-    app.router.add_route(
-        "*", "/proxy/{project}/{service}", proxy_handler)
     app.router.add_static("/static", STATIC_DIR)
 
-    log.info(f"Research Sandbox webui listening on https://{LISTEN_HOST}:{LISTEN_PORT}")
-    web.run_app(app, host=LISTEN_HOST, port=LISTEN_PORT,
-                ssl_context=ssl_ctx, access_log=log)
+    # Second application for the per-editor origin ports: one catch-all
+    # route, dispatched by ARRIVAL PORT inside origin_proxy_handler. Must
+    # ALSO be built with client_max_size=0 — the editor-save traffic the
+    # root app's cap-disable exists for is exactly what moves here; a
+    # default-constructed app would 413 any save over 1 MiB.
+    origin_app = web.Application(client_max_size=0)
+    origin_app.router.add_route("*", "/{tail:.*}", origin_proxy_handler)
+
+    _origin_table_load()
+    _origin_table_sweep()
+
+    async def _serve() -> None:
+        # Explicit runners (web.run_app can't serve two Applications): the
+        # root app on 7777 plus one TCPSite per origin port, all sharing the
+        # one ssl_ctx. access_log is threaded explicitly — run_app passed it
+        # implicitly, and losing it would silently drop request logging.
+        root_runner = web.AppRunner(app, access_log=log)
+        await root_runner.setup()
+        await web.TCPSite(root_runner, LISTEN_HOST, LISTEN_PORT,
+                          ssl_context=ssl_ctx).start()
+        origin_runner = web.AppRunner(origin_app, access_log=log)
+        await origin_runner.setup()
+        # Bind ALL range ports at startup: docker squats the host side of the
+        # whole range regardless, and in-container binds are free. A bind
+        # failure here propagates loudly (container restart-loop, visible in
+        # docker logs) — it cannot happen under docker's own port mapping.
+        for p in range(ORIGIN_PORT_LO, ORIGIN_PORT_HI + 1):
+            await web.TCPSite(origin_runner, LISTEN_HOST, p,
+                              ssl_context=ssl_ctx).start()
+        log.info(
+            f"Research Sandbox webui listening on "
+            f"https://{LISTEN_HOST}:{LISTEN_PORT} "
+            f"(+ origin ports {ORIGIN_PORT_LO}-{ORIGIN_PORT_HI})")
+        # Park until SIGTERM/SIGINT, then clean up both runners so `docker
+        # stop` gets a graceful exit instead of hitting the kill timeout.
+        # (web.run_app handled SIGINT for free; SIGTERM — docker's stop
+        # signal — needs the explicit handler.)
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, stop.set)
+        try:
+            await stop.wait()
+        finally:
+            await origin_runner.cleanup()
+            await root_runner.cleanup()
+
+    try:
+        asyncio.run(_serve())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

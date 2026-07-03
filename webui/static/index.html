@@ -3,7 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <title>Research Sandbox</title>
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' ws: wss:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'self'">
+    <!-- CSP is a computed response header now (index_handler): frame-src must
+         name the request's own host for the per-editor origin ports, which a
+         static meta can't express — and header+meta would intersect. -->
     <link rel="stylesheet" href="/static/vendor/xterm.css">
     <link rel="stylesheet" href="/static/style.css">
 </head>
