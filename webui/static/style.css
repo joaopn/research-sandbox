@@ -920,6 +920,11 @@ body {
     padding: 16px 20px;
     background: var(--bg-base);
 }
+/* When the sidebar floats (unpinned + expanded) it overlays the left edge of
+   the host-page content; pad it clear. Pinned/collapsed rail doesn't overlap. */
+.dashboard.expanded:not(.pinned) .management-view {
+    padding-left: calc(var(--rail-width, 200px) + 20px);
+}
 .mgmt-loading { color: var(--fg-faint); font-size: 13px; }
 .mgmt-center {
     display: flex;
