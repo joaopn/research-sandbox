@@ -7,5 +7,6 @@
   "image_overlay": "rs-sandbox-dind",
   "repo": "https://github.com/joaopn/social-data-pipeline.git",
   "ref": "main",
+  "setup": "ln -sf \"$PWD/README.md\" /workspace/README.md",
   "description": "Pipeline for processing, classifying, and ingesting large-scale social data."
 }

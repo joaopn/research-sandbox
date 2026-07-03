@@ -7,5 +7,6 @@
   "agents": ["claude"],
   "repo": "https://github.com/Imbad0202/academic-research-skills.git",
   "ref": "main",
+  "setup": "ln -sf \"$PWD/README.md\" /workspace/README.md",
   "description": "Academic Research Skills for Claude Code: research → write → review → revise → finalize"
 }

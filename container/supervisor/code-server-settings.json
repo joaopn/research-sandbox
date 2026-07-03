@@ -4,7 +4,7 @@
   "extensions.autoCheckUpdates": false,
   "extensions.autoUpdate": false,
 
-  "workbench.startupEditor": "none",
+  "workbench.startupEditor": "readme",
   "workbench.enableExperiments": false,
   "workbench.settings.enableNaturalLanguageSearch": false,
   "workbench.tips.enabled": false,

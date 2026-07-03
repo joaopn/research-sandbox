@@ -7,6 +7,6 @@
   "image_overlay": "rs-sandbox-dind",
   "repo": "https://github.com/joaopn/agentic-dev-sandbox.git",
   "ref": "main",
-  "setup": "python3 -c 'import os,re; p=\"docker-compose.yml\"; s=open(p).read() if os.path.exists(p) else \"\"; n=re.sub(r\"GITEA__server__ROOT_URL=[^\\s\\\"]+\", \"GITEA__server__ROOT_URL=http://localhost:${GITEA_PORT:-3000}\", s); open(p,\"w\").write(n) if (s and n != s) else None'",
+  "setup": "python3 -c 'import os,re; p=\"docker-compose.yml\"; s=open(p).read() if os.path.exists(p) else \"\"; n=re.sub(r\"GITEA__server__ROOT_URL=[^\\s\\\"]+\", \"GITEA__server__ROOT_URL=http://localhost:${GITEA_PORT:-3000}\", s); open(p,\"w\").write(n) if (s and n != s) else None' && ln -sf \"$PWD/README.md\" /workspace/README.md",
   "description": "An agentic software development sandbox with an integrated Gitea server."
 }

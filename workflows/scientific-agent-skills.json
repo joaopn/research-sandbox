@@ -7,5 +7,6 @@
   "agents": ["claude"],
   "repo": "https://github.com/k-dense-ai/scientific-agent-skills.git",
   "ref": "main",
+  "setup": "ln -sf \"$PWD/README.md\" /workspace/README.md",
   "description": "A comprehensive collection of 148 ready-to-use scientific and research skills."
 }
