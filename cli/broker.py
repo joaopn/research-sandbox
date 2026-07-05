@@ -339,7 +339,7 @@ def _verb_update(args: dict, progress=None) -> dict:
 
 def _verb_destroy(args: dict, progress=None) -> dict:
     """Tear a project down. Step-up re-auth (see STEP_UP_VERBS) is enforced in
-    dispatch BEFORE this runs; the request's `password` is consumed there and
+    dispatch BEFORE this runs; the request's `proof` is consumed there and
     never reaches rscore (DestroyRequest reads only `name`)."""
     req = rscore.DestroyRequest.from_kwargs(**args)  # may raise ValidationError
     rscore.destroy(req, progress=progress)           # may die() → SystemExit
@@ -350,7 +350,7 @@ def _verb_destroy(args: dict, progress=None) -> dict:
 # box add/remove/list, mirroring CREATE_WEBUI_FIELDS. Every field acts INSIDE the
 # locked-egress, credential-free inner box (project is name-regex'd; name is
 # box-regex'd; agent ∈ {claude,none}; browser is a bool) — none is host-shaped, so
-# they are relayable. from_kwargs still validates them. The step-up `password`
+# they are relayable. from_kwargs still validates them. The step-up `proof`
 # for box_remove is NOT here: it is verified + consumed in dispatch, never
 # forwarded to rscore.
 # preset = box TYPE (catalog-gated in box_add); agent overrides the preset default;
@@ -361,7 +361,7 @@ BOX_ADD_WEBUI_FIELDS = frozenset({"project", "name", "preset", "agent", "editor"
                                   "mcps", "repo", "ref", "setup"})
 BOX_TARGET_WEBUI_FIELDS = frozenset({"project", "name"})
 # box_remove additionally accepts keep_workspace (a bool, not host-shaped): when
-# set the box is removed but its artifacts stay on disk. The step-up `password`
+# set the box is removed but its artifacts stay on disk. The step-up `proof`
 # stays OUT of the set (verified + consumed in dispatch, never forwarded).
 BOX_REMOVE_WEBUI_FIELDS = BOX_TARGET_WEBUI_FIELDS | {"keep_workspace"}
 
@@ -440,8 +440,9 @@ VERBS = {
     "port_list": _verb_port_list,
 }
 
-# Verbs requiring step-up re-auth: a FRESH password in the request, not just a
-# live session token, so a stolen token alone cannot trigger them. `destroy` is
+# Verbs requiring step-up re-auth: a FRESH login proof (derived client-side
+# from the re-typed master password) in the request, not just a live session
+# token, so a stolen token alone cannot trigger them. `destroy` is
 # the data-destroying verb; this is the cheap half of its gate (the recoverable
 # soft-delete + rate-limit land before the webui is exposed beyond localhost).
 STEP_UP_VERBS = frozenset({"destroy", "box_remove"})
@@ -465,11 +466,13 @@ def _err(kind: str, message: str) -> dict:
 
 
 def _auth_login(args: dict, tokens) -> dict:
-    """Verify the operator password and issue a session token. Never calls
-    rscore / docker. Absent/wrong password (or no password set, which fails
-    closed) → kind 'auth'."""
-    password = args.get("password")
-    if not isinstance(password, str) or not broker_auth.verify_password(password):
+    """Verify the operator login proof and issue a session token. Never calls
+    rscore / docker. `proof` carries the client-side login derivation
+    (broker_auth.derive_login_proof) — the raw master password never transits;
+    the browser derives it, and `broker passwd` stores scrypt(proof). An
+    absent/wrong proof (or no secret set, which fails closed) → kind 'auth'."""
+    proof = args.get("proof")
+    if not isinstance(proof, str) or not broker_auth.verify_password(proof):
         return _err("auth", "invalid credentials")
     token, expires_at = tokens.issue(broker_auth.DEFAULT_PRINCIPAL)
     return {"ok": True, "result": {
@@ -533,11 +536,12 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
 
     # Step-up re-auth for the data-destroying verbs. Checked AFTER the token
     # gate, so an unauthenticated caller gets a plain 'unauthorized' and never
-    # learns the step-up exists. The fresh password is verified here and not
-    # forwarded to rscore.
+    # learns the step-up exists. The fresh proof is verified here and never
+    # reaches rscore's request fields (from_kwargs / the WEBUI_FIELDS
+    # allow-lists read only their own keys).
     if verb in STEP_UP_VERBS:
-        step_pw = args.get("password")
-        if not isinstance(step_pw, str) or not broker_auth.verify_password(step_pw):
+        step_proof = args.get("proof")
+        if not isinstance(step_proof, str) or not broker_auth.verify_password(step_proof):
             return _audited(principal, "step_up_fail",
                             _err("step_up_required",
                                  "this action requires re-entering your password"))
@@ -842,21 +846,28 @@ def status() -> None:
 
 def passwd() -> None:
     """Set/replace the single operator secret (interactive, double-entry).
-    Hashing + storage live in broker_auth; this is the thin terminal wrapper."""
+    Unified login: this must be the SAME password as the webui vault's master
+    password — the browser derives a login proof from it client-side and the
+    raw password never transits; what we store is scrypt(proof). Hashing +
+    derivation live in broker_auth; this is the thin terminal wrapper."""
     import getpass
+    print("This password must match your webui vault (master) password —")
+    print("one password unlocks the vault and logs into Management.")
     try:
         pw = getpass.getpass("New broker password: ")
         pw2 = getpass.getpass("Confirm: ")
     except (EOFError, KeyboardInterrupt):
         print("\naborted")
         return
-    if not pw:
-        print("aborted: empty password")
+    if len(pw) < broker_auth.MIN_PASSWORD_LENGTH:
+        print(f"aborted: password must be at least "
+              f"{broker_auth.MIN_PASSWORD_LENGTH} characters (the webui vault "
+              f"enforces the same minimum)")
         return
     if pw != pw2:
         print("aborted: passwords do not match")
         return
-    broker_auth.set_password(pw)
+    broker_auth.set_password(broker_auth.derive_login_proof(pw))
     print(f"broker password set ({broker_auth.PASSWD_FILE})")
     # Tokens live only in the running daemon's memory and are not bound to the
     # password — rotating the secret does NOT drop sessions already issued.

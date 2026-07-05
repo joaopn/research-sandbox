@@ -24,6 +24,17 @@ const RAIL_WIDTH_DEFAULT = 200;
 const RAIL_WIDTH_MIN = 80;
 const RAIL_WIDTH_MAX = 480;
 const PBKDF2_ITERATIONS = 600000;
+// Unified login, split derivations: the ONE master password yields (a) the
+// vault key (PBKDF2 over the random per-vault salt above — never transmitted)
+// and (b) a LOGIN PROOF (PBKDF2 over this fixed public domain-separation
+// constant) which is the only thing sent to the webui/broker. Different salts
+// mean the server side can never derive the vault key from the proof.
+// MIRROR-PAIR LOCKSTEP with cli/broker_auth.py's LOGIN_PROOF_SALT /
+// LOGIN_PROOF_ITERATIONS — the broker cannot be imported from here; the bash
+// acceptance harness keeps the two implementations honest. Both sides MUST
+// stay equal or every login fails.
+const LOGIN_PROOF_SALT_STR = "rs-broker-login-v1";
+const LOGIN_PROOF_ITERATIONS = 600000;
 const PROBE_INTERVAL_MS = 15000;
 // Status polling cadence — only runs while the rail is open. Higher than
 // PROBE_INTERVAL_MS because the data is filesystem-derived and changes on
@@ -197,6 +208,9 @@ function currentXtermTheme() {
 const state = {
     derivedKey: null,        // CryptoKey | null
     salt: null,              // Uint8Array | null
+    loginProof: null,        // string | null — broker login derivation; memory-only
+                             // sibling of derivedKey (set at setup/post-decrypt
+                             // unlock, cleared on lock, NEVER persisted)
     vault: null,             // { version, projects, settings } | null
     activeProject: null,     // string | null
     hostPage: null,          // "workflows" | "management" | "settings" | null
@@ -259,6 +273,23 @@ async function deriveKey(password, salt) {
         false,
         ["encrypt", "decrypt"],
     );
+}
+
+// The login proof: base64 of 256 PBKDF2 bits over the fixed public salt.
+// Canonical wire form — must match cli/broker_auth.py::derive_login_proof
+// byte for byte (standard-alphabet padded base64). Needs its own importKey:
+// the vault key's import above grants only ["deriveKey"].
+async function deriveLoginProof(password) {
+    const enc = new TextEncoder();
+    const baseKey = await crypto.subtle.importKey(
+        "raw", enc.encode(password), "PBKDF2", false, ["deriveBits"],
+    );
+    const bits = await crypto.subtle.deriveBits(
+        { name: "PBKDF2", salt: enc.encode(LOGIN_PROOF_SALT_STR),
+          iterations: LOGIN_PROOF_ITERATIONS, hash: "SHA-256" },
+        baseKey, 256,
+    );
+    return b64(bits);
 }
 
 async function encryptVault(key, vault) {
@@ -324,6 +355,7 @@ function renderSetup() {
             const salt = crypto.getRandomValues(new Uint8Array(16));
             state.derivedKey = await deriveKey(pw1.value, salt);
             state.salt = salt;
+            state.loginProof = await deriveLoginProof(pw1.value);
             state.vault = { version: 1, projects: [], settings: {} };
             await persistVault();
             await renderDashboard();
@@ -335,7 +367,12 @@ function renderSetup() {
     const card = el("div", { class: "card" }, [
         el("h2", {}, ["Set master password"]),
         el("p", {}, [
-            "This password encrypts your saved supervisor credentials. There is no recovery — if you forget it, you'll need to re-add each project.",
+            "One password for everything: it encrypts your saved supervisor credentials and logs you into Management. There is no recovery — if you forget it, you'll need to re-add each project.",
+        ]),
+        el("p", { class: "hint" }, [
+            "For Management, set the same password on the host with ",
+            el("code", {}, ["research broker passwd"]),
+            " (at least 8 characters).",
         ]),
         el("div", { class: "field" }, [el("label", {}, ["Master password"]), pw1]),
         el("div", { class: "field" }, [el("label", {}, ["Confirm password"]), pw2]),
@@ -360,6 +397,10 @@ function renderUnlock() {
             const salt = ub64(stored.salt);
             const key = await deriveKey(pw.value, salt);
             const vault = await decryptVault(key, stored.iv, stored.ciphertext);
+            // Derive the broker login proof only AFTER decrypt succeeds: a
+            // wrong password must never leave a proof behind that a later
+            // auto-login would burn against the broker's rate limiter.
+            state.loginProof = await deriveLoginProof(pw.value);
             state.derivedKey = key;
             state.salt = salt;
             state.vault = vault;
@@ -431,10 +472,30 @@ async function renderDashboard() {
         await activateProject(state.activeProject);
     }
 
-    // Repopulate the sidebar from the broker's running set (non-blocking) so a
-    // reload doesn't lose the transient (_jit) create/attach rows. No-ops when
-    // not logged into Management.
-    syncSidebarFromBroker();
+    // Unified login: one best-effort broker login with the unlock-derived
+    // proof, AWAITED before the sidebar sync — fired non-blocking, the sync
+    // would race the session mint and silently no-op on first unlock. A down
+    // broker or a password mismatch is tolerated (Management stays opt-in;
+    // the Management page surfaces the mismatch card when opened).
+    tryBrokerLogin().then(() => syncSidebarFromBroker());
+}
+
+// One POST /broker/login with the in-memory proof. Exactly one attempt per
+// call — callers fire it once per unlock / Management open / explicit Retry,
+// never in a loop, so it cannot trip the webui's global login rate limiter.
+// Returns true on a live management session, false otherwise.
+async function tryBrokerLogin() {
+    if (!state.loginProof) return false;
+    try {
+        const res = await fetch("/broker/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ proof: state.loginProof }),
+        });
+        return res.status === 200;
+    } catch (e) {
+        return false;   // broker/webui unreachable — Management is opt-in
+    }
 }
 
 // ---- rail expand / pin -----------------------------------------------------
@@ -877,44 +938,51 @@ function mgmtCard(view, children) {
     ]));
 }
 
-function renderMgmtLogin(view, onSuccess) {
-    const pw = el("input", { type: "password", autocomplete: "current-password" });
-    const errEl = el("div", { class: "error" });
-    const submit = el("button", { class: "btn" }, ["Log in"]);
-    const doLogin = async () => {
-        errEl.textContent = "";
-        let res;
+// Unified login: no Management password form — the proof derived from the
+// master password at unlock is auto-submitted, ONE attempt per call (a call
+// happens per Management/Workflows open on 401 and per explicit Retry click,
+// never in a loop, so the global login rate limiter can't be tripped). A 401
+// here means the broker's stored secret was set to a DIFFERENT password than
+// the vault's — surfaced as a mismatch card; the fix is host-side. `onSuccess`
+// preserves the caller's landing page exactly as before (the Workflows 401
+// path routes back to Workflows, not the Management table).
+async function renderMgmtLogin(view, onSuccess) {
+    const route = onSuccess || renderManagementInto;
+    mgmtCard(view, [el("div", { class: "mgmt-loading" }, ["Connecting to Management…"])]);
+    let res = null;
+    if (state.loginProof) {
         try {
             res = await fetch("/broker/login", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ password: pw.value }),
+                body: JSON.stringify({ proof: state.loginProof }),
             });
-        } catch (e) { errEl.textContent = "Broker unreachable."; return; }
-        if (res.status === 200) return (onSuccess || renderManagementInto)(view);
-        if (res.status === 429) {
-            const ra = res.headers.get("Retry-After");
-            errEl.textContent = `Too many attempts. Wait ${ra || "a moment"}s.`;
-            return;
-        }
-        if (res.status === 401) { errEl.textContent = "Wrong management password."; return; }
-        if (res.status === 403) return renderMgmtRejected(view);
-        errEl.textContent = "Broker unavailable.";
-    };
-    submit.onclick = doLogin;
-    pw.onkeydown = (e) => { if (e.key === "Enter") doLogin(); };
-    mgmtCard(view, [
-        el("h2", {}, ["Log in to management"]),
-        el("div", { class: "field" }, [el("label", {}, ["Management password"]), pw]),
-        el("div", { class: "btn-row" }, [submit]),
-        errEl,
-        el("div", { class: "hint" }, [
-            "Set on the host with ",
+        } catch (e) { return renderMgmtUnavailable(view); }
+    }
+    if (res && res.status === 200) return route(view);
+    if (res && res.status === 403) return renderMgmtRejected(view);
+    if (res && res.status === 503) return renderMgmtUnavailable(view);
+    // 401 (password mismatch), 429 (rate-limited), or a missing proof:
+    // explain + a manual Retry (each click = one limiter-visible attempt).
+    const retry = el("button", { class: "btn" }, ["Retry"]);
+    retry.onclick = () => renderMgmtLogin(view, onSuccess);
+    let msg;
+    if (res && res.status === 429) {
+        const ra = res.headers.get("Retry-After");
+        msg = el("p", {}, [`Too many login attempts. Wait ${ra || "a moment"}s, then retry.`]);
+    } else {
+        msg = el("p", {}, [
+            "Your master password doesn't match the broker's operator password. ",
+            "On the host, run ",
             el("code", {}, ["research broker passwd"]),
-            ". Separate from your vault password.",
-        ]),
+            " and enter your vault (master) password — then retry.",
+        ]);
+    }
+    mgmtCard(view, [
+        el("h2", {}, ["Management login failed"]),
+        msg,
+        el("div", { class: "btn-row" }, [retry]),
     ]);
-    setTimeout(() => pw.focus(), 50);
 }
 
 function renderMgmtUnavailable(view) {
@@ -948,11 +1016,12 @@ function renderMgmtTable(view, projects) {
     create.onclick = () => openWorkflows();
     const refresh = el("button", { class: "btn-small" }, ["Refresh"]);
     refresh.onclick = () => renderManagementInto(view);
-    const logout = el("button", { class: "btn-small" }, ["Log out"]);
-    logout.onclick = () => mgmtLogout(view);
+    // No Log-out control: under unified login the session model is "locked
+    // vault = logged out" — Lock vault (rail footer) revokes the broker
+    // session; a separate Management logout would just auto-re-login.
     view.appendChild(el("div", { class: "mgmt-header" }, [
         el("h2", {}, ["Management — host projects (live)"]),
-        el("div", { class: "mgmt-toolbar" }, [create, refresh, logout]),
+        el("div", { class: "mgmt-toolbar" }, [create, refresh]),
     ]));
     if (projects.length === 0) {
         view.appendChild(el("div", { class: "mgmt-empty" }, ["No projects on this host."]));
@@ -1050,14 +1119,6 @@ function mgmtAction(view, name, action) {
             `/broker/project/${encodeURIComponent(name)}/${action}`,
             { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }),
     });
-}
-
-async function mgmtLogout(view) {
-    try {
-        await fetch("/broker/logout",
-            { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-    } catch (e) { /* logging out is best-effort */ }
-    renderMgmtLogin(view);
 }
 
 // An auth/availability status the caller should defer to (re-render the right
@@ -1766,20 +1827,23 @@ function mgmtDestroyDialog(view, name) {
                 el("label", {}, ["Type the project name to confirm"]), nameI,
             ]),
             el("div", { class: "field" }, [
-                el("label", {}, ["Re-enter management password"]), pwI,
+                el("label", {}, ["Re-enter your master password"]), pwI,
             ]),
         ],
         validate: () => {
             if (nameI.value.trim() !== name) return "Type the project name exactly to confirm.";
-            if (!pwI.value) return "Re-enter your management password.";
+            if (!pwI.value) return "Re-enter your master password.";
             return null;
         },
-        // The step-up password rides the request; the broker re-verifies it
-        // async, so a wrong password surfaces as a FAILED op in phase 2
-        // ("Failed — Wrong password."), not an inline phase-1 error.
-        request: () => fetch(`/broker/project/${encodeURIComponent(name)}/destroy`, {
+        // Step-up: the retyped password is derived CLIENT-SIDE (unified login —
+        // the raw password never transits) and the proof rides the request; the
+        // broker re-verifies it async, so a wrong password surfaces as a FAILED
+        // op in phase 2 ("Failed — Wrong password."), not an inline phase-1
+        // error. Retype (vs reusing state.loginProof) is deliberate: it keeps
+        // step-up meaningful against a stolen webui session cookie.
+        request: async () => fetch(`/broker/project/${encodeURIComponent(name)}/destroy`, {
             method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ password: pwI.value }),
+            body: JSON.stringify({ proof: await deriveLoginProof(pwI.value) }),
         }),
         onDone: async (ok) => {
             if (!ok) return;
@@ -2066,18 +2130,19 @@ function mgmtBoxRemoveDialog(project, box) {
                 keepCb, " preserve artifacts (keep workspace files on disk)",
             ]),
             el("div", { class: "field" }, [
-                el("label", {}, ["Re-enter management password"]), pwI,
+                el("label", {}, ["Re-enter your master password"]), pwI,
             ]),
         ],
-        validate: () => (pwI.value ? null : "Re-enter your management password."),
-        // Step-up password rides the request; the broker re-verifies async, so a
-        // wrong password surfaces as a FAILED op in phase 2, like destroy.
-        request: () => fetch(
+        validate: () => (pwI.value ? null : "Re-enter your master password."),
+        // Step-up: retyped password → client-side derivation; the proof rides
+        // the request and the broker re-verifies async, so a wrong password
+        // surfaces as a FAILED op in phase 2, like destroy.
+        request: async () => fetch(
             `/broker/project/${encodeURIComponent(project)}/box/${encodeURIComponent(box)}/remove`,
             {
                 method: "POST", headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
-                    password: pwI.value,
+                    proof: await deriveLoginProof(pwI.value),
                     keep_workspace: keepCb.checked,
                 }),
             }),
@@ -2260,7 +2325,19 @@ function lockVault() {
         try { if (t.ws) t.ws.close(); } catch (_) {}
         try { if (t.term) t.term.dispose(); } catch (_) {}
     }
+    // Locked vault = logged out of Management too: revoke the webui session +
+    // broker token (fire-and-forget — a down broker must not block locking).
+    // A refresh/tab-close drops JS memory without running this, so that path
+    // keeps today's behavior: the session cookie just ages out on its TTL.
+    try {
+        fetch("/broker/logout", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: "{}",
+        }).catch(() => {});
+    } catch (e) { /* best-effort */ }
     state.derivedKey = null;
+    state.loginProof = null;
     state.vault = null;
     state.salt = null;
     state.terminals = {};

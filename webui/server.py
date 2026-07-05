@@ -53,7 +53,8 @@ PROJECT_CONTAINER_PREFIX = "rs-project-"
 # Session TTL for the /session/<proj>-issued cookie. Eight hours = one full
 # work day; cookies expire silently and the SPA re-POSTs /session on the
 # next service-tab open. Not user-visible until expiry; no re-prompt for
-# the master password (the SPA still has the SSH credential in the vault).
+# the master password (the SPA still has the SSH credential in the vault;
+# under unified login the same password also yields the broker login proof).
 SESSION_TTL_SECONDS = 8 * 60 * 60
 
 # How long a TCP probe waits before declaring a per-project service down.
@@ -245,10 +246,12 @@ def origin_ok(request: web.Request) -> bool:
 # Broker relay — management lifecycle via the host-side broker daemon.
 #
 # The webui holds NO docker socket and NO standing authority: it relays the
-# operator's password to the broker (which authenticates), then holds the
-# broker-issued session token in *process memory*, keyed by an opaque webui
-# cookie the browser gets. Every relay (reads included) requires that session,
-# so a logged-out / network-reached webui can't enumerate or mutate anything.
+# operator's login PROOF (the browser's client-side derivation — the raw
+# master password never reaches the webui) to the broker (which
+# authenticates), then holds the broker-issued session token in *process
+# memory*, keyed by an opaque webui cookie the browser gets. Every relay
+# (reads included) requires that session, so a logged-out / network-reached
+# webui can't enumerate or mutate anything.
 #
 # Wire protocol mirrors cli/broker.py::client_call (length-prefixed JSON over
 # the broker's AF_UNIX socket) — cli/broker.py is the authoritative spec, and
@@ -461,8 +464,11 @@ async def _relay(request: web.Request, verb: str,
 
 
 async def broker_login_handler(request: web.Request) -> web.Response:
-    """POST /broker/login {password} — relay to the broker; on success mint a
-    management session cookie holding the broker token server-side."""
+    """POST /broker/login {proof} — relay to the broker; on success mint a
+    management session cookie holding the broker token server-side. `proof` is
+    the browser's client-side login derivation (PBKDF2 over a public
+    domain-separation salt) — the raw master password never reaches the webui,
+    so neither the webui nor the broker can derive the vault key from it."""
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")
     wait = LOGIN_LIMITER.retry_after()
@@ -475,12 +481,12 @@ async def broker_login_handler(request: web.Request) -> web.Response:
     except Exception:
         return web.json_response(
             {"ok": False, "error": {"kind": "bad_request"}}, status=400)
-    password = body.get("password")
-    if not isinstance(password, str):
+    proof = body.get("proof")
+    if not isinstance(proof, str):
         return web.json_response(
             {"ok": False, "error": {"kind": "bad_request"}}, status=400)
     try:
-        reply = await broker_call("login", {"password": password})
+        reply = await broker_call("login", {"proof": proof})
     except BrokerUnavailable:
         return web.json_response(
             {"ok": False, "error": {"kind": "broker_unavailable"}}, status=503)
@@ -662,8 +668,9 @@ async def broker_project_action_handler(request: web.Request) -> web.Response:
     """POST /broker/project/{name}/{action} — start|stop|update|destroy (gated,
     origin-checked). Returns {op_id} immediately and runs the verb as a
     background task; the browser tails the op log. `destroy` carries a step-up
-    `password` in the body that rides the background request and the broker
-    re-verifies; the others ignore the body. The longer timeout bounds the
+    `proof` (the client-side login derivation of the re-typed password) in the
+    body that rides the background request and the broker re-verifies; the
+    others ignore the body. The longer timeout bounds the
     background call with headroom for a recreate queued behind another op on the
     serial daemon."""
     if not origin_ok(request):
@@ -679,9 +686,9 @@ async def broker_project_action_handler(request: web.Request) -> web.Response:
             req_body = await request.json()
         except Exception:
             req_body = {}
-        pw = req_body.get("password") if isinstance(req_body, dict) else None
-        if isinstance(pw, str):
-            args["password"] = pw
+        proof = req_body.get("proof") if isinstance(req_body, dict) else None
+        if isinstance(proof, str):
+            args["proof"] = proof
     elif action == "update":
         # The editor extension toggles code-server via `update` enable/disable
         # (STAGE_BOX_EXT_UX C). The broker's UPDATE_WEBUI_FIELDS ({name, enable,
@@ -725,9 +732,10 @@ async def broker_box_add_handler(request: web.Request) -> web.Response:
 
 
 async def broker_box_remove_handler(request: web.Request) -> web.Response:
-    """POST /broker/project/{name}/box/{box}/remove {password} — discard a
-    sandbox box (gated, origin-checked, STEP-UP). The step-up `password` rides
-    the background request and the broker re-verifies it; rscore never sees it."""
+    """POST /broker/project/{name}/box/{box}/remove {proof} — discard a
+    sandbox box (gated, origin-checked, STEP-UP). The step-up `proof` (the
+    client-side login derivation of the re-typed password) rides the background
+    request and the broker re-verifies it; rscore never sees it."""
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")
     project = request.match_info.get("name", "")
@@ -737,9 +745,9 @@ async def broker_box_remove_handler(request: web.Request) -> web.Response:
         req_body = await request.json()
     except Exception:
         req_body = {}
-    pw = req_body.get("password") if isinstance(req_body, dict) else None
-    if isinstance(pw, str):
-        args["password"] = pw
+    proof = req_body.get("proof") if isinstance(req_body, dict) else None
+    if isinstance(proof, str):
+        args["proof"] = proof
     if isinstance(req_body, dict):
         args["keep_workspace"] = bool(req_body.get("keep_workspace"))
     return await _start_op(request, "box_remove", args, BROKER_OP_TIMEOUT_S,

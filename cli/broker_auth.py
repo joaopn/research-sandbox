@@ -60,6 +60,33 @@ SCRYPT_DKLEN = 32          # 256-bit derived key
 SALT_BYTES = 16            # 128-bit salt, fresh per set_password
 PASSWD_FORMAT_VERSION = 1
 
+# --- login-proof derivation (unified login, split derivations) ----------------
+# The browser derives TWO independent values from the one master password: the
+# vault key (PBKDF2, random per-vault salt, never transmitted) and this LOGIN
+# PROOF — the only thing that transits browser → webui → broker. The salt here
+# is a fixed, public, versioned domain-separation constant (the account-
+# identifier salt pattern password managers use, degenerate single-account
+# case; the multi-user step upgrades it to constant + username). It is not a
+# secret — it only has to DIFFER from the vault derivation's salt so neither
+# the webui nor the broker can compute the vault key from a relayed proof.
+# The stored record still gets its own fresh random scrypt salt on top
+# (set_password below), so a stolen passwd file stays per-record salted.
+#
+# MIRROR-PAIR LOCKSTEP: LOGIN_PROOF_SALT / LOGIN_PROOF_ITERATIONS must equal
+# LOGIN_PROOF_SALT_STR / LOGIN_PROOF_ITERATIONS in webui/static/app.js. The
+# webui cannot import this module; the bash acceptance harness keeps the two
+# implementations honest. 600k = the vault derivation's existing PBKDF2-SHA256
+# tier — the two sides MUST stay equal or every login fails.
+LOGIN_PROOF_SALT = b"rs-broker-login-v1"
+LOGIN_PROOF_ITERATIONS = 600_000
+LOGIN_PROOF_DKLEN = 32     # 256-bit proof; canonical wire form is base64 of it
+
+# One password now gates BOTH the webui vault and the broker, so the two entry
+# points must agree on the minimum or an operator can set a broker password the
+# vault UI would refuse at create. 8 mirrors the vault-create gate in
+# webui/static/app.js (renderSetup) — change them together.
+MIN_PASSWORD_LENGTH = 8
+
 # --- session token ------------------------------------------------------------
 # token_urlsafe(32) ⇒ 256 bits of entropy (same primitive the webui's SESSIONS
 # already uses). TTL is one work day: log in once, reversible verbs only; a
@@ -87,9 +114,24 @@ def _scrypt(password: str, salt: bytes, *, n: int, r: int, p: int,
                           n=n, r=r, p=p, dklen=dklen)
 
 
+def derive_login_proof(password: str) -> str:
+    """The client-side login derivation: base64 (standard alphabet, padded) of
+    PBKDF2-HMAC-SHA256(password, LOGIN_PROOF_SALT). This string — never the
+    raw master password — is what clients send at login/step-up and what
+    `research broker passwd` stores (scrypt-hashed). Mirror of app.js's
+    deriveLoginProof; the two must produce identical strings."""
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), LOGIN_PROOF_SALT,
+        LOGIN_PROOF_ITERATIONS, dklen=LOGIN_PROOF_DKLEN)
+    return _b64(digest)
+
+
 def set_password(password: str, *, path: Path = PASSWD_FILE) -> None:
     """Hash `password` with a fresh salt and write the versioned 0600 record.
-    Raises ValueError on an empty password (an empty secret = no auth)."""
+    Under unified login the stored secret is the LOGIN PROOF (derive_login_proof
+    of the master password), never the raw password — this stays a generic
+    string hasher; callers derive first. Raises ValueError on an empty password
+    (an empty secret = no auth)."""
     if not password:
         raise ValueError("password must not be empty")
     salt = secrets.token_bytes(SALT_BYTES)
@@ -121,7 +163,10 @@ def password_is_set(*, path: Path = PASSWD_FILE) -> bool:
 
 def verify_password(password: str, *, path: Path = PASSWD_FILE) -> bool:
     """Constant-time verify against the stored record. Fail closed: a missing
-    or unreadable/garbled record returns False (never authenticates)."""
+    or unreadable/garbled record returns False (never authenticates). Under
+    unified login the verified string is the login proof, so a pre-merge
+    record hashed over a raw password simply stops verifying — the remedy is
+    re-running `research broker passwd`."""
     try:
         record = json.loads(path.read_text())
     except (FileNotFoundError, ValueError, OSError):
