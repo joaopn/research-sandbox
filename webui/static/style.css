@@ -984,6 +984,44 @@ body {
     color: var(--fg-muted);
 }
 
+/* Software / images host page (F2). Read-only status tables; own grid templates
+   (the 5-col .mgmt-row grid doesn't fit these). */
+.sw-section { margin-bottom: 22px; max-width: 860px; }
+.sw-section h3 {
+    font-size: 12px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 0.04em; color: var(--fg-faint); margin: 0 0 8px;
+}
+.sw-banner {
+    padding: 8px 12px; border-radius: 4px; font-size: 13px;
+    background: var(--bg-input); border: 1px solid var(--border); color: var(--fg-muted);
+}
+.sw-table { display: flex; flex-direction: column; gap: 1px; }
+.sw-row {
+    display: grid; align-items: center; gap: 12px; padding: 7px 10px;
+    background: var(--bg-card); font-size: 13px; min-width: 0;
+}
+.sw-row-head {
+    background: transparent; color: var(--fg-faint); font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.04em;
+}
+.sw-dists .sw-row { grid-template-columns: minmax(0, 1.3fr) 70px minmax(0, 1fr) minmax(0, 1fr) 110px; }
+.sw-images .sw-row { grid-template-columns: minmax(0, 1fr) 90px; }
+.sw-pins .sw-row { grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) 70px; }
+.sw-name { font-weight: 600; color: var(--fg-base); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sw-mono {
+    font-family: ui-monospace, Menlo, Consolas, monospace; color: var(--fg-muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sw-ok { color: var(--fg-accent); }
+.sw-warn { color: #d29922; }
+.sw-muted { color: var(--fg-faint); }
+.sw-badge {
+    justify-self: start; font-size: 11px; padding: 1px 8px; border-radius: 10px;
+    white-space: nowrap;
+}
+.sw-badge.base { background: var(--bg-input); color: var(--fg-muted); }
+.sw-badge.override { background: rgba(210, 153, 34, 0.18); color: #d29922; }
+
 /* project-type badge: normal text, type-coloured border (research/sandbox).
    :empty (before the flavour lands, or unknown) collapses to nothing. */
 .type-badge {

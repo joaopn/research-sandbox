@@ -548,6 +548,15 @@ async def broker_workflows_handler(request: web.Request) -> web.Response:
     return web.json_response(body, status=status)
 
 
+async def broker_software_handler(request: web.Request) -> web.Response:
+    """GET /broker/software — read-only status of the host's agent/editor dists,
+    the built image fleet, and the effective version pins (gated). Mirrors
+    /broker/workflows: a no-args broker read; the SameSite=Strict cookie is the
+    CSRF defense. Pull/rebuild/refresh (the write side) land in later slices."""
+    status, body = await _relay(request, "software_status")
+    return web.json_response(body, status=status)
+
+
 def _mint_op_id(name: str, action: str) -> str:
     """A safe-basename op_id embedding project/action/ts for a browsable handle,
     plus a random suffix for uniqueness. The broker re-validates it against the
@@ -1852,6 +1861,7 @@ def main() -> None:
     app.router.add_post("/broker/logout", broker_logout_handler)
     app.router.add_get("/broker/projects", broker_projects_handler)
     app.router.add_get("/broker/workflows", broker_workflows_handler)
+    app.router.add_get("/broker/software", broker_software_handler)
     app.router.add_post("/broker/project", broker_create_handler)
     # attach is a fixed segment registered before the {action} variable so it
     # routes to the keyring handler, not the start|stop|update|destroy dispatcher

@@ -213,7 +213,7 @@ const state = {
                              // unlock, cleared on lock, NEVER persisted)
     vault: null,             // { version, projects, settings } | null
     activeProject: null,     // string | null
-    hostPage: null,          // "workflows" | "management" | "settings" | null
+    hostPage: null,          // "workflows" | "management" | "software" | "settings" | null
     explainIndex: null,      // string[] of workflows with a rendered Explain doc (/static/explain/index.json); null = unfetched
     activeService: null,     // string | null
     serviceRegistry: null,   // { [serviceId]: spec } from /services
@@ -803,6 +803,8 @@ function makeBottomNav() {
            "New Project — pick a workflow, or import an existing project", openWorkflows),
         mk("management-entry", "🗂", "Management",
            "Host project management (broker)", openManagement),
+        mk("software-entry", "📦", "Software",
+           "Agent/editor dists, image fleet, version pins (broker)", openSoftware),
         mk("settings-entry", "⚙", "Settings", "UI settings", openSettings),
     ]);
 }
@@ -815,7 +817,7 @@ function refreshBottomNav() {
     // makeBottomNav builds every entry inactive; re-derive the active highlight
     // from the current host page.
     const hp = state.hostPage;
-    if (hp === "workflows" || hp === "management" || hp === "settings") {
+    if (hp === "workflows" || hp === "management" || hp === "software" || hp === "settings") {
         setActiveNavEntry(hp + "-entry");
     }
 }
@@ -871,6 +873,15 @@ function openSettings() {
     renderSettingsInto(view);
 }
 
+function openSoftware() {
+    if (state.hostPage === "software") return leaveHostView();
+    state.hostPage = "software";
+    const view = enterHostView();
+    if (!view) return;
+    setActiveNavEntry("software-entry");
+    renderSoftwareInto(view);
+}
+
 // Clicking the already-open host tab deselects it (temporary-tab feel): drop
 // back to the project that was open before, or the welcome area if none.
 function leaveHostView() {
@@ -896,6 +907,118 @@ function renderSettingsInto(view) {
             el("label", {}, ["Editor zoom"]),
             makeIframeZoomSelector(),
         ]),
+    ]));
+}
+
+// Software / images host page — read-only status of the host's agent/editor
+// dists, built image fleet, and effective version pins (base + local override),
+// via the login-gated broker `software_status` read. Pull/rebuild/refresh (the
+// write side) land in later slices; this slice surfaces status only.
+async function renderSoftwareInto(view) {
+    view.innerHTML = "";
+    view.appendChild(el("div", { class: "mgmt-loading" }, ["Loading software status…"]));
+    let res;
+    try {
+        res = await fetch("/broker/software");
+    } catch (e) { return renderMgmtUnavailable(view); }
+    if (res.status === 401) return renderMgmtLogin(view, renderSoftwareInto);
+    if (res.status === 403) return renderMgmtRejected(view);
+    if (res.status === 503) return renderMgmtUnavailable(view);
+    let body;
+    try { body = await res.json(); } catch (e) { return renderMgmtUnavailable(view); }
+    if (!res.ok || !body.ok || !body.result) return renderMgmtUnavailable(view);
+    renderSoftwareScreen(view, body.result);
+}
+
+function renderSoftwareScreen(view, result) {
+    view.innerHTML = "";
+    const agents = Array.isArray(result.agents) ? result.agents : [];
+    const editor = result.editor || {};
+    const images = Array.isArray(result.images) ? result.images : [];
+    const pins = Array.isArray(result.pins) ? result.pins : [];
+    const dockerOk = !!result.docker_ok;
+
+    const refresh = el("button", { class: "btn-small" }, ["Refresh"]);
+    refresh.onclick = () => renderSoftwareInto(view);
+    view.appendChild(el("div", { class: "mgmt-header" }, [
+        el("h2", {}, ["Software — dists, images, pins"]),
+        el("div", { class: "mgmt-toolbar" }, [refresh]),
+    ]));
+
+    const cell = (v, cls) =>
+        el("span", cls ? { class: cls } : {}, [v == null || v === "" ? "—" : String(v)]);
+    const distStatus = (d) => {
+        if (!d.present) return el("span", { class: "sw-muted" }, ["not pulled"]);
+        if (d.effective_pin == null) return el("span", { class: "sw-muted" }, ["cached"]);
+        return d.matches_pin
+            ? el("span", { class: "sw-ok" }, ["up to date"])
+            : el("span", { class: "sw-warn" }, ["stale — re-pull"]);
+    };
+
+    // --- Dists (agents + the editor) ---
+    const distRows = [el("div", { class: "sw-row sw-row-head" }, [
+        el("span", {}, ["Dist"]), el("span", {}, ["Present"]),
+        el("span", {}, ["Cached"]), el("span", {}, ["Effective pin"]), el("span", {}, ["Status"]),
+    ])];
+    for (const a of agents) {
+        distRows.push(el("div", { class: "sw-row" }, [
+            el("span", { class: "sw-name" }, ["agent: " + a.agent]),
+            cell(a.present ? "yes" : "no"),
+            cell(a.cached_version, "sw-mono"),
+            cell(a.effective_pin, "sw-mono"),
+            distStatus(a),
+        ]));
+    }
+    const nExt = Object.keys(editor.extensions || {}).length;
+    distRows.push(el("div", { class: "sw-row" }, [
+        el("span", { class: "sw-name" }, ["editor: code-server" + (nExt ? ` (+${nExt} ext)` : "")]),
+        cell(editor.present ? "yes" : "no"),
+        cell(editor.cached_version, "sw-mono"),
+        cell(editor.effective_pin, "sw-mono"),
+        distStatus(editor),
+    ]));
+    view.appendChild(el("div", { class: "sw-section" }, [
+        el("h3", {}, ["Dists"]),
+        el("div", { class: "sw-table sw-dists" }, distRows),
+    ]));
+
+    // --- Image fleet ---
+    const imgChildren = [el("h3", {}, ["Image fleet"])];
+    if (!dockerOk) {
+        imgChildren.push(el("div", { class: "sw-banner" },
+            ["Docker unreachable — image presence can't be read on this host."]));
+    } else {
+        const imgRows = [el("div", { class: "sw-row sw-row-head" }, [
+            el("span", {}, ["Image"]), el("span", {}, ["Built"]),
+        ])];
+        for (const im of images) {
+            imgRows.push(el("div", { class: "sw-row" }, [
+                el("span", { class: "sw-mono" }, [im.tag]),
+                im.present
+                    ? el("span", { class: "sw-ok" }, ["present"])
+                    : el("span", { class: "sw-warn" }, ["absent"]),
+            ]));
+        }
+        imgChildren.push(el("div", { class: "sw-table sw-images" }, imgRows));
+    }
+    view.appendChild(el("div", { class: "sw-section" }, imgChildren));
+
+    // --- Version pins (effective: base overlaid with the local override) ---
+    const pinRows = [el("div", { class: "sw-row sw-row-head" }, [
+        el("span", {}, ["Pin"]), el("span", {}, ["Value"]), el("span", {}, ["Source"]),
+    ])];
+    for (const p of pins) {
+        pinRows.push(el("div", { class: "sw-row" }, [
+            el("span", { class: "sw-mono" }, [p.key]),
+            el("span", { class: "sw-mono" }, [p.value]),
+            p.override
+                ? el("span", { class: "sw-badge override", title: "from versions.local.env" }, ["local"])
+                : el("span", { class: "sw-badge base", title: "from versions.env" }, ["base"]),
+        ]));
+    }
+    view.appendChild(el("div", { class: "sw-section" }, [
+        el("h3", {}, ["Version pins"]),
+        el("div", { class: "sw-table sw-pins" }, pinRows),
     ]));
 }
 

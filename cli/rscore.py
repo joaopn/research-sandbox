@@ -1621,6 +1621,11 @@ PROBE_IMAGE = "busybox:1.36"
 # Dockerfile ARG defaults. `_build_images` threads them as `docker build
 # --build-arg`; see versions.env for the workflow + per-pin caveats.
 VERSIONS_FILE = SCRIPT_DIR / "versions.env"
+# Untracked per-instance override (gitignored). load_versions() overlays it on
+# top of the tracked base (override wins per-key), so a local pin bump (`research
+# agent/editor refresh`) lands ONLY here and never mutates committed source —
+# versions.env stays in lockstep with the repo.
+VERSIONS_LOCAL_FILE = SCRIPT_DIR / "versions.local.env"
 
 # Upstream datasource per pin, consumed by `research images outdated`. Kept here
 # rather than annotated into versions.env so the manifest stays a clean
@@ -2215,15 +2220,16 @@ def _preflight() -> None:
             print(f"created empty {env_path.name}")
 
 
-def load_versions() -> dict[str, str]:
-    """Parse the root-level versions.env (KEY=VALUE, `#`-comment lines) into a
-    dict of image-version pins. Mirrors load_config()'s .env parsing — stdlib
-    only, no quote/inline-comment handling (pins are bare tokens). Missing file
-    yields {} so every Dockerfile ARG default still applies."""
+def _parse_env_pins(path: Path) -> dict[str, str]:
+    """Parse one KEY=VALUE manifest (`#`-comment + blank lines skipped) into a
+    dict. Mirrors load_config()'s .env parsing — stdlib only, no quote/inline-
+    comment handling (pins are bare tokens). A missing file yields {}. This is the
+    single parse loop shared by load_versions (base + override) and
+    software_status's override-flag compute, so the two can never drift."""
     pins: dict[str, str] = {}
-    if not VERSIONS_FILE.exists():
+    if not path.exists():
         return pins
-    for line in VERSIONS_FILE.read_text().splitlines():
+    for line in path.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -2231,6 +2237,17 @@ def load_versions() -> dict[str, str]:
         k, v = k.strip(), v.strip()
         if k:
             pins[k] = v
+    return pins
+
+
+def load_versions() -> dict[str, str]:
+    """The effective image-version pins: the tracked versions.env base overlaid
+    with the untracked versions.local.env override (override wins per-key). A
+    missing base yields {} so every Dockerfile ARG default still applies; a
+    missing override is a no-op. SOLE read path for pins — every consumer
+    (build-arg threading, the status panel, the CLI) sees the merged view."""
+    pins = _parse_env_pins(VERSIONS_FILE)
+    pins.update(_parse_env_pins(VERSIONS_LOCAL_FILE))
     return pins
 
 
@@ -2650,9 +2667,15 @@ def agent_refresh_check(agent: str = "claude") -> tuple[str, str]:
 
 
 def _set_version_pin(key: str, value: str) -> None:
-    """Rewrite KEY=… in versions.env in place — the SANCTIONED `agent refresh`
-    write (the file's header sanctions this one bespoke writer)."""
-    lines = VERSIONS_FILE.read_text().splitlines()
+    """Write KEY=value to the untracked versions.local.env override — the
+    SANCTIONED `agent refresh` / `editor refresh` write. It NEVER touches the
+    tracked versions.env base (which stays in lockstep with the repo); a local
+    bump lands only in the gitignored override, which load_versions overlays on
+    top. Rewrites the key in place if the override already carries it, else
+    appends; a missing override file starts empty. Key-match stays aligned with
+    _parse_env_pins for well-formed lines."""
+    lines = (VERSIONS_LOCAL_FILE.read_text().splitlines()
+             if VERSIONS_LOCAL_FILE.exists() else [])
     out, found = [], False
     for ln in lines:
         s = ln.strip()
@@ -2663,7 +2686,7 @@ def _set_version_pin(key: str, value: str) -> None:
             out.append(ln)
     if not found:
         out.append(f"{key}={value}")
-    VERSIONS_FILE.write_text("\n".join(out) + "\n")
+    VERSIONS_LOCAL_FILE.write_text("\n".join(out) + "\n")
 
 
 def agent_apply_refresh(agent: str, version: str) -> None:
@@ -2940,12 +2963,15 @@ def _stage_editor_dist(supervisor: str, *, deploy_local: bool = False) -> None:
         _deploy_supervisor_editor(supervisor)
 
 
-def _build_images(force: bool) -> None:
-    """Build supervisor + worker + mcp-proxy + role-mcp images. Skip
-    existing ones unless --rebuild. Build order matters: rs-role-mcp-base
-    FROMs rs-analysis-base, per-role images (rs-echo-mcp etc.) FROM
-    rs-role-mcp-base — keep the list bottom-up so each FROM resolves to
-    the just-built layer rather than a stale cached copy."""
+def _image_build_specs() -> list:
+    """The (image_tag, Dockerfile) build set, bottom-up so each FROM resolves to
+    the just-built layer rather than a stale cached copy. Static leaves + the
+    per-role MCP images that HAVE a Dockerfile; a role missing its Dockerfile is
+    skipped SILENTLY here — this is a pure query with no side channel (the
+    operator warning lives on the build path, re-derived in _build_images). Shared
+    with software_status so the panel's image fleet is exactly the build fleet,
+    never a drifting copy of the tag list. Excludes the lane-3 :<pin> snapshot
+    retags — they're derived from the same pins the panel already shows."""
     specs = [
         # No-DIND base MUST build first: rs-substrate-base AND rs-minimal both
         # FROM it (WORKFLOW_TAXONOMY_S1.md carve).
@@ -2974,12 +3000,25 @@ def _build_images(force: bool) -> None:
     ]
     for role, image in sorted(role_mcp.ROLE_IMAGES.items()):
         dockerfile = SCRIPT_DIR / "agent" / f"Dockerfile.{role}"
-        if not dockerfile.is_file():
+        if dockerfile.is_file():
+            specs.append((image, dockerfile))
+    return specs
+
+
+def _build_images(force: bool) -> None:
+    """Build supervisor + worker + mcp-proxy + role-mcp images. Skip
+    existing ones unless --rebuild. Build order matters: rs-role-mcp-base
+    FROMs rs-analysis-base, per-role images (rs-echo-mcp etc.) FROM
+    rs-role-mcp-base — the spec list is bottom-up so each FROM resolves to
+    the just-built layer rather than a stale cached copy."""
+    specs = _image_build_specs()
+    # Operator warning for a role-MCP image whose Dockerfile is missing — kept on
+    # the BUILD path only (_image_build_specs skips it silently for read callers).
+    for role, image in sorted(role_mcp.ROLE_IMAGES.items()):
+        if not (SCRIPT_DIR / "agent" / f"Dockerfile.{role}").is_file():
             print(f"warning: role-mcp image {image} has no Dockerfile at "
-                  f"{dockerfile.name}; skipping (add it in the per-role stage)",
+                  f"Dockerfile.{role}; skipping (add it in the per-role stage)",
                   file=sys.stderr)
-            continue
-        specs.append((image, dockerfile))
     pins = load_versions()
     for tag, dockerfile in specs:
         if not force and run_quiet(["docker", "image", "inspect", tag]):
@@ -3015,6 +3054,82 @@ def _build_images(force: bool) -> None:
             continue
         if run_quiet(["docker", "image", "inspect", f"{host_base}:latest"]):
             run_check(["docker", "tag", f"{host_base}:latest", f"{host_base}:{pin}"])
+
+
+def software_status() -> dict:
+    """Read-only status of the host's agent/editor dists, the built image fleet,
+    and the effective version pins — the data behind the webui Software panel.
+    Crash-proof by construction: every filesystem/subprocess touch is guarded and
+    degrades rather than raising, so it never escapes the broker dispatch as an
+    unhandled exception. No writes, no network (the upstream-freshness check is a
+    separate, slower surface — `research images outdated` / a future verb)."""
+    base = _parse_env_pins(VERSIONS_FILE)
+    override = _parse_env_pins(VERSIONS_LOCAL_FILE)
+    effective = dict(base)
+    effective.update(override)
+
+    # Agents: iterate the whole known set (not agent_list, which drops unpulled
+    # agents) so "claude: dist absent — run `research agent pull`" is representable.
+    agents = []
+    for agent in KNOWN_AGENTS:
+        present = dist_present(agent)
+        cached_version = pulled_at = None
+        sidecar = _agent_sidecar(agent)
+        if present and sidecar.exists():
+            try:
+                data = json.loads(sidecar.read_text())
+                cached_version = data.get("version")
+                pulled_at = data.get("pulled_at")
+            except Exception:
+                pass
+        pin = effective.get(_AGENT_INSTALL[agent]["version_key"])
+        agents.append({
+            "agent": agent,
+            "present": present,
+            "cached_version": cached_version,
+            "pulled_at": pulled_at,
+            "effective_pin": pin,
+            "matches_pin": (cached_version is not None and pin is not None
+                            and cached_version == pin),
+        })
+
+    ed = editor_show() or {}
+    ed_ver = ed.get("code_server_version")
+    ed_pin = effective.get(_CODE_SERVER_VERSION_KEY)
+    editor = {
+        "present": editor_dist_present(),
+        "cached_version": ed_ver,
+        "pulled_at": ed.get("pulled_at"),
+        "extensions": ed.get("extensions") or {},
+        "effective_pin": ed_pin,
+        "matches_pin": (ed_ver is not None and ed_pin is not None
+                        and ed_ver == ed_pin),
+    }
+
+    # One `docker info` probe distinguishes "docker unreachable" (whole fleet
+    # renders as one honest banner) from "image genuinely absent" (per-row). Guard
+    # it: a missing docker binary raises FileNotFoundError from run_quiet, which
+    # would otherwise escape dispatch — degrade to docker_ok=False instead.
+    try:
+        docker_ok = run_quiet(["docker", "info"])
+    except OSError:
+        docker_ok = False
+    images = [
+        {"tag": tag,
+         "present": docker_ok and run_quiet(["docker", "image", "inspect", tag])}
+        for tag, _dockerfile in _image_build_specs()
+    ]
+
+    pins = [{"key": k, "value": effective[k], "override": k in override}
+            for k in effective]
+
+    return {
+        "docker_ok": docker_ok,
+        "agents": agents,
+        "editor": editor,
+        "images": images,
+        "pins": pins,
+    }
 
 
 def _http_json(url: str, timeout: float = 10.0) -> dict:

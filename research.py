@@ -333,28 +333,30 @@ def cmd_agent_show(args: argparse.Namespace) -> None:
 
 
 def cmd_agent_refresh(args: argparse.Namespace) -> None:
-    """HITL: check upstream, offer to bump the versions.env pin + re-pull. The
-    pin (CLAUDE_CODE_VERSION) is shared with the transitional bake, so this moves
-    the fleet's next-rebuild version too (STAGE_AGENT_DIST_S1 coupled pin)."""
+    """HITL: check upstream, offer to bump the local pin + re-pull. The bump
+    (CLAUDE_CODE_VERSION) lands in the untracked versions.local.env override, not
+    the tracked base — so it's a per-instance change, never a committed one — and
+    it also moves this instance's next `start --rebuild` version (load_versions
+    overlays the override for build-arg threading)."""
     agent = args.agent
     current, latest = rscore.agent_refresh_check(agent)
     if current == latest:
-        print(f"{agent}: up to date (versions.env pin {current} == upstream {latest})")
+        print(f"{agent}: up to date (effective pin {current} == upstream {latest})")
         if not rscore.dist_present(agent):
             print(f"  (no dist cached yet — run `research agent pull --agent {agent}`)")
         return
-    print(f"{agent}: versions.env pin {current or '(unset)'} → upstream {latest}")
-    print("  (this also moves the fleet's next `start --rebuild` version)")
+    print(f"{agent}: effective pin {current or '(unset)'} → upstream {latest}")
+    print("  (this also moves this instance's next `start --rebuild` version)")
     if not args.yes:
         try:
-            resp = input("bump the pin in versions.env + pull it? [y/N] ").strip().lower()
+            resp = input("bump the pin (writes versions.local.env) + pull it? [y/N] ").strip().lower()
         except EOFError:
             resp = "n"
         if resp not in ("y", "yes"):
-            print("aborted; versions.env unchanged")
+            print("aborted; versions.local.env unchanged")
             return
     rscore.agent_apply_refresh(agent, latest)
-    print(f"bumped versions.env + pulled {agent} {latest}; review + commit versions.env")
+    print(f"bumped versions.local.env + pulled {agent} {latest} (untracked; no commit needed)")
 
 
 def cmd_editor_pull(args: argparse.Namespace) -> None:
@@ -376,28 +378,29 @@ def cmd_editor_show(args: argparse.Namespace) -> None:
 
 
 def cmd_editor_refresh(args: argparse.Namespace) -> None:
-    """HITL: check upstream code-server, offer to bump the versions.env pin +
-    re-pull. The pin (CODE_SERVER_VERSION) is shared with the transitional bake
-    (slice 1), so this moves the fleet's next-rebuild version too."""
+    """HITL: check upstream code-server, offer to bump the local pin + re-pull.
+    The bump (CODE_SERVER_VERSION) lands in the untracked versions.local.env
+    override, not the tracked base — a per-instance change, never a committed one
+    — and it also moves this instance's next `start --rebuild` version."""
     current, latest = rscore.editor_refresh_check()
     if current == latest:
-        print(f"editor: up to date (versions.env pin {current} == upstream {latest})")
+        print(f"editor: up to date (effective pin {current} == upstream {latest})")
         if not rscore.editor_dist_present():
             print("  (no dist cached yet — run `research editor pull`)")
         return
-    print(f"editor: versions.env CODE_SERVER_VERSION {current or '(unset)'} → upstream {latest}")
-    print("  (this also moves the fleet's next `start --rebuild` version)")
+    print(f"editor: effective CODE_SERVER_VERSION {current or '(unset)'} → upstream {latest}")
+    print("  (this also moves this instance's next `start --rebuild` version)")
     if not args.yes:
         try:
-            resp = input("bump the pin in versions.env + pull it? [y/N] ").strip().lower()
+            resp = input("bump the pin (writes versions.local.env) + pull it? [y/N] ").strip().lower()
         except EOFError:
             resp = "n"
         if resp not in ("y", "yes"):
-            print("aborted; versions.env unchanged")
+            print("aborted; versions.local.env unchanged")
             return
     rscore.editor_apply_refresh(latest)
-    print(f"bumped versions.env + pulled editor code-server {latest}; "
-          "review + commit versions.env")
+    print(f"bumped versions.local.env + pulled editor code-server {latest} "
+          "(untracked; no commit needed)")
 
 
 def cmd_project_attach(args: argparse.Namespace) -> None:

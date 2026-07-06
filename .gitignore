@@ -19,3 +19,7 @@ PLAN/
 .mcp.json
 .cache/
 external/
+
+# Untracked per-instance version-pin override (wins over the tracked versions.env
+# base; written by `research agent/editor refresh`). Local upgrades stay local.
+versions.local.env

@@ -272,6 +272,22 @@ def _verb_workflows(_args: dict, _progress=None) -> dict:
     }
 
 
+def _verb_software_status(_args: dict, _progress=None) -> dict:
+    """Read-only status of the host's agent/editor dists, the built image fleet,
+    and the effective version pins (base + untracked override) — the data behind
+    the webui Software panel. Token-gated (NOT in OPEN_VERBS) — deny-by-default,
+    like every other non-`list`/`status` verb. `software_status` is crash-proof by
+    construction (guarded reads, degrade-not-raise); the belt-and-braces wrap maps
+    any residual exception to a clean ValidationError envelope rather than letting
+    it escape dispatch as a truncated reply (the _verb_workflows discipline)."""
+    try:
+        return rscore.software_status()
+    except (rscore.ValidationError, rscore.HarnessError, SystemExit):
+        raise
+    except Exception as e:                       # pragma: no cover — defensive
+        raise rscore.ValidationError(f"software status unavailable: {e}")
+
+
 def _verb_stop(args: dict, progress=None) -> list[dict]:
     req = rscore.StartStopRequest.from_kwargs(**args)  # may raise ValidationError
     return [dataclasses.asdict(r) for r in rscore.stop(req, progress=progress)]
@@ -425,6 +441,7 @@ VERBS = {
     "list": _verb_list,
     "status": _verb_status,
     "workflows": _verb_workflows,
+    "software_status": _verb_software_status,
     "stop": _verb_stop,
     "start": _verb_start,
     "create": _verb_create,
