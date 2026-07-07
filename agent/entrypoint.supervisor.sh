@@ -220,6 +220,19 @@ if [[ "${RS_SERVICE_CODE_SERVER:-enabled}" == "enabled" ]] \
     bash /opt/editor-dist/tools/code-server-deploy.sh || true
 fi
 
+# --- reader (dist) — STAGE_READER. The mobile artifact reader, default OFF
+#     (RS_SERVICE_READER defaults to disabled, mirroring the service's create-time
+#     default). Same first-boot no-op shape as the editor block above: the mount is
+#     empty at container-start, so the supervisor's OWN reader is brought up by the
+#     post-start `_stage_reader_dist` deploy_local (a `docker exec` of this same
+#     deploy script). The block stays for parity + to cover a host/daemon-reboot
+#     restart where the staged mount persists in the container fs. Populated-mount
+#     guard keeps it safe.
+if [[ "${RS_SERVICE_READER:-disabled}" == "enabled" ]] \
+   && [[ -e /opt/reader-dist/.local/bin/jupyter-nbconvert ]]; then
+    bash /opt/reader-dist/tools/reader-deploy.sh || true
+fi
+
 # Byobu is NOT pre-started here. `research project attach` creates the "main"
 # session lazily if needed. Pre-starting would freeze a bash process that
 # predates `usermod -aG docker research` (docker-ce is installed at project

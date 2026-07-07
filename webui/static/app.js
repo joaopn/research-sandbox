@@ -946,6 +946,7 @@ function renderSoftwareScreen(view, result) {
     view.innerHTML = "";
     const agents = Array.isArray(result.agents) ? result.agents : [];
     const editor = result.editor || {};
+    const reader = result.reader || {};
     const images = Array.isArray(result.images) ? result.images : [];
     const pins = Array.isArray(result.pins) ? result.pins : [];
     const dockerOk = !!result.docker_ok;
@@ -1032,6 +1033,25 @@ function renderSoftwareScreen(view, result) {
                 "editor: code-server",
                 { verb: "editor_refresh_check" },
                 { verb: "editor_refresh" }),
+        ]),
+    ]));
+    // Reader dist (STAGE_READER): nbconvert is the primary/refreshable pin;
+    // markdown rides bundled. The cell shows the nbconvert version.
+    distRows.push(el("div", { class: "sw-row" }, [
+        el("span", { class: "sw-name" }, ["reader: nbconvert"
+            + (reader.markdown_version ? ` (+md ${reader.markdown_version})` : "")]),
+        cell(reader.present ? "yes" : "no"),
+        cell(reader.cached_version, "sw-mono"),
+        cell(reader.effective_pin, "sw-mono"),
+        distStatus(reader),
+        el("span", { class: "sw-act" }, [
+            pullBtn(
+                { verb: "reader_pull" },
+                "Rebuild the reader dist (nbconvert + markdown) at the effective pins, in a throwaway build container (a few minutes)."),
+            refreshBtn(
+                "reader: nbconvert",
+                { verb: "reader_refresh_check" },
+                { verb: "reader_refresh" }),
         ]),
     ]));
     view.appendChild(el("div", { class: "sw-section" }, [
@@ -1820,6 +1840,18 @@ function mgmtCreateDialog(view, manifest, agents) {
         editorCb.checked = !editorCb.checked;
         editorCard.classList.toggle("selected", editorCb.checked);
     };
+    // Reader (mobile artifact viewer, STAGE_READER) — dind-only + default OFF.
+    // Checked → enable:["reader"] (merged with worker presets in the payload). The
+    // card is offered ONLY on dind workflows (!isDocker): the backend rejects reader
+    // on the docker substrate, so showing it there would be a dead-end control.
+    const readerCb = el("input", { type: "checkbox" });
+    readerCb.checked = false;
+    const readerCard = el("div", { class: "box-opt-card" },
+                          [el("span", { class: "box-opt-name" }, ["Reader (mobile viewer)"])]);
+    readerCard.onclick = () => {
+        readerCb.checked = !readerCb.checked;
+        readerCard.classList.toggle("selected", readerCb.checked);
+    };
 
     // Enable presets — only for a workflow that has a worker/sandbox layer
     // (research flavor). A bare box / sandbox host has none, so the backend would
@@ -1885,7 +1917,8 @@ function mgmtCreateDialog(view, manifest, agents) {
         ])] : []),
         el("div", { class: "box-opt-group" }, [
             el("div", { class: "box-opt-caption" }, ["Extensions"]),
-            el("div", { class: "box-opt-cards" }, [editorCard]),
+            el("div", { class: "box-opt-cards" },
+               isDocker ? [editorCard] : [editorCard, readerCard]),
         ]),
     ]);
 
@@ -1961,9 +1994,17 @@ function mgmtCreateDialog(view, manifest, agents) {
             };
             // Editor on by default; unchecking disables the code-server service.
             if (!editorCb.checked) payload.disable = ["code-server"];
+            // Build ONE merged enable array so the reader tickbox and the worker
+            // presets don't clobber each other (the broker drops silently, so a
+            // second assignment would just lose the other's tokens). Worker presets
+            // ride only on a workflow with a worker layer; reader only on dind
+            // (!isDocker), matching where each control is shown.
+            const enableTokens = [];
             if (hasWorkerLayer) {
-                payload.enable = checks.filter((c) => c.cb.checked).map((c) => c.p);
+                enableTokens.push(...checks.filter((c) => c.cb.checked).map((c) => c.p));
             }
+            if (!isDocker && readerCb.checked) enableTokens.push("reader");
+            if (enableTokens.length) payload.enable = enableTokens;
             if (showInBox) {
                 const sel = agentChecks.filter((c) => c.cb.checked)
                                        .map((c) => c.name);
@@ -3413,6 +3454,21 @@ function appendEditorExtensionSection(box, project, enabled) {
     btn.onclick = () => mgmtEditorToggle(project.name, editorOn, isDocker);
     row.appendChild(btn);
     section.appendChild(row);
+    // Reader toggle (STAGE_READER) — dind-only (a docker box has no reader), so it
+    // is omitted there rather than offering a control the broker refuses. The reader
+    // deploys/removes LIVE on dind (no recreate), like the dind editor.
+    if (!isDocker) {
+        const readerOn = Object.prototype.hasOwnProperty.call(enabled, "reader");
+        const rrow = el("div", { class: "config-box-row" }, [
+            el("span", { class: "config-box-name" }, ["Reader"]),
+            el("span", { class: "config-box-meta" }, [readerOn ? "on" : "off"]),
+        ]);
+        const rbtn = el("button", { class: "btn btn-secondary" },
+                       [readerOn ? "Disable" : "Enable"]);
+        rbtn.onclick = () => mgmtReaderToggle(project.name, readerOn);
+        rrow.appendChild(rbtn);
+        section.appendChild(rrow);
+    }
     box.appendChild(section);
 }
 
@@ -3547,6 +3603,25 @@ function mgmtEditorToggle(name, on, isDocker) {
         request: () => fetch(`/broker/project/${encodeURIComponent(name)}/update`, {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify(on ? { disable: ["code-server"] } : { enable: ["code-server"] }),
+        }),
+        onDone: async (ok) => { if (ok) await refreshAfterBoxChange(name); },
+    });
+}
+
+// Reader toggle (STAGE_READER) — dind-only, so no docker-recreate branch: the
+// reader always deploys/removes LIVE via the update reader-flip live-toggle path.
+function mgmtReaderToggle(name, on) {
+    const word = on ? "Disable" : "Enable";
+    mgmtConfirmThenTail(boxOpView(), {
+        title: `${word} the reader on ${name}`,
+        tailTitle: `${on ? "Disabling" : "Enabling"} the reader on ${name}`,
+        verb: "update",
+        confirmLabel: word,
+        body: [el("p", {}, [`${word} the mobile artifact reader on "${name}". ` +
+            "This deploys it live (no recreate) — it takes effect on the next page load."])],
+        request: () => fetch(`/broker/project/${encodeURIComponent(name)}/update`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(on ? { disable: ["reader"] } : { enable: ["reader"] }),
         }),
         onDone: async (ok) => { if (ok) await refreshAfterBoxChange(name); },
     });

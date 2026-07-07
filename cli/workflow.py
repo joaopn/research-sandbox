@@ -51,7 +51,7 @@ EXPORT_TRANSPORTS = ("http", "sse")
 # e.g. the `sandbox` workflow sets {"code-server": false} for a lean box. Mirror
 # rscore.KNOWN_SERVICES / ALWAYS_ON_SERVICES (kept here as bare strings to keep
 # this module stdlib-light + independently importable; lockstep with rscore).
-SERVICE_IDS = ("supervisor", "code-server")
+SERVICE_IDS = ("supervisor", "code-server", "reader")
 ALWAYS_ON_SERVICE_IDS = ("supervisor",)
 
 # Create-window presentation (STAGE_STORE_WORKFLOWS). `group` buckets a workflow

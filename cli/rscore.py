@@ -461,6 +461,24 @@ class CreateRequest:
             raise ValidationError(
                 "no cached editor dist — run `research editor pull` first "
                 "(or `research start`, which auto-pulls)")
+        # Reader floor + docker rejection (STAGE_READER). The reader is a
+        # dind-only supervisor service: on the docker substrate nothing deploys it
+        # (entrypoint.minimal.sh has no reader block, no dist mount), so an enabled
+        # reader there would be a silent no-op (flag stamped, no server, no tab) —
+        # reject it pre-side-effect, which also keeps the reader readiness wait
+        # dind-only by construction. On dind it needs a pulled reader dist (no bake).
+        # Same flag-aware resolution as the editor floor above; reader defaults OFF,
+        # so an un-flagged create never trips this. NO `research start` auto-pull —
+        # a default-off service pulls only on the explicit enable path.
+        reader_on = _compute_service_flags(
+            svc_en, svc_dis, base=(service_defaults or None)).get("reader", False)
+        if reader_on and substrate is Substrate.DOCKER:
+            raise ValidationError(
+                "the reader service is not available on the docker substrate "
+                "(it is a research-workflow supervisor service) — drop `--enable reader`")
+        if reader_on and substrate is Substrate.DIND_SYSBOX and not reader_dist_present():
+            raise ValidationError(
+                "no cached reader dist — run `research reader pull` first")
         return cls(
             name=_require_name(kw.get("name")),
             workflow=workflow_id,
@@ -743,14 +761,16 @@ class BoxPresetsRequest:
 # `port`/`label` act on the project's own supervisor netns — neither is
 # host-shaped, so both are broker-relayable. The TCP port space is the OS/protocol
 # bound (1-65535), not an invented cap. Reserved: the supervisor's own ssh (22) +
-# editor-stub (8443) ports and the per-box editor publish range (8500-8599) —
-# registering one would synthesize a confusing duplicate tab onto a netns port the
-# webui already serves. Lockstep: 22 == services.SERVICES["supervisor"].default_port;
-# 8443 == services.SERVICES["code-server"].default_port; 8500-8599 ==
+# editor-stub (8443) + reader (8445) ports and the per-box editor publish range
+# (8500-8599) — registering one would synthesize a confusing duplicate tab onto a
+# netns port the webui already serves. Lockstep: 22 ==
+# services.SERVICES["supervisor"].default_port; 8443 ==
+# services.SERVICES["code-server"].default_port; 8445 ==
+# services.SERVICES["reader"].default_port == READER_PORT; 8500-8599 ==
 # rs_sandbox.BOX_EDITOR_PORT_LO/HI.
 _PORT_MIN = 1
 _PORT_MAX = 65535
-_EXPORT_RESERVED_PORTS = frozenset({22, 8443})
+_EXPORT_RESERVED_PORTS = frozenset({22, 8443, 8445})
 _EXPORT_BOX_EDITOR_PORT_LO = 8500
 _EXPORT_BOX_EDITOR_PORT_HI = 8599  # inclusive
 
@@ -769,7 +789,7 @@ def _coerce_export_port(value: Any) -> int:
         raise ValidationError(f"port must be between {_PORT_MIN} and {_PORT_MAX}")
     if port in _EXPORT_RESERVED_PORTS:
         raise ValidationError(
-            f"port {port} is reserved (the supervisor's ssh / editor ports)")
+            f"port {port} is reserved (the supervisor's ssh / editor / reader ports)")
     if _EXPORT_BOX_EDITOR_PORT_LO <= port <= _EXPORT_BOX_EDITOR_PORT_HI:
         raise ValidationError(
             f"port {port} is reserved for box editors "
@@ -1163,6 +1183,12 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             if editor_dist_present():
                 _stage_editor_dist(container_name,
                                    deploy_local=service_flags.get("code-server", True))
+            # Reader dist (STAGE_READER): staged when cached so a later live-enable is
+            # deploy-only; deployed now iff the reader flag resolved ON (default off).
+            # The create-time floor guaranteed a dist when reader is enabled.
+            if reader_dist_present():
+                _stage_reader_dist(container_name,
+                                   deploy_local=service_flags.get("reader", False))
             # Box harness (STAGE_DIND_UNIFY — a standing dind utility, no longer an
             # opt-in): stage the rs-sandbox CLI (no longer baked) + deliver the box
             # images (MINT site, push=True; pins were frozen into the marker above).
@@ -1197,6 +1223,11 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             if editor_dist_present():
                 _stage_editor_dist(container_name,
                                    deploy_local=service_flags.get("code-server", True))
+            # Reader dist (STAGE_READER): staged when cached (deploy-only on a later
+            # live-enable); deployed now iff the reader flag resolved ON (default off).
+            if reader_dist_present():
+                _stage_reader_dist(container_name,
+                                   deploy_local=service_flags.get("reader", False))
 
         # 6b/6c. The MCP proxy/reload/auto-allow cone runs for ALL dind now
         #        (STAGE_DIND_UNIFY): research AND sandbox-dind get the proxy so
@@ -1238,16 +1269,22 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
 
         progress.step("wire", "enabling workers")
 
-    # 6e. Editor readiness gate: create reports "ready" only when the editor is
-    #     actually listening, so there's no post-create race where the webui probes
-    #     a not-yet-up editor and shows no Editor tab. code-server is the only http
-    #     service in KNOWN_SERVICES, and it's on CODE_SERVER_STUB_PORT inside
-    #     rs-project-<name> for BOTH substrates. Best-effort (warn + proceed) — a
-    #     slow editor must never fail an otherwise-healthy create.
+    # 6e. Http-service readiness gates: create reports "ready" only when each
+    #     enabled http service is actually listening, so there's no post-create race
+    #     where the webui probes a not-yet-up service and shows no tab. code-server
+    #     (CODE_SERVER_STUB_PORT, both substrates) and reader (READER_PORT, dind-only
+    #     — the docker floor rejects it) are the http services in KNOWN_SERVICES.
+    #     Best-effort (warn + proceed) — a slow service must never fail an otherwise-
+    #     healthy create.
     if service_flags.get("code-server"):
         progress.step("editor", "waiting for editor")
-        if not _wait_for_editor_ready(container_name):
+        if not _wait_for_service_ready(container_name, CODE_SERVER_STUB_PORT):
             print(f"warning: editor not listening on :{CODE_SERVER_STUB_PORT} after "
+                  f"{EDITOR_READY_TIMEOUT_S}s; it should come up shortly")
+    if service_flags.get("reader"):
+        progress.step("reader", "waiting for reader")
+        if not _wait_for_service_ready(container_name, READER_PORT):
+            print(f"warning: reader not listening on :{READER_PORT} after "
                   f"{EDITOR_READY_TIMEOUT_S}s; it should come up shortly")
 
     # 7. Return result (the front-end formats the report from this).
@@ -1460,14 +1497,20 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
             die(str(e))
 
     workspace_path = workspace_path_for(project, cfg)
-    # A code-server-only flip on a dind supervisor is deployed LIVE (docker exec),
-    # skipping the multi-minute _recreate_supervisor. (Docker already returned via
-    # _update_docker_substrate at the gate above.) Same gate shape as that path.
+    # A code-server-only OR reader-only flip on a dind supervisor is deployed LIVE
+    # (docker exec), skipping the multi-minute _recreate_supervisor. (Docker already
+    # returned via _update_docker_substrate at the gate above.) A MIXED flip
+    # ({"code-server","reader"}) falls through to the full recreate, which stages +
+    # deploys per the resolved flags and clears both overrides — no live path needed.
     touched = _parse_service_list(enable_services) | _parse_service_list(disable_services)
-    if (not req.rebuild and not enable_workers and not disable_workers
-            and not req.role_mcp_upstream and touched == {"code-server"}):
+    live_ok = (not req.rebuild and not enable_workers and not disable_workers
+               and not req.role_mcp_upstream)
+    if live_ok and touched == {"code-server"}:
         enable = "code-server" in _parse_service_list(enable_services)
         return _live_toggle_editor(project, cfg, container, workspace_path, enable, progress)
+    if live_ok and touched == {"reader"}:
+        enable = "reader" in _parse_service_list(enable_services)
+        return _live_toggle_reader(project, cfg, container, workspace_path, enable, progress)
 
     if req.rebuild:
         progress.step("rebuild", "rebuilding images")
@@ -1646,6 +1689,9 @@ VERSION_SOURCES: dict[str, dict[str, str]] = {
     "PLAYWRIGHT_MCP_VERSION": {"kind": "npm", "pkg": "@playwright/mcp"},
     "PYYAML_VERSION": {"kind": "pypi", "pkg": "PyYAML"},
     "AIOHTTP_VERSION": {"kind": "pypi", "pkg": "aiohttp"},
+    # Reader dist pins (STAGE_READER) — nbconvert + markdown, dist-pin-only.
+    "NBCONVERT_VERSION": {"kind": "pypi", "pkg": "nbconvert"},
+    "MARKDOWN_LIB_VERSION": {"kind": "pypi", "pkg": "Markdown"},
     "DOCKER_VERSION": {
         "kind": "manual",
         "url": "https://download.docker.com/linux/static/stable/x86_64/",
@@ -1689,8 +1735,21 @@ VERSION_SOURCES: dict[str, dict[str, str]] = {
 # disabling it would brick the project. New service kinds extend both
 # lists in the same commit that ships the entrypoint conditional and the
 # registry entry.
-KNOWN_SERVICES: list[str] = ["supervisor", "code-server"]
+KNOWN_SERVICES: list[str] = ["supervisor", "code-server", "reader"]
 ALWAYS_ON_SERVICES: set[str] = {"supervisor"}
+# Services whose create-time default is OFF (STAGE_READER). Everything else
+# defaults ON. `reader` (the mobile artifact reader) is opt-in — most projects
+# won't want it, and it costs a pip-tree dist to be present. `_service_default`
+# is the SINGLE source of the missing-label default, used at every site that
+# resolves a flag from an absent label / setdefault so the "missing = on-create
+# default" invariant stays true for a default-off service too.
+DEFAULT_OFF_SERVICES: set[str] = {"reader"}
+
+
+def _service_default(sid: str) -> bool:
+    """The create-time default for a service with no explicit --enable/--disable:
+    ON unless it's in DEFAULT_OFF_SERVICES."""
+    return sid not in DEFAULT_OFF_SERVICES
 SERVICE_LABEL_PREFIX = "research.service."
 
 # In-supervisor ports for code-server's lazy-start stub. The stub listens on
@@ -1700,6 +1759,12 @@ SERVICE_LABEL_PREFIX = "research.service."
 # inside their own network namespace, no contention possible.
 CODE_SERVER_STUB_PORT = 8443
 CODE_SERVER_UPSTREAM_PORT = 8444
+
+# In-supervisor port for the reader service (STAGE_READER). Same single-tenant
+# reasoning as the code-server stub ports — one port on the supervisor netns the
+# webui reaches via container DNS; the reader server (no lazy-start stub) listens
+# here directly. Distinct from 8443/8444 and outside the box-editor 8500-8599 range.
+READER_PORT = 8445
 
 # ---------------------------------------------------------------------------
 # Generic helpers
@@ -1952,19 +2017,21 @@ def wait_for_inner_dockerd(container: str, timeout: int = 60) -> None:
 EDITOR_READY_TIMEOUT_S = 60
 
 
-def _wait_for_editor_ready(container: str, timeout: int = EDITOR_READY_TIMEOUT_S) -> bool:
-    """Poll until the code-server stub is LISTENING on CODE_SERVER_STUB_PORT inside
-    ``container``. The stub launches asynchronously to create() — the docker box
-    deploys it in the entrypoint boot (after `docker run` returns), dind via the
-    deploy's `nohup` stub — so create otherwise returns before the editor is up and
-    the webui probes a not-yet-listening port. Best-effort: returns True once it's
-    listening, or False after ``timeout`` (the caller warns and proceeds rather than
-    failing a create over a slow editor; the container is healthy and the webui
-    re-probes on activation)."""
+def _wait_for_service_ready(container: str, port: int = CODE_SERVER_STUB_PORT,
+                            timeout: int = EDITOR_READY_TIMEOUT_S) -> bool:
+    """Poll until something is LISTENING on ``port`` inside ``container`` — the
+    code-server stub on CODE_SERVER_STUB_PORT, or the reader server on READER_PORT.
+    These http services launch asynchronously to create() (the docker box in its
+    entrypoint boot after `docker run` returns; dind via a deploy's `nohup`), so
+    create otherwise returns before the port is up and the webui probes a
+    not-yet-listening port. Best-effort: returns True once it's listening, or False
+    after ``timeout`` (the caller warns and proceeds rather than failing a create
+    over a slow service; the container is healthy and the webui re-probes on
+    activation)."""
     import time
 
     deadline = time.time() + timeout
-    check = f"ss -ltn 2>/dev/null | grep -q ':{CODE_SERVER_STUB_PORT}'"
+    check = f"ss -ltn 2>/dev/null | grep -q ':{port}'"
     while time.time() < deadline:
         if run(["docker", "exec", container, "sh", "-c", check],
                capture_output=True).returncode == 0:
@@ -2165,7 +2232,11 @@ def build_supervisor_docker_args(
     # (`${RS_SERVICE_CODE-SERVER}` parses as `$RS_SERVICE_CODE` minus `SERVICE`),
     # and every reader (the entrypoints, rs_sandbox's os.environ lookup) uses the
     # underscore form. The LABEL keeps the canonical hyphenated id.
-    flags = service_flags if service_flags is not None else {sid: True for sid in KNOWN_SERVICES}
+    # Defensive fallback (all current callers pass explicit flags): default each
+    # service to its create-time default so this dead path can't stamp
+    # RS_SERVICE_READER=enabled on a container that didn't ask for the reader.
+    flags = (service_flags if service_flags is not None
+             else {sid: _service_default(sid) for sid in KNOWN_SERVICES})
     for sid in sorted(flags):
         ena = "enabled" if flags[sid] else "disabled"
         env_name = "RS_SERVICE_" + sid.upper().replace("-", "_")
@@ -2359,6 +2430,26 @@ EDITOR_DIST_MOUNT = "/opt/editor-dist"
 EDITOR_DIST_MOUNT_ARGS = ["-v", f"{EDITOR_DIST_MOUNT}:{EDITOR_DIST_MOUNT}:ro"]
 _CODE_SERVER_BIN = "code-server"
 _CODE_SERVER_VERSION_KEY = "CODE_SERVER_VERSION"
+
+# ---- reader dist (nbconvert + markdown) — STAGE_READER ---------------------
+# The mobile artifact reader supervisor service. A host-cached pip-tree dist
+# (nbconvert + markdown + the reader server/deploy scripts) STAGED into a
+# reader-enabled supervisor at boot, like the editor dist. Supervisor-only in v1
+# (the reader is research-workflow-shaped; docker boxes are rejected at create),
+# so there is no RO `-v` mount into inner containers and no MOUNT_ARGS. Unlike the
+# editor's self-contained node bundle, a pip tree is CPython-ABI-coupled — the dist
+# records the build ABI (sidecar + an in-tree PYTHON_ABI file) and reader-deploy.sh
+# fails loud on a mismatch (see that script).
+READER_DIST_DIR = Path.home() / ".research-sandbox" / "reader-dist"
+READER_DIST_MOUNT = "/opt/reader-dist"
+_READER_BIN = "jupyter-nbconvert"   # console script present iff nbconvert installed
+_NBCONVERT_VERSION_KEY = "NBCONVERT_VERSION"
+_MARKDOWN_VERSION_KEY = "MARKDOWN_LIB_VERSION"
+# The conda interpreter every miniconda3-lineage container carries + that
+# reader-server.py's shebang targets. The reader dist is built AND ABI-guarded
+# against THIS interpreter, never bare `python3` (which is the system python under
+# a login shell — no pip, different minor). Same literal in reader-deploy.sh.
+_CONDA_PY = "/opt/conda/bin/python"
 
 # Tier-2 extension prune — MUST mirror agent/Dockerfile.minimal-base's strip list
 # until slice 2 deletes the bake (the dist and the bake should ship the same
@@ -3011,16 +3102,28 @@ def _stage_editor_dist(supervisor: str, *, deploy_local: bool = False) -> None:
     binary or launch the stub. The sandbox-dind management supervisor passes
     deploy_local=False — it deploys NO editor of its own (its boxes RO-mount the
     staged dist and deploy theirs); staging still runs so that mount is populated."""
-    src = EDITOR_DIST_DIR
     if not editor_dist_present():
         die("no cached editor dist to stage — run `research editor pull` first")
+    _stage_dist_tree(supervisor, EDITOR_DIST_DIR, EDITOR_DIST_MOUNT, "editor")
+    if deploy_local:
+        _deploy_supervisor_editor(supervisor)
 
+
+def _stage_dist_tree(supervisor: str, src: Path, mount: str, label: str) -> None:
+    """Stream a host dist tree into a RUNNING supervisor as uid-0 — the shared
+    tar-over-stdin core of `_stage_editor_dist` / `_stage_reader_dist`. Mirrors
+    `_stage_agent_dist`'s uid-0 tar stream (the sysbox-uid-shift + docker-cp-nesting
+    dragons; see that helper): build the archive normalized to uid/gid 0 and stream
+    it into the container's `tar -x` via `docker exec -i` stdin (no host temp file,
+    no `docker cp` of a tree we'd then need to chown/rm), extract to `mount`, chown
+    to 1000:1000. `stdout→DEVNULL` so the large stdin write can't deadlock on
+    backpressure. `label` names the dist in the failure message only."""
     def _root_owned(ti: tarfile.TarInfo) -> tarfile.TarInfo:
         ti.uid = ti.gid = 0
         ti.uname = ti.gname = ""
         return ti
-    extract = (f"rm -rf {EDITOR_DIST_MOUNT} && mkdir -p {EDITOR_DIST_MOUNT} && "
-               f"tar -C {EDITOR_DIST_MOUNT} -x && chown -R 1000:1000 {EDITOR_DIST_MOUNT}")
+    extract = (f"rm -rf {mount} && mkdir -p {mount} && "
+               f"tar -C {mount} -x && chown -R 1000:1000 {mount}")
     proc = subprocess.Popen(
         ["docker", "exec", "-i", "-u", "0", supervisor, "sh", "-c", extract],
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -3034,10 +3137,228 @@ def _stage_editor_dist(supervisor: str, *, deploy_local: bool = False) -> None:
     _, err = proc.communicate()
     if proc.returncode != 0:
         detail = (err.decode(errors="replace") if err else "").strip()
-        die(f"staging editor dist into {supervisor} failed: "
+        die(f"staging {label} dist into {supervisor} failed: "
             f"{detail or 'tar extract returned non-zero'}")
+
+
+# ---- reader dist (nbconvert + markdown) — the artifact-reader service twin --
+# Mirrors the editor dist lane (build in a throwaway rs-minimal-base, swap into the
+# host cache, stage into a running supervisor), differing only where a pip tree
+# differs from a node bundle: it captures the build's CPython ABI so reader-deploy.sh
+# can fail loud on a base-image Python bump instead of a silent import crash.
+
+def _reader_sidecar() -> Path:
+    return READER_DIST_DIR.parent / "reader-dist.json"
+
+
+def reader_dist_present() -> bool:
+    """True iff a usable reader dist is cached. lexists mirrors the editor/agent
+    dists — a pip console script may be a symlink; an inode compare is meaningless
+    host-side."""
+    return os.path.lexists(READER_DIST_DIR / ".local" / "bin" / _READER_BIN)
+
+
+def _reader_build_dist(nbconvert_ver: str, markdown_ver: str) -> None:
+    """Build the reader dist IN a throwaway rs-minimal-base container and swap it
+    into the host cache (STAGE_READER). Fixed tree:
+        .local/                  -- `pip install --user` (nbconvert + markdown)
+        tools/reader-server.py   -- the stdlib http reader
+        tools/reader-deploy.sh   -- the ABI-guarded deploy
+        PYTHON_ABI               -- "3.X" the build ran against (the ABI-guard source)
+    The pip install runs in-container (network); the two scripts are repo files
+    copied host-side (self-contained build). pip console scripts carry an absolute
+    `/opt/conda/bin/python` shebang, uniform across the whole miniconda3 lineage, so
+    NO launcher relativization is needed (unlike the symlink-launcher agent/editor
+    dists) — the only home-coupling a pip tree has is its site-packages Python-minor
+    dir, which the PYTHON_ABI guard covers."""
+    for v in (nbconvert_ver, markdown_ver):
+        if not _AGENT_VERSION_RE.match(v):
+            die(f"refusing to build reader dist with suspicious version {v!r}")
+    if not run_quiet(["docker", "image", "inspect", MINIMAL_BASE_IMAGE]):
+        die(f"{MINIMAL_BASE_IMAGE} not found — run `research start --rebuild` first")
+    sup_dir = SCRIPT_DIR / "container" / "supervisor"
+    server_src = sup_dir / "reader-server.py"
+    deploy_src = sup_dir / "reader-deploy.sh"
+    for p in (server_src, deploy_src):
+        if not p.is_file():
+            die(f"reader dist build: missing repo file {p}")
+    READER_DIST_DIR.parent.mkdir(parents=True, exist_ok=True)
+    tmp: Path | None = Path(tempfile.mkdtemp(dir=str(READER_DIST_DIR.parent)))
+    py_abi = ""
+    try:
+        # set -e + pipefail (mirror _editor_build_dist) so a pip failure aborts with a
+        # NAMED error instead of an empty capture that fails opaquely after retries.
+        # Use the CONDA python explicitly (`/opt/conda/bin/python`), NOT bare
+        # `python3`: under `su - research` the login PATH resolves `python3` to the
+        # system `/usr/bin/python3`, which has no pip AND is a different minor than
+        # the interpreter reader-server.py runs under (its shebang is
+        # /opt/conda/bin/python). Both the install and the ABI capture must be that
+        # conda interpreter so the captured tree + the recorded ABI agree with the
+        # runtime, and the deploy-side guard compares against the same interpreter.
+        inner = (
+            "set -e; set -o pipefail; "
+            f"{_CONDA_PY} -m pip install --user --no-warn-script-location "
+            f"nbconvert=={nbconvert_ver} markdown=={markdown_ver}; "
+            f"test -x ~/.local/bin/{_READER_BIN}; "
+            "cp -a ~/.local /out/.local; "
+            f"{_CONDA_PY} -c 'import sys; print(\"%d.%d\" % sys.version_info[:2])' > /out/PYTHON_ABI")
+        script = (f"set -e; set -o pipefail; su - research -c {shlex.quote(inner)}; "
+                  f"chown -R {os.getuid()}:{os.getgid()} /out")
+        captured_local = tmp / ".local"
+        abi_file = tmp / "PYTHON_ABI"
+        built, last_err = False, ""
+        for _ in range(_AGENT_BUILD_ATTEMPTS):
+            r = run(["docker", "run", "--rm", "-v", f"{tmp}:/out",
+                     MINIMAL_BASE_IMAGE, "sh", "-lc", script], capture_output=True)
+            if (r.returncode == 0
+                    and os.path.lexists(captured_local / "bin" / _READER_BIN)
+                    and abi_file.is_file() and abi_file.read_text().strip()):
+                built = True
+                break
+            last_err = ((r.stderr or "") + (r.stdout or "")).strip()
+            shutil.rmtree(captured_local, ignore_errors=True)
+            if abi_file.exists():
+                abi_file.unlink()
+        if not built:
+            die(f"reader dist build failed after {_AGENT_BUILD_ATTEMPTS} attempts:\n"
+                f"{last_err[-_AGENT_ERR_TAIL:] or 'no output'}")
+        py_abi = abi_file.read_text().strip()
+        (tmp / "tools").mkdir()
+        for src in (server_src, deploy_src):
+            dst = tmp / "tools" / src.name
+            shutil.copy2(src, dst)
+            os.chmod(dst, 0o755)   # entrypoint runs the deploy; server is nohup'd by it
+        if READER_DIST_DIR.exists():
+            shutil.rmtree(READER_DIST_DIR)
+        os.replace(tmp, READER_DIST_DIR)   # same fs (mkdtemp under the parent)
+        tmp = None                         # moved into place; skip the finally rmtree
+    finally:
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
+    _reader_sidecar().write_text(json.dumps(
+        {"nbconvert_version": nbconvert_ver, "markdown_version": markdown_ver,
+         "python": py_abi,
+         "pulled_at": datetime.datetime.now(datetime.timezone.utc).isoformat()},
+        indent=2) + "\n")
+
+
+def reader_pull(nbconvert_ver: str | None = None, markdown_ver: str | None = None,
+                progress=None) -> dict:
+    """Pull the reader dist at (versions or the effective pins) into the cache.
+    `progress` gets a coarse view-log milestone; the raw build streams to the
+    host-only full log."""
+    progress = progress or _NULL_PROGRESS
+    v = load_versions()
+    nb = nbconvert_ver or v.get(_NBCONVERT_VERSION_KEY)
+    md = markdown_ver or v.get(_MARKDOWN_VERSION_KEY)
+    if not nb:
+        die(f"no pinned {_NBCONVERT_VERSION_KEY} in versions.env")
+    if not md:
+        die(f"no pinned {_MARKDOWN_VERSION_KEY} in versions.env")
+    progress.step("build-dist", f"building reader dist (nbconvert {nb}, markdown {md})")
+    _reader_build_dist(nb, md)
+    return {"nbconvert_version": nb, "markdown_version": md,
+            "path": str(READER_DIST_DIR)}
+
+
+def reader_show() -> dict:
+    """The cached reader dist's sidecar, or {} if none pulled yet."""
+    if not reader_dist_present():
+        return {}
+    try:
+        return json.loads(_reader_sidecar().read_text())
+    except Exception:
+        return {"nbconvert_version": "?"}
+
+
+def _reader_resolve_latest() -> str:
+    """LIGHT resolve of nbconvert's latest PyPI version (no install). Reads the
+    PyPI JSON with in-container curl + python3 (no host jq / no host tool) and
+    bounds the wait with `--max-time` (the same footgun-avoidance as the editor
+    resolver). nbconvert is the reader's primary pin; markdown is a bundled pin
+    bumped by hand + `research reader pull`, mirroring the editor's bundled
+    extensions."""
+    if not run_quiet(["docker", "image", "inspect", MINIMAL_BASE_IMAGE]):
+        die(f"{MINIMAL_BASE_IMAGE} not found — run `research start --rebuild` first")
+    r = run(["docker", "run", "--rm", MINIMAL_BASE_IMAGE, "sh", "-lc",
+             f"curl -fsSL --max-time {_UPSTREAM_RESOLVE_MAX_TIME_S} "
+             "https://pypi.org/pypi/nbconvert/json "
+             "| python3 -c 'import sys,json; print(json.load(sys.stdin)[\"info\"][\"version\"])'"],
+            capture_output=True)
+    if r.returncode != 0:
+        die(f"could not resolve upstream nbconvert version: "
+            f"{(r.stderr or '').strip() or 'fetch failed'}")
+    ver = (r.stdout or "").strip()
+    if not _AGENT_VERSION_RE.match(ver) or not ver[:1].isdigit():
+        die(f"upstream returned an unexpected version string: {ver!r}")
+    return ver
+
+
+def reader_refresh_check() -> tuple[str, str]:
+    """Side-effect-free: (current NBCONVERT_VERSION pin, upstream latest)."""
+    current = load_versions().get(_NBCONVERT_VERSION_KEY, "")
+    return current, _reader_resolve_latest()
+
+
+def reader_apply_refresh(nbconvert_ver: str) -> None:
+    """Bump the NBCONVERT_VERSION pin in the untracked versions.local.env override
+    (never the tracked base) AND rebuild the dist at it (markdown stays at its own
+    pin). The prompt/confirm is the front-end's job."""
+    _set_version_pin(_NBCONVERT_VERSION_KEY, nbconvert_ver)
+    v = load_versions()
+    _reader_build_dist(nbconvert_ver, v.get(_MARKDOWN_VERSION_KEY, ""))
+
+
+def reader_refresh(progress=None) -> dict:
+    """Build-lane refresh for the reader dist — the twin of editor_refresh. Resolve
+    upstream nbconvert, and if newer than the effective NBCONVERT_VERSION pin, bump
+    the untracked override + rebuild. Re-resolves child-side (no client version
+    crosses); up-to-date is equality-only and points at Pull for a stale cached
+    dist. Milestones carry only the _AGENT_VERSION_RE-guarded version."""
+    progress = progress or _NULL_PROGRESS
+    progress.step("resolve", "resolving upstream nbconvert version")
+    current, latest = reader_refresh_check()
+    if current == latest:
+        progress.step("uptodate", f"pin already at upstream {latest} — "
+                      "use Pull to (re)build the dist")
+        return {"nbconvert_version": latest, "bumped": False}
+    progress.step("bump", f"bumping pin to {latest}")
+    reader_apply_refresh(latest)
+    return {"nbconvert_version": latest, "bumped": True}
+
+
+def _deploy_supervisor_reader(container: str) -> None:
+    """Run the reader deploy script in a RUNNING supervisor (cp the dist into
+    ~/.local, launch reader-server on 8445) — shared by `_stage_reader_dist`'s
+    deploy_local and the live reader toggle. Assumes /opt/reader-dist is staged.
+    HOME pinned absolute (cross-boundary-path rule); the nohup'd server reparents
+    under tini when the exec session closes."""
+    run_check(["docker", "exec", "-e", "HOME=/home/research", container,
+               "bash", f"{READER_DIST_MOUNT}/tools/reader-deploy.sh"])
+
+
+def _reader_dist_staged_in(container: str) -> bool:
+    """True iff the reader dist is already staged in the supervisor (staged at
+    create regardless of the flag; only the deploy is flag-gated). Lets the live
+    toggle skip the re-stage and deploy-only."""
+    return run(["docker", "exec", container, "test", "-e",
+                f"{READER_DIST_MOUNT}/.local/bin/{_READER_BIN}"],
+               capture_output=True).returncode == 0
+
+
+def _stage_reader_dist(supervisor: str, *, deploy_local: bool = False) -> None:
+    """Stage the host reader dist into a RUNNING supervisor (STAGE_READER). Real
+    files at READER_DIST_MOUNT via the shared uid-0 tar stream. `deploy_local` ALSO
+    deploys the reader into the supervisor's OWN ~/.local + launches the server (the
+    supervisor entrypoint ran BEFORE this post-start staging, so its dist block saw
+    an empty mount and no-op'd — this exec brings the server up). Gated on the
+    RESOLVED reader flag by the caller (reader-deploy.sh does not re-check
+    RS_SERVICE_READER)."""
+    if not reader_dist_present():
+        die("no cached reader dist to stage — run `research reader pull` first")
+    _stage_dist_tree(supervisor, READER_DIST_DIR, READER_DIST_MOUNT, "reader")
     if deploy_local:
-        _deploy_supervisor_editor(supervisor)
+        _deploy_supervisor_reader(supervisor)
 
 
 def _image_build_specs() -> list:
@@ -3196,6 +3517,22 @@ def software_status() -> dict:
                         and ed_ver == ed_pin),
     }
 
+    # Reader dist (STAGE_READER). nbconvert is the primary pin (what `reader refresh`
+    # resolves); markdown rides as a bundled pin. Staleness keys on the nbconvert pin.
+    rd = reader_show() or {}
+    rd_ver = rd.get("nbconvert_version")
+    rd_pin = effective.get(_NBCONVERT_VERSION_KEY)
+    reader = {
+        "present": reader_dist_present(),
+        "cached_version": rd_ver,
+        "markdown_version": rd.get("markdown_version"),
+        "python": rd.get("python"),
+        "pulled_at": rd.get("pulled_at"),
+        "effective_pin": rd_pin,
+        "matches_pin": (rd_ver is not None and rd_pin is not None
+                        and rd_ver == rd_pin),
+    }
+
     # One `docker info` probe distinguishes "docker unreachable" (whole fleet
     # renders as one honest banner) from "image genuinely absent" (per-row). Guard
     # it: a missing docker binary raises FileNotFoundError from run_quiet, which
@@ -3217,6 +3554,7 @@ def software_status() -> dict:
         "docker_ok": docker_ok,
         "agents": agents,
         "editor": editor,
+        "reader": reader,
         "images": images,
         "pins": pins,
     }
@@ -3426,9 +3764,11 @@ def _read_supervisor_metadata(container: str) -> dict:
     service_flags: dict[str, bool] = {}
     for sid in KNOWN_SERVICES:
         v = labels.get(f"{SERVICE_LABEL_PREFIX}{sid}")
-        # Missing label (legacy projects) defaults to enabled, which matches
-        # the on-create default. ALWAYS_ON_SERVICES are forced True regardless.
-        service_flags[sid] = (v != "disabled")
+        # A missing label (legacy projects, or a newer service absent at create)
+        # falls back to the service's create-time default via _service_default —
+        # ON for most, OFF for DEFAULT_OFF_SERVICES (reader). ALWAYS_ON_SERVICES
+        # are forced True regardless below.
+        service_flags[sid] = _service_default(sid) if v is None else (v != "disabled")
     for sid in ALWAYS_ON_SERVICES:
         service_flags[sid] = True
 
@@ -3604,6 +3944,10 @@ def _recreate_supervisor(
         _stage_agent_dist(container)
         if editor_dist_present():
             _stage_editor_dist(container, deploy_local=flags.get("code-server", True))
+        # Reader dist re-staged (STAGE_READER): survives the recreate so a
+        # reader-enabled project's tab comes back; deploy_local on the resolved flag.
+        if reader_dist_present():
+            _stage_reader_dist(container, deploy_local=flags.get("reader", False))
         # Box harness is a standing dind utility (STAGE_DIND_UNIFY — no --with-boxes
         # gate): re-stage rs-sandbox (no bake) + re-deliver the box images for every
         # sandbox-dind recreate.
@@ -3636,6 +3980,10 @@ def _recreate_supervisor(
         if editor_dist_present():
             _stage_editor_dist(container,
                                deploy_local=flags.get("code-server", True))
+        # Reader dist re-staged (STAGE_READER): survives the recreate so a
+        # reader-enabled research project's tab comes back; deploy on resolved flag.
+        if reader_dist_present():
+            _stage_reader_dist(container, deploy_local=flags.get("reader", False))
     stage_worker_image(container, MCP_PROXY_IMAGE, force=force_restage)
 
     run(["docker", "exec", container, "/usr/local/bin/mcp-reload"],
@@ -3842,6 +4190,34 @@ def _live_toggle_editor(project: str, cfg: "Config", container: str,  # type: ig
              "pkill -f code-server-stub.py; pkill -x code-server || true"],
             capture_output=True)
     _write_service_override(workspace_path, "code-server", enable)
+    return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
+                        workers_enabled=[], workers_disabled=[])
+
+
+def _live_toggle_reader(project: str, cfg: "Config", container: str,  # type: ignore[name-defined]
+                        workspace_path: Path, enable: bool, progress) -> "UpdateResult":  # type: ignore[name-defined]
+    """Enable/disable the reader on a RUNNING dind supervisor WITHOUT recreating
+    (STAGE_READER) — the twin of `_live_toggle_editor`: deploy the reader live (it's
+    already staged at /opt/reader-dist; only the deploy was skipped when off) or kill
+    its server. The choice persists to the service-override file so a later
+    recreate/start honors it (the docker label is immutable on a running container)."""
+    if enable:
+        if not reader_dist_present():
+            die("no reader dist cached — run `research reader pull` first")
+        progress.step("deploy", "deploying the reader")
+        print(f"=== {project}: deploying the reader (live) ===")
+        if _reader_dist_staged_in(container):     # common case: staged at create
+            _deploy_supervisor_reader(container)
+        else:                                     # host had no dist at create
+            _stage_reader_dist(container, deploy_local=True)
+    else:
+        progress.step("disable", "removing the reader")
+        print(f"=== {project}: removing the reader (live) ===")
+        # Kill the reader server (supervisor PID ns only).
+        run(["docker", "exec", container, "sh", "-c",
+             "pkill -f reader-server.py || true"],
+            capture_output=True)
+    _write_service_override(workspace_path, "reader", enable)
     return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
                         workers_enabled=[], workers_disabled=[])
 
@@ -5046,7 +5422,7 @@ def _compute_service_flags(
 
     flags: dict[str, bool] = dict(base) if base else {}
     for sid in KNOWN_SERVICES:
-        flags.setdefault(sid, True)
+        flags.setdefault(sid, _service_default(sid))
     for sid in disable:
         flags[sid] = False
     for sid in enable:
@@ -5058,11 +5434,14 @@ def _compute_service_flags(
 
 def _read_service_flags(container: str) -> dict[str, bool]:
     """Recover per-service flags from a supervisor's existing labels.
-    Missing labels (legacy projects) default to enabled. Used by
-    `_recreate_supervisor` so a bare `project update` preserves prior
+    A missing label (legacy projects, or a service that didn't exist when the
+    container was created) falls back to the service's create-time default via
+    `_service_default` — ON for most, OFF for DEFAULT_OFF_SERVICES (reader) — so
+    the "missing == on-create default" invariant holds for default-off services
+    too. Used by `_recreate_supervisor` so a bare `project update` preserves prior
     --enable/--disable choices."""
     if not container_exists(container):
-        return {sid: True for sid in KNOWN_SERVICES}
+        return {sid: _service_default(sid) for sid in KNOWN_SERVICES}
     r = run(["docker", "inspect", container, "-f",
              "{{json .Config.Labels}}"], capture_output=True)
     try:
@@ -5072,7 +5451,8 @@ def _read_service_flags(container: str) -> dict[str, bool]:
     out: dict[str, bool] = {}
     for sid in KNOWN_SERVICES:
         v = labels.get(f"{SERVICE_LABEL_PREFIX}{sid}")
-        out[sid] = (v != "disabled")  # missing or "enabled" => True
+        # "enabled"/"disabled" are authoritative; a missing label → the default.
+        out[sid] = _service_default(sid) if v is None else (v != "disabled")
     for sid in ALWAYS_ON_SERVICES:
         out[sid] = True
     return out

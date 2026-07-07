@@ -108,6 +108,16 @@ if [[ "${RS_SERVICE_CODE_SERVER:-enabled}" == "enabled" ]] \
     bash /opt/editor-dist/tools/code-server-deploy.sh || true
 fi
 
+# --- reader (dist) — STAGE_READER. Default OFF; same first-boot no-op shape as
+#     the editor block (deploy runs post-start via _stage_reader_dist deploy_local;
+#     this block covers a restart with an already-populated mount). Reader surfaces
+#     mostly-empty listings on sandbox-dind (few research artifact roots) — that's
+#     the deferred-tailoring degradation, not a bug.
+if [[ "${RS_SERVICE_READER:-disabled}" == "enabled" ]] \
+   && [[ -e /opt/reader-dist/.local/bin/jupyter-nbconvert ]]; then
+    bash /opt/reader-dist/tools/reader-deploy.sh || true
+fi
+
 echo "=== Sandbox-dind ready ==="
 echo "Workspace:    /workspace"
 echo "Agent:        run \`claude\` in this tab (locked egress; inner Docker available)"

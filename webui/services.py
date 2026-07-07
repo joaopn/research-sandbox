@@ -29,6 +29,20 @@ SERVICES = {
         "default_port": 8443,
         "upstream_path": "/",
     },
+    # The mobile artifact reader (STAGE_READER) — a read-only markdown/notebook
+    # viewer over the project's artifact surfaces, default OFF (opt-in via
+    # `--enable reader` / the create tickbox). http like the editor: probe-gated on
+    # READER_PORT (rscore) and served on its own origin port. Research-workflow only
+    # (rejected on the docker substrate at create); on sandbox-dind it degrades to
+    # mostly-empty listings.
+    "reader": {
+        "label": "Reader",
+        "kind": "http",
+        "always_on": False,
+        "renderer": "iframe",
+        "default_port": 8445,
+        "upstream_path": "/",
+    },
     # The supervisor's interactive Claude session, attached via SSH +
     # byobu. The new-session lands in bash (NON-login, as before) after
     # cat-ing the workflow greeting if one was staged (STAGE_SPAWN_GREETING):

@@ -549,8 +549,8 @@ async def broker_workflows_handler(request: web.Request) -> web.Response:
 
 
 async def broker_software_handler(request: web.Request) -> web.Response:
-    """GET /broker/software — read-only status of the host's agent/editor dists,
-    the built image fleet, and the effective version pins (gated). Mirrors
+    """GET /broker/software — read-only status of the host's agent/editor/reader
+    dists, the built image fleet, and the effective version pins (gated). Mirrors
     /broker/workflows: a no-args broker read; the SameSite=Strict cookie is the
     CSRF defense. The per-dist refresh preview + apply are separate endpoints
     (/broker/software/refresh-check and /broker/software/build)."""
@@ -563,8 +563,9 @@ async def broker_software_handler(request: web.Request) -> web.Response:
 # agent_pull/agent_refresh carry the agent enum. agent_refresh/editor_refresh
 # bump the untracked override pin + rebuild (they re-resolve the upstream version
 # child-side — no client-supplied version crosses).
-_BUILD_VERBS = frozenset({"agent_pull", "editor_pull",
-                          "agent_refresh", "editor_refresh", "rebuild"})
+_BUILD_VERBS = frozenset({"agent_pull", "editor_pull", "reader_pull",
+                          "agent_refresh", "editor_refresh", "reader_refresh",
+                          "rebuild"})
 
 
 async def broker_build_handler(request: web.Request) -> web.Response:
@@ -618,7 +619,8 @@ async def broker_build_handler(request: web.Request) -> web.Response:
 # The fixed set of dist-refresh PREVIEW verbs the browser may request. Reads that
 # resolve a dist's upstream `latest`; the APPLY (bump+rebuild) is a _BUILD_VERBS
 # op which re-resolves child-side, so this preview value never feeds the apply.
-_REFRESH_CHECK_VERBS = frozenset({"agent_refresh_check", "editor_refresh_check"})
+_REFRESH_CHECK_VERBS = frozenset({"agent_refresh_check", "editor_refresh_check",
+                                  "reader_refresh_check"})
 
 
 async def broker_refresh_check_handler(request: web.Request) -> web.Response:

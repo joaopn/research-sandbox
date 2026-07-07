@@ -409,6 +409,47 @@ def cmd_editor_refresh(args: argparse.Namespace) -> None:
           "(untracked; no commit needed)")
 
 
+def cmd_reader_pull(args: argparse.Namespace) -> None:
+    res = rscore.reader_pull()
+    print(f"pulled reader dist (nbconvert {res['nbconvert_version']}, "
+          f"markdown {res['markdown_version']}) → {res['path']}")
+
+
+def cmd_reader_show(args: argparse.Namespace) -> None:
+    s = rscore.reader_show()
+    if not s:
+        print("no reader dist pulled yet — run `research reader pull`")
+        return
+    print(f"  nbconvert {s.get('nbconvert_version', '?')}, "
+          f"markdown {s.get('markdown_version', '?')} "
+          f"(python {s.get('python', '?')}) pulled {s.get('pulled_at', '?')}")
+
+
+def cmd_reader_refresh(args: argparse.Namespace) -> None:
+    """HITL: check upstream nbconvert, offer to bump the local pin + re-pull. The
+    bump (NBCONVERT_VERSION) lands in the untracked versions.local.env override,
+    never the tracked base. markdown is a bundled pin — bump it by hand-editing
+    versions.env, then `research reader pull` (mirrors the editor's extensions)."""
+    current, latest = rscore.reader_refresh_check()
+    if current == latest:
+        print(f"reader: up to date (effective nbconvert pin {current} == upstream {latest})")
+        if not rscore.reader_dist_present():
+            print("  (no dist cached yet — run `research reader pull`)")
+        return
+    print(f"reader: effective NBCONVERT_VERSION {current or '(unset)'} → upstream {latest}")
+    if not args.yes:
+        try:
+            resp = input("bump the pin (writes versions.local.env) + pull it? [y/N] ").strip().lower()
+        except EOFError:
+            resp = "n"
+        if resp not in ("y", "yes"):
+            print("aborted; versions.local.env unchanged")
+            return
+    rscore.reader_apply_refresh(latest)
+    print(f"bumped versions.local.env + pulled reader dist (nbconvert {latest}) "
+          "(untracked; no commit needed)")
+
+
 def cmd_project_attach(args: argparse.Namespace) -> None:
     container = container_name_for(args.name)
     if not container_running(container):
@@ -2104,6 +2145,21 @@ def build_parser() -> argparse.ArgumentParser:
                             help="check upstream; offer to bump the pin + re-pull")
     edr.add_argument("--yes", action="store_true", help="skip the confirm prompt")
     edr.set_defaults(func=cmd_editor_refresh)
+
+    rd = sub.add_parser("reader",
+                        help="host-cached mobile artifact reader (the Reader tab) — "
+                             "nbconvert + markdown dist deployed into reader-enabled "
+                             "supervisors at boot via cp, not baked")
+    rd_sub = rd.add_subparsers(dest="subcommand", required=True)
+    rdp = rd_sub.add_parser("pull",
+                            help="build + cache the versions.env-pinned reader dist")
+    rdp.set_defaults(func=cmd_reader_pull)
+    rds = rd_sub.add_parser("show", help="show the cached reader dist + versions")
+    rds.set_defaults(func=cmd_reader_show)
+    rdr = rd_sub.add_parser("refresh",
+                            help="check upstream nbconvert; offer to bump the pin + re-pull")
+    rdr.add_argument("--yes", action="store_true", help="skip the confirm prompt")
+    rdr.set_defaults(func=cmd_reader_refresh)
 
     wu = sub.add_parser("webui", help="manage the optional browser UI container")
     wu_sub = wu.add_subparsers(dest="webui_action", required=True)

@@ -326,6 +326,11 @@ def _verb_editor_refresh_check(_args: dict, _progress=None) -> dict:
     return {"current": current, "latest": latest}
 
 
+def _verb_reader_refresh_check(_args: dict, _progress=None) -> dict:
+    current, latest = rscore.reader_refresh_check()
+    return {"current": current, "latest": latest}
+
+
 def _verb_op_full_tail(args: dict, _progress=None) -> dict:
     """Token-gated tail of a build op's HOST-ONLY full log — the raw docker/build
     firehose that carries host paths, deliberately never mounted, served ONLY
@@ -529,6 +534,7 @@ VERBS = {
     "software_status": _verb_software_status,
     "agent_refresh_check": _verb_agent_refresh_check,
     "editor_refresh_check": _verb_editor_refresh_check,
+    "reader_refresh_check": _verb_reader_refresh_check,
     "op_full_tail": _verb_op_full_tail,
     "build_alive": _verb_build_alive,
     "stop": _verb_stop,
@@ -610,6 +616,14 @@ def _verb_editor_refresh(_args: dict, progress=None) -> dict:
     return rscore.editor_refresh(progress=progress)
 
 
+def _verb_reader_pull(_args: dict, progress=None) -> dict:
+    return rscore.reader_pull(progress=progress)
+
+
+def _verb_reader_refresh(_args: dict, progress=None) -> dict:
+    return rscore.reader_refresh(progress=progress)
+
+
 def _verb_rebuild(_args: dict, progress=None) -> dict:
     rscore.rebuild(progress=progress)
     return {"rebuilt": True}
@@ -619,8 +633,10 @@ def _verb_rebuild(_args: dict, progress=None) -> dict:
 BUILD_DISPATCH = {
     "agent_pull": _verb_agent_pull,
     "editor_pull": _verb_editor_pull,
+    "reader_pull": _verb_reader_pull,
     "agent_refresh": _verb_agent_refresh,
     "editor_refresh": _verb_editor_refresh,
+    "reader_refresh": _verb_reader_refresh,
     "rebuild": _verb_rebuild,
 }
 
