@@ -222,6 +222,7 @@ const state = {
     terminals: {},           // "${project}:${service}" -> { term, fitAddon, ws, container, project, service }
     probeTimer: null,
     statusTimer: null,
+    servicesTimer: null,
     theme: null,
     railPinned: false,       // persisted: keep rail in flex flow (push layout)
     railExpanded: false,     // in-memory: rail visible (overlay when unpinned)
@@ -465,6 +466,7 @@ async function renderDashboard() {
 
     applyRailState();
     schedulePolling();
+    scheduleServicesRefresh();
     // Rail-visibility-gated status polling is started inside applyRailState;
     // no separate kickoff needed here.
 
@@ -695,6 +697,7 @@ function refreshProjectRail() {
     old.replaceWith(makeProjectRail());
     applyRailState();
     schedulePolling();
+    scheduleServicesRefresh();
 }
 
 // Fetch a project's SSH coordinates from the broker (JIT keyring) and add/refresh
@@ -2608,6 +2611,60 @@ function schedulePolling() {
     state.probeTimer = setInterval(probeAll, PROBE_INTERVAL_MS);
 }
 
+// Periodic re-sync of the ACTIVE project's service tabs. The tab set is
+// server-side probe-gated — an exported port (or a box editor) shows only once
+// it's actually LISTENING on the supervisor netns — so the documented flow
+// "register the port, THEN start serving it" leaves the tab hidden until the
+// listener comes up, and nothing re-fetches after that. Without this, a
+// newly-listening surface only appears on a manual project re-select or a full
+// reload (the same latency the box-editor stub-boot delay has). Runs on the
+// rail's reachability cadence (PROBE_INTERVAL_MS) and only touches the strip
+// when the id/label signature actually changed, so an unchanged poll is a
+// no-op (no flicker, no focus theft).
+function scheduleServicesRefresh() {
+    if (state.servicesTimer) clearInterval(state.servicesTimer);
+    state.servicesTimer = setInterval(refreshActiveServices, PROBE_INTERVAL_MS);
+}
+
+// Tab-visible fingerprint: the sorted service ids plus their labels. A newly-
+// listening port adds an id; a re-add relabels; a stopped listener drops one —
+// all move the signature, so the guard in refreshActiveServices fires only then.
+function serviceTabsSignature(map) {
+    return Object.keys(map || {}).sort()
+        .map((id) => `${id} ${(map[id] && map[id].label) || ""}`)
+        .join("");
+}
+
+async function refreshActiveServices() {
+    const name = state.activeProject;
+    if (!name) return;
+    let fresh;
+    try {
+        const res = await fetch(`/services/${encodeURIComponent(name)}`);
+        if (!res.ok) return;
+        fresh = await res.json();
+    } catch (_) {
+        return;   // transient; the next tick retries
+    }
+    // The active project (or the whole vault) may have changed while the fetch
+    // was in flight — bail rather than render stale tabs onto a different view.
+    if (state.activeProject !== name) return;
+    const current = state.projectServices[name] || {};
+    if (serviceTabsSignature(fresh) === serviceTabsSignature(current)) return;
+    state.projectServices[name] = fresh;
+    renderServiceTabs(name, fresh);
+    // renderServiceTabs rebuilds the strip without the active underline; re-apply
+    // it. activateService returns early on an existing, connected terminal, so no
+    // open pane is torn down. If the active service vanished (a listener stopped),
+    // fall back to the first visible tab — mirrors setServiceHidden.
+    const visible = visibleServiceIds(name, fresh);
+    if (state.activeService && visible.includes(state.activeService)) {
+        activateService(state.activeService);
+    } else if (visible.length > 0) {
+        activateService(visible[0]);
+    }
+}
+
 async function probeProject(project) {
     try {
         const url = `/probe?host=${encodeURIComponent(project.host)}&port=${project.port}`;
@@ -2736,6 +2793,7 @@ function formatAgo(sec) {
 function lockVault() {
     if (state.probeTimer) { clearInterval(state.probeTimer); state.probeTimer = null; }
     if (state.statusTimer) { clearInterval(state.statusTimer); state.statusTimer = null; }
+    if (state.servicesTimer) { clearInterval(state.servicesTimer); state.servicesTimer = null; }
     for (const t of Object.values(state.terminals)) {
         try { if (t.ws) t.ws.close(); } catch (_) {}
         try { if (t.term) t.term.dispose(); } catch (_) {}
