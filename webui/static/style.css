@@ -1008,6 +1008,13 @@ body {
 .sw-images .sw-row { grid-template-columns: minmax(0, 1fr) 90px; }
 .sw-pins .sw-row { grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) 70px; }
 .sw-act { justify-self: end; }
+/* The Software section folded into the Settings page — a divider above it and a
+   lightweight not-logged-in note. */
+.sw-embed { margin-top: 28px; padding-top: 20px; border-top: 1px solid var(--border); }
+.sw-embed-note {
+    display: flex; align-items: center; gap: 12px;
+    color: var(--fg-muted); font-size: 13px;
+}
 /* Build-lane dialog: a scrolling raw build-log tail (the authenticated stream of
    the host-only full log) + a coarse phase line. */
 .sw-build-card { width: 640px; max-width: 100%; }

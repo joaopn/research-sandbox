@@ -213,7 +213,7 @@ const state = {
                              // unlock, cleared on lock, NEVER persisted)
     vault: null,             // { version, projects, settings } | null
     activeProject: null,     // string | null
-    hostPage: null,          // "workflows" | "management" | "software" | "settings" | null
+    hostPage: null,          // "workflows" | "management" | "settings" | null
     explainIndex: null,      // string[] of workflows with a rendered Explain doc (/static/explain/index.json); null = unfetched
     activeService: null,     // string | null
     serviceRegistry: null,   // { [serviceId]: spec } from /services
@@ -803,9 +803,7 @@ function makeBottomNav() {
            "New Project — pick a workflow, or import an existing project", openWorkflows),
         mk("management-entry", "🗂", "Management",
            "Host project management (broker)", openManagement),
-        mk("software-entry", "📦", "Software",
-           "Agent/editor dists, image fleet, version pins (broker)", openSoftware),
-        mk("settings-entry", "⚙", "Settings", "UI settings", openSettings),
+        mk("settings-entry", "⚙", "Settings", "UI settings + software", openSettings),
     ]);
 }
 
@@ -817,7 +815,7 @@ function refreshBottomNav() {
     // makeBottomNav builds every entry inactive; re-derive the active highlight
     // from the current host page.
     const hp = state.hostPage;
-    if (hp === "workflows" || hp === "management" || hp === "software" || hp === "settings") {
+    if (hp === "workflows" || hp === "management" || hp === "settings") {
         setActiveNavEntry(hp + "-entry");
     }
 }
@@ -873,15 +871,6 @@ function openSettings() {
     renderSettingsInto(view);
 }
 
-function openSoftware() {
-    if (state.hostPage === "software") return leaveHostView();
-    state.hostPage = "software";
-    const view = enterHostView();
-    if (!view) return;
-    setActiveNavEntry("software-entry");
-    renderSoftwareInto(view);
-}
-
 // Clicking the already-open host tab deselects it (temporary-tab feel): drop
 // back to the project that was open before, or the welcome area if none.
 function leaveHostView() {
@@ -893,10 +882,14 @@ function leaveHostView() {
     }
 }
 
-// Local UI settings page (no broker; theme + editor-zoom are client-side). These
-// live here now instead of the rail footer.
+// Settings page: the local UI settings (theme + editor-zoom, client-side) plus
+// the broker-gated Software section (dists / image fleet / pins + build lane),
+// folded in here rather than a separate rail entry. The software section renders
+// into its OWN sub-container so its self-contained fetch+gate+build machinery
+// (renderSoftwareInto) never disturbs the local settings above it.
 function renderSettingsInto(view) {
     view.innerHTML = "";
+    const swSub = el("div", { class: "sw-embed" });
     view.appendChild(el("div", { class: "settings-screen" }, [
         el("h2", { class: "workflows-title" }, ["Settings"]),
         el("div", { class: "field" }, [
@@ -907,13 +900,29 @@ function renderSettingsInto(view) {
             el("label", {}, ["Editor zoom"]),
             makeIframeZoomSelector(),
         ]),
+        swSub,
     ]));
+    renderSoftwareInto(swSub);   // async, fire-and-forget; fills swSub when ready
 }
 
 // Software / images host page — read-only status of the host's agent/editor
 // dists, built image fleet, and effective version pins (base + local override),
 // via the login-gated broker `software_status` read. Pull/rebuild/refresh (the
 // write side) land in later slices; this slice surfaces status only.
+// No live Management session (rare — Management auto-logs-in at vault unlock): a
+// LIGHTWEIGHT note in the section rather than the full login card auto-embedded in
+// Settings. The "Log in" button shows the login on demand (into this same
+// sub-container), so the full card only appears on an explicit click.
+function renderSoftwareLoginNote(view) {
+    view.innerHTML = "";
+    const login = el("button", { class: "btn-small" }, ["Log in"]);
+    login.onclick = () => renderMgmtLogin(view, renderSoftwareInto);
+    view.appendChild(el("div", { class: "sw-embed-note" }, [
+        el("span", {}, ["Log in to Management to manage software (dists, images, pins)."]),
+        login,
+    ]));
+}
+
 async function renderSoftwareInto(view) {
     view.innerHTML = "";
     view.appendChild(el("div", { class: "mgmt-loading" }, ["Loading software status…"]));
@@ -921,7 +930,7 @@ async function renderSoftwareInto(view) {
     try {
         res = await fetch("/broker/software");
     } catch (e) { return renderMgmtUnavailable(view); }
-    if (res.status === 401) return renderMgmtLogin(view, renderSoftwareInto);
+    if (res.status === 401) return renderSoftwareLoginNote(view);
     if (res.status === 403) return renderMgmtRejected(view);
     if (res.status === 503) return renderMgmtUnavailable(view);
     let body;
