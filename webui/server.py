@@ -552,14 +552,19 @@ async def broker_software_handler(request: web.Request) -> web.Response:
     """GET /broker/software — read-only status of the host's agent/editor dists,
     the built image fleet, and the effective version pins (gated). Mirrors
     /broker/workflows: a no-args broker read; the SameSite=Strict cookie is the
-    CSRF defense. Refresh (pin bumps) lands in a later slice."""
+    CSRF defense. The per-dist refresh preview + apply are separate endpoints
+    (/broker/software/refresh-check and /broker/software/build)."""
     status, body = await _relay(request, "software_status")
     return web.json_response(body, status=status)
 
 
 # The fixed set of build verbs the browser may request (the input boundary — the
-# broker re-validates the agent enum pre-spawn). editor_pull/rebuild take no args.
-_BUILD_VERBS = frozenset({"agent_pull", "editor_pull", "rebuild"})
+# broker re-validates the agent enum pre-spawn). editor_*/rebuild take no args;
+# agent_pull/agent_refresh carry the agent enum. agent_refresh/editor_refresh
+# bump the untracked override pin + rebuild (they re-resolve the upstream version
+# child-side — no client-supplied version crosses).
+_BUILD_VERBS = frozenset({"agent_pull", "editor_pull",
+                          "agent_refresh", "editor_refresh", "rebuild"})
 
 
 async def broker_build_handler(request: web.Request) -> web.Response:
@@ -588,7 +593,8 @@ async def broker_build_handler(request: web.Request) -> web.Response:
         return web.json_response(
             {"ok": False, "error": {"kind": "validation",
              "message": "unknown build verb"}}, status=200)
-    args = {"agent": body.get("agent", "claude")} if verb == "agent_pull" else {}
+    args = ({"agent": body.get("agent", "claude")}
+            if verb in ("agent_pull", "agent_refresh") else {})
     op_id = _mint_op_id("software", verb)
     try:
         reply = await broker_call(verb, args, token=s["broker_token"],
@@ -607,6 +613,39 @@ async def broker_build_handler(request: web.Request) -> web.Response:
     if not reply.get("ok"):
         return web.json_response(reply, status=200)   # busy / validation → app error
     return web.json_response({"ok": True, "op_id": op_id})
+
+
+# The fixed set of dist-refresh PREVIEW verbs the browser may request. Reads that
+# resolve a dist's upstream `latest`; the APPLY (bump+rebuild) is a _BUILD_VERBS
+# op which re-resolves child-side, so this preview value never feeds the apply.
+_REFRESH_CHECK_VERBS = frozenset({"agent_refresh_check", "editor_refresh_check"})
+
+
+async def broker_refresh_check_handler(request: web.Request) -> web.Response:
+    """POST /broker/software/refresh-check {verb, agent?} — resolve a dist's
+    upstream `latest` so the Software panel can preview current→latest before the
+    operator confirms a bump+rebuild. A gated read, origin-checked because it POSTs
+    and triggers an in-container resolve (bounded broker-side by
+    _UPSTREAM_RESOLVE_MAX_TIME_S). Returns the broker verb's {current, latest} or
+    its error envelope. Only `verb` (a fixed allowlist) and `agent` (for the agent
+    variant) cross from the browser."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    verb = body.get("verb")
+    if verb not in _REFRESH_CHECK_VERBS:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "validation",
+             "message": "unknown refresh-check verb"}}, status=200)
+    args = ({"agent": body.get("agent", "claude")}
+            if verb == "agent_refresh_check" else {})
+    status, reply = await _relay(request, verb, args)
+    return web.json_response(reply, status=status)
 
 
 def _mint_op_id(name: str, action: str) -> str:
@@ -1956,6 +1995,7 @@ def main() -> None:
     app.router.add_get("/broker/workflows", broker_workflows_handler)
     app.router.add_get("/broker/software", broker_software_handler)
     app.router.add_post("/broker/software/build", broker_build_handler)
+    app.router.add_post("/broker/software/refresh-check", broker_refresh_check_handler)
     app.router.add_post("/broker/project", broker_create_handler)
     # attach is a fixed segment registered before the {action} variable so it
     # routes to the keyring handler, not the start|stop|update|destroy dispatcher

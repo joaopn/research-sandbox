@@ -2401,6 +2401,21 @@ def _editor_ext_vsix_name(e: dict) -> str:
 # resolves the upstream version with curl alone (no in-container JSON parse).
 _CODE_SERVER_LATEST_URL = "https://github.com/coder/code-server/releases/latest"
 
+# Wall-clock bound on the in-container `curl` that resolves an upstream "latest"
+# version (agent + editor resolvers). Load-bearing because the webui refresh-check
+# read verb runs this resolve ON the serial broker accept thread — an UNbounded
+# network wait there could freeze every other verb (the exact failure class the
+# detached build lane exists to avoid). 15s reasoning: a live upstream answers in
+# <2s; ~7s is tight for a slow-but-reachable link; ~150s would freeze the daemon
+# unacceptably long; 15s is generous-for-live yet sits UNDER the webui's 30s relay
+# cap (BROKER_CALL_TIMEOUT_S), so the daemon unblocks around when the browser gives
+# up. --max-time (not --connect-timeout) bounds the whole transfer incl. the editor
+# resolver's load-bearing -L redirect chain. Shared with the CLI `agent/editor
+# refresh` resolvers — bounding there is a strict improvement (a hung resolve now
+# fails at 15s instead of hanging). It does NOT bound the outer `docker run`; a
+# wedged docker daemon is a codebase-wide risk, out of scope here.
+_UPSTREAM_RESOLVE_MAX_TIME_S = 15
+
 
 def agent_dist_path(agent: str) -> Path:
     return AGENT_DIST_DIR / agent
@@ -2654,7 +2669,8 @@ def _agent_resolve_latest(agent: str) -> str:
     if not run_quiet(["docker", "image", "inspect", MINIMAL_BASE_IMAGE]):
         die(f"{MINIMAL_BASE_IMAGE} not found — run `research start --rebuild` first")
     r = run(["docker", "run", "--rm", MINIMAL_BASE_IMAGE, "sh", "-lc",
-             f"curl -fsSL {shlex.quote(spec['latest_url'])}"], capture_output=True)
+             f"curl -fsSL --max-time {_UPSTREAM_RESOLVE_MAX_TIME_S} "
+             f"{shlex.quote(spec['latest_url'])}"], capture_output=True)
     if r.returncode != 0:
         die(f"could not resolve upstream {agent} version: "
             f"{(r.stderr or '').strip() or 'fetch failed'}")
@@ -2703,6 +2719,33 @@ def agent_apply_refresh(agent: str, version: str) -> None:
     the front-end's job (this just applies)."""
     _set_version_pin(_AGENT_INSTALL[agent]["version_key"], version)
     _agent_build_dist(agent, version)
+
+
+def agent_refresh(agent: str = "claude", progress=None) -> dict:
+    """Build-lane refresh: resolve the upstream latest, and if newer than the
+    effective pin, bump the untracked versions.local.env override to it + rebuild
+    the dist at it (via agent_apply_refresh — override-only, never the tracked
+    base). The webui's preview already showed the operator current→latest; this
+    RE-RESOLVES child-side so no client-supplied version ever crosses the boundary
+    — only the `agent` enum does — and a stale preview can't cause a wrong bump
+    (if upstream moved to equal between preview and confirm, this returns
+    bumped:False, TOCTOU-safe). `progress` (the broker build-lane sink;
+    _NULL_PROGRESS on the CLI) gets coarse view-log milestones — agent enum +
+    _AGENT_VERSION_RE-guarded version only, never a host path — while the raw
+    resolve+build firehose streams to the host-only full log. Up-to-date is
+    equality-only (mirrors the CLI `agent refresh`): no dist-presence check, so it
+    never writes a redundant override entry; the milestone points at Pull for a
+    stale cached dist."""
+    progress = progress or _NULL_PROGRESS
+    progress.step("resolve", f"resolving upstream {agent} version")
+    current, latest = agent_refresh_check(agent)
+    if current == latest:
+        progress.step("uptodate", f"pin already at upstream {latest} — "
+                      "use Pull to (re)build the dist")
+        return {"agent": agent, "version": latest, "bumped": False}
+    progress.step("bump", f"bumping pin to {latest}")
+    agent_apply_refresh(agent, latest)
+    return {"agent": agent, "version": latest, "bumped": True}
 
 
 def agent_list() -> list[dict]:
@@ -2870,7 +2913,8 @@ def _editor_resolve_latest() -> str:
     if not run_quiet(["docker", "image", "inspect", MINIMAL_BASE_IMAGE]):
         die(f"{MINIMAL_BASE_IMAGE} not found — run `research start --rebuild` first")
     r = run(["docker", "run", "--rm", MINIMAL_BASE_IMAGE, "sh", "-lc",
-             "curl -fsSL -o /dev/null -w '%{url_effective}' "
+             f"curl -fsSL --max-time {_UPSTREAM_RESOLVE_MAX_TIME_S} "
+             "-o /dev/null -w '%{url_effective}' "
              + shlex.quote(_CODE_SERVER_LATEST_URL)], capture_output=True)
     if r.returncode != 0:
         die(f"could not resolve upstream code-server version: "
@@ -2904,6 +2948,26 @@ def editor_apply_refresh(cs_version: str) -> None:
     job."""
     _set_version_pin(_CODE_SERVER_VERSION_KEY, cs_version)
     _editor_build_dist(cs_version)
+
+
+def editor_refresh(progress=None) -> dict:
+    """Build-lane refresh for the editor dist — the twin of agent_refresh. Resolve
+    upstream code-server, and if newer than the effective CODE_SERVER_VERSION pin,
+    bump the untracked override + rebuild (via editor_apply_refresh; bundled
+    extensions stay at their own pins). Re-resolves child-side (no client version
+    crosses); up-to-date is equality-only and points at Pull for a stale cached
+    dist. Milestones carry only the _AGENT_VERSION_RE-guarded version; the raw
+    build streams to the host-only full log."""
+    progress = progress or _NULL_PROGRESS
+    progress.step("resolve", "resolving upstream code-server version")
+    current, latest = editor_refresh_check()
+    if current == latest:
+        progress.step("uptodate", f"pin already at upstream {latest} — "
+                      "use Pull to (re)build the dist")
+        return {"code_server_version": latest, "bumped": False}
+    progress.step("bump", f"bumping pin to {latest}")
+    editor_apply_refresh(latest)
+    return {"code_server_version": latest, "bumped": True}
 
 
 def _deploy_supervisor_editor(container: str) -> None:

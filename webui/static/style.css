@@ -1004,10 +1004,10 @@ body {
     background: transparent; color: var(--fg-faint); font-size: 11px;
     text-transform: uppercase; letter-spacing: 0.04em;
 }
-.sw-dists .sw-row { grid-template-columns: minmax(0, 1.3fr) 64px minmax(0, 1fr) minmax(0, 1fr) 96px 64px; }
+.sw-dists .sw-row { grid-template-columns: minmax(0, 1.3fr) 64px minmax(0, 1fr) minmax(0, 1fr) 96px 148px; }
 .sw-images .sw-row { grid-template-columns: minmax(0, 1fr) 90px; }
 .sw-pins .sw-row { grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) 70px; }
-.sw-act { justify-self: end; }
+.sw-act { justify-self: end; display: flex; gap: 6px; }
 /* The Software section folded into the Settings page — a divider above it and a
    lightweight not-logged-in note. */
 .sw-embed { margin-top: 28px; padding-top: 20px; border-top: 1px solid var(--border); }

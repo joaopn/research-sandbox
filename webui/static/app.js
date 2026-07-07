@@ -979,6 +979,16 @@ function renderSoftwareScreen(view, result) {
         });
         return b;
     };
+    // Refresh = preview upstream, then (only if newer) bump the untracked override
+    // pin + re-pull via the build lane. distLabel names the dist in the dialog.
+    const refreshBtn = (distLabel, checkPayload, buildPayload) => {
+        const b = el("button", { class: "btn-small" }, ["Refresh"]);
+        b.onclick = () => mgmtRefreshDialog(view, {
+            title: "Refresh " + distLabel, tailTitle: "Refreshing " + distLabel,
+            distLabel: distLabel, checkPayload: checkPayload, buildPayload: buildPayload,
+        });
+        return b;
+    };
 
     // --- Dists (agents + the editor) ---
     const distRows = [el("div", { class: "sw-row sw-row-head" }, [
@@ -993,9 +1003,15 @@ function renderSoftwareScreen(view, result) {
             cell(a.cached_version, "sw-mono"),
             cell(a.effective_pin, "sw-mono"),
             distStatus(a),
-            el("span", { class: "sw-act" }, [pullBtn(
-                { verb: "agent_pull", agent: a.agent },
-                "Rebuild this agent dist at the effective pin, in a throwaway build container (a few minutes).")]),
+            el("span", { class: "sw-act" }, [
+                pullBtn(
+                    { verb: "agent_pull", agent: a.agent },
+                    "Rebuild this agent dist at the effective pin, in a throwaway build container (a few minutes)."),
+                refreshBtn(
+                    "agent: " + a.agent,
+                    { verb: "agent_refresh_check", agent: a.agent },
+                    { verb: "agent_refresh", agent: a.agent }),
+            ]),
         ]));
     }
     const nExt = Object.keys(editor.extensions || {}).length;
@@ -1005,9 +1021,15 @@ function renderSoftwareScreen(view, result) {
         cell(editor.cached_version, "sw-mono"),
         cell(editor.effective_pin, "sw-mono"),
         distStatus(editor),
-        el("span", { class: "sw-act" }, [pullBtn(
-            { verb: "editor_pull" },
-            "Rebuild the editor dist at the effective pin, in a throwaway build container (a few minutes).")]),
+        el("span", { class: "sw-act" }, [
+            pullBtn(
+                { verb: "editor_pull" },
+                "Rebuild the editor dist at the effective pin, in a throwaway build container (a few minutes)."),
+            refreshBtn(
+                "editor: code-server",
+                { verb: "editor_refresh_check" },
+                { verb: "editor_refresh" }),
+        ]),
     ]));
     view.appendChild(el("div", { class: "sw-section" }, [
         el("h3", {}, ["Dists"]),
@@ -1650,6 +1672,104 @@ function mgmtBuildDialog(view, cfg) {
     };
     backdrop.appendChild(card);
     document.body.appendChild(backdrop);
+    return backdrop;
+}
+
+// Two-step dist refresh: check the upstream version, then (only if newer) confirm
+// the bump+rebuild and stream it. cfg = {title, distLabel, checkPayload,
+// buildPayload, tailTitle}. The APPLY re-resolves child-side, so the previewed
+// version is advisory — the confirm text says "at last check", never a guarantee.
+async function mgmtRefreshDialog(view, cfg) {
+    if (document.querySelector(".modal-backdrop")) return null;
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const bodyEl = el("div", {});
+    const card = el("div", { class: "card sw-build-card" }, [
+        el("h2", {}, [cfg.title]),
+        bodyEl,
+    ]);
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+
+    const closeRow = () => {
+        const close = el("button", { class: "btn btn-secondary" }, ["Close"]);
+        close.onclick = () => backdrop.remove();
+        return el("div", { class: "btn-row" }, [close]);
+    };
+    const fail = (msg) => {
+        bodyEl.innerHTML = "";
+        bodyEl.appendChild(el("p", { class: "error" }, [msg]));
+        bodyEl.appendChild(closeRow());
+    };
+
+    bodyEl.appendChild(el("p", { class: "mgmt-loading" }, ["Checking upstream…"]));
+    let res;
+    try {
+        res = await fetch("/broker/software/refresh-check", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(cfg.checkPayload),
+        });
+    } catch (e) { fail("Broker unreachable."); return backdrop; }
+    const redirect = mgmtStatusRedirect(view, res.status);
+    if (redirect) { backdrop.remove(); return redirect(); }
+    let body; try { body = await res.json(); } catch (e) { body = {}; }
+    if (!body.ok || !body.result) {
+        fail("Could not resolve upstream: " + mgmtErrText(body)); return backdrop;
+    }
+    const current = body.result.current || "(unset)";
+    const latest = body.result.latest;
+    bodyEl.innerHTML = "";
+    // Up-to-date is equality on the RAW values ("" == "" for an unset pin at an
+    // unresolved upstream would be odd, but the resolver returns a concrete
+    // version); a stale cached dist at the same pin is covered by Pull.
+    if (body.result.current === body.result.latest) {
+        bodyEl.appendChild(el("p", {}, [
+            cfg.distLabel + " is already at the upstream version ",
+            el("span", { class: "sw-mono" }, [latest]),
+            ". Use Pull to (re)build the dist if the cache is stale.",
+        ]));
+        bodyEl.appendChild(closeRow());
+        return backdrop;
+    }
+    bodyEl.appendChild(el("p", {}, [
+        cfg.distLabel + ": pin ",
+        el("span", { class: "sw-mono" }, [current]),
+        " → upstream ",
+        el("span", { class: "sw-mono" }, [latest]),
+        ".",
+    ]));
+    bodyEl.appendChild(el("p", {}, [
+        "Bump to the current upstream (", el("span", { class: "sw-mono" }, [latest]),
+        " at last check) in the local override (versions.local.env, untracked — ",
+        "never committed) and re-pull the dist? A few minutes; the rest of the ",
+        "webui stays responsive.",
+    ]));
+    const errEl = el("div", { class: "error" });
+    const cancel = el("button", { class: "btn btn-secondary" }, ["Cancel"]);
+    cancel.onclick = () => backdrop.remove();
+    const go = el("button", { class: "btn" }, ["Bump + re-pull"]);
+    go.onclick = async () => {
+        errEl.textContent = "";
+        go.disabled = true; cancel.disabled = true; go.textContent = "…";
+        const reset = () => {
+            go.disabled = false; cancel.disabled = false; go.textContent = "Bump + re-pull";
+        };
+        let r;
+        try {
+            r = await fetch("/broker/software/build", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(cfg.buildPayload),
+            });
+        } catch (e) { reset(); errEl.textContent = "Broker unreachable."; return; }
+        const rd = mgmtStatusRedirect(view, r.status);
+        if (rd) { backdrop.remove(); return rd(); }
+        let b; try { b = await r.json(); } catch (e) { b = {}; }
+        if (!b.ok || !b.op_id) { reset(); errEl.textContent = "Failed: " + mgmtErrText(b); return; }
+        await mgmtTailBuildLog(view, backdrop, card, b.op_id, cfg.tailTitle || cfg.title);
+    };
+    bodyEl.appendChild(el("div", { class: "btn-row" }, [cancel, go]));
+    bodyEl.appendChild(errEl);
     return backdrop;
 }
 

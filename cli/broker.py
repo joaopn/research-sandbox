@@ -302,6 +302,30 @@ def _verb_software_status(_args: dict, _progress=None) -> dict:
         raise rscore.ValidationError(f"software status unavailable: {e}")
 
 
+# The dist-refresh PREVIEW reads: resolve the upstream `latest` for a dist so the
+# webui can show current→latest before the operator confirms the bump+rebuild.
+# Token-gated (in VERBS, NOT OPEN_VERBS), and DELIBERATELY NOT in BUILD_DISPATCH —
+# they are fast(ish) reads, not builds; the actual bump+rebuild is the separate
+# BUILD_DISPATCH `agent_refresh`/`editor_refresh` lane verb, which re-resolves
+# child-side (this preview value never crosses back into the apply path). The
+# underlying resolve runs an in-container `curl` bounded by
+# rscore._UPSTREAM_RESOLVE_MAX_TIME_S so this inline (serial-daemon) read can't
+# hang the accept thread. rscore.die() on a network/upstream failure → SystemExit →
+# clean failed envelope (the established path).
+def _verb_agent_refresh_check(args: dict, _progress=None) -> dict:
+    agent = args.get("agent", "claude")
+    if agent not in rscore.KNOWN_AGENTS:
+        raise rscore.ValidationError(
+            f"unknown agent {agent!r} (known: {', '.join(rscore.KNOWN_AGENTS)})")
+    current, latest = rscore.agent_refresh_check(agent)
+    return {"current": current, "latest": latest}
+
+
+def _verb_editor_refresh_check(_args: dict, _progress=None) -> dict:
+    current, latest = rscore.editor_refresh_check()
+    return {"current": current, "latest": latest}
+
+
 def _verb_op_full_tail(args: dict, _progress=None) -> dict:
     """Token-gated tail of a build op's HOST-ONLY full log — the raw docker/build
     firehose that carries host paths, deliberately never mounted, served ONLY
@@ -503,6 +527,8 @@ VERBS = {
     "status": _verb_status,
     "workflows": _verb_workflows,
     "software_status": _verb_software_status,
+    "agent_refresh_check": _verb_agent_refresh_check,
+    "editor_refresh_check": _verb_editor_refresh_check,
     "op_full_tail": _verb_op_full_tail,
     "build_alive": _verb_build_alive,
     "stop": _verb_stop,
@@ -572,6 +598,18 @@ def _verb_editor_pull(_args: dict, progress=None) -> dict:
     return rscore.editor_pull(progress=progress)
 
 
+def _verb_agent_refresh(args: dict, progress=None) -> dict:
+    agent = args.get("agent", "claude")
+    if agent not in rscore.KNOWN_AGENTS:          # defense-in-depth (parent re-checks pre-spawn)
+        raise rscore.ValidationError(
+            f"unknown agent {agent!r} (known: {', '.join(rscore.KNOWN_AGENTS)})")
+    return rscore.agent_refresh(agent=agent, progress=progress)
+
+
+def _verb_editor_refresh(_args: dict, progress=None) -> dict:
+    return rscore.editor_refresh(progress=progress)
+
+
 def _verb_rebuild(_args: dict, progress=None) -> dict:
     rscore.rebuild(progress=progress)
     return {"rebuilt": True}
@@ -581,6 +619,8 @@ def _verb_rebuild(_args: dict, progress=None) -> dict:
 BUILD_DISPATCH = {
     "agent_pull": _verb_agent_pull,
     "editor_pull": _verb_editor_pull,
+    "agent_refresh": _verb_agent_refresh,
+    "editor_refresh": _verb_editor_refresh,
     "rebuild": _verb_rebuild,
 }
 
@@ -752,7 +792,7 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
                             _err("bad_request", "a valid op_id is required"))
         # Pre-spawn arg validation: a bad agent must NOT spawn a child — the client
         # already holds started:true and would never see a child-side failure.
-        if verb == "agent_pull":
+        if verb in ("agent_pull", "agent_refresh"):
             agent = args.get("agent", "claude")
             if agent not in rscore.KNOWN_AGENTS:
                 return _audited(principal, "validation",
