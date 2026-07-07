@@ -552,9 +552,61 @@ async def broker_software_handler(request: web.Request) -> web.Response:
     """GET /broker/software — read-only status of the host's agent/editor dists,
     the built image fleet, and the effective version pins (gated). Mirrors
     /broker/workflows: a no-args broker read; the SameSite=Strict cookie is the
-    CSRF defense. Pull/rebuild/refresh (the write side) land in later slices."""
+    CSRF defense. Refresh (pin bumps) lands in a later slice."""
     status, body = await _relay(request, "software_status")
     return web.json_response(body, status=status)
+
+
+# The fixed set of build verbs the browser may request (the input boundary — the
+# broker re-validates the agent enum pre-spawn). editor_pull/rebuild take no args.
+_BUILD_VERBS = frozenset({"agent_pull", "editor_pull", "rebuild"})
+
+
+async def broker_build_handler(request: web.Request) -> web.Response:
+    """POST /broker/software/build {verb, agent?} — kick a build-lane op (agent
+    pull / editor pull / fleet rebuild) on the broker's DETACHED child, gated +
+    origin-checked. Returns {op_id} at once: the broker spawns and returns fast,
+    so this is a SYNCHRONOUS relay-with-op_id, NOT a background _start_op (whose
+    OP_RUNS would flip 'done' the moment the spawn returns). The browser then
+    streams the raw build log from /broker/op/<id>/fulllog (authenticated) and the
+    coarse phases + terminal from /broker/op/<id>/log. Only `verb` (a fixed
+    allowlist) and `agent` (for agent_pull) cross from the browser."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    s = _broker_session(request)
+    if s is None:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    verb = body.get("verb")
+    if verb not in _BUILD_VERBS:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "validation",
+             "message": "unknown build verb"}}, status=200)
+    args = {"agent": body.get("agent", "claude")} if verb == "agent_pull" else {}
+    op_id = _mint_op_id("software", verb)
+    try:
+        reply = await broker_call(verb, args, token=s["broker_token"],
+                                  op_id=op_id, timeout=BROKER_CALL_TIMEOUT_S)
+    except BrokerUnavailable:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "broker_unavailable"}}, status=503)
+    except BrokerForbidden:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "forbidden"}}, status=403)
+    if (not reply.get("ok")
+            and reply.get("error", {}).get("kind") == "unauthorized"):
+        BROKER_SESSIONS.pop(request.cookies.get(BROKER_COOKIE), None)
+        return web.json_response(
+            {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+    if not reply.get("ok"):
+        return web.json_response(reply, status=200)   # busy / validation → app error
+    return web.json_response({"ok": True, "op_id": op_id})
 
 
 def _mint_op_id(name: str, action: str) -> str:
@@ -886,6 +938,47 @@ async def broker_op_status_handler(request: web.Request) -> web.Response:
         return web.json_response({"ok": True, "state": "unknown", "result": None})
     return web.json_response(
         {"ok": True, "state": entry["state"], "result": entry["result"]})
+
+
+async def broker_op_full_log_handler(request: web.Request) -> web.Response:
+    """GET /broker/op/{op_id}/fulllog?from=<n> — the AUTHENTICATED stream of a
+    build op's RAW log. Unlike /log (which reads the RO-mounted view-log file
+    directly), the full log is HOST-ONLY and never mounted — so this RELAYS
+    through the broker's token-gated op_full_tail, keeping the raw firehose (host
+    paths, every build step) off any mount a compromised webui could read without
+    a session. Returns {data, next, exists}; a not-yet-created log → exists:false."""
+    op_id = request.match_info.get("op_id", "")
+    if not _OP_ID_RE.match(op_id):
+        return web.json_response(
+            {"ok": False, "error": {"kind": "bad_request"}}, status=400)
+    try:
+        frm = max(0, int(request.query.get("from", "0")))
+    except ValueError:
+        frm = 0
+    status, body = await _relay(request, "op_full_tail",
+                                {"op_id": op_id, "from": frm})
+    if status != 200 or not body.get("ok"):
+        return web.json_response(body, status=status)
+    r = body.get("result", {})
+    return web.json_response({
+        "ok": True, "from": r.get("from", frm), "next": r.get("next", frm),
+        "data": r.get("data", ""), "exists": bool(r.get("exists", False))})
+
+
+async def broker_op_alive_handler(request: web.Request) -> web.Response:
+    """GET /broker/op/{op_id}/alive — {alive} for a build op (relays build_alive).
+    The build tail is terminal-first (no OP_RUNS entry, GET /broker/op/<id> is
+    'unknown' for a build), so it has no liveness signal on its own; this lets it
+    escape a wedged modal when a child is hard-killed without writing a terminal."""
+    op_id = request.match_info.get("op_id", "")
+    if not _OP_ID_RE.match(op_id):
+        return web.json_response(
+            {"ok": False, "error": {"kind": "bad_request"}}, status=400)
+    status, body = await _relay(request, "build_alive", {"op_id": op_id})
+    if status != 200 or not body.get("ok"):
+        return web.json_response(body, status=status)
+    return web.json_response(
+        {"ok": True, "alive": bool(body.get("result", {}).get("alive", False))})
 
 
 async def ws_handler(request: web.Request) -> web.WebSocketResponse:
@@ -1862,6 +1955,7 @@ def main() -> None:
     app.router.add_get("/broker/projects", broker_projects_handler)
     app.router.add_get("/broker/workflows", broker_workflows_handler)
     app.router.add_get("/broker/software", broker_software_handler)
+    app.router.add_post("/broker/software/build", broker_build_handler)
     app.router.add_post("/broker/project", broker_create_handler)
     # attach is a fixed segment registered before the {action} variable so it
     # routes to the keyring handler, not the start|stop|update|destroy dispatcher
@@ -1889,6 +1983,8 @@ def main() -> None:
         "/broker/project/{name}/{action}", broker_project_action_handler)
     # op-log tail + status (GETs, session-gated; the more specific /log first).
     app.router.add_get("/broker/op/{op_id}/log", broker_op_log_handler)
+    app.router.add_get("/broker/op/{op_id}/fulllog", broker_op_full_log_handler)
+    app.router.add_get("/broker/op/{op_id}/alive", broker_op_alive_handler)
     app.router.add_get("/broker/op/{op_id}", broker_op_status_handler)
     app.router.add_get("/ws/{project}/{service}", ws_handler)
     app.router.add_static("/static", STATIC_DIR)

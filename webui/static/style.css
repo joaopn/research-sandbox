@@ -1004,9 +1004,21 @@ body {
     background: transparent; color: var(--fg-faint); font-size: 11px;
     text-transform: uppercase; letter-spacing: 0.04em;
 }
-.sw-dists .sw-row { grid-template-columns: minmax(0, 1.3fr) 70px minmax(0, 1fr) minmax(0, 1fr) 110px; }
+.sw-dists .sw-row { grid-template-columns: minmax(0, 1.3fr) 64px minmax(0, 1fr) minmax(0, 1fr) 96px 64px; }
 .sw-images .sw-row { grid-template-columns: minmax(0, 1fr) 90px; }
 .sw-pins .sw-row { grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) 70px; }
+.sw-act { justify-self: end; }
+/* Build-lane dialog: a scrolling raw build-log tail (the authenticated stream of
+   the host-only full log) + a coarse phase line. */
+.sw-build-card { width: 640px; max-width: 100%; }
+.op-phase { color: var(--fg-muted); font-size: 12px; margin-bottom: 8px; }
+.sw-buildlog {
+    background: var(--bg-input); border: 1px solid var(--border); border-radius: 4px;
+    padding: 8px 10px; margin: 0 0 12px; height: 320px; max-height: 50vh;
+    overflow: auto; white-space: pre-wrap; word-break: break-word;
+    font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px;
+    color: var(--fg-muted); line-height: 1.4;
+}
 .sw-name { font-weight: 600; color: var(--fg-base); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sw-mono {
     font-family: ui-monospace, Menlo, Consolas, monospace; color: var(--fg-muted);

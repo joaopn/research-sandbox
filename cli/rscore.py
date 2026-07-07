@@ -2531,14 +2531,20 @@ def _agent_build_dist(agent: str, version: str) -> None:
         indent=2) + "\n")
 
 
-def agent_pull(agent: str = "claude", version: str | None = None) -> dict:
-    """Pull agent@(version or the versions.env pin) into the host cache."""
+def agent_pull(agent: str = "claude", version: str | None = None,
+               progress=None) -> dict:
+    """Pull agent@(version or the effective pin) into the host cache. `progress`
+    (the broker build-lane sink; _NULL_PROGRESS on the CLI) gets coarse milestones
+    on the mounted view-log; the raw build firehose streams to the host-only full
+    log via the child's fd redirect, never here."""
+    progress = progress or _NULL_PROGRESS
     if agent not in _AGENT_INSTALL:
         die(f"unknown agent {agent!r} (known: {', '.join(KNOWN_AGENTS)})")
     ver = version or load_versions().get(_AGENT_INSTALL[agent]["version_key"])
     if not ver:
         die(f"no pinned version for {agent!r} in versions.env "
             f"({_AGENT_INSTALL[agent]['version_key']})")
+    progress.step("build-dist", f"building {agent} {ver} dist")
     _agent_build_dist(agent, ver)
     return {"agent": agent, "version": ver, "path": str(agent_dist_path(agent))}
 
@@ -2659,7 +2665,9 @@ def _agent_resolve_latest(agent: str) -> str:
 
 
 def agent_refresh_check(agent: str = "claude") -> tuple[str, str]:
-    """Side-effect-free: return (current pin from versions.env, upstream latest)."""
+    """Side-effect-free: return (current effective pin, upstream latest). The
+    effective pin is load_versions()'s merged view (tracked base ⊕ untracked
+    versions.local.env override)."""
     if agent not in _AGENT_INSTALL:
         die(f"unknown agent {agent!r} (known: {', '.join(KNOWN_AGENTS)})")
     current = load_versions().get(_AGENT_INSTALL[agent]["version_key"], "")
@@ -2690,8 +2698,9 @@ def _set_version_pin(key: str, value: str) -> None:
 
 
 def agent_apply_refresh(agent: str, version: str) -> None:
-    """Bump versions.env's pin to `version` AND (re)build the dist at it. The
-    prompt/confirm is the front-end's job (this just applies)."""
+    """Bump the pin to `version` in the untracked versions.local.env override
+    (never the tracked base) AND (re)build the dist at it. The prompt/confirm is
+    the front-end's job (this just applies)."""
     _set_version_pin(_AGENT_INSTALL[agent]["version_key"], version)
     _agent_build_dist(agent, version)
 
@@ -2829,13 +2838,16 @@ def _editor_build_dist(cs_version: str) -> None:
         indent=2) + "\n")
 
 
-def editor_pull(cs_version: str | None = None) -> dict:
-    """Pull the editor dist at (cs_version or the versions.env pin) into the cache
-    (bundled-extension versions come from their own versions.env pins)."""
+def editor_pull(cs_version: str | None = None, progress=None) -> dict:
+    """Pull the editor dist at (cs_version or the effective pin) into the cache
+    (bundled-extension versions come from their own pins). `progress` gets a
+    coarse view-log milestone; the raw build streams to the host-only full log."""
+    progress = progress or _NULL_PROGRESS
     v = load_versions()
     cs = cs_version or v.get(_CODE_SERVER_VERSION_KEY)
     if not cs:
         die(f"no pinned {_CODE_SERVER_VERSION_KEY} in versions.env")
+    progress.step("build-dist", f"building code-server {cs} dist")
     _editor_build_dist(cs)
     return {"code_server_version": cs, "path": str(EDITOR_DIST_DIR)}
 
@@ -2886,9 +2898,10 @@ def editor_refresh_check() -> tuple[str, str]:
 
 
 def editor_apply_refresh(cs_version: str) -> None:
-    """Bump versions.env's CODE_SERVER_VERSION pin AND rebuild the dist at it
-    (the bundled extensions stay at their own pins). The prompt/confirm is the
-    front-end's job."""
+    """Bump the CODE_SERVER_VERSION pin in the untracked versions.local.env
+    override (never the tracked base) AND rebuild the dist at it (the bundled
+    extensions stay at their own pins). The prompt/confirm is the front-end's
+    job."""
     _set_version_pin(_CODE_SERVER_VERSION_KEY, cs_version)
     _editor_build_dist(cs_version)
 
@@ -3005,12 +3018,17 @@ def _image_build_specs() -> list:
     return specs
 
 
-def _build_images(force: bool) -> None:
+def _build_images(force: bool, progress=None) -> None:
     """Build supervisor + worker + mcp-proxy + role-mcp images. Skip
     existing ones unless --rebuild. Build order matters: rs-role-mcp-base
     FROMs rs-analysis-base, per-role images (rs-echo-mcp etc.) FROM
     rs-role-mcp-base — the spec list is bottom-up so each FROM resolves to
-    the just-built layer rather than a stale cached copy."""
+    the just-built layer rather than a stale cached copy. `progress` (the broker
+    build-lane sink; _NULL_PROGRESS on the CLI) gets one milestone per image on
+    the mounted view-log — each `msg` is a fixed image TAG, never a host path — so
+    the browser sees the fleet tick by while the raw docker output streams to the
+    host-only full log."""
+    progress = progress or _NULL_PROGRESS
     specs = _image_build_specs()
     # Operator warning for a role-MCP image whose Dockerfile is missing — kept on
     # the BUILD path only (_image_build_specs skips it silently for read callers).
@@ -3033,6 +3051,7 @@ def _build_images(force: bool) -> None:
         for key, value in pins.items():
             if f"ARG {key}" in text:
                 build_args += ["--build-arg", f"{key}={value}"]
+        progress.step("build", f"building {tag}")   # tag is a fixed constant, view-log safe
         print(f"building {tag}...")
         run_check([
             "docker", "build",
@@ -3041,6 +3060,7 @@ def _build_images(force: bool) -> None:
             *build_args,
             str(SCRIPT_DIR),
         ])
+    progress.step("retag", "retagging generic images")
 
     # Lane-3 generic images (STAGE_FEATURE_STAGING): retag each :latest with its
     # content-snapshot pin so the registry PUSH ref carries it. :latest stays for
@@ -3054,6 +3074,12 @@ def _build_images(force: bool) -> None:
             continue
         if run_quiet(["docker", "image", "inspect", f"{host_base}:latest"]):
             run_check(["docker", "tag", f"{host_base}:latest", f"{host_base}:{pin}"])
+
+
+def rebuild(progress=None) -> None:
+    """Rebuild the full image fleet (force). Thin public wrapper the broker build
+    lane calls; the CLI reaches _build_images directly via `start --rebuild`."""
+    _build_images(True, progress=progress)
 
 
 def software_status() -> dict:

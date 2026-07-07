@@ -107,6 +107,20 @@ _OP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 # that, for this closed verb set, is certainly malformed.
 MAX_REQUEST_BYTES = 64 * 1024
 
+# The build lock (host-only, NOT under run/) serialises the build lane: one
+# agent-pull / editor-pull / fleet-rebuild at a time. It records the detached
+# child's pid so a second request tells a LIVE build from a crashed one
+# (stale-pid recovery — a dead pid is reclaimable). Content: {pid, op_id, verb}.
+BUILD_LOCK = BROKER_DIR / "build.lock"
+
+# Max bytes returned per op_full_tail poll. Bounds ONE reply frame — a fleet-build
+# full log grows to MBs, and the whole point of tailing is not to ship it all at
+# once. The webui advances its `from` byte cursor and polls again, so this is
+# NEVER truncation-loss (the cursor is authoritative): at half this value the
+# webui just polls twice as often; at 10× a single reply is larger but still one
+# frame. 64 KiB mirrors the request-frame ceiling, keeping replies bounded.
+OP_TAIL_MAX_BYTES = 64 * 1024
+
 # 4-byte unsigned big-endian length prefix on every frame, both directions.
 _LEN = struct.Struct(">I")
 _LEN_SIZE = _LEN.size
@@ -288,6 +302,53 @@ def _verb_software_status(_args: dict, _progress=None) -> dict:
         raise rscore.ValidationError(f"software status unavailable: {e}")
 
 
+def _verb_op_full_tail(args: dict, _progress=None) -> dict:
+    """Token-gated tail of a build op's HOST-ONLY full log — the raw docker/build
+    firehose that carries host paths, deliberately never mounted, served ONLY
+    through this authenticated relay (a compromised webui with no token can't
+    reach it). Mirrors broker_op_log_handler's discipline: _OP_ID_RE basename
+    guard (it names a file), guarded read, missing file → exists:false, per-poll
+    byte cap (OP_TAIL_MAX_BYTES). A fast read → runs INLINE, so it stays in VERBS
+    (unlike the build verbs, which spawn a child)."""
+    op_id = args.get("op_id")
+    if not isinstance(op_id, str) or not _OP_ID_RE.match(op_id):
+        raise rscore.ValidationError(f"op_id is not a safe basename: {op_id!r}")
+    try:
+        frm = max(0, int(args.get("from", 0)))
+    except (TypeError, ValueError):
+        frm = 0
+    path = BROKER_FULLLOG_DIR / f"{op_id}.full.log"
+    try:
+        with open(path, "rb") as f:
+            f.seek(frm)
+            chunk = f.read(OP_TAIL_MAX_BYTES)
+    except FileNotFoundError:
+        return {"exists": False, "from": frm, "next": frm, "data": ""}
+    except OSError as e:
+        raise rscore.ValidationError(f"cannot read op log: {e}")
+    return {"exists": True, "from": frm, "next": frm + len(chunk),
+            "data": chunk.decode("utf-8", "replace")}
+
+
+def _verb_build_alive(args: dict, _progress=None) -> dict:
+    """Token-gated liveness probe for a build op: {alive:true} iff the build lock
+    holds THIS op_id with a LIVE pid. The terminal-first build tail has no other
+    liveness signal, so a child hard-killed (OOM / kill -9 / power-loss) before its
+    finally writes a view-log terminal would wedge the browser modal forever; this
+    lets the tail detect that and stop. A safe read (in VERBS, runs inline). NB:
+    run_build writes the terminal BEFORE releasing the lock, so a normal finish is
+    seen as a terminal first — alive:false only ever means 'no longer running',
+    after which the tail drains once more before declaring an interruption."""
+    op_id = args.get("op_id")
+    if not isinstance(op_id, str) or not _OP_ID_RE.match(op_id):
+        raise rscore.ValidationError(f"op_id is not a safe basename: {op_id!r}")
+    holder = _build_lock_holder()
+    pid = holder.get("pid") if holder else None
+    alive = (holder is not None and holder.get("op_id") == op_id
+             and isinstance(pid, int) and _alive(pid))
+    return {"alive": bool(alive)}
+
+
 def _verb_stop(args: dict, progress=None) -> list[dict]:
     req = rscore.StartStopRequest.from_kwargs(**args)  # may raise ValidationError
     return [dataclasses.asdict(r) for r in rscore.stop(req, progress=progress)]
@@ -442,6 +503,8 @@ VERBS = {
     "status": _verb_status,
     "workflows": _verb_workflows,
     "software_status": _verb_software_status,
+    "op_full_tail": _verb_op_full_tail,
+    "build_alive": _verb_build_alive,
     "stop": _verb_stop,
     "start": _verb_start,
     "create": _verb_create,
@@ -478,6 +541,136 @@ OPEN_VERBS = frozenset({"list", "status"})
 AUTH_VERBS = frozenset({"login", "logout"})
 
 
+# ---------------------------------------------------------------------------
+# Build lane (F2 Slice 2)
+#
+# Long builds (agent/editor dist pulls, a full fleet rebuild) are multi-minute —
+# running one inline on the serial UnixStreamServer would freeze every other
+# verb. So build verbs live in a SEPARATE dispatch table (BUILD_DISPATCH),
+# DELIBERATELY absent from VERBS: the inline-exec path (dispatch's `table.get`
+# over VERBS) physically cannot resolve a build verb, so no future edit can run a
+# build on the accept thread. dispatch's build branch is the sole entry — it
+# token-gates, validates, checks the lock, spawns a DETACHED child, and returns
+# started:true at once. The child (run_build) owns the op-log, points fd 1/2 at
+# the HOST-ONLY full log (the raw firehose the authenticated op_full_tail relays),
+# emits coarse view-log milestones, and always releases the lock.
+# ---------------------------------------------------------------------------
+
+# Only `agent` is browser-relayable (an enum); editor/rebuild take no args.
+AGENT_PULL_WEBUI_FIELDS = frozenset({"agent"})
+
+
+def _verb_agent_pull(args: dict, progress=None) -> dict:
+    agent = args.get("agent", "claude")
+    if agent not in rscore.KNOWN_AGENTS:          # defense-in-depth (parent re-checks pre-spawn)
+        raise rscore.ValidationError(
+            f"unknown agent {agent!r} (known: {', '.join(rscore.KNOWN_AGENTS)})")
+    return rscore.agent_pull(agent=agent, progress=progress)
+
+
+def _verb_editor_pull(_args: dict, progress=None) -> dict:
+    return rscore.editor_pull(progress=progress)
+
+
+def _verb_rebuild(_args: dict, progress=None) -> dict:
+    rscore.rebuild(progress=progress)
+    return {"rebuilt": True}
+
+
+# The child-only build vocabulary — NOT in VERBS (see the section header).
+BUILD_DISPATCH = {
+    "agent_pull": _verb_agent_pull,
+    "editor_pull": _verb_editor_pull,
+    "rebuild": _verb_rebuild,
+}
+
+
+def _build_lock_holder() -> dict | None:
+    """The current build.lock {pid, op_id, verb}, or None if absent/unreadable."""
+    try:
+        return json.loads(BUILD_LOCK.read_text())
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+
+
+def _build_in_progress() -> bool:
+    """True iff a build lock is held by a LIVE process. A lock whose pid is dead
+    is a crashed child → stale → reclaimable (False)."""
+    holder = _build_lock_holder()
+    if holder is None:
+        return False
+    pid = holder.get("pid")
+    return isinstance(pid, int) and _alive(pid)
+
+
+def _write_build_lock(pid: int, op_id: str, verb: str) -> None:
+    BROKER_DIR.mkdir(parents=True, exist_ok=True)
+    BUILD_LOCK.write_text(json.dumps({"pid": pid, "op_id": op_id, "verb": verb}))
+
+
+def _release_build_lock() -> None:
+    with contextlib.suppress(FileNotFoundError):
+        BUILD_LOCK.unlink()
+
+
+def _spawn_build_child(op_id: str, verb: str, args: dict) -> int:
+    """Spawn the DETACHED build child (`broker __run-build`). Mirrors start()'s
+    Popen: start_new_session=True so a SIGTERM to the daemon's process group (or a
+    broker restart) doesn't kill an in-flight build; stdout/stderr → BROKER_LOG is
+    only a startup backstop — run_build re-points fd 1/2 at its host-only full log
+    once it has an _OpLog. Returns the child pid the parent records in build.lock."""
+    BROKER_DIR.mkdir(parents=True, exist_ok=True)
+    research_py = rscore.SCRIPT_DIR / "research.py"
+    log = open(BROKER_LOG, "a")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(research_py), "broker", "__run-build",
+             op_id, verb, json.dumps(args)],
+            stdout=log, stderr=log, start_new_session=True,
+            cwd=str(rscore.SCRIPT_DIR))
+    finally:
+        log.close()                               # the child holds its own dup'd fd
+    return proc.pid
+
+
+def run_build(op_id: str, verb: str, args_json: str) -> None:
+    """The DETACHED build child (invoked by `broker __run-build`). Owns the op-log
+    for one build: points fd 1/2 at the HOST-ONLY full log (so docker build's
+    inherited stdout/stderr + all prints stream there for the authenticated tail),
+    runs the build verb DIRECTLY from BUILD_DISPATCH (NEVER dispatch() — that would
+    re-hit the build branch and fork-bomb), writes a terminal done/fail to the
+    mounted view-log, and ALWAYS releases the lock. The view-log fail reason is a
+    COARSE allowlist-safe token, NEVER str(exception) — a build error can carry a
+    host path, and _Progress flushes straight to the mounted file; the raw detail's
+    only home is the full log (already streamed via the fd redirect)."""
+    try:
+        args = json.loads(args_json)
+    except ValueError:
+        args = {}
+    try:
+        op = make_oplog(op_id, verb, args)
+    except (ValueError, OSError):
+        _release_build_lock()
+        return
+    try:
+        # fd-level redirect: contextlib.redirect_stdout swaps only sys.stdout and
+        # misses the subprocess's inherited OS fd 1/2, so use dup2 on the real fds,
+        # then rebind Python's line-buffered wrappers so print()s also stream.
+        os.dup2(op.full.fileno(), 1)
+        os.dup2(op.full.fileno(), 2)
+        sys.stdout = os.fdopen(1, "w", buffering=1, closefd=False)
+        sys.stderr = os.fdopen(2, "w", buffering=1, closefd=False)
+        BUILD_DISPATCH[verb](args, op.progress)
+        op.progress.done()
+    except rscore.ValidationError:
+        op.progress.fail("invalid request")
+    except (rscore.HarnessError, SystemExit, Exception):
+        op.progress.fail("build failed")          # coarse token; detail is in the full log
+    finally:
+        op.close()
+        _release_build_lock()
+
+
 def _err(kind: str, message: str) -> dict:
     return {"ok": False, "error": {"kind": kind, "message": message}}
 
@@ -498,7 +691,8 @@ def _auth_login(args: dict, tokens) -> dict:
 
 
 def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
-             verbs: dict | None = None, audit=None, oplog=None) -> dict:
+             verbs: dict | None = None, audit=None, oplog=None,
+             spawn_build=None) -> dict:
     """Resolve and run one verb, mapping every failure mode to a reply dict.
     Pure by default (no socket; no file I/O unless an `audit` or `oplog` sink is
     passed) so it is unit-testable on its own.
@@ -510,6 +704,9 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
     created AFTER the gates so a rejected caller writes no file (and never
     learns the step-up gate exists), and only for a write verb fired with an
     `op_id`. Left None in tests for the same side-effect-free reason as `audit`.
+    `spawn_build(op_id, verb, args) → child pid` launches the detached build
+    child for a BUILD_DISPATCH verb; the daemon injects `_spawn_build_child`,
+    tests pass None (the branch then gates + validates but never spawns).
     """
     def _audited(principal, outcome, reply):
         if audit is not None:
@@ -534,6 +731,44 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
             tokens.revoke(token)
         return _audited(principal, "logout",
                         {"ok": True, "result": {"logged_out": True}})
+
+    # Build lane — the SOLE entry for a build verb (BUILD_DISPATCH is absent from
+    # VERBS, so the inline-exec path below can never reach one). Placed before the
+    # VERBS `table.get`: token-gate → op_id + pre-spawn arg validation → lock →
+    # spawn a DETACHED child → return started:true at once. The child owns the
+    # op-log and releases the lock; nothing here runs the build on the accept
+    # thread. Uses `verbs is None` so an alternate table passed by a test can't
+    # accidentally re-route builds (the daemon always passes the real BUILD path).
+    if verbs is None and verb in BUILD_DISPATCH:
+        if not isinstance(args, dict):
+            return _err("bad_request", "args must be a JSON object")
+        principal = tokens.principal_for(token) if tokens is not None else None
+        if principal is None:
+            return _audited(None, "unauthorized",
+                            _err("unauthorized",
+                                 "a valid session token is required; call login"))
+        if not isinstance(op_id, str) or not _OP_ID_RE.match(op_id):
+            return _audited(principal, "bad_request",
+                            _err("bad_request", "a valid op_id is required"))
+        # Pre-spawn arg validation: a bad agent must NOT spawn a child — the client
+        # already holds started:true and would never see a child-side failure.
+        if verb == "agent_pull":
+            agent = args.get("agent", "claude")
+            if agent not in rscore.KNOWN_AGENTS:
+                return _audited(principal, "validation",
+                                _err("validation",
+                                     f"unknown agent {agent!r} (known: "
+                                     f"{', '.join(rscore.KNOWN_AGENTS)})"))
+        if _build_in_progress():
+            return _audited(principal, "busy",
+                            _err("busy", "a build is already running"))
+        if spawn_build is None:              # tests: gate + validate, never spawn
+            return _audited(principal, "ok",
+                            {"ok": True, "result": {"op_id": op_id, "started": True}})
+        pid = spawn_build(op_id, verb, args)     # detached child
+        _write_build_lock(pid, op_id, verb)      # PARENT writes, in the serial section
+        return _audited(principal, "ok",
+                        {"ok": True, "result": {"op_id": op_id, "started": True}})
 
     fn = table.get(verb)
     if fn is None:
@@ -682,7 +917,8 @@ class _Handler(socketserver.StreamRequestHandler):
                             msg.get("token"), self.server.tokens,
                             op_id=msg.get("op_id"),
                             audit=broker_auth.audit_event,
-                            oplog=make_oplog))
+                            oplog=make_oplog,
+                            spawn_build=_spawn_build_child))
 
     def _send(self, reply: dict) -> None:
         data = json.dumps(reply).encode()

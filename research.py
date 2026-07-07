@@ -191,6 +191,12 @@ def cmd_broker_passwd(_: argparse.Namespace) -> None:
     broker.passwd()
 
 
+def cmd_broker_run_build(args: argparse.Namespace) -> None:
+    """Hidden: the detached build-lane child. The running broker daemon spawns
+    this via _spawn_build_child (one per pull/rebuild); never an operator command."""
+    broker.run_build(args.op_id, args.verb, args.args_json)
+
+
 def _build(reqcls, **kw):
     """Build a validated rscore request from CLI args, mapping the
     input-validation channel (ValidationError) to the terminal's die()."""
@@ -1633,6 +1639,11 @@ def build_parser() -> argparse.ArgumentParser:
     brk_sub.add_parser(
         "serve", help="run the broker loop in the foreground (what `start` "
                       "spawns; for debugging)").set_defaults(func=cmd_broker_serve)
+    rb = brk_sub.add_parser("__run-build", help=argparse.SUPPRESS)  # detached build child
+    rb.add_argument("op_id")
+    rb.add_argument("verb")
+    rb.add_argument("args_json")
+    rb.set_defaults(func=cmd_broker_run_build)
 
     img = sub.add_parser("images", help="image version pins (manifest + freshness)")
     img_sub = img.add_subparsers(dest="subcommand", required=True)

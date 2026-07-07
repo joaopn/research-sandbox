@@ -940,9 +940,17 @@ function renderSoftwareScreen(view, result) {
 
     const refresh = el("button", { class: "btn-small" }, ["Refresh"]);
     refresh.onclick = () => renderSoftwareInto(view);
+    const rebuildBtn = el("button", { class: "btn-small" }, ["Rebuild all"]);
+    rebuildBtn.onclick = () => mgmtBuildDialog(view, {
+        title: "Rebuild the image fleet",
+        tailTitle: "Rebuilding the image fleet",
+        confirmLabel: "Rebuild all",
+        payload: { verb: "rebuild" },
+        body: [el("p", {}, ["Rebuild every image at the current effective pins — a long operation (often 10–15 min), one image at a time on the host. The rest of the webui stays responsive while it runs."])],
+    });
     view.appendChild(el("div", { class: "mgmt-header" }, [
         el("h2", {}, ["Software — dists, images, pins"]),
-        el("div", { class: "mgmt-toolbar" }, [refresh]),
+        el("div", { class: "mgmt-toolbar" }, [refresh, rebuildBtn]),
     ]));
 
     const cell = (v, cls) =>
@@ -954,11 +962,20 @@ function renderSoftwareScreen(view, result) {
             ? el("span", { class: "sw-ok" }, ["up to date"])
             : el("span", { class: "sw-warn" }, ["stale — re-pull"]);
     };
+    const pullBtn = (payload, tip) => {
+        const b = el("button", { class: "btn-small" }, ["Pull"]);
+        b.onclick = () => mgmtBuildDialog(view, {
+            title: "Pull dist", tailTitle: "Pulling dist", confirmLabel: "Pull",
+            payload: payload, body: [el("p", {}, [tip])],
+        });
+        return b;
+    };
 
     // --- Dists (agents + the editor) ---
     const distRows = [el("div", { class: "sw-row sw-row-head" }, [
         el("span", {}, ["Dist"]), el("span", {}, ["Present"]),
-        el("span", {}, ["Cached"]), el("span", {}, ["Effective pin"]), el("span", {}, ["Status"]),
+        el("span", {}, ["Cached"]), el("span", {}, ["Effective pin"]),
+        el("span", {}, ["Status"]), el("span", {}, [""]),
     ])];
     for (const a of agents) {
         distRows.push(el("div", { class: "sw-row" }, [
@@ -967,6 +984,9 @@ function renderSoftwareScreen(view, result) {
             cell(a.cached_version, "sw-mono"),
             cell(a.effective_pin, "sw-mono"),
             distStatus(a),
+            el("span", { class: "sw-act" }, [pullBtn(
+                { verb: "agent_pull", agent: a.agent },
+                "Rebuild this agent dist at the effective pin, in a throwaway build container (a few minutes).")]),
         ]));
     }
     const nExt = Object.keys(editor.extensions || {}).length;
@@ -976,6 +996,9 @@ function renderSoftwareScreen(view, result) {
         cell(editor.cached_version, "sw-mono"),
         cell(editor.effective_pin, "sw-mono"),
         distStatus(editor),
+        el("span", { class: "sw-act" }, [pullBtn(
+            { verb: "editor_pull" },
+            "Rebuild the editor dist at the effective pin, in a throwaway build container (a few minutes).")]),
     ]));
     view.appendChild(el("div", { class: "sw-section" }, [
         el("h3", {}, ["Dists"]),
@@ -1478,6 +1501,146 @@ function mgmtConfirmThenTail(view, cfg) {
     backdrop.appendChild(card);
     document.body.appendChild(backdrop);
     if (cfg.focus) setTimeout(() => cfg.focus(), 50);
+    return backdrop;
+}
+
+// ---- software: build lane (pull / rebuild) ---------------------------------
+// A build runs on the broker's DETACHED child (F2 Slice 2): the POST returns an
+// op_id at once, then we stream the RAW build log from /fulllog (the authenticated
+// relay of the host-only full log) into a scrolling <pre>, and read completion
+// TERMINAL-FIRST from the view-log (/log). We deliberately do NOT consult
+// GET /broker/op/<id> — it returns "unknown" for a build op by design (no OP_RUNS
+// entry), which is not-failure; the child's op.progress.done()/fail() in the
+// view-log is the completion signal.
+async function mgmtTailBuildLog(view, backdrop, card, opId, title) {
+    const phaseEl = el("div", { class: "op-phase" }, ["starting…"]);
+    const pre = el("pre", { class: "sw-buildlog" }, [""]);
+    const failEl = el("div", { class: "op-fail" });
+    const doneBtn = el("button", { class: "btn", disabled: "" }, ["Working…"]);
+    doneBtn.onclick = () => {
+        if (doneBtn.disabled) return;
+        backdrop.remove();
+        renderSoftwareInto(view);
+    };
+    card.innerHTML = "";
+    card.appendChild(el("h2", {}, [title]));
+    card.appendChild(phaseEl);
+    card.appendChild(pre);
+    card.appendChild(failEl);
+    card.appendChild(el("div", { class: "btn-row" }, [doneBtn]));
+
+    let logFrom = 0, viewFrom = 0, done = false, ok = false, sawTerminal = false, interrupted = false;
+    // Liveness probe (via the build lock) — the terminal-first tail has no other
+    // signal, so a hard-killed child (OOM / kill -9 / power-loss) that never wrote
+    // a terminal would spin the modal forever. null on a transient error → assume
+    // still alive and keep polling; only an explicit false ends the wait.
+    const checkAlive = async () => {
+        try {
+            const r = await fetch(`/broker/op/${encodeURIComponent(opId)}/alive`);
+            if (!r.ok) return null;
+            const b = await r.json();
+            return b.ok ? !!b.alive : null;
+        } catch (e) { return null; }
+    };
+    const drainFull = async () => {
+        const r = await fetch(`/broker/op/${encodeURIComponent(opId)}/fulllog?from=${logFrom}`);
+        const redirect = mgmtStatusRedirect(view, r.status);
+        if (redirect) return redirect;
+        const b = await r.json();
+        if (b.ok && b.exists && b.data) {
+            logFrom = b.next;
+            const atBottom = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+            pre.textContent += b.data;
+            if (atBottom) pre.scrollTop = pre.scrollHeight;   // follow the tail
+        }
+        return null;
+    };
+    const drainView = async () => {
+        const r = await fetch(`/broker/op/${encodeURIComponent(opId)}/log?from=${viewFrom}`);
+        const redirect = mgmtStatusRedirect(view, r.status);
+        if (redirect) return redirect;
+        const b = await r.json();
+        if (b.started !== false && b.data) {
+            viewFrom = b.next;
+            for (const line of b.data.split("\n")) {
+                if (!line.trim()) continue;
+                let rec; try { rec = JSON.parse(line); } catch (e) { continue; }
+                if (rec.status === "done") { sawTerminal = true; ok = true; }
+                else if (rec.status === "failed") { sawTerminal = true; ok = false; }
+                else if (rec.msg) phaseEl.textContent = rec.msg;
+            }
+        }
+        return null;
+    };
+
+    while (!done) {
+        try { const rd = await drainFull(); if (rd) { backdrop.remove(); return rd(); } }
+        catch (e) { /* transient */ }
+        try { const rd = await drainView(); if (rd) { backdrop.remove(); return rd(); } }
+        catch (e) { /* transient */ }
+        if (sawTerminal) { done = true; break; }   // view-log terminal = completion
+        // No terminal yet — is the build still running? run_build writes the
+        // terminal BEFORE releasing the lock, so alive===false means either the
+        // terminal just landed (drain once more to catch it) or the child was
+        // hard-killed without writing one (→ interrupted, don't spin forever).
+        const alive = await checkAlive();
+        if (alive === false) {
+            try { await drainFull(); await drainView(); } catch (e) { /* transient */ }
+            if (!sawTerminal) interrupted = true;
+            done = true; break;
+        }
+        await opSleep(OP_POLL_INTERVAL_MS);
+    }
+    try { await drainFull(); } catch (e) { /* best-effort trailing bytes */ }
+    if (interrupted) {
+        phaseEl.textContent = "interrupted";
+        failEl.textContent = "Build interrupted — the build process stopped without finishing. Check the log above.";
+    } else if (ok) { phaseEl.textContent = "done"; }
+    else { phaseEl.textContent = "failed"; failEl.textContent = "Build failed — see the log above."; }
+    doneBtn.textContent = "Done";
+    doneBtn.disabled = false;
+}
+
+// Confirm → POST /broker/software/build → stream. cfg = {title, confirmLabel,
+// body[], payload, tailTitle?}.
+function mgmtBuildDialog(view, cfg) {
+    if (document.querySelector(".modal-backdrop")) return null;
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const errEl = el("div", { class: "error" });
+    const cancel = el("button", { class: "btn btn-secondary" }, ["Cancel"]);
+    cancel.onclick = () => backdrop.remove();
+    const go = el("button", { class: "btn" }, [cfg.confirmLabel]);
+    const card = el("div", { class: "card sw-build-card" }, [
+        el("h2", {}, [cfg.title]),
+        ...(cfg.body || []),
+        el("div", { class: "btn-row" }, [cancel, go]),
+        errEl,
+    ]);
+    go.onclick = async () => {
+        errEl.textContent = "";
+        go.disabled = true; cancel.disabled = true; go.textContent = "…";
+        let res;
+        try {
+            res = await fetch("/broker/software/build", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(cfg.payload),
+            });
+        } catch (e) {
+            go.disabled = false; cancel.disabled = false; go.textContent = cfg.confirmLabel;
+            errEl.textContent = "Broker unreachable."; return;
+        }
+        const redirect = mgmtStatusRedirect(view, res.status);
+        if (redirect) { backdrop.remove(); return redirect(); }
+        let body; try { body = await res.json(); } catch (e) { body = {}; }
+        if (!body.ok || !body.op_id) {
+            go.disabled = false; cancel.disabled = false; go.textContent = cfg.confirmLabel;
+            errEl.textContent = "Failed: " + mgmtErrText(body); return;
+        }
+        await mgmtTailBuildLog(view, backdrop, card, body.op_id, cfg.tailTitle || cfg.title);
+    };
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
     return backdrop;
 }
 
