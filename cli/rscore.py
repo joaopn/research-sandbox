@@ -67,6 +67,7 @@ import mcp_registry  # noqa: E402
 import role_mcp  # noqa: E402
 import extension  # noqa: E402
 import workflow  # noqa: E402  (manifest store catalog; from_kwargs resolves --workflow)
+import gitea  # noqa: E402  (STAGE_DEV_GITEA: shared rs-gitea client + dev-lane host state)
 
 
 # ---------------------------------------------------------------------------
@@ -835,6 +836,159 @@ class PortListRequest:
         return cls(project=_require_name(kw.get("project")))
 
 
+# ---------------------------------------------------------------------------
+# Dev lane (STAGE_DEV_GITEA S1) — shared-gitea repo lifecycle + attachment
+# ---------------------------------------------------------------------------
+
+# GitHub repo URL parser + segment validator. The derived `repo` segment feeds a
+# HOST filesystem path (tokens/agent-<repo>.token) AND gitea account/repo names,
+# and dev_repo_add is a broker verb (webui-reachable once S3 lands) — so the
+# owner/repo segments are user-supplied input on a host path. Anchor them with the
+# _light_clone_basename rejection discipline (empty / '.' / '..' / separator).
+def _parse_github_repo(url: Any) -> tuple[str, str, str]:
+    """(_url, owner, repo) from an https://github.com/<owner>/<repo>[.git] URL.
+    Raises ValidationError (pre-side-effect) on a non-github/https URL or a
+    path-escaping segment. `repo` is the anchored segment used everywhere."""
+    if not isinstance(url, str) or not url.strip():
+        raise ValidationError("a github repo URL is required")
+    url = url.strip()
+    if not url.startswith("https://github.com/"):
+        raise ValidationError(
+            f"repo must be an https://github.com/<owner>/<repo> URL (got {url!r})")
+    rest = url[len("https://github.com/"):].strip("/")
+    parts = rest.split("/")
+    if len(parts) != 2:
+        raise ValidationError(
+            f"repo URL must name exactly <owner>/<repo> (got {url!r})")
+    owner, repo = parts[0], parts[1]
+    if repo.endswith(".git"):
+        repo = repo[: -len(".git")]
+    for seg, label in ((owner, "owner"), (repo, "repo")):
+        if seg in ("", ".", "..") or "/" in seg or "\\" in seg:
+            raise ValidationError(
+                f"invalid {label} segment in repo URL {url!r}")
+    return url, owner, repo
+
+
+@dataclass(frozen=True)
+class DevRepoAddRequest:
+    url: str
+    repo: str                                   # the anchored segment (derived)
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "DevRepoAddRequest":
+        url, _owner, repo = _parse_github_repo(kw.get("url"))
+        return cls(url=url, repo=repo)
+
+
+@dataclass(frozen=True)
+class DevRepoRemoveRequest:
+    repo: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "DevRepoRemoveRequest":
+        repo = kw.get("repo")
+        if not (isinstance(repo, str) and repo and repo not in (".", "..")
+                and "/" not in repo and "\\" not in repo):
+            raise ValidationError(f"invalid repo name {repo!r}")
+        return cls(repo=repo)
+
+
+@dataclass(frozen=True)
+class DevRepoListRequest:
+    @classmethod
+    def from_kwargs(cls, **_kw: Any) -> "DevRepoListRequest":
+        return cls()
+
+
+@dataclass(frozen=True)
+class DevAttachRequest:
+    project: str
+    klass: str                                  # "agent" | "control"
+    repo: str | None                            # required iff klass == "agent"
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "DevAttachRequest":
+        klass = kw.get("klass")
+        if klass not in ("agent", "control"):
+            raise ValidationError("class must be 'agent' or 'control'")
+        repo = kw.get("repo")
+        if klass == "agent":
+            if not (isinstance(repo, str) and repo and repo not in (".", "..")
+                    and "/" not in repo and "\\" not in repo):
+                raise ValidationError("an agent attachment requires a repo")
+        else:
+            repo = None                          # control entries carry no repo
+        return cls(project=_require_name(kw.get("project")), klass=klass, repo=repo)
+
+
+@dataclass(frozen=True)
+class DevDetachRequest:
+    project: str
+    repo: str | None                            # None ⇒ detach ALL of the project
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "DevDetachRequest":
+        repo = kw.get("repo")
+        if repo is not None:
+            if not (isinstance(repo, str) and repo and repo not in (".", "..")
+                    and "/" not in repo and "\\" not in repo):
+                raise ValidationError(f"invalid repo name {repo!r}")
+        return cls(project=_require_name(kw.get("project")), repo=repo)
+
+
+@dataclass(frozen=True)
+class DevSyncRequest:
+    repo: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "DevSyncRequest":
+        repo = kw.get("repo")
+        if not (isinstance(repo, str) and repo and repo not in (".", "..")
+                and "/" not in repo and "\\" not in repo):
+            raise ValidationError(f"invalid repo name {repo!r}")
+        return cls(repo=repo)
+
+
+@dataclass
+class DevRepoAddResult:
+    repo: str
+    url: str
+    mirror: str                                 # sandbox-admin/<repo>
+    fork: str                                   # agent-<repo>/<repo>
+    token_path: str                             # NEVER the token value (secret)
+
+
+@dataclass
+class DevRepoRemoveResult:
+    repo: str
+
+
+@dataclass
+class DevRepoListResult:
+    repos: list[dict]                           # [{repo, mirror, private}]
+
+
+@dataclass
+class DevAttachResult:
+    project: str
+    klass: str
+    repo: str | None
+    gitea_ip: str
+
+
+@dataclass
+class DevDetachResult:
+    project: str
+    repo: str | None
+    remaining: int                              # entries still attached for project
+
+
+@dataclass
+class DevSyncResult:
+    repo: str
+
+
 @dataclass
 class BoxAddResult:
     project: str
@@ -1352,6 +1506,12 @@ def destroy(req: DestroyRequest, cfg: "Config" | None = None,
     if volume_exists(docker_volume):
         run(["docker", "volume", "rm", docker_volume], capture_output=True)
     remove_project_network(project)
+    # Drop the project's dev-lane attachment entries (best-effort — a destroy
+    # must not die on a corrupt record). STAGE_DEV_GITEA S1.
+    try:
+        gitea.prune_project(project)
+    except Exception:
+        pass
 
 
 def start(req: StartStopRequest, cfg: "Config" | None = None,
@@ -2167,7 +2327,10 @@ def remove_project_network(project: str) -> None:
     # `_connect_registry_to_project_network()`; without an explicit disconnect,
     # `network rm` fails with "endpoints remain". All calls are idempotent — they
     # exit non-zero silently when the container isn't on this network.
-    for svc in (ROUTER_CONTAINER, WEBUI_CONTAINER, REGISTRY_CONTAINER):
+    # rs-gitea (if the project ever attached a dev repo) is disconnected too —
+    # same endpoints-remain reason (STAGE_DEV_GITEA S1).
+    for svc in (ROUTER_CONTAINER, WEBUI_CONTAINER, REGISTRY_CONTAINER,
+                gitea.GITEA_CONTAINER):
         run(["docker", "network", "disconnect", network, svc],
             capture_output=True)
     run(["docker", "network", "rm", network], capture_output=True)
@@ -4472,6 +4635,177 @@ def _connect_registry_to_project_network(network: str) -> None:
         capture_output=True)
 
 
+# ---------------------------------------------------------------------------
+# Shared rs-gitea (STAGE_DEV_GITEA S1) — the dev lane's registry-pattern sibling
+# ---------------------------------------------------------------------------
+
+def _ensure_gitea_running() -> None:
+    """Idempotent shared Gitea on rs-sandbox (the dev workflow's git hub). Triad:
+    running -> no-op; exists-stopped -> docker start; absent -> docker run. Home
+    ROUTER_NETWORK (internet via the gateway for mirror sync); admin API on a
+    127.0.0.1 loopback port only (the host-side dev verbs). Stood up LAZILY on
+    the first `dev repo add`, not at `research start`.
+
+    Stale-token guard: if the tokens exist but the container AND its volume are
+    gone, die with a remedy — a fresh gitea would reject the stale admin token
+    silently, so surface it rather than half-work."""
+    if (gitea.bootstrap_present()
+            and not container_exists(gitea.GITEA_CONTAINER)
+            and not volume_exists(gitea.GITEA_DATA_VOLUME)):
+        die(f"stale dev-lane tokens from a removed {gitea.GITEA_CONTAINER}; "
+            f"rm {gitea.ADMIN_TOKEN_PATH} and {gitea.OPERATOR_TOKEN_PATH} to "
+            f"re-bootstrap on the next `research dev repo add`.")
+    pins = load_versions()
+    host_port = pins.get("GITEA_HOST_PORT", gitea.DEFAULT_GITEA_HOST_PORT)
+    if container_running(gitea.GITEA_CONTAINER):
+        # Already up — but a prior attempt may have started it and then FAILED
+        # bootstrap (leaving no tokens). So fall through to the bootstrap-if-absent
+        # step rather than early-returning; the wait+bootstrap runs at most once
+        # (bootstrap_present() gates it), so a healthy re-entry is a cheap no-op.
+        _bootstrap_gitea_if_absent(host_port)
+        return
+    if container_exists(gitea.GITEA_CONTAINER):
+        run_check(["docker", "start", gitea.GITEA_CONTAINER])
+    else:
+        image = "gitea/gitea:" + pins.get("GITEA_VERSION", gitea.DEFAULT_GITEA_VERSION)
+        if not run_quiet(["docker", "image", "inspect", image]):
+            print(f"pulling {image}...")
+            run_check(["docker", "pull", image])
+        env = {
+            "INSTALL_LOCK": "true",
+            "GITEA__service__DISABLE_REGISTRATION": "true",
+            "GITEA__service__REQUIRE_SIGNIN_VIEW": "true",
+            # GitHub migration hits api.github.com (metadata) + codeload.github.com
+            # (archives) besides github.com (clone), so allow the apex + its
+            # subdomains — still tight (SSRF-guarded to GitHub only).
+            "GITEA__migrations__ALLOWED_DOMAINS": "github.com,*.github.com",
+            "GITEA__webhook__ALLOWED_HOST_LIST": "github.com",
+            "GITEA__server__DISABLE_SSH": "true",
+            "GITEA__server__ROOT_URL": f"http://{gitea.GITEA_CONTAINER}:{gitea.GITEA_INNER_PORT}/",
+        }
+        cmd = [
+            "docker", "run", "-d",
+            "--name", gitea.GITEA_CONTAINER,
+            "--network", ROUTER_NETWORK,
+            "--restart", "unless-stopped",
+            "-p", f"127.0.0.1:{host_port}:{gitea.GITEA_INNER_PORT}",
+            "-v", f"{gitea.GITEA_DATA_VOLUME}:/data",
+        ]
+        for k, v in env.items():
+            cmd += ["-e", f"{k}={v}"]
+        cmd.append(image)
+        r = run(cmd, capture_output=True)
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "").strip()
+            if "already allocated" in err or "address already in use" in err:
+                die(f"host port {host_port} is already in use; set GITEA_HOST_PORT "
+                    f"in versions.env to a free port and retry. (docker: "
+                    f"{err[-200:]})")
+            die(f"failed to start {gitea.GITEA_CONTAINER}: {err[-300:]}")
+        print(f"started {gitea.GITEA_CONTAINER} (shared dev gitea on "
+              f"{ROUTER_NETWORK})")
+    # We just started (or created) the container: its app is NOT serving the
+    # instant `docker start` returns (sqlite reopen + http bind take a moment).
+    # Wait for readiness BEFORE any caller touches the API — an already-bootstrapped
+    # restart would otherwise race the first post-restart API call (the "not
+    # private" cascade the harness caught). The pure-already-running path above
+    # skips this (gitea was already serving from a prior call).
+    _wait_for_gitea(host_port)
+    _bootstrap_gitea_if_absent(host_port)
+
+
+def _bootstrap_gitea_if_absent(host_port: str) -> None:
+    """Wait for readiness + create the admin/operator accounts, ONCE. Gated on
+    bootstrap_present() so a healthy re-entry is a cheap no-op; runs from both
+    the just-started path AND the already-running path (a prior run that started
+    the container but failed bootstrap left no tokens — this heals it)."""
+    if gitea.bootstrap_present():
+        return
+    _wait_for_gitea(host_port)
+    # A mint failure here raises GiteaError; die() (mid-execution infra channel)
+    # so it never escapes a broker verb fn as a foreign exception (dispatch
+    # catches only ValidationError/HarnessError/SystemExit).
+    try:
+        gitea.bootstrap_accounts(host_port, secrets.token_urlsafe(24),
+                                 secrets.token_urlsafe(24))
+    except gitea.GiteaError as e:
+        die(str(e))
+    print(f"bootstrapped {gitea.GITEA_CONTAINER} accounts "
+          f"({gitea.ADMIN_USER}, {gitea.OPERATOR_USER})")
+
+
+def _wait_for_gitea(host_port: str) -> None:
+    """Block until the gitea API answers, bounded. Named constant: gitea's first
+    boot (sqlite init + migrations) is a few seconds; 60 * 1s covers a cold pull
+    on a slow disk without hanging forever on a wedged container."""
+    import time
+    # /api/healthz is the PUBLIC readiness endpoint (DB + cache ping) — unlike
+    # /api/v1/version, it is NOT gated by REQUIRE_SIGNIN_VIEW (which we set), so
+    # it answers 200 without auth the moment gitea is serving.
+    health = f"http://127.0.0.1:{host_port}/api/healthz"
+    # Worst case on the serial thread is GITEA_BOOT_WAIT_TRIES × (probe+sleep) ≈
+    # 4 min against a wedged gitea — bounded, CLI-dominant today (a webui client
+    # would have hit its 30s relay timeout long before, which is acceptable: the
+    # daemon keeps working, only that one relayed call reports unreachable).
+    for _ in range(GITEA_BOOT_WAIT_TRIES):
+        # Per-probe bound so a half-up gitea can't hang the caller on urllib's
+        # default (no) timeout. Stdlib only — no host-tool dependency.
+        try:
+            with urllib.request.urlopen(health, timeout=GITEA_PROBE_MAX_TIME_S):
+                return
+        except OSError:
+            pass
+        time.sleep(1)
+    die(f"{gitea.GITEA_CONTAINER} did not become ready on 127.0.0.1:{host_port}")
+
+
+GITEA_BOOT_WAIT_TRIES = 60       # ~1 probe/sec; covers a cold pull + sqlite init
+GITEA_PROBE_MAX_TIME_S = 3       # per-probe bound (< the 1s-cadence loop's budget)
+
+
+def _connect_gitea_to_project_network(network: str) -> str:
+    """Attach rs-gitea to a per-project network (L2, dodging the router RFC1918
+    DROP, exactly like the registry) and return its IP on that bridge — recorded
+    in the attachment record so S2 can inject `--add-host rs-gitea:<ip>` into a
+    box (inner-container DNS does not resolve outer-bridge names)."""
+    _ensure_gitea_running()
+    run(["docker", "network", "connect", network, gitea.GITEA_CONTAINER],
+        capture_output=True)
+    r = run(["docker", "inspect", gitea.GITEA_CONTAINER, "-f",
+             '{{(index .NetworkSettings.Networks "' + network + '").IPAddress}}'],
+            capture_output=True)
+    return r.stdout.strip()
+
+
+def wire_gitea_to_projects() -> None:
+    """Re-attach rs-gitea after a host `start`/recreate — SELECTIVE, unlike
+    wire_registry_to_projects (which wires ALL projects): only the projects in
+    the attachment record, refreshing each entry's gitea_ip on reconnect. No-op
+    if gitea was never stood up (no dev repo added yet)."""
+    if not container_exists(gitea.GITEA_CONTAINER):
+        return
+    if not container_running(gitea.GITEA_CONTAINER):
+        run_check(["docker", "start", gitea.GITEA_CONTAINER])
+    entries = gitea.load_attachments()
+    projects = sorted({e["project"] for e in entries if e.get("project")})
+    for project in projects:
+        network = project_network_for(project)
+        if not network_exists(network):
+            continue
+        ip = _connect_gitea_to_project_network(network)
+        if not ip:
+            # A reconnect whose inspect came back empty must NOT overwrite the
+            # recorded IP with "" (symmetry with dev_attach's empty-IP guard);
+            # leave the prior record for S2 to re-read.
+            print(f"warning: rs-gitea reconnect to {network} returned no IP; "
+                  f"keeping the recorded gitea_ip", file=sys.stderr)
+            continue
+        # Refresh gitea_ip on every entry of this project (the IP can change
+        # across a disconnect/reconnect).
+        for e in gitea.project_entries(project):
+            gitea.record_attachment(project, e["class"], e.get("repo"), ip)
+
+
 def _push_generic_image(host_base: str) -> None:
     """Lazily publish a GENERIC lane-3 box image (rs-sandbox-box[-browser]) into
     the local registry. Keys on extension.GENERIC_REGISTRY_IMAGES and the
@@ -5813,6 +6147,118 @@ def port_list(req: "PortListRequest", _progress=None) -> PortListResult:  # type
     if not ws.is_dir():
         return PortListResult(project=req.project, ports=[])
     return PortListResult(project=req.project, ports=read_exported_ports(ws))
+
+
+# ---------------------------------------------------------------------------
+# Dev lane verbs (STAGE_DEV_GITEA S1). Every gitea.GiteaError is re-raised as a
+# ValidationError so a broker verb fn never lets a foreign exception escape into
+# socketserver (the _verb_workflows rule). Secrets (PAT, agent token) never enter
+# a message — GiteaError carries only method/path/status by construction.
+# ---------------------------------------------------------------------------
+
+def _gitea_host_port() -> str:
+    return load_versions().get("GITEA_HOST_PORT", gitea.DEFAULT_GITEA_HOST_PORT)
+
+
+def dev_repo_add(req: "DevRepoAddRequest", _progress=None) -> DevRepoAddResult:  # type: ignore[name-defined]
+    """Mirror a GitHub repo into shared gitea + fork it for a per-repo agent user.
+    Resumable/idempotent (a mid-migrate timeout heals on re-run). Reports the
+    TOKEN FILE PATH, never the token value (secrets-off-results)."""
+    _ensure_gitea_running()
+    host_port = _gitea_host_port()
+    # Private-source detection is best-effort: a private GitHub repo needs the PAT
+    # in the migrate auth_token. We can't know without asking GitHub, so treat the
+    # repo as private iff a PAT is configured (the PAT is harmless on a public
+    # clone, and a private repo without a PAT fails loudly at migrate).
+    private = gitea.PAT_PATH.is_file()
+    try:
+        gitea.add_repo(host_port, req.url, req.repo, private)
+    except gitea.GiteaError as e:
+        raise ValidationError(str(e))
+    return DevRepoAddResult(
+        repo=req.repo, url=req.url,
+        mirror=f"{gitea.ADMIN_USER}/{req.repo}",
+        fork=f"{gitea.agent_user_for(req.repo)}/{req.repo}",
+        token_path=str(gitea.agent_token_path(req.repo)))
+
+
+def dev_repo_remove(req: "DevRepoRemoveRequest", _progress=None) -> DevRepoRemoveResult:  # type: ignore[name-defined]
+    """Delete the mirror + fork + agent user + token file. Refuse while any
+    project is still attached to the repo (explicit beats silent unwiring)."""
+    attached = gitea.attached_projects(req.repo)
+    if attached:
+        die(f"repo {req.repo!r} is attached to: {', '.join(attached)}. "
+            f"Detach those projects first (`research dev detach <project>`).")
+    if not container_exists(gitea.GITEA_CONTAINER):
+        die("rs-gitea does not exist; nothing to remove")
+    _ensure_gitea_running()            # start a stopped-but-existing gitea first
+    try:
+        gitea.remove_repo(_gitea_host_port(), req.repo)
+    except gitea.GiteaError as e:
+        raise ValidationError(str(e))
+    return DevRepoRemoveResult(repo=req.repo)
+
+
+def dev_repo_list(_req: "DevRepoListRequest", _progress=None) -> DevRepoListResult:  # type: ignore[name-defined]
+    if not container_exists(gitea.GITEA_CONTAINER):
+        return DevRepoListResult(repos=[])
+    _ensure_gitea_running()
+    try:
+        repos = gitea.list_repos(_gitea_host_port())
+    except gitea.GiteaError as e:
+        raise ValidationError(str(e))
+    return DevRepoListResult(repos=repos)
+
+
+def dev_attach(req: "DevAttachRequest", _progress=None) -> DevAttachResult:  # type: ignore[name-defined]
+    """Connect a project's bridge to rs-gitea and record the attachment (class +
+    repo + gitea_ip). Agent-class carries the repo it works; control-class is
+    fetch-only (repo None). The staged credential differs (S2/S3); the network
+    connect is identical."""
+    container = container_name_for(req.project)
+    if not container_exists(container):
+        die(f"project {req.project!r} does not exist")
+    network = project_network_for(req.project)
+    if not network_exists(network):
+        die(f"project {req.project!r} has no network; start it first")
+    if req.klass == "agent":
+        # The repo must have been added (its mirror/fork exist) before an agent
+        # attaches — the token file is the S2 staging bridge.
+        if not gitea.agent_token_path(req.repo).is_file():
+            die(f"repo {req.repo!r} not added yet "
+                f"(`research dev repo add <github-url>` first)")
+    ip = _connect_gitea_to_project_network(network)
+    if not ip:
+        die(f"rs-gitea did not attach to {network} (no IP); check docker state")
+    gitea.record_attachment(req.project, req.klass, req.repo, ip)
+    return DevAttachResult(project=req.project, klass=req.klass, repo=req.repo,
+                           gitea_ip=ip)
+
+
+def dev_detach(req: "DevDetachRequest", _progress=None) -> DevDetachResult:  # type: ignore[name-defined]
+    """Remove attachment entries; disconnect the bridge from rs-gitea IFF no
+    entry remains for the project. repo=None detaches ALL of the project."""
+    if req.repo is None:
+        gitea.prune_project(req.project)
+        remaining = []
+    else:
+        remaining = gitea.prune_entry(req.project, req.repo)
+    if not remaining:
+        network = project_network_for(req.project)
+        if network_exists(network):
+            run(["docker", "network", "disconnect", network, gitea.GITEA_CONTAINER],
+                capture_output=True)
+    return DevDetachResult(project=req.project, repo=req.repo,
+                           remaining=len(remaining))
+
+
+def dev_sync(req: "DevSyncRequest", _progress=None) -> DevSyncResult:  # type: ignore[name-defined]
+    _ensure_gitea_running()
+    try:
+        gitea.sync_repo(_gitea_host_port(), req.repo)
+    except gitea.GiteaError as e:
+        raise ValidationError(str(e))
+    return DevSyncResult(repo=req.repo)
 
 
 def wire_webui_to_projects() -> None:

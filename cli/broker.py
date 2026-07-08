@@ -525,6 +525,52 @@ def _verb_port_list(args: dict, _progress=None) -> dict:
     return dataclasses.asdict(rscore.port_list(req))
 
 
+# Dev lane (STAGE_DEV_GITEA S1). Deny-by-default field allowlists, mirroring the
+# port verbs. `url`/`repo`/`project`/`class` act inside gitea or on the project's
+# own network — none is host-shaped (no bind-mount source, no host port). The
+# GitHub PAT is NOT here: it's a host-CLI-only secret write, never relayed. Repo
+# remove joins STEP_UP_VERBS (deletes agent work). None joins OPEN_VERBS.
+DEV_REPO_ADD_WEBUI_FIELDS = frozenset({"url"})
+DEV_ATTACH_WEBUI_FIELDS = frozenset({"project", "klass", "repo"})
+DEV_DETACH_WEBUI_FIELDS = frozenset({"project", "repo"})
+DEV_TARGET_WEBUI_FIELDS = frozenset({"repo"})
+
+
+def _verb_dev_repo_add(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in DEV_REPO_ADD_WEBUI_FIELDS}
+    req = rscore.DevRepoAddRequest.from_kwargs(**safe)   # may raise ValidationError
+    return dataclasses.asdict(rscore.dev_repo_add(req))
+
+
+def _verb_dev_repo_remove(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in DEV_TARGET_WEBUI_FIELDS}
+    req = rscore.DevRepoRemoveRequest.from_kwargs(**safe)  # may raise ValidationError
+    return dataclasses.asdict(rscore.dev_repo_remove(req))
+
+
+def _verb_dev_repo_list(_args: dict, _progress=None) -> dict:
+    req = rscore.DevRepoListRequest.from_kwargs()
+    return dataclasses.asdict(rscore.dev_repo_list(req))
+
+
+def _verb_dev_attach(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in DEV_ATTACH_WEBUI_FIELDS}
+    req = rscore.DevAttachRequest.from_kwargs(**safe)    # may raise ValidationError
+    return dataclasses.asdict(rscore.dev_attach(req))
+
+
+def _verb_dev_detach(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in DEV_DETACH_WEBUI_FIELDS}
+    req = rscore.DevDetachRequest.from_kwargs(**safe)    # may raise ValidationError
+    return dataclasses.asdict(rscore.dev_detach(req))
+
+
+def _verb_dev_sync(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in DEV_TARGET_WEBUI_FIELDS}
+    req = rscore.DevSyncRequest.from_kwargs(**safe)      # may raise ValidationError
+    return dataclasses.asdict(rscore.dev_sync(req))
+
+
 # The closed lifecycle vocabulary — the host-root boundary. Adding a verb here
 # is a deliberate, security-reviewed edit; never a docker passthrough.
 VERBS = {
@@ -550,6 +596,12 @@ VERBS = {
     "port_add": _verb_port_add,
     "port_remove": _verb_port_remove,
     "port_list": _verb_port_list,
+    "dev_repo_add": _verb_dev_repo_add,
+    "dev_repo_remove": _verb_dev_repo_remove,
+    "dev_repo_list": _verb_dev_repo_list,
+    "dev_attach": _verb_dev_attach,
+    "dev_detach": _verb_dev_detach,
+    "dev_sync": _verb_dev_sync,
 }
 
 # Verbs requiring step-up re-auth: a FRESH login proof (derived client-side
@@ -557,7 +609,7 @@ VERBS = {
 # token, so a stolen token alone cannot trigger them. `destroy` is
 # the data-destroying verb; this is the cheap half of its gate (the recoverable
 # soft-delete + rate-limit land before the webui is exposed beyond localhost).
-STEP_UP_VERBS = frozenset({"destroy", "box_remove"})
+STEP_UP_VERBS = frozenset({"destroy", "box_remove", "dev_repo_remove"})
 
 # Deny-by-default gating: a verb in VERBS but NOT in this read allowlist
 # requires a valid session token. Inverting the set (vs an explicit *gated*

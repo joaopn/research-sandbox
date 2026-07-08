@@ -50,6 +50,7 @@ import mcp_registry  # noqa: E402
 import role_mcp  # noqa: E402
 import extension  # noqa: E402  (per-project box surface)
 import workflow  # noqa: E402  (workflow manifest schema + store catalog; read-only here)
+import gitea  # noqa: E402  (STAGE_DEV_GITEA: dev-lane host state paths for the CLI shims)
 import broker  # noqa: E402  (host-side lifecycle-verb daemon over a unix socket; opt-in)
 
 # --- lifecycle core ---------------------------------------------------------
@@ -160,6 +161,10 @@ def cmd_start(args: argparse.Namespace) -> None:
     # recreated it. LAZY: no-op until a project has stood the registry up (first
     # box delivery — sandbox-dind create or research box_add). STAGE_FEATURE_STAGING C1.
     wire_registry_to_projects()
+    # Re-attach shared rs-gitea to the projects in the dev-lane attachment record.
+    # SELECTIVE (only recorded projects), unlike the registry. No-op until a dev
+    # repo has been attached. STAGE_DEV_GITEA S1.
+    wire_gitea_to_projects()
     _start_enabled_mcps()
     print("up.")
 
@@ -202,6 +207,16 @@ def _build(reqcls, **kw):
     input-validation channel (ValidationError) to the terminal's die()."""
     try:
         return reqcls.from_kwargs(**kw)
+    except rscore.ValidationError as e:
+        die(str(e))
+
+
+def _call(fn, *args):
+    """Invoke an rscore verb, mapping a mid-verb ValidationError to die(). The
+    dev verbs are the first to re-raise (e.g. a GiteaError→ValidationError inside
+    the verb), which _build (from_kwargs-only) and main() do not net."""
+    try:
+        return fn(*args)
     except rscore.ValidationError as e:
         die(str(e))
 
@@ -1614,6 +1629,101 @@ def cmd_webui(args: argparse.Namespace) -> None:
         return
 
 
+_GITHUB_API_TIMEOUT_S = 15   # one /user validation call; bounded like gitea's API
+
+
+def cmd_dev_pat_set(args: argparse.Namespace) -> None:
+    """Save the GitHub PAT used only for private-mirror sync. Validate against
+    GET /user; warn (not fail) on classic-PAT write scopes — the read-only-PAT
+    invariant is a discipline, and the API can't see fine-grained scopes."""
+    import getpass
+    token = sys.stdin.readline().strip() if not sys.stdin.isatty() \
+        else getpass.getpass("GitHub PAT (input hidden): ").strip()
+    if not token:
+        die("no token provided")
+    req = urllib.request.Request(
+        "https://api.github.com/user",
+        headers={"Authorization": f"Bearer {token}",
+                 "Accept": "application/vnd.github+json",
+                 "User-Agent": "research-sandbox"})
+    try:
+        with urllib.request.urlopen(req, timeout=_GITHUB_API_TIMEOUT_S) as resp:
+            scopes = resp.headers.get("X-OAuth-Scopes", "")
+    except urllib.error.HTTPError as e:
+        die(f"GitHub rejected the token (HTTP {e.code}); not saved")
+    except urllib.error.URLError as e:
+        die(f"could not reach GitHub: {e.reason}")
+    write_scopes = [s.strip() for s in scopes.split(",")
+                    if s.strip() and ("write" in s or "delete" in s
+                                      or s.strip() == "repo")]
+    if write_scopes:
+        print(f"warning: token carries write-capable scope(s) {write_scopes}; "
+              "the dev lane only needs read. Prefer a read-only fine-grained PAT.",
+              file=sys.stderr)
+    gitea.DEV_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(gitea.DEV_DIR, 0o700)
+    except OSError:
+        pass
+    fd = os.open(str(gitea.PAT_PATH), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(token)
+    print(f"saved GitHub PAT at {gitea.PAT_PATH} (0600)")
+
+
+def cmd_dev_pat_unset(_args: argparse.Namespace) -> None:
+    try:
+        gitea.PAT_PATH.unlink()
+        print(f"removed {gitea.PAT_PATH}")
+    except FileNotFoundError:
+        print("no GitHub PAT configured")
+
+
+def cmd_dev_repo_add(args: argparse.Namespace) -> None:
+    req = _build(rscore.DevRepoAddRequest, url=args.url)
+    res = _call(rscore.dev_repo_add, req)
+    print(f"added {res.repo}")
+    print(f"  mirror: {res.mirror}")
+    print(f"  fork:   {res.fork}")
+    print(f"  token:  {res.token_path}")
+
+
+def cmd_dev_repo_remove(args: argparse.Namespace) -> None:
+    req = _build(rscore.DevRepoRemoveRequest, repo=args.repo)
+    _call(rscore.dev_repo_remove, req)
+    print(f"removed {args.repo} (mirror + fork + agent user + token)")
+
+
+def cmd_dev_repo_list(_args: argparse.Namespace) -> None:
+    res = _call(rscore.dev_repo_list, _build(rscore.DevRepoListRequest))
+    if not res.repos:
+        print("no dev repos")
+        return
+    for r in sorted(res.repos, key=lambda e: e.get("repo") or ""):
+        print(f"  {r.get('repo')}")
+
+
+def cmd_dev_attach(args: argparse.Namespace) -> None:
+    req = _build(rscore.DevAttachRequest, project=args.project, klass=args.klass,
+                 repo=args.repo)
+    res = _call(rscore.dev_attach, req)
+    tail = f" (repo {res.repo})" if res.repo else ""
+    print(f"attached {res.project} as {res.klass}{tail}; rs-gitea at {res.gitea_ip}")
+
+
+def cmd_dev_detach(args: argparse.Namespace) -> None:
+    req = _build(rscore.DevDetachRequest, project=args.project, repo=args.repo)
+    res = _call(rscore.dev_detach, req)
+    print(f"detached {res.project}"
+          + (f" (repo {res.repo})" if res.repo else " (all)")
+          + f"; {res.remaining} attachment(s) remain")
+
+
+def cmd_dev_sync(args: argparse.Namespace) -> None:
+    _call(rscore.dev_sync, _build(rscore.DevSyncRequest, repo=args.repo))
+    print(f"triggered mirror sync for {args.repo}")
+
+
 def cmd_workflow_list(args: argparse.Namespace) -> None:
     """Render the store catalog: built-in workflows + any host-side BYO entries.
     Read-only — the workflow surface is not yet wired into `create()` (that, plus
@@ -2115,6 +2225,43 @@ def build_parser() -> argparse.ArgumentParser:
     wfl = wf_sub.add_parser("list", help="list available workflows (built-in + BYO)")
     wfl.add_argument("--json", action="store_true")
     wfl.set_defaults(func=cmd_workflow_list)
+
+    # Dev lane (STAGE_DEV_GITEA S1): shared-gitea repo lifecycle + attachment.
+    dv = sub.add_parser("dev",
+                        help="dev workflow: shared Gitea repo mirror/fork + "
+                             "per-project attachment (ADS-style dev sandbox)")
+    dv_sub = dv.add_subparsers(dest="subcommand", required=True)
+    dvp = dv_sub.add_parser("pat", help="GitHub PAT for private-mirror sync")
+    dvp_sub = dvp.add_subparsers(dest="pat_action", required=True)
+    dvps = dvp_sub.add_parser("set", help="save a (read-only) GitHub PAT; reads "
+                                          "stdin when piped, prompts on a tty")
+    dvps.set_defaults(func=cmd_dev_pat_set)
+    dvpu = dvp_sub.add_parser("unset", help="remove the saved GitHub PAT")
+    dvpu.set_defaults(func=cmd_dev_pat_unset)
+    dvr = dv_sub.add_parser("repo", help="mirror/fork lifecycle for a repo")
+    dvr_sub = dvr.add_subparsers(dest="repo_action", required=True)
+    dvra = dvr_sub.add_parser("add", help="mirror a GitHub repo + fork it for an agent")
+    dvra.add_argument("url", help="https://github.com/<owner>/<repo> URL")
+    dvra.set_defaults(func=cmd_dev_repo_add)
+    dvrr = dvr_sub.add_parser("remove", help="delete mirror + fork + agent user + token")
+    dvrr.add_argument("repo")
+    dvrr.set_defaults(func=cmd_dev_repo_remove)
+    dvrl = dvr_sub.add_parser("list", help="list dev repos")
+    dvrl.set_defaults(func=cmd_dev_repo_list)
+    dva = dv_sub.add_parser("attach", help="connect a project's network to rs-gitea")
+    dva.add_argument("project")
+    dva.add_argument("--class", dest="klass", choices=["agent", "control"],
+                     default="agent", help="agent (works a repo) or control (fetch-only)")
+    dva.add_argument("--repo", default=None, help="repo to work (required for --class agent)")
+    dva.set_defaults(func=cmd_dev_attach)
+    dvd = dv_sub.add_parser("detach", help="disconnect a project from rs-gitea")
+    dvd.add_argument("project")
+    dvd.add_argument("--repo", default=None,
+                     help="detach only this repo's entry (default: all of the project)")
+    dvd.set_defaults(func=cmd_dev_detach)
+    dvs = dv_sub.add_parser("sync", help="trigger a mirror sync from GitHub")
+    dvs.add_argument("repo")
+    dvs.set_defaults(func=cmd_dev_sync)
 
     ag = sub.add_parser("agent",
                         help="host-cached agent dists (claude, …) deployed into "
