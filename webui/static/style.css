@@ -1224,38 +1224,43 @@ body {
 
 /* Column layout. Height follows the visual viewport (--vvh, maintained by
    installGlobalTermRefit) so the soft keyboard shrinks the layout; 100dvh is
-   the pre-first-measurement fallback. The order swap puts .main-area (the
-   strip) ABOVE the rail in the column, so the open Projects view renders
-   under a still-visible strip — the chip stays reachable as the way back. */
+   the pre-first-measurement fallback. */
 html.mobile .dashboard {
     flex-direction: column;
     height: var(--vvh, 100dvh);
 }
-html.mobile .dashboard .main-area { order: 1; }
-html.mobile .dashboard .project-rail { order: 2; }
 
-/* The rail IS the Projects view: hidden unless .mobile-projects, filling the
-   space under the strip when shown. The desktop expanded/pinned classes never
-   appear on mobile (applyRailState strips them), so the floating-overlay
-   rules above are unreachable — no specificity contest. */
+/* The rail IS the Projects view: hidden unless .mobile-projects, and then a
+   full-height LEFT DRAWER under the strip — shrink-to-fit width (absolute →
+   width:auto sizes to content), so the service pane stays partially visible
+   to its right; taps on that exposed region close the drawer (the
+   installMobileProjectsOutsideClose handler). Same edge treatment as the
+   desktop unpinned-rail overlay above. The desktop expanded/pinned classes
+   never appear on mobile (applyRailState strips them), so that overlay rule
+   itself is unreachable — no specificity contest.
+   LOCKSTEP: top must equal the mobile strip height (html.mobile
+   .service-tabs, 52px) — the desktop overlay's top:36px↔36px-strip twin. */
 html.mobile .dashboard .project-rail { display: none; }
 html.mobile .dashboard.mobile-projects .project-rail {
     display: flex;
+    position: absolute;
+    top: 52px;
+    bottom: 0;
+    left: 0;
+    z-index: 3;
     width: auto;
-    flex: 1;
-    min-height: 0;
-    border-right: none;
+    min-width: 200px;   /* the desktop rail's default width — rows stay legible */
+    max-width: 85vw;    /* a service-pane sliver stays visible even with long names */
+    border-right: 1px solid var(--border-strong);
+    box-shadow: 4px 0 12px rgba(0, 0, 0, 0.4);
 }
 html.mobile .project-rail .rail-splitter { display: none; }
 html.mobile .project-rail .pin-btn { display: none; }
 
-/* Projects view open: the main area hugs the strip (terminal hidden below it,
-   rail takes the rest), and the strip collapses to the chip alone — service
-   chips, + / box controls, dividers and the zero-services note all hide, so a
-   strip tap while picking a project can't activate a service under the list.
+/* Projects view open: the strip collapses to the chip alone — service chips,
+   + / box controls, dividers and the zero-services note all hide, so a strip
+   tap while picking a project can't switch services under the open drawer.
    The chip gets an accent ring as the open-state affordance. */
-html.mobile .dashboard.mobile-projects .main-area { flex: 0 0 auto; }
-html.mobile .dashboard.mobile-projects .main-area .terminal-area { display: none; }
 html.mobile .dashboard.mobile-projects .service-tabs .tab[data-service],
 html.mobile .dashboard.mobile-projects .service-tabs .add-box-tab-btn,
 html.mobile .dashboard.mobile-projects .service-tabs .tab-group-divider,
@@ -1266,7 +1271,8 @@ html.mobile .dashboard.mobile-projects .service-tabs .active-project {
 }
 
 /* Tab strip = [project chip][whitelisted chips]: one thick thumbable row.
-   52px = the common 44px minimum touch target + room for the larger type.
+   52px = the common 44px minimum touch target + room for the larger type;
+   LOCKSTEP: the open drawer's top offset above must match this height.
    THE MOBILE TAB MODEL: show enabled ∩ {cli, reader} — the :not() below IS
    the whitelist; extending mobile to another visual surface = extending that
    list. code-server / box editors / port-<n> stay desktop-only. Pin buttons
@@ -1280,10 +1286,15 @@ html.mobile .service-tabs .tab[data-surface="visual"]:not([data-service="reader"
 html.mobile .service-tabs .pin-tab-btn,
 html.mobile .service-tabs .tab-group-divider { display: none; }
 
-/* The chip as a control: chevron affordance + comfortable tap height. */
+/* The chip as a control: chevron affordance + comfortable tap height. The
+   right margin mirrors the base rule's margin-left (the divider that used to
+   separate chip and tabs is mobile-hidden, so without it the chip abuts the
+   first tab); symmetric padding keeps the chevron off the edge. */
 html.mobile .service-tabs .active-project {
     height: 32px;
     font-size: 14px;
+    padding: 0 14px;
+    margin-right: 8px;
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
 }
@@ -1315,6 +1326,41 @@ html.mobile .http-iframe {
 }
 
 html.mobile .welcome { padding: 24px 16px; }
+
+/* Terminal key bar — keys the soft keyboard lacks (Esc/Tab/Ctrl, up/down,
+   byobu F1-F4, Paste). A .main-area flex sibling below the terminal area, so
+   the --vvh keyboard shrink pushes it up with everything else. 40px: full-
+   height single-glyph keys stay thumbable while slimmer than the 52px
+   primary strip. The keys' flex-grow JUSTIFIES the row whenever it fits the
+   width (ten keys × 36px min ≈ 360px fits typical phones); only an
+   overflowing row falls back to min-width + horizontal scroll. */
+html.mobile .term-keybar {
+    display: flex;
+    flex-shrink: 0;
+    height: 40px;
+    overflow-x: auto;
+    background: var(--bg-card);
+    border-top: 1px solid var(--border);
+}
+html.mobile .term-keybar.hidden { display: none; }
+html.mobile .term-keybar .key {
+    flex: 1 0 auto;
+    min-width: 36px;
+    padding: 0 6px;
+    background: transparent;
+    color: var(--fg-muted);
+    border: none;
+    border-right: 1px solid var(--border);
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 13px;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+}
+html.mobile .term-keybar .key:last-child { border-right: none; }
+html.mobile .term-keybar .key.active {
+    color: var(--fg-accent);
+    box-shadow: 0 -2px 0 var(--fg-accent) inset;
+}
 
 /* The per-project ⚙ config box (opened from the Projects view rows) is the
    mobile enable/disable surface for the whitelisted tabs (Editor/Reader

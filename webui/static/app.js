@@ -484,6 +484,9 @@ async function renderDashboard(opts = {}) {
     termArea.appendChild(el("div", { class: "welcome", id: "welcome" }, [welcomeText()]));
 
     const main = el("div", { class: "main-area" }, [tabStrip, termArea]);
+    // Terminal key bar (mobile only): a flex sibling BELOW the terminal area,
+    // hidden until an ssh-kind service is active (updateMobileKeybar).
+    if (mobileModeActive()) main.appendChild(makeTermKeybar());
     const dashboard = el("div", { class: "dashboard" }, [rail, main]);
     document.body.appendChild(el("div", { id: "app" }, [dashboard]));
 
@@ -492,6 +495,9 @@ async function renderDashboard(opts = {}) {
     scheduleServicesRefresh();
     // Rail-visibility-gated status polling is started inside applyRailState;
     // no separate kickoff needed here.
+
+    // Project-less strips need the fallback opener chip (softlock guard).
+    ensureMobileChip();
 
     if (state.activeProject) {
         await activateProject(state.activeProject);
@@ -541,6 +547,11 @@ function teardownAllTerminals() {
 // host-nav tap hit the toggle-closed branch and appear dead.
 async function rerenderShell() {
     teardownAllTerminals();
+    // The key-bar Ctrl latch must not survive the rebuild: the bar is
+    // destroyed without a hide transition here, and on a mobile→desktop flip
+    // no new bar exists to ever clear it — the next typed character would be
+    // silently transformed into a control char.
+    clearKeybarCtrlLatch();
     state.hostPage = null;
     applyMobileClass();
     await renderDashboard({ skipBrokerLogin: true });
@@ -928,6 +939,7 @@ function setMobileProjectsView(on) {
     if (!dashboard) return;
     dashboard.classList.toggle("mobile-projects", on);
     scheduleStatusPolling();
+    updateMobileKeybar();
     // Close transition: #terminal-area was display:none while the view was
     // open, so any viewport change during it (rotation, soft keyboard) made
     // the global refit a no-op on a 0x0 container — refit the now-visible
@@ -957,6 +969,165 @@ function mobileToggleProjects() {
     const dashboard = document.querySelector(".dashboard");
     const on = !!(dashboard && dashboard.classList.contains("mobile-projects"));
     setMobileProjectsView(!on);
+}
+
+// The chip is the ONLY drawer opener on mobile, but the real chip is born in
+// renderServiceTabs (per-project) and showWelcome's wipe clears the strip —
+// so a project-less state (first spawn, zero-visible fallback) would leave
+// an EMPTY strip and, combined with the outside-tap close below, a SOFTLOCK:
+// the drawer dismissed with nothing left to reopen it. Keep a placeholder
+// chip in any project-less strip; idempotent (no-op when a chip exists), and
+// renderServiceTabs replaces the whole strip with the real chip on project
+// activation.
+function ensureMobileChip() {
+    if (!mobileModeActive()) return;
+    const strip = document.getElementById("service-tabs");
+    if (!strip || strip.querySelector(".active-project")) return;
+    const chip = el("div", { class: "active-project" }, ["Projects"]);
+    chip.onclick = () => {
+        if (!mobileModeActive()) return;
+        mobileToggleProjects();
+    };
+    strip.appendChild(chip);
+}
+
+// Drawer-scrim semantics: a tap on the exposed service pane beside the open
+// drawer CLOSES it instead of typing into a half-visible terminal. Mirrors
+// installRailOutsideClickHandlers' exclusion walk — the drawer itself, the
+// chip (its own onclick toggles; firing here too would double-toggle), the
+// per-row config gear + its floating box, and any modal all keep the drawer
+// open. Known accepted edge: taps INSIDE an iframe (reader) don't bubble to
+// the document and won't close the drawer.
+function installMobileProjectsOutsideClose() {
+    document.addEventListener("pointerdown", (ev) => {
+        if (!mobileModeActive()) return;
+        const dashboard = document.querySelector(".dashboard.mobile-projects");
+        if (!dashboard) return;
+        const path = ev.composedPath ? ev.composedPath() : [];
+        for (const node of path) {
+            if (!node || !node.classList) continue;
+            if (node.classList.contains("project-rail")) return;
+            if (node.classList.contains("active-project")) return;
+            if (node.classList.contains("project-config-btn")) return;
+            if (node.classList.contains("project-config-box")) return;
+            if (node.classList.contains("modal-backdrop")) return;
+        }
+        setMobileProjectsView(false);
+    });
+}
+
+// ---- mobile terminal key bar ------------------------------------------------
+// Keys the soft keyboard lacks, for driving byobu/claude from a phone:
+// Esc · Tab · Ctrl(latch) · arrows · F1-F4 (byobu window nav) · Paste.
+// Lives as a .main-area flex sibling BELOW #terminal-area (the terminal
+// instances are absolutely positioned INSIDE the area, so the bar must sit
+// outside it); created only on mobile, visibility derived by
+// updateMobileKeybar. Sends ride the same TextEncoder→ws path as term.onData.
+
+let keybarCtrlLatch = false;
+
+function clearKeybarCtrlLatch() {
+    keybarCtrlLatch = false;
+    const btn = document.querySelector(".term-keybar .key-ctrl");
+    if (btn) btn.classList.remove("active");
+}
+
+// One-shot Ctrl, consumed by the NEXT typed character (called from the
+// term.onData path). Uppercasing maps a-z into the @-_ control range;
+// anything outside it passes through unchanged but still spends the latch —
+// a latch that survives would turn a much-later ordinary keystroke into an
+// unintended control char (e.g. a stray SIGINT).
+function consumeKeybarCtrl(d) {
+    if (!keybarCtrlLatch || d.length !== 1) return d;
+    clearKeybarCtrlLatch();
+    const code = d.toUpperCase().charCodeAt(0);
+    if (code >= 64 && code <= 95) return String.fromCharCode(code & 0x1f);
+    return d;
+}
+
+// Raw-sequence sender for the non-typed keys. Clears the latch first: EVERY
+// bar action is "the next key" for the one-shot Ctrl (an Esc/arrow tap must
+// not leave the latch armed for a later keystroke).
+function keybarSend(seq) {
+    clearKeybarCtrlLatch();
+    const t = activeTerminal();
+    if (t && t.ws && t.ws.readyState === WebSocket.OPEN) {
+        t.ws.send(new TextEncoder().encode(seq));
+    }
+}
+
+function makeTermKeybar() {
+    const bar = el("div", { class: "term-keybar hidden" });
+    const key = (label, cls, onTap) => {
+        const b = el("button", { class: "key " + cls }, [label]);
+        // Keep the xterm textarea focused so the soft keyboard stays up.
+        b.addEventListener("pointerdown", (ev) => ev.preventDefault());
+        b.onclick = onTap;
+        return b;
+    };
+    // Arrows honor DECCKM (byobu/vim set application cursor keys; plain
+    // bash doesn't): SS3 in application mode, CSI otherwise.
+    const arrow = (letter) => () => {
+        const t = activeTerminal();
+        const app = !!(t && t.term && t.term.modes && t.term.modes.applicationCursorKeysMode);
+        keybarSend((app ? "\x1bO" : "\x1b[") + letter);
+    };
+    const ss3 = (letter) => () => keybarSend("\x1bO" + letter);
+    const ctrlBtn = key("Ctrl", "key-ctrl", () => {
+        keybarCtrlLatch = !keybarCtrlLatch;
+        ctrlBtn.classList.toggle("active", keybarCtrlLatch);
+    });
+    const paste = key("Paste", "key-paste", async () => {
+        // Spend the latch BEFORE pasting — a 1-char clipboard would otherwise
+        // be transformed by the onData consumer.
+        clearKeybarCtrlLatch();
+        const t = activeTerminal();
+        if (!t || !t.term) return;
+        try {
+            const text = await navigator.clipboard.readText();
+            if (text) t.term.paste(text);
+        } catch (_) {
+            // clipboard permission denied / unavailable — no-op
+        }
+    });
+    // No ←/→ (PI-cut: up/down covers the menu-driving need; two fewer keys
+    // is what lets the row fit a phone width and justify instead of scroll).
+    bar.append(
+        key("Esc", "key-esc", () => keybarSend("\x1b")),
+        key("Tab", "key-tab", () => keybarSend("\x09")),
+        ctrlBtn,
+        key("↓", "key-down", arrow("B")),
+        key("↑", "key-up", arrow("A")),
+        key("F1", "key-f1", ss3("P")),
+        key("F2", "key-f2", ss3("Q")),
+        key("F3", "key-f3", ss3("R")),
+        key("F4", "key-f4", ss3("S")),
+        paste,
+    );
+    return bar;
+}
+
+// Derived visibility: mobile + an ssh-kind active service + no host page +
+// Projects view closed. On every visibility CHANGE the active terminal gets
+// a deferred refit (#terminal-area gains/loses the bar's height). Early
+// return on a missing bar makes every desktop call a no-op.
+function updateMobileKeybar() {
+    const bar = document.querySelector(".term-keybar");
+    if (!bar) return;
+    let show = false;
+    if (mobileModeActive() && !state.hostPage && state.activeProject && state.activeService) {
+        const dashboard = document.querySelector(".dashboard");
+        const picking = !!(dashboard && dashboard.classList.contains("mobile-projects"));
+        const svc = (state.projectServices[state.activeProject] || {})[state.activeService];
+        show = !picking && !!svc && svc.kind === "ssh";
+    }
+    if (bar.classList.contains("hidden") === !show) return;   // no change
+    bar.classList.toggle("hidden", !show);
+    if (!show) clearKeybarCtrlLatch();
+    const t = activeTerminal();
+    if (t && t.fitAddon) {
+        setTimeout(() => { try { t.fitAddon.fit(); } catch (_) {} }, 0);
+    }
 }
 
 // Mobile landing preference — MOBILE-ONLY (the three desktop auto-activation
@@ -4019,6 +4190,10 @@ function activateService(serviceId) {
         // side-pane activation below is skipped by the !isPinned guard).
         state.projectLastService[state.activeProject] = serviceId;
     }
+    // Key-bar visibility follows the resolved KIND of the active service, so
+    // it must be derived here — BEFORE the existing-terminal fast path below
+    // returns early — or a reader→CLI re-activation would skip it.
+    updateMobileKeybar();
 
     // Hide everything except the active and the pinned terminal.
     const activeKey = state.activeService ? tkey(state.activeProject, state.activeService) : null;
@@ -4086,6 +4261,12 @@ function showWelcome(clearTabs = true) {
     }
     const welcome = document.getElementById("welcome");
     if (welcome) welcome.style.display = "";
+    // Callers null state.activeService before showing the welcome — hide the
+    // key bar to match (no-op on desktop / when the bar doesn't exist).
+    updateMobileKeybar();
+    // The clearTabs wipe above removes the chip too — restore the fallback
+    // opener so a project-less mobile strip can still open the drawer.
+    ensureMobileChip();
 }
 
 // ---- ssh-kind terminal -----------------------------------------------------
@@ -4235,8 +4416,11 @@ function openSshTerminal(project, serviceId, svc) {
     };
 
     term.onData((d) => {
+        // Mobile key bar: a latched one-shot Ctrl transforms the next typed
+        // character (no-op when the latch is off, i.e. always on desktop).
+        const data = consumeKeybarCtrl(d);
         if (ws.readyState === WebSocket.OPEN) {
-            ws.send(new TextEncoder().encode(d));
+            ws.send(new TextEncoder().encode(data));
         }
     });
 
@@ -4418,6 +4602,7 @@ window.addEventListener("DOMContentLoaded", () => {
     applyMobileClass();
     installMobileModeWatcher();
     installGlobalTermRefit();
+    installMobileProjectsOutsideClose();
     installRailOutsideClickHandlers();
     if (loadStored()) renderUnlock();
     else renderSetup();
