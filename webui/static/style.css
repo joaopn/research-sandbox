@@ -60,7 +60,9 @@ body {
     background: var(--bg-card);
     padding: 32px;
     border-radius: 8px;
-    min-width: 400px;
+    /* min() lets the unlock/setup cards fit phone viewports (and narrow
+       desktop windows); at >=435px this is byte-identical to the old 400px. */
+    min-width: min(400px, 92vw);
     max-width: 540px;
 }
 .card h2 { margin-bottom: 16px; font-weight: 500; }
@@ -1209,4 +1211,130 @@ body {
     padding: 0;
     background: none;
     border: none;
+}
+
+/* ===================== Mobile shell (html.mobile) ==========================
+   Applied by app.js (mobileModeActive: width <= the 768px breakpoint, or the
+   Settings Layout override). The desktop layout above is untouched — every
+   rule here is scoped under html.mobile. Single-pane views + a fixed bottom
+   nav (Projects | Terminal | Reader); the nav is a .dashboard SIBLING of
+   .main-area, so no iframe can ever cover it — there is always a reachable
+   escape from an embedded surface. */
+
+/* Column layout: content on top, nav pinned at the bottom. Height follows
+   the visual viewport (--vvh, maintained by installGlobalTermRefit) so the
+   soft keyboard shrinks the layout instead of covering the nav; 100dvh is
+   the pre-first-measurement fallback. */
+html.mobile .dashboard {
+    flex-direction: column;
+    height: var(--vvh, 100dvh);
+}
+
+/* The rail IS the Projects view: hidden unless .mobile-projects, full-area
+   when shown. The desktop expanded/pinned classes never appear on mobile
+   (applyRailState strips them), so the floating-overlay rules above are
+   unreachable — no specificity contest. */
+html.mobile .dashboard .project-rail { display: none; }
+html.mobile .dashboard.mobile-projects .project-rail {
+    display: flex;
+    width: auto;
+    flex: 1;
+    min-height: 0;
+    border-right: none;
+}
+html.mobile .dashboard.mobile-projects .main-area { display: none; }
+html.mobile .project-rail .rail-splitter { display: none; }
+html.mobile .project-rail .pin-btn { display: none; }
+
+/* Bottom nav. 56px = the common 44px minimum touch target plus room for the
+   icon+label stack; three equal thumb-width targets. */
+html.mobile .mobile-nav {
+    display: flex;
+    flex-shrink: 0;
+    height: 56px;
+    background: var(--bg-card);
+    border-top: 1px solid var(--border);
+}
+html.mobile .mobile-nav .mobile-nav-entry {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    font-size: 11px;
+    color: var(--fg-muted);
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+}
+html.mobile .mobile-nav .mobile-nav-entry.active { color: var(--fg-accent); }
+html.mobile .mobile-nav .mobile-nav-icon { display: inline-flex; }
+html.mobile .mobile-nav .mobile-nav-icon svg { width: 20px; height: 20px; display: block; }
+
+/* Tab strip = [active-project chip][CLI chips]: taller touch row; desktop-only
+   controls (Projects toggle, visual tabs, pin/close/add-box, dividers) hidden —
+   visual surfaces are reached via the bottom nav (Reader) or not at all. */
+html.mobile .service-tabs { height: 44px; }
+html.mobile .service-tabs .projects-tab,
+html.mobile .service-tabs .tab[data-surface="visual"],
+html.mobile .service-tabs .pin-tab-btn,
+html.mobile .service-tabs .close-tab-btn,
+html.mobile .service-tabs .add-box-tab-btn,
+html.mobile .service-tabs .tab-group-divider { display: none; }
+
+/* Iframes (reader) render 1:1 — the desktop zoom trick (lay out wider, scale
+   down) makes phone text unreadably small. */
+html.mobile .http-iframe {
+    width: 100%;
+    height: 100%;
+    transform: none;
+}
+
+/* Reader empty-state content (lives in #welcome; see mobileOpenReader). */
+html.mobile .welcome { padding: 24px 16px; }
+html.mobile .reader-hint-title { font-size: 15px; margin-bottom: 8px; color: var(--fg-base); }
+html.mobile .welcome .reader-enable-btn { margin-top: 14px; }
+
+/* 16px inputs stop iOS Safari's auto-zoom-on-focus (fires below 16px), which
+   otherwise leaves the page zoomed after unlocking the vault. */
+html.mobile .field input, html.mobile .field textarea { font-size: 16px; }
+
+/* Host pages (Management / Workflows / Settings) squeezed to one column. */
+html.mobile .management-view { padding: 12px; }
+html.mobile .workflows-screen,
+html.mobile .settings-screen,
+html.mobile .sw-section { max-width: none; }
+html.mobile .workflows-grid { grid-template-columns: 1fr; }
+html.mobile .box-preset-cards { grid-template-columns: 1fr; }
+
+/* Management table: the 5-column desktop grid is wider than any phone. Each
+   row becomes a 2-column card (name+state / ssh+size) with the actions row
+   spanning full width below; the header row's 5 labels no longer align, so
+   it is dropped. */
+html.mobile .mgmt-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    row-gap: 6px;
+}
+html.mobile .mgmt-row > .mgmt-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-start;  /* base rule right-aligns; stranded on a full-width row */
+    flex-wrap: wrap;
+}
+html.mobile .mgmt-row-head { display: none; }
+
+/* Software tables keep their column grids but scroll sideways inside their
+   section — 560px preserves legible column widths for the 6-col dists grid. */
+html.mobile .sw-section { overflow-x: auto; }
+html.mobile .sw-section .sw-table { min-width: 560px; }
+
+/* Dialogs become near-full-screen sheets. Specificity note: (0,3,1) here
+   beats the fixed-width cards (.mgmt-card 360px at (0,1,0), .sw-build-card
+   640px, .box-add-card min(720px,94vw) at (0,3,0)). dvh, not vh: the visual
+   viewport shrinks under the soft keyboard. */
+html.mobile .modal-backdrop .card {
+    width: 94vw;
+    min-width: 0;
+    max-width: 94vw;
+    max-height: 90dvh;
+    overflow-y: auto;
 }

@@ -2,6 +2,10 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <!-- interactive-widget=resizes-content: Chromium-only — the soft keyboard
+         shrinks the layout viewport so the bottom nav / terminal stay visible.
+         iOS ignores it; the --vvh visualViewport fallback in app.js covers it. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
     <title>Research Sandbox</title>
     <!-- CSP is a computed response header now (index_handler): frame-src must
          name the request's own host for the per-editor origin ports, which a
