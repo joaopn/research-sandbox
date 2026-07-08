@@ -1216,24 +1216,28 @@ body {
 /* ===================== Mobile shell (html.mobile) ==========================
    Applied by app.js (mobileModeActive: width <= the 768px breakpoint, or the
    Settings Layout override). The desktop layout above is untouched — every
-   rule here is scoped under html.mobile. Single-pane views + a fixed bottom
-   nav (Projects | Terminal | Reader); the nav is a .dashboard SIBLING of
-   .main-area, so no iframe can ever cover it — there is always a reachable
-   escape from an embedded surface. */
+   rule here is scoped under html.mobile. ONE thick top strip is the whole
+   mobile chrome: the project-name chip (tap = toggle the Projects view, which
+   slides in UNDER the strip) + the whitelisted enabled surfaces. The strip
+   sits outside every iframe, so there is always a reachable escape from an
+   embedded surface. */
 
-/* Column layout: content on top, nav pinned at the bottom. Height follows
-   the visual viewport (--vvh, maintained by installGlobalTermRefit) so the
-   soft keyboard shrinks the layout instead of covering the nav; 100dvh is
-   the pre-first-measurement fallback. */
+/* Column layout. Height follows the visual viewport (--vvh, maintained by
+   installGlobalTermRefit) so the soft keyboard shrinks the layout; 100dvh is
+   the pre-first-measurement fallback. The order swap puts .main-area (the
+   strip) ABOVE the rail in the column, so the open Projects view renders
+   under a still-visible strip — the chip stays reachable as the way back. */
 html.mobile .dashboard {
     flex-direction: column;
     height: var(--vvh, 100dvh);
 }
+html.mobile .dashboard .main-area { order: 1; }
+html.mobile .dashboard .project-rail { order: 2; }
 
-/* The rail IS the Projects view: hidden unless .mobile-projects, full-area
-   when shown. The desktop expanded/pinned classes never appear on mobile
-   (applyRailState strips them), so the floating-overlay rules above are
-   unreachable — no specificity contest. */
+/* The rail IS the Projects view: hidden unless .mobile-projects, filling the
+   space under the strip when shown. The desktop expanded/pinned classes never
+   appear on mobile (applyRailState strips them), so the floating-overlay
+   rules above are unreachable — no specificity contest. */
 html.mobile .dashboard .project-rail { display: none; }
 html.mobile .dashboard.mobile-projects .project-rail {
     display: flex;
@@ -1242,45 +1246,65 @@ html.mobile .dashboard.mobile-projects .project-rail {
     min-height: 0;
     border-right: none;
 }
-html.mobile .dashboard.mobile-projects .main-area { display: none; }
 html.mobile .project-rail .rail-splitter { display: none; }
 html.mobile .project-rail .pin-btn { display: none; }
 
-/* Bottom nav. 56px = the common 44px minimum touch target plus room for the
-   icon+label stack; three equal thumb-width targets. */
-html.mobile .mobile-nav {
-    display: flex;
-    flex-shrink: 0;
-    height: 56px;
-    background: var(--bg-card);
-    border-top: 1px solid var(--border);
+/* Projects view open: the main area hugs the strip (terminal hidden below it,
+   rail takes the rest), and the strip collapses to the chip alone — service
+   chips, + / box controls, dividers and the zero-services note all hide, so a
+   strip tap while picking a project can't activate a service under the list.
+   The chip gets an accent ring as the open-state affordance. */
+html.mobile .dashboard.mobile-projects .main-area { flex: 0 0 auto; }
+html.mobile .dashboard.mobile-projects .main-area .terminal-area { display: none; }
+html.mobile .dashboard.mobile-projects .service-tabs .tab[data-service],
+html.mobile .dashboard.mobile-projects .service-tabs .add-box-tab-btn,
+html.mobile .dashboard.mobile-projects .service-tabs .tab-group-divider,
+html.mobile .dashboard.mobile-projects .service-tabs .empty { display: none; }
+html.mobile .dashboard.mobile-projects .service-tabs .active-project {
+    border-color: var(--fg-accent);
+    color: var(--fg-accent);
 }
-html.mobile .mobile-nav .mobile-nav-entry {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 3px;
-    font-size: 11px;
-    color: var(--fg-muted);
+
+/* Tab strip = [project chip][whitelisted chips]: one thick thumbable row.
+   52px = the common 44px minimum touch target + room for the larger type.
+   THE MOBILE TAB MODEL: show enabled ∩ {cli, reader} — the :not() below IS
+   the whitelist; extending mobile to another visual surface = extending that
+   list. code-server / box editors / port-<n> stay desktop-only. Pin buttons
+   stay hidden (no split panes on mobile); + Add box and the per-box ✕ are
+   SHOWN (dind box lifecycle from the phone; their dialogs are sheet-styled). */
+html.mobile .service-tabs { height: 52px; }
+html.mobile .service-tabs .tab { font-size: 14px; }
+html.mobile .service-tabs .tab .tab-icon svg { width: 16px; height: 16px; }
+html.mobile .service-tabs .projects-tab,
+html.mobile .service-tabs .tab[data-surface="visual"]:not([data-service="reader"]),
+html.mobile .service-tabs .pin-tab-btn,
+html.mobile .service-tabs .tab-group-divider { display: none; }
+
+/* The chip as a control: chevron affordance + comfortable tap height. */
+html.mobile .service-tabs .active-project {
+    height: 32px;
+    font-size: 14px;
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
 }
-html.mobile .mobile-nav .mobile-nav-entry.active { color: var(--fg-accent); }
-html.mobile .mobile-nav .mobile-nav-icon { display: inline-flex; }
-html.mobile .mobile-nav .mobile-nav-icon svg { width: 20px; height: 20px; display: block; }
+html.mobile .service-tabs .active-project::after {
+    content: "▾";
+    margin-left: 6px;
+    font-size: 11px;
+    color: var(--fg-faint);
+}
 
-/* Tab strip = [active-project chip][CLI chips]: taller touch row; desktop-only
-   controls (Projects toggle, visual tabs, pin/close/add-box, dividers) hidden —
-   visual surfaces are reached via the bottom nav (Reader) or not at all. */
-html.mobile .service-tabs { height: 44px; }
-html.mobile .service-tabs .projects-tab,
-html.mobile .service-tabs .tab[data-surface="visual"],
-html.mobile .service-tabs .pin-tab-btn,
-html.mobile .service-tabs .close-tab-btn,
-html.mobile .service-tabs .add-box-tab-btn,
-html.mobile .service-tabs .tab-group-divider { display: none; }
+/* Box lifecycle controls, thumb-sized. The ✕ keeps enough padding that it is
+   hittable without fat-fingering the tab switch; the + gets a full-height
+   target. */
+html.mobile .service-tabs .add-box-tab-btn {
+    min-width: 44px;
+    font-size: 20px;
+}
+html.mobile .service-tabs .close-tab-btn {
+    padding: 8px 6px;
+    font-size: 14px;
+}
 
 /* Iframes (reader) render 1:1 — the desktop zoom trick (lay out wider, scale
    down) makes phone text unreadably small. */
@@ -1290,10 +1314,16 @@ html.mobile .http-iframe {
     transform: none;
 }
 
-/* Reader empty-state content (lives in #welcome; see mobileOpenReader). */
 html.mobile .welcome { padding: 24px 16px; }
-html.mobile .reader-hint-title { font-size: 15px; margin-bottom: 8px; color: var(--fg-base); }
-html.mobile .welcome .reader-enable-btn { margin-top: 14px; }
+
+/* The per-project ⚙ config box (opened from the Projects view rows) is the
+   mobile enable/disable surface for the whitelisted tabs (Editor/Reader
+   toggles live there). The JS position clamp handles x/y but not height —
+   cap it so Tabs + Extensions + Ports never exceed a phone viewport. */
+html.mobile .project-config-box {
+    max-height: 70dvh;
+    overflow-y: auto;
+}
 
 /* 16px inputs stop iOS Safari's auto-zoom-on-focus (fires below 16px), which
    otherwise leaves the page zoomed after unlocking the vault. */

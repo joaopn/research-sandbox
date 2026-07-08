@@ -485,7 +485,6 @@ async function renderDashboard(opts = {}) {
 
     const main = el("div", { class: "main-area" }, [tabStrip, termArea]);
     const dashboard = el("div", { class: "dashboard" }, [rail, main]);
-    if (mobileModeActive()) dashboard.appendChild(makeMobileNav());
     document.body.appendChild(el("div", { id: "app" }, [dashboard]));
 
     applyRailState();
@@ -910,37 +909,16 @@ function refreshBottomNav() {
     }
 }
 
-// ---- mobile shell: bottom nav + single-pane views ---------------------------
-// Three views, one visible at a time: Projects (the rail, full-area), the
-// service pane (#terminal-area — terminal chips or the reader iframe), and
-// the host pages (#management-view, opened from inside the Projects view via
-// the rail's own nav entries). The bottom nav is a dashboard SIBLING of
-// .main-area, so it is never covered by an iframe — the structural fix for
-// "the editor eats every touch and there's no way out".
-
-// Hand-authored inline SVG (the TAB_ICON_SVG discipline: innerHTML, never
-// el("svg") — createElement makes an inert HTML-namespace svg).
-const MOBILE_NAV_ICON_SVG = {
-    projects: '<svg viewBox="0 0 16 16" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M2 3h12v2.2H2zM2 6.9h12v2.2H2zM2 10.8h12v2.2H2z"/></svg>',
-    terminal: '<svg viewBox="0 0 16 16" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M2 2.9 3.4 1.5 9.9 8l-6.5 6.5L2 13.1 7.1 8z"/><path d="M8 12h6v2H8z"/></svg>',
-    reader: '<svg viewBox="0 0 16 16" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M2 2.5c2 0 4 .4 5.2 1.3v9.7C6 12.6 4 12.2 2 12.2zM14 2.5c-2 0-4 .4-5.2 1.3v9.7c1.2-.9 3.2-1.3 5.2-1.3z"/></svg>',
-};
-
-function makeMobileNav() {
-    const mk = (id, label, onTap) => {
-        const icon = el("span", { class: "mobile-nav-icon" });
-        icon.innerHTML = MOBILE_NAV_ICON_SVG[id];
-        const e = el("div", { class: `mobile-nav-entry mobile-nav-${id}` },
-                     [icon, el("span", {}, [label])]);
-        e.onclick = (ev) => { ev.stopPropagation(); onTap(); };
-        return e;
-    };
-    return el("div", { class: "mobile-nav" }, [
-        mk("projects", "Projects", mobileToggleProjects),
-        mk("terminal", "Terminal", mobileOpenTerminal),
-        mk("reader", "Reader", mobileOpenReader),
-    ]);
-}
+// ---- mobile shell: one top strip + single-pane views ------------------------
+// The service-tab strip is the ONLY mobile chrome: it carries the project-name
+// chip (tap = toggle the full-screen Projects view, which slides in UNDER the
+// strip) plus the WHITELISTED enabled surfaces — enabled ∩ {cli, reader}
+// (the whitelist lives in the html.mobile CSS hide rule; code-server / box
+// editors / port-<n> stay desktop-only). The strip sits outside every iframe,
+// so there is always a reachable escape from an embedded surface. Enabling /
+// disabling surfaces happens in the per-row ⚙ config box (Projects view),
+// same as desktop; a newly-enabled surface's tab appears on the next services
+// poll like any other tab.
 
 // The ONLY mutator of the .mobile-projects class. Status polling is gated on
 // "projects list visible" (mobile: this view; desktop: rail pinned/expanded),
@@ -950,14 +928,24 @@ function setMobileProjectsView(on) {
     if (!dashboard) return;
     dashboard.classList.toggle("mobile-projects", on);
     scheduleStatusPolling();
-    refreshMobileNav();
+    // Close transition: #terminal-area was display:none while the view was
+    // open, so any viewport change during it (rotation, soft keyboard) made
+    // the global refit a no-op on a 0x0 container — refit the now-visible
+    // active terminal. Deferred so the reflow lands first (the applyRailState
+    // idiom); harmless duplicate on the activateProject close path.
+    if (!on) {
+        const t = activeTerminal();
+        if (t && t.fitAddon) {
+            setTimeout(() => { try { t.fitAddon.fit(); } catch (_) {} }, 0);
+        }
+    }
 }
 
-// Every nav entry leaves an open host page FIRST: enterHostView display:none's
-// #terminal-area, so activating a service (or rendering the reader empty-state)
-// behind it would open websockets into an invisible pane — a dead-looking nav.
-// closeManagement is synchronous (restores the terminal area, unhides tabs,
-// nulls hostPage, clears highlights), so leave-then-act has no race.
+// The chip's tap handler. Leaves an open host page FIRST: enterHostView
+// display:none's #terminal-area, and the Projects view would fight the host
+// page over the screen. closeManagement is synchronous (restores the terminal
+// area, unhides tabs, nulls hostPage, clears highlights), so leave-then-act
+// has no race.
 function mobileToggleProjects() {
     if (state.hostPage) {
         // After a host-page leave this tap means "show me the projects" —
@@ -969,95 +957,6 @@ function mobileToggleProjects() {
     const dashboard = document.querySelector(".dashboard");
     const on = !!(dashboard && dashboard.classList.contains("mobile-projects"));
     setMobileProjectsView(!on);
-}
-
-function mobileOpenTerminal() {
-    if (state.hostPage) closeManagement();
-    if (!state.activeProject) { setMobileProjectsView(true); return; }
-    const name = state.activeProject;
-    const enabled = state.projectServices[name] || {};
-    const visible = visibleServiceIds(name, enabled);
-    setMobileProjectsView(false);
-    // CLI-only preference — the landing helper's remembered-tab rule would
-    // return "reader" while the reader is open, making this button a no-op.
-    const next = mobileCliService(name, visible, enabled);
-    if (next) {
-        activateService(next);
-    } else {
-        state.activeService = null;
-        showWelcome(false);
-        refreshMobileNav();
-    }
-}
-
-function mobileOpenReader() {
-    if (state.hostPage) closeManagement();
-    if (!state.activeProject) { setMobileProjectsView(true); return; }
-    const name = state.activeProject;
-    const enabled = state.projectServices[name] || {};
-    setMobileProjectsView(false);
-    if (enabled["reader"]) {
-        activateService("reader");
-        return;
-    }
-    // Reader not running — empty state reusing #welcome (no strip wipe), so
-    // the existing hide paths own its lifecycle: activateService hides it on
-    // the next activation, showWelcome resets the stamped content.
-    showWelcome(false);
-    const welcome = document.getElementById("welcome");
-    if (!welcome) return;
-    welcome.textContent = "";
-    welcome.setAttribute("data-mobile-reader", "1");
-    welcome.appendChild(el("div", { class: "reader-hint-title" },
-        ["The reader isn't running for this project."]));
-    // Same dind gate as the config-box reader row: a docker box has no reader,
-    // so don't offer a control the broker refuses.
-    const isDocker = !(enabled.supervisor && enabled.supervisor.box_harness);
-    if (isDocker) {
-        welcome.appendChild(el("div", { class: "hint" },
-            ["This project type has no reader."]));
-    } else {
-        welcome.appendChild(el("div", { class: "hint" },
-            ["Enable it below — the Reader appears once it finishes booting" +
-             " (tap Reader again then)."]));
-        const btn = el("button", { class: "btn reader-enable-btn" }, ["Enable Reader"]);
-        btn.onclick = async () => {
-            // Without a live Management session, mgmtConfirmThenTail's 401
-            // redirect renders into a detached view (silent dead-end) — probe
-            // first and land on the real Management login instead.
-            let live = false;
-            try { live = (await fetch("/broker/projects")).ok; } catch (_) {}
-            if (live) mgmtReaderToggle(name, false);
-            else openManagement();
-        };
-        welcome.appendChild(btn);
-    }
-    state.activeService = null;
-    refreshMobileNav();
-}
-
-// Nav highlight, derived: Projects view showing → Projects; reader (live tab
-// or empty-state) → Reader; a CLI service → Terminal; host page open → none
-// of the three (host pages are reached from inside the Projects view).
-function refreshMobileNav() {
-    const nav = document.querySelector(".mobile-nav");
-    if (!nav) return;
-    nav.querySelectorAll(".mobile-nav-entry").forEach((e) => e.classList.remove("active"));
-    if (state.hostPage) return;
-    const mark = (cls) => {
-        const e = nav.querySelector(".mobile-nav-" + cls);
-        if (e) e.classList.add("active");
-    };
-    const dashboard = document.querySelector(".dashboard");
-    if (dashboard && dashboard.classList.contains("mobile-projects")) return mark("projects");
-    const welcome = document.getElementById("welcome");
-    const readerHint = !!(welcome && welcome.hasAttribute("data-mobile-reader")
-        && welcome.style.display !== "none");
-    if (readerHint || state.activeService === "reader") return mark("reader");
-    if (state.activeService && state.activeProject) {
-        const svc = (state.projectServices[state.activeProject] || {})[state.activeService];
-        if (svc && surfaceOf(state.activeService, svc) === "cli") return mark("terminal");
-    }
 }
 
 // Mobile landing preference — MOBILE-ONLY (the three desktop auto-activation
@@ -4019,8 +3918,15 @@ function renderServiceTabs(projectName, enabled) {
     strip.appendChild(makeProjectsTab());
     // Active-project label — a bordered chip (distinct from the service tabs),
     // followed by a separator (same rule as the visual/cli divider) so it reads as
-    // an anchor for the strip rather than the first tab.
-    strip.appendChild(el("div", { class: "active-project" }, [projectName]));
+    // an anchor for the strip rather than the first tab. On mobile the chip IS
+    // the Projects-view toggle (the desktop Projects tab is CSS-hidden there);
+    // on desktop the guard keeps it inert static text.
+    const chip = el("div", { class: "active-project" }, [projectName]);
+    chip.onclick = () => {
+        if (!mobileModeActive()) return;
+        mobileToggleProjects();
+    };
+    strip.appendChild(chip);
     strip.appendChild(el("div", { class: "tab-group-divider" }));
     const ids = visibleServiceIds(projectName, enabled);
     if (ids.length === 0) {
@@ -4113,7 +4019,6 @@ function activateService(serviceId) {
         // side-pane activation below is skipped by the !isPinned guard).
         state.projectLastService[state.activeProject] = serviceId;
     }
-    refreshMobileNav();
 
     // Hide everything except the active and the pinned terminal.
     const activeKey = state.activeService ? tkey(state.activeProject, state.activeService) : null;
@@ -4159,8 +4064,8 @@ function activateService(serviceId) {
 function welcomeText() {
     const none = !state.vault || state.vault.projects.length === 0;
     if (mobileModeActive()) {
-        return none ? "No projects yet. Tap Projects to add one."
-                    : "Tap Projects to pick a project.";
+        return none ? "No projects yet. Add one from the project list."
+                    : "Tap the project name to switch projects.";
     }
     return none ? "No projects yet. Click the Projects tab to add one."
                 : "Click the Projects tab to attach.";
@@ -4180,15 +4085,7 @@ function showWelcome(clearTabs = true) {
         if (strip) strip.innerHTML = "";
     }
     const welcome = document.getElementById("welcome");
-    if (welcome) {
-        // A mobile reader empty-state repurposed this node earlier — restore
-        // the generic text so a later welcome isn't a stale reader hint.
-        if (welcome.hasAttribute("data-mobile-reader")) {
-            welcome.removeAttribute("data-mobile-reader");
-            welcome.textContent = welcomeText();
-        }
-        welcome.style.display = "";
-    }
+    if (welcome) welcome.style.display = "";
 }
 
 // ---- ssh-kind terminal -----------------------------------------------------
