@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# rs-repo-watch — manual post-auth launcher for the dev repo-watch loop.
+#
+# Launches /opt/dev/repo-watch.sh DETACHED into a byobu window named
+# "repo-watch". Deliberately never entrypoint-started: dev surfaces boot
+# credential-less, and repo-watch needs a logged-in `claude` — run `claude`
+# and complete /login first, then start this.
+#
+# Wiring resolution:
+#   - dev BOX: GITEA_URL/TOKEN/USER + REPO_NAME arrive as container env — used
+#     as-is.
+#   - dev PROJECT (supervisor): read the host-staged non-secret
+#     .orchestrator/dev-gitea.json + the staged token at
+#     ~/.dev-tokens/agent-<repo>.token. With several attached repos, name one:
+#     rs-repo-watch <repo>.
+#
+# Usage: rs-repo-watch [repo]
+#   Watch it:  byobu attach  (then switch to the repo-watch window)
+#   Stop it:   byobu kill-window -t repo-watch   (or Ctrl+C inside the window)
+
+set -euo pipefail
+
+REPO_ARG="${1:-}"
+WATCH="/opt/dev/repo-watch.sh"
+
+if [[ -z "${GITEA_TOKEN:-}" ]]; then
+    # Supervisor path: resolve from the host-staged state.
+    DEV_JSON="${RS_WORKSPACE:-/workspace}/.orchestrator/dev-gitea.json"
+    if [[ ! -f "$DEV_JSON" ]]; then
+        echo "rs-repo-watch: no dev wiring ($DEV_JSON missing);" \
+             "run 'research dev attach <project> --class agent --repo <repo>' first" >&2
+        exit 1
+    fi
+    OUT="$(python3 - "$DEV_JSON" "$REPO_ARG" <<'PYEOF'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except (OSError, ValueError) as e:
+    sys.exit(f"rs-repo-watch: cannot read dev wiring: {e}")
+repos = [r for r in (data.get("repos") or [])
+         if isinstance(r, dict) and r.get("repo")]
+want = sys.argv[2]
+if want:
+    repos = [r for r in repos if r["repo"] == want]
+if not repos:
+    sys.exit(f"rs-repo-watch: no attached repo matching {want!r}" if want
+             else "rs-repo-watch: no repos attached to this project")
+if len(repos) > 1:
+    sys.exit("rs-repo-watch: several repos attached; pick one: "
+             + " ".join(sorted(r["repo"] for r in repos)))
+print(repos[0]["repo"], repos[0].get("user") or "agent-" + repos[0]["repo"])
+PYEOF
+)"
+    read -r REPO_NAME GITEA_USER <<<"$OUT"
+    TOKEN_FILE="$HOME/.dev-tokens/agent-${REPO_NAME}.token"
+    if [[ ! -s "$TOKEN_FILE" ]]; then
+        echo "rs-repo-watch: token missing at $TOKEN_FILE;" \
+             "re-run 'research dev attach' (it re-stages the token)" >&2
+        exit 1
+    fi
+    GITEA_TOKEN="$(cat "$TOKEN_FILE")"
+    GITEA_URL="http://rs-gitea:3000"
+else
+    : "${GITEA_URL:?GITEA_URL must be set alongside GITEA_TOKEN}"
+    : "${GITEA_USER:?GITEA_USER must be set alongside GITEA_TOKEN}"
+    : "${REPO_NAME:?REPO_NAME must be set alongside GITEA_TOKEN}"
+fi
+REPO_DIR="${REPO_DIR:-/workspace/${REPO_NAME}}"
+
+if [[ ! -d "${REPO_DIR}/.git" ]]; then
+    echo "rs-repo-watch: ${REPO_DIR} is not a git clone; is the repo attached/cloned?" >&2
+    exit 1
+fi
+
+if byobu list-windows -a -F '#{window_name}' 2>/dev/null | grep -qx repo-watch; then
+    echo "rs-repo-watch: a repo-watch window is already running" \
+         "(byobu attach to view; byobu kill-window -t repo-watch to stop)" >&2
+    exit 1
+fi
+
+# tmux/byobu -e threads the wiring into the window's environment without a
+# temp file (tmux >= 3.2 for new-session -e; trixie carries 3.5).
+ENV_ARGS=(-e "GITEA_URL=${GITEA_URL}" -e "GITEA_TOKEN=${GITEA_TOKEN}"
+          -e "GITEA_USER=${GITEA_USER}" -e "REPO_NAME=${REPO_NAME}"
+          -e "REPO_DIR=${REPO_DIR}")
+if byobu list-sessions >/dev/null 2>&1; then
+    byobu new-window -d -n repo-watch "${ENV_ARGS[@]}" "$WATCH"
+else
+    byobu new-session -d -s repo-watch -n repo-watch "${ENV_ARGS[@]}" "$WATCH"
+fi
+echo "rs-repo-watch: started for ${GITEA_USER}/${REPO_NAME} (detached byobu" \
+     "window 'repo-watch'; byobu attach to view)"

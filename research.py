@@ -328,6 +328,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         repo=args.repo, ref=args.ref, setup=args.setup_script,
         github_pat=os.environ.get("RS_GITHUB_PAT") or "",   # never a CLI flag
         agents=args.agents,   # repeatable --agent + --agents a,b both feed this list
+        dev_repo=args.dev_repo,
     )
     try:
         res = rscore.create(req, cfg)
@@ -1886,6 +1887,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "run `research agent pull` first). Repeatable, or a comma "
                         f"list. Known: {', '.join(rscore.KNOWN_AGENTS)}. Default: "
                         "none (clean box). Ignored on non-docker workflows.")
+    c.add_argument("--dev-repo", dest="dev_repo", metavar="REPO",
+                   help="REQUIRED with a dev workflow (--workflow dev): the name "
+                        "of a repo added via `research dev repo add` — the agent "
+                        "fork is cloned into the project workspace at create")
     c.set_defaults(func=cmd_project_create)
 
     a = proj_sub.add_parser("attach", help="docker exec + byobu attach")

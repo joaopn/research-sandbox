@@ -57,9 +57,12 @@ _BUILTIN_ORDER = ("empty", "websearcher", "data-wrangler", "byo",
 # (BYO), so it is an allowed key on the normalized entry the validator sees.
 # `repo` bakes a clone URL into the preset (clone:true presets only); `editor_default`
 # pre-selects the box's editor toggle in the webui (a UI default — NOT honored by
-# the in-supervisor rs-sandbox, so a box stays opt-out-able).
+# the in-supervisor rs-sandbox, so a box stays opt-out-able). `dev` marks the
+# gitea dev-lane preset (STAGE_DEV_GITEA): rs-sandbox runs it on a dedicated
+# bridge with the ADS hardening flags and an authed fork clone — mutually
+# exclusive with the auth-less `clone` lane and base-image-only.
 _ALLOWED_KEYS = {"name", "image", "agent_default", "clone", "description",
-                 "instructions", "repo", "editor_default"}
+                 "instructions", "repo", "editor_default", "dev"}
 
 
 class BoxCatalogError(Exception):
@@ -100,6 +103,18 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
     # editor_default is optional; when present it must be a boolean.
     if "editor_default" in m and not isinstance(m["editor_default"], bool):
         out.append(p(f"editor_default must be a boolean, got {m.get('editor_default')!r}"))
+
+    # dev is optional; a dev preset clones via the authed gitea lane (NOT the
+    # auth-less RS_BOX_CLONE lane) and runs on the base image only.
+    if "dev" in m:
+        if not isinstance(m["dev"], bool):
+            out.append(p(f"dev must be a boolean, got {m.get('dev')!r}"))
+        elif m["dev"]:
+            if m.get("clone") is not False:
+                out.append(p("dev:true requires clone:false (the dev clone is the "
+                             "authed gitea lane, not the byo clone lane)"))
+            if m.get("image") != "base":
+                out.append(p("dev:true requires image:'base'"))
 
     # repo bakes a clone URL into the preset; it must be a non-empty string and is
     # only meaningful for a clone preset (so a non-empty repo requires clone:true).

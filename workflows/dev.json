@@ -1,0 +1,10 @@
+{
+  "name": "dev",
+  "group": "base",
+  "tags": ["dind", "code"],
+  "substrate": "dind-sysbox",
+  "image_overlay": "rs-sandbox-dind",
+  "dev": true,
+  "description": "A dedicated software-dev project wired to the shared Gitea: the agent works your repo's fork via PRs, with its own inner Docker for test containers.",
+  "greeting": "Dev project — a yolo dev agent with its own inner Docker.\n\nYour fork is cloned at /workspace/<repo> (origin = your fork, upstream = the\nread-only GitHub mirror; work on agent/* branches, deliver via PRs). This\nproject holds no human credentials — the human fetches and reviews outside.\n\nGet going:\n  claude                start the agent (complete /login first — the project\n                        boots credential-less)\n  rs-repo-watch         after login: watch Gitea issues/PRs in a detached\n                        byobu window and drive the agent automatically\n  docker …              the inner Docker daemon is yours for test containers\n\nMore repos: research dev attach <project> --class agent --repo <name> (host).\n"
+}

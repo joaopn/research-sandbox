@@ -74,6 +74,41 @@ BOX_EDITOR_PORT_LO = 8500
 BOX_EDITOR_PORT_HI = 8599  # inclusive
 KIND = "sandbox"
 
+# --- dev-lane constants (STAGE_DEV_GITEA) ------------------------------------
+# A dev box runs on its OWN bridge (one /24 per box — "agent + nothing else":
+# no L2 adjacency between agents, and no path to mcp-proxy on rs-inner, which is
+# why --mcps is rejected for dev boxes). The subnets are explicitly PINNED: the
+# inner daemon's default pools start at 172.17/16 and the OUTER per-project
+# bridge draws from the host daemon's same 172.16/12 default pools — an unpinned
+# dev bridge can land on the outer subnet, and its connected route would then
+# swallow gitea-bound traffic. 192.168.100+ mirrors the rs-inner 192.168.99.0/24
+# pin; 12 subnets match the 12-box IP-pool ceiling above.
+DEV_NET_PREFIX = "rs-dev-"
+DEV_SUBNET_BASE = 100                 # 192.168.<base+n>.0/24
+DEV_SUBNET_COUNT = 12
+# The box's pinned address on its own /24 (.1 is the bridge gateway). A static
+# --ip is valid here because the dev bridge has a user-configured subnet.
+DEV_BOX_HOST_OCTET = 2
+# Container hardening for dev boxes, ported verbatim from the agentic-dev-sandbox
+# agent containers: drop all capabilities, re-add only what an unprivileged
+# interactive dev container needs; bound the pid count (fork-bomb backstop).
+# Spike-verified: entrypoint, git, byobu/tmux, and the claude binary all run
+# under this set.
+DEV_CAPS = [
+    "--cap-drop=ALL",
+    "--cap-add=CHOWN", "--cap-add=DAC_OVERRIDE", "--cap-add=FOWNER",
+    "--cap-add=SETGID", "--cap-add=SETUID", "--cap-add=KILL",
+    "--cap-add=FSETID", "--cap-add=AUDIT_WRITE", "--cap-add=NET_RAW",
+]
+DEV_PIDS_LIMIT = "512"
+# Host-staged dev wiring: the non-secret half (gitea_ip + attached repos) lives
+# in the bind-mounted .orchestrator/ (webui-readable — NEVER a token); the token
+# is staged separately into the supervisor's own fs, OUTSIDE the workspace.
+DEV_GITEA_JSON = ORCH / "dev-gitea.json"
+DEV_TOKENS_DIR = Path(os.environ.get("HOME", "/home/research")) / ".dev-tokens"
+# In-box gitea URL: the box resolves the NAME via its --add-host entry.
+DEV_GITEA_URL = "http://rs-gitea:3000"
+
 # Box names: lowercase, must match the webui tab-id regex so the tab
 # synthesizer renders a tab for them. Auto-named box-N.
 _NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
@@ -85,10 +120,12 @@ rs-sandbox — isolated boxes for running un-vetted code
   rs-sandbox create [name] [--preset TYPE] [--agent claude|none] [--editor]
                            [--mcps a,b] [--repo URL --ref REF --setup CMD]
                               spin a box (auto-named box-N). --preset picks the box
-                              type (empty, websearcher, data-wrangler, byo, or an
-                              operator-registered type); the agent defaults per
+                              type (empty, dev, websearcher, data-wrangler, byo, or
+                              an operator-registered type); the agent defaults per
                               preset; --mcps wires project MCPs (forces the agent on);
-                              --repo/--ref/--setup seed a byo box from a repo.
+                              --repo/--ref/--setup seed a byo box from a repo. A dev
+                              box takes --repo <name> (an attached gitea repo) and
+                              boots with the fork cloned + hardened.
   rs-sandbox list [--json]    show boxes (+ any baked extensions) and their state
   rs-sandbox stop <name>      stop a box (keeps its workspace; start to resume)
   rs-sandbox start <name>     (re)start a stopped box from its saved entry
@@ -166,6 +203,19 @@ def allocate_ip(entries: dict[str, dict]) -> str:
             return ip
     die(f"box IP pool exhausted ({IP_PREFIX}{BOX_IP_LO}-{IP_PREFIX}{BOX_IP_HI}); "
         f"discard an unused box first")
+
+
+def allocate_dev_subnet(entries: dict[str, dict]) -> tuple[str, str]:
+    """A free (subnet, box_ip) pair for a dev box's dedicated bridge — the
+    sequential-scan discipline of allocate_ip, keyed on the stored dev_subnet."""
+    taken = {e.get("dev_subnet") for e in entries.values() if isinstance(e, dict)}
+    for n in range(DEV_SUBNET_COUNT):
+        octet = DEV_SUBNET_BASE + n
+        subnet = f"192.168.{octet}.0/24"
+        if subnet not in taken:
+            return subnet, f"192.168.{octet}.{DEV_BOX_HOST_OCTET}"
+    die(f"dev subnet pool exhausted (192.168.{DEV_SUBNET_BASE}-"
+        f"{DEV_SUBNET_BASE + DEV_SUBNET_COUNT - 1}.0/24); discard an unused dev box first")
 
 
 def allocate_editor_port(entries: dict[str, dict]) -> int:
@@ -285,9 +335,53 @@ def _stage_box_workspace(name: str, preset: dict, mcps: list[str],
 # --- run / teardown ---------------------------------------------------------
 
 
+def _dev_run_info(repo: str) -> dict:
+    """Resolve the CURRENT gitea wiring for a dev box run: the host-staged
+    non-secret dev-gitea.json + the separately-staged token file. Read at EVERY
+    run/re-run, so a recreate/restart always picks up the current gitea IP (the
+    stale-IP heal is exactly `rs-sandbox restart` after the host re-stages)."""
+    try:
+        data = json.loads(DEV_GITEA_JSON.read_text())
+    except (OSError, json.JSONDecodeError):
+        die("no dev wiring staged (.orchestrator/dev-gitea.json missing or invalid); "
+            "attach a repo first: research dev attach <project> --class agent --repo <repo>")
+    repos = {r.get("repo"): r for r in (data.get("repos") or [])
+             if isinstance(r, dict) and r.get("repo")}
+    if repo not in repos:
+        die(f"repo {repo!r} is not attached to this project "
+            f"(attached: {sorted(repos) or 'none'}); run "
+            f"`research dev attach <project> --class agent --repo {repo}` first")
+    gitea_ip = (data.get("gitea_ip") or "").strip()
+    if not gitea_ip:
+        die("staged dev wiring carries no gitea_ip; re-run `research dev attach`")
+    token_path = DEV_TOKENS_DIR / f"agent-{repo}.token"
+    try:
+        token = token_path.read_text().strip()
+    except OSError:
+        token = ""
+    if not token:
+        die(f"agent token missing at {token_path}; re-run `research dev attach` "
+            f"(it re-stages the token)")
+    return {"gitea_ip": gitea_ip, "repo": repo, "token": token,
+            "user": repos[repo].get("user") or f"agent-{repo}"}
+
+
+def _ensure_dev_bridge(name: str, subnet: str) -> str:
+    """Idempotently create the box's dedicated bridge (fresh inner dockerd after
+    a supervisor recreate has no networks). Returns the network name."""
+    net = f"{DEV_NET_PREFIX}{name}"
+    if _docker("network", "inspect", net).returncode != 0:
+        r = _docker("network", "create", "--subnet", subnet, net)
+        if r.returncode != 0:
+            die(f"could not create dev bridge {net!r}: "
+                f"{(r.stderr or r.stdout).strip()}")
+    return net
+
+
 def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
              editor: bool = False, editor_port: int = 0, clone_repo: str = "",
-             clone_ref: str = "", clone_setup: str = "") -> None:
+             clone_ref: str = "", clone_setup: str = "",
+             dev: dict | None = None, dev_subnet: str = "") -> None:
     """docker run a box in the local inner dockerd. ``browser`` selects the
     Chromium-equipped image; ``agent`` (claude|none) → RS_BOX_AGENT (entrypoint
     deploys claude only for "claude", still auth-free); ``editor`` → the box's OWN
@@ -318,11 +412,27 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         clone_env = ["-e", f"RS_BOX_CLONE_REPO={clone_repo}",
                      "-e", f"RS_BOX_CLONE_REF={clone_ref}",
                      "-e", f"RS_BOX_CLONE_SETUP={clone_setup}"]
+    if dev:
+        # Dev lane: dedicated pinned bridge instead of rs-inner, the gitea name
+        # staged via --add-host (inner-container DNS cannot resolve outer-bridge
+        # names), the ADS hardening set, and the GITEA_* env the entrypoint's dev
+        # clone block + repo-watch consume. Token via env = ADS parity (visible
+        # only to inner `docker inspect`, i.e. this already-authoritative shell).
+        net = _ensure_dev_bridge(name, dev_subnet)
+        net_args = ["--network", net, "--ip", ip,
+                    "--add-host", f"rs-gitea:{dev['gitea_ip']}",
+                    *DEV_CAPS, f"--pids-limit={DEV_PIDS_LIMIT}"]
+        dev_env = ["-e", f"GITEA_URL={DEV_GITEA_URL}",
+                   "-e", f"GITEA_USER={dev['user']}",
+                   "-e", f"GITEA_TOKEN={dev['token']}",
+                   "-e", f"REPO_NAME={dev['repo']}"]
+    else:
+        net_args = ["--network", INNER_NETWORK, "--ip", ip]
+        dev_env = []
     r = _docker(
         "run", "-d",
         "--name", cname,
-        "--network", INNER_NETWORK,
-        "--ip", ip,
+        *net_args,
         "--restart", "unless-stopped",
         "-v", f"{WORKSPACE}/{sub}:/workspace",
         *agent_mount,
@@ -332,6 +442,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         "-e", f"RS_SANDBOX_NAME={name}",
         "-e", f"RS_BOX_AGENT={agent}",
         *clone_env,
+        *dev_env,
         "--label", "research.sandbox=1",
         "--label", f"research.box={name}",
         image,
@@ -344,18 +455,24 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
 def _rerun_box(name: str, entry: dict) -> None:
     """Re-run a box from its saved entry (restart/start after a recreate). Re-
     renders the proxy MCP source (allowlist may have changed) non-strictly, then
-    re-runs from the stored axes. CLAUDE.md persists on the volume (no-clobber)."""
+    re-runs from the stored axes. CLAUDE.md persists on the volume (no-clobber).
+    A dev entry re-resolves its gitea wiring FRESH (staged file + token) so the
+    re-run bakes the CURRENT gitea IP into --add-host — this is the stale-IP heal."""
     mcps = [m for m in (entry.get("upstream_mcps") or []) if isinstance(m, str)]
     ws = WORKSPACE / f"pi-isolated/{name}"
     ws.mkdir(parents=True, exist_ok=True)
     servers = _build_proxy_mcps(mcps, strict=False)
     (ws / ".mcp-proxy.json").write_text(
         json.dumps({"mcpServers": servers}, indent=2, sort_keys=True) + "\n")
+    is_dev = bool(entry.get("dev"))
     _run_box(name, entry["ip"], browser=bool(entry.get("browser")),
              agent=entry.get("agent", "none"), editor=bool(entry.get("editor")),
              editor_port=int(entry.get("editor_port") or 0),
-             clone_repo=entry.get("repo") or "", clone_ref=entry.get("ref") or "",
-             clone_setup=entry.get("setup") or "")
+             clone_repo=(entry.get("repo") or "") if not is_dev else "",
+             clone_ref=entry.get("ref") or "",
+             clone_setup=entry.get("setup") or "",
+             dev=_dev_run_info(entry["repo"]) if is_dev else None,
+             dev_subnet=entry.get("dev_subnet") or "")
 
 
 def _box_entry(entries: dict[str, dict], name: str) -> dict:
@@ -380,22 +497,45 @@ def cmd_create(args: argparse.Namespace) -> None:
         die(f"sandbox {name!r} already exists; discard it or pick another name")
     preset = resolve_preset(args.preset)
     is_clone = bool(preset.get("clone"))
+    is_dev = bool(preset.get("dev"))
     # A clone preset may bake its repo URL (e.g. paper-orchestra); an explicit
     # --repo overrides it. ref/setup stay caller-supplied (no baked-ref presets yet).
+    # A DEV preset reuses --repo with NAME semantics (an attached gitea repo);
+    # ref/setup/mcps are rejected there — the dev clone is the authed gitea lane
+    # (entrypoint-driven), and the dedicated dev bridge has no path to mcp-proxy.
     repo = (args.repo or "").strip() or (preset.get("repo") or "").strip()
     ref, setup = (args.ref or "").strip(), (args.setup or "").strip()
-    if (repo or setup) and not is_clone:
+    mcps = _parse_csv(args.mcps)
+    dev_info: dict | None = None
+    if is_dev:
+        if not repo:
+            die(f"the {args.preset!r} preset requires --repo <name> (a repo "
+                f"attached via `research dev attach <project> --class agent`)")
+        if ref or setup:
+            die("--ref/--setup are not valid for a dev box (the fork's default "
+                "branch is checked out; setup runs are the agent's own work)")
+        if mcps:
+            die("--mcps is not valid for a dev box (its dedicated bridge has no "
+                "path to mcp-proxy)")
+        dev_info = _dev_run_info(repo)   # dies with the attach remedy if unstaged
+    elif (repo or setup) and not is_clone:
         die(f"--repo/--setup are only valid for a clone (BYO) preset; "
             f"preset {args.preset!r} does not clone")
     # Agent: explicit override, else the preset default; selecting any MCP forces
     # the agent on (nothing else can reach an MCP — STAGE_BOX_EXT_UX D-B).
-    mcps = _parse_csv(args.mcps)
     agent = args.agent or ("claude" if preset.get("agent_default") else "none")
     if mcps:
         agent = "claude"
     browser = preset.get("image") == "browser"
     editor = bool(args.editor)
-    ip = allocate_ip(entries)
+    dev_subnet = ""
+    if is_dev:
+        # Dev boxes live on their own pinned /24, NOT the rs-inner pool: no
+        # .14-.25 slot is consumed, and entry["ip"] is the box's REAL pinned
+        # address on that bridge (list/restart/start stay truthful).
+        dev_subnet, ip = allocate_dev_subnet(entries)
+    else:
+        ip = allocate_ip(entries)
     # A box editor publishes onto a per-box supervisor-netns port (0 = no editor).
     editor_port = allocate_editor_port(entries) if editor else 0
     # Stage CLAUDE.md + .mcp-proxy.json BEFORE the run (M2: the entrypoint reads
@@ -408,11 +548,14 @@ def cmd_create(args: argparse.Namespace) -> None:
         entry["editor_port"] = editor_port
     if is_clone:
         entry.update({"repo": repo, "ref": ref, "setup": setup})
+    if is_dev:
+        entry.update({"dev": True, "repo": repo, "dev_subnet": dev_subnet})
     entries[name] = entry
     save(entries)
     _run_box(name, ip, browser=browser, agent=agent, editor=editor,
              editor_port=editor_port, clone_repo=repo if is_clone else "",
-             clone_ref=ref, clone_setup=setup)
+             clone_ref=ref, clone_setup=setup,
+             dev=dev_info, dev_subnet=dev_subnet)
     print(json.dumps({"name": name, "ip": ip, "preset": args.preset,
                       "browser": browser, "agent": agent, "editor": editor,
                       "editor_port": editor_port or None,
@@ -443,11 +586,23 @@ def cmd_stop(args: argparse.Namespace) -> None:
 
 def cmd_start(args: argparse.Namespace) -> None:
     """Resume a stopped box, or re-run it from its entry if the container is
-    gone (e.g. after a recreate)."""
+    gone (e.g. after a recreate). A parked DEV box whose baked --add-host no
+    longer matches the currently staged gitea address is RE-RUN instead of
+    plain-started — ExtraHosts is fixed at docker run, so a `docker start`
+    would boot it stale (the workspace persists either way)."""
     _require_dind_project()
     entry = _box_entry(load(), args.name)
     cname = box_container(args.name)
     exists = _docker("container", "inspect", cname).returncode == 0
+    if exists and entry.get("dev"):
+        dev = _dev_run_info(entry["repo"])   # dies with the attach remedy if unstaged
+        ins = _docker("inspect", "-f", "{{json .HostConfig.ExtraHosts}}", cname)
+        # Quoted JSON form — a bare substring would false-match a prefix ip.
+        if f"\"rs-gitea:{dev['gitea_ip']}\"" not in (ins.stdout or ""):
+            _rerun_box(args.name, entry)
+            print(f"box {args.name!r}: re-run at {entry['ip']} "
+                  f"(gitea address changed while parked)")
+            return
     if exists:
         r = _docker("start", cname)
         if r.returncode != 0:
@@ -461,8 +616,12 @@ def cmd_start(args: argparse.Namespace) -> None:
 def cmd_discard(args: argparse.Namespace) -> None:
     _require_dind_project()
     entries = load()
-    _box_entry(entries, args.name)
+    entry = _box_entry(entries, args.name)
     _docker("rm", "-f", box_container(args.name))
+    if entry.get("dev"):
+        # The box's dedicated bridge goes with it (best-effort — a fresh inner
+        # dockerd after a recreate may never have re-created it).
+        _docker("network", "rm", f"{DEV_NET_PREFIX}{args.name}")
     # Drop the entry (box is gone either way). --keep-workspace leaves the
     # box's artifacts on disk under pi-isolated/<name>/ for later retrieval;
     # the default is full teardown — a box is disposable.
@@ -520,8 +679,8 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("name", nargs="?", default=None,
                    help="box name (default: auto-named box-N)")
     c.add_argument("--preset", default="empty",
-                   help="box type: empty, websearcher, data-wrangler, byo, or an "
-                        "operator-registered type (default empty)")
+                   help="box type: empty, dev, websearcher, data-wrangler, byo, or "
+                        "an operator-registered type (default empty)")
     c.add_argument("--agent", choices=["claude", "none"], default=None,
                    help="override the preset's agent default; 'claude' cp's the "
                         "binary in (still auth-free — run `claude` + /login inside)")

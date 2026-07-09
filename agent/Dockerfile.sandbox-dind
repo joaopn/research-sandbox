@@ -28,6 +28,14 @@ RUN su - research -c 'echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.bash
 # Snapshot the home (byobu from the base + the PATH export) for first-boot restore.
 RUN cp -a /home/research /etc/research-skel
 
+# Dev-lane tooling (STAGE_DEV_GITEA): the repo-watch loop + prompt + the manual
+# post-auth launcher, for the dev workflow (the supervisor-level agent IS the
+# yolo agent there). Inert on a non-dev sandbox-dind project — rs-repo-watch
+# exits with a remedy when no dev wiring is staged.
+COPY container/dev/repo-watch.sh container/dev/repo-watch-prompt.md /opt/dev/
+COPY container/dev/rs-repo-watch /usr/local/bin/rs-repo-watch
+RUN chmod +x /opt/dev/repo-watch.sh /usr/local/bin/rs-repo-watch
+
 COPY agent/entrypoint.sandbox-dind.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 

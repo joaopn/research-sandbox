@@ -66,6 +66,32 @@ if [[ ! -f ~/.claude/settings.json ]]; then
         > ~/.claude/settings.json
 fi
 
+# --- Dev clone (dev preset): authed fork clone via the shared gitea --------
+# GITEA_URL/TOKEN/USER + REPO_NAME are set only for a dev box (rs-sandbox's dev
+# lane; mutually exclusive with RS_BOX_CLONE_* — the catalog forces clone:false
+# on dev presets). credential-helper-store so later push/pull authenticate;
+# origin = the agent's fork, upstream = the read-only mirror. Clone-if-absent
+# idempotent, like the byo block below. FAILURE POSTURE = byo parity: a clone
+# failure (gitea down, stale staged IP) exits non-zero and the box crash-loops
+# under --restart unless-stopped until the designed heal (host re-stage →
+# `rs-sandbox restart`) re-runs it with fresh wiring — deliberate, not a bug.
+if [[ -n "${GITEA_TOKEN:-}" && -n "${GITEA_URL:-}" && -n "${REPO_NAME:-}" ]]; then
+    ( umask 077 && printf '%s\n' \
+        "${GITEA_URL//:\/\//:\/\/${GITEA_USER}:${GITEA_TOKEN}@}" > ~/.git-credentials )
+    git config --global credential.helper store
+    DEV_REPO_DIR="/workspace/${REPO_NAME}"
+    if [[ ! -d "${DEV_REPO_DIR}/.git" ]]; then
+        echo "sandbox-box[${RS_SANDBOX_NAME}]: cloning fork ${GITEA_USER}/${REPO_NAME}"
+        rm -rf "${DEV_REPO_DIR}"
+        git clone "${GITEA_URL}/${GITEA_USER}/${REPO_NAME}.git" "${DEV_REPO_DIR}"
+    fi
+    if ! git -C "${DEV_REPO_DIR}" remote get-url upstream >/dev/null 2>&1; then
+        git -C "${DEV_REPO_DIR}" remote add upstream \
+            "${GITEA_URL}/sandbox-admin/${REPO_NAME}.git"
+    fi
+    git -C "${DEV_REPO_DIR}" fetch upstream --quiet || true
+fi
+
 # --- BYO clone (byo preset): clone repo@ref + run setup --------------------
 # RS_BOX_CLONE_REPO/REF/SETUP are set only for a `byo` box: clone VISIBLY to
 # /workspace/<repo-name>, pin REF (no drift), run SETUP in the clone (every boot —

@@ -70,7 +70,7 @@ PORT_MIN, PORT_MAX = 1, 65535
 
 _ALLOWED_KEYS = {"name", "substrate", "image_overlay", "repo", "ref", "setup",
                  "tabs", "mcp_exports", "resources", "services", "description",
-                 "greeting", "title", "group", "tags", "agents"}
+                 "greeting", "title", "group", "tags", "agents", "dev"}
 _TAB_KEYS = {"name", "port", "kind", "path"}
 _EXPORT_KEYS = {"name", "port", "transport"}
 _RESOURCE_KEYS = {"memory", "cpus"}
@@ -229,6 +229,14 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
     # slug (file stem, NAME_RE) and can't hold "[user]/[repo]"; `title` carries it.
     if "title" in m and not _is_str(m["title"]):
         out.append(p("title must be a non-empty string"))
+
+    # dev — marks the gitea dev lane (STAGE_DEV_GITEA): a dev-flagged workflow
+    # REQUIRES --dev-repo at create. Semantic coupling (must derive the
+    # sandbox-dind flavor) is enforced in CreateRequest.from_kwargs against the
+    # DERIVED type — the single resolve choke point — not against raw manifest
+    # fields here.
+    if "dev" in m and not isinstance(m["dev"], bool):
+        out.append(p(f"dev must be a boolean, got {m.get('dev')!r}"))
 
     # group — the New Project window section; optional (a group-less manifest
     # buckets into Store webui-side), ∈ GROUPS when present.

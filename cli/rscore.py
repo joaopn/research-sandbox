@@ -381,6 +381,14 @@ class CreateRequest:
     # /workspace/.orchestrator/greeting at create for the management/research
     # flavor; "" ⇒ no file staged.
     greeting: str = ""
+    # Dev lane (STAGE_DEV_GITEA S2). dev_lane is DERIVED from the workflow
+    # manifest's `dev: true` (data, never the workflow name — the flavor-
+    # derivation discipline); dev_repo is the MANDATORY-on-a-dev-workflow gitea
+    # repo NAME whose fork the create step clones into the supervisor workspace.
+    # CLI-only: dev_repo stays OUT of CREATE_WEBUI_FIELDS until the S3 Dev page
+    # opens it deliberately.
+    dev_lane: bool = False
+    dev_repo: str = ""
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "CreateRequest":
@@ -415,6 +423,35 @@ class CreateRequest:
                     "docker box is locked-egress (no ssh/port 22) and a private "
                     "repo clones over https via a PAT")
             _light_clone_basename(repo)   # reject a path-escaping basename early
+        # Dev lane (STAGE_DEV_GITEA S2), derived from manifest DATA (`dev: true`),
+        # never the workflow NAME. The repo is MANDATORY on a dev workflow (PI
+        # decision: a dev project gets its repo at create, one command) and
+        # rejected elsewhere. Pre-side-effect floors: the repo must already be
+        # added (its agent token file is the staging bridge — the dist-present
+        # precedent) and the manifest must derive the sandbox-dind flavor (the
+        # create-time dev step lives in that branch; a dev-flagged manifest on
+        # another flavor would silently skip it — reject instead).
+        dev_lane = bool(manifest.get("dev"))
+        dev_repo = (kw.get("dev_repo") or "").strip()
+        if dev_lane:
+            if (project_type is not ProjectType.SANDBOX_DIND
+                    or substrate is not Substrate.DIND_SYSBOX):
+                raise ValidationError(
+                    "a dev-flagged workflow must derive the sandbox-dind flavor "
+                    "(dind substrate + the rs-sandbox-dind overlay); fix the manifest")
+            if not dev_repo:
+                raise ValidationError(
+                    "the dev workflow requires --dev-repo <repo> (a repo added via "
+                    "`research dev repo add <github-url>`)")
+            if not _valid_dev_repo_name(dev_repo):
+                raise ValidationError(f"invalid dev repo name {dev_repo!r}")
+            if not gitea.agent_token_path(dev_repo).is_file():
+                raise ValidationError(
+                    f"repo {dev_repo!r} not added yet — run "
+                    f"`research dev repo add <github-url>` first")
+        elif dev_repo:
+            raise ValidationError(
+                "--dev-repo is only valid with a dev workflow (e.g. --workflow dev)")
         # Agent dists (STAGE_MULTI_AGENT): an enable-SET. Each must be a known agent,
         # and on the docker substrate each must already be pulled. Non-docker is
         # noted-and-ignored in create() (only the docker-box cp-deploy path is wired
@@ -503,6 +540,8 @@ class CreateRequest:
             agents=agents,
             service_defaults=service_defaults,
             greeting=greeting,
+            dev_lane=dev_lane,
+            dev_repo=dev_repo,
         )
 
 
@@ -868,6 +907,14 @@ def _parse_github_repo(url: Any) -> tuple[str, str, str]:
             raise ValidationError(
                 f"invalid {label} segment in repo URL {url!r}")
     return url, owner, repo
+
+
+def _valid_dev_repo_name(repo: Any) -> bool:
+    """The anchored dev-repo NAME shape — one helper for the new S2 call sites
+    (box_add's dev gate, CreateRequest.dev_repo); matches the inline checks the
+    Dev*Request validators carry."""
+    return (isinstance(repo, str) and bool(repo) and repo not in (".", "..")
+            and "/" not in repo and "\\" not in repo)
 
 
 @dataclass(frozen=True)
@@ -1359,6 +1406,23 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             # (after inject_route; raises HarnessError on failure, box left standing).
             clone_dir = _run_light_harness(
                 container_name, req.repo, req.ref, req.setup, req.github_pat, progress)
+            # Dev workflow step (STAGE_DEV_GITEA S2, create-time by PI decision:
+            # the repo is mandatory on a dev workflow): attach the shared gitea
+            # to the project bridge, record + stage the wiring (non-secret JSON
+            # + in-supervisor token), and clone the agent fork into the
+            # supervisor workspace. After inject_route + the dist staging above.
+            # A clone failure raises HarnessError and leaves the project
+            # standing: `research dev attach` re-stages idempotently and only
+            # the clone needs a manual in-project finish (or destroy+recreate).
+            if req.dev_repo:
+                progress.step("dev-attach", "attaching shared gitea")
+                gitea_ip = _connect_gitea_to_project_network(network)
+                if not gitea_ip:
+                    die(f"rs-gitea did not attach to {network} (no IP); "
+                        f"check docker state")
+                gitea.record_attachment(project, "agent", req.dev_repo, gitea_ip)
+                _stage_dev_gitea(project, cfg)
+                clone_dir = _run_dev_clone(container_name, req.dev_repo, progress)
         else:
             stage_worker_image(container_name, ANALYSIS_IMAGE)
             # Stage the agent dist into the supervisor (its own ~/.local + the
@@ -4176,6 +4240,14 @@ def _recreate_supervisor(
                   f"`research project role-mcp enable {project} {role}`",
                   file=sys.stderr)
 
+    # Dev-lane wiring (STAGE_DEV_GITEA S2): the token half lives in the
+    # supervisor's own fs, which the recreate just wiped — re-stage BEFORE the
+    # box relaunch loop below (a dev box's _rerun_box re-reads it; the
+    # order-is-load-bearing class). The staged gitea_ip refreshes from the
+    # record too (the network attachment itself survives a recreate).
+    if gitea.project_entries(project):
+        _stage_dev_gitea(project, cfg)
+
     # Restart the project's boxes (kind="sandbox", extensions.json). Boxes are
     # owned by the in-supervisor rs-sandbox CLI; the snapshot is the source of
     # truth and the workspace state survives on the project volume. Any non-box
@@ -4781,13 +4853,16 @@ def wire_gitea_to_projects() -> None:
     """Re-attach rs-gitea after a host `start`/recreate — SELECTIVE, unlike
     wire_registry_to_projects (which wires ALL projects): only the projects in
     the attachment record, refreshing each entry's gitea_ip on reconnect. No-op
-    if gitea was never stood up (no dev repo added yet)."""
+    if gitea was never stood up (no dev repo added yet). Re-stages each
+    project's dev wiring and, when the IP actually CHANGED, auto-heals its dev
+    boxes (F1 — a strict no-op on the stable common path)."""
     if not container_exists(gitea.GITEA_CONTAINER):
         return
     if not container_running(gitea.GITEA_CONTAINER):
         run_check(["docker", "start", gitea.GITEA_CONTAINER])
     entries = gitea.load_attachments()
     projects = sorted({e["project"] for e in entries if e.get("project")})
+    cfg = load_config() if projects else None
     for project in projects:
         network = project_network_for(project)
         if not network_exists(network):
@@ -4804,6 +4879,167 @@ def wire_gitea_to_projects() -> None:
         # across a disconnect/reconnect).
         for e in gitea.project_entries(project):
             gitea.record_attachment(project, e["class"], e.get("repo"), ip)
+        # Project-side dev wiring rides the record: re-stage, then reconcile
+        # the dev boxes — per-box change detection (actual ExtraHosts vs the
+        # staged address) lives in _restart_dev_boxes; stable path = no-op.
+        _stage_dev_gitea(project, cfg)
+        _restart_dev_boxes(project, cfg, ip)
+
+
+def _stage_dev_gitea(project: str, cfg: "Config") -> None:
+    """Stage a project's dev-lane wiring (STAGE_DEV_GITEA S2), split by secrecy:
+
+      * ``<ws>/.orchestrator/dev-gitea.json`` — NON-secret ``{gitea_ip, repos:
+        [{repo, user}]}``, host-written into the bind-mounted workspace (atomic
+        tmp+rename; the parent dir is the mount, no inode pin). The webui's RO
+        /projects mount can read this file, so a token must NEVER enter it —
+        the writer only handles ip/repo/user by construction.
+      * the per-repo agent token, streamed into the RUNNING supervisor's own fs
+        at ``~/.dev-tokens/agent-<repo>.token`` (0600) via ``docker exec -i …
+        cat`` — stdin as the container's own user (docker cp would land a
+        foreign-uid file under sysbox), never argv, never the workspace.
+
+    Zero agent-class entries ⇒ the staged JSON is removed (detach-to-zero).
+    Silently skips the token half when the supervisor isn't running: the
+    project-start path re-runs this from _recreate_supervisor, and dev_attach
+    requires a running project up-front."""
+    ws = workspace_path_for(project, cfg)
+    if not ws.is_dir():
+        return
+    entries = [e for e in gitea.project_entries(project)
+               if e.get("class") == "agent" and e.get("repo")]
+    payload_path = ws / ".orchestrator" / "dev-gitea.json"
+    if not entries:
+        try:
+            payload_path.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    gitea_ip = next((e["gitea_ip"] for e in entries if e.get("gitea_ip")), "")
+    payload = {"gitea_ip": gitea_ip,
+               "repos": [{"repo": e["repo"],
+                          "user": gitea.agent_user_for(e["repo"])}
+                         for e in entries]}
+    payload_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = payload_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    tmp.replace(payload_path)
+    container = container_name_for(project)
+    if not container_running(container):
+        return
+    for e in entries:
+        tok_path = gitea.agent_token_path(e["repo"])
+        try:
+            tok = tok_path.read_text().strip()
+        except OSError:
+            tok = ""
+        if not tok:
+            print(f"warning: agent token missing at {tok_path}; skipped its "
+                  f"in-supervisor staging (re-run `research dev repo add`)",
+                  file=sys.stderr)
+            continue
+        # Positional-arg sh so the (validated) repo name never rides string
+        # interpolation, and the token rides ONLY stdin.
+        r = run(["docker", "exec", "-i", "-u", "research", container, "sh", "-c",
+                 'umask 077 && mkdir -p "$HOME/.dev-tokens" && cat > "$HOME/.dev-tokens/$1"',
+                 "sh", f"agent-{e['repo']}.token"],
+                input=tok + "\n", capture_output=True)
+        if r.returncode != 0:
+            print(f"warning: token staging for repo {e['repo']!r} failed: "
+                  f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
+
+
+def _restart_dev_boxes(project: str, cfg: "Config", gitea_ip: str) -> None:
+    """F1 auto-heal (STAGE_DEV_GITEA S2): re-run any RUNNING dev box whose
+    baked /etc/hosts entry does not match the CURRENTLY staged gitea address.
+    The change check is against the box container's ACTUAL ExtraHosts —
+    --add-host is fixed at docker run, and only a re-run (rs-sandbox restart →
+    _rerun_box → rm+run, re-reading the fresh staging) refreshes it — NOT
+    against record history: the primary address-changing flow (detach →
+    re-attach) deletes the record in between, so a prior-record comparison can
+    never fire there (the acceptance harness caught exactly that). A matching
+    box is skipped — the stable-path no-op; a deliberately-parked (stopped)
+    box is left parked — rs-sandbox's own start path reconciles it. Dev boxes
+    are enumerated HOST-side from the bind-mounted extensions.json. Best-
+    effort: a failure warns and leaves the box to a manual
+    `rs-sandbox restart <name>`."""
+    container = container_name_for(project)
+    if not gitea_ip or not container_running(container):
+        return
+    ws = workspace_path_for(project, cfg)
+    for name, e in sorted(extension.load(ws).items()):
+        if not (isinstance(e, dict) and e.get("kind") == extension.SANDBOX_KIND
+                and e.get("dev")):
+            continue
+        cname = e.get("container") or f"rs-pi-iso-{name}"
+        ins = run(["docker", "exec", container, "docker", "inspect", "-f",
+                   "{{.State.Running}} {{json .HostConfig.ExtraHosts}}", cname],
+                  capture_output=True)
+        state = ins.stdout.strip() if ins.returncode == 0 else ""
+        if not state.startswith("true"):
+            continue                    # absent or parked — not ours to start
+        # Match the QUOTED JSON form: a bare substring would false-match a
+        # prefix ip ("…:172.20.0.9" is a substring of "…:172.20.0.90") and
+        # skip a genuinely stale box.
+        if f'"rs-gitea:{gitea_ip}"' in state:
+            continue                    # already current — the stable no-op
+        r = run(["docker", "exec", container, "rs-sandbox", "restart", name],
+                capture_output=True)
+        if r.returncode != 0:
+            print(f"warning: dev box {name!r} re-run after the gitea address "
+                  f"change failed: {(r.stderr or r.stdout).strip()}",
+                  file=sys.stderr)
+        else:
+            print(f"dev box {name!r} re-run against the new gitea address")
+
+
+def _run_dev_clone(container: str, repo: str, progress) -> str:
+    """Clone the agent fork into the supervisor workspace (the dev workflow's
+    create-time step, STAGE_DEV_GITEA S2): credential-helper store +
+    clone-if-absent + the read-only mirror as ``upstream`` — the same contract
+    as the box entrypoint's dev block, executed host-side as the unprivileged
+    research user. Deliberately NOT _run_light_harness (that path is
+    https://-only + GitHub-PAT-shaped). Secret discipline: the credentials line
+    reaches the container via STDIN (never exec argv); the clone script itself
+    carries NO token (the helper file supplies auth); failures raise
+    HarnessError with the token literal scrubbed (via _light_exec). Also stages
+    the dev instructions as /workspace/CLAUDE.md, no-clobber — the same text
+    the dev box preset stages, from boxes/dev.instructions.md. Returns the
+    clone dir."""
+    user = gitea.agent_user_for(repo)
+    token = gitea.agent_token_path(repo).read_text().strip()
+    if not token:
+        die(f"agent token file for {repo!r} is empty; re-run `research dev repo add`")
+    base = f"http://{gitea.GITEA_CONTAINER}:{gitea.GITEA_INNER_PORT}"
+    progress.step("dev-clone", "cloning the dev fork")
+    r = run(["docker", "exec", "-i", "-u", "research", container, "sh", "-c",
+             'umask 077 && cat > "$HOME/.git-credentials"'],
+            input=f"http://{user}:{token}@"
+                  f"{gitea.GITEA_CONTAINER}:{gitea.GITEA_INNER_PORT}\n",
+            capture_output=True)
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout or "").replace(token, "***").strip()
+        raise HarnessError("dev credentials staging failed", detail)
+    workdir = f"/workspace/{repo}"
+    q = shlex.quote
+    script = (
+        "git config --global credential.helper store && "
+        f"if [ ! -d {q(workdir)}/.git ]; then rm -rf {q(workdir)} && "
+        f"git clone {q(base + '/' + user + '/' + repo + '.git')} {q(workdir)}; fi && "
+        f"cd {q(workdir)} && "
+        "(git remote get-url upstream >/dev/null 2>&1 || "
+        f"git remote add upstream {q(base + '/' + gitea.ADMIN_USER + '/' + repo + '.git')}) && "
+        "git fetch upstream --quiet"
+    )
+    # _light_exec's scrub parameter is generic "replace this literal" — here the
+    # literal is the gitea agent token, not a GitHub PAT.
+    _light_exec(container, script, step="dev fork clone", github_pat=token)
+    instr = box_catalog.BUILTIN_DIR / "dev.instructions.md"
+    if instr.is_file():
+        run(["docker", "exec", "-i", "-u", "research", container, "sh", "-c",
+             '[ -e /workspace/CLAUDE.md ] || cat > /workspace/CLAUDE.md'],
+            input=instr.read_text(), capture_output=True)
+    return workdir
 
 
 def _push_generic_image(host_base: str) -> None:
@@ -5962,6 +6198,29 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         raise ValidationError(
             f"MCP(s) {bad} are not allowed for project {req.project!r}; allow them "
             f"first (`research project mcp allow ...`) or omit them")
+    # Dev preset (STAGE_DEV_GITEA S2): mirror the in-supervisor rs-sandbox gates
+    # host-side for a clean pre-exec ValidationError (the two-gate lockstep).
+    # `repo` carries NAME semantics here (an attached gitea repo), not the byo
+    # clone URL; ref/setup/mcps are rejected — the dev clone is the authed gitea
+    # lane, and the box's dedicated bridge has no path to mcp-proxy.
+    if catalog.get(req.preset, {}).get("dev"):
+        if req.mcps:
+            raise ValidationError(
+                "a dev box cannot take MCPs (its dedicated bridge has no path "
+                "to mcp-proxy)")
+        if req.ref or req.setup:
+            raise ValidationError("ref/setup are not valid for a dev box")
+        if not _valid_dev_repo_name(req.repo):
+            raise ValidationError(
+                "a dev box requires 'repo': the NAME of a dev repo attached to "
+                "this project")
+        attached = {e.get("repo") for e in gitea.project_entries(req.project)
+                    if e.get("class") == "agent"}
+        if req.repo not in attached:
+            raise ValidationError(
+                f"repo {req.repo!r} is not attached to project {req.project!r}; "
+                f"run `research dev attach {req.project} --class agent "
+                f"--repo {req.repo}` first")
     # Lazily stand up the box harness. On research this stages rs-sandbox + delivers
     # the needed box image on first use (research create/recreate never touch boxes
     # — the frozen lane); on sandbox-dind (eager-staged) it no-ops. The image a box
@@ -6212,9 +6471,13 @@ def dev_repo_list(_req: "DevRepoListRequest", _progress=None) -> DevRepoListResu
 
 def dev_attach(req: "DevAttachRequest", _progress=None) -> DevAttachResult:  # type: ignore[name-defined]
     """Connect a project's bridge to rs-gitea and record the attachment (class +
-    repo + gitea_ip). Agent-class carries the repo it works; control-class is
-    fetch-only (repo None). The staged credential differs (S2/S3); the network
-    connect is identical."""
+    repo + gitea_ip). Agent-class carries the repo it works, requires a RUNNING
+    project (the token staging is a docker exec into the live supervisor), and
+    stages the project-side dev wiring; control-class is fetch-only (repo None,
+    staging is S3's). A re-attach that lands a DIFFERENT gitea IP auto-heals the
+    project's dev boxes (F1). Attach never clones into the supervisor — the dev
+    workflow's create step owns that; a later-attached extra repo is staged-only
+    (the in-project agent can clone it itself with the staged credentials)."""
     container = container_name_for(req.project)
     if not container_exists(container):
         die(f"project {req.project!r} does not exist")
@@ -6227,22 +6490,47 @@ def dev_attach(req: "DevAttachRequest", _progress=None) -> DevAttachResult:  # t
         if not gitea.agent_token_path(req.repo).is_file():
             die(f"repo {req.repo!r} not added yet "
                 f"(`research dev repo add <github-url>` first)")
+        if not container_running(container):
+            die(f"project {req.project!r} is not running; start it first (an "
+                f"agent attach stages the gitea token into the live supervisor)")
     ip = _connect_gitea_to_project_network(network)
     if not ip:
         die(f"rs-gitea did not attach to {network} (no IP); check docker state")
     gitea.record_attachment(req.project, req.klass, req.repo, ip)
+    if req.klass == "agent":
+        cfg = load_config()
+        _stage_dev_gitea(req.project, cfg)
+        # Unconditional reconcile: change detection lives per-box in
+        # _restart_dev_boxes (against actual ExtraHosts) — a record-history
+        # comparison cannot work here, detach deletes the prior entry.
+        _restart_dev_boxes(req.project, cfg, ip)
     return DevAttachResult(project=req.project, klass=req.klass, repo=req.repo,
                            gitea_ip=ip)
 
 
 def dev_detach(req: "DevDetachRequest", _progress=None) -> DevDetachResult:  # type: ignore[name-defined]
     """Remove attachment entries; disconnect the bridge from rs-gitea IFF no
-    entry remains for the project. repo=None detaches ALL of the project."""
+    entry remains for the project. repo=None detaches ALL of the project. The
+    staged dev wiring follows the record (re-written minus the detached entries;
+    removed at zero) and the detached repos' in-supervisor tokens are deleted
+    best-effort. Standing dev boxes are NOT auto-discarded — they keep running
+    but lose their gitea wiring (an operator action, documented)."""
+    before = {e.get("repo") for e in gitea.project_entries(req.project)
+              if e.get("class") == "agent" and e.get("repo")}
     if req.repo is None:
         gitea.prune_project(req.project)
         remaining = []
     else:
         remaining = gitea.prune_entry(req.project, req.repo)
+    still = {e.get("repo") for e in remaining
+             if e.get("class") == "agent" and e.get("repo")}
+    _stage_dev_gitea(req.project, load_config())
+    container = container_name_for(req.project)
+    if container_running(container):
+        for repo in sorted(before - still):
+            run(["docker", "exec", "-u", "research", container, "sh", "-c",
+                 'rm -f "$HOME/.dev-tokens/$1"', "sh", f"agent-{repo}.token"],
+                capture_output=True)
     if not remaining:
         network = project_network_for(req.project)
         if network_exists(network):
