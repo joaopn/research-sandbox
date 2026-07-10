@@ -121,6 +121,24 @@ ORIGIN_PORT_HI = int(os.environ.get("WEBUI_ORIGIN_PORT_HI", "10164"))
 STATE_DIR = Path(os.environ.get("WEBUI_STATE_DIR", "/app/state"))
 ORIGIN_PORTS_FILE = STATE_DIR / "origin-ports.json"
 
+# The shared-gitea origin admission (STAGE_DEV_GITEA S3). The Development
+# page's Gitea tab renders gitea on its OWN origin port like any http tab, but
+# gitea is a NON-project upstream: the admission entry uses this sentinel as
+# its "project". A leading '-' is unreachable under the project-name regex
+# (alnum first char), so the sentinel can never collide with a real project —
+# and the cookie-gate code works verbatim (the cookie name derives from
+# entry["project"] → rs_session_-gitea-). Minted by /broker/dev/gitea-session,
+# which is Management-session-anchored (the broker cookie is Path=/broker — the
+# reason the mint route lives under /broker/ — and never reaches port-root
+# origins, which is why the mint sets a dedicated Path=/ cookie).
+GITEA_ORIGIN_KEY = "-gitea-"
+GITEA_ORIGIN_SERVICE = "gitea"
+# Lockstep with cli/gitea.py GITEA_CONTAINER / GITEA_INNER_PORT (the webui
+# cannot import cli/gitea.py — it would drag host-only deps into this image).
+# Reachability is the compose bridge both containers share.
+GITEA_UPSTREAM_HOST = "rs-gitea"
+GITEA_UPSTREAM_PORT = 3000
+
 # In-memory mirror of ORIGIN_PORTS_FILE: port(int) → {"project", "service"}.
 # Loaded once at startup; every mutation persists synchronously. The table
 # stores only the IDENTITY key — the upstream port is re-derived per request
@@ -211,7 +229,8 @@ def _origin_table_sweep() -> None:
     except OSError:
         return
     stale = [p for p, e in ORIGIN_PORTS.items()
-             if _project_workspace(e["project"]) is None]
+             if e["project"] != GITEA_ORIGIN_KEY
+             and _project_workspace(e["project"]) is None]
     for p in stale:
         del ORIGIN_PORTS[p]
     if stale:
@@ -917,6 +936,79 @@ async def broker_ports_handler(request: web.Request) -> web.Response:
     project = request.match_info.get("name", "")
     status, reply = await _relay(request, "port_list", {"project": project})
     return web.json_response(reply, status=status)
+
+
+async def broker_dev_handler(request: web.Request) -> web.Response:
+    """GET /broker/dev — the Development-page read (gitea state + per-repo
+    mirror/PR/branch status + attachments), relayed to the token-gated
+    dev_status verb. A READ: the broker never starts gitea for it (a stopped
+    gitea reports running:false; the Infrastructure Start button is the
+    explicit path). Also feeds the Management page's Infrastructure section."""
+    status, reply = await _relay(request, "dev_status", {})
+    return web.json_response(reply, status=status)
+
+
+async def broker_dev_sync_handler(request: web.Request) -> web.Response:
+    """POST /broker/dev/sync {repo} — trigger a mirror sync (gated,
+    origin-checked). One bounded gitea call broker-side — synchronous relay."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    status, reply = await _relay(request, "dev_sync", {"repo": body.get("repo")})
+    return web.json_response(reply, status=status)
+
+
+async def broker_dev_gitea_start_handler(request: web.Request) -> web.Response:
+    """POST /broker/dev/gitea-start — explicit gitea start (gated,
+    origin-checked; the Management Infrastructure button). The broker-side
+    start is bounded by its readiness wait; the 30s relay may report a timeout
+    while the daemon finishes — the UI re-reads status after."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    status, reply = await _relay(request, "dev_gitea_start", {})
+    return web.json_response(reply, status=status)
+
+
+async def dev_gitea_session_handler(request: web.Request) -> web.Response:
+    """POST /broker/dev/gitea-session — mint the shared-gitea origin session
+    (STAGE_DEV_GITEA S3). MANAGEMENT-SESSION-ANCHORED: the trust anchor is the
+    broker login (the SPA's Management session cookie). That cookie is
+    Path=/broker, so this route MUST live under /broker/ or the browser never
+    sends it (a /dev/... mint would 401 while logged in — caught live by the
+    acceptance harness). It never reaches port-root origin requests either,
+    which is why the mint sets a dedicated Path=/ cookie (the /session/<proj>
+    pattern) under the sentinel name, validated per-request by
+    origin_proxy_handler against the same SESSIONS map. Allocates the gitea
+    origin port on first use and returns the origin URL for the iframe."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    if _broker_session(request) is None:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+    port = _origin_port_for(GITEA_ORIGIN_KEY, GITEA_ORIGIN_SERVICE)
+    if port is None:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "exhausted",
+             "message": "origin-port pool exhausted"}}, status=503)
+    token = secrets.token_urlsafe(32)
+    SESSIONS[token] = {
+        "project": GITEA_ORIGIN_KEY,
+        "expires": time.time() + SESSION_TTL_SECONDS,
+    }
+    response = web.json_response(
+        {"ok": True, "url": f"https://{_request_host(request)}:{port}/"})
+    response.set_cookie(
+        f"rs_session_{GITEA_ORIGIN_KEY}", token,
+        path="/",
+        httponly=True, secure=True, samesite="Strict",
+        max_age=SESSION_TTL_SECONDS,
+    )
+    return response
 
 
 async def broker_op_log_handler(request: web.Request) -> web.Response:
@@ -1845,13 +1937,22 @@ async def origin_proxy_handler(request: web.Request) -> web.StreamResponse:
     if not cookie or not _session_valid(cookie, project):
         return web.Response(status=401, text="session required")
 
-    upstream_port = _resolve_origin_upstream_port(project, service_id)
-    if upstream_port is None:
-        return web.Response(
-            status=404, text=f"unknown http service {service_id!r}")
+    if project == GITEA_ORIGIN_KEY:
+        # The shared-gitea admission (STAGE_DEV_GITEA S3): a FIXED non-project
+        # upstream — constants only, no client value can ever pick it (the
+        # _resolve_origin_upstream_port discipline, by construction). The
+        # cookie gate above already ran against the sentinel-named cookie
+        # minted by the Management-anchored /broker/dev/gitea-session.
+        upstream_host: str = GITEA_UPSTREAM_HOST
+        upstream_port: int | None = GITEA_UPSTREAM_PORT
+    else:
+        upstream_port = _resolve_origin_upstream_port(project, service_id)
+        if upstream_port is None:
+            return web.Response(
+                status=404, text=f"unknown http service {service_id!r}")
+        upstream_host = f"{PROJECT_CONTAINER_PREFIX}{project}"
 
     tail = request.match_info.get("tail", "")
-    upstream_host = f"{PROJECT_CONTAINER_PREFIX}{project}"
     is_ws = (request.headers.get("Upgrade", "").lower() == "websocket")
     scheme = "ws" if is_ws else "http"
     upstream_url = f"{scheme}://{upstream_host}:{upstream_port}/{tail}"
@@ -2018,6 +2119,12 @@ def main() -> None:
     # `{action}` catch-all below (first-match wins, else `port`/`port-remove` are
     # swallowed as actions).
     app.router.add_get("/broker/project/{name}/ports", broker_ports_handler)
+    app.router.add_get("/broker/dev", broker_dev_handler)
+    app.router.add_post("/broker/dev/sync", broker_dev_sync_handler)
+    app.router.add_post("/broker/dev/gitea-start", broker_dev_gitea_start_handler)
+    # Under /broker/ ON PURPOSE: the Management session cookie is Path=/broker
+    # and a browser won't send it to any other path prefix.
+    app.router.add_post("/broker/dev/gitea-session", dev_gitea_session_handler)
     app.router.add_post("/broker/project/{name}/port", broker_port_add_handler)
     app.router.add_post(
         "/broker/project/{name}/port-remove", broker_port_remove_handler)

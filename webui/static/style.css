@@ -1213,6 +1213,61 @@ body {
     border: none;
 }
 
+/* Development host page (STAGE_DEV_GITEA S3): Gitea iframe tab + the Fetch
+   copy list, plus the Management Infrastructure section. Every selector is
+   self-scoped under dev-* / mgmt-infra (no bare input/label rules — the
+   .field-bleed discipline). */
+.dev-tab-btn.active {
+    color: var(--fg-accent);
+    box-shadow: 0 -2px 0 var(--fg-accent) inset;
+}
+.dev-body { display: flex; flex-direction: column; gap: 10px; }
+.dev-gitea-frame {
+    width: 100%;
+    /* Fill the host page under its header; gitea manages its own scrolling. */
+    height: calc(100dvh - 130px);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-card);
+}
+.dev-repo-card {
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.dev-repo-head { display: flex; align-items: center; gap: 10px; }
+.dev-repo-name { font-weight: 600; }
+.dev-repo-meta { color: var(--fg-muted); font-size: 12px; flex: 1; }
+.dev-pr-row, .dev-branch-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+}
+.dev-pr-id { color: var(--fg-muted); min-width: 42px; }
+.dev-pr-title {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.dev-pr-meta { color: var(--fg-faint); font-size: 12px; }
+.dev-attached { margin-top: 2px; }
+.dev-copy { min-width: 34px; }
+/* Dev preset: the MCP picker is locked (a dev box's bridge has no mcp-proxy
+   path); pointer-events off so the disabled checkboxes read as inert. */
+.config-mcp-picker.disabled { opacity: 0.45; pointer-events: none; }
+.mgmt-infra { margin-top: 24px; }
+.mgmt-infra-title { font-size: 14px; font-weight: 600; margin-bottom: 8px; }
+.mgmt-infra-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 10px;
+    background: var(--bg-card);
+}
+
 /* ===================== Mobile shell (html.mobile) ==========================
    Applied by app.js (mobileModeActive: width <= the 768px breakpoint, or the
    Settings Layout override). The desktop layout above is untouched — every

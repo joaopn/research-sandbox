@@ -531,7 +531,9 @@ def _verb_port_list(args: dict, _progress=None) -> dict:
 # GitHub PAT is NOT here: it's a host-CLI-only secret write, never relayed. Repo
 # remove joins STEP_UP_VERBS (deletes agent work). None joins OPEN_VERBS.
 DEV_REPO_ADD_WEBUI_FIELDS = frozenset({"url"})
-DEV_ATTACH_WEBUI_FIELDS = frozenset({"project", "klass", "repo"})
+# klass is GONE (STAGE_DEV_GITEA S3): attachments are agent-class only — the
+# fetch surface went universal and the former "control" class was retired.
+DEV_ATTACH_WEBUI_FIELDS = frozenset({"project", "repo"})
 DEV_DETACH_WEBUI_FIELDS = frozenset({"project", "repo"})
 DEV_TARGET_WEBUI_FIELDS = frozenset({"repo"})
 
@@ -571,6 +573,19 @@ def _verb_dev_sync(args: dict, _progress=None) -> dict:
     return dataclasses.asdict(rscore.dev_sync(req))
 
 
+def _verb_dev_status(_args: dict, _progress=None) -> dict:
+    # The Development-page read: no fields; NEVER starts gitea (a stopped one
+    # reports running:false immediately — dev_gitea_start is the explicit verb).
+    req = rscore.DevStatusRequest.from_kwargs()
+    return dataclasses.asdict(rscore.dev_status(req))
+
+
+def _verb_dev_gitea_start(_args: dict, _progress=None) -> dict:
+    # Explicit gitea start (the Management Infrastructure button). No fields.
+    req = rscore.DevGiteaStartRequest.from_kwargs()
+    return dataclasses.asdict(rscore.dev_gitea_start(req))
+
+
 # The closed lifecycle vocabulary — the host-root boundary. Adding a verb here
 # is a deliberate, security-reviewed edit; never a docker passthrough.
 VERBS = {
@@ -602,6 +617,8 @@ VERBS = {
     "dev_attach": _verb_dev_attach,
     "dev_detach": _verb_dev_detach,
     "dev_sync": _verb_dev_sync,
+    "dev_status": _verb_dev_status,
+    "dev_gitea_start": _verb_dev_gitea_start,
 }
 
 # Verbs requiring step-up re-auth: a FRESH login proof (derived client-side

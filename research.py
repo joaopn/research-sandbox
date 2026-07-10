@@ -1680,6 +1680,39 @@ def cmd_dev_pat_unset(_args: argparse.Namespace) -> None:
         print("no GitHub PAT configured")
 
 
+def cmd_dev_passwd(args: argparse.Namespace) -> None:
+    """Set the sandbox-admin gitea password — the human's interactive gitea
+    identity (the webui Development page's Gitea tab sign-in). Bootstrap mints
+    and DISCARDS a random one, so this is how the operator makes the gitea web
+    UI passable. Host-CLI only (no broker verb): it sets a human credential.
+    The password rides `docker exec` argv into our own gitea container — the
+    exact bootstrap_accounts precedent (gitea admin user create --password)."""
+    import getpass
+    from broker_auth import MIN_PASSWORD_LENGTH
+    pw = sys.stdin.readline().strip() if not sys.stdin.isatty() \
+        else getpass.getpass("New sandbox-admin password (input hidden): ").strip()
+    if len(pw) < MIN_PASSWORD_LENGTH:
+        die(f"password must be at least {MIN_PASSWORD_LENGTH} characters")
+    if not container_exists(gitea.GITEA_CONTAINER):
+        die("rs-gitea has not been set up yet — add a repo first "
+            "(`research dev repo add <github-url>`)")
+    rscore._ensure_gitea_running()
+    # --must-change-password=false matches both bootstrap `user create` calls:
+    # without it a (version-dependent) forced change at next sign-in defeats
+    # the web-UI login this command exists to enable.
+    r = run(["docker", "exec", "-u", "git", gitea.GITEA_CONTAINER,
+             "gitea", "admin", "user", "change-password",
+             "--username", gitea.ADMIN_USER, "--password", pw,
+             "--must-change-password=false"], capture_output=True)
+    if r.returncode != 0:
+        # Never echo gitea's stderr verbatim at full length — coarse tail only.
+        detail = (r.stderr or r.stdout or "").strip()
+        die(f"could not set the {gitea.ADMIN_USER} password"
+            + (f" ({detail[-200:]})" if detail else ""))
+    print(f"password set for {gitea.ADMIN_USER} — sign in on the webui's "
+          f"Development page (Gitea tab)")
+
+
 def cmd_dev_repo_add(args: argparse.Namespace) -> None:
     req = _build(rscore.DevRepoAddRequest, url=args.url)
     res = _call(rscore.dev_repo_add, req)
@@ -1705,11 +1738,9 @@ def cmd_dev_repo_list(_args: argparse.Namespace) -> None:
 
 
 def cmd_dev_attach(args: argparse.Namespace) -> None:
-    req = _build(rscore.DevAttachRequest, project=args.project, klass=args.klass,
-                 repo=args.repo)
+    req = _build(rscore.DevAttachRequest, project=args.project, repo=args.repo)
     res = _call(rscore.dev_attach, req)
-    tail = f" (repo {res.repo})" if res.repo else ""
-    print(f"attached {res.project} as {res.klass}{tail}; rs-gitea at {res.gitea_ip}")
+    print(f"attached {res.project} (repo {res.repo}); rs-gitea at {res.gitea_ip}")
 
 
 def cmd_dev_detach(args: argparse.Namespace) -> None:
@@ -2243,6 +2274,10 @@ def build_parser() -> argparse.ArgumentParser:
     dvps.set_defaults(func=cmd_dev_pat_set)
     dvpu = dvp_sub.add_parser("unset", help="remove the saved GitHub PAT")
     dvpu.set_defaults(func=cmd_dev_pat_unset)
+    dvpw = dv_sub.add_parser("passwd",
+                             help="set the sandbox-admin gitea password (the "
+                                  "human web-UI sign-in); reads stdin when piped")
+    dvpw.set_defaults(func=cmd_dev_passwd)
     dvr = dv_sub.add_parser("repo", help="mirror/fork lifecycle for a repo")
     dvr_sub = dvr.add_subparsers(dest="repo_action", required=True)
     dvra = dvr_sub.add_parser("add", help="mirror a GitHub repo + fork it for an agent")
@@ -2253,11 +2288,11 @@ def build_parser() -> argparse.ArgumentParser:
     dvrr.set_defaults(func=cmd_dev_repo_remove)
     dvrl = dvr_sub.add_parser("list", help="list dev repos")
     dvrl.set_defaults(func=cmd_dev_repo_list)
-    dva = dv_sub.add_parser("attach", help="connect a project's network to rs-gitea")
+    dva = dv_sub.add_parser("attach",
+                            help="attach a dev repo to a project (agent fork "
+                                 "wiring; fetch access is universal already)")
     dva.add_argument("project")
-    dva.add_argument("--class", dest="klass", choices=["agent", "control"],
-                     default="agent", help="agent (works a repo) or control (fetch-only)")
-    dva.add_argument("--repo", default=None, help="repo to work (required for --class agent)")
+    dva.add_argument("--repo", required=True, help="dev repo NAME the project works")
     dva.set_defaults(func=cmd_dev_attach)
     dvd = dv_sub.add_parser("detach", help="disconnect a project from rs-gitea")
     dvd.add_argument("project")

@@ -239,7 +239,7 @@ const state = {
                              // unlock, cleared on lock, NEVER persisted)
     vault: null,             // { version, projects, settings } | null
     activeProject: null,     // string | null
-    hostPage: null,          // "workflows" | "management" | "settings" | null
+    hostPage: null,          // "workflows" | "development" | "management" | "settings" | null
     explainIndex: null,      // string[] of workflows with a rendered Explain doc (/static/explain/index.json); null = unfetched
     activeService: null,     // string | null
     serviceRegistry: null,   // { [serviceId]: spec } from /services
@@ -901,6 +901,8 @@ function makeBottomNav() {
     return el("div", { class: "rail-nav-group" }, [
         mk("workflows-entry", "🛍", "New Project",
            "New Project — pick a workflow, or import an existing project", openWorkflows),
+        mk("development-entry", "⑂", "Development",
+           "Development — dev repos, PRs, fetch commands (shared Gitea)", openDevelopment),
         mk("management-entry", "🗂", "Management",
            "Host project management (broker)", openManagement),
         mk("settings-entry", "⚙", "Settings", "UI settings + software", openSettings),
@@ -1559,6 +1561,7 @@ function renderMgmtTable(view, projects) {
     ]));
     if (projects.length === 0) {
         view.appendChild(el("div", { class: "mgmt-empty" }, ["No projects on this host."]));
+        appendInfraSection(view);   // async, fire-and-forget
         return;
     }
     const rows = [el("div", { class: "mgmt-row mgmt-row-head" }, [
@@ -1595,6 +1598,7 @@ function renderMgmtTable(view, projects) {
         ]));
     }
     view.appendChild(el("div", { class: "mgmt-table" }, rows));
+    appendInfraSection(view);   // async, fire-and-forget (its own sub-block)
     mgmtFillStatus(fill);
 }
 
@@ -1634,6 +1638,251 @@ function setTypeBadge(elm, label) {
         : label ? " type-box" : "";
     elm.className = "type-badge" + cls;
     elm.textContent = label || "";
+}
+
+// ---- Development host page (STAGE_DEV_GITEA S3) ----------------------------
+// Two sub-tabs: "Gitea" (the gitea web UI on its own origin port, session
+// minted via the Management-anchored /broker/dev/gitea-session) and "Fetch" (the
+// RS-rendered open-PR/branch list with click-to-copy rs-fetch commands, fed by
+// one /broker/dev read per open — Q6, no poller). The Fetch tab is the
+// guaranteed copy surface; the agent's final-comment code block inside Gitea
+// (with Gitea's own copy button) is the convenience layer.
+
+let devActiveTab = "gitea";
+
+function openDevelopment() {
+    if (state.hostPage === "development") return leaveHostView();
+    state.hostPage = "development";
+    const view = enterHostView();
+    if (!view) return;
+    setActiveNavEntry("development-entry");
+    renderDevelopmentInto(view);
+}
+
+function renderDevelopmentInto(view) {
+    view.innerHTML = "";
+    const body = el("div", { class: "dev-body" });
+    const tabGitea = el("button", { class: "btn-small dev-tab-btn" }, ["Gitea"]);
+    const tabFetch = el("button", { class: "btn-small dev-tab-btn" }, ["Fetch"]);
+    const mark = () => {
+        tabGitea.classList.toggle("active", devActiveTab === "gitea");
+        tabFetch.classList.toggle("active", devActiveTab === "fetch");
+    };
+    tabGitea.onclick = () => { devActiveTab = "gitea"; mark(); renderDevGiteaTab(view, body); };
+    tabFetch.onclick = () => { devActiveTab = "fetch"; mark(); renderDevFetchTab(view, body); };
+    view.appendChild(el("div", { class: "mgmt-header" }, [
+        el("h2", {}, ["Development"]),
+        el("div", { class: "mgmt-toolbar dev-tabs" }, [tabGitea, tabFetch]),
+    ]));
+    view.appendChild(body);
+    mark();
+    if (devActiveTab === "fetch") renderDevFetchTab(view, body);
+    else renderDevGiteaTab(view, body);
+}
+
+async function renderDevGiteaTab(view, body) {
+    body.innerHTML = "";
+    body.appendChild(el("div", { class: "mgmt-loading" }, ["Opening Gitea…"]));
+    let res;
+    try {
+        // /broker/-prefixed: the Management session cookie is Path=/broker.
+        res = await fetch("/broker/dev/gitea-session", { method: "POST" });
+    } catch (e) { return renderMgmtUnavailable(body); }
+    if (res.status === 401) return renderMgmtLogin(view, renderDevelopmentInto);
+    if (res.status === 403) return renderMgmtRejected(body);
+    let data;
+    try { data = await res.json(); } catch (e) { data = {}; }
+    if (!res.ok || !data.ok || !data.url) {
+        body.innerHTML = "";
+        body.appendChild(el("div", { class: "mgmt-empty" }, [
+            "Gitea isn't reachable — it may be stopped or not set up yet. ",
+            "Start it under Management → Infrastructure, or add a repo first: ",
+            el("code", {}, ["research dev repo add <github-url>"]),
+        ]));
+        return;
+    }
+    body.innerHTML = "";
+    // clipboard-write delegation is what lets Gitea's native code-block copy
+    // button work inside the cross-origin frame (Permissions-Policy features
+    // whose default allowlist is 'self' are silently revoked otherwise).
+    const iframe = el("iframe", {
+        class: "dev-gitea-frame",
+        src: data.url,
+        allow: "fullscreen; clipboard-read; clipboard-write",
+    });
+    iframe.setAttribute("allowfullscreen", "");
+    body.appendChild(iframe);
+}
+
+function devCopyBtn(cmd) {
+    const b = el("button", { class: "btn-small dev-copy", title: "Copy: " + cmd },
+                 ["📋"]);
+    b.onclick = async () => {
+        try { await navigator.clipboard.writeText(cmd); } catch (e) { return; }
+        b.textContent = "✓";
+        setTimeout(() => { b.textContent = "📋"; }, 1200);
+    };
+    return b;
+}
+
+async function renderDevFetchTab(view, body) {
+    body.innerHTML = "";
+    body.appendChild(el("div", { class: "mgmt-loading" }, ["Loading dev repos…"]));
+    let res;
+    try {
+        res = await fetch("/broker/dev");
+    } catch (e) { return renderMgmtUnavailable(body); }
+    if (res.status === 401) return renderMgmtLogin(view, renderDevelopmentInto);
+    if (res.status === 403) return renderMgmtRejected(body);
+    if (res.status === 503) return renderMgmtUnavailable(body);
+    let data;
+    try { data = await res.json(); } catch (e) { return renderMgmtUnavailable(body); }
+    if (!res.ok || !data.ok || !data.result) {
+        body.innerHTML = "";
+        body.appendChild(el("div", { class: "mgmt-empty" },
+                            [mgmtErrText(data) || "Could not load dev status."]));
+        return;
+    }
+    renderDevFetchScreen(view, body, data.result);
+}
+
+function renderDevFetchScreen(view, body, result) {
+    body.innerHTML = "";
+    const gitea = result.gitea || {};
+    const repos = Array.isArray(result.repos) ? result.repos : [];
+    const attachments = Array.isArray(result.attachments) ? result.attachments : [];
+    if (!gitea.exists) {
+        body.appendChild(el("div", { class: "mgmt-empty" }, [
+            "The dev lane isn't set up yet. Add a repo on the host: ",
+            el("code", {}, ["research dev repo add <github-url>"]),
+        ]));
+        return;
+    }
+    if (!gitea.running) {
+        const start = el("button", { class: "btn-small" }, ["Start Gitea"]);
+        start.onclick = async () => {
+            start.disabled = true;
+            start.textContent = "Starting…";
+            try { await fetch("/broker/dev/gitea-start", { method: "POST" }); }
+            catch (e) { /* re-read below tells the truth either way */ }
+            renderDevFetchTab(view, body);
+        };
+        body.appendChild(el("div", { class: "mgmt-empty" }, [
+            el("span", {}, ["Gitea is stopped. "]), start,
+        ]));
+        return;
+    }
+    if (!repos.length) {
+        body.appendChild(el("div", { class: "mgmt-empty" }, [
+            "No dev repos yet — add one on the host: ",
+            el("code", {}, ["research dev repo add <github-url>"]),
+        ]));
+        return;
+    }
+    for (const r of repos) {
+        const prs = Array.isArray(r.prs) ? r.prs : [];
+        const branches = Array.isArray(r.branches) ? r.branches : [];
+        const attached = attachments.filter((a) => a.repo === r.repo)
+                                    .map((a) => a.project);
+        const sync = el("button", { class: "btn-small" }, ["Sync"]);
+        sync.onclick = async () => {
+            sync.disabled = true;
+            sync.textContent = "Syncing…";
+            try {
+                await fetch("/broker/dev/sync", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ repo: r.repo }),
+                });
+            } catch (e) { /* re-render reports the live state */ }
+            renderDevFetchTab(view, body);
+        };
+        const meta = (r.private ? "private · " : "")
+            + `${prs.length} open PR${prs.length === 1 ? "" : "s"} · `
+            + `${branches.length} branch${branches.length === 1 ? "" : "es"}`
+            + (r.mirror_synced_at ? ` · synced ${r.mirror_synced_at}` : "");
+        const rows = [el("div", { class: "dev-repo-head" }, [
+            el("span", { class: "dev-repo-name" }, [r.repo]),
+            el("span", { class: "dev-repo-meta" }, [meta]),
+            sync,
+        ])];
+        for (const p of prs) {
+            rows.push(el("div", { class: "dev-pr-row" }, [
+                devCopyBtn(`rs-fetch ${r.repo} --pr ${p.number}`),
+                el("span", { class: "dev-pr-id" }, [`#${p.number}`]),
+                el("span", { class: "dev-pr-title" }, [p.title || ""]),
+                el("span", { class: "dev-pr-meta" },
+                   [`[${p.head || "?"}] ${p.updated_at || ""}`]),
+            ]));
+        }
+        if (!prs.length) {
+            rows.push(el("div", { class: "config-empty" }, ["No open PRs."]));
+        }
+        for (const b of branches) {
+            rows.push(el("div", { class: "dev-branch-row" }, [
+                devCopyBtn(`rs-fetch ${r.repo} --branch ${b.name}`),
+                el("span", { class: "dev-pr-title" }, [b.name || ""]),
+                el("span", { class: "dev-pr-meta" }, [b.committed_at || ""]),
+            ]));
+        }
+        if (attached.length) {
+            rows.push(el("div", { class: "dev-pr-meta dev-attached" },
+                         ["worked by: " + attached.join(", ")]));
+        }
+        body.appendChild(el("div", { class: "card dev-repo-card" }, rows));
+    }
+    body.appendChild(el("div", { class: "hint" }, [
+        "📋 copies the rs-fetch command — paste it in any project or box ",
+        "terminal (every container carries rs-fetch + read-only fetch access).",
+    ]));
+}
+
+// Management → Infrastructure (STAGE_DEV_GITEA S3): shared host services that
+// aren't projects. Gitea only, for now — status + an explicit Start button (a
+// page READ never starts it; this button is the deliberate action).
+async function appendInfraSection(view) {
+    const row = el("div", { class: "mgmt-row mgmt-infra-row" }, [
+        el("span", {}, ["Gitea (dev lane)"]),
+        el("span", { class: "mgmt-loading" }, ["…"]),
+    ]);
+    view.appendChild(el("div", { class: "mgmt-infra" }, [
+        el("h3", { class: "mgmt-infra-title" }, ["Infrastructure"]),
+        row,
+    ]));
+    let g = null;
+    try {
+        const res = await fetch("/broker/dev");
+        if (res.ok) {
+            const b = await res.json();
+            if (b.ok && b.result) g = b.result.gitea || null;
+        }
+    } catch (e) { /* leave the unknown badge */ }
+    row.innerHTML = "";
+    row.appendChild(el("span", {}, ["Gitea (dev lane)"]));
+    if (!g) {
+        row.appendChild(el("span", { class: "type-badge" }, ["unknown"]));
+        return;
+    }
+    if (!g.exists) {
+        row.appendChild(el("span", { class: "type-badge" }, ["not set up"]));
+        row.appendChild(el("span", { class: "hint" },
+                           ["research dev repo add <github-url>"]));
+        return;
+    }
+    row.appendChild(el("span",
+                       { class: g.running ? "state-running" : "state-stopped" },
+                       [g.running ? "running" : "stopped"]));
+    if (!g.running) {
+        const start = el("button", { class: "btn-small" }, ["Start"]);
+        start.onclick = async () => {
+            start.disabled = true;
+            start.textContent = "Starting…";
+            try { await fetch("/broker/dev/gitea-start", { method: "POST" }); }
+            catch (e) { /* the re-render below reports the live state */ }
+            renderManagementInto(view);
+        };
+        row.appendChild(start);
+    }
 }
 
 function mgmtAction(view, name, action) {
@@ -2683,7 +2932,7 @@ async function refreshAfterBoxChange(project) {
 // open the window — a box can't be added on a stopped/non-dind supervisor anyway,
 // and a malformed box-registry ValidationError must be shown, not swallowed.
 async function mgmtBoxAddDialog(project) {
-    let presets, allowed;
+    let presets, allowed, attachedDevRepos;
     try {
         const res = await fetch(`/broker/project/${encodeURIComponent(project)}/box-presets`);
         let body; try { body = await res.json(); } catch (e) { body = {}; }
@@ -2694,6 +2943,7 @@ async function mgmtBoxAddDialog(project) {
         }
         presets = body.result.presets || [];
         allowed = body.result.allowed_mcps || [];
+        attachedDevRepos = body.result.attached_dev_repos || [];
     } catch (e) {
         alert("Can't add a box: broker unreachable.");
         return;
@@ -2802,7 +3052,43 @@ async function mgmtBoxAddDialog(project) {
         el("div", { class: "hint" }, ["Cloned + setup-run inside the box at boot."]),
     ]);
 
+    // Dev preset repo picker (STAGE_DEV_GITEA S3): the box's `repo` field
+    // carries NAME semantics here (an attached gitea repo), never the BYO
+    // clone URL — the select is fed by the project's agent-class attachments.
+    const devRepoS = el("select", {},
+        attachedDevRepos.map((r) => el("option", { value: r }, [r])));
+    const devGroup = el("div", { class: "mgmt-docker-group" }, [
+        el("div", { class: "field" }, [
+            el("label", {}, ["Dev repo"]),
+            attachedDevRepos.length
+                ? devRepoS
+                : el("div", { class: "config-empty" }, [
+                    "No dev repos attached to this project — attach one first: ",
+                    el("code", {}, [`research dev attach ${project} --repo <repo>`]),
+                ]),
+        ]),
+        el("div", { class: "hint" },
+           ["The agent's fork is cloned at boot; work is delivered via PRs."]),
+    ]);
+
+    // A dev box can't take MCPs (its dedicated bridge has no path to
+    // mcp-proxy — both S2 gates reject them); the dialog must not offer a
+    // guaranteed rejection, and a live picker would wedge the agent cards via
+    // applyMcpCoupling. Disabling unchecks first so the coupling releases.
+    function setMcpsDisabled(disabled) {
+        for (const b of mcpBoxes) {
+            if (disabled) b.cb.checked = false;
+            b.cb.disabled = disabled;
+        }
+        mcpList.classList.toggle("disabled", disabled);
+        applyMcpCoupling();
+    }
+
     function applyPreset() {
+        const isDev = !!selectedPreset.dev;
+        // A dev preset locks the MCP picker (uncheck + disable) BEFORE the
+        // agent pre-select below, so the coupling can't hold the cards locked.
+        setMcpsDisabled(isDev);
         // Pre-select the preset's default agent (unless MCP coupling has forced
         // claude on + locked the cards); the operator can still override it.
         if (!agentS.disabled) agentS.value = selectedPreset.agent_default ? "claude" : "none";
@@ -2811,8 +3097,10 @@ async function mgmtBoxAddDialog(project) {
         editorCb.checked = !!selectedPreset.editor_default;
         editorCard.classList.toggle("selected", editorCb.checked);
         // Show the BYO clone fields only when the preset clones AND the repo isn't
-        // baked into the preset (a baked-repo preset like paper-orchestra hides them).
+        // baked into the preset (a baked-repo preset like paper-orchestra hides them);
+        // a dev preset shows the attached-repo picker instead.
         byoGroup.style.display = (selectedPreset.clone && !selectedPreset.repo) ? "" : "none";
+        devGroup.style.display = isDev ? "" : "none";
     }
     function applyMcpCoupling() {
         const any = mcpBoxes.some((b) => b.cb.checked);
@@ -2858,6 +3146,7 @@ async function mgmtBoxAddDialog(project) {
                 ]),
             ]),
             byoGroup,
+            devGroup,
         ],
         validate: () => {
             const n = nameI.value.trim();
@@ -2866,6 +3155,9 @@ async function mgmtBoxAddDialog(project) {
             }
             if (selectedPreset.clone && repoI.value.trim() && !refI.value.trim()) {
                 return "A repo requires a ref (pin the clone).";
+            }
+            if (selectedPreset.dev && !(attachedDevRepos.length && devRepoS.value)) {
+                return "A dev box requires an attached dev repo — attach one to this project first.";
             }
             return null;
         },
@@ -2879,7 +3171,10 @@ async function mgmtBoxAddDialog(project) {
             // Agent is always explicit now (the preset default is pre-selected,
             // not a sentinel); no `browser`.
             if (agentS.value) payload.agent = agentS.value;
-            if (selectedPreset.clone) {
+            if (selectedPreset.dev) {
+                // NAME semantics (an attached gitea repo) — never the BYO URL.
+                payload.repo = devRepoS.value;
+            } else if (selectedPreset.clone) {
                 const repo = repoI.value.trim(), ref = refI.value.trim(),
                     setup = setupT.value.trim();
                 if (repo) payload.repo = repo;

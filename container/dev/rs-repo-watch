@@ -28,7 +28,7 @@ if [[ -z "${GITEA_TOKEN:-}" ]]; then
     DEV_JSON="${RS_WORKSPACE:-/workspace}/.orchestrator/dev-gitea.json"
     if [[ ! -f "$DEV_JSON" ]]; then
         echo "rs-repo-watch: no dev wiring ($DEV_JSON missing);" \
-             "run 'research dev attach <project> --class agent --repo <repo>' first" >&2
+             "run 'research dev attach <project> --repo <repo>' first" >&2
         exit 1
     fi
     OUT="$(python3 - "$DEV_JSON" "$REPO_ARG" <<'PYEOF'

@@ -84,3 +84,17 @@ zero when fixed), and verify it on both the base branch and your branch before p
 
 Your Gitea API token is in `$GITEA_TOKEN`. Base URL: `$GITEA_URL/api/v1`.
 Repo path: `$GITEA_USER/$REPO_NAME`.
+
+## Delivering work — the final comment
+
+When you open a pull request (and when you close out a task issue after opening
+its PR), END your comment with the exact fetch command the maintainer runs to
+pull your work, in a fenced code block on its own:
+
+```
+rs-fetch <repo-name> --pr <N>
+```
+
+Use the real repo name and the PR number Gitea returned when you opened the PR.
+The code block matters: Gitea renders it with a copy button, so the maintainer
+copies it in one click. Never invent a different command shape.

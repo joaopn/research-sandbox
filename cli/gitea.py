@@ -9,9 +9,11 @@ imports it, so it must NOT import rscore (that would be circular). It holds:
   - the per-repo mirror→fork→token→grant sequence (idempotent/resumable — a
     bounded call can time out mid-migrate while gitea finishes, so a re-run must
     heal, ADS `sandboxcore.py:1225-1266`);
-  - the host-side attachment record (`attachments.json`) that makes the
-    selective wire-at-start possible (the registry wires ALL projects; gitea
-    wires only the ones in the record).
+  - the host-side attachment record (`attachments.json`): which project works
+    which repo (agent-class), driving the per-repo token staging and the
+    dev-box repo association. (Wire-at-start is UNIVERSAL now — every project
+    is connected once gitea exists, like the registry; the record is no longer
+    what selects the wire set.)
 
 Host state lives under ``~/.research-sandbox/dev/`` — OUTSIDE the webui-mounted
 ``run/`` subdir, never bind-mounted. Secrets (the GitHub PAT, the gitea agent
@@ -58,8 +60,9 @@ API_TIMEOUT_S = 15
 # fail-then-resume on every add. 120s covers a normal code repo comfortably; a
 # multi-GB repo still exceeds it and heals on re-run (the D2 resume posture). At
 # 60s a medium repo on a slow link false-fails; at 1200s a wedged clone would hold
-# the caller 20 min. This is the CLI-path value; the webui (S3) routes repo-add
-# through the detached build lane, so the serial daemon never holds this inline.
+# the caller 20 min. This is the CLI-path value; repo add has NO webui route —
+# a future webui repo-add must go through the detached build lane, never inline
+# (an inline relay would hold the serial daemon for the whole migrate).
 MIGRATE_TIMEOUT_S = 120
 
 ADMIN_USER = "sandbox-admin"
@@ -73,6 +76,15 @@ MIRROR_INTERVAL = "10m"
 # `repos/search` page cap for `dev repo list`. A single-operator dev lane holds
 # far fewer mirrors than this; truncation (loud, above) means "add pagination".
 LIST_LIMIT = 100
+# The Development-page read bound (repo_status: three metadata GETs per repo on
+# the broker's serial thread). A local-bridge gitea answers these in ms and a
+# DOWN one refuses instantly — the bound only matters for a HALF-UP gitea,
+# where the quick-call API_TIMEOUT_S (15s) would blow the webui's 30s relay
+# window at a single repo (3 calls). At 1s a gitea mid-GC could false-fail a
+# healthy read; at 15s one repo exhausts the relay window. A many-repo half-up
+# worst can still exceed the window — accepted (the daemon keeps working; only
+# that one relayed page read reports unreachable).
+STATUS_TIMEOUT_S = 5
 # Bounded wait for gitea's async fork (202) to materialize. A small-repo fork is
 # near-instant; 30×1s covers a busy gitea without hanging. At 5s a loaded gitea
 # false-fails; at 300s a wedged fork would hold the caller 5 min.
@@ -416,12 +428,51 @@ def sync_repo(host_port: str, repo: str) -> None:
     GiteaClient(api_base(host_port), read_admin_token()).trigger_sync(repo)
 
 
+def repo_status(host_port: str, repo: str) -> dict:
+    """Per-repo Development-page status: mirror sync time + the fork's open PRs
+    + branches. Three STATUS_TIMEOUT_S-bounded GETs; fields are picked by NAME,
+    so no secret can enter the result (and GiteaError never carries bodies)."""
+    client = GiteaClient(api_base(host_port), read_admin_token())
+    agent = agent_user_for(repo)
+    info = client._api("GET", f"/repos/{ADMIN_USER}/{repo}",
+                       timeout=STATUS_TIMEOUT_S) or {}
+    prs_raw = client._api(
+        "GET", f"/repos/{agent}/{repo}/pulls?state=open&limit={LIST_LIMIT}",
+        timeout=STATUS_TIMEOUT_S) or []
+    branches_raw = client._api("GET", f"/repos/{agent}/{repo}/branches",
+                               timeout=STATUS_TIMEOUT_S) or []
+    prs = []
+    for p in prs_raw if isinstance(prs_raw, list) else []:
+        if not isinstance(p, dict):
+            continue
+        prs.append({"number": p.get("number"),
+                    "title": p.get("title") or "",
+                    "head": (p.get("head") or {}).get("ref") or "",
+                    "user": (p.get("user") or {}).get("login") or "",
+                    "updated_at": p.get("updated_at") or ""})
+    branches = []
+    for b in branches_raw if isinstance(branches_raw, list) else []:
+        if not isinstance(b, dict):
+            continue
+        branches.append({
+            "name": b.get("name") or "",
+            "committed_at": (b.get("commit") or {}).get("timestamp") or ""})
+    return {"repo": repo,
+            "private": bool(info.get("private")),
+            "mirror_synced_at": (info.get("mirror_updated")
+                                 or info.get("updated_at") or ""),
+            "prs": prs,
+            "branches": branches}
+
+
 # --- attachment record ------------------------------------------------------
 #
-# The selective wire-at-start source of truth. Entries:
-#   {"project": str, "class": "agent"|"control", "repo": str|None, "gitea_ip": str}
-# A project may hold multiple entries (two repos, or agent + control). Host-only
-# state, never bind-mounted, so a plain tmp+rename is correct (no inode pin).
+# Which project works which repo (agent tokens + dev-box association). Entries:
+#   {"project": str, "class": "agent", "repo": str, "gitea_ip": str}
+# `class` is ALWAYS "agent" now (the control class was retired when fetch went
+# universal); the key is kept for record-shape stability — one writer. A project
+# may hold multiple entries (one per repo). Host-only state, never bind-mounted,
+# so a plain tmp+rename is correct (no inode pin).
 
 def load_attachments() -> list[dict]:
     if not ATTACHMENTS_PATH.is_file():

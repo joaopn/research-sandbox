@@ -344,13 +344,13 @@ def _dev_run_info(repo: str) -> dict:
         data = json.loads(DEV_GITEA_JSON.read_text())
     except (OSError, json.JSONDecodeError):
         die("no dev wiring staged (.orchestrator/dev-gitea.json missing or invalid); "
-            "attach a repo first: research dev attach <project> --class agent --repo <repo>")
+            "attach a repo first: research dev attach <project> --repo <repo>")
     repos = {r.get("repo"): r for r in (data.get("repos") or [])
              if isinstance(r, dict) and r.get("repo")}
     if repo not in repos:
         die(f"repo {repo!r} is not attached to this project "
             f"(attached: {sorted(repos) or 'none'}); run "
-            f"`research dev attach <project> --class agent --repo {repo}` first")
+            f"`research dev attach <project> --repo {repo}` first")
     gitea_ip = (data.get("gitea_ip") or "").strip()
     if not gitea_ip:
         die("staged dev wiring carries no gitea_ip; re-run `research dev attach`")
@@ -376,6 +376,57 @@ def _ensure_dev_bridge(name: str, subnet: str) -> str:
             die(f"could not create dev bridge {net!r}: "
                 f"{(r.stderr or r.stdout).strip()}")
     return net
+
+
+# The universal fetch surface's supervisor-side halves (STAGE_DEV_GITEA S3):
+# the host stages both into THIS supervisor; every box run copies them in.
+RS_FETCH_BIN = "/usr/local/bin/rs-fetch"
+OPERATOR_TOKEN_FILE = DEV_TOKENS_DIR / "operator.token"
+
+
+def _staged_gitea_ip() -> str:
+    """The project's gitea address from the host-staged non-secret wiring file,
+    or "" (pre-gitea project / not wired). Tolerant read — a plain box run must
+    never fail because the dev lane doesn't exist."""
+    try:
+        data = json.loads(DEV_GITEA_JSON.read_text())
+    except (OSError, json.JSONDecodeError):
+        return ""
+    ip = data.get("gitea_ip") if isinstance(data, dict) else ""
+    return ip.strip() if isinstance(ip, str) else ""
+
+
+def _stage_box_fetch(cname: str) -> None:
+    """Copy the universal fetch surface into a just-run box: the rs-fetch tool
+    (from this supervisor's own staged copy, root-owned 0755) + the READ-ONLY
+    operator token (0600, stdin as the box user — never argv, never the
+    workspace). SILENT skip when the supervisor halves aren't staged (pre-gitea
+    project — an ordinary restart after the dev lane exists heals it, the
+    greenfield posture); a staging FAILURE warns and leaves the box usable
+    without fetch (never die — the box itself is fine)."""
+    try:
+        tok = OPERATOR_TOKEN_FILE.read_text().strip()
+    except OSError:
+        return
+    if not tok or not os.path.isfile(RS_FETCH_BIN):
+        return
+    r = subprocess.run(
+        ["docker", "exec", "-i", "-u", "0", cname, "sh", "-c",
+         "cat > /usr/local/bin/rs-fetch && chmod 755 /usr/local/bin/rs-fetch"],
+        input=Path(RS_FETCH_BIN).read_bytes(), capture_output=True)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or b"").decode(errors="replace").strip()
+        print(f"warning: staging rs-fetch into box {cname!r} failed: "
+              f"{err or 'cat returned non-zero'}", file=sys.stderr)
+    r = subprocess.run(
+        ["docker", "exec", "-i", "-u", "worker", cname, "sh", "-c",
+         'umask 077 && mkdir -p "$HOME/.dev-tokens" && '
+         'cat > "$HOME/.dev-tokens/operator.token"'],
+        input=(tok + "\n").encode(), capture_output=True)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or b"").decode(errors="replace").strip()
+        print(f"warning: operator-token staging into box {cname!r} failed: "
+              f"{err}", file=sys.stderr)
 
 
 def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
@@ -428,6 +479,14 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
                    "-e", f"REPO_NAME={dev['repo']}"]
     else:
         net_args = ["--network", INNER_NETWORK, "--ip", ip]
+        # Universal fetch wiring (STAGE_DEV_GITEA S3): every box resolves
+        # rs-gitea once the project is wired (inner-container DNS cannot
+        # resolve outer-bridge names, so the staged address rides --add-host —
+        # fixed at run; a stale address heals by restart, greenfield posture).
+        # The dev branch above injects its own from _dev_run_info (strict).
+        gitea_ip = _staged_gitea_ip()
+        if gitea_ip:
+            net_args += ["--add-host", f"rs-gitea:{gitea_ip}"]
         dev_env = []
     r = _docker(
         "run", "-d",
@@ -450,6 +509,9 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     if r.returncode != 0:
         die(f"docker run failed for box {name!r}:\n"
             f"{(r.stderr or r.stdout).strip()}")
+    # Universal fetch surface: rs-fetch + the operator token into the fresh box
+    # (silent no-op until the dev lane exists; warn-not-die on failure).
+    _stage_box_fetch(cname)
 
 
 def _rerun_box(name: str, entry: dict) -> None:
@@ -510,7 +572,7 @@ def cmd_create(args: argparse.Namespace) -> None:
     if is_dev:
         if not repo:
             die(f"the {args.preset!r} preset requires --repo <name> (a repo "
-                f"attached via `research dev attach <project> --class agent`)")
+                f"attached via `research dev attach <project> --repo <repo>`)")
         if ref or setup:
             die("--ref/--setup are not valid for a dev box (the fork's default "
                 "branch is checked out; setup runs are the agent's own work)")
