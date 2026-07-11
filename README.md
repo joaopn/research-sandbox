@@ -109,13 +109,12 @@ The shipped store workflows (`research workflow list`):
 | Card | Clones | Box |
 |---|---|---|
 | `social-data-pipeline` | joaopn/social-data-pipeline | sandbox-dind (inner Docker, locked egress) |
-| `agentic-dev-sandbox` | joaopn/agentic-dev-sandbox | sandbox-dind |
 | `academic-research-skills` | Imbad0202/academic-research-skills | sandbox (runc, claude on) |
 | `scientific-agent-skills` | k-dense-ai/scientific-agent-skills | sandbox |
 
 ```bash
 python research.py project create lab --workflow research --data ~/data
-python research.py project create dev --workflow agentic-dev-sandbox
+python research.py project create pipeline --workflow social-data-pipeline
 python research.py workflow list                 # the full catalog
 ```
 
