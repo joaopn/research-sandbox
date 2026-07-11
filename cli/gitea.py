@@ -47,6 +47,18 @@ OPERATOR_TOKEN_PATH = DEV_DIR / "operator.token"
 ATTACHMENTS_PATH = DEV_DIR / "attachments.json"
 TOKENS_DIR = DEV_DIR / "tokens"                 # per-repo agent tokens, 0700 dir
 
+# Reviewer surface (STAGE_DEV_GITEA S4). The verdict ledger is HOST-ONLY state:
+# never bind-mounted, never written into gitea or any container (invariant 4 —
+# verdicts are not agent-visible; the Development page, via the authenticated
+# broker relay, is the only surface). Sibling of dev/, not inside it, so the
+# webui-adjacent dev/ tree and the ledger stay separate concerns.
+REVIEWS_DIR = Path.home() / ".research-sandbox" / "reviews"
+# The dedicated reviewer Claude account's OAuth creds (Q3): minted once by
+# `research dev reviewer-login`, staged into each ephemeral reviewer container
+# at spawn, updated by the post-review capture-back (token rotation).
+REVIEWER_CRED_DIR = DEV_DIR / "reviewer"
+REVIEWER_CRED_PATH = REVIEWER_CRED_DIR / ".credentials.json"
+
 # Bounded so an unresponsive gitea can't wedge the broker's serial accept thread:
 # must be < the webui's 30s BROKER_CALL_TIMEOUT_S (rscore._UPSTREAM_RESOLVE_MAX_TIME_S
 # is the sibling precedent). At half this, a slow-but-alive API call false-fails;
@@ -287,6 +299,44 @@ class GiteaClient:
         self._api("PUT", f"/repos/{owner}/{repo}/collaborators/{collaborator}",
                   {"permission": "read"})
 
+    def pull_info(self, owner: str, repo: str, index: int) -> dict:
+        """One PR's metadata (title, state, head sha) for the review header +
+        the verdict's staleness stamp. Fields picked by name."""
+        data = self._api("GET", f"/repos/{owner}/{repo}/pulls/{index}")
+        if not isinstance(data, dict):
+            raise GiteaError(f"gitea GET pull {owner}/{repo}#{index} -> no data")
+        return {"title": data.get("title") or "",
+                "body": data.get("body") or "",
+                "state": data.get("state") or "",
+                "merged": bool(data.get("merged")),
+                "head_sha": (data.get("head") or {}).get("sha") or ""}
+
+    def pull_diff(self, owner: str, repo: str, index: int,
+                  max_bytes: int) -> str:
+        """The PR's raw unified diff (gitea's `.diff` endpoint) — a non-JSON
+        sibling of _api with the same headers/timeout/no-bodies discipline.
+        Reads max_bytes + 1 so overflow is detected exactly; the overflow error
+        names sizes only, never content (the diff is adversarial input and the
+        message may reach a client envelope)."""
+        path = f"/repos/{owner}/{repo}/pulls/{index}.diff"
+        req = urllib.request.Request(self._base + path, headers={
+            "Authorization": f"token {self._token}",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=API_TIMEOUT_S) as resp:
+                raw = resp.read(max_bytes + 1)
+        except urllib.error.HTTPError as e:
+            raise GiteaError(f"gitea GET {path} -> HTTP {e.code}") from None
+        except urllib.error.URLError as e:
+            raise GiteaError(f"gitea GET {path} unreachable: {e.reason}") from None
+        except OSError as e:
+            raise GiteaError(f"gitea GET {path} failed: {e}") from None
+        if len(raw) > max_bytes:
+            raise GiteaError(
+                f"gitea GET {path} -> diff exceeds the review cap "
+                f"({max_bytes} bytes)")
+        return raw.decode("utf-8", "replace")
+
     def delete_repo(self, owner: str, repo: str) -> None:
         try:
             self._api("DELETE", f"/repos/{owner}/{repo}")
@@ -448,6 +498,7 @@ def repo_status(host_port: str, repo: str) -> dict:
         prs.append({"number": p.get("number"),
                     "title": p.get("title") or "",
                     "head": (p.get("head") or {}).get("ref") or "",
+                    "sha": (p.get("head") or {}).get("sha") or "",
                     "user": (p.get("user") or {}).get("login") or "",
                     "updated_at": p.get("updated_at") or ""})
     branches = []
@@ -532,3 +583,61 @@ def attached_projects(repo: str) -> list[str]:
     guard for repo remove)."""
     return sorted({e["project"] for e in load_attachments()
                    if e.get("repo") == repo and e.get("project")})
+
+
+# --- review verdict ledger (STAGE_DEV_GITEA S4) -------------------------------
+#
+# One JSON file per reviewed PR: REVIEWS_DIR/<repo>/<pr>.json, host-only (see
+# the REVIEWS_DIR comment). Schema — fields picked by name, coarse failure
+# reasons only (a review error can carry host paths; raw detail lives in the
+# broker's host-only full log):
+#   {repo, pr, head_sha, status: "ok"|"failed", reason?: <coarse token>,
+#    risk?: "low"|"medium"|"high", summary?, findings?: [{file, note}],
+#    reviewed_at}
+# Failed entries are written too (from the diff-fetch step onward) so the
+# Development page can show WHY nothing usable exists.
+
+def verdict_ledger_path(repo: str, pr: int) -> Path:
+    return REVIEWS_DIR / repo / f"{pr}.json"
+
+
+def load_verdict(repo: str, pr: int) -> dict | None:
+    """Tolerant read: absent/corrupt → None (a lost verdict re-reviews)."""
+    try:
+        data = json.loads(verdict_ledger_path(repo, pr).read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def save_verdict(repo: str, pr: int, payload: dict) -> Path:
+    """Atomic per-PR write. The tmp name carries the writer's PID: reviews run
+    in PARALLEL (S4/F5), and the shared `.with_suffix(".json.tmp")` idiom would
+    let two same-PR writers interleave on one tmp file (A truncated by B, then
+    A renames B's half-written bytes). Per-writer tmp + rename makes concurrent
+    writes genuinely last-writer-wins."""
+    path = verdict_ledger_path(repo, pr)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    tmp.replace(path)
+    return path
+
+
+def load_repo_verdicts(repo: str) -> dict[str, dict]:
+    """All of a repo's ledger entries keyed by str(pr) — the dev_status merge.
+    Pure host-file reads (the page read stays structurally no-start)."""
+    d = REVIEWS_DIR / repo
+    if not d.is_dir():
+        return {}
+    out: dict[str, dict] = {}
+    for f in d.glob("*.json"):
+        if not f.stem.isdigit():
+            continue
+        try:
+            data = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict):
+            out[f.stem] = data
+    return out

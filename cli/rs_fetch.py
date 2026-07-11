@@ -21,8 +21,11 @@ reviewed in the editor / ``git diff`` before anything is committed or pushed.
 
 Ported from agentic-dev-sandbox's fetch-sandbox.py. The in-tool LLM review is
 deliberately ABSENT: reviews run host-side in an ephemeral sandboxed container
-and land as verdict files (see VERDICT_DIR below) — rs-fetch only surfaces a
-verdict when one was staged, and never blocks when none exists.
+and their verdicts live in the HOST ledger, surfaced on the webui Development
+page ONLY — the SYSTEM never writes a verdict into any container (they must
+not be agent-visible). The VERDICT_DIR seam below is a MANUAL human escape
+hatch: rs-fetch surfaces a verdict file if the human deliberately staged one
+themselves, and never blocks when none exists.
 """
 
 from __future__ import annotations
@@ -52,8 +55,11 @@ AGENT_USER_PREFIX = "agent-"
 
 TOKEN_PATH = Path.home() / ".dev-tokens" / "operator.token"
 
-# Verdict seam (S4 owns the transport INTO this path; rs-fetch only reads it):
-# a review verdict for <repo> PR <n> lives at VERDICT_DIR/<repo>/<n>.json.
+# Verdict seam — a MANUAL human escape hatch only. The system NEVER writes
+# here (verdicts stay host-side; the Development page is their surface): if
+# the human deliberately copies a verdict to VERDICT_DIR/<repo>/<n>.json,
+# rs-fetch surfaces it beside the fetched diff; otherwise the absent-note
+# prints and nothing blocks.
 VERDICT_DIR = Path("/workspace/.rs-reviews")
 
 # In-network API bound. Gitea is one bridge hop away: a healthy instance

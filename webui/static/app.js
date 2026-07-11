@@ -1725,6 +1725,48 @@ function devCopyBtn(cmd) {
     return b;
 }
 
+// One PR review on the broker's parallel detached lane (STAGE_DEV_GITEA S4):
+// POST /broker/dev/review → {op_id} → stream the op via the build-tail modal
+// (build_alive covers review ops). Advisory — the verdict lands in the host
+// ledger and shows as a badge/panel after the Fetch-tab re-read on close.
+async function devReviewDialog(view, body, repo, pr) {
+    if (document.querySelector(".modal-backdrop")) return;
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const card = el("div", { class: "card sw-build-card" }, [
+        el("h2", {}, [`Review ${repo} #${pr}`]),
+        el("div", { class: "mgmt-loading" }, ["Starting the sandboxed reviewer…"]),
+    ]);
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+    let res;
+    try {
+        res = await fetch("/broker/dev/review", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ repo: repo, pr: pr }),
+        });
+    } catch (e) {
+        backdrop.remove();
+        return renderMgmtUnavailable(body);
+    }
+    const redirect = mgmtStatusRedirect(view, res.status);
+    if (redirect) { backdrop.remove(); return redirect(); }
+    let b; try { b = await res.json(); } catch (e) { b = {}; }
+    if (!b.ok || !b.op_id) {
+        card.innerHTML = "";
+        card.appendChild(el("h2", {}, [`Review ${repo} #${pr}`]));
+        card.appendChild(el("div", { class: "error" },
+                            ["Could not start the review: " + mgmtErrText(b)]));
+        const close = el("button", { class: "btn btn-secondary" }, ["Close"]);
+        close.onclick = () => backdrop.remove();
+        card.appendChild(el("div", { class: "btn-row" }, [close]));
+        return;
+    }
+    await mgmtTailBuildLog(view, backdrop, card, b.op_id,
+                           `Review ${repo} #${pr}`,
+                           () => renderDevFetchTab(view, body));
+}
+
 async function renderDevFetchTab(view, body) {
     body.innerHTML = "";
     body.appendChild(el("div", { class: "mgmt-loading" }, ["Loading dev repos…"]));
@@ -1806,14 +1848,67 @@ function renderDevFetchScreen(view, body, result) {
             el("span", { class: "dev-repo-meta" }, [meta]),
             sync,
         ])];
+        const reviews = (r.reviews && typeof r.reviews === "object") ? r.reviews : {};
         for (const p of prs) {
-            rows.push(el("div", { class: "dev-pr-row" }, [
+            const cells = [
                 devCopyBtn(`rs-fetch ${r.repo} --pr ${p.number}`),
                 el("span", { class: "dev-pr-id" }, [`#${p.number}`]),
                 el("span", { class: "dev-pr-title" }, [p.title || ""]),
                 el("span", { class: "dev-pr-meta" },
                    [`[${p.head || "?"}] ${p.updated_at || ""}`]),
-            ]));
+            ];
+            // Review verdicts (S4): ledger entries keyed by str(pr) — JS
+            // property lookup coerces p.number across the int/str boundary.
+            // All verdict strings are MODEL OUTPUT → text nodes only.
+            const v = reviews[p.number];
+            const reviewBtn = (label) => {
+                const btn = el("button", { class: "btn-small dev-review-btn" },
+                               [label]);
+                btn.onclick = () => {
+                    btn.disabled = true;
+                    devReviewDialog(view, body, r.repo, p.number);
+                };
+                return btn;
+            };
+            let panel = null;
+            if (!v) {
+                cells.push(reviewBtn("Review"));
+            } else if (v.status === "ok") {
+                const stale = !!(v.head_sha && p.sha && v.head_sha !== p.sha);
+                const badge = el("button", {
+                    class: "btn-small dev-review-badge",
+                    title: "show the review verdict",
+                }, ["reviewed ✓" + (v.risk ? ` · ${v.risk}` : "")
+                    + (stale ? " · stale" : "")]);
+                panel = el("div", { class: "dev-verdict-panel" });
+                panel.style.display = "none";
+                panel.appendChild(el("div", { class: "dev-pr-meta" }, [
+                    `reviewed ${v.reviewed_at || ""}`
+                    + (stale ? " — the PR has new commits since this review" : ""),
+                ]));
+                if (v.summary) {
+                    panel.appendChild(el("div", { class: "dev-verdict-summary" },
+                                         [v.summary]));
+                }
+                const findings = Array.isArray(v.findings) ? v.findings : [];
+                for (const f of findings) {
+                    if (!f || typeof f !== "object") continue;
+                    panel.appendChild(el("div", { class: "dev-verdict-finding" },
+                        ["• " + (f.file ? f.file + ": " : "") + (f.note || "")]));
+                }
+                panel.appendChild(reviewBtn("Re-review"));
+                badge.onclick = () => {
+                    panel.style.display =
+                        panel.style.display === "none" ? "" : "none";
+                };
+                cells.push(badge);
+            } else {
+                cells.push(el("span", { class: "dev-pr-meta dev-review-failed" },
+                    ["review failed" + (v.reason ? `: ${v.reason}` : "")]));
+                cells.push(reviewBtn("Retry"));
+            }
+            rows.push(el("div", { class: "dev-pr-row" }, cells));
+            if (panel) rows.push(panel);
         }
         if (!prs.length) {
             rows.push(el("div", { class: "config-empty" }, ["No open PRs."]));
@@ -2149,7 +2244,7 @@ function mgmtConfirmThenTail(view, cfg) {
 // GET /broker/op/<id> — it returns "unknown" for a build op by design (no OP_RUNS
 // entry), which is not-failure; the child's op.progress.done()/fail() in the
 // view-log is the completion signal.
-async function mgmtTailBuildLog(view, backdrop, card, opId, title) {
+async function mgmtTailBuildLog(view, backdrop, card, opId, title, onDone) {
     const phaseEl = el("div", { class: "op-phase" }, ["starting…"]);
     const pre = el("pre", { class: "sw-buildlog" }, [""]);
     const failEl = el("div", { class: "op-fail" });
@@ -2157,7 +2252,9 @@ async function mgmtTailBuildLog(view, backdrop, card, opId, title) {
     doneBtn.onclick = () => {
         if (doneBtn.disabled) return;
         backdrop.remove();
-        renderSoftwareInto(view);
+        // Default: the Software page (the original build-lane caller); the dev
+        // review dialog passes its own Fetch-tab re-render.
+        if (onDone) onDone(); else renderSoftwareInto(view);
     };
     card.innerHTML = "";
     card.appendChild(el("h2", {}, [title]));
@@ -2231,9 +2328,9 @@ async function mgmtTailBuildLog(view, backdrop, card, opId, title) {
     try { await drainFull(); } catch (e) { /* best-effort trailing bytes */ }
     if (interrupted) {
         phaseEl.textContent = "interrupted";
-        failEl.textContent = "Build interrupted — the build process stopped without finishing. Check the log above.";
+        failEl.textContent = "Interrupted — the process stopped without finishing. Check the log above.";
     } else if (ok) { phaseEl.textContent = "done"; }
-    else { phaseEl.textContent = "failed"; failEl.textContent = "Build failed — see the log above."; }
+    else { phaseEl.textContent = "failed"; failEl.textContent = "Failed — see the log above."; }
     doneBtn.textContent = "Done";
     doneBtn.disabled = false;
 }

@@ -202,6 +202,12 @@ def cmd_broker_run_build(args: argparse.Namespace) -> None:
     broker.run_build(args.op_id, args.verb, args.args_json)
 
 
+def cmd_broker_run_review(args: argparse.Namespace) -> None:
+    """Hidden: the detached review-lane child (one per PR review, parallel).
+    Spawned by the daemon via _spawn_review_child; never an operator command."""
+    broker.run_review(args.op_id, args.args_json)
+
+
 def _build(reqcls, **kw):
     """Build a validated rscore request from CLI args, mapping the
     input-validation channel (ValidationError) to the terminal's die()."""
@@ -1756,6 +1762,20 @@ def cmd_dev_sync(args: argparse.Namespace) -> None:
     print(f"triggered mirror sync for {args.repo}")
 
 
+def cmd_dev_reviewer_login(_args: argparse.Namespace) -> None:
+    _call(rscore.reviewer_login)
+
+
+def cmd_dev_review(args: argparse.Namespace) -> None:
+    req = _build(rscore.ReviewRequest, repo=args.repo, pr=args.pr)
+    res = _call(rscore.review_pr, req)
+    print(f"review of {res['repo']}#{res['pr']}: {res['status']}"
+          + (f" (risk: {res['risk']})" if res.get("risk") else ""))
+    if res.get("summary"):
+        print(f"  {res['summary']}")
+    print(f"  ledger: {res['ledger']}")
+
+
 def cmd_workflow_list(args: argparse.Namespace) -> None:
     """Render the store catalog: built-in workflows + any host-side BYO entries.
     Read-only — the workflow surface is not yet wired into `create()` (that, plus
@@ -1827,6 +1847,10 @@ def build_parser() -> argparse.ArgumentParser:
     rb.add_argument("verb")
     rb.add_argument("args_json")
     rb.set_defaults(func=cmd_broker_run_build)
+    rr = brk_sub.add_parser("__run-review", help=argparse.SUPPRESS)  # detached review child
+    rr.add_argument("op_id")
+    rr.add_argument("args_json")
+    rr.set_defaults(func=cmd_broker_run_review)
 
     img = sub.add_parser("images", help="image version pins (manifest + freshness)")
     img_sub = img.add_subparsers(dest="subcommand", required=True)
@@ -2302,6 +2326,18 @@ def build_parser() -> argparse.ArgumentParser:
     dvs = dv_sub.add_parser("sync", help="trigger a mirror sync from GitHub")
     dvs.add_argument("repo")
     dvs.set_defaults(func=cmd_dev_sync)
+    dvrl2 = dv_sub.add_parser(
+        "reviewer-login",
+        help="one-time OAuth mint for the dedicated reviewer Claude account "
+             "(interactive, in a throwaway container; creds -> host stash)")
+    dvrl2.set_defaults(func=cmd_dev_reviewer_login)
+    dvrv = dv_sub.add_parser(
+        "review",
+        help="review a PR in the ephemeral sandboxed reviewer (advisory; "
+             "verdict -> host ledger + the Development page)")
+    dvrv.add_argument("repo", help="dev repo NAME (fork agent-<repo>/<repo>)")
+    dvrv.add_argument("--pr", required=True, type=int, help="PR number to review")
+    dvrv.set_defaults(func=cmd_dev_review)
 
     ag = sub.add_parser("agent",
                         help="host-cached agent dists (claude, …) deployed into "

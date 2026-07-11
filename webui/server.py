@@ -974,6 +974,47 @@ async def broker_dev_gitea_start_handler(request: web.Request) -> web.Response:
     return web.json_response(reply, status=status)
 
 
+async def broker_dev_review_handler(request: web.Request) -> web.Response:
+    """POST /broker/dev/review {repo, pr} — kick one PR review on the broker's
+    PARALLEL detached review lane (gated, origin-checked). The broker_build_handler
+    shape: mint an op_id, synchronous relay-with-op_id (the broker spawns the
+    child and returns fast — no lock, reviews run N-at-a-time), return {op_id};
+    the browser then tails /broker/op/<id>/log (+ build_alive covers review
+    ops). Only `repo` and `pr` cross from the browser; the broker re-filters
+    against REVIEW_WEBUI_FIELDS and shape-validates pre-spawn."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    s = _broker_session(request)
+    if s is None:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    args = {"repo": body.get("repo"), "pr": body.get("pr")}
+    op_id = _mint_op_id("dev-review", "pr")
+    try:
+        reply = await broker_call("review_pr", args, token=s["broker_token"],
+                                  op_id=op_id, timeout=BROKER_CALL_TIMEOUT_S)
+    except BrokerUnavailable:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "broker_unavailable"}}, status=503)
+    except BrokerForbidden:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "forbidden"}}, status=403)
+    if (not reply.get("ok")
+            and reply.get("error", {}).get("kind") == "unauthorized"):
+        BROKER_SESSIONS.pop(request.cookies.get(BROKER_COOKIE), None)
+        return web.json_response(
+            {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+    if not reply.get("ok"):
+        return web.json_response(reply, status=200)   # validation → app error
+    return web.json_response({"ok": True, "op_id": op_id})
+
+
 async def dev_gitea_session_handler(request: web.Request) -> web.Response:
     """POST /broker/dev/gitea-session — mint the shared-gitea origin session
     (STAGE_DEV_GITEA S3). MANAGEMENT-SESSION-ANCHORED: the trust anchor is the
@@ -2122,6 +2163,7 @@ def main() -> None:
     app.router.add_get("/broker/dev", broker_dev_handler)
     app.router.add_post("/broker/dev/sync", broker_dev_sync_handler)
     app.router.add_post("/broker/dev/gitea-start", broker_dev_gitea_start_handler)
+    app.router.add_post("/broker/dev/review", broker_dev_review_handler)
     # Under /broker/ ON PURPOSE: the Management session cookie is Path=/broker
     # and a browser won't send it to any other path prefix.
     app.router.add_post("/broker/dev/gitea-session", dev_gitea_session_handler)

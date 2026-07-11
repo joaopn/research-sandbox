@@ -57,6 +57,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rscore  # noqa: E402
 import broker_auth  # noqa: E402
+import gitea  # noqa: E402  (S4: the reviewer-stash path for pre-spawn checks)
 import workflow  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -112,6 +113,15 @@ MAX_REQUEST_BYTES = 64 * 1024
 # child's pid so a second request tells a LIVE build from a crashed one
 # (stale-pid recovery — a dead pid is reclaimable). Content: {pid, op_id, verb}.
 BUILD_LOCK = BROKER_DIR / "build.lock"
+
+# Per-op liveness markers for the PARALLEL review lane (STAGE_DEV_GITEA S4).
+# Reviews deliberately do NOT share BUILD_LOCK (they run N-at-a-time by PI
+# decision, and run_build's finally releases the GLOBAL lock — a review riding
+# that lane would unlink a concurrent build's lock). One {pid} file per op_id,
+# written by the PARENT after a successful spawn, unlinked by the child's
+# finally — build_alive covers review ops through these. Host-only, never
+# under run/ (same reasoning as BUILD_LOCK).
+REVIEW_LOCKS_DIR = BROKER_DIR / "review-locks"
 
 # Max bytes returned per op_full_tail poll. Bounds ONE reply frame — a fleet-build
 # full log grows to MBs, and the whole point of tailing is not to ship it all at
@@ -375,6 +385,11 @@ def _verb_build_alive(args: dict, _progress=None) -> dict:
     pid = holder.get("pid") if holder else None
     alive = (holder is not None and holder.get("op_id") == op_id
              and isinstance(pid, int) and _alive(pid))
+    # Review ops (S4): the parallel lane has no global lock — liveness comes
+    # from the per-op review-lock file (same terminal-first property:
+    # run_review writes done/fail before its finally unlinks the lock).
+    if not alive:
+        alive = _review_lock_alive(op_id)
     return {"alive": bool(alive)}
 
 
@@ -531,6 +546,10 @@ def _verb_port_list(args: dict, _progress=None) -> dict:
 # GitHub PAT is NOT here: it's a host-CLI-only secret write, never relayed. Repo
 # remove joins STEP_UP_VERBS (deletes agent work). None joins OPEN_VERBS.
 DEV_REPO_ADD_WEBUI_FIELDS = frozenset({"url"})
+# The review lane's input boundary (S4). Consumed by the dispatch review
+# branch + _verb_review_pr, NOT by any VERBS entry — review_pr lives in
+# REVIEW_DISPATCH only (see the review-lane section).
+REVIEW_WEBUI_FIELDS = frozenset({"repo", "pr"})
 # klass is GONE (STAGE_DEV_GITEA S3): attachments are agent-class only — the
 # fetch surface went universal and the former "control" class was retired.
 DEV_ATTACH_WEBUI_FIELDS = frozenset({"project", "repo"})
@@ -796,6 +815,111 @@ def run_build(op_id: str, verb: str, args_json: str) -> None:
         _release_build_lock()
 
 
+# ---------------------------------------------------------------------------
+# Review lane (STAGE_DEV_GITEA S4)
+#
+# The PARALLEL sibling of the build lane: each PR review runs in its own
+# detached child (`broker __run-review`) with NO shared lock — reviews are
+# ephemeral locked containers and may run N-at-a-time (PI decision). review_pr
+# lives in its OWN table, absent from VERBS (the inline path structurally
+# cannot run a multi-minute review on the accept thread) AND absent from
+# BUILD_DISPATCH (that lane serialises on BUILD_LOCK, and run_build's finally
+# releases the GLOBAL lock — a review there would unlink a concurrent build's
+# lock). Per-op review-lock files give build_alive its liveness signal.
+# ---------------------------------------------------------------------------
+
+
+def _verb_review_pr(args: dict, progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in REVIEW_WEBUI_FIELDS}
+    req = rscore.ReviewRequest.from_kwargs(**safe)   # may raise ValidationError
+    return rscore.review_pr(req, progress)
+
+
+# The child-only review vocabulary — NOT in VERBS, NOT in BUILD_DISPATCH.
+REVIEW_DISPATCH = {
+    "review_pr": _verb_review_pr,
+}
+
+
+def _review_lock_path(op_id: str) -> Path:
+    return REVIEW_LOCKS_DIR / f"{op_id}.json"
+
+
+def _write_review_lock(op_id: str, pid: int) -> None:
+    REVIEW_LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+    _review_lock_path(op_id).write_text(json.dumps({"pid": pid}))
+
+
+def _release_review_lock(op_id: str) -> None:
+    with contextlib.suppress(FileNotFoundError, OSError):
+        _review_lock_path(op_id).unlink()
+
+
+def _review_lock_alive(op_id: str) -> bool:
+    """True iff this op's review lock holds a LIVE pid (a dead pid is a crashed
+    child — reads as not-alive, the wedge-escape signal)."""
+    try:
+        holder = json.loads(_review_lock_path(op_id).read_text())
+    except (FileNotFoundError, ValueError, OSError):
+        return False
+    pid = holder.get("pid") if isinstance(holder, dict) else None
+    return isinstance(pid, int) and _alive(pid)
+
+
+def _spawn_review_child(op_id: str, args: dict) -> int:
+    """Spawn the DETACHED review child (`broker __run-review`). Mirrors
+    _spawn_build_child: start_new_session so a daemon restart doesn't kill an
+    in-flight review; BROKER_LOG is only the startup backstop — run_review
+    re-points fd 1/2 at its host-only full log."""
+    BROKER_DIR.mkdir(parents=True, exist_ok=True)
+    research_py = rscore.SCRIPT_DIR / "research.py"
+    log = open(BROKER_LOG, "a")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(research_py), "broker", "__run-review",
+             op_id, json.dumps(args)],
+            stdout=log, stderr=log, start_new_session=True,
+            cwd=str(rscore.SCRIPT_DIR))
+    finally:
+        log.close()                               # the child holds its own dup'd fd
+    return proc.pid
+
+
+def run_review(op_id: str, args_json: str) -> None:
+    """The DETACHED review child (invoked by `broker __run-review`). Mirrors
+    run_build: owns the op-log, points fd 1/2 at the HOST-ONLY full log (review
+    detail can carry host + gitea paths; the review-specific coarse reason
+    lives in the LEDGER entry review_pr writes), calls the review verb DIRECTLY
+    from REVIEW_DISPATCH (never dispatch() — re-entry), writes a terminal
+    done/fail to the mounted view-log, and unlinks ITS OWN review lock in
+    finally (never BUILD_LOCK). Terminal-first: done/fail lands before the lock
+    release, so build_alive's alive:false always trails a written terminal on
+    every in-process path."""
+    try:
+        args = json.loads(args_json)
+    except ValueError:
+        args = {}
+    try:
+        op = make_oplog(op_id, "review_pr", args)
+    except (ValueError, OSError):
+        _release_review_lock(op_id)
+        return
+    try:
+        os.dup2(op.full.fileno(), 1)
+        os.dup2(op.full.fileno(), 2)
+        sys.stdout = os.fdopen(1, "w", buffering=1, closefd=False)
+        sys.stderr = os.fdopen(2, "w", buffering=1, closefd=False)
+        REVIEW_DISPATCH["review_pr"](args, op.progress)
+        op.progress.done()
+    except rscore.ValidationError:
+        op.progress.fail("invalid request")
+    except (rscore.HarnessError, SystemExit, Exception):
+        op.progress.fail("review failed")         # coarse token; detail is in the full log
+    finally:
+        op.close()
+        _release_review_lock(op_id)
+
+
 def _err(kind: str, message: str) -> dict:
     return {"ok": False, "error": {"kind": kind, "message": message}}
 
@@ -817,7 +941,7 @@ def _auth_login(args: dict, tokens) -> dict:
 
 def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
              verbs: dict | None = None, audit=None, oplog=None,
-             spawn_build=None) -> dict:
+             spawn_build=None, spawn_review=None) -> dict:
     """Resolve and run one verb, mapping every failure mode to a reply dict.
     Pure by default (no socket; no file I/O unless an `audit` or `oplog` sink is
     passed) so it is unit-testable on its own.
@@ -832,6 +956,8 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
     `spawn_build(op_id, verb, args) → child pid` launches the detached build
     child for a BUILD_DISPATCH verb; the daemon injects `_spawn_build_child`,
     tests pass None (the branch then gates + validates but never spawns).
+    `spawn_review(op_id, args) → child pid` is the review lane's analog
+    (daemon injects `_spawn_review_child`; tests pass None likewise).
     """
     def _audited(principal, outcome, reply):
         if audit is not None:
@@ -892,6 +1018,49 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
                             {"ok": True, "result": {"op_id": op_id, "started": True}})
         pid = spawn_build(op_id, verb, args)     # detached child
         _write_build_lock(pid, op_id, verb)      # PARENT writes, in the serial section
+        return _audited(principal, "ok",
+                        {"ok": True, "result": {"op_id": op_id, "started": True}})
+
+    # Review lane (S4) — the SOLE entry for review_pr (REVIEW_DISPATCH is
+    # absent from VERBS and BUILD_DISPATCH). Same gate order as the build
+    # branch but NO lock check — reviews run in PARALLEL; the parent writes a
+    # PER-OP review lock only AFTER a successful spawn, so a rejected caller
+    # leaves no lock and no op-log (gate-before-sink).
+    if verbs is None and verb in REVIEW_DISPATCH:
+        if not isinstance(args, dict):
+            return _err("bad_request", "args must be a JSON object")
+        principal = tokens.principal_for(token) if tokens is not None else None
+        if principal is None:
+            return _audited(None, "unauthorized",
+                            _err("unauthorized",
+                                 "a valid session token is required; call login"))
+        if not isinstance(op_id, str) or not _OP_ID_RE.match(op_id):
+            return _audited(principal, "bad_request",
+                            _err("bad_request", "a valid op_id is required"))
+        # Pre-spawn validation: a bad request must NOT spawn a child — the
+        # client already holds started:true and would never see a child-side
+        # failure. Shape via from_kwargs + two sub-ms host file gates.
+        safe = {k: v for k, v in args.items() if k in REVIEW_WEBUI_FIELDS}
+        try:
+            rscore.ReviewRequest.from_kwargs(**safe)
+        except rscore.ValidationError as e:
+            return _audited(principal, "validation",
+                            _err("validation", str(e)))
+        if not gitea.REVIEWER_CRED_PATH.is_file():
+            return _audited(principal, "validation",
+                            _err("validation",
+                                 "no reviewer credentials — run `research dev "
+                                 "reviewer-login` on the host first"))
+        if not rscore.dist_present(rscore.DEFAULT_AGENT):
+            return _audited(principal, "validation",
+                            _err("validation",
+                                 "no cached agent dist — run `research agent "
+                                 "pull` on the host first"))
+        if spawn_review is None:            # tests: gate + validate, never spawn
+            return _audited(principal, "ok",
+                            {"ok": True, "result": {"op_id": op_id, "started": True}})
+        pid = spawn_review(op_id, safe)          # detached child, FILTERED args
+        _write_review_lock(op_id, pid)           # PARENT writes, post-spawn only
         return _audited(principal, "ok",
                         {"ok": True, "result": {"op_id": op_id, "started": True}})
 
@@ -1043,7 +1212,8 @@ class _Handler(socketserver.StreamRequestHandler):
                             op_id=msg.get("op_id"),
                             audit=broker_auth.audit_event,
                             oplog=make_oplog,
-                            spawn_build=_spawn_build_child))
+                            spawn_build=_spawn_build_child,
+                            spawn_review=_spawn_review_child))
 
     def _send(self, reply: dict) -> None:
         data = json.dumps(reply).encode()
