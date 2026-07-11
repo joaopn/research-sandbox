@@ -5,5 +5,5 @@
   "clone": false,
   "dev": true,
   "editor_default": true,
-  "description": "A software-dev box wired to the shared Gitea: your fork cloned at boot, hardened container, PR-based delivery. Requires the project to be attached to a dev repo first."
+  "description": "A software-dev box wired to the shared Gitea, spawned from a GitHub URL: mirror, fork, and attachment happen automatically; your fork is cloned at boot, hardened container, PR-based delivery."
 }

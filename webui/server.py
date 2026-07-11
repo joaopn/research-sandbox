@@ -1018,6 +1018,55 @@ async def broker_dev_review_handler(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "op_id": op_id})
 
 
+async def broker_dev_box_handler(request: web.Request) -> web.Response:
+    """POST /broker/project/{name}/dev-box {url, pat?, name?, agent?, editor?} —
+    provision a dev box from a GitHub URL (mirror+fork+attach+create as ONE
+    action) on the broker's detached dev-box lane (gated, origin-checked). The
+    broker_dev_review_handler shape: mint an op_id, synchronous
+    relay-with-op_id (the broker spawns the detached child and returns fast —
+    the ~120s migrate never rides this call), return {op_id}; the browser
+    tails the view log terminal-first (build_alive covers dev-box ops via the
+    per-op lock). The optional `pat` is a per-repo SECRET: it rides this POST
+    body + the broker envelope only — never OP_RUNS (this path doesn't use
+    _start_op), never a log; the broker re-filters against
+    DEV_BOX_WEBUI_FIELDS and shape-validates pre-spawn."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    s = _broker_session(request)
+    if s is None:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+    project = request.match_info.get("name", "")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    args = {"project": project, "url": body.get("url"), "pat": body.get("pat"),
+            "name": body.get("name"), "agent": body.get("agent"),
+            "editor": bool(body.get("editor"))}
+    op_id = _mint_op_id(project, "dev-box")
+    try:
+        reply = await broker_call("dev_box_provision", args,
+                                  token=s["broker_token"], op_id=op_id,
+                                  timeout=BROKER_CALL_TIMEOUT_S)
+    except BrokerUnavailable:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "broker_unavailable"}}, status=503)
+    except BrokerForbidden:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "forbidden"}}, status=403)
+    if (not reply.get("ok")
+            and reply.get("error", {}).get("kind") == "unauthorized"):
+        BROKER_SESSIONS.pop(request.cookies.get(BROKER_COOKIE), None)
+        return web.json_response(
+            {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+    if not reply.get("ok"):
+        return web.json_response(reply, status=200)   # validation → app error
+    return web.json_response({"ok": True, "op_id": op_id})
+
+
 async def dev_gitea_session_handler(request: web.Request) -> web.Response:
     """POST /broker/dev/gitea-session — mint the shared-gitea origin session
     (STAGE_DEV_GITEA S3). MANAGEMENT-SESSION-ANCHORED: the trust anchor is the
@@ -2171,6 +2220,11 @@ def main() -> None:
     app.router.add_get("/broker/project/{name}/boxes", broker_boxes_handler)
     app.router.add_get(
         "/broker/project/{name}/box-presets", broker_box_presets_handler)
+    # Dev-box provision (webui-first B) — a fixed segment that MUST precede the
+    # {action} catch-all below (first-match-wins, else "dev-box" is swallowed
+    # as an action).
+    app.router.add_post(
+        "/broker/project/{name}/dev-box", broker_dev_box_handler)
     # Exported ports (STAGE_EXPORTED_PORTS). The specific POSTs MUST precede the
     # `{action}` catch-all below (first-match wins, else `port`/`port-remove` are
     # swallowed as actions).

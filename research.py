@@ -40,7 +40,6 @@ import subprocess
 import sys
 import tempfile
 import urllib.error
-import urllib.request
 from pathlib import Path
 
 # Make cli/ helpers importable.
@@ -206,6 +205,13 @@ def cmd_broker_run_review(args: argparse.Namespace) -> None:
     """Hidden: the detached review-lane child (one per PR review, parallel).
     Spawned by the daemon via _spawn_review_child; never an operator command."""
     broker.run_review(args.op_id, args.args_json)
+
+
+def cmd_broker_run_dev_box(args: argparse.Namespace) -> None:
+    """Hidden: the detached dev-box provision child (one per box, parallel).
+    Spawned by the daemon via _spawn_dev_box_child; never an operator command.
+    The args JSON arrives on STDIN, never argv — it carries the per-repo PAT."""
+    broker.run_dev_box(args.op_id)
 
 
 def _build(reqcls, **kw):
@@ -1636,56 +1642,6 @@ def cmd_webui(args: argparse.Namespace) -> None:
         return
 
 
-_GITHUB_API_TIMEOUT_S = 15   # one /user validation call; bounded like gitea's API
-
-
-def cmd_dev_pat_set(args: argparse.Namespace) -> None:
-    """Save the GitHub PAT used only for private-mirror sync. Validate against
-    GET /user; warn (not fail) on classic-PAT write scopes — the read-only-PAT
-    invariant is a discipline, and the API can't see fine-grained scopes."""
-    import getpass
-    token = sys.stdin.readline().strip() if not sys.stdin.isatty() \
-        else getpass.getpass("GitHub PAT (input hidden): ").strip()
-    if not token:
-        die("no token provided")
-    req = urllib.request.Request(
-        "https://api.github.com/user",
-        headers={"Authorization": f"Bearer {token}",
-                 "Accept": "application/vnd.github+json",
-                 "User-Agent": "research-sandbox"})
-    try:
-        with urllib.request.urlopen(req, timeout=_GITHUB_API_TIMEOUT_S) as resp:
-            scopes = resp.headers.get("X-OAuth-Scopes", "")
-    except urllib.error.HTTPError as e:
-        die(f"GitHub rejected the token (HTTP {e.code}); not saved")
-    except urllib.error.URLError as e:
-        die(f"could not reach GitHub: {e.reason}")
-    write_scopes = [s.strip() for s in scopes.split(",")
-                    if s.strip() and ("write" in s or "delete" in s
-                                      or s.strip() == "repo")]
-    if write_scopes:
-        print(f"warning: token carries write-capable scope(s) {write_scopes}; "
-              "the dev lane only needs read. Prefer a read-only fine-grained PAT.",
-              file=sys.stderr)
-    gitea.DEV_DIR.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(gitea.DEV_DIR, 0o700)
-    except OSError:
-        pass
-    fd = os.open(str(gitea.PAT_PATH), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        fh.write(token)
-    print(f"saved GitHub PAT at {gitea.PAT_PATH} (0600)")
-
-
-def cmd_dev_pat_unset(_args: argparse.Namespace) -> None:
-    try:
-        gitea.PAT_PATH.unlink()
-        print(f"removed {gitea.PAT_PATH}")
-    except FileNotFoundError:
-        print("no GitHub PAT configured")
-
-
 def cmd_dev_passwd(args: argparse.Namespace) -> None:
     """Set the sandbox-admin gitea password — the human's interactive gitea
     identity (the webui Development page's Gitea tab sign-in). Bootstrap mints
@@ -1717,7 +1673,19 @@ def cmd_dev_passwd(args: argparse.Namespace) -> None:
 
 
 def cmd_dev_repo_add(args: argparse.Namespace) -> None:
-    req = _build(rscore.DevRepoAddRequest, url=args.url)
+    """Mirror+fork a GitHub repo. `--private` prompts for a per-repo PAT (stdin
+    when piped) — RS stores no PAT: it reaches only gitea's migrate auth_token,
+    and a bad one fails loudly at the migrate step. To change a repo's PAT
+    later: `dev repo remove` + re-add (gitea keeps it per-repo; a resume never
+    re-delivers it)."""
+    pat = ""
+    if args.private:
+        import getpass
+        pat = sys.stdin.readline().strip() if not sys.stdin.isatty() \
+            else getpass.getpass("GitHub PAT for this repo (input hidden): ").strip()
+        if not pat:
+            die("no PAT provided (--private reads one from the prompt/stdin)")
+    req = _build(rscore.DevRepoAddRequest, url=args.url, pat=pat)
     res = _call(rscore.dev_repo_add, req)
     print(f"added {res.repo}")
     print(f"  mirror: {res.mirror}")
@@ -1857,6 +1825,9 @@ def build_parser() -> argparse.ArgumentParser:
     rr.add_argument("op_id")
     rr.add_argument("args_json")
     rr.set_defaults(func=cmd_broker_run_review)
+    rdb = brk_sub.add_parser("__run-dev-box", help=argparse.SUPPRESS)  # detached dev-box child
+    rdb.add_argument("op_id")                     # args JSON rides stdin (PAT)
+    rdb.set_defaults(func=cmd_broker_run_dev_box)
 
     img = sub.add_parser("images", help="image version pins (manifest + freshness)")
     img_sub = img.add_subparsers(dest="subcommand", required=True)
@@ -2297,13 +2268,6 @@ def build_parser() -> argparse.ArgumentParser:
                         help="dev workflow: shared Gitea repo mirror/fork + "
                              "per-project attachment (ADS-style dev sandbox)")
     dv_sub = dv.add_subparsers(dest="subcommand", required=True)
-    dvp = dv_sub.add_parser("pat", help="GitHub PAT for private-mirror sync")
-    dvp_sub = dvp.add_subparsers(dest="pat_action", required=True)
-    dvps = dvp_sub.add_parser("set", help="save a (read-only) GitHub PAT; reads "
-                                          "stdin when piped, prompts on a tty")
-    dvps.set_defaults(func=cmd_dev_pat_set)
-    dvpu = dvp_sub.add_parser("unset", help="remove the saved GitHub PAT")
-    dvpu.set_defaults(func=cmd_dev_pat_unset)
     dvpw = dv_sub.add_parser("passwd",
                              help="set the sandbox-admin gitea password (the "
                                   "human web-UI sign-in); reads stdin when piped")
@@ -2312,6 +2276,12 @@ def build_parser() -> argparse.ArgumentParser:
     dvr_sub = dvr.add_subparsers(dest="repo_action", required=True)
     dvra = dvr_sub.add_parser("add", help="mirror a GitHub repo + fork it for an agent")
     dvra.add_argument("url", help="https://github.com/<owner>/<repo> URL")
+    dvra.add_argument("--private", action="store_true",
+                      help="private source: prompts for a per-repo GitHub PAT "
+                           "(reads stdin when piped; prefer a read-only "
+                           "fine-grained PAT). RS stores no PAT — gitea keeps it "
+                           "in its own per-repo mirror config; to change it "
+                           "later, remove the repo and re-add it.")
     dvra.set_defaults(func=cmd_dev_repo_add)
     dvrr = dvr_sub.add_parser("remove", help="delete mirror + fork + agent user + token")
     dvrr.add_argument("repo")

@@ -41,7 +41,6 @@ DEFAULT_GITEA_VERSION = "1.25.1"
 DEFAULT_GITEA_HOST_PORT = "3000"
 
 DEV_DIR = Path.home() / ".research-sandbox" / "dev"
-PAT_PATH = DEV_DIR / "github.pat"
 ADMIN_TOKEN_PATH = DEV_DIR / "admin.token"
 OPERATOR_TOKEN_PATH = DEV_DIR / "operator.token"
 ATTACHMENTS_PATH = DEV_DIR / "attachments.json"
@@ -72,9 +71,11 @@ API_TIMEOUT_S = 15
 # fail-then-resume on every add. 120s covers a normal code repo comfortably; a
 # multi-GB repo still exceeds it and heals on re-run (the D2 resume posture). At
 # 60s a medium repo on a slow link false-fails; at 1200s a wedged clone would hold
-# the caller 20 min. This is the CLI-path value; repo add has NO webui route —
-# a future webui repo-add must go through the detached build lane, never inline
-# (an inline relay would hold the serial daemon for the whole migrate).
+# the caller 20 min. This bound applies on the CLI path (research.py calls rscore
+# directly) and inside the broker's DETACHED dev-box child — the only broker-side
+# repo-add (there is no inline repo-add verb). A future standalone webui repo-add
+# must also run detached, never inline (an inline relay would hold the serial
+# daemon for the whole migrate).
 MIGRATE_TIMEOUT_S = 120
 
 ADMIN_USER = "sandbox-admin"
@@ -215,13 +216,17 @@ class GiteaClient:
         except GiteaError:
             return False
 
-    def migrate_mirror(self, url: str, repo: str, private: bool,
-                       pat: str | None) -> None:
+    def migrate_mirror(self, url: str, repo: str, pat: str | None) -> None:
         """Create the read-only mirror admin/<repo> from GitHub. Resumable: a
         COMPLETE existing mirror → trigger a sync; an INCOMPLETE stub (an `empty`
         repo left by an interrupted migrate — the D2 tail) → delete + re-migrate,
         since gitea 400s "not a mirror" on syncing a half-migrated repo. `auth_token`
-        (the PAT) is sent only for a private source; it never appears in a GiteaError."""
+        (the caller-supplied per-repo PAT; private source = bool(pat)) is sent only
+        when present; gitea persists it in its own per-repo mirror config, so a
+        private mirror keeps auto-syncing with no host-side copy — and a NEW PAT
+        for an already-mirrored repo is NOT re-delivered (the healthy-mirror resume
+        path above returns before the migrate): refresh = repo remove + re-add.
+        It never appears in a GiteaError."""
         if self.repo_exists(ADMIN_USER, repo):
             info = self._api("GET", f"/repos/{ADMIN_USER}/{repo}") or {}
             if info.get("mirror") and not info.get("empty"):
@@ -261,7 +266,7 @@ class GiteaClient:
             "labels": False,
             "milestones": False,
         }
-        if private and pat:
+        if pat:
             body["auth_token"] = pat
         self._api("POST", "/repos/migrate", body, timeout=MIGRATE_TIMEOUT_S)
 
@@ -421,17 +426,14 @@ def read_admin_token() -> str:
 
 # --- repo lifecycle (composed sequences) ------------------------------------
 
-def add_repo(host_port: str, url: str, repo: str, private: bool) -> None:
+def add_repo(host_port: str, url: str, repo: str, pat: str | None = None) -> None:
     """The resumable mirror→user→fork→token→grants sequence. Every stage is
     exists-checked, so a re-run after a mid-migrate timeout heals the state.
-    Reads the PAT (0600) only when the source is private, in memory for the call
-    only."""
+    ``pat`` is the caller-supplied per-repo GitHub token (private source =
+    bool(pat)); it stays in memory for this call only — RS stores no PAT."""
     import secrets as _secrets
     client = GiteaClient(api_base(host_port), read_admin_token())
-    pat = None
-    if private and PAT_PATH.is_file():
-        pat = PAT_PATH.read_text().strip() or None
-    client.migrate_mirror(url, repo, private, pat)
+    client.migrate_mirror(url, repo, pat)
     agent = agent_user_for(repo)
     client.create_user(agent, _secrets.token_urlsafe(24))
     client.grant_read(ADMIN_USER, repo, agent)          # agent reads the private mirror

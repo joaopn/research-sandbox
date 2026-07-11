@@ -2277,8 +2277,21 @@ function mgmtConfirmThenTail(view, cfg) {
             go.disabled = false; cancel.disabled = false; go.textContent = orig;
             errEl.textContent = "Failed: " + mgmtErrText(body); return;
         }
-        await mgmtTailOp(view, backdrop, card, body.op_id,
-                         cfg.tailTitle || cfg.title, cfg.verb, cfg.onDone);
+        // Detached-lane ops (cfg.tailMode "buildlog", value or function) have
+        // no OP_RUNS entry — GET /broker/op/<id> stays "unknown" by design —
+        // so they tail terminal-first via the build-log modal (build_alive
+        // covers the per-op lock lanes); everything else keeps the checklist
+        // tail. The buildlog onDone fires on the Done click (the S4 review-
+        // dialog semantics), so the ok flag is not meaningful there.
+        const tailMode = typeof cfg.tailMode === "function" ? cfg.tailMode() : cfg.tailMode;
+        if (tailMode === "buildlog") {
+            await mgmtTailBuildLog(view, backdrop, card, body.op_id,
+                                   cfg.tailTitle || cfg.title,
+                                   () => { if (cfg.onDone) cfg.onDone(true); });
+        } else {
+            await mgmtTailOp(view, backdrop, card, body.op_id,
+                             cfg.tailTitle || cfg.title, cfg.verb, cfg.onDone);
+        }
     };
     backdrop.appendChild(card);
     document.body.appendChild(backdrop);
@@ -3079,7 +3092,7 @@ async function refreshAfterBoxChange(project) {
 // open the window — a box can't be added on a stopped/non-dind supervisor anyway,
 // and a malformed box-registry ValidationError must be shown, not swallowed.
 async function mgmtBoxAddDialog(project) {
-    let presets, allowed, attachedDevRepos;
+    let presets, allowed;
     try {
         const res = await fetch(`/broker/project/${encodeURIComponent(project)}/box-presets`);
         let body; try { body = await res.json(); } catch (e) { body = {}; }
@@ -3090,7 +3103,6 @@ async function mgmtBoxAddDialog(project) {
         }
         presets = body.result.presets || [];
         allowed = body.result.allowed_mcps || [];
-        attachedDevRepos = body.result.attached_dev_repos || [];
     } catch (e) {
         alert("Can't add a box: broker unreachable.");
         return;
@@ -3199,23 +3211,23 @@ async function mgmtBoxAddDialog(project) {
         el("div", { class: "hint" }, ["Cloned + setup-run inside the box at boot."]),
     ]);
 
-    // Dev preset repo picker (STAGE_DEV_GITEA S3): the box's `repo` field
-    // carries NAME semantics here (an attached gitea repo), never the BYO
-    // clone URL — the select is fed by the project's agent-class attachments.
-    const devRepoS = el("select", {},
-        attachedDevRepos.map((r) => el("option", { value: r }, [r])));
+    // Dev preset (webui-first B): the box is provisioned FROM a GitHub URL —
+    // mirror+fork+attach+create run as ONE detached broker op, no prior
+    // `dev attach` needed. The PAT is for private sources only and rides this
+    // POST body alone: RS stores no PAT (gitea keeps it in its own per-repo
+    // mirror config), so changing it later = remove the repo + re-create.
+    const devUrlI = el("input", { type: "text", autocomplete: "off",
+                                  placeholder: "https://github.com/owner/repo" });
+    const devPatI = el("input", { type: "password", autocomplete: "off",
+                                  placeholder: "private repos only" });
     const devGroup = el("div", { class: "mgmt-docker-group" }, [
-        el("div", { class: "field" }, [
-            el("label", {}, ["Dev repo"]),
-            attachedDevRepos.length
-                ? devRepoS
-                : el("div", { class: "config-empty" }, [
-                    "No dev repos attached to this project — attach one first: ",
-                    el("code", {}, [`research dev attach ${project} --repo <repo>`]),
-                ]),
-        ]),
+        el("div", { class: "field" }, [el("label", {}, ["GitHub repo (https)"]), devUrlI]),
+        el("div", { class: "field" }, [el("label", {}, ["GitHub PAT (optional)"]), devPatI]),
         el("div", { class: "hint" },
-           ["The agent's fork is cloned at boot; work is delivered via PRs."]),
+           ["Mirrored + forked into the shared Gitea; the agent's fork is " +
+            "cloned at boot and work is delivered via PRs. The PAT (private " +
+            "repos only, prefer read-only fine-grained) is kept by Gitea " +
+            "per-repo — to change it, remove the repo and re-create the box."]),
     ]);
 
     // A dev box can't take MCPs (its dedicated bridge has no path to
@@ -3303,12 +3315,33 @@ async function mgmtBoxAddDialog(project) {
             if (selectedPreset.clone && repoI.value.trim() && !refI.value.trim()) {
                 return "A repo requires a ref (pin the clone).";
             }
-            if (selectedPreset.dev && !(attachedDevRepos.length && devRepoS.value)) {
-                return "A dev box requires an attached dev repo — attach one to this project first.";
+            if (selectedPreset.dev
+                    && !devUrlI.value.trim().startsWith("https://github.com/")) {
+                return "A dev box needs a GitHub repo URL (https://github.com/owner/repo).";
             }
             return null;
         },
+        // The dev preset runs on the broker's DETACHED dev-box lane: no
+        // OP_RUNS entry (GET /broker/op/<id> stays "unknown" by design), so
+        // it needs the terminal-first build-log tail, not the checklist tail.
+        tailMode: () => (selectedPreset.dev ? "buildlog" : undefined),
         request: () => {
+            if (selectedPreset.dev) {
+                // URL-driven provision (mirror+fork+attach+create as one op) —
+                // a different route from /box; `pat` rides this POST body only
+                // (never logged, never OP_RUNS; broker re-filters + validates).
+                const payload = {
+                    name: nameI.value.trim() || null,
+                    url: devUrlI.value.trim(),
+                    pat: devPatI.value.trim(),
+                    editor: editorCb.checked,
+                };
+                if (agentS.value) payload.agent = agentS.value;
+                return fetch(`/broker/project/${encodeURIComponent(project)}/dev-box`, {
+                    method: "POST", headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload),
+                });
+            }
             const payload = {
                 name: nameI.value.trim() || null,
                 preset: selectedPreset.name,
@@ -3318,10 +3351,7 @@ async function mgmtBoxAddDialog(project) {
             // Agent is always explicit now (the preset default is pre-selected,
             // not a sentinel); no `browser`.
             if (agentS.value) payload.agent = agentS.value;
-            if (selectedPreset.dev) {
-                // NAME semantics (an attached gitea repo) — never the BYO URL.
-                payload.repo = devRepoS.value;
-            } else if (selectedPreset.clone) {
+            if (selectedPreset.clone) {
                 const repo = repoI.value.trim(), ref = refI.value.trim(),
                     setup = setupT.value.trim();
                 if (repo) payload.repo = repo;

@@ -51,6 +51,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 # broker lives in cli/; make sibling modules importable when run directly.
@@ -122,6 +123,12 @@ BUILD_LOCK = BROKER_DIR / "build.lock"
 # finally — build_alive covers review ops through these. Host-only, never
 # under run/ (same reasoning as BUILD_LOCK).
 REVIEW_LOCKS_DIR = BROKER_DIR / "review-locks"
+
+# Per-op liveness markers for the PARALLEL detached dev-box lane (webui-first
+# B) — the review-locks sibling: one {pid} file per op_id, parent-written after
+# a successful spawn, child-unlinked in finally; build_alive covers dev-box ops
+# through these. Host-only, never under run/.
+DEV_BOX_LOCKS_DIR = BROKER_DIR / "dev-box-locks"
 
 # Max bytes returned per op_full_tail poll. Bounds ONE reply frame — a fleet-build
 # full log grows to MBs, and the whole point of tailing is not to ship it all at
@@ -385,11 +392,11 @@ def _verb_build_alive(args: dict, _progress=None) -> dict:
     pid = holder.get("pid") if holder else None
     alive = (holder is not None and holder.get("op_id") == op_id
              and isinstance(pid, int) and _alive(pid))
-    # Review ops (S4): the parallel lane has no global lock — liveness comes
-    # from the per-op review-lock file (same terminal-first property:
-    # run_review writes done/fail before its finally unlinks the lock).
+    # Review + dev-box ops: the parallel lanes have no global lock — liveness
+    # comes from the per-op lock files (same terminal-first property: the
+    # children write done/fail before their finally unlinks the lock).
     if not alive:
-        alive = _review_lock_alive(op_id)
+        alive = _review_lock_alive(op_id) or _dev_box_lock_alive(op_id)
     return {"alive": bool(alive)}
 
 
@@ -541,11 +548,12 @@ def _verb_port_list(args: dict, _progress=None) -> dict:
 
 
 # Dev lane (STAGE_DEV_GITEA S1). Deny-by-default field allowlists, mirroring the
-# port verbs. `url`/`repo`/`project`/`class` act inside gitea or on the project's
-# own network — none is host-shaped (no bind-mount source, no host port). The
-# GitHub PAT is NOT here: it's a host-CLI-only secret write, never relayed. Repo
+# port verbs. `url`/`repo`/`project` act inside gitea or on the project's own
+# network — none is host-shaped (no bind-mount source, no host port). Repo
 # remove joins STEP_UP_VERBS (deletes agent work). None joins OPEN_VERBS.
-DEV_REPO_ADD_WEBUI_FIELDS = frozenset({"url"})
+# There is NO inline repo-add verb: broker-side repo-add exists only inside the
+# detached dev-box lane (the ~120s migrate must never run on the accept
+# thread); the CLI calls rscore.dev_repo_add directly.
 # The review lane's input boundary (S4). Consumed by the dispatch review
 # branch + _verb_review_pr, NOT by any VERBS entry — review_pr lives in
 # REVIEW_DISPATCH only (see the review-lane section).
@@ -555,12 +563,15 @@ REVIEW_WEBUI_FIELDS = frozenset({"repo", "pr"})
 DEV_ATTACH_WEBUI_FIELDS = frozenset({"project", "repo"})
 DEV_DETACH_WEBUI_FIELDS = frozenset({"project", "repo"})
 DEV_TARGET_WEBUI_FIELDS = frozenset({"repo"})
-
-
-def _verb_dev_repo_add(args: dict, _progress=None) -> dict:
-    safe = {k: v for k, v in args.items() if k in DEV_REPO_ADD_WEBUI_FIELDS}
-    req = rscore.DevRepoAddRequest.from_kwargs(**safe)   # may raise ValidationError
-    return dataclasses.asdict(rscore.dev_repo_add(req))
+# The dev-box provision lane's input boundary (webui-first B). Consumed by the
+# dispatch dev-box branch + _verb_dev_box_provision, NOT by any VERBS entry —
+# dev_box_provision lives in DEV_BOX_DISPATCH only. None is host-shaped:
+# url/name/agent/editor act inside gitea / the inner box; `pat` is a SECRET
+# that reaches only gitea's migrate auth_token (per-repo transient — RS stores
+# no PAT): repr=False on the request, off every Result, never argv (child args
+# ride stdin), never a durable sink.
+DEV_BOX_WEBUI_FIELDS = frozenset({"project", "url", "pat", "name", "agent",
+                                  "editor"})
 
 
 def _verb_dev_repo_remove(args: dict, _progress=None) -> dict:
@@ -632,7 +643,6 @@ VERBS = {
     "port_add": _verb_port_add,
     "port_remove": _verb_port_remove,
     "port_list": _verb_port_list,
-    "dev_repo_add": _verb_dev_repo_add,
     "dev_repo_remove": _verb_dev_repo_remove,
     "dev_repo_list": _verb_dev_repo_list,
     "dev_attach": _verb_dev_attach,
@@ -922,6 +932,139 @@ def run_review(op_id: str, args_json: str) -> None:
         _release_review_lock(op_id)
 
 
+# ---------------------------------------------------------------------------
+# Dev-box provision lane (STAGE_DEV_GITEA webui-first B)
+#
+# The review lane's parallel sibling for the box window's URL-driven dev box:
+# mirror+fork+attach+create as one detached child (`broker __run-dev-box`).
+# The ~120s GitHub migrate must never sit on the serial accept thread, so
+# dev_box_provision lives in its OWN table — absent from VERBS (the inline
+# path structurally cannot reach it), absent from BUILD_DISPATCH (that lane
+# serialises on the GLOBAL build.lock, which run_build's finally releases
+# unconditionally), absent from REVIEW_DISPATCH (that branch filters review
+# fields). Per-op locks give build_alive its liveness signal, exactly like
+# reviews. ONE deliberate deviation from the review-lane mirror: the child
+# args carry the per-repo GitHub PAT, so they ride the child's STDIN — never
+# argv, which is world-readable in /proc/<pid>/cmdline for the child's
+# lifetime.
+# ---------------------------------------------------------------------------
+
+
+def _verb_dev_box_provision(args: dict, progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in DEV_BOX_WEBUI_FIELDS}
+    req = rscore.DevBoxProvisionRequest.from_kwargs(**safe)  # may raise ValidationError
+    return rscore.dev_box_provision(req, progress)
+
+
+# The child-only vocabulary — NOT in VERBS / BUILD_DISPATCH / REVIEW_DISPATCH.
+DEV_BOX_DISPATCH = {
+    "dev_box_provision": _verb_dev_box_provision,
+}
+
+
+def _dev_box_lock_path(op_id: str) -> Path:
+    return DEV_BOX_LOCKS_DIR / f"{op_id}.json"
+
+
+def _write_dev_box_lock(op_id: str, pid: int) -> None:
+    DEV_BOX_LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+    _dev_box_lock_path(op_id).write_text(json.dumps({"pid": pid}))
+
+
+def _release_dev_box_lock(op_id: str) -> None:
+    with contextlib.suppress(FileNotFoundError, OSError):
+        _dev_box_lock_path(op_id).unlink()
+
+
+def _dev_box_lock_alive(op_id: str) -> bool:
+    """True iff this op's dev-box lock holds a LIVE pid (mirrors
+    _review_lock_alive — a dead pid reads as not-alive, the wedge-escape)."""
+    try:
+        holder = json.loads(_dev_box_lock_path(op_id).read_text())
+    except (FileNotFoundError, ValueError, OSError):
+        return False
+    pid = holder.get("pid") if isinstance(holder, dict) else None
+    return isinstance(pid, int) and _alive(pid)
+
+
+def _spawn_dev_box_child(op_id: str, args: dict) -> int:
+    """Spawn the DETACHED dev-box child (`broker __run-dev-box`). Mirrors
+    _spawn_review_child EXCEPT the args JSON rides the child's STDIN, never
+    argv: the args carry the per-repo GitHub PAT, and an argv value is
+    world-readable in /proc/<pid>/cmdline for the child's lifetime. The
+    write+close is BrokenPipe-tolerant: a child dying at exec must not raise
+    on the serial accept thread (an uncaught error would escape dispatch into
+    socketserver and truncate the client reply) — the op then degrades through
+    the never-alive per-op lock into the tail's wedge-escape."""
+    BROKER_DIR.mkdir(parents=True, exist_ok=True)
+    research_py = rscore.SCRIPT_DIR / "research.py"
+    log = open(BROKER_LOG, "a")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(research_py), "broker", "__run-dev-box", op_id],
+            stdin=subprocess.PIPE, stdout=log, stderr=log,
+            start_new_session=True, cwd=str(rscore.SCRIPT_DIR))
+    finally:
+        log.close()                               # the child holds its own dup'd fd
+    with contextlib.suppress(BrokenPipeError, OSError):
+        proc.stdin.write(json.dumps(args).encode())
+    with contextlib.suppress(BrokenPipeError, OSError):
+        proc.stdin.close()
+    return proc.pid
+
+
+def run_dev_box(op_id: str) -> None:
+    """The DETACHED dev-box child (invoked by `broker __run-dev-box`). Mirrors
+    run_review: owns the op-log, points fd 1/2 at the HOST-ONLY full log,
+    calls the verb DIRECTLY from DEV_BOX_DISPATCH (never dispatch() —
+    re-entry), writes a terminal done/fail to the mounted view-log, and
+    unlinks ITS OWN dev-box lock in finally (never BUILD_LOCK). Terminal-
+    first: done/fail lands before the lock release. The args JSON arrives on
+    STDIN (never argv — it carries the PAT; see _spawn_dev_box_child).
+    View-log fail reasons are COARSE tokens; the ValidationError arm
+    additionally prints str(e) to the full log FIRST — a bad PAT or a
+    private-without-PAT source surfaces as GiteaError→ValidationError, and
+    without that print it would be undiagnosable from the browser AND the
+    full log. Safe by construction: GiteaError carries method/path/status
+    only, never a body or the PAT."""
+    try:
+        args = json.loads(sys.stdin.read())
+    except (ValueError, OSError):
+        args = {}
+    if not isinstance(args, dict):
+        args = {}
+    try:
+        op = make_oplog(op_id, "dev_box_provision", args)
+    except (ValueError, OSError):
+        _release_dev_box_lock(op_id)
+        return
+    try:
+        os.dup2(op.full.fileno(), 1)
+        os.dup2(op.full.fileno(), 2)
+        sys.stdout = os.fdopen(1, "w", buffering=1, closefd=False)
+        sys.stderr = os.fdopen(2, "w", buffering=1, closefd=False)
+        DEV_BOX_DISPATCH["dev_box_provision"](args, op.progress)
+        op.progress.done()
+    except rscore.ValidationError as e:
+        print(f"validation: {e}")                 # full log — status-only, PAT-free
+        op.progress.fail("invalid request")
+    except SystemExit:
+        op.progress.fail("provision failed")      # die() already printed to the full log
+    except (rscore.HarnessError, Exception):
+        # A RAW exception prints nothing on its own — without this the full log
+        # is EMPTY and the failure is undiagnosable (bit the first acceptance
+        # run: a NameError died silently behind the coarse token). Stdout/stderr
+        # are the fd-redirected HOST-ONLY full log here, the sanctioned home for
+        # host detail; print_exc emits frames + source lines, never locals, so
+        # the PAT (never in an exception message by the GiteaError/HarnessError
+        # constructions) cannot ride it.
+        traceback.print_exc()
+        op.progress.fail("provision failed")      # coarse token; detail is in the full log
+    finally:
+        op.close()
+        _release_dev_box_lock(op_id)
+
+
 def _err(kind: str, message: str) -> dict:
     return {"ok": False, "error": {"kind": kind, "message": message}}
 
@@ -943,7 +1086,7 @@ def _auth_login(args: dict, tokens) -> dict:
 
 def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
              verbs: dict | None = None, audit=None, oplog=None,
-             spawn_build=None, spawn_review=None) -> dict:
+             spawn_build=None, spawn_review=None, spawn_dev_box=None) -> dict:
     """Resolve and run one verb, mapping every failure mode to a reply dict.
     Pure by default (no socket; no file I/O unless an `audit` or `oplog` sink is
     passed) so it is unit-testable on its own.
@@ -959,7 +1102,9 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
     child for a BUILD_DISPATCH verb; the daemon injects `_spawn_build_child`,
     tests pass None (the branch then gates + validates but never spawns).
     `spawn_review(op_id, args) → child pid` is the review lane's analog
-    (daemon injects `_spawn_review_child`; tests pass None likewise).
+    (daemon injects `_spawn_review_child`; tests pass None likewise), and
+    `spawn_dev_box(op_id, args) → child pid` the dev-box lane's (daemon
+    injects `_spawn_dev_box_child`).
     """
     def _audited(principal, outcome, reply):
         if audit is not None:
@@ -1063,6 +1208,49 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
                             {"ok": True, "result": {"op_id": op_id, "started": True}})
         pid = spawn_review(op_id, safe)          # detached child, FILTERED args
         _write_review_lock(op_id, pid)           # PARENT writes, post-spawn only
+        return _audited(principal, "ok",
+                        {"ok": True, "result": {"op_id": op_id, "started": True}})
+
+    # Dev-box provision lane (webui-first B) — the SOLE entry for
+    # dev_box_provision (DEV_BOX_DISPATCH is absent from every other table).
+    # Mirrors the review branch: token → op_id → pre-spawn validation → spawn →
+    # the parent writes a PER-OP lock only AFTER a successful spawn
+    # (gate-before-sink). NO lock check — provisions run N-at-a-time; a
+    # same-repo double-submit is the documented migrate-resume quirk (the
+    # duplicate-review posture). The spawn passes the FILTERED args over the
+    # child's stdin (they carry the PAT — see _spawn_dev_box_child).
+    if verbs is None and verb in DEV_BOX_DISPATCH:
+        if not isinstance(args, dict):
+            return _err("bad_request", "args must be a JSON object")
+        principal = tokens.principal_for(token) if tokens is not None else None
+        if principal is None:
+            return _audited(None, "unauthorized",
+                            _err("unauthorized",
+                                 "a valid session token is required; call login"))
+        if not isinstance(op_id, str) or not _OP_ID_RE.match(op_id):
+            return _audited(principal, "bad_request",
+                            _err("bad_request", "a valid op_id is required"))
+        # Pre-spawn validation: shape via from_kwargs + one cheap file gate —
+        # a bad request must NOT spawn a child (the client already holds
+        # started:true and would never see a child-side failure). Everything
+        # docker-shaped stays child-side.
+        safe = {k: v for k, v in args.items() if k in DEV_BOX_WEBUI_FIELDS}
+        try:
+            rscore.DevBoxProvisionRequest.from_kwargs(**safe)
+        except rscore.ValidationError as e:
+            return _audited(principal, "validation",
+                            _err("validation", str(e)))
+        if not gitea.bootstrap_present():
+            return _audited(principal, "validation",
+                            _err("validation",
+                                 "Gitea isn't enabled — enable it under "
+                                 "Management → Infrastructure (or `research "
+                                 "dev gitea-enable`) first"))
+        if spawn_dev_box is None:           # tests: gate + validate, never spawn
+            return _audited(principal, "ok",
+                            {"ok": True, "result": {"op_id": op_id, "started": True}})
+        pid = spawn_dev_box(op_id, safe)         # detached child, args via stdin
+        _write_dev_box_lock(op_id, pid)          # PARENT writes, post-spawn only
         return _audited(principal, "ok",
                         {"ok": True, "result": {"op_id": op_id, "started": True}})
 
@@ -1215,7 +1403,8 @@ class _Handler(socketserver.StreamRequestHandler):
                             audit=broker_auth.audit_event,
                             oplog=make_oplog,
                             spawn_build=_spawn_build_child,
-                            spawn_review=_spawn_review_child))
+                            spawn_review=_spawn_review_child,
+                            spawn_dev_box=_spawn_dev_box_child))
 
     def _send(self, reply: dict) -> None:
         data = json.dumps(reply).encode()

@@ -881,7 +881,8 @@ class PortListRequest:
 
 # GitHub repo URL parser + segment validator. The derived `repo` segment feeds a
 # HOST filesystem path (tokens/agent-<repo>.token) AND gitea account/repo names,
-# and dev_repo_add is a broker verb (webui-reachable once S3 lands) — so the
+# and the URL is browser-supplied through the broker's detached dev-box lane (the
+# CLI calls rscore directly; there is no inline broker repo-add verb) — so the
 # owner/repo segments are user-supplied input on a host path. Anchor them with the
 # _light_clone_basename rejection discipline (empty / '.' / '..' / separator).
 def _parse_github_repo(url: Any) -> tuple[str, str, str]:
@@ -921,11 +922,19 @@ def _valid_dev_repo_name(repo: Any) -> bool:
 class DevRepoAddRequest:
     url: str
     repo: str                                   # the anchored segment (derived)
+    # Per-repo transient GitHub PAT for a private source (RS stores no PAT — it
+    # reaches only gitea's migrate auth_token, which gitea persists per-repo in
+    # its own mirror config). repr=False keeps it out of any stringified
+    # request; it is never a Result field.
+    pat: str = field(default="", repr=False)
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "DevRepoAddRequest":
         url, _owner, repo = _parse_github_repo(kw.get("url"))
-        return cls(url=url, repo=repo)
+        pat = kw.get("pat")
+        if pat is not None and not isinstance(pat, str):
+            raise ValidationError("pat must be a string")
+        return cls(url=url, repo=repo, pat=(pat or "").strip())
 
 
 @dataclass(frozen=True)
@@ -1028,6 +1037,39 @@ class ReviewRequest:
         return cls(repo=repo, pr=pr)
 
 
+@dataclass(frozen=True)
+class DevBoxProvisionRequest:
+    """The webui dev-box provision (the box window's dev preset): ONE action =
+    mirror+fork the GitHub URL, attach the repo to the project, create the dev
+    box. Runs ONLY in the broker's detached dev-box child (the ~120s migrate
+    never sits on the accept thread) or inline from a direct rscore caller.
+    ``pat`` is the per-repo transient secret (repr=False; reaches only gitea's
+    migrate auth_token, never a Result)."""
+    project: str
+    url: str
+    repo: str                                   # the anchored segment (derived)
+    pat: str = field(default="", repr=False)
+    name: str | None = None                     # box name (None ⇒ auto box-N)
+    agent: str | None = None                    # claude | none | None (preset default)
+    editor: bool = False
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "DevBoxProvisionRequest":
+        url, _owner, repo = _parse_github_repo(kw.get("url"))
+        pat = kw.get("pat")
+        if pat is not None and not isinstance(pat, str):
+            raise ValidationError("pat must be a string")
+        # Delegate the box-field validation (project name, box-name regex, agent
+        # enum) to the shipped choke point — constructed for its validated
+        # fields; shape-only, no docker (box_add re-gates semantics child-side).
+        box = BoxAddRequest.from_kwargs(
+            project=kw.get("project"), name=kw.get("name"), preset="dev",
+            agent=kw.get("agent"), editor=kw.get("editor"), repo=repo)
+        return cls(project=box.project, url=url, repo=repo,
+                   pat=(pat or "").strip(), name=box.name, agent=box.agent,
+                   editor=box.editor)
+
+
 @dataclass
 class DevRepoAddResult:
     repo: str
@@ -1112,7 +1154,6 @@ class BoxPresetsResult:
     project: str
     presets: list[dict]                     # {name,image,agent_default,clone,editor_default,repo,description,source,dev}
     allowed_mcps: list[str]
-    attached_dev_repos: list[str]           # agent-class dev repos attached to the project (drives the dev preset's repo picker)
 
 
 @dataclass
@@ -6526,12 +6567,8 @@ def box_presets(req: "BoxPresetsRequest", _progress=None) -> BoxPresetsResult:  
                for e in catalog]
     allowed = sorted(x["name"] for x in load_project_allowlist(req.project, cfg)
                      if x.get("name"))
-    # Agent-class dev repos attached to THIS project — a pure record read (no
-    # gitea stand-up inside a read verb); feeds the dev preset's repo picker.
-    attached = sorted({e["repo"] for e in gitea.project_entries(req.project)
-                       if e.get("class") == "agent" and e.get("repo")})
     return BoxPresetsResult(project=req.project, presets=presets,
-                            allowed_mcps=allowed, attached_dev_repos=attached)
+                            allowed_mcps=allowed)
 
 
 # --- exported-port registry (STAGE_EXPORTED_PORTS) --------------------------
@@ -6628,13 +6665,11 @@ def dev_repo_add(req: "DevRepoAddRequest", _progress=None) -> DevRepoAddResult: 
     TOKEN FILE PATH, never the token value (secrets-off-results)."""
     _resume_gitea(require=True)         # resume an enabled gitea; never create
     host_port = _gitea_host_port()
-    # Private-source detection is best-effort: a private GitHub repo needs the PAT
-    # in the migrate auth_token. We can't know without asking GitHub, so treat the
-    # repo as private iff a PAT is configured (the PAT is harmless on a public
-    # clone, and a private repo without a PAT fails loudly at migrate).
-    private = gitea.PAT_PATH.is_file()
+    # Private source ⇔ the caller supplied a per-repo PAT (RS stores no PAT).
+    # The PAT is harmless on a public clone; a private repo without one fails
+    # loudly at migrate.
     try:
-        gitea.add_repo(host_port, req.url, req.repo, private)
+        gitea.add_repo(host_port, req.url, req.repo, pat=req.pat or None)
     except gitea.GiteaError as e:
         raise ValidationError(str(e))
     return DevRepoAddResult(
@@ -6784,6 +6819,30 @@ def dev_gitea_start(_req: "DevGiteaStartRequest", progress=None) -> DevGiteaStar
     pull streams milestones to the view log; the browser tails to completion."""
     _provision_gitea(progress)
     return DevGiteaStartResult(running=True)
+
+
+def dev_box_provision(req: "DevBoxProvisionRequest", progress=None) -> dict:  # type: ignore[name-defined]
+    """Webui dev-box provision: mirror+fork+attach+create as ONE action (the
+    box window's dev preset takes a GitHub URL + optional per-repo PAT). A
+    COMPOSITION of the three shipped verbs so every gate and secret discipline
+    is reused, not re-derived: dev_repo_add (resumes gitea require=True — the
+    deliberate-create model; resumable migrate) → dev_attach (running-project
+    checks, network connect, attachment record, staging, dev-box reconcile) →
+    box_add (preset "dev" — its attachment gate passes because the attach step
+    just ran). Runs in the broker's detached dev-box child or inline from a
+    direct rscore caller — never on the broker's accept thread. Failure detail
+    streams to the child's full log (die() prints to the redirected stderr);
+    the view log gets only run_dev_box's coarse tokens."""
+    progress = progress or _NULL_PROGRESS
+    progress.step("repo", "mirroring + forking the repo")
+    dev_repo_add(DevRepoAddRequest.from_kwargs(url=req.url, pat=req.pat))
+    progress.step("attach", "attaching the repo to the project")
+    dev_attach(DevAttachRequest.from_kwargs(project=req.project, repo=req.repo))
+    box = box_add(BoxAddRequest.from_kwargs(
+        project=req.project, name=req.name, preset="dev", agent=req.agent,
+        editor=req.editor, repo=req.repo), progress)
+    return {"project": req.project, "repo": req.repo, "box": box.name,
+            "container": box.container}
 
 
 # ---------------------------------------------------------------------------
