@@ -964,14 +964,17 @@ async def broker_dev_sync_handler(request: web.Request) -> web.Response:
 
 
 async def broker_dev_gitea_start_handler(request: web.Request) -> web.Response:
-    """POST /broker/dev/gitea-start — explicit gitea start (gated,
-    origin-checked; the Management Infrastructure button). The broker-side
-    start is bounded by its readiness wait; the 30s relay may report a timeout
-    while the daemon finishes — the UI re-reads status after."""
+    """POST /broker/dev/gitea-start — DELIBERATELY enable/provision gitea (gated,
+    origin-checked; the Management Infrastructure "Enable Gitea" button + the
+    Development-page stopped branch). A TAILED op (dev_gitea_start ∈
+    PROGRESS_VERBS): returns {op_id} immediately and runs as a background task so
+    the one-time image pull streams milestones, instead of a bare inline relay
+    that would freeze the browser on the ~30-60s pull. `op_seed` is fixed (no
+    project) → a "dev-gitea-…" op_id."""
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")
-    status, reply = await _relay(request, "dev_gitea_start", {})
-    return web.json_response(reply, status=status)
+    return await _start_op(request, "dev_gitea_start", {}, BROKER_OP_TIMEOUT_S,
+                           op_seed="dev-gitea")
 
 
 async def broker_dev_review_handler(request: web.Request) -> web.Response:
@@ -1906,13 +1909,23 @@ async def _proxy_http(request: web.Request,
     # the source of truth for "done", not a wall clock.
     timeout = ClientTimeout(total=None, sock_read=None)
     async with ClientSession(timeout=timeout, auto_decompress=False) as sess:
-        async with sess.request(
-            request.method,
-            upstream_url,
-            headers=headers_in,
-            data=data,
-            allow_redirects=False,
-        ) as upstream_resp:
+        # A down/unreachable upstream (e.g. the gitea iframe when gitea isn't
+        # enabled) raises ClientError out of `sess.request` — return a clean 502
+        # instead of aiohttp's generic 500 ("Server got itself in trouble"), the
+        # exact shape _proxy_ws already uses. The Gitea sub-tab gates on
+        # gitea.running before it ever loads the iframe, so this is the backstop.
+        try:
+            req_ctx = sess.request(
+                request.method,
+                upstream_url,
+                headers=headers_in,
+                data=data,
+                allow_redirects=False,
+            )
+            upstream_resp = await req_ctx.__aenter__()
+        except Exception as e:                       # mirror _proxy_ws's connect guard
+            return web.Response(status=502, text=f"upstream unreachable: {e}")
+        try:
             headers_out = _filter_headers(
                 upstream_resp.headers, RESPONSE_DROP_HEADERS)
             response = web.StreamResponse(
@@ -1927,6 +1940,8 @@ async def _proxy_http(request: web.Request,
                 await response.write(chunk)
             await response.write_eof()
             return response
+        finally:
+            await req_ctx.__aexit__(None, None, None)
 
 
 def _resolve_origin_upstream_port(project: str, service_id: str) -> int | None:

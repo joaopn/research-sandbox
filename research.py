@@ -1699,10 +1699,7 @@ def cmd_dev_passwd(args: argparse.Namespace) -> None:
         else getpass.getpass("New sandbox-admin password (input hidden): ").strip()
     if len(pw) < MIN_PASSWORD_LENGTH:
         die(f"password must be at least {MIN_PASSWORD_LENGTH} characters")
-    if not container_exists(gitea.GITEA_CONTAINER):
-        die("rs-gitea has not been set up yet — add a repo first "
-            "(`research dev repo add <github-url>`)")
-    rscore._ensure_gitea_running()
+    rscore._resume_gitea(require=True)   # resume an enabled gitea; never create
     # --must-change-password=false matches both bootstrap `user create` calls:
     # without it a (version-dependent) forced change at next sign-in defeats
     # the web-UI login this command exists to enable.
@@ -1760,6 +1757,15 @@ def cmd_dev_detach(args: argparse.Namespace) -> None:
 def cmd_dev_sync(args: argparse.Namespace) -> None:
     _call(rscore.dev_sync, _build(rscore.DevSyncRequest, repo=args.repo))
     print(f"triggered mirror sync for {args.repo}")
+
+
+def cmd_dev_gitea_enable(_args: argparse.Namespace) -> None:
+    """Provision/enable the shared Gitea (the CLI twin of the webui Management →
+    Infrastructure button). The SOLE stand-up path — gitea is never lazily
+    created anymore; this or the button creates it, and an enabled-but-stopped
+    one auto-resumes at `research start`."""
+    _call(rscore.dev_gitea_start, _build(rscore.DevGiteaStartRequest))
+    print("Gitea enabled.")
 
 
 def cmd_dev_reviewer_login(_args: argparse.Namespace) -> None:
@@ -2326,6 +2332,11 @@ def build_parser() -> argparse.ArgumentParser:
     dvs = dv_sub.add_parser("sync", help="trigger a mirror sync from GitHub")
     dvs.add_argument("repo")
     dvs.set_defaults(func=cmd_dev_sync)
+    dvge = dv_sub.add_parser(
+        "gitea-enable",
+        help="enable the shared Gitea backend (create if absent, else resume) — "
+             "the CLI twin of the webui Management → Infrastructure button")
+    dvge.set_defaults(func=cmd_dev_gitea_enable)
     dvrl2 = dv_sub.add_parser(
         "reviewer-login",
         help="one-time OAuth mint for the dedicated reviewer Claude account "

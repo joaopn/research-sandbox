@@ -89,7 +89,7 @@ BROKER_FULLLOG_DIR = BROKER_DIR / "oplogs-full"     # .full.log — host-only
 # Verbs that get a per-op progress log: the long-running lifecycle writes. Reads
 # (OPEN_VERBS) and auth verbs never produce one. op_id-driven from the webui.
 PROGRESS_VERBS = frozenset({"create", "update", "destroy", "start", "stop",
-                            "box_add", "box_remove"})
+                            "box_add", "box_remove", "dev_gitea_start"})
 
 # op_id names a file, so it is validated as a safe basename before it ever does:
 # first char alnum, rest alnum/dot/dash/underscore — no path separator, no
@@ -599,10 +599,12 @@ def _verb_dev_status(_args: dict, _progress=None) -> dict:
     return dataclasses.asdict(rscore.dev_status(req))
 
 
-def _verb_dev_gitea_start(_args: dict, _progress=None) -> dict:
-    # Explicit gitea start (the Management Infrastructure button). No fields.
+def _verb_dev_gitea_start(_args: dict, progress=None) -> dict:
+    # Deliberate gitea enable/provision (the Management Infrastructure button).
+    # No fields. A tailed op (PROGRESS_VERBS) — thread `progress` so the one-time
+    # image pull streams milestones to the view log.
     req = rscore.DevGiteaStartRequest.from_kwargs()
-    return dataclasses.asdict(rscore.dev_gitea_start(req))
+    return dataclasses.asdict(rscore.dev_gitea_start(req, progress))
 
 
 # The closed lifecycle vocabulary — the host-root boundary. Adding a verb here

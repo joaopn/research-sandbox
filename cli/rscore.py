@@ -1459,6 +1459,10 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             # the clone needs a manual in-project finish (or destroy+recreate).
             if req.dev_repo:
                 progress.step("dev-attach", "attaching shared gitea")
+                # A dev-workflow project NEEDS gitea — resume an enabled one
+                # (never create; deliberate-create model), die with the enable
+                # remedy if it was never enabled.
+                _resume_gitea(require=True)
                 gitea_ip = _connect_gitea_to_project_network(network)
                 if not gitea_ip:
                     die(f"rs-gitea did not attach to {network} (no IP); "
@@ -1535,19 +1539,21 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     # — a standing utility, not a designation (the read-only operator token can
     # fetch agent forks and write nothing; the human's push credential and the
     # review verdicts never ride this path). BEST-EFFORT for non-dev workflows:
-    # a sick gitea must never fail a research/sandbox create (die() inside
-    # _ensure_gitea_running surfaces as SystemExit — caught, warn, continue;
-    # heals at `research start`). The dev workflow wired STRICTLY above (its
-    # repo is mandatory; it keeps the die()).
-    if not req.dev_repo and container_exists(gitea.GITEA_CONTAINER):
+    # a sick gitea must never fail a research/sandbox create. _resume_gitea
+    # RESUMES an enabled-but-stopped gitea (never creates — deliberate-create
+    # model) and returns False when it was never enabled, so a gitea-less create
+    # is byte-equivalent; a resume-path failure (wedged wait) die()s → SystemExit
+    # → caught, warn, continue. The dev workflow wired STRICTLY above (require).
+    if not req.dev_repo:
         try:
-            dev_ip = _connect_gitea_to_project_network(network)
-            if dev_ip:
-                _stage_dev_gitea(project, cfg, gitea_ip=dev_ip)
-            else:
-                print(f"warning: rs-gitea attach to {network} returned no IP; "
-                      f"dev wiring skipped (heals at `research start`)",
-                      file=sys.stderr)
+            if _resume_gitea(require=False):
+                dev_ip = _connect_gitea_to_project_network(network)
+                if dev_ip:
+                    _stage_dev_gitea(project, cfg, gitea_ip=dev_ip)
+                else:
+                    print(f"warning: rs-gitea attach to {network} returned no IP; "
+                          f"dev wiring skipped (heals at `research start`)",
+                          file=sys.stderr)
         except SystemExit:
             print("warning: rs-gitea unavailable; dev wiring skipped "
                   "(heals at `research start`)", file=sys.stderr)
@@ -4382,15 +4388,15 @@ def _start_docker_substrate(project: str, cfg: "Config") -> None:  # type: ignor
     # project started individually gets wired + staged here instead of waiting
     # for a global `research start`. Best-effort: gitea sickness must never
     # fail a project start; a gitea-less start is byte-equivalent (gate below).
-    if container_exists(gitea.GITEA_CONTAINER):
-        try:
+    try:
+        if _resume_gitea(require=False):
             ip = _connect_gitea_to_project_network(network)
             if ip:
                 _stage_dev_gitea(project, cfg, gitea_ip=ip)
-        except SystemExit:
-            print("warning: rs-gitea unavailable; dev wiring not refreshed",
-                  file=sys.stderr)
-        _stage_dev_fetch(container)
+    except SystemExit:
+        print("warning: rs-gitea unavailable; dev wiring not refreshed",
+              file=sys.stderr)
+    _stage_dev_fetch(container)
 
 
 def _without_mount(mounts: list[str], dst: str) -> list[str]:
@@ -4802,22 +4808,26 @@ def _connect_registry_to_project_network(network: str) -> None:
 # Shared rs-gitea (STAGE_DEV_GITEA S1) — the dev lane's registry-pattern sibling
 # ---------------------------------------------------------------------------
 
-def _ensure_gitea_running() -> None:
-    """Idempotent shared Gitea on rs-sandbox (the dev workflow's git hub). Triad:
-    running -> no-op; exists-stopped -> docker start; absent -> docker run. Home
-    ROUTER_NETWORK (internet via the gateway for mirror sync); admin API on a
-    127.0.0.1 loopback port only (the host-side dev verbs). Stood up LAZILY on
-    the first `dev repo add`, not at `research start`.
+def _provision_gitea(progress=None) -> None:
+    """Provision the shared Gitea on rs-sandbox — the DELIBERATE Enable action,
+    and the SOLE creator (deliberate-create / auto-resume model). Triad: running
+    -> ensure-bootstrap; exists-stopped -> docker start; absent -> pull + docker
+    run. Home ROUTER_NETWORK (internet via the gateway for mirror sync); admin
+    API on a 127.0.0.1 loopback port only. Stood up DELIBERATELY via
+    `dev_gitea_start` (webui Management -> Infrastructure, or `research dev
+    gitea-enable`) — never lazily. A stopped-but-enabled gitea is RESUMED by
+    _resume_gitea, which never creates; only this function ever CREATES it.
 
     Stale-token guard: if the tokens exist but the container AND its volume are
     gone, die with a remedy — a fresh gitea would reject the stale admin token
     silently, so surface it rather than half-work."""
+    progress = progress or _NULL_PROGRESS
     if (gitea.bootstrap_present()
             and not container_exists(gitea.GITEA_CONTAINER)
             and not volume_exists(gitea.GITEA_DATA_VOLUME)):
         die(f"stale dev-lane tokens from a removed {gitea.GITEA_CONTAINER}; "
             f"rm {gitea.ADMIN_TOKEN_PATH} and {gitea.OPERATOR_TOKEN_PATH} to "
-            f"re-bootstrap on the next `research dev repo add`.")
+            f"re-enable on the next `research dev gitea-enable`.")
     pins = load_versions()
     host_port = pins.get("GITEA_HOST_PORT", gitea.DEFAULT_GITEA_HOST_PORT)
     if container_running(gitea.GITEA_CONTAINER):
@@ -4825,12 +4835,15 @@ def _ensure_gitea_running() -> None:
         # bootstrap (leaving no tokens). So fall through to the bootstrap-if-absent
         # step rather than early-returning; the wait+bootstrap runs at most once
         # (bootstrap_present() gates it), so a healthy re-entry is a cheap no-op.
+        progress.step("bootstrap", "checking gitea accounts")
         _bootstrap_gitea_if_absent(host_port)
         return
     if container_exists(gitea.GITEA_CONTAINER):
+        progress.step("start", "starting gitea")
         run_check(["docker", "start", gitea.GITEA_CONTAINER])
     else:
         image = "gitea/gitea:" + pins.get("GITEA_VERSION", gitea.DEFAULT_GITEA_VERSION)
+        progress.step("pull", "pulling the gitea image")
         if not run_quiet(["docker", "image", "inspect", image]):
             print(f"pulling {image}...")
             run_check(["docker", "pull", image])
@@ -4874,7 +4887,33 @@ def _ensure_gitea_running() -> None:
     # private" cascade the harness caught). The pure-already-running path above
     # skips this (gitea was already serving from a prior call).
     _wait_for_gitea(host_port)
+    progress.step("bootstrap", "checking gitea accounts")
     _bootstrap_gitea_if_absent(host_port)
+
+
+def _resume_gitea(*, require: bool) -> bool:
+    """RESUME an already-enabled gitea (the router/projects precedent) — NEVER
+    creates. running -> ensure-bootstrap; exists-stopped -> docker start + wait +
+    ensure-bootstrap; absent -> die with the enable remedy when `require`, else
+    return False (best-effort skip for universal wiring). This is the
+    'no lazy-loading' line: adding a repo, syncing, or wiring a project resumes
+    an ENABLED backend but never conjures one — only _provision_gitea (the Enable
+    action) creates. A stale-token/corrupt state (tokens present, container gone)
+    surfaces on the eventual Enable, whose _provision_gitea guard names the real
+    remedy; here the operator is simply told to enable first."""
+    host_port = load_versions().get("GITEA_HOST_PORT", gitea.DEFAULT_GITEA_HOST_PORT)
+    if container_running(gitea.GITEA_CONTAINER):
+        _bootstrap_gitea_if_absent(host_port)
+        return True
+    if container_exists(gitea.GITEA_CONTAINER):
+        run_check(["docker", "start", gitea.GITEA_CONTAINER])
+        _wait_for_gitea(host_port)
+        _bootstrap_gitea_if_absent(host_port)
+        return True
+    if require:
+        die("Gitea isn't enabled — enable it in Management → Infrastructure "
+            "(or run `research dev gitea-enable`)")
+    return False
 
 
 def _bootstrap_gitea_if_absent(host_port: str) -> None:
@@ -4930,8 +4969,13 @@ def _connect_gitea_to_project_network(network: str) -> str:
     """Attach rs-gitea to a per-project network (L2, dodging the router RFC1918
     DROP, exactly like the registry) and return its IP on that bridge — recorded
     in the attachment record so S2 can inject `--add-host rs-gitea:<ip>` into a
-    box (inner-container DNS does not resolve outer-bridge names)."""
-    _ensure_gitea_running()
+    box (inner-container DNS does not resolve outer-bridge names).
+
+    CONNECT-ONLY: it does NOT provision or resume gitea (the caller decides its
+    resume/skip posture via _resume_gitea first — deliberate-create/auto-resume).
+    Returns "" if gitea isn't running, which every caller already tolerates."""
+    if not container_running(gitea.GITEA_CONTAINER):
+        return ""
     run(["docker", "network", "connect", network, gitea.GITEA_CONTAINER],
         capture_output=True)
     r = run(["docker", "inspect", gitea.GITEA_CONTAINER, "-f",
@@ -6582,7 +6626,7 @@ def dev_repo_add(req: "DevRepoAddRequest", _progress=None) -> DevRepoAddResult: 
     """Mirror a GitHub repo into shared gitea + fork it for a per-repo agent user.
     Resumable/idempotent (a mid-migrate timeout heals on re-run). Reports the
     TOKEN FILE PATH, never the token value (secrets-off-results)."""
-    _ensure_gitea_running()
+    _resume_gitea(require=True)         # resume an enabled gitea; never create
     host_port = _gitea_host_port()
     # Private-source detection is best-effort: a private GitHub repo needs the PAT
     # in the migrate auth_token. We can't know without asking GitHub, so treat the
@@ -6607,9 +6651,7 @@ def dev_repo_remove(req: "DevRepoRemoveRequest", _progress=None) -> DevRepoRemov
     if attached:
         die(f"repo {req.repo!r} is attached to: {', '.join(attached)}. "
             f"Detach those projects first (`research dev detach <project>`).")
-    if not container_exists(gitea.GITEA_CONTAINER):
-        die("rs-gitea does not exist; nothing to remove")
-    _ensure_gitea_running()            # start a stopped-but-existing gitea first
+    _resume_gitea(require=True)        # resume an enabled gitea to talk to it
     try:
         gitea.remove_repo(_gitea_host_port(), req.repo)
     except gitea.GiteaError as e:
@@ -6618,9 +6660,10 @@ def dev_repo_remove(req: "DevRepoRemoveRequest", _progress=None) -> DevRepoRemov
 
 
 def dev_repo_list(_req: "DevRepoListRequest", _progress=None) -> DevRepoListResult:  # type: ignore[name-defined]
-    if not container_exists(gitea.GITEA_CONTAINER):
+    # A READ — NEVER starts gitea (the dev_status precedent): a stopped/absent
+    # gitea lists nothing rather than resuming a backend on a page read.
+    if not container_running(gitea.GITEA_CONTAINER):
         return DevRepoListResult(repos=[])
-    _ensure_gitea_running()
     try:
         repos = gitea.list_repos(_gitea_host_port())
     except gitea.GiteaError as e:
@@ -6650,6 +6693,7 @@ def dev_attach(req: "DevAttachRequest", _progress=None) -> DevAttachResult:  # t
     if not container_running(container):
         die(f"project {req.project!r} is not running; start it first (an "
             f"agent attach stages the gitea token into the live supervisor)")
+    _resume_gitea(require=True)         # resume an enabled gitea; never create
     ip = _connect_gitea_to_project_network(network)
     if not ip:
         die(f"rs-gitea did not attach to {network} (no IP); check docker state")
@@ -6692,7 +6736,7 @@ def dev_detach(req: "DevDetachRequest", _progress=None) -> DevDetachResult:  # t
 
 
 def dev_sync(req: "DevSyncRequest", _progress=None) -> DevSyncResult:  # type: ignore[name-defined]
-    _ensure_gitea_running()
+    _resume_gitea(require=True)         # resume an enabled gitea; never create
     try:
         gitea.sync_repo(_gitea_host_port(), req.repo)
     except gitea.GiteaError as e:
@@ -6704,10 +6748,10 @@ def dev_status(_req: "DevStatusRequest", _progress=None) -> DevStatusResult:  # 
     """The Development-page read: gitea state + per-repo mirror/PR/branch
     status + agent attachments. A READ — never starts gitea, never waits: an
     absent or STOPPED gitea reports running:false with no repos immediately
-    (`dev_gitea_start` is the explicit start verb; `dev_sync`, a user-initiated
-    write, keeps its self-heal). Deliberately no _ensure_gitea_running on any
-    path: a page-load read must not docker-start containers or sit in a
-    readiness wait on the serial thread."""
+    (`dev_gitea_start` is the explicit enable verb; `dev_sync`, a user-initiated
+    write, resumes an enabled gitea). Deliberately no _provision_gitea/
+    _resume_gitea on any path: a page-load read must neither create nor
+    docker-start containers, nor sit in a readiness wait on the serial thread."""
     exists = container_exists(gitea.GITEA_CONTAINER)
     running = bool(exists and container_running(gitea.GITEA_CONTAINER))
     repos: list[dict] = []
@@ -6731,15 +6775,14 @@ def dev_status(_req: "DevStatusRequest", _progress=None) -> DevStatusResult:  # 
                            repos=repos, attachments=attachments)
 
 
-def dev_gitea_start(_req: "DevGiteaStartRequest", _progress=None) -> DevGiteaStartResult:  # type: ignore[name-defined]
-    """Explicit gitea start — the Management page's Infrastructure button.
-    Bounded by the _wait_for_gitea ceiling on the serial thread; user-initiated
-    (the webui's 30s relay may report a timeout while the daemon finishes the
-    start — accepted, the daemon keeps working)."""
-    if not container_exists(gitea.GITEA_CONTAINER):
-        die("rs-gitea has not been set up yet — add a repo first "
-            "(`research dev repo add <github-url>`)")
-    _ensure_gitea_running()
+def dev_gitea_start(_req: "DevGiteaStartRequest", progress=None) -> DevGiteaStartResult:  # type: ignore[name-defined]
+    """DELIBERATELY provision/enable gitea — the Management page's Infrastructure
+    "Enable Gitea" button (and `research dev gitea-enable`). The SOLE stand-up
+    path (deliberate-create / auto-resume model): it CREATES gitea from nothing
+    (pull + run + bootstrap) or resumes a stopped one. Runs as a tailed op
+    (PROGRESS_VERBS via _start_op, the 600s op timeout) — the one-time image
+    pull streams milestones to the view log; the browser tails to completion."""
+    _provision_gitea(progress)
     return DevGiteaStartResult(running=True)
 
 
@@ -6984,7 +7027,7 @@ def review_pr(req: "ReviewRequest", progress=None) -> dict:  # type: ignore[name
     if not dist_present(DEFAULT_AGENT):
         die(f"no cached {DEFAULT_AGENT} dist — run `research agent pull` first")
     router_ip = _ensure_reviewer_network()
-    _ensure_gitea_running()
+    _resume_gitea(require=True)         # tracks dev_sync: resume, never create
     host_port = _gitea_host_port()
     owner = gitea.agent_user_for(repo)
     client = gitea.GiteaClient(gitea.api_base(host_port),

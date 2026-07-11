@@ -1683,6 +1683,30 @@ function renderDevelopmentInto(view) {
 async function renderDevGiteaTab(view, body) {
     body.innerHTML = "";
     body.appendChild(el("div", { class: "mgmt-loading" }, ["Opening Gitea…"]));
+    // Gate on gitea RUNNING before minting a session / loading the iframe — a
+    // stopped gitea would otherwise proxy the iframe into an unreachable
+    // upstream (the _proxy_http 502 is the backstop; this is the graceful path).
+    let dev;
+    try {
+        const r = await fetch("/broker/dev");
+        if (r.status === 401) return renderMgmtLogin(view, renderDevelopmentInto);
+        dev = await r.json();
+    } catch (e) { return renderMgmtUnavailable(body); }
+    const gstate = (dev && dev.ok && dev.result && dev.result.gitea) || {};
+    if (!gstate.running) {
+        body.innerHTML = "";
+        const enable = el("button", { class: "btn-small" }, ["Enable Gitea"]);
+        enable.onclick = () =>
+            devEnableGiteaDialog(view, () => renderDevGiteaTab(view, body));
+        body.appendChild(el("div", { class: "mgmt-empty" }, [
+            el("span", {}, [gstate.exists
+                ? "Gitea is stopped. Enable it to open the web UI. "
+                : "Gitea isn't enabled yet. Enable it under Management → " +
+                  "Infrastructure, or here: "]),
+            enable,
+        ]));
+        return;
+    }
     let res;
     try {
         // /broker/-prefixed: the Management session cookie is Path=/broker.
@@ -1693,11 +1717,17 @@ async function renderDevGiteaTab(view, body) {
     let data;
     try { data = await res.json(); } catch (e) { data = {}; }
     if (!res.ok || !data.ok || !data.url) {
+        // The running-gate above already passed, so this is a race (gitea
+        // stopped mid-flight) or a session hiccup — offer Enable + a retry,
+        // never the stale "add a repo first" remedy.
         body.innerHTML = "";
+        const enable = el("button", { class: "btn-small" }, ["Enable Gitea"]);
+        enable.onclick = () =>
+            devEnableGiteaDialog(view, () => renderDevGiteaTab(view, body));
+        const retry = el("button", { class: "btn-small" }, ["Retry"]);
+        retry.onclick = () => renderDevGiteaTab(view, body);
         body.appendChild(el("div", { class: "mgmt-empty" }, [
-            "Gitea isn't reachable — it may be stopped or not set up yet. ",
-            "Start it under Management → Infrastructure, or add a repo first: ",
-            el("code", {}, ["research dev repo add <github-url>"]),
+            el("span", {}, ["Gitea isn't reachable right now. "]), enable, retry,
         ]));
         return;
     }
@@ -1794,23 +1824,20 @@ function renderDevFetchScreen(view, body, result) {
     const repos = Array.isArray(result.repos) ? result.repos : [];
     const attachments = Array.isArray(result.attachments) ? result.attachments : [];
     if (!gitea.exists) {
+        const enable = el("button", { class: "btn-small" }, ["Enable Gitea"]);
+        enable.onclick = () =>
+            devEnableGiteaDialog(view, () => renderDevFetchTab(view, body));
         body.appendChild(el("div", { class: "mgmt-empty" }, [
-            "The dev lane isn't set up yet. Add a repo on the host: ",
-            el("code", {}, ["research dev repo add <github-url>"]),
+            el("span", {}, ["The dev lane isn't enabled yet. "]), enable,
         ]));
         return;
     }
     if (!gitea.running) {
-        const start = el("button", { class: "btn-small" }, ["Start Gitea"]);
-        start.onclick = async () => {
-            start.disabled = true;
-            start.textContent = "Starting…";
-            try { await fetch("/broker/dev/gitea-start", { method: "POST" }); }
-            catch (e) { /* re-read below tells the truth either way */ }
-            renderDevFetchTab(view, body);
-        };
+        const enable = el("button", { class: "btn-small" }, ["Enable Gitea"]);
+        enable.onclick = () =>
+            devEnableGiteaDialog(view, () => renderDevFetchTab(view, body));
         body.appendChild(el("div", { class: "mgmt-empty" }, [
-            el("span", {}, ["Gitea is stopped. "]), start,
+            el("span", {}, ["Gitea is stopped. "]), enable,
         ]));
         return;
     }
@@ -1958,25 +1985,22 @@ async function appendInfraSection(view) {
         row.appendChild(el("span", { class: "type-badge" }, ["unknown"]));
         return;
     }
+    const enableBtn = () => {
+        const b = el("button", { class: "btn-small" }, ["Enable Gitea"]);
+        b.onclick = () =>
+            devEnableGiteaDialog(view, () => renderManagementInto(view));
+        return b;
+    };
     if (!g.exists) {
-        row.appendChild(el("span", { class: "type-badge" }, ["not set up"]));
-        row.appendChild(el("span", { class: "hint" },
-                           ["research dev repo add <github-url>"]));
+        row.appendChild(el("span", { class: "type-badge" }, ["not enabled"]));
+        row.appendChild(enableBtn());
         return;
     }
     row.appendChild(el("span",
                        { class: g.running ? "state-running" : "state-stopped" },
                        [g.running ? "running" : "stopped"]));
     if (!g.running) {
-        const start = el("button", { class: "btn-small" }, ["Start"]);
-        start.onclick = async () => {
-            start.disabled = true;
-            start.textContent = "Starting…";
-            try { await fetch("/broker/dev/gitea-start", { method: "POST" }); }
-            catch (e) { /* the re-render below reports the live state */ }
-            renderManagementInto(view);
-        };
-        row.appendChild(start);
+        row.appendChild(enableBtn());
     }
 }
 
@@ -2075,7 +2099,33 @@ const OP_CHECKLISTS = {
         { key: "validate", label: "checking the project" },
         { key: "discard", label: "discarding the box" },
     ],
+    // Keys LOCKSTEP with rscore._provision_gitea's progress.step() calls.
+    dev_gitea_start: [
+        { key: "pull", label: "pulling the gitea image" },
+        { key: "start", label: "starting gitea" },
+        { key: "bootstrap", label: "creating accounts" },
+    ],
 };
+
+// The deliberate "Enable Gitea" flow (STAGE_DEV_GITEA webui-first A): a tailed
+// op (dev_gitea_start ∈ PROGRESS_VERBS) that CREATES gitea from nothing or
+// resumes a stopped one. Shared by the Development Gitea tab, the Fetch tab's
+// stopped branch, and Management → Infrastructure. onDone(ok) re-renders the
+// caller's surface against the now-running gitea.
+function devEnableGiteaDialog(view, onDone) {
+    mgmtConfirmThenTail(view, {
+        title: "Enable Gitea",
+        tailTitle: "Enabling Gitea",
+        verb: "dev_gitea_start",
+        confirmLabel: "Enable",
+        body: [el("p", {}, [
+            "Starts the shared Gitea backend (a one-time image pull the first " +
+            "time). Dev repos and dev boxes need it running.",
+        ])],
+        request: () => fetch("/broker/dev/gitea-start", { method: "POST" }),
+        onDone: (ok) => { if (onDone) onDone(ok); },
+    });
+}
 
 // Human message for a failed op, from its structured result envelope.
 function mgmtOpFailMsg(result) {

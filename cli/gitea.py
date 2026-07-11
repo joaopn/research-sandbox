@@ -360,7 +360,7 @@ def bootstrap_accounts(host_port: str, admin_password: str,
                        operator_password: str) -> None:
     """Create the admin + operator gitea accounts and capture their tokens.
     Idempotent: no-op once admin.token exists (the stale-token guard in
-    rscore._ensure_gitea_running catches a token-present-but-gitea-gone mismatch
+    rscore._provision_gitea catches a token-present-but-gitea-gone mismatch
     BEFORE this runs). Tokens are minted via the gitea CLI (`docker exec`) — the
     only way to obtain another user's token without that user's basic-auth."""
     if bootstrap_present():
