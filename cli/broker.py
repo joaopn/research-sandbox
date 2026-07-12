@@ -840,7 +840,10 @@ def run_build(op_id: str, verb: str, args_json: str) -> None:
     mounted view-log, and ALWAYS releases the lock. The view-log fail reason is a
     COARSE allowlist-safe token, NEVER str(exception) — a build error can carry a
     host path, and _Progress flushes straight to the mounted file; the raw detail's
-    only home is the full log (already streamed via the fd redirect)."""
+    only home is the full log (already streamed via the fd redirect). A RAW
+    exception prints nothing on its own, so its arm print_exc()s to that full log
+    FIRST — without it a crashed child leaves an EMPTY log and is undiagnosable
+    from the browser tail AND the host."""
     try:
         args = json.loads(args_json)
     except ValueError:
@@ -862,7 +865,14 @@ def run_build(op_id: str, verb: str, args_json: str) -> None:
         op.progress.done()
     except rscore.ValidationError:
         op.progress.fail("invalid request")
-    except (rscore.HarnessError, SystemExit, Exception):
+    except SystemExit:
+        op.progress.fail("build failed")          # die() already printed to the full log
+    except (rscore.HarnessError, Exception):
+        # A RAW exception prints nothing on its own — without this the full log is
+        # EMPTY and the failure is undiagnosable from the browser tail AND the host.
+        # Stdout/stderr are the fd-redirected HOST-ONLY full log here; print_exc
+        # emits frames + source lines, never locals.
+        traceback.print_exc()
         op.progress.fail("build failed")          # coarse token; detail is in the full log
     finally:
         op.close()
@@ -948,7 +958,12 @@ def run_review(op_id: str, args_json: str) -> None:
     done/fail to the mounted view-log, and unlinks ITS OWN review lock in
     finally (never BUILD_LOCK). Terminal-first: done/fail lands before the lock
     release, so build_alive's alive:false always trails a written terminal on
-    every in-process path."""
+    every in-process path. View-log fail reasons are COARSE tokens; the full log
+    gets the detail — a RAW exception print_exc()s there (it prints nothing on
+    its own, so without it a crashed child is undiagnosable), and the
+    ValidationError arm prints str(e) there (_verb_review_pr runs from_kwargs
+    INSIDE this try, so a malformed request lands here and would otherwise leave
+    no reason anywhere)."""
     try:
         args = json.loads(args_json)
     except ValueError:
@@ -965,9 +980,13 @@ def run_review(op_id: str, args_json: str) -> None:
         sys.stderr = os.fdopen(2, "w", buffering=1, closefd=False)
         REVIEW_DISPATCH["review_pr"](args, op.progress)
         op.progress.done()
-    except rscore.ValidationError:
+    except rscore.ValidationError as e:
+        print(f"validation: {e}")                 # full log — ReviewRequest is repo+pr, secret-free
         op.progress.fail("invalid request")
-    except (rscore.HarnessError, SystemExit, Exception):
+    except SystemExit:
+        op.progress.fail("review failed")         # die() already printed to the full log
+    except (rscore.HarnessError, Exception):
+        traceback.print_exc()                     # a raw exception prints nothing on its own
         op.progress.fail("review failed")         # coarse token; detail is in the full log
     finally:
         op.close()

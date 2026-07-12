@@ -3640,8 +3640,8 @@ function scheduleServicesRefresh() {
 // all move the signature, so the guard in refreshActiveServices fires only then.
 function serviceTabsSignature(map) {
     return Object.keys(map || {}).sort()
-        .map((id) => `${id} ${(map[id] && map[id].label) || ""}`)
-        .join("");
+        .map((id) => `${id}\x00${(map[id] && map[id].label) || ""}`)
+        .join("\x01");
 }
 
 async function refreshActiveServices() {
