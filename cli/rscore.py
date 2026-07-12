@@ -386,8 +386,9 @@ class CreateRequest:
     # manifest's `dev: true` (data, never the workflow name — the flavor-
     # derivation discipline); dev_repo is the MANDATORY-on-a-dev-workflow gitea
     # repo NAME whose fork the create step clones into the supervisor workspace.
-    # CLI-only: dev_repo stays OUT of CREATE_WEBUI_FIELDS until the S3 Dev page
-    # opens it deliberately.
+    # dev_repo stays OUT of CREATE_WEBUI_FIELDS deliberately: the browser path
+    # is the detached `dev_project_provision` verb (mirror + create as one op),
+    # never a raw relayed create.
     dev_lane: bool = False
     dev_repo: str = ""
 
@@ -446,7 +447,14 @@ class CreateRequest:
                     "`research dev repo add <github-url>`)")
             if not _valid_dev_repo_name(dev_repo):
                 raise ValidationError(f"invalid dev repo name {dev_repo!r}")
-            if not gitea.mirror_present(dev_repo):
+            # dev_repo_preflight is a KWARG-ONLY seam (never a dataclass field,
+            # never in any *_WEBUI_FIELDS — structurally unreachable from a
+            # relayed request): the detached dev-project lane pre-spawn-validates
+            # the full create shape BEFORE the child creates the mirror, so the
+            # mirror-stamp floor alone is deferred there; the child re-runs
+            # from_kwargs with the floor ON after dev_repo_add (TOCTOU-safe).
+            if (kw.get("dev_repo_preflight", True)
+                    and not gitea.mirror_present(dev_repo)):
                 raise ValidationError(
                     f"repo {dev_repo!r} not added yet — run "
                     f"`research dev repo add <github-url>` first")
@@ -1136,6 +1144,60 @@ class DevBoxProvisionRequest:
         return cls(project=box.project, url=url, repo=repo,
                    pat=(pat or "").strip(), name=box.name, agent=box.agent,
                    editor=box.editor)
+
+
+@dataclass(frozen=True)
+class DevProjectProvisionRequest:
+    """The webui dev-workflow create: ONE detached action = mirror the GitHub
+    URL + create the dev project (create's dev step mints the PROJECT
+    consumer's fork — per-consumer forks, no attach leg, no exclusivity).
+    Runs ONLY in the broker's detached dev-lane child (the ~120s migrate never
+    sits on the accept thread) or inline from a direct rscore caller. ``pat``
+    is the per-repo transient secret (repr=False; reaches only gitea's migrate
+    auth_token, never a Result). ``workflow`` is the manifest the dialog was
+    opened from — a BYO dev-flagged workflow creates exactly what its manifest
+    says; a non-dev workflow fails closed in the CreateRequest delegation
+    (dev_repo is rejected outside a dev workflow)."""
+    name: str
+    url: str
+    repo: str                                   # the anchored segment (derived)
+    workflow: str = "dev"
+    pat: str = field(default="", repr=False)
+    egress: str | None = None
+    enable: tuple = ()
+    disable: tuple = ()
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "DevProjectProvisionRequest":
+        url, _owner, repo = _parse_github_repo(kw.get("url"))
+        pat = kw.get("pat")
+        if pat is not None and not isinstance(pat, str):
+            raise ValidationError("pat must be a string")
+        # Str shape-check BEFORE _resolve_workflow: an unhashable relayed value
+        # (list/dict) would TypeError inside the catalog lookup and escape
+        # dispatch as a truncated reply.
+        workflow = kw.get("workflow") or "dev"
+        if not isinstance(workflow, str):
+            raise ValidationError("workflow must be a string")
+        egress = kw.get("egress")
+        if egress is not None and not isinstance(egress, str):
+            raise ValidationError("egress must be a string")
+        enable = _as_tuple(kw.get("enable"))
+        disable = _as_tuple(kw.get("disable"))
+        # Delegate the create-shape validation (name regex, egress enum,
+        # enable/disable tokens, the dind dist floors, the dev-manifest flavor
+        # gate) to the shipped choke point — ONE validator, no hand-rolled
+        # partial copy that drifts. dev_repo_preflight=False skips ONLY the
+        # mirror-stamp floor: at pre-spawn the mirror doesn't exist yet (the
+        # child's dev_repo_add creates it first); the verb re-runs from_kwargs
+        # with the floor ON child-side.
+        cr = CreateRequest.from_kwargs(
+            name=kw.get("name"), workflow=workflow, dev_repo=repo,
+            egress=egress, enable=enable, disable=disable,
+            dev_repo_preflight=False)
+        return cls(name=cr.name, url=url, repo=repo, workflow=workflow,
+                   pat=(pat or "").strip(), egress=egress,
+                   enable=enable, disable=disable)
 
 
 @dataclass
@@ -7112,6 +7174,33 @@ def dev_box_provision(req: "DevBoxProvisionRequest", progress=None) -> dict:  # 
         editor=req.editor, repo=req.repo), progress)
     return {"project": req.project, "repo": req.repo, "box": box.name,
             "container": box.container}
+
+
+def dev_project_provision(req: "DevProjectProvisionRequest", progress=None) -> dict:  # type: ignore[name-defined]
+    """Webui dev-workflow create: mirror + project-create as ONE action (the
+    Workflows page's dev card takes a GitHub URL + optional per-repo PAT). A
+    COMPOSITION of the shipped verbs so every gate and secret discipline is
+    reused, not re-derived: dev_repo_add (mirror-only; resumes gitea
+    require=True — the deliberate-create model; resumable migrate) → create()
+    on the dev-flagged workflow (its dev step mints the PROJECT consumer's
+    fork/token and clones it — per-consumer forks, no attach leg). The
+    CreateRequest is re-derived HERE, with the mirror-stamp floor ON: the
+    stamp exists by ordering now (dev_repo_add just wrote it), and no
+    pre-spawn-validated value crosses into create unchecked (TOCTOU-safe, the
+    preview-vs-apply discipline). Runs in the broker's detached dev-lane
+    child or inline from a direct rscore caller — never on the broker's
+    accept thread. Failure detail streams to the child's full log; the view
+    log gets only run_dev_box's coarse tokens. The reply is secret-free by
+    construction: CreateResult (ssh_password) is NOT forwarded — the lane has
+    no OP_RUNS retention and the webui sidebar JIT-attaches instead."""
+    progress = progress or _NULL_PROGRESS
+    progress.step("repo", "mirroring the repo")
+    dev_repo_add(DevRepoAddRequest.from_kwargs(url=req.url, pat=req.pat))
+    cr = CreateRequest.from_kwargs(
+        name=req.name, workflow=req.workflow, dev_repo=req.repo,
+        egress=req.egress, enable=req.enable, disable=req.disable)
+    create(cr, progress=progress)
+    return {"project": req.name, "repo": req.repo}
 
 
 # ---------------------------------------------------------------------------

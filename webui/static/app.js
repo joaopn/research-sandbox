@@ -2652,13 +2652,23 @@ function mgmtCreateDialog(view, manifest, agents) {
     // same agents + light-path group as the docker box, plus an opt-in box-harness
     // toggle. box_capable is manifest-derived (the broker workflows verb).
     const boxCapable = !!manifest.box_capable;
-    const showInBox = isDocker || boxCapable;
+    // Dev-flagged workflow (dev:true — built-in `dev` or a BYO sibling): the
+    // form is the URL-driven dev variant. It POSTs the detached dev-project
+    // provision (mirror + create as one op), so the light-path clone group +
+    // agents cards are hidden — the dev step owns the repo wiring, and the
+    // dind fleet deploys the default agent dist regardless.
+    const isDev = !!manifest.dev;
+    const showInBox = !isDev && (isDocker || boxCapable);
 
     const nameI = el("input", { type: "text", autocomplete: "off" });
     const egressS = el("select", {}, [
         el("option", { value: "open" }, ["open"]),
         el("option", { value: "locked" }, ["locked"]),
     ]);
+    // Dev preselects locked (matches the flavor's own default; PI decision).
+    // Locked still allows 80/443/DNS — pip/apt/LLM work; gitea rides the
+    // project bridge directly and is egress-mode-independent.
+    if (isDev) egressS.value = "locked";
     // Editor (code-server) is universal + on by default (STAGE_BOX_EXT_UX C).
     // Unchecking sends disable:["code-server"]; checked sends nothing (default-on).
     const editorCb = el("input", { type: "checkbox" });
@@ -2781,11 +2791,40 @@ function mgmtCreateDialog(view, manifest, agents) {
     cloneGroup.style.display = hasClonePreset ? "" : "none";
     cloneCb.onchange = () => { cloneGroup.style.display = cloneCb.checked ? "" : "none"; };
 
+    // Dev variant inputs — its OWN url/PAT fields, NOT the light-path repoI/patI
+    // (different semantics: this URL is mirrored into the shared Gitea and the
+    // project works its consumer FORK; the PAT reaches only Gitea's migrate
+    // config for a private source — never stored by RS, never logged).
+    const devUrlI = el("input", { type: "text", autocomplete: "off",
+                                  placeholder: "https://github.com/owner/repo" });
+    const devPatI = el("input", {
+        type: "password", autocomplete: "off",
+        title: "Optional. Only needed for a private repo: used once by Gitea's " +
+               "mirror config to pull the source. RS stores no copy — sent once " +
+               "with this create and never logged or persisted.",
+    });
+    const devGroup = el("div", { class: "mgmt-docker-group" }, [
+        el("div", { class: "field" }, [el("label", {}, ["GitHub repo (https)"]), devUrlI]),
+        el("div", { class: "field" }, [
+            el("label", { title: devPatI.getAttribute("title") }, ["GitHub PAT (secret)"]),
+            devPatI,
+        ]),
+        el("div", { class: "hint" }, [
+            "The repo is mirrored into the shared Gitea and the project's dev " +
+            "agent works its own fork. A first mirror of a large repo can take " +
+            "a couple of minutes.",
+        ]),
+    ]);
+
     mgmtConfirmThenTail(view, {
         title: "New project",
         tailTitle: "Creating project",
         verb: "create",
         confirmLabel: "Create",
+        // The dev variant runs on the broker's DETACHED dev lane: no OP_RUNS
+        // entry (GET /broker/op/<id> stays "unknown" by design), so it needs
+        // the terminal-first build-log tail, not the checklist tail.
+        tailMode: () => (isDev ? "buildlog" : undefined),
         body: [
             el("div", { class: "field" }, [
                 el("label", {}, ["Workflow"]),
@@ -2796,6 +2835,7 @@ function mgmtCreateDialog(view, manifest, agents) {
                     ? el("div", { class: "hint" }, [manifest.description]) : null,
             ]),
             el("div", { class: "field" }, [el("label", {}, ["Project name"]), nameI]),
+            ...(isDev ? [devGroup] : []),
             el("div", { class: "field" }, [el("label", {}, ["Egress"]), egressS]),
             enableField,
             settingsRegion,
@@ -2805,7 +2845,18 @@ function mgmtCreateDialog(view, manifest, agents) {
             ]),
         ],
         validate: () => {
-            if (!nameI.value.trim()) return "Project name is required.";
+            const n = nameI.value.trim();
+            if (!n) return "Project name is required.";
+            // Mirror rscore's project-name regex: without this a bad name dies
+            // broker-side as the opaque "a valid op_id is required" (the op_id
+            // charset gate precedes from_kwargs on the detached lane).
+            if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(n)) {
+                return "Project name must start with a letter or digit and use " +
+                       "only letters, digits, '-' or '_'.";
+            }
+            if (isDev && !devUrlI.value.trim().startsWith("https://github.com/")) {
+                return "A dev project needs a GitHub repo URL (https://github.com/owner/repo).";
+            }
             // Mirror from_kwargs: an in-box repo needs a ref (pin the clone).
             if (showInBox && cloneCb.checked && repoI.value.trim() && !refI.value.trim()) {
                 return "A workflow repo requires a ref.";
@@ -2813,6 +2864,29 @@ function mgmtCreateDialog(view, manifest, agents) {
             return null;
         },
         request: () => {
+            if (isDev) {
+                // URL-driven dev-project provision (mirror + create as one
+                // detached op) — a different route from /broker/project.
+                // `workflow` threads the manifest this dialog was opened from
+                // (a BYO dev workflow creates what ITS manifest says); `pat`
+                // rides this POST body only (never logged, never OP_RUNS; the
+                // broker re-filters + shape-validates pre-spawn). Lockstep:
+                // every key here is in DEV_PROJECT_WEBUI_FIELDS.
+                const payload = {
+                    name: nameI.value.trim(),
+                    workflow: workflow,
+                    url: devUrlI.value.trim(),
+                    egress: egressS.value,
+                };
+                const pat = devPatI.value.trim();
+                if (pat) payload.pat = pat;
+                if (!editorCb.checked) payload.disable = ["code-server"];
+                if (readerCb.checked) payload.enable = ["reader"];
+                return fetch("/broker/dev/project", {
+                    method: "POST", headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload),
+                });
+            }
             // Lockstep: every key below is in CREATE_WEBUI_FIELDS. enable rides
             // only for a workflow with a worker layer; the in-box fields (agents,
             // repo/ref/setup/PAT) for a docker box OR sandbox-dind, and only when

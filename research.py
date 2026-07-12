@@ -208,10 +208,11 @@ def cmd_broker_run_review(args: argparse.Namespace) -> None:
 
 
 def cmd_broker_run_dev_box(args: argparse.Namespace) -> None:
-    """Hidden: the detached dev-box provision child (one per box, parallel).
-    Spawned by the daemon via _spawn_dev_box_child; never an operator command.
-    The args JSON arrives on STDIN, never argv — it carries the per-repo PAT."""
-    broker.run_dev_box(args.op_id)
+    """Hidden: the detached dev-lane provision child (one per op, parallel —
+    dev box OR dev project, selected by the verb argv). Spawned by the daemon
+    via _spawn_dev_box_child; never an operator command. The args JSON
+    arrives on STDIN, never argv — it carries the per-repo PAT."""
+    broker.run_dev_box(args.op_id, args.verb)
 
 
 def _build(reqcls, **kw):
@@ -1841,8 +1842,9 @@ def build_parser() -> argparse.ArgumentParser:
     rr.add_argument("op_id")
     rr.add_argument("args_json")
     rr.set_defaults(func=cmd_broker_run_review)
-    rdb = brk_sub.add_parser("__run-dev-box", help=argparse.SUPPRESS)  # detached dev-box child
+    rdb = brk_sub.add_parser("__run-dev-box", help=argparse.SUPPRESS)  # detached dev-lane child
     rdb.add_argument("op_id")                     # args JSON rides stdin (PAT)
+    rdb.add_argument("verb")                      # dev_box_provision | dev_project_provision
     rdb.set_defaults(func=cmd_broker_run_dev_box)
 
     img = sub.add_parser("images", help="image version pins (manifest + freshness)")

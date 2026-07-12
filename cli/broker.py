@@ -568,15 +568,25 @@ DEV_TARGET_WEBUI_FIELDS = frozenset({"repo"})
 # username, both shape-validated in from_kwargs and re-gated against the
 # repo's LIVE forks in the verb — neither is host-shaped.
 DEV_ACTIVE_FORK_WEBUI_FIELDS = frozenset({"repo", "user"})
-# The dev-box provision lane's input boundary (webui-first B). Consumed by the
-# dispatch dev-box branch + _verb_dev_box_provision, NOT by any VERBS entry —
-# dev_box_provision lives in DEV_BOX_DISPATCH only. None is host-shaped:
-# url/name/agent/editor act inside gitea / the inner box; `pat` is a SECRET
+# The dev lane's input boundaries (webui-first B; the lane keeps its dev-box
+# mechanism names while carrying BOTH dev provision verbs — see
+# _DEV_LANE_VERBS). Consumed by the dispatch dev-lane branch + the _verb_*
+# fns, NOT by any VERBS entry — the verbs live in DEV_BOX_DISPATCH only. None
+# is host-shaped: url/name/agent/editor act inside gitea / the inner box;
+# workflow/egress/enable/disable are the already-relayable create policy
+# fields (a subset of CREATE_WEBUI_FIELDS' vocabulary); `pat` is a SECRET
 # that reaches only gitea's migrate auth_token (per-repo transient — RS stores
-# no PAT): repr=False on the request, off every Result, never argv (child args
-# ride stdin), never a durable sink.
+# no PAT): repr=False on the requests, off every Result, never argv (child
+# args ride stdin), never a durable sink.
 DEV_BOX_WEBUI_FIELDS = frozenset({"project", "url", "pat", "name", "agent",
                                   "editor"})
+# The dev-project provision boundary (the Workflows page's dev card): minimal
+# and deliberate. Adding a field here is a boundary edit — never open a
+# path/host-shaped one. `workflow` threads the manifest the dialog was opened
+# from (a BYO dev-flagged workflow creates what ITS manifest says); fail-closed
+# in from_kwargs (dev_repo is rejected outside a dev-flagged workflow).
+DEV_PROJECT_WEBUI_FIELDS = frozenset({"name", "workflow", "url", "pat",
+                                      "egress", "enable", "disable"})
 # The gitea-password verb's input boundary: ONE field, a SECRET (repr=False on
 # the request, off the Result, never a durable sink). The step-up `proof` is
 # consumed in dispatch and never reaches this filter.
@@ -965,20 +975,22 @@ def run_review(op_id: str, args_json: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Dev-box provision lane (STAGE_DEV_GITEA webui-first B)
+# Dev provision lane (STAGE_DEV_GITEA webui-first B; dev-project create added)
 #
-# The review lane's parallel sibling for the box window's URL-driven dev box:
-# mirror+fork+attach+create as one detached child (`broker __run-dev-box`).
-# The ~120s GitHub migrate must never sit on the serial accept thread, so
-# dev_box_provision lives in its OWN table — absent from VERBS (the inline
-# path structurally cannot reach it), absent from BUILD_DISPATCH (that lane
-# serialises on the GLOBAL build.lock, which run_build's finally releases
-# unconditionally), absent from REVIEW_DISPATCH (that branch filters review
-# fields). Per-op locks give build_alive its liveness signal, exactly like
-# reviews. ONE deliberate deviation from the review-lane mirror: the child
-# args carry the per-repo GitHub PAT, so they ride the child's STDIN — never
-# argv, which is world-readable in /proc/<pid>/cmdline for the child's
-# lifetime.
+# The review lane's parallel sibling for the URL-driven dev surfaces: the box
+# window's dev box (mirror+box-create) AND the Workflows page's dev project
+# (mirror+project-create), each one detached child (`broker __run-dev-box`).
+# A GitHub migrate can block ~120s and must never sit on the serial accept
+# thread, so both verbs live in their OWN table — absent from VERBS (the
+# inline path structurally cannot reach them), absent from BUILD_DISPATCH
+# (that lane serialises on the GLOBAL build.lock, which run_build's finally
+# releases unconditionally), absent from REVIEW_DISPATCH (that branch filters
+# review fields). Per-op locks give build_alive its liveness signal, exactly
+# like reviews. ONE deliberate deviation from the review-lane mirror: the
+# child args carry the per-repo GitHub PAT, so they ride the child's STDIN —
+# never argv, which is world-readable in /proc/<pid>/cmdline for the child's
+# lifetime. (The lane predates the second verb; it keeps its dev-box
+# mechanism names — table, locks, child subcommand — by deliberate choice.)
 # ---------------------------------------------------------------------------
 
 
@@ -988,10 +1000,29 @@ def _verb_dev_box_provision(args: dict, progress=None) -> dict:
     return rscore.dev_box_provision(req, progress)
 
 
-# The child-only vocabulary — NOT in VERBS / BUILD_DISPATCH / REVIEW_DISPATCH.
-DEV_BOX_DISPATCH = {
-    "dev_box_provision": _verb_dev_box_provision,
+def _verb_dev_project_provision(args: dict, progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in DEV_PROJECT_WEBUI_FIELDS}
+    req = rscore.DevProjectProvisionRequest.from_kwargs(**safe)  # may raise ValidationError
+    return rscore.dev_project_provision(req, progress)
+
+
+# The lane's SINGLE source of truth: verb → (webui field allowlist, request
+# class for the dispatch-side PRE-SPAWN shape validation, verb fn the child
+# executes). DEV_BOX_DISPATCH is DERIVED below so the two key sets cannot
+# drift — a verb added here is automatically dispatchable, and there is no
+# hand-maintained second table to forget (a mismatch would KeyError in
+# dispatch and escape as a truncated reply).
+_DEV_LANE_VERBS = {
+    "dev_box_provision": (
+        DEV_BOX_WEBUI_FIELDS, rscore.DevBoxProvisionRequest,
+        _verb_dev_box_provision),
+    "dev_project_provision": (
+        DEV_PROJECT_WEBUI_FIELDS, rscore.DevProjectProvisionRequest,
+        _verb_dev_project_provision),
 }
+
+# The child-only vocabulary — NOT in VERBS / BUILD_DISPATCH / REVIEW_DISPATCH.
+DEV_BOX_DISPATCH = {v: spec[2] for v, spec in _DEV_LANE_VERBS.items()}
 
 
 def _dev_box_lock_path(op_id: str) -> Path:
@@ -1019,21 +1050,24 @@ def _dev_box_lock_alive(op_id: str) -> bool:
     return isinstance(pid, int) and _alive(pid)
 
 
-def _spawn_dev_box_child(op_id: str, args: dict) -> int:
-    """Spawn the DETACHED dev-box child (`broker __run-dev-box`). Mirrors
-    _spawn_review_child EXCEPT the args JSON rides the child's STDIN, never
-    argv: the args carry the per-repo GitHub PAT, and an argv value is
-    world-readable in /proc/<pid>/cmdline for the child's lifetime. The
-    write+close is BrokenPipe-tolerant: a child dying at exec must not raise
-    on the serial accept thread (an uncaught error would escape dispatch into
-    socketserver and truncate the client reply) — the op then degrades through
-    the never-alive per-op lock into the tail's wedge-escape."""
+def _spawn_dev_box_child(op_id: str, verb: str, args: dict) -> int:
+    """Spawn the DETACHED dev-lane child (`broker __run-dev-box <op_id>
+    <verb>`). Mirrors _spawn_review_child EXCEPT the args JSON rides the
+    child's STDIN, never argv: the args carry the per-repo GitHub PAT, and an
+    argv value is world-readable in /proc/<pid>/cmdline for the child's
+    lifetime. The VERB NAME does ride argv — it is fixed lane vocabulary, not
+    a secret, and the child needs it before it can trust anything on stdin.
+    The write+close is BrokenPipe-tolerant: a child dying at exec must not
+    raise on the serial accept thread (an uncaught error would escape dispatch
+    into socketserver and truncate the client reply) — the op then degrades
+    through the never-alive per-op lock into the tail's wedge-escape."""
     BROKER_DIR.mkdir(parents=True, exist_ok=True)
     research_py = rscore.SCRIPT_DIR / "research.py"
     log = open(BROKER_LOG, "a")
     try:
         proc = subprocess.Popen(
-            [sys.executable, str(research_py), "broker", "__run-dev-box", op_id],
+            [sys.executable, str(research_py), "broker", "__run-dev-box",
+             op_id, verb],
             stdin=subprocess.PIPE, stdout=log, stderr=log,
             start_new_session=True, cwd=str(rscore.SCRIPT_DIR))
     finally:
@@ -1045,20 +1079,26 @@ def _spawn_dev_box_child(op_id: str, args: dict) -> int:
     return proc.pid
 
 
-def run_dev_box(op_id: str) -> None:
-    """The DETACHED dev-box child (invoked by `broker __run-dev-box`). Mirrors
-    run_review: owns the op-log, points fd 1/2 at the HOST-ONLY full log,
-    calls the verb DIRECTLY from DEV_BOX_DISPATCH (never dispatch() —
-    re-entry), writes a terminal done/fail to the mounted view-log, and
-    unlinks ITS OWN dev-box lock in finally (never BUILD_LOCK). Terminal-
-    first: done/fail lands before the lock release. The args JSON arrives on
-    STDIN (never argv — it carries the PAT; see _spawn_dev_box_child).
-    View-log fail reasons are COARSE tokens; the ValidationError arm
-    additionally prints str(e) to the full log FIRST — a bad PAT or a
-    private-without-PAT source surfaces as GiteaError→ValidationError, and
-    without that print it would be undiagnosable from the browser AND the
-    full log. Safe by construction: GiteaError carries method/path/status
-    only, never a body or the PAT."""
+def run_dev_box(op_id: str, verb: str) -> None:
+    """The DETACHED dev-lane child (invoked by `broker __run-dev-box <op_id>
+    <verb>`). Mirrors run_review: owns the op-log, points fd 1/2 at the
+    HOST-ONLY full log, calls the verb DIRECTLY from DEV_BOX_DISPATCH (never
+    dispatch() — re-entry), writes a terminal done/fail to the mounted
+    view-log, and unlinks ITS OWN dev-box lock in finally (never BUILD_LOCK).
+    Terminal-first: done/fail lands before the lock release. The args JSON
+    arrives on STDIN (never argv — it carries the PAT; see
+    _spawn_dev_box_child); the verb rides argv (fixed lane vocabulary). An
+    unknown verb releases the lock and returns BEFORE make_oplog — the parent
+    only spawns known verbs, and a bogus one must write no op files
+    (gate-before-sink). View-log fail reasons are COARSE tokens; the
+    ValidationError arm additionally prints str(e) to the full log FIRST — a
+    bad PAT or a private-without-PAT source surfaces as
+    GiteaError→ValidationError, and without that print it would be
+    undiagnosable from the browser AND the full log. Safe by construction:
+    GiteaError carries method/path/status only, never a body or the PAT."""
+    if verb not in DEV_BOX_DISPATCH:
+        _release_dev_box_lock(op_id)
+        return
     try:
         args = json.loads(sys.stdin.read())
     except (ValueError, OSError):
@@ -1066,7 +1106,7 @@ def run_dev_box(op_id: str) -> None:
     if not isinstance(args, dict):
         args = {}
     try:
-        op = make_oplog(op_id, "dev_box_provision", args)
+        op = make_oplog(op_id, verb, args)
     except (ValueError, OSError):
         _release_dev_box_lock(op_id)
         return
@@ -1075,7 +1115,7 @@ def run_dev_box(op_id: str) -> None:
         os.dup2(op.full.fileno(), 2)
         sys.stdout = os.fdopen(1, "w", buffering=1, closefd=False)
         sys.stderr = os.fdopen(2, "w", buffering=1, closefd=False)
-        DEV_BOX_DISPATCH["dev_box_provision"](args, op.progress)
+        DEV_BOX_DISPATCH[verb](args, op.progress)
         op.progress.done()
     except rscore.ValidationError as e:
         print(f"validation: {e}")                 # full log — status-only, PAT-free
@@ -1135,8 +1175,9 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
     tests pass None (the branch then gates + validates but never spawns).
     `spawn_review(op_id, args) → child pid` is the review lane's analog
     (daemon injects `_spawn_review_child`; tests pass None likewise), and
-    `spawn_dev_box(op_id, args) → child pid` the dev-box lane's (daemon
-    injects `_spawn_dev_box_child`).
+    `spawn_dev_box(op_id, verb, args) → child pid` the dev lane's (daemon
+    injects `_spawn_dev_box_child`; the lane carries both dev provision
+    verbs, so the verb threads through to the child's argv).
     """
     def _audited(principal, outcome, reply):
         if audit is not None:
@@ -1243,14 +1284,16 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
         return _audited(principal, "ok",
                         {"ok": True, "result": {"op_id": op_id, "started": True}})
 
-    # Dev-box provision lane (webui-first B) — the SOLE entry for
-    # dev_box_provision (DEV_BOX_DISPATCH is absent from every other table).
-    # Mirrors the review branch: token → op_id → pre-spawn validation → spawn →
-    # the parent writes a PER-OP lock only AFTER a successful spawn
-    # (gate-before-sink). NO lock check — provisions run N-at-a-time; a
-    # same-repo double-submit is the documented migrate-resume quirk (the
-    # duplicate-review posture). The spawn passes the FILTERED args over the
-    # child's stdin (they carry the PAT — see _spawn_dev_box_child).
+    # Dev provision lane (webui-first B) — the SOLE entry for the
+    # _DEV_LANE_VERBS vocabulary (dev_box_provision + dev_project_provision;
+    # DEV_BOX_DISPATCH is derived from the same map and absent from every
+    # other table). Mirrors the review branch: token → op_id → per-verb
+    # pre-spawn validation → spawn → the parent writes a PER-OP lock only
+    # AFTER a successful spawn (gate-before-sink). NO lock check — provisions
+    # run N-at-a-time; a same-repo double-submit is the documented
+    # migrate-resume quirk (the duplicate-review posture). The spawn passes
+    # the FILTERED args over the child's stdin (they carry the PAT — see
+    # _spawn_dev_box_child); the verb rides the child's argv.
     if verbs is None and verb in DEV_BOX_DISPATCH:
         if not isinstance(args, dict):
             return _err("bad_request", "args must be a JSON object")
@@ -1262,13 +1305,14 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
         if not isinstance(op_id, str) or not _OP_ID_RE.match(op_id):
             return _audited(principal, "bad_request",
                             _err("bad_request", "a valid op_id is required"))
-        # Pre-spawn validation: shape via from_kwargs + one cheap file gate —
-        # a bad request must NOT spawn a child (the client already holds
-        # started:true and would never see a child-side failure). Everything
-        # docker-shaped stays child-side.
-        safe = {k: v for k, v in args.items() if k in DEV_BOX_WEBUI_FIELDS}
+        # Pre-spawn validation: per-verb shape via from_kwargs + one cheap
+        # file gate — a bad request must NOT spawn a child (the client already
+        # holds started:true and would never see a child-side failure).
+        # Everything docker-shaped stays child-side.
+        fields, req_cls, _fn = _DEV_LANE_VERBS[verb]
+        safe = {k: v for k, v in args.items() if k in fields}
         try:
-            rscore.DevBoxProvisionRequest.from_kwargs(**safe)
+            req_cls.from_kwargs(**safe)
         except rscore.ValidationError as e:
             return _audited(principal, "validation",
                             _err("validation", str(e)))
@@ -1281,7 +1325,7 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
         if spawn_dev_box is None:           # tests: gate + validate, never spawn
             return _audited(principal, "ok",
                             {"ok": True, "result": {"op_id": op_id, "started": True}})
-        pid = spawn_dev_box(op_id, safe)         # detached child, args via stdin
+        pid = spawn_dev_box(op_id, verb, safe)   # detached child, args via stdin
         _write_dev_box_lock(op_id, pid)          # PARENT writes, post-spawn only
         return _audited(principal, "ok",
                         {"ok": True, "result": {"op_id": op_id, "started": True}})
