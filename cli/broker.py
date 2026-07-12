@@ -564,6 +564,10 @@ REVIEW_WEBUI_FIELDS = frozenset({"repo", "pr"})
 DEV_ATTACH_WEBUI_FIELDS = frozenset({"project", "repo"})
 DEV_DETACH_WEBUI_FIELDS = frozenset({"project", "repo"})
 DEV_TARGET_WEBUI_FIELDS = frozenset({"repo"})
+# The active-fork selector (per-consumer forks): a repo name + a gitea agent
+# username, both shape-validated in from_kwargs and re-gated against the
+# repo's LIVE forks in the verb — neither is host-shaped.
+DEV_ACTIVE_FORK_WEBUI_FIELDS = frozenset({"repo", "user"})
 # The dev-box provision lane's input boundary (webui-first B). Consumed by the
 # dispatch dev-box branch + _verb_dev_box_provision, NOT by any VERBS entry —
 # dev_box_provision lives in DEV_BOX_DISPATCH only. None is host-shaped:
@@ -606,6 +610,15 @@ def _verb_dev_sync(args: dict, _progress=None) -> dict:
     safe = {k: v for k, v in args.items() if k in DEV_TARGET_WEBUI_FIELDS}
     req = rscore.DevSyncRequest.from_kwargs(**safe)      # may raise ValidationError
     return dataclasses.asdict(rscore.dev_sync(req))
+
+
+def _verb_dev_set_active_fork(args: dict, _progress=None) -> dict:
+    # Management's global per-repo active-fork selector (the ≥2-live-forks
+    # edge). A user-initiated WRITE (dev_sync posture: resumes an enabled
+    # gitea, never creates); re-stages the wiring on attached projects.
+    safe = {k: v for k, v in args.items() if k in DEV_ACTIVE_FORK_WEBUI_FIELDS}
+    req = rscore.DevSetActiveForkRequest.from_kwargs(**safe)  # may raise ValidationError
+    return dataclasses.asdict(rscore.dev_set_active_fork(req))
 
 
 def _verb_dev_status(_args: dict, _progress=None) -> dict:
@@ -667,6 +680,7 @@ VERBS = {
     "dev_status": _verb_dev_status,
     "dev_gitea_start": _verb_dev_gitea_start,
     "dev_passwd": _verb_dev_passwd,
+    "dev_set_active_fork": _verb_dev_set_active_fork,
 }
 
 # Verbs requiring step-up re-auth: a FRESH login proof (derived client-side

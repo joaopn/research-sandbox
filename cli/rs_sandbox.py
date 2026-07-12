@@ -335,35 +335,41 @@ def _stage_box_workspace(name: str, preset: dict, mcps: list[str],
 # --- run / teardown ---------------------------------------------------------
 
 
-def _dev_run_info(repo: str) -> dict:
+def _dev_run_info(repo: str, gitea_user: str) -> dict:
     """Resolve the CURRENT gitea wiring for a dev box run: the host-staged
-    non-secret dev-gitea.json + the separately-staged token file. Read at EVERY
-    run/re-run, so a recreate/restart always picks up the current gitea IP (the
-    stale-IP heal is exactly `rs-sandbox restart` after the host re-stages)."""
+    non-secret dev-gitea.json (the gitea IP) + the BOX's OWN consumer identity
+    (per-consumer forks: ``gitea_user`` from the box's entry, minted host-side
+    at box add; its token staged as ``~/.dev-tokens/<user>.token``). Read at
+    EVERY run/re-run, so a recreate/restart always picks up the current gitea
+    IP (the stale-IP heal is exactly `rs-sandbox restart` after the host
+    re-stages)."""
+    if not gitea_user:
+        die("this dev box carries no gitea identity (pre-fork-model entry); "
+            "discard it and re-add the box")
     try:
         data = json.loads(DEV_GITEA_JSON.read_text())
     except (OSError, json.JSONDecodeError):
         die("no dev wiring staged (.orchestrator/dev-gitea.json missing or invalid); "
-            "attach a repo first: research dev attach <project> --repo <repo>")
+            "re-add the box (host-side box add stages the wiring)")
     repos = {r.get("repo"): r for r in (data.get("repos") or [])
              if isinstance(r, dict) and r.get("repo")}
     if repo not in repos:
-        die(f"repo {repo!r} is not attached to this project "
-            f"(attached: {sorted(repos) or 'none'}); run "
-            f"`research dev attach <project> --repo {repo}` first")
+        die(f"repo {repo!r} carries no staged wiring for this project "
+            f"(staged: {sorted(repos) or 'none'}); re-add the box")
     gitea_ip = (data.get("gitea_ip") or "").strip()
     if not gitea_ip:
-        die("staged dev wiring carries no gitea_ip; re-run `research dev attach`")
-    token_path = DEV_TOKENS_DIR / f"agent-{repo}.token"
+        die("staged dev wiring carries no gitea_ip; restart the project or "
+            "re-add the box")
+    token_path = DEV_TOKENS_DIR / f"{gitea_user}.token"
     try:
         token = token_path.read_text().strip()
     except OSError:
         token = ""
     if not token:
-        die(f"agent token missing at {token_path}; re-run `research dev attach` "
-            f"(it re-stages the token)")
+        die(f"consumer token missing at {token_path}; restart the project "
+            f"(the host re-stages consumer tokens) or re-add the box")
     return {"gitea_ip": gitea_ip, "repo": repo, "token": token,
-            "user": repos[repo].get("user") or f"agent-{repo}"}
+            "user": gitea_user}
 
 
 def _ensure_dev_bridge(name: str, subnet: str) -> str:
@@ -533,7 +539,8 @@ def _rerun_box(name: str, entry: dict) -> None:
              clone_repo=(entry.get("repo") or "") if not is_dev else "",
              clone_ref=entry.get("ref") or "",
              clone_setup=entry.get("setup") or "",
-             dev=_dev_run_info(entry["repo"]) if is_dev else None,
+             dev=(_dev_run_info(entry["repo"], entry.get("gitea_user") or "")
+                  if is_dev else None),
              dev_subnet=entry.get("dev_subnet") or "")
 
 
@@ -571,15 +578,23 @@ def cmd_create(args: argparse.Namespace) -> None:
     dev_info: dict | None = None
     if is_dev:
         if not repo:
-            die(f"the {args.preset!r} preset requires --repo <name> (a repo "
-                f"attached via `research dev attach <project> --repo <repo>`)")
+            die(f"the {args.preset!r} preset requires --repo <name> (an added "
+                f"dev repo)")
         if ref or setup:
             die("--ref/--setup are not valid for a dev box (the fork's default "
                 "branch is checked out; setup runs are the agent's own work)")
         if mcps:
             die("--mcps is not valid for a dev box (its dedicated bridge has no "
                 "path to mcp-proxy)")
-        dev_info = _dev_run_info(repo)   # dies with the attach remedy if unstaged
+        # Per-consumer forks: the box's gitea identity is minted HOST-side
+        # (research/webui box add) before this runs and arrives as
+        # --gitea-user; a bare in-supervisor `rs-sandbox create` cannot mint
+        # it (the gitea admin token is host-only).
+        if not (args.gitea_user or "").strip():
+            die("a dev box is created via `research project box add` (or the "
+                "webui box window), which mints its gitea identity — "
+                "--gitea-user is required here")
+        dev_info = _dev_run_info(repo, args.gitea_user.strip())
     elif (repo or setup) and not is_clone:
         die(f"--repo/--setup are only valid for a clone (BYO) preset; "
             f"preset {args.preset!r} does not clone")
@@ -611,7 +626,8 @@ def cmd_create(args: argparse.Namespace) -> None:
     if is_clone:
         entry.update({"repo": repo, "ref": ref, "setup": setup})
     if is_dev:
-        entry.update({"dev": True, "repo": repo, "dev_subnet": dev_subnet})
+        entry.update({"dev": True, "repo": repo, "dev_subnet": dev_subnet,
+                      "gitea_user": args.gitea_user.strip()})
     entries[name] = entry
     save(entries)
     _run_box(name, ip, browser=browser, agent=agent, editor=editor,
@@ -657,7 +673,7 @@ def cmd_start(args: argparse.Namespace) -> None:
     cname = box_container(args.name)
     exists = _docker("container", "inspect", cname).returncode == 0
     if exists and entry.get("dev"):
-        dev = _dev_run_info(entry["repo"])   # dies with the attach remedy if unstaged
+        dev = _dev_run_info(entry["repo"], entry.get("gitea_user") or "")
         ins = _docker("inspect", "-f", "{{json .HostConfig.ExtraHosts}}", cname)
         # Quoted JSON form — a bare substring would false-match a prefix ip.
         if f"\"rs-gitea:{dev['gitea_ip']}\"" not in (ins.stdout or ""):
@@ -757,6 +773,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="(byo preset) git ref to check out")
     c.add_argument("--setup", default="",
                    help="(byo preset) setup command to run in the clone")
+    c.add_argument("--gitea-user", default="", dest="gitea_user",
+                   help="(dev preset) the box's gitea consumer username, minted "
+                        "host-side by box add (per-consumer forks)")
     c.set_defaults(func=cmd_create)
 
     lst = sub.add_parser("list", help="list sandboxes (boxes + baked)")

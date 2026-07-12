@@ -1870,9 +1870,37 @@ function renderDevFetchScreen(view, body, result) {
             + `${prs.length} open PR${prs.length === 1 ? "" : "s"} · `
             + `${branches.length} branch${branches.length === 1 ? "" : "es"}`
             + (r.mirror_synced_at ? ` · synced ${r.mirror_synced_at}` : "");
+        // Active-fork control (per-consumer forks): a plain badge with one
+        // live fork; a dropdown at ≥2 — the Management-steered GLOBAL
+        // selector (PR list, rs-fetch and reviews all follow it).
+        const forks = Array.isArray(r.forks) ? r.forks : [];
+        const live = forks.filter((f) => f && !f.archived && f.user);
+        let forkEl = null;
+        if (live.length >= 2) {
+            forkEl = el("select", { class: "dev-fork-select" },
+                live.map((f) => {
+                    const o = el("option", { value: f.user }, [f.user]);
+                    if (f.user === r.active) o.selected = true;
+                    return o;
+                }));
+            forkEl.onchange = async () => {
+                forkEl.disabled = true;
+                try {
+                    await fetch("/broker/dev/active-fork", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ repo: r.repo, user: forkEl.value }),
+                    });
+                } catch (e) { /* re-render reports the live state */ }
+                renderDevFetchTab(view, body);
+            };
+        } else if (r.active) {
+            forkEl = el("span", { class: "dev-repo-meta" }, [`fork: ${r.active}`]);
+        }
         const rows = [el("div", { class: "dev-repo-head" }, [
             el("span", { class: "dev-repo-name" }, [r.repo]),
             el("span", { class: "dev-repo-meta" }, [meta]),
+            ...(forkEl ? [forkEl] : []),
             sync,
         ])];
         const reviews = (r.reviews && typeof r.reviews === "object") ? r.reviews : {};

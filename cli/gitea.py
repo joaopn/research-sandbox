@@ -23,9 +23,11 @@ never request or response bodies.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -44,7 +46,16 @@ DEV_DIR = Path.home() / ".research-sandbox" / "dev"
 ADMIN_TOKEN_PATH = DEV_DIR / "admin.token"
 OPERATOR_TOKEN_PATH = DEV_DIR / "operator.token"
 ATTACHMENTS_PATH = DEV_DIR / "attachments.json"
-TOKENS_DIR = DEV_DIR / "tokens"                 # per-repo agent tokens, 0700 dir
+TOKENS_DIR = DEV_DIR / "tokens"                 # per-CONSUMER agent tokens, 0700 dir
+# Mirror stamps: one empty file per added mirror — the host-side "repo is
+# added" floor (from_kwargs / attach / the box dev gate). Replaces the old
+# token-file floor: `dev repo add` is mirror-only now and mints no tokens.
+MIRRORS_DIR = DEV_DIR / "mirrors"
+# The global per-repo ACTIVE fork map {repo: agent username}. Steers the
+# Development-page reads, the reviewer's fork resolution, and the staged
+# dev-gitea.json `user` rows. Absent entry = derived (single live fork, else
+# the most recently created live fork).
+ACTIVE_FORKS_PATH = DEV_DIR / "active-forks.json"
 
 # Reviewer surface (STAGE_DEV_GITEA S4). The verdict ledger is HOST-ONLY state:
 # never bind-mounted, never written into gitea or any container (invariant 4 —
@@ -110,16 +121,52 @@ class GiteaError(Exception):
 
 
 # --- paths / identity -------------------------------------------------------
+#
+# PER-CONSUMER identities: a consumer is a project's own dev agent
+# ("<project>") or one dev box ("<project>.<box>"). Each consumer gets its OWN
+# gitea user + fork + token — simultaneous consumers on one repo are legal
+# (each works its own fork); retirement ARCHIVES the fork (history kept) and
+# the user stays inert forever (deleting a gitea user PURGES its repos).
 
-def agent_user_for(repo: str) -> str:
-    """The per-repo agent gitea username. `repo` is already the validated,
-    path-anchored segment (rscore.DevRepoAddRequest.from_kwargs) — one choke
-    point, so no re-validation here."""
-    return f"{AGENT_USER_PREFIX}{repo}"
+# Gitea's username length cap. The '.' consumer separator is legal in gitea's
+# AlphaDashDot username charset but ILLEGAL in both the project- and box-name
+# charsets — so '<project>.<box>' can never collide with a plain project's
+# consumer string (project 'a_b' + box 'c' vs a project named 'a_b_c').
+GITEA_USERNAME_MAX = 40
 
 
-def agent_token_path(repo: str) -> Path:
-    return TOKENS_DIR / f"{AGENT_USER_PREFIX}{repo}.token"
+def consumer_for(project: str, box: str | None = None) -> str:
+    """The consumer string. Inputs are already validated names (project regex /
+    box regex choke points); the '.' join is the only added character."""
+    return f"{project}.{box}" if box else project
+
+
+def agent_username(consumer: str) -> str:
+    """Gitea username for a consumer: 'agent-<consumer>', capped at gitea's
+    limit. The cap applies to the FULL prefixed name; an over-long name keeps
+    its head and appends '-XX' (2 hex chars of a stable hash of the full
+    consumer string) so truncation-collided names stay distinct in practice."""
+    name = f"{AGENT_USER_PREFIX}{consumer}"
+    if len(name) <= GITEA_USERNAME_MAX:
+        return name
+    tail = hashlib.sha256(consumer.encode()).hexdigest()[:2]
+    return f"{name[:GITEA_USERNAME_MAX - 3]}-{tail}"
+
+
+def consumer_token_path(user: str) -> Path:
+    """Host token file for a consumer's gitea user (the file name IS the
+    username, already prefix+capped by agent_username)."""
+    return TOKENS_DIR / f"{user}.token"
+
+
+def mirror_stamp_path(repo: str) -> Path:
+    return MIRRORS_DIR / repo
+
+
+def mirror_present(repo: str) -> bool:
+    """The 'repo is added' floor — a pure host-file check (no gitea call), so
+    from_kwargs and the box gate can run it pre-side-effect."""
+    return mirror_stamp_path(repo).is_file()
 
 
 def api_base(host_port: str) -> str:
@@ -402,18 +449,17 @@ def _mint_token(username: str, scopes: str) -> str:
     return tok
 
 
-def mint_or_rotate_agent_token(repo: str) -> str:
-    """Return the agent's gitea token for <repo>, minting it (0600) if absent.
-    Mint-if-absent: on a re-add resume the file already exists, so the token is
-    kept — a rotation happens only after delete_repo_set removed the file
-    (decision 8: never rotate at wire/attach). The secret is written to a file,
-    NOT returned into any result/report."""
-    path = agent_token_path(repo)
+def mint_or_rotate_token(user: str) -> str:
+    """Return a CONSUMER's gitea token, minting it (0600) if absent. The token
+    is USER-scoped: a project consumer reuses one token across all its attached
+    repos. Mint-if-absent (never rotate at wire/attach); the secret is written
+    to a file, NOT returned into any result/report."""
+    path = consumer_token_path(user)
     if path.is_file():
         val = path.read_text().strip()
         if val:
             return val
-    tok = _mint_token(agent_user_for(repo), "write:repository")
+    tok = _mint_token(user, "write:repository")
     _write_secret(path, tok)
     return tok
 
@@ -427,32 +473,92 @@ def read_admin_token() -> str:
 # --- repo lifecycle (composed sequences) ------------------------------------
 
 def add_repo(host_port: str, url: str, repo: str, pat: str | None = None) -> None:
-    """The resumable mirror→user→fork→token→grants sequence. Every stage is
-    exists-checked, so a re-run after a mid-migrate timeout heals the state.
-    ``pat`` is the caller-supplied per-repo GitHub token (private source =
-    bool(pat)); it stays in memory for this call only — RS stores no PAT."""
-    import secrets as _secrets
+    """MIRROR-ONLY now: migrate + the host mirror-stamp (the 'added' floor).
+    Consumer identities (user/fork/token) are minted per consumer at the point
+    that needs an agent — provision_consumer, called by the dev-workflow create,
+    the box dev path, and an explicit dev attach. Resumable: migrate is
+    exists-checked upstream; re-stamping is a no-op. ``pat`` is the per-repo
+    GitHub token (private source = bool(pat)); in memory for this call only."""
     client = GiteaClient(api_base(host_port), read_admin_token())
     client.migrate_mirror(url, repo, pat)
-    agent = agent_user_for(repo)
-    client.create_user(agent, _secrets.token_urlsafe(24))
-    client.grant_read(ADMIN_USER, repo, agent)          # agent reads the private mirror
-    client.fork_repo(ADMIN_USER, repo, agent)           # fork into the agent namespace
-    client.grant_read(agent, repo, OPERATOR_USER)        # operator reads the fork (fetch)
-    mint_or_rotate_agent_token(repo)                     # writes tokens/agent-<repo>.token
+    MIRRORS_DIR.mkdir(parents=True, exist_ok=True)
+    mirror_stamp_path(repo).write_text("")
+
+
+def provision_consumer(host_port: str, repo: str, user: str) -> None:
+    """Create-or-reuse one consumer's identity for one repo: gitea user +
+    mirror read-grant + fork into the consumer namespace + operator read-grant
+    on the fork (the universal-fetch valve) + a user-scoped token file. Every
+    stage is exists-checked/idempotent (the add-repo resume discipline)."""
+    import secrets as _secrets
+    client = GiteaClient(api_base(host_port), read_admin_token())
+    client.create_user(user, _secrets.token_urlsafe(24))
+    client.grant_read(ADMIN_USER, repo, user)     # consumer reads the private mirror
+    client.fork_repo(ADMIN_USER, repo, user)      # fork into the consumer namespace
+    client.grant_read(user, repo, OPERATOR_USER)  # operator reads the fork (fetch)
+    mint_or_rotate_token(user)                    # writes tokens/<user>.token
+
+
+def archive_fork(host_port: str, user: str, repo: str) -> None:
+    """Read-only-freeze a retired consumer's fork — history kept, never
+    deleted. The gitea USER is deliberately kept inert (deleting a user PURGES
+    its repos, including any other fork it holds). FULLY best-effort — an
+    unbootstrapped/sick gitea, an already-archived or an absent fork are all
+    no-ops (retirement paths must never die on this). Token cleanup is the
+    CALLER's decision (a project consumer's token is shared across repos)."""
+    try:
+        client = GiteaClient(api_base(host_port), read_admin_token())
+        client._api("PATCH", f"/repos/{user}/{repo}", {"archived": True})
+    except GiteaError:
+        pass
+
+
+def delete_consumer_token(user: str) -> None:
+    try:
+        consumer_token_path(user).unlink()
+    except FileNotFoundError:
+        pass
 
 
 def remove_repo(host_port: str, repo: str) -> None:
-    """Delete the fork, agent user, and mirror, plus the token file."""
+    """Delete the mirror + best-effort every consumer FORK (repos only — NEVER
+    delete_user; archived-fork users stay inert). WARN-and-continue on every
+    cascade arm: a fork that survives (or an enumeration failure) prints the
+    manual-cleanup remedy instead of failing silently or aborting the mirror
+    delete. Cleans the mirror stamp + the active-fork entry + the forks'
+    token files."""
     client = GiteaClient(api_base(host_port), read_admin_token())
-    agent = agent_user_for(repo)
-    client.delete_repo(agent, repo)
-    client.delete_user(agent)
+    # Enumerate directly (NOT list_forks, whose []-on-error is the right
+    # degradation for STATUS reads but would silently skip this cascade).
+    try:
+        raw = client._api("GET", f"/repos/{ADMIN_USER}/{repo}/forks",
+                          timeout=STATUS_TIMEOUT_S) or []
+    except GiteaError as e:
+        raw = []
+        print(f"warning: could not enumerate {repo!r}'s consumer forks ({e}); "
+              f"delete any leftover agent-* forks in the gitea UI",
+              file=sys.stderr)
+    for f in raw if isinstance(raw, list) else []:
+        if not isinstance(f, dict):
+            continue
+        owner = (f.get("owner") or {}).get("login") or ""
+        if not owner.startswith(AGENT_USER_PREFIX):
+            continue
+        try:
+            client._api("DELETE", f"/repos/{owner}/{repo}")
+        except GiteaError as e:
+            print(f"warning: could not delete fork {owner}/{repo} ({e}); "
+                  f"delete it manually in the gitea UI", file=sys.stderr)
+        delete_consumer_token(owner)
     client.delete_repo(ADMIN_USER, repo)
     try:
-        agent_token_path(repo).unlink()
+        mirror_stamp_path(repo).unlink()
     except FileNotFoundError:
         pass
+    active = load_active_forks()
+    if repo in active:
+        del active[repo]
+        save_active_forks(active)
 
 
 def list_repos(host_port: str) -> list[dict]:
@@ -480,19 +586,86 @@ def sync_repo(host_port: str, repo: str) -> None:
     GiteaClient(api_base(host_port), read_admin_token()).trigger_sync(repo)
 
 
-def repo_status(host_port: str, repo: str) -> dict:
-    """Per-repo Development-page status: mirror sync time + the fork's open PRs
-    + branches. Three STATUS_TIMEOUT_S-bounded GETs; fields are picked by NAME,
-    so no secret can enter the result (and GiteaError never carries bodies)."""
+# --- consumer forks + the active-fork map ------------------------------------
+
+def list_forks(host_port: str, repo: str) -> list[dict]:
+    """The mirror's consumer forks: [{user, archived, created_at}]. Bounded,
+    best-effort (a sick gitea → empty list, callers degrade to no-fork reads).
+    Only agent-prefixed owners count — a manual human fork is not a consumer."""
     client = GiteaClient(api_base(host_port), read_admin_token())
-    agent = agent_user_for(repo)
+    try:
+        raw = client._api("GET", f"/repos/{ADMIN_USER}/{repo}/forks",
+                          timeout=STATUS_TIMEOUT_S) or []
+    except GiteaError:
+        return []
+    out = []
+    for f in raw if isinstance(raw, list) else []:
+        if not isinstance(f, dict):
+            continue
+        owner = (f.get("owner") or {}).get("login") or ""
+        if owner.startswith(AGENT_USER_PREFIX):
+            out.append({"user": owner,
+                        "archived": bool(f.get("archived")),
+                        "created_at": f.get("created_at") or ""})
+    return out
+
+
+def load_active_forks() -> dict:
+    if not ACTIVE_FORKS_PATH.is_file():
+        return {}
+    try:
+        data = json.loads(ACTIVE_FORKS_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_active_forks(entries: dict) -> None:
+    DEV_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = ACTIVE_FORKS_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(entries, indent=2, sort_keys=True))
+    tmp.replace(ACTIVE_FORKS_PATH)
+
+
+def resolve_active_fork(repo: str, forks: list[dict]) -> str:
+    """PURE resolution over an already-fetched forks list (unit-testable):
+    the explicit map entry if it names a LIVE fork, else the single live fork,
+    else the most recently created live fork (gitea `created_at` — the pinned
+    recency source), else ''. Archived forks are never active."""
+    live = [f for f in forks if not f.get("archived")]
+    explicit = load_active_forks().get(repo)
+    if explicit and any(f.get("user") == explicit for f in live):
+        return explicit
+    if len(live) == 1:
+        return live[0].get("user") or ""
+    if live:
+        return max(live, key=lambda f: f.get("created_at") or "").get("user") or ""
+    return ""
+
+
+def active_fork_for(host_port: str, repo: str) -> str:
+    """Fetch + resolve. '' when the repo has no live consumer fork."""
+    return resolve_active_fork(repo, list_forks(host_port, repo))
+
+
+def repo_status(host_port: str, repo: str) -> dict:
+    """Per-repo Development-page status: mirror sync time + the ACTIVE fork's
+    open PRs + branches (multi-fork reads are steered by the active-fork map —
+    the deliberate simplification; no cross-fork aggregation), plus the forks
+    list + active marker for the Management dropdown. STATUS_TIMEOUT_S-bounded
+    GETs; fields are picked by NAME, so no secret can enter the result."""
+    client = GiteaClient(api_base(host_port), read_admin_token())
+    forks = list_forks(host_port, repo)
+    active = resolve_active_fork(repo, forks)
     info = client._api("GET", f"/repos/{ADMIN_USER}/{repo}",
                        timeout=STATUS_TIMEOUT_S) or {}
-    prs_raw = client._api(
-        "GET", f"/repos/{agent}/{repo}/pulls?state=open&limit={LIST_LIMIT}",
-        timeout=STATUS_TIMEOUT_S) or []
-    branches_raw = client._api("GET", f"/repos/{agent}/{repo}/branches",
-                               timeout=STATUS_TIMEOUT_S) or []
+    prs_raw, branches_raw = [], []
+    if active:
+        prs_raw = client._api(
+            "GET", f"/repos/{active}/{repo}/pulls?state=open&limit={LIST_LIMIT}",
+            timeout=STATUS_TIMEOUT_S) or []
+        branches_raw = client._api("GET", f"/repos/{active}/{repo}/branches",
+                                   timeout=STATUS_TIMEOUT_S) or []
     prs = []
     for p in prs_raw if isinstance(prs_raw, list) else []:
         if not isinstance(p, dict):
@@ -514,18 +687,23 @@ def repo_status(host_port: str, repo: str) -> dict:
             "private": bool(info.get("private")),
             "mirror_synced_at": (info.get("mirror_updated")
                                  or info.get("updated_at") or ""),
+            "forks": forks,
+            "active": active,
             "prs": prs,
             "branches": branches}
 
 
 # --- attachment record ------------------------------------------------------
 #
-# Which project works which repo (agent tokens + dev-box association). Entries:
-#   {"project": str, "class": "agent", "repo": str, "gitea_ip": str}
-# `class` is ALWAYS "agent" now (the control class was retired when fetch went
-# universal); the key is kept for record-shape stability — one writer. A project
-# may hold multiple entries (one per repo). Host-only state, never bind-mounted,
-# so a plain tmp+rename is correct (no inode pin).
+# The CONSUMER ledger: which agent works which repo. Entries:
+#   {"project": str, "class": "agent", "repo": str, "gitea_ip": str,
+#    "box": str | None, "user": str}
+# box=None → the project's own dev agent; box=<name> → that dev box. `user` is
+# the consumer's gitea username (agent_username(consumer_for(...))). `class` is
+# ALWAYS "agent" (the control class was retired); kept for record-shape
+# stability. Dedupe key = (project, class, repo, box) — a box entry and the
+# project's own entry for the SAME repo coexist. Host-only state, never
+# bind-mounted, so a plain tmp+rename is correct (no inode pin).
 
 def load_attachments() -> list[dict]:
     if not ATTACHMENTS_PATH.is_file():
@@ -545,23 +723,28 @@ def save_attachments_atomic(entries: list[dict]) -> None:
 
 
 def record_attachment(project: str, klass: str, repo: str | None,
-                      gitea_ip: str) -> None:
-    """Add/refresh a project's entry. Keyed on (project, class, repo) so a
-    re-wire refreshes gitea_ip in place rather than duplicating."""
+                      gitea_ip: str, *, box: str | None = None,
+                      user: str = "") -> None:
+    """Add/refresh a consumer's entry. Keyed on (project, class, repo, box) so
+    a re-wire refreshes gitea_ip in place rather than duplicating — and so a
+    box entry never clobbers the project's own entry for the same repo."""
     entries = [e for e in load_attachments()
                if not (e.get("project") == project and e.get("class") == klass
-                       and e.get("repo") == repo)]
+                       and e.get("repo") == repo and e.get("box") == box)]
     entries.append({"project": project, "class": klass, "repo": repo,
-                    "gitea_ip": gitea_ip})
+                    "gitea_ip": gitea_ip, "box": box, "user": user})
     save_attachments_atomic(entries)
 
 
-def prune_entry(project: str, repo: str | None) -> list[dict]:
-    """Remove one entry (project, repo). Returns the project's REMAINING entries
-    so the caller decides whether to disconnect the network."""
+def prune_entry(project: str, repo: str | None,
+                box: str | None = None) -> list[dict]:
+    """Remove one consumer entry (project, repo, box). Returns the project's
+    REMAINING entries so the caller decides network disconnect / token
+    cleanup (the detach-to-zero rule)."""
     kept, remaining = [], []
     for e in load_attachments():
-        if e.get("project") == project and e.get("repo") == repo:
+        if (e.get("project") == project and e.get("repo") == repo
+                and e.get("box") == box):
             continue
         kept.append(e)
         if e.get("project") == project:

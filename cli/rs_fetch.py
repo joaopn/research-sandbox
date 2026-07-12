@@ -3,8 +3,10 @@
 
 Staged by the host into every project container and box (never baked;
 the fetch surface is a standing utility of the dev lane). Runs as the
-container user against the per-repo agent fork (``agent-<repo>/<repo>``)
-using the READ-ONLY operator token staged at ``~/.dev-tokens/operator.token``
+container user against the repo's ACTIVE consumer fork (per-consumer forks —
+the owner comes from the staged wiring rows, steered by Management's
+active-fork selector) using the READ-ONLY operator token staged at
+``~/.dev-tokens/operator.token``
 — it can fetch agent work; nothing it holds can write to gitea (the one-way
 valve). The human's push credential is theirs alone and never involved here.
 
@@ -92,8 +94,29 @@ def die(msg: str) -> None:
     sys.exit(1)
 
 
+# The staged non-secret wiring file (host-written; rows carry the repo's
+# ACTIVE fork owner under `user` — per-consumer forks: the owner is no longer
+# derivable from the repo name).
+DEV_GITEA_JSON = Path("/workspace/.orchestrator/dev-gitea.json")
+
+
 def fork_owner(repo: str) -> str:
-    return f"{AGENT_USER_PREFIX}{repo}"
+    """The repo's ACTIVE consumer fork owner, from the staged wiring rows.
+    Host-side Management steers it (the active-fork map); a change re-stages
+    the file, so this read needs no restart. Dies with a remedy when the repo
+    has no staged row — the per-repo `agent-<repo>` derivation is GONE."""
+    try:
+        data = json.loads(DEV_GITEA_JSON.read_text())
+    except (OSError, json.JSONDecodeError):
+        die(f"no dev wiring staged at {DEV_GITEA_JSON}; is this project wired "
+            f"to the dev lane? (add a dev project/box on the repo first)")
+    for row in (data.get("repos") or []) if isinstance(data, dict) else []:
+        if isinstance(row, dict) and row.get("repo") == repo and row.get("user"):
+            return row["user"]
+    die(f"repo {repo!r} has no staged fork owner (staged repos: "
+        f"{sorted(r.get('repo') for r in data.get('repos') or [] if isinstance(r, dict)) or 'none'}); "
+        f"add a dev project/box on it, or set the active fork on the "
+        f"Development page")
 
 
 def valid_commit_sha(sha: str) -> bool:
@@ -283,7 +306,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="rs-fetch",
         description="fetch agent work from the shared rs-gitea into a local "
                     "clone (no selector: list the fork's open PRs)")
-    p.add_argument("repo", help="dev repo NAME (the fork agent-<repo>/<repo>)")
+    p.add_argument("repo", help="dev repo NAME (fetches its ACTIVE consumer fork)")
     p.add_argument("repo_path", nargs="?", default=None,
                    help="local git clone to apply into (default: cwd)")
     p.add_argument("--pr", type=int, default=None, help="fetch PR #N")

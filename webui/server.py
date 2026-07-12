@@ -963,6 +963,24 @@ async def broker_dev_sync_handler(request: web.Request) -> web.Response:
     return web.json_response(reply, status=status)
 
 
+async def broker_dev_active_fork_handler(request: web.Request) -> web.Response:
+    """POST /broker/dev/active-fork {repo, user} — set the repo's GLOBAL
+    active fork (gated, origin-checked; the Development page's fork dropdown,
+    shown only at ≥2 live forks). Synchronous relay — bounded gitea reads."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    status, reply = await _relay(request, "dev_set_active_fork",
+                                 {"repo": body.get("repo"),
+                                  "user": body.get("user")})
+    return web.json_response(reply, status=status)
+
+
 async def broker_dev_gitea_start_handler(request: web.Request) -> web.Response:
     """POST /broker/dev/gitea-start — DELIBERATELY enable/provision gitea (gated,
     origin-checked; the Management Infrastructure "Enable Gitea" button + the
@@ -2252,6 +2270,7 @@ def main() -> None:
     app.router.add_get("/broker/project/{name}/ports", broker_ports_handler)
     app.router.add_get("/broker/dev", broker_dev_handler)
     app.router.add_post("/broker/dev/sync", broker_dev_sync_handler)
+    app.router.add_post("/broker/dev/active-fork", broker_dev_active_fork_handler)
     app.router.add_post("/broker/dev/gitea-start", broker_dev_gitea_start_handler)
     app.router.add_post("/broker/dev/passwd", broker_dev_passwd_handler)
     app.router.add_post("/broker/dev/review", broker_dev_review_handler)

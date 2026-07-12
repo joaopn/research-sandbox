@@ -446,7 +446,7 @@ class CreateRequest:
                     "`research dev repo add <github-url>`)")
             if not _valid_dev_repo_name(dev_repo):
                 raise ValidationError(f"invalid dev repo name {dev_repo!r}")
-            if not gitea.agent_token_path(dev_repo).is_file():
+            if not gitea.mirror_present(dev_repo):
                 raise ValidationError(
                     f"repo {dev_repo!r} not added yet — run "
                     f"`research dev repo add <github-url>` first")
@@ -880,8 +880,9 @@ class PortListRequest:
 # Dev lane (STAGE_DEV_GITEA S1) — shared-gitea repo lifecycle + attachment
 # ---------------------------------------------------------------------------
 
-# GitHub repo URL parser + segment validator. The derived `repo` segment feeds a
-# HOST filesystem path (tokens/agent-<repo>.token) AND gitea account/repo names,
+# GitHub repo URL parser + segment validator. The derived `repo` segment feeds
+# HOST filesystem paths (the mirror stamp; consumer token files derive from
+# project/box names, not the repo) AND gitea account/repo names,
 # and the URL is browser-supplied through the broker's detached dev-box lane (the
 # CLI calls rscore directly; there is no inline broker repo-add verb) — so the
 # owner/repo segments are user-supplied input on a host path. Anchor them with the
@@ -917,6 +918,12 @@ def _valid_dev_repo_name(repo: Any) -> bool:
     Dev*Request validators carry."""
     return (isinstance(repo, str) and bool(repo) and repo not in (".", "..")
             and "/" not in repo and "\\" not in repo)
+
+
+# Gitea username shape (AlphaDashDot + the 40-char cap gitea enforces) — the
+# active-fork request's SHAPE gate; the verb re-gates against live forks, so
+# this only needs to keep junk out of API paths.
+_GITEA_USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$")
 
 
 @dataclass(frozen=True)
@@ -1043,6 +1050,25 @@ class DevPasswdRequest:
 
 
 @dataclass(frozen=True)
+class DevSetActiveForkRequest:
+    """Set the GLOBAL active fork for a repo (the Management dropdown — the
+    multi-fork edge case; sequential use never needs it). Shape-only here; the
+    verb re-gates against the repo's actual LIVE forks."""
+    repo: str
+    user: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "DevSetActiveForkRequest":
+        repo = kw.get("repo")
+        if not _valid_dev_repo_name(repo):
+            raise ValidationError(f"invalid dev repo name: {repo!r}")
+        user = kw.get("user")
+        if not (isinstance(user, str) and _GITEA_USERNAME_RE.match(user)):
+            raise ValidationError(f"invalid fork user: {user!r}")
+        return cls(repo=repo, user=user)
+
+
+@dataclass(frozen=True)
 class ReviewRequest:
     """One PR review in the ephemeral sandboxed reviewer (STAGE_DEV_GITEA S4).
     Shape-validation only — repo existence / gitea state are checked in the
@@ -1066,16 +1092,17 @@ class ReviewRequest:
 @dataclass(frozen=True)
 class DevBoxProvisionRequest:
     """The webui dev-box provision (the box window's dev preset): ONE action =
-    mirror+fork the GitHub URL, attach the repo to the project, create the dev
-    box. Runs ONLY in the broker's detached dev-box child (the ~120s migrate
-    never sits on the accept thread) or inline from a direct rscore caller.
-    ``pat`` is the per-repo transient secret (repr=False; reaches only gitea's
-    migrate auth_token, never a Result)."""
+    mirror the GitHub URL + create the dev box (which mints the BOX's own
+    consumer fork — per-consumer forks; no attach leg). Runs ONLY in the
+    broker's detached dev-box child (the ~120s migrate never sits on the
+    accept thread) or inline from a direct rscore caller. ``pat`` is the
+    per-repo transient secret (repr=False; reaches only gitea's migrate
+    auth_token, never a Result)."""
     project: str
     url: str
     repo: str                                   # the anchored segment (derived)
     pat: str = field(default="", repr=False)
-    name: str | None = None                     # box name (None ⇒ auto box-N)
+    name: str | None = None                     # box name (None ⇒ derived from repo HERE)
     agent: str | None = None                    # claude | none | None (preset default)
     editor: bool = False
 
@@ -1085,11 +1112,26 @@ class DevBoxProvisionRequest:
         pat = kw.get("pat")
         if pat is not None and not isinstance(pat, str):
             raise ValidationError("pat must be a string")
+        # A dev box needs an explicit name (its gitea identity derives from
+        # <project>.<name> BEFORE the box runs). URL-only flow: derive the
+        # default from the repo segment, normalized to the box-name charset
+        # (lowercase; every other char folds to '-') — validated HERE, so an
+        # unmappable name rejects PRE-SPAWN, never after the migrate side
+        # effect. The verb uses the derived value verbatim.
+        name = kw.get("name")
+        if not (isinstance(name, str) and name.strip()):
+            derived = re.sub(r"-{2,}", "-",
+                             re.sub(r"[^a-z0-9-]", "-", repo.lower())).strip("-")
+            if not derived or not _BOX_NAME_RE.match(derived):
+                raise ValidationError(
+                    f"cannot derive a box name from repo {repo!r}; pass an "
+                    f"explicit box name")
+            name = derived
         # Delegate the box-field validation (project name, box-name regex, agent
         # enum) to the shipped choke point — constructed for its validated
         # fields; shape-only, no docker (box_add re-gates semantics child-side).
         box = BoxAddRequest.from_kwargs(
-            project=kw.get("project"), name=kw.get("name"), preset="dev",
+            project=kw.get("project"), name=name, preset="dev",
             agent=kw.get("agent"), editor=kw.get("editor"), repo=repo)
         return cls(project=box.project, url=url, repo=repo,
                    pat=(pat or "").strip(), name=box.name, agent=box.agent,
@@ -1101,8 +1143,7 @@ class DevRepoAddResult:
     repo: str
     url: str
     mirror: str                                 # sandbox-admin/<repo>
-    fork: str                                   # agent-<repo>/<repo>
-    token_path: str                             # NEVER the token value (secret)
+    stamp: str                                  # host mirror-stamp path (the 'added' floor)
 
 
 @dataclass
@@ -1149,6 +1190,12 @@ class DevGiteaStartResult:
 @dataclass
 class DevPasswdResult:
     user: str                                   # never the password
+
+
+@dataclass
+class DevSetActiveForkResult:
+    repo: str
+    user: str
 
 
 @dataclass
@@ -1539,9 +1586,22 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
                 if not gitea_ip:
                     die(f"rs-gitea did not attach to {network} (no IP); "
                         f"check docker state")
-                gitea.record_attachment(project, "agent", req.dev_repo, gitea_ip)
+                # Per-consumer identity: the PROJECT's own dev agent gets its
+                # user + fork + token here (provisioning lives at the point
+                # that needs an agent, never in shared wiring).
+                dev_user = gitea.agent_username(gitea.consumer_for(project))
+                try:
+                    gitea.provision_consumer(_gitea_host_port(), req.dev_repo,
+                                             dev_user)
+                except gitea.GiteaError as e:
+                    # Mid-side-effect (mirrors the adjacent no-IP die): a raw
+                    # GiteaError would escape dispatch into socketserver.
+                    die(f"could not provision the project's dev identity: {e}")
+                gitea.record_attachment(project, "agent", req.dev_repo,
+                                        gitea_ip, box=None, user=dev_user)
                 _stage_dev_gitea(project, cfg, gitea_ip=gitea_ip)
-                clone_dir = _run_dev_clone(container_name, req.dev_repo, progress)
+                clone_dir = _run_dev_clone(container_name, req.dev_repo,
+                                           dev_user, progress)
         else:
             stage_worker_image(container_name, ANALYSIS_IMAGE)
             # Stage the agent dist into the supervisor (its own ~/.local + the
@@ -1716,9 +1776,20 @@ def destroy(req: DestroyRequest, cfg: "Config" | None = None,
     if volume_exists(docker_volume):
         run(["docker", "volume", "rm", docker_volume], capture_output=True)
     remove_project_network(project)
-    # Drop the project's dev-lane attachment entries (best-effort — a destroy
-    # must not die on a corrupt record). STAGE_DEV_GITEA S1.
+    # Retire the project's dev-lane consumers (best-effort — a destroy must not
+    # die on a corrupt record or a sick gitea): archive every consumer fork
+    # (history kept, users stay inert) + delete their host token files, THEN
+    # drop the ledger entries.
     try:
+        entries = [e for e in gitea.project_entries(project)
+                   if e.get("class") == "agent" and e.get("repo")
+                   and e.get("user")]
+        if entries and container_running(gitea.GITEA_CONTAINER):
+            host_port = _gitea_host_port()
+            for e in entries:
+                gitea.archive_fork(host_port, e["user"], e["repo"])
+        for e in entries:
+            gitea.delete_consumer_token(e["user"])
         gitea.prune_project(project)
     except Exception:
         pass
@@ -5089,7 +5160,8 @@ def wire_gitea_to_projects() -> None:
         # Refresh gitea_ip on every entry of this project (the IP can change
         # across a disconnect/reconnect).
         for e in gitea.project_entries(project):
-            gitea.record_attachment(project, e["class"], e.get("repo"), ip)
+            gitea.record_attachment(project, e["class"], e.get("repo"), ip,
+                                    box=e.get("box"), user=e.get("user") or "")
         # Project-side wiring: the non-secret file + agent tokens ride the
         # record; the fetch surface is universal (self-gating). Dev-box
         # reconcile stays record-scoped — per-box change detection (actual
@@ -5106,17 +5178,24 @@ def _stage_dev_gitea(project: str, cfg: "Config", gitea_ip: str = "") -> None:
     secrecy:
 
       * ``<ws>/.orchestrator/dev-gitea.json`` — NON-secret ``{gitea_ip, repos:
-        [{repo, user}]}``, host-written into the bind-mounted workspace (atomic
-        tmp+rename; the parent dir is the mount, no inode pin). The webui's RO
-        /projects mount can read this file, so a token must NEVER enter it —
-        the writer only handles ip/repo/user by construction. Written for ANY
-        wired project (``repos`` may be ``[]``): the ``gitea_ip`` is
-        load-bearing for the universal box ``--add-host`` injection, not just
-        for dev boxes.
-      * the per-repo agent token, streamed into the RUNNING supervisor's own fs
-        at ``~/.dev-tokens/agent-<repo>.token`` (0600) via ``docker exec -i …
-        cat`` — stdin as the container's own user (docker cp would land a
-        foreign-uid file under sysbox), never argv, never the workspace.
+        [{repo, user, agent_user, token_file}]}``, host-written into the
+        bind-mounted workspace (atomic tmp+rename; the parent dir is the
+        mount, no inode pin). The webui's RO /projects mount can read this
+        file, so a token must NEVER enter it — the writer only handles
+        ip/name fields by construction. Rows are REPO-level: ``user`` is the
+        repo's ACTIVE fork owner (what rs-fetch reads), ``agent_user`` /
+        ``token_file`` are the PROJECT consumer's identity (empty when the
+        project's own agent doesn't work the repo — box entries never mint
+        those fields). Written for ANY wired project (``repos`` may be
+        ``[]``): the ``gitea_ip`` is load-bearing for the universal box
+        ``--add-host`` injection, not just for dev boxes.
+      * every project CONSUMER's token (the project's own + each dev box's),
+        streamed into the RUNNING supervisor's own fs at
+        ``~/.dev-tokens/<user>.token`` (0600) via ``docker exec -i … cat`` —
+        stdin as the container's own user (docker cp would land a foreign-uid
+        file under sysbox), never argv, never the workspace. Staging ALL
+        consumers here means a supervisor recreate re-heals box tokens for
+        free.
 
     IP source, in order: the ``gitea_ip`` param (call sites that JUST connected
     thread it), an agent-class record entry, a live inspect of rs-gitea on the
@@ -5143,10 +5222,28 @@ def _stage_dev_gitea(project: str, cfg: "Config", gitea_ip: str = "") -> None:
                 ip = ""
     if ip:
         payload_path = ws / ".orchestrator" / "dev-gitea.json"
-        payload = {"gitea_ip": ip,
-                   "repos": [{"repo": e["repo"],
-                              "user": gitea.agent_user_for(e["repo"])}
-                             for e in entries]}
+        rows = []
+        for repo in sorted({e["repo"] for e in entries}):
+            repo_entries = [e for e in entries if e["repo"] == repo]
+            proj_user = next((e.get("user") for e in repo_entries
+                              if e.get("box") is None and e.get("user")), "")
+            # Active fork for the row's `user`: the explicit map first (a host
+            # file — no API), a live-gitea resolution when possible, then the
+            # project consumer / any box consumer (a stopped gitea at recreate
+            # time must not blank the row).
+            active = gitea.load_active_forks().get(repo, "")
+            if not active and container_running(gitea.GITEA_CONTAINER):
+                try:
+                    active = gitea.active_fork_for(_gitea_host_port(), repo)
+                except gitea.GiteaError:
+                    active = ""
+            if not active:
+                active = proj_user or next((e.get("user") for e in repo_entries
+                                            if e.get("user")), "")
+            rows.append({"repo": repo, "user": active,
+                         "agent_user": proj_user,
+                         "token_file": f"{proj_user}.token" if proj_user else ""})
+        payload = {"gitea_ip": ip, "repos": rows}
         payload_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = payload_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
@@ -5154,25 +5251,25 @@ def _stage_dev_gitea(project: str, cfg: "Config", gitea_ip: str = "") -> None:
     container = container_name_for(project)
     if not entries or not container_running(container):
         return
-    for e in entries:
-        tok_path = gitea.agent_token_path(e["repo"])
+    for user in sorted({e["user"] for e in entries if e.get("user")}):
+        tok_path = gitea.consumer_token_path(user)
         try:
             tok = tok_path.read_text().strip()
         except OSError:
             tok = ""
         if not tok:
-            print(f"warning: agent token missing at {tok_path}; skipped its "
-                  f"in-supervisor staging (re-run `research dev repo add`)",
+            print(f"warning: consumer token missing at {tok_path}; skipped its "
+                  f"in-supervisor staging (re-attach or re-add the box)",
                   file=sys.stderr)
             continue
-        # Positional-arg sh so the (validated) repo name never rides string
-        # interpolation, and the token rides ONLY stdin.
+        # Positional-arg sh so the (validated-name-derived) file name never
+        # rides string interpolation, and the token rides ONLY stdin.
         r = run(["docker", "exec", "-i", "-u", "research", container, "sh", "-c",
                  'umask 077 && mkdir -p "$HOME/.dev-tokens" && cat > "$HOME/.dev-tokens/$1"',
-                 "sh", f"agent-{e['repo']}.token"],
+                 "sh", f"{user}.token"],
                 input=tok + "\n", capture_output=True)
         if r.returncode != 0:
-            print(f"warning: token staging for repo {e['repo']!r} failed: "
+            print(f"warning: token staging for consumer {user!r} failed: "
                   f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
 
 
@@ -5260,7 +5357,7 @@ def _restart_dev_boxes(project: str, cfg: "Config", gitea_ip: str) -> None:
             print(f"dev box {name!r} re-run against the new gitea address")
 
 
-def _run_dev_clone(container: str, repo: str, progress) -> str:
+def _run_dev_clone(container: str, repo: str, user: str, progress) -> str:
     """Clone the agent fork into the supervisor workspace (the dev workflow's
     create-time step, STAGE_DEV_GITEA S2): credential-helper store +
     clone-if-absent + the read-only mirror as ``upstream`` — the same contract
@@ -5273,10 +5370,9 @@ def _run_dev_clone(container: str, repo: str, progress) -> str:
     the dev instructions as /workspace/CLAUDE.md, no-clobber — the same text
     the dev box preset stages, from boxes/dev.instructions.md. Returns the
     clone dir."""
-    user = gitea.agent_user_for(repo)
-    token = gitea.agent_token_path(repo).read_text().strip()
+    token = gitea.consumer_token_path(user).read_text().strip()
     if not token:
-        die(f"agent token file for {repo!r} is empty; re-run `research dev repo add`")
+        die(f"consumer token file for {user!r} is empty; re-run the attach")
     base = f"http://{gitea.GITEA_CONTAINER}:{gitea.GITEA_INNER_PORT}"
     progress.step("dev-clone", "cloning the dev fork")
     r = run(["docker", "exec", "-i", "-u", "research", container, "sh", "-c",
@@ -6479,14 +6575,20 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
             raise ValidationError("ref/setup are not valid for a dev box")
         if not _valid_dev_repo_name(req.repo):
             raise ValidationError(
-                "a dev box requires 'repo': the NAME of a dev repo attached to "
-                "this project")
-        attached = {e.get("repo") for e in gitea.project_entries(req.project)
-                    if e.get("class") == "agent"}
-        if req.repo not in attached:
+                "a dev box requires 'repo': the NAME of an added dev repo")
+        # Mirror-stamp floor (per-consumer forks: no attachment prerequisite —
+        # the box mints its OWN consumer below, 4c-a).
+        if not gitea.mirror_present(req.repo):
             raise ValidationError(
-                f"repo {req.repo!r} is not attached to project {req.project!r}; "
-                f"run `research dev attach {req.project} --repo {req.repo}` first")
+                f"repo {req.repo!r} not added yet — run "
+                f"`research dev repo add <github-url>` first")
+        # The box's gitea identity (agent-<project>.<name>) and its token must
+        # exist BEFORE `rs-sandbox create` runs the container, so the name
+        # cannot be auto-assigned in-box for a dev box.
+        if not req.name:
+            raise ValidationError(
+                "a dev box requires an explicit name (its gitea identity is "
+                "minted from <project>.<name> before the box runs)")
     # Lazily stand up the box harness. On research this stages rs-sandbox + delivers
     # the needed box image on first use (research create/recreate never touch boxes
     # — the frozen lane); on sandbox-dind (eager-staged) it no-ops. The image a box
@@ -6495,6 +6597,26 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     progress.step("harness", "ensuring the box harness")
     _ensure_box_harness(container, project_network_for(req.project),
                         workspace_path, want_browser)
+    # Dev preset: wire gitea + mint the BOX's own consumer (user + fork +
+    # token) BEFORE the box runs — ordering is load-bearing: connect → provision
+    # → ledger → staging (the token lands in ~/.dev-tokens for rs-sandbox to
+    # read at `docker run`). 4c-a: no project-level fork rides this path.
+    box_user = ""
+    if catalog.get(req.preset, {}).get("dev"):
+        _resume_gitea(require=True)     # a dev box NEEDS gitea; never create
+        network = project_network_for(req.project)
+        ip = _connect_gitea_to_project_network(network)
+        if not ip:
+            die(f"rs-gitea did not attach to {network} (no IP); check docker state")
+        box_user = gitea.agent_username(
+            gitea.consumer_for(req.project, req.name))
+        try:
+            gitea.provision_consumer(_gitea_host_port(), req.repo, box_user)
+        except gitea.GiteaError as e:
+            raise ValidationError(str(e))
+        gitea.record_attachment(req.project, "agent", req.repo, ip,
+                                box=req.name, user=box_user)
+        _stage_dev_gitea(req.project, cfg, gitea_ip=ip)
     argv = ["docker", "exec", container, "rs-sandbox", "create"]
     if req.name:
         argv.append(req.name)
@@ -6511,6 +6633,8 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         argv += ["--ref", req.ref]
     if req.setup:
         argv += ["--setup", req.setup]
+    if box_user:
+        argv += ["--gitea-user", box_user]
     progress.step("create-box", "creating the box")
     r = run(argv, capture_output=True)
     if r.returncode != 0:
@@ -6547,6 +6671,29 @@ def box_remove(req: "BoxRemoveRequest", progress=None) -> BoxRemoveResult:  # ty
     r = run(cmd, capture_output=True)
     if r.returncode != 0:
         die(f"failed to remove box {req.name!r}: {(r.stderr or r.stdout).strip()}")
+    # Retire the box's dev consumer, if it had one: ARCHIVE its fork (history
+    # kept, user stays inert), delete its token (host + staged), drop its
+    # ledger entry, restage the wiring. Best-effort — the discard already
+    # succeeded; a sick gitea must not fail the remove.
+    entry = next((e for e in gitea.project_entries(req.project)
+                  if e.get("class") == "agent" and e.get("box") == req.name),
+                 None)
+    if entry is not None:
+        if (entry.get("user") and entry.get("repo")
+                and container_running(gitea.GITEA_CONTAINER)):
+            try:
+                gitea.archive_fork(_gitea_host_port(), entry["user"],
+                                   entry["repo"])
+            except gitea.GiteaError:
+                pass
+        if entry.get("user"):
+            gitea.delete_consumer_token(entry["user"])
+            if container_running(container):
+                run(["docker", "exec", "-u", "research", container, "sh", "-c",
+                     'rm -f "$HOME/.dev-tokens/$1"', "sh",
+                     f"{entry['user']}.token"], capture_output=True)
+        gitea.prune_entry(req.project, entry.get("repo"), box=req.name)
+        _stage_dev_gitea(req.project, load_config())
     return BoxRemoveResult(project=req.project, name=req.name)
 
 
@@ -6691,9 +6838,10 @@ def _gitea_host_port() -> str:
 
 
 def dev_repo_add(req: "DevRepoAddRequest", _progress=None) -> DevRepoAddResult:  # type: ignore[name-defined]
-    """Mirror a GitHub repo into shared gitea + fork it for a per-repo agent user.
-    Resumable/idempotent (a mid-migrate timeout heals on re-run). Reports the
-    TOKEN FILE PATH, never the token value (secrets-off-results)."""
+    """Mirror a GitHub repo into shared gitea — MIRROR-ONLY (per-consumer
+    identities are minted at the point that needs an agent: dev-workflow
+    create, the box dev path, an explicit attach). Resumable/idempotent (a
+    mid-migrate timeout heals on re-run)."""
     _resume_gitea(require=True)         # resume an enabled gitea; never create
     host_port = _gitea_host_port()
     # Private source ⇔ the caller supplied a per-repo PAT (RS stores no PAT).
@@ -6706,13 +6854,14 @@ def dev_repo_add(req: "DevRepoAddRequest", _progress=None) -> DevRepoAddResult: 
     return DevRepoAddResult(
         repo=req.repo, url=req.url,
         mirror=f"{gitea.ADMIN_USER}/{req.repo}",
-        fork=f"{gitea.agent_user_for(req.repo)}/{req.repo}",
-        token_path=str(gitea.agent_token_path(req.repo)))
+        stamp=str(gitea.mirror_stamp_path(req.repo)))
 
 
 def dev_repo_remove(req: "DevRepoRemoveRequest", _progress=None) -> DevRepoRemoveResult:  # type: ignore[name-defined]
-    """Delete the mirror + fork + agent user + token file. Refuse while any
-    project is still attached to the repo (explicit beats silent unwiring)."""
+    """Delete the mirror + best-effort every consumer fork (repos only — agent
+    USERS stay inert; gitea purges a deleted user's repos) + the forks' token
+    files + the mirror stamp. Refuse while any project is still attached to
+    the repo (explicit beats silent unwiring)."""
     attached = gitea.attached_projects(req.repo)
     if attached:
         die(f"repo {req.repo!r} is attached to: {', '.join(attached)}. "
@@ -6751,9 +6900,9 @@ def dev_attach(req: "DevAttachRequest", _progress=None) -> DevAttachResult:  # t
     network = project_network_for(req.project)
     if not network_exists(network):
         die(f"project {req.project!r} has no network; start it first")
-    # The repo must have been added (its mirror/fork exist) before an agent
-    # attaches — the token file is the S2 staging bridge.
-    if not gitea.agent_token_path(req.repo).is_file():
+    # The repo must have been added (its mirror exists) before an agent
+    # attaches — the mirror stamp is the host-side floor.
+    if not gitea.mirror_present(req.repo):
         die(f"repo {req.repo!r} not added yet "
             f"(`research dev repo add <github-url>` first)")
     if not container_running(container):
@@ -6763,7 +6912,16 @@ def dev_attach(req: "DevAttachRequest", _progress=None) -> DevAttachResult:  # t
     ip = _connect_gitea_to_project_network(network)
     if not ip:
         die(f"rs-gitea did not attach to {network} (no IP); check docker state")
-    gitea.record_attachment(req.project, "agent", req.repo, ip)
+    # An explicit attach means "this project's OWN agent works this repo" —
+    # provision the PROJECT consumer (user + fork + token). Boxes provision
+    # their own consumers in box_add, never through here (4c-a).
+    dev_user = gitea.agent_username(gitea.consumer_for(req.project))
+    try:
+        gitea.provision_consumer(_gitea_host_port(), req.repo, dev_user)
+    except gitea.GiteaError as e:
+        raise ValidationError(str(e))
+    gitea.record_attachment(req.project, "agent", req.repo, ip,
+                            box=None, user=dev_user)
     cfg = load_config()
     _stage_dev_gitea(req.project, cfg, gitea_ip=ip)
     # Unconditional reconcile: change detection lives per-box in
@@ -6774,28 +6932,52 @@ def dev_attach(req: "DevAttachRequest", _progress=None) -> DevAttachResult:  # t
 
 
 def dev_detach(req: "DevDetachRequest", _progress=None) -> DevDetachResult:  # type: ignore[name-defined]
-    """Remove attachment entries. repo=None detaches ALL of the project. The
-    staged dev wiring follows the record (re-written minus the detached
-    entries) and the detached repos' in-supervisor tokens are deleted
-    best-effort. The network attachment is NOT dropped (S3: the fetch surface
-    is universal — every project stays wired while gitea exists; only destroy
-    disconnects). Standing dev boxes are NOT auto-discarded — they keep running
-    but lose their gitea wiring (an operator action, documented)."""
-    before = {e.get("repo") for e in gitea.project_entries(req.project)
-              if e.get("class") == "agent" and e.get("repo")}
+    """Retire consumer entries. repo=<r> detaches the PROJECT consumer's entry
+    for that repo (box entries retire via box remove); repo=None detaches ALL
+    of the project's entries — detach-to-zero by definition, boxes included.
+    Every detached consumer's fork is ARCHIVED (history kept, best-effort —
+    skipped when gitea isn't running) and the PROJECT consumer's token — ONE
+    file shared across its repos — is deleted ONLY at zero project-consumer
+    entries. The staged dev wiring follows the record. The network attachment
+    is NOT dropped (S3: fetch is universal; only destroy disconnects).
+    Standing dev boxes are NOT auto-discarded — the ALL branch leaves them
+    running but unwired (an operator action, documented)."""
+    entries = [e for e in gitea.project_entries(req.project)
+               if e.get("class") == "agent" and e.get("repo")]
     if req.repo is None:
+        targets = list(entries)
         gitea.prune_project(req.project)
         remaining = []
     else:
-        remaining = gitea.prune_entry(req.project, req.repo)
-    still = {e.get("repo") for e in remaining
-             if e.get("class") == "agent" and e.get("repo")}
+        targets = [e for e in entries
+                   if e.get("repo") == req.repo and e.get("box") is None]
+        remaining = gitea.prune_entry(req.project, req.repo, box=None)
+    if targets and container_running(gitea.GITEA_CONTAINER):
+        host_port = _gitea_host_port()
+        for e in targets:
+            if e.get("user"):
+                try:
+                    gitea.archive_fork(host_port, e["user"], e["repo"])
+                except gitea.GiteaError:
+                    pass
+    # Token cleanup (the detach-to-zero rule). Box tokens go with their
+    # dropped box entries on the ALL branch.
+    drop_users = {e["user"] for e in targets
+                  if e.get("user") and e.get("box") is not None}
+    proj_user = gitea.agent_username(gitea.consumer_for(req.project))
+    still_proj = any(e.get("box") is None for e in remaining
+                     if e.get("class") == "agent" and e.get("repo"))
+    if not still_proj and (req.repo is None
+                           or any(e.get("box") is None for e in targets)):
+        drop_users.add(proj_user)
+    for user in drop_users:
+        gitea.delete_consumer_token(user)
     _stage_dev_gitea(req.project, load_config())
     container = container_name_for(req.project)
     if container_running(container):
-        for repo in sorted(before - still):
+        for user in sorted(drop_users):
             run(["docker", "exec", "-u", "research", container, "sh", "-c",
-                 'rm -f "$HOME/.dev-tokens/$1"', "sh", f"agent-{repo}.token"],
+                 'rm -f "$HOME/.dev-tokens/$1"', "sh", f"{user}.token"],
                 capture_output=True)
     return DevDetachResult(project=req.project, repo=req.repo,
                            remaining=len(remaining))
@@ -6852,6 +7034,32 @@ def dev_gitea_start(_req: "DevGiteaStartRequest", progress=None) -> DevGiteaStar
     return DevGiteaStartResult(running=True)
 
 
+def dev_set_active_fork(req: "DevSetActiveForkRequest", _progress=None) -> DevSetActiveForkResult:  # type: ignore[name-defined]
+    """Set the GLOBAL active fork for a repo (the Management dropdown). A
+    user-initiated WRITE, so it keeps the dev_sync self-heal posture (resume an
+    enabled gitea, never create). Validates the fork is LIVE, persists the map
+    entry, and re-stages dev-gitea.json on every attached project so the
+    in-container readers (rs-fetch) pick the new owner up without a restart."""
+    _resume_gitea(require=True)
+    host_port = _gitea_host_port()
+    try:
+        forks = gitea.list_forks(host_port, req.repo)
+    except gitea.GiteaError as e:
+        raise ValidationError(str(e))
+    live = {f["user"] for f in forks if not f.get("archived")}
+    if req.user not in live:
+        raise ValidationError(
+            f"{req.user!r} is not a live consumer fork of {req.repo!r} "
+            f"(live: {sorted(live) or 'none'})")
+    active = gitea.load_active_forks()
+    active[req.repo] = req.user
+    gitea.save_active_forks(active)
+    cfg = load_config()
+    for project in gitea.attached_projects(req.repo):
+        _stage_dev_gitea(project, cfg)
+    return DevSetActiveForkResult(repo=req.repo, user=req.user)
+
+
 def dev_passwd(req: "DevPasswdRequest", progress=None) -> DevPasswdResult:  # type: ignore[name-defined]
     """Set the sandbox-admin gitea password (the Management → Infrastructure
     dialog + `research dev passwd`). Requires an ENABLED gitea — resumes a
@@ -6882,22 +7090,23 @@ def dev_passwd(req: "DevPasswdRequest", progress=None) -> DevPasswdResult:  # ty
 
 
 def dev_box_provision(req: "DevBoxProvisionRequest", progress=None) -> dict:  # type: ignore[name-defined]
-    """Webui dev-box provision: mirror+fork+attach+create as ONE action (the
-    box window's dev preset takes a GitHub URL + optional per-repo PAT). A
-    COMPOSITION of the three shipped verbs so every gate and secret discipline
-    is reused, not re-derived: dev_repo_add (resumes gitea require=True — the
-    deliberate-create model; resumable migrate) → dev_attach (running-project
-    checks, network connect, attachment record, staging, dev-box reconcile) →
-    box_add (preset "dev" — its attachment gate passes because the attach step
-    just ran). Runs in the broker's detached dev-box child or inline from a
-    direct rscore caller — never on the broker's accept thread. Failure detail
-    streams to the child's full log (die() prints to the redirected stderr);
-    the view log gets only run_dev_box's coarse tokens."""
+    """Webui dev-box provision: mirror + box-create as ONE action (the box
+    window's dev preset takes a GitHub URL + optional per-repo PAT). A
+    COMPOSITION of the shipped verbs so every gate and secret discipline is
+    reused, not re-derived: dev_repo_add (mirror-only now; resumes gitea
+    require=True — the deliberate-create model; resumable migrate) → box_add
+    (preset "dev" — wires gitea and mints the BOX's OWN consumer fork/token).
+    Per-consumer forks, 4c-a: the old dev_attach leg is GONE, so no phantom
+    project-level fork is minted. Runs in the broker's detached dev-box child
+    or inline from a direct rscore caller — never on the broker's accept
+    thread. Failure detail streams to the child's full log (die() prints to
+    the redirected stderr); the view log gets only run_dev_box's coarse
+    tokens."""
     progress = progress or _NULL_PROGRESS
-    progress.step("repo", "mirroring + forking the repo")
+    progress.step("repo", "mirroring the repo")
     dev_repo_add(DevRepoAddRequest.from_kwargs(url=req.url, pat=req.pat))
-    progress.step("attach", "attaching the repo to the project")
-    dev_attach(DevAttachRequest.from_kwargs(project=req.project, repo=req.repo))
+    # req.name is ALWAYS set here: from_kwargs derived+validated the default
+    # PRE-SPAWN (never a post-migrate name failure).
     box = box_add(BoxAddRequest.from_kwargs(
         project=req.project, name=req.name, preset="dev", agent=req.agent,
         editor=req.editor, repo=req.repo), progress)
@@ -7148,7 +7357,12 @@ def review_pr(req: "ReviewRequest", progress=None) -> dict:  # type: ignore[name
     router_ip = _ensure_reviewer_network()
     _resume_gitea(require=True)         # tracks dev_sync: resume, never create
     host_port = _gitea_host_port()
-    owner = gitea.agent_user_for(repo)
+    # Per-consumer forks: the review targets the repo's ACTIVE fork (the
+    # Management-steered global selector; no cross-fork aggregation).
+    owner = gitea.active_fork_for(host_port, repo)
+    if not owner:
+        die(f"repo {repo!r} has no live consumer fork to review "
+            f"(create a dev project or dev box on it first)")
     client = gitea.GiteaClient(gitea.api_base(host_port),
                                gitea.read_admin_token())
 

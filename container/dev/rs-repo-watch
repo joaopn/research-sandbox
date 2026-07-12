@@ -10,9 +10,10 @@
 #   - dev BOX: GITEA_URL/TOKEN/USER + REPO_NAME arrive as container env — used
 #     as-is.
 #   - dev PROJECT (supervisor): read the host-staged non-secret
-#     .orchestrator/dev-gitea.json + the staged token at
-#     ~/.dev-tokens/agent-<repo>.token. With several attached repos, name one:
-#     rs-repo-watch <repo>.
+#     .orchestrator/dev-gitea.json — the row's agent_user/token_file are the
+#     PROJECT's OWN consumer identity (per-consumer forks; the row's `user` is
+#     the ACTIVE fork for fetch-side readers, not necessarily ours). With
+#     several attached repos, name one: rs-repo-watch <repo>.
 #
 # Usage: rs-repo-watch [repo]
 #   Watch it:  byobu attach  (then switch to the repo-watch window)
@@ -42,17 +43,22 @@ repos = [r for r in (data.get("repos") or [])
 want = sys.argv[2]
 if want:
     repos = [r for r in repos if r["repo"] == want]
+# The supervisor loop pushes to the PROJECT's OWN fork: rows without an
+# agent_user are box-only repos — this project's agent has no identity there.
+repos = [r for r in repos if r.get("agent_user")]
 if not repos:
-    sys.exit(f"rs-repo-watch: no attached repo matching {want!r}" if want
-             else "rs-repo-watch: no repos attached to this project")
+    sys.exit(f"rs-repo-watch: no project-agent repo matching {want!r}" if want
+             else "rs-repo-watch: this project's own agent works no repo "
+                  "(box-only wiring?); run 'research dev attach' first")
 if len(repos) > 1:
     sys.exit("rs-repo-watch: several repos attached; pick one: "
              + " ".join(sorted(r["repo"] for r in repos)))
-print(repos[0]["repo"], repos[0].get("user") or "agent-" + repos[0]["repo"])
+print(repos[0]["repo"], repos[0]["agent_user"],
+      repos[0].get("token_file") or repos[0]["agent_user"] + ".token")
 PYEOF
 )"
-    read -r REPO_NAME GITEA_USER <<<"$OUT"
-    TOKEN_FILE="$HOME/.dev-tokens/agent-${REPO_NAME}.token"
+    read -r REPO_NAME GITEA_USER TOKEN_BASE <<<"$OUT"
+    TOKEN_FILE="$HOME/.dev-tokens/${TOKEN_BASE}"
     if [[ ! -s "$TOKEN_FILE" ]]; then
         echo "rs-repo-watch: token missing at $TOKEN_FILE;" \
              "re-run 'research dev attach' (it re-stages the token)" >&2

@@ -1677,14 +1677,42 @@ def cmd_dev_repo_add(args: argparse.Namespace) -> None:
     res = _call(rscore.dev_repo_add, req)
     print(f"added {res.repo}")
     print(f"  mirror: {res.mirror}")
-    print(f"  fork:   {res.fork}")
-    print(f"  token:  {res.token_path}")
+    print(f"  stamp:  {res.stamp}")
+    print("  (consumer forks are minted per dev project/box, on demand)")
 
 
 def cmd_dev_repo_remove(args: argparse.Namespace) -> None:
     req = _build(rscore.DevRepoRemoveRequest, repo=args.repo)
     _call(rscore.dev_repo_remove, req)
-    print(f"removed {args.repo} (mirror + fork + agent user + token)")
+    print(f"removed {args.repo} (mirror + consumer forks; agent users stay inert)")
+
+
+def cmd_dev_fork_list(_args: argparse.Namespace) -> None:
+    """Per-repo consumer forks + the active marker (a READ — a stopped gitea
+    lists nothing, the dev_status posture)."""
+    res = _call(rscore.dev_status, _build(rscore.DevStatusRequest))
+    if not res.gitea.get("running"):
+        print("gitea is not running (enable/start it to list forks)")
+        return
+    if not res.repos:
+        print("no dev repos")
+        return
+    for r in res.repos:
+        print(f"{r.get('repo')}:")
+        for f in r.get("forks") or []:
+            mark = " (active)" if f.get("user") == r.get("active") else ""
+            state = "archived" if f.get("archived") else "live"
+            print(f"  {f.get('user')}  [{state}]{mark}")
+        if not (r.get("forks") or []):
+            print("  no consumer forks")
+
+
+def cmd_dev_fork_set_active(args: argparse.Namespace) -> None:
+    """Set a repo's GLOBAL active fork (the CLI twin of the Development page's
+    fork dropdown — the multi-fork edge case)."""
+    req = _build(rscore.DevSetActiveForkRequest, repo=args.repo, user=args.user)
+    res = _call(rscore.dev_set_active_fork, req)
+    print(f"active fork for {res.repo}: {res.user}")
 
 
 def cmd_dev_repo_list(_args: argparse.Namespace) -> None:
@@ -2262,7 +2290,7 @@ def build_parser() -> argparse.ArgumentParser:
     dvpw.set_defaults(func=cmd_dev_passwd)
     dvr = dv_sub.add_parser("repo", help="mirror/fork lifecycle for a repo")
     dvr_sub = dvr.add_subparsers(dest="repo_action", required=True)
-    dvra = dvr_sub.add_parser("add", help="mirror a GitHub repo + fork it for an agent")
+    dvra = dvr_sub.add_parser("add", help="mirror a GitHub repo (consumer forks are minted per dev project/box)")
     dvra.add_argument("url", help="https://github.com/<owner>/<repo> URL")
     dvra.add_argument("--private", action="store_true",
                       help="private source: prompts for a per-repo GitHub PAT "
@@ -2290,6 +2318,20 @@ def build_parser() -> argparse.ArgumentParser:
     dvs = dv_sub.add_parser("sync", help="trigger a mirror sync from GitHub")
     dvs.add_argument("repo")
     dvs.set_defaults(func=cmd_dev_sync)
+    dvfk = dv_sub.add_parser(
+        "fork",
+        help="consumer-fork controls (per-consumer forks)")
+    dvfk_sub = dvfk.add_subparsers(dest="fork_cmd", required=True)
+    dvfkl = dvfk_sub.add_parser(
+        "list", help="list each repo's consumer forks + the active marker")
+    dvfkl.set_defaults(func=cmd_dev_fork_list)
+    dvfka = dvfk_sub.add_parser(
+        "set-active",
+        help="set a repo's GLOBAL active fork (steers PR reads, rs-fetch and "
+             "reviews) — the CLI twin of the Development page's dropdown")
+    dvfka.add_argument("repo")
+    dvfka.add_argument("user", help="a live consumer fork's gitea username")
+    dvfka.set_defaults(func=cmd_dev_fork_set_active)
     dvge = dv_sub.add_parser(
         "gitea-enable",
         help="enable the shared Gitea backend (create if absent, else resume) — "
@@ -2304,7 +2346,7 @@ def build_parser() -> argparse.ArgumentParser:
         "review",
         help="review a PR in the ephemeral sandboxed reviewer (advisory; "
              "verdict -> host ledger + the Development page)")
-    dvrv.add_argument("repo", help="dev repo NAME (fork agent-<repo>/<repo>)")
+    dvrv.add_argument("repo", help="dev repo NAME (reviews its ACTIVE consumer fork)")
     dvrv.add_argument("--pr", required=True, type=int, help="PR number to review")
     dvrv.set_defaults(func=cmd_dev_review)
 
