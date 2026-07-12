@@ -2002,6 +2002,11 @@ async function appendInfraSection(view) {
     if (!g.running) {
         row.appendChild(enableBtn());
     }
+    // Enabled (running or stopped — the verb resumes a stopped gitea itself).
+    const pwBtn = el("button", { class: "btn-small" }, ["Set Gitea password"]);
+    pwBtn.onclick = () =>
+        devGiteaPasswdDialog(view, () => renderManagementInto(view));
+    row.appendChild(pwBtn);
 }
 
 function mgmtAction(view, name, action) {
@@ -2105,6 +2110,10 @@ const OP_CHECKLISTS = {
         { key: "start", label: "starting gitea" },
         { key: "bootstrap", label: "creating accounts" },
     ],
+    // Key LOCKSTEP with rscore.dev_passwd's progress.step() call.
+    dev_passwd: [
+        { key: "set", label: "setting the gitea password" },
+    ],
 };
 
 // The deliberate "Enable Gitea" flow (STAGE_DEV_GITEA webui-first A): a tailed
@@ -2124,6 +2133,57 @@ function devEnableGiteaDialog(view, onDone) {
         ])],
         request: () => fetch("/broker/dev/gitea-start", { method: "POST" }),
         onDone: (ok) => { if (onDone) onDone(ok); },
+    });
+}
+
+// Set the sandbox-admin gitea password (Management → Infrastructure). Step-up:
+// retyped master password → client-side derivation, the proof rides the body
+// (the destroy mold). The NEW gitea password is a SEPARATE secret by design —
+// never the master password (gitea would become a second, weaker verifier of
+// it: raw-password sign-ins, its own hash store, a container-reachable login
+// endpoint).
+function devGiteaPasswdDialog(view, onDone) {
+    const pw1 = el("input", { type: "password", autocomplete: "new-password" });
+    const pw2 = el("input", { type: "password", autocomplete: "new-password" });
+    const masterI = el("input", { type: "password", autocomplete: "current-password" });
+    mgmtConfirmThenTail(view, {
+        title: "Set Gitea password",
+        tailTitle: "Setting Gitea password",
+        verb: "dev_passwd",
+        confirmLabel: "Set password",
+        body: [
+            el("p", {}, [
+                "Sets the sandbox-admin password — your interactive Gitea " +
+                "sign-in (the Development page's Gitea tab, git over http). " +
+                "A separate secret from your master password, on purpose.",
+            ]),
+            el("div", { class: "field" }, [
+                el("label", {}, ["New Gitea password"]), pw1,
+            ]),
+            el("div", { class: "field" }, [
+                el("label", {}, ["Repeat it"]), pw2,
+            ]),
+            el("div", { class: "field" }, [
+                el("label", {}, ["Re-enter your master password"]), masterI,
+            ]),
+        ],
+        validate: () => {
+            // Floor mirrors broker_auth.MIN_PASSWORD_LENGTH (the renderSetup
+            // vault-create floor — change together).
+            if (pw1.value.length < 8) return "Password must be at least 8 characters.";
+            if (pw1.value !== pw2.value) return "Passwords do not match.";
+            if (!masterI.value) return "Re-enter your master password.";
+            return null;
+        },
+        request: async () => fetch("/broker/dev/passwd", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                password: pw1.value,
+                proof: await deriveLoginProof(masterI.value),
+            }),
+        }),
+        onDone: (ok) => { if (onDone) onDone(ok); },
+        focus: () => pw1.focus(),
     });
 }
 

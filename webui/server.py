@@ -977,6 +977,27 @@ async def broker_dev_gitea_start_handler(request: web.Request) -> web.Response:
                            op_seed="dev-gitea")
 
 
+async def broker_dev_passwd_handler(request: web.Request) -> web.Response:
+    """POST /broker/dev/passwd {password, proof} — set the sandbox-admin gitea
+    password (gated, origin-checked, STEP-UP). The step-up `proof` (client-side
+    derivation of the retyped master password — the raw master password never
+    transits) rides the args and is consumed by the broker's dispatch gate; the
+    new gitea password is the single allow-listed verb field. A tailed op
+    (dev_passwd ∈ PROGRESS_VERBS); args live only in the task closure —
+    OP_RUNS never stores them."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    args = {"password": body.get("password"), "proof": body.get("proof")}
+    return await _start_op(request, "dev_passwd", args, BROKER_OP_TIMEOUT_S,
+                           op_seed="dev-gitea")
+
+
 async def broker_dev_review_handler(request: web.Request) -> web.Response:
     """POST /broker/dev/review {repo, pr} — kick one PR review on the broker's
     PARALLEL detached review lane (gated, origin-checked). The broker_build_handler
@@ -2232,6 +2253,7 @@ def main() -> None:
     app.router.add_get("/broker/dev", broker_dev_handler)
     app.router.add_post("/broker/dev/sync", broker_dev_sync_handler)
     app.router.add_post("/broker/dev/gitea-start", broker_dev_gitea_start_handler)
+    app.router.add_post("/broker/dev/passwd", broker_dev_passwd_handler)
     app.router.add_post("/broker/dev/review", broker_dev_review_handler)
     # Under /broker/ ON PURPOSE: the Management session cookie is Path=/broker
     # and a browser won't send it to any other path prefix.

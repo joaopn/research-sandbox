@@ -68,6 +68,7 @@ import role_mcp  # noqa: E402
 import extension  # noqa: E402
 import workflow  # noqa: E402  (manifest store catalog; from_kwargs resolves --workflow)
 import gitea  # noqa: E402  (STAGE_DEV_GITEA: shared rs-gitea client + dev-lane host state)
+from broker_auth import MIN_PASSWORD_LENGTH  # noqa: E402  (single password-length floor: broker passwd + gitea passwd + the app.js mirror)
 
 
 # ---------------------------------------------------------------------------
@@ -1017,6 +1018,31 @@ class DevGiteaStartRequest:
 
 
 @dataclass(frozen=True)
+class DevPasswdRequest:
+    """Set the sandbox-admin gitea password — the human's interactive gitea
+    identity. ``password`` is a SECRET (repr=False): it reaches only the gitea
+    change-password exec, never a Result, never a durable sink. Deliberately a
+    SEPARATE secret from the master password (gitea would otherwise become a
+    second, weaker verifier/store of it)."""
+    password: str = field(repr=False)
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "DevPasswdRequest":
+        pw = kw.get("password")
+        if not isinstance(pw, str):
+            raise ValidationError("password must be a string")
+        if pw != pw.strip():
+            # Reject rather than silently strip: a trailing-whitespace password
+            # would become gitea's literal sign-in credential, invisible to the
+            # operator (the CLI's getpass/stdin read strips upstream anyway).
+            raise ValidationError("password must not start or end with whitespace")
+        if len(pw) < MIN_PASSWORD_LENGTH:
+            raise ValidationError(
+                f"password must be at least {MIN_PASSWORD_LENGTH} characters")
+        return cls(password=pw)
+
+
+@dataclass(frozen=True)
 class ReviewRequest:
     """One PR review in the ephemeral sandboxed reviewer (STAGE_DEV_GITEA S4).
     Shape-validation only — repo existence / gitea state are checked in the
@@ -1118,6 +1144,11 @@ class DevStatusResult:
 @dataclass
 class DevGiteaStartResult:
     running: bool
+
+
+@dataclass
+class DevPasswdResult:
+    user: str                                   # never the password
 
 
 @dataclass
@@ -6819,6 +6850,35 @@ def dev_gitea_start(_req: "DevGiteaStartRequest", progress=None) -> DevGiteaStar
     pull streams milestones to the view log; the browser tails to completion."""
     _provision_gitea(progress)
     return DevGiteaStartResult(running=True)
+
+
+def dev_passwd(req: "DevPasswdRequest", progress=None) -> DevPasswdResult:  # type: ignore[name-defined]
+    """Set the sandbox-admin gitea password (the Management → Infrastructure
+    dialog + `research dev passwd`). Requires an ENABLED gitea — resumes a
+    stopped one, never creates (the not-enabled die() carries the enable remedy
+    and no secret). The password rides `docker exec` argv into our own gitea
+    container — the bootstrap_accounts precedent. Failure raises HarnessError
+    (split sinks), never die(): die-text tees to the durable full log, and
+    gitea's stderr could echo argv."""
+    progress = progress or _NULL_PROGRESS
+    _resume_gitea(require=True)
+    progress.step("set", "setting the gitea password")
+    # --must-change-password=false matches both bootstrap `user create` calls:
+    # without it a (version-dependent) forced change at next sign-in defeats
+    # the web-UI login this verb exists to enable.
+    r = run(["docker", "exec", "-u", "git", gitea.GITEA_CONTAINER,
+             "gitea", "admin", "user", "change-password",
+             "--username", gitea.ADMIN_USER, "--password", req.password,
+             "--must-change-password=false"], capture_output=True)
+    if r.returncode != 0:
+        # Scrub the password literal from the FULL output BEFORE slicing — a
+        # slice-first could truncate the literal at the boundary and the
+        # replace would miss the fragment.
+        detail = ((r.stderr or "") + (r.stdout or "")).replace(
+            req.password, "***").strip()
+        raise HarnessError("gitea change-password failed",
+                           detail[-200:] if detail else "")
+    return DevPasswdResult(user=gitea.ADMIN_USER)
 
 
 def dev_box_provision(req: "DevBoxProvisionRequest", progress=None) -> dict:  # type: ignore[name-defined]

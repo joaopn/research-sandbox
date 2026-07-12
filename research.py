@@ -1645,29 +1645,17 @@ def cmd_webui(args: argparse.Namespace) -> None:
 def cmd_dev_passwd(args: argparse.Namespace) -> None:
     """Set the sandbox-admin gitea password — the human's interactive gitea
     identity (the webui Development page's Gitea tab sign-in). Bootstrap mints
-    and DISCARDS a random one, so this is how the operator makes the gitea web
-    UI passable. Host-CLI only (no broker verb): it sets a human credential.
-    The password rides `docker exec` argv into our own gitea container — the
-    exact bootstrap_accounts precedent (gitea admin user create --password)."""
+    and DISCARDS a random one, so this (or the Management → Infrastructure
+    dialog) is how the operator makes the gitea web UI passable."""
     import getpass
-    from broker_auth import MIN_PASSWORD_LENGTH
     pw = sys.stdin.readline().strip() if not sys.stdin.isatty() \
         else getpass.getpass("New sandbox-admin password (input hidden): ").strip()
-    if len(pw) < MIN_PASSWORD_LENGTH:
-        die(f"password must be at least {MIN_PASSWORD_LENGTH} characters")
-    rscore._resume_gitea(require=True)   # resume an enabled gitea; never create
-    # --must-change-password=false matches both bootstrap `user create` calls:
-    # without it a (version-dependent) forced change at next sign-in defeats
-    # the web-UI login this command exists to enable.
-    r = run(["docker", "exec", "-u", "git", gitea.GITEA_CONTAINER,
-             "gitea", "admin", "user", "change-password",
-             "--username", gitea.ADMIN_USER, "--password", pw,
-             "--must-change-password=false"], capture_output=True)
-    if r.returncode != 0:
-        # Never echo gitea's stderr verbatim at full length — coarse tail only.
-        detail = (r.stderr or r.stdout or "").strip()
+    req = _build(rscore.DevPasswdRequest, password=pw)
+    try:
+        rscore.dev_passwd(req)
+    except rscore.HarnessError as e:
         die(f"could not set the {gitea.ADMIN_USER} password"
-            + (f" ({detail[-200:]})" if detail else ""))
+            + (f" ({e.client_detail})" if e.client_detail else ""))
     print(f"password set for {gitea.ADMIN_USER} — sign in on the webui's "
           f"Development page (Gitea tab)")
 

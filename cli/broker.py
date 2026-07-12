@@ -90,7 +90,8 @@ BROKER_FULLLOG_DIR = BROKER_DIR / "oplogs-full"     # .full.log — host-only
 # Verbs that get a per-op progress log: the long-running lifecycle writes. Reads
 # (OPEN_VERBS) and auth verbs never produce one. op_id-driven from the webui.
 PROGRESS_VERBS = frozenset({"create", "update", "destroy", "start", "stop",
-                            "box_add", "box_remove", "dev_gitea_start"})
+                            "box_add", "box_remove", "dev_gitea_start",
+                            "dev_passwd"})
 
 # op_id names a file, so it is validated as a safe basename before it ever does:
 # first char alnum, rest alnum/dot/dash/underscore — no path separator, no
@@ -572,6 +573,10 @@ DEV_TARGET_WEBUI_FIELDS = frozenset({"repo"})
 # ride stdin), never a durable sink.
 DEV_BOX_WEBUI_FIELDS = frozenset({"project", "url", "pat", "name", "agent",
                                   "editor"})
+# The gitea-password verb's input boundary: ONE field, a SECRET (repr=False on
+# the request, off the Result, never a durable sink). The step-up `proof` is
+# consumed in dispatch and never reaches this filter.
+DEV_PASSWD_WEBUI_FIELDS = frozenset({"password"})
 
 
 def _verb_dev_repo_remove(args: dict, _progress=None) -> dict:
@@ -618,6 +623,17 @@ def _verb_dev_gitea_start(_args: dict, progress=None) -> dict:
     return dataclasses.asdict(rscore.dev_gitea_start(req, progress))
 
 
+def _verb_dev_passwd(args: dict, progress=None) -> dict:
+    # Set the sandbox-admin gitea password (the Management → Infrastructure
+    # dialog). Step-up gated (STEP_UP_VERBS): a stolen session cookie must not
+    # suffice to mint a gitea-admin credential. The password is the single
+    # allow-listed field; a change-password failure raises HarnessError so the
+    # detail never reaches the durable full log unscrubbed.
+    safe = {k: v for k, v in args.items() if k in DEV_PASSWD_WEBUI_FIELDS}
+    req = rscore.DevPasswdRequest.from_kwargs(**safe)    # may raise ValidationError
+    return dataclasses.asdict(rscore.dev_passwd(req, progress))
+
+
 # The closed lifecycle vocabulary — the host-root boundary. Adding a verb here
 # is a deliberate, security-reviewed edit; never a docker passthrough.
 VERBS = {
@@ -650,6 +666,7 @@ VERBS = {
     "dev_sync": _verb_dev_sync,
     "dev_status": _verb_dev_status,
     "dev_gitea_start": _verb_dev_gitea_start,
+    "dev_passwd": _verb_dev_passwd,
 }
 
 # Verbs requiring step-up re-auth: a FRESH login proof (derived client-side
@@ -657,7 +674,8 @@ VERBS = {
 # token, so a stolen token alone cannot trigger them. `destroy` is
 # the data-destroying verb; this is the cheap half of its gate (the recoverable
 # soft-delete + rate-limit land before the webui is exposed beyond localhost).
-STEP_UP_VERBS = frozenset({"destroy", "box_remove", "dev_repo_remove"})
+STEP_UP_VERBS = frozenset({"destroy", "box_remove", "dev_repo_remove",
+                           "dev_passwd"})
 
 # Deny-by-default gating: a verb in VERBS but NOT in this read allowlist
 # requires a valid session token. Inverting the set (vs an explicit *gated*
