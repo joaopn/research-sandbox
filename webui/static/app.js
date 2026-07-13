@@ -993,6 +993,21 @@ function ensureMobileChip() {
     strip.appendChild(chip);
 }
 
+// The desktop twin of ensureMobileChip, and it exists for the same softlock.
+// The Projects TAB is the only opener of an unpinned (auto-collapsed) rail, it
+// is the strip's first child, and it is created ONLY by renderDashboard /
+// renderServiceTabs — neither of which runs on activateProject's zero-visible
+// landing (a project whose supervisor is down, or whose service probe failed).
+// showWelcome's wipe therefore removes it with nothing left to re-create it:
+// rail collapsed, opener gone, recovery only by page reload. Guarded + first-
+// child so a later renderServiceTabs produces the same DOM order.
+function ensureProjectsTab() {
+    if (mobileModeActive()) return;          // there the chip is the opener; this tab is CSS-hidden
+    const strip = document.getElementById("service-tabs");
+    if (!strip || strip.querySelector(".projects-tab")) return;
+    strip.insertBefore(makeProjectsTab(), strip.firstChild);
+}
+
 // Drawer-scrim semantics: a tap on the exposed service pane beside the open
 // drawer CLOSES it instead of typing into a half-visible terminal. Mirrors
 // installRailOutsideClickHandlers' exclusion walk — the drawer itself, the
@@ -1274,7 +1289,9 @@ async function renderSoftwareInto(view) {
     if (res.status === 503) return renderMgmtUnavailable(view);
     let body;
     try { body = await res.json(); } catch (e) { return renderMgmtUnavailable(view); }
-    if (!res.ok || !body.ok || !body.result) return renderMgmtUnavailable(view);
+    if (!res.ok || !body.ok || !body.result) {
+        return renderMgmtVerbError(view, body, renderSoftwareInto);
+    }
     renderSoftwareScreen(view, body.result);
 }
 
@@ -1460,7 +1477,9 @@ async function renderManagementInto(view) {
     if (res.status === 503) return renderMgmtUnavailable(view);
     let body;
     try { body = await res.json(); } catch (e) { return renderMgmtUnavailable(view); }
-    if (!res.ok || !body.ok) return renderMgmtUnavailable(view);
+    if (!res.ok || !body.ok) {
+        return renderMgmtVerbError(view, body, renderManagementInto);
+    }
     renderMgmtTable(view, body.result || []);
     // Reuse the authoritative list to repopulate the sidebar's running set
     // (so opening / logging into Management surfaces running projects there too).
@@ -1529,6 +1548,25 @@ function renderMgmtUnavailable(view) {
         el("div", { class: "hint" }, [
             "Management is opt-in; the rest of the webui is unaffected.",
         ]),
+    ]);
+}
+
+// The broker ANSWERED and the verb refused or failed — a clean {ok:false,
+// error:{kind,message}} envelope, which arrives with HTTP 200 (the relay maps
+// its own failures to 401/403/503, peeled off before this). Rendering that as
+// "the broker isn't reachable" sends the operator to restart a daemon that is
+// perfectly fine and hides the real reason — the single most misleading signal
+// on the debugging path. Show the actual error, and offer a retry.
+function renderMgmtVerbError(view, body, retry) {
+    const again = el("button", { class: "btn btn-secondary" }, ["Retry"]);
+    again.onclick = () => retry(view);
+    mgmtCard(view, [
+        el("h2", {}, ["Couldn’t load this page"]),
+        el("p", { class: "error" }, [mgmtErrText(body)]),
+        el("div", { class: "hint" }, [
+            "The broker is reachable — it refused or failed this request.",
+        ]),
+        el("div", { class: "btn-row" }, [again]),
     ]);
 }
 
@@ -3032,7 +3070,9 @@ async function renderWorkflowsInto(view) {
     if (res.status === 503) return renderMgmtUnavailable(view);
     let body;
     try { body = await res.json(); } catch (e) { return renderMgmtUnavailable(view); }
-    if (!res.ok || !body.ok || !body.result) return renderMgmtUnavailable(view);
+    if (!res.ok || !body.ok || !body.result) {
+        return renderMgmtVerbError(view, body, renderWorkflowsInto);
+    }
     // Which workflows have a rendered Explain doc (baked static index — built-ins
     // only). Best-effort + cached: a missing index just means no Explain buttons.
     if (state.explainIndex === null) {
@@ -4949,9 +4989,13 @@ function showWelcome(clearTabs = true) {
     // Callers null state.activeService before showing the welcome — hide the
     // key bar to match (no-op on desktop / when the bar doesn't exist).
     updateMobileKeybar();
-    // The clearTabs wipe above removes the chip too — restore the fallback
-    // opener so a project-less mobile strip can still open the drawer.
+    // The clearTabs wipe above removes both openers — restore whichever this
+    // layout uses, or a project-less strip is a softlock (mobile: the drawer
+    // chip; desktop: the Projects tab of an unpinned, auto-collapsed rail).
+    // Both are guarded + idempotent, so the showWelcome(false) callers — whose
+    // strip still carries its openers — no-op through here.
     ensureMobileChip();
+    ensureProjectsTab();
 }
 
 // ---- ssh-kind terminal -----------------------------------------------------
