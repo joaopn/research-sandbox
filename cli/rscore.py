@@ -64,6 +64,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import box_catalog  # noqa: E402  (box-preset catalog; staged into the supervisor)
 import defaults  # noqa: E402
 import mcp_registry  # noqa: E402
+import model_catalog  # noqa: E402  (agent model/effort catalog + per-type defaults; HOST-side only — never staged/baked into a container, see _read_models)
 import role_mcp  # noqa: E402
 import extension  # noqa: E402
 import workflow  # noqa: E402  (manifest store catalog; from_kwargs resolves --workflow)
@@ -337,6 +338,112 @@ def _run_light_harness(container: str, repo: str, ref: str, setup: str,
     return workdir if repo else ""
 
 
+# ---------------------------------------------------------------------------
+# Agent model + effort (STAGE_MODEL_SELECT). Four container types — supervisor,
+# worker, role, box — each resolving its OWN (model, effort) pair from
+# models/defaults.json ⊕ the operator's ~/.research-sandbox/model-defaults.json.
+# There is deliberately NO inheritance between types: a box does not follow the
+# supervisor, a worker follows nothing. One type, one lookup.
+#
+# The pair reaches an agent by one of two channels, split by who owns the argv:
+#   • a HUMAN-launched agent (supervisor / box tab) runs a login shell, not the
+#     agent — there is no argv to inject, so it rides container ENV
+#     (ANTHROPIC_MODEL / CLAUDE_CODE_EFFORT_LEVEL, both read by the agent CLI);
+#   • an agent WE spawn (analysis worker, role-MCP per-call session) gets the
+#     explicit --model / --effort flags, built in the entrypoint from the
+#     RS_AGENT_* env we set on its container.
+# Deliberately NOT ~/.claude/settings.json: a worker's settings.json is a COPY of
+# the supervisor's, so a `model` key there would propagate supervisor→worker —
+# exactly inverted — and it is installed no-clobber at six entrypoints, so
+# changing it later would silently not take.
+# ---------------------------------------------------------------------------
+def _resolve_model_pair(ctype: str, model: str = "", effort: str = "", *,
+                        catalog: dict | None = None,
+                        pairs: dict | None = None) -> tuple[str, str]:
+    """model_catalog.resolve with its error mapped onto the PRE-SIDE-EFFECT
+    ValidationError channel: a typo in the operator's override file, an unknown
+    alias, or an impossible model/effort pair must refuse the request cleanly
+    rather than half-create a project (or freeze a bad pair into its marker)."""
+    try:
+        return model_catalog.resolve(ctype, model, effort,
+                                     catalog=catalog, defaults=pairs)
+    except model_catalog.ModelCatalogError as e:
+        raise ValidationError(str(e)) from e
+
+
+def _resolve_all_model_pairs(supervisor: tuple[str, str] = ("", ""),
+                             worker: tuple[str, str] = ("", ""),
+                             role: tuple[str, str] = ("", ""),
+                             box: tuple[str, str] = ("", "")) -> dict[str, dict[str, str]]:
+    """Resolve all FOUR container types into concrete, mutually-valid pairs — the
+    exact shape written into `.orchestrator/project.json`.
+
+    Every pair (including `box`, which has no create-time field and therefore
+    comes straight from the defaults file) passes through the effort-support drop
+    BEFORE it is written. That is what makes the marker safe by construction: the
+    in-supervisor readers (`rs-worker`, `rs-sandbox`) consume it VERBATIM and have
+    no catalog to check it against — they are staged as standalone stdlib scripts
+    and there is no `cli/` package in the image. Without this, an operator
+    override of `box: {haiku, max}` would be frozen into the marker and the
+    in-supervisor `rs-sandbox create` would compose `--model haiku --effort max`,
+    the one pair this whole mechanism exists to make unconstructible."""
+    catalog = _model_catalog_checked()
+    pairs = _model_defaults_checked(catalog)
+    out: dict[str, dict[str, str]] = {}
+    for ctype, supplied in (("supervisor", supervisor), ("worker", worker),
+                            ("role", role), ("box", box)):
+        m, e = _resolve_model_pair(ctype, supplied[0], supplied[1],
+                                   catalog=catalog, pairs=pairs)
+        out[ctype] = {"model": m, "effort": e}
+    return out
+
+
+def _box_model_shape(kw: dict) -> tuple[str, str]:
+    """Validate the EXPLICITLY-supplied box model/effort — shape + the pair, and
+    nothing else. No defaulting: a box's fallback is the project's `box` marker
+    pair, and this validator has no project context (the same reason preset-∈-
+    catalog and mcps-⊆-allowlist are gated in box_add, not here).
+
+    The pair IS checked when both halves are given, so an impossible combination
+    is refused at the synchronous gate. That matters most on the dev lane: its
+    provision verb runs detached, and a ValidationError raised child-side lands in
+    the host-only full log while the browser only sees a coarse failure token —
+    so a bad pair must be refused HERE, at the POST, with a clean envelope."""
+    model = kw.get("model") or ""
+    effort = kw.get("effort") or ""
+    if not isinstance(model, str) or not isinstance(effort, str):
+        raise ValidationError("box model and effort must be strings")
+    if not model and not effort:
+        return "", ""
+    catalog = _model_catalog_checked()
+    if model and model not in model_catalog.aliases(catalog):
+        raise ValidationError(
+            f"unknown model {model!r}; must be one of "
+            f"{model_catalog.aliases(catalog)}")
+    if effort and effort not in catalog["efforts"]:
+        raise ValidationError(
+            f"unknown effort level {effort!r}; must be one of {catalog['efforts']}")
+    if model and effort and not model_catalog.supports_effort(model, effort, catalog):
+        raise ValidationError(
+            f"model {model!r} does not accept an effort level; "
+            f"remove the effort setting for this box")
+    return model, effort
+
+
+def _model_catalog_checked() -> dict:
+    try:
+        return model_catalog.load_catalog()
+    except model_catalog.ModelCatalogError as e:
+        raise ValidationError(str(e)) from e
+
+
+def _model_defaults_checked(catalog: dict) -> dict[str, dict[str, str]]:
+    try:
+        return model_catalog.load_defaults(catalog=catalog)
+    except model_catalog.ModelCatalogError as e:
+        raise ValidationError(str(e)) from e
+
+
 @dataclass(frozen=True)
 class CreateRequest:
     name: str
@@ -391,6 +498,23 @@ class CreateRequest:
     # never a raw relayed create.
     dev_lane: bool = False
     dev_repo: str = ""
+    # Agent model + effort per container type (STAGE_MODEL_SELECT). "" = not
+    # specified ⇒ the type's default from models/defaults.json ⊕ the operator
+    # override. RESOLVED here in from_kwargs (host-side) and frozen CONCRETE into
+    # the project marker — never a sentinel, because the in-supervisor readers
+    # consume the marker verbatim and cannot resolve anything (no catalog there).
+    # `worker_*`/`role_*` are rejected on a workflow with no worker layer. There
+    # is no box_* field: a box's pair is chosen per-box at box-add, and its
+    # DEFAULT is written to the marker straight from the defaults file.
+    # These names are claude-shaped (ANTHROPIC_MODEL / CLAUDE_CODE_EFFORT_LEVEL);
+    # the day a second agent framework lands they become agent-keyed — which is
+    # exactly why a box carries its own pair rather than inheriting one.
+    supervisor_model: str = ""
+    supervisor_effort: str = ""
+    worker_model: str = ""
+    worker_effort: str = ""
+    role_model: str = ""
+    role_effort: str = ""
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "CreateRequest":
@@ -526,6 +650,33 @@ class CreateRequest:
         if reader_on and substrate is Substrate.DIND_SYSBOX and not reader_dist_present():
             raise ValidationError(
                 "no cached reader dist — run `research reader pull` first")
+        # Agent model + effort (STAGE_MODEL_SELECT). Resolve HERE — the one
+        # pre-side-effect validation point — so a bad override file or an
+        # impossible model/effort pair refuses the create cleanly instead of
+        # freezing a broken pair into the marker. An explicitly-set effort a model
+        # cannot support raises; a merely-defaulted one is dropped (else choosing
+        # an effort-less tier for a type whose default effort is set could not be
+        # expressed at all). Only the docker substrate lacks NOTHING here: every
+        # flavor has an agent the researcher talks to, so `supervisor_*` always
+        # applies. `worker_*`/`role_*` exist only where a worker layer does.
+        catalog = _model_catalog_checked()
+        model_pairs = _model_defaults_checked(catalog)
+        has_worker_layer = (project_type is ProjectType.RESEARCH
+                            and substrate is Substrate.DIND_SYSBOX)
+        for f in ("worker_model", "worker_effort", "role_model", "role_effort"):
+            if (kw.get(f) or "") and not has_worker_layer:
+                raise ValidationError(
+                    f"--{f.replace('_', '-')} is only valid on a workflow with a "
+                    f"worker layer (the research workflow); this workflow has none")
+        sup_m, sup_e = _resolve_model_pair(
+            "supervisor", kw.get("supervisor_model") or "",
+            kw.get("supervisor_effort") or "", catalog=catalog, pairs=model_pairs)
+        wrk_m, wrk_e = _resolve_model_pair(
+            "worker", kw.get("worker_model") or "", kw.get("worker_effort") or "",
+            catalog=catalog, pairs=model_pairs)
+        rol_m, rol_e = _resolve_model_pair(
+            "role", kw.get("role_model") or "", kw.get("role_effort") or "",
+            catalog=catalog, pairs=model_pairs)
         return cls(
             name=_require_name(kw.get("name")),
             workflow=workflow_id,
@@ -551,6 +702,9 @@ class CreateRequest:
             greeting=greeting,
             dev_lane=dev_lane,
             dev_repo=dev_repo,
+            supervisor_model=sup_m, supervisor_effort=sup_e,
+            worker_model=wrk_m, worker_effort=wrk_e,
+            role_model=rol_m, role_effort=rol_e,
         )
 
 
@@ -599,9 +753,70 @@ class UpdateRequest:
     enable: tuple[str, ...] = ()
     disable: tuple[str, ...] = ()
     role_mcp_upstream: tuple[str, ...] = ()
+    # Agent model + effort (STAGE_MODEL_SELECT). ⚠ On THIS request "" means
+    # **UNCHANGED** — NOT "apply the type default", which is what it means on the
+    # identically-named CreateRequest fields. UpdateRequest has no other scalar
+    # string field, so the distinction has no local precedent and must be stated:
+    # were "" to re-default here, `update --worker-model haiku` would silently
+    # stamp the type defaults over the supervisor and role pairs the researcher
+    # had already chosen, AND — because the supervisor pair would then look
+    # "changed" — it would trigger the multi-minute _recreate_supervisor that the
+    # granular update path exists to avoid. `live_ok` requires all six to be empty
+    # for exactly this reason; the two are a matched pair.
+    supervisor_model: str = ""
+    supervisor_effort: str = ""
+    worker_model: str = ""
+    worker_effort: str = ""
+    role_model: str = ""
+    role_effort: str = ""
+
+    def model_changes(self) -> dict[str, dict[str, str]]:
+        """The per-type model/effort fields the caller actually SET, as
+        {type: {model?, effort?}}. Empty dict ⇒ no model change requested."""
+        out: dict[str, dict[str, str]] = {}
+        for ctype, m, e in (("supervisor", self.supervisor_model, self.supervisor_effort),
+                            ("worker", self.worker_model, self.worker_effort),
+                            ("role", self.role_model, self.role_effort)):
+            blk = {}
+            if m:
+                blk["model"] = m
+            if e:
+                blk["effort"] = e
+            if blk:
+                out[ctype] = blk
+        return out
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "UpdateRequest":
+        # Validate ONLY what was supplied — no defaulting (see the field note).
+        catalog = None
+        vals: dict[str, str] = {}
+        for f in ("supervisor_model", "supervisor_effort", "worker_model",
+                  "worker_effort", "role_model", "role_effort"):
+            v = kw.get(f) or ""
+            if v and not isinstance(v, str):
+                raise ValidationError(f"{f} must be a string")
+            if v:
+                catalog = catalog or _model_catalog_checked()
+                if f.endswith("_model") and v not in model_catalog.aliases(catalog):
+                    raise ValidationError(
+                        f"unknown model {v!r}; must be one of "
+                        f"{model_catalog.aliases(catalog)}")
+                if f.endswith("_effort") and v not in catalog["efforts"]:
+                    raise ValidationError(
+                        f"unknown effort level {v!r}; must be one of "
+                        f"{catalog['efforts']}")
+            vals[f] = v
+        # A model+effort pair supplied TOGETHER is checked here; a model supplied
+        # against a STORED effort is re-checked in update() against the marker
+        # (there the stored effort is dropped, not rejected — the researcher
+        # explicitly asked for the new model, so the model wins).
+        for ctype in ("supervisor", "worker", "role"):
+            m, e = vals[f"{ctype}_model"], vals[f"{ctype}_effort"]
+            if m and e and not model_catalog.supports_effort(m, e, catalog):
+                raise ValidationError(
+                    f"model {m!r} does not accept an effort level; "
+                    f"remove --{ctype}-effort")
         return cls(
             name=_require_name(kw.get("name")),
             rebuild=bool(kw.get("rebuild", False)),
@@ -609,6 +824,7 @@ class UpdateRequest:
             enable=_as_tuple(kw.get("enable")),
             disable=_as_tuple(kw.get("disable")),
             role_mcp_upstream=_as_tuple(kw.get("role_mcp_upstream")),
+            **vals,
         )
 
 
@@ -688,6 +904,11 @@ class UpdateResult:
     refreshed_claude: bool
     workers_enabled: list[str] = field(default_factory=list)
     workers_disabled: list[str] = field(default_factory=list)
+    # Container types whose STORED effort a model change invalidated and which
+    # therefore had it dropped (e.g. `--worker-model haiku` against a stored
+    # `max`: haiku accepts no effort level, and the explicitly-requested model
+    # wins). Reported so the drop is never silent.
+    effort_dropped: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -722,6 +943,13 @@ class BoxAddRequest:
     repo: str = ""
     ref: str = ""
     setup: str = ""
+    # Agent model + effort for THIS box (STAGE_MODEL_SELECT). "" = not specified ⇒
+    # the project's `box` default (resolved in box_add, which has the marker). A
+    # box carries its OWN pair rather than inheriting the supervisor's — that is
+    # what makes a future mixed-agent box (a different agent framework from its
+    # parent) expressible at all.
+    model: str = ""
+    effort: str = ""
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "BoxAddRequest":
@@ -759,11 +987,18 @@ class BoxAddRequest:
             v = kw.get(fld)
             if v is not None and not isinstance(v, str):
                 raise ValidationError(f"{fld} must be a string")
+        # Agent model + effort (STAGE_MODEL_SELECT). Validate ONLY what the caller
+        # explicitly supplied — no defaulting here. The fallback to the project's
+        # `box` default needs the project's marker, which this context-free
+        # validator does not have, so it lives in box_add (the same reason
+        # preset-∈-catalog and mcps-⊆-allowlist do).
+        _model, _effort = _box_model_shape(kw)
         return cls(
             project=_require_name(kw.get("project")), name=name, preset=preset,
             agent=agent, editor=bool(kw.get("editor", False)),
             mcps=tuple(mcps), repo=(kw.get("repo") or "").strip(),
-            ref=(kw.get("ref") or "").strip(), setup=(kw.get("setup") or ""))
+            ref=(kw.get("ref") or "").strip(), setup=(kw.get("setup") or ""),
+            model=_model, effort=_effort)
 
 
 @dataclass(frozen=True)
@@ -1113,6 +1348,8 @@ class DevBoxProvisionRequest:
     name: str | None = None                     # box name (None ⇒ derived from repo HERE)
     agent: str | None = None                    # claude | none | None (preset default)
     editor: bool = False
+    model: str = ""                             # agent model for the box ("" ⇒ project's box default)
+    effort: str = ""
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "DevBoxProvisionRequest":
@@ -1138,12 +1375,20 @@ class DevBoxProvisionRequest:
         # Delegate the box-field validation (project name, box-name regex, agent
         # enum) to the shipped choke point — constructed for its validated
         # fields; shape-only, no docker (box_add re-gates semantics child-side).
+        # model/effort ride the SAME delegation — a hand-written kwarg list does
+        # not forward a new field, and this is the PRE-SPAWN gate: miss it and an
+        # impossible pair passes the synchronous POST, the broker spawns the
+        # detached child, and the child's own validation raises where the reason
+        # goes to the HOST-ONLY full log while the browser gets only a coarse
+        # "provision failed". Refuse here, with a clean envelope. Populate from
+        # the VALIDATED sub-request (never a partial copy of the raw kwargs).
         box = BoxAddRequest.from_kwargs(
             project=kw.get("project"), name=name, preset="dev",
-            agent=kw.get("agent"), editor=kw.get("editor"), repo=repo)
+            agent=kw.get("agent"), editor=kw.get("editor"), repo=repo,
+            model=kw.get("model"), effort=kw.get("effort"))
         return cls(project=box.project, url=url, repo=repo,
                    pat=(pat or "").strip(), name=box.name, agent=box.agent,
-                   editor=box.editor)
+                   editor=box.editor, model=box.model, effort=box.effort)
 
 
 @dataclass(frozen=True)
@@ -1166,6 +1411,11 @@ class DevProjectProvisionRequest:
     egress: str | None = None
     enable: tuple = ()
     disable: tuple = ()
+    # A dev project has no worker/role layer, so it carries the supervisor pair
+    # only — one model picker on the dev card, like any other non-research
+    # workflow's create dialog.
+    supervisor_model: str = ""
+    supervisor_effort: str = ""
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "DevProjectProvisionRequest":
@@ -1191,13 +1441,22 @@ class DevProjectProvisionRequest:
         # mirror-stamp floor: at pre-spawn the mirror doesn't exist yet (the
         # child's dev_repo_add creates it first); the verb re-runs from_kwargs
         # with the floor ON child-side.
+        # supervisor_model/effort ride the SAME delegation (the pre-spawn gate —
+        # see the DevBoxProvisionRequest note: a ValidationError raised child-side
+        # in the detached lane is invisible to the browser). Populate from the
+        # VALIDATED CreateRequest, so the resolved pair — not the raw input — is
+        # what the child re-derives from.
         cr = CreateRequest.from_kwargs(
             name=kw.get("name"), workflow=workflow, dev_repo=repo,
             egress=egress, enable=enable, disable=disable,
+            supervisor_model=kw.get("supervisor_model"),
+            supervisor_effort=kw.get("supervisor_effort"),
             dev_repo_preflight=False)
         return cls(name=cr.name, url=url, repo=repo, workflow=workflow,
                    pat=(pat or "").strip(), egress=egress,
-                   enable=enable, disable=disable)
+                   enable=enable, disable=disable,
+                   supervisor_model=cr.supervisor_model,
+                   supervisor_effort=cr.supervisor_effort)
 
 
 @dataclass
@@ -1469,8 +1728,20 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     orch_dir = workspace_path / ".orchestrator"
     orch_dir.mkdir(parents=True, exist_ok=True)
     deployed_agents = list(req.agents) if is_docker else []
+    # Agent model + effort (STAGE_MODEL_SELECT): all FOUR container types, frozen
+    # CONCRETE and already effort-drop-resolved. `box` has no create-time field —
+    # it comes straight from the defaults file — so it MUST pass through the same
+    # resolver here, or an operator override of `box: {haiku, max}` would land in
+    # the marker as an impossible pair and the in-supervisor `rs-sandbox create`
+    # (which reads it verbatim, with no catalog to check it) would compose
+    # `--model haiku --effort max`.
+    model_pairs = _resolve_all_model_pairs(
+        supervisor=(req.supervisor_model, req.supervisor_effort),
+        worker=(req.worker_model, req.worker_effort),
+        role=(req.role_model, req.role_effort))
     marker = {"type": project_type, "substrate": substrate.value,
-              "workflow": req.workflow, "agents": deployed_agents}
+              "workflow": req.workflow, "agents": deployed_agents,
+              "models": model_pairs}
     if project_type == PROJECT_TYPE_SANDBOX_DIND:
         # Freeze the box-image pins (lane-3): sandbox-dind eager-stages the box
         # harness (STAGE_DIND_UNIFY — the harness is a standing dind utility now,
@@ -1543,6 +1814,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         project_type=project_type,
         substrate=substrate.value,
         service_flags=service_flags,
+        agent_pair=model_pairs["supervisor"],
     )
     if extra_mounts:
         docker_args = docker_args[:-1] + extra_mounts + [docker_args[-1]]
@@ -2006,14 +2278,57 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     # ({"code-server","reader"}) falls through to the full recreate, which stages +
     # deploys per the resolved flags and clears both overrides — no live path needed.
     touched = _parse_service_list(enable_services) | _parse_service_list(disable_services)
+    # Agent model/effort changes (STAGE_MODEL_SELECT). Merge them into the marker
+    # FIRST — every downstream path (the live toggles, the full recreate, the
+    # role-mcp restart) reads the marker, so writing it once here means each of
+    # them picks the change up without its own special case.
+    model_changes = req.model_changes()
+    effort_dropped: list[str] = []
+    if model_changes:
+        effort_dropped = _apply_model_changes(workspace_path, model_changes)
+    # `live_ok` must exclude any model change: `--worker-model haiku --enable
+    # code-server` would otherwise take the live-editor fast path, which returns
+    # without ever applying the worker pair to anything (the pair is in the marker
+    # now, but the role containers would not be re-run and a supervisor change
+    # would not be recreated) — a silent half-application.
     live_ok = (not req.rebuild and not enable_workers and not disable_workers
-               and not req.role_mcp_upstream)
+               and not req.role_mcp_upstream and not model_changes)
     if live_ok and touched == {"code-server"}:
         enable = "code-server" in _parse_service_list(enable_services)
         return _live_toggle_editor(project, cfg, container, workspace_path, enable, progress)
     if live_ok and touched == {"reader"}:
         enable = "reader" in _parse_service_list(enable_services)
         return _live_toggle_reader(project, cfg, container, workspace_path, enable, progress)
+    # Granular model application — the point of writing the marker above. Only a
+    # SUPERVISOR pair change needs the multi-minute recreate (its env is fixed at
+    # docker run); the other two are far cheaper and must not pay for it:
+    #   * worker  → nothing at all. `rs-worker spawn` reads the marker per spawn,
+    #     so the next worker picks it up; workers already mid-run correctly keep
+    #     the model they started on.
+    #   * role    → re-run just the role-MCP containers (their env is also fixed
+    #     at docker run), honoring the in-flight gate. The supervisor — and the
+    #     researcher's session in it — is untouched.
+    # A model change MIXED with anything else falls through to the full recreate
+    # below, which re-reads the marker anyway (the code-server/reader precedent).
+    if (model_changes and not touched and not req.rebuild and not enable_workers
+            and not disable_workers and not req.role_mcp_upstream):
+        changed = set(model_changes)
+        if changed == {"worker"}:
+            progress.step("models", "applying the worker model")
+            print("worker model updated; the next `rs-worker spawn` picks it up "
+                  "(no container touched).")
+            return UpdateResult(project=project, rebuilt=False,
+                                refreshed_claude=False,
+                                effort_dropped=effort_dropped)
+        if changed == {"role"}:
+            progress.step("models", "applying the role model")
+            _restart_role_mcps_for_models(project, cfg, workspace_path)
+            return UpdateResult(project=project, rebuilt=False,
+                                refreshed_claude=False,
+                                effort_dropped=effort_dropped)
+        # A `role` change alongside a `supervisor` change still needs the
+        # recreate, which relaunches the role containers from the marker — so it
+        # falls through with no extra work here.
 
     if req.rebuild:
         progress.step("rebuild", "rebuilding images")
@@ -2077,7 +2392,8 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
 
     return UpdateResult(
         project=project, rebuilt=req.rebuild, refreshed_claude=refreshed,
-        workers_enabled=workers_enabled, workers_disabled=workers_disabled)
+        workers_enabled=workers_enabled, workers_disabled=workers_disabled,
+        effort_dropped=effort_dropped)
 
 
 # ===========================================================================
@@ -2701,6 +3017,7 @@ def build_supervisor_docker_args(
     project_type: str = PROJECT_TYPE_RESEARCH,
     substrate: str = Substrate.DIND_SYSBOX.value,
     service_flags: dict[str, bool] | None = None,
+    agent_pair: dict[str, str] | None = None,
 ) -> list[str]:
     is_docker = substrate == Substrate.DOCKER.value
     args = [
@@ -2756,6 +3073,13 @@ def build_supervisor_docker_args(
     idle = os.environ.get("CODE_SERVER_IDLE_SECONDS")
     if idle:
         args += ["-e", f"CODE_SERVER_IDLE_SECONDS={idle}"]
+    # Agent model + effort for the agent the RESEARCHER talks to in this container
+    # (STAGE_MODEL_SELECT). This one builder serves the research supervisor, the
+    # sandbox-dind supervisor AND the docker box — all three run a login shell in
+    # their tab (not the agent), so there is no argv to inject and the pair must
+    # ride the env the agent CLI reads. Callers pass the marker's `supervisor`
+    # pair; an absent pair emits nothing (pre-STAGE_MODEL_SELECT project).
+    args += _model_env_args(agent_pair)
     for s in dns_servers:
         args += ["--dns", s]
 
@@ -4414,6 +4738,10 @@ def _recreate_supervisor(
         project_type=md_ptype,
         substrate=md["substrate"],
         service_flags=flags,
+        # From the MARKER, never the live container's env: the marker is the
+        # durable source (it survives the rm+create), so a recreate cannot revert
+        # the researcher's model choice.
+        agent_pair=_read_models(workspace_path).get("supervisor"),
     )
     if md["extra_mounts"]:
         docker_args = docker_args[:-1] + md["extra_mounts"] + [docker_args[-1]]
@@ -4638,6 +4966,15 @@ def _update_docker_substrate(req: "UpdateRequest", cfg: "Config",  # type: ignor
     enable_svcs = _parse_service_list(enable_services)
     disable_svcs = _parse_service_list(disable_services)
     touched = enable_svcs | disable_svcs
+    # A model change on this substrate is REFUSED, not ignored. It must be named
+    # in the guard: without it, `update --supervisor-model opus --enable
+    # code-server` passes (the guard sees only a code-server flip), recreates the
+    # box, and drops the model silently. And a model-only update would otherwise
+    # die via `not touched` with a message about the *editor* — telling the
+    # operator the wrong thing about why their model change was refused.
+    if req.model_changes():
+        die("the agent model is fixed at create on the docker substrate "
+            "(a plain runc box); recreate the project to change it")
     if (req.rebuild or enable_workers or disable_workers or req.role_mcp_upstream
             or touched - {"code-server"} or not touched):
         die("`update` on the docker substrate only supports enabling or disabling "
@@ -4683,7 +5020,9 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
         memory=md["memory"], cpus=md["cpus"], image=MINIMAL_IMAGE,
         dind_mode=md["dind_mode"], inner_firewall=md["inner_firewall"],
         project_type=md["project_type"], substrate=md["substrate"],
-        service_flags=service_flags)
+        service_flags=service_flags,
+        # Marker-sourced, same reasoning as _recreate_supervisor.
+        agent_pair=_read_models(workspace_path).get("supervisor"))
     # Recovered binds minus any prior editor-dist mount (agent-dist + --data mounts
     # pass through); re-derive the editor mount from the new flag (mirrors create).
     extra = _without_mount(md["extra_mounts"], EDITOR_DIST_MOUNT)
@@ -5583,6 +5922,128 @@ def _write_box_pins(workspace_path: "Path", box_pins: dict[str, str]) -> None:
     f.write_text(json.dumps(data, indent=2) + "\n")
 
 
+def _read_models(workspace_path: "Path") -> dict[str, dict[str, str]]:
+    """The project's frozen per-type (model, effort) pairs from
+    .orchestrator/project.json, or {} for a pre-STAGE_MODEL_SELECT project.
+
+    {} means EMIT NO FLAGS — it deliberately does NOT fall back to the catalog
+    defaults, so an existing project keeps behaving exactly as it does today on
+    its next recreate instead of silently acquiring a model it never had
+    (greenfield: old projects are disposable, but they must not change under you).
+
+    Every pair in here is already RESOLVED and mutually valid (see
+    _resolve_all_model_pairs) — that is the contract the in-supervisor readers
+    (rs-worker, rs-sandbox) depend on, since they read it verbatim and have no
+    catalog to validate against."""
+    f = workspace_path / ".orchestrator" / "project.json"
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    models = data.get("models")
+    return models if isinstance(models, dict) else {}
+
+
+def _write_models(workspace_path: "Path", models: dict[str, dict[str, str]]) -> None:
+    """Write the per-type model pairs into project.json, KEEPING EVERY OTHER MARKER
+    KEY INTACT (mirrors _write_box_pins). A naive whole-file rewrite would silently
+    drop `type`, `substrate`, `workflow`, `agents`, and `box_image_pins` — which the
+    webui's flavor gate and every box recreate read — and the damage would surface
+    far from its cause."""
+    f = workspace_path / ".orchestrator" / "project.json"
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    data["models"] = models
+    f.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def _apply_model_changes(workspace_path: "Path",
+                         changes: dict[str, dict[str, str]]) -> list[str]:
+    """Merge per-type model/effort changes into the project marker and return the
+    types whose stored effort had to be DROPPED.
+
+    A model change can invalidate an effort that is already stored: `--worker-model
+    haiku` against a stored `max` cannot stand, because haiku accepts no effort
+    level. The researcher explicitly asked for haiku, so the model wins and the
+    effort is dropped — reported on the result, never silent. (An effort supplied
+    TOGETHER with an incompatible model already died in UpdateRequest.from_kwargs.)
+
+    Writes through _write_models, which is read-modify-write: the marker's other
+    keys (`type`, `substrate`, `workflow`, `agents`, `box_image_pins`) survive."""
+    catalog = _model_catalog_checked()
+    current = _read_models(workspace_path)
+    if not current:
+        # A pre-STAGE_MODEL_SELECT project has no block at all. Seed the missing
+        # types from the defaults so the merge lands on a complete marker rather
+        # than a partial one that would emit flags for some containers only.
+        current = _resolve_all_model_pairs()
+    merged = {t: dict(p) for t, p in current.items() if isinstance(p, dict)}
+    dropped: list[str] = []
+    for ctype, blk in changes.items():
+        pair = dict(merged.get(ctype) or {})
+        pair.update(blk)
+        model, effort = pair.get("model", ""), pair.get("effort", "")
+        if model and effort and not model_catalog.supports_effort(model, effort, catalog):
+            pair["effort"] = ""
+            dropped.append(ctype)
+        merged[ctype] = pair
+    _write_models(workspace_path, merged)
+    return dropped
+
+
+def _restart_role_mcps_for_models(project: str, cfg: "Config",
+                                  workspace_path: "Path") -> None:
+    """Re-run the project's ENABLED role-MCP containers so they pick up a changed
+    model pair. Their env is fixed at `docker run` (a plain restart does not
+    re-evaluate it), and _role_mcp_start is an idempotent rm+run — so this is the
+    whole of it. The supervisor is deliberately NOT touched: only the role
+    containers changed, and recreating the supervisor would kill the researcher's
+    session for no reason.
+
+    Refuses while a send_job is in flight rather than killing a live call (the
+    same gate `_role_mcp_stop` honors)."""
+    supervisor = container_name_for(project)
+    entries = role_mcp.load_role_mcps(workspace_path)
+    for role in sorted(entries):
+        running = _role_mcp_in_flight(workspace_path, role)
+        if running:
+            die(f"role-mcp {role!r} has {len(running)} call(s) in flight; "
+                f"retry once they finish (a model change re-runs its container)")
+    for role in sorted(entries):
+        print(f"re-running role-mcp {role!r} with the new model...")
+        _role_mcp_start(supervisor, project, cfg, role)
+
+
+def _model_env_args(pair: dict[str, str] | None) -> list[str]:
+    """`docker run` -e args for a HUMAN-launched agent (supervisor tab, box tab):
+    the tab runs a login shell, not the agent, so there is no argv to inject and
+    the pair rides the environment the agent CLI reads. Empty/absent pair → no
+    args at all (a pre-STAGE_MODEL_SELECT project is untouched). The effort half
+    is conditional: an effort-less tier (haiku) emits no effort var."""
+    if not pair or not pair.get("model"):
+        return []
+    args = ["-e", f"ANTHROPIC_MODEL={pair['model']}"]
+    if pair.get("effort"):
+        args += ["-e", f"CLAUDE_CODE_EFFORT_LEVEL={pair['effort']}"]
+    return args
+
+
+def _agent_flag_env_args(pair: dict[str, str] | None) -> list[str]:
+    """`docker run` -e args for an agent WE spawn (analysis worker, role-MCP): the
+    entrypoint turns these into explicit `--model` / `--effort` flags on the agent
+    command line. RS-namespaced on purpose — one active channel per container, so
+    a container never silently falls back to ANTHROPIC_MODEL if the flag-building
+    code is skipped."""
+    if not pair or not pair.get("model"):
+        return []
+    args = ["-e", f"RS_AGENT_MODEL={pair['model']}"]
+    if pair.get("effort"):
+        args += ["-e", f"RS_AGENT_EFFORT={pair['effort']}"]
+    return args
+
+
 def _stage_box_catalog(workspace_path: "Path", *, strict: bool) -> list[dict]:
     """Stage the resolved box-preset catalog into .orchestrator/box-catalog.json
     (STAGE_BOX_EXT_UX) so the in-supervisor rs-sandbox resolves presets offline,
@@ -6046,6 +6507,13 @@ def _role_mcp_start(supervisor: str, project: str, cfg: "Config",
         "-v", f"/workspace/shared/{role}:/workspace/published",
         "-v", "/workspace/.orchestrator:/etc/orchestrator:ro",
         *AGENT_DIST_MOUNT_ARGS,   # claude copy-source (no bake; slice 2)
+        # Agent model + effort for the per-call `claude -p` this daemon spawns
+        # (STAGE_MODEL_SELECT). RS-namespaced: spawn.sh turns these into explicit
+        # --model / --effort flags — we own that argv, so we use it rather than
+        # ANTHROPIC_MODEL, and there is exactly one active channel per container.
+        # Read verbatim from the marker (already resolved + effort-drop-checked).
+        # A model change re-runs this container (update's granular role path).
+        *_agent_flag_env_args(_read_models(workspace_path).get("role")),
         "-e", f"RS_ROLE_NAME={role}",
         "-e", f"RS_ROLE_MCP_PORT={role_mcp.ROLE_MCP_PORT}",
         # Daemon reads this to enforce the cap on send_job. 0 = uncapped.
@@ -6679,12 +7147,36 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         gitea.record_attachment(req.project, "agent", req.repo, ip,
                                 box=req.name, user=box_user)
         _stage_dev_gitea(req.project, cfg, gitea_ip=ip)
+    # Agent model + effort for this box (STAGE_MODEL_SELECT). Explicit wins;
+    # otherwise the project's `box` pair from the marker — which create already
+    # wrote CONCRETE and effort-drop-resolved, so it is safe to use as-is. A box
+    # does NOT inherit the supervisor's pair: one type, one lookup.
+    box_pair = _read_models(workspace_path).get("box") or {}
+    box_model = req.model or box_pair.get("model") or ""
+    box_effort = req.effort or box_pair.get("effort") or ""
+    if box_model and box_effort:
+        # Re-check the RESOLVED pair: an explicit `--model haiku` against a
+        # defaulted `max` must drop the effort, not compose an impossible pair.
+        # An explicit effort that the resolved model cannot support already died
+        # in from_kwargs when both were given; here only the defaulted half can
+        # be at fault, so dropping (never raising) is the right move.
+        _cat = _model_catalog_checked()
+        if not model_catalog.supports_effort(box_model, box_effort, _cat):
+            if req.effort:
+                raise ValidationError(
+                    f"model {box_model!r} does not accept an effort level; "
+                    f"remove the effort setting for this box")
+            box_effort = ""
     argv = ["docker", "exec", container, "rs-sandbox", "create"]
     if req.name:
         argv.append(req.name)
     argv += ["--preset", req.preset]
     if req.agent is not None:
         argv += ["--agent", req.agent]
+    if box_model:
+        argv += ["--model", box_model]
+    if box_effort:
+        argv += ["--effort", box_effort]
     if req.editor:
         argv.append("--editor")
     if req.mcps:
@@ -7202,7 +7694,8 @@ def dev_box_provision(req: "DevBoxProvisionRequest", progress=None) -> dict:  # 
     # PRE-SPAWN (never a post-migrate name failure).
     box = box_add(BoxAddRequest.from_kwargs(
         project=req.project, name=req.name, preset="dev", agent=req.agent,
-        editor=req.editor, repo=req.repo), progress)
+        editor=req.editor, repo=req.repo,
+        model=req.model, effort=req.effort), progress)
     return {"project": req.project, "repo": req.repo, "box": box.name,
             "container": box.container}
 
@@ -7229,7 +7722,9 @@ def dev_project_provision(req: "DevProjectProvisionRequest", progress=None) -> d
     dev_repo_add(DevRepoAddRequest.from_kwargs(url=req.url, pat=req.pat))
     cr = CreateRequest.from_kwargs(
         name=req.name, workflow=req.workflow, dev_repo=req.repo,
-        egress=req.egress, enable=req.enable, disable=req.disable)
+        egress=req.egress, enable=req.enable, disable=req.disable,
+        supervisor_model=req.supervisor_model,
+        supervisor_effort=req.supervisor_effort)
     create(cr, progress=progress)
     return {"project": req.name, "repo": req.repo}
 

@@ -60,6 +60,7 @@ import rscore  # noqa: E402
 import broker_auth  # noqa: E402
 import gitea  # noqa: E402  (S4: the reviewer-stash path for pre-spawn checks)
 import workflow  # noqa: E402
+import model_catalog  # noqa: E402  (agent model/effort catalog + per-type defaults)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -270,6 +271,26 @@ def _verb_status(args: dict, _progress=None) -> dict:
     return dataclasses.asdict(rscore.status(req))    # may die() → SystemExit
 
 
+def _verb_models(_args: dict, _progress=None) -> dict:
+    """The agent model catalog + the merged per-container-type defaults, for the
+    webui's model pickers (create dialog, the per-project config box, the box
+    window, the dev card). The webui cannot read `models/` itself — the directory
+    sits at the repo root, OUTSIDE the scoped ./webui build context — so this
+    in-broker read (host python, stdlib-only `model_catalog`) is its only source,
+    and it pre-selects every control from the same `defaults` the verbs fall back
+    to, so the browser and the CLI cannot diverge.
+
+    Token-gated (NOT in OPEN_VERBS) — deny-by-default like every non-list/status
+    verb. A malformed catalog or a bad operator override raises ModelCatalogError,
+    which dispatch does NOT catch (only Validation/Harness/SystemExit) and would
+    escape into socketserver as a TRUNCATED reply — so map it to ValidationError
+    here for a clean envelope (the _verb_workflows discipline)."""
+    try:
+        return model_catalog.payload()
+    except model_catalog.ModelCatalogError as e:
+        raise rscore.ValidationError(str(e))
+
+
 def _verb_workflows(_args: dict, _progress=None) -> dict:
     """The store catalog for the webui create form: built-ins + BYO, plus the
     agent enum and the default workflow. The webui image carries no `cli/`, so
@@ -434,6 +455,16 @@ CREATE_WEBUI_FIELDS = frozenset({
     # enforced in from_kwargs. The rename is a lockstep boundary edit: the webui
     # form POSTs `agents:[...]` (a field not in this set is silently dropped).
     "agents",
+    # Agent model + effort per container type (STAGE_MODEL_SELECT). IN-BOX fields:
+    # they select which model the agent INSIDE the container talks to — no path, no
+    # host port, no bind-mount source — so they are openable under the host-root
+    # boundary, the same class as repo/setup. Validated + resolved against the
+    # catalog in from_kwargs (an unknown alias or an impossible model/effort pair is
+    # refused pre-side-effect). There is deliberately no `box_*` here: a box's pair
+    # is chosen per-box at box-add.
+    "supervisor_model", "supervisor_effort",
+    "worker_model", "worker_effort",
+    "role_model", "role_effort",
 })
 
 # The webui-settable subset of UpdateRequest fields. `rebuild`/`keep_claude` are
@@ -443,6 +474,13 @@ CREATE_WEBUI_FIELDS = frozenset({
 # stay a deliberate CLI action.
 UPDATE_WEBUI_FIELDS = frozenset({
     "name", "enable", "disable", "role_mcp_upstream",
+    # Agent model + effort (STAGE_MODEL_SELECT). On UPDATE an unset field means
+    # LEAVE UNCHANGED — not "reset to the default" (see the UpdateRequest note).
+    # A worker-only change is the cheapest write in the system: it touches no
+    # container at all.
+    "supervisor_model", "supervisor_effort",
+    "worker_model", "worker_effort",
+    "role_model", "role_effort",
 })
 
 
@@ -487,7 +525,10 @@ def _verb_destroy(args: dict, progress=None) -> dict:
 # repo/ref/setup seed a `byo` box and run INSIDE it (in-box, relayable per
 # WORKFLOW_TAXONOMY_S4). `browser` is GONE — folded into the websearcher preset.
 BOX_ADD_WEBUI_FIELDS = frozenset({"project", "name", "preset", "agent", "editor",
-                                  "mcps", "repo", "ref", "setup"})
+                                  "mcps", "repo", "ref", "setup",
+                                  # This box's own agent model/effort; unset ⇒ the
+                                  # project's `box` default from the marker.
+                                  "model", "effort"})
 BOX_TARGET_WEBUI_FIELDS = frozenset({"project", "name"})
 # box_remove additionally accepts keep_workspace (a bool, not host-shaped): when
 # set the box is removed but its artifacts stay on disk. The step-up `proof`
@@ -579,14 +620,25 @@ DEV_ACTIVE_FORK_WEBUI_FIELDS = frozenset({"repo", "user"})
 # no PAT): repr=False on the requests, off every Result, never argv (child
 # args ride stdin), never a durable sink.
 DEV_BOX_WEBUI_FIELDS = frozenset({"project", "url", "pat", "name", "agent",
-                                  "editor"})
+                                  "editor",
+                                  # The dev box's agent model/effort. Without these
+                                  # the box window's dev preset would have its model
+                                  # dropped HERE and again in the verb's kwarg list,
+                                  # and the box would silently run the default —
+                                  # on the box type where the choice matters most.
+                                  "model", "effort"})
 # The dev-project provision boundary (the Workflows page's dev card): minimal
 # and deliberate. Adding a field here is a boundary edit — never open a
 # path/host-shaped one. `workflow` threads the manifest the dialog was opened
 # from (a BYO dev-flagged workflow creates what ITS manifest says); fail-closed
 # in from_kwargs (dev_repo is rejected outside a dev-flagged workflow).
 DEV_PROJECT_WEBUI_FIELDS = frozenset({"name", "workflow", "url", "pat",
-                                      "egress", "enable", "disable"})
+                                      "egress", "enable", "disable",
+                                      # A dev project has no worker/role layer, so
+                                      # the dev card carries ONE model picker — the
+                                      # agent the researcher talks to. Same as any
+                                      # other non-research workflow's create dialog.
+                                      "supervisor_model", "supervisor_effort"})
 # The gitea-password verb's input boundary: ONE field, a SECRET (repr=False on
 # the request, off the Result, never a durable sink). The step-up `proof` is
 # consumed in dispatch and never reaches this filter.
@@ -667,6 +719,7 @@ VERBS = {
     "list": _verb_list,
     "status": _verb_status,
     "workflows": _verb_workflows,
+    "models": _verb_models,
     "software_status": _verb_software_status,
     "agent_refresh_check": _verb_agent_refresh_check,
     "editor_refresh_check": _verb_editor_refresh_check,

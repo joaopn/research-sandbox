@@ -38,6 +38,20 @@ SYS_PROMPT_FILE="${6:-}"
 # also passes them in the task preamble for redundancy).
 export RS_ROLE_NAME RS_CALL_ID="$CALL_ID" RS_CALLER="$CALLER"
 
+# Agent model + effort (STAGE_MODEL_SELECT). The host sets RS_AGENT_MODEL /
+# RS_AGENT_EFFORT on this container from the project's *role* pair; daemon.py
+# passes its environment through to us (env = dict(os.environ)), so they arrive
+# here. Unset means "no flag" — the agent's own default. Explicit flags rather
+# than ANTHROPIC_MODEL because we own this argv; both spawn modes below use them.
+MODEL_ARG=()
+if [[ -n "${RS_AGENT_MODEL:-}" ]]; then
+    MODEL_ARG=(--model "$RS_AGENT_MODEL")
+fi
+EFFORT_ARG=()
+if [[ -n "${RS_AGENT_EFFORT:-}" ]]; then
+    EFFORT_ARG=(--effort "$RS_AGENT_EFFORT")
+fi
+
 if [[ -n "$SYS_PROMPT_FILE" ]]; then
     # Summarize-mode spawn. --system-prompt sets the entire system prompt
     # to the role's summarize.md, overriding the default. CLAUDE.md
@@ -64,6 +78,8 @@ if [[ -n "$SYS_PROMPT_FILE" ]]; then
         --output-format stream-json \
         --verbose \
         --permission-mode bypassPermissions \
+        "${MODEL_ARG[@]}" \
+        "${EFFORT_ARG[@]}" \
         --system-prompt "$(cat "$SYS_PROMPT_FILE")" \
         > "$LOG_PATH" 2>&1
 fi
@@ -82,5 +98,7 @@ exec claude --print "$(cat "$TASK_MD")" \
     --output-format stream-json \
     --verbose \
     --permission-mode bypassPermissions \
+    "${MODEL_ARG[@]}" \
+    "${EFFORT_ARG[@]}" \
     "${MCP_ARG[@]}" \
     > "$LOG_PATH" 2>&1

@@ -1,0 +1,24 @@
+{
+  "_comment": "Model tiers the agent CLI accepts as a --model alias, and which effort levels each supports. Hand-maintained: add an entry only when a genuinely new tier ships. Aliases (not pinned model ids) are deliberate — an alias follows the vendor's current model for that tier, so this file does not go stale on every release. `efforts: []` means the tier does not accept an effort parameter at all; the resolver drops a defaulted effort for such a model and REFUSES an explicitly-set one.",
+  "efforts": ["low", "medium", "high", "xhigh", "max"],
+  "models": [
+    {
+      "alias": "opus",
+      "label": "Opus",
+      "blurb": "Most capable. The default for agents you talk to and for judgement-heavy work.",
+      "efforts": ["low", "medium", "high", "xhigh", "max"]
+    },
+    {
+      "alias": "sonnet",
+      "label": "Sonnet",
+      "blurb": "Strong and substantially cheaper. Good for long-running headless work.",
+      "efforts": ["low", "medium", "high", "xhigh", "max"]
+    },
+    {
+      "alias": "haiku",
+      "label": "Haiku",
+      "blurb": "Fastest and cheapest, for mechanical work. Does not support effort levels.",
+      "efforts": []
+    }
+  ]
+}

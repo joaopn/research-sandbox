@@ -241,6 +241,7 @@ const state = {
     activeProject: null,     // string | null
     hostPage: null,          // "workflows" | "development" | "management" | "settings" | null
     explainIndex: null,      // string[] of workflows with a rendered Explain doc (/static/explain/index.json); null = unfetched
+    modelCatalog: null,      // { efforts, models, defaults, types } from /broker/models; null = unfetched. The webui image has no `models/` (it sits outside the ./webui build context), so this relay is the only source — and every picker pre-selects from its `defaults`, the same ones the verbs fall back to, so browser and CLI cannot diverge.
     activeService: null,     // string | null
     serviceRegistry: null,   // { [serviceId]: spec } from /services
     projectServices: {},     // { [projectName]: { [serviceId]: spec } }
@@ -2741,6 +2742,142 @@ async function mgmtRefreshDialog(view, cfg) {
 
 const MGMT_ENABLE_PRESETS = ["websearcher", "wrangler"];
 
+// ---------------------------------------------------------------------------
+// Agent model + effort pickers (STAGE_MODEL_SELECT).
+//
+// One factory serves every surface — the create dialog, the per-project config
+// box, the box window and the dev card — so a new container type cannot reach
+// one and miss another. Controls pre-select from the catalog's `defaults`, which
+// are the SAME defaults box_add / create fall back to, so what the browser sends
+// back is by construction what the CLI would have resolved.
+//
+// Rendered as the standard `.field` + <label> + <select> idiom (exactly what
+// Egress uses). Deliberately NOT checkboxes or radio inputs inside a `.field`:
+// `.field input { width:100% }` and `.field label { display:block;
+// text-transform:uppercase }` bleed into any raw input/label nested under a
+// `.field`, which is what distorted the box window's tickboxes. A <select> is
+// native `.field` content and inherits nothing harmful.
+// ---------------------------------------------------------------------------
+
+// Fetch + cache the model catalog. Returns null when the broker can't serve it
+// (a bad operator override file, say). Callers degrade gracefully: no pickers
+// render, no model fields go on the wire, and the backend applies its defaults —
+// the researcher loses the choice, never the project.
+async function ensureModelCatalog() {
+    if (state.modelCatalog) return state.modelCatalog;
+    try {
+        const res = await fetch("/broker/models");
+        if (!res.ok) return null;
+        const body = await res.json();
+        if (!body.ok || !body.result) return null;
+        state.modelCatalog = body.result;
+        return state.modelCatalog;
+    } catch (e) { return null; }
+}
+
+const UNCHANGED = "— unchanged —";
+
+/**
+ * A model+effort picker for one container type. Model and effort sit on ONE line
+ * (`.model-row`), which is what makes the same control usable in both places it
+ * has to live: wrapped in a `.field` on the create dialog / config box, and bare
+ * beside the agent cards inside the box window's Settings → Agent group.
+ *
+ * @param {object} cat      the /broker/models payload
+ * @param {string} ctype    "supervisor" | "worker" | "role" | "box"
+ * @param {string} title    the label the RESEARCHER sees ("Agent", not "supervisor" —
+ *                          a docker box has no supervisor, and the vocabulary
+ *                          shouldn't lie; the wire field keeps the internal key)
+ * @param {string} hint     one line explaining what this type is
+ * @param {object} opts     { unchanged?: bool } — the config box offers "leave
+ *                          unchanged" because on UPDATE an empty field means
+ *                          exactly that (never "reset to the default")
+ * @returns {{node: Node, row: Node, value: () => {model: string, effort: string}}}
+ *          `node` = the `.field`-wrapped form (labelled); `row` = the bare
+ *          one-line control, for callers that supply their own caption.
+ */
+function modelPicker(cat, ctype, title, hint, opts) {
+    opts = opts || {};
+    const dflt = (cat.defaults && cat.defaults[ctype]) || { model: "", effort: "" };
+    const modelSel = el("select", {});
+    const effortSel = el("select", {});
+    if (opts.unchanged) modelSel.appendChild(el("option", { value: "" }, [UNCHANGED]));
+    (cat.models || []).forEach((m) => {
+        modelSel.appendChild(el("option", { value: m.alias }, [m.label || m.alias]));
+    });
+    modelSel.value = opts.unchanged ? "" : dflt.model;
+
+    // The effort options depend on the chosen model: a tier with no effort levels
+    // (haiku) must offer none, and must not be able to send one. This is the
+    // browser half of the rule the backend enforces — an effort-less model with
+    // an explicit effort is refused server-side, so leaving the control live here
+    // would just manufacture a rejection the researcher can't understand.
+    const syncEfforts = () => {
+        const alias = modelSel.value;
+        const m = (cat.models || []).find((x) => x.alias === alias);
+        const levels = m ? (m.efforts || []) : (cat.efforts || []);
+        const prev = effortSel.value;
+        effortSel.innerHTML = "";
+        if (opts.unchanged || !alias) {
+            effortSel.appendChild(el("option", { value: "" }, [UNCHANGED]));
+        }
+        levels.forEach((lv) => {
+            effortSel.appendChild(el("option", { value: lv }, [lv]));
+        });
+        if (alias && !levels.length) {
+            // No levels at all — say why, rather than showing an empty control.
+            effortSel.innerHTML = "";
+            effortSel.appendChild(el("option", { value: "" }, ["no effort levels"]));
+            effortSel.disabled = true;
+            effortSel.value = "";
+            return;
+        }
+        effortSel.disabled = false;
+        if (levels.includes(prev)) effortSel.value = prev;
+        else if (!opts.unchanged && levels.includes(dflt.effort)) effortSel.value = dflt.effort;
+        else if (opts.unchanged) effortSel.value = "";
+    };
+    modelSel.onchange = syncEfforts;
+    syncEfforts();
+
+    // Model + effort on ONE line. The per-select captions are <span>s, never
+    // <label>s: this row is nested inside a `.field` on the create dialog and in
+    // the box window's `.field box-settings`, where `.field label` forces
+    // display:block + UPPERCASE onto anything it matches. (<select> is safe —
+    // the width:100% bleed is `.field input, .field textarea`, which does not
+    // match a select, and there is no `.field select` rule.)
+    const row = el("div", { class: "model-row" }, [
+        el("div", { class: "model-cell" }, [
+            el("span", { class: "model-cap" }, ["model"]), modelSel,
+        ]),
+        el("div", { class: "model-cell" }, [
+            el("span", { class: "model-cap" }, ["effort"]), effortSel,
+        ]),
+    ]);
+
+    return {
+        row: row,
+        node: el("div", { class: "field" }, [
+            el("label", {}, [title]),
+            row,
+            hint ? el("div", { class: "hint" }, [hint]) : null,
+        ]),
+        value: () => ({
+            model: modelSel.value || "",
+            effort: (effortSel.disabled ? "" : effortSel.value) || "",
+        }),
+    };
+}
+
+// The three project-level types, in the order the create dialog shows them. The
+// `worker`/`role` pickers only render where a worker layer exists — elsewhere the
+// backend rejects those fields outright, so offering them would be a dead end.
+const MODEL_PICKER_SPECS = [
+    ["supervisor", "Agent", "The agent you talk to in this project."],
+    ["worker", "Workers", "Headless analysis workers the agent spawns."],
+    ["role", "Role-MCPs", "Tool services workers call — one session per tool-call."],
+];
+
 function mgmtCreateDialog(view, manifest, agents) {
     manifest = manifest || {};
     agents = Array.isArray(agents) ? agents : [];
@@ -2758,6 +2895,31 @@ function mgmtCreateDialog(view, manifest, agents) {
     // dind fleet deploys the default agent dist regardless.
     const isDev = !!manifest.dev;
     const showInBox = !isDev && (isDocker || boxCapable);
+
+    // Agent model + effort. Every workflow has an agent the researcher talks to,
+    // so the "Agent" picker is universal (the dev card included — a dev project
+    // has no worker layer, so it gets exactly one picker, like any other
+    // non-research workflow). Workers/Role-MCPs only where a worker layer exists.
+    const cat = state.modelCatalog;
+    const modelPickers = cat
+        ? MODEL_PICKER_SPECS
+              .filter(([ctype]) => ctype === "supervisor" || hasWorkerLayer)
+              .map(([ctype, title, hint]) => [ctype, modelPicker(cat, ctype, title, hint, {})])
+        : [];
+    // One `.field` per container type, with its model and effort side by side.
+    const modelFields = modelPickers.map(([, p]) => p.node);
+    // Collect the model half of the payload once — both the dev and the normal
+    // branch below send the same field names (CREATE_WEBUI_FIELDS ⊃
+    // DEV_PROJECT_WEBUI_FIELDS for these), so there is one place to get it wrong.
+    const modelPayload = () => {
+        const out = {};
+        modelPickers.forEach(([ctype, p]) => {
+            const v = p.value();
+            if (v.model) out[ctype + "_model"] = v.model;
+            if (v.effort) out[ctype + "_effort"] = v.effort;
+        });
+        return out;
+    };
 
     const nameI = el("input", { type: "text", autocomplete: "off" });
     const egressS = el("select", {}, [
@@ -2936,6 +3098,7 @@ function mgmtCreateDialog(view, manifest, agents) {
             el("div", { class: "field" }, [el("label", {}, ["Project name"]), nameI]),
             ...(isDev ? [devGroup] : []),
             el("div", { class: "field" }, [el("label", {}, ["Egress"]), egressS]),
+            ...modelFields,
             enableField,
             settingsRegion,
             ...(showInBox ? [cloneToggle, cloneGroup] : []),
@@ -2976,6 +3139,11 @@ function mgmtCreateDialog(view, manifest, agents) {
                     workflow: workflow,
                     url: devUrlI.value.trim(),
                     egress: egressS.value,
+                    // A dev project has no worker layer, so modelPayload() yields
+                    // supervisor_* only — exactly the pair in
+                    // DEV_PROJECT_WEBUI_FIELDS. A field absent from that set is
+                    // dropped silently by the broker, so this is a lockstep.
+                    ...modelPayload(),
                 };
                 const pat = devPatI.value.trim();
                 if (pat) payload.pat = pat;
@@ -2995,6 +3163,10 @@ function mgmtCreateDialog(view, manifest, agents) {
                 name: nameI.value.trim(),
                 workflow: workflow,
                 egress: egressS.value,
+                // supervisor_* always; worker_*/role_* only where a worker layer
+                // exists (from_kwargs rejects them elsewhere, and the pickers are
+                // filtered to match). Every key is in CREATE_WEBUI_FIELDS.
+                ...modelPayload(),
             };
             // Editor on by default; unchecking disables the code-server service.
             if (!editorCb.checked) payload.disable = ["code-server"];
@@ -3081,6 +3253,10 @@ async function renderWorkflowsInto(view) {
             state.explainIndex = ir.ok ? await ir.json() : [];
         } catch (e) { state.explainIndex = []; }
     }
+    // The model catalog, so the create dialog (opened synchronously from a card
+    // click) can render its pickers without an await. Best-effort: if it fails,
+    // the dialog simply omits the pickers and the backend applies its defaults.
+    await ensureModelCatalog();
     renderWorkflowsScreen(view, body.result);
 }
 
@@ -3372,6 +3548,28 @@ async function mgmtBoxAddDialog(project) {
     }
     if (!presets.length) { alert("No box presets available for this project."); return; }
 
+    // This box's own agent model + effort. A box does not inherit the project's
+    // agent pair — it has its own default (the `box` type), which is what makes a
+    // future mixed-agent box expressible. Unset ⇒ box_add falls back to the same
+    // `box` default from the project marker, so the picker and the fallback agree.
+    const boxCat = await ensureModelCatalog();
+    const boxModelP = boxCat
+        ? modelPicker(boxCat, "box", "Agent",
+                      "The model this box's agent runs on.", {})
+        : null;
+    // The model/effort row lives INSIDE Settings → Agent, beside the agent cards
+    // (see the group below), and is meaningful only when an agent actually runs
+    // in the box — a blank box (agent "none") has nothing to run a model. Shown /
+    // hidden from markAgent(), the single choke point every agent change passes
+    // through (card click, preset pre-select, and the MCP coupling that forces
+    // claude on). `agentModelOn()` is the one predicate the payloads also use, so
+    // a hidden control can never put a model on the wire.
+    const boxModelRow = boxModelP ? boxModelP.row : null;
+    const agentModelOn = () => !!boxModelP && agentS.value === "claude";
+    const syncAgentModel = () => {
+        if (boxModelRow) boxModelRow.style.display = agentModelOn() ? "" : "none";
+    };
+
     const nameI = el("input", { type: "text", autocomplete: "off",
                                 placeholder: "auto (box-N)" });
 
@@ -3437,6 +3635,10 @@ async function mgmtBoxAddDialog(project) {
     function markAgent() {
         for (const { value, card } of agentCardEls)
             card.classList.toggle("selected", value === agentS.value);
+        // The model/effort row follows the agent: no agent, no model. Hooking it
+        // here rather than at each call site means every path that can change the
+        // agent — card click, preset pre-select, MCP coupling — keeps it honest.
+        syncAgentModel();
     }
 
     const editorCb = el("input", { type: "checkbox" });   // box-level toggle, default off
@@ -3556,7 +3758,13 @@ async function mgmtBoxAddDialog(project) {
                 el("div", { class: "box-settings-label" }, ["Settings"]),
                 el("div", { class: "box-opt-group" }, [
                     el("div", { class: "box-opt-caption" }, ["Agent"]),
-                    agentCardsWrap,
+                    // Cards, then the model/effort row to their right (hidden
+                    // unless an agent is actually selected). One line, one group:
+                    // "which agent, and which model it runs on" is one decision.
+                    el("div", { class: "box-agent-row" }, [
+                        agentCardsWrap,
+                        boxModelRow,
+                    ]),
                 ]),
                 el("div", { class: "box-opt-group" }, [
                     el("div", { class: "box-opt-caption" }, ["Extensions"]),
@@ -3600,6 +3808,16 @@ async function mgmtBoxAddDialog(project) {
                     editor: editorCb.checked,
                 };
                 if (agentS.value) payload.agent = agentS.value;
+                // The dev preset posts to a DIFFERENT route (the detached
+                // provision lane), so the model must be threaded here too — it is
+                // the box type where the choice matters most, and a field missing
+                // from DEV_BOX_WEBUI_FIELDS is dropped silently. Same
+                // agent-gate as the control's visibility: a blank box sends none.
+                if (agentModelOn()) {
+                    const v = boxModelP.value();
+                    if (v.model) payload.model = v.model;
+                    if (v.effort) payload.effort = v.effort;
+                }
                 return fetch(`/broker/project/${encodeURIComponent(project)}/dev-box`, {
                     method: "POST", headers: { "Content-Type": "application/json" },
                     body: JSON.stringify(payload),
@@ -3614,6 +3832,13 @@ async function mgmtBoxAddDialog(project) {
             // Agent is always explicit now (the preset default is pre-selected,
             // not a sentinel); no `browser`.
             if (agentS.value) payload.agent = agentS.value;
+            // Gated on the agent, exactly like the control's visibility — a blank
+            // box (agent "none") runs no agent, so it sends no model.
+            if (agentModelOn()) {
+                const v = boxModelP.value();
+                if (v.model) payload.model = v.model;
+                if (v.effort) payload.effort = v.effort;
+            }
             if (selectedPreset.clone) {
                 const repo = repoI.value.trim(), ref = refI.value.trim(),
                     setup = setupT.value.trim();
@@ -4544,7 +4769,116 @@ function makeProjectConfigBox(project) {
     ]));
     appendExportedPortsSection(box, project);
     appendEditorExtensionSection(box, project, enabled);
+    appendModelsSection(box, project, enabled);
     return box;
+}
+
+// The "Models" surface (STAGE_MODEL_SELECT) — change which model each kind of
+// agent in this project runs on, after create. Goes through `update`, whose cost
+// differs sharply by type and which is why the section says so:
+//   * Workers  — touches NO container. `rs-worker spawn` reads the project marker
+//                per spawn, so the next worker picks it up; ones already running
+//                keep the model they started on.
+//   * Role-MCPs — re-runs just the role containers (their env is fixed at docker
+//                run). The supervisor, and your session in it, is untouched.
+//   * Agent    — recreates the supervisor (its env is fixed at docker run too).
+// On the docker substrate the model is fixed at create (update refuses it), so we
+// show a note rather than a control the broker would reject — the editor's docker
+// treatment, same reasoning.
+function appendModelsSection(box, project, enabled) {
+    const section = el("div", { class: "config-section" });
+    section.appendChild(el("div", { class: "config-section-label" }, ["Models"]));
+    const isDocker = !(enabled.supervisor && enabled.supervisor.box_harness);
+    if (isDocker) {
+        section.appendChild(el("div", { class: "config-empty" }, [
+            "Set at create on this project type.",
+        ]));
+        box.appendChild(section);
+        return;
+    }
+    const row = el("div", { class: "config-box-row" }, [
+        el("span", { class: "config-box-name" }, ["Agent models"]),
+        el("span", { class: "config-box-meta" }, ["…"]),
+    ]);
+    const btn = el("button", { class: "btn btn-secondary" }, ["Change"]);
+    btn.disabled = true;
+    row.appendChild(btn);
+    section.appendChild(row);
+    box.appendChild(section);
+
+    // The worker/role pickers only apply to a research-flavor project; elsewhere
+    // there is no worker layer and the backend rejects those fields outright, so
+    // offering them would be a dead end. `flavor` rides the status payload.
+    (async () => {
+        const cat = await ensureModelCatalog();
+        let flavor = "";
+        try {
+            const res = await fetch(
+                `/projects/status?names=${encodeURIComponent(project.name)}`);
+            const body = await res.json();
+            const st = body && body[project.name];
+            flavor = (st && st.flavor) || "";
+        } catch (e) { /* flavor unknown → agent picker only */ }
+        const meta = row.querySelector(".config-box-meta");
+        if (!cat) {
+            if (meta) meta.textContent = "unavailable";
+            return;
+        }
+        const hasWorkerLayer = flavor === "research";
+        if (meta) meta.textContent = hasWorkerLayer ? "agent, workers, role-MCPs" : "agent";
+        btn.disabled = false;
+        btn.onclick = () => mgmtModelsDialog(project.name, cat, hasWorkerLayer);
+    })();
+}
+
+// The dialog behind the Models section. Every picker starts at "— unchanged —",
+// which is exactly what an empty field means on UPDATE (never "reset to the
+// default") — so what the researcher didn't touch is what stays.
+function mgmtModelsDialog(name, cat, hasWorkerLayer) {
+    const pickers = MODEL_PICKER_SPECS
+        .filter(([ctype]) => ctype === "supervisor" || hasWorkerLayer)
+        .map(([ctype, title, hint]) =>
+            [ctype, modelPicker(cat, ctype, title, hint, { unchanged: true })]);
+    mgmtConfirmThenTail(boxOpView(), {
+        title: `Models for ${name}`,
+        tailTitle: `Updating models on ${name}`,
+        verb: "update",
+        confirmLabel: "Apply",
+        body: [
+            el("p", {}, [
+                "Anything left unchanged stays as it is.",
+            ]),
+            ...pickers.map(([, p]) => p.node),
+            el("div", { class: "hint" }, [
+                "Changing the workers' model touches no container — the next " +
+                "worker spawned picks it up. Changing the role-MCPs' model re-runs " +
+                "those containers. Changing the agent's model recreates the " +
+                "project container, interrupting work running in it.",
+            ]),
+        ],
+        validate: () => {
+            const any = pickers.some(([, p]) => {
+                const v = p.value();
+                return v.model || v.effort;
+            });
+            return any ? null : "Nothing to change.";
+        },
+        request: () => {
+            // Only the fields the researcher actually SET go on the wire: on
+            // UPDATE an absent field means "leave unchanged". Every key is in
+            // UPDATE_WEBUI_FIELDS.
+            const payload = {};
+            pickers.forEach(([ctype, p]) => {
+                const v = p.value();
+                if (v.model) payload[ctype + "_model"] = v.model;
+                if (v.effort) payload[ctype + "_effort"] = v.effort;
+            });
+            return fetch(`/broker/project/${encodeURIComponent(name)}/update`, {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+            });
+        },
+    });
 }
 
 // The editor "Extensions" surface (STAGE_BOX_EXT_UX C) — host-container webui

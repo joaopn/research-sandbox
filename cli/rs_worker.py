@@ -59,6 +59,28 @@ ALLOWLIST_PATH = Path("/workspace/.orchestrator/mcp-allow.json")
 # proxy config renderer's merge policy.
 ROLE_MCPS_PATH = Path("/workspace/.orchestrator/role-mcps.json")
 
+# The project's per-container-type agent model/effort pairs, frozen at create by
+# the host (STAGE_MODEL_SELECT). Read VERBATIM — this script is staged into the
+# supervisor as a standalone stdlib file (there is no `cli/` package in the image
+# and no model catalog), so it cannot resolve or validate anything. The host
+# guarantees every pair here is already resolved and mutually valid: an
+# effort-less model never carries an effort. Absent/legacy → no flags, i.e. the
+# agent's own default, exactly as before this feature existed.
+PROJECT_MARKER_PATH = Path("/workspace/.orchestrator/project.json")
+
+
+def worker_model_pair() -> dict:
+    """The `worker` (model, effort) pair from the project marker, or {}."""
+    try:
+        data = json.loads(PROJECT_MARKER_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    models = data.get("models")
+    if not isinstance(models, dict):
+        return {}
+    pair = models.get("worker")
+    return pair if isinstance(pair, dict) else {}
+
 # Plan / accept / finalize contract.
 PLAN_SECTIONS = ("Question", "Inputs", "Deliverables", "Verification", "MCPs")
 OUTPUT_WHITELIST_SUFFIXES = (
@@ -585,7 +607,17 @@ def cmd_spawn(args: argparse.Namespace) -> None:
         )
 
     # --- env ---
+    # Built EXPLICITLY — never an os.environ passthrough. The supervisor's own
+    # ANTHROPIC_MODEL (the model the PI talks to) must not leak into a worker,
+    # which runs the project's *worker* model. The RS_AGENT_* pair below is the
+    # only model channel a worker gets; entrypoint.worker.sh turns it into
+    # explicit --model / --effort flags on the `claude --print` it runs.
     env = {"PYTHONUNBUFFERED": "1"}
+    _pair = worker_model_pair()
+    if _pair.get("model"):
+        env["RS_AGENT_MODEL"] = _pair["model"]
+        if _pair.get("effort"):
+            env["RS_AGENT_EFFORT"] = _pair["effort"]
     for kv in args.env:
         k, _, v = kv.partition("=")
         if not k:

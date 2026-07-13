@@ -74,11 +74,27 @@ if [[ -f /workspace/.mcp.json ]]; then
     MCP_ARG=(--mcp-config /workspace/.mcp.json)
 fi
 
+# Agent model + effort (STAGE_MODEL_SELECT). The supervisor's `rs-worker spawn`
+# sets these from the project's *worker* pair; unset means "no flag", i.e. the
+# agent's own default. Explicit flags rather than ANTHROPIC_MODEL because we own
+# this argv — the flag is visible in the process list and outranks any settings
+# file the worker inherited from the supervisor.
+MODEL_ARG=()
+if [[ -n "${RS_AGENT_MODEL:-}" ]]; then
+    MODEL_ARG=(--model "$RS_AGENT_MODEL")
+fi
+EFFORT_ARG=()
+if [[ -n "${RS_AGENT_EFFORT:-}" ]]; then
+    EFFORT_ARG=(--effort "$RS_AGENT_EFFORT")
+fi
+
 run_claude() {
     claude --print "$(cat "$1")" \
         --output-format stream-json \
         --verbose \
         --permission-mode bypassPermissions \
+        "${MODEL_ARG[@]}" \
+        "${EFFORT_ARG[@]}" \
         "${MCP_ARG[@]}" \
         >> /workspace/log.jsonl 2>&1 || true
 }

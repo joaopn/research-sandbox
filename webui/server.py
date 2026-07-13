@@ -567,6 +567,22 @@ async def broker_workflows_handler(request: web.Request) -> web.Response:
     return web.json_response(body, status=status)
 
 
+async def broker_models_handler(request: web.Request) -> web.Response:
+    """GET /broker/models — the agent model catalog + the merged per-container-type
+    defaults, for every model picker (create dialog, the per-project config box,
+    the box window, the dev card).
+
+    The webui image cannot read `models/` itself: the directory sits at the repo
+    root, OUTSIDE the scoped ./webui build context, so it is not in the image at
+    all. This relay to the broker's in-process `model_catalog.payload()` is the
+    browser's only source — and because every control pre-selects from the same
+    `defaults` the verbs fall back to, the browser and the CLI cannot diverge.
+    SameSite=Strict cookie is the CSRF defense for this read (mirrors
+    /broker/workflows)."""
+    status, body = await _relay(request, "models")
+    return web.json_response(body, status=status)
+
+
 async def broker_software_handler(request: web.Request) -> web.Response:
     """GET /broker/software — read-only status of the host's agent/editor/reader
     dists, the built image fleet, and the effective version pins (gated). Mirrors
@@ -812,15 +828,23 @@ async def broker_project_action_handler(request: web.Request) -> web.Response:
             args["proof"] = proof
     elif action == "update":
         # The editor extension toggles code-server via `update` enable/disable
-        # (STAGE_BOX_EXT_UX C). The broker's UPDATE_WEBUI_FIELDS ({name, enable,
-        # disable, role_mcp_upstream}) is the real boundary — only those reach the
-        # verb; nothing host-shaped. Forward for `update` only (start/stop ignore them).
+        # (STAGE_BOX_EXT_UX C); the Models section changes the per-container-type
+        # agent model/effort (STAGE_MODEL_SELECT). The broker's UPDATE_WEBUI_FIELDS
+        # is the real boundary — only those reach the verb; nothing host-shaped.
+        # ⚠ This forward list is a SECOND filter, in front of the broker's: a field
+        # missing HERE is dropped before the broker ever sees it, with no error
+        # anywhere. Keep it in lockstep with UPDATE_WEBUI_FIELDS (the webui image
+        # carries no `cli/`, so nothing enforces that at import time).
+        # Forward for `update` only (start/stop ignore the body).
         try:
             req_body = await request.json()
         except Exception:
             req_body = {}
         if isinstance(req_body, dict):
-            for k in ("enable", "disable"):
+            for k in ("enable", "disable",
+                      "supervisor_model", "supervisor_effort",
+                      "worker_model", "worker_effort",
+                      "role_model", "role_effort"):
                 if req_body.get(k) is not None:
                     args[k] = req_body[k]
     return await _start_op(request, action, args, BROKER_OP_TIMEOUT_S)
@@ -843,11 +867,16 @@ async def broker_box_add_handler(request: web.Request) -> web.Response:
         body = {}
     if not isinstance(body, dict):
         body = {}
+    # ⚠ This dict is a SECOND filter in front of the broker's BOX_ADD_WEBUI_FIELDS:
+    # a field missing here never reaches the broker, with no error anywhere. Keep
+    # the two in lockstep (the webui image carries no `cli/`, so nothing enforces
+    # it at import time). `model`/`effort` = this box's own agent pair.
     args = {"project": project, "name": body.get("name"),
             "preset": body.get("preset"), "agent": body.get("agent"),
             "editor": bool(body.get("editor")), "mcps": body.get("mcps"),
             "repo": body.get("repo"), "ref": body.get("ref"),
-            "setup": body.get("setup")}
+            "setup": body.get("setup"),
+            "model": body.get("model"), "effort": body.get("effort")}
     return await _start_op(request, "box_add", args, BROKER_OP_TIMEOUT_S,
                            op_seed=project)
 
@@ -1111,9 +1140,14 @@ async def broker_dev_box_handler(request: web.Request) -> web.Response:
         body = {}
     if not isinstance(body, dict):
         body = {}
+    # Lockstep with DEV_BOX_WEBUI_FIELDS — a field missing here is dropped before
+    # the broker sees it. The dev box is the one where the model choice matters
+    # most, so it must be threaded on THIS route too (it does not go through
+    # box_add's route).
     args = {"project": project, "url": body.get("url"), "pat": body.get("pat"),
             "name": body.get("name"), "agent": body.get("agent"),
-            "editor": bool(body.get("editor"))}
+            "editor": bool(body.get("editor")),
+            "model": body.get("model"), "effort": body.get("effort")}
     op_id = _mint_op_id(project, "dev-box")
     try:
         reply = await broker_call("dev_box_provision", args,
@@ -1165,10 +1199,14 @@ async def broker_dev_project_handler(request: web.Request) -> web.Response:
     if not isinstance(body, dict):
         body = {}
     name = body.get("name")
+    # Lockstep with DEV_PROJECT_WEBUI_FIELDS. A dev project has no worker layer, so
+    # the dev card carries the supervisor pair only.
     args = {"name": name, "workflow": body.get("workflow"),
             "url": body.get("url"), "pat": body.get("pat"),
             "egress": body.get("egress"), "enable": body.get("enable"),
-            "disable": body.get("disable")}
+            "disable": body.get("disable"),
+            "supervisor_model": body.get("supervisor_model"),
+            "supervisor_effort": body.get("supervisor_effort")}
     op_id = _mint_op_id(name if isinstance(name, str) and name else "dev",
                         "dev-project")
     try:
@@ -2325,6 +2363,7 @@ def main() -> None:
     app.router.add_post("/broker/logout", broker_logout_handler)
     app.router.add_get("/broker/projects", broker_projects_handler)
     app.router.add_get("/broker/workflows", broker_workflows_handler)
+    app.router.add_get("/broker/models", broker_models_handler)
     app.router.add_get("/broker/software", broker_software_handler)
     app.router.add_post("/broker/software/build", broker_build_handler)
     app.router.add_post("/broker/software/refresh-check", broker_refresh_check_handler)

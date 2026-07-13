@@ -1,0 +1,7 @@
+{
+  "_comment": "Per-container-type model + effort defaults. Layered like versions.env: this tracked file is the base, and an untracked ~/.research-sandbox/model-defaults.json overrides it PER KEY (a partial override file is fine — only the types it names are replaced). Every type resolves independently; there is no inheritance between types. All four are overridable per-invocation at project create, box add, and the dev card.",
+  "supervisor": { "model": "opus", "effort": "max" },
+  "worker": { "model": "sonnet", "effort": "max" },
+  "role": { "model": "opus", "effort": "max" },
+  "box": { "model": "opus", "effort": "max" }
+}

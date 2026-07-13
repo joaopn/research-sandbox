@@ -1213,6 +1213,51 @@ body {
     border: none;
 }
 
+/* Agent model + effort — ONE line, in both places it lives: wrapped in a `.field`
+   on the create dialog / config box, and bare beside the agent cards inside the
+   box window's Settings → Agent group.
+
+   No `.field` bleed to undo here, unlike .mgmt-check above: the width:100% rule is
+   `.field input, .field textarea`, which does not match a <select>, and there is no
+   `.field select` rule. The per-select captions are deliberately <span class=
+   "model-cap">, NOT <label> — a <label> under a `.field` would be forced to
+   display:block + UPPERCASE. */
+.model-row {
+    display: flex;
+    align-items: flex-end;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+.model-cell {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+.model-cap {
+    font-size: 11px;
+    color: var(--fg-muted);
+    line-height: 1;
+}
+.model-row select {
+    padding: 6px 8px;
+    font-size: 13px;
+    background: var(--bg-input);
+    color: var(--fg-base);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+}
+.model-row select:disabled { opacity: 0.55; }
+
+/* Box window: the agent cards and the model/effort row sit on one line — "which
+   agent, and which model it runs on" is one decision. The row hides itself when no
+   agent is selected (a blank box runs nothing, so it has no model). */
+.box-agent-row {
+    display: flex;
+    align-items: flex-end;
+    gap: 14px;
+    flex-wrap: wrap;
+}
+
 /* Development host page (STAGE_DEV_GITEA S3): Gitea iframe tab + the Fetch
    copy list, plus the Management Infrastructure section. Every selector is
    self-scoped under dev-* / mgmt-infra (no bare input/label rules — the

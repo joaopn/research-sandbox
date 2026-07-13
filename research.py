@@ -224,6 +224,22 @@ def _build(reqcls, **kw):
         die(str(e))
 
 
+def _add_model_flags(p: argparse.ArgumentParser, *, unset_note: str) -> None:
+    """Per-container-type agent model/effort flags, shared by `project create` and
+    `project update`. The two parsers differ ONLY in what an unset flag means:
+    at create it falls back to the type's configured default; at update it means
+    LEAVE UNCHANGED. Keep them in one place so a new container type can't reach
+    one parser and miss the other."""
+    for ctype, what in (("supervisor", "the agent you talk to"),
+                        ("worker", "analysis workers"),
+                        ("role", "role-MCP services")):
+        p.add_argument(f"--{ctype}-model", default="", metavar="MODEL",
+                       help=f"agent model for {what} ({unset_note})")
+        p.add_argument(f"--{ctype}-effort", default="", metavar="LEVEL",
+                       help=f"agent effort level for {what} ({unset_note}; "
+                            f"ignored for a model with no effort levels)")
+
+
 def _call(fn, *args):
     """Invoke an rscore verb, mapping a mid-verb ValidationError to die(). The
     dev verbs are the first to re-raise (e.g. a GiteaError→ValidationError inside
@@ -342,6 +358,10 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         github_pat=os.environ.get("RS_GITHUB_PAT") or "",   # never a CLI flag
         agents=args.agents,   # repeatable --agent + --agents a,b both feed this list
         dev_repo=args.dev_repo,
+        supervisor_model=args.supervisor_model,
+        supervisor_effort=args.supervisor_effort,
+        worker_model=args.worker_model, worker_effort=args.worker_effort,
+        role_model=args.role_model, role_effort=args.role_effort,
     )
     try:
         res = rscore.create(req, cfg)
@@ -617,9 +637,17 @@ def cmd_project_update(args: argparse.Namespace) -> None:
         name=args.name, rebuild=args.rebuild, keep_claude=args.keep_claude,
         enable=args.enable, disable=args.disable,
         role_mcp_upstream=args.role_mcp_upstream,
+        supervisor_model=args.supervisor_model,
+        supervisor_effort=args.supervisor_effort,
+        worker_model=args.worker_model, worker_effort=args.worker_effort,
+        role_model=args.role_model, role_effort=args.role_effort,
     )
-    rscore.update(req)
+    res = rscore.update(req)
     print(f"\nproject {req.name!r} updated.")
+    # A model change can invalidate a stored effort (haiku accepts none); the
+    # requested model wins and the effort is dropped — say so, never silently.
+    for ctype in res.effort_dropped:
+        print(f"  note: {ctype} effort cleared — the chosen model has no effort levels")
 
 
 def cmd_mcp_add(args: argparse.Namespace) -> None:
@@ -1911,6 +1939,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "(supervisor is always-on) and worker services. "
                         "e.g. `--disable websearcher` skips a default-enabled "
                         "worker for this one project.")
+    # Agent model/effort per container type. Unset = the type's default from
+    # models/defaults.json ⊕ ~/.research-sandbox/model-defaults.json.
+    _add_model_flags(c, unset_note="unset = the type's configured default")
     c.add_argument("--mcp", metavar="NAMES", default="all-enabled",
                    help="MCPs to auto-allow at create time: 'all-enabled' "
                         "(default — every currently-enabled MCP), 'none', or a "
@@ -2007,6 +2038,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "(supervisor is always-on and cannot be "
                         "disabled), plus worker services to disable "
                         "for this project.")
+    # Agent model/effort. Unset = LEAVE UNCHANGED (not "reset to the default").
+    # A worker-only change touches no container at all; a role-only change re-runs
+    # just the role containers; only a supervisor change needs a recreate.
+    _add_model_flags(u, unset_note="unset = leave unchanged")
     u.set_defaults(func=cmd_project_update)
 
     uc = proj_sub.add_parser(

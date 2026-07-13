@@ -435,18 +435,40 @@ def _stage_box_fetch(cname: str) -> None:
               f"{err}", file=sys.stderr)
 
 
+def _project_box_pair() -> dict:
+    """The project's default (model, effort) pair for a BOX, from the marker the
+    host wrote at create (STAGE_MODEL_SELECT). Read VERBATIM: this CLI is staged
+    into the supervisor as a standalone stdlib file — there is no `cli/` package
+    and no model catalog here — so it cannot resolve or validate anything. The
+    host guarantees the pair is already resolved and mutually valid (an
+    effort-less model never carries an effort), which is exactly why the marker is
+    written with all four types drop-resolved. Absent/legacy → {} → no flags."""
+    try:
+        data = json.loads((WORKSPACE / ".orchestrator" / "project.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    models = data.get("models")
+    if not isinstance(models, dict):
+        return {}
+    pair = models.get("box")
+    return pair if isinstance(pair, dict) else {}
+
+
 def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
              editor: bool = False, editor_port: int = 0, clone_repo: str = "",
              clone_ref: str = "", clone_setup: str = "",
-             dev: dict | None = None, dev_subnet: str = "") -> None:
+             dev: dict | None = None, dev_subnet: str = "",
+             model: str = "", effort: str = "") -> None:
     """docker run a box in the local inner dockerd. ``browser`` selects the
     Chromium-equipped image; ``agent`` (claude|none) → RS_BOX_AGENT (entrypoint
     deploys claude only for "claude", still auth-free); ``editor`` → the box's OWN
     RS_SERVICE_CODE_SERVER (box-level toggle, default off — decoupled from the
     project's editor); ``clone_*`` (BYO) → RS_BOX_CLONE_* the entrypoint clones +
-    runs (as box-shell env argv, never a host shell). The workspace dir is
-    pre-staged + uid-1000-owned (see _stage_box_workspace) so dockerd's auto-create
-    on -v doesn't land it root-owned."""
+    runs (as box-shell env argv, never a host shell); ``model``/``effort`` → the
+    agent env this box's claude reads (a box tab runs a login shell, not the
+    agent, so there is no argv to inject — it must ride the environment). The
+    workspace dir is pre-staged + uid-1000-owned (see _stage_box_workspace) so
+    dockerd's auto-create on -v doesn't land it root-owned."""
     sub = f"pi-isolated/{name}"
     (WORKSPACE / sub).mkdir(parents=True, exist_ok=True)
     cname = box_container(name)
@@ -494,6 +516,14 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         if gitea_ip:
             net_args += ["--add-host", f"rs-gitea:{gitea_ip}"]
         dev_env = []
+    # Agent model + effort (STAGE_MODEL_SELECT). Fixed at `docker run` — a plain
+    # `docker restart` does NOT re-evaluate env — so _rerun_box re-applies them
+    # from the stored entry on every restart / supervisor recreate.
+    model_env: list[str] = []
+    if model:
+        model_env = ["-e", f"ANTHROPIC_MODEL={model}"]
+        if effort:
+            model_env += ["-e", f"CLAUDE_CODE_EFFORT_LEVEL={effort}"]
     r = _docker(
         "run", "-d",
         "--name", cname,
@@ -506,6 +536,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         "-e", f"RS_SERVICE_CODE_SERVER={'enabled' if editor else 'disabled'}",
         "-e", f"RS_SANDBOX_NAME={name}",
         "-e", f"RS_BOX_AGENT={agent}",
+        *model_env,
         *clone_env,
         *dev_env,
         "--label", "research.sandbox=1",
@@ -541,7 +572,12 @@ def _rerun_box(name: str, entry: dict) -> None:
              clone_setup=entry.get("setup") or "",
              dev=(_dev_run_info(entry["repo"], entry.get("gitea_user") or "")
                   if is_dev else None),
-             dev_subnet=entry.get("dev_subnet") or "")
+             dev_subnet=entry.get("dev_subnet") or "",
+             # From the STORED entry, not re-derived: env is fixed at docker run,
+             # so a restart (and the supervisor-recreate relaunch loop, which
+             # lands here) must re-apply the box's own pair or it evaporates.
+             model=entry.get("model") or "",
+             effort=entry.get("effort") or "")
 
 
 def _box_entry(entries: dict[str, dict], name: str) -> dict:
@@ -618,9 +654,17 @@ def cmd_create(args: argparse.Namespace) -> None:
     # Stage CLAUDE.md + .mcp-proxy.json BEFORE the run (M2: the entrypoint reads
     # them at boot). strict=True → die on an MCP not in the project allowlist.
     _stage_box_workspace(name, preset, mcps, strict=True)
+    # Agent model + effort (STAGE_MODEL_SELECT). Explicit flags win; otherwise the
+    # project's `box` default from the marker, read verbatim (the host resolved and
+    # effort-drop-checked it at create — nothing here can validate). Persisted on
+    # the entry so _rerun_box re-applies it: docker run env is fixed at run.
+    _pair = _project_box_pair()
+    model = (args.model or "").strip() or (_pair.get("model") or "")
+    effort = (args.effort or "").strip() or (_pair.get("effort") or "")
     entry = {"kind": KIND, "ip": ip, "container": box_container(name),
              "preset": args.preset, "browser": browser, "agent": agent,
-             "editor": editor, "upstream_mcps": mcps}
+             "editor": editor, "upstream_mcps": mcps,
+             "model": model, "effort": effort}
     if editor:
         entry["editor_port"] = editor_port
     if is_clone:
@@ -633,7 +677,8 @@ def cmd_create(args: argparse.Namespace) -> None:
     _run_box(name, ip, browser=browser, agent=agent, editor=editor,
              editor_port=editor_port, clone_repo=repo if is_clone else "",
              clone_ref=ref, clone_setup=setup,
-             dev=dev_info, dev_subnet=dev_subnet)
+             dev=dev_info, dev_subnet=dev_subnet,
+             model=model, effort=effort)
     print(json.dumps({"name": name, "ip": ip, "preset": args.preset,
                       "browser": browser, "agent": agent, "editor": editor,
                       "editor_port": editor_port or None,
@@ -762,6 +807,12 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--agent", choices=["claude", "none"], default=None,
                    help="override the preset's agent default; 'claude' cp's the "
                         "binary in (still auth-free — run `claude` + /login inside)")
+    c.add_argument("--model", default="",
+                   help="agent model for this box (default: the project's box "
+                        "default, set at project create)")
+    c.add_argument("--effort", default="",
+                   help="agent effort level for this box (default: the project's "
+                        "box default; ignored for a model with no effort levels)")
     c.add_argument("--editor", action="store_true",
                    help="bundle the code-server editor into this box")
     c.add_argument("--mcps", default="",
