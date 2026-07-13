@@ -6919,18 +6919,49 @@ def dev_repo_add(req: "DevRepoAddRequest", _progress=None) -> DevRepoAddResult: 
         stamp=str(gitea.mirror_stamp_path(req.repo)))
 
 
-def dev_repo_remove(req: "DevRepoRemoveRequest", _progress=None) -> DevRepoRemoveResult:  # type: ignore[name-defined]
+def dev_repo_remove(req: "DevRepoRemoveRequest", progress=None) -> DevRepoRemoveResult:  # type: ignore[name-defined]
     """Delete the mirror + best-effort every consumer fork (repos only — agent
     USERS stay inert; gitea purges a deleted user's repos) + the forks' token
-    files + the mirror stamp. Refuse while any project is still attached to
-    the repo (explicit beats silent unwiring)."""
+    files + the mirror stamp.
+
+    TWO refusals, in order:
+      1. The LEDGER check (a local file read — no gitea needed): a project is
+         still attached. Friendly and actionable ("delete that project first"),
+         but only as truthful as the record.
+      2. The FORK check — the AUTHORITATIVE gate: the mirror still carries a
+         LIVE (unarchived) consumer fork, i.e. an agent's work nobody retired.
+         It measures ACTUAL gitea state rather than trusting the ledger, and it
+         FAILS CLOSED: if the forks can't be enumerated we refuse rather than
+         delete (hence gitea.consumer_forks, which raises — NOT list_forks,
+         whose []-on-error would read a sick gitea as "no forks, safe to wipe").
+
+    A RETIRED consumer (destroyed project, removed box) leaves its fork
+    ARCHIVED, which is not live — so the normal "this repo is finished" path
+    passes both gates with no extra step."""
+    progress = progress or _NULL_PROGRESS
     attached = gitea.attached_projects(req.repo)
     if attached:
-        die(f"repo {req.repo!r} is attached to: {', '.join(attached)}. "
-            f"Detach those projects first (`research dev detach <project>`).")
+        die(f"repo {req.repo!r} is still worked by: {', '.join(attached)}. "
+            f"Delete those dev projects (or their boxes) first — retiring a "
+            f"consumer archives its fork and releases the repo.")
     _resume_gitea(require=True)        # resume an enabled gitea to talk to it
+    host_port = _gitea_host_port()
+    progress.step("forks", "checking for live agent forks")
     try:
-        gitea.remove_repo(_gitea_host_port(), req.repo)
+        forks = gitea.consumer_forks(host_port, req.repo)
+    except gitea.GiteaError as e:
+        # Fail CLOSED: an unverifiable fork state is never a licence to delete.
+        raise ValidationError(
+            f"could not verify {req.repo!r}'s forks ({e}); refusing to delete")
+    live = [f["user"] for f in forks if not f.get("archived")]
+    if live:
+        die(f"repo {req.repo!r} still has live agent fork(s): "
+            f"{', '.join(live)}. Delete the dev project or box that owns the "
+            f"work first (retiring it archives the fork), or archive the fork "
+            f"in the Gitea tab if it is orphaned.")
+    progress.step("delete", "deleting the mirror and its retired forks")
+    try:
+        gitea.remove_repo(host_port, req.repo)
     except gitea.GiteaError as e:
         raise ValidationError(str(e))
     return DevRepoRemoveResult(repo=req.repo)

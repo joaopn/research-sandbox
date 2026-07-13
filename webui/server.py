@@ -995,6 +995,35 @@ async def broker_dev_gitea_start_handler(request: web.Request) -> web.Response:
                            op_seed="dev-gitea")
 
 
+async def broker_dev_repo_remove_handler(request: web.Request) -> web.Response:
+    """POST /broker/dev/repo-remove {repo, proof} — delete a finished repo's
+    mirror + its retired forks (gated, origin-checked, STEP-UP). The step-up
+    `proof` (client-side derivation of the retyped master password — the raw
+    password never transits) rides the args and is consumed by the broker's
+    dispatch gate, exactly as box_remove does.
+
+    A tailed op (dev_repo_remove ∈ PROGRESS_VERBS): the delete makes N bounded
+    gitea calls (enumerate the forks, delete each retired one, delete the
+    mirror), which on a repo with several retired consumers could brush the 30s
+    relay window and report a false "unreachable" while the broker completes.
+    The broker's own gate is the authority — it refuses on a LIVE fork and
+    fails closed if it cannot enumerate."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    args = {"repo": body.get("repo")}
+    proof = body.get("proof")
+    if isinstance(proof, str):
+        args["proof"] = proof
+    return await _start_op(request, "dev_repo_remove", args,
+                           BROKER_OP_TIMEOUT_S, op_seed="dev-repo")
+
+
 async def broker_dev_passwd_handler(request: web.Request) -> web.Response:
     """POST /broker/dev/passwd {password, proof} — set the sandbox-admin gitea
     password (gated, origin-checked, STEP-UP). The step-up `proof` (client-side
@@ -2329,6 +2358,7 @@ def main() -> None:
     app.router.add_post("/broker/dev/active-fork", broker_dev_active_fork_handler)
     app.router.add_post("/broker/dev/gitea-start", broker_dev_gitea_start_handler)
     app.router.add_post("/broker/dev/passwd", broker_dev_passwd_handler)
+    app.router.add_post("/broker/dev/repo-remove", broker_dev_repo_remove_handler)
     app.router.add_post("/broker/dev/review", broker_dev_review_handler)
     app.router.add_post("/broker/dev/project", broker_dev_project_handler)
     # Under /broker/ ON PURPOSE: the Management session cookie is Path=/broker

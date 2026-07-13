@@ -91,7 +91,7 @@ BROKER_FULLLOG_DIR = BROKER_DIR / "oplogs-full"     # .full.log — host-only
 # (OPEN_VERBS) and auth verbs never produce one. op_id-driven from the webui.
 PROGRESS_VERBS = frozenset({"create", "update", "destroy", "start", "stop",
                             "box_add", "box_remove", "dev_gitea_start",
-                            "dev_passwd"})
+                            "dev_passwd", "dev_repo_remove"})
 
 # op_id names a file, so it is validated as a safe basename before it ever does:
 # first char alnum, rest alnum/dot/dash/underscore — no path separator, no
@@ -593,10 +593,14 @@ DEV_PROJECT_WEBUI_FIELDS = frozenset({"name", "workflow", "url", "pat",
 DEV_PASSWD_WEBUI_FIELDS = frozenset({"password"})
 
 
-def _verb_dev_repo_remove(args: dict, _progress=None) -> dict:
+def _verb_dev_repo_remove(args: dict, progress=None) -> dict:
+    # Step-up gated (STEP_UP_VERBS) + tailed (PROGRESS_VERBS): the delete makes
+    # N bounded gitea calls (enumerate + delete each retired fork + the mirror),
+    # so it runs as an op rather than inside the webui's 30s relay window.
+    # `progress` is forwarded so the fork-gate / delete milestones reach the tail.
     safe = {k: v for k, v in args.items() if k in DEV_TARGET_WEBUI_FIELDS}
     req = rscore.DevRepoRemoveRequest.from_kwargs(**safe)  # may raise ValidationError
-    return dataclasses.asdict(rscore.dev_repo_remove(req))
+    return dataclasses.asdict(rscore.dev_repo_remove(req, progress))
 
 
 def _verb_dev_repo_list(_args: dict, _progress=None) -> dict:

@@ -1843,8 +1843,9 @@ function renderDevFetchScreen(view, body, result) {
     }
     if (!repos.length) {
         body.appendChild(el("div", { class: "mgmt-empty" }, [
-            "No dev repos yet — add one on the host: ",
-            el("code", {}, ["research dev repo add <github-url>"]),
+            "No dev repos yet. A repo is mirrored here when you create a dev "
+            + "project from a GitHub URL (Workflows → Dev), or add a dev box to "
+            + "an existing project.",
         ]));
         return;
     }
@@ -1897,11 +1898,30 @@ function renderDevFetchScreen(view, body, result) {
         } else if (r.active) {
             forkEl = el("span", { class: "dev-repo-meta" }, [`fork: ${r.active}`]);
         }
+        // Remove is offered only for a FINISHED repo — no live fork, nobody
+        // working it. Retiring a consumer (destroying its project, removing its
+        // box) archives the fork, which is what releases the repo. This disable
+        // is an affordance only: the broker's gate is the authority (it re-reads
+        // the LIVE fork state and fails closed), so a stale page cannot delete.
+        const blocker = live.length
+            ? `still has a live agent fork (${live.map((f) => f.user).join(", ")})`
+            : (attached.length
+                ? `still worked by ${attached.join(", ")}`
+                : "");
+        const remove = el("button", {
+            class: "btn-small btn-danger",
+            title: blocker
+                ? `Can't remove — ${blocker}. Delete the dev project or box first.`
+                : "Delete this repo's mirror and its retired forks",
+        }, ["Remove"]);
+        remove.disabled = !!blocker;
+        remove.onclick = () => devRepoRemoveDialog(view, body, r.repo);
         const rows = [el("div", { class: "dev-repo-head" }, [
             el("span", { class: "dev-repo-name" }, [r.repo]),
             el("span", { class: "dev-repo-meta" }, [meta]),
             ...(forkEl ? [forkEl] : []),
             sync,
+            remove,
         ])];
         const reviews = (r.reviews && typeof r.reviews === "object") ? r.reviews : {};
         for (const p of prs) {
@@ -1985,6 +2005,47 @@ function renderDevFetchScreen(view, body, result) {
         "📋 copies the rs-fetch command — paste it in any project or box ",
         "terminal (every container carries rs-fetch + read-only fetch access).",
     ]));
+}
+
+// Delete a finished repo: its gitea mirror + every retired agent fork (history
+// included) + their tokens + the host stamp. STEP-UP gated like destroy and
+// box-remove — a stolen session cookie must not suffice. The broker re-verifies
+// the fork state and refuses on a live fork (and fails closed if it cannot read
+// it), so this dialog's own disable is only an affordance.
+function devRepoRemoveDialog(view, body, repo) {
+    const pwI = el("input", { type: "password", autocomplete: "current-password" });
+    mgmtConfirmThenTail(view, {
+        title: `Remove ${repo}`,
+        tailTitle: `Removing ${repo}`,
+        verb: "dev_repo_remove",
+        confirmLabel: "Remove",
+        danger: true,
+        body: [
+            el("p", {}, [
+                `This deletes "${repo}" from Gitea: the mirror, every retired `
+                + "agent fork (including its commit history), their tokens, and "
+                + "the local record. It cannot be undone. The GitHub original is "
+                + "untouched.",
+            ]),
+            el("div", { class: "field" }, [
+                el("label", {}, ["Re-enter your master password"]), pwI,
+            ]),
+        ],
+        validate: () => (pwI.value ? null : "Re-enter your master password."),
+        // Step-up: the retyped password is derived client-side and only the
+        // proof rides the request; the broker verifies it async, so a wrong
+        // password surfaces as a FAILED op (the destroy / box-remove semantics).
+        request: async () => fetch("/broker/dev/repo-remove", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                repo: repo,
+                proof: await deriveLoginProof(pwI.value),
+            }),
+        }),
+        onDone: (ok) => { if (ok) renderDevFetchTab(view, body); },
+        focus: () => pwI.focus(),
+    });
 }
 
 // Management → Infrastructure (STAGE_DEV_GITEA S3): shared host services that
@@ -2712,8 +2773,8 @@ function mgmtCreateDialog(view, manifest, agents) {
     // Docker-substrate-only agents (rendered as cards in the Settings region below).
     // Staged agents only — one independent on/off box each (STAGE_MULTI_AGENT),
     // default claude on. Un-staged KNOWN_AGENTS are omitted: the form never offers
-    // an agent the host can't deploy (pull it on the host first), so the POSTed set
-    // always validates in from_kwargs.
+    // an agent that isn't deployable yet (pull it under Management → Software), so
+    // the POSTed set always validates in from_kwargs.
     const stagedAgents = agents
         .filter((a) => a && a.staged)
         .map((a) => a.name);
@@ -2753,7 +2814,7 @@ function mgmtCreateDialog(view, manifest, agents) {
             agentChecks.length
                 ? el("div", { class: "box-opt-cards" }, agentChecks.map((c) => c.card))
                 : el("div", { class: "hint" }, [
-                      "No agents pulled on the host — run `research agent pull`.",
+                      "No agents available yet — pull one under Management → Software.",
                   ]),
         ])] : []),
         el("div", { class: "box-opt-group" }, [
@@ -3026,12 +3087,12 @@ function renderWorkflowsScreen(view, result) {
     const buckets = { research: [], base: [], store: [] };
     for (const m of workflows) buckets[bucketOf(m)].push(buildCard(m));
     // Import an existing project — a card in the Store section (imported things);
-    // was the rail's "+ Add project". Opens the SSH-coordinates / import modal.
+    // was the rail's "+ Add project". Opens the SSH-coordinates modal.
     const importCard = el("div", { class: "workflows-card import-card",
                                    title: "Add an existing project by its SSH coordinates" }, [
         el("div", { class: "workflows-card-name" }, ["Import project"]),
         el("div", { class: "workflows-card-desc" },
-           ["Add an existing project by its SSH coordinates (or an import string)."]),
+           ["Add a box you run elsewhere, by its SSH coordinates."]),
         el("div", { class: "workflows-card-actions" }, [null]),
     ]);
     importCard.onclick = () => openAddProjectModal();
@@ -3974,26 +4035,16 @@ function makeLayoutSelector() {
 // ---- add / remove project --------------------------------------------------
 
 function openAddProjectModal() {
-    const importTa = el("textarea", { placeholder: "Paste `research webui import <project>` output (optional)" });
+    // No import-string paste box: its only filler was the output of a host CLI
+    // command. A project on this sandbox attaches with one click (Management →
+    // Attach, which pulls the SSH coordinates from the broker); an external box
+    // is entered by hand below. Neither needs a shell.
     const nameI = el("input", { type: "text" });
     const hostI = el("input", { type: "text" });
     const portI = el("input", { type: "number", min: "1", max: "65535", value: "22" });
     const userI = el("input", { type: "text", value: "research" });
     const passI = el("input", { type: "password", autocomplete: "new-password" });
     const errEl = el("div", { class: "error" });
-
-    importTa.oninput = () => {
-        const s = importTa.value.trim();
-        if (!s) return;
-        try {
-            const decoded = JSON.parse(atob(s));
-            if (decoded.name) nameI.value = decoded.name;
-            if (decoded.host) hostI.value = decoded.host;
-            if (decoded.port) portI.value = decoded.port;
-            if (decoded.username) userI.value = decoded.username;
-            if (decoded.password) passI.value = decoded.password;
-        } catch (_) { /* ignore non-import-string content */ }
-    };
 
     const backdrop = el("div", { class: "modal-backdrop" });
     const cancel = el("button", { class: "btn btn-secondary" }, ["Cancel"]);
@@ -4026,10 +4077,10 @@ function openAddProjectModal() {
 
     const card = el("div", { class: "card" }, [
         el("h2", {}, ["Import project"]),
-        el("div", { class: "field" }, [
-            el("label", {}, ["Import string (optional)"]),
-            importTa,
-            el("div", { class: "hint" }, ["Paste the base64 string from `research webui import <project>` to auto-fill the fields."]),
+        el("div", { class: "hint" }, [
+            "For a project on this sandbox, use Attach under Management — it "
+            + "fetches the coordinates for you. This form is for a box you run "
+            + "elsewhere.",
         ]),
         el("div", { class: "field" }, [el("label", {}, ["Project name"]), nameI]),
         el("div", { class: "field" }, [el("label", {}, ["Host"]), hostI]),
@@ -5199,7 +5250,7 @@ async function handleControl(project, serviceId, term, ws, ctrl) {
             `Stored: ${project.host_key_fingerprint}\n` +
             `Actual: ${ctrl.actual}\n\n` +
             `Accept the new key?\n\n` +
-            `Click OK only if you intentionally recreated the supervisor (e.g. \`research project update\`) — otherwise this could be a man-in-the-middle.`,
+            `Click OK only if you intentionally recreated the supervisor (e.g. you changed its services from Management) — otherwise this could be a man-in-the-middle.`,
         );
         if (accept) {
             project.host_key_fingerprint = ctrl.actual;

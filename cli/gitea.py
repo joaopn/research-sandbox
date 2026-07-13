@@ -528,22 +528,17 @@ def remove_repo(host_port: str, repo: str) -> None:
     delete. Cleans the mirror stamp + the active-fork entry + the forks'
     token files."""
     client = GiteaClient(api_base(host_port), read_admin_token())
-    # Enumerate directly (NOT list_forks, whose []-on-error is the right
-    # degradation for STATUS reads but would silently skip this cascade).
+    # The STRICT enumeration under this lane's own posture: warn-and-continue
+    # (NOT list_forks, whose []-on-error would silently skip the cascade).
     try:
-        raw = client._api("GET", f"/repos/{ADMIN_USER}/{repo}/forks",
-                          timeout=STATUS_TIMEOUT_S) or []
+        forks = consumer_forks(host_port, repo)
     except GiteaError as e:
-        raw = []
+        forks = []
         print(f"warning: could not enumerate {repo!r}'s consumer forks ({e}); "
               f"delete any leftover agent-* forks in the gitea UI",
               file=sys.stderr)
-    for f in raw if isinstance(raw, list) else []:
-        if not isinstance(f, dict):
-            continue
-        owner = (f.get("owner") or {}).get("login") or ""
-        if not owner.startswith(AGENT_USER_PREFIX):
-            continue
+    for f in forks:
+        owner = f["user"]
         try:
             client._api("DELETE", f"/repos/{owner}/{repo}")
         except GiteaError as e:
@@ -588,16 +583,22 @@ def sync_repo(host_port: str, repo: str) -> None:
 
 # --- consumer forks + the active-fork map ------------------------------------
 
-def list_forks(host_port: str, repo: str) -> list[dict]:
-    """The mirror's consumer forks: [{user, archived, created_at}]. Bounded,
-    best-effort (a sick gitea → empty list, callers degrade to no-fork reads).
-    Only agent-prefixed owners count — a manual human fork is not a consumer."""
+def consumer_forks(host_port: str, repo: str) -> list[dict]:
+    """The mirror's consumer forks: [{user, archived, created_at}] — the STRICT
+    enumeration: a GiteaError PROPAGATES. Only agent-prefixed owners count (a
+    manual human fork is not a consumer).
+
+    This is the single enumeration body; its callers pick the failure posture,
+    and the posture is the whole point:
+      * A destructive GATE (rscore.dev_repo_remove) must FAIL CLOSED — it calls
+        this and refuses when it raises. Reading a sick gitea as "no forks" would
+        mean "safe to delete the mirror and every fork on it".
+      * A STATUS read degrades to empty (list_forks).
+      * The delete CASCADE warns and continues (remove_repo).
+    """
     client = GiteaClient(api_base(host_port), read_admin_token())
-    try:
-        raw = client._api("GET", f"/repos/{ADMIN_USER}/{repo}/forks",
-                          timeout=STATUS_TIMEOUT_S) or []
-    except GiteaError:
-        return []
+    raw = client._api("GET", f"/repos/{ADMIN_USER}/{repo}/forks",
+                      timeout=STATUS_TIMEOUT_S) or []
     out = []
     for f in raw if isinstance(raw, list) else []:
         if not isinstance(f, dict):
@@ -608,6 +609,16 @@ def list_forks(host_port: str, repo: str) -> list[dict]:
                         "archived": bool(f.get("archived")),
                         "created_at": f.get("created_at") or ""})
     return out
+
+
+def list_forks(host_port: str, repo: str) -> list[dict]:
+    """The best-effort posture over consumer_forks: a sick gitea → empty list,
+    so a STATUS read degrades to a no-fork view instead of failing the page.
+    NEVER use this to gate a destructive action — it fails OPEN by design."""
+    try:
+        return consumer_forks(host_port, repo)
+    except GiteaError:
+        return []
 
 
 def load_active_forks() -> dict:
