@@ -1674,6 +1674,45 @@ async def project_services_handler(request: web.Request) -> web.Response:
                 url = _origin_url(request, project, esid)
                 out[esid] = {**espec, **({"origin_url": url} if url else {})}
 
+    # One tab per dev CONSUMER that got a fork at spawn — the dev-workflow
+    # project's own agent, and each dev box — linking to that fork's home page on
+    # the shared gitea. Both sources are already on the RO mount: the project's
+    # dev-gitea.json rows (agent_user = its OWN fork owner) and each dev box's
+    # extensions.json entry (gitea_user + repo). Lifecycle is free — remove the
+    # box or detach the repo and the row is gone, so the tab is gone next load.
+    #
+    # Id = git-<consumer>:<repo>, and both separators are load-bearing. The `.` in
+    # a box's consumer (<project>.<box>) is legal in gitea usernames but ILLEGAL
+    # in project and box names, so a box named after its project cannot collide
+    # with the project's own tab. The `:` is illegal in project, box AND gitea
+    # repo names, so a project working two repos (rows are repo-level while
+    # agent_user is ONE identity across them) gets two distinct ids instead of one
+    # silently overwriting the other. Nothing parses the id back — it is a dict
+    # key and a quoted `data-service` attribute.
+    fork_tabs: list[tuple[str, str, str, str]] = []   # (consumer, label, user, repo)
+    dev_rows = _read_dev_gitea(project)
+    for row in dev_rows:
+        # Single repo (the normal case) keeps the plain label; a multi-repo
+        # project disambiguates rather than dropping a fork.
+        label = (f"{project} (GIT)" if len(dev_rows) == 1
+                 else f"{project} (GIT: {row['repo']})")
+        fork_tabs.append((project, label, row["agent_user"], row["repo"]))
+    for name, entry in sorted(sandbox_map.items()):
+        if (entry.get("kind") == "sandbox" and entry.get("dev")
+                and entry.get("gitea_user") and entry.get("repo")):
+            # A dev box is repo-specific by construction — always exactly one.
+            fork_tabs.append((f"{project}.{name}", f"{name} (GIT)",
+                              entry["gitea_user"], entry["repo"]))
+    # Probe only when there is something to gate (the sibling blocks guard the
+    # same way): gitea unreachable ⇒ no fork tabs at all, never a tab that 502s.
+    if fork_tabs and await tcp_probe(GITEA_UPSTREAM_HOST, GITEA_UPSTREAM_PORT):
+        for consumer, label, user, repo in fork_tabs:
+            spec = services.dev_fork_service(label, user, repo)
+            if spec is not None:
+                # Skip-on-None matters: the charset guard is what keeps a `/` or
+                # `:` out of a value baked into BOTH the iframe path and the id.
+                out[f"{services.DEV_FORK_ID_PREFIX}{consumer}:{repo}"] = spec
+
     # Operator-registered exported ports (STAGE_EXPORTED_PORTS): one http tab per
     # port that is currently LISTENING on the supervisor netns — same probe-gated
     # discipline as the editor (a port the PI hasn't started serving yet shows no
@@ -1714,6 +1753,39 @@ def _read_project_extensions(project: str) -> dict[str, dict]:
     if not isinstance(data, dict):
         return {}
     return {n: e for n, e in data.items() if isinstance(e, dict)}
+
+
+def _read_dev_gitea(project: str) -> list[dict]:
+    """Return the dev-lane repo rows for ``project`` — ``[{repo, agent_user}]`` —
+    read from its `.orchestrator/dev-gitea.json` off the `/projects:ro`
+    bind-mount. Tolerant like _read_project_extensions; no cache.
+
+    Names ONLY: the file is non-secret by construction (its writer can emit
+    nothing but ip/name fields), and this reader takes just the two it needs.
+    ``agent_user`` is the PROJECT consumer's own fork owner, and is empty exactly
+    when the project's own agent doesn't work that repo — NOT ``user``, which is
+    the ACTIVE fork and may belong to a BOX (that is the read-steering surface,
+    deliberately not what a project's own fork tab opens)."""
+    workspace = _project_workspace(project)
+    if workspace is None:
+        return []
+    f = workspace / ".orchestrator" / "dev-gitea.json"
+    if not f.is_file():
+        return []
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    out: list[dict] = []
+    for row in data.get("repos") or []:
+        if not isinstance(row, dict):
+            continue
+        repo, user = row.get("repo") or "", row.get("agent_user") or ""
+        if repo and user:
+            out.append({"repo": repo, "agent_user": user})
+    return out
 
 
 def _read_exported_ports(project: str) -> list[dict]:

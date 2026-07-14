@@ -5499,6 +5499,63 @@ function openSshTerminal(project, serviceId, svc) {
 
 // ---- http-kind iframe ------------------------------------------------------
 
+// Mount a dev consumer's gitea fork in a service pane. The shared gitea origin
+// is gated by the sentinel cookie that POST /broker/dev/gitea-session mints
+// (Management-session-anchored — the route lives under /broker/ because that
+// cookie is Path=/broker), so the mint comes first and the fork's path rides on
+// top of the origin URL it hands back.
+//
+// TRANSPORT failure and VERB failure are distinguishable by construction and are
+// kept apart here: a throw or a 503 means the broker is genuinely unreachable; a
+// 200 carrying {ok:false} means it ANSWERED and refused. Collapsing the two would
+// send the operator to restart a daemon that is answering fine.
+async function mountGiteaFork(container, status, giteaPath) {
+    const fail = (msg, retry) => {
+        status.textContent = msg;
+        if (retry) {
+            const b = el("button", { class: "btn-small" }, ["Retry"]);
+            b.onclick = () => {
+                status.textContent = "Authenticating…";
+                const stale = container.querySelector("button");
+                if (stale) stale.remove();
+                mountGiteaFork(container, status, giteaPath);
+            };
+            container.appendChild(b);
+        }
+    };
+    let res;
+    try {
+        res = await fetch("/broker/dev/gitea-session", { method: "POST" });
+    } catch (e) {
+        return fail("Gitea isn't reachable right now.", true);
+    }
+    if (res.status === 503) return fail("Gitea isn't reachable right now.", true);
+    if (res.status === 401) {
+        // The vault unlock auto-logs into Management, so a 401 here means the
+        // vault and broker passwords disagree — a host-side fix, not a retry.
+        return fail("Not signed in to Management — unlock the vault again.", false);
+    }
+    if (res.status === 403) return fail("Origin rejected.", false);
+    let data;
+    try { data = await res.json(); } catch (e) { data = {}; }
+    if (!res.ok || !data.ok || !data.url) {
+        return fail(`Could not open the fork: ${mgmtErrText(data)}`, true);
+    }
+    // clipboard-write delegation is what lets Gitea's native code-block copy
+    // button work inside the cross-origin frame (Permissions-Policy features
+    // whose default allowlist is 'self' are silently revoked otherwise). NO
+    // sandbox attribute — this follows the Development gitea frame, not the
+    // neighbouring per-origin http tab, which does sandbox its iframe.
+    const iframe = el("iframe", {
+        class: "http-iframe",
+        src: data.url.replace(/\/$/, "") + giteaPath,
+        allow: "fullscreen; clipboard-read; clipboard-write",
+    });
+    iframe.setAttribute("allowfullscreen", "");
+    status.remove();
+    container.appendChild(iframe);
+}
+
 async function openHttpService(project, serviceId, svc) {
     const container = el("div", { class: "terminal-instance http-instance" });
     const status = el("div", { class: "http-status" }, ["Authenticating…"]);
@@ -5509,6 +5566,17 @@ async function openHttpService(project, serviceId, svc) {
     state.terminals[key] = {
         kind: "http", container, project, service: serviceId,
     };
+
+    // A dev consumer's gitea FORK tab serves off the SHARED -gitea- sentinel
+    // origin, not a per-container origin port — so it has no origin_url, and it
+    // must branch BEFORE the /session/<project> mint below (which would mint a
+    // cookie for an origin this tab never loads) and before that mint's
+    // `!svc.origin_url` bail (which would otherwise reject this tab outright).
+    // The bookkeeping above is shared deliberately: teardown stays identical.
+    if (svc.gitea_path) {
+        await mountGiteaFork(container, status, svc.gitea_path);
+        return;
+    }
 
     // POST /session/<project> to mint the cookie before mounting the iframe.
     // The fingerprint, if any, is included so the server's TOFU check

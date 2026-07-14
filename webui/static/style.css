@@ -1373,16 +1373,18 @@ html.mobile .dashboard.mobile-projects .service-tabs .active-project {
 /* Tab strip = [project chip][whitelisted chips]: one thick thumbable row.
    52px = the common 44px minimum touch target + room for the larger type;
    LOCKSTEP: the open drawer's top offset above must match this height.
-   THE MOBILE TAB MODEL: show enabled ∩ {cli, reader} — the :not() below IS
-   the whitelist; extending mobile to another visual surface = extending that
-   list. code-server / box editors / port-<n> stay desktop-only. Pin buttons
+   THE MOBILE TAB MODEL: show enabled ∩ {cli, reader, git-<consumer>} — the
+   :not() chain below IS the whitelist; extending mobile to another visual
+   surface = extending that chain. The dev-fork (git-) tabs are shown: reading a
+   fork's issues and PRs from the phone is the point of the dev lane's human→agent
+   channel. code-server / box editors / port-<n> stay desktop-only. Pin buttons
    stay hidden (no split panes on mobile); + Add box and the per-box ✕ are
    SHOWN (dind box lifecycle from the phone; their dialogs are sheet-styled). */
 html.mobile .service-tabs { height: 52px; }
 html.mobile .service-tabs .tab { font-size: 14px; }
 html.mobile .service-tabs .tab .tab-icon svg { width: 16px; height: 16px; }
 html.mobile .service-tabs .projects-tab,
-html.mobile .service-tabs .tab[data-surface="visual"]:not([data-service="reader"]),
+html.mobile .service-tabs .tab[data-surface="visual"]:not([data-service="reader"]):not([data-service^="git-"]),
 html.mobile .service-tabs .pin-tab-btn,
 html.mobile .service-tabs .tab-group-divider { display: none; }
 

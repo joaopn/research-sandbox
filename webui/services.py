@@ -9,6 +9,8 @@ via supervisor docker labels (`research.service.<id>=...`), read by
 project_services_handler.
 """
 
+import re
+
 # Each entry's `command` is what the SSH-kind service runs after auth — the
 # byobu invocation lands the user in /workspace, the supervisor's project root.
 # `default_port` is the in-container port the webui reaches via container DNS
@@ -170,6 +172,38 @@ def exported_port_service(port: int, label: str) -> dict | None:
         "default_port": port,
         "upstream_path": "/",
         "surface": "visual",
+    }
+
+
+# A dev consumer's gitea FORK (the dev-workflow project's own agent, or a dev
+# box) — one tab per consumer+repo, linking to that fork's home page. Distinct
+# from every other prefix (`pi-iso-`, `box-editor-`, `port-`).
+DEV_FORK_ID_PREFIX = "git-"
+
+# gitea usernames and repo names are alnum + `.`/`-`/`_`. The value is baked into
+# BOTH the iframe path on the shared gitea origin AND the tab id, so anything
+# outside that charset (a `/` retargeting the frame elsewhere in gitea, a `:`
+# colliding in the id namespace) is refused rather than sanitized.
+_DEV_FORK_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def dev_fork_service(label: str, user: str, repo: str) -> dict | None:
+    """Synthesize the tab spec for one dev consumer's gitea fork, or None if the
+    fork's owner/repo is not a plain gitea name.
+
+    Carries `gitea_path`, NEVER `origin_url`: this tab serves off the SHARED
+    `-gitea-` sentinel origin (one gitea, one login), not a per-container origin
+    port — so the synthesizer must not call `_origin_url()` for it, and its id
+    never enters ORIGIN_PORTS. `kind` is load-bearing: the SPA dispatches on it
+    (an absent kind falls back to "cli" and renders the tab as a terminal)."""
+    if not (_DEV_FORK_NAME.match(user or "") and _DEV_FORK_NAME.match(repo or "")):
+        return None
+    return {
+        "label": label,
+        "kind": "http",
+        "always_on": False,
+        "renderer": "iframe",
+        "gitea_path": f"/{user}/{repo}",
     }
 
 
