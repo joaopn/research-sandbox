@@ -114,6 +114,19 @@ STATUS_TIMEOUT_S = 5
 # false-fails; at 300s a wedged fork would hold the caller 5 min.
 FORK_WAIT_TRIES = 30
 
+# Repo FEATURES (gitea "units") on the two dev-lane repo kinds. Gitea's built-in
+# DefaultForkRepoUnits is code+pulls ONLY, so a fresh fork ships with NO issue
+# tracker — but the fork IS the human<->agent channel: repo-watch
+# (container/dev/repo-watch.sh) polls /repos/<agent>/<repo>/issues on the fork,
+# and gitea 404s that route while the unit is off. The MIRROR is a read-only
+# upstream nobody watches, and gitea's DefaultMirrorRepoUnits DOES include
+# issues — so issues are turned OFF there, leaving exactly ONE place to file.
+# Unnamed units are PRESERVED by gitea's Edit (each is touched only when its
+# option is non-nil), so a mirror keeps its code unit and its private flag.
+FORK_FEATURES = {"has_issues": True, "has_pull_requests": True,
+                 "has_wiki": True, "has_projects": True}
+MIRROR_FEATURES = {"has_issues": False}
+
 
 class GiteaError(Exception):
     """Any gitea-side failure. Message carries only method/path/status — never a
@@ -346,10 +359,27 @@ class GiteaClient:
             time.sleep(1)
         raise GiteaError(f"fork {as_user}/{repo} did not appear in time")
 
-    def grant_read(self, owner: str, repo: str, collaborator: str) -> None:
+    def set_repo_features(self, owner: str, repo: str, features: dict) -> None:
+        """PATCH a repo's unit flags. Idempotent (re-runnable on resume); every
+        EditRepoOption field is optional, so unnamed fields (private, default
+        branch, mirror interval) are untouched. Legal on a mirror and on an
+        archived fork — gitea's Edit special-cases neither."""
+        self._api("PATCH", f"/repos/{owner}/{repo}", dict(features))
+
+    def grant_collaborator(self, owner: str, repo: str, collaborator: str,
+                           permission: str) -> None:
         """PUT is idempotent — safe to re-run on resume."""
         self._api("PUT", f"/repos/{owner}/{repo}/collaborators/{collaborator}",
-                  {"permission": "read"})
+                  {"permission": permission})
+
+    def grant_read(self, owner: str, repo: str, collaborator: str) -> None:
+        self.grant_collaborator(owner, repo, collaborator, "read")
+
+    def subscribe(self, owner: str, repo: str) -> None:
+        """The ACTING identity watches the repo. We call with the admin token,
+        so the watcher is sandbox-admin — the human's gitea identity — and agent
+        activity on the fork raises notifications for them."""
+        self._api("PUT", f"/repos/{owner}/{repo}/subscription")
 
     def pull_info(self, owner: str, repo: str, index: int) -> dict:
         """One PR's metadata (title, state, head sha) for the review header +
@@ -481,6 +511,10 @@ def add_repo(host_port: str, url: str, repo: str, pat: str | None = None) -> Non
     GitHub token (private source = bool(pat)); in memory for this call only."""
     client = GiteaClient(api_base(host_port), read_admin_token())
     client.migrate_mirror(url, repo, pat)
+    # The mirror's OWN units, set where the mirror is minted. migrate_mirror
+    # early-returns on a healthy existing mirror, so THIS call — not the migrate
+    # — is what heals an already-added mirror's units on a re-add.
+    client.set_repo_features(ADMIN_USER, repo, MIRROR_FEATURES)
     MIRRORS_DIR.mkdir(parents=True, exist_ok=True)
     mirror_stamp_path(repo).write_text("")
 
@@ -488,14 +522,25 @@ def add_repo(host_port: str, url: str, repo: str, pat: str | None = None) -> Non
 def provision_consumer(host_port: str, repo: str, user: str) -> None:
     """Create-or-reuse one consumer's identity for one repo: gitea user +
     mirror read-grant + fork into the consumer namespace + operator read-grant
-    on the fork (the universal-fetch valve) + a user-scoped token file. Every
-    stage is exists-checked/idempotent (the add-repo resume discipline)."""
+    on the fork (the universal-fetch valve) + the fork's issue channel + a
+    user-scoped token file. Every stage is exists-checked/idempotent (the
+    add-repo resume discipline), so a re-run heals a fork that predates the
+    feature block."""
     import secrets as _secrets
     client = GiteaClient(api_base(host_port), read_admin_token())
     client.create_user(user, _secrets.token_urlsafe(24))
     client.grant_read(ADMIN_USER, repo, user)     # consumer reads the private mirror
     client.fork_repo(ADMIN_USER, repo, user)      # fork into the consumer namespace
     client.grant_read(user, repo, OPERATOR_USER)  # operator reads the fork (fetch)
+    # The fork's units MUST outlive a failure here: without the issue unit, gitea
+    # 404s repo-watch's poll and the human->agent channel is dead. So features +
+    # the human's grant are STRICT; the watch is a notification nicety and warns.
+    client.set_repo_features(user, repo, FORK_FEATURES)
+    client.grant_collaborator(user, repo, ADMIN_USER, "admin")
+    try:
+        client.subscribe(user, repo)
+    except GiteaError as e:
+        print(f"warning: could not watch {user}/{repo} ({e})", file=sys.stderr)
     mint_or_rotate_token(user)                    # writes tokens/<user>.token
 
 
