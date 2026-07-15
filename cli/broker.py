@@ -321,6 +321,11 @@ def _verb_workflows(_args: dict, _progress=None) -> dict:
         # can't deploy — so a relayed `agents` set always validates in from_kwargs.
         "agents": [{"name": a, "staged": rscore.dist_present(a)}
                    for a in rscore.KNOWN_AGENTS],
+        # Whether the node seed is cached (STAGE_NODE_SEED) — the create form's Node
+        # tickbox is an affordance off this bit (disabled + hinted when absent); the
+        # real gate is from_kwargs' node floor. Same "only offer what's deployable"
+        # motive as `agents` staged-state.
+        "node_present": rscore.node_dist_present(),
         "default_workflow": rscore.DEFAULT_WORKFLOW,
     }
 
@@ -823,6 +828,12 @@ def _verb_reader_refresh(_args: dict, progress=None) -> dict:
     return rscore.reader_refresh(progress=progress)
 
 
+def _verb_node_pull(_args: dict, progress=None) -> dict:
+    # Node is a SEED, not a managed dist — there is deliberately NO node_refresh
+    # verb (STAGE_NODE_SEED). This pull is the whole build-lane surface.
+    return rscore.node_pull(progress=progress)
+
+
 def _verb_rebuild(_args: dict, progress=None) -> dict:
     rscore.rebuild(progress=progress)
     return {"rebuilt": True}
@@ -833,6 +844,7 @@ BUILD_DISPATCH = {
     "agent_pull": _verb_agent_pull,
     "editor_pull": _verb_editor_pull,
     "reader_pull": _verb_reader_pull,
+    "node_pull": _verb_node_pull,
     "agent_refresh": _verb_agent_refresh,
     "editor_refresh": _verb_editor_refresh,
     "reader_refresh": _verb_reader_refresh,

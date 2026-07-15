@@ -650,6 +650,19 @@ class CreateRequest:
         if reader_on and substrate is Substrate.DIND_SYSBOX and not reader_dist_present():
             raise ValidationError(
                 "no cached reader dist — run `research reader pull` first")
+        # Node seed floor (STAGE_NODE_SEED). SUBSTRATE-AGNOSTIC (unlike the reader's
+        # dind-only floor): node reaches all three flavors, so the check is a plain
+        # dist-presence gate. Same flag-aware resolution as the floors above; node
+        # defaults OFF, so an un-flagged create never trips this. Message names NO
+        # CLI verb (it reaches the browser verbatim — the editor/reader die()s that
+        # name `research … pull` are the B28 defect, deliberately not copied here);
+        # the pull path is surfaced by the webui Software panel + affordance instead.
+        node_on = _compute_service_flags(
+            svc_en, svc_dis, base=(service_defaults or None)).get("node", False)
+        if node_on and not node_dist_present():
+            raise ValidationError(
+                "node is enabled but no node seed is cached — pull the node runtime "
+                "from the Software panel first")
         # Agent model + effort (STAGE_MODEL_SELECT). Resolve HERE — the one
         # pre-side-effect validation point — so a bad override file or an
         # impossible model/effort pair refuses the create cleanly instead of
@@ -1840,6 +1853,17 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         docker_args = (docker_args[:-1]
                        + ["-v", f"{EDITOR_DIST_DIR}:{EDITOR_DIST_MOUNT}:ro"]
                        + [docker_args[-1]])
+    # Node seed for the docker box (STAGE_NODE_SEED): same host-cache RO mount as the
+    # editor. The mount is a copy-source; _deploy_node (D2 below) cp's it into the
+    # box's own ~/.local. This mount survives a _recreate_docker_substrate as a
+    # RECOVERED bind (never re-derived from the flag — _without_mount strips only
+    # EDITOR_DIST_MOUNT), which is correct ONLY because node has no post-create
+    # toggle; a future live-node-toggle slice must convert it to the editor's
+    # _without_mount + re-derive shape.
+    if is_docker and service_flags.get("node") and node_dist_present():
+        docker_args = (docker_args[:-1]
+                       + ["-v", f"{NODE_DIST_DIR}:{NODE_DIST_MOUNT}:ro"]
+                       + [docker_args[-1]])
 
     # 4. Create container.
     progress.step("create-container", "creating project container")
@@ -1854,6 +1878,18 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     clone_dir = ""
     if is_docker:
         # No inner dockerd: nothing to stage, no proxy, no worker/extension cone.
+        # Node seed (STAGE_NODE_SEED, D2 — the RACE FIX): deploy node HOST-SIDE and
+        # SYNCHRONOUSLY, BEFORE the light-path setup runs. `docker run` returns while
+        # the entrypoint is still working (agent-dist cp, the slow editor deploy), so
+        # a node deploy left to the entrypoint could lose the race to a `setup` that
+        # needs npm (open-knowledge's `npm install -g` is the first such setup). This
+        # exec guarantees node is present first. NOTE: this runs concurrently with the
+        # entrypoint's OTHER ~/.local cp's (agent/editor) — safe, they write disjoint
+        # files, and _deploy_node is no-clobber — it is NOT the sole ~/.local writer
+        # during boot, only the sole NODE writer. The docker box has NO entrypoint
+        # node block (see D6 — none exists), so a restart never re-deploys.
+        if service_flags.get("node") and node_dist_present():
+            _deploy_node(container_name)
         # 6'. Light-path harness: clone the workflow repo + run setup on the box
         #     (after inject_route, so egress works). Create-time only; raises
         #     HarnessError on failure (box left standing).
@@ -1886,6 +1922,14 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             if reader_dist_present():
                 _stage_reader_dist(container_name,
                                    deploy_local=service_flags.get("reader", False))
+            # Node seed (STAGE_NODE_SEED): staged when cached so a later flag-on is
+            # deploy-only; deployed into the supervisor's own ~/.local iff node
+            # resolved ON (default off). Synchronous + ordered BEFORE _run_light_harness
+            # below, so the dind side is never racy (unlike the docker box, which
+            # needs the explicit host deploy D2).
+            if node_dist_present():
+                _stage_node_dist(container_name,
+                                 deploy_local=service_flags.get("node", False))
             # Box harness (STAGE_DIND_UNIFY — a standing dind utility, no longer an
             # opt-in): stage the rs-sandbox CLI (no longer baked) + deliver the box
             # images (MINT site, push=True; pins were frozen into the marker above).
@@ -1959,6 +2003,11 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             if reader_dist_present():
                 _stage_reader_dist(container_name,
                                    deploy_local=service_flags.get("reader", False))
+            # Node seed (STAGE_NODE_SEED): staged when cached; deployed into the
+            # supervisor's own ~/.local iff node resolved ON (default off).
+            if node_dist_present():
+                _stage_node_dist(container_name,
+                                 deploy_local=service_flags.get("node", False))
 
         # 6b/6c. The MCP proxy/reload/auto-allow cone runs for ALL dind now
         #        (STAGE_DIND_UNIFY): research AND sandbox-dind get the proxy so
@@ -2278,6 +2327,23 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     # ({"code-server","reader"}) falls through to the full recreate, which stages +
     # deploys per the resolved flags and clears both overrides — no live path needed.
     touched = _parse_service_list(enable_services) | _parse_service_list(disable_services)
+    # Node is create-time only (STAGE_NODE_SEED, E2). It joins KNOWN_SERVICES, so
+    # `project update --enable`'s help advertises it — but node has no live-toggle
+    # path, so an accepted `--enable node` would fall through to the full recreate
+    # whose only node guard SKIPS when no dist is cached (D5): the label + env would
+    # be stamped with nothing deployed (the exact silent no-op the reader floor
+    # rejects pre-side-effect). Refuse it — symmetric for --disable. MUST land BEFORE
+    # _apply_model_changes below (which persists the marker), or a refused
+    # `--enable node --worker-model haiku` writes the worker pair and THEN dies — a
+    # side effect on a rejected request. Message names NO CLI verb (it reaches the
+    # browser via the enable/disable relay) and the remedy is TRUE in the seed model:
+    # node detaches after delivery, so a box can install node itself. A bare update
+    # (no node token) still preserves node via label → _read_service_flags →
+    # _stage_node_dist. (Docker substrate is already covered — _update_docker_substrate
+    # early-returns at the gate above, so this line is dind-only.)
+    if "node" in touched:
+        die("node is fixed at create — a project can install node itself if it "
+            "needs it later")
     # Agent model/effort changes (STAGE_MODEL_SELECT). Merge them into the marker
     # FIRST — every downstream path (the live toggles, the full recreate, the
     # role-mcp restart) reads the marker, so writing it once here means each of
@@ -2515,6 +2581,13 @@ VERSION_SOURCES: dict[str, dict[str, str]] = {
         "kind": "manual",
         "url": "https://download.docker.com/linux/static/stable/x86_64/",
     },
+    # Node seed pin (STAGE_NODE_SEED) — dist-pin-only, manual. No resolver by
+    # design: node is a seed with no refresh lane (hand-bump + `research node
+    # pull` is the whole mechanism), so `manual` here is coherent, not a shortcut.
+    "NODE_VERSION": {
+        "kind": "manual",
+        "url": "https://nodejs.org/en/about/previous-releases",
+    },
     # Editor-bundled VS Code extensions (Open VSX item pages — eyeball the latest
     # before bumping the pin in versions.env, then `research editor pull`).
     "PYTHON_EXT_VERSION": {
@@ -2554,7 +2627,17 @@ VERSION_SOURCES: dict[str, dict[str, str]] = {
 # disabling it would brick the project. New service kinds extend both
 # lists in the same commit that ships the entrypoint conditional and the
 # registry entry.
-KNOWN_SERVICES: list[str] = ["supervisor", "code-server", "reader"]
+#
+# `node` (STAGE_NODE_SEED) is the FIRST tab-less service: a container capability
+# (a node runtime seeded into ~/.local so a node workflow works out of the box),
+# with NO webui tab, NO port, NO probe — so it has no `webui/services.py` entry.
+# It is also unusual in that its flag is consumed HOST-SIDE ONLY: the label is the
+# durable state _read_service_flags recovers to decide the mount + deploy, and the
+# node deploy is host-driven (see _deploy_node / D-delivery), so NOTHING
+# in-container reads RS_SERVICE_NODE. build_supervisor_docker_args still emits it
+# for free (lockstep with the label); it is a harmless free rider, not a bug —
+# don't hunt for an in-container consumer.
+KNOWN_SERVICES: list[str] = ["supervisor", "code-server", "reader", "node"]
 ALWAYS_ON_SERVICES: set[str] = {"supervisor"}
 # Services whose create-time default is OFF (STAGE_READER). Everything else
 # defaults ON. `reader` (the mobile artifact reader) is opt-in — most projects
@@ -2562,7 +2645,7 @@ ALWAYS_ON_SERVICES: set[str] = {"supervisor"}
 # is the SINGLE source of the missing-label default, used at every site that
 # resolves a flag from an absent label / setdefault so the "missing = on-create
 # default" invariant stays true for a default-off service too.
-DEFAULT_OFF_SERVICES: set[str] = {"reader"}
+DEFAULT_OFF_SERVICES: set[str] = {"reader", "node"}
 
 
 def _service_default(sid: str) -> bool:
@@ -3280,6 +3363,24 @@ _MARKDOWN_VERSION_KEY = "MARKDOWN_LIB_VERSION"
 # against THIS interpreter, never bare `python3` (which is the system python under
 # a login shell — no pip, different minor). Same literal in reader-deploy.sh.
 _CONDA_PY = "/opt/conda/bin/python"
+
+# ---- node SEED (STAGE_NODE_SEED) -------------------------------------------
+# A version-pinned node runtime `cp`'d into a box once so a node-based workflow
+# works out of the box, then DETACHED: RS neither tracks nor updates it, and a box
+# that upgrades its own node (`npm i -g n`) keeps it (the no-clobber deploy guard).
+# Not a managed dist like the three above — NO refresh lane, NO resolver, NO
+# _set_version_pin writer; hand-bump versions.env + `research node pull` re-seeds.
+# The official nodejs.org linux-x64 tarball is self-contained AND relocatable
+# (bin/node a regular file; bin/npm/npx RELATIVE symlinks), so unlike the agent/
+# editor dists it needs NO _relativize_launcher, and unlike the reader (a pip tree)
+# it has NO CPython-ABI coupling — the FIRST dist with zero home-coupling.
+# _node_build_dist ASSERTS that relocatability at build time (dies if it fails).
+# Tarball is .tar.gz (rs-minimal-base has no xz-utils, so .tar.xz can't extract).
+NODE_DIST_DIR = Path.home() / ".research-sandbox" / "node-dist"
+NODE_DIST_MOUNT = "/opt/node-dist"
+_NODE_BIN = "node"
+_NODE_VERSION_KEY = "NODE_VERSION"
+_NODE_ARCH = "linux-x64"
 
 # Tier-2 extension prune — MUST mirror agent/Dockerfile.minimal-base's strip list
 # until slice 2 deletes the bake (the dist and the bake should ship the same
@@ -4191,6 +4292,172 @@ def _stage_reader_dist(supervisor: str, *, deploy_local: bool = False) -> None:
         _deploy_supervisor_reader(supervisor)
 
 
+# ---- node SEED — the runtime for node-based workflows (STAGE_NODE_SEED) -----
+# A seed, NOT a managed dist: no refresh lane, no resolver, no _set_version_pin.
+# `node_pull` + `node_show` is the WHOLE public surface.
+
+def _node_sidecar() -> Path:
+    return NODE_DIST_DIR.parent / "node-dist.json"
+
+
+def node_dist_present() -> bool:
+    """True iff a usable node seed is cached. lexists (not exists) for symmetry
+    with the other dists; node's bin/node is a regular file so exists would also
+    work, but the shared idiom is lexists."""
+    return os.path.lexists(NODE_DIST_DIR / ".local" / "bin" / _NODE_BIN)
+
+
+def _node_build_dist(node_ver: str) -> None:
+    """Fetch the official nodejs.org linux-x64 tarball IN a throwaway
+    rs-minimal-base container and swap it into the host cache (STAGE_NODE_SEED).
+    Fixed tree: {.local/} only (bin/ + lib/ + include/ + share/), so it cp-deploys
+    like the agent dist.
+
+    Two properties this dist does NOT need, and WHY — asserted, not assumed:
+      * NO _relativize_launcher. The tarball's bin/npm and bin/npx are RELATIVE
+        symlinks (../lib/node_modules/npm/bin/...), and bin/node is a regular file,
+        so the tree is already $HOME-agnostic. The agent/editor dists needed the
+        relink only because their launcher was an ABSOLUTE symlink into
+        /home/research (dangles in a /home/worker box — the cross-user dragon).
+      * NO PYTHON_ABI guard. That is a pip-tree property (the reader); node is a
+        self-contained binary with no interpreter-minor coupling.
+    Because I cannot run node on the host to confirm the above, the build ASSERTS
+    both — bin/node a regular file, bin/npm + bin/npx relative symlinks — and DIES
+    if either fails (a future node layout change must be caught here, not discovered
+    when node dangles in a worker home). Tarball is .tar.gz: rs-minimal-base has no
+    xz-utils, so .tar.xz cannot be extracted in the build container."""
+    if not _AGENT_VERSION_RE.match(node_ver):
+        die(f"refusing to build node seed with suspicious version {node_ver!r}")
+    if not run_quiet(["docker", "image", "inspect", MINIMAL_BASE_IMAGE]):
+        die(f"{MINIMAL_BASE_IMAGE} not found — run `research start --rebuild` first")
+    NODE_DIST_DIR.parent.mkdir(parents=True, exist_ok=True)
+    tmp: Path | None = Path(tempfile.mkdtemp(dir=str(NODE_DIST_DIR.parent)))
+    node_ver_full = node_ver if node_ver.startswith("v") else f"v{node_ver}"
+    tarname = f"node-{node_ver_full}-{_NODE_ARCH}.tar.gz"
+    url = f"https://nodejs.org/dist/{node_ver_full}/{tarname}"
+    npm_ver = ""
+    try:
+        # Extract the tarball's inner dir (--strip-components=1) straight into
+        # ~/.local, dropping the top-level docs, so the tree is a bare ~/.local like
+        # the agent dist. Then ASSERT relocatability (see docstring) before capture:
+        #   - bin/node regular file (not a symlink)
+        #   - bin/npm, bin/npx symlinks whose readlink target is RELATIVE (no leading /)
+        # set -e + pipefail so a curl/tar failure aborts with a NAMED error rather
+        # than an empty capture that fails opaquely after the retries.
+        inner = (
+            "set -e; set -o pipefail; "
+            "mkdir -p ~/.local; "
+            f"curl -fsSL --max-time 120 {shlex.quote(url)} "
+            "| tar -xz --strip-components=1 -C ~/.local "
+            "--exclude=CHANGELOG.md --exclude=LICENSE --exclude=README.md; "
+            f"test -f ~/.local/bin/{_NODE_BIN}; "
+            f"test ! -L ~/.local/bin/{_NODE_BIN}; "        # node is a REGULAR file
+            'for l in npm npx; do '
+            '  test -L ~/.local/bin/$l || { echo "bin/$l not a symlink" >&2; exit 1; }; '
+            '  case "$(readlink ~/.local/bin/$l)" in '
+            '    /*) echo "bin/$l is an ABSOLUTE symlink — dist not relocatable" >&2; exit 1;; '
+            '  esac; '
+            'done; '
+            "cp -a ~/.local /out/.local; "
+            "~/.local/bin/npm --version > /out/NPM_VERSION")
+        script = (f"set -e; set -o pipefail; su - research -c {shlex.quote(inner)}; "
+                  f"chown -R {os.getuid()}:{os.getgid()} /out")
+        captured_local = tmp / ".local"
+        npm_file = tmp / "NPM_VERSION"
+        built, last_err = False, ""
+        for _ in range(_AGENT_BUILD_ATTEMPTS):
+            r = run(["docker", "run", "--rm", "-v", f"{tmp}:/out",
+                     MINIMAL_BASE_IMAGE, "sh", "-lc", script], capture_output=True)
+            if (r.returncode == 0
+                    and (captured_local / "bin" / _NODE_BIN).is_file()
+                    and npm_file.is_file() and npm_file.read_text().strip()):
+                built = True
+                break
+            last_err = ((r.stderr or "") + (r.stdout or "")).strip()
+            shutil.rmtree(captured_local, ignore_errors=True)
+            if npm_file.exists():
+                npm_file.unlink()
+        if not built:
+            die(f"node seed build failed after {_AGENT_BUILD_ATTEMPTS} attempts:\n"
+                f"{last_err[-_AGENT_ERR_TAIL:] or 'no output'}")
+        npm_ver = npm_file.read_text().strip()
+        npm_file.unlink()
+        if NODE_DIST_DIR.exists():
+            shutil.rmtree(NODE_DIST_DIR)
+        os.replace(tmp, NODE_DIST_DIR)     # same fs (mkdtemp under the parent)
+        tmp = None                         # moved into place; skip the finally rmtree
+    finally:
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
+    _node_sidecar().write_text(json.dumps(
+        {"node_version": node_ver, "npm_version": npm_ver,
+         "pulled_at": datetime.datetime.now(datetime.timezone.utc).isoformat()},
+        indent=2) + "\n")
+
+
+def node_pull(node_ver: str | None = None, progress=None) -> dict:
+    """Pull (seed) the node runtime at (node_ver or the effective pin) into the host
+    cache. `progress` gets a coarse view-log milestone; the raw fetch streams to the
+    host-only full log. This is the ONLY writer of the node seed — there is no
+    refresh lane (node is detached after delivery), so a version bump is a manual
+    versions.env edit followed by this pull."""
+    progress = progress or _NULL_PROGRESS
+    v = load_versions()
+    nv = node_ver or v.get(_NODE_VERSION_KEY)
+    if not nv:
+        die(f"no pinned {_NODE_VERSION_KEY} in versions.env")
+    progress.step("build-dist", f"seeding node {nv}")
+    _node_build_dist(nv)
+    return {"node_version": nv, "path": str(NODE_DIST_DIR)}
+
+
+def node_show() -> dict:
+    """The cached node seed's sidecar, or {} if none pulled yet."""
+    if not node_dist_present():
+        return {}
+    try:
+        return json.loads(_node_sidecar().read_text())
+    except Exception:
+        return {"node_version": "?"}
+
+
+def _deploy_node(container: str) -> None:
+    """Deploy the node seed into a container's OWN ~/.local — the SINGLE deploy,
+    shared by the docker box (D2, host-side before setup) and the dind supervisors
+    (via _stage_node_dist deploy_local). Works identically whether /opt/node-dist is
+    a RO host-cache mount (docker box) or staged real files (dind).
+
+    Copies _deploy_supervisor_editor's shape WHOLE: `docker exec -e
+    HOME=/home/research` (runs as the research user, uid 1000 — NOT -u 0), so no
+    trailing chown is needed (a RO-mount source is world-readable; a staged mount is
+    already 1000:1000). The half-copy footgun is _stage_agent_dist's `-u 0` +
+    chown shape — dropping its chown would leave root-owned files exactly where
+    `npm install -g` writes.
+
+    NO-CLOBBER (`[ -e ~/.local/bin/node ] ||`): this is the DETACH CONTRACT, not a
+    nicety — a box that ran `npm i -g n` to upgrade its own node must keep it. A
+    ~/.local that is empty on this code path (a fresh create / a docker recreate's
+    new fs) has no node yet, so the guard deploys; a restart never reaches this
+    code (host-driven delivery only), so a self-upgraded node survives."""
+    run_check(["docker", "exec", "-e", "HOME=/home/research", container, "sh", "-c",
+               f"[ -e /home/research/.local/bin/{_NODE_BIN} ] || "
+               f"( mkdir -p /home/research/.local && "
+               f"cp -a {NODE_DIST_MOUNT}/.local/. /home/research/.local/ )"])
+
+
+def _stage_node_dist(supervisor: str, *, deploy_local: bool = False) -> None:
+    """Stage the host node seed into a RUNNING supervisor (STAGE_NODE_SEED). Real
+    files at NODE_DIST_MOUNT via the shared uid-0 tar stream (never docker cp — the
+    sysbox foreign-uid dragon). `deploy_local` ALSO deploys node into the
+    supervisor's OWN ~/.local (the dind flavors: sandbox-dind + research). Unlike the
+    editor/reader there is no server to launch and no deploy script — just the cp."""
+    if not node_dist_present():
+        die("no cached node seed to stage — run `research node pull` first")
+    _stage_dist_tree(supervisor, NODE_DIST_DIR, NODE_DIST_MOUNT, "node")
+    if deploy_local:
+        _deploy_node(supervisor)
+
+
 def _image_build_specs() -> list:
     """The (image_tag, Dockerfile) build set, bottom-up so each FROM resolves to
     the just-built layer rather than a stale cached copy. Static leaves + the
@@ -4363,6 +4630,21 @@ def software_status() -> dict:
                         and rd_ver == rd_pin),
     }
 
+    # Node seed (STAGE_NODE_SEED). `matches_pin` is a READ only — node has no
+    # refresh lane, so the panel offers Pull (hand-bump + re-seed), never Refresh.
+    nd = node_show() or {}
+    nd_ver = nd.get("node_version")
+    nd_pin = effective.get(_NODE_VERSION_KEY)
+    node = {
+        "present": node_dist_present(),
+        "cached_version": nd_ver,
+        "npm_version": nd.get("npm_version"),
+        "pulled_at": nd.get("pulled_at"),
+        "effective_pin": nd_pin,
+        "matches_pin": (nd_ver is not None and nd_pin is not None
+                        and nd_ver == nd_pin),
+    }
+
     # One `docker info` probe distinguishes "docker unreachable" (whole fleet
     # renders as one honest banner) from "image genuinely absent" (per-row). Guard
     # it: a missing docker binary raises FileNotFoundError from run_quiet, which
@@ -4385,6 +4667,7 @@ def software_status() -> dict:
         "agents": agents,
         "editor": editor,
         "reader": reader,
+        "node": node,
         "images": images,
         "pins": pins,
     }
@@ -4782,6 +5065,10 @@ def _recreate_supervisor(
         # reader-enabled project's tab comes back; deploy_local on the resolved flag.
         if reader_dist_present():
             _stage_reader_dist(container, deploy_local=flags.get("reader", False))
+        # Node seed re-staged (STAGE_NODE_SEED): survives the recreate so a
+        # node-enabled project keeps node; deploy_local on the resolved flag.
+        if node_dist_present():
+            _stage_node_dist(container, deploy_local=flags.get("node", False))
         # Box harness is a standing dind utility (STAGE_DIND_UNIFY — no --with-boxes
         # gate): re-stage rs-sandbox (no bake) + re-deliver the box images for every
         # sandbox-dind recreate.
@@ -4818,6 +5105,9 @@ def _recreate_supervisor(
         # reader-enabled research project's tab comes back; deploy on resolved flag.
         if reader_dist_present():
             _stage_reader_dist(container, deploy_local=flags.get("reader", False))
+        # Node seed re-staged (STAGE_NODE_SEED): survives the recreate; deploy on flag.
+        if node_dist_present():
+            _stage_node_dist(container, deploy_local=flags.get("node", False))
     stage_worker_image(container, MCP_PROXY_IMAGE, force=force_restage)
 
     run(["docker", "exec", container, "/usr/local/bin/mcp-reload"],
@@ -5034,6 +5324,14 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
     print(f"creating new container from {MINIMAL_IMAGE}...")
     run_check(["docker", *docker_args])
     inject_route(container, get_router_ip(network))
+    # Node seed (STAGE_NODE_SEED, D3): the rm + run wiped ~/.local, so re-deploy node
+    # into the fresh container fs. The node bind survived (recovered above; only the
+    # EDITOR mount is stripped), so _deploy_node has a live copy-source. WITHOUT this,
+    # `update --enable code-server` on a node box silently drops node — the mount
+    # would be present but nothing copies it in. Gated on the flag the recreate is
+    # applying (node is create-time only, so it is unchanged on this path).
+    if service_flags.get("node") and node_dist_present():
+        _deploy_node(container)
     # Universal fetch surface (STAGE_DEV_GITEA S3): the rm + run above wiped the
     # container fs — re-stage rs-fetch + the operator token (self-gating no-op
     # when the dev lane doesn't exist).

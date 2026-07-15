@@ -218,6 +218,21 @@ def _origin_ports_free(project: str) -> None:
         _origin_table_save()
 
 
+def _origin_port_free_one(project: str, service_id: str) -> None:
+    """Release the SINGLE origin slot for (project, service_id), if one is
+    allocated — the per-service sibling of `_origin_ports_free`. Called when an
+    exported port is unregistered (`port_remove`): the broker verb only edits the
+    on-disk `exported-ports.json`, so the in-webui ORIGIN_PORTS table is ours to
+    maintain. Without this, a registered exported port that ever allocated a slot
+    (which is now EVERY registered port, since the tab is no longer probe-gated)
+    leaks that slot until the project is destroyed."""
+    for p, e in list(ORIGIN_PORTS.items()):
+        if e["project"] == project and e["service"] == service_id:
+            del ORIGIN_PORTS[p]
+            _origin_table_save()
+            return
+
+
 def _origin_table_sweep() -> None:
     """Startup GC: drop entries whose project no longer exists on disk
     (covers CLI-side destroys while the webui was down). Skipped entirely
@@ -598,7 +613,7 @@ async def broker_software_handler(request: web.Request) -> web.Response:
 # agent_pull/agent_refresh carry the agent enum. agent_refresh/editor_refresh
 # bump the untracked override pin + rebuild (they re-resolve the upstream version
 # child-side — no client-supplied version crosses).
-_BUILD_VERBS = frozenset({"agent_pull", "editor_pull", "reader_pull",
+_BUILD_VERBS = frozenset({"agent_pull", "editor_pull", "reader_pull", "node_pull",
                           "agent_refresh", "editor_refresh", "reader_refresh",
                           "rebuild"})
 
@@ -956,6 +971,20 @@ async def broker_port_remove_handler(request: web.Request) -> web.Response:
         body = {}
     args = {"project": project, "port": body.get("port")}
     status, reply = await _relay(request, "port_remove", args)
+    # Free the origin slot for this port on a SUCCESSFUL removal (_relay returns
+    # 200 + {ok:true} for a verb success; 401/403/503 + verb-errors are peeled off
+    # to non-200 / {ok:false}). The broker verb only edits the on-disk registry, so
+    # without this the slot leaks until destroy (DEFECT: pre-existing, but the
+    # unconditional-tab change makes it a routine leak — every registered port now
+    # holds a slot). A non-int port just means there's nothing to free.
+    if status == 200 and isinstance(reply, dict) and reply.get("ok"):
+        try:
+            port_n = int(body.get("port"))
+        except (TypeError, ValueError):
+            port_n = None
+        if port_n is not None:
+            _origin_port_free_one(
+                project, f"{services.EXPORTED_PORT_ID_PREFIX}{port_n}")
     return web.json_response(reply, status=status)
 
 
@@ -1572,12 +1601,19 @@ def _origin_url(request: web.Request, project: str, service_id: str) -> str | No
 
 async def project_services_handler(request: web.Request) -> web.Response:
     """Per-project enabled-set. always_on services are always included;
-    kind=http services are included iff their default port is currently
-    listening on `rs-project-<proj>`. Probe-driven rather than label-
-    driven: this avoids granting the webui a docker socket while
-    preserving the property that disabled services don't surface a tab.
-    A crashed (enabled-but-not-listening) service also drops off, which
-    is the correct UX — a tab that 502s on click is worse than no tab.
+    INFERRED kind=http services (editors, boxes) are included iff their default
+    port is currently listening on `rs-project-<proj>`. Probe-driven rather than
+    label-driven: this avoids granting the webui a docker socket while preserving
+    the property that disabled services don't surface a tab. A crashed
+    (enabled-but-not-listening) inferred service also drops off, which is the
+    correct UX for a surface the operator never asked for by port — a tab that
+    502s on click is worse than no tab.
+
+    EXCEPTION — operator-registered exported ports are NOT probe-gated: a
+    registered port is an explicit "wire this port" instruction, so it is shown
+    unconditionally (a not-yet-serving port renders a tab whose iframe surfaces the
+    connection error on click). That is the deliberate opposite of the inferred-
+    service rule above, because the operator asked for it by hand.
 
     One tab is synthesized per box (kind="sandbox" in the project's
     per-supervisor extensions.json), read directly off the existing
@@ -1714,21 +1750,20 @@ async def project_services_handler(request: web.Request) -> web.Response:
                 out[f"{services.DEV_FORK_ID_PREFIX}{consumer}:{repo}"] = spec
 
     # Operator-registered exported ports (STAGE_EXPORTED_PORTS): one http tab per
-    # port that is currently LISTENING on the supervisor netns — same probe-gated
-    # discipline as the editor (a port the PI hasn't started serving yet shows no
-    # dead-iframe tab). origin_proxy_handler re-checks membership per request.
-    exported = _read_exported_ports(project)
-    if exported:
-        port_up = await asyncio.gather(*[
-            tcp_probe(upstream, int(e["port"])) for e in exported])
-        for e, up in zip(exported, port_up):
-            if not up:
-                continue
-            spec = services.exported_port_service(int(e["port"]), e["label"])
-            if spec is not None:
-                psid = f"{services.EXPORTED_PORT_ID_PREFIX}{int(e['port'])}"
-                url = _origin_url(request, project, psid)
-                out[psid] = {**spec, **({"origin_url": url} if url else {})}
+    # registered port, NOT probe-gated (PI directive). Registering a port is an
+    # explicit "wire this port to the webui" instruction — so honor it and show the
+    # tab unconditionally; if nothing is listening yet, the iframe surfaces that on
+    # click, which the operator can act on. (The editor/box surfaces stay probe-gated
+    # because the OPERATOR never asked for them by port — they're inferred; an
+    # exported port is asked for by hand.) The SSRF posture is unchanged: the origin
+    # proxy still re-derives + membership-checks the upstream per request in
+    # _resolve_origin_upstream_port, so a port that isn't registered never proxies.
+    for e in _read_exported_ports(project):
+        spec = services.exported_port_service(int(e["port"]), e["label"])
+        if spec is not None:
+            psid = f"{services.EXPORTED_PORT_ID_PREFIX}{int(e['port'])}"
+            url = _origin_url(request, project, psid)
+            out[psid] = {**spec, **({"origin_url": url} if url else {})}
     return web.json_response(out)
 
 

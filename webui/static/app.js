@@ -1301,6 +1301,7 @@ function renderSoftwareScreen(view, result) {
     const agents = Array.isArray(result.agents) ? result.agents : [];
     const editor = result.editor || {};
     const reader = result.reader || {};
+    const node = result.node || {};
     const images = Array.isArray(result.images) ? result.images : [];
     const pins = Array.isArray(result.pins) ? result.pins : [];
     const dockerOk = !!result.docker_ok;
@@ -1406,6 +1407,22 @@ function renderSoftwareScreen(view, result) {
                 "reader: nbconvert",
                 { verb: "reader_refresh_check" },
                 { verb: "reader_refresh" }),
+        ]),
+    ]));
+    // Node seed (STAGE_NODE_SEED): Pull ONLY — node is a seed, not a managed dist,
+    // so there is no Refresh (bump NODE_VERSION in versions.env by hand, then Pull).
+    // The npm version rides in the name for parity with the reader's markdown note.
+    distRows.push(el("div", { class: "sw-row" }, [
+        el("span", { class: "sw-name" }, ["node"
+            + (node.npm_version ? ` (npm ${node.npm_version})` : "")]),
+        cell(node.present ? "yes" : "no"),
+        cell(node.cached_version, "sw-mono"),
+        cell(node.effective_pin, "sw-mono"),
+        distStatus(node),
+        el("span", { class: "sw-act" }, [
+            pullBtn(
+                { verb: "node_pull" },
+                "Fetch the node runtime seed at the effective pin, in a throwaway build container (under a minute). Node is a seed: it is copied into a box once and then detached — RS does not track or update it after."),
         ]),
     ]));
     view.appendChild(el("div", { class: "sw-section" }, [
@@ -2878,7 +2895,7 @@ const MODEL_PICKER_SPECS = [
     ["role", "Role-MCPs", "Tool services workers call — one session per tool-call."],
 ];
 
-function mgmtCreateDialog(view, manifest, agents) {
+function mgmtCreateDialog(view, manifest, agents, nodePresent) {
     manifest = manifest || {};
     agents = Array.isArray(agents) ? agents : [];
     const workflow = manifest.name || "research";
@@ -2954,6 +2971,36 @@ function mgmtCreateDialog(view, manifest, agents) {
         readerCb.checked = !readerCb.checked;
         readerCard.classList.toggle("selected", readerCb.checked);
     };
+    // Node (runtime SEED for node-based workflows, STAGE_NODE_SEED) — ALL flavors,
+    // default OFF. Checked → enable:["node"] (merged in the payload). Node has no
+    // webui tab (it is a container capability, not a service surface); this card is
+    // the only place it's toggled at create. Disabled + hinted when no node seed is
+    // cached — an AFFORDANCE only; from_kwargs is the real gate.
+    //
+    // A workflow can MANDATE node by declaring `services: {node: true}` (e.g.
+    // open-knowledge): the manifest forces node on server-side regardless of this
+    // card, so reflect that honestly — pre-check AND lock the card so the UI can't
+    // imply node is off on a workflow that cannot run without it. (Mirrors how the
+    // manifest already forces the flag in from_kwargs' service_defaults; the card is
+    // display-only either way.)
+    const nodeSeedPresent = !!nodePresent;
+    const nodeMandatory = !!(manifest.services && manifest.services.node === true);
+    const nodeCb = el("input", { type: "checkbox" });
+    nodeCb.checked = nodeMandatory;
+    let nodeName;
+    if (nodeMandatory) nodeName = "Node (npm) — required by this workflow";
+    else nodeName = "Node" + (nodeSeedPresent ? " (npm)" : " — pull it under Software");
+    const nodeCard = el("div",
+        { class: "box-opt-card"
+            + (nodeMandatory ? " selected locked"
+               : (nodeSeedPresent ? "" : " disabled")) },
+        [el("span", { class: "box-opt-name" }, [nodeName])]);
+    nodeCard.onclick = () => {
+        if (nodeMandatory) return;      // locked on — the workflow requires node
+        if (!nodeSeedPresent) return;   // affordance; the backend floor is the gate
+        nodeCb.checked = !nodeCb.checked;
+        nodeCard.classList.toggle("selected", nodeCb.checked);
+    };
 
     // Enable presets — only for a workflow that has a worker/sandbox layer
     // (research flavor). A bare box / sandbox host has none, so the backend would
@@ -3019,8 +3066,12 @@ function mgmtCreateDialog(view, manifest, agents) {
         ])] : []),
         el("div", { class: "box-opt-group" }, [
             el("div", { class: "box-opt-caption" }, ["Extensions"]),
+            // Node is substrate-agnostic (all flavors); reader is dind-only. Node
+            // must appear on BOTH branches of the isDocker fork — the docker box is
+            // where node-based store workflows (open-knowledge) run.
             el("div", { class: "box-opt-cards" },
-               isDocker ? [editorCard] : [editorCard, readerCard]),
+               isDocker ? [editorCard, nodeCard]
+                        : [editorCard, readerCard, nodeCard]),
         ]),
     ]);
 
@@ -3148,7 +3199,13 @@ function mgmtCreateDialog(view, manifest, agents) {
                 const pat = devPatI.value.trim();
                 if (pat) payload.pat = pat;
                 if (!editorCb.checked) payload.disable = ["code-server"];
-                if (readerCb.checked) payload.enable = ["reader"];
+                // ONE merged enable array (STAGE_NODE_SEED): reader + node must not
+                // clobber each other — the broker drops a field silently, so a second
+                // bare `payload.enable = [...]` would just lose the other's token.
+                const devEnable = [];
+                if (readerCb.checked) devEnable.push("reader");
+                if (nodeCb.checked) devEnable.push("node");
+                if (devEnable.length) payload.enable = devEnable;
                 return fetch("/broker/dev/project", {
                     method: "POST", headers: { "Content-Type": "application/json" },
                     body: JSON.stringify(payload),
@@ -3180,6 +3237,9 @@ function mgmtCreateDialog(view, manifest, agents) {
                 enableTokens.push(...checks.filter((c) => c.cb.checked).map((c) => c.p));
             }
             if (!isDocker && readerCb.checked) enableTokens.push("reader");
+            // Node is substrate-agnostic (STAGE_NODE_SEED) — no isDocker gate, unlike
+            // reader; the docker box is exactly where node-based workflows run.
+            if (nodeCb.checked) enableTokens.push("node");
             if (enableTokens.length) payload.enable = enableTokens;
             if (showInBox) {
                 const sel = agentChecks.filter((c) => c.cb.checked)
@@ -3264,6 +3324,7 @@ function renderWorkflowsScreen(view, result) {
     view.innerHTML = "";
     const workflows = Array.isArray(result.workflows) ? result.workflows : [];
     const agents = Array.isArray(result.agents) ? result.agents : [];
+    const nodePresent = !!result.node_present;   // STAGE_NODE_SEED: Node tickbox affordance
     const explain = new Set(state.explainIndex || []);
     // A card's section: its declared group, else Store — the catch-all for a
     // group-less manifest (e.g. a future BYO entry).
@@ -3295,7 +3356,7 @@ function renderWorkflowsScreen(view, result) {
             el("div", { class: "workflows-card-desc" }, [m.description || ""]),
             el("div", { class: "workflows-card-actions" }, [tagsEl, action]),
         ]);
-        card.onclick = () => mgmtCreateDialog(view, m, agents);
+        card.onclick = () => mgmtCreateDialog(view, m, agents, nodePresent);
         return card;
     };
     // Partition into the three sections, then render Research → Base → Store —

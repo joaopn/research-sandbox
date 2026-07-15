@@ -499,6 +499,23 @@ def cmd_reader_refresh(args: argparse.Namespace) -> None:
           "(untracked; no commit needed)")
 
 
+def cmd_node_pull(args: argparse.Namespace) -> None:
+    res = rscore.node_pull()
+    print(f"seeded node {res['node_version']} → {res['path']}")
+
+
+def cmd_node_show(args: argparse.Namespace) -> None:
+    # No `node refresh` (STAGE_NODE_SEED): node is a seed, not a managed dist. To
+    # move the version, hand-edit NODE_VERSION in versions.env, then `research node
+    # pull` to re-seed the host cache. Existing boxes keep their node (detach).
+    s = rscore.node_show()
+    if not s:
+        print("no node seed pulled yet — run `research node pull`")
+        return
+    print(f"  node {s.get('node_version', '?')} "
+          f"(npm {s.get('npm_version', '?')}) pulled {s.get('pulled_at', '?')}")
+
+
 def cmd_project_attach(args: argparse.Namespace) -> None:
     container = container_name_for(args.name)
     if not container_running(container):
@@ -2431,6 +2448,16 @@ def build_parser() -> argparse.ArgumentParser:
                             help="check upstream nbconvert; offer to bump the pin + re-pull")
     rdr.add_argument("--yes", action="store_true", help="skip the confirm prompt")
     rdr.set_defaults(func=cmd_reader_refresh)
+
+    nd = sub.add_parser("node",
+                        help="host-cached node runtime SEED for node-based workflows "
+                             "— cp'd into a box once, then detached (no refresh lane)")
+    nd_sub = nd.add_subparsers(dest="subcommand", required=True)
+    ndp = nd_sub.add_parser("pull",
+                            help="fetch + cache the versions.env-pinned node seed")
+    ndp.set_defaults(func=cmd_node_pull)
+    nds = nd_sub.add_parser("show", help="show the cached node seed + version")
+    nds.set_defaults(func=cmd_node_show)
 
     wu = sub.add_parser("webui", help="manage the optional browser UI container")
     wu_sub = wu.add_subparsers(dest="webui_action", required=True)

@@ -1,0 +1,12 @@
+{
+  "name": "open-knowledge",
+  "title": "inkeep/open-knowledge",
+  "group": "store",
+  "tags": ["research"],
+  "substrate": "docker",
+  "agents": ["claude"],
+  "services": { "node": true },
+  "setup": "npm install -g @inkeep/open-knowledge",
+  "description": "A markdown editor and knowledge base for LLM wikis, specs and notes — wired to your agent.",
+  "greeting": "OpenKnowledge — a markdown knowledge base for LLM wikis, specs and notes.\n\nThe `ok` CLI is installed and on your PATH (node is seeded in this box). Store\nworkflows auto-INSTALL but never auto-configure, so scaffold it yourself:\n\n  ok init          scaffold /workspace + wire up your AI editor (one time)\n  ok start --open  serve the web editor\n  claude           the agent (complete /login first — the box boots credential-less)\n"
+}

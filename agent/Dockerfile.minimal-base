@@ -59,6 +59,22 @@ RUN useradd -m -s /bin/bash -G sudo -u 1000 research && \
 # Initialize conda hooks in the research user's shell.
 RUN su - research -c "/opt/conda/bin/conda init bash"
 
+# ~/.local/bin on PATH for LOGIN shells (STAGE_NODE_SEED). A dist-delivered
+# launcher (node/npm, claude, code-server) lands in ~/.local/bin, but the two
+# PATH exports elsewhere in the tree (this base's conda bashrc, entrypoint bashrc
+# lines) all live in ~/.bashrc — which Debian's skel early-`return`s for a
+# NON-interactive shell. The workflow `setup` harness runs `bash -lc` (a login,
+# NON-interactive shell: ~/.profile sources ~/.bashrc, which returns immediately),
+# so ~/.local/bin is otherwise NOT on PATH there — and `npm install -g` can't run
+# (npm's launcher shebangs `#!/usr/bin/env node`, so npm itself needs node on
+# PATH even when invoked by absolute path). /etc/profile.d/*.sh is sourced by
+# /etc/profile for ALL login shells regardless of interactivity, so this covers
+# `bash -lc`. Generic on purpose (not node-specific): it fixes PATH for every
+# dist-delivered launcher. Additive + idempotent — a no-op if PATH already
+# resolved. The interactive ~/.bashrc exports stay (they serve byobu shells).
+RUN printf '%s\n' 'export PATH="$HOME/.local/bin:$PATH"' \
+    > /etc/profile.d/rs-local-bin.sh && chmod 0644 /etc/profile.d/rs-local-bin.sh
+
 # code-server (the Editor tab) is NO LONGER baked here (STAGE_EDITOR_DIST slice
 # 2). It is a host-cached, version-pinned dist (built by `research editor pull`)
 # cp'd into each interactive container's own ~/.local at boot by the editor dist
