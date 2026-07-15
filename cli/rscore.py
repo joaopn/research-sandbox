@@ -2075,6 +2075,9 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     # Self-gating (silent no-op until the dev lane's operator token exists), so
     # this covers the dev workflow, the universal path, and both substrates.
     _stage_dev_fetch(container_name)
+    # F3 Slice 1: bring up loopback forwarders for any already-registered exported
+    # ports (inert on a fresh project's empty registry; self-gates on docker).
+    _reconcile_loopback_bridges(project, cfg)
 
     # 6e. Http-service readiness gates: create reports "ready" only when each
     #     enabled http service is actually listening, so there's no post-create race
@@ -5220,6 +5223,9 @@ def _start_docker_substrate(project: str, cfg: "Config") -> None:  # type: ignor
         print("warning: rs-gitea unavailable; dev wiring not refreshed",
               file=sys.stderr)
     _stage_dev_fetch(container)
+    # F3 Slice 1: re-establish loopback forwarders for the project's registered
+    # exported ports (the container's netns/processes reset on stop/start).
+    _reconcile_loopback_bridges(project, cfg)
 
 
 def _without_mount(mounts: list[str], dst: str) -> list[str]:
@@ -5336,6 +5342,9 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
     # container fs — re-stage rs-fetch + the operator token (self-gating no-op
     # when the dev lane doesn't exist).
     _stage_dev_fetch(container)
+    # F3 Slice 1: the rm + run above wiped the container fs + netns — re-establish
+    # loopback forwarders for the project's registered exported ports.
+    _reconcile_loopback_bridges(project, cfg)
 
 
 def _live_toggle_editor(project: str, cfg: "Config", container: str,  # type: ignore[name-defined]
@@ -5868,6 +5877,9 @@ def wire_gitea_to_projects() -> None:
         # stable path = no-op.
         _stage_dev_gitea(project, cfg, gitea_ip=ip)
         _stage_dev_fetch(container_name_for(project))
+        # F3 Slice 1: heal loopback forwarders on the universal `research start`
+        # wiring pass (self-gates on docker; no-op for non-docker projects).
+        _reconcile_loopback_bridges(project, cfg)
         if gitea.project_entries(project):
             _restart_dev_boxes(project, cfg, ip)
 
@@ -6010,6 +6022,122 @@ def _stage_dev_fetch(container: str) -> None:
     if r.returncode != 0:
         print(f"warning: operator-token staging into {container} failed: "
               f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
+
+
+# --- F3 loopback->bridge forwarder (Slice 1, docker substrate) --------------
+# A 127.0.0.1-bound in-box service is unreachable from outside the container's
+# netns (that invisibility is the boundary). For an operator-registered exported
+# port we stand up a tiny in-box forwarder (cli/rs_loopback_fwd.py) that binds the
+# box's bridge IP at the SAME port and relays to 127.0.0.1:<port>, so the webui
+# reaches it at rs-project-<name>:<port> with no resolver change. Docker substrate
+# only (the box container IS rs-project-<name>); dind inner boxes are Slice 2. The
+# forwarder + its pidfiles live at these fixed in-box paths and the host reconcile
+# is the ONLY thing that launches/reaps them.
+_LOOPBACK_FWD_BIN = "/usr/local/bin/rs-loopback-fwd"
+_LOOPBACK_PIDFILE_DIR = "/tmp/rs-loopback-fwd"
+
+
+def _stage_loopback_fwd(container: str) -> None:
+    """Stage the F3 loopback forwarder into a RUNNING container at
+    /usr/local/bin/rs-loopback-fwd (root-owned 0755 — the _stage_dev_fetch
+    single-file stdin idiom, never docker cp). Idempotent (overwrites);
+    best-effort — a staging failure warns and continues (the box is fine without
+    it). Callers gate on docker substrate + container_running (see
+    _reconcile_loopback_bridges)."""
+    src = Path(__file__).resolve().parent / "rs_loopback_fwd.py"
+    if not src.is_file():
+        print(f"warning: rs_loopback_fwd.py not found at {src}; loopback forwarder "
+              f"not staged into {container}", file=sys.stderr)
+        return
+    install = ("cat > /usr/local/bin/rs-loopback-fwd && "
+               "chmod 755 /usr/local/bin/rs-loopback-fwd")
+    proc = subprocess.Popen(
+        ["docker", "exec", "-i", "-u", "0", container, "sh", "-c", install],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    _, err = proc.communicate(input=src.read_bytes())
+    if proc.returncode != 0:
+        detail = (err.decode(errors="replace") if err else "").strip()
+        print(f"warning: staging rs-loopback-fwd into {container} failed: "
+              f"{detail or 'cat returned non-zero'}", file=sys.stderr)
+
+
+def _reconcile_loopback_bridges(project: str, cfg: "Config") -> None:  # type: ignore[name-defined]
+    """Make the running set of in-box loopback forwarders match a project's
+    exported-port registry (F3 Slice 1). DOCKER substrate only — the self-gate
+    below returns immediately for research/sandbox-dind supervisors, so their
+    `port add` stays registry-only exactly as before (dind inner boxes are
+    Slice 2). Host-orchestrated: the launches are host `docker exec -d` (the box
+    has no docker CLI), only liveness + teardown run as in-box `sh`. Best-effort
+    throughout — the registry write is the source of truth and the forwarders
+    reconcile toward it; a hiccup warns and continues. Called live from
+    port_add/port_remove and after each docker container-swap re-stage site."""
+    container = container_name_for(project)
+    if _container_substrate(container) != Substrate.DOCKER.value:
+        return
+    if not container_running(container):
+        return
+    desired = sorted({int(e["port"]) for e in read_exported_ports(
+        workspace_path_for(project, cfg))})
+    # Teardown ALWAYS runs first (even when desired is empty) so a removed port's
+    # forwarder is reaped. The kill is GUARDED by a /proc/<pid>/cmdline content
+    # check — identical to the liveness probe (F1): a bare `kill $(cat pidfile)`
+    # would SIGTERM a recycled PID after a restart (/tmp is not tmpfs, so pidfiles
+    # persist). The pidfile is removed unconditionally (a stale file must always
+    # clear; only the kill is guarded). glob-no-match + empty pidfile are guarded
+    # (F2); the bin path + port token are NUL-exact matched via `grep -z` so 80
+    # never matches 808 (F3).
+    keep = (" " + " ".join(str(p) for p in desired) + " ") if desired else "  "
+    teardown = f'''set -u
+DIR={_LOOPBACK_PIDFILE_DIR}
+KEEP="{keep}"
+for f in "$DIR"/*.pid; do
+  [ -e "$f" ] || continue
+  port=$(basename "$f" .pid)
+  case "$KEEP" in *" $port "*) continue ;; esac
+  pid=$(cat "$f" 2>/dev/null)
+  if [ -n "$pid" ] && [ -r "/proc/$pid/cmdline" ] \
+     && grep -zFxq "{_LOOPBACK_FWD_BIN}" "/proc/$pid/cmdline" \
+     && grep -zFxq "$port" "/proc/$pid/cmdline"; then
+    kill "$pid" 2>/dev/null || true
+  fi
+  rm -f "$f"
+done'''
+    r = run(["docker", "exec", "-u", "0", container, "sh", "-c", teardown],
+            capture_output=True)
+    if r.returncode != 0:
+        print(f"warning: loopback-bridge teardown in {container} failed: "
+              f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
+    if not desired:
+        return
+    _stage_loopback_fwd(container)
+    for port in desired:
+        # Liveness: is a genuine rs-loopback-fwd for THIS exact port already
+        # running? Content-check /proc/<pid>/cmdline (NOT kill -0, which mis-reads
+        # a recycled PID after a restart). glob/empty guarded; bin path + port
+        # NUL-exact matched.
+        probe = f'''set -u
+f={_LOOPBACK_PIDFILE_DIR}/{port}.pid
+[ -e "$f" ] || exit 1
+pid=$(cat "$f" 2>/dev/null)
+[ -n "$pid" ] || exit 1
+[ -r "/proc/$pid/cmdline" ] || exit 1
+grep -zFxq "{_LOOPBACK_FWD_BIN}" "/proc/$pid/cmdline" || exit 1
+grep -zFxq "{port}" "/proc/$pid/cmdline" || exit 1
+exit 0'''
+        live = run(["docker", "exec", "-u", "0", container, "sh", "-c", probe],
+                   capture_output=True)
+        if live.returncode == 0:
+            continue
+        # Not live -> launch detached as root (binds any validated port >= 1;
+        # writes its own pidfile after a successful bind, exits clean if the port
+        # is already held by a 0.0.0.0 app).
+        launched = run(["docker", "exec", "-d", "-u", "0", container,
+                        _LOOPBACK_FWD_BIN, str(port)], capture_output=True)
+        if launched.returncode != 0:
+            print(f"warning: launching loopback forwarder for port {port} in "
+                  f"{container} failed: "
+                  f"{(launched.stderr or launched.stdout).strip()}",
+                  file=sys.stderr)
 
 
 def _restart_dev_boxes(project: str, cfg: "Config", gitea_ip: str) -> None:
@@ -7645,8 +7773,10 @@ def _write_exported_ports(workspace_path: "Path", ports: list[dict]) -> None:  #
 
 
 def port_add(req: "PortAddRequest", _progress=None) -> PortAddResult:  # type: ignore[name-defined]
-    """Register an exported port for a project (writes the workspace registry; no
-    container action). Idempotent on the port — a re-add updates the label."""
+    """Register an exported port for a project (writes the workspace registry).
+    Idempotent on the port — a re-add updates the label. On a docker box this also
+    stands up an in-box loopback forwarder for the port (F3 Slice 1); the port is
+    ASSUMED bound on 127.0.0.1, so registering it is the request to bridge it."""
     cfg = load_config()
     ws = workspace_path_for(req.project, cfg)
     if not ws.is_dir():
@@ -7655,6 +7785,7 @@ def port_add(req: "PortAddRequest", _progress=None) -> PortAddResult:  # type: i
     ports.append({"port": req.port, "label": req.label})
     ports.sort(key=lambda e: e["port"])
     _write_exported_ports(ws, ports)
+    _reconcile_loopback_bridges(req.project, cfg)
     return PortAddResult(project=req.project, port=req.port, label=req.label,
                          ports=ports)
 
@@ -7667,6 +7798,8 @@ def port_remove(req: "PortRemoveRequest", _progress=None) -> PortRemoveResult:  
         return PortRemoveResult(project=req.project, port=req.port, ports=[])
     ports = [e for e in read_exported_ports(ws) if e.get("port") != req.port]
     _write_exported_ports(ws, ports)
+    # F3 Slice 1: reap the now-unregistered port's forwarder (docker box only).
+    _reconcile_loopback_bridges(req.project, cfg)
     return PortRemoveResult(project=req.project, port=req.port, ports=ports)
 
 
