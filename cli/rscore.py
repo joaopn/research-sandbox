@@ -5152,6 +5152,9 @@ def _recreate_supervisor(
     # until the dev lane exists; dev-gitea.json itself survives on the
     # workspace volume).
     _stage_dev_fetch(container)
+    # F3 Slice 2a: the sysbox recreate reset the supervisor's netns/processes —
+    # re-establish loopback forwarders for its registered exported ports (Fork-B).
+    _reconcile_loopback_bridges(project, cfg)
 
     # Restart the project's boxes (kind="sandbox", extensions.json). Boxes are
     # owned by the in-supervisor rs-sandbox CLI; the snapshot is the source of
@@ -6063,17 +6066,20 @@ def _stage_loopback_fwd(container: str) -> None:
 
 def _reconcile_loopback_bridges(project: str, cfg: "Config") -> None:  # type: ignore[name-defined]
     """Make the running set of in-box loopback forwarders match a project's
-    exported-port registry (F3 Slice 1). DOCKER substrate only — the self-gate
-    below returns immediately for research/sandbox-dind supervisors, so their
-    `port add` stays registry-only exactly as before (dind inner boxes are
-    Slice 2). Host-orchestrated: the launches are host `docker exec -d` (the box
-    has no docker CLI), only liveness + teardown run as in-box `sh`. Best-effort
-    throughout — the registry write is the source of truth and the forwarders
-    reconcile toward it; a hiccup warns and continues. Called live from
-    port_add/port_remove and after each docker container-swap re-stage site."""
+    exported-port registry, for the TOP-LEVEL `rs-project-<name>` container of
+    ANY substrate — a docker box (F3 Slice 1) OR a research/sandbox-dind
+    supervisor (Slice 2a, Fork-B). The forwarder binds that container's own bridge
+    IP at each registered port and relays to 127.0.0.1, so a loopback app is
+    reachable at rs-project-<name>:<port>. Inner boxes (rs-pi-iso-<name>) are NOT
+    reached here — they live one netns down and are published/forwarded by
+    rs-sandbox (Slice 2b); this only ever exec's the top-level container.
+    Host-orchestrated: the launches are host `docker exec -d` (the container has
+    no docker CLI reachable this way), only liveness + teardown run as in-box
+    `sh`. Best-effort throughout — the registry write is the source of truth and
+    the forwarders reconcile toward it; a hiccup warns and continues. Called live
+    from port_add/port_remove and after each container-swap re-stage site (docker
+    start/recreate + the sysbox supervisor recreate)."""
     container = container_name_for(project)
-    if _container_substrate(container) != Substrate.DOCKER.value:
-        return
     if not container_running(container):
         return
     desired = sorted({int(e["port"]) for e in read_exported_ports(
