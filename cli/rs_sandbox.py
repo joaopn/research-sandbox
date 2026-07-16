@@ -72,6 +72,15 @@ BOX_IP_HI = 25  # inclusive
 # sequentially, the same discipline as the IP pool.
 BOX_EDITOR_PORT_LO = 8500
 BOX_EDITOR_PORT_HI = 8599  # inclusive
+# Per-box loopback publish-port pool (F3 Slice 2b). When a box exposes a
+# 127.0.0.1 service, `docker run -p <pub_super>:<app_port>` publishes it onto the
+# SUPERVISOR's netns (like the editor pool) and an in-box forwarder bridges
+# lo→eth0 so the DNAT reaches it. A DISTINCT band from the editor pool (both live
+# on the supervisor netns; disjoint so they never collide); 100 ports ≫ the 12-IP
+# box ceiling. Lockstep: rscore._EXPORT_BOX_LOOPBACK_PORT_LO/HI reserves this same
+# band from operator-registerable top-level ports.
+BOX_LOOPBACK_PORT_LO = 8600
+BOX_LOOPBACK_PORT_HI = 8699  # inclusive
 KIND = "sandbox"
 
 # --- dev-lane constants (STAGE_DEV_GITEA) ------------------------------------
@@ -225,6 +234,24 @@ def allocate_editor_port(entries: dict[str, dict]) -> int:
             return port
     die(f"box editor-port pool exhausted "
         f"({BOX_EDITOR_PORT_LO}-{BOX_EDITOR_PORT_HI}); discard an unused box first")
+
+
+def allocate_loopback_pub(entries: dict[str, dict]) -> int:
+    """Lowest free supervisor-netns publish port for an exposed box loopback port
+    (F3 Slice 2b). Scans every box's loopback_ports list (a box can expose more
+    than one), the editor-pool sibling for the per-box publish surface."""
+    taken: set[int] = set()
+    for e in entries.values():
+        if not isinstance(e, dict):
+            continue
+        for lp in e.get("loopback_ports") or []:
+            if isinstance(lp, dict) and isinstance(lp.get("pub_super"), int):
+                taken.add(lp["pub_super"])
+    for port in range(BOX_LOOPBACK_PORT_LO, BOX_LOOPBACK_PORT_HI + 1):
+        if port not in taken:
+            return port
+    die(f"box loopback publish-port pool exhausted "
+        f"({BOX_LOOPBACK_PORT_LO}-{BOX_LOOPBACK_PORT_HI}); unexpose a port first")
 
 
 def auto_name(entries: dict[str, dict]) -> str:
@@ -458,6 +485,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
              editor: bool = False, editor_port: int = 0, clone_repo: str = "",
              clone_ref: str = "", clone_setup: str = "",
              dev: dict | None = None, dev_subnet: str = "",
+             loopback_ports: list[dict] | None = None,
              model: str = "", effort: str = "") -> None:
     """docker run a box in the local inner dockerd. ``browser`` selects the
     Chromium-equipped image; ``agent`` (claude|none) → RS_BOX_AGENT (entrypoint
@@ -486,6 +514,12 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     # editor_port so the webui can reach it at rs-project-<proj>:<editor_port>.
     editor_publish = (["-p", f"{editor_port}:8443"]
                       if (editor and editor_port) else [])
+    # F3 Slice 2b: publish each exposed loopback port onto the supervisor netns.
+    # -p <pub_super>:<app_port> DNATs to the box's eth0:<app_port>, where the in-box
+    # forwarder (launched below) listens and relays to 127.0.0.1:<app_port>.
+    lp_list = loopback_ports or []
+    loopback_publish = [x for lp in lp_list
+                        for x in ("-p", f"{lp['pub_super']}:{lp['app_port']}")]
     clone_env: list[str] = []
     if clone_repo:
         clone_env = ["-e", f"RS_BOX_CLONE_REPO={clone_repo}",
@@ -533,6 +567,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         *agent_mount,
         *editor_mount,
         *editor_publish,
+        *loopback_publish,
         "-e", f"RS_SERVICE_CODE_SERVER={'enabled' if editor else 'disabled'}",
         "-e", f"RS_SANDBOX_NAME={name}",
         "-e", f"RS_BOX_AGENT={agent}",
@@ -549,6 +584,24 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     # Universal fetch surface: rs-fetch + the operator token into the fresh box
     # (silent no-op until the dev lane exists; warn-not-die on failure).
     _stage_box_fetch(cname)
+    # F3 Slice 2b: launch the in-box loopback forwarders for the freshly-run box.
+    _launch_box_forwarders(cname, lp_list)
+
+
+def _launch_box_forwarders(cname: str, loopback_ports: list[dict]) -> None:
+    """Launch the baked rs-loopback-fwd (root, so any app_port ≥1 binds) for each
+    exposed loopback port. No liveness guard needed: a double launch self-resolves
+    — the second forwarder's eth0 bind fails and it exits 0 with no pidfile
+    (reuse_address=False). Best-effort; a hiccup warns, the box is otherwise fine."""
+    for lp in loopback_ports:
+        ap = lp.get("app_port")
+        if not isinstance(ap, int):
+            continue
+        r = _docker("exec", "-d", "-u", "0", cname, "rs-loopback-fwd", str(ap))
+        if r.returncode != 0:
+            print(f"warning: launching loopback forwarder for app-port {ap} in "
+                  f"box {cname!r} failed: {(r.stderr or r.stdout).strip()}",
+                  file=sys.stderr)
 
 
 def _rerun_box(name: str, entry: dict) -> None:
@@ -573,6 +626,10 @@ def _rerun_box(name: str, entry: dict) -> None:
              dev=(_dev_run_info(entry["repo"], entry.get("gitea_user") or "")
                   if is_dev else None),
              dev_subnet=entry.get("dev_subnet") or "",
+             # Re-apply the exposed loopback publishes + forwarders from the stored
+             # entry: -p is fixed at docker run, so a restart/recreate must re-run
+             # them (F3 Slice 2b), same reason as editor_port/model above.
+             loopback_ports=entry.get("loopback_ports") or [],
              # From the STORED entry, not re-derived: env is fixed at docker run,
              # so a restart (and the supervisor-recreate relaunch loop, which
              # lands here) must re-apply the box's own pair or it evaporates.
@@ -697,6 +754,50 @@ def cmd_restart(args: argparse.Namespace) -> None:
     print(f"box {args.name!r}: restarted at {entry['ip']}")
 
 
+def cmd_expose(args: argparse.Namespace) -> None:
+    """Expose a box's 127.0.0.1:<app_port> as a webui tab (F3 Slice 2b). Allocate
+    a supervisor-netns publish port, record it on the entry, re-run the box (so the
+    new -p publish + forwarder take effect — -p is fixed at docker run), and print
+    the pub_super for the host to register. Idempotent on app_port."""
+    _require_dind_project()
+    entries = load()
+    entry = _box_entry(entries, args.name)
+    app_port = args.app_port
+    lp_list = entry.get("loopback_ports") or []
+    for lp in lp_list:
+        if isinstance(lp, dict) and lp.get("app_port") == app_port:
+            print(json.dumps({"pub_super": lp["pub_super"], "app_port": app_port}))
+            return
+    pub = allocate_loopback_pub(entries)
+    lp_list.append({"app_port": app_port, "pub_super": pub})
+    entry["loopback_ports"] = lp_list
+    entries[args.name] = entry
+    save(entries)
+    _rerun_box(args.name, entry)
+    print(json.dumps({"pub_super": pub, "app_port": app_port}))
+
+
+def cmd_unexpose(args: argparse.Namespace) -> None:
+    """Drop an exposed loopback port (F3 Slice 2b): remove it from the entry and
+    re-run the box (rm+run without the -p — the removed port's forwarder dies with
+    the old container). A no-op if the app_port wasn't exposed."""
+    _require_dind_project()
+    entries = load()
+    entry = _box_entry(entries, args.name)
+    old = entry.get("loopback_ports") or []
+    lp_list = [lp for lp in old
+               if not (isinstance(lp, dict) and lp.get("app_port") == args.app_port)]
+    if len(lp_list) == len(old):
+        # Nothing was exposed on this app_port — a true no-op, don't restart the box.
+        print(json.dumps({"ok": True, "app_port": args.app_port, "changed": False}))
+        return
+    entry["loopback_ports"] = lp_list
+    entries[args.name] = entry
+    save(entries)
+    _rerun_box(args.name, entry)
+    print(json.dumps({"ok": True, "app_port": args.app_port, "changed": True}))
+
+
 def cmd_stop(args: argparse.Namespace) -> None:
     _require_dind_project()
     _box_entry(load(), args.name)  # validate it's our box
@@ -731,6 +832,10 @@ def cmd_start(args: argparse.Namespace) -> None:
         if r.returncode != 0:
             die(f"failed to start box {args.name!r}: "
                 f"{(r.stderr or r.stdout).strip()}")
+        # A plain `docker start` keeps the -p publishes but the exec'd forwarder
+        # processes died with the stop — relaunch them (F3 Slice 2b). The
+        # _rerun_box branches above/below relaunch via _run_box.
+        _launch_box_forwarders(cname, entry.get("loopback_ports") or [])
     else:
         _rerun_box(args.name, entry)
     print(f"box {args.name!r}: started at {entry['ip']}")
@@ -850,6 +955,17 @@ def build_parser() -> argparse.ArgumentParser:
     rt = sub.add_parser("restart", help="re-run a box from its saved entry")
     rt.add_argument("name")
     rt.set_defaults(func=cmd_restart)
+
+    ex = sub.add_parser("expose",
+                        help="publish a box's 127.0.0.1:<app_port> as a webui tab")
+    ex.add_argument("name")
+    ex.add_argument("app_port", type=int)
+    ex.set_defaults(func=cmd_expose)
+
+    ux = sub.add_parser("unexpose", help="drop an exposed loopback port")
+    ux.add_argument("name")
+    ux.add_argument("app_port", type=int)
+    ux.set_defaults(func=cmd_unexpose)
     return p
 
 

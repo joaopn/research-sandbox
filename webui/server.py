@@ -939,10 +939,12 @@ async def broker_box_presets_handler(request: web.Request) -> web.Response:
 
 
 async def broker_port_add_handler(request: web.Request) -> web.Response:
-    """POST /broker/project/{name}/port {port,label} — register an exported port
-    (gated, origin-checked). Synchronous relay (an instant file write, not a
+    """POST /broker/project/{name}/port {port,label,box?} — register an exported
+    port (gated, origin-checked). Synchronous relay (an instant file write, not a
     background op). The broker's PORT_ADD_WEBUI_FIELDS allow-list is the input
-    boundary; port/label come from the body, project from the URL."""
+    boundary; port/label/box come from the body, project from the URL. `box` (F3
+    Slice 2b) names an inner box whose 127.0.0.1:<port> is exposed; "" / absent =
+    the top-level supervisor/docker container."""
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")
     project = request.match_info.get("name", "")
@@ -952,7 +954,8 @@ async def broker_port_add_handler(request: web.Request) -> web.Response:
         body = {}
     if not isinstance(body, dict):
         body = {}
-    args = {"project": project, "port": body.get("port"), "label": body.get("label")}
+    args = {"project": project, "port": body.get("port"),
+            "label": body.get("label"), "box": body.get("box", "")}
     status, reply = await _relay(request, "port_add", args)
     return web.json_response(reply, status=status)
 
@@ -1848,7 +1851,15 @@ def _read_exported_ports(project: str) -> list[dict]:
             continue
         port, label = e.get("port"), e.get("label")
         if isinstance(port, int) and not isinstance(port, bool) and isinstance(label, str):
-            out.append({"port": port, "label": label})
+            entry = {"port": port, "label": label}
+            # F3 Slice 2b: surface the inner-box coupling for display. NOT gating —
+            # a box entry already tabs + proxies via port(=pub_super)/label alone,
+            # the resolver dials `port` unchanged.
+            box, app_port = e.get("box"), e.get("app_port")
+            if isinstance(box, str) and box and isinstance(app_port, int) \
+                    and not isinstance(app_port, bool):
+                entry["box"], entry["app_port"] = box, app_port
+            out.append(entry)
     return out
 
 

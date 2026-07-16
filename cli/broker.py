@@ -572,7 +572,7 @@ def _verb_box_presets(args: dict, _progress=None) -> dict:
 # is host-shaped (cf. the host-root boundary). Deny-by-default field allowlist,
 # mirroring BOX_ADD_WEBUI_FIELDS. Token-gated (not in OPEN_VERBS), no step-up (a
 # tab carries no data), no progress (instant file write — synchronous relay).
-PORT_ADD_WEBUI_FIELDS = frozenset({"project", "port", "label"})
+PORT_ADD_WEBUI_FIELDS = frozenset({"project", "port", "label", "box"})
 PORT_TARGET_WEBUI_FIELDS = frozenset({"project", "port"})
 
 

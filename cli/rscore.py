@@ -1059,17 +1059,20 @@ class BoxPresetsRequest:
 # host-shaped, so both are broker-relayable. The TCP port space is the OS/protocol
 # bound (1-65535), not an invented cap. Reserved: the supervisor's own ssh (22) +
 # editor-stub (8443) + reader (8445) ports and the per-box editor publish range
-# (8500-8599) — registering one would synthesize a confusing duplicate tab onto a
-# netns port the webui already serves. Lockstep: 22 ==
+# (8500-8599) + the per-box loopback publish range (8600-8699) — registering one
+# would synthesize a confusing duplicate tab onto a netns port the webui already
+# serves (or collide with an allocated box publish). Lockstep: 22 ==
 # services.SERVICES["supervisor"].default_port; 8443 ==
 # services.SERVICES["code-server"].default_port; 8445 ==
 # services.SERVICES["reader"].default_port == READER_PORT; 8500-8599 ==
-# rs_sandbox.BOX_EDITOR_PORT_LO/HI.
+# rs_sandbox.BOX_EDITOR_PORT_LO/HI; 8600-8699 == rs_sandbox.BOX_LOOPBACK_PORT_LO/HI.
 _PORT_MIN = 1
 _PORT_MAX = 65535
 _EXPORT_RESERVED_PORTS = frozenset({22, 8443, 8445})
 _EXPORT_BOX_EDITOR_PORT_LO = 8500
 _EXPORT_BOX_EDITOR_PORT_HI = 8599  # inclusive
+_EXPORT_BOX_LOOPBACK_PORT_LO = 8600
+_EXPORT_BOX_LOOPBACK_PORT_HI = 8699  # inclusive
 
 
 def _coerce_export_port(value: Any) -> int:
@@ -1091,6 +1094,28 @@ def _coerce_export_port(value: Any) -> int:
         raise ValidationError(
             f"port {port} is reserved for box editors "
             f"({_EXPORT_BOX_EDITOR_PORT_LO}-{_EXPORT_BOX_EDITOR_PORT_HI})")
+    if _EXPORT_BOX_LOOPBACK_PORT_LO <= port <= _EXPORT_BOX_LOOPBACK_PORT_HI:
+        raise ValidationError(
+            f"port {port} is reserved for box loopback publishes "
+            f"({_EXPORT_BOX_LOOPBACK_PORT_LO}-{_EXPORT_BOX_LOOPBACK_PORT_HI})")
+    return port
+
+
+def _coerce_app_port(value: Any) -> int:
+    """Validate an IN-BOX app port (F3 Slice 2b): a plain 1-65535 — no
+    supervisor-netns reserved bands, since it lives in the box's own netns. A
+    collision with the box's own baked service (e.g. code-server) surfaces as the
+    app/forwarder failing to bind, which is the operator's mistake, not ours."""
+    if isinstance(value, bool):
+        raise ValidationError("port must be an integer")
+    if isinstance(value, int):
+        port = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        port = int(value.strip())
+    else:
+        raise ValidationError("port must be an integer")
+    if not (_PORT_MIN <= port <= _PORT_MAX):
+        raise ValidationError(f"port must be between {_PORT_MIN} and {_PORT_MAX}")
     return port
 
 
@@ -1099,15 +1124,26 @@ class PortAddRequest:
     project: str
     port: int
     label: str
+    box: str = ""   # "" => the top-level supervisor/docker container; else an
+                    # inner box name, whose 127.0.0.1:<port> is exposed (Slice 2b).
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "PortAddRequest":
-        port = _coerce_export_port(kw.get("port"))
         label = kw.get("label")
         if not (isinstance(label, str) and label.strip()):
             raise ValidationError("label must be a non-empty string")
+        box = kw.get("box") or ""
+        if box:
+            # Inner-box expose: `port` is the app's IN-BOX loopback port (validated
+            # without the supervisor-netns reserved bands); the tab lands on an
+            # allocated pub_super. Box name must match the shared box grammar.
+            if not (isinstance(box, str) and _BOX_NAME_RE.match(box)):
+                raise ValidationError(f"invalid box name {box!r}")
+            port = _coerce_app_port(kw.get("port"))
+        else:
+            port = _coerce_export_port(kw.get("port"))
         return cls(project=_require_name(kw.get("project")), port=port,
-                   label=label.strip())
+                   label=label.strip(), box=box)
 
 
 @dataclass(frozen=True)
@@ -1117,10 +1153,12 @@ class PortRemoveRequest:
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "PortRemoveRequest":
-        # Reuse the same coercion (a reserved port can never be in the list, so
-        # rejecting it on remove is harmless — keeps one validation path).
+        # Validate as a plain 1-65535 WITHOUT the reserved bands: a remove targets
+        # an existing entry's tab port, which for an inner-box entry (F3 Slice 2b)
+        # IS a pub_super in the 8600-8699 reserved band — rejecting it here would
+        # make box tabs unremovable. An unknown port simply matches nothing.
         return cls(project=_require_name(kw.get("project")),
-                   port=_coerce_export_port(kw.get("port")))
+                   port=_coerce_app_port(kw.get("port")))
 
 
 @dataclass(frozen=True)
@@ -6082,8 +6120,12 @@ def _reconcile_loopback_bridges(project: str, cfg: "Config") -> None:  # type: i
     container = container_name_for(project)
     if not container_running(container):
         return
+    # Only the TOP-LEVEL entries (no `box` field) are ours — an inner-box entry
+    # (F3 Slice 2b) is published + forwarded by rs-sandbox inside the box; binding
+    # its pub_super on the supervisor's eth0 here would double-bind against the -p
+    # publish (N2).
     desired = sorted({int(e["port"]) for e in read_exported_ports(
-        workspace_path_for(project, cfg))})
+        workspace_path_for(project, cfg)) if not e.get("box")})
     # Teardown ALWAYS runs first (even when desired is empty) so a removed port's
     # forwarder is reaped. The kill is GUARDED by a /proc/<pid>/cmdline content
     # check — identical to the liveness probe (F1): a bare `kill $(cat pidfile)`
@@ -7657,6 +7699,17 @@ def box_remove(req: "BoxRemoveRequest", progress=None) -> BoxRemoveResult:  # ty
     r = run(cmd, capture_output=True)
     if r.returncode != 0:
         die(f"failed to remove box {req.name!r}: {(r.stderr or r.stdout).strip()}")
+    # F3 Slice 2b: sweep the discarded box's exported-port entries — its pub_super
+    # publishes went with the box, so a lingering registry entry would be a dead
+    # tab. (The box's forwarders died with its container; nothing to reap here.)
+    # ONLY write when something actually changes — a normal box discard on a
+    # project with no exported ports must not create a spurious registry file.
+    ws = workspace_path_for(req.project, load_config())
+    if ws.is_dir():
+        existing = read_exported_ports(ws)
+        remaining = [e for e in existing if e.get("box") != req.name]
+        if len(remaining) != len(existing):
+            _write_exported_ports(ws, remaining)
     # Retire the box's dev consumer, if it had one: ARCHIVE its fork (history
     # kept, user stays inert), delete its token (host + staged), drop its
     # ledger entry, restage the wiring. Best-effort — the discard already
@@ -7747,9 +7800,12 @@ def exported_ports_path(workspace_path: "Path") -> "Path":  # type: ignore[name-
 
 
 def read_exported_ports(workspace_path: "Path") -> list[dict]:  # type: ignore[name-defined]
-    """Tolerant read of the exported-port registry → [{port:int, label:str}].
-    Missing/malformed → []. Host-written but webui-read, so never trust the shape
-    (mirrors _read_box_pins's defensive posture)."""
+    """Tolerant read of the exported-port registry → [{port:int, label:str}], plus
+    optional {box:str, app_port:int} on an inner-box entry (F3 Slice 2b): `port` is
+    the supervisor-netns publish port (pub_super) the resolver dials, `app_port` the
+    box's own 127.0.0.1 port, `box` the box name — the pair the unexpose/sweep paths
+    need. Missing/malformed → []; a plain {port,label} stays a top-level entry.
+    Host-written but webui-read, so never trust the shape."""
     f = exported_ports_path(workspace_path)
     if not f.is_file():
         return []
@@ -7766,7 +7822,12 @@ def read_exported_ports(workspace_path: "Path") -> list[dict]:  # type: ignore[n
         port, label = e.get("port"), e.get("label")
         if isinstance(port, int) and not isinstance(port, bool) \
                 and isinstance(label, str):
-            out.append({"port": port, "label": label})
+            entry = {"port": port, "label": label}
+            box, app_port = e.get("box"), e.get("app_port")
+            if isinstance(box, str) and box and isinstance(app_port, int) \
+                    and not isinstance(app_port, bool):
+                entry["box"], entry["app_port"] = box, app_port
+            out.append(entry)
     return out
 
 
@@ -7780,13 +7841,42 @@ def _write_exported_ports(workspace_path: "Path", ports: list[dict]) -> None:  #
 
 def port_add(req: "PortAddRequest", _progress=None) -> PortAddResult:  # type: ignore[name-defined]
     """Register an exported port for a project (writes the workspace registry).
-    Idempotent on the port — a re-add updates the label. On a docker box this also
-    stands up an in-box loopback forwarder for the port (F3 Slice 1); the port is
-    ASSUMED bound on 127.0.0.1, so registering it is the request to bridge it."""
+    Idempotent — a re-add updates the label. TWO shapes:
+    - req.box == "" (F3 Slice 1/2a): the top-level supervisor/docker container. The
+      port is ASSUMED bound on 127.0.0.1, so registering it stands up an in-box
+      forwarder (via _reconcile_loopback_bridges); the tab is on that same `port`.
+    - req.box set (F3 Slice 2b): `port` is an inner box's own 127.0.0.1 port. Drive
+      `rs-sandbox expose` to allocate a supervisor-netns publish port (pub_super) +
+      run the box's forwarder, then register {port: pub_super, box, app_port} — the
+      tab lands on pub_super, which the resolver already dials."""
     cfg = load_config()
     ws = workspace_path_for(req.project, cfg)
     if not ws.is_dir():
         die(f"project {req.project!r} has no workspace; create it first")
+    if req.box:
+        # A running dind supervisor is required (the box lives in its inner dockerd).
+        container = _running_dind_supervisor(req.project)
+        r = run(["docker", "exec", container, "rs-sandbox", "expose",
+                 req.box, str(req.port)], capture_output=True)
+        if r.returncode != 0:
+            die(f"failed to expose box port: {(r.stderr or r.stdout).strip()}")
+        try:
+            info = json.loads(r.stdout)
+        except (json.JSONDecodeError, TypeError):
+            die(f"could not parse rs-sandbox expose output: {r.stdout.strip()!r}")
+        pub = info.get("pub_super") if isinstance(info, dict) else None
+        if not isinstance(pub, int) or isinstance(pub, bool):
+            die(f"unexpected rs-sandbox expose output shape: {r.stdout.strip()!r}")
+        # Register by pub_super (the tab port); keep the app_port + box for
+        # unexpose/sweep. Idempotent on (box, app_port) — drop a prior entry.
+        ports = [e for e in read_exported_ports(ws)
+                 if not (e.get("box") == req.box and e.get("app_port") == req.port)]
+        ports.append({"port": pub, "label": req.label,
+                      "box": req.box, "app_port": req.port})
+        ports.sort(key=lambda e: e["port"])
+        _write_exported_ports(ws, ports)
+        return PortAddResult(project=req.project, port=pub, label=req.label,
+                             ports=ports)
     ports = [e for e in read_exported_ports(ws) if e.get("port") != req.port]
     ports.append({"port": req.port, "label": req.label})
     ports.sort(key=lambda e: e["port"])
@@ -7802,9 +7892,20 @@ def port_remove(req: "PortRemoveRequest", _progress=None) -> PortRemoveResult:  
     if not ws.is_dir():
         # Nothing to remove and never auto-create a workspace from a remove.
         return PortRemoveResult(project=req.project, port=req.port, ports=[])
-    ports = [e for e in read_exported_ports(ws) if e.get("port") != req.port]
+    existing = read_exported_ports(ws)
+    # A box entry (F3 Slice 2b) is keyed on its tab port (pub_super) — the same
+    # `port` the webui removes by. Unexpose it in the box before dropping the entry.
+    gone = next((e for e in existing if e.get("port") == req.port), None)
+    if gone and gone.get("box"):
+        container = _running_dind_supervisor(req.project)
+        r = run(["docker", "exec", container, "rs-sandbox", "unexpose",
+                 gone["box"], str(gone["app_port"])], capture_output=True)
+        if r.returncode != 0:
+            die(f"failed to unexpose box port: {(r.stderr or r.stdout).strip()}")
+    ports = [e for e in existing if e.get("port") != req.port]
     _write_exported_ports(ws, ports)
-    # F3 Slice 1: reap the now-unregistered port's forwarder (docker box only).
+    # Reap the top-level forwarder for a supervisor/docker entry (a box entry's
+    # forwarder died with the box's rm+run in unexpose — the reconcile skips it).
     _reconcile_loopback_bridges(req.project, cfg)
     return PortRemoveResult(project=req.project, port=req.port, ports=ports)
 

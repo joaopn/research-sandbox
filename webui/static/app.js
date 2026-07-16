@@ -4998,6 +4998,20 @@ function appendExportedPortsSection(box, project) {
     const labelI = el("input", { type: "text", class: "config-port-label",
                                  placeholder: "label" });
     const addBtn = el("button", { class: "btn btn-secondary" }, ["Add"]);
+    // Box selector (F3 Slice 2b): a dind project's boxes each surface a pi-iso-<name>
+    // service; the operator can expose a 127.0.0.1 port on one of them, or on the
+    // supervisor (value ""). Absent when the project has no boxes.
+    const svcs = (state.projectServices && state.projectServices[project.name]) || {};
+    const boxNames = Object.keys(svcs)
+        .filter((id) => id.startsWith("pi-iso-"))
+        .map((id) => id.slice("pi-iso-".length))
+        .sort();
+    let boxSel = null;
+    if (boxNames.length) {
+        boxSel = el("select", { class: "config-port-box" });
+        boxSel.appendChild(el("option", { value: "" }, ["supervisor"]));
+        for (const b of boxNames) boxSel.appendChild(el("option", { value: b }, [b]));
+    }
 
     async function loadPorts() {
         listWrap.innerHTML = "";
@@ -5026,8 +5040,13 @@ function appendExportedPortsSection(box, project) {
             const rm = el("button", { class: "close-tab-btn",
                                       title: `Remove port ${e.port}` }, ["✕"]);
             rm.onclick = () => removePort(e.port);
+            // A box entry (F3 Slice 2b) shows its box + in-box app port; a
+            // supervisor/docker entry shows the plain port.
+            const text = e.box
+                ? `${e.label} — box ${e.box}:${e.app_port}`
+                : `${e.port} — ${e.label}`;
             listWrap.appendChild(el("div", { class: "config-box-row" }, [
-                el("span", { class: "config-box-name" }, [`${e.port} — ${e.label}`]),
+                el("span", { class: "config-box-name" }, [text]),
                 rm,
             ]));
         }
@@ -5040,13 +5059,14 @@ function appendExportedPortsSection(box, project) {
             alert("Enter a port between 1 and 65535."); return;
         }
         if (!label) { alert("Enter a label for the tab."); return; }
+        const box = boxSel ? boxSel.value : "";
         addBtn.disabled = true;
         try {
             const res = await fetch(
                 `/broker/project/${encodeURIComponent(project.name)}/port`, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ port, label }),
+                    body: JSON.stringify({ port, label, box }),
                 });
             let body; try { body = await res.json(); } catch (e) { body = {}; }
             if (!res.ok || !body.ok) {
@@ -5081,9 +5101,11 @@ function appendExportedPortsSection(box, project) {
 
     addBtn.onclick = addPort;
     section.appendChild(el("div", { class: "config-box-row config-port-add" },
-                           [portI, labelI, addBtn]));
+                           [boxSel, portI, labelI, addBtn].filter(Boolean)));
     section.appendChild(el("div", { class: "config-hint" }, [
-        "The tab appears once something is listening on that port inside the supervisor.",
+        boxSel
+            ? "The tab appears once something is listening on that 127.0.0.1 port in the supervisor or the selected box."
+            : "The tab appears once something is listening on that port inside the supervisor.",
     ]));
     box.appendChild(section);
     loadPorts();
