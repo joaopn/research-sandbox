@@ -14,13 +14,8 @@
     "*.md": "vscode.markdown.preview.editor"
   },
 
-  "files.exclude": {
-    "**/.*": true
-  },
-
-  "git.enabled": false,
-  "git.autoRepositoryDetection": false,
-  "scm.diffDecorations": "none",
+  "git.enabled": true,
+  "git.autoRepositoryDetection": true,
 
   "security.workspace.trust.enabled": false,
 

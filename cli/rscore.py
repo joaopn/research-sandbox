@@ -3423,15 +3423,14 @@ _NODE_BIN = "node"
 _NODE_VERSION_KEY = "NODE_VERSION"
 _NODE_ARCH = "linux-x64"
 
-# Tier-2 extension prune — MUST mirror agent/Dockerfile.minimal-base's strip list
-# until slice 2 deletes the bake (the dist and the bake should ship the same
-# editor). Keep grammar/themes/markdown/notebook; drop heavy language-servers,
-# the git stack, and JS build/debug tooling.
+# Tier-2 extension prune, iterated by the editor-dist build. Keep
+# grammar/themes/markdown/notebook AND the git stack (git/github/merge-conflict —
+# so the editor's Source Control panel works and users can bring synced
+# extensions); drop heavy language-servers and JS build/debug tooling.
 _CODE_SERVER_STRIP_EXTS = (
     "typescript-language-features", "html-language-features",
     "css-language-features", "json-language-features", "php-language-features",
-    "git", "git-base", "github", "github-authentication",
-    "microsoft-authentication", "merge-conflict", "npm", "grunt", "gulp",
+    "npm", "grunt", "gulp",
     "jake", "node-debug", "node-debug2", "debug-auto-launch",
     "debug-server-ready", "references-view", "extension-editing",
     "simple-browser",
