@@ -1742,13 +1742,35 @@ async function renderDevGiteaTab(view, body) {
     // Gate on gitea RUNNING before minting a session / loading the iframe — a
     // stopped gitea would otherwise proxy the iframe into an unreachable
     // upstream (the _proxy_http 502 is the backstop; this is the graceful path).
-    let dev;
+    let devRes;
     try {
-        const r = await fetch("/broker/dev");
-        if (r.status === 401) return renderMgmtLogin(view, renderDevelopmentInto);
-        dev = await r.json();
+        devRes = await fetch("/broker/dev");
     } catch (e) { return renderMgmtUnavailable(body); }
-    const gstate = (dev && dev.ok && dev.result && dev.result.gitea) || {};
+    if (devRes.status === 401) return renderMgmtLogin(view, renderDevelopmentInto);
+    if (devRes.status === 403) return renderMgmtRejected(body);
+    // _relay's 503 body is PARSEABLE JSON ({ok:false, broker_unavailable}) —
+    // without this peel a broker outage would fall through to the verb-error
+    // arm below, inverting the split on the ONE surface allowed to name
+    // `research broker start`.
+    if (devRes.status === 503) return renderMgmtUnavailable(body);
+    let dev;
+    try { dev = await devRes.json(); } catch (e) { return renderMgmtUnavailable(body); }
+    if (!devRes.ok || !dev.ok || !dev.result) {
+        // Reachable ONLY on 200-with-parseable-JSON (the ladder above peeled
+        // every relay-own failure): the broker ANSWERED and the verb refused
+        // — render the REAL error, never the "isn't enabled" card (B38; the
+        // renderDevFetchTab shape).
+        body.innerHTML = "";
+        const retry = el("button", { class: "btn-small" }, ["Retry"]);
+        retry.onclick = () => renderDevGiteaTab(view, body);
+        body.appendChild(el("div", { class: "mgmt-empty" }, [
+            el("span", {}, [
+                (mgmtErrText(dev) || "Could not read the dev status.") + " "]),
+            retry,
+        ]));
+        return;
+    }
+    const gstate = dev.result.gitea || {};
     if (!gstate.running) {
         body.innerHTML = "";
         const enable = el("button", { class: "btn-small" }, ["Enable Gitea"]);
@@ -2010,9 +2032,29 @@ function renderDevFetchScreen(view, body, result) {
             } catch (e) { /* re-render reports the live state */ }
             renderDevFetchTab(view, body);
         };
+        // Degraded row (B37): repo_status failed for THIS repo — render its
+        // error inline (a text node: server text, house style) and keep the
+        // healthy rows around it. Sync stays (the plausible heal for a
+        // half-migrated/sick repo); the other affordances need fork state the
+        // degraded row doesn't carry.
+        if (r.error) {
+            body.appendChild(el("div", { class: "card dev-repo-card" }, [
+                el("div", { class: "dev-repo-head" }, [
+                    el("span", { class: "dev-repo-name" }, [r.repo || ""]),
+                    el("span", { class: "dev-pr-meta dev-review-failed" },
+                       [String(r.error)]),
+                    sync,
+                ]),
+            ]));
+            continue;
+        }
         const meta = (r.private ? "private · " : "")
-            + `${prs.length} open PR${prs.length === 1 ? "" : "s"} · `
-            + `${branches.length} branch${branches.length === 1 ? "" : "es"}`
+            + (r.empty
+                // The quiet empty state (B37): a zero-commit source, or a
+                // fresh consumer fork before the agent's first push.
+                ? "empty — the agent hasn't pushed yet"
+                : `${prs.length} open PR${prs.length === 1 ? "" : "s"} · `
+                  + `${branches.length} branch${branches.length === 1 ? "" : "es"}`)
             + (r.mirror_synced_at ? ` · synced ${r.mirror_synced_at}` : "");
         // Active-fork control (per-consumer forks): a plain badge with one
         // live fork; a dropdown at ≥2 — the Management-steered GLOBAL
@@ -2131,7 +2173,7 @@ function renderDevFetchScreen(view, body, result) {
             rows.push(commitsUi.panel);
             if (panel) rows.push(panel);
         }
-        if (!prs.length) {
+        if (!prs.length && !r.empty) {
             rows.push(el("div", { class: "config-empty" }, ["No open PRs."]));
         }
         for (const b of branches) {

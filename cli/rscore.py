@@ -8178,16 +8178,27 @@ def dev_status(_req: "DevStatusRequest", _progress=None) -> DevStatusResult:  # 
     if running:
         host_port = _gitea_host_port()
         try:
-            for r in gitea.list_repos(host_port):
-                if r.get("repo"):
-                    row = gitea.repo_status(host_port, r["repo"])
-                    # Review verdicts (S4): pure host-file ledger reads keyed
-                    # by str(pr) — adds no docker/network call, so the read
-                    # stays structurally no-start.
-                    row["reviews"] = gitea.load_repo_verdicts(r["repo"])
-                    repos.append(row)
+            listed = [r["repo"] for r in gitea.list_repos(host_port)
+                      if r.get("repo")]
         except gitea.GiteaError as e:
+            # No list, no page — the enumeration itself staying page-fatal is
+            # deliberate; only the PER-ROW reads degrade below.
             raise ValidationError(str(e))
+        for name in listed:
+            # Per-repo degradation (B37): one sick repo must never take down
+            # the other rows. A raising repo_status becomes a degraded
+            # {repo, error} row the page renders inline; GiteaError carries
+            # only method/path/status by that class's own contract, so no
+            # secret can enter the row.
+            try:
+                row = gitea.repo_status(host_port, name)
+                # Review verdicts (S4): pure host-file ledger reads keyed
+                # by str(pr) — adds no docker/network call, so the read
+                # stays structurally no-start.
+                row["reviews"] = gitea.load_repo_verdicts(name)
+            except gitea.GiteaError as e:
+                row = {"repo": name, "error": str(e)}
+            repos.append(row)
     attachments = [{"project": e.get("project"), "repo": e.get("repo")}
                    for e in gitea.load_attachments()
                    if e.get("project") and e.get("repo")]

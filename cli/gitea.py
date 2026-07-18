@@ -101,14 +101,17 @@ MIRROR_INTERVAL = "10m"
 # `repos/search` page cap for `dev repo list`. A single-operator dev lane holds
 # far fewer mirrors than this; truncation (loud, above) means "add pagination".
 LIST_LIMIT = 100
-# The Development-page read bound (repo_status: three metadata GETs per repo on
-# the broker's serial thread). A local-bridge gitea answers these in ms and a
-# DOWN one refuses instantly — the bound only matters for a HALF-UP gitea,
-# where the quick-call API_TIMEOUT_S (15s) would blow the webui's 30s relay
-# window at a single repo (3 calls). At 1s a gitea mid-GC could false-fail a
-# healthy read; at 15s one repo exhausts the relay window. A many-repo half-up
-# worst can still exceed the window — accepted (the daemon keeps working; only
-# that one relayed page read reports unreachable).
+# The Development-page read bound (repo_status: up to FIVE metadata GETs per
+# repo on the broker's serial thread — forks list, mirror info, fork info,
+# pulls, branches; an EMPTY or fork-less repo stops at three/two). A
+# local-bridge gitea answers these in ms and a DOWN one refuses instantly —
+# the bound only matters for a HALF-UP gitea, where the quick-call
+# API_TIMEOUT_S (15s) would blow the webui's 30s relay window at a single
+# repo. At 1s a gitea mid-GC could false-fail a healthy read; at 15s one repo
+# exhausts the relay window. A many-repo half-up worst can still exceed the
+# window — accepted (the daemon keeps working; only that one relayed page
+# read reports unreachable), and dev_status's per-repo degradation keeps a
+# slow/sick repo from taking the other rows with it.
 STATUS_TIMEOUT_S = 5
 # Bounded wait for gitea's async fork (202) to materialize. A small-repo fork is
 # near-instant; 30×1s covers a busy gitea without hanging. At 5s a loaded gitea
@@ -730,12 +733,27 @@ def repo_status(host_port: str, repo: str) -> dict:
     info = client._api("GET", f"/repos/{ADMIN_USER}/{repo}",
                        timeout=STATUS_TIMEOUT_S) or {}
     prs_raw, branches_raw = [], []
+    fork_empty = False
     if active:
-        prs_raw = client._api(
-            "GET", f"/repos/{active}/{repo}/pulls?state=open&limit={LIST_LIMIT}",
-            timeout=STATUS_TIMEOUT_S) or []
-        branches_raw = client._api("GET", f"/repos/{active}/{repo}/branches",
-                                   timeout=STATUS_TIMEOUT_S) or []
+        # The ACTIVE FORK's own info decides emptiness — the MIRROR's does
+        # not suffice (a synced mirror + an agent that never pushed leaves
+        # the fork empty). Gitea 404s the pulls list (and most repo
+        # sub-APIs) on an EMPTY repo, and an empty fork is a NORMAL state: a
+        # zero-commit GitHub source migrates "successfully" as empty (the
+        # migrate_mirror stub-heal quirk) and its fork is born empty, as is
+        # any fresh consumer fork before the agent's first push. So the
+        # 404-prone GETs are SKIPPED, not attempted-and-tolerated (B37).
+        fork_info = client._api("GET", f"/repos/{active}/{repo}",
+                                timeout=STATUS_TIMEOUT_S) or {}
+        fork_empty = bool(fork_info.get("empty"))
+        if not fork_empty:
+            prs_raw = client._api(
+                "GET",
+                f"/repos/{active}/{repo}/pulls?state=open&limit={LIST_LIMIT}",
+                timeout=STATUS_TIMEOUT_S) or []
+            branches_raw = client._api(
+                "GET", f"/repos/{active}/{repo}/branches",
+                timeout=STATUS_TIMEOUT_S) or []
     prs = []
     for p in prs_raw if isinstance(prs_raw, list) else []:
         if not isinstance(p, dict):
@@ -759,6 +777,7 @@ def repo_status(host_port: str, repo: str) -> dict:
                                  or info.get("updated_at") or ""),
             "forks": forks,
             "active": active,
+            "empty": fork_empty,
             "prs": prs,
             "branches": branches}
 
