@@ -30,6 +30,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -113,6 +114,19 @@ STATUS_TIMEOUT_S = 5
 # near-instant; 30×1s covers a busy gitea without hanging. At 5s a loaded gitea
 # false-fails; at 300s a wedged fork would hold the caller 5 min.
 FORK_WAIT_TRIES = 30
+
+# Commit-list bounds for the Development page's lazy per-row dropdowns.
+# PR_COMMITS_LIMIT sits AT gitea's server-side list clamp (api.MAX_RESPONSE_ITEMS,
+# default 50): a larger value would be silently clamped server-side and the
+# truncation flag below could never fire, so the limit is pinned to the clamp
+# and truncation keys on len(rows) >= limit (loud in the result, not a print —
+# the consumer is the browser, not the broker's stdout).
+PR_COMMITS_LIMIT = 50
+# Branch rows show the LATEST few commits (PI-specified display count): a
+# branch is unbounded history, unlike a PR's finite commit set, and 5 keeps
+# the "recent work at a glance" read scannable. Older commits stay reachable
+# by walking (each landed step surfaces the next) or via the gitea UI.
+BRANCH_COMMITS_LIMIT = 5
 
 # Repo FEATURES (gitea "units") on the two dev-lane repo kinds. Gitea's built-in
 # DefaultForkRepoUnits is code+pulls ONLY, so a fresh fork ships with NO issue
@@ -747,6 +761,72 @@ def repo_status(host_port: str, repo: str) -> dict:
             "active": active,
             "prs": prs,
             "branches": branches}
+
+
+# --- per-row commit lists (the Development-page dropdowns) --------------------
+
+def _require_active_fork(host_port: str, repo: str) -> str:
+    """The active fork or a RAISE — the commit reads are row-level: the page
+    only renders PR/branch rows when a fork exists, so reaching them with no
+    live fork is abnormal and deserves a loud error, not an empty dropdown."""
+    active = active_fork_for(host_port, repo)
+    if not active:
+        raise GiteaError(f"no live agent fork for {repo!r} (add a dev "
+                         f"project/box on it first)")
+    return active
+
+
+def _commit_rows(raw: Any, limit: int) -> tuple[list[dict], bool]:
+    """Field-picked commit rows, normalized OLDEST-FIRST — both gitea commit
+    endpoints return newest-first, and the dropdown renders fetch-WALK order.
+    Picked by NAME so nothing unexpected can enter the result. Truncation is
+    measured BEFORE the reverse, against the page gitea actually returned."""
+    rows = []
+    for c in raw if isinstance(raw, list) else []:
+        if not isinstance(c, dict):
+            continue
+        commit = c.get("commit") or {}
+        msg = commit.get("message") or ""
+        rows.append({"sha": c.get("sha") or "",
+                     "subject": msg.splitlines()[0] if msg else "",
+                     "date": ((commit.get("committer") or {}).get("date")
+                              or (commit.get("author") or {}).get("date")
+                              or "")})
+    truncated = len(rows) >= limit
+    rows.reverse()
+    return rows, truncated
+
+
+# Both commit endpoints compute per-commit diffstats by default; the dropdown
+# needs none of that on the broker's serial accept thread — these toggles make
+# the reads metadata-cheap.
+_COMMITS_QS = "stat=false&verification=false&files=false"
+
+
+def pr_commits(host_port: str, repo: str, pr: int) -> tuple[list[dict], bool]:
+    """A PR's commits on the ACTIVE fork: (rows oldest-first, truncated)."""
+    active = _require_active_fork(host_port, repo)
+    client = GiteaClient(api_base(host_port), read_admin_token())
+    raw = client._api(
+        "GET", f"/repos/{active}/{repo}/pulls/{pr}/commits"
+               f"?limit={PR_COMMITS_LIMIT}&{_COMMITS_QS}") or []
+    return _commit_rows(raw, PR_COMMITS_LIMIT)
+
+
+def branch_commits(host_port: str, repo: str,
+                   branch: str) -> tuple[list[dict], bool]:
+    """A branch's LATEST commits on the ACTIVE fork: (rows oldest-first,
+    truncated). The branch name is the first client-supplied FREE-TEXT value
+    to reach this client's URL builder (every other path piece is
+    regex-validated or gitea-sourced), so it is URL-quoted — `&`/`#`/`?` are
+    all legal in git ref names and would otherwise corrupt the query."""
+    active = _require_active_fork(host_port, repo)
+    client = GiteaClient(api_base(host_port), read_admin_token())
+    raw = client._api(
+        "GET", f"/repos/{active}/{repo}/commits"
+               f"?sha={urllib.parse.quote(branch, safe='')}"
+               f"&limit={BRANCH_COMMITS_LIMIT}&{_COMMITS_QS}") or []
+    return _commit_rows(raw, BRANCH_COMMITS_LIMIT)
 
 
 # --- attachment record ------------------------------------------------------

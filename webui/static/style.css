@@ -1308,6 +1308,22 @@ body {
 .dev-pr-meta { color: var(--fg-faint); font-size: 12px; }
 .dev-attached { margin-top: 2px; }
 .dev-copy { min-width: 34px; }
+/* Per-row commit dropdowns (the unified commit page). The panel indents under
+   its PR/branch row; rows reuse the dev-pr-* cell styles. */
+.dev-commits-btn { min-width: 28px; }
+.dev-commits-panel {
+    margin-left: 42px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.dev-commit-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+}
+.dev-commits-note { margin-top: 2px; }
 /* Dev preset: the MCP picker is locked (a dev box's bridge has no mcp-proxy
    path); pointer-events off so the disabled checkboxes read as inert. */
 .config-mcp-picker.disabled { opacity: 0.45; pointer-events: none; }

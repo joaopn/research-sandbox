@@ -1811,6 +1811,93 @@ function devCopyBtn(cmd) {
     return b;
 }
 
+// Lazy per-row commit dropdown (the unified commit page): ▸ expands a PR's
+// commits or a branch's latest few, OLDEST-FIRST — the rs-fetch WALK order —
+// each with a copy button for `rs-fetch <repo> <locator> --commit <sha>`.
+// Fetched on first expand only (the broker read is click-triggered by design;
+// the page read must never fan out per-row), cached per row. Commit subjects
+// are AGENT OUTPUT → text nodes only (the verdict-string rule). Transport
+// failures (unreachable/503/unparseable) and verb refusals (200 + ok:false)
+// render DIFFERENT texts — never collapse the split.
+function devCommitsExpander(repo, sel) {
+    const btn = el("button", {
+        class: "btn-small dev-commits-btn",
+        title: "show commits (fetchable one by one)",
+    }, ["▸"]);
+    const panel = el("div", { class: "dev-commits-panel" });
+    panel.style.display = "none";
+    let loaded = false;
+    let open = false;
+    btn.onclick = async () => {
+        open = !open;
+        btn.textContent = open ? "▾" : "▸";
+        panel.style.display = open ? "" : "none";
+        if (!open || loaded) return;
+        loaded = true;
+        panel.appendChild(el("div", { class: "dev-pr-meta" }, ["Loading commits…"]));
+        const locator = sel.pr != null
+            ? `pr=${encodeURIComponent(sel.pr)}`
+            : `branch=${encodeURIComponent(sel.branch)}`;
+        let res, data;
+        try {
+            res = await fetch(`/broker/dev/commits?repo=${encodeURIComponent(repo)}&${locator}`);
+            data = await res.json();
+        } catch (e) {
+            panel.innerHTML = "";
+            panel.appendChild(el("div", { class: "dev-pr-meta" },
+                ["The broker isn't reachable — is it running?"]));
+            loaded = false;                 // transport error: allow a retry
+            return;
+        }
+        panel.innerHTML = "";
+        if (res.status === 503) {
+            panel.appendChild(el("div", { class: "dev-pr-meta" },
+                ["The broker isn't reachable — is it running?"]));
+            loaded = false;
+            return;
+        }
+        if (!res.ok || !data.ok || !data.result) {
+            // The broker ANSWERED and the verb refused — show the real reason.
+            panel.appendChild(el("div", { class: "dev-pr-meta" },
+                [mgmtErrText(data) || "Could not load commits."]));
+            loaded = false;
+            return;
+        }
+        const commits = Array.isArray(data.result.commits)
+            ? data.result.commits : [];
+        const cmdFor = (sha) => sel.pr != null
+            ? `rs-fetch ${repo} --pr ${sel.pr} --commit ${sha}`
+            : `rs-fetch ${repo} --branch ${sel.branch} --commit ${sha}`;
+        for (const c of commits) {
+            if (!c || typeof c !== "object" || !c.sha) continue;
+            panel.appendChild(el("div", { class: "dev-commit-row" }, [
+                devCopyBtn(cmdFor(c.sha)),
+                el("span", { class: "dev-pr-id" }, [c.sha.slice(0, 9)]),
+                el("span", { class: "dev-pr-title" }, [c.subject || ""]),
+                el("span", { class: "dev-pr-meta" }, [c.date || ""]),
+            ]));
+        }
+        if (!commits.length) {
+            panel.appendChild(el("div", { class: "dev-pr-meta" }, ["No commits."]));
+            return;
+        }
+        if (data.result.truncated) {
+            panel.appendChild(el("div", { class: "dev-pr-meta" },
+                [`(list truncated at ${commits.length} — older commits exist)`]));
+        }
+        // The walk contract, stated where the buttons are. (Message-vs-content
+        // consistency is guaranteed for a PURE top-down walk; after a skip
+        // landing or local touch-ups a later step's message may over-quote
+        // already-landed commits — the staged CONTENT stays correct.)
+        panel.appendChild(el("div", { class: "dev-pr-meta dev-commits-note" }, [
+            "Oldest first: fetching top-down stages one commit (+ its message) "
+            + "per step; skipping ahead stages everything above it as one "
+            + "squash with the messages concatenated.",
+        ]));
+    };
+    return { btn, panel };
+}
+
 // One PR review on the broker's parallel detached lane (STAGE_DEV_GITEA S4):
 // POST /broker/dev/review → {op_id} → stream the op via the build-tail modal
 // (build_alive covers review ops). Advisory — the verdict lands in the host
@@ -1981,8 +2068,10 @@ function renderDevFetchScreen(view, body, result) {
         ])];
         const reviews = (r.reviews && typeof r.reviews === "object") ? r.reviews : {};
         for (const p of prs) {
+            const commitsUi = devCommitsExpander(r.repo, { pr: p.number });
             const cells = [
                 devCopyBtn(`rs-fetch ${r.repo} --pr ${p.number}`),
+                commitsUi.btn,
                 el("span", { class: "dev-pr-id" }, [`#${p.number}`]),
                 el("span", { class: "dev-pr-title" }, [p.title || ""]),
                 el("span", { class: "dev-pr-meta" },
@@ -2039,17 +2128,21 @@ function renderDevFetchScreen(view, body, result) {
                 cells.push(reviewBtn("Retry"));
             }
             rows.push(el("div", { class: "dev-pr-row" }, cells));
+            rows.push(commitsUi.panel);
             if (panel) rows.push(panel);
         }
         if (!prs.length) {
             rows.push(el("div", { class: "config-empty" }, ["No open PRs."]));
         }
         for (const b of branches) {
+            const commitsUi = devCommitsExpander(r.repo, { branch: b.name });
             rows.push(el("div", { class: "dev-branch-row" }, [
                 devCopyBtn(`rs-fetch ${r.repo} --branch ${b.name}`),
+                commitsUi.btn,
                 el("span", { class: "dev-pr-title" }, [b.name || ""]),
                 el("span", { class: "dev-pr-meta" }, [b.committed_at || ""]),
             ]));
+            rows.push(commitsUi.panel);
         }
         if (attached.length) {
             rows.push(el("div", { class: "dev-pr-meta dev-attached" },
@@ -2059,7 +2152,9 @@ function renderDevFetchScreen(view, body, result) {
     }
     body.appendChild(el("div", { class: "hint" }, [
         "📋 copies the rs-fetch command — paste it in any project or box ",
-        "terminal (every container carries rs-fetch + read-only fetch access).",
+        "terminal (every container carries rs-fetch + read-only fetch access). ",
+        "rs-fetch stages the work with the agent's message prefilled and never ",
+        "commits; ▸ lists a row's commits to fetch them one by one.",
     ]));
 }
 

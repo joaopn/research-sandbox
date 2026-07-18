@@ -1363,6 +1363,49 @@ class DevSetActiveForkRequest:
 
 
 @dataclass(frozen=True)
+class DevCommitsRequest:
+    """One PR's or one branch's commit list for the Development-page dropdowns
+    (a lazy, click-triggered read — never part of the page read). EXACTLY one
+    locator: ``pr`` (int) or ``branch``. Empty-string and absent are the SAME
+    unset (the webui PR expander sends no ``branch`` key while a query-string
+    miss can arrive as ``""`` — a phantom empty field must not kill a
+    legitimate click)."""
+    repo: str
+    pr: int | None
+    branch: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "DevCommitsRequest":
+        repo = kw.get("repo")
+        if not _valid_dev_repo_name(repo):
+            raise ValidationError(f"invalid dev repo name: {repo!r}")
+        pr = kw.get("pr")
+        if pr in (None, ""):
+            pr = None
+        else:
+            if isinstance(pr, str) and pr.isdigit():
+                pr = int(pr)
+            if not isinstance(pr, int) or isinstance(pr, bool) or pr <= 0:
+                raise ValidationError(
+                    f"pr must be a positive integer, got {pr!r}")
+        branch = kw.get("branch")
+        if branch in (None, ""):
+            branch = ""
+        elif not isinstance(branch, str):
+            raise ValidationError("branch must be a string")
+        else:
+            # Shape gate only (gitea 404s an unknown branch): keep control
+            # chars out of logs/URLs and option-shaped names out of any argv.
+            if branch.startswith("-") or any(
+                    ord(ch) < 0x20 or ch == "\x7f" for ch in branch):
+                raise ValidationError(f"invalid branch name: {branch!r}")
+        if (pr is None) == (branch == ""):
+            raise ValidationError(
+                "exactly one of pr and branch is required")
+        return cls(repo=repo, pr=pr, branch=branch)
+
+
+@dataclass(frozen=True)
 class ReviewRequest:
     """One PR review in the ephemeral sandboxed reviewer (STAGE_DEV_GITEA S4).
     Shape-validation only — repo existence / gitea state are checked in the
@@ -1568,6 +1611,13 @@ class DevPasswdResult:
 class DevSetActiveForkResult:
     repo: str
     user: str
+
+
+@dataclass
+class DevCommitsResult:
+    repo: str
+    commits: list[dict]              # [{sha, subject, date}] OLDEST-first
+    truncated: bool                  # gitea page clamp hit — render it loud
 
 
 @dataclass
@@ -8180,6 +8230,29 @@ def dev_set_active_fork(req: "DevSetActiveForkRequest", _progress=None) -> DevSe
     for project in gitea.attached_projects(req.repo):
         _stage_dev_gitea(project, cfg)
     return DevSetActiveForkResult(repo=req.repo, user=req.user)
+
+
+def dev_commits(req: "DevCommitsRequest", _progress=None) -> DevCommitsResult:  # type: ignore[name-defined]
+    """One PR's or one branch's commits, oldest-first, for the Development
+    page's lazy per-row dropdowns. A READ — the dev_status/dev_repo_list
+    posture: NEVER starts gitea on any path (no _provision_gitea, no
+    _resume_gitea; a stopped/absent gitea returns empty immediately). The
+    try encloses the ENTIRE gitea chain deliberately: read_admin_token()
+    raises GiteaError on an un-bootstrapped lane, and an escaped GiteaError
+    would leave the broker reply truncated with no envelope."""
+    if not container_running(gitea.GITEA_CONTAINER):
+        return DevCommitsResult(repo=req.repo, commits=[], truncated=False)
+    try:
+        if req.pr is not None:
+            commits, truncated = gitea.pr_commits(
+                _gitea_host_port(), req.repo, req.pr)
+        else:
+            commits, truncated = gitea.branch_commits(
+                _gitea_host_port(), req.repo, req.branch)
+    except gitea.GiteaError as e:
+        raise ValidationError(str(e))
+    return DevCommitsResult(repo=req.repo, commits=commits,
+                            truncated=truncated)
 
 
 def dev_passwd(req: "DevPasswdRequest", progress=None) -> DevPasswdResult:  # type: ignore[name-defined]

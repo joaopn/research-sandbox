@@ -614,6 +614,11 @@ DEV_TARGET_WEBUI_FIELDS = frozenset({"repo"})
 # username, both shape-validated in from_kwargs and re-gated against the
 # repo's LIVE forks in the verb — neither is host-shaped.
 DEV_ACTIVE_FORK_WEBUI_FIELDS = frozenset({"repo", "user"})
+# The per-row commit dropdown read (lazy, click-triggered): a repo name + ONE
+# of pr/branch (exactly-one enforced in from_kwargs, which also normalizes
+# ""-vs-absent — a webui query miss must not read as a phantom field). None is
+# host-shaped; the branch name is URL-quoted at the gitea client.
+DEV_COMMITS_WEBUI_FIELDS = frozenset({"repo", "pr", "branch"})
 # The dev lane's input boundaries (webui-first B; the lane keeps its dev-box
 # mechanism names while carrying BOTH dev provision verbs — see
 # _DEV_LANE_VERBS). Consumed by the dispatch dev-lane branch + the _verb_*
@@ -692,6 +697,16 @@ def _verb_dev_set_active_fork(args: dict, _progress=None) -> dict:
     return dataclasses.asdict(rscore.dev_set_active_fork(req))
 
 
+def _verb_dev_commits(args: dict, _progress=None) -> dict:
+    # The Fetch tab's lazy per-row commit list (PR expanders + branch
+    # expanders). A bounded READ on the accept thread (one fork-list GET + one
+    # commits GET, both API_TIMEOUT_S=15 < the webui's 30s relay window);
+    # never starts gitea.
+    safe = {k: v for k, v in args.items() if k in DEV_COMMITS_WEBUI_FIELDS}
+    req = rscore.DevCommitsRequest.from_kwargs(**safe)   # may raise ValidationError
+    return dataclasses.asdict(rscore.dev_commits(req))
+
+
 def _verb_dev_status(_args: dict, _progress=None) -> dict:
     # The Development-page read: no fields; NEVER starts gitea (a stopped one
     # reports running:false immediately — dev_gitea_start is the explicit verb).
@@ -753,6 +768,7 @@ VERBS = {
     "dev_gitea_start": _verb_dev_gitea_start,
     "dev_passwd": _verb_dev_passwd,
     "dev_set_active_fork": _verb_dev_set_active_fork,
+    "dev_commits": _verb_dev_commits,
 }
 
 # Verbs requiring step-up re-auth: a FRESH login proof (derived client-side

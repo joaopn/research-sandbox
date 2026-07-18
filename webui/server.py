@@ -1024,6 +1024,26 @@ async def broker_dev_sync_handler(request: web.Request) -> web.Response:
     return web.json_response(reply, status=status)
 
 
+async def broker_dev_commits_handler(request: web.Request) -> web.Response:
+    """GET /broker/dev/commits?repo=<r>&(pr=<n>|branch=<name>) — the Fetch
+    tab's lazy per-row commit list, relayed to the token-gated dev_commits
+    verb. A READ (no origin check — GETs mutate nothing; the session gate is
+    _relay's). ALL THREE keys are forwarded when present — the hand-picked
+    args here are the fourth link of the field lockstep (request field ↔
+    DEV_COMMITS_WEBUI_FIELDS ↔ this dict ↔ the app.js query); a key missing
+    HERE is dropped silently with no error at any layer. Absent params stay
+    absent (from_kwargs also treats "" as unset, belt and braces)."""
+    args: dict = {"repo": request.query.get("repo")}
+    pr = request.query.get("pr")
+    if pr:
+        args["pr"] = pr
+    branch = request.query.get("branch")
+    if branch:
+        args["branch"] = branch
+    status, reply = await _relay(request, "dev_commits", args)
+    return web.json_response(reply, status=status)
+
+
 async def broker_dev_active_fork_handler(request: web.Request) -> web.Response:
     """POST /broker/dev/active-fork {repo, user} — set the repo's GLOBAL
     active fork (gated, origin-checked; the Development page's fork dropdown,
@@ -2511,6 +2531,7 @@ def main() -> None:
     # swallowed as actions).
     app.router.add_get("/broker/project/{name}/ports", broker_ports_handler)
     app.router.add_get("/broker/dev", broker_dev_handler)
+    app.router.add_get("/broker/dev/commits", broker_dev_commits_handler)
     app.router.add_post("/broker/dev/sync", broker_dev_sync_handler)
     app.router.add_post("/broker/dev/active-fork", broker_dev_active_fork_handler)
     app.router.add_post("/broker/dev/gitea-start", broker_dev_gitea_start_handler)
