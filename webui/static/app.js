@@ -1835,13 +1835,16 @@ function devCopyBtn(cmd) {
 
 // Lazy per-row commit dropdown (the unified commit page): ▸ expands a PR's
 // commits or a branch's latest few, OLDEST-FIRST — the rs-fetch WALK order —
-// each with a copy button for `rs-fetch <repo> <locator> --commit <sha>`.
+// each with a copy button for `rs-fetch <repo> <locator> --commit <sha>` and
+// per-commit review affordances (Review / reviewed-badge / Retry, fed by the
+// dev_commits result's sha-keyed ledger entries). view/body are threaded in
+// for devReviewDialog (status-redirect routing + the onDone re-render).
 // Fetched on first expand only (the broker read is click-triggered by design;
 // the page read must never fan out per-row), cached per row. Commit subjects
 // are AGENT OUTPUT → text nodes only (the verdict-string rule). Transport
 // failures (unreachable/503/unparseable) and verb refusals (200 + ok:false)
 // render DIFFERENT texts — never collapse the split.
-function devCommitsExpander(repo, sel) {
+function devCommitsExpander(view, body, repo, sel) {
     const btn = el("button", {
         class: "btn-small dev-commits-btn",
         title: "show commits (fetchable one by one)",
@@ -1890,14 +1893,70 @@ function devCommitsExpander(repo, sel) {
         const cmdFor = (sha) => sel.pr != null
             ? `rs-fetch ${repo} --pr ${sel.pr} --commit ${sha}`
             : `rs-fetch ${repo} --branch ${sel.branch} --commit ${sha}`;
+        // Per-commit review verdicts: ledger entries keyed by FULL sha. All
+        // verdict strings are MODEL OUTPUT → text nodes only. No stale
+        // marker — a commit is immutable.
+        const reviews = (data.result.reviews
+                         && typeof data.result.reviews === "object")
+            ? data.result.reviews : {};
         for (const c of commits) {
             if (!c || typeof c !== "object" || !c.sha) continue;
-            panel.appendChild(el("div", { class: "dev-commit-row" }, [
+            const cells = [
                 devCopyBtn(cmdFor(c.sha)),
                 el("span", { class: "dev-pr-id" }, [c.sha.slice(0, 9)]),
                 el("span", { class: "dev-pr-title" }, [c.subject || ""]),
                 el("span", { class: "dev-pr-meta" }, [c.date || ""]),
-            ]));
+            ];
+            const v = reviews[c.sha];
+            const reviewBtn = (label) => {
+                const btn = el("button", { class: "btn-small dev-review-btn" },
+                               [label]);
+                btn.onclick = () => {
+                    btn.disabled = true;
+                    devReviewDialog(view, body, repo, { commit: c.sha });
+                };
+                return btn;
+            };
+            let vpanel = null;
+            if (!v) {
+                cells.push(reviewBtn("Review"));
+            } else if (v.status === "ok") {
+                const badge = el("button", {
+                    class: "btn-small dev-review-badge",
+                    title: "show the review verdict",
+                }, ["reviewed ✓" + (v.risk ? ` · ${v.risk}` : "")]);
+                vpanel = el("div", { class: "dev-verdict-panel" });
+                vpanel.style.display = "none";
+                vpanel.appendChild(el("div", { class: "dev-pr-meta" },
+                    [`reviewed ${v.reviewed_at || ""}`]));
+                if (v.summary) {
+                    vpanel.appendChild(
+                        el("div", { class: "dev-verdict-summary" },
+                           [v.summary]));
+                }
+                const findings = Array.isArray(v.findings) ? v.findings : [];
+                for (const f of findings) {
+                    if (!f || typeof f !== "object") continue;
+                    vpanel.appendChild(
+                        el("div", { class: "dev-verdict-finding" },
+                           ["• " + (f.file ? f.file + ": " : "")
+                            + (f.note || "")]));
+                }
+                vpanel.appendChild(reviewBtn("Re-review"));
+                badge.onclick = () => {
+                    vpanel.style.display =
+                        vpanel.style.display === "none" ? "" : "none";
+                };
+                cells.push(badge);
+            } else {
+                cells.push(el("span",
+                              { class: "dev-pr-meta dev-review-failed" },
+                              ["review failed"
+                               + (v.reason ? `: ${v.reason}` : "")]));
+                cells.push(reviewBtn("Retry"));
+            }
+            panel.appendChild(el("div", { class: "dev-commit-row" }, cells));
+            if (vpanel) panel.appendChild(vpanel);
         }
         if (!commits.length) {
             panel.appendChild(el("div", { class: "dev-pr-meta" }, ["No commits."]));
@@ -1920,15 +1979,20 @@ function devCommitsExpander(repo, sel) {
     return { btn, panel };
 }
 
-// One PR review on the broker's parallel detached lane (STAGE_DEV_GITEA S4):
+// One review on the broker's parallel detached lane (STAGE_DEV_GITEA S4):
 // POST /broker/dev/review → {op_id} → stream the op via the build-tail modal
-// (build_alive covers review ops). Advisory — the verdict lands in the host
-// ledger and shows as a badge/panel after the Fetch-tab re-read on close.
-async function devReviewDialog(view, body, repo, pr) {
+// (build_alive covers review ops). `sel` is the locator: {pr} reviews the
+// whole PR, {commit} a single commit (full sha). Advisory — the verdict lands
+// in the host ledger and shows as a badge/panel after the Fetch-tab re-read
+// on close.
+async function devReviewDialog(view, body, repo, sel) {
     if (document.querySelector(".modal-backdrop")) return;
+    const title = sel.pr != null
+        ? `Review ${repo} #${sel.pr}`
+        : `Review ${repo} @${(sel.commit || "").slice(0, 9)}`;
     const backdrop = el("div", { class: "modal-backdrop" });
     const card = el("div", { class: "card sw-build-card" }, [
-        el("h2", {}, [`Review ${repo} #${pr}`]),
+        el("h2", {}, [title]),
         el("div", { class: "mgmt-loading" }, ["Starting the sandboxed reviewer…"]),
     ]);
     backdrop.appendChild(card);
@@ -1938,7 +2002,10 @@ async function devReviewDialog(view, body, repo, pr) {
         res = await fetch("/broker/dev/review", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ repo: repo, pr: pr }),
+            body: JSON.stringify({
+                repo: repo,
+                ...(sel.pr != null ? { pr: sel.pr } : { commit: sel.commit }),
+            }),
         });
     } catch (e) {
         backdrop.remove();
@@ -1949,7 +2016,7 @@ async function devReviewDialog(view, body, repo, pr) {
     let b; try { b = await res.json(); } catch (e) { b = {}; }
     if (!b.ok || !b.op_id) {
         card.innerHTML = "";
-        card.appendChild(el("h2", {}, [`Review ${repo} #${pr}`]));
+        card.appendChild(el("h2", {}, [title]));
         card.appendChild(el("div", { class: "error" },
                             ["Could not start the review: " + mgmtErrText(b)]));
         const close = el("button", { class: "btn btn-secondary" }, ["Close"]);
@@ -1957,8 +2024,7 @@ async function devReviewDialog(view, body, repo, pr) {
         card.appendChild(el("div", { class: "btn-row" }, [close]));
         return;
     }
-    await mgmtTailBuildLog(view, backdrop, card, b.op_id,
-                           `Review ${repo} #${pr}`,
+    await mgmtTailBuildLog(view, backdrop, card, b.op_id, title,
                            () => renderDevFetchTab(view, body));
 }
 
@@ -2110,7 +2176,8 @@ function renderDevFetchScreen(view, body, result) {
         ])];
         const reviews = (r.reviews && typeof r.reviews === "object") ? r.reviews : {};
         for (const p of prs) {
-            const commitsUi = devCommitsExpander(r.repo, { pr: p.number });
+            const commitsUi = devCommitsExpander(view, body, r.repo,
+                                                 { pr: p.number });
             const cells = [
                 devCopyBtn(`rs-fetch ${r.repo} --pr ${p.number}`),
                 commitsUi.btn,
@@ -2128,7 +2195,7 @@ function renderDevFetchScreen(view, body, result) {
                                [label]);
                 btn.onclick = () => {
                     btn.disabled = true;
-                    devReviewDialog(view, body, r.repo, p.number);
+                    devReviewDialog(view, body, r.repo, { pr: p.number });
                 };
                 return btn;
             };
@@ -2177,7 +2244,8 @@ function renderDevFetchScreen(view, body, result) {
             rows.push(el("div", { class: "config-empty" }, ["No open PRs."]));
         }
         for (const b of branches) {
-            const commitsUi = devCommitsExpander(r.repo, { branch: b.name });
+            const commitsUi = devCommitsExpander(view, body, r.repo,
+                                                 { branch: b.name });
             rows.push(el("div", { class: "dev-branch-row" }, [
                 devCopyBtn(`rs-fetch ${r.repo} --branch ${b.name}`),
                 commitsUi.btn,

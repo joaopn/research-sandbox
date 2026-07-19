@@ -603,8 +603,9 @@ def _verb_port_list(args: dict, _progress=None) -> dict:
 # thread); the CLI calls rscore.dev_repo_add directly.
 # The review lane's input boundary (S4). Consumed by the dispatch review
 # branch + _verb_review_pr, NOT by any VERBS entry — review_pr lives in
-# REVIEW_DISPATCH only (see the review-lane section).
-REVIEW_WEBUI_FIELDS = frozenset({"repo", "pr"})
+# REVIEW_DISPATCH only (see the review-lane section). `commit` is the
+# single-commit locator (exactly one of pr/commit, enforced in from_kwargs).
+REVIEW_WEBUI_FIELDS = frozenset({"repo", "pr", "commit"})
 # klass is GONE (STAGE_DEV_GITEA S3): attachments are agent-class only — the
 # fetch surface went universal and the former "control" class was retired.
 DEV_ATTACH_WEBUI_FIELDS = frozenset({"project", "repo"})

@@ -1127,13 +1127,15 @@ async def broker_dev_passwd_handler(request: web.Request) -> web.Response:
 
 
 async def broker_dev_review_handler(request: web.Request) -> web.Response:
-    """POST /broker/dev/review {repo, pr} — kick one PR review on the broker's
-    PARALLEL detached review lane (gated, origin-checked). The broker_build_handler
+    """POST /broker/dev/review {repo, pr} | {repo, commit} — kick one review
+    (a whole PR, or a single commit by full sha) on the broker's PARALLEL
+    detached review lane (gated, origin-checked). The broker_build_handler
     shape: mint an op_id, synchronous relay-with-op_id (the broker spawns the
     child and returns fast — no lock, reviews run N-at-a-time), return {op_id};
     the browser then tails /broker/op/<id>/log (+ build_alive covers review
-    ops). Only `repo` and `pr` cross from the browser; the broker re-filters
-    against REVIEW_WEBUI_FIELDS and shape-validates pre-spawn."""
+    ops). Only the locator fields cross from the browser; the broker re-filters
+    against REVIEW_WEBUI_FIELDS and shape-validates pre-spawn (exactly one of
+    pr/commit)."""
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")
     s = _broker_session(request)
@@ -1146,8 +1148,12 @@ async def broker_dev_review_handler(request: web.Request) -> web.Response:
         body = {}
     if not isinstance(body, dict):
         body = {}
-    args = {"repo": body.get("repo"), "pr": body.get("pr")}
-    op_id = _mint_op_id("dev-review", "pr")
+    # Build args from the body's locator keys only (the hand-picked-args
+    # fourth link of the field lockstep): absent keys stay absent so
+    # from_kwargs' exactly-one-of gate sees the true shape.
+    args = {k: body.get(k) for k in ("repo", "pr", "commit")
+            if body.get(k) is not None}
+    op_id = _mint_op_id("dev-review", "commit" if body.get("commit") else "pr")
     try:
         reply = await broker_call("review_pr", args, token=s["broker_token"],
                                   op_id=op_id, timeout=BROKER_CALL_TIMEOUT_S)

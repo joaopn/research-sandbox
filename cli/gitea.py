@@ -436,6 +436,45 @@ class GiteaClient:
                 f"({max_bytes} bytes)")
         return raw.decode("utf-8", "replace")
 
+    def commit_info(self, owner: str, repo: str, sha: str) -> dict:
+        """One commit's metadata (subject + full message) for the commit-review
+        header — the pull_info mold, fields picked by name. _COMMITS_QS keeps
+        the read metadata-cheap (no diffstat/verification/files)."""
+        data = self._api("GET", f"/repos/{owner}/{repo}/git/commits/{sha}"
+                                f"?{_COMMITS_QS}")
+        if not isinstance(data, dict):
+            raise GiteaError(
+                f"gitea GET commit {owner}/{repo}@{sha} -> no data")
+        msg = (data.get("commit") or {}).get("message") or ""
+        return {"subject": msg.splitlines()[0] if msg else "",
+                "message": msg}
+
+    def commit_diff(self, owner: str, repo: str, sha: str,
+                    max_bytes: int) -> str:
+        """One commit's raw unified diff (gitea's commit `.diff` endpoint) —
+        the pull_diff shape verbatim: reads max_bytes + 1 so overflow is
+        detected exactly; the overflow error names sizes only, never content
+        (the diff is adversarial input and the message may reach a client
+        envelope)."""
+        path = f"/repos/{owner}/{repo}/git/commits/{sha}.diff"
+        req = urllib.request.Request(self._base + path, headers={
+            "Authorization": f"token {self._token}",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=API_TIMEOUT_S) as resp:
+                raw = resp.read(max_bytes + 1)
+        except urllib.error.HTTPError as e:
+            raise GiteaError(f"gitea GET {path} -> HTTP {e.code}") from None
+        except urllib.error.URLError as e:
+            raise GiteaError(f"gitea GET {path} unreachable: {e.reason}") from None
+        except OSError as e:
+            raise GiteaError(f"gitea GET {path} failed: {e}") from None
+        if len(raw) > max_bytes:
+            raise GiteaError(
+                f"gitea GET {path} -> diff exceeds the review cap "
+                f"({max_bytes} bytes)")
+        return raw.decode("utf-8", "replace")
+
     def delete_repo(self, owner: str, repo: str) -> None:
         try:
             self._api("DELETE", f"/repos/{owner}/{repo}")
@@ -980,4 +1019,47 @@ def load_repo_verdicts(repo: str) -> dict[str, dict]:
             continue
         if isinstance(data, dict):
             out[f.stem] = data
+    return out
+
+
+# Per-COMMIT verdicts live beside the PR ones as commit-<sha>.json. The
+# `commit-` prefix is load-bearing: load_repo_verdicts filters on
+# f.stem.isdigit(), and a 40-hex sha CAN be all-decimal — a bare <sha>.json
+# could masquerade as a PR entry. The prefix keeps the two globs structurally
+# disjoint in both directions. Schema mirrors the PR entry minus head_sha/pr:
+#   {repo, commit, status: "ok"|"failed", reason?, risk?, summary?,
+#    findings?, reviewed_at}
+
+def commit_verdict_path(repo: str, sha: str) -> Path:
+    return REVIEWS_DIR / repo / f"commit-{sha}.json"
+
+
+def save_commit_verdict(repo: str, sha: str, payload: dict) -> Path:
+    """Atomic per-commit write — the save_verdict per-writer-PID tmp shape
+    (commit reviews run in PARALLEL on the same lane)."""
+    path = commit_verdict_path(repo, sha)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    tmp.replace(path)
+    return path
+
+
+def load_repo_commit_verdicts(repo: str) -> dict[str, dict]:
+    """All of a repo's COMMIT ledger entries keyed by sha — the dev_commits
+    merge. Pure host-file reads (the page read stays structurally no-start)."""
+    d = REVIEWS_DIR / repo
+    if not d.is_dir():
+        return {}
+    out: dict[str, dict] = {}
+    for f in d.glob("commit-*.json"):
+        sha = f.stem[len("commit-"):]
+        if not sha:
+            continue
+        try:
+            data = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(data, dict):
+            out[sha] = data
     return out

@@ -1288,6 +1288,10 @@ body {
     display: flex;
     flex-direction: column;
     gap: 6px;
+    /* Fetch page cards fill the host view: undo the base .card 540px cap
+       (which the vault/login cards keep). */
+    max-width: none;
+    min-width: 0;
 }
 .dev-repo-head { display: flex; align-items: center; gap: 10px; }
 .dev-repo-name { font-weight: 600; }
@@ -1324,6 +1328,23 @@ body {
     font-size: 13px;
 }
 .dev-commits-note { margin-top: 2px; }
+/* Review verdict panel: the model's summary/findings in a darker inset box
+   (--bg-input is the darkest surface — the .mgmt-card pre precedent). The
+   42px indent matches .dev-commits-panel. */
+.dev-verdict-panel {
+    margin-left: 42px;
+    padding: 8px 10px;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;   /* the Re-review button keeps its natural size */
+    gap: 4px;
+    font-size: 13px;
+}
+.dev-verdict-summary { color: var(--fg-base); }
+.dev-verdict-finding { color: var(--fg-muted); }
 /* Dev preset: the MCP picker is locked (a dev box's bridge has no mcp-proxy
    path); pointer-events off so the disabled checkboxes read as inert. */
 .config-mcp-picker.disabled { opacity: 0.45; pointer-events: none; }

@@ -1803,9 +1803,12 @@ def cmd_dev_reviewer_login(_args: argparse.Namespace) -> None:
 
 
 def cmd_dev_review(args: argparse.Namespace) -> None:
-    req = _build(rscore.ReviewRequest, repo=args.repo, pr=args.pr)
+    req = _build(rscore.ReviewRequest, repo=args.repo, pr=args.pr,
+                 commit=args.commit)
     res = _call(rscore.review_pr, req)
-    print(f"review of {res['repo']}#{res['pr']}: {res['status']}"
+    target = (f"{res['repo']}@{res['commit'][:9]}" if res.get("commit")
+              else f"{res['repo']}#{res['pr']}")
+    print(f"review of {target}: {res['status']}"
           + (f" (risk: {res['risk']})" if res.get("risk") else ""))
     if res.get("summary"):
         print(f"  {res['summary']}")
@@ -2398,10 +2401,14 @@ def build_parser() -> argparse.ArgumentParser:
     dvrl2.set_defaults(func=cmd_dev_reviewer_login)
     dvrv = dv_sub.add_parser(
         "review",
-        help="review a PR in the ephemeral sandboxed reviewer (advisory; "
-             "verdict -> host ledger + the Development page)")
+        help="review a PR or a single commit in the ephemeral sandboxed "
+             "reviewer (advisory; verdict -> host ledger + the Development "
+             "page)")
     dvrv.add_argument("repo", help="dev repo NAME (reviews its ACTIVE consumer fork)")
-    dvrv.add_argument("--pr", required=True, type=int, help="PR number to review")
+    dvrv.add_argument("--pr", type=int, help="PR number to review")
+    dvrv.add_argument("--commit",
+                      help="full commit sha to review (exactly one of "
+                           "--pr/--commit)")
     dvrv.set_defaults(func=cmd_dev_review)
 
     ag = sub.add_parser("agent",
