@@ -10,7 +10,7 @@
 # REPO_DIR/PROMPT_FILE resolve from env (the rs-repo-watch launcher sets them),
 # and the external-CI comment plumbing is dropped (no CI account here).
 #
-# Usage (normally via `rs-repo-watch`, which resolves env + detaches a window):
+# Usage (normally via `rs-repo-watch`, which resolves the env and runs this):
 #   /opt/dev/repo-watch.sh              # poll every 10s (default)
 #   POLL_INTERVAL=60 /opt/dev/repo-watch.sh
 #
@@ -23,8 +23,8 @@
 #   - Claude Code installed and authenticated (`claude` must work)
 #   - GITEA_URL, GITEA_TOKEN, GITEA_USER, REPO_NAME set (launcher/entrypoint)
 #
-# This script blocks the terminal. rs-repo-watch runs it in a detached byobu
-# window; attach to it to watch activity.
+# This script blocks the terminal, and rs-repo-watch runs it in the foreground —
+# Ctrl+C stops it, `rs-repo-watch &` backgrounds it.
 
 set -euo pipefail
 

@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # rs-repo-watch — manual post-auth launcher for the dev repo-watch loop.
 #
-# Launches /opt/dev/repo-watch.sh DETACHED into a byobu window named
-# "repo-watch". Deliberately never entrypoint-started: dev surfaces boot
-# credential-less, and repo-watch needs a logged-in `claude` — run `claude`
-# and complete /login first, then start this.
+# Runs /opt/dev/repo-watch.sh in THIS terminal — it blocks until you stop it.
+# Background it yourself with `&` if you want the shell back. Deliberately never
+# entrypoint-started: dev surfaces boot credential-less, and repo-watch needs a
+# logged-in `claude` — run `claude` and complete /login first, then start this.
+#
+# One watcher at a time: a lock file is created at start and removed on exit.
+# Two watchers would both poll the same issues and both drive the agent. The
+# lock lives on tmpfs (/dev/shm), so a container restart clears it — after a
+# restart nothing is running, so nothing should be locked.
 #
 # Wiring resolution:
 #   - dev BOX: GITEA_URL/TOKEN/USER + REPO_NAME arrive as container env — used
@@ -16,8 +21,8 @@
 #     several attached repos, name one: rs-repo-watch <repo>.
 #
 # Usage: rs-repo-watch [repo]
-#   Watch it:  byobu attach  (then switch to the repo-watch window)
-#   Stop it:   byobu kill-window -t repo-watch   (or Ctrl+C inside the window)
+#   Stop it:   Ctrl+C
+#   Background it: rs-repo-watch &
 
 set -euo pipefail
 
@@ -78,21 +83,31 @@ if [[ ! -d "${REPO_DIR}/.git" ]]; then
     exit 1
 fi
 
-if byobu list-windows -a -F '#{window_name}' 2>/dev/null | grep -qx repo-watch; then
-    echo "rs-repo-watch: a repo-watch window is already running" \
-         "(byobu attach to view; byobu kill-window -t repo-watch to stop)" >&2
+# tmpfs, not $HOME: /dev/shm is cleared on every container restart, so a
+# leftover lock never outlives the watcher that made it (a container stop ends
+# in SIGKILL, which runs no trap — a $HOME lock would then survive into the
+# next boot and refuse forever).
+LOCK="/dev/shm/repo-watch.lock"
+if [[ -e "$LOCK" ]]; then
+    echo "rs-repo-watch: a watcher is already running here (lock: $LOCK)." \
+         "If it is not — a crash, not a restart — delete that file and retry." >&2
     exit 1
 fi
+touch "$LOCK"
+# EXIT covers normal exit; HUP/INT/TERM are the routine ways a foreground
+# blocking command ends (ssh drop, Ctrl+C, `research project stop`) and do NOT
+# fire an EXIT trap on their own. rm -f is idempotent, so a double fire is safe.
+trap 'rm -f "$LOCK"' EXIT HUP INT TERM
 
-# tmux/byobu -e threads the wiring into the window's environment without a
-# temp file (tmux >= 3.2 for new-session -e; trixie carries 3.5).
-ENV_ARGS=(-e "GITEA_URL=${GITEA_URL}" -e "GITEA_TOKEN=${GITEA_TOKEN}"
-          -e "GITEA_USER=${GITEA_USER}" -e "REPO_NAME=${REPO_NAME}"
-          -e "REPO_DIR=${REPO_DIR}")
-if byobu list-sessions >/dev/null 2>&1; then
-    byobu new-window -d -n repo-watch "${ENV_ARGS[@]}" "$WATCH"
-else
-    byobu new-session -d -s repo-watch -n repo-watch "${ENV_ARGS[@]}" "$WATCH"
-fi
-echo "rs-repo-watch: started for ${GITEA_USER}/${REPO_NAME} (detached byobu" \
-     "window 'repo-watch'; byobu attach to view)"
+# repo-watch.sh reads its wiring from the environment, so every var it
+# dereferences must be EXPORTED, not just set: it runs under `set -u` and
+# derefs GITEA_URL/GITEA_USER at startup, so a missed export is an
+# "unbound variable" death. On the supervisor path these are plain locals,
+# and REPO_DIR is a plain assignment on both paths.
+export GITEA_URL GITEA_TOKEN GITEA_USER REPO_NAME REPO_DIR
+
+# Run as a CHILD, not exec: exec would clear the EXIT trap above and leak the
+# lock. Ctrl+C reaches the child anyway — it is in this foreground process
+# group — and the trap then removes the lock.
+echo "rs-repo-watch: watching ${GITEA_USER}/${REPO_NAME} (Ctrl+C to stop)"
+"$WATCH"
