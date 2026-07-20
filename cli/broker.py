@@ -617,9 +617,11 @@ DEV_TARGET_WEBUI_FIELDS = frozenset({"repo"})
 DEV_ACTIVE_FORK_WEBUI_FIELDS = frozenset({"repo", "user"})
 # The per-row commit dropdown read (lazy, click-triggered): a repo name + ONE
 # of pr/branch (exactly-one enforced in from_kwargs, which also normalizes
-# ""-vs-absent — a webui query miss must not read as a phantom field). None is
-# host-shaped; the branch name is URL-quoted at the gitea client.
-DEV_COMMITS_WEBUI_FIELDS = frozenset({"repo", "pr", "branch"})
+# ""-vs-absent — a webui query miss must not read as a phantom field) + the
+# 1-based `page` the dropdown's "show more" walks. None is host-shaped: the
+# branch name is URL-quoted at the gitea client, and `page` reaches only a
+# gitea query string as a from_kwargs-validated positive int.
+DEV_COMMITS_WEBUI_FIELDS = frozenset({"repo", "pr", "branch", "page"})
 # The dev lane's input boundaries (webui-first B; the lane keeps its dev-box
 # mechanism names while carrying BOTH dev provision verbs — see
 # _DEV_LANE_VERBS). Consumed by the dispatch dev-lane branch + the _verb_*

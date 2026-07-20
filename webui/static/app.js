@@ -1833,20 +1833,31 @@ function devCopyBtn(cmd) {
     return b;
 }
 
-// Lazy per-row commit dropdown (the unified commit page): ▸ expands a PR's
-// commits or a branch's latest few, OLDEST-FIRST — the rs-fetch WALK order —
-// each with a copy button for `rs-fetch <repo> <locator> --commit <sha>` and
-// per-commit review affordances (Review / reviewed-badge / Retry, fed by the
-// dev_commits result's sha-keyed ledger entries). view/body are threaded in
-// for devReviewDialog (status-redirect routing + the onDone re-render);
-// `rerender`/`onLogin` (optional) ride through to it — the close landing and
-// the view-rooted 401 landing respectively (absent ⇒ the Fetch-tab default /
-// the Management landing; see devReviewDialog for why they differ).
-// Fetched on first expand only (the broker read is click-triggered by design;
-// the page read must never fan out per-row), cached per row. Commit subjects
-// are AGENT OUTPUT → text nodes only (the verdict-string rule). Transport
-// failures (unreachable/503/unparseable) and verb refusals (200 + ok:false)
-// render DIFFERENT texts — never collapse the split.
+// Lazy per-row commit dropdown (the unified commit page): ▸ expands one PAGE
+// of a PR's or a branch's commits, NEWEST-FIRST — newest at the top, oldest at
+// the bottom, so the rs-fetch WALK runs BOTTOM-UP — each with a copy button for
+// `rs-fetch <repo> <locator> --commit <sha>` and per-commit review affordances
+// (Review / reviewed-badge / Retry, fed by the dev_commits result's sha-keyed
+// ledger entries). view/body are threaded in for devReviewDialog
+// (status-redirect routing + the onDone re-render); `rerender`/`onLogin`
+// (optional) ride through to it — the close landing and the view-rooted 401
+// landing respectively (absent ⇒ the Fetch-tab default / the Management
+// landing; see devReviewDialog for why they differ).
+//
+// The broker read stays click-triggered by design — the page read must never
+// fan out per-row — but it is now ONE PAGE PER EXPLICIT CLICK, not once per
+// expander: the first expand loads page 1 and "Show older commits" appends the
+// next page below. Three PERSISTENT regions, created once and never rebuilt:
+// rows (append-only — a failed load must never destroy loaded rows), a status
+// foot (the button / message, cleared per load), and the walk note (shown once
+// when the first rows land, so it cannot stack per page).
+//
+// Commit subjects are AGENT OUTPUT → text nodes only (the verdict-string
+// rule). THREE failure texts, never collapsed: transport
+// (unreachable/503/unparseable), verb refusal (200 + ok:false), and gitea-down
+// (200 + ok:true + running:false — an empty list from a stopped gitea is
+// otherwise indistinguishable from the end of the history). All three are
+// RECOVERABLE: they leave the rows alone and offer a Retry for the same page.
 function devCommitsExpander(view, body, repo, sel, rerender, onLogin) {
     const btn = el("button", {
         class: "btn-small dev-commits-btn",
@@ -1854,54 +1865,60 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin) {
     }, ["▸"]);
     const panel = el("div", { class: "dev-commits-panel" });
     panel.style.display = "none";
-    let loaded = false;
+    const rowsEl = el("div", { class: "dev-commits-rows" });
+    const footEl = el("div", { class: "dev-commits-foot" });
+    const noteEl = el("div", { class: "dev-pr-meta dev-commits-note" }, [
+        "Newest first — the oldest commit is at the bottom. Fetching bottom-up "
+        + "stages one commit (+ its message) per step; skipping ahead stages "
+        + "everything below it as one squash with the messages concatenated.",
+    ]);
+    noteEl.style.display = "none";
+    panel.appendChild(rowsEl);
+    panel.appendChild(footEl);
+    panel.appendChild(noteEl);
+
+    // `page` is the highest page RENDERED (0 = nothing yet) and doubles as the
+    // first-load guard: a failed page-N>1 load must not make a re-expand
+    // re-fetch page 1 and duplicate the rows already on screen. Recovery from
+    // a failed page comes from the Retry button instead.
+    let page = 0;
     let open = false;
-    btn.onclick = async () => {
-        open = !open;
-        btn.textContent = open ? "▾" : "▸";
-        panel.style.display = open ? "" : "none";
-        if (!open || loaded) return;
-        loaded = true;
-        panel.appendChild(el("div", { class: "dev-pr-meta" }, ["Loading commits…"]));
-        const locator = sel.pr != null
-            ? `pr=${encodeURIComponent(sel.pr)}`
-            : `branch=${encodeURIComponent(sel.branch)}`;
-        let res, data;
-        try {
-            res = await fetch(`/broker/dev/commits?repo=${encodeURIComponent(repo)}&${locator}`);
-            data = await res.json();
-        } catch (e) {
-            panel.innerHTML = "";
-            panel.appendChild(el("div", { class: "dev-pr-meta" },
-                ["The broker isn't reachable — is it running?"]));
-            loaded = false;                 // transport error: allow a retry
-            return;
-        }
-        panel.innerHTML = "";
-        if (res.status === 503) {
-            panel.appendChild(el("div", { class: "dev-pr-meta" },
-                ["The broker isn't reachable — is it running?"]));
-            loaded = false;
-            return;
-        }
-        if (!res.ok || !data.ok || !data.result) {
-            // The broker ANSWERED and the verb refused — show the real reason.
-            panel.appendChild(el("div", { class: "dev-pr-meta" },
-                [mgmtErrText(data) || "Could not load commits."]));
-            loaded = false;
-            return;
-        }
-        const commits = Array.isArray(data.result.commits)
-            ? data.result.commits : [];
-        const cmdFor = (sha) => sel.pr != null
-            ? `rs-fetch ${repo} --pr ${sel.pr} --commit ${sha}`
-            : `rs-fetch ${repo} --branch ${sel.branch} --commit ${sha}`;
-        // Per-commit review verdicts: ledger entries keyed by FULL sha. All
-        // verdict strings are MODEL OUTPUT → text nodes only. No stale
-        // marker — a commit is immutable.
-        const reviews = (data.result.reviews
-                         && typeof data.result.reviews === "object")
-            ? data.result.reviews : {};
+    let inFlight = false;
+
+    const cmdFor = (sha) => sel.pr != null
+        ? `rs-fetch ${repo} --pr ${sel.pr} --commit ${sha}`
+        : `rs-fetch ${repo} --branch ${sel.branch} --commit ${sha}`;
+
+    const foot = (nodes) => {
+        footEl.innerHTML = "";
+        for (const n of nodes) footEl.appendChild(n);
+        // An empty foot is display:none so the panel's inter-region gap does
+        // not leave a stray band under the last row.
+        footEl.style.display = nodes.length ? "" : "none";
+    };
+    const meta = (text) => el("div", { class: "dev-pr-meta" }, [text]);
+    // Every failure arm lands here: rows are NEVER touched (a transport blip on
+    // the page-4 click must not erase pages 1-3), and the same page stays
+    // retryable — gitea coming back up, or the broker restarting, is an
+    // ordinary transient, not a terminal state for this panel.
+    const fail = (text, next) => {
+        const retry = el("button", { class: "btn-small" }, ["Retry"]);
+        retry.onclick = () => load(next);
+        foot([meta(text), retry]);
+    };
+    const moreBtn = (next) => {
+        // No count in the label: the page size lives in gitea.COMMITS_PAGE_SIZE
+        // and a number here would be a silent lockstep to drift.
+        const b = el("button", { class: "btn-small dev-commits-more" },
+                     ["Show older commits"]);
+        b.onclick = () => load(next);
+        return b;
+    };
+
+    // Append one page's rows. Per-commit review verdicts: ledger entries keyed
+    // by FULL sha. All verdict strings are MODEL OUTPUT → text nodes only. No
+    // stale marker — a commit is immutable.
+    const renderRows = (commits, reviews) => {
         for (const c of commits) {
             if (!c || typeof c !== "object" || !c.sha) continue;
             const cells = [
@@ -1912,14 +1929,14 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin) {
             ];
             const v = reviews[c.sha];
             const reviewBtn = (label) => {
-                const btn = el("button", { class: "btn-small dev-review-btn" },
-                               [label]);
-                btn.onclick = () => {
-                    btn.disabled = true;
+                const rbtn = el("button", { class: "btn-small dev-review-btn" },
+                                [label]);
+                rbtn.onclick = () => {
+                    rbtn.disabled = true;
                     devReviewDialog(view, body, repo, { commit: c.sha },
                                     rerender, onLogin);
                 };
-                return btn;
+                return rbtn;
             };
             let vpanel = null;
             if (!v) {
@@ -1959,26 +1976,79 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin) {
                                + (v.reason ? `: ${v.reason}` : "")]));
                 cells.push(reviewBtn("Retry"));
             }
-            panel.appendChild(el("div", { class: "dev-commit-row" }, cells));
-            if (vpanel) panel.appendChild(vpanel);
+            rowsEl.appendChild(el("div", { class: "dev-commit-row" }, cells));
+            if (vpanel) rowsEl.appendChild(vpanel);
         }
-        if (!commits.length) {
-            panel.appendChild(el("div", { class: "dev-pr-meta" }, ["No commits."]));
+    };
+
+    async function load(next) {
+        if (inFlight) return;
+        inFlight = true;
+        foot([meta("Loading commits…")]);
+        const locator = sel.pr != null
+            ? `pr=${encodeURIComponent(sel.pr)}`
+            : `branch=${encodeURIComponent(sel.branch)}`;
+        let res, data;
+        try {
+            res = await fetch(`/broker/dev/commits?repo=${encodeURIComponent(repo)}`
+                              + `&${locator}&page=${encodeURIComponent(next)}`);
+            data = await res.json();
+        } catch (e) {
+            inFlight = false;
+            fail("The broker isn't reachable — is it running?", next);
             return;
         }
-        if (data.result.truncated) {
-            panel.appendChild(el("div", { class: "dev-pr-meta" },
-                [`(list truncated at ${commits.length} — older commits exist)`]));
+        inFlight = false;
+        if (res.status === 503) {
+            fail("The broker isn't reachable — is it running?", next);
+            return;
         }
-        // The walk contract, stated where the buttons are. (Message-vs-content
-        // consistency is guaranteed for a PURE top-down walk; after a skip
-        // landing or local touch-ups a later step's message may over-quote
-        // already-landed commits — the staged CONTENT stays correct.)
-        panel.appendChild(el("div", { class: "dev-pr-meta dev-commits-note" }, [
-            "Oldest first: fetching top-down stages one commit (+ its message) "
-            + "per step; skipping ahead stages everything above it as one "
-            + "squash with the messages concatenated.",
-        ]));
+        if (!res.ok || !data.ok || !data.result) {
+            // The broker ANSWERED and the verb refused — show the real reason.
+            fail(mgmtErrText(data) || "Could not load commits.", next);
+            return;
+        }
+        // Only past that guard is data.result guaranteed non-null — reading
+        // `running` above it would throw on exactly the verb-refusal path.
+        if (data.result.running === false) {
+            fail("Gitea isn't running — start it from Management → "
+                 + "Infrastructure, then retry.", next);
+            return;
+        }
+        // The cursor echo is a GUARD, not decoration: a broker running older
+        // code filters the unknown `page` field out silently (no error at any
+        // layer) and serves page 1 for every click — appending that would
+        // duplicate rows already on screen, with matching shas and no way to
+        // tell. Refuse to append anything we did not ask for.
+        if (data.result.page !== next) {
+            fail("The broker served a different page than requested — it looks "
+                 + "out of date. Nothing was added.", next);
+            return;
+        }
+        const commits = Array.isArray(data.result.commits)
+            ? data.result.commits : [];
+        const reviews = (data.result.reviews
+                         && typeof data.result.reviews === "object")
+            ? data.result.reviews : {};
+        if (!commits.length) {
+            // has_more is "a FULL page came back", so a history that is an
+            // exact multiple of the page size offers one button that fetches
+            // an empty page. That is ordinary, not an error — and on page 1 it
+            // means the fork genuinely has no commits.
+            foot([meta(next === 1 ? "No commits." : "No older commits.")]);
+            return;
+        }
+        renderRows(commits, reviews);
+        page = next;
+        noteEl.style.display = "";
+        foot(data.result.has_more ? [moreBtn(next + 1)] : []);
+    }
+
+    btn.onclick = () => {
+        open = !open;
+        btn.textContent = open ? "▾" : "▸";
+        panel.style.display = open ? "" : "none";
+        if (open && page === 0) load(1);
     };
     return { btn, panel };
 }

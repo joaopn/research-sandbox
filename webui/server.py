@@ -1025,14 +1025,16 @@ async def broker_dev_sync_handler(request: web.Request) -> web.Response:
 
 
 async def broker_dev_commits_handler(request: web.Request) -> web.Response:
-    """GET /broker/dev/commits?repo=<r>&(pr=<n>|branch=<name>) — the Fetch
-    tab's lazy per-row commit list, relayed to the token-gated dev_commits
-    verb. A READ (no origin check — GETs mutate nothing; the session gate is
-    _relay's). ALL THREE keys are forwarded when present — the hand-picked
-    args here are the fourth link of the field lockstep (request field ↔
-    DEV_COMMITS_WEBUI_FIELDS ↔ this dict ↔ the app.js query); a key missing
-    HERE is dropped silently with no error at any layer. Absent params stay
-    absent (from_kwargs also treats "" as unset, belt and braces)."""
+    """GET /broker/dev/commits?repo=<r>&(pr=<n>|branch=<name>)[&page=<n>] — one
+    PAGE of the Fetch tab's lazy per-row commit list, relayed to the
+    token-gated dev_commits verb. A READ (no origin check — GETs mutate
+    nothing; the session gate is _relay's). ALL FOUR keys are forwarded when
+    present — the hand-picked args here are the fourth link of the field
+    lockstep (request field ↔ DEV_COMMITS_WEBUI_FIELDS ↔ this dict ↔ the app.js
+    query); a key missing HERE is dropped silently with no error at any layer,
+    which for `page` would silently pin every "show more" click to page 1.
+    Absent params stay absent (from_kwargs also treats "" as unset, belt and
+    braces)."""
     args: dict = {"repo": request.query.get("repo")}
     pr = request.query.get("pr")
     if pr:
@@ -1040,6 +1042,9 @@ async def broker_dev_commits_handler(request: web.Request) -> web.Response:
     branch = request.query.get("branch")
     if branch:
         args["branch"] = branch
+    page = request.query.get("page")
+    if page:
+        args["page"] = page
     status, reply = await _relay(request, "dev_commits", args)
     return web.json_response(reply, status=status)
 

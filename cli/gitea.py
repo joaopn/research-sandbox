@@ -118,18 +118,14 @@ STATUS_TIMEOUT_S = 5
 # false-fails; at 300s a wedged fork would hold the caller 5 min.
 FORK_WAIT_TRIES = 30
 
-# Commit-list bounds for the Development page's lazy per-row dropdowns.
-# PR_COMMITS_LIMIT sits AT gitea's server-side list clamp (api.MAX_RESPONSE_ITEMS,
-# default 50): a larger value would be silently clamped server-side and the
-# truncation flag below could never fire, so the limit is pinned to the clamp
-# and truncation keys on len(rows) >= limit (loud in the result, not a print —
-# the consumer is the browser, not the broker's stdout).
-PR_COMMITS_LIMIT = 50
-# Branch rows show the LATEST few commits (PI-specified display count): a
-# branch is unbounded history, unlike a PR's finite commit set, and 5 keeps
-# the "recent work at a glance" read scannable. Older commits stay reachable
-# by walking (each landed step surfaces the next) or via the gitea UI.
-BRANCH_COMMITS_LIMIT = 5
+# Page size for the Development page's lazy per-row commit dropdowns (PR rows
+# and branch rows alike — the dropdown pages, it does not clamp). The browser
+# walks older history by asking for page 2, 3, … so this is a PAGE size, never
+# a display ceiling. It MUST stay <= gitea's server-side list clamp
+# (api.MAX_RESPONSE_ITEMS, default 50): a larger value is silently clamped
+# server-side, which would make a full page look short and under-report the
+# has-more flag below (which keys on len(rows) >= limit).
+COMMITS_PAGE_SIZE = 5
 
 # Repo FEATURES (gitea "units") on the two dev-lane repo kinds. Gitea's built-in
 # DefaultForkRepoUnits is code+pulls ONLY, so a fresh fork ships with NO issue
@@ -835,10 +831,11 @@ def _require_active_fork(host_port: str, repo: str) -> str:
 
 
 def _commit_rows(raw: Any, limit: int) -> tuple[list[dict], bool]:
-    """Field-picked commit rows, normalized OLDEST-FIRST — both gitea commit
-    endpoints return newest-first, and the dropdown renders fetch-WALK order.
-    Picked by NAME so nothing unexpected can enter the result. Truncation is
-    measured BEFORE the reverse, against the page gitea actually returned."""
+    """Field-picked commit rows, NEWEST-FIRST as displayed — gitea's own order,
+    kept (the dropdown renders newest at the top and pages older downward, so
+    the fetch WALK runs bottom-up). Picked by NAME so nothing unexpected can
+    enter the result. has_more means a FULL page came back, so another page may
+    exist — measured against the page gitea actually returned."""
     rows = []
     for c in raw if isinstance(raw, list) else []:
         if not isinstance(c, dict):
@@ -850,9 +847,8 @@ def _commit_rows(raw: Any, limit: int) -> tuple[list[dict], bool]:
                      "date": ((commit.get("committer") or {}).get("date")
                               or (commit.get("author") or {}).get("date")
                               or "")})
-    truncated = len(rows) >= limit
-    rows.reverse()
-    return rows, truncated
+    has_more = len(rows) >= limit
+    return rows, has_more
 
 
 # Both commit endpoints compute per-commit diffstats by default; the dropdown
@@ -861,30 +857,33 @@ def _commit_rows(raw: Any, limit: int) -> tuple[list[dict], bool]:
 _COMMITS_QS = "stat=false&verification=false&files=false"
 
 
-def pr_commits(host_port: str, repo: str, pr: int) -> tuple[list[dict], bool]:
-    """A PR's commits on the ACTIVE fork: (rows oldest-first, truncated)."""
+def pr_commits(host_port: str, repo: str, pr: int,
+               page: int = 1) -> tuple[list[dict], bool]:
+    """One PAGE of a PR's commits on the ACTIVE fork, newest-first:
+    (rows, has_more). `page` is 1-based; a page past the end returns []."""
     active = _require_active_fork(host_port, repo)
     client = GiteaClient(api_base(host_port), read_admin_token())
     raw = client._api(
         "GET", f"/repos/{active}/{repo}/pulls/{pr}/commits"
-               f"?limit={PR_COMMITS_LIMIT}&{_COMMITS_QS}") or []
-    return _commit_rows(raw, PR_COMMITS_LIMIT)
+               f"?page={page}&limit={COMMITS_PAGE_SIZE}&{_COMMITS_QS}") or []
+    return _commit_rows(raw, COMMITS_PAGE_SIZE)
 
 
-def branch_commits(host_port: str, repo: str,
-                   branch: str) -> tuple[list[dict], bool]:
-    """A branch's LATEST commits on the ACTIVE fork: (rows oldest-first,
-    truncated). The branch name is the first client-supplied FREE-TEXT value
-    to reach this client's URL builder (every other path piece is
-    regex-validated or gitea-sourced), so it is URL-quoted — `&`/`#`/`?` are
-    all legal in git ref names and would otherwise corrupt the query."""
+def branch_commits(host_port: str, repo: str, branch: str,
+                   page: int = 1) -> tuple[list[dict], bool]:
+    """One PAGE of a branch's commits on the ACTIVE fork, newest-first:
+    (rows, has_more). `page` is 1-based; a page past the end returns [].
+    The branch name is the first client-supplied FREE-TEXT value to reach this
+    client's URL builder (every other path piece is regex-validated or
+    gitea-sourced), so it is URL-quoted — `&`/`#`/`?` are all legal in git ref
+    names and would otherwise corrupt the query."""
     active = _require_active_fork(host_port, repo)
     client = GiteaClient(api_base(host_port), read_admin_token())
     raw = client._api(
         "GET", f"/repos/{active}/{repo}/commits"
                f"?sha={urllib.parse.quote(branch, safe='')}"
-               f"&limit={BRANCH_COMMITS_LIMIT}&{_COMMITS_QS}") or []
-    return _commit_rows(raw, BRANCH_COMMITS_LIMIT)
+               f"&page={page}&limit={COMMITS_PAGE_SIZE}&{_COMMITS_QS}") or []
+    return _commit_rows(raw, COMMITS_PAGE_SIZE)
 
 
 # --- attachment record ------------------------------------------------------

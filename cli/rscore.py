@@ -1383,10 +1383,14 @@ class DevCommitsRequest:
     locator: ``pr`` (int) or ``branch``. Empty-string and absent are the SAME
     unset (the webui PR expander sends no ``branch`` key while a query-string
     miss can arrive as ``""`` — a phantom empty field must not kill a
-    legitimate click)."""
+    legitimate click). ``page`` is the 1-based commit page the dropdown's
+    "show more" walks; absent/"" is page 1. Deliberately UNCAPPED — a page past
+    the end returns an empty list from gitea, which the browser renders as
+    "no older commits", so a ceiling would be a magic number buying nothing."""
     repo: str
     pr: int | None
     branch: str
+    page: int
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "DevCommitsRequest":
@@ -1416,7 +1420,16 @@ class DevCommitsRequest:
         if (pr is None) == (branch == ""):
             raise ValidationError(
                 "exactly one of pr and branch is required")
-        return cls(repo=repo, pr=pr, branch=branch)
+        page = kw.get("page")
+        if page in (None, ""):
+            page = 1
+        else:
+            if isinstance(page, str) and page.isdigit():
+                page = int(page)
+            if not isinstance(page, int) or isinstance(page, bool) or page <= 0:
+                raise ValidationError(
+                    f"page must be a positive integer, got {page!r}")
+        return cls(repo=repo, pr=pr, branch=branch, page=page)
 
 
 @dataclass(frozen=True)
@@ -1654,8 +1667,12 @@ class DevSetActiveForkResult:
 @dataclass
 class DevCommitsResult:
     repo: str
-    commits: list[dict]              # [{sha, subject, date}] OLDEST-first
-    truncated: bool                  # gitea page clamp hit — render it loud
+    commits: list[dict]              # [{sha, subject, date}] NEWEST-first
+    has_more: bool                   # a FULL page came back — another may exist
+    page: int                        # the page these rows ARE (cursor echo)
+    running: bool                    # gitea up? a stopped one returns 200+[] —
+                                     # without this the browser cannot tell an
+                                     # empty page from the end of history
     reviews: dict                    # {sha: commit ledger entry} — badge data
 
 
@@ -8309,29 +8326,37 @@ def dev_set_active_fork(req: "DevSetActiveForkRequest", _progress=None) -> DevSe
 
 
 def dev_commits(req: "DevCommitsRequest", _progress=None) -> DevCommitsResult:  # type: ignore[name-defined]
-    """One PR's or one branch's commits, oldest-first, for the Development
-    page's lazy per-row dropdowns. A READ — the dev_status/dev_repo_list
-    posture: NEVER starts gitea on any path (no _provision_gitea, no
-    _resume_gitea; a stopped/absent gitea returns empty immediately). The
-    try encloses the ENTIRE gitea chain deliberately: read_admin_token()
-    raises GiteaError on an un-bootstrapped lane, and an escaped GiteaError
-    would leave the broker reply truncated with no envelope."""
+    """ONE PAGE of a PR's or a branch's commits, newest-first, for the
+    Development page's lazy per-row dropdowns. A READ — the
+    dev_status/dev_repo_list posture: NEVER starts gitea on any path (no
+    _provision_gitea, no _resume_gitea; a stopped/absent gitea returns empty
+    immediately). The try encloses the ENTIRE gitea chain deliberately:
+    read_admin_token() raises GiteaError on an un-bootstrapped lane, and an
+    escaped GiteaError would leave the broker reply truncated with no envelope.
+
+    `running` is load-bearing for the browser's honesty: a stopped gitea
+    returns an empty list inside a normal ok:true envelope, which is
+    indistinguishable from "you have reached the end of the history" — and the
+    dropdown asserts one of those to the operator. It is free here (the
+    no-start guard already performs exactly this check)."""
     if not container_running(gitea.GITEA_CONTAINER):
-        return DevCommitsResult(repo=req.repo, commits=[], truncated=False,
-                                reviews={})
+        return DevCommitsResult(repo=req.repo, commits=[], has_more=False,
+                                page=req.page, running=False, reviews={})
     try:
         if req.pr is not None:
-            commits, truncated = gitea.pr_commits(
-                _gitea_host_port(), req.repo, req.pr)
+            commits, has_more = gitea.pr_commits(
+                _gitea_host_port(), req.repo, req.pr, req.page)
         else:
-            commits, truncated = gitea.branch_commits(
-                _gitea_host_port(), req.repo, req.branch)
+            commits, has_more = gitea.branch_commits(
+                _gitea_host_port(), req.repo, req.branch, req.page)
     except gitea.GiteaError as e:
         raise ValidationError(str(e))
     # Per-commit review verdicts for the rows' badges: a pure host-file ledger
     # read (the dev_status precedent), so the read stays structurally no-start.
+    # The ledger is the repo's FULL sha-keyed map, so every page carries badge
+    # data for its own rows with no extra call.
     return DevCommitsResult(repo=req.repo, commits=commits,
-                            truncated=truncated,
+                            has_more=has_more, page=req.page, running=True,
                             reviews=gitea.load_repo_commit_verdicts(req.repo))
 
 

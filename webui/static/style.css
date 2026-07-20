@@ -1327,6 +1327,20 @@ body {
     gap: 8px;
     font-size: 13px;
 }
+/* The panel's three persistent regions (rows / status foot / walk note). The
+   rows region re-applies the column layout the panel used to give the rows
+   directly, so the per-row gap survives the wrapper; the foot lays its message
+   and its button out on one line. */
+.dev-commits-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.dev-commits-foot {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
 .dev-commits-note { margin-top: 2px; }
 /* The per-project Fetch pane (the fetch-<repo> tab): RS-rendered HTML inside
    #terminal-area, which never scrolls host content itself — the pane owns its
