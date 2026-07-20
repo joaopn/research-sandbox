@@ -715,6 +715,16 @@ def _verb_dev_status(_args: dict, _progress=None) -> dict:
     return dataclasses.asdict(rscore.dev_status(req))
 
 
+def _verb_dev_repo_status(args: dict, _progress=None) -> dict:
+    # ONE repo's Development status (the per-project Fetch tab) — the
+    # repo-scoped sibling of dev_status: same never-starts-gitea posture, one
+    # repo_status read + host-file reviews/attachments. Repo-targeted like
+    # dev_sync, so it shares DEV_TARGET_WEBUI_FIELDS.
+    safe = {k: v for k, v in args.items() if k in DEV_TARGET_WEBUI_FIELDS}
+    req = rscore.DevRepoStatusRequest.from_kwargs(**safe)  # may raise ValidationError
+    return dataclasses.asdict(rscore.dev_repo_status(req))
+
+
 def _verb_dev_gitea_start(_args: dict, progress=None) -> dict:
     # Deliberate gitea enable/provision (the Management Infrastructure button).
     # No fields. A tailed op (PROGRESS_VERBS) — thread `progress` so the one-time
@@ -766,6 +776,7 @@ VERBS = {
     "dev_detach": _verb_dev_detach,
     "dev_sync": _verb_dev_sync,
     "dev_status": _verb_dev_status,
+    "dev_repo_status": _verb_dev_repo_status,
     "dev_gitea_start": _verb_dev_gitea_start,
     "dev_passwd": _verb_dev_passwd,
     "dev_set_active_fork": _verb_dev_set_active_fork,

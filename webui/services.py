@@ -207,6 +207,32 @@ def dev_fork_service(label: str, user: str, repo: str) -> dict | None:
     }
 
 
+# A dev repo's Fetch window as a project-strip tab — one tab per DISTINCT repo
+# among the project's dev consumers (content is repo-scoped + active-fork
+# steered, so agent+box on the same repo share one tab). Distinct from every
+# other prefix (`git-`, `pi-iso-`, `box-editor-`, `port-`).
+DEV_FETCH_ID_PREFIX = "fetch-"
+
+
+def dev_fetch_service(label: str, repo: str) -> dict | None:
+    """Synthesize the per-project Fetch-tab spec for one dev repo, or None if
+    the repo is not a plain gitea name.
+
+    Carries `fetch_repo`, NEVER `origin_url`/`gitea_path`: the SPA renders
+    this pane itself from the /broker/dev/repo-status relay — no iframe, no
+    upstream, so its id never enters ORIGIN_PORTS and no session cookie is
+    minted for it. `kind` stays load-bearing for the tab dispatch."""
+    if not _DEV_FORK_NAME.match(repo or ""):
+        return None
+    return {
+        "label": label,
+        "kind": "http",
+        "always_on": False,
+        "renderer": "panel",
+        "fetch_repo": repo,
+    }
+
+
 def resolve(service_id: str) -> dict | None:
     """Static registry lookup, falling back to a synthesized PI-isolated
     spec for `pi-iso-<name>` ids. Used by the ssh handler so it can run the

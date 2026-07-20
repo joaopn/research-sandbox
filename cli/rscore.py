@@ -1312,6 +1312,20 @@ class DevStatusRequest:
 
 
 @dataclass(frozen=True)
+class DevRepoStatusRequest:
+    """ONE repo's Development status for the per-project Fetch tab (the
+    repo-scoped sibling of DevStatusRequest). Shape-validation only."""
+    repo: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "DevRepoStatusRequest":
+        repo = kw.get("repo")
+        if not _valid_dev_repo_name(repo):
+            raise ValidationError(f"invalid dev repo name: {repo!r}")
+        return cls(repo=repo)
+
+
+@dataclass(frozen=True)
 class DevGiteaStartRequest:
     @classmethod
     def from_kwargs(cls, **_kw: Any) -> "DevGiteaStartRequest":
@@ -1612,6 +1626,13 @@ class DevStatusResult:
     gitea: dict                                 # {"exists": bool, "running": bool}
     repos: list[dict]                           # gitea.repo_status rows (running only)
     attachments: list[dict]                     # [{project, repo}] (agent-class)
+
+
+@dataclass
+class DevRepoStatusResult:
+    gitea: dict                                 # {"exists": bool, "running": bool}
+    repo: dict                                  # ONE repo_status row (+reviews), {} when not running, {repo, error} degraded
+    attachments: list[dict]                     # [{project}] — this repo's consumers
 
 
 @dataclass
@@ -8222,6 +8243,32 @@ def dev_status(_req: "DevStatusRequest", _progress=None) -> DevStatusResult:  # 
                    if e.get("project") and e.get("repo")]
     return DevStatusResult(gitea={"exists": exists, "running": running},
                            repos=repos, attachments=attachments)
+
+
+def dev_repo_status(req: "DevRepoStatusRequest", _progress=None) -> DevRepoStatusResult:  # type: ignore[name-defined]
+    """ONE repo's Development status — the per-project Fetch-tab read, the
+    repo-scoped sibling of dev_status with the SAME posture: a READ that never
+    starts gitea and never waits (no _provision_gitea/_resume_gitea on any
+    path; absent/stopped -> running:false with an empty row immediately).
+    There is no enumeration here, so nothing stays page-fatal: an unknown or
+    sick repo degrades to a {repo, error} row (repo_status raises GiteaError
+    on the mirror GET's 404), which the pane renders inline (B37 posture)."""
+    exists = container_exists(gitea.GITEA_CONTAINER)
+    running = bool(exists and container_running(gitea.GITEA_CONTAINER))
+    row: dict = {}
+    if running:
+        try:
+            row = gitea.repo_status(_gitea_host_port(), req.repo)
+            # Review verdicts: pure host-file ledger reads keyed by str(pr) —
+            # no docker/network call, so the read stays structurally no-start.
+            row["reviews"] = gitea.load_repo_verdicts(req.repo)
+        except gitea.GiteaError as e:
+            row = {"repo": req.repo, "error": str(e)}
+    attachments = [{"project": e.get("project")}
+                   for e in gitea.load_attachments()
+                   if e.get("project") and e.get("repo") == req.repo]
+    return DevRepoStatusResult(gitea={"exists": exists, "running": running},
+                               repo=row, attachments=attachments)
 
 
 def dev_gitea_start(_req: "DevGiteaStartRequest", progress=None) -> DevGiteaStartResult:  # type: ignore[name-defined]

@@ -1328,6 +1328,10 @@ body {
     font-size: 13px;
 }
 .dev-commits-note { margin-top: 2px; }
+/* The per-project Fetch pane (the fetch-<repo> tab): RS-rendered HTML inside
+   #terminal-area, which never scrolls host content itself — the pane owns its
+   scrolling. */
+.dev-fetch-pane { overflow: auto; padding: 12px 16px; }
 /* Review verdict panel: the model's summary/findings in a darker inset box
    (--bg-input is the darkest surface — the .mgmt-card pre precedent). The
    42px indent matches .dev-commits-panel. */
@@ -1422,14 +1426,15 @@ html.mobile .dashboard.mobile-projects .service-tabs .active-project {
    :not() chain below IS the whitelist; extending mobile to another visual
    surface = extending that chain. The dev-fork (git-) tabs are shown: reading a
    fork's issues and PRs from the phone is the point of the dev lane's human→agent
-   channel. code-server / box editors / port-<n> stay desktop-only. Pin buttons
+   channel, and the fetch- panes are lightweight RS-rendered HTML.
+   code-server / box editors / port-<n> stay desktop-only. Pin buttons
    stay hidden (no split panes on mobile); + Add box and the per-box ✕ are
    SHOWN (dind box lifecycle from the phone; their dialogs are sheet-styled). */
 html.mobile .service-tabs { height: 52px; }
 html.mobile .service-tabs .tab { font-size: 14px; }
 html.mobile .service-tabs .tab .tab-icon svg { width: 16px; height: 16px; }
 html.mobile .service-tabs .projects-tab,
-html.mobile .service-tabs .tab[data-surface="visual"]:not([data-service="reader"]):not([data-service^="git-"]),
+html.mobile .service-tabs .tab[data-surface="visual"]:not([data-service="reader"]):not([data-service^="git-"]):not([data-service^="fetch-"]),
 html.mobile .service-tabs .pin-tab-btn,
 html.mobile .service-tabs .tab-group-divider { display: none; }
 

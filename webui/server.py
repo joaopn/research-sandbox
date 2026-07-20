@@ -1044,6 +1044,18 @@ async def broker_dev_commits_handler(request: web.Request) -> web.Response:
     return web.json_response(reply, status=status)
 
 
+async def broker_dev_repo_status_handler(request: web.Request) -> web.Response:
+    """GET /broker/dev/repo-status?repo=<name> — ONE repo's Development status
+    for the per-project Fetch tab, relayed to the token-gated dev_repo_status
+    verb (the repo-scoped sibling of /broker/dev). A READ (no origin check —
+    GETs mutate nothing; the session gate is _relay's). The single `repo` key
+    is the fourth link of the field lockstep (request field ↔
+    DEV_TARGET_WEBUI_FIELDS ↔ this dict ↔ the app.js query)."""
+    status, reply = await _relay(request, "dev_repo_status",
+                                 {"repo": request.query.get("repo")})
+    return web.json_response(reply, status=status)
+
+
 async def broker_dev_active_fork_handler(request: web.Request) -> web.Response:
     """POST /broker/dev/active-fork {repo, user} — set the repo's GLOBAL
     active fork (gated, origin-checked; the Development page's fork dropdown,
@@ -1777,6 +1789,14 @@ async def project_services_handler(request: web.Request) -> web.Response:
                 # Skip-on-None matters: the charset guard is what keeps a `/` or
                 # `:` out of a value baked into BOTH the iframe path and the id.
                 out[f"{services.DEV_FORK_ID_PREFIX}{consumer}:{repo}"] = spec
+        # One Fetch tab per DISTINCT repo among this project's dev consumers —
+        # repo-keyed BY DESIGN: the pane is repo-scoped (active-fork steered),
+        # so a project whose agent AND dev box work the same repo gets ONE tab,
+        # not two identical ones. Same probe gating as the fork tabs above.
+        for repo in dict.fromkeys(r for *_, r in fork_tabs):
+            spec = services.dev_fetch_service(f"{repo} (FETCH)", repo)
+            if spec is not None:
+                out[f"{services.DEV_FETCH_ID_PREFIX}{repo}"] = spec
 
     # Operator-registered exported ports (STAGE_EXPORTED_PORTS): one http tab per
     # registered port, NOT probe-gated (PI directive). Registering a port is an
@@ -2538,6 +2558,7 @@ def main() -> None:
     app.router.add_get("/broker/project/{name}/ports", broker_ports_handler)
     app.router.add_get("/broker/dev", broker_dev_handler)
     app.router.add_get("/broker/dev/commits", broker_dev_commits_handler)
+    app.router.add_get("/broker/dev/repo-status", broker_dev_repo_status_handler)
     app.router.add_post("/broker/dev/sync", broker_dev_sync_handler)
     app.router.add_post("/broker/dev/active-fork", broker_dev_active_fork_handler)
     app.router.add_post("/broker/dev/gitea-start", broker_dev_gitea_start_handler)

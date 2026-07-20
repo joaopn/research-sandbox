@@ -1838,13 +1838,16 @@ function devCopyBtn(cmd) {
 // each with a copy button for `rs-fetch <repo> <locator> --commit <sha>` and
 // per-commit review affordances (Review / reviewed-badge / Retry, fed by the
 // dev_commits result's sha-keyed ledger entries). view/body are threaded in
-// for devReviewDialog (status-redirect routing + the onDone re-render).
+// for devReviewDialog (status-redirect routing + the onDone re-render);
+// `rerender`/`onLogin` (optional) ride through to it — the close landing and
+// the view-rooted 401 landing respectively (absent ⇒ the Fetch-tab default /
+// the Management landing; see devReviewDialog for why they differ).
 // Fetched on first expand only (the broker read is click-triggered by design;
 // the page read must never fan out per-row), cached per row. Commit subjects
 // are AGENT OUTPUT → text nodes only (the verdict-string rule). Transport
 // failures (unreachable/503/unparseable) and verb refusals (200 + ok:false)
 // render DIFFERENT texts — never collapse the split.
-function devCommitsExpander(view, body, repo, sel) {
+function devCommitsExpander(view, body, repo, sel, rerender, onLogin) {
     const btn = el("button", {
         class: "btn-small dev-commits-btn",
         title: "show commits (fetchable one by one)",
@@ -1913,7 +1916,8 @@ function devCommitsExpander(view, body, repo, sel) {
                                [label]);
                 btn.onclick = () => {
                     btn.disabled = true;
-                    devReviewDialog(view, body, repo, { commit: c.sha });
+                    devReviewDialog(view, body, repo, { commit: c.sha },
+                                    rerender, onLogin);
                 };
                 return btn;
             };
@@ -1983,10 +1987,17 @@ function devCommitsExpander(view, body, repo, sel) {
 // POST /broker/dev/review → {op_id} → stream the op via the build-tail modal
 // (build_alive covers review ops). `sel` is the locator: {pr} reviews the
 // whole PR, {commit} a single commit (full sha). Advisory — the verdict lands
-// in the host ledger and shows as a badge/panel after the Fetch-tab re-read
-// on close.
-async function devReviewDialog(view, body, repo, sel) {
+// in the host ledger and shows as a badge/panel after the re-render on close.
+// `rerender` (optional) is the CLOSE landing (fires with view/body intact):
+// the Development page passes its Fetch-tab re-render, the per-project Fetch
+// pane passes itself. `onLogin` (optional) is the 401 POST-LOGIN landing and
+// must be VIEW-rooted — renderMgmtLogin wipes `view` (mgmtCard), detaching
+// any body-scoped target — so the scoped pane (where view === the pane
+// container) passes its own renderer and Development passes NOTHING (the
+// pre-slice Management landing). The two are deliberately distinct values.
+async function devReviewDialog(view, body, repo, sel, rerender, onLogin) {
     if (document.querySelector(".modal-backdrop")) return;
+    const onDone = rerender || (() => renderDevFetchTab(view, body));
     const title = sel.pr != null
         ? `Review ${repo} #${sel.pr}`
         : `Review ${repo} @${(sel.commit || "").slice(0, 9)}`;
@@ -2011,7 +2022,7 @@ async function devReviewDialog(view, body, repo, sel) {
         backdrop.remove();
         return renderMgmtUnavailable(body);
     }
-    const redirect = mgmtStatusRedirect(view, res.status);
+    const redirect = mgmtStatusRedirect(view, res.status, onLogin);
     if (redirect) { backdrop.remove(); return redirect(); }
     let b; try { b = await res.json(); } catch (e) { b = {}; }
     if (!b.ok || !b.op_id) {
@@ -2024,8 +2035,8 @@ async function devReviewDialog(view, body, repo, sel) {
         card.appendChild(el("div", { class: "btn-row" }, [close]));
         return;
     }
-    await mgmtTailBuildLog(view, backdrop, card, b.op_id, title,
-                           () => renderDevFetchTab(view, body));
+    await mgmtTailBuildLog(view, backdrop, card, b.op_id, title, onDone,
+                           onLogin);
 }
 
 async function renderDevFetchTab(view, body) {
@@ -2081,74 +2092,117 @@ function renderDevFetchScreen(view, body, result) {
         return;
     }
     for (const r of repos) {
-        const prs = Array.isArray(r.prs) ? r.prs : [];
-        const branches = Array.isArray(r.branches) ? r.branches : [];
         const attached = attachments.filter((a) => a.repo === r.repo)
                                     .map((a) => a.project);
-        const sync = el("button", { class: "btn-small" }, ["Sync"]);
-        sync.onclick = async () => {
-            sync.disabled = true;
-            sync.textContent = "Syncing…";
+        body.appendChild(buildDevRepoCard(view, body, r, attached, {
+            scoped: false,
+            rerender: () => renderDevFetchTab(view, body),
+        }));
+    }
+    body.appendChild(el("div", { class: "hint" }, [
+        "📋 copies the rs-fetch command — paste it in any project or box ",
+        "terminal (every container carries rs-fetch + read-only fetch access). ",
+        "rs-fetch stages the work with the agent's message prefilled and never ",
+        "commits; ▸ lists a row's commits to fetch them one by one.",
+    ]));
+}
+
+// Build ONE dev repo's card — shared by the Development Fetch tab (unscoped)
+// and the per-project Fetch pane (scoped). view/body host the review dialog's
+// redirects and error cards (the host page, or the pane container — both work:
+// every render helper takes a bare element). opts:
+//   scoped   — hide the GLOBAL affordances: Remove (destructive, Development-
+//              only) and the ≥2-fork dropdown (the Management-steered GLOBAL
+//              selector; steering from a pane would silently re-steer every
+//              consumer's rs-fetch/review reads) — the plain `fork:` badge
+//              shows instead.
+//   rerender — the re-render target after Sync / fork change / a review lands
+//              (the CLOSE landing; the 401 post-login landing is the distinct
+//              view-rooted onLogin derived below).
+function buildDevRepoCard(view, body, r, attached, opts) {
+    const scoped = !!(opts && opts.scoped);
+    const rerender = (opts && opts.rerender)
+        || (() => renderDevFetchTab(view, body));
+    // The 401 post-login landing must be VIEW-rooted: renderMgmtLogin wipes
+    // `view` (mgmtCard), which on Development DETACHES `body` — so a
+    // body-scoped rerender there would render into a dead node. The scoped
+    // pane is its own view (view === body === the pane container), so its
+    // rerender is safe; unscoped, undefined keeps the Management landing.
+    const onLogin = scoped ? rerender : undefined;
+    const prs = Array.isArray(r.prs) ? r.prs : [];
+    const branches = Array.isArray(r.branches) ? r.branches : [];
+    const sync = el("button", { class: "btn-small" }, ["Sync"]);
+    sync.onclick = async () => {
+        sync.disabled = true;
+        sync.textContent = "Syncing…";
+        try {
+            await fetch("/broker/dev/sync", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ repo: r.repo }),
+            });
+        } catch (e) { /* re-render reports the live state */ }
+        rerender();
+    };
+    // Degraded row (B37): repo_status failed for THIS repo — render its
+    // error inline (a text node: server text, house style) and keep the
+    // healthy rows around it. Sync stays (the plausible heal for a
+    // half-migrated/sick repo); the other affordances need fork state the
+    // degraded row doesn't carry.
+    if (r.error) {
+        return el("div", { class: "card dev-repo-card" }, [
+            el("div", { class: "dev-repo-head" }, [
+                el("span", { class: "dev-repo-name" }, [r.repo || ""]),
+                el("span", { class: "dev-pr-meta dev-review-failed" },
+                   [String(r.error)]),
+                sync,
+            ]),
+        ]);
+    }
+    const meta = (r.private ? "private · " : "")
+        + (r.empty
+            // The quiet empty state (B37): a zero-commit source, or a
+            // fresh consumer fork before the agent's first push.
+            ? "empty — the agent hasn't pushed yet"
+            : `${prs.length} open PR${prs.length === 1 ? "" : "s"} · `
+              + `${branches.length} branch${branches.length === 1 ? "" : "es"}`)
+        + (r.mirror_synced_at ? ` · synced ${r.mirror_synced_at}` : "");
+    // Active-fork control (per-consumer forks): a plain badge with one
+    // live fork; a dropdown at ≥2 — the Management-steered GLOBAL
+    // selector (PR list, rs-fetch and reviews all follow it). Scoped mode
+    // never shows the dropdown (badge only): a pane must not re-steer the
+    // global selector.
+    const forks = Array.isArray(r.forks) ? r.forks : [];
+    const live = forks.filter((f) => f && !f.archived && f.user);
+    let forkEl = null;
+    if (!scoped && live.length >= 2) {
+        forkEl = el("select", { class: "dev-fork-select" },
+            live.map((f) => {
+                const o = el("option", { value: f.user }, [f.user]);
+                if (f.user === r.active) o.selected = true;
+                return o;
+            }));
+        forkEl.onchange = async () => {
+            forkEl.disabled = true;
             try {
-                await fetch("/broker/dev/sync", {
+                await fetch("/broker/dev/active-fork", {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ repo: r.repo }),
+                    body: JSON.stringify({ repo: r.repo, user: forkEl.value }),
                 });
             } catch (e) { /* re-render reports the live state */ }
-            renderDevFetchTab(view, body);
+            rerender();
         };
-        // Degraded row (B37): repo_status failed for THIS repo — render its
-        // error inline (a text node: server text, house style) and keep the
-        // healthy rows around it. Sync stays (the plausible heal for a
-        // half-migrated/sick repo); the other affordances need fork state the
-        // degraded row doesn't carry.
-        if (r.error) {
-            body.appendChild(el("div", { class: "card dev-repo-card" }, [
-                el("div", { class: "dev-repo-head" }, [
-                    el("span", { class: "dev-repo-name" }, [r.repo || ""]),
-                    el("span", { class: "dev-pr-meta dev-review-failed" },
-                       [String(r.error)]),
-                    sync,
-                ]),
-            ]));
-            continue;
-        }
-        const meta = (r.private ? "private · " : "")
-            + (r.empty
-                // The quiet empty state (B37): a zero-commit source, or a
-                // fresh consumer fork before the agent's first push.
-                ? "empty — the agent hasn't pushed yet"
-                : `${prs.length} open PR${prs.length === 1 ? "" : "s"} · `
-                  + `${branches.length} branch${branches.length === 1 ? "" : "es"}`)
-            + (r.mirror_synced_at ? ` · synced ${r.mirror_synced_at}` : "");
-        // Active-fork control (per-consumer forks): a plain badge with one
-        // live fork; a dropdown at ≥2 — the Management-steered GLOBAL
-        // selector (PR list, rs-fetch and reviews all follow it).
-        const forks = Array.isArray(r.forks) ? r.forks : [];
-        const live = forks.filter((f) => f && !f.archived && f.user);
-        let forkEl = null;
-        if (live.length >= 2) {
-            forkEl = el("select", { class: "dev-fork-select" },
-                live.map((f) => {
-                    const o = el("option", { value: f.user }, [f.user]);
-                    if (f.user === r.active) o.selected = true;
-                    return o;
-                }));
-            forkEl.onchange = async () => {
-                forkEl.disabled = true;
-                try {
-                    await fetch("/broker/dev/active-fork", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ repo: r.repo, user: forkEl.value }),
-                    });
-                } catch (e) { /* re-render reports the live state */ }
-                renderDevFetchTab(view, body);
-            };
-        } else if (r.active) {
-            forkEl = el("span", { class: "dev-repo-meta" }, [`fork: ${r.active}`]);
-        }
+    } else if (r.active) {
+        forkEl = el("span", { class: "dev-repo-meta" }, [`fork: ${r.active}`]);
+    }
+    const head = [
+        el("span", { class: "dev-repo-name" }, [r.repo]),
+        el("span", { class: "dev-repo-meta" }, [meta]),
+        ...(forkEl ? [forkEl] : []),
+        sync,
+    ];
+    if (!scoped) {
         // Remove is offered only for a FINISHED repo — no live fork, nobody
         // working it. Retiring a consumer (destroying its project, removing its
         // box) archives the fork, which is what releases the repo. This disable
@@ -2167,105 +2221,164 @@ function renderDevFetchScreen(view, body, result) {
         }, ["Remove"]);
         remove.disabled = !!blocker;
         remove.onclick = () => devRepoRemoveDialog(view, body, r.repo);
-        const rows = [el("div", { class: "dev-repo-head" }, [
-            el("span", { class: "dev-repo-name" }, [r.repo]),
-            el("span", { class: "dev-repo-meta" }, [meta]),
-            ...(forkEl ? [forkEl] : []),
-            sync,
-            remove,
-        ])];
-        const reviews = (r.reviews && typeof r.reviews === "object") ? r.reviews : {};
-        for (const p of prs) {
-            const commitsUi = devCommitsExpander(view, body, r.repo,
-                                                 { pr: p.number });
-            const cells = [
-                devCopyBtn(`rs-fetch ${r.repo} --pr ${p.number}`),
-                commitsUi.btn,
-                el("span", { class: "dev-pr-id" }, [`#${p.number}`]),
-                el("span", { class: "dev-pr-title" }, [p.title || ""]),
-                el("span", { class: "dev-pr-meta" },
-                   [`[${p.head || "?"}] ${p.updated_at || ""}`]),
-            ];
-            // Review verdicts (S4): ledger entries keyed by str(pr) — JS
-            // property lookup coerces p.number across the int/str boundary.
-            // All verdict strings are MODEL OUTPUT → text nodes only.
-            const v = reviews[p.number];
-            const reviewBtn = (label) => {
-                const btn = el("button", { class: "btn-small dev-review-btn" },
-                               [label]);
-                btn.onclick = () => {
-                    btn.disabled = true;
-                    devReviewDialog(view, body, r.repo, { pr: p.number });
-                };
-                return btn;
-            };
-            let panel = null;
-            if (!v) {
-                cells.push(reviewBtn("Review"));
-            } else if (v.status === "ok") {
-                const stale = !!(v.head_sha && p.sha && v.head_sha !== p.sha);
-                const badge = el("button", {
-                    class: "btn-small dev-review-badge",
-                    title: "show the review verdict",
-                }, ["reviewed ✓" + (v.risk ? ` · ${v.risk}` : "")
-                    + (stale ? " · stale" : "")]);
-                panel = el("div", { class: "dev-verdict-panel" });
-                panel.style.display = "none";
-                panel.appendChild(el("div", { class: "dev-pr-meta" }, [
-                    `reviewed ${v.reviewed_at || ""}`
-                    + (stale ? " — the PR has new commits since this review" : ""),
-                ]));
-                if (v.summary) {
-                    panel.appendChild(el("div", { class: "dev-verdict-summary" },
-                                         [v.summary]));
-                }
-                const findings = Array.isArray(v.findings) ? v.findings : [];
-                for (const f of findings) {
-                    if (!f || typeof f !== "object") continue;
-                    panel.appendChild(el("div", { class: "dev-verdict-finding" },
-                        ["• " + (f.file ? f.file + ": " : "") + (f.note || "")]));
-                }
-                panel.appendChild(reviewBtn("Re-review"));
-                badge.onclick = () => {
-                    panel.style.display =
-                        panel.style.display === "none" ? "" : "none";
-                };
-                cells.push(badge);
-            } else {
-                cells.push(el("span", { class: "dev-pr-meta dev-review-failed" },
-                    ["review failed" + (v.reason ? `: ${v.reason}` : "")]));
-                cells.push(reviewBtn("Retry"));
-            }
-            rows.push(el("div", { class: "dev-pr-row" }, cells));
-            rows.push(commitsUi.panel);
-            if (panel) rows.push(panel);
-        }
-        if (!prs.length && !r.empty) {
-            rows.push(el("div", { class: "config-empty" }, ["No open PRs."]));
-        }
-        for (const b of branches) {
-            const commitsUi = devCommitsExpander(view, body, r.repo,
-                                                 { branch: b.name });
-            rows.push(el("div", { class: "dev-branch-row" }, [
-                devCopyBtn(`rs-fetch ${r.repo} --branch ${b.name}`),
-                commitsUi.btn,
-                el("span", { class: "dev-pr-title" }, [b.name || ""]),
-                el("span", { class: "dev-pr-meta" }, [b.committed_at || ""]),
-            ]));
-            rows.push(commitsUi.panel);
-        }
-        if (attached.length) {
-            rows.push(el("div", { class: "dev-pr-meta dev-attached" },
-                         ["worked by: " + attached.join(", ")]));
-        }
-        body.appendChild(el("div", { class: "card dev-repo-card" }, rows));
+        head.push(remove);
     }
-    body.appendChild(el("div", { class: "hint" }, [
-        "📋 copies the rs-fetch command — paste it in any project or box ",
-        "terminal (every container carries rs-fetch + read-only fetch access). ",
-        "rs-fetch stages the work with the agent's message prefilled and never ",
-        "commits; ▸ lists a row's commits to fetch them one by one.",
-    ]));
+    const rows = [el("div", { class: "dev-repo-head" }, head)];
+    const reviews = (r.reviews && typeof r.reviews === "object") ? r.reviews : {};
+    for (const p of prs) {
+        const commitsUi = devCommitsExpander(view, body, r.repo,
+                                             { pr: p.number }, rerender,
+                                             onLogin);
+        const cells = [
+            devCopyBtn(`rs-fetch ${r.repo} --pr ${p.number}`),
+            commitsUi.btn,
+            el("span", { class: "dev-pr-id" }, [`#${p.number}`]),
+            el("span", { class: "dev-pr-title" }, [p.title || ""]),
+            el("span", { class: "dev-pr-meta" },
+               [`[${p.head || "?"}] ${p.updated_at || ""}`]),
+        ];
+        // Review verdicts (S4): ledger entries keyed by str(pr) — JS
+        // property lookup coerces p.number across the int/str boundary.
+        // All verdict strings are MODEL OUTPUT → text nodes only.
+        const v = reviews[p.number];
+        const reviewBtn = (label) => {
+            const btn = el("button", { class: "btn-small dev-review-btn" },
+                           [label]);
+            btn.onclick = () => {
+                btn.disabled = true;
+                devReviewDialog(view, body, r.repo, { pr: p.number }, rerender,
+                                onLogin);
+            };
+            return btn;
+        };
+        let panel = null;
+        if (!v) {
+            cells.push(reviewBtn("Review"));
+        } else if (v.status === "ok") {
+            const stale = !!(v.head_sha && p.sha && v.head_sha !== p.sha);
+            const badge = el("button", {
+                class: "btn-small dev-review-badge",
+                title: "show the review verdict",
+            }, ["reviewed ✓" + (v.risk ? ` · ${v.risk}` : "")
+                + (stale ? " · stale" : "")]);
+            panel = el("div", { class: "dev-verdict-panel" });
+            panel.style.display = "none";
+            panel.appendChild(el("div", { class: "dev-pr-meta" }, [
+                `reviewed ${v.reviewed_at || ""}`
+                + (stale ? " — the PR has new commits since this review" : ""),
+            ]));
+            if (v.summary) {
+                panel.appendChild(el("div", { class: "dev-verdict-summary" },
+                                     [v.summary]));
+            }
+            const findings = Array.isArray(v.findings) ? v.findings : [];
+            for (const f of findings) {
+                if (!f || typeof f !== "object") continue;
+                panel.appendChild(el("div", { class: "dev-verdict-finding" },
+                    ["• " + (f.file ? f.file + ": " : "") + (f.note || "")]));
+            }
+            panel.appendChild(reviewBtn("Re-review"));
+            badge.onclick = () => {
+                panel.style.display =
+                    panel.style.display === "none" ? "" : "none";
+            };
+            cells.push(badge);
+        } else {
+            cells.push(el("span", { class: "dev-pr-meta dev-review-failed" },
+                ["review failed" + (v.reason ? `: ${v.reason}` : "")]));
+            cells.push(reviewBtn("Retry"));
+        }
+        rows.push(el("div", { class: "dev-pr-row" }, cells));
+        rows.push(commitsUi.panel);
+        if (panel) rows.push(panel);
+    }
+    if (!prs.length && !r.empty) {
+        rows.push(el("div", { class: "config-empty" }, ["No open PRs."]));
+    }
+    for (const b of branches) {
+        const commitsUi = devCommitsExpander(view, body, r.repo,
+                                             { branch: b.name }, rerender,
+                                             onLogin);
+        rows.push(el("div", { class: "dev-branch-row" }, [
+            devCopyBtn(`rs-fetch ${r.repo} --branch ${b.name}`),
+            commitsUi.btn,
+            el("span", { class: "dev-pr-title" }, [b.name || ""]),
+            el("span", { class: "dev-pr-meta" }, [b.committed_at || ""]),
+        ]));
+        rows.push(commitsUi.panel);
+    }
+    if (attached.length) {
+        rows.push(el("div", { class: "dev-pr-meta dev-attached" },
+                     ["worked by: " + attached.join(", ")]));
+    }
+    return el("div", { class: "card dev-repo-card" }, rows);
+}
+
+// ---- Per-project Fetch pane (the `fetch-<repo>` tab) -----------------------
+// The Development Fetch page's repo card, repo-scoped (active-fork steered —
+// identical content, coherent copy/review buttons), rendered as a service
+// pane off the token-gated /broker/dev/repo-status relay. Global affordances
+// (Remove, the fork dropdown, Enable Gitea's tailed op) stay on the
+// Development page — the pane links there instead. The transport-vs-verb
+// ladder mirrors renderDevFetchTab, rendering into the pane container (every
+// mgmt render helper takes a bare element), and the 401 arm routes back to
+// THIS renderer so a session expiry never lands a host page inside the pane.
+async function renderProjectFetchPane(container, repo) {
+    container.innerHTML = "";
+    container.appendChild(el("div", { class: "mgmt-loading" },
+                             [`Loading ${repo}…`]));
+    let res;
+    try {
+        res = await fetch(`/broker/dev/repo-status?repo=${encodeURIComponent(repo)}`);
+    } catch (e) { return renderMgmtUnavailable(container); }
+    if (res.status === 401)
+        return renderMgmtLogin(container,
+                               () => renderProjectFetchPane(container, repo));
+    if (res.status === 403) return renderMgmtRejected(container);
+    // _relay's 503 body is PARSEABLE JSON — peel it explicitly or a broker
+    // outage would render as a verb error (the transport-vs-verb split).
+    if (res.status === 503) return renderMgmtUnavailable(container);
+    let data;
+    try { data = await res.json(); } catch (e) { return renderMgmtUnavailable(container); }
+    if (!res.ok || !data.ok || !data.result) {
+        container.innerHTML = "";
+        const retry = el("button", { class: "btn-small" }, ["Retry"]);
+        retry.onclick = () => renderProjectFetchPane(container, repo);
+        container.appendChild(el("div", { class: "mgmt-empty" }, [
+            el("span", {}, [
+                (mgmtErrText(data) || "Could not load the repo status.") + " "]),
+            retry,
+        ]));
+        return;
+    }
+    container.innerHTML = "";
+    const result = data.result;
+    const gitea = result.gitea || {};
+    if (!gitea.exists || !gitea.running) {
+        const openDev = el("button", { class: "btn-small" },
+                           ["Open Development"]);
+        openDev.onclick = () => openDevelopment();
+        container.appendChild(el("div", { class: "mgmt-empty" }, [
+            el("span", {}, [gitea.exists
+                ? "Gitea is stopped. Enable it from the Development page. "
+                : "The dev lane isn't enabled yet. Enable it from the "
+                  + "Development page. "]),
+            openDev,
+        ]));
+        return;
+    }
+    const r = (result.repo && typeof result.repo === "object") ? result.repo : {};
+    if (!r.repo) {
+        container.appendChild(el("div", { class: "mgmt-empty" },
+            [`No status for ${repo} — was the repo removed?`]));
+        return;
+    }
+    const attached = (Array.isArray(result.attachments) ? result.attachments : [])
+        .map((a) => a && a.project).filter(Boolean);
+    container.appendChild(buildDevRepoCard(container, container, r, attached, {
+        scoped: true,
+        rerender: () => renderProjectFetchPane(container, repo),
+    }));
 }
 
 // Delete a finished repo: its gitea mirror + every retired agent fork (history
@@ -2380,8 +2493,13 @@ function mgmtAction(view, name, action) {
 
 // An auth/availability status the caller should defer to (re-render the right
 // card), or null if the response carries a real verb result to handle.
-function mgmtStatusRedirect(view, status) {
-    if (status === 401) return () => renderMgmtLogin(view);
+// `onLogin` (optional) is the post-login landing for the 401 arm — a caller
+// hosted OUTSIDE the Management host page (the per-project Fetch pane) passes
+// its own re-render so a session expiry never lands the Management table
+// inside a service pane. Absent ⇒ renderMgmtLogin's default landing, exactly
+// today's behavior.
+function mgmtStatusRedirect(view, status, onLogin) {
+    if (status === 401) return () => renderMgmtLogin(view, onLogin);
     if (status === 403) return () => renderMgmtRejected(view);
     if (status === 503) return () => renderMgmtUnavailable(view);
     return null;
@@ -2717,7 +2835,8 @@ function mgmtConfirmThenTail(view, cfg) {
 // GET /broker/op/<id> — it returns "unknown" for a build op by design (no OP_RUNS
 // entry), which is not-failure; the child's op.progress.done()/fail() in the
 // view-log is the completion signal.
-async function mgmtTailBuildLog(view, backdrop, card, opId, title, onDone) {
+async function mgmtTailBuildLog(view, backdrop, card, opId, title, onDone,
+                                onLogin) {
     const phaseEl = el("div", { class: "op-phase" }, ["starting…"]);
     const pre = el("pre", { class: "sw-buildlog" }, [""]);
     const failEl = el("div", { class: "op-fail" });
@@ -2751,7 +2870,7 @@ async function mgmtTailBuildLog(view, backdrop, card, opId, title, onDone) {
     };
     const drainFull = async () => {
         const r = await fetch(`/broker/op/${encodeURIComponent(opId)}/fulllog?from=${logFrom}`);
-        const redirect = mgmtStatusRedirect(view, r.status);
+        const redirect = mgmtStatusRedirect(view, r.status, onLogin);
         if (redirect) return redirect;
         const b = await r.json();
         if (b.ok && b.exists && b.data) {
@@ -2764,7 +2883,7 @@ async function mgmtTailBuildLog(view, backdrop, card, opId, title, onDone) {
     };
     const drainView = async () => {
         const r = await fetch(`/broker/op/${encodeURIComponent(opId)}/log?from=${viewFrom}`);
-        const redirect = mgmtStatusRedirect(view, r.status);
+        const redirect = mgmtStatusRedirect(view, r.status, onLogin);
         if (redirect) return redirect;
         const b = await r.json();
         if (b.started !== false && b.data) {
@@ -5854,6 +5973,16 @@ async function openHttpService(project, serviceId, svc) {
     state.terminals[key] = {
         kind: "http", container, project, service: serviceId,
     };
+
+    // A dev repo's FETCH pane renders RS-side off the broker relay — no
+    // iframe, no upstream origin, no session mint (branch BEFORE the mint and
+    // the gitea_path branch; neither applies). The bookkeeping above is
+    // shared deliberately: teardown stays identical.
+    if (svc.fetch_repo) {
+        container.classList.add("dev-fetch-pane");
+        await renderProjectFetchPane(container, svc.fetch_repo);
+        return;
+    }
 
     // A dev consumer's gitea FORK tab serves off the SHARED -gitea- sentinel
     // origin, not a per-container origin port — so it has no origin_url, and it
