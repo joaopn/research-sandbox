@@ -3636,9 +3636,14 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent) {
             if (nodeCb.checked) enableTokens.push("node");
             if (enableTokens.length) payload.enable = enableTokens;
             if (showInBox) {
-                const sel = agentChecks.filter((c) => c.cb.checked)
-                                       .map((c) => c.name);
-                if (sel.length) payload.agents = sel;   // empty => clean box
+                // ALWAYS send the explicit selection, [] included. An omitted key
+                // means UNSET server-side (from_kwargs falls back to the workflow's
+                // agent preset), so omitting on deselect-all would silently
+                // resurrect the preset's claude — the explicit [] IS the
+                // agent-less create. Outside showInBox no key is sent (the dev
+                // dialog etc. keep their manifest preset).
+                payload.agents = agentChecks.filter((c) => c.cb.checked)
+                                            .map((c) => c.name);
                 // Light-path fields ride only when the operator opts into a clone,
                 // so an unchecked clone POSTs none of them and from_kwargs applies
                 // the manifest presets unshadowed (same as the blank-field path).

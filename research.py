@@ -308,7 +308,9 @@ def _print_create_report(res, cfg) -> None:
     # was actually cloned. Non-secret — the report never carries the PAT.
     clone_block = (f"  Cloned:    {res.repo} → {res.clone_dir}\n"
                    if getattr(res, "clone_dir", "") else "")
-    # Agent dists (STAGE_MULTI_AGENT): show only when a docker box deployed some.
+    # Agent dists (STAGE_MULTI_AGENT): shown when the create deployed some — a
+    # docker box's set, or sandbox-dind's claude (deploy_local); accurate either
+    # way ("~/.local" is exactly where both land). Research stays empty.
     agent_block = (f"  Agents:    {', '.join(res.agents)} (deployed to ~/.local)\n"
                    if getattr(res, "agents", None) else "")
 
@@ -356,7 +358,10 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         mcp=args.mcp,
         repo=args.repo, ref=args.ref, setup=args.setup_script,
         github_pat=os.environ.get("RS_GITHUB_PAT") or "",   # never a CLI flag
-        agents=args.agents,   # repeatable --agent + --agents a,b both feed this list
+        # repeatable --agent + --agents a,b feed the list; --no-agents (mutually
+        # exclusive with them) sends the EXPLICIT empty set, which from_kwargs
+        # keeps distinct from None/unset (unset => the workflow's preset).
+        agents=([] if args.no_agents else args.agents),
         dev_repo=args.dev_repo,
         supervisor_model=args.supervisor_model,
         supervisor_effort=args.supervisor_effort,
@@ -1981,13 +1986,22 @@ def build_parser() -> argparse.ArgumentParser:
                    help="shell snippet run in the clone dir after checkout (or in "
                         "/workspace when there is no repo). Chain steps with "
                         "&& / newlines. Runs once at create.")
-    c.add_argument("--agent", "--agents", dest="agents", action=_AppendAgents,
-                   default=None, metavar="AGENT[,AGENT...]",
-                   help="deploy agent dist(s) into a docker-substrate box at boot, "
-                        "one writable ~/.local launcher each (cp from the host dist; "
-                        "run `research agent pull` first). Repeatable, or a comma "
-                        f"list. Known: {', '.join(rscore.KNOWN_AGENTS)}. Default: "
-                        "none (clean box). Ignored on non-docker workflows.")
+    cag = c.add_mutually_exclusive_group()
+    cag.add_argument("--agent", "--agents", dest="agents", action=_AppendAgents,
+                     default=None, metavar="AGENT[,AGENT...]",
+                     help="deploy agent dist(s) into the box at boot, one writable "
+                          "~/.local launcher each (cp from the host dist; run "
+                          "`research agent pull` first). Repeatable, or a comma "
+                          f"list. Known: {', '.join(rscore.KNOWN_AGENTS)}. Unset "
+                          "=> the workflow's agent preset. Docker boxes deploy "
+                          "the full set; sandbox-dind honors claude on/off for "
+                          "its supervisor; the research workflow ignores this "
+                          "(its fleet always runs claude).")
+    cag.add_argument("--no-agents", dest="no_agents", action="store_true",
+                     help="create with NO agent wired (an explicit empty set — "
+                          "overrides the workflow's agent preset; on sandbox-dind "
+                          "the supervisor boots without claude while boxes keep "
+                          "their own agent toggle). Refused on the dev workflow.")
     c.add_argument("--dev-repo", dest="dev_repo", metavar="REPO",
                    help="REQUIRED with a dev workflow (--workflow dev): the name "
                         "of a repo added via `research dev repo add` — the agent "

@@ -455,10 +455,13 @@ CREATE_WEBUI_FIELDS = frozenset({
     # github_pat is a SECRET in-box field: forwarded over the request envelope,
     # never logged/persisted off the box, never a CreateResult field.
     "repo", "ref", "setup", "github_pat",
-    # agents: the agent-dist SET a docker box deploys at boot — in-box field
-    # (STAGE_MULTI_AGENT; was the single `agent`). Per-agent dist-must-exist is
-    # enforced in from_kwargs. The rename is a lockstep boundary edit: the webui
-    # form POSTs `agents:[...]` (a field not in this set is silently dropped).
+    # agents: the agent-dist SET — in-box field (STAGE_MULTI_AGENT; was the single
+    # `agent`). A docker box deploys the full set at boot; sandbox-dind honors
+    # claude on/off for its supervisor (an explicit [] = agent-less, distinct from
+    # an ABSENT key = the workflow's preset — from_kwargs keeps the two apart).
+    # Per-agent dist-must-exist is enforced in from_kwargs. Lockstep boundary
+    # edit: the webui form POSTs `agents:[...]` when its agent cards are shown
+    # (a field not in this set is silently dropped).
     "agents",
     # Agent model + effort per container type (STAGE_MODEL_SELECT). IN-BOX fields:
     # they select which model the agent INSIDE the container talks to — no path, no

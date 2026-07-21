@@ -5,6 +5,7 @@
   "tags": ["dind", "data"],
   "substrate": "dind-sysbox",
   "image_overlay": "rs-sandbox-dind",
+  "agents": ["claude"],
   "repo": "https://github.com/joaopn/social-data-pipeline.git",
   "ref": "main",
   "setup": "ln -sf \"$PWD/README.md\" /workspace/README.md",

@@ -4,12 +4,14 @@
 Listens on CODE_SERVER_STUB_PORT (the port the webui's reverse proxy
 hits via container DNS, `rs-project-<proj>:<port>`). On the first
 client connection, spawns code-server on 127.0.0.1:CODE_SERVER_UPSTREAM_PORT
-and forwards bytes bidirectionally. After CODE_SERVER_IDLE_SECONDS
-with no active connections, SIGTERMs the child; the next request
-respawns it.
+and forwards bytes bidirectionally. Once spawned, code-server lives
+until the container stops — there is deliberately NO idle reaper (PI
+directive): reaping would kill the pty host and every in-editor
+terminal process with it, and editor state should survive the
+operator walking away.
 
-This is the centerpiece of the slim-RAM strategy: zero code-server
-RAM cost when the editor tab isn't open, regardless of how many
+Lazy START is the slim-boot strategy: zero code-server RAM cost for
+any project whose editor tab is never opened, regardless of how many
 projects exist on the host.
 
 Why TCP-layer proxy and not application-layer:
@@ -41,11 +43,6 @@ UPSTREAM_BOOT_TIMEOUT_SECONDS = 30
 # "feels instant" threshold once the upstream is ready.
 UPSTREAM_BOOT_POLL_SECONDS = 0.1
 
-# Reap-loop check interval. The actual reap can lag idle-eligibility by
-# up to this amount; 30s strikes a balance between "checks often" (so RAM
-# is reclaimed promptly) and "doesn't burn CPU in a tight loop".
-REAP_CHECK_INTERVAL_SECONDS = 30
-
 # Grace period after SIGTERM before falling back to SIGKILL on the
 # upstream code-server. code-server's hot-exit (saving unsaved buffers
 # to user-data-dir on exit) typically completes in ~1s. 5s is the
@@ -62,7 +59,6 @@ LISTEN_HOST = os.environ.get("CODE_SERVER_STUB_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ["CODE_SERVER_STUB_PORT"])
 UPSTREAM_HOST = os.environ.get("CODE_SERVER_UPSTREAM_HOST", "127.0.0.1")
 UPSTREAM_PORT = int(os.environ["CODE_SERVER_UPSTREAM_PORT"])
-IDLE_SECONDS = int(os.environ["CODE_SERVER_IDLE_SECONDS"])
 WORKSPACE = os.environ.get("CODE_SERVER_WORKSPACE", "/workspace")
 USER_DATA_DIR = os.environ.get(
     "CODE_SERVER_USER_DATA_DIR",
@@ -84,8 +80,6 @@ class State:
 
     def __init__(self) -> None:
         self.proc: asyncio.subprocess.Process | None = None
-        self.last_activity: float = time.time()
-        self.active_conns: int = 0
         self.lock = asyncio.Lock()
 
 
@@ -169,72 +163,34 @@ async def _pipe(src: asyncio.StreamReader,
 
 async def handle_client(client_reader: asyncio.StreamReader,
                         client_writer: asyncio.StreamWriter) -> None:
-    S.active_conns += 1
-    S.last_activity = time.time()
     try:
+        await ensure_upstream()
+    except Exception as e:
+        log.warning(f"ensure_upstream failed: {e}")
+        client_writer.close()
         try:
-            await ensure_upstream()
-        except Exception as e:
-            log.warning(f"ensure_upstream failed: {e}")
-            client_writer.close()
-            try:
-                await client_writer.wait_closed()
-            except Exception:
-                pass
-            return
-
-        try:
-            up_reader, up_writer = await asyncio.open_connection(
-                UPSTREAM_HOST, UPSTREAM_PORT)
-        except OSError as e:
-            log.warning(f"upstream connect failed post-spawn: {e}")
-            client_writer.close()
-            try:
-                await client_writer.wait_closed()
-            except Exception:
-                pass
-            return
-
-        await asyncio.gather(
-            _pipe(client_reader, up_writer),
-            _pipe(up_reader, client_writer),
-            return_exceptions=True,
-        )
-    finally:
-        S.active_conns -= 1
-        S.last_activity = time.time()
-
-
-async def reap_loop() -> None:
-    """Periodically check whether code-server has been idle long enough to
-    reap. SIGTERM with a grace window; SIGKILL on grace expiry."""
-    while True:
-        await asyncio.sleep(REAP_CHECK_INTERVAL_SECONDS)
-        if S.proc is None or S.proc.returncode is not None:
-            continue
-        if S.active_conns > 0:
-            continue
-        idle_for = time.time() - S.last_activity
-        if idle_for < IDLE_SECONDS:
-            continue
-        log.info(f"reaping code-server (idle for {int(idle_for)}s)")
-        try:
-            S.proc.terminate()
-            try:
-                await asyncio.wait_for(
-                    S.proc.wait(), timeout=SIGTERM_GRACE_SECONDS)
-            except asyncio.TimeoutError:
-                log.warning(
-                    f"code-server did not exit in {SIGTERM_GRACE_SECONDS}s "
-                    "after SIGTERM; sending SIGKILL")
-                try:
-                    S.proc.kill()
-                except ProcessLookupError:
-                    pass
-                await S.proc.wait()
-        except ProcessLookupError:
+            await client_writer.wait_closed()
+        except Exception:
             pass
-        S.proc = None
+        return
+
+    try:
+        up_reader, up_writer = await asyncio.open_connection(
+            UPSTREAM_HOST, UPSTREAM_PORT)
+    except OSError as e:
+        log.warning(f"upstream connect failed post-spawn: {e}")
+        client_writer.close()
+        try:
+            await client_writer.wait_closed()
+        except Exception:
+            pass
+        return
+
+    await asyncio.gather(
+        _pipe(client_reader, up_writer),
+        _pipe(up_reader, client_writer),
+        return_exceptions=True,
+    )
 
 
 async def shutdown(server: asyncio.AbstractServer) -> None:
@@ -258,15 +214,13 @@ async def main() -> None:
         handle_client, LISTEN_HOST, LISTEN_PORT)
     log.info(
         f"listening on {LISTEN_HOST}:{LISTEN_PORT}; "
-        f"upstream {UPSTREAM_HOST}:{UPSTREAM_PORT}; "
-        f"idle reap after {IDLE_SECONDS}s")
+        f"upstream {UPSTREAM_HOST}:{UPSTREAM_PORT}")
 
     loop = asyncio.get_running_loop()
     stopper = asyncio.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stopper.set)
 
-    asyncio.create_task(reap_loop())
     serve_task = asyncio.create_task(server.serve_forever())
 
     await stopper.wait()

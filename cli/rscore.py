@@ -586,15 +586,20 @@ class CreateRequest:
             raise ValidationError(
                 "--dev-repo is only valid with a dev workflow (e.g. --workflow dev)")
         # Agent dists (STAGE_MULTI_AGENT): an enable-SET. Each must be a known agent,
-        # and on the docker substrate each must already be pulled. Non-docker is
-        # noted-and-ignored in create() (only the docker-box cp-deploy path is wired
-        # for the explicit set; dind uses the DEFAULT_AGENT floor below). Dedup while
-        # preserving order so a box never double-mounts the same agent. An
-        # explicit set wins; otherwise the workflow's `agents` preset applies (the
-        # docker store workflows carry ["claude"] so the box is claude-on by
-        # default — a bare `sandbox` box, with no preset, stays agent-less).
-        agents = tuple(dict.fromkeys(
-            _as_tuple(kw.get("agents")) or _as_tuple(manifest.get("agents"))))
+        # and on the docker substrate each must already be pulled. EXPLICIT vs UNSET
+        # is load-bearing: an UNSET selection (CLI without --agent/--no-agents, a
+        # relayed body without the key) falls back to the workflow's `agents` preset
+        # (every dind-flavor manifest that wants a claude-wired supervisor carries
+        # ["claude"]; a bare `sandbox` box, with no preset, stays agent-less), while
+        # an EXPLICIT EMPTY set ([] — the webui's deselect-all, the CLI --no-agents)
+        # means agent-less and must NOT be shadowed by the preset. The docker box
+        # deploys the full set (per-agent mounts); sandbox-dind honors claude
+        # on/off for its OWN ~/.local (Option C — /opt/agent-dist is always staged
+        # as the box copy-source); research ignores the set (noted in create(),
+        # fleet floor below). Dedup preserving order so a box never double-mounts.
+        raw_agents = kw.get("agents")
+        agents = tuple(dict.fromkeys(_as_tuple(
+            raw_agents if raw_agents is not None else manifest.get("agents"))))
         for a in agents:
             if a not in KNOWN_AGENTS:
                 raise ValidationError(
@@ -603,12 +608,27 @@ class CreateRequest:
                 raise ValidationError(
                     f"agent {a!r}: no cached dist — run "
                     f"`research agent pull --agent {a}` first")
+            # The dind stage is flat single-default (_stage_agent_dist stages
+            # DEFAULT_AGENT only) — refuse rather than silently ignore a
+            # non-default selection. Unreachable while KNOWN_AGENTS is
+            # single-entry; it fires the day a second agent joins the enum.
+            if substrate is Substrate.DIND_SYSBOX and a != DEFAULT_AGENT:
+                raise ValidationError(
+                    f"agent {a!r} is not available on this workflow — only "
+                    f"{DEFAULT_AGENT!r} can be deployed here")
+        # A dev project's whole point is the repo-working agent (repo-watch drives
+        # it) — an agent-less dev create is a broken project, refuse up front.
+        if dev_lane and DEFAULT_AGENT not in agents:
+            raise ValidationError(
+                "a dev project runs the claude agent — it cannot be created "
+                "agent-less")
         # Fleet floor (STAGE_AGENT_DIST slice 2): EVERY dind project deploys claude
         # from the dist (no bake) — research flavor for the supervisor + worker/
         # role-MCP/PI fleet, sandbox-dind flavor for its rs-sandbox-box boxes (FROM
-        # rs-analysis-base). So a dind create needs a pulled dist. (docker boxes use
-        # the explicit --agent path above.) `research start` auto-pulls if absent,
-        # so this floor rarely trips.
+        # rs-analysis-base). So a dind create needs a pulled dist EVEN when the
+        # supervisor is created agent-less: /opt/agent-dist is still staged as the
+        # box copy-source (Option C). (docker boxes use the explicit --agent path
+        # above.) `research start` auto-pulls if absent, so this floor rarely trips.
         if substrate is Substrate.DIND_SYSBOX and not dist_present(DEFAULT_AGENT):
             raise ValidationError(
                 f"no cached {DEFAULT_AGENT} dist — run `research agent pull` first "
@@ -1798,9 +1818,10 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         print("note: --repo/--setup-script apply only to the light-path docker "
               "box / sandbox-dind; ignoring for this workflow", file=sys.stderr)
     # --agent(s) deploys an agent-dist set into the docker box (STAGE_MULTI_AGENT);
-    # sandbox-dind shows the same checklist but deploys the DEFAULT_AGENT via
-    # _stage_agent_dist (B1 single-agent). On the research/overlay workflow the
-    # explicit set isn't wired (the fleet uses the floor), so it's noted-and-ignored.
+    # sandbox-dind honors claude on/off for the supervisor's OWN ~/.local (the
+    # deploy_local gate in step 6 below — B1 single-agent). Only on the research/
+    # overlay workflow is the explicit set unwired (the fleet uses the floor), so
+    # it's noted-and-ignored there.
     if (not is_docker and project_type != PROJECT_TYPE_SANDBOX_DIND
             and req.agents):
         print(f"note: --agent {','.join(req.agents)} applies only to the docker "
@@ -1884,7 +1905,13 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     #     derived "type"/"substrate" are what the machinery branches on.
     orch_dir = workspace_path / ".orchestrator"
     orch_dir.mkdir(parents=True, exist_ok=True)
-    deployed_agents = list(req.agents) if is_docker else []
+    # The resolved agent set, with FOUR readers: the marker below, the docker-box
+    # label+mount branch (gated `is_docker` — never fires for dind), the
+    # CreateResult (surfaces in the create report), and — via the marker — the
+    # recreate re-stage. Research stays []: its fleet deploy is flavor-forced
+    # (fleet floor) and never consults the set.
+    deployed_agents = list(req.agents) if (
+        is_docker or project_type == PROJECT_TYPE_SANDBOX_DIND) else []
     # Agent model + effort (STAGE_MODEL_SELECT): all FOUR container types, frozen
     # CONCRETE and already effort-drop-resolved. `box` has no create-time field —
     # it comes straight from the defaults file — so it MUST pass through the same
@@ -1977,12 +2004,16 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         docker_args = docker_args[:-1] + extra_mounts + [docker_args[-1]]
     # Agent dists: one RO copy-source mount per enabled agent at
     # /opt/agent-dist/<agent> + a comma-joined provenance label (STAGE_MULTI_AGENT).
-    # docker-substrate only; the entrypoint loops over the mounted subdirs and cp's
-    # each into the box's OWN writable ~/.local on first boot. The mounts ARE the
-    # enabled set (the entrypoint reads the mounts, not the label) — empty set => no
-    # mount => /opt/agent-dist absent => the boot loop no-ops (lean box). Inserted
-    # before the image (last arg).
-    if deployed_agents:
+    # docker-substrate only BY GATE (deployed_agents is non-empty on sandbox-dind
+    # too now, where the host-cache mount would be fatal: _stage_agent_dist's
+    # `rm -rf /opt/agent-dist` on a live mountpoint + host-uid files foreign-owned
+    # under the sysbox userns — dind gets the flat staged tree instead). The
+    # entrypoint loops over the mounted subdirs and cp's each into the box's OWN
+    # writable ~/.local on first boot. The mounts ARE the enabled set (the
+    # entrypoint reads the mounts, not the label) — empty set => no mount =>
+    # /opt/agent-dist absent => the boot loop no-ops (lean box). Inserted before
+    # the image (last arg).
+    if is_docker and deployed_agents:
         agent_args = ["--label", f"{AGENT_LABEL}={','.join(deployed_agents)}"]
         for a in deployed_agents:
             agent_args += ["-v", f"{agent_dist_path(a)}:/opt/agent-dist/{a}:ro"]
@@ -2048,11 +2079,13 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         if is_management:
             # Sandbox-dind is the docker `sandbox` flavor + DIND
             # (STAGE_SANDBOX_DIND_AGENT): the supervisor RUNS an agent itself and
-            # gets the light-path harness; the rs-sandbox box harness is OPT-IN.
-            # Stage the agent dist into the supervisor's OWN ~/.local
-            # (deploy_local=True) — that staging ALSO populates /opt/agent-dist for
-            # any boxes the harness later spawns.
-            _stage_agent_dist(container_name)
+            # gets the light-path harness. /opt/agent-dist is ALWAYS staged (the
+            # copy-source any box's agent toggle deploys from — Option C), but the
+            # supervisor's OWN ~/.local gets the launcher + claude settings only
+            # when the create selected claude (deploy_local honors req.agents; an
+            # agent-less create leaves the supervisor unwired).
+            _stage_agent_dist(container_name,
+                              deploy_local=DEFAULT_AGENT in req.agents)
             # Editor gated on the resolved code-server flag, like research (the
             # sandbox-dind manifest defaults code-server OFF ⇒ lean box unless
             # --enable code-server). Staged before any box spawn so a box can
@@ -3295,14 +3328,6 @@ def build_supervisor_docker_args(
         env_name = "RS_SERVICE_" + sid.upper().replace("-", "_")
         args += ["--label", f"{SERVICE_LABEL_PREFIX}{sid}={ena}"]
         args += ["-e", f"{env_name}={ena}"]
-    # code-server lazy-reap idle window. Optional — entrypoint defaults to
-    # 1800s (30 min) when unset; .env can override per-host. Survives
-    # _recreate_supervisor by being re-passed from the host's env on every
-    # create, which is what we want (a host-side tweak should propagate to
-    # the next project lifecycle, not require per-project state).
-    idle = os.environ.get("CODE_SERVER_IDLE_SECONDS")
-    if idle:
-        args += ["-e", f"CODE_SERVER_IDLE_SECONDS={idle}"]
     # Agent model + effort for the agent the RESEARCHER talks to in this container
     # (STAGE_MODEL_SELECT). This one builder serves the research supervisor, the
     # sandbox-dind supervisor AND the docker box — all three run a login shell in
@@ -3738,9 +3763,10 @@ def _stage_agent_dist(supervisor: str, agent: str = DEFAULT_AGENT,
     2). Real files at AGENT_DIST_MOUNT — the inner fleet (worker / role-MCP /
     sandbox-box) RO-mounts that path and cp's its own writable copy at boot.
     `deploy_local` ALSO (re)deploys the supervisor's OWN ~/.local from the
-    dist — True for the research flavor (the PI's interactive claude + the
-    rs-audit-stop hook live there); False for the rs-sandbox-dind (sandbox-dind) flavor,
-    whose supervisor never runs claude itself but DOES stage the dist so its
+    dist — always True for the research flavor (the PI's interactive claude +
+    the rs-audit-stop hook live there); on sandbox-dind it follows the create's
+    agent selection (marker `agents` on recreate): False leaves the supervisor
+    UNWIRED (agent-less create, Option C) while the dist is still staged so its
     rs-sandbox-box boxes (FROM rs-analysis-base — no bake now) can deploy it.
 
     Two dragons handled here:
@@ -5200,11 +5226,15 @@ def _recreate_supervisor(
     # Sandbox flavor stages the blank box image (no analysis workers); see
     # cmd_project_create's matching branch.
     if md_ptype == PROJECT_TYPE_SANDBOX_DIND:
-        # Sandbox-dind supervisor RUNS an agent (STAGE_SANDBOX_DIND_AGENT): re-stage
-        # the dist into its OWN ~/.local (deploy_local=True; that staging also
-        # populates /opt/agent-dist for any boxes), editor gated like research. No
-        # bake, so a recreate must redeploy. Before the role-MCP relaunch below.
-        _stage_agent_dist(container)
+        # Sandbox-dind (STAGE_SANDBOX_DIND_AGENT): always re-stage /opt/agent-dist
+        # (the box copy-source), but re-deploy the supervisor's OWN ~/.local only
+        # if the create selected claude — the workspace marker's `agents` is the
+        # source (stamped at create, survives on the bind-mount; dind containers
+        # carry no agent label). Editor gated like research. No bake, so a
+        # recreate must redeploy. Before the role-MCP relaunch below.
+        _stage_agent_dist(
+            container,
+            deploy_local=DEFAULT_AGENT in _read_marker_agents(workspace_path))
         if editor_dist_present():
             _stage_editor_dist(container, deploy_local=flags.get("code-server", True))
         # Reader dist re-staged (STAGE_READER): survives the recreate so a
@@ -6475,6 +6505,21 @@ def _ensure_box_harness(container: str, network: str, workspace_path: "Path",
                       latest_tag]):
         pins = _read_box_pins(workspace_path) or _box_image_pins(load_versions())
         _deliver_box_images(container, network, pins, push=True, only={host_base})
+
+
+def _read_marker_agents(workspace_path: "Path") -> list[str]:
+    """The agent set stamped into .orchestrator/project.json at create (drives the
+    sandbox-dind recreate's deploy_local). Tolerant read, the _read_box_pins shape:
+    a missing/unreadable marker or key reads as [] — the recreate then comes back
+    UNWIRED (accepted B31-family caveat; greenfield posture — pre-change non-docker
+    markers already carry [])."""
+    f = workspace_path / ".orchestrator" / "project.json"
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    agents = data.get("agents")
+    return agents if isinstance(agents, list) else []
 
 
 def _read_box_pins(workspace_path: "Path") -> dict[str, str]:

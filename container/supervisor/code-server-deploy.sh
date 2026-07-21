@@ -98,12 +98,12 @@ if [[ -d "$AGENT_EXT_DIR" ]]; then
     done
 fi
 
-# 4. Launch the lazy-start stub (spawn code-server on first connect, reap on idle).
+# 4. Launch the lazy-start stub (spawn code-server on first connect; once up it
+#    lives until the container stops — deliberately NO idle reaper).
 : "${CODE_SERVER_STUB_PORT:=8443}"
 : "${CODE_SERVER_UPSTREAM_PORT:=8444}"
-: "${CODE_SERVER_IDLE_SECONDS:=1800}"
-export CODE_SERVER_STUB_PORT CODE_SERVER_UPSTREAM_PORT CODE_SERVER_IDLE_SECONDS
+export CODE_SERVER_STUB_PORT CODE_SERVER_UPSTREAM_PORT
 nohup "${DIST}/tools/code-server-stub.py" \
     > /tmp/code-server-stub.log 2>&1 &
 echo "code-server (dist) stub launched on :${CODE_SERVER_STUB_PORT}; "\
-"upstream :${CODE_SERVER_UPSTREAM_PORT}; idle reap ${CODE_SERVER_IDLE_SECONDS}s"
+"upstream :${CODE_SERVER_UPSTREAM_PORT}"
