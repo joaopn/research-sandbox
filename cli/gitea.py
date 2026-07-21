@@ -517,9 +517,10 @@ def bootstrap_accounts(host_port: str, admin_password: str,
 
 def _mint_token(username: str, scopes: str) -> str:
     # Fixed token name: gitea rejects a duplicate name for one user, so a
-    # manually-deleted token FILE whose gitea-side "rs-dev" token still lives
-    # will fail re-mint until the repo is removed+re-added (which purges the
-    # user). Acceptable — the file is the source of truth in the normal flow.
+    # deleted token FILE whose gitea-side "rs-dev" token still lives will
+    # fail re-mint until that stale token is deleted gitea-side (consumer
+    # retirement never deletes users, so nothing purges it automatically).
+    # Acceptable — the file is the source of truth in the normal flow.
     r = _gitea_admin(["user", "generate-access-token", "--username", username,
                       "--scopes", scopes, "--raw", "--token-name", "rs-dev"])
     if r.returncode != 0:
@@ -541,7 +542,7 @@ def mint_or_rotate_token(user: str) -> str:
         val = path.read_text().strip()
         if val:
             return val
-    tok = _mint_token(user, "write:repository")
+    tok = _mint_token(user, "write:repository,write:issue")
     _write_secret(path, tok)
     return tok
 
