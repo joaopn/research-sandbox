@@ -8136,6 +8136,19 @@ def dev_attach(req: "DevAttachRequest", _progress=None) -> DevAttachResult:  # t
     if not container_running(container):
         die(f"project {req.project!r} is not running; start it first (an "
             f"agent attach stages the gitea token into the live supervisor)")
+    # ONE REPO PER DEV CONTAINER (hard invariant): a project's own agent works
+    # exactly one repo. Same-repo re-attach (the gitea-IP heal below) is fine; a
+    # DIFFERENT repo is the retired multi-repo flow and is refused here — the
+    # only door to a second agent repo (create records the one repo directly,
+    # box_add provisions box consumers, neither routes through here). Box
+    # entries (box != None) are OTHER containers, never this project's 2nd repo.
+    existing = {e["repo"] for e in gitea.project_entries(req.project)
+                if e.get("class") == "agent" and e.get("box") is None
+                and e.get("repo")}
+    if existing and existing != {req.repo}:
+        die(f"project {req.project!r} already works repo {sorted(existing)[0]!r}; "
+            f"a dev container is single-repo — discard and recreate it to work a "
+            f"different repo")
     _resume_gitea(require=True)         # resume an enabled gitea; never create
     ip = _connect_gitea_to_project_network(network)
     if not ip:
