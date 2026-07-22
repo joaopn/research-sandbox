@@ -698,6 +698,21 @@ def cmd_create(args: argparse.Namespace) -> None:
         agent = "claude"
     browser = preset.get("image") == "browser"
     editor = bool(args.editor)
+    # Fail LOUD when the editor is requested but the dist is not staged — the
+    # silent alternative (_run_box skips the mount, the entrypoint skips the
+    # deploy, the box boots editor-less with no error anywhere) is the exact
+    # defect this kills. POPULATED sentinel, never a bare isdir: a partial/
+    # interrupted stage leaves the dir without the launcher, and isfile follows
+    # the relativized launcher symlink, which resolves inside a complete staged
+    # tree by construction. Pre-state-write: no entry, no port, no container
+    # exists yet. Wording is webui-safe (die text reaches the browser via the
+    # op tail): both remedies are webui-doable.
+    if editor and not os.path.isfile(
+            os.path.join(EDITOR_DIST_MOUNT, ".local/bin/code-server")):
+        die("this box requests the editor, but the editor files are not "
+            "staged in this project — install the editor from the Software "
+            "page if it is missing on this host, then stop and start the "
+            "project to stage it, and retry")
     dev_subnet = ""
     if is_dev:
         # Dev boxes live on their own pinned /24, NOT the rs-inner pool: no

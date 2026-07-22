@@ -2086,10 +2086,11 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             # agent-less create leaves the supervisor unwired).
             _stage_agent_dist(container_name,
                               deploy_local=DEFAULT_AGENT in req.agents)
-            # Editor gated on the resolved code-server flag, like research (the
-            # sandbox-dind manifest defaults code-server OFF ⇒ lean box unless
-            # --enable code-server). Staged before any box spawn so a box can
-            # RO-mount /opt/editor-dist.
+            # Editor dist staged whenever cached so any box can RO-mount
+            # /opt/editor-dist; deploy_local follows the RESOLVED code-server
+            # flag (default ON since the editor-by-default slice — a
+            # --disable code-server project stages the mount source but
+            # deploys no supervisor editor). Staged before any box spawn.
             if editor_dist_present():
                 _stage_editor_dist(container_name,
                                    deploy_local=service_flags.get("code-server", True))
@@ -3116,6 +3117,39 @@ def _wait_for_service_ready(container: str, port: int = CODE_SERVER_STUB_PORT,
     check = f"ss -ltn 2>/dev/null | grep -q ':{port}'"
     while time.time() < deadline:
         if run(["docker", "exec", container, "sh", "-c", check],
+               capture_output=True).returncode == 0:
+            return True
+        time.sleep(1)
+    return False
+
+
+def _wait_for_box_editor_ready(supervisor: str, box_container: str,
+                               timeout: int = EDITOR_READY_TIMEOUT_S) -> bool:
+    """Poll until the BOX's code-server stub is LISTENING on
+    127.0.0.1:CODE_SERVER_STUB_PORT inside ``box_container`` (an inner container
+    of ``supervisor``). The box's editor deploy runs in its entrypoint AFTER
+    `docker run` returns (extension installs first, then the stub — ~15-30s), so
+    box_add would otherwise report ready before the editor tab is probeable and
+    the webui's op-completion refresh renders the box without its Editor tab.
+
+    Probed IN the box, deliberately NOT via _wait_for_service_ready or an
+    in-supervisor connect to the published editor_port: the inner dockerd's
+    docker-proxy binds that port in the supervisor netns the moment the box
+    runs and ACCEPTS local connects while the stub is still down, so both the
+    `ss` look and a local connect are false-positive for this port. Only the
+    in-box connect (or a true remote, DNAT-traversing one — what the webui's
+    probe does) reflects stub readiness.
+
+    Best-effort like _wait_for_service_ready: True once listening, False after
+    ``timeout`` (the caller warns and proceeds — the box is healthy and the
+    webui re-probes on its poll)."""
+    import time
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if run(["docker", "exec", supervisor, "docker", "exec", box_container,
+                "timeout", "2", "bash", "-c",
+                f"</dev/tcp/127.0.0.1/{CODE_SERVER_STUB_PORT}"],
                capture_output=True).returncode == 0:
             return True
         time.sleep(1)
@@ -7751,6 +7785,24 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     progress.step("harness", "ensuring the box harness")
     _ensure_box_harness(container, project_network_for(req.project),
                         workspace_path, want_browser)
+    # Editor dist on demand (the staged-catalog Q1-live precedent above): an
+    # editor box RO-mounts the supervisor's /opt/editor-dist, and a project
+    # created before the host had a cached editor dist never got it staged —
+    # without this, such a project can never grow an editor box short of a
+    # recreate, silently. ORDER IS LOAD-BEARING: the editor_dist_present()
+    # guard must stay BEFORE _stage_editor_dist — that helper die()s naming a
+    # CLI verb, and die text is browser-reachable via the op tail; the
+    # ValidationError below is the webui-safe refusal for the no-host-cache
+    # case. deploy_local stays False: stage the mount source only, never the
+    # supervisor's own editor.
+    if req.editor and not _editor_dist_staged_in(container):
+        if editor_dist_present():
+            _stage_editor_dist(container)
+        else:
+            raise ValidationError(
+                "this box requests the editor, but the editor software is not "
+                "installed on this host yet — install it from the Software "
+                "page, then retry")
     # Dev preset: wire gitea + mint the BOX's own consumer (user + fork +
     # token) BEFORE the box runs — ordering is load-bearing: connect → provision
     # → ledger → staging (the token lands in ~/.dev-tokens for rs-sandbox to
@@ -7826,6 +7878,17 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     # that would escape dispatch's invariant; box_list is already .get()-defensive.
     if not isinstance(info, dict) or not all(k in info for k in ("name", "ip", "container")):
         die(f"unexpected rs-sandbox output shape: {r.stdout.strip()!r}")
+    # Editor readiness gate (create()'s editor-gate shape): the box's stub only
+    # listens ~15-30s after `docker run` (in-box extension installs first), and
+    # the webui re-fetches the tab set the moment this op completes — without
+    # the wait it probes a not-yet-listening port and the Editor tab never
+    # renders while the operator is looking. op-done ⇒ tab probeable.
+    # Best-effort: a slow editor warns, never fails an otherwise-healthy box.
+    if req.editor:
+        progress.step("editor", "waiting for the box editor")
+        if not _wait_for_box_editor_ready(container, info["container"]):
+            print(f"warning: box editor not listening on :{CODE_SERVER_STUB_PORT} "
+                  f"after {EDITOR_READY_TIMEOUT_S}s; it should come up shortly")
     progress.step("ready", "box ready")
     return BoxAddResult(project=req.project, name=info["name"], ip=info["ip"],
                         preset=info.get("preset", req.preset),
