@@ -473,6 +473,11 @@ CREATE_WEBUI_FIELDS = frozenset({
     "supervisor_model", "supervisor_effort",
     "worker_model", "worker_effort",
     "role_model", "role_effort",
+    # Opt-in rs-fetch (docker substrate only): an IN-BOX capability toggle —
+    # stages the read-only fetch tool + operator token + wiring INSIDE the
+    # container; no path, no host port, no mount. from_kwargs rejects it off
+    # the docker substrate and floors it on gitea bootstrap (fail-early).
+    "fetch",
 })
 
 # The webui-settable subset of UpdateRequest fields. `rebuild`/`keep_claude` are
@@ -529,11 +534,13 @@ def _verb_destroy(args: dict, progress=None) -> dict:
 # for box_remove is NOT here: it is verified + consumed in dispatch, never
 # forwarded to rscore.
 # preset = box TYPE (catalog-gated in box_add); agent overrides the preset default;
-# editor bundles code-server; mcps are project MCP names (⊆ allow, gated in box_add);
+# editor bundles code-server; fetch wires the box's opt-in read-only rs-fetch
+# surface (in-box; rejected on a dev preset + gitea-bootstrap-floored in box_add);
+# mcps are project MCP names (⊆ allow, gated in box_add);
 # repo/ref/setup seed a `byo` box and run INSIDE it (in-box, relayable per
 # WORKFLOW_TAXONOMY_S4). `browser` is GONE — folded into the websearcher preset.
 BOX_ADD_WEBUI_FIELDS = frozenset({"project", "name", "preset", "agent", "editor",
-                                  "mcps", "repo", "ref", "setup",
+                                  "fetch", "mcps", "repo", "ref", "setup",
                                   # This box's own agent model/effort; unset ⇒ the
                                   # project's `box` default from the marker.
                                   "model", "effort"})

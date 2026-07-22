@@ -357,6 +357,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         disable=args.disable, role_mcp_upstream=args.role_mcp_upstream,
         mcp=args.mcp,
         repo=args.repo, ref=args.ref, setup=args.setup_script,
+        fetch=args.fetch,
         github_pat=os.environ.get("RS_GITHUB_PAT") or "",   # never a CLI flag
         # repeatable --agent + --agents a,b feed the list; --no-agents (mutually
         # exclusive with them) sends the EXPLICIT empty set, which from_kwargs
@@ -1986,6 +1987,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="shell snippet run in the clone dir after checkout (or in "
                         "/workspace when there is no repo). Chain steps with "
                         "&& / newlines. Runs once at create.")
+    c.add_argument("--fetch", action="store_true",
+                   help="wire the project container for rs-fetch: stage the "
+                        "read-only fetch tool + operator token + dev-lane "
+                        "wiring so agent commits can be fetched from the "
+                        "shared gitea into a local clone (single-container "
+                        "sandbox workflow only; dind projects use the box "
+                        "window's per-box toggle). Requires the dev lane "
+                        "(gitea) enabled.")
     cag = c.add_mutually_exclusive_group()
     cag.add_argument("--agent", "--agents", dest="agents", action=_AppendAgents,
                      default=None, metavar="AGENT[,AGENT...]",

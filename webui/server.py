@@ -866,8 +866,9 @@ async def broker_project_action_handler(request: web.Request) -> web.Response:
 
 
 async def broker_box_add_handler(request: web.Request) -> web.Response:
-    """POST /broker/project/{name}/box {name?,preset?,agent?,editor?,mcps?,repo?,
-    ref?,setup?} — add a box to a running dind project (gated, origin-checked).
+    """POST /broker/project/{name}/box {name?,preset?,agent?,editor?,fetch?,
+    mcps?,repo?,ref?,setup?} — add a box to a running dind project (gated,
+    origin-checked).
     Returns {op_id} immediately and tails like create/destroy. The broker's
     BOX_ADD_WEBUI_FIELDS allow-list is the real input boundary; the body is
     forwarded as box fields under the project name from the URL. `browser` is GONE
@@ -888,7 +889,8 @@ async def broker_box_add_handler(request: web.Request) -> web.Response:
     # it at import time). `model`/`effort` = this box's own agent pair.
     args = {"project": project, "name": body.get("name"),
             "preset": body.get("preset"), "agent": body.get("agent"),
-            "editor": bool(body.get("editor")), "mcps": body.get("mcps"),
+            "editor": bool(body.get("editor")),
+            "fetch": bool(body.get("fetch")), "mcps": body.get("mcps"),
             "repo": body.get("repo"), "ref": body.get("ref"),
             "setup": body.get("setup"),
             "model": body.get("model"), "effort": body.get("effort")}

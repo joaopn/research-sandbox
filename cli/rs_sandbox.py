@@ -127,7 +127,7 @@ CHEATSHEET = """\
 rs-sandbox — isolated boxes for running un-vetted code
 
   rs-sandbox create [name] [--preset TYPE] [--agent claude|none] [--editor]
-                           [--mcps a,b] [--repo URL --ref REF --setup CMD]
+                           [--fetch] [--mcps a,b] [--repo URL --ref REF --setup CMD]
                               spin a box (auto-named box-N). --preset picks the box
                               type (empty, dev, websearcher, data-wrangler, byo, or
                               an operator-registered type); the agent defaults per
@@ -411,10 +411,12 @@ def _ensure_dev_bridge(name: str, subnet: str) -> str:
     return net
 
 
-# The universal fetch surface's supervisor-side halves (STAGE_DEV_GITEA S3):
-# the host stages both into THIS supervisor; every box run copies them in.
+# The opt-in fetch surface's supervisor-side halves: the host stages these
+# into THIS supervisor when the project carries rs-fetch consumers; an
+# rs-fetch-ENABLED box run copies them in (universal staging is retired).
 RS_FETCH_BIN = "/usr/local/bin/rs-fetch"
 OPERATOR_TOKEN_FILE = DEV_TOKENS_DIR / "operator.token"
+FETCH_WIRING_FILE = DEV_TOKENS_DIR / "fetch-wiring.json"
 
 
 def _staged_gitea_ip() -> str:
@@ -430,18 +432,28 @@ def _staged_gitea_ip() -> str:
 
 
 def _stage_box_fetch(cname: str) -> None:
-    """Copy the universal fetch surface into a just-run box: the rs-fetch tool
-    (from this supervisor's own staged copy, root-owned 0755) + the READ-ONLY
-    operator token (0600, stdin as the box user — never argv, never the
-    workspace). SILENT skip when the supervisor halves aren't staged (pre-gitea
-    project — an ordinary restart after the dev lane exists heals it, the
-    greenfield posture); a staging FAILURE warns and leaves the box usable
+    """Copy the opt-in fetch surface into a just-run rs-fetch-ENABLED box: the
+    rs-fetch tool (from this supervisor's own staged copy, root-owned 0755) +
+    the READ-ONLY operator token (0600, stdin as the box user — never argv,
+    never the workspace) + the global fetch wiring (non-secret repo->owner
+    rows, to ~/.dev-tokens/fetch-wiring.json where rs-fetch reads it). Called
+    ONLY for a fetch-flagged box now, so missing supervisor halves are a LOUD
+    warning (the surface was explicitly requested — the retired universal
+    staging skipped silently): the heal is a project stop/start (the host
+    re-stages the halves for fetch-consumer projects), then `rs-sandbox
+    restart` of this box. A staging FAILURE warns and leaves the box usable
     without fetch (never die — the box itself is fine)."""
     try:
         tok = OPERATOR_TOKEN_FILE.read_text().strip()
     except OSError:
-        return
+        tok = ""
     if not tok or not os.path.isfile(RS_FETCH_BIN):
+        print(f"warning: rs-fetch box {cname!r}: the supervisor-side fetch "
+              f"halves are not staged (tool "
+              f"{'present' if os.path.isfile(RS_FETCH_BIN) else 'missing'}, "
+              f"operator token {'present' if tok else 'missing'}); stop/start "
+              f"the project to re-stage them, then restart this box",
+              file=sys.stderr)
         return
     r = subprocess.run(
         ["docker", "exec", "-i", "-u", "0", cname, "sh", "-c",
@@ -460,6 +472,42 @@ def _stage_box_fetch(cname: str) -> None:
         err = (r.stderr or r.stdout or b"").decode(errors="replace").strip()
         print(f"warning: operator-token staging into box {cname!r} failed: "
               f"{err}", file=sys.stderr)
+    # Global fetch wiring (non-secret; rs-fetch's fork-owner source in a box).
+    # Warn-skip when the supervisor copy is absent — an older staging; heals
+    # the same way as the halves above.
+    try:
+        wiring = FETCH_WIRING_FILE.read_text()
+    except OSError:
+        wiring = ""
+    if not wiring:
+        print(f"warning: fetch wiring missing at {FETCH_WIRING_FILE}; rs-fetch "
+              f"in box {cname!r} cannot resolve fork owners — stop/start the "
+              f"project to re-stage it, then restart this box", file=sys.stderr)
+        return
+    r = subprocess.run(
+        ["docker", "exec", "-i", "-u", "worker", cname, "sh", "-c",
+         'umask 077 && mkdir -p "$HOME/.dev-tokens" && '
+         'cat > "$HOME/.dev-tokens/fetch-wiring.json"'],
+        input=wiring.encode(), capture_output=True)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or b"").decode(errors="replace").strip()
+        print(f"warning: fetch-wiring staging into box {cname!r} failed: "
+              f"{err}", file=sys.stderr)
+
+
+def _install_repo_watch(cname: str) -> None:
+    """Install the rs-repo-watch launcher into a DEV box. The box image bakes
+    the dev tooling at /opt/dev only (command-relevance: a non-dev box carries
+    no dev commands on PATH), and the box entrypoint runs as `worker`, which
+    cannot write /usr/local/bin — so the launcher lands via a root exec here,
+    right after the dev box's docker run (the rs-fetch staging idiom).
+    Best-effort: a failure warns; the watcher stays manually startable via
+    /opt/dev/rs-repo-watch."""
+    r = _docker("exec", "-u", "0", cname, "ln", "-sf",
+                "/opt/dev/rs-repo-watch", "/usr/local/bin/rs-repo-watch")
+    if r.returncode != 0:
+        print(f"warning: installing rs-repo-watch into dev box {cname!r} "
+              f"failed: {(r.stderr or r.stdout).strip()}", file=sys.stderr)
 
 
 def _project_box_pair() -> dict:
@@ -486,7 +534,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
              clone_ref: str = "", clone_setup: str = "",
              dev: dict | None = None, dev_subnet: str = "",
              loopback_ports: list[dict] | None = None,
-             model: str = "", effort: str = "") -> None:
+             model: str = "", effort: str = "", fetch: bool = False) -> None:
     """docker run a box in the local inner dockerd. ``browser`` selects the
     Chromium-equipped image; ``agent`` (claude|none) → RS_BOX_AGENT (entrypoint
     deploys claude only for "claude", still auth-free); ``editor`` → the box's OWN
@@ -541,14 +589,22 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
                    "-e", f"REPO_NAME={dev['repo']}"]
     else:
         net_args = ["--network", INNER_NETWORK, "--ip", ip]
-        # Universal fetch wiring (STAGE_DEV_GITEA S3): every box resolves
-        # rs-gitea once the project is wired (inner-container DNS cannot
+        # Opt-in rs-fetch wiring (the universal add-host is RETIRED): only an
+        # rs-fetch-enabled box resolves rs-gitea (inner-container DNS cannot
         # resolve outer-bridge names, so the staged address rides --add-host —
-        # fixed at run; a stale address heals by restart, greenfield posture).
-        # The dev branch above injects its own from _dev_run_info (strict).
-        gitea_ip = _staged_gitea_ip()
-        if gitea_ip:
-            net_args += ["--add-host", f"rs-gitea:{gitea_ip}"]
+        # fixed at run; a stale address is auto-healed by the host reconcile /
+        # `rs-sandbox start`, both of which re-run on mismatch). Warn-not-die
+        # on missing staging: a sick gitea must not brick a box restart — the
+        # box runs fetch-less until the next healthy re-run. The dev branch
+        # above injects its own from _dev_run_info (strict).
+        if fetch:
+            gitea_ip = _staged_gitea_ip()
+            if gitea_ip:
+                net_args += ["--add-host", f"rs-gitea:{gitea_ip}"]
+            else:
+                print(f"warning: no staged gitea address for rs-fetch box "
+                      f"{name!r}; it runs without fetch until a restart after "
+                      f"the project wiring is staged", file=sys.stderr)
         dev_env = []
     # Agent model + effort (STAGE_MODEL_SELECT). Fixed at `docker run` — a plain
     # `docker restart` does NOT re-evaluate env — so _rerun_box re-applies them
@@ -581,9 +637,16 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     if r.returncode != 0:
         die(f"docker run failed for box {name!r}:\n"
             f"{(r.stderr or r.stdout).strip()}")
-    # Universal fetch surface: rs-fetch + the operator token into the fresh box
-    # (silent no-op until the dev lane exists; warn-not-die on failure).
-    _stage_box_fetch(cname)
+    # Opt-in fetch surface: rs-fetch + the operator token + the global fetch
+    # wiring into the fresh box — ONLY when this box opted in (the universal
+    # staging is retired; a dev box never gets it — the flag is rejected on
+    # the dev preset at both gates).
+    if fetch:
+        _stage_box_fetch(cname)
+    # Dev tooling on PATH for a DEV box only (the image bakes it at /opt/dev;
+    # command-relevance — see _install_repo_watch).
+    if dev:
+        _install_repo_watch(cname)
     # F3 Slice 2b: launch the in-box loopback forwarders for the freshly-run box.
     _launch_box_forwarders(cname, lp_list)
 
@@ -634,7 +697,10 @@ def _rerun_box(name: str, entry: dict) -> None:
              # so a restart (and the supervisor-recreate relaunch loop, which
              # lands here) must re-apply the box's own pair or it evaporates.
              model=entry.get("model") or "",
-             effort=entry.get("effort") or "")
+             effort=entry.get("effort") or "",
+             # Same reasoning: the rs-fetch add-host + staging must re-apply
+             # from the stored entry on every re-run.
+             fetch=bool(entry.get("fetch")))
 
 
 def _box_entry(entries: dict[str, dict], name: str) -> dict:
@@ -679,6 +745,9 @@ def cmd_create(args: argparse.Namespace) -> None:
         if mcps:
             die("--mcps is not valid for a dev box (its dedicated bridge has no "
                 "path to mcp-proxy)")
+        if args.fetch:
+            die("--fetch is not valid for a dev box (it works its own fork; "
+                "the read-only fetch surface is for non-dev boxes)")
         # Per-consumer forks: the box's gitea identity is minted HOST-side
         # (research/webui box add) before this runs and arrives as
         # --gitea-user; a bare in-supervisor `rs-sandbox create` cannot mint
@@ -698,6 +767,7 @@ def cmd_create(args: argparse.Namespace) -> None:
         agent = "claude"
     browser = preset.get("image") == "browser"
     editor = bool(args.editor)
+    fetch = bool(args.fetch)
     # Fail LOUD when the editor is requested but the dist is not staged — the
     # silent alternative (_run_box skips the mount, the entrypoint skips the
     # deploy, the box boots editor-less with no error anywhere) is the exact
@@ -739,6 +809,11 @@ def cmd_create(args: argparse.Namespace) -> None:
              "model": model, "effort": effort}
     if editor:
         entry["editor_port"] = editor_port
+    if fetch:
+        # Persisted so _rerun_box re-applies the add-host + re-copies the fetch
+        # halves on every restart/recreate (docker run wiring is fixed at run),
+        # and so the host-side reconciles can find this box.
+        entry["fetch"] = True
     if is_clone:
         entry.update({"repo": repo, "ref": ref, "setup": setup})
     if is_dev:
@@ -750,10 +825,10 @@ def cmd_create(args: argparse.Namespace) -> None:
              editor_port=editor_port, clone_repo=repo if is_clone else "",
              clone_ref=ref, clone_setup=setup,
              dev=dev_info, dev_subnet=dev_subnet,
-             model=model, effort=effort)
+             model=model, effort=effort, fetch=fetch)
     print(json.dumps({"name": name, "ip": ip, "preset": args.preset,
                       "browser": browser, "agent": agent, "editor": editor,
-                      "editor_port": editor_port or None,
+                      "editor_port": editor_port or None, "fetch": fetch,
                       "container": box_container(name)}, indent=2))
 
 
@@ -842,6 +917,20 @@ def cmd_start(args: argparse.Namespace) -> None:
             print(f"box {args.name!r}: re-run at {entry['ip']} "
                   f"(gitea address changed while parked)")
             return
+    if exists and entry.get("fetch"):
+        # Same reconcile for an rs-fetch box: its baked rs-gitea add-host is
+        # fixed at docker run. Guard on a NON-EMPTY staged ip — with "" the
+        # quoted form below never matches, so every start of a parked fetch
+        # box on a wiring-less project would pointlessly re-run it.
+        gitea_ip = _staged_gitea_ip()
+        if gitea_ip:
+            ins = _docker("inspect", "-f", "{{json .HostConfig.ExtraHosts}}", cname)
+            # Quoted JSON form — a bare substring would false-match a prefix ip.
+            if f"\"rs-gitea:{gitea_ip}\"" not in (ins.stdout or ""):
+                _rerun_box(args.name, entry)
+                print(f"box {args.name!r}: re-run at {entry['ip']} "
+                      f"(gitea address changed while parked)")
+                return
     if exists:
         r = _docker("start", cname)
         if r.returncode != 0:
@@ -935,6 +1024,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "box default; ignored for a model with no effort levels)")
     c.add_argument("--editor", action="store_true",
                    help="bundle the code-server editor into this box")
+    c.add_argument("--fetch", action="store_true",
+                   help="wire this box for rs-fetch (read-only fetch of "
+                        "dev-lane agent commits from the shared gitea); the "
+                        "host box-add path stages the fetch surface this "
+                        "copies from — rejected on a dev preset")
     c.add_argument("--mcps", default="",
                    help="comma-separated project MCP names to wire into the box "
                         "(forces the agent on)")

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """rs-fetch — stage agent work from the shared rs-gitea into a local clone.
 
-Staged by the host into every project container and box (never baked;
-the fetch surface is a standing utility of the dev lane). Runs as the
+Staged by the host into rs-fetch-ENABLED surfaces only (opt-in at box /
+project creation — the box window's rs-fetch toggle, or the sandbox
+workflow's create option; never baked, never universal). Runs as the
 container user against the repo's ACTIVE consumer fork (per-consumer forks —
 the owner comes from the staged wiring rows, steered by Management's
 active-fork selector) using the READ-ONLY operator token staged at
@@ -176,29 +177,58 @@ def die(msg: str) -> None:
     sys.exit(1)
 
 
-# The staged non-secret wiring file (host-written; rows carry the repo's
+# The staged non-secret wiring files (host-written; rows carry the repo's
 # ACTIVE fork owner under `user` — per-consumer forks: the owner is no longer
-# derivable from the repo name).
+# derivable from the repo name). TWO homes, cascaded at the ROW level:
+#   * DEV_GITEA_JSON — the PROJECT wiring in the container workspace
+#     (supervisors + the docker substrate; rows cover THIS project's own dev
+#     consumers and are re-staged live on Management's active-fork change).
+#   * BOX_WIRING_JSON — the GLOBAL fetch wiring staged into an rs-fetch-enabled
+#     surface's home dir (every mirrored dev repo -> its active fork owner).
+#     Boxes have no project wiring in their /workspace, and the docker
+#     substrate's project file carries no rows — this file is what makes
+#     cross-project fetch resolvable. Refreshes on box/project restart.
+# The cascade is row-level, NOT file-level: the docker substrate HAS a
+# workspace file (gitea_ip, `repos: []`), so stopping at the first readable
+# file would never reach the global rows.
 DEV_GITEA_JSON = Path("/workspace/.orchestrator/dev-gitea.json")
+BOX_WIRING_JSON = Path.home() / ".dev-tokens" / "fetch-wiring.json"
+
+
+def _wiring_rows(path: Path) -> list | None:
+    """One staged wiring file's `repos` rows, or None when the file is absent/
+    unreadable (the cascade treats unreadable as carrying no rows)."""
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    rows = data.get("repos") if isinstance(data, dict) else None
+    return rows if isinstance(rows, list) else []
 
 
 def fork_owner(repo: str) -> str:
-    """The repo's ACTIVE consumer fork owner, from the staged wiring rows.
-    Host-side Management steers it (the active-fork map); a change re-stages
-    the file, so this read needs no restart. Dies with a remedy when the repo
-    has no staged row — the per-repo `agent-<repo>` derivation is GONE."""
-    try:
-        data = json.loads(DEV_GITEA_JSON.read_text())
-    except (OSError, json.JSONDecodeError):
-        die(f"no dev wiring staged at {DEV_GITEA_JSON}; is this project wired "
-            f"to the dev lane? (add a dev project/box on the repo first)")
-    for row in (data.get("repos") or []) if isinstance(data, dict) else []:
-        if isinstance(row, dict) and row.get("repo") == repo and row.get("user"):
-            return row["user"]
+    """The repo's ACTIVE consumer fork owner, from the staged wiring rows —
+    the workspace file first (project containers; re-staged live on
+    Management's active-fork change), then the home-dir global fetch wiring
+    (rs-fetch-enabled boxes / the docker substrate). Dies with a remedy when
+    neither carries a row — the per-repo `agent-<repo>` derivation is GONE."""
+    ws_rows = _wiring_rows(DEV_GITEA_JSON)
+    box_rows = _wiring_rows(BOX_WIRING_JSON)
+    if ws_rows is None and box_rows is None:
+        die(f"no fetch wiring staged (neither {DEV_GITEA_JSON} nor "
+            f"{BOX_WIRING_JSON} is readable); this surface is not wired for "
+            f"rs-fetch — create the box with the rs-fetch option (box "
+            f"window), or recreate the project with rs-fetch enabled")
+    for rows in ((ws_rows or []), (box_rows or [])):
+        for row in rows:
+            if isinstance(row, dict) and row.get("repo") == repo and row.get("user"):
+                return row["user"]
+    staged = sorted({r.get("repo") for rows in ((ws_rows or []), (box_rows or []))
+                     for r in rows if isinstance(r, dict) and r.get("repo")})
     die(f"repo {repo!r} has no staged fork owner (staged repos: "
-        f"{sorted(r.get('repo') for r in data.get('repos') or [] if isinstance(r, dict)) or 'none'}); "
-        f"add a dev project/box on it, or set the active fork on the "
-        f"Development page")
+        f"{staged or 'none'}); add a dev project/box on it (or set the "
+        f"active fork on the Development page), then restart this "
+        f"box/project to refresh the wiring")
 
 
 def valid_commit_sha(sha: str) -> bool:
@@ -235,9 +265,10 @@ def read_token() -> str:
     except OSError:
         tok = ""
     if not tok:
-        die(f"operator token missing at {TOKEN_PATH}; the host stages it once "
-            f"the dev lane exists — re-run `research start` (or restart this "
-            f"box) and retry")
+        die(f"operator token missing at {TOKEN_PATH}; it is staged only into "
+            f"rs-fetch-enabled surfaces — create the box with the rs-fetch "
+            f"option (box window) or recreate the project with rs-fetch "
+            f"enabled; a stop/start of the project re-stages it")
     return tok
 
 
@@ -255,8 +286,9 @@ def api_get(path: str, token: str):
         die(f"gitea GET {path} -> HTTP {e.code}")
     except (URLError, OSError) as e:
         die(f"cannot reach gitea at {GITEA_BASE}: "
-            f"{getattr(e, 'reason', e)} (is this container wired to the dev "
-            f"lane? re-run `research start` or restart this box)")
+            f"{getattr(e, 'reason', e)} (is this surface wired for rs-fetch, "
+            f"and is Gitea enabled on the Management page? restarting this "
+            f"box/project refreshes the wiring)")
     try:
         return json.loads(raw) if raw else None
     except json.JSONDecodeError:

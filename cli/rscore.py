@@ -498,6 +498,13 @@ class CreateRequest:
     # never a raw relayed create.
     dev_lane: bool = False
     dev_repo: str = ""
+    # Opt-in rs-fetch surface (docker substrate ONLY — from_kwargs rejects it
+    # elsewhere: on dind projects fetch is a PER-BOX option, the box window's
+    # toggle). When set, create() stages the read-only fetch tool + operator
+    # token + the global fetch wiring into the project container. An IN-BOX
+    # capability field (no path, no host port, no mount), so it is broker-
+    # openable (CREATE_WEBUI_FIELDS).
+    fetch: bool = False
     # Agent model + effort per container type (STAGE_MODEL_SELECT). "" = not
     # specified ⇒ the type's default from models/defaults.json ⊕ the operator
     # override. RESOLVED here in from_kwargs (host-side) and frozen CONCRETE into
@@ -525,6 +532,26 @@ class CreateRequest:
         # validation choke point, so create() consumes the same fields as before.
         workflow_id = kw.get("workflow") or DEFAULT_WORKFLOW
         manifest, project_type, substrate = _resolve_workflow(workflow_id)
+        # Opt-in rs-fetch — two fail-early gates, deliberately ordered BEFORE
+        # the dist/editor floors below so both stay hermetically testable:
+        # (a) the flag is docker-substrate-only (on dind projects fetch is a
+        # per-box option); (b) the bootstrap floor — an explicit fetch ask on
+        # a host whose dev lane was never enabled refuses instantly instead of
+        # building the whole container and dying at the deep
+        # _resume_gitea(require=True) gate in create() (which stays as the
+        # TOCTOU authority). Both messages are webui-safe (ValidationError
+        # text reaches the browser verbatim — no CLI verbs).
+        fetch = bool(kw.get("fetch", False))
+        if fetch and substrate is not Substrate.DOCKER:
+            raise ValidationError(
+                "the rs-fetch option applies to the single-container sandbox "
+                "workflow only; on this workflow it is a per-box option (the "
+                "box window's rs-fetch toggle)")
+        if fetch and not gitea.bootstrap_present():
+            raise ValidationError(
+                "this project requests rs-fetch, but the dev lane (Gitea) is "
+                "not enabled on this host yet — enable Gitea from the "
+                "Management page, then retry")
         # Per-flavor service defaults from the manifest (STAGE_EDITOR_DIST slice 2;
         # validated at catalog-load time): research/sandbox-dind omit `services` ⇒ {}
         # ⇒ editor on; `sandbox` declares {"code-server": false} ⇒ lean box.
@@ -735,6 +762,7 @@ class CreateRequest:
             greeting=greeting,
             dev_lane=dev_lane,
             dev_repo=dev_repo,
+            fetch=fetch,
             supervisor_model=sup_m, supervisor_effort=sup_e,
             worker_model=wrk_m, worker_effort=wrk_e,
             role_model=rol_m, role_effort=rol_e,
@@ -983,6 +1011,11 @@ class BoxAddRequest:
     # parent) expressible at all.
     model: str = ""
     effort: str = ""
+    # Opt-in rs-fetch surface: stage the read-only fetch tool + operator token
+    # + the global fetch wiring into THIS box (plus the rs-gitea --add-host at
+    # run). REJECTED on a dev preset — the agent's own box must not hold the
+    # read-all-forks operator token; gated in box_add, which has the catalog.
+    fetch: bool = False
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "BoxAddRequest":
@@ -1031,7 +1064,8 @@ class BoxAddRequest:
             agent=agent, editor=bool(kw.get("editor", False)),
             mcps=tuple(mcps), repo=(kw.get("repo") or "").strip(),
             ref=(kw.get("ref") or "").strip(), setup=(kw.get("setup") or ""),
-            model=_model, effort=_effort)
+            model=_model, effort=_effort,
+            fetch=bool(kw.get("fetch", False)))
 
 
 @dataclass(frozen=True)
@@ -1706,6 +1740,7 @@ class BoxAddResult:
     agent: str
     editor: bool
     container: str
+    fetch: bool = False
 
 
 @dataclass
@@ -1934,6 +1969,11 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         # box-create, never on restart. (Research carries no frozen pins — it stages
         # boxes LAZILY via box_add against the current versions.env pins.)
         marker["box_image_pins"] = _box_image_pins(load_versions())
+    if req.fetch:
+        # Opt-in rs-fetch (docker substrate; gated in from_kwargs): the marker
+        # key drives the conditional re-stage of the fetch surface at
+        # start/recreate (_project_has_fetch_consumers).
+        marker["fetch"] = True
     (orch_dir / "project.json").write_text(json.dumps(marker, indent=2) + "\n")
     # Starting message (STAGE_SPAWN_GREETING) for the workflow's main shell, read
     # by the Management/Supervisor tab on first byobu new-session. Manifest-
@@ -2227,16 +2267,18 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
 
         progress.step("wire", "enabling workers")
 
-    # Universal dev-lane wiring (STAGE_DEV_GITEA S3): once the shared gitea
-    # exists, EVERY project is wired to it at create and gets the fetch surface
-    # — a standing utility, not a designation (the read-only operator token can
-    # fetch agent forks and write nothing; the human's push credential and the
-    # review verdicts never ride this path). BEST-EFFORT for non-dev workflows:
-    # a sick gitea must never fail a research/sandbox create. _resume_gitea
-    # RESUMES an enabled-but-stopped gitea (never creates — deliberate-create
-    # model) and returns False when it was never enabled, so a gitea-less create
-    # is byte-equivalent; a resume-path failure (wedged wait) die()s → SystemExit
-    # → caught, warn, continue. The dev workflow wired STRICTLY above (require).
+    # Universal dev-lane wiring (STAGE_DEV_GITEA S3; fetch is OPT-IN now): once
+    # the shared gitea exists, EVERY project's NETWORK is wired to it at create
+    # and the non-secret dev-gitea.json is staged (the gitea_ip floor for dev
+    # boxes + consumers). The FETCH surface (tool + operator token + global
+    # wiring) does NOT ride this path anymore — it is staged per-box (box_add)
+    # or per docker project (the req.fetch step below); unflagged surfaces get
+    # nothing. BEST-EFFORT for non-dev workflows: a sick gitea must never fail
+    # a research/sandbox create. _resume_gitea RESUMES an enabled-but-stopped
+    # gitea (never creates — deliberate-create model) and returns False when it
+    # was never enabled, so a gitea-less create is byte-equivalent; a
+    # resume-path failure (wedged wait) die()s → SystemExit → caught, warn,
+    # continue. The dev workflow wired STRICTLY above (require).
     if not req.dev_repo:
         try:
             if _resume_gitea(require=False):
@@ -2250,9 +2292,21 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         except SystemExit:
             print("warning: rs-gitea unavailable; dev wiring skipped "
                   "(heals at `research start`)", file=sys.stderr)
-    # Self-gating (silent no-op until the dev lane's operator token exists), so
-    # this covers the dev workflow, the universal path, and both substrates.
-    _stage_dev_fetch(container_name)
+    # Opt-in rs-fetch (docker substrate; from_kwargs rejects the flag on dind —
+    # there it is a per-box option in box_add). STRICT, unlike the best-effort
+    # universal wiring above: the flag is an explicit ask, so a sick gitea
+    # fails the create loudly (the from_kwargs bootstrap floor already refused
+    # the never-enabled case; _resume_gitea is the TOCTOU authority). No
+    # --add-host needed: this container sits on rs-net-<project>, where
+    # rs-gitea resolves via the bridge's embedded DNS.
+    if req.fetch:
+        _resume_gitea(require=True)
+        fetch_ip = _connect_gitea_to_project_network(network)
+        if not fetch_ip:
+            die(f"rs-gitea did not attach to {network} (no IP); check docker state")
+        _stage_dev_gitea(project, cfg, gitea_ip=fetch_ip)
+        _stage_dev_fetch(container_name)
+        _stage_fetch_wiring(container_name)
     # F3 Slice 1: bring up loopback forwarders for any already-registered exported
     # ports (inert on a fresh project's empty registry; self-gates on docker).
     _reconcile_loopback_bridges(project, cfg)
@@ -5354,11 +5408,15 @@ def _recreate_supervisor(
     # record too (the network attachment itself survives a recreate).
     if gitea.project_entries(project):
         _stage_dev_gitea(project, cfg)
-    # Universal fetch surface (S3): rs-fetch + the operator token also live in
-    # the wiped container fs — re-stage for EVERY project (self-gating no-op
-    # until the dev lane exists; dev-gitea.json itself survives on the
-    # workspace volume).
-    _stage_dev_fetch(container)
+    # Opt-in fetch surface (universal staging RETIRED): the recreate wiped the
+    # supervisor halves the boxes copy from (rs-fetch tool + operator token +
+    # the global fetch wiring) — re-stage them iff this project carries any
+    # rs-fetch-enabled consumer, BEFORE the box relaunch loop below (a fetch
+    # box's _rerun_box → _stage_box_fetch copies these; the
+    # order-is-load-bearing class).
+    if _project_has_fetch_consumers(workspace_path):
+        _stage_dev_fetch(container)
+        _stage_fetch_wiring(container)
     # F3 Slice 2a: the sysbox recreate reset the supervisor's netns/processes —
     # re-establish loopback forwarders for its registered exported ports (Fork-B).
     _reconcile_loopback_bridges(project, cfg)
@@ -5432,7 +5490,12 @@ def _start_docker_substrate(project: str, cfg: "Config") -> None:  # type: ignor
     except SystemExit:
         print("warning: rs-gitea unavailable; dev wiring not refreshed",
               file=sys.stderr)
-    _stage_dev_fetch(container)
+    # Opt-in fetch surface (marker-gated; universal staging RETIRED): a stop
+    # keeps the container fs, but re-staging keeps the wiring fresh (gitea's
+    # IP on this network can change across the stop).
+    if _project_has_fetch_consumers(workspace_path_for(project, cfg)):
+        _stage_dev_fetch(container)
+        _stage_fetch_wiring(container)
     # F3 Slice 1: re-establish loopback forwarders for the project's registered
     # exported ports (the container's netns/processes reset on stop/start).
     _reconcile_loopback_bridges(project, cfg)
@@ -5548,10 +5611,12 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
     # applying (node is create-time only, so it is unchanged on this path).
     if service_flags.get("node") and node_dist_present():
         _deploy_node(container)
-    # Universal fetch surface (STAGE_DEV_GITEA S3): the rm + run above wiped the
-    # container fs — re-stage rs-fetch + the operator token (self-gating no-op
-    # when the dev lane doesn't exist).
-    _stage_dev_fetch(container)
+    # Opt-in fetch surface (marker-gated; universal staging RETIRED): the rm +
+    # run above wiped the container fs — re-stage the fetch halves for a
+    # fetch-enabled project.
+    if _project_has_fetch_consumers(workspace_path):
+        _stage_dev_fetch(container)
+        _stage_fetch_wiring(container)
     # F3 Slice 1: the rm + run above wiped the container fs + netns — re-establish
     # loopback forwarders for the project's registered exported ports.
     _reconcile_loopback_bridges(project, cfg)
@@ -6046,14 +6111,15 @@ def _connect_gitea_to_project_network(network: str) -> str:
 
 
 def wire_gitea_to_projects() -> None:
-    """Re-attach rs-gitea after a host `start`/recreate — UNIVERSAL, like
-    wire_registry_to_projects (STAGE_DEV_GITEA S3: the fetch surface is a
-    standing utility, so EVERY project is wired once gitea exists), refreshing
-    each record entry's gitea_ip on reconnect and re-staging the project-side
-    wiring + fetch surface. No-op if gitea was never stood up (no dev repo
-    added yet). Dev boxes keep their record-scoped auto-heal
-    (_restart_dev_boxes — a strict no-op on the stable path); plain boxes heal
-    a stale address by restart (the greenfield posture, recorded in the plan)."""
+    """Re-attach rs-gitea after a host `start`/recreate — UNIVERSAL network
+    wiring, like wire_registry_to_projects (STAGE_DEV_GITEA S3: every project
+    is wired once gitea exists), refreshing each record entry's gitea_ip on
+    reconnect and re-staging the project-side non-secret wiring. The FETCH
+    surface is OPT-IN now: its supervisor halves re-stage only for projects
+    carrying rs-fetch consumers. Dev AND rs-fetch boxes get the per-box
+    ExtraHosts auto-heal (_restart_dev_boxes — a strict no-op on the stable
+    path); unflagged boxes carry no gitea address at all. No-op if gitea was
+    never stood up."""
     if not container_exists(gitea.GITEA_CONTAINER):
         return
     if not container_running(gitea.GITEA_CONTAINER):
@@ -6081,17 +6147,22 @@ def wire_gitea_to_projects() -> None:
             gitea.record_attachment(project, e["class"], e.get("repo"), ip,
                                     box=e.get("box"), user=e.get("user") or "")
         # Project-side wiring: the non-secret file + agent tokens ride the
-        # record; the fetch surface is universal (self-gating). Dev-box
-        # reconcile stays record-scoped — per-box change detection (actual
-        # ExtraHosts vs the staged address) lives in _restart_dev_boxes;
-        # stable path = no-op.
+        # record; the fetch surface is OPT-IN now (universal staging RETIRED) —
+        # re-stage the supervisor halves only for a project carrying rs-fetch
+        # consumers, BEFORE the box reconcile below (a re-run box copies them).
         _stage_dev_gitea(project, cfg, gitea_ip=ip)
-        _stage_dev_fetch(container_name_for(project))
+        if _project_has_fetch_consumers(workspace_path_for(project, cfg)):
+            _stage_dev_fetch(container_name_for(project))
+            _stage_fetch_wiring(container_name_for(project))
         # F3 Slice 1: heal loopback forwarders on the universal `research start`
         # wiring pass (self-gates on docker; no-op for non-docker projects).
         _reconcile_loopback_bridges(project, cfg)
-        if gitea.project_entries(project):
-            _restart_dev_boxes(project, cfg, ip)
+        # UNGATED (was `if gitea.project_entries(project):`): fetch boxes mint
+        # no gitea consumer, so a ledger gate would skip exactly the projects
+        # the fetch half of the reconcile targets. _restart_dev_boxes
+        # self-gates (gitea_ip + container_running) and its entry filter skips
+        # projects with neither dev nor fetch boxes — the stable no-op.
+        _restart_dev_boxes(project, cfg, ip)
 
 
 def _stage_dev_gitea(project: str, cfg: "Config", gitea_ip: str = "") -> None:
@@ -6195,16 +6266,19 @@ def _stage_dev_gitea(project: str, cfg: "Config", gitea_ip: str = "") -> None:
 
 
 def _stage_dev_fetch(container: str) -> None:
-    """Stage the universal fetch surface (STAGE_DEV_GITEA S3) into a RUNNING
-    project container: the rs-fetch tool at /usr/local/bin/rs-fetch (root-owned
-    0755 — the _stage_rs_sandbox single-file stdin idiom) + the READ-ONLY gitea
-    operator token at ~/.dev-tokens/operator.token (0600, the agent-token stdin
-    pattern — never argv, never the workspace). Every container gets it once
-    the dev lane exists: the crown jewels (the human's push credential, review
-    verdicts) never ride this surface. SILENT skip when the operator token
-    doesn't exist (dev lane never bootstrapped) or the container isn't running
-    — a gitea-less `research start` can't warn-spam. A staging failure WARNS
-    and continues: the container is fine without fetch."""
+    """Stage the OPT-IN fetch surface into a RUNNING rs-fetch-enabled project
+    container: the rs-fetch tool at /usr/local/bin/rs-fetch (root-owned 0755 —
+    the _stage_rs_sandbox single-file stdin idiom) + the READ-ONLY gitea
+    operator token at ~/.dev-tokens/operator.token (0600, the agent-token
+    stdin pattern — never argv, never the workspace). Called only for fetch
+    consumers now (the universal every-container staging is RETIRED): the
+    crown jewels (the human's push credential, review verdicts) never ride
+    this surface, and unflagged containers get NOTHING. SILENT skip when the
+    operator token doesn't exist (dev lane never bootstrapped) or the
+    container isn't running — callers gate on the explicit ask, and the
+    bootstrap floor already refused the never-enabled case on those paths. A
+    staging failure WARNS and continues: the container is fine without
+    fetch."""
     try:
         tok = gitea.OPERATOR_TOKEN_PATH.read_text().strip()
     except OSError:
@@ -6231,6 +6305,55 @@ def _stage_dev_fetch(container: str) -> None:
             input=tok + "\n", capture_output=True)
     if r.returncode != 0:
         print(f"warning: operator-token staging into {container} failed: "
+              f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
+
+
+def _stage_fetch_wiring(container: str) -> None:
+    """Stage the GLOBAL fetch wiring into a RUNNING rs-fetch-enabled container:
+    every mirrored dev repo -> its ACTIVE consumer fork owner, written to
+    ~/.dev-tokens/fetch-wiring.json (rs_fetch.BOX_WIRING_JSON — a mirror-pair
+    path lockstep; the staged rs-fetch cannot import this module). NON-SECRET
+    by construction: the writer only emits repo/owner NAME fields. Cross-
+    project on purpose (fork F3): a project's own dev-gitea.json rows cover
+    only that project's consumers, while a fetch surface may pull any dev-lane
+    repo — the read-only operator token already reads every consumer fork, so
+    the row list adds reach, never privilege. Owner resolution mirrors
+    _stage_dev_gitea's: the explicit active-fork map, then a live-gitea
+    resolution (guarded on a RUNNING gitea), then any ledger consumer;
+    unresolvable repos are SKIPPED (a fork-less mirror is not fetchable —
+    never die). Staleness (a later active-fork change / new repo) heals at
+    box/project restart — the re-run re-copies (the ExtraHosts-heal posture,
+    fork F5). Best-effort: a failure warns and leaves the container usable
+    without fetch."""
+    try:
+        mirrors = sorted(p.name for p in gitea.MIRRORS_DIR.iterdir()
+                         if p.is_file())
+    except OSError:
+        mirrors = []
+    active_map = gitea.load_active_forks()
+    ledger = gitea.load_attachments()
+    rows = []
+    for repo in mirrors:
+        owner = active_map.get(repo, "")
+        if not owner and container_running(gitea.GITEA_CONTAINER):
+            try:
+                owner = gitea.active_fork_for(_gitea_host_port(), repo)
+            except gitea.GiteaError:
+                owner = ""
+        if not owner:
+            owner = next((e.get("user") for e in ledger
+                          if e.get("repo") == repo and e.get("user")), "")
+        if owner:
+            rows.append({"repo": repo, "user": owner})
+    if not container_running(container):
+        return
+    payload = json.dumps({"repos": rows}, indent=2, sort_keys=True) + "\n"
+    r = run(["docker", "exec", "-i", "-u", "research", container, "sh", "-c",
+             'umask 077 && mkdir -p "$HOME/.dev-tokens" && '
+             'cat > "$HOME/.dev-tokens/fetch-wiring.json"'],
+            input=payload, capture_output=True)
+    if r.returncode != 0:
+        print(f"warning: fetch-wiring staging into {container} failed: "
               f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
 
 
@@ -6358,8 +6481,11 @@ exit 0'''
 
 
 def _restart_dev_boxes(project: str, cfg: "Config", gitea_ip: str) -> None:
-    """F1 auto-heal (STAGE_DEV_GITEA S2): re-run any RUNNING dev box whose
-    baked /etc/hosts entry does not match the CURRENTLY staged gitea address.
+    """F1 auto-heal (STAGE_DEV_GITEA S2): re-run any RUNNING dev OR
+    rs-fetch-enabled box whose baked /etc/hosts entry does not match the
+    CURRENTLY staged gitea address (both kinds bake the same rs-gitea
+    --add-host at docker run; a fetch box's re-run also re-copies the fetch
+    halves via _stage_box_fetch).
     The change check is against the box container's ACTUAL ExtraHosts —
     --add-host is fixed at docker run, and only a re-run (rs-sandbox restart →
     _rerun_box → rm+run, re-reading the fresh staging) refreshes it — NOT
@@ -6377,7 +6503,7 @@ def _restart_dev_boxes(project: str, cfg: "Config", gitea_ip: str) -> None:
     ws = workspace_path_for(project, cfg)
     for name, e in sorted(extension.load(ws).items()):
         if not (isinstance(e, dict) and e.get("kind") == extension.SANDBOX_KIND
-                and e.get("dev")):
+                and (e.get("dev") or e.get("fetch"))):
             continue
         cname = e.get("container") or f"rs-pi-iso-{name}"
         ins = run(["docker", "exec", container, "docker", "inspect", "-f",
@@ -6394,11 +6520,11 @@ def _restart_dev_boxes(project: str, cfg: "Config", gitea_ip: str) -> None:
         r = run(["docker", "exec", container, "rs-sandbox", "restart", name],
                 capture_output=True)
         if r.returncode != 0:
-            print(f"warning: dev box {name!r} re-run after the gitea address "
-                  f"change failed: {(r.stderr or r.stdout).strip()}",
+            print(f"warning: dev/fetch box {name!r} re-run after the gitea "
+                  f"address change failed: {(r.stderr or r.stdout).strip()}",
                   file=sys.stderr)
         else:
-            print(f"dev box {name!r} re-run against the new gitea address")
+            print(f"dev/fetch box {name!r} re-run against the new gitea address")
 
 
 def _run_dev_clone(container: str, repo: str, user: str, progress) -> str:
@@ -6539,6 +6665,26 @@ def _ensure_box_harness(container: str, network: str, workspace_path: "Path",
                       latest_tag]):
         pins = _read_box_pins(workspace_path) or _box_image_pins(load_versions())
         _deliver_box_images(container, network, pins, push=True, only={host_base})
+
+
+def _project_has_fetch_consumers(workspace_path: "Path") -> bool:
+    """True when this project carries any opt-in rs-fetch surface: the docker
+    substrate's marker `fetch` key, or any rs-fetch-enabled box entry in
+    extensions.json. Drives the conditional re-stage of the supervisor-side
+    fetch halves at start/recreate/wire (the universal staging is retired).
+    Tolerant reads — missing/corrupt ⇒ False: an unflagged project must never
+    grow the surface from a bad file."""
+    f = workspace_path / ".orchestrator" / "project.json"
+    try:
+        if json.loads(f.read_text()).get("fetch") is True:
+            return True
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
+    try:
+        entries = extension.load(workspace_path)
+    except Exception:
+        return False
+    return any(isinstance(e, dict) and e.get("fetch") for e in entries.values())
 
 
 def _read_marker_agents(workspace_path: "Path") -> list[str]:
@@ -7761,6 +7907,10 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
                 "to mcp-proxy)")
         if req.ref or req.setup:
             raise ValidationError("ref/setup are not valid for a dev box")
+        if req.fetch:
+            raise ValidationError(
+                "a dev box does not take the rs-fetch option (it works its "
+                "own fork; the read-only fetch surface is for non-dev boxes)")
         if not _valid_dev_repo_name(req.repo):
             raise ValidationError(
                 "a dev box requires 'repo': the NAME of an added dev repo")
@@ -7777,6 +7927,17 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
             raise ValidationError(
                 "a dev box requires an explicit name (its gitea identity is "
                 "minted from <project>.<name> before the box runs)")
+    # Fail-early rs-fetch floor (the dev-lane bootstrap_present precedent): an
+    # explicit fetch ask on a host whose dev lane was never enabled refuses
+    # BEFORE any harness/image/editor work below — and AFTER the dev-preset
+    # gate above, so a dev+fetch request gets the correct dev refusal, never a
+    # misleading Gitea remedy. _resume_gitea(require=True) in the fetch branch
+    # below stays the TOCTOU authority. Webui-safe wording (no CLI verbs).
+    if req.fetch and not gitea.bootstrap_present():
+        raise ValidationError(
+            "this box requests rs-fetch, but the dev lane (Gitea) is not "
+            "enabled on this host yet — enable Gitea from the Management "
+            "page, then retry")
     # Lazily stand up the box harness. On research this stages rs-sandbox + delivers
     # the needed box image on first use (research create/recreate never touch boxes
     # — the frozen lane); on sandbox-dind (eager-staged) it no-ops. The image a box
@@ -7823,6 +7984,24 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         gitea.record_attachment(req.project, "agent", req.repo, ip,
                                 box=req.name, user=box_user)
         _stage_dev_gitea(req.project, cfg, gitea_ip=ip)
+    # Opt-in rs-fetch wiring (host side): resume gitea (the authority behind
+    # the bootstrap floor above), connect it to this project's network, ensure
+    # the workspace wiring carries the gitea_ip (rs_sandbox._staged_gitea_ip's
+    # source for the box --add-host), then stage the supervisor halves the box
+    # run copies in: the rs-fetch tool + read-only operator token
+    # (_stage_dev_fetch) and the GLOBAL repo->active-fork wiring
+    # (_stage_fetch_wiring). This ordering makes the box-side copy sources
+    # present by construction before `rs-sandbox create --fetch` runs below.
+    # Mutually exclusive with the dev branch above (fetch is rejected there).
+    if req.fetch:
+        _resume_gitea(require=True)
+        network = project_network_for(req.project)
+        ip = _connect_gitea_to_project_network(network)
+        if not ip:
+            die(f"rs-gitea did not attach to {network} (no IP); check docker state")
+        _stage_dev_gitea(req.project, cfg, gitea_ip=ip)
+        _stage_dev_fetch(container)
+        _stage_fetch_wiring(container)
     # Agent model + effort for this box (STAGE_MODEL_SELECT). Explicit wins;
     # otherwise the project's `box` pair from the marker — which create already
     # wrote CONCRETE and effort-drop-resolved, so it is safe to use as-is. A box
@@ -7855,6 +8034,8 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         argv += ["--effort", box_effort]
     if req.editor:
         argv.append("--editor")
+    if req.fetch:
+        argv.append("--fetch")
     if req.mcps:
         argv += ["--mcps", ",".join(req.mcps)]
     if req.repo:
@@ -7895,7 +8076,8 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
                         browser=bool(info.get("browser")),
                         agent=info.get("agent", "none"),
                         editor=bool(info.get("editor", req.editor)),
-                        container=info["container"])
+                        container=info["container"],
+                        fetch=bool(info.get("fetch", req.fetch)))
 
 
 def box_remove(req: "BoxRemoveRequest", progress=None) -> BoxRemoveResult:  # type: ignore[name-defined]

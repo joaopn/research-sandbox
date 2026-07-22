@@ -3353,6 +3353,24 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent) {
         editorCb.checked = !editorCb.checked;
         editorCard.classList.toggle("selected", editorCb.checked);
     };
+    // rs-fetch (opt-in fetch surface) — docker substrate ONLY, default off: on
+    // dind workflows fetch is a per-box option (the box window's toggle) and
+    // from_kwargs rejects a project-level fetch there, so the card is only
+    // offered on the docker branch of the Extensions row below. Checked →
+    // `fetch: true` in the payload.
+    const fetchCb = el("input", { type: "checkbox" });
+    fetchCb.checked = false;
+    const fetchCard = el("div", {
+        class: "box-opt-card",
+        title: "Wire this box to fetch dev-lane agent commits: rs-fetch " +
+               "stages agent work from the shared Gitea into a git clone in " +
+               "this box. Read-only — no write access to Gitea, no access " +
+               "to dev containers. Needs Gitea enabled (Management page).",
+    }, [el("span", { class: "box-opt-name" }, ["rs-fetch"])]);
+    fetchCard.onclick = () => {
+        fetchCb.checked = !fetchCb.checked;
+        fetchCard.classList.toggle("selected", fetchCb.checked);
+    };
     // Reader (mobile artifact viewer, STAGE_READER) — dind-only + default OFF.
     // Checked → enable:["reader"] (merged with worker presets in the payload). The
     // card is offered ONLY on dind workflows (!isDocker): the backend rejects reader
@@ -3460,11 +3478,13 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent) {
         ])] : []),
         el("div", { class: "box-opt-group" }, [
             el("div", { class: "box-opt-caption" }, ["Extensions"]),
-            // Node is substrate-agnostic (all flavors); reader is dind-only. Node
-            // must appear on BOTH branches of the isDocker fork — the docker box is
-            // where node-based store workflows (open-knowledge) run.
+            // Node is substrate-agnostic (all flavors); reader is dind-only;
+            // rs-fetch is docker-only (dind projects take it per-box in the box
+            // window — no dead-end control). Node must appear on BOTH branches
+            // of the isDocker fork — the docker box is where node-based store
+            // workflows (open-knowledge) run.
             el("div", { class: "box-opt-cards" },
-               isDocker ? [editorCard, nodeCard]
+               isDocker ? [editorCard, fetchCard, nodeCard]
                         : [editorCard, readerCard, nodeCard]),
         ]),
     ]);
@@ -3621,6 +3641,9 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent) {
             };
             // Editor on by default; unchecking disables the code-server service.
             if (!editorCb.checked) payload.disable = ["code-server"];
+            // Opt-in rs-fetch — docker substrate only (the card is only shown
+            // there; from_kwargs rejects it elsewhere). Sent only when checked.
+            if (isDocker && fetchCb.checked) payload.fetch = true;
             // Build ONE merged enable array so the reader tickbox and the worker
             // presets don't clobber each other (the broker drops silently, so a
             // second assignment would just lose the other's tokens). Worker presets
@@ -4109,6 +4132,24 @@ async function mgmtBoxAddDialog(project) {
         editorCard.classList.toggle("selected", editorCb.checked);
     };
 
+    // rs-fetch (opt-in fetch surface, default off). The card's `title` is the
+    // toggle's explainer; fetchCb stays the detached value-holder (the editor
+    // pattern). A dev preset disables it in applyPreset — box_add rejects the
+    // combination, so the dialog must not offer a guaranteed rejection.
+    const fetchCb = el("input", { type: "checkbox" });    // box-level toggle, default off
+    const fetchCard = el("div", {
+        class: "box-opt-card",
+        title: "Wire this box to fetch dev-lane agent commits: rs-fetch " +
+               "stages agent work from the shared Gitea into a git clone in " +
+               "this box. Read-only — no write access to Gitea, no access " +
+               "to dev containers.",
+    }, [el("span", { class: "box-opt-name" }, ["rs-fetch"])]);
+    fetchCard.onclick = () => {
+        if (fetchCard.classList.contains("disabled")) return;
+        fetchCb.checked = !fetchCb.checked;
+        fetchCard.classList.toggle("selected", fetchCb.checked);
+    };
+
     // MCP picker over the project's allowed MCPs. Checking ≥1 forces the agent on
     // (nothing else reaches an MCP) — reflect the backend coupling by forcing +
     // disabling the agent select.
@@ -4180,6 +4221,13 @@ async function mgmtBoxAddDialog(project) {
         // Pre-check the editor toggle from the preset's UI default (still un-checkable).
         editorCb.checked = !!selectedPreset.editor_default;
         editorCard.classList.toggle("selected", editorCb.checked);
+        // A dev box refuses rs-fetch (it works its own fork; box_add rejects
+        // the combination) — uncheck + disable rather than offer a rejection.
+        if (isDev) {
+            fetchCb.checked = false;
+            fetchCard.classList.remove("selected");
+        }
+        fetchCard.classList.toggle("disabled", isDev);
         // Show the BYO clone fields only when the preset clones AND the repo isn't
         // baked into the preset (a baked-repo preset like paper-orchestra hides them);
         // a dev preset shows the attached-repo picker instead.
@@ -4228,7 +4276,7 @@ async function mgmtBoxAddDialog(project) {
                 ]),
                 el("div", { class: "box-opt-group" }, [
                     el("div", { class: "box-opt-caption" }, ["Extensions"]),
-                    el("div", { class: "box-opt-cards" }, [editorCard]),
+                    el("div", { class: "box-opt-cards" }, [editorCard, fetchCard]),
                 ]),
                 el("div", { class: "box-opt-group" }, [
                     el("div", { class: "box-opt-caption" }, ["MCP tools"]),
@@ -4287,6 +4335,7 @@ async function mgmtBoxAddDialog(project) {
                 name: nameI.value.trim() || null,
                 preset: selectedPreset.name,
                 editor: editorCb.checked,
+                fetch: fetchCb.checked,
                 mcps: mcpBoxes.filter((b) => b.cb.checked).map((b) => b.name),
             };
             // Agent is always explicit now (the preset default is pre-selected,

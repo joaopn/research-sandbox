@@ -32,6 +32,8 @@ Independent of the type:
 - **Agent** — deploy `claude` into the box (defaults per type: empty off, the
   others on). Selecting any MCP turns it on.
 - **Editor** — bundle the code-server editor (off by default).
+- **rs-fetch** — wire the box to pull dev-lane agent commits from the shared
+  Gitea into a git clone here (read-only; off by default; not on dev boxes).
 - **MCP tools** — wire any of the project's allowed MCP servers into the box's
   agent through the inner proxy.
 
