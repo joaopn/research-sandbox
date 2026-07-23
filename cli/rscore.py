@@ -9312,13 +9312,20 @@ def review_pr(req: "ReviewRequest", progress=None) -> dict:  # type: ignore[name
                 f"(see the full log)")
         reviewed_at = datetime.datetime.now(
             datetime.timezone.utc).isoformat()
+        # Display-ready record of what actually RAN (the resolved pair, not
+        # the defaults at render time); empty effort -> no trailing word.
+        # _parse_verdict shape-coerces to summary/risk/findings only, so the
+        # **verdict spread can never carry a "model" key over this one.
+        rev_desc = f"{DEFAULT_AGENT} {rev_model}" + (
+            f" {rev_effort}" if rev_effort else "")
         if req.commit:
             entry = {"repo": repo, "commit": req.commit, "status": "ok",
-                     "reviewed_at": reviewed_at, **verdict}
+                     "reviewed_at": reviewed_at, "model": rev_desc, **verdict}
             ledger = gitea.save_commit_verdict(repo, req.commit, entry)
         else:
             entry = {"repo": repo, "pr": pr, "head_sha": head_sha,
-                     "status": "ok", "reviewed_at": reviewed_at, **verdict}
+                     "status": "ok", "reviewed_at": reviewed_at,
+                     "model": rev_desc, **verdict}
             ledger = gitea.save_verdict(repo, pr, entry)
         progress.step("verdict", "verdict recorded")
 
@@ -9340,6 +9347,7 @@ def review_pr(req: "ReviewRequest", progress=None) -> dict:  # type: ignore[name
                 "status": "ok",
                 "summary": verdict.get("summary", ""),
                 "risk": verdict.get("risk", ""),
+                "model": rev_desc,
                 "ledger": str(ledger)}
     finally:
         run(["docker", "rm", "-f", name], capture_output=True)

@@ -1994,7 +1994,8 @@ function devRenderCommitReviewCell(cell, repo, sha, v, ctx) {
         const vpanel = el("div", { class: "dev-verdict-panel" });
         vpanel.style.display = "none";
         vpanel.appendChild(el("div", { class: "dev-pr-meta" },
-            [`reviewed ${v.reviewed_at || ""}`]));
+            [`reviewed ${v.reviewed_at || ""}`
+             + (v.model ? ` (model: ${v.model})` : "")]));
         if (v.summary) {
             vpanel.appendChild(el("div", { class: "dev-verdict-summary" },
                                   [v.summary]));
@@ -2709,6 +2710,7 @@ function buildDevRepoCard(view, body, r, attached, opts) {
             panel.style.display = "none";
             panel.appendChild(el("div", { class: "dev-pr-meta" }, [
                 `reviewed ${v.reviewed_at || ""}`
+                + (v.model ? ` (model: ${v.model})` : "")
                 + (stale ? " — the PR has new commits since this review" : ""),
             ]));
             if (v.summary) {
