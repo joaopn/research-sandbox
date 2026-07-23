@@ -24,9 +24,28 @@ STAGED changes — a 3-way patch application (``git apply --3way``) of exactly
 the NEW commits' diff — with the agent's commit message(s) prefilled
 (SCRUBBED, see below) into git's message file, so ``git commit`` opens ready
 to edit. Staged work does NOT show in bare ``git diff``: review with ``git
-diff --staged``. rs-fetch NEVER commits, and authorship is always the human's
-— ``git apply`` carries no commit metadata at all, so the agent is
-structurally neither author nor committer of anything this tool stages.
+diff --staged``. rs-fetch never commits WITHOUT the explicit ``--auto-commit``
+flag below, and authorship is always the human's — ``git apply`` carries no
+commit metadata at all, so the agent is structurally neither author nor
+committer of anything this tool stages.
+
+``--auto-commit`` (explicit, per command) is the one exception to stage-only:
+it WALKS the effective commits oldest-first and commits EACH one locally —
+never a squash, on every locator shape including the ``--commit`` skip — with
+the agent's original author AND committer DATES preserved, the HUMAN's
+identity (the authorship erasure above is unchanged; only the dates copy
+over), the scrubbed message, hooks fully disabled (``--no-verify`` plus a
+null hooks path: agent work can modify hook managers, and nothing
+agent-controlled may execute at a commit the human never inspected), and no
+GPG signature (attestation stays a deliberate act). A branch carrying MERGE
+commits refuses the flag up front — merge-introduced content is invisible to
+a per-commit walk, and silently wrong committed content is the one failure
+this tool must never produce; fetch without the flag instead (the cumulative
+staged diff handles merges correctly). A conflict mid-walk keeps the landed
+prefix, leaves that step staged with its message prefilled, and exits 1 —
+later pasted batch commands refuse on the dirty index, and re-running the
+SAME command after resolving resumes (landed commits are skipped by
+patch-id). Push always stays the human's own act.
 
 WHICH commits land is patch-id-based (``git cherry``): commits whose diff is
 already in HEAD are skipped even though the local copies have different shas.
@@ -475,41 +494,187 @@ def handle_verdict(repo: str, pr: int | None, commit: str,
 
 # --- apply ---------------------------------------------------------------------
 
+def _parent_or_empty_tree(repo_path: str, sha: str) -> str:
+    """`sha`'s first parent, or git's empty tree for a root commit — the
+    diff base for both the cumulative patch and a walk step's own patch."""
+    r = git(repo_path, "rev-parse", "--verify", "--quiet", sha + "^")
+    prev = r.stdout.strip()
+    if not prev:
+        prev = git(repo_path, "hash-object", "-t", "tree",
+                   os.devnull).stdout.strip()
+    return prev
+
+
+def _diff_patch(repo_path: str, base: str, target: str) -> bytes:
+    """The binary-safe ``git diff <base> <target>`` patch. BYTES end-to-end:
+    --binary patches are not text. A failed diff yields empty stdout, which
+    would flow into the empty-patch guard and read as a reassuring "nothing
+    new" — die loud instead (plain `git diff` exits non-zero only on real
+    errors)."""
+    r = subprocess.run(["git", "-C", repo_path, "diff", "--full-index",
+                        "--binary", base, target], capture_output=True)
+    if r.returncode != 0:
+        die("could not build the patch: "
+            + (r.stderr or b"").decode("utf-8", "replace").strip())
+    return r.stdout
+
+
 def _new_work_patch(repo_path: str, target: str, shas: list[str]) -> bytes:
-    """The binary-safe patch carrying exactly the NEW commits' cumulative
-    diff: ``git diff <parent-of-first-new> <target>``. The parent-of-first-`+`
+    """The patch carrying exactly the NEW commits' cumulative diff:
+    ``git diff <parent-of-first-new> <target>``. The parent-of-first-`+`
     base is the whole walk fix — merge-base stays pinned at the fork base
     forever (walked commits land under NEW shas, so no shared history ever
     accrues), which made a base-rooted `merge --squash` conflict on any
     commit that retouched an earlier step's file (add/add: ours v1, theirs
     v2). diff from the first new commit's parent contains only the un-landed
     delta, and the 3-way application absorbs identical already-landed content
-    as a no-op. BYTES end-to-end: --binary patches are not text."""
-    r = git(repo_path, "rev-parse", "--verify", "--quiet", shas[0] + "^")
-    prev = r.stdout.strip()
-    if not prev:
-        # Root commit (no parent): diff against git's empty tree.
-        prev = git(repo_path, "hash-object", "-t", "tree",
-                   os.devnull).stdout.strip()
-    r = subprocess.run(["git", "-C", repo_path, "diff", "--full-index",
-                        "--binary", prev, target], capture_output=True)
+    as a no-op."""
+    return _diff_patch(repo_path, _parent_or_empty_tree(repo_path, shas[0]),
+                       target)
+
+
+def commit_dates(repo_path: str, sha: str) -> tuple[str, str]:
+    """(author date, committer date) of `sha`, strict ISO — the timestamps
+    --auto-commit preserves. Read locally post-fetch; no gitea call."""
+    r = git(repo_path, "log", "-1", "--format=%aI%n%cI", sha)
+    lines = r.stdout.splitlines()
+    if r.returncode != 0 or len(lines) < 2:
+        die(f"could not read the dates of {sha[:12]}")
+    return lines[0].strip(), lines[1].strip()
+
+
+def auto_commit_step(repo_path: str, sha: str, message: str) -> None:
+    """Commit the staged walk step: the scrubbed message on stdin, the agent
+    commit's original author+committer dates in env (MERGED over os.environ —
+    a bare env would strip PATH/HOME and masquerade as an identity failure),
+    the human's own identity from the clone's config. Hooks are structurally
+    disabled — --no-verify covers pre-commit/commit-msg, the null hooksPath
+    covers prepare-commit-msg/post-commit and an in-tree core.hooksPath
+    redirect (.husky is a named AUTO_EXEC_PATHS threat; nothing
+    agent-controlled may execute at a commit the human never inspected) — and
+    signing is forced off (the human's attestation stays a deliberate act; a
+    signed-commits-required repo refuses the unsigned push VISIBLY, never
+    silently). On ANY failure (unset user.name/user.email is the common one;
+    a message that scrubbed down to nothing also lands here): degrade to
+    today's exact staged state — prefill written, nothing lost — and exit 1
+    so a pasted batch arrests."""
+    adate, cdate = commit_dates(repo_path, sha)
+    r = subprocess.run(["git", "-C", repo_path,
+                        "-c", "core.hooksPath=/dev/null",
+                        "-c", "commit.gpgsign=false",
+                        "commit", "--no-verify", "-F", "-"],
+                       input=message, capture_output=True, text=True,
+                       env={**os.environ, "GIT_AUTHOR_DATE": adate,
+                            "GIT_COMMITTER_DATE": cdate})
     if r.returncode != 0:
-        # A failed diff yields empty stdout, which would flow into the
-        # empty-patch guard and read as a reassuring "nothing new" — die loud
-        # instead (plain `git diff` exits non-zero only on real errors).
-        die("could not build the patch: "
-            + (r.stderr or b"").decode("utf-8", "replace").strip())
-    return r.stdout
+        try:
+            squash_msg_path(repo_path).write_text(message)
+        except OSError as e:
+            print(f"  (could not write the prefilled message: {e})")
+        print(f"auto-commit failed for {sha[:9]}:\n"
+              f"{(r.stderr or r.stdout or '').strip()}", file=sys.stderr)
+        print("the step is left STAGED with the message prefilled — fix the "
+              "cause (usually: git config user.name / user.email in this "
+              "clone), then `git commit` yourself and re-run to resume.",
+              file=sys.stderr)
+        sys.exit(1)
+    oneline = git(repo_path, "log", "-1", "--oneline").stdout.strip()
+    print(f"  committed: {oneline}  [dates {adate} / {cdate}; hooks "
+          f"disabled, unsigned]")
 
 
-def apply_staged(repo_path: str, target: str, shas: list[str]) -> None:
+def _walk_and_commit(repo_path: str, target: str, shas: list[str]) -> None:
+    """The --auto-commit path: land each effective commit INDIVIDUALLY,
+    oldest-first — never a squash (every locator shape, the --commit skip
+    included). Per step: that commit's OWN patch (parent..sha, 3-way — an
+    already-landed identical change is absorbed as a no-op), that commit's
+    own scrubbed message, that commit's own dates. A conflict keeps the
+    landed prefix, prefills THAT step's message, and exits 1 (a pasted batch
+    self-arrests on later lines' dirty-index refusals); re-running the same
+    command after resolve+commit resumes, since landed commits are skipped by
+    patch-id. Empty or already-landed steps are SKIPPED with a note — no
+    --allow-empty (an empty commit is noise, deliberately)."""
+    smsg = squash_msg_path(repo_path)
+    # Merge guard FIRST (zero side effects before it): merge-introduced
+    # content belongs to no single commit, so a per-commit walk can silently
+    # drop it — the one failure class this tool must never produce. The
+    # cumulative default path handles merges correctly; refuse the flag.
+    r = git(repo_path, "merge-base", "HEAD", target)
+    base = r.stdout.strip()
+    if r.returncode != 0 or not base:
+        die("no common history between HEAD and the fetched work "
+            "(is this clone of the same repo?)")
+    r = git(repo_path, "rev-list", "--merges", f"{base}..{target}")
+    if r.returncode != 0:
+        die("could not scan for merge commits: " + r.stderr.strip())
+    if r.stdout.strip():
+        die("this branch has merge commits — content can arrive via the "
+            "merges themselves, which a per-commit walk cannot replay; "
+            "fetch WITHOUT --auto-commit (the staged fetch handles merges "
+            "correctly)")
+    r = git(repo_path, "rev-parse", "--abbrev-ref", "HEAD")
+    local_branch = r.stdout.strip() if r.returncode == 0 else "unknown"
+    landed = 0
+    skipped = 0
+    for sha in shas:
+        patch = _diff_patch(repo_path,
+                            _parent_or_empty_tree(repo_path, sha), sha)
+        if not patch.strip():
+            skipped += 1
+            print(f"  {sha[:9]}: empty diff — skipped (no commit)")
+            continue
+        r = subprocess.run(["git", "-C", repo_path, "apply", "--3way"],
+                           input=patch, capture_output=True)
+        if r.returncode != 0:
+            detail = (r.stderr or b"").decode("utf-8", "replace").strip()
+            # Same conflict-vs-hard-abort split as the cumulative path: only
+            # a REAL conflict (unmerged entries) earns the prefill.
+            if git(repo_path, "ls-files", "-u").stdout.strip():
+                message = build_message(repo_path, [sha])
+                try:
+                    smsg.write_text(message)
+                except OSError as e:
+                    print(f"  (could not write the prefilled message: {e})")
+                print(f"\nmerge failed at {sha[:9]} "
+                      f"({landed} commit{'s' if landed != 1 else ''} landed "
+                      f"before it):\n{detail}")
+                print("resolve conflicts (`git status` shows the unmerged "
+                      "files), `git add` them, then commit — this step's "
+                      "scrubbed message is prefilled. Then RE-RUN the same "
+                      "command to land the rest (landed commits are skipped "
+                      "by patch-id).")
+                sys.exit(1)
+            smsg.unlink(missing_ok=True)
+            print(f"\napply failed at {sha[:9]} (nothing was changed by "
+                  f"this step):\n{detail}")
+            print("(a shallow clone lacks the blobs a 3-way apply needs — "
+                  "`git fetch --unshallow` and retry)")
+            sys.exit(1)
+        if git(repo_path, "diff", "--cached", "--quiet").returncode == 0:
+            skipped += 1
+            print(f"  {sha[:9]}: tree already matches — skipped (no commit)")
+            continue
+        auto_commit_step(repo_path, sha, build_message(repo_path, [sha]))
+        landed += 1
+    print(f"\n-- Landed {landed} commit{'s' if landed != 1 else ''} on "
+          f"{local_branch}"
+          + (f" ({skipped} skipped)" if skipped else "")
+          + " --")
+    print("done — each commit carries the agent's original timestamps and "
+          "your identity. Push is yours.")
+
+
+def apply_staged(repo_path: str, target: str, shas: list[str],
+                 auto: bool = False) -> None:
     """Stage `target`'s new work (``git apply --3way`` of the new-commits
     patch — spike-verified: stages on success, leaves conflict markers +
     unmerged index entries on divergence, carries ZERO commit metadata) with
-    the scrubbed message prefilled. NEVER commits — `git commit` is always
-    the human's own act. Order is load-bearing: dirty-index refusal, then the
-    nothing-new guards, then the apply, whose CONFLICT arm returns before the
-    post-apply staged check (a conflicted index is not 'nothing staged')."""
+    the scrubbed message prefilled. The DEFAULT path never commits — `git
+    commit` is the human's own act; the explicit ``auto`` path hands off to
+    `_walk_and_commit` (per-commit landing, never a squash) after the shared
+    guards. Order is load-bearing: dirty-index refusal, then the nothing-new
+    guards, then the apply, whose CONFLICT arm returns before the post-apply
+    staged check (a conflicted index is not 'nothing staged')."""
     smsg = squash_msg_path(repo_path)
     # A dirty index would silently merge two fetches' content and the second
     # prefill overwrite would destroy the first — refuse up front.
@@ -526,6 +691,9 @@ def apply_staged(repo_path: str, target: str, shas: list[str]) -> None:
         smsg.unlink(missing_ok=True)
         print("\nnothing new to fetch — every commit here is already in HEAD "
               "(by patch-id).")
+        return
+    if auto:
+        _walk_and_commit(repo_path, target, shas)
         return
     message = build_message(repo_path, shas)
     r = git(repo_path, "rev-parse", "--abbrev-ref", "HEAD")
@@ -590,7 +758,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="rs-fetch",
         description="stage agent work from the shared rs-gitea into a local "
                     "clone, commit message prefilled (no selector: list the "
-                    "fork's open PRs; rs-fetch never commits)")
+                    "fork's open PRs; never commits unless --auto-commit)")
     p.add_argument("repo", help="dev repo NAME (fetches its ACTIVE consumer fork)")
     p.add_argument("repo_path", nargs="?", default=None,
                    help="local git clone to apply into (default: cwd)")
@@ -602,6 +770,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="stage ONE commit of the --pr/--branch work; walking "
                         "them oldest-first lands one commit's delta + message "
                         "per step")
+    p.add_argument("--auto-commit", action="store_true",
+                   help="after fetching, COMMIT each effective commit "
+                        "individually (never a squash) with the agent's "
+                        "original author+committer dates, your identity, the "
+                        "scrubbed message, hooks disabled (--no-verify + null "
+                        "hooks path) and no signature; refuses on a branch "
+                        "with merge commits — fetch without the flag there")
     return p
 
 
@@ -611,6 +786,12 @@ def main(argv: list[str] | None = None) -> None:
         mode = pick_mode(args.pr, args.branch, args.commit)
     except ValueError as e:
         die(str(e))
+    if args.auto_commit and mode == "list":
+        # List mode fetches nothing, so there is nothing to commit. (A pasted
+        # BATCH of locator commands is the supported flow — every line there
+        # is a normal staging fetch and takes the flag.)
+        die("--auto-commit needs a locator (--pr <N> or --branch <name>): "
+            "list mode fetches nothing")
     if args.commit and not valid_commit_sha(args.commit):
         die(f"--commit expects a hex SHA (4-64 chars), got {args.commit!r}")
     repo = args.repo
@@ -681,7 +862,7 @@ def main(argv: list[str] | None = None) -> None:
         handle_verdict(repo,
                        args.pr if (mode == "pr" and not args.commit) else None,
                        commit_full, repo_path)
-        apply_staged(repo_path, target, shas)
+        apply_staged(repo_path, target, shas, auto=args.auto_commit)
     finally:
         git(repo_path, "update-ref", "-d", ref)
 

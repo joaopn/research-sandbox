@@ -1822,11 +1822,18 @@ async function renderDevGiteaTab(view, body) {
     body.appendChild(iframe);
 }
 
+// cmd is a STRING (fixed command) or a FUNCTION (computed AT CLICK TIME —
+// the card's auto-commit tick box changes what a copy produces, so provider
+// buttons read the live state; their hover title stays generic because a
+// tooltip carrying a stale command would lie about the tick).
 function devCopyBtn(cmd) {
-    const b = el("button", { class: "btn-small dev-copy", title: "Copy: " + cmd },
-                 ["📋"]);
+    const isFn = typeof cmd === "function";
+    const b = el("button", { class: "btn-small dev-copy",
+                             title: isFn ? "Copy the rs-fetch command"
+                                         : "Copy: " + cmd }, ["📋"]);
     b.onclick = async () => {
-        try { await navigator.clipboard.writeText(cmd); } catch (e) { return; }
+        const text = isFn ? cmd() : cmd;
+        try { await navigator.clipboard.writeText(text); } catch (e) { return; }
         b.textContent = "✓";
         setTimeout(() => { b.textContent = "📋"; }, 1200);
     };
@@ -2072,7 +2079,8 @@ async function devRefreshCommitCells(repo, sha, ctx) {
 // (200 + ok:true + running:false — an empty list from a stopped gitea is
 // otherwise indistinguishable from the end of the history). All three are
 // RECOVERABLE: they leave the rows alone and offer a Retry for the same page.
-function devCommitsExpander(view, body, repo, sel, rerender, onLogin) {
+function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
+                            autoCommit) {
     const btn = el("button", {
         class: "btn-small dev-commits-btn",
         title: "show commits (fetchable one by one)",
@@ -2109,9 +2117,12 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin) {
     // closures this expander was threaded.
     const ctx = { view, body, sel, rerender, onLogin };
 
-    const cmdFor = (sha) => sel.pr != null
+    // The card's auto-commit tick rides every copied command; consulted at
+    // CALL time (per-row copies pass a provider; Copy all builds at click).
+    const cmdFor = (sha) => (sel.pr != null
         ? `rs-fetch ${repo} --pr ${sel.pr} --commit ${sha}`
-        : `rs-fetch ${repo} --branch ${sel.branch} --commit ${sha}`;
+        : `rs-fetch ${repo} --branch ${sel.branch} --commit ${sha}`)
+        + (autoCommit && autoCommit() ? " --auto-commit" : "");
 
     const foot = (nodes) => {
         footEl.innerHTML = "";
@@ -2253,7 +2264,7 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin) {
             cell.setAttribute("data-rkey", devReviewKey(repo, c.sha));
             rowsEl.appendChild(el("div", { class: "dev-commit-row" }, [
                 check,
-                devCopyBtn(cmdFor(c.sha)),
+                devCopyBtn(() => cmdFor(c.sha)),
                 el("span", { class: "dev-pr-id" }, [c.sha.slice(0, 9)]),
                 el("span", { class: "dev-pr-title" }, [c.subject || ""]),
                 el("span", { class: "dev-pr-meta" }, [c.date || ""]),
@@ -2500,10 +2511,12 @@ function renderDevFetchScreen(view, body, result) {
         }));
     }
     body.appendChild(el("div", { class: "hint" }, [
-        "📋 copies the rs-fetch command — paste it in any project or box ",
-        "terminal (every container carries rs-fetch + read-only fetch access). ",
-        "rs-fetch stages the work with the agent's message prefilled and never ",
-        "commits; ▸ lists a row's commits to fetch them one by one.",
+        "📋 copies the rs-fetch command — paste it in a fetch-enabled project ",
+        "or box terminal. rs-fetch stages the work with the agent's message ",
+        "prefilled and never commits unless the card's auto-commit box is ",
+        "ticked (then each fetched commit lands locally with the agent's ",
+        "original timestamps); ▸ lists a row's commits to fetch them one by ",
+        "one.",
     ]));
 }
 
@@ -2596,10 +2609,25 @@ function buildDevRepoCard(view, body, r, attached, opts) {
     } else if (r.active) {
         forkEl = el("span", { class: "dev-repo-meta" }, [`fork: ${r.active}`]);
     }
+    // Auto-commit tick (card-level, default OFF, deliberately RESETS on every
+    // card re-render — the flag is per-session consent, never sticky). A LIVE
+    // getter consulted at click time by every copy surface on this card
+    // (per-commit copies, Copy all, the PR/branch row copies) — never baked
+    // into a button at render, so a copy can never contradict the tick.
+    const acBox = el("input", { type: "checkbox", class: "dev-ac-check" });
+    const acWrap = el("label", {
+        class: "dev-ac",
+        title: "Copied rs-fetch commands include --auto-commit: each fetched "
+             + "commit is committed locally with the agent's original "
+             + "timestamps — your identity, hooks disabled, unsigned. "
+             + "Unticked: commands stage only (the default).",
+    }, [acBox, "auto-commit"]);
+    const autoCommit = () => acBox.checked;
     const head = [
         el("span", { class: "dev-repo-name" }, [r.repo]),
         el("span", { class: "dev-repo-meta" }, [meta]),
         ...(forkEl ? [forkEl] : []),
+        acWrap,
         sync,
     ];
     if (!scoped) {
@@ -2628,9 +2656,10 @@ function buildDevRepoCard(view, body, r, attached, opts) {
     for (const p of prs) {
         const commitsUi = devCommitsExpander(view, body, r.repo,
                                              { pr: p.number }, rerender,
-                                             onLogin);
+                                             onLogin, autoCommit);
         const cells = [
-            devCopyBtn(`rs-fetch ${r.repo} --pr ${p.number}`),
+            devCopyBtn(() => `rs-fetch ${r.repo} --pr ${p.number}`
+                             + (autoCommit() ? " --auto-commit" : "")),
             commitsUi.btn,
             el("span", { class: "dev-pr-id" }, [`#${p.number}`]),
             el("span", { class: "dev-pr-title" }, [p.title || ""]),
@@ -2715,9 +2744,10 @@ function buildDevRepoCard(view, body, r, attached, opts) {
     for (const b of branches) {
         const commitsUi = devCommitsExpander(view, body, r.repo,
                                              { branch: b.name }, rerender,
-                                             onLogin);
+                                             onLogin, autoCommit);
         rows.push(el("div", { class: "dev-branch-row" }, [
-            devCopyBtn(`rs-fetch ${r.repo} --branch ${b.name}`),
+            devCopyBtn(() => `rs-fetch ${r.repo} --branch ${b.name}`
+                             + (autoCommit() ? " --auto-commit" : "")),
             commitsUi.btn,
             el("span", { class: "dev-pr-title" }, [b.name || ""]),
             el("span", { class: "dev-pr-meta" }, [b.committed_at || ""]),

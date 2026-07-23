@@ -1357,6 +1357,17 @@ body {
 }
 .dev-commit-check { display: none; margin: 0; width: 14px; height: 14px; }
 .dev-commits-panel.selecting .dev-commit-check { display: inline-block; }
+/* Card-head auto-commit tick: NOT inside any .field, so the label/input
+   bleeds don't apply; sized inline to sit in the flex head row. */
+.dev-ac {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 12px;
+    color: var(--fg-muted);
+    cursor: pointer;
+}
+.dev-ac-check { margin: 0; width: 13px; height: 13px; }
 .dev-review-cell {
     display: inline-flex;
     align-items: center;
