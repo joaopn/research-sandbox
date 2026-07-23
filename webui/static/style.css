@@ -1342,6 +1342,27 @@ body {
     gap: 8px;
 }
 .dev-commits-note { margin-top: 2px; }
+/* Bulk-select toolbar + per-row checkboxes: the checkbox column is revealed
+   by the panel's .selecting class only (rows are never rebuilt). Not inside
+   any .field wrapper, so the .field input/label bleed does not apply; the
+   checkbox is still sized explicitly so the row height stays put. */
+.dev-commits-tools {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.dev-select-btn.active {
+    color: var(--fg-accent);
+    box-shadow: 0 -2px 0 var(--fg-accent) inset;
+}
+.dev-commit-check { display: none; margin: 0; width: 14px; height: 14px; }
+.dev-commits-panel.selecting .dev-commit-check { display: inline-block; }
+.dev-review-cell {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+.dev-reviewing { font-style: italic; }
 /* The per-project Fetch pane (the fetch-<repo> tab): RS-rendered HTML inside
    #terminal-area, which never scrolls host content itself — the pane owns its
    scrolling. */
