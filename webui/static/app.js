@@ -2869,18 +2869,30 @@ function devRepoRemoveDialog(view, body, repo) {
     });
 }
 
-// Management → Infrastructure (STAGE_DEV_GITEA S3): shared host services that
-// aren't projects. Gitea only, for now — status + an explicit Start button (a
-// page READ never starts it; this button is the deliberate action).
+// Management → Infrastructure: shared host state that isn't a project, in two
+// sub-groups — "Development" (the shared gitea dev lane) and "Reviewer" (the
+// sandboxed reviewer's model/effort default). ALL static DOM (both sub-headers
+// and both rows) is built synchronously BEFORE any await: the gitea fill below
+// early-returns on unknown/not-enabled, and the reviewer control is
+// gitea-independent — building it before the ladder is what keeps a gitea
+// hiccup from vanishing the reviewer row (DOM order stays gitea-first; the
+// reviewer row fills through its own async path).
 async function appendInfraSection(view) {
     const row = el("div", { class: "mgmt-row mgmt-infra-row" }, [
         el("span", {}, ["Gitea (dev lane)"]),
         el("span", { class: "mgmt-loading" }, ["…"]),
     ]);
+    const reviewerRow = el("div", { class: "mgmt-row mgmt-infra-row" }, [
+        el("span", { class: "mgmt-loading" }, ["…"]),
+    ]);
     view.appendChild(el("div", { class: "mgmt-infra" }, [
         el("h3", { class: "mgmt-infra-title" }, ["Infrastructure"]),
+        el("div", { class: "mgmt-infra-sub" }, ["Development"]),
         row,
+        el("div", { class: "mgmt-infra-sub" }, ["Reviewer"]),
+        reviewerRow,
     ]));
+    appendReviewerModelRow(view, reviewerRow);   // async, own fetch path
     let g = null;
     try {
         const res = await fetch("/broker/dev");
@@ -2917,6 +2929,73 @@ async function appendInfraSection(view) {
     pwBtn.onclick = () =>
         devGiteaPasswdDialog(view, () => renderManagementInto(view));
     row.appendChild(pwBtn);
+}
+
+// The reviewer's model/effort DEFAULT (the fifth model_catalog type). Unlike
+// the four project types there is no per-invocation knob: review_pr resolves
+// this live at each run, so Apply takes effect on the very next review — no
+// recreate, no restart. Apply writes the pair into the operator's untracked
+// override via the token-gated model_default_set verb; Reset clears the
+// override key back to the tracked base. `view` is the Management page root
+// (the 401/403/503 ladders land there); `rowEl` is the pre-built row this
+// fills (created before appendInfraSection's gitea await — see the D-placement
+// note there).
+async function appendReviewerModelRow(view, rowEl) {
+    const cat = await ensureModelCatalog();
+    rowEl.innerHTML = "";
+    rowEl.appendChild(el("span", {}, ["Review model"]));
+    if (!cat) {
+        // ensureModelCatalog swallows transport AND verb failures into null;
+        // this row is secondary surface, so a quiet badge (not a page-level
+        // card) is the honest degradation — Retry = the page's Refresh.
+        rowEl.appendChild(el("span", { class: "type-badge" },
+                             ["model catalog unavailable"]));
+        return;
+    }
+    const overridden = (cat.overridden || []).includes("reviewer");
+    const picker = modelPicker(cat, "reviewer", "", "", {});
+    const errEl = el("span", { class: "mgmt-reviewer-err" }, []);
+    const post = async (payload) => {
+        errEl.textContent = "";
+        let res, body = null;
+        try {
+            res = await fetch("/broker/models/default", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+            });
+        } catch (e) { return renderMgmtUnavailable(view); }
+        const redirect = mgmtStatusRedirect(view, res.status);
+        if (redirect) return redirect();
+        try { body = await res.json(); } catch (e) { return renderMgmtUnavailable(view); }
+        if (!res.ok || !body.ok) {
+            // Reachable only on 200-with-parseable-JSON (the relay peels
+            // 401/403/503 off above): the broker ANSWERED and the verb
+            // refused — show its message beside the controls, never the
+            // unreachable card.
+            errEl.textContent = mgmtErrText(body);
+            return;
+        }
+        // Every picker in the app pre-selects from the cached /broker/models
+        // payload — bust it so create dialogs / the box window seed the fresh
+        // defaults too, then re-render the page (badge + picker re-seed).
+        state.modelCatalog = null;
+        renderManagementInto(view);
+    };
+    rowEl.appendChild(picker.row);
+    const apply = el("button", { class: "btn-small" }, ["Apply"]);
+    apply.onclick = () => {
+        const v = picker.value();
+        post({ type: "reviewer", model: v.model, effort: v.effort });
+    };
+    rowEl.appendChild(apply);
+    if (overridden) {
+        rowEl.appendChild(el("span", { class: "type-badge" }, ["overridden"]));
+        const reset = el("button", { class: "btn-small" }, ["Reset to default"]);
+        reset.onclick = () => post({ type: "reviewer", clear: true });
+        rowEl.appendChild(reset);
+    }
+    rowEl.appendChild(errEl);
 }
 
 function mgmtAction(view, name, action) {

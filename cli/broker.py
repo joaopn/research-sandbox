@@ -291,6 +291,19 @@ def _verb_models(_args: dict, _progress=None) -> dict:
         raise rscore.ValidationError(str(e))
 
 
+def _verb_model_default_set(args: dict, _progress=None) -> dict:
+    """Write (or clear) one container type's default (model, effort) pair in
+    the operator's untracked model-defaults override — the write half of
+    `models` (the Management → Infrastructure → Reviewer control). Token-gated
+    (NOT in OPEN_VERBS); inline is fine — a sub-ms validated file write, no
+    docker, no network. The request layer + verb map every catalog/OS error
+    onto ValidationError, so nothing but the three dispatch-caught exceptions
+    can escape."""
+    safe = {k: v for k, v in args.items() if k in MODEL_DEFAULT_WEBUI_FIELDS}
+    req = rscore.ModelDefaultSetRequest.from_kwargs(**safe)
+    return rscore.model_default_set(req)
+
+
 def _verb_workflows(_args: dict, _progress=None) -> dict:
     """The store catalog for the webui create form: built-ins + BYO, plus the
     agent enum and the default workflow. The webui image carries no `cli/`, so
@@ -667,6 +680,11 @@ DEV_PROJECT_WEBUI_FIELDS = frozenset({"name", "workflow", "url", "pat",
 # the request, off the Result, never a durable sink). The step-up `proof` is
 # consumed in dispatch and never reaches this filter.
 DEV_PASSWD_WEBUI_FIELDS = frozenset({"password"})
+# Set/clear one container type's model+effort default in the operator's
+# untracked override file (the Management → Infrastructure → Reviewer
+# control). Name-shaped catalog tokens + a bool only — nothing host-shaped;
+# the contract is full-pair-or-clear (no partial writes).
+MODEL_DEFAULT_WEBUI_FIELDS = frozenset({"type", "model", "effort", "clear"})
 
 
 def _verb_dev_repo_remove(args: dict, progress=None) -> dict:
@@ -764,6 +782,7 @@ VERBS = {
     "status": _verb_status,
     "workflows": _verb_workflows,
     "models": _verb_models,
+    "model_default_set": _verb_model_default_set,
     "software_status": _verb_software_status,
     "agent_refresh_check": _verb_agent_refresh_check,
     "editor_refresh_check": _verb_editor_refresh_check,

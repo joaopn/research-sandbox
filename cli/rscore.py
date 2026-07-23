@@ -445,6 +445,48 @@ def _model_defaults_checked(catalog: dict) -> dict[str, dict[str, str]]:
         raise ValidationError(str(e)) from e
 
 
+def model_default_set(req: "ModelDefaultSetRequest") -> dict:  # type: ignore[name-defined]
+    """Write one container type's default (model, effort) pair into the
+    operator's untracked override file (model_catalog.OVERRIDE_PATH), or clear
+    it back to the tracked base. Read-modify-write over the VALIDATING reader
+    (load_override): a hand-corrupted file REFUSES here with a host-side
+    remedy — fail-closed, never clobbered (the unreadable-state-file lesson).
+    Atomic tmp+replace; the file has host-only readers (nothing bind-mounts
+    it), so the inode change is safe. The reviewer consumes the result on its
+    very next run (review_pr resolves live); the four project types consume it
+    at their next create/box-add. Returns the type's post-write merged default
+    plus whether an override now exists for it."""
+    catalog = _model_catalog_checked()
+    try:
+        data = model_catalog.load_override(catalog)
+    except model_catalog.ModelCatalogError as e:
+        raise ValidationError(
+            "cannot edit model defaults: the override file is invalid — fix "
+            f"or remove it on the host ({model_catalog.OVERRIDE_PATH}): {e}"
+        ) from e
+    if req.clear:
+        data.pop(req.type, None)
+    else:
+        data[req.type] = {"model": req.model, "effort": req.effort}
+    # OVERRIDE_PATH is read at call time (not captured) so tests can repoint
+    # the module attribute; the parent dir derives from it for the same reason.
+    target = model_catalog.OVERRIDE_PATH
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.parent / (target.name + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        os.replace(tmp, target)
+    except OSError as e:
+        # dispatch catches only Validation/Harness/SystemExit — an escaped
+        # OSError would truncate the broker reply envelope.
+        raise ValidationError(
+            f"cannot write the model-defaults override ({target}): {e}") from e
+    merged = _model_defaults_checked(catalog)
+    return {"type": req.type, "cleared": req.clear,
+            "default": merged[req.type],
+            "overridden": req.type in data}
+
+
 @dataclass(frozen=True)
 class CreateRequest:
     name: str
@@ -1530,6 +1572,63 @@ class ReviewRequest:
         if (pr is None) == (commit == ""):
             raise ValidationError("exactly one of pr and commit is required")
         return cls(repo=repo, pr=pr, commit=commit)
+
+
+@dataclass(frozen=True)
+class ModelDefaultSetRequest:
+    """Set (or clear) one container type's default (model, effort) pair in the
+    operator's untracked model-defaults override file — the write half of the
+    broker's `models` read verb (drives the Management → Infrastructure →
+    Reviewer control; the verb itself accepts any catalog type, deliberately —
+    equivalent in power to the documented hand-edit of the same file).
+
+    `clear` exists so "" never has to mean "unset": an empty effort is a REAL
+    pair value ("emit no effort level" — how an effort-less tier like haiku is
+    expressed), so removal is an explicit flag, never an empty-field sentinel.
+    clear=True removes the type's override key (reverting it to the tracked
+    base) and requires model/effort empty. The contract is full-pair-or-clear:
+    an effort-only partial override stays a hand-edit affair."""
+    type: str
+    model: str = ""
+    effort: str = ""
+    clear: bool = False
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "ModelDefaultSetRequest":
+        ctype = kw.get("type")
+        if ctype not in model_catalog.TYPES:
+            raise ValidationError(
+                f"unknown container type {ctype!r}; must be one of "
+                f"{list(model_catalog.TYPES)}")
+        clear = kw.get("clear", False)
+        if not isinstance(clear, bool):
+            raise ValidationError("clear must be true or false")
+        model = kw.get("model") or ""
+        effort = kw.get("effort") or ""
+        if not isinstance(model, str) or not isinstance(effort, str):
+            raise ValidationError("model and effort must be strings")
+        if clear:
+            if model or effort:
+                raise ValidationError(
+                    "clear takes no model/effort — send either a pair or clear")
+            return cls(type=ctype, clear=True)
+        if not model:
+            raise ValidationError(
+                "a model is required (or set clear to revert to the base)")
+        catalog = _model_catalog_checked()
+        if model not in model_catalog.aliases(catalog):
+            raise ValidationError(
+                f"unknown model {model!r}; must be one of "
+                f"{model_catalog.aliases(catalog)}")
+        if effort and effort not in catalog["efforts"]:
+            raise ValidationError(
+                f"unknown effort level {effort!r}; must be one of "
+                f"{catalog['efforts']}")
+        if effort and not model_catalog.supports_effort(model, effort, catalog):
+            raise ValidationError(
+                f"model {model!r} does not accept an effort level; "
+                f"remove the effort setting")
+        return cls(type=ctype, model=model, effort=effort)
 
 
 @dataclass(frozen=True)
@@ -9000,15 +9099,24 @@ def _parse_verdict(text: str) -> dict | None:
     return out
 
 
-def _review_container_script() -> str:
+def _review_container_script(model: str, effort: str) -> str:
     """The reviewer container's root script. Fixed strings only — the repo/pr
-    never enter it (diff + prompt arrive as staged files). Steps: bounded
+    never enter it (diff + prompt arrive as staged files); the model/effort
+    argv tokens are catalog-validated aliases re-guarded here against the same
+    charset, because they interpolate into a shell string (only validated
+    values are ever interpolated). An empty effort emits no --effort (the
+    effort-less-tier rule). Steps: bounded
     route-gate (no egress until the host pointed the default route at the
     router; self-terminates on the wall bound so a hard host kill can't leave
     an orphan — --rm reaps the exit), managed-settings tool deny, creds + dist
     deploy, the claude -p run as research against a container-LOCAL /work copy
     (no host-uid coupling on the mount), then results + creds copied back out
     by root (root writes the mount regardless of the host uid)."""
+    if not re.fullmatch(r"[a-z][a-z0-9-]*", model):
+        die(f"invalid reviewer model token: {model!r}")
+    if effort and not re.fullmatch(r"[a-z][a-z0-9-]*", effort):
+        die(f"invalid reviewer effort token: {effort!r}")
+    model_flags = f"--model {model}" + (f" --effort {effort}" if effort else "")
     gate_iters = int(REVIEW_MAX_TIME_S / _REVIEW_GATE_POLL_S)
     return (
         "set -e\n"
@@ -9030,7 +9138,7 @@ def _review_container_script() -> str:
         "install -m 644 -o research -g research /review/diff.patch /work/diff.patch\n"
         "install -m 644 -o research -g research /review/prompt.md /work/prompt.md\n"
         "su - research -c 'cd /work && " + _REVIEWER_CLAUDE
-        + " -p \"$(cat /work/prompt.md)\" "
+        + " " + model_flags + " -p \"$(cat /work/prompt.md)\" "
         "> /work/raw.txt 2> /work/err.txt' || true\n"
         "mkdir -p /review/out\n"
         "cp /work/raw.txt /review/out/raw.txt 2>/dev/null || true\n"
@@ -9073,6 +9181,15 @@ def review_pr(req: "ReviewRequest", progress=None) -> dict:  # type: ignore[name
         die("no reviewer credentials — run `research dev reviewer-login` first")
     if not dist_present(DEFAULT_AGENT):
         die(f"no cached {DEFAULT_AGENT} dist — run `research agent pull` first")
+    # The reviewer's (model, effort) — the fifth model_catalog type, resolved
+    # LIVE per run (never marker-frozen: this runs in a fresh detached child
+    # or a fresh CLI process, so a Management-page default change applies to
+    # the very next review). A bad operator override refuses HERE, before any
+    # docker/network side effect; stdout is the host-only full log / the
+    # operator's own terminal, never the mounted view log.
+    rev_model, rev_effort = _resolve_model_pair("reviewer")
+    print(f"reviewer model: {rev_model}"
+          + (f" effort {rev_effort}" if rev_effort else ""))
     router_ip = _ensure_reviewer_network()
     _resume_gitea(require=True)         # tracks dev_sync: resume, never create
     host_port = _gitea_host_port()
@@ -9165,7 +9282,7 @@ def review_pr(req: "ReviewRequest", progress=None) -> dict:  # type: ignore[name
                    "-v", f"{tmp}:/review",
                    "-v", f"{agent_dist_path(DEFAULT_AGENT)}:/opt/agent-dist/claude:ro",
                    MINIMAL_BASE_IMAGE, "sh", "-lc",
-                   _review_container_script()])
+                   _review_container_script(rev_model, rev_effort)])
         inject_route(name, router_ip)
         (tmp / "route-ok").write_text("ok\n")
         try:

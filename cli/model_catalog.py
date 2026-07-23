@@ -15,7 +15,11 @@ Two data files, two jobs:
   * ``models/defaults.json`` — the default (model, effort) pair for each container
     TYPE, layered exactly like ``versions.env``: this tracked file is the base and
     an untracked ``~/.research-sandbox/model-defaults.json`` overrides it per key.
-    Types resolve independently; there is NO inheritance between them.
+    Types resolve independently; there is NO inheritance between them. The
+    ``reviewer`` type (the ephemeral dev-lane reviewer) is the one type never
+    frozen into a project marker — ``rscore.review_pr`` resolves it live at each
+    run, and ``rscore.model_default_set`` is the sanctioned override writer (the
+    Management-page control).
 
 `load_defaults()` READS AND VALIDATES (mirroring `box_catalog.load_registry`) — it
 is not a bare merge. That matters because the resolved pairs are frozen into a
@@ -47,10 +51,14 @@ DEFAULTS_PATH = BUILTIN_DIR / "defaults.json"
 OVERRIDE_DIR = Path.home() / ".research-sandbox"
 OVERRIDE_PATH = OVERRIDE_DIR / "model-defaults.json"
 
-# The container types that run an agent. Each resolves its own pair; a box does
-# NOT inherit the supervisor's, a worker does not inherit anything. Lockstep with
-# the marker's `models` block and with rscore's per-type request fields.
-TYPES = ("supervisor", "worker", "role", "box")
+# The container types that run an agent, plus the ephemeral dev-lane reviewer.
+# Each resolves its own pair; a box does NOT inherit the supervisor's, a worker
+# does not inherit anything. The first four are frozen into a project's marker at
+# create (lockstep with the marker's `models` block and rscore's per-type request
+# fields); `reviewer` is NEVER marker-frozen — `rscore.review_pr` resolves it
+# live from this catalog at each run, so a defaults change applies to the very
+# next review with no recreate anywhere.
+TYPES = ("supervisor", "worker", "role", "box", "reviewer")
 
 ALIAS_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 
@@ -98,9 +106,14 @@ def load_catalog(path: Path | None = None) -> dict:
         raise ModelCatalogError(f"model catalog: unknown keys: {sorted(extras)}")
 
     efforts = data.get("efforts")
+    # Charset-bound tokens, not free strings: effort levels (like aliases) are
+    # interpolated into agent argv — including a shell string in the reviewer
+    # container script — so only validated token-shaped values may exist here.
     if (not isinstance(efforts, list) or not efforts
-            or not all(isinstance(e, str) and e.strip() for e in efforts)):
-        raise ModelCatalogError("model catalog: 'efforts' must be a non-empty list of strings")
+            or not all(isinstance(e, str) and ALIAS_RE.match(e) for e in efforts)):
+        raise ModelCatalogError(
+            "model catalog: 'efforts' must be a non-empty list of tokens "
+            f"matching {ALIAS_RE.pattern!r}")
 
     models = data.get("models")
     if not isinstance(models, list) or not models:
@@ -173,6 +186,40 @@ def _validate_pair_block(label: str, ctype: str, block: Any, catalog: dict) -> N
                 f"must be one of {catalog['efforts']} (or \"\" for none)")
 
 
+def load_override(catalog: dict | None = None,
+                  path: Path | None = None) -> dict[str, dict[str, str]]:
+    """Read + validate the operator's untracked override file ALONE — {} when
+    absent. Entries may be partial (only `model` or only `effort`); values are
+    filtered to the pair keys. Raises ModelCatalogError on malformed JSON, an
+    unknown container-type key, an unknown model alias, or an unknown effort
+    level — the same strictness as load_defaults, because this is also the read
+    the sanctioned writer (`rscore.model_default_set`) runs before its
+    read-modify-write: a hand-corrupted file must REFUSE there, never be
+    silently clobbered.
+
+    The path defaults at CALL time, not at import — see load_catalog."""
+    path = path or OVERRIDE_PATH
+    catalog = catalog or load_catalog()
+    if not path.is_file():
+        return {}
+    ov = _load_json(path, "model-defaults override")
+    if not isinstance(ov, dict):
+        raise ModelCatalogError(
+            f"model-defaults override root must be an object: {path}")
+    ov = _strip_comments(ov)
+    unknown = set(ov) - set(TYPES)
+    if unknown:
+        raise ModelCatalogError(
+            f"model-defaults override {path}: unknown container type(s) "
+            f"{sorted(unknown)}; must be drawn from {list(TYPES)}")
+    out: dict[str, dict[str, str]] = {}
+    for t, blk in ov.items():
+        _validate_pair_block(f"model-defaults override {path.name}", t, blk,
+                             catalog)
+        out[t] = {k: v for k, v in blk.items() if k in _PAIR_KEYS}
+    return out
+
+
 def load_defaults(base_path: Path | None = None,
                   override_path: Path | None = None,
                   catalog: dict | None = None) -> dict[str, dict[str, str]]:
@@ -218,22 +265,9 @@ def load_defaults(base_path: Path | None = None,
                 f"model defaults {base_path}: {t!r} must define both 'model' and 'effort'")
         merged[t] = {"model": blk["model"], "effort": blk["effort"]}
 
-    if override_path.is_file():
-        ov = _load_json(override_path, "model-defaults override")
-        if not isinstance(ov, dict):
-            raise ModelCatalogError(
-                f"model-defaults override root must be an object: {override_path}")
-        ov = _strip_comments(ov)
-        unknown = set(ov) - set(TYPES)
-        if unknown:
-            raise ModelCatalogError(
-                f"model-defaults override {override_path}: unknown container type(s) "
-                f"{sorted(unknown)}; must be drawn from {list(TYPES)}")
-        for t, blk in ov.items():
-            _validate_pair_block(f"model-defaults override {override_path.name}",
-                                 t, blk, catalog)
-            # Per-field merge: a partial entry keeps the base's other half.
-            merged[t].update({k: v for k, v in blk.items() if k in _PAIR_KEYS})
+    # Per-field merge: a partial override entry keeps the base's other half.
+    for t, blk in load_override(catalog, override_path).items():
+        merged[t].update(blk)
 
     return merged
 
@@ -285,9 +319,12 @@ def resolve(ctype: str, model: str = "", effort: str = "", *,
 def payload() -> dict:
     """Catalog + merged defaults, for the broker's `models` read verb (the webui
     has no access to `models/` — it is outside the scoped ./webui build context —
-    so this is its only source, and it pre-selects its controls from `defaults`)."""
+    so this is its only source, and it pre-selects its controls from `defaults`).
+    `overridden` lists the types the operator's untracked override file names, so
+    the Management page can badge them and offer reset-to-base."""
     catalog = load_catalog()
     return {"efforts": catalog["efforts"],
             "models": catalog["models"],
             "defaults": load_defaults(catalog=catalog),
+            "overridden": sorted(load_override(catalog).keys()),
             "types": list(TYPES)}

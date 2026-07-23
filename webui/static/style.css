@@ -1400,6 +1400,15 @@ body {
 .config-mcp-picker.disabled { opacity: 0.45; pointer-events: none; }
 .mgmt-infra { margin-top: 24px; }
 .mgmt-infra-title { font-size: 14px; font-weight: 600; margin-bottom: 8px; }
+/* Sub-group headers inside Infrastructure ("Development" / "Reviewer"). */
+.mgmt-infra-sub {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--fg-muted);
+    margin: 12px 0 4px;
+}
 .mgmt-infra-row {
     display: flex;
     align-items: center;
@@ -1407,6 +1416,9 @@ body {
     padding: 8px 10px;
     background: var(--bg-card);
 }
+/* Verb-refusal text beside the reviewer model controls (the 200+{ok:false}
+   arm of the transport-vs-verb split renders inline, not as a page card). */
+.mgmt-reviewer-err { color: var(--error-fg); font-size: 12px; }
 
 /* ===================== Mobile shell (html.mobile) ==========================
    Applied by app.js (mobileModeActive: width <= the 768px breakpoint, or the

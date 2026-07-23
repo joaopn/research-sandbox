@@ -598,6 +598,32 @@ async def broker_models_handler(request: web.Request) -> web.Response:
     return web.json_response(body, status=status)
 
 
+async def broker_models_default_handler(request: web.Request) -> web.Response:
+    """POST /broker/models/default {type, model, effort} | {type, clear:true} —
+    set or clear one container type's default pair in the operator's untracked
+    override file (the Management → Infrastructure → Reviewer control; the
+    broker verb accepts any catalog type). Origin-checked because it POSTs and
+    writes host state. Args are HAND-PICKED — this handler is the fourth leg of
+    the request-field ↔ MODEL_DEFAULT_WEBUI_FIELDS ↔ app.js payload lockstep,
+    so a new field must be added here too or it is dropped silently before the
+    broker ever sees it. Values pass through raw; the broker-side request
+    refuses bad shapes (e.g. a non-bool clear) with a clean envelope."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    args = {"type": body.get("type"),
+            "model": body.get("model", ""),
+            "effort": body.get("effort", ""),
+            "clear": body.get("clear", False)}
+    status, reply = await _relay(request, "model_default_set", args)
+    return web.json_response(reply, status=status)
+
+
 async def broker_software_handler(request: web.Request) -> web.Response:
     """GET /broker/software — read-only status of the host's agent/editor/reader
     dists, the built image fleet, and the effective version pins (gated). Mirrors
@@ -2535,6 +2561,7 @@ def main() -> None:
     app.router.add_get("/broker/projects", broker_projects_handler)
     app.router.add_get("/broker/workflows", broker_workflows_handler)
     app.router.add_get("/broker/models", broker_models_handler)
+    app.router.add_post("/broker/models/default", broker_models_default_handler)
     app.router.add_get("/broker/software", broker_software_handler)
     app.router.add_post("/broker/software/build", broker_build_handler)
     app.router.add_post("/broker/software/refresh-check", broker_refresh_check_handler)
