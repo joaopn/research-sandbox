@@ -3353,11 +3353,11 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent) {
         editorCb.checked = !editorCb.checked;
         editorCard.classList.toggle("selected", editorCb.checked);
     };
-    // rs-fetch (opt-in fetch surface) — docker substrate ONLY, default off: on
-    // dind workflows fetch is a per-box option (the box window's toggle) and
-    // from_kwargs rejects a project-level fetch there, so the card is only
-    // offered on the docker branch of the Extensions row below. Checked →
-    // `fetch: true` in the payload.
+    // rs-fetch (opt-in fetch surface) — ANY non-dev workflow, default off: it
+    // wires the PROJECT container (the supervisor, on dind — boxes keep their
+    // own per-box toggle in the box window). Hidden on the dev workflow only
+    // (from_kwargs refuses it there — the dev supervisor is the working
+    // agent's own container; no dead-end control). Checked → `fetch: true`.
     const fetchCb = el("input", { type: "checkbox" });
     fetchCb.checked = false;
     const fetchCard = el("div", {
@@ -3479,13 +3479,15 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent) {
         el("div", { class: "box-opt-group" }, [
             el("div", { class: "box-opt-caption" }, ["Extensions"]),
             // Node is substrate-agnostic (all flavors); reader is dind-only;
-            // rs-fetch is docker-only (dind projects take it per-box in the box
-            // window — no dead-end control). Node must appear on BOTH branches
-            // of the isDocker fork — the docker box is where node-based store
+            // rs-fetch is any-workflow-but-dev (the dev supervisor is the
+            // agent's own container — from_kwargs refuses it, so no dead-end
+            // control there). Node must appear on BOTH branches of the
+            // isDocker fork — the docker box is where node-based store
             // workflows (open-knowledge) run.
             el("div", { class: "box-opt-cards" },
                isDocker ? [editorCard, fetchCard, nodeCard]
-                        : [editorCard, readerCard, nodeCard]),
+                        : (isDev ? [editorCard, readerCard, nodeCard]
+                                 : [editorCard, fetchCard, readerCard, nodeCard])),
         ]),
     ]);
 
@@ -3641,9 +3643,9 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent) {
             };
             // Editor on by default; unchecking disables the code-server service.
             if (!editorCb.checked) payload.disable = ["code-server"];
-            // Opt-in rs-fetch — docker substrate only (the card is only shown
-            // there; from_kwargs rejects it elsewhere). Sent only when checked.
-            if (isDocker && fetchCb.checked) payload.fetch = true;
+            // Opt-in rs-fetch — any non-dev workflow (this payload branch never
+            // runs for dev, and the card is hidden there). Sent only when checked.
+            if (fetchCb.checked) payload.fetch = true;
             // Build ONE merged enable array so the reader tickbox and the worker
             // presets don't clobber each other (the broker drops silently, so a
             // second assignment would just lose the other's tokens). Worker presets

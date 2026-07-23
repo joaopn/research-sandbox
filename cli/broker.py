@@ -473,10 +473,11 @@ CREATE_WEBUI_FIELDS = frozenset({
     "supervisor_model", "supervisor_effort",
     "worker_model", "worker_effort",
     "role_model", "role_effort",
-    # Opt-in rs-fetch (docker substrate only): an IN-BOX capability toggle —
+    # Opt-in rs-fetch (any non-dev workflow): an IN-BOX capability toggle —
     # stages the read-only fetch tool + operator token + wiring INSIDE the
-    # container; no path, no host port, no mount. from_kwargs rejects it off
-    # the docker substrate and floors it on gitea bootstrap (fail-early).
+    # container (the supervisor, on dind); no path, no host port, no mount.
+    # from_kwargs refuses it on the dev workflow and floors it on gitea
+    # bootstrap (fail-early).
     "fetch",
 })
 

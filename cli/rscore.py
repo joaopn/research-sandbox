@@ -498,12 +498,13 @@ class CreateRequest:
     # never a raw relayed create.
     dev_lane: bool = False
     dev_repo: str = ""
-    # Opt-in rs-fetch surface (docker substrate ONLY — from_kwargs rejects it
-    # elsewhere: on dind projects fetch is a PER-BOX option, the box window's
-    # toggle). When set, create() stages the read-only fetch tool + operator
-    # token + the global fetch wiring into the project container. An IN-BOX
-    # capability field (no path, no host port, no mount), so it is broker-
-    # openable (CREATE_WEBUI_FIELDS).
+    # Opt-in rs-fetch surface (ANY non-dev workflow — from_kwargs refuses only
+    # the dev workflow, whose supervisor is the working agent's own container).
+    # When set, create() stages the read-only fetch tool + operator token +
+    # the global fetch wiring into the project container (the SUPERVISOR, on
+    # dind — boxes keep their own per-box toggle). An IN-BOX capability field
+    # (no path, no host port, no mount), so it is broker-openable
+    # (CREATE_WEBUI_FIELDS).
     fetch: bool = False
     # Agent model + effort per container type (STAGE_MODEL_SELECT). "" = not
     # specified ⇒ the type's default from models/defaults.json ⊕ the operator
@@ -534,19 +535,25 @@ class CreateRequest:
         manifest, project_type, substrate = _resolve_workflow(workflow_id)
         # Opt-in rs-fetch — two fail-early gates, deliberately ordered BEFORE
         # the dist/editor floors below so both stay hermetically testable:
-        # (a) the flag is docker-substrate-only (on dind projects fetch is a
-        # per-box option); (b) the bootstrap floor — an explicit fetch ask on
-        # a host whose dev lane was never enabled refuses instantly instead of
-        # building the whole container and dying at the deep
-        # _resume_gitea(require=True) gate in create() (which stays as the
-        # TOCTOU authority). Both messages are webui-safe (ValidationError
-        # text reaches the browser verbatim — no CLI verbs).
+        # (a) ONLY the dev workflow refuses, keyed on manifest DATA (never the
+        # workflow name) — its supervisor IS the fork-working agent's own
+        # container, the same isolation line that refuses dev boxes; every
+        # other workflow's project container is a human work surface (dind
+        # supervisor included — boxes keep their own per-box toggle); (b) the
+        # bootstrap floor — an explicit fetch ask on a host whose dev lane was
+        # never enabled refuses instantly instead of building the whole
+        # container and dying at the deep _resume_gitea(require=True) gate in
+        # create() (which stays as the TOCTOU authority). Dev-reject-before-
+        # floor mirrors box_add: a dev+fetch ask on a Gitea-less host gets the
+        # dev refusal, never a misleading Gitea remedy. Both messages are
+        # webui-safe (ValidationError text reaches the browser verbatim — no
+        # CLI verbs).
         fetch = bool(kw.get("fetch", False))
-        if fetch and substrate is not Substrate.DOCKER:
+        if fetch and manifest.get("dev"):
             raise ValidationError(
-                "the rs-fetch option applies to the single-container sandbox "
-                "workflow only; on this workflow it is a per-box option (the "
-                "box window's rs-fetch toggle)")
+                "a dev project does not take the rs-fetch option (its "
+                "supervisor is the working agent's own container; fetch from "
+                "a separate project or box instead)")
         if fetch and not gitea.bootstrap_present():
             raise ValidationError(
                 "this project requests rs-fetch, but the dev lane (Gitea) is "
@@ -1970,8 +1977,8 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         # boxes LAZILY via box_add against the current versions.env pins.)
         marker["box_image_pins"] = _box_image_pins(load_versions())
     if req.fetch:
-        # Opt-in rs-fetch (docker substrate; gated in from_kwargs): the marker
-        # key drives the conditional re-stage of the fetch surface at
+        # Opt-in rs-fetch (any non-dev workflow; gated in from_kwargs): the
+        # marker key drives the conditional re-stage of the fetch surface at
         # start/recreate (_project_has_fetch_consumers).
         marker["fetch"] = True
     (orch_dir / "project.json").write_text(json.dumps(marker, indent=2) + "\n")
@@ -2292,13 +2299,14 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         except SystemExit:
             print("warning: rs-gitea unavailable; dev wiring skipped "
                   "(heals at `research start`)", file=sys.stderr)
-    # Opt-in rs-fetch (docker substrate; from_kwargs rejects the flag on dind —
-    # there it is a per-box option in box_add). STRICT, unlike the best-effort
-    # universal wiring above: the flag is an explicit ask, so a sick gitea
-    # fails the create loudly (the from_kwargs bootstrap floor already refused
-    # the never-enabled case; _resume_gitea is the TOCTOU authority). No
-    # --add-host needed: this container sits on rs-net-<project>, where
-    # rs-gitea resolves via the bridge's embedded DNS.
+    # Opt-in rs-fetch (any non-dev workflow; from_kwargs refuses only the dev
+    # workflow — on dind this wires the SUPERVISOR, boxes keep their per-box
+    # toggle). STRICT, unlike the best-effort universal wiring above: the flag
+    # is an explicit ask, so a sick gitea fails the create loudly (the
+    # from_kwargs bootstrap floor already refused the never-enabled case;
+    # _resume_gitea is the TOCTOU authority). No --add-host needed on EITHER
+    # substrate: this container sits on rs-net-<project>, where rs-gitea
+    # resolves via the bridge's embedded DNS.
     if req.fetch:
         _resume_gitea(require=True)
         fetch_ip = _connect_gitea_to_project_network(network)

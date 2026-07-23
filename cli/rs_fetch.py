@@ -2,8 +2,8 @@
 """rs-fetch — stage agent work from the shared rs-gitea into a local clone.
 
 Staged by the host into rs-fetch-ENABLED surfaces only (opt-in at box /
-project creation — the box window's rs-fetch toggle, or the sandbox
-workflow's create option; never baked, never universal). Runs as the
+project creation — the box window's rs-fetch toggle, or a project's create
+option on any non-dev workflow; never baked, never universal). Runs as the
 container user against the repo's ACTIVE consumer fork (per-consumer forks —
 the owner comes from the staged wiring rows, steered by Management's
 active-fork selector) using the READ-ONLY operator token staged at

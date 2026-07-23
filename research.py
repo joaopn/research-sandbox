@@ -1991,9 +1991,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="wire the project container for rs-fetch: stage the "
                         "read-only fetch tool + operator token + dev-lane "
                         "wiring so agent commits can be fetched from the "
-                        "shared gitea into a local clone (single-container "
-                        "sandbox workflow only; dind projects use the box "
-                        "window's per-box toggle). Requires the dev lane "
+                        "shared gitea into a local clone (any workflow except "
+                        "dev; on dind this wires the supervisor — boxes have "
+                        "their own per-box toggle). Requires the dev lane "
                         "(gitea) enabled.")
     cag = c.add_mutually_exclusive_group()
     cag.add_argument("--agent", "--agents", dest="agents", action=_AppendAgents,
