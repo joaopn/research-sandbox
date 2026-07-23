@@ -3,6 +3,12 @@
   "efforts": ["low", "medium", "high", "xhigh", "max"],
   "models": [
     {
+      "alias": "fable",
+      "label": "Fable",
+      "blurb": "Mythos-class tier above Opus. The most capable model available.",
+      "efforts": ["low", "medium", "high", "xhigh", "max"]
+    },
+    {
       "alias": "opus",
       "label": "Opus",
       "blurb": "Most capable. The default for agents you talk to and for judgement-heavy work.",
