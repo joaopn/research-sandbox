@@ -40,6 +40,7 @@ import argparse
 import base64
 import datetime
 import enum
+import fcntl
 import ipaddress
 import json
 import os
@@ -8794,6 +8795,13 @@ REVIEW_PR_BODY_MAX_CHARS = 4000
 REVIEWER_NETWORK = "rs-reviewer"
 REVIEWER_RUN_PREFIX = "rs-reviewer-run-"
 REVIEWER_LOGIN_CONTAINER = "rs-reviewer-login"
+# Serializes the SHARED lane setup (_ensure_reviewer_network) across the
+# parallel detached review children — separate processes, so a kernel file
+# lock is the right primitive (released on fd close/process death; no stale-
+# lock recovery path, the pid-file weakness this avoids). Host-only home-dir
+# state, deliberately NOT under the webui-mounted run/ dir. Reviews themselves
+# stay N-at-a-time; only the ~1s setup critical section serializes.
+REVIEWER_NET_LOCK = Path.home() / ".research-sandbox" / "reviewer-net.lock"
 
 # Shared in-container deploy fragment (root): the agent dist -> the research
 # user's own writable ~/.local + the dist's bypass settings (no-clobber), the
@@ -8877,14 +8885,46 @@ def _ensure_reviewer_network() -> str:
     (re-)assert the LOCKED rules, return the router's IP on it. Rules are
     re-asserted on EVERY call (apply-rules.sh is remove-then-apply), so a
     router RECREATE heals at the next review; a plain router restart already
-    self-heals via the router's own rules persist (/etc/sandbox/rules)."""
+    self-heals via the router's own rules persist (/etc/sandbox/rules).
+
+    The whole setup runs under a host file lock (B45/B46): the parallel
+    detached review children otherwise race the check-then-create (2 of 3
+    died "network already exists" on the first live 3-wide bulk fire) and
+    interleave the remove-then-apply rule re-assert. The lock's flock blocks
+    INDEFINITELY by design — a sibling wedged inside the section means docker
+    itself is wedged and a timeout constant would only rename that failure;
+    a dead holder releases via the kernel. Reviews stay parallel; only this
+    ~1s section serializes."""
     if not container_running(ROUTER_CONTAINER):
         die(f"{ROUTER_CONTAINER} is not running. Run `research start` first.")
-    if not network_exists(REVIEWER_NETWORK):
-        run_check(["docker", "network", "create", REVIEWER_NETWORK])
-    run(["docker", "network", "connect", REVIEWER_NETWORK, ROUTER_CONTAINER],
-        capture_output=True)
-    apply_firewall_rules(REVIEWER_NETWORK, "locked")
+    REVIEWER_NET_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with open(REVIEWER_NET_LOCK, "w") as lockf:
+        fcntl.flock(lockf, fcntl.LOCK_EX)
+        if not network_exists(REVIEWER_NETWORK):
+            # Tolerant create (belt-and-braces under the lock): proceed iff
+            # the network exists afterwards — a non-rscore creator winning a
+            # race is tolerable, a daemon-down create failure stays fail-loud.
+            r = run(["docker", "network", "create", REVIEWER_NETWORK],
+                    capture_output=True)
+            if r.returncode != 0 and not network_exists(REVIEWER_NETWORK):
+                die(f"command failed: docker network create "
+                    f"{REVIEWER_NETWORK}\n{(r.stderr or '').strip()}")
+        run(["docker", "network", "connect", REVIEWER_NETWORK,
+             ROUTER_CONTAINER], capture_output=True)
+        apply_firewall_rules(REVIEWER_NETWORK, "locked")
+        # Proactive sweep of crashed reviews' leftovers (PI decision): a child
+        # hard-killed between its docker run and its finally leaves a STOPPED
+        # container; clear exited ones at the next review instead of letting
+        # them accumulate until pid reuse. Anchored on the RUN prefix (the
+        # name filter is substring-by-default — bare "rs-reviewer-" would
+        # match the login container) and status=exited ONLY (a running
+        # sibling is never touched; verdict capture reads host-side tmp
+        # files, never the container).
+        r = run(["docker", "ps", "-aq",
+                 "--filter", f"name=^{REVIEWER_RUN_PREFIX}",
+                 "--filter", "status=exited"], capture_output=True)
+        for cid in (r.stdout or "").split():
+            run(["docker", "rm", "-f", cid], capture_output=True)
     return get_router_ip(REVIEWER_NETWORK)
 
 
@@ -9111,7 +9151,16 @@ def review_pr(req: "ReviewRequest", progress=None) -> dict:  # type: ignore[name
         shutil.copyfile(gitea.REVIEWER_CRED_PATH, tmp / ".credentials.json")
         os.chmod(tmp / ".credentials.json", 0o600)
         (tmp / "out").mkdir()
-        run_check(["docker", "run", "-d", "--rm", "--name", name,
+        # No --rm: auto-remove raced our own finally rm -f, leaving Dead
+        # husks that squat the name (B47) — the finally is the SINGLE removal
+        # path now, and docker wait below is reliable again (the S4 --rm
+        # caveat). The tolerant PRE-run rm clears a same-pid leftover from a
+        # hard-killed prior child (two LIVE children can never share a pid,
+        # so the name it clears is dead by construction — the reviewer_login
+        # pattern); a hard-killed child's stopped container otherwise lingers
+        # visibly until this or the lane sweep removes it (accepted).
+        run(["docker", "rm", "-f", name], capture_output=True)
+        run_check(["docker", "run", "-d", "--name", name,
                    "--network", REVIEWER_NETWORK,
                    "-v", f"{tmp}:/review",
                    "-v", f"{agent_dist_path(DEFAULT_AGENT)}:/opt/agent-dist/claude:ro",
