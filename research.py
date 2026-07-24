@@ -1823,6 +1823,7 @@ def cmd_dev_review(args: argparse.Namespace) -> None:
               else f"{res['repo']}#{res['pr']}")
     print(f"review of {target}: {res['status']}"
           + (f" (risk: {res['risk']})" if res.get("risk") else "")
+          + (f" (outcome: {res['outcome']})" if res.get("outcome") else "")
           + (f" (model: {res['model']})" if res.get("model") else ""))
     if res.get("summary"):
         print(f"  {res['summary']}")

@@ -993,8 +993,8 @@ def attached_projects(repo: str) -> list[str]:
 # reasons only (a review error can carry host paths; raw detail lives in the
 # broker's host-only full log):
 #   {repo, pr, head_sha, status: "ok"|"failed", reason?: <coarse token>,
-#    risk?: "low"|"medium"|"high", summary?, findings?: [{file, note}],
-#    reviewed_at}
+#    risk?: <free-text label, parse-capped>, outcome?: "pass"|"fail",
+#    summary?, findings?: [{file, note}], reviewed_at}
 # Failed entries are written too (from the diff-fetch step onward) so the
 # Development page can show WHY nothing usable exists.
 
@@ -1049,7 +1049,7 @@ def load_repo_verdicts(repo: str) -> dict[str, dict]:
 # f.stem.isdigit(), and a 40-hex sha CAN be all-decimal — a bare <sha>.json
 # could masquerade as a PR entry. The prefix keeps the two globs structurally
 # disjoint in both directions. Schema mirrors the PR entry minus head_sha/pr:
-#   {repo, commit, status: "ok"|"failed", reason?, risk?, summary?,
+#   {repo, commit, status: "ok"|"failed", reason?, risk?, outcome?, summary?,
 #    findings?, reviewed_at}
 
 def commit_verdict_path(repo: str, sha: str) -> Path:

@@ -1374,6 +1374,12 @@ body {
     gap: 6px;
 }
 .dev-reviewing { font-style: italic; }
+/* Review outcome colors: keyed on the machine "outcome" field only (the
+   free-text risk label is display, never parsed). No class = no color
+   (unknown / pre-field entries); review-run failures share the error red. */
+.dev-review-badge.dev-outcome-pass { color: var(--status-up); }
+.dev-review-badge.dev-outcome-fail { color: var(--error-fg); }
+.dev-review-failed { color: var(--error-fg); }
 /* The per-project Fetch pane (the fetch-<repo> tab): RS-rendered HTML inside
    #terminal-area, which never scrolls host content itself — the pane owns its
    scrolling. */

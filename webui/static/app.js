@@ -1926,7 +1926,11 @@ function devRenderPrReviewCell(cellEl, repo, p, v, ctx) {
     if (v.status === "ok") {
         const stale = !!(v.head_sha && p.sha && v.head_sha !== p.sha);
         const badge = el("button", {
-            class: "btn-small dev-review-badge",
+            // Color keys on the STRICT outcome field only — never on the
+            // free-text risk label, which the prompt owns.
+            class: "btn-small dev-review-badge"
+                + (v.outcome === "pass" ? " dev-outcome-pass"
+                   : v.outcome === "fail" ? " dev-outcome-fail" : ""),
             title: "show the review verdict",
         }, ["reviewed ✓" + (v.risk ? ` · ${v.risk}` : "")
             + (stale ? " · stale" : "")]);
@@ -2108,7 +2112,10 @@ function devRenderCommitReviewCell(cell, repo, sha, v, ctx) {
         cell.appendChild(reviewBtn("Review"));
     } else if (v.status === "ok") {
         const badge = el("button", {
-            class: "btn-small dev-review-badge",
+            // Same outcome-only color keying as the PR badge above.
+            class: "btn-small dev-review-badge"
+                + (v.outcome === "pass" ? " dev-outcome-pass"
+                   : v.outcome === "fail" ? " dev-outcome-fail" : ""),
             title: "show the review verdict",
         }, ["reviewed ✓" + (v.risk ? ` · ${v.risk}` : "")]);
         const vpanel = el("div", { class: "dev-verdict-panel" });
