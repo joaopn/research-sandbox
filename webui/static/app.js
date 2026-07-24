@@ -1875,16 +1875,136 @@ function devMarkReviewingCells(key) {
     });
 }
 
-// A dismissed PR review's terminal: swap the PR row's cell to a
-// "done — refresh" button (PI decision: never auto-re-render the page under
-// the operator; PR badges ride the /broker/dev read, so a refresh is the
-// honest resolution). `rerender` is threaded from the dismissal/render site.
-function devMarkPrReviewDone(key, rerender) {
+// Render ONE PR row's review cell — shared by buildDevRepoCard's initial
+// render and devResolvePrReviewCell's in-place completion resolve (the PI
+// revision of the never-auto-re-render decision: the PAGE is still never
+// re-rendered under the operator, but the CELL resolves in place). ctx =
+// {view, body, rerender, onLogin}, the devRefreshCommitCells shape. The
+// verdict panel is LAZY: built on the first badge click and inserted after
+// the row's commits panel when one follows (preserving the shipped
+// row → commits-panel → verdict-panel order), toggled thereafter via the
+// local ref, and stamped data-rkey-panel so a cell re-render can clear THIS
+// row's stale panel. The removal is scoped to the row's own sibling run,
+// never a document-wide query — the Development page and a per-project pane
+// showing the same repo carry colliding keys, and one surface must never
+// reach into the other's DOM; the initial build path (cell not yet in a row,
+// closest → null) needs no removal at all, the card wipe detaches old panels
+// wholesale.
+function devRenderPrReviewCell(cellEl, repo, p, v, ctx) {
+    const rkey = devReviewKey(repo, "#" + String(p.number));
+    cellEl.innerHTML = "";
+    const row = cellEl.closest(".dev-pr-row");
+    if (row) {
+        let sib = row.nextElementSibling;
+        while (sib && !sib.classList.contains("dev-pr-row")) {
+            const next = sib.nextElementSibling;
+            if (sib.getAttribute("data-rkey-panel") === rkey) sib.remove();
+            sib = next;
+        }
+    }
+    const reviewBtn = (label) => {
+        const btn = el("button", { class: "btn-small dev-review-btn" },
+                       [label]);
+        btn.onclick = () => {
+            btn.disabled = true;
+            devReviewDialog(ctx.view, ctx.body, repo, { pr: p.number },
+                            ctx.rerender, ctx.onLogin);
+        };
+        return btn;
+    };
+    const flight = devReviewsInFlight.get(rkey);
+    if (flight) {
+        cellEl.appendChild(el("span",
+            { class: "dev-pr-meta dev-reviewing" }, ["reviewing…"]));
+        if (!flight.watching)   // stalled: restart with THIS render's context
+            devWatchReview(rkey, flight.opId,
+                           () => devResolvePrReviewCell(rkey, repo, p.number,
+                                                        ctx));
+        return;
+    }
+    if (!v) { cellEl.appendChild(reviewBtn("Review")); return; }
+    if (v.status === "ok") {
+        const stale = !!(v.head_sha && p.sha && v.head_sha !== p.sha);
+        const badge = el("button", {
+            class: "btn-small dev-review-badge",
+            title: "show the review verdict",
+        }, ["reviewed ✓" + (v.risk ? ` · ${v.risk}` : "")
+            + (stale ? " · stale" : "")]);
+        let panel = null;
+        badge.onclick = () => {
+            if (panel) {
+                panel.style.display =
+                    panel.style.display === "none" ? "" : "none";
+                return;
+            }
+            const prow = cellEl.closest(".dev-pr-row");
+            if (!prow) return;   // detached leftover — nothing to anchor on
+            panel = el("div", { class: "dev-verdict-panel" });
+            panel.setAttribute("data-rkey-panel", rkey);
+            panel.appendChild(el("div", { class: "dev-pr-meta" }, [
+                `reviewed ${v.reviewed_at || ""}`
+                + (v.model ? ` (model: ${v.model})` : "")
+                + (stale ? " — the PR has new commits since this review" : ""),
+            ]));
+            if (v.summary) {
+                panel.appendChild(el("div", { class: "dev-verdict-summary" },
+                                     [v.summary]));
+            }
+            const findings = Array.isArray(v.findings) ? v.findings : [];
+            for (const f of findings) {
+                if (!f || typeof f !== "object") continue;
+                panel.appendChild(el("div", { class: "dev-verdict-finding" },
+                    ["• " + (f.file ? f.file + ": " : "") + (f.note || "")]));
+            }
+            panel.appendChild(reviewBtn("Re-review"));
+            // D1 anchor: keep the shipped row → commits-panel → verdict-panel
+            // order when the commits expander sits after this row.
+            let anchor = prow;
+            if (anchor.nextElementSibling && anchor.nextElementSibling
+                    .classList.contains("dev-commits-panel"))
+                anchor = anchor.nextElementSibling;
+            anchor.after(panel);
+        };
+        cellEl.appendChild(badge);
+        return;
+    }
+    cellEl.appendChild(el("span",
+        { class: "dev-pr-meta dev-review-failed" },
+        ["review failed" + (v.reason ? `: ${v.reason}` : "")]));
+    cellEl.appendChild(reviewBtn("Retry"));
+}
+
+// The PR twin of devRefreshCommitCells: on a review's terminal, fetch the
+// repo's status and repaint the PR row's cell IN PLACE — fresh verdict, fresh
+// head sha (the stale calc). Every degraded arm (transport failure,
+// unparseable body, missing row/PR — incl. the B37 {repo,error} row, a
+// stopped gitea's empty row, and a since-closed PR — and 401/403) falls back
+// to the shipped "done — refresh" button: a BACKGROUND resolve must never
+// yank the page to a login card or re-render it under the operator (the
+// devWatchReview stall posture).
+async function devResolvePrReviewCell(key, repo, prNumber, ctx) {
+    let p = null, v = null;
+    try {
+        const res = await fetch(
+            `/broker/dev/repo-status?repo=${encodeURIComponent(repo)}`);
+        if (res.ok) {
+            const data = await res.json();
+            const row = (data.ok && data.result && data.result.repo
+                         && typeof data.result.repo === "object")
+                ? data.result.repo : null;
+            if (row && Array.isArray(row.prs)) {
+                p = row.prs.find((x) => x && x.number === prNumber) || null;
+                if (row.reviews && typeof row.reviews === "object")
+                    v = row.reviews[String(prNumber)] || null;
+            }
+        }
+    } catch (e) { /* degraded arm below */ }
     devUpdateReviewCells(key, (cellEl) => {
+        if (p && v) return devRenderPrReviewCell(cellEl, repo, p, v, ctx);
         cellEl.innerHTML = "";
         const btn = el("button", { class: "btn-small dev-review-btn" },
                        ["done — refresh"]);
-        btn.onclick = () => rerender();
+        btn.onclick = () => ctx.rerender();
         cellEl.appendChild(btn);
     });
 }
@@ -2358,9 +2478,11 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
 // body carries exactly ONE locator (commit wins — it is only ever set for a
 // commit review). Advisory — the verdict lands in the host ledger.
 // The box is DISMISSABLE: a backdrop click closes it while the review keeps
-// running detached — the row flips to "reviewing…" and resolves via the
-// background watcher (commit cells re-render from the ledger; PR cells get
-// "done — refresh"). A review already running for this subject no-ops up
+// running detached — the row flips to "reviewing…" and resolves IN PLACE via
+// the background watcher (commit cells via devRefreshCommitCells, PR cells
+// via devResolvePrReviewCell; "done — refresh" survives only as the degraded
+// fallback). With the box left OPEN, opts.onTerminal resolves the cells the
+// moment the terminal lands. A review already running for this subject no-ops up
 // front: the modal guard only stops concurrent DIALOGS, not a duplicate of a
 // detached review a stale row still offers.
 // `rerender` (optional) is the CLOSE landing (fires with view/body intact):
@@ -2388,6 +2510,17 @@ async function devReviewDialog(view, body, repo, sel, rerender, onLogin) {
     document.body.appendChild(backdrop);
     let opId = null;
     let dismissed = false;
+    let terminalSeen = false;
+    const cctx = { view, body, sel, rerender: onDone, onLogin };
+    // In-place completion resolve — fired by the OPEN modal's tail the moment
+    // the terminal record lands (opts.onTerminal), and by the background
+    // watcher on the dismissal path. Either way the page is never re-rendered
+    // under the operator; only the stamped cells repaint.
+    const resolveCells = () => {
+        terminalSeen = true;
+        if (sel.commit) devRefreshCommitCells(repo, sel.commit, cctx);
+        else devResolvePrReviewCell(key, repo, sel.pr, cctx);
+    };
     // Hand the running op to the background watcher (the dismissal path).
     const registerDetached = () => {
         devReviewsInFlight.set(key, { opId: opId, watching: false,
@@ -2395,10 +2528,11 @@ async function devReviewDialog(view, body, repo, sel, rerender, onLogin) {
         devMarkReviewingCells(key);
         if (sel.commit) {
             devWatchReview(key, opId, () => devRefreshCommitCells(
-                repo, sel.commit,
-                { view, body, sel, rerender: onDone, onLogin }));
+                repo, sel.commit, cctx));
         } else {
-            devWatchReview(key, opId, () => devMarkPrReviewDone(key, onDone));
+            devWatchReview(key, opId,
+                           () => devResolvePrReviewCell(key, repo, sel.pr,
+                                                        cctx));
         }
     };
     const dismiss = () => {
@@ -2408,7 +2542,10 @@ async function devReviewDialog(view, body, repo, sel, rerender, onLogin) {
         // Pre-op dismissal (the POST is still pending): the continuation
         // below registers a successfully started op, or silently drops a
         // refusal — the row then still offers Review, the honest state.
-        if (opId) registerDetached();
+        // Post-terminal dismissal: the cells already resolved via onTerminal —
+        // re-registering would flash "reviewing…" and mint a watcher whose
+        // registry entry lies until its first poll.
+        if (opId && !terminalSeen) registerDetached();
     };
     backdrop.onclick = (e) => { if (e.target === backdrop) dismiss(); };
     let res;
@@ -2448,7 +2585,8 @@ async function devReviewDialog(view, body, repo, sel, rerender, onLogin) {
     }
     opId = b.op_id;
     await mgmtTailBuildLog(view, backdrop, card, b.op_id, title, onDone,
-                           onLogin, { onDismiss: dismiss });
+                           onLogin, { onDismiss: dismiss,
+                                      onTerminal: resolveCells });
 }
 
 async function renderDevFetchTab(view, body) {
@@ -2698,75 +2836,21 @@ function buildDevRepoCard(view, body, r, attached, opts) {
         // Review verdicts (S4): ledger entries keyed by str(pr) — JS
         // property lookup coerces p.number across the int/str boundary.
         // All verdict strings are MODEL OUTPUT → text nodes only. The review
-        // UI lives in a stamped cell (data-rkey, str-coerced pr) so a
-        // dismissed review's watcher can flip it ("reviewing…" →
-        // "done — refresh") across card re-renders, and a mid-flight
+        // UI lives in a stamped cell (data-rkey, str-coerced pr) rendered by
+        // the shared devRenderPrReviewCell, so a dismissed review's watcher
+        // resolves it IN PLACE across card re-renders, and a mid-flight
         // re-render shows "reviewing…" instead of a duplicate-inviting
-        // Review button.
+        // Review button. The verdict panel is lazy (first badge click) —
+        // nothing to push after the commits panel here anymore.
         const v = reviews[p.number];
         const rkey = devReviewKey(r.repo, "#" + String(p.number));
         const revCell = el("span", { class: "dev-review-cell" });
         revCell.setAttribute("data-rkey", rkey);
-        const reviewBtn = (label) => {
-            const btn = el("button", { class: "btn-small dev-review-btn" },
-                           [label]);
-            btn.onclick = () => {
-                btn.disabled = true;
-                devReviewDialog(view, body, r.repo, { pr: p.number }, rerender,
-                                onLogin);
-            };
-            return btn;
-        };
-        let panel = null;
-        const flight = devReviewsInFlight.get(rkey);
-        if (flight) {
-            revCell.appendChild(el("span",
-                { class: "dev-pr-meta dev-reviewing" }, ["reviewing…"]));
-            if (!flight.watching)   // stalled: restart with THIS rerender
-                devWatchReview(rkey, flight.opId,
-                               () => devMarkPrReviewDone(rkey, rerender));
-        } else if (!v) {
-            revCell.appendChild(reviewBtn("Review"));
-        } else if (v.status === "ok") {
-            const stale = !!(v.head_sha && p.sha && v.head_sha !== p.sha);
-            const badge = el("button", {
-                class: "btn-small dev-review-badge",
-                title: "show the review verdict",
-            }, ["reviewed ✓" + (v.risk ? ` · ${v.risk}` : "")
-                + (stale ? " · stale" : "")]);
-            panel = el("div", { class: "dev-verdict-panel" });
-            panel.style.display = "none";
-            panel.appendChild(el("div", { class: "dev-pr-meta" }, [
-                `reviewed ${v.reviewed_at || ""}`
-                + (v.model ? ` (model: ${v.model})` : "")
-                + (stale ? " — the PR has new commits since this review" : ""),
-            ]));
-            if (v.summary) {
-                panel.appendChild(el("div", { class: "dev-verdict-summary" },
-                                     [v.summary]));
-            }
-            const findings = Array.isArray(v.findings) ? v.findings : [];
-            for (const f of findings) {
-                if (!f || typeof f !== "object") continue;
-                panel.appendChild(el("div", { class: "dev-verdict-finding" },
-                    ["• " + (f.file ? f.file + ": " : "") + (f.note || "")]));
-            }
-            panel.appendChild(reviewBtn("Re-review"));
-            badge.onclick = () => {
-                panel.style.display =
-                    panel.style.display === "none" ? "" : "none";
-            };
-            revCell.appendChild(badge);
-        } else {
-            revCell.appendChild(el("span",
-                { class: "dev-pr-meta dev-review-failed" },
-                ["review failed" + (v.reason ? `: ${v.reason}` : "")]));
-            revCell.appendChild(reviewBtn("Retry"));
-        }
+        devRenderPrReviewCell(revCell, r.repo, p, v,
+                              { view, body, rerender, onLogin });
         cells.push(revCell);
         rows.push(el("div", { class: "dev-pr-row" }, cells));
         rows.push(commitsUi.panel);
-        if (panel) rows.push(panel);
     }
     if (!prs.length && !r.empty) {
         rows.push(el("div", { class: "config-empty" }, ["No open PRs."]));
@@ -3493,6 +3577,14 @@ async function mgmtTailBuildLog(view, backdrop, card, opId, title, onDone,
         await opSleep(OP_POLL_INTERVAL_MS);
     }
     if (cancelled) return;
+    // In-place completion resolve for the caller (opts.onTerminal — passed
+    // ONLY by the review dialog): fires ONCE, on a REAL terminal only (never
+    // on cancelled/auth exits or a hard-killed interrupt), before the
+    // operator touches Done — the page behind the open modal resolves
+    // immediately; the Done click keeps its full re-render landing.
+    if (sawTerminal && opts && opts.onTerminal) {
+        try { opts.onTerminal(ok); } catch (e) { /* cell resolve is best-effort */ }
+    }
     try { await drainFull(); } catch (e) { /* best-effort trailing bytes */ }
     if (interrupted) {
         phaseEl.textContent = "interrupted";
