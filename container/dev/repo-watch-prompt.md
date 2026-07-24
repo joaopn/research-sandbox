@@ -82,9 +82,16 @@ curl -s -X POST \
 curl -s -X POST \
   -H "Authorization: token $GITEA_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"Do":"merge","delete_branch_after_merge":true}' \
+  -d '{"Do":"fast-forward-only","delete_branch_after_merge":true}' \
   "$GITEA_URL/api/v1/repos/$GITEA_USER/$REPO_NAME/pulls/PR_NUMBER/merge"
 ```
+
+Always merge fast-forward-only. If gitea refuses the merge (HTTP 405 — your
+branch is behind the base), rebase your branch onto the base branch,
+force-push it to your fork, and retry the same merge call. Never fall back to
+the plain "merge" style: your fork refuses merge-commit merges by policy, so
+that refusal is expected behavior, not breakage — a linear history is what
+lets the maintainer land your commits individually.
 
 ### Add labels to an issue
 

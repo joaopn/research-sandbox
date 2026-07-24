@@ -159,7 +159,22 @@ COMMITS_PAGE_SIZE = 5
 # Unnamed units are PRESERVED by gitea's Edit (each is touched only when its
 # option is non-nil), so a mirror keeps its code unit and its private flag.
 FORK_FEATURES = {"has_issues": True, "has_pull_requests": True,
-                 "has_wiki": True, "has_projects": True}
+                 "has_wiki": True, "has_projects": True,
+                 # Linear-history contract: merge-commit and squash styles are
+                 # BANNED on consumer forks so every landed change exists as an
+                 # individual commit the human can walk (rs-fetch --auto-commit
+                 # refuses merge-bearing ranges). fast-forward-only is the
+                 # default; plain rebase stays allowed as the catch-up fallback
+                 # DELIBERATELY — a server-side rebase rewrites shas, but the
+                 # fetch walk keys on patch-id equivalence (sha-independent),
+                 # so banning only the merge-commit producers (merge, squash,
+                 # rebase_explicit) is sufficient.
+                 "allow_merge_commits": False,
+                 "allow_squash_merge": False,
+                 "allow_rebase_explicit": False,
+                 "allow_rebase": True,
+                 "allow_fast_forward_only_merge": True,
+                 "default_merge_style": "fast-forward-only"}
 MIRROR_FEATURES = {"has_issues": False}
 
 
