@@ -1800,6 +1800,7 @@ class DevStatusResult:
     gitea: dict                                 # {"exists": bool, "running": bool}
     repos: list[dict]                           # gitea.repo_status rows (running only)
     attachments: list[dict]                     # [{project, repo}] (agent-class)
+    reviewer: dict                              # {"present": bool, "set_at": str} — token state, never token material
 
 
 @dataclass
@@ -1807,6 +1808,7 @@ class DevRepoStatusResult:
     gitea: dict                                 # {"exists": bool, "running": bool}
     repo: dict                                  # ONE repo_status row (+reviews), {} when not running, {repo, error} degraded
     attachments: list[dict]                     # [{project}] — this repo's consumers
+    reviewer: dict                              # {"present": bool, "set_at": str} — token state, never token material
 
 
 @dataclass
@@ -8669,8 +8671,11 @@ def dev_status(_req: "DevStatusRequest", _progress=None) -> DevStatusResult:  # 
     attachments = [{"project": e.get("project"), "repo": e.get("repo")}
                    for e in gitea.load_attachments()
                    if e.get("project") and e.get("repo")]
+    # Reviewer-token state rides OUTSIDE `if running:` — it is orthogonal to
+    # gitea's state (a pure local file read; the no-start posture holds).
     return DevStatusResult(gitea={"exists": exists, "running": running},
-                           repos=repos, attachments=attachments)
+                           repos=repos, attachments=attachments,
+                           reviewer=gitea.reviewer_token_state())
 
 
 def dev_repo_status(req: "DevRepoStatusRequest", _progress=None) -> DevRepoStatusResult:  # type: ignore[name-defined]
@@ -8695,8 +8700,11 @@ def dev_repo_status(req: "DevRepoStatusRequest", _progress=None) -> DevRepoStatu
     attachments = [{"project": e.get("project")}
                    for e in gitea.load_attachments()
                    if e.get("project") and e.get("repo") == req.repo]
+    # Same posture as dev_status: the token state is a local file read,
+    # populated outside `if running:`.
     return DevRepoStatusResult(gitea={"exists": exists, "running": running},
-                               repo=row, attachments=attachments)
+                               repo=row, attachments=attachments,
+                               reviewer=gitea.reviewer_token_state())
 
 
 def dev_gitea_start(_req: "DevGiteaStartRequest", progress=None) -> DevGiteaStartResult:  # type: ignore[name-defined]
@@ -8890,10 +8898,16 @@ _REVIEW_GATE_POLL_S = 0.2
 # with the diff for context; at 10x this it would dominate it. Truncation is
 # marked in the prompt.
 REVIEW_PR_BODY_MAX_CHARS = 4000
+# Bounded tail of the reviewer's raw stdout/stderr printed to the HOST-ONLY
+# full log on failure. Not a new magic number: it NAMES the literal the
+# stderr-tail read already shipped with; the raw-output tail (the fix for the
+# unparseable-output diagnostic dead-end) reuses it. At half, a long auth/
+# usage message could truncate mid-explanation; at 10x a runaway output would
+# bloat the full log for no diagnostic gain.
+_REVIEW_OUTPUT_TAIL_CHARS = 2000
 
 REVIEWER_NETWORK = "rs-reviewer"
 REVIEWER_RUN_PREFIX = "rs-reviewer-run-"
-REVIEWER_LOGIN_CONTAINER = "rs-reviewer-login"
 # Serializes the SHARED lane setup (_ensure_reviewer_network) across the
 # parallel detached review children — separate processes, so a kernel file
 # lock is the right primitive (released on fd close/process death; no stale-
@@ -9015,8 +9029,8 @@ def _ensure_reviewer_network() -> str:
         # hard-killed between its docker run and its finally leaves a STOPPED
         # container; clear exited ones at the next review instead of letting
         # them accumulate until pid reuse. Anchored on the RUN prefix (the
-        # name filter is substring-by-default — bare "rs-reviewer-" would
-        # match the login container) and status=exited ONLY (a running
+        # name filter is substring-by-default — keep it anchored so only the
+        # per-run containers ever match) and status=exited ONLY (a running
         # sibling is never touched; verdict capture reads host-side tmp
         # files, never the container).
         r = run(["docker", "ps", "-aq",
@@ -9027,51 +9041,25 @@ def _ensure_reviewer_network() -> str:
     return get_router_ip(REVIEWER_NETWORK)
 
 
-def reviewer_login() -> dict:
-    """One-time (re-runnable) interactive OAuth mint for the dedicated reviewer
-    Claude account (Q3): a throwaway rs-minimal-base container with the agent
-    dist RO-mounted, the operator completes the device-code flow in it, and the
-    creds are captured OUT to the host stash (0600). Host-CLI-only — never a
-    broker verb (interactive + writes host secrets)."""
-    if not dist_present(DEFAULT_AGENT):
-        die(f"no cached {DEFAULT_AGENT} dist — run `research agent pull` first")
-    router_ip = _ensure_reviewer_network()
-    run(["docker", "rm", "-f", REVIEWER_LOGIN_CONTAINER], capture_output=True)
-    run_check(["docker", "run", "-d", "--rm",
-               "--name", REVIEWER_LOGIN_CONTAINER,
-               "--network", REVIEWER_NETWORK,
-               "-v", f"{agent_dist_path(DEFAULT_AGENT)}:/opt/agent-dist/claude:ro",
-               MINIMAL_BASE_IMAGE, "sleep", "infinity"])
-    try:
-        inject_route(REVIEWER_LOGIN_CONTAINER, router_ip)
-        run_check(["docker", "exec", REVIEWER_LOGIN_CONTAINER,
-                   "sh", "-lc", _REVIEWER_DEPLOY])
-        print("Opening an interactive claude in the throwaway login container.")
-        print("Log in with the DEDICATED reviewer account (device-code OAuth),")
-        print("then /exit. The credentials are captured to the host stash;")
-        print("nothing else in the container survives.")
-        run(["docker", "exec", "-it", "-u", "research",
-             "-w", "/home/research", REVIEWER_LOGIN_CONTAINER,
-             _REVIEWER_CLAUDE])
-        r = run(["docker", "exec", "-u", "research", REVIEWER_LOGIN_CONTAINER,
-                 "cat", "/home/research/.claude/.credentials.json"],
-                capture_output=True)
-        creds = (r.stdout or "").strip()
-        try:
-            valid = bool(creds) and isinstance(json.loads(creds), dict)
-        except json.JSONDecodeError:
-            valid = False
-        if not valid:
-            die("OAuth did not complete (no credentials found in the login "
-                "container); re-run `research dev reviewer-login`")
-        gitea.REVIEWER_CRED_DIR.mkdir(parents=True, exist_ok=True)
-        os.chmod(gitea.REVIEWER_CRED_DIR, 0o700)
-        gitea._write_secret(gitea.REVIEWER_CRED_PATH, creds)
-    finally:
-        run(["docker", "rm", "-f", REVIEWER_LOGIN_CONTAINER],
-            capture_output=True)
-    print(f"reviewer credentials stored at {gitea.REVIEWER_CRED_PATH}")
-    return {"stored": str(gitea.REVIEWER_CRED_PATH)}
+def reviewer_token_set(token: str) -> dict:
+    """Store the dedicated reviewer account's long-lived setup-token — the
+    one-time host bootstrap step (mint it with `claude setup-token` in any
+    terminal logged into that account). Host-CLI-only by PI ruling: never a
+    broker verb, no Request class, absent from every *_WEBUI_FIELDS — the
+    browser structurally cannot reach it. The token arrives via stdin/getpass
+    (never argv) and is validated only for shape: non-empty, single line —
+    an opaque secret gets no content sniffing; a bad token fails loud at the
+    next review with the raw-output tail in the full log."""
+    token = (token or "").strip()
+    if not token:
+        raise ValidationError("empty reviewer token")
+    if any(c in token for c in "\r\n"):
+        raise ValidationError("the reviewer token must be a single line")
+    gitea.REVIEWER_CRED_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(gitea.REVIEWER_CRED_DIR, 0o700)
+    gitea._write_secret(gitea.REVIEWER_TOKEN_PATH, token + "\n")
+    print(f"reviewer token stored at {gitea.REVIEWER_TOKEN_PATH}")
+    return {"stored": str(gitea.REVIEWER_TOKEN_PATH)}
 
 
 def _parse_verdict(text: str) -> dict | None:
@@ -9108,10 +9096,10 @@ def _review_container_script(model: str, effort: str) -> str:
     effort-less-tier rule). Steps: bounded
     route-gate (no egress until the host pointed the default route at the
     router; self-terminates on the wall bound so a hard host kill can't leave
-    an orphan — --rm reaps the exit), managed-settings tool deny, creds + dist
-    deploy, the claude -p run as research against a container-LOCAL /work copy
-    (no host-uid coupling on the mount), then results + creds copied back out
-    by root (root writes the mount regardless of the host uid)."""
+    an orphan), managed-settings tool deny, token + dist deploy, the claude -p
+    run as research against a container-LOCAL /work copy (no host-uid coupling
+    on the mount), then results — and ONLY results — copied back out by root
+    (root writes the mount regardless of the host uid)."""
     if not re.fullmatch(r"[a-z][a-z0-9-]*", model):
         die(f"invalid reviewer model token: {model!r}")
     if effort and not re.fullmatch(r"[a-z][a-z0-9-]*", effort):
@@ -9130,21 +9118,26 @@ def _review_container_script(model: str, effort: str) -> str:
         + _REVIEWER_MANAGED_SETTINGS + "\n"
         "RSEOF\n"
         + _REVIEWER_DEPLOY + "\n"
-        "install -d -m 700 -o research -g research /home/research/.claude\n"
-        "install -m 600 -o research -g research /review/.credentials.json "
-        "/home/research/.claude/.credentials.json\n"
-        "chown research:research /home/research/.claude/.credentials.json\n"
+        # Auth = the long-lived setup-token, exported inside su's child shell
+        # from a root-installed research-owned copy: the value never rides an
+        # argv (the $(cat …) below is LITERAL text in every /proc cmdline and
+        # expands only in-shell) and never lands in docker inspect. NOTHING
+        # credential-shaped is copied back out — the token never rotates, and
+        # nothing from the untrusted container may touch durable host auth
+        # state (PI ruling; the old capture-back is retired).
+        "install -m 400 -o research -g research /review/token "
+        "/home/research/.reviewer-token\n"
         "install -d -m 755 -o research -g research /work\n"
         "install -m 644 -o research -g research /review/diff.patch /work/diff.patch\n"
         "install -m 644 -o research -g research /review/prompt.md /work/prompt.md\n"
-        "su - research -c 'cd /work && " + _REVIEWER_CLAUDE
+        "su - research -c 'cd /work && "
+        "CLAUDE_CODE_OAUTH_TOKEN=\"$(cat /home/research/.reviewer-token)\" "
+        + _REVIEWER_CLAUDE
         + " " + model_flags + " -p \"$(cat /work/prompt.md)\" "
         "> /work/raw.txt 2> /work/err.txt' || true\n"
         "mkdir -p /review/out\n"
         "cp /work/raw.txt /review/out/raw.txt 2>/dev/null || true\n"
         "cp /work/err.txt /review/out/err.txt 2>/dev/null || true\n"
-        "cp /home/research/.claude/.credentials.json /review/out/creds.json "
-        "2>/dev/null || true\n"
     )
 
 
@@ -9177,8 +9170,10 @@ def review_pr(req: "ReviewRequest", progress=None) -> dict:  # type: ignore[name
     the view-log gets only run_review's coarse tokens."""
     progress = progress or _NULL_PROGRESS
     repo, pr = req.repo, req.pr
-    if not gitea.REVIEWER_CRED_PATH.is_file():
-        die("no reviewer credentials — run `research dev reviewer-login` first")
+    if not gitea.REVIEWER_TOKEN_PATH.is_file():
+        die("no reviewer token — mint one with `claude setup-token` (any "
+            "project terminal, logged into the dedicated reviewer account) "
+            "and store it with `research dev reviewer-token` (one-time setup)")
     if not dist_present(DEFAULT_AGENT):
         die(f"no cached {DEFAULT_AGENT} dist — run `research agent pull` first")
     # The reviewer's (model, effort) — the fifth model_catalog type, resolved
@@ -9186,10 +9181,16 @@ def review_pr(req: "ReviewRequest", progress=None) -> dict:  # type: ignore[name
     # or a fresh CLI process, so a Management-page default change applies to
     # the very next review). A bad operator override refuses HERE, before any
     # docker/network side effect; stdout is the host-only full log / the
-    # operator's own terminal, never the mounted view log.
+    # operator's own terminal, never the mounted view log. The token-state
+    # line beside it is diagnostic only — a stale/bad token fails loud at the
+    # run with the raw-output tail below, never a silent dead-end.
     rev_model, rev_effort = _resolve_model_pair("reviewer")
     print(f"reviewer model: {rev_model}"
           + (f" effort {rev_effort}" if rev_effort else ""))
+    tstate = gitea.reviewer_token_state()
+    print("reviewer token: "
+          + (f"present (set {tstate['set_at']})" if tstate["present"]
+             else "absent"))
     router_ip = _ensure_reviewer_network()
     _resume_gitea(require=True)         # tracks dev_sync: resume, never create
     host_port = _gitea_host_port()
@@ -9265,17 +9266,17 @@ def review_pr(req: "ReviewRequest", progress=None) -> dict:  # type: ignore[name
     try:
         (tmp / "diff.patch").write_text(diff)
         (tmp / "prompt.md").write_text(prompt)
-        shutil.copyfile(gitea.REVIEWER_CRED_PATH, tmp / ".credentials.json")
-        os.chmod(tmp / ".credentials.json", 0o600)
+        shutil.copyfile(gitea.REVIEWER_TOKEN_PATH, tmp / "token")
+        os.chmod(tmp / "token", 0o600)
         (tmp / "out").mkdir()
         # No --rm: auto-remove raced our own finally rm -f, leaving Dead
         # husks that squat the name (B47) — the finally is the SINGLE removal
         # path now, and docker wait below is reliable again (the S4 --rm
         # caveat). The tolerant PRE-run rm clears a same-pid leftover from a
         # hard-killed prior child (two LIVE children can never share a pid,
-        # so the name it clears is dead by construction — the reviewer_login
-        # pattern); a hard-killed child's stopped container otherwise lingers
-        # visibly until this or the lane sweep removes it (accepted).
+        # so the name it clears is dead by construction); a hard-killed
+        # child's stopped container otherwise lingers visibly until this or
+        # the lane sweep removes it (accepted).
         run(["docker", "rm", "-f", name], capture_output=True)
         run_check(["docker", "run", "-d", "--name", name,
                    "--network", REVIEWER_NETWORK,
@@ -9296,17 +9297,30 @@ def review_pr(req: "ReviewRequest", progress=None) -> dict:  # type: ignore[name
 
         err_path = tmp / "out" / "err.txt"
         if err_path.is_file():
-            tail = err_path.read_text(errors="replace")[-2000:]
+            tail = err_path.read_text(errors="replace")[-_REVIEW_OUTPUT_TAIL_CHARS:]
             if tail.strip():
                 print(f"reviewer stderr tail:\n{tail}")   # full log / terminal only
 
         raw_path = tmp / "out" / "raw.txt"
         raw = raw_path.read_text(errors="replace") if raw_path.is_file() else ""
         if not raw.strip():
+            # Distinguish "claude wrote nothing" from "the copy-out never ran/
+            # the container died pre-launch" — full log / terminal only; the
+            # ledger reason stays coarse.
+            print("reviewer out-file state: raw.txt "
+                  + (f"{raw_path.stat().st_size}B" if raw_path.is_file()
+                     else "missing")
+                  + ", err.txt "
+                  + (f"{err_path.stat().st_size}B" if err_path.is_file()
+                     else "missing"))
             _fail("reviewer run failed")
             die(f"review of {target} produced no output (see the full log)")
         verdict = _parse_verdict(raw)
         if verdict is None:
+            # The raw output IS the diagnosis (an auth/usage message arrives
+            # on stdout and used to vanish here) — bounded, full log only.
+            print("reviewer raw output tail:\n"
+                  + raw[-_REVIEW_OUTPUT_TAIL_CHARS:])
             _fail("unparseable verdict")
             die(f"review of {target} returned unparseable output "
                 f"(see the full log)")
@@ -9329,19 +9343,11 @@ def review_pr(req: "ReviewRequest", progress=None) -> dict:  # type: ignore[name
             ledger = gitea.save_verdict(repo, pr, entry)
         progress.step("verdict", "verdict recorded")
 
-        # Capture-back (token rotation): replace the stash only from a
-        # non-empty, VALID capture that differs. Accepted+documented race:
-        # with parallel reviews a stale rotation can win -> a later 401 ->
-        # remedy is re-running reviewer-login. Never clobber on a failed run.
-        creds_out = tmp / "out" / "creds.json"
-        try:
-            captured = creds_out.read_text().strip()
-            if (captured and isinstance(json.loads(captured), dict)
-                    and captured != gitea.REVIEWER_CRED_PATH.read_text().strip()):
-                gitea._write_secret(gitea.REVIEWER_CRED_PATH, captured)
-                print("reviewer credentials rotated; stash updated")
-        except (OSError, json.JSONDecodeError):
-            pass
+        # No capture-back, deliberately (PI ruling): the long-lived setup
+        # token never rotates, and nothing produced inside the untrusted
+        # container may touch durable host auth state — the container is
+        # disposable in BOTH directions. The token store changes only via
+        # `research dev reviewer-token`.
         return {"repo": repo,
                 **({"commit": req.commit} if req.commit else {"pr": pr}),
                 "status": "ok",

@@ -2472,6 +2472,30 @@ async function renderDevFetchTab(view, body) {
     renderDevFetchScreen(view, body, data.result);
 }
 
+// The reviewer's token state on the Fetch surfaces — the sandboxed reviewer
+// authenticates from a long-lived setup-token stored host-side as one-time
+// setup (it never rotates; nothing credential-shaped ever returns from the
+// reviewer container). Absent FIELD (an older broker) → null, render nothing
+// (silent degradation); token present → a quiet hint line; token missing →
+// a warning that reviews will fail, carrying the two-step bootstrap remedy —
+// a SANCTIONED CLI mention (PI ruling: the token store is initial-setup
+// bootstrap, the broker-passwd tier; the mint itself runs in any project
+// terminal, which is already a browser surface).
+function devReviewerLine(reviewer) {
+    if (!reviewer || typeof reviewer !== "object") return null;
+    if (reviewer.present) {
+        return el("div", { class: "hint dev-reviewer-line" },
+                  ["reviewer token set"
+                   + (reviewer.set_at ? ` · ${reviewer.set_at}` : "")]);
+    }
+    return el("div", { class: "dev-reviewer-line dev-reviewer-warn" }, [
+        "reviewer token not set — reviews will fail. One-time setup: run "
+        + "claude setup-token in any project terminal (logged into the "
+        + "dedicated reviewer account), then store it on the host with "
+        + "research dev reviewer-token.",
+    ]);
+}
+
 function renderDevFetchScreen(view, body, result) {
     body.innerHTML = "";
     const gitea = result.gitea || {};
@@ -2503,6 +2527,10 @@ function renderDevFetchScreen(view, body, result) {
         ]));
         return;
     }
+    // Reviewer-token state, always within the repos-present path (the Review
+    // affordances live on the cards below; the empty states have none).
+    const revLine = devReviewerLine(result.reviewer);
+    if (revLine) body.appendChild(revLine);
     for (const r of repos) {
         const attached = attachments.filter((a) => a.repo === r.repo)
                                     .map((a) => a.project);
@@ -2828,6 +2856,10 @@ async function renderProjectFetchPane(container, repo) {
         scoped: true,
         rerender: () => renderProjectFetchPane(container, repo),
     }));
+    // Reviewer-token state beside the card's Review affordances (F4: both
+    // Fetch surfaces; same silent degradation on a missing field).
+    const revLine = devReviewerLine(result.reviewer);
+    if (revLine) container.appendChild(revLine);
 }
 
 // Delete a finished repo: its gitea mirror + every retired agent fork (history

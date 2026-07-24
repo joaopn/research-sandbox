@@ -23,6 +23,7 @@ never request or response bodies.
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import os
@@ -64,11 +65,32 @@ ACTIVE_FORKS_PATH = DEV_DIR / "active-forks.json"
 # broker relay, is the only surface). Sibling of dev/, not inside it, so the
 # webui-adjacent dev/ tree and the ledger stay separate concerns.
 REVIEWS_DIR = Path.home() / ".research-sandbox" / "reviews"
-# The dedicated reviewer Claude account's OAuth creds (Q3): minted once by
-# `research dev reviewer-login`, staged into each ephemeral reviewer container
-# at spawn, updated by the post-review capture-back (token rotation).
+# The dedicated reviewer Claude account's LONG-LIVED setup-token (PI ruling,
+# 2026-07-24): minted once with `claude setup-token` (inference-only by
+# design) and stored via `research dev reviewer-token` — a one-time host
+# bootstrap step, the broker-passwd tier. Staged into each ephemeral reviewer
+# container at spawn; it never rotates, so NOTHING credential-shaped ever
+# returns from the untrusted container (the disposability principle — the
+# OAuth stash + its capture-back are retired; an old .credentials.json here
+# is inert residue).
 REVIEWER_CRED_DIR = DEV_DIR / "reviewer"
-REVIEWER_CRED_PATH = REVIEWER_CRED_DIR / ".credentials.json"
+REVIEWER_TOKEN_PATH = REVIEWER_CRED_DIR / "token"
+
+
+def reviewer_token_state() -> dict:
+    """Non-secret reviewer-token state for the Development/Fetch surfaces:
+    {"present": bool, "set_at": str} — set_at is the file's mtime as UTC ISO
+    ("" when absent/unreadable). NEVER reads token content into the payload:
+    the value crosses to the browser, so this key set IS the boundary. Pure
+    local file read — no docker, no network (the dev_status/dev_repo_status
+    no-start posture depends on that)."""
+    try:
+        st = REVIEWER_TOKEN_PATH.stat()
+    except OSError:
+        return {"present": False, "set_at": ""}
+    set_at = datetime.datetime.fromtimestamp(
+        st.st_mtime, datetime.timezone.utc).isoformat(timespec="seconds")
+    return {"present": True, "set_at": set_at}
 
 # Bounded so an unresponsive gitea can't wedge the broker's serial accept thread:
 # must be < the webui's 30s BROKER_CALL_TIMEOUT_S (rscore._UPSTREAM_RESOLVE_MAX_TIME_S

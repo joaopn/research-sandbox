@@ -1398,6 +1398,10 @@ body {
 /* Dev preset: the MCP picker is locked (a dev box's bridge has no mcp-proxy
    path); pointer-events off so the disabled checkboxes read as inert. */
 .config-mcp-picker.disabled { opacity: 0.45; pointer-events: none; }
+/* Reviewer-token state line on the Fetch surfaces; the quiet (token-set) arm
+   rides .hint, the warning arm gets the error color. */
+.dev-reviewer-line { margin: 6px 0; }
+.dev-reviewer-warn { color: var(--error-fg); font-size: 13px; }
 .mgmt-infra { margin-top: 24px; }
 .mgmt-infra-title { font-size: 14px; font-weight: 600; margin-bottom: 8px; }
 /* Sub-group headers inside Infrastructure ("Development" / "Reviewer"). */

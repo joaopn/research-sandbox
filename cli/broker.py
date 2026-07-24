@@ -1414,11 +1414,17 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
         except rscore.ValidationError as e:
             return _audited(principal, "validation",
                             _err("validation", str(e)))
-        if not gitea.REVIEWER_CRED_PATH.is_file():
+        # The CLI mention below is a SANCTIONED bootstrap exemption (PI
+        # ruling: the token store is one-time initial setup, the broker-passwd
+        # tier) — the one class of remedy the webui-never-names-CLI rule
+        # permits a browser-reachable string to carry.
+        if not gitea.REVIEWER_TOKEN_PATH.is_file():
             return _audited(principal, "validation",
                             _err("validation",
-                                 "no reviewer credentials — run `research dev "
-                                 "reviewer-login` on the host first"))
+                                 "no reviewer token — mint one with `claude "
+                                 "setup-token` (any project terminal) and "
+                                 "store it with `research dev reviewer-token` "
+                                 "(one-time setup)"))
         if not rscore.dist_present(rscore.DEFAULT_AGENT):
             return _audited(principal, "validation",
                             _err("validation",

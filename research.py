@@ -1804,8 +1804,15 @@ def cmd_dev_gitea_enable(_args: argparse.Namespace) -> None:
     print("Gitea enabled.")
 
 
-def cmd_dev_reviewer_login(_args: argparse.Namespace) -> None:
-    _call(rscore.reviewer_login)
+def cmd_dev_reviewer_token(_args: argparse.Namespace) -> None:
+    """Store the dedicated reviewer account's long-lived setup-token — the
+    one-time setup step for the sandboxed reviewer. Mint the token first with
+    `claude setup-token` in any terminal logged into that account; this reads
+    it from stdin (piped) or a hidden prompt (TTY) — never argv."""
+    import getpass
+    tok = sys.stdin.readline().strip() if not sys.stdin.isatty() \
+        else getpass.getpass("Reviewer setup-token (input hidden): ").strip()
+    _call(rscore.reviewer_token_set, tok)
 
 
 def cmd_dev_review(args: argparse.Namespace) -> None:
@@ -2418,11 +2425,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="enable the shared Gitea backend (create if absent, else resume) — "
              "the CLI twin of the webui Management → Infrastructure button")
     dvge.set_defaults(func=cmd_dev_gitea_enable)
-    dvrl2 = dv_sub.add_parser(
-        "reviewer-login",
-        help="one-time OAuth mint for the dedicated reviewer Claude account "
-             "(interactive, in a throwaway container; creds -> host stash)")
-    dvrl2.set_defaults(func=cmd_dev_reviewer_login)
+    dvrt = dv_sub.add_parser(
+        "reviewer-token",
+        help="store the dedicated reviewer account's long-lived setup-token "
+             "(mint it first with `claude setup-token`; one-time setup, "
+             "stdin or hidden prompt)")
+    dvrt.set_defaults(func=cmd_dev_reviewer_token)
     dvrv = dv_sub.add_parser(
         "review",
         help="review a PR or a single commit in the ephemeral sandboxed "
