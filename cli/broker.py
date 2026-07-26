@@ -468,6 +468,16 @@ CREATE_WEBUI_FIELDS = frozenset({
     # github_pat is a SECRET in-box field: forwarded over the request envelope,
     # never logged/persisted off the box, never a CreateResult field.
     "repo", "ref", "setup", "github_pat",
+    # GitHub SSH auth + git commit identity for the light-path box. IN-BOX, like
+    # the PAT: they configure git INSIDE the container (~/.ssh, ~/.gitconfig) and
+    # are not path/host-shaped — no bind-mount source, no host port, no daemon
+    # wiring. github_ssh_key is a SECRET and satisfies the three conditions that
+    # let a secret be relayed at all: it reaches the container over `docker exec`
+    # STDIN (never argv/env, so it cannot surface in `docker inspect` or
+    # /proc/<pid>/cmdline), it is repr=False and never a CreateResult field, and
+    # from_kwargs validates it pre-side-effect (shape, mutual exclusion with
+    # github_pat, GitHub-host gate).
+    "github_ssh_key", "git_user_name", "git_user_email",
     # agents: the agent-dist SET — in-box field (STAGE_MULTI_AGENT; was the single
     # `agent`). A docker box deploys the full set at boot; sandbox-dind honors
     # claude on/off for its supervisor (an explicit [] = agent-less, distinct from

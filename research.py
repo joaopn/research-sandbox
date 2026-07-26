@@ -345,6 +345,24 @@ class _AppendAgents(argparse.Action):
         setattr(namespace, self.dest, cur)
 
 
+def _read_github_ssh_key() -> str:
+    """Read the optional GitHub SSH private key from the path in
+    RS_GITHUB_SSH_KEY_FILE. A PATH, not the key itself: an env var holding key
+    MATERIAL is readable via /proc/<pid>/environ for the process's lifetime and
+    tends to end up in shell history and CI logs, and a CLI flag would leak via
+    `ps` — so the key never becomes an argv or env VALUE anywhere in the chain
+    (rscore stages it into the container over stdin for the same reason).
+    Unset => "" (the feature is optional). Set-but-unreadable dies rather than
+    silently creating a project without the auth the operator asked for."""
+    path = os.environ.get("RS_GITHUB_SSH_KEY_FILE") or ""
+    if not path:
+        return ""
+    try:
+        return Path(path).expanduser().read_text()
+    except OSError as e:
+        die(f"RS_GITHUB_SSH_KEY_FILE={path!r} could not be read: {e}")
+
+
 def cmd_project_create(args: argparse.Namespace) -> None:
     cfg = load_config()
     req = _build(
@@ -359,6 +377,11 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         repo=args.repo, ref=args.ref, setup=args.setup_script,
         fetch=args.fetch,
         github_pat=os.environ.get("RS_GITHUB_PAT") or "",   # never a CLI flag
+        # Key material never rides a flag or an env VALUE — only a file path
+        # (RS_GITHUB_SSH_KEY_FILE). The identity is not secret, so plain flags.
+        github_ssh_key=_read_github_ssh_key(),
+        git_user_name=args.git_user_name or "",
+        git_user_email=args.git_user_email or "",
         # repeatable --agent + --agents a,b feed the list; --no-agents (mutually
         # exclusive with them) sends the EXPLICIT empty set, which from_kwargs
         # keeps distinct from None/unset (unset => the workflow's preset).
@@ -1996,6 +2019,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help="shell snippet run in the clone dir after checkout (or in "
                         "/workspace when there is no repo). Chain steps with "
                         "&& / newlines. Runs once at create.")
+    # GitHub SSH auth + git commit identity for the light-path box. The key is
+    # NOT a flag and NOT an env value — set RS_GITHUB_SSH_KEY_FILE to a path.
+    # It is mutually exclusive with RS_GITHUB_PAT and requires a github.com repo.
+    c.add_argument("--git-user-name", dest="git_user_name", metavar="NAME",
+                   help="git commit identity (user.name) configured inside the "
+                        "box at create. Pair with --git-user-email; without both, "
+                        "git refuses to commit. Set the GitHub SSH key via "
+                        "RS_GITHUB_SSH_KEY_FILE=<path to private key> (never a "
+                        "flag or an env value — key material must not reach `ps` "
+                        "or /proc/<pid>/environ).")
+    c.add_argument("--git-user-email", dest="git_user_email", metavar="EMAIL",
+                   help="git commit identity (user.email) configured inside the "
+                        "box at create. See --git-user-name.")
     c.add_argument("--fetch", action="store_true",
                    help="wire the project container for rs-fetch: stage the "
                         "read-only fetch tool + operator token + dev-lane "

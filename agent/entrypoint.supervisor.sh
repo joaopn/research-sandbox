@@ -84,6 +84,34 @@ if [[ -f /workspace/.creds-stash-home.json ]]; then
     echo "restored ~/.claude.json from /workspace/.creds-stash-home.json"
 fi
 
+# --- Git auth restore: the GitHub SSH key + the git commit identity ---
+#     Inert on the research flavor TODAY (the light path that stages git auth
+#     runs on the docker box and the sandbox-dind supervisor, not here) — but
+#     _stash_git_auth_for_rebuild is called from _recreate_supervisor, which
+#     serves EVERY dind flavor. A stash with no matching restore would strand
+#     the key in the workspace on host disk permanently; the asymmetry is the
+#     bug, so this block stays even where it never fires.
+#
+#     Modes are re-asserted because a bind-mount round-trip can drift them and
+#     ssh refuses BOTH a group/other-readable key AND a group/other-writable
+#     config — the config error names the config, not the key, which sends you
+#     debugging the wrong file. `find -type f` rather than a glob: under
+#     `set -euo pipefail` a non-matching `chmod 600 ~/.ssh/*` hands the literal
+#     pattern to chmod, which errors and kills the entrypoint.
+if [[ -d /workspace/.ssh-stash ]]; then
+    sudo rm -rf /home/research/.ssh
+    sudo mv /workspace/.ssh-stash /home/research/.ssh
+    sudo chown -R research:research /home/research/.ssh
+    sudo chmod 700 /home/research/.ssh
+    sudo find /home/research/.ssh -type f -exec chmod 600 {} +
+    echo "restored git ssh auth from /workspace/.ssh-stash"
+fi
+if [[ -f /workspace/.gitconfig-stash ]]; then
+    sudo mv /workspace/.gitconfig-stash /home/research/.gitconfig
+    sudo chown research:research /home/research/.gitconfig
+    echo "restored git identity from /workspace/.gitconfig-stash"
+fi
+
 # --- Workspace first-boot staging ---
 # Under host bind-mount, /workspace is owned by the host user. Under sysbox's
 # user namespace the chown may fail (host uid outside the ns-uid range); under

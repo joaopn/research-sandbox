@@ -55,6 +55,32 @@ if [[ -f /workspace/.creds-stash-home.json ]]; then
     echo "restored ~/.claude.json from /workspace/.creds-stash-home.json"
 fi
 
+# --- Git auth restore: the GitHub SSH key + the git commit identity ---
+#     Same recreate-survival mechanism as the Claude creds above:
+#     _stash_git_auth_for_rebuild mv's these into the workspace before the old
+#     container is rm'd, and staging them is create-time only — so without this
+#     restore a `project stop`/`start` would silently disarm the box's git auth.
+#
+#     Modes are re-asserted because a bind-mount round-trip can drift them and
+#     ssh refuses BOTH a group/other-readable key AND a group/other-writable
+#     config — the config error names the config, not the key, which sends you
+#     debugging the wrong file. `find -type f` rather than a glob: under
+#     `set -euo pipefail` a non-matching `chmod 600 ~/.ssh/*` hands the literal
+#     pattern to chmod, which errors and kills the entrypoint.
+if [[ -d /workspace/.ssh-stash ]]; then
+    sudo rm -rf /home/research/.ssh
+    sudo mv /workspace/.ssh-stash /home/research/.ssh
+    sudo chown -R research:research /home/research/.ssh
+    sudo chmod 700 /home/research/.ssh
+    sudo find /home/research/.ssh -type f -exec chmod 600 {} +
+    echo "restored git ssh auth from /workspace/.ssh-stash"
+fi
+if [[ -f /workspace/.gitconfig-stash ]]; then
+    sudo mv /workspace/.gitconfig-stash /home/research/.gitconfig
+    sudo chown research:research /home/research/.gitconfig
+    echo "restored git identity from /workspace/.gitconfig-stash"
+fi
+
 # --- Workspace: only the orchestrator dir (extensions.json + project.json). No
 #     plan/logbook/workers tree — there are no workers and no supervisor agent.
 if [[ "$(stat -c %U /workspace)" != "research" ]]; then

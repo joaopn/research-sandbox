@@ -430,8 +430,35 @@ project destroy <name|--all>       Remove container + workspace + network + cred
 --agent / --agents <a[,b]> (docker-substrate boxes) agent dist(s) to deploy at boot
 --repo URL --ref SHA       (docker-substrate boxes) clone repo@ref into /workspace/<name> at create
 --setup-script <snippet>   Shell snippet run once after checkout (RS_GITHUB_PAT for a private clone)
+--git-user-name / --git-user-email   git commit identity configured in the box at create
 --role-mcp-upstream ROLE=CSV   Pin an explicit upstream list for a --enable'd role-mcp (repeatable)
 ```
+
+#### Authenticating the clone
+
+Two mutually exclusive options; supplying both is refused.
+
+| | PAT | SSH key |
+|---|---|---|
+| Supplied as | `RS_GITHUB_PAT=<token>` | `RS_GITHUB_SSH_KEY_FILE=<path to private key>` |
+| Clone transport | https | ssh, via `ssh.github.com:443` |
+| Stored in the box | the clone's remote URL, i.e. `.git/config` under `/workspace` — **which is a host bind-mount** | `~/.ssh/github` (0600), in the container layer only |
+| Later pushes | work (token is in the remote) | work, if the key has write access |
+| Scope | can be fine-grained per-repo | account-wide unless you use a per-repo deploy key |
+
+Neither is ever a CLI flag, and the SSH key is a **file path**, never an env value —
+key material must not reach `ps` or `/proc/<pid>/environ`. The key is delivered into
+the container over `docker exec` stdin, so it never appears in `docker inspect`.
+
+The SSH option requires a `github.com` repo (it writes a GitHub-specific
+`~/.ssh/config`) and uses port 443 because the locked-egress router drops port 22.
+GitHub's host keys are pinned, so there is no trust-on-first-use step.
+
+Pair either with `--git-user-name` / `--git-user-email` — without a commit identity
+git refuses to commit. Both the key and the identity survive `project stop`/`start`.
+
+> **Prefer a per-repo deploy key.** The agent running in the box can read
+> `~/.ssh/github`, and RS cannot scope the key for you. See `docs/SECURITY.md`.
 
 ### Dists (host-cached, cp-deployed at boot — not baked)
 

@@ -26,6 +26,34 @@ umask 002
 if [[ ! -f ~/.bashrc ]]; then
     cp -a /etc/research-skel/. ~/
 fi
+
+# --- Git auth restore: the GitHub SSH key + the git commit identity ---
+#     This box keeps its filesystem across a plain docker stop/start, but
+#     _recreate_docker_substrate (any editor enable/disable) does rm + run —
+#     and staging git auth is create-time only. _stash_git_auth_for_rebuild
+#     mv's these into the workspace before that rm; restore them here, before
+#     anything that might want to use git.
+#
+#     Modes are re-asserted because a bind-mount round-trip can drift them and
+#     ssh refuses BOTH a group/other-readable key AND a group/other-writable
+#     config — the config error names the config, not the key, which sends you
+#     debugging the wrong file. `find -type f` rather than a glob: under
+#     `set -euo pipefail` a non-matching `chmod 600 ~/.ssh/*` hands the literal
+#     pattern to chmod, which errors and kills the entrypoint.
+if [[ -d /workspace/.ssh-stash ]]; then
+    sudo rm -rf /home/research/.ssh
+    sudo mv /workspace/.ssh-stash /home/research/.ssh
+    sudo chown -R research:research /home/research/.ssh
+    sudo chmod 700 /home/research/.ssh
+    sudo find /home/research/.ssh -type f -exec chmod 600 {} +
+    echo "restored git ssh auth from /workspace/.ssh-stash"
+fi
+if [[ -f /workspace/.gitconfig-stash ]]; then
+    sudo mv /workspace/.gitconfig-stash /home/research/.gitconfig
+    sudo chown research:research /home/research/.gitconfig
+    echo "restored git identity from /workspace/.gitconfig-stash"
+fi
+
 # Deploy each enabled agent dist into our OWN writable ~/.local (STAGE_MULTI_AGENT).
 # create() RO-mounts one copy-source per enabled agent at /opt/agent-dist/<agent>,
 # so the mounts ARE the enabled set — loop over the mounted subdirs (empty set => no

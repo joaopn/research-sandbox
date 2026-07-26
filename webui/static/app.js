@@ -4067,6 +4067,71 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent) {
                "https inside the locked box. Never logged or persisted — sent once " +
                "with this create and never stored.",
     });
+    // Authentication inputs. The key cannot be an <input type=password> (it is
+    // multi-line), so it is a textarea with autocomplete/spellcheck off; it stays
+    // DISABLED until the acknowledgment tick below is checked.
+    const sshKeyT = el("textarea", {
+        rows: "4", autocomplete: "off", spellcheck: "false", disabled: "disabled",
+        placeholder: "-----BEGIN OPENSSH PRIVATE KEY-----",
+        title: "Optional. An alternative to the PAT: clones over ssh and stays " +
+               "usable for pushes. Installed at ~/.ssh/github inside the box. " +
+               "Sent once with this create; RS keeps no host-side copy.",
+    });
+    const gitNameI = el("input", { type: "text", autocomplete: "off",
+                                   placeholder: "Ada Lovelace" });
+    const gitEmailI = el("input", { type: "text", autocomplete: "off",
+                                    placeholder: "ada@example.org" });
+    // F3: pasting a key is a deliberate act. RS cannot tell an account-wide key
+    // from a per-repo deploy key, and the box's agent runs under
+    // bypassPermissions with read access to ~/.ssh/github — so the tick is the
+    // operator's explicit acknowledgment, not an enforceable gate.
+    const sshAckCb = el("input", { type: "checkbox" });
+    const sshAck = el("label", { class: "mgmt-check" }, [
+        sshAckCb, " I understand the agent running in this box can read this key",
+    ]);
+    sshAckCb.onchange = () => {
+        sshKeyT.disabled = !sshAckCb.checked;
+        // Clear on untick, and read it back only while ticked (see the payload
+        // builder). A disabled control's .value is fully readable and this is a
+        // hand-built JSON body, not a form submit — so `disabled` alone would
+        // suppress nothing on the wire and tick→paste→untick→Create would ship
+        // the key anyway. Same convention as the model/effort picker, which
+        // clears on disable and reads `disabled ? "" : value`.
+        if (!sshAckCb.checked) sshKeyT.value = "";
+    };
+    // Authentication group — collapsed by default, nested inside the clone group.
+    // Both toggles are `.mgmt-check` labels OUTSIDE any `.field`: a raw checkbox
+    // nested in a `.field` inherits `width:100%` + a block/uppercase label and
+    // renders distorted.
+    const authCb = el("input", { type: "checkbox" });
+    const authToggle = el("label", { class: "mgmt-check" }, [authCb, " authentication"]);
+    const authGroup = el("div", { class: "mgmt-docker-group" }, [
+        el("div", { class: "field" }, [
+            el("label", { title: patI.getAttribute("title") }, ["GitHub PAT (secret)"]),
+            patI,
+        ]),
+        el("div", { class: "hint" }, [
+            "…or a GitHub SSH key instead — supply one or the other, not both. " +
+            "The key clones over ssh (port 443, so it works under locked egress) " +
+            "and stays usable for pushes; a PAT is stored in the clone's remote " +
+            "URL. Prefer a per-repo deploy key over an account-wide key: RS " +
+            "cannot scope it, and the agent in this box can read it.",
+        ]),
+        sshAck,
+        el("div", { class: "field" }, [
+            el("label", { title: sshKeyT.getAttribute("title") },
+               ["GitHub SSH private key (secret)"]),
+            sshKeyT,
+        ]),
+        el("div", { class: "field" }, [el("label", {}, ["Git user.name"]), gitNameI]),
+        el("div", { class: "field" }, [el("label", {}, ["Git user.email"]), gitEmailI]),
+        el("div", { class: "hint" }, [
+            "The identity is what the box's commits are authored as; without it " +
+            "git refuses to commit. Both survive a project stop/start.",
+        ]),
+    ]);
+    authGroup.style.display = "none";
+    authCb.onchange = () => { authGroup.style.display = authCb.checked ? "" : "none"; };
     // Settings region — agent + editor as bordered cards inside a single bordered
     // box (mirrors the box window). Editor is universal; agents only showInBox
     // (docker box / sandbox-dind), preserving today's visibility split. No raw
@@ -4096,18 +4161,18 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent) {
         ]),
     ]);
 
-    // Clone-a-repo group: the light-path repo/ref/setup/PAT fields, shown only when
-    // the operator opts in (and only showInBox). Agent moved out to Settings above.
+    // Clone-a-repo group: the light-path repo/ref/setup fields, shown only when
+    // the operator opts in (and only showInBox). Agent moved out to Settings
+    // above; the PAT moved down into the collapsed Authentication sub-box, which
+    // now holds every credential/identity field for the clone.
     const cloneCb = el("input", { type: "checkbox" });
     const cloneToggle = el("label", { class: "mgmt-check" }, [cloneCb, " clone a git repo"]);
     const cloneGroup = el("div", { class: "mgmt-docker-group" }, [
         el("div", { class: "field" }, [el("label", {}, ["Repo (https)"]), repoI]),
         el("div", { class: "field" }, [el("label", {}, ["Ref"]), refI]),
         el("div", { class: "field" }, [el("label", {}, ["Setup"]), setupT]),
-        el("div", { class: "field" }, [
-            el("label", { title: patI.getAttribute("title") }, ["GitHub PAT (secret)"]),
-            patI,
-        ]),
+        authToggle,
+        authGroup,
         el("div", { class: "hint" }, [
             "Repo/setup run inside the box (docker sandbox or sandbox-dind).",
         ]),
@@ -4194,6 +4259,24 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent) {
             // Mirror from_kwargs: an in-box repo needs a ref (pin the clone).
             if (showInBox && cloneCb.checked && repoI.value.trim() && !refI.value.trim()) {
                 return "A workflow repo requires a ref.";
+            }
+            // Mirror the from_kwargs auth refusals so they surface in the form
+            // rather than as a failed op. Read the key the same way the payload
+            // does (disabled ⇒ not sent, so it must not trip these either).
+            if (showInBox && cloneCb.checked) {
+                const sshKey = sshKeyT.disabled ? "" : sshKeyT.value.trim();
+                if (sshKey && patI.value.trim()) {
+                    return "Supply either a GitHub PAT or a GitHub SSH key, not both.";
+                }
+                const repo = repoI.value.trim();
+                if (sshKey && repo) {
+                    let host = "";
+                    try { host = new URL(repo).hostname; } catch (e) { host = ""; }
+                    if (host !== "github.com") {
+                        return "The GitHub SSH key configures github.com only — " +
+                               "point at a github.com repo or drop the key.";
+                    }
+                }
             }
             return null;
         },
@@ -4286,6 +4369,19 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent) {
                     if (ref) payload.ref = ref;
                     if (setup) payload.setup = setup;
                     if (pat) payload.github_pat = pat;
+                    // Read the key only while the acknowledgment tick is checked
+                    // (`disabled ? "" : value`, the model-picker convention) —
+                    // `disabled` alone suppresses nothing in a hand-built body,
+                    // so tick→paste→untick→Create must not ship the key. The
+                    // tick itself is never sent: it is a client-side affordance,
+                    // and a relayed `ack` would imply a server gate that cannot
+                    // exist. Lockstep: these three keys are in CREATE_WEBUI_FIELDS.
+                    const sshKey = sshKeyT.disabled ? "" : sshKeyT.value.trim();
+                    const gitName = gitNameI.value.trim();
+                    const gitEmail = gitEmailI.value.trim();
+                    if (sshKey) payload.github_ssh_key = sshKey;
+                    if (gitName) payload.git_user_name = gitName;
+                    if (gitEmail) payload.git_user_email = gitEmail;
                 }
             }
             return fetch("/broker/project", {

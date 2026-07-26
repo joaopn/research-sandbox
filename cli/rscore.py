@@ -54,6 +54,11 @@ import sys
 import tarfile
 import tempfile
 import urllib.error
+# Explicit: `urllib.request` happens to bind `urllib.parse` today (its own module
+# body does `from urllib.parse import ...`), so this resolves either way — but
+# relying on another module's import list is the implicit dependency that breaks
+# silently on a stdlib refactor. Used by the GitHub-host gate in from_kwargs.
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -267,6 +272,82 @@ def workflow_is_sandbox_dind(manifest: dict) -> bool:
     return manifest.get("image_overlay") == mgmt_overlay
 
 
+# ---------------------------------------------------------------------------
+# GitHub SSH auth for the light-path box (optional, alternative to github_pat).
+#
+# Port 443 is LOAD-BEARING, not a preference: router/scripts/apply-rules.sh
+# ACCEPTs only ICMP/80/443/53 and then DROPs under `locked` egress — the
+# sandbox-dind default — so a port-22 clone would hang. ssh.github.com:443 is
+# GitHub's own alternate SSH endpoint and works under BOTH egress modes, so this
+# one config is universal rather than a locked-mode workaround.
+#
+# Everything lives INSIDE the `Host github.com` block: StrictHostKeyChecking is
+# scoped so it never leaks onto some other SSH destination the operator uses
+# later. BatchMode makes a passphrase-protected key fail fast and legibly
+# instead of hanging on a prompt nobody can see. CheckHostIP is belt-and-braces
+# (bookworm's OpenSSH 9.2 already defaults it off) against a base-image bump.
+# ---------------------------------------------------------------------------
+_GITHUB_SSH_HOST = "github.com"
+_GITHUB_SSH_ALT_HOST = "ssh.github.com"
+_GITHUB_SSH_ALT_PORT = 443
+_GITHUB_SSH_KEY_FILE = "github"          # ~/.ssh/<this>
+
+_GITHUB_SSH_CONFIG = f"""\
+# Written by research-sandbox at project create. GitHub over SSH on port 443
+# (port 22 is dropped by the locked-egress router).
+Host {_GITHUB_SSH_HOST}
+    HostName {_GITHUB_SSH_ALT_HOST}
+    Port {_GITHUB_SSH_ALT_PORT}
+    User git
+    IdentityFile ~/.ssh/{_GITHUB_SSH_KEY_FILE}
+    IdentitiesOnly yes
+    BatchMode yes
+    StrictHostKeyChecking yes
+    CheckHostIP no
+"""
+
+# GitHub's published SSH host keys, pinned so StrictHostKeyChecking=yes has
+# something to verify against (no TOFU on first connect).
+#
+# SOURCE OF TRUTH: https://api.github.com/meta → the "ssh_keys" array. These
+# were copied from that endpoint; NEVER write them from memory — a wrong pin
+# fails every clone with an MITM warning. The acceptance harness re-fetches the
+# endpoint and asserts these still match, so a GitHub rotation surfaces as one
+# clear test failure rather than as mysterious clone breakage.
+#
+# The `[host]:port` bracket form is REQUIRED: ssh verifies against the REWRITTEN
+# HostName/Port from the config block above, so a bare `ssh.github.com` line
+# would never match and StrictHostKeyChecking=yes would refuse the connection.
+_GITHUB_HOST_KEYS = (
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl",
+    "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=",
+    "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=",
+)
+_GITHUB_KNOWN_HOSTS = "".join(
+    f"[{_GITHUB_SSH_ALT_HOST}]:{_GITHUB_SSH_ALT_PORT} {k}\n"
+    for k in _GITHUB_HOST_KEYS)
+
+
+def _github_ssh_url(repo: str) -> str:
+    """Rewrite the operator's https GitHub URL to its ssh form for the clone.
+
+    The operator always types https (the create form asks for it and from_kwargs
+    validates it); only the clone transport changes, and ~/.ssh/config supplies
+    the port-443 rewrite. Built from the PARSED path — never a
+    ``repo[len("https://"):]`` slice like the PAT path — so userinfo is dropped
+    and a non-GitHub host cannot be smuggled through (the host itself is already
+    gated in from_kwargs). Applies the same trailing-slash / trailing-'.git'
+    normalizations as _light_clone_basename."""
+    path = urllib.parse.urlsplit(repo).path.strip("/")
+    if path.endswith(".git"):
+        path = path[: -len(".git")]
+    if not path:
+        raise ValidationError(
+            f"could not derive a GitHub repo path from {repo!r} (expected "
+            f"https://{_GITHUB_SSH_HOST}/<owner>/<repo>)")
+    return f"git@{_GITHUB_SSH_HOST}:{path}.git"
+
+
 def _light_clone_basename(repo: str) -> str:
     """Derive the clone-dir basename from a repo URL: the last path segment with
     a trailing '/' and a trailing '.git' stripped (``…/u/foo.git`` → ``foo``).
@@ -304,12 +385,15 @@ def _light_exec(container: str, script: str, *, step: str, github_pat: str,
 
 
 def _run_light_harness(container: str, repo: str, ref: str, setup: str,
-                       github_pat: str, progress) -> str:
+                       github_pat: str, progress, *, use_ssh: bool = False) -> str:
     """Light-path harness (WORKFLOW_TAXONOMY_S4): clone ``repo``@``ref`` into
     /workspace/<basename> and run ``setup`` inside the docker box, as the
     unprivileged `research` user. No-op when neither repo nor setup is set;
     returns the clone dir ("" if no repo). Create-time only — the artifacts ride
     the bind-mount volume, so start/update never re-run it.
+
+    ``use_ssh`` (a GitHub SSH key was staged by _stage_git_auth) rewrites the
+    clone URL to its ssh form; ~/.ssh/config then supplies the port-443 rewrite.
 
     Must run AFTER inject_route (egress). Fail-explicit via HarnessError so the
     partial box is left standing and the broker can split the diagnostic from the
@@ -321,7 +405,12 @@ def _run_light_harness(container: str, repo: str, ref: str, setup: str,
         base = _light_clone_basename(repo)        # already validated in from_kwargs
         workdir = f"/workspace/{base}"
         clone_url = repo
-        if github_pat:
+        # STRUCTURALLY exclusive. from_kwargs already refuses key+PAT together,
+        # but that guarantee lives ~1600 lines away — the elif keeps it local so a
+        # future caller cannot silently get whichever assignment ran last.
+        if use_ssh:
+            clone_url = _github_ssh_url(repo)
+        elif github_pat:
             # Token-in-remote so it persists in .git/config for later `git pull`
             # (PI decision). https-validated; the token reaches git as an argv
             # element via bash -lc, never a host shell (run() is list-form).
@@ -337,6 +426,90 @@ def _run_light_harness(container: str, repo: str, ref: str, setup: str,
         _light_exec(container, setup, step="workflow setup",
                     github_pat=github_pat, workdir=workdir)
     return workdir if repo else ""
+
+
+def _stage_git_auth(container: str, ssh_key: str, user_name: str,
+                    user_email: str, progress) -> None:
+    """Stage optional GitHub SSH auth + git commit identity into a RUNNING
+    light-path container, as the unprivileged `research` user. No-op when all
+    three are empty.
+
+    THE KEY RIDES STDIN, NEVER ARGV. `docker exec -i … sh -c 'umask 077 && cat >
+    "$HOME/.ssh/github"'` with input= — mirroring the consumer-token staging in
+    _stage_dev_gitea. A `docker run -e` / --env-file / argv delivery would put a
+    live private key in `docker inspect` and /proc/<pid>/cmdline; this cannot.
+
+    Three separate execs so the key exec does exactly one thing: (1) the key,
+    (2) the non-secret config + pinned known_hosts, (3) the identity. The
+    identity rides POSITIONAL ARGS (`sh -c '…' sh "$name" "$email"`), so an
+    operator-supplied value is never interpolated into a script body.
+
+    Must run AFTER inject_route and BEFORE _run_light_harness (the clone needs
+    the key). Fail-explicit via HarnessError — never die(), whose text reaches
+    the broker's teed stream and therefore the durable host-only full log."""
+    if not ssh_key and not user_name and not user_email:
+        return
+    progress.step("git-auth", "staging git credentials")
+
+    def _exec(script: str, *args: str, step: str, stdin: str = "") -> None:
+        # input= is ALWAYS passed (default ""), never None: `docker exec -i` with
+        # no stdin redirect inherits the caller's — a terminal under the CLI — so
+        # anything that ever read stdin would block on the operator. An empty
+        # string gives it an immediately-closed pipe instead.
+        r = run(["docker", "exec", "-i", "-u", "research", container,
+                 "sh", "-c", script, "sh", *args],
+                input=stdin, capture_output=True)
+        if r.returncode != 0:
+            detail = (r.stderr or r.stdout or "").strip()
+            if ssh_key:
+                # Defensive: the key is never in an argv to leak, so this is a
+                # no-op today. Kept so a future edit that does put it on a
+                # command line cannot quietly start echoing it.
+                detail = detail.replace(ssh_key, "***")
+            raise HarnessError(f"{step} failed (exit {r.returncode})", detail)
+
+    if ssh_key:
+        # _GITHUB_SSH_KEY_FILE is interpolated here as well as into the config
+        # block: a constant honoured by only one of its two consumers is worse
+        # than no constant — changing it would point IdentityFile at a file the
+        # staging never writes, which fails as an auth error, not a missing file.
+        _exec(f'umask 077 && mkdir -p "$HOME/.ssh" '
+              f'&& cat > "$HOME/.ssh/{_GITHUB_SSH_KEY_FILE}" '
+              f'&& chmod 600 "$HOME/.ssh/{_GITHUB_SSH_KEY_FILE}"',
+              step="git ssh key staging",
+              stdin=ssh_key if ssh_key.endswith("\n") else ssh_key + "\n")
+        _exec('umask 077 && mkdir -p "$HOME/.ssh" && cat > "$HOME/.ssh/config" '
+              '&& chmod 600 "$HOME/.ssh/config"',
+              step="git ssh config staging", stdin=_GITHUB_SSH_CONFIG)
+        _exec('umask 077 && mkdir -p "$HOME/.ssh" '
+              '&& cat > "$HOME/.ssh/known_hosts" '
+              '&& chmod 600 "$HOME/.ssh/known_hosts"',
+              step="git ssh known_hosts staging", stdin=_GITHUB_KNOWN_HOSTS)
+    if user_name or user_email:
+        # Three properties, and the shape below is the only one that has all
+        # three:
+        #  • a name-only identity must SUCCEED. The terse
+        #    `[ -n "$1" ] && git config …; [ -n "$2" ] && …` form returns 1
+        #    whenever the email is empty (sh -c yields the LAST command's
+        #    status), failing the whole create on valid input. Explicit
+        #    if-blocks fix that: POSIX gives `if` the status of the branch it
+        #    ran, or ZERO when no branch ran.
+        #  • a REAL `git config` failure must PROPAGATE (unwritable $HOME, git
+        #    absent from a future image) — otherwise create reports success for
+        #    a box with no commit identity and no error anywhere. So: no
+        #    trailing `exit 0`, which would swallow every failure, and `set -e`,
+        #    without which a failure of the FIRST block is masked by the second
+        #    succeeding.
+        #  • `set -e` must not break the first property — it does not: an `if`
+        #    CONDITION is exempt from it, so the empty-arg path still exits 0.
+        #
+        # Each key is set only when non-empty: writing user.email "" creates an
+        # entry git later rejects at commit time ("empty ident"), which is
+        # strictly worse than absent.
+        _exec('set -e\n'
+              'if [ -n "$1" ]; then git config --global user.name "$1"; fi\n'
+              'if [ -n "$2" ]; then git config --global user.email "$2"; fi',
+              user_name, user_email, step="git identity staging")
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +686,15 @@ class CreateRequest:
     ref: str = ""
     setup: str = ""
     github_pat: str = field(default="", repr=False)
+    # GitHub SSH auth + git commit identity for the light-path box. The key is a
+    # SECRET (repr=False, like github_pat, and never a CreateResult field); it is
+    # staged over `docker exec -i` STDIN only — never argv, never `docker run -e`,
+    # never --env-file, so it cannot surface in `docker inspect` or
+    # /proc/<pid>/cmdline. Mutually exclusive with github_pat (from_kwargs).
+    # The identity is not secret; it lands in the box's ~/.gitconfig.
+    github_ssh_key: str = field(default="", repr=False)
+    git_user_name: str = ""
+    git_user_email: str = ""
     # Which agent dists a docker box deploys at boot (STAGE_MULTI_AGENT; was the
     # single STAGE_AGENT_DIST_S1 `agent`). An independent on/off set — one writable
     # ~/.local launcher per enabled agent. In-box field (selects software run
@@ -626,6 +808,63 @@ class CreateRequest:
                     "docker box is locked-egress (no ssh/port 22) and a private "
                     "repo clones over https via a PAT")
             _light_clone_basename(repo)   # reject a path-escaping basename early
+        # GitHub SSH auth + git identity. Explicit-only (never manifest-preset: a
+        # curated manifest must not carry a key, and an identity belongs to the
+        # operator, not the workflow). Validated here — pre-side-effect, and ABOVE
+        # the dist/editor/reader/node floors below, which keeps the unit test
+        # hermetic.
+        # Stripped at the read: a paste with a leading blank line would satisfy a
+        # lstrip()ed shape check and then be written verbatim, and OpenSSH's PEM
+        # reader is picky about leading junk — it would fail at clone time with a
+        # message that points nowhere near the cause. Empty stays empty (an
+        # unconditional `+ "\n"` here would make "no key supplied" truthy).
+        github_ssh_key = (kw.get("github_ssh_key") or "").strip()
+        git_user_name = (kw.get("git_user_name") or "").strip()
+        git_user_email = (kw.get("git_user_email") or "").strip()
+        for label, value in (("git user name", git_user_name),
+                             ("git user email", git_user_email)):
+            # Every C0 control plus DEL, not just \n\r\0: nothing here can inject
+            # (the values ride positional args, never interpolation), but an ESC
+            # sequence in commit metadata is worth keeping out on its own.
+            if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+                raise ValidationError(
+                    f"{label} must not contain control characters")
+        if github_ssh_key:
+            if not (github_ssh_key.startswith("-----BEGIN ")
+                    and "PRIVATE KEY-----" in github_ssh_key):
+                raise ValidationError(
+                    "the GitHub SSH key must be an OpenSSH/PEM private key "
+                    "(it should start with '-----BEGIN ... PRIVATE KEY-----'); "
+                    "this looks like a public key or a truncated paste")
+            if github_pat:
+                raise ValidationError(
+                    "a GitHub PAT and a GitHub SSH key were both supplied — pick "
+                    "one: the PAT clones over https and is stored in the clone's "
+                    "remote URL, the SSH key clones over ssh and is stored at "
+                    "~/.ssh/github in the box")
+            # The key and the ~/.ssh/config we write are GitHub-shaped, so a repo
+            # anywhere else cannot use them. Refuse rather than silently cloning
+            # over public https and leaving the key inert. urlsplit().hostname —
+            # NOT startswith: 'https://github.com.evil.com/o/r' has the right
+            # prefix and the wrong host, and hostname also sees through userinfo
+            # ('https://evil.com@github.com/o/r' → github.com).
+            if repo and urllib.parse.urlsplit(repo).hostname != _GITHUB_SSH_HOST:
+                raise ValidationError(
+                    f"the GitHub SSH key configures {_GITHUB_SSH_HOST} only, but "
+                    f"the repo {repo!r} is hosted elsewhere; drop the key (a "
+                    "public repo clones over https unauthenticated) or point at "
+                    f"a {_GITHUB_SSH_HOST} repo")
+            if repo:
+                # Resolve the ssh URL HERE, discarding the result, so its own
+                # ValidationError fires PRE-SIDE-EFFECT. _run_light_harness calls
+                # this from inside create(), after `docker run` — and only
+                # HarnessError is caught around create(), so a ValidationError
+                # escaping there reaches the CLI operator as a raw traceback.
+                # It is reachable: 'https://github.com/' passes every gate above
+                # (_light_clone_basename reads the HOST as the last path segment),
+                # leaving _github_ssh_url with an empty path. The guard inside
+                # _github_ssh_url stays as defense-in-depth.
+                _github_ssh_url(repo)
         # Dev lane (STAGE_DEV_GITEA S2), derived from manifest DATA (`dev: true`),
         # never the workflow NAME. The repo is MANDATORY on a dev workflow (PI
         # decision: a dev project gets its repo at create, one command) and
@@ -807,6 +1046,8 @@ class CreateRequest:
             role_mcp_upstream=_as_tuple(kw.get("role_mcp_upstream")),
             mcp=kw.get("mcp") if kw.get("mcp") is not None else "all-enabled",
             repo=repo, ref=ref, setup=setup, github_pat=github_pat,
+            github_ssh_key=github_ssh_key,
+            git_user_name=git_user_name, git_user_email=git_user_email,
             agents=agents,
             service_defaults=service_defaults,
             greeting=greeting,
@@ -2214,11 +2455,20 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         # node block (see D6 — none exists), so a restart never re-deploys.
         if service_flags.get("node") and node_dist_present():
             _deploy_node(container_name)
+        # 6''. Optional GitHub SSH auth + git identity, BEFORE the clone (which
+        #      needs the key). Like _deploy_node above this lands in the same
+        #      post-`docker run` window as the still-booting entrypoint — safe,
+        #      because the paths are disjoint (~/.ssh + ~/.gitconfig here vs
+        #      ~/.local there) and entrypoint.minimal.sh's skel restore never
+        #      fires on rs-minimal (its /home/research is image-resident).
+        _stage_git_auth(container_name, req.github_ssh_key,
+                        req.git_user_name, req.git_user_email, progress)
         # 6'. Light-path harness: clone the workflow repo + run setup on the box
         #     (after inject_route, so egress works). Create-time only; raises
         #     HarnessError on failure (box left standing).
         clone_dir = _run_light_harness(
-            container_name, req.repo, req.ref, req.setup, req.github_pat, progress)
+            container_name, req.repo, req.ref, req.setup, req.github_pat, progress,
+            use_ssh=bool(req.github_ssh_key))
         progress.step("ready", "project ready")
     else:
         # 6. Wait for inner dockerd, then stage the inner images.
@@ -2269,10 +2519,15 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             # can resolve presets for a directly-invoked `rs-sandbox create`
             # (box_add refreshes it live; STAGE_BOX_EXT_UX). Best-effort.
             _stage_box_catalog(workspace_path, strict=False)
+            # Optional GitHub SSH auth + git identity, BEFORE the clone (which
+            # needs the key). Raises HarnessError on failure.
+            _stage_git_auth(container_name, req.github_ssh_key,
+                            req.git_user_name, req.git_user_email, progress)
             # Light-path harness: clone repo@ref + run setup on the supervisor
             # (after inject_route; raises HarnessError on failure, box left standing).
             clone_dir = _run_light_harness(
-                container_name, req.repo, req.ref, req.setup, req.github_pat, progress)
+                container_name, req.repo, req.ref, req.setup, req.github_pat, progress,
+                use_ssh=bool(req.github_ssh_key))
             # Dev workflow step (STAGE_DEV_GITEA S2, create-time by PI decision:
             # the repo is mandatory on a dev workflow): attach the shared gitea
             # to the project bridge, record + stage the wiring (non-secret JSON
@@ -5322,6 +5577,68 @@ def _stash_creds_for_rebuild(
                 capture_output=True)
 
 
+def _stash_git_auth_for_rebuild(
+    container: str, was_running: bool, workspace_path: Path
+) -> None:
+    """Move git auth state into the workspace bind-mount so it survives container
+    destruction. Two pieces, mirroring _stash_creds_for_rebuild's dir + sibling
+    file:
+      - ~research/.ssh/       → /workspace/.ssh-stash/      (the GitHub key,
+                                                             config, known_hosts)
+      - ~research/.gitconfig  → /workspace/.gitconfig-stash (the commit identity)
+
+    BOTH halves matter. _stage_git_auth is create-time only, and every container
+    swap destroys the writable layer: on sysbox that is EVERY `project start`
+    (sysbox cannot stop/start, so start() routes through _recreate_supervisor),
+    and on the docker substrate it is any editor toggle. Stashing only the key
+    would leave the box able to push as nobody — the exact unset-user.name state
+    rs-fetch's auto-commit names as its common failure.
+
+    Deliberately SEPARATE from _stash_creds_for_rebuild, not a parameter on it:
+    _recreate_docker_substrate must gain this without gaining the Claude-creds
+    stash it pointedly does not have (that box re-auths in place).
+
+    ~/.git-credentials is deliberately NOT carried. On a dev-workflow supervisor
+    _run_dev_clone writes `credential.helper store` into ~/.gitconfig (so that
+    line rides along here — harmless, and an operator's own ~/.gitconfig tweaks
+    now survive a recreate too) with the matching token in ~/.git-credentials.
+    That token is already lost on every recreate today; widening the stash to
+    carry it would park a live gitea credential on host disk for no gain.
+
+    Same running/stopped fork and idempotent skip as _stash_creds_for_rebuild;
+    the entrypoints move both pieces back (and re-assert modes) at next start."""
+    host_ssh_stash = workspace_path / ".ssh-stash"
+    host_gitconfig_stash = workspace_path / ".gitconfig-stash"
+    if was_running:
+        if not host_ssh_stash.exists():
+            run(["docker", "exec", container, "sh", "-c",
+                 "if [ -d /home/research/.ssh ] && "
+                 "[ ! -d /workspace/.ssh-stash ]; then "
+                 "mv /home/research/.ssh /workspace/.ssh-stash; "
+                 "fi"],
+                capture_output=True)
+        if not host_gitconfig_stash.exists():
+            run(["docker", "exec", container, "sh", "-c",
+                 "if [ -f /home/research/.gitconfig ] && "
+                 "[ ! -f /workspace/.gitconfig-stash ]; then "
+                 "mv /home/research/.gitconfig "
+                 "/workspace/.gitconfig-stash; "
+                 "fi"],
+                capture_output=True)
+    else:
+        # docker cp on a stopped container works for files in its filesystem.
+        if not host_ssh_stash.exists():
+            run(["docker", "cp",
+                 f"{container}:/home/research/.ssh",
+                 str(host_ssh_stash)],
+                capture_output=True)
+        if not host_gitconfig_stash.exists():
+            run(["docker", "cp",
+                 f"{container}:/home/research/.gitconfig",
+                 str(host_gitconfig_stash)],
+                capture_output=True)
+
+
 def _recreate_supervisor(
     project: str,
     cfg: "Config",
@@ -5349,6 +5666,7 @@ def _recreate_supervisor(
     workspace_path = workspace_path_for(project, cfg)
 
     _stash_creds_for_rebuild(container, was_running, workspace_path)
+    _stash_git_auth_for_rebuild(container, was_running, workspace_path)
     md = _read_supervisor_metadata(container)
 
     # The sysbox recreate dance (rm + create + re-stage) exists because sysbox
@@ -5684,6 +6002,19 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
     md = _read_supervisor_metadata(container)
     if md.get("substrate") != Substrate.DOCKER.value:
         die(f"_recreate_docker_substrate called for non-docker project {project!r}")
+
+    # Git auth (GitHub key + commit identity) rides the container's writable
+    # layer, which the rm below destroys — carry it through the workspace
+    # bind-mount; the entrypoint restores it at next boot. Claude creds are
+    # deliberately NOT stashed here (this box re-auths in place).
+    #
+    # MUST be before the stop, not merely before the rm: `was_running` is
+    # already latched above, and the stash's running fork is a `docker exec`
+    # with capture_output and no returncode check — run it against a stopped
+    # container and it fails SILENTLY, then the rm takes the key with no error
+    # on any surface. (_recreate_supervisor stashes before its stop for the
+    # same reason.)
+    _stash_git_auth_for_rebuild(container, was_running, workspace_path)
 
     if was_running:
         print(f"stopping {container}...")
