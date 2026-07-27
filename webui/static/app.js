@@ -2682,6 +2682,11 @@ function renderDevFetchScreen(view, body, result) {
         body.appendChild(buildDevRepoCard(view, body, r, attached, {
             scoped: false,
             rerender: () => renderDevFetchTab(view, body),
+            // Every mirror's fork list, so the purge dialog can name the OTHER
+            // repos a retired identity owns a fork of (purging is user-scoped,
+            // this view is repo-scoped). Free — already fetched. The scoped
+            // pane passes none: it holds one repo, and it has no purge control.
+            allRepos: repos,
         }));
     }
     body.appendChild(el("div", { class: "hint" }, [
@@ -2716,6 +2721,7 @@ function buildDevRepoCard(view, body, r, attached, opts) {
     // pane is its own view (view === body === the pane container), so its
     // rerender is safe; unscoped, undefined keeps the Management landing.
     const onLogin = scoped ? rerender : undefined;
+    const allRepos = (opts && Array.isArray(opts.allRepos)) ? opts.allRepos : [];
     const prs = Array.isArray(r.prs) ? r.prs : [];
     const branches = Array.isArray(r.branches) ? r.branches : [];
     const sync = el("button", { class: "btn-small" }, ["Sync"]);
@@ -2761,6 +2767,13 @@ function buildDevRepoCard(view, body, r, attached, opts) {
     // global selector.
     const forks = Array.isArray(r.forks) ? r.forks : [];
     const live = forks.filter((f) => f && !f.archived && f.user);
+    // Retired (archived) consumer forks. Until now these were filtered out
+    // entirely, which is why a retired identity was invisible while still
+    // blocking a same-named project or box: destroy keeps the gitea user (it
+    // owns the archived fork, and deleting a user purges its repos), so the
+    // name stays taken with nothing on screen to explain it. Each row offers
+    // the purge that frees the name.
+    const retired = forks.filter((f) => f && f.archived && f.user);
     let forkEl = null;
     if (!scoped && live.length >= 2) {
         forkEl = el("select", { class: "dev-fork-select" },
@@ -2879,6 +2892,22 @@ function buildDevRepoCard(view, body, r, attached, opts) {
         rows.push(el("div", { class: "dev-pr-meta dev-attached" },
                      ["worked by: " + attached.join(", ")]));
     }
+    // Retired identities, with the purge that frees their names. !scoped for
+    // the same reason as Remove and the fork dropdown: a per-project pane must
+    // not delete another project's identity. The button is an affordance only —
+    // the broker re-derives the ledger and live-fork state and fails closed.
+    if (!scoped && retired.length) {
+        for (const f of retired) {
+            const del = el("button", { class: "btn-small btn-danger" }, ["Purge"]);
+            del.onclick = () => devPurgeIdentityDialog(
+                view, body, f.user, devForksOf(f.user, allRepos, r));
+            rows.push(el("div", { class: "dev-branch-row dev-retired-row" }, [
+                el("span", { class: "dev-pr-meta" }, ["retired"]),
+                el("span", { class: "dev-pr-title" }, [f.user]),
+                del,
+            ]));
+        }
+    }
     return el("div", { class: "card dev-repo-card" }, rows);
 }
 
@@ -2951,6 +2980,83 @@ async function renderProjectFetchPane(container, repo) {
     // Fetch surfaces; same silent degradation on a missing field).
     const revLine = devReviewerLine(result.reviewer);
     if (revLine) container.appendChild(revLine);
+}
+
+// Which repos does <user> own a fork of, across every mirror the page loaded?
+// Purging is USER-scoped while this view is repo-scoped, so the dialog has to
+// say what else goes. `here` is the card's own repo, kept even when the page
+// data is thin so the list is never empty on the row you clicked.
+//
+// ⚠ This is a FLOOR, never an exhaustive list: dev_status degrades a sick repo
+// to {repo, error} with NO forks key (B37), so a partly-sick gitea silently
+// under-reports — which is exactly when someone is most likely to be cleaning
+// up. The dialog copy must read as "at least these".
+function devForksOf(user, allRepos, here) {
+    const out = [];
+    for (const rr of allRepos) {
+        if (!rr || !Array.isArray(rr.forks)) continue;
+        if (rr.forks.some((f) => f && f.user === user) && rr.repo)
+            out.push(rr.repo);
+    }
+    if (here && here.repo && !out.includes(here.repo)) out.push(here.repo);
+    return out.sort();
+}
+
+// Purge a RETIRED agent identity: its gitea user and EVERY fork it owns. This
+// is what frees the name — retirement archives the fork but keeps the user
+// (deleting one purges its repos), and the surviving user's access token cannot
+// be reissued, so a same-named project or box is blocked until this runs.
+// STEP-UP gated like destroy and repo-remove. The broker re-derives both gates
+// (the attachment ledger, and whether any fork is still live) and fails closed,
+// so the row's presence is an affordance, never the authority.
+// No onLogin: mgmtConfirmThenTail calls mgmtStatusRedirect(view, status) with
+// no landing callback, and this control is !scoped-only — so the Management
+// landing is already the right one, exactly as devRepoRemoveDialog relies on.
+// Threading a callback here would be dead code that reads as if it weren't.
+function devPurgeIdentityDialog(view, body, user, repos) {
+    const pwI = el("input", { type: "password", autocomplete: "current-password" });
+    const scope = repos.length
+        ? `This deletes its fork${repos.length === 1 ? "" : "s"} of `
+          + `${repos.join(", ")}, including all commit history on `
+          + `${repos.length === 1 ? "it" : "them"}. `
+        : "This deletes every fork it owns, including all commit history. ";
+    mgmtConfirmThenTail(view, {
+        title: `Purge ${user}`,
+        tailTitle: `Purging ${user}`,
+        verb: "dev_purge_consumer",
+        confirmLabel: "Purge",
+        danger: true,
+        body: [
+            el("p", {}, [
+                `"${user}" is a retired agent identity. ` + scope
+                + "Its Gitea user is deleted too, which frees the project or "
+                + "box name for reuse. It cannot be undone, and the GitHub "
+                + "original is untouched.",
+            ]),
+            el("p", { class: "dev-pr-meta" }, [
+                "If this identity also has forks on repos not shown here, "
+                + "those are deleted as well.",
+            ]),
+            el("div", { class: "field" }, [
+                el("label", {}, ["Re-enter your master password"]), pwI,
+            ]),
+        ],
+        validate: () => (pwI.value ? null : "Re-enter your master password."),
+        // Step-up: the retyped password is derived client-side and only the
+        // proof rides the request; the broker verifies it async, so a wrong
+        // password surfaces as a FAILED op (the destroy / repo-remove
+        // semantics), not an inline phase-1 error.
+        request: async () => fetch("/broker/dev/purge-consumer", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                user: user,
+                proof: await deriveLoginProof(pwI.value),
+            }),
+        }),
+        onDone: (ok) => { if (ok) renderDevFetchTab(view, body); },
+        focus: () => pwI.focus(),
+    });
 }
 
 // Delete a finished repo: its gitea mirror + every retired agent fork (history

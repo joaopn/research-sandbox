@@ -368,6 +368,24 @@ class GiteaClient:
         except GiteaError:
             return False
 
+    def user_exists_strict(self, username: str) -> bool:
+        """Does <username> exist? The STRICT sibling of user_exists — do not
+        "harmonize" the two, for exactly the reason branch_exists spells out.
+        user_exists' swallow is safe at ITS one call site (create_user, where
+        False means "do the work" and a spurious retry costs nothing). Here
+        False decides whether the caller REFUSES an operator's create, so
+        swallowing an outage would report a surviving retired identity as
+        absent and send the create on to a token mint that fails with the
+        opaque message this whole surface exists to remove. True on a hit,
+        False ONLY on a definitive 404, re-raise everything else."""
+        try:
+            self._api("GET", f"/users/{username}")
+            return True
+        except GiteaError as e:
+            if e.status == 404:
+                return False
+            raise
+
     def migrate_mirror(self, url: str, repo: str, pat: str | None) -> None:
         """Create the read-only mirror admin/<repo> from GitHub. Resumable: a
         COMPLETE existing mirror → trigger a sync; an INCOMPLETE stub (an `empty`
@@ -440,9 +458,38 @@ class GiteaClient:
         """Fork admin/<repo> into <as_user>/<repo> (Sudo = act as that user).
         Resumable: skip if the fork already exists. Gitea forks ASYNCHRONOUSLY
         (202 Accepted), so accept 202 and wait, bounded, for the fork to
-        materialize — the operator-grant that follows operates on it."""
-        if self.repo_exists(as_user, repo):
-            return
+        materialize — the operator-grant that follows operates on it.
+
+        The existence probe is INLINE (not repo_exists) so it can read the
+        `archived` flag off the same GET — zero extra calls — because an
+        ARCHIVED fork must NOT be adopted. Retiring a consumer archives its
+        fork, and gitea archived repos are read-only (pushes, issues and
+        comments all rejected), so silently reusing one hands the agent a fork
+        it cannot write: a SILENT breakage, where refusing is loud. Un-archiving
+        instead is deliberately not done — reviving a fork the operator chose to
+        keep as history is not what reusing a name means.
+
+        Strict semantics, the branch_exists split: definitive 404 => fork;
+        archived => raise; anything else => raise (repo_exists would swallow an
+        outage here and fall through to a POST that then fails)."""
+        try:
+            info = self._api("GET", f"/repos/{as_user}/{repo}") or {}
+        except GiteaError as e:
+            if e.status != 404:
+                raise
+            info = None                          # definitive miss -> fork below
+        if info is not None:
+            if isinstance(info, dict) and info.get("archived"):
+                # Browser-reachable (box_add / dev_attach wrap this as a
+                # ValidationError) — no CLI verb, and it must not promise the
+                # purge is always one click away (a fork-less identity is not
+                # listed anywhere).
+                raise GiteaError(
+                    f"the gitea identity {as_user!r} was retired and its fork "
+                    f"of {repo!r} is archived (read-only), so it cannot be "
+                    f"reused. Purge that retired identity from the Development "
+                    f"page, or use a different project or box name")
+            return                               # live fork — resume/heal path
         self._api("POST", f"/repos/{src_owner}/{repo}/forks", {}, sudo=as_user,
                   ok=(200, 201, 202))
         for _ in range(FORK_WAIT_TRIES):
@@ -557,10 +604,13 @@ class GiteaClient:
             pass                                 # already gone — best-effort teardown
 
     def delete_user(self, username: str) -> None:
-        try:
-            self._api("DELETE", f"/admin/users/{username}?purge=true")
-        except GiteaError:
-            pass
+        """Delete a user AND its repos (purge=true; gitea refuses to delete a
+        user that still owns repos otherwise). RAISES — deliberately not the
+        best-effort swallow the teardown helpers use: the sole caller
+        (purge_consumer) exists to FREE a username, and a swallowed failure
+        would report success while the name stays blocked, which is precisely
+        the confusing state this surface was built to end."""
+        self._api("DELETE", f"/admin/users/{username}?purge=true")
 
 
 # --- bootstrap (first stand-up) ---------------------------------------------
@@ -596,10 +646,15 @@ def bootstrap_accounts(host_port: str, admin_password: str,
 
 def _mint_token(username: str, scopes: str) -> str:
     # Fixed token name: gitea rejects a duplicate name for one user, so a
-    # deleted token FILE whose gitea-side "rs-dev" token still lives will
-    # fail re-mint until that stale token is deleted gitea-side (consumer
-    # retirement never deletes users, so nothing purges it automatically).
-    # Acceptable — the file is the source of truth in the normal flow.
+    # deleted token FILE whose gitea-side "rs-dev" token still lives fails
+    # re-mint. There is NO admin-side delete for another user's token (gitea
+    # gates /users/{u}/tokens behind reqBasicAuth AS that user; Sudo does not
+    # bypass it and the admin CLI has no delete subcommand), and consumer
+    # retirement never deletes users — so nothing clears it automatically.
+    # That is why reusing a retired identity is REFUSED early (retired_identity,
+    # checked by create/box_add/dev_attach) and freeing the name means purging
+    # the whole user (purge_consumer): the callers keep this function from ever
+    # meeting a surviving token.
     r = _gitea_admin(["user", "generate-access-token", "--username", username,
                       "--scopes", scopes, "--raw", "--token-name", "rs-dev"])
     if r.returncode != 0:
@@ -722,6 +777,99 @@ def delete_consumer_token(user: str) -> None:
         consumer_token_path(user).unlink()
     except FileNotFoundError:
         pass
+
+
+def retired_identity(host_port: str, user: str) -> bool:
+    """Is <user> a SURVIVING RETIREMENT — a gitea consumer whose host token file
+    is gone? That pair is the exact precondition of the token-mint failure:
+    retirement unlinks the file but never deletes the gitea user, whose
+    fixed-name 'rs-dev' token then blocks the re-mint (see _mint_token). Callers
+    (create / box_add / dev_attach) use this to REFUSE BEFORE any side effect,
+    instead of dying deep in provisioning with a half-built project standing.
+
+    STRICT by construction (user_exists_strict raises on anything but a
+    definitive miss): a False here sends the caller on to provisioning, so an
+    outage read as 'absent' would resurrect exactly the opaque failure this
+    replaces. Read-only — no writes on any path."""
+    client = GiteaClient(api_base(host_port), read_admin_token())
+    return (client.user_exists_strict(user)
+            and not consumer_token_path(user).is_file())
+
+
+def user_repos(host_port: str, user: str) -> list[dict]:
+    """Every repo <user> owns: [{repo, archived}] — the STRICT enumeration, a
+    GiteaError PROPAGATES.
+
+    Sibling of consumer_forks, and the posture is the point: this one backs a
+    DESTRUCTIVE gate (dev_purge_consumer refuses when any of the identity's
+    forks is still live), so a []-on-error form would read an unverifiable
+    gitea as 'this identity owns nothing' and wave the purge through. Fail
+    closed; never add a best-effort wrapper for a gate to call.
+
+    An ABSENT user maps to [] rather than raising — a purge of something already
+    gone is a no-op success, not an error (see purge_consumer)."""
+    client = GiteaClient(api_base(host_port), read_admin_token())
+    try:
+        raw = client._api("GET", f"/users/{user}/repos?limit={LIST_LIMIT}",
+                          timeout=STATUS_TIMEOUT_S) or []
+    except GiteaError as e:
+        if e.status == 404:
+            return []
+        raise
+    rows = raw if isinstance(raw, list) else []
+    # NO SILENT CAP on a fail-closed gate. A full page means there may be more
+    # repos we never saw, and "we did not see a live fork" would then be an
+    # artefact of pagination — fail-OPEN in the delete direction, the one
+    # direction that cannot be taken back. list_repos WARNS here because it
+    # feeds a display; this feeds a delete, so it takes the posture stated three
+    # lines up: an unverifiable state is never a licence to delete.
+    if len(rows) >= LIST_LIMIT:
+        raise GiteaError(
+            f"{user!r} owns at least {LIST_LIMIT} repos — cannot enumerate them "
+            f"in one page, so its fork state cannot be verified")
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        out.append({"repo": r.get("name") or "",
+                    "archived": bool(r.get("archived"))})
+    return out
+
+
+def purge_consumer(host_port: str, user: str) -> list[str]:
+    """Delete a consumer identity outright: the gitea USER and every repo it
+    owns, plus its host token file. Returns the repo names deleted.
+
+    ⚠ USER-SCOPED: this deletes EVERY fork the identity owns, on every repo —
+    callers that surface it from a repo-scoped UI must say so.
+
+    Carries NO fork-state gate, deliberately. Its two callers need opposite
+    things and each holds the proof the other cannot: RETIREMENT (destroy /
+    box remove) purges forks that are still LIVE — archiving them is exactly
+    what it replaces — and its proof of ownership is the ledger entry it is
+    about to prune; RECOVERY (dev_purge_consumer) lets an operator name an
+    arbitrary user, so it fails closed on both the ledger and a live fork
+    BEFORE calling this. Putting the archived-only check in here would make the
+    retirement path structurally impossible.
+
+    The prefix floor stays HERE as well as in the request validator: this is the
+    function holding the delete, and 'operator' / 'sandbox-admin' match the
+    username shape while owning zero (resp. unarchived) repos.
+
+    Idempotent: an absent user is a no-op success. Ordering is load-bearing —
+    delete_user RAISES now, so a failure leaves the token file in place rather
+    than stranding a live gitea identity with no host record of it."""
+    if not user.startswith(AGENT_USER_PREFIX):
+        raise GiteaError(
+            f"refusing to purge {user!r}: only dev-lane agent identities "
+            f"({AGENT_USER_PREFIX}*) can be purged")
+    client = GiteaClient(api_base(host_port), read_admin_token())
+    if not client.user_exists_strict(user):
+        return []                                  # already gone — no-op success
+    repos = [r["repo"] for r in user_repos(host_port, user) if r["repo"]]
+    client.delete_user(user)
+    delete_consumer_token(user)
+    return repos
 
 
 def remove_repo(host_port: str, repo: str) -> None:

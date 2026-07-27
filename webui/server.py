@@ -1150,6 +1150,37 @@ async def broker_dev_repo_remove_handler(request: web.Request) -> web.Response:
                            BROKER_OP_TIMEOUT_S, op_seed="dev-repo")
 
 
+async def broker_dev_purge_consumer_handler(request: web.Request) -> web.Response:
+    """POST /broker/dev/purge-consumer {user, proof} — delete a RETIRED dev
+    identity: its gitea user and every fork it owns, freeing the name for a
+    same-named project or box (gated, origin-checked, STEP-UP). The step-up
+    `proof` rides the args and is consumed by the broker's dispatch gate.
+
+    A tailed op, for the dev_repo_remove reasons: the purge makes several
+    bounded gitea calls (existence, the owned-repo enumeration, then a
+    delete_user that cascades N repo deletions server-side), and a wrong step-up
+    proof should surface as a FAILED op in phase 2 rather than an inline error.
+    `op_seed` is EXPLICIT: _start_op defaults it to args["name"], which this
+    verb does not carry, so the id would otherwise be unscoped.
+
+    The broker's gates are the authority — it refuses when the attachment ledger
+    still names the identity, and when any of its forks is still live."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    args = {"user": body.get("user")}
+    proof = body.get("proof")
+    if isinstance(proof, str):
+        args["proof"] = proof
+    return await _start_op(request, "dev_purge_consumer", args,
+                           BROKER_OP_TIMEOUT_S, op_seed="dev-purge")
+
+
 async def broker_dev_passwd_handler(request: web.Request) -> web.Response:
     """POST /broker/dev/passwd {password, proof} — set the sandbox-admin gitea
     password (gated, origin-checked, STEP-UP). The step-up `proof` (client-side
@@ -2599,6 +2630,8 @@ def main() -> None:
     app.router.add_post("/broker/dev/gitea-start", broker_dev_gitea_start_handler)
     app.router.add_post("/broker/dev/passwd", broker_dev_passwd_handler)
     app.router.add_post("/broker/dev/repo-remove", broker_dev_repo_remove_handler)
+    app.router.add_post("/broker/dev/purge-consumer",
+                        broker_dev_purge_consumer_handler)
     app.router.add_post("/broker/dev/review", broker_dev_review_handler)
     app.router.add_post("/broker/dev/project", broker_dev_project_handler)
     # Under /broker/ ON PURPOSE: the Management session cookie is Path=/broker

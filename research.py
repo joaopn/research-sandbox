@@ -395,6 +395,13 @@ def cmd_project_create(args: argparse.Namespace) -> None:
     )
     try:
         res = rscore.create(req, cfg)
+    except rscore.ValidationError as e:
+        # create() re-raises for its PRE-side-effect dev-lane refusals (branch
+        # resolution; a retired dev identity). _build nets from_kwargs only and
+        # main() nets nothing, so without this arm an ordinary refusal reaches
+        # the operator as a traceback — and a harness asserting the refusal text
+        # would happily match it.
+        die(str(e))
     except rscore.HarnessError as e:
         # Off-broker there is no durable webui sink, so the diagnostic on the
         # operator's own terminal is fine (WORKFLOW_TAXONOMY_S4 rule 4).
@@ -1791,6 +1798,35 @@ def cmd_dev_fork_set_active(args: argparse.Namespace) -> None:
     print(f"active fork for {res.repo}: {res.user}")
 
 
+def cmd_dev_fork_purge(args: argparse.Namespace) -> None:
+    """Delete a RETIRED dev identity — its gitea user and every fork it owns —
+    freeing the name for a same-named project or box (the CLI twin of the
+    Development page's retired-identity control).
+
+    No step-up prompt, matching `dev repo remove`, which likewise deletes forks
+    unprompted: the host CLI already runs with the operator's docker access, so
+    a second password would be theatre. The verb's own gates still apply — it
+    refuses while the attachment ledger names the identity, and while any of its
+    forks is still live.
+
+    This is also the ONLY surface that reaches an identity with no fork left
+    (a removed repo, or a create that died before its fork existed): the
+    Development page lists retired identities by their forks, so those have no
+    row to click."""
+    req = _build(rscore.DevPurgeConsumerRequest, user=args.user)
+    res = _call(rscore.dev_purge_consumer, req)
+    # Three outcomes, not two: an empty `repos` means "already gone" OR "existed
+    # but owned no fork" — and the second is exactly the orphan this verb is the
+    # only remedy for, so it must not read as "nothing happened".
+    if not res.purged:
+        print(f"nothing to purge: {res.user} does not exist in gitea")
+    elif res.repos:
+        print(f"purged {res.user} ({len(res.repos)} fork(s): "
+              f"{', '.join(res.repos)})")
+    else:
+        print(f"purged {res.user} (no forks remained); the name is free")
+
+
 def cmd_dev_repo_list(_args: argparse.Namespace) -> None:
     res = _call(rscore.dev_repo_list, _build(rscore.DevRepoListRequest))
     if not res.repos:
@@ -2464,6 +2500,15 @@ def build_parser() -> argparse.ArgumentParser:
     dvfka.add_argument("repo")
     dvfka.add_argument("user", help="a live consumer fork's gitea username")
     dvfka.set_defaults(func=cmd_dev_fork_set_active)
+    dvfkp = dvfk_sub.add_parser(
+        "purge",
+        help="delete a RETIRED agent identity (its gitea user + every fork it "
+             "owns) to free its name — the CLI twin of the Development page's "
+             "retired-identity control, and the only way to reach one that no "
+             "longer has a fork")
+    dvfkp.add_argument("user", help="a retired consumer's gitea username "
+                                    "(agent-<project>[.<box>])")
+    dvfkp.set_defaults(func=cmd_dev_fork_purge)
     dvge = dv_sub.add_parser(
         "gitea-enable",
         help="enable the shared Gitea backend (create if absent, else resume) — "

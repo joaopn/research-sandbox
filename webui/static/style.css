@@ -1311,6 +1311,9 @@ body {
 }
 .dev-pr-meta { color: var(--fg-faint); font-size: 12px; }
 .dev-attached { margin-top: 2px; }
+/* Retired agent identities: present but inert — dimmed so they read as history
+   rather than as another working fork. The row keeps .dev-branch-row's layout. */
+.dev-retired-row .dev-pr-title { color: var(--fg-muted); }
 .dev-copy { min-width: 34px; }
 /* Per-row commit dropdowns (the unified commit page). The panel indents under
    its PR/branch row; rows reuse the dev-pr-* cell styles. */

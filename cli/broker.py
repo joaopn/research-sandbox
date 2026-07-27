@@ -92,7 +92,8 @@ BROKER_FULLLOG_DIR = BROKER_DIR / "oplogs-full"     # .full.log — host-only
 # (OPEN_VERBS) and auth verbs never produce one. op_id-driven from the webui.
 PROGRESS_VERBS = frozenset({"create", "update", "destroy", "start", "stop",
                             "box_add", "box_remove", "dev_gitea_start",
-                            "dev_passwd", "dev_repo_remove"})
+                            "dev_passwd", "dev_repo_remove",
+                            "dev_purge_consumer"})
 
 # op_id names a file, so it is validated as a safe basename before it ever does:
 # first char alnum, rest alnum/dot/dash/underscore — no path separator, no
@@ -654,6 +655,11 @@ DEV_TARGET_WEBUI_FIELDS = frozenset({"repo"})
 # username, both shape-validated in from_kwargs and re-gated against the
 # repo's LIVE forks in the verb — neither is host-shaped.
 DEV_ACTIVE_FORK_WEBUI_FIELDS = frozenset({"repo", "user"})
+# Purging a retired dev identity: the gitea agent username ONLY. Shape +
+# agent-prefix floor in from_kwargs, then re-gated in the verb against the
+# attachment ledger AND the identity's live forks. Nothing host-shaped, and no
+# repo field — the purge is user-scoped by construction.
+DEV_PURGE_WEBUI_FIELDS = frozenset({"user"})
 # The per-row commit dropdown read (lazy, click-triggered): a repo name + ONE
 # of pr/branch (exactly-one enforced in from_kwargs, which also normalizes
 # ""-vs-absent — a webui query miss must not read as a phantom field) + the
@@ -752,6 +758,17 @@ def _verb_dev_set_active_fork(args: dict, _progress=None) -> dict:
     return dataclasses.asdict(rscore.dev_set_active_fork(req))
 
 
+def _verb_dev_purge_consumer(args: dict, progress=None) -> dict:
+    # Delete a RETIRED dev identity (gitea user + every fork it owns) so its
+    # name can be reused. STEP-UP gated (it deletes history irreversibly) and a
+    # TAILED op — hence dev_purge_consumer sits in BOTH STEP_UP_VERBS and
+    # PROGRESS_VERBS; dispatch gates op-log creation on the latter, so a tailed
+    # op outside it would write no file and the browser would tail nothing.
+    safe = {k: v for k, v in args.items() if k in DEV_PURGE_WEBUI_FIELDS}
+    req = rscore.DevPurgeConsumerRequest.from_kwargs(**safe)  # may raise ValidationError
+    return dataclasses.asdict(rscore.dev_purge_consumer(req, progress=progress))
+
+
 def _verb_dev_commits(args: dict, _progress=None) -> dict:
     # The Fetch tab's lazy per-row commit list (PR expanders + branch
     # expanders). A bounded READ on the accept thread (one fork-list GET + one
@@ -835,6 +852,7 @@ VERBS = {
     "dev_gitea_start": _verb_dev_gitea_start,
     "dev_passwd": _verb_dev_passwd,
     "dev_set_active_fork": _verb_dev_set_active_fork,
+    "dev_purge_consumer": _verb_dev_purge_consumer,
     "dev_commits": _verb_dev_commits,
 }
 
@@ -844,7 +862,7 @@ VERBS = {
 # the data-destroying verb; this is the cheap half of its gate (the recoverable
 # soft-delete + rate-limit land before the webui is exposed beyond localhost).
 STEP_UP_VERBS = frozenset({"destroy", "box_remove", "dev_repo_remove",
-                           "dev_passwd"})
+                           "dev_passwd", "dev_purge_consumer"})
 
 # Deny-by-default gating: a verb in VERBS but NOT in this read allowlist
 # requires a valid session token. Inverting the set (vs an explicit *gated*

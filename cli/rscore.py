@@ -1779,6 +1779,31 @@ class DevSetActiveForkRequest:
 
 
 @dataclass(frozen=True)
+class DevPurgeConsumerRequest:
+    """Delete a RETIRED dev identity outright — the gitea user and every fork it
+    owns — to free its name for reuse. The verb re-gates against the ledger and
+    the identity's live forks; this is shape only.
+
+    The AGENT-PREFIX FLOOR is load-bearing, not decoration: _GITEA_USERNAME_RE
+    happily matches 'operator' and 'sandbox-admin', and `operator` owns ZERO
+    repos — so the verb's live-fork gate would pass vacuously and purge the
+    read-only fetch identity every project depends on. Refuse by shape, before
+    any side effect. purge_consumer re-checks (it holds the delete)."""
+    user: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "DevPurgeConsumerRequest":
+        user = kw.get("user")
+        if not (isinstance(user, str) and _GITEA_USERNAME_RE.match(user)):
+            raise ValidationError(f"invalid consumer user: {user!r}")
+        if not user.startswith(gitea.AGENT_USER_PREFIX):
+            raise ValidationError(
+                f"only dev-lane agent identities "
+                f"({gitea.AGENT_USER_PREFIX}*) can be purged, not {user!r}")
+        return cls(user=user)
+
+
+@dataclass(frozen=True)
 class DevCommitsRequest:
     """One PR's or one branch's commit list for the Development-page dropdowns
     (a lazy, click-triggered read — never part of the page read). EXACTLY one
@@ -2131,6 +2156,19 @@ class DevSetActiveForkResult:
 
 
 @dataclass
+class DevPurgeConsumerResult:
+    user: str
+    repos: list[str]                 # forks deleted (may be EMPTY — see below)
+    # Did we actually delete a gitea user? `repos` CANNOT answer that: it is
+    # empty both when the identity was already gone AND when it existed but
+    # owned no fork. The second is the create-crashed-midway orphan — the very
+    # case the CLI verb exists to reach, since a fork-less identity has no row
+    # on the Development page — so collapsing the two would report "nothing to
+    # purge" for a name we just freed, and the operator would keep avoiding it.
+    purged: bool = False
+
+
+@dataclass
 class DevCommitsResult:
     repo: str
     commits: list[dict]              # [{sha, subject, date}] NEWEST-first
@@ -2340,6 +2378,15 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     effective_dev_branch = ""
     if req.dev_repo:
         effective_dev_branch = _resolve_dev_branch(req.dev_repo, req.dev_branch)
+        # Same reasoning, same place: REFUSE a project name whose dev identity
+        # survived a retirement. Destroy unlinks the host token file but never
+        # deletes the gitea user, whose fixed-name token then blocks the re-mint
+        # — which used to surface ~270 lines below as an opaque "could not mint
+        # a gitea token", with the container already up and the workspace on
+        # disk. Here it is a pre-side-effect ValidationError: clean envelope,
+        # clean CLI die, nothing left standing to clean up.
+        _refuse_retired_identity(gitea.agent_username(
+            gitea.consumer_for(project)))
 
     print(f"=== Creating project: {project} ===")
     ssh_port = req.ssh_port or find_free_port()
@@ -7102,6 +7149,38 @@ def _resolve_dev_branch(repo: str, branch: str) -> str:
     return default
 
 
+def _refuse_retired_identity(user: str) -> None:
+    """Refuse to re-provision a consumer identity that survived a retirement.
+
+    Shared by ALL THREE provision_consumer callers (create, box_add,
+    dev_attach) so the refusal reads the same everywhere and no path is left
+    surfacing gitea's raw text. Call it BEFORE the caller's first side effect —
+    it raises ValidationError, whose whole value here is that nothing has been
+    built yet.
+
+    The message is BROWSER-REACHABLE (ValidationError text reaches the op tail
+    verbatim), so: no CLI verb, and no promise that the purge is one click away
+    — an identity with no fork left is not listed on the Development page at
+    all, which is why 'a different name' is offered as an equal remedy rather
+    than a fallback. It also must not imply purging is immediately available
+    for a STILL-ATTACHED project: there the real sequence is detach, purge,
+    attach, and the purge verb's ledger gate correctly refuses until then."""
+    try:
+        retired = gitea.retired_identity(_gitea_host_port(), user)
+    except gitea.GiteaError as e:
+        # Could not VERIFY — never silently proceed into the opaque mint
+        # failure this exists to replace.
+        raise ValidationError(
+            f"could not check the dev identity {user!r} against Gitea: {e}")
+    if retired:
+        raise ValidationError(
+            f"the dev identity {user!r} still exists in Gitea from an earlier "
+            f"project or box of this name, and its access token cannot be "
+            f"reissued. Purge that retired identity from the Development page "
+            f"(it is listed under its repo while it still has a fork), or use "
+            f"a different name")
+
+
 def _run_dev_clone(container: str, repo: str, user: str, branch: str,
                    progress) -> str:
     """Clone the agent fork into the supervisor workspace (the dev workflow's
@@ -8530,6 +8609,12 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         # failure mode this exists to avoid). Needs the mirror, which the stamp
         # floor above just established.
         effective_branch = _resolve_dev_branch(req.repo, req.branch)
+        # ...and refuse a BOX name whose dev identity survived an earlier box's
+        # removal, for the same reason and with the same timing: inside the dev
+        # block (gitea is up — the fetch floor below is outside it and runs with
+        # gitea possibly stopped), and before any harness/image work.
+        _refuse_retired_identity(gitea.agent_username(
+            gitea.consumer_for(req.project, req.name)))
     # Fail-early rs-fetch floor (the dev-lane bootstrap_present precedent): an
     # explicit fetch ask on a host whose dev lane was never enabled refuses
     # BEFORE any harness/image/editor work below — and AFTER the dev-preset
@@ -9048,6 +9133,14 @@ def dev_attach(req: "DevAttachRequest", _progress=None) -> DevAttachResult:  # t
             f"a dev container is single-repo — discard and recreate it to work a "
             f"different repo")
     _resume_gitea(require=True)         # resume an enabled gitea; never create
+    # Refuse a surviving retired identity BEFORE the network attach below — the
+    # first thing here that mutates anything. This is the path most likely to
+    # meet one in practice, and until now it was the WORST at saying so: a
+    # re-attach against an archived fork used to succeed silently and leave the
+    # agent unable to push. Everything above is read-only, and the resume is
+    # idempotent, so the refusal costs nothing.
+    _refuse_retired_identity(gitea.agent_username(
+        gitea.consumer_for(req.project)))
     ip = _connect_gitea_to_project_network(network)
     if not ip:
         die(f"rs-gitea did not attach to {network} (no IP); check docker state")
@@ -9253,6 +9346,68 @@ def dev_set_active_fork(req: "DevSetActiveForkRequest", _progress=None) -> DevSe
     for project in gitea.attached_projects(req.repo):
         _stage_dev_gitea(project, cfg)
     return DevSetActiveForkResult(repo=req.repo, user=req.user)
+
+
+def dev_purge_consumer(req: "DevPurgeConsumerRequest", progress=None) -> DevPurgeConsumerResult:  # type: ignore[name-defined]
+    """Delete a RETIRED dev identity — the gitea user and every fork it owns —
+    freeing its name for reuse. The recovery half of B41: retirement keeps the
+    user (deleting one PURGES its repos, so archiving is the history-preserving
+    default), and a kept identity blocks a same-name project or box forever.
+
+    TWO GATES, both FAIL CLOSED, and the order matters:
+
+      0. Absent user -> no-op success, checked FIRST. A stale ledger row naming
+         a user that is already gone must not reach a gate that then refuses on
+         it, and a double click (or a delete_user that timed out while
+         succeeding server-side) must be able to clear the row.
+      1. LEDGER — refuse if ANY attachment entry names this user. That is what
+         stops a repo-scoped click from purging a consumer still attached
+         elsewhere, and it needs no gitea call, so it holds even when gitea is
+         half-up. The record is the friendly pre-flight...
+      2. GITEA — ...and the LIVE STATE is the authority: refuse if any fork the
+         identity owns is unarchived. gitea and the ledger can diverge (B27),
+         and this is the arm that catches it. A GiteaError here REFUSES (via
+         user_repos, which raises) — an unverifiable state is never a licence
+         to delete.
+
+    Only then purge_consumer, which is gate-free by design (retirement calls it
+    with LIVE forks; see its docstring)."""
+    progress = progress or _NULL_PROGRESS
+    _resume_gitea(require=True)         # resume an enabled gitea; never create
+    host_port = _gitea_host_port()
+    try:
+        if not gitea.GiteaClient(gitea.api_base(host_port),
+                                 gitea.read_admin_token()
+                                 ).user_exists_strict(req.user):
+            progress.step("purge", f"{req.user} is already gone")
+            return DevPurgeConsumerResult(user=req.user, repos=[], purged=False)
+    except gitea.GiteaError as e:
+        raise ValidationError(f"could not check {req.user!r} against Gitea: {e}")
+    claimed = sorted({e["project"] for e in gitea.load_attachments()
+                      if e.get("user") == req.user and e.get("project")})
+    if claimed:
+        raise ValidationError(
+            f"{req.user!r} is still in use by {', '.join(claimed)} — retire "
+            f"that project or box first (destroying it archives the fork)")
+    try:
+        owned = gitea.user_repos(host_port, req.user)
+    except gitea.GiteaError as e:
+        raise ValidationError(
+            f"could not verify what {req.user!r} owns ({e}); refusing to purge")
+    live = sorted(r["repo"] for r in owned if not r["archived"])
+    if live:
+        raise ValidationError(
+            f"{req.user!r} still has a live fork ({', '.join(live)}); refusing "
+            f"to purge — an identity is only retired once its forks are "
+            f"archived")
+    progress.step("purge", f"deleting {req.user} and its retired fork(s)")
+    try:
+        repos = gitea.purge_consumer(host_port, req.user)
+    except gitea.GiteaError as e:
+        raise ValidationError(str(e))
+    # purged=True even when `repos` is empty: the identity existed (checked
+    # above) and its user is gone now, which is what frees the name.
+    return DevPurgeConsumerResult(user=req.user, repos=repos, purged=True)
 
 
 def dev_commits(req: "DevCommitsRequest", _progress=None) -> DevCommitsResult:  # type: ignore[name-defined]
