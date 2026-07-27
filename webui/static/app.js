@@ -1372,6 +1372,22 @@ function renderSoftwareScreen(view, result) {
                     { verb: "agent_refresh", agent: a.agent }),
             ]),
         ]));
+        // The companion editor extension as a CONTINUATION sub-row (same six grid
+        // columns: name, Present, Cached, Effective pin, Status, actions — the two
+        // version cells must land under the parent's headings, hence the empty
+        // Present cell). Gated on has_ext, which is the SAME field software_status
+        // uses to decide whether the extension participates in matches_pin — so a
+        // "stale — re-pull" can never render without the row that explains it.
+        if (a.has_ext) {
+            distRows.push(el("div", { class: "sw-row sw-subrow" }, [
+                el("span", { class: "sw-subname" }, ["└ extension"]),
+                el("span", {}, []),
+                cell(a.cached_ext_version, "sw-mono"),
+                cell(a.ext_pin, "sw-mono"),
+                el("span", {}, []),
+                el("span", {}, []),
+            ]));
+        }
     }
     const nExt = Object.keys(editor.extensions || {}).length;
     distRows.push(el("div", { class: "sw-row" }, [
@@ -3794,31 +3810,57 @@ async function mgmtRefreshDialog(view, cfg) {
     }
     const current = body.result.current || "(unset)";
     const latest = body.result.latest;
+    // The agent variant carries a SECOND pin — the companion editor extension,
+    // bumped in tandem with the CLI. The editor and reader variants send no ext
+    // keys, so every branch below is skipped and their rendering is unchanged.
+    const extLatest = body.result.ext_latest || "";
+    const extCurrent = body.result.ext_current || "(unset)";
+    const extMoved = !!extLatest && body.result.ext_current !== body.result.ext_latest;
     bodyEl.innerHTML = "";
     // Up-to-date is equality on the RAW values ("" == "" for an unset pin at an
     // unresolved upstream would be odd, but the resolver returns a concrete
-    // version); a stale cached dist at the same pin is covered by Pull.
-    if (body.result.current === body.result.latest) {
-        bodyEl.appendChild(el("p", {}, [
+    // version); a stale cached dist at the same pin is covered by Pull. EITHER pin
+    // moving disqualifies up-to-date — the CLI and the extension publish
+    // independently, so an extension-only bump is a real case.
+    if (body.result.current === body.result.latest && !extMoved) {
+        const kids = [
             cfg.distLabel + " is already at the upstream version ",
             el("span", { class: "sw-mono" }, [latest]),
-            ". Use Pull to (re)build the dist if the cache is stale.",
-        ]));
+        ];
+        if (extLatest) {
+            kids.push(" (extension ", el("span", { class: "sw-mono" }, [extLatest]), ")");
+        }
+        kids.push(". Use Pull to (re)build the dist if the cache is stale.");
+        bodyEl.appendChild(el("p", {}, kids));
         bodyEl.appendChild(closeRow());
         return backdrop;
     }
+    // Either pin moving gets us here, so ONE of them may be unchanged — label it
+    // rather than drawing an arrow between two identical versions. An unchanged
+    // pin is also not written to the override, so "both pins" would overstate it.
+    const cliMoved = body.result.current !== body.result.latest;
     bodyEl.appendChild(el("p", {}, [
         cfg.distLabel + ": pin ",
         el("span", { class: "sw-mono" }, [current]),
-        " → upstream ",
+        cliMoved ? " → upstream " : " — already at upstream ",
         el("span", { class: "sw-mono" }, [latest]),
         ".",
     ]));
+    if (extLatest) {
+        bodyEl.appendChild(el("p", {}, [
+            "editor extension: pin ",
+            el("span", { class: "sw-mono" }, [extCurrent]),
+            extMoved ? " → upstream " : " — already at upstream ",
+            el("span", { class: "sw-mono" }, [extLatest]),
+            ".",
+        ]));
+    }
     bodyEl.appendChild(el("p", {}, [
-        "Bump to the current upstream (", el("span", { class: "sw-mono" }, [latest]),
-        " at last check) in the local override (versions.local.env, untracked — ",
-        "never committed) and re-pull the dist? A few minutes; the rest of the ",
-        "webui stays responsive.",
+        (extLatest && cliMoved && extMoved)
+            ? "Bump both pins to the versions above (at last check) in the local "
+            : "Bump to the version above (at last check) in the local ",
+        "override (versions.local.env, untracked — never committed) and re-pull ",
+        "the dist? A few minutes; the rest of the webui stays responsive.",
     ]));
     const errEl = el("div", { class: "error" });
     const cancel = el("button", { class: "btn btn-secondary" }, ["Cancel"]);

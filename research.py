@@ -420,35 +420,57 @@ def cmd_agent_show(args: argparse.Namespace) -> None:
         print("no agent dists pulled yet — run `research agent pull`")
         return
     for r in rows:
+        # ext_version is absent on a pre-tandem sidecar and None for an agent with
+        # no companion extension — both render as a bare row, unchanged.
+        ext = r.get("ext_version")
         print(f"  {r.get('agent', '?'):10} {r.get('version', '?'):14} "
-              f"pulled {r.get('pulled_at', '?')}")
+              f"pulled {r.get('pulled_at', '?')}"
+              + (f"\n  {'':10} extension {ext}" if ext else ""))
 
 
 def cmd_agent_refresh(args: argparse.Namespace) -> None:
-    """HITL: check upstream, offer to bump the local pin + re-pull. The bump
-    (CLAUDE_CODE_VERSION) lands in the untracked versions.local.env override, not
-    the tracked base — so it's a per-instance change, never a committed one — and
-    it also moves this instance's next `start --rebuild` version (load_versions
-    overlays the override for build-arg threading)."""
+    """HITL: check upstream, offer to bump the local pins + re-pull. The bumps
+    (CLAUDE_CODE_VERSION and, in tandem, CLAUDE_CODE_EXT_VERSION for the companion
+    editor extension) land in the untracked versions.local.env override, not the
+    tracked base — so it's a per-instance change, never a committed one — and it
+    also moves this instance's next `start --rebuild` version (load_versions
+    overlays the override for build-arg threading). Either pin moving is enough to
+    offer the bump: the CLI and the extension publish independently."""
     agent = args.agent
-    current, latest = rscore.agent_refresh_check(agent)
-    if current == latest:
+    current, latest, ext_current, ext_latest = rscore.agent_refresh_check(agent)
+    ext_moved = bool(ext_latest) and ext_current != ext_latest
+    if current == latest and not ext_moved:
         print(f"{agent}: up to date (effective pin {current} == upstream {latest})")
+        if ext_latest:
+            print(f"  extension: {ext_current} == upstream {ext_latest}")
         if not rscore.dist_present(agent):
             print(f"  (no dist cached yet — run `research agent pull --agent {agent}`)")
         return
-    print(f"{agent}: effective pin {current or '(unset)'} → upstream {latest}")
+    # Either-moved got us here, so ONE of these may not have moved — say so rather
+    # than printing `X → upstream X`, which reads as a transition that isn't one
+    # (and no longer happens: an unchanged pin is not written to the override).
+    if current != latest:
+        print(f"{agent}: effective pin {current or '(unset)'} → upstream {latest}")
+    else:
+        print(f"{agent}: pin {current} already at upstream (unchanged)")
+    if ext_latest:
+        if ext_moved:
+            print(f"  extension: {ext_current or '(unset)'} → upstream {ext_latest}")
+        else:
+            print(f"  extension: {ext_current} already at upstream (unchanged)")
     print("  (this also moves this instance's next `start --rebuild` version)")
     if not args.yes:
         try:
-            resp = input("bump the pin (writes versions.local.env) + pull it? [y/N] ").strip().lower()
+            resp = input("bump the pin(s) (writes versions.local.env) + pull it? [y/N] ").strip().lower()
         except EOFError:
             resp = "n"
         if resp not in ("y", "yes"):
             print("aborted; versions.local.env unchanged")
             return
-    rscore.agent_apply_refresh(agent, latest)
-    print(f"bumped versions.local.env + pulled {agent} {latest} (untracked; no commit needed)")
+    rscore.agent_apply_refresh(agent, latest, ext_latest)
+    print(f"bumped versions.local.env + pulled {agent} {latest}"
+          + (f" (extension {ext_latest})" if ext_latest else "")
+          + " (untracked; no commit needed)")
 
 
 def cmd_editor_pull(args: argparse.Namespace) -> None:

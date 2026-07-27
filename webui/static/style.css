@@ -1029,6 +1029,19 @@ body {
     color: var(--fg-muted); line-height: 1.4;
 }
 .sw-name { font-weight: 600; color: var(--fg-base); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Agent sub-row: the companion editor extension's cached-vs-pin, reading as a
+   CONTINUATION of the agent row above rather than a peer. .sw-table is a flex
+   column with gap:1px and every .sw-row sits on --bg-card, so the gutter has to
+   be closed explicitly. The compound .sw-row.sw-subrow (0,2,0) beats .sw-row's
+   (0,1,0) `padding` shorthand regardless of source order. Indent lives on the
+   LABEL, not the row's padding-left — indenting the row would shift its grid
+   columns out of alignment with the parent's. Deliberately NOT .sw-name: that
+   font-weight:600 would make the sub-row read as a peer. */
+.sw-row.sw-subrow { margin-top: -1px; padding-top: 0; }
+.sw-subname {
+    padding-left: 12px; color: var(--fg-faint);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 .sw-mono {
     font-family: ui-monospace, Menlo, Consolas, monospace; color: var(--fg-muted);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

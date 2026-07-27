@@ -1,7 +1,13 @@
 {
   "telemetry.telemetryLevel": "off",
   "update.mode": "none",
-  "extensions.autoCheckUpdates": false,
+  // The editor is the PRIMARY updater for the Claude Code extension: check marks
+  // it outdated in the Extensions view, and the operator clicks Update. autoUpdate
+  // stays false so nothing moves unattended — the dist pin remains what a FRESH
+  // container starts at. Note the badge is not Claude-scoped: it appears for every
+  // installed extension, so the six editor-dist pins (python + the five jupyter
+  // entries) are a starting point, not enforced — an operator can click those too.
+  "extensions.autoCheckUpdates": true,
   "extensions.autoUpdate": false,
 
   "workbench.startupEditor": "readme",

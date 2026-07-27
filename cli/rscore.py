@@ -3277,13 +3277,31 @@ VERSIONS_FILE = SCRIPT_DIR / "versions.env"
 # versions.env stays in lockstep with the repo.
 VERSIONS_LOCAL_FILE = SCRIPT_DIR / "versions.local.env"
 
+# Open VSX metadata API for the claude-code editor extension (platform-pinned
+# linux-x64 — the extension is platform-specific and our containers are x86_64
+# linux). A plain GET whose JSON body carries a top-level "version".
+#
+# DEFINED HERE, far from its sibling _OPEN_VSX_VSIX_URL, because the placement is
+# FORCED by module load order: VERSION_SOURCES (just below) and _AGENT_INSTALL
+# (far below) both read it, so it must precede the earlier of the two. Referencing
+# _AGENT_INSTALL from inside VERSION_SOURCES instead would be a module-load
+# NameError — i.e. the whole CLI dead at import.
+_OPEN_VSX_CLAUDE_EXT_API = "https://open-vsx.org/api/Anthropic/claude-code/linux-x64"
+
 # Upstream datasource per pin, consumed by `research images outdated`. Kept here
 # rather than annotated into versions.env so the manifest stays a clean
-# KEY=VALUE file. Two ecosystems are stdlib-awkward to query honestly — the
-# docker-ce static repo (HTML dir listing) and the VS Code Marketplace gallery
-# (POST query API) — so they're marked "manual" with a URL instead of a faked
-# check. A pin present in versions.env but absent here prints "no source"; a
-# source whose key isn't pinned is skipped. Keep in sync when adding a pin.
+# KEY=VALUE file. One ecosystem is stdlib-awkward to query honestly — the
+# docker-ce static repo (HTML dir listing) — so it is marked "manual" with a URL
+# instead of a faked check. A pin present in versions.env but absent here prints
+# "no source"; a source whose key isn't pinned is skipped. Keep in sync when
+# adding a pin.
+#
+# The six editor-extension pins below (ms-python + the five ms-toolsai Jupyter
+# entries) are ALSO Open VSX and would resolve fine through the "openvsx" kind —
+# they stay "manual" by CHOICE, not because they can't be queried: the tandem
+# CLI+extension bump shipped the agent-bound one only, and widening the rest is a
+# deliberate follow-on. Do not read their "manual" as evidence Open VSX is
+# unqueryable; CLAUDE_CODE_EXT_VERSION below proves otherwise.
 VERSION_SOURCES: dict[str, dict[str, str]] = {
     "CODE_SERVER_VERSION": {
         "kind": "github-releases",
@@ -3334,10 +3352,13 @@ VERSION_SOURCES: dict[str, dict[str, str]] = {
         "kind": "manual",
         "url": "https://open-vsx.org/extension/ms-toolsai/vscode-jupyter-slideshow",
     },
+    # Resolvable since the tandem bump landed: `research agent refresh` moves this
+    # pin alongside CLAUDE_CODE_VERSION, so `images outdated` must be able to see
+    # it too. Shares its URL with _AGENT_INSTALL["claude"]["ext"]["latest_url"] via
+    # the hoisted constant — one home, no lockstep to maintain.
     "CLAUDE_CODE_EXT_VERSION": {
-        "kind": "manual",
-        # Open VSX item page — eyeball the latest linux-x64 build before bumping.
-        "url": "https://open-vsx.org/extension/Anthropic/claude-code",
+        "kind": "openvsx",
+        "url": _OPEN_VSX_CLAUDE_EXT_API,
     },
 }
 
@@ -4030,17 +4051,25 @@ _AGENT_INSTALL = {
         "latest_url": "https://downloads.claude.ai/claude-code-releases/latest",
         # OPTIONAL companion editor extension (agent-bound; STAGE_AGENT_EXTENSIONS).
         # A future agent with no extension omits this whole key → no .vsix, no-op.
-        # version_key is an INDEPENDENT versions.env pin (the CLI + extension move
-        # together upstream but are bumped separately). The url is Open VSX,
-        # platform-pinned linux-x64 (the extension is platform-specific; our
-        # containers are x86_64 linux). file = the saved basename, chosen as the
-        # extension id so code-server-deploy.sh's skip-glob (*<base>*) precisely
+        # version_key is a SEPARATE versions.env pin from CLAUDE_CODE_VERSION, but
+        # it is no longer bumped separately: `agent refresh` resolves and moves BOTH
+        # in tandem. They are resolved INDEPENDENTLY rather than deriving the ext
+        # version from the CLI one — Open VSX can trail the CLI release by hours,
+        # and _agent_build_dist die()s on a 404 .vsix, so a derived version would
+        # fail every dist build inside that window.
+        # url is the .vsix download (platform-pinned linux-x64 — the extension is
+        # platform-specific; our containers are x86_64 linux); latest_url is the
+        # sibling metadata GET whose JSON body carries latest_json_key at the top
+        # level. file = the saved basename, chosen as the extension id so
+        # code-server-deploy.sh's anchored skip-glob (<base>-[0-9]*) precisely
         # matches the installed folder anthropic.claude-code-<ver>.
         "ext": {
             "id": "Anthropic.claude-code",
             "version_key": "CLAUDE_CODE_EXT_VERSION",
             "url": ("https://open-vsx.org/api/Anthropic/claude-code/linux-x64/"
                     "{ver}/file/Anthropic.claude-code-{ver}@linux-x64.vsix"),
+            "latest_url": _OPEN_VSX_CLAUDE_EXT_API,
+            "latest_json_key": "version",
             "file": "anthropic.claude-code.vsix",
         },
     },
@@ -4184,6 +4213,12 @@ _CODE_SERVER_LATEST_URL = "https://github.com/coder/code-server/releases/latest"
 # wedged docker daemon is a codebase-wide risk, out of scope here.
 _UPSTREAM_RESOLVE_MAX_TIME_S = 15
 
+# Line-oriented delimiter separating the two upstream bodies when ONE resolve
+# container fetches both (see _agent_resolve_upstream). Impossible in a bare
+# semver, and the host-side split uses str.partition (FIRST occurrence), so a body
+# that happens to contain the token cannot shift the half ahead of it.
+_UPSTREAM_SPLIT_SENTINEL = "---rs-upstream-split---"
+
 
 def agent_dist_path(agent: str) -> Path:
     return AGENT_DIST_DIR / agent
@@ -4308,8 +4343,14 @@ def _agent_build_dist(agent: str, version: str) -> None:
         (dest / "claude" / "settings.json").write_text(_AGENT_SETTINGS_JSON)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+    # ext_version records what this build actually BUNDLED (the local ext_ver the
+    # .vsix was fetched at), not what a pin says now — that is what lets
+    # software_status detect a pin that moved without a re-pull. None for an
+    # ext-less agent; `ext_ver if ext else None` evaluates `ext` first, so the
+    # conditionally-bound name is never read on the ext-less path.
     _agent_sidecar(agent).write_text(json.dumps(
         {"agent": agent, "version": version,
+         "ext_version": ext_ver if ext else None,
          "pulled_at": datetime.datetime.now(datetime.timezone.utc).isoformat()},
         indent=2) + "\n")
 
@@ -4431,32 +4472,93 @@ def _stage_rs_sandbox(container: str) -> None:
             f"{detail or 'cat returned non-zero'}")
 
 
-def _agent_resolve_latest(agent: str) -> str:
-    """LIGHT in-container fetch of upstream `latest` → a concrete version string
-    (no install). Honors the no-host-tool rule (curl runs in rs-minimal-base)."""
+def _checked_upstream_version(value, agent: str, what: str) -> str:
+    """Charset-guard a resolved upstream version before it can reach an
+    in-container shell interpolation (_agent_build_dist formats both into curl
+    URLs). TYPE-checks FIRST, deliberately: a JSON metadata body can hand back an
+    int or None, and _AGENT_VERSION_RE.match(non-str) raises TypeError — which is
+    NOT in the broker dispatch's caught set, so it would escape _Handler.handle()
+    and truncate the client's reply with no envelope at all."""
+    if not isinstance(value, str) or not _AGENT_VERSION_RE.match(value):
+        die(f"upstream returned an unexpected {agent} {what}: {value!r}")
+    return value
+
+
+def _agent_resolve_upstream(agent: str) -> tuple[str, str]:
+    """LIGHT in-container fetch of the agent's upstream `latest`, plus — when the
+    agent declares a companion editor extension — that extension's latest.
+    Returns (cli_latest, ext_latest); ext_latest is "" for an ext-less agent. No
+    install. Honors the no-host-tool rule (curl runs in rs-minimal-base).
+
+    ONE container, both curls CONCURRENT, and both properties are load-bearing:
+    this runs INLINE on the broker's serial accept thread (via
+    agent_refresh_check), and _UPSTREAM_RESOLVE_MAX_TIME_S is reasoned against the
+    webui's BROKER_CALL_TIMEOUT_S. Two SEQUENTIAL resolves — plus a second docker
+    run start — would exceed that budget and reach the operator as a bogus 'broker
+    unreachable'. Concurrent keeps wall clock at one --max-time, so the existing
+    constant's reasoning holds unchanged and no new timeout is invented.
+
+    Each curl writes its OWN file and is waited on BY PID. Two backgrounded curls
+    sharing stdout interleave — the metadata body is multi-KB, well past PIPE_BUF,
+    where writes stop being atomic — and a bare `wait` (no argument) returns 0
+    unconditionally in POSIX sh, which would swallow a network failure and degrade
+    it into the charset guard's uninformative empty-string message."""
     spec = _AGENT_INSTALL[agent]
+    ext = spec.get("ext")
     if not run_quiet(["docker", "image", "inspect", MINIMAL_BASE_IMAGE]):
         die(f"{MINIMAL_BASE_IMAGE} not found — run `research start --rebuild` first")
-    r = run(["docker", "run", "--rm", MINIMAL_BASE_IMAGE, "sh", "-lc",
-             f"curl -fsSL --max-time {_UPSTREAM_RESOLVE_MAX_TIME_S} "
-             f"{shlex.quote(spec['latest_url'])}"], capture_output=True)
+    t = _UPSTREAM_RESOLVE_MAX_TIME_S
+    if ext:
+        script = (
+            f"curl -fsSL --max-time {t} -o /tmp/cli "
+            f"{shlex.quote(spec['latest_url'])} & p1=$!; "
+            f"curl -fsSL --max-time {t} -o /tmp/ext "
+            f"{shlex.quote(ext['latest_url'])} & p2=$!; "
+            'wait "$p1"; s1=$?; '
+            'wait "$p2"; s2=$?; '
+            '[ "$s1" -eq 0 ] && [ "$s2" -eq 0 ] || exit 1; '
+            f"cat /tmp/cli; printf '\\n%s\\n' "
+            f"{shlex.quote(_UPSTREAM_SPLIT_SENTINEL)}; cat /tmp/ext")
+    else:
+        script = (f"curl -fsSL --max-time {t} "
+                  f"{shlex.quote(spec['latest_url'])}")
+    r = run(["docker", "run", "--rm", MINIMAL_BASE_IMAGE, "sh", "-lc", script],
+            capture_output=True)
     if r.returncode != 0:
         die(f"could not resolve upstream {agent} version: "
             f"{(r.stderr or '').strip() or 'fetch failed'}")
-    ver = (r.stdout or "").strip()
-    if not _AGENT_VERSION_RE.match(ver):
-        die(f"upstream returned an unexpected version string: {ver!r}")
-    return ver
+    out = r.stdout or ""
+    if not ext:
+        return _checked_upstream_version(out.strip(), agent, "version"), ""
+    head, sep, tail = out.partition(_UPSTREAM_SPLIT_SENTINEL)
+    if not sep:
+        die(f"could not resolve upstream {agent} version: "
+            "resolver output was missing its delimiter")
+    try:
+        meta = json.loads(tail)
+    except ValueError:
+        die(f"could not parse the upstream {agent} extension metadata")
+    if not isinstance(meta, dict):
+        die(f"upstream {agent} extension metadata was not a JSON object")
+    return (_checked_upstream_version(head.strip(), agent, "version"),
+            _checked_upstream_version(meta.get(ext["latest_json_key"]),
+                                      agent, "extension version"))
 
 
-def agent_refresh_check(agent: str = "claude") -> tuple[str, str]:
-    """Side-effect-free: return (current effective pin, upstream latest). The
-    effective pin is load_versions()'s merged view (tracked base ⊕ untracked
-    versions.local.env override)."""
+def agent_refresh_check(agent: str = "claude") -> tuple[str, str, str, str]:
+    """Side-effect-free: return (current pin, upstream latest, current ext pin,
+    upstream ext latest). The ext pair is ("", "") for an agent that declares no
+    companion extension. Effective pins are load_versions()'s merged view (tracked
+    base ⊕ untracked versions.local.env override)."""
     if agent not in _AGENT_INSTALL:
         die(f"unknown agent {agent!r} (known: {', '.join(KNOWN_AGENTS)})")
-    current = load_versions().get(_AGENT_INSTALL[agent]["version_key"], "")
-    return current, _agent_resolve_latest(agent)
+    versions = load_versions()
+    spec = _AGENT_INSTALL[agent]
+    ext = spec.get("ext")
+    current = versions.get(spec["version_key"], "")
+    ext_current = versions.get(ext["version_key"], "") if ext else ""
+    latest, ext_latest = _agent_resolve_upstream(agent)
+    return current, latest, ext_current, ext_latest
 
 
 def _set_version_pin(key: str, value: str) -> None:
@@ -4482,19 +4584,48 @@ def _set_version_pin(key: str, value: str) -> None:
     VERSIONS_LOCAL_FILE.write_text("\n".join(out) + "\n")
 
 
-def agent_apply_refresh(agent: str, version: str) -> None:
-    """Bump the pin to `version` in the untracked versions.local.env override
-    (never the tracked base) AND (re)build the dist at it. The prompt/confirm is
-    the front-end's job (this just applies)."""
-    _set_version_pin(_AGENT_INSTALL[agent]["version_key"], version)
+def agent_apply_refresh(agent: str, version: str, ext_version: str = "") -> None:
+    """Bump the CLI pin to `version` and — when the agent declares a companion
+    editor extension — its pin to `ext_version`, both in the untracked
+    versions.local.env override (never the tracked base), AND (re)build the dist.
+    The prompt/confirm is the front-end's job (this just applies).
+
+    Both pins are written BEFORE the build, and that ordering is load-bearing:
+    _agent_build_dist re-reads the ext pin out of load_versions() (which is
+    uncached — it re-parses both files per call), so building first would bundle
+    the OLD .vsix into a dist stamped with the new CLI version.
+
+    Each pin is written ONLY if its effective value actually changed, and that
+    guard is load-bearing under either-moved semantics: the caller reaches here
+    when EITHER pin moved, so the other one routinely arrives unchanged. Writing an
+    unchanged value into the override is NOT a harmless no-op — override wins
+    per-key forever, so it silently detaches that pin from the tracked baseline a
+    maintainer may later move, and false-flags it as overridden in the Software
+    panel's pin table. The effective pins are read ONCE up front, before any write,
+    so the second comparison can't see the first write.
+
+    Posture, unchanged in kind but now widened from one pin to two: a build that
+    fails AFTER a successful resolve leaves the pin(s) bumped with no dist
+    rebuilt. The next `agent pull` reconciles. This is pre-existing behaviour for
+    the CLI pin, not a regression introduced by the extension pin."""
+    spec = _AGENT_INSTALL[agent]
+    ext = spec.get("ext")
+    effective = load_versions()
+    if effective.get(spec["version_key"]) != version:
+        _set_version_pin(spec["version_key"], version)
+    if ext and ext_version and effective.get(ext["version_key"]) != ext_version:
+        _set_version_pin(ext["version_key"], ext_version)
     _agent_build_dist(agent, version)
 
 
 def agent_refresh(agent: str = "claude", progress=None) -> dict:
-    """Build-lane refresh: resolve the upstream latest, and if newer than the
-    effective pin, bump the untracked versions.local.env override to it + rebuild
-    the dist at it (via agent_apply_refresh — override-only, never the tracked
-    base). The webui's preview already showed the operator current→latest; this
+    """Build-lane refresh: resolve the upstream latest for the CLI *and* the
+    companion editor extension, and if EITHER is newer than its effective pin,
+    bump the untracked versions.local.env override for both + rebuild the dist
+    (via agent_apply_refresh — override-only, never the tracked base). Either-moved
+    (not both) is the trigger on purpose: the two versions publish independently,
+    so an extension-only bump is a real, common case and must not read as
+    up-to-date. The webui's preview already showed the operator current→latest; this
     RE-RESOLVES child-side so no client-supplied version ever crosses the boundary
     — only the `agent` enum does — and a stale preview can't cause a wrong bump
     (if upstream moved to equal between preview and confirm, this returns
@@ -4502,19 +4633,24 @@ def agent_refresh(agent: str = "claude", progress=None) -> dict:
     _NULL_PROGRESS on the CLI) gets coarse view-log milestones — agent enum +
     _AGENT_VERSION_RE-guarded version only, never a host path — while the raw
     resolve+build firehose streams to the host-only full log. Up-to-date is
-    equality-only (mirrors the CLI `agent refresh`): no dist-presence check, so it
-    never writes a redundant override entry; the milestone points at Pull for a
-    stale cached dist."""
+    equality-only across both pins (mirrors the CLI `agent refresh`): no
+    dist-presence check, so it never writes a redundant override entry; the
+    milestone points at Pull for a stale cached dist."""
     progress = progress or _NULL_PROGRESS
     progress.step("resolve", f"resolving upstream {agent} version")
-    current, latest = agent_refresh_check(agent)
-    if current == latest:
-        progress.step("uptodate", f"pin already at upstream {latest} — "
-                      "use Pull to (re)build the dist")
-        return {"agent": agent, "version": latest, "bumped": False}
-    progress.step("bump", f"bumping pin to {latest}")
-    agent_apply_refresh(agent, latest)
-    return {"agent": agent, "version": latest, "bumped": True}
+    current, latest, ext_current, ext_latest = agent_refresh_check(agent)
+    ext_moved = bool(ext_latest) and ext_current != ext_latest
+    if current == latest and not ext_moved:
+        progress.step("uptodate", f"pins already at upstream {latest}"
+                      + (f" / extension {ext_latest}" if ext_latest else "")
+                      + " — use Pull to (re)build the dist")
+        return {"agent": agent, "version": latest,
+                "ext_version": ext_latest or None, "bumped": False}
+    progress.step("bump", f"bumping pin to {latest}"
+                  + (f" / extension {ext_latest}" if ext_latest else ""))
+    agent_apply_refresh(agent, latest, ext_latest)
+    return {"agent": agent, "version": latest,
+            "ext_version": ext_latest or None, "bumped": True}
 
 
 def agent_list() -> list[dict]:
@@ -5328,24 +5464,42 @@ def software_status() -> dict:
     agents = []
     for agent in KNOWN_AGENTS:
         present = dist_present(agent)
-        cached_version = pulled_at = None
+        cached_version = pulled_at = cached_ext_version = None
         sidecar = _agent_sidecar(agent)
         if present and sidecar.exists():
             try:
                 data = json.loads(sidecar.read_text())
                 cached_version = data.get("version")
                 pulled_at = data.get("pulled_at")
+                cached_ext_version = data.get("ext_version")
             except Exception:
                 pass
+        ext = _AGENT_INSTALL[agent].get("ext")
         pin = effective.get(_AGENT_INSTALL[agent]["version_key"])
+        ext_pin = effective.get(ext["version_key"]) if ext else None
+        # has_ext is the SINGLE predicate behind both the staleness calculation
+        # here and the webui's sub-row render. Deriving them separately is how the
+        # panel ends up saying "stale — re-pull" with no visible cause; sharing one
+        # field makes that drift impossible rather than merely unlikely.
+        has_ext = ext is not None
+        # An UNSET ext pin does not fail matches_pin — mirroring distStatus's
+        # `effective_pin == null -> cached` short-circuit, and for a sharper
+        # reason: _agent_build_dist die()s on an unset ext pin, so "stale —
+        # re-pull" there would name a remedy that cannot succeed.
+        ext_ok = (not has_ext or ext_pin is None
+                  or (cached_ext_version is not None
+                      and cached_ext_version == ext_pin))
         agents.append({
             "agent": agent,
             "present": present,
             "cached_version": cached_version,
+            "cached_ext_version": cached_ext_version,
             "pulled_at": pulled_at,
             "effective_pin": pin,
+            "ext_pin": ext_pin,
+            "has_ext": has_ext,
             "matches_pin": (cached_version is not None and pin is not None
-                            and cached_version == pin),
+                            and cached_version == pin and ext_ok),
         })
 
     ed = editor_show() or {}
@@ -5445,6 +5599,12 @@ def _latest_version(source: dict[str, str]) -> str:
     if kind == "pypi":
         data = _http_json(f"https://pypi.org/pypi/{source['pkg']}/json")
         return str(data["info"]["version"])
+    if kind == "openvsx":
+        # The metadata GET carries the latest version for the pinned target
+        # platform at the top level. Same posture as the arms above: no extra
+        # guard, cmd_images_outdated catches KeyError/ValueError and renders
+        # 'unreachable'.
+        return str(_http_json(source["url"])["version"])
     raise ValueError(f"unknown datasource kind: {kind}")
 
 
