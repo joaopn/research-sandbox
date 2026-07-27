@@ -180,7 +180,23 @@ MIRROR_FEATURES = {"has_issues": False}
 
 class GiteaError(Exception):
     """Any gitea-side failure. Message carries only method/path/status — never a
-    request/response body, so a token in a migrate payload can never leak here."""
+    request/response body, so a token in a migrate payload can never leak here.
+
+    ``status`` is the HTTP status when one was actually received, else None. It
+    exists so a caller can tell a DEFINITIVE 404 from "gitea is broken": _api
+    otherwise collapses 404, 502, unreachable and timeout into one
+    indistinguishable error, with the code surviving only inside the message
+    string. Callers that refuse an operator request on a False MUST branch on
+    it (see GiteaClient.branch_exists) — a swallow-everything bool there would
+    report an outage as "that branch does not exist".
+
+    NOTE: only _api sets it. The two inline urllib blocks (pull_diff /
+    commit_diff) raise with status=None, which under the branch_exists rule
+    means re-raise — the safe default."""
+
+    def __init__(self, msg: str, status: int | None = None) -> None:
+        super().__init__(msg)
+        self.status = status
 
 
 # --- paths / identity -------------------------------------------------------
@@ -230,6 +246,9 @@ def mirror_present(repo: str) -> bool:
     """The 'repo is added' floor — a pure host-file check (no gitea call), so
     from_kwargs and the box gate can run it pre-side-effect."""
     return mirror_stamp_path(repo).is_file()
+
+# The mirror's live reads (mirror_state / mirror_has_branch) are NOT here: they
+# call gitea, so they live with the other client-using helpers below add_repo.
 
 
 def api_base(host_port: str) -> str:
@@ -298,13 +317,15 @@ class GiteaClient:
         except urllib.error.HTTPError as e:
             # e.code is the status; DO NOT include the response body (it can echo
             # the request, which for migrate carries auth_token).
-            raise GiteaError(f"gitea {method} {path} -> HTTP {e.code}") from None
+            raise GiteaError(f"gitea {method} {path} -> HTTP {e.code}",
+                             status=e.code) from None
         except urllib.error.URLError as e:
             raise GiteaError(f"gitea {method} {path} unreachable: {e.reason}") from None
         except OSError as e:                    # timeout surfaces here
             raise GiteaError(f"gitea {method} {path} failed: {e}") from None
         if status not in ok:
-            raise GiteaError(f"gitea {method} {path} -> HTTP {status}")
+            raise GiteaError(f"gitea {method} {path} -> HTTP {status}",
+                             status=status)
         if not raw:
             return None
         try:
@@ -318,6 +339,27 @@ class GiteaClient:
             return True
         except GiteaError:
             return False
+
+    def branch_exists(self, owner: str, repo: str, branch: str) -> bool:
+        """Does <branch> exist on <owner>/<repo>?
+
+        DELIBERATELY NOT repo_exists' swallow-everything shape — do not
+        "harmonize" the two. repo_exists' swallow is safe at ITS call sites:
+        they are resume/idempotency decisions where False means "do the work"
+        and a spurious retry costs nothing. Here False means "REFUSE the
+        operator's request", so swallowing an outage would report a live branch
+        as nonexistent and send them to fix their own input. Hence: True on a
+        hit, False ONLY on a definitive 404, re-raise everything else so the
+        caller can say "could not verify" instead of lying. Same strict-vs-
+        best-effort split as consumer_forks vs list_forks."""
+        try:
+            self._api("GET", f"/repos/{owner}/{repo}/branches/"
+                             f"{urllib.parse.quote(branch, safe='/')}")
+            return True
+        except GiteaError as e:
+            if e.status == 404:
+                return False
+            raise
 
     def user_exists(self, username: str) -> bool:
         try:
@@ -607,6 +649,33 @@ def add_repo(host_port: str, url: str, repo: str, pat: str | None = None) -> Non
     client.set_repo_features(ADMIN_USER, repo, MIRROR_FEATURES)
     MIRRORS_DIR.mkdir(parents=True, exist_ok=True)
     mirror_stamp_path(repo).write_text("")
+
+
+# Live mirror reads. Named 'state'/'has' rather than a *_present name: beside
+# the pure-file mirror_present these DO call gitea and DO raise, and a
+# *_present sibling would read as "cheap bool, never raises". Both need a
+# RUNNING gitea — the stamp check is not a liveness signal.
+
+
+def mirror_state(host_port: str, repo: str) -> dict:
+    """The mirror's {empty, default_branch} in one GET. `empty` is a legitimate
+    state, not a fault: gitea treats a zero-commit GitHub source as a SUCCESSFUL
+    migrate, and an empty repo has no branches at all — so a caller resolving a
+    branch must check it FIRST (the branch route 404s on an empty repo, which
+    would otherwise surface as 'no such branch')."""
+    client = GiteaClient(api_base(host_port), read_admin_token())
+    data = client._api("GET", f"/repos/{ADMIN_USER}/{repo}")
+    if not isinstance(data, dict):
+        raise GiteaError(f"gitea GET repo {ADMIN_USER}/{repo} -> no data")
+    return {"empty": bool(data.get("empty")),
+            "default_branch": data.get("default_branch") or ""}
+
+
+def mirror_has_branch(host_port: str, repo: str, branch: str) -> bool:
+    """Does the mirror carry <branch>? Raises on anything but a definitive
+    miss — see GiteaClient.branch_exists for why that matters here."""
+    client = GiteaClient(api_base(host_port), read_admin_token())
+    return client.branch_exists(ADMIN_USER, repo, branch)
 
 
 def provision_consumer(host_port: str, repo: str, user: str) -> None:
@@ -955,15 +1024,23 @@ def save_attachments_atomic(entries: list[dict]) -> None:
 
 def record_attachment(project: str, klass: str, repo: str | None,
                       gitea_ip: str, *, box: str | None = None,
-                      user: str = "") -> None:
+                      user: str = "", branch: str = "") -> None:
     """Add/refresh a consumer's entry. Keyed on (project, class, repo, box) so
     a re-wire refreshes gitea_ip in place rather than duplicating — and so a
-    box entry never clobbers the project's own entry for the same repo."""
+    box entry never clobbers the project's own entry for the same repo.
+
+    ``branch`` is the consumer's base branch. This REPLACES on the key like
+    every other field, so a caller re-recording an existing entry must pass the
+    value forward explicitly (see the IP-refresh loop and dev_attach, which both
+    read the prior entry) — omitting it BLANKS a branch the operator chose.
+    Deliberately not a None-means-preserve sentinel: `user` already replaces on
+    every re-record, and mixing the two semantics in one function is a footgun."""
     entries = [e for e in load_attachments()
                if not (e.get("project") == project and e.get("class") == klass
                        and e.get("repo") == repo and e.get("box") == box)]
     entries.append({"project": project, "class": klass, "repo": repo,
-                    "gitea_ip": gitea_ip, "box": box, "user": user})
+                    "gitea_ip": gitea_ip, "box": box, "user": user,
+                    "branch": branch})
     save_attachments_atomic(entries)
 
 

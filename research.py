@@ -387,6 +387,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         # keeps distinct from None/unset (unset => the workflow's preset).
         agents=([] if args.no_agents else args.agents),
         dev_repo=args.dev_repo,
+        dev_branch=args.dev_branch,
         supervisor_model=args.supervisor_model,
         supervisor_effort=args.supervisor_effort,
         worker_model=args.worker_model, worker_effort=args.worker_effort,
@@ -2060,6 +2061,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="REQUIRED with a dev workflow (--workflow dev): the name "
                         "of a repo added via `research dev repo add` — the agent "
                         "fork is cloned into the project workspace at create")
+    c.add_argument("--dev-branch", dest="dev_branch", metavar="BRANCH",
+                   default="",
+                   help="(dev workflow) base branch the agent works: it is "
+                        "cloned, named in the agent's instructions, and targeted "
+                        "by its pull requests. Defaults to the repo's default "
+                        "branch. Must already exist.")
     c.set_defaults(func=cmd_project_create)
 
     a = proj_sub.add_parser("attach", help="docker exec + byobu attach")

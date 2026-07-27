@@ -118,6 +118,12 @@ DEV_TOKENS_DIR = Path(os.environ.get("HOME", "/home/research")) / ".dev-tokens"
 # In-box gitea URL: the box resolves the NAME via its --add-host entry.
 DEV_GITEA_URL = "http://rs-gitea:3000"
 
+# The placeholder the dev instructions carry for the box's base branch,
+# substituted at the CLAUDE.md write so no template token reaches the agent.
+# MIRROR-PAIR LOCKSTEP with cli/rscore.py's BASE_BRANCH_TOKEN — this file is
+# streamed into the supervisor standalone and cannot import rscore.
+BASE_BRANCH_TOKEN = "{{BASE_BRANCH}}"
+
 # Box names: lowercase, must match the webui tab-id regex so the tab
 # synthesizer renders a tab for them. Auto-named box-N.
 _NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
@@ -331,17 +337,23 @@ def _build_proxy_mcps(mcps: list[str], *, strict: bool) -> dict:
 
 
 def _stage_box_workspace(name: str, preset: dict, mcps: list[str],
-                         *, strict: bool) -> None:
+                         *, strict: bool, base_branch: str = "") -> None:
     """Write the box's CLAUDE.md (instructions) + .mcp-proxy.json (the stable
     proxy source-1) into the box's workspace dir BEFORE the container starts —
     the entrypoint reads them at boot. CLAUDE.md is first-boot no-clobber (a PI
     edit survives a restart); .mcp-proxy.json is overwritten every create/restart
     so an allowlist change re-renders. The entrypoint regenerates /workspace/.mcp.json
     wholesale from .mcp-proxy.json + the image-baked stdio MCPs (idempotent across
-    reboots — a fresh proxy-only source each boot)."""
+    reboots — a fresh proxy-only source each boot).
+
+    ``base_branch`` (dev boxes) is substituted for BASE_BRANCH_TOKEN in the
+    instructions, so the agent reads a literal branch name rather than a
+    template. Empty for every other preset, whose text carries no token."""
     ws = WORKSPACE / f"pi-isolated/{name}"
     ws.mkdir(parents=True, exist_ok=True)
     instr = (preset.get("instructions") or "").strip()
+    if base_branch:
+        instr = instr.replace(BASE_BRANCH_TOKEN, base_branch)
     claude_md = ws / "CLAUDE.md"
     if instr and not claude_md.exists():
         claude_md.write_text(instr + "\n")
@@ -532,7 +544,7 @@ def _project_box_pair() -> dict:
 def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
              editor: bool = False, editor_port: int = 0, clone_repo: str = "",
              clone_ref: str = "", clone_setup: str = "",
-             dev: dict | None = None, dev_subnet: str = "",
+             dev: dict | None = None, dev_subnet: str = "", branch: str = "",
              loopback_ports: list[dict] | None = None,
              model: str = "", effort: str = "", fetch: bool = False) -> None:
     """docker run a box in the local inner dockerd. ``browser`` selects the
@@ -587,6 +599,12 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
                    "-e", f"GITEA_USER={dev['user']}",
                    "-e", f"GITEA_TOKEN={dev['token']}",
                    "-e", f"REPO_NAME={dev['repo']}"]
+        # The base branch rides its OWN parameter, never the `dev` dict: that
+        # dict is _dev_run_info()'s return, read from the staged dev-gitea.json,
+        # and will never carry a branch. Consumed by the entrypoint's first
+        # clone and exported to the agent by rs-repo-watch.
+        if branch:
+            dev_env += ["-e", f"GITEA_BRANCH={branch}"]
     else:
         net_args = ["--network", INNER_NETWORK, "--ip", ip]
         # Opt-in rs-fetch wiring (the universal add-host is RETIRED): only an
@@ -689,6 +707,11 @@ def _rerun_box(name: str, entry: dict) -> None:
              dev=(_dev_run_info(entry["repo"], entry.get("gitea_user") or "")
                   if is_dev else None),
              dev_subnet=entry.get("dev_subnet") or "",
+             # From the STORED entry (env is fixed at docker run). Only matters
+             # if the workspace was wiped and the entrypoint re-clones; on a
+             # normal re-run the clone already exists and the agent's own
+             # checkout is left alone.
+             branch=entry.get("branch") or "",
              # Re-apply the exposed loopback publishes + forwarders from the stored
              # entry: -p is fixed at docker run, so a restart/recreate must re-run
              # them (F3 Slice 2b), same reason as editor_port/model above.
@@ -733,15 +756,19 @@ def cmd_create(args: argparse.Namespace) -> None:
     # (entrypoint-driven), and the dedicated dev bridge has no path to mcp-proxy.
     repo = (args.repo or "").strip() or (preset.get("repo") or "").strip()
     ref, setup = (args.ref or "").strip(), (args.setup or "").strip()
+    branch = (args.branch or "").strip()
     mcps = _parse_csv(args.mcps)
+    if branch and not is_dev:
+        die("--branch is only valid for a dev box; a byo box pins its clone "
+            "with --ref (which also accepts a tag or commit)")
     dev_info: dict | None = None
     if is_dev:
         if not repo:
             die(f"the {args.preset!r} preset requires --repo <name> (an added "
                 f"dev repo)")
         if ref or setup:
-            die("--ref/--setup are not valid for a dev box (the fork's default "
-                "branch is checked out; setup runs are the agent's own work)")
+            die("--ref/--setup are not valid for a dev box (use --branch to "
+                "pick the base branch; setup runs are the agent's own work)")
         if mcps:
             die("--mcps is not valid for a dev box (its dedicated bridge has no "
                 "path to mcp-proxy)")
@@ -756,6 +783,17 @@ def cmd_create(args: argparse.Namespace) -> None:
             die("a dev box is created via `research project box add` (or the "
                 "webui box window), which mints its gitea identity — "
                 "--gitea-user is required here")
+        # Same reasoning as --gitea-user: the host resolves the base branch
+        # against the mirror (existence-checked, ""-means-repo-default) BEFORE
+        # this runs and passes it concretely. Requiring it here is what makes
+        # the token-survives case UNREACHABLE: an empty branch would skip
+        # _stage_box_workspace's substitution and write a CLAUDE.md whose every
+        # git recipe reads `git checkout {{BASE_BRANCH}}` — a failure visible
+        # only inside the agent's own session.
+        if not branch:
+            die("a dev box is created via `research project box add` (or the "
+                "webui box window), which resolves its base branch against the "
+                "mirror — --branch is required here")
         dev_info = _dev_run_info(repo, args.gitea_user.strip())
     elif (repo or setup) and not is_clone:
         die(f"--repo/--setup are only valid for a clone (BYO) preset; "
@@ -795,7 +833,7 @@ def cmd_create(args: argparse.Namespace) -> None:
     editor_port = allocate_editor_port(entries) if editor else 0
     # Stage CLAUDE.md + .mcp-proxy.json BEFORE the run (M2: the entrypoint reads
     # them at boot). strict=True → die on an MCP not in the project allowlist.
-    _stage_box_workspace(name, preset, mcps, strict=True)
+    _stage_box_workspace(name, preset, mcps, strict=True, base_branch=branch)
     # Agent model + effort (STAGE_MODEL_SELECT). Explicit flags win; otherwise the
     # project's `box` default from the marker, read verbatim (the host resolved and
     # effort-drop-checked it at create — nothing here can validate). Persisted on
@@ -818,13 +856,14 @@ def cmd_create(args: argparse.Namespace) -> None:
         entry.update({"repo": repo, "ref": ref, "setup": setup})
     if is_dev:
         entry.update({"dev": True, "repo": repo, "dev_subnet": dev_subnet,
+                      "branch": branch,
                       "gitea_user": args.gitea_user.strip()})
     entries[name] = entry
     save(entries)
     _run_box(name, ip, browser=browser, agent=agent, editor=editor,
              editor_port=editor_port, clone_repo=repo if is_clone else "",
              clone_ref=ref, clone_setup=setup,
-             dev=dev_info, dev_subnet=dev_subnet,
+             dev=dev_info, dev_subnet=dev_subnet, branch=branch,
              model=model, effort=effort, fetch=fetch)
     print(json.dumps({"name": name, "ip": ip, "preset": args.preset,
                       "browser": browser, "agent": agent, "editor": editor,
@@ -1036,6 +1075,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="(byo preset) git repo URL to clone into the box at boot")
     c.add_argument("--ref", default="",
                    help="(byo preset) git ref to check out")
+    c.add_argument("--branch", default="",
+                   help="(dev preset) base branch the agent works; the host "
+                        "box-add path resolves and validates it against the "
+                        "mirror before this runs")
     c.add_argument("--setup", default="",
                    help="(byo preset) setup command to run in the clone")
     c.add_argument("--gitea-user", default="", dest="gitea_user",

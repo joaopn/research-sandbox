@@ -4201,8 +4201,18 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent) {
                "mirror config to pull the source. RS stores no copy — sent once " +
                "with this create and never logged or persisted.",
     });
+    const devBranchI = el("input", {
+        type: "text", autocomplete: "off", placeholder: "e.g. main",
+        title: "The branch the agent works from: it syncs this branch, branches " +
+               "off it, and targets it with pull requests. Must already exist on " +
+               "the repo.",
+    });
     const devGroup = el("div", { class: "mgmt-docker-group" }, [
         el("div", { class: "field" }, [el("label", {}, ["GitHub repo (https)"]), devUrlI]),
+        el("div", { class: "field" }, [
+            el("label", { title: devBranchI.getAttribute("title") }, ["Branch"]),
+            devBranchI,
+        ]),
         el("div", { class: "field" }, [
             el("label", { title: devPatI.getAttribute("title") }, ["GitHub PAT (secret)"]),
             devPatI,
@@ -4256,6 +4266,12 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent) {
             if (isDev && !devUrlI.value.trim().startsWith("https://github.com/")) {
                 return "A dev project needs a GitHub repo URL (https://github.com/owner/repo).";
             }
+            // Branch is REQUIRED in the webui (the CLI may omit it and take the
+            // repo default). Client-side only: an omitted branch is a valid
+            // server-side state, so this is an affordance, not a gate.
+            if (isDev && !devBranchI.value.trim()) {
+                return "A dev project needs a branch for the agent to work from.";
+            }
             // Mirror from_kwargs: an in-box repo needs a ref (pin the clone).
             if (showInBox && cloneCb.checked && repoI.value.trim() && !refI.value.trim()) {
                 return "A workflow repo requires a ref.";
@@ -4293,6 +4309,8 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent) {
                     name: nameI.value.trim(),
                     workflow: workflow,
                     url: devUrlI.value.trim(),
+                    // Unconditional — the validator above guarantees non-empty.
+                    branch: devBranchI.value.trim(),
                     egress: egressS.value,
                     // A dev project has no worker layer, so modelPayload() yields
                     // supervisor_* only — exactly the pair in
@@ -4889,8 +4907,18 @@ async function mgmtBoxAddDialog(project) {
                                   placeholder: "https://github.com/owner/repo" });
     const devPatI = el("input", { type: "password", autocomplete: "off",
                                   placeholder: "private repos only" });
+    const devBranchI = el("input", {
+        type: "text", autocomplete: "off", placeholder: "e.g. main",
+        title: "The branch the agent works from: it syncs this branch, branches " +
+               "off it, and targets it with pull requests. Must already exist on " +
+               "the repo.",
+    });
     const devGroup = el("div", { class: "mgmt-docker-group" }, [
         el("div", { class: "field" }, [el("label", {}, ["GitHub repo (https)"]), devUrlI]),
+        el("div", { class: "field" }, [
+            el("label", { title: devBranchI.getAttribute("title") }, ["Branch"]),
+            devBranchI,
+        ]),
         el("div", { class: "field" }, [el("label", {}, ["GitHub PAT (optional)"]), devPatI]),
         el("div", { class: "hint" },
            ["Mirrored + forked into the shared Gitea; the agent's fork is " +
@@ -5001,6 +5029,12 @@ async function mgmtBoxAddDialog(project) {
                     && !devUrlI.value.trim().startsWith("https://github.com/")) {
                 return "A dev box needs a GitHub repo URL (https://github.com/owner/repo).";
             }
+            // Branch is REQUIRED in the webui (the in-supervisor CLI may omit it
+            // and take the repo default). Client-side only: an omitted branch is
+            // a valid server-side state, so this is an affordance, not a gate.
+            if (selectedPreset.dev && !devBranchI.value.trim()) {
+                return "A dev box needs a branch for the agent to work from.";
+            }
             return null;
         },
         // The dev preset runs on the broker's DETACHED dev-box lane: no
@@ -5017,6 +5051,8 @@ async function mgmtBoxAddDialog(project) {
                     url: devUrlI.value.trim(),
                     pat: devPatI.value.trim(),
                     editor: editorCb.checked,
+                    // Unconditional — the validator above guarantees non-empty.
+                    branch: devBranchI.value.trim(),
                 };
                 if (agentS.value) payload.agent = agentS.value;
                 // The dev preset posts to a DIFFERENT route (the detached

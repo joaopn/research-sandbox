@@ -8,25 +8,40 @@ Read the issue conversation below, decide what to do next, and act.
 
 ## Git workflow
 
+### Your base branch
+
+Your base branch is `$GITEA_BRANCH` (already set in your environment). That is the
+branch you sync, start new work from, and target with pull requests. The
+maintainer can point you at a different one at any time — if they ask, use the
+branch they name from then on.
+
 ### Syncing the base branch before starting work
 
 You own your fork (`origin`). The maintainer may merge PRs on it or push changes
-to GitHub (reflected in `upstream`). Always sync the repo's default branch (the
-base branch) from **both** before branching.
+to GitHub (reflected in `upstream`). Always sync from **both** before branching.
 
 ```bash
-git checkout <base-branch>
-git pull origin <base-branch>
+git checkout "$GITEA_BRANCH"
+git pull origin "$GITEA_BRANCH"
 git fetch upstream
-git merge upstream/<base-branch>
-git push origin <base-branch>
+git merge upstream/"$GITEA_BRANCH"
+git push origin "$GITEA_BRANCH"
 ```
+
+If that merge fast-forwards cleanly, carry on. If it does **not** — conflicts, or
+upstream moved in a way that will not simply replay — STOP: `git merge --abort`,
+comment on the issue describing what diverged, and wait for the maintainer. Never
+`reset --hard`, force-push, or rebase your base branch to clear the problem: your
+own merged work may live there, and discarding it can lose commits the maintainer
+has not collected yet.
 
 ### Branches
 
 - One branch per issue: `agent/{short-description}`
 - Commit often, push when a chunk of work is complete
-- Do not create branches without the `agent/` prefix (except the base branch)
+- The `agent/` prefix is a naming convention that keeps in-progress work easy to
+  spot, not a restriction — you may check out and work on any existing branch,
+  and you merge your finished work into your base branch once it is approved
 
 ## Gitea API
 
@@ -34,6 +49,7 @@ Use curl to interact with Gitea. Environment variables are already set:
 - `$GITEA_URL` — Gitea base URL
 - `$GITEA_TOKEN` — your API token
 - `$GITEA_USER` / `$REPO_NAME` — your repo coordinates
+- `$GITEA_BRANCH` — your base branch
 
 ### Comment on an issue
 
@@ -68,15 +84,36 @@ curl -s -X POST \
 
 ### Create a pull request
 
+Build the body with `jq` — a single-quoted `-d '{...}'` would NOT expand
+`$GITEA_BRANCH`, and jq also escapes newlines in the description correctly:
+
 ```bash
 curl -s -X POST \
   -H "Authorization: token $GITEA_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"title":"PR title","head":"agent/branch-name","base":"<base-branch>","body":"Fixes #ISSUE_NUMBER\n\nDescription here."}' \
+  -d "$(jq -n --arg head "agent/branch-name" --arg base "$GITEA_BRANCH" \
+           --arg title "PR title" \
+           --arg body "Fixes #ISSUE_NUMBER"$'\n\n'"Description here." \
+           '{title: $title, head: $head, base: $base, body: $body}')" \
   "$GITEA_URL/api/v1/repos/$GITEA_USER/$REPO_NAME/pulls"
 ```
 
 ### Merge a pull request
+
+**First check whether the base branch has moved.** Your view of GitHub comes from
+the `upstream` mirror, which refreshes periodically, so fetch it right before
+checking:
+
+```bash
+git fetch upstream
+git merge-base --is-ancestor upstream/"$GITEA_BRANCH" "$GITEA_BRANCH"
+```
+
+A non-zero exit means upstream has moved ahead of your base branch. **STOP.** Do
+not rebase, do not force-push, do not merge. Comment on the issue saying the base
+branch has moved and ask the maintainer how to proceed, then wait.
+
+If it exits zero, merge:
 
 ```bash
 curl -s -X POST \
@@ -86,12 +123,10 @@ curl -s -X POST \
   "$GITEA_URL/api/v1/repos/$GITEA_USER/$REPO_NAME/pulls/PR_NUMBER/merge"
 ```
 
-Always merge fast-forward-only. If gitea refuses the merge (HTTP 405 — your
-branch is behind the base), rebase your branch onto the base branch,
-force-push it to your fork, and retry the same merge call. Never fall back to
-the plain "merge" style: your fork refuses merge-commit merges by policy, so
-that refusal is expected behavior, not breakage — a linear history is what
-lets the maintainer land your commits individually.
+Always merge fast-forward-only — your fork refuses merge-commit and squash styles
+by policy, and a linear history is what lets the maintainer land your commits
+individually. If gitea still refuses (HTTP 405), STOP and report that in a
+comment. Do not work around the refusal.
 
 ### Add labels to an issue
 

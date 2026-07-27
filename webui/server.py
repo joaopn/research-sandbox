@@ -918,7 +918,7 @@ async def broker_box_add_handler(request: web.Request) -> web.Response:
             "editor": bool(body.get("editor")),
             "fetch": bool(body.get("fetch")), "mcps": body.get("mcps"),
             "repo": body.get("repo"), "ref": body.get("ref"),
-            "setup": body.get("setup"),
+            "setup": body.get("setup"), "branch": body.get("branch"),
             "model": body.get("model"), "effort": body.get("effort")}
     return await _start_op(request, "box_add", args, BROKER_OP_TIMEOUT_S,
                            op_seed=project)
@@ -1249,7 +1249,7 @@ async def broker_dev_box_handler(request: web.Request) -> web.Response:
     # box_add's route).
     args = {"project": project, "url": body.get("url"), "pat": body.get("pat"),
             "name": body.get("name"), "agent": body.get("agent"),
-            "editor": bool(body.get("editor")),
+            "editor": bool(body.get("editor")), "branch": body.get("branch"),
             "model": body.get("model"), "effort": body.get("effort")}
     op_id = _mint_op_id(project, "dev-box")
     try:
@@ -1306,6 +1306,7 @@ async def broker_dev_project_handler(request: web.Request) -> web.Response:
     # the dev card carries the supervisor pair only.
     args = {"name": name, "workflow": body.get("workflow"),
             "url": body.get("url"), "pat": body.get("pat"),
+            "branch": body.get("branch"),
             "egress": body.get("egress"), "enable": body.get("enable"),
             "disable": body.get("disable"),
             "supervisor_model": body.get("supervisor_model"),

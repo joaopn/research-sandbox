@@ -723,6 +723,11 @@ class CreateRequest:
     # never a raw relayed create.
     dev_lane: bool = False
     dev_repo: str = ""
+    # The base branch the project's agent works. "" ⇒ the host resolves the
+    # mirror's default at create (_resolve_dev_branch) — the resolved CONCRETE
+    # name is what reaches the clone and the agent's CLAUDE.md, never "".
+    # Out of CREATE_WEBUI_FIELDS for the same reason as dev_repo.
+    dev_branch: str = ""
     # Opt-in rs-fetch surface (ANY non-dev workflow — from_kwargs refuses only
     # the dev workflow, whose supervisor is the working agent's own container).
     # When set, create() stages the read-only fetch tool + operator token +
@@ -901,6 +906,16 @@ class CreateRequest:
         elif dev_repo:
             raise ValidationError(
                 "--dev-repo is only valid with a dev workflow (e.g. --workflow dev)")
+        # Base branch: SHAPE only here (from_kwargs stays network-free); the
+        # live existence check + the ""-means-repo-default resolution happen in
+        # create() via _resolve_dev_branch, pre-side-effect.
+        dev_branch = (kw.get("dev_branch") or "").strip()
+        if dev_branch and not dev_lane:
+            raise ValidationError(
+                "--dev-branch is only valid with a dev workflow "
+                "(e.g. --workflow dev)")
+        if dev_branch and not _valid_branch_name(dev_branch):
+            raise ValidationError(f"invalid branch name {dev_branch!r}")
         # Agent dists (STAGE_MULTI_AGENT): an enable-SET. Each must be a known agent,
         # and on the docker substrate each must already be pulled. EXPLICIT vs UNSET
         # is load-bearing: an UNSET selection (CLI without --agent/--no-agents, a
@@ -1053,6 +1068,7 @@ class CreateRequest:
             greeting=greeting,
             dev_lane=dev_lane,
             dev_repo=dev_repo,
+            dev_branch=dev_branch,
             fetch=fetch,
             supervisor_model=sup_m, supervisor_effort=sup_e,
             worker_model=wrk_m, worker_effort=wrk_e,
@@ -1295,6 +1311,11 @@ class BoxAddRequest:
     repo: str = ""
     ref: str = ""
     setup: str = ""
+    # Base branch for a DEV box ("" ⇒ box_add resolves the mirror's default).
+    # Distinct from `ref` on purpose: `ref` pins a byo clone to any commit-ish
+    # (a tag/sha ⇒ detached HEAD), while a dev box must sit on a real branch it
+    # can commit to and push. Rejected on non-dev presets in box_add.
+    branch: str = ""
     # Agent model + effort for THIS box (STAGE_MODEL_SELECT). "" = not specified ⇒
     # the project's `box` default (resolved in box_add, which has the marker). A
     # box carries its OWN pair rather than inheriting the supervisor's — that is
@@ -1340,10 +1361,16 @@ class BoxAddRequest:
         # (STAGE_BOX_EXT_UX D-B). Overrides an explicit agent="none".
         if mcps:
             agent = "claude"
-        for fld in ("repo", "ref", "setup"):
+        for fld in ("repo", "ref", "setup", "branch"):
             v = kw.get(fld)
             if v is not None and not isinstance(v, str):
                 raise ValidationError(f"{fld} must be a string")
+        # The loop above is a TYPE check only; the branch also needs its shape
+        # gate (preset-legality + existence stay in box_add, which has the
+        # catalog and gitea).
+        branch = (kw.get("branch") or "").strip()
+        if branch and not _valid_branch_name(branch):
+            raise ValidationError(f"invalid branch name {branch!r}")
         # Agent model + effort (STAGE_MODEL_SELECT). Validate ONLY what the caller
         # explicitly supplied — no defaulting here. The fallback to the project's
         # `box` default needs the project's marker, which this context-free
@@ -1355,7 +1382,7 @@ class BoxAddRequest:
             agent=agent, editor=bool(kw.get("editor", False)),
             mcps=tuple(mcps), repo=(kw.get("repo") or "").strip(),
             ref=(kw.get("ref") or "").strip(), setup=(kw.get("setup") or ""),
-            model=_model, effort=_effort,
+            branch=branch, model=_model, effort=_effort,
             fetch=bool(kw.get("fetch", False)))
 
 
@@ -1557,6 +1584,36 @@ def _valid_dev_repo_name(repo: Any) -> bool:
     Dev*Request validators carry."""
     return (isinstance(repo, str) and bool(repo) and repo not in (".", "..")
             and "/" not in repo and "\\" not in repo)
+
+
+# Git branch-name shape. ALLOWLIST charset + the structural rules git's own
+# check-ref-format enforces, so nothing that survives can need escaping anywhere
+# downstream: the value reaches a gitea API path, a `docker exec ... --branch
+# <v>` argv (hence the leading-alnum anchor, which is what rejects a leading
+# '-'), a shlex.quote'd sh -c script, a container env var, and a whitespace-
+# split staged field (rs-repo-watch's `read -r`, which is why no whitespace is
+# load-bearing rather than merely tidy).
+_BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+# Refs land at .git/refs/heads/<name>; 255 is the ext4 per-component limit, so a
+# longer name cannot be stored as a loose ref at all. Not an invented bound.
+_BRANCH_NAME_MAX = 255
+
+
+def _valid_branch_name(branch: Any) -> bool:
+    """Shape only — existence is a live gitea question (_resolve_dev_branch)."""
+    return (isinstance(branch, str) and bool(branch)
+            and len(branch) <= _BRANCH_NAME_MAX
+            and bool(_BRANCH_NAME_RE.match(branch))
+            and ".." not in branch and "//" not in branch
+            and not branch.endswith(("/", ".", ".lock")))
+
+
+# The placeholder the dev instructions carry for the container's base branch.
+# Substituted HOST-side at both CLAUDE.md write points (_run_dev_clone here and
+# rs_sandbox._stage_box_workspace), so no template token ever reaches an agent.
+# MIRROR-PAIR LOCKSTEP with cli/rs_sandbox.py's BASE_BRANCH_TOKEN — rs_sandbox is
+# streamed into the supervisor as a standalone file and cannot import rscore.
+BASE_BRANCH_TOKEN = "{{BASE_BRANCH}}"
 
 
 # Gitea username shape (AlphaDashDot + the 40-char cap gitea enforces) — the
@@ -1888,6 +1945,7 @@ class DevBoxProvisionRequest:
     name: str | None = None                     # box name (None ⇒ derived from repo HERE)
     agent: str | None = None                    # claude | none | None (preset default)
     editor: bool = False
+    branch: str = ""                            # base branch ("" ⇒ the repo's default)
     model: str = ""                             # agent model for the box ("" ⇒ project's box default)
     effort: str = ""
 
@@ -1925,10 +1983,12 @@ class DevBoxProvisionRequest:
         box = BoxAddRequest.from_kwargs(
             project=kw.get("project"), name=name, preset="dev",
             agent=kw.get("agent"), editor=kw.get("editor"), repo=repo,
+            branch=kw.get("branch"),
             model=kw.get("model"), effort=kw.get("effort"))
         return cls(project=box.project, url=url, repo=repo,
                    pat=(pat or "").strip(), name=box.name, agent=box.agent,
-                   editor=box.editor, model=box.model, effort=box.effort)
+                   editor=box.editor, branch=box.branch,
+                   model=box.model, effort=box.effort)
 
 
 @dataclass(frozen=True)
@@ -1948,6 +2008,7 @@ class DevProjectProvisionRequest:
     repo: str                                   # the anchored segment (derived)
     workflow: str = "dev"
     pat: str = field(default="", repr=False)
+    branch: str = ""                            # base branch ("" ⇒ the repo's default)
     egress: str | None = None
     enable: tuple = ()
     disable: tuple = ()
@@ -1988,12 +2049,13 @@ class DevProjectProvisionRequest:
         # what the child re-derives from.
         cr = CreateRequest.from_kwargs(
             name=kw.get("name"), workflow=workflow, dev_repo=repo,
+            dev_branch=kw.get("branch"),
             egress=egress, enable=enable, disable=disable,
             supervisor_model=kw.get("supervisor_model"),
             supervisor_effort=kw.get("supervisor_effort"),
             dev_repo_preflight=False)
         return cls(name=cr.name, url=url, repo=repo, workflow=workflow,
-                   pat=(pat or "").strip(), egress=egress,
+                   pat=(pat or "").strip(), branch=cr.dev_branch, egress=egress,
                    enable=enable, disable=disable,
                    supervisor_model=cr.supervisor_model,
                    supervisor_effort=cr.supervisor_effort)
@@ -2267,6 +2329,17 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
                 "stay distinct.")
         data_basenames[base] = p
         extra_mounts += ["-v", f"{p}:/workspace/shared/data/{base}:ro"]
+
+    # Dev lane: resolve the base branch to a CONCRETE name BEFORE any side
+    # effect. It has to be concrete because the clone and the agent's CLAUDE.md
+    # both name it, and a bad branch (or an empty repo) must refuse here rather
+    # than ~270 lines in, where the dev step runs and would leave a half-created
+    # project. Deliberate consequence: on a dev create a stopped gitea is now
+    # RESUMED — and a never-enabled one dies with the enable remedy — before the
+    # line below. Non-dev creates are untouched.
+    effective_dev_branch = ""
+    if req.dev_repo:
+        effective_dev_branch = _resolve_dev_branch(req.dev_repo, req.dev_branch)
 
     print(f"=== Creating project: {project} ===")
     ssh_port = req.ssh_port or find_free_port()
@@ -2558,10 +2631,12 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
                     # GiteaError would escape dispatch into socketserver.
                     die(f"could not provision the project's dev identity: {e}")
                 gitea.record_attachment(project, "agent", req.dev_repo,
-                                        gitea_ip, box=None, user=dev_user)
+                                        gitea_ip, box=None, user=dev_user,
+                                        branch=effective_dev_branch)
                 _stage_dev_gitea(project, cfg, gitea_ip=gitea_ip)
                 clone_dir = _run_dev_clone(container_name, req.dev_repo,
-                                           dev_user, progress)
+                                           dev_user, effective_dev_branch,
+                                           progress)
         else:
             stage_worker_image(container_name, ANALYSIS_IMAGE)
             # Stage the agent dist into the supervisor (its own ~/.local + the
@@ -6584,9 +6659,15 @@ def wire_gitea_to_projects() -> None:
             continue
         # Refresh gitea_ip on every entry of this project (the IP can change
         # across a disconnect/reconnect).
+        # record_attachment REPLACES on the key, so every field this loop does
+        # not forward is BLANKED. `branch` needs the same preserve-guard `user`
+        # already has: without it one `research start` wipes the operator's
+        # chosen branch off every entry, and the next supervisor recreate stages
+        # a branch-less row.
         for e in gitea.project_entries(project):
             gitea.record_attachment(project, e["class"], e.get("repo"), ip,
-                                    box=e.get("box"), user=e.get("user") or "")
+                                    box=e.get("box"), user=e.get("user") or "",
+                                    branch=e.get("branch") or "")
         # Project-side wiring: the non-secret file + agent tokens ride the
         # record; the fetch surface is OPT-IN now (universal staging RETIRED) —
         # re-stage the supervisor halves only for a project carrying rs-fetch
@@ -6611,15 +6692,16 @@ def _stage_dev_gitea(project: str, cfg: "Config", gitea_ip: str = "") -> None:
     secrecy:
 
       * ``<ws>/.orchestrator/dev-gitea.json`` — NON-secret ``{gitea_ip, repos:
-        [{repo, user, agent_user, token_file}]}``, host-written into the
+        [{repo, user, agent_user, branch, token_file}]}``, host-written into the
         bind-mounted workspace (atomic tmp+rename; the parent dir is the
         mount, no inode pin). The webui's RO /projects mount can read this
         file, so a token must NEVER enter it — the writer only handles
         ip/name fields by construction. Rows are REPO-level: ``user`` is the
         repo's ACTIVE fork owner (what rs-fetch reads), ``agent_user`` /
-        ``token_file`` are the PROJECT consumer's identity (empty when the
-        project's own agent doesn't work the repo — box entries never mint
-        those fields). Written for ANY wired project (``repos`` may be
+        ``branch`` / ``token_file`` are the PROJECT consumer's identity + base
+        branch (empty when the project's own agent doesn't work the repo — box
+        entries never mint those fields; rs-repo-watch filters to the
+        agent_user-bearing row). Written for ANY wired project (``repos`` may be
         ``[]``): the ``gitea_ip`` is load-bearing for the universal box
         ``--add-host`` injection, not just for dev boxes.
       * every project CONSUMER's token (the project's own + each dev box's),
@@ -6673,8 +6755,14 @@ def _stage_dev_gitea(project: str, cfg: "Config", gitea_ip: str = "") -> None:
             if not active:
                 active = proj_user or next((e.get("user") for e in repo_entries
                                             if e.get("user")), "")
+            # The PROJECT consumer's base branch, derived exactly like proj_user
+            # above (box entries are OTHER containers' wiring). rs-repo-watch
+            # reads it off the agent_user-bearing row and exports GITEA_BRANCH.
+            proj_branch = next((e.get("branch") for e in repo_entries
+                                if e.get("box") is None and e.get("branch")), "")
             rows.append({"repo": repo, "user": active,
                          "agent_user": proj_user,
+                         "branch": proj_branch,
                          "token_file": f"{proj_user}.token" if proj_user else ""})
         payload = {"gitea_ip": ip, "repos": rows}
         payload_path.parent.mkdir(parents=True, exist_ok=True)
@@ -6968,7 +7056,54 @@ def _restart_dev_boxes(project: str, cfg: "Config", gitea_ip: str) -> None:
             print(f"dev/fetch box {name!r} re-run against the new gitea address")
 
 
-def _run_dev_clone(container: str, repo: str, user: str, progress) -> str:
+def _resolve_dev_branch(repo: str, branch: str) -> str:
+    """Resolve a dev container's base branch to a CONCRETE name, pre-side-effect.
+
+    ONE home for the resolution and all four refusals — box_add and create both
+    call this and must refuse identically; a second copy is where they drift.
+    Returns the caller's branch (validated to exist) or the mirror's default.
+
+    Every arm raises ValidationError, so the browser gets a clean envelope and
+    the CLI a clean die. GiteaError text is safe to surface: it carries only
+    method/path/status, never a body. No message names a CLI verb."""
+    # The reads below need gitea RUNNING. Enabled-but-stopped is a routine state
+    # (any host reboot leaves it there), and the pure-file mirror_present stamp
+    # the callers check beside this is NOT a liveness signal. Idempotent with
+    # the callers' own later resume.
+    _resume_gitea(require=True)
+    hp = _gitea_host_port()
+    try:
+        state = gitea.mirror_state(hp, repo)
+    except gitea.GiteaError as e:
+        raise ValidationError(f"could not read {repo!r} from Gitea: {e}")
+    # ORDER IS LOAD-BEARING: an empty repo has no branches at all and 404s the
+    # branch route, so checking it AFTER the branch query would report "no such
+    # branch" for a repo whose real problem is that it has no commits.
+    if state["empty"]:
+        raise ValidationError(
+            f"repo {repo!r} has no commits yet — push an initial commit to "
+            f"GitHub and retry (a dev container starts from a branch of your "
+            f"existing work)")
+    if branch:
+        try:
+            found = gitea.mirror_has_branch(hp, repo, branch)
+        except gitea.GiteaError as e:
+            raise ValidationError(
+                f"could not verify branch {branch!r} against Gitea: {e}")
+        if not found:
+            raise ValidationError(
+                f"branch {branch!r} does not exist in {repo!r}")
+        return branch
+    default = state["default_branch"]
+    if not default:
+        raise ValidationError(
+            f"could not determine the default branch of {repo!r}; name a "
+            f"branch explicitly")
+    return default
+
+
+def _run_dev_clone(container: str, repo: str, user: str, branch: str,
+                   progress) -> str:
     """Clone the agent fork into the supervisor workspace (the dev workflow's
     create-time step, STAGE_DEV_GITEA S2): credential-helper store +
     clone-if-absent + the read-only mirror as ``upstream`` — the same contract
@@ -6979,8 +7114,9 @@ def _run_dev_clone(container: str, repo: str, user: str, progress) -> str:
     carries NO token (the helper file supplies auth); failures raise
     HarnessError with the token literal scrubbed (via _light_exec). Also stages
     the dev instructions as /workspace/CLAUDE.md, no-clobber — the same text
-    the dev box preset stages, from boxes/dev.instructions.md. Returns the
-    clone dir."""
+    the dev box preset stages, from boxes/dev.instructions.md, with the base
+    branch substituted in. ``branch`` is the CONCRETE name the host already
+    resolved (_resolve_dev_branch) — never empty. Returns the clone dir."""
     token = gitea.consumer_token_path(user).read_text().strip()
     if not token:
         die(f"consumer token file for {user!r} is empty; re-run the attach")
@@ -6998,8 +7134,16 @@ def _run_dev_clone(container: str, repo: str, user: str, progress) -> str:
     q = shlex.quote
     script = (
         "git config --global credential.helper store && "
+        # The clone carries TWO remotes (origin=fork, upstream=mirror) holding
+        # the same branch names, which makes `git checkout <branch>` ambiguous
+        # for every branch but the cloned one ("matched multiple (2) remote
+        # tracking branches"). defaultRemote restores the DWIM against the
+        # fork. --global is correct, not sloppy: one repo per container is a
+        # structural invariant, so there is nothing else here to affect.
+        "git config --global checkout.defaultRemote origin && "
         f"if [ ! -d {q(workdir)}/.git ]; then rm -rf {q(workdir)} && "
-        f"git clone {q(base + '/' + user + '/' + repo + '.git')} {q(workdir)}; fi && "
+        f"git clone --branch {q(branch)} "
+        f"{q(base + '/' + user + '/' + repo + '.git')} {q(workdir)}; fi && "
         f"cd {q(workdir)} && "
         "(git remote get-url upstream >/dev/null 2>&1 || "
         f"git remote add upstream {q(base + '/' + gitea.ADMIN_USER + '/' + repo + '.git')}) && "
@@ -7010,9 +7154,15 @@ def _run_dev_clone(container: str, repo: str, user: str, progress) -> str:
     _light_exec(container, script, step="dev fork clone", github_pat=token)
     instr = box_catalog.BUILTIN_DIR / "dev.instructions.md"
     if instr.is_file():
+        # WIRE the base branch into the agent's own instructions: the host holds
+        # the text here, so substitute the resolved name before it ever reaches
+        # the container — no template token can survive to the agent. (The box
+        # twin is rs_sandbox._stage_box_workspace; repo-watch-prompt.md is
+        # image-baked and read verbatim, so it uses $GITEA_BRANCH instead.)
+        text = instr.read_text().replace(BASE_BRANCH_TOKEN, branch)
         run(["docker", "exec", "-i", "-u", "research", container, "sh", "-c",
              '[ -e /workspace/CLAUDE.md ] || cat > /workspace/CLAUDE.md'],
-            input=instr.read_text(), capture_output=True)
+            input=text, capture_output=True)
     return workdir
 
 
@@ -8341,7 +8491,13 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     # `repo` carries NAME semantics here (an attached gitea repo), not the byo
     # clone URL; ref/setup/mcps are rejected — the dev clone is the authed gitea
     # lane, and the box's dedicated bridge has no path to mcp-proxy.
-    if catalog.get(req.preset, {}).get("dev"):
+    is_dev_preset = bool(catalog.get(req.preset, {}).get("dev"))
+    if req.branch and not is_dev_preset:
+        raise ValidationError(
+            "branch is only valid for a dev box; a byo box pins its clone with "
+            "'ref' (which also accepts a tag or commit)")
+    effective_branch = ""
+    if is_dev_preset:
         if req.mcps:
             raise ValidationError(
                 "a dev box cannot take MCPs (its dedicated bridge has no path "
@@ -8368,6 +8524,12 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
             raise ValidationError(
                 "a dev box requires an explicit name (its gitea identity is "
                 "minted from <project>.<name> before the box runs)")
+        # Base branch: resolve to a CONCRETE name here — the box's clone AND its
+        # CLAUDE.md both need a real name, and a bad one must refuse BEFORE any
+        # harness/image work below (byo's nonexistent-ref crash-loop is the
+        # failure mode this exists to avoid). Needs the mirror, which the stamp
+        # floor above just established.
+        effective_branch = _resolve_dev_branch(req.repo, req.branch)
     # Fail-early rs-fetch floor (the dev-lane bootstrap_present precedent): an
     # explicit fetch ask on a host whose dev lane was never enabled refuses
     # BEFORE any harness/image/editor work below — and AFTER the dev-preset
@@ -8423,7 +8585,8 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         except gitea.GiteaError as e:
             raise ValidationError(str(e))
         gitea.record_attachment(req.project, "agent", req.repo, ip,
-                                box=req.name, user=box_user)
+                                box=req.name, user=box_user,
+                                branch=effective_branch)
         _stage_dev_gitea(req.project, cfg, gitea_ip=ip)
     # Opt-in rs-fetch wiring (host side): resume gitea (the authority behind
     # the bootstrap floor above), connect it to this project's network, ensure
@@ -8485,6 +8648,10 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         argv += ["--ref", req.ref]
     if req.setup:
         argv += ["--setup", req.setup]
+    # Always concrete for a dev box (resolved above); empty for every other
+    # preset, where the flag is rejected at both gates.
+    if effective_branch:
+        argv += ["--branch", effective_branch]
     if box_user:
         argv += ["--gitea-user", box_user]
     progress.step("create-box", "creating the box")
@@ -8892,8 +9059,21 @@ def dev_attach(req: "DevAttachRequest", _progress=None) -> DevAttachResult:  # t
         gitea.provision_consumer(_gitea_host_port(), req.repo, dev_user)
     except gitea.GiteaError as e:
         raise ValidationError(str(e))
+    # PRESERVE the recorded branch. record_attachment REPLACES on
+    # (project, class, repo, box), and the same-repo re-attach is the ONLY live
+    # path here — the single-repo guard above hard-refuses a different repo — so
+    # this is exactly the entry create recorded. Resolving a fresh default would
+    # silently re-point the agent's prompt at the repo default while its clone
+    # stays on the chosen branch: no error, just wiring that lies. Resolve ONLY
+    # when there is nothing to preserve (a first attach, or a pre-change entry).
+    prior = next((e for e in gitea.project_entries(req.project)
+                  if e.get("class") == "agent" and e.get("repo") == req.repo
+                  and e.get("box") is None), None)
+    branch = (prior or {}).get("branch") or ""
+    if not branch:
+        branch = _resolve_dev_branch(req.repo, "")
     gitea.record_attachment(req.project, "agent", req.repo, ip,
-                            box=None, user=dev_user)
+                            box=None, user=dev_user, branch=branch)
     cfg = load_config()
     _stage_dev_gitea(req.project, cfg, gitea_ip=ip)
     # Unconditional reconcile: change detection lives per-box in
@@ -9159,7 +9339,7 @@ def dev_box_provision(req: "DevBoxProvisionRequest", progress=None) -> dict:  # 
     # PRE-SPAWN (never a post-migrate name failure).
     box = box_add(BoxAddRequest.from_kwargs(
         project=req.project, name=req.name, preset="dev", agent=req.agent,
-        editor=req.editor, repo=req.repo,
+        editor=req.editor, repo=req.repo, branch=req.branch,
         model=req.model, effort=req.effort), progress)
     return {"project": req.project, "repo": req.repo, "box": box.name,
             "container": box.container}
@@ -9187,6 +9367,7 @@ def dev_project_provision(req: "DevProjectProvisionRequest", progress=None) -> d
     dev_repo_add(DevRepoAddRequest.from_kwargs(url=req.url, pat=req.pat))
     cr = CreateRequest.from_kwargs(
         name=req.name, workflow=req.workflow, dev_repo=req.repo,
+        dev_branch=req.branch,
         egress=req.egress, enable=req.enable, disable=req.disable,
         supervisor_model=req.supervisor_model,
         supervisor_effort=req.supervisor_effort)

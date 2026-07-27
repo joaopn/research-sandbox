@@ -12,39 +12,52 @@ Do not add other remotes.
 
 ## Git Workflow
 
+### Your base branch
+
+Your base branch is **`{{BASE_BRANCH}}`**. That is the branch you sync, the branch you start
+new work from, and the branch your pull requests target. The maintainer can point you at a
+different one at any time — if they ask, use the branch they name from then on.
+
 ### Syncing the base branch
 
-Sync the repo's default branch (the base branch) from **both** remotes before starting new
-work. The maintainer may have merged PRs on your fork (`origin`) or pushed changes to GitHub
-(`upstream`).
+Sync it from **both** remotes before starting new work. The maintainer may have merged PRs on
+your fork (`origin`) or pushed changes to GitHub (`upstream`).
 
 ```bash
-git checkout <base-branch>
-git pull origin <base-branch>            # Get PRs the maintainer merged on your fork
+git checkout {{BASE_BRANCH}}
+git pull origin {{BASE_BRANCH}}            # Get PRs the maintainer merged on your fork
 git fetch upstream
-git merge upstream/<base-branch>         # Get changes from the real GitHub repo
-git push origin <base-branch>            # Keep your fork up to date
+git merge upstream/{{BASE_BRANCH}}         # Get changes from the real GitHub repo
+git push origin {{BASE_BRANCH}}            # Keep your fork up to date
 ```
 
-### Conflict resolution: origin vs upstream
+If that merge fast-forwards cleanly, carry on — nothing was overwritten and there is nothing
+to decide.
 
-If merging upstream produces conflicts, **upstream wins** — it mirrors the real GitHub repo
-and is the maintainer's final word.
+### When upstream has diverged: STOP and ask
+
+If the merge does **not** fast-forward — conflicts, or `upstream/{{BASE_BRANCH}}` has moved in
+a way that does not simply replay on top of your base — stop and ask the maintainer.
 
 ```bash
 git merge --abort
-git reset --hard upstream/<base-branch>
-git push origin <base-branch> --force
 ```
 
-This is safe because your work lives on `agent/*` branches, never on the base branch; the
-only thing lost is the fork's base-branch pointer, not any branch or commit. After resetting,
-continue normally: `git checkout -b agent/my-feature`.
+Then comment on the issue saying what diverged (which branch, roughly what changed) and wait
+for the maintainer to tell you how to proceed.
+
+**Never resolve this on your own.** Do not `reset --hard`, do not force-push, do not rebase
+your base branch to make the problem go away. Your own merged work may live on this branch,
+and discarding it can destroy work the maintainer has not collected yet. Waiting costs
+nothing; guessing can lose commits.
 
 ### Branches
 
-- **Use the `agent/` prefix** for feature branches: `agent/add-auth`, `agent/fix-parser`.
-- **Do not create branches without the `agent/` prefix** (except the base branch).
+- **Use the `agent/` prefix** for new feature branches: `agent/add-auth`, `agent/fix-parser`.
+  This is a naming convention that keeps your in-progress work easy to spot — not a
+  restriction.
+- **You may check out and work on any existing branch** in the repo.
+- **Merge your finished work into your base branch** once a pull request is approved.
 - **Commit often locally**, with small commits and clear messages.
 - **Push when you finish a logical chunk of work** — a completed task or milestone, before a
   risky operation, or when you want the maintainer to review. The maintainer squash-merges

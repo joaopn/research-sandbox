@@ -50,11 +50,26 @@ repos = [r for r in (data.get("repos") or [])
 if not repos:
     sys.exit("rs-repo-watch: this project's own agent works no repo "
              "(box-only wiring?); run 'research dev attach' first")
+# `or ""` is load-bearing, NOT tidiness: a bare .get("branch") prints the literal
+# string "None" when the key is absent, which is non-empty and would sail past
+# the emptiness guard below — exporting GITEA_BRANCH=None to the agent, whose
+# `git checkout None` then fails inside its own session. The absent-key case is
+# exactly the population the guard exists for (rows staged before the branch
+# field existed).
 print(repos[0]["repo"], repos[0]["agent_user"],
-      repos[0].get("token_file") or repos[0]["agent_user"] + ".token")
+      repos[0].get("token_file") or repos[0]["agent_user"] + ".token",
+      repos[0].get("branch") or "")
 PYEOF
 )"
-    read -r REPO_NAME GITEA_USER TOKEN_BASE <<<"$OUT"
+    read -r REPO_NAME GITEA_USER TOKEN_BASE GITEA_BRANCH <<<"$OUT"
+    # Branch names carry no whitespace (the host-side shape gate enforces it),
+    # which is what makes this word-split safe — same property the three fields
+    # above rely on.
+    if [[ -z "${GITEA_BRANCH:-}" ]]; then
+        echo "rs-repo-watch: no base branch in the staged wiring;" \
+             "recreate the project (it predates the base-branch field)" >&2
+        exit 1
+    fi
     TOKEN_FILE="$HOME/.dev-tokens/${TOKEN_BASE}"
     if [[ ! -s "$TOKEN_FILE" ]]; then
         echo "rs-repo-watch: token missing at $TOKEN_FILE;" \
@@ -67,6 +82,11 @@ else
     : "${GITEA_URL:?GITEA_URL must be set alongside GITEA_TOKEN}"
     : "${GITEA_USER:?GITEA_USER must be set alongside GITEA_TOKEN}"
     : "${REPO_NAME:?REPO_NAME must be set alongside GITEA_TOKEN}"
+    # ${VAR:?} catches unset AND empty. Needed explicitly: nothing in
+    # repo-watch.sh dereferences GITEA_BRANCH (only the AGENT does, running the
+    # prompt's recipes) and `export FOO` does not expand FOO — so `set -u`
+    # catches nothing here, and an unset value would reach the agent silently.
+    : "${GITEA_BRANCH:?GITEA_BRANCH must be set alongside GITEA_TOKEN (recreate the box if it predates the base-branch field)}"
 fi
 REPO_DIR="${REPO_DIR:-/workspace/${REPO_NAME}}"
 
@@ -96,7 +116,7 @@ trap 'rm -f "$LOCK"' EXIT HUP INT TERM
 # derefs GITEA_URL/GITEA_USER at startup, so a missed export is an
 # "unbound variable" death. On the supervisor path these are plain locals,
 # and REPO_DIR is a plain assignment on both paths.
-export GITEA_URL GITEA_TOKEN GITEA_USER REPO_NAME REPO_DIR
+export GITEA_URL GITEA_TOKEN GITEA_USER REPO_NAME REPO_DIR GITEA_BRANCH
 
 # Run as a CHILD, not exec: exec would clear the EXIT trap above and leak the
 # lock. Ctrl+C reaches the child anyway — it is in this foreground process

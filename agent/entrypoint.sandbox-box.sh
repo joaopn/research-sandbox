@@ -79,11 +79,26 @@ if [[ -n "${GITEA_TOKEN:-}" && -n "${GITEA_URL:-}" && -n "${REPO_NAME:-}" ]]; th
     ( umask 077 && printf '%s\n' \
         "${GITEA_URL//:\/\//:\/\/${GITEA_USER}:${GITEA_TOKEN}@}" > ~/.git-credentials )
     git config --global credential.helper store
+    # The clone carries TWO remotes (origin=fork, upstream=mirror) holding the
+    # same branch names, which makes `git checkout <branch>` ambiguous for every
+    # branch but the cloned one ("matched multiple (2) remote tracking
+    # branches"). defaultRemote restores the DWIM against the fork. --global is
+    # correct: one repo per container is a structural invariant.
+    git config --global checkout.defaultRemote origin
     DEV_REPO_DIR="/workspace/${REPO_NAME}"
     if [[ ! -d "${DEV_REPO_DIR}/.git" ]]; then
         echo "sandbox-box[${RS_SANDBOX_NAME}]: cloning fork ${GITEA_USER}/${REPO_NAME}"
         rm -rf "${DEV_REPO_DIR}"
-        git clone "${GITEA_URL}/${GITEA_USER}/${REPO_NAME}.git" "${DEV_REPO_DIR}"
+        # Base branch at FIRST clone only — never re-asserted on a later boot
+        # (the agent owns its fork and may be on any branch by then). The `:-`
+        # form matches this block's own guard above: a bare deref would be an
+        # unbound-variable death on a box created before this field existed.
+        if [[ -n "${GITEA_BRANCH:-}" ]]; then
+            git clone --branch "${GITEA_BRANCH}" \
+                "${GITEA_URL}/${GITEA_USER}/${REPO_NAME}.git" "${DEV_REPO_DIR}"
+        else
+            git clone "${GITEA_URL}/${GITEA_USER}/${REPO_NAME}.git" "${DEV_REPO_DIR}"
+        fi
     fi
     if ! git -C "${DEV_REPO_DIR}" remote get-url upstream >/dev/null 2>&1; then
         git -C "${DEV_REPO_DIR}" remote add upstream \

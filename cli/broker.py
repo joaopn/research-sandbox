@@ -565,6 +565,11 @@ def _verb_destroy(args: dict, progress=None) -> dict:
 # WORKFLOW_TAXONOMY_S4). `browser` is GONE — folded into the websearcher preset.
 BOX_ADD_WEBUI_FIELDS = frozenset({"project", "name", "preset", "agent", "editor",
                                   "fetch", "mcps", "repo", "ref", "setup",
+                                  # Base branch for a DEV box (in-box: it selects
+                                  # which branch of the agent's own fork gets
+                                  # cloned). Rejected on non-dev presets in
+                                  # box_add; resolved + existence-checked there.
+                                  "branch",
                                   # This box's own agent model/effort; unset ⇒ the
                                   # project's `box` default from the marker.
                                   "model", "effort"})
@@ -668,6 +673,10 @@ DEV_COMMITS_WEBUI_FIELDS = frozenset({"repo", "pr", "branch", "page"})
 # args ride stdin), never a durable sink.
 DEV_BOX_WEBUI_FIELDS = frozenset({"project", "url", "pat", "name", "agent",
                                   "editor",
+                                  # The base branch this box's agent works —
+                                  # in-box, and validated against the mirror
+                                  # before the box is created.
+                                  "branch",
                                   # The dev box's agent model/effort. Without these
                                   # the box window's dev preset would have its model
                                   # dropped HERE and again in the verb's kwarg list,
@@ -680,6 +689,10 @@ DEV_BOX_WEBUI_FIELDS = frozenset({"project", "url", "pat", "name", "agent",
 # from (a BYO dev-flagged workflow creates what ITS manifest says); fail-closed
 # in from_kwargs (dev_repo is rejected outside a dev-flagged workflow).
 DEV_PROJECT_WEBUI_FIELDS = frozenset({"name", "workflow", "url", "pat",
+                                      # The base branch the project's agent
+                                      # works; validated against the mirror
+                                      # pre-side-effect in create().
+                                      "branch",
                                       "egress", "enable", "disable",
                                       # A dev project has no worker/role layer, so
                                       # the dev card carries ONE model picker — the
