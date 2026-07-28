@@ -2239,10 +2239,17 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
         + "everything below it as one squash with the messages concatenated.",
     ]);
     noteEl.style.display = "none";
+    // The mirror-boundary note, shown only when the mirror HAS this branch but
+    // its head is not among the loaded rows. A fifth PERSISTENT region, not a
+    // foot message: foot() wipes itself on every load (including every failure
+    // arm), and not a row either — the rows region stays append-only.
+    const divergeEl = el("div", { class: "dev-pr-meta dev-commits-diverge" });
+    divergeEl.style.display = "none";
     const toolsEl = el("div", { class: "dev-commits-tools" });
     toolsEl.style.display = "none";
     panel.appendChild(toolsEl);
     panel.appendChild(rowsEl);
+    panel.appendChild(divergeEl);
     panel.appendChild(footEl);
     panel.appendChild(noteEl);
 
@@ -2254,6 +2261,17 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
     let open = false;
     let inFlight = false;
     let selecting = false;
+    // The mirror's head sha for THIS branch ("" = no counterpart upstream, a
+    // PR locator, or an unverifiable probe — the server collapses all three,
+    // deliberately: a probe failure must never be renderable as a claim), and
+    // whether we have drawn its divider on any loaded page. headSeen is never
+    // reset: if the mirror advances mid-session the divider stays where it is,
+    // which under-reports what has landed — conservative, and it costs at most
+    // an over-fetch that rs-fetch's patch-id walk skips. It clears when the
+    // card re-renders and builds a fresh expander, not on a re-expand (which
+    // does not reload).
+    let mirrorHead = "";
+    let headSeen = false;
     const selected = new Set();          // full shas ticked in select mode
     const loadedOrder = [];              // display order (newest-first)
     // Context for the module-level review-cell renderer + watcher restarts:
@@ -2386,6 +2404,25 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
     };
     updateTools();
 
+    // The mirror-boundary note. Called ONLY after a successful render, so a
+    // failed page leaves the last honest state on screen. Gated on a non-empty
+    // mirrorHead — i.e. on having positively confirmed the mirror carries this
+    // branch — so a probe failure (which the server reports as "") can only
+    // ever produce silence here, never a claim about the fork's state.
+    // `ended` distinguishes "not among what is loaded so far" (more pages
+    // remain) from "not in this branch's history at all" (we walked off the
+    // end); only the second is a statement about the branch.
+    const updateDiverge = (ended) => {
+        if (!mirrorHead || headSeen) {
+            divergeEl.style.display = "none";
+            return;
+        }
+        divergeEl.textContent = ended
+            ? "This branch doesn't contain the mirror's head."
+            : "The mirror's head isn't among the commits loaded so far.";
+        divergeEl.style.display = "";
+    };
+
     // Append one page's rows. Per-commit review verdicts: ledger entries keyed
     // by FULL sha. All verdict strings are MODEL OUTPUT → text nodes only. No
     // stale marker — a commit is immutable. The review UI lives in a stamped
@@ -2396,6 +2433,18 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
     const renderRows = (commits, reviews) => {
         for (const c of commits) {
             if (!c || typeof c !== "object" || !c.sha) continue;
+            // The boundary marker, laid down ABOVE the commit it names: that
+            // commit and everything below it are already in the mirror, so
+            // everything above the line is what the human's repo lacks. AFTER
+            // the malformed-row guard (a null c must not reach .sha) and
+            // before the row it precedes. FULL-sha compare — the row only
+            // DISPLAYS the first 9 characters.
+            if (mirrorHead && c.sha === mirrorHead) {
+                headSeen = true;
+                rowsEl.appendChild(el("div", { class: "dev-commit-divider" }, [
+                    el("span", { class: "dev-pr-meta" }, ["Mirror head"]),
+                ]));
+            }
             loadedOrder.push(c.sha);
             const check = el("input", { type: "checkbox",
                                         class: "dev-commit-check" });
@@ -2468,18 +2517,28 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
         const reviews = (data.result.reviews
                          && typeof data.result.reviews === "object")
             ? data.result.reviews : {};
+        // Past the cursor guard, so a refused page cannot change the marker,
+        // and above the empty-page return, so both updateDiverge call sites
+        // read the same fresh value.
+        mirrorHead = typeof data.result.mirror_head === "string"
+            ? data.result.mirror_head : "";
         if (!commits.length) {
             // has_more is "a FULL page came back", so a history that is an
             // exact multiple of the page size offers one button that fetches
             // an empty page. That is ordinary, not an error — and on page 1 it
             // means the fork genuinely has no commits.
             foot([meta(next === 1 ? "No commits." : "No older commits.")]);
+            // An empty page past the first IS the end of the history — the
+            // other half of the has_more split below. On page 1 nothing is
+            // loaded, so there is nothing to say about a boundary.
+            if (next > 1) updateDiverge(true);
             return;
         }
         renderRows(commits, reviews);
         page = next;
         noteEl.style.display = "";
         toolsEl.style.display = "";
+        updateDiverge(!data.result.has_more);
         foot(data.result.has_more ? [moreBtn(next + 1)] : []);
     }
 

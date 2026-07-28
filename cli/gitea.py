@@ -1141,6 +1141,54 @@ def branch_commits(host_port: str, repo: str, branch: str,
     return _commit_rows(raw, COMMITS_PAGE_SIZE)
 
 
+def mirror_branch_head(host_port: str, repo: str, branch: str) -> str:
+    """The MIRROR's head sha for <branch>, or "" when the mirror has no branch
+    of that name. The Fetch-tab dropdown's boundary marker: everything newer
+    than this sha in the fork's list is work the human's repo does not carry.
+
+    EXACT ON A LINEAR BRANCH, which is what a consumer fork has: FORK_FEATURES
+    bans the merge-commit producers repo-side and the dev instructions merge
+    upstream fast-forward-only, so same-sha implies same transitive ancestry
+    and "this commit and everything below it are in the mirror" holds. Those
+    are PR-merge settings plus instruction, not branch protection — a locally
+    merged commit pushed straight to the base branch would make the marker
+    UNDER-report (rows below it not yet in the mirror). It can never
+    over-report, because a divider is only drawn on an exact sha hit.
+
+    STATUS_TIMEOUT_S, not branch_commits' default API_TIMEOUT_S: this is a
+    decoration on a list that has already loaded, and it must not out-wait the
+    data it decorates.
+
+    404 -> "" (the ordinary "no counterpart upstream" case); every other error
+    RAISES, the branch_exists split — the caller decides how to degrade. The
+    branch is a path segment against gitea's wildcard branches route, so it is
+    quoted with safe='/' (a `feature/foo` name must keep its slash); contrast
+    branch_commits, where the branch is a query VALUE and safe='' is right."""
+    client = GiteaClient(api_base(host_port), read_admin_token())
+    try:
+        resp = client._api(
+            "GET", f"/repos/{ADMIN_USER}/{repo}/branches/"
+                   f"{urllib.parse.quote(branch, safe='/')}",
+            timeout=STATUS_TIMEOUT_S)
+    except GiteaError as e:
+        if e.status == 404:
+            return ""
+        raise
+    # _api returns None on an empty or unparseable body, so the strict guard
+    # (pull_info/mirror_info's shape) is what keeps a malformed 200 inside the
+    # GiteaError channel instead of raising AttributeError past the broker's
+    # catch set — an escape there truncates the reply with no envelope.
+    if not isinstance(resp, dict):
+        raise GiteaError(f"gitea GET branch {ADMIN_USER}/{repo}@{branch} "
+                         f"-> no data")
+    commit = resp.get("commit") or {}
+    # `id` is the PayloadCommit sha field (the same object repo_status reads
+    # `timestamp` off); the `sha` fallback costs one `or` and cannot invent a
+    # wrong divider — an unexpected value simply matches no row — while a
+    # silently-renamed field would otherwise mean "no divider, ever".
+    return commit.get("id") or commit.get("sha") or ""
+
+
 # --- attachment record ------------------------------------------------------
 #
 # The CONSUMER ledger: which agent works which repo. Entries:

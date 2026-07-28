@@ -2178,6 +2178,11 @@ class DevCommitsResult:
                                      # without this the browser cannot tell an
                                      # empty page from the end of history
     reviews: dict                    # {sha: commit ledger entry} — badge data
+    # The MIRROR's head sha for THIS branch — the dropdown's boundary marker.
+    # "" means: no counterpart branch upstream, a PR locator (a PR's commits
+    # are head-not-in-base, so the mirror head can never be among them), or an
+    # unverifiable probe. A decoration: never a gate, never a fetch input.
+    mirror_head: str = ""
 
 
 @dataclass
@@ -9586,7 +9591,13 @@ def dev_commits(req: "DevCommitsRequest", _progress=None) -> DevCommitsResult:  
     no-start guard already performs exactly this check)."""
     if not container_running(gitea.GITEA_CONTAINER):
         return DevCommitsResult(repo=req.repo, commits=[], has_more=False,
-                                page=req.page, running=False, reviews={})
+                                page=req.page, running=False, reviews={},
+                                mirror_head="")
+    # Bound on BOTH legs before the branch: the return below reads it either
+    # way, and an UnboundLocalError on the PR leg is not in dispatch's catch
+    # set — it would escape past the un-wrapped dispatch() call in handle()
+    # and truncate the client's reply with no envelope.
+    mirror_head = ""
     try:
         if req.pr is not None:
             commits, has_more = gitea.pr_commits(
@@ -9594,6 +9605,17 @@ def dev_commits(req: "DevCommitsRequest", _progress=None) -> DevCommitsResult:  
         else:
             commits, has_more = gitea.branch_commits(
                 _gitea_host_port(), req.repo, req.branch, req.page)
+            # The dropdown's boundary marker. Encloses ONLY the probe: a wider
+            # try would leave commits/has_more unbound on the same escape path
+            # AND swallow the failure the outer arm exists to convert. A
+            # missing marker is exactly today's screen, and the over-fetch it
+            # may cost is absorbed by rs-fetch's patch-id walk — so a
+            # decoration must never take down a list that loaded fine.
+            try:
+                mirror_head = gitea.mirror_branch_head(
+                    _gitea_host_port(), req.repo, req.branch)
+            except gitea.GiteaError:
+                mirror_head = ""
     except gitea.GiteaError as e:
         raise ValidationError(str(e))
     # Per-commit review verdicts for the rows' badges: a pure host-file ledger
@@ -9602,7 +9624,8 @@ def dev_commits(req: "DevCommitsRequest", _progress=None) -> DevCommitsResult:  
     # data for its own rows with no extra call.
     return DevCommitsResult(repo=req.repo, commits=commits,
                             has_more=has_more, page=req.page, running=True,
-                            reviews=gitea.load_repo_commit_verdicts(req.repo))
+                            reviews=gitea.load_repo_commit_verdicts(req.repo),
+                            mirror_head=mirror_head)
 
 
 def dev_passwd(req: "DevPasswdRequest", progress=None) -> DevPasswdResult:  # type: ignore[name-defined]

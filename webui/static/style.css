@@ -1358,6 +1358,24 @@ body {
     gap: 8px;
 }
 .dev-commits-note { margin-top: 2px; }
+/* The mirror-boundary marker: a hairline across the commit list with its
+   label in the same faint 12px as the walk note (.dev-pr-meta on the inner
+   span). A row of the rows region, so the panel's column layout carries it;
+   the rules are pseudo-elements so the label stays the only text node. */
+.dev-commit-divider {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.dev-commit-divider::before,
+.dev-commit-divider::after {
+    content: "";
+    flex: 1;
+    border-top: 1px solid var(--border);
+}
+/* Its sibling note (the mirror has this branch, but its head is not among the
+   loaded rows) — spaced like the walk note it sits above. */
+.dev-commits-diverge { margin-top: 2px; }
 /* Bulk-select toolbar + per-row checkboxes: the checkbox column is revealed
    by the panel's .selecting class only (rows are never rebuilt). Not inside
    any .field wrapper, so the .field input/label bleed does not apply; the
