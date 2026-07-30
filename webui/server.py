@@ -1863,6 +1863,17 @@ async def project_services_handler(request: web.Request) -> web.Response:
             if spec is not None:
                 out[f"{services.DEV_FETCH_ID_PREFIX}{repo}"] = spec
 
+    # The PROJECT-WIDE Fetch tab: shown whenever THIS project carries an opt-in
+    # rs-fetch surface, INDEPENDENT of the dev-consumer tabs above (a project can
+    # legitimately have both; their ids cannot collide — see PROJECT_FETCH_ID).
+    # Deliberately outside the tcp_probe block and NOT probe-gated: enabling
+    # rs-fetch is an explicit operator instruction, so this follows the
+    # exported-port rule below, not the inferred-service rule. A stopped gitea or
+    # an unenabled dev lane renders as the pane's OWN empty state (which links to
+    # Development) rather than a tab that silently vanishes.
+    if _project_has_fetch(project):
+        out[services.PROJECT_FETCH_ID] = services.project_fetch_service("Fetch")
+
     # Operator-registered exported ports (STAGE_EXPORTED_PORTS): one http tab per
     # registered port, NOT probe-gated (PI directive). Registering a port is an
     # explicit "wire this port to the webui" instruction — so honor it and show the
@@ -1991,6 +2002,27 @@ def _read_project_marker(project: str) -> dict:
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _project_has_fetch(project: str) -> bool:
+    """True when `project` carries an opt-in rs-fetch surface: the marker's
+    `fetch` key (a project-level --fetch), or any rs-fetch-enabled box entry.
+    Drives the project-wide Fetch tab.
+
+    TOLERANT MIRROR of rscore._project_has_fetch_consumers — the webui image
+    carries no `cli/` (rscore drags in docker/yaml), so NOTHING enforces the pair
+    at import time; review and the bash harness are the only enforcement. Both
+    arms mirror it exactly: the marker test is `is True` (a `"fetch": "yes"`
+    marker must not enable the tab — the host would not stage the surface for
+    it), and the entries test is plain truthiness with NO `kind` filter.
+
+    Tolerance comes for free from the two readers above, which return {}
+    for a missing workspace, a missing file, bad JSON, or a non-dict payload —
+    so an unflagged project can never grow the tab from a corrupt file."""
+    if _read_project_marker(project).get("fetch") is True:
+        return True
+    return any(isinstance(e, dict) and e.get("fetch")
+               for e in _read_project_extensions(project).values())
 
 
 def _read_project_type(project: str) -> str:

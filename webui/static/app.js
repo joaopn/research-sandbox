@@ -2764,14 +2764,21 @@ function renderDevFetchScreen(view, body, result) {
             allRepos: repos,
         }));
     }
-    body.appendChild(el("div", { class: "hint" }, [
+    body.appendChild(devFetchLegend());
+}
+
+// The 📋/▸/auto-commit legend — ONE copy shared by the Development page and
+// the project-wide (fetch-:all) pane so the two cannot drift; the per-repo
+// pane omits it deliberately (one card needs no legend).
+function devFetchLegend() {
+    return el("div", { class: "hint" }, [
         "📋 copies the rs-fetch command — paste it in a fetch-enabled project ",
         "or box terminal. rs-fetch stages the work with the agent's message ",
         "prefilled and never commits unless the card's auto-commit box is ",
         "ticked (then each fetched commit lands locally with the agent's ",
         "original timestamps); ▸ lists a row's commits to fetch them one by ",
         "one.",
-    ]));
+    ]);
 }
 
 // Build ONE dev repo's card — shared by the Development Fetch tab (unscoped)
@@ -2986,22 +2993,46 @@ function buildDevRepoCard(view, body, r, attached, opts) {
     return el("div", { class: "card dev-repo-card" }, rows);
 }
 
-// ---- Per-project Fetch pane (the `fetch-<repo>` tab) -----------------------
-// The Development Fetch page's repo card, repo-scoped (active-fork steered —
-// identical content, coherent copy/review buttons), rendered as a service
-// pane off the token-gated /broker/dev/repo-status relay. Global affordances
-// (Remove, the fork dropdown, Enable Gitea's tailed op) stay on the
-// Development page — the pane links there instead. The transport-vs-verb
-// ladder mirrors renderDevFetchTab, rendering into the pane container (every
-// mgmt render helper takes a bare element), and the 401 arm routes back to
-// THIS renderer so a session expiry never lands a host page inside the pane.
+// ---- Per-project Fetch panes (the `fetch-<repo>` and `fetch-:all` tabs) ----
+// The Development Fetch page's repo cards, rendered as a service pane off the
+// token-gated /broker/dev* relays. Two modes, ONE renderer:
+//   repo given  — the `fetch-<repo>` tab: that repo alone, off /broker/dev/
+//                 repo-status. Active-fork steered, so content is identical to
+//                 the Development page's card for it.
+//   repo null   — the `fetch-:all` tab of an rs-fetch-enabled project: EVERY
+//                 mirrored repo, off /broker/dev. All-mirrors because an
+//                 rs-fetch consumer can pull any mirror, and the mirror list is
+//                 host-side (not on the webui's /projects:ro mount), so the repo
+//                 set can only be resolved here, at open time.
+// Sharing the renderer is safe because the ROW SHAPE is identical in both
+// modes: dev_status and dev_repo_status each build a row from the same
+// gitea.repo_status(...) + row["reviews"] = load_repo_verdicts(...) pair
+// (cli/rscore.py dev_status / dev_repo_status), so buildDevRepoCard needs no
+// per-mode branching. The ATTACHMENTS are the one thing that genuinely differs
+// — see the filter below.
+//
+// Both modes are SCOPED: the global affordances (Remove, the ≥2-fork dropdown,
+// Enable Gitea's tailed op) stay on the Development page — steering the active
+// fork from a project pane would silently re-steer every other consumer's
+// rs-fetch and review reads — and the pane links there instead. The
+// transport-vs-verb ladder mirrors renderDevFetchTab, rendering into the pane
+// container (every mgmt render helper takes a bare element), and the 401 arm
+// routes back to THIS renderer so a session expiry never lands a host page
+// inside the pane.
+//
+// The pane is a SNAPSHOT, not a live view: activateService unhides an existing
+// instance without re-fetching, so a repo mirrored elsewhere after this pane
+// first rendered appears on the next Sync / review rerender or page reload.
 async function renderProjectFetchPane(container, repo) {
+    const all = !repo;
     container.innerHTML = "";
     container.appendChild(el("div", { class: "mgmt-loading" },
-                             [`Loading ${repo}…`]));
+                             [all ? "Loading dev repos…" : `Loading ${repo}…`]));
     let res;
     try {
-        res = await fetch(`/broker/dev/repo-status?repo=${encodeURIComponent(repo)}`);
+        res = await fetch(all
+            ? "/broker/dev"
+            : `/broker/dev/repo-status?repo=${encodeURIComponent(repo)}`);
     } catch (e) { return renderMgmtUnavailable(container); }
     if (res.status === 401)
         return renderMgmtLogin(container,
@@ -3012,13 +3043,20 @@ async function renderProjectFetchPane(container, repo) {
     if (res.status === 503) return renderMgmtUnavailable(container);
     let data;
     try { data = await res.json(); } catch (e) { return renderMgmtUnavailable(container); }
+    // The broker ANSWERED and the verb refused (200 + {ok:false}) — distinct
+    // from the transport arms peeled above. Genuinely live in all-repos mode:
+    // dev_status keeps its mirror ENUMERATION page-fatal (a raising list_repos
+    // becomes a ValidationError), so a healthy broker with a sick gitea lands
+    // here. Do not "simplify" this into the gitea empty state below — that
+    // would report an erroring gitea as a stopped one.
     if (!res.ok || !data.ok || !data.result) {
         container.innerHTML = "";
         const retry = el("button", { class: "btn-small" }, ["Retry"]);
         retry.onclick = () => renderProjectFetchPane(container, repo);
         container.appendChild(el("div", { class: "mgmt-empty" }, [
-            el("span", {}, [
-                (mgmtErrText(data) || "Could not load the repo status.") + " "]),
+            el("span", {}, [(mgmtErrText(data) || (all
+                ? "Could not load dev status."
+                : "Could not load the repo status.")) + " "]),
             retry,
         ]));
         return;
@@ -3039,22 +3077,48 @@ async function renderProjectFetchPane(container, repo) {
         ]));
         return;
     }
-    const r = (result.repo && typeof result.repo === "object") ? result.repo : {};
-    if (!r.repo) {
+    const rows = all
+        ? (Array.isArray(result.repos) ? result.repos : [])
+        : [(result.repo && typeof result.repo === "object") ? result.repo : {}];
+    const atts = Array.isArray(result.attachments) ? result.attachments : [];
+    if (all && !rows.length) {
+        container.appendChild(el("div", { class: "mgmt-empty" }, [
+            "No dev repos yet. A repo is mirrored here when you create a dev "
+            + "project from a GitHub URL (Workflows → Dev), or add a dev box to "
+            + "an existing project.",
+        ]));
+        return;
+    }
+    if (!all && !rows[0].repo) {
         container.appendChild(el("div", { class: "mgmt-empty" },
             [`No status for ${repo} — was the repo removed?`]));
         return;
     }
-    const attached = (Array.isArray(result.attachments) ? result.attachments : [])
-        .map((a) => a && a.project).filter(Boolean);
-    container.appendChild(buildDevRepoCard(container, container, r, attached, {
-        scoped: true,
-        rerender: () => renderProjectFetchPane(container, repo),
-    }));
-    // Reviewer-token state beside the card's Review affordances (F4: both
-    // Fetch surfaces; same silent degradation on a missing field).
+    for (const r of rows) {
+        // ⚠ The two verbs return DIFFERENT attachment shapes, so these must not
+        // be unified: dev_status emits [{project, repo}] for EVERY repo (filter,
+        // or every card claims every project), while dev_repo_status emits
+        // [{project}] already scoped server-side to this repo — it has no `repo`
+        // key at all, so filtering there yields [] and silently drops the card's
+        // "worked by" line. See dev_status / dev_repo_status in cli/rscore.py.
+        const attached = (all ? atts.filter((a) => a && a.repo === r.repo) : atts)
+            .map((a) => a && a.project).filter(Boolean);
+        container.appendChild(buildDevRepoCard(container, container, r, attached, {
+            scoped: true,
+            rerender: () => renderProjectFetchPane(container, repo),
+            // No allRepos: it feeds the purge dialog, which is a global
+            // affordance a scoped card never renders.
+        }));
+    }
+    // Reviewer-token state beside the cards' Review affordances (both Fetch
+    // surfaces; same silent degradation on a missing field). Placed AFTER the
+    // cards so the two project panes read identically; the Development page
+    // keeps its own placement above them.
     const revLine = devReviewerLine(result.reviewer);
     if (revLine) container.appendChild(revLine);
+    // The shared legend — worth carrying only where there are many cards and
+    // the 📋/▸/auto-commit affordances need naming (the per-repo pane omits it).
+    if (all) container.appendChild(devFetchLegend());
 }
 
 // Which repos does <user> own a fork of, across every mirror the page loaded?
@@ -7044,13 +7108,17 @@ async function openHttpService(project, serviceId, svc) {
         kind: "http", container, project, service: serviceId,
     };
 
-    // A dev repo's FETCH pane renders RS-side off the broker relay — no
-    // iframe, no upstream origin, no session mint (branch BEFORE the mint and
-    // the gitea_path branch; neither applies). The bookkeeping above is
-    // shared deliberately: teardown stays identical.
-    if (svc.fetch_repo) {
+    // A FETCH pane renders RS-side off the broker relay — no iframe, no
+    // upstream origin, no session mint (branch BEFORE the mint and the
+    // gitea_path branch; neither applies). The bookkeeping above is shared
+    // deliberately: teardown stays identical. Two markers, one renderer:
+    // `fetch_repo` is the per-repo dev tab, `fetch_all` the project-wide tab of
+    // an rs-fetch-enabled project (null repo ⇒ every mirror). The
+    // dev-fetch-pane class is load-bearing on BOTH — it supplies the pane's
+    // scroll + padding.
+    if (svc.fetch_repo || svc.fetch_all) {
         container.classList.add("dev-fetch-pane");
-        await renderProjectFetchPane(container, svc.fetch_repo);
+        await renderProjectFetchPane(container, svc.fetch_repo || null);
         return;
     }
 

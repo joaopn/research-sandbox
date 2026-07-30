@@ -237,6 +237,44 @@ def dev_fetch_service(label: str, repo: str) -> dict | None:
     }
 
 
+# The PROJECT-WIDE Fetch tab — ONE per rs-fetch-enabled project, listing EVERY
+# mirrored repo. Deliberately not repo-keyed like the tab above: an rs-fetch
+# consumer can pull ANY mirror (the staged ~/.dev-tokens/fetch-wiring.json maps
+# every mirror -> its active fork), and the mirror list is host-side, off the
+# webui's `/projects:ro` mount — so the repo set is resolved client-side from
+# the /broker/dev relay when the tab is opened, never here.
+#
+# Shares the `fetch-` prefix ON PURPOSE: the mobile tab whitelist already
+# exempts `[data-service^="fetch-"]`, so this tab reaches the phone with no CSS
+# edit (and without touching that selector's exact-match neighbours). The `:` is
+# what keeps the id collision-proof against a real per-repo tab — `:` is illegal
+# in gitea repo names, so `_DEV_FORK_NAME` refuses it and dev_fetch_service can
+# never mint this id. That matters because ONE project can carry both families
+# at once (a dev box + a fetch box). Nothing parses the id back: it is a dict key
+# and a quoted `data-service` attribute.
+PROJECT_FETCH_ID = DEV_FETCH_ID_PREFIX + ":all"
+
+
+def project_fetch_service(label: str) -> dict:
+    """Synthesize the project-wide Fetch-tab spec.
+
+    Carries `fetch_all`, NEVER `fetch_repo`/`origin_url`/`gitea_path`: the SPA
+    renders every mirrored repo's card itself from the /broker/dev relay — no
+    iframe, no upstream, so the id never enters ORIGIN_PORTS and no session
+    cookie is minted for it. `kind` stays load-bearing for the tab dispatch.
+
+    Returns a plain dict, not `dict | None` like its siblings: there is no
+    user-supplied name to charset-guard here, so an Optional return would be
+    dead shape at every call site."""
+    return {
+        "label": label,
+        "kind": "http",
+        "always_on": False,
+        "renderer": "panel",
+        "fetch_all": True,
+    }
+
+
 def resolve(service_id: str) -> dict | None:
     """Static registry lookup, falling back to a synthesized PI-isolated
     spec for `pi-iso-<name>` ids. Used by the ssh handler so it can run the

@@ -1414,9 +1414,9 @@ body {
 .dev-review-badge.dev-outcome-pass { color: var(--status-up); }
 .dev-review-badge.dev-outcome-fail { color: var(--error-fg); }
 .dev-review-failed { color: var(--error-fg); }
-/* The per-project Fetch pane (the fetch-<repo> tab): RS-rendered HTML inside
-   #terminal-area, which never scrolls host content itself — the pane owns its
-   scrolling. */
+/* The per-project Fetch panes (the fetch-<repo> and fetch-:all tabs):
+   RS-rendered HTML inside #terminal-area, which never scrolls host content
+   itself — the pane owns its scrolling. */
 .dev-fetch-pane { overflow: auto; padding: 12px 16px; }
 /* Review verdict panel: the model's summary/findings in a darker inset box
    (--bg-input is the darkest surface — the .mgmt-card pre precedent). The
@@ -1524,11 +1524,13 @@ html.mobile .dashboard.mobile-projects .service-tabs .active-project {
 /* Tab strip = [project chip][whitelisted chips]: one thick thumbable row.
    52px = the common 44px minimum touch target + room for the larger type;
    LOCKSTEP: the open drawer's top offset above must match this height.
-   THE MOBILE TAB MODEL: show enabled ∩ {cli, reader, git-<consumer>} — the
-   :not() chain below IS the whitelist; extending mobile to another visual
-   surface = extending that chain. The dev-fork (git-) tabs are shown: reading a
-   fork's issues and PRs from the phone is the point of the dev lane's human→agent
-   channel, and the fetch- panes are lightweight RS-rendered HTML.
+   THE MOBILE TAB MODEL: show enabled ∩ {cli, reader, git-<consumer>,
+   fetch-<repo>, fetch-:all} — the :not() chain below IS the whitelist;
+   extending mobile to another visual surface = extending that chain. The
+   dev-fork (git-) tabs are shown: reading a fork's issues and PRs from the
+   phone is the point of the dev lane's human→agent channel, and the fetch-
+   panes (both the per-repo one and the project-wide all-mirrors one, which
+   share the prefix) are lightweight RS-rendered HTML that scrolls.
    code-server / box editors / port-<n> stay desktop-only. Pin buttons
    stay hidden (no split panes on mobile); + Add box and the per-box ✕ are
    SHOWN (dind box lifecycle from the phone; their dialogs are sheet-styled). */
