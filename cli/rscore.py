@@ -1307,6 +1307,12 @@ class BoxAddRequest:
     preset: str = "empty"
     agent: str | None = None                # claude | none | None (preset default)
     editor: bool = False
+    # Spawn-time image toggle (tri-state): True/False override the preset's
+    # image (base vs Playwright+Chromium browser); None keeps the preset's
+    # default. Explicit-vs-unset mirrors the agents-preset semantics — the
+    # preset's `image` is a DEFAULT now, not a fixture. Rejected (True) on dev
+    # presets in box_add: dev boxes are base-image-only by catalog rule.
+    browser: bool | None = None
     mcps: tuple[str, ...] = ()
     repo: str = ""
     ref: str = ""
@@ -1361,6 +1367,12 @@ class BoxAddRequest:
         # (STAGE_BOX_EXT_UX D-B). Overrides an explicit agent="none".
         if mcps:
             agent = "claude"
+        # Browser is tri-state: absent/None ⇒ preset default. Only a real bool
+        # may pass (JSON true/false); anything else is a malformed request, not
+        # a truthy value to coerce.
+        browser = kw.get("browser")
+        if browser is not None and not isinstance(browser, bool):
+            raise ValidationError("browser must be true or false when given")
         for fld in ("repo", "ref", "setup", "branch"):
             v = kw.get(fld)
             if v is not None and not isinstance(v, str):
@@ -1379,7 +1391,7 @@ class BoxAddRequest:
         _model, _effort = _box_model_shape(kw)
         return cls(
             project=_require_name(kw.get("project")), name=name, preset=preset,
-            agent=agent, editor=bool(kw.get("editor", False)),
+            agent=agent, editor=bool(kw.get("editor", False)), browser=browser,
             mcps=tuple(mcps), repo=(kw.get("repo") or "").strip(),
             ref=(kw.get("ref") or "").strip(), setup=(kw.get("setup") or ""),
             branch=branch, model=_model, effort=_effort,
@@ -8748,6 +8760,13 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
                 "to mcp-proxy)")
         if req.ref or req.setup:
             raise ValidationError("ref/setup are not valid for a dev box")
+        # Base-image only, by catalog rule (dev:true requires image:'base').
+        # Placed HERE — before any mirror/gitea/identity work — so a refusable
+        # request refuses without a dev lane even existing.
+        if req.browser is True:
+            raise ValidationError(
+                "a dev box cannot take the browser image (dev presets are "
+                "base-image only)")
         if req.fetch:
             raise ValidationError(
                 "a dev box does not take the rs-fetch option (it works its "
@@ -8794,8 +8813,11 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     # Lazily stand up the box harness. On research this stages rs-sandbox + delivers
     # the needed box image on first use (research create/recreate never touch boxes
     # — the frozen lane); on sandbox-dind (eager-staged) it no-ops. The image a box
-    # needs is the browser image iff its preset selects it.
-    want_browser = catalog.get(req.preset, {}).get("image") == "browser"
+    # needs is the request's explicit tri-state, else the preset's image default —
+    # resolved BEFORE _ensure_box_harness so the image the box will run IS the one
+    # delivered (a research project's lazy delivery keys on this).
+    want_browser = (req.browser if req.browser is not None
+                    else catalog.get(req.preset, {}).get("image") == "browser")
     progress.step("harness", "ensuring the box harness")
     _ensure_box_harness(container, project_network_for(req.project),
                         workspace_path, want_browser)
@@ -8888,6 +8910,11 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         argv += ["--effort", box_effort]
     if req.editor:
         argv.append("--editor")
+    # Tri-state: thread the flag ONLY when the caller was explicit, so the
+    # in-supervisor rs-sandbox applies the preset default itself on None (the
+    # two resolvers stay in agreement by construction).
+    if req.browser is not None:
+        argv.append("--browser" if req.browser else "--no-browser")
     if req.fetch:
         argv.append("--fetch")
     if req.mcps:

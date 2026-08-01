@@ -775,6 +775,12 @@ def cmd_create(args: argparse.Namespace) -> None:
         if args.fetch:
             die("--fetch is not valid for a dev box (it works its own fork; "
                 "the read-only fetch surface is for non-dev boxes)")
+        # Two-gate lockstep with box_add: base-image only (the catalog forces
+        # dev presets to image:'base'). Only an explicit --browser dies;
+        # --no-browser/absent resolve to base below anyway.
+        if args.browser:
+            die("--browser is not valid for a dev box (dev presets are "
+                "base-image only)")
         # Per-consumer forks: the box's gitea identity is minted HOST-side
         # (research/webui box add) before this runs and arrives as
         # --gitea-user; a bare in-supervisor `rs-sandbox create` cannot mint
@@ -803,7 +809,12 @@ def cmd_create(args: argparse.Namespace) -> None:
     agent = args.agent or ("claude" if preset.get("agent_default") else "none")
     if mcps:
         agent = "claude"
-    browser = preset.get("image") == "browser"
+    # Spawn-time tri-state (the host box_add threads --browser/--no-browser only
+    # when the caller was explicit): None ⇒ the preset's image default. The
+    # resolved value is persisted on the entry below, so _rerun_box re-applies
+    # it across restarts/recreates with no further logic.
+    browser = (args.browser if args.browser is not None
+               else preset.get("image") == "browser")
     editor = bool(args.editor)
     fetch = bool(args.fetch)
     # Fail LOUD when the editor is requested but the dist is not staged — the
@@ -1063,6 +1074,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "box default; ignored for a model with no effort levels)")
     c.add_argument("--editor", action="store_true",
                    help="bundle the code-server editor into this box")
+    # Tri-state on purpose (first BooleanOptionalAction in this codebase):
+    # --browser / --no-browser override the preset's image, ABSENT (None) keeps
+    # the preset default — a store_true could not express "not specified".
+    c.add_argument("--browser", action=argparse.BooleanOptionalAction, default=None,
+                   help="override the preset's image: --browser runs the "
+                        "Playwright+Chromium box image, --no-browser the base "
+                        "image (default: the preset's image)")
     c.add_argument("--fetch", action="store_true",
                    help="wire this box for rs-fetch (read-only fetch of "
                         "dev-lane agent commits from the shared gitea); the "

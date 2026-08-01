@@ -567,8 +567,12 @@ def _verb_destroy(args: dict, progress=None) -> dict:
 # surface (in-box; rejected on a dev preset + gitea-bootstrap-floored in box_add);
 # mcps are project MCP names (⊆ allow, gated in box_add);
 # repo/ref/setup seed a `byo` box and run INSIDE it (in-box, relayable per
-# WORKFLOW_TAXONOMY_S4). `browser` is GONE — folded into the websearcher preset.
+# WORKFLOW_TAXONOMY_S4). `browser` is a TRI-STATE spawn toggle: true/false override
+# the preset's image (base vs Playwright+Chromium), absent/None keeps the preset
+# default — an in-box image choice, not host-shaped; rejected (true) on dev
+# presets in box_add.
 BOX_ADD_WEBUI_FIELDS = frozenset({"project", "name", "preset", "agent", "editor",
+                                  "browser",
                                   "fetch", "mcps", "repo", "ref", "setup",
                                   # Base branch for a DEV box (in-box: it selects
                                   # which branch of the agent's own fork gets

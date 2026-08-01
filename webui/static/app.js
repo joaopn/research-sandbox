@@ -5142,6 +5142,25 @@ async function mgmtBoxAddDialog(project) {
         fetchCard.classList.toggle("selected", fetchCb.checked);
     };
 
+    // Browser (spawn-time image toggle, tri-state server-side): checked ⇒ the
+    // Playwright + headless Chromium box image, unchecked ⇒ the base image. The
+    // preset's image is only the DEFAULT (applyPreset seeds the checkbox from
+    // it); the payload always sends the explicit checkbox state for non-dev
+    // presets. Disabled on dev presets (base-image only — box_add rejects the
+    // combination), the fetch-card pattern.
+    const browserCb = el("input", { type: "checkbox" });  // value holder
+    const browserCard = el("div", {
+        class: "box-opt-card",
+        title: "Run this box on the Playwright + headless Chromium image so " +
+               "its agent can browse the web. Heavier image; websearcher " +
+               "pre-checks it (its instructions assume the browser tools).",
+    }, [el("span", { class: "box-opt-name" }, ["Browser"])]);
+    browserCard.onclick = () => {
+        if (browserCard.classList.contains("disabled")) return;
+        browserCb.checked = !browserCb.checked;
+        browserCard.classList.toggle("selected", browserCb.checked);
+    };
+
     // MCP picker over the project's allowed MCPs. Checking ≥1 forces the agent on
     // (nothing else reaches an MCP) — reflect the backend coupling by forcing +
     // disabling the agent select.
@@ -5230,6 +5249,12 @@ async function mgmtBoxAddDialog(project) {
             fetchCard.classList.remove("selected");
         }
         fetchCard.classList.toggle("disabled", isDev);
+        // Browser follows the preset's image default on every preset switch; a
+        // dev preset forces it off + disabled (base-image only — both gates
+        // reject the combination, so the dialog must not offer it).
+        browserCb.checked = !isDev && selectedPreset.image === "browser";
+        browserCard.classList.toggle("selected", browserCb.checked);
+        browserCard.classList.toggle("disabled", isDev);
         // Show the BYO clone fields only when the preset clones AND the repo isn't
         // baked into the preset (a baked-repo preset like paper-orchestra hides them);
         // a dev preset shows the attached-repo picker instead.
@@ -5278,7 +5303,7 @@ async function mgmtBoxAddDialog(project) {
                 ]),
                 el("div", { class: "box-opt-group" }, [
                     el("div", { class: "box-opt-caption" }, ["Extensions"]),
-                    el("div", { class: "box-opt-cards" }, [editorCard, fetchCard]),
+                    el("div", { class: "box-opt-cards" }, [editorCard, fetchCard, browserCard]),
                 ]),
                 el("div", { class: "box-opt-group" }, [
                     el("div", { class: "box-opt-caption" }, ["MCP tools"]),
@@ -5345,11 +5370,17 @@ async function mgmtBoxAddDialog(project) {
                 name: nameI.value.trim() || null,
                 preset: selectedPreset.name,
                 editor: editorCb.checked,
+                // Always explicit for non-dev (this payload branch): the
+                // checkbox state IS the choice — applyPreset seeded it from the
+                // preset's image, so sending it unconditionally can never
+                // surprise, and the tri-state's None stays reachable only for
+                // callers that genuinely omit the field (CLI).
+                browser: browserCb.checked,
                 fetch: fetchCb.checked,
                 mcps: mcpBoxes.filter((b) => b.cb.checked).map((b) => b.name),
             };
             // Agent is always explicit now (the preset default is pre-selected,
-            // not a sentinel); no `browser`.
+            // not a sentinel).
             if (agentS.value) payload.agent = agentS.value;
             // Gated on the agent, exactly like the control's visibility — a blank
             // box (agent "none") runs no agent, so it sends no model.

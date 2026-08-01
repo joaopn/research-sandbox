@@ -32,6 +32,11 @@ Independent of the type:
 - **Agent** — deploy `claude` into the box (defaults per type: empty off, the
   others on). Selecting any MCP turns it on.
 - **Editor** — bundle the code-server editor (off by default).
+- **Browser** — run the box on the Playwright + headless Chromium image so its
+  agent can browse. The box type only sets the default (websearcher pre-checks
+  it; its instructions assume the browser tools, so un-checking it there leaves
+  them pointing at tools the box doesn't have). Heavier image — leave it off
+  unless the box needs the web. Not available on dev boxes.
 - **rs-fetch** — wire the box to pull dev-lane agent commits from the shared
   Gitea into a git clone here (read-only; off by default; not on dev boxes).
 - **MCP tools** — wire any of the project's allowed MCP servers into the box's

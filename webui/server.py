@@ -897,9 +897,9 @@ async def broker_box_add_handler(request: web.Request) -> web.Response:
     origin-checked).
     Returns {op_id} immediately and tails like create/destroy. The broker's
     BOX_ADD_WEBUI_FIELDS allow-list is the real input boundary; the body is
-    forwarded as box fields under the project name from the URL. `browser` is GONE
-    (folded into the websearcher preset); `agent` defaults to None so the box's
-    preset default applies (BoxAddRequest.from_kwargs)."""
+    forwarded as box fields under the project name from the URL. `browser` is a
+    tri-state image toggle (absent/None ⇒ preset default); `agent` defaults to
+    None so the box's preset default applies (BoxAddRequest.from_kwargs)."""
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")
     project = request.match_info.get("name", "")
@@ -916,6 +916,11 @@ async def broker_box_add_handler(request: web.Request) -> web.Response:
     args = {"project": project, "name": body.get("name"),
             "preset": body.get("preset"), "agent": body.get("agent"),
             "editor": bool(body.get("editor")),
+            # RAW, deliberately NOT bool() like its neighbours: browser is
+            # TRI-STATE — absent/None means "the preset's image default", and
+            # bool() would collapse None→false, silently forcing base on
+            # browser-default presets. The broker request re-validates the type.
+            "browser": body.get("browser"),
             "fetch": bool(body.get("fetch")), "mcps": body.get("mcps"),
             "repo": body.get("repo"), "ref": body.get("ref"),
             "setup": body.get("setup"), "branch": body.get("branch"),
