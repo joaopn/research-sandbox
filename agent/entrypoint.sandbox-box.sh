@@ -25,6 +25,17 @@ if [[ ! -f ~/.bashrc ]]; then
     cp -a /etc/worker-skel/. ~/
 fi
 
+# Preset input fields (~/.rs-box.env, staged 0600 by the host BEFORE first
+# start via create→cp→start). Sourced HERE — above the agent deploy and the
+# editor spawn — so every child of this entrypoint (the code-server stub, its
+# integrated terminals, the preset setup below) inherits the values; login
+# shells get them via the .bashrc source line added further down. On these
+# boxes the skel restore above never fires (image-resident home), which is
+# what makes the pre-start docker cp safe from being clobbered.
+if [[ -f ~/.rs-box.env ]]; then
+    . ~/.rs-box.env
+fi
+
 # Deploy the agent (claude) from the management-supervisor-staged dist into our
 # OWN writable ~/.local (no bake; STAGE_AGENT_DIST slice 2) — ONLY when the box
 # was created with an agent (RS_BOX_AGENT=claude). Blank by default (unset/none
@@ -42,6 +53,19 @@ if [[ "${RS_BOX_AGENT:-none}" == "claude" && -f /opt/agent-dist/claude/settings.
 fi
 if ! grep -q '\.local/bin' ~/.bashrc 2>/dev/null; then
     echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+fi
+# Login shells (byobu tabs, the agent, its MCP servers) inherit the preset
+# field values too — the agent expands ${FIELD} references in .mcp.json from
+# its own environment, which these lines populate. TWO homes, deliberately:
+# ~/.bashrc covers interactive non-login bash, while ~/.profile covers every
+# LOGIN shell — sh-family AND non-interactive `bash -lc`/`sh -lc` scripts,
+# which never reach ~/.bashrc (Debian's early-return + bash-only sourcing;
+# the same shell-family gap the /etc/profile.d PATH fix exists for).
+if ! grep -q 'rs-box\.env' ~/.bashrc 2>/dev/null; then
+    echo '[ -f "$HOME/.rs-box.env" ] && . "$HOME/.rs-box.env"' >> ~/.bashrc
+fi
+if ! grep -q 'rs-box\.env' ~/.profile 2>/dev/null; then
+    echo '[ -f "$HOME/.rs-box.env" ] && . "$HOME/.rs-box.env"' >> ~/.profile
 fi
 
 # --- code-server editor (dist) — STAGE_EDITOR_DIST. Deploy + lazy-launch from
@@ -130,7 +154,22 @@ if [[ -n "${RS_BOX_CLONE_REPO:-}" ]]; then
     fi
 fi
 
-# --- Render /workspace/.mcp.json from two sources (STAGE_BOX_EXT_UX) -------
+# --- Preset setup (RS_BOX_SETUP): run ONCE per container filesystem --------
+# Sentinel semantics, deliberately unlike the byo clone setup above: a preset
+# setup installs software (e.g. a pinned pip package), so re-running every
+# boot would put the network on the RESTART path — the sentinel keeps plain
+# docker stop/start offline-safe. A re-run/recreate wipes the fs → the
+# sentinel is gone → setup re-runs (the install must land on the fresh fs).
+# Runs AFTER the env source above (a setup may rely on the field values) and
+# with set -e in force: a failure kills the boot and the box crash-loops under
+# --restart unless-stopped until healed (byo parity — deliberate, not a bug).
+if [[ -n "${RS_BOX_SETUP:-}" && ! -f ~/.rs-box-setup-done ]]; then
+    echo "sandbox-box[${RS_SANDBOX_NAME}]: running preset setup"
+    ( cd /workspace && bash -lc "${RS_BOX_SETUP}" )
+    touch ~/.rs-box-setup-done
+fi
+
+# --- Render /workspace/.mcp.json from three sources (STAGE_BOX_EXT_UX) -----
 # Regenerated WHOLESALE every boot — idempotent across reboots (NOT a blind
 # append into an already-merged file, which would re-collide on the second boot).
 #   source-1 = /workspace/.mcp-proxy.json  — proxy MCP servers the host wrote at
@@ -186,6 +225,40 @@ if extras_path.is_file():
             cfg.setdefault("type", "stdio")
         servers[n] = cfg
 
+# Source 3: preset-declared stdio MCPs (host-staged from the box catalog into
+# /workspace/.mcp-preset.json). Values are copied VERBATIM — ${FIELD}
+# references are expanded by the AGENT at config load, never by this merge.
+# Checked against the UNION of sources 1+2 (must run AFTER source 2, or a
+# preset-vs-baked collision slips through this backstop — the host pre-flight
+# normally refuses first, but a backstop nobody exercises is one nobody
+# notices is broken). Collision policy: refuse-to-start, same as source 2.
+preset_path = Path("/workspace/.mcp-preset.json")
+if preset_path.is_file():
+    try:
+        pre = json.loads(preset_path.read_text())
+    except json.JSONDecodeError as e:
+        print(f"sandbox-box: .mcp-preset.json invalid JSON: {e}", file=sys.stderr)
+        sys.exit(1)
+    ps = pre.get("mcpServers") if isinstance(pre, dict) else None
+    if ps is None:
+        ps = {}
+    if not isinstance(ps, dict):
+        print("sandbox-box: .mcp-preset.json mcpServers must be an object",
+              file=sys.stderr)
+        sys.exit(1)
+    collisions = sorted(n for n in ps if n in servers)
+    if collisions:
+        print(f"sandbox-box: preset / baked-or-project MCP name collision: "
+              f"{', '.join(map(repr, collisions))}; refusing to start. "
+              f"Rename the preset's server or drop the colliding source.",
+              file=sys.stderr)
+        sys.exit(1)
+    for n, cfg in ps.items():
+        if isinstance(cfg, dict):
+            cfg = dict(cfg)
+            cfg.setdefault("type", "stdio")
+        servers[n] = cfg
+
 if servers:
     mcp_path.write_text(json.dumps({"mcpServers": servers}, indent=2, sort_keys=True) + "\n")
     rows = []
@@ -195,7 +268,7 @@ if servers:
         rows.append(f"| `{n}` | {t} | {loc} |")
     inv_path.write_text(
         f"# Tools wired into this box\n\n"
-        f"Rendered at boot from .mcp-proxy.json (project MCPs) + image-baked tools.\n"
+        f"Rendered at boot from .mcp-proxy.json (project MCPs) + image-baked + preset tools.\n"
         f"claude auto-discovers /workspace/.mcp.json — call tools by name.\n\n"
         f"| Name | Type | Location |\n|---|---|---|\n" + "\n".join(rows) + "\n")
 else:

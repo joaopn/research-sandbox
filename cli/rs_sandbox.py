@@ -59,6 +59,12 @@ EDITOR_DIST_MOUNT = "/opt/editor-dist"
 BOX_IMAGE = "rs-sandbox-box:latest"
 # Browser variant: + @playwright/mcp + Chromium, wired into the box's claude.
 BOX_IMAGE_BROWSER = "rs-sandbox-box-browser:latest"
+# The browser image's baked stdio MCP server name(s). ⚠ MIRROR of
+# cli/box_catalog.py::BAKED_BROWSER_MCPS — this file is staged standalone into
+# the supervisor (no cli/ package in-image), so it CANNOT import the canonical
+# constant; a host pytest pins the two equal. Used by cmd_create's collision
+# die (two-gate lockstep with box_add's host-side pre-flight).
+BAKED_BROWSER_MCPS = ("playwright",)
 IP_PREFIX = "192.168.99."
 # Box IP pool — the .14-.25 PI sub-range (shared with BYO sandboxes; the whole
 # .10-.25 PI range is ACCEPTed by the inner firewall, so no per-box rule).
@@ -369,6 +375,24 @@ def _stage_box_workspace(name: str, preset: dict, mcps: list[str],
     servers = _build_proxy_mcps(mcps, strict=strict)
     (ws / ".mcp-proxy.json").write_text(
         json.dumps({"mcpServers": servers}, indent=2, sort_keys=True) + "\n")
+    _write_mcp_preset(ws, preset)
+
+
+def _write_mcp_preset(ws: Path, preset: dict) -> None:
+    """Write /workspace/.mcp-preset.json — source-3 of the entrypoint's
+    wholesale .mcp.json regen — from the preset's declared mcp_servers;
+    REMOVE the file when the preset declares none (a preset that drops the key
+    must not leave a stale merge source behind). The webui's RO /projects mount
+    can read this file, so a field VALUE must NEVER enter it — the writer only
+    handles catalog manifest data by construction; ${FIELD} references (never
+    expanded values) are what land here, expanded by the agent at config load."""
+    mp = ws / ".mcp-preset.json"
+    servers = preset.get("mcp_servers") or {}
+    if servers:
+        mp.write_text(json.dumps({"mcpServers": servers}, indent=2,
+                                 sort_keys=True) + "\n")
+    elif mp.exists():
+        mp.unlink()
 
 
 # --- run / teardown ---------------------------------------------------------
@@ -543,7 +567,7 @@ def _project_box_pair() -> dict:
 
 def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
              editor: bool = False, editor_port: int = 0, clone_repo: str = "",
-             clone_ref: str = "", clone_setup: str = "",
+             clone_ref: str = "", clone_setup: str = "", preset_setup: str = "",
              dev: dict | None = None, dev_subnet: str = "", branch: str = "",
              loopback_ports: list[dict] | None = None,
              model: str = "", effort: str = "", fetch: bool = False) -> None:
@@ -632,8 +656,10 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         model_env = ["-e", f"ANTHROPIC_MODEL={model}"]
         if effort:
             model_env += ["-e", f"CLAUDE_CODE_EFFORT_LEVEL={effort}"]
-    r = _docker(
-        "run", "-d",
+    # Preset setup script rides env argv deliberately: it is user-VISIBLE
+    # catalog data (the window shows it), never a field value.
+    setup_env = (["-e", f"RS_BOX_SETUP={preset_setup}"] if preset_setup else [])
+    common = [
         "--name", cname,
         *net_args,
         "--restart", "unless-stopped",
@@ -646,15 +672,42 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         "-e", f"RS_SANDBOX_NAME={name}",
         "-e", f"RS_BOX_AGENT={agent}",
         *model_env,
+        *setup_env,
         *clone_env,
         *dev_env,
         "--label", "research.sandbox=1",
         "--label", f"research.box={name}",
         image,
-    )
-    if r.returncode != 0:
-        die(f"docker run failed for box {name!r}:\n"
-            f"{(r.stderr or r.stdout).strip()}")
+    ]
+    env_src = Path.home() / ".rs-box-env" / f"{name}.env"
+    if env_src.is_file():
+        # Preset input fields: deliver ~/.rs-box.env BEFORE first boot via
+        # create → cp → start — never -e (inner `docker inspect` would carry
+        # the values) and never the workspace (host/webui-readable). The cp is
+        # safe by construction: supervisor→inner has NO userns shift (research
+        # 1000 → worker 1000) and docker cp preserves mode, so the 0600 file
+        # lands owned by the box user; the box's home is image-resident (the
+        # skel restore never fires there), so nothing clobbers it at boot.
+        # Each step checks its own rc; a cp/start failure removes the created
+        # container so no Created husk sits behind the already-saved entry
+        # (cmd_create writes the entry pre-run).
+        r = _docker("create", *common)
+        if r.returncode != 0:
+            die(f"docker create failed for box {name!r}:\n"
+                f"{(r.stderr or r.stdout).strip()}")
+        r = _docker("cp", str(env_src), f"{cname}:/home/worker/.rs-box.env")
+        if r.returncode == 0:
+            r = _docker("start", cname)
+        if r.returncode != 0:
+            _docker("rm", "-f", cname)
+            die(f"failed to stage/start box {name!r} with its env file:\n"
+                f"{(r.stderr or r.stdout).strip()}")
+    else:
+        # No env file ⇒ the pre-existing single-step run, byte-identical.
+        r = _docker("run", "-d", *common)
+        if r.returncode != 0:
+            die(f"docker run failed for box {name!r}:\n"
+                f"{(r.stderr or r.stdout).strip()}")
     # Opt-in fetch surface: rs-fetch + the operator token + the global fetch
     # wiring into the fresh box — ONLY when this box opted in (the universal
     # staging is retired; a dev box never gets it — the flag is rejected on
@@ -697,6 +750,17 @@ def _rerun_box(name: str, entry: dict) -> None:
     servers = _build_proxy_mcps(mcps, strict=False)
     (ws / ".mcp-proxy.json").write_text(
         json.dumps({"mcpServers": servers}, indent=2, sort_keys=True) + "\n")
+    # Refresh the preset MCP source alongside the proxy source (write + remove
+    # at BOTH sites): a catalog edit lands at restart, like an allowlist edit.
+    # Tolerant — a preset since removed from the catalog keeps the existing
+    # staged file rather than failing the restart (today a restart never
+    # resolves the preset at all; that must not regress).
+    try:
+        _write_mcp_preset(ws, resolve_preset(entry.get("preset") or "empty"))
+    except SystemExit:
+        print(f"rs-sandbox: warning: preset {entry.get('preset')!r} no longer "
+              f"resolvable; keeping the box's existing .mcp-preset.json",
+              file=sys.stderr)
     is_dev = bool(entry.get("dev"))
     _run_box(name, entry["ip"], browser=bool(entry.get("browser")),
              agent=entry.get("agent", "none"), editor=bool(entry.get("editor")),
@@ -704,6 +768,9 @@ def _rerun_box(name: str, entry: dict) -> None:
              clone_repo=(entry.get("repo") or "") if not is_dev else "",
              clone_ref=entry.get("ref") or "",
              clone_setup=entry.get("setup") or "",
+             # Snapshot from the entry (a recreate wipes the fs + the run-once
+             # sentinel, so the setup must re-run on the fresh filesystem).
+             preset_setup=entry.get("preset_setup") or "",
              dev=(_dev_run_info(entry["repo"], entry.get("gitea_user") or "")
                   if is_dev else None),
              dev_subnet=entry.get("dev_subnet") or "",
@@ -781,6 +848,11 @@ def cmd_create(args: argparse.Namespace) -> None:
         if args.browser:
             die("--browser is not valid for a dev box (dev presets are "
                 "base-image only)")
+        # The catalog validator forbids these on dev presets; a tampered staged
+        # catalog is the only way here — die rather than run half-wired.
+        if preset.get("fields") or preset.get("setup") or preset.get("mcp_servers"):
+            die("a dev preset cannot carry fields/setup/mcp_servers; fix the "
+                "box type in the catalog")
         # Per-consumer forks: the box's gitea identity is minted HOST-side
         # (research/webui box add) before this runs and arrives as
         # --gitea-user; a bare in-supervisor `rs-sandbox create` cannot mint
@@ -815,6 +887,27 @@ def cmd_create(args: argparse.Namespace) -> None:
     # it across restarts/recreates with no further logic.
     browser = (args.browser if args.browser is not None
                else preset.get("image") == "browser")
+    # Two-gate lockstep with box_add's host-side collision pre-flight (same
+    # mirrored constant): a preset MCP name colliding with the browser image's
+    # baked tools or a selected MCP would crash-loop the box at boot (the
+    # entrypoint's merge refuses under --restart unless-stopped) — die here.
+    preset_mcp_names = set(preset.get("mcp_servers") or {})
+    clash = sorted(preset_mcp_names & set(BAKED_BROWSER_MCPS)) if browser else []
+    if clash:
+        die(f"preset MCP server name(s) {', '.join(clash)} collide with the "
+            f"browser image's baked tools; rename them or drop the browser")
+    clash = sorted(preset_mcp_names & set(mcps))
+    if clash:
+        die(f"preset MCP server name(s) {', '.join(clash)} collide with "
+            f"selected MCP(s); deselect or rename them")
+    # A fields preset needs its env file staged BEFORE the run. The sanctioned
+    # path (the project's Add-box window) stages it; a direct in-supervisor run
+    # is the power path — stage ~/.rs-box-env/<name>.env yourself.
+    preset_setup = (preset.get("setup") or "").strip()
+    if preset.get("fields"):
+        if not (Path.home() / ".rs-box-env" / f"{name}.env").is_file():
+            die(f"this box type takes input fields, but no env file is staged "
+                f"for {name!r}; add the box from the project's Add-box window")
     editor = bool(args.editor)
     fetch = bool(args.fetch)
     # Fail LOUD when the editor is requested but the dist is not staged — the
@@ -858,6 +951,11 @@ def cmd_create(args: argparse.Namespace) -> None:
              "model": model, "effort": effort}
     if editor:
         entry["editor_port"] = editor_port
+    if preset_setup:
+        # Snapshot (like the clone entries' setup): _rerun_box re-passes it so
+        # a recreate — which wipes the container fs and the run-once sentinel —
+        # re-runs the setup on the fresh filesystem.
+        entry["preset_setup"] = preset_setup
     if fetch:
         # Persisted so _rerun_box re-applies the add-host + re-copies the fetch
         # halves on every restart/recreate (docker run wiring is fixed at run),
@@ -873,7 +971,7 @@ def cmd_create(args: argparse.Namespace) -> None:
     save(entries)
     _run_box(name, ip, browser=browser, agent=agent, editor=editor,
              editor_port=editor_port, clone_repo=repo if is_clone else "",
-             clone_ref=ref, clone_setup=setup,
+             clone_ref=ref, clone_setup=setup, preset_setup=preset_setup,
              dev=dev_info, dev_subnet=dev_subnet, branch=branch,
              model=model, effort=effort, fetch=fetch)
     print(json.dumps({"name": name, "ip": ip, "preset": args.preset,

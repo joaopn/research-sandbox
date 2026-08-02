@@ -5217,6 +5217,31 @@ async function mgmtBoxAddDialog(project) {
             "per-repo — to change it, remove the repo and re-create the box."]),
     ]);
 
+    // Preset-declared input fields (secret ⇒ password input). Rebuilt on every
+    // preset switch; values are read at submit into payload.field_values. The
+    // values travel to a private in-box env file server-side — the dialog never
+    // stores them anywhere else.
+    let fieldInputs = [];   // [{name, label, input}]
+    const fieldsGroup = el("div", { class: "mgmt-docker-group" });
+    function buildFields() {
+        fieldInputs = [];
+        fieldsGroup.innerHTML = "";
+        const fs = selectedPreset.fields || [];
+        for (const f of fs) {
+            const input = el("input", {
+                type: f.secret ? "password" : "text", autocomplete: "off",
+            });
+            fieldInputs.push({ name: f.name, label: f.label, input });
+            fieldsGroup.appendChild(
+                el("div", { class: "field" }, [el("label", {}, [f.label]), input]));
+        }
+        if (fs.length && selectedPreset.setup) {
+            fieldsGroup.appendChild(el("div", { class: "hint" },
+                ["Runs at first boot: " + selectedPreset.setup]));
+        }
+        fieldsGroup.style.display = fs.length ? "" : "none";
+    }
+
     // A dev box can't take MCPs (its dedicated bridge has no path to
     // mcp-proxy — both S2 gates reject them); the dialog must not offer a
     // guaranteed rejection, and a live picker would wedge the agent cards via
@@ -5260,6 +5285,14 @@ async function mgmtBoxAddDialog(project) {
         // a dev preset shows the attached-repo picker instead.
         byoGroup.style.display = (selectedPreset.clone && !selectedPreset.repo) ? "" : "none";
         devGroup.style.display = isDev ? "" : "none";
+        // Declared input fields follow the preset. A fields preset also needs
+        // an EXPLICIT box name (its env file is keyed by name before the box
+        // exists) — prefill with the preset name so the server-side gate never
+        // bites in the UI; only fill an empty input, never clobber a typed one.
+        buildFields();
+        if ((selectedPreset.fields || []).length && !nameI.value.trim()) {
+            nameI.value = selectedPreset.name;
+        }
     }
     function applyMcpCoupling() {
         const any = mcpBoxes.some((b) => b.cb.checked);
@@ -5310,6 +5343,7 @@ async function mgmtBoxAddDialog(project) {
                     mcpList,
                 ]),
             ]),
+            fieldsGroup,
             byoGroup,
             devGroup,
         ],
@@ -5317,6 +5351,14 @@ async function mgmtBoxAddDialog(project) {
             const n = nameI.value.trim();
             if (n && !/^[a-z][a-z0-9-]*$/.test(n)) {
                 return "Box name must be lowercase, start with a letter, and use only letters, digits, or '-'.";
+            }
+            // Every declared field is required (the server gate demands the
+            // exact declared set), and a fields preset needs an explicit name.
+            for (const f of fieldInputs) {
+                if (!f.input.value.trim()) return f.label + " is required.";
+            }
+            if (fieldInputs.length && !n) {
+                return "This box type needs a name (its inputs are stored per box).";
             }
             if (selectedPreset.clone && repoI.value.trim() && !refI.value.trim()) {
                 return "A repo requires a ref (pin the clone).";
@@ -5395,6 +5437,13 @@ async function mgmtBoxAddDialog(project) {
                 if (repo) payload.repo = repo;
                 if (ref) payload.ref = ref;
                 if (setup) payload.setup = setup;
+            }
+            // Declared field values ride ONE keyed object; the relay passes it
+            // raw and the broker gates names against the preset's declaration.
+            if (fieldInputs.length) {
+                const fv = {};
+                for (const f of fieldInputs) fv[f.name] = f.input.value.trim();
+                payload.field_values = fv;
             }
             return fetch(`/broker/project/${encodeURIComponent(project)}/box`, {
                 method: "POST", headers: { "Content-Type": "application/json" },

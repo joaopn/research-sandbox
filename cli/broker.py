@@ -573,6 +573,13 @@ def _verb_destroy(args: dict, progress=None) -> dict:
 # presets in box_add.
 BOX_ADD_WEBUI_FIELDS = frozenset({"project", "name", "preset", "agent", "editor",
                                   "browser",
+                                  # Values for the preset's DECLARED input
+                                  # fields ({NAME: value}; may carry secrets —
+                                  # request field is repr=False, values reach
+                                  # only a private env file, never argv/env
+                                  # config/results/logs). Gated in box_add:
+                                  # names must EQUAL the preset's declaration.
+                                  "field_values",
                                   "fetch", "mcps", "repo", "ref", "setup",
                                   # Base branch for a DEV box (in-box: it selects
                                   # which branch of the agent's own fork gets

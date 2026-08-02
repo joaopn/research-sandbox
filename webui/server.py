@@ -921,6 +921,9 @@ async def broker_box_add_handler(request: web.Request) -> web.Response:
             # bool() would collapse None→false, silently forcing base on
             # browser-default presets. The broker request re-validates the type.
             "browser": body.get("browser"),
+            # Preset input-field values ({NAME: value}) — raw passthrough; the
+            # broker request validates shape + names and never echoes a value.
+            "field_values": body.get("field_values"),
             "fetch": bool(body.get("fetch")), "mcps": body.get("mcps"),
             "repo": body.get("repo"), "ref": body.get("ref"),
             "setup": body.get("setup"), "branch": body.get("branch"),

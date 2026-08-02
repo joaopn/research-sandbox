@@ -1313,6 +1313,14 @@ class BoxAddRequest:
     # preset's `image` is a DEFAULT now, not a fixture. Rejected (True) on dev
     # presets in box_add: dev boxes are base-image-only by catalog rule.
     browser: bool | None = None
+    # Values for the preset's declared input fields ({NAME: value}). A dict,
+    # deliberately breaking the tuple convention of this dataclass's other
+    # collections: values are keyed by field name and nothing hashes requests.
+    # repr=False — values can be API keys; they must never reach a log, an
+    # error string, a Result, or this dataclass's repr. Delivery: rendered
+    # into a private 0600 env file (host store → supervisor home → box home),
+    # NEVER argv / docker -e / the workspace.
+    field_values: dict = field(default_factory=dict, repr=False)
     mcps: tuple[str, ...] = ()
     repo: str = ""
     ref: str = ""
@@ -1373,6 +1381,34 @@ class BoxAddRequest:
         browser = kw.get("browser")
         if browser is not None and not isinstance(browser, bool):
             raise ValidationError("browser must be true or false when given")
+        # Preset input-field values. ⚠ Every message in this block names the
+        # KEY and the rule, NEVER the value — a deliberate deviation from the
+        # surrounding {x!r}-echoing idiom: ValidationError text reaches the
+        # browser verbatim AND the broker's durable host log, and these values
+        # can be API keys. (The container-level arm below is value-free for the
+        # same reason — the whole object could carry a secret.)
+        raw_fv = kw.get("field_values")
+        if raw_fv is None:
+            raw_fv = {}
+        if not isinstance(raw_fv, dict):
+            raise ValidationError(
+                "field_values must be an object mapping field names to strings")
+        field_values: dict[str, str] = {}
+        for fk, fv in raw_fv.items():
+            if not (isinstance(fk, str) and box_catalog.FIELD_NAME_RE.match(fk)) \
+                    or box_catalog.is_reserved_field(fk):
+                raise ValidationError(
+                    f"invalid or reserved field name {fk[:64]!r}")
+            if not (isinstance(fv, str) and fv.strip()):
+                raise ValidationError(
+                    f"field {fk!r} must be a non-empty string")
+            field_values[fk] = fv
+        # The env file is keyed by box name BEFORE the box exists, so an
+        # auto-assigned name cannot work here (the dev-box precedent; the box
+        # window prefills the name, so this never bites the sanctioned path).
+        if field_values and not name:
+            raise ValidationError(
+                "a box with preset input fields requires an explicit name")
         for fld in ("repo", "ref", "setup", "branch"):
             v = kw.get(fld)
             if v is not None and not isinstance(v, str):
@@ -1392,6 +1428,7 @@ class BoxAddRequest:
         return cls(
             project=_require_name(kw.get("project")), name=name, preset=preset,
             agent=agent, editor=bool(kw.get("editor", False)), browser=browser,
+            field_values=field_values,
             mcps=tuple(mcps), repo=(kw.get("repo") or "").strip(),
             ref=(kw.get("ref") or "").strip(), setup=(kw.get("setup") or ""),
             branch=branch, model=_model, effort=_effort,
@@ -2915,6 +2952,9 @@ def destroy(req: DestroyRequest, cfg: "Config" | None = None,
         gitea.prune_project(project)
     except Exception:
         pass
+    # Preset-field env store for this project's boxes — host-only, never
+    # mounted; the boxes died with the project, so their keys go too.
+    shutil.rmtree(BOX_ENV_DIR / project, ignore_errors=True)
 
 
 def start(req: StartStopRequest, cfg: "Config" | None = None,
@@ -6144,6 +6184,10 @@ def _recreate_supervisor(
     if _project_has_fetch_consumers(workspace_path):
         _stage_dev_fetch(container)
         _stage_fetch_wiring(container)
+    # Preset-field env files (host store → supervisor home): the recreate wiped
+    # the supervisor halves; restage BEFORE the box relaunch loop below, whose
+    # _rerun_box create→cp→start reads them (the order-is-load-bearing class).
+    _stage_box_env_files(project, container)
     # F3 Slice 2a: the sysbox recreate reset the supervisor's netns/processes —
     # re-establish loopback forwarders for its registered exported ports (Fork-B).
     _reconcile_loopback_bridges(project, cfg)
@@ -8709,6 +8753,46 @@ def _running_dind_supervisor(project: str) -> str:
     return container
 
 
+# Host store for preset-field env files: ~/.research-sandbox/box-env/<project>/
+# <box>.env — HOST-ONLY (never mounted anywhere; same tier as the dev consumer
+# tokens), 0700 dirs / 0600 files. The durable root that survives supervisor
+# recreates: _recreate_supervisor re-streams it into the supervisor's
+# ~/.rs-box-env/, which rs-sandbox's create→cp→start reads. Swept at box remove
+# (its file) and project destroy (the project dir).
+BOX_ENV_DIR = Path.home() / ".research-sandbox" / "box-env"
+
+
+def _render_box_env(values: dict) -> str:
+    """The box env file: `export K=V` lines, shell-quoted, sorted for a stable
+    diffable file. Pure — the single place field VALUES are serialized, so the
+    quoting is testable without any I/O. Sourced by the box entrypoint and by
+    every login shell; never expanded host-side."""
+    lines = [f"export {k}={shlex.quote(v)}" for k, v in sorted(values.items())]
+    return "\n".join(lines) + "\n"
+
+
+def _stage_box_env_files(project: str, container: str) -> None:
+    """Re-stream every host-stored box env file into the supervisor's
+    ~/.rs-box-env/ (a recreate wiped that copy; _rerun_box's create→cp→start
+    reads it). Best-effort per file: a failed restage degrades to a box whose
+    preset MCP errors visibly in-session — never a failed recreate."""
+    env_dir = BOX_ENV_DIR / project
+    if not env_dir.is_dir():
+        return
+    for f in sorted(env_dir.glob("*.env")):
+        try:
+            content = f.read_text()
+        except OSError:
+            continue
+        r = run(["docker", "exec", "-i", "-u", "research", container, "sh", "-c",
+                 'umask 077 && mkdir -p "$HOME/.rs-box-env" && cat > "$HOME/.rs-box-env/$1"',
+                 "sh", f.name], input=content, capture_output=True)
+        if r.returncode != 0:
+            print(f"warning: failed to restage box env file {f.name!r}; that "
+                  f"box's preset MCP lacks its field values until a later "
+                  f"restage", file=sys.stderr)
+
+
 def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignore[name-defined]
     """Create a sandbox box in a running sandbox-dind supervisor by driving its
     in-box `rs-sandbox create`. Validated fields only reach the list-form argv
@@ -8735,6 +8819,31 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         raise ValidationError(
             f"unknown box preset {req.preset!r} "
             f"(available: {sorted({'empty', *catalog})})")
+    # Image tri-state resolved HERE, in the gate block — pure data over
+    # catalog + req — so ALL gating (the collision pre-flight below needs it)
+    # precedes ALL side effects (harness/image delivery, editor staging, gitea
+    # wiring). `catalog.get(...,{})` degrades correctly for `empty` (absent ⇒
+    # base unless the request overrides).
+    want_browser = (req.browser if req.browser is not None
+                    else catalog.get(req.preset, {}).get("image") == "browser")
+    # Collision pre-flight: the box entrypoint's .mcp.json merge REFUSES on a
+    # name collision, and under --restart unless-stopped that is a silent
+    # crash-loop (box_add reports success; the tab never comes up; the signal
+    # lives in inner docker logs). Both collision classes are statically known
+    # here, so refuse at the form. Names are schema tokens — safe to echo.
+    preset_mcp_names = set(catalog.get(req.preset, {}).get("mcp_servers") or {})
+    if want_browser:
+        clash = sorted(preset_mcp_names & set(box_catalog.BAKED_BROWSER_MCPS))
+        if clash:
+            raise ValidationError(
+                f"preset MCP server name(s) {', '.join(clash)} collide with "
+                f"the browser image's baked tools; rename them in the preset "
+                f"or run this box without the browser")
+    clash = sorted(preset_mcp_names & set(req.mcps))
+    if clash:
+        raise ValidationError(
+            f"preset MCP server name(s) {', '.join(clash)} collide with "
+            f"selected project MCP(s); deselect or rename them")
     allowed = {e["name"] for e in load_project_allowlist(req.project, cfg)
                if e.get("name")}
     bad = [m for m in req.mcps if m not in allowed]
@@ -8767,6 +8876,10 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
             raise ValidationError(
                 "a dev box cannot take the browser image (dev presets are "
                 "base-image only)")
+        if req.field_values:
+            raise ValidationError(
+                "a dev box does not take preset input fields (the catalog "
+                "forbids fields on dev presets)")
         if req.fetch:
             raise ValidationError(
                 "a dev box does not take the rs-fetch option (it works its "
@@ -8810,14 +8923,28 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
             "this box requests rs-fetch, but the dev lane (Gitea) is not "
             "enabled on this host yet — enable Gitea from the Management "
             "page, then retry")
+    # Fields gate (after the dev gate, so dev+fields gets the dev refusal):
+    # provided names must EQUAL the preset's declared set — every declared
+    # field is required, undeclared ones refused. Messages name KEYS only;
+    # the values can be API keys and must never enter an error string.
+    declared = {f["name"]
+                for f in (catalog.get(req.preset, {}).get("fields") or [])}
+    provided = set(req.field_values)
+    if provided != declared:
+        parts = []
+        missing = sorted(declared - provided)
+        extra = sorted(provided - declared)
+        if missing:
+            parts.append(f"missing required field(s): {', '.join(missing)}")
+        if extra:
+            parts.append(f"field(s) not declared by this preset: "
+                         f"{', '.join(extra)}")
+        raise ValidationError("; ".join(parts))
     # Lazily stand up the box harness. On research this stages rs-sandbox + delivers
     # the needed box image on first use (research create/recreate never touch boxes
-    # — the frozen lane); on sandbox-dind (eager-staged) it no-ops. The image a box
-    # needs is the request's explicit tri-state, else the preset's image default —
-    # resolved BEFORE _ensure_box_harness so the image the box will run IS the one
-    # delivered (a research project's lazy delivery keys on this).
-    want_browser = (req.browser if req.browser is not None
-                    else catalog.get(req.preset, {}).get("image") == "browser")
+    # — the frozen lane); on sandbox-dind (eager-staged) it no-ops. want_browser
+    # was resolved in the gate block above, so the image the box will run IS the
+    # one delivered (a research project's lazy delivery keys on this).
     progress.step("harness", "ensuring the box harness")
     _ensure_box_harness(container, project_network_for(req.project),
                         workspace_path, want_browser)
@@ -8898,6 +9025,27 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
                     f"model {box_model!r} does not accept an effort level; "
                     f"remove the effort setting for this box")
             box_effort = ""
+    # Preset-field env staging — after every gate (a rejected request must
+    # leave no file), before the rs-sandbox exec (cmd_create requires the
+    # supervisor-home copy for a fields preset). Values ride the file + stdin
+    # ONLY: never this argv, never docker -e, never the workspace.
+    if req.field_values:
+        env_text = _render_box_env(dict(req.field_values))
+        host_dir = BOX_ENV_DIR / req.project
+        host_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(BOX_ENV_DIR, 0o700)
+        os.chmod(host_dir, 0o700)
+        host_file = host_dir / f"{req.name}.env"
+        fd = os.open(host_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(env_text)
+        r = run(["docker", "exec", "-i", "-u", "research", container, "sh", "-c",
+                 'umask 077 && mkdir -p "$HOME/.rs-box-env" && cat > "$HOME/.rs-box-env/$1"',
+                 "sh", f"{req.name}.env"], input=env_text, capture_output=True)
+        if r.returncode != 0:
+            host_file.unlink(missing_ok=True)
+            die(f"failed to stage the box env file into the supervisor: "
+                f"{(r.stderr or r.stdout).strip()}")
     argv = ["docker", "exec", container, "rs-sandbox", "create"]
     if req.name:
         argv.append(req.name)
@@ -8934,6 +9082,13 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     progress.step("create-box", "creating the box")
     r = run(argv, capture_output=True)
     if r.returncode != 0:
+        # A failed add must not orphan staged secrets (both copies best-effort;
+        # the box itself never ran or was rm'd by rs-sandbox's own die path).
+        if req.field_values:
+            (BOX_ENV_DIR / req.project / f"{req.name}.env").unlink(missing_ok=True)
+            run(["docker", "exec", "-u", "research", container, "sh", "-c",
+                 'rm -f "$HOME/.rs-box-env/$1"', "sh", f"{req.name}.env"],
+                capture_output=True)
         die(f"failed to add box: {(r.stderr or r.stdout).strip()}")
     try:
         info = json.loads(r.stdout)            # rs-sandbox create prints the entry
@@ -9013,6 +9168,14 @@ def box_remove(req: "BoxRemoveRequest", progress=None) -> BoxRemoveResult:  # ty
                      f"{entry['user']}.token"], capture_output=True)
         gitea.prune_entry(req.project, entry.get("repo"), box=req.name)
         _stage_dev_gitea(req.project, load_config())
+    # Preset-field env cleanup (best-effort, the dev-token posture): the host
+    # store copy AND the supervisor-home copy the box was staged from — a
+    # removed box must not leave its key at rest anywhere.
+    (BOX_ENV_DIR / req.project / f"{req.name}.env").unlink(missing_ok=True)
+    if container_running(container):
+        run(["docker", "exec", "-u", "research", container, "sh", "-c",
+             'rm -f "$HOME/.rs-box-env/$1"', "sh", f"{req.name}.env"],
+            capture_output=True)
     return BoxRemoveResult(project=req.project, name=req.name)
 
 
@@ -9057,6 +9220,13 @@ def box_presets(req: "BoxPresetsRequest", _progress=None) -> BoxPresetsResult:  
                 "repo": e.get("repo") or "",
                 "description": e.get("description") or "",
                 "source": e.get("source"),
+                # Declared input fields (the window renders them; secret ⇒
+                # password input) + the visible setup script. Projection, not
+                # passthrough — a key missing HERE never reaches the window.
+                "fields": [{"name": f.get("name"), "label": f.get("label"),
+                            "secret": bool(f.get("secret"))}
+                           for f in (e.get("fields") or [])],
+                "setup": e.get("setup") or "",
                 # Drives the dialog's dev-preset branch (repo picker instead of
                 # the BYO fields; MCP group disabled — both S2 gates reject
                 # mcps on a dev box).
