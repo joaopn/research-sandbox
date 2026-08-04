@@ -3,7 +3,7 @@
   "image": "base",
   "agent_default": true,
   "clone": false,
-  "setup": "pip install --user zotero-mcp-server==0.6.4",
+  "setup": "pip install --user 'zotero-mcp-server[pdf]==0.9.0'",
   "fields": [
     {"name": "ZOTERO_API_KEY", "label": "Zotero API key (from zotero.org/settings/keys)", "secret": true},
     {"name": "ZOTERO_LIBRARY_ID", "label": "Zotero library ID (your userID, shown on the same page)", "secret": false}
@@ -14,6 +14,7 @@
       "env": {
         "ZOTERO_LOCAL": "false",
         "ZOTERO_LIBRARY_TYPE": "user",
+        "ZOTERO_MCP_TOOLSETS": "libraries,discovery,pdf-geometry",
         "ZOTERO_API_KEY": "${ZOTERO_API_KEY}",
         "ZOTERO_LIBRARY_ID": "${ZOTERO_LIBRARY_ID}"
       }

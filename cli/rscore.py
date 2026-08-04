@@ -3775,6 +3775,37 @@ def _wait_for_box_editor_ready(supervisor: str, box_container: str,
     return False
 
 
+# Preset-setup readiness bound. Reasoning: the setup is typically a pinned pip
+# install (~30-90s cold incl. resolver+wheels; slower on the browser image or a
+# cold PyPI path). Half this bound would false-warn on ordinary cold installs;
+# far above it presses the webui's 600s op window with no added signal — a
+# setup still running at 5 minutes is either a huge install (the warn says it
+# finishes in the background) or a crash-loop (visible in the tab either way).
+BOX_SETUP_READY_TIMEOUT_S = 300
+
+
+def _wait_for_box_setup_done(supervisor: str, box_container: str,
+                             timeout: int = BOX_SETUP_READY_TIMEOUT_S) -> bool:
+    """Poll until the box's run-once preset setup finished (the entrypoint
+    touches ~/.rs-box-setup-done AFTER a successful RS_BOX_SETUP run — and the
+    .mcp.json merge runs after that still). Without this hold, box_add returns
+    while pip is mid-install: the operator opens the fresh tab, starts the
+    agent, and it discovers NO .mcp.json — a running session never reloads it,
+    so the box looks wired-but-dead (the editor-gate class: op-done must mean
+    usable). Best-effort: False after ``timeout`` ⇒ the caller warns and
+    proceeds (a crash-looping setup also lands here; the tab shows it)."""
+    import time
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if run(["docker", "exec", supervisor, "docker", "exec", box_container,
+                "test", "-f", "/home/worker/.rs-box-setup-done"],
+               capture_output=True).returncode == 0:
+            return True
+        time.sleep(2)
+    return False
+
+
 def stage_worker_image(container: str, image: str, force: bool = False) -> None:
     """Push the host-built image into the supervisor's inner Docker daemon.
 
@@ -9110,6 +9141,21 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         if not _wait_for_box_editor_ready(container, info["container"]):
             print(f"warning: box editor not listening on :{CODE_SERVER_STUB_PORT} "
                   f"after {EDITOR_READY_TIMEOUT_S}s; it should come up shortly")
+    # Preset setup hold (the editor-gate class): op-done must mean the box is
+    # USABLE — the setup installs the preset's software and the .mcp.json merge
+    # runs after it, so returning early invites starting the agent into a box
+    # with no MCP config yet (a running session never reloads it).
+    if catalog.get(req.preset, {}).get("setup"):
+        progress.step("setup", "waiting for the preset setup to finish")
+        if not _wait_for_box_setup_done(container, info["container"]):
+            # Two causes land here and the wording must carry BOTH: a genuinely
+            # slow install, or a FAILING setup (non-zero exit → the box restarts
+            # under --restart and retries forever; the sentinel never appears).
+            # "Wait for it to settle" alone would misdirect the crash-loop case.
+            print(f"warning: preset setup not finished after "
+                  f"{BOX_SETUP_READY_TIMEOUT_S}s — it may still be installing, "
+                  f"or it may be failing (a failed setup restarts the box and "
+                  f"retries); check the box's tab before starting the agent")
     progress.step("ready", "box ready")
     return BoxAddResult(project=req.project, name=info["name"], ip=info["ip"],
                         preset=info.get("preset", req.preset),

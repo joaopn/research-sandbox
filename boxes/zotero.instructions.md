@@ -9,6 +9,12 @@ If `/workspace/.tools-inventory.md` exists, read it first — it lists the tools
 wired into this box (the zotero server, plus browser tools if this box has the
 Browser toggle, plus any project MCP servers).
 
+The zotero toolset is deliberately trimmed: semantic/vector search, the scite
+enrichment tools, feeds, item relations, and duplicate-merging are NOT
+available in this box — do not hunt for them. Keyword/tag/collection search
+plus fulltext retrieval is the intended search surface; PDF outline and page
+tools ARE available for cheap orientation before pulling full text.
+
 ## First action of every session: credential self-check
 
 Before any task, make one cheap zotero call (e.g. a one-item search). If it

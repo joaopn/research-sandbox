@@ -165,7 +165,15 @@ fi
 # --restart unless-stopped until healed (byo parity — deliberate, not a bug).
 if [[ -n "${RS_BOX_SETUP:-}" && ! -f ~/.rs-box-setup-done ]]; then
     echo "sandbox-box[${RS_SANDBOX_NAME}]: running preset setup"
-    ( cd /workspace && bash -lc "${RS_BOX_SETUP}" )
+    # Plain bash -c, NOT -l: a login shell rebuilds PATH from /etc/profile and
+    # LOSES the image's conda/docker ENV PATH (pip → exit 127; the bare-python3
+    # class — and this box lineage forks off BEFORE minimal-base's profile.d
+    # PATH drop-in, so a login shell here has neither conda nor ~/.local/bin).
+    # This entrypoint already sourced ~/.rs-box.env above, so the setup inherits
+    # the field values AND the full image environment. The ~/.local/bin prepend
+    # lets a setup that installs a console script also RUN it
+    # (pip install --user X && X --init).
+    ( cd /workspace && PATH="$HOME/.local/bin:$PATH" bash -c "${RS_BOX_SETUP}" )
     touch ~/.rs-box-setup-done
 fi
 
