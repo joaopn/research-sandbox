@@ -6738,29 +6738,28 @@ function surfaceOf(id, svc) {
     return svc.surface || (svc.kind === "http" ? "visual" : "cli");
 }
 
-// Per-tab icon name, default-derived: the editor gets the code glyph, any
-// cli surface gets the terminal glyph, everything else the generic window.
-function iconOf(id, svc) {
-    if (svc.icon) return svc.icon;
+// Tab TYPE for the strip's color coding (a colored top border per family):
+// "cli" = terminals, "editor" = code-server + box editors (the spec stamp),
+// "git" = gitea fork tabs + fetch panes, "other" = everything else (reader,
+// exported ports, unknown). Keyed on spec DATA where the spec carries it —
+// an explicit tab_type, then the fields openHttpService itself dispatches
+// on — never on id prefixes.
+function tabTypeOf(id, svc) {
+    if (svc.tab_type) return svc.tab_type;
+    if (svc.gitea_path || svc.fetch_repo || svc.fetch_all) return "git";
     if (id === "code-server") return "editor";
-    return surfaceOf(id, svc) === "cli" ? "terminal" : "generic";
+    return surfaceOf(id, svc) === "cli" ? "cli" : "other";
 }
 
-// Hand-authored inline SVG glyphs (CSP-clean: inline markup, currentColor,
-// no external refs). Built via innerHTML — the makePinButton() precedent —
-// because el() routes through createElement, which makes an inert
-// HTML-namespace <svg> that does not render.
-const TAB_ICON_SVG = {
-    editor: '<svg viewBox="0 0 16 16" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M5.5 3.4 1 8l4.5 4.6L7 11.1 3.9 8 7 4.9zM10.5 3.4 9 4.9 12.1 8 9 11.1l1.5 1.5L15 8z"/></svg>',
-    terminal: '<svg viewBox="0 0 16 16" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><path d="M2 2.9 3.4 1.5 9.9 8l-6.5 6.5L2 13.1 7.1 8z"/><path d="M8 12h6v2H8z"/></svg>',
-    generic: '<svg viewBox="0 0 16 16" fill="currentColor" fill-rule="evenodd" xmlns="http://www.w3.org/2000/svg"><path d="M1.5 3h13v10h-13V3zm1.5 1.5v7h10v-7H3z"/></svg>',
-};
-
-function iconSvg(name) {
-    const span = el("span", { class: "tab-icon" });
-    span.innerHTML = TAB_ICON_SVG[name] || TAB_ICON_SVG.generic;
-    return span;
-}
+// Per-tab refresh glyph (a ¾ ring + clockwise arrowhead). Hand-authored
+// inline SVG (CSP-clean: inline markup, currentColor, no external refs).
+// Built via innerHTML — the makePinButton() precedent — because el() routes
+// through createElement, which makes an inert HTML-namespace <svg> that
+// does not render.
+const REFRESH_TAB_SVG =
+    '<svg viewBox="0 0 16 16" fill="currentColor" xmlns="http://www.w3.org/2000/svg">' +
+    '<path d="M8 1.5A6.5 6.5 0 1 1 1.5 8h2A4.5 4.5 0 1 0 8 3.5z"/>' +
+    '<path d="M8 0l4.5 2.5L8 5z"/></svg>';
 
 function renderServiceTabs(projectName, enabled) {
     const strip = document.getElementById("service-tabs");
@@ -6803,12 +6802,17 @@ function renderServiceTabs(projectName, enabled) {
     const makeTab = (id) => {
         const svc = enabled[id];
         const isPinned = id === state.pinnedService;
+        const refreshBtn = el("button", {
+            class: "refresh-tab-btn", title: "Refresh tab",
+        });
+        refreshBtn.innerHTML = REFRESH_TAB_SVG;
+        refreshBtn.onclick = (ev) => { ev.stopPropagation(); refreshService(id); };
         const pinBtn = el("button", {
             class: "pin-tab-btn",
             title: isPinned ? "Unpin from side" : "Pin to side",
         }, ["⇥"]);
         pinBtn.onclick = (ev) => { ev.stopPropagation(); togglePin(id); };
-        const kids = [iconSvg(iconOf(id, svc)), el("span", {}, [svc.label || id]), pinBtn];
+        const kids = [refreshBtn, el("span", {}, [svc.label || id]), pinBtn];
         // A real box tab (box_kind === "sandbox") carries a ✕ that discards the box
         // in place — box deletion lives on the tab, not in a sidebar settings panel.
         if (boxHarness && id.startsWith("pi-iso-") && svc.box_kind === "sandbox") {
@@ -6828,6 +6832,10 @@ function renderServiceTabs(projectName, enabled) {
             // Surface stamp for the mobile CSS (visual tabs are hidden there);
             // nothing desktop keys on it.
             "data-surface": surfaceOf(id, svc),
+            // Type stamp for the color-coded top border (style.css
+            // [data-tabtype] rules); scoping on the attribute keeps the
+            // Projects tab / project chip border-free.
+            "data-tabtype": tabTypeOf(id, svc),
             onclick: () => activateService(id),
         }, kids);
     };
@@ -6846,6 +6854,29 @@ function renderServiceTabs(projectName, enabled) {
         addBox.onclick = () => mgmtBoxAddDialog(projectName);
         strip.appendChild(addBox);
     }
+}
+
+// Refresh a tab's content in place: tear down the live pane (terminal,
+// iframe, or fetch panel) and re-run the open path via activateService. ssh
+// tabs reattach byobu (the session and its content survive server-side; only
+// the browser-side xterm scrollback resets), http tabs re-mint their session
+// and reload the upstream, fetch panes re-fetch. Nulling onclose BEFORE the
+// close is load-bearing for LIVE terminals: the old socket's async close
+// event recomputes the key at fire time and would stamp `disconnected` on
+// the FRESH entry the reopen registers under it (the disconnected-branch
+// teardown in activateService doesn't need this — there the ws is already
+// closed, so close() cannot re-fire the handler).
+function refreshService(serviceId) {
+    if (!state.activeProject) return;
+    const key = tkey(state.activeProject, serviceId);
+    const t = state.terminals[key];
+    if (t) {
+        try { if (t.ws) { t.ws.onclose = null; t.ws.close(); } } catch (_) {}
+        try { if (t.term) t.term.dispose(); } catch (_) {}
+        try { if (t.container) t.container.remove(); } catch (_) {}
+        delete state.terminals[key];
+    }
+    activateService(serviceId);
 }
 
 function activateService(serviceId) {

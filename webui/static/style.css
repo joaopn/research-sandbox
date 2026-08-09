@@ -28,6 +28,12 @@
     --type-sandbox-border: #17a2b8;
     --type-box-border: #8a8a8a;   /* neutral grey = bare box (empty / BYO) */
     --type-store-border: #a371f7; /* violet = imported-repo store workflow */
+    /* service-tab type borders (the strip's color code, top edge) — hues
+       reuse the badge palette above so the UI stays one palette */
+    --tab-type-cli: #2e7d32;      /* green = terminal tabs (the research green) */
+    --tab-type-editor: #17a2b8;   /* cyan = editor tabs (the sandbox cyan) */
+    --tab-type-git: #d29922;      /* amber = git fork/fetch tabs (the code amber) */
+    --tab-type-other: #8a8a8a;    /* grey = everything else (reader, ports) */
     /* New-Project card tag chips (research reuses the research green, dind the
        sandbox cyan; code/data get their own hues). */
     --tag-research: #2e7d32;
@@ -419,6 +425,15 @@ body {
     box-shadow: 0 -2px 0 var(--fg-accent) inset;
 }
 .service-tabs .tab:hover:not(.active) { background: var(--border); }
+/* Type color code — a 3px top border per tab family, stamped as data-tabtype
+   by makeTab. Scoped on the attribute so the Projects tab and the project
+   chip stay border-free. A real border, NOT box-shadow: the .active underline
+   owns the box-shadow channel and would clobber a shadow-based stripe. Base
+   color = "other"; the three overrides recolor per family. */
+.service-tabs .tab[data-tabtype] { border-top: 3px solid var(--tab-type-other); }
+.service-tabs .tab[data-tabtype="cli"] { border-top-color: var(--tab-type-cli); }
+.service-tabs .tab[data-tabtype="editor"] { border-top-color: var(--tab-type-editor); }
+.service-tabs .tab[data-tabtype="git"] { border-top-color: var(--tab-type-git); }
 .service-tabs .empty {
     padding: 0 14px;
     display: flex;
@@ -456,15 +471,22 @@ body {
     background: var(--border);
     flex-shrink: 0;
 }
-/* Inline-SVG tab icon. Inherits the tab's `color`, so the active/hover
-   states recolor it for free via currentColor. The .tab's flex `gap`
-   spaces it from the label. */
-.service-tabs .tab .tab-icon {
+/* Per-tab refresh button — sits where the old type icon did (leftmost kid).
+   Ghost-icon styling mirrors the pin button, minus its left margin (the
+   .tab's flex `gap` does the spacing here). The svg inherits the tab's
+   `color` via currentColor, so active/hover states recolor it for free. */
+.service-tabs .tab .refresh-tab-btn {
+    background: transparent;
+    border: none;
+    color: var(--fg-faint);
+    cursor: pointer;
+    padding: 0;
     display: inline-flex;
     align-items: center;
     flex-shrink: 0;
 }
-.service-tabs .tab .tab-icon svg {
+.service-tabs .tab .refresh-tab-btn:hover { color: var(--fg-base); }
+.service-tabs .tab .refresh-tab-btn svg {
     display: block;
     width: 14px;
     height: 14px;
@@ -1532,14 +1554,17 @@ html.mobile .dashboard.mobile-projects .service-tabs .active-project {
    panes (both the per-repo one and the project-wide all-mirrors one, which
    share the prefix) are lightweight RS-rendered HTML that scrolls.
    code-server / box editors / port-<n> stay desktop-only. Pin buttons
-   stay hidden (no split panes on mobile); + Add box and the per-box ✕ are
-   SHOWN (dind box lifecycle from the phone; their dialogs are sheet-styled). */
+   stay hidden (no split panes on mobile) and so does the per-tab refresh
+   button (PI decision: too small a target beside a live terminal — a
+   mis-tap would reconnect it; a dead tab still reconnects by tapping the
+   tab itself); + Add box and the per-box ✕ are SHOWN (dind box lifecycle
+   from the phone; their dialogs are sheet-styled). */
 html.mobile .service-tabs { height: 52px; }
 html.mobile .service-tabs .tab { font-size: 14px; }
-html.mobile .service-tabs .tab .tab-icon svg { width: 16px; height: 16px; }
 html.mobile .service-tabs .projects-tab,
 html.mobile .service-tabs .tab[data-surface="visual"]:not([data-service="reader"]):not([data-service^="git-"]):not([data-service^="fetch-"]),
 html.mobile .service-tabs .pin-tab-btn,
+html.mobile .service-tabs .refresh-tab-btn,
 html.mobile .service-tabs .tab-group-divider { display: none; }
 
 /* The chip as a control: chevron affordance + comfortable tap height. The

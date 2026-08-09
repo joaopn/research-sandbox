@@ -145,10 +145,10 @@ def pi_isolated_editor_service(name: str, port: int) -> dict | None:
         "renderer": "iframe",
         "default_port": int(port),
         "upstream_path": "/",
-        # The SPA's iconOf honors an explicit spec icon before its kind-derived
-        # default, so a box's editor tab renders the same code glyph as the
-        # project's own Editor tab instead of the generic window.
-        "icon": "editor",
+        # The SPA's tabTypeOf honors an explicit spec tab_type before its
+        # derived default, so a box's editor tab gets the same editor-type
+        # border color as the project's own Editor tab instead of "other".
+        "tab_type": "editor",
     }
 
 
