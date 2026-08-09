@@ -406,6 +406,8 @@ body {
     height: 36px;
     flex-shrink: 0;
     overflow-x: auto;
+    /* Anchor for the absolutely-positioned drag drop-indicator. */
+    position: relative;
 }
 .service-tabs .tab {
     display: flex;
@@ -626,6 +628,36 @@ body {
     flex-shrink: 0;
 }
 .service-tabs .add-box-tab-btn:hover { background: var(--border); color: var(--fg-base); }
+/* Drag-to-reorder chrome. The ghost is a body-level clone (the .service-tabs
+   descendant rules don't reach it, so it carries its own tab-like look); the
+   indicator is a strip-anchored insertion caret; the source tab dims while
+   dragging. All pointer-events:none — hit-testing is mathematical. */
+.tab-drag-ghost {
+    position: fixed;
+    z-index: 1000;
+    pointer-events: none;
+    opacity: 0.8;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 30px;
+    padding: 0 14px;
+    background: var(--bg-active);
+    border: 1px solid var(--border-strong);
+    border-radius: 4px;
+    font-size: 13px;
+    color: var(--fg-base);
+    white-space: nowrap;
+}
+.service-tabs .tab-drop-indicator {
+    position: absolute;
+    top: 4px;
+    bottom: 4px;
+    width: 2px;
+    background: var(--fg-accent);
+    pointer-events: none;
+}
+.service-tabs .tab.dragging { opacity: 0.4; }
 .service-tabs .tab.pinned {
     box-shadow: 0 -2px 0 var(--fg-accent) inset, inset 0 0 0 9999px rgba(127, 127, 127, 0.05);
 }

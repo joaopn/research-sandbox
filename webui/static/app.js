@@ -6761,6 +6761,178 @@ const REFRESH_TAB_SVG =
     '<path d="M8 1.5A6.5 6.5 0 1 1 1.5 8h2A4.5 4.5 0 1 0 8 3.5z"/>' +
     '<path d="M8 0l4.5 2.5L8 5z"/></svg>';
 
+// ---- tab layout (vault `tab_columns`) --------------------------------------
+
+// Default tab order for a project that has never been arranged: Visual
+// (editors / iframe surfaces) first — the editor is the primary work
+// surface — then CLI (terminals), preserving SERVICES insertion order within
+// each group. This partition is the ONLY survivor of the old grouped-strip
+// rendering (its divider is gone); it seeds order and nothing else.
+function defaultTabOrder(visibleIds, enabled) {
+    const visual = [], cli = [];
+    for (const id of visibleIds) {
+        (surfaceOf(id, enabled[id]) === "visual" ? visual : cli).push(id);
+    }
+    return visual.concat(cli);
+}
+
+// Reconcile the project's persisted tab layout (vault `tab_columns`, an array
+// of columns each holding service ids — single-column at this stage) against
+// the currently VISIBLE ids. Pure and EPHEMERAL: ids that vanished are
+// dropped, duplicates collapse, never-seen ids append to column 0's tail in
+// default relative order, empty columns fold away. It never writes the
+// vault — persistence happens only on user arrangement actions (a drop), so
+// a flapping service probe can't churn vault writes. A project without the
+// field decodes to a single column in default order — vault schema stays v1
+// (the tolerant-decode precedent of the retired pinned_service field).
+function reconcileTabLayout(project, visibleIds, enabled) {
+    // Single-column by construction at this stage: stored columns concatenate
+    // into one order, so the renderer (which draws columns[0]) can never
+    // silently drop a tab. The column-splits stage generalizes this body.
+    const stored = Array.isArray(project?.tab_columns) ? project.tab_columns : [];
+    const seen = new Set();
+    const order = [];
+    for (const col of stored) {
+        if (!Array.isArray(col)) continue;
+        for (const id of col) {
+            if (typeof id === "string" && visibleIds.includes(id) && !seen.has(id)) {
+                seen.add(id);
+                order.push(id);
+            }
+        }
+    }
+    for (const id of defaultTabOrder(visibleIds, enabled)) {
+        if (!seen.has(id)) order.push(id);
+    }
+    return [order];
+}
+
+async function persistTabLayout(project, columns) {
+    project.tab_columns = columns;
+    await persistVault();
+}
+
+// ---- tab drag-to-reorder (desktop only) ------------------------------------
+
+// A press is a CLICK below this slop and a DRAG above it — click-to-activate
+// must survive arming. 5px is the common browser drag threshold: small
+// enough that a deliberate drag engages immediately, large enough that a
+// shaky press still lands as a click.
+const TAB_DRAG_SLOP_PX = 5;
+
+// With pointer capture the browser synthesizes the post-drag click on the
+// captured tab (possibly already detached by the drop re-render) — this
+// module flag lets the tab's onclick swallow exactly that one click.
+let tabDragClickPending = false;
+function consumeTabDragClick() {
+    const pending = tabDragClickPending;
+    tabDragClickPending = false;
+    return pending;
+}
+
+// Pointer-based drag (setPointerCapture), NEVER HTML5 drag-and-drop: captured
+// moves keep routing to the tab while the pointer crosses cross-origin
+// iframes (the splitter precedent — see installSplitterDrag), where dragover
+// events would die inside the frame's browsing context. The drop position is
+// resolved mathematically from tab midpoints, never via elementFromPoint.
+// ctx = { projectName, enabled, project, columns } closed over by the render.
+function armTabDrag(tab, id, ctx) {
+    tab.onpointerdown = (ev) => {
+        if (mobileModeActive()) return;           // desktop-only affordance
+        if (ev.button !== 0) return;
+        if (ev.target.closest("button")) return;  // refresh / box ✕ keep their clicks
+        const strip = document.getElementById("service-tabs");
+        if (!strip || !ctx.project) return;       // no vault entry — nothing to persist to
+        const startX = ev.clientX, startY = ev.clientY;
+        let dragging = false;
+        let ghost = null, indicator = null;
+        let dropIndex = -1;
+        const onMove = (mv) => {
+            if (!dragging) {
+                if (Math.abs(mv.clientX - startX) < TAB_DRAG_SLOP_PX
+                    && Math.abs(mv.clientY - startY) < TAB_DRAG_SLOP_PX) return;
+                dragging = true;
+                tab.classList.add("dragging");
+                document.body.style.userSelect = "none";
+                ghost = tab.cloneNode(true);
+                ghost.classList.add("tab-drag-ghost");
+                document.body.appendChild(ghost);
+                indicator = el("div", { class: "tab-drop-indicator" });
+                strip.appendChild(indicator);
+            }
+            ghost.style.left = `${mv.clientX + 10}px`;
+            ghost.style.top = `${mv.clientY + 10}px`;
+            // Insertion index over the strip's service tabs (midpoint rule);
+            // the dragged tab itself stays in the list — the drop adjusts.
+            const tabs = Array.from(strip.querySelectorAll(".tab[data-service]"));
+            dropIndex = tabs.length;
+            for (let i = 0; i < tabs.length; i++) {
+                const r = tabs[i].getBoundingClientRect();
+                if (mv.clientX < r.left + r.width / 2) { dropIndex = i; break; }
+            }
+            const stripR = strip.getBoundingClientRect();
+            const anchor = tabs[Math.min(dropIndex, tabs.length - 1)];
+            const ar = anchor.getBoundingClientRect();
+            const edgeX = dropIndex < tabs.length ? ar.left : ar.right;
+            indicator.style.left = `${edgeX - stripR.left + strip.scrollLeft}px`;
+        };
+        const cleanup = () => {
+            // lostpointercapture FIRST: the explicit release below fires it
+            // synchronously, and removing this listener before releasing is
+            // what prevents a re-entrant onCancel → cleanup cycle.
+            tab.removeEventListener("lostpointercapture", onCancel);
+            tab.removeEventListener("pointermove", onMove);
+            tab.removeEventListener("pointerup", onUp);
+            tab.removeEventListener("pointercancel", onCancel);
+            try { tab.releasePointerCapture(ev.pointerId); } catch (_) {}
+            if (ghost) ghost.remove();
+            if (indicator) indicator.remove();
+            tab.classList.remove("dragging");
+            document.body.style.userSelect = "";
+        };
+        const onCancel = () => { cleanup(); };
+        const onUp = async () => {
+            const didDrag = dragging;
+            const target = dropIndex;
+            cleanup();
+            if (!didDrag) return;                 // plain click — let it through
+            tabDragClickPending = true;
+            const order = ctx.columns[0];
+            const from = order.indexOf(id);
+            if (from === -1 || target < 0) return;
+            let insert = target;
+            if (from < insert) insert -= 1;
+            if (insert === from) return;          // dropped where it started
+            order.splice(from, 1);
+            order.splice(insert, 0, id);
+            await persistTabLayout(ctx.project, ctx.columns);
+            // Staleness bail (the refreshActiveServices idiom): the active
+            // project may have changed during the await — never paint another
+            // project's strip from this closure's captured ctx.
+            if (state.activeProject !== ctx.projectName) return;
+            renderServiceTabs(ctx.projectName, ctx.enabled);
+            // The rebuild drops the active underline; activateService
+            // early-returns on the existing connected pane, so this only
+            // re-applies chrome (the refreshActiveServices idiom).
+            if (state.activeService) activateService(state.activeService);
+        };
+        tab.setPointerCapture(ev.pointerId);
+        tab.addEventListener("pointermove", onMove);
+        tab.addEventListener("pointerup", onUp);
+        tab.addEventListener("pointercancel", onCancel);
+        // A mid-drag strip re-render (refreshActiveServices on a service-set
+        // signature change — e.g. a box editor's stub coming up) detaches the
+        // captured tab, which implicitly releases capture and fires
+        // lostpointercapture at the detached element; the subsequent pointerup
+        // goes elsewhere, so WITHOUT this path neither onUp nor onCancel would
+        // run — the ghost would leak and body user-select would stick. The
+        // drag dies cleanly at the re-render instead (which also retires the
+        // stale-ctx splice class). A plain click never reaches it: onUp
+        // removes this listener before the implicit post-pointerup release.
+        tab.addEventListener("lostpointercapture", onCancel);
+    };
+}
+
 function renderServiceTabs(projectName, enabled) {
     const strip = document.getElementById("service-tabs");
     if (!strip) return;
@@ -6777,6 +6949,20 @@ function renderServiceTabs(projectName, enabled) {
         mobileToggleProjects();
     };
     strip.appendChild(chip);
+    // + Add box sits in the chrome cluster — chip-adjacent, BEFORE the
+    // separator (PI decision: `Projects | name | + | ─ | tabs`) — for ANY
+    // dind project (research + sandbox-dind): the server stamps `box_harness`
+    // on the always-present Supervisor tab spec (STAGE_DIND_UNIFY); on
+    // research the harness is staged lazily on the first box_add. Boxes are
+    // created where they appear, not in a sidebar settings panel.
+    const boxHarness = !!(enabled["supervisor"] && enabled["supervisor"].box_harness);
+    if (boxHarness) {
+        const addBox = el("button", {
+            class: "add-box-tab-btn", title: "Add a box",
+        }, ["+"]);
+        addBox.onclick = () => mgmtBoxAddDialog(projectName);
+        strip.appendChild(addBox);
+    }
     strip.appendChild(el("div", { class: "tab-group-divider" }));
     const ids = visibleServiceIds(projectName, enabled);
     if (ids.length === 0) {
@@ -6785,20 +6971,15 @@ function renderServiceTabs(projectName, enabled) {
         ]));
         return;
     }
-    // Partition into Visual (editors / iframe surfaces) then CLI (terminals),
-    // preserving SERVICES insertion order within each group. Visual leads —
-    // the editor is the primary work surface. A thin vertical rule separates
-    // the groups, omitted when either is empty so a CLI-only project (e.g. a
-    // bare docker box with no live editor) shows no orphan divider.
-    // The box harness is a standing dind utility (STAGE_DIND_UNIFY): the server
-    // stamps `box_harness` on the always-present Supervisor tab spec for ANY dind
-    // project (research + sandbox-dind), so the "+ Add box" control shows on both.
+    // Tab order comes from the project's persisted layout (vault
+    // `tab_columns`, single-column at this stage), reconciled against the
+    // visible set — the old visual-then-CLI partition survives only inside
+    // defaultTabOrder as the never-arranged default, and its group divider
+    // is gone (order is free-form; drag to rearrange).
     // A pi-iso-* tab is a disposable BOX (gets the ✕) when box_kind === "sandbox".
-    const boxHarness = !!(enabled["supervisor"] && enabled["supervisor"].box_harness);
-    const visual = [], cli = [];
-    for (const id of ids) {
-        (surfaceOf(id, enabled[id]) === "visual" ? visual : cli).push(id);
-    }
+    const project = state.vault.projects.find((p) => p.name === projectName);
+    const columns = reconcileTabLayout(project, ids, enabled);
+    const dragCtx = { projectName, enabled, project, columns };
     const makeTab = (id) => {
         const svc = enabled[id];
         const isPinned = id === state.pinnedService;
@@ -6826,7 +7007,7 @@ function renderServiceTabs(projectName, enabled) {
             };
             kids.push(closeBtn);
         }
-        return el("div", {
+        const tab = el("div", {
             class: isPinned ? "tab pinned" : "tab",
             "data-service": id,
             // Surface stamp for the mobile CSS (visual tabs are hidden there);
@@ -6836,24 +7017,17 @@ function renderServiceTabs(projectName, enabled) {
             // [data-tabtype] rules); scoping on the attribute keeps the
             // Projects tab / project chip border-free.
             "data-tabtype": tabTypeOf(id, svc),
-            onclick: () => activateService(id),
+            // consumeTabDragClick swallows the one click the browser
+            // synthesizes on the captured tab after a real drag.
+            onclick: () => {
+                if (consumeTabDragClick()) return;
+                activateService(id);
+            },
         }, kids);
+        armTabDrag(tab, id, dragCtx);
+        return tab;
     };
-    for (const id of visual) strip.appendChild(makeTab(id));
-    if (visual.length > 0 && cli.length > 0) {
-        strip.appendChild(el("div", { class: "tab-group-divider" }));
-    }
-    for (const id of cli) strip.appendChild(makeTab(id));
-    // + Add box lives on the strip for ANY dind project (research + sandbox-dind);
-    // boxes are created where they appear, not in a sidebar settings panel. On
-    // research the harness is staged lazily on the first box_add (STAGE_DIND_UNIFY).
-    if (boxHarness) {
-        const addBox = el("button", {
-            class: "add-box-tab-btn", title: "Add a box",
-        }, ["+"]);
-        addBox.onclick = () => mgmtBoxAddDialog(projectName);
-        strip.appendChild(addBox);
-    }
+    for (const id of columns[0]) strip.appendChild(makeTab(id));
 }
 
 // Refresh a tab's content in place: tear down the live pane (terminal,
