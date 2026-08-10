@@ -20,7 +20,7 @@ const RAIL_WIDTH_DEFAULT = 200;
 // viewports. Min is intentionally permissive — at 80px the footer
 // dropdowns clip but project names + status dots stay legible, which
 // is the only thing the rail actually has to show when shrunk to a
-// status strip. Same posture as SPLIT_RATIO_MIN/MAX.
+// status strip. Same posture as COLUMN_MIN_FRAC.
 const RAIL_WIDTH_MIN = 80;
 const RAIL_WIDTH_MAX = 480;
 const PBKDF2_ITERATIONS = 600000;
@@ -40,12 +40,19 @@ const PROBE_INTERVAL_MS = 15000;
 // PROBE_INTERVAL_MS because the data is filesystem-derived and changes on
 // human / worker timescales (minutes), not network-up timescales (seconds).
 const STATUS_INTERVAL_MS = 20000;
-// Split-pane (W8): main-pane fraction bounds. 0.5 keeps the main pane at
-// least half (below that, pin a different service); 0.9 leaves the side
-// pane ~10% — enough room for a slim agent strip on widescreen monitors.
-const SPLIT_RATIO_DEFAULT = 0.7;
-const SPLIT_RATIO_MIN = 0.5;
-const SPLIT_RATIO_MAX = 0.9;
+// Column layout: up to three side-by-side groups, each a width fraction of
+// the terminal area. The floor keeps every column usable — below ~15% of a
+// typical desktop area neither a tab strip nor a terminal has workable
+// width — and the splitter clamp derives from it (a drag can never crush a
+// neighbor to nothing). Three columns is the ceiling the PI set: the daily
+// case is editor + one or two terminal groups; beyond that, panes stop
+// earning their width.
+const MAX_TAB_COLUMNS = 3;
+const COLUMN_MIN_FRAC = 0.15;
+// Fraction of a column's width forming the left/right drop bands that split
+// a new column out of it. 0.2 is wide enough to hit at drag speed while
+// keeping the center (move-into) zone dominant.
+const COLUMN_EDGE_BAND_FRAC = 0.2;
 // Mobile shell (bottom-nav single-pane layout). Mode is a device-local
 // preference like the theme — localStorage, never the vault: "auto" (absent)
 // follows the breakpoint, "desktop"/"mobile" pin it (the Settings Layout
@@ -254,8 +261,8 @@ const state = {
     railPinned: false,       // persisted: keep rail in flex flow (push layout)
     railExpanded: false,     // in-memory: rail visible (overlay when unpinned)
     railWidth: RAIL_WIDTH_DEFAULT,  // persisted: rail width in px
-    pinnedService: null,     // service id pinned to side pane for active project, or null
-    splitRatio: SPLIT_RATIO_DEFAULT,  // main-pane fraction when split
+    columnActive: [],        // per-column shown service id for the active project (session-only)
+    tabLayout: null,         // last engine-reconciled {columns, ratios} (drag/splitter working copy)
     iframeZoom: IFRAME_ZOOM_DEFAULT,  // CSS transform scale applied to http-kind iframes
 };
 
@@ -1177,7 +1184,7 @@ function setServiceTabsHidden(hidden) {
     // Hide the service tabs AND the group divider in the global host view —
     // the divider is neither a .tab nor data-service-bearing, so without it
     // a floating rule would strand after the active-project label.
-    document.querySelectorAll("#service-tabs .tab[data-service], #service-tabs .tab-group-divider")
+    document.querySelectorAll("#service-tabs .tab[data-service], #service-tabs .tab-group-divider, #service-tabs .column-tab-group")
         .forEach((t) => { t.style.display = hidden ? "none" : ""; });
 }
 function setActiveNavEntry(cls) {
@@ -5587,6 +5594,11 @@ async function refreshActiveServices() {
     if (serviceTabsSignature(fresh) === serviceTabsSignature(current)) return;
     state.projectServices[name] = fresh;
     renderServiceTabs(name, fresh);
+    // The column engine must reconcile on THIS signature-change path too —
+    // a vanished service's tab would otherwise linger in its column strip
+    // and an appeared one would never join. Reconciliation is pure (no
+    // vault write), so a flapping probe can't churn the vault.
+    applyColumnLayout();
     // renderServiceTabs rebuilds the strip without the active underline; re-apply
     // it. activateService returns early on an existing, connected terminal, so no
     // open pane is torn down. If the active service vanished (a listener stopped),
@@ -5763,8 +5775,8 @@ function lockVault() {
     state.activeProject = null;
     state.activeService = null;
     state.projectServices = {};
-    state.pinnedService = null;
-    state.splitRatio = SPLIT_RATIO_DEFAULT;
+    state.columnActive = [];
+    state.tabLayout = null;
     state.railExpanded = state.railPinned;
     renderUnlock();
 }
@@ -5979,90 +5991,56 @@ function teardownProjectState(name) {
     }
 }
 
-// ---- split pane (W8) -------------------------------------------------------
+// ---- column layout engine (flat host) --------------------------------------
 
-// Where a new .terminal-instance should be appended given the current pin
-// state. The unsplit case returns .terminal-area itself — preserves today's
-// DOM exactly.
-function paneFor(serviceId) {
-    const area = document.getElementById("terminal-area");
-    if (!area) return null;
-    if (state.pinnedService && serviceId === state.pinnedService) {
-        return area.querySelector(".side-pane") || area;
-    }
-    return area.querySelector(".main-pane") || area;
+// The terminal area is a FLAT host: every .terminal-instance stays its direct
+// child forever — the engine assigns visible containers computed rectangles
+// (percent-based inline left/width/top) instead of re-parenting them into
+// pane wrappers. Load-bearing: moving an <iframe> node ANYWHERE in the DOM
+// discards and reloads its browsing context (spec behavior — the retired
+// split-pane code did exactly that on pin toggles), so arrangement must be
+// geometry-only. Percent units make window resizes self-adapting; the global
+// refit listener + scheduleColumnRefit handle xterm re-measurement.
+
+// Service id back out of a terminals key (`${project}:${service}`) for the
+// active project.
+function serviceOfKey(k) {
+    return k.slice(state.activeProject.length + 1);
 }
 
-// Mutate .terminal-area between unsplit and split shapes idempotently.
-// Called whenever pin state changes or a project becomes active. Existing
-// .terminal-instance children get re-parented into the right pane; .hidden
-// classes are recomputed for the active project's terminals so the pinned
-// one stays visible and the active one shows in the main pane.
-function applySplitLayout() {
-    const area = document.getElementById("terminal-area");
-    if (!area) return;
-    const pinned = state.pinnedService;
-    const isSplit = area.classList.contains("split");
+const pctOf = (f) => `${(f * 100).toFixed(4)}%`;
 
-    if (!pinned && isSplit) {
-        // Collapse: hoist pane children back up to .terminal-area, drop wrappers.
-        const main = area.querySelector(".main-pane");
-        const side = area.querySelector(".side-pane");
-        const splitter = area.querySelector(".pane-splitter");
-        if (main) while (main.firstChild) area.appendChild(main.firstChild);
-        if (side) while (side.firstChild) area.appendChild(side.firstChild);
-        if (main) main.remove();
-        if (side) side.remove();
-        if (splitter) splitter.remove();
-        area.classList.remove("split");
-        area.style.removeProperty("--split-ratio");
-    } else if (pinned && !isSplit) {
-        // Expand: wrap existing children into .main-pane, attach splitter + .side-pane.
-        const main = el("div", { class: "pane main-pane" });
-        const splitter = el("div", { class: "pane-splitter" });
-        const side = el("div", { class: "pane side-pane" });
-        // Move all area children into main-pane except the floating search bar,
-        // which is absolutely positioned and stays at area level.
-        const movable = Array.from(area.children).filter(
-            (c) => !c.classList.contains("search-bar"),
-        );
-        for (const c of movable) main.appendChild(c);
-        area.appendChild(main);
-        area.appendChild(splitter);
-        area.appendChild(side);
-        area.classList.add("split");
-        installSplitterDrag(splitter);
-    }
+// Reconcile stored per-column width fractions against the column count:
+// filter junk, truncate/refill, normalize, floor at COLUMN_MIN_FRAC,
+// renormalize. Pure — never writes the vault.
+function reconcileColumnRatios(project, nColumns) {
+    const stored = Array.isArray(project?.column_ratios) ? project.column_ratios : [];
+    const ratios = stored.filter((r) => typeof r === "number" && r > 0).slice(0, nColumns);
+    while (ratios.length < nColumns) ratios.push(1 / nColumns);
+    const sum = ratios.reduce((a, b) => a + b, 0);
+    const floored = ratios.map((r) => Math.max(COLUMN_MIN_FRAC, r / sum));
+    const sum2 = floored.reduce((a, b) => a + b, 0);
+    return floored.map((r) => r / sum2);
+}
 
-    if (pinned) {
-        area.style.setProperty("--split-ratio", `${state.splitRatio * 100}%`);
-        const main = area.querySelector(".main-pane");
-        const side = area.querySelector(".side-pane");
-        const pinnedKey = tkey(state.activeProject, pinned);
-        const pinnedT = state.terminals[pinnedKey];
-        if (pinnedT && pinnedT.container && side && pinnedT.container.parentElement !== side) {
-            side.appendChild(pinnedT.container);
-        }
-        // Ensure non-pinned containers for the active project live in main-pane.
-        for (const [k, t] of Object.entries(state.terminals)) {
-            if (k === pinnedKey || !t.container) continue;
-            if (!k.startsWith(`${state.activeProject}:`)) continue;
-            if (main && t.container.parentElement !== main) main.appendChild(t.container);
-        }
-    }
+// Remove the engine's own chrome. The floating search bar is also an
+// absolute child of the area and must survive — the selector names only
+// engine-owned classes.
+function sweepColumnChrome(area) {
+    area.querySelectorAll(".column-splitter, .column-drop-overlay")
+        .forEach((n) => n.remove());
+}
 
-    // Recompute .hidden: pinned terminal always visible, plus the active one.
-    const activeKey = state.activeService ? tkey(state.activeProject, state.activeService) : null;
-    const pinnedKey = pinned ? tkey(state.activeProject, pinned) : null;
-    for (const [k, t] of Object.entries(state.terminals)) {
-        if (!t.container) continue;
-        if (!state.activeProject || !k.startsWith(`${state.activeProject}:`)) continue;
-        if (k === pinnedKey || k === activeKey) t.container.classList.remove("hidden");
-        else t.container.classList.add("hidden");
-    }
+function clearContainerGeometry(t) {
+    if (!t.container) return;
+    t.container.style.left = "";
+    t.container.style.width = "";
+    t.container.style.top = "";
+}
 
-    // xterm needs an explicit refit after its container changes size.
-    // Iframes reflow via their own ResizeObservers.
+// Deferred xterm refit after any geometry change (a container resize is
+// invisible to xterm until fit() re-measures). Iframes reflow on their own.
+function scheduleColumnRefit() {
     setTimeout(() => {
         for (const t of Object.values(state.terminals)) {
             if (t.fitAddon) { try { t.fitAddon.fit(); } catch (_) {} }
@@ -6070,92 +6048,220 @@ function applySplitLayout() {
     }, 0);
 }
 
-function installSplitterDrag(splitter) {
-    // Pointer capture is load-bearing: without it, a pointermove that
-    // crosses into an iframe (code-server) gets delivered to the iframe's
-    // browsing context instead of bubbling to the document, and the drag
-    // appears to freeze until the cursor re-enters the top-bar. Capturing
-    // the pointer to the splitter element routes every subsequent move /
-    // up for that pointer id to the splitter regardless of what's under
-    // the cursor.
-    let dragging = false;
-    let pointerId = null;
-    const onMove = (ev) => {
-        if (!dragging) return;
-        const area = document.getElementById("terminal-area");
-        if (!area) return;
-        const rect = area.getBoundingClientRect();
-        if (rect.width <= 0) return;
-        let ratio = (ev.clientX - rect.left) / rect.width;
-        ratio = Math.max(SPLIT_RATIO_MIN, Math.min(SPLIT_RATIO_MAX, ratio));
-        area.style.setProperty("--split-ratio", `${ratio * 100}%`);
-        state.splitRatio = ratio;
+// Position-only pass: set left/width on the splitters and the visible
+// containers from a candidate ratio set (top stays the base inset:0 — the
+// tabs live in the ONE top strip, so panes span the area's full height).
+// Split out of the full engine so the splitter drag can run it per frame
+// without any DOM rebuild — a mid-drag rebuild would detach the splitter's
+// pointer capture (the class of bug the tab drag's lostpointercapture path
+// covers).
+function positionColumnChrome(columns, ratios) {
+    const area = document.getElementById("terminal-area");
+    if (!area || !state.activeProject) return;
+    const lefts = [];
+    let x = 0;
+    for (const r of ratios) { lefts.push(x); x += r; }
+    area.querySelectorAll(".column-splitter").forEach((s, i) => {
+        s.style.left = `calc(${pctOf(lefts[i + 1])} - 3px)`;
+    });
+    // The strip's tab groups track the pane boundaries — the strip spans
+    // the same width as the area, so the fractions map 1:1.
+    positionStripGroups(ratios);
+    for (const [k, t] of Object.entries(state.terminals)) {
+        if (!k.startsWith(`${state.activeProject}:`) || !t.container) continue;
+        if (t.container.classList.contains("hidden")) continue;
+        const col = columns.findIndex((c) => c.includes(serviceOfKey(k)));
+        if (col === -1) continue;
+        t.container.style.left = pctOf(lefts[col]);
+        t.container.style.width = pctOf(ratios[col]);
+    }
+}
+
+// Geometry for the strip's column tab groups (desktop multi-column): group 0
+// runs from where the chrome cluster ends (its pane starts at x=0, which the
+// chrome occupies) to the first boundary; each further group spans exactly
+// its pane's fraction. Width-capping is what makes NO-OVERLAP structural —
+// tabs inside a capped group flex-shrink with ellipsized labels, the
+// wrapper clips as the last resort. The px/% calc mix keeps window resizes
+// self-adapting: the chrome width is content-fixed px (re-measured every
+// render via the divider's offset edge), the boundaries are fractions.
+// Degenerate accepted edges, both from a first boundary landing near/left
+// of the chrome end: (a) group 0's width computes negative — CSS floors it
+// at 0 and column 0's tabs vanish until the splitter widens it; (b) group
+// 1's anchor slides under the chrome cluster — the chrome's z-lift
+// (style.css) keeps it visible + clickable while that group's leftmost
+// tabs clip beneath it.
+function positionStripGroups(ratios) {
+    const strip = document.getElementById("service-tabs");
+    if (!strip) return;
+    const groups = strip.querySelectorAll(".column-tab-group");
+    if (!groups.length) return;
+    const divider = strip.querySelector(".tab-group-divider");
+    const chromeEnd = divider ? divider.offsetLeft + divider.offsetWidth : 0;
+    let x = 0;
+    groups.forEach((g, i) => {
+        if (i === 0) {
+            g.style.left = `${chromeEnd}px`;
+            g.style.width = `calc(${pctOf(ratios[0])} - ${chromeEnd}px)`;
+        } else {
+            g.style.left = pctOf(x);
+            g.style.width = pctOf(ratios[i]);
+        }
+        x += ratios[i];
+    });
+}
+
+// Repaint the top strip's per-column actives from columnActive: each
+// column's shown tab carries .active (several at once in a split layout).
+// The tabs' data-column stamps come from renderServiceTabs, which derives
+// the same reconciled columns the engine stashed.
+function paintColumnActives() {
+    const layout = state.tabLayout;
+    if (!layout) return;
+    document.querySelectorAll("#service-tabs .tab[data-service]").forEach((t) => {
+        const id = t.getAttribute("data-service");
+        const col = layout.columns.findIndex((c) => c.includes(id));
+        t.classList.toggle("active", col !== -1 && state.columnActive[col] === id);
+    });
+}
+
+// The full engine: derive the reconciled layout from vault + live services,
+// stash it as state.tabLayout (the drag/splitter working copy), repair the
+// per-column actives, maintain the splitters (>= 2 columns; the tabs stay
+// in the ONE top strip, each column's group anchored above its pane — PI
+// decisions across two dogfood rounds: per-pane strip rows wasted a line,
+// and flowing groups lost the tab-to-pane alignment), and set every
+// container's visibility + geometry. Desktop-only — the
+// mobile shell keeps the flat single-strip model — so on mobile (and with
+// no project / no services / no vault entry) it sweeps its chrome and
+// clears inline geometry: that reset IS the explicit teardown arm for
+// project switches and the zero-visible welcome path.
+function applyColumnLayout() {
+    const area = document.getElementById("terminal-area");
+    if (!area) return;
+    const reset = () => {
+        sweepColumnChrome(area);
+        for (const t of Object.values(state.terminals)) clearContainerGeometry(t);
+        state.tabLayout = null;
     };
-    const onUp = async (ev) => {
-        if (!dragging) return;
-        dragging = false;
-        splitter.classList.remove("dragging");
-        try { if (pointerId != null) splitter.releasePointerCapture(pointerId); } catch (_) {}
-        pointerId = null;
-        splitter.removeEventListener("pointermove", onMove);
-        splitter.removeEventListener("pointerup", onUp);
-        splitter.removeEventListener("pointercancel", onUp);
-        document.body.style.userSelect = "";
-        // Refit on drag-end only; per-frame refits during the drag would
-        // thrash xterm's measurements.
-        setTimeout(() => {
-            for (const t of Object.values(state.terminals)) {
-                if (t.fitAddon) { try { t.fitAddon.fit(); } catch (_) {} }
+    if (!state.activeProject || mobileModeActive()) { reset(); return; }
+    const project = state.vault?.projects.find((p) => p.name === state.activeProject);
+    const enabled = state.projectServices[state.activeProject] || {};
+    const ids = visibleServiceIds(state.activeProject, enabled);
+    if (!project || ids.length === 0) { reset(); return; }
+
+    const columns = reconcileTabLayout(project, ids, enabled);
+    const ratios = reconcileColumnRatios(project, columns.length);
+    state.tabLayout = { columns, ratios };
+    // Repair per-column actives: each column shows its remembered tab when
+    // that tab still lives there, else its first.
+    state.columnActive.length = columns.length;
+    for (let i = 0; i < columns.length; i++) {
+        if (!columns[i].includes(state.columnActive[i])) {
+            state.columnActive[i] = columns[i][0];
+        }
+    }
+
+    sweepColumnChrome(area);
+    if (columns.length === 1) {
+        // Single column: today's exact shape — no engine chrome; containers
+        // fall back to the base inset:0 (stale rects from a fold MUST be
+        // cleared or they survive over the base rule); visibility = the one
+        // active tab.
+        const activeKey = tkey(state.activeProject, state.columnActive[0]);
+        for (const [k, t] of Object.entries(state.terminals)) {
+            if (!t.container) continue;
+            // Another project's pane must NEVER stay visible: containers are
+            // absolutely-stacked siblings in the flat host, so a skipped
+            // foreign pane sits (selectable) behind the new project's — the
+            // retired activateService hide-loop swept ALL projects and the
+            // engine owns that job now.
+            if (!k.startsWith(`${state.activeProject}:`)) {
+                t.container.classList.add("hidden");
+                continue;
             }
-        }, 0);
-        await persistPinForActiveProject();
-    };
+            clearContainerGeometry(t);
+            t.container.classList.toggle("hidden", k !== activeKey);
+        }
+        scheduleColumnRefit();
+        return;
+    }
+
+    // Multi-column: splitters between neighbors (the tabs live in the top
+    // strip, grouped per column by renderServiceTabs), then visibility +
+    // geometry + the strip's per-column actives.
+    for (let i = 1; i < columns.length; i++) {
+        const sp = el("div", { class: "column-splitter" });
+        installColumnSplitterDrag(sp, i - 1);
+        area.appendChild(sp);
+    }
+    for (const [k, t] of Object.entries(state.terminals)) {
+        if (!t.container) continue;
+        // Foreign-project panes are hidden, never skipped — same rationale
+        // as the single-column arm above.
+        if (!k.startsWith(`${state.activeProject}:`)) {
+            t.container.classList.add("hidden");
+            continue;
+        }
+        const svcId = serviceOfKey(k);
+        const col = columns.findIndex((c) => c.includes(svcId));
+        const show = col !== -1 && svcId === state.columnActive[col];
+        t.container.classList.toggle("hidden", !show);
+    }
+    positionColumnChrome(columns, ratios);
+    paintColumnActives();
+    scheduleColumnRefit();
+}
+
+// Splitter between column `boundary` and `boundary+1`: pointer-captured
+// drag — capture is load-bearing, without it a pointermove crossing into a
+// code-server iframe is delivered to the iframe's browsing context and the
+// drag freezes (the original pane-splitter's discovery) — adjusting the two
+// adjacent ratios under the COLUMN_MIN_FRAC clamp. Geometry-only per frame
+// (a mid-drag strip rebuild would detach this very capture); persist + refit
+// on release. lostpointercapture is removed FIRST in the shared release
+// handler, before releasePointerCapture — the explicit release fires it
+// synchronously and remove-first prevents the re-entrant cycle (the tab
+// drag's discipline).
+function installColumnSplitterDrag(splitter, boundary) {
     splitter.onpointerdown = (ev) => {
+        const layout = state.tabLayout;
+        const area = document.getElementById("terminal-area");
+        const project = state.vault?.projects.find((p) => p.name === state.activeProject);
+        if (!layout || !area || !project) return;
         ev.preventDefault();
-        dragging = true;
-        pointerId = ev.pointerId;
+        const pair = layout.ratios[boundary] + layout.ratios[boundary + 1];
+        const onMove = (mv) => {
+            const rect = area.getBoundingClientRect();
+            if (rect.width <= 0) return;
+            let leftEdge = 0;
+            for (let i = 0; i < boundary; i++) leftEdge += layout.ratios[i];
+            let share = (mv.clientX - rect.left) / rect.width - leftEdge;
+            share = Math.max(COLUMN_MIN_FRAC, Math.min(pair - COLUMN_MIN_FRAC, share));
+            layout.ratios[boundary] = share;
+            layout.ratios[boundary + 1] = pair - share;
+            positionColumnChrome(layout.columns, layout.ratios);
+        };
+        const onUp = async () => {
+            splitter.removeEventListener("lostpointercapture", onUp);
+            splitter.removeEventListener("pointermove", onMove);
+            splitter.removeEventListener("pointerup", onUp);
+            splitter.removeEventListener("pointercancel", onUp);
+            try { splitter.releasePointerCapture(ev.pointerId); } catch (_) {}
+            splitter.classList.remove("dragging");
+            document.body.style.userSelect = "";
+            // Refit on drag-end only; per-frame refits would thrash xterm.
+            scheduleColumnRefit();
+            await persistTabLayout(project, layout.columns, layout.ratios);
+        };
         splitter.classList.add("dragging");
+        document.body.style.userSelect = "none";
         try { splitter.setPointerCapture(ev.pointerId); } catch (_) {}
         splitter.addEventListener("pointermove", onMove);
         splitter.addEventListener("pointerup", onUp);
         splitter.addEventListener("pointercancel", onUp);
-        document.body.style.userSelect = "none";
+        splitter.addEventListener("lostpointercapture", onUp);
     };
-}
-
-async function persistPinForActiveProject() {
-    if (!state.activeProject) return;
-    const project = state.vault.projects.find((p) => p.name === state.activeProject);
-    if (!project) return;
-    if (state.pinnedService) project.pinned_service = state.pinnedService;
-    else delete project.pinned_service;
-    if (Math.abs(state.splitRatio - SPLIT_RATIO_DEFAULT) > 1e-6) {
-        project.split_ratio = state.splitRatio;
-    } else {
-        delete project.split_ratio;
-    }
-    await persistVault();
-}
-
-async function togglePin(serviceId) {
-    state.pinnedService = state.pinnedService === serviceId ? null : serviceId;
-    // Pinning the currently-active service means main pane has nothing
-    // to show. Fall back to the first remaining service.
-    if (state.pinnedService && state.activeService === state.pinnedService) {
-        const enabled = state.projectServices[state.activeProject] || {};
-        const fallback = Object.keys(enabled).find((id) => id !== state.pinnedService);
-        state.activeService = fallback || null;
-    }
-    applySplitLayout();
-    const enabled = state.projectServices[state.activeProject] || {};
-    renderServiceTabs(state.activeProject, enabled);
-    if (state.activeService) activateService(state.activeService);
-    // Auto-open the pinned service so the side pane isn't empty.
-    if (state.pinnedService) {
-        const pinnedKey = tkey(state.activeProject, state.pinnedService);
-        if (!state.terminals[pinnedKey]) activateService(state.pinnedService);
-    }
-    await persistPinForActiveProject();
 }
 
 // ---- project / service activation ------------------------------------------
@@ -6178,6 +6284,10 @@ async function activateProject(name) {
     if (mobileModeActive()) setMobileProjectsView(false);
 
     state.activeProject = name;
+    // Column actives are per-project session state — reset before anything
+    // reads them; the engine reseeds each column's active from its layout.
+    state.columnActive = [];
+    state.tabLayout = null;
     // Bust the per-project service cache on every activation so a service that
     // came up AFTER the first activation (a box editor's code-server stub takes a
     // few seconds to boot) surfaces on re-select — without a full page reload.
@@ -6186,24 +6296,8 @@ async function activateProject(name) {
     delete state.projectServices[name];
     const enabled = await fetchProjectServices(name);
 
-    // Load per-project pin state from the vault entry. Missing fields
-    // decode cleanly to "no pin, default ratio" — vault schema stays v1.
-    const project = state.vault.projects.find((p) => p.name === name);
-    const desiredPin = project?.pinned_service || null;
-    // Drop the pin if its service is no longer enabled — e.g. operator
-    // disabled it between sessions — or if the user has hidden that tab.
-    // Cheaper than a vault migration.
-    const hiddenSet = new Set(project?.hidden_services || []);
-    // No split panes on mobile: the pin (a side-pane concept) is forced off —
-    // applySplitLayout then keeps/returns the unsplit shape.
-    state.pinnedService = !mobileModeActive()
-        && desiredPin && enabled[desiredPin] && !hiddenSet.has(desiredPin)
-        ? desiredPin : null;
-    const ratio = project?.split_ratio;
-    state.splitRatio = typeof ratio === "number" ? ratio : SPLIT_RATIO_DEFAULT;
-
     renderServiceTabs(name, enabled);
-    applySplitLayout();
+    applyColumnLayout();
 
     // Landing tab: a project reopens on whatever it last had open this session
     // (per-project memory). A project with no remembered tab — never opened, or
@@ -6231,20 +6325,27 @@ async function activateProject(name) {
         }
     } else {
         next = state.projectLastService[name];
-        if (!next || !enabled[next] || !visible.includes(next) || next === state.pinnedService) {
-            next = (visible.includes("code-server") && "code-server" !== state.pinnedService && "code-server")
-                || visible.find((id) => id !== state.pinnedService && enabled[id].always_on)
-                || visible.find((id) => id !== state.pinnedService)
+        if (!next || !enabled[next] || !visible.includes(next)) {
+            next = (visible.includes("code-server") && "code-server")
+                || visible.find((id) => enabled[id].always_on)
                 || visible[0];
         }
     }
     activateService(next);
 
-    // Auto-open the pinned service so the side pane isn't empty after
-    // a fresh page load with a pin already persisted.
-    if (state.pinnedService && state.pinnedService !== next) {
-        const pinnedKey = tkey(name, state.pinnedService);
-        if (!state.terminals[pinnedKey]) activateService(state.pinnedService);
+    // Auto-open every OTHER column's active tab so no pane sits empty after
+    // activation (the generalization of the retired pin auto-open — up to
+    // N-1 extra sessions, the accepted multi-column activation cost). The
+    // background flag keeps focus + the landing bookkeeping on `next`.
+    const layout = state.tabLayout;
+    if (layout && layout.columns.length > 1) {
+        for (let i = 0; i < layout.columns.length; i++) {
+            const cid = state.columnActive[i];
+            if (!cid || cid === next) continue;
+            if (!state.terminals[tkey(name, cid)]) {
+                activateService(cid, { background: true });
+            }
+        }
     }
 }
 
@@ -6704,18 +6805,14 @@ async function setServiceHidden(project, serviceId, hide) {
     if (hidden.size > 0) project.hidden_services = Array.from(hidden);
     else delete project.hidden_services;
 
-    // Hiding the pinned service unpins it — a tab the user just hid
-    // shouldn't keep claiming the side pane.
-    if (hide && state.activeProject === project.name && state.pinnedService === serviceId) {
-        state.pinnedService = null;
-        delete project.pinned_service;
-        applySplitLayout();
-    }
     await persistVault();
 
     if (state.activeProject !== project.name) return;
     const enabled = state.projectServices[project.name] || {};
     renderServiceTabs(project.name, enabled);
+    // Reconcile the column layout against the changed visible set (a hidden
+    // tab leaves its column; the engine repairs that column's active).
+    applyColumnLayout();
     // If the active service was just hidden, fall back to a visible one.
     const visible = visibleServiceIds(project.name, enabled);
     if (!visible.includes(state.activeService) && visible.length > 0) {
@@ -6784,32 +6881,93 @@ function defaultTabOrder(visibleIds, enabled) {
 // vault — persistence happens only on user arrangement actions (a drop), so
 // a flapping service probe can't churn vault writes. A project without the
 // field decodes to a single column in default order — vault schema stays v1
-// (the tolerant-decode precedent of the retired pinned_service field).
+// (the tolerant-decode precedent of the retired pin fields).
 function reconcileTabLayout(project, visibleIds, enabled) {
-    // Single-column by construction at this stage: stored columns concatenate
-    // into one order, so the renderer (which draws columns[0]) can never
-    // silently drop a tab. The column-splits stage generalizes this body.
     const stored = Array.isArray(project?.tab_columns) ? project.tab_columns : [];
     const seen = new Set();
-    const order = [];
+    const columns = [];
     for (const col of stored) {
         if (!Array.isArray(col)) continue;
+        const kept = [];
         for (const id of col) {
             if (typeof id === "string" && visibleIds.includes(id) && !seen.has(id)) {
                 seen.add(id);
-                order.push(id);
+                kept.push(id);
             }
         }
+        if (kept.length) columns.push(kept);
     }
+    // Overflow columns fold into the last kept one rather than dropping tabs.
+    if (columns.length > MAX_TAB_COLUMNS) {
+        const extra = columns.splice(MAX_TAB_COLUMNS);
+        columns[MAX_TAB_COLUMNS - 1].push(...extra.flat());
+    }
+    if (columns.length === 0) columns.push([]);
     for (const id of defaultTabOrder(visibleIds, enabled)) {
-        if (!seen.has(id)) order.push(id);
+        if (!seen.has(id)) columns[0].push(id);
     }
-    return [order];
+    return columns;
 }
 
-async function persistTabLayout(project, columns) {
+async function persistTabLayout(project, columns, ratios) {
     project.tab_columns = columns;
+    if (columns.length > 1 && Array.isArray(ratios)) project.column_ratios = ratios;
+    else delete project.column_ratios;
     await persistVault();
+}
+
+// Apply a drop target to the working layout {columns, ratios}. Targets:
+//   {type:"strip", col, index} — insert at `index` in column `col`'s list
+//   {type:"append", col}       — move to column `col`'s end (pane-center drop)
+//   {type:"split", col, side}  — new column "before"/"after" column `col`,
+//                                taking half its width
+// Returns true iff the layout changed. Emptied source columns collapse with
+// their width folding into a neighbor. Known accepted edge: at
+// MAX_TAB_COLUMNS every split refuses — including the sole-tab move that
+// would net the same column count — the same arrangement is reachable via
+// an append plus reorders.
+function moveTabInLayout(layout, id, target) {
+    const { columns, ratios } = layout;
+    const src = columns.findIndex((c) => c.includes(id));
+    if (src === -1) return false;
+    const srcIdx = columns[src].indexOf(id);
+
+    if (target.type === "strip" || target.type === "append") {
+        const dst = target.col;
+        if (dst < 0 || dst >= columns.length) return false;
+        let index = target.type === "append" ? columns[dst].length : target.index;
+        columns[src].splice(srcIdx, 1);
+        if (dst === src && srcIdx < index) index -= 1;
+        index = Math.max(0, Math.min(index, columns[dst].length));
+        if (dst === src && index === srcIdx) {
+            columns[src].splice(srcIdx, 0, id);   // dropped where it started
+            return false;
+        }
+        columns[dst].splice(index, 0, id);
+    } else if (target.type === "split") {
+        if (columns.length >= MAX_TAB_COLUMNS) return false;
+        const at = target.col + (target.side === "after" ? 1 : 0);
+        // A column's sole tab split adjacent to itself recreates the same
+        // shape — refuse as a no-op.
+        if (columns[src].length === 1 && (at === src || at === src + 1)) return false;
+        columns[src].splice(srcIdx, 1);
+        const half = ratios[target.col] / 2;
+        ratios[target.col] = half;
+        columns.splice(at, 0, [id]);
+        ratios.splice(at, 0, half);
+    } else {
+        return false;
+    }
+
+    // Collapse emptied columns, folding their width into a neighbor.
+    for (let i = columns.length - 1; i >= 0; i--) {
+        if (columns[i].length) continue;
+        const neighbor = i > 0 ? i - 1 : 1;
+        if (ratios[neighbor] !== undefined) ratios[neighbor] += ratios[i];
+        columns.splice(i, 1);
+        ratios.splice(i, 1);
+    }
+    return true;
 }
 
 // ---- tab drag-to-reorder (desktop only) ------------------------------------
@@ -6832,7 +6990,7 @@ function consumeTabDragClick() {
 
 // Pointer-based drag (setPointerCapture), NEVER HTML5 drag-and-drop: captured
 // moves keep routing to the tab while the pointer crosses cross-origin
-// iframes (the splitter precedent — see installSplitterDrag), where dragover
+// iframes (the splitter precedent — see installColumnSplitterDrag), where dragover
 // events would die inside the frame's browsing context. The drop position is
 // resolved mathematically from tab midpoints, never via elementFromPoint.
 // ctx = { projectName, enabled, project, columns } closed over by the render.
@@ -6841,12 +6999,101 @@ function armTabDrag(tab, id, ctx) {
         if (mobileModeActive()) return;           // desktop-only affordance
         if (ev.button !== 0) return;
         if (ev.target.closest("button")) return;  // refresh / box ✕ keep their clicks
-        const strip = document.getElementById("service-tabs");
-        if (!strip || !ctx.project) return;       // no vault entry — nothing to persist to
+        if (!ctx.project) return;                 // no vault entry — nothing to persist to
+        const area = document.getElementById("terminal-area");
         const startX = ev.clientX, startY = ev.clientY;
         let dragging = false;
-        let ghost = null, indicator = null;
-        let dropIndex = -1;
+        let ghost = null, indicator = null, overlay = null;
+        let target = null;
+
+        // Resolve the pointer position to a drop target. The ONE top strip
+        // wins over panes: the flat insertion point (midpoint rule over all
+        // groups) maps to (column, in-column index) via the anchor tab's
+        // data-column stamp — inserting before a group's first tab joins
+        // THAT group, so a boundary drop reads as "start of the right
+        // group"; appending to a group's end happens via its pane's center.
+        // Within a pane, the outer COLUMN_EDGE_BAND_FRAC bands split a new
+        // column out (only below MAX_TAB_COLUMNS — at the cap they are
+        // inert and the whole pane reads as move-into), the center appends.
+        const resolveTarget = (mv) => {
+            const layout = state.tabLayout;
+            if (!layout) return null;
+            const top = document.getElementById("service-tabs");
+            if (top) {
+                const r = top.getBoundingClientRect();
+                if (mv.clientX >= r.left && mv.clientX <= r.right
+                    && mv.clientY >= r.top && mv.clientY <= r.bottom) {
+                    const tabs = Array.from(top.querySelectorAll(".tab[data-service]"));
+                    if (!tabs.length) return null;
+                    let flatIndex = tabs.length;
+                    for (let i = 0; i < tabs.length; i++) {
+                        const tr = tabs[i].getBoundingClientRect();
+                        if (mv.clientX < tr.left + tr.width / 2) { flatIndex = i; break; }
+                    }
+                    let col, index;
+                    if (flatIndex < tabs.length) {
+                        col = parseInt(tabs[flatIndex].getAttribute("data-column") || "0", 10);
+                        index = tabs.slice(0, flatIndex).filter(
+                            (t) => t.getAttribute("data-column") === String(col)).length;
+                    } else {
+                        col = parseInt(tabs[tabs.length - 1].getAttribute("data-column") || "0", 10);
+                        index = (layout.columns[col] || []).length;
+                    }
+                    return { type: "strip", col, index, stripEl: top, tabs, flatIndex };
+                }
+            }
+            if (!area) return null;
+            const ar = area.getBoundingClientRect();
+            if (mv.clientX < ar.left || mv.clientX > ar.right
+                || mv.clientY < ar.top || mv.clientY > ar.bottom) return null;
+            const frac = (mv.clientX - ar.left) / ar.width;
+            let x = 0, col = 0;
+            for (let i = 0; i < layout.ratios.length; i++) {
+                col = i;
+                if (frac < x + layout.ratios[i] || i === layout.ratios.length - 1) break;
+                x += layout.ratios[i];
+            }
+            const within = (frac - x) / layout.ratios[col];
+            if (layout.columns.length < MAX_TAB_COLUMNS) {
+                if (within < COLUMN_EDGE_BAND_FRAC) return { type: "split", col, side: "before" };
+                if (within > 1 - COLUMN_EDGE_BAND_FRAC) return { type: "split", col, side: "after" };
+            }
+            return { type: "append", col };
+        };
+
+        // Feedback: an insertion caret inside the target strip, or a tinted
+        // region over the target pane (full column = move-into; half = the
+        // new column a split would create).
+        const showFeedback = (t) => {
+            if (indicator) { indicator.remove(); indicator = null; }
+            if (overlay) { overlay.remove(); overlay = null; }
+            if (!t) return;
+            if (t.type === "strip") {
+                const anchor = t.tabs[Math.min(t.flatIndex, t.tabs.length - 1)];
+                if (!anchor) return;
+                const sr = t.stripEl.getBoundingClientRect();
+                const tr = anchor.getBoundingClientRect();
+                const edgeX = (t.flatIndex < t.tabs.length ? tr.left : tr.right)
+                    - sr.left + t.stripEl.scrollLeft;
+                indicator = el("div", { class: "tab-drop-indicator" });
+                indicator.style.left = `${edgeX}px`;
+                t.stripEl.appendChild(indicator);
+            } else if (area && state.tabLayout) {
+                const { ratios } = state.tabLayout;
+                let left = 0;
+                for (let i = 0; i < t.col; i++) left += ratios[i];
+                let w = ratios[t.col];
+                if (t.type === "split") {
+                    w = w / 2;
+                    if (t.side === "after") left += w;
+                }
+                overlay = el("div", { class: "column-drop-overlay" });
+                overlay.style.left = pctOf(left);
+                overlay.style.width = pctOf(w);
+                area.appendChild(overlay);
+            }
+        };
+
         const onMove = (mv) => {
             if (!dragging) {
                 if (Math.abs(mv.clientX - startX) < TAB_DRAG_SLOP_PX
@@ -6857,24 +7104,11 @@ function armTabDrag(tab, id, ctx) {
                 ghost = tab.cloneNode(true);
                 ghost.classList.add("tab-drag-ghost");
                 document.body.appendChild(ghost);
-                indicator = el("div", { class: "tab-drop-indicator" });
-                strip.appendChild(indicator);
             }
             ghost.style.left = `${mv.clientX + 10}px`;
             ghost.style.top = `${mv.clientY + 10}px`;
-            // Insertion index over the strip's service tabs (midpoint rule);
-            // the dragged tab itself stays in the list — the drop adjusts.
-            const tabs = Array.from(strip.querySelectorAll(".tab[data-service]"));
-            dropIndex = tabs.length;
-            for (let i = 0; i < tabs.length; i++) {
-                const r = tabs[i].getBoundingClientRect();
-                if (mv.clientX < r.left + r.width / 2) { dropIndex = i; break; }
-            }
-            const stripR = strip.getBoundingClientRect();
-            const anchor = tabs[Math.min(dropIndex, tabs.length - 1)];
-            const ar = anchor.getBoundingClientRect();
-            const edgeX = dropIndex < tabs.length ? ar.left : ar.right;
-            indicator.style.left = `${edgeX - stripR.left + strip.scrollLeft}px`;
+            target = resolveTarget(mv);
+            showFeedback(target);
         };
         const cleanup = () => {
             // lostpointercapture FIRST: the explicit release below fires it
@@ -6887,34 +7121,32 @@ function armTabDrag(tab, id, ctx) {
             try { tab.releasePointerCapture(ev.pointerId); } catch (_) {}
             if (ghost) ghost.remove();
             if (indicator) indicator.remove();
+            if (overlay) overlay.remove();
             tab.classList.remove("dragging");
             document.body.style.userSelect = "";
         };
         const onCancel = () => { cleanup(); };
         const onUp = async () => {
             const didDrag = dragging;
-            const target = dropIndex;
+            const t = target;
             cleanup();
             if (!didDrag) return;                 // plain click — let it through
             tabDragClickPending = true;
-            const order = ctx.columns[0];
-            const from = order.indexOf(id);
-            if (from === -1 || target < 0) return;
-            let insert = target;
-            if (from < insert) insert -= 1;
-            if (insert === from) return;          // dropped where it started
-            order.splice(from, 1);
-            order.splice(insert, 0, id);
-            await persistTabLayout(ctx.project, ctx.columns);
+            const layout = state.tabLayout;
+            if (!t || !layout) return;            // dropped nowhere actionable
+            const move = t.type === "strip"
+                ? { type: "strip", col: t.col, index: t.index } : t;
+            if (!moveTabInLayout(layout, id, move)) return;
+            await persistTabLayout(ctx.project, layout.columns, layout.ratios);
             // Staleness bail (the refreshActiveServices idiom): the active
             // project may have changed during the await — never paint another
             // project's strip from this closure's captured ctx.
             if (state.activeProject !== ctx.projectName) return;
             renderServiceTabs(ctx.projectName, ctx.enabled);
-            // The rebuild drops the active underline; activateService
-            // early-returns on the existing connected pane, so this only
-            // re-applies chrome (the refreshActiveServices idiom).
-            if (state.activeService) activateService(state.activeService);
+            applyColumnLayout();
+            // The moved tab becomes its new column's shown tab and takes
+            // focus (the VS Code convention).
+            activateService(id);
         };
         tab.setPointerCapture(ev.pointerId);
         tab.addEventListener("pointermove", onMove);
@@ -6927,7 +7159,8 @@ function armTabDrag(tab, id, ctx) {
         // goes elsewhere, so WITHOUT this path neither onUp nor onCancel would
         // run — the ghost would leak and body user-select would stick. The
         // drag dies cleanly at the re-render instead (which also retires the
-        // stale-ctx splice class). A plain click never reaches it: onUp
+        // stale-layout splice class — state.tabLayout is re-stashed by the
+        // engine on every rebuild). A plain click never reaches it: onUp
         // removes this listener before the implicit post-pointerup release.
         tab.addEventListener("lostpointercapture", onCancel);
     };
@@ -6963,71 +7196,98 @@ function renderServiceTabs(projectName, enabled) {
         addBox.onclick = () => mgmtBoxAddDialog(projectName);
         strip.appendChild(addBox);
     }
-    strip.appendChild(el("div", { class: "tab-group-divider" }));
     const ids = visibleServiceIds(projectName, enabled);
     if (ids.length === 0) {
+        strip.appendChild(el("div", { class: "tab-group-divider" }));
         strip.appendChild(el("div", { class: "empty" }, [
             "No services enabled for this project.",
         ]));
         return;
     }
-    // Tab order comes from the project's persisted layout (vault
-    // `tab_columns`, single-column at this stage), reconciled against the
-    // visible set — the old visual-then-CLI partition survives only inside
-    // defaultTabOrder as the never-arranged default, and its group divider
-    // is gone (order is free-form; drag to rearrange).
-    // A pi-iso-* tab is a disposable BOX (gets the ✕) when box_kind === "sandbox".
+    // Tab placement: ONE strip, always — no second row (PI decision). Mobile
+    // renders the flat set (its CSS whitelist hides what it hides; columns
+    // never render there). Desktop single-column keeps the plain inline flow.
+    // Desktop multi-column wraps EVERY column's tabs in an absolutely-
+    // positioned, WIDTH-CAPPED .column-tab-group anchored above its pane —
+    // group 0 from where the chrome ends to the first boundary, each further
+    // group spanning exactly its pane (PI decisions, three dogfood rounds:
+    // no extra strip row, tabs on top of their column, and NO OVERLAP — a
+    // too-narrow column shrinks its tabs to fit instead, labels ellipsizing,
+    // the wrapper clipping as the last resort). positionStripGroups sets the
+    // geometry and positionColumnChrome keeps it tracking the splitters
+    // live. data-column stamps carry each tab's group for the drag's
+    // strip-drop resolution and the per-column active repaint.
     const project = state.vault.projects.find((p) => p.name === projectName);
     const columns = reconcileTabLayout(project, ids, enabled);
-    const dragCtx = { projectName, enabled, project, columns };
-    const makeTab = (id) => {
-        const svc = enabled[id];
-        const isPinned = id === state.pinnedService;
-        const refreshBtn = el("button", {
-            class: "refresh-tab-btn", title: "Refresh tab",
+    const ctx = { projectName, enabled, project };
+    strip.appendChild(el("div", { class: "tab-group-divider" }));
+    if (mobileModeActive() || columns.length === 1) {
+        columns.forEach((col, i) => {
+            for (const id of col) strip.appendChild(makeServiceTab(id, ctx, i));
         });
-        refreshBtn.innerHTML = REFRESH_TAB_SVG;
-        refreshBtn.onclick = (ev) => { ev.stopPropagation(); refreshService(id); };
-        const pinBtn = el("button", {
-            class: "pin-tab-btn",
-            title: isPinned ? "Unpin from side" : "Pin to side",
-        }, ["⇥"]);
-        pinBtn.onclick = (ev) => { ev.stopPropagation(); togglePin(id); };
-        const kids = [refreshBtn, el("span", {}, [svc.label || id]), pinBtn];
-        // A real box tab (box_kind === "sandbox") carries a ✕ that discards the box
-        // in place — box deletion lives on the tab, not in a sidebar settings panel.
-        if (boxHarness && id.startsWith("pi-iso-") && svc.box_kind === "sandbox") {
-            const boxName = id.slice("pi-iso-".length);
-            const closeBtn = el("button", {
-                class: "close-tab-btn", title: `Remove box "${boxName}"`,
-            }, ["✕"]);
-            closeBtn.onclick = (ev) => {
-                ev.stopPropagation();
-                mgmtBoxRemoveDialog(projectName, boxName);
-            };
-            kids.push(closeBtn);
-        }
-        const tab = el("div", {
-            class: isPinned ? "tab pinned" : "tab",
-            "data-service": id,
-            // Surface stamp for the mobile CSS (visual tabs are hidden there);
-            // nothing desktop keys on it.
-            "data-surface": surfaceOf(id, svc),
-            // Type stamp for the color-coded top border (style.css
-            // [data-tabtype] rules); scoping on the attribute keeps the
-            // Projects tab / project chip border-free.
-            "data-tabtype": tabTypeOf(id, svc),
-            // consumeTabDragClick swallows the one click the browser
-            // synthesizes on the captured tab after a real drag.
-            onclick: () => {
-                if (consumeTabDragClick()) return;
-                activateService(id);
-            },
-        }, kids);
-        armTabDrag(tab, id, dragCtx);
-        return tab;
-    };
-    for (const id of columns[0]) strip.appendChild(makeTab(id));
+    } else {
+        const ratios = reconcileColumnRatios(project, columns.length);
+        columns.forEach((col, i) => {
+            const group = el("div", {
+                class: i === 0
+                    ? "column-tab-group column-tab-group-first"
+                    : "column-tab-group",
+            });
+            for (const id of col) group.appendChild(makeServiceTab(id, ctx, i));
+            strip.appendChild(group);
+        });
+        positionStripGroups(ratios);
+    }
+}
+
+// One service tab. Order/columns come from the vault layout
+// (reconcileTabLayout); the old visual-then-CLI partition survives only
+// inside defaultTabOrder as the never-arranged default. colIdx stamps
+// data-column — the tab's group — read by the drag's strip-drop resolution
+// and paintColumnActives.
+// A pi-iso-* tab is a disposable BOX (gets the ✕) when box_kind === "sandbox".
+function makeServiceTab(id, ctx, colIdx = 0) {
+    const svc = ctx.enabled[id];
+    const refreshBtn = el("button", {
+        class: "refresh-tab-btn", title: "Refresh tab",
+    });
+    refreshBtn.innerHTML = REFRESH_TAB_SVG;
+    refreshBtn.onclick = (ev) => { ev.stopPropagation(); refreshService(id); };
+    const kids = [refreshBtn, el("span", {}, [svc.label || id])];
+    // A real box tab (box_kind === "sandbox") carries a ✕ that discards the box
+    // in place — box deletion lives on the tab, not in a sidebar settings panel.
+    const boxHarness = !!(ctx.enabled["supervisor"] && ctx.enabled["supervisor"].box_harness);
+    if (boxHarness && id.startsWith("pi-iso-") && svc.box_kind === "sandbox") {
+        const boxName = id.slice("pi-iso-".length);
+        const closeBtn = el("button", {
+            class: "close-tab-btn", title: `Remove box "${boxName}"`,
+        }, ["✕"]);
+        closeBtn.onclick = (ev) => {
+            ev.stopPropagation();
+            mgmtBoxRemoveDialog(ctx.projectName, boxName);
+        };
+        kids.push(closeBtn);
+    }
+    const tab = el("div", {
+        class: "tab",
+        "data-service": id,
+        "data-column": String(colIdx),
+        // Surface stamp for the mobile CSS (visual tabs are hidden there);
+        // nothing desktop keys on it.
+        "data-surface": surfaceOf(id, svc),
+        // Type stamp for the color-coded top border (style.css
+        // [data-tabtype] rules); scoping on the attribute keeps the
+        // Projects tab / project chip border-free.
+        "data-tabtype": tabTypeOf(id, svc),
+        // consumeTabDragClick swallows the one click the browser
+        // synthesizes on the captured tab after a real drag.
+        onclick: () => {
+            if (consumeTabDragClick()) return;
+            activateService(id);
+        },
+    }, kids);
+    armTabDrag(tab, id, ctx);
+    return tab;
 }
 
 // Refresh a tab's content in place: tear down the live pane (terminal,
@@ -7053,7 +7313,7 @@ function refreshService(serviceId) {
     activateService(serviceId);
 }
 
-function activateService(serviceId) {
+function activateService(serviceId, opts) {
     if (!state.activeProject) return;
 
     const project = state.vault.projects.find((p) => p.name === state.activeProject);
@@ -7062,17 +7322,29 @@ function activateService(serviceId) {
     const svc = enabled[serviceId];
     if (!svc) return;
 
-    const isPinned = serviceId === state.pinnedService;
+    // Background activation (opts.background) opens a pane WITHOUT taking
+    // focus or the landing bookkeeping — the multi-column auto-open path
+    // (the successor of the retired pin's !isPinned guard).
+    const background = !!(opts && opts.background);
 
-    // The pinned tab represents the side pane, not main-pane activation,
-    // so it never gets the .active underline.
-    if (!isPinned) {
-        document.querySelectorAll(".service-tabs .tab").forEach((t) => t.classList.remove("active"));
-        const tabEl = document.querySelector(`.service-tabs .tab[data-service="${CSS.escape(serviceId)}"]`);
+    // Column bookkeeping: the activated tab becomes its column's shown one.
+    // Single-column layouts resolve to column 0; on mobile tabLayout is null
+    // and the flat model below applies.
+    const layout = state.tabLayout;
+    if (layout) {
+        const col = layout.columns.findIndex((c) => c.includes(serviceId));
+        if (col !== -1) state.columnActive[col] = serviceId;
+    }
+
+    if (!background) {
+        // Underline: this global toggle is the mobile/single-column path; in
+        // a multi-column layout it transiently strips the other columns'
+        // actives, and the engine call below repaints them all from
+        // columnActive in the same synchronous frame (paintColumnActives).
+        document.querySelectorAll("#service-tabs .tab").forEach((t) => t.classList.remove("active"));
+        const tabEl = document.querySelector(`#service-tabs .tab[data-service="${CSS.escape(serviceId)}"]`);
         if (tabEl) tabEl.classList.add("active");
         state.activeService = serviceId;
-        // Remember this as the project's landing tab (main-pane only; the pinned
-        // side-pane activation below is skipped by the !isPinned guard).
         state.projectLastService[state.activeProject] = serviceId;
     }
     // Key-bar visibility follows the resolved KIND of the active service, so
@@ -7080,13 +7352,18 @@ function activateService(serviceId) {
     // returns early — or a reader→CLI re-activation would skip it.
     updateMobileKeybar();
 
-    // Hide everything except the active and the pinned terminal.
-    const activeKey = state.activeService ? tkey(state.activeProject, state.activeService) : null;
-    const pinnedKey = state.pinnedService ? tkey(state.activeProject, state.pinnedService) : null;
-    for (const [k, t] of Object.entries(state.terminals)) {
-        if (!t.container) continue;
-        if (k === activeKey || k === pinnedKey) t.container.classList.remove("hidden");
-        else t.container.classList.add("hidden");
+    if (mobileModeActive()) {
+        // Mobile keeps the flat model: hide everything except the active.
+        const activeKey = state.activeService ? tkey(state.activeProject, state.activeService) : null;
+        for (const [k, t] of Object.entries(state.terminals)) {
+            if (!t.container) continue;
+            if (k === activeKey) t.container.classList.remove("hidden");
+            else t.container.classList.add("hidden");
+        }
+    } else {
+        // Desktop: the engine owns visibility + geometry + per-column strip
+        // actives (columnActive was updated above).
+        applyColumnLayout();
     }
     const welcome = document.getElementById("welcome");
     if (welcome) welcome.style.display = "none";
@@ -7096,7 +7373,7 @@ function activateService(serviceId) {
     if (existing && !existing.disconnected) {
         if (existing.container) existing.container.classList.remove("hidden");
         if (existing.fitAddon) existing.fitAddon.fit();
-        if (existing.term) existing.term.focus();
+        if (existing.term && !background) existing.term.focus();
         return;
     }
     if (existing && existing.disconnected) {
@@ -7113,12 +7390,17 @@ function activateService(serviceId) {
     } else if (svc.kind === "http") {
         openHttpService(project, serviceId, svc);
     } else {
-        const parent = paneFor(serviceId) || document.getElementById("terminal-area");
+        const parent = document.getElementById("terminal-area");
         const placeholder = el("div", { class: "welcome" }, [
             `Unknown service kind: ${svc.kind}`,
         ]);
-        parent.appendChild(placeholder);
+        if (parent) parent.appendChild(placeholder);
     }
+    // A freshly-created container has no inline geometry — position it (and
+    // repaint strip actives) now. The open paths append synchronously even
+    // when their session mint is still in flight, so the rect lands before
+    // any content does. Desktop-only; mobile containers use the base inset.
+    if (!mobileModeActive()) applyColumnLayout();
 }
 
 function welcomeText() {
@@ -7140,6 +7422,10 @@ function showWelcome(clearTabs = true) {
     for (const t of Object.values(state.terminals)) {
         if (t.container) t.container.classList.add("hidden");
     }
+    // Sweep the column engine's chrome (strips/splitters) and stale inline
+    // geometry — the welcome states (zero-visible, project-less) must not
+    // keep orphaned strips floating over the empty area.
+    applyColumnLayout();
     if (clearTabs) {
         const strip = document.getElementById("service-tabs");
         if (strip) strip.innerHTML = "";
@@ -7184,9 +7470,15 @@ function installGlobalTermRefit() {
             raf = 0;
             setVvh();
             if (!state.activeProject) return;
+            // Refit every VISIBLE terminal: the focused one plus each
+            // column's shown tab (the successor of the old active+pinned
+            // pair — percent-based column rects resize with the window, so
+            // this re-measure is the only per-resize work the engine needs).
             const keys = new Set();
             if (state.activeService) keys.add(tkey(state.activeProject, state.activeService));
-            if (state.pinnedService) keys.add(tkey(state.activeProject, state.pinnedService));
+            for (const cid of state.columnActive) {
+                if (cid) keys.add(tkey(state.activeProject, cid));
+            }
             for (const k of keys) {
                 const t = state.terminals[k];
                 if (t && t.fitAddon) { try { t.fitAddon.fit(); } catch (_) {} }
@@ -7207,7 +7499,7 @@ function openSshTerminal(project, serviceId, svc) {
     // on .terminal-pad for the fit-addon quirk this works around.
     const pad = el("div", { class: "terminal-pad" });
     container.appendChild(pad);
-    (paneFor(serviceId) || document.getElementById("terminal-area")).appendChild(container);
+    document.getElementById("terminal-area").appendChild(container);
 
     const term = new Terminal({
         cursorBlink: true,
@@ -7386,7 +7678,7 @@ async function openHttpService(project, serviceId, svc) {
     const container = el("div", { class: "terminal-instance http-instance" });
     const status = el("div", { class: "http-status" }, ["Authenticating…"]);
     container.appendChild(status);
-    (paneFor(serviceId) || document.getElementById("terminal-area")).appendChild(container);
+    document.getElementById("terminal-area").appendChild(container);
 
     const key = tkey(project.name, serviceId);
     state.terminals[key] = {

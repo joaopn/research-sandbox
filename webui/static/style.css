@@ -550,55 +550,84 @@ body {
 }
 .terminal-instance.hidden { display: none; }
 
-/* Split-pane (W8) — when .terminal-area gets .split, it becomes a flex row
-   with .main-pane | .pane-splitter | .side-pane. Each pane is itself
-   position: relative so the existing .terminal-instance absolute children
-   anchor inside their parent pane rather than the whole area. */
-.terminal-area.split {
+/* Column layout engine (flat host). All tabs live in the ONE top strip:
+   every column's tabs sit in an absolutely-positioned, WIDTH-CAPPED wrapper
+   anchored above its pane (positionStripGroups sets the geometry; the
+   splitter drag tracks it live). The cap is what makes no-overlap
+   structural: tabs inside shrink to fit (labels ellipsize via the rules
+   below) and the wrapper clips as the last resort. The left border marks
+   the pane boundary — suppressed on group 0, whose left edge is the chrome
+   cluster, not a boundary. Panes below span the area's full height; only
+   splitters and the drag overlay live inside the area. */
+.service-tabs .column-tab-group {
+    position: absolute;
+    top: 0;
+    bottom: 0;
     display: flex;
-    flex-direction: row;
-}
-.terminal-area.split .pane {
-    position: relative;
+    align-items: stretch;
+    background: var(--bg-card);
+    border-left: 2px solid var(--border-strong);
+    z-index: 1;
     overflow: hidden;
+}
+.service-tabs .column-tab-group.column-tab-group-first { border-left: none; }
+/* The chrome cluster stays ABOVE the wrappers (z-index 1 vs 2): at narrow
+   windows the first boundary (COLUMN_MIN_FRAC of the strip) can land LEFT
+   of the chrome end, and an opaque wrapper would otherwise paint over —
+   and click-block — the + Add box. With the lift, that case presents as
+   column 1's leftmost tabs clipping under the chrome instead: the mirror
+   of group 0's own zero-width degenerate, chrome always visible and
+   clickable. Direct-child scoped so nothing inside a wrapper is touched. */
+.service-tabs > .projects-tab,
+.service-tabs > .active-project,
+.service-tabs > .add-box-tab-btn,
+.service-tabs > .tab-group-divider {
+    position: relative;
+    z-index: 2;
+}
+/* Shrink-to-fit inside a capped group: the tab may compress below its
+   content width (min-width: 0 unlocks flex shrink), the LABEL absorbs the
+   loss by ellipsizing, and the control buttons keep their size (the
+   refresh button already carries flex-shrink: 0; the box ✕ gets it here). */
+.service-tabs .column-tab-group .tab {
+    min-width: 0;
+    flex-shrink: 1;
+}
+.service-tabs .column-tab-group .tab > span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     min-width: 0;
 }
-.terminal-area.split .main-pane {
-    flex: 0 0 var(--split-ratio, 70%);
-}
-.terminal-area.split .side-pane {
-    flex: 1 1 auto;
-}
-.terminal-area.split .pane-splitter {
-    flex: 0 0 6px;
+.service-tabs .column-tab-group .close-tab-btn { flex-shrink: 0; }
+/* Splitter between adjacent columns — the engine positions it inline. */
+.terminal-area .column-splitter {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 6px;
     background: var(--border);
     cursor: col-resize;
     z-index: 4;
 }
-.terminal-area.split .pane-splitter:hover,
-.terminal-area.split .pane-splitter.dragging {
+.terminal-area .column-splitter:hover,
+.terminal-area .column-splitter.dragging {
     background: var(--fg-accent);
 }
-
-/* Pin button — lives on the right edge of each service tab. Always
-   visible but muted; switches to the theme accent when its tab is the
-   pinned one. */
-.service-tabs .tab .pin-tab-btn {
-    background: transparent;
-    border: none;
-    color: var(--fg-faint);
-    cursor: pointer;
-    padding: 0 2px;
-    margin-left: 4px;
-    font-size: 13px;
-    line-height: 1;
-    display: flex;
-    align-items: center;
+/* Drag drop-zone tint over a target pane: full column = move-into, half
+   column = the new column a split would create. */
+.terminal-area .column-drop-overlay {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    background: rgba(102, 204, 153, 0.12);
+    border: 1px dashed var(--fg-accent);
+    pointer-events: none;
+    z-index: 5;
 }
-.service-tabs .tab .pin-tab-btn:hover { color: var(--fg-base); }
-.service-tabs .tab.pinned .pin-tab-btn { color: var(--fg-accent); }
-/* Per-box ✕ on a sandbox-dind box tab (pi-iso-*). Mirrors the pin button's
-   ghost-icon styling; reddens on hover to read as a destructive control. */
+
+/* Per-box ✕ on a sandbox-dind box tab (pi-iso-*). Ghost-icon styling like
+   the refresh button; reddens on hover to read as a destructive control. */
 .service-tabs .tab .close-tab-btn {
     background: transparent;
     border: none;
@@ -656,11 +685,10 @@ body {
     width: 2px;
     background: var(--fg-accent);
     pointer-events: none;
+    /* Above the positioned column-tab-group wrappers (z-index 1). */
+    z-index: 3;
 }
 .service-tabs .tab.dragging { opacity: 0.4; }
-.service-tabs .tab.pinned {
-    box-shadow: 0 -2px 0 var(--fg-accent) inset, inset 0 0 0 9999px rgba(127, 127, 127, 0.05);
-}
 
 .http-instance {
     padding: 0;
@@ -1585,17 +1613,17 @@ html.mobile .dashboard.mobile-projects .service-tabs .active-project {
    phone is the point of the dev lane's human→agent channel, and the fetch-
    panes (both the per-repo one and the project-wide all-mirrors one, which
    share the prefix) are lightweight RS-rendered HTML that scrolls.
-   code-server / box editors / port-<n> stay desktop-only. Pin buttons
-   stay hidden (no split panes on mobile) and so does the per-tab refresh
-   button (PI decision: too small a target beside a live terminal — a
-   mis-tap would reconnect it; a dead tab still reconnects by tapping the
-   tab itself); + Add box and the per-box ✕ are SHOWN (dind box lifecycle
-   from the phone; their dialogs are sheet-styled). */
+   code-server / box editors / port-<n> stay desktop-only. The per-tab
+   refresh button stays hidden (PI decision: too small a target beside a
+   live terminal — a mis-tap would reconnect it; a dead tab still
+   reconnects by tapping the tab itself), and the column layout is
+   desktop-only — mobile always renders the flat single-strip model, so no
+   column tab groups or splitters ever exist here. + Add box and the per-box
+   ✕ are SHOWN (dind box lifecycle from the phone; sheet-styled dialogs). */
 html.mobile .service-tabs { height: 52px; }
 html.mobile .service-tabs .tab { font-size: 14px; }
 html.mobile .service-tabs .projects-tab,
 html.mobile .service-tabs .tab[data-surface="visual"]:not([data-service="reader"]):not([data-service^="git-"]):not([data-service^="fetch-"]),
-html.mobile .service-tabs .pin-tab-btn,
 html.mobile .service-tabs .refresh-tab-btn,
 html.mobile .service-tabs .tab-group-divider { display: none; }
 
