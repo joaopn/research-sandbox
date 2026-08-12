@@ -532,18 +532,19 @@ def _stage_box_fetch(cname: str) -> None:
 
 
 def _install_repo_watch(cname: str) -> None:
-    """Install the rs-repo-watch launcher into a DEV box. The box image bakes
-    the dev tooling at /opt/dev only (command-relevance: a non-dev box carries
-    no dev commands on PATH), and the box entrypoint runs as `worker`, which
-    cannot write /usr/local/bin — so the launcher lands via a root exec here,
-    right after the dev box's docker run (the rs-fetch staging idiom).
-    Best-effort: a failure warns; the watcher stays manually startable via
-    /opt/dev/rs-repo-watch."""
-    r = _docker("exec", "-u", "0", cname, "ln", "-sf",
-                "/opt/dev/rs-repo-watch", "/usr/local/bin/rs-repo-watch")
-    if r.returncode != 0:
-        print(f"warning: installing rs-repo-watch into dev box {cname!r} "
-              f"failed: {(r.stderr or r.stdout).strip()}", file=sys.stderr)
+    """Install the dev tooling launchers (rs-repo-watch + rs-wt) into a DEV
+    box. The box image bakes the dev tooling at /opt/dev only
+    (command-relevance: a non-dev box carries no dev commands on PATH), and
+    the box entrypoint runs as `worker`, which cannot write /usr/local/bin —
+    so the launchers land via a root exec here, right after the dev box's
+    docker run (the rs-fetch staging idiom). Best-effort per launcher: a
+    failure warns; each stays manually startable via its /opt/dev path."""
+    for tool in ("rs-repo-watch", "rs-wt"):
+        r = _docker("exec", "-u", "0", cname, "ln", "-sf",
+                    f"/opt/dev/{tool}", f"/usr/local/bin/{tool}")
+        if r.returncode != 0:
+            print(f"warning: installing {tool} into dev box {cname!r} "
+                  f"failed: {(r.stderr or r.stdout).strip()}", file=sys.stderr)
 
 
 def _project_box_pair() -> dict:

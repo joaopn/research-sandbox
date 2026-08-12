@@ -1,0 +1,380 @@
+#!/opt/conda/bin/python
+"""rs-wt — parallel per-session git worktrees for a dev-lane clone.
+
+One interactive agent session = one worktree + one agent/<name> branch, so N
+sessions can work the SAME repo in one container without tripping over each
+other's checkout, index, or working files. The primary clone at
+/workspace/<repo> stays the integration tree (repo-watch / single-session
+work); parallel sessions live under /workspace/wt/<name>.
+
+Verbs:
+  new <name> [--base REF]  create branch agent/<name> + its worktree
+  reopen <name>            re-attach a worktree to an existing agent/<name>
+  list                     every tree (branch, tip, dirty, unpushed) + branches
+                           whose tree was removed
+  done <name> [--force]    remove the worktree — the branch is ALWAYS kept
+
+Branch policy: rs-wt NEVER deletes a branch, on any path ("done" removes the
+working tree only; branches pile up deliberately — archival/pruning is a
+separate, human-driven step). Lifecycle cleanup is the session's own "done";
+recurring maintenance stays with git's defaults (auto-gc untouched).
+
+Dev-lane gate: rs-wt refuses unless the discovered clone's `origin` remote is
+the shared Gitea (both dev surfaces clone from it by construction — the dev
+project supervisor via rscore._run_dev_clone, a dev box via the entrypoint dev
+block). A light-path clone (GitHub https) is deliberately refused.
+
+Standalone by design: baked into the sandbox-dind and sandbox-box images, so
+it cannot import cli/ modules — the constants below carry their locksteps.
+"""
+
+import argparse
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+WORKSPACE = Path("/workspace")
+# Worktrees live UNDER the workspace so they survive container stop/start AND
+# recreate (the container fs does not survive a recreate; the workspace does).
+WT_DIRNAME = "wt"
+WT_ROOT = WORKSPACE / WT_DIRNAME
+
+# Session branches are namespaced under the dev lane's established convention
+# (boxes/dev.instructions.md "Use the agent/ prefix").
+BRANCH_PREFIX = "agent/"
+
+# MIRROR-PAIR LOCKSTEP (three-way): the shared-Gitea origin every dev clone is
+# minted from. cli/gitea.py GITEA_CONTAINER + GITEA_INNER_PORT (the supervisor
+# clone, rscore._run_dev_clone) and cli/rs_sandbox.py DEV_GITEA_URL (the box
+# clone) — this file is image-baked standalone and cannot import either.
+# Pinned by the unit test.
+GITEA_ORIGIN_PREFIX = "http://rs-gitea:"
+
+# Mirror of cli/rscore.py _BRANCH_NAME_MAX: the cap rscore enforces on branch
+# names. The name cap keeps the COMPOSED branch (agent/<name>) within that same
+# cap — NAME_MAX per fs component would allow slightly more; this is the
+# branch-cap mirror, deliberately the stricter of the two.
+_BRANCH_NAME_MAX = 255
+NAME_MAX = _BRANCH_NAME_MAX - len(BRANCH_PREFIX)
+
+# The rscore._valid_branch_name shape minus "/" — the name doubles as a
+# directory name under WT_ROOT, so path separators are out.
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def die(msg: str) -> None:
+    print(f"rs-wt: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def warn(msg: str) -> None:
+    print(f"rs-wt: warning: {msg}", file=sys.stderr)
+
+
+def _run(cmd):
+    """Single subprocess seam (the unit test stubs this)."""
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def git(anchor, *args):
+    """Run git anchored at an ABSOLUTE path (the clone or one worktree) —
+    never the caller's cwd: verbs are invoked from inside worktrees, and a
+    cwd-relative git reads the wrong repo (the relative-git-dir trap)."""
+    return _run(["git", "-C", str(anchor), *args])
+
+
+def name_error(name: str):
+    """Shape rule for a worktree/session name; None when valid."""
+    if not name or not NAME_RE.match(name):
+        return (f"invalid name {name!r}: letter/digit first, then letters, "
+                f"digits, '.', '_', '-' (no '/')")
+    if ".." in name:
+        return f"invalid name {name!r}: '..' is not allowed"
+    if name.endswith("."):
+        return f"invalid name {name!r}: trailing '.' is not a valid git ref"
+    if name.endswith(".lock"):
+        return f"invalid name {name!r}: '.lock' suffix is reserved by git"
+    if len(name) > NAME_MAX:
+        return f"invalid name {name!r}: longer than {NAME_MAX} characters"
+    return None
+
+
+def find_clone() -> Path:
+    """The single primary clone: exactly one top-level /workspace/<d> whose
+    .git is a DIRECTORY (a linked worktree carries a .git FILE, so trees under
+    wt/ can never be mistaken for the clone)."""
+    if not WORKSPACE.is_dir():
+        die(f"no {WORKSPACE} — rs-wt runs inside a dev container")
+    clones = []
+    for d in sorted(WORKSPACE.iterdir()):
+        if not d.is_dir() or d.name == WT_DIRNAME:
+            continue
+        if (d / ".git").is_dir():
+            clones.append(d)
+    if not clones:
+        if (WORKSPACE / WT_DIRNAME / ".git").is_dir():
+            die(f"the dev repo is named '{WT_DIRNAME}', which rs-wt reserves "
+                f"for worktrees — unsupported")
+        die(f"no dev clone found under {WORKSPACE} (still cloning, or not a "
+            f"dev container)")
+    if len(clones) > 1:
+        names = ", ".join(d.name for d in clones)
+        die(f"multiple top-level clones under {WORKSPACE} ({names}) — rs-wt "
+            f"needs exactly one; keep reference clones out of the workspace "
+            f"top level")
+    return clones[0]
+
+
+def gated_clone() -> Path:
+    """Discovery + the dev-lane gate, shared by every verb (uniformly — a
+    refusal is clearer than a `list` rendering empty state on a non-dev
+    container)."""
+    repo = find_clone()
+    r = git(repo, "remote", "get-url", "origin")
+    if r.returncode != 0:
+        die(f"cannot read the origin remote of {repo}: "
+            f"{(r.stderr or r.stdout).strip() or 'git failed'}")
+    if not r.stdout.strip().startswith(GITEA_ORIGIN_PREFIX):
+        die(f"rs-wt works dev-lane clones only (origin of {repo.name!r} is "
+            f"not the shared Gitea)")
+    return repo
+
+
+def branch_exists(repo: Path, branch: str) -> bool:
+    return git(repo, "rev-parse", "--verify", "--quiet",
+               f"refs/heads/{branch}").returncode == 0
+
+
+def worktree_map(repo: Path) -> dict:
+    """Registered worktrees (the primary clone included) from
+    `git worktree list --porcelain`: path -> {branch, head}."""
+    r = git(repo, "worktree", "list", "--porcelain")
+    if r.returncode != 0:
+        die(f"git worktree list failed: {(r.stderr or r.stdout).strip()}")
+    out, cur = {}, None
+    for line in r.stdout.splitlines():
+        if line.startswith("worktree "):
+            cur = line[len("worktree "):]
+            out[cur] = {"branch": "", "head": ""}
+        elif cur and line.startswith("HEAD "):
+            out[cur]["head"] = line[len("HEAD "):]
+        elif cur and line.startswith("branch "):
+            ref = line[len("branch "):]
+            out[cur]["branch"] = (ref[len("refs/heads/"):]
+                                  if ref.startswith("refs/heads/") else ref)
+    return out
+
+
+def resolve_base(repo: Path, explicit: str) -> str:
+    """Default base = the primary clone's checked-out branch — that is the
+    spawn-time resolved base by construction (the clone is created checked out
+    on it), and it tracks a maintainer redirect while origin/HEAD does not
+    (`clone --branch X` never repoints origin/HEAD). Prefer the fork's state
+    of that branch when the remote-tracking ref exists."""
+    if explicit:
+        return explicit
+    r = git(repo, "symbolic-ref", "--short", "HEAD")
+    if r.returncode != 0:
+        die("primary clone is detached; pass --base <ref>")
+    head = r.stdout.strip()
+    if git(repo, "rev-parse", "--verify", "--quiet",
+           f"refs/remotes/origin/{head}").returncode == 0:
+        return f"origin/{head}"
+    return head
+
+
+def cmd_new(args) -> None:
+    repo = gated_clone()
+    err = name_error(args.name)
+    if err:
+        die(err)
+    path = WT_ROOT / args.name
+    branch = BRANCH_PREFIX + args.name
+    if str(path) in worktree_map(repo) or path.exists():
+        die(f"worktree {args.name!r} already exists at {path} — pick another "
+            f"name (see `rs-wt list`)")
+    if branch_exists(repo, branch):
+        die(f"branch {branch!r} already exists — `rs-wt reopen {args.name}` "
+            f"resumes it; pick another name for fresh work")
+    # Freshness is best-effort: gitea may be stopped (the offline posture) —
+    # branch from the last-known refs rather than failing the session start.
+    r = git(repo, "fetch", "origin", "--prune")
+    if r.returncode != 0:
+        warn(f"`git fetch origin` failed "
+             f"({(r.stderr or r.stdout).strip() or 'no detail'}); branching "
+             f"from the last-known refs")
+    base = resolve_base(repo, args.base)
+    WT_ROOT.mkdir(parents=True, exist_ok=True)
+    r = git(repo, "worktree", "add", "-b", branch, str(path), base)
+    if r.returncode != 0:
+        die(f"git worktree add failed: {(r.stderr or r.stdout).strip()}")
+    print(f"worktree: {path}")
+    print(f"branch:   {branch}")
+    print(f"base:     {base}")
+    print(f"\ncd {path}")
+
+
+def cmd_reopen(args) -> None:
+    repo = gated_clone()
+    err = name_error(args.name)
+    if err:
+        die(err)
+    path = WT_ROOT / args.name
+    branch = BRANCH_PREFIX + args.name
+    if not branch_exists(repo, branch):
+        die(f"no branch {branch!r} to reopen — `rs-wt new {args.name}` "
+            f"starts fresh")
+    wts = worktree_map(repo)
+    if str(path) in wts:
+        if path.exists():
+            die(f"worktree {args.name!r} is already open at {path}")
+        # Registered but the directory is gone (hand-deleted): clear the
+        # stale metadata so the re-add succeeds.
+        r = git(repo, "worktree", "prune")
+        if r.returncode != 0:
+            die(f"git worktree prune failed: {(r.stderr or r.stdout).strip()}")
+    elif path.exists():
+        die(f"{path} exists but is not a registered worktree — move it "
+            f"aside first")
+    r = git(repo, "worktree", "add", str(path), branch)
+    if r.returncode != 0:
+        # Includes git's own refusal when the branch is checked out in
+        # another worktree — its message names where.
+        die(f"git worktree add failed: {(r.stderr or r.stdout).strip()}")
+    tip = git(path, "log", "-1", "--format=%h %s")
+    tipline = tip.stdout.strip() if tip.returncode == 0 else "(unknown)"
+    print(f"worktree: {path}")
+    print(f"branch:   {branch}")
+    print(f"at:       {tipline}")
+    print(f"\ncd {path}")
+
+
+def cmd_list(args) -> None:
+    repo = gated_clone()
+    r = git(repo, "symbolic-ref", "--short", "HEAD")
+    head = r.stdout.strip() if r.returncode == 0 else "(detached)"
+    print(f"primary: {repo}  [{head}]")
+    wts = worktree_map(repo)
+    prefix = str(WT_ROOT) + "/"
+    open_branches = set()
+    rows = []
+    for path in sorted(p for p in wts if p.startswith(prefix)):
+        info = wts[path]
+        name = Path(path).name
+        branch = info["branch"] or "(detached)"
+        if info["branch"]:
+            open_branches.add(info["branch"])
+        tip = git(path, "log", "-1", "--format=%h %s")
+        tipline = tip.stdout.strip() if tip.returncode == 0 else "(unknown)"
+        st = git(path, "status", "--porcelain")
+        dirty = "?" if st.returncode != 0 else \
+            ("dirty" if st.stdout.strip() else "clean")
+        if info["branch"]:
+            if git(repo, "rev-parse", "--verify", "--quiet",
+                   f"refs/remotes/origin/{branch}").returncode == 0:
+                n = git(repo, "rev-list", "--count",
+                        f"origin/{branch}..{branch}")
+                cnt = n.stdout.strip() if n.returncode == 0 else "?"
+                pushed = "pushed" if cnt == "0" else f"{cnt} unpushed"
+            else:
+                pushed = "not pushed"
+        else:
+            pushed = "-"
+        rows.append(f"  {name}  [{branch}]  {tipline}  ({dirty}, {pushed})")
+    print(f"worktrees under {WT_ROOT}:")
+    print("\n".join(rows) if rows else "  (none)")
+    r = git(repo, "for-each-ref", "--format=%(refname:short)",
+            f"refs/heads/{BRANCH_PREFIX}")
+    orphans = [b for b in r.stdout.split()
+               if r.returncode == 0 and b not in open_branches]
+    if orphans:
+        print("branches without a tree (`rs-wt reopen <name>` resumes one):")
+        for b in orphans:
+            print(f"  {b[len(BRANCH_PREFIX):]}  [{b}]")
+
+
+def cmd_done(args) -> None:
+    repo = gated_clone()
+    err = name_error(args.name)
+    if err:
+        die(err)
+    path = WT_ROOT / args.name
+    branch = BRANCH_PREFIX + args.name
+    wts = worktree_map(repo)
+    if str(path) not in wts:
+        if path.exists():
+            die(f"{path} exists but is not a registered worktree — refusing "
+                f"to touch it")
+        die(f"no worktree {args.name!r} (see `rs-wt list`)")
+    if not path.exists():
+        # Stale metadata (directory hand-deleted): nothing to remove.
+        r = git(repo, "worktree", "prune")
+        if r.returncode != 0:
+            die(f"git worktree prune failed: {(r.stderr or r.stdout).strip()}")
+        print(f"{path} was already gone; pruned stale metadata. "
+              f"branch {branch} kept.")
+        return
+    # The tool's refusal-with-remedy fires BEFORE git's terser dirty error
+    # (status --porcelain counts untracked too, matching worktree remove).
+    st = git(path, "status", "--porcelain")
+    if st.returncode != 0:
+        die(f"cannot read worktree status: "
+            f"{(st.stderr or st.stdout).strip() or 'git failed'}")
+    if st.stdout.strip() and not args.force:
+        die(f"worktree {args.name!r} has uncommitted changes — commit them "
+            f"first, or `rs-wt done {args.name} --force` DISCARDS them")
+    if branch_exists(repo, branch):
+        if git(repo, "rev-parse", "--verify", "--quiet",
+               f"refs/remotes/origin/{branch}").returncode == 0:
+            n = git(repo, "rev-list", "--count", f"origin/{branch}..{branch}")
+            if n.returncode == 0 and n.stdout.strip() not in ("", "0"):
+                warn(f"branch {branch} has {n.stdout.strip()} commit(s) not "
+                     f"on the fork — it stays local until you push")
+        else:
+            warn(f"branch {branch} was never pushed — it stays local until "
+                 f"you push")
+    rm = ["worktree", "remove"]
+    if args.force:
+        rm.append("--force")
+    rm.append(str(path))
+    r = git(repo, *rm)
+    if r.returncode != 0:
+        die(f"git worktree remove failed: {(r.stderr or r.stdout).strip()}")
+    print(f"removed worktree {args.name!r}; branch {branch} kept "
+          f"(`rs-wt reopen {args.name}` resumes it)")
+
+
+def main(argv=None) -> None:
+    p = argparse.ArgumentParser(
+        prog="rs-wt",
+        description="Parallel per-session git worktrees for the dev-lane "
+                    "clone (one session = one tree + one agent/<name> "
+                    "branch). Never deletes branches.")
+    sub = p.add_subparsers(dest="verb", required=True)
+    n = sub.add_parser("new", help="create branch agent/<name> + its worktree")
+    n.add_argument("name", help="session/feature name (also the dir name "
+                                "under /workspace/wt/)")
+    n.add_argument("--base", default="",
+                   help="ref to branch from (default: origin/<the primary "
+                        "clone's checked-out branch>)")
+    n.set_defaults(func=cmd_new)
+    ro = sub.add_parser("reopen",
+                        help="re-attach a worktree to an existing "
+                             "agent/<name> branch")
+    ro.add_argument("name")
+    ro.set_defaults(func=cmd_reopen)
+    ls = sub.add_parser("list", help="worktrees + branches without a tree")
+    ls.set_defaults(func=cmd_list)
+    d = sub.add_parser("done",
+                       help="remove the worktree (the branch is ALWAYS kept)")
+    d.add_argument("name")
+    d.add_argument("--force", action="store_true",
+                   help="discard uncommitted changes in the tree")
+    d.set_defaults(func=cmd_done)
+    args = p.parse_args(argv)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
