@@ -39,9 +39,14 @@ has not collected yet.
 
 - One branch per issue: `agent/{short-description}`
 - Commit often, push when a chunk of work is complete
+- Keep every branch with an open PR rebased onto the current "$GITEA_BRANCH":
+  when something else lands on the base branch, rebase your open PR branches
+  onto it and force-push them (never the base branch) as part of normal work,
+  so review always looks at work sitting on the current base
 - The `agent/` prefix is a naming convention that keeps in-progress work easy to
   spot, not a restriction — you may check out and work on any existing branch,
-  and you merge your finished work into your base branch once it is approved
+  and you land your finished work into your base branch with `rs-land` once it
+  is approved
 
 ## Gitea API
 
@@ -113,20 +118,28 @@ A non-zero exit means upstream has moved ahead of your base branch. **STOP.** Do
 not rebase, do not force-push, do not merge. Comment on the issue saying the base
 branch has moved and ask the maintainer how to proceed, then wait.
 
-If it exits zero, merge:
+If it exits zero, land the PR:
 
 ```bash
-curl -s -X POST \
-  -H "Authorization: token $GITEA_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"Do":"fast-forward-only","delete_branch_after_merge":true}' \
-  "$GITEA_URL/api/v1/repos/$GITEA_USER/$REPO_NAME/pulls/PR_NUMBER/merge"
+rs-land PR_NUMBER
 ```
 
-Always merge fast-forward-only — your fork refuses merge-commit and squash styles
-by policy, and a linear history is what lets the maintainer land your commits
-individually. If gitea still refuses (HTTP 405), STOP and report that in a
-comment. Do not work around the refusal.
+rs-land merges fast-forward-only (your fork refuses merge-commit and squash
+styles by policy — a linear history is what lets the maintainer land your
+commits individually), tags the landing as `PR_NUMBER-<feature>` (the branch
+name without its `agent/` prefix; the tag is the durable record of what
+landed), and deletes the branch. It refuses rather than repairs: a refused
+landing leaves the fork exactly as it was.
+
+If rs-land refuses because the base branch moved (another PR landed first),
+the fix is yours: rebase your branch onto "$GITEA_BRANCH", force-push the
+feature branch (NEVER the base branch), and run rs-land again. If that rebase
+had conflicts, the resolution is new code nobody has reviewed — describe it in
+a PR comment, label the issue `needs-review`, and wait for a fresh approval
+instead of landing. A refusal right after a push can be transient (gitea is
+still recomputing mergeability) — re-run rs-land once before reaching for a
+rebase. If rs-land keeps refusing for a reason none of this explains, STOP and
+report the refusal text in a comment — do not work around it.
 
 ### Add labels to an issue
 
@@ -216,7 +229,7 @@ For every task, follow this sequence:
 1. **Use labels** to signal status: `in-progress` when working, `needs-review` when you open a PR, `done` when merged.
 2. **Stop after submitting a PR.** Once you open a PR and label the issue `needs-review`, you are done. Do not check PR status — the system will call you back when there is new activity.
 3. **When invoked with review feedback**, check the PR's review comments and address them. Push fixes to the same branch and comment on the PR.
-4. **Merge only when approved.** Look for explicit approval ("LGTM", "approved", "merge it", "looks good") before merging a PR. After merging, close the issue and label it `done`.
+4. **Merge only when approved.** Look for explicit approval ("LGTM", "approved", "merge it", "looks good") before landing a PR — then land it with `rs-land PR_NUMBER` (see "Merge a pull request"). After landing, close the issue and label it `done`.
 5. **Don't start large changes without confirmation.** Describe what you plan to do and wait for the human to agree.
 6. **Create sub-issues** if you discover bugs or related work while working on something.
 7. **Reference issues** in commit messages and PR descriptions using `#N` or `Fixes #N`.

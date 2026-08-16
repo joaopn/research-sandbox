@@ -1,0 +1,363 @@
+#!/opt/conda/bin/python
+"""rs-land — land an approved PR: archive tag -> ff-only merge -> branch delete.
+
+One command performs the whole landing against the shared Gitea:
+  1. tag the PR's head commit as <pr>-<feature> (the branch name with its
+     leading agent/ stripped) — the durable, out-of-the-branch-list archive
+     of exactly what landed;
+  2. merge the PR fast-forward-only, PINNED to that head commit (a push that
+     lands between resolve and merge refuses instead of landing bytes the
+     tag does not point at);
+  3. delete the head branch (server-side, via the merge option).
+
+Refuse-don't-repair: every precondition failure refuses and leaves the fork
+exactly as found — rs-land never rebases, never force-pushes, never retries.
+Two deliberate carve-outs:
+  - resume-if-identical: a run that finds a tag already pointing at exactly
+    the PR's current head (a crashed prior landing) ADOPTS it and proceeds;
+  - a completed landing is never undone: when the merge is refused because
+    the PR turned out to be merged by another actor (a concurrent run, or a
+    human in the gitea UI), the tag IS the archive of a successful landing —
+    it is KEPT and rs-land exits 0. The rollback that erases a provisional
+    tag fires only when a re-resolve shows the PR still open.
+
+Usage: rs-land <pr-number>
+
+Wiring resolution (mirrors rs-repo-watch):
+  - dev BOX: GITEA_URL/GITEA_TOKEN/GITEA_USER/REPO_NAME arrive as container
+    env — used as-is.
+  - dev PROJECT (supervisor): the agent_user-bearing row of the host-staged
+    /workspace/.orchestrator/dev-gitea.json + its token file under
+    ~/.dev-tokens/ (per-consumer forks: the row's `user` is the ACTIVE fork
+    for fetch-side readers, not necessarily ours; a dev project's agent
+    works exactly ONE repo, so there is nothing to pick).
+
+Pure API by design: no git subprocess anywhere — the merge endpoint is the
+authority on landability, and a less specific refusal beats a local-clone
+dependency. The token travels ONLY as the Authorization header — never argv,
+never inside a URL, never in output.
+
+Standalone by design: image-baked into both dev surfaces (sandbox-dind
+/usr/local/bin; box /opt/dev + the dev-box symlink), so it cannot import
+cli/ modules — the constants below carry their locksteps.
+"""
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+# MIRROR-PAIR LOCKSTEP (four-way now): the shared-Gitea base URL every dev
+# surface talks to. cli/gitea.py GITEA_CONTAINER + GITEA_INNER_PORT,
+# cli/rs_sandbox.py DEV_GITEA_URL, and rs-wt's GITEA_ORIGIN_PREFIX — this
+# file is image-baked standalone and cannot import any of them. Pinned by
+# the unit test.
+DEV_GITEA_URL = "http://rs-gitea:3000"
+
+# The dev lane's branch namespace (rs-wt's BRANCH_PREFIX — same lockstep
+# family). Stripped from the head branch when deriving the tag name.
+BRANCH_PREFIX = "agent/"
+
+# Quick-call bound, mirroring cli/gitea.py API_TIMEOUT_S (the dev lane's
+# established bound for metadata GET/POSTs against the always-local gitea).
+API_TIMEOUT_S = 15
+# The merge is a server-side ref update plus hooks — normally sub-second,
+# but it is the one call doing real work, so it gets a generous separate
+# bound. Bounded at all so a wedged gitea cannot hang an interactive
+# session forever; at 10x the quick bound a slower answer still lands.
+MERGE_TIMEOUT_S = 60
+
+# Refusal messages quote gitea's own error detail (409 is overloaded
+# upstream: head-moved / ff-diverged / conflicts all use it) — bounded so a
+# pathological body cannot flood the terminal. 300 chars comfortably holds
+# gitea's one-sentence message bodies.
+_DETAIL_MAX_CHARS = 300
+
+# Filled by resolve_wiring() before any API call: url, token, user, repo.
+_WIRING = {}
+
+
+def die(msg: str) -> None:
+    print(f"rs-land: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def warn(msg: str) -> None:
+    print(f"rs-land: warning: {msg}", file=sys.stderr)
+
+
+class Unreachable(Exception):
+    """Network-level failure — no HTTP status. Distinct from an answered
+    error by construction: an unverifiable state must never read as a 404
+    (absent) or as a refusal."""
+
+
+def resolve_wiring() -> None:
+    """Box env first, else the supervisor's staged wiring (the rs-repo-watch
+    resolution, mirrored)."""
+    token = os.environ.get("GITEA_TOKEN") or ""
+    if token:
+        url = os.environ.get("GITEA_URL") or ""
+        user = os.environ.get("GITEA_USER") or ""
+        repo = os.environ.get("REPO_NAME") or ""
+        if not (url and user and repo):
+            die("GITEA_URL/GITEA_USER/REPO_NAME must be set alongside "
+                "GITEA_TOKEN")
+        _WIRING.update(url=url, token=token, user=user, repo=repo)
+        return
+    dev_json = (Path(os.environ.get("RS_WORKSPACE") or "/workspace")
+                / ".orchestrator" / "dev-gitea.json")
+    if not dev_json.is_file():
+        die(f"no dev wiring ({dev_json} missing); run "
+            f"'research dev attach <project> --repo <repo>' first")
+    try:
+        data = json.loads(dev_json.read_text())
+    except (OSError, ValueError) as e:
+        die(f"cannot read dev wiring: {e}")
+    # Rows without an agent_user are box-only repos — OTHER containers'
+    # wiring, where this project's agent has no identity. At most one row
+    # bears agent_user (one repo per dev container).
+    rows = [r for r in (data.get("repos") or [])
+            if isinstance(r, dict) and r.get("repo") and r.get("agent_user")]
+    if not rows:
+        die("this project's own agent works no repo (box-only wiring?); "
+            "run 'research dev attach' first")
+    row = rows[0]
+    token_base = row.get("token_file") or row["agent_user"] + ".token"
+    token_file = Path.home() / ".dev-tokens" / token_base
+    try:
+        token = token_file.read_text().strip()
+    except OSError:
+        token = ""
+    if not token:
+        die(f"token missing at {token_file}; re-run 'research dev attach' "
+            f"(it re-stages the token)")
+    _WIRING.update(url=DEV_GITEA_URL, token=token,
+                   user=row["agent_user"], repo=row["repo"])
+
+
+def api(method: str, path: str, body=None, timeout: int = API_TIMEOUT_S):
+    """One JSON API call -> (status, parsed-body-or-None). Answered HTTP
+    errors return their status (with the parsed error body); network-level
+    failures raise Unreachable. The token rides the Authorization header
+    ONLY."""
+    url = _WIRING["url"] + "/api/v1" + path
+    payload = json.dumps(body).encode() if body is not None else None
+    headers = {"Authorization": "token " + _WIRING["token"]}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=payload, method=method,
+                                 headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status, raw = resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        status, raw = e.code, e.read()
+    except (urllib.error.URLError, OSError) as e:
+        reason = getattr(e, "reason", None) or e
+        raise Unreachable(f"{method} {path}: {reason}") from None
+    try:
+        return status, json.loads(raw) if raw.strip() else None
+    except ValueError:
+        return status, None
+
+
+def _q(name: str) -> str:
+    """Quote one ref name for a URL path. safe='/' is load-bearing: gitea's
+    tag and branch routes take the name via a wildcard PathParam, so a
+    slash-bearing name (a branch with extra slashes -> tag '29-foo/bar')
+    must keep raw slashes to route."""
+    return urllib.parse.quote(name, safe="/")
+
+
+def detail_of(data, status: int) -> str:
+    """Gitea's own error detail, bounded, for refusal messages."""
+    msg = data.get("message") if isinstance(data, dict) else None
+    text = str(msg) if msg else "no detail"
+    return f"HTTP {status}: {text[:_DETAIL_MAX_CHARS]}"
+
+
+def tag_name_for(pr: int, head_ref: str) -> str:
+    """<pr>-<head branch stripped of a leading agent/>; '' when underivable."""
+    rest = (head_ref[len(BRANCH_PREFIX):]
+            if head_ref.startswith(BRANCH_PREFIX) else head_ref)
+    return f"{pr}-{rest}" if rest else ""
+
+
+def probe_tag(name: str, head_sha: str) -> str:
+    """'absent' | 'adopt' (lightweight, at the PR's current head — a crashed
+    prior rs-land's own tag) | die otherwise. Adoption requires BOTH
+    commit.sha == head (the target commit; a tag's `id` is the tag-OBJECT
+    sha when annotated) AND id == commit.sha (the lightweight structural
+    check rs-land's own tags always satisfy) — a foreign ANNOTATED tag
+    coincidentally at the head refuses, so rollback can never delete a tag
+    rs-land did not mint."""
+    repo_path = f"/repos/{_WIRING['user']}/{_WIRING['repo']}"
+    try:
+        status, data = api("GET", f"{repo_path}/tags/{_q(name)}")
+    except Unreachable as e:
+        die(f"gitea unreachable while probing tag {name!r} ({e}) — "
+            f"refusing (an unverifiable tag never reads as absent)")
+    if status == 404:
+        return "absent"
+    if status == 200 and isinstance(data, dict):
+        commit_sha = (data.get("commit") or {}).get("sha") or ""
+        tag_id = data.get("id") or ""
+        if commit_sha == head_sha and tag_id == commit_sha:
+            return "adopt"
+        target = commit_sha[:9] if commit_sha else "unknown"
+        die(f"tag {name!r} already exists (target {target}, not this PR's "
+            f"current head) — refusing; if it is a leftover you own, delete "
+            f"it and re-run")
+    die(f"could not verify tag {name!r} ({detail_of(data, status)}) — "
+        f"refusing (an unverifiable tag never reads as absent)")
+
+
+def rollback_tag(name: str) -> None:
+    """Best-effort delete of the tag this run proceeded with (created or
+    adopted-identical — both provisional until the merge lands)."""
+    repo_path = f"/repos/{_WIRING['user']}/{_WIRING['repo']}"
+    try:
+        status, data = api("DELETE", f"{repo_path}/tags/{_q(name)}")
+    except Unreachable as e:
+        warn(f"rollback failed ({e}) — delete tag {name!r} manually "
+             f"(gitea UI, or: git push origin :refs/tags/{name})")
+        return
+    if status not in (200, 204):
+        warn(f"rollback failed ({detail_of(data, status)}) — delete tag "
+             f"{name!r} manually (gitea UI, or: git push origin "
+             f":refs/tags/{name})")
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="rs-land",
+        description="Land an approved PR: archive tag -> fast-forward-only "
+                    "merge -> branch delete. Refuses rather than repairs; "
+                    "run it after the maintainer's explicit all-clear.")
+    ap.add_argument("pr", type=int, help="the PR number on your own fork")
+    args = ap.parse_args(argv)
+    resolve_wiring()
+    user, repo, pr = _WIRING["user"], _WIRING["repo"], args.pr
+    repo_path = f"/repos/{user}/{repo}"
+
+    # Resolve the PR (refuse unless open and unmerged).
+    try:
+        status, pr_data = api("GET", f"{repo_path}/pulls/{pr}")
+    except Unreachable as e:
+        die(f"gitea unreachable ({e})")
+    if status == 404:
+        die(f"PR #{pr} not found on {user}/{repo}")
+    if status != 200 or not isinstance(pr_data, dict):
+        die(f"PR #{pr} lookup failed ({detail_of(pr_data, status)})")
+    if pr_data.get("merged"):
+        die(f"PR #{pr} already landed; nothing to do")
+    if (pr_data.get("state") or "") != "open":
+        die(f"PR #{pr} is {pr_data.get('state')!r}; only open PRs are landed")
+    head_ref = (pr_data.get("head") or {}).get("ref") or ""
+    head_sha = (pr_data.get("head") or {}).get("sha") or ""
+    base_ref = (pr_data.get("base") or {}).get("ref") or ""
+    if not head_ref or not head_sha:
+        die(f"PR #{pr} response missing head ref/sha")
+
+    name = tag_name_for(pr, head_ref)
+    if not name:
+        die(f"cannot derive a tag name from head branch {head_ref!r}")
+
+    # Archive tag first (no window where the branch is gone and the tag is
+    # not), pinned to the resolved head.
+    state = probe_tag(name, head_sha)
+    if state == "adopt":
+        print(f"tag {name} already at the PR head — resuming a crashed "
+              f"landing")
+    else:
+        try:
+            status, data = api("POST", f"{repo_path}/tags",
+                               {"tag_name": name, "target": head_sha})
+        except Unreachable as e:
+            die(f"gitea unreachable while creating tag {name!r} ({e})")
+        if status == 409:
+            # Creation race: someone tagged between probe and create. Re-probe
+            # once; adopt-or-refuse decides. "absent" here means the racer's
+            # tag was rolled back in the window — refuse rather than merge
+            # UNTAGGED (the ordering invariant); probe_tag itself dies on the
+            # other-sha and unverifiable outcomes.
+            if probe_tag(name, head_sha) != "adopt":
+                die(f"tag create raced and the tag then vanished — re-run "
+                    f"rs-land {pr}")
+            print(f"tag {name} appeared at the PR head — adopting")
+        elif status not in (200, 201):
+            die(f"tag create failed ({detail_of(data, status)})")
+        else:
+            print(f"tagged {name} -> {head_sha[:9]}")
+
+    # Merge, pinned to the tagged head (v1.25.1: a moved head answers
+    # 409 "head out of date" instead of landing bytes the tag misses).
+    try:
+        status, mdata = api("POST", f"{repo_path}/pulls/{pr}/merge",
+                            {"Do": "fast-forward-only",
+                             "delete_branch_after_merge": True,
+                             "head_commit_id": head_sha},
+                            timeout=MERGE_TIMEOUT_S)
+    except Unreachable as e:
+        # State unknown: the merge may or may not have landed. Fail-safe
+        # direction is KEEP (deleting could destroy a completed landing's
+        # archive); a re-run resumes via adopt or reports already-landed.
+        die(f"gitea unreachable during the merge ({e}) — landing state "
+            f"unknown; tag {name} kept, re-run rs-land {pr} (it resumes "
+            f"safely)")
+
+    if status not in (200, 201):
+        # Refused. A completed landing is never undone: re-resolve FIRST —
+        # the refusal may mean another actor merged in the window, and then
+        # the tag is the archive, not a provisional to roll back. Keyed on
+        # the re-GET, never on the refusal's status/text.
+        merged = None
+        try:
+            s2, p2 = api("GET", f"{repo_path}/pulls/{pr}")
+            if s2 == 200 and isinstance(p2, dict):
+                merged = bool(p2.get("merged"))
+        except Unreachable:
+            merged = None
+        if merged is True:
+            print(f"PR #{pr} already landed (by another actor); tag {name} "
+                  f"kept")
+            return 0
+        if merged is None:
+            die(f"merge refused ({detail_of(mdata, status)}) and the PR "
+                f"state could not be re-verified — tag {name} kept; check "
+                f"gitea and re-run rs-land {pr}")
+        rollback_tag(name)
+        die(f"merge refused ({detail_of(mdata, status)}); tag {name} rolled "
+            f"back. If the base branch moved, rebase {head_ref} onto "
+            f"{base_ref}, force-push the feature branch, and re-run; a 405 "
+            f"right after a push can be transient — re-run once before "
+            f"rebasing")
+
+    # Landed. The merge option's branch delete is best-effort server-side
+    # (200 even if it failed) — post-verify, and never claim an unverified
+    # deletion; the landing stands on tag + merge regardless.
+    branch_note = "branch deleted"
+    try:
+        s4, _ = api("GET", f"{repo_path}/branches/{_q(head_ref)}")
+        if s4 == 200:
+            branch_note = "branch delete did NOT take"
+            warn(f"branch {head_ref!r} survived the merge's delete — "
+                 f"remove it manually")
+        elif s4 != 404:
+            branch_note = "branch delete unverified"
+            warn(f"could not verify the branch delete (HTTP {s4})")
+    except Unreachable:
+        branch_note = "branch delete unverified"
+        warn("could not verify the branch delete (gitea unreachable)")
+    print(f"landed PR #{pr}: {head_ref} -> {base_ref} (fast-forward), "
+          f"tag {name} -> {head_sha[:9]}, {branch_note}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

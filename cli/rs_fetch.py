@@ -823,7 +823,12 @@ def main(argv: list[str] | None = None) -> None:
 
     ref = f"refs/rs-fetch/{branch}"
     print(f"\nfetching '{branch}' from {fork_url}...")
-    r = git(repo_path, "fetch", fork_url, f"{branch}:{ref}", with_auth=True)
+    # --no-tags: git's default tag-following would import any tag pointing
+    # into the fetched ancestry — and every rs-land archive tag points at a
+    # merged head, an ancestor of every future branch. The archive namespace
+    # must never ride a fetch into the human's clone.
+    r = git(repo_path, "fetch", "--no-tags", fork_url, f"{branch}:{ref}",
+            with_auth=True)
     if r.returncode != 0:
         print(f"error: branch '{branch}' not found at {fork_url}",
               file=sys.stderr)

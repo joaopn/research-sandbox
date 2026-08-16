@@ -62,11 +62,24 @@ nothing; guessing can lose commits.
   restriction.
 - **You may check out and work on any existing branch** in the repo — in the primary clone,
   when you are the only session there; a parallel worktree session stays on its own branch.
-- **Merge your finished work into your base branch** once a pull request is approved.
+- **Keep every branch with an open PR rebased onto the current `{{BASE_BRANCH}}`** as part
+  of normal work — when something else lands on the base branch, rebase your open PR
+  branches onto it and force-push them (never the base branch), so review always looks at
+  work sitting on the current base.
+- **Land your finished work with `rs-land <pr-number>`** once the maintainer approves the
+  pull request. One command does the whole landing: it merges fast-forward-only, tags what
+  landed as `<pr>-<feature>` (the branch name without its `agent/` prefix — the durable
+  record of what landed), and deletes the branch. It refuses rather than repairs — if it
+  refuses because the base branch moved, rebase your branch onto `{{BASE_BRANCH}}`,
+  force-push the feature branch (never the base branch), and run it again; if that rebase
+  had conflicts, describe the resolution in a PR comment and ask for a fresh review before
+  landing. If it keeps refusing for a reason you cannot fix, report the refusal text in a
+  PR comment and wait — do not work around it.
 - **Commit often locally**, with small commits and clear messages.
 - **Push when you finish a logical chunk of work** — a completed task or milestone, before a
-  risky operation, or when you want the maintainer to review. The maintainer squash-merges
-  your branch, so what matters is a clean, correct final diff.
+  risky operation, or when you want the maintainer to review. The maintainer collects your
+  work commit by commit, so a clean, linear sequence of well-scoped commits matters — not
+  just the final diff.
 
 ## Parallel sessions (rs-wt worktrees)
 
@@ -88,8 +101,9 @@ touch it.
   the worktree and always keeps the branch. Resume finished work later with
   `rs-wt reopen <name>` (a fresh `rs-wt new` under an old name refuses and points you there).
 - **Never, in any session:** `git stash` (the stash stack is shared across all trees), edits
-  to git config/remotes/hooks, deleting branches, or global package installs (pip, `npm -g`,
-  apt) without asking the maintainer first.
+  to git config/remotes/hooks, manually deleting branches (the server-side branch retirement
+  `rs-land` performs after an approved landing is the ONE sanctioned path), or global package
+  installs (pip, `npm -g`, apt) without asking the maintainer first.
 - **Servers and ports:** don't leave servers running unattended. Bind only the port the
   maintainer names when they ask for a demo, and stop it afterwards.
 - **Reference clones:** if you need another repo just to read it, clone it under your

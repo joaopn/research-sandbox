@@ -39,8 +39,12 @@ COPY container/dev/rs-repo-watch /usr/local/bin/rs-repo-watch
 # its outside-the-dev-lane refusal is the tool's OWN gate: the discovered
 # clone's origin remote must be the shared Gitea.
 COPY container/dev/rs-wt /usr/local/bin/rs-wt
+# rs-land (approval-gated landing: archive tag -> ff-only merge -> branch
+# delete) rides the same bake; like rs-repo-watch it exits with a remedy when
+# no dev wiring is staged, so it is inert on a non-dev project.
+COPY container/dev/rs-land /usr/local/bin/rs-land
 RUN chmod +x /opt/dev/repo-watch.sh /usr/local/bin/rs-repo-watch \
-    /usr/local/bin/rs-wt
+    /usr/local/bin/rs-wt /usr/local/bin/rs-land
 
 COPY agent/entrypoint.sandbox-dind.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

@@ -532,14 +532,14 @@ def _stage_box_fetch(cname: str) -> None:
 
 
 def _install_repo_watch(cname: str) -> None:
-    """Install the dev tooling launchers (rs-repo-watch + rs-wt) into a DEV
-    box. The box image bakes the dev tooling at /opt/dev only
+    """Install the dev tooling launchers (rs-repo-watch + rs-wt + rs-land)
+    into a DEV box. The box image bakes the dev tooling at /opt/dev only
     (command-relevance: a non-dev box carries no dev commands on PATH), and
     the box entrypoint runs as `worker`, which cannot write /usr/local/bin —
     so the launchers land via a root exec here, right after the dev box's
     docker run (the rs-fetch staging idiom). Best-effort per launcher: a
     failure warns; each stays manually startable via its /opt/dev path."""
-    for tool in ("rs-repo-watch", "rs-wt"):
+    for tool in ("rs-repo-watch", "rs-wt", "rs-land"):
         r = _docker("exec", "-u", "0", cname, "ln", "-sf",
                     f"/opt/dev/{tool}", f"/usr/local/bin/{tool}")
         if r.returncode != 0:

@@ -34,8 +34,10 @@ RUN chmod +x /entrypoint.sh
 # /usr/local/bin (rs-sandbox's _install_repo_watch, at the box's docker run);
 # on other boxes the files are inert and invisible to tab-completion.
 COPY container/dev/repo-watch.sh container/dev/repo-watch-prompt.md \
-     container/dev/rs-repo-watch container/dev/rs-wt /opt/dev/
-RUN chmod +x /opt/dev/repo-watch.sh /opt/dev/rs-repo-watch /opt/dev/rs-wt
+     container/dev/rs-repo-watch container/dev/rs-wt container/dev/rs-land \
+     /opt/dev/
+RUN chmod +x /opt/dev/repo-watch.sh /opt/dev/rs-repo-watch /opt/dev/rs-wt \
+    /opt/dev/rs-land
 
 # F3 loopback forwarder (STAGE loopback-bridge): republishes a 127.0.0.1-bound
 # in-box service onto the box's bridge IP so the -p <pub_super>:<app_port> publish
