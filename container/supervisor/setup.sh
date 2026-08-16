@@ -18,6 +18,9 @@ if [[ ! -f ~/.claude/settings.json ]]; then
     "defaultMode": "bypassPermissions"
   },
   "theme": "dark",
+  "env": {
+    "CLAUDE_CODE_DISABLE_MOUSE_CLICKS": "1"
+  },
   "hooks": {
     "Stop": [
       {

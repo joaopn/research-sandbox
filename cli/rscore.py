@@ -4186,9 +4186,12 @@ _AGENT_ERR_TAIL = 2000
 # race). Fresh surfaces (docker box, sandbox-dind) with no settings get bypass.
 # The no-hooks shape is load-bearing for inner surfaces — a `hooks` key there is a
 # `command not found` on every Stop event. Mirror of container/supervisor/setup.sh
-# MINUS hooks; keep the two in sync.
+# MINUS hooks; keep the two in sync. The env block disables the TUI's click/drag
+# mouse capture (Claude Code ≥2.1.150 captures the mouse and breaks native
+# terminal text selection; wheel scroll stays).
 _AGENT_SETTINGS_JSON = json.dumps(
-    {"permissions": {"defaultMode": "bypassPermissions"}, "theme": "dark"},
+    {"permissions": {"defaultMode": "bypassPermissions"}, "theme": "dark",
+     "env": {"CLAUDE_CODE_DISABLE_MOUSE_CLICKS": "1"}},
     indent=2) + "\n"
 
 

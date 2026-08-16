@@ -86,7 +86,7 @@ echo "${RS_SANDBOX_NAME}" > ~/.rs-role
 # deliberately absent here, unlike rs-pi-base.
 mkdir -p ~/.claude
 if [[ ! -f ~/.claude/settings.json ]]; then
-    printf '%s\n' '{"permissions": {"defaultMode": "bypassPermissions"}, "theme": "dark"}' \
+    printf '%s\n' '{"permissions": {"defaultMode": "bypassPermissions"}, "theme": "dark", "env": {"CLAUDE_CODE_DISABLE_MOUSE_CLICKS": "1"}}' \
         > ~/.claude/settings.json
 fi
 
