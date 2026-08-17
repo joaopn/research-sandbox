@@ -1021,7 +1021,15 @@ function setMobileProjectsView(on) {
     if (!on) {
         const t = activeTerminal();
         if (t && t.fitAddon) {
-            setTimeout(() => { try { t.fitAddon.fit(); } catch (_) {} }, 0);
+            // Sync-then-fit: the chip's leave-Settings route (closeManagement →
+            // drawer → close-without-switching) restores the area through
+            // NEITHER applyColumnLayout NOR activateService, so this is the
+            // third font-size application site — without it a font changed in
+            // Settings silently doesn't take until the next tab tap.
+            setTimeout(() => {
+                syncTermFontSize(t);
+                try { t.fitAddon.fit(); } catch (_) {}
+            }, 0);
         }
     }
 }
@@ -6004,21 +6012,44 @@ function loadTermFontSize() {
     return TERM_FONT_SIZES.includes(v) ? v : TERM_FONT_SIZE_DEFAULT;
 }
 
-// Applied LIVE to open terminals via the options proxy (the applyTheme
-// pattern; the guard skips http entries) — then a refit, which IS load-bearing
-// here, unlike the CLI-width setter's belt-and-braces call: a font-size change
-// alters cell metrics, so cols/rows must re-derive and propagate over each
-// terminal's ws. Hidden panes no-op the fit and heal at their next show
-// (leave-Settings refit / the activateService fast-path fit). New terminals
-// pick the value up at the constructor (fontSize: state.termFontSize).
+// DEFER-APPLY: the setter stores + persists only — the option lands
+// per-terminal via syncTermFontSize at the next refit/show, NEVER here. This
+// setter is only reachable from Settings, a host page that display:none's the
+// whole terminal area, and xterm 5.3.0 cannot take a font change while
+// hidden: CharSizeService.measure() RETAINS the previous cell metrics on a
+// zero-geometry measure, and nothing re-measures on re-show — so a direct
+// option write here leaves stale metrics that every later fit() consumes,
+// desyncing the pty grid from the render (missing byobu/claude bottom bars,
+// freeze-until-typing). New terminals pick the value up at the constructor
+// (fontSize: state.termFontSize).
 function setTermFontSize(v) {
     state.termFontSize = v;
     if (v !== TERM_FONT_SIZE_DEFAULT) localStorage.setItem(TERM_FONT_SIZE_KEY, String(v));
     else localStorage.removeItem(TERM_FONT_SIZE_KEY);
-    for (const t of Object.values(state.terminals)) {
-        if (t.term) t.term.options.fontSize = v;
-    }
     scheduleColumnRefit();
+}
+
+// Apply the stored font size to one terminal iff its pane is actually VISIBLE
+// — the sole writer of options.fontSize on live terminals. Guards: the
+// engine's own .hidden vocabulary (pane-level), then offsetParent === null,
+// which catches display:none on ANY ancestor (the host-page case: the pane's
+// class says visible while #terminal-area is hidden — valid because
+// .terminal-instance is position:absolute under the position:relative area,
+// so offsetParent is the area normally and null exactly when an ancestor is
+// display:none). Applying while visible makes xterm's re-measure correct by
+// construction. Fail-safe by design: a hidden pane is REFUSED, so a missed
+// application site degrades to "old font, self-consistent metrics, applies
+// at the next covered show" — never the desync above. Call sites: the
+// scheduleColumnRefit loop, the activateService fast path, and the mobile
+// drawer-close refit (the one leave-Settings route that bypasses the other
+// two).
+function syncTermFontSize(t) {
+    if (!t || !t.term || !t.container) return;
+    if (t.container.classList.contains("hidden")) return;
+    if (t.container.offsetParent === null) return;
+    if (t.term.options.fontSize !== state.termFontSize) {
+        t.term.options.fontSize = state.termFontSize;
+    }
 }
 
 function makeTermFontSizeSelector() {
@@ -6207,9 +6238,13 @@ function clearContainerGeometry(t) {
 
 // Deferred xterm refit after any geometry change (a container resize is
 // invisible to xterm until fit() re-measures). Iframes reflow on their own.
+// Also the font-size application choke point: sync BEFORE fit, per terminal —
+// the option set triggers xterm's synchronous re-measure at the new font, and
+// the fit then consumes the fresh metrics (see syncTermFontSize).
 function scheduleColumnRefit() {
     setTimeout(() => {
         for (const t of Object.values(state.terminals)) {
+            syncTermFontSize(t);
             if (t.fitAddon) { try { t.fitAddon.fit(); } catch (_) {} }
         }
     }, 0);
@@ -7541,6 +7576,11 @@ function activateService(serviceId, opts) {
     const existing = state.terminals[key];
     if (existing && !existing.disconnected) {
         if (existing.container) existing.container.classList.remove("hidden");
+        // Un-hide first, sync second, fit third: the pane is visible here, so
+        // a pending font-size change applies with a correct re-measure before
+        // the fit consumes the metrics. Mobile-critical — this fast path (plus
+        // the drawer-close refit) is the whole mobile show path.
+        syncTermFontSize(existing);
         if (existing.fitAddon) existing.fitAddon.fit();
         if (existing.term && !background) existing.term.focus();
         return;
