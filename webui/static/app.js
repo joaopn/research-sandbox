@@ -368,6 +368,46 @@ async function persistVault() {
     saveStored({ salt: b64(state.salt), ...enc });
 }
 
+// ---- per-project UI state (vault settings.project_ui) ----------------------
+// Per-project UI prefs (tab layout + hidden tabs) live in a name-keyed map
+// under vault.settings, NOT on the sidebar rows: broker-derived rows are
+// _jit transients that persistVault strips wholesale (the SSH-creds
+// guarantee), so row fields never persist. Writers mirror row -> map on
+// each user action; the broker mint sites rehydrate map -> row. Both
+// directions deep-copy so a map entry never aliases a live row's arrays.
+// Non-_jit bookmark rows (manual Import) are mirrored into the map too —
+// harmless and self-consistent: row and map stay in step, and the row wins
+// for bookmarks since Import never rehydrates. Not duplication to "fix" in
+// either direction.
+const PROJECT_UI_FIELDS = ["hidden_services", "tab_columns", "column_ratios"];
+
+function projectUiMap() {
+    if (!state.vault.settings || typeof state.vault.settings !== "object") {
+        state.vault.settings = {};
+    }
+    const s = state.vault.settings;
+    if (!s.project_ui || typeof s.project_ui !== "object") s.project_ui = {};
+    return s.project_ui;
+}
+
+function syncProjectUiState(project) {
+    const entry = {};
+    for (const f of PROJECT_UI_FIELDS) {
+        if (project[f] !== undefined) entry[f] = JSON.parse(JSON.stringify(project[f]));
+    }
+    const map = projectUiMap();
+    if (Object.keys(entry).length > 0) map[project.name] = entry;
+    else delete map[project.name];
+}
+
+function rehydrateProjectUiState(row) {
+    const entry = projectUiMap()[row.name];
+    if (!entry || typeof entry !== "object") return;
+    for (const f of PROJECT_UI_FIELDS) {
+        if (entry[f] !== undefined) row[f] = JSON.parse(JSON.stringify(entry[f]));
+    }
+}
+
 // ---- screens ---------------------------------------------------------------
 
 function renderSetup() {
@@ -824,10 +864,12 @@ async function attachIntoVault(name) {
         existing.host = info.host; existing.port = info.port;
         existing.username = info.username; existing.password = info.password;
     } else {
-        state.vault.projects.push({
+        const row = {
             name: info.name, host: info.host, port: info.port,
             username: info.username, password: info.password, _jit: true,
-        });
+        };
+        rehydrateProjectUiState(row);
+        state.vault.projects.push(row);
     }
     return true;
 }
@@ -4902,10 +4944,12 @@ async function mgmtAttach(view, name, btn) {
         existing.host = info.host; existing.port = info.port;
         existing.username = info.username; existing.password = info.password;
     } else {
-        state.vault.projects.push({
+        const row = {
             name: info.name, host: info.host, port: info.port,
             username: info.username, password: info.password, _jit: true,
-        });
+        };
+        rehydrateProjectUiState(row);
+        state.vault.projects.push(row);
     }
     closeManagement();
     await renderDashboard();
@@ -4971,10 +5015,13 @@ function mgmtDestroyDialog(view, name) {
         onDone: async (ok) => {
             if (!ok) return;
             // Tear down the gone project's open terminals/websockets (no dead
-            // reconnect spam), drop it from the sidebar + persisted vault, then
-            // refresh the rail behind the box so the row disappears.
+            // reconnect spam), drop it from the sidebar + persisted vault —
+            // including its saved tab arrangement, so a reused name starts
+            // with the default layout — then refresh the rail behind the box
+            // so the row disappears.
             teardownProjectState(name);
             state.vault.projects = state.vault.projects.filter((p) => p.name !== name);
+            delete projectUiMap()[name];
             try { await persistVault(); } catch (e) { /* best-effort */ }
             refreshProjectRail();
         },
@@ -6804,6 +6851,7 @@ async function setServiceHidden(project, serviceId, hide) {
     else hidden.delete(serviceId);
     if (hidden.size > 0) project.hidden_services = Array.from(hidden);
     else delete project.hidden_services;
+    syncProjectUiState(project);
 
     await persistVault();
 
@@ -6913,6 +6961,7 @@ async function persistTabLayout(project, columns, ratios) {
     project.tab_columns = columns;
     if (columns.length > 1 && Array.isArray(ratios)) project.column_ratios = ratios;
     else delete project.column_ratios;
+    syncProjectUiState(project);
     await persistVault();
 }
 
