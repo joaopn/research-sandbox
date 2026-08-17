@@ -13,6 +13,14 @@ const THEME_KEY = "rs-webui-theme";
 const IFRAME_ZOOM_KEY = "rs-webui-iframe-zoom";
 const IFRAME_ZOOMS = [0.7, 0.8, 0.9, 1.0, 1.1, 1.2];
 const IFRAME_ZOOM_DEFAULT = 0.9;
+// Optional px cap on ssh (CLI) terminal panes, for line-length readability on
+// wide non-split windows. Applied WINDOW-side (a max-width on .terminal-pad,
+// which xterm-addon-fit measures) — never via xterm options, so the
+// xterm↔agent wiring stays untouched. 0 = off (full width, the default).
+// Values reasoned from the terminal font (fontSize 13, monospace advance
+// ≈ 0.6em ⇒ ~7.8px/col): 800 ≈ 100 cols, 1000 ≈ 125 cols, 1200 ≈ 150 cols.
+const CLI_WIDTH_KEY = "rs-webui-cli-max-width";
+const CLI_MAX_WIDTHS = [0, 800, 1000, 1200];
 const RAIL_PINNED_KEY = "rs-webui-rail-pinned";
 const RAIL_WIDTH_KEY = "rs-webui-rail-width";
 const RAIL_WIDTH_DEFAULT = 200;
@@ -264,6 +272,7 @@ const state = {
     columnActive: [],        // per-column shown service id for the active project (session-only)
     tabLayout: null,         // last engine-reconciled {columns, ratios} (drag/splitter working copy)
     iframeZoom: IFRAME_ZOOM_DEFAULT,  // CSS transform scale applied to http-kind iframes
+    cliMaxWidth: 0,          // px cap on ssh terminal panes (0 = off / full width)
 };
 
 // ---- utilities -------------------------------------------------------------
@@ -1303,6 +1312,10 @@ function renderSettingsInto(view) {
         el("div", { class: "field" }, [
             el("label", {}, ["Editor zoom"]),
             makeIframeZoomSelector(),
+        ]),
+        el("div", { class: "field" }, [
+            el("label", {}, ["CLI width"]),
+            makeCliWidthSelector(),
         ]),
         swSub,
     ]));
@@ -5916,6 +5929,58 @@ function makeIframeZoomSelector() {
     return sel;
 }
 
+// ---- CLI pane max width (Settings dropdown) --------------------------------
+
+function loadCliMaxWidth() {
+    const v = parseInt(localStorage.getItem(CLI_WIDTH_KEY) || "", 10);
+    return CLI_MAX_WIDTHS.includes(v) ? v : 0;
+}
+
+// The cap rides a root CSS var consumed by .terminal-pad (style.css) — the
+// engine-invisible inset wrapper xterm-addon-fit measures — so a change
+// reflows terminal cols with zero xterm configuration. Off removes the
+// property; the CSS falls back to max-width: none (byte-inert rule).
+function applyCliMaxWidthVar(v) {
+    if (v > 0) document.documentElement.style.setProperty("--cli-max-width", `${v}px`);
+    else document.documentElement.style.removeProperty("--cli-max-width");
+}
+
+function setCliMaxWidth(v) {
+    state.cliMaxWidth = v;
+    applyCliMaxWidthVar(v);
+    if (v > 0) localStorage.setItem(CLI_WIDTH_KEY, String(v));
+    else localStorage.removeItem(CLI_WIDTH_KEY);
+    // Belt-and-braces: Settings is a host page (terminal area hidden, so this
+    // no-ops there — fit() proposes nothing at zero size) and leaving Settings
+    // refits via activateProject → applyColumnLayout anyway; the explicit call
+    // covers any future setting surface that changes the var while panes show.
+    scheduleColumnRefit();
+}
+
+function makeCliWidthSelector() {
+    const sel = document.createElement("select");
+    sel.className = "theme-select";
+    sel.title = "Max width of CLI terminal panes (readability on wide windows)";
+    // Col counts are honest approximations at the 13px terminal font (see the
+    // CLI_MAX_WIDTHS comment); "~" is doing real work — the exact advance
+    // width varies slightly by platform monospace font.
+    const labels = {
+        0: "Full width",
+        800: "800 px (~100 cols)",
+        1000: "1000 px (~125 cols)",
+        1200: "1200 px (~150 cols)",
+    };
+    for (const w of CLI_MAX_WIDTHS) {
+        const opt = document.createElement("option");
+        opt.value = String(w);
+        opt.textContent = labels[w] || `${w} px`;
+        if (w === state.cliMaxWidth) opt.selected = true;
+        sel.appendChild(opt);
+    }
+    sel.onchange = () => setCliMaxWidth(parseInt(sel.value, 10));
+    return sel;
+}
+
 function makeThemeSelector() {
     const sel = document.createElement("select");
     sel.className = "theme-select";
@@ -7909,6 +7974,8 @@ window.addEventListener("DOMContentLoaded", () => {
     applyRailWidth(state.railWidth);
     state.iframeZoom = loadIframeZoom();
     applyIframeZoomVar(state.iframeZoom);
+    state.cliMaxWidth = loadCliMaxWidth();
+    applyCliMaxWidthVar(state.cliMaxWidth);
     // Mobile class before the first render — the unlock/setup cards are
     // already styled by the html.mobile scope.
     applyMobileClass();

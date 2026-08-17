@@ -527,6 +527,19 @@ body {
 .terminal-pad {
     position: absolute;
     inset: 2px 2px 4px;
+    /* Optional CLI width cap (Settings → CLI width): the cap lives HERE, not
+       on .terminal-instance — the column engine owns container geometry
+       (inline left/width percent rects), while this pad is engine-invisible
+       and is exactly what xterm-addon-fit measures, so a narrower pad reflows
+       terminal cols with no xterm configuration. Only ssh panes have a pad
+       (http panes are .http-instance with an iframe), so the cap is
+       CLI-scoped by construction. With left+right insets both set, max-width
+       over-constrains the box and the auto side margins split the remainder
+       equally — centered. Var unset ⇒ max-width: none ⇒ auto margins resolve
+       to 0: the off state leaves this rule byte-inert. */
+    max-width: var(--cli-max-width, none);
+    margin-left: auto;
+    margin-right: auto;
     display: flex;
     flex-direction: column;
     justify-content: flex-end;
