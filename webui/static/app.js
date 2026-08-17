@@ -17,10 +17,21 @@ const IFRAME_ZOOM_DEFAULT = 0.9;
 // wide non-split windows. Applied WINDOW-side (a max-width on .terminal-pad,
 // which xterm-addon-fit measures) — never via xterm options, so the
 // xterm↔agent wiring stays untouched. 0 = off (full width, the default).
-// Values reasoned from the terminal font (fontSize 13, monospace advance
-// ≈ 0.6em ⇒ ~7.8px/col): 800 ≈ 100 cols, 1000 ≈ 125 cols, 1200 ≈ 150 cols.
+// Values reasoned from the terminal font at its DEFAULT size (fontSize 13,
+// monospace advance ≈ 0.6em ⇒ ~7.8px/col): 800 ≈ 100 cols, 1000 ≈ 125 cols,
+// 1200 ≈ 150 cols. A changed CLI font size shifts the ~col estimates (the
+// labels stay honest approximations); the px cap itself is exact regardless.
 const CLI_WIDTH_KEY = "rs-webui-cli-max-width";
 const CLI_MAX_WIDTHS = [0, 800, 1000, 1200];
+// xterm font size for ssh (CLI) terminal panes, applied globally and LIVE to
+// open terminals (the applyTheme options-proxy pattern + a refit, since cell
+// metrics change). 13 is the previously hardcoded constructor value — keeping
+// it as the default leaves unset behavior byte-identical. Integer px only
+// (xterm cell metrics); steps widen upward because the relative change per px
+// shrinks as sizes grow (the IFRAME_ZOOMS 6-option shape).
+const TERM_FONT_SIZE_KEY = "rs-webui-term-font-size";
+const TERM_FONT_SIZES = [11, 12, 13, 14, 16, 18];
+const TERM_FONT_SIZE_DEFAULT = 13;
 const RAIL_PINNED_KEY = "rs-webui-rail-pinned";
 const RAIL_WIDTH_KEY = "rs-webui-rail-width";
 const RAIL_WIDTH_DEFAULT = 200;
@@ -273,6 +284,7 @@ const state = {
     tabLayout: null,         // last engine-reconciled {columns, ratios} (drag/splitter working copy)
     iframeZoom: IFRAME_ZOOM_DEFAULT,  // CSS transform scale applied to http-kind iframes
     cliMaxWidth: 0,          // px cap on ssh terminal panes (0 = off / full width)
+    termFontSize: TERM_FONT_SIZE_DEFAULT,  // xterm font size for ssh panes (live-applied)
 };
 
 // ---- utilities -------------------------------------------------------------
@@ -1316,6 +1328,10 @@ function renderSettingsInto(view) {
         el("div", { class: "field" }, [
             el("label", {}, ["CLI width"]),
             makeCliWidthSelector(),
+        ]),
+        el("div", { class: "field" }, [
+            el("label", {}, ["CLI font size"]),
+            makeTermFontSizeSelector(),
         ]),
         swSub,
     ]));
@@ -5981,6 +5997,45 @@ function makeCliWidthSelector() {
     return sel;
 }
 
+// ---- CLI terminal font size (Settings dropdown) ----------------------------
+
+function loadTermFontSize() {
+    const v = parseInt(localStorage.getItem(TERM_FONT_SIZE_KEY) || "", 10);
+    return TERM_FONT_SIZES.includes(v) ? v : TERM_FONT_SIZE_DEFAULT;
+}
+
+// Applied LIVE to open terminals via the options proxy (the applyTheme
+// pattern; the guard skips http entries) — then a refit, which IS load-bearing
+// here, unlike the CLI-width setter's belt-and-braces call: a font-size change
+// alters cell metrics, so cols/rows must re-derive and propagate over each
+// terminal's ws. Hidden panes no-op the fit and heal at their next show
+// (leave-Settings refit / the activateService fast-path fit). New terminals
+// pick the value up at the constructor (fontSize: state.termFontSize).
+function setTermFontSize(v) {
+    state.termFontSize = v;
+    if (v !== TERM_FONT_SIZE_DEFAULT) localStorage.setItem(TERM_FONT_SIZE_KEY, String(v));
+    else localStorage.removeItem(TERM_FONT_SIZE_KEY);
+    for (const t of Object.values(state.terminals)) {
+        if (t.term) t.term.options.fontSize = v;
+    }
+    scheduleColumnRefit();
+}
+
+function makeTermFontSizeSelector() {
+    const sel = document.createElement("select");
+    sel.className = "theme-select";
+    sel.title = "Font size of CLI terminal panes (applies to open tabs immediately)";
+    for (const n of TERM_FONT_SIZES) {
+        const opt = document.createElement("option");
+        opt.value = String(n);
+        opt.textContent = n === TERM_FONT_SIZE_DEFAULT ? `${n} px (default)` : `${n} px`;
+        if (n === state.termFontSize) opt.selected = true;
+        sel.appendChild(opt);
+    }
+    sel.onchange = () => setTermFontSize(parseInt(sel.value, 10));
+    return sel;
+}
+
 function makeThemeSelector() {
     const sel = document.createElement("select");
     sel.className = "theme-select";
@@ -7618,7 +7673,7 @@ function openSshTerminal(project, serviceId, svc) {
     const term = new Terminal({
         cursorBlink: true,
         fontFamily: "ui-monospace, Menlo, Consolas, monospace",
-        fontSize: 13,
+        fontSize: state.termFontSize,
         theme: currentXtermTheme(),
         scrollback: 5000,
     });
@@ -7976,6 +8031,7 @@ window.addEventListener("DOMContentLoaded", () => {
     applyIframeZoomVar(state.iframeZoom);
     state.cliMaxWidth = loadCliMaxWidth();
     applyCliMaxWidthVar(state.cliMaxWidth);
+    state.termFontSize = loadTermFontSize();
     // Mobile class before the first render — the unlock/setup cards are
     // already styled by the html.mobile scope.
     applyMobileClass();
