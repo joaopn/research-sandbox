@@ -2892,6 +2892,11 @@ function buildDevRepoCard(view, body, r, attached, opts) {
     const allRepos = (opts && Array.isArray(opts.allRepos)) ? opts.allRepos : [];
     const prs = Array.isArray(r.prs) ? r.prs : [];
     const branches = Array.isArray(r.branches) ? r.branches : [];
+    // agent/<name> session branches (rs-wt's prefix): minted one per session,
+    // never deleted, so the fork's branch list is mostly this clutter — the
+    // hide tick below (default ON) filters them out of the branch rows.
+    const isAgentBranch = (b) => ((b && b.name) || "").startsWith("agent/");
+    const agentBranches = branches.filter(isAgentBranch);
     const sync = el("button", { class: "btn-small" }, ["Sync"]);
     sync.onclick = async () => {
         sync.disabled = true;
@@ -2978,11 +2983,27 @@ function buildDevRepoCard(view, body, r, attached, opts) {
              + "Unticked: commands stage only (the default).",
     }, [acBox, "auto-commit"]);
     const autoCommit = () => acBox.checked;
+    // Hide-agent/ tick (card-level, default ON). Same ephemeral posture as
+    // the auto-commit tick above — resets to hidden on every card re-render,
+    // never persisted. Rendered only when the fork actually HAS agent/
+    // branches (no inert control otherwise); the label's count is what
+    // explains an all-hidden branch list against the meta line's TOTAL.
+    // Toggling repaints ONLY the branch rows (paintBranches below) — no
+    // refetch, no card re-render, open PR expanders untouched.
+    const hideBox = el("input", { type: "checkbox", class: "dev-ac-check" });
+    hideBox.checked = true;
+    const hideWrap = el("label", {
+        class: "dev-ac dev-hide-agent",
+        title: "Hide the agent/<name> session branches (one per agent "
+             + "session, never deleted — they accumulate by design). "
+             + "Untick to list them.",
+    }, [hideBox, `hide agent/ (${agentBranches.length})`]);
     const head = [
         el("span", { class: "dev-repo-name" }, [r.repo]),
         el("span", { class: "dev-repo-meta" }, [meta]),
         ...(forkEl ? [forkEl] : []),
         acWrap,
+        ...(agentBranches.length ? [hideWrap] : []),
         sync,
     ];
     if (!scoped) {
@@ -3043,19 +3064,36 @@ function buildDevRepoCard(view, body, r, attached, opts) {
     if (!prs.length && !r.empty) {
         rows.push(el("div", { class: "config-empty" }, ["No open PRs."]));
     }
-    for (const b of branches) {
-        const commitsUi = devCommitsExpander(view, body, r.repo,
-                                             { branch: b.name }, rerender,
-                                             onLogin, autoCommit);
-        rows.push(el("div", { class: "dev-branch-row" }, [
-            devCopyBtn(() => `rs-fetch ${r.repo} --branch ${b.name}`
-                             + (autoCommit() ? " --auto-commit" : "")),
-            commitsUi.btn,
-            el("span", { class: "dev-pr-title" }, [b.name || ""]),
-            el("span", { class: "dev-pr-meta" }, [b.committed_at || ""]),
-        ]));
-        rows.push(commitsUi.panel);
-    }
+    // Branch rows live in their own wrapper so the hide-agent/ tick can
+    // repaint them locally (no refetch, no card re-render — an open branch
+    // expander is discarded with its row, accepted). .dev-branch-wrap
+    // re-applies the card's flex column + 6px gap (the .dev-commits-rows
+    // precedent: rows inside a plain div lose .dev-repo-card's gap and
+    // render tighter), and its :empty rule display:none's the wrapper so a
+    // branch-less or all-hidden card doesn't carry a phantom gap slot.
+    const branchWrap = el("div", { class: "dev-branch-wrap" });
+    const paintBranches = () => {
+        branchWrap.innerHTML = "";
+        const visible = hideBox.checked
+            ? branches.filter((b) => !isAgentBranch(b))
+            : branches;
+        for (const b of visible) {
+            const commitsUi = devCommitsExpander(view, body, r.repo,
+                                                 { branch: b.name }, rerender,
+                                                 onLogin, autoCommit);
+            branchWrap.append(el("div", { class: "dev-branch-row" }, [
+                devCopyBtn(() => `rs-fetch ${r.repo} --branch ${b.name}`
+                                 + (autoCommit() ? " --auto-commit" : "")),
+                commitsUi.btn,
+                el("span", { class: "dev-pr-title" }, [b.name || ""]),
+                el("span", { class: "dev-pr-meta" }, [b.committed_at || ""]),
+            ]));
+            branchWrap.append(commitsUi.panel);
+        }
+    };
+    hideBox.onchange = paintBranches;
+    paintBranches();
+    rows.push(branchWrap);
     if (attached.length) {
         rows.push(el("div", { class: "dev-pr-meta dev-attached" },
                      ["worked by: " + attached.join(", ")]));

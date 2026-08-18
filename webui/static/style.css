@@ -1410,6 +1410,13 @@ body {
     gap: 8px;
     font-size: 13px;
 }
+/* Branch rows live in a wrapper (so the hide-agent/ tick repaints them
+   locally); it re-applies .dev-repo-card's column layout + 6px gap so the
+   rows keep the spacing they had as direct card children (the
+   .dev-commits-rows precedent). :empty removes it from the flex flow —
+   a branch-less or all-hidden card must not carry a phantom gap slot. */
+.dev-branch-wrap { display: flex; flex-direction: column; gap: 6px; }
+.dev-branch-wrap:empty { display: none; }
 .dev-pr-id { color: var(--fg-muted); min-width: 42px; }
 .dev-pr-title {
     flex: 1;
