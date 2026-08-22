@@ -5971,12 +5971,15 @@ def _stash_git_auth_for_rebuild(
     _recreate_docker_substrate must gain this without gaining the Claude-creds
     stash it pointedly does not have (that box re-auths in place).
 
-    ~/.git-credentials is deliberately NOT carried. On a dev-workflow supervisor
-    _run_dev_clone writes `credential.helper store` into ~/.gitconfig (so that
-    line rides along here — harmless, and an operator's own ~/.gitconfig tweaks
-    now survive a recreate too) with the matching token in ~/.git-credentials.
-    That token is already lost on every recreate today; widening the stash to
-    carry it would park a live gitea credential on host disk for no gain.
+    ~/.git-credentials is deliberately NOT carried — it is RE-DERIVED instead
+    (B62): _stage_dev_gitea re-writes it from the host token file
+    (~/.research-sandbox/dev/tokens/, where the same token already lives)
+    whenever a project with an agent row re-stages, so every heal path that
+    restores ~/.dev-tokens restores the credential store with it. On a
+    dev-workflow supervisor _run_dev_clone writes `credential.helper store`
+    into ~/.gitconfig (so that line rides along here — harmless, and an
+    operator's own ~/.gitconfig tweaks survive a recreate too); the store
+    file itself follows the re-derivation, never the stash.
 
     Same running/stopped fork and idempotent skip as _stash_creds_for_rebuild;
     the entrypoints move both pieces back (and re-assert modes) at next start."""
@@ -6989,6 +6992,57 @@ def wire_gitea_to_projects() -> None:
         _restart_dev_boxes(project, cfg, ip)
 
 
+def _stage_dev_git_credentials(container: str, user: str, *,
+                               strict: bool = False) -> str:
+    """Write a dev consumer's git credential store (~/.git-credentials) in a
+    RUNNING container from the HOST token file — the push/pull half of the dev
+    wiring, RE-DERIVED rather than stashed (B62): _stash_git_auth_for_rebuild
+    deliberately does not carry the file, so every heal path that re-stages
+    ~/.dev-tokens must re-derive it or the agent can commit but never push.
+    Token discipline matches the ~/.dev-tokens staging: read from
+    gitea.consumer_token_path (the host bridge), stream over stdin as the
+    container's own user — never argv, never the workspace. Overwrite, not
+    append (the box entrypoint's every-boot rewrite is the precedent; the
+    file is agent-owned on any container that has an agent row).
+
+    Two postures. strict=True (the create path): an empty/missing/unreadable
+    token die()s and a failed write raises HarnessError with the token literal
+    scrubbed — the missing/unreadable arms are a DELIBERATE die where a bare
+    read formerly escaped as FileNotFoundError/PermissionError, which the
+    broker's verb-exception contract does not catch. strict=False (the heal
+    paths — recreate, attach, wire, docker-substrate start): warn-and-return,
+    because those run under `research start`/`project start` and must never
+    raise. Returns the staged token ("" when nothing was staged) so the create
+    path can reuse the same literal for its scrub without a second, unguarded
+    read."""
+    tok_path = gitea.consumer_token_path(user)
+    try:
+        tok = tok_path.read_text().strip()
+    except OSError:
+        tok = ""
+    if not tok:
+        if strict:
+            die(f"consumer token file for {user!r} is empty or missing; "
+                f"re-run the attach")
+        print(f"warning: consumer token missing at {tok_path}; skipped the "
+              f"git credential store re-derivation (re-attach to heal)",
+              file=sys.stderr)
+        return ""
+    r = run(["docker", "exec", "-i", "-u", "research", container, "sh", "-c",
+             'umask 077 && cat > "$HOME/.git-credentials"'],
+            input=f"http://{user}:{tok}@"
+                  f"{gitea.GITEA_CONTAINER}:{gitea.GITEA_INNER_PORT}\n",
+            capture_output=True)
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout or "").replace(tok, "***").strip()
+        if strict:
+            raise HarnessError("dev credentials staging failed", detail)
+        print(f"warning: git credential store staging for {user!r} failed: "
+              f"{detail}", file=sys.stderr)
+        return ""
+    return tok
+
+
 def _stage_dev_gitea(project: str, cfg: "Config", gitea_ip: str = "") -> None:
     """Stage a project's dev-lane wiring (STAGE_DEV_GITEA S2/S3), split by
     secrecy:
@@ -7094,6 +7148,16 @@ def _stage_dev_gitea(project: str, cfg: "Config", gitea_ip: str = "") -> None:
         if r.returncode != 0:
             print(f"warning: token staging for consumer {user!r} failed: "
                   f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
+    # The push/pull half (B62): the PROJECT consumer's ~/.git-credentials is
+    # container-fs state a recreate wipes, so re-derive it wherever the tokens
+    # re-stage. Box-None agent rows all carry the one project consumer, so
+    # this is a single write; a project that only HOSTS dev boxes has no such
+    # row and its supervisor stays credential-free (a human's own store there
+    # is never touched — the write fires only on an agent's own container).
+    proj_user = next((e.get("user") for e in entries
+                      if e.get("box") is None and e.get("user")), "")
+    if proj_user:
+        _stage_dev_git_credentials(container, proj_user)
 
 
 def _stage_dev_fetch(container: str) -> None:
@@ -7451,19 +7515,9 @@ def _run_dev_clone(container: str, repo: str, user: str, branch: str,
     the dev box preset stages, from boxes/dev.instructions.md, with the base
     branch substituted in. ``branch`` is the CONCRETE name the host already
     resolved (_resolve_dev_branch) — never empty. Returns the clone dir."""
-    token = gitea.consumer_token_path(user).read_text().strip()
-    if not token:
-        die(f"consumer token file for {user!r} is empty; re-run the attach")
     base = f"http://{gitea.GITEA_CONTAINER}:{gitea.GITEA_INNER_PORT}"
     progress.step("dev-clone", "cloning the dev fork")
-    r = run(["docker", "exec", "-i", "-u", "research", container, "sh", "-c",
-             'umask 077 && cat > "$HOME/.git-credentials"'],
-            input=f"http://{user}:{token}@"
-                  f"{gitea.GITEA_CONTAINER}:{gitea.GITEA_INNER_PORT}\n",
-            capture_output=True)
-    if r.returncode != 0:
-        detail = (r.stderr or r.stdout or "").replace(token, "***").strip()
-        raise HarnessError("dev credentials staging failed", detail)
+    token = _stage_dev_git_credentials(container, user, strict=True)
     workdir = f"/workspace/{repo}"
     q = shlex.quote
     script = (
@@ -9634,6 +9688,19 @@ def dev_detach(req: "DevDetachRequest", _progress=None) -> DevDetachResult:  # t
         for user in sorted(drop_users):
             run(["docker", "exec", "-u", "research", container, "sh", "-c",
                  'rm -f "$HOME/.dev-tokens/$1"', "sh", f"{user}.token"],
+                capture_output=True)
+        # B62 detach-to-zero: the consumer's credential store follows its
+        # token. Gate = the CONJUNCTION — the project consumer is being
+        # dropped AND this detach actually retired an agent (box=None) row.
+        # drop_users membership alone over-fires on a box-only project's
+        # detach-ALL (the disjunct above adds proj_user with no agent row
+        # ever having existed — and ~/.git-credentials there can be the
+        # HUMAN's own store); box-None-in-targets alone over-fires on a
+        # per-repo detach that leaves the consumer working another repo.
+        if proj_user in drop_users and any(e.get("box") is None
+                                           for e in targets):
+            run(["docker", "exec", "-u", "research", container, "sh", "-c",
+                 'rm -f "$HOME/.git-credentials"'],
                 capture_output=True)
     return DevDetachResult(project=req.project, repo=req.repo,
                            remaining=len(remaining))

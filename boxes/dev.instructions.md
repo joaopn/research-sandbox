@@ -161,8 +161,14 @@ zero when fixed), and verify it on both the base branch and your branch before p
 
 ## Gitea API
 
-Your Gitea API token is in `$GITEA_TOKEN`. Base URL: `$GITEA_URL/api/v1`.
-Repo path: `$GITEA_USER/$REPO_NAME`.
+Your Gitea API token is in `$GITEA_TOKEN`, the base URL is `$GITEA_URL/api/v1`,
+and your repo path is `$GITEA_USER/$REPO_NAME`. On a dev box these are container
+env (always set). On a dev project's supervisor they are set only inside
+repo-watch-launched sessions; in other sessions read the wiring from
+`/workspace/.orchestrator/dev-gitea.json` (`agent_user` is your user, its
+`token_file` names your token under `~/.dev-tokens/`; the base URL is
+`http://rs-gitea:3000/api/v1`). Git push/pull authenticate via the credential
+store and need no env.
 
 ## Delivering work — the final comment
 
