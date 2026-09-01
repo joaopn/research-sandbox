@@ -1719,6 +1719,7 @@ function renderMgmtTable(view, projects) {
     ]));
     if (projects.length === 0) {
         view.appendChild(el("div", { class: "mgmt-empty" }, ["No projects on this host."]));
+        appendPassthroughSection(view, []);   // async, fire-and-forget; above Infra
         appendInfraSection(view);   // async, fire-and-forget
         return;
     }
@@ -1756,6 +1757,10 @@ function renderMgmtTable(view, projects) {
         ]));
     }
     view.appendChild(el("div", { class: "mgmt-table" }, rows));
+    // Pass-through ports ABOVE Infrastructure (PI decision). Both are async
+    // fire-and-forget with their static DOM appended synchronously, so the
+    // section order is deterministic regardless of fetch timing.
+    appendPassthroughSection(view, projects);
     appendInfraSection(view);   // async, fire-and-forget (its own sub-block)
     mgmtFillStatus(fill);
 }
@@ -6864,8 +6869,237 @@ function appendEditorExtensionSection(box, project, enabled) {
 // The exported-ports surface (STAGE_EXPORTED_PORTS): register a port the PI is
 // serving inside the supervisor (rs-project-<proj>:<port>) so it shows as an http
 // tab. Renders REGARDLESS of whether services have loaded — you register a port,
-// THEN start serving it. The list is the broker's port_list; the tab itself only
-// appears once the port is actually listening (server-side probe-gated).
+// THEN start serving it. The list is the broker's port_list; page tabs appear
+// as soon as the port is registered (unconditional — a not-yet-serving port
+// surfaces its connection error in the iframe on click), and pass-through
+// claims appear as launcher tabs.
+
+// The pass-through launcher pane (pass-<n> tabs). Two scheme buttons instead
+// of a stored scheme field (PI decision): the claim doesn't record what
+// protocol the app speaks, and a wrong guess is one click away either way.
+function renderPassthroughLauncher(container, status, svc) {
+    status.remove();
+    const host = svc.passthrough_host || window.location.hostname;
+    const port = svc.passthrough_port;
+    const count = svc.passthrough_count || 1;
+    const span = count > 1 ? `${port}-${port + count - 1}` : `${port}`;
+    const wrap = el("div", { class: "pt-launcher" });
+    wrap.appendChild(el("h3", {}, [svc.label || `Port ${port}`]));
+    wrap.appendChild(el("div", { class: "pt-launcher-addr" }, [`${host}:${span}`]));
+    wrap.appendChild(el("div", { class: "pt-launcher-note" }, [
+        "Pass-through: traffic reaches the app untouched and is NOT behind " +
+        "the webui login — the app's own login is the only lock. Opens in a " +
+        "new browser tab; the app brings its own certificate, so expect a " +
+        "browser warning if it is self-signed.",
+    ]));
+    const mk = (scheme) => {
+        const b = el("button", { class: "btn btn-secondary" },
+                     [`Open ${scheme} ↗`]);
+        b.onclick = () => window.open(`${scheme}://${host}:${port}/`, "_blank",
+                                      "noopener,noreferrer");
+        return b;
+    };
+    wrap.appendChild(el("div", { class: "pt-launcher-btns" },
+                        [mk("https"), mk("http")]));
+    container.appendChild(wrap);
+}
+
+// Shared pass-through claim form — used by the per-project Ports section
+// (projectName fixed) and the Management "Pass-through ports" subsection
+// (projects picker: ALL broker-known rows, stopped included — a claim on a
+// stopped project takes effect at its next start, same contract as the
+// per-project section). Payload discipline: host_port is OMITTED when it
+// equals the app port and count is OMITTED when 1 — the server defaults
+// them, and an explicit null/0 refuses loudly by design (never send
+// placeholders).
+function buildPassthroughClaimForm(opts) {
+    const wrap = el("div", { class: "pt-claim-form" });
+    let projSel = null;
+    if (!opts.projectName) {
+        projSel = el("select", { class: "config-port-box" });
+        for (const p of (opts.projects || [])) {
+            projSel.appendChild(el("option", { value: p }, [p]));
+        }
+    }
+    const hostI = el("input", { type: "number", min: "1", max: "65535",
+                                class: "config-port-num",
+                                placeholder: "host port" });
+    const countI = el("input", { type: "number", min: "1",
+                                 class: "config-port-num",
+                                 placeholder: "count (1)" });
+    const appI = el("input", { type: "number", min: "1", max: "65535",
+                               class: "config-port-num",
+                               placeholder: "app port (same)" });
+    const labelI = el("input", { type: "text", class: "config-port-label",
+                                 placeholder: "label" });
+    const claimBtn = el("button", { class: "btn btn-secondary" }, ["Claim"]);
+    const errEl = el("div", { class: "pt-claim-err" });
+    errEl.style.display = "none";
+    const hint = el("div", { class: "config-hint" },
+                    ["Loading the pass-through block…"]);
+    (async () => {
+        try {
+            const res = await fetch("/broker/passthrough");
+            let body; try { body = await res.json(); } catch (e) { body = null; }
+            if (res.ok && body && body.ok && body.result) {
+                const r = body.result;
+                const used = (r.claimed || [])
+                    .reduce((n, c) => n + (c.count || 1), 0);
+                hint.textContent =
+                    `Block ${r.lo}-${r.hi} · ${used} claimed · ` +
+                    `${r.hi - r.lo + 1 - used} free. Pass-through traffic is ` +
+                    "NOT behind the webui login — the app's own login is the " +
+                    "only lock. Count > 1 claims a consecutive span (host and " +
+                    "app ports advance together).";
+            } else {
+                hint.textContent = "Couldn't load the pass-through block.";
+            }
+        } catch (e) {
+            hint.textContent = "Couldn't load the pass-through block.";
+        }
+    })();
+    claimBtn.onclick = async () => {
+        errEl.style.display = "none";
+        const project = opts.projectName || (projSel && projSel.value) || "";
+        if (!project) { alert("Pick a project."); return; }
+        const host = parseInt(hostI.value, 10);
+        if (!Number.isInteger(host)) {
+            alert("Enter the host port to claim."); return;
+        }
+        const label = labelI.value.trim();
+        if (!label) { alert("Enter a label for the tab."); return; }
+        const cnt = countI.value.trim() ? parseInt(countI.value, 10) : 1;
+        const app = appI.value.trim() ? parseInt(appI.value, 10) : host;
+        const payload = { port: app, label, box: "", passthrough: true };
+        if (host !== app) payload.host_port = host;
+        if (cnt > 1) payload.count = cnt;
+        claimBtn.disabled = true;
+        try {
+            const res = await fetch(
+                `/broker/project/${encodeURIComponent(project)}/port`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload),
+                });
+            let body; try { body = await res.json(); } catch (e) { body = {}; }
+            if (opts.onStatus && opts.onStatus(res.status)) return;
+            if (!res.ok || !body.ok) {
+                errEl.textContent =
+                    "Couldn't claim: " + (mgmtErrText(body) || res.status);
+                errEl.style.display = "";
+                return;
+            }
+            hostI.value = ""; countI.value = ""; appI.value = "";
+            labelI.value = "";
+            if (opts.onClaimed) await opts.onClaimed(project);
+        } catch (e) {
+            errEl.textContent = "Couldn't claim: connection failed.";
+            errEl.style.display = "";
+        } finally {
+            claimBtn.disabled = false;
+        }
+    };
+    wrap.appendChild(el("div", { class: "config-box-row config-port-add" },
+        [projSel, hostI, countI, appI, labelI, claimBtn].filter(Boolean)));
+    wrap.appendChild(errEl);
+    wrap.appendChild(hint);
+    return wrap;
+}
+
+// Management → Pass-through ports: the host-global view — the block, every
+// claim, remove-any, claim-for-any-project. Placed ABOVE Infrastructure at
+// both renderMgmtTable call sites. Static DOM is built SYNCHRONOUSLY before
+// any await (the appendInfraSection D-placement invariant: section order on
+// the page must not depend on fetch timing). No CLI is ever mentioned here.
+async function appendPassthroughSection(view, projects) {
+    const table = el("div", { class: "mgmt-pt-list" });
+    const wrap = el("div", { class: "mgmt-infra" }, [
+        el("h3", { class: "mgmt-infra-title" }, ["Pass-through ports"]),
+        table,
+    ]);
+    const names = (projects || []).map((p) => p.project);
+    wrap.appendChild(buildPassthroughClaimForm({
+        projects: names,
+        onClaimed: async (project) => {
+            await fillPassthroughList(view, table);
+            await refreshAfterBoxChange(project);
+        },
+        onStatus: (status) => {
+            // Relay-status arm (the transport-vs-verb split): 401/403/503
+            // route to the Management landing; anything else falls through to
+            // the inline verb text beside the form.
+            const redirect = mgmtStatusRedirect(view, status);
+            if (redirect) { redirect(); return true; }
+            return false;
+        },
+    }));
+    view.appendChild(wrap);
+    await fillPassthroughList(view, table);
+}
+
+async function fillPassthroughList(view, table) {
+    table.innerHTML = "";
+    let body = null;
+    try {
+        const res = await fetch("/broker/passthrough");
+        try { body = await res.json(); } catch (e) { body = null; }
+        if (!res.ok || !body || !body.ok || !body.result) {
+            table.appendChild(el("div", { class: "mgmt-pt-status" },
+                ["Couldn't load pass-through claims."]));
+            return;
+        }
+    } catch (e) {
+        table.appendChild(el("div", { class: "mgmt-pt-status" },
+            ["Couldn't load pass-through claims."]));
+        return;
+    }
+    const r = body.result;
+    const used = (r.claimed || []).reduce((n, c) => n + (c.count || 1), 0);
+    table.appendChild(el("div", { class: "mgmt-pt-status" }, [
+        `Block ${r.lo}-${r.hi} · ${used} port(s) claimed · ` +
+        `${r.hi - r.lo + 1 - used} free`,
+    ]));
+    for (const c of (r.claimed || [])) {
+        const cnt = c.count || 1;
+        const span = cnt > 1 ? `${c.host_port}-${c.host_port + cnt - 1}`
+                             : `${c.host_port}`;
+        const rm = el("button", { class: "close-tab-btn",
+                                  title: `Remove claim ${span}` }, ["✕"]);
+        rm.onclick = async () => {
+            try {
+                const res = await fetch(
+                    `/broker/project/${encodeURIComponent(c.project)}/port-remove`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ port: c.host_port,
+                                               passthrough: true }),
+                    });
+                let b; try { b = await res.json(); } catch (e) { b = {}; }
+                const redirect = mgmtStatusRedirect(view, res.status);
+                if (redirect) { redirect(); return; }
+                if (!res.ok || !b.ok) {
+                    alert("Couldn't remove: " + (mgmtErrText(b) || res.status));
+                    return;
+                }
+                await fillPassthroughList(view, table);
+                await refreshAfterBoxChange(c.project);
+            } catch (e) { alert("Couldn't remove: connection failed."); }
+        };
+        table.appendChild(el("div", { class: "mgmt-row mgmt-pt-row" }, [
+            el("span", { class: "mgmt-name" }, [c.project]),
+            el("span", { class: "mgmt-pt-span" }, [`⇉ ${span} → ${c.port}`]),
+            el("span", {}, [c.label]),
+            rm,
+        ]));
+    }
+    if ((r.ambiguous || []).length) {
+        table.appendChild(el("div", { class: "mgmt-pt-status" }, [
+            `Conflicting claims on: ${r.ambiguous.join(", ")} — these ports ` +
+            "refuse connections until one of the claims is removed.",
+        ]));
+    }
+}
+
 function appendExportedPortsSection(box, project) {
     const section = el("div", { class: "config-section" });
     section.appendChild(el("div", { class: "config-section-label" }, ["Ports"]));
@@ -6916,14 +7150,24 @@ function appendExportedPortsSection(box, project) {
             return;
         }
         for (const e of ports) {
+            const isPt = !!e.passthrough;
+            const rmKey = isPt ? e.host_port : e.port;
             const rm = el("button", { class: "close-tab-btn",
-                                      title: `Remove port ${e.port}` }, ["✕"]);
-            rm.onclick = () => removePort(e.port);
+                                      title: `Remove ${isPt ? "claim" : "port"} ${rmKey}` }, ["✕"]);
+            rm.onclick = () => removePort(rmKey, isPt);
             // A box entry (F3 Slice 2b) shows its box + in-box app port; a
+            // pass-through claim shows its host span + target; a
             // supervisor/docker entry shows the plain port.
-            const text = e.box
-                ? `${e.label} — box ${e.box}:${e.app_port}`
-                : `${e.port} — ${e.label}`;
+            const cnt = e.count || 1;
+            const ptSpan = isPt
+                ? (cnt > 1 ? `${e.host_port}-${e.host_port + cnt - 1}`
+                           : `${e.host_port}`)
+                : "";
+            const text = isPt
+                ? `⇉ ${ptSpan} → ${e.port} — ${e.label}`
+                : (e.box
+                    ? `${e.label} — box ${e.box}:${e.app_port}`
+                    : `${e.port} — ${e.label}`);
             listWrap.appendChild(el("div", { class: "config-box-row" }, [
                 el("span", { class: "config-box-name" }, [text]),
                 rm,
@@ -6960,13 +7204,13 @@ function appendExportedPortsSection(box, project) {
         }
     }
 
-    async function removePort(port) {
+    async function removePort(port, passthrough) {
         try {
             const res = await fetch(
                 `/broker/project/${encodeURIComponent(project.name)}/port-remove`, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify({ port }),
+                    body: JSON.stringify({ port, passthrough: !!passthrough }),
                 });
             let body; try { body = await res.json(); } catch (e) { body = {}; }
             if (!res.ok || !body.ok) {
@@ -6979,12 +7223,35 @@ function appendExportedPortsSection(box, project) {
     }
 
     addBtn.onclick = addPort;
-    section.appendChild(el("div", { class: "config-box-row config-port-add" },
-                           [boxSel, portI, labelI, addBtn].filter(Boolean)));
+    // Mode toggle (STAGE_PASSTHROUGH_PORTS): "Web page" keeps the embedded
+    // page-relay row; "Pass-through" swaps in the shared raw-TCP claim form
+    // (top-level only — never a box). style.display (not the hidden attr) —
+    // an author display rule on these rows would beat the UA [hidden] style.
+    const modeSel = el("select", { class: "config-port-box" });
+    modeSel.appendChild(el("option", { value: "page" }, ["Web page"]));
+    modeSel.appendChild(el("option", { value: "pass" }, ["Pass-through"]));
+    const pageRow = el("div", { class: "config-box-row config-port-add" },
+                       [boxSel, portI, labelI, addBtn].filter(Boolean));
+    const ptForm = buildPassthroughClaimForm({
+        projectName: project.name,
+        onClaimed: async () => {
+            await loadPorts();
+            await refreshAfterBoxChange(project.name);
+        },
+    });
+    ptForm.style.display = "none";
+    modeSel.onchange = () => {
+        const pass = modeSel.value === "pass";
+        pageRow.style.display = pass ? "none" : "";
+        ptForm.style.display = pass ? "" : "none";
+    };
+    section.appendChild(el("div", { class: "config-box-row" }, [modeSel]));
+    section.appendChild(pageRow);
+    section.appendChild(ptForm);
     section.appendChild(el("div", { class: "config-hint" }, [
         boxSel
-            ? "The tab appears once something is listening on that 127.0.0.1 port in the supervisor or the selected box."
-            : "The tab appears once something is listening on that port inside the supervisor.",
+            ? "Web-page tabs relay one HTTP port (serve on 127.0.0.1 in the supervisor or the selected box) and appear as soon as the port is registered; pass-through claims add a launcher tab that opens the app in a new browser tab."
+            : "Web-page tabs relay one HTTP port (serve on 127.0.0.1 inside the container) and appear as soon as the port is registered; pass-through claims add a launcher tab that opens the app in a new browser tab.",
     ]));
     box.appendChild(section);
     loadPorts();
@@ -7931,6 +8198,19 @@ async function openHttpService(project, serviceId, svc) {
     state.terminals[key] = {
         kind: "http", container, project, service: serviceId,
     };
+
+    // A PASS-THROUGH claim renders a LAUNCHER pane — the app is encrypted
+    // and/or multi-port, so nothing embeds: the buttons open
+    // https://<this host>:<host_port> in a NEW browser tab (window.open
+    // inside the click gesture — popup blockers eat it outside one). Branch
+    // BEFORE the /session mint below (a launcher never loads a per-container
+    // origin, so minting a cookie for it would be pure waste) and before the
+    // `!svc.origin_url` bail. The bookkeeping above is shared deliberately:
+    // teardown stays identical (no ws/term/iframe to reap).
+    if (svc.passthrough_port) {
+        renderPassthroughLauncher(container, status, svc);
+        return;
+    }
 
     // A FETCH pane renders RS-side off the broker relay — no iframe, no
     // upstream origin, no session mint (branch BEFORE the mint and the

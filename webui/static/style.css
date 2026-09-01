@@ -1633,7 +1633,9 @@ html.mobile .dashboard.mobile-projects .service-tabs .active-project {
    phone is the point of the dev lane's human→agent channel, and the fetch-
    panes (both the per-repo one and the project-wide all-mirrors one, which
    share the prefix) are lightweight RS-rendered HTML that scrolls.
-   code-server / box editors / port-<n> stay desktop-only. The per-tab
+   code-server / box editors / port-<n> stay desktop-only; pass-<n> launcher
+   tabs SHOW (they embed nothing — the pane just opens the app in a new
+   browser tab, which works as well on a phone). The per-tab
    refresh button stays hidden (PI decision: too small a target beside a
    live terminal — a mis-tap would reconnect it; a dead tab still
    reconnects by tapping the tab itself), and the column layout is
@@ -1643,7 +1645,7 @@ html.mobile .dashboard.mobile-projects .service-tabs .active-project {
 html.mobile .service-tabs { height: 52px; }
 html.mobile .service-tabs .tab { font-size: 14px; }
 html.mobile .service-tabs .projects-tab,
-html.mobile .service-tabs .tab[data-surface="visual"]:not([data-service="reader"]):not([data-service^="git-"]):not([data-service^="fetch-"]),
+html.mobile .service-tabs .tab[data-surface="visual"]:not([data-service="reader"]):not([data-service^="git-"]):not([data-service^="fetch-"]):not([data-service^="pass-"]),
 html.mobile .service-tabs .refresh-tab-btn,
 html.mobile .service-tabs .tab-group-divider { display: none; }
 
@@ -1775,3 +1777,19 @@ html.mobile .modal-backdrop .card {
     max-height: 90dvh;
     overflow-y: auto;
 }
+
+/* Pass-through launcher pane (pass-<n> tabs) + the shared claim form + the
+   Management "Pass-through ports" subsection (STAGE_PASSTHROUGH_PORTS).
+   Colors ride the existing theme variables; the pane embeds nothing. */
+.pt-launcher { padding: 24px; max-width: 560px; }
+.pt-launcher h3 { margin: 0 0 6px 0; }
+.pt-launcher-addr { font-family: monospace; margin-bottom: 12px; opacity: 0.8; }
+.pt-launcher-note { font-size: 13px; opacity: 0.75; margin-bottom: 16px;
+                    line-height: 1.4; }
+.pt-launcher-btns { display: flex; gap: 10px; }
+.pt-claim-err { font-size: 12px; margin-top: 4px; color: #d9534f; }
+.mgmt-pt-status { font-size: 12px; opacity: 0.75; margin: 4px 0 8px 0; }
+.mgmt-pt-row { display: grid;
+               grid-template-columns: 1.2fr 1.2fr 1fr auto; gap: 8px;
+               align-items: center; }
+.mgmt-pt-span { font-family: monospace; }

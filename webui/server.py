@@ -116,6 +116,14 @@ SESSIONS: dict[str, dict] = {}
 ORIGIN_PORT_LO = int(os.environ.get("WEBUI_ORIGIN_PORT_LO", "10100"))
 ORIGIN_PORT_HI = int(os.environ.get("WEBUI_ORIGIN_PORT_HI", "10164"))
 
+# Pass-through block (STAGE_PASSTHROUGH_PORTS): host ports forwarded as RAW TCP
+# (no TLS termination, numbers preserved) into whichever project claimed them —
+# see passthrough_conn_handler. Defaults are a 4-file lockstep with
+# .env.example / docker-compose.yml / cli/rscore.py (this image cannot import
+# rscore), pinned by the stage pytest as a source-text check.
+PASSTHROUGH_PORT_LO = int(os.environ.get("WEBUI_PASSTHROUGH_PORT_LO", "10200"))
+PASSTHROUGH_PORT_HI = int(os.environ.get("WEBUI_PASSTHROUGH_PORT_HI", "10299"))
+
 # Webui-writable state (the rs-webui-state named volume; the TLS volume stays
 # cert-only). Holds the persisted origin-port map.
 STATE_DIR = Path(os.environ.get("WEBUI_STATE_DIR", "/app/state"))
@@ -991,7 +999,14 @@ async def broker_port_add_handler(request: web.Request) -> web.Response:
     if not isinstance(body, dict):
         body = {}
     args = {"project": project, "port": body.get("port"),
-            "label": body.get("label"), "box": body.get("box", "")}
+            "label": body.get("label"), "box": body.get("box", ""),
+            # Pass-through trio (STAGE_PASSTHROUGH_PORTS). The SPA OMITS
+            # host_port on identity claims (absent ⇒ defaults to port) and
+            # count when 1; an explicit null refuses loudly by design — never
+            # send null/0 placeholders.
+            "passthrough": body.get("passthrough", False),
+            "host_port": body.get("host_port"),
+            "count": body.get("count", 1)}
     status, reply = await _relay(request, "port_add", args)
     return web.json_response(reply, status=status)
 
@@ -1008,7 +1023,8 @@ async def broker_port_remove_handler(request: web.Request) -> web.Response:
         body = {}
     if not isinstance(body, dict):
         body = {}
-    args = {"project": project, "port": body.get("port")}
+    args = {"project": project, "port": body.get("port"),
+            "passthrough": body.get("passthrough", False)}
     status, reply = await _relay(request, "port_remove", args)
     # Free the origin slot for this port on a SUCCESSFUL removal (_relay returns
     # 200 + {ok:true} for a verb success; 401/403/503 + verb-errors are peeled off
@@ -1016,7 +1032,11 @@ async def broker_port_remove_handler(request: web.Request) -> web.Response:
     # without this the slot leaks until destroy (DEFECT: pre-existing, but the
     # unconditional-tab change makes it a routine leak — every registered port now
     # holds a slot). A non-int port just means there's nothing to free.
-    if status == 200 and isinstance(reply, dict) and reply.get("ok"):
+    # Guarded on NOT passthrough: a claim never held an origin slot, and its
+    # host_port may numerically equal a page tab's port in another project —
+    # freeing port-<n> here would evict that page tab's slot.
+    if (status == 200 and isinstance(reply, dict) and reply.get("ok")
+            and not body.get("passthrough")):
         try:
             port_n = int(body.get("port"))
         except (TypeError, ValueError):
@@ -1033,6 +1053,32 @@ async def broker_ports_handler(request: web.Request) -> web.Response:
     project = request.match_info.get("name", "")
     status, reply = await _relay(request, "port_list", {"project": project})
     return web.json_response(reply, status=status)
+
+
+async def broker_passthrough_handler(request: web.Request) -> web.Response:
+    """GET /broker/passthrough — the pass-through block + every claim on the
+    host. Webui-LOCAL (read off the /projects:ro mount like /broker/op/*/log —
+    no broker round-trip), gated by the management session cookie; under
+    /broker/ ON PURPOSE (the session cookie is Path=/broker). Drives the Ports
+    dialog's block hint AND the Management → Pass-through ports subsection."""
+    if _broker_session(request) is None:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+    claims = _passthrough_claims()
+    rows = []
+    for p in sorted(claims):
+        c = claims[p]
+        # One row per CLAIM (its base member), not per span member; an
+        # ambiguous base is reported via `ambiguous` below instead.
+        if c is None or p != c["host_port"]:
+            continue
+        rows.append({"project": c["project"], "host_port": c["host_port"],
+                     "count": c["count"], "port": c["port"],
+                     "label": c["label"]})
+    ambiguous = sorted(p for p, c in claims.items() if c is None)
+    return web.json_response({"ok": True, "result": {
+        "lo": PASSTHROUGH_PORT_LO, "hi": PASSTHROUGH_PORT_HI,
+        "claimed": rows, "ambiguous": ambiguous}})
 
 
 async def broker_dev_handler(request: web.Request) -> web.Response:
@@ -1892,11 +1938,29 @@ async def project_services_handler(request: web.Request) -> web.Response:
     # proxy still re-derives + membership-checks the upstream per request in
     # _resolve_origin_upstream_port, so a port that isn't registered never proxies.
     for e in _read_exported_ports(project):
+        if e.get("passthrough"):
+            # Claims get a pass- LAUNCHER tab below, NEVER a page tab or an
+            # origin slot — a 66-wide span would exhaust the 65-wide origin
+            # pool on its own.
+            continue
         spec = services.exported_port_service(int(e["port"]), e["label"])
         if spec is not None:
             psid = f"{services.EXPORTED_PORT_ID_PREFIX}{int(e['port'])}"
             url = _origin_url(request, project, psid)
             out[psid] = {**spec, **({"origin_url": url} if url else {})}
+
+    # Pass-through claims (STAGE_PASSTHROUGH_PORTS): one launcher tab per
+    # claim, keyed on its host_port — no origin allocation, no session mint;
+    # the SPA opens https://<this host>:<host_port> in a NEW browser tab.
+    for e in _read_exported_ports(project):
+        if not e.get("passthrough") or e.get("box"):
+            continue
+        spec = services.passthrough_service(int(e["host_port"]), e["label"],
+                                            int(e.get("count", 1)))
+        if spec is not None:
+            ptid = f"{services.PASSTHROUGH_ID_PREFIX}{int(e['host_port'])}"
+            out[ptid] = {**spec, "passthrough_host": _request_host(request),
+                         "passthrough_port": int(e["host_port"])}
     return web.json_response(out)
 
 
@@ -1962,7 +2026,13 @@ def _read_exported_ports(project: str) -> list[dict]:
     `/projects:ro` bind-mount (STAGE_EXPORTED_PORTS). Tolerant like
     _read_project_extensions; no cache — `project_services_handler` probes each on
     every load, and `origin_proxy_handler` re-reads per request so a removed port stops
-    proxying immediately (no stale-allow window)."""
+    proxying immediately (no stale-allow window).
+
+    MIRROR of rscore.read_exported_ports' acceptance rule (this image can't
+    import rscore — keep the two byte-equivalent in effect): a pass-through
+    claim carries {passthrough:true, host_port:int non-bool, count:int non-bool
+    >=1 (key absent == 1)}; any malformed member DEGRADES the entry to a plain
+    {port,label} — never dropped, never trusted."""
     workspace = _project_workspace(project)
     if workspace is None:
         return []
@@ -1989,6 +2059,13 @@ def _read_exported_ports(project: str) -> list[dict]:
             if isinstance(box, str) and box and isinstance(app_port, int) \
                     and not isinstance(app_port, bool):
                 entry["box"], entry["app_port"] = box, app_port
+            pt, hp, cnt = e.get("passthrough"), e.get("host_port"), e.get("count", 1)
+            if (pt is True and isinstance(hp, int) and not isinstance(hp, bool)
+                    and isinstance(cnt, int) and not isinstance(cnt, bool)
+                    and cnt >= 1):
+                entry["passthrough"], entry["host_port"] = True, hp
+                if cnt > 1:
+                    entry["count"] = cnt
             out.append(entry)
     return out
 
@@ -2448,11 +2525,95 @@ def _resolve_origin_upstream_port(project: str, service_id: str) -> int | None:
         # re-read per request. Parse defensively — non-digit/unregistered
         # falls through to None, never an exception.
         raw = service_id[len(services.EXPORTED_PORT_ID_PREFIX):]
-        registered = {int(e["port"]) for e in _read_exported_ports(project)}
+        # Pass-through claims are NOT page tabs: excluding them keeps a stale
+        # ORIGIN_PORTS slot from ever resolving a claim's project-side port as
+        # an embedded page (the claims' own lane is the raw relay below).
+        registered = {int(e["port"]) for e in _read_exported_ports(project)
+                      if not e.get("passthrough")}
         if raw.isdigit() and int(raw) in registered:
             return int(raw)
         return None
     return None
+
+
+def _passthrough_claims() -> dict[int, dict | None]:
+    """host_port → claim {project, port, label, host_port, count} for every
+    pass-through claim on disk, or None where two projects claim the same host
+    port (ambiguous ⇒ the relay refuses — fail closed). Scans EVERY project
+    registry per call, uncached (the SSRF membership discipline: a removed
+    claim stops relaying on the very next connection, and no client byte ever
+    picks the destination — the arrival port is the only routing key).
+    Box-bearing rows are never claims: the verb refuses the combination, and a
+    hand-crafted row is skipped here exactly like the reconcile skips it."""
+    claims: dict[int, dict | None] = {}
+    try:
+        names = sorted(d.name for d in PROJECTS_ROOT.iterdir() if d.is_dir())
+    except OSError:
+        return {}
+    for name in names:
+        if _project_workspace(name) is None:
+            continue
+        for e in _read_exported_ports(name):
+            if not e.get("passthrough") or e.get("box"):
+                continue
+            for i in range(e.get("count", 1)):
+                hp = e["host_port"] + i
+                if hp in claims:
+                    claims[hp] = None          # duplicate ⇒ ambiguous ⇒ refuse
+                else:
+                    claims[hp] = {"project": name, "port": e["port"] + i,
+                                  "label": e["label"],
+                                  "host_port": e["host_port"],
+                                  "count": e.get("count", 1)}
+    return claims
+
+
+async def _pt_pump(reader: asyncio.StreamReader,
+                   writer: asyncio.StreamWriter) -> None:
+    """One-direction byte pump for the pass-through relay (the webui image
+    cannot import cli/rs_loopback_fwd.py — this is its small twin). 64 KiB is
+    read granularity, not a cap — the OS enforces its own socket bounds."""
+    try:
+        while True:
+            data = await reader.read(65536)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except (OSError, asyncio.CancelledError):
+        pass
+    finally:
+        try:
+            writer.close()
+        except OSError:
+            pass
+
+
+async def passthrough_conn_handler(reader: asyncio.StreamReader,
+                                   writer: asyncio.StreamWriter) -> None:
+    """Raw-TCP pass-through (STAGE_PASSTHROUGH_PORTS): forward the connection
+    UNTOUCHED to the claiming project's container at the mapped project-side
+    port. Deliberately NO cookie/session gate (raw TLS cannot carry one — the
+    claim dialog warns that the app's own auth is the only lock), no origin
+    check (this is not HTTP), and no payload logging. The arrival port is the
+    ONLY routing key; the claim table is re-read per connection (uncached), and
+    an unclaimed or ambiguous port closes with ZERO bytes written."""
+    sock = writer.get_extra_info("sockname")
+    arrival = int(sock[1]) if sock else 0
+    claim = _passthrough_claims().get(arrival)
+    if not claim:
+        writer.close()
+        return
+    try:
+        up_reader, up_writer = await asyncio.wait_for(
+            asyncio.open_connection(
+                f"{PROJECT_CONTAINER_PREFIX}{claim['project']}", claim["port"]),
+            TCP_PROBE_TIMEOUT_SECONDS)
+    except (OSError, asyncio.TimeoutError):
+        writer.close()
+        return
+    await asyncio.gather(_pt_pump(reader, up_writer),
+                         _pt_pump(up_reader, writer))
 
 
 async def origin_proxy_handler(request: web.Request) -> web.StreamResponse:
@@ -2662,6 +2823,7 @@ def main() -> None:
     # `{action}` catch-all below (first-match wins, else `port`/`port-remove` are
     # swallowed as actions).
     app.router.add_get("/broker/project/{name}/ports", broker_ports_handler)
+    app.router.add_get("/broker/passthrough", broker_passthrough_handler)
     app.router.add_get("/broker/dev", broker_dev_handler)
     app.router.add_get("/broker/dev/commits", broker_dev_commits_handler)
     app.router.add_get("/broker/dev/repo-status", broker_dev_repo_status_handler)
@@ -2701,6 +2863,22 @@ def main() -> None:
     _origin_table_load()
     _origin_table_sweep()
 
+    # Pass-through block sanity — IN-container netns (the fixed 7777 + the
+    # origin range as THIS container binds them). research.py's webui-start
+    # check is the HOST-netns twin against the host WEBUI_PORT — different
+    # netns, both correct, do not "harmonize" them. A misconfigured overlap
+    # dies loudly here (container restart-loop, visible in docker logs) rather
+    # than binding one port as two different things.
+    if (PASSTHROUGH_PORT_LO <= LISTEN_PORT <= PASSTHROUGH_PORT_HI
+            or not (PASSTHROUGH_PORT_HI < ORIGIN_PORT_LO
+                    or ORIGIN_PORT_HI < PASSTHROUGH_PORT_LO)):
+        log.error(
+            f"pass-through block {PASSTHROUGH_PORT_LO}-{PASSTHROUGH_PORT_HI} "
+            f"overlaps the UI port {LISTEN_PORT} or the origin range "
+            f"{ORIGIN_PORT_LO}-{ORIGIN_PORT_HI}; fix the WEBUI_PASSTHROUGH_* "
+            "environment")
+        raise SystemExit(1)
+
     async def _serve() -> None:
         # Explicit runners (web.run_app can't serve two Applications): the
         # root app on 7777 plus one TCPSite per origin port, all sharing the
@@ -2719,10 +2897,18 @@ def main() -> None:
         for p in range(ORIGIN_PORT_LO, ORIGIN_PORT_HI + 1):
             await web.TCPSite(origin_runner, LISTEN_HOST, p,
                               ssl_context=ssl_ctx).start()
+        # Pass-through block: PLAIN TCP servers — no ssl_ctx, deliberately.
+        # The traffic is forwarded untouched; TLS, if any, is the claimed
+        # app's own, end-to-end between the browser and the app.
+        pt_servers = []
+        for p in range(PASSTHROUGH_PORT_LO, PASSTHROUGH_PORT_HI + 1):
+            pt_servers.append(await asyncio.start_server(
+                passthrough_conn_handler, LISTEN_HOST, p))
         log.info(
             f"Research Sandbox webui listening on "
             f"https://{LISTEN_HOST}:{LISTEN_PORT} "
-            f"(+ origin ports {ORIGIN_PORT_LO}-{ORIGIN_PORT_HI})")
+            f"(+ origin ports {ORIGIN_PORT_LO}-{ORIGIN_PORT_HI}, "
+            f"pass-through {PASSTHROUGH_PORT_LO}-{PASSTHROUGH_PORT_HI})")
         # Park until SIGTERM/SIGINT, then clean up both runners so `docker
         # stop` gets a graceful exit instead of hitting the kill timeout.
         # (web.run_app handled SIGINT for free; SIGTERM — docker's stop
@@ -2734,6 +2920,8 @@ def main() -> None:
         try:
             await stop.wait()
         finally:
+            for s in pt_servers:
+                s.close()
             await origin_runner.cleanup()
             await root_runner.cleanup()
 

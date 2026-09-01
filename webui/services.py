@@ -179,6 +179,32 @@ def exported_port_service(port: int, label: str) -> dict | None:
     }
 
 
+# Pass-through claims (STAGE_PASSTHROUGH_PORTS): a raw-TCP host-port claim
+# surfaced as a LAUNCHER tab — the pane opens https://<host>:<host_port> in a
+# NEW browser tab (encrypted and/or multi-port apps the page-relay tab
+# structurally can't front). Distinct prefix from `port-`: a claim never
+# allocates an origin slot, and its id keys on the HOST port. The SPA branches
+# on `passthrough_port` in openHttpService BEFORE the session mint.
+PASSTHROUGH_ID_PREFIX = "pass-"
+
+
+def passthrough_service(host_port: int, label: str, count: int = 1) -> dict | None:
+    """Synthesize the launcher-tab spec for a pass-through claim, or None when
+    the host port is outside the valid TCP range."""
+    host_port = int(host_port)
+    if not (1 <= host_port <= 65535):
+        return None
+    return {
+        "label": label,
+        "kind": "http",     # load-bearing: surfaceOf/activateService dispatch
+        "always_on": False,
+        "renderer": "launcher",
+        "default_port": host_port,
+        "surface": "visual",
+        "passthrough_count": int(count),
+    }
+
+
 # A dev consumer's gitea FORK (the dev-workflow project's own agent, or a dev
 # box) — one tab per consumer+repo, linking to that fork's home page. Distinct
 # from every other prefix (`pi-iso-`, `box-editor-`, `port-`).
