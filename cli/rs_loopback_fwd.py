@@ -16,6 +16,13 @@ overlaps 127.0.0.1:<port> and would EADDRINUSE against the app, but a distinct
 specific address coexists with the loopback listener. A genuinely 0.0.0.0-bound app
 already holds the bridge IP, so our bind fails cleanly and we exit 0 (the service
 is already reachable) — the accepted loopback-only contract (F3 Fork C).
+
+GROUPS (STAGE_PASSTHROUGH_PORTS): one process may serve SEVERAL ports (a
+pass-through span) — every argv port gets its own listener and its own pidfile,
+all holding this pid; a port that fails to bind is skipped (never aborts its
+siblings), and if nothing binds the process exits 0 with no pidfile. The
+single-port invocation (rs_sandbox's box expose, the sandbox-box image bake) is
+the count==1 case of the same contract.
 """
 import asyncio
 import os
@@ -70,47 +77,63 @@ async def _handle(client_reader: asyncio.StreamReader,
     )
 
 
-async def _main(port: int) -> int:
+async def _main(ports: list[int]) -> int:
     ip = _bridge_ip()
-
-    async def _cb(reader: asyncio.StreamReader,
-                  writer: asyncio.StreamWriter) -> None:
-        await _handle(reader, writer, port)
-
-    try:
-        # reuse_address=False is load-bearing (NOT the asyncio Unix default of
-        # True): with SO_REUSEADDR OFF, our specific eth0:<port> bind can never
-        # coexist with a wildcard 0.0.0.0:<port> app (that coexistence requires
-        # BOTH sockets to set SO_REUSEADDR). So the loopback-only contract holds
-        # deterministically regardless of the app's own SO_REUSEADDR: app-first ->
-        # our bind fails -> we step aside (below); forwarder-first -> a later
-        # 0.0.0.0 app fails to bind (the accepted F3 Fork-C behaviour). The happy
-        # path (eth0:<port> vs 127.0.0.1:<port>, two distinct specific addresses)
-        # coexists either way. A listener never enters TIME_WAIT, so dropping
-        # SO_REUSEADDR does not impede a kill-then-relaunch on the same port.
-        server = await asyncio.start_server(_cb, host=ip, port=port,
-                                            reuse_address=False)
-    except OSError as e:
-        # Bind failed — most commonly a 0.0.0.0-bound app already holds the port
-        # (already reachable). Clean exit, and NO pidfile (D4): a doomed launch must
-        # never leave a file that poisons the reconcile liveness check.
-        print(f"rs-loopback-fwd: bind {ip}:{port} failed ({e}); assuming the "
-              f"service is already reachable — exiting", file=sys.stderr)
+    servers = []
+    bound: list[int] = []
+    for port in ports:
+        def _make_cb(p: int):
+            async def _cb(reader: asyncio.StreamReader,
+                          writer: asyncio.StreamWriter) -> None:
+                await _handle(reader, writer, p)
+            return _cb
+        try:
+            # reuse_address=False is load-bearing (NOT the asyncio Unix default of
+            # True): with SO_REUSEADDR OFF, our specific eth0:<port> bind can never
+            # coexist with a wildcard 0.0.0.0:<port> app (that coexistence requires
+            # BOTH sockets to set SO_REUSEADDR). So the loopback-only contract holds
+            # deterministically regardless of the app's own SO_REUSEADDR: app-first ->
+            # our bind fails -> we step aside (below); forwarder-first -> a later
+            # 0.0.0.0 app fails to bind (the accepted F3 Fork-C behaviour). The happy
+            # path (eth0:<port> vs 127.0.0.1:<port>, two distinct specific addresses)
+            # coexists either way. A listener never enters TIME_WAIT, so dropping
+            # SO_REUSEADDR does not impede a kill-then-relaunch on the same port.
+            server = await asyncio.start_server(_make_cb(port), host=ip, port=port,
+                                                reuse_address=False)
+        except OSError as e:
+            # Bind failed — most commonly a 0.0.0.0-bound app already holds the
+            # port (already reachable). Skip THIS port only (a group must never
+            # abort its siblings), and write no pidfile for it (D4): a doomed
+            # bind must never leave a file that poisons the reconcile liveness
+            # check.
+            print(f"rs-loopback-fwd: bind {ip}:{port} failed ({e}); assuming "
+                  f"the service is already reachable — skipping", file=sys.stderr)
+            continue
+        servers.append(server)
+        bound.append(port)
+    if not servers:
         return 0
-    # Bind succeeded -> record our pid so the host reconcile can find + reap us.
+    # Binds succeeded -> record our pid, one pidfile per BOUND port (the host
+    # reconcile keys liveness + teardown per port; a group's files all hold the
+    # same pid).
     _PIDFILE_DIR.mkdir(parents=True, exist_ok=True)
-    (_PIDFILE_DIR / f"{port}.pid").write_text(f"{os.getpid()}\n")
-    async with server:
-        await server.serve_forever()
+    for port in bound:
+        (_PIDFILE_DIR / f"{port}.pid").write_text(f"{os.getpid()}\n")
+    try:
+        await asyncio.gather(*(s.serve_forever() for s in servers))
+    finally:
+        for s in servers:
+            s.close()
     return 0
 
 
 def main() -> int:
-    if len(sys.argv) != 2 or not sys.argv[1].isdigit():
-        print("usage: rs-loopback-fwd <port>", file=sys.stderr)
+    args = sys.argv[1:]
+    if not args or not all(a.isdigit() for a in args):
+        print("usage: rs-loopback-fwd <port> [<port> ...]", file=sys.stderr)
         return 2
     try:
-        return asyncio.run(_main(int(sys.argv[1])))
+        return asyncio.run(_main([int(a) for a in args]))
     except KeyboardInterrupt:
         return 0
 

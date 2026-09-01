@@ -45,10 +45,20 @@ services:
       # start` pre-probes it and fails loudly on any busy port (no gappy
       # publish). Docker holds the whole range for the container's lifetime.
       - "${WEBUI_BIND:-127.0.0.1}:${WEBUI_ORIGIN_PORT_LO:-10100}-${WEBUI_ORIGIN_PORT_HI:-10164}:${WEBUI_ORIGIN_PORT_LO:-10100}-${WEBUI_ORIGIN_PORT_HI:-10164}"
+      # Pass-through block (STAGE_PASSTHROUGH_PORTS): raw-TCP forwarded — no
+      # TLS termination, numbers preserved — into whichever project claimed
+      # each port (encrypted/multi-port apps the page-relay tab can't front).
+      # Same static 1:1 range shape as the origin range above; `research webui
+      # start` pre-probes it and refuses overlap with WEBUI_PORT / the origin
+      # range. NOT behind the webui login by design (raw TLS can't carry a
+      # session cookie) — the app's own auth is the gate.
+      - "${WEBUI_BIND:-127.0.0.1}:${WEBUI_PASSTHROUGH_PORT_LO:-10200}-${WEBUI_PASSTHROUGH_PORT_HI:-10299}:${WEBUI_PASSTHROUGH_PORT_LO:-10200}-${WEBUI_PASSTHROUGH_PORT_HI:-10299}"
     environment:
       - WEBUI_BIND=${WEBUI_BIND:-127.0.0.1}
       - WEBUI_ORIGIN_PORT_LO=${WEBUI_ORIGIN_PORT_LO:-10100}
       - WEBUI_ORIGIN_PORT_HI=${WEBUI_ORIGIN_PORT_HI:-10164}
+      - WEBUI_PASSTHROUGH_PORT_LO=${WEBUI_PASSTHROUGH_PORT_LO:-10200}
+      - WEBUI_PASSTHROUGH_PORT_HI=${WEBUI_PASSTHROUGH_PORT_HI:-10299}
       - RS_PROJECTS_ROOT=/projects
       - RS_BROKER_SOCKET=/run/rs-broker/broker.sock
     volumes:

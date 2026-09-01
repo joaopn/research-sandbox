@@ -1495,6 +1495,39 @@ _EXPORT_BOX_EDITOR_PORT_HI = 8599  # inclusive
 _EXPORT_BOX_LOOPBACK_PORT_LO = 8600
 _EXPORT_BOX_LOOPBACK_PORT_HI = 8699  # inclusive
 
+# Pass-through block (STAGE_PASSTHROUGH_PORTS): host ports the webui forwards as
+# RAW TCP (no TLS termination, numbers preserved) into the claiming project.
+# The defaults are a 4-file lockstep with .env.example, docker-compose.yml and
+# webui/server.py (the webui image cannot import this module) — pytest-pinned.
+# 100 ports: one nested-RS-shaped tenant (66 = a root page + 65 per-editor
+# origins) plus headroom for ordinary single-port apps; sits above the 101xx
+# origin range, inside the dev-squatter-free 10xxx band.
+WEBUI_PASSTHROUGH_PORT_LO_DEFAULT = 10200
+WEBUI_PASSTHROUGH_PORT_HI_DEFAULT = 10299
+
+
+def webui_passthrough_port_range() -> tuple[int, int]:
+    """Effective pass-through block [lo, hi] from .env (defaults above).
+
+    Raises ValidationError on a malformed range — this is reached from
+    PortAddRequest.from_kwargs (pre-flight channel), so the text is
+    browser-verbatim and names the KEYS and bounds only, never a file or a
+    remedy (the webui-CLI-mention rule). research.py's webui-start caller maps
+    it to die() and appends the .env remedy there (CLI-only surface).
+    """
+    raw_lo = read_env_value("WEBUI_PASSTHROUGH_PORT_LO")
+    raw_hi = read_env_value("WEBUI_PASSTHROUGH_PORT_HI")
+    try:
+        lo = int(raw_lo or WEBUI_PASSTHROUGH_PORT_LO_DEFAULT)
+        hi = int(raw_hi or WEBUI_PASSTHROUGH_PORT_HI_DEFAULT)
+    except ValueError:
+        raise ValidationError("WEBUI_PASSTHROUGH_PORT_LO/HI must be integers")
+    if not (0 < lo <= hi < 65536):
+        raise ValidationError(
+            f"invalid pass-through port block {lo}-{hi} "
+            "(need 0 < LO <= HI < 65536)")
+    return lo, hi
+
 
 def _coerce_export_port(value: Any) -> int:
     # bool is an int subclass — reject it before the isinstance(int) branch.
@@ -1547,6 +1580,12 @@ class PortAddRequest:
     label: str
     box: str = ""   # "" => the top-level supervisor/docker container; else an
                     # inner box name, whose 127.0.0.1:<port> is exposed (Slice 2b).
+    # Pass-through claim (STAGE_PASSTHROUGH_PORTS): host_port..host_port+count-1
+    # in the webui's reserved block relay RAW TCP to port..port+count-1 on the
+    # project's own container. Identity claims have host_port == port.
+    passthrough: bool = False
+    host_port: int = 0
+    count: int = 1
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "PortAddRequest":
@@ -1554,6 +1593,43 @@ class PortAddRequest:
         if not (isinstance(label, str) and label.strip()):
             raise ValidationError("label must be a non-empty string")
         box = kw.get("box") or ""
+        passthrough = kw.get("passthrough", False)
+        if not isinstance(passthrough, bool):
+            raise ValidationError("passthrough must be a boolean")
+        if passthrough:
+            # Pass-through claim. Every refusal text below is browser-verbatim
+            # (the relay handler forwards it into the webui), so it names
+            # bounds/keys only — never a file, a CLI verb, or a remedy.
+            if box:
+                raise ValidationError(
+                    "pass-through on a box is not supported yet")
+            lo, hi = webui_passthrough_port_range()
+            count = kw.get("count", 1)
+            if isinstance(count, bool) or not isinstance(count, int):
+                raise ValidationError("count must be an integer")
+            if not (1 <= count <= hi - lo + 1):
+                raise ValidationError(
+                    f"count must be between 1 and {hi - lo + 1} "
+                    f"(the pass-through block is {lo}-{hi})")
+            # EVERY project-side port in the span must dodge the reserved bands
+            # (the reconcile binds each on the container's bridge IP, and the
+            # raw relay would hand ssh/editor/reader to the network with no
+            # webui session in front) — the first port alone is not enough for
+            # a mapped span.
+            port = _coerce_export_port(kw.get("port"))
+            for i in range(1, count):
+                _coerce_export_port(port + i)
+            hp_raw = kw.get("host_port")
+            host_port = port if hp_raw is None else _coerce_app_port(hp_raw)
+            if not (lo <= host_port and host_port + count - 1 <= hi):
+                span_txt = (f"{host_port}-{host_port + count - 1}"
+                            if count > 1 else str(host_port))
+                raise ValidationError(
+                    f"host ports must lie within the pass-through block "
+                    f"{lo}-{hi} (got {span_txt})")
+            return cls(project=_require_name(kw.get("project")), port=port,
+                       label=label.strip(), box="", passthrough=True,
+                       host_port=host_port, count=count)
         if box:
             # Inner-box expose: `port` is the app's IN-BOX loopback port (validated
             # without the supervisor-netns reserved bands); the tab lands on an
@@ -1571,6 +1647,9 @@ class PortAddRequest:
 class PortRemoveRequest:
     project: str
     port: int
+    # True => `port` is a pass-through claim's host_port key (a claim's
+    # project-side port may equal a page entry's port — the flag disambiguates).
+    passthrough: bool = False
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "PortRemoveRequest":
@@ -1578,8 +1657,12 @@ class PortRemoveRequest:
         # an existing entry's tab port, which for an inner-box entry (F3 Slice 2b)
         # IS a pub_super in the 8600-8699 reserved band — rejecting it here would
         # make box tabs unremovable. An unknown port simply matches nothing.
+        passthrough = kw.get("passthrough", False)
+        if not isinstance(passthrough, bool):
+            raise ValidationError("passthrough must be a boolean")
         return cls(project=_require_name(kw.get("project")),
-                   port=_coerce_app_port(kw.get("port")))
+                   port=_coerce_app_port(kw.get("port")),
+                   passthrough=passthrough)
 
 
 @dataclass(frozen=True)
@@ -2276,7 +2359,9 @@ class PortAddResult:
     project: str
     port: int
     label: str
-    ports: list[dict]                       # the full {port,label} list after the add
+    ports: list[dict]                       # full entry list after the add ({port,label}
+                                            # + optional box/app_port or
+                                            # passthrough/host_port/count fields)
 
 
 @dataclass
@@ -7263,6 +7348,15 @@ def _stage_fetch_wiring(container: str) -> None:
 # is the ONLY thing that launches/reaps them.
 _LOOPBACK_FWD_BIN = "/usr/local/bin/rs-loopback-fwd"
 _LOOPBACK_PIDFILE_DIR = "/tmp/rs-loopback-fwd"
+# Reap bound for a killed forwarder GROUP (one process may serve several ports):
+# SIGTERM ends the handler-less asyncio process in milliseconds, so the poll
+# normally passes on its first iteration; the 5s bound caps a pathologically
+# wedged process to one tolerable port_remove latency (the reconcile runs on the
+# broker's serial thread — at 10x this would push a single remove past the
+# webui's 30s relay window), after which SIGKILL guarantees the listeners are
+# gone before survivors relaunch. At half (2.5s) the normal case is unchanged.
+_LOOPBACK_REAP_WAIT_S = 5.0
+_LOOPBACK_REAP_POLL_S = 0.1
 
 
 def _stage_loopback_fwd(container: str) -> None:
@@ -7303,16 +7397,30 @@ def _reconcile_loopback_bridges(project: str, cfg: "Config") -> None:  # type: i
     `sh`. Best-effort throughout — the registry write is the source of truth and
     the forwarders reconcile toward it; a hiccup warns and continues. Called live
     from port_add/port_remove and after each container-swap re-stage site (docker
-    start/recreate + the sysbox supervisor recreate)."""
+    start/recreate + the sysbox supervisor recreate).
+
+    GROUP semantics (STAGE_PASSTHROUGH_PORTS): all non-live desired ports launch
+    as ONE forwarder process (a 66-wide span as 66 python processes would cost
+    ~0.5-1 GB RSS), one pidfile per port all holding that pid. Removing one port
+    therefore kills its whole group — BY CONSTRUCTION, not timing: the teardown
+    reaps the killed pid (bounded wait, then SIGKILL) and unlinks every sibling
+    pidfile holding it, so the survivors read dead in THIS call's liveness pass
+    and relaunch together as one new group before this function returns."""
     container = container_name_for(project)
     if not container_running(container):
         return
     # Only the TOP-LEVEL entries (no `box` field) are ours — an inner-box entry
     # (F3 Slice 2b) is published + forwarded by rs-sandbox inside the box; binding
     # its pub_super on the supervisor's eth0 here would double-bind against the -p
-    # publish (N2).
-    desired = sorted({int(e["port"]) for e in read_exported_ports(
-        workspace_path_for(project, cfg)) if not e.get("box")})
+    # publish (N2). A pass-through claim expands to its whole project-side span —
+    # the forwarder bridges every port the webui relay dials.
+    desired_set: set[int] = set()
+    for e in read_exported_ports(workspace_path_for(project, cfg)):
+        if e.get("box"):
+            continue
+        span = int(e.get("count", 1)) if e.get("passthrough") else 1
+        desired_set.update(int(e["port"]) + i for i in range(span))
+    desired = sorted(desired_set)
     # Teardown ALWAYS runs first (even when desired is empty) so a removed port's
     # forwarder is reaped. The kill is GUARDED by a /proc/<pid>/cmdline content
     # check — identical to the liveness probe (F1): a bare `kill $(cat pidfile)`
@@ -7320,8 +7428,16 @@ def _reconcile_loopback_bridges(project: str, cfg: "Config") -> None:  # type: i
     # persist). The pidfile is removed unconditionally (a stale file must always
     # clear; only the kill is guarded). glob-no-match + empty pidfile are guarded
     # (F2); the bin path + port token are NUL-exact matched via `grep -z` so 80
-    # never matches 808 (F3).
+    # never matches 808 (F3). After a kill: bounded reap (poll /proc, then
+    # SIGKILL, then poll again) + unlink of EVERY sibling pidfile holding that
+    # pid — a group process serves several ports, and without the reap+unlink a
+    # survivor's liveness probe could still read the dying pid as live and skip
+    # its own relaunch (silent unbridged port). The mid-loop sibling unlink is
+    # safe ONLY because the glob expanded once and `[ -e "$f" ] || continue`
+    # skips already-unlinked siblings on their own iteration — that guard is
+    # load-bearing here, not just for the no-match glob.
     keep = (" " + " ".join(str(p) for p in desired) + " ") if desired else "  "
+    reap_iters = int(_LOOPBACK_REAP_WAIT_S / _LOOPBACK_REAP_POLL_S)
     teardown = f'''set -u
 DIR={_LOOPBACK_PIDFILE_DIR}
 KEEP="{keep}"
@@ -7334,6 +7450,18 @@ for f in "$DIR"/*.pid; do
      && grep -zFxq "{_LOOPBACK_FWD_BIN}" "/proc/$pid/cmdline" \
      && grep -zFxq "$port" "/proc/$pid/cmdline"; then
     kill "$pid" 2>/dev/null || true
+    i=0
+    while [ -d "/proc/$pid" ] && [ "$i" -lt {reap_iters} ]; do
+      sleep {_LOOPBACK_REAP_POLL_S}; i=$((i+1))
+    done
+    if [ -d "/proc/$pid" ]; then
+      kill -9 "$pid" 2>/dev/null || true
+      i=0
+      while [ -d "/proc/$pid" ] && [ "$i" -lt {reap_iters} ]; do
+        sleep {_LOOPBACK_REAP_POLL_S}; i=$((i+1))
+      done
+    fi
+    grep -lFx "$pid" "$DIR"/*.pid 2>/dev/null | xargs -r rm -f --
   fi
   rm -f "$f"
 done'''
@@ -7345,6 +7473,7 @@ done'''
     if not desired:
         return
     _stage_loopback_fwd(container)
+    to_launch: list[int] = []
     for port in desired:
         # Liveness: is a genuine rs-loopback-fwd for THIS exact port already
         # running? Content-check /proc/<pid>/cmdline (NOT kill -0, which mis-reads
@@ -7363,16 +7492,23 @@ exit 0'''
                    capture_output=True)
         if live.returncode == 0:
             continue
-        # Not live -> launch detached as root (binds any validated port >= 1;
-        # writes its own pidfile after a successful bind, exits clean if the port
-        # is already held by a 0.0.0.0 app).
-        launched = run(["docker", "exec", "-d", "-u", "0", container,
-                        _LOOPBACK_FWD_BIN, str(port)], capture_output=True)
-        if launched.returncode != 0:
-            print(f"warning: launching loopback forwarder for port {port} in "
-                  f"{container} failed: "
-                  f"{(launched.stderr or launched.stdout).strip()}",
-                  file=sys.stderr)
+        to_launch.append(port)
+    if not to_launch:
+        return
+    # Launch ALL non-live ports as ONE detached root group process (binds any
+    # validated port >= 1; writes a pidfile per port it actually binds, skips a
+    # port already held by a 0.0.0.0 app). Argv shape is load-bearing:
+    # [..., _LOOPBACK_FWD_BIN, p1, p2, ...] with nothing between the bin and the
+    # port tokens — the teardown/liveness greps match tokens NUL-exactly, and
+    # archived pins assert the single-port tail.
+    launched = run(["docker", "exec", "-d", "-u", "0", container,
+                    _LOOPBACK_FWD_BIN, *(str(p) for p in to_launch)],
+                   capture_output=True)
+    if launched.returncode != 0:
+        print(f"warning: launching loopback forwarder for port(s) "
+              f"{', '.join(str(p) for p in to_launch)} in {container} failed: "
+              f"{(launched.stderr or launched.stdout).strip()}",
+              file=sys.stderr)
 
 
 def _restart_dev_boxes(project: str, cfg: "Config", gitea_ip: str) -> None:
@@ -9358,7 +9494,13 @@ def read_exported_ports(workspace_path: "Path") -> list[dict]:  # type: ignore[n
     the supervisor-netns publish port (pub_super) the resolver dials, `app_port` the
     box's own 127.0.0.1 port, `box` the box name — the pair the unexpose/sweep paths
     need. Missing/malformed → []; a plain {port,label} stays a top-level entry.
-    Host-written but webui-read, so never trust the shape."""
+    A pass-through claim (STAGE_PASSTHROUGH_PORTS) additionally carries
+    {passthrough:true, host_port:int, count:int>=1 (absent == 1)} — accepted only
+    when ALL of those hold, else the entry DEGRADES to a plain {port,label}
+    (never dropped, never trusted). webui/server.py::_read_exported_ports is the
+    MIRROR of this rule (the webui image can't import this module) — keep the two
+    byte-equivalent in effect. Host-written but webui-read, so never trust the
+    shape."""
     f = exported_ports_path(workspace_path)
     if not f.is_file():
         return []
@@ -9380,6 +9522,13 @@ def read_exported_ports(workspace_path: "Path") -> list[dict]:  # type: ignore[n
             if isinstance(box, str) and box and isinstance(app_port, int) \
                     and not isinstance(app_port, bool):
                 entry["box"], entry["app_port"] = box, app_port
+            pt, hp, cnt = e.get("passthrough"), e.get("host_port"), e.get("count", 1)
+            if (pt is True and isinstance(hp, int) and not isinstance(hp, bool)
+                    and isinstance(cnt, int) and not isinstance(cnt, bool)
+                    and cnt >= 1):
+                entry["passthrough"], entry["host_port"] = True, hp
+                if cnt > 1:
+                    entry["count"] = cnt
             out.append(entry)
     return out
 
@@ -9394,14 +9543,21 @@ def _write_exported_ports(workspace_path: "Path", ports: list[dict]) -> None:  #
 
 def port_add(req: "PortAddRequest", _progress=None) -> PortAddResult:  # type: ignore[name-defined]
     """Register an exported port for a project (writes the workspace registry).
-    Idempotent — a re-add updates the label. TWO shapes:
+    Idempotent — a re-add updates the label. THREE shapes:
     - req.box == "" (F3 Slice 1/2a): the top-level supervisor/docker container. The
       port is ASSUMED bound on 127.0.0.1, so registering it stands up an in-box
       forwarder (via _reconcile_loopback_bridges); the tab is on that same `port`.
     - req.box set (F3 Slice 2b): `port` is an inner box's own 127.0.0.1 port. Drive
       `rs-sandbox expose` to allocate a supervisor-netns publish port (pub_super) +
       run the box's forwarder, then register {port: pub_super, box, app_port} — the
-      tab lands on pub_super, which the resolver already dials."""
+      tab lands on pub_super, which the resolver already dials.
+    - req.passthrough (STAGE_PASSTHROUGH_PORTS): a raw-TCP claim of
+      host_port..host_port+count-1 in the webui's reserved block, relaying to
+      port..port+count-1 on this project's container. FAIL-CLOSED global gate: a
+      block port is claimable ONCE across ALL projects (walk every workspace
+      registry; the one pass is this project re-claiming the IDENTICAL
+      (host_port, count, port) triple — the idempotent label update). The result
+      `port` is host_port (the claim's identity + the tab key)."""
     cfg = load_config()
     ws = workspace_path_for(req.project, cfg)
     if not ws.is_dir():
@@ -9430,7 +9586,49 @@ def port_add(req: "PortAddRequest", _progress=None) -> PortAddResult:  # type: i
         _write_exported_ports(ws, ports)
         return PortAddResult(project=req.project, port=pub, label=req.label,
                              ports=ports)
-    ports = [e for e in read_exported_ports(ws) if e.get("port") != req.port]
+    if req.passthrough:
+        span_lo, span_hi = req.host_port, req.host_port + req.count - 1
+        # GLOBAL fail-closed collision gate over every project's registry.
+        # Refusal text is browser-verbatim: it names the holder + the webui
+        # surfaces, never a CLI verb or a file (the webui-CLI-mention rule).
+        root = Path(cfg.projects_dir).expanduser().resolve()
+        if root.is_dir():
+            for pdir in sorted(p for p in root.iterdir() if p.is_dir()):
+                for e in read_exported_ports(pdir / "workspace"):
+                    if not e.get("passthrough"):
+                        continue
+                    e_lo = e["host_port"]
+                    e_hi = e_lo + e.get("count", 1) - 1
+                    if e_hi < span_lo or span_hi < e_lo:
+                        continue                      # disjoint spans
+                    if (pdir.name == req.project and e_lo == req.host_port
+                            and e.get("count", 1) == req.count
+                            and e.get("port") == req.port):
+                        continue                      # identical re-claim
+                    die(f"host port {max(span_lo, e_lo)} is already claimed "
+                        f"by project {pdir.name!r} — remove that claim from "
+                        f"its Ports section (or Management → Pass-through "
+                        f"ports) first")
+        ports = [e for e in read_exported_ports(ws)
+                 if not (e.get("passthrough")
+                         and e.get("host_port") == req.host_port
+                         and e.get("count", 1) == req.count
+                         and e.get("port") == req.port)]
+        entry: dict = {"port": req.port, "label": req.label,
+                       "passthrough": True, "host_port": req.host_port}
+        if req.count > 1:
+            entry["count"] = req.count
+        ports.append(entry)
+        ports.sort(key=lambda e: e["port"])
+        _write_exported_ports(ws, ports)
+        _reconcile_loopback_bridges(req.project, cfg)
+        return PortAddResult(project=req.project, port=req.host_port,
+                             label=req.label, ports=ports)
+    # Plain (page-tab) entry: dedupe on `port` among NON-passthrough entries
+    # only — a pass-through claim targeting the same project-side port is a
+    # DIFFERENT registration (identity = host_port) and must survive this add.
+    ports = [e for e in read_exported_ports(ws)
+             if not (e.get("port") == req.port and not e.get("passthrough"))]
     ports.append({"port": req.port, "label": req.label})
     ports.sort(key=lambda e: e["port"])
     _write_exported_ports(ws, ports)
@@ -9446,16 +9644,25 @@ def port_remove(req: "PortRemoveRequest", _progress=None) -> PortRemoveResult:  
         # Nothing to remove and never auto-create a workspace from a remove.
         return PortRemoveResult(project=req.project, port=req.port, ports=[])
     existing = read_exported_ports(ws)
-    # A box entry (F3 Slice 2b) is keyed on its tab port (pub_super) — the same
-    # `port` the webui removes by. Unexpose it in the box before dropping the entry.
-    gone = next((e for e in existing if e.get("port") == req.port), None)
+
+    # Matcher split by req.passthrough: a pass-through claim's identity is its
+    # host_port (its project-side `port` may legitimately equal a page entry's
+    # port); everything else keys on `port` and must never match a pass-through
+    # entry whose project-side port collides. A box entry (F3 Slice 2b) is keyed
+    # on its tab port (pub_super) — the same `port` the webui removes by.
+    def _match(e: dict) -> bool:
+        if req.passthrough:
+            return bool(e.get("passthrough")) and e.get("host_port") == req.port
+        return e.get("port") == req.port and not e.get("passthrough")
+
+    gone = next((e for e in existing if _match(e)), None)
     if gone and gone.get("box"):
         container = _running_dind_supervisor(req.project)
         r = run(["docker", "exec", container, "rs-sandbox", "unexpose",
                  gone["box"], str(gone["app_port"])], capture_output=True)
         if r.returncode != 0:
             die(f"failed to unexpose box port: {(r.stderr or r.stdout).strip()}")
-    ports = [e for e in existing if e.get("port") != req.port]
+    ports = [e for e in existing if not _match(e)]
     _write_exported_ports(ws, ports)
     # Reap the top-level forwarder for a supervisor/docker entry (a box entry's
     # forwarder died with the box's rm+run in unexpose — the reconcile skips it).

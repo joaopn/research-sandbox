@@ -622,13 +622,15 @@ def _verb_box_presets(args: dict, _progress=None) -> dict:
     return dataclasses.asdict(rscore.box_presets(req))
 
 
-# Exported ports (STAGE_EXPORTED_PORTS): port + label act on the project's own
-# supervisor netns (a port the PI is serving there), so they're relayable — neither
-# is host-shaped (cf. the host-root boundary). Deny-by-default field allowlist,
-# mirroring BOX_ADD_WEBUI_FIELDS. Token-gated (not in OPEN_VERBS), no step-up (a
-# tab carries no data), no progress (instant file write — synchronous relay).
-PORT_ADD_WEBUI_FIELDS = frozenset({"project", "port", "label", "box"})
-PORT_TARGET_WEBUI_FIELDS = frozenset({"project", "port"})
+# Exported ports (STAGE_EXPORTED_PORTS) + pass-through claims
+# (STAGE_PASSTHROUGH_PORTS): every field acts on the project's own supervisor
+# netns or the webui's own already-published block — none is host-shaped (cf.
+# the host-root boundary). Deny-by-default field allowlist, mirroring
+# BOX_ADD_WEBUI_FIELDS. Token-gated (not in OPEN_VERBS), no step-up (a tab
+# carries no data), no progress (instant file write — synchronous relay).
+PORT_ADD_WEBUI_FIELDS = frozenset({"project", "port", "label", "box",
+                                   "passthrough", "host_port", "count"})
+PORT_TARGET_WEBUI_FIELDS = frozenset({"project", "port", "passthrough"})
 
 
 def _verb_port_add(args: dict, _progress=None) -> dict:

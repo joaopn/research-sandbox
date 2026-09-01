@@ -1620,14 +1620,21 @@ def _webui_probe_ports(bind: str, ports: list[int]) -> None:
             s.close()
     if busy:
         lo, hi = _webui_origin_port_range()
+        try:
+            pt_lo, pt_hi = webui_passthrough_port_range()
+            pt_line = (f"  plus {pt_lo}-{pt_hi} (WEBUI_PASSTHROUGH_PORT_LO/HI) "
+                       "for pass-through apps,\n")
+        except ValidationError:
+            pt_line = ""    # start() dies on the malformed block before probing
         die(f"webui port(s) already in use on {bind}: "
             f"{', '.join(str(p) for p in busy)}\n"
             f"  The webui reserves {lo}-{hi} (WEBUI_ORIGIN_PORT_LO/HI) for "
             "per-editor browser origins,\n"
+            f"{pt_line}"
             "  plus WEBUI_PORT for the UI itself. Free those ports, or move "
             "the range: edit\n"
-            "  WEBUI_ORIGIN_PORT_LO / WEBUI_ORIGIN_PORT_HI in .env, then "
-            "re-run `research webui start`.")
+            "  the corresponding keys in .env, then re-run "
+            "`research webui start`.")
 
 
 def cmd_webui(args: argparse.Namespace) -> None:
@@ -1689,6 +1696,24 @@ def cmd_webui(args: argparse.Namespace) -> None:
                 f"{origin_lo}-{origin_hi}; move one of them in .env")
         os.environ["WEBUI_ORIGIN_PORT_LO"] = str(origin_lo)
         os.environ["WEBUI_ORIGIN_PORT_HI"] = str(origin_hi)
+        # Pass-through block (STAGE_PASSTHROUGH_PORTS): resolved from .env via
+        # rscore (the SAME helper PortAddRequest validation uses — one
+        # definition), exported for compose's ports/environment interpolation.
+        # These are HOST-netns overlap checks against the HOST port numbers;
+        # webui/server.py keeps its own IN-container guard against the fixed
+        # 7777 — different netns, both correct, do not "harmonize" them.
+        try:
+            pt_lo, pt_hi = webui_passthrough_port_range()
+        except ValidationError as e:
+            die(f"{e} — fix WEBUI_PASSTHROUGH_PORT_LO/HI in .env")
+        if pt_lo <= int(port) <= pt_hi:
+            die(f"WEBUI_PORT={port} falls inside the pass-through block "
+                f"{pt_lo}-{pt_hi}; move one of them in .env")
+        if not (pt_hi < origin_lo or origin_hi < pt_lo):
+            die(f"the pass-through block {pt_lo}-{pt_hi} overlaps the origin "
+                f"port range {origin_lo}-{origin_hi}; move one of them in .env")
+        os.environ["WEBUI_PASSTHROUGH_PORT_LO"] = str(pt_lo)
+        os.environ["WEBUI_PASSTHROUGH_PORT_HI"] = str(pt_hi)
         # Run the webui as the operator's uid so it can connect to the broker's
         # 0600 socket and pass its SO_PEERCRED check (the uid-equality contract,
         # value-agnostic — not hardcoded to 1000). Expose only the broker's
@@ -1719,7 +1744,8 @@ def cmd_webui(args: argparse.Namespace) -> None:
         # be free. Placed after the rm -f above so the old webui's own binds
         # never read as squatters; the already-running early-return above never
         # reaches here.
-        _webui_probe_ports(bind, [int(port), *range(origin_lo, origin_hi + 1)])
+        _webui_probe_ports(bind, [int(port), *range(origin_lo, origin_hi + 1),
+                                  *range(pt_lo, pt_hi + 1)])
         print(f"starting webui (bind {bind}:{port})...")
         docker_compose("--profile", "webui", "up", "-d", "webui")
         wire_webui_to_projects()
