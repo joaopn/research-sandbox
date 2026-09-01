@@ -42,6 +42,22 @@ RUN curl -fsSL https://get.docker.com | VERSION=${DOCKER_VERSION} sh && \
 # network (the inner dockerd pulls extension images by container DNS); it must
 # match sandbox.EXT_REGISTRY exactly. Host pushes go via a loopback port, which
 # Docker trusts by default, so ONLY the inner daemon needs this entry.
+#
+# Address layout (STAGE_DIND_PRIVILEGED_SUBSTRATE): `bip` PINS docker0 to the
+# exact value the daemon default already yields — once default-address-pools
+# exists, docker0 itself would draw from the pool, so the pin is what keeps the
+# pool addition invisible to the existing fleet (workers/boxes see zero drift).
+# `default-address-pools` moves CREATED networks (a nested RS's project
+# bridges, user compose nets) into 10.201.0.0/16 in /24 slices (254 addresses
+# per network × 256 networks — a project bridge carries a handful of
+# containers; at /16 the base would yield ONE network) — disjoint from
+# 172.16/12 (the container's OWN eth0 lives there: the outer project bridge
+# draws from the host pool), the pinned 192.168.99-111 inner nets, and the
+# 100.64/10 tailnet. The router drops RFC1918 egress in BOTH modes, so
+# shadowing external 10.x costs nothing. Explicit-subnet creations (rs-inner,
+# rs-dev-*) bypass pools entirely. This is what keeps an inner network from
+# ever shadowing the container's route out (the sudden-total-network-loss
+# class the dev-box /24 pin closed one level up).
 RUN mkdir -p /etc/docker && cat > /etc/docker/daemon.json <<'JSON'
 {
   "default-runtime": "crun",
@@ -50,7 +66,11 @@ RUN mkdir -p /etc/docker && cat > /etc/docker/daemon.json <<'JSON'
       "path": "/usr/bin/crun"
     }
   },
-  "insecure-registries": ["rs-registry:5000"]
+  "insecure-registries": ["rs-registry:5000"],
+  "bip": "172.17.0.1/16",
+  "default-address-pools": [
+    {"base": "10.201.0.0/16", "size": 24}
+  ]
 }
 JSON
 

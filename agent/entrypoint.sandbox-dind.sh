@@ -92,6 +92,18 @@ mkdir -p /workspace/.orchestrator/logs
 if [[ "${DOCKER_DIND:-}" == "true" ]] && command -v dockerd >/dev/null 2>&1; then
     echo "Starting dockerd..."
     sudo rm -f /var/run/docker.pid /var/run/docker.sock
+    # cgroup v2 nesting (the upstream docker-in-docker boot dance): a cgroup
+    # with processes cannot enable subtree controllers, and only sysbox sets
+    # delegation up for us — under --privileged the inner runtime tolerates
+    # the missing controllers and silently runs containers with NO resource
+    # limits. Move everything started so far into /init and delegate. Every
+    # write is best-effort (`|| :`): under sysbox this is redundant and any
+    # refused write must never regress the boot. MIRROR block — byte-identical
+    # in entrypoint.supervisor.sh (each dind leaf boots its substrate
+    # independently); pytest-pinned.
+    if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then
+        sudo sh -c 'mkdir -p /sys/fs/cgroup/init || :; xargs -rn1 < /sys/fs/cgroup/cgroup.procs > /sys/fs/cgroup/init/cgroup.procs || :; sed -e "s/ / +/g" -e "s/^/+/" < /sys/fs/cgroup/cgroup.controllers > /sys/fs/cgroup/cgroup.subtree_control || :'
+    fi
     sudo sh -c 'dockerd > /tmp/dockerd.log 2>&1 &'
     for _ in $(seq 1 30); do
         if docker info >/dev/null 2>&1; then
