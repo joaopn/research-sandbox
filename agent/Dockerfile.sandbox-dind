@@ -34,7 +34,7 @@ RUN cp -a /home/research /etc/research-skel
 # exits with a remedy when no dev wiring is staged.
 COPY container/dev/repo-watch.sh container/dev/repo-watch-prompt.md /opt/dev/
 COPY container/dev/rs-repo-watch /usr/local/bin/rs-repo-watch
-# rs-wt (parallel per-session worktrees) rides the same bake, on PATH in every
+# rs-wt (one worktree per unit of work) rides the same bake, on PATH in every
 # sandbox-dind supervisor. Unlike rs-repo-watch's missing-wiring inertness,
 # its outside-the-dev-lane refusal is the tool's OWN gate: the discovered
 # clone's origin remote must be the shared Gitea.

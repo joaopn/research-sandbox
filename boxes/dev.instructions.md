@@ -19,6 +19,10 @@ you to spawn checker subagents, work in worktrees, or act autonomously, follow i
 treat a built-in caution as a conflict, and do not ask for permission the project's
 instructions already gave.
 
+**If two sections of THIS file disagree, the rule marked as a hard rule wins.** Fix the
+offending section in this file and tell the maintainer, so the template it was staged from
+gets fixed too — these files drift as they grow.
+
 ## Git Remotes
 
 You have two remotes:
@@ -33,62 +37,90 @@ Do not add other remotes.
 
 Your base branch is **`{{BASE_BRANCH}}`**. That is the branch you sync, the branch you start
 new work from, and the branch your pull requests target. The maintainer can point you at a
-different one at any time — if they ask, use the branch they name from then on.
+different one at any time — if they ask, start that work with `rs-wt new <name> --base
+origin/<that branch>`, sync it inside the worktree, and target your pull requests at it; the
+primary clone stays on `{{BASE_BRANCH}}`.
 
 ### Syncing the base branch
 
-Sync it from **both** remotes before starting new work. The maintainer may have merged PRs on
-your fork (`origin`) or pushed changes to GitHub (`upstream`).
+Sync it from **both** remotes before starting new work and before landing. Other sessions may
+have landed PRs on your fork (`origin`); the maintainer may have collected your work or
+pushed changes to GitHub (`upstream`).
 
-This flow runs **in the primary clone only** — the single-session / repo-watch surface. In a
-parallel worktree session, sync your own branch instead (see "Parallel sessions" below) and
-never check out the base branch.
+This flow runs **in the primary clone**, which is always checked out on `{{BASE_BRANCH}}` —
+it is the only git operation you run there yourself. Your own work never happens there (see
+"Worktrees (rs-wt) — every unit of work" below).
 
 ```bash
 git checkout {{BASE_BRANCH}}
-git pull origin {{BASE_BRANCH}}            # Get PRs the maintainer merged on your fork
+git fetch origin
+git rebase origin/{{BASE_BRANCH}}        # catch up with landings on your fork; also repairs a sync that did not finish
 git fetch upstream
-git merge upstream/{{BASE_BRANCH}}         # Get changes from the real GitHub repo
-git push origin {{BASE_BRANCH}}            # Keep your fork up to date
+git rebase upstream/{{BASE_BRANCH}}      # your base is always a straight line on top of the mirror
+git push --force-with-lease --force-if-includes origin {{BASE_BRANCH}}
 ```
 
-If that merge fast-forwards cleanly, carry on — nothing was overwritten and there is nothing
-to decide.
+Read the outcome before you carry on:
 
-### When upstream has diverged: STOP and ask
+- **Up to date** — nothing moved; the rebases and the push do nothing.
+- **Catching up with your fork** — other sessions landed work, or a previous sync did not
+  finish: the first rebase brings you level.
+- **Your collected copies dropped** — the maintainer collected your landed work, so the
+  mirror carries it under new commit ids; the second rebase drops your copies and replays
+  only what is not collected yet. This is the normal steady state after every collection,
+  not a fault — say so in one line in your report.
+- **A conflict at the first rebase** (onto your fork): `git rebase --skip`. Everything it can
+  skip already exists on your fork or on the mirror, and the second rebase re-attaches you to
+  the real commits (a conflict may then reappear there).
+- **A conflict at the second rebase** (onto the mirror): the maintainer changed something you
+  also touched. Keep the maintainer's version (during a rebase `--ours` is the mirror's side),
+  re-apply yours on top, `git rebase --continue`. When keeping the maintainer's version leaves
+  nothing of yours to re-apply, the commit was already collected (squashed together with
+  others) — `git rebase --skip` it.
+- **The push refused** — someone landed work while you were syncing: run the block again from
+  the top.
 
-If the merge does **not** fast-forward — conflicts, or `upstream/{{BASE_BRANCH}}` has moved in
-a way that does not simply replay on top of your base — stop and ask the maintainer.
+### Your base branch is a straight line on top of the mirror
 
-```bash
-git merge --abort
-```
+The mirror (`upstream`) is the maintainer's repo and it is sacred: you cannot push to it, and
+you never resolve a conflict by changing what the maintainer has. Your fork's base branch is
+yours to rewrite, and the rebases above are how it moves — it must always follow from the
+mirror's head with no merge commits. **Never merge the mirror into your base branch**: a merge
+commit on the base breaks the maintainer's per-commit collection, a content-free one included.
 
-Then comment on the issue saying what diverged (which branch, roughly what changed) and wait
-for the maintainer to tell you how to proceed.
+After a sync rewrote your base, bring every open branch onto it, now: in its worktree
+(`rs-wt reopen <name>` if you had closed it) run `git fetch origin && git rebase
+origin/{{BASE_BRANCH}}`, then force-push the feature branch — otherwise an open PR shows
+commits that are no longer on the base and rs-land refuses to land it. Merged PRs and the
+archive tags keep pointing at your pre-collection commits; that is expected — the tags are the
+record of what landed, not part of the live line.
 
-**Never resolve this on your own.** Do not `reset --hard`, do not force-push, do not rebase
-your base branch to make the problem go away. Your own merged work may live on this branch,
-and discarding it can destroy work the maintainer has not collected yet. Waiting costs
-nothing; guessing can lose commits.
+**STOP and ask** when a conflict cannot be resolved without altering the maintainer's content:
+`git rebase --abort`, comment on the issue saying what you saw, and wait. Do not `reset --hard`
+to something else, do not merge the mirror in, do not guess. Waiting costs nothing; guessing
+can lose commits.
 
 ### Branches
 
 - **Use the `agent/` prefix** for new feature branches: `agent/add-auth`, `agent/fix-parser`.
   This is a naming convention that keeps your in-progress work easy to spot — not a
   restriction.
-- **You may check out and work on any existing branch** in the repo — in the primary clone,
-  when you are the only session there; a parallel worktree session stays on its own branch.
+- **Never move the primary clone off `{{BASE_BRANCH}}`** — hard rule, see "Worktrees" below.
+  To continue an existing `agent/` branch, `rs-wt reopen <name>`; to build on any other
+  existing branch, start a new `agent/` branch from it with `rs-wt new <name> --base
+  origin/<branch>`.
 - **Keep every branch with an open PR rebased onto the current `{{BASE_BRANCH}}`** as part
   of normal work — when something else lands on the base branch, rebase your open PR
-  branches onto it and force-push them (never the base branch), so review always looks at
+  branches onto it and force-push them (the base branch moves only through the sync above),
+  so review always looks at
   work sitting on the current base.
 - **Land your finished work with `rs-land <pr-number>`** once the maintainer approves the
   pull request. One command does the whole landing: it merges fast-forward-only, tags what
   landed as `<pr>-<feature>` (the branch name without its `agent/` prefix — the durable
   record of what landed), and deletes the branch. It refuses rather than repairs — if it
   refuses because the base branch moved, rebase your branch onto `{{BASE_BRANCH}}`,
-  force-push the feature branch (never the base branch), and run it again; if that rebase
+  force-push the feature branch (the base branch moves only through the sync above), and run
+  it again; if that rebase
   had conflicts, describe the resolution in a PR comment and ask for a fresh review before
   landing. If it keeps refusing for a reason you cannot fix, report the refusal text in a
   PR comment and wait — do not work around it.
@@ -98,18 +130,30 @@ nothing; guessing can lose commits.
   work commit by commit, so a clean, linear sequence of well-scoped commits matters — not
   just the final diff.
 
-## Parallel sessions (rs-wt worktrees)
+## Worktrees (rs-wt) — every unit of work
 
-When several agent sessions work this repo at once, each session gets its own git worktree —
-a private checkout with its own branch. The primary clone at `/workspace/<repo>` is the
-integration tree (repo-watch and single-session work happen there); parallel sessions never
-touch it. Some projects make worktrees mandatory for every unit of work, single-session
-included — if the project's instructions say so, that rule wins (see "Instruction
-precedence").
+Every unit of work — a feature, a fix, a review follow-up, whether you are the only session
+or one of several — happens in its own git worktree with its own `agent/` branch. Worktrees
+are mandatory for every unit of work, not only when sessions run in parallel. The primary
+clone at `/workspace/<repo>` is the integration tree: it stays checked out on
+`{{BASE_BRANCH}}`, the base-branch sync runs there, and nothing else does. Two things ARE fine
+in the primary clone, because they never move its HEAD: editing files git ignores (a
+project's own notes and plans usually live there and never reach a worktree — `git worktree
+add` checks out tracked files only), and running project-level commands that pin the clone's
+path (a compose stack, a data directory) — build from the worktree, run from the clone.
 
+- **Never change the branch checked out in the primary clone.** The only checkout that ever
+  runs there is `git checkout {{BASE_BRANCH}}` — the sync's first line, or putting the clone
+  back. No `git checkout <other branch>`, no `git switch`, no `git checkout -b` there — not to
+  preview a PR, not to run branch code, not because another section seems to allow it.
+  Path-level checkouts while resolving a rebase (`git checkout --ours -- <file>`) restore
+  files and do not move the branch — those are fine. Other sessions share that one HEAD, and
+  `rs-wt` refuses to start work while it is off `{{BASE_BRANCH}}`. If you find it on another
+  branch, put it back and say so.
 - **Start:** `rs-wt new <name>` (short, feature-shaped name). It creates branch
-  `agent/<name>` from `origin/{{BASE_BRANCH}}` and prints your worktree path
-  (`/workspace/wt/<name>`). `cd` there; ALL your work happens under that path.
+  `agent/<name>` from `origin/{{BASE_BRANCH}}` — the base comes from the project's wiring;
+  pass `--base <ref>` only when the maintainer named a different branch — and prints your
+  worktree path (`/workspace/wt/<name>`). `cd` there; ALL your work happens under that path.
 - **Own your tree only.** Never edit files in the primary clone or another session's
   worktree, and never check out the base branch — it stays checked out in the primary clone.
 - **Sync inside a worktree:** `git fetch origin`, then `git rebase origin/{{BASE_BRANCH}}` on
@@ -158,6 +202,13 @@ zero when fixed), and verify it on both the base branch and your branch before p
 - Keep changes focused. One branch per task.
 - If unsure about an approach, create the branch, push what you have, and note the
   uncertainty in the commit message. The maintainer will review.
+- **Ask questions in plain text**, in your reply, with the options and your recommendation —
+  never through the runtime's question-popup tool. The maintainer reads this tab
+  intermittently; a popup times out unanswered and the work stalls.
+- **Never write the runtime's memory files** (`~/.claude/projects/<…>/memory/`, `MEMORY.md`).
+  On a dev box that directory is discarded at every re-run; on a supervisor it survives, but
+  nobody reads it. Durable notes go where the maintainer reads them: the project's own
+  instruction and plan files.
 
 ## Gitea API
 
@@ -183,3 +234,15 @@ rs-fetch <repo-name> --pr <N>
 Use the real repo name and the PR number Gitea returned when you opened the PR.
 The code block matters: Gitea renders it with a copy button, so the maintainer
 copies it in one click. Never invent a different command shape.
+
+**Mirror your plans and bug records to Gitea.** The maintainer reads the Gitea board, not
+your container's filesystem. Every plan you write for them and every bug you record in the
+project's ledger is duplicated as a Gitea issue: title = the plan's name, or the bug's stable
+code plus its one-line symptom; body = the file's text verbatim. The file in the repo is
+authoritative and the issue is its mirror — re-sync the body when the entry changes, and
+close the issue naming the PR when the work lands. Never keep only one of the two.
+
+**Never hard-wrap prose in issues, PR bodies or comments.** Gitea renders a single newline as
+a line break, so a paragraph wrapped at 80 columns is shredded on the board. One paragraph is
+one line; separate paragraphs with a blank line (lists, tables and fenced code keep their own
+lines).

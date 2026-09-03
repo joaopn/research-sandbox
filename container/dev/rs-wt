@@ -1,11 +1,20 @@
 #!/opt/conda/bin/python
-"""rs-wt — parallel per-session git worktrees for a dev-lane clone.
+"""rs-wt — one git worktree per unit of work for a dev-lane clone.
 
-One interactive agent session = one worktree + one agent/<name> branch, so N
-sessions can work the SAME repo in one container without tripping over each
-other's checkout, index, or working files. The primary clone at
-/workspace/<repo> stays the integration tree (repo-watch / single-session
-work); parallel sessions live under /workspace/wt/<name>.
+Every unit of work = one worktree + one agent/<name> branch, so N sessions can
+work the SAME repo in one container without tripping over each other's
+checkout, index, or working files. The primary clone at /workspace/<repo> is
+the integration tree: it stays checked out on the base branch (the base-branch
+sync runs there and nothing else does); all work lives under /workspace/wt/<name>.
+
+Primary-clone guard: `new` and `reopen` REFUSE while the primary clone is not
+checked out on the base branch (other sessions share that one HEAD; a moved
+clone once silently re-based every other session's new tree), `list` warns,
+`done` is ungated so cleanup always works. The base branch comes from the dev
+wiring — GITEA_BRANCH in a dev box's env, else the agent_user-bearing row of
+/workspace/.orchestrator/dev-gitea.json on a dev project's supervisor (the
+rs-repo-watch / rs-land resolution) — never from the clone's HEAD; --base
+overrides the default base only, never the guard.
 
 Verbs:
   new <name> [--base REF]  create branch agent/<name> + its worktree
@@ -29,6 +38,8 @@ it cannot import cli/ modules — the constants below carry their locksteps.
 """
 
 import argparse
+import json
+import os
 import re
 import subprocess
 import sys
@@ -61,6 +72,14 @@ NAME_MAX = _BRANCH_NAME_MAX - len(BRANCH_PREFIX)
 # The rscore._valid_branch_name shape minus "/" — the name doubles as a
 # directory name under WT_ROOT, so path separators are out.
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+# The dev wiring the host stages into a dev PROJECT's supervisor
+# (rscore._stage_dev_gitea). Joined onto WORKSPACE at CALL time, never at
+# import: the unit fixture re-points WORKSPACE after import. A dev BOX has no
+# such file — its wiring is container env (BASE_BRANCH_ENV, emitted by
+# rs_sandbox at docker run).
+DEV_GITEA_JSON = ".orchestrator/dev-gitea.json"
+BASE_BRANCH_ENV = "GITEA_BRANCH"
 
 
 def die(msg: str) -> None:
@@ -166,22 +185,73 @@ def worktree_map(repo: Path) -> dict:
     return out
 
 
-def resolve_base(repo: Path, explicit: str) -> str:
-    """Default base = the primary clone's checked-out branch — that is the
-    spawn-time resolved base by construction (the clone is created checked out
-    on it), and it tracks a maintainer redirect while origin/HEAD does not
-    (`clone --branch X` never repoints origin/HEAD). Prefer the fork's state
-    of that branch when the remote-tracking ref exists."""
-    if explicit:
-        return explicit
+def wiring_base() -> str:
+    """The base branch from the dev wiring, or "" when there is none. Box arm:
+    GITEA_BRANCH is container env. Project arm: the agent_user-bearing row of
+    the staged dev-gitea.json — rows without agent_user are box-only repos,
+    OTHER containers' wiring (the rs-repo-watch / rs-land row rule; at most
+    one row bears agent_user). `or ""` on the field is load-bearing: a bare
+    .get() hands back None for a row staged before the branch field existed.
+    Never dies — the callers decide what an empty base means."""
+    env = (os.environ.get(BASE_BRANCH_ENV) or "").strip()
+    if env:
+        return env
+    path = WORKSPACE / DEV_GITEA_JSON
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return ""
+    rows = [r for r in (data.get("repos") or [])
+            if isinstance(r, dict) and r.get("repo") and r.get("agent_user")]
+    if not rows:
+        return ""
+    return (rows[0].get("branch") or "").strip()
+
+
+def wiring_sources() -> str:
+    """The two places a base branch could have come from, for messages."""
+    return (f"no {BASE_BRANCH_ENV} in the environment, no branch in "
+            f"{WORKSPACE / DEV_GITEA_JSON}")
+
+
+def require_primary_on_base(repo: Path, base: str) -> None:
+    """The primary clone must be checked out on the base branch: other
+    sessions share that one HEAD, and the base-branch sync runs there. Arms,
+    in order: detached -> die; no wiring -> warn and return (the CALLERS
+    decide when that arm is reachable: `new` only with an explicit --base,
+    `reopen` always); off-base -> die with the remedy; on-base -> return."""
     r = git(repo, "symbolic-ref", "--short", "HEAD")
     if r.returncode != 0:
-        die("primary clone is detached; pass --base <ref>")
+        die(f"primary clone {repo} is detached — check it out on "
+            f"{base or 'the base branch'} (`git -C {repo} checkout "
+            f"{base or '<base>'}`) and re-run")
     head = r.stdout.strip()
+    if not base:
+        warn(f"cannot verify the primary clone is on the base branch "
+             f"({wiring_sources()})")
+        return
+    if head != base:
+        die(f"primary clone {repo} is on '{head}', not the base branch "
+            f"'{base}'. The primary clone never leaves the base branch: other "
+            f"sessions share that one HEAD, and the base-branch sync runs "
+            f"there. Commit or move your work to a worktree, then put it back "
+            f"(`git -C {repo} checkout {base}`) and re-run")
+
+
+def resolve_base(repo: Path, explicit: str, base: str) -> str:
+    """The ref a new tree branches from: --base wins; else the wiring base,
+    preferring the fork's state of it (origin/<base>) when the remote-tracking
+    ref exists. HEAD is NOT a source any more — a moved primary clone used to
+    re-base every new tree silently; the guard reads HEAD, this does not."""
+    if explicit:
+        return explicit
+    if not base:
+        die(f"cannot resolve the base branch ({wiring_sources()}); pass "
+            f"--base <ref>")
     if git(repo, "rev-parse", "--verify", "--quiet",
-           f"refs/remotes/origin/{head}").returncode == 0:
-        return f"origin/{head}"
-    return head
+           f"refs/remotes/origin/{base}").returncode == 0:
+        return f"origin/{base}"
+    return base
 
 
 def cmd_new(args) -> None:
@@ -197,6 +267,15 @@ def cmd_new(args) -> None:
     if branch_exists(repo, branch):
         die(f"branch {branch!r} already exists — `rs-wt reopen {args.name}` "
             f"resumes it; pick another name for fresh work")
+    # Wiring + the primary-clone guard BEFORE the fetch: a refusal leaves zero
+    # side effects. The no-wiring/no-flag arm dies HERE (with the --base
+    # remedy), so the guard's empty-base warn arm is reachable from `new`
+    # only with an explicit --base.
+    wb = wiring_base()
+    if not wb and not args.base:
+        die(f"cannot resolve the base branch ({wiring_sources()}); pass "
+            f"--base <ref>")
+    require_primary_on_base(repo, wb)
     # Freshness is best-effort: gitea may be stopped (the offline posture) —
     # branch from the last-known refs rather than failing the session start.
     r = git(repo, "fetch", "origin", "--prune")
@@ -204,7 +283,7 @@ def cmd_new(args) -> None:
         warn(f"`git fetch origin` failed "
              f"({(r.stderr or r.stdout).strip() or 'no detail'}); branching "
              f"from the last-known refs")
-    base = resolve_base(repo, args.base)
+    base = resolve_base(repo, args.base, wb)
     WT_ROOT.mkdir(parents=True, exist_ok=True)
     r = git(repo, "worktree", "add", "-b", branch, str(path), base)
     if r.returncode != 0:
@@ -225,6 +304,10 @@ def cmd_reopen(args) -> None:
     if not branch_exists(repo, branch):
         die(f"no branch {branch!r} to reopen — `rs-wt new {args.name}` "
             f"starts fresh")
+    # The primary-clone guard before any mutation (the prune below). No
+    # wiring -> the guard warns and reopen proceeds: it needs no base to
+    # compute and has no --base to offer as a remedy.
+    require_primary_on_base(repo, wiring_base())
     wts = worktree_map(repo)
     if str(path) in wts:
         if path.exists():
@@ -255,6 +338,12 @@ def cmd_list(args) -> None:
     r = git(repo, "symbolic-ref", "--short", "HEAD")
     head = r.stdout.strip() if r.returncode == 0 else "(detached)"
     print(f"primary: {repo}  [{head}]")
+    # A diagnostic, never a refusal: name the violation and the remedy.
+    wb = wiring_base()
+    if wb and head != wb:
+        print(f"warning: primary clone is on '{head}', not the base branch "
+              f"'{wb}' — put it back (`git -C {repo} checkout {wb}`); "
+              f"`rs-wt new` and `rs-wt reopen` refuse until then")
     wts = worktree_map(repo)
     prefix = str(WT_ROOT) + "/"
     open_branches = set()
@@ -348,16 +437,18 @@ def cmd_done(args) -> None:
 def main(argv=None) -> None:
     p = argparse.ArgumentParser(
         prog="rs-wt",
-        description="Parallel per-session git worktrees for the dev-lane "
-                    "clone (one session = one tree + one agent/<name> "
-                    "branch). Never deletes branches.")
+        description="One git worktree per unit of work for the dev-lane "
+                    "clone (one unit of work = one tree + one agent/<name> "
+                    "branch; the primary clone stays on the base branch). "
+                    "Never deletes branches.")
     sub = p.add_subparsers(dest="verb", required=True)
     n = sub.add_parser("new", help="create branch agent/<name> + its worktree")
     n.add_argument("name", help="session/feature name (also the dir name "
                                 "under /workspace/wt/)")
     n.add_argument("--base", default="",
-                   help="ref to branch from (default: origin/<the primary "
-                        "clone's checked-out branch>)")
+                   help="ref to branch from (default: origin/<the base branch "
+                        "from the dev wiring>); never bypasses the "
+                        "primary-clone guard")
     n.set_defaults(func=cmd_new)
     ro = sub.add_parser("reopen",
                         help="re-attach a worktree to an existing "
