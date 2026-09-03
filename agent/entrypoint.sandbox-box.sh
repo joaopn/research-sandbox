@@ -83,10 +83,14 @@ echo "${RS_SANDBOX_NAME}" > ~/.rs-role
 
 # bypassPermissions so an in-box `claude` doesn't prompt (the container is the
 # security boundary). Crucially NO `hooks` key — the artifact-contract gate is
-# deliberately absent here, unlike rs-pi-base.
+# deliberately absent here, unlike rs-pi-base. The `attribution` block switches
+# git/PR attribution OFF (co-author trailer, PR footer, AND the private session
+# link — three keys; rationale at rscore._AGENT_SETTINGS_JSON). This printf, that
+# constant, and the supervisor setup.sh heredoc are a three-writer mirror,
+# pytest-pinned; keep the JSON on ONE line (the pin json-loads it off this line).
 mkdir -p ~/.claude
 if [[ ! -f ~/.claude/settings.json ]]; then
-    printf '%s\n' '{"permissions": {"defaultMode": "bypassPermissions"}, "theme": "dark", "env": {"CLAUDE_CODE_DISABLE_MOUSE_CLICKS": "1"}}' \
+    printf '%s\n' '{"permissions": {"defaultMode": "bypassPermissions"}, "theme": "dark", "env": {"CLAUDE_CODE_DISABLE_MOUSE_CLICKS": "1"}, "attribution": {"commit": "", "pr": "", "sessionUrl": false}}' \
         > ~/.claude/settings.json
 fi
 

@@ -140,8 +140,15 @@ HEX_DIGITS = set("0123456789abcdefABCDEF")
 # real repo's issue of the same number ("Fixes #3" closes real issue #3 on
 # push), and authorship trailers assert the very authorship this fetch exists
 # to erase. Scope is the PI-decided STANDARD scrub:
-#   * Co-authored-by / Signed-off-by trailer LINES are DROPPED — they ARE
-#     authorship. Case-INSENSITIVE: GitHub's own UI emits "Co-authored-by".
+#   * Co-authored-by / Signed-off-by / Claude-Session trailer LINES are
+#     DROPPED — the first two ARE authorship; the third (Claude Code's
+#     `Claude-Session: https://claude.ai/code/session_…`) links the agent's
+#     PRIVATE conversation and must never reach a public history. Dropped as
+#     trailer LINES (git/GitHub key on the trailer form; a mid-sentence
+#     mention stays) — not a URL-substring hunt. Case-INSENSITIVE: GitHub's
+#     own UI emits "Co-authored-by". The agent runtime is configured not to
+#     write any of these (the dist settings' attribution block); this is the
+#     collection-side backstop for an overridden or pre-fix container.
 #   * All three GitHub auto-close forms are NEUTRALIZED by breaking the
 #     keyword-reference adjacency GitHub requires, keeping the reference
 #     readable. Rewrite outputs:
@@ -153,8 +160,9 @@ HEX_DIGITS = set("0123456789abcdefABCDEF")
 #   * @mentions are deliberately NOT touched (PI decision: a bare @name only
 #     pings if it happens to match a real GitHub account, and stripping
 #     mangles emails and decorators).
-_TRAILER_RE = re.compile(r"^\s*(?:co-authored-by|signed-off-by)\s*:.*$",
-                         re.IGNORECASE | re.MULTILINE)
+_TRAILER_RE = re.compile(
+    r"^\s*(?:co-authored-by|signed-off-by|claude-session)\s*:.*$",
+    re.IGNORECASE | re.MULTILINE)
 # GitHub's close-keyword vocabulary (close/fix/resolve + tenses), an optional
 # colon, then one of the three reference forms. Alternation order matters:
 # URL, then owner/repo#N, then bare #N (the specific before the general).

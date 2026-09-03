@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # Claude Code configuration — sourced by entrypoint.supervisor.sh on first boot.
-# Sets bypassPermissions so Claude Code never prompts. Credentials are NOT
-# staged here — the user authenticates once per project via VSCode CC
-# extension OAuth or `claude` in byobu.
+# Sets bypassPermissions so Claude Code never prompts, and switches git/PR
+# attribution OFF (co-author trailer, PR footer, AND the private session link —
+# three keys, the session link is a separate switch; see the rationale at
+# rscore._AGENT_SETTINGS_JSON). This heredoc, that constant, and the sandbox-box
+# entrypoint's printf fallback are a three-writer mirror, pytest-pinned; this
+# one alone adds the rs-audit-stop Stop hook. Credentials are NOT staged here —
+# the user authenticates once per project via VSCode CC extension OAuth or
+# `claude` in byobu.
 
 # Ensure ~/.local/bin is on PATH (Claude Code installs there).
 if ! grep -q '.local/bin' ~/.bashrc 2>/dev/null; then
@@ -20,6 +25,11 @@ if [[ ! -f ~/.claude/settings.json ]]; then
   "theme": "dark",
   "env": {
     "CLAUDE_CODE_DISABLE_MOUSE_CLICKS": "1"
+  },
+  "attribution": {
+    "commit": "",
+    "pr": "",
+    "sessionUrl": false
   },
   "hooks": {
     "Stop": [

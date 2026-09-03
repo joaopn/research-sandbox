@@ -4274,9 +4274,26 @@ _AGENT_ERR_TAIL = 2000
 # MINUS hooks; keep the two in sync. The env block disables the TUI's click/drag
 # mouse capture (Claude Code ≥2.1.150 captures the mouse and breaks native
 # terminal text selection; wheel scroll stays).
+# The `attribution` block switches OFF every git/PR attribution the agent would
+# otherwise add: the `Co-Authored-By: Claude …` commit trailer (`commit: ""` —
+# an empty string hides the text), the "Generated with Claude Code" PR-body
+# footer (`pr: ""`), AND the `Claude-Session: <url>` trailer + PR-body link
+# (`sessionUrl: false`). THREE keys are load-bearing: the session link is a
+# SEPARATE switch in the binary — `commit: ""` alone still yields a bare
+# `Claude-Session:` line, and the deprecated `includeCoAuthoredBy: false` never
+# touches it. Verified against the pinned 2.1.258 dist. The session link is
+# emitted only by remote/bridge-driven sessions (the field-reported trailer on a
+# public commit came from one); `sessionUrl: false` cuts it before that branch.
+# Disabling also flips the binary's own system-prompt line to "do not add
+# attribution lines", so the model is told as well as the git plumbing. The
+# dev lane's collection scrub (cli/rs_fetch.py) and the reviewer's attribution
+# criterion are the backstops for an overridden or pre-fix container. This is
+# one of THREE writers (setup.sh heredoc, the sandbox-box entrypoint printf) —
+# pytest-pinned as a lockstep.
 _AGENT_SETTINGS_JSON = json.dumps(
     {"permissions": {"defaultMode": "bypassPermissions"}, "theme": "dark",
-     "env": {"CLAUDE_CODE_DISABLE_MOUSE_CLICKS": "1"}},
+     "env": {"CLAUDE_CODE_DISABLE_MOUSE_CLICKS": "1"},
+     "attribution": {"commit": "", "pr": "", "sessionUrl": False}},
     indent=2) + "\n"
 
 
@@ -10266,7 +10283,11 @@ _REVIEW_GATE_POLL_S = 0.2
 # The PR body is agent-authored metadata embedded in the prompt as untrusted
 # context; the DIFF is the review subject. Uncapped, a long PR body competes
 # with the diff for context; at 10x this it would dominate it. Truncation is
-# marked in the prompt.
+# marked in the prompt. The same cap bounds a COMMIT review's full message, and
+# it cuts the TAIL — git trailers ARE the tail, so a >4000-char agent message
+# hides an attribution / session-link trailer from the reviewer's attribution
+# criterion (the second net; the rs-fetch collection scrub, the first net, is
+# unaffected). Accepted: raising it is a deliberate edit, not a bug.
 REVIEW_PR_BODY_MAX_CHARS = 4000
 # Bounded tail of the reviewer's raw stdout/stderr printed to the HOST-ONLY
 # full log on failure. Not a new magic number: it NAMES the literal the

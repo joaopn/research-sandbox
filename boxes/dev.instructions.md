@@ -125,6 +125,10 @@ can lose commits.
   landing. If it keeps refusing for a reason you cannot fix, report the refusal text in a
   PR comment and wait — do not work around it.
 - **Commit often locally**, with small commits and clear messages.
+- **No attribution lines.** Never add a co-author trailer, an AI-generated footer, or a
+  session link to a commit message or a PR description — the maintainer's repository carries
+  no agent attribution, and a session link is a private URL. Your runtime is configured not
+  to add them; if one appears anyway, remove it before pushing.
 - **Push when you finish a logical chunk of work** — a completed task or milestone, before a
   risky operation, or when you want the maintainer to review. The maintainer collects your
   work commit by commit, so a clean, linear sequence of well-scoped commits matters — not
