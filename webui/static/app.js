@@ -3026,7 +3026,7 @@ function buildDevRepoCard(view, body, r, attached, opts) {
             class: "btn-small btn-danger",
             title: blocker
                 ? `Can't remove — ${blocker}. Delete the dev project or box first.`
-                : "Delete this repo's mirror and its retired forks",
+                : "Delete this repo's mirror, its retired forks and their identities",
         }, ["Remove"]);
         remove.disabled = !!blocker;
         remove.onclick = () => devRepoRemoveDialog(view, body, r.repo);
@@ -3328,7 +3328,10 @@ function devPurgeIdentityDialog(view, body, user, repos) {
 }
 
 // Delete a finished repo: its gitea mirror + every retired agent fork (history
-// included) + their tokens + the host stamp. STEP-UP gated like destroy and
+// included) + the retired identities that own them (their gitea users — the
+// purge that frees a project/box name; an identity another project still
+// records, or that owns something else, is kept with a warning) + the tokens of
+// identities nothing else uses + the host stamp. STEP-UP gated like destroy and
 // box-remove — a stolen session cookie must not suffice. The broker re-verifies
 // the fork state and refuses on a live fork (and fails closed if it cannot read
 // it), so this dialog's own disable is only an affordance.
@@ -3343,9 +3346,11 @@ function devRepoRemoveDialog(view, body, repo) {
         body: [
             el("p", {}, [
                 `This deletes "${repo}" from Gitea: the mirror, every retired `
-                + "agent fork (including its commit history), their tokens, and "
-                + "the local record. It cannot be undone. The GitHub original is "
-                + "untouched.",
+                + "agent fork (including its commit history), the retired agent "
+                + "identities that own them (which frees their project or box "
+                + "names for reuse), the tokens of identities nothing else uses, "
+                + "and the local record. It cannot be undone. The GitHub original "
+                + "is untouched.",
             ]),
             el("div", { class: "field" }, [
                 el("label", {}, ["Re-enter your master password"]), pwI,

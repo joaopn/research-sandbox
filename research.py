@@ -1814,8 +1814,11 @@ def cmd_dev_repo_add(args: argparse.Namespace) -> None:
 
 def cmd_dev_repo_remove(args: argparse.Namespace) -> None:
     req = _build(rscore.DevRepoRemoveRequest, repo=args.repo)
-    _call(rscore.dev_repo_remove, req)
-    print(f"removed {args.repo} (mirror + consumer forks; agent users stay inert)")
+    res = _call(rscore.dev_repo_remove, req)
+    purged = list(getattr(res, "purged_users", None) or [])
+    tail = (f"identities purged: {', '.join(purged)}" if purged
+            else "no identities purged")
+    print(f"removed {args.repo} (mirror + retired agent forks; {tail})")
 
 
 def cmd_dev_fork_list(_args: argparse.Namespace) -> None:
@@ -1858,9 +1861,11 @@ def cmd_dev_fork_purge(args: argparse.Namespace) -> None:
     forks is still live.
 
     This is also the ONLY surface that reaches an identity with no fork left
-    (a removed repo, or a create that died before its fork existed): the
-    Development page lists retired identities by their forks, so those have no
-    row to click."""
+    (a create that died before its fork existed, or an owner a mirror Remove
+    had to keep because it owned something else): the Development page lists
+    retired identities by their forks, so those have no row to click. A plain
+    mirror Remove no longer manufactures them — it purges the fully retired
+    owners of the forks it deletes."""
     req = _build(rscore.DevPurgeConsumerRequest, user=args.user)
     res = _call(rscore.dev_purge_consumer, req)
     # Three outcomes, not two: an empty `repos` means "already gone" OR "existed

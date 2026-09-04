@@ -2229,6 +2229,10 @@ class DevRepoAddResult:
 @dataclass
 class DevRepoRemoveResult:
     repo: str
+    # Retired identities (gitea users) deleted with their forks — the names
+    # freed for reuse. Empty when every owner was kept (still recorded by a
+    # project, or owning something else) or none existed.
+    purged_users: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -7631,26 +7635,65 @@ def _refuse_retired_identity(user: str) -> None:
     built yet.
 
     The message is BROWSER-REACHABLE (ValidationError text reaches the op tail
-    verbatim), so: no CLI verb, and no promise that the purge is one click away
-    — an identity with no fork left is not listed on the Development page at
-    all, which is why 'a different name' is offered as an equal remedy rather
-    than a fallback. It also must not imply purging is immediately available
-    for a STILL-ATTACHED project: there the real sequence is detach, purge,
-    attach, and the purge verb's ledger gate correctly refuses until then."""
+    verbatim), so: no CLI verb anywhere in it. It classifies the identity by
+    what it OWNS (user_repos — the same strict read the purge gate uses),
+    because the Development page lists a retired identity ONLY through an
+    archived fork it owns. Three states, three remedies, none of them a lie:
+      * archived fork(s) only — the page shows a Purge row under each of those
+        repos: point at them by name.
+      * a LIVE fork — the create-crashed-after-fork orphan (B52): no row (the
+        page lists archived forks only) and the purge verb refuses a live
+        fork, so the honest route is archive-in-the-Gitea-tab, THEN the page.
+      * nothing at all — the create-crashed-before-fork orphan (B52): no row
+        anywhere; the browser route is Site Administration in the Gitea tab.
+    A classification failure falls back to the generic text: the refusal is
+    still correct, only the pointer degrades. 'A different name' is an equal
+    remedy in every arm, never a fallback, and no arm implies purging is
+    immediate for a STILL-ATTACHED project (there the sequence is detach,
+    purge, attach, and the purge verb's ledger gate refuses until then)."""
+    host_port = _gitea_host_port()
     try:
-        retired = gitea.retired_identity(_gitea_host_port(), user)
+        retired = gitea.retired_identity(host_port, user)
     except gitea.GiteaError as e:
         # Could not VERIFY — never silently proceed into the opaque mint
         # failure this exists to replace.
         raise ValidationError(
             f"could not check the dev identity {user!r} against Gitea: {e}")
-    if retired:
-        raise ValidationError(
-            f"the dev identity {user!r} still exists in Gitea from an earlier "
+    if not retired:
+        return
+    head = (f"the dev identity {user!r} still exists in Gitea from an earlier "
             f"project or box of this name, and its access token cannot be "
-            f"reissued. Purge that retired identity from the Development page "
-            f"(it is listed under its repo while it still has a fork), or use "
-            f"a different name")
+            f"reissued. ")
+    try:
+        owned = gitea.user_repos(host_port, user)
+    except gitea.GiteaError:
+        owned = None
+    if owned is None:
+        raise ValidationError(
+            head + "Purge that retired identity from the Development page (it "
+            "is listed under its repo while it still has a fork), or use a "
+            "different name")
+    # A malformed row carries an empty name (user_repos emits `name or ""`);
+    # never print "listed under , X".
+    live = sorted(r["repo"] for r in owned
+                  if r.get("repo") and not r.get("archived"))
+    archived = sorted(r["repo"] for r in owned
+                      if r.get("repo") and r.get("archived"))
+    if live:
+        raise ValidationError(
+            head + f"It still holds a live fork of {', '.join(live)} — archive "
+            f"that fork in the Gitea tab (if no project is still working it), "
+            f"then purge the identity from the Development page, where it "
+            f"appears once archived; or use a different name")
+    if archived:
+        raise ValidationError(
+            head + f"Purge that retired identity from the Development page — "
+            f"it is listed under {', '.join(archived)} — or use a different "
+            f"name")
+    raise ValidationError(
+        head + "It holds no fork, so it is not shown on the Development page; "
+        "delete the user under Site Administration in the Gitea tab, or use a "
+        "different name")
 
 
 def _run_dev_clone(container: str, repo: str, user: str, branch: str,
@@ -9742,9 +9785,15 @@ def dev_repo_add(req: "DevRepoAddRequest", _progress=None) -> DevRepoAddResult: 
 
 
 def dev_repo_remove(req: "DevRepoRemoveRequest", progress=None) -> DevRepoRemoveResult:  # type: ignore[name-defined]
-    """Delete the mirror + best-effort every consumer fork (repos only — agent
-    USERS stay inert; gitea purges a deleted user's repos) + the forks' token
-    files + the mirror stamp.
+    """Delete the mirror + best-effort every consumer fork + the gitea USER
+    (and host token) of every fork owner that is FULLY retired — nothing in
+    the attachment ledger records it and it owns nothing else once its fork is
+    gone — + the mirror stamp. An owner some project still records (the B53
+    name-collision edge: two consumers on one gitea username, one shared token
+    file) keeps both its token and its user, with a warning. The purge is what
+    frees the project/box name: a retired identity is visible on the
+    Development page only through an archived fork, so deleting the fork while
+    keeping the user used to leave an invisible blocker (B52).
 
     TWO refusals, in order:
       1. The LEDGER check (a local file read — no gitea needed): a project is
@@ -9781,12 +9830,16 @@ def dev_repo_remove(req: "DevRepoRemoveRequest", progress=None) -> DevRepoRemove
             f"{', '.join(live)}. Delete the dev project or box that owns the "
             f"work first (retiring it archives the fork), or archive the fork "
             f"in the Gitea tab if it is orphaned.")
-    progress.step("delete", "deleting the mirror and its retired forks")
+    # Milestone KEY "delete" is read by the archived remove harness; only the
+    # message changed.
+    progress.step("delete",
+                  "deleting the mirror, its retired forks and their identities")
     try:
-        gitea.remove_repo(host_port, req.repo)
+        # `or []`: an archived stub returns None here; the CLI joins the list.
+        purged = gitea.remove_repo(host_port, req.repo) or []
     except gitea.GiteaError as e:
         raise ValidationError(str(e))
-    return DevRepoRemoveResult(repo=req.repo)
+    return DevRepoRemoveResult(repo=req.repo, purged_users=list(purged))
 
 
 def dev_repo_list(_req: "DevRepoListRequest", _progress=None) -> DevRepoListResult:  # type: ignore[name-defined]

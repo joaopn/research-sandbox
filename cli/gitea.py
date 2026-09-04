@@ -668,11 +668,13 @@ def _mint_token(username: str, scopes: str) -> str:
     # re-mint. There is NO admin-side delete for another user's token (gitea
     # gates /users/{u}/tokens behind reqBasicAuth AS that user; Sudo does not
     # bypass it and the admin CLI has no delete subcommand), and consumer
-    # retirement never deletes users — so nothing clears it automatically.
-    # That is why reusing a retired identity is REFUSED early (retired_identity,
-    # checked by create/box_add/dev_attach) and freeing the name means purging
-    # the whole user (purge_consumer): the callers keep this function from ever
-    # meeting a surviving token.
+    # retirement (destroy / box remove / detach) keeps the user — so nothing
+    # clears it at retirement. That is why reusing a retired identity is
+    # REFUSED early (retired_identity, checked by create/box_add/dev_attach)
+    # and freeing the name means purging the whole user (purge_consumer — via a
+    # Development-page row, `dev fork purge`, or mirror Remove, which purges the
+    # fully retired owners of the forks it deletes): the callers keep this
+    # function from ever meeting a surviving token.
     r = _gitea_admin(["user", "generate-access-token", "--username", username,
                       "--scopes", scopes, "--raw", "--token-name", "rs-dev"])
     if r.returncode != 0:
@@ -778,8 +780,10 @@ def provision_consumer(host_port: str, repo: str, user: str) -> None:
 
 def archive_fork(host_port: str, user: str, repo: str) -> None:
     """Read-only-freeze a retired consumer's fork — history kept, never
-    deleted. The gitea USER is deliberately kept inert (deleting a user PURGES
-    its repos, including any other fork it holds). FULLY best-effort — an
+    deleted. The gitea USER is deliberately kept inert until its mirror is
+    removed (deleting a user PURGES its repos, including any other fork it
+    holds; remove_repo purges the user only once its fork is gone and it owns
+    nothing else). FULLY best-effort — an
     unbootstrapped/sick gitea, an already-archived or an absent fork are all
     no-ops (retirement paths must never die on this). Token cleanup is the
     CALLER's decision (a project consumer's token is shared across repos)."""
@@ -861,14 +865,17 @@ def purge_consumer(host_port: str, user: str) -> list[str]:
     ⚠ USER-SCOPED: this deletes EVERY fork the identity owns, on every repo —
     callers that surface it from a repo-scoped UI must say so.
 
-    Carries NO fork-state gate, deliberately. Its two callers need opposite
-    things and each holds the proof the other cannot: RETIREMENT (destroy /
-    box remove) purges forks that are still LIVE — archiving them is exactly
-    what it replaces — and its proof of ownership is the ledger entry it is
-    about to prune; RECOVERY (dev_purge_consumer) lets an operator name an
+    Carries NO fork-state gate, deliberately. Its callers need different
+    things and each gates at its own entry point with the proof the others
+    cannot hold: RECOVERY (dev_purge_consumer) lets an operator name an
     arbitrary user, so it fails closed on both the ledger and a live fork
-    BEFORE calling this. Putting the archived-only check in here would make the
-    retirement path structurally impossible.
+    BEFORE calling this; MIRROR REMOVE (remove_repo → _purge_retired_owner)
+    reaches only the owners of forks the verb's live-fork gate proved archived,
+    and gates on the ledger + owns-nothing-else itself; a purge-at-RETIREMENT
+    (destroy / box remove — pending B53, today those archive) would purge forks
+    that are still LIVE, its proof of ownership being the ledger entry it is
+    about to prune. Putting the archived-only check in here would make that
+    last path structurally impossible.
 
     The prefix floor stays HERE as well as in the request validator: this is the
     function holding the delete, and 'operator' / 'sandbox-admin' match the
@@ -890,13 +897,68 @@ def purge_consumer(host_port: str, user: str) -> list[str]:
     return repos
 
 
-def remove_repo(host_port: str, repo: str) -> None:
-    """Delete the mirror + best-effort every consumer FORK (repos only — NEVER
-    delete_user; archived-fork users stay inert). WARN-and-continue on every
-    cascade arm: a fork that survives (or an enumeration failure) prints the
-    manual-cleanup remedy instead of failing silently or aborting the mirror
-    delete. Cleans the mirror stamp + the active-fork entry + the forks'
-    token files."""
+def _purge_retired_owner(host_port: str, owner: str) -> bool:
+    """Mirror Remove's per-owner purge, run AFTER the owner's fork on the
+    removed mirror is deleted and AFTER the ledger gate (G1 in remove_repo)
+    passed. Decides whether the owner is FULLY retired — owns nothing else in
+    gitea — and if so deletes its user (purge_consumer). WARN-and-continue on
+    every arm: this runs inside remove_repo's cascade and must never abort the
+    mirror delete.
+
+    G2 reads LIVE state (user_repos, strict), not the ledger: a repo the owner
+    still holds may be a live orphan fork of another mirror, an archived fork
+    listed on that mirror's Development-page card, or a hand-made repo — none
+    of which mirror Remove was asked to delete, and deleting the user would
+    purge them all. The owner is then KEPT, and the warning names both browser
+    remedies (its repo card, or Site Administration in the Gitea tab) without
+    promising a card that a non-fork or a live orphan does not have.
+
+    Returns True when the user is GONE NOW: purge_consumer returns [] both for
+    'deleted' and for 'already absent', and the only way to meet the second is
+    an owner enumerated seconds earlier vanishing mid-cascade — accepted
+    without a probe; the caller reports the name as purged either way."""
+    try:
+        owned = user_repos(host_port, owner)
+    except GiteaError as e:
+        print(f"warning: could not verify what {owner!r} owns ({e}); left in "
+              f"Gitea — delete the user under Site Administration in the Gitea "
+              f"tab", file=sys.stderr)
+        return False
+    names = sorted(r["repo"] for r in owned if r.get("repo"))
+    if names:
+        print(f"warning: kept {owner!r}: it also owns {', '.join(names)} — "
+              f"purge it from that repo's card on the Development page if that "
+              f"is an archived fork, or delete the user under Site "
+              f"Administration in the Gitea tab", file=sys.stderr)
+        return False
+    try:
+        purge_consumer(host_port, owner)
+    except GiteaError as e:
+        print(f"warning: could not delete {owner!r} ({e}); left in Gitea — "
+              f"delete the user under Site Administration in the Gitea tab",
+              file=sys.stderr)
+        return False
+    return True
+
+
+def remove_repo(host_port: str, repo: str) -> list[str]:
+    """Delete the mirror + best-effort every consumer FORK on it, and purge the
+    gitea USER (+ host token) of every fork owner that is FULLY RETIRED: no
+    attachment-ledger row names it anywhere (G1, a file read) and it owns
+    nothing else once its fork is gone (G2, live state). An owner some project
+    still records — the B53 truncation collision, two consumers on one gitea
+    username sharing ONE token file — keeps BOTH its token and its user; an
+    owner that owns anything else keeps its user (its token goes: this fork's
+    retirement already ended the token's use). WARN-and-continue on every
+    cascade arm: a fork that survives, an enumeration failure, or a refused
+    user delete prints the manual-cleanup remedy instead of failing silently or
+    aborting the mirror delete. Cleans the mirror stamp + the active-fork
+    entry. Returns the users purged (the names freed for reuse).
+
+    Why the user goes with the fork: a retired identity is visible on the
+    Development page ONLY through an archived fork it owns, so deleting the
+    fork while keeping the user used to leave an invisible identity that still
+    blocked its project or box name (B52's normal-flow source)."""
     client = GiteaClient(api_base(host_port), read_admin_token())
     # The STRICT enumeration under this lane's own posture: warn-and-continue
     # (NOT list_forks, whose []-on-error would silently skip the cascade).
@@ -907,14 +969,40 @@ def remove_repo(host_port: str, repo: str) -> None:
         print(f"warning: could not enumerate {repo!r}'s consumer forks ({e}); "
               f"delete any leftover agent-* forks in the gitea UI",
               file=sys.stderr)
+    purged: list[str] = []
     for f in forks:
         owner = f["user"]
+        # 1. The fork on THIS mirror goes regardless of what follows (the verb's
+        #    live-fork gate already guarantees it is archived).
+        deleted = True
         try:
             client._api("DELETE", f"/repos/{owner}/{repo}")
         except GiteaError as e:
+            deleted = False
             print(f"warning: could not delete fork {owner}/{repo} ({e}); "
                   f"delete it manually in the gitea UI", file=sys.stderr)
+        # 2. G1 — the ledger, BEFORE the token unlink: an owner any project
+        #    still records shares its token file with that project (one file
+        #    per gitea user), so unlinking it here would break that project at
+        #    its next recreate. Reads `user`, never project/repo: this repo's
+        #    rows were already refused by the verb's attached_projects gate, so
+        #    a hit is a row for ANOTHER repo — the collision case.
+        named = sorted({e["project"] for e in load_attachments()
+                        if e.get("user") == owner and e.get("project")})
+        if named:
+            print(f"warning: kept {owner!r}: still recorded for "
+                  f"{', '.join(named)} — its token and Gitea user stay",
+                  file=sys.stderr)
+            continue
+        # 3. Nothing records the owner: its token file has no user left.
         delete_consumer_token(owner)
+        # 4. A fork that survived the delete would 422 the user delete
+        #    (ErrUserOwnRepos); the warning above already names the remedy.
+        if not deleted:
+            continue
+        # 5. G2 + the purge.
+        if _purge_retired_owner(host_port, owner):
+            purged.append(owner)
     client.delete_repo(ADMIN_USER, repo)
     try:
         mirror_stamp_path(repo).unlink()
@@ -924,6 +1012,7 @@ def remove_repo(host_port: str, repo: str) -> None:
     if repo in active:
         del active[repo]
         save_active_forks(active)
+    return purged
 
 
 def list_repos(host_port: str) -> list[dict]:

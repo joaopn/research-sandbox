@@ -1177,7 +1177,8 @@ async def broker_dev_gitea_start_handler(request: web.Request) -> web.Response:
 
 async def broker_dev_repo_remove_handler(request: web.Request) -> web.Response:
     """POST /broker/dev/repo-remove {repo, proof} — delete a finished repo's
-    mirror + its retired forks (gated, origin-checked, STEP-UP). The step-up
+    mirror + its retired forks + the retired identities (gitea users) that own
+    them (gated, origin-checked, STEP-UP). The step-up
     `proof` (client-side derivation of the retyped master password — the raw
     password never transits) rides the args and is consumed by the broker's
     dispatch gate, exactly as box_remove does.
