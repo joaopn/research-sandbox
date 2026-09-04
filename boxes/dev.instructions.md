@@ -167,10 +167,18 @@ path (a compose stack, a data directory) — build from the worktree, run from t
 - **Finish:** push your branch, open the PR as usual, then `rs-wt done <name>` — it removes
   the worktree and always keeps the branch. Resume finished work later with
   `rs-wt reopen <name>` (a fresh `rs-wt new` under an old name refuses and points you there).
-- **Never, in any session:** `git stash` (the stash stack is shared across all trees), edits
-  to git config/remotes/hooks, manually deleting branches (the server-side branch retirement
-  `rs-land` performs after an approved landing is the ONE sanctioned path), or global package
-  installs (pip, `npm -g`, apt) without asking the maintainer first.
+- **Shared git state:** every worktree shares the primary clone's `.git` — config, the stash
+  stack, remotes and hooks are ONE set for every session, so a change in one tree is a change
+  in all of them; coordinate rather than assume you are alone. Keep `origin` pointing at your
+  fork and `upstream` at the mirror: `rs-wt` gates on `origin` being the shared Gitea and
+  branches from `origin/{{BASE_BRANCH}}`, the sync block above fetches both by name, and
+  `checkout.defaultRemote` resolves ambiguous branch names against `origin`. An open PR's head
+  branch stays until `rs-land` retires it after the landing — deleting it orphans the PR
+  (Gitea marks it branch-deleted and there is no head left to merge). `rs-wt reopen` and
+  `rs-wt list` need the local `agent/<name>` branch, so delete one only when you are finished
+  with that name. Packages installed into the container filesystem (`pip install --user`,
+  `npm -g`, apt) vanish at a container recreate; anything under `/workspace` — a venv there,
+  for instance — survives.
 - **Servers and ports:** don't leave servers running unattended. Bind only the port the
   maintainer names when they ask for a demo, and stop it afterwards.
 - **Reference clones:** if you need another repo just to read it, clone it under your
@@ -190,6 +198,11 @@ zero when fixed), and verify it on both the base branch and your branch before p
 ## What You Have Access To
 
 - This workspace (the cloned repo at `/workspace/<repo>`)
+- **`/workspace` is the only filesystem that survives.** The container's own filesystem — your
+  home, `/opt`, `/usr`, anything a package manager writes — is rebuilt at every container
+  recreate (a box re-run, a project stop + start). Anything you need afterwards — a venv, a
+  tool install, a cache, notes — goes under `/workspace`. `pip install --user`, `npm -g` and
+  apt are yours to run, and gone after the next recreate; a venv under `/workspace` is not.
 - Internet access for API calls and package installation (subject to the project's egress policy)
 - Git push/pull to Gitea (`origin` for push, `upstream` for fetch)
 

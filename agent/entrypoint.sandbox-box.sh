@@ -132,6 +132,15 @@ if [[ -n "${GITEA_TOKEN:-}" && -n "${GITEA_URL:-}" && -n "${REPO_NAME:-}" ]]; th
         git -C "${DEV_REPO_DIR}" remote add upstream \
             "${GITEA_URL}/sandbox-admin/${REPO_NAME}.git"
     fi
+    # The agent's git identity, pinned repo-LOCAL in the fork clone (B36): the
+    # consumer's gitea account name + that account's email. Every boot,
+    # idempotent (same values). LOCAL, not --global: it scopes the identity to
+    # this clone and its worktrees (they share .git/config), and the clone
+    # lives on the box's workspace volume, so a re-run keeps it with no heal.
+    # The `@rs.invalid` literal MIRRORS cli/gitea.py's EMAIL_DOMAIN (this
+    # script cannot import it) — a pytest pins the two together.
+    git -C "${DEV_REPO_DIR}" config user.name "${GITEA_USER}"
+    git -C "${DEV_REPO_DIR}" config user.email "${GITEA_USER}@rs.invalid"
     git -C "${DEV_REPO_DIR}" fetch upstream --quiet || true
 fi
 

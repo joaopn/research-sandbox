@@ -115,6 +115,24 @@ MIGRATE_TIMEOUT_S = 120
 ADMIN_USER = "sandbox-admin"
 OPERATOR_USER = "operator"
 AGENT_USER_PREFIX = "agent-"
+# Email domain of every gitea account RS mints (`create_user`; the admin +
+# operator bootstrap keep their own literal). A consumer account (`agent-…`)
+# carries `<name>@rs.invalid`, and BOTH dev clone paths pin that same address
+# as the agent's git `user.email` (rscore._run_dev_clone, and the dev block of
+# agent/entrypoint.sandbox-box.sh — a bash MIRROR of this literal, since the
+# entrypoint cannot import this module; pytest-pinned), so the fork's commits
+# resolve to the gitea account that owns the fork (B36). `.invalid` is the
+# RFC 2606 reserved TLD: never routable, never anyone else's.
+EMAIL_DOMAIN = "rs.invalid"
+
+
+def consumer_email(username: str) -> str:
+    """The email of the gitea account `username` — ALSO the git `user.email`
+    the dev clones pin as the agent's commit identity. One function for both,
+    so the account and the commit identity cannot drift apart."""
+    return f"{username}@{EMAIL_DOMAIN}"
+
+
 # Mirror cron cadence. Gitea's default `mirror.MIN_INTERVAL` is 10m and it 500s
 # a migrate that sets a shorter one — so 10m is the floor without weakening that
 # guard. It's only a BACKSTOP anyway: `dev sync <repo>` (and the resume path)
@@ -450,7 +468,7 @@ class GiteaClient:
         self._api("POST", "/admin/users", {
             "username": username,
             "password": password,
-            "email": f"{username}@rs.invalid",
+            "email": consumer_email(username),
             "must_change_password": False,
         })
 

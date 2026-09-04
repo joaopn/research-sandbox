@@ -7657,10 +7657,11 @@ def _run_dev_clone(container: str, repo: str, user: str, branch: str,
                    progress) -> str:
     """Clone the agent fork into the supervisor workspace (the dev workflow's
     create-time step, STAGE_DEV_GITEA S2): credential-helper store +
-    clone-if-absent + the read-only mirror as ``upstream`` — the same contract
-    as the box entrypoint's dev block, executed host-side as the unprivileged
-    research user. Deliberately NOT _run_light_harness (that path is
-    https://-only + GitHub-PAT-shaped). Secret discipline: the credentials line
+    clone-if-absent + the agent's repo-local git identity + the read-only
+    mirror as ``upstream`` — the same contract as the box entrypoint's dev
+    block, executed host-side as the unprivileged research user.
+    Deliberately NOT _run_light_harness (that path is https://-only +
+    GitHub-PAT-shaped). Secret discipline: the credentials line
     reaches the container via STDIN (never exec argv); the clone script itself
     carries NO token (the helper file supplies auth); failures raise
     HarnessError with the token literal scrubbed (via _light_exec). Also stages
@@ -7686,6 +7687,20 @@ def _run_dev_clone(container: str, repo: str, user: str, branch: str,
         f"git clone --branch {q(branch)} "
         f"{q(base + '/' + user + '/' + repo + '.git')} {q(workdir)}; fi && "
         f"cd {q(workdir)} && "
+        # The agent's git identity, pinned repo-LOCAL (B36): the consumer's
+        # gitea account name + that account's email (gitea.consumer_email —
+        # the address create_user minted, so the fork's commits resolve to the
+        # account that owns the fork). LOCAL, not --global, because it scopes
+        # the identity to the fork clone and its worktrees (linked worktrees
+        # share this .git/config) and nothing else in the container; it cannot
+        # collide with an operator identity _stage_git_auth may have written
+        # globally (that runs before this clone); and it lives on the workspace
+        # bind mount, so no heal path has to re-derive it. Survival is NOT the
+        # reason — a global identity would also ride the creds stash across a
+        # recreate (~/.gitconfig is stashed + restored). Idempotent: a re-run
+        # writes the same values.
+        f"git config user.name {q(user)} && "
+        f"git config user.email {q(gitea.consumer_email(user))} && "
         "(git remote get-url upstream >/dev/null 2>&1 || "
         f"git remote add upstream {q(base + '/' + gitea.ADMIN_USER + '/' + repo + '.git')}) && "
         "git fetch upstream --quiet"
