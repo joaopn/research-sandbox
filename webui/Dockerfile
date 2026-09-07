@@ -10,18 +10,23 @@ RUN pip install --no-cache-dir \
 
 # Vendor xterm.js + addons at build time so the image carries no
 # runtime internet dependency.
-ARG XTERM_VERSION=5.3.0
-ARG FIT_VERSION=0.8.0
-ARG WEB_LINKS_VERSION=0.9.0
-ARG WEBGL_VERSION=0.16.0
-ARG SEARCH_VERSION=0.13.0
+# Packages live under the @xterm/ npm scope since 5.4 (the unscoped `xterm`
+# name stopped at 5.3.0). 6.0.0 is the first release carrying the IME
+# composition fix (xterm.js #5024) behind duplicated/garbled input from
+# predictive soft keyboards; its viewport rewrite is what style.css's
+# scrollbar rules and app.js's touch scrolling are written against.
+ARG XTERM_VERSION=6.0.0
+ARG FIT_VERSION=0.11.0
+ARG WEB_LINKS_VERSION=0.12.0
+ARG WEBGL_VERSION=0.19.0
+ARG SEARCH_VERSION=0.16.0
 WORKDIR /app/static/vendor
-RUN wget -q https://unpkg.com/xterm@${XTERM_VERSION}/lib/xterm.js \
- && wget -q https://unpkg.com/xterm@${XTERM_VERSION}/css/xterm.css \
- && wget -q https://unpkg.com/xterm-addon-fit@${FIT_VERSION}/lib/xterm-addon-fit.js \
- && wget -q https://unpkg.com/xterm-addon-web-links@${WEB_LINKS_VERSION}/lib/xterm-addon-web-links.js \
- && wget -q https://unpkg.com/xterm-addon-webgl@${WEBGL_VERSION}/lib/xterm-addon-webgl.js \
- && wget -q https://unpkg.com/xterm-addon-search@${SEARCH_VERSION}/lib/xterm-addon-search.js
+RUN wget -q https://unpkg.com/@xterm/xterm@${XTERM_VERSION}/lib/xterm.js \
+ && wget -q https://unpkg.com/@xterm/xterm@${XTERM_VERSION}/css/xterm.css \
+ && wget -q https://unpkg.com/@xterm/addon-fit@${FIT_VERSION}/lib/addon-fit.js \
+ && wget -q https://unpkg.com/@xterm/addon-web-links@${WEB_LINKS_VERSION}/lib/addon-web-links.js \
+ && wget -q https://unpkg.com/@xterm/addon-webgl@${WEBGL_VERSION}/lib/addon-webgl.js \
+ && wget -q https://unpkg.com/@xterm/addon-search@${SEARCH_VERSION}/lib/addon-search.js
 
 WORKDIR /app
 COPY server.py services.py ./

@@ -550,16 +550,32 @@ body {
        (left) and dump the entire remainder on the right. Centering splits
        it evenly so left/right padding reads as symmetric. */
     align-items: center;
+    /* Touch: the pad's own finger scrolling (app.js installTouchScroll) must
+       be the ONLY vertical pan here. Without this the browser claims a slow
+       drag as a native page pan on its first sub-row move, after which every
+       later touchmove of that gesture is uncancelable — arrows still flow,
+       but Android Chrome pulls-to-refresh on a downward drag and shows/hides
+       the URL bar on an upward one. Pinch stays native (the handler resets on
+       a second finger), so zooming small text keeps working. */
+    touch-action: pinch-zoom;
 }
 
 /* xterm's viewport ships with `overflow-y: scroll` (always-visible track),
    not `auto`. Hide it — mouse wheel + tmux/byobu's own scrollback keys
-   (Shift+PgUp etc.) still work without a visible track. */
+   (Shift+PgUp etc.) still work without a visible track. xterm 6 keeps that
+   viewport element AND paints its own fading overlay scrollbar inside the
+   scrollable element; the second rule hides that one for the same reason
+   (touch scrolling of a plain shell's history goes through scrollLines, no
+   track needed). Neither rule changes the column count: the fit addon
+   reserves its scrollbar gutter either way. */
 .terminal-pad .xterm-viewport {
     scrollbar-width: none;        /* Firefox */
 }
 .terminal-pad .xterm-viewport::-webkit-scrollbar {
     display: none;                /* Chromium, Safari */
+}
+.terminal-pad .xterm-scrollable-element > .scrollbar {
+    display: none;                /* xterm 6 overlay scrollbar */
 }
 .terminal-instance.hidden { display: none; }
 

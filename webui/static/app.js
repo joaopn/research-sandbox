@@ -8011,6 +8011,98 @@ function installGlobalTermRefit() {
     }
 }
 
+// Touch scrolling for the CLI tab. xterm has no touch path a finger can use
+// inside a full-screen app: 6.0 has no touch scrolling at all, and 5.x's only
+// moved xterm's own scrollback viewport (dead in the alternate buffer, where
+// byobu/tmux always keep us) and bailed outright while the app had mouse
+// tracking on. Everything a desktop wheel does lives in xterm's `wheel`
+// listener on term.element — the mouse report when tracking is on, the
+// wheel→arrow-key conversion when the buffer has no scrollback — so a
+// vertical finger drag is re-expressed as wheel events there: one LINE-mode
+// event per row of travel (both arms emit exactly one sequence per event, so
+// N rows = N arrows = N reports; pixel deltas would fight xterm's own
+// per-version accumulator), carrying the touch point so the report arm's
+// coordinate lookup lands inside the screen. In a plain shell (normal buffer,
+// no wheel-requesting tracking) the history is scrolled through the public scrollLines
+// instead — the 6.0 scrollable element ignores synthetic wheels. Capture
+// phase + stopPropagation keep xterm's own bubble-phase touch listeners (5.x)
+// and the document-level gesture recogniser (6.0) from acting on the same
+// drag; style.css's `touch-action: pinch-zoom` on the pad keeps the browser
+// from claiming the gesture as a native pan first. A sub-row jitter stays
+// uncancelled so a shaky tap keeps its click/focus. Touch-only by
+// construction (a touchscreen laptop gets it too) — deliberately NOT behind
+// mobileModeActive(); the mouse/wheel path stays byte-identical.
+function installTouchScroll(term) {
+    const el = term.element;
+    let lastY = null;
+    let carry = 0;
+    let consumed = false;   // this drag has scrolled: cancel + stop from here on
+    const seed = (touch) => { lastY = touch.clientY; carry = 0; consumed = false; };
+    const reset = () => { lastY = null; carry = 0; consumed = false; };
+    el.addEventListener("touchstart", (ev) => {
+        if (ev.touches.length !== 1) { reset(); return; }   // pinch etc. stay native
+        seed(ev.touches[0]);
+    }, { capture: true, passive: true });
+    el.addEventListener("touchmove", (ev) => {
+        if (lastY === null || ev.touches.length !== 1) return;
+        // xterm sizes .xterm-screen to exactly rows × cellHeight (both the DOM
+        // and the WebGL renderer), so this is the live row height with no
+        // private API. A hidden pane (0) cannot be touched — no fallback.
+        const screen = el.querySelector(".xterm-screen");
+        const rowPx = screen && term.rows ? screen.clientHeight / term.rows : 0;
+        if (!(rowPx > 0)) return;
+        const t = ev.touches[0];
+        carry += lastY - t.clientY;          // finger up ⇒ positive ⇒ toward newer lines
+        lastY = t.clientY;
+        const rows = Math.trunc(carry / rowPx);
+        carry -= rows * rowPx;
+        // A sub-row jitter is not a scroll: leave it uncancelled so a slightly
+        // shaky tap keeps its click/focus (cancelling the first touchmove drops
+        // the gesture's compat mouse events).
+        if (rows === 0 && !consumed) return;
+        consumed = true;
+        if (rows !== 0) {
+            // x10 tracking reports button presses only — no wheel — so it
+            // takes the scrollLines arm outside the alternate buffer; the
+            // three wheel-requesting modes are the ones xterm detaches its
+            // own viewport scrolling for.
+            const mode = term.modes.mouseTrackingMode;
+            if (term.buffer.active.type === "alternate"
+                || mode === "vt200" || mode === "drag" || mode === "any") {
+                // A finger that wanders into the fit addon's scrollbar gutter
+                // would make xterm drop the report (no cell under it): clamp
+                // the point to the screen so no row of travel is lost.
+                const r = screen.getBoundingClientRect();
+                const cx = Math.min(Math.max(t.clientX, r.left), r.right - 1);
+                const cy = Math.min(Math.max(t.clientY, r.top), r.bottom - 1);
+                const sign = rows > 0 ? 1 : -1;
+                for (let i = 0; i < Math.abs(rows); i++) {
+                    el.dispatchEvent(new WheelEvent("wheel", {
+                        deltaY: sign, deltaMode: WheelEvent.DOM_DELTA_LINE,
+                        clientX: cx, clientY: cy,
+                        bubbles: true, cancelable: true,
+                    }));
+                }
+            } else {
+                term.scrollLines(rows);
+            }
+        }
+        ev.stopPropagation();
+        // Once the browser has let an uncancelled sub-row move through, the
+        // rest of that gesture arrives non-cancelable (a Chrome intervention);
+        // the pad's touch-action already forbids the pan, so only cancel what
+        // can be cancelled rather than log a warning per move.
+        if (ev.cancelable) ev.preventDefault();
+    }, { capture: true, passive: false });
+    // A pinch that ends with one finger still down re-seeds from that finger
+    // so the drag can continue; the last finger lifting resets.
+    const endOrCancel = (ev) => {
+        if (ev.touches.length === 1) seed(ev.touches[0]); else reset();
+    };
+    el.addEventListener("touchend", endOrCancel, { capture: true });
+    el.addEventListener("touchcancel", endOrCancel, { capture: true });
+}
+
 function openSshTerminal(project, serviceId, svc) {
     const container = el("div", { class: "terminal-instance" });
     // Inset wrapper: gives the visual breathing room WITHOUT putting
@@ -8035,6 +8127,7 @@ function openSshTerminal(project, serviceId, svc) {
     const searchAddon = new SearchAddon.SearchAddon();
     term.loadAddon(searchAddon);
     term.open(pad);
+    installTouchScroll(term);
     try {
         const webgl = new WebglAddon.WebglAddon();
         webgl.onContextLoss(() => webgl.dispose());
