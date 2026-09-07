@@ -4291,13 +4291,27 @@ _AGENT_ERR_TAIL = 2000
 # Disabling also flips the binary's own system-prompt line to "do not add
 # attribution lines", so the model is told as well as the git plumbing. The
 # dev lane's collection scrub (cli/rs_fetch.py) and the reviewer's attribution
-# criterion are the backstops for an overridden or pre-fix container. This is
-# one of THREE writers (setup.sh heredoc, the sandbox-box entrypoint printf) —
-# pytest-pinned as a lockstep.
+# criterion are the backstops for an overridden or pre-fix container.
+# `remoteControlAtStartup: false` keeps the Remote Control bridge (`/rc`) OFF by
+# default. The binary's startup resolver reads project/local settings (a `false`
+# there wins outright; a `true` there is ignored — repo-scoped settings cannot
+# enable it), then policy > flag > USER settings, then the legacy ~/.claude.json,
+# and only when every tier is undefined falls to a REMOTELY SERVED default (an
+# org policy value, else a rollout flag the binary fetches at runtime; the
+# in-binary fallback is false). That served default has been observed ON, so an
+# ABSENT key auto-starts the bridge — and because it is served, not baked, it
+# can flip with no version change; an explicit user-scope `false` is the only
+# way to make the container posture independent of it. It is a DEFAULT, not a
+# lock: an operator flipping "Enable Remote Control for all sessions" in /config
+# or the IDE panel rewrites this same key at user scope. Resolver read out of the
+# pinned 2.1.258 dist and 2.1.263 (byte-equivalent logic). This is one of THREE
+# writers (setup.sh heredoc, the sandbox-box entrypoint printf) — pytest-pinned
+# as a lockstep.
 _AGENT_SETTINGS_JSON = json.dumps(
     {"permissions": {"defaultMode": "bypassPermissions"}, "theme": "dark",
      "env": {"CLAUDE_CODE_DISABLE_MOUSE_CLICKS": "1"},
-     "attribution": {"commit": "", "pr": "", "sessionUrl": False}},
+     "attribution": {"commit": "", "pr": "", "sessionUrl": False},
+     "remoteControlAtStartup": False},
     indent=2) + "\n"
 
 

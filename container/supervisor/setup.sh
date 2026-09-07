@@ -2,7 +2,9 @@
 # Claude Code configuration — sourced by entrypoint.supervisor.sh on first boot.
 # Sets bypassPermissions so Claude Code never prompts, and switches git/PR
 # attribution OFF (co-author trailer, PR footer, AND the private session link —
-# three keys, the session link is a separate switch; see the rationale at
+# three keys, the session link is a separate switch) and the Remote Control
+# bridge (/rc) OFF by default (`remoteControlAtStartup: false` — an absent key
+# falls to the rollout default, which auto-starts it; rationale for both at
 # rscore._AGENT_SETTINGS_JSON). This heredoc, that constant, and the sandbox-box
 # entrypoint's printf fallback are a three-writer mirror, pytest-pinned; this
 # one alone adds the rs-audit-stop Stop hook. Credentials are NOT staged here —
@@ -31,6 +33,7 @@ if [[ ! -f ~/.claude/settings.json ]]; then
     "pr": "",
     "sessionUrl": false
   },
+  "remoteControlAtStartup": false,
   "hooks": {
     "Stop": [
       {
