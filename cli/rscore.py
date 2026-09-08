@@ -3477,12 +3477,16 @@ _OPEN_VSX_CLAUDE_EXT_API = "https://open-vsx.org/api/Anthropic/claude-code/linux
 # "no source"; a source whose key isn't pinned is skipped. Keep in sync when
 # adding a pin.
 #
-# The six editor-extension pins below (ms-python + the five ms-toolsai Jupyter
-# entries) are ALSO Open VSX and would resolve fine through the "openvsx" kind —
-# they stay "manual" by CHOICE, not because they can't be queried: the tandem
-# CLI+extension bump shipped the agent-bound one only, and widening the rest is a
-# deliberate follow-on. Do not read their "manual" as evidence Open VSX is
-# unqueryable; CLAUDE_CODE_EXT_VERSION below proves otherwise.
+# Open VSX entries resolve through the item metadata GET, whose top-level
+# "version" is the HIGHEST-semver active version, pre-release or not (the body's
+# sibling "preRelease" flag says which; the arm does not filter on it, so a
+# publisher whose pre-release outnumbers its stable line surfaces as an
+# update). The six editor-extension pins (ms-python + the five
+# ms-toolsai Jupyter entries) are UNIVERSAL packages, so their URL is
+# api/<ns>/<name> with NO target-platform segment — unlike the claude extension
+# just below, whose URL is platform-pinned. The <ns>/<name> pairs repeat the
+# _EDITOR_EXTENSIONS table (defined far below — the same load-order constraint
+# as _OPEN_VSX_CLAUDE_EXT_API); the pytest pins the two in lockstep.
 VERSION_SOURCES: dict[str, dict[str, str]] = {
     "CODE_SERVER_VERSION": {
         "kind": "github-releases",
@@ -3509,29 +3513,29 @@ VERSION_SOURCES: dict[str, dict[str, str]] = {
         "kind": "manual",
         "url": "https://nodejs.org/en/about/previous-releases",
     },
-    # Editor-bundled VS Code extensions (Open VSX item pages — eyeball the latest
-    # before bumping the pin in versions.env, then `research editor pull`).
+    # Editor-bundled VS Code extensions (universal Open VSX packages; bump the
+    # pin in versions.env, then `research editor pull`).
     "PYTHON_EXT_VERSION": {
-        "kind": "manual", "url": "https://open-vsx.org/extension/ms-python/python",
+        "kind": "openvsx", "url": "https://open-vsx.org/api/ms-python/python",
     },
     "JUPYTER_VERSION": {
-        "kind": "manual", "url": "https://open-vsx.org/extension/ms-toolsai/jupyter",
+        "kind": "openvsx", "url": "https://open-vsx.org/api/ms-toolsai/jupyter",
     },
     "JUPYTER_CELL_TAGS_VERSION": {
-        "kind": "manual",
-        "url": "https://open-vsx.org/extension/ms-toolsai/vscode-jupyter-cell-tags",
+        "kind": "openvsx",
+        "url": "https://open-vsx.org/api/ms-toolsai/vscode-jupyter-cell-tags",
     },
     "JUPYTER_KEYMAP_VERSION": {
-        "kind": "manual",
-        "url": "https://open-vsx.org/extension/ms-toolsai/jupyter-keymap",
+        "kind": "openvsx",
+        "url": "https://open-vsx.org/api/ms-toolsai/jupyter-keymap",
     },
     "JUPYTER_RENDERERS_VERSION": {
-        "kind": "manual",
-        "url": "https://open-vsx.org/extension/ms-toolsai/jupyter-renderers",
+        "kind": "openvsx",
+        "url": "https://open-vsx.org/api/ms-toolsai/jupyter-renderers",
     },
     "JUPYTER_SLIDESHOW_VERSION": {
-        "kind": "manual",
-        "url": "https://open-vsx.org/extension/ms-toolsai/vscode-jupyter-slideshow",
+        "kind": "openvsx",
+        "url": "https://open-vsx.org/api/ms-toolsai/vscode-jupyter-slideshow",
     },
     # Resolvable since the tandem bump landed: `research agent refresh` moves this
     # pin alongside CLAUDE_CODE_VERSION, so `images outdated` must be able to see
@@ -5959,8 +5963,10 @@ def _latest_version(source: dict[str, str]) -> str:
         data = _http_json(f"https://pypi.org/pypi/{source['pkg']}/json")
         return str(data["info"]["version"])
     if kind == "openvsx":
-        # The metadata GET carries the latest version for the pinned target
-        # platform at the top level. Same posture as the arms above: no extra
+        # The metadata GET carries the highest-semver version at the top level
+        # (pre-release included — see the VERSION_SOURCES header) — for the
+        # pinned target platform when the URL names one, for the universal
+        # package otherwise. Same posture as the arms above: no extra
         # guard, cmd_images_outdated catches KeyError/ValueError and renders
         # 'unreachable'.
         return str(_http_json(source["url"])["version"])
