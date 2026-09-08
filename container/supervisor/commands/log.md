@@ -6,9 +6,9 @@ End this session cleanly: have every live worker write its own `summary.md`, wri
 
 ## Step 1 — Preconditions
 
-Every live worker must be in runtime state `waiting` (idle, ready for input). If any is `working`, **refuse to proceed**. Report:
+Every live worker must be in runtime state `waiting` (idle, ready for input). If any is `working` or `parked` (asleep waiting on a job, with a pending wake-up — `rs-worker status <name>` → `wakes`), **refuse to proceed**. Report:
 
-> /log: cannot log while workers are running: `<name>`, `<name>`.
+> /log: cannot log while workers are running or parked: `<name>` (working), `<name>` (parked until <wake time>).
 > Wait for completion (rs-worker wait) or message them to stop before logging.
 
 Then wait for them to return to `waiting` and retry. No `--force` escape hatch.
@@ -113,6 +113,8 @@ rs-worker shutdown <name>
 Expected JSON: `{"name": "<name>", "state": "down", "last_down_at": "..."}`.
 
 Under the hood: `docker stop` (SIGTERM → entrypoint trap → `DONE` → exit), then `docker rm`. Bind-mount preserved. Registry → `state: down`.
+
+`rs-worker shutdown` refuses a worker that is `parked` (it parked itself during the summary turn, waiting on a job). Wait for its wake (`rs-worker wait <name>`) or `rs-worker message <name>` it to collect what it has and return to `waiting`, then retry the shutdown.
 
 After all shutdowns, `rs-worker list` (without `--all`) should return an empty array.
 

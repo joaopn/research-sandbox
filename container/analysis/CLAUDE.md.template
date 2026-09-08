@@ -73,12 +73,24 @@ You do not need to `ls inbox/` yourself — the entrypoint feeds you one message
 
 A granted role-MCP (wrangler, websearcher, …) is a service that spawns a **fresh agent per call** — about a minute of startup before any work happens. Call it accordingly:
 
-- **Default to `mode=async`.** `send_job` returns a `job_id` at once; poll `query_job_status` **within the same turn** (every 30 s or so, bounded) until `status` is `done` or `failed`, then continue. Do not end your turn to wait for an async job — nothing re-invokes you.
+- **Default to `mode=async`.** `send_job` returns a `job_id` at once; poll `query_job_status` **within the same turn** (every 30 s or so, bounded) until `status` is `done` or `failed`, then continue. For a job that will take longer than you should hold a turn, **park** (below) — never end a turn mid-job without a wake file: with one pending the supervisor reads you as `parked`; without one it reads you as finished and may accept or shut you down.
 - **`mode=sync` only for calls you expect to finish well inside the sync budget** (240 s by default). A sync call that outlives it is killed and comes back as a tool error whose text is JSON `{"reason": "sync_timeout", "call_id": …, "remedy": …}` — resubmit it with `mode=async`.
 - **Read the structured refusals** (tool errors whose text parses as JSON with a `reason`):
   - `needs_credentials` — the role has no credentials yet. Record it in `research_log.md`, finish the cycle stating it; the supervisor syncs them and messages you.
   - `concurrency_limit` — the role is at capacity. Back off `retry_after_hint_seconds`, retry once, then record it and move on.
   - `sync_timeout` — resubmit the same task with `mode=async` and poll.
+
+### Parking — scheduling your own wake-up
+
+<!-- LOCKSTEP: the supervisor's runtime-states table and /log preconditions (container/supervisor/CLAUDE.md, commands/log.md) describe the same `parked` state and wake-file grammar; the entrypoint and rs-worker implement it. -->
+
+Nothing re-invokes you on its own. To wait on a long job without holding a turn, write a **wake file** and end your turn:
+
+- Path: `/workspace/wake/<unix_ts>.md` — the name is the epoch second you want to be woken at (e.g. `$(( $(date +%s) + 600 ))` for ten minutes from now; digits only, `.md`).
+- Body: the exact prompt you want to resume with — the job id, what to do with its result, which slug you are on. The next session is fresh and contextless; the body is all it gets (plus `research_log.md`, which you should update before parking).
+- When the time comes, the entrypoint moves the file into `inbox/` and invokes you with that body, even if the container was restarted in between. Wake **once**, around the expected completion — not every few minutes; each wake is a full fresh session.
+- If a supervisor message arrives first, the wake still fires later. Delete your own wake file when you no longer need it (you collected the result in that message turn).
+- While a wake is pending you are `parked`: the supervisor cannot accept or shut you down and its `wait` blocks through it. Once the wake fires and you finish, return to `WAITING` as usual.
 
 ## `/log` — summarize and prepare for shutdown
 

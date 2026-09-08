@@ -17,11 +17,24 @@
 #   /workspace/.claude/           creds + settings, staged at spawn
 #   /workspace/summary.md         prior-session memory (absent on first spawn)
 #   /workspace/inbox/             follow-up messages: msg_<unix_ts>.md
+#   /workspace/wake/<unix_ts>.md  worker-written wake-ups: the name is the
+#                                 due time (epoch seconds), the body is the
+#                                 worker's own resume prompt; the poll loop
+#                                 moves a due file into inbox/ so it rides
+#                                 the message path (survives restarts, not
+#                                 respawns — rs-worker spawn clears them)
 #   /workspace/outputs/<slug>/    per-cycle deliverables, accumulate
 #   /workspace/research_log.md    accumulating narrative
 #   /workspace/scratch/           accumulating working memory
 #   /workspace/WAITING            set while idle; cleared while working
 #   /workspace/DONE               set on clean shutdown
+#   /workspace/FAILED             set when the agent never completed a turn
+#                                 (exit=<rc> / reason=<last log line>); the
+#                                 container then exits non-zero and the
+#                                 supervisor reads `failed` with the reason.
+#                                 An unprocessed inbox message (a moved wake
+#                                 included) survives that exit and a respawn:
+#                                 it runs after the new task.md cycle.
 
 set -euo pipefail
 
@@ -63,7 +76,10 @@ cd /workspace
 export PATH="$HOME/.local/bin:/opt/conda/bin:$PATH"
 
 # Clear stale sentinels from a prior incarnation on this same bind-mount.
-rm -f /workspace/WAITING /workspace/DONE
+# Pending wake files are deliberately kept: a wake survives a container
+# restart (the loop below honours it after the boot cycle).
+rm -f /workspace/WAITING /workspace/DONE /workspace/FAILED
+mkdir -p /workspace/inbox /workspace/wake
 
 # Clean shutdown on SIGTERM / SIGINT: drop WAITING, leave DONE for the
 # supervisor's shutdown CLI to observe.
@@ -88,7 +104,30 @@ if [[ -n "${RS_AGENT_EFFORT:-}" ]]; then
     EFFORT_ARG=(--effort "$RS_AGENT_EFFORT")
 fi
 
+# The agent never completed a turn: a non-zero exit with no stream-json
+# `result` event in this run's slice of the log. Distinct from a TASK failure
+# (an errored turn still emits a `result` event, e.g. an auth error) — that one
+# keeps the poll loop alive as before. Here we leave neither WAITING nor DONE,
+# record why, and exit: the supervisor reads `failed` plus the reason, fixes
+# the cause (creds, MCP config, model) and respawns.
+# The reason recorded in FAILED is a diagnostic pointer, not the log: the full
+# line stays in log.jsonl, and the cap keeps FAILED and `rs-worker status`
+# output bounded when the last line is a multi-KB stream-json event. cut -c is
+# byte-based; the reader tolerates a split multibyte character.
+FAILED_REASON_MAX_BYTES=500
+launch_failed() {
+    local rc="$1" before="$2" last
+    last="$(tail -c +$((before + 1)) /workspace/log.jsonl 2>/dev/null \
+            | grep -v '^[[:space:]]*$' | tail -n 1 \
+            | cut -c1-"$FAILED_REASON_MAX_BYTES" || true)"
+    printf 'exit=%s\nreason=%s\n' "$rc" "${last:-no output}" > /workspace/FAILED
+    echo "=== Worker agent failed to launch (exit $rc): ${last:-no output} ===" >&2
+    exit "$rc"
+}
+
 run_claude() {
+    local rc=0 before
+    before="$(stat -c %s /workspace/log.jsonl 2>/dev/null || echo 0)"
     claude --print "$(cat "$1")" \
         --output-format stream-json \
         --verbose \
@@ -96,12 +135,18 @@ run_claude() {
         "${MODEL_ARG[@]}" \
         "${EFFORT_ARG[@]}" \
         "${MCP_ARG[@]}" \
-        >> /workspace/log.jsonl 2>&1 || true
+        >> /workspace/log.jsonl 2>&1 || rc=$?
+    # Process substitution, not a pipe: grep's early exit must not surface as
+    # a pipefail status and misread a launched agent as a launch failure.
+    if (( rc != 0 )) && ! grep -qF '"type":"result"' \
+            < <(tail -c +$((before + 1)) /workspace/log.jsonl); then
+        launch_failed "$rc" "$before"
+    fi
 }
 
 if [[ ! -f /workspace/task.md ]]; then
     echo "error: /workspace/task.md missing; spawn did not stage the task." >&2
-    touch /workspace/DONE
+    printf 'exit=2\nreason=task.md missing; spawn did not stage the task\n' > /workspace/FAILED
     exit 2
 fi
 
@@ -112,11 +157,27 @@ echo "Task: $(head -n 1 /workspace/task.md)"
 run_claude /workspace/task.md
 touch /workspace/WAITING
 
-# Poll inbox FIFO. File names are msg_<unix_ts>.md so lexical sort = temporal.
-# Process one at a time, serial only.
-mkdir -p /workspace/inbox
+# Poll inbox FIFO. File names are msg_<unix_ts>.md so a C-locale sort is
+# temporal (the image sets LC_ALL=en_US.UTF-8, whose collation ignores
+# punctuation — hence the explicit LC_ALL=C). Process one at a time, serial only.
+#
+# Wake files first: a due /workspace/wake/<epoch>.md becomes
+# inbox/msg_<now>_wake_<epoch>.md and rides the message path unchanged. The
+# name grammar (digits only) is shared with rs-worker's state resolver and the
+# supervisor's Stop hook — a pending numeric wake is what makes a WAITING
+# worker read `parked`; anything else in wake/ is ignored by all three.
 while true; do
-    msg="$(ls /workspace/inbox/msg_*.md 2>/dev/null | sort | head -n 1 || true)"
+    now="$(date +%s)"
+    for w in /workspace/wake/*; do
+        [[ -e "$w" ]] || continue
+        base="${w##*/}"
+        [[ "$base" =~ ^([0-9]+)\.md$ ]] || continue
+        due="${BASH_REMATCH[1]}"
+        if (( 10#$due <= now )); then
+            mv "$w" "/workspace/inbox/msg_${now}_wake_${due}.md"
+        fi
+    done
+    msg="$(ls /workspace/inbox/msg_*.md 2>/dev/null | LC_ALL=C sort | head -n 1 || true)"
     if [[ -n "${msg:-}" ]]; then
         rm -f /workspace/WAITING
         run_claude "$msg"

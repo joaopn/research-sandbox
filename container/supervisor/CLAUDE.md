@@ -51,7 +51,8 @@ Worker names are **project-permanent** once used, including after `rs-worker des
   - `research_log.md` — worker's accumulating narrative, one `## Cycle <slug>` section per cycle.
   - `scratch/` — worker's exploration / debug space.
   - `inbox/msg_<ts>.md` — messages queued for the worker.
-  - `WAITING` / `DONE` — runtime sentinels (see *Runtime states*).
+  - `wake/<epoch>.md` — the worker's own scheduled wake-ups (see *Runtime states*: `parked`).
+  - `WAITING` / `DONE` / `FAILED` — runtime sentinels (see *Runtime states*; `FAILED` is the launch-failure marker `status` reads into `failed_reason`).
   - `log.jsonl` — worker's stream-json log (useful for debugging crashed cycles).
 
 The host bind-mount means the PI can browse `/workspace/` with any editor, edit plans directly, and inspect outputs without attaching to the container.
@@ -103,12 +104,13 @@ These are derived at query time from docker + sentinels; they are **not** stored
 | docker status | sentinels | runtime state |
 |---|---|---|
 | running | `WAITING` | `waiting` — idle, ready for input |
+| running | `WAITING` + a pending `wake/<epoch>.md` | `parked` — asleep until its own wake-up (`rs-worker status` → `wakes`); **not terminal**: `wait` blocks through it, `accept` and `shutdown` refuse it |
 | running | — | `working` — claude invocation in progress |
 | exited | `DONE` | `done` — clean SIGTERM-shutdown |
-| exited | — | `failed` — crash |
+| exited | `FAILED` or nothing | `failed` — the agent crashed, or never completed a turn (`rs-worker status` → `failed_reason` carries the exit code and the last log line) |
 | (no container) | n/a | per registry — `down` / `destroyed_*` |
 
-`rs-worker wait` blocks until `{waiting, done, failed}`.
+`rs-worker wait` blocks until `{waiting, done, failed}`. A parked worker scheduled its own resumption to wait on a long job; the wake time is in `rs-worker status` (`wakes`) and `rs-worker list` (`wake_at`). When a `wait` times out with a worker `parked` beyond the budget, do not babysit it: report the parked worker and its wake time to the PI, return control, and re-wait later. A supervisor message to a parked worker is delivered normally (it wakes early; its pending wake still fires afterwards).
 
 ## Planning protocol
 
@@ -185,7 +187,7 @@ To see what MCPs are available to grant to workers, read **both**:
 - `/workspace/.orchestrator/mcp-allow.json` — externally-registered MCPs the project allows (postgres, arxiv, sdp-*, etc.). Each entry has a `name` and an optional `description` — the **PI's project-level intent** for what the MCP gives access to (e.g. "postgres-mcp serves parsed aggregates; mongo-mcp serves raw event logs").
 - `/workspace/.orchestrator/role-mcps.json` — project-internal **role-MCPs** (wrangler, websearcher, librarian, etc.). These are orchestration containers that spawn their own ephemeral `claude -p` per call; you grant them to workers the same way (`--mcps <role-name>`) and the worker reaches them through the same `mcp-proxy:8888/<name>/...` route as external MCPs. Both registries are the project's source of truth — `rs-worker spawn --mcps <name>` accepts entries from EITHER file (the validation gate consults both). Names cannot collide across the two registries.
 
-**Role-MCP calls are async by default.** Every `send_job` to a role spawns a fresh agent (~1 min of startup before work), so workers submit role jobs with `mode=async` and poll `query_job_status` within their turn; `sync` is for short calls only, and a sync call that outlives the daemon's budget (240 s by default) comes back as a structured `sync_timeout` envelope the worker resubmits async. Expect this shape when you review a plan's `## MCPs` section or read a worker's log: a long role job is polled inside the worker's turn, not awaited across turns. <!-- LOCKSTEP (prose, three homes): this paragraph, the worker template's "Calling a role-MCP" section (container/analysis/CLAUDE.md.template) and the daemon's send_job description (container/role-mcp/daemon.py TOOLS_SCHEMA). -->
+**Role-MCP calls are async by default.** Every `send_job` to a role spawns a fresh agent (~1 min of startup before work), so workers submit role jobs with `mode=async` and poll `query_job_status` within their turn; `sync` is for short calls only, and a sync call that outlives the daemon's budget (240 s by default) comes back as a structured `sync_timeout` envelope the worker resubmits async. Expect this shape when you review a plan's `## MCPs` section or read a worker's log: a short role job is polled inside the worker's turn; a long one is waited on by **parking** — the worker writes itself a wake-up (`wake/<epoch>.md`) and ends its turn, reads as `parked` until the wake fires, and is re-invoked then (see *Runtime states*). <!-- LOCKSTEP (prose, three homes): this paragraph, the worker template's "Calling a role-MCP" section (container/analysis/CLAUDE.md.template) and the daemon's send_job description (container/role-mcp/daemon.py TOOLS_SCHEMA). -->
 
 Read both before spawning a worker that needs external tools so you understand what's actually available and why. If the PI references a role-MCP by name (e.g. "use websearcher to find X") and it appears in `role-mcps.json` but not `mcp-allow.json`, that's normal — pass it through `--mcps` and proceed; do not flag it as missing.
 
@@ -241,11 +243,11 @@ When a worker is `waiting`, `done`, or `failed`:
 | PI rejects at staging | `rs-worker unstage <name>`, then `rs-worker message <name> "<correction>. Use slug <new-slug>."` — iterate |
 | Worker still waiting; minor gap | `rs-worker message <name> "<correction>"` — same slug if the cycle's facet is unchanged, otherwise a new slug |
 | Shape gate refused accept | either iterate via message (new slug) or `rs-worker accept --waived "<reason>"` (rare; reason is persisted in the registry cycle entry) |
-| Worker crashed (runtime state = `failed`) | investigate `log.jsonl`, `rs-worker destroy <name> --yes` + `rs-worker spawn <name_v2>` with an amended plan. Name-permanence: the old name is now reserved. |
+| Worker crashed or its agent never launched (runtime state = `failed`) | `rs-worker status <name>` → `failed_reason` (exit code + last log line) and `log.jsonl`. Fix the cause (creds → re-authenticate in this supervisor; the respawn re-stages them — `sync-creds` reaches running workers only; a bad MCP config or model → the plan/spawn flags), then `rs-worker shutdown <name>` (registry `down`) and `rs-worker spawn <name> --plan …` to keep the name and its workdir (an unread inbox message survives and runs after the new brief); `rs-worker destroy <name> --yes` + `spawn <name_v2>` only when you want the name retired. |
 
 `rs-worker accept` refuses on:
 
-- worker not in a terminal state (`done` or `waiting`)
+- worker not in a terminal state (`done` or `waiting`; `parked` refuses — it is asleep waiting on a job)
 - `outputs/<slug>/` is empty
 - `research_log.md` unchanged from the skeleton (first cycle only)
 - no whitelisted files in `outputs/<slug>/` (`.ipynb`, `.py`, `.csv`, `.parquet`, `.png`, `.svg`, `.pdf`, `.md`, …)
@@ -260,10 +262,10 @@ Accept **requires** `--id "<one line: what this deliverable is>"` — it is reco
 
 The PI triggers `/log`. Follow the slash command at `/workspace/.claude/commands/log.md` exactly. In brief:
 
-1. **Preconditions.** Every live worker must be `waiting`. If any is `working`, message them to stop/complete and wait. `/log` refuses while anything is `working`.
+1. **Preconditions.** Every live worker must be `waiting`. If any is `working`, message them to stop/complete and wait; if any is `parked`, either wait for its wake (`rs-worker wait`) or message it to collect what it has and return to `waiting`. `/log` refuses while anything is `working` or `parked`.
 2. **Summary round.** For each live worker, send the summarize-and-prepare-for-shutdown message (template below). Wait for each to return to `waiting`.
 3. **Logbook writes.** One supervisor session log (`logbook/supervisor/<YYYY-MM-DD>-<HHMM>.md`, chronological). N PI topic logs (`logbook/pi/<YYYY-MM-DD>-<slug>.md`, one per coherent topic you covered this session, each with a `**Source:**` cross-reference to the supervisor log).
-4. **Shutdown round.** `rs-worker shutdown <name>` for each live worker. SIGTERM → entrypoint trap → `DONE` → exit → `docker rm`. Registry goes to `state: down`, `last_down_at: <now>`.
+4. **Shutdown round.** `rs-worker shutdown <name>` for each live worker. SIGTERM → entrypoint trap → `DONE` → exit → `docker rm`. Registry goes to `state: down`, `last_down_at: <now>`. `shutdown` refuses a worker that parked itself during the summary turn — wait for its wake or message it, then retry.
 
 Both logs are **immutable** after `/log` — never edited. Corrections are new entries in the next `/log`.
 

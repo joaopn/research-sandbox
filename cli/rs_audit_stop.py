@@ -29,7 +29,11 @@ WORKSPACE = Path("/workspace")
 CONTAINER_PREFIX = "rs-worker-"
 LABEL_WORKER = "research.worker"
 
+# `parked` (idle with a pending wake-up) is deliberately NOT terminal: a parked
+# worker is asleep, not finished, so this audit skips it.
 TERMINAL_STATES = frozenset({"done", "waiting", "failed"})
+# Wake-file name grammar, shared with rs_worker and the worker entrypoint.
+_WAKE_NAME = re.compile(r"^([0-9]+)\.md$")
 
 _READ_PATTERN = re.compile(r'"name"\s*:\s*"Read"')
 
@@ -62,7 +66,22 @@ def _inbox_has_unread(wdir: Path) -> bool:
     )
 
 
+def _pending_wakes(wdir: Path) -> list[int]:
+    wake = wdir / "wake"
+    if not wake.is_dir():
+        return []
+    out: list[int] = []
+    for p in wake.iterdir():
+        m = _WAKE_NAME.match(p.name)
+        if m and p.is_file():
+            out.append(int(m.group(1)))
+    return sorted(out)
+
+
 def _resolve_state(container, wdir: Path) -> str:
+    """LOCKSTEP: a deliberate copy of cli/rs_worker.py::_resolve_state (this
+    hook cannot import rs_worker); change both together — the pytest drives
+    both against one sentinel matrix."""
     state = container.status
     if state == "exited":
         if (wdir / "DONE").exists():
@@ -76,7 +95,7 @@ def _resolve_state(container, wdir: Path) -> str:
         if _inbox_has_unread(wdir):
             return "working"
         if (wdir / "WAITING").exists():
-            return "waiting"
+            return "parked" if _pending_wakes(wdir) else "waiting"
         return "working"
     return state
 

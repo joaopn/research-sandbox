@@ -8,9 +8,12 @@ State model (Stage 1.7): each worker has a persistent registry entry at
     /workspace/.workers/<name>.json
 describing lifecycle state (live | down | destroyed_pre_accept |
 destroyed_post_accept) plus the list of accepted cycles. Runtime state
-(waiting/working/done/failed) is derived on demand from docker + the
-WAITING / DONE sentinels in the bind-mount. Names are project-permanent:
-a destroyed worker's name is tombstoned and can never be reused.
+(waiting/parked/working/done/failed) is derived on demand from docker + the
+WAITING / DONE / FAILED sentinels and the wake/ directory in the bind-mount:
+a WAITING worker with a pending numeric wake file (wake/<epoch>.md, its own
+scheduled resumption) is `parked` — asleep, not finished. Names are
+project-permanent: a destroyed worker's name is tombstoned and can never be
+reused.
 """
 
 from __future__ import annotations
@@ -92,8 +95,15 @@ OUTPUT_WHITELIST_SUFFIXES = (
 OUTPUT_DENYLIST_SUFFIXES = (".pyc", ".tmp")
 OUTPUT_DENYLIST_DIRS = ("__pycache__", ".ipynb_checkpoints")
 
+# `parked` (idle with a pending wake-up) is deliberately in NEITHER set: `wait`
+# blocks through it, `accept` refuses it, `shutdown` refuses it — the worker has
+# not finished, it is asleep until its own wake fires.
 TERMINAL_STATES = frozenset({"done", "waiting", "failed"})
 ACCEPTED_STATES = frozenset({"done", "waiting"})
+# Wake-file name grammar: digits only (epoch seconds) + ".md". Shared with the
+# worker entrypoint's mover and the supervisor Stop hook's resolver mirror —
+# anything else under wake/ is ignored by all three.
+_WAKE_NAME = re.compile(r"^([0-9]+)\.md$")
 POLL_INTERVAL_SEC = 2.0
 DEFAULT_WAIT_TIMEOUT = 540
 # Per-tool-call patience of a worker's claude, in milliseconds (the pinned
@@ -195,11 +205,53 @@ def _inbox_has_unread(wdir: Path) -> bool:
     )
 
 
+def _pending_wakes(wdir: Path) -> list[int]:
+    """Due times (epoch seconds, ascending) of the worker's pending wake files."""
+    wake = wdir / "wake"
+    if not wake.is_dir():
+        return []
+    out: list[int] = []
+    for p in wake.iterdir():
+        m = _WAKE_NAME.match(p.name)
+        if m and p.is_file():
+            out.append(int(m.group(1)))
+    return sorted(out)
+
+
+def _failed_reason(wdir: Path) -> dict | None:
+    """The FAILED marker the entrypoint writes when the agent never completed
+    a turn: {"exit": <int|None>, "reason": <str>}; None when absent."""
+    p = wdir / "FAILED"
+    if not p.is_file():
+        return None
+    out: dict = {"exit": None, "reason": ""}
+    try:
+        # The entrypoint truncates the reason by bytes; a split multibyte
+        # character must not turn `status` into a traceback.
+        for line in p.read_text(errors="replace").splitlines():
+            k, sep, v = line.partition("=")
+            if not sep:
+                continue
+            if k == "exit":
+                out["exit"] = int(v) if v.strip().lstrip("-").isdigit() else None
+            elif k == "reason":
+                out["reason"] = v
+    except (OSError, ValueError):
+        return None
+    return out
+
+
 def _resolve_state(container, wdir: Path) -> str:
     """Map docker container.status + sentinel files to a runtime state.
 
     Returns one of: running, created, restarting, paused, working, waiting,
-    done, failed. ("working" = running without a WAITING sentinel yet.)
+    parked, done, failed. ("working" = running without a WAITING sentinel
+    yet; "parked" = WAITING plus a pending wake file — the worker scheduled
+    its own resumption and is asleep, not finished; "failed" on exit covers
+    both a crash and an agent that never completed a turn — see FAILED.)
+
+    LOCKSTEP: cli/rs_audit_stop.py::_resolve_state is a deliberate copy (the
+    Stop hook cannot import this module); change both together.
     """
     state = container.status
     if state == "exited":
@@ -215,9 +267,19 @@ def _resolve_state(container, wdir: Path) -> str:
         if _inbox_has_unread(wdir):
             return "working"
         if (wdir / "WAITING").exists():
-            return "waiting"
+            return "parked" if _pending_wakes(wdir) else "waiting"
         return "working"
     return state
+
+
+def _iso_epoch(ts: int) -> str:
+    """ISO render of a wake time; a garbage digit run (a millisecond epoch, a
+    typo) must not take `list`/`status` down, so it falls back to the raw
+    number."""
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+    except (OverflowError, OSError, ValueError):
+        return str(ts)
 
 
 def _validate_plan(text: str) -> list[str]:
@@ -441,8 +503,13 @@ def _stage_workdir(name: str, plan_text: str, fresh: bool) -> Path:
     """Stage workdir for (fresh or respawned) worker. Returns workdir path."""
     wdir = worker_dir(name)
     wdir.mkdir(parents=True, exist_ok=True)
-    for sub in ("inbox", "outputs", "scratch", ".claude"):
+    for sub in ("inbox", "outputs", "scratch", "wake", ".claude"):
         (wdir / sub).mkdir(exist_ok=True)
+    # A spawn is a new brief: pending wake-ups from a previous life are noise
+    # (a wake survives a container RESTART, never a respawn).
+    for p in (wdir / "wake").iterdir():
+        if p.is_file():
+            p.unlink()
 
     # Current-session brief, rewritten every spawn.
     (wdir / "task.md").write_text(plan_text.rstrip() + "\n")
@@ -486,7 +553,7 @@ def _stage_workdir(name: str, plan_text: str, fresh: bool) -> Path:
     # which authenticates from `.credentials.json` alone.
 
     # Clear stale runtime sentinels. Entrypoint does this too (belt+braces).
-    for sentinel in ("DONE", "WAITING"):
+    for sentinel in ("DONE", "WAITING", "FAILED"):
         p = wdir / sentinel
         if p.exists():
             p.unlink()
@@ -725,10 +792,12 @@ def _live_row(c, name: str) -> dict:
     dm = c.labels.get(LABEL_MOUNTS, "")
     wdir = worker_dir(name)
     reg = registry_load(name) or {}
+    wakes = _pending_wakes(wdir)
     return {
         "name": name,
         "container": c.name,
         "state": _resolve_state(c, wdir),
+        "wake_at": _iso_epoch(wakes[0]) if wakes else None,
         "registry_state": reg.get("state"),
         "cycles_accepted": len(reg.get("cycles", [])),
         "staging": staging_link(name).is_symlink(),
@@ -856,6 +925,8 @@ def cmd_status(args: argparse.Namespace) -> None:
         "exit_code": (c.attrs.get("State", {}).get("ExitCode") if c else None),
         "done_sentinel": (wdir / "DONE").exists(),
         "waiting_sentinel": (wdir / "WAITING").exists(),
+        "wakes": [_iso_epoch(t) for t in _pending_wakes(wdir)],
+        "failed_reason": _failed_reason(wdir),
         "inbox_unread": inbox,
         "output_slugs": output_slugs,
         "outputs": outputs,
@@ -915,6 +986,19 @@ def cmd_shutdown(args: argparse.Namespace) -> None:
         die(f"no registry entry for {args.name!r}; cannot shut down cleanly")
     if reg.get("state") != REG_LIVE:
         die(f"worker {args.name!r} registry state is {reg.get('state')!r}, not 'live'")
+    # The code half of the session-end gate: a parked worker is asleep, not
+    # finished — shutting it down would lose the job it is waiting on.
+    c.reload()
+    wdir = worker_dir(args.name)
+    if _resolve_state(c, wdir) == "parked":
+        wakes = _pending_wakes(wdir)   # may have just fired (the 2s mover)
+        when = _iso_epoch(wakes[0]) if wakes else "a wake that just fired"
+        die(
+            f"worker {args.name!r} is parked: it scheduled its own wake-up at "
+            f"{when} and is waiting on a job. Either wait for the "
+            f"wake (`rs-worker wait {args.name}`) or `rs-worker message {args.name} …` "
+            f"to bring it back now; shut it down once it is `waiting`."
+        )
 
     # SIGTERM → entrypoint trap → DONE → exit 0. Grace: spec default 10s.
     try:
@@ -1239,7 +1323,11 @@ def cmd_wait(args: argparse.Namespace) -> None:
 
         if time.monotonic() >= deadline:
             in_flight = [n for n in args.name if snap[n]["state"] not in _WAIT_TERMINAL]
-            _print_json({"timeout": True, "in_flight": in_flight})
+            # `states` lets the caller tell a `parked` worker (asleep until its
+            # own wake-up; re-wait later, or report it to the PI) from one
+            # still `working`.
+            _print_json({"timeout": True, "in_flight": in_flight,
+                         "states": {n: snap[n]["state"] for n in in_flight}})
             sys.exit(3)
 
         time.sleep(POLL_INTERVAL_SEC)
@@ -1327,9 +1415,11 @@ def _accept_checks(wdir: Path, container, slug_dir: Path) -> list[str]:
 
     state = _resolve_state(container, wdir)
     if state not in ACCEPTED_STATES:
+        hint = ("the worker is asleep until its own wake-up; wait for it or message it"
+                if state == "parked" else
+                "run `rs-worker wait` first, or investigate a failed run")
         failures.append(
-            f"state is {state!r}; must be 'done' or 'waiting' (run `rs-worker wait` "
-            "first, or investigate a failed run)"
+            f"state is {state!r}; must be 'done' or 'waiting' ({hint})"
         )
         return failures
 
