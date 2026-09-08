@@ -8,6 +8,25 @@
 #   rs-role-mcp sync-creds    manually re-stage supervisor creds into every
 #                             running role-MCP container. Mirrors the
 #                             `rs-pi sync-creds` shape exactly.
+#   rs-role-mcp ping <role>   is the role's daemon up, and what tools does it
+#                             serve — no spawn, no tokens.
+#   rs-role-mcp call <role> <task…>
+#                             run one role task from the supervisor without a
+#                             plan, an approval or a worker spawn: submitted in
+#                             the background by default and polled in-process
+#                             until done (or --no-wait to collect later).
+#   rs-role-mcp job <role> <job_id>
+#                             one status lookup of a background job.
+#
+# The direct client runs INSIDE the role container (docker exec + the
+# container's stdlib python against localhost:8000): the supervisor's own
+# network namespace cannot reach rs-inner, where the daemons live. Exit codes,
+# shared by call and job so a --no-wait + job loop reads uniformly:
+#   0 done · 1 failed (or a protocol error) · 2 usage · 3 wait budget expired /
+#   job still running · 4 the role refused with a tool-error envelope
+#   (needs_credentials, concurrency_limit, sync_timeout, or a daemon-side
+#   error) — printed as-is on stdout, NEVER retried here: the supervisor
+#   decides (its CLAUDE.md names the remedies).
 #
 # Why this script exists: role-MCP containers stage Claude creds at boot
 # from a bind-mounted source and never refresh them mid-life. When the
@@ -31,8 +50,217 @@ usage: rs-role-mcp <subcommand>
   rs-role-mcp list          list running role-MCP containers
   rs-role-mcp sync-creds    propagate supervisor creds to every running
                             role-MCP container (~/.claude/.credentials.json)
+  rs-role-mcp ping <role>   {"role","ok","tools"} on one line; exit 0/1
+  rs-role-mcp call <role> [--caller <id>] [--mode async|sync] [--wait <s>]
+                          [--no-wait] <task…>
+                            run one role task; async (default) submits and
+                            polls query_job_status in-process
+  rs-role-mcp job <role> <job_id>
+                            one status lookup
+  (a task whose first word starts with "--": put "--" before it)
+
+exit codes (call, job): 0 done · 1 failed · 2 usage · 3 wait budget expired
+  or still running · 4 the role refused (tool-error envelope on stdout)
 EOF
     exit 2
+}
+
+# --wait default for `call`: the supervisor drives this from the Bash tool,
+# whose own limit is 600s, so the budget must expire first and hand back a
+# structured {"timeout": true, "job_id": …} the supervisor can `job` later.
+# MIRROR: cli/rs_worker.py::DEFAULT_WAIT_TIMEOUT (same value, same reasoning).
+CALL_WAIT_TIMEOUT=540
+# Poll cadence for the in-process wait. MIRROR: cli/rs_worker.py::POLL_INTERVAL_SEC.
+POLL_INTERVAL_SEC=2
+
+# The in-container client. Quoted heredoc: nothing here expands in bash; the
+# program reaches python through -c and every argument through argv. The two
+# constants above ride in as env. RS_CLIENT_BASE exists for the hermetic
+# pytest (a stub server); the product never sets it.
+# --- client:begin ---
+read -r -d '' CLIENT_PY <<'PY' || true
+import argparse, json, os, socket, sys, time, urllib.error, urllib.request
+
+BASE = os.environ.get("RS_CLIENT_BASE", "http://localhost:8000")
+EXIT_DONE, EXIT_FAILED, EXIT_USAGE, EXIT_WAIT, EXIT_REFUSED = 0, 1, 2, 3, 4
+# Per-request bound for the requests that do no work (/health, tools/list, an
+# async submit, a status lookup — each answers in milliseconds): it only keeps
+# a hung socket from outliving the wait budget, so one value serves all four.
+# A sync send_job is the exception and is bounded by --wait instead.
+RPC_TIMEOUT_S = 15
+
+
+def out(obj):
+    print(json.dumps(obj, sort_keys=True))
+    sys.stdout.flush()
+
+
+def rpc(method, params, timeout):
+    body = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    req = urllib.request.Request(BASE + "/mcp", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    return json.loads(urllib.request.urlopen(req, timeout=timeout).read().decode())
+
+
+def rpc_or_fail(method, params, timeout):
+    """rpc() with every transport failure (daemon still booting, connection
+    reset, bad body) turned into the one-line {"error": …} + exit 1 that
+    every verb promises on stdout — never a traceback."""
+    try:
+        return rpc(method, params, timeout)
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        out({"error": str(e)})
+        sys.exit(EXIT_FAILED)
+
+
+def tool(name, args, timeout):
+    """One tools/call. A JSON-RPC-level error (unknown tool, bad params) is a
+    client/protocol failure → exit 1. A tool-error envelope (isError) is the
+    ROLE refusing — its payload is printed as-is (reason present or not) and
+    the process exits 4; the caller decides, nothing is retried here."""
+    return unwrap(rpc_or_fail("tools/call", {"name": name, "arguments": args}, timeout))
+
+
+def unwrap(r):
+    if "error" in r:
+        out({"error": r["error"]})
+        sys.exit(EXIT_FAILED)
+    res = r.get("result") or {}
+    text = ((res.get("content") or [{}])[0]).get("text", "")
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        payload = {"text": text}
+    if res.get("isError"):
+        out(payload)
+        sys.exit(EXIT_REFUSED)
+    return payload
+
+
+def cmd_ping(a):
+    try:
+        health = json.loads(urllib.request.urlopen(BASE + "/health", timeout=RPC_TIMEOUT_S).read().decode())
+        tools = rpc("tools/list", {}, RPC_TIMEOUT_S).get("result", {}).get("tools", [])
+        out({"role": a.role, "ok": bool(health.get("ok")),
+             "tools": [t.get("name") for t in tools]})
+        sys.exit(EXIT_DONE if health.get("ok") else EXIT_FAILED)
+    except Exception as e:  # unreachable daemon, bad body: one line, exit 1
+        out({"role": a.role, "ok": False, "error": str(e)})
+        sys.exit(EXIT_FAILED)
+
+
+def exit_for(status):
+    return {"done": EXIT_DONE, "failed": EXIT_FAILED}.get(status, EXIT_WAIT)
+
+
+def cmd_job(a):
+    payload = tool("query_job_status", {"job_id": a.job_id}, RPC_TIMEOUT_S)
+    out(payload)
+    sys.exit(exit_for(payload.get("status")))
+
+
+def cmd_call(a):
+    task = " ".join(a.task)
+    args = {"caller": a.caller, "mode": a.mode, "task": task}
+    if a.mode == "sync":
+        # The daemon's own sync bound answers first whenever it is set; this
+        # arm exists for an unbounded daemon (RS_ROLE_SYNC_TIMEOUT_S=0): the
+        # job keeps running under an id the daemon never returned (jobs/).
+        try:
+            r = rpc("tools/call", {"name": "send_job", "arguments": args}, a.wait)
+        except (socket.timeout, urllib.error.URLError, TimeoutError, OSError, ValueError) as e:
+            timed_out = isinstance(e, (socket.timeout, TimeoutError)) or (
+                isinstance(e, urllib.error.URLError) and isinstance(e.reason, socket.timeout))
+            if not timed_out:
+                out({"error": str(e)})
+                sys.exit(EXIT_FAILED)
+            out({"timeout": True, "mode": "sync", "wait": a.wait})
+            sys.exit(EXIT_WAIT)
+        payload = unwrap(r)
+        if "error" in payload:
+            out({"status": "failed", "call_id": payload.get("call_id"), "error": payload["error"]})
+            sys.exit(EXIT_FAILED)
+        out({"status": "done", "call_id": payload.get("call_id"), "result": payload.get("result")})
+        sys.exit(EXIT_DONE)
+    submitted = tool("send_job", args, RPC_TIMEOUT_S)
+    job_id = submitted.get("job_id")
+    if a.no_wait or not job_id:
+        out(submitted)
+        sys.exit(EXIT_DONE)
+    deadline = time.monotonic() + a.wait
+    while True:
+        payload = tool("query_job_status", {"job_id": job_id}, RPC_TIMEOUT_S)
+        if payload.get("status") in ("done", "failed"):
+            out(payload)
+            sys.exit(exit_for(payload["status"]))
+        if time.monotonic() >= deadline:
+            out({"timeout": True, "job_id": job_id, "call_id": submitted.get("call_id")})
+            sys.exit(EXIT_WAIT)
+        time.sleep(a.poll)
+
+
+ap = argparse.ArgumentParser(prog="rs-role-mcp", add_help=False)
+sub = ap.add_subparsers(dest="cmd", required=True)
+p = sub.add_parser("ping"); p.add_argument("role")
+p = sub.add_parser("job"); p.add_argument("role"); p.add_argument("job_id")
+p = sub.add_parser("call"); p.add_argument("role")
+p.add_argument("--caller", default="supervisor")
+p.add_argument("--mode", choices=("async", "sync"), default="async")
+p.add_argument("--wait", type=float, default=float(os.environ.get("RS_CLIENT_WAIT", "540")))
+p.add_argument("--no-wait", action="store_true")
+p.add_argument("task", nargs="+")
+a = ap.parse_args()
+a.poll = float(os.environ.get("RS_CLIENT_POLL", "2"))
+{"ping": cmd_ping, "job": cmd_job, "call": cmd_call}[a.cmd](a)
+PY
+# --- client:end ---
+
+# The role container is rs-<role> (cli/role_mcp.py::role_container_name) AND
+# must carry the research.role_mcp label the launcher sets at enable time —
+# the name alone is not proof (rs-worker-<x> is a worker), so a container
+# without the label is refused even when its name matches. Prints one line
+# on stderr and returns 1 on any refusal; the message is what the caller
+# sees (ping wraps it into its JSON line).
+role_check() {
+    local cn="rs-$1" state
+    state="$(docker container inspect -f '{{.State.Running}} {{index .Config.Labels "research.role_mcp"}}' "$cn" 2>/dev/null)" \
+        || { echo "no role-MCP container $cn (is the role enabled?)" >&2; return 1; }
+    [[ "${state#* }" != "" ]] \
+        || { echo "$cn is not a role-MCP container (no research.role_mcp label)" >&2; return 1; }
+    [[ "${state%% *}" == "true" ]] \
+        || { echo "role-MCP container $cn is not running" >&2; return 1; }
+}
+
+# Run the client inside the role's container.
+role_exec() {
+    local role="$1"; shift
+    local cn="rs-$role" why
+    why="$(role_check "$role" 2>&1)" || { echo "rs-role-mcp: $why" >&2; return 1; }
+    docker exec -e "RS_CLIENT_WAIT=$CALL_WAIT_TIMEOUT" -e "RS_CLIENT_POLL=$POLL_INTERVAL_SEC" \
+        "$cn" /opt/conda/bin/python3 -c "$CLIENT_PY" "$@"
+}
+
+cmd_ping() {
+    [[ $# -eq 1 ]] || usage
+    local why
+    if ! why="$(role_check "$1" 2>&1)"; then
+        # The one-line JSON contract holds on the refusal path too; the role
+        # name goes through an encoder, never string-built.
+        python3 -c 'import json, sys; print(json.dumps({"role": sys.argv[1], "ok": False, "error": sys.argv[2]}))' "$1" "$why"
+        exit 1
+    fi
+    role_exec "$1" ping "$1"
+}
+
+cmd_call() {
+    [[ $# -ge 2 ]] || usage
+    local role="$1"; shift
+    role_exec "$role" call "$role" "$@"
+}
+
+cmd_job() {
+    [[ $# -eq 2 ]] || usage
+    role_exec "$1" job "$1" "$2"
 }
 
 if [[ $# -eq 0 ]]; then
@@ -92,6 +320,9 @@ cmd_sync_creds() {
 case "$1" in
     list)        shift; cmd_list "$@" ;;
     sync-creds)  shift; cmd_sync_creds "$@" ;;
+    ping)        shift; cmd_ping "$@" ;;
+    call)        shift; cmd_call "$@" ;;
+    job)         shift; cmd_job "$@" ;;
     -h|--help)   usage ;;
     *)           echo "rs-role-mcp: unknown subcommand $1" >&2; usage ;;
 esac

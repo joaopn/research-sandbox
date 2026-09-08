@@ -34,7 +34,7 @@ RUN chmod +x /usr/local/bin/rs-inner-firewall
 COPY agent/scripts/rs-pi              /usr/local/bin/rs-pi
 RUN chmod +x /usr/local/bin/rs-pi
 
-# role-MCP-side companion to rs-pi (`list` + `sync-creds`).
+# role-MCP-side CLI (`list`, `sync-creds`, and the direct client `ping`/`call`/`job`).
 COPY agent/scripts/rs-role-mcp        /usr/local/bin/rs-role-mcp
 RUN chmod +x /usr/local/bin/rs-role-mcp
 

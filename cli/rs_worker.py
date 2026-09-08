@@ -104,6 +104,10 @@ ACCEPTED_STATES = frozenset({"done", "waiting"})
 # worker entrypoint's mover and the supervisor Stop hook's resolver mirror —
 # anything else under wake/ is ignored by all three.
 _WAKE_NAME = re.compile(r"^([0-9]+)\.md$")
+# MIRROR: agent/scripts/rs-role-mcp carries the same two values (POLL_INTERVAL_SEC,
+# CALL_WAIT_TIMEOUT) for the supervisor's direct role client — a bash script,
+# so the pair is pinned by regex, not import. 540: under the Bash tool's 600s
+# limit, so `wait` hands back a structured timeout before the tool kills it.
 POLL_INTERVAL_SEC = 2.0
 DEFAULT_WAIT_TIMEOUT = 540
 # Per-tool-call patience of a worker's claude, in milliseconds (the pinned
