@@ -428,7 +428,7 @@ project destroy <name|--all>       Remove container + workspace + network + cred
 --dind {auto,sysbox,privileged}   Container runtime (default: auto)
 --ssh-port <port>          Explicit SSH host port
 --agent / --agents <a[,b]> (docker-substrate boxes) agent dist(s) to deploy at boot
---repo URL --ref SHA       (docker-substrate boxes) clone repo@ref into /workspace/<name> at create
+--repo URL --ref SHA       clone repo@ref into /workspace/<name> at create (docker boxes and sandbox-dind supervisors)
 --setup-script <snippet>   Shell snippet run once after checkout (RS_GITHUB_PAT for a private clone)
 --git-user-name / --git-user-email   git commit identity configured in the box at create
 --role-mcp-upstream ROLE=CSV   Pin an explicit upstream list for a --enable'd role-mcp (repeatable)

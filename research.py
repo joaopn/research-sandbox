@@ -2097,12 +2097,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "(disabled, container not running, host unreachable) print "
                         "a warning and skip; the project still comes up. Add or "
                         "remove later with `research project mcp allow|deny|sync`.")
-    # Light-path harness (WORKFLOW_TAXONOMY_S4) — docker substrate only. These
-    # override the selected workflow's manifest presets. The PAT is NOT a flag (a
+    # Light-path harness — runs on the docker substrate AND on a sandbox-dind
+    # supervisor (create() calls it from both branches). These override the
+    # selected workflow's manifest presets. The PAT is NOT a flag (a
     # CLI arg leaks via `ps` + shell history); read it from RS_GITHUB_PAT instead.
     c.add_argument("--repo", help="https git URL to clone into /workspace/<name> "
-                                  "at create (docker-substrate workflows only; "
-                                  "overrides the workflow's manifest repo)")
+                                  "at create (overrides the workflow's manifest repo)")
     c.add_argument("--ref", help="commit/tag to check out for --repo (required "
                                  "when --repo is given — pins the clone)")
     c.add_argument("--setup-script", dest="setup_script", metavar="SNIPPET",
