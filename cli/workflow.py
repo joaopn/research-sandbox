@@ -368,9 +368,13 @@ def load_catalog(builtin_dir: Path = BUILTIN_DIR,
 
 
 def payload_kind(m: dict) -> str:
-    """One-word description of a manifest's payload for `workflow list`."""
+    """The manifest's payload facets for `workflow list`, every present one
+    named: an image overlay, a repo clone, or both (a store workflow may bake
+    an image AND clone a repo, and hiding the second facet behind the first
+    made such rows read as overlay-only). `bare` when it carries neither."""
+    facets = []
     if _is_str(m.get("image_overlay")):
-        return f"overlay:{m['image_overlay']}"
+        facets.append(f"overlay:{m['image_overlay']}")
     if _is_str(m.get("repo")):
-        return f"repo:{m['repo']}"
-    return "bare"
+        facets.append(f"repo:{m['repo']}")
+    return " + ".join(facets) if facets else "bare"
