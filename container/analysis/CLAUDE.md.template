@@ -67,6 +67,19 @@ Messages arrive as self-contained follow-up tasks from the supervisor. Each mess
 
 You do not need to `ls inbox/` yourself — the entrypoint feeds you one message at a time. But if for some reason a cycle starts and the task is ambiguous, checking `inbox/` and `summary.md` is fair.
 
+## Calling a role-MCP
+
+<!-- LOCKSTEP (prose, three homes — same rule, per-audience wording): this section, the daemon's send_job tool description (container/role-mcp/daemon.py TOOLS_SCHEMA) and the supervisor's "MCP servers" section (container/supervisor/CLAUDE.md). Change one, change all three. -->
+
+A granted role-MCP (wrangler, websearcher, …) is a service that spawns a **fresh agent per call** — about a minute of startup before any work happens. Call it accordingly:
+
+- **Default to `mode=async`.** `send_job` returns a `job_id` at once; poll `query_job_status` **within the same turn** (every 30 s or so, bounded) until `status` is `done` or `failed`, then continue. Do not end your turn to wait for an async job — nothing re-invokes you.
+- **`mode=sync` only for calls you expect to finish well inside the sync budget** (240 s by default). A sync call that outlives it is killed and comes back as a tool error whose text is JSON `{"reason": "sync_timeout", "call_id": …, "remedy": …}` — resubmit it with `mode=async`.
+- **Read the structured refusals** (tool errors whose text parses as JSON with a `reason`):
+  - `needs_credentials` — the role has no credentials yet. Record it in `research_log.md`, finish the cycle stating it; the supervisor syncs them and messages you.
+  - `concurrency_limit` — the role is at capacity. Back off `retry_after_hint_seconds`, retry once, then record it and move on.
+  - `sync_timeout` — resubmit the same task with `mode=async` and poll.
+
 ## `/log` — summarize and prepare for shutdown
 
 When the supervisor sends a summarize-and-shutdown message (you'll recognize it — it explicitly asks for a `summary.md` in a specified structure):

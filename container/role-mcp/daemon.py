@@ -82,6 +82,37 @@ SPAWN_SH = Path(os.environ.get("RS_ROLE_SPAWN_SH",
 # reasoning.
 MAX_CONCURRENT_CALLS = int(os.environ.get("RS_ROLE_MAX_CONCURRENT_CALLS", "0"))
 
+# Daemon-side bound on a `mode=sync` send_job, in seconds. 0 = unbounded.
+# Why a bound exists: every call spawns a fresh `claude -p` (~1 min cold
+# start before any work), the mcp-proxy never propagates a caller's hang-up
+# upstream, and aiohttp does not cancel a handler on disconnect — so without
+# it an abandoned sync call runs to completion holding one concurrency slot
+# for work nobody is waiting for. Why 240: measured sync jobs on the first
+# dogfood project ran 53s–2m39s on trivial queries, so the bound must clear
+# cold start + a short query with margin (120s would cut observed-legitimate
+# calls; 40 min re-opens the slot starvation). Past the bound the spawned
+# process GROUP is killed, the slot is freed and the caller gets a structured
+# `sync_timeout` envelope naming the async remedy.
+# LOCKSTEP (mirror pair, pytest-pinned — the two files cannot import each
+# other): this value MUST stay BELOW cli/rs_worker.py::MCP_TOOL_TIMEOUT_MS
+# (the worker's per-tool-call patience), or the worker's client times out
+# first and the caller sees a bare tool error instead of the envelope.
+# Fixed for now (no per-role field, no Config default): the env override is
+# for test fixtures; a caller that needs longer than this goes async.
+SYNC_TIMEOUT_S = int(os.environ.get("RS_ROLE_SYNC_TIMEOUT_S", "240"))
+
+# Per-tool-call patience of the role's OWN spawned `claude -p` against its
+# upstream MCPs (claude reads MCP_TOOL_TIMEOUT, in milliseconds). Without it
+# the spawn runs claude's built-in default, so a legitimately long upstream
+# read (the wrangler's OLAP queries) fails inside the role even when the
+# worker→role leg is healthy. Same value as the worker's patience for a
+# role call — one number, one reasoning (5 min: above SYNC_TIMEOUT_S, under
+# the Bash tool's 10 min); a role tool call that outlives it fails that job
+# with a clear timeout in the role's log. Applied with setdefault in
+# Spawner.run so a container-level `-e MCP_TOOL_TIMEOUT=…` wins.
+# LOCKSTEP (pytest-pinned): equals cli/rs_worker.py::MCP_TOOL_TIMEOUT_MS.
+MCP_TOOL_TIMEOUT_MS = 300_000
+
 # Retry-hint floor returned in the concurrency_limit payload. Typical
 # send_job in a browser-bearing role takes 20-60s; 30 gives the caller a
 # back-off that's likely to find an open slot without thrashing. Not
@@ -207,6 +238,27 @@ class NeedsCredentialsError(Exception):
         return {
             "reason": "needs_credentials",
             "remedy": "run `rs-role-mcp sync-creds` from the supervisor, then retry",
+        }
+
+
+class SyncTimeoutError(Exception):
+    """Raised by tool_send_job when a `mode=sync` call outlives SYNC_TIMEOUT_S.
+    By the time it is raised the spawned process group is dead, the job file
+    reads failed/sync_timeout and the concurrency slot is freed. Same MCP
+    tool-error envelope shape as the two errors above (`isError: true` +
+    structured JSON text) so the caller's claude can parse
+    `reason: "sync_timeout"` and resubmit with mode=async."""
+
+    def __init__(self, call_id: str) -> None:
+        self.call_id = call_id
+        super().__init__(f"sync_timeout: call_id={call_id} after {SYNC_TIMEOUT_S}s")
+
+    def to_payload(self) -> dict:
+        return {
+            "reason": "sync_timeout",
+            "call_id": self.call_id,
+            "timeout_s": SYNC_TIMEOUT_S,
+            "remedy": "resubmit with mode=async and poll query_job_status",
         }
 
 
@@ -341,6 +393,31 @@ class JobTable:
 # ---------------------------------------------------------------------------
 
 
+def _write_memory_stub(memory_path: Path, caller: str, call_id: str, *,
+                       outcome: str, note: str, err_excerpt: str) -> None:
+    """Per-call memory note written by the daemon when the spawned claude
+    left none — the normal exit path (note `no_log_produced`) and the sync
+    bound's kill path (note `sync_timeout`) share it, so every call leaves a
+    trace for summarize regardless of how it ended."""
+    _atomic_write_text(
+        memory_path,
+        "---\n"
+        f"caller: {caller}\n"
+        f"call_id: {call_id}\n"
+        f"ts: {_iso_now()}\n"
+        f"mode: -\n"
+        f"outcome: {outcome}\n"
+        f"note: {note}\n"
+        "---\n\n"
+        "## Question\n\n(role-worker did not write a per-call log)\n\n"
+        "## Approach\n\n-\n\n"
+        "## What worked\n\n-\n\n"
+        "## What failed\n\n"
+        f"{err_excerpt or '-'}\n\n"
+        "## Lessons\n\n-\n",
+    )
+
+
 class Spawner:
     """Manages the subprocess that runs ``claude -p`` for one call.
     Captures stream-json on disk and the last `result` event's body in
@@ -397,6 +474,9 @@ class Spawner:
         env["RS_ROLE_NAME"] = ROLE
         env["RS_CALL_ID"] = call_id
         env["RS_CALLER"] = caller
+        # The role's own upstream patience (see MCP_TOOL_TIMEOUT_MS); a
+        # container-level override wins.
+        env.setdefault("MCP_TOOL_TIMEOUT", str(MCP_TOOL_TIMEOUT_MS))
 
         # The spawned claude writes its stream-json log to log.jsonl in the
         # per-call dir. The daemon parses the final `result` event from the
@@ -408,6 +488,7 @@ class Spawner:
         system_prompt_file = ""
         if summarize_mode:
             system_prompt_file = str(ROLE_TEMPLATE_DIR / "summarize.md")
+        memory_path = MEMORIES_DIR / caller / f"{call_id}.md"
         try:
             proc = await asyncio.create_subprocess_exec(
                 str(SPAWN_SH),
@@ -420,38 +501,58 @@ class Spawner:
                 cwd=str(call_dir),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                # Own session ⇒ pgid == pid, so the kill below reaches
+                # claude's own children (a stdio MCP server, a browser) and
+                # not just the exec'd claude.
+                start_new_session=True,
             )
         except OSError as e:
             return False, f"spawn failed: {e}"
 
-        await self.jobs.mark_pid(call_id, proc.pid)
-        stdout, stderr = await proc.communicate()
+        # COVERAGE INVARIANT: from here on a pid exists, and cancellation
+        # (tool_send_job's sync bound via asyncio.wait_for) can land at any
+        # await. Every such await MUST sit inside this try so the kill
+        # fires; an await added to run() outside it leaks a live spawn.
+        try:
+            await self.jobs.mark_pid(call_id, proc.pid)
+            stdout, stderr = await proc.communicate()
+        except asyncio.CancelledError:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            # proc.wait() returns once the exit code is known AND the
+            # stdout/stderr pipes are closed — spawn.sh redirects them to
+            # the log file at exec, so only a process that both escaped the
+            # session and still holds them could wedge this await.
+            await proc.wait()
+            # Every call leaves a trace. This handler cannot know WHY it was
+            # cancelled — the sync bound and a daemon shutdown (aiohttp
+            # cancels in-flight handlers and the async _bg tasks on SIGTERM)
+            # both land here — so it records the neutral `cancelled`; the
+            # one caller that knows the bound fired (tool_send_job's
+            # timeout arm) upgrades the note to `sync_timeout`. Summarize
+            # therefore never learns "this query blows the sync budget"
+            # from a routine project stop.
+            if not memory_path.is_file():
+                _write_memory_stub(
+                    memory_path, caller, call_id,
+                    outcome="failure", note="cancelled",
+                    err_excerpt=("killed before exit (cancelled by the daemon); "
+                                 f"partial transcript: {log_path}"),
+                )
+            raise
 
         # Ensure the per-call log exists. If the role-worker didn't write
         # one, drop a stub so summarize sees an entry and the failure
         # mode is bounded.
-        memory_path = MEMORIES_DIR / caller / f"{call_id}.md"
         if not memory_path.is_file():
             stub_outcome = "success" if proc.returncode == 0 else "failure"
             err_excerpt = (stderr.decode(errors="replace")[-500:]
                             if stderr else "")
-            _atomic_write_text(
-                memory_path,
-                "---\n"
-                f"caller: {caller}\n"
-                f"call_id: {call_id}\n"
-                f"ts: {_iso_now()}\n"
-                f"mode: -\n"
-                f"outcome: {stub_outcome}\n"
-                f"note: no_log_produced\n"
-                "---\n\n"
-                "## Question\n\n(role-worker did not write a per-call log)\n\n"
-                "## Approach\n\n-\n\n"
-                "## What worked\n\n-\n\n"
-                "## What failed\n\n"
-                f"{err_excerpt or '-'}\n\n"
-                "## Lessons\n\n-\n",
-            )
+            _write_memory_stub(memory_path, caller, call_id,
+                               outcome=stub_outcome, note="no_log_produced",
+                               err_excerpt=err_excerpt)
 
         last_result = _extract_last_result(log_path)
         if proc.returncode != 0:
@@ -562,11 +663,23 @@ class Memory:
 TOOLS_SCHEMA = [
     {
         "name": "send_job",
+        # LOCKSTEP (prose, three homes — same rule, per-audience wording):
+        # this description (the caller's tool view), the worker template's
+        # "Calling a role-MCP" section (container/analysis/CLAUDE.md.template)
+        # and the supervisor's "MCP servers" section
+        # (container/supervisor/CLAUDE.md). Change one, change all three.
         "description": (
-            f"Send a task to the {ROLE} role-MCP. Mode 'sync' blocks until "
-            "the spawned role-worker exits and returns the result. Mode "
-            "'async' returns a job_id immediately; poll with query_job_status. "
-            "Every call gets a per-call log under memories/<caller>/<call_id>.md."
+            f"Send a task to the {ROLE} role-MCP. EVERY call spawns a fresh "
+            "agent (~1 min of startup before any work), so DEFAULT to "
+            "mode='async' — it returns a job_id at once; poll query_job_status "
+            "in the same turn until done. Use mode='sync' ONLY for calls "
+            "expected to finish well inside the sync budget "
+            + (f"({SYNC_TIMEOUT_S}s, RS_ROLE_SYNC_TIMEOUT_S): a sync call that "
+               "outlives it is killed and returns the tool-error envelope "
+               "{reason: 'sync_timeout', call_id, remedy} — resubmit it async. "
+               if SYNC_TIMEOUT_S > 0 else
+               "(unbounded on this daemon: RS_ROLE_SYNC_TIMEOUT_S=0). ")
+            + "Every call gets a per-call log under memories/<caller>/<call_id>.md."
         ),
         "inputSchema": {
             "type": "object",
@@ -616,6 +729,30 @@ TOOLS_SCHEMA = [
 ]
 
 
+def _note_sync_timeout(caller: str, call_id: str) -> None:
+    """Upgrade the killed call's memory note from the handler's neutral
+    `cancelled` to `sync_timeout` — this is the only place that knows the
+    bound fired. Written when the note is absent (no handler ran, e.g. the
+    spawn never started) or is the daemon's own `cancelled` stub; a per-call
+    log the role-worker managed to write before the kill is never
+    clobbered."""
+    memory_path = MEMORIES_DIR / caller / f"{call_id}.md"
+    if memory_path.is_file():
+        try:
+            existing = memory_path.read_text()
+        except OSError:
+            return
+        if "note: cancelled\n" not in existing:
+            return
+    _write_memory_stub(
+        memory_path, caller, call_id,
+        outcome="failure", note="sync_timeout",
+        err_excerpt=(f"killed at the sync bound "
+                     f"(RS_ROLE_SYNC_TIMEOUT_S={SYNC_TIMEOUT_S}); "
+                     f"partial transcript: {CALLS_DIR / call_id / 'log.jsonl'}"),
+    )
+
+
 async def tool_send_job(jobs: JobTable, spawner: Spawner,
                         args: dict) -> dict:
     caller = args.get("caller")
@@ -639,7 +776,23 @@ async def tool_send_job(jobs: JobTable, spawner: Spawner,
     job_id, call_id = await jobs.register(caller, mode)
 
     if mode == "sync":
-        ok, result = await spawner.run(call_id, caller, task)
+        # Bounded (see SYNC_TIMEOUT_S). wait_for cancels run() at the bound,
+        # whose handler kills the process group and writes the memory stub
+        # BEFORE the TimeoutError reaches us; mark_failed then frees the
+        # slot (its was_running guard makes a double decrement impossible).
+        # `asyncio.TimeoutError` deliberately — on Python < 3.11 the bare
+        # builtin does not match, and an unmatched timeout would escape to
+        # the generic arm with the slot never freed: the exact leak this
+        # bound exists to close. SYNC_TIMEOUT_S is read here at call time.
+        try:
+            ok, result = await asyncio.wait_for(
+                spawner.run(call_id, caller, task),
+                timeout=SYNC_TIMEOUT_S if SYNC_TIMEOUT_S > 0 else None,
+            )
+        except asyncio.TimeoutError:
+            await jobs.mark_failed(call_id, "sync_timeout")
+            _note_sync_timeout(caller, call_id)
+            raise SyncTimeoutError(call_id)
         if ok:
             await jobs.mark_done(call_id, result)
             return {"call_id": call_id, "result": result}
@@ -812,6 +965,15 @@ async def handle_mcp(request: web.Request) -> web.Response:
             print(
                 f"role-mcp[{ROLE}]: refused send_job — needs_credentials "
                 f"(no creds staged; run rs-role-mcp sync-creds)",
+                file=sys.stderr,
+            )
+            return web.json_response(_rpc_result(rid, _tool_text_result(
+                e.to_payload(),
+            ) | {"isError": True}))
+        except SyncTimeoutError as e:
+            print(
+                f"role-mcp[{ROLE}]: killed sync send_job — sync_timeout "
+                f"call_id={e.call_id} after {SYNC_TIMEOUT_S}s (resubmit async)",
                 file=sys.stderr,
             )
             return web.json_response(_rpc_result(rid, _tool_text_result(

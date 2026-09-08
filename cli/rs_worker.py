@@ -96,6 +96,30 @@ TERMINAL_STATES = frozenset({"done", "waiting", "failed"})
 ACCEPTED_STATES = frozenset({"done", "waiting"})
 POLL_INTERVAL_SEC = 2.0
 DEFAULT_WAIT_TIMEOUT = 540
+# Per-tool-call patience of a worker's claude, in milliseconds (the pinned
+# claude build reads MCP_TOOL_TIMEOUT). Exists because a role-MCP call
+# spawns a fresh agent per call (~1 min cold start) and claude's built-in
+# default gave up before the role could answer — 3 of 3 sync calls on the
+# first dogfood project. 300s: ABOVE the role daemon's sync bound so the
+# daemon always answers first and the worker sees its structured
+# `sync_timeout` envelope rather than a bare tool error; under the Bash
+# tool's 600s. Residual cost: a wedged tool call holds the worker's turn
+# for up to 5 min. Set before the `--env` loop in spawn so an explicit
+# `--env MCP_TOOL_TIMEOUT=…` still wins.
+# LOCKSTEP (mirror pair, pytest-pinned — the files cannot import each
+# other): MUST stay ABOVE container/role-mcp/daemon.py::SYNC_TIMEOUT_S
+# (seconds) and EQUAL to daemon.py::MCP_TOOL_TIMEOUT_MS (the role's own
+# upstream patience — one number for both legs).
+MCP_TOOL_TIMEOUT_MS = 300_000
+# Description rendered into a worker's CLAUDE.md for every granted role-MCP
+# (role-mcps.json carries none of its own). One change point for both
+# granted paths in _write_mcp_config. The rule it states is the caller-facing
+# half of the daemon's send_job contract; keep it in step with the three
+# prose homes named in daemon.py's TOOLS_SCHEMA.
+ROLE_MCP_GRANT_DESCRIPTION = (
+    "role-MCP — spawns a fresh agent per call (~1 min startup); "
+    "prefer mode=async + query_job_status; sync only for short calls"
+)
 
 # Registry lifecycle states.
 REG_LIVE = "live"
@@ -292,8 +316,10 @@ def _load_role_mcps_by_name() -> dict[str, dict]:
     minimal — role-MCPs don't carry the external-MCP fields (host_port,
     headers, etc.) and the URL rendering only needs `transport` and `path`,
     both of which fall back to their MCP-server-contract defaults
-    (`http` and `/mcp`). An empty dict per entry suffices and keeps the
-    surface stable if future role-MCP fields appear in role-mcps.json
+    (`http` and `/mcp`). Each entry carries only the shared grant
+    description (ROLE_MCP_GRANT_DESCRIPTION) so the worker's CLAUDE.md
+    block tells it how to call a role; nothing else from role-mcps.json is
+    surfaced, which keeps this stable if future role-MCP fields appear
     without rs_worker needing to learn them."""
     if not ROLE_MCPS_PATH.is_file():
         return {}
@@ -306,7 +332,7 @@ def _load_role_mcps_by_name() -> dict[str, dict]:
     out: dict[str, dict] = {}
     for name, entry in data.items():
         if isinstance(name, str) and isinstance(entry, dict):
-            out[name] = {}
+            out[name] = {"description": ROLE_MCP_GRANT_DESCRIPTION}
     return out
 
 
@@ -336,9 +362,9 @@ def _write_mcp_config(wdir: Path, requested: list[str]) -> tuple[str, list[tuple
         names = sorted((cfg.get("mcpServers") or {}).keys())
         if not names:
             return "", []
-        # role-MCPs don't carry descriptions in v1 — overlay returns
-        # empty-dict entries, so `.get("description", "")` yields "" for
-        # them and the CLAUDE.md block renders bare bullets.
+        # role-MCPs render the shared grant description (async-by-default
+        # rule) via the overlay; external MCPs render their allowlist
+        # description, or a bare bullet when they have none.
         by_name = _load_allowlist_by_name()
         by_name.update(_load_role_mcps_by_name())
         granted = [(n, by_name.get(n, {}).get("description", "")) for n in names]
@@ -618,6 +644,9 @@ def cmd_spawn(args: argparse.Namespace) -> None:
         env["RS_AGENT_MODEL"] = _pair["model"]
         if _pair.get("effort"):
             env["RS_AGENT_EFFORT"] = _pair["effort"]
+    # Role-MCP call patience (see MCP_TOOL_TIMEOUT_MS); before the --env
+    # loop so an explicit override wins (last-wins dict assignment).
+    env["MCP_TOOL_TIMEOUT"] = str(MCP_TOOL_TIMEOUT_MS)
     for kv in args.env:
         k, _, v = kv.partition("=")
         if not k:
