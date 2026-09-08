@@ -1529,6 +1529,36 @@ def webui_passthrough_port_range() -> tuple[int, int]:
     return lo, hi
 
 
+# Project SSH-port block: every project is handed ONE host port from here at
+# create and owns it until destroy (recorded in its marker; see
+# allocate_ssh_port). Defaults = the range the allocator always used: 2240
+# upward, 1000 wide, chosen to stay clear of a sibling tool's 2222-3221 band
+# so the two can share a host. Lockstep with .env.example (pytest-pinned); not
+# in docker-compose.yml — SSH ports are published per project container.
+PROJECT_SSH_PORT_LO_DEFAULT = 2240
+PROJECT_SSH_PORT_HI_DEFAULT = 3239
+
+
+def project_ssh_port_range() -> tuple[int, int]:
+    """Effective project SSH-port block [lo, hi] from .env (defaults above).
+
+    ValidationError on a malformed block — reached from create's pre-flight,
+    whose text reaches the browser verbatim, so it names the KEYS and bounds
+    only, never a file or a remedy (the webui-CLI-mention rule)."""
+    raw_lo = read_env_value("PROJECT_SSH_PORT_LO")
+    raw_hi = read_env_value("PROJECT_SSH_PORT_HI")
+    try:
+        lo = int(raw_lo or PROJECT_SSH_PORT_LO_DEFAULT)
+        hi = int(raw_hi or PROJECT_SSH_PORT_HI_DEFAULT)
+    except ValueError:
+        raise ValidationError("PROJECT_SSH_PORT_LO/HI must be integers")
+    if not (0 < lo <= hi < 65536):
+        raise ValidationError(
+            f"invalid project SSH port block {lo}-{hi} "
+            "(need 0 < PROJECT_SSH_PORT_LO <= PROJECT_SSH_PORT_HI < 65536)")
+    return lo, hi
+
+
 def _coerce_export_port(value: Any) -> int:
     # bool is an int subclass — reject it before the isinstance(int) branch.
     if isinstance(value, bool):
@@ -2532,7 +2562,9 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             gitea.consumer_for(project)))
 
     print(f"=== Creating project: {project} ===")
-    ssh_port = req.ssh_port or find_free_port()
+    # Pre-flight (raises ValidationError, nothing standing yet): the port the
+    # project owns until destroy, recorded in its marker below.
+    ssh_port = allocate_ssh_port(cfg, req.ssh_port, project=project)
     ssh_pass = gen_password()
 
     # 1. Workspace dir (host bind-mount) + optional privileged-DIND volume.
@@ -2573,7 +2605,10 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         role=(req.role_model, req.role_effort))
     marker = {"type": project_type, "substrate": substrate.value,
               "workflow": req.workflow, "agents": deployed_agents,
-              "models": model_pairs}
+              "models": model_pairs,
+              # The project's own record of its SSH host port (allocate_ssh_port
+              # keys on it across stops; start/recreate read it back).
+              "ssh_port": ssh_port}
     if project_type == PROJECT_TYPE_SANDBOX_DIND:
         # Freeze the box-image pins (lane-3): sandbox-dind eager-stages the box
         # harness (STAGE_DIND_UNIFY — the harness is a standing dind utility now,
@@ -3693,17 +3728,130 @@ def gen_password() -> str:
     return secrets.token_urlsafe(16)
 
 
-def find_free_port(base: int = 2240) -> int:
-    # 2240–3239 avoids ADS's 2222–3221 range so the two can coexist on one host.
-    for port in range(base, base + 1000):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind(("", port))
-                return port
-        except OSError:
+def _port_is_free(port: int) -> bool:
+    """Live bind probe: nothing on the host is listening on `port` right now.
+    Sees only LIVE listeners — the reason ownership is recorded elsewhere
+    (allocate_ssh_port): a stopped project's port reads as free here."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("", port))
+            return True
+    except OSError:
+        return False
+
+
+def _read_marker_ssh_port(workspace_path: "Path") -> int | None:
+    """The SSH port recorded in .orchestrator/project.json at create — the
+    project's OWN record of its port, authoritative for start/recreate.
+    Tolerant read (the _read_marker_agents shape): missing/unreadable marker
+    or key, or a non-int, reads as None (a pre-change project; its container
+    binding is then the only record — see _recreate_supervisor)."""
+    f = workspace_path / ".orchestrator" / "project.json"
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    port = data.get("ssh_port") if isinstance(data, dict) else None
+    return port if isinstance(port, int) and not isinstance(port, bool) else None
+
+
+def _recorded_marker_ports(cfg: "Config", *, exclude: str = "") -> dict[str, int]:
+    """project -> SSH port, from every project workspace's marker under
+    projects_dir (stopped projects included — the record outlives the
+    container). `exclude` skips one project's dir: create is about to
+    overwrite that marker, so a stale record left by an earlier failed
+    create of the same name must not count as another owner."""
+    out: dict[str, int] = {}
+    root = Path(cfg.projects_dir).expanduser().resolve()
+    if not root.is_dir():
+        return out
+    for pdir in sorted(p for p in root.iterdir() if p.is_dir()):
+        if pdir.name == exclude:
             continue
-    die(f"could not find a free port starting at {base}")
+        port = _read_marker_ssh_port(pdir / "workspace")
+        if port is not None:
+            out[pdir.name] = port
+    return out
+
+
+def _recorded_container_ports() -> dict[str, int]:
+    """project -> published 22/tcp host port of every supervisor container
+    (running, exited or created — HostConfig.PortBindings is the REQUEST,
+    present in every state). The second ownership source: a pre-change
+    project has no marker key, and a container whose workspace was removed
+    by hand still holds its port. Reads through _read_supervisor_metadata,
+    the one reader of the requested binding (get_ssh_port reads the LIVE
+    NetworkSettings — running-only — and is never an allocation source)."""
+    out: dict[str, int] = {}
+    for c in get_supervisor_containers():
+        try:
+            port = _read_supervisor_metadata(c["name"]).get("ssh_port") or 0
+        except SystemExit:
+            continue   # vanished between ps and inspect
+        if port:
+            out[c["project"]] = int(port)
+    return out
+
+
+def _reserved_host_ports() -> set[int]:
+    """Host ports the product itself publishes (versions.env: the dev-lane
+    gitea, the box registry) — never handed to a project even when that
+    service is not running at create time, or a later `dev enable` would
+    find its port owned by a project."""
+    v = load_versions()
+    out: set[int] = set()
+    for key, default in (("GITEA_HOST_PORT", gitea.DEFAULT_GITEA_HOST_PORT),
+                         ("REGISTRY_HOST_PORT", DEFAULT_REGISTRY_HOST_PORT)):
+        try:
+            out.add(int(v.get(key) or default))
+        except ValueError:
+            continue
+    return out
+
+
+def allocate_ssh_port(cfg: "Config", explicit: int | None = None, *,
+                      project: str = "") -> int:
+    """The SSH host port a new project owns until destroy.
+
+    `taken` = every existing project's recorded port (marker scan + every
+    supervisor container's published binding, stopped ones included) plus
+    the product's own host ports. An explicit port (the hidden --ssh-port)
+    must be inside the block, not taken, and not live-busy — refused with
+    ValidationError BEFORE any side effect (nothing is created on refusal);
+    the text names keys/holders only (browser-verbatim). Otherwise the
+    lowest block port that is not taken and passes the live probe — lowest
+    first, so a destroyed project's port is reused by the next create."""
+    lo, hi = project_ssh_port_range()
+    holders: dict[int, str] = {}
+    for name, port in _recorded_marker_ports(cfg, exclude=project).items():
+        holders.setdefault(port, name)
+    for name, port in _recorded_container_ports().items():
+        holders.setdefault(port, name)
+    taken = set(holders) | _reserved_host_ports()
+    if explicit is not None:
+        if not (lo <= explicit <= hi):
+            raise ValidationError(
+                f"ssh_port {explicit} is outside the project SSH port block "
+                f"{lo}-{hi} (PROJECT_SSH_PORT_LO/HI)")
+        if explicit in holders:
+            raise ValidationError(
+                f"ssh_port {explicit} is recorded by project {holders[explicit]!r}; "
+                "a project owns its port until it is destroyed")
+        if explicit in taken:
+            raise ValidationError(
+                f"ssh_port {explicit} is reserved for a host service")
+        if not _port_is_free(explicit):
+            raise ValidationError(f"ssh_port {explicit} is in use on the host")
+        return explicit
+    for port in range(lo, hi + 1):
+        if port in taken:
+            continue
+        if _port_is_free(port):
+            return port
+    raise ValidationError(
+        f"no free port in the project SSH port block {lo}-{hi} "
+        f"({len(taken)} recorded or reserved; PROJECT_SSH_PORT_LO/HI)")
 
 
 # ---------------------------------------------------------------------------
@@ -6194,7 +6342,11 @@ def _recreate_supervisor(
         project=project,
         network=network,
         workspace_path=workspace_path,
-        ssh_port=md["ssh_port"],
+        # The marker is the authority (the port the project owns); the old
+        # container's binding is the only record a pre-change project has
+        # and stays as the fallback — read-only, no write-back (a marker
+        # read-modify-write is the clobber class B31 describes).
+        ssh_port=_read_marker_ssh_port(workspace_path) or md["ssh_port"],
         ssh_pass=md["ssh_pass"],
         dns_servers=cfg.sandbox_dns,
         memory=md["memory"],
@@ -6525,7 +6677,11 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
     network = project_network_for(project)
     docker_args = build_supervisor_docker_args(
         container_name=container, project=project, network=network,
-        workspace_path=workspace_path, ssh_port=md["ssh_port"],
+        workspace_path=workspace_path,
+        # Marker first, container binding as the pre-change fallback (same
+        # reasoning as _recreate_supervisor). A docker-substrate project
+        # reaches this only on a recreate; plain docker start keeps its port.
+        ssh_port=_read_marker_ssh_port(workspace_path) or md["ssh_port"],
         ssh_pass=md["ssh_pass"], dns_servers=cfg.sandbox_dns,
         memory=md["memory"], cpus=md["cpus"], image=MINIMAL_IMAGE,
         dind_mode=md["dind_mode"], inner_firewall=md["inner_firewall"],
