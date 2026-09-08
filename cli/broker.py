@@ -340,6 +340,13 @@ def _verb_workflows(_args: dict, _progress=None) -> dict:
         # real gate is from_kwargs' node floor. Same "only offer what's deployable"
         # motive as `agents` staged-state.
         "node_present": rscore.node_dist_present(),
+        # The host-declared browser-mountable data roots (RESOLVED, as the gate
+        # compares them). The create form shows its data-mount control ONLY
+        # when this is non-empty (no dead-end control; the declaration is a
+        # host-side bootstrap step the browser never names). A malformed entry
+        # raises ValidationError here — fail-early on the Workflows page, the
+        # SSH-port-block posture — so a misconfiguration is seen, not hidden.
+        "data_roots": [str(r) for r in rscore.data_mount_roots()],
         "default_workflow": rscore.DEFAULT_WORKFLOW,
     }
 
@@ -465,6 +472,12 @@ def _verb_start(args: dict, progress=None) -> list[dict]:
 # (name regex, workflow membership, egress enum, enable/disable token lists).
 # `workflow` is the user-facing selector (substrate + flavor are derived from its
 # manifest, never relayed); the old `type` flag is gone (WORKFLOW_TAXONOMY_S3).
+# ONE gated exception lives OUTSIDE this set: `data` (a bind-mount SOURCE) is
+# honoured by _verb_create only through rscore's root gate — every relayed path
+# must resolve inside a host-declared DATA_MOUNT_ROOTS subtree — and is never
+# forwarded raw. It stays absent here on purpose: this set's contract ("never a
+# path/host-shaped field") is byte-for-byte unchanged, and the gate is the one
+# visibly-special line a reviewer has to look at.
 CREATE_WEBUI_FIELDS = frozenset({
     "name", "workflow", "egress", "enable", "disable", "memory", "cpus",
     # Light-path harness payload (WORKFLOW_TAXONOMY_S4). repo/ref/setup are
@@ -528,6 +541,18 @@ UPDATE_WEBUI_FIELDS = frozenset({
 
 def _verb_create(args: dict, progress=None) -> dict:
     safe = {k: v for k, v in args.items() if k in CREATE_WEBUI_FIELDS}
+    # The webui data mounts (the maintainer-ruled, gated revision of the
+    # host-root boundary): a relayed `data` never reaches from_kwargs raw. Each
+    # path is resolved (symlinks followed) and refused unless it lies at or
+    # under a root the operator declared host-side in .env (DATA_MOUNT_ROOTS,
+    # read fresh per request — no restart). What from_kwargs receives is the
+    # RESOLVED tuple. A refusal is a ValidationError BEFORE any side effect
+    # (dispatch's validation envelope; nothing created). The coercion mirrors
+    # from_kwargs' own (_as_tuple: a browser list or a comma string).
+    raw_data = args.get("data")
+    if raw_data is not None:
+        safe["data"] = rscore.resolve_data_paths_within_roots(
+            rscore._as_tuple(raw_data), rscore.data_mount_roots())
     req = rscore.CreateRequest.from_kwargs(**safe)  # may raise ValidationError
     return dataclasses.asdict(rscore.create(req, progress=progress))
 

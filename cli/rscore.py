@@ -1557,6 +1557,128 @@ def project_ssh_port_range() -> tuple[int, int]:
     return lo, hi
 
 
+# Browser-mountable data roots (the webui create dialog's data mounts). The
+# operator declares, once and host-side, the subtrees a BROWSER-created project
+# may bind-mount read-only under /workspace/shared/data/<basename>/; the broker
+# refuses any relayed path that does not resolve (symlinks followed) to a
+# location at or under one of them. Host-side by construction: the webui can
+# never widen this list (it lives in the tracked .env, which no broker verb
+# writes). Read FRESH per request through read_env_value, like the SSH-port
+# block above — an edit takes effect on the next create with no restart. The
+# host CLI's --data is NOT gated: that caller already holds a host shell. The
+# key name is a lockstep with .env.example (pytest-pinned).
+DATA_MOUNT_ROOTS_KEY = "DATA_MOUNT_ROOTS"
+
+
+def _resolve_host_path(raw: str, what: str) -> Path:
+    """Resolve an absolute host path string for the data-mount gate.
+
+    Non-strict, so a not-yet-existing tail (a directory create() will mkdir)
+    resolves as far as it exists; symlinks are followed, which is the whole
+    point — the gate compares REAL locations. A relative or ``~`` path would
+    resolve against the broker's cwd/home, so it is refused outright. resolve()
+    raises ValueError/OSError on a path the OS cannot lstat (an embedded NUL
+    from a JSON body, an over-long component); those become ValidationError
+    so the broker answers with an envelope instead of a truncated reply (its
+    dispatch maps only ValidationError/HarnessError/SystemExit)."""
+    if not raw.startswith("/"):
+        raise ValidationError(f"{what} must be an absolute host path: {raw}")
+    try:
+        return Path(raw).resolve()
+    except (ValueError, OSError):
+        raise ValidationError(f"{what} is not a usable host path: {raw!r}")
+
+
+def data_mount_roots() -> tuple[Path, ...]:
+    """The declared browser-mountable roots from .env, RESOLVED and de-duplicated
+    (order kept). Unset or empty ⇒ (). A relative entry raises ValidationError
+    naming the KEY only (the text reaches the browser verbatim through the
+    workflows and create verbs — no file, no remedy), same wording rule as
+    project_ssh_port_range."""
+    raw = read_env_value(DATA_MOUNT_ROOTS_KEY)
+    roots: list[Path] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        r = _resolve_host_path(entry, f"{DATA_MOUNT_ROOTS_KEY} entry")
+        if r not in roots:
+            roots.append(r)
+    return tuple(roots)
+
+
+def resolve_data_paths_within_roots(paths: Sequence[str],
+                                    roots: Sequence[Path]) -> tuple[str, ...]:
+    """The browser data-mount gate: resolve each requested host path and refuse
+    it unless it is one of ``roots`` or lies strictly under one. Returns the
+    RESOLVED paths as strings, de-duplicated (two spellings of one target — a
+    symlink and its target — collapse here, else create()'s own basename
+    collision check would self-collide), in request order.
+
+    Deliberately NOT checked here: basename collisions and exists-but-not-a-dir
+    — create()'s data block keeps those for both front-ends. The refusal text
+    shows the RESOLVED path so a symlink escape is visible for what it is.
+    Residual (accepted): a symlink swapped between this resolve and create()'s
+    own resolve of the same string is a host-side race that needs write access
+    inside a declared root — the trust the declaration already grants."""
+    out: list[str] = []
+    for raw in paths:
+        raw = raw.strip()
+        if not raw:
+            continue
+        p = _resolve_host_path(raw, "data path")
+        if not roots:
+            raise ValidationError(
+                "no mountable data roots are declared on this host")
+        if not any(p == r or r in p.parents for r in roots):
+            raise ValidationError(
+                f"data path {p} is outside the declared mountable roots "
+                f"({', '.join(str(r) for r in roots)})")
+        s = str(p)
+        if s not in out:
+            out.append(s)
+    return tuple(out)
+
+
+def _prepare_data_mounts(paths: Sequence[str]) -> tuple[dict[str, Path], list[str]]:
+    """Turn the requested data paths into (basename → host source, docker -v
+    args), creating a missing directory (so a producer can start writing into
+    it later). Shared by both front-ends — the CLI's --data and the webui's
+    root-gated data field — so every refusal text here reaches the browser
+    verbatim: flag-neutral, no host-filesystem remedy. Refusals are die()
+    (a `failed` envelope through the broker; the CLI's normal exit), and a
+    filesystem error while preparing a path (a file where a directory is
+    expected, a parent the operator cannot write) is mapped to the same
+    channel — an unwrapped OSError would escape the broker's dispatch as a
+    truncated reply. Missing-path creation is the ONLY side effect and only
+    happens for a path the caller was allowed to name."""
+    extra_mounts: list[str] = []
+    data_basenames: dict[str, Path] = {}
+    for raw in paths:
+        raw = raw.strip()
+        if not raw:
+            continue
+        p = Path(raw).expanduser().resolve()
+        try:
+            if p.exists() and not p.is_dir():
+                die(f"data path exists but is not a directory: {p}")
+            if not p.exists():
+                p.mkdir(parents=True, exist_ok=True)
+                print(f"created data directory: {p}")
+        except OSError as e:
+            die(f"data path cannot be prepared: {p} ({e.strerror or e})")
+        base = p.name
+        if not base:
+            die(f"data path has no basename (refusing to mount root): {p}")
+        if base in data_basenames:
+            die(f"data basename collision: {base!r} appears in both "
+                f"{data_basenames[base]} and {p}; each mounted path needs "
+                "a distinct final directory name.")
+        data_basenames[base] = p
+        extra_mounts += ["-v", f"{p}:/workspace/shared/data/{base}:ro"]
+    return data_basenames, extra_mounts
+
+
 def _coerce_export_port(value: Any) -> int:
     # bool is an int subclass — reject it before the isinstance(int) branch.
     if isinstance(value, bool):
@@ -2513,31 +2635,13 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     if egress not in ("open", "locked"):
         die(f"invalid --egress value: {egress!r} (expected open|locked)")
 
-    # Optional --data bind-mounts (RO inside supervisor), each at
-    # /workspace/shared/data/<basename>/. Missing paths are mkdir -p'd;
-    # basename collisions are a hard error.
-    extra_mounts: list[str] = []
-    data_basenames: dict[str, Path] = {}
-    for raw in req.data:
-        raw = raw.strip()
-        if not raw:
-            continue
-        p = Path(raw).expanduser().resolve()
-        if p.exists() and not p.is_dir():
-            die(f"--data path exists but is not a directory: {p}")
-        if not p.exists():
-            p.mkdir(parents=True, exist_ok=True)
-            print(f"created data directory: {p}")
-        base = p.name
-        if not base:
-            die(f"--data path has no basename (refusing to mount root): {p}")
-        if base in data_basenames:
-            die(f"--data basename collision: {base!r} appears in both "
-                f"{data_basenames[base]} and {p}. Rename or symlink "
-                "one of the host paths so the container destinations "
-                "stay distinct.")
-        data_basenames[base] = p
-        extra_mounts += ["-v", f"{p}:/workspace/shared/data/{base}:ro"]
+    # Optional data bind-mounts (the CLI's --data, or the webui's data field
+    # after the broker's root gate — resolve_data_paths_within_roots hands
+    # this RESOLVED absolute paths), RO inside the container, each at
+    # /workspace/shared/data/<basename>/. Pure host-side preparation, no
+    # container yet: a refusal here leaves nothing but a directory created
+    # inside a path the caller was allowed to name.
+    data_basenames, extra_mounts = _prepare_data_mounts(req.data)
 
     # Dev lane: resolve the base branch to a CONCRETE name BEFORE any side
     # effect. It has to be concrete because the clone and the agent's CLAUDE.md
