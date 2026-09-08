@@ -333,6 +333,43 @@ def cmd_reopen(args) -> None:
     print(f"\ncd {path}")
 
 
+def landing_state(repo: Path, branch: str, name: str, base: str) -> str:
+    """Label for a branch with NO tracking ref (origin/<branch> absent). Absence
+    has two causes: never pushed, or pushed + landed by rs-land — which deletes
+    the fork branch at the landing — + pruned by the next `fetch --prune`
+    (`rs-wt new` runs one), after which every landed tree used to read "not
+    pushed" and the hint inverted its purpose (it discouraged the cleanup it
+    should invite). Evidence, in order:
+      1. rs-land's archive tag `<pr>-<name>` sitting on the tip — the durable
+         record of a landing. git auto-follows a tag whose commit it already
+         has, so the same fetch that pruned the tracking ref brought the tag:
+         a local read, no network.
+      2. Patch-integration into the base (git cherry against origin/<base>):
+         every commit applied commit-for-commit under another id (a
+         per-commit collection, or a single-commit PR squashed) → landed;
+         no commit beyond the base at all (a fast-forwarded landing before
+         collection, a landing that left no tag, or a fresh tree) → nothing
+         to push; any commit the base lacks → not pushed. Known limit: a
+         multi-commit PR the maintainer SQUASHED matches no per-commit
+         patch-id, so once its tip has left the archive tag it reads not
+         pushed again."""
+    tags = git(repo, "tag", "--points-at", branch)
+    if tags.returncode == 0:
+        for t in tags.stdout.split():
+            if re.fullmatch(rf"\d+-{re.escape(name)}", t):
+                return f"landed (tag {t})"
+    if base and git(repo, "rev-parse", "--verify", "--quiet",
+                    f"refs/remotes/origin/{base}").returncode == 0:
+        ch = git(repo, "cherry", f"origin/{base}", branch)
+        if ch.returncode == 0:
+            lines = [ln for ln in ch.stdout.splitlines() if ln.strip()]
+            if not lines:
+                return "nothing to push"
+            if all(ln.startswith("-") for ln in lines):
+                return "landed (integrated)"
+    return "not pushed"
+
+
 def cmd_list(args) -> None:
     repo = gated_clone()
     r = git(repo, "symbolic-ref", "--short", "HEAD")
@@ -348,6 +385,7 @@ def cmd_list(args) -> None:
     prefix = str(WT_ROOT) + "/"
     open_branches = set()
     rows = []
+    landed = []
     for path in sorted(p for p in wts if p.startswith(prefix)):
         info = wts[path]
         name = Path(path).name
@@ -367,12 +405,17 @@ def cmd_list(args) -> None:
                 cnt = n.stdout.strip() if n.returncode == 0 else "?"
                 pushed = "pushed" if cnt == "0" else f"{cnt} unpushed"
             else:
-                pushed = "not pushed"
+                pushed = landing_state(repo, branch, name, wb)
+                if pushed.startswith("landed"):
+                    landed.append(name)
         else:
             pushed = "-"
         rows.append(f"  {name}  [{branch}]  {tipline}  ({dirty}, {pushed})")
     print(f"worktrees under {WT_ROOT}:")
     print("\n".join(rows) if rows else "  (none)")
+    if landed:
+        print("landed trees are safe to remove: "
+              + ", ".join(f"`rs-wt done {n}`" for n in landed))
     r = git(repo, "for-each-ref", "--format=%(refname:short)",
             f"refs/heads/{BRANCH_PREFIX}")
     orphans = [b for b in r.stdout.split()
@@ -421,8 +464,12 @@ def cmd_done(args) -> None:
                 warn(f"branch {branch} has {n.stdout.strip()} commit(s) not "
                      f"on the fork — it stays local until you push")
         else:
-            warn(f"branch {branch} was never pushed — it stays local until "
-                 f"you push")
+            state = landing_state(repo, branch, args.name, wiring_base())
+            if state == "not pushed":
+                warn(f"branch {branch} was never pushed — it stays local "
+                     f"until you push")
+            else:
+                print(f"branch {branch}: {state} — the tree is safe to remove")
     rm = ["worktree", "remove"]
     if args.force:
         rm.append("--force")
