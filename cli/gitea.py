@@ -548,6 +548,16 @@ class GiteaClient:
             time.sleep(1)
         raise GiteaError(f"fork {as_user}/{repo} did not appear in time")
 
+    def set_default_branch(self, owner: str, repo: str, branch: str) -> None:
+        """PATCH ONLY the default branch (unnamed EditRepoOption fields are
+        preserved). Gitea answers 200 without changing anything when the repo
+        does not carry <branch>, so the caller reads it back to know."""
+        self._api("PATCH", f"/repos/{owner}/{repo}", {"default_branch": branch})
+
+    def default_branch(self, owner: str, repo: str) -> str:
+        data = self._api("GET", f"/repos/{owner}/{repo}") or {}
+        return str(data.get("default_branch") or "") if isinstance(data, dict) else ""
+
     def set_repo_features(self, owner: str, repo: str, features: dict) -> None:
         """PATCH a repo's unit flags. Idempotent (re-runnable on resume); every
         EditRepoOption field is optional, so unnamed fields (private, default
@@ -785,13 +795,20 @@ def mirror_has_branch(host_port: str, repo: str, branch: str) -> bool:
     return client.branch_exists(ADMIN_USER, repo, branch)
 
 
-def provision_consumer(host_port: str, repo: str, user: str) -> None:
+def provision_consumer(host_port: str, repo: str, user: str,
+                       default_branch: str = "") -> None:
     """Create-or-reuse one consumer's identity for one repo: gitea user +
     mirror read-grant + fork into the consumer namespace + operator read-grant
     on the fork (the universal-fetch valve) + the fork's issue channel + a
     user-scoped token file. Every stage is exists-checked/idempotent (the
     add-repo resume discipline), so a re-run heals a fork that predates the
-    feature block."""
+    feature block.
+
+    ``default_branch`` (the resolved dev base, when the caller has one) is set
+    on the FORK — never the mirror, whose default is GitHub's — so a PR opened
+    by hand in the Gitea UI pre-selects the base every RS tool already names.
+    A convenience, never a floor: any failure warns and continues, and a silent
+    no-change (gitea 200s a branch the fork lacks) is detected by read-back."""
     import secrets as _secrets
     client = GiteaClient(api_base(host_port), read_admin_token())
     client.create_user(user, _secrets.token_urlsafe(24))
@@ -807,6 +824,21 @@ def provision_consumer(host_port: str, repo: str, user: str) -> None:
         client.subscribe(user, repo)
     except GiteaError as e:
         print(f"warning: could not watch {user}/{repo} ({e})", file=sys.stderr)
+    if default_branch:
+        try:
+            client.set_default_branch(user, repo, default_branch)
+            got = client.default_branch(user, repo)
+        except GiteaError as e:
+            print(f"warning: could not set the default branch of {user}/{repo} "
+                  f"to {default_branch!r} ({e}); PRs opened by hand in the "
+                  f"Gitea tab will pre-select the fork's current default",
+                  file=sys.stderr)
+        else:
+            if got != default_branch:
+                print(f"warning: {user}/{repo} kept default branch {got!r} — "
+                      f"it does not carry {default_branch!r} yet; PRs opened by "
+                      f"hand in the Gitea tab will pre-select {got!r}",
+                      file=sys.stderr)
     mint_or_rotate_token(user)                    # writes tokens/<user>.token
 
 

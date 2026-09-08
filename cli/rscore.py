@@ -2850,7 +2850,8 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
                 dev_user = gitea.agent_username(gitea.consumer_for(project))
                 try:
                     gitea.provision_consumer(_gitea_host_port(), req.dev_repo,
-                                             dev_user)
+                                             dev_user,
+                                             default_branch=effective_dev_branch)
                 except gitea.GiteaError as e:
                     # Mid-side-effect (mirrors the adjacent no-IP die): a raw
                     # GiteaError would escape dispatch into socketserver.
@@ -9455,7 +9456,8 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         box_user = gitea.agent_username(
             gitea.consumer_for(req.project, req.name))
         try:
-            gitea.provision_consumer(_gitea_host_port(), req.repo, box_user)
+            gitea.provision_consumer(_gitea_host_port(), req.repo, box_user,
+                                     default_branch=effective_branch)
         except gitea.GiteaError as e:
             raise ValidationError(str(e))
         gitea.record_attachment(req.project, "agent", req.repo, ip,
@@ -10081,10 +10083,6 @@ def dev_attach(req: "DevAttachRequest", _progress=None) -> DevAttachResult:  # t
     # provision the PROJECT consumer (user + fork + token). Boxes provision
     # their own consumers in box_add, never through here (4c-a).
     dev_user = gitea.agent_username(gitea.consumer_for(req.project))
-    try:
-        gitea.provision_consumer(_gitea_host_port(), req.repo, dev_user)
-    except gitea.GiteaError as e:
-        raise ValidationError(str(e))
     # PRESERVE the recorded branch. record_attachment REPLACES on
     # (project, class, repo, box), and the same-repo re-attach is the ONLY live
     # path here — the single-repo guard above hard-refuses a different repo — so
@@ -10092,12 +10090,18 @@ def dev_attach(req: "DevAttachRequest", _progress=None) -> DevAttachResult:  # t
     # silently re-point the agent's prompt at the repo default while its clone
     # stays on the chosen branch: no error, just wiring that lies. Resolve ONLY
     # when there is nothing to preserve (a first attach, or a pre-change entry).
+    # Resolved BEFORE the provision so the fork's default branch can follow it.
     prior = next((e for e in gitea.project_entries(req.project)
                   if e.get("class") == "agent" and e.get("repo") == req.repo
                   and e.get("box") is None), None)
     branch = (prior or {}).get("branch") or ""
     if not branch:
         branch = _resolve_dev_branch(req.repo, "")
+    try:
+        gitea.provision_consumer(_gitea_host_port(), req.repo, dev_user,
+                                 default_branch=branch)
+    except gitea.GiteaError as e:
+        raise ValidationError(str(e))
     gitea.record_attachment(req.project, "agent", req.repo, ip,
                             box=None, user=dev_user, branch=branch)
     cfg = load_config()
