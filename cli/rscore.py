@@ -231,7 +231,7 @@ def _resolve_workflow(workflow_id: str) -> tuple[dict, "ProjectType", "Substrate
     m = catalog.get(workflow_id)
     if m is None:
         raise ValidationError(
-            f"unknown workflow {workflow_id!r}; see `research workflow list`")
+            f"unknown workflow {workflow_id!r}; the Workflows page lists the catalog")
     substrate = Substrate(m["substrate"])  # manifest substrate is schema-validated
     mgmt_overlay = SANDBOX_DIND_IMAGE.split(":", 1)[0]  # "rs-sandbox-dind"
     if m["substrate"] == Substrate.DOCKER.value:
@@ -888,8 +888,9 @@ class CreateRequest:
                     "(dind substrate + the rs-sandbox-dind overlay); fix the manifest")
             if not dev_repo:
                 raise ValidationError(
-                    "the dev workflow requires --dev-repo <repo> (a repo added via "
-                    "`research dev repo add <github-url>`)")
+                    "the dev workflow requires --dev-repo <repo> (a repo added "
+                    "first: the dev workflow card and the dev box dialog take "
+                    "its GitHub URL)")
             if not _valid_dev_repo_name(dev_repo):
                 raise ValidationError(f"invalid dev repo name {dev_repo!r}")
             # dev_repo_preflight is a KWARG-ONLY seam (never a dataclass field,
@@ -901,8 +902,8 @@ class CreateRequest:
             if (kw.get("dev_repo_preflight", True)
                     and not gitea.mirror_present(dev_repo)):
                 raise ValidationError(
-                    f"repo {dev_repo!r} not added yet — run "
-                    f"`research dev repo add <github-url>` first")
+                    f"repo {dev_repo!r} not added yet — add it first (the dev "
+                    f"workflow card and the dev box dialog take its GitHub URL)")
         elif dev_repo:
             raise ValidationError(
                 "--dev-repo is only valid with a dev workflow (e.g. --workflow dev)")
@@ -937,8 +938,7 @@ class CreateRequest:
                     f"unknown agent {a!r} (known: {', '.join(KNOWN_AGENTS)})")
             if substrate is Substrate.DOCKER and not dist_present(a):
                 raise ValidationError(
-                    f"agent {a!r}: no cached dist — run "
-                    f"`research agent pull --agent {a}` first")
+                    f"agent {a!r}: no cached dist — pull it under Management → Software first")
             # The dind stage is flat single-default (_stage_agent_dist stages
             # DEFAULT_AGENT only) — refuse rather than silently ignore a
             # non-default selection. Unreachable while KNOWN_AGENTS is
@@ -962,8 +962,7 @@ class CreateRequest:
         # above.) `research start` auto-pulls if absent, so this floor rarely trips.
         if substrate is Substrate.DIND_SYSBOX and not dist_present(DEFAULT_AGENT):
             raise ValidationError(
-                f"no cached {DEFAULT_AGENT} dist — run `research agent pull` first "
-                f"(or `research start`, which auto-pulls)")
+                f"no cached {DEFAULT_AGENT} dist — pull it under Management → Software first")
         # Editor floor (STAGE_EDITOR_DIST slice 2 — PI chose fail-fast): ANY
         # project whose editor will be ENABLED needs a pulled editor dist (no bake
         # anymore), so you never get a supervisor / box with a missing Editor tab.
@@ -981,8 +980,7 @@ class CreateRequest:
             svc_en, svc_dis, base=(service_defaults or None)).get("code-server", True)
         if editor_on and not editor_dist_present():
             raise ValidationError(
-                "no cached editor dist — run `research editor pull` first "
-                "(or `research start`, which auto-pulls)")
+                "no cached editor dist — pull it under Management → Software first")
         # Reader floor + docker rejection (STAGE_READER). The reader is a
         # dind-only supervisor service: on the docker substrate nothing deploys it
         # (entrypoint.minimal.sh has no reader block, no dist mount), so an enabled
@@ -1000,7 +998,7 @@ class CreateRequest:
                 "(it is a research-workflow supervisor service) — drop `--enable reader`")
         if reader_on and substrate is Substrate.DIND_SYSBOX and not reader_dist_present():
             raise ValidationError(
-                "no cached reader dist — run `research reader pull` first")
+                "no cached reader dist — pull it under Management → Software first")
         # Node seed floor (STAGE_NODE_SEED). SUBSTRATE-AGNOSTIC (unlike the reader's
         # dind-only floor): node reaches all three flavors, so the check is a plain
         # dist-presence gate. Same flag-aware resolution as the floors above; node
@@ -4762,7 +4760,7 @@ def _stage_agent_dist(supervisor: str, agent: str = DEFAULT_AGENT,
     /home/research, not ~ (cross-boundary-path rule)."""
     src = agent_dist_path(agent)
     if not dist_present(agent):
-        die(f"no cached {agent} dist to stage — run `research agent pull` first")
+        die(f"no cached {agent} dist to stage — pull it under Management → Software first")
     # SYSBOX UID SHIFT: a plain `docker cp` carries the HOST uid/gid of the cache
     # files; inside the sysbox supervisor those land as a foreign (unmapped) owner
     # that container-root can neither chown NOR rm NOR overwrite (EPERM — even a
@@ -5281,7 +5279,7 @@ def _stage_editor_dist(supervisor: str, *, deploy_local: bool = False) -> None:
     deploy_local=False — it deploys NO editor of its own (its boxes RO-mount the
     staged dist and deploy theirs); staging still runs so that mount is populated."""
     if not editor_dist_present():
-        die("no cached editor dist to stage — run `research editor pull` first")
+        die("no cached editor dist to stage — pull it under Management → Software first")
     _stage_dist_tree(supervisor, EDITOR_DIST_DIR, EDITOR_DIST_MOUNT, "editor")
     if deploy_local:
         _deploy_supervisor_editor(supervisor)
@@ -5533,7 +5531,7 @@ def _stage_reader_dist(supervisor: str, *, deploy_local: bool = False) -> None:
     RESOLVED reader flag by the caller (reader-deploy.sh does not re-check
     RS_SERVICE_READER)."""
     if not reader_dist_present():
-        die("no cached reader dist to stage — run `research reader pull` first")
+        die("no cached reader dist to stage — pull it under Management → Software first")
     _stage_dist_tree(supervisor, READER_DIST_DIR, READER_DIST_MOUNT, "reader")
     if deploy_local:
         _deploy_supervisor_reader(supervisor)
@@ -5699,7 +5697,7 @@ def _stage_node_dist(supervisor: str, *, deploy_local: bool = False) -> None:
     supervisor's OWN ~/.local (the dind flavors: sandbox-dind + research). Unlike the
     editor/reader there is no server to launch and no deploy script — just the cp."""
     if not node_dist_present():
-        die("no cached node seed to stage — run `research node pull` first")
+        die("no cached node seed to stage — pull it under Management → Software first")
     _stage_dist_tree(supervisor, NODE_DIST_DIR, NODE_DIST_MOUNT, "node")
     if deploy_local:
         _deploy_node(supervisor)
@@ -6636,7 +6634,7 @@ def _update_docker_substrate(req: "UpdateRequest", cfg: "Config",  # type: ignor
         die("`update` on the docker substrate only supports enabling or disabling "
             "the editor (code-server); destroy + recreate for anything else")
     if enable_svcs and not editor_dist_present():
-        die("no editor dist cached — run `research editor pull` first")
+        die("no editor dist cached — pull it under Management → Software first")
     base = _read_service_flags(container)
     flags = _compute_service_flags(enable_services, disable_services, base=base)
     progress.step("recreate", "recreating box")
@@ -6736,7 +6734,7 @@ def _live_toggle_editor(project: str, cfg: "Config", container: str,  # type: ig
     inner-image re-staging, no role-MCP/box relaunch)."""
     if enable:
         if not editor_dist_present():
-            die("no editor dist cached — run `research editor pull` first")
+            die("no editor dist cached — pull it under Management → Software first")
         progress.step("deploy", "deploying the editor")
         print(f"=== {project}: deploying the editor (live) ===")
         if _editor_dist_staged_in(container):     # common case: staged at create
@@ -6765,7 +6763,7 @@ def _live_toggle_reader(project: str, cfg: "Config", container: str,  # type: ig
     recreate/start honors it (the docker label is immutable on a running container)."""
     if enable:
         if not reader_dist_present():
-            die("no reader dist cached — run `research reader pull` first")
+            die("no reader dist cached — pull it under Management → Software first")
         progress.step("deploy", "deploying the reader")
         print(f"=== {project}: deploying the reader (live) ===")
         if _reader_dist_staged_in(container):     # common case: staged at create
@@ -7141,8 +7139,7 @@ def _resume_gitea(*, require: bool) -> bool:
         _bootstrap_gitea_if_absent(host_port)
         return True
     if require:
-        die("Gitea isn't enabled — enable it in Management → Infrastructure "
-            "(or run `research dev gitea-enable`)")
+        die("Gitea isn't enabled — enable it in Management → Infrastructure first")
     return False
 
 
@@ -9367,8 +9364,8 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         # the box mints its OWN consumer below, 4c-a).
         if not gitea.mirror_present(req.repo):
             raise ValidationError(
-                f"repo {req.repo!r} not added yet — run "
-                f"`research dev repo add <github-url>` first")
+                f"repo {req.repo!r} not added yet — add it first (the dev "
+                f"workflow card and the dev box dialog take its GitHub URL)")
         # The box's gitea identity (agent-<project>.<name>) and its token must
         # exist BEFORE `rs-sandbox create` runs the container, so the name
         # cannot be auto-assigned in-box for a dev box.
@@ -10049,8 +10046,8 @@ def dev_attach(req: "DevAttachRequest", _progress=None) -> DevAttachResult:  # t
     # The repo must have been added (its mirror exists) before an agent
     # attaches — the mirror stamp is the host-side floor.
     if not gitea.mirror_present(req.repo):
-        die(f"repo {req.repo!r} not added yet "
-            f"(`research dev repo add <github-url>` first)")
+        die(f"repo {req.repo!r} not added yet — add it first (the dev "
+            f"workflow card and the dev box dialog take its GitHub URL)")
     if not container_running(container):
         die(f"project {req.project!r} is not running; start it first (an "
             f"agent attach stages the gitea token into the live supervisor)")
@@ -10827,7 +10824,7 @@ def review_pr(req: "ReviewRequest", progress=None) -> dict:  # type: ignore[name
             "project terminal, logged into the dedicated reviewer account) "
             "and store it with `research dev reviewer-token` (one-time setup)")
     if not dist_present(DEFAULT_AGENT):
-        die(f"no cached {DEFAULT_AGENT} dist — run `research agent pull` first")
+        die(f"no cached {DEFAULT_AGENT} dist — pull it under Management → Software first")
     # The reviewer's (model, effort) — the fifth model_catalog type, resolved
     # LIVE per run (never marker-frozen: this runs in a fresh detached child
     # or a fresh CLI process, so a Management-page default change applies to

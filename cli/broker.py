@@ -1486,8 +1486,7 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
         if not rscore.dist_present(rscore.DEFAULT_AGENT):
             return _audited(principal, "validation",
                             _err("validation",
-                                 "no cached agent dist — run `research agent "
-                                 "pull` on the host first"))
+                                 "no cached agent dist — pull it under Management → Software first"))
         if spawn_review is None:            # tests: gate + validate, never spawn
             return _audited(principal, "ok",
                             {"ok": True, "result": {"op_id": op_id, "started": True}})
@@ -1532,8 +1531,7 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
             return _audited(principal, "validation",
                             _err("validation",
                                  "Gitea isn't enabled — enable it under "
-                                 "Management → Infrastructure (or `research "
-                                 "dev gitea-enable`) first"))
+                                 "Management → Infrastructure first"))
         if spawn_dev_box is None:           # tests: gate + validate, never spawn
             return _audited(principal, "ok",
                             {"ok": True, "result": {"op_id": op_id, "started": True}})
