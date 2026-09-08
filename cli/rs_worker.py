@@ -1129,7 +1129,7 @@ def cmd_destroy(args: argparse.Namespace) -> None:
 # The supervisor's claude calls this when it observes a worker returning
 # HTTP 401 from api.anthropic.com (or "Not logged in") — typically after
 # a supervisor re-OAuth invalidates the creds the worker staged at spawn
-# time. Mirrors the rs-pi / rs-role-mcp sync-creds shape: hash-compare,
+# time. Mirrors the rs-role-mcp sync-creds shape: hash-compare,
 # docker cp + install on mismatch, idempotent.
 #
 # Updates BOTH the bind-mount source (so a respawn / restart of this
@@ -1147,7 +1147,7 @@ def _docker_cp_install_in(container, src: Path, dest_in_container: str,
     test-fixture sleep-only containers) doesn't fail on a missing
     `~/.claude/`. Returns True on success, False on any docker failure
     (tolerant; per-container failures don't abort a batch invocation,
-    mirroring rs-pi sync-creds)."""
+    mirroring rs-role-mcp sync-creds)."""
     staging = f"/tmp/{src.name}.new"
     parent = os.path.dirname(dest_in_container)
     try:

@@ -31,11 +31,11 @@ PROXY_IP="${RS_INNER_PROXY_IP:-192.168.99.2}"
 # Role-MCP↔mcp-proxy traffic stays on the rs-inner bridge (L2) and bypasses
 # FORWARD entirely, so the proxy path doesn't need a hole here.
 ROLE_MCP_RANGE="${RS_INNER_ROLE_MCP_RANGE:-192.168.99.4/29}"
-# PI role containers (pi-echo, pi-wrangler, pi-librarian, pi-websearcher,
-# …) live in 192.168.99.10-99.25 — sixteen addresses to fit the four v1
-# PI roles plus a generous reservation. They run interactive `claude`
-# sessions inside byobu, which talk directly to api.anthropic.com (L3
-# egress, FORWARD path), so they need the same ACCEPT shape as role-MCPs.
+# PI-direct boxes (rs-pi-iso-<name>, allocated by rs-sandbox at .14-.25)
+# live in 192.168.99.10-99.25 — sixteen addresses, the box allocator's
+# slots plus a reservation. They run interactive `claude` sessions inside
+# byobu, which talk directly to api.anthropic.com (L3 egress, FORWARD
+# path), so they need the same ACCEPT shape as role-MCPs.
 # Using `iprange` rather than a CIDR because .10-.25 does not align to a
 # clean prefix; iprange avoids the CIDR-canonicalization ambiguity that
 # `192.168.99.4/29` has (the comment claims .4-.11, but the canonical

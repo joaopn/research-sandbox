@@ -234,10 +234,9 @@ if [[ "${RS_INNER_FIREWALL:-0}" == "1" ]]; then
         echo "WARNING: inner-firewall failed to apply" >&2
 fi
 
-# PI containers are PI-owned (STAGE_PI_AUTH_OWNERSHIP): they boot un-authed
-# and the PI authenticates in-tab (/login), or the operator pushes the
-# supervisor's creds in via `rs-pi sync-creds`. There is no automatic
-# supervisor→PI credential propagation — no watcher to launch here.
+# Boxes are PI-owned: they boot un-authed and the PI authenticates in-tab
+# (/login). There is no automatic supervisor→box credential propagation — no
+# watcher to launch here.
 
 # --- SSH ---
 if [[ -n "${SSH_PASSWORD:-}" ]]; then

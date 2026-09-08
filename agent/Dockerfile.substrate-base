@@ -7,7 +7,7 @@ FROM rs-minimal-base:latest
 # deps + crun, docker-ce, the crun daemon.json, and the research user's `docker`
 # group membership. The two per-flavor leaves FROM this are unchanged:
 #
-#   rs-supervisor  (research projects) = base + claude + rs-worker/rs-pi/
+#   rs-supervisor  (research projects) = base + claude + rs-worker/
 #                  rs-role-mcp + mcp-proxy tooling + inner-firewall + the
 #                  CLAUDE.md/setup.sh templates + entrypoint.supervisor.sh
 #   rs-sandbox-dind  (--workflow sandbox-dind)    = base + rs-sandbox + entrypoint.sandbox-dind.sh

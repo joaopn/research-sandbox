@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # greet-and-shell.sh — print a starting message (MOTD), then drop into a login
-# shell (STAGE_SPAWN_GREETING). Baked into rs-pi-base, so every PI-style tab
-# (Wrangler, Websearcher, pi-isolated) can call it as the byobu new-session
+# shell. Baked into rs-ext-base, so every box tab (rs-pi-iso-<name>) can call
+# it as the byobu new-session
 # command WITHOUT nesting single-quotes inside the tab's `docker exec … bash
 # -lc '…'` wrapper — the helper takes the greeting path as $1 instead.
 #

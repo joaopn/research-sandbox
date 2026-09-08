@@ -30,10 +30,6 @@ RUN chmod +x /usr/local/bin/mcp-reload
 COPY container/supervisor/inner-firewall.sh /usr/local/bin/rs-inner-firewall
 RUN chmod +x /usr/local/bin/rs-inner-firewall
 
-# PI-role substrate CLI (attach + manual `rs-pi sync-creds` cred bridge).
-COPY agent/scripts/rs-pi              /usr/local/bin/rs-pi
-RUN chmod +x /usr/local/bin/rs-pi
-
 # role-MCP-side CLI (`list`, `sync-creds`, and the direct client `ping`/`call`/`job`).
 COPY agent/scripts/rs-role-mcp        /usr/local/bin/rs-role-mcp
 RUN chmod +x /usr/local/bin/rs-role-mcp

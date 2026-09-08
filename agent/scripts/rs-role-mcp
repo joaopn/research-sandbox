@@ -6,8 +6,8 @@
 #
 #   rs-role-mcp list          list running role-MCP containers + their IPs.
 #   rs-role-mcp sync-creds    manually re-stage supervisor creds into every
-#                             running role-MCP container. Mirrors the
-#                             `rs-pi sync-creds` shape exactly.
+#                             running role-MCP container (hash-compare,
+#                             docker cp + install on mismatch, idempotent).
 #   rs-role-mcp ping <role>   is the role's daemon up, and what tools does it
 #                             serve — no spawn, no tokens.
 #   rs-role-mcp call <role> <task…>

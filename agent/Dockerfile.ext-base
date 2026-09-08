@@ -38,7 +38,7 @@ ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 
 # Non-root user at UID 1000 named `worker` (matches the supervisor's UID so
 # bind-mounted /workspace subdirs are read/writable; HOME=/home/worker, which the
-# PI entrypoint + `rs-pi sync-creds` bridge assume). NOPASSWD:ALL — the container
+# box entrypoint assumes). NOPASSWD:ALL — the container
 # is the security boundary.
 RUN useradd -m -s /bin/bash -G sudo -u 1000 worker && \
     echo "worker ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/worker

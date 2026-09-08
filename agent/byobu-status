@@ -5,7 +5,7 @@
 # full key list so a byobu version bump that adds new widgets doesn't
 # silently re-enable them — every name is explicitly opted in or out.
 #
-# Baked into the supervisor, pi-base, and analysis-base images at build
+# Baked into the supervisor, ext-base, and analysis-base images at build
 # time via COPY into ~/.byobu/status. Image-level change — picking it up
 # requires `python research.py start --rebuild` plus destroy/recreate of
 # affected projects.
