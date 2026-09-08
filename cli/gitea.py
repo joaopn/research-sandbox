@@ -456,7 +456,39 @@ class GiteaClient:
         }
         if pat:
             body["auth_token"] = pat
-        self._api("POST", "/repos/migrate", body, timeout=MIGRATE_TIMEOUT_S)
+        try:
+            self._api("POST", "/repos/migrate", body, timeout=MIGRATE_TIMEOUT_S)
+        except GiteaError as e:
+            # Gitea CREATES the repo record and THEN clones into it, so a clone
+            # that fails (no such GitHub repo, a bad PAT on a private source)
+            # leaves a data-free mirror stub that `dev repo list` shows forever
+            # while every consumer path correctly treats the repo as not added
+            # (the stamp is never written). Sweep it — but ONLY when gitea
+            # ANSWERED (a status-bearing error): a status-less error is a
+            # timeout or an outage, and the clone may still be running
+            # server-side, where deleting would kill a large migration that
+            # merely outran MIGRATE_TIMEOUT_S; the resume path above heals that
+            # stub on the next add instead.
+            if e.status is not None:
+                self._sweep_empty_stub(repo)
+            raise
+
+    def _sweep_empty_stub(self, repo: str) -> None:
+        """Delete admin/<repo> if it exists and reads `empty` (the failed-migrate
+        residue); never a repo carrying data. Best-effort: a failure here warns
+        and the caller re-raises the migrate error it was already holding."""
+        try:
+            info = self._api("GET", f"/repos/{ADMIN_USER}/{repo}") or {}
+        except GiteaError as e:
+            if e.status == 404:
+                return                           # nothing was left behind
+            print(f"warning: could not inspect the failed migrate's leftover "
+                  f"{ADMIN_USER}/{repo} ({e}); remove it from the Gitea tab if "
+                  f"it lingers", file=sys.stderr)
+            return
+        if not isinstance(info, dict) or not info.get("empty"):
+            return                               # has data: never delete
+        self.delete_repo(ADMIN_USER, repo)
 
     def trigger_sync(self, repo: str) -> None:
         self._api("POST", f"/repos/{ADMIN_USER}/{repo}/mirror-sync")
