@@ -402,11 +402,15 @@ async function persistVault() {
 // either direction.
 const PROJECT_UI_FIELDS = ["hidden_services", "tab_columns", "column_ratios"];
 
-function projectUiMap() {
+function vaultSettings() {
     if (!state.vault.settings || typeof state.vault.settings !== "object") {
         state.vault.settings = {};
     }
-    const s = state.vault.settings;
+    return state.vault.settings;
+}
+
+function projectUiMap() {
+    const s = vaultSettings();
     if (!s.project_ui || typeof s.project_ui !== "object") s.project_ui = {};
     return s.project_ui;
 }
@@ -427,6 +431,85 @@ function rehydrateProjectUiState(row) {
     for (const f of PROJECT_UI_FIELDS) {
         if (entry[f] !== undefined) row[f] = JSON.parse(JSON.stringify(entry[f]));
     }
+}
+
+// ---- rail order (vault settings.project_order) ------------------------------
+// The order the operator dragged the sidebar rows into, kept as a list of
+// project NAMES beside the per-project map above — deliberately NOT a saved
+// reshuffle of state.vault.projects. Most rows are _jit transients that
+// persistVault strips: they are re-minted from the broker on every load, each
+// pushed as its own fetch lands (syncSidebarFromBroker's Promise.all), so a
+// saved array order would say nothing about them. Names survive that.
+
+// Tolerant, NON-CREATING probe: applyProjectOrder runs on every rail render,
+// and a render must never touch saved state (the tab engine's reconciliation
+// follows the same purity rule). A non-array, or entries that aren't strings,
+// read as "nothing saved" rather than throwing — the vault is decoded from a
+// blob older builds wrote.
+function readProjectOrder() {
+    const s = state.vault && state.vault.settings;
+    const raw = s && s.project_order;
+    if (!Array.isArray(raw)) return [];
+    const out = [];
+    for (const n of raw) {
+        if (typeof n === "string" && n && !out.includes(n)) out.push(n);
+    }
+    return out;
+}
+
+// Sort the live project list into the saved order, IN PLACE (the destroy path
+// reassigns state.vault.projects instead — both are fine, nothing holds an
+// index into or an alias of this array across a render). The sort itself never
+// writes: a later unrelated persist does carry the sorted array, which is
+// harmless because the order is re-derived from the saved names on every
+// render anyway. Saved names first in
+// saved order; every project the operator has never arranged after them, BY
+// NAME — the tail must not inherit broker-response order, which differs run to
+// run and is exactly the shuffle this feature exists to remove.
+function applyProjectOrder() {
+    const order = readProjectOrder();
+    const rank = new Map(order.map((n, i) => [n, i]));
+    state.vault.projects.sort((a, b) => {
+        const ra = rank.has(a.name) ? rank.get(a.name) : order.length;
+        const rb = rank.has(b.name) ? rank.get(b.name) : order.length;
+        if (ra !== rb) return ra - rb;
+        if (ra < order.length) return 0;        // both saved: ranks are unique
+        // localeCompare, not `<`: the relational operators compare UTF-16 code
+        // units, which puts every capitalised name above every lowercase one
+        // ("Zoo" before "alpha") — a tail that reads as unsorted.
+        return a.name.localeCompare(b.name);
+    });
+}
+
+// Persist the rail's current order — the ONLY writer, called from the drop.
+// Saved names that are NOT on screen right now (a stopped project has no row
+// until it runs again) are re-inserted after whichever saved predecessor
+// survived, so an absent project keeps its slot instead of falling to the end
+// when it comes back.
+async function writeProjectOrder(names) {
+    const prev = readProjectOrder();
+    const present = new Set(names);
+    const out = names.slice();
+    let cursor = -1;                            // insertion point in `out`
+    for (const n of prev) {
+        if (present.has(n)) { cursor = out.indexOf(n); continue; }
+        if (out.includes(n)) continue;          // never duplicate a name
+        cursor += 1;
+        out.splice(cursor, 0, n);
+    }
+    vaultSettings().project_order = out;
+    await persistVault();
+}
+
+// Forget a destroyed project's slot — the twin of the project_ui prune it sits
+// beside, and for the same reason: a later project reusing the name starts at
+// the tail rather than inheriting a stranger's position. A project removed any
+// other way leaves its name behind; a saved name with no row is skipped by
+// applyProjectOrder, so the residue is invisible.
+function pruneProjectOrder(name) {
+    const s = state.vault && state.vault.settings;
+    if (!s || !Array.isArray(s.project_order)) return;
+    s.project_order = s.project_order.filter((n) => n !== name);
 }
 
 // ---- screens ---------------------------------------------------------------
@@ -860,7 +943,13 @@ function togglePinned() {
 function refreshProjectRail() {
     const old = document.querySelector(".project-rail");
     if (!old) return;
-    old.replaceWith(makeProjectRail());
+    // The rail is overflow-y: auto, so its scroll offset lives on the element
+    // being discarded — carry it across, or every rebuild yanks a long list
+    // back to the top (most visible on a drop, which rebuilds per gesture).
+    const scrolled = old.scrollTop;
+    const fresh = makeProjectRail();
+    old.replaceWith(fresh);
+    fresh.scrollTop = scrolled;
     applyRailState();
     schedulePolling();
     scheduleServicesRefresh();
@@ -922,6 +1011,10 @@ async function syncSidebarFromBroker(prefetched) {
 }
 
 function makeProjectRail() {
+    // The single choke point every rail render passes through (initial render,
+    // refresh-after-op, mobile drawer) — so the saved order is applied here
+    // rather than at each of the three sites that push a row.
+    applyProjectOrder();
     const rail = el("aside", { class: "project-rail" });
     const splitter = el("div", { class: "rail-splitter", title: "Drag to resize" });
     installRailSplitterDrag(splitter);
@@ -5160,6 +5253,7 @@ function mgmtDestroyDialog(view, name) {
             teardownProjectState(name);
             state.vault.projects = state.vault.projects.filter((p) => p.name !== name);
             delete projectUiMap()[name];
+            pruneProjectOrder(name);
             try { await persistVault(); } catch (e) { /* best-effort */ }
             refreshProjectRail();
         },
@@ -5695,6 +5789,153 @@ function mgmtBoxRemoveDialog(project, box) {
     });
 }
 
+// ---- project rail drag-to-reorder (desktop only) ---------------------------
+// The rail's twin of the tab strip's armTabDrag, following the same three
+// rules. Pointer capture, NEVER HTML5 drag-and-drop: captured moves keep
+// routing to the row while the pointer crosses a cross-origin editor iframe,
+// where dragover events die inside the frame's browsing context. Hit-testing
+// is MATHEMATICAL over row midpoints, never elementFromPoint, for the same
+// reason. And lostpointercapture is a cancel path: a rail rebuild mid-drag (a
+// create/destroy op completing, or syncSidebarFromBroker landing a late
+// project) replaces the whole <aside> and detaches the captured row, which
+// implicitly releases capture and sends the pointerup elsewhere — without it
+// the ghost leaks and body user-select sticks.
+// Press-vs-drag threshold: TAB_DRAG_SLOP_PX, one slop for every pointer drag
+// in the app.
+
+// With pointer capture the browser synthesises the post-drag click on the
+// captured row (already detached by the drop's rebuild) — this flag lets the
+// row's onclick swallow exactly that one click instead of switching project.
+let projectDragClickPending = false;
+function consumeProjectDragClick() {
+    const pending = projectDragClickPending;
+    projectDragClickPending = false;
+    return pending;
+}
+
+function armProjectDrag(row, project) {
+    row.onpointerdown = (ev) => {
+        // Self-heal: a drag that ends without the browser synthesising a click
+        // (a touch pointer wide enough to miss the mobile gate) would leave the
+        // flag set and swallow the next legitimate press. A new press is always
+        // the start of a new gesture, so clearing here is safe.
+        projectDragClickPending = false;
+        if (mobileModeActive()) return;         // desktop-only affordance
+        if (ev.button !== 0) return;
+        // The per-row gear is a <span>, not a <button>: closest("button")
+        // alone would capture its pointer, swallow its own click and switch
+        // project instead of opening the per-project config box.
+        if (ev.target.closest("button, .project-config-btn")) return;
+        const rail = row.closest(".project-rail");
+        if (!rail) return;
+        const startX = ev.clientX, startY = ev.clientY;
+        let dragging = false;
+        let ghost = null, indicator = null;
+        let target = null;
+
+        // Resolve the pointer to an insertion index over the rail's rows.
+        // Rects are re-read on EVERY move, never cached at drag start: a
+        // status poll landing mid-drag fills a row's sub-lines, and
+        // .project-status-meta:empty { display: none } makes rows change
+        // height under the pointer.
+        const resolveTarget = (mv) => {
+            const rr = rail.getBoundingClientRect();
+            if (mv.clientX < rr.left || mv.clientX > rr.right
+                || mv.clientY < rr.top || mv.clientY > rr.bottom) return null;
+            const rows = Array.from(rail.querySelectorAll(".project"));
+            if (!rows.length) return null;
+            let index = rows.length;
+            for (let i = 0; i < rows.length; i++) {
+                const r = rows[i].getBoundingClientRect();
+                if (mv.clientY < r.top + r.height / 2) { index = i; break; }
+            }
+            return { index, rows };
+        };
+
+        // An accent caret at the insertion edge, anchored in the rail (which is
+        // position: relative) so it scrolls with the rows: offsetTop is already
+        // rail-relative, the rail being every row's offsetParent.
+        const showFeedback = (t) => {
+            if (indicator) { indicator.remove(); indicator = null; }
+            if (!t) return;
+            const anchor = t.rows[Math.min(t.index, t.rows.length - 1)];
+            if (!anchor) return;
+            const edgeY = t.index < t.rows.length
+                ? anchor.offsetTop : anchor.offsetTop + anchor.offsetHeight;
+            indicator = el("div", { class: "project-drop-indicator" });
+            indicator.style.top = `${edgeY}px`;
+            rail.appendChild(indicator);
+        };
+
+        const onMove = (mv) => {
+            if (!dragging) {
+                if (Math.abs(mv.clientX - startX) < TAB_DRAG_SLOP_PX
+                    && Math.abs(mv.clientY - startY) < TAB_DRAG_SLOP_PX) return;
+                dragging = true;
+                row.classList.add("dragging");
+                document.body.style.userSelect = "none";
+                // A body-level LABEL, not a row clone: rail descendant rules
+                // don't reach document.body (so a clone would render unstyled),
+                // and a clone would carry the row's data-name into the three
+                // document-wide [data-name] lookups (probe / status / activate).
+                ghost = el("div", { class: "project-drag-ghost" }, [project.name]);
+                document.body.appendChild(ghost);
+            }
+            ghost.style.left = `${mv.clientX + 10}px`;
+            ghost.style.top = `${mv.clientY + 10}px`;
+            target = resolveTarget(mv);
+            showFeedback(target);
+        };
+        const cleanup = () => {
+            // lostpointercapture FIRST: the explicit release below fires it
+            // synchronously, and removing this listener before releasing is
+            // what prevents a re-entrant onCancel -> cleanup cycle.
+            row.removeEventListener("lostpointercapture", onCancel);
+            row.removeEventListener("pointermove", onMove);
+            row.removeEventListener("pointerup", onUp);
+            row.removeEventListener("pointercancel", onCancel);
+            try { row.releasePointerCapture(ev.pointerId); } catch (_) {}
+            if (ghost) ghost.remove();
+            if (indicator) indicator.remove();
+            row.classList.remove("dragging");
+            document.body.style.userSelect = "";
+        };
+        const onCancel = () => { cleanup(); };
+        const onUp = async () => {
+            const didDrag = dragging;
+            const t = target;
+            cleanup();
+            if (!didDrag) return;               // plain click — let it through
+            // Set SYNCHRONOUSLY, before any await: the synthesised click
+            // arrives long before the persist below resolves.
+            projectDragClickPending = true;
+            if (!t) return;                     // dropped outside the rail
+            // DOM row order IS state.vault.projects order (the rail is built
+            // from it, sorted, in one pass), so the resolved index is an array
+            // index; the row itself is re-found by NAME, never by index.
+            const rows = state.vault.projects;
+            const from = rows.findIndex((p) => p.name === project.name);
+            if (from < 0) return;               // row went away mid-drag
+            const to = t.index > from ? t.index - 1 : t.index;
+            if (to === from) return;            // dropped where it already was
+            const [moved] = rows.splice(from, 1);
+            rows.splice(to, 0, moved);
+            // Best-effort persist (the destroy path's precedent): a locked
+            // vault or a full localStorage must not leave the rail showing the
+            // pre-drag order while the live list already holds the new one.
+            try {
+                await writeProjectOrder(rows.map((p) => p.name));
+            } catch (e) { /* best-effort */ }
+            refreshProjectRail();
+        };
+        row.setPointerCapture(ev.pointerId);
+        row.addEventListener("pointermove", onMove);
+        row.addEventListener("pointerup", onUp);
+        row.addEventListener("pointercancel", onCancel);
+        row.addEventListener("lostpointercapture", onCancel);
+    };
+}
+
 function makeProjectRow(project) {
     const dot = el("span", { class: "status-dot" });
     const name = el("span", { class: "name" }, [project.name]);
@@ -5720,11 +5961,24 @@ function makeProjectRow(project) {
     };
     const statusLine = el("div", { class: "project-status-line" }, [typeBadge, statusText, configBtn]);
     const statusMeta = el("div", { class: "project-status-meta" });
+    // .active is stamped here so a rail rebuild (a drop, a create, a destroy)
+    // keeps the "you are here" highlight — refreshProjectRail replaces the
+    // whole <aside> and never re-activates. Gated on no host page being open:
+    // entering Management / Workflows / Development / Settings deliberately
+    // clears the rail highlight while LEAVING state.activeProject set (it is
+    // what leaveHostView reads to come back), and create/destroy both rebuild
+    // the rail from inside those pages — an ungated stamp would paint the
+    // highlight back underneath a host view.
     const row = el("div", {
-        class: "project",
+        class: "project" + (!state.hostPage && state.activeProject === project.name
+            ? " active" : ""),
         "data-name": project.name,
-        onclick: () => activateProject(project.name),
+        onclick: () => {
+            if (consumeProjectDragClick()) return;
+            activateProject(project.name);
+        },
     }, [head, statusLine, statusMeta]);
+    armProjectDrag(row, project);
     return row;
 }
 

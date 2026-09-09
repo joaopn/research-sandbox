@@ -294,6 +294,38 @@ body {
 }
 .project-rail .project .project-config-btn:hover { color: var(--fg-accent); }
 
+/* Drag-to-reorder chrome for the rail — the tab strip's twin, rotated 90°.
+   The ghost is a body-level label (rail descendant rules don't reach it, so it
+   carries its own complete look); the caret is a rail-anchored insertion line
+   that must clear the rail-splitter's z-index: 5; the source row dims. All
+   pointer-events: none — hit-testing is mathematical. */
+.project-drag-ghost {
+    position: fixed;
+    z-index: 1000;
+    pointer-events: none;
+    opacity: 0.8;
+    max-width: 240px;
+    padding: 6px 12px;
+    background: var(--bg-active);
+    border: 1px solid var(--border-strong);
+    border-radius: 4px;
+    font-size: 13px;
+    color: var(--fg-base);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.project-rail .project-drop-indicator {
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 2px;
+    background: var(--fg-accent);
+    pointer-events: none;
+    z-index: 6;
+}
+.project-rail .project.dragging { opacity: 0.4; }
+
 /* Per-project floating config box — position: fixed in JS so it overlays
    outside the (possibly narrow) rail rather than being clipped by it.
    Hosts the Tabs visibility checkboxes now; structured for more sections
