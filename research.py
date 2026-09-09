@@ -124,7 +124,10 @@ def cmd_images_outdated(args: argparse.Namespace) -> None:
 
 
 def cmd_start(args: argparse.Namespace) -> None:
-    """Bring up shared infra: ensure images + start the router container."""
+    """Bring the shared fleet up: ensure images and the agent/editor dists, start
+    the router, re-wire it and the registry to every project network, resume the
+    browser UI if a `research stop` took it down, spawn the enabled shared MCPs,
+    and re-wire gitea last."""
     _preflight()
     _build_images(force=args.rebuild)
     # Ensure the fleet agent dist exists so research projects can deploy claude at
@@ -160,18 +163,56 @@ def cmd_start(args: argparse.Namespace) -> None:
     # recreated it. LAZY: no-op until a project has stood the registry up (first
     # box delivery — sandbox-dind create or research box_add). STAGE_FEATURE_STAGING C1.
     wire_registry_to_projects()
+    # Bring the browser UI back if `research stop` took it down (existence is the
+    # operator's signal — `research webui stop` removes the container).
+    _resume_webui()
+    _start_enabled_mcps()
     # Re-attach shared rs-gitea to the projects in the dev-lane attachment record.
     # SELECTIVE (only recorded projects), unlike the registry. No-op until a dev
-    # repo has been attached. STAGE_DEV_GITEA S1.
+    # repo has been attached. Runs LAST of the wiring passes: it is the only one
+    # that can wait on a readiness probe, and nothing above depends on it, so an
+    # unhealthy gitea must not delay work that never needed it.
     wire_gitea_to_projects()
-    _start_enabled_mcps()
     print("up.")
 
 
 def cmd_stop(_: argparse.Namespace) -> None:
-    """Stop shared infra. Leaves images, volumes, and projects untouched."""
-    run_check(["docker", "compose", "-f", str(SCRIPT_DIR / "docker-compose.yml"),
-               "stop", "router"])
+    """Tear the whole shared fleet down: the browser UI, the shared MCP
+    services, gitea, the image registry and the router. Images, volumes and
+    projects are left untouched — per-project shutdown is `research project
+    stop`, and the broker is a host process with its own `research broker stop`.
+
+    Every service is attempted independently: one that refuses to stop warns and
+    the teardown carries on, because the operator asked for the whole fleet down
+    and stranding the services behind the first refusal is worse than finishing
+    and reporting. Survivors are named at the end and the command exits
+    non-zero, so `stopped.` can never again mean "one of five containers".
+
+    Issues no docker call of its own: every step goes through a helper in rscore
+    so the whole teardown has a single interception point."""
+    # Probe the daemon ONCE up front. container_running() cannot tell "not
+    # running" from "cannot reach the daemon", so without this a dead daemon
+    # would make every per-service check read as already-stopped and the summary
+    # would name only the router while all five were still up — the exact
+    # misreport this change exists to remove.
+    if not run_quiet(["docker", "info"]):
+        die("cannot reach the docker daemon; nothing was stopped")
+    failed: list[str] = []
+    # Reverse of the start order, front-to-back: the operator's entry point goes
+    # dark first, so nothing half-serves a request against a fleet that is
+    # already coming apart.
+    if not _stop_infra_container(WEBUI_CONTAINER):
+        failed.append(WEBUI_CONTAINER)
+    failed += _stop_shared_mcps()
+    for cname in (gitea.GITEA_CONTAINER, REGISTRY_CONTAINER):
+        if not _stop_infra_container(cname):
+            failed.append(cname)
+    # The router leg keeps its return inspected so a compose-level refusal is
+    # named like any other survivor rather than vanishing into a zero exit.
+    if not _stop_router():
+        failed.append(ROUTER_CONTAINER)
+    if failed:
+        die("still running: " + ", ".join(failed))
     print("stopped.")
 
 
@@ -1014,8 +1055,13 @@ def cmd_mcp_stop(args: argparse.Namespace) -> None:
         cname = mcp_container_name_for(name)
         if not container_running(cname):
             continue
-        run_check(["docker", "stop", cname])
-        print(f"stopped {cname}")
+        # Shares the fleet teardown's primitive so the two cannot drift, but
+        # keeps this verb's own contract: the container_running pre-check above
+        # still drives the "(no running shared MCPs)" line, and a failed stop is
+        # fatal HERE (the operator named one MCP and it did not stop) where the
+        # fleet teardown deliberately warns and carries on.
+        if not _stop_infra_container(cname):
+            die(f"could not stop {cname}")
         stopped_any = True
     if not stopped_any:
         print("(no running shared MCPs)")
@@ -1982,12 +2028,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="research", description="Research Sandbox CLI")
     sub = p.add_subparsers(dest="command", required=True)
 
-    st = sub.add_parser("start", help="start shared infra (router); build images if missing")
+    st = sub.add_parser("start", help="start shared infra (router, registry, "
+                                      "gitea, enabled MCPs, webui if stopped); "
+                                      "build images if missing")
     st.add_argument("--rebuild", action="store_true",
                     help="force-rebuild supervisor + worker images even if they exist")
     st.set_defaults(func=cmd_start)
 
-    sp = sub.add_parser("stop", help="stop shared infra (router)")
+    sp = sub.add_parser("stop", help="stop ALL shared infra (webui, shared MCPs, "
+                                     "gitea, registry, router); projects untouched")
     sp.set_defaults(func=cmd_stop)
 
     brk = sub.add_parser(

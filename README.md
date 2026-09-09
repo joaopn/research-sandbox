@@ -244,7 +244,7 @@ Everyday commands. Every subcommand has `--help`; the full reference lives in [d
 ```bash
 # infrastructure
 python research.py start [--rebuild]                # build images + router + cache dists
-python research.py stop                             # stop the router (projects untouched)
+python research.py stop                             # stop ALL shared infra (projects untouched)
 
 # project lifecycle
 python research.py project create <name> [--workflow W] [--data PATHS] [--egress open|locked] [opts]

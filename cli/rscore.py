@@ -3975,6 +3975,92 @@ def container_exists(name: str) -> bool:
     return run_quiet(["docker", "inspect", name])
 
 
+def _stop_infra_container(name: str) -> bool:
+    """`docker stop` one shared-infra container. Absent or already stopped is a
+    SILENT no-op returning True, so a teardown is idempotent and says nothing
+    about services this host never stood up. A failed stop WARNS and returns
+    False instead of dying: the operator asked for the whole fleet down, and
+    stranding the services behind this one is worse than finishing and
+    reporting. The single definition of the primitive — `research stop` and
+    `research mcp stop` both go through it so their behaviour cannot drift."""
+    if not container_running(name):
+        return True
+    r = run(["docker", "stop", name], capture_output=True)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip()
+        print(f"warning: could not stop {name}: {err[-200:]}", file=sys.stderr)
+        return False
+    print(f"stopped {name}")
+    return True
+
+
+def _start_infra_container(name: str) -> bool:
+    """Resume one shared-infra container. Already running is a no-op returning
+    True. A failed start WARNS and returns False rather than dying, so one
+    service that cannot come back (a host port claimed while the fleet was
+    down) does not abort `research start` before the services after it."""
+    if container_running(name):
+        return True
+    r = run(["docker", "start", name], capture_output=True)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip()
+        print(f"warning: could not start {name}: {err[-200:]}", file=sys.stderr)
+        return False
+    return True
+
+
+def _stop_router() -> bool:
+    """Stop the compose-managed router. Deliberately a RAW `run`, NOT the
+    `docker_compose` helper: that routes through run_check -> die, which would
+    abort `research stop` before its tail could name the services that already
+    failed, turning "3 survivors" into a bare compose error. An absent router is
+    a no-op compose reports as success."""
+    r = run(["docker", "compose", "-f", str(SCRIPT_DIR / "docker-compose.yml"),
+             "stop", "router"], capture_output=True)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip()
+        print(f"warning: could not stop {ROUTER_CONTAINER}: {err[-200:]}",
+              file=sys.stderr)
+        return False
+    return True
+
+
+def _container_present(name: str) -> bool:
+    """Does a CONTAINER by this name exist? `container_exists` uses bare
+    `docker inspect`, which also matches an IMAGE of the same name — and the
+    webui is the one fleet member where that collides: docker-compose.yml gives
+    it `image: rs-webui:latest` AND `container_name: rs-webui`. So after
+    `research webui stop` (which REMOVES the container and leaves the image)
+    bare inspect still says "exists", and a resume would `docker start` a
+    container that is not there. Measured: bare inspect rc=0, `docker container
+    inspect` rc=1, in exactly that state."""
+    return run_quiet(["docker", "container", "inspect", name])
+
+
+def _resume_webui() -> bool:
+    """Bring the browser UI back if `research stop` took it down. EXISTENCE is
+    the operator's signal: `research webui stop` REMOVES the container, so "I do
+    not want the UI" survives a start while "I stopped the whole system" does
+    not lose it. Absent -> no-op (never creates; that is `research webui start`,
+    which also pre-probes the published ports). A plain `docker start` reuses
+    the container's own ports/env/uid, so none of the compose-time setup needs
+    re-running — but it does NOT re-probe, so a port taken while the fleet was
+    down surfaces as docker's raw bind error; the warning names the verb that
+    rebinds readably."""
+    # Container-scoped: bare `docker inspect` would match the rs-webui IMAGE and
+    # turn a deliberate `research webui stop` into a "could not start" warning on
+    # every `research start`.
+    if not _container_present(WEBUI_CONTAINER):
+        return True
+    if container_running(WEBUI_CONTAINER):
+        return True
+    if not _start_infra_container(WEBUI_CONTAINER):
+        print(f"warning: run `research webui start` to rebind {WEBUI_CONTAINER}",
+              file=sys.stderr)
+        return False
+    return True
+
+
 def volume_exists(name: str) -> bool:
     return run_quiet(["docker", "volume", "inspect", name])
 
@@ -6086,6 +6172,37 @@ def _start_enabled_mcps() -> None:
                   file=sys.stderr)
 
 
+def _stop_shared_mcps() -> list[str]:
+    """Stop every RUNNING shared-MCP container — the teardown counterpart of
+    _start_enabled_mcps. Returns the container names that failed to stop.
+
+    Enumerates by the `research.mcp=1` label the spawn applies, NOT by reading
+    the MCP registry. The registry read expands `${VAR}` references and dies on
+    an unset one, which an operator hits whenever a key is not exported — and a
+    teardown that swallowed that would report "no MCPs" while the containers
+    kept running, which is the very bug this whole change exists to fix. The
+    label also catches a container whose registry entry was since renamed or
+    removed, and cannot match a role-MCP (those run on a project's INNER daemon)
+    or a box (`research.box`/`research.sandbox` are different labels).
+
+    Deliberately asymmetric with start, which resumes only ENABLED MCPs: a
+    disabled-but-running MCP is a leftover, so a fleet teardown stops it and a
+    later start does not resurrect it. `research mcp start <name>` brings back
+    a specific one."""
+    r = run(["docker", "ps", "--filter", f"label={MCP_LABEL}=1",
+             "--format", "{{.Names}}"], capture_output=True)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip()
+        print(f"warning: could not list shared MCP containers: {err[-200:]}",
+              file=sys.stderr)
+        return [MCP_CONTAINER_PREFIX + "*"]
+    failed = []
+    for cname in sorted(n for n in r.stdout.strip().splitlines() if n):
+        if not _stop_infra_container(cname):
+            failed.append(cname)
+    return failed
+
+
 def _resolve_create_mcp_arg(value: str | None) -> list[str]:
     """Resolve ``project create --mcp`` into a list of registry names. The
     helper validates membership only — enabled-state and reachability are
@@ -7223,7 +7340,7 @@ def _provision_gitea(progress=None) -> None:
     _bootstrap_gitea_if_absent(host_port)
 
 
-def _resume_gitea(*, require: bool) -> bool:
+def _resume_gitea(*, require: bool, tries: int | None = None) -> bool:
     """RESUME an already-enabled gitea (the router/projects precedent) — NEVER
     creates. running -> ensure-bootstrap; exists-stopped -> docker start + wait +
     ensure-bootstrap; absent -> die with the enable remedy when `require`, else
@@ -7235,26 +7352,26 @@ def _resume_gitea(*, require: bool) -> bool:
     remedy; here the operator is simply told to enable first."""
     host_port = load_versions().get("GITEA_HOST_PORT", gitea.DEFAULT_GITEA_HOST_PORT)
     if container_running(gitea.GITEA_CONTAINER):
-        _bootstrap_gitea_if_absent(host_port)
+        _bootstrap_gitea_if_absent(host_port, tries=tries)
         return True
     if container_exists(gitea.GITEA_CONTAINER):
         run_check(["docker", "start", gitea.GITEA_CONTAINER])
-        _wait_for_gitea(host_port)
-        _bootstrap_gitea_if_absent(host_port)
+        _wait_for_gitea(host_port, tries=tries)
+        _bootstrap_gitea_if_absent(host_port, tries=tries)
         return True
     if require:
         die("Gitea isn't enabled — enable it in Management → Infrastructure first")
     return False
 
 
-def _bootstrap_gitea_if_absent(host_port: str) -> None:
+def _bootstrap_gitea_if_absent(host_port: str, *, tries: int | None = None) -> None:
     """Wait for readiness + create the admin/operator accounts, ONCE. Gated on
     bootstrap_present() so a healthy re-entry is a cheap no-op; runs from both
     the just-started path AND the already-running path (a prior run that started
     the container but failed bootstrap left no tokens — this heals it)."""
     if gitea.bootstrap_present():
         return
-    _wait_for_gitea(host_port)
+    _wait_for_gitea(host_port, tries=tries)
     # A mint failure here raises GiteaError; die() (mid-execution infra channel)
     # so it never escapes a broker verb fn as a foreign exception (dispatch
     # catches only ValidationError/HarnessError/SystemExit).
@@ -7267,7 +7384,7 @@ def _bootstrap_gitea_if_absent(host_port: str) -> None:
           f"({gitea.ADMIN_USER}, {gitea.OPERATOR_USER})")
 
 
-def _wait_for_gitea(host_port: str) -> None:
+def _wait_for_gitea(host_port: str, *, tries: int | None = None) -> None:
     """Block until the gitea API answers, bounded. Named constant: gitea's first
     boot (sqlite init + migrations) is a few seconds; 60 * 1s covers a cold pull
     on a slow disk without hanging forever on a wedged container."""
@@ -7276,11 +7393,13 @@ def _wait_for_gitea(host_port: str) -> None:
     # /api/v1/version, it is NOT gated by REQUIRE_SIGNIN_VIEW (which we set), so
     # it answers 200 without auth the moment gitea is serving.
     health = f"http://127.0.0.1:{host_port}/api/healthz"
+    # `tries` overrides the budget for callers that are RESUMING rather than
+    # cold-booting (see GITEA_RESUME_WAIT_TRIES); None means the full budget.
     # Worst case on the serial thread is GITEA_BOOT_WAIT_TRIES × (probe+sleep) ≈
     # 4 min against a wedged gitea — bounded, CLI-dominant today (a webui client
     # would have hit its 30s relay timeout long before, which is acceptable: the
     # daemon keeps working, only that one relayed call reports unreachable).
-    for _ in range(GITEA_BOOT_WAIT_TRIES):
+    for _ in range(GITEA_BOOT_WAIT_TRIES if tries is None else tries):
         # Per-probe bound so a half-up gitea can't hang the caller on urllib's
         # default (no) timeout. Stdlib only — no host-tool dependency.
         try:
@@ -7294,6 +7413,26 @@ def _wait_for_gitea(host_port: str) -> None:
 
 GITEA_BOOT_WAIT_TRIES = 60       # ~1 probe/sec; covers a cold pull + sqlite init
 GITEA_PROBE_MAX_TIME_S = 3       # per-probe bound (< the 1s-cadence loop's budget)
+# The RESUME deadline, for `research start`'s wiring pass. The budget above is
+# sized for a COLD boot — image pull, sqlite init, migrations. A resume does none
+# of that: the container exists and is already bootstrapped, so it starts a
+# process and binds a port. Spending the cold-boot budget here would make
+# `research start` hang for minutes on a sick gitea, on the routine path after
+# every `research stop` and on the very command an operator reaches for when
+# things are already broken. Expiry is NOT destructive (the wiring pass catches
+# it and continues with the container merely running), so this only has to cover
+# a warm restart with headroom.
+# The deadline bounds the WAIT; the serving flag the wiring pass carries out of
+# a failed wait bounds everything AFTER it (the live fork resolutions would
+# otherwise each pay gitea.API_TIMEOUT_S, per repo, per project). Neither alone
+# is sufficient — a short deadline without the flag can hand back a pass that
+# costs more than the wait it replaced.
+# MEASURED, not chosen: a warm restart of an already-bootstrapped gitea reached
+# its health endpoint in 2.4s on the acceptance run, so ten tries (~10s, since
+# each is a bounded probe plus a 1s sleep) is roughly 4x headroom while staying
+# an order of magnitude under the cold-boot budget. The harness re-measures and
+# fails if the margin ever disappears.
+GITEA_RESUME_WAIT_TRIES = 10
 
 
 def _connect_gitea_to_project_network(network: str) -> str:
@@ -7325,10 +7464,42 @@ def wire_gitea_to_projects() -> None:
     ExtraHosts auto-heal (_restart_dev_boxes — a strict no-op on the stable
     path); unflagged boxes carry no gitea address at all. No-op if gitea was
     never stood up."""
-    if not container_exists(gitea.GITEA_CONTAINER):
-        return
+    # Resume an ENABLED-but-stopped gitea (never creates), on the SHORT deadline:
+    # this is the routine state after a `research stop`, not a cold boot.
+    # `require=False` gates ONLY the absent branch — the start, the readiness
+    # wait and the bootstrap heal can each still die(), which is why the catch
+    # below is load-bearing and not belt-and-braces. Do not delete it on the
+    # strength of `require=False`. `except SystemExit` specifically: die() raises
+    # it, and `except Exception` would sail past while looking correct.
+    serving = True
+    try:
+        _resume_gitea(require=False, tries=GITEA_RESUME_WAIT_TRIES)
+    except SystemExit:
+        serving = False
+        # A resume that could not finish must NOT abandon the wiring pass. The
+        # docker-level work below needs gitea RUNNING, not SERVING —
+        # _connect_gitea_to_project_network is connect-only and returns "" for a
+        # non-running gitea, which every caller tolerates. The one step that
+        # needs a SERVING gitea, the live active-fork resolution inside
+        # _stage_dev_gitea, already degrades to the recorded row. Unwinding here
+        # would instead skip every network connect, every gitea_ip refresh and
+        # every dev-box heal — precisely the work this pass exists to do, and
+        # the reason a shorter deadline is safe rather than risky.
+        # Deliberately NOT printed here: on the failed-`docker start` arm the
+        # container is not running, nothing below will wire, and promising
+        # "wiring from the recorded rows" would be a lie (run_check has already
+        # printed the real error). The message belongs after the running gate.
+        pass
+    # Absent gitea -> the resume returned False without side effects and nothing
+    # is running, so there is nothing to wire. The EARLY RETURN matters: falling
+    # through would print a per-project reconnect warning on every
+    # `research start` on any host that never enabled the dev lane.
     if not container_running(gitea.GITEA_CONTAINER):
-        run_check(["docker", "start", gitea.GITEA_CONTAINER])
+        return
+    if not serving:
+        print(f"warning: {gitea.GITEA_CONTAINER} is running but not answering; "
+              f"wiring from the recorded rows and skipping the live fork "
+              f"resolution", file=sys.stderr)
     r = run(["docker", "network", "ls",
              "--filter", f"name=^{PROJECT_NETWORK_PREFIX}",
              "--format", "{{.Name}}"], capture_output=True)
@@ -7361,10 +7532,10 @@ def wire_gitea_to_projects() -> None:
         # record; the fetch surface is OPT-IN now (universal staging RETIRED) —
         # re-stage the supervisor halves only for a project carrying rs-fetch
         # consumers, BEFORE the box reconcile below (a re-run box copies them).
-        _stage_dev_gitea(project, cfg, gitea_ip=ip)
+        _stage_dev_gitea(project, cfg, gitea_ip=ip, serving=serving)
         if _project_has_fetch_consumers(workspace_path_for(project, cfg)):
             _stage_dev_fetch(container_name_for(project))
-            _stage_fetch_wiring(container_name_for(project))
+            _stage_fetch_wiring(container_name_for(project), serving=serving)
         # F3 Slice 1: heal loopback forwarders on the universal `research start`
         # wiring pass (self-gates on docker; no-op for non-docker projects).
         _reconcile_loopback_bridges(project, cfg)
@@ -7427,7 +7598,8 @@ def _stage_dev_git_credentials(container: str, user: str, *,
     return tok
 
 
-def _stage_dev_gitea(project: str, cfg: "Config", gitea_ip: str = "") -> None:
+def _stage_dev_gitea(project: str, cfg: "Config", gitea_ip: str = "",
+                     *, serving: bool = True) -> None:
     """Stage a project's dev-lane wiring (STAGE_DEV_GITEA S2/S3), split by
     secrecy:
 
@@ -7487,7 +7659,13 @@ def _stage_dev_gitea(project: str, cfg: "Config", gitea_ip: str = "") -> None:
             # project consumer / any box consumer (a stopped gitea at recreate
             # time must not blank the row).
             active = gitea.load_active_forks().get(repo, "")
-            if not active and container_running(gitea.GITEA_CONTAINER):
+            # `serving` is the caller's ANSWER to "is gitea actually answering",
+            # which container_running cannot give: a resumed-but-not-yet-serving
+            # gitea is running, so without this the call below is attempted and
+            # burns gitea.API_TIMEOUT_S per repo per project against a listener
+            # that is up but still migrating. Defaults True — every caller other
+            # than `research start`'s wiring pass has already waited for gitea.
+            if not active and serving and container_running(gitea.GITEA_CONTAINER):
                 try:
                     active = gitea.active_fork_for(_gitea_host_port(), repo)
                 except gitea.GiteaError:
@@ -7587,7 +7765,7 @@ def _stage_dev_fetch(container: str) -> None:
               f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
 
 
-def _stage_fetch_wiring(container: str) -> None:
+def _stage_fetch_wiring(container: str, *, serving: bool = True) -> None:
     """Stage the GLOBAL fetch wiring into a RUNNING rs-fetch-enabled container:
     every mirrored dev repo -> its ACTIVE consumer fork owner, written to
     ~/.dev-tokens/fetch-wiring.json (rs_fetch.BOX_WIRING_JSON — a mirror-pair
@@ -7614,7 +7792,11 @@ def _stage_fetch_wiring(container: str) -> None:
     rows = []
     for repo in mirrors:
         owner = active_map.get(repo, "")
-        if not owner and container_running(gitea.GITEA_CONTAINER):
+        # Same bound as _stage_dev_gitea's: skip the live resolution outright
+        # when the caller already knows gitea is not answering, and fall through
+        # to the ledger owner below (a repo with no owner anywhere is omitted
+        # from `rows`, exactly as for a stopped gitea).
+        if not owner and serving and container_running(gitea.GITEA_CONTAINER):
             try:
                 owner = gitea.active_fork_for(_gitea_host_port(), repo)
             except gitea.GiteaError:
@@ -11169,8 +11351,11 @@ def wire_registry_to_projects() -> None:
     leave existing projects' inner dockerds unable to pull their extensions."""
     if not container_exists(REGISTRY_CONTAINER):
         return
-    if not container_running(REGISTRY_CONTAINER):
-        run_check(["docker", "start", REGISTRY_CONTAINER])
+    # A registry that will not come back leaves nothing to connect, and must not
+    # abort the rest of `research start`: the connect loop below already ignores
+    # per-network failures, so this start was the pass's only fatal step.
+    if not _start_infra_container(REGISTRY_CONTAINER):
+        return
     r = run(["docker", "network", "ls",
              "--filter", f"name=^{PROJECT_NETWORK_PREFIX}",
              "--format", "{{.Name}}"],

@@ -395,8 +395,10 @@ The complete `research.py` surface. Every subcommand also has `--help`; this is 
 ### Infrastructure
 
 ```
-start [--rebuild]                  Build images (if missing) + start the rs-router + cache agent/editor dists
-stop                               Stop the router (projects untouched)
+start [--rebuild]                  Build images (if missing) + start the shared fleet (router, registry, gitea,
+                                   enabled MCPs, and the webui if it was stopped) + cache agent/editor dists
+stop                               Stop the whole shared fleet: webui, shared MCPs, gitea, registry, router.
+                                   Projects, images and volumes untouched. Non-zero exit if anything survives
 images versions                    Print current image version pins (from versions.env)
 ```
 
