@@ -1590,6 +1590,23 @@ body {
     gap: 4px;
     font-size: 13px;
 }
+/* Review history rows (Development -> Reviews): a row and its lazily toggled
+   verdict panel travel together in one wrapper, because this list has no live
+   gitea row to anchor a panel against (the .dev-branch-wrap column precedent).
+   The leading timestamp gets a fixed column so the repo names line up, and the
+   repo reads as primary text rather than as a muted PR id. */
+.dev-review-history-row { display: flex; flex-direction: column; gap: 4px; }
+.dev-review-history-row > .dev-pr-row > .dev-pr-meta:first-child {
+    min-width: 108px;
+}
+.dev-review-history-row .dev-pr-id {
+    min-width: 0;
+    max-width: 40%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;      /* hyphens are break opportunities without it */
+    color: var(--fg-base);
+}
 .dev-verdict-summary { color: var(--fg-base); }
 .dev-verdict-finding { color: var(--fg-muted); }
 /* Dev preset: the MCP picker is locked (a dev box's bridge has no mcp-proxy

@@ -828,6 +828,15 @@ def _verb_dev_status(_args: dict, _progress=None) -> dict:
     return dataclasses.asdict(rscore.dev_status(req))
 
 
+def _verb_dev_reviews(_args: dict, _progress=None) -> dict:
+    # The review HISTORY read: no fields, and no gitea/docker call at all —
+    # a pure host-file walk of the verdict ledger, so it answers with gitea
+    # stopped (which is the whole point: a review must outlive the row it was
+    # run against).
+    req = rscore.DevReviewsRequest.from_kwargs()
+    return dataclasses.asdict(rscore.dev_reviews(req))
+
+
 def _verb_dev_repo_status(args: dict, _progress=None) -> dict:
     # ONE repo's Development status (the per-project Fetch tab) — the
     # repo-scoped sibling of dev_status: same never-starts-gitea posture, one
@@ -891,6 +900,7 @@ VERBS = {
     "dev_sync": _verb_dev_sync,
     "dev_status": _verb_dev_status,
     "dev_repo_status": _verb_dev_repo_status,
+    "dev_reviews": _verb_dev_reviews,
     "dev_gitea_start": _verb_dev_gitea_start,
     "dev_passwd": _verb_dev_passwd,
     "dev_set_active_fork": _verb_dev_set_active_fork,

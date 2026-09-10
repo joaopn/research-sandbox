@@ -1897,12 +1897,19 @@ function setTypeBadge(elm, label) {
 }
 
 // ---- Development host page (STAGE_DEV_GITEA S3) ----------------------------
-// Two sub-tabs: "Gitea" (the gitea web UI on its own origin port, session
-// minted via the Management-anchored /broker/dev/gitea-session) and "Fetch" (the
+// Three sub-tabs: "Gitea" (the gitea web UI on its own origin port, session
+// minted via the Management-anchored /broker/dev/gitea-session), "Fetch" (the
 // RS-rendered open-PR/branch list with click-to-copy rs-fetch commands, fed by
-// one /broker/dev read per open — Q6, no poller). The Fetch tab is the
-// guaranteed copy surface; the agent's final-comment code block inside Gitea
-// (with Gitea's own copy button) is the convenience layer.
+// one /broker/dev read per open — Q6, no poller) and "Reviews" (every verdict
+// ever recorded, off its own ledger read). The Fetch tab is the guaranteed copy
+// surface; the agent's final-comment code block inside Gitea (with Gitea's own
+// copy button) is the convenience layer.
+//
+// Reviews is deliberately NOT a section of the Fetch tab's repo cards: a repo
+// card exists only while gitea runs AND its mirror is still listed, so a
+// history living there would vanish exactly when the rows it outlives do. Its
+// read touches no gitea at all, so the tab renders with gitea stopped and after
+// the last mirror is gone.
 
 let devActiveTab = "gitea";
 
@@ -1920,20 +1927,122 @@ function renderDevelopmentInto(view) {
     const body = el("div", { class: "dev-body" });
     const tabGitea = el("button", { class: "btn-small dev-tab-btn" }, ["Gitea"]);
     const tabFetch = el("button", { class: "btn-small dev-tab-btn" }, ["Fetch"]);
+    const tabReviews = el("button", { class: "btn-small dev-tab-btn" },
+                          ["Reviews"]);
     const mark = () => {
         tabGitea.classList.toggle("active", devActiveTab === "gitea");
         tabFetch.classList.toggle("active", devActiveTab === "fetch");
+        tabReviews.classList.toggle("active", devActiveTab === "reviews");
     };
     tabGitea.onclick = () => { devActiveTab = "gitea"; mark(); renderDevGiteaTab(view, body); };
     tabFetch.onclick = () => { devActiveTab = "fetch"; mark(); renderDevFetchTab(view, body); };
+    tabReviews.onclick = () => { devActiveTab = "reviews"; mark(); renderDevReviewsTab(view, body); };
     view.appendChild(el("div", { class: "mgmt-header" }, [
         el("h2", {}, ["Development"]),
-        el("div", { class: "mgmt-toolbar dev-tabs" }, [tabGitea, tabFetch]),
+        el("div", { class: "mgmt-toolbar dev-tabs" },
+           [tabGitea, tabFetch, tabReviews]),
     ]));
     view.appendChild(body);
     mark();
     if (devActiveTab === "fetch") renderDevFetchTab(view, body);
+    else if (devActiveTab === "reviews") renderDevReviewsTab(view, body);
     else renderDevGiteaTab(view, body);
+}
+
+// The review HISTORY: every verdict on the host, newest first, off
+// /broker/dev/reviews. A badge on a PR row is a decoration on something live —
+// it dies with the row when the PR lands, the fork is purged or a collection
+// rewrites the shas. These rows are the durable record, which is why each one
+// names what was reviewed (title / branch / commit subject / fork) rather than
+// leaning on a neighbouring row for context: the row it came from is usually
+// gone by the time anyone reads this.
+//
+// Rendered from the entry alone — no gitea state is consulted, so a stopped
+// gitea shows the same list rather than the enable card the other two tabs owe
+// their read to.
+async function renderDevReviewsTab(view, body) {
+    body.innerHTML = "";
+    body.appendChild(el("div", { class: "mgmt-loading" }, ["Loading reviews…"]));
+    let res;
+    try {
+        res = await fetch("/broker/dev/reviews");
+    } catch (e) { return renderMgmtUnavailable(body); }
+    if (res.status === 401) return renderMgmtLogin(view, renderDevelopmentInto);
+    if (res.status === 403) return renderMgmtRejected(body);
+    // _relay's 503 body is PARSEABLE JSON ({ok:false, broker_unavailable}) and
+    // carries no message — peel it explicitly or the error card below renders
+    // the bare token at the operator.
+    if (res.status === 503) return renderMgmtUnavailable(body);
+    let data;
+    try { data = await res.json(); } catch (e) { data = {}; }
+    if (!res.ok || !data.ok || !data.result) {
+        body.innerHTML = "";
+        const retry = el("button", { class: "btn-small" }, ["Retry"]);
+        retry.onclick = () => renderDevReviewsTab(view, body);
+        body.appendChild(el("div", { class: "mgmt-empty" }, [
+            el("span", {}, [(mgmtErrText(data)
+                             || "Could not read the reviews.") + " "]),
+            retry,
+        ]));
+        return;
+    }
+    const rows = Array.isArray(data.result.reviews) ? data.result.reviews : [];
+    body.innerHTML = "";
+    if (!rows.length) {
+        body.appendChild(el("div", { class: "mgmt-empty" }, [
+            el("span", {}, ["No reviews yet. Review a pull request or a "
+                            + "commit from the Fetch tab and it is kept here."]),
+        ]));
+        return;
+    }
+    const card = el("div", { class: "card dev-repo-card" }, [
+        el("div", { class: "dev-repo-head" }, [
+            el("span", { class: "dev-repo-name" }, ["Reviews"]),
+            el("span", { class: "dev-repo-meta" },
+               [`${rows.length} recorded`]),
+        ]),
+    ]);
+    for (const v of rows) card.appendChild(devReviewHistoryRow(v));
+    body.appendChild(card);
+}
+
+// ONE history row + its lazily-toggled verdict panel, in a wrapper so the panel
+// stays with its row (the list has no stable anchor to re-attach to).
+function devReviewHistoryRow(v) {
+    const pr = v.kind === "pr";
+    const what = pr ? `#${v.pr}`
+                    : `@${String(v.commit || "").slice(0, 9)}`;
+    // The title/subject is only on entries written since verdicts started
+    // carrying it; an older one degrades to its identifier alone.
+    const label = (pr ? v.title : v.subject) || "";
+    const ok = v.status === "ok";
+    const badge = el("button", {
+        // Outcome-only colour keying, exactly as the row badges do it — never
+        // the free-text risk label, which the reviewer's prompt owns.
+        class: "btn-small " + (ok ? "dev-review-badge" : "dev-review-failed")
+            + (v.outcome === "pass" ? " dev-outcome-pass"
+               : v.outcome === "fail" ? " dev-outcome-fail" : ""),
+        title: ok ? "show the review verdict" : "show what the attempt recorded",
+    }, [ok ? "reviewed ✓" + (v.risk ? ` · ${v.risk}` : "")
+           : "review failed" + (v.reason ? `: ${v.reason}` : "")]);
+    const panel = el("div", { class: "dev-verdict-panel" });
+    panel.style.display = "none";
+    for (const n of devVerdictBody(v, v.fork ? ` · fork ${v.fork}` : ""))
+        panel.appendChild(n);
+    badge.onclick = () => {
+        panel.style.display = panel.style.display === "none" ? "" : "none";
+    };
+    return el("div", { class: "dev-review-history-row" }, [
+        el("div", { class: "dev-pr-row" }, [
+            el("span", { class: "dev-pr-meta" }, [devStamp(v.reviewed_at)]),
+            el("span", { class: "dev-pr-id" }, [v.repo || ""]),
+            el("span", { class: "dev-pr-meta" }, [what]),
+            el("span", { class: "dev-pr-title" },
+               [label + (pr && v.head ? `  [${v.head}]` : "")]),
+            badge,
+        ]),
+        panel,
+    ]);
 }
 
 async function renderDevGiteaTab(view, body) {
@@ -2075,6 +2184,37 @@ function devMarkReviewingCells(key) {
     });
 }
 
+// The verdict BODY — the meta line, the summary and the findings — shared by
+// the PR badge panel, the commit badge panel and the Reviews tab. Only the
+// body is shared: each caller keeps its own panel element, its own anchoring
+// (the PR panel re-anchors past an open commits panel) and its own buttons,
+// because those differ and quietly regressing the ordering is the trap here.
+// All verdict strings are MODEL OUTPUT → text nodes only, never innerHTML.
+// Verdict timestamps are stored as full ISO instants in UTC (microseconds and
+// a +00:00 offset); a reader wants the minute it happened, so both the history
+// rows and the panels render them through here. The zone marker is kept — the
+// truncation is the only thing that would have dropped it, and a bare
+// wall-clock time silently reads as local.
+function devStamp(iso) {
+    const s = String(iso || "");
+    return s ? s.slice(0, 16).replace("T", " ") + " UTC" : "";
+}
+
+function devVerdictBody(v, extraMeta) {
+    const nodes = [el("div", { class: "dev-pr-meta" }, [
+        `reviewed ${devStamp(v.reviewed_at)}`
+        + (v.model ? ` (model: ${v.model})` : "") + (extraMeta || ""),
+    ])];
+    if (v.summary)
+        nodes.push(el("div", { class: "dev-verdict-summary" }, [v.summary]));
+    for (const f of (Array.isArray(v.findings) ? v.findings : [])) {
+        if (!f || typeof f !== "object") continue;
+        nodes.push(el("div", { class: "dev-verdict-finding" },
+            ["• " + (f.file ? f.file + ": " : "") + (f.note || "")]));
+    }
+    return nodes;
+}
+
 // Render ONE PR row's review cell — shared by buildDevRepoCard's initial
 // render and devResolvePrReviewCell's in-place completion resolve (the PI
 // revision of the never-auto-re-render decision: the PAGE is still never
@@ -2145,21 +2285,9 @@ function devRenderPrReviewCell(cellEl, repo, p, v, ctx) {
             if (!prow) return;   // detached leftover — nothing to anchor on
             panel = el("div", { class: "dev-verdict-panel" });
             panel.setAttribute("data-rkey-panel", rkey);
-            panel.appendChild(el("div", { class: "dev-pr-meta" }, [
-                `reviewed ${v.reviewed_at || ""}`
-                + (v.model ? ` (model: ${v.model})` : "")
-                + (stale ? " — the PR has new commits since this review" : ""),
-            ]));
-            if (v.summary) {
-                panel.appendChild(el("div", { class: "dev-verdict-summary" },
-                                     [v.summary]));
-            }
-            const findings = Array.isArray(v.findings) ? v.findings : [];
-            for (const f of findings) {
-                if (!f || typeof f !== "object") continue;
-                panel.appendChild(el("div", { class: "dev-verdict-finding" },
-                    ["• " + (f.file ? f.file + ": " : "") + (f.note || "")]));
-            }
+            for (const n of devVerdictBody(v, stale
+                    ? " — the PR has new commits since this review" : ""))
+                panel.appendChild(n);
             panel.appendChild(reviewBtn("Re-review"));
             // D1 anchor: keep the shipped row → commits-panel → verdict-panel
             // order when the commits expander sits after this row.
@@ -2320,19 +2448,7 @@ function devRenderCommitReviewCell(cell, repo, sha, v, ctx) {
         }, ["reviewed ✓" + (v.risk ? ` · ${v.risk}` : "")]);
         const vpanel = el("div", { class: "dev-verdict-panel" });
         vpanel.style.display = "none";
-        vpanel.appendChild(el("div", { class: "dev-pr-meta" },
-            [`reviewed ${v.reviewed_at || ""}`
-             + (v.model ? ` (model: ${v.model})` : "")]));
-        if (v.summary) {
-            vpanel.appendChild(el("div", { class: "dev-verdict-summary" },
-                                  [v.summary]));
-        }
-        const findings = Array.isArray(v.findings) ? v.findings : [];
-        for (const f of findings) {
-            if (!f || typeof f !== "object") continue;
-            vpanel.appendChild(el("div", { class: "dev-verdict-finding" },
-                ["• " + (f.file ? f.file + ": " : "") + (f.note || "")]));
-        }
+        for (const n of devVerdictBody(v, "")) vpanel.appendChild(n);
         vpanel.appendChild(reviewBtn("Re-review"));
         badge.onclick = () => {
             vpanel.style.display =
@@ -3228,7 +3344,8 @@ function buildDevRepoCard(view, body, r, attached, opts) {
 //                 set can only be resolved here, at open time.
 // Sharing the renderer is safe because the ROW SHAPE is identical in both
 // modes: dev_status and dev_repo_status each build a row from the same
-// gitea.repo_status(...) + row["reviews"] = load_repo_verdicts(...) pair
+// gitea.repo_status(...) + row["reviews"] = select_pr_verdicts(
+// load_repo_pr_verdicts(...), ...) pair
 // (cli/rscore.py dev_status / dev_repo_status), so buildDevRepoCard needs no
 // per-mode branching. The ATTACHMENTS are the one thing that genuinely differs
 // — see the filter below.

@@ -1935,6 +1935,27 @@ def cmd_dev_repo_list(_args: argparse.Namespace) -> None:
         print(f"  {r.get('repo')}")
 
 
+def cmd_dev_reviews(_args: argparse.Namespace) -> None:
+    """Every recorded review, newest first — the terminal twin of the webui's
+    Reviews tab. Reads the ledger only, so it works with gitea stopped."""
+    res = _call(rscore.dev_reviews, _build(rscore.DevReviewsRequest))
+    if not res.reviews:
+        print("no reviews recorded")
+        return
+    for e in res.reviews:
+        what = (f"#{e.get('pr')}" if e.get("kind") == "pr"
+                else f"@{str(e.get('commit') or '')[:9]}")
+        label = e.get("title") or e.get("subject") or ""
+        verdict = (f"{e.get('outcome') or 'reviewed'}"
+                   + (f" · {e.get('risk')}" if e.get("risk") else "")
+                   if e.get("status") == "ok"
+                   else f"FAILED: {e.get('reason') or 'unknown'}")
+        print(f"  {e.get('reviewed_at') or '':<32} {e.get('repo')} {what:<12} "
+              f"{verdict}")
+        if label:
+            print(f"      {label}")
+
+
 def cmd_dev_attach(args: argparse.Namespace) -> None:
     req = _build(rscore.DevAttachRequest, project=args.project, repo=args.repo)
     res = _call(rscore.dev_attach, req)
@@ -2574,6 +2595,10 @@ def build_parser() -> argparse.ArgumentParser:
     dvrr.set_defaults(func=cmd_dev_repo_remove)
     dvrl = dvr_sub.add_parser("list", help="list dev repos")
     dvrl.set_defaults(func=cmd_dev_repo_list)
+    dvrv = dv_sub.add_parser("reviews",
+                             help="list every recorded review verdict, newest "
+                                  "first (the ledger; no gitea needed)")
+    dvrv.set_defaults(func=cmd_dev_reviews)
     dva = dv_sub.add_parser("attach",
                             help="attach a dev repo to a project (agent fork "
                                  "wiring; fetch access is universal already)")

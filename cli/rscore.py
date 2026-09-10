@@ -1996,6 +1996,19 @@ class DevStatusRequest:
 
 
 @dataclass(frozen=True)
+class DevReviewsRequest:
+    """The review history read — every verdict on the host. Deliberately
+    ARGUMENT-LESS: with no operator-supplied repo there is no name to
+    interpolate into a filesystem path, and the surface lists everything
+    anyway. (Add a filter here only with the DevRepoStatusRequest name
+    validation, never a raw string into REVIEWS_DIR.)"""
+
+    @classmethod
+    def from_kwargs(cls, **_kw: Any) -> "DevReviewsRequest":
+        return cls()
+
+
+@dataclass(frozen=True)
 class DevRepoStatusRequest:
     """ONE repo's Development status for the per-project Fetch tab (the
     repo-scoped sibling of DevStatusRequest). Shape-validation only."""
@@ -2415,6 +2428,11 @@ class DevStatusResult:
     repos: list[dict]                           # gitea.repo_status rows (running only)
     attachments: list[dict]                     # [{project, repo}] (agent-class)
     reviewer: dict                              # {"present": bool, "set_at": str} — token state, never token material
+
+
+@dataclass
+class DevReviewsResult:
+    reviews: list[dict]                         # every verdict, newest first (kind: "pr"|"commit")
 
 
 @dataclass
@@ -10498,10 +10516,16 @@ def dev_status(_req: "DevStatusRequest", _progress=None) -> DevStatusResult:  # 
             # secret can enter the row.
             try:
                 row = gitea.repo_status(host_port, name)
-                # Review verdicts (S4): pure host-file ledger reads keyed
-                # by str(pr) — adds no docker/network call, so the read
-                # stays structurally no-start.
-                row["reviews"] = gitea.load_repo_verdicts(name)
+                # The badge feed (S4): pure host-file ledger reads, so the
+                # read stays structurally no-start. The ledger holds every
+                # verdict ever recorded for the repo — including other forks'
+                # and superseded heads — and the selection picks the ONE that
+                # may decorate each open-PR row. The full history is not this
+                # verb's job; it has its own read (dev_reviews), which is what
+                # survives a landing.
+                row["reviews"] = gitea.select_pr_verdicts(
+                    gitea.load_repo_pr_verdicts(name), row.get("prs") or [],
+                    row.get("active") or "", row.get("active_id"))
             except gitea.GiteaError as e:
                 row = {"repo": name, "error": str(e)}
             repos.append(row)
@@ -10513,6 +10537,22 @@ def dev_status(_req: "DevStatusRequest", _progress=None) -> DevStatusResult:  # 
     return DevStatusResult(gitea={"exists": exists, "running": running},
                            repos=repos, attachments=attachments,
                            reviewer=gitea.reviewer_token_state())
+
+
+def dev_reviews(_req: "DevReviewsRequest", _progress=None) -> DevReviewsResult:  # type: ignore[name-defined]
+    """Every review verdict recorded on this host, newest first — the review
+    HISTORY, as opposed to dev_status's badge feed.
+
+    A verdict used to be visible only as a decoration on a live gitea row: an
+    open PR, or a commit still listed on a branch. Landing the PR (or purging
+    the fork, or collecting the repo, which rewrites the shas) took every
+    review off the screen while the files sat untouched on disk. This read
+    answers from the ledger alone — no gitea call, no docker, nothing to start
+    — so the history stands with gitea stopped, with the mirror removed, and
+    after any respawn. Entries carry what they reviewed (title/branch/subject,
+    the fork and its era) for exactly that reason: the row they came from may
+    no longer exist anywhere."""
+    return DevReviewsResult(reviews=gitea.load_all_verdicts())
 
 
 def dev_repo_status(req: "DevRepoStatusRequest", _progress=None) -> DevRepoStatusResult:  # type: ignore[name-defined]
@@ -10529,9 +10569,12 @@ def dev_repo_status(req: "DevRepoStatusRequest", _progress=None) -> DevRepoStatu
     if running:
         try:
             row = gitea.repo_status(_gitea_host_port(), req.repo)
-            # Review verdicts: pure host-file ledger reads keyed by str(pr) —
-            # no docker/network call, so the read stays structurally no-start.
-            row["reviews"] = gitea.load_repo_verdicts(req.repo)
+            # The badge feed, selected exactly as dev_status does it — the
+            # two verbs MUST stay in lockstep: the page renders both through
+            # one card renderer that assumes an identical row shape.
+            row["reviews"] = gitea.select_pr_verdicts(
+                gitea.load_repo_pr_verdicts(req.repo), row.get("prs") or [],
+                row.get("active") or "", row.get("active_id"))
         except gitea.GiteaError as e:
             row = {"repo": req.repo, "error": str(e)}
     attachments = [{"project": e.get("project")}
@@ -11073,22 +11116,28 @@ def _review_container_script(model: str, effort: str) -> str:
     )
 
 
-def _write_failed_verdict(repo: str, pr: int, head_sha: str,
-                          reason: str) -> None:
+def _write_failed_verdict(repo: str, pr: int, head_sha: str, reason: str,
+                          stamp: dict | None = None) -> None:
     """Failed ledger entry (COARSE reason token only — a review error can carry
-    host paths; raw detail belongs to the host-only full log / CLI terminal)."""
+    host paths; raw detail belongs to the host-only full log / CLI terminal).
+    `stamp` carries the same what-was-reviewed fields an ok entry gets (fork,
+    fork_id, title, head): a failure is history too, and the Reviews tab has to
+    name what the attempt was about once the PR row is gone."""
     gitea.save_verdict(repo, pr, {
         "repo": repo, "pr": pr, "head_sha": head_sha,
+        **(stamp or {}),
         "status": "failed", "reason": reason,
         "reviewed_at": datetime.datetime.now(
             datetime.timezone.utc).isoformat()})
 
 
-def _write_failed_commit_verdict(repo: str, sha: str, reason: str) -> None:
+def _write_failed_commit_verdict(repo: str, sha: str, reason: str,
+                                 stamp: dict | None = None) -> None:
     """The COMMIT twin of _write_failed_verdict (same coarse-token discipline;
     no head_sha/pr — the sha itself is the immutable subject)."""
     gitea.save_commit_verdict(repo, sha, {
         "repo": repo, "commit": sha,
+        **(stamp or {}),
         "status": "failed", "reason": reason,
         "reviewed_at": datetime.datetime.now(
             datetime.timezone.utc).isoformat()})
@@ -11142,14 +11191,23 @@ def review_pr(req: "ReviewRequest", progress=None) -> dict:  # type: ignore[name
     # and WHICH ledger file the postures write; the container run is shared.
     target = f"{repo}@{req.commit[:9]}" if req.commit else f"{repo}#{pr}"
     head_sha = ""
+    # What this review is ABOUT, stamped into whichever entry gets written.
+    # Filled in by the locator branch as soon as the target resolves — BEFORE
+    # each leg's diff fetch, whose failure writes an entry that would otherwise
+    # be unlabelled. Empty only where the resolve itself dies, which writes no
+    # entry at all. _fail reads it from the enclosing scope at CALL time (hence
+    # the assignment order above being load-bearing) and hands it to the ledger
+    # writers as one argument, so an ok entry and a failed entry for the same
+    # review can never carry different stamps.
+    stamp: dict = {}
 
     def _fail(reason: str) -> None:
         # Coarse-token failed entry into the matching ledger (commit entries
         # never touch the PR ledger and vice versa).
         if req.commit:
-            _write_failed_commit_verdict(repo, req.commit, reason)
+            _write_failed_commit_verdict(repo, req.commit, reason, stamp)
         else:
-            _write_failed_verdict(repo, pr, head_sha, reason)
+            _write_failed_verdict(repo, pr, head_sha, reason, stamp)
 
     if req.commit:
         progress.step("resolve-commit", "resolving the commit")
@@ -11157,6 +11215,7 @@ def review_pr(req: "ReviewRequest", progress=None) -> dict:  # type: ignore[name
             cinfo = client.commit_info(owner, repo, req.commit)
         except gitea.GiteaError as e:
             die(str(e))                 # pre-diff: no ledger write (PR parity)
+        stamp = {"fork": owner, "subject": cinfo["subject"]}
         progress.step("fetch-diff", "fetching the diff")
         try:
             diff = client.commit_diff(owner, repo, req.commit,
@@ -11180,6 +11239,8 @@ def review_pr(req: "ReviewRequest", progress=None) -> dict:  # type: ignore[name
                 f"({'merged' if info['merged'] else info['state']}); "
                 f"only open PRs are reviewed")
         head_sha = info["head_sha"]
+        stamp = {"fork": owner, "fork_id": info["fork_id"],
+                 "title": info["title"], "head": info["head"]}
 
         progress.step("fetch-diff", "fetching the diff")
         try:
@@ -11268,11 +11329,12 @@ def review_pr(req: "ReviewRequest", progress=None) -> dict:  # type: ignore[name
         rev_desc = f"{DEFAULT_AGENT} {rev_model}" + (
             f" {rev_effort}" if rev_effort else "")
         if req.commit:
-            entry = {"repo": repo, "commit": req.commit, "status": "ok",
+            entry = {"repo": repo, "commit": req.commit, **stamp,
+                     "status": "ok",
                      "reviewed_at": reviewed_at, "model": rev_desc, **verdict}
             ledger = gitea.save_commit_verdict(repo, req.commit, entry)
         else:
-            entry = {"repo": repo, "pr": pr, "head_sha": head_sha,
+            entry = {"repo": repo, "pr": pr, "head_sha": head_sha, **stamp,
                      "status": "ok", "reviewed_at": reviewed_at,
                      "model": rev_desc, **verdict}
             ledger = gitea.save_verdict(repo, pr, entry)

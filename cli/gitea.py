@@ -581,15 +581,27 @@ class GiteaClient:
         self._api("PUT", f"/repos/{owner}/{repo}/subscription")
 
     def pull_info(self, owner: str, repo: str, index: int) -> dict:
-        """One PR's metadata (title, state, head sha) for the review header +
-        the verdict's staleness stamp. Fields picked by name."""
+        """One PR's metadata for the review header, the verdict's staleness
+        stamp, and the verdict's own record of WHAT it reviewed (the branch and
+        the fork the PR was opened on — a verdict outlives both its PR row and
+        its branch, so anything it does not stamp is unrecoverable later).
+        Fields picked by name.
+
+        `fork_id` comes from the BASE side: the page lists PRs by the repo they
+        were opened INTO, so that is the id a status read holds to match
+        against. Gitea serves it flat (`base.repo_id`) and nested; the flat
+        field survives a deleted head repo, where the nested object is null."""
         data = self._api("GET", f"/repos/{owner}/{repo}/pulls/{index}")
         if not isinstance(data, dict):
             raise GiteaError(f"gitea GET pull {owner}/{repo}#{index} -> no data")
+        base = data.get("base") or {}
         return {"title": data.get("title") or "",
                 "body": data.get("body") or "",
                 "state": data.get("state") or "",
                 "merged": bool(data.get("merged")),
+                "head": (data.get("head") or {}).get("ref") or "",
+                "fork_id": (base.get("repo_id")
+                            or (base.get("repo") or {}).get("id") or 0),
                 "head_sha": (data.get("head") or {}).get("sha") or ""}
 
     def pull_diff(self, owner: str, repo: str, index: int,
@@ -1195,6 +1207,10 @@ def repo_status(host_port: str, repo: str) -> dict:
                        timeout=STATUS_TIMEOUT_S) or {}
     prs_raw, branches_raw = [], []
     fork_empty = False
+    # The ACTIVE fork's own gitea repo id — what a review verdict is filed
+    # under, so the badge feed can tell this fork's PR #N from another
+    # consumer's (or from a purged predecessor's, which gets a NEW id).
+    active_id = 0
     if active:
         # The ACTIVE FORK's own info decides emptiness — the MIRROR's does
         # not suffice (a synced mirror + an agent that never pushed leaves
@@ -1207,6 +1223,7 @@ def repo_status(host_port: str, repo: str) -> dict:
         fork_info = client._api("GET", f"/repos/{active}/{repo}",
                                 timeout=STATUS_TIMEOUT_S) or {}
         fork_empty = bool(fork_info.get("empty"))
+        active_id = fork_info.get("id") or 0
         if not fork_empty:
             prs_raw = client._api(
                 "GET",
@@ -1238,6 +1255,7 @@ def repo_status(host_port: str, repo: str) -> dict:
                                  or info.get("updated_at") or ""),
             "forks": forks,
             "active": active,
+            "active_id": active_id,
             "empty": fork_empty,
             "prs": prs,
             "branches": branches}
@@ -1447,36 +1465,77 @@ def attached_projects(repo: str) -> list[str]:
 
 # --- review verdict ledger (STAGE_DEV_GITEA S4) -------------------------------
 #
-# One JSON file per reviewed PR: REVIEWS_DIR/<repo>/<pr>.json, host-only (see
-# the REVIEWS_DIR comment). Schema — fields picked by name, coarse failure
-# reasons only (a review error can carry host paths; raw detail lives in the
-# broker's host-only full log):
-#   {repo, pr, head_sha, status: "ok"|"failed", reason?: <coarse token>,
-#    risk?: <free-text label, parse-capped>, outcome?: "pass"|"fail",
-#    summary?, findings?: [{file, note}], reviewed_at}
-# Failed entries are written too (from the diff-fetch step onward) so the
-# Development page can show WHY nothing usable exists.
+# Host-only (see the REVIEWS_DIR comment). Three file shapes share one per-repo
+# directory, kept disjoint by their name prefixes under every loader's glob:
+#
+#   pr-<pr>-<fork id>-<head sha>.json   one PR review, named by WHAT it read
+#   commit-<sha>.json                   one commit review
+#   <pr>.json                           LEGACY: the pre-content-addressing PR
+#                                       shape — read, never written again
+#
+# A PR verdict is filed under the fork it belonged to AND the head commit it
+# reviewed, so no later review can overwrite what an earlier one recorded: a
+# re-review at a new head, a second consumer's fork, and a purged-and-recreated
+# fork (gitea gives the new repo a NEW id) each land on their own file. That is
+# what makes this a HISTORY rather than a set of current-state markers — a
+# landed PR's review stays readable long after its row is gone, which is the
+# whole point of the Development page's Reviews tab. Commit entries stay
+# one-per-sha: the same sha is the same bytes, so a re-review supersedes.
+#
+# Schema — fields picked by name, coarse failure reasons only (a review error
+# can carry host paths; raw detail lives in the broker's host-only full log):
+#   {repo, pr, head_sha, fork, fork_id, title, head, status: "ok"|"failed",
+#    reason?: <coarse token>, risk?: <free-text label, parse-capped>,
+#    outcome?: "pass"|"fail", summary?, findings?: [{file, note}], reviewed_at,
+#    model?}
+# The commit twin carries {repo, commit, subject} in place of pr/head_sha/head.
+# Failed entries are written too (from the diff-fetch step onward) so the page
+# can show WHY nothing usable exists. Every stamp beyond the original set is
+# OPTIONAL on read — an entry written before they existed still renders.
 
-def verdict_ledger_path(repo: str, pr: int) -> Path:
-    return REVIEWS_DIR / repo / f"{pr}.json"
+PR_ENTRY_PREFIX = "pr-"
+# A head sha reaches a FILENAME, so it is validated exactly the way the commit
+# locator already is (rscore's ReviewRequest): a gitea payload is not a trusted
+# path segment, and one carrying a separator must not escape the repo's dir.
+_SHA_LENGTHS = (40, 64)
+_HEX_DIGITS = "0123456789abcdef"
+# The one degenerate name: a PR entry whose head sha gitea never gave us. That
+# fork+PR stays last-writer-wins, deliberately — there is nothing to key on.
+UNKNOWN_SHA_TOKEN = "unknown"
 
 
-def load_verdict(repo: str, pr: int) -> dict | None:
-    """Tolerant read: absent/corrupt → None (a lost verdict re-reviews)."""
+def valid_sha(sha: Any) -> bool:
+    """A full lowercase-hex commit id — the only shape allowed into a path."""
+    return (isinstance(sha, str) and len(sha) in _SHA_LENGTHS
+            and all(c in _HEX_DIGITS for c in sha))
+
+
+def _sha_token(head_sha: Any) -> str:
+    return head_sha if valid_sha(head_sha) else UNKNOWN_SHA_TOKEN
+
+
+def _fork_token(fork_id: Any) -> str:
+    """A fork's gitea repo id as a name segment. A missing or odd id degrades
+    to "0" rather than raising: an unattributable entry is still worth keeping,
+    and "0" simply never matches a live fork."""
     try:
-        data = json.loads(verdict_ledger_path(repo, pr).read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-    return data if isinstance(data, dict) else None
+        n = int(fork_id)
+    except (TypeError, ValueError):
+        return "0"
+    return str(n) if n > 0 else "0"
 
 
-def save_verdict(repo: str, pr: int, payload: dict) -> Path:
-    """Atomic per-PR write. The tmp name carries the writer's PID: reviews run
-    in PARALLEL (S4/F5), and the shared `.with_suffix(".json.tmp")` idiom would
-    let two same-PR writers interleave on one tmp file (A truncated by B, then
-    A renames B's half-written bytes). Per-writer tmp + rename makes concurrent
-    writes genuinely last-writer-wins."""
-    path = verdict_ledger_path(repo, pr)
+def pr_verdict_path(repo: str, pr: int, fork_id: Any, head_sha: Any) -> Path:
+    return (REVIEWS_DIR / repo
+            / f"{PR_ENTRY_PREFIX}{int(pr)}-{_fork_token(fork_id)}"
+              f"-{_sha_token(head_sha)}.json")
+
+
+def _atomic_write(path: Path, payload: dict) -> Path:
+    """The tmp name carries the writer's PID: reviews run in PARALLEL (S4/F5),
+    and the shared `.with_suffix(".json.tmp")` idiom would let two writers
+    interleave on one tmp file (A truncated by B, then A renames B's
+    half-written bytes)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
@@ -1484,30 +1543,125 @@ def save_verdict(repo: str, pr: int, payload: dict) -> Path:
     return path
 
 
-def load_repo_verdicts(repo: str) -> dict[str, dict]:
-    """All of a repo's ledger entries keyed by str(pr) — the dev_status merge.
-    Pure host-file reads (the page read stays structurally no-start)."""
+def save_verdict(repo: str, pr: int, payload: dict) -> Path:
+    """Write ONE PR verdict, named from the payload's OWN fork id and head sha
+    so the filename and the record can never disagree."""
+    return _atomic_write(
+        pr_verdict_path(repo, pr, payload.get("fork_id"),
+                        payload.get("head_sha")), payload)
+
+
+def _read_entry(f: Path) -> dict | None:
+    """Tolerant read: absent/corrupt/non-dict → None (a lost verdict re-reviews)."""
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def load_repo_pr_verdicts(repo: str) -> list[dict]:
+    """EVERY PR verdict recorded for a repo — the content-addressed files and
+    the legacy flat ones alike. Legacy entries stay readable so an operator's
+    existing history, and the badges on their currently-open PRs, survive this
+    change. Pure host-file reads (the page read stays structurally no-start).
+
+    A list, not a map: one PR can now hold several verdicts (one per head it
+    was reviewed at, per fork), which is exactly the history that was being
+    thrown away before."""
     d = REVIEWS_DIR / repo
     if not d.is_dir():
-        return {}
-    out: dict[str, dict] = {}
+        return []
+    out: list[dict] = []
     for f in d.glob("*.json"):
-        if not f.stem.isdigit():
+        # isdigit() is true for characters int() rejects (superscripts, other
+        # unicode digits), and the legacy name is converted, not just matched —
+        # so the ascii test is what keeps a hand-made file from raising through
+        # the page read.
+        legacy = f.stem.isdigit() and f.stem.isascii()
+        if not legacy and not f.stem.startswith(PR_ENTRY_PREFIX):
+            continue                       # commit-<sha>.json, or anything else
+        data = _read_entry(f)
+        if data is None:
             continue
-        try:
-            data = json.loads(f.read_text())
-        except (OSError, json.JSONDecodeError):
+        entry = dict(data)
+        entry.setdefault("repo", repo)
+        if legacy:
+            entry.setdefault("pr", int(f.stem))
+        out.append(entry)
+    return out
+
+
+def select_pr_verdicts(entries: list[dict], prs: list[Any],
+                       fork: str, fork_id: Any) -> dict[str, dict]:
+    """The badge feed: per OPEN PR row, the ONE verdict that may be shown
+    against it, keyed by str(pr) — the shape the page has always consumed.
+
+    A verdict qualifies only when it belongs to the SAME fork, so a second
+    consumer's PR #1, or a purged fork's, can never decorate this one. Among a
+    row's own verdicts an exact head-sha match wins (the page renders it as a
+    current review); failing that the newest is offered and the page renders it
+    stale against the row's head. A LEGACY entry predates the fork stamp and
+    cannot be attributed, so it qualifies only on an exact head-sha match — it
+    is trusted precisely when it demonstrably read the code now on the row."""
+    # want_id is "0" only when the caller has no active fork, and a repo with
+    # no active fork has no PR rows either — so the username fallback below is
+    # never the sole discriminator on a real page.
+    want_id = _fork_token(fork_id)
+    heads: dict[str, str] = {}
+    for p in prs if isinstance(prs, list) else []:
+        if isinstance(p, dict) and p.get("number") is not None:
+            heads[str(p["number"])] = p.get("sha") or ""
+    best: dict[str, tuple] = {}
+    out: dict[str, dict] = {}
+    for e in entries:
+        key = str(e.get("pr"))
+        if key not in heads:
             continue
-        if isinstance(data, dict):
-            out[f.stem] = data
+        exact = bool(e.get("head_sha")) and e["head_sha"] == heads[key]
+        stamped = bool(e.get("fork_id")) or bool(e.get("fork"))
+        if stamped:
+            same_fork = (_fork_token(e.get("fork_id")) == want_id
+                         if e.get("fork_id") and want_id != "0"
+                         else e.get("fork") == fork and bool(fork))
+            if not same_fork:
+                continue
+        elif not exact:
+            continue                       # unattributable and not this code
+        rank = (1 if exact else 0, str(e.get("reviewed_at") or ""))
+        if key not in best or rank > best[key]:
+            best[key], out[key] = rank, e
+    return out
+
+
+def load_all_verdicts() -> list[dict]:
+    """Every verdict on the host, newest first — the review history read. A
+    pure filesystem walk: no gitea call, no docker, nothing to start, so the
+    history stands with gitea stopped and after the last repo mirror is gone
+    (which is the durability the badges never had)."""
+    if not REVIEWS_DIR.is_dir():
+        return []
+    out: list[dict] = []
+    for d in sorted(REVIEWS_DIR.iterdir()):
+        if not d.is_dir():
+            continue
+        for e in load_repo_pr_verdicts(d.name):
+            out.append({**e, "repo": e.get("repo") or d.name, "kind": "pr"})
+        for sha, e in load_repo_commit_verdicts(d.name).items():
+            out.append({**e, "repo": e.get("repo") or d.name, "kind": "commit",
+                        "commit": e.get("commit") or sha})
+    out.sort(key=lambda e: str(e.get("reviewed_at") or ""), reverse=True)
     return out
 
 
 # Per-COMMIT verdicts live beside the PR ones as commit-<sha>.json. The
-# `commit-` prefix is load-bearing: load_repo_verdicts filters on
-# f.stem.isdigit(), and a 40-hex sha CAN be all-decimal — a bare <sha>.json
-# could masquerade as a PR entry. The prefix keeps the two globs structurally
-# disjoint in both directions. Schema mirrors the PR entry minus head_sha/pr:
+# `commit-` prefix is load-bearing: the PR loader takes a digit stem (legacy)
+# or the `pr-` prefix, and a 40-hex sha CAN be all-decimal — a bare <sha>.json
+# could masquerade as a legacy PR entry. The three shapes stay structurally
+# disjoint in every direction: a sha is hex so it can never start `pr-`, a PR
+# number is an integer so it can never start `commit-`, and neither loader's
+# `*.json` glob matches the `.tmp` files an in-flight write leaves.
+# Schema mirrors the PR entry minus head_sha/pr, plus the commit subject:
 #   {repo, commit, status: "ok"|"failed", reason?, risk?, outcome?, summary?,
 #    findings?, reviewed_at}
 
@@ -1516,14 +1670,8 @@ def commit_verdict_path(repo: str, sha: str) -> Path:
 
 
 def save_commit_verdict(repo: str, sha: str, payload: dict) -> Path:
-    """Atomic per-commit write — the save_verdict per-writer-PID tmp shape
-    (commit reviews run in PARALLEL on the same lane)."""
-    path = commit_verdict_path(repo, sha)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    tmp.replace(path)
-    return path
+    """Atomic per-commit write — one file per sha, superseded by a re-review."""
+    return _atomic_write(commit_verdict_path(repo, sha), payload)
 
 
 def load_repo_commit_verdicts(repo: str) -> dict[str, dict]:
@@ -1537,10 +1685,7 @@ def load_repo_commit_verdicts(repo: str) -> dict[str, dict]:
         sha = f.stem[len("commit-"):]
         if not sha:
             continue
-        try:
-            data = json.loads(f.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        if isinstance(data, dict):
+        data = _read_entry(f)
+        if data is not None:
             out[sha] = data
     return out
