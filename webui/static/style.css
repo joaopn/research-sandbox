@@ -367,6 +367,13 @@ body {
 .project-config-box .config-check input { cursor: pointer; }
 .project-config-box .config-check.floor { opacity: 0.6; cursor: default; }
 .project-config-box .config-empty { color: var(--fg-faint); font-size: 12px; }
+/* The Sidebar section: the one action in this box that removes something, so it
+   is ruled off from the per-project settings above it. */
+.project-config-box .config-section.config-danger {
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+}
 .project-config-box .config-hint {
     margin-top: 8px;
     color: var(--fg-faint);

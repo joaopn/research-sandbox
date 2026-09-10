@@ -5939,9 +5939,12 @@ function armProjectDrag(row, project) {
 function makeProjectRow(project) {
     const dot = el("span", { class: "status-dot" });
     const name = el("span", { class: "name" }, [project.name]);
-    // No per-row remove/destroy: project lifecycle is the Management panel's job
+    // No per-row DESTROY: project lifecycle is the Management panel's job
     // (broker create/destroy). The rail just reflects the running set — create
     // adds a row, destroy removes it (see mgmtConfirmThenTail onDone hooks).
+    // The gear's Sidebar section does carry a per-row REMOVE, which is a
+    // different thing: it forgets this browser's bookmark and touches nothing
+    // on the sandbox (appendSidebarSection).
     const head = el("div", { class: "project-head" }, [dot, name]);
     // Second line: a project-type badge (research/sandbox, filled by
     // fetchProjectsStatus) + the worker-activity figures, plus the always-
@@ -6533,6 +6536,14 @@ function teardownProjectState(name) {
             const t = state.terminals[k];
             try { if (t.ws) t.ws.close(); } catch (_) {}
             try { if (t.term) t.term.dispose(); } catch (_) {}
+            // The pane node goes too, as at every other teardown site. Nothing
+            // sweeps an orphan: showWelcome and the column engine both iterate
+            // state.terminals, which no longer carries this one, so a surviving
+            // .terminal-instance stays inset:0 over the welcome pane until the
+            // page is reloaded. An http pane is the visible case — it has
+            // neither ws nor term, so the two lines above are no-ops for it,
+            // and its iframe is opaque.
+            try { if (t.container) t.container.remove(); } catch (_) {}
             delete state.terminals[k];
         }
     }
@@ -6987,6 +6998,7 @@ function makeProjectConfigBox(project) {
         box.appendChild(section);
         // Ports render even with no tabs loaded — register before you start serving.
         appendExportedPortsSection(box, project);
+        appendSidebarSection(box, project);
         return box;
     }
 
@@ -7027,7 +7039,95 @@ function makeProjectConfigBox(project) {
     appendExportedPortsSection(box, project);
     appendEditorExtensionSection(box, project, enabled);
     appendModelsSection(box, project, enabled);
+    appendSidebarSection(box, project);
     return box;
+}
+
+// The "Sidebar" section — drop this browser's bookmark for a project. It is the
+// ONLY way to get rid of a row whose project is no longer here: the sidebar is a
+// per-browser list, and the one other place that ever removed a row is the
+// completion hook of Management's Destroy — which is unreachable for a project
+// with no supervisor container, because that table lists containers, so a project
+// destroyed elsewhere (or a box on another host, entered by hand) had no exit at all.
+//
+// Appended at BOTH exits of makeProjectConfigBox on purpose. The early one is
+// taken while a row has never been opened; the full one the moment it IS opened,
+// because the services list carries the always-on entries for ANY name, existing
+// or not. A tail-only append would hide the affordance in half the cases it
+// exists for — including the reported one.
+function appendSidebarSection(box, project) {
+    const section = el("div", { class: "config-section config-danger" });
+    section.appendChild(el("div", { class: "config-section-label" }, ["Sidebar"]));
+    const btn = el("button", { class: "btn-small btn-danger" }, ["Remove from sidebar"]);
+    btn.onclick = () => removeProjectFromSidebar(project);
+    section.appendChild(btn);
+    box.appendChild(section);
+    box.appendChild(el("div", { class: "config-hint" }, [
+        "Removes the bookmark from this browser only — nothing on the sandbox is "
+        + "created, changed or destroyed.",
+    ]));
+}
+
+// Confirm, then forget the row. This performs EXACTLY the browser-state half of
+// the destroy hook (teardown, drop the row, prune the two saved per-project
+// surfaces, persist, repaint) and issues NO request of any kind: removing a
+// bookmark must never be confusable with destroying a project.
+function removeProjectFromSidebar(project) {
+    // A dialog is already open — the guard every other confirm here uses.
+    if (document.querySelector(".modal-backdrop")) return;
+    // Close the config box FIRST. It is z-index 200 against the modal's 100 and
+    // is dismissed only by the NEXT pointerdown, so leaving it open floats an
+    // opaque card over the dialog — over its buttons on a narrow viewport —
+    // until the operator's first press.
+    closeProjectConfigBox();
+    const name = project.name;
+
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const cancel = el("button", { class: "btn btn-secondary" }, ["Cancel"]);
+    cancel.onclick = () => backdrop.remove();
+    const go = el("button", { class: "btn btn-danger" }, ["Remove"]);
+    go.onclick = async () => {
+        go.disabled = true; cancel.disabled = true;
+        backdrop.remove();
+        // Capture before the teardown: it nulls state.activeProject itself.
+        const wasActive = state.activeProject === name;
+        teardownProjectState(name);
+        state.vault.projects = state.vault.projects.filter((p) => p.name !== name);
+        // Same prune as destroy: a project that later arrives under this name
+        // starts with the default tab arrangement and at the tail of the list,
+        // rather than inheriting a stranger's. The confirm says so, since for a
+        // project that is still running here the row itself comes back.
+        delete projectUiMap()[name];
+        pruneProjectOrder(name);
+        try { await persistVault(); } catch (e) { /* best-effort, as destroy */ }
+        refreshProjectRail();
+        // Unconditional, and NOT gated on a host page being open: closeManagement
+        // restores the terminal area but never re-shows #welcome, which
+        // activateService had hidden — so skipping this leaves a blank pane
+        // behind whenever the removed project had a service open. Running it
+        // under a host view is inert (#welcome sits inside the hidden terminal
+        // area, and the tab wipe only touches tabs that view already hid).
+        if (wasActive) showWelcome(true);
+    };
+    const card = el("div", { class: "card" }, [
+        el("h2", {}, ["Remove from sidebar"]),
+        el("p", {}, [
+            `Remove "${name}" from this browser's sidebar. Nothing on the sandbox `
+            + "is created, changed or destroyed — no project is stopped, and none "
+            + "is deleted.",
+        ]),
+        el("p", {}, [
+            "Its tab arrangement and its position in the list are forgotten too. A "
+            + "project on this sandbox comes back on its own once it is running — on "
+            + "the next page load, or as soon as you open Management. A box you run "
+            + "elsewhere, entered by hand under New Project, is known only to this "
+            + "browser: it comes back only by entering it again, with its host, port, "
+            + "user and password.",
+        ]),
+        el("div", { class: "btn-row" }, [cancel, go]),
+    ]);
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
 }
 
 // The "Models" surface (STAGE_MODEL_SELECT) — change which model each kind of
