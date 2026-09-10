@@ -995,7 +995,8 @@ class CreateRequest:
         if reader_on and substrate is Substrate.DOCKER:
             raise ValidationError(
                 "the reader service is not available on the docker substrate "
-                "(it is a research-workflow supervisor service) — drop `--enable reader`")
+                "(it is delivered by a dist that substrate does not mount) — "
+                "drop `--enable reader`")
         if reader_on and substrate is Substrate.DIND_SYSBOX and not reader_dist_present():
             raise ValidationError(
                 "no cached reader dist — pull it under Management → Software first")
@@ -4728,11 +4729,12 @@ _CODE_SERVER_VERSION_KEY = "CODE_SERVER_VERSION"
 # The mobile artifact reader supervisor service. A host-cached pip-tree dist
 # (nbconvert + markdown + the reader server/deploy scripts) STAGED into a
 # reader-enabled supervisor at boot, like the editor dist. Supervisor-only in v1
-# (the reader is research-workflow-shaped; docker boxes are rejected at create),
-# so there is no RO `-v` mount into inner containers and no MOUNT_ARGS. Unlike the
-# editor's self-contained node bundle, a pip tree is CPython-ABI-coupled — the dist
-# records the build ABI (sidecar + an in-tree PYTHON_ABI file) and reader-deploy.sh
-# fails loud on a mismatch (see that script).
+# (the reader needs the dist mount the docker substrate lacks, so it is rejected
+# at create there), so there is no RO `-v` mount into inner containers and no
+# MOUNT_ARGS. Unlike the editor's self-contained node bundle, a pip tree is
+# CPython-ABI-coupled — the dist records the build ABI (sidecar + an in-tree
+# PYTHON_ABI file) and reader-deploy.sh fails loud on a mismatch (see that
+# script).
 READER_DIST_DIR = Path.home() / ".research-sandbox" / "reader-dist"
 READER_DIST_MOUNT = "/opt/reader-dist"
 _READER_BIN = "jupyter-nbconvert"   # console script present iff nbconvert installed

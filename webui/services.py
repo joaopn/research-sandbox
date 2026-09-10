@@ -31,12 +31,13 @@ SERVICES = {
         "default_port": 8443,
         "upstream_path": "/",
     },
-    # The mobile artifact reader (STAGE_READER) — a read-only markdown/notebook
-    # viewer over the project's artifact surfaces, default OFF (opt-in via
-    # `--enable reader` / the create tickbox). http like the editor: probe-gated on
-    # READER_PORT (rscore) and served on its own origin port. Research-workflow only
-    # (rejected on the docker substrate at create); on sandbox-dind it degrades to
-    # mostly-empty listings.
+    # The mobile reader — a read-only markdown/notebook/text viewer over the
+    # project's workspace, default OFF (opt-in via `--enable reader` / the create
+    # tickbox). http like the editor: probe-gated on READER_PORT (rscore) and served
+    # on its own origin port. Every dind workflow gets a useful view: the reader
+    # shows the workspace minus a deny-list, so a dev project reads as its clone and
+    # worktrees rather than as the empty listing a research-shaped allowlist gave it.
+    # Still rejected on the docker substrate at create (no dist mount there).
     "reader": {
         "label": "Reader",
         "kind": "http",

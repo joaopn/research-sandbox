@@ -1,11 +1,18 @@
 #!/opt/conda/bin/python
-"""reader-server.py — read-only mobile artifact reader for the research workflow
-(STAGE_READER).
+"""reader-server.py — read-only mobile file reader for a project workspace.
 
-Serves the supervisor project's *artifact surfaces* to a mobile browser: markdown
-rendered via python-markdown, notebooks rendered via nbconvert, everything else
-served raw (images, CSV, text). Ships in the reader dist (`tools/`) and is cp'd
+Serves a project's workspace to a mobile browser: markdown rendered via
+python-markdown, notebooks rendered via nbconvert, any other text file rendered as
+a plain page, and everything else streamed raw: images, the documents a browser
+renders natively, binaries, and text above the render ceiling (markdown and
+notebooks have no such ceiling). Ships in the reader dist (`tools/`) and is cp'd
 into a reader-enabled supervisor at boot, run under the container conda python.
+
+Every workflow gets the same view — the workspace minus a short deny-list — rather
+than a curated per-workflow surface. A curated allowlist of research folder names
+was the original design and it made the reader useless on every other workflow: a
+dev project's files are its repo clone and its worktrees, none of which a research
+allowlist can name, so the whole tab rendered as one empty folder.
 
 Design (settled with the PI):
 - **Read-only by construction.** GET/HEAD only; any write method → 405. There is
@@ -20,9 +27,10 @@ Design (settled with the PI):
   runs OUTSIDE the lock — a concurrent double-render is idempotent and cheap.
 - **Path containment is the one security-critical surface.** Every request path is
   resolved to its realpath (symlinks followed), which must land under WORKSPACE
-  AND classify into the artifact allowlist — a symlink pointing outside the
-  workspace or at a denied subtree is rejected (404). `..` segments are rejected
-  before resolution.
+  AND survive the deny-list — a symlink pointing outside the workspace or at a
+  denied path is rejected (404). `..` segments are rejected before resolution.
+  Because the deny test runs on the RESOLVED path, an innocently-named symlink
+  cannot smuggle a denied target.
 - **Isolation.** Notebook outputs can embed arbitrary HTML/JS; this server runs on
   its own per-project origin port (the webui origin-isolation lane), so embedded
   scripts are contained to that origin and can't reach the webui/vault origin.
@@ -62,14 +70,65 @@ WORKSPACE = Path(os.environ.get("READER_WORKSPACE", "/workspace")).resolve()
 # eviction only costs one re-render on the next view.
 READER_CACHE_MAX_BYTES = 256 * 1024 * 1024
 
-# Top-level artifact subtrees browsable in full (whole subtree viewable).
-#   logbook/ plan/ shared/ published/ — the general artifact surfaces.
-#   results/  — the PI-visible ACCEPTED-deliverables bundles + manifest.json
-#               (the project inventory / executive surface).
-#   staging/  — the cycle awaiting the PI's review; its entries are symlinks into
-#               workers/<name>/work/outputs/<slug>/, which classify "ok" on the
-#               resolved path, so the staged cycle is readable from a phone too.
-_ALLOW_DIRS = {"logbook", "plan", "shared", "published", "results", "staging"}
+# Types the BROWSER renders better than an escaped <pre>, checked BEFORE the
+# content sniff and handed to the raw stream (which is what they got before this
+# server rendered text at all). The sniff alone cannot decide this: SVG and
+# PostScript are NUL-free text, and an uncompressed PDF often is for its first
+# page of bytes, so a content-only rule would turn a figure into its own source
+# — and `results/` is where a worker's accepted .pdf/.svg figures land, i.e.
+# exactly what the reader exists to show. HTML is here for the same reason and
+# on the same terms as a rendered notebook: this server already serves notebook
+# output that can embed arbitrary markup, and origin isolation (not escaping) is
+# what contains it, so escaping a worker's plotly export would cost the figure
+# and buy nothing. Everything else — including the application/* configs
+# (.json, .toml, .xml) — falls through to the sniff and renders as text.
+_RAW_MIME_PREFIXES = ("image/", "video/", "audio/")
+_RAW_MIME_TYPES = frozenset({
+    "application/pdf", "application/postscript",
+    "text/html", "application/xhtml+xml",
+})
+
+# Text render (see _render_text). A file the reader can't render specially is
+# still usually TEXT — source, config, a Dockerfile, a LICENSE — and handing it to
+# the browser raw means a download on a phone rather than a read, because a
+# guessed mimetype for those is either an odd text/* subtype or nothing at all.
+# So the choice is made on CONTENT: read the first chunk and look for a NUL byte,
+# the same test git uses to call a blob binary. One page-sized window is the
+# whole heuristic (git reads a longer one; this is our own number) — a
+# binary format carrying no NUL in its first 4 KiB is not one this reader could
+# usefully display anyway, and a larger window only costs latency on every file.
+READER_TEXT_SNIFF_BYTES = 4096
+
+# Ceiling above which a TEXT file streams raw instead of rendering. It bounds this
+# branch only — markdown and notebook rendering are unbounded, as they were before
+# this branch existed, so a huge .ipynb can still buffer whole. The render path
+# holds the whole body in memory and caches it, while a research project's
+# shared/data/ routinely holds multi-GB files. 4 MiB clears any real source file
+# by several times (the largest tracked file in this repo is 585 KB) and is about
+# as much monospace as a phone browser will lay out as one <pre>; ten times higher
+# would start evicting a notebook the operator is still scrolling out of the cache
+# budget above — and the cached entry is the ESCAPED body, which a quote-dense
+# file inflates several-fold, so the budget is spent faster than the ceiling
+# suggests. Nothing becomes unreachable — over the ceiling is exactly today's
+# raw stream.
+READER_TEXT_RENDER_MAX_BYTES = 4 * 1024 * 1024
+
+# ---- the deny-list (see _classify) -----------------------------------------
+
+# Build residue: machine-generated, never authored, and pure noise in a listing —
+# a clone of this repo grows one per package dir the moment anything runs in it,
+# each landing right where the source files are. Matched as a path SEGMENT anywhere,
+# because both nest arbitrarily deep in a repo.
+_DENY_DIRS = {"__pycache__", "node_modules"}
+
+# Worker process residue, denied ONLY inside a worker's own work dir (below) —
+# never as bare names anywhere, because a repo may legitimately carry a folder
+# called `scratch`, and hiding something the operator authored is a worse failure
+# than showing some noise. `scratch/` is created per worker and defined by the
+# worker role doc as exploration and dead ends; `log.jsonl` (the stream-json
+# transcript) and `terminal.log` (the terminal capture) are megabytes of
+# one-event-per-line text that no one opens a phone to read.
+_DENY_WORKER_RESIDUE = {"scratch", "log.jsonl", "terminal.log"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,29 +137,31 @@ log = logging.getLogger("reader")
 
 
 # ---------------------------------------------------------------------------
-# Artifact allowlist — what of /workspace the reader may show.
+# The deny-list — what of the workspace the reader refuses to show.
 # ---------------------------------------------------------------------------
 #
-# The research workspace holds far more than deliverables (creds, plan drafts,
-# worker inboxes, the .orchestrator control plane). The reader surfaces ONLY the
-# PI-facing artifact surfaces. Every access is classified on the RESOLVED real
-# path (post-symlink), so a symlink can't dodge this:
+# Everything in the workspace is viewable EXCEPT what this function denies. That
+# is the whole model: a workspace's shape differs per workflow (a research project
+# has logbook/plan/results/workers, a dev project has a repo clone and worktrees,
+# a management project has box workspaces), and any allowlist of names is wrong
+# for every workflow it was not written for.
 #
-#   "ok"  — content-viewable (render / raw) AND, if a dir, listable.
-#   "nav" — a navigation ancestor: listable as a dir, but its own content is not
-#           served (you can browse THROUGH it to reach allowed leaves).
-#   None  — denied.
+# What carries the containment is the dot rule, and it carries it alone: every
+# credential-bearing path any flavor writes into a workspace is dot-leading —
+# .claude/.credentials.json (supervisor + each worker), the rebuild stashes
+# (.creds-stash, .creds-stash-home.json, .ssh-stash, .gitconfig-stash),
+# .role-mcps/<role>/.creds/, the .orchestrator control plane, a box's staged
+# .claude/, and a clone's .git. Box secrets and the dev consumer's git credentials
+# live in $HOME, outside the mount entirely. Since the test below runs on the
+# RESOLVED path, a non-dot symlink aimed at any of them is denied too.
 #
-# Worker surfaces are deliberately narrow: a worker's outputs/ subtree plus its
-# research_log.md + summary.md — never its inbox/, scratch/, task.md, .claude/,
-# log.jsonl, or creds. The accepted (results/) and staged (staging/) surfaces are
-# whole-subtree allowed above; staging/ entries symlink into a worker's outputs/,
-# which classifies "ok" on the resolved path.
+#   "ok"  — viewable, and listable if it is a directory.
+#   None  — denied, both in listings and on a direct /view/ or /raw/ fetch.
 def _classify(rel: str) -> str | None:
     """Classify a workspace-relative POSIX path (already '..'-free, no leading
-    '/'). Returns "ok" | "nav" | None."""
+    '/'). Returns "ok" | None."""
     if rel == "":
-        return "nav"
+        return "ok"
     segs = rel.split("/")
     # Dotfiles/dot-dirs are ALWAYS hidden — on direct /view/ and /raw/ requests,
     # not just in listings. This is where the control plane / creds / .claude live;
@@ -108,29 +169,20 @@ def _classify(rel: str) -> str | None:
     # keeps a direct-URL fetch from reaching them.
     if any(s.startswith(".") for s in segs):
         return None
-    top = segs[0]
-    if top in _ALLOW_DIRS:
-        return "ok"
-    if top == "workers":
-        if len(segs) <= 2:
-            return "nav"                      # workers/ , workers/<w>/
-        if segs[2] != "work":
-            return None
-        if len(segs) == 3:
-            return "nav"                      # workers/<w>/work/
-        sub = segs[3]
-        if sub == "outputs":
-            return "ok"                       # workers/<w>/work/outputs[/...]
-        if len(segs) == 4 and sub in ("research_log.md", "summary.md"):
-            return "ok"                       # the two allowed loose files
+    if any(s in _DENY_DIRS for s in segs):
         return None
-    return None
+    # Worker process residue, scoped to workers/<name>/work/ so the names mean
+    # what the research workflow says they mean and nowhere else.
+    if len(segs) > 3 and segs[0] == "workers" and segs[2] == "work" \
+            and segs[3] in _DENY_WORKER_RESIDUE:
+        return None
+    return "ok"
 
 
 def _resolve(req_path: str) -> tuple[Path, str] | None:
-    """Map a URL sub-path to a contained, allowlisted (realpath, rel) pair, or
+    """Map a URL sub-path to a contained, permitted (realpath, rel) pair, or
     None if it escapes the workspace, contains '..', or is denied by the
-    allowlist. The classification runs on the RESOLVED path so a symlink can't
+    deny-list. The classification runs on the RESOLVED path so a symlink can't
     smuggle access to a denied/outside target."""
     rel = urllib.parse.unquote(req_path or "").strip("/")
     if rel:
@@ -243,6 +295,33 @@ def _render_markdown(text: str, rel: str) -> bytes:
     return _page(rel or "workspace", _breadcrumb(rel) + body)
 
 
+def _browser_renders(name: str) -> bool:
+    """True for a file whose type the browser displays better than escaped
+    source (see _RAW_MIME_TYPES) — checked before the content sniff."""
+    mime = mimetypes.guess_type(name)[0] or ""
+    return mime in _RAW_MIME_TYPES or mime.startswith(_RAW_MIME_PREFIXES)
+
+
+def _looks_like_text(path: Path) -> bool:
+    """Content sniff: a file with no NUL byte in its first chunk is text."""
+    try:
+        with open(path, "rb") as f:
+            return b"\0" not in f.read(READER_TEXT_SNIFF_BYTES)
+    except OSError:
+        return False
+
+
+def _render_text(path: Path, rel: str) -> bytes:
+    """Render a text file as a plain page: escaped into a <pre>, wrapped in the
+    same mobile shell as markdown. Unlike markdown this content is NEVER trusted
+    markup — a source file full of angle brackets must read as source, and a
+    workspace can hold files a worker or a cloned repo wrote."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return _page(rel or "workspace",
+                 _breadcrumb(rel)
+                 + f"<pre><code>{html.escape(text)}</code></pre>")
+
+
 def _render_notebook(path: Path, rel: str) -> bytes:
     from nbconvert import HTMLExporter  # lazy — heavy import only on first .ipynb
     import nbformat
@@ -268,16 +347,25 @@ def _listing(real: Path, rel: str) -> bytes:
         if e.name.startswith("."):
             continue
         child_rel = f"{rel}/{e.name}" if rel else e.name
-        got = _resolve(child_rel)               # re-classify each child on realpath
+        # _resolve unquotes (its callers hand it URL sub-paths), so a real filename
+        # containing '%' must be quoted on the way in or it is decoded as an escape
+        # — which yields a dead link, or points the row at an unrelated file, or
+        # drops the row. Rare in a curated research tree; ordinary in a repo clone.
+        try:
+            quoted = urllib.parse.quote(child_rel)
+        except UnicodeEncodeError:
+            # scandir decodes names with surrogateescape, so a name carrying
+            # non-UTF-8 bytes has no URL form at all. Skip the row: before the
+            # deny-list, only the handful of agent-written folders could hold such
+            # a name, and now one foreign file anywhere (a clone, a share dropped
+            # in shared/data/) would otherwise take the whole listing down with an
+            # unsent response rather than lose one row.
+            continue
+        got = _resolve(quoted)                  # re-classify on realpath
         if got is None:
             continue
         is_dir = e.is_dir()
-        if is_dir:
-            href = "/tree/" + urllib.parse.quote(got[1])
-        else:
-            if _classify(got[1]) != "ok":       # nav-only leaf files aren't viewable
-                continue
-            href = "/view/" + urllib.parse.quote(got[1])
+        href = ("/tree/" if is_dir else "/view/") + urllib.parse.quote(got[1])
         rows.append((is_dir, e.name, href))
     items = "".join(
         f'<li><a class="{"rd-dir" if d else "rd-file"}" href="{h}">{html.escape(n)}</a></li>'
@@ -354,7 +442,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if got is None:
             return self._fail(404, "not found")
         real, rel = got
-        if _classify(rel) != "ok" or not real.is_file():
+        # _resolve already applied the deny-list; this guard is the directory
+        # check. It must stay: without it a /view/ or /raw/ of a DIRECTORY reaches
+        # the raw path, which sends Content-Length + a content type and only then
+        # hits IsADirectoryError — headers already on the wire, so the OSError
+        # swallow below would turn a clean 404 into a truncated body.
+        if not real.is_file():
             return self._fail(404, "not found")
         try:
             st = real.stat()
@@ -364,19 +457,28 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if cached is not None:
             return self._send(200, cached[0], cached[1])
         suffix = real.suffix.lower()
+        body = None
+        ctype = "text/html; charset=utf-8"
+        # Render INSIDE the try; hand off to raw OUTSIDE it. The hand-off writes
+        # headers itself, so leaving it in here would let a later failure append a
+        # 422 to a response already on the wire — the same "headers are already
+        # sent" hazard the is_file() guard above exists for.
         try:
             if suffix == ".md":
                 body = _render_markdown(real.read_text(errors="replace"), rel)
-                ctype = "text/html; charset=utf-8"
             elif suffix == ".ipynb":
                 body = _render_notebook(real, rel)
-                ctype = "text/html; charset=utf-8"
-            else:
-                # Non-rendered types: hand off to raw so images/CSV/etc. display.
-                return self._route_raw(sub)
+            elif (not _browser_renders(real.name)
+                    and st.st_size <= READER_TEXT_RENDER_MAX_BYTES
+                    and _looks_like_text(real)):
+                body = _render_text(real, rel)          # text, small enough
         except Exception as exc:  # a corrupt notebook / bad markdown must not 500 opaque
             log.warning("render failed for %s: %s", rel, exc)
             return self._fail(422, "could not render this file")
+        if body is None:
+            # Images, documents the browser renders, binaries, oversized text:
+            # hand off to raw, which streams rather than buffering.
+            return self._route_raw(sub)
         _CACHE.put(rel, st.st_mtime_ns, st.st_size, body, ctype)
         self._send(200, body, ctype)
 
@@ -385,7 +487,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if got is None:
             return self._fail(404, "not found")
         real, rel = got
-        if _classify(rel) != "ok" or not real.is_file():
+        if not real.is_file():          # see the same guard in _route_view
             return self._fail(404, "not found")
         # STREAM raw bytes rather than read the whole file into memory: shared/data/
         # routinely holds multi-GB research files, and a few concurrent large GETs
