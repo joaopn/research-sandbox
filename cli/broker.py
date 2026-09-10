@@ -702,6 +702,12 @@ DEV_ACTIVE_FORK_WEBUI_FIELDS = frozenset({"repo", "user"})
 # attachment ledger AND the identity's live forks. Nothing host-shaped, and no
 # repo field — the purge is user-scoped by construction.
 DEV_PURGE_WEBUI_FIELDS = frozenset({"user"})
+# rs-fetch VISIBILITY for one repo (the Development page's Repos tab): a repo
+# name + a bool. Nothing host-shaped; the repo is shape-validated in from_kwargs
+# and gated on the mirror stamp in the verb. `enabled` MUST be listed here — a
+# field absent from an allowlist is dropped SILENTLY, and the request validator
+# refuses a missing one loudly rather than coercing it to "disable".
+DEV_FETCH_ENABLED_WEBUI_FIELDS = frozenset({"repo", "enabled"})
 # The per-row commit dropdown read (lazy, click-triggered): a repo name + ONE
 # of pr/branch (exactly-one enforced in from_kwargs, which also normalizes
 # ""-vs-absent — a webui query miss must not read as a phantom field) + the
@@ -798,6 +804,17 @@ def _verb_dev_set_active_fork(args: dict, _progress=None) -> dict:
     safe = {k: v for k, v in args.items() if k in DEV_ACTIVE_FORK_WEBUI_FIELDS}
     req = rscore.DevSetActiveForkRequest.from_kwargs(**safe)  # may raise ValidationError
     return dataclasses.asdict(rscore.dev_set_active_fork(req))
+
+
+def _verb_dev_set_fetch_enabled(args: dict, _progress=None) -> dict:
+    # Show/hide one repo on the webui's rs-fetch lists. A pure host-file write —
+    # no gitea call at all, so it is neither step-up (it destroys nothing and the
+    # same click reverses it) nor a progress verb (nothing to tail); an inline
+    # relay inside the webui's 30s window is right. Token-gated by the
+    # deny-by-default rule like every other dev verb.
+    safe = {k: v for k, v in args.items() if k in DEV_FETCH_ENABLED_WEBUI_FIELDS}
+    req = rscore.DevSetFetchEnabledRequest.from_kwargs(**safe)  # may raise ValidationError
+    return dataclasses.asdict(rscore.dev_set_fetch_enabled(req))
 
 
 def _verb_dev_purge_consumer(args: dict, progress=None) -> dict:
@@ -904,6 +921,7 @@ VERBS = {
     "dev_gitea_start": _verb_dev_gitea_start,
     "dev_passwd": _verb_dev_passwd,
     "dev_set_active_fork": _verb_dev_set_active_fork,
+    "dev_set_fetch_enabled": _verb_dev_set_fetch_enabled,
     "dev_purge_consumer": _verb_dev_purge_consumer,
     "dev_commits": _verb_dev_commits,
 }

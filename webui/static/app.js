@@ -1900,16 +1900,20 @@ function setTypeBadge(elm, label) {
 // Three sub-tabs: "Gitea" (the gitea web UI on its own origin port, session
 // minted via the Management-anchored /broker/dev/gitea-session), "Fetch" (the
 // RS-rendered open-PR/branch list with click-to-copy rs-fetch commands, fed by
-// one /broker/dev read per open — Q6, no poller) and "Reviews" (every verdict
-// ever recorded, off its own ledger read). The Fetch tab is the guaranteed copy
-// surface; the agent's final-comment code block inside Gitea (with Gitea's own
-// copy button) is the convenience layer.
+// one /broker/dev read per open — Q6, no poller), "Repos" (the dev-lane
+// inventory: per-repo activity counts and the rs-fetch visibility switches that
+// decide which repos the Fetch list shows, off the SAME /broker/dev read) and
+// "Reviews" (every verdict ever recorded, off its own ledger read). The Fetch
+// tab is the guaranteed copy surface; the agent's final-comment code block
+// inside Gitea (with Gitea's own copy button) is the convenience layer.
 //
 // Reviews is deliberately NOT a section of the Fetch tab's repo cards: a repo
 // card exists only while gitea runs AND its mirror is still listed, so a
 // history living there would vanish exactly when the rows it outlives do. Its
 // read touches no gitea at all, so the tab renders with gitea stopped and after
-// the last mirror is gone.
+// the last mirror is gone. Repos is the opposite case and belongs where it is:
+// it enumerates exactly those live mirrors, so it shares Fetch's read and its
+// gitea-running gate.
 
 let devActiveTab = "gitea";
 
@@ -1927,24 +1931,30 @@ function renderDevelopmentInto(view) {
     const body = el("div", { class: "dev-body" });
     const tabGitea = el("button", { class: "btn-small dev-tab-btn" }, ["Gitea"]);
     const tabFetch = el("button", { class: "btn-small dev-tab-btn" }, ["Fetch"]);
+    const tabRepos = el("button", { class: "btn-small dev-tab-btn" }, ["Repos"]);
     const tabReviews = el("button", { class: "btn-small dev-tab-btn" },
                           ["Reviews"]);
     const mark = () => {
         tabGitea.classList.toggle("active", devActiveTab === "gitea");
         tabFetch.classList.toggle("active", devActiveTab === "fetch");
+        tabRepos.classList.toggle("active", devActiveTab === "repos");
         tabReviews.classList.toggle("active", devActiveTab === "reviews");
     };
     tabGitea.onclick = () => { devActiveTab = "gitea"; mark(); renderDevGiteaTab(view, body); };
     tabFetch.onclick = () => { devActiveTab = "fetch"; mark(); renderDevFetchTab(view, body); };
+    tabRepos.onclick = () => { devActiveTab = "repos"; mark(); renderDevReposTab(view, body); };
     tabReviews.onclick = () => { devActiveTab = "reviews"; mark(); renderDevReviewsTab(view, body); };
     view.appendChild(el("div", { class: "mgmt-header" }, [
         el("h2", {}, ["Development"]),
         el("div", { class: "mgmt-toolbar dev-tabs" },
-           [tabGitea, tabFetch, tabReviews]),
+           [tabGitea, tabFetch, tabRepos, tabReviews]),
     ]));
     view.appendChild(body);
     mark();
+    // Gitea stays the landing tab (unchanged): the inventory is a management
+    // surface, not the thing you open the page to do.
     if (devActiveTab === "fetch") renderDevFetchTab(view, body);
+    else if (devActiveTab === "repos") renderDevReposTab(view, body);
     else if (devActiveTab === "reviews") renderDevReviewsTab(view, body);
     else renderDevGiteaTab(view, body);
 }
@@ -3051,7 +3061,14 @@ function renderDevFetchScreen(view, body, result) {
     // affordances live on the cards below; the empty states have none).
     const revLine = devReviewerLine(result.reviewer);
     if (revLine) body.appendChild(revLine);
-    for (const r of repos) {
+    // ⚠ The visibility filter runs HERE, strictly AFTER the !repos.length gate
+    // above. Filtering first would tell an operator who has merely hidden every
+    // repo that they have none and should go mirror one — false, and it points
+    // them at the wrong page. All-hidden falls through to the hidden-count line
+    // at the bottom instead.
+    const visible = devFetchVisible(repos);
+    const hidden = repos.length - visible.length;
+    for (const r of visible) {
         const attached = attachments.filter((a) => a.repo === r.repo)
                                     .map((a) => a.project);
         body.appendChild(buildDevRepoCard(view, body, r, attached, {
@@ -3061,7 +3078,20 @@ function renderDevFetchScreen(view, body, result) {
             // repos a retired identity owns a fork of (purging is user-scoped,
             // this view is repo-scoped). Free — already fetched. The scoped
             // pane passes none: it holds one repo, and it has no purge control.
+            //
+            // ⚠ UNFILTERED, deliberately — `repos`, never `visible`. This feeds
+            // devForksOf, which tells the step-up-gated purge dialog what is
+            // about to be irreversibly deleted; that list already under-reports
+            // on degraded rows by construction, and a display preference must
+            // never become a second way to under-report it. The filter governs
+            // which cards render and nothing else.
             allRepos: repos,
+        }));
+    }
+    if (hidden) {
+        body.appendChild(devHiddenLine(hidden, "Repos", () => {
+            devActiveTab = "repos";
+            renderDevelopmentInto(view);
         }));
     }
     body.appendChild(devFetchLegend());
@@ -3079,6 +3109,279 @@ function devFetchLegend() {
         "original timestamps); ▸ lists a row's commits to fetch them one by ",
         "one.",
     ]);
+}
+
+// ---- rs-fetch visibility (the Repos tab's toggle, and the lists it filters) --
+//
+// A repo the operator has switched OFF is dropped from the rs-fetch LISTS — the
+// Development page's Fetch tab and a project's project-wide fetch pane. It is a
+// display setting and nothing more: the repo stays mirrored, its own per-repo
+// fetch tab still renders, and `rs-fetch <repo>` typed in a terminal is
+// unaffected (nothing in a container enumerates repos).
+//
+// TOLERANT on purpose: a row from a broker that predates the field carries no
+// `fetch_enabled` at all, and must stay visible. Only an explicit `false` hides.
+function devFetchVisible(repos) {
+    return repos.filter((r) => !(r && r.fetch_enabled === false));
+}
+
+// The "N repos hidden" footer. Never let a filtered list end silently — the
+// whole failure this guards against is a repo the operator cannot find and
+// cannot remember hiding. `onOpen` is the way back, and it differs per surface:
+// on the Development page it switches to the Repos tab (saying "Development →
+// Repos" there would point at the page you are standing on); on a project's
+// pane it opens Development.
+function devHiddenLine(count, label, onOpen) {
+    const open = el("button", { class: "btn-small" }, [label]);
+    open.onclick = onOpen;
+    return el("div", { class: "hint dev-hidden-line" }, [
+        el("span", {}, [`${count} repo${count === 1 ? "" : "s"} hidden from `
+                        + "this list. "]),
+        open,
+    ]);
+}
+
+// ---- The Repos tab: the dev-lane inventory + the rs-fetch switches ----------
+//
+// Reads the SAME /broker/dev payload the Fetch tab reads — one verb, no second
+// read path — through the same transport-vs-verb ladder: a thrown fetch, a 503
+// or an unparseable body mean the broker is unreachable; a 200 carrying
+// {ok:false} means the broker ANSWERED and the verb refused, which is a
+// different thing and must not be reported as an outage.
+async function renderDevReposTab(view, body) {
+    body.innerHTML = "";
+    body.appendChild(el("div", { class: "mgmt-loading" }, ["Loading dev repos…"]));
+    let res;
+    try {
+        res = await fetch("/broker/dev");
+    } catch (e) { return renderMgmtUnavailable(body); }
+    if (res.status === 401) return renderMgmtLogin(view, renderDevelopmentInto);
+    if (res.status === 403) return renderMgmtRejected(body);
+    if (res.status === 503) return renderMgmtUnavailable(body);
+    let data;
+    try { data = await res.json(); } catch (e) { return renderMgmtUnavailable(body); }
+    if (!res.ok || !data.ok || !data.result) {
+        body.innerHTML = "";
+        const retry = el("button", { class: "btn-small" }, ["Retry"]);
+        retry.onclick = () => renderDevReposTab(view, body);
+        body.appendChild(el("div", { class: "mgmt-empty" }, [
+            el("span", {}, [(mgmtErrText(data) || "Could not load dev status.")
+                            + " "]),
+            retry,
+        ]));
+        return;
+    }
+    renderDevReposScreen(view, body, data.result);
+}
+
+// One inventory row's plain-language state, or "" when there is nothing to say.
+//
+// ⚠ `empty` is the ACTIVE FORK's emptiness, never the mirror's — so a repo
+// nobody has ever worked reads {active:"", empty:false} while a worked one whose
+// agent has not pushed reads {active:<user>, empty:true}. A bare "empty" badge
+// would therefore mark the SECOND and not the first, which is the inverse of
+// what an inventory reader infers. Spell both out instead.
+function devRepoStateText(r) {
+    if (!r.active) return "no agent yet";
+    if (r.empty) return "no pushes yet";
+    return "";
+}
+
+// A count cell: a number, or an em-dash when the figure is genuinely unknown.
+// 0 and "unknown" are DIFFERENT answers here — a repo with no consumer fork has
+// no counters at all, and printing 0 would claim it is quiet rather than
+// unworked, which is exactly the distinction this table exists to draw.
+function devCountCell(n) {
+    return el("td", { class: "dev-repos-num" },
+              [typeof n === "number" ? String(n) : "—"]);
+}
+
+function renderDevReposScreen(view, body, result) {
+    body.innerHTML = "";
+    const gitea = result.gitea || {};
+    const repos = Array.isArray(result.repos) ? result.repos : [];
+    const attachments = Array.isArray(result.attachments) ? result.attachments : [];
+    // The list itself comes from gitea's search API, so a stopped gitea has
+    // nothing to enumerate and nothing to toggle — the same Enable prompt as
+    // the Fetch tab, not a special case.
+    if (!gitea.exists || !gitea.running) {
+        const enable = el("button", { class: "btn-small" }, ["Enable Gitea"]);
+        enable.onclick = () =>
+            devEnableGiteaDialog(view, () => renderDevReposTab(view, body));
+        body.appendChild(el("div", { class: "mgmt-empty" }, [
+            el("span", {}, [gitea.exists ? "Gitea is stopped. "
+                                         : "The dev lane isn't enabled yet. "]),
+            enable,
+        ]));
+        return;
+    }
+    if (!repos.length) {
+        body.appendChild(el("div", { class: "mgmt-empty" }, [
+            "No dev repos yet. A repo is mirrored here when you create a dev "
+            + "project from a GitHub URL (Workflows → Dev), or add a dev box to "
+            + "an existing project.",
+        ]));
+        return;
+    }
+    // The active fork lives in the repo cell's sub-line rather than its own
+    // column: it is the longest value in the table, and on a phone a sixth
+    // column pushed the rs-fetch switch — the one control here — off-screen.
+    // The two optional columns are CSS-hidden at narrow widths (see style.css),
+    // which leaves repo + counts + switch, the set that is worth a phone.
+    const head = el("tr", {}, [
+        el("th", {}, ["Repo"]),
+        el("th", { class: "dev-repos-num" }, ["Issues"]),
+        el("th", { class: "dev-repos-num" }, ["PRs"]),
+        el("th", { class: "dev-repos-opt" }, ["Synced"]),
+        el("th", { class: "dev-repos-opt" }, ["Worked by"]),
+        el("th", {}, ["rs-fetch"]),
+    ]);
+    const rows = [];
+    for (const r of repos) {
+        // Deduplicated PROJECT names. The payload cannot say more: dev_status
+        // drops the ledger's `box` discriminator, so one project hosting two dev
+        // boxes on a repo contributes three indistinguishable rows. An EMPTY
+        // list does NOT mean nobody is working the repo — provision_consumer
+        // mints a fork with no ledger row at all — so this column is rendered
+        // plainly, never as a warning state.
+        const worked = [...new Set(attachments.filter((a) => a && a.repo === r.repo)
+                                              .map((a) => a.project)
+                                              .filter(Boolean))];
+        rows.push(devRepoInventoryRow(view, body, r, worked));
+    }
+    body.appendChild(el("div", { class: "dev-repos-wrap" }, [
+        el("table", { class: "dev-repos-table" }, [
+            el("thead", {}, [head]), el("tbody", {}, rows),
+        ]),
+    ]));
+    body.appendChild(el("div", { class: "hint" }, [
+        "Issues and PRs are counted on each repo's active agent fork — the "
+        + "fork is where the agent files work and where you file tasks for it. "
+        + "Switching rs-fetch off hides a repo from the Fetch tab and from "
+        + "every project's rs-fetch tab; it never deletes anything, and "
+        + "rs-fetch still works on it by name in a terminal.",
+    ]));
+}
+
+// ONE inventory row. The degraded arm is not optional: dev_status hands back a
+// {repo, error} row when a repo's status read raises, and that row carries NONE
+// of the keys the data columns read — so an unqualified render would print
+// "undefined" across it and, worse, would report "no agent yet" (the `active`
+// key is merely absent) about a repo whose fork state is unknown. The toggle
+// stays live there on purpose: a sick repo is exactly the one you reach for the
+// hide button on, and the preference is a local file read that works regardless.
+function devRepoInventoryRow(view, body, r, worked) {
+    const toggle = devFetchToggle(view, body, r);
+    if (r.error) {
+        return el("tr", { class: "dev-repos-degraded" }, [
+            el("td", {}, [
+                el("div", { class: "dev-repo-name" }, [r.repo || ""]),
+                el("div", { class: "dev-pr-meta dev-review-failed" },
+                   [String(r.error)]),
+            ]),
+            el("td", { class: "dev-repos-num" }, ["—"]),
+            el("td", { class: "dev-repos-num" }, ["—"]),
+            el("td", { class: "dev-repos-opt" }, ["—"]),
+            el("td", { class: "dev-repos-opt" }, ["—"]),
+            el("td", {}, [toggle]),
+        ]);
+    }
+    // Sub-line: what this row's numbers belong to. The fork NAME is the
+    // attribution — simultaneous consumers on one repo are legal, so a bare
+    // count would read as the repo's total when it is one fork's — and the two
+    // plain-language states stand in its place when there is no fork to name.
+    const nameCell = [el("div", { class: "dev-repo-name" }, [r.repo || ""])];
+    const sub = [];
+    if (r.private) sub.push(el("span", {}, ["private"]));
+    if (r.active) sub.push(el("span", { class: "dev-repos-fork" }, [r.active]));
+    const state = devRepoStateText(r);
+    if (state) sub.push(el("span", {}, [state]));
+    if (sub.length) {
+        const line = el("div", { class: "dev-pr-meta dev-repos-sub" }, []);
+        sub.forEach((s, i) => {
+            if (i) line.appendChild(el("span", {}, [" · "]));
+            line.appendChild(s);
+        });
+        nameCell.push(line);
+    }
+    return el("tr", {}, [
+        el("td", {}, nameCell),
+        devCountCell(r.open_issues),
+        devCountCell(r.open_prs),
+        el("td", { class: "dev-pr-meta dev-repos-opt" },
+           [r.mirror_synced_at || "—"]),
+        el("td", { class: "dev-pr-meta dev-repos-opt" },
+           [worked.length ? worked.join(", ") : "—"]),
+        el("td", {}, [toggle]),
+    ]);
+}
+
+// The rs-fetch switch. Optimism is deliberately absent: the button disables
+// itself, posts, and the tab re-renders from what the SERVER says — never from
+// what the page believed. `enabled` is sent as a real boolean and is named
+// explicitly at every hop, because a field the broker does not recognise is
+// dropped silently (the verb's validator refuses a missing one rather than
+// reading it as "disable").
+function devFetchToggle(view, body, r) {
+    const on = r.fetch_enabled !== false;
+    const btn = el("button", {
+        class: "btn-small dev-fetch-toggle" + (on ? "" : " off"),
+        title: on
+            ? "Shown on the Fetch tab and on every project's rs-fetch tab. "
+              + "Click to hide it there."
+            : "Hidden from the rs-fetch lists. The repo, its forks and its "
+              + "history are untouched, and rs-fetch still works on it by "
+              + "name. Click to show it again.",
+    }, [on ? "Enabled" : "Disabled"]);
+    // A refusal is REPORTED, not swallowed. The verb's gate is reachable in
+    // normal use — the repo was removed in another tab, or it is listed from
+    // gitea while this host holds no mirror stamp for it — and without this the
+    // only feedback is the button silently snapping back, which reads as the
+    // page being broken. The message is server text (already written to be
+    // browser-safe, naming no CLI command) and goes in as a TEXT node.
+    const err = el("span", { class: "dev-pr-meta dev-review-failed" }, []);
+    err.hidden = true;
+    btn.onclick = async () => {
+        btn.disabled = true;
+        btn.textContent = "…";
+        err.hidden = true;
+        let msg = "";
+        try {
+            const res = await fetch("/broker/dev/fetch-enabled", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ repo: r.repo, enabled: !on }),
+            });
+            // The transport-vs-verb split: 401/403/503 are the broker being
+            // unreachable or refusing the webui, not this verb refusing — and
+            // they are THREE different remedies, so they get three messages.
+            // Collapsing them into one that names only the session cause sends
+            // an operator whose broker is down to re-login, which cannot help.
+            if (res.status === 401) {
+                msg = "Management session expired — reload the page.";
+            } else if (res.status === 403) {
+                msg = "The broker rejected the webui.";
+            } else if (res.status === 503) {
+                msg = "The broker isn’t reachable.";
+            } else {
+                const data = await res.json();
+                if (!res.ok || !data.ok) msg = mgmtErrText(data) || "Refused.";
+            }
+        } catch (e) {
+            msg = "The broker isn’t reachable.";
+        }
+        if (msg) {
+            // Leave the row as it was and say why, rather than re-rendering
+            // into a state the click did not achieve.
+            err.textContent = msg;
+            err.hidden = false;
+            btn.disabled = false;
+            btn.textContent = on ? "Enabled" : "Disabled";
+            return;
+        }
+        renderDevReposTab(view, body);
+    };
+    return el("span", { class: "dev-fetch-cell" }, [btn, err]);
 }
 
 // Build ONE dev repo's card — shared by the Development Fetch tab (unscoped)
@@ -3433,7 +3736,12 @@ async function renderProjectFetchPane(container, repo) {
             [`No status for ${repo} — was the repo removed?`]));
         return;
     }
-    for (const r of rows) {
+    // Same ordering rule as the Development page: filter AFTER the empty gate
+    // above, and only in all-repos mode — the per-repo `fetch-<repo>` tab was
+    // opened by name, so it never hides its one repo.
+    const visible = all ? devFetchVisible(rows) : rows;
+    const hiddenCount = all ? rows.length - visible.length : 0;
+    for (const r of visible) {
         // ⚠ The two verbs return DIFFERENT attachment shapes, so these must not
         // be unified: dev_status emits [{project, repo}] for EVERY repo (filter,
         // or every card claims every project), while dev_repo_status emits
@@ -3455,6 +3763,10 @@ async function renderProjectFetchPane(container, repo) {
     // keeps its own placement above them.
     const revLine = devReviewerLine(result.reviewer);
     if (revLine) container.appendChild(revLine);
+    if (hiddenCount) {
+        container.appendChild(devHiddenLine(hiddenCount, "Open Development",
+                                            () => openDevelopment()));
+    }
     // The shared legend — worth carrying only where there are many cards and
     // the 📋/▸/auto-commit affordances need naming (the per-repo pane omits it).
     if (all) container.appendChild(devFetchLegend());

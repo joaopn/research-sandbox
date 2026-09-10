@@ -2074,6 +2074,34 @@ class DevSetActiveForkRequest:
 
 
 @dataclass(frozen=True)
+class DevSetFetchEnabledRequest:
+    """Show or hide one repo on the webui's rs-fetch LISTS. Shape only; the verb
+    gates on the mirror stamp.
+
+    `enabled` is REQUIRED and must be a real bool — never `bool(kw.get(...))`.
+    This field crosses four hops (the browser payload, the webui handler's
+    hand-picked args, the broker's field allowlist, here), and the broker DROPS
+    an unknown field with NO error. A coercing read would turn a key lost at any
+    of those hops into a silent "disable", which is the worst possible failure
+    for this verb: the operator clicks Enable and the repo stays hidden, with
+    nothing anywhere reporting a problem. Refusing makes that hop failure loud.
+    """
+    repo: str
+    enabled: bool
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "DevSetFetchEnabledRequest":
+        repo = kw.get("repo")
+        if not _valid_dev_repo_name(repo):
+            raise ValidationError(f"invalid dev repo name: {repo!r}")
+        enabled = kw.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ValidationError(
+                f"enabled must be true or false, got {enabled!r}")
+        return cls(repo=repo, enabled=enabled)
+
+
+@dataclass(frozen=True)
 class DevPurgeConsumerRequest:
     """Delete a RETIRED dev identity outright — the gitea user and every fork it
     owns — to free its name for reuse. The verb re-gates against the ledger and
@@ -2457,6 +2485,12 @@ class DevPasswdResult:
 class DevSetActiveForkResult:
     repo: str
     user: str
+
+
+@dataclass
+class DevSetFetchEnabledResult:
+    repo: str
+    enabled: bool
 
 
 @dataclass
@@ -10330,6 +10364,14 @@ def dev_repo_list(_req: "DevRepoListRequest", _progress=None) -> DevRepoListResu
         repos = gitea.list_repos(_gitea_host_port())
     except gitea.GiteaError as e:
         raise ValidationError(str(e))
+    # rs-fetch visibility rides every repo-listing read (the CLI's list surface
+    # here; the browser's on dev_status below). A pure host-file read: it adds
+    # no docker or network call, so the no-start posture above is untouched.
+    # Deliberately the same `fetch_enabled` seam the other two read verbs use
+    # rather than a hoisted map read: one function is one place for a test to
+    # stub, and the archived pins that drive these verbs stub exactly it.
+    for row in repos:
+        row["fetch_enabled"] = gitea.fetch_enabled(row.get("repo"))
     return DevRepoListResult(repos=repos)
 
 
@@ -10528,6 +10570,12 @@ def dev_status(_req: "DevStatusRequest", _progress=None) -> DevStatusResult:  # 
                     row.get("active") or "", row.get("active_id"))
             except gitea.GiteaError as e:
                 row = {"repo": name, "error": str(e)}
+            # The visibility preference rides BOTH arms deliberately. A degraded
+            # repo is exactly the one an operator reaches for the hide button on,
+            # so its row must still carry the state its toggle renders from — and
+            # unlike the fields repo_status computes, this one is knowable even
+            # when gitea cannot answer for the repo (it is a local file read).
+            row["fetch_enabled"] = gitea.fetch_enabled(name)
             repos.append(row)
     attachments = [{"project": e.get("project"), "repo": e.get("repo")}
                    for e in gitea.load_attachments()
@@ -10577,6 +10625,8 @@ def dev_repo_status(req: "DevRepoStatusRequest", _progress=None) -> DevRepoStatu
                 row.get("active") or "", row.get("active_id"))
         except gitea.GiteaError as e:
             row = {"repo": req.repo, "error": str(e)}
+        # Same annotation as dev_status, on both arms, for the same reason.
+        row["fetch_enabled"] = gitea.fetch_enabled(req.repo)
     attachments = [{"project": e.get("project")}
                    for e in gitea.load_attachments()
                    if e.get("project") and e.get("repo") == req.repo]
@@ -10622,6 +10672,34 @@ def dev_set_active_fork(req: "DevSetActiveForkRequest", _progress=None) -> DevSe
     for project in gitea.attached_projects(req.repo):
         _stage_dev_gitea(project, cfg)
     return DevSetActiveForkResult(repo=req.repo, user=req.user)
+
+
+def dev_set_fetch_enabled(req: "DevSetFetchEnabledRequest", _progress=None) -> DevSetFetchEnabledResult:  # type: ignore[name-defined]
+    """Show or hide one repo on the webui's rs-fetch LISTS (the Development
+    page's Repos tab, and its CLI twin).
+
+    The cheapest verb in the dev lane: a single host-file write with NO gitea
+    call on any path — so, unlike its sibling dev_set_active_fork, it does not
+    resume gitea and cannot wait on one. A stopped or sick gitea is irrelevant
+    to it.
+
+    The one gate is the mirror stamp — the same pre-side-effect host-file floor
+    dev_attach, box_add's dev gate and CreateRequest.from_kwargs use — so a
+    preference can never be minted for a repo that was never added (a stale page
+    clicking a repo removed in another tab is the live case). Its refusal text is
+    the wording those three already share: it reaches the browser verbatim, so it
+    names webui affordances and no CLI command.
+
+    Visibility is a DISPLAY setting, not a permission: nothing here touches the
+    in-container fetch wiring, and `rs-fetch <repo>` typed in a terminal keeps
+    working on a hidden repo. Nothing in a container enumerates repos, so there
+    is no in-container list for this to clean."""
+    if not gitea.mirror_present(req.repo):
+        raise ValidationError(
+            f"repo {req.repo!r} not added yet — add it first (the dev "
+            f"workflow card and the dev box dialog take its GitHub URL)")
+    gitea.set_fetch_enabled(req.repo, req.enabled)
+    return DevSetFetchEnabledResult(repo=req.repo, enabled=req.enabled)
 
 
 def dev_purge_consumer(req: "DevPurgeConsumerRequest", progress=None) -> DevPurgeConsumerResult:  # type: ignore[name-defined]

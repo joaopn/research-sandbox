@@ -1565,6 +1565,76 @@ body {
     gap: 6px;
 }
 .dev-reviewing { font-style: italic; }
+
+/* Development → Repos: the dev-lane inventory + its rs-fetch switches. A real
+   table (the content IS tabular — one row per repo, columns compared down) in
+   an overflow-x wrapper, so a narrow viewport scrolls the table instead of
+   forcing the page to scroll sideways. Every selector self-scoped under
+   dev-repos-* / dev-fetch-toggle, and NOTHING here sits inside a .field — the
+   toggle is a plain button and the table carries no bare input/label rules. */
+.dev-repos-wrap { overflow-x: auto; }
+.dev-repos-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+.dev-repos-table th {
+    text-align: left;
+    font-weight: 600;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--fg-muted);
+    padding: 0 10px 6px 0;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+}
+.dev-repos-table td {
+    padding: 8px 10px 8px 0;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+}
+.dev-repos-table tr:last-child td { border-bottom: none; }
+/* Counts read as a column of figures, so they align right and never wrap. */
+.dev-repos-table .dev-repos-num { text-align: right; white-space: nowrap; }
+/* The fork name is an identifier: never break it mid-token. It sits in the repo
+   cell's sub-line (not its own column) so the row stays narrow enough for the
+   rs-fetch switch to survive a phone. */
+.dev-repos-fork {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    white-space: nowrap;
+}
+/* The sub-line wraps rather than widening the column. */
+.dev-repos-sub { display: flex; flex-wrap: wrap; gap: 0 2px; }
+/* Columns worth a wide screen and not worth a phone: on mobile the table keeps
+   repo + both counts + the switch, because the switch is the only control here
+   and a horizontally-scrolled table hides it behind a gesture nothing on screen
+   suggests. The data is not lost, just not shown at this width.
+   Scoped under html.mobile — the ONE mobile switch (app.js mobileModeActive:
+   the 768px breakpoint OR the Settings -> Layout override) — and NOT a raw
+   media query: a viewport query ignores that override, so pinning Layout to
+   Desktop in a narrow window would drop these columns anyway (with nothing on
+   screen explaining it) while pinning it to Mobile on a wide one would keep
+   them, which is exactly the case this rule exists for. */
+html.mobile .dev-repos-table .dev-repos-opt { display: none; }
+/* A row whose status could not be read: dimmed like the retired-fork rows, so
+   it reads as "nothing to report here" rather than as data. Its toggle stays at
+   full strength — that control still works and is the reason the row renders. */
+.dev-repos-degraded td { color: var(--fg-muted); }
+/* The switch. `off` is a muted state, not a danger state: hiding a repo deletes
+   nothing and the same click reverses it. */
+.dev-fetch-toggle { min-width: 74px; }
+/* The switch and its refusal message share a cell: the message wraps under the
+   button rather than widening the column. */
+.dev-fetch-cell { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
+.dev-fetch-toggle.off { color: var(--fg-muted); }
+/* The "N repos hidden" footer, with its way back inline. */
+.dev-hidden-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
 /* Review outcome colors: keyed on the machine "outcome" field only (the
    free-text risk label is display, never parsed). No class = no color
    (unknown / pre-field entries); review-run failures share the error red. */

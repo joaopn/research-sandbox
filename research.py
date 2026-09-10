@@ -1932,7 +1932,19 @@ def cmd_dev_repo_list(_args: argparse.Namespace) -> None:
         print("no dev repos")
         return
     for r in sorted(res.repos, key=lambda e: e.get("repo") or ""):
-        print(f"  {r.get('repo')}")
+        state = "on" if r.get("fetch_enabled", True) else "off"
+        print(f"  {r.get('repo')}  [rs-fetch: {state}]")
+
+
+def cmd_dev_repo_fetch(args: argparse.Namespace) -> None:
+    """Show or hide a repo on the webui's rs-fetch lists — the CLI twin of the
+    Development page's Repos-tab toggle. Display only: a hidden repo is still
+    fetchable by name with `rs-fetch <repo>`."""
+    req = _build(rscore.DevSetFetchEnabledRequest, repo=args.repo,
+                 enabled=(args.state == "on"))
+    res = _call(rscore.dev_set_fetch_enabled, req)
+    shown = "shown on" if res.enabled else "hidden from"
+    print(f"{res.repo} is now {shown} the rs-fetch lists")
 
 
 def cmd_dev_reviews(_args: argparse.Namespace) -> None:
@@ -2595,6 +2607,16 @@ def build_parser() -> argparse.ArgumentParser:
     dvrr.set_defaults(func=cmd_dev_repo_remove)
     dvrl = dvr_sub.add_parser("list", help="list dev repos")
     dvrl.set_defaults(func=cmd_dev_repo_list)
+    dvrf = dvr_sub.add_parser(
+        "fetch",
+        help="show/hide a repo on the webui's rs-fetch lists — the CLI twin of "
+             "the Development page's Repos tab. Display only: a hidden repo is "
+             "still fetchable by name")
+    dvrf.add_argument("repo")
+    dvrf.add_argument("state", choices=["on", "off"],
+                      help="on = shown on the rs-fetch lists (the default for "
+                           "every repo); off = hidden")
+    dvrf.set_defaults(func=cmd_dev_repo_fetch)
     dvrv = dv_sub.add_parser("reviews",
                              help="list every recorded review verdict, newest "
                                   "first (the ledger; no gitea needed)")

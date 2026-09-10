@@ -58,6 +58,15 @@ MIRRORS_DIR = DEV_DIR / "mirrors"
 # dev-gitea.json `user` rows. Absent entry = derived (single live fork, else
 # the most recently created live fork).
 ACTIVE_FORKS_PATH = DEV_DIR / "active-forks.json"
+# Per-repo rs-fetch VISIBILITY, the sibling of the active-fork map above: a
+# {repo: bool} preference read with a default of True, so a repo that has never
+# been touched is visible and the file only ever records deliberate choices.
+# Display state ONLY — it steers which repos the webui's rs-fetch LISTS render
+# and nothing else. Deliberately NOT gitea's own `archived` flag: archiving a
+# repo makes it read-only (a mirror would stop syncing), and `archived` already
+# means "retired consumer identity" to the Remove gate, the purge gate and the
+# active-fork resolver. A display preference must not change what the backend does.
+FETCH_PREFS_PATH = DEV_DIR / "fetch-repos.json"
 
 # Reviewer surface (STAGE_DEV_GITEA S4). The verdict ledger is HOST-ONLY state:
 # never bind-mounted, never written into gitea or any container (invariant 4 —
@@ -1088,6 +1097,16 @@ def remove_repo(host_port: str, repo: str) -> list[str]:
     if repo in active:
         del active[repo]
         save_active_forks(active)
+    # The rs-fetch visibility preference goes with the repo, exactly as the
+    # active-fork entry above does. Without this, removing a HIDDEN repo and
+    # later re-adding it under the same name (the documented way to refresh a
+    # private repo's PAT) brings the mirror back already hidden, with nothing
+    # on screen to explain why — and the "new repos are visible" default would
+    # be false for the one case where it matters most.
+    prefs = load_fetch_prefs()
+    if repo in prefs:
+        del prefs[repo]
+        save_fetch_prefs(prefs)
     return purged
 
 
@@ -1173,6 +1192,43 @@ def save_active_forks(entries: dict) -> None:
     tmp.replace(ACTIVE_FORKS_PATH)
 
 
+def load_fetch_prefs() -> dict:
+    """The {repo: bool} rs-fetch visibility map. TOLERANT by design (the
+    load_active_forks posture): absent, unreadable or malformed all read as "no
+    preferences recorded" rather than raising — this is consulted on every
+    Development-page read, and a corrupt preference file must never take the
+    page down. Its worst case is that everything shows, which is the default."""
+    if not FETCH_PREFS_PATH.is_file():
+        return {}
+    try:
+        data = json.loads(FETCH_PREFS_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_fetch_prefs(entries: dict) -> None:
+    DEV_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = FETCH_PREFS_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(entries, indent=2, sort_keys=True))
+    tmp.replace(FETCH_PREFS_PATH)
+
+
+def fetch_enabled(repo: str) -> bool:
+    """Is `repo` shown on the webui's rs-fetch lists? Default TRUE — a repo with
+    no recorded preference is visible, so a newly mirrored repo needs no write to
+    appear and a deleted preference file restores the default everywhere."""
+    return bool(load_fetch_prefs().get(repo, True))
+
+
+def set_fetch_enabled(repo: str, enabled: bool) -> None:
+    """Record the preference. The explicit True is STORED rather than the key
+    deleted: the write stays idempotent and the file says what was chosen."""
+    prefs = load_fetch_prefs()
+    prefs[repo] = bool(enabled)
+    save_fetch_prefs(prefs)
+
+
 def resolve_active_fork(repo: str, forks: list[dict]) -> str:
     """PURE resolution over an already-fetched forks list (unit-testable):
     the explicit map entry if it names a LIVE fork, else the single live fork,
@@ -1194,6 +1250,13 @@ def active_fork_for(host_port: str, repo: str) -> str:
     return resolve_active_fork(repo, list_forks(host_port, repo))
 
 
+def _count_or_none(value: Any) -> "int | None":
+    """A gitea counter as an int, or None when it is absent or not a number.
+    None and 0 mean different things on the Development surfaces — "not known"
+    vs "none open" — so a missing counter must never collapse into a zero."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def repo_status(host_port: str, repo: str) -> dict:
     """Per-repo Development-page status: mirror sync time + the ACTIVE fork's
     open PRs + branches (multi-fork reads are steered by the active-fork map —
@@ -1211,6 +1274,9 @@ def repo_status(host_port: str, repo: str) -> dict:
     # under, so the badge feed can tell this fork's PR #N from another
     # consumer's (or from a purged predecessor's, which gets a NEW id).
     active_id = 0
+    # Gitea's own maintained counters on the ACTIVE FORK — None (not 0) when
+    # there is no live consumer fork. See the field-picking block below.
+    open_issues = open_prs = None
     if active:
         # The ACTIVE FORK's own info decides emptiness — the MIRROR's does
         # not suffice (a synced mirror + an agent that never pushed leaves
@@ -1224,6 +1290,17 @@ def repo_status(host_port: str, repo: str) -> dict:
                                 timeout=STATUS_TIMEOUT_S) or {}
         fork_empty = bool(fork_info.get("empty"))
         active_id = fork_info.get("id") or 0
+        # FREE: read off the fork info this call already made. `open_issues_count`
+        # and `open_pr_counter` are DISJOINT on the repo JSON (measured on gitea
+        # 1.25.1: filing an issue moved the first and left the second alone), so
+        # this is not the issues API's "a list of issues also contains PRs"
+        # behaviour. Read from the FORK, never the mirror: the mirror's issue unit
+        # is off at migrate time and it has no pulls unit, so its counters are
+        # structurally zero — reporting them would claim "0 issues, 0 PRs" about a
+        # repo nobody has ever worked, which is exactly the state a reader needs to
+        # be able to tell apart from a quiet one.
+        open_issues = _count_or_none(fork_info.get("open_issues_count"))
+        open_prs = _count_or_none(fork_info.get("open_pr_counter"))
         if not fork_empty:
             prs_raw = client._api(
                 "GET",
@@ -1257,6 +1334,8 @@ def repo_status(host_port: str, repo: str) -> dict:
             "active": active,
             "active_id": active_id,
             "empty": fork_empty,
+            "open_issues": open_issues,
+            "open_prs": open_prs,
             "prs": prs,
             "branches": branches}
 

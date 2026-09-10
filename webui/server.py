@@ -1174,6 +1174,30 @@ async def broker_dev_active_fork_handler(request: web.Request) -> web.Response:
     return web.json_response(reply, status=status)
 
 
+async def broker_dev_fetch_enabled_handler(request: web.Request) -> web.Response:
+    """POST /broker/dev/fetch-enabled {repo, enabled} — show or hide one repo on
+    the rs-fetch lists (gated, origin-checked; the Development page's Repos tab).
+    Synchronous relay — the verb is one host-file write and makes no gitea call.
+
+    BOTH keys are named below on purpose. The broker filters a relayed request
+    down to its field allowlist and DROPS an unknown field with no error, so a
+    key missing from this dict fails silently at every layer; `enabled` losing
+    its way would read as "disable" forever. The verb's validator refuses a
+    missing one rather than coercing it, which turns that hop failure loud."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    status, reply = await _relay(request, "dev_set_fetch_enabled",
+                                 {"repo": body.get("repo"),
+                                  "enabled": body.get("enabled")})
+    return web.json_response(reply, status=status)
+
+
 async def broker_dev_gitea_start_handler(request: web.Request) -> web.Response:
     """POST /broker/dev/gitea-start — DELIBERATELY enable/provision gitea (gated,
     origin-checked; the Management Infrastructure "Enable Gitea" button + the
@@ -2844,6 +2868,8 @@ def main() -> None:
     app.router.add_get("/broker/dev/reviews", broker_dev_reviews_handler)
     app.router.add_post("/broker/dev/sync", broker_dev_sync_handler)
     app.router.add_post("/broker/dev/active-fork", broker_dev_active_fork_handler)
+    app.router.add_post("/broker/dev/fetch-enabled",
+                        broker_dev_fetch_enabled_handler)
     app.router.add_post("/broker/dev/gitea-start", broker_dev_gitea_start_handler)
     app.router.add_post("/broker/dev/passwd", broker_dev_passwd_handler)
     app.router.add_post("/broker/dev/repo-remove", broker_dev_repo_remove_handler)
