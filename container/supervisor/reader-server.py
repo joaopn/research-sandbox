@@ -306,9 +306,15 @@ tr:nth-child(even) td { background: var(--rd-row); }
 .rd-list li { padding: .55rem 0; border-bottom: 1px solid var(--rd-rule); }
 .rd-list a { display: block; }
 .rd-dir::before { content: "\\1F4C1  "; } .rd-file::before { content: "\\1F4C4  "; }
-/* The theme button. Fixed so it is reachable from anywhere in a long file; the
-   column below reserves room for it so it never sits on top of the text. */
-.rd-theme { position: fixed; top: .5rem; right: .5rem; z-index: 9;
+/* The theme button rides in a fixed bar that mirrors the COLUMN's geometry —
+   same max-width, same auto margins — so its right edge tracks the text column
+   instead of the window's corner (on a wide screen a window-anchored button
+   strands itself in the corner, far from anything it belongs to). The bar takes
+   no pointer events, so only the button itself is clickable over the text. */
+.rd-theme-bar { position: fixed; top: 0; left: 0; right: 0; z-index: 9;
+  max-width: 46rem; margin-inline: auto; padding: .5rem .6rem 0 0;
+  display: flex; justify-content: flex-end; pointer-events: none; }
+.rd-theme { pointer-events: auto;
   min-width: 2.75rem; min-height: 2.75rem; padding: .35rem .7rem;
   font: inherit; font-size: .85rem; line-height: 1.2; cursor: pointer;
   color: var(--rd-btn-fg); background: var(--rd-btn-bg);
@@ -322,10 +328,17 @@ tr:nth-child(even) td { background: var(--rd-row); }
 }
 :root[data-theme="dark"] .rd-theme .rd-to-dark { display: none; }
 :root[data-theme="dark"] .rd-theme .rd-to-light { display: inline; }
-/* Below the width where the centred column leaves its own gutter, inset the
-   whole column instead, so no line ever runs under the button. */
+/* The column reserves the corner the button sits in, at EVERY width — the bar
+   above tracks the column, so the button is inside the column box and would
+   otherwise cover the first line of each scrolled screenful. The reserve is
+   wider where it is free (a roomy window) and tight where it is not (a phone),
+   which is also why the word drops on a narrow screen: the glyph alone fits the
+   smaller gutter, and a button that outgrew its gutter would be back on top of
+   the text. */
+body { padding-right: 5.5rem; }
 @media (max-width: 52rem) {
-  body { padding-right: 4rem; }
+  body { padding-right: 3.5rem; }
+  .rd-theme .rd-word { display: none; }
 }
 """
 
@@ -376,11 +389,12 @@ function rdToggleTheme() {
 """ % {"key": _THEME_KEY}
 
 _THEME_BUTTON_HTML = (
+    '<div class="rd-theme-bar">'
     '<button class="rd-theme" type="button" onclick="rdToggleTheme()"'
     ' aria-label="Switch between light and dark theme">'
-    '<span class="rd-to-dark">\u263e Dark</span>'
-    '<span class="rd-to-light">\u2600 Light</span>'
-    '</button>')
+    '<span class="rd-to-dark">\u263e<span class="rd-word"> Dark</span></span>'
+    '<span class="rd-to-light">\u2600<span class="rd-word"> Light</span></span>'
+    '</button></div>')
 
 _VIEWPORT = '<meta name="viewport" content="width=device-width, initial-scale=1">'
 
