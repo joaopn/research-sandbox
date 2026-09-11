@@ -242,40 +242,158 @@ _CACHE = _RenderCache(READER_CACHE_MAX_BYTES)
 
 
 # ---------------------------------------------------------------------------
-# Rendering. python-markdown for .md; nbconvert (lazy import) for .ipynb.
+# Rendering — the theme, then the renderers that use it: python-markdown for
+# .md, nbconvert (lazy import) for .ipynb, an escaped <pre> for anything else
+# that is text.
+#
+# Theme: two real palettes, and a button that picks one.
 # ---------------------------------------------------------------------------
+#
+# Every colour is a token, defined three times: light on bare :root, dark under
+# the system preference GUARDED so an explicit light choice still wins, and dark
+# again under an explicit choice. Before the button is ever pressed the page
+# follows the system, which is what it always did.
+#
+# The two dark blocks carry IDENTICAL values, which is the only reason their equal
+# specificity (0-2-0 each) is harmless. Give explicit-dark a palette of its own and
+# source order becomes load-bearing — put it last if you do.
+#
+# The button cannot be labelled by the server: one page is built for every viewer
+# and the theme lives in the viewer's browser, so a server-written label is stale
+# for anyone whose stored choice differs from the default. Both labels ship in the
+# markup and the same three blocks choose between them, which also means there is
+# no flash of the wrong word. The accessible name is deliberately state-neutral —
+# an aria-label cannot be swapped by CSS, and a stale one is worse than a general
+# one.
 _MOBILE_CSS = """
-:root { color-scheme: light dark; }
+:root {
+  color-scheme: light;
+  --rd-bg: #ffffff; --rd-fg: #1a1a1a; --rd-link: #0b5ed7;
+  --rd-soft: #f4f4f4; --rd-rule: #d8d8d8; --rd-row: #fafafa;
+  --rd-btn-bg: #f4f4f4; --rd-btn-fg: #1a1a1a; --rd-btn-rule: #b0b0b0;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --rd-bg: #121212; --rd-fg: #e6e6e6; --rd-link: #6ea8fe;
+    --rd-soft: #1e1e1e; --rd-rule: #333333; --rd-row: #181818;
+    --rd-btn-bg: #242424; --rd-btn-fg: #e6e6e6; --rd-btn-rule: #5a5a5a;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --rd-bg: #121212; --rd-fg: #e6e6e6; --rd-link: #6ea8fe;
+  --rd-soft: #1e1e1e; --rd-rule: #333333; --rd-row: #181818;
+  --rd-btn-bg: #242424; --rd-btn-fg: #e6e6e6; --rd-btn-rule: #5a5a5a;
+}
 * { box-sizing: border-box; }
 body { margin: 0; padding: 1rem 1.1rem 4rem;
   font: 16px/1.6 -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
   max-width: 46rem; margin-inline: auto;
-  color: #1a1a1a; background: #fff; overflow-wrap: anywhere; }
-@media (prefers-color-scheme: dark) {
-  body { color: #e6e6e6; background: #161616; }
-  a { color: #6ea8fe; } tr:nth-child(even) td { background: #1e1e1e; }
-  pre, code { background: #222 !important; } }
-a { color: #0b5ed7; text-decoration: none; } a:hover { text-decoration: underline; }
+  color: var(--rd-fg); background: var(--rd-bg); overflow-wrap: anywhere; }
+a { color: var(--rd-link); text-decoration: none; }
+a:hover { text-decoration: underline; }
 img, svg, table { max-width: 100%; } img { height: auto; }
-pre { overflow-x: auto; padding: .75rem; background: #f4f4f4; border-radius: 6px; }
-code { background: #f4f4f4; padding: .1em .35em; border-radius: 4px; }
+pre { overflow-x: auto; padding: .75rem; background: var(--rd-soft);
+  border-radius: 6px; }
+code { background: var(--rd-soft); padding: .1em .35em; border-radius: 4px; }
 pre code { padding: 0; background: none; }
 table { border-collapse: collapse; display: block; overflow-x: auto; }
-th, td { border: 1px solid #8884; padding: .35rem .6rem; text-align: left; }
+th, td { border: 1px solid var(--rd-rule); padding: .35rem .6rem; text-align: left; }
+tr:nth-child(even) td { background: var(--rd-row); }
 .rd-crumb { font-size: .9rem; margin: 0 0 1rem; opacity: .8; }
 .rd-list { list-style: none; padding: 0; }
-.rd-list li { padding: .55rem 0; border-bottom: 1px solid #8883; }
+.rd-list li { padding: .55rem 0; border-bottom: 1px solid var(--rd-rule); }
 .rd-list a { display: block; }
 .rd-dir::before { content: "\\1F4C1  "; } .rd-file::before { content: "\\1F4C4  "; }
+/* The theme button. Fixed so it is reachable from anywhere in a long file; the
+   column below reserves room for it so it never sits on top of the text. */
+.rd-theme { position: fixed; top: .5rem; right: .5rem; z-index: 9;
+  min-width: 2.75rem; min-height: 2.75rem; padding: .35rem .7rem;
+  font: inherit; font-size: .85rem; line-height: 1.2; cursor: pointer;
+  color: var(--rd-btn-fg); background: var(--rd-btn-bg);
+  border: 1px solid var(--rd-btn-rule); border-radius: 8px; }
+/* Which word shows is the same three-way question as the palette. */
+.rd-theme .rd-to-dark { display: inline; }
+.rd-theme .rd-to-light { display: none; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .rd-theme .rd-to-dark { display: none; }
+  :root:not([data-theme="light"]) .rd-theme .rd-to-light { display: inline; }
+}
+:root[data-theme="dark"] .rd-theme .rd-to-dark { display: none; }
+:root[data-theme="dark"] .rd-theme .rd-to-light { display: inline; }
+/* Below the width where the centred column leaves its own gutter, inset the
+   whole column instead, so no line ever runs under the button. */
+@media (max-width: 52rem) {
+  body { padding-right: 4rem; }
+}
 """
+
+# The stored choice, and the two scripts that read and write it. Kept OUT of the
+# f-string in _page: a literal brace inside that literal is a replacement field.
+#
+# THE HEAD SCRIPT MUST STAY SYNCHRONOUS AND IN THE HEAD, and it carries the click
+# handler for the same reason. Every page here is a fresh document, so a choice
+# applied from the body would paint the wrong theme first on every navigation —
+# and the button is the first node in the body, tappable the moment it paints,
+# while a 4 MiB text render is still arriving over a phone connection. A handler
+# defined at the END of the body does not exist yet for all of that time, so every
+# early tap is silently ignored (measured: throttled to 250 kbps, a real click
+# changed nothing and logged a ReferenceError to a console no phone user opens).
+#
+# It touches documentElement (body does not exist yet) and validates the stored
+# value, which is why junk in that key never reaches the attribute at all: the
+# page then behaves exactly as it does with nothing stored, following the system,
+# and the first tap flips it normally. WITHOUT the validation the junk would land
+# on the attribute, and the handler — which asks whether it reads "dark", not
+# whether it is valid — would take it for light and write "dark", i.e. no visible
+# change at all on a system that was already dark.
+#
+# Every storage access is wrapped. It is first-party here (the webui frames this
+# on the same host, and partitioning ignores the port), but a private window, a
+# policy, or an opaque origin can still make even a READ throw — in which case the
+# button works for this page and the next page starts from the system preference.
+_THEME_KEY = "rs-reader-theme"
+
+_THEME_HEAD_JS = """
+(function () {
+  try {
+    var t = window.localStorage.getItem('%(key)s');
+    if (t === 'dark' || t === 'light') {
+      document.documentElement.setAttribute('data-theme', t);
+    }
+  } catch (e) { /* storage unavailable: follow the system, as before */ }
+})();
+function rdToggleTheme() {
+  var root = document.documentElement;
+  var dark = root.getAttribute('data-theme') === 'dark'
+    || (!root.hasAttribute('data-theme')
+        && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  var next = dark ? 'light' : 'dark';
+  root.setAttribute('data-theme', next);
+  try { window.localStorage.setItem('%(key)s', next); } catch (e) { /* this page only */ }
+}
+""" % {"key": _THEME_KEY}
+
+_THEME_BUTTON_HTML = (
+    '<button class="rd-theme" type="button" onclick="rdToggleTheme()"'
+    ' aria-label="Switch between light and dark theme">'
+    '<span class="rd-to-dark">\u263e Dark</span>'
+    '<span class="rd-to-light">\u2600 Light</span>'
+    '</button>')
 
 _VIEWPORT = '<meta name="viewport" content="width=device-width, initial-scale=1">'
 
 
 def _page(title: str, body_html: str) -> bytes:
+    """Every document this server renders itself — listings, markdown, text and
+    the error pages. (A notebook is nbconvert's own document and does not pass
+    through here, so it carries neither the button nor the palette.)"""
     return (f"<!doctype html><html><head><meta charset='utf-8'>{_VIEWPORT}"
             f"<title>{html.escape(title)}</title><style>{_MOBILE_CSS}</style>"
-            f"</head><body>{body_html}</body></html>").encode("utf-8")
+            f"<script>{_THEME_HEAD_JS}</script>"
+            f"</head><body>{_THEME_BUTTON_HTML}{body_html}"
+            f"</body></html>").encode("utf-8")
 
 
 def _breadcrumb(rel: str) -> str:
