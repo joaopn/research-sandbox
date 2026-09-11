@@ -1837,6 +1837,59 @@ def cmd_dev_passwd(args: argparse.Namespace) -> None:
           f"Development page (Gitea tab)")
 
 
+def cmd_dev_board_export(args: argparse.Namespace) -> None:
+    """Export the whole dev Gitea instance to one encrypted file.
+
+    Stands alone: no browser, no broker session, no webui container. The
+    passphrase is chosen here and is NOT the Management password — the file
+    leaves the machine, and binding its secrecy to the login secret means
+    rotating one silently weakens or orphans the other.
+    """
+    import getpass
+    if sys.stdin.isatty():
+        # DOUBLE ENTRY, the `broker passwd` precedent — not cmd_dev_passwd's
+        # single read. That password is re-settable at will; this one is not:
+        # a lost or mistyped passphrase is a lost backup, and verification
+        # cannot catch a typo because it verifies with the SAME wrong value.
+        # Same precedent for the guard: a Ctrl-D or Ctrl-C at either prompt is
+        # an abort, not a traceback.
+        try:
+            pp = getpass.getpass("Backup passphrase (input hidden): ")
+            again = getpass.getpass("Confirm passphrase: ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            die("aborted; nothing was written")
+        if pp != again:
+            die("the two passphrases did not match; nothing was written")
+    else:
+        # Piped: one line, and deliberately NOT stripped — from_kwargs rejects a
+        # whitespace-edged or newline-bearing passphrase rather than silently
+        # normalising it, so the operator sees the refusal instead of getting an
+        # artifact that refuses the passphrase they believe they set.
+        pp = sys.stdin.readline().rstrip("\n")
+    req = _build(rscore.DevBoardExportRequest, passphrase=pp)
+    out = Path(args.out).expanduser()
+    try:
+        res = rscore.dev_board_export(req, dest=out)
+    except rscore.HarnessError as e:
+        die("could not export the gitea instance"
+            + (f" ({e.client_detail})" if e.client_detail else ""))
+    mb = res.size / (1024 * 1024)
+    # member_count is None when the listing could not be parsed. Print that as
+    # "an unreadable member count" rather than as a number — a bare "0 members"
+    # beside a healthy multi-megabyte artifact is a confident lie.
+    members = (f"{res.member_count} members" if res.member_count is not None
+               else "an unreadable member count")
+    print(f"wrote {res.path} ({mb:.1f} MiB, {members})")
+    print("This file is the ENTIRE gitea instance, not one board: restoring it "
+          "rolls every repo and every project's board back to this moment.")
+    print("It also carries the server's own keys, so treat the file as the "
+          "server itself. There is NO recovery for a lost passphrase.")
+    print("Not included: the host-side dev ledger (which project works which "
+          "repo, the per-consumer tokens). A restore does not bring back "
+          "authentication for anything provisioned after this export.")
+
+
 def cmd_dev_repo_add(args: argparse.Namespace) -> None:
     """Mirror+fork a GitHub repo. `--private` prompts for a per-repo PAT (stdin
     when piped) — RS stores no PAT: it reaches only gitea's migrate auth_token,
@@ -2591,6 +2644,21 @@ def build_parser() -> argparse.ArgumentParser:
                              help="set the sandbox-admin gitea password (the "
                                   "human web-UI sign-in); reads stdin when piped")
     dvpw.set_defaults(func=cmd_dev_passwd)
+    dvb = dv_sub.add_parser("board",
+                            help="encrypted export of the whole dev Gitea "
+                                 "instance (issues, PRs and discussion included)")
+    dvb_sub = dvb.add_subparsers(dest="board_action", required=True)
+    dvbe = dvb_sub.add_parser("export",
+                              help="write an encrypted export to --out; prompts "
+                                   "for a passphrase (reads one line when piped)")
+    # --out is REQUIRED, not optional: a CLI export must never write into the
+    # broker's run/ directory. It holds no broker lock, so it could destroy the
+    # resident artifact a browser download is about to fetch, and that directory
+    # exists only once the broker or webui created it — while this command must
+    # work on a host with neither.
+    dvbe.add_argument("--out", required=True,
+                      help="destination file for the encrypted export")
+    dvbe.set_defaults(func=cmd_dev_board_export)
     dvr = dv_sub.add_parser("repo", help="mirror/fork lifecycle for a repo")
     dvr_sub = dvr.add_subparsers(dest="repo_action", required=True)
     dvra = dvr_sub.add_parser("add", help="mirror a GitHub repo (consumer forks are minted per dev project/box)")

@@ -53,6 +53,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 # Explicit: `urllib.request` happens to bind `urllib.parse` today (its own module
 # body does `from urllib.parse import ...`), so this resolves either way — but
@@ -2056,6 +2057,52 @@ class DevPasswdRequest:
 
 
 @dataclass(frozen=True)
+class DevBoardExportRequest:
+    """Export the whole dev Gitea instance to one encrypted file.
+
+    ``passphrase`` is a SECRET (repr=False) and is chosen by the OPERATOR at
+    export time — deliberately not the Management password, because the artifact
+    leaves the machine and binding its secrecy to the login secret means rotating
+    one silently weakens or orphans the other. There is NO recovery path for a
+    lost passphrase and none can be added.
+    """
+    passphrase: str = field(repr=False)
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "DevBoardExportRequest":
+        pp = kw.get("passphrase")
+        if not isinstance(pp, str):
+            raise ValidationError("passphrase must be a string")
+        if not pp:
+            raise ValidationError("passphrase must not be empty")
+        # Reject rather than normalise, the DevPasswdRequest precedent — and the
+        # reason binds harder here. That password is re-settable at will; this one
+        # is unrecoverable, and the two surfaces disagree about whitespace: a CLI
+        # read strips, a browser field does not, so a silently-normalised
+        # passphrase would produce an artifact the other surface cannot open.
+        if pp != pp.strip():
+            raise ValidationError(
+                "passphrase must not start or end with whitespace")
+        # gpg --passphrase-file reads only the FIRST LINE, so an embedded newline
+        # silently truncates the key: the export would succeed and the artifact
+        # would refuse the passphrase the operator believes they set.
+        if "\n" in pp or "\r" in pp:
+            raise ValidationError("passphrase must not contain a line break")
+        # Reuse MIN_PASSWORD_LENGTH rather than inventing a number: this file
+        # carries the instance's own signing keys, so a one-character passphrase
+        # on it is a worse outcome than on the login it already guards, and the
+        # operator has met this refusal once already. Deliberately the same floor
+        # and not a stricter one — no basis exists here for picking a bigger
+        # number, and there is no strength meter to hide behind.
+        if len(pp) < MIN_PASSWORD_LENGTH:
+            raise ValidationError(
+                f"passphrase must be at least {MIN_PASSWORD_LENGTH} characters — "
+                f"this file carries the server's own keys, and a lost passphrase "
+                f"cannot be recovered")
+        return cls(passphrase=pp)
+
+
+@dataclass(frozen=True)
 class DevSetActiveForkRequest:
     """Set the GLOBAL active fork for a repo (the Management dropdown — the
     multi-fork edge case; sequential use never needs it). Shape-only here; the
@@ -2480,6 +2527,20 @@ class DevGiteaStartResult:
 @dataclass
 class DevPasswdResult:
     user: str                                   # never the password
+
+
+@dataclass
+class DevBoardExportResult:
+    path: str                                   # never the passphrase
+    size: int
+    created_at: str
+    # None means UNKNOWN, not zero: the count is parsed out of busybox unzip's
+    # listing footer, and a format drift must read as unknown at every surface
+    # rather than as a confident 0 beside a good multi-megabyte artifact. Every
+    # consumer has to carry that through — coercing it here is what turned the
+    # miss into a TypeError after the artifact was already on disk.
+    member_count: int | None
+    has_db: bool
 
 
 @dataclass
@@ -7465,6 +7526,32 @@ def _wait_for_gitea(host_port: str, *, tries: int | None = None) -> None:
     die(f"{gitea.GITEA_CONTAINER} did not become ready on 127.0.0.1:{host_port}")
 
 
+# Bound on the whole encrypted instance export, which runs INLINE on the broker's
+# serial accept thread (the export is deliberately not a detached lane: the
+# one-resident-artifact invariant has no other serializer). rscore cannot import
+# the webui's BROKER_OP_TIMEOUT_S — that constant lives in webui/server.py and the
+# webui image carries no cli/ — so this is the house form: a literal whose comment
+# names the value it must stay under (_UPSTREAM_RESOLVE_MAX_TIME_S here and
+# gitea.API_TIMEOUT_S are the same shape).
+#
+# 540 = 60s UNDER the webui's 600s op window. Strictly under, not equal: at exactly
+# 600 the browser's wait and the daemon's bound expire together, so the browser
+# reports failure while the export is still running and still holding the daemon.
+# The 60s covers writing the reply envelope and the client's own round trip.
+#
+# The CLI shares this bound, and its consequence differs from a migrate's: a
+# migrate HEALS on re-run, so exceeding MIGRATE_TIMEOUT_S is a retry. An export
+# does not heal — a kill at the ceiling is a hard failure that wrote nothing, and
+# the refusal says so rather than implying a retry behaves differently.
+BOARD_EXPORT_TIMEOUT_S = 540
+# The floor below which starting an export is pointless. The budget above covers
+# resuming gitea AND the export, and a resume can consume most of it; 60s is the
+# same headroom figure used above, i.e. roughly one round trip plus the smallest
+# export this code has been measured producing (a seeded fixture dumps in a few
+# seconds). Below it the export is certain to be cut off, so refusing costs the
+# operator nothing they would not lose anyway and tells them why.
+BOARD_EXPORT_MIN_RUN_S = 60
+
 GITEA_BOOT_WAIT_TRIES = 60       # ~1 probe/sec; covers a cold pull + sqlite init
 GITEA_PROBE_MAX_TIME_S = 3       # per-probe bound (< the 1s-cadence loop's budget)
 # The RESUME deadline, for `research start`'s wiring pass. The budget above is
@@ -10817,6 +10904,110 @@ def dev_commits(req: "DevCommitsRequest", _progress=None) -> DevCommitsResult:  
                             has_more=has_more, page=req.page, running=True,
                             reviews=gitea.load_repo_commit_verdicts(req.repo),
                             mirror_head=mirror_head)
+
+
+def dev_board_export(req: "DevBoardExportRequest", progress=None, *,
+                     dest: Path) -> DevBoardExportResult:  # type: ignore[name-defined]
+    """Write an encrypted export of the WHOLE dev Gitea instance to ``dest``.
+
+    What the artifact covers, stated plainly because the UI repeats it: the
+    entire instance, not one board. Restoring it rolls every repo and every
+    project's board back to the moment of export. Recovering a single damaged
+    fork without reverting the rest means restoring into a scratch gitea and
+    copying across by hand.
+
+    What it does NOT cover: the host-side dev ledger under ~/.research-sandbox/dev
+    (which project works which repo, the per-consumer tokens, the mirror stamps,
+    the active-fork map) never lived in gitea and is not in a gitea dump. After a
+    restore the host still claims forks the rolled-back gitea no longer has, and
+    any consumer provisioned SINCE the export has no token row in the restored
+    instance — those agents silently lose push authentication until they are
+    re-provisioned. The restore surface states this; it is the severest of the
+    artifact's gaps and is not a board-rollback-shaped problem.
+
+    ``progress`` is POSITIONAL: the broker's dispatch calls ``fn(args, progress)``
+    and the verb wrappers forward it positionally, so a keyword-only parameter
+    would raise TypeError — which dispatch does NOT catch (it catches only
+    ValidationError, HarnessError and SystemExit), leaving the client with no
+    reply envelope at all.
+
+    ``dest`` is KEYWORD-ONLY and REQUIRED, and it is deliberately NOT a field on
+    the request: a filesystem path must never be relayable from the browser, and
+    keyword-only means the broker's ``fn(args, progress)`` call shape structurally
+    cannot reach it. The CLI always names its own path and never writes into the
+    broker's run/ directory — a CLI export holds no broker lock, so writing there
+    could destroy an artifact a browser download is about to fetch.
+    """
+    progress = progress or _NULL_PROGRESS
+    # The clock starts HERE, not at the dump. `_resume_gitea` can take minutes on
+    # the stopped-container arm (docker start + _wait_for_gitea, whose own bound
+    # is ~4 min), so a budget that began after it would let the verb run to
+    # ~780s — past the 600s window this bound exists to stay under, which is
+    # precisely the outcome its comment claims to buy off.
+    deadline = time.monotonic() + BOARD_EXPORT_TIMEOUT_S
+    # RESUME an enabled gitea; never create one. A backup verb must not stand up a
+    # backend the operator disabled, and `gitea dump` needs it running anyway.
+    # Its refusal text is already webui-clean.
+    _resume_gitea(require=True)
+    progress.step("image", "resolving the gitea image")
+    image = _live_gitea_image()
+    remaining = int(deadline - time.monotonic())
+    if remaining < BOARD_EXPORT_MIN_RUN_S:
+        # Bringing gitea up ate the budget. Refuse rather than start an export
+        # that is certain to be cut off part-way, which would cost the operator
+        # the wait and leave them nothing.
+        raise HarnessError(
+            "gitea board export had no time budget left",
+            f"starting gitea used the export's {BOARD_EXPORT_TIMEOUT_S}s budget; "
+            f"retry now that it is running")
+    progress.step("dump", "exporting, encrypting and verifying the instance")
+    try:
+        # ONE call, ONE budget: dump_instance dumps, verifies the .part end to
+        # end, and promotes it to `dest` only if it opened. Two separate calls
+        # here would each carry the full timeout, so the verb's worst case would
+        # be twice the number this bound was reasoned against.
+        size, info = gitea.dump_instance(
+            container=gitea.GITEA_CONTAINER, passphrase=req.passphrase,
+            out_path=dest, image=image, timeout=remaining)
+    except gitea.GiteaError as e:
+        # HarnessError splits the sinks: log_msg (a STEP NAME, no path, no
+        # detail) reaches the durable full log and the mounted view log, while
+        # client_detail reaches the error envelope only. Nothing scrubs the
+        # passphrase out of the detail because nothing can carry it there: it
+        # travels on stdin into a 0600 file inside the container and never enters
+        # argv. (dev_passwd DOES scrub, because its secret rides argv into
+        # `docker exec` — do not copy that scrub here, and do not read its absence
+        # as an oversight.)
+        raise HarnessError("gitea board export failed", str(e))
+    st = dest.stat()
+    return DevBoardExportResult(
+        path=str(dest), size=size,
+        created_at=datetime.datetime.fromtimestamp(
+            st.st_mtime, datetime.timezone.utc).isoformat(timespec="seconds"),
+        member_count=info.get("member_count"),      # may be None = unknown
+        has_db=bool(info.get("has_db")),
+    )
+
+
+def _live_gitea_image() -> str:
+    """The image the RUNNING gitea container is actually on, as a sha256 ID.
+
+    Not `load_versions()["GITEA_VERSION"]`: that pin is consumed ONLY when the
+    container is CREATED (see _provision_gitea) — an existing container is
+    `docker start`ed unchanged and _resume_gitea never re-creates — so after a pin
+    bump the pin names a version the live instance is not running, and a helper
+    container built from it would touch this instance's data with a different
+    gitea. Not `.Config.Image` either: that is the TAG as given at `docker run`,
+    which drifts the moment a tag is re-pointed or re-pulled. `{{.Image}}` is the
+    content-addressed ID and `docker run` accepts it directly.
+    """
+    r = run(["docker", "container", "inspect", gitea.GITEA_CONTAINER,
+             "-f", "{{.Image}}"], capture_output=True)
+    ref = (r.stdout or "").strip()
+    if r.returncode != 0 or not ref:
+        raise HarnessError("could not resolve the running gitea image",
+                           "the gitea container is not inspectable")
+    return ref
 
 
 def dev_passwd(req: "DevPasswdRequest", progress=None) -> DevPasswdResult:  # type: ignore[name-defined]

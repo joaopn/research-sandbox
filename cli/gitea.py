@@ -17,8 +17,15 @@ imports it, so it must NOT import rscore (that would be circular). It holds:
 
 Host state lives under ``~/.research-sandbox/dev/`` — OUTSIDE the webui-mounted
 ``run/`` subdir, never bind-mounted. Secrets (the GitHub PAT, the gitea agent
-tokens) never enter a `GiteaError` message: errors carry only method/path/status,
-never request or response bodies.
+tokens) never enter a `GiteaError` message: API errors carry only
+method/path/status, never request or response bodies.
+
+The instance-export helpers at the bottom of this module widen that scope
+deliberately and are the only exception: their refusals carry container stderr
+tails and resolved host paths, because an export failure is a local fault the
+operator has to diagnose and a status code names none of them. They still carry
+no secret — the passphrase reaches the container on stdin and lives only in a
+0600 file inside a trapped tempdir, so it cannot appear in either stream.
 """
 
 from __future__ import annotations
@@ -27,6 +34,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -309,6 +317,317 @@ def _docker_exec(argv: list[str]) -> subprocess.CompletedProcess:
 
 def _gitea_admin(argv: list[str]) -> subprocess.CompletedProcess:
     return _docker_exec(["gitea", "admin", *argv])
+
+
+# --- encrypted instance export (STAGE_BOARD_BACKUP) -------------------------
+#
+# An agent OWNS its fork, and in gitea ownership implies destruction: a consumer
+# token can delete an issue, a comment, or the whole fork with every PR and
+# discussion in it, and gitea has no trash. The board — issues, PRs and their
+# discussion — is the human<->agent channel and exists nowhere else and in no git
+# object. This is the artifact that makes that survivable.
+#
+# The whole pipeline runs INSIDE the gitea container, which must be running for
+# `gitea dump` anyway, using the `gpg` that image already ships. Three reasons it
+# cannot run host-side: rscore is stdlib-only by contract (no cipher in the
+# stdlib), `research.py` must work with any operator python (no `cryptography`),
+# and shelling to a host `openssl` adds a dependency RS does not have.
+#
+# The scripts below are MODULE-LEVEL CONSTANTS with nothing interpolated into
+# them. The passphrase arrives on stdin and is written to a 0600 file inside a
+# per-run tempdir; it never enters argv, so it can never surface in `ps`, in a
+# docker inspect, or in a stderr echo. That is also why nothing here scrubs
+# stderr the way `rscore.dev_passwd` does — that verb scrubs because ITS secret
+# rides argv into `docker exec`; this one's does not.
+#
+# Four mechanical facts, each measured, each fatal if dropped:
+#   - `gitea dump` REFUSES to run as root, so the exec is `-u git`.
+#   - the dump takes `--tempdir`; pointed at a per-run `mktemp -d` under a trap,
+#     residue becomes impossible rather than swept. With the default tempdir it
+#     leaves a plaintext `gitea-db.sql` carrying access_token rows behind.
+#   - GNUPGHOME must be pinned INTO that tempdir. `docker exec -u git` yields
+#     HOME=/data/git, which is inside the named volume, and gpg starts an agent
+#     and creates $HOME/.gnupg — an unpinned run writes gpg state into persistent
+#     storage, outside the trap's reach and surviving the container.
+#   - `set -o pipefail` is LOAD-BEARING, not hygiene. Measured on the pinned
+#     image's busybox sh: `(echo partial; exit 3) | cat` exits 3 with pipefail
+#     and 0 WITHOUT it. Without pipefail a `gitea dump` that dies mid-stream is
+#     encrypted as a truncated archive and the export reports success — a silent
+#     corrupt backup, which is the worst outcome this module can produce.
+_DUMP_SCRIPT = r"""
+set -eu
+set -o pipefail
+T=$(mktemp -d)
+trap 'rm -rf "$T"' EXIT INT TERM
+export GNUPGHOME="$T/gnupg"
+mkdir -p "$GNUPGHOME"
+chmod 700 "$GNUPGHOME"
+umask 077
+cat > "$T/pp"
+chmod 600 "$T/pp"
+gitea dump --tempdir "$T" --file -   | gpg --batch --symmetric --cipher-algo AES256         --pinentry-mode loopback --passphrase-file "$T/pp"
+"""
+
+# Verification decrypts into a tmpfs rather than to /dev/null: a zip's central
+# directory sits at the END of the stream, so members cannot be enumerated from a
+# discarded pipe. The tmpfs keeps that plaintext — the credential-bearing blob the
+# encryption exists for — in memory and disposes of it with the container.
+#
+# THE EXIT STATUS IS THE ONLY TRUSTWORTHY SIGNAL. Measured: a tampered ciphertext
+# with the CORRECT passphrase produced ~951 KB of plausible, structurally valid
+# plaintext on stdout before gpg reported `manipulated` and exited non-zero — it
+# writes as it decrypts and checks the modification-detection code only at the
+# end. So a caller that gates on "bytes arrived" or "the output parses" accepts a
+# tampered archive. Gate on the exit code, then inspect.
+_VERIFY_SCRIPT = r"""
+set -eu
+set -o pipefail
+export GNUPGHOME=/x/gnupg
+mkdir -p "$GNUPGHOME"
+chmod 700 "$GNUPGHOME"
+umask 077
+cat > /x/pp
+chmod 600 /x/pp
+gpg --batch --decrypt --pinentry-mode loopback     --passphrase-file /x/pp --output /x/plain.zip /in.gpg
+unzip -l /x/plain.zip
+"""
+
+
+def _docker_exec_stdin(argv: list[str], *, container: str, stdin_bytes: bytes,
+                       stdout_to, timeout: int) -> subprocess.CompletedProcess:
+    """`docker exec -i -u git <container> <argv>` with bytes on stdin and BINARY
+    stdout streamed to an open file handle.
+
+    Deliberately NOT a widening of `_docker_exec`: that helper has exactly one
+    caller (`_gitea_admin`, which serves the three `gitea admin` bootstrap calls)
+    and they all want text capture and a closed stdin. Adding `-i` there would
+    change stdin semantics for every token mint and account create.
+    """
+    return subprocess.run(
+        ["docker", "exec", "-i", "-u", "git", container, *argv],
+        input=stdin_bytes, stdout=stdout_to, stderr=subprocess.PIPE,
+        timeout=timeout,
+    )
+
+
+def _mount_source(path: str) -> str:
+    """Resolve an operator-supplied path for a `-v <src>:<dst>` spec.
+
+    Two hazards, both silent. A relative path is refused by docker with an
+    unhelpful error, and a path containing ':' RE-PARSES the spec into different
+    fields entirely — so a file named `a:b` would mount something else, or
+    nothing, with no diagnostic. `_prepare_data_mounts` (rscore) resolves for the
+    same reason; the ':' refusal is explicit here because this path comes from an
+    `--out`/positional argument rather than a validated config field.
+    """
+    resolved = Path(path).expanduser().resolve()
+    if ":" in str(resolved):
+        raise GiteaError(
+            "the backup file's path contains ':', which docker reads as a field "
+            "separator in a mount; move or rename the file and retry")
+    # Existence is checked HERE, before the path reaches a `-v` spec, because a
+    # bind-mount source that does not exist is not an error to docker: it CREATES
+    # A DIRECTORY at that path on the host and mounts that. So verifying a
+    # missing file would silently litter the operator's filesystem with a
+    # directory named after their backup, and then fail with a gpg error that
+    # names neither cause.
+    if not resolved.is_file():
+        raise GiteaError(f"no backup file at {resolved}")
+    return str(resolved)
+
+
+def _dest_for_write(out_path: Path) -> Path:
+    """Validate an operator-supplied destination BEFORE a long export runs.
+
+    The input path is guarded meticulously (`_mount_source`); the output path had
+    no equivalent, and three realistic values failed late and badly:
+    `--out .` and `--out /` raise ValueError out of `with_name` (an empty name),
+    and `--out <an existing directory>` passes every check, runs the whole
+    dump-and-verify, and then dies in `replace()` — leaving the complete
+    credential-bearing archive orphaned as `<directory>.part` under a name
+    nothing will ever clean up. All three are now refusals, before any work.
+    """
+    if not out_path.name or out_path.name in (".", ".."):
+        raise GiteaError(f"{out_path} is not a file name to write the export to")
+    if out_path.is_dir():
+        raise GiteaError(
+            f"{out_path} is a directory; name the file to write, not a folder")
+    # Require the parent to EXIST rather than creating it: silently materialising
+    # a directory tree from a typo is the same hazard `_mount_source` refuses on
+    # the input side, and here it would be created seconds before a multi-minute
+    # export writes into it.
+    if not out_path.parent.is_dir():
+        raise GiteaError(f"no such directory: {out_path.parent}")
+    return out_path
+
+
+def dump_instance(*, container: str, passphrase: str, out_path: Path,
+                  image: str, timeout: int) -> tuple[int, dict]:
+    """Write a VERIFIED encrypted `gitea dump` of the whole instance to
+    ``out_path``. Returns ``(size_bytes, verify_info)``.
+
+    The artifact reaches ``out_path`` only after it has been decrypted end to end
+    in a throwaway container and its integrity confirmed. Until then it lives
+    under a `.part` sibling, so a failed, killed or UNVERIFIABLE export never
+    leaves a file under a name a restore would accept — which also means the one
+    resident artifact a browser surface advertises is always one that opened.
+
+    ONE timeout covers the whole operation, split by elapsed time rather than by
+    an invented per-phase share: the dump gets what is left of the budget and the
+    verification gets what the dump did not spend. Two independent `timeout`
+    budgets would let the verb run to twice the number its caller reasoned about
+    — the trap `_UPSTREAM_RESOLVE_MAX_TIME_S` documents for sequential resolves.
+
+    The instance must be RUNNING (the caller resumes it). `gitea dump` captures a
+    live instance consistently, which is the whole reason the artifact is a dump
+    rather than an API-shaped export of issues and PRs: gitea numbers issues and
+    PRs from one shared per-repo sequence, and the create endpoints attribute to
+    the caller and stamp "now", so an API export is a readable record and not a
+    restore.
+    """
+    deadline = time.monotonic() + timeout
+    out_path = _dest_for_write(out_path)
+    part = out_path.with_name(out_path.name + ".part")
+    # The open/chmod is its OWN try: an OSError out of subprocess.run means the
+    # `docker` binary is missing or not executable, and reporting that as "could
+    # not write the export file: [Errno 2] ... 'docker'" is a confidently wrong
+    # message that would reach the operator and, later, the browser envelope.
+    try:
+        # 0600 FROM THE START, never a chmod after the fact — the _write_secret
+        # precedent above. A default umask would otherwise leave the file 0644
+        # while the first ciphertext bytes land in it. O_NOFOLLOW because `.part`
+        # is a fully predictable sibling name and `--out` may point anywhere the
+        # operator can write, including a world-writable directory.
+        # O_EXCL as well as O_NOFOLLOW: under the threat model O_NOFOLLOW is
+        # justified by ("--out may point anywhere the operator can write"), a
+        # pre-created regular .part would keep ITS mode and owner — the mode
+        # argument is ignored for an existing file — and `replace()` would carry
+        # that mode onto the final artifact, quietly voiding the 0600 property.
+        # A stale .part from a killed run is unlinked first so O_EXCL does not
+        # turn that into a permanent refusal.
+        part.unlink(missing_ok=True)
+        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600)
+    except OSError as e:
+        raise GiteaError(f"could not create the export file: {e}") from None
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            r = _docker_exec_stdin(["sh", "-c", _DUMP_SCRIPT],
+                                   container=container,
+                                   stdin_bytes=passphrase.encode(),
+                                   stdout_to=fh,
+                                   timeout=max(1, int(deadline - time.monotonic())))
+    except subprocess.TimeoutExpired:
+        part.unlink(missing_ok=True)
+        # Precise about what was stopped: subprocess's timeout kills the `docker
+        # exec` CLIENT, so "nothing was written" is true of the HOST and must not
+        # be claimed of the container. What the in-container pipeline then does
+        # is deliberately NOT asserted here — it may take SIGPIPE or may run to
+        # completion with the daemon draining it, and that has not been measured.
+        # Either way its own trap reclaims the tempdir when that shell exits.
+        raise GiteaError(
+            f"the export exceeded its {timeout}s budget; the partial file was "
+            f"removed (the export inside the container stops on its own)"
+        ) from None
+    except OSError as e:
+        part.unlink(missing_ok=True)
+        raise GiteaError(f"the export could not be run: {e}") from None
+    if r.returncode != 0:
+        part.unlink(missing_ok=True)
+        # stderr carries gitea/gpg diagnostics only — the passphrase reached the
+        # container on stdin and lives in a 0600 file, never in argv.
+        detail = (r.stderr or b"").decode("utf-8", "replace").strip()
+        raise GiteaError(f"gitea dump failed: {detail[-300:]}")
+    # VERIFY THE PART, PROMOTE ONLY IF IT OPENS.
+    try:
+        info = verify_export(path=part, passphrase=passphrase, image=image,
+                             timeout=max(1, int(deadline - time.monotonic())))
+        # The inspection has to GATE the promote or performing it is theatre. An
+        # archive that decrypts cleanly but carries no database is exactly as
+        # unrestorable as one that does not decrypt, and promoting it hands the
+        # operator a file that opens and is useless — a fact they would discover
+        # at restore time, which is the worst possible moment.
+        #
+        # Keyed on has_db, NOT on member_count: the count is a PARSED number and
+        # its miss-value is None, so gating on it would turn a listing-format
+        # change into a refused good backup. has_db is a content property read
+        # straight out of the listing text.
+        if not info.get("has_db"):
+            raise GiteaError(
+                "the export decrypted but contains no database — it would not "
+                "restore, so it was discarded rather than kept as a backup")
+    except GiteaError:
+        part.unlink(missing_ok=True)
+        raise
+    size = part.stat().st_size
+    part.replace(out_path)
+    return size, info
+
+
+def verify_export(*, path: Path, passphrase: str, image: str,
+                  timeout: int) -> dict:
+    """Decrypt ``path`` end to end in a throwaway container and report on it.
+
+    Gates on gpg's EXIT STATUS before looking at the contents (see _VERIFY_SCRIPT
+    on why that is the only trustworthy signal). Returns
+    ``{"member_count": int, "has_db": bool}``; raises GiteaError on any failure,
+    which is what every destructive caller must treat as "stop".
+
+    ``image`` is a PARAMETER, not a module constant: cli/gitea.py cannot import
+    rscore (circular — rscore imports this module), so it cannot resolve the
+    version pin, and the harness needs to point this at its own instance.
+    """
+    src = _mount_source(str(path))
+    try:
+        r = subprocess.run(
+            ["docker", "run", "--rm", "-i", "--entrypoint", "sh",
+             # no size= on the tmpfs: the archive's size is the operator's
+             # instance, not a number this module may invent. Docker's own
+             # default bound applies. mode=0700 because this holds the full
+             # decrypted, credential-bearing archive.
+             "--tmpfs", "/x:mode=0700",
+             "-v", f"{src}:/in.gpg:ro", image, "-c", _VERIFY_SCRIPT],
+            input=passphrase.encode(), capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Deliberately does NOT name the number: this bound is whatever the dump
+        # left of the shared budget, so interpolating it tells the operator
+        # "exceeded its 1s budget" for a limit nobody configured, while the
+        # dump's own message names the real one.
+        raise GiteaError(
+            "verifying the backup ran out of the export's time budget") from None
+    if r.returncode != 0:
+        detail = (r.stderr or b"").decode("utf-8", "replace").strip()
+        # Do NOT lead with a cause. The three obvious ones (wrong passphrase,
+        # damaged file, altered file) are not the only ones — the decrypt also
+        # fails with ENOSPC when the archive does not fit the container's tmpfs,
+        # and naming a cause we did not establish is a confident misdiagnosis.
+        # The tail carries what actually happened.
+        raise GiteaError(
+            f"the backup file did not open: {detail[-200:]}")
+    listing = (r.stdout or b"").decode("utf-8", "replace")
+    return {
+        "member_count": _zip_member_count(listing),   # None when unparseable
+        "has_db": "gitea-db.sql" in listing,
+    }
+
+
+def _zip_member_count(listing: str) -> int | None:
+    """The member count from a busybox `unzip -l` listing.
+
+    The image ships BUSYBOX unzip (no `-Z`), whose listing wraps the entries in
+    three header lines and two footer lines — so counting non-blank lines
+    overstates by five, and that number is shown to the operator and rendered by
+    the Backup panel, where "a wrong number is worse than no number". The footer
+    states the real total ("      151                     3 files"); parse it, and
+    return None — not 0 — if the format ever moves, so a parse miss reads as
+    "unknown" at every surface instead of as a confident zero beside a good
+    multi-megabyte artifact.
+    """
+    for line in reversed(listing.strip().splitlines()):
+        m = re.search(r"(\d+)\s+files?\s*$", line.strip())
+        if m:
+            return int(m.group(1))
+    return None
 
 
 # --- the REST client --------------------------------------------------------
