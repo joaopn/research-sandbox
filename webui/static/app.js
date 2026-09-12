@@ -1934,20 +1934,23 @@ function renderDevelopmentInto(view) {
     const tabRepos = el("button", { class: "btn-small dev-tab-btn" }, ["Repos"]);
     const tabReviews = el("button", { class: "btn-small dev-tab-btn" },
                           ["Reviews"]);
+    const tabBackup = el("button", { class: "btn-small dev-tab-btn" }, ["Backup"]);
     const mark = () => {
         tabGitea.classList.toggle("active", devActiveTab === "gitea");
         tabFetch.classList.toggle("active", devActiveTab === "fetch");
         tabRepos.classList.toggle("active", devActiveTab === "repos");
         tabReviews.classList.toggle("active", devActiveTab === "reviews");
+        tabBackup.classList.toggle("active", devActiveTab === "backup");
     };
     tabGitea.onclick = () => { devActiveTab = "gitea"; mark(); renderDevGiteaTab(view, body); };
     tabFetch.onclick = () => { devActiveTab = "fetch"; mark(); renderDevFetchTab(view, body); };
     tabRepos.onclick = () => { devActiveTab = "repos"; mark(); renderDevReposTab(view, body); };
     tabReviews.onclick = () => { devActiveTab = "reviews"; mark(); renderDevReviewsTab(view, body); };
+    tabBackup.onclick = () => { devActiveTab = "backup"; mark(); renderDevBackupTab(view, body); };
     view.appendChild(el("div", { class: "mgmt-header" }, [
         el("h2", {}, ["Development"]),
         el("div", { class: "mgmt-toolbar dev-tabs" },
-           [tabGitea, tabFetch, tabRepos, tabReviews]),
+           [tabGitea, tabFetch, tabRepos, tabReviews, tabBackup]),
     ]));
     view.appendChild(body);
     mark();
@@ -1956,7 +1959,235 @@ function renderDevelopmentInto(view) {
     if (devActiveTab === "fetch") renderDevFetchTab(view, body);
     else if (devActiveTab === "repos") renderDevReposTab(view, body);
     else if (devActiveTab === "reviews") renderDevReviewsTab(view, body);
+    else if (devActiveTab === "backup") renderDevBackupTab(view, body);
     else renderDevGiteaTab(view, body);
+}
+
+// The Backup tab: take, download and discard an encrypted copy of the whole
+// dev Gitea. The board — issues, pull requests and their discussion — is the
+// human<->agent channel and exists in no git object, while an agent owns its
+// fork and in gitea ownership implies destruction. This is the surface that
+// makes that survivable.
+//
+// The panel shows the EXPORT'S OWN facts and nothing else. It deliberately does
+// not summarise what is inside: the Development page's repo counters filter to
+// the mirrors (not the consumer forks, which is where boards live) and count
+// only OPEN items, so any headline drawn from them would state a number
+// materially smaller than what is being downloaded.
+function devBackupBytes(n) {
+    if (typeof n !== "number") return "";
+    const mb = n / (1024 * 1024);
+    return mb >= 1 ? mb.toFixed(1) + " MiB" : Math.max(1, Math.round(n / 1024)) + " KiB";
+}
+
+async function renderDevBackupTab(view, body) {
+    body.innerHTML = "";
+    body.appendChild(el("div", { class: "mgmt-loading" }, ["Loading backup…"]));
+    // Two independent reads: whether gitea is up (a backup needs it running),
+    // and whether an artifact is already resident (served off the read-only
+    // mount, so it answers even while the daemon is busy taking one).
+    let devRes, artRes;
+    try {
+        [devRes, artRes] = await Promise.all([
+            fetch("/broker/dev"), fetch("/broker/dev/board-export"),
+        ]);
+    } catch (e) { return renderMgmtUnavailable(body); }
+    for (const res of [devRes, artRes]) {
+        // The transport-vs-verb split: _relay reports its OWN failures as
+        // 401/403/503 and a verb's refusal as HTTP 200 with {ok:false}. They must
+        // not collapse into one error card — a 503 means the broker is
+        // unreachable, which is a different remedy from a refused verb.
+        if (res.status === 401) return renderMgmtLogin(view, renderDevelopmentInto);
+        if (res.status === 403) return renderMgmtRejected(body);
+        if (res.status === 503) return renderMgmtUnavailable(body);
+    }
+    let dev = {}, art = {};
+    try { dev = await devRes.json(); } catch (e) { dev = {}; }
+    try { art = await artRes.json(); } catch (e) { art = {}; }
+    body.innerHTML = "";
+    const rerender = () => renderDevBackupTab(view, body);
+
+    // A VERB refusal (HTTP 200 carrying {ok:false}) or an unparseable body must
+    // render the REAL error — never collapse into the "Gitea isn't running"
+    // card below. That collapse is B38: it sends the operator to press Enable on
+    // a Gitea that is already up, hiding whatever actually failed. The sibling
+    // tabs carry the same arm for exactly this reason.
+    if (!devRes.ok || !dev.ok || !dev.result) {
+        const retryE = el("button", { class: "btn-small" }, ["Retry"]);
+        retryE.onclick = rerender;
+        body.appendChild(el("div", { class: "mgmt-empty" }, [
+            el("span", {}, [(mgmtErrText(dev)
+                             || "Could not read the dev state.") + " "]),
+            retryE,
+        ]));
+        return;
+    }
+    // `running` is nested under result.gitea, not at the top of result — the
+    // same read the Repos and Fetch tabs do. One level too high is SILENT:
+    // undefined is falsy, so the tab reports gitea down while it is up.
+    const gstate = dev.result.gitea || {};
+    const running = !!gstate.running;
+    // The artifact read is allowed to be absent without failing the page: it is
+    // served off the read-only mount and answers even mid-export, so an empty
+    // reading means "no backup", not "broken".
+    const info = (art && art.ok && art.result) ? art.result : {};
+
+    if (!running) {
+        const enable = el("button", { class: "btn-small" }, ["Enable Gitea"]);
+        enable.onclick = () => devEnableGiteaDialog(view, rerender);
+        const retry = el("button", { class: "btn-small" }, ["Retry"]);
+        retry.onclick = rerender;
+        body.appendChild(el("div", { class: "mgmt-empty" }, [
+            el("span", {}, ["Gitea isn't running, so there is nothing to back "
+                            + "up yet. "]), enable, retry,
+        ]));
+        return;
+    }
+
+    const head = el("div", { class: "dev-repo-head" }, [
+        el("span", { class: "dev-repo-name" }, ["Backup"]),
+    ]);
+    const kids = [head];
+
+    if (info.present) {
+        const when = info.created_at
+            ? new Date(info.created_at).toLocaleString() : "unknown";
+        kids.push(el("p", {}, [
+            "One backup is held here, taken ", el("strong", {}, [when]),
+            " (", devBackupBytes(info.size), "). Download it to keep it "
+            + "somewhere safe — it stays here until you take another or "
+            + "discard it.",
+        ]));
+    } else {
+        kids.push(el("p", {}, [
+            "No backup is held here yet.",
+        ]));
+    }
+
+    kids.push(el("p", { class: "dev-repo-meta" }, [
+        "A backup is the ", el("strong", {}, ["whole Gitea"]),
+        " — every repository and every project's board, not one of them. "
+        + "It is encrypted with a passphrase you choose, which is not your "
+        + "master password and cannot be recovered if you lose it. Treat the "
+        + "file as the server itself: it carries the server's own keys as well "
+        + "as its contents.",
+    ]));
+    kids.push(el("p", { class: "dev-repo-meta" }, [
+        "What it does not contain: the host's record of which project works "
+        + "which repository, and the agents' own credentials. Those live "
+        + "outside Gitea, so anything set up after a backup will need setting "
+        + "up again if you ever restore from it.",
+    ]));
+    kids.push(el("p", { class: "dev-repo-meta" }, [
+        "Restoring a backup is not available yet — it arrives with the next "
+        + "piece of this work. Until then a backup is worth taking and keeping: "
+        + "it is what a restore will read.",
+    ]));
+
+    const take = el("button", { class: "btn-small" },
+                   [info.present ? "Take a new backup" : "Take a backup"]);
+    take.onclick = () => devBoardExportDialog(view, rerender);
+    const actions = [take];
+    if (info.present) {
+        // A BUTTON that navigates, not an <a class="btn-small">: nothing else
+        // in this app styles an anchor as a button, so an anchor here would
+        // render as underlined inline text among real buttons. The navigation
+        // is what hands the transfer to the browser's own download machinery —
+        // Content-Disposition names the file and the page does not move.
+        const dl = el("button", { class: "btn-small" }, ["Download"]);
+        dl.onclick = () => {
+            window.location.href = "/broker/dev/board-export/download";
+        };
+        const discard = el("button", { class: "btn-small btn-danger" },
+                           ["Discard"]);
+        discard.onclick = () => devBoardDiscardDialog(view, rerender);
+        actions.push(dl, discard);
+    }
+    kids.push(el("div", { class: "btn-row left" }, actions));
+    body.appendChild(el("div", { class: "card dev-repo-card" }, kids));
+}
+
+function devBoardExportDialog(view, onDone) {
+    const pp1 = el("input", { type: "password", autocomplete: "new-password" });
+    const pp2 = el("input", { type: "password", autocomplete: "new-password" });
+    const masterI = el("input", { type: "password", autocomplete: "current-password" });
+    mgmtConfirmThenTail(view, {
+        title: "Take a backup",
+        tailTitle: "Backing up Gitea",
+        verb: "dev_board_export",
+        confirmLabel: "Take backup",
+        body: [
+            el("p", {}, [
+                "Encrypts the whole Gitea — every repository and every board — "
+                + "into one file you can download and keep.",
+            ]),
+            el("p", {}, [
+                "Choose a passphrase for the file. It is not your master "
+                + "password, and there is no way to recover it: lose it and the "
+                + "backup cannot be opened by anyone, including you.",
+            ]),
+            el("p", {}, [
+                "This can take a while on a large Gitea, and other management "
+                + "actions wait until it finishes.",
+            ]),
+            el("div", { class: "field" }, [
+                el("label", {}, ["Backup passphrase"]), pp1,
+            ]),
+            el("div", { class: "field" }, [
+                el("label", {}, ["Repeat it"]), pp2,
+            ]),
+            el("div", { class: "field" }, [
+                el("label", {}, ["Re-enter your master password"]), masterI,
+            ]),
+        ],
+        // Mirrors ALL of the server's refusals, not just the length floor: the
+        // server also rejects a whitespace-edged value, and a password input
+        // holds a pasted trailing space perfectly well. Without the check that
+        // lands as a mid-operation refusal on a backup the operator already
+        // committed to. The 8 mirrors broker_auth.MIN_PASSWORD_LENGTH (the
+        // renderSetup / devGiteaPasswdDialog floor — change together).
+        validate: () => {
+            if (pp1.value.length < 8) return "Passphrase must be at least 8 characters.";
+            if (pp1.value !== pp1.value.trim()) {
+                return "Passphrase must not start or end with a space.";
+            }
+            if (pp1.value !== pp2.value) return "Passphrases do not match.";
+            if (!masterI.value) return "Re-enter your master password.";
+            return null;
+        },
+        request: async () => fetch("/broker/dev/board-export", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                passphrase: pp1.value,
+                proof: await deriveLoginProof(masterI.value),
+            }),
+        }),
+        onDone: (ok) => { if (onDone) onDone(ok); },
+        focus: () => pp1.focus(),
+    });
+}
+
+function devBoardDiscardDialog(view, onDone) {
+    mgmtConfirmThenTail(view, {
+        title: "Discard this backup",
+        tailTitle: "Discarding backup",
+        verb: "dev_board_discard",
+        confirmLabel: "Discard",
+        danger: true,
+        body: [
+            el("p", {}, [
+                "Deletes the backup held here. If you have not downloaded it, "
+                + "it is gone. You can take another while Gitea is healthy — but "
+                + "if this backup is the only copy of a board something "
+                + "already destroyed, there is nothing to take it from.",
+            ]),
+        ],
+        request: async () => fetch("/broker/dev/board-discard", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({}),
+        }),
+        onDone: (ok) => { if (onDone) onDone(ok); },
+    });
 }
 
 // The review HISTORY: every verdict on the host, newest first, off
@@ -4133,6 +4364,16 @@ const OP_CHECKLISTS = {
     // Key LOCKSTEP with rscore.dev_passwd's progress.step() call.
     dev_passwd: [
         { key: "set", label: "setting the gitea password" },
+    ],
+    // Keys are LOCKSTEP with rscore `dev_board_export`'s progress.step() calls.
+    dev_board_export: [
+        { key: "gitea", label: "making sure gitea is running" },
+        { key: "image", label: "resolving the gitea image" },
+        { key: "dump", label: "exporting, encrypting and verifying" },
+    ],
+    // Keys LOCKSTEP with rscore `dev_board_discard`'s progress.step() call.
+    dev_board_discard: [
+        { key: "discard", label: "removing the backup" },
     ],
 };
 

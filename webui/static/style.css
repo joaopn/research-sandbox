@@ -1100,9 +1100,20 @@ body {
     align-items: center;
     justify-content: space-between;
     margin-bottom: 16px;
+    /* Wrap rather than clip. This row is title + toolbar, and with the
+       Development page's FIFTH tab the pair stopped fitting a phone-width
+       viewport: without wrapping, `space-between` pushes the row wider than the
+       screen and the PAGE CONTENT is cut off at the left edge — the strip does
+       not merely overflow itself. flex-wrap is inert wherever the row already
+       fits; the gap is not strictly inert (under space-between it sets a floor
+       on the separation once free space drops below 8px), which is why it is
+       here rather than left implicit — all three consumers are title+toolbar
+       rows, so the effect is the intended one. */
+    flex-wrap: wrap;
+    gap: 8px;
 }
 .mgmt-header h2 { font-size: 16px; font-weight: 600; }
-.mgmt-toolbar { display: flex; gap: 8px; }
+.mgmt-toolbar { display: flex; gap: 8px; flex-wrap: wrap; }
 .mgmt-empty { color: var(--fg-muted); font-size: 14px; }
 
 .mgmt-table { display: flex; flex-direction: column; gap: 1px; }

@@ -2103,6 +2103,17 @@ class DevBoardExportRequest:
 
 
 @dataclass(frozen=True)
+class DevBoardDiscardRequest:
+    """Remove the resident browser-export artifact. No fields — house style gives
+    even a field-less verb a request class, so every verb reaches rscore through
+    the same validated choke point."""
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "DevBoardDiscardRequest":
+        return cls()
+
+
+@dataclass(frozen=True)
 class DevSetActiveForkRequest:
     """Set the GLOBAL active fork for a repo (the Management dropdown — the
     multi-fork edge case; sequential use never needs it). Shape-only here; the
@@ -2541,6 +2552,11 @@ class DevBoardExportResult:
     # miss into a TypeError after the artifact was already on disk.
     member_count: int | None
     has_db: bool
+
+
+@dataclass
+class DevBoardDiscardResult:
+    removed: int                                # 0 when nothing was resident
 
 
 @dataclass
@@ -7552,6 +7568,23 @@ BOARD_EXPORT_TIMEOUT_S = 540
 # operator nothing they would not lose anyway and tells them why.
 BOARD_EXPORT_MIN_RUN_S = 60
 
+# Where a BROWSER-initiated export lands. Derived here rather than imported from
+# cli/broker.py: broker imports rscore, so the reverse would be circular (the
+# cli/broker_auth.py precedent). Three copies of this path exist by necessity and
+# only two can be checked by a test — this one and broker's BROKER_RUN_DIR, which
+# a pin asserts are equal; the webui derives its own from the broker SOCKET path
+# it already knows, because it cannot import cli/ at all.
+#
+# It must live under the broker's run/ directory: that is the one host directory
+# the webui container has mounted (read-only), so it is the only place the broker
+# can put a file the browser can then download.
+BOARD_EXPORT_DIR = Path.home() / ".research-sandbox" / "run" / "exports"
+# ONE fixed on-disk name, which is what makes "at most one resident artifact"
+# a checkable property and lets the download route drop its id entirely. The
+# operator-facing filename comes from the download's Content-Disposition, so a
+# fixed name on disk costs them nothing.
+BOARD_EXPORT_NAME = "gitea-instance.gpg"
+
 GITEA_BOOT_WAIT_TRIES = 60       # ~1 probe/sec; covers a cold pull + sqlite init
 GITEA_PROBE_MAX_TIME_S = 3       # per-probe bound (< the 1s-cadence loop's budget)
 # The RESUME deadline, for `research start`'s wiring pass. The budget above is
@@ -10907,7 +10940,7 @@ def dev_commits(req: "DevCommitsRequest", _progress=None) -> DevCommitsResult:  
 
 
 def dev_board_export(req: "DevBoardExportRequest", progress=None, *,
-                     dest: Path) -> DevBoardExportResult:  # type: ignore[name-defined]
+                     dest: Path | None = None) -> DevBoardExportResult:  # type: ignore[name-defined]
     """Write an encrypted export of the WHOLE dev Gitea instance to ``dest``.
 
     What the artifact covers, stated plainly because the UI repeats it: the
@@ -10931,12 +10964,23 @@ def dev_board_export(req: "DevBoardExportRequest", progress=None, *,
     ValidationError, HarnessError and SystemExit), leaving the client with no
     reply envelope at all.
 
-    ``dest`` is KEYWORD-ONLY and REQUIRED, and it is deliberately NOT a field on
-    the request: a filesystem path must never be relayable from the browser, and
-    keyword-only means the broker's ``fn(args, progress)`` call shape structurally
-    cannot reach it. The CLI always names its own path and never writes into the
-    broker's run/ directory — a CLI export holds no broker lock, so writing there
-    could destroy an artifact a browser download is about to fetch.
+    ``dest`` is KEYWORD-ONLY and deliberately NOT a field on the request: a
+    filesystem path must never be relayable from the browser, and keyword-only
+    means the broker's ``fn(args, progress)`` call shape structurally cannot
+    reach it. ``None`` means the BROWSER path and lands on the one fixed name
+    under ``BOARD_EXPORT_DIR``; the CLI always passes its own path and never
+    writes into the broker's run/ directory (``--out`` is required, which is what
+    keeps it out).
+
+    There is deliberately NO sweep of the export directory before writing. It
+    would be a pure regression: the on-disk name is FIXED, so ``dump_instance``'s
+    verified `.part` → ``replace()`` already IS the one-resident-artifact
+    mechanism, and it is atomic. A sweep could only delete the file that
+    ``replace()`` is about to overwrite — while every failure arm of the export
+    unlinks its part and raises, so a sweep-first export that failed would leave
+    the operator with NO backup where they previously had a good one. The cost of
+    not sweeping is transient disk: the old artifact and the new `.part` coexist
+    for the duration of the export.
     """
     progress = progress or _NULL_PROGRESS
     # The clock starts HERE, not at the dump. `_resume_gitea` can take minutes on
@@ -10945,12 +10989,29 @@ def dev_board_export(req: "DevBoardExportRequest", progress=None, *,
     # ~780s — past the 600s window this bound exists to stay under, which is
     # precisely the outcome its comment claims to buy off.
     deadline = time.monotonic() + BOARD_EXPORT_TIMEOUT_S
+    # Emitted BEFORE the resume, not after: the stopped-container arm is `docker
+    # start` + a readiness wait measured in minutes, and without a step here the
+    # browser's checklist shows nothing at all for that whole stretch while the
+    # op reads as running. Lockstep with OP_CHECKLISTS.dev_board_export.
+    progress.step("gitea", "making sure gitea is running")
     # RESUME an enabled gitea; never create one. A backup verb must not stand up a
     # backend the operator disabled, and `gitea dump` needs it running anyway.
     # Its refusal text is already webui-clean.
     _resume_gitea(require=True)
     progress.step("image", "resolving the gitea image")
     image = _live_gitea_image()
+    if dest is None:
+        # The browser path. Create the directory 0700 explicitly rather than via
+        # mkdir(mode=…), which does nothing to an EXISTING directory — the
+        # broker's own serve() uses the same create-then-chmod shape for run/.
+        BOARD_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            BOARD_EXPORT_DIR.chmod(0o700)
+        except OSError:
+            pass
+        dest = BOARD_EXPORT_DIR / BOARD_EXPORT_NAME
+    # Coerce: a caller handing us a string would otherwise reach .stat() as a str.
+    dest = Path(dest)
     remaining = int(deadline - time.monotonic())
     if remaining < BOARD_EXPORT_MIN_RUN_S:
         # Bringing gitea up ate the budget. Refuse rather than start an export
@@ -10987,6 +11048,31 @@ def dev_board_export(req: "DevBoardExportRequest", progress=None, *,
         member_count=info.get("member_count"),      # may be None = unknown
         has_db=bool(info.get("has_db")),
     )
+
+
+def dev_board_discard(_req: "DevBoardDiscardRequest",
+                      progress=None) -> DevBoardDiscardResult:  # type: ignore[name-defined]
+    """Remove the resident browser-export artifact (and any stale `.part`).
+
+    Idempotent by design: discarding when nothing is resident is `removed=0`, not
+    an error — the browser offers this beside a file whose existence it read a
+    moment ago, and a race with a sibling tab must not surface as a failure.
+    Touches ONLY the browser export directory; a CLI export's `--out` file is the
+    operator's own and is never swept.
+    """
+    progress = progress or _NULL_PROGRESS
+    progress.step("discard", "removing the backup")
+    removed = 0
+    for p in (BOARD_EXPORT_DIR / BOARD_EXPORT_NAME,
+              BOARD_EXPORT_DIR / (BOARD_EXPORT_NAME + ".part")):
+        try:
+            p.unlink()
+            removed += 1
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            raise HarnessError("could not discard the gitea backup", str(e))
+    return DevBoardDiscardResult(removed=removed)
 
 
 def _live_gitea_image() -> str:

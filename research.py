@@ -1890,6 +1890,21 @@ def cmd_dev_board_export(args: argparse.Namespace) -> None:
           "authentication for anything provisioned after this export.")
 
 
+def cmd_dev_board_discard(args: argparse.Namespace) -> None:
+    """Remove the backup the browser holds. The CLI twin of the Backup tab's
+    Discard — the webui is the primary surface, but the CLI stays capable."""
+    try:
+        res = rscore.dev_board_discard(_build(rscore.DevBoardDiscardRequest))
+    except rscore.HarnessError as e:
+        # Same net as cmd_dev_board_export ten lines up: without it an
+        # unlink that fails for any reason other than "already gone" reaches
+        # the operator as a traceback, since main() has no generic handler.
+        die("could not discard the backup"
+            + (f" ({e.client_detail})" if e.client_detail else ""))
+    print(f"discarded {res.removed} file(s) from the browser backup slot"
+          if res.removed else "no backup was being held")
+
+
 def cmd_dev_repo_add(args: argparse.Namespace) -> None:
     """Mirror+fork a GitHub repo. `--private` prompts for a per-repo PAT (stdin
     when piped) — RS stores no PAT: it reaches only gitea's migrate auth_token,
@@ -2659,6 +2674,10 @@ def build_parser() -> argparse.ArgumentParser:
     dvbe.add_argument("--out", required=True,
                       help="destination file for the encrypted export")
     dvbe.set_defaults(func=cmd_dev_board_export)
+    dvbd = dvb_sub.add_parser("discard",
+                              help="remove the backup the browser is holding "
+                                   "(does not touch a --out file you exported)")
+    dvbd.set_defaults(func=cmd_dev_board_discard)
     dvr = dv_sub.add_parser("repo", help="mirror/fork lifecycle for a repo")
     dvr_sub = dvr.add_subparsers(dest="repo_action", required=True)
     dvra = dvr_sub.add_parser("add", help="mirror a GitHub repo (consumer forks are minted per dev project/box)")

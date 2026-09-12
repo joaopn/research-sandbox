@@ -353,6 +353,17 @@ BROKER_COOKIE = "rs_broker"
 # it can poll while the op is still in flight.
 RS_BROKER_OPLOG_DIR = str(Path(RS_BROKER_SOCKET).parent / "oplogs")
 
+# The encrypted instance export the broker writes for a BROWSER-initiated backup.
+# Derived from the socket path the same way the oplog dir is, and for the same
+# reason: this image carries no cli/, so rscore.BOARD_EXPORT_DIR cannot be
+# imported. The three copies of this path are a deliberate lockstep —
+# rscore's, broker's and this one — and a unit pin asserts the first two are
+# equal (both host-importable); this one can only be kept honest by review.
+# The mount is READ-ONLY, so the webui serves the artifact and can never create
+# or delete one: both of those are broker verbs.
+RS_BOARD_EXPORT_DIR = Path(RS_BROKER_SOCKET).parent / "exports"
+RS_BOARD_EXPORT_NAME = "gitea-instance.gpg"
+
 # In-process op handles: op_id → {"state","result","task","broker_token"}.
 # state ∈ {"running","ok","failed"}. The browser gets the op_id immediately and
 # polls the log file (durable) + this status (the structured verb result on
@@ -1292,6 +1303,128 @@ async def broker_dev_passwd_handler(request: web.Request) -> web.Response:
     args = {"password": body.get("password"), "proof": body.get("proof")}
     return await _start_op(request, "dev_passwd", args, BROKER_OP_TIMEOUT_S,
                            op_seed="dev-gitea")
+
+
+def _board_export_stat() -> dict:
+    """Facts about the resident artifact, read from the FILESYSTEM.
+
+    Never from OP_RUNS: that is this process's memory, so a webui restart between
+    an export and its download would report no artifact while the file is sitting
+    right there. A missing directory or file is `present: false`, not an error —
+    the common case is simply that no backup has been taken yet.
+    """
+    try:
+        st = (RS_BOARD_EXPORT_DIR / RS_BOARD_EXPORT_NAME).stat()
+    except OSError:      # FileNotFound / NotADirectory / Permission are subclasses
+        return {"present": False}
+    return {
+        "present": True,
+        "size": st.st_size,
+        "created_at": datetime.fromtimestamp(
+            st.st_mtime, timezone.utc).isoformat(timespec="seconds"),
+    }
+
+
+async def broker_dev_board_export_status_handler(request: web.Request) -> web.Response:
+    """GET /broker/dev/board-export — is a backup resident, and how big/old.
+
+    A READ served entirely from the RO mount: it makes no broker call at all, so
+    it still answers while the daemon is busy running an export (which holds the
+    serial thread for the duration). Session-gated like every /broker/ route.
+    """
+    if _broker_session(request) is None:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+    return web.json_response({"ok": True, "result": _board_export_stat()})
+
+
+async def broker_dev_board_export_handler(request: web.Request) -> web.Response:
+    """POST /broker/dev/board-export {passphrase, proof} — take an encrypted
+    backup of the whole gitea instance (gated, origin-checked, STEP-UP).
+
+    `proof` must be forwarded EXPLICITLY: this handler hand-picks body keys into
+    `args` (the broker_dev_passwd_handler shape), and a forgotten proof does not
+    fail loudly — the step-up gate simply refuses, which reads to the operator as
+    a wrong password. A tailed op (dev_board_export ∈ PROGRESS_VERBS); the
+    passphrase lives only in the task closure and never reaches OP_RUNS or a log.
+    """
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    args = {"passphrase": body.get("passphrase"), "proof": body.get("proof")}
+    return await _start_op(request, "dev_board_export", args,
+                           BROKER_OP_TIMEOUT_S, op_seed="dev-gitea")
+
+
+async def broker_dev_board_discard_handler(request: web.Request) -> web.Response:
+    """POST /broker/dev/board-discard — remove the resident backup (gated,
+    origin-checked).
+
+    Mints an op rather than relaying synchronously, even though the verb is two
+    unlinks: the browser reaches it through the shared confirm-and-tail dialog,
+    whose ONLY success path requires an `op_id`. A synchronous `_relay` here
+    returns {ok, result} with no op_id, so the dialog reports "Failed" on a
+    discard that actually succeeded, never re-renders the panel, and leaves
+    Download offered on a file that is gone.
+    """
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    return await _start_op(request, "dev_board_discard", {},
+                           BROKER_OP_TIMEOUT_S, op_seed="dev-gitea")
+
+
+async def broker_dev_board_download_handler(request: web.Request) -> web.Response:
+    """GET /broker/dev/board-export/download — stream the resident artifact.
+
+    NO op id in the path. Only one artifact is ever resident and its on-disk name
+    is fixed, so there is nothing to look up: no id→file mapping, no id
+    validation, and no path the client can steer. The bytes never cross the
+    broker socket — the daemon assembles replies on its serial accept thread, and
+    pushing megabytes through it would block every other operation.
+
+    The Content-Disposition filename is stamped here rather than on disk, so the
+    operator gets a dated name while the storage name stays fixed.
+
+    Session-gated only, and that is a KNOWN residual rather than an oversight:
+    taking a backup is step-up gated, but the artifact then stays resident, so
+    once one exists a stolen session can fetch it without re-authenticating. The
+    step-up therefore bites on creating a backup, not on retrieving one. Closing
+    that needs a second gate (a short-lived one-shot handle minted by a POST
+    carrying the proof); it is posted to the maintainer as a decision rather than
+    assumed, because the cost is a password prompt before every download.
+
+    A GET with no origin check, unlike the other routes that return a credential
+    (which are POST + origin-checked). That is deliberate and not an oversight:
+    this response must be a NAVIGATION so the browser's own download machinery
+    takes the transfer, and a navigation carries no Origin header, so origin_ok
+    is structurally unusable. What protects it instead is the session cookie's
+    SameSite=Strict + Secure + Path=/broker, which is not sent on any cross-site
+    request INCLUDING a top-level navigation — so a foreign page cannot cause an
+    authenticated fetch of this file.
+    """
+    if _broker_session(request) is None:
+        return web.Response(status=401, text="session required")
+    path = RS_BOARD_EXPORT_DIR / RS_BOARD_EXPORT_NAME
+    if not path.is_file():
+        return web.json_response(
+            {"ok": False, "error": {"kind": "not_found",
+                                    "message": "no backup is resident"}},
+            status=404)
+    # The artifact's OWN date, not now(): the panel beside this button says
+    # "taken <mtime>", and a week-old backup downloading as today's date makes
+    # the two disagree about the same file.
+    stamp = datetime.fromtimestamp(
+        path.stat().st_mtime, timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return web.FileResponse(path, headers={
+        "Content-Type": "application/octet-stream",
+        "Content-Disposition":
+            f'attachment; filename="gitea-instance-{stamp}.gpg"',
+    })
 
 
 async def broker_dev_review_handler(request: web.Request) -> web.Response:
@@ -2872,6 +3005,14 @@ def main() -> None:
                         broker_dev_fetch_enabled_handler)
     app.router.add_post("/broker/dev/gitea-start", broker_dev_gitea_start_handler)
     app.router.add_post("/broker/dev/passwd", broker_dev_passwd_handler)
+    app.router.add_get("/broker/dev/board-export",
+                       broker_dev_board_export_status_handler)
+    app.router.add_post("/broker/dev/board-export",
+                        broker_dev_board_export_handler)
+    app.router.add_get("/broker/dev/board-export/download",
+                       broker_dev_board_download_handler)
+    app.router.add_post("/broker/dev/board-discard",
+                        broker_dev_board_discard_handler)
     app.router.add_post("/broker/dev/repo-remove", broker_dev_repo_remove_handler)
     app.router.add_post("/broker/dev/purge-consumer",
                         broker_dev_purge_consumer_handler)

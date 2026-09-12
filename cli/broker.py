@@ -93,7 +93,8 @@ BROKER_FULLLOG_DIR = BROKER_DIR / "oplogs-full"     # .full.log — host-only
 PROGRESS_VERBS = frozenset({"create", "update", "destroy", "start", "stop",
                             "box_add", "box_remove", "dev_gitea_start",
                             "dev_passwd", "dev_repo_remove",
-                            "dev_purge_consumer"})
+                            "dev_purge_consumer", "dev_board_export",
+                            "dev_board_discard"})
 
 # op_id names a file, so it is validated as a safe basename before it ever does:
 # first char alnum, rest alnum/dot/dash/underscore — no path separator, no
@@ -757,6 +758,11 @@ DEV_PROJECT_WEBUI_FIELDS = frozenset({"name", "workflow", "url", "pat",
 # the request, off the Result, never a durable sink). The step-up `proof` is
 # consumed in dispatch and never reaches this filter.
 DEV_PASSWD_WEBUI_FIELDS = frozenset({"password"})
+# The encrypted instance export. `passphrase` is the ONLY relayable field: the
+# destination is a keyword-only parameter on the verb, never a request field, so
+# dispatch's fn(args, progress) call shape cannot reach it and no browser value
+# can steer where the artifact is written.
+DEV_BOARD_EXPORT_WEBUI_FIELDS = frozenset({"passphrase"})
 # Set/clear one container type's model+effort default in the operator's
 # untracked override file (the Management → Infrastructure → Reviewer
 # control). Name-shaped catalog tokens + a bool only — nothing host-shaped;
@@ -883,6 +889,36 @@ def _verb_dev_passwd(args: dict, progress=None) -> dict:
     return dataclasses.asdict(rscore.dev_passwd(req, progress))
 
 
+def _verb_dev_board_export(args: dict, progress=None) -> dict:
+    # Export the whole dev gitea to one encrypted file under the broker's run/
+    # directory, which the webui has mounted read-only and serves from. Step-up
+    # gated (STEP_UP_VERBS): the artifact carries every token hash in the lane
+    # AND the instance's own signing keys, so minting one must cost a re-typed
+    # master password rather than a live session alone.
+    #
+    # `dest` is deliberately NOT forwarded — not even filtered out, simply never
+    # passed — so the browser default (the fixed name under BOARD_EXPORT_DIR)
+    # applies and no relayed value can redirect the write.
+    safe = {k: v for k, v in args.items() if k in DEV_BOARD_EXPORT_WEBUI_FIELDS}
+    req = rscore.DevBoardExportRequest.from_kwargs(**safe)  # may raise ValidationError
+    return dataclasses.asdict(rscore.dev_board_export(req, progress))
+
+
+def _verb_dev_board_discard(args: dict, progress=None) -> dict:
+    # Remove the resident artifact. Deliberately NOT step-up gated — but the
+    # honest reason is narrower than "it can be re-created": after an agent has
+    # destroyed a fork, the resident artifact may be the ONLY copy of that board,
+    # which is precisely the case this feature exists for. It is un-gated because
+    # it is a deliberate, confirmed, single-file delete the operator just asked
+    # for by name, not because the file is cheap. The dialog says so.
+    #
+    # In PROGRESS_VERBS despite being two unlinks: the browser's confirm dialog
+    # tails an op, so a verb reachable from it must mint one or the dialog has no
+    # success path to take.
+    req = rscore.DevBoardDiscardRequest.from_kwargs()
+    return dataclasses.asdict(rscore.dev_board_discard(req, progress))
+
+
 # The closed lifecycle vocabulary — the host-root boundary. Adding a verb here
 # is a deliberate, security-reviewed edit; never a docker passthrough.
 VERBS = {
@@ -924,6 +960,11 @@ VERBS = {
     "dev_set_fetch_enabled": _verb_dev_set_fetch_enabled,
     "dev_purge_consumer": _verb_dev_purge_consumer,
     "dev_commits": _verb_dev_commits,
+    "dev_board_export": _verb_dev_board_export,
+    "dev_board_discard": _verb_dev_board_discard,
+    # NOTE: there is deliberately NO dev_board_import. Restoring is destructive
+    # enough that it stays a host-side act; deny-by-default does the enforcing —
+    # a verb absent from this table is unreachable through dispatch's table.get.
 }
 
 # Verbs requiring step-up re-auth: a FRESH login proof (derived client-side
@@ -932,7 +973,8 @@ VERBS = {
 # the data-destroying verb; this is the cheap half of its gate (the recoverable
 # soft-delete + rate-limit land before the webui is exposed beyond localhost).
 STEP_UP_VERBS = frozenset({"destroy", "box_remove", "dev_repo_remove",
-                           "dev_passwd", "dev_purge_consumer"})
+                           "dev_passwd", "dev_purge_consumer",
+                           "dev_board_export"})
 
 # Deny-by-default gating: a verb in VERBS but NOT in this read allowlist
 # requires a valid session token. Inverting the set (vs an explicit *gated*
