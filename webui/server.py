@@ -1343,7 +1343,7 @@ async def broker_dev_board_discard_handler(request: web.Request) -> web.Response
     whose ONLY success path requires an `op_id`. A synchronous `_relay` here
     returns {ok, result} with no op_id, so the dialog reports "Failed" on a
     discard that actually succeeded, never re-renders the panel, and leaves
-    Download offered on a file that is gone.
+    Discard offered on a file that is gone.
     """
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")

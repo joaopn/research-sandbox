@@ -1890,6 +1890,53 @@ def cmd_dev_board_export(args: argparse.Namespace) -> None:
           "authentication for anything provisioned after this export.")
 
 
+def cmd_dev_board_import(args: argparse.Namespace) -> None:
+    """Restore the whole gitea instance from an encrypted backup.
+
+    Host-side by ruling: this stops gitea, replaces its database and every
+    repository, and reverts every project's board to the moment the backup was
+    taken. The confirmation is not ceremony — it is the only thing between a
+    mistyped path and an instance rolled back by weeks.
+    """
+    import getpass
+    target = Path(args.file).expanduser()
+    print(f"About to restore the whole gitea instance from {target}.")
+    print("Every repository and every project's board goes back to the moment "
+          "that backup was taken. Work done since is lost.")
+    print("Not restored: the host's record of which project works which repo "
+          "and the agents' own credentials, so anything set up since the backup "
+          "will need setting up again.")
+    if sys.stdin.isatty():
+        # BOTH prompts inside the guard. A Ctrl-D or Ctrl-C at the confirmation
+        # is an abort, exactly as it is at the passphrase — and main() has no
+        # generic handler, so leaving the first one outside meant a raw traceback
+        # on the one destructive command in the lane.
+        try:
+            if input("Type the word restore to continue: ").strip() != "restore":
+                die("aborted; nothing was changed")
+            pp = getpass.getpass("Backup passphrase (input hidden): ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            die("aborted; nothing was changed")
+    else:
+        pp = sys.stdin.readline().rstrip("\n")
+    req = _build(rscore.DevBoardImportRequest, path=str(target), passphrase=pp,
+                 safety_export=not args.no_safety_export)
+    try:
+        # _call nets a MID-VERB ValidationError — which this verb raises for a
+        # path that does not exist. Without it the single most likely operator
+        # mistake on the one destructive command in the lane is a traceback.
+        res = _call(rscore.dev_board_import, req)
+    except rscore.HarnessError as e:
+        die("could not restore the gitea instance"
+            + (f" ({e.client_detail})" if e.client_detail else ""))
+    print(f"restored from {res.restored_from}")
+    if res.safety_export:
+        print(f"the instance as it was is kept at {res.safety_export}")
+    print("Attachments, avatars and LFS objects were in the backup but are NOT "
+          "restored, so some rows may point at files that are not there.")
+
+
 def cmd_dev_board_discard(args: argparse.Namespace) -> None:
     """Remove the resident backup. The CLI twin of the Backup tab's Discard —
     the webui is the primary surface, but the CLI stays capable."""
@@ -2666,11 +2713,12 @@ def build_parser() -> argparse.ArgumentParser:
     dvbe = dvb_sub.add_parser("export",
                               help="write an encrypted export to --out; prompts "
                                    "for a passphrase (reads one line when piped)")
-    # --out is REQUIRED, not optional: a CLI export must never write into the
-    # broker's run/ directory. It holds no broker lock, so it could destroy the
-    # resident artifact a browser download is about to fetch, and that directory
-    # exists only once the broker or webui created it — while this command must
-    # work on a host with neither.
+    # --out is REQUIRED, not optional: a CLI export must never land on the ONE
+    # fixed name the browser path owns. It holds no broker lock, so it would
+    # replace the backup the page is describing, silently and from underneath a
+    # surface that has no idea it happened. (A restore's safety copy also lives
+    # under that directory now, in a `pre-restore/` subdirectory — it cannot
+    # collide with the fixed name, which is the property this flag protects.)
     dvbe.add_argument("--out", required=True,
                       help="destination file for the encrypted export")
     dvbe.set_defaults(func=cmd_dev_board_export)
@@ -2678,6 +2726,14 @@ def build_parser() -> argparse.ArgumentParser:
                               help="remove the resident backup (does not touch "
                                    "a --out file you exported yourself)")
     dvbd.set_defaults(func=cmd_dev_board_discard)
+    dvbi = dvb_sub.add_parser("import",
+                              help="restore the whole gitea instance from an "
+                                   "encrypted backup (stops gitea; destructive)")
+    dvbi.add_argument("file", help="the encrypted backup file to restore from")
+    dvbi.add_argument("--no-safety-export", action="store_true",
+                      help="skip backing up the current instance first (it is "
+                           "the only rollback a failed restore has)")
+    dvbi.set_defaults(func=cmd_dev_board_import)
     dvr = dv_sub.add_parser("repo", help="mirror/fork lifecycle for a repo")
     dvr_sub = dvr.add_subparsers(dest="repo_action", required=True)
     dvra = dvr_sub.add_parser("add", help="mirror a GitHub repo (consumer forks are minted per dev project/box)")

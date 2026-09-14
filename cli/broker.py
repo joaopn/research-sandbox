@@ -890,8 +890,10 @@ def _verb_dev_passwd(args: dict, progress=None) -> dict:
 
 
 def _verb_dev_board_export(args: dict, progress=None) -> dict:
-    # Export the whole dev gitea to one encrypted file under the broker's run/
-    # directory, which the webui has mounted read-only and serves from. Step-up
+    # Export the whole dev gitea to one encrypted file in the operator's backups
+    # directory, which the webui deliberately does NOT mount: the page names the
+    # path and the operator copies the file themselves, so a compromised webui
+    # cannot read the instance's own keys off the disk. Step-up
     # gated (STEP_UP_VERBS): the artifact carries every token hash in the lane
     # AND the instance's own signing keys, so minting one must cost a re-typed
     # master password rather than a live session alone.

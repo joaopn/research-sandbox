@@ -2103,6 +2103,34 @@ class DevBoardExportRequest:
 
 
 @dataclass(frozen=True)
+class DevBoardImportRequest:
+    """Restore the whole gitea instance from an encrypted backup.
+
+    CLI-only by ruling — there is deliberately no broker verb, so this request is
+    never built from relayed input. It still goes through from_kwargs because
+    every verb reaches rscore through the same validated choke point.
+    """
+    path: str
+    passphrase: str = field(repr=False)
+    safety_export: bool = True
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "DevBoardImportRequest":
+        raw = kw.get("path")
+        if not isinstance(raw, str) or not raw.strip():
+            raise ValidationError("a backup file to restore from is required")
+        pp = kw.get("passphrase")
+        if not isinstance(pp, str) or not pp:
+            raise ValidationError("passphrase must be a non-empty string")
+        # Deliberately NOT re-applying the export's whitespace/length rules: this
+        # passphrase is not being CHOSEN, it is being supplied to open a file
+        # that already exists. Refusing a short one here would refuse to open a
+        # backup made before that floor existed.
+        return cls(path=raw, passphrase=pp,
+                   safety_export=bool(kw.get("safety_export", True)))
+
+
+@dataclass(frozen=True)
 class DevBoardStatusRequest:
     """Read the resident backup's facts. No fields."""
 
@@ -2561,6 +2589,12 @@ class DevBoardExportResult:
     # miss into a TypeError after the artifact was already on disk.
     member_count: int | None
     has_db: bool
+
+
+@dataclass
+class DevBoardImportResult:
+    restored_from: str
+    safety_export: str                          # "" when the operator declined
 
 
 @dataclass
@@ -7585,6 +7619,29 @@ BOARD_EXPORT_TIMEOUT_S = 540
 # operator nothing they would not lose anyway and tells them why.
 BOARD_EXPORT_MIN_RUN_S = 60
 
+# Bound on the restore. It is NOT BOARD_EXPORT_TIMEOUT_S: that number is reasoned
+# entirely from the webui's op window, and the restore has no webui path at all
+# (CLI only, by ruling — it stops gitea and replaces its data). What it does have
+# is more work than an export: a verification decrypt, then a full safety export
+# with its own verify, then a second decrypt that also unpacks. Three passes over
+# the artifact rather than one. 1800s is that shape with headroom on a large
+# instance; at the export's 540 a big restore would be killed MID-REPLACE, which
+# is the one moment this code must not be interrupted. There is no client waiting
+# on a clock, so a generous bound costs nothing but a longer wait on a genuinely
+# wedged docker.
+BOARD_IMPORT_TIMEOUT_S = 1800
+# The floor for STARTING the replace, and deliberately not the export's 60s one.
+# That constant is reasoned as "one round trip plus the smallest export measured"
+# — a sensible gate for a read pass that can simply be re-run. The replace is the
+# opposite case: being cut off part way is the one thing this code must not do,
+# and it is the pass whose failure leaves a half-written database. 300s is the
+# measured shape of a replace (decrypt, unpack, load, copy a repository tree)
+# with room for an instance several times the size of anything measured here; if
+# less than that is left, the restore refuses to start rather than begin work it
+# may not finish. Below it the operator loses nothing but the wait they already
+# spent, and their instance is still running.
+BOARD_REPLACE_MIN_RUN_S = 300
+
 # Where a browser-initiated export lands. This is the ONLY definition — the
 # webui is told the path rather than deriving one, because it runs in a container
 # and cannot know the operator's home.
@@ -10991,8 +11048,8 @@ def dev_board_export(req: "DevBoardExportRequest", progress=None, *,
     means the broker's ``fn(args, progress)`` call shape structurally cannot
     reach it. ``None`` means the BROWSER path and lands on the one fixed name
     under ``BOARD_EXPORT_DIR``; the CLI always passes its own path and never
-    writes into the broker's run/ directory (``--out`` is required, which is what
-    keeps it out).
+    writes into the backups directory the browser path uses (``--out`` is
+    required, which is what keeps it out).
 
     There is deliberately NO sweep of the export directory before writing. It
     would be a pure regression: the on-disk name is FIXED, so ``dump_instance``'s
@@ -11072,6 +11129,211 @@ def dev_board_export(req: "DevBoardExportRequest", progress=None, *,
     )
 
 
+def dev_board_import(req: "DevBoardImportRequest",
+                     progress=None) -> DevBoardImportResult:  # type: ignore[name-defined]
+    """Restore the whole gitea instance from an encrypted backup.
+
+    The destructive one. It stops gitea, replaces its database and every
+    repository, and reverts every project's board to the moment the backup was
+    taken. There is no broker verb and there will not be one: the ceremony of a
+    host-side command is the point.
+
+    THE ORDER IS THE DESIGN. Verification runs before anything else, including
+    the safety export, so a wrong passphrase or a damaged file costs nothing but
+    the time to find out — not a full dump and an orphaned file on the operator's
+    disk. Only then is the safety export taken, and only then is gitea stopped.
+
+    Three things it does NOT restore, printed rather than buried, because each
+    one surprises somebody:
+
+      1. The host's own dev ledger — which project works which repo, the
+         per-consumer tokens, the mirror stamps — never lived in gitea and is not
+         in the archive. After a restore the host still claims forks the
+         rolled-back gitea no longer has, and anything provisioned SINCE the
+         backup has no token row in the restored instance, so those agents
+         silently lose push access until they are re-provisioned. This is the
+         severest gap and it is not board-shaped.
+      2. Attachments, avatars and LFS objects ARE in the archive and are left
+         alone, so rows can point at files this did not bring back.
+      3. The decrypted archive and its unpacked tree live in memory for the
+         duration, so the whole dump has to fit.
+    """
+    progress = progress or _NULL_PROGRESS
+    src = Path(req.path).expanduser()
+    if not src.is_file():
+        raise ValidationError(f"no backup file at {src}")
+    # ONE budget for the whole verb, spent down across three passes over the
+    # artifact rather than handed to each in full. The constant is reasoned as
+    # the SUM of those passes, so giving it to each would let the verb run to
+    # three times the number it was sized against — the trap dump_instance's own
+    # docstring names, at its second site.
+    deadline = time.monotonic() + BOARD_IMPORT_TIMEOUT_S
+
+    def _left(step: str, *, floor: int = BOARD_EXPORT_MIN_RUN_S) -> int:
+        """What is left of the one budget, refusing if a pass cannot finish.
+
+        The floor differs by pass: a read pass can be re-run, so the export's
+        small floor is right for it; the replace cannot be re-run safely once
+        started, so it carries its own much larger one.
+        """
+        remaining = int(deadline - time.monotonic())
+        if remaining < floor:
+            raise HarnessError(
+                f"gitea restore ran out of time before {step}",
+                f"the restore's {BOARD_IMPORT_TIMEOUT_S}s budget was spent "
+                f"before {step} could start; nothing was replaced and gitea is "
+                f"still running")
+        return remaining
+
+    # Running: the safety export is a dump of the LIVE instance, and the image
+    # has to be read off the container before it is stopped.
+    _resume_gitea(require=True)
+    image = _live_gitea_image()
+
+    progress.step("verify", "checking the backup opens")
+    try:
+        gitea.verify_export(path=src, passphrase=req.passphrase, image=image,
+                            timeout=_left("checking the backup"))
+    except gitea.GiteaError as e:
+        raise HarnessError("gitea restore: the backup did not open", str(e))
+
+    safety = ""
+    if req.safety_export:
+        progress.step("safety", "backing up what is here now")
+        stamp = datetime.datetime.now(
+            datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+        # In a `pre-restore/` subdirectory beside the file being restored, NOT
+        # alongside it. The ordinary restore reads the resident backup, so
+        # writing next to it would drop full instance dumps — each carrying the
+        # server's keys — straight into the directory the page describes as
+        # holding exactly one backup. They accumulate (one per restore) and
+        # nothing reclaims them, so at minimum they must not make that statement
+        # false. Timestamped, so a second attempt cannot overwrite the first
+        # attempt's rollback.
+        keep = src.parent / "pre-restore"
+        try:
+            keep.mkdir(parents=True, exist_ok=True)
+            keep.chmod(0o700)
+        except OSError as e:
+            # The mkdir is the half that can genuinely fail — a read-only mount,
+            # a directory the operator cannot write — and without this it is a
+            # raw traceback on the one destructive command in the lane. Nothing
+            # has been touched yet, so this is a clean refusal.
+            raise HarnessError(
+                "gitea restore: could not write the safety backup",
+                f"{e} — nothing was changed. Move the backup somewhere "
+                f"writable, or pass --no-safety-export to skip it")
+        out = keep / (src.name + f".pre-restore-{stamp}.gpg")
+        try:
+            gitea.dump_instance(container=gitea.GITEA_CONTAINER,
+                                passphrase=req.passphrase, out_path=out,
+                                image=image, timeout=_left("the safety backup"))
+        except gitea.GiteaError as e:
+            raise HarnessError("gitea restore: the safety backup failed", str(e))
+        safety = str(out)
+        # Printed BEFORE the destruction starts, so it is on screen even if
+        # everything after this goes wrong.
+        print(f"safety backup of the current instance: {safety}")
+        print("  (safety backups are kept, one per restore, and are yours to "
+              "remove when you no longer want them)")
+
+    # Resolved BEFORE the stop, deliberately. `_left` raises when the budget is
+    # spent, and raising AFTER `docker stop` would leave gitea down over a
+    # failure that changed nothing — inverting the very invariant the rest of
+    # this function is built around.
+    replace_budget = _left("the replace", floor=BOARD_REPLACE_MIN_RUN_S)
+    # Read before the stop so BOTH the success and the refusal arms can wait for
+    # readiness; it is a file read and cannot fail in a way worth branching on.
+    host_port_for_restore = load_versions().get(
+        "GITEA_HOST_PORT", gitea.DEFAULT_GITEA_HOST_PORT)
+    progress.step("stop", "stopping gitea")
+    run_check(["docker", "stop", gitea.GITEA_CONTAINER])
+    progress.step("replace", "replacing the database and repositories")
+    try:
+        gitea.restore_instance(volume=gitea.GITEA_DATA_VOLUME, image=image,
+                               passphrase=req.passphrase, path=src,
+                               timeout=replace_budget)
+    except gitea.RestoreRefused as e:
+        # A PRE-FLIGHT refusal, and only that: the volume is provably untouched,
+        # so the instance that was running a moment ago should be running again
+        # rather than left down by a check that changed nothing.
+        #
+        # It is brought back the SAME way the success path brings it back, not
+        # with a bare `docker start`. This arm is the EXPECTED outcome of the
+        # case the Backup page warns about — a backup from a gitea that no
+        # longer exists — so it is a path operators will actually take, and a
+        # stop/start moves gitea's address on every project network. Without the
+        # re-wire each dev box keeps the address baked at its own launch and
+        # silently loses push until someone runs a host start.
+        started = run(["docker", "start", gitea.GITEA_CONTAINER],
+                      capture_output=True)
+        if started.returncode == 0:
+            try:
+                _wait_for_gitea(host_port_for_restore)
+                wire_gitea_to_projects()
+            except SystemExit:
+                # Readiness or wiring failed on top of the refusal. Say both
+                # things rather than replacing the refusal with a vaguer error.
+                raise HarnessError(
+                    "gitea restore refused, and gitea did not come back",
+                    f"{e} — and gitea did not answer after being started again; "
+                    f"check it before using the dev lane")
+            raise HarnessError("gitea restore refused", str(e))
+        raise HarnessError(
+            "gitea restore refused, and gitea could not be started again",
+            f"{e} — and starting gitea back up failed, so it is currently DOWN")
+    except gitea.GiteaError as e:
+        # Anything else: the replace may have got part way, or the container
+        # doing it may still be running. Starting gitea here would point it at a
+        # half-written database, or add a second writer to the same volume.
+        # Leave it stopped and say so — being down is recoverable, a corrupted
+        # database started and migrated is not.
+        raise HarnessError(
+            "gitea restore failed part way",
+            f"{e} — gitea has been left STOPPED because its data may be "
+            f"partly replaced; restore again from a good backup"
+            + (f", or from the safety backup at {safety}" if safety else
+               " (no safety backup was taken, because --no-safety-export was "
+               "given)")
+            + " before starting it")
+
+    # From here the DATA IS ALREADY RESTORED. Every failure below is about
+    # bringing gitea back, not about the restore — and it must say so, because
+    # the operator's next decision (restore again? from what?) depends entirely
+    # on which of the two it was. This arm carries HIGHER stakes than the refusal
+    # arm above, so it cannot be handled more crudely than it: a bare run_check
+    # here would die() with "command failed: docker start" and skip the re-wire,
+    # never mentioning that the restore itself succeeded.
+    progress.step("start", "starting gitea on the restored data")
+    started = run(["docker", "start", gitea.GITEA_CONTAINER], capture_output=True)
+    if started.returncode != 0:
+        raise HarnessError(
+            "gitea restored, but it could not be started again",
+            f"the restore COMPLETED and your data is in place — but starting "
+            f"gitea failed, so it is currently DOWN. Start it and the dev boxes "
+            f"will pick up its address on the next host start.")
+    try:
+        # The COLD-BOOT budget, explicitly not the resume budget that
+        # wire_gitea_to_projects would use on its own. Gitea coming up on a
+        # restored database re-applies migrations and rebuilds the search index
+        # this restore deliberately deleted, which is minutes of work on a large
+        # instance — GITEA_RESUME_WAIT_TRIES is documented as sized for a WARM
+        # restart and would time out, and its caller SWALLOWS that timeout and
+        # wires from recorded rows. That would let this verb report success
+        # against an instance that is not answering.
+        _wait_for_gitea(host_port_for_restore)
+    except SystemExit:
+        raise HarnessError(
+            "gitea restored, but it did not come back up",
+            f"the restore COMPLETED and your data is in place — but gitea did "
+            f"not answer in time after being started. It may still be applying "
+            f"migrations on the restored database; check it, then run a host "
+            f"start so the dev boxes pick up its address.")
+    progress.step("wire", "re-attaching gitea to the projects")
+    wire_gitea_to_projects()
+    return DevBoardImportResult(restored_from=str(src), safety_export=safety)
+
+
 def dev_board_status(_req: "DevBoardStatusRequest",
                      progress=None) -> DevBoardStatusResult:  # type: ignore[name-defined]
     """The resident backup's facts, including the HOST PATH the operator copies
@@ -11100,8 +11362,9 @@ def dev_board_discard(_req: "DevBoardDiscardRequest",
     Idempotent by design: discarding when nothing is resident is `removed=0`, not
     an error — the browser offers this beside a file whose existence it read a
     moment ago, and a race with a sibling tab must not surface as a failure.
-    Touches ONLY the browser export directory; a CLI export's `--out` file is the
-    operator's own and is never swept.
+    Touches ONLY the resident backup and a stale `.part` of it. A CLI export's
+    `--out` file is the operator's own, and so are the safety copies a restore
+    leaves under `pre-restore/` — neither is ever swept.
     """
     progress = progress or _NULL_PROGRESS
     progress.step("discard", "removing the backup")

@@ -611,6 +611,209 @@ def verify_export(*, path: Path, passphrase: str, image: str,
     }
 
 
+# The restore, which is the only thing here that DESTROYS. Its shape is dictated
+# by one fact: gitea must be STOPPED while its database and repository tree are
+# replaced, and a stopped container cannot be `docker exec`'d into — so this runs
+# in a THROWAWAY container mounting the same named volume, which is also why the
+# helper takes the volume rather than the container name.
+#
+# Order inside the script is load-bearing and is NOT the obvious one. The archive
+# is decrypted and inspected BEFORE anything is removed, so a bad passphrase, a
+# damaged file or an archive from a DIFFERENT gitea costs the operator nothing:
+# the script exits with the volume untouched. Only once the contents are known
+# good does it start replacing.
+#
+# The instance check is the part that is easy to get wrong, and the obvious
+# predicate is the wrong one. Restoring another instance's archive does not fail
+# loudly — it succeeds, and anything that instance had encrypted then decrypts to
+# nothing, silently, which is the worst outcome this code can produce.
+#
+# `SECRET_KEY` is what governs that decryption, so it looks like the predicate.
+# MEASURED on this deployment: it is EMPTY in the on-disk config, in both the
+# live instance and the archive. Building the guard on it would compare "" with
+# "" — it would refuse nothing and, written fail-closed, would refuse EVERY
+# legitimate restore instead. `INTERNAL_TOKEN` is populated (a signed 105-char
+# value), per-instance, and identical between an archive and the instance it came
+# from, so it answers the question the refusal actually asks: is this archive
+# from THIS gitea?
+#
+# It reads the archive's `data/conf/app.ini` — the on-disk copy — and not the
+# top-level `app.ini` the dump also writes, so the comparison is like for like.
+# Neither value is ever echoed: the script prints a marker and the host maps it
+# to a message.
+#
+# GNUPGHOME is pinned into the tmpfs for the same measured reason as the export:
+# gpg creates its home under $HOME, and any $HOME inside this container is either
+# ephemeral or — if the image's user resolves into the mounted tree — INSIDE the
+# volume being restored.
+_RESTORE_SCRIPT = r"""
+set -eu
+set -o pipefail
+export GNUPGHOME=/x/gnupg
+mkdir -p "$GNUPGHOME"
+chmod 700 "$GNUPGHOME"
+umask 077
+cat > /x/pp
+chmod 600 /x/pp
+
+# --- decrypt and unpack, before touching anything -------------------------
+gpg --batch --decrypt --pinentry-mode loopback \
+    --passphrase-file /x/pp --output /x/plain.zip /in.gpg
+mkdir -p /x/ex
+unzip -q /x/plain.zip -d /x/ex
+
+# EVERY pre-flight lives here, above the first destructive command, and each
+# tests a thing the replace below will USE. A check that is merely implied is
+# worthless: an absent member or a missing tool would otherwise be discovered
+# after `rm` had already run, which is the one outcome this ordering exists to
+# prevent.
+CONF=/data/gitea/conf/app.ini
+[ -f "$CONF" ] || { echo "RESTORE-REFUSED no-live-config"; exit 3; }
+[ -f /x/ex/gitea-db.sql ] || { echo "RESTORE-REFUSED no-database-in-archive"; exit 4; }
+# The repository tree, checked for the same reason as the database. Without this
+# `rm -rf "$REPOROOT"` would delete every repository and the copy after it would
+# then fail — reported as a restore failure, having destroyed the thing it was
+# restoring.
+[ -d /x/ex/repos ] || { echo "RESTORE-REFUSED no-repos-in-archive"; exit 8; }
+# sqlite3 loads the database dump. gpg and unzip are established by the export
+# path; this one is introduced here, so a pin bump to an image without it must
+# fail BEFORE the database is removed, not after.
+command -v sqlite3 >/dev/null 2>&1 || { echo "RESTORE-REFUSED no-sqlite"; exit 9; }
+
+# --- refuse an archive from a different instance --------------------------
+# The file is tested before it is read. `set -eu` with a failing command
+# substitution aborts the whole script, so a `sed` over a missing file would
+# take the interpreter down BEFORE the marker below could print — the refusal
+# would exist and be unreachable, and the caller would see an empty failure.
+ARCHCONF=/x/ex/data/conf/app.ini
+[ -f "$ARCHCONF" ] || { echo "RESTORE-REFUSED no-identity"; exit 5; }
+ARCH_ID=$(sed -n 's/^INTERNAL_TOKEN *= *//p' "$ARCHCONF" | head -1 || true)
+LIVE_ID=$(sed -n 's/^INTERNAL_TOKEN *= *//p' "$CONF" | head -1 || true)
+[ -n "$ARCH_ID" ] && [ -n "$LIVE_ID" ] || { echo "RESTORE-REFUSED no-identity"; exit 5; }
+[ "$ARCH_ID" = "$LIVE_ID" ] || { echo "RESTORE-REFUSED foreign-archive"; exit 6; }
+
+# --- replace ---------------------------------------------------------------
+# EVERYTHING above this line is non-destructive: the decrypt, the unpack and
+# every pre-flight. This marker is what lets the caller tell a failure that
+# changed nothing — a wrong passphrase, a damaged file, an archive from another
+# instance, a missing tool — from one that got part way through replacing. That
+# distinction decides whether gitea is safe to start again, so it is drawn from
+# a fact the script emits rather than from a list of error kinds somebody has to
+# remember to keep complete.
+# The repository root is read from the live config rather than assumed, and
+# ownership is taken from what is already there. Both are READS and both can
+# fail, so they belong above the marker: a failure here changes nothing, and
+# classifying it as "may be half-replaced" would leave gitea stopped over it.
+REPOROOT=$(sed -n 's/^ROOT *= *//p' "$CONF" | head -1 || true)
+[ -n "$REPOROOT" ] || { echo "RESTORE-REFUSED no-repo-root"; exit 7; }
+OWNER=$(stat -c '%u:%g' "$CONF" || true)
+[ -n "$OWNER" ] || { echo "RESTORE-REFUSED no-owner"; exit 10; }
+
+# IMMEDIATELY above the first destructive command, with nothing between. Every
+# line above it is a read or a check; every line below it may have changed the
+# volume. Any command inserted into that gap would be misclassified on failure —
+# reported as "your data may be half-replaced" when it changed nothing — so the
+# gap is kept empty on purpose and a test asserts it.
+DB=/data/gitea/gitea.db
+echo "RESTORE-POINT-OF-NO-RETURN"
+rm -f "$DB" "$DB-wal" "$DB-shm"
+sqlite3 "$DB" < /x/ex/gitea-db.sql
+rm -rf "$REPOROOT"
+cp -a /x/ex/repos "$REPOROOT"
+# The search index and the queues describe the database that WAS here. Left in
+# place they index content the restored database no longer has, and across a
+# gitea version change the old index is not even readable. Gitea rebuilds both.
+rm -rf /data/gitea/indexers /data/gitea/queues
+chown -R "$OWNER" "$DB" "$REPOROOT"
+echo "RESTORE-OK"
+"""
+
+_RESTORE_REFUSALS = {
+    "no-live-config": "the running gitea has no config file on its volume, so "
+                      "there is nothing to check this backup against",
+    "no-database-in-archive": "the backup contains no database and could not "
+                              "restore anything",
+    "no-identity": "either the backup or the live gitea carries no instance "
+                   "identity in its config, so they cannot be told apart — "
+                   "refusing rather than risking a restore that silently "
+                   "decrypts everything to nothing",
+    "foreign-archive": "this backup was taken from a DIFFERENT gitea. Restoring "
+                       "it would appear to work and then silently fail to read "
+                       "everything the other instance had encrypted. A gitea "
+                       "that has been destroyed and re-created cannot be "
+                       "restored from a backup of the old one",
+    "no-repo-root": "the live config does not say where repositories live",
+    "no-owner": "the live config's ownership could not be read, so the restored "
+                "files could not be given the right owner",
+    "no-repos-in-archive": "the backup contains no repository tree",
+    "no-sqlite": "the gitea image has no sqlite3, so the database in the backup "
+                 "cannot be loaded",
+}
+
+
+class RestoreRefused(GiteaError):
+    """The restore was refused by a PRE-FLIGHT check, before anything on the
+    volume was touched.
+
+    It exists so a caller can tell the two failure kinds apart, which they must:
+    after a refusal the instance is exactly as it was and should be started again
+    immediately, while after a mid-replace failure the volume is half-written and
+    starting gitea on it would run migrations against a broken database. The
+    marker the script prints is the only reliable signal — a non-zero exit alone
+    cannot distinguish them.
+    """
+
+
+def restore_instance(*, volume: str, image: str, passphrase: str,
+                     path: Path, timeout: int) -> None:
+    """Replace a STOPPED gitea's database and repository tree from ``path``.
+
+    The caller stops the container first and starts it afterwards; this touches
+    only the volume. It is the one destructive operation in this module, and
+    everything above about ordering is why it reads the way it does.
+
+    NOT restored, deliberately, and stated by the caller rather than hidden here:
+    attachments, avatars and LFS objects are IN the archive but are left alone,
+    so rows can point at files this did not bring back.
+    """
+    src = _mount_source(str(path))
+    try:
+        r = subprocess.run(
+            ["docker", "run", "--rm", "-i", "--entrypoint", "sh",
+             # The decrypted archive AND its extracted tree live here, in RAM,
+             # so the whole dump must fit — the caller says so out loud.
+             "--tmpfs", "/x:mode=0700",
+             "-v", f"{volume}:/data",
+             "-v", f"{src}:/in.gpg:ro", image, "-c", _RESTORE_SCRIPT],
+            input=passphrase.encode(), capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # NOT a RestoreRefused: the timeout kills the docker CLIENT, so the
+        # restore container may still be writing into the volume. Gitea must NOT
+        # be started on top of it — two writers on one database is worse than
+        # being down — and the message says what to do instead.
+        raise GiteaError(
+            f"the restore exceeded its {timeout}s budget. The container doing "
+            f"the work may still be running, so gitea has been left stopped: "
+            f"wait for it to finish, then start gitea and check the result "
+            f"before restoring again") from None
+    out = (r.stdout or b"").decode("utf-8", "replace")
+    touched = "RESTORE-POINT-OF-NO-RETURN" in out
+    for marker, message in _RESTORE_REFUSALS.items():
+        if f"RESTORE-REFUSED {marker}" in out:
+            raise RestoreRefused(f"refused: {message}")
+    if r.returncode != 0 or "RESTORE-OK" not in out:
+        detail = (r.stderr or b"").decode("utf-8", "replace").strip()
+        if not touched:
+            # The script never reached its replace section, so the volume is
+            # exactly as it was. The commonest case by far is a wrong passphrase,
+            # and leaving the operator's gitea stopped over a typo would be a
+            # harsh way to report one.
+            raise RestoreRefused(
+                f"the backup did not open — wrong passphrase, or the file is "
+                f"damaged: {detail[-300:]}")
+        raise GiteaError(f"the restore failed part way: {detail[-300:]}")
+
+
 def _zip_member_count(listing: str) -> int | None:
     """The member count from a busybox `unzip -l` listing.
 

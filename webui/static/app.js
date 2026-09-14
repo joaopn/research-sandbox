@@ -1984,8 +1984,8 @@ async function renderDevBackupTab(view, body) {
     body.innerHTML = "";
     body.appendChild(el("div", { class: "mgmt-loading" }, ["Loading backup…"]));
     // Two independent reads: whether gitea is up (a backup needs it running),
-    // and whether an artifact is already resident (served off the read-only
-    // mount, so it answers even while the daemon is busy taking one).
+    // and whether a backup is already resident (its host path, size and age, from
+    // the host — the page cannot compute a path inside a container).
     let devRes, artRes;
     try {
         [devRes, artRes] = await Promise.all([
@@ -2028,8 +2028,9 @@ async function renderDevBackupTab(view, body) {
     const gstate = dev.result.gitea || {};
     const running = !!gstate.running;
     // The artifact read is allowed to be absent without failing the page: it is
-    // served off the read-only mount and answers even mid-export, so an empty
-    // reading means "no backup", not "broken".
+    // a relay like the one beside it, so an empty reading means "no backup"
+    // rather than "broken"; the dev-state arm above is what catches a real
+    // failure, and this default only covers the ordinary absent-file case.
     const info = (art && art.ok && art.result) ? art.result : {};
 
     if (!running) {
@@ -2058,12 +2059,14 @@ async function renderDevBackupTab(view, body) {
             + "another or discard it. Copy it somewhere safe — it is on the "
             + "machine running this, at:",
         ]));
-        kids.push(el("p", { class: "dev-backup-path" }, [info.path || ""]));
+        kids.push(el("p", { class: "dev-backup-path" },
+                 [info.path || "(the host could not be asked where backups live)"]));
     } else {
         kids.push(el("p", {}, [
             "No backup is held yet. When you take one it is written to:",
         ]));
-        kids.push(el("p", { class: "dev-backup-path" }, [info.path || ""]));
+        kids.push(el("p", { class: "dev-backup-path" },
+                 [info.path || "(the host could not be asked where backups live)"]));
     }
 
     kids.push(el("p", { class: "dev-repo-meta" }, [
@@ -2080,10 +2083,27 @@ async function renderDevBackupTab(view, body) {
         + "outside Gitea, so anything set up after a backup will need setting "
         + "up again if you ever restore from it.",
     ]));
+    // THE WARNING (maintainer ruling, 2026-09-14). A backup can only ever be
+    // restored into the Gitea that made it — the instance identity in its config
+    // is what a restore checks, and a re-created Gitea has a new one. Saying so
+    // here is the difference between a backup that protects what the operator
+    // thinks it protects and one that quietly does not.
     kids.push(el("p", { class: "dev-repo-meta" }, [
-        "Restoring a backup is not available yet — it arrives with the next "
-        + "piece of this work. Until then a backup is worth taking and keeping: "
-        + "it is what a restore will read.",
+        el("strong", {}, ["A backup protects against things being deleted "
+                          + "inside Gitea, not against losing Gitea itself. "]),
+        "It can only be restored into the same Gitea that made it. If this "
+        + "Gitea is ever destroyed and set up again, its old backups cannot be "
+        + "read — the new one is a different server, and a restore refuses "
+        + "rather than appearing to work and silently losing everything that "
+        + "was encrypted.",
+    ]));
+    // The FOURTH sanctioned exemption to the no-CLI-mention directive, granted
+    // for exactly this and deliberately not taken until the command existed.
+    kids.push(el("p", { class: "dev-repo-meta" }, [
+        "Restoring is done on the machine running this, not from here — it "
+        + "stops Gitea and replaces every repository and every board, so it "
+        + "asks for confirmation at the terminal: ",
+        el("code", {}, ["research dev board import <file>"]),
     ]));
 
     const take = el("button", { class: "btn-small" },
