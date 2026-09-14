@@ -904,13 +904,22 @@ def _verb_dev_board_export(args: dict, progress=None) -> dict:
     return dataclasses.asdict(rscore.dev_board_export(req, progress))
 
 
+def _verb_dev_board_status(args: dict, progress=None) -> dict:
+    # Where the resident backup is, how big and how old. A pure stat with no
+    # fields, so there is no lockstep to keep: nothing from the request reaches
+    # the verb. It exists as a verb rather than a webui filesystem read because
+    # the artifact deliberately sits OUTSIDE the webui's mount, and because only
+    # the host knows the host path.
+    return dataclasses.asdict(
+        rscore.dev_board_status(rscore.DevBoardStatusRequest.from_kwargs(), progress))
+
+
 def _verb_dev_board_discard(args: dict, progress=None) -> dict:
-    # Remove the resident artifact. Deliberately NOT step-up gated — but the
-    # honest reason is narrower than "it can be re-created": after an agent has
-    # destroyed a fork, the resident artifact may be the ONLY copy of that board,
-    # which is precisely the case this feature exists for. It is un-gated because
-    # it is a deliberate, confirmed, single-file delete the operator just asked
-    # for by name, not because the file is cheap. The dialog says so.
+    # Remove the resident backup. STEP-UP GATED (maintainer ruling, 2026-09-14):
+    # after an agent has destroyed a fork this file may be the ONLY copy of that
+    # board, so a live session alone must not be enough to delete it — the
+    # earlier reasoning that it is cheap because you can "just take another" is
+    # false in exactly the case the feature exists for.
     #
     # In PROGRESS_VERBS despite being two unlinks: the browser's confirm dialog
     # tails an op, so a verb reachable from it must mint one or the dialog has no
@@ -961,6 +970,7 @@ VERBS = {
     "dev_purge_consumer": _verb_dev_purge_consumer,
     "dev_commits": _verb_dev_commits,
     "dev_board_export": _verb_dev_board_export,
+    "dev_board_status": _verb_dev_board_status,
     "dev_board_discard": _verb_dev_board_discard,
     # NOTE: there is deliberately NO dev_board_import. Restoring is destructive
     # enough that it stays a host-side act; deny-by-default does the enforcing —
@@ -974,7 +984,7 @@ VERBS = {
 # soft-delete + rate-limit land before the webui is exposed beyond localhost).
 STEP_UP_VERBS = frozenset({"destroy", "box_remove", "dev_repo_remove",
                            "dev_passwd", "dev_purge_consumer",
-                           "dev_board_export"})
+                           "dev_board_export", "dev_board_discard"})
 
 # Deny-by-default gating: a verb in VERBS but NOT in this read allowlist
 # requires a valid session token. Inverting the set (vs an explicit *gated*

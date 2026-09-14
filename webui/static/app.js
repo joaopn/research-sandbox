@@ -1963,7 +1963,7 @@ function renderDevelopmentInto(view) {
     else renderDevGiteaTab(view, body);
 }
 
-// The Backup tab: take, download and discard an encrypted copy of the whole
+// The Backup tab: take and discard an encrypted copy of the whole
 // dev Gitea. The board — issues, pull requests and their discussion — is the
 // human<->agent channel and exists in no git object, while an agent owns its
 // fork and in gitea ownership implies destruction. This is the surface that
@@ -1973,7 +1973,7 @@ function renderDevelopmentInto(view) {
 // not summarise what is inside: the Development page's repo counters filter to
 // the mirrors (not the consumer forks, which is where boards live) and count
 // only OPEN items, so any headline drawn from them would state a number
-// materially smaller than what is being downloaded.
+// materially smaller than what the file actually holds.
 function devBackupBytes(n) {
     if (typeof n !== "number") return "";
     const mb = n / (1024 * 1024);
@@ -2053,15 +2053,17 @@ async function renderDevBackupTab(view, body) {
         const when = info.created_at
             ? new Date(info.created_at).toLocaleString() : "unknown";
         kids.push(el("p", {}, [
-            "One backup is held here, taken ", el("strong", {}, [when]),
-            " (", devBackupBytes(info.size), "). Download it to keep it "
-            + "somewhere safe — it stays here until you take another or "
-            + "discard it.",
+            "One backup is held, taken ", el("strong", {}, [when]),
+            " (", devBackupBytes(info.size), "). It stays here until you take "
+            + "another or discard it. Copy it somewhere safe — it is on the "
+            + "machine running this, at:",
         ]));
+        kids.push(el("p", { class: "dev-backup-path" }, [info.path || ""]));
     } else {
         kids.push(el("p", {}, [
-            "No backup is held here yet.",
+            "No backup is held yet. When you take one it is written to:",
         ]));
+        kids.push(el("p", { class: "dev-backup-path" }, [info.path || ""]));
     }
 
     kids.push(el("p", { class: "dev-repo-meta" }, [
@@ -2089,19 +2091,10 @@ async function renderDevBackupTab(view, body) {
     take.onclick = () => devBoardExportDialog(view, rerender);
     const actions = [take];
     if (info.present) {
-        // A BUTTON that navigates, not an <a class="btn-small">: nothing else
-        // in this app styles an anchor as a button, so an anchor here would
-        // render as underlined inline text among real buttons. The navigation
-        // is what hands the transfer to the browser's own download machinery —
-        // Content-Disposition names the file and the page does not move.
-        const dl = el("button", { class: "btn-small" }, ["Download"]);
-        dl.onclick = () => {
-            window.location.href = "/broker/dev/board-export/download";
-        };
         const discard = el("button", { class: "btn-small btn-danger" },
                            ["Discard"]);
         discard.onclick = () => devBoardDiscardDialog(view, rerender);
-        actions.push(dl, discard);
+        actions.push(discard);
     }
     kids.push(el("div", { class: "btn-row left" }, actions));
     body.appendChild(el("div", { class: "card dev-repo-card" }, kids));
@@ -2119,7 +2112,8 @@ function devBoardExportDialog(view, onDone) {
         body: [
             el("p", {}, [
                 "Encrypts the whole Gitea — every repository and every board — "
-                + "into one file you can download and keep.",
+                + "into one file on the machine running this, which you "
+                + "can copy and keep.",
             ]),
             el("p", {}, [
                 "Choose a passphrase for the file. It is not your master "
@@ -2168,6 +2162,7 @@ function devBoardExportDialog(view, onDone) {
 }
 
 function devBoardDiscardDialog(view, onDone) {
+    const masterI = el("input", { type: "password", autocomplete: "current-password" });
     mgmtConfirmThenTail(view, {
         title: "Discard this backup",
         tailTitle: "Discarding backup",
@@ -2176,17 +2171,23 @@ function devBoardDiscardDialog(view, onDone) {
         danger: true,
         body: [
             el("p", {}, [
-                "Deletes the backup held here. If you have not downloaded it, "
-                + "it is gone. You can take another while Gitea is healthy — but "
-                + "if this backup is the only copy of a board something "
-                + "already destroyed, there is nothing to take it from.",
+                "Deletes the backup held here. If you have not copied it "
+                + "elsewhere, it is gone. You can take another while Gitea is "
+                + "healthy — but if this backup is the only copy of a board "
+                + "something already destroyed, there is nothing to take "
+                + "another from.",
+            ]),
+            el("div", { class: "field" }, [
+                el("label", {}, ["Re-enter your master password"]), masterI,
             ]),
         ],
+        validate: () => masterI.value ? null : "Re-enter your master password.",
         request: async () => fetch("/broker/dev/board-discard", {
             method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({}),
+            body: JSON.stringify({ proof: await deriveLoginProof(masterI.value) }),
         }),
         onDone: (ok) => { if (onDone) onDone(ok); },
+        focus: () => masterI.focus(),
     });
 }
 

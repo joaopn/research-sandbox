@@ -2103,6 +2103,15 @@ class DevBoardExportRequest:
 
 
 @dataclass(frozen=True)
+class DevBoardStatusRequest:
+    """Read the resident backup's facts. No fields."""
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "DevBoardStatusRequest":
+        return cls()
+
+
+@dataclass(frozen=True)
 class DevBoardDiscardRequest:
     """Remove the resident browser-export artifact. No fields — house style gives
     even a field-less verb a request class, so every verb reaches rscore through
@@ -2552,6 +2561,14 @@ class DevBoardExportResult:
     # miss into a TypeError after the artifact was already on disk.
     member_count: int | None
     has_db: bool
+
+
+@dataclass
+class DevBoardStatusResult:
+    present: bool
+    path: str                                   # the HOST path, shown to the operator
+    size: int = 0
+    created_at: str = ""
 
 
 @dataclass
@@ -7568,21 +7585,26 @@ BOARD_EXPORT_TIMEOUT_S = 540
 # operator nothing they would not lose anyway and tells them why.
 BOARD_EXPORT_MIN_RUN_S = 60
 
-# Where a BROWSER-initiated export lands. Derived here rather than imported from
-# cli/broker.py: broker imports rscore, so the reverse would be circular (the
-# cli/broker_auth.py precedent). Three copies of this path exist by necessity and
-# only two can be checked by a test — this one and broker's BROKER_RUN_DIR, which
-# a pin asserts are equal; the webui derives its own from the broker SOCKET path
-# it already knows, because it cannot import cli/ at all.
+# Where a browser-initiated export lands. This is the ONLY definition — the
+# webui is told the path rather than deriving one, because it runs in a container
+# and cannot know the operator's home.
 #
-# It must live under the broker's run/ directory: that is the one host directory
-# the webui container has mounted (read-only), so it is the only place the broker
-# can put a file the browser can then download.
-BOARD_EXPORT_DIR = Path.home() / ".research-sandbox" / "run" / "exports"
-# ONE fixed on-disk name, which is what makes "at most one resident artifact"
-# a checkable property and lets the download route drop its id entirely. The
-# operator-facing filename comes from the download's Content-Disposition, so a
-# fixed name on disk costs them nothing.
+# It used to live under the broker's `run/` directory for one reason: that is the
+# host directory the webui has mounted read-only, so it was the only place a file
+# could be served to the browser from. The browser download was removed (the page
+# names this path and the operator takes the file themselves), and with it that
+# reason. `run/` holds the socket and the op logs — runtime state — and a backup
+# is the opposite of runtime state, so it moves here where the name says what it
+# is. A real consequence beyond tidiness: the artifact now sits OUTSIDE anything
+# the webui container has mounted, so a compromised webui cannot read the
+# instance's own signing keys off the disk.
+BOARD_EXPORT_DIR = Path.home() / ".research-sandbox" / "backups"
+# ONE fixed on-disk name. It is what makes "at most one resident backup" a
+# checkable property, and with no sweep (see dev_board_export) the atomic replace
+# onto this name IS the mechanism. It carries no date deliberately: a dated name
+# would mean many resident files and therefore a sweep, which was reversed for
+# good reasons. The page shows when the file was taken, and the operator dates
+# their own copy if they want one.
 BOARD_EXPORT_NAME = "gitea-instance.gpg"
 
 GITEA_BOOT_WAIT_TRIES = 60       # ~1 probe/sec; covers a cold pull + sqlite init
@@ -11048,6 +11070,27 @@ def dev_board_export(req: "DevBoardExportRequest", progress=None, *,
         member_count=info.get("member_count"),      # may be None = unknown
         has_db=bool(info.get("has_db")),
     )
+
+
+def dev_board_status(_req: "DevBoardStatusRequest",
+                     progress=None) -> DevBoardStatusResult:  # type: ignore[name-defined]
+    """The resident backup's facts, including the HOST PATH the operator copies
+    from. Always returns a path — where a backup WOULD be when none is there —
+    so the page can tell them where to look either way.
+
+    A pure stat. It touches no container and no network, so it needs no bound and
+    cannot be made to hang; and it is the reason the webui asks rather than
+    derives, since a container cannot know the operator's home directory.
+    """
+    target = BOARD_EXPORT_DIR / BOARD_EXPORT_NAME
+    try:
+        st = target.stat()
+    except OSError:                 # absent dir or file: "no backup yet", not an error
+        return DevBoardStatusResult(present=False, path=str(target))
+    return DevBoardStatusResult(
+        present=True, path=str(target), size=st.st_size,
+        created_at=datetime.datetime.fromtimestamp(
+            st.st_mtime, datetime.timezone.utc).isoformat(timespec="seconds"))
 
 
 def dev_board_discard(_req: "DevBoardDiscardRequest",

@@ -1470,6 +1470,21 @@ body {
 .dev-repo-head { display: flex; align-items: center; gap: 10px; }
 .dev-repo-name { font-weight: 600; }
 .dev-repo-meta { color: var(--fg-muted); font-size: 12px; flex: 1; }
+/* The host path of the resident backup. Monospace because it is a path the
+   operator will select and copy, and `overflow-wrap: anywhere` because an
+   absolute path under a long home directory has no break opportunities of its
+   own — without it the card forces a horizontal scroll at phone width, where
+   the tab strip already had to be taught to wrap. */
+.dev-backup-path {
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 12px;
+    color: var(--fg-base);
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 6px 8px;
+    overflow-wrap: anywhere;
+}
 .dev-pr-row, .dev-branch-row {
     display: flex;
     align-items: center;

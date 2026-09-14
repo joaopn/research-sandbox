@@ -1891,8 +1891,8 @@ def cmd_dev_board_export(args: argparse.Namespace) -> None:
 
 
 def cmd_dev_board_discard(args: argparse.Namespace) -> None:
-    """Remove the backup the browser holds. The CLI twin of the Backup tab's
-    Discard — the webui is the primary surface, but the CLI stays capable."""
+    """Remove the resident backup. The CLI twin of the Backup tab's Discard —
+    the webui is the primary surface, but the CLI stays capable."""
     try:
         res = rscore.dev_board_discard(_build(rscore.DevBoardDiscardRequest))
     except rscore.HarnessError as e:
@@ -1901,7 +1901,7 @@ def cmd_dev_board_discard(args: argparse.Namespace) -> None:
         # the operator as a traceback, since main() has no generic handler.
         die("could not discard the backup"
             + (f" ({e.client_detail})" if e.client_detail else ""))
-    print(f"discarded {res.removed} file(s) from the browser backup slot"
+    print(f"discarded {res.removed} file(s) from the backup slot"
           if res.removed else "no backup was being held")
 
 
@@ -2675,8 +2675,8 @@ def build_parser() -> argparse.ArgumentParser:
                       help="destination file for the encrypted export")
     dvbe.set_defaults(func=cmd_dev_board_export)
     dvbd = dvb_sub.add_parser("discard",
-                              help="remove the backup the browser is holding "
-                                   "(does not touch a --out file you exported)")
+                              help="remove the resident backup (does not touch "
+                                   "a --out file you exported yourself)")
     dvbd.set_defaults(func=cmd_dev_board_discard)
     dvr = dv_sub.add_parser("repo", help="mirror/fork lifecycle for a repo")
     dvr_sub = dvr.add_subparsers(dest="repo_action", required=True)
