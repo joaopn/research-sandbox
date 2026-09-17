@@ -62,10 +62,11 @@ SESSION_TTL_SECONDS = 8 * 60 * 60
 # enumeration. 3s is the number /probe shipped with in W1; kept consistent.
 TCP_PROBE_TIMEOUT_SECONDS = 3.0
 
-# Read-side mount of the host PROJECTS_DIR. The rail's per-project status
-# sub-line is computed from this tree — workers/<n>/work/, logbook/, file
-# mtimes, total size. Compose mounts it `:ro`; the server further enforces
-# project names match a strict regex and resolve inside this root.
+# Read-side mount of the host PROJECTS_DIR. The per-project markers (the
+# rail badge, the config box's flavor), the services/ports registries and the
+# user-triggered disk sizing all read from this tree. Compose mounts it `:ro`;
+# the server further enforces project names match a strict regex and resolve
+# inside this root.
 PROJECTS_ROOT = Path(os.environ.get("RS_PROJECTS_ROOT", "/projects"))
 
 # Project-name regex mirrors the host-side validator's character class.
@@ -1884,7 +1885,7 @@ async def project_services_handler(request: web.Request) -> web.Response:
     One tab is synthesized per box (kind="sandbox" in the project's
     per-supervisor extensions.json), read directly off the existing
     `/projects:ro` bind-mount — same data plane that powers the rail's
-    status sub-line; no cache, no SSH, no docker socket. Box lifecycle
+    workflow badge; no cache, no SSH, no docker socket. Box lifecycle
     changes (add / remove a box) reflect on the next page load. RO mount
     surface is wider than this filter (covers `.creds/` etc.), so adding
     new file reads here doesn't expand the webui's trust posture."""
@@ -2233,7 +2234,7 @@ def _read_project_substrate(project: str) -> str:
             else "dind-sysbox")
 
 
-# ---- /projects/status — per-project rail sub-line data ----------------
+# ---- /projects/status + /projects/disk — marker data, on-demand disk size
 
 def _project_workspace(name: str) -> Path | None:
     """Resolve a vault-supplied project name to its `<root>/<name>/workspace`
@@ -2256,123 +2257,75 @@ def _project_workspace(name: str) -> Path | None:
     return workspace
 
 
-def _compute_status(name: str) -> dict:
-    """Walk a project's workspace and produce {workers_running, workers_done,
-    disk_bytes, latest}. `latest` carries the freshest mtime across event-
-    bearing paths (log.jsonl → active, DONE → done, outputs/* → output,
-    research_log.md → notes, logbook/* → logbook, plus the worker dir's
-    own mtime → spawn) AND the workspace-relative path that produced it,
-    so the rail can name the actual file the user might want to open
-    rather than a generic kind label.
 
-    Walks the tree once: disk_bytes accumulates st_size for every file
-    encountered and the path discriminator picks event-kinds off the same
-    pass. Uncached on purpose — start simple, add a TTL cache only when
-    profiling shows a real cost."""
+def _project_summary(name: str) -> dict:
+    """The rail badge / config-box data for one project, read from the
+    project marker ONLY — {flavor, workflow}, or {error: not_found} when the
+    name fails validation or has no workspace on disk. Deliberately walk-free:
+    this is what the rail paints on every render and what each config box
+    reads, so it must cost one small file read per project, never a tree
+    walk. `flavor` is the legacy derived type ("research" | "sandbox-dind",
+    the config box gates its worker pickers on it); `workflow` is what the
+    user picked (the rail badge), falling back to the flavor for markers that
+    predate the workflow field."""
+    if _project_workspace(name) is None:
+        return {"error": "not_found"}
+    marker = _read_project_marker(name)
+    flavor = "sandbox-dind" if marker.get("type") == "sandbox-dind" else "research"
+    return {"flavor": flavor, "workflow": marker.get("workflow") or flavor}
+
+
+def _project_disk_bytes(name: str) -> dict:
+    """Sum st_size over every regular entry under a project's workspace —
+    {disk_bytes: N}, or {error: not_found}. This is the ONE tree walk the
+    webui performs, and it runs only when the Management page's "Measure
+    sizes" button asks for it: on a host with a 110k-file dev workspace it
+    costs seconds and more than a core, which is why it is no longer on any
+    periodic path. Uncached on purpose — a user-triggered measurement should
+    report the tree as it is now."""
     workspace = _project_workspace(name)
     if workspace is None:
         return {"error": "not_found"}
-
-    workers_running = 0
-    workers_done = 0
-    latest_ts: float = 0.0
-    latest_kind: str | None = None
-    latest_path: str | None = None
-
-    def bump(kind: str, path: str, ts: float) -> None:
-        nonlocal latest_ts, latest_kind, latest_path
-        if ts > latest_ts:
-            latest_ts = ts
-            latest_kind = kind
-            latest_path = path
-
-    workers_dir = workspace / "workers"
-    if workers_dir.is_dir():
-        try:
-            for entry in os.scandir(workers_dir):
-                if not entry.is_dir(follow_symlinks=False):
-                    continue
-                done_marker = Path(entry.path) / "work" / "DONE"
-                if done_marker.is_file():
-                    workers_done += 1
-                else:
-                    workers_running += 1
-                try:
-                    bump("spawn",
-                         f"workers/{entry.name}/",
-                         entry.stat(follow_symlinks=False).st_mtime)
-                except OSError:
-                    pass
-        except OSError:
-            pass
-
     disk_bytes = 0
     for dirpath, _dirnames, filenames in os.walk(workspace, followlinks=False):
-        try:
-            rel_parts = Path(dirpath).relative_to(workspace).parts
-        except ValueError:
-            rel_parts = ()
-        in_worker_work = (
-            len(rel_parts) >= 3
-            and rel_parts[0] == "workers"
-            and rel_parts[2] == "work"
-        )
-        worker_tail = rel_parts[3:] if in_worker_work else ()
-        in_logbook = rel_parts == ("logbook",)
         for fname in filenames:
             try:
                 st = os.stat(os.path.join(dirpath, fname), follow_symlinks=False)
             except OSError:
                 continue
             disk_bytes += st.st_size
-            rel_path = "/".join((*rel_parts, fname)) if rel_parts else fname
-            if in_worker_work:
-                if not worker_tail:
-                    if fname == "log.jsonl":
-                        bump("active", rel_path, st.st_mtime)
-                    elif fname == "DONE":
-                        bump("done", rel_path, st.st_mtime)
-                    elif fname == "research_log.md":
-                        bump("notes", rel_path, st.st_mtime)
-                elif worker_tail[0] == "outputs":
-                    bump("output", rel_path, st.st_mtime)
-            elif in_logbook:
-                bump("logbook", rel_path, st.st_mtime)
-
-    out: dict = {
-        "workers_running": workers_running,
-        "workers_done": workers_done,
-        "disk_bytes": disk_bytes,
-        "flavor": _read_project_type(name),     # "research" | "sandbox-dind" (legacy)
-        # The user-facing label: the WORKFLOW the user picked (empty/research/
-        # sandbox-dind/BYO), not the derived flavor — so a docker `empty` box stops
-        # mislabelling as "research". Falls back to the flavor for legacy markers
-        # that predate the workflow field. Substrate stays hidden (Q7).
-        "workflow": _read_project_marker(name).get("workflow") or _read_project_type(name),
-        "latest": None,
-    }
-    if latest_kind is not None:
-        out["latest"] = {
-            "kind": latest_kind,
-            "path": latest_path,
-            "ts_ms": int(latest_ts * 1000),
-        }
-    return out
+    return {"disk_bytes": disk_bytes}
 
 
 async def projects_status_handler(request: web.Request) -> web.Response:
-    """GET /projects/status?names=foo,bar — batched per-project status lookup.
+    """GET /projects/status?names=foo,bar — batched per-project marker
+    lookup: {name: {flavor, workflow} | {error: not_found}}.
 
     Names are client-supplied (the SPA's vault drives the rail) and
     validated against PROJECT_NAME_RE before any filesystem access. Each
-    name's compute runs in a worker thread so a deep walk on one project
-    can't stall the event loop for the others."""
+    answer is one marker read on the /projects bind-mount, computed inline:
+    there is no walk here by design (the walk lives behind /projects/disk),
+    so nothing is worth a worker thread."""
+    raw = request.query.get("names", "")
+    names = [n.strip() for n in raw.split(",") if n.strip()]
+    if not names:
+        return web.json_response({})
+    return web.json_response({n: _project_summary(n) for n in names})
+
+
+async def projects_disk_handler(request: web.Request) -> web.Response:
+    """GET /projects/disk?names=foo,bar — batched per-project disk usage:
+    {name: {disk_bytes} | {error: not_found}}. USER-TRIGGERED ONLY (the
+    Management page's "Measure sizes" button); no timer in the SPA calls it.
+    Same name validation as /projects/status. Each walk runs in a worker
+    thread so a deep tree on one project can't stall the event loop for the
+    others — or for the terminals, which share that loop."""
     raw = request.query.get("names", "")
     names = [n.strip() for n in raw.split(",") if n.strip()]
     if not names:
         return web.json_response({})
     results = await asyncio.gather(*[
-        asyncio.to_thread(_compute_status, n) for n in names
+        asyncio.to_thread(_project_disk_bytes, n) for n in names
     ])
     return web.json_response(dict(zip(names, results)))
 
@@ -2893,6 +2846,7 @@ def main() -> None:
     app.router.add_get("/services", services_handler)
     app.router.add_get("/services/{project}", project_services_handler)
     app.router.add_get("/projects/status", projects_status_handler)
+    app.router.add_get("/projects/disk", projects_disk_handler)
     app.router.add_post("/session/{project}", session_handler)
     # Broker relay (management lifecycle) — login-gated; no docker socket.
     app.router.add_post("/broker/login", broker_login_handler)

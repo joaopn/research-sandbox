@@ -55,10 +55,6 @@ const PBKDF2_ITERATIONS = 600000;
 const LOGIN_PROOF_SALT_STR = "rs-broker-login-v1";
 const LOGIN_PROOF_ITERATIONS = 600000;
 const PROBE_INTERVAL_MS = 15000;
-// Status polling cadence — only runs while the rail is open. Higher than
-// PROBE_INTERVAL_MS because the data is filesystem-derived and changes on
-// human / worker timescales (minutes), not network-up timescales (seconds).
-const STATUS_INTERVAL_MS = 20000;
 // Column layout: up to three side-by-side groups, each a width fraction of
 // the terminal area. The floor keeps every column usable — below ~15% of a
 // typical desktop area neither a tab strip nor a terminal has workable
@@ -274,7 +270,6 @@ const state = {
     projectLastService: {},  // { [projectName]: serviceId } — per-project landing memory (in-memory; reload/restart resets to the editor default)
     terminals: {},           // "${project}:${service}" -> { term, fitAddon, ws, container, project, service }
     probeTimer: null,
-    statusTimer: null,
     servicesTimer: null,
     theme: null,
     railPinned: false,       // persisted: keep rail in flex flow (push layout)
@@ -644,9 +639,8 @@ async function renderDashboard(opts = {}) {
 
     applyRailState();
     schedulePolling();
+    paintProjectBadges();
     scheduleServicesRefresh();
-    // Rail-visibility-gated status polling is started inside applyRailState;
-    // no separate kickoff needed here.
 
     // Project-less strips need the fallback opener chip (softlock guard).
     ensureMobileChip();
@@ -854,10 +848,6 @@ function applyRailState() {
     const projectsTab = dashboard.querySelector(".projects-tab");
     if (projectsTab) projectsTab.title = expanded ? "Hide projects" : "Show projects";
 
-    // Status polling lifecycle is tied to rail visibility — no point
-    // walking project trees while the rail's hidden.
-    scheduleStatusPolling();
-
     // Layout shift only happens when pinned toggles; refit the active terminal.
     const t = activeTerminal();
     if (t && t.fitAddon) {
@@ -952,6 +942,7 @@ function refreshProjectRail() {
     fresh.scrollTop = scrolled;
     applyRailState();
     schedulePolling();
+    paintProjectBadges();
     scheduleServicesRefresh();
 }
 
@@ -1097,14 +1088,11 @@ function refreshBottomNav() {
 // same as desktop; a newly-enabled surface's tab appears on the next services
 // poll like any other tab.
 
-// The ONLY mutator of the .mobile-projects class. Status polling is gated on
-// "projects list visible" (mobile: this view; desktop: rail pinned/expanded),
-// so every visibility change re-derives it here.
+// The ONLY mutator of the .mobile-projects class.
 function setMobileProjectsView(on) {
     const dashboard = document.querySelector(".dashboard");
     if (!dashboard) return;
     dashboard.classList.toggle("mobile-projects", on);
-    scheduleStatusPolling();
     updateMobileKeybar();
     // Close transition: #terminal-area was display:none while the view was
     // open, so any viewport change during it (rotation, soft keyboard) made
@@ -1803,12 +1791,17 @@ function renderMgmtTable(view, projects) {
     create.onclick = () => openWorkflows();
     const refresh = el("button", { class: "btn-small" }, ["Refresh"]);
     refresh.onclick = () => renderManagementInto(view);
+    // Disk sizes are a USER-TRIGGERED measurement: summing a workspace means
+    // walking every file in it (seconds and more than a core on a large dev
+    // tree), so nothing computes it on open or on a timer — the column starts
+    // empty and this button fills it for every listed project.
+    const measure = el("button", { class: "btn-small" }, ["Measure sizes"]);
     // No Log-out control: under unified login the session model is "locked
     // vault = logged out" — Lock vault (rail footer) revokes the broker
     // session; a separate Management logout would just auto-re-login.
     view.appendChild(el("div", { class: "mgmt-header" }, [
         el("h2", {}, ["Management — host projects (live)"]),
-        el("div", { class: "mgmt-toolbar" }, [create, refresh]),
+        el("div", { class: "mgmt-toolbar" }, [create, refresh, measure]),
     ]));
     if (projects.length === 0) {
         view.appendChild(el("div", { class: "mgmt-empty" }, ["No projects on this host."]));
@@ -1824,7 +1817,7 @@ function renderMgmtTable(view, projects) {
     for (const p of projects) {
         const running = p.state === "running";
         const badge = el("span", { class: "type-badge" });          // filled by mgmtFillStatus
-        const sizeEl = el("span", { class: "mgmt-size" }, ["…"]);
+        const sizeEl = el("span", { class: "mgmt-size" }, ["—"]);   // filled by Measure sizes
         fill[p.project] = { badge, size: sizeEl };
         const power = el("button", { class: "btn-small" }, [running ? "Stop" : "Start"]);
         power.onclick = () => mgmtAction(view, p.project, running ? "stop" : "start");
@@ -1856,11 +1849,13 @@ function renderMgmtTable(view, projects) {
     appendPassthroughSection(view, projects);
     appendInfraSection(view);   // async, fire-and-forget (its own sub-block)
     mgmtFillStatus(fill);
+    measure.onclick = () => mgmtMeasureSizes(fill, measure);
 }
 
-// The broker `list` carries name/state/ssh; the project flavour + disk size come
-// off the same /projects/status data plane the rail uses (read from the
-// /projects:ro mount, joined here by name).
+// The broker `list` carries name/state/ssh; the project flavour (the badge)
+// comes off the same marker-only /projects/status call the rail uses (read
+// from the /projects:ro mount, joined here by name). Disk size is NOT read
+// here — see mgmtMeasureSizes.
 async function mgmtFillStatus(fill) {
     const names = Object.keys(fill);
     if (names.length === 0) return;
@@ -1873,13 +1868,37 @@ async function mgmtFillStatus(fill) {
     for (const [name, st] of Object.entries(data)) {
         const ref = fill[name];
         if (!ref) continue;
-        if (st && st.error === "not_found") {
-            ref.size.textContent = "—";
-            setTypeBadge(ref.badge, null);
-            continue;
+        setTypeBadge(ref.badge, st && st.error !== "not_found" ? st.workflow : null);
+    }
+}
+
+// "Measure sizes": the one place the webui asks the server to walk project
+// trees (/projects/disk). Every listed project at once; the cells show "…"
+// while the walk runs, the button is disabled for the duration so a second
+// click cannot stack a second walk, and a failed fetch leaves "?" rather than
+// a stale number. A Refresh mid-flight replaces the table — the late fill then
+// writes into detached nodes, which is harmless — and hands the user a fresh,
+// enabled button, so a second click during a first walk starts a second walk:
+// accepted, the cost is bounded by clicks and the later answer is the fresher.
+async function mgmtMeasureSizes(fill, btn) {
+    const names = Object.keys(fill);
+    if (names.length === 0) return;
+    btn.disabled = true;
+    for (const ref of Object.values(fill)) ref.size.textContent = "…";
+    try {
+        const res = await fetch(`/projects/disk?names=${encodeURIComponent(names.join(","))}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        for (const [name, st] of Object.entries(data)) {
+            const ref = fill[name];
+            if (!ref) continue;
+            ref.size.textContent = (st && typeof st.disk_bytes === "number")
+                ? formatBytes(st.disk_bytes) : "—";
         }
-        ref.size.textContent = formatBytes((st && st.disk_bytes) || 0);
-        setTypeBadge(ref.badge, st && st.workflow);
+    } catch (e) {
+        for (const ref of Object.values(fill)) ref.size.textContent = "?";
+    } finally {
+        btn.disabled = false;
     }
 }
 
@@ -6525,10 +6544,9 @@ function armProjectDrag(row, project) {
         let target = null;
 
         // Resolve the pointer to an insertion index over the rail's rows.
-        // Rects are re-read on EVERY move, never cached at drag start: a
-        // status poll landing mid-drag fills a row's sub-lines, and
-        // .project-status-meta:empty { display: none } makes rows change
-        // height under the pointer.
+        // Rects are re-read on EVERY move, never cached at drag start: it is
+        // cheap, and it keeps the drop index right if anything reflows the
+        // rail mid-gesture (a badge paint landing, a resize).
         const resolveTarget = (mv) => {
             const rr = rail.getBoundingClientRect();
             if (mv.clientX < rr.left || mv.clientX > rr.right
@@ -6637,14 +6655,14 @@ function makeProjectRow(project) {
     // different thing: it forgets this browser's bookmark and touches nothing
     // on the sandbox (appendSidebarSection).
     const head = el("div", { class: "project-head" }, [dot, name]);
-    // Second line: a project-type badge (research/sandbox, filled by
-    // fetchProjectsStatus) + the worker-activity figures, plus the always-
-    // present config gear. The gear opens the per-project floating config box.
-    // The badge starts empty (collapsed) until the flavour lands; the gear
-    // keeps the line non-empty so it shows from row construction. Disk size
-    // lives in the broker Management table now, not here.
+    // Second line: a project-type badge (research/sandbox/dev, painted once per
+    // rail render by paintProjectBadges) plus the always-present config gear,
+    // which opens the per-project floating config box. The badge starts empty
+    // (collapsed) until the marker read lands; the gear keeps the line
+    // non-empty so it shows from row construction. There is deliberately NO
+    // activity sub-line here: filling one meant walking every project tree on
+    // a timer. Disk size lives in the Management table, behind its button.
     const typeBadge = el("span", { class: "type-badge" });
-    const statusText = el("span", { class: "status-text" });
     const configBtn = el("span", {
         class: "project-config-btn",
         title: "Project settings",
@@ -6653,8 +6671,7 @@ function makeProjectRow(project) {
         ev.stopPropagation();
         openProjectConfigBox(project, configBtn);
     };
-    const statusLine = el("div", { class: "project-status-line" }, [typeBadge, statusText, configBtn]);
-    const statusMeta = el("div", { class: "project-status-meta" });
+    const statusLine = el("div", { class: "project-status-line" }, [typeBadge, configBtn]);
     // .active is stamped here so a rail rebuild (a drop, a create, a destroy)
     // keeps the "you are here" highlight — refreshProjectRail replaces the
     // whole <aside> and never re-activates. Gated on no host page being open:
@@ -6671,7 +6688,7 @@ function makeProjectRow(project) {
             if (consumeProjectDragClick()) return;
             activateProject(project.name);
         },
-    }, [head, statusLine, statusMeta]);
+    }, [head, statusLine]);
     armProjectDrag(row, project);
     return row;
 }
@@ -6764,103 +6781,28 @@ async function probeProject(project) {
     }
 }
 
-// Per-project status sub-lines — only polled while the rail is open.
-// Server reads from a RO bind-mount of PROJECTS_DIR; no per-supervisor
-// HTTP, no docker socket. See PLAN/STAGE_WEBUI_W3_status_rail.md.
-function scheduleStatusPolling() {
-    if (state.statusTimer) {
-        clearInterval(state.statusTimer);
-        state.statusTimer = null;
-    }
-    if (!state.vault || state.vault.projects.length === 0) return;
-    // "Projects list visible" differs by shell: desktop = rail pinned or
-    // expanded; mobile = the full-screen Projects view is showing (the rail
-    // flags stay untouched on mobile — driving railExpanded instead would
-    // arm the outside-click auto-collapse handlers).
-    const listVisible = mobileModeActive()
-        ? !!document.querySelector(".dashboard.mobile-projects")
-        : (state.railPinned || state.railExpanded);
-    if (!listVisible) return;
-    fetchProjectsStatus();
-    state.statusTimer = setInterval(fetchProjectsStatus, STATUS_INTERVAL_MS);
-}
-
-async function fetchProjectsStatus() {
+// Paint each rail row's workflow badge from ONE marker-only /projects/status
+// call. Runs once per rail render (initial build, every refreshProjectRail) —
+// never on a timer: the label changes only when a project is created or
+// destroyed, and both rebuild the rail. A project with no workspace on disk
+// (or a name the server rejects) keeps an empty, collapsed badge.
+async function paintProjectBadges() {
     if (!state.vault || state.vault.projects.length === 0) return;
     const names = state.vault.projects.map((p) => p.name).join(",");
+    let data;
     try {
         const res = await fetch(`/projects/status?names=${encodeURIComponent(names)}`);
         if (!res.ok) return;
-        const data = await res.json();
-        for (const [name, status] of Object.entries(data)) {
-            applyProjectStatus(name, status);
-        }
+        data = await res.json();
     } catch (_) {
-        // ignore — next tick will retry
+        return;   // the next rail render repaints
     }
-}
-
-function applyProjectStatus(name, status) {
-    const row = document.querySelector(`.project[data-name="${CSS.escape(name)}"]`);
-    if (!row) return;
-    // Write the disk/worker figures into the text span only — the sibling
-    // config gear in .project-status-line must survive every poll.
-    const line1 = row.querySelector(".project-status-line .status-text");
-    const line2 = row.querySelector(".project-status-meta");
-    const badge = row.querySelector(".project-status-line .type-badge");
-    if (!line1 || !line2) return;
-    if (status.error === "not_found") {
-        line1.textContent = "";
-        line2.textContent = "missing on disk";
-        line2.removeAttribute("title");
-        if (badge) setTypeBadge(badge, null);
-        return;
+    for (const [name, st] of Object.entries(data)) {
+        const row = document.querySelector(`.project[data-name="${CSS.escape(name)}"]`);
+        const badge = row && row.querySelector(".project-status-line .type-badge");
+        if (!badge) continue;
+        setTypeBadge(badge, st && st.error !== "not_found" ? st.workflow : null);
     }
-    if (badge) setTypeBadge(badge, status.workflow);
-    line1.textContent = formatStatusLine1(status);
-    line2.textContent = formatStatusLine2(status);
-    if (status.latest && status.latest.path) {
-        line2.title = status.latest.path;
-    } else {
-        line2.removeAttribute("title");
-    }
-}
-
-// ▶️ = workers currently running (no DONE marker yet).
-// ⏹ = workers that have stopped (DONE was touched on exit; this says
-// nothing about success vs failure — the worker entrypoint touches
-// DONE on every exit path).
-function formatStatusLine1(s) {
-    // Worker-activity figures only — disk size moved to the Management table.
-    const parts = [];
-    if ((s.workers_running || 0) > 0) parts.push(`▶️ ${s.workers_running}`);
-    if ((s.workers_done || 0) > 0) parts.push(`⏹ ${s.workers_done}`);
-    return parts.join("  ");
-}
-
-function formatStatusLine2(s) {
-    if (!s.latest) return "";
-    const ageSec = Math.max(0, Math.floor((Date.now() - s.latest.ts_ms) / 1000));
-    if (ageSec > 7 * 86400) return "idle";
-    const display = displayLatestPath(s.latest.path);
-    return display ? `${display} ${formatAgo(ageSec)}` : formatAgo(ageSec);
-}
-
-// Workspace-relative path → short, rail-friendly label. The full path is
-// preserved in the element's `title` (hover tooltip) for users who want
-// to see exactly which file the timestamp came from.
-function displayLatestPath(path) {
-    if (!path) return "";
-    let m = /^workers\/([^/]+)\/work\/(.+)$/.exec(path);
-    if (m) {
-        const basename = m[2].split("/").pop();
-        return `${m[1]} · ${basename}`;
-    }
-    m = /^workers\/([^/]+)\/?$/.exec(path);
-    if (m) return m[1];
-    m = /^logbook\/(.+)$/.exec(path);
-    if (m) return m[1];
-    return path;
 }
 
 function formatBytes(n) {
@@ -6872,18 +6814,8 @@ function formatBytes(n) {
     return v >= 10 ? `${Math.round(v)} ${units[i]}` : `${v.toFixed(1)} ${units[i]}`;
 }
 
-function formatAgo(sec) {
-    if (sec < 60) return `${sec}s`;
-    const mins = Math.floor(sec / 60);
-    if (mins < 60) return `${mins}m`;
-    const hours = Math.floor(mins / 60);
-    if (hours < 24) return `${hours}h`;
-    return `${Math.floor(hours / 24)}d`;
-}
-
 function lockVault() {
     if (state.probeTimer) { clearInterval(state.probeTimer); state.probeTimer = null; }
-    if (state.statusTimer) { clearInterval(state.statusTimer); state.statusTimer = null; }
     if (state.servicesTimer) { clearInterval(state.servicesTimer); state.servicesTimer = null; }
     for (const t of Object.values(state.terminals)) {
         try { if (t.ws) t.ws.close(); } catch (_) {}
