@@ -428,6 +428,46 @@ function rehydrateProjectUiState(row) {
     }
 }
 
+// ---- rs-fetch auto-commit tick (vault settings.fetch_auto_commit) -----------
+// The repos whose card-head auto-commit tick is ON, kept as a plain list of
+// repo NAMES beside project_ui and project_order — the third per-user (per
+// browser, in the encrypted vault) preference, and the set-level shape: one
+// boolean per repo, so "ticked" and "present in the list" are the same test.
+// Same three invariants as the rail order: the read is a tolerant NON-creating
+// probe (it runs on every card render, and a render must never touch saved
+// state); exactly ONE function assigns the list (called by the tick's change
+// handler and by the mirror-Remove prune, nowhere else); and a removed mirror
+// is pruned, so a repo mirrored again later starts unticked (the reused-name
+// rule the project map follows).
+function readFetchAutoCommit() {
+    const s = state.vault && state.vault.settings;
+    const raw = s && s.fetch_auto_commit;
+    if (!Array.isArray(raw)) return [];
+    const out = [];
+    for (const n of raw) {
+        if (typeof n === "string" && n && !out.includes(n)) out.push(n);
+    }
+    return out;
+}
+
+// The ONE writer. Persists at once (best-effort, like the destroy prune) and
+// flips every OTHER card's box for the same repo that is on screen right now:
+// a repo can be on screen twice (the Development page and a project's Fetch
+// pane), each card copies from its own box, and two visible boxes must never
+// disagree about one saved preference. JS string compare over the stamped
+// attribute, never a CSS attribute-value selector (the data-rkey precedent).
+async function setFetchAutoCommit(repo, on) {
+    const list = readFetchAutoCommit().filter((n) => n !== repo);
+    if (on) list.push(repo);
+    if (list.length) vaultSettings().fetch_auto_commit = list;
+    else delete vaultSettings().fetch_auto_commit;
+    for (const box of document.querySelectorAll(".dev-ac-check[data-ac-repo]")) {
+        if (box.getAttribute("data-ac-repo") !== repo) continue;
+        box.checked = on;
+    }
+    try { await persistVault(); } catch (e) { /* best-effort */ }
+}
+
 // ---- rail order (vault settings.project_order) ------------------------------
 // The order the operator dragged the sidebar rows into, kept as a list of
 // project NAMES beside the per-project map above — deliberately NOT a saved
@@ -2853,8 +2893,20 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
     // does not reload).
     let mirrorHead = "";
     let headSeen = false;
+    // How many rows sat ABOVE the divider when it was drawn — the set the
+    // Select-ahead button ticks, captured at DRAW time and never recomputed
+    // from the head sha: mirrorHead is re-read on every page and the divider
+    // is never redrawn, so a click-time lookup could disagree with the line
+    // on screen (or find nothing) after the mirror advances mid-session.
+    // Complete by construction: rows load newest-first, so every row above
+    // the head's is already rendered when the head's row lands.
+    let aheadCount = 0;
+    // The history was walked to its end (an empty page, or a last page) —
+    // distinguishes "head not loaded yet" from "head not in this branch".
+    let ended = false;
     const selected = new Set();          // full shas ticked in select mode
     const loadedOrder = [];              // display order (newest-first)
+    const checks = new Map();            // full sha → its row's checkbox
     // Context for the module-level review-cell renderer + watcher restarts:
     // the buttons and the terminal refresh need the locator and the landing
     // closures this expander was threaded.
@@ -2903,11 +2955,57 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
     // already-✓ commit is deliberate (the badge is visible at the checkbox).
     const selectBtn = el("button", { class: "btn-small dev-select-btn" },
                          ["Select"]);
+    // Select ahead: tick every row above the mirror-head divider — the
+    // commits the human's repo lacks — in one click. Always shown beside
+    // Select; ENABLED only once the divider has been drawn among the loaded
+    // rows with at least one row above it. Disabled, the title says which
+    // unknown state applies. Additive (the tick-all convention): ticks
+    // already present, above or below the line, stay the operator's.
+    const aheadBtn = el("button", { class: "btn-small dev-ahead-btn" },
+                        ["Select ahead"]);
     const reviewAllBtn = el("button", { class: "btn-small" }, ["Review all"]);
     const copyAllBtn = el("button", { class: "btn-small" }, ["Copy all"]);
     toolsEl.appendChild(selectBtn);
+    toolsEl.appendChild(aheadBtn);
     toolsEl.appendChild(reviewAllBtn);
     toolsEl.appendChild(copyAllBtn);
+    // The divider's own caveat, carried onto the button: the boundary assumes
+    // a linear branch history, and on a merged one it UNDER-reports — a commit
+    // below the line may not be in the mirror yet, so the button would miss
+    // it. (Over-selecting, the other direction, only arises from a mirror that
+    // advanced mid-session; it is harmless — rs-fetch skips what the repo has.)
+    const AHEAD_LINEAR = " Assumes a linear branch history: on a merged one a "
+        + "commit below the line may not be in the mirror yet — check the "
+        + "rows below.";
+    // Why the button is blocked, from the same state the boundary note reads.
+    // The DRAWN divider is tested first, like updateDiverge does: the head
+    // string is re-read per page and a later page's failed probe empties it,
+    // and an enabled button must never carry the "isn't known" title over a
+    // line that is on screen. The empty-head arm must NOT claim "no
+    // counterpart": the server reports one "" for a fork-only branch, a PR
+    // locator AND a failed probe, so the title lists the three readings
+    // rather than asserting one.
+    const aheadTitle = () => {
+        if (headSeen) {
+            if (!aheadCount) {
+                return "Nothing ahead of the mirror — the mirror's head is "
+                    + "the newest commit here.";
+            }
+            return `Tick the ${aheadCount} commit${aheadCount === 1 ? "" : "s"} `
+                + "above the mirror head — everything your repo lacks."
+                + AHEAD_LINEAR;
+        }
+        if (!mirrorHead) {
+            return "The mirror's head for this branch isn't known — a PR, a "
+                + "branch the mirror doesn't have, or a head that couldn't be "
+                + "read — so there is no boundary to select up to.";
+        }
+        return ended
+            ? "This branch doesn't contain the mirror's head, so there is "
+              + "no boundary to select up to."
+            : "The mirror's head isn't among the commits loaded so far — "
+              + "show older commits until it appears.";
+    };
     const updateTools = () => {
         selectBtn.classList.toggle("active", selecting);
         const n = selected.size;
@@ -2917,10 +3015,30 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
         copyAllBtn.style.display = selecting ? "" : "none";
         reviewAllBtn.disabled = !n;
         copyAllBtn.disabled = !n;
+        const ahead = headSeen && aheadCount > 0;
+        aheadBtn.disabled = !ahead;
+        aheadBtn.textContent = ahead ? `Select ahead (${aheadCount})`
+                                     : "Select ahead";
+        aheadBtn.title = aheadTitle();
     };
     selectBtn.onclick = () => {
         selecting = !selecting;
         panel.classList.toggle("selecting", selecting);
+        updateTools();
+    };
+    aheadBtn.onclick = () => {
+        if (!(headSeen && aheadCount > 0)) return;
+        if (!selecting) {
+            selecting = true;
+            panel.classList.add("selecting");
+        }
+        // A programmatic `checked` fires no change event, so the selection
+        // set is updated here alongside the box.
+        for (const sha of loadedOrder.slice(0, aheadCount)) {
+            selected.add(sha);
+            const check = checks.get(sha);
+            if (check) check.checked = true;
+        }
         updateTools();
     };
     const selectedOldestFirst = () =>
@@ -3020,8 +3138,12 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
             // the malformed-row guard (a null c must not reach .sha) and
             // before the row it precedes. FULL-sha compare — the row only
             // DISPLAYS the first 9 characters.
-            if (mirrorHead && c.sha === mirrorHead) {
+            // Drawn ONCE (!headSeen): the head sha is re-read per page, so a
+            // mirror that advanced between clicks must not draw a second line
+            // — the first one stays, which is the conservative posture above.
+            if (mirrorHead && !headSeen && c.sha === mirrorHead) {
                 headSeen = true;
+                aheadCount = loadedOrder.length;
                 rowsEl.appendChild(el("div", { class: "dev-commit-divider" }, [
                     el("span", { class: "dev-pr-meta" }, ["Mirror head"]),
                 ]));
@@ -3029,6 +3151,7 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
             loadedOrder.push(c.sha);
             const check = el("input", { type: "checkbox",
                                         class: "dev-commit-check" });
+            checks.set(c.sha, check);
             check.onchange = () => {
                 if (check.checked) selected.add(c.sha);
                 else selected.delete(c.sha);
@@ -3112,14 +3235,22 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
             // An empty page past the first IS the end of the history — the
             // other half of the has_more split below. On page 1 nothing is
             // loaded, so there is nothing to say about a boundary.
-            if (next > 1) updateDiverge(true);
+            if (next > 1) {
+                ended = true;
+                updateDiverge(true);
+                updateTools();
+            }
             return;
         }
         renderRows(commits, reviews);
         page = next;
         noteEl.style.display = "";
         toolsEl.style.display = "";
-        updateDiverge(!data.result.has_more);
+        ended = !data.result.has_more;
+        updateDiverge(ended);
+        // The Select-ahead gate changes with every page (the head may have
+        // just been paged in, or the walk may have ended without it).
+        updateTools();
         foot(data.result.has_more ? [moreBtn(next + 1)] : []);
     }
 
@@ -3757,27 +3888,39 @@ function buildDevRepoCard(view, body, r, attached, opts) {
     } else if (r.active) {
         forkEl = el("span", { class: "dev-repo-meta" }, [`fork: ${r.active}`]);
     }
-    // Auto-commit tick (card-level, default OFF, deliberately RESETS on every
-    // card re-render — the flag is per-session consent, never sticky). A LIVE
-    // getter consulted at click time by every copy surface on this card
-    // (per-commit copies, Copy all, the PR/branch row copies) — never baked
-    // into a button at render, so a copy can never contradict the tick.
+    // Auto-commit tick (card-level, default OFF), REMEMBERED PER REPO in the
+    // vault's settings.fetch_auto_commit list (readFetchAutoCommit /
+    // setFetchAutoCommit): it initialises from the list on every render and
+    // the change handler is the list's one writer. A LIVE getter consulted at
+    // click time by every copy surface on this card (per-commit copies, Copy
+    // all, the PR/branch row copies) — never baked into a button at render,
+    // so a copy can never contradict the tick. The box is stamped with its
+    // repo so the writer can keep a second card for the same repo (the
+    // Development page and a project's pane) showing the same state.
     const acBox = el("input", { type: "checkbox", class: "dev-ac-check" });
+    acBox.setAttribute("data-ac-repo", r.repo);
+    acBox.checked = readFetchAutoCommit().includes(r.repo);
+    acBox.onchange = () => { setFetchAutoCommit(r.repo, acBox.checked); };
     const acWrap = el("label", {
         class: "dev-ac",
         title: "Copied rs-fetch commands include --auto-commit: each fetched "
              + "commit is committed locally with the agent's original "
              + "timestamps — your identity, hooks disabled, unsigned. "
-             + "Unticked: commands stage only (the default).",
+             + "Unticked: commands stage only (the default). Remembered for "
+             + "this repo in this browser.",
     }, [acBox, "auto-commit"]);
     const autoCommit = () => acBox.checked;
-    // Hide-agent/ tick (card-level, default ON). Same ephemeral posture as
-    // the auto-commit tick above — resets to hidden on every card re-render,
-    // never persisted. Rendered only when the fork actually HAS agent/
+    // Hide-agent/ tick (card-level, default ON). Ephemeral, unlike the
+    // auto-commit tick above — it is display, not consent — so it resets to
+    // hidden on every card re-render and is never persisted. Rendered only
+    // when the fork actually HAS agent/
     // branches (no inert control otherwise); the label's count is what
     // explains an all-hidden branch list against the meta line's TOTAL.
     // Toggling repaints ONLY the branch rows (paintBranches below) — no
     // refetch, no card re-render, open PR expanders untouched.
+    // Shares the auto-commit box's class for its look, but carries NO
+    // data-ac-repo stamp — that absence is load-bearing: the auto-commit
+    // writer's cross-card flip selects on the stamp, and must never reach this.
     const hideBox = el("input", { type: "checkbox", class: "dev-ac-check" });
     hideBox.checked = true;
     const hideWrap = el("label", {
@@ -4161,7 +4304,15 @@ function devRepoRemoveDialog(view, body, repo) {
                 proof: await deriveLoginProof(pwI.value),
             }),
         }),
-        onDone: (ok) => { if (ok) renderDevFetchTab(view, body); },
+        // The prune: a repo mirrored again under this name starts with the
+        // auto-commit tick OFF (the reused-name rule the project map follows).
+        // Awaited (the op tail awaits onDone), best-effort inside, before the
+        // tab re-renders.
+        onDone: async (ok) => {
+            if (!ok) return;
+            await setFetchAutoCommit(repo, false);
+            renderDevFetchTab(view, body);
+        },
         focus: () => pwI.focus(),
     });
 }
