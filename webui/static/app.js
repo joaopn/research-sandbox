@@ -10,6 +10,10 @@
 
 const VAULT_KEY = "rs-webui-vault";
 const THEME_KEY = "rs-webui-theme";
+// Terminal palette, chosen apart from the interface theme. Absent = follow
+// the interface theme's own terminal palette (the default, and the only
+// behavior before the split).
+const TERM_THEME_KEY = "rs-webui-term-theme";
 const IFRAME_ZOOM_KEY = "rs-webui-iframe-zoom";
 const IFRAME_ZOOMS = [0.7, 0.8, 0.9, 1.0, 1.1, 1.2];
 const IFRAME_ZOOM_DEFAULT = 0.9;
@@ -121,7 +125,7 @@ const THEMES = {
             "--btn-danger-bg": "#7c3a3a", "--btn-danger-bg-hover": "#8c4a4a",
             "--error-fg": "#e88",
             "--status-up": "#6c6", "--status-down": "#555", "--status-error": "#e66",
-            "--terminal-bg": "#000", "--terminal-fg": "#e0e0e0",
+            "--pane-bg": "#000",
         },
     },
     light: {
@@ -147,7 +151,7 @@ const THEMES = {
             "--btn-danger-bg": "#b03a3a", "--btn-danger-bg-hover": "#c04a4a",
             "--error-fg": "#a33",
             "--status-up": "#3a8a3a", "--status-down": "#aaa", "--status-error": "#c04040",
-            "--terminal-bg": "#ffffff", "--terminal-fg": "#2a2a2a",
+            "--pane-bg": "#ffffff",
         },
     },
     "solarized-dark": {
@@ -173,7 +177,7 @@ const THEMES = {
             "--btn-danger-bg": "#dc322f", "--btn-danger-bg-hover": "#ec4240",
             "--error-fg": "#dc322f",
             "--status-up": "#859900", "--status-down": "#586e75", "--status-error": "#dc322f",
-            "--terminal-bg": "#002b36", "--terminal-fg": "#839496",
+            "--pane-bg": "#002b36",
         },
     },
     dracula: {
@@ -199,7 +203,7 @@ const THEMES = {
             "--btn-danger-bg": "#ff5555", "--btn-danger-bg-hover": "#ff6e6e",
             "--error-fg": "#ff5555",
             "--status-up": "#50fa7b", "--status-down": "#6272a4", "--status-error": "#ff5555",
-            "--terminal-bg": "#282a36", "--terminal-fg": "#f8f8f2",
+            "--pane-bg": "#282a36",
         },
     },
     nord: {
@@ -225,32 +229,182 @@ const THEMES = {
             "--btn-danger-bg": "#bf616a", "--btn-danger-bg-hover": "#cf717a",
             "--error-fg": "#bf616a",
             "--status-up": "#a3be8c", "--status-down": "#4c566a", "--status-error": "#bf616a",
-            "--terminal-bg": "#2e3440", "--terminal-fg": "#d8dee9",
+            "--pane-bg": "#2e3440",
         },
     },
 };
 
 const DEFAULT_THEME = "nord";
 
+// Terminal-only palettes (Settings → Terminal theme). The interface themes'
+// own palettes are REFERENCED, never copied, so "Same as interface theme"
+// and naming that same theme explicitly can never drift apart. `tone` only
+// groups the dropdown. The added palettes follow each project's published
+// terminal colors; Monokai Dimmed is the terminal panel of the default editor
+// theme (code-server-settings.json) — the bundled theme gives its ANSI
+// colors but no terminal foreground, cursor or selection, so those are
+// code-server's own fallbacks (foreground/cursor #cccccc, selection = the
+// editor selection #676b7180), and its ANSI black equals its background
+// exactly as it does in the editor.
+const TERM_THEMES = {
+    dark: { label: "Dark", tone: "dark", xterm: THEMES.dark.xterm },
+    "solarized-dark": { label: "Solarized Dark", tone: "dark", xterm: THEMES["solarized-dark"].xterm },
+    dracula: { label: "Dracula", tone: "dark", xterm: THEMES.dracula.xterm },
+    nord: { label: "Nord", tone: "dark", xterm: THEMES.nord.xterm },
+    "gruvbox-dark": {
+        label: "Gruvbox Dark", tone: "dark",
+        xterm: {
+            background: "#282828", foreground: "#ebdbb2",
+            cursor: "#ebdbb2", cursorAccent: "#282828",
+            selectionBackground: "rgba(146,131,116,0.4)",
+            black: "#282828", red: "#cc241d", green: "#98971a", yellow: "#d79921",
+            blue: "#458588", magenta: "#b16286", cyan: "#689d6a", white: "#a89984",
+            brightBlack: "#928374", brightRed: "#fb4934", brightGreen: "#b8bb26",
+            brightYellow: "#fabd2f", brightBlue: "#83a598", brightMagenta: "#d3869b",
+            brightCyan: "#8ec07c", brightWhite: "#ebdbb2",
+        },
+    },
+    "one-dark": {
+        label: "One Dark", tone: "dark",
+        xterm: {
+            background: "#282c34", foreground: "#abb2bf",
+            cursor: "#528bff", cursorAccent: "#282c34",
+            selectionBackground: "rgba(103,118,150,0.4)",
+            black: "#3f4451", red: "#e05561", green: "#8cc265", yellow: "#d18f52",
+            blue: "#4aa5f0", magenta: "#c162de", cyan: "#42b3c2", white: "#e6e6e6",
+            brightBlack: "#4f5666", brightRed: "#ff616e", brightGreen: "#a5e075",
+            brightYellow: "#f0a45d", brightBlue: "#4dc4ff", brightMagenta: "#de73ff",
+            brightCyan: "#4cd1e0", brightWhite: "#ffffff",
+        },
+    },
+    "tokyo-night": {
+        label: "Tokyo Night", tone: "dark",
+        xterm: {
+            background: "#1a1b26", foreground: "#c0caf5",
+            cursor: "#c0caf5", cursorAccent: "#1a1b26",
+            selectionBackground: "#283457",
+            black: "#15161e", red: "#f7768e", green: "#9ece6a", yellow: "#e0af68",
+            blue: "#7aa2f7", magenta: "#bb9af7", cyan: "#7dcfff", white: "#a9b1d6",
+            brightBlack: "#414868", brightRed: "#f7768e", brightGreen: "#9ece6a",
+            brightYellow: "#e0af68", brightBlue: "#7aa2f7", brightMagenta: "#bb9af7",
+            brightCyan: "#7dcfff", brightWhite: "#c0caf5",
+        },
+    },
+    "catppuccin-mocha": {
+        label: "Catppuccin Mocha", tone: "dark",
+        xterm: {
+            background: "#1e1e2e", foreground: "#cdd6f4",
+            cursor: "#f5e0dc", cursorAccent: "#1e1e2e",
+            selectionBackground: "rgba(88,91,112,0.6)",
+            black: "#45475a", red: "#f38ba8", green: "#a6e3a1", yellow: "#f9e2af",
+            blue: "#89b4fa", magenta: "#f5c2e7", cyan: "#94e2d5", white: "#bac2de",
+            brightBlack: "#585b70", brightRed: "#f38ba8", brightGreen: "#a6e3a1",
+            brightYellow: "#f9e2af", brightBlue: "#89b4fa", brightMagenta: "#f5c2e7",
+            brightCyan: "#94e2d5", brightWhite: "#a6adc8",
+        },
+    },
+    "monokai-dimmed": {
+        label: "Monokai Dimmed", tone: "dark",
+        xterm: {
+            background: "#1e1e1e", foreground: "#cccccc",
+            cursor: "#cccccc", cursorAccent: "#1e1e1e",
+            selectionBackground: "#676b7180",
+            black: "#1e1e1e", red: "#c4265e", green: "#86b42b", yellow: "#b3b42b",
+            blue: "#6a7ec8", magenta: "#8c6bc8", cyan: "#56adbc", white: "#e3e3dd",
+            brightBlack: "#666666", brightRed: "#f92672", brightGreen: "#a6e22e",
+            brightYellow: "#e2e22e", brightBlue: "#819aff", brightMagenta: "#ae81ff",
+            brightCyan: "#66d9ef", brightWhite: "#f8f8f2",
+        },
+    },
+    light: { label: "Light", tone: "light", xterm: THEMES.light.xterm },
+    "solarized-light": {
+        label: "Solarized Light", tone: "light",
+        xterm: {
+            background: "#fdf6e3", foreground: "#657b83",
+            cursor: "#586e75", cursorAccent: "#fdf6e3",
+            selectionBackground: "rgba(7,54,66,0.15)",
+            black: "#073642", red: "#dc322f", green: "#859900", yellow: "#b58900",
+            blue: "#268bd2", magenta: "#d33682", cyan: "#2aa198", white: "#eee8d5",
+            brightBlack: "#002b36", brightRed: "#cb4b16", brightGreen: "#586e75",
+            brightYellow: "#657b83", brightBlue: "#839496", brightMagenta: "#6c71c4",
+            brightCyan: "#93a1a1", brightWhite: "#fdf6e3",
+        },
+    },
+    "catppuccin-latte": {
+        label: "Catppuccin Latte", tone: "light",
+        xterm: {
+            background: "#eff1f5", foreground: "#4c4f69",
+            cursor: "#dc8a78", cursorAccent: "#eff1f5",
+            selectionBackground: "rgba(172,176,190,0.6)",
+            black: "#5c5f77", red: "#d20f39", green: "#40a02b", yellow: "#df8e1d",
+            blue: "#1e66f5", magenta: "#ea76cb", cyan: "#179299", white: "#acb0be",
+            brightBlack: "#6c6f85", brightRed: "#d20f39", brightGreen: "#40a02b",
+            brightYellow: "#df8e1d", brightBlue: "#1e66f5", brightMagenta: "#ea76cb",
+            brightCyan: "#179299", brightWhite: "#bcc0cc",
+        },
+    },
+    "github-light": {
+        label: "GitHub Light", tone: "light",
+        xterm: {
+            background: "#ffffff", foreground: "#1f2328",
+            cursor: "#0969da", cursorAccent: "#ffffff",
+            selectionBackground: "rgba(9,105,218,0.2)",
+            black: "#24292f", red: "#cf222e", green: "#116329", yellow: "#4d2d00",
+            blue: "#0969da", magenta: "#8250df", cyan: "#1b7c83", white: "#6e7781",
+            brightBlack: "#57606a", brightRed: "#a40e26", brightGreen: "#1a7f37",
+            brightYellow: "#633c01", brightBlue: "#218bff", brightMagenta: "#a475f9",
+            brightCyan: "#3192aa", brightWhite: "#8c959f",
+        },
+    },
+};
+
 function loadStoredTheme() {
     const id = localStorage.getItem(THEME_KEY);
     return THEMES[id] ? id : DEFAULT_THEME;
 }
 
+// null = follow the interface theme (the stored key is absent).
+function loadStoredTermTheme() {
+    const id = localStorage.getItem(TERM_THEME_KEY);
+    return TERM_THEMES[id] ? id : null;
+}
+
 function applyTheme(id) {
-    const theme = THEMES[id] || THEMES[DEFAULT_THEME];
-    for (const [k, v] of Object.entries(theme.css)) {
+    // Unknown ids resolve to the default here, not at the reader: the
+    // terminal repaint below reads state.theme back through
+    // currentXtermTheme().
+    const valid = THEMES[id] ? id : DEFAULT_THEME;
+    for (const [k, v] of Object.entries(THEMES[valid].css)) {
         document.documentElement.style.setProperty(k, v);
     }
-    for (const t of Object.values(state.terminals)) {
-        if (t.term) t.term.options.theme = theme.xterm;
-    }
-    state.theme = id;
-    localStorage.setItem(THEME_KEY, id);
+    state.theme = valid;
+    localStorage.setItem(THEME_KEY, valid);
+    repaintTerminals();
+}
+
+function applyTermTheme(id) {
+    state.termTheme = TERM_THEMES[id] ? id : null;
+    if (state.termTheme) localStorage.setItem(TERM_THEME_KEY, state.termTheme);
+    else localStorage.removeItem(TERM_THEME_KEY);
+    repaintTerminals();
 }
 
 function currentXtermTheme() {
-    return THEMES[state.theme || DEFAULT_THEME].xterm;
+    const pinned = state.termTheme && TERM_THEMES[state.termTheme];
+    return pinned ? pinned.xterm : THEMES[state.theme || DEFAULT_THEME].xterm;
+}
+
+// Live recolor of every open terminal, plus the --xterm-bg var that paints
+// each ssh pane's own frame (style.css .ssh-instance) so the pad's inset and
+// row-rounding strip match the palette rather than the interface. Colors
+// never touch cell metrics, so this is safe on hidden panes (unlike font
+// size — see syncTermFontSize).
+function repaintTerminals() {
+    const x = currentXtermTheme();
+    document.documentElement.style.setProperty("--xterm-bg", x.background);
+    for (const t of Object.values(state.terminals)) {
+        if (t.term) t.term.options.theme = x;
+    }
 }
 
 const state = {
@@ -272,6 +426,7 @@ const state = {
     probeTimer: null,
     servicesTimer: null,
     theme: null,
+    termTheme: null,         // persisted: TERM_THEMES id, or null = follow the interface theme
     railPinned: false,       // persisted: keep rail in flex flow (push layout)
     railExpanded: false,     // in-memory: rail visible (overlay when unpinned)
     railWidth: RAIL_WIDTH_DEFAULT,  // persisted: rail width in px
@@ -1432,7 +1587,8 @@ function leaveHostView() {
     }
 }
 
-// Settings page: the local UI settings (theme + editor-zoom, client-side) plus
+// Settings page: the local UI settings (interface + terminal theme, layout,
+// editor zoom, CLI width + font size — all client-side) plus
 // the broker-gated Software section (dists / image fleet / pins + build lane),
 // folded in here rather than a separate rail entry. The software section renders
 // into its OWN sub-container so its self-contained fetch+gate+build machinery
@@ -1443,8 +1599,12 @@ function renderSettingsInto(view) {
     view.appendChild(el("div", { class: "settings-screen" }, [
         el("h2", { class: "workflows-title" }, ["Settings"]),
         el("div", { class: "field" }, [
-            el("label", {}, ["Theme"]),
+            el("label", {}, ["Interface theme"]),
             makeThemeSelector(),
+        ]),
+        el("div", { class: "field" }, [
+            el("label", {}, ["Terminal theme"]),
+            makeTermThemeSelector(),
         ]),
         el("div", { class: "field" }, [
             el("label", {}, ["Layout"]),
@@ -7202,7 +7362,7 @@ function makeTermFontSizeSelector() {
 function makeThemeSelector() {
     const sel = document.createElement("select");
     sel.className = "theme-select";
-    sel.title = "Theme";
+    sel.title = "Interface theme";
     for (const [id, t] of Object.entries(THEMES)) {
         const opt = document.createElement("option");
         opt.value = id;
@@ -7211,6 +7371,34 @@ function makeThemeSelector() {
         sel.appendChild(opt);
     }
     sel.onchange = () => applyTheme(sel.value);
+    return sel;
+}
+
+// Terminal theme (Settings): "" = follow the interface theme; the named
+// palettes sit in dark/light optgroups. Applies live to open terminals.
+function makeTermThemeSelector() {
+    const sel = document.createElement("select");
+    sel.className = "theme-select";
+    sel.title = "Terminal theme (CLI tabs only)";
+    const follow = document.createElement("option");
+    follow.value = "";
+    follow.textContent = "Same as interface theme";
+    if (!state.termTheme) follow.selected = true;
+    sel.appendChild(follow);
+    for (const [tone, label] of [["dark", "Dark palettes"], ["light", "Light palettes"]]) {
+        const group = document.createElement("optgroup");
+        group.label = label;
+        for (const [id, t] of Object.entries(TERM_THEMES)) {
+            if (t.tone !== tone) continue;
+            const opt = document.createElement("option");
+            opt.value = id;
+            opt.textContent = t.label;
+            if (id === state.termTheme) opt.selected = true;
+            group.appendChild(opt);
+        }
+        sel.appendChild(group);
+    }
+    sel.onchange = () => applyTermTheme(sel.value || null);
     return sel;
 }
 
@@ -9285,7 +9473,7 @@ function installTouchScroll(term) {
 }
 
 function openSshTerminal(project, serviceId, svc) {
-    const container = el("div", { class: "terminal-instance" });
+    const container = el("div", { class: "terminal-instance ssh-instance" });
     // Inset wrapper: gives the visual breathing room WITHOUT putting
     // padding on the element xterm-fit measures. See style.css comment
     // on .terminal-pad for the fit-addon quirk this works around.
@@ -9659,6 +9847,8 @@ async function handleControl(project, serviceId, term, ws, ctrl) {
 // ---- bootstrap -------------------------------------------------------------
 
 window.addEventListener("DOMContentLoaded", () => {
+    // Terminal choice first: applyTheme's repaint reads it.
+    state.termTheme = loadStoredTermTheme();
     applyTheme(loadStoredTheme());
     state.railPinned = loadRailPinned();
     state.railExpanded = state.railPinned;

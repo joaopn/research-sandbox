@@ -20,8 +20,12 @@
     --status-up: #6c6;
     --status-down: #555;
     --status-error: #e66;
-    --terminal-bg: #000;
-    --terminal-fg: #e0e0e0;
+    /* Pane-area background (behind every pane, the welcome text and an
+       editor iframe while it loads) is the INTERFACE theme's; an ssh pane's
+       own frame takes the TERMINAL palette's background (--xterm-bg, written
+       by app.js repaintTerminals), since the two themes are chosen apart. */
+    --pane-bg: #000;
+    --xterm-bg: #000;
     /* project-type badge borders: dark green = research, cyan = sandbox
        (the text stays a normal fg colour; only the border carries the type) */
     --type-research-border: #2e7d32;
@@ -530,7 +534,7 @@ body {
 .terminal-area {
     flex: 1;
     position: relative;
-    background: var(--terminal-bg);
+    background: var(--pane-bg);
     overflow: hidden;
 }
 .terminal-instance {
@@ -544,7 +548,7 @@ body {
       and draws its last row outside the visible area, eating byobu.
    2. xterm sizes its element to exactly rows × cellHeight, always ≤
       available height; the row-rounding remainder would otherwise leave
-      empty terminal-bg below byobu, "comically hanging in mid air."
+      empty frame below byobu, "comically hanging in mid air."
    Solution: this inset wrapper has no padding (xterm-fit sees a clean
    rectangle), uses flex column with justify-content: flex-end so the
    row-rounding remainder is absorbed at the top, and uses a small bottom
@@ -603,6 +607,11 @@ body {
     display: none;                /* xterm 6 overlay scrollbar */
 }
 .terminal-instance.hidden { display: none; }
+/* An ssh pane paints its own frame in the terminal palette: the pad's inset,
+   the row-rounding strip above the prompt and the CLI-width gutters all show
+   this, so a terminal themed apart from the interface sits in a frame of its
+   own color rather than a band of the interface's. */
+.terminal-instance.ssh-instance { background: var(--xterm-bg); }
 
 /* Column layout engine (flat host). All tabs live in the ONE top strip:
    every column's tabs sit in an absolutely-positioned, WIDTH-CAPPED wrapper
@@ -761,7 +770,7 @@ body {
     width: calc(100% / var(--iframe-zoom, 1));
     height: calc(100% / var(--iframe-zoom, 1));
     border: 0;
-    background: var(--terminal-bg);
+    background: var(--pane-bg);
     transform: scale(var(--iframe-zoom, 1));
     transform-origin: top left;
 }
