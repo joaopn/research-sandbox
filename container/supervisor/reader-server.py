@@ -149,7 +149,8 @@ log = logging.getLogger("reader")
 # What carries the containment is the dot rule, and it carries it alone: every
 # credential-bearing path any flavor writes into a workspace is dot-leading —
 # .claude/.credentials.json (supervisor + each worker), the rebuild stashes
-# (.creds-stash, .creds-stash-home.json, .ssh-stash, .gitconfig-stash),
+# (.creds-stash, .creds-stash-home.json, .creds-stash-pi, .ssh-stash,
+# .gitconfig-stash),
 # .role-mcps/<role>/.creds/, the .orchestrator control plane, a box's staged
 # .claude/, and a clone's .git. Box secrets and the dev consumer's git credentials
 # live in $HOME, outside the mount entirely. Since the test below runs on the

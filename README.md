@@ -101,7 +101,7 @@ That's the **research** workflow. Leaner ones exist too — disposable docker-in
 |---|---|---|
 | **`research`** (default) | dind-sysbox | The full lab: a supervisor agent + headless analysis workers + service role-MCPs. |
 | **`sandbox-dind`** | dind-sysbox | An agent box **with inner Docker**: spin isolated, disposable **boxes** via the webui or the in-box `rs-sandbox` CLI. |
-| **`sandbox`** | docker (runc) | A **single confined container** — ssh + byobu + editor, no inner docker. Add an agent with `--agent claude`. |
+| **`sandbox`** | docker (runc) | A **single confined container** — ssh + byobu + editor, no inner docker. Add agents with `--agent claude` and/or `--agent pi`. |
 | **store** workflows | docker / dind | Curated public GitHub repos, **cloned into a box at create with the editor + claude on** — a ready-to-explore environment. |
 
 The shipped store workflows (`research workflow list`):
@@ -225,7 +225,7 @@ On any DIND project (`research` / `sandbox-dind`) you can spin **boxes** — iso
 | **`data-wrangler`** | the base, oriented for data work |
 | **`byo`** | bring your own — clone a repo / run a setup snippet at boot |
 
-Per-box toggles: `--agent claude` (or none), `--editor`, `--mcps <subset of the project allowlist>`, and `--repo/--ref/--setup` for the `byo` preset. Boxes boot un-authed and reach an LLM / pip / apt through the project's locked egress — the containment is router + no-creds + container isolation.
+Per-box toggles: `--agent claude|pi` (or none — an agent-bearing box receives every agent the project carries), `--editor`, `--mcps <subset of the project allowlist>`, and `--repo/--ref/--setup` for the `byo` preset. Boxes boot un-authed and reach an LLM / pip / apt through the project's locked egress — the containment is router + no-creds + container isolation.
 
 ## ◾ Security model
 

@@ -3824,6 +3824,14 @@ VERSIONS_LOCAL_FILE = SCRIPT_DIR / "versions.local.env"
 # _AGENT_INSTALL from inside VERSION_SOURCES instead would be a module-load
 # NameError — i.e. the whole CLI dead at import.
 _OPEN_VSX_CLAUDE_EXT_API = "https://open-vsx.org/api/Anthropic/claude-code/linux-x64"
+# The second agent, pi (STAGE_PI_AGENT): an npm package. Its upstream "latest" is
+# the registry's per-package `/latest` manifest (a JSON object whose top-level
+# `version` is the dist-tag — the same value `images outdated`'s `npm` kind reads
+# from the full package document's dist-tags). The MCP adapter it vendors is a
+# second npm package. One home each; pytest-pinned.
+_PI_NPM_PACKAGE = "@earendil-works/pi-coding-agent"
+_PI_LATEST_URL = "https://registry.npmjs.org/@earendil-works%2Fpi-coding-agent/latest"
+_PI_MCP_ADAPTER_PACKAGE = "pi-mcp-adapter"
 # Claude Code's upstream version-resolve endpoint (verified against its
 # bootstrap.sh: the installer curls this to turn "latest" into a concrete
 # version; the body is a bare semver string). Read by VERSION_SOURCES and
@@ -3911,6 +3919,10 @@ VERSION_SOURCES: dict[str, dict[str, str]] = {
     # upstream answers a bare-semver text body (`text` kind); a row whose
     # upstream is a JSON document names its key on the row (`latest_json_key`).
     "CLAUDE_CODE_VERSION": {"kind": "text", "url": _CLAUDE_LATEST_URL},
+    # pi (npm): the CLI pin `agent refresh --agent pi` moves, and the vendored MCP
+    # adapter's pin, moved by hand (reported here so a stale vendored copy shows).
+    "PI_CODING_AGENT_VERSION": {"kind": "npm", "pkg": _PI_NPM_PACKAGE},
+    "PI_MCP_ADAPTER_VERSION": {"kind": "npm", "pkg": _PI_MCP_ADAPTER_PACKAGE},
 }
 
 # Per-supervisor service registry. KNOWN_SERVICES lists every kind the webui
@@ -4866,6 +4878,82 @@ _AGENT_INSTALL = {
             "file": "anthropic.claude-code.vsix",
         },
     },
+    # pi (STAGE_PI_AGENT): a node program (`npm install -g`, node ≥ 22.19) with no
+    # self-contained binary, so the dist is SELF-CONTAINED by construction: a
+    # PRIVATE node runtime (the node seed's tarball at NODE_VERSION — kept OUT of
+    # ~/.local/bin so it never collides with the seed a box may carry) under
+    # share/pi-agent/node, the npm-installed package under share/pi-agent/pi, pi's
+    # agent dir RELOCATED to share/pi-agent/agent (settings, the vendored
+    # pi-mcp-adapter package, and at runtime the PI's auth.json + sessions) and
+    # an RS launcher script at bin/pi that resolves node from its own directory
+    # and exports pi's four env defaults when unset — so a copy runs from ANY
+    # home with an EMPTY environment (measured: uid 1001, `env -i`). No symlink
+    # launcher (`launcher_symlink` False); no companion editor extension (none
+    # exists). `extra_pins` are extra `.format` keys for the recipe, resolved
+    # through load_versions() at build (an unset one dies) and recorded in the
+    # sidecar, so software_status can tell a stale vendored adapter / node from a
+    # current one. `files` are written by _agent_build_dist AFTER the capture
+    # (JSON carries braces, so it is never part of the formatted recipe);
+    # `built_check` paths are relative to the CAPTURED ~/.local and gate the
+    # cache write (a dist whose adapter install silently failed is never cached).
+    # The recipe is `.format`-ed: its only braces are the format keys and the
+    # doubled `${{0%/*}}` of the launcher (no external `dirname` — a PATH that
+    # carries only ~/.local/bin, or none at all, must still resolve the tree;
+    # `cd`, `pwd -P` and parameter expansion are shell builtins).
+    "pi": {
+        "version_key": "PI_CODING_AGENT_VERSION",
+        "extra_pins": {"adapter_ver": "PI_MCP_ADAPTER_VERSION", "node_ver": "NODE_VERSION"},
+        "install": (
+            "mkdir -p ~/.local/bin ~/.local/share/pi-agent/node ~/.local/share/pi-agent/pi"
+            " ~/.local/share/pi-agent/agent/extensions"
+            " && curl -fsSL --max-time 300"
+            " https://nodejs.org/dist/v{node_ver}/node-v{node_ver}-linux-x64.tar.gz"
+            " | tar -xz --strip-components=1 -C ~/.local/share/pi-agent/node"
+            " --exclude=CHANGELOG.md --exclude=LICENSE --exclude=README.md"
+            " && export PATH=~/.local/share/pi-agent/node/bin:$PATH"
+            " && npm install -g --ignore-scripts --prefix ~/.local/share/pi-agent/pi"
+            " --no-fund --no-audit --loglevel=error"
+            f" {_PI_NPM_PACKAGE}@{{ver}}"
+            " && PI_CODING_AGENT_DIR=~/.local/share/pi-agent/agent PI_SKIP_VERSION_CHECK=1"
+            " PI_TELEMETRY=0 ~/.local/share/pi-agent/pi/bin/pi install"
+            f" npm:{_PI_MCP_ADAPTER_PACKAGE}@{{adapter_ver}} </dev/null"
+            " && printf '%s\\n'"
+            " '#!/bin/sh'"
+            " '# RS launcher for pi: resolves the private node + the bundled cli.js'"
+            " '# from its own directory and supplies the env defaults when unset,'"
+            " '# so an absolute-path call from any home and any environment works.'"
+            " 'd=$(cd \"${{0%/*}}/..\" && pwd -P)'"
+            " '[ -n \"$PI_CODING_AGENT_DIR\" ] || export PI_CODING_AGENT_DIR=\"$d/share/pi-agent/agent\"'"
+            " '[ -n \"$PI_OFFLINE\" ] || export PI_OFFLINE=1'"
+            " '[ -n \"$PI_SKIP_VERSION_CHECK\" ] || export PI_SKIP_VERSION_CHECK=1'"
+            " '[ -n \"$PI_TELEMETRY\" ] || export PI_TELEMETRY=0'"
+            " 'exec \"$d/share/pi-agent/node/bin/node\" \"$d/share/pi-agent/pi/lib/node_modules/"
+            "@earendil-works/pi-coding-agent/dist/bundle/cli.js\" \"$@\"'"
+            " > ~/.local/bin/pi && chmod 755 ~/.local/bin/pi"
+            # The trim: build-time tools (npm, corepack, node headers, docs) and the
+            # 25 foreign esbuild platform binaries (284 MB) — 727 MB → ~370 MB.
+            " && rm -rf ~/.local/share/pi-agent/node/include ~/.local/share/pi-agent/node/share/doc"
+            " ~/.local/share/pi-agent/node/share/man ~/.local/share/pi-agent/node/lib/node_modules/npm"
+            " ~/.local/share/pi-agent/node/lib/node_modules/corepack ~/.local/share/pi-agent/node/bin/npm"
+            " ~/.local/share/pi-agent/node/bin/npx ~/.local/share/pi-agent/node/bin/corepack"
+            " && for d in ~/.local/share/pi-agent/pi/lib/node_modules/@earendil-works/"
+            "pi-coding-agent/node_modules/@esbuild/*; do case \"$d\" in */linux-x64) ;;"
+            " *) rm -rf \"$d\";; esac; done"
+        ),
+        "bin": "pi",
+        "launcher_symlink": False,
+        "latest_url": _PI_LATEST_URL,
+        "latest_json_key": "version",
+        "config": None,
+        "files": [
+            {"path": "local/share/pi-agent/agent/settings.json", "content": None},  # → _pi_settings_json (bound below)
+            {"path": "local/share/pi-agent/agent/mcp.json", "content": None},       # → _PI_MCP_JSON (bound below)
+        ],
+        "built_check": [
+            f"share/pi-agent/agent/npm/node_modules/{_PI_MCP_ADAPTER_PACKAGE}/package.json",
+            "share/pi-agent/node/bin/node",
+        ],
+    },
 }
 KNOWN_AGENTS = tuple(_AGENT_INSTALL)   # the --agent enum
 
@@ -4876,6 +4964,11 @@ KNOWN_AGENTS = tuple(_AGENT_INSTALL)   # the --agent enum
 # this point of the module (a derivation above it is a module-load NameError).
 _BOX_AGENTS = frozenset(KNOWN_AGENTS) | {"none"}
 
+# pi's RELOCATED agent dir (STAGE_PI_AGENT): settings + the vendored adapter ride
+# the dist under it, the PI's auth.json + sessions live beside them at runtime,
+# and the creds stash carries the whole dir across a recreate.
+PI_AGENT_DIR_REL = ".local/share/pi-agent/agent"
+
 
 def _agent_env(agent: str, home: str) -> list[tuple[str, str]]:
     """The (name, value) env pairs that wire ONE deployed agent's config for a
@@ -4883,9 +4976,14 @@ def _agent_env(agent: str, home: str) -> list[tuple[str, str]]:
     inject and config must ride env — keyed by the container user's home
     (`/home/research` for supervisors + the docker box, `/home/worker` for
     boxes). claude needs none: it reads ~/.claude/settings.json, which the deploy
-    sites install from the dist. An agent that needs any adds its arm here.
-    MIRRORED by rs_sandbox._AGENT_BOX_ENV for boxes (staged standalone; pytest-
-    pinned equal after home substitution)."""
+    sites install from the dist. pi: the relocated agent dir + the three offline
+    switches — the SAME four defaults its launcher exports when unset, emitted
+    here so the container's record (`docker inspect`) states the posture and an
+    operator override is possible. MIRRORED by rs_sandbox._AGENT_BOX_ENV for
+    boxes (staged standalone; pytest-pinned equal after home substitution)."""
+    if agent == "pi":
+        return [("PI_CODING_AGENT_DIR", f"{home}/{PI_AGENT_DIR_REL}"),
+                ("PI_OFFLINE", "1"), ("PI_SKIP_VERSION_CHECK", "1"), ("PI_TELEMETRY", "0")]
     return []
 
 
@@ -4960,6 +5058,33 @@ _AGENT_SETTINGS_JSON = json.dumps(
      "remoteControlAtStartup": False},
     indent=2) + "\n"
 _AGENT_INSTALL["claude"]["config"]["content"] = _AGENT_SETTINGS_JSON
+
+
+def _pi_settings_json(pins: dict) -> str:
+    """pi's canonical global settings (STAGE_PI_AGENT), a function of the resolved
+    extra pins because the vendored adapter is named at its exact version: the
+    `packages` entry MUST match what `pi install npm:pi-mcp-adapter@<ver>` recorded
+    at build (pi resolves it from the agent dir's npm/ tree offline — measured).
+    `defaultProjectTrust: always` — the container is the boundary, and a headless
+    run must never stall on (or silently skip project resources for) a trust
+    prompt; telemetry off (the version check + offline mode are env, exported by
+    the launcher); dark theme like claude's."""
+    return json.dumps(
+        {"defaultProjectTrust": "always",
+         "enableInstallTelemetry": False,
+         "theme": "dark",
+         "packages": [f"npm:{_PI_MCP_ADAPTER_PACKAGE}@{pins['adapter_ver']}"]},
+        indent=2) + "\n"
+
+
+# pi-mcp-adapter's global defaults (`<agentdir>/mcp.json`, the Pi-owned override
+# file the adapter reads beneath a project's .mcp.json): every MCP tool registered
+# by name (`<server>_<tool>`), as claude registers them, instead of only the
+# adapter's proxy tool. Measured against a box-shaped `.mcp.json` entry
+# (`"type": "http"`, `${VAR}` headers): applies, interpolates.
+_PI_MCP_JSON = json.dumps({"settings": {"directTools": True}}, indent=2) + "\n"
+_AGENT_INSTALL["pi"]["files"][0]["content"] = _pi_settings_json
+_AGENT_INSTALL["pi"]["files"][1]["content"] = _PI_MCP_JSON
 
 
 # ---------------------------------------------------------------------------
@@ -5141,6 +5266,18 @@ def _agent_build_dist(agent: str, version: str) -> None:
     # (wired-but-absent is the worst failure shape); charset-guard before the URL
     # interpolation reaches an in-container shell (same defense as the CLI version).
     ext = spec.get("ext")
+    # Extra pins (pi): more versions the recipe interpolates — the vendored MCP
+    # adapter, the private node. Resolved like the ext pin: effective (merged)
+    # value, die on an unset one (a dist with an unversioned component is the
+    # wired-but-wrong shape), charset-guarded before the shell sees it.
+    extras: dict[str, str] = {}
+    for key, pin in (spec.get("extra_pins") or {}).items():
+        val = load_versions().get(pin)
+        if not val:
+            die(f"agent {agent!r} needs the pin {pin} ({key}) but it is unset in versions.env")
+        if not _AGENT_VERSION_RE.match(val):
+            die(f"refusing to build {agent!r} with suspicious {pin}={val!r}")
+        extras[key] = val
     ext_dl = ""
     if ext:
         ext_ver = load_versions().get(ext["version_key"])
@@ -5165,7 +5302,7 @@ def _agent_build_dist(agent: str, version: str) -> None:
         # resolves. Root container: su to research for the install, then chown the
         # captured tree to the operator (so a non-1000 host owns its cache).
         inner = ("set -e; set -o pipefail; "
-                 + spec["install"].format(ver=version)
+                 + spec["install"].format(ver=version, **extras)
                  + f" && test -x ~/.local/bin/{bin_}"
                  + ext_dl                       # tuck the .vsix into ~/.local BEFORE the capture
                  + " && cp -a ~/.local /out/.local")
@@ -5179,9 +5316,14 @@ def _agent_build_dist(agent: str, version: str) -> None:
         for _ in range(_AGENT_BUILD_ATTEMPTS):
             r = run(["docker", "run", "--rm", "-v", f"{tmp}:/out",
                      MINIMAL_BASE_IMAGE, "sh", "-lc", script], capture_output=True)
+            # `built_check` paths are relative to the CAPTURED ~/.local and are
+            # tested HERE, before the tree moves under dest/local — a dist whose
+            # vendored component silently failed to install is never cached.
             if (r.returncode == 0 and os.path.lexists(captured / "bin" / bin_)
                     and (not ext
-                         or (captured / AGENT_EXT_SUBDIR / ext["file"]).is_file())):
+                         or (captured / AGENT_EXT_SUBDIR / ext["file"]).is_file())
+                    and all((captured / rel).is_file()
+                            for rel in (spec.get("built_check") or []))):
                 built = True
                 break
             last_err = ((r.stderr or "") + (r.stdout or "")).strip()
@@ -5207,6 +5349,16 @@ def _agent_build_dist(agent: str, version: str) -> None:
             cfg_path = dest / config["path"]
             cfg_path.parent.mkdir(parents=True, exist_ok=True)
             cfg_path.write_text(config["content"])
+        # Further canonical files (pi): written post-capture so JSON braces never
+        # meet the `.format`-ed recipe; `content` may be a callable of the
+        # resolved extra pins (the adapter's exact version is named inside).
+        for f in spec.get("files") or []:
+            fpath = dest / f["path"]
+            fpath.parent.mkdir(parents=True, exist_ok=True)
+            content = f["content"]
+            fpath.write_text(content(extras) if callable(content) else content)
+            if f.get("mode") is not None:
+                os.chmod(fpath, f["mode"])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     # ext_version records what this build actually BUNDLED (the local ext_ver the
@@ -5217,6 +5369,10 @@ def _agent_build_dist(agent: str, version: str) -> None:
     _agent_sidecar(agent).write_text(json.dumps(
         {"agent": agent, "version": version,
          "ext_version": ext_ver if ext else None,
+         # What this build actually BUNDLED for each extra pin (software_status
+         # compares them against the effective pins — a hand-moved adapter/node
+         # pin then reads "stale — re-pull" instead of "matches pin" forever).
+         "extra_pins": extras,
          "pulled_at": datetime.datetime.now(datetime.timezone.utc).isoformat()},
         indent=2) + "\n")
 
@@ -6389,6 +6545,7 @@ def software_status() -> dict:
     for agent in KNOWN_AGENTS:
         present = dist_present(agent)
         cached_version = pulled_at = cached_ext_version = None
+        cached_extras: dict = {}
         sidecar = _agent_sidecar(agent)
         if present and sidecar.exists():
             try:
@@ -6396,6 +6553,8 @@ def software_status() -> dict:
                 cached_version = data.get("version")
                 pulled_at = data.get("pulled_at")
                 cached_ext_version = data.get("ext_version")
+                if isinstance(data.get("extra_pins"), dict):
+                    cached_extras = data["extra_pins"]
             except Exception:
                 pass
         ext = _AGENT_INSTALL[agent].get("ext")
@@ -6413,6 +6572,18 @@ def software_status() -> dict:
         ext_ok = (not has_ext or ext_pin is None
                   or (cached_ext_version is not None
                       and cached_ext_version == ext_pin))
+        # Extra pins (pi's vendored adapter + private node): the sidecar records
+        # what the build bundled; a bumped pin reads as stale until a re-pull.
+        # An UNSET pin short-circuits like the ext pin (the build would die on it).
+        extras_ok = all(effective.get(pin) is None or cached_extras.get(key) == effective.get(pin)
+                        for key, pin in (_AGENT_INSTALL[agent].get("extra_pins") or {}).items())
+        # The extra pins as sub-rows for the panel (the ext sub-row's shape) — a
+        # "stale — re-pull" must never render without the row that explains it.
+        extra_rows = [{"key": key, "pin": pin, "cached": cached_extras.get(key),
+                       "effective": effective.get(pin),
+                       # the short name the sub-row shows (the pin key is its title)
+                       "label": key[:-4] if key.endswith("_ver") else key}
+                      for key, pin in (_AGENT_INSTALL[agent].get("extra_pins") or {}).items()]
         agents.append({
             "agent": agent,
             "present": present,
@@ -6422,8 +6593,9 @@ def software_status() -> dict:
             "effective_pin": pin,
             "ext_pin": ext_pin,
             "has_ext": has_ext,
+            "extra_pins": extra_rows,
             "matches_pin": (cached_version is not None and pin is not None
-                            and cached_version == pin and ext_ok),
+                            and cached_version == pin and ext_ok and extras_ok),
         })
 
     ed = editor_show() or {}
@@ -6773,9 +6945,15 @@ def _stash_creds_for_rebuild(
     container: str, was_running: bool, workspace_path: Path
 ) -> None:
     """Move agent auth state into the workspace bind-mount so it survives
-    container destruction. Two pieces:
+    container destruction. Three pieces:
       - ~research/.claude/        → /workspace/.creds-stash/
       - ~research/.claude.json    → /workspace/.creds-stash-home.json
+      - ~research/.local/share/pi-agent/agent/ → /workspace/.creds-stash-pi/
+        (pi's relocated agent dir: auth.json, sessions, trust, the PI's own
+        extensions — the WHOLE dir, so a live file pi adds later rides along
+        unnamed; the entrypoint restore drops the dist-delivered subpaths (the
+        vendored package tree, settings, the adapter defaults) before the
+        post-start deploy re-lays them; STAGE_PI_AGENT)
 
     The second piece is what makes interactive `claude` skip the /login
     prompt after the recreate (it carries `oauthAccount`); without it,
@@ -6792,6 +6970,7 @@ def _stash_creds_for_rebuild(
     failed update. The entrypoint will move them back at next start."""
     host_stash = workspace_path / ".creds-stash"
     host_home_stash = workspace_path / ".creds-stash-home.json"
+    host_pi_stash = workspace_path / ".creds-stash-pi"
     if was_running:
         if not host_stash.exists():
             run(["docker", "exec", container, "sh", "-c",
@@ -6808,6 +6987,13 @@ def _stash_creds_for_rebuild(
                  "/workspace/.creds-stash-home.json; "
                  "fi"],
                 capture_output=True)
+        if not host_pi_stash.exists():
+            run(["docker", "exec", container, "sh", "-c",
+                 "if [ -d /home/research/.local/share/pi-agent/agent ] && "
+                 "[ ! -d /workspace/.creds-stash-pi ]; then "
+                 "mv /home/research/.local/share/pi-agent/agent /workspace/.creds-stash-pi; "
+                 "fi"],
+                capture_output=True)
     else:
         # docker cp on a stopped container works for files in its filesystem.
         if not host_stash.exists():
@@ -6819,6 +7005,11 @@ def _stash_creds_for_rebuild(
             run(["docker", "cp",
                  f"{container}:/home/research/.claude.json",
                  str(host_home_stash)],
+                capture_output=True)
+        if not host_pi_stash.exists():
+            run(["docker", "cp",
+                 f"{container}:/home/research/.local/share/pi-agent/agent",
+                 str(host_pi_stash)],
                 capture_output=True)
 
 

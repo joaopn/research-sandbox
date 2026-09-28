@@ -465,7 +465,7 @@ git refuses to commit. Both the key and the identity survive `project stop`/`sta
 ### Dists (host-cached, cp-deployed at boot — not baked)
 
 ```
-agent  show | pull | refresh [--agent claude]   Manage the agent (Claude Code) dist
+agent  show | pull | refresh [--agent claude|pi]   Manage the agent dists (Claude Code, pi)
 editor show | pull | refresh                      Manage the code-server (editor) dist
 ```
 
@@ -507,4 +507,4 @@ project worker disable | stop | start | list | status <proj> [<name>]
 The supervisor's Claude uses these; you rarely call them directly.
 
 - **`rs-worker`** — analysis-worker lifecycle: `spawn --plan`, `list`, `status`, `wait`, `message`, `finalize`/`accept`/`unstage` (the cycle gates), `shutdown`/`destroy`, `attach`/`tail`.
-- **`rs-sandbox`** — (DIND projects) box lifecycle: `create [name] --preset {empty,websearcher,data-wrangler,byo} [--agent claude|none] [--editor] [--mcps csv] [--repo URL --ref SHA --setup CMD]`, `list [--json]`, `stop`, `start`, `restart`, `discard [--keep-workspace]`.
+- **`rs-sandbox`** — (DIND projects) box lifecycle: `create [name] --preset {empty,websearcher,data-wrangler,byo} [--agent claude|pi|none] [--editor] [--mcps csv] [--repo URL --ref SHA --setup CMD]`, `list [--json]`, `stop`, `start`, `restart`, `discard [--keep-workspace]`.

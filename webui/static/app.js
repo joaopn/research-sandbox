@@ -1755,6 +1755,20 @@ function renderSoftwareScreen(view, result) {
                 el("span", {}, []),
             ]));
         }
+        // Extra pins an agent's dist bundles (pi: the vendored MCP adapter, the
+        // private node) — the same continuation shape, one sub-row per pin, named
+        // by the versions.env key; they participate in matches_pin exactly like
+        // the extension does, so the row explains itself when one moved.
+        for (const x of (Array.isArray(a.extra_pins) ? a.extra_pins : [])) {
+            distRows.push(el("div", { class: "sw-row sw-subrow" }, [
+                el("span", { class: "sw-subname", title: x.pin }, ["└ " + (x.label || x.pin)]),
+                el("span", {}, []),
+                cell(x.cached, "sw-mono"),
+                cell(x.effective, "sw-mono"),
+                el("span", {}, []),
+                el("span", {}, []),
+            ]));
+        }
     }
     const nExt = Object.keys(editor.extensions || {}).length;
     distRows.push(el("div", { class: "sw-row" }, [
@@ -8045,8 +8059,9 @@ function makeProjectConfigBox(project) {
 // The agents deployed in this project (the supervisor tab + every box), after
 // create. ADD-only, and LIVE on a sandbox-dind project: the merged agent set is
 // re-staged into the running supervisor with no recreate, so the tab can run the
-// new agent at once. A research project runs claude only (its supervision hook
-// has no twin elsewhere); the docker substrate fixes its agents at create — both
+// new agent at once. A research project runs claude only in this slice (the
+// supervision gate is redesigned before another agent runs research); the docker
+// substrate fixes its agents at create — both
 // show a note instead of a control the broker would refuse.
 function appendAgentsSection(box, project, enabled) {
     const section = el("div", { class: "config-section" });
@@ -8129,11 +8144,16 @@ function mgmtAgentsDialog(name, current, addable) {
             el("div", { class: "box-opt-cards" }, checks.map((c) => c.card)),
             el("div", { class: "hint" }, [
                 "Applied live — nothing is recreated. The project tab can run the " +
-                "new agent at once; sign in inside the tab with the agent's own login. " +
-                "Boxes that already exist keep their current agent until they are " +
-                "re-created (a project update re-creates every box, or remove + add " +
-                "the box); new boxes get every deployed agent. Agents are added, " +
-                "never removed.",
+                "new agent at once; sign in inside the tab: claude with /login; pi with " +
+                "/login inside `pi` and an API key (OpenRouter, the intended path, or any " +
+                "provider pi supports; the Claude subscription login is not used here). " +
+                "pi's login, sessions and your own pi extensions are kept across re-deploys " +
+                "of the agent set (an add, a recreate); its global settings (a default " +
+                "model saved in-app included) and packages installed with `pi install` are " +
+                "reset to the shipped ones — pick the model again with /model. Boxes that " +
+                "already exist keep their current agent until they are re-created (a " +
+                "project update re-creates every box, or remove + add the box); new boxes " +
+                "get every deployed agent. Agents are added, never removed.",
             ]),
         ],
         validate: () => (checks.some((c) => c.cb.checked) ? null : "Tick at least one agent."),

@@ -550,8 +550,11 @@ def _install_repo_watch(cname: str) -> None:
 # Per-agent env for a BOX (home /home/worker) — MIRROR of rscore._agent_env
 # (this file is staged into the supervisor standalone and cannot import rscore;
 # the pytest pins the two equal after home substitution). Registry order; claude
-# needs none, so the table is empty until an agent that does joins the registry.
-_AGENT_BOX_ENV: dict[str, list[tuple[str, str]]] = {}
+# needs none. pi: its relocated agent dir + the three offline switches.
+_AGENT_BOX_ENV: dict[str, list[tuple[str, str]]] = {
+    "pi": [("PI_CODING_AGENT_DIR", "/home/worker/.local/share/pi-agent/agent"),
+           ("PI_OFFLINE", "1"), ("PI_SKIP_VERSION_CHECK", "1"), ("PI_TELEMETRY", "0")],
+}
 
 
 def _project_agents() -> list[str]:
@@ -614,8 +617,8 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     # RS_BOX_AGENT=claude, so that is what an agent-bearing box exports below.
     agent_mount = (["-v", f"{AGENT_DIST_MOUNT}:{AGENT_DIST_MOUNT}:ro"]
                    if (agent != "none" and os.path.isdir(AGENT_DIST_MOUNT)) else [])
-    # Per-agent config env for the project's deployed set: only when the box
-    # mounts the dist. (A box that existed before an add is re-run with this env
+    # Per-agent config env for the project's deployed set (pi's relocated agent
+    # dir + offline switches): only when the box mounts the dist. (A box that existed before an add is re-run with this env
     # while its absence-guarded entrypoint keeps its old ~/.local — the env then
     # names a file that is not there, inert because the binary is not there
     # either; a re-created box gets both.) The box user is `worker`.
@@ -1216,10 +1219,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="box type: empty, dev, websearcher, data-wrangler, byo, or "
                         "an operator-registered type (default empty)")
     # LOCKSTEP with rscore._BOX_AGENTS (every known agent + none).
-    c.add_argument("--agent", choices=["claude", "none"], default=None,
+    c.add_argument("--agent", choices=["claude", "pi", "none"], default=None,
                    help="override the preset's agent default; any agent cp's the "
                         "project's whole agent set in (still auth-free — sign in "
-                        "inside with the agent's own login: `claude` + /login)")
+                        "inside: `claude` + /login, or `pi` + /login with an API key)")
     c.add_argument("--model", default="",
                    help="agent model for this box (default: the project's box "
                         "default, set at project create)")

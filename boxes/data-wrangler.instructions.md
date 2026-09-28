@@ -23,8 +23,9 @@ box (the MCP toggle on the box window).
 - Refer to data sources generically — the concrete list is in
   `.tools-inventory.md`, not baked here.
 
-This box is disposable and credential-free — run `claude` then `/login` inside to
-authenticate. There is no artifact-publishing contract; your outputs live in
+This box is disposable and credential-free — sign in inside: `claude` then `/login`
+(Claude Code), or `pi` then `/login` with an API key (pi: OpenRouter, the intended path,
+or any provider pi supports — not the Claude subscription), whichever this project carries. There is no artifact-publishing contract; your outputs live in
 `/workspace`. You can `pip install` and reach the network (subject to the
 project's egress policy).
 
