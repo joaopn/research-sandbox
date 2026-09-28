@@ -469,6 +469,8 @@ agent  show | pull | refresh [--agent claude|pi]   Manage the agent dists (Claud
 editor show | pull | refresh                      Manage the code-server (editor) dist
 ```
 
+pi reads `.claude/rules/` (path-scoped rules), `.claude/CLAUDE.md`, `CLAUDE.local.md` and a subdirectory's `CLAUDE.md` like Claude Code does, through the RS-owned `rs-rules` extension the pi dist carries (`/rules` inside pi lists what it found); it also refuses an edit of a file that was not read first, as Claude Code does.
+
 ### Browser UI + broker (optional)
 
 ```

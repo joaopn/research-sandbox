@@ -4902,7 +4902,8 @@ _AGENT_INSTALL = {
     # `cd`, `pwd -P` and parameter expansion are shell builtins).
     "pi": {
         "version_key": "PI_CODING_AGENT_VERSION",
-        "extra_pins": {"adapter_ver": "PI_MCP_ADAPTER_VERSION", "node_ver": "NODE_VERSION"},
+        "extra_pins": {"adapter_ver": "PI_MCP_ADAPTER_VERSION", "node_ver": "NODE_VERSION",
+                       "rules_ver": "RS_PI_RULES_VERSION"},
         "install": (
             "mkdir -p ~/.local/bin ~/.local/share/pi-agent/node ~/.local/share/pi-agent/pi"
             " ~/.local/share/pi-agent/agent/extensions"
@@ -4948,6 +4949,13 @@ _AGENT_INSTALL = {
         "files": [
             {"path": "local/share/pi-agent/agent/settings.json", "content": None},  # → _pi_settings_json (bound below)
             {"path": "local/share/pi-agent/agent/mcp.json", "content": None},       # → _PI_MCP_JSON (bound below)
+            # The RS-owned rules extension (Claude Code's .claude/rules for pi),
+            # OUTSIDE the agent dir: extensions/ inside it is the PI's own slot
+            # and rides the creds stash; rs/ is dist content, re-laid by every
+            # deploy and never stashed, so an RS bump always wins. Named from the
+            # canonical settings below (a global-settings path resolves relative
+            # to the agent dir).
+            {"path": "local/share/pi-agent/rs/rs-rules.ts", "content": None},      # → _rs_rules_source (bound below)
         ],
         "built_check": [
             f"share/pi-agent/agent/npm/node_modules/{_PI_MCP_ADAPTER_PACKAGE}/package.json",
@@ -5073,7 +5081,10 @@ def _pi_settings_json(pins: dict) -> str:
         {"defaultProjectTrust": "always",
          "enableInstallTelemetry": False,
          "theme": "dark",
-         "packages": [f"npm:{_PI_MCP_ADAPTER_PACKAGE}@{pins['adapter_ver']}"]},
+         "packages": [f"npm:{_PI_MCP_ADAPTER_PACKAGE}@{pins['adapter_ver']}"],
+         # The RS-owned rules extension, shipped beside the agent dir (see the
+         # registry row's `files`); the path is relative to the agent dir.
+         "extensions": [f"../rs/{_RS_RULES_SRC.name}"]},
         indent=2) + "\n"
 
 
@@ -5083,8 +5094,35 @@ def _pi_settings_json(pins: dict) -> str:
 # adapter's proxy tool. Measured against a box-shaped `.mcp.json` entry
 # (`"type": "http"`, `${VAR}` headers): applies, interpolates.
 _PI_MCP_JSON = json.dumps({"settings": {"directTools": True}}, indent=2) + "\n"
+
+# The RS-owned pi extension that gives pi Claude Code's `.claude/rules/`
+# behaviour (path-scoped rules, the project instruction files, the
+# read-before-edit refusal). Tracked source, copied into the dist verbatim at
+# build; its first line carries its version, which MUST equal the
+# RS_PI_RULES_VERSION pin (the sidecar records it, the Software row compares it,
+# a bump without the other is a build error, not a silent drift).
+_RS_RULES_SRC = SCRIPT_DIR / "container" / "pi" / "rs-rules.ts"
+_RS_RULES_HEADER_RE = re.compile(r"\A// rs-rules v(\S+)\s*$", re.M)
+
+
+def _rs_rules_source(pins: dict) -> str:
+    """The extension's source for the dist, checked against the resolved pin."""
+    try:
+        text = _RS_RULES_SRC.read_text()
+    except OSError as e:
+        die(f"the pi rules extension is missing: {_RS_RULES_SRC} ({e})")
+    m = _RS_RULES_HEADER_RE.match(text)
+    if not m:
+        die(f"{_RS_RULES_SRC}: the first line must be `// rs-rules v<version>`")
+    if m.group(1) != pins["rules_ver"]:
+        die(f"{_RS_RULES_SRC} is v{m.group(1)} but RS_PI_RULES_VERSION={pins['rules_ver']}; "
+            f"bump the pin and the header together")
+    return text
+
+
 _AGENT_INSTALL["pi"]["files"][0]["content"] = _pi_settings_json
 _AGENT_INSTALL["pi"]["files"][1]["content"] = _PI_MCP_JSON
+_AGENT_INSTALL["pi"]["files"][2]["content"] = _rs_rules_source
 
 
 # ---------------------------------------------------------------------------
@@ -5278,6 +5316,12 @@ def _agent_build_dist(agent: str, version: str) -> None:
         if not _AGENT_VERSION_RE.match(val):
             die(f"refusing to build {agent!r} with suspicious {pin}={val!r}")
         extras[key] = val
+    # The post-capture files' content, resolved NOW: a callable that dies (the
+    # rules extension's header/pin check) must die before the docker run and
+    # before the previous dist is removed — a die after `os.replace` would leave
+    # a half-written dist behind a sidecar that still describes the old build.
+    file_contents = [(f["path"], f["content"](extras) if callable(f["content"]) else f["content"], f.get("mode"))
+                     for f in (spec.get("files") or [])]
     ext_dl = ""
     if ext:
         ext_ver = load_versions().get(ext["version_key"])
@@ -5352,13 +5396,12 @@ def _agent_build_dist(agent: str, version: str) -> None:
         # Further canonical files (pi): written post-capture so JSON braces never
         # meet the `.format`-ed recipe; `content` may be a callable of the
         # resolved extra pins (the adapter's exact version is named inside).
-        for f in spec.get("files") or []:
-            fpath = dest / f["path"]
+        for rel, content, mode in file_contents:
+            fpath = dest / rel
             fpath.parent.mkdir(parents=True, exist_ok=True)
-            content = f["content"]
-            fpath.write_text(content(extras) if callable(content) else content)
-            if f.get("mode") is not None:
-                os.chmod(fpath, f["mode"])
+            fpath.write_text(content)
+            if mode is not None:
+                os.chmod(fpath, mode)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     # ext_version records what this build actually BUNDLED (the local ext_ver the
