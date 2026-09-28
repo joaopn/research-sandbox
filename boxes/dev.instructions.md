@@ -222,7 +222,7 @@ zero when fixed), and verify it on both the base branch and your branch before p
 - **Ask questions in plain text**, in your reply, with the options and your recommendation —
   never through the runtime's question-popup tool. The maintainer reads this tab
   intermittently; a popup times out unanswered and the work stalls.
-- **Never write the runtime's memory files** (`~/.claude/projects/<…>/memory/`, `MEMORY.md`).
+- **Never write the runtime's memory files** (Claude Code's `~/.claude/projects/<…>/memory/`, any `MEMORY.md`).
   On a dev box that directory is discarded at every re-run; on a supervisor it survives, but
   nobody reads it. Durable notes go where the maintainer reads them: the project's own
   instruction and plan files.

@@ -749,6 +749,12 @@ def cmd_project_ssh(args: argparse.Namespace) -> None:
 
 
 def cmd_project_update(args: argparse.Namespace) -> None:
+    agents = None
+    if args.agents:
+        # Additive: the marker's current set ∪ the requested agents.
+        current = rscore._read_marker_agents(
+            workspace_path_for(args.name, load_config()))
+        agents = list(current) + [a for a in args.agents if a not in current]
     req = _build(
         rscore.UpdateRequest,
         name=args.name, rebuild=args.rebuild, keep_claude=args.keep_claude,
@@ -758,9 +764,12 @@ def cmd_project_update(args: argparse.Namespace) -> None:
         supervisor_effort=args.supervisor_effort,
         worker_model=args.worker_model, worker_effort=args.worker_effort,
         role_model=args.role_model, role_effort=args.role_effort,
+        agents=agents,
     )
-    res = rscore.update(req)
+    res = _call(rscore.update, req)
     print(f"\nproject {req.name!r} updated.")
+    if res.agents_added:
+        print(f"  agents added: {', '.join(res.agents_added)}")
     # A model change can invalidate a stored effort (haiku accepts none); the
     # requested model wins and the effort is dropped — say so, never silently.
     for ctype in res.effort_dropped:
@@ -1503,38 +1512,26 @@ def cmd_project_role_mcp_status(args: argparse.Namespace) -> None:
 
 
 def cmd_project_update_agent(args: argparse.Namespace) -> None:
-    """Re-stage the host agent dist into a running project — no image rebuild,
-    no in-supervisor network install.
+    """Re-stage the host agent dist(s) into a running project — no image rebuild,
+    no in-supervisor network install — and, with `--agent`, ADD an agent to a
+    sandbox-dind project's set (the additive twin of `project update --agent`).
 
-    The agent (claude) is no longer baked anywhere (STAGE_AGENT_DIST slice 2); it
-    lives in the host cache (`research agent pull`/`refresh`) and every container
-    deploys it via `cp` at boot. This re-`docker cp`s the current host dist into
-    the supervisor's /opt/agent-dist (the copy-source the inner fleet RO-mounts)
-    and force-refreshes the supervisor's OWN ~/.local (research flavor — the PI's
-    interactive claude). NEWLY-spawned workers / role-MCPs / PI / boxes then deploy
-    the re-staged version; already-running long-lived containers keep their copy
-    until their next restart (the entrypoint absence-guard). Pull a new version
-    first with `research agent pull` (or `agent refresh`).
-
-    Sandbox-dind (`--workflow sandbox-dind`) projects ARE supported: their supervisor never runs
-    claude itself (deploy_local=False), but it stages the dist for its boxes."""
-    supervisor = _require_project(args.name)
-    agent = args.agent
-    if not rscore.dist_present(agent):
-        die(f"no cached {agent} dist — run `research agent pull "
-            f"--agent {agent}` first")
-    if not container_running(supervisor):
-        die(f"project {args.name!r} is not running "
-            f"(use `research project start {args.name}` first)")
-    is_sandbox = _container_project_type(supervisor) == PROJECT_TYPE_SANDBOX_DIND
-    rscore._stage_agent_dist(supervisor, agent, deploy_local=not is_sandbox)
-    ver = rscore.load_versions().get(
-        rscore._AGENT_INSTALL[agent]["version_key"], "(unknown)")
-    print(f"re-staged {agent} {ver} into {args.name!r}.")
-    print("note: newly-spawned workers / role-MCPs / PI / boxes pick this up; "
-          "already-running long-lived containers keep their copy until restart. "
-          + ("(sandbox-dind: the supervisor itself runs no claude.)" if is_sandbox
-             else "Open a fresh claude tab in the supervisor to use the new one."))
+    No agent is baked anywhere (STAGE_AGENT_DIST slice 2); the dists live in the
+    host cache (`research agent pull`/`refresh`) and every container deploys them
+    via `cp` at boot. Without `--agent` this re-streams the project's CURRENT set
+    into the supervisor's /opt/agent-dist (the copy-source the inner fleet
+    RO-mounts) and refreshes the supervisor's OWN ~/.local. NEWLY-spawned workers /
+    role-MCPs / boxes then deploy the re-staged version; already-running
+    long-lived containers keep their copy until re-created (the entrypoint
+    absence-guard). Pull a new version first with `research agent pull`."""
+    _require_project(args.name)
+    res = _call(rscore.project_add_agents, args.name, tuple(args.agents or ()))
+    if res.agents_added:
+        print(f"added {', '.join(res.agents_added)} to {args.name!r}.")
+    else:
+        print(f"re-staged the agent set into {args.name!r}.")
+    print("note: the supervisor tab has it now; newly-created boxes / workers pick "
+          "it up; boxes that already exist keep their copy until re-created.")
 
 
 def cmd_webui_cert_tailscale() -> None:
@@ -2419,6 +2416,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "(supervisor is always-on and cannot be "
                         "disabled), plus worker services to disable "
                         "for this project.")
+    u.add_argument("--agent", dest="agents", action="append", metavar="AGENT",
+                   help="repeatable: ADD an agent to a sandbox-dind project's "
+                        f"set ({', '.join(rscore.KNOWN_AGENTS)}); applied live "
+                        "(no recreate) when nothing else changes. Agents are "
+                        "added, never removed.")
     # Agent model/effort. Unset = LEAVE UNCHANGED (not "reset to the default").
     # A worker-only change touches no container at all; a role-only change re-runs
     # just the role containers; only a supervisor change needs a recreate.
@@ -2431,10 +2433,10 @@ def build_parser() -> argparse.ArgumentParser:
              "rebuild); newly-spawned containers pick up the new version. "
              "Pull a new version first with `research agent pull`/`refresh`.")
     uc.add_argument("name")
-    uc.add_argument("--agent", default=rscore.DEFAULT_AGENT,
+    uc.add_argument("--agent", dest="agents", action="append",
                     choices=rscore.KNOWN_AGENTS,
-                    help=f"which agent dist to re-stage (default "
-                         f"{rscore.DEFAULT_AGENT})")
+                    help="repeatable: ADD this agent to the project's set "
+                         "(sandbox-dind only); omitted = re-stage the current set")
     uc.set_defaults(func=cmd_project_update_agent)
 
     sh = proj_sub.add_parser("ssh", help="print SSH connection info")
@@ -2830,13 +2832,13 @@ def build_parser() -> argparse.ArgumentParser:
     ag_sub = ag.add_subparsers(dest="subcommand", required=True)
     agp = ag_sub.add_parser("pull",
                             help="build + cache the versions.env-pinned agent dist")
-    agp.add_argument("--agent", default="claude", choices=list(rscore.KNOWN_AGENTS))
+    agp.add_argument("--agent", default=rscore.DEFAULT_AGENT, choices=list(rscore.KNOWN_AGENTS))
     agp.set_defaults(func=cmd_agent_pull)
     ags = ag_sub.add_parser("show", help="list cached agent dists + versions")
     ags.set_defaults(func=cmd_agent_show)
     agr = ag_sub.add_parser("refresh",
                             help="check upstream; offer to bump the pin + re-pull")
-    agr.add_argument("--agent", default="claude", choices=list(rscore.KNOWN_AGENTS))
+    agr.add_argument("--agent", default=rscore.DEFAULT_AGENT, choices=list(rscore.KNOWN_AGENTS))
     agr.add_argument("--yes", action="store_true", help="skip the confirm prompt")
     agr.set_defaults(func=cmd_agent_refresh)
 

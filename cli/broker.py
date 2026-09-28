@@ -336,6 +336,8 @@ def _verb_workflows(_args: dict, _progress=None) -> dict:
         # can't deploy — so a relayed `agents` set always validates in from_kwargs.
         "agents": [{"name": a, "staged": rscore.dist_present(a)}
                    for a in rscore.KNOWN_AGENTS],
+        # The default-on agent for the create form (never a literal in app.js).
+        "default_agent": rscore.DEFAULT_AGENT,
         # Whether the node seed is cached (STAGE_NODE_SEED) — the create form's Node
         # tickbox is an affordance off this bit (disabled + hinted when absent); the
         # real gate is from_kwargs' node floor. Same "only offer what's deployable"
@@ -379,7 +381,7 @@ def _verb_software_status(_args: dict, _progress=None) -> dict:
 # hang the accept thread. rscore.die() on a network/upstream failure → SystemExit →
 # clean failed envelope (the established path).
 def _verb_agent_refresh_check(args: dict, _progress=None) -> dict:
-    agent = args.get("agent", "claude")
+    agent = args.get("agent", rscore.DEFAULT_AGENT)
     if agent not in rscore.KNOWN_AGENTS:
         raise rscore.ValidationError(
             f"unknown agent {agent!r} (known: {', '.join(rscore.KNOWN_AGENTS)})")
@@ -537,6 +539,9 @@ UPDATE_WEBUI_FIELDS = frozenset({
     "supervisor_model", "supervisor_effort",
     "worker_model", "worker_effort",
     "role_model", "role_effort",
+    # The project's agent SET (STAGE_PI_AGENT): add-only, applied live on
+    # sandbox-dind (no recreate); an enum list, validated in from_kwargs.
+    "agents",
 })
 
 
@@ -584,7 +589,7 @@ def _verb_destroy(args: dict, progress=None) -> dict:
 # The webui-settable subset of the box verbs' inputs — the input boundary for
 # box add/remove/list, mirroring CREATE_WEBUI_FIELDS. Every field acts INSIDE the
 # locked-egress, credential-free inner box (project is name-regex'd; name is
-# box-regex'd; agent ∈ {claude,none}; browser is a bool) — none is host-shaped, so
+# box-regex'd; agent ∈ KNOWN_AGENTS ∪ {none}; browser is a bool) — none is host-shaped, so
 # they are relayable. from_kwargs still validates them. The step-up `proof`
 # for box_remove is NOT here: it is verified + consumed in dispatch, never
 # forwarded to rscore.
@@ -1022,7 +1027,7 @@ AGENT_PULL_WEBUI_FIELDS = frozenset({"agent"})
 
 
 def _verb_agent_pull(args: dict, progress=None) -> dict:
-    agent = args.get("agent", "claude")
+    agent = args.get("agent", rscore.DEFAULT_AGENT)
     if agent not in rscore.KNOWN_AGENTS:          # defense-in-depth (parent re-checks pre-spawn)
         raise rscore.ValidationError(
             f"unknown agent {agent!r} (known: {', '.join(rscore.KNOWN_AGENTS)})")
@@ -1034,7 +1039,7 @@ def _verb_editor_pull(_args: dict, progress=None) -> dict:
 
 
 def _verb_agent_refresh(args: dict, progress=None) -> dict:
-    agent = args.get("agent", "claude")
+    agent = args.get("agent", rscore.DEFAULT_AGENT)
     if agent not in rscore.KNOWN_AGENTS:          # defense-in-depth (parent re-checks pre-spawn)
         raise rscore.ValidationError(
             f"unknown agent {agent!r} (known: {', '.join(rscore.KNOWN_AGENTS)})")
@@ -1537,7 +1542,7 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
         # Pre-spawn arg validation: a bad agent must NOT spawn a child — the client
         # already holds started:true and would never see a child-side failure.
         if verb in ("agent_pull", "agent_refresh"):
-            agent = args.get("agent", "claude")
+            agent = args.get("agent", rscore.DEFAULT_AGENT)
             if agent not in rscore.KNOWN_AGENTS:
                 return _audited(principal, "validation",
                                 _err("validation",

@@ -5556,7 +5556,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataRoots) {
 
     // Docker-substrate-only agents (rendered as cards in the Settings region below).
     // Staged agents only — one independent on/off box each (STAGE_MULTI_AGENT),
-    // default claude on. Un-staged KNOWN_AGENTS are omitted: the form never offers
+    // the broker's default agent on. Un-staged KNOWN_AGENTS are omitted: the form never offers
     // an agent that isn't deployable yet (pull it under Management → Software), so
     // the POSTed set always validates in from_kwargs.
     const stagedAgents = agents
@@ -5566,7 +5566,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataRoots) {
     // (cb stays the value-holder), NOT the box window's single-select radio agent.
     const agentChecks = stagedAgents.map((name) => {
         const cb = el("input", { type: "checkbox", value: name });
-        if (name === "claude") cb.checked = true;   // default {claude} on
+        if (agents.some((a) => a && a.name === name && a.isDefault)) cb.checked = true;   // the default agent on
         const card = el("div", { class: "box-opt-card" + (cb.checked ? " selected" : "") },
                         [el("span", { class: "box-opt-name" }, [name])]);
         card.onclick = () => {
@@ -6036,6 +6036,15 @@ function renderWorkflowsScreen(view, result) {
     view.innerHTML = "";
     const workflows = Array.isArray(result.workflows) ? result.workflows : [];
     const agents = Array.isArray(result.agents) ? result.agents : [];
+    // The default-on agent card comes from the broker (never a literal here).
+    // Fallback to the first staged agent: app.js and the broker rebuild
+    // independently, and a form with no card checked would be a regression.
+    let defaultAgent = typeof result.default_agent === "string" ? result.default_agent : "";
+    if (!defaultAgent) {
+        const firstStaged = agents.find((a) => a && a.staged);
+        defaultAgent = firstStaged ? firstStaged.name : "";
+    }
+    agents.forEach((a) => { if (a) a.isDefault = a.name === defaultAgent; });
     const nodePresent = !!result.node_present;   // STAGE_NODE_SEED: Node tickbox affordance
     // Host-declared browser-mountable data roots: the create dialog's data-mount
     // control exists only when this is non-empty. Refetched per render (no cache).
@@ -6314,6 +6323,18 @@ async function refreshAfterBoxChange(project) {
 // and a malformed box-registry ValidationError must be shown, not swallowed.
 async function mgmtBoxAddDialog(project) {
     let presets, allowed;
+    // The agents a box in THIS project can deploy: the set the project staged
+    // (claude is always staged as the box copy-source; the marker adds the rest).
+    // Never the host's global staged list — a box cannot get what its project
+    // did not stage.
+    let projectAgents = [];
+    try {
+        const sres = await fetch(`/projects/status?names=${encodeURIComponent(project)}`);
+        const sbody = await sres.json();
+        const st = sbody && sbody[project];
+        if (st && Array.isArray(st.agents_staged)) projectAgents = st.agents_staged.slice();
+    } catch (e) { /* only "None" is offered; a preset-default agent then submits with
+                     no `agent` field and the server applies the preset default */ }
     try {
         const res = await fetch(`/broker/project/${encodeURIComponent(project)}/box-presets`);
         let body; try { body = await res.json(); } catch (e) { body = {}; }
@@ -6397,26 +6418,38 @@ async function mgmtBoxAddDialog(project) {
     // are byte-unchanged — the cards only drive + reflect them. There is no
     // "preset default" choice: selecting a preset pre-selects its default agent
     // (applyPreset), which the operator can then override.
+    // The preset default is the FIRST staged agent (the project's floor agent);
+    // a box that selects any agent receives the project's whole staged set.
+    const defaultBoxAgent = projectAgents[0] || "";
     const agentS = el("select", {}, [
         el("option", { value: "none" }, ["none (blank box)"]),
-        el("option", { value: "claude" }, ["claude"]),
+        ...projectAgents.map((a) => el("option", { value: a }, [a])),
     ]);
     const agentSpecs = [
         { value: "none", label: "None" },
-        { value: "claude", label: "Claude" },
+        ...projectAgents.map((a) => ({ value: a, label: a })),
     ];
     const agentCardEls = [];
+    // With an MCP ticked only "None" is off the table (an MCP needs some agent);
+    // the agent choice itself stays the operator's.
+    let noneLocked = false;
     const agentCards = agentSpecs.map((s) => {
         const card = el("div", { class: "box-opt-card" },
                         [el("span", { class: "box-opt-name" }, [s.label])]);
-        card.onclick = () => { if (!agentS.disabled) { agentS.value = s.value; markAgent(); } };
+        card.onclick = () => {
+            if (agentS.disabled) return;
+            if (s.value === "none" && noneLocked) return;
+            agentS.value = s.value; markAgent();
+        };
         agentCardEls.push({ value: s.value, card });
         return card;
     });
     const agentCardsWrap = el("div", { class: "box-opt-cards" }, agentCards);
     function markAgent() {
-        for (const { value, card } of agentCardEls)
+        for (const { value, card } of agentCardEls) {
             card.classList.toggle("selected", value === agentS.value);
+            if (value === "none") card.classList.toggle("disabled", noneLocked);
+        }
         // The model/effort row follows the agent: no agent, no model. Hooking it
         // here rather than at each call site means every path that can change the
         // agent — card click, preset pre-select, MCP coupling — keeps it honest.
@@ -6569,7 +6602,10 @@ async function mgmtBoxAddDialog(project) {
         setMcpsDisabled(isDev);
         // Pre-select the preset's default agent (unless MCP coupling has forced
         // claude on + locked the cards); the operator can still override it.
-        if (!agentS.disabled) agentS.value = selectedPreset.agent_default ? "claude" : "none";
+        if (!agentS.disabled) {
+            agentS.value = selectedPreset.agent_default ? defaultBoxAgent : "none";
+            if (agentS.value === "none" && noneLocked) agentS.value = defaultBoxAgent;
+        }
         markAgent();
         // Pre-check the editor toggle from the preset's UI default (still un-checkable).
         editorCb.checked = !!selectedPreset.editor_default;
@@ -6602,11 +6638,11 @@ async function mgmtBoxAddDialog(project) {
         }
     }
     function applyMcpCoupling() {
-        const any = mcpBoxes.some((b) => b.cb.checked);
-        if (any) { agentS.value = "claude"; agentS.disabled = true; }
-        else { agentS.disabled = false; }
+        // An MCP needs an agent: lock out "None" (the server coerces a bare
+        // "none" to the default too), keep the agent choice open.
+        noneLocked = mcpBoxes.some((b) => b.cb.checked);
+        if (noneLocked && agentS.value === "none") agentS.value = defaultBoxAgent;
         markAgent();
-        agentCardsWrap.classList.toggle("disabled", agentS.disabled);
     }
     applyPreset();
     applyMcpCoupling();
@@ -8001,8 +8037,115 @@ function makeProjectConfigBox(project) {
     appendExportedPortsSection(box, project);
     appendEditorExtensionSection(box, project, enabled);
     appendModelsSection(box, project, enabled);
+    appendAgentsSection(box, project, enabled);
     appendSidebarSection(box, project);
     return box;
+}
+
+// The agents deployed in this project (the supervisor tab + every box), after
+// create. ADD-only, and LIVE on a sandbox-dind project: the merged agent set is
+// re-staged into the running supervisor with no recreate, so the tab can run the
+// new agent at once. A research project runs claude only (its supervision hook
+// has no twin elsewhere); the docker substrate fixes its agents at create — both
+// show a note instead of a control the broker would refuse.
+function appendAgentsSection(box, project, enabled) {
+    const section = el("div", { class: "config-section" });
+    section.appendChild(el("div", { class: "config-section-label" }, ["Agents"]));
+    const isDocker = !(enabled.supervisor && enabled.supervisor.box_harness);
+    if (isDocker) {
+        section.appendChild(el("div", { class: "config-empty" }, [
+            "Set at create on this project type.",
+        ]));
+        box.appendChild(section);
+        return;
+    }
+    const row = el("div", { class: "config-box-row" }, [
+        el("span", { class: "config-box-name" }, ["Deployed agents"]),
+        el("span", { class: "config-box-meta" }, ["…"]),
+    ]);
+    const btn = el("button", { class: "btn btn-secondary" }, ["Add"]);
+    btn.disabled = true;
+    row.appendChild(btn);
+    section.appendChild(row);
+    box.appendChild(section);
+    (async () => {
+        const meta = row.querySelector(".config-box-meta");
+        let st = null;
+        try {
+            const res = await fetch(
+                `/projects/status?names=${encodeURIComponent(project.name)}`);
+            const body = await res.json();
+            st = body && body[project.name];
+        } catch (e) { /* unavailable */ }
+        if (!st) { if (meta) meta.textContent = "unavailable"; return; }
+        const current = Array.isArray(st.agents) ? st.agents : [];
+        if (st.flavor !== "sandbox-dind") {
+            if (meta) meta.textContent = "claude (fixed on a research project)";
+            return;
+        }
+        if (meta) meta.textContent = current.length ? current.join(", ") : "none";
+        // The host's staged dists — what CAN be added. Same payload the create
+        // form uses, so only a pulled dist is ever offered.
+        let staged = [];
+        try {
+            const wres = await fetch("/broker/workflows");
+            const wbody = await wres.json();
+            const list = wbody && wbody.result && Array.isArray(wbody.result.agents)
+                ? wbody.result.agents : [];
+            staged = list.filter((a) => a && a.staged).map((a) => a.name);
+        } catch (e) { /* no additions offered */ }
+        const addable = staged.filter((a) => !current.includes(a));
+        if (!addable.length) {
+            btn.textContent = "All staged agents deployed";
+            return;
+        }
+        btn.disabled = false;
+        btn.onclick = () => mgmtAgentsDialog(project.name, current, addable);
+    })();
+}
+
+// The dialog behind the Agents section: tick the agents to add; the request
+// carries the FULL resulting set (add-only — the broker refuses a removal).
+function mgmtAgentsDialog(name, current, addable) {
+    const checks = addable.map((a) => {
+        const cb = el("input", { type: "checkbox", value: a });
+        const card = el("div", { class: "box-opt-card" },
+                        [el("span", { class: "box-opt-name" }, [a])]);
+        card.onclick = () => {
+            cb.checked = !cb.checked;
+            card.classList.toggle("selected", cb.checked);
+        };
+        return { name: a, cb, card };
+    });
+    mgmtConfirmThenTail(boxOpView(), {
+        title: `Add an agent to ${name}`,
+        tailTitle: `Adding agents to ${name}`,
+        verb: "update",
+        confirmLabel: "Add",
+        body: [
+            el("p", {}, [
+                "Deployed now: " + (current.length ? current.join(", ") : "none") + ".",
+            ]),
+            el("div", { class: "box-opt-cards" }, checks.map((c) => c.card)),
+            el("div", { class: "hint" }, [
+                "Applied live — nothing is recreated. The project tab can run the " +
+                "new agent at once; sign in inside the tab with the agent's own login. " +
+                "Boxes that already exist keep their current agent until they are " +
+                "re-created (a project update re-creates every box, or remove + add " +
+                "the box); new boxes get every deployed agent. Agents are added, " +
+                "never removed.",
+            ]),
+        ],
+        validate: () => (checks.some((c) => c.cb.checked) ? null : "Tick at least one agent."),
+        request: () => {
+            const chosen = checks.filter((c) => c.cb.checked).map((c) => c.name);
+            const payload = { agents: current.concat(chosen.filter((a) => !current.includes(a))) };
+            return fetch(`/broker/project/${encodeURIComponent(name)}/update`, {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+            });
+        },
+    });
 }
 
 // The "Sidebar" section — drop this browser's bookmark for a project. It is the

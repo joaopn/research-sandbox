@@ -547,6 +547,24 @@ def _install_repo_watch(cname: str) -> None:
                   f"failed: {(r.stderr or r.stdout).strip()}", file=sys.stderr)
 
 
+# Per-agent env for a BOX (home /home/worker) — MIRROR of rscore._agent_env
+# (this file is staged into the supervisor standalone and cannot import rscore;
+# the pytest pins the two equal after home substitution). Registry order; claude
+# needs none, so the table is empty until an agent that does joins the registry.
+_AGENT_BOX_ENV: dict[str, list[tuple[str, str]]] = {}
+
+
+def _project_agents() -> list[str]:
+    """The project's deployed agent set from the marker (STAGE_PI_AGENT),
+    read verbatim like _project_box_pair; absent/legacy → []."""
+    try:
+        data = json.loads((WORKSPACE / ".orchestrator" / "project.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return []
+    agents = data.get("agents") if isinstance(data, dict) else None
+    return [a for a in agents if isinstance(a, str)] if isinstance(agents, list) else []
+
+
 def _project_box_pair() -> dict:
     """The project's default (model, effort) pair for a BOX, from the marker the
     host wrote at create (STAGE_MODEL_SELECT). Read VERBATIM: this CLI is staged
@@ -573,8 +591,10 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
              loopback_ports: list[dict] | None = None,
              model: str = "", effort: str = "", fetch: bool = False) -> None:
     """docker run a box in the local inner dockerd. ``browser`` selects the
-    Chromium-equipped image; ``agent`` (claude|none) → RS_BOX_AGENT (entrypoint
-    deploys claude only for "claude", still auth-free); ``editor`` → the box's OWN
+    Chromium-equipped image; ``agent`` (any staged agent|none): any agent mounts
+    the project's MERGED copy-source and exports RS_BOX_AGENT=claude (the baked
+    entrypoint gate), so the box receives every agent the project carries, still
+    auth-free; ``editor`` → the box's OWN
     RS_SERVICE_CODE_SERVER (box-level toggle, default off — decoupled from the
     project's editor); ``clone_*`` (BYO) → RS_BOX_CLONE_* the entrypoint clones +
     runs (as box-shell env argv, never a host shell); ``model``/``effort`` → the
@@ -589,8 +609,23 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     _docker("rm", "-f", cname)  # idempotent
     # Guard the mount so a missing source can't turn a box run into a cryptic mount
     # error; the box's entrypoint absence-guard surfaces it as "claude not found".
+    # Any agent selection mounts the project's MERGED copy-source (every staged
+    # agent arrives in one cp); the baked entrypoint's gate is the literal
+    # RS_BOX_AGENT=claude, so that is what an agent-bearing box exports below.
     agent_mount = (["-v", f"{AGENT_DIST_MOUNT}:{AGENT_DIST_MOUNT}:ro"]
-                   if (agent == "claude" and os.path.isdir(AGENT_DIST_MOUNT)) else [])
+                   if (agent != "none" and os.path.isdir(AGENT_DIST_MOUNT)) else [])
+    # Per-agent config env for the project's deployed set: only when the box
+    # mounts the dist. (A box that existed before an add is re-run with this env
+    # while its absence-guarded entrypoint keeps its old ~/.local — the env then
+    # names a file that is not there, inert because the binary is not there
+    # either; a re-created box gets both.) The box user is `worker`.
+    agent_env: list[str] = []
+    if agent != "none":
+        staged = _project_agents()
+        for a, pairs in _AGENT_BOX_ENV.items():
+            if a in staged:
+                for k, v in pairs:
+                    agent_env += ["-e", f"{k}={v}"]
     # Editor dist mount, gated on the box's OWN editor toggle (STAGE_EDITOR_DIST +
     # STAGE_BOX_EXT_UX). Only mount when this box opted in AND the dist is staged.
     editor_mount = (["-v", f"{EDITOR_DIST_MOUNT}:{EDITOR_DIST_MOUNT}:ro"]
@@ -652,8 +687,10 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     # Agent model + effort (STAGE_MODEL_SELECT). Fixed at `docker run` — a plain
     # `docker restart` does NOT re-evaluate env — so _rerun_box re-applies them
     # from the stored entry on every restart / supervisor recreate.
+    # The pair is claude's (ANTHROPIC_MODEL / CLAUDE_CODE_EFFORT_LEVEL); an
+    # non-claude agent's box carries no RS-side model (the PI picks in-app).
     model_env: list[str] = []
-    if model:
+    if model and agent == "claude":
         model_env = ["-e", f"ANTHROPIC_MODEL={model}"]
         if effort:
             model_env += ["-e", f"CLAUDE_CODE_EFFORT_LEVEL={effort}"]
@@ -671,8 +708,12 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         *loopback_publish,
         "-e", f"RS_SERVICE_CODE_SERVER={'enabled' if editor else 'disabled'}",
         "-e", f"RS_SANDBOX_NAME={name}",
-        "-e", f"RS_BOX_AGENT={agent}",
+        # The entrypoint gates the dist cp on the literal "claude" (baked); every
+        # agent-bearing box exports it and receives the merged set. The box's
+        # own `agent` stays the selected name on its entry.
+        "-e", f"RS_BOX_AGENT={'claude' if agent != 'none' else 'none'}",
         *model_env,
+        *agent_env,
         *setup_env,
         *clone_env,
         *dev_env,
@@ -880,8 +921,20 @@ def cmd_create(args: argparse.Namespace) -> None:
     # Agent: explicit override, else the preset default; selecting any MCP forces
     # the agent on (nothing else can reach an MCP — STAGE_BOX_EXT_UX D-B).
     agent = args.agent or ("claude" if preset.get("agent_default") else "none")
-    if mcps:
+    if mcps and agent == "none":
         agent = "claude"
+    # Only an agent this project staged can reach the box (the merged copy-source
+    # is the project's set + claude); refuse by name, before any side effect.
+    carried = ["claude", *[a for a in _project_agents() if a != "claude"]]
+    if agent != "none" and agent not in carried:
+        die(f"this project carries {', '.join(carried)} — add {agent!r} to the "
+            f"project first")
+    # The model pair is claude's: refuse an explicit pair on any OTHER agent
+    # rather than record one the box would silently ignore. An agent-less box
+    # keeps accepting one (base behaviour; _run_box drops it where no claude
+    # runs). LOCKSTEP with rscore.BoxAddRequest.from_kwargs's predicate.
+    if agent not in ("claude", "none") and ((args.model or "").strip() or (args.effort or "").strip()):
+        die(f"a model applies to a claude box; agent {agent!r} picks its model in-app")
     # Spawn-time tri-state (the host box_add threads --browser/--no-browser only
     # when the caller was explicit): None ⇒ the preset's image default. The
     # resolved value is persisted on the entry below, so _rerun_box re-applies
@@ -943,7 +996,7 @@ def cmd_create(args: argparse.Namespace) -> None:
     # project's `box` default from the marker, read verbatim (the host resolved and
     # effort-drop-checked it at create — nothing here can validate). Persisted on
     # the entry so _rerun_box re-applies it: docker run env is fixed at run.
-    _pair = _project_box_pair()
+    _pair = _project_box_pair() if agent == "claude" else {}
     model = (args.model or "").strip() or (_pair.get("model") or "")
     effort = (args.effort or "").strip() or (_pair.get("effort") or "")
     entry = {"kind": KIND, "ip": ip, "container": box_container(name),
@@ -1162,9 +1215,11 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--preset", default="empty",
                    help="box type: empty, dev, websearcher, data-wrangler, byo, or "
                         "an operator-registered type (default empty)")
+    # LOCKSTEP with rscore._BOX_AGENTS (every known agent + none).
     c.add_argument("--agent", choices=["claude", "none"], default=None,
-                   help="override the preset's agent default; 'claude' cp's the "
-                        "binary in (still auth-free — run `claude` + /login inside)")
+                   help="override the preset's agent default; any agent cp's the "
+                        "project's whole agent set in (still auth-free — sign in "
+                        "inside with the agent's own login: `claude` + /login)")
     c.add_argument("--model", default="",
                    help="agent model for this box (default: the project's box "
                         "default, set at project create)")

@@ -896,7 +896,8 @@ async def broker_project_action_handler(request: web.Request) -> web.Response:
             for k in ("enable", "disable",
                       "supervisor_model", "supervisor_effort",
                       "worker_model", "worker_effort",
-                      "role_model", "role_effort"):
+                      "role_model", "role_effort",
+                      "agents"):
                 if req_body.get(k) is not None:
                     args[k] = req_body[k]
     return await _start_op(request, action, args, BROKER_OP_TIMEOUT_S)
@@ -2196,6 +2197,14 @@ def _read_project_marker(project: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _agents_staged(project: str) -> list[str]:
+    marker = _read_project_marker(project)
+    agents = [a for a in (marker.get("agents") or []) if isinstance(a, str)]
+    if marker.get("substrate") == "docker":
+        return agents
+    return list(dict.fromkeys(["claude", *agents]))
+
+
 def _project_has_fetch(project: str) -> bool:
     """True when `project` carries an opt-in rs-fetch surface: the marker's
     `fetch` key (a project-level --fetch), or any rs-fetch-enabled box entry.
@@ -2272,7 +2281,21 @@ def _project_summary(name: str) -> dict:
         return {"error": "not_found"}
     marker = _read_project_marker(name)
     flavor = "sandbox-dind" if marker.get("type") == "sandbox-dind" else "research"
-    return {"flavor": flavor, "workflow": marker.get("workflow") or flavor}
+    return {
+        "flavor": flavor,
+        "workflow": marker.get("workflow") or flavor,
+        # The project's deployed agent set (marker `agents`; [] on research and
+        # legacy markers) — the Agents row + the box window's agent choices read
+        # it (a box can only deploy what THIS project staged). Marker reads,
+        # so the summary stays walk-free.
+        "agents": [a for a in (marker.get("agents") or []) if isinstance(a, str)],
+        # What a box in this project can deploy — the STAGED set: on a dind
+        # project claude is always staged as the box copy-source and the marker
+        # adds the rest (TOLERANT MIRROR of rscore._dind_stage_set — the webui
+        # image carries no cli/, so review + the harness enforce the pair); on
+        # the docker substrate exactly the marker's set.
+        "agents_staged": _agents_staged(name),
+    }
 
 
 def _project_disk_bytes(name: str) -> dict:

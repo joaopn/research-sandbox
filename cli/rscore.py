@@ -147,12 +147,11 @@ class HarnessError(Exception):
 # leading '-' can be read as a flag), with no use case here.
 _PROJECT_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]*\Z")
 
-# Sandbox-box name grammar + agent enum — LOCKSTEP COPIES of rs_sandbox._NAME_RE
-# and the `rs-sandbox create --agent` choices (cli/rs_sandbox.py). rscore cannot
-# import rs_sandbox (it's baked into the supervisor image under conda python), so
-# the box_* verbs re-declare the validation here; keep both in agreement.
+# Sandbox-box name grammar — LOCKSTEP COPY of rs_sandbox._NAME_RE (cli/rs_sandbox.py).
+# rscore cannot import rs_sandbox (it's baked into the supervisor image under conda
+# python), so the box_* verbs re-declare the validation here; keep both in
+# agreement. The agent enum twin (_BOX_AGENTS) sits below KNOWN_AGENTS.
 _BOX_NAME_RE = re.compile(r"\A[a-z][a-z0-9-]*\Z")
-_BOX_AGENTS = frozenset({"claude", "none"})
 
 
 def valid_project_name(name: str) -> bool:
@@ -937,23 +936,19 @@ class CreateRequest:
             if a not in KNOWN_AGENTS:
                 raise ValidationError(
                     f"unknown agent {a!r} (known: {', '.join(KNOWN_AGENTS)})")
-            if substrate is Substrate.DOCKER and not dist_present(a):
+            # Every selected agent needs a pulled dist on EVERY substrate: the
+            # docker box mounts each one, the dind supervisor stages the merged
+            # set (STAGE_PI_AGENT — the former dind "only claude" refusal is
+            # gone; the stage is N-agent now).
+            if not dist_present(a):
                 raise ValidationError(
                     f"agent {a!r}: no cached dist — pull it under Management → Software first")
-            # The dind stage is flat single-default (_stage_agent_dist stages
-            # DEFAULT_AGENT only) — refuse rather than silently ignore a
-            # non-default selection. Unreachable while KNOWN_AGENTS is
-            # single-entry; it fires the day a second agent joins the enum.
-            if substrate is Substrate.DIND_SYSBOX and a != DEFAULT_AGENT:
-                raise ValidationError(
-                    f"agent {a!r} is not available on this workflow — only "
-                    f"{DEFAULT_AGENT!r} can be deployed here")
         # A dev project's whole point is the repo-working agent (repo-watch drives
-        # it) — an agent-less dev create is a broken project, refuse up front.
+        # it, and repo-watch runs claude) — refuse a dev create without it.
         if dev_lane and DEFAULT_AGENT not in agents:
             raise ValidationError(
-                "a dev project runs the claude agent — it cannot be created "
-                "agent-less")
+                f"a dev project needs the {DEFAULT_AGENT} agent (repo-watch runs it) — "
+                f"it cannot be created agent-less or without it; add it to the selection")
         # Fleet floor (STAGE_AGENT_DIST slice 2): EVERY dind project deploys claude
         # from the dist (no bake) — research flavor for the supervisor + worker/
         # role-MCP/PI fleet, sandbox-dind flavor for its rs-sandbox-box boxes (FROM
@@ -1137,6 +1132,14 @@ class UpdateRequest:
     worker_effort: str = ""
     role_model: str = ""
     role_effort: str = ""
+    # The project's agent SET after this update (STAGE_PI_AGENT). None =
+    # unchanged. Slice 1 is ADD-only: the set must be a superset of the marker's
+    # (checked in update(), which has the project; from_kwargs checks shape, enum
+    # and dist presence). Applied LIVE on sandbox-dind (a merged re-stage into
+    # the running supervisor, no recreate); refused on research (claude-only —
+    # the Stop hook) and on the docker substrate (agent mounts are docker-run
+    # fixed).
+    agents: tuple[str, ...] | None = None
 
     def model_changes(self) -> dict[str, dict[str, str]]:
         """The per-type model/effort fields the caller actually SET, as
@@ -1185,6 +1188,19 @@ class UpdateRequest:
                 raise ValidationError(
                     f"model {m!r} does not accept an effort level; "
                     f"remove --{ctype}-effort")
+        agents: tuple[str, ...] | None = None
+        if kw.get("agents") is not None:
+            agents = tuple(dict.fromkeys(_as_tuple(kw.get("agents"))))
+            if not agents:
+                raise ValidationError(
+                    "an agent set cannot be empty on update — agents are added, never removed")
+            for a in agents:
+                if a not in KNOWN_AGENTS:
+                    raise ValidationError(
+                        f"unknown agent {a!r} (known: {', '.join(KNOWN_AGENTS)})")
+                if not dist_present(a):
+                    raise ValidationError(
+                        f"agent {a!r}: no cached dist — pull it under Management → Software first")
         return cls(
             name=_require_name(kw.get("name")),
             rebuild=bool(kw.get("rebuild", False)),
@@ -1192,6 +1208,7 @@ class UpdateRequest:
             enable=_as_tuple(kw.get("enable")),
             disable=_as_tuple(kw.get("disable")),
             role_mcp_upstream=_as_tuple(kw.get("role_mcp_upstream")),
+            agents=agents,
             **vals,
         )
 
@@ -1277,6 +1294,9 @@ class UpdateResult:
     # `max`: haiku accepts no effort level, and the explicitly-requested model
     # wins). Reported so the drop is never silent.
     effort_dropped: list[str] = field(default_factory=list)
+    # Agents this update ADDED to the project (STAGE_PI_AGENT); empty when
+    # the request carried no agent change or the set was already complete.
+    agents_added: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1371,10 +1391,11 @@ class BoxAddRequest:
             if not (isinstance(m, str) and m.strip()):
                 raise ValidationError("each MCP name must be a non-empty string")
             mcps.append(m.strip())
-        # Selecting any MCP forces the agent on — nothing else can reach an MCP
-        # (STAGE_BOX_EXT_UX D-B). Overrides an explicit agent="none".
-        if mcps:
-            agent = "claude"
+        # Selecting any MCP forces AN agent on — nothing else can reach an MCP
+        # (STAGE_BOX_EXT_UX D-B). Overrides an explicit agent="none" with the
+        # default; an explicit other agent stays (STAGE_PI_AGENT).
+        if mcps and agent in (None, "none"):
+            agent = DEFAULT_AGENT
         # Browser is tri-state: absent/None ⇒ preset default. Only a real bool
         # may pass (JSON true/false); anything else is a malformed request, not
         # a truthy value to coerce.
@@ -1425,6 +1446,17 @@ class BoxAddRequest:
         # validator does not have, so it lives in box_add (the same reason
         # preset-∈-catalog and mcps-⊆-allowlist do).
         _model, _effort = _box_model_shape(kw)
+        # The pair is claude's (STAGE_PI_AGENT): an explicit pair on any
+        # OTHER agent is refused here — before any side effect, and pre-spawn for
+        # the dev-box lane, which delegates to this validator. An agent-less box
+        # keeps accepting one (the box drops it; base behaviour), and a defaulted
+        # agent is only ever claude or none (agent_default is a bool), so the
+        # explicit-name check is the whole rule. LOCKSTEP with rs_sandbox's
+        # `cmd_create` predicate.
+        if agent not in (None, DEFAULT_AGENT, "none") and (_model or _effort):
+            raise ValidationError(
+                f"a model applies to a {DEFAULT_AGENT} box; agent {agent!r} picks "
+                f"its model in-app")
         return cls(
             project=_require_name(kw.get("project")), name=name, preset=preset,
             agent=agent, editor=bool(kw.get("editor", False)), browser=browser,
@@ -2970,6 +3002,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         substrate=substrate.value,
         service_flags=service_flags,
         agent_pair=model_pairs["supervisor"],
+        agents=deployed_agents,
     )
     if extra_mounts:
         docker_args = docker_args[:-1] + extra_mounts + [docker_args[-1]]
@@ -3064,8 +3097,8 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             # supervisor's OWN ~/.local gets the launcher + claude settings only
             # when the create selected claude (deploy_local honors req.agents; an
             # agent-less create leaves the supervisor unwired).
-            _stage_agent_dist(container_name,
-                              deploy_local=DEFAULT_AGENT in req.agents)
+            _stage_agent_dist(container_name, _dind_stage_set(req.agents),
+                              deploy_local=bool(req.agents))
             # Editor dist staged whenever cached so any box can RO-mount
             # /opt/editor-dist; deploy_local follows the RESOLVED code-server
             # flag (default ON since the editor-by-default slice — a
@@ -3154,7 +3187,10 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             # MUST stay before the worker/extension enable cone below — a role-MCP or
             # PI container brought up by that cone mounts /opt/agent-dist and would
             # boot claude-less (failing only on first send_job) if staged after.
-            _stage_agent_dist(container_name)
+            # Research stays claude-only in this slice (its supervisor's Stop hook
+            # is a claude mechanism; the supervision gate is redesigned before
+            # another agent runs research — STAGE_PI_AGENT).
+            _stage_agent_dist(container_name, [DEFAULT_AGENT])
             # Editor dist (STAGE_EDITOR_DIST): staged before the enable cone too so
             # interactive PI containers RO-mount a populated /opt/editor-dist.
             # deploy_local brings up the supervisor's OWN editor from the dist (no
@@ -3535,23 +3571,57 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     # FIRST — every downstream path (the live toggles, the full recreate, the
     # role-mcp restart) reads the marker, so writing it once here means each of
     # them picks the change up without its own special case.
+    # Agent set (STAGE_PI_AGENT): VALIDATED before any marker write (a
+    # refused combination must leave the marker untouched — the node guard's
+    # rule), then written beside the model pairs so every downstream path (the
+    # live stage below, a full recreate) reads the same marker. `agents_added` is
+    # the delta this update owes the supervisor; an unchanged set adds nothing.
+    agents_added = _validate_agents_update(req, container, workspace_path)
     model_changes = req.model_changes()
     effort_dropped: list[str] = []
     if model_changes:
         effort_dropped = _apply_model_changes(workspace_path, model_changes)
-    # `live_ok` must exclude any model change: `--worker-model haiku --enable
-    # code-server` would otherwise take the live-editor fast path, which returns
-    # without ever applying the worker pair to anything (the pair is in the marker
-    # now, but the role containers would not be re-run and a supervisor change
-    # would not be recreated) — a silent half-application.
+    if agents_added:
+        _write_marker_agents(workspace_path,
+                             list(_read_marker_agents(workspace_path)) + agents_added)
+    # `live_ok` must exclude any model OR agent change: `--worker-model haiku
+    # --enable code-server` would otherwise take the live-editor fast path, which
+    # returns without ever applying the worker pair to anything (the pair is in
+    # the marker now, but the role containers would not be re-run and a
+    # supervisor change would not be recreated) — a silent half-application. The
+    # same shape for `--agent <other> --enable code-server`.
     live_ok = (not req.rebuild and not enable_workers and not disable_workers
-               and not req.role_mcp_upstream and not model_changes)
+               and not req.role_mcp_upstream and not model_changes
+               and not agents_added)
     if live_ok and touched == {"code-server"}:
         enable = "code-server" in _parse_service_list(enable_services)
         return _live_toggle_editor(project, cfg, container, workspace_path, enable, progress)
     if live_ok and touched == {"reader"}:
         enable = "reader" in _parse_service_list(enable_services)
         return _live_toggle_reader(project, cfg, container, workspace_path, enable, progress)
+    # An agents-only update is LIVE: re-stage the merged set into the running
+    # supervisor (its own ~/.local included) and return — no recreate, nothing
+    # else in the project touched. Mixed with anything else it falls through to
+    # the full recreate, which re-reads the marker (the model-change shape).
+    # Gated on the REQUEST carrying an agent set (not on a delta): a set the
+    # project already carries is an idempotent re-stage, never a recreate.
+    if (req.agents is not None and not touched and not req.rebuild and not enable_workers
+            and not disable_workers and not req.role_mcp_upstream and not model_changes):
+        marker_now = _read_marker_agents(workspace_path)
+        staged = _dind_stage_set(marker_now)
+        progress.step("agents", f"staging {'+'.join(agents_added or staged)} into the project")
+        # deploy_local derived from the marker like every other call site (Option
+        # C: an agent-less project's supervisor stays unwired); the validator
+        # already refuses an empty set, so this is True for every real add.
+        _stage_agent_dist(container, staged, deploy_local=bool(marker_now))
+        if agents_added:
+            print(f"added {', '.join(agents_added)} to {project!r}: the supervisor tab can "
+                  f"run it now; boxes that already exist keep their current agent until "
+                  f"re-created (a project update, or remove + add the box); new boxes get it.")
+        else:
+            print(f"agent set unchanged; re-staged {', '.join(staged)} into {project!r}.")
+        return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
+                            effort_dropped=effort_dropped, agents_added=agents_added)
     # Granular model application — the point of writing the marker above. Only a
     # SUPERVISOR pair change needs the multi-minute recreate (its env is fixed at
     # docker run); the other two are far cheaper and must not pay for it:
@@ -3563,8 +3633,10 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     #     researcher's session in it — is untouched.
     # A model change MIXED with anything else falls through to the full recreate
     # below, which re-reads the marker anyway (the code-server/reader precedent).
+    # `not agents_added` is load-bearing: `--worker-model haiku --agent <other>`
+    # would otherwise return here with the marker claiming an agent nothing staged.
     if (model_changes and not touched and not req.rebuild and not enable_workers
-            and not disable_workers and not req.role_mcp_upstream):
+            and not disable_workers and not req.role_mcp_upstream and not agents_added):
         changed = set(model_changes)
         if changed == {"worker"}:
             progress.step("models", "applying the worker model")
@@ -3646,7 +3718,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     return UpdateResult(
         project=project, rebuilt=req.rebuild, refreshed_claude=refreshed,
         workers_enabled=workers_enabled, workers_disabled=workers_disabled,
-        effort_dropped=effort_dropped)
+        effort_dropped=effort_dropped, agents_added=agents_added)
 
 
 # ===========================================================================
@@ -3752,6 +3824,11 @@ VERSIONS_LOCAL_FILE = SCRIPT_DIR / "versions.local.env"
 # _AGENT_INSTALL from inside VERSION_SOURCES instead would be a module-load
 # NameError — i.e. the whole CLI dead at import.
 _OPEN_VSX_CLAUDE_EXT_API = "https://open-vsx.org/api/Anthropic/claude-code/linux-x64"
+# Claude Code's upstream version-resolve endpoint (verified against its
+# bootstrap.sh: the installer curls this to turn "latest" into a concrete
+# version; the body is a bare semver string). Read by VERSION_SOURCES and
+# _AGENT_INSTALL["claude"] — one home.
+_CLAUDE_LATEST_URL = "https://downloads.claude.ai/claude-code-releases/latest"
 
 # Upstream datasource per pin, consumed by `research images outdated`. Kept here
 # rather than annotated into versions.env so the manifest stays a clean
@@ -3829,6 +3906,11 @@ VERSION_SOURCES: dict[str, dict[str, str]] = {
         "kind": "openvsx",
         "url": _OPEN_VSX_CLAUDE_EXT_API,
     },
+    # The agent CLI pins — every registry row's `version_key` is listed here so
+    # `images outdated` sees what `research agent refresh` moves. Claude's
+    # upstream answers a bare-semver text body (`text` kind); a row whose
+    # upstream is a JSON document names its key on the row (`latest_json_key`).
+    "CLAUDE_CODE_VERSION": {"kind": "text", "url": _CLAUDE_LATEST_URL},
 }
 
 # Per-supervisor service registry. KNOWN_SERVICES lists every kind the webui
@@ -4576,6 +4658,7 @@ def build_supervisor_docker_args(
     substrate: str = Substrate.DIND_SYSBOX.value,
     service_flags: dict[str, bool] | None = None,
     agent_pair: dict[str, str] | None = None,
+    agents: "Sequence[str]" = (),
 ) -> list[str]:
     is_docker = substrate == Substrate.DOCKER.value
     args = [
@@ -4630,6 +4713,11 @@ def build_supervisor_docker_args(
     # ride the env the agent CLI reads. Callers pass the marker's `supervisor`
     # pair; an absent pair emits nothing (pre-STAGE_MODEL_SELECT project).
     args += _model_env_args(agent_pair)
+    # Per-agent config env for the deployed set (STAGE_PI_AGENT) — the
+    # same human-launched channel as the model pair: research supervisor
+    # (claude only), sandbox-dind supervisor and docker box all run a login
+    # shell in the tab. The container user's home is research on all three.
+    args += _agent_env_args(agents, "/home/research")
     for s in dns_servers:
         args += ["--dns", s]
 
@@ -4744,10 +4832,16 @@ _AGENT_INSTALL = {
         "version_key": "CLAUDE_CODE_VERSION",
         "install": "curl -fsSL https://claude.ai/install.sh | bash -s -- {ver}",
         "bin": "claude",
-        # Upstream version-resolve endpoint (verified against bootstrap.sh: the
-        # installer curls this to turn "latest" into a concrete version; the body
-        # is a bare semver string). `agent refresh` fetches just this — no install.
-        "latest_url": "https://downloads.claude.ai/claude-code-releases/latest",
+        # Upstream version-resolve endpoint: a bare semver body. `agent refresh`
+        # fetches just this — no install. (Hoisted constant, shared with
+        # VERSION_SOURCES.)
+        "latest_url": _CLAUDE_LATEST_URL,
+        # The agent's canonical config, written into the dist tree at `path`
+        # (relative to the dist root) at build. claude's lands OUTSIDE local/
+        # (its dest is ~/.claude/, installed no-clobber by every deploy site);
+        # an agent whose config lives under ~/.local puts it INSIDE local/ so
+        # it rides the existing ~/.local copy with no entrypoint edit.
+        "config": {"path": "claude/settings.json", "content": None},   # → _AGENT_SETTINGS_JSON (bound below)
         # OPTIONAL companion editor extension (agent-bound; STAGE_AGENT_EXTENSIONS).
         # A future agent with no extension omits this whole key → no .vsix, no-op.
         # version_key is a SEPARATE versions.env pin from CLAUDE_CODE_VERSION, but
@@ -4774,6 +4868,36 @@ _AGENT_INSTALL = {
     },
 }
 KNOWN_AGENTS = tuple(_AGENT_INSTALL)   # the --agent enum
+
+# Sandbox-box agent enum — LOCKSTEP COPY of the `rs-sandbox create --agent`
+# choices (cli/rs_sandbox.py, which cannot be imported here: it is staged into the
+# supervisor as a standalone file). Every known agent plus the agent-less box.
+# Defined HERE, not beside _BOX_NAME_RE, because KNOWN_AGENTS is bound only at
+# this point of the module (a derivation above it is a module-load NameError).
+_BOX_AGENTS = frozenset(KNOWN_AGENTS) | {"none"}
+
+
+def _agent_env(agent: str, home: str) -> list[tuple[str, str]]:
+    """The (name, value) env pairs that wire ONE deployed agent's config for a
+    HUMAN-launched container — a tab runs a login shell, so there is no argv to
+    inject and config must ride env — keyed by the container user's home
+    (`/home/research` for supervisors + the docker box, `/home/worker` for
+    boxes). claude needs none: it reads ~/.claude/settings.json, which the deploy
+    sites install from the dist. An agent that needs any adds its arm here.
+    MIRRORED by rs_sandbox._AGENT_BOX_ENV for boxes (staged standalone; pytest-
+    pinned equal after home substitution)."""
+    return []
+
+
+def _agent_env_args(agents: "Sequence[str]", home: str) -> list[str]:
+    """`docker run` -e args for every agent in the deployed set (see _agent_env),
+    in registry order — deterministic, so `docker inspect` reads the same."""
+    out: list[str] = []
+    for agent in KNOWN_AGENTS:
+        if agent in agents:
+            for k, v in _agent_env(agent, home):
+                out += ["-e", f"{k}={v}"]
+    return out
 
 # A version token safe to interpolate into the in-container install shell — a
 # charset guard (defense-in-depth against a crafted versions.env), not a range.
@@ -4835,6 +4959,7 @@ _AGENT_SETTINGS_JSON = json.dumps(
      "attribution": {"commit": "", "pr": "", "sessionUrl": False},
      "remoteControlAtStartup": False},
     indent=2) + "\n"
+_AGENT_INSTALL["claude"]["config"]["content"] = _AGENT_SETTINGS_JSON
 
 
 # ---------------------------------------------------------------------------
@@ -5064,17 +5189,24 @@ def _agent_build_dist(agent: str, version: str) -> None:
         if not built:
             die(f"agent {agent} build failed after {_AGENT_BUILD_ATTEMPTS} "
                 f"attempts (version {version}):\n{last_err[-_AGENT_ERR_TAIL:] or 'no output'}")
-        _relativize_launcher(captured / "bin" / bin_)
+        # The relink is claude-specific (a symlink launcher into ~/.local/share);
+        # an agent whose launcher is a regular file skips it.
+        if spec.get("launcher_symlink", True):
+            _relativize_launcher(captured / "bin" / bin_)
         dest = agent_dist_path(agent)
         if dest.exists():
             shutil.rmtree(dest)
         # Fixed tree (STAGE_AGENT_DIST_SETTINGS): local/ = the captured ~/.local,
-        # claude/settings.json = the bundled bypass settings (no hooks). Mirrors the
+        # plus the agent's canonical config at spec["config"]["path"] — claude's
+        # beside local/ (claude/settings.json), another agent's INSIDE it. Mirrors the
         # editor dist's fixed-tree shape. captured is tmp/.local, same fs as dest.
         dest.mkdir(parents=True)
         os.replace(captured, dest / "local")
-        (dest / "claude").mkdir()
-        (dest / "claude" / "settings.json").write_text(_AGENT_SETTINGS_JSON)
+        config = spec.get("config")
+        if config:
+            cfg_path = dest / config["path"]
+            cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            cfg_path.write_text(config["content"])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     # ext_version records what this build actually BUNDLED (the local ext_ver the
@@ -5107,11 +5239,30 @@ def agent_pull(agent: str = "claude", version: str | None = None,
     return {"agent": agent, "version": ver, "path": str(agent_dist_path(agent))}
 
 
-def _stage_agent_dist(supervisor: str, agent: str = DEFAULT_AGENT,
+def _dind_stage_set(agents: "Sequence[str]") -> list[str]:
+    """The agent set a dind supervisor stages as its fleet copy-source: the
+    project's selected agents PLUS claude (Option C — /opt/agent-dist is always a
+    claude copy-source for the boxes/fleet, so an agent-less or claude-less
+    project still stages it). Dedup, default first. Selecting ANY agent deploys
+    this whole set into the supervisor's own ~/.local (the merged tree is one
+    copy); the per-agent split is the deferred convergence."""
+    return list(dict.fromkeys([DEFAULT_AGENT, *agents]))
+
+
+def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,),
                       *, deploy_local: bool = True) -> None:
-    """Stage the host agent dist into a RUNNING supervisor (STAGE_AGENT_DIST slice
-    2). Real files at AGENT_DIST_MOUNT — the inner fleet (worker / role-MCP /
+    """Stage the host agent dists — the SET `agents`, merged — into a RUNNING
+    supervisor (STAGE_AGENT_DIST slice 2; N agents since STAGE_PI_AGENT).
+    Real files at AGENT_DIST_MOUNT — the inner fleet (worker / role-MCP /
     sandbox-box) RO-mounts that path and cp's its own writable copy at boot.
+    MERGED, not per-agent: every agent's `local/` lands in ONE local/ (their file
+    sets are disjoint by construction — bin/<agent> + share/<agent>/… + the
+    vsix/config sidecars), each agent's config beside it, so the five baked
+    entrypoints keep copying `local/.` unchanged and a second agent reaches an
+    existing project with no image rebuild. The wipe-then-extract-all shape is
+    what makes an agent ADD idempotent: the caller passes the whole set (the
+    marker's `agents` ∪ claude), never a delta — a single-agent re-stage would
+    delete its siblings.
     `deploy_local` ALSO (re)deploys the supervisor's OWN ~/.local from the
     dist — always True for the research flavor (the PI's interactive claude +
     the rs-audit-stop hook live there); on sandbox-dind it follows the create's
@@ -5130,9 +5281,15 @@ def _stage_agent_dist(supervisor: str, agent: str = DEFAULT_AGENT,
     Runs as root (-u 0) to write /opt + /home; chowns to uid:gid 1000:1000
     numerically (the documented both-leaf uid) so it's user-name-agnostic; absolute
     /home/research, not ~ (cross-boundary-path rule)."""
-    src = agent_dist_path(agent)
-    if not dist_present(agent):
-        die(f"no cached {agent} dist to stage — pull it under Management → Software first")
+    if isinstance(agents, str):   # a str IS a Sequence[str]; it would iterate characters
+        raise TypeError("_stage_agent_dist takes a sequence of agent names, not a string")
+    agents = list(dict.fromkeys(agents))
+    if not agents:
+        raise ValueError("_stage_agent_dist needs at least one agent")
+    for agent in agents:
+        if not dist_present(agent):
+            die(f"no cached {agent} dist to stage — pull it under Management → Software first")
+    label = "+".join(agents)
     # SYSBOX UID SHIFT: a plain `docker cp` carries the HOST uid/gid of the cache
     # files; inside the sysbox supervisor those land as a foreign (unmapped) owner
     # that container-root can neither chown NOR rm NOR overwrite (EPERM — even a
@@ -5155,15 +5312,20 @@ def _stage_agent_dist(supervisor: str, agent: str = DEFAULT_AGENT,
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
         with tarfile.open(fileobj=proc.stdin, mode="w|") as tf:   # streaming; symlinks preserved
-            for entry in sorted(os.listdir(src)):
-                tf.add(os.path.join(src, entry), arcname=entry, filter=_root_owned)
+            # One stream, every agent's tree in turn: a repeated directory header
+            # (local/, local/bin/, …) is a no-op mkdir for tar -x; the FILE sets
+            # never overlap (see the docstring).
+            for agent in agents:
+                src = agent_dist_path(agent)
+                for entry in sorted(os.listdir(src)):
+                    tf.add(os.path.join(src, entry), arcname=entry, filter=_root_owned)
     finally:
         if proc.stdin:
             proc.stdin.close()
     _, err = proc.communicate()
     if proc.returncode != 0:
         detail = (err.decode(errors="replace") if err else "").strip()
-        die(f"staging {agent} dist into {supervisor} failed: "
+        die(f"staging {label} dist into {supervisor} failed: "
             f"{detail or 'tar extract returned non-zero'}")
     if deploy_local:
         # /opt/agent-dist is now research-owned, so cp -a preserves cleanly. -f
@@ -5174,6 +5336,11 @@ def _stage_agent_dist(supervisor: str, agent: str = DEFAULT_AGENT,
         # the settings.json install is NO-CLOBBER so a baked/propagated settings —
         # chiefly the research supervisor's hook-bearing one from setup.sh, which is
         # boot-ordered to land first — is preserved (STAGE_AGENT_DIST_SETTINGS).
+        # claude is in every staged set by construction (_dind_stage_set floors
+        # on it; research passes [DEFAULT_AGENT]), so its settings install is
+        # unconditional and the command is byte-identical to the single-agent
+        # one; an agent whose config must ALSO land outside ~/.local adds its
+        # own fragment here.
         run_check(["docker", "exec", "-u", "0", supervisor, "sh", "-c",
                    f"mkdir -p /home/research/.local /home/research/.claude && "
                    f"cp -af {AGENT_DIST_MOUNT}/local/. /home/research/.local/ && "
@@ -5263,7 +5430,7 @@ def _agent_resolve_upstream(agent: str) -> tuple[str, str]:
             f"{(r.stderr or '').strip() or 'fetch failed'}")
     out = r.stdout or ""
     if not ext:
-        return _checked_upstream_version(out.strip(), agent, "version"), ""
+        return _cli_latest_from_body(spec, out, agent), ""
     head, sep, tail = out.partition(_UPSTREAM_SPLIT_SENTINEL)
     if not sep:
         die(f"could not resolve upstream {agent} version: "
@@ -5274,9 +5441,32 @@ def _agent_resolve_upstream(agent: str) -> tuple[str, str]:
         die(f"could not parse the upstream {agent} extension metadata")
     if not isinstance(meta, dict):
         die(f"upstream {agent} extension metadata was not a JSON object")
-    return (_checked_upstream_version(head.strip(), agent, "version"),
+    return (_cli_latest_from_body(spec, head, agent),
             _checked_upstream_version(meta.get(ext["latest_json_key"]),
                                       agent, "extension version"))
+
+
+def _cli_latest_from_body(spec: dict, body: str, agent: str) -> str:
+    """The CLI's upstream latest out of its `latest_url` body: a bare version
+    string (claude) or, when the spec names `latest_json_key`, that key of a JSON
+    object (a GitHub release's `tag_name`, say). `latest_strip_prefix` (`v`) is removed
+    BEFORE the charset guard — `v1.2.3` passes _AGENT_VERSION_RE, so stripping
+    after would pin `v1.2.3` and format the download URL as `vv1.2.3`."""
+    key = spec.get("latest_json_key")
+    if key:
+        try:
+            meta = json.loads(body)
+        except ValueError:
+            die(f"could not parse the upstream {agent} version metadata")
+        if not isinstance(meta, dict):
+            die(f"upstream {agent} version metadata was not a JSON object")
+        value = meta.get(key)
+    else:
+        value = body.strip()
+    prefix = spec.get("latest_strip_prefix")
+    if prefix and isinstance(value, str) and value.startswith(prefix):
+        value = value[len(prefix):]
+    return _checked_upstream_version(value, agent, "version")
 
 
 def agent_refresh_check(agent: str = "claude") -> tuple[str, str, str, str]:
@@ -6333,6 +6523,12 @@ def _latest_version(source: dict[str, str]) -> str:
     if kind == "pypi":
         data = _http_json(f"https://pypi.org/pypi/{source['pkg']}/json")
         return str(data["info"]["version"])
+    if kind == "text":
+        # A bare version string as the whole body (claude's latest endpoint).
+        req = urllib.request.Request(
+            source["url"], headers={"User-Agent": "research-sandbox/images-outdated"})
+        with urllib.request.urlopen(req, timeout=10.0) as resp:
+            return resp.read().decode().strip()
     if kind == "openvsx":
         # The metadata GET carries the highest-semver version at the top level
         # (pre-release included — see the VERSION_SOURCES header) — for the
@@ -6576,7 +6772,7 @@ def _read_supervisor_metadata(container: str) -> dict:
 def _stash_creds_for_rebuild(
     container: str, was_running: bool, workspace_path: Path
 ) -> None:
-    """Move Claude auth state into the workspace bind-mount so it survives
+    """Move agent auth state into the workspace bind-mount so it survives
     container destruction. Two pieces:
       - ~research/.claude/        → /workspace/.creds-stash/
       - ~research/.claude.json    → /workspace/.creds-stash-home.json
@@ -6769,6 +6965,8 @@ def _recreate_supervisor(
         # durable source (it survives the rm+create), so a recreate cannot revert
         # the researcher's model choice.
         agent_pair=_read_models(workspace_path).get("supervisor"),
+        # The deployed set, from the marker (research markers carry [] → no env).
+        agents=_read_marker_agents(workspace_path),
     )
     if md["extra_mounts"]:
         docker_args = docker_args[:-1] + md["extra_mounts"] + [docker_args[-1]]
@@ -6804,9 +7002,9 @@ def _recreate_supervisor(
         # source (stamped at create, survives on the bind-mount; dind containers
         # carry no agent label). Editor gated like research. No bake, so a
         # recreate must redeploy. Before the role-MCP relaunch below.
-        _stage_agent_dist(
-            container,
-            deploy_local=DEFAULT_AGENT in _read_marker_agents(workspace_path))
+        marker_agents = _read_marker_agents(workspace_path)
+        _stage_agent_dist(container, _dind_stage_set(marker_agents),
+                          deploy_local=bool(marker_agents))
         if editor_dist_present():
             _stage_editor_dist(container, deploy_local=flags.get("code-server", True))
         # Reader dist re-staged (STAGE_READER): survives the recreate so a
@@ -6841,7 +7039,7 @@ def _recreate_supervisor(
         # Re-stage the agent dist into the fresh container (its own ~/.local + the
         # /opt/agent-dist the fleet mounts) — no bake, so a recreate must redeploy
         # it. Before the role-MCP relaunch loop below, which mounts that path.
-        _stage_agent_dist(container)
+        _stage_agent_dist(container, [DEFAULT_AGENT])
         # Editor dist re-staged the same way (STAGE_EDITOR_DIST) so a recreated
         # supervisor's interactive PI/extension containers find a populated mount.
         # deploy_local re-deploys the supervisor's OWN editor (no bake now), gated
@@ -7029,6 +7227,14 @@ def _update_docker_substrate(req: "UpdateRequest", cfg: "Config",  # type: ignor
     # box, and drops the model silently. And a model-only update would otherwise
     # die via `not touched` with a message about the *editor* — telling the
     # operator the wrong thing about why their model change was refused.
+    # Same posture for the agent SET (STAGE_PI_AGENT): a docker box's
+    # per-agent dist mounts are fixed at docker run and recovered from the old
+    # container on recreate, so there is no additive path — refuse, by name, so
+    # `--agent x --enable code-server` cannot recreate the box and drop the agent
+    # silently, and `--agent x` alone is not refused with the editor's message.
+    if req.agents is not None:
+        die("the agent set is fixed at create on the docker substrate "
+            "(a plain runc box); recreate the project to change it")
     if req.model_changes():
         die("the agent model is fixed at create on the docker substrate "
             "(a plain runc box); recreate the project to change it")
@@ -7096,7 +7302,11 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
         project_type=md["project_type"], substrate=md["substrate"],
         service_flags=service_flags,
         # Marker-sourced, same reasoning as _recreate_supervisor.
-        agent_pair=_read_models(workspace_path).get("supervisor"))
+        agent_pair=_read_models(workspace_path).get("supervisor"),
+        # The docker box's agent set lives in its recovered per-agent mounts
+        # (`-v <cache>/<a>:/opt/agent-dist/<a>:ro`, docker-run fixed) — the same
+        # source the entrypoint's per-agent loop reads, so env and deploy agree.
+        agents=_agents_from_mounts(md["extra_mounts"]))
     # Recovered binds minus any prior editor-dist mount (agent-dist + --data mounts
     # pass through); re-derive the editor mount from the new flag (mirrors create).
     extra = _without_mount(md["extra_mounts"], EDITOR_DIST_MOUNT)
@@ -8590,6 +8800,24 @@ def _project_has_fetch_consumers(workspace_path: "Path") -> bool:
     return any(isinstance(e, dict) and e.get("fetch") for e in entries.values())
 
 
+def _agents_from_mounts(extra_mounts: list[str]) -> list[str]:
+    """Agent names out of a docker box's recovered `-v …:/opt/agent-dist/<a>:ro`
+    binds (create() mounts one per enabled agent). Tolerant: anything that is not
+    such a bind is skipped."""
+    out: list[str] = []
+    for m in extra_mounts:
+        if not isinstance(m, str) or ":" not in m:
+            continue
+        parts = m.split(":")
+        dest = parts[1] if len(parts) > 1 else ""
+        prefix = f"{AGENT_DIST_MOUNT}/"
+        if dest.startswith(prefix):
+            a = dest[len(prefix):]
+            if a in KNOWN_AGENTS and a not in out:
+                out.append(a)
+    return out
+
+
 def _read_marker_agents(workspace_path: "Path") -> list[str]:
     """The agent set stamped into .orchestrator/project.json at create (drives the
     sandbox-dind recreate's deploy_local). Tolerant read, the _read_box_pins shape:
@@ -8603,6 +8831,89 @@ def _read_marker_agents(workspace_path: "Path") -> list[str]:
         return []
     agents = data.get("agents")
     return agents if isinstance(agents, list) else []
+
+
+def _write_marker_agents(workspace_path: "Path", agents: list[str]) -> None:
+    """Write the agent set into project.json, keeping every other key intact —
+    and REFUSING on an unreadable marker rather than clobbering it (the B31
+    shape the two read-modify-write precedents accept for a backfill is NOT
+    acceptable for a live operator update: `type`, `substrate`, `workflow`,
+    `models`, `box_image_pins`, `ssh_port` would all vanish, and the recreate +
+    the webui flavor gate read every one of them)."""
+    f = workspace_path / ".orchestrator" / "project.json"
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        raise ValidationError(
+            f"cannot update the agent set: the project marker {f} is unreadable "
+            f"({e}); repair it before changing agents")
+    if not isinstance(data, dict):
+        raise ValidationError(
+            f"cannot update the agent set: the project marker {f} is not a JSON object")
+    data["agents"] = list(dict.fromkeys(agents))
+    f.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def _validate_agents_update(req: "UpdateRequest", container: str,
+                            workspace_path: "Path") -> list[str]:
+    """The agents an update ADDS, or [] when the request carries no agent change /
+    an already-complete set. Raises ValidationError (pre-side-effect, a clean
+    browser refusal) on: a research project (claude-only in this slice — its
+    supervision gate is a claude hook), a removal (slice 1 is add-only: a deployed
+    agent leaves only with a recreate), or an unreadable marker."""
+    if req.agents is None:
+        return []
+    if _container_project_type(container) != PROJECT_TYPE_SANDBOX_DIND:
+        raise ValidationError(
+            "the agent set can only change on a sandbox-dind (dev / sandbox) project; "
+            "a research-workflow project runs claude")
+    f = workspace_path / ".orchestrator" / "project.json"
+    if not f.is_file():
+        raise ValidationError(
+            f"cannot update the agent set: the project marker {f} is missing")
+    current = list(_read_marker_agents(workspace_path))
+    missing = [a for a in current if a not in req.agents]
+    if missing:
+        raise ValidationError(
+            f"agents can be added, not removed ({', '.join(missing)} would be dropped); "
+            f"recreate the project to shed an agent")
+    return [a for a in req.agents if a not in current]
+
+
+def project_add_agents(project: str, agents: "Sequence[str]",
+                       cfg: "Config" | None = None) -> "UpdateResult":  # type: ignore[name-defined]
+    """`project update-agent --agent X` (CLI): the additive form of update() —
+    the current marker set ∪ `agents`. With no agents it re-stages the current
+    set (the old "refresh the dist copy" semantics), on any dind flavor."""
+    if cfg is None:
+        cfg = load_config()
+    container = container_name_for(project)
+    if not container_exists(container):
+        die(f"project {project!r} does not exist")
+    if not container_running(container):
+        die(f"project {project!r} is not running — start it first")
+    workspace_path = workspace_path_for(project, cfg)
+    if not agents:
+        is_research = _container_project_type(container) != PROJECT_TYPE_SANDBOX_DIND
+        current = [DEFAULT_AGENT] if is_research else _dind_stage_set(_read_marker_agents(workspace_path))
+        _stage_agent_dist(container, current,
+                          deploy_local=is_research or bool(_read_marker_agents(workspace_path)))
+        return UpdateResult(project=project, rebuilt=False, refreshed_claude=False)
+    is_research = _container_project_type(container) != PROJECT_TYPE_SANDBOX_DIND
+    marker_agents = list(_read_marker_agents(workspace_path))
+    # Membership is against the MARKER (research: claude by construction), not
+    # the floored stage set — else `--agent claude` on an agent-less sandbox-dind
+    # project would read as "already carried" and never wire the supervisor.
+    carried = [DEFAULT_AGENT] if is_research else marker_agents
+    if all(a in carried for a in agents):
+        # Nothing to add — the documented re-stage (research's `--agent claude`
+        # included), on any dind flavor, never routed through update().
+        _stage_agent_dist(container, [DEFAULT_AGENT] if is_research else _dind_stage_set(marker_agents),
+                          deploy_local=is_research or bool(marker_agents))
+        return UpdateResult(project=project, rebuilt=False, refreshed_claude=False)
+    current = list(_read_marker_agents(workspace_path))
+    req = UpdateRequest.from_kwargs(name=project, agents=current + list(agents))
+    return update(req, cfg)
 
 
 def _read_box_pins(workspace_path: "Path") -> dict[str, str]:
@@ -9815,6 +10126,16 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     cfg = load_config()
     container = _running_dind_supervisor(req.project)
     workspace_path = workspace_path_for(req.project, cfg)
+    # An agent this project never staged cannot reach the box (the merged
+    # copy-source holds the project's set + claude) — refuse by name, before any
+    # side effect, rather than mint a box whose tab says "command not found"
+    # (STAGE_PI_AGENT; the docker-substrate update takes the same posture).
+    if req.agent not in (None, "none"):
+        carried = _dind_stage_set(_read_marker_agents(workspace_path))
+        if req.agent not in carried:
+            raise ValidationError(
+                f"this project carries {', '.join(carried)} — add {req.agent!r} to "
+                f"the project (Config → Agents) before giving a box to it")
     # Refresh the staged box-preset catalog (Q1→live: an operator-registered type in
     # box-registry.json becomes usable on this already-created project). strict=True
     # → a malformed registry surfaces as ValidationError, not a half-built box.
@@ -10022,7 +10343,13 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     # otherwise the project's `box` pair from the marker — which create already
     # wrote CONCRETE and effort-drop-resolved, so it is safe to use as-is. A box
     # does NOT inherit the supervisor's pair: one type, one lookup.
-    box_pair = _read_models(workspace_path).get("box") or {}
+    # The pair is claude's (STAGE_PI_AGENT): resolve the box's EFFECTIVE
+    # agent (explicit, else the preset default; the implicit `empty` preset has
+    # none) and thread the marker's default pair only for a claude box. (An
+    # explicit pair on a non-claude agent was already refused in from_kwargs.)
+    eff_agent = req.agent if req.agent is not None else (
+        DEFAULT_AGENT if catalog.get(req.preset, {}).get("agent_default") else "none")
+    box_pair = (_read_models(workspace_path).get("box") or {}) if eff_agent == DEFAULT_AGENT else {}
     box_model = req.model or box_pair.get("model") or ""
     box_effort = req.effort or box_pair.get("effort") or ""
     if box_model and box_effort:
