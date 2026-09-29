@@ -31,14 +31,18 @@ Containment, by construction:
     raises SystemExit; the dispatcher catches it and returns an error envelope
     (the same SystemExit channel the CLI lets exit the process).
 
-Requests are handled one at a time (a single local operator; lifecycle ops are
-infrequent). Serial handling also keeps the stderr-capture below race-free.
+Requests are handled one at a time (a single local operator). Serial handling
+also keeps the stderr-capture below race-free. Anything slow never runs on
+that one thread: builds, reviews, dev provisions and project start/stop/update
+each run in a DETACHED child (the lanes below), so the daemon keeps answering
+while they work.
 """
 
 from __future__ import annotations
 
 import contextlib
 import dataclasses
+import fcntl
 import io
 import json
 import os
@@ -90,6 +94,8 @@ BROKER_FULLLOG_DIR = BROKER_DIR / "oplogs-full"     # .full.log — host-only
 
 # Verbs that get a per-op progress log: the long-running lifecycle writes. Reads
 # (OPEN_VERBS) and auth verbs never produce one. op_id-driven from the webui.
+# (start/stop/update now run on the lifecycle lane, whose child owns its op-log
+# directly; they stay listed so the set keeps naming every op-logged verb.)
 PROGRESS_VERBS = frozenset({"create", "update", "destroy", "start", "stop",
                             "box_add", "box_remove", "dev_gitea_start",
                             "dev_passwd", "dev_repo_remove",
@@ -133,6 +139,23 @@ REVIEW_LOCKS_DIR = BROKER_DIR / "review-locks"
 # a successful spawn, child-unlinked in finally; build_alive covers dev-box ops
 # through these. Host-only, never under run/.
 DEV_BOX_LOCKS_DIR = BROKER_DIR / "dev-box-locks"
+
+# The lifecycle lane (project start/stop/update off the accept thread). Three
+# host-only files, never under run/:
+#   * LIFECYCLE_LOCKS_DIR — one {pid, project, verb} file per op, written by the
+#     PARENT after a successful spawn and unlinked by the child's finally. It is
+#     what makes an op "in flight" (queued or running) for the same-project
+#     refusals, lifecycle_active and build_alive.
+#   * LIFECYCLE_LOCK — the host-wide flock that makes project lifecycle actions
+#     run one at a time: a lane child BLOCKS on it (that wait is the queue), the
+#     inline create/destroy take it non-blocking and refuse when it is held. The
+#     kernel drops an flock when its holder dies, so a hard-killed child can
+#     never wedge the queue.
+#   * LIFECYCLE_HOLDER — {op_id} of the lane op currently holding the flock, so a
+#     reader can tell running from queued.
+LIFECYCLE_LOCKS_DIR = BROKER_DIR / "lifecycle-locks"
+LIFECYCLE_LOCK = BROKER_DIR / "lifecycle.lock"
+LIFECYCLE_HOLDER = BROKER_DIR / "lifecycle.holder"
 
 # Max bytes returned per op_full_tail poll. Bounds ONE reply frame — a fleet-build
 # full log grows to MBs, and the whole point of tailing is not to ship it all at
@@ -451,17 +474,35 @@ def _verb_build_alive(args: dict, _progress=None) -> dict:
     # comes from the per-op lock files (same terminal-first property: the
     # children write done/fail before their finally unlinks the lock).
     if not alive:
-        alive = _review_lock_alive(op_id) or _dev_box_lock_alive(op_id)
+        alive = (_review_lock_alive(op_id) or _dev_box_lock_alive(op_id)
+                 or _lifecycle_op(op_id) is not None)
     return {"alive": bool(alive)}
 
 
+def _verb_lifecycle_active(_args: dict, _progress=None) -> dict:
+    """Token-gated read: every project start/stop/update in flight on the
+    lifecycle lane, {op_id, project, verb, state: running|queued}. The browser
+    seeds its "starting…" labels from this after a reload, so the in-flight view
+    comes from the broker and not from a page's memory. A safe read (in VERBS,
+    runs inline): tolerant of vanished/garbled lock files, never creates one."""
+    return {"ops": _live_lifecycle_ops()}
+
+
+# start/stop take ONLY the project name over the socket: `all` (every project
+# at once) stays a CLI-only form — the webui never sends it, and a lane op is
+# scoped to one project so the same-project refusals can key on it.
+START_STOP_WEBUI_FIELDS = frozenset({"name"})
+
+
 def _verb_stop(args: dict, progress=None) -> list[dict]:
-    req = rscore.StartStopRequest.from_kwargs(**args)  # may raise ValidationError
+    safe = {k: v for k, v in args.items() if k in START_STOP_WEBUI_FIELDS}
+    req = rscore.StartStopRequest.from_kwargs(**safe)  # may raise ValidationError
     return [dataclasses.asdict(r) for r in rscore.stop(req, progress=progress)]
 
 
 def _verb_start(args: dict, progress=None) -> list[dict]:
-    req = rscore.StartStopRequest.from_kwargs(**args)  # may raise ValidationError
+    safe = {k: v for k, v in args.items() if k in START_STOP_WEBUI_FIELDS}
+    req = rscore.StartStopRequest.from_kwargs(**safe)  # may raise ValidationError
     return [dataclasses.asdict(r) for r in rscore.start(req, progress=progress)]
 
 
@@ -949,11 +990,12 @@ VERBS = {
     "reader_refresh_check": _verb_reader_refresh_check,
     "op_full_tail": _verb_op_full_tail,
     "build_alive": _verb_build_alive,
-    "stop": _verb_stop,
-    "start": _verb_start,
+    "lifecycle_active": _verb_lifecycle_active,
+    # start / stop / update are NOT here: they run on the lifecycle lane
+    # (LIFECYCLE_DISPATCH), so the inline path cannot hold the accept thread
+    # for a supervisor recreate.
     "create": _verb_create,
     "attach": _verb_attach,
-    "update": _verb_update,
     "destroy": _verb_destroy,
     "box_add": _verb_box_add,
     "box_remove": _verb_box_remove,
@@ -1455,6 +1497,285 @@ def run_dev_box(op_id: str, verb: str) -> None:
         _release_dev_box_lock(op_id)
 
 
+# ---------------------------------------------------------------------------
+# Lifecycle lane (project start / stop / update)
+#
+# A start or an update recreates the project's supervisor — tens of seconds to
+# minutes — and inline on the serial accept thread it froze every other verb
+# (Management, login, attach) for that long. So the three live in their OWN
+# child-only table, absent from VERBS, reached only through dispatch's
+# lifecycle branch: gate → validate → same-project refusal → spawn a DETACHED
+# child (`broker __run-lifecycle`) → the parent writes the per-op lock → reply
+# started:true at once. The child owns the op-log and waits its turn on the
+# host-wide LIFECYCLE_LOCK flock (one lifecycle action at a time; the wait is
+# the queue, announced by a `queue` milestone). Its view-log failure text is
+# the SAME text the inline path wrote before (ValidationError text, the die()
+# message, HarnessError.log_msg) — lifecycle messages are operator-facing, and
+# the browser shows them as the reason.
+# ---------------------------------------------------------------------------
+
+# The child-only lifecycle vocabulary — NOT in VERBS. verb → (field allowlist
+# the parent filters by, request class for the PRE-SPAWN shape validation,
+# verb fn the child runs). One table so the three cannot drift.
+_LIFECYCLE_VERBS = {
+    "start": (START_STOP_WEBUI_FIELDS, rscore.StartStopRequest, _verb_start),
+    "stop": (START_STOP_WEBUI_FIELDS, rscore.StartStopRequest, _verb_stop),
+    "update": (UPDATE_WEBUI_FIELDS, rscore.UpdateRequest, _verb_update),
+}
+LIFECYCLE_DISPATCH = {v: spec[2] for v, spec in _LIFECYCLE_VERBS.items()}
+
+# The argv marker a live lane child carries (`research.py broker
+# __run-lifecycle <op_id> …`) — the liveness check reads it back from /proc.
+_LIFECYCLE_CHILD_ARG = "__run-lifecycle"
+
+_BUSY_MSG = "another project action is running — try again when it finishes"
+
+# Whether this host exposes per-process command lines (Linux /proc). Without it
+# a missing /proc/<pid> would read every lane child as dead.
+_PROC_READABLE = Path("/proc/self/cmdline").exists()
+
+# Inline verbs refused while their project has a lane op in flight → the arg
+# naming the project. destroy is here too (it also takes the flock, but a start
+# just spawned may not have reached the flock yet — the per-op lock already
+# exists, so this closes that window).
+_INLINE_PROJECT_KEY = {
+    "destroy": "name",
+    "box_add": "project", "box_remove": "project",
+    "port_add": "project", "port_remove": "project",
+}
+# Inline verbs that take the host-wide lifecycle flock (non-blocking).
+_INLINE_EXCLUSIVE = frozenset({"create", "destroy"})
+
+
+def _lifecycle_lock_path(op_id: str) -> Path:
+    return LIFECYCLE_LOCKS_DIR / f"{op_id}.json"
+
+
+def _write_lifecycle_lock(op_id: str, pid: int, project: str, verb: str) -> None:
+    LIFECYCLE_LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+    _lifecycle_lock_path(op_id).write_text(
+        json.dumps({"pid": pid, "project": project, "verb": verb}))
+
+
+def _release_lifecycle_lock(op_id: str) -> None:
+    with contextlib.suppress(FileNotFoundError, OSError):
+        _lifecycle_lock_path(op_id).unlink()
+
+
+def _lifecycle_child_alive(pid: int, op_id: str) -> bool:
+    """True iff `pid` is a RUNNING lane child for THIS op. A bare `kill(pid, 0)`
+    is not enough here: the daemon never waits on its lane children, so a
+    hard-killed one lingers as a zombie (which `kill` still reaches) until the
+    daemon next spawns something, and after a reboot a leftover lock can name a
+    pid the OS has handed to an unrelated process. Both read wrong through
+    `kill`; the process's command line tells them apart — a zombie's is empty,
+    a stranger's does not carry this lane's argv marker and op_id."""
+    if not _PROC_READABLE:
+        return _alive(pid)                    # no /proc on this host: best effort
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return _alive(pid)
+    argv = raw.split(b"\0")
+    return (_LIFECYCLE_CHILD_ARG.encode() in argv) and (op_id.encode() in argv)
+
+
+def _lifecycle_op(op_id: str) -> dict | None:
+    """This op's lock record if it is in flight (its child is alive), else None.
+    Tolerant: a vanished, unreadable or garbled file reads as not in flight."""
+    try:
+        rec = json.loads(_lifecycle_lock_path(op_id).read_text())
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+    if not isinstance(rec, dict):
+        return None
+    pid = rec.get("pid")
+    if not isinstance(pid, int) or not _lifecycle_child_alive(pid, op_id):
+        return None
+    return rec
+
+
+def _lifecycle_holder_op() -> str | None:
+    try:
+        rec = json.loads(LIFECYCLE_HOLDER.read_text())
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+    op = rec.get("op_id") if isinstance(rec, dict) else None
+    return op if isinstance(op, str) else None
+
+
+def _live_lifecycle_ops() -> list[dict]:
+    """Every lane op in flight, oldest first: {op_id, project, verb, state}. A
+    read — never creates the directory, never raises on a bad file."""
+    try:
+        found = list(LIFECYCLE_LOCKS_DIR.glob("*.json"))
+    except (FileNotFoundError, OSError):
+        return []
+    stamped = []
+    for path in found:
+        try:
+            stamped.append((path.stat().st_mtime, path))
+        except OSError:                           # finished between glob and stat
+            continue
+    holder = _lifecycle_holder_op()
+    out = []
+    for _mtime, path in sorted(stamped):
+        op_id = path.name[: -len(".json")]
+        if not _OP_ID_RE.match(op_id):
+            continue
+        rec = _lifecycle_op(op_id)
+        if rec is None:
+            continue
+        out.append({"op_id": op_id, "project": rec.get("project"),
+                    "verb": rec.get("verb"),
+                    "state": "running" if holder == op_id else "queued"})
+    return out
+
+
+def _project_in_flight(project) -> bool:
+    """True iff `project` has a start/stop/update in flight on the lane."""
+    if not isinstance(project, str):
+        return False
+    return any(op["project"] == project for op in _live_lifecycle_ops())
+
+
+def _prune_dead_lifecycle_locks() -> None:
+    """Drop lock files whose child is gone (a hard kill, or a child that ended
+    before the parent wrote its lock). Called only from the lane's write path —
+    reads never mutate."""
+    try:
+        paths = list(LIFECYCLE_LOCKS_DIR.glob("*.json"))
+    except (FileNotFoundError, OSError):
+        return
+    for path in paths:
+        op_id = path.name[: -len(".json")]
+        if _lifecycle_op(op_id) is None:
+            with contextlib.suppress(FileNotFoundError, OSError):
+                path.unlink()
+
+
+def _try_lifecycle_flock():
+    """Take the host-wide lifecycle flock WITHOUT waiting (the inline create /
+    destroy path, which must never block the accept thread). Returns the open
+    file holding the lock, or None when another action holds it. OSError
+    propagates to the caller, which maps it to an error envelope."""
+    BROKER_DIR.mkdir(parents=True, exist_ok=True)
+    f = open(LIFECYCLE_LOCK, "a")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.close()
+        return None
+    except OSError:
+        f.close()
+        raise
+    return f
+
+
+def _spawn_lifecycle_child(op_id: str, verb: str, args: dict) -> int:
+    """Spawn the DETACHED lifecycle child (`broker __run-lifecycle <op_id> <verb>
+    <args_json>`). Mirrors _spawn_review_child: start_new_session so a daemon
+    restart doesn't kill an in-flight start; BROKER_LOG is only the startup
+    backstop. The args ride argv — the filtered start/stop/update fields carry
+    no secret (a name, component tokens, model choices, an agent set)."""
+    BROKER_DIR.mkdir(parents=True, exist_ok=True)
+    research_py = rscore.SCRIPT_DIR / "research.py"
+    log = open(BROKER_LOG, "a")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(research_py), "broker", _LIFECYCLE_CHILD_ARG,
+             op_id, verb, json.dumps(args)],
+            stdout=log, stderr=log, start_new_session=True,
+            cwd=str(rscore.SCRIPT_DIR))
+    finally:
+        log.close()                               # the child holds its own dup'd fd
+    return proc.pid
+
+
+def _write_lifecycle_holder(op_id: str) -> None:
+    LIFECYCLE_HOLDER.write_text(json.dumps({"op_id": op_id}))
+
+
+def _clear_lifecycle_holder(op_id: str) -> None:
+    # Only our own record: a crashed predecessor's stale holder was already
+    # overwritten when we took the flock, and nothing else writes it while we
+    # hold it.
+    if _lifecycle_holder_op() == op_id:
+        with contextlib.suppress(FileNotFoundError, OSError):
+            LIFECYCLE_HOLDER.unlink()
+
+
+def run_lifecycle(op_id: str, verb: str, args_json: str) -> None:
+    """The DETACHED lifecycle child (invoked by `broker __run-lifecycle`). Owns
+    the op-log for one start/stop/update: points fd 1/2 at the HOST-ONLY full
+    log, waits its turn on the host-wide flock (a `queue` milestone first when
+    another action holds it), marks itself the holder, runs the verb DIRECTLY
+    from LIFECYCLE_DISPATCH (never dispatch() — re-entry), and writes the
+    terminal. Release order is terminal → holder → per-op lock → flock, so a
+    reader that sees the op gone has already been able to read its terminal. An
+    unknown verb or an unwritable op-log releases the per-op lock and returns
+    before writing anything (gate-before-sink)."""
+    if verb not in LIFECYCLE_DISPATCH:
+        _release_lifecycle_lock(op_id)
+        return
+    try:
+        args = json.loads(args_json)
+    except ValueError:
+        args = {}
+    if not isinstance(args, dict):
+        args = {}
+    try:
+        op = make_oplog(op_id, verb, args)
+    except (ValueError, OSError):
+        _release_lifecycle_lock(op_id)
+        return
+    lock_f = None
+    held = False
+    buf = io.StringIO()                           # die() text → the terminal reason
+    try:
+        os.dup2(op.full.fileno(), 1)
+        os.dup2(op.full.fileno(), 2)
+        sys.stdout = os.fdopen(1, "w", buffering=1, closefd=False)
+        sys.stderr = os.fdopen(2, "w", buffering=1, closefd=False)
+        BROKER_DIR.mkdir(parents=True, exist_ok=True)
+        lock_f = open(LIFECYCLE_LOCK, "a")
+        try:
+            fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            op.progress.step("queue", "waiting for another project action to finish")
+            fcntl.flock(lock_f, fcntl.LOCK_EX)
+        held = True
+        _write_lifecycle_holder(op_id)
+        with contextlib.redirect_stderr(_Tee(buf, sys.stderr)):
+            LIFECYCLE_DISPATCH[verb](args, op.progress)
+        op.progress.done()
+    except rscore.ValidationError as e:
+        print(f"validation: {e}")                 # full log
+        op.progress.fail(str(e))
+    except rscore.HarnessError as e:
+        # log_msg only (the step name) — never client_detail, which is the
+        # client-envelope-only half of the split sink.
+        print(e.log_msg)
+        op.progress.fail(e.log_msg)
+    except SystemExit:
+        # die() printed "error: <msg>" to stderr (teed into buf AND the full
+        # log); the same trim the inline dispatch path applies.
+        msg = buf.getvalue().strip() or "operation failed"
+        op.progress.fail(msg.split("error: ", 1)[-1])
+    except Exception:
+        traceback.print_exc()                     # a raw exception prints nothing on its own
+        op.progress.fail("operation failed")      # coarse token; detail is in the full log
+    finally:
+        op.close()
+        if held:
+            _clear_lifecycle_holder(op_id)
+        _release_lifecycle_lock(op_id)
+        if lock_f is not None:
+            lock_f.close()                        # releases the flock
+
+
 def _err(kind: str, message: str) -> dict:
     return {"ok": False, "error": {"kind": kind, "message": message}}
 
@@ -1476,7 +1797,8 @@ def _auth_login(args: dict, tokens) -> dict:
 
 def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
              verbs: dict | None = None, audit=None, oplog=None,
-             spawn_build=None, spawn_review=None, spawn_dev_box=None) -> dict:
+             spawn_build=None, spawn_review=None, spawn_dev_box=None,
+             spawn_lifecycle=None) -> dict:
     """Resolve and run one verb, mapping every failure mode to a reply dict.
     Pure by default (no socket; no file I/O unless an `audit` or `oplog` sink is
     passed) so it is unit-testable on its own.
@@ -1496,6 +1818,8 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
     `spawn_dev_box(op_id, verb, args) → child pid` the dev lane's (daemon
     injects `_spawn_dev_box_child`; the lane carries both dev provision
     verbs, so the verb threads through to the child's argv).
+    `spawn_lifecycle(op_id, verb, args) → child pid` the lifecycle lane's
+    (daemon injects `_spawn_lifecycle_child`; tests pass None likewise).
     """
     def _audited(principal, outcome, reply):
         if audit is not None:
@@ -1644,11 +1968,80 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
                             _err("validation",
                                  "Gitea isn't enabled — enable it under "
                                  "Management → Infrastructure first"))
+        # A dev box lands in a running project's container; one that is being
+        # started, stopped or recreated right now would lose it mid-way.
+        if verb == "dev_box_provision" and _project_in_flight(safe.get("project")):
+            return _audited(principal, "busy",
+                            _err("busy", f"{safe.get('project')} is starting, "
+                                         "stopping or updating — try again "
+                                         "when it finishes"))
         if spawn_dev_box is None:           # tests: gate + validate, never spawn
             return _audited(principal, "ok",
                             {"ok": True, "result": {"op_id": op_id, "started": True}})
         pid = spawn_dev_box(op_id, verb, safe)   # detached child, args via stdin
         _write_dev_box_lock(op_id, pid)          # PARENT writes, post-spawn only
+        return _audited(principal, "ok",
+                        {"ok": True, "result": {"op_id": op_id, "started": True}})
+
+    # Lifecycle lane — the SOLE entry for start/stop/update (absent from VERBS,
+    # so the inline path below cannot run a recreate on the accept thread).
+    # token → op_id → per-verb pre-spawn validation (filtered fields; pure
+    # from_kwargs, no docker) → same-project refusal → spawn → the parent writes
+    # the per-op lock AFTER a successful spawn (gate-before-sink). NO global
+    # busy check here: a second project's action is accepted and QUEUES in its
+    # child on the host-wide flock. The same project twice is refused — its
+    # queued or running op already owns it. The parent writes the lock in this
+    # serial section, so two requests cannot both pass the refusal.
+    if verbs is None and verb in LIFECYCLE_DISPATCH:
+        if not isinstance(args, dict):
+            return _err("bad_request", "args must be a JSON object")
+        principal = tokens.principal_for(token) if tokens is not None else None
+        if principal is None:
+            return _audited(None, "unauthorized",
+                            _err("unauthorized",
+                                 "a valid session token is required; call login"))
+        if not isinstance(op_id, str) or not _OP_ID_RE.match(op_id):
+            return _audited(principal, "bad_request",
+                            _err("bad_request", "a valid op_id is required"))
+        # An op_id names this op's lock and logs; reusing one that is still in
+        # flight would overwrite them and hide the first op from every check.
+        if _lifecycle_op(op_id) is not None:
+            return _audited(principal, "bad_request",
+                            _err("bad_request", "this op_id is already in use"))
+        fields, req_cls, _fn = _LIFECYCLE_VERBS[verb]
+        safe = {k: v for k, v in args.items() if k in fields}
+        try:
+            req_cls.from_kwargs(**safe)
+        except rscore.ValidationError as e:
+            return _audited(principal, "validation",
+                            _err("validation", str(e)))
+        project = safe.get("name")
+        if _project_in_flight(project):
+            return _audited(principal, "busy",
+                            _err("busy", f"{project} already has an action in "
+                                         "progress — wait for it to finish"))
+        if spawn_lifecycle is None:         # tests: gate + validate, never spawn
+            return _audited(principal, "ok",
+                            {"ok": True, "result": {"op_id": op_id, "started": True}})
+        _prune_dead_lifecycle_locks()
+        # strerror, never str(e): the latter carries a host path, and this
+        # message reaches the browser verbatim.
+        try:
+            pid = spawn_lifecycle(op_id, verb, safe)   # detached child
+        except OSError as e:
+            return _audited(principal, "failed",
+                            _err("failed", f"could not start the action: {e.strerror or 'I/O error'}"))
+        try:
+            _write_lifecycle_lock(op_id, pid, project, verb)  # PARENT, post-spawn
+        except OSError as e:
+            # A child with no lock file is invisible to every refusal and to
+            # the browser — never leave one running behind a "failed" reply.
+            # It is a session leader (start_new_session), so its group is its
+            # own: this takes any docker call it already began with it.
+            with contextlib.suppress(OSError):
+                os.killpg(pid, signal.SIGKILL)
+            return _audited(principal, "failed",
+                            _err("failed", f"could not start the action: {e.strerror or 'I/O error'}"))
         return _audited(principal, "ok",
                         {"ok": True, "result": {"op_id": op_id, "started": True}})
 
@@ -1680,6 +2073,35 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
                             _err("step_up_required",
                                  "this action requires re-entering your password"))
 
+    # One project action at a time (the lifecycle lane's contract), without
+    # ever blocking this thread: create/destroy take the host-wide flock
+    # NON-blocking for their whole run and refuse when a lane start/stop/update
+    # holds it or waits for it; verbs that act inside ONE project's container
+    # refuse while that project has a lane op in flight (it is being replaced
+    # under them). Decided here — after the token + step-up gates, BEFORE the
+    # op-log exists — so a refused caller writes no file (gate-before-sink).
+    # `verbs is None` only: a test's stub table never touches the real lock.
+    lc_lock = None
+    if verbs is None:
+        project_key = _INLINE_PROJECT_KEY.get(verb)
+        if project_key is not None and _project_in_flight(args.get(project_key)):
+            return _audited(principal, "busy",
+                            _err("busy", f"{args.get(project_key)} is starting, "
+                                         "stopping or updating — try again when "
+                                         "it finishes"))
+        if verb in _INLINE_EXCLUSIVE:
+            # A lane op counts from its spawn, not from the moment its child
+            # reaches the flock — the gap is the child's interpreter startup.
+            if _live_lifecycle_ops():
+                return _audited(principal, "busy", _err("busy", _BUSY_MSG))
+            try:
+                lc_lock = _try_lifecycle_flock()
+            except OSError as e:
+                return _audited(principal, "failed",
+                                _err("failed", f"cannot take the lifecycle lock: {e.strerror or 'I/O error'}"))
+            if lc_lock is None:
+                return _audited(principal, "busy", _err("busy", _BUSY_MSG))
+
     # Per-op progress log: write verbs only, and only when the caller supplied
     # an op_id (the webui does; the CLI/socket-direct callers don't). Created
     # HERE — after the token + step-up gates — so a rejected caller leaves no
@@ -1691,6 +2113,8 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
         try:
             op = oplog(op_id, verb, args)
         except (ValueError, OSError) as e:
+            if lc_lock is not None:
+                lc_lock.close()                   # releases the flock
             return _audited(principal, "bad_request",
                             _err("bad_request", f"invalid op_id: {e}"))
     progress = op.progress if op is not None else None
@@ -1738,6 +2162,8 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
     finally:
         if op is not None:
             op.close()
+        if lc_lock is not None:
+            lc_lock.close()                       # releases the flock
 
     # Audit write verbs only (reads stay open + low-value/noisy).
     if verb not in OPEN_VERBS:
@@ -1802,7 +2228,8 @@ class _Handler(socketserver.StreamRequestHandler):
                             oplog=make_oplog,
                             spawn_build=_spawn_build_child,
                             spawn_review=_spawn_review_child,
-                            spawn_dev_box=_spawn_dev_box_child))
+                            spawn_dev_box=_spawn_dev_box_child,
+                            spawn_lifecycle=_spawn_lifecycle_child))
 
     def _send(self, reply: dict) -> None:
         data = json.dumps(reply).encode()

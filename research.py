@@ -256,6 +256,13 @@ def cmd_broker_run_dev_box(args: argparse.Namespace) -> None:
     broker.run_dev_box(args.op_id, args.verb)
 
 
+def cmd_broker_run_lifecycle(args: argparse.Namespace) -> None:
+    """Hidden: the detached lifecycle-lane child (one per project start / stop /
+    update; they run one at a time host-wide, a later one waiting its turn).
+    Spawned by the daemon via _spawn_lifecycle_child; never an operator command."""
+    broker.run_lifecycle(args.op_id, args.verb, args.args_json)
+
+
 def _build(reqcls, **kw):
     """Build a validated rscore request from CLI args, mapping the
     input-validation channel (ValidationError) to the terminal's die()."""
@@ -2216,6 +2223,11 @@ def build_parser() -> argparse.ArgumentParser:
     rdb.add_argument("op_id")                     # args JSON rides stdin (PAT)
     rdb.add_argument("verb")                      # dev_box_provision | dev_project_provision
     rdb.set_defaults(func=cmd_broker_run_dev_box)
+    rlc = brk_sub.add_parser("__run-lifecycle", help=argparse.SUPPRESS)  # detached lifecycle child
+    rlc.add_argument("op_id")
+    rlc.add_argument("verb")                      # start | stop | update
+    rlc.add_argument("args_json")
+    rlc.set_defaults(func=cmd_broker_run_lifecycle)
 
     img = sub.add_parser("images", help="image version pins (manifest + freshness)")
     img_sub = img.add_subparsers(dest="subcommand", required=True)

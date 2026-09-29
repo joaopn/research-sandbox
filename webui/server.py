@@ -309,8 +309,11 @@ def origin_ok(request: web.Request) -> bool:
 RS_BROKER_SOCKET = os.environ.get("RS_BROKER_SOCKET", "/run/rs-broker/broker.sock")
 
 _BROKER_LEN = struct.Struct(">I")
-# A read verb is instant; `start` recreates the supervisor (slow). 30s covers
-# the slowest verb the webui relays while still failing fast on a hung daemon.
+# A read verb is instant, and every slow verb (builds, reviews, dev provisions,
+# project start/stop/update) answers at once because the broker runs it in a
+# detached child. 30s covers the slowest verb the webui still relays inline
+# (create/destroy run as background ops on BROKER_OP_TIMEOUT_S, below) while
+# still failing fast on a hung daemon.
 BROKER_CALL_TIMEOUT_S = 30
 
 # `create` is the slow outlier: workspace + per-project network + sysbox
@@ -325,7 +328,8 @@ BROKER_CALL_TIMEOUT_S = 30
 # exceed this bound.
 BROKER_CREATE_TIMEOUT_S = 120
 
-# Read-timeout for a webui-fired BACKGROUND op (create/start/stop/update/destroy).
+# Read-timeout for a webui-fired BACKGROUND op (create/destroy/box add+remove and
+# the dev ops — start/stop/update moved to the broker's lifecycle lane).
 # Unlike the synchronous relays, the HTTP response already returned the op_id, so
 # this timeout no longer bounds a request — its ONLY job is to terminalize an op
 # whose daemon accepted the connection but never replied (a wedged daemon). A
@@ -855,13 +859,15 @@ async def broker_attach_handler(request: web.Request) -> web.Response:
 
 async def broker_project_action_handler(request: web.Request) -> web.Response:
     """POST /broker/project/{name}/{action} — start|stop|update|destroy (gated,
-    origin-checked). Returns {op_id} immediately and runs the verb as a
-    background task; the browser tails the op log. `destroy` carries a step-up
-    `proof` (the client-side login derivation of the re-typed password) in the
-    body that rides the background request and the broker re-verifies; the
-    others ignore the body. The longer timeout bounds the
-    background call with headroom for a recreate queued behind another op on the
-    serial daemon."""
+    origin-checked). Returns {op_id} immediately; the browser tails the op log.
+    start/stop/update run on the broker's LIFECYCLE LANE: the broker validates,
+    spawns a detached child and answers at once, so this is a SYNCHRONOUS
+    relay-with-op_id (the broker_build_handler shape) — a background _start_op
+    would mark the op finished the moment the spawn returned. A refusal (busy,
+    validation) comes back in this response, before any op exists. `destroy`
+    still runs inline at the broker, as a background _start_op; it carries a
+    step-up `proof` (the client-side login derivation of the re-typed password)
+    in the body that rides the background request and the broker re-verifies."""
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")
     name = request.match_info.get("name", "")
@@ -900,7 +906,65 @@ async def broker_project_action_handler(request: web.Request) -> web.Response:
                       "agents"):
                 if req_body.get(k) is not None:
                     args[k] = req_body[k]
-    return await _start_op(request, action, args, BROKER_OP_TIMEOUT_S)
+    if action == "destroy":
+        return await _start_op(request, action, args, BROKER_OP_TIMEOUT_S)
+    return await _lane_relay(request, action, args, name)
+
+
+async def _lane_relay(request: web.Request, verb: str, args: dict,
+                      seed: str) -> web.Response:
+    """Kick a broker lane verb that spawns a detached child and answers at once:
+    mint an op_id, one synchronous broker call carrying it, return {ok, op_id}
+    or the broker's refusal. The op then lives only in the broker's view log —
+    no OP_RUNS entry, so GET /broker/op/<id> reads "unknown" by design and the
+    browser tails terminal-first (the view log + /alive)."""
+    s = _broker_session(request)
+    if s is None:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+    op_id = _mint_op_id(seed, verb)
+    # Same guard as _start_op: a name the op_id charset rejects would hand the
+    # browser an unpollable handle — answer it as a normal validation error.
+    if not _OP_ID_RE.match(op_id):
+        return web.json_response(
+            {"ok": False, "error": {"kind": "validation",
+             "message": "project name has characters not allowed in a project name"}},
+            status=200)
+    # The broker answers a lane verb at once — unless it is still busy with a
+    # slow INLINE verb from another tab (a create or destroy, a box add/remove,
+    # the dev-lane writes). The short bound is deliberate: a longer one would
+    # hold the browser's confirm dialog for that verb's whole run. Known
+    # residual until those join a lane: past the bound this answers 503 — the
+    # Management dialog shows the broker as unreachable, a config-box dialog
+    # closes — while the queued request still reaches the broker and the action
+    # runs; the next Management render picks it up (seeding).
+    try:
+        reply = await broker_call(verb, args, token=s["broker_token"],
+                                  op_id=op_id, timeout=BROKER_CALL_TIMEOUT_S)
+    except BrokerUnavailable:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "broker_unavailable"}}, status=503)
+    except BrokerForbidden:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "forbidden"}}, status=403)
+    if (not reply.get("ok")
+            and reply.get("error", {}).get("kind") == "unauthorized"):
+        BROKER_SESSIONS.pop(request.cookies.get(BROKER_COOKIE), None)
+        return web.json_response(
+            {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+    if not reply.get("ok"):
+        return web.json_response(reply, status=200)   # busy / validation → app error
+    return web.json_response({"ok": True, "op_id": op_id})
+
+
+async def broker_lifecycle_handler(request: web.Request) -> web.Response:
+    """GET /broker/lifecycle — every project start/stop/update in flight on the
+    broker's lifecycle lane, {ops:[{op_id, project, verb, state}]} (gated).
+    The browser seeds its "starting…" labels and background watchers from this
+    after a reload, so the in-flight view does not depend on a page's memory.
+    SameSite=Strict cookie is the CSRF defense for this read."""
+    status, body = await _relay(request, "lifecycle_active")
+    return web.json_response(body, status=status)
 
 
 async def broker_box_add_handler(request: web.Request) -> web.Response:
@@ -2875,6 +2939,7 @@ def main() -> None:
     app.router.add_post("/broker/login", broker_login_handler)
     app.router.add_post("/broker/logout", broker_logout_handler)
     app.router.add_get("/broker/projects", broker_projects_handler)
+    app.router.add_get("/broker/lifecycle", broker_lifecycle_handler)
     app.router.add_get("/broker/workflows", broker_workflows_handler)
     app.router.add_get("/broker/models", broker_models_handler)
     app.router.add_post("/broker/models/default", broker_models_default_handler)

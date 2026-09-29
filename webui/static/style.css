@@ -283,6 +283,14 @@ body {
     padding: 0 2px;
 }
 .project-rail .project .project-config-btn:hover { color: var(--fg-accent); }
+/* "starting…" / "stopping…" / "updating…" / "queued…" while a start/stop/update
+   for this project runs in the background. */
+.project-rail .project .project-inflight {
+    color: var(--fg-accent);
+    font-size: 11px;
+    font-style: italic;
+    white-space: nowrap;
+}
 
 /* Drag-to-reorder chrome for the rail — the tab strip's twin, rotated 90°.
    The ghost is a body-level label (rail descendant rules don't reach it, so it
@@ -872,6 +880,48 @@ body {
 .op-check.ok .op-check-icon { color: var(--status-up); }
 .op-check.failed { color: var(--error-fg); }
 .op-check.failed .op-check-icon { color: var(--status-error); }
+/* The lifecycle lane's "waiting for another project action to finish" line. */
+.op-waiting { color: var(--fg-muted); font-size: 13px; font-style: italic; }
+.op-waiting:empty { display: none; }
+
+/* Corner notices: the outcome of a start/stop/update that finished while its
+   op box was closed. Below the modal layer (z 100) so an open dialog stays on
+   top; they stack upward from the bottom-right corner and stay until dismissed. */
+.op-notices {
+    position: fixed;
+    right: 16px;
+    bottom: 16px;
+    z-index: 90;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 8px;
+    max-width: min(360px, calc(100vw - 32px));
+}
+.op-notice {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-strong);
+    border-left: 3px solid var(--status-up);
+    border-radius: 6px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+    color: var(--fg-base);
+    font-size: 13px;
+}
+.op-notice.failed { border-left-color: var(--status-error); }
+.op-notice-body, .op-notice-close {
+    background: none;
+    border: none;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+}
+.op-notice-body { padding: 10px 4px 10px 12px; text-align: left; overflow-wrap: anywhere; }
+.op-notice-body:hover { color: var(--fg-accent); }
+.op-notice-close { padding: 10px 12px 10px 8px; color: var(--fg-muted); font-size: 16px; line-height: 1; }
+.op-notice-close:hover { color: var(--fg-base); }
 
 /* ---- Management (broker-driven host lifecycle) -------------------------- */
 /* Workflows / Management / Settings nav group, pinned at the bottom of the rail —
@@ -1230,6 +1280,7 @@ body {
 .type-badge.type-box { border-color: var(--type-box-border); }
 .state-running { color: var(--status-up); }
 .state-stopped { color: var(--fg-faint); }
+.state-inflight { color: var(--fg-accent); font-style: italic; }
 
 .btn-small {
     background: var(--bg-input);

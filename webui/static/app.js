@@ -861,8 +861,14 @@ async function renderDashboard(opts = {}) {
     // 401-silent, so a dead session just skips the sync.
     if (opts.skipBrokerLogin) {
         syncSidebarFromBroker();
+        seedLifecycleFromBroker();
     } else {
-        tryBrokerLogin().then(() => syncSidebarFromBroker());
+        tryBrokerLogin().then(() => {
+            syncSidebarFromBroker();
+            // Start/stop/update keep running on the broker across a reload;
+            // re-learn them so their labels and completion notices come back.
+            seedLifecycleFromBroker();
+        });
     }
 }
 
@@ -1899,6 +1905,9 @@ async function renderManagementInto(view) {
     // Reuse the authoritative list to repopulate the sidebar's running set
     // (so opening / logging into Management surfaces running projects there too).
     syncSidebarFromBroker(body.result || []);
+    // Pick up actions started elsewhere (another tab, before a reload) and
+    // restart any watcher a session expiry stalled.
+    seedLifecycleFromBroker();
 }
 
 function mgmtCard(view, children) {
@@ -2048,15 +2057,17 @@ function renderMgmtTable(view, projects) {
         const destroy = el("button", { class: "btn-small btn-danger" }, ["Destroy"]);
         destroy.onclick = () => mgmtDestroyDialog(view, p.project);
         actions.push(destroy);
-        rows.push(el("div", { class: "mgmt-row" }, [
+        rows.push(el("div", { class: "mgmt-row", "data-project": p.project }, [
             el("span", { class: "mgmt-name" }, [el("span", { class: "mgmt-name-text" }, [p.project]), badge]),
-            el("span", { class: running ? "state-running" : "state-stopped" }, [p.state]),
+            el("span", { class: "mgmt-state " + (running ? "state-running" : "state-stopped"),
+                         "data-state": p.state }, [p.state]),
             el("span", { class: "mgmt-ssh" }, [p.ssh || "—"]),
             sizeEl,
             el("span", { class: "mgmt-actions" }, actions),
         ]));
     }
     view.appendChild(el("div", { class: "mgmt-table" }, rows));
+    paintLifecycleLabels();   // rows with an action in flight: label + disabled buttons
     // Pass-through ports ABOVE Infrastructure (PI decision). Both are async
     // fire-and-forget with their static DOM appended synchronously, so the
     // section order is deterministic regardless of fetch timing.
@@ -4631,6 +4642,7 @@ function mgmtAction(view, name, action) {
     mgmtConfirmThenTail(view, {
         title: `${action === "start" ? "Start" : "Stop"} project ${name}`,
         verb: action,
+        project: name,
         confirmLabel: action === "start" ? "Start" : "Stop",
         body: [el("p", {}, [desc])],
         request: () => fetch(
@@ -4829,7 +4841,9 @@ function mgmtOpFailMsg(result) {
 // no-log failure paths (broker_unavailable, step-up reject, internal) where the
 // broker never wrote a view file. A log terminal is a fallback for the
 // webui-restarted-mid-op case where OP_RUNS was lost (status → "unknown").
-async function mgmtTailOp(view, backdrop, card, opId, title, verb, onDone) {
+// The expected-stage checklist for one op box: every OP_CHECKLISTS row up front
+// (pending), each flipped to ✓ by markDone as its milestone lands.
+function opChecklist(verb) {
     const checklist = OP_CHECKLISTS[verb] || [];
     const listEl = el("div", { class: "op-checklist" });
     const items = {};   // stepKey → { row, icon }
@@ -4850,6 +4864,11 @@ async function mgmtTailOp(view, backdrop, card, opId, title, verb, onDone) {
         ref.row.classList.add("ok");
         ref.icon.textContent = "✓";
     };
+    return { listEl, markDone };
+}
+
+async function mgmtTailOp(view, backdrop, card, opId, title, verb, onDone) {
+    const { listEl, markDone } = opChecklist(verb);
 
     // The failure reason — populated ONLY on failure; the running/done state is
     // conveyed by the checklist + the foot button, with no status chatter above.
@@ -4925,6 +4944,320 @@ async function mgmtTailOp(view, backdrop, card, opId, title, verb, onDone) {
     if (onDone) { try { await onDone(ok, result); } catch (e) { /* best-effort */ } }
 }
 
+// ---- lifecycle lane: start / stop / update in the background ----------------
+// The broker runs a project start/stop/update in a detached child and answers at
+// once, one action at a time host-wide (a later one waits its turn — the child
+// writes a `queue` milestone while it waits). The op lives only in the broker's
+// view log: completion is TERMINAL-FIRST from that log, with /alive as the
+// escape for a child killed before it wrote one (the mgmtTailBuildLog
+// contract). The op box can be sent to the background; a watcher then carries
+// the op to its end, and a corner notice reports the outcome.
+const LIFECYCLE_LANE_VERBS = new Set(["start", "stop", "update"]);
+const LIFECYCLE_LABELS = { start: "starting…", stop: "stopping…", update: "updating…" };
+const LIFECYCLE_TITLES = { start: "Starting", stop: "Stopping", update: "Updating" };
+
+// In-flight registry, keyed by project (the broker refuses a second action on a
+// project that already has one, so one entry per project is exact). Value:
+// {opId, verb, queued, modal, watching, stalled, onDone}. `modal` = an open op
+// box is tailing it; `watching` = a background watcher is. A 401/403 stalls the
+// watcher (entry kept, `stalled`), and the next seed restarts it.
+const lifecycleInFlight = new Map();
+
+function lifecycleLabel(entry) {
+    return entry.queued ? "queued…" : (LIFECYCLE_LABELS[entry.verb] || "working…");
+}
+
+function lifecycleRegister(project, opId, verb, onDone) {
+    const entry = { opId, verb, queued: false, modal: false, watching: false,
+                    stalled: false, onDone: onDone || null };
+    lifecycleInFlight.set(project, entry);
+    paintLifecycleLabels();
+    return entry;
+}
+
+function lifecycleSetQueued(project, opId, queued) {
+    const entry = lifecycleInFlight.get(project);
+    if (!entry || entry.opId !== opId || entry.queued === queued) return;
+    entry.queued = queued;
+    paintLifecycleLabels();
+}
+
+// Repaint every surface that shows an in-flight action: the rail row's tag and
+// the Management row (state cell + its action buttons, disabled meanwhile — the
+// broker would refuse them anyway). A Management row whose action ended while
+// the table could not be re-rendered (a dialog was open) says so and keeps its
+// buttons off: its render-time buttons describe the project BEFORE the action.
+function paintLifecycleLabels() {
+    for (const row of document.querySelectorAll(".project-rail .project[data-name]")) {
+        const line = row.querySelector(".project-status-line");
+        if (!line) continue;
+        const entry = lifecycleInFlight.get(row.getAttribute("data-name"));
+        let tag = line.querySelector(".project-inflight");
+        if (!entry) { if (tag) tag.remove(); continue; }
+        if (!tag) {
+            tag = el("span", { class: "project-inflight" });
+            const badge = line.querySelector(".type-badge");
+            if (badge) badge.after(tag); else line.prepend(tag);
+        }
+        tag.textContent = lifecycleLabel(entry);
+    }
+    for (const row of document.querySelectorAll(".mgmt-row[data-project]")) {
+        const stateEl = row.querySelector(".mgmt-state");
+        if (!stateEl) continue;
+        const entry = lifecycleInFlight.get(row.getAttribute("data-project"));
+        const buttons = row.querySelectorAll(".mgmt-actions button");
+        if (entry) {
+            stateEl.textContent = lifecycleLabel(entry);
+            stateEl.classList.add("state-inflight");
+            buttons.forEach((b) => { b.disabled = true; });
+            row.setAttribute("data-inflight", "1");
+        } else if (row.getAttribute("data-inflight")) {
+            stateEl.textContent = "changed — Refresh";
+            row.removeAttribute("data-inflight");
+        }
+    }
+}
+
+// Read one lane op's new view-log records from st.from. `onRecord` gets every
+// non-terminal milestone; a terminal sets st.terminal = {ok, msg}. Returns the
+// HTTP status on 401/403 (the caller decides what an expired session means),
+// else 0 — transient failures are 0 too, the caller just polls again.
+async function lifecycleDrain(st, onRecord) {
+    let r;
+    try {
+        r = await fetch(`/broker/op/${encodeURIComponent(st.opId)}/log?from=${st.from}`);
+    } catch (e) { return 0; }
+    if (r.status === 401 || r.status === 403) return r.status;
+    let b; try { b = await r.json(); } catch (e) { return 0; }
+    if (!b || b.started === false || !b.data) return 0;
+    st.from = b.next;
+    for (const line of b.data.split("\n")) {
+        if (!line.trim()) continue;
+        let rec; try { rec = JSON.parse(line); } catch (e) { continue; }
+        if (rec.status === "done") st.terminal = { ok: true, msg: rec.msg || "" };
+        else if (rec.status === "failed") st.terminal = { ok: false, msg: rec.msg || "" };
+        else onRecord(rec);
+    }
+    return 0;
+}
+
+// true / false from the broker's liveness probe; null when it could not answer
+// (transient, or a session problem the next drain will surface).
+async function lifecycleAlive(opId) {
+    try {
+        const r = await fetch(`/broker/op/${encodeURIComponent(opId)}/alive`);
+        if (!r.ok) return null;
+        const b = await r.json();
+        return b.ok ? !!b.alive : null;
+    } catch (e) { return null; }
+}
+
+// Poll one op to its end: drain, then — no terminal yet — ask /alive; the child
+// writes its terminal BEFORE it drops its lock, so alive:false means either the
+// terminal just landed (drain once more) or the child died without one
+// (interrupted). Returns {ok, msg, interrupted} or {auth: <status>} or null when
+// `stop()` says to give up (the op box was dismissed / the entry superseded).
+async function lifecyclePoll(st, onRecord, stop) {
+    while (true) {
+        if (stop()) return null;
+        const auth = await lifecycleDrain(st, onRecord);
+        if (stop()) return null;
+        if (auth) return { auth };
+        if (st.terminal) break;
+        const alive = await lifecycleAlive(st.opId);
+        if (stop()) return null;
+        if (alive === false) {
+            await lifecycleDrain(st, onRecord);
+            if (stop()) return null;
+            break;
+        }
+        await opSleep(OP_POLL_INTERVAL_MS);
+    }
+    if (!st.terminal) return { ok: false, msg: "", interrupted: true };
+    return { ok: st.terminal.ok, msg: st.terminal.msg, interrupted: false };
+}
+
+function lifecycleFailText(outcome) {
+    if (outcome.interrupted) return "Interrupted — the action stopped without finishing.";
+    return "Failed — " + (outcome.msg || "operation failed");
+}
+
+// The one completion path (op box or watcher): drop the entry, repaint, run the
+// caller's hook, re-sync the sidebar (a started project joins it). A watcher's
+// completion also posts the corner notice and refreshes Management when it is
+// the open page — but never under an open dialog, and never while the page
+// holds the operator's own work (focus or typed text in one of its fields, e.g.
+// a half-filled pass-through claim): a re-render starts the page from scratch.
+// Skipped, the finished row reads "changed — Refresh" (paintLifecycleLabels).
+function lifecycleFinish(project, opId, outcome, background) {
+    const entry = lifecycleInFlight.get(project);
+    if (!entry || entry.opId !== opId) return;
+    lifecycleInFlight.delete(project);
+    paintLifecycleLabels();
+    if (background) showLifecycleNotice(project, entry.verb, opId, outcome);
+    if (entry.onDone) {
+        try { Promise.resolve(entry.onDone(outcome.ok)).catch(() => {}); }
+        catch (e) { /* the caller's hook is best-effort */ }
+    }
+    syncSidebarFromBroker();
+    if (background && state.hostPage === "management"
+            && !document.querySelector(".modal-backdrop")) {
+        const view = document.getElementById("management-view");
+        if (view && !mgmtViewHoldsInput(view)) renderManagementInto(view);
+    }
+}
+
+function mgmtViewHoldsInput(view) {
+    const active = document.activeElement;
+    if (active && active !== document.body && view.contains(active)
+            && /^(INPUT|SELECT|TEXTAREA)$/.test(active.tagName)) return true;
+    return Array.from(view.querySelectorAll("input:not([type=checkbox]):not([type=radio]), textarea"))
+        .some((i) => i.value !== "");
+}
+
+// Background watcher for one in-flight entry (a dismissed op box, or an op this
+// page learned from GET /broker/lifecycle). The double-start guard is
+// `watching`, set before the first await.
+async function lifecycleWatch(project) {
+    const entry = lifecycleInFlight.get(project);
+    if (!entry || entry.watching || entry.modal) return;
+    entry.watching = true;
+    entry.stalled = false;
+    const opId = entry.opId;
+    const st = { opId, from: 0, terminal: null };
+    const res = await lifecyclePoll(
+        st,
+        (rec) => lifecycleSetQueued(project, opId, rec.step === "queue"),
+        () => lifecycleInFlight.get(project) !== entry);
+    if (res === null) return;                   // superseded
+    if (res.auth) { entry.watching = false; entry.stalled = true; return; }
+    lifecycleFinish(project, opId, res, true);
+}
+
+// Learn every action in flight on the broker (after the broker login, and on
+// each Management render). Entries this page already tracks keep their state;
+// stalled watchers restart. 401/503 → nothing (Management is opt-in).
+async function seedLifecycleFromBroker() {
+    let res;
+    try { res = await fetch("/broker/lifecycle"); } catch (e) { return; }
+    if (!res.ok) return;
+    let body; try { body = await res.json(); } catch (e) { return; }
+    const ops = (body && body.ok && body.result && Array.isArray(body.result.ops))
+        ? body.result.ops : [];
+    for (const op of ops) {
+        if (!op || typeof op.project !== "string" || typeof op.op_id !== "string"
+                || !LIFECYCLE_LANE_VERBS.has(op.verb)) continue;
+        const cur = lifecycleInFlight.get(op.project);
+        if (cur) continue;               // tracked already (or another op of ours)
+        const entry = lifecycleRegister(op.project, op.op_id, op.verb, null);
+        entry.queued = op.state === "queued";
+        lifecycleWatch(op.project);
+    }
+    for (const [project, entry] of lifecycleInFlight) {
+        if (entry.stalled && !entry.watching && !entry.modal) lifecycleWatch(project);
+    }
+    paintLifecycleLabels();
+}
+
+// Corner notice for an action that finished in the background. It stays until
+// dismissed (an outcome nobody saw is the failure this exists to prevent);
+// clicking it reopens the op box, already complete, with the reason.
+function showLifecycleNotice(project, verb, opId, outcome) {
+    let host = document.getElementById("op-notices");
+    if (!host) {
+        host = el("div", { id: "op-notices", class: "op-notices" });
+        document.body.appendChild(host);
+    }
+    const past = { start: "started", stop: "stopped", update: "updated" }[verb] || "finished";
+    const text = outcome.interrupted
+        ? `${project}: the ${verb} was interrupted`
+        : outcome.ok ? `${project} ${past}` : `${project} failed to ${verb}`;
+    const body = el("button", { class: "op-notice-body", title: "Show the details" }, [text]);
+    const close = el("button", { class: "op-notice-close", title: "Dismiss",
+                                 "aria-label": "Dismiss" }, ["×"]);
+    const notice = el("div", { class: "op-notice" + (outcome.ok ? "" : " failed"),
+                               role: "status" }, [body, close]);
+    close.onclick = () => notice.remove();
+    body.onclick = () => {
+        if (document.querySelector(".modal-backdrop")) return;
+        notice.remove();
+        const backdrop = el("div", { class: "modal-backdrop" });
+        const card = el("div", { class: "card" });
+        backdrop.appendChild(card);
+        document.body.appendChild(backdrop);
+        lifecycleTail(null, backdrop, card, opId,
+                      `${LIFECYCLE_TITLES[verb] || "Working on"} ${project}`,
+                      verb, project, null, { replay: true });
+    };
+    host.appendChild(notice);
+}
+
+// Phase 2 of a start/stop/update op box. Same checklist as mgmtTailOp, plus a
+// "Continue in background" button (and a backdrop click) that closes the box
+// while the action carries on under a watcher. `opts.replay` re-shows a FINISHED
+// op from its log (the notice's click): no registry, no hooks, just the record.
+async function lifecycleTail(view, backdrop, card, opId, title, verb, project,
+                             onDone, opts) {
+    const replay = !!(opts && opts.replay);
+    const { listEl, markDone } = opChecklist(verb);
+    const waitEl = el("div", { class: "op-waiting" });
+    const failEl = el("div", { class: "op-fail" });
+    const bgBtn = el("button", { class: "btn btn-secondary" }, ["Continue in background"]);
+    const doneBtn = el("button", { class: "btn", disabled: "" }, [replay ? "…" : "Working…"]);
+    const entry = (!replay && project) ? lifecycleRegister(project, opId, verb, onDone) : null;
+    if (entry) entry.modal = true;
+    let finished = false, dismissed = false;
+    const dismiss = () => {
+        if (finished || dismissed) return;
+        dismissed = true;
+        backdrop.remove();
+        if (entry) { entry.modal = false; lifecycleWatch(project); }
+    };
+    bgBtn.onclick = dismiss;
+    backdrop.onclick = (e) => { if (e.target === backdrop) dismiss(); };
+    doneBtn.onclick = () => {
+        if (doneBtn.disabled) return;
+        backdrop.remove();
+        if (!replay && view) renderManagementInto(view);
+    };
+    card.innerHTML = "";
+    card.appendChild(el("h2", {}, [title]));
+    card.appendChild(listEl);
+    card.appendChild(waitEl);
+    card.appendChild(failEl);
+    card.appendChild(el("div", { class: "btn-row" }, replay ? [doneBtn] : [bgBtn, doneBtn]));
+
+    const st = { opId, from: 0, terminal: null };
+    const res = await lifecyclePoll(st, (rec) => {
+        if (rec.step === "queue") {
+            waitEl.textContent = rec.msg || "waiting for another project action to finish";
+            if (entry) lifecycleSetQueued(project, opId, true);
+            return;
+        }
+        waitEl.textContent = "";
+        if (entry) lifecycleSetQueued(project, opId, false);
+        markDone(rec.step);
+    }, () => dismissed);
+    if (res === null) return;                   // sent to the background
+    if (res.auth) {
+        // Session expired mid-tail: the action carries on at the broker. Keep
+        // the entry (stalled) so the next seed after re-login picks it back up.
+        backdrop.remove();
+        if (entry) { entry.modal = false; entry.stalled = true; }
+        if (replay || !view) return;
+        const redirect = mgmtStatusRedirect(view, res.auth);
+        return redirect ? redirect() : undefined;
+    }
+    finished = true;
+    backdrop.onclick = null;
+    waitEl.textContent = "";
+    bgBtn.remove();
+    if (!res.ok) failEl.textContent = lifecycleFailText(res);
+    doneBtn.textContent = "Done";
+    doneBtn.disabled = false;
+    if (entry) { entry.modal = false; lifecycleFinish(project, opId, res, false); }
+}
+
 // Build the phase-1 confirm card; on confirm, fire `cfg.request()`, then hand
 // the returned op_id to mgmtTailOp for phase 2. Shared by all five write actions.
 function mgmtConfirmThenTail(view, cfg) {
@@ -4970,7 +5303,14 @@ function mgmtConfirmThenTail(view, cfg) {
         // tail. The buildlog onDone fires on the Done click (the S4 review-
         // dialog semantics), so the ok flag is not meaningful there.
         const tailMode = typeof cfg.tailMode === "function" ? cfg.tailMode() : cfg.tailMode;
-        if (tailMode === "buildlog") {
+        if (LIFECYCLE_LANE_VERBS.has(cfg.verb)) {
+            // start/stop/update run on the broker's lifecycle lane: no OP_RUNS
+            // entry, terminal-first tail, and the box can be sent to the
+            // background while the action carries on.
+            await lifecycleTail(view, backdrop, card, body.op_id,
+                                cfg.tailTitle || cfg.title, cfg.verb,
+                                cfg.project || null, cfg.onDone);
+        } else if (tailMode === "buildlog") {
             await mgmtTailBuildLog(view, backdrop, card, body.op_id,
                                    cfg.tailTitle || cfg.title,
                                    () => { if (cfg.onDone) cfg.onDone(true); });
@@ -6238,6 +6578,7 @@ function mgmtUpdate(view, name) {
         title: `Update project ${name}`,
         tailTitle: `Updating ${name}`,
         verb: "update",
+        project: name,
         confirmLabel: "Update",
         body: [el("p", {}, [
             `Update "${name}". This recreates the supervisor with the latest ` +
@@ -6323,7 +6664,10 @@ function boxOpView() { return el("div"); }
 // modal takes a pointer-down).
 async function refreshAfterBoxChange(project) {
     delete state.projectServices[project];
-    if (state.activeProject === project) {
+    // Re-activate only when the project's own view is what is on screen: this
+    // also runs when an update finishes in the background, and re-activating
+    // closes whatever host page (Management, Workflows) the operator moved on to.
+    if (state.activeProject === project && !state.hostPage) {
         try { await activateProject(project); } catch (e) { /* best-effort */ }
     }
 }
@@ -7032,7 +7376,13 @@ function makeProjectRow(project) {
         ev.stopPropagation();
         openProjectConfigBox(project, configBtn);
     };
-    const statusLine = el("div", { class: "project-status-line" }, [typeBadge, configBtn]);
+    // "starting…" / "stopping…" / "updating…" / "queued…" while a lifecycle-lane
+    // op is in flight for this project (paintLifecycleLabels keeps it current).
+    const flight = lifecycleInFlight.get(project.name);
+    const statusLine = el("div", { class: "project-status-line" },
+        flight ? [typeBadge, el("span", { class: "project-inflight" },
+                                [lifecycleLabel(flight)]), configBtn]
+               : [typeBadge, configBtn]);
     // .active is stamped here so a rail rebuild (a drop, a create, a destroy)
     // keeps the "you are here" highlight — refreshProjectRail replaces the
     // whole <aside> and never re-activates. Gated on no host page being open:
@@ -8136,6 +8486,7 @@ function mgmtAgentsDialog(name, current, addable) {
         title: `Add an agent to ${name}`,
         tailTitle: `Adding agents to ${name}`,
         verb: "update",
+        project: name,
         confirmLabel: "Add",
         body: [
             el("p", {}, [
@@ -8325,6 +8676,7 @@ function mgmtModelsDialog(name, cat, hasWorkerLayer) {
         title: `Models for ${name}`,
         tailTitle: `Updating models on ${name}`,
         verb: "update",
+        project: name,
         confirmLabel: "Apply",
         body: [
             el("p", {}, [
@@ -8813,6 +9165,7 @@ function mgmtEditorToggle(name, on, isDocker) {
         title: `${word} the editor on ${name}`,
         tailTitle: `${on ? "Disabling" : "Enabling"} the editor on ${name}`,
         verb: "update",
+        project: name,
         confirmLabel: word,
         body: body,
         request: () => fetch(`/broker/project/${encodeURIComponent(name)}/update`, {
@@ -8831,6 +9184,7 @@ function mgmtReaderToggle(name, on) {
         title: `${word} the reader on ${name}`,
         tailTitle: `${on ? "Disabling" : "Enabling"} the reader on ${name}`,
         verb: "update",
+        project: name,
         confirmLabel: word,
         body: [el("p", {}, [`${word} the mobile artifact reader on "${name}". ` +
             "This deploys it live (no recreate) — it takes effect on the next page load."])],
