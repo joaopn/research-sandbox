@@ -1530,9 +1530,10 @@ async def broker_dev_box_handler(request: web.Request) -> web.Response:
 
 
 async def broker_dev_project_handler(request: web.Request) -> web.Response:
-    """POST /broker/dev/project {name, workflow?, url, pat?, egress?, enable?,
-    disable?} — provision a dev PROJECT from a GitHub URL (mirror +
-    project-create as ONE action) on the broker's detached dev lane (gated,
+    """POST /broker/dev/project {name, workflow?, url, pat?, branch?, egress?,
+    enable?, disable?, supervisor_model?, supervisor_effort?, agents?} —
+    provision a dev PROJECT from a GitHub URL (mirror + project-create as ONE
+    action) on the broker's detached dev lane (gated,
     origin-checked). The broker_dev_box_handler shape: mint an op_id,
     synchronous relay-with-op_id (the broker spawns the detached child and
     returns fast — the ~120s migrate never rides this call), return {op_id};
@@ -1567,7 +1568,9 @@ async def broker_dev_project_handler(request: web.Request) -> web.Response:
             "egress": body.get("egress"), "enable": body.get("enable"),
             "disable": body.get("disable"),
             "supervisor_model": body.get("supervisor_model"),
-            "supervisor_effort": body.get("supervisor_effort")}
+            "supervisor_effort": body.get("supervisor_effort"),
+            # The agent set; an absent key relays as None ⇒ the workflow preset.
+            "agents": body.get("agents")}
     op_id = _mint_op_id(name if isinstance(name, str) and name else "dev",
                         "dev-project")
     try:

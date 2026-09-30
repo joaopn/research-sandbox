@@ -925,9 +925,11 @@ class CreateRequest:
         # ["claude"]; a bare `sandbox` box, with no preset, stays agent-less), while
         # an EXPLICIT EMPTY set ([] — the webui's deselect-all, the CLI --no-agents)
         # means agent-less and must NOT be shadowed by the preset. The docker box
-        # deploys the full set (per-agent mounts); sandbox-dind honors claude
-        # on/off for its OWN ~/.local (Option C — /opt/agent-dist is always staged
-        # as the box copy-source); research ignores the set (noted in create(),
+        # deploys the full set (per-agent mounts); sandbox-dind deploys the whole
+        # staged set (the selection plus claude, _dind_stage_set) into its OWN
+        # ~/.local whenever ANY agent is selected, and nothing when none is
+        # (Option C — /opt/agent-dist is always staged as the box copy-source);
+        # research ignores the set (noted in create(),
         # fleet floor below). Dedup preserving order so a box never double-mounts.
         raw_agents = kw.get("agents")
         agents = tuple(dict.fromkeys(_as_tuple(
@@ -943,12 +945,15 @@ class CreateRequest:
             if not dist_present(a):
                 raise ValidationError(
                     f"agent {a!r}: no cached dist — pull it under Management → Software first")
-        # A dev project's whole point is the repo-working agent (repo-watch drives
-        # it, and repo-watch runs claude) — refuse a dev create without it.
-        if dev_lane and DEFAULT_AGENT not in agents:
+        # A dev project's whole point is an agent working its repo — refuse a dev
+        # create with none. ANY agent qualifies (pi alone included): repo-watch
+        # runs claude, but the dind stage set floors on claude (_dind_stage_set)
+        # and a non-empty selection deploys that whole set into the supervisor's
+        # ~/.local, so a claude-less dev project still carries a runnable claude.
+        if dev_lane and not agents:
             raise ValidationError(
-                f"a dev project needs the {DEFAULT_AGENT} agent (repo-watch runs it) — "
-                f"it cannot be created agent-less or without it; add it to the selection")
+                "a dev project needs at least one agent to work its repo — it "
+                "cannot be created agent-less; select at least one")
         # Fleet floor (STAGE_AGENT_DIST slice 2): EVERY dind project deploys claude
         # from the dist (no bake) — research flavor for the supervisor + worker/
         # role-MCP/PI fleet, sandbox-dind flavor for its rs-sandbox-box boxes (FROM
@@ -2493,6 +2498,10 @@ class DevProjectProvisionRequest:
     # workflow's create dialog.
     supervisor_model: str = ""
     supervisor_effort: str = ""
+    # The project's agent SET. None ⇒ the workflow's preset (a body without the
+    # key); an explicit list is validated by the CreateRequest delegation below
+    # (known agents, pulled dists, and the dev floor: at least one agent).
+    agents: tuple[str, ...] | None = None
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "DevProjectProvisionRequest":
@@ -2522,19 +2531,24 @@ class DevProjectProvisionRequest:
         # see the DevBoxProvisionRequest note: a ValidationError raised child-side
         # in the detached lane is invisible to the browser). Populate from the
         # VALIDATED CreateRequest, so the resolved pair — not the raw input — is
-        # what the child re-derives from.
+        # what the child re-derives from. `agents` rides it too, keeping the
+        # UNSET-vs-EXPLICIT split: an absent key stays None (the preset), an
+        # explicit [] reaches the dev floor's agent-less refusal pre-spawn.
+        raw_agents = kw.get("agents")
         cr = CreateRequest.from_kwargs(
             name=kw.get("name"), workflow=workflow, dev_repo=repo,
             dev_branch=kw.get("branch"),
             egress=egress, enable=enable, disable=disable,
             supervisor_model=kw.get("supervisor_model"),
             supervisor_effort=kw.get("supervisor_effort"),
+            agents=raw_agents,
             dev_repo_preflight=False)
         return cls(name=cr.name, url=url, repo=repo, workflow=workflow,
                    pat=(pat or "").strip(), branch=cr.dev_branch, egress=egress,
                    enable=enable, disable=disable,
                    supervisor_model=cr.supervisor_model,
-                   supervisor_effort=cr.supervisor_effort)
+                   supervisor_effort=cr.supervisor_effort,
+                   agents=None if raw_agents is None else cr.agents)
 
 
 @dataclass
@@ -3094,9 +3108,10 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             # (STAGE_SANDBOX_DIND_AGENT): the supervisor RUNS an agent itself and
             # gets the light-path harness. /opt/agent-dist is ALWAYS staged (the
             # copy-source any box's agent toggle deploys from — Option C), but the
-            # supervisor's OWN ~/.local gets the launcher + claude settings only
-            # when the create selected claude (deploy_local honors req.agents; an
-            # agent-less create leaves the supervisor unwired).
+            # supervisor's OWN ~/.local gets the whole staged set (claude included,
+            # _dind_stage_set — its launchers + claude's settings) whenever the
+            # create selected ANY agent (deploy_local=bool(req.agents)); an
+            # agent-less create leaves the supervisor unwired.
             _stage_agent_dist(container_name, _dind_stage_set(req.agents),
                               deploy_local=bool(req.agents))
             # Editor dist staged whenever cached so any box can RO-mount
@@ -12043,7 +12058,8 @@ def dev_project_provision(req: "DevProjectProvisionRequest", progress=None) -> d
         dev_branch=req.branch,
         egress=req.egress, enable=req.enable, disable=req.disable,
         supervisor_model=req.supervisor_model,
-        supervisor_effort=req.supervisor_effort)
+        supervisor_effort=req.supervisor_effort,
+        agents=req.agents)
     create(cr, progress=progress)
     return {"project": req.name, "repo": req.repo}
 

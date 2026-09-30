@@ -799,7 +799,12 @@ DEV_PROJECT_WEBUI_FIELDS = frozenset({"name", "workflow", "url", "pat",
                                       # the dev card carries ONE model picker — the
                                       # agent the researcher talks to. Same as any
                                       # other non-research workflow's create dialog.
-                                      "supervisor_model", "supervisor_effort"})
+                                      "supervisor_model", "supervisor_effort",
+                                      # The project's agent SET (an enum list,
+                                      # in-box): absent ⇒ the workflow preset;
+                                      # validated pre-spawn by the create
+                                      # delegation, which refuses an empty set.
+                                      "agents"})
 # The gitea-password verb's input boundary: ONE field, a SECRET (repr=False on
 # the request, off the Result, never a durable sink). The step-up `proof` is
 # consumed in dispatch and never reaches this filter.

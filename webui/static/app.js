@@ -5780,9 +5780,10 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataRoots) {
     const boxCapable = !!manifest.box_capable;
     // Dev-flagged workflow (dev:true — built-in `dev` or a BYO sibling): the
     // form is the URL-driven dev variant. It POSTs the detached dev-project
-    // provision (mirror + create as one op), so the light-path clone group +
-    // agents cards are hidden — the dev step owns the repo wiring, and the
-    // dind fleet deploys the default agent dist regardless.
+    // provision (mirror + create as one op), so the light-path clone group is
+    // hidden — the dev step owns the repo wiring. The agents cards DO show
+    // (the dev agent may be any staged agent, at least one), outside showInBox
+    // because the rest of that group does not apply to a dev project.
     const isDev = !!manifest.dev;
     const showInBox = !isDev && (isDocker || boxCapable);
 
@@ -5908,7 +5909,8 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataRoots) {
     ]);
     if (!hasWorkerLayer) enableField.style.display = "none";
 
-    // Docker-substrate-only agents (rendered as cards in the Settings region below).
+    // The agent-set cards (rendered in the Settings region below): docker box,
+    // sandbox-dind and the dev variant.
     // Staged agents only — one independent on/off box each (STAGE_MULTI_AGENT),
     // the broker's default agent on. Un-staged KNOWN_AGENTS are omitted: the form never offers
     // an agent that isn't deployable yet (pull it under Management → Software), so
@@ -6007,12 +6009,12 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataRoots) {
     authGroup.style.display = "none";
     authCb.onchange = () => { authGroup.style.display = authCb.checked ? "" : "none"; };
     // Settings region — agent + editor as bordered cards inside a single bordered
-    // box (mirrors the box window). Editor is universal; agents only showInBox
-    // (docker box / sandbox-dind), preserving today's visibility split. No raw
+    // box (mirrors the box window). Editor is universal; agents on showInBox
+    // (docker box / sandbox-dind) and on the dev variant. No raw
     // <input> lives here (only cards), so the .field input{width:100%} bleed doesn't apply.
     const settingsRegion = el("div", { class: "field box-settings" }, [
         el("div", { class: "box-settings-label" }, ["Settings"]),
-        ...(showInBox ? [el("div", { class: "box-opt-group" }, [
+        ...(showInBox || isDev ? [el("div", { class: "box-opt-group" }, [
             el("div", { class: "box-opt-caption" }, ["Agents"]),
             agentChecks.length
                 ? el("div", { class: "box-opt-cards" }, agentChecks.map((c) => c.card))
@@ -6177,6 +6179,11 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataRoots) {
             if (isDev && !devBranchI.value.trim()) {
                 return "A dev project needs a branch for the agent to work from.";
             }
+            // Mirror the dev floor in from_kwargs (the broker refuses an empty
+            // set too): a dev project exists for an agent to work its repo.
+            if (isDev && !agentChecks.some((c) => c.cb.checked)) {
+                return "A dev project needs at least one agent to work its repo.";
+            }
             // Mirror from_kwargs: an in-box repo needs a ref (pin the clone).
             if (showInBox && cloneCb.checked && repoI.value.trim() && !refI.value.trim()) {
                 return "A workflow repo requires a ref.";
@@ -6232,6 +6239,11 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataRoots) {
                     // DEV_PROJECT_WEBUI_FIELDS. A field absent from that set is
                     // dropped silently by the broker, so this is a lockstep.
                     ...modelPayload(),
+                    // ALWAYS the explicit selection (never omitted): an absent
+                    // key would fall back to the workflow's preset, silently
+                    // replacing what the operator ticked. The validator above
+                    // guarantees it is non-empty.
+                    agents: agentChecks.filter((c) => c.cb.checked).map((c) => c.name),
                 };
                 const pat = devPatI.value.trim();
                 if (pat) payload.pat = pat;
@@ -6294,8 +6306,9 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataRoots) {
                 // means UNSET server-side (from_kwargs falls back to the workflow's
                 // agent preset), so omitting on deselect-all would silently
                 // resurrect the preset's claude — the explicit [] IS the
-                // agent-less create. Outside showInBox no key is sent (the dev
-                // dialog etc. keep their manifest preset).
+                // agent-less create. Outside showInBox no key is sent here (a
+                // research create keeps its fixed set; the dev branch above sends
+                // its own explicit selection).
                 payload.agents = agentChecks.filter((c) => c.cb.checked)
                                             .map((c) => c.name);
                 // Light-path fields ride only when the operator opts into a clone,
