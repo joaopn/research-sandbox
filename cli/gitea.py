@@ -833,6 +833,19 @@ def _zip_member_count(listing: str) -> int | None:
     return None
 
 
+def _migrate_500_hint(pat_sent: bool) -> str:
+    """The likely cause appended to a migrate HTTP 500. Measured on gitea
+    1.25.1: a private source with no token, and a nonexistent source, both
+    answer 500 (GitHub's API 404s a repo the caller cannot see; gitea has no
+    mapping for that). Browser-reachable text: names no CLI verb, no secret."""
+    if pat_sent:
+        return (" — the GitHub PAT may not be able to read this repository "
+                "(a classic PAT needs the repo scope; a fine-grained PAT must "
+                "include this repository) or the URL may be wrong")
+    return (" — the GitHub repository may be private (supply a GitHub PAT "
+            "that can read it) or the URL may be wrong")
+
+
 # --- the REST client --------------------------------------------------------
 
 class GiteaClient:
@@ -1002,6 +1015,12 @@ class GiteaClient:
             # stub on the next add instead.
             if e.status is not None:
                 self._sweep_empty_stub(repo)
+            if e.status == 500:
+                # Gitea's migrate maps a GitHub API 404 (a private repo it may
+                # not see, or a nonexistent one) to a bare 500, and _api drops
+                # the body — so say what most likely happened.
+                raise GiteaError(f"{e}{_migrate_500_hint(bool(pat))}",
+                                 status=e.status) from None
             raise
 
     def _sweep_empty_stub(self, repo: str) -> None:
