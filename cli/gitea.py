@@ -160,7 +160,9 @@ MIRROR_INTERVAL = "10m"
 LIST_LIMIT = 100
 # The Development-page read bound (repo_status: up to FIVE metadata GETs per
 # repo on the broker's serial thread — forks list, mirror info, fork info,
-# pulls, branches; an EMPTY or fork-less repo stops at three/two). A
+# pulls, branches; an EMPTY or fork-less repo stops at three/two — plus the
+# upstream-sync decoration, which spends only what those five LEFT of
+# REPO_STATUS_BUDGET_S below, so it never moves the per-repo worst). A
 # local-bridge gitea answers these in ms and a DOWN one refuses instantly —
 # the bound only matters for a HALF-UP gitea, where the quick-call
 # API_TIMEOUT_S (15s) would blow the webui's 30s relay window at a single
@@ -170,6 +172,15 @@ LIST_LIMIT = 100
 # read reports unreachable), and dev_status's per-repo degradation keeps a
 # slow/sick repo from taking the other rows with it.
 STATUS_TIMEOUT_S = 5
+# One repo_status read's whole wall-time budget: the five-read worst the
+# rationale above already accepts (5 x STATUS_TIMEOUT_S, inside the webui's 30s
+# relay window), named rather than re-derived. The five reads keep their own
+# per-call bound; the upstream-sync decoration that follows them gets only the
+# REMAINDER of this budget, so a half-up gitea drops the sentence instead of
+# pushing one repo's read past the window. Approximate in the same way every
+# STATUS_TIMEOUT_S bound is: urlopen's timeout bounds each blocking socket
+# operation, not the call as a whole.
+REPO_STATUS_BUDGET_S = 5 * STATUS_TIMEOUT_S
 # Bounded wait for gitea's async fork (202) to materialize. A small-repo fork is
 # near-instant; 30×1s covers a busy gitea without hanging. At 5s a loaded gitea
 # false-fails; at 300s a wedged fork would hold the caller 5 min.
@@ -858,7 +869,15 @@ class GiteaClient:
 
     def _api(self, method: str, path: str, body: Any = None,
              sudo: str | None = None, ok: tuple[int, ...] = (200, 201, 204),
-             timeout: int | None = None) -> Any:
+             timeout: float | None = None,
+             headers_out: dict | None = None) -> Any:
+        """``headers_out``, when passed, receives the response headers with
+        lower-cased names for any response urlopen returns (it is filled before
+        the status check, so a 2xx outside ``ok`` fills it and then raises) —
+        the only way a caller can read a
+        header-borne value (X-Total-Count). It rides THIS method rather than a
+        sibling with its own urlopen so every test that stubs _api wholesale
+        intercepts the header-reading calls too."""
         url = self._base + path
         to = API_TIMEOUT_S if timeout is None else timeout
         data = None
@@ -876,6 +895,9 @@ class GiteaClient:
             with urllib.request.urlopen(req, timeout=to) as resp:
                 status = resp.status
                 raw = resp.read()
+                if headers_out is not None:
+                    headers_out.update((k.lower(), v)
+                                       for k, v in resp.headers.items())
         except urllib.error.HTTPError as e:
             # e.code is the status; DO NOT include the response body (it can echo
             # the request, which for migrate carries auth_token).
@@ -1802,8 +1824,14 @@ def repo_status(host_port: str, repo: str) -> dict:
     """Per-repo Development-page status: mirror sync time + the ACTIVE fork's
     open PRs + branches (multi-fork reads are steered by the active-fork map —
     the deliberate simplification; no cross-fork aggregation), plus the forks
-    list + active marker for the Management dropdown. STATUS_TIMEOUT_S-bounded
-    GETs; fields are picked by NAME, so no secret can enter the result."""
+    list + active marker for the Management dropdown, plus `upstream` — where
+    the active fork's recorded base stands against the mirror (upstream_sync;
+    None when unknown). STATUS_TIMEOUT_S-bounded GETs inside one
+    REPO_STATUS_BUDGET_S; fields are picked by NAME, so no secret can enter
+    the result."""
+    # Taken at entry: the upstream-sync decoration below spends only what the
+    # reads before it leave of REPO_STATUS_BUDGET_S.
+    deadline_at = _monotonic() + REPO_STATUS_BUDGET_S
     client = GiteaClient(api_base(host_port), read_admin_token())
     forks = list_forks(host_port, repo)
     active = resolve_active_fork(repo, forks)
@@ -1867,6 +1895,19 @@ def repo_status(host_port: str, repo: str) -> dict:
         branches.append({
             "name": b.get("name") or "",
             "committed_at": (b.get("commit") or {}).get("timestamp") or ""})
+    # Where the active fork's recorded base stands against upstream — the
+    # card's sync sentence. A DECORATION on a row that has already loaded: any
+    # failure, including a spent budget, is None (no sentence), never a lost
+    # row. No ledger entry (or no branch) means no extra gitea call at all.
+    upstream = None
+    if active and not fork_empty:
+        base = recorded_base_branch(repo, active)
+        if base:
+            try:
+                upstream = upstream_sync(client, active, repo, base,
+                                         deadline_at)
+            except GiteaError:
+                upstream = None
     return {"repo": repo,
             "private": bool(info.get("private")),
             "mirror_synced_at": (info.get("mirror_updated")
@@ -1878,7 +1919,8 @@ def repo_status(host_port: str, repo: str) -> dict:
             "open_issues": open_issues,
             "open_prs": open_prs,
             "prs": prs,
-            "branches": branches}
+            "branches": branches,
+            "upstream": upstream}
 
 
 # --- per-row commit lists (the Development-page dropdowns) --------------------
@@ -1996,6 +2038,219 @@ def mirror_branch_head(host_port: str, repo: str, branch: str) -> str:
     # wrong divider — an unexpected value simply matches no row — while a
     # silently-renamed field would otherwise mean "no divider, ever".
     return commit.get("id") or commit.get("sha") or ""
+
+
+# --- the agent's base against upstream (the Fetch card's sync sentence) -------
+#
+# Where the agent fork's base branch stands against the same branch on the
+# mirror. Measured on gitea 1.25.1 — and the obvious tool is NOT usable: the
+# compare endpoint with a cross-repo head resolves commits only in the BASE
+# repo's own object store, so once upstream gains a commit the fork has never
+# seen it answers 500 "bad object" (and the mirror-side form is refused: a
+# mirror has no pulls unit). What works is counting inside ONE store that holds
+# both heads: `commits?sha=A&not=B` reports, in X-Total-Count, exactly how many
+# commits are reachable from A and not from B (exact past the 50-row clamp,
+# correct across merges). A store holding neither head of the other side IS
+# divergence, exactly: a fork head absent from the mirror's store cannot be
+# reachable from the mirror head, and vice versa.
+
+# The clock the budget reads — a module seam so a test can advance it
+# (patching time.monotonic would patch the global time module).
+_monotonic = time.monotonic
+
+# A full commit id: sha1 or sha256 object format. Checked before a sha from a
+# response is interpolated into a path or a query.
+_SHA_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+class _Deadline:
+    """The remainder of a caller's wall-time budget, handed out per call.
+
+    The check happens HERE, before _api: urlopen raises ValueError on a negative
+    timeout (outside the GiteaError channel) and misreads 0 as unreachable."""
+
+    def __init__(self, at: float) -> None:
+        self.at = at
+
+    def timeout(self, what: str) -> float:
+        left = self.at - _monotonic()
+        if left <= 0:
+            raise GiteaError(f"upstream sync: time budget spent before {what}")
+        return min(STATUS_TIMEOUT_S, left)
+
+
+def recorded_base_branch(repo: str, user: str) -> str:
+    """The base branch the ledger records for <user>'s consumer of <repo> — the
+    branch its sync and rs-land target (GITEA_BRANCH, {{BASE_BRANCH}}). NOT the
+    fork's default_branch: that is a best-effort copy set warn-and-continue at
+    provision, which the agent can change, so comparing it could report a
+    branch nobody syncs. "" when there is no entry, or the entries disagree —
+    no sentence beats a sentence about the wrong branch."""
+    values = [e.get("branch") for e in load_attachments()
+              if isinstance(e, dict) and e.get("repo") == repo
+              and e.get("user") == user]
+    if not values or not all(isinstance(v, str) for v in values):
+        return ""
+    distinct = set(values)
+    return distinct.pop() if len(distinct) == 1 else ""
+
+
+def _branch_head(client: "GiteaClient", owner: str, repo: str, branch: str,
+                 deadline: _Deadline) -> str:
+    """<owner>/<repo>@<branch>'s head sha, or "" on a definitive 404. The branch
+    is a path segment on gitea's wildcard branches route — quoted safe='/'
+    (the mirror_branch_head precedent). `id` is the field gitea serves (pinned
+    live by the mirror-head harness); no fallback here, because a value that is
+    not a full sha is refused rather than probed with."""
+    try:
+        resp = client._api(
+            "GET", f"/repos/{owner}/{repo}/branches/"
+                   f"{urllib.parse.quote(branch, safe='/')}",
+            timeout=deadline.timeout("a branch read"))
+    except GiteaError as e:
+        if e.status == 404:
+            return ""
+        raise
+    commit = resp.get("commit") if isinstance(resp, dict) else None
+    sha = commit.get("id") if isinstance(commit, dict) else None
+    if not isinstance(sha, str) or not _SHA_RE.fullmatch(sha):
+        raise GiteaError(f"gitea GET branch {owner}/{repo}@{branch} -> no "
+                         f"commit id")
+    return sha
+
+
+def _has_commit(client: "GiteaClient", owner: str, repo: str, sha: str,
+                deadline: _Deadline) -> bool:
+    """Is commit <sha> in <owner>/<repo>'s object store (present, not
+    necessarily reachable)? 404 -> False; every other error raises. _COMMITS_QS
+    keeps gitea from computing a diffstat on the broker's serial thread."""
+    try:
+        resp = client._api(
+            "GET", f"/repos/{owner}/{repo}/git/commits/{sha}?{_COMMITS_QS}",
+            timeout=deadline.timeout("a commit probe"))
+    except GiteaError as e:
+        if e.status == 404:
+            return False
+        raise
+    if not isinstance(resp, dict):
+        raise GiteaError(f"gitea GET commit {owner}/{repo}@{sha} -> no data")
+    return True
+
+
+def _count_not(client: "GiteaClient", owner: str, repo: str, tip: str,
+               exclude: str, deadline: _Deadline) -> int:
+    """How many commits are reachable from <tip> and not from <exclude>, counted
+    in <owner>/<repo>'s store (which must hold both). limit=1 because the
+    number rides the X-Total-Count header, not the rows; a missing, non-integer
+    or negative header raises — a wrong number is worse than none."""
+    headers: dict = {}
+    client._api(
+        "GET", f"/repos/{owner}/{repo}/commits?sha={tip}&not={exclude}"
+               f"&limit=1&{_COMMITS_QS}",
+        timeout=deadline.timeout("a commit count"), headers_out=headers)
+    raw = headers.get("x-total-count")
+    try:
+        n = int(raw) if isinstance(raw, str) else -1
+    except ValueError:
+        n = -1
+    if n < 0:
+        raise GiteaError(f"gitea commit count {owner}/{repo} {tip}..{exclude} "
+                         f"-> no usable X-Total-Count")
+    return n
+
+
+def _top_tree(client: "GiteaClient", owner: str, repo: str, sha: str,
+              deadline: _Deadline) -> list | None:
+    """Commit <sha>'s top-level tree entries, sorted, or None when the listing
+    is incomplete. gitea's own `sha` on a tree response echoes the COMMIT id
+    (measured, on both git/commits and git/trees), so trees are compared by
+    their entries — (path, mode, type, id) is exactly what a git tree hashes,
+    so equal entry lists mean equal trees."""
+    resp = client._api("GET", f"/repos/{owner}/{repo}/git/trees/{sha}",
+                       timeout=deadline.timeout("a tree read"))
+    entries = resp.get("tree") if isinstance(resp, dict) else None
+    if not isinstance(entries, list):
+        raise GiteaError(f"gitea GET tree {owner}/{repo}@{sha} -> no data")
+    total = resp.get("total_count")
+    if resp.get("truncated") or type(total) is not int or total != len(entries):
+        return None
+    out = []
+    for e in entries:
+        fields = tuple(e.get(k) if isinstance(e, dict) else None
+                       for k in ("path", "mode", "type", "sha"))
+        if not all(isinstance(f, str) and f for f in fields):
+            raise GiteaError(f"gitea GET tree {owner}/{repo}@{sha} -> "
+                             f"malformed entry")
+        out.append(fields)
+    return sorted(out)
+
+
+def _same_tree(client: "GiteaClient", fork_owner: str, repo: str,
+               mirror_head: str, fork_head: str, deadline: _Deadline) -> bool:
+    """Do the two heads carry identical file contents? An incomplete listing on
+    either side answers False — the refinement is withheld, never guessed."""
+    mine = _top_tree(client, ADMIN_USER, repo, mirror_head, deadline)
+    if mine is None:
+        return False
+    theirs = _top_tree(client, fork_owner, repo, fork_head, deadline)
+    return theirs is not None and mine == theirs
+
+
+def upstream_sync(client: "GiteaClient", fork_owner: str, repo: str,
+                  branch: str, deadline_at: float) -> dict | None:
+    """Where <fork_owner>/<repo>@<branch> stands against the mirror's <branch>:
+    {branch, state, behind, ahead}, or None when either side lacks the branch.
+
+    States, each exact:
+      in_sync       the two heads are the same commit;
+      counted       one store holds both heads: behind = mirror-only commits,
+                    ahead = fork-only commits (at least one is positive);
+      same_content  both sides moved (both counts positive, or neither store
+                    can count) and the two heads carry identical trees — the
+                    collected-but-not-rebased case;
+      diverged      neither store holds the other side's head (so each side
+                    has at least one commit the other lacks), trees differ.
+
+    Raises GiteaError on any failure, including a spent budget (`deadline_at`
+    is a _monotonic() instant) — the caller degrades to no sentence."""
+    if not isinstance(branch, str) or not branch:
+        return None
+    deadline = _Deadline(deadline_at)
+    mirror_head = _branch_head(client, ADMIN_USER, repo, branch, deadline)
+    if not mirror_head:
+        return None
+    fork_head = _branch_head(client, fork_owner, repo, branch, deadline)
+    if not fork_head:
+        return None
+
+    def result(state: str, behind: int | None = None,
+               ahead: int | None = None) -> dict:
+        return {"branch": branch, "state": state, "behind": behind,
+                "ahead": ahead}
+
+    if mirror_head == fork_head:
+        return result("in_sync", 0, 0)
+    store = ""
+    if _has_commit(client, ADMIN_USER, repo, fork_head, deadline):
+        store = ADMIN_USER
+    elif _has_commit(client, fork_owner, repo, mirror_head, deadline):
+        store = fork_owner
+    if store:
+        behind = _count_not(client, store, repo, mirror_head, fork_head,
+                            deadline)
+        ahead = _count_not(client, store, repo, fork_head, mirror_head,
+                           deadline)
+        if not behind and not ahead:
+            # Two distinct commits cannot both be reachable from each other.
+            raise GiteaError(f"gitea counted no difference between distinct "
+                             f"heads of {repo}@{branch}")
+        if behind and ahead and _same_tree(client, fork_owner, repo,
+                                           mirror_head, fork_head, deadline):
+            return result("same_content", behind, ahead)
+        return result("counted", behind, ahead)
+    if _same_tree(client, fork_owner, repo, mirror_head, fork_head, deadline):
+        return result("same_content")
+    return result("diverged")
 
 
 # --- attachment record ------------------------------------------------------

@@ -3971,6 +3971,35 @@ function devFetchToggle(view, body, r) {
     return el("span", { class: "dev-fetch-cell" }, [btn, err]);
 }
 
+// The card's sync sentence: where the agent's recorded base branch stands
+// against the same branch on the mirror, from repo_status's `upstream`
+// ({branch, state, behind, ahead}, or null). "" for anything not known — the
+// key absent (a degraded row), null, an unrecognised state, or a count that is
+// not a non-negative integer — so a malformed reply can only produce silence,
+// never a claim. "Not on upstream yet" rather than "not collected": a count is
+// an exact set difference, and collection re-creates commits under new ids.
+function devUpstreamText(u) {
+    if (!u || typeof u !== "object") return "";
+    const count = (v) => Number.isInteger(v) && v >= 0;
+    const commits = (k) => `${k} commit${k === 1 ? "" : "s"}`;
+    if (u.state === "in_sync") return "In sync with upstream.";
+    if (u.state === "same_content") {
+        return "Same content as upstream, but the agent hasn't rebased onto "
+            + "it yet.";
+    }
+    if (u.state === "diverged") {
+        return "Out of sync with upstream; the agent needs to rebase onto it.";
+    }
+    if (u.state !== "counted" || !count(u.behind) || !count(u.ahead)
+        || (!u.behind && !u.ahead)) {
+        return "";
+    }
+    if (!u.ahead) return `${commits(u.behind)} behind upstream.`;
+    if (!u.behind) return `${commits(u.ahead)} not on upstream yet.`;
+    return `${commits(u.behind)} behind upstream; ${u.ahead} not on `
+        + "upstream yet.";
+}
+
 // Build ONE dev repo's card — shared by the Development Fetch tab (unscoped)
 // and the per-project Fetch pane (scoped). view/body host the review dialog's
 // redirects and error cards (the host page, or the pane container — both work:
@@ -4177,8 +4206,28 @@ function buildDevRepoCard(view, body, r, attached, opts) {
         rows.push(el("div", { class: "dev-pr-row" }, cells));
         rows.push(commitsUi.panel);
     }
+    // The sync sentence joins "No open PRs." when there are none, and is its
+    // own faint line under the PR rows otherwise. The tooltip names the branch
+    // pair (the sentence compares ONE branch) and the freshness caveat:
+    // upstream here is the mirror, as of its last sync.
+    const upText = devUpstreamText(r.upstream);
+    const upAttrs = (cls) => {
+        const a = { class: cls };
+        const b = upText && r.upstream.branch;
+        if (typeof b === "string" && b) {
+            // Named by fork: the card follows the ACTIVE fork, which on a
+            // project's pane can be another consumer's.
+            const who = r.active ? `${r.active}'s` : "The agent's";
+            a.title = `${who} ${b} compared with upstream's ${b}, as of the `
+                + "mirror's last sync.";
+        }
+        return a;
+    };
     if (!prs.length && !r.empty) {
-        rows.push(el("div", { class: "config-empty" }, ["No open PRs."]));
+        rows.push(el("div", upAttrs("config-empty"),
+                     [upText ? `No open PRs. ${upText}` : "No open PRs."]));
+    } else if (upText) {
+        rows.push(el("div", upAttrs("dev-pr-meta dev-upstream"), [upText]));
     }
     // Branch rows live in their own wrapper so the hide-agent/ tick can
     // repaint them locally (no refetch, no card re-render — an open branch
