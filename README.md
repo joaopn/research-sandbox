@@ -150,7 +150,7 @@ python research.py agent show | pull | refresh      # the Claude Code dist
 python research.py editor show | pull | refresh       # the code-server editor dist
 ```
 
-A DIND project requires a pulled agent dist; `start` guarantees it. Upgrades are deliberate: `refresh` bumps the `versions.env` pin, and existing projects pick it up via `project update-agent` or a recreate.
+A DIND project requires a pulled agent dist; `start` guarantees it. Upgrades are deliberate: `refresh` bumps the `versions.env` pin, and a running project picks it up via `project update-agent`, which deploys the cached agents into the project's own terminal and every running box live (no recreate; Claude Code's editor extension is reinstalled too), on every project type.
 
 **3. Browser UI + broker** (optional, recommended): see [The browser UI](#-the-browser-ui) and the TL;DR. Off by default — with the broker stopped the CLI is unchanged and the webui is read-only.
 

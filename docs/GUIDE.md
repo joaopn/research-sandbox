@@ -413,7 +413,7 @@ project status <name>              Detailed state + worker summary
 project stop  <name|--all>         Stop the supervisor without destroying
 project start <name|--all>         Start a stopped supervisor
 project update <name> [--rebuild] [--enable IDS] [--disable IDS]
-project update-agent <name>        Re-stage the cached agent dist into a running project
+project update-agent <name>        Deploy the cached agents into a running project + its running boxes (live)
 project destroy <name|--all>       Remove container + workspace + network + creds (multiple names ok)
 ```
 

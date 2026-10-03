@@ -26,6 +26,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Minimal idle entrypoint (also rs-ext-base's default; re-COPYd here so the box
 # image is explicit about what it runs).
 COPY agent/entrypoint.sandbox-box.sh /entrypoint.sh
+# The box's MCP render: run by the entrypoint at boot, and streamed by the host
+# into a running box when an agent change gives it pi (one source, two callers).
+COPY agent/box-render-mcp.py /usr/local/lib/rs-box/box-render-mcp.py
 RUN chmod +x /entrypoint.sh
 
 # Dev-lane tooling (STAGE_DEV_GITEA): the repo-watch loop + its prompt + the

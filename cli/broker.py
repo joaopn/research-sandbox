@@ -123,7 +123,9 @@ MAX_REQUEST_BYTES = 64 * 1024
 # agent-pull / editor-pull / fleet-rebuild at a time. It records the detached
 # child's pid so a second request tells a LIVE build from a crashed one
 # (stale-pid recovery — a dead pid is reclaimable). Content: {pid, op_id, verb}.
-BUILD_LOCK = BROKER_DIR / "build.lock"
+# ONE path, rscore's: an agent update (rscore, which cannot import broker)
+# reads this lock to refuse while an agent download is being built.
+BUILD_LOCK = rscore.BUILD_LOCK_PATH
 
 # Per-op liveness markers for the PARALLEL review lane (STAGE_DEV_GITEA S4).
 # Reviews deliberately do NOT share BUILD_LOCK (they run N-at-a-time by PI

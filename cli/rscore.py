@@ -51,6 +51,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import io
 import tarfile
 import tempfile
 import time
@@ -1302,6 +1303,11 @@ class UpdateResult:
     # Agents this update ADDED to the project (STAGE_PI_AGENT); empty when
     # the request carried no agent change or the set was already complete.
     agents_added: list[str] = field(default_factory=list)
+    # Running boxes a live agent change (an Add, or an Update) refreshed in
+    # place, and the ones it could not — box NAMES only (a nested exec's output
+    # carries inner paths and never leaves the host).
+    boxes_refreshed: list[str] = field(default_factory=list)
+    boxes_not_refreshed: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -3024,7 +3030,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     # /opt/agent-dist/<agent> + a comma-joined provenance label (STAGE_MULTI_AGENT).
     # docker-substrate only BY GATE (deployed_agents is non-empty on sandbox-dind
     # too now, where the host-cache mount would be fatal: _stage_agent_dist's
-    # `rm -rf /opt/agent-dist` on a live mountpoint + host-uid files foreign-owned
+    # re-stage delete on a live mountpoint + host-uid files foreign-owned
     # under the sysbox userns — dind gets the flat staged tree instead). The
     # entrypoint loops over the mounted subdirs and cp's each into the box's OWN
     # writable ~/.local on first boot. The mounts ARE the enabled set (the
@@ -3592,6 +3598,11 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     # live stage below, a full recreate) reads the same marker. `agents_added` is
     # the delta this update owes the supervisor; an unchanged set adds nothing.
     agents_added = _validate_agents_update(req, container, workspace_path)
+    # Any agent change reads the cached downloads: refuse while an agent build is
+    # swapping them — BEFORE the marker below records an agent that could not be
+    # staged.
+    if req.agents is not None:
+        _refuse_during_agent_build()
     model_changes = req.model_changes()
     effort_dropped: list[str] = []
     if model_changes:
@@ -3629,14 +3640,29 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         # C: an agent-less project's supervisor stays unwired); the validator
         # already refuses an empty set, so this is True for every real add.
         _stage_agent_dist(container, staged, deploy_local=bool(marker_now))
+        # Running boxes follow live (an Add delivers the new agent wired; a
+        # request that adds nothing is an Update). The editor extension: an Add
+        # installs it only where none is (a supervisor that just gained claude);
+        # an Update forces the shipped version back.
+        update_form = not agents_added
+        if marker_now and not _install_agent_extensions(
+                ["docker", "exec", "-u", "1000", "-e", "HOME=/home/research", container],
+                "/home/research", update_form):
+            progress.step("agents", "the project's editor extension could not be installed")
+        refreshed, not_refreshed = _refresh_running_boxes(
+            container, staged, progress, force_ext=update_form)
         if agents_added:
             print(f"added {', '.join(agents_added)} to {project!r}: the supervisor tab can "
-                  f"run it now; boxes that already exist keep their current agent until "
-                  f"re-created (a project update, or remove + add the box); new boxes get it.")
+                  f"run it now; {len(refreshed)} running box(es) got it too; a stopped box "
+                  f"gets it at the next add or update while it runs, or when re-created.")
         else:
-            print(f"agent set unchanged; re-staged {', '.join(staged)} into {project!r}.")
+            print(f"agent set unchanged; re-staged {', '.join(staged)} into {project!r} "
+                  f"and {len(refreshed)} running box(es).")
+        if not_refreshed:
+            print(f"warning: not refreshed: {', '.join(not_refreshed)}", file=sys.stderr)
         return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
-                            effort_dropped=effort_dropped, agents_added=agents_added)
+                            effort_dropped=effort_dropped, agents_added=agents_added,
+                            boxes_refreshed=refreshed, boxes_not_refreshed=not_refreshed)
     # Granular model application — the point of writing the marker above. Only a
     # SUPERVISOR pair change needs the multi-minute recreate (its env is fixed at
     # docker run); the other two are far cheaper and must not pay for it:
@@ -4827,6 +4853,25 @@ AGENT_DIST_DIR = Path.home() / ".research-sandbox" / "agent-dist"
 # agent the supervisor + worker homes deploy (no bake; STAGE_AGENT_DIST slice 2).
 AGENT_DIST_MOUNT = "/opt/agent-dist"
 DEFAULT_AGENT = "claude"
+# The last entry of every agent-dist stream (at the archive ROOT, never under
+# local/, so it can never reach a home). A stream cut between two files leaves
+# `tar -x` exiting 0 with a valid-looking partial tree, so the receiving side
+# deploys only when this arrived (measured).
+STAGE_MARKER = ".rs-stage-complete"
+# The box MCP render (one source: baked into the box image for the boot, and
+# streamed into a running box when an agent change gives it pi).
+BOX_RENDER_SCRIPT = Path(__file__).resolve().parent.parent / "agent" / "box-render-mcp.py"
+# The build lane's lock (broker binds its BUILD_LOCK to this one path; rscore
+# cannot import broker). An agent update refuses while an AGENT build holds it:
+# the update reads the cached downloads that build is swapping.
+BUILD_LOCK_PATH = Path.home() / ".research-sandbox" / "build.lock"
+_AGENT_BUILD_VERBS = frozenset({"agent_pull", "agent_refresh"})
+# The build lane child's argv marker (broker `__run-build`): a live pid must
+# also carry it, so a reused pid can never block an agent update forever.
+_BUILD_CHILD_ARG = b"__run-build"
+_AGENT_BUILD_RUNNING_MSG = "an agent download is being built — try again when it finishes"
+_DIST_CHANGED_MSG = ("the agent download changed while it was being deployed "
+                     "(a Pull ran at the same time) — run the update again")
 # RO copy-source mount spliced into every inner `docker run` (the source is the
 # supervisor's staged dir — same path, RO). The entrypoint cp's its own copy.
 # Spliced UNCONDITIONALLY at the rscore role-MCP spawn site:
@@ -5293,6 +5338,45 @@ def _agent_sidecar(agent: str) -> Path:
     return AGENT_DIST_DIR / f"{agent}.json"
 
 
+def agent_build_running() -> bool:
+    """True while the build lane is building an AGENT download (an editor,
+    reader, node or image build does not count): the lock names an agent verb
+    AND its pid is alive AND that pid is the build lane's child. Tolerant: no
+    lock, an unreadable lock or a foreign pid reads as not running."""
+    try:
+        holder = json.loads(BUILD_LOCK_PATH.read_text())
+    except (OSError, ValueError):
+        return False
+    if not isinstance(holder, dict) or holder.get("verb") not in _AGENT_BUILD_VERBS:
+        return False
+    pid = holder.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        return _BUILD_CHILD_ARG in Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+
+
+def _refuse_during_agent_build() -> None:
+    if agent_build_running():
+        die(_AGENT_BUILD_RUNNING_MSG)
+
+
+def _sidecar_snapshot(agent: str) -> object:
+    """The sidecar's raw bytes, for a before/after comparison around a dist
+    transfer. Bytes, never parsed JSON: the sidecar is written non-atomically,
+    so a mid-write read must not become a traceback. Missing reads as None
+    (missing before and after = unchanged); any other read error as a fresh
+    object, which compares unequal to everything (= changed)."""
+    try:
+        return _agent_sidecar(agent).read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return object()
+
+
 def dist_present(agent: str) -> bool:
     """True iff a usable dist for `agent` is cached (its launcher entry exists).
     lexists, not exists: the launcher is a symlink to an absolute ~/.local/share
@@ -5493,18 +5577,21 @@ def _dind_stage_set(agents: "Sequence[str]") -> list[str]:
 
 
 def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,),
-                      *, deploy_local: bool = True) -> None:
+                      *, deploy_local: bool = True, docker: bool = False) -> None:
     """Stage the host agent dists — the SET `agents`, merged — into a RUNNING
     supervisor (STAGE_AGENT_DIST slice 2; N agents since STAGE_PI_AGENT).
     Real files at AGENT_DIST_MOUNT — the inner fleet (worker / role-MCP /
     sandbox-box) RO-mounts that path and cp's its own writable copy at boot.
+    With `docker=True` (a docker-substrate box: no inner fleet, its own
+    agent mounts read-only) the stream goes to a scratch dir instead and is
+    deployed straight into the box's home in the same exec.
     MERGED, not per-agent: every agent's `local/` lands in ONE local/ (their file
     sets are disjoint by construction — bin/<agent> + share/<agent>/… + the
     vsix/config sidecars), each agent's config beside it (claude/, pi/), so the
     five baked entrypoints keep copying `local/.` unchanged and a second agent
     reaches an existing project with no image rebuild. (pi's settings beside
-    local/ reach the docker substrate and boxes through their entrypoints'
-    no-clobber install, i.e. only once those images carry it.) The wipe-then-extract-all shape is
+    local/ reach a box through its entrypoint's no-clobber install at boot, or
+    through the live box refresh after an Add or Update.) The wipe-then-extract-all shape is
     what makes an agent ADD idempotent: the caller passes the whole set (the
     marker's `agents` ∪ claude), never a delta — a single-agent re-stage would
     delete its siblings.
@@ -5516,9 +5603,11 @@ def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,
     rs-sandbox-box boxes (FROM rs-analysis-base — no bake now) can deploy it.
 
     Two dragons handled here:
-      • docker-cp-into-existing-dir NESTS (src copied INTO dest → .../claude/bin),
-        silently breaking the mount path on the update-agent / recreate re-stage.
-        So rm the dest first, then `docker cp <cache>/.` to land contents directly.
+      • The re-stage replaces the shared copy's CONTENTS and keeps the directory:
+        every box / worker / role service bind-mounts it, and a mount stays pinned
+        to the directory it was made on (an `rm -rf` + `mkdir` would leave them
+        all reading an empty directory — measured). A completion marker, last in
+        the stream, gates every deploy (see _stream_agent_dists).
       • The supervisor's ~/.local deploy is UNCONDITIONAL (not absence-guarded) so
         `update-agent` actually refreshes the launcher the PI's interactive claude
         uses; a version bump leaves the old versions/<oldver>/ as harmless dead
@@ -5542,36 +5631,67 @@ def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,
     # inner `cp -a` can't preserve it either. So never let a foreign uid in AND
     # never leave an intermediate file: STREAM a uid/gid-0-normalized tar straight
     # into the container's `tar -x` via stdin. The extracted tree is root-owned
-    # (in-range) → chown→1000 works, as does a future re-stage's `rm -rf`. No host
+    # (in-range) → chown→1000 works, as does a future re-stage's delete. No host
     # temp file, no `docker cp`, no in-container leftover. (No host `tar` either —
     # tarfile is Python stdlib; stdout→DEVNULL so the 150MB stdin write can't
     # deadlock on backpressure, the quiet extract keeps stderr tiny.)
-    def _root_owned(ti: tarfile.TarInfo) -> tarfile.TarInfo:
-        ti.uid = ti.gid = 0
-        ti.uname = ti.gname = ""
-        return ti
-    extract = (f"rm -rf {AGENT_DIST_MOUNT} && mkdir -p {AGENT_DIST_MOUNT} && "
-               f"tar -C {AGENT_DIST_MOUNT} -x && chown -R 1000:1000 {AGENT_DIST_MOUNT}")
-    proc = subprocess.Popen(
-        ["docker", "exec", "-i", "-u", "0", supervisor, "sh", "-c", extract],
-        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    try:
-        with tarfile.open(fileobj=proc.stdin, mode="w|") as tf:   # streaming; symlinks preserved
-            # One stream, every agent's tree in turn: a repeated directory header
-            # (local/, local/bin/, …) is a no-op mkdir for tar -x; the FILE sets
-            # never overlap (see the docstring).
-            for agent in agents:
-                src = agent_dist_path(agent)
-                for entry in sorted(os.listdir(src)):
-                    tf.add(os.path.join(src, entry), arcname=entry, filter=_root_owned)
-    finally:
-        if proc.stdin:
-            proc.stdin.close()
+    if docker:
+        # The docker substrate (a plain runc box): its /opt/agent-dist/<agent>
+        # are READ-ONLY bind mounts of the host caches, pinned to the directory
+        # they were created on — a Pull deletes and recreates that directory,
+        # leaving the mount EMPTY until a restart (measured). So the update
+        # streams the dists in like a dind stage, into a fresh scratch dir, and
+        # deploys from it in the SAME exec (a mktemp path cannot cross to a
+        # second exec, nor can a trap clean up after one). Absolute paths: the
+        # exec runs as root.
+        settings = "".join(
+            f"( [ -e /home/research/.claude/settings.json ] || [ ! -f \"$d/claude/settings.json\" ] || "
+            f"cp \"$d/claude/settings.json\" /home/research/.claude/settings.json )\n"
+            if a == DEFAULT_AGENT else
+            f"( [ ! -f \"$d/pi/settings.json\" ] || [ -e /home/research/{PI_AGENT_DIR_REL}/settings.json ] || "
+            f"{{ mkdir -p /home/research/{PI_AGENT_DIR_REL} && "
+            f"cp \"$d/pi/settings.json\" /home/research/{PI_AGENT_DIR_REL}/settings.json; }} )\n"
+            if a == "pi" else ""
+            for a in agents)
+        script = ("set -e\n"
+                  "d=$(mktemp -d /tmp/rs-agent-stage.XXXXXX)\n"
+                  "trap 'rm -rf \"$d\"' EXIT\n"
+                  "tar -C \"$d\" -x\n"
+                  f"[ -f \"$d/{STAGE_MARKER}\" ] || {{ echo 'the transfer was cut short' >&2; exit 1; }}\n"
+                  "mkdir -p /home/research/.local /home/research/.claude\n"
+                  "cp -af \"$d/local/.\" /home/research/.local/\n"
+                  + settings +
+                  "chown -R 1000:1000 /home/research/.local /home/research/.claude\n")
+        cmd = ["docker", "exec", "-i", "-u", "0", supervisor, "sh", "-c", script]
+    else:
+        # In place: the CONTENTS go, the directory stays. Every box, worker and
+        # role service bind-mounts this path, and a mount is pinned to the
+        # directory it was made on — `rm -rf` + `mkdir` would leave every
+        # existing mount reading an empty directory (measured).
+        extract = (f"mkdir -p {AGENT_DIST_MOUNT} && find {AGENT_DIST_MOUNT} -mindepth 1 -delete && "
+                   f"tar -C {AGENT_DIST_MOUNT} -x && "
+                   f"{{ test -f {AGENT_DIST_MOUNT}/{STAGE_MARKER} || "
+                   f"{{ echo 'the transfer was cut short' >&2; false; }}; }} && "
+                   f"rm {AGENT_DIST_MOUNT}/{STAGE_MARKER} && "
+                   f"chown -R 1000:1000 {AGENT_DIST_MOUNT}")
+        cmd = ["docker", "exec", "-i", "-u", "0", supervisor, "sh", "-c", extract]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE)
+    outcome = _stream_agent_dists(proc, agents)
     _, err = proc.communicate()
+    detail = (err.decode(errors="replace") if err else "").strip()
+    if outcome == "broken":
+        die(f"staging {label} dist into {supervisor} failed: "
+            f"{detail or 'the container stopped reading the transfer'}")
+    if outcome == "changed":
+        die(_DIST_CHANGED_MSG)
+    if isinstance(outcome, OSError):
+        die(f"reading the cached {label} download failed: {outcome}")
     if proc.returncode != 0:
-        detail = (err.decode(errors="replace") if err else "").strip()
         die(f"staging {label} dist into {supervisor} failed: "
             f"{detail or 'tar extract returned non-zero'}")
+    if docker:
+        return
     if deploy_local:
         # /opt/agent-dist is now research-owned, so cp -a preserves cleanly. -f
         # (force) is load-bearing for the update-agent RE-deploy: the existing
@@ -5605,6 +5725,192 @@ def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,
                    f"/home/research/.claude/settings.json ) && "
                    + pi_settings +
                    f"chown -R 1000:1000 /home/research/.local /home/research/.claude"])
+
+
+def _root_owned(ti: tarfile.TarInfo) -> tarfile.TarInfo:
+    ti.uid = ti.gid = 0
+    ti.uname = ti.gname = ""
+    return ti
+
+
+class _DistChanged(Exception):
+    """A cached download changed under a transfer (see _stream_agent_dists)."""
+
+
+def _stream_agent_dists(proc, agents: "Sequence[str]") -> object:
+    """Write every agent's cached dist into `proc`'s stdin as ONE tar stream,
+    then the completion marker. Returns None on success, else "broken" (the
+    container side stopped reading — its stderr says why), "changed" (the
+    download changed under the walk: a concurrent Pull) or the OSError that
+    reading the cache raised. Never raises for those, so the caller can
+    collect the container's stderr through communicate() first.
+    BrokenPipeError is caught FIRST (it is an OSError): the original failure
+    must keep showing the container's reason. An exception inside the `with`
+    makes TarFile.__exit__ flush the stream again, which raises a second
+    BrokenPipeError out of it (measured) — hence the try around the whole
+    block. A Pull that completes between two files raises nothing, and one
+    caught between its delete and its replace lists an empty directory; the
+    sidecar bytes before/after and the per-agent launcher check catch both,
+    BEFORE the marker is written."""
+    before = {a: _sidecar_snapshot(a) for a in agents}
+    names: set[str] = set()
+
+    def _collect(ti: tarfile.TarInfo) -> tarfile.TarInfo:
+        names.add(ti.name)
+        return _root_owned(ti)
+
+    outcome: object = None
+    try:
+        with tarfile.open(fileobj=proc.stdin, mode="w|") as tf:   # streaming; symlinks preserved
+            # One stream, every agent's tree in turn: a repeated directory header
+            # (local/, local/bin/, …) is a no-op mkdir for tar -x; the FILE sets
+            # never overlap (see _stage_agent_dist's docstring).
+            for agent in agents:
+                src = agent_dist_path(agent)
+                for entry in sorted(os.listdir(src)):
+                    tf.add(os.path.join(src, entry), arcname=entry, filter=_collect)
+            for agent in agents:
+                if f"local/bin/{_AGENT_INSTALL[agent]['bin']}" not in names:
+                    raise _DistChanged(agent)
+                if _sidecar_snapshot(agent) != before[agent]:
+                    raise _DistChanged(agent)
+            marker = tarfile.TarInfo(STAGE_MARKER)
+            tf.addfile(_root_owned(marker), io.BytesIO(b""))
+    except BrokenPipeError:
+        outcome = "broken"
+    except (_DistChanged, FileNotFoundError, NotADirectoryError):
+        outcome = "changed"
+    except OSError as e:
+        # A file that shrank mid-read ("unexpected end of data") is a concurrent
+        # rebuild too; anything else (a permission problem) keeps its own text.
+        outcome = "changed" if "unexpected end of data" in str(e) else e
+    finally:
+        if proc.stdin:
+            try:
+                proc.stdin.close()
+            except BrokenPipeError:
+                if outcome is None:
+                    outcome = "broken"
+    return outcome
+
+
+# The editor keeps its extensions on the container's own /workspace, which a
+# recreate keeps (container/supervisor/code-server-deploy.sh).
+_CS_USER_DIR = "/workspace/.local/share/code-server"
+
+
+def _ext_install_script(home: str, force: bool) -> str:
+    """Install every agent editor extension the container's ~/.local carries
+    into its editor — only where the editor is deployed. `force` (an Update)
+    reinstalls the shipped version over whatever is installed: measured, a
+    different version's install switches the active one and --force also
+    downgrades, the editor's registry keeping exactly one active version (a
+    superseded version folder stays on disk for the editor's own cleanup).
+    Without force (an Add) it installs only an extension of which no version is
+    installed — the boot's own rule. Exits non-zero if any install failed."""
+    cs = f"{home}/.local/bin/code-server"
+    skip = "" if force else '    set -- "$E/$b-"[0-9]*; [ -e "$1" ] && continue\n'
+    flag = " --force" if force else ""
+    return (f'[ -x "{cs}" ] || exit 0\n'
+            f'X="{home}/.local/share/rs-agent-ext"; [ -d "$X" ] || exit 0\n'
+            f'U="{_CS_USER_DIR}"; E="$U/extensions"; rc=0\n'
+            f'for v in "$X"/*.vsix; do\n'
+            f'    [ -f "$v" ] || continue\n'
+            f'    b=$(basename "$v" .vsix)\n'
+            + skip +
+            f'    "{cs}" --install-extension "$v"{flag} --extensions-dir "$E" '
+            f'--user-data-dir "$U" >/dev/null 2>&1 || rc=1\n'
+            f'done\nexit $rc\n')
+
+
+def _install_agent_extensions(exec_prefix: "Sequence[str]", home: str, force: bool) -> bool:
+    """Run _ext_install_script through `exec_prefix` (a `docker exec …` chain
+    that ends just before the command, as uid 1000 with HOME set — code-server
+    writes its own config there). True when nothing failed."""
+    r = run([*exec_prefix, "sh", "-c", _ext_install_script(home, force)], capture_output=True)
+    return r.returncode == 0
+
+
+def _running_agent_boxes(supervisor: str) -> "list[str] | None":
+    """Running boxes in the project's inner daemon that mount the shared agent
+    copy (agent-less boxes have no such mount), or None when the inner daemon
+    cannot be listed. None, not a die(): the supervisor's own deploy has already
+    landed, so the caller reports the boxes as not refreshed rather than failing
+    an update that half happened."""
+    r = run(["docker", "exec", supervisor, "docker", "ps", "--filter",
+             "label=research.sandbox=1", "--format", "{{.Names}}"], capture_output=True)
+    if r.returncode != 0:
+        return None
+    out = []
+    for name in r.stdout.split():
+        m = run(["docker", "exec", supervisor, "docker", "inspect", "-f",
+                 "{{range .Mounts}}{{.Destination}}\n{{end}}", name], capture_output=True)
+        if m.returncode == 0 and AGENT_DIST_MOUNT in m.stdout.split():
+            out.append(name)
+    return out
+
+
+_BOX_HOME = "/home/worker"
+
+
+def _refresh_running_boxes(supervisor: str, agents: "Sequence[str]", progress,
+                           *, force_ext: bool) -> tuple[list[str], list[str]]:
+    """Bring every RUNNING agent-bearing box of a dind project to the project's
+    agent set, live — after an Add or an Update has re-staged the shared copy.
+    Per box: the whole shared tree into the box user's home, exactly as the
+    box's own boot copies it (every agent-bearing box carries the project's
+    whole set; this form never nests), each agent's settings no-clobber, a
+    chown; then, only where pi is present but not yet wired (its trust record
+    for /workspace missing — pi just arrived, or an earlier render failed), the
+    box's MCP render (agent/box-render-mcp.py, streamed from the host so an
+    older box image is wired too) — never otherwise, because it regenerates
+    .mcp.json wholesale and would drop servers added by hand; then the editor extension
+    (forced on an Update, install-if-absent on an Add). A box that fails is
+    reported by NAME and never stops the others. Returns (refreshed, failed)."""
+    refreshed: list[str] = []
+    failed: list[str] = []
+    pi_dir = f"{_BOX_HOME}/{PI_AGENT_DIR_REL}"
+    deploy = (f"mkdir -p {_BOX_HOME}/.local {_BOX_HOME}/.claude && "
+              f"cp -af {AGENT_DIST_MOUNT}/local/. {_BOX_HOME}/.local/ && "
+              f"( [ -e {_BOX_HOME}/.claude/settings.json ] || [ ! -f {AGENT_DIST_MOUNT}/claude/settings.json ] || "
+              f"cp {AGENT_DIST_MOUNT}/claude/settings.json {_BOX_HOME}/.claude/settings.json ) && "
+              f"( [ ! -f {AGENT_DIST_MOUNT}/pi/settings.json ] || [ -e {pi_dir}/settings.json ] || "
+              f"{{ mkdir -p {pi_dir} && cp {AGENT_DIST_MOUNT}/pi/settings.json {pi_dir}/settings.json; }} ) && "
+              f"chown -R 1000:1000 {_BOX_HOME}/.local {_BOX_HOME}/.claude")
+    # pi is "wired" once the render has recorded /workspace in pi's trust.json —
+    # it writes that record at every successful run and a failed run never does,
+    # so a box whose render failed is rendered again by the next Update, and a
+    # wired box is never re-rendered (that would drop servers added by hand).
+    wired = (f'python3 -c "import json,sys; '
+             f'sys.exit(0 if \'/workspace\' in json.load(open(\'{pi_dir}/trust.json\')) else 1)"')
+    boxes = _running_agent_boxes(supervisor)
+    if boxes is None:
+        progress.step("agents", "the running boxes could not be listed; none refreshed")
+        return [], ["(the box list)"]
+    for box in boxes:
+        inner = ["docker", "exec", supervisor, "docker", "exec"]
+        ok = run([*inner, "-u", "0", box, "sh", "-c", deploy], capture_output=True).returncode == 0
+        why = "" if ok else " (the agent copy did not land)"
+        needs_render = (ok and run([*inner, box, "test", "-x", f"{_BOX_HOME}/.local/bin/pi"],
+                                   capture_output=True).returncode == 0
+                        and run([*inner, "-u", "1000", box, "sh", "-c", wired],
+                                capture_output=True).returncode != 0)
+        if needs_render:
+            env = dict(_agent_env("pi", _BOX_HOME))
+            r = subprocess.run(
+                ["docker", "exec", "-i", supervisor, "docker", "exec", "-i", "-u", "1000",
+                 "-e", f"RS_PI_AGENT_DIR={env['PI_CODING_AGENT_DIR']}", box, "python3", "-"],
+                input=BOX_RENDER_SCRIPT.read_bytes(), capture_output=True)
+            ok = r.returncode == 0
+            why = "" if ok else " (pi's MCP setup failed; it is retried at the next update)"
+        if ok and not _install_agent_extensions(
+                [*inner, "-u", "1000", "-e", f"HOME={_BOX_HOME}", box], _BOX_HOME, force_ext):
+            progress.step("agents", f"box {box}: the editor extension could not be installed")
+        (refreshed if ok else failed).append(box)
+        progress.step("agents", f"box {box}: {'refreshed' if ok else 'NOT refreshed' + why}")
+    progress.step("agents", f"{len(refreshed)} box(es) refreshed, {len(failed)} not refreshed"
+                  + (f": {', '.join(failed)}" if failed else ""))
+    return refreshed, failed
 
 
 def _stage_rs_sandbox(container: str) -> None:
@@ -9173,11 +9479,33 @@ def _validate_agents_update(req: "UpdateRequest", container: str,
     return [a for a in req.agents if a not in current]
 
 
+def _read_marker_substrate(workspace_path: "Path") -> str:
+    """The substrate stamped into .orchestrator/project.json at create. Tolerant
+    (the _read_marker_agents shape): a missing/unreadable marker or key reads as
+    dind-sysbox, the substrate every pre-docker marker meant."""
+    f = workspace_path / ".orchestrator" / "project.json"
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError):
+        return Substrate.DIND_SYSBOX.value
+    sub = data.get("substrate") if isinstance(data, dict) else None
+    return sub if isinstance(sub, str) else Substrate.DIND_SYSBOX.value
+
+
 def project_add_agents(project: str, agents: "Sequence[str]",
-                       cfg: "Config" | None = None) -> "UpdateResult":  # type: ignore[name-defined]
-    """`project update-agent --agent X` (CLI): the additive form of update() —
-    the current marker set ∪ `agents`. With no agents it re-stages the current
-    set (the old "refresh the dist copy" semantics), on any dind flavor."""
+                       cfg: "Config" | None = None, progress=None) -> "UpdateResult":  # type: ignore[name-defined]
+    """`project update-agent [--agent X]` (CLI) and the browser's Update: bring a
+    RUNNING project's agents level with the host's cached downloads, live — no
+    recreate. An invocation that ADDS an agent is an Add, routed through
+    update()'s live agents-only branch; one that adds nothing (no agent, or only
+    agents the project carries) is an Update: re-stage the project's set, deploy
+    it into the supervisor's own home, refresh every running agent-bearing box,
+    and force the editor extension back to the shipped version.
+    The docker substrate (a plain runc box, its set fixed at create) takes the
+    streamed transfer (its agent mounts go stale after a Pull) and has no boxes.
+    The substrate and the agent set come from the project MARKER (the container's
+    agent label does not survive an editor-toggle recreate)."""
+    progress = progress or _NULL_PROGRESS
     if cfg is None:
         cfg = load_config()
     container = container_name_for(project)
@@ -9186,27 +9514,41 @@ def project_add_agents(project: str, agents: "Sequence[str]",
     if not container_running(container):
         die(f"project {project!r} is not running — start it first")
     workspace_path = workspace_path_for(project, cfg)
-    if not agents:
-        is_research = _container_project_type(container) != PROJECT_TYPE_SANDBOX_DIND
-        current = [DEFAULT_AGENT] if is_research else _dind_stage_set(_read_marker_agents(workspace_path))
-        _stage_agent_dist(container, current,
-                          deploy_local=is_research or bool(_read_marker_agents(workspace_path)))
+    marker_agents = list(_read_marker_agents(workspace_path))
+    if _read_marker_substrate(workspace_path) == Substrate.DOCKER.value:
+        if any(a not in marker_agents for a in agents):
+            die("the agent set is fixed at create on the docker substrate "
+                "(a plain runc box); recreate the project to change it")
+        if not marker_agents:
+            die("this project has no agents to update")
+        _refuse_during_agent_build()
+        progress.step("agents", f"deploying {'+'.join(marker_agents)} into the project")
+        _stage_agent_dist(container, marker_agents, docker=True)
+        if not _install_agent_extensions(
+                ["docker", "exec", "-u", "1000", "-e", "HOME=/home/research", container],
+                "/home/research", True):
+            progress.step("agents", "the project's editor extension could not be installed")
         return UpdateResult(project=project, rebuilt=False, refreshed_claude=False)
     is_research = _container_project_type(container) != PROJECT_TYPE_SANDBOX_DIND
-    marker_agents = list(_read_marker_agents(workspace_path))
     # Membership is against the MARKER (research: claude by construction), not
     # the floored stage set — else `--agent claude` on an agent-less sandbox-dind
     # project would read as "already carried" and never wire the supervisor.
     carried = [DEFAULT_AGENT] if is_research else marker_agents
-    if all(a in carried for a in agents):
-        # Nothing to add — the documented re-stage (research's `--agent claude`
-        # included), on any dind flavor, never routed through update().
-        _stage_agent_dist(container, [DEFAULT_AGENT] if is_research else _dind_stage_set(marker_agents),
-                          deploy_local=is_research or bool(marker_agents))
-        return UpdateResult(project=project, rebuilt=False, refreshed_claude=False)
-    current = list(_read_marker_agents(workspace_path))
-    req = UpdateRequest.from_kwargs(name=project, agents=current + list(agents))
-    return update(req, cfg)
+    if agents and not all(a in carried for a in agents):
+        req = UpdateRequest.from_kwargs(name=project, agents=marker_agents + list(agents))
+        return update(req, cfg, progress=progress)
+    _refuse_during_agent_build()
+    staged = [DEFAULT_AGENT] if is_research else _dind_stage_set(marker_agents)
+    deploy_local = is_research or bool(marker_agents)
+    progress.step("agents", f"staging {'+'.join(staged)} into the project")
+    _stage_agent_dist(container, staged, deploy_local=deploy_local)
+    if deploy_local and not _install_agent_extensions(
+            ["docker", "exec", "-u", "1000", "-e", "HOME=/home/research", container],
+            "/home/research", True):
+        progress.step("agents", "the project's editor extension could not be installed")
+    refreshed, not_refreshed = _refresh_running_boxes(container, staged, progress, force_ext=True)
+    return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
+                        boxes_refreshed=refreshed, boxes_not_refreshed=not_refreshed)
 
 
 def _read_box_pins(workspace_path: "Path") -> dict[str, str]:

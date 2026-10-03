@@ -70,10 +70,11 @@ fi
 #     (B-tuck), so this glob is non-empty IFF an agent dist was deployed into
 #     this container's ~/.local — the install gate falls out of file presence,
 #     no launcher check. An agent-less box (e.g. management) has no such dir →
-#     no-op. Same idempotent already-installed skip as step 3; a .vsix version
-#     bump only reaches FRESH / recreated / restarted containers (the installed
-#     folder name carries the old version, so the skip matches), never an
-#     in-place upgrade — identical to the Data Wrangler lane above.
+#     no-op. Same idempotent already-installed skip as step 3: ANY installed
+#     version skips, and the extensions live on /workspace, which a recreate
+#     keeps — so a boot never upgrades the extension, not even after a recreate.
+#     The agent update (`project update-agent`) is what reinstalls it, forced
+#     to the shipped version.
 AGENT_EXT_DIR="$HOME/.local/share/rs-agent-ext"
 if [[ -d "$AGENT_EXT_DIR" ]]; then
     for vsix in "$AGENT_EXT_DIR"/*.vsix; do

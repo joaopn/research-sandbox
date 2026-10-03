@@ -1525,20 +1525,26 @@ def cmd_project_update_agent(args: argparse.Namespace) -> None:
 
     No agent is baked anywhere (STAGE_AGENT_DIST slice 2); the dists live in the
     host cache (`research agent pull`/`refresh`) and every container deploys them
-    via `cp` at boot. Without `--agent` this re-streams the project's CURRENT set
-    into the supervisor's /opt/agent-dist (the copy-source the inner fleet
-    RO-mounts) and refreshes the supervisor's OWN ~/.local. NEWLY-spawned workers /
-    role-MCPs / boxes then deploy the re-staged version; already-running
-    long-lived containers keep their copy until re-created (the entrypoint
-    absence-guard). Pull a new version first with `research agent pull`."""
+    via `cp` at boot. Without `--agent` (or naming only agents the project
+    carries) this is an UPDATE: it re-streams the project's CURRENT set (in place,
+    so every box's mount stays live) and deploys it into the supervisor's own
+    home, every RUNNING agent-bearing box, and the editors (Claude Code's
+    extension forced to the shipped version) — live, no recreate. On the docker
+    substrate it streams the set straight into the box (its dist mounts go stale
+    after a Pull). A stopped box, and long-lived research role services, keep
+    their copy until they next run during an update or are re-created. Pull a new
+    version first with `research agent pull`."""
     _require_project(args.name)
     res = _call(rscore.project_add_agents, args.name, tuple(args.agents or ()))
-    if res.agents_added:
-        print(f"added {', '.join(res.agents_added)} to {args.name!r}.")
-    else:
+    if not res.agents_added:      # an Add printed its own lines in update()
         print(f"re-staged the agent set into {args.name!r}.")
-    print("note: the supervisor tab has it now; newly-created boxes / workers pick "
-          "it up; boxes that already exist keep their copy until re-created.")
+        if res.boxes_refreshed:
+            print(f"running boxes refreshed: {', '.join(res.boxes_refreshed)}")
+        if res.boxes_not_refreshed:
+            print(f"warning: boxes NOT refreshed: {', '.join(res.boxes_not_refreshed)}",
+                  file=sys.stderr)
+    print("note: restart running agent sessions to use the new version; a stopped box "
+          "catches up at the next update while it runs, or when re-created.")
 
 
 def cmd_webui_cert_tailscale() -> None:

@@ -8648,10 +8648,11 @@ function mgmtAgentsDialog(name, current, addable) {
                 "pi's login, sessions, settings (a default model saved in-app included), " +
                 "your own extensions and packages installed with `pi install` are kept " +
                 "across re-deploys of the agent set (an add, a recreate); a pi updated with " +
-                "`pi update` returns to the shipped version. Boxes that " +
-                "already exist keep their current agent until they are re-created (a " +
-                "project update re-creates every box, or remove + add the box); new boxes " +
-                "get every deployed agent. Agents are added, never removed.",
+                "`pi update` returns to the shipped version. Running boxes that carry " +
+                "agents get the new one now, set up the way a new box would be; a stopped " +
+                "box gets it the next time it runs during an add or update, or when " +
+                "re-created; new boxes get every deployed agent. Agents are added, never " +
+                "removed.",
             ]),
         ],
         validate: () => (checks.some((c) => c.cb.checked) ? null : "Tick at least one agent."),
