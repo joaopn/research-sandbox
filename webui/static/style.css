@@ -324,6 +324,25 @@ body {
 }
 .project-rail .project.dragging { opacity: 0.4; }
 
+/* The rail's group separator: the padded strip is the drag handle, the 3px
+   rule inside it is what shows. --fg-faint, not a border token: the border
+   colours sit too close to the rail background in several themes to read
+   as a divider. */
+.project-rail .rail-separator {
+    padding: 6px 14px;
+    cursor: grab;
+    flex-shrink: 0;
+}
+.project-rail .rail-separator::before {
+    content: "";
+    display: block;
+    height: 3px;
+    border-radius: 2px;
+    background: var(--fg-faint);
+}
+.project-rail .rail-separator.dragging { opacity: 0.4; }
+html.mobile .project-rail .rail-separator { cursor: default; }
+
 /* Per-project floating config box — position: fixed in JS so it overlays
    outside the (possibly narrow) rail rather than being clipped by it.
    Hosts the Tabs visibility checkboxes now; structured for more sections
