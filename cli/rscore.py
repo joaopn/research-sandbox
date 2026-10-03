@@ -4861,9 +4861,11 @@ _AGENT_INSTALL = {
         "latest_url": _CLAUDE_LATEST_URL,
         # The agent's canonical config, written into the dist tree at `path`
         # (relative to the dist root) at build. claude's lands OUTSIDE local/
-        # (its dest is ~/.claude/, installed no-clobber by every deploy site);
-        # an agent whose config lives under ~/.local puts it INSIDE local/ so
-        # it rides the existing ~/.local copy with no entrypoint edit.
+        # (its dest is ~/.claude/, installed no-clobber by every deploy site).
+        # Any config the operator may later change belongs OUTSIDE local/ too:
+        # everything inside local/ is re-laid by every `cp -af local/.` restage,
+        # so a config there is reset at each one (pi's settings ride beside local/
+        # as pi/settings.json for exactly that reason, via `files`).
         "config": {"path": "claude/settings.json", "content": None},   # → _AGENT_SETTINGS_JSON (bound below)
         # OPTIONAL companion editor extension (agent-bound; STAGE_AGENT_EXTENSIONS).
         # A future agent with no extension omits this whole key → no .vsix, no-op.
@@ -4894,8 +4896,10 @@ _AGENT_INSTALL = {
     # PRIVATE node runtime (the node seed's tarball at NODE_VERSION — kept OUT of
     # ~/.local/bin so it never collides with the seed a box may carry) under
     # share/pi-agent/node, the npm-installed package under share/pi-agent/pi, pi's
-    # agent dir RELOCATED to share/pi-agent/agent (the canonical settings, and at
-    # runtime the PI's auth.json, sessions, trust and own mcp.json) and
+    # agent dir RELOCATED to share/pi-agent/agent (the dist lays only its empty
+    # extensions/ slot; at runtime it holds the settings each deploy site installs
+    # no-clobber from pi/settings.json beside local/, and the PI's auth.json,
+    # sessions, trust, own mcp.json and `pi install` packages) and
     # an RS launcher script at bin/pi that resolves node from its own directory,
     # exports pi's two env defaults when unset (the relocated agent dir, telemetry
     # off) and APPENDS the private node's bin/ to PATH — so a copy runs from ANY
@@ -4980,7 +4984,12 @@ _AGENT_INSTALL = {
         # `cp -af` overlay deploy would clobber theirs. A box's MCP servers reach
         # pi through the box entrypoint's `.pi/mcp.json` link instead.
         "files": [
-            {"path": "local/share/pi-agent/agent/settings.json", "content": None},  # → _pi_settings_json (bound below)
+            # pi's canonical settings ride BESIDE local/ (like claude's
+            # claude/settings.json): every deploy site installs them NO-CLOBBER into
+            # the agent dir, so what the operator changes in pi (a default model,
+            # packages from `pi install`) survives a restage and, via the creds
+            # stash, a recreate. Inside local/ they were reset by every restage.
+            {"path": "pi/settings.json", "content": None},  # → _pi_settings_json (bound below)
             # The RS-owned rules extension (Claude Code's .claude/rules for pi),
             # OUTSIDE the agent dir: extensions/ inside it is the PI's own slot
             # and rides the creds stash; rs/ is dist content, re-laid by every
@@ -5152,7 +5161,7 @@ def _rs_rules_source(pins: dict) -> str:
 
 # Bound by PATH, not list position: a row added or dropped must not shift a
 # callable onto the wrong file (and an unknown path is a KeyError at import).
-_PI_FILE_CONTENT = {"local/share/pi-agent/agent/settings.json": _pi_settings_json,
+_PI_FILE_CONTENT = {"pi/settings.json": _pi_settings_json,
                     "local/share/pi-agent/rs/rs-rules.ts": _rs_rules_source}
 for _f in _AGENT_INSTALL["pi"]["files"]:
     _f["content"] = _PI_FILE_CONTENT[_f["path"]]
@@ -5417,8 +5426,9 @@ def _agent_build_dist(agent: str, version: str) -> None:
         if dest.exists():
             shutil.rmtree(dest)
         # Fixed tree (STAGE_AGENT_DIST_SETTINGS): local/ = the captured ~/.local,
-        # plus the agent's canonical config at spec["config"]["path"] — claude's
-        # beside local/ (claude/settings.json), another agent's INSIDE it. Mirrors the
+        # plus the agent's canonical config at spec["config"]["path"] (claude's
+        # claude/settings.json) and any `files` (pi's pi/settings.json, its rules
+        # extension under local/), each at its dist-root-relative path. Mirrors the
         # editor dist's fixed-tree shape. captured is tmp/.local, same fs as dest.
         dest.mkdir(parents=True)
         os.replace(captured, dest / "local")
@@ -5490,9 +5500,11 @@ def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,
     sandbox-box) RO-mounts that path and cp's its own writable copy at boot.
     MERGED, not per-agent: every agent's `local/` lands in ONE local/ (their file
     sets are disjoint by construction — bin/<agent> + share/<agent>/… + the
-    vsix/config sidecars), each agent's config beside it, so the five baked
-    entrypoints keep copying `local/.` unchanged and a second agent reaches an
-    existing project with no image rebuild. The wipe-then-extract-all shape is
+    vsix/config sidecars), each agent's config beside it (claude/, pi/), so the
+    five baked entrypoints keep copying `local/.` unchanged and a second agent
+    reaches an existing project with no image rebuild. (pi's settings beside
+    local/ reach the docker substrate and boxes through their entrypoints'
+    no-clobber install, i.e. only once those images carry it.) The wipe-then-extract-all shape is
     what makes an agent ADD idempotent: the caller passes the whole set (the
     marker's `agents` ∪ claude), never a delta — a single-agent re-stage would
     delete its siblings.
@@ -5571,15 +5583,27 @@ def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,
         # boot-ordered to land first — is preserved (STAGE_AGENT_DIST_SETTINGS).
         # claude is in every staged set by construction (_dind_stage_set floors
         # on it; research passes [DEFAULT_AGENT]), so its settings install is
-        # unconditional and the command is byte-identical to the single-agent
-        # one; an agent whose config must ALSO land outside ~/.local adds its
-        # own fragment here.
+        # unconditional and a claude-only command is byte-identical to the
+        # single-agent one; an agent whose config must ALSO land outside
+        # ~/.local adds its own fragment here, gated on its membership.
+        # pi's: no-clobber into its agent dir (a restored stash's settings win),
+        # and source-guarded so a download from before the layout moved is a
+        # no-op, never a failure. GROUPED in ( … ): sh gives && and || equal,
+        # left-to-right precedence, so an unwrapped `|| … ||` spliced into this
+        # && chain would let a failed `cp -af` above fall through to the chown
+        # and exit 0.
+        pi_dir = f"/home/research/{PI_AGENT_DIR_REL}"
+        pi_settings = (
+            f"( [ ! -f {AGENT_DIST_MOUNT}/pi/settings.json ] || [ -e {pi_dir}/settings.json ] || "
+            f"{{ mkdir -p {pi_dir} && cp {AGENT_DIST_MOUNT}/pi/settings.json {pi_dir}/settings.json; }} ) && "
+            if "pi" in agents else "")
         run_check(["docker", "exec", "-u", "0", supervisor, "sh", "-c",
                    f"mkdir -p /home/research/.local /home/research/.claude && "
                    f"cp -af {AGENT_DIST_MOUNT}/local/. /home/research/.local/ && "
                    f"( [ -e /home/research/.claude/settings.json ] || "
                    f"cp {AGENT_DIST_MOUNT}/claude/settings.json "
                    f"/home/research/.claude/settings.json ) && "
+                   + pi_settings +
                    f"chown -R 1000:1000 /home/research/.local /home/research/.claude"])
 
 
@@ -7028,9 +7052,10 @@ def _stash_creds_for_rebuild(
       - ~research/.local/share/pi-agent/agent/ → /workspace/.creds-stash-pi/
         (pi's relocated agent dir: auth.json, sessions, trust, the PI's own
         mcp.json + extensions — the WHOLE dir, so a live file pi adds later
-        rides along unnamed; the entrypoint restore drops the dist-delivered
-        settings (and any npm/ tree an older dist vendored) before the
-        post-start deploy re-lays them; STAGE_PI_AGENT)
+        rides along unnamed; the entrypoint restores it WHOLE — the settings,
+        the npm/ packages from `pi install` and the fetched fd/rg included —
+        and the post-start deploy installs the dist's settings only where none
+        exist; STAGE_PI_AGENT)
 
     The second piece is what makes interactive `claude` skip the /login
     prompt after the recreate (it carries `oauthAccount`); without it,

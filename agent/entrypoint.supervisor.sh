@@ -84,19 +84,18 @@ if [[ -f /workspace/.creds-stash-home.json ]]; then
     echo "restored ~/.claude.json from /workspace/.creds-stash-home.json"
 fi
 # pi's relocated agent dir (auth.json + sessions + trust + the PI's own mcp.json
-# and extensions) — the third stash point (STAGE_PI_AGENT). The WHOLE dir moved,
-# so the dist-delivered half (settings, plus any npm/ package tree an older dist
-# vendored) is dropped here and re-laid clean by the post-start dist deploy; the
-# live half stays. mcp.json is the PI's own on pi >= 1.0 (`pi mcp add`, `/mcp`
-# toggles) and is kept, like extensions/, which the dist ships empty as the
-# documented home for the PI's own .ts extensions. Leaf only: never rm the
-# parent share/.
+# and extensions) — the third stash point (STAGE_PI_AGENT). The WHOLE dir moved
+# and is restored WHOLE: everything in it is the operator's now — the settings
+# (the dist ships its canonical copy beside local/ and the post-start deploy
+# installs it only where none exists), the npm/ tree of packages added with
+# `pi install`, mcp.json (`pi mcp add`, `/mcp` toggles), extensions/ and the
+# fd/rg pi fetched into bin/. Nothing is dropped: pi 0.x dists shipped a package
+# there, which is why an earlier restore deleted npm/ and settings.json. Leaf
+# only: never rm the parent share/.
 if [[ -d /workspace/.creds-stash-pi ]]; then
     sudo mkdir -p /home/research/.local/share/pi-agent
     sudo rm -rf /home/research/.local/share/pi-agent/agent
     sudo mv /workspace/.creds-stash-pi /home/research/.local/share/pi-agent/agent
-    sudo rm -rf /home/research/.local/share/pi-agent/agent/npm \
-                /home/research/.local/share/pi-agent/agent/settings.json
     sudo chown -R research:research /home/research/.local
     echo "restored pi auth from /workspace/.creds-stash-pi"
 fi

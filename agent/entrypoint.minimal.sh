@@ -78,6 +78,18 @@ if [[ -d /opt/agent-dist ]]; then
             mkdir -p ~/.claude
             cp "$agent_src"claude/settings.json ~/.claude/settings.json
         fi
+        # pi's canonical settings ride beside local/ (pi/settings.json) — no-clobber
+        # into its agent dir, so what the operator changes in pi is never reset.
+        # Absent in a download from before that layout: then nothing to install.
+        # Never fatal: a failed copy leaves pi without RS's settings, not a box
+        # that cannot boot.
+        if [[ -f "$agent_src"pi/settings.json ]]; then
+            pi_dir="${PI_CODING_AGENT_DIR:-$HOME/.local/share/pi-agent/agent}"
+            if [[ ! -e "$pi_dir/settings.json" ]]; then
+                { mkdir -p "$pi_dir" && cp "$agent_src"pi/settings.json "$pi_dir/settings.json"; } \
+                    || echo "warning: could not install pi's settings into $pi_dir" >&2
+            fi
+        fi
     done
 fi
 if ! grep -q 'umask 002' ~/.bashrc 2>/dev/null; then

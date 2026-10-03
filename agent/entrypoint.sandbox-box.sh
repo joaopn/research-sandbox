@@ -12,7 +12,8 @@
 #
 # Environment:
 #   RS_SANDBOX_NAME      — box name (e.g. box-1); used for the role marker + logs.
-#   RS_BOX_AGENT         — agent to deploy: claude | none (default none).
+#   RS_BOX_AGENT         — claude | none (default none): `claude` means agent-bearing —
+#                          every agent the project carries arrives in the one deploy.
 #   RS_SERVICE_CODE_SERVER — enabled | disabled: the box's OWN editor toggle.
 #   RS_BOX_CLONE_REPO/REF/SETUP — (byo preset) repo to clone + ref + setup cmd.
 
@@ -64,6 +65,16 @@ if [[ -x ~/.local/bin/pi ]]; then
     RS_PI_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.local/share/pi-agent/agent}"
 fi
 export RS_PI_AGENT_DIR
+# pi's canonical settings ride beside local/ in the staged dist (pi/settings.json):
+# install them NO-CLOBBER into pi's agent dir, only when pi landed, so what the
+# operator changes in pi is never reset. A download from before that layout has
+# no such file: then there is nothing to install. Never fatal, like the rest of
+# the box's pi wiring: a failed copy leaves pi without RS's settings, not a box
+# that cannot boot.
+if [[ -n "$RS_PI_AGENT_DIR" && -f /opt/agent-dist/pi/settings.json && ! -e "$RS_PI_AGENT_DIR/settings.json" ]]; then
+    { mkdir -p "$RS_PI_AGENT_DIR" && cp /opt/agent-dist/pi/settings.json "$RS_PI_AGENT_DIR/settings.json"; } \
+        || echo "warning: could not install pi's settings into $RS_PI_AGENT_DIR" >&2
+fi
 # Login shells (byobu tabs, the agent, its MCP servers) inherit the preset
 # field values too — the agent expands ${FIELD} references in .mcp.json from
 # its own environment, which these lines populate. TWO homes, deliberately:

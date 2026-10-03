@@ -8645,10 +8645,10 @@ function mgmtAgentsDialog(name, current, addable) {
                 "new agent at once; sign in inside the tab: claude with /login; pi with " +
                 "/login inside `pi` and an API key (OpenRouter, the intended path, or any " +
                 "provider pi supports; the Claude subscription login is not used here). " +
-                "pi's login, sessions and your own pi extensions are kept across re-deploys " +
-                "of the agent set (an add, a recreate); its global settings (a default " +
-                "model saved in-app included) and packages installed with `pi install` are " +
-                "reset to the shipped ones — pick the model again with /model. Boxes that " +
+                "pi's login, sessions, settings (a default model saved in-app included), " +
+                "your own extensions and packages installed with `pi install` are kept " +
+                "across re-deploys of the agent set (an add, a recreate); a pi updated with " +
+                "`pi update` returns to the shipped version. Boxes that " +
                 "already exist keep their current agent until they are re-created (a " +
                 "project update re-creates every box, or remove + add the box); new boxes " +
                 "get every deployed agent. Agents are added, never removed.",
