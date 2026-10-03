@@ -631,14 +631,19 @@ async function setFetchAutoCommit(repo, on) {
 // pushed as its own fetch lands (syncSidebarFromBroker's Promise.all), so a
 // saved array order would say nothing about them. Names survive that.
 
-// The rail's one group separator rides in the same saved list, as a name no
+// The rail's two group separators ride in the same saved list, as names no
 // project can have (project names are alnum-first; the NUL is the same
-// never-a-name convention devReviewsInFlight keys on). Sharing the list means
-// a stopped project keeps its place after the item it last followed:
-// writeProjectOrder re-inserts an absent name after its saved predecessor,
-// the line included — so it changes group only when that predecessor is
-// dragged across the line, or the line is dragged past that predecessor.
+// never-a-name convention devReviewsInFlight keys on). One sits under the
+// last project by default, the other above the first; "top" and "bottom"
+// name only those defaults — once dragged, either line can be anywhere.
+// Sharing the list means a stopped project keeps its place after the item it
+// last followed: writeProjectOrder re-inserts an absent name after its saved
+// predecessor, a line included — so it changes group only when that
+// predecessor is dragged across a line, or a line is dragged past that
+// predecessor.
 const RAIL_SEPARATOR = "\u0000separator";
+const RAIL_SEPARATOR_TOP = "\u0000separator-top";
+const RAIL_SEPARATORS = [RAIL_SEPARATOR_TOP, RAIL_SEPARATOR];
 
 // Tolerant, NON-CREATING probe: applyProjectOrder runs on every rail render,
 // and a render must never touch saved state (the tab engine's reconciliation
@@ -656,22 +661,40 @@ function readProjectOrder() {
     return out;
 }
 
+// The saved order as the rail reads it: a line that was never saved sits at
+// its default end — the top line before everything, the other after
+// everything. The ONE place those defaults live: the sort, the line
+// placement and the writer's re-insertion all walk this, so a vault saved
+// before a line existed reads the same way in all three.
+function railVirtualOrder() {
+    const order = readProjectOrder();
+    if (!order.includes(RAIL_SEPARATOR_TOP)) order.unshift(RAIL_SEPARATOR_TOP);
+    if (!order.includes(RAIL_SEPARATOR)) order.push(RAIL_SEPARATOR);
+    return order;
+}
+
+// Rank of every saved name (projects and lines) in the virtual order, plus the
+// rank a never-arranged project takes: just above the visually LOWEST line
+// (the largest index), i.e. the end of the group above it.
+function railRanks() {
+    const order = railVirtualOrder();
+    const rank = new Map(order.map((n, i) => [n, i]));
+    const lowest = Math.max(...RAIL_SEPARATORS.map((n) => rank.get(n)));
+    return { rank, unarranged: lowest - 0.5 };
+}
+
 // Sort the live project list into the saved order, IN PLACE (the destroy path
 // reassigns state.vault.projects instead — both are fine, nothing holds an
 // index into or an alias of this array across a render). The sort itself never
 // writes: a later unrelated persist does carry the sorted array, which is
 // harmless because the order is re-derived from the saved names on every
-// render anyway. Saved names first in
-// saved order; every project the operator has never arranged goes, BY NAME,
-// just above the separator (the end of the top group) — or after every saved
-// name while no separator is saved, where the line sits under the last row
-// anyway. Never broker-response order, which differs run to run and is
-// exactly the shuffle this feature exists to remove.
+// render anyway. Saved names in saved order;
+// every project the operator has never arranged goes, BY NAME, just above the
+// lowest line (railRanks) — with nothing arranged, that is the middle group
+// between the two default lines. Never broker-response order, which differs
+// run to run and is exactly the shuffle this feature exists to remove.
 function applyProjectOrder() {
-    const order = readProjectOrder();
-    const rank = new Map(order.map((n, i) => [n, i]));
-    const sep = rank.has(RAIL_SEPARATOR) ? rank.get(RAIL_SEPARATOR) : order.length;
-    const unarranged = sep - 0.5;
+    const { rank, unarranged } = railRanks();
     state.vault.projects.sort((a, b) => {
         const ra = rank.has(a.name) ? rank.get(a.name) : unarranged;
         const rb = rank.has(b.name) ? rank.get(b.name) : unarranged;
@@ -684,17 +707,20 @@ function applyProjectOrder() {
     });
 }
 
-// Where the separator sits in the SORTED project list (call after
-// applyProjectOrder): before the first project saved below it, else under
-// the last project — which is also where it sits while none is saved.
-function railSeparatorSlot() {
-    const order = readProjectOrder();
-    const at = order.indexOf(RAIL_SEPARATOR);
-    const projects = state.vault.projects;
-    if (at < 0) return projects.length;
-    const below = new Set(order.slice(at + 1));
-    const i = projects.findIndex((p) => below.has(p.name));
-    return i < 0 ? projects.length : i;
+// The rail's full item order — project names and the two lines (call after
+// applyProjectOrder). The lines are MERGED into the already-sorted project
+// list by rank rather than re-sorting it, so the projects keep exactly the
+// order applyProjectOrder gave them.
+function railItemNames() {
+    const { rank, unarranged } = railRanks();
+    const rankOf = (n) => (rank.has(n) ? rank.get(n) : unarranged);
+    const lines = RAIL_SEPARATORS.slice().sort((a, b) => rank.get(a) - rank.get(b));
+    const out = [];
+    for (const p of state.vault.projects) {
+        while (lines.length && rank.get(lines[0]) < rankOf(p.name)) out.push(lines.shift());
+        out.push(p.name);
+    }
+    return out.concat(lines);
 }
 
 // Persist the rail's current order — the ONLY writer, called from the drop.
@@ -703,7 +729,10 @@ function railSeparatorSlot() {
 // survived, so an absent project keeps its slot instead of falling to the end
 // when it comes back.
 async function writeProjectOrder(names) {
-    const prev = readProjectOrder();
+    // The VIRTUAL order: a line never saved still has a predecessor role at
+    // its default end, so a stopped project saved before the top line existed
+    // re-inserts below that line, where it was drawn, not above it.
+    const prev = railVirtualOrder();
     const present = new Set(names);
     const out = names.slice();
     let cursor = -1;                            // insertion point in `out`
@@ -719,7 +748,7 @@ async function writeProjectOrder(names) {
 
 // Forget a destroyed project's slot — the twin of the project_ui prune it sits
 // beside, and for the same reason: a later project reusing the name lands
-// where never-arranged projects go (just above the separator) rather than
+// where never-arranged projects go (just above the lowest line) rather than
 // inheriting a stranger's position. A project removed any
 // other way leaves its name behind; a saved name with no row is skipped by
 // applyProjectOrder, so the residue is invisible.
@@ -1243,13 +1272,17 @@ function makeProjectRail() {
         makePinButton(),
     ]);
     rail.appendChild(header);
-    const rows = [];
-    for (const p of state.vault.projects) {
-        rows.push(makeProjectRow(p));
+    // Rows and the two group lines, in railItemNames order; the lines are
+    // drawn only when there is a project to separate. Rows are taken in
+    // sorted order, which railItemNames preserves.
+    if (state.vault.projects.length) {
+        let next = 0;
+        for (const n of railItemNames()) {
+            rail.appendChild(RAIL_SEPARATORS.includes(n)
+                ? makeRailSeparator(n)
+                : makeProjectRow(state.vault.projects[next++]));
+        }
     }
-    // The group separator, drawn only when there is a project to separate.
-    if (rows.length) rows.splice(railSeparatorSlot(), 0, makeRailSeparator());
-    for (const r of rows) rail.appendChild(r);
     // (Import-an-existing-project moved into the New Project page as a box —
     // openAddProjectModal is reached from there now, not a rail button.)
     rail.appendChild(el("div", { class: "rail-spacer" }));
@@ -7342,7 +7375,7 @@ function armProjectDrag(row, project) {
         let target = null;
 
         // Resolve the pointer to an insertion index over the rail's items —
-        // the project rows and the group separator, in screen order.
+        // the project rows and the group lines, in screen order.
         // Rects are re-read on EVERY move, never cached at drag start: it is
         // cheap, and it keeps the drop index right if anything reflows the
         // rail mid-gesture (a badge paint landing, a resize).
@@ -7387,7 +7420,7 @@ function armProjectDrag(row, project) {
                 // and a clone would carry the row's data-name into the three
                 // document-wide [data-name] lookups (probe / status / activate).
                 ghost = el("div", { class: "project-drag-ghost" },
-                    [project.name === RAIL_SEPARATOR ? "Separator" : project.name]);
+                    [RAIL_SEPARATORS.includes(project.name) ? "Separator" : project.name]);
                 document.body.appendChild(ghost);
             }
             ghost.style.left = `${mv.clientX + 10}px`;
@@ -7423,9 +7456,9 @@ function armProjectDrag(row, project) {
             // resolved over — never rebuilt from state.vault.projects, which a
             // broker sync can grow (one push per landed fetch) before the rail
             // repaints, and which would then put the row on the wrong side of
-            // the separator and save a never-arranged name as arranged.
+            // a separator and save a never-arranged name as arranged.
             const rows = t.rows.map((r) => r.classList.contains("rail-separator")
-                ? RAIL_SEPARATOR : r.getAttribute("data-name"));
+                ? r.getAttribute("data-sep") : r.getAttribute("data-name"));
             const from = t.rows.indexOf(row);
             if (from < 0) return;               // row went away mid-drag
             const to = t.index > from ? t.index - 1 : t.index;
@@ -7448,17 +7481,19 @@ function armProjectDrag(row, project) {
     };
 }
 
-// The rail's group separator: a line the operator moves like a row (and
-// moves rows across) to split the projects into two groups. Its position is
-// the RAIL_SEPARATOR entry of the saved order. Its own click only swallows
-// the click a drag of it synthesises.
-function makeRailSeparator() {
+// One of the rail's two group separators: a line the operator moves like a
+// row (and moves rows across) to split the projects into groups. `name` is
+// its entry in the saved order (RAIL_SEPARATORS), stamped as data-sep so the
+// drop can read it back off the screen. Its own click only swallows the
+// click a drag of it synthesises.
+function makeRailSeparator(name) {
     const sep = el("div", {
         class: "rail-separator",
+        "data-sep": name,
         title: "Drag to move the separator",
         onclick: () => { consumeProjectDragClick(); },
     });
-    armProjectDrag(sep, { name: RAIL_SEPARATOR });
+    armProjectDrag(sep, { name });
     return sep;
 }
 
