@@ -8,7 +8,7 @@
 # `project attach`. Instructions (CLAUDE.md) + the proxy MCP source (.mcp-proxy.json)
 # are pre-staged into /workspace by the host's `rs-sandbox create` BEFORE boot;
 # this entrypoint deploys the agent/editor, optionally clones a BYO repo, and
-# regenerates /workspace/.mcp.json from the two MCP sources.
+# regenerates /workspace/.mcp.json from the MCP sources (+ pi's link to it).
 #
 # Environment:
 #   RS_SANDBOX_NAME      — box name (e.g. box-1); used for the role marker + logs.
@@ -202,8 +202,17 @@ fi
 #              browser box's Playwright); base boxes don't carry the file.
 # A name collision between the two is a hard error (refuse to start) so a project
 # MCP cannot silently shadow the baked browser tooling.
+# pi reads the SAME servers: pi's built-in MCP takes a project's servers from
+# <cwd>/.pi/mcp.json (never .mcp.json), in the identical `mcpServers` shape, so
+# /workspace/.pi/mcp.json is a symlink to ../.mcp.json. Every entry carries
+# `"exposure": "direct"` (pi declares the tools to the model by name, as claude
+# does; pi's default hides them behind its scripting tool, and it has no global
+# default) — claude ignores the key. pi's `mcp list` shell command trusts a
+# project only by its trust.json (never the dist's defaultProjectTrust), so
+# /workspace is recorded trusted there too, in a box that deploys pi.
 python3 - <<'PYEOF'
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -283,8 +292,71 @@ if preset_path.is_file():
             cfg.setdefault("type", "stdio")
         servers[n] = cfg
 
+pi_link = Path("/workspace/.pi/mcp.json")
+PI_LINK_TARGET = "../.mcp.json"
+
+
+def pi_link_is_ours() -> bool:
+    return pi_link.is_symlink() and os.readlink(pi_link) == PI_LINK_TARGET
+
+
+def pi_link_set() -> None:
+    """Point /workspace/.pi/mcp.json at the rendered file — idempotent across
+    boots. Anything else at that path (a file the PI made while no link existed,
+    a link of their own) is the PI's: never touched, the link is skipped and pi
+    uses theirs. Never fatal (set -e would crash-loop the box over pi wiring)."""
+    try:
+        if pi_link_is_ours():
+            return
+        if pi_link.is_symlink() or pi_link.exists() or (
+                pi_link.parent.exists() and not pi_link.parent.is_dir()):
+            print(f"sandbox-box: {pi_link} is the PI's own file; pi will not see "
+                  f"the box's MCP servers (remove it to restore the link)", file=sys.stderr)
+            return
+        pi_link.parent.mkdir(exist_ok=True)
+        tmp = pi_link.with_name(pi_link.name + ".rs-tmp")
+        if tmp.is_symlink() or tmp.exists():
+            tmp.unlink()
+        os.symlink(PI_LINK_TARGET, tmp)
+        os.replace(tmp, pi_link)
+    except OSError as e:
+        print(f"sandbox-box: could not link {pi_link}: {e}", file=sys.stderr)
+
+
+def pi_trust_workspace() -> None:
+    """Record /workspace trusted in pi's trust.json (merged; a decision already
+    there for /workspace is the PI's and stays). Only in a box that deploys pi
+    (PI_CODING_AGENT_DIR is pi's env). Never fatal."""
+    agent_dir = os.environ.get("PI_CODING_AGENT_DIR")
+    if not agent_dir:
+        return
+    trust = Path(agent_dir) / "trust.json"
+    try:
+        data = json.loads(trust.read_text()) if trust.exists() else {}
+        if not isinstance(data, dict):
+            raise ValueError("not a JSON object")
+    except (OSError, ValueError) as e:
+        print(f"sandbox-box: leaving {trust} alone ({e})", file=sys.stderr)
+        return
+    if "/workspace" in data:
+        return
+    data["/workspace"] = True
+    try:
+        trust.parent.mkdir(parents=True, exist_ok=True)
+        tmp = trust.with_name(trust.name + ".rs-tmp")
+        tmp.write_text(json.dumps(data, indent=2) + "\n")
+        os.replace(tmp, trust)
+    except OSError as e:
+        print(f"sandbox-box: could not write {trust}: {e}", file=sys.stderr)
+
+
+pi_trust_workspace()
 if servers:
+    for cfg in servers.values():
+        if isinstance(cfg, dict):
+            cfg.setdefault("exposure", "direct")
     mcp_path.write_text(json.dumps({"mcpServers": servers}, indent=2, sort_keys=True) + "\n")
+    pi_link_set()
     rows = []
     for n, cfg in sorted(servers.items()):
         t = cfg.get("type", "?") if isinstance(cfg, dict) else "?"
@@ -293,12 +365,20 @@ if servers:
     inv_path.write_text(
         f"# Tools wired into this box\n\n"
         f"Rendered at boot from .mcp-proxy.json (project MCPs) + image-baked + preset tools.\n"
-        f"claude auto-discovers /workspace/.mcp.json — call tools by name.\n\n"
+        f"claude auto-discovers /workspace/.mcp.json (pi reads it through "
+        f"/workspace/.pi/mcp.json) — call tools by name. /workspace/.mcp.json "
+        f"is rewritten at every boot: a server added to it (also by `pi mcp add "
+        f"-l`, which writes through the link) lasts until the box restarts.\n\n"
         f"| Name | Type | Location |\n|---|---|---|\n" + "\n".join(rows) + "\n")
 else:
     for p in (mcp_path, inv_path):
         if p.exists():
             p.unlink()
+    try:
+        if pi_link_is_ours():
+            pi_link.unlink()
+    except OSError as e:
+        print(f"sandbox-box: could not remove {pi_link}: {e}", file=sys.stderr)
 PYEOF
 
 echo "sandbox-box[${RS_SANDBOX_NAME}]: ready (workspace at /workspace)"

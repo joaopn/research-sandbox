@@ -1761,7 +1761,7 @@ function renderSoftwareScreen(view, result) {
                 el("span", {}, []),
             ]));
         }
-        // Extra pins an agent's dist bundles (pi: the vendored MCP adapter, the
+        // Extra pins an agent's dist bundles (pi: the RS rules extension, the
         // private node) — the same continuation shape, one sub-row per pin, named
         // by the versions.env key; they participate in matches_pin exactly like
         // the extension does, so the row explains itself when one moved.

@@ -3842,11 +3842,9 @@ _OPEN_VSX_CLAUDE_EXT_API = "https://open-vsx.org/api/Anthropic/claude-code/linux
 # The second agent, pi (STAGE_PI_AGENT): an npm package. Its upstream "latest" is
 # the registry's per-package `/latest` manifest (a JSON object whose top-level
 # `version` is the dist-tag — the same value `images outdated`'s `npm` kind reads
-# from the full package document's dist-tags). The MCP adapter it vendors is a
-# second npm package. One home each; pytest-pinned.
+# from the full package document's dist-tags). One home each; pytest-pinned.
 _PI_NPM_PACKAGE = "@earendil-works/pi-coding-agent"
 _PI_LATEST_URL = "https://registry.npmjs.org/@earendil-works%2Fpi-coding-agent/latest"
-_PI_MCP_ADAPTER_PACKAGE = "pi-mcp-adapter"
 # Claude Code's upstream version-resolve endpoint (verified against its
 # bootstrap.sh: the installer curls this to turn "latest" into a concrete
 # version; the body is a bare semver string). Read by VERSION_SOURCES and
@@ -3934,10 +3932,8 @@ VERSION_SOURCES: dict[str, dict[str, str]] = {
     # upstream answers a bare-semver text body (`text` kind); a row whose
     # upstream is a JSON document names its key on the row (`latest_json_key`).
     "CLAUDE_CODE_VERSION": {"kind": "text", "url": _CLAUDE_LATEST_URL},
-    # pi (npm): the CLI pin `agent refresh --agent pi` moves, and the vendored MCP
-    # adapter's pin, moved by hand (reported here so a stale vendored copy shows).
+    # pi (npm): the CLI pin `agent refresh --agent pi` moves.
     "PI_CODING_AGENT_VERSION": {"kind": "npm", "pkg": _PI_NPM_PACKAGE},
-    "PI_MCP_ADAPTER_VERSION": {"kind": "npm", "pkg": _PI_MCP_ADAPTER_PACKAGE},
 }
 
 # Per-supervisor service registry. KNOWN_SERVICES lists every kind the webui
@@ -4898,27 +4894,28 @@ _AGENT_INSTALL = {
     # PRIVATE node runtime (the node seed's tarball at NODE_VERSION — kept OUT of
     # ~/.local/bin so it never collides with the seed a box may carry) under
     # share/pi-agent/node, the npm-installed package under share/pi-agent/pi, pi's
-    # agent dir RELOCATED to share/pi-agent/agent (settings, the vendored
-    # pi-mcp-adapter package, and at runtime the PI's auth.json + sessions) and
+    # agent dir RELOCATED to share/pi-agent/agent (the canonical settings, and at
+    # runtime the PI's auth.json, sessions, trust and own mcp.json) and
     # an RS launcher script at bin/pi that resolves node from its own directory
     # and exports pi's four env defaults when unset — so a copy runs from ANY
     # home with an EMPTY environment (measured: uid 1001, `env -i`). No symlink
     # launcher (`launcher_symlink` False); no companion editor extension (none
     # exists). `extra_pins` are extra `.format` keys for the recipe, resolved
     # through load_versions() at build (an unset one dies) and recorded in the
-    # sidecar, so software_status can tell a stale vendored adapter / node from a
-    # current one. `files` are written by _agent_build_dist AFTER the capture
-    # (JSON carries braces, so it is never part of the formatted recipe);
+    # sidecar, so software_status can tell a stale node / rules extension from a
+    # current one. MCP is pi's OWN (the built-in `mcp` extension, pi >= 1.0): no
+    # MCP extension is vendored — one that registers `/mcp` would make pi refuse
+    # to load its built-in. `files` are written by _agent_build_dist AFTER the
+    # capture (JSON carries braces, so it is never part of the formatted recipe);
     # `built_check` paths are relative to the CAPTURED ~/.local and gate the
-    # cache write (a dist whose adapter install silently failed is never cached).
+    # cache write (a dist whose npm install silently failed is never cached).
     # The recipe is `.format`-ed: its only braces are the format keys and the
     # doubled `${{0%/*}}` of the launcher (no external `dirname` — a PATH that
     # carries only ~/.local/bin, or none at all, must still resolve the tree;
     # `cd`, `pwd -P` and parameter expansion are shell builtins).
     "pi": {
         "version_key": "PI_CODING_AGENT_VERSION",
-        "extra_pins": {"adapter_ver": "PI_MCP_ADAPTER_VERSION", "node_ver": "NODE_VERSION",
-                       "rules_ver": "RS_PI_RULES_VERSION"},
+        "extra_pins": {"node_ver": "NODE_VERSION", "rules_ver": "RS_PI_RULES_VERSION"},
         "install": (
             "mkdir -p ~/.local/bin ~/.local/share/pi-agent/node ~/.local/share/pi-agent/pi"
             " ~/.local/share/pi-agent/agent/extensions"
@@ -4930,9 +4927,6 @@ _AGENT_INSTALL = {
             " && npm install -g --ignore-scripts --prefix ~/.local/share/pi-agent/pi"
             " --no-fund --no-audit --loglevel=error"
             f" {_PI_NPM_PACKAGE}@{{ver}}"
-            " && PI_CODING_AGENT_DIR=~/.local/share/pi-agent/agent PI_SKIP_VERSION_CHECK=1"
-            " PI_TELEMETRY=0 ~/.local/share/pi-agent/pi/bin/pi install"
-            f" npm:{_PI_MCP_ADAPTER_PACKAGE}@{{adapter_ver}} </dev/null"
             " && printf '%s\\n'"
             " '#!/bin/sh'"
             " '# RS launcher for pi: resolves the private node + the bundled cli.js'"
@@ -4961,9 +4955,12 @@ _AGENT_INSTALL = {
         "latest_url": _PI_LATEST_URL,
         "latest_json_key": "version",
         "config": None,
+        # NO mcp.json and NO trust.json: on pi >= 1.0 both are the PI's own state
+        # (`pi mcp add`, `/mcp` toggles, trust answers) — the supervisor's
+        # `cp -af` overlay deploy would clobber theirs. A box's MCP servers reach
+        # pi through the box entrypoint's `.pi/mcp.json` link instead.
         "files": [
             {"path": "local/share/pi-agent/agent/settings.json", "content": None},  # → _pi_settings_json (bound below)
-            {"path": "local/share/pi-agent/agent/mcp.json", "content": None},       # → _PI_MCP_JSON (bound below)
             # The RS-owned rules extension (Claude Code's .claude/rules for pi),
             # OUTSIDE the agent dir: extensions/ inside it is the PI's own slot
             # and rides the creds stash; rs/ is dist content, re-laid by every
@@ -4973,7 +4970,7 @@ _AGENT_INSTALL = {
             {"path": "local/share/pi-agent/rs/rs-rules.ts", "content": None},      # → _rs_rules_source (bound below)
         ],
         "built_check": [
-            f"share/pi-agent/agent/npm/node_modules/{_PI_MCP_ADAPTER_PACKAGE}/package.json",
+            "share/pi-agent/pi/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
             "share/pi-agent/node/bin/node",
         ],
     },
@@ -4987,9 +4984,9 @@ KNOWN_AGENTS = tuple(_AGENT_INSTALL)   # the --agent enum
 # this point of the module (a derivation above it is a module-load NameError).
 _BOX_AGENTS = frozenset(KNOWN_AGENTS) | {"none"}
 
-# pi's RELOCATED agent dir (STAGE_PI_AGENT): settings + the vendored adapter ride
-# the dist under it, the PI's auth.json + sessions live beside them at runtime,
-# and the creds stash carries the whole dir across a recreate.
+# pi's RELOCATED agent dir (STAGE_PI_AGENT): the canonical settings ride the dist
+# under it, the PI's auth.json, sessions, trust and own mcp.json live beside them
+# at runtime, and the creds stash carries the whole dir across a recreate.
 PI_AGENT_DIR_REL = ".local/share/pi-agent/agent"
 
 
@@ -5084,31 +5081,23 @@ _AGENT_INSTALL["claude"]["config"]["content"] = _AGENT_SETTINGS_JSON
 
 
 def _pi_settings_json(pins: dict) -> str:
-    """pi's canonical global settings (STAGE_PI_AGENT), a function of the resolved
-    extra pins because the vendored adapter is named at its exact version: the
-    `packages` entry MUST match what `pi install npm:pi-mcp-adapter@<ver>` recorded
-    at build (pi resolves it from the agent dir's npm/ tree offline — measured).
+    """pi's canonical global settings (STAGE_PI_AGENT; the registry's file-content
+    callables all take the resolved extra pins, this one reads none).
     `defaultProjectTrust: always` — the container is the boundary, and a headless
     run must never stall on (or silently skip project resources for) a trust
     prompt; telemetry off (the version check + offline mode are env, exported by
-    the launcher); dark theme like claude's."""
+    the launcher); dark theme like claude's. `tuiMode: regular` keeps the
+    terminal's own scrollback and selection as before pi 1.0, whose default
+    became a fullscreen TUI. No `packages`: MCP is pi's built-in extension."""
     return json.dumps(
         {"defaultProjectTrust": "always",
          "enableInstallTelemetry": False,
          "theme": "dark",
-         "packages": [f"npm:{_PI_MCP_ADAPTER_PACKAGE}@{pins['adapter_ver']}"],
+         "tuiMode": "regular",
          # The RS-owned rules extension, shipped beside the agent dir (see the
          # registry row's `files`); the path is relative to the agent dir.
          "extensions": [f"../rs/{_RS_RULES_SRC.name}"]},
         indent=2) + "\n"
-
-
-# pi-mcp-adapter's global defaults (`<agentdir>/mcp.json`, the Pi-owned override
-# file the adapter reads beneath a project's .mcp.json): every MCP tool registered
-# by name (`<server>_<tool>`), as claude registers them, instead of only the
-# adapter's proxy tool. Measured against a box-shaped `.mcp.json` entry
-# (`"type": "http"`, `${VAR}` headers): applies, interpolates.
-_PI_MCP_JSON = json.dumps({"settings": {"directTools": True}}, indent=2) + "\n"
 
 # The RS-owned pi extension that gives pi Claude Code's `.claude/rules/`
 # behaviour (path-scoped rules, the project instruction files, the
@@ -5135,9 +5124,13 @@ def _rs_rules_source(pins: dict) -> str:
     return text
 
 
-_AGENT_INSTALL["pi"]["files"][0]["content"] = _pi_settings_json
-_AGENT_INSTALL["pi"]["files"][1]["content"] = _PI_MCP_JSON
-_AGENT_INSTALL["pi"]["files"][2]["content"] = _rs_rules_source
+# Bound by PATH, not list position: a row added or dropped must not shift a
+# callable onto the wrong file (and an unknown path is a KeyError at import).
+_PI_FILE_CONTENT = {"local/share/pi-agent/agent/settings.json": _pi_settings_json,
+                    "local/share/pi-agent/rs/rs-rules.ts": _rs_rules_source}
+for _f in _AGENT_INSTALL["pi"]["files"]:
+    _f["content"] = _PI_FILE_CONTENT[_f["path"]]
+del _f   # a module global would ride `from rscore import *`
 
 
 # ---------------------------------------------------------------------------
@@ -5319,8 +5312,8 @@ def _agent_build_dist(agent: str, version: str) -> None:
     # (wired-but-absent is the worst failure shape); charset-guard before the URL
     # interpolation reaches an in-container shell (same defense as the CLI version).
     ext = spec.get("ext")
-    # Extra pins (pi): more versions the recipe interpolates — the vendored MCP
-    # adapter, the private node. Resolved like the ext pin: effective (merged)
+    # Extra pins (pi): more versions the dist carries — the private node, the
+    # RS rules extension. Resolved like the ext pin: effective (merged)
     # value, die on an unset one (a dist with an unversioned component is the
     # wired-but-wrong shape), charset-guarded before the shell sees it.
     extras: dict[str, str] = {}
@@ -5410,7 +5403,7 @@ def _agent_build_dist(agent: str, version: str) -> None:
             cfg_path.write_text(config["content"])
         # Further canonical files (pi): written post-capture so JSON braces never
         # meet the `.format`-ed recipe; `content` may be a callable of the
-        # resolved extra pins (the adapter's exact version is named inside).
+        # resolved extra pins (the rules extension's header is checked against one).
         for rel, content, mode in file_contents:
             fpath = dest / rel
             fpath.parent.mkdir(parents=True, exist_ok=True)
@@ -5428,7 +5421,7 @@ def _agent_build_dist(agent: str, version: str) -> None:
         {"agent": agent, "version": version,
          "ext_version": ext_ver if ext else None,
          # What this build actually BUNDLED for each extra pin (software_status
-         # compares them against the effective pins — a hand-moved adapter/node
+         # compares them against the effective pins — a hand-moved node/rules
          # pin then reads "stale — re-pull" instead of "matches pin" forever).
          "extra_pins": extras,
          "pulled_at": datetime.datetime.now(datetime.timezone.utc).isoformat()},
@@ -6630,7 +6623,7 @@ def software_status() -> dict:
         ext_ok = (not has_ext or ext_pin is None
                   or (cached_ext_version is not None
                       and cached_ext_version == ext_pin))
-        # Extra pins (pi's vendored adapter + private node): the sidecar records
+        # Extra pins (pi's private node + rules extension): the sidecar records
         # what the build bundled; a bumped pin reads as stale until a re-pull.
         # An UNSET pin short-circuits like the ext pin (the build would die on it).
         extras_ok = all(effective.get(pin) is None or cached_extras.get(key) == effective.get(pin)
@@ -7008,9 +7001,9 @@ def _stash_creds_for_rebuild(
       - ~research/.claude.json    → /workspace/.creds-stash-home.json
       - ~research/.local/share/pi-agent/agent/ → /workspace/.creds-stash-pi/
         (pi's relocated agent dir: auth.json, sessions, trust, the PI's own
-        extensions — the WHOLE dir, so a live file pi adds later rides along
-        unnamed; the entrypoint restore drops the dist-delivered subpaths (the
-        vendored package tree, settings, the adapter defaults) before the
+        mcp.json + extensions — the WHOLE dir, so a live file pi adds later
+        rides along unnamed; the entrypoint restore drops the dist-delivered
+        settings (and any npm/ tree an older dist vendored) before the
         post-start deploy re-lays them; STAGE_PI_AGENT)
 
     The second piece is what makes interactive `claude` skip the /login

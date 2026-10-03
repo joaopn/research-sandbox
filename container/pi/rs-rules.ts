@@ -1,4 +1,4 @@
-// rs-rules v0.1.0
+// rs-rules v0.2.0
 //
 // Claude Code's rules capability for pi, one-to-one, as an RS-owned extension.
 // Shipped inside the pi dist (share/pi-agent/rs/rs-rules.ts) and named from the
@@ -30,7 +30,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-export const RS_RULES_VERSION = "0.1.0";
+export const RS_RULES_VERSION = "0.2.0";
+
+// The system-prompt SECTION the launch rules ride in (pi wraps it as
+// `<project_rules>…</project_rules>`). A section, never a returned
+// `systemPrompt`: since pi 1.0 a returned prompt is FORCED — opaque text that
+// overrides every section another extension sets, the built-in MCP's
+// `mcp_servers` listing included.
+export const RS_RULES_SECTION = "project_rules";
 
 // Claude Code's documented budgets for a rule's `paths:` list (memory.md, the
 // glob grammar): brace groups multiply; past either budget a pattern is used
@@ -791,9 +798,10 @@ export default function rsRules(pi: ExtensionAPI) {
       if (d.claudeMd && !already.has(d.claudeMd.id)) push(d.claudeMd);
       if (d.claudeLocal && !already.has(d.claudeLocal.id)) push(d.claudeLocal);
       for (const r of d.rules) if (r.scope === "project" && !r.paths) push(r);
-      if (parts.length === 0) return undefined;
-      const section = "# Project rules (rs-rules)\n\n" + parts.join("\n\n");
-      return { systemPrompt: `${event.systemPrompt}\n\n${section}` };
+      const sections = event.systemPromptOptions.sections;
+      if (parts.length === 0) delete sections[RS_RULES_SECTION];
+      else sections[RS_RULES_SECTION] = "# Project rules (rs-rules)\n\n" + parts.join("\n\n");
+      return undefined;
     });
   });
 

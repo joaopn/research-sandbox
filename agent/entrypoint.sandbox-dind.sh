@@ -54,20 +54,20 @@ if [[ -f /workspace/.creds-stash-home.json ]]; then
     sudo chmod 600 /home/research/.claude.json
     echo "restored ~/.claude.json from /workspace/.creds-stash-home.json"
 fi
-# pi's relocated agent dir (auth.json + sessions + trust + the PI's own
-# extensions) — the third stash point (STAGE_PI_AGENT). The WHOLE dir moved, so
-# the dist-delivered half (settings, the adapter defaults, the vendored adapter
-# package tree) is dropped here and re-laid clean by the post-start dist deploy;
-# the live half stays. extensions/ is NOT dist content (the dist ships it empty as
-# the documented home for the PI's own .ts extensions) and is kept. Leaf only:
-# never rm the parent share/.
+# pi's relocated agent dir (auth.json + sessions + trust + the PI's own mcp.json
+# and extensions) — the third stash point (STAGE_PI_AGENT). The WHOLE dir moved,
+# so the dist-delivered half (settings, plus any npm/ package tree an older dist
+# vendored) is dropped here and re-laid clean by the post-start dist deploy; the
+# live half stays. mcp.json is the PI's own on pi >= 1.0 (`pi mcp add`, `/mcp`
+# toggles) and is kept, like extensions/, which the dist ships empty as the
+# documented home for the PI's own .ts extensions. Leaf only: never rm the
+# parent share/.
 if [[ -d /workspace/.creds-stash-pi ]]; then
     sudo mkdir -p /home/research/.local/share/pi-agent
     sudo rm -rf /home/research/.local/share/pi-agent/agent
     sudo mv /workspace/.creds-stash-pi /home/research/.local/share/pi-agent/agent
     sudo rm -rf /home/research/.local/share/pi-agent/agent/npm \
-                /home/research/.local/share/pi-agent/agent/settings.json \
-                /home/research/.local/share/pi-agent/agent/mcp.json
+                /home/research/.local/share/pi-agent/agent/settings.json
     sudo chown -R research:research /home/research/.local
     echo "restored pi auth from /workspace/.creds-stash-pi"
 fi
