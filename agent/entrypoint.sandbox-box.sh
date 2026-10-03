@@ -54,6 +54,16 @@ fi
 if ! grep -q '\.local/bin' ~/.bashrc 2>/dev/null; then
     echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
 fi
+# pi is never baked: it arrives with the dist above, or not at all. Whether its
+# launcher landed decides every piece of pi wiring the MCP render below adds
+# (the .pi/mcp.json link, the `exposure` key, the trust record) — a box without
+# pi gets none of it, and no .pi/ folder. The agent dir is pi's own env, else
+# the launcher's default.
+RS_PI_AGENT_DIR=""
+if [[ -x ~/.local/bin/pi ]]; then
+    RS_PI_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.local/share/pi-agent/agent}"
+fi
+export RS_PI_AGENT_DIR
 # Login shells (byobu tabs, the agent, its MCP servers) inherit the preset
 # field values too — the agent expands ${FIELD} references in .mcp.json from
 # its own environment, which these lines populate. TWO homes, deliberately:
@@ -202,14 +212,15 @@ fi
 #              browser box's Playwright); base boxes don't carry the file.
 # A name collision between the two is a hard error (refuse to start) so a project
 # MCP cannot silently shadow the baked browser tooling.
+# In a box that deploys pi (RS_PI_AGENT_DIR, set after the dist deploy above),
 # pi reads the SAME servers: pi's built-in MCP takes a project's servers from
 # <cwd>/.pi/mcp.json (never .mcp.json), in the identical `mcpServers` shape, so
-# /workspace/.pi/mcp.json is a symlink to ../.mcp.json. Every entry carries
+# /workspace/.pi/mcp.json is a symlink to ../.mcp.json. Every entry then carries
 # `"exposure": "direct"` (pi declares the tools to the model by name, as claude
 # does; pi's default hides them behind its scripting tool, and it has no global
 # default) — claude ignores the key. pi's `mcp list` shell command trusts a
 # project only by its trust.json (never the dist's defaultProjectTrust), so
-# /workspace is recorded trusted there too, in a box that deploys pi.
+# /workspace is recorded trusted there too. Without pi: none of the three.
 python3 - <<'PYEOF'
 import json
 import os
@@ -294,6 +305,7 @@ if preset_path.is_file():
 
 pi_link = Path("/workspace/.pi/mcp.json")
 PI_LINK_TARGET = "../.mcp.json"
+pi_agent_dir = os.environ.get("RS_PI_AGENT_DIR") or ""
 
 
 def pi_link_is_ours() -> bool:
@@ -323,14 +335,26 @@ def pi_link_set() -> None:
         print(f"sandbox-box: could not link {pi_link}: {e}", file=sys.stderr)
 
 
+def pi_link_clear() -> None:
+    """Remove OUR link (never a PI's file), and the .pi/ folder when that leaves
+    it empty. Never fatal."""
+    try:
+        if pi_link_is_ours():
+            pi_link.unlink()
+        if pi_link.parent.is_dir() and not pi_link.parent.is_symlink() \
+                and not any(pi_link.parent.iterdir()):
+            pi_link.parent.rmdir()
+    except OSError as e:
+        print(f"sandbox-box: could not remove {pi_link}: {e}", file=sys.stderr)
+
+
 def pi_trust_workspace() -> None:
     """Record /workspace trusted in pi's trust.json (merged; a decision already
-    there for /workspace is the PI's and stays). Only in a box that deploys pi
-    (PI_CODING_AGENT_DIR is pi's env). Never fatal."""
-    agent_dir = os.environ.get("PI_CODING_AGENT_DIR")
-    if not agent_dir:
+    there for /workspace is the PI's and stays). Only in a box that deploys pi.
+    Never fatal."""
+    if not pi_agent_dir:
         return
-    trust = Path(agent_dir) / "trust.json"
+    trust = Path(pi_agent_dir) / "trust.json"
     try:
         data = json.loads(trust.read_text()) if trust.exists() else {}
         if not isinstance(data, dict):
@@ -352,11 +376,15 @@ def pi_trust_workspace() -> None:
 
 pi_trust_workspace()
 if servers:
-    for cfg in servers.values():
-        if isinstance(cfg, dict):
-            cfg.setdefault("exposure", "direct")
+    if pi_agent_dir:
+        for cfg in servers.values():
+            if isinstance(cfg, dict):
+                cfg.setdefault("exposure", "direct")
     mcp_path.write_text(json.dumps({"mcpServers": servers}, indent=2, sort_keys=True) + "\n")
-    pi_link_set()
+    if pi_agent_dir:
+        pi_link_set()
+    else:
+        pi_link_clear()
     rows = []
     for n, cfg in sorted(servers.items()):
         t = cfg.get("type", "?") if isinstance(cfg, dict) else "?"
@@ -365,20 +393,18 @@ if servers:
     inv_path.write_text(
         f"# Tools wired into this box\n\n"
         f"Rendered at boot from .mcp-proxy.json (project MCPs) + image-baked + preset tools.\n"
-        f"claude auto-discovers /workspace/.mcp.json (pi reads it through "
-        f"/workspace/.pi/mcp.json) — call tools by name. /workspace/.mcp.json "
-        f"is rewritten at every boot: a server added to it (also by `pi mcp add "
-        f"-l`, which writes through the link) lasts until the box restarts.\n\n"
+        f"claude auto-discovers /workspace/.mcp.json"
+        + (f" (pi reads it through /workspace/.pi/mcp.json)" if pi_agent_dir else "")
+        + f" — call tools by name. /workspace/.mcp.json is rewritten at every "
+        f"boot: a server added to it"
+        + (f" (also by `pi mcp add -l`, which writes through the link)" if pi_agent_dir else "")
+        + f" lasts until the box restarts.\n\n"
         f"| Name | Type | Location |\n|---|---|---|\n" + "\n".join(rows) + "\n")
 else:
     for p in (mcp_path, inv_path):
         if p.exists():
             p.unlink()
-    try:
-        if pi_link_is_ours():
-            pi_link.unlink()
-    except OSError as e:
-        print(f"sandbox-box: could not remove {pi_link}: {e}", file=sys.stderr)
+    pi_link_clear()
 PYEOF
 
 echo "sandbox-box[${RS_SANDBOX_NAME}]: ready (workspace at /workspace)"
