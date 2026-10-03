@@ -15,7 +15,7 @@ What happens:
 - Rebuilds images. Skip on re-runs with `SKIP_REBUILD=1`.
 - Creates a throwaway project `rsb1-<pid>`.
 - **First run pauses once** for OAuth inside the supervisor — the script prints the exact instructions in a second terminal. Subsequent runs reuse the credentials cached at `~/.cache/rs-b1-test/` by `docker cp`-ing them into the freshly-created supervisor (no host-side `research auth` step; per-project credential ownership).
-- Verifies image build, IP pinning at `192.168.99.5`, two-mount layout, the three image-baked JSON artifacts (`extra-mcps.json` + `playwright-mcp-config.json` + `/etc/claude-code/managed-settings.json` with all 7 WS2 deny rules), lifecycle CLI surface, `docker restart` survival, `_recreate_supervisor` survival, version pinning.
+- Verifies image build, IP pinning at `192.168.99.5`, two-mount layout, the three image-baked JSON artifacts (`extra-mcps.json` + `playwright-mcp-config.json` + `/etc/claude-code/managed-settings.json` with the WS2 deny rules), lifecycle CLI surface, `docker restart` survival, `_recreate_supervisor` survival, version pinning.
 - Trap-driven cleanup on exit (success or failure).
 
 Exit `0` with **`PASS: N  FAIL: 0`** ⇒ structural surface is green.

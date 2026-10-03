@@ -104,7 +104,20 @@ chromium_args:
 # (SB2) is direct to the Playwright MCP and does NOT pass through
 # Claude Code's permission layer — so denied tools STILL appear in
 # tools-inventory.md. role.md notes this so the spawned claude
-# doesn't try to call them.
+# doesn't try to call them. role.md and boxes/websearcher.instructions.md
+# both enumerate this list for the model — keep them in step.
+#
+# REVIEWED OR THE BUILD FAILS: every tool the pinned Playwright MCP exposes
+# must be named here or under `allowed_tools` below. The renderer starts the
+# server at image build exactly as rendered and asks for its tool list; an
+# unnamed tool fails the build, naming it. This is a denylist over an
+# allow-by-default server, so without the check a Playwright bump that adds a
+# tool widens the surface silently (that is how browser_run_code_unsafe and
+# browser_drop got in). A name here that the server no longer exposes is only
+# reported (keeping a denial for a tool that may come back is the safe side).
+# The check covers the rendered command and the image's own environment: a
+# PLAYWRIGHT_MCP_* variable set at runtime (e.g. PLAYWRIGHT_MCP_CAPS) can
+# still add tools it never saw.
 denied_tools:
   browser_evaluate: >-
     Runs arbitrary JavaScript in page context. Prompt-injection via
@@ -129,3 +142,48 @@ denied_tools:
     third-party binary into the live container.
   browser_resize: >-
     Viewport changes don't help an accessibility-tree consumer.
+  browser_run_code_unsafe: >-
+    Runs an arbitrary Playwright code snippet (upstream: "executes
+    arbitrary JavaScript in the Playwright server process and is
+    RCE-equivalent"). Everything browser_evaluate is denied for, with the
+    full page API and outside the page sandbox: prompt-injected page text ->
+    arbitrary browser-automation code. Load-bearing, like browser_evaluate.
+  browser_drop: >-
+    Drops local files or MIME-typed data onto an element "as if dragged
+    from outside the page". Same family as browser_file_upload (attachment
+    workflows are out of scope for AT-driven research) and browser_drag
+    (interaction primitive of last resort), and a route for injected text to
+    push data into page state.
+
+# The tools the role keeps, each reviewed. A tool appears in exactly one of
+# the two mappings; the build fails on overlap.
+allowed_tools:
+  browser_navigate: Open a URL — the core of web research.
+  browser_navigate_back: History back — navigation.
+  browser_snapshot: >-
+    The accessibility-tree read the role is built around. Optional
+    `filename` writes the snapshot under the role's own working/output dir.
+  browser_click: Follow links and controls found in the snapshot.
+  browser_hover: Reveal hover menus/tooltips the snapshot hides.
+  browser_type: Type into search boxes and fields.
+  browser_fill_form: Fill several fields at once (search/filter forms).
+  browser_press_key: Submit, paginate, escape overlays.
+  browser_select_option: Choose from dropdown filters.
+  browser_wait_for: Wait for dynamic content before reading.
+  browser_tabs: >-
+    List/switch/close tabs, and open a new one (optionally at a URL — no
+    wider than browser_navigate).
+  browser_close: Close the page when done.
+  browser_take_screenshot: >-
+    Saves an image of the page for the researcher or a later read of the
+    file (the model never sees the image itself: --image-responses=omit).
+    Optional `filename` writes under the role's own working/output dir.
+  browser_console_messages: >-
+    Read console output to diagnose a page that fails to render. Optional
+    `filename` writes under the role's own working/output dir.
+  browser_network_requests: >-
+    List the page's requests (find the data endpoint behind a page).
+    Optional `filename` writes under the role's own working/output dir.
+  browser_network_request: >-
+    Read one request's details. Optional `filename` writes under the role's
+    own working/output dir.

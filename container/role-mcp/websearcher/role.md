@@ -26,7 +26,8 @@ Every call, in this order:
    managed-settings** and will fail at call time. The denied set is
    `browser_evaluate`, `browser_handle_dialog`, `browser_drag`,
    `browser_file_upload`, `browser_pdf_save`, `browser_install`,
-   `browser_resize` — never call them. They're denied because they
+   `browser_resize`, `browser_run_code_unsafe`, `browser_drop` — never
+   call them. They're denied because they
    open prompt-injection escalation paths or are out-of-scope for
    AT-driven web research. Stick to the navigation/snapshot/click/
    type/wait/tabs surface for everything you need.

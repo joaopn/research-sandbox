@@ -21,8 +21,8 @@ this box.
 ## Denied browser tools (image-enforced)
 
 `browser_evaluate`, `browser_handle_dialog`, `browser_drag`,
-`browser_file_upload`, `browser_pdf_save`, `browser_install`, `browser_resize`
-are blocked by baked managed-settings (prompt-injection / out-of-scope). Never
+`browser_file_upload`, `browser_pdf_save`, `browser_install`, `browser_resize`,
+`browser_run_code_unsafe`, `browser_drop` are blocked by baked managed-settings (prompt-injection / out-of-scope). Never
 call them — they will fail at call-time.
 
 ## Untrusted content (load-bearing)
