@@ -2231,7 +2231,7 @@ def build_parser() -> argparse.ArgumentParser:
     rdb.set_defaults(func=cmd_broker_run_dev_box)
     rlc = brk_sub.add_parser("__run-lifecycle", help=argparse.SUPPRESS)  # detached lifecycle child
     rlc.add_argument("op_id")
-    rlc.add_argument("verb")                      # start | stop | update
+    rlc.add_argument("verb")                      # start | stop | update | agents_update
     rlc.add_argument("args_json")
     rlc.set_defaults(func=cmd_broker_run_lifecycle)
 

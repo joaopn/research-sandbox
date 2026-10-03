@@ -95,7 +95,8 @@ BROKER_FULLLOG_DIR = BROKER_DIR / "oplogs-full"     # .full.log — host-only
 # Verbs that get a per-op progress log: the long-running lifecycle writes. Reads
 # (OPEN_VERBS) and auth verbs never produce one. op_id-driven from the webui.
 # (start/stop/update now run on the lifecycle lane, whose child owns its op-log
-# directly; they stay listed so the set keeps naming every op-logged verb.)
+# directly; they stay listed for history. agents_update was born lane-only and is
+# not listed: this set gates only the inline path, which it never takes.)
 PROGRESS_VERBS = frozenset({"create", "update", "destroy", "start", "stop",
                             "box_add", "box_remove", "dev_gitea_start",
                             "dev_passwd", "dev_repo_remove",
@@ -500,6 +501,21 @@ def _verb_stop(args: dict, progress=None) -> list[dict]:
     safe = {k: v for k, v in args.items() if k in START_STOP_WEBUI_FIELDS}
     req = rscore.StartStopRequest.from_kwargs(**safe)  # may raise ValidationError
     return [dataclasses.asdict(r) for r in rscore.stop(req, progress=progress)]
+
+
+def _verb_agents_update(args: dict, progress=None) -> dict:
+    """The Config box's Update: bring a running project's agents level with the
+    host's cached downloads, live (rscore.project_add_agents with no agent — the
+    Update form: the project's own home, every running agent-bearing box, the
+    editors' Claude Code extension). Only the project name crosses the boundary;
+    StartStopRequest validates exactly that. Runs on the lifecycle lane (a
+    minute-long transfer); its per-box outcome rides the progress messages,
+    since the lane discards a verb's return value."""
+    safe = {k: v for k, v in args.items() if k in START_STOP_WEBUI_FIELDS}
+    req = rscore.StartStopRequest.from_kwargs(**safe)  # may raise ValidationError
+    if req.name is None:
+        raise rscore.ValidationError("name a project")
+    return dataclasses.asdict(rscore.project_add_agents(req.name, (), progress=progress))
 
 
 def _verb_start(args: dict, progress=None) -> list[dict]:
@@ -1528,6 +1544,8 @@ _LIFECYCLE_VERBS = {
     "start": (START_STOP_WEBUI_FIELDS, rscore.StartStopRequest, _verb_start),
     "stop": (START_STOP_WEBUI_FIELDS, rscore.StartStopRequest, _verb_stop),
     "update": (UPDATE_WEBUI_FIELDS, rscore.UpdateRequest, _verb_update),
+    # The Config box's Update: the project name only (StartStopRequest).
+    "agents_update": (START_STOP_WEBUI_FIELDS, rscore.StartStopRequest, _verb_agents_update),
 }
 LIFECYCLE_DISPATCH = {v: spec[2] for v, spec in _LIFECYCLE_VERBS.items()}
 

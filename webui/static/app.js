@@ -1895,6 +1895,10 @@ function renderSoftwareScreen(view, result) {
     view.appendChild(el("div", { class: "sw-section" }, [
         el("h3", {}, ["Dists"]),
         el("div", { class: "sw-table sw-dists" }, distRows),
+        el("div", { class: "hint" }, [
+            "Running projects keep the agent versions they have until Update is " +
+            "pressed in their Config box (Agents); new projects get these.",
+        ]),
     ]));
 
     // --- Image fleet ---
@@ -4835,6 +4839,10 @@ const OP_CHECKLISTS = {
         { key: "validate", label: "validating update" },
         { key: "recreate", label: "recreating supervisor" },
     ],
+    // Update's progress lines are its REPORT (each box refreshed or not, the
+    // editor extension): they all share one step key, so the tail renders each
+    // line's message as its own row (opChecklist's markMsg) instead of one "agents" row.
+    agents_update: [],
     // Keys are LOCKSTEP with the rscore box_* progress.step() calls.
     box_add: [
         { key: "validate", label: "checking the project" },
@@ -4977,7 +4985,18 @@ function opChecklist(verb) {
         ref.row.classList.add("ok");
         ref.icon.textContent = "✓";
     };
-    return { listEl, markDone };
+    // One row per progress MESSAGE (a verb whose lines are a report): a line that
+    // says something was not done is marked failed, so a partial outcome never
+    // reads as all green.
+    const markMsg = (msg) => {
+        // "NOT refreshed" / "could not", or a summary counting at least one box not refreshed
+        const bad = /NOT refreshed|could not|[1-9]\d* not refreshed/.test(msg);
+        const ref = addRow("msg-" + Object.keys(items).length, msg);
+        ref.row.classList.remove("pending");
+        ref.row.classList.add(bad ? "failed" : "ok");
+        ref.icon.textContent = bad ? "✗" : "✓";
+    };
+    return { listEl, markDone, markMsg };
 }
 
 async function mgmtTailOp(view, backdrop, card, opId, title, verb, onDone) {
@@ -5065,9 +5084,11 @@ async function mgmtTailOp(view, backdrop, card, opId, title, verb, onDone) {
 // escape for a child killed before it wrote one (the mgmtTailBuildLog
 // contract). The op box can be sent to the background; a watcher then carries
 // the op to its end, and a corner notice reports the outcome.
-const LIFECYCLE_LANE_VERBS = new Set(["start", "stop", "update"]);
-const LIFECYCLE_LABELS = { start: "starting…", stop: "stopping…", update: "updating…" };
-const LIFECYCLE_TITLES = { start: "Starting", stop: "Stopping", update: "Updating" };
+const LIFECYCLE_LANE_VERBS = new Set(["start", "stop", "update", "agents_update"]);
+const LIFECYCLE_LABELS = { start: "starting…", stop: "stopping…", update: "updating…",
+                           agents_update: "updating agents…" };
+const LIFECYCLE_TITLES = { start: "Starting", stop: "Stopping", update: "Updating",
+                           agents_update: "Updating agents" };
 
 // In-flight registry, keyed by project (the broker refuses a second action on a
 // project that already has one, so one entry per project is exact). Value:
@@ -5281,10 +5302,14 @@ function showLifecycleNotice(project, verb, opId, outcome) {
         host = el("div", { id: "op-notices", class: "op-notices" });
         document.body.appendChild(host);
     }
-    const past = { start: "started", stop: "stopped", update: "updated" }[verb] || "finished";
+    const past = { start: "started", stop: "stopped", update: "updated",
+                   agents_update: "agents updated" }[verb] || "finished";
+    const noun = { agents_update: "agent update" }[verb] || verb;
+    const failed = verb === "agents_update" ? `${project}: the agent update failed`
+                                             : `${project} failed to ${verb}`;
     const text = outcome.interrupted
-        ? `${project}: the ${verb} was interrupted`
-        : outcome.ok ? `${project} ${past}` : `${project} failed to ${verb}`;
+        ? `${project}: the ${noun} was interrupted`
+        : outcome.ok ? `${project} ${past}` : failed;
     const body = el("button", { class: "op-notice-body", title: "Show the details" }, [text]);
     const close = el("button", { class: "op-notice-close", title: "Dismiss",
                                  "aria-label": "Dismiss" }, ["×"]);
@@ -5312,7 +5337,7 @@ function showLifecycleNotice(project, verb, opId, outcome) {
 async function lifecycleTail(view, backdrop, card, opId, title, verb, project,
                              onDone, opts) {
     const replay = !!(opts && opts.replay);
-    const { listEl, markDone } = opChecklist(verb);
+    const { listEl, markDone, markMsg } = opChecklist(verb);
     const waitEl = el("div", { class: "op-waiting" });
     const failEl = el("div", { class: "op-fail" });
     const bgBtn = el("button", { class: "btn btn-secondary" }, ["Continue in background"]);
@@ -5349,7 +5374,8 @@ async function lifecycleTail(view, backdrop, card, opId, title, verb, project,
         }
         waitEl.textContent = "";
         if (entry) lifecycleSetQueued(project, opId, false);
-        markDone(rec.step);
+        if (verb === "agents_update" && rec.msg) markMsg(rec.msg);
+        else markDone(rec.step);
     }, () => dismissed);
     if (res === null) return;                   // sent to the background
     if (res.auth) {
@@ -8558,26 +8584,28 @@ function makeProjectConfigBox(project) {
 // re-staged into the running supervisor with no recreate, so the tab can run the
 // new agent at once. A research project runs claude only in this slice (the
 // supervision gate is redesigned before another agent runs research); the docker
-// substrate fixes its agents at create — both
-// show a note instead of a control the broker would refuse.
+// substrate fixes its agents at create — both show a note instead of Add. Update
+// (bring the deployed agents level with the cached versions, live) is offered on
+// every project type that has agents.
 function appendAgentsSection(box, project, enabled) {
     const section = el("div", { class: "config-section" });
     section.appendChild(el("div", { class: "config-section-label" }, ["Agents"]));
     const isDocker = !(enabled.supervisor && enabled.supervisor.box_harness);
-    if (isDocker) {
-        section.appendChild(el("div", { class: "config-empty" }, [
-            "Set at create on this project type.",
-        ]));
-        box.appendChild(section);
-        return;
-    }
     const row = el("div", { class: "config-box-row" }, [
         el("span", { class: "config-box-name" }, ["Deployed agents"]),
         el("span", { class: "config-box-meta" }, ["…"]),
     ]);
+    // Update: bring the project's agents (its own terminal and every running box)
+    // level with the versions the Software page shows — live, nothing recreated.
+    const upd = el("button", { class: "btn btn-secondary" }, ["Update"]);
+    upd.disabled = true;
+    upd.title = isDocker
+        ? "Deploy the cached agent versions into this project"
+        : "Deploy the cached agent versions into this project and its running boxes";
     const btn = el("button", { class: "btn btn-secondary" }, ["Add"]);
     btn.disabled = true;
-    row.appendChild(btn);
+    row.appendChild(upd);
+    if (!isDocker) row.appendChild(btn);
     section.appendChild(row);
     box.appendChild(section);
     (async () => {
@@ -8591,6 +8619,25 @@ function appendAgentsSection(box, project, enabled) {
         } catch (e) { /* unavailable */ }
         if (!st) { if (meta) meta.textContent = "unavailable"; return; }
         const current = Array.isArray(st.agents) ? st.agents : [];
+        if (isDocker) {
+            // The docker substrate fixes its agent set at create; Update refreshes it.
+            if (meta) meta.textContent = current.length
+                ? current.join(", ") + " (set at create)" : "none (set at create)";
+            if (current.length) {
+                upd.disabled = false;
+                upd.onclick = () => mgmtAgentsUpdateDialog(project.name, current, false, true);
+            }
+            return;
+        }
+        // A dind project's shared copy always carries claude, so its boxes may
+        // run claude even when the project's own terminal runs no agent.
+        // The dialog names what is DEPLOYED: the staged set (a dind project's always
+        // carries claude; research stages claude), not the project's own selection.
+        const deployedSet = Array.isArray(st.agents_staged) && st.agents_staged.length
+            ? st.agents_staged : ["claude"];
+        const ownTerminal = st.flavor !== "sandbox-dind" || current.length > 0;
+        upd.disabled = false;
+        upd.onclick = () => mgmtAgentsUpdateDialog(project.name, deployedSet, true, ownTerminal);
         if (st.flavor !== "sandbox-dind") {
             if (meta) meta.textContent = "claude (fixed on a research project)";
             return;
@@ -8664,6 +8711,52 @@ function mgmtAgentsDialog(name, current, addable) {
                 body: JSON.stringify(payload),
             });
         },
+    });
+}
+
+// The Update dialog behind the Agents section: names the cached versions it will
+// deploy (the Software page's own data, flagging a row that reads stale), says
+// what an update does and does not touch, and runs `agents_update` on the
+// lifecycle lane (its op log names each box refreshed or not).
+async function mgmtAgentsUpdateDialog(name, deployed, hasBoxes, ownTerminal) {
+    let rows = [];
+    try {
+        const res = await fetch("/broker/software");
+        const body = await res.json();
+        rows = (body && body.result && Array.isArray(body.result.agents)) ? body.result.agents : [];
+    } catch (e) { /* versions unavailable: the dialog still works */ }
+    const versions = rows.filter((r) => deployed.includes(r.agent) && r.present).map((r) =>
+        el("li", {}, [
+            r.agent + " " + (r.cached_version || "?"),
+            r.matches_pin ? "" : " — the cached copy is stale; press Pull on the " +
+                "Software page first to get the pinned version",
+        ]));
+    mgmtConfirmThenTail(boxOpView(), {
+        title: `Update the agents of ${name}`,
+        tailTitle: `Updating the agents of ${name}`,
+        verb: "agents_update",
+        project: name,
+        confirmLabel: "Update",
+        body: [
+            el("p", {}, ["Deploys the versions cached on this host:"]),
+            versions.length ? el("ul", {}, versions)
+                : el("p", { class: "hint" }, ["(the cached versions could not be read)"]),
+            el("div", { class: "hint" }, [
+                "Applied live — nothing is recreated, and logins, sessions and settings " +
+                "are kept. " + (ownTerminal && hasBoxes ? "The project's terminal and every " +
+                "running box that carries agents get"
+                    : ownTerminal ? "The project's terminal gets"
+                    : "Every running box that carries agents gets") + " these versions, including over " +
+                "an agent you updated yourself; Claude Code's editor extension returns to " +
+                "the cached version too (reload an open editor window to pick it up). " +
+                "Restart running agent sessions afterwards to use the new versions." +
+                (hasBoxes ? " A stopped box keeps its copy until it runs during an update " +
+                    "or is re-created." : ""),
+            ]),
+        ],
+        request: () => fetch(`/broker/project/${encodeURIComponent(name)}/agents_update`, {
+            method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+        }),
     });
 }
 

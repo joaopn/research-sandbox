@@ -7833,7 +7833,8 @@ def _update_docker_substrate(req: "UpdateRequest", cfg: "Config",  # type: ignor
     # silently, and `--agent x` alone is not refused with the editor's message.
     if req.agents is not None:
         die("the agent set is fixed at create on the docker substrate "
-            "(a plain runc box); recreate the project to change it")
+            "(a plain runc box); recreate the project to change it; to update its "
+            "agents to the cached versions, use Update in the project's Config box")
     if req.model_changes():
         die("the agent model is fixed at create on the docker substrate "
             "(a plain runc box); recreate the project to change it")
@@ -9518,7 +9519,8 @@ def project_add_agents(project: str, agents: "Sequence[str]",
     if _read_marker_substrate(workspace_path) == Substrate.DOCKER.value:
         if any(a not in marker_agents for a in agents):
             die("the agent set is fixed at create on the docker substrate "
-                "(a plain runc box); recreate the project to change it")
+                "(a plain runc box); recreate the project to change it; to update its "
+                "agents to the cached versions, use Update in the project's Config box")
         if not marker_agents:
             die("this project has no agents to update")
         _refuse_during_agent_build()

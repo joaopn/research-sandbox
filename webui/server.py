@@ -858,9 +858,9 @@ async def broker_attach_handler(request: web.Request) -> web.Response:
 
 
 async def broker_project_action_handler(request: web.Request) -> web.Response:
-    """POST /broker/project/{name}/{action} — start|stop|update|destroy (gated,
-    origin-checked). Returns {op_id} immediately; the browser tails the op log.
-    start/stop/update run on the broker's LIFECYCLE LANE: the broker validates,
+    """POST /broker/project/{name}/{action} — start|stop|update|agents_update|destroy
+    (gated, origin-checked). Returns {op_id} immediately; the browser tails the op log.
+    start/stop/update/agents_update run on the broker's LIFECYCLE LANE: the broker validates,
     spawns a detached child and answers at once, so this is a SYNCHRONOUS
     relay-with-op_id (the broker_build_handler shape) — a background _start_op
     would mark the op finished the moment the spawn returned. A refusal (busy,
@@ -872,7 +872,7 @@ async def broker_project_action_handler(request: web.Request) -> web.Response:
         return web.Response(status=403, text="origin rejected")
     name = request.match_info.get("name", "")
     action = request.match_info.get("action", "")
-    if action not in ("start", "stop", "update", "destroy"):
+    if action not in ("start", "stop", "update", "agents_update", "destroy"):
         return web.json_response(
             {"ok": False, "error": {"kind": "bad_request"}}, status=400)
     args = {"name": name}
