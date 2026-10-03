@@ -225,7 +225,7 @@ On any DIND project (`research` / `sandbox-dind`) you can spin **boxes** — iso
 | **`data-wrangler`** | the base, oriented for data work |
 | **`byo`** | bring your own — clone a repo / run a setup snippet at boot |
 
-pi reads a repo's `.claude/rules/`, `.claude/CLAUDE.md` and nested `CLAUDE.md` files like Claude Code does (an RS-owned `rs-rules` extension rides the pi dist). Per-box toggles: `--agent claude|pi` (or none — an agent-bearing box receives every agent the project carries), `--editor`, `--mcps <subset of the project allowlist>`, and `--repo/--ref/--setup` for the `byo` preset. Boxes boot un-authed and reach an LLM / pip / apt through the project's locked egress — the containment is router + no-creds + container isolation.
+pi reads a repo's `.claude/rules/`, `.claude/CLAUDE.md` and nested `CLAUDE.md` files like Claude Code does (an RS-owned `rs-rules` extension rides the pi dist). It runs online like a stock install: `pi update` updates it in place (like `claude update`; restaging or recreating the project or box returns it to the pinned version), `pi install` / `pi remove` manage its packages, and it refreshes its model catalogs and fetches `rg` / `fd` on first need. Install telemetry stays off. Per-box toggles: `--agent claude|pi` (or none — an agent-bearing box receives every agent the project carries), `--editor`, `--mcps <subset of the project allowlist>`, and `--repo/--ref/--setup` for the `byo` preset. Boxes boot un-authed and reach an LLM / pip / apt through the project's locked egress — the containment is router + no-creds + container isolation.
 
 ## ◾ Security model
 

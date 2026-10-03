@@ -4896,14 +4896,31 @@ _AGENT_INSTALL = {
     # share/pi-agent/node, the npm-installed package under share/pi-agent/pi, pi's
     # agent dir RELOCATED to share/pi-agent/agent (the canonical settings, and at
     # runtime the PI's auth.json, sessions, trust and own mcp.json) and
-    # an RS launcher script at bin/pi that resolves node from its own directory
-    # and exports pi's four env defaults when unset — so a copy runs from ANY
-    # home with an EMPTY environment (measured: uid 1001, `env -i`). No symlink
+    # an RS launcher script at bin/pi that resolves node from its own directory,
+    # exports pi's two env defaults when unset (the relocated agent dir, telemetry
+    # off) and APPENDS the private node's bin/ to PATH — so a copy runs from ANY
+    # home with an EMPTY environment (measured: uid 1001, `env -i`). pi runs
+    # ONLINE like a stock install: its self-update, package installs, model-catalog
+    # refresh and fd/rg fetch all need the network, and the first two spawn `npm`
+    # (and npm's `#!/usr/bin/env node`) BY NAME from PATH — hence npm stays in the
+    # dist and the private node rides PATH. APPENDED, not prepended, so a box's
+    # node seed, a repo's nvm node or conda still win for the agent's own shell
+    # commands; pi falls through to its own node only when nothing else provides
+    # one. The PATH default covers a set-but-EMPTY PATH (dash already supplies
+    # its own when PATH is unset), which a plain append would turn into
+    # `:<node/bin>` — the cwd plus node and nothing else. No symlink
     # launcher (`launcher_symlink` False); no companion editor extension (none
-    # exists). `extra_pins` are extra `.format` keys for the recipe, resolved
-    # through load_versions() at build (an unset one dies) and recorded in the
-    # sidecar, so software_status can tell a stale node / rules extension from a
-    # current one. MCP is pi's OWN (the built-in `mcp` extension, pi >= 1.0): no
+    # exists). `extra_pins` are build-time pins beside the agent's own version,
+    # resolved through load_versions() at build (an unset one dies), passed as
+    # extra `.format` keys (the recipe uses `node_ver`; the `files` callables may
+    # read the rest, as the rules extension's header check reads `rules_ver`) and
+    # recorded in the sidecar, so software_status can tell a stale node / rules
+    # extension from a current one. `layout_ver` is the one extra pin NOTHING
+    # reads at build: it versions the dist's TREE LAYOUT (RS_PI_DIST_LAYOUT,
+    # bumped whenever a deploy site starts depending on a new path in the dist)
+    # and exists only to be recorded, so a download built before a layout change
+    # reads "stale — re-pull" with a `layout` sub-row instead of passing for
+    # current. MCP is pi's OWN (the built-in `mcp` extension, pi >= 1.0): no
     # MCP extension is vendored — one that registers `/mcp` would make pi refuse
     # to load its built-in. `files` are written by _agent_build_dist AFTER the
     # capture (JSON carries braces, so it is never part of the formatted recipe);
@@ -4915,7 +4932,8 @@ _AGENT_INSTALL = {
     # `cd`, `pwd -P` and parameter expansion are shell builtins).
     "pi": {
         "version_key": "PI_CODING_AGENT_VERSION",
-        "extra_pins": {"node_ver": "NODE_VERSION", "rules_ver": "RS_PI_RULES_VERSION"},
+        "extra_pins": {"node_ver": "NODE_VERSION", "rules_ver": "RS_PI_RULES_VERSION",
+                       "layout_ver": "RS_PI_DIST_LAYOUT"},
         "install": (
             "mkdir -p ~/.local/bin ~/.local/share/pi-agent/node ~/.local/share/pi-agent/pi"
             " ~/.local/share/pi-agent/agent/extensions"
@@ -4932,19 +4950,21 @@ _AGENT_INSTALL = {
             " '# RS launcher for pi: resolves the private node + the bundled cli.js'"
             " '# from its own directory and supplies the env defaults when unset,'"
             " '# so an absolute-path call from any home and any environment works.'"
+            " '# The private node is APPENDED to PATH: pi spawns npm by name.'"
             " 'd=$(cd \"${{0%/*}}/..\" && pwd -P)'"
             " '[ -n \"$PI_CODING_AGENT_DIR\" ] || export PI_CODING_AGENT_DIR=\"$d/share/pi-agent/agent\"'"
-            " '[ -n \"$PI_OFFLINE\" ] || export PI_OFFLINE=1'"
-            " '[ -n \"$PI_SKIP_VERSION_CHECK\" ] || export PI_SKIP_VERSION_CHECK=1'"
             " '[ -n \"$PI_TELEMETRY\" ] || export PI_TELEMETRY=0'"
+            " 'PATH=\"${{PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}}:$d/share/pi-agent/node/bin\"; export PATH'"
             " 'exec \"$d/share/pi-agent/node/bin/node\" \"$d/share/pi-agent/pi/lib/node_modules/"
             "@earendil-works/pi-coding-agent/dist/bundle/cli.js\" \"$@\"'"
             " > ~/.local/bin/pi && chmod 755 ~/.local/bin/pi"
-            # The trim: build-time tools (npm, corepack, node headers, docs) and the
-            # 25 foreign esbuild platform binaries (284 MB) — 727 MB → ~370 MB.
+            # The trim: build-time tools (corepack, npx, node headers, docs) and the
+            # 25 foreign esbuild platform binaries (284 MB) — 727 MB → ~380 MB. npm
+            # STAYS (12 MB): pi's self-update and package installs spawn it. Its
+            # bin/npm is a relative symlink, so the kept tree stays $HOME-agnostic.
             " && rm -rf ~/.local/share/pi-agent/node/include ~/.local/share/pi-agent/node/share/doc"
-            " ~/.local/share/pi-agent/node/share/man ~/.local/share/pi-agent/node/lib/node_modules/npm"
-            " ~/.local/share/pi-agent/node/lib/node_modules/corepack ~/.local/share/pi-agent/node/bin/npm"
+            " ~/.local/share/pi-agent/node/share/man"
+            " ~/.local/share/pi-agent/node/lib/node_modules/corepack"
             " ~/.local/share/pi-agent/node/bin/npx ~/.local/share/pi-agent/node/bin/corepack"
             " && for d in ~/.local/share/pi-agent/pi/lib/node_modules/@earendil-works/"
             "pi-coding-agent/node_modules/@esbuild/*; do case \"$d\" in */linux-x64) ;;"
@@ -4972,6 +4992,9 @@ _AGENT_INSTALL = {
         "built_check": [
             "share/pi-agent/pi/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
             "share/pi-agent/node/bin/node",
+            # is_file follows the in-tree relative link: an npm-less dist (a
+            # failed or truncated node extract) is never cached.
+            "share/pi-agent/node/bin/npm",
         ],
     },
 }
@@ -4996,14 +5019,17 @@ def _agent_env(agent: str, home: str) -> list[tuple[str, str]]:
     inject and config must ride env — keyed by the container user's home
     (`/home/research` for supervisors + the docker box, `/home/worker` for
     boxes). claude needs none: it reads ~/.claude/settings.json, which the deploy
-    sites install from the dist. pi: the relocated agent dir + the three offline
-    switches — the SAME four defaults its launcher exports when unset, emitted
-    here so the container's record (`docker inspect`) states the posture and an
-    operator override is possible. MIRRORED by rs_sandbox._AGENT_BOX_ENV for
-    boxes (staged standalone; pytest-pinned equal after home substitution)."""
+    sites install from the dist. pi: the relocated agent dir + telemetry off —
+    the SAME two defaults its launcher exports when unset, emitted here so the
+    container's record (`docker inspect`) states the posture and an operator
+    override is possible. Deliberately NO PI_OFFLINE / PI_SKIP_VERSION_CHECK: pi
+    runs online like a stock install (self-update, packages, model catalogs, the
+    fd/rg fetch); an operator opts into offline per shell or with `--offline`.
+    MIRRORED by rs_sandbox._AGENT_BOX_ENV for boxes (staged standalone;
+    pytest-pinned equal after home substitution)."""
     if agent == "pi":
         return [("PI_CODING_AGENT_DIR", f"{home}/{PI_AGENT_DIR_REL}"),
-                ("PI_OFFLINE", "1"), ("PI_SKIP_VERSION_CHECK", "1"), ("PI_TELEMETRY", "0")]
+                ("PI_TELEMETRY", "0")]
     return []
 
 
@@ -5085,8 +5111,8 @@ def _pi_settings_json(pins: dict) -> str:
     callables all take the resolved extra pins, this one reads none).
     `defaultProjectTrust: always` — the container is the boundary, and a headless
     run must never stall on (or silently skip project resources for) a trust
-    prompt; telemetry off (the version check + offline mode are env, exported by
-    the launcher); dark theme like claude's. `tuiMode: regular` keeps the
+    prompt; install telemetry off (also PI_TELEMETRY=0, exported by the
+    launcher); dark theme like claude's. `tuiMode: regular` keeps the
     terminal's own scrollback and selection as before pi 1.0, whose default
     became a fullscreen TUI. No `packages`: MCP is pi's built-in extension."""
     return json.dumps(

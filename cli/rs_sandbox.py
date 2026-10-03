@@ -550,10 +550,10 @@ def _install_repo_watch(cname: str) -> None:
 # Per-agent env for a BOX (home /home/worker) — MIRROR of rscore._agent_env
 # (this file is staged into the supervisor standalone and cannot import rscore;
 # the pytest pins the two equal after home substitution). Registry order; claude
-# needs none. pi: its relocated agent dir + the three offline switches.
+# needs none. pi: its relocated agent dir + telemetry off (pi runs online).
 _AGENT_BOX_ENV: dict[str, list[tuple[str, str]]] = {
     "pi": [("PI_CODING_AGENT_DIR", "/home/worker/.local/share/pi-agent/agent"),
-           ("PI_OFFLINE", "1"), ("PI_SKIP_VERSION_CHECK", "1"), ("PI_TELEMETRY", "0")],
+           ("PI_TELEMETRY", "0")],
 }
 
 
@@ -618,7 +618,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     agent_mount = (["-v", f"{AGENT_DIST_MOUNT}:{AGENT_DIST_MOUNT}:ro"]
                    if (agent != "none" and os.path.isdir(AGENT_DIST_MOUNT)) else [])
     # Per-agent config env for the project's deployed set (pi's relocated agent
-    # dir + offline switches): only when the box mounts the dist. (A box that existed before an add is re-run with this env
+    # dir + telemetry off): only when the box mounts the dist. (A box that existed before an add is re-run with this env
     # while its absence-guarded entrypoint keeps its old ~/.local — the env then
     # names a file that is not there, inert because the binary is not there
     # either; a re-created box gets both.) The box user is `worker`.
