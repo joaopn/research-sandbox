@@ -39,6 +39,14 @@ if [[ ! -f "${CS_USER_DIR}/User/settings.json" ]] && \
    [[ -f "${DIST}/templates/User/settings.json" ]]; then
     cp "${DIST}/templates/User/settings.json" "${CS_USER_DIR}/User/settings.json"
 fi
+# Remote settings: the browser tab is a remote window, so machine-scoped keys (the
+# Claude Code extension's permission keys) apply only from Machine/settings.json.
+# No-clobber like User: an operator's own Remote settings are theirs.
+if [[ ! -f "${CS_USER_DIR}/Machine/settings.json" ]] && \
+   [[ -f "${DIST}/templates/Machine/settings.json" ]]; then
+    mkdir -p "${CS_USER_DIR}/Machine"
+    cp "${DIST}/templates/Machine/settings.json" "${CS_USER_DIR}/Machine/settings.json"
+fi
 
 # 3. Install pre-staged .vsix extensions (the bundled editor extensions) if not
 #    already present.

@@ -25,8 +25,8 @@
 
   "security.workspace.trust.enabled": false,
 
-  "claudeCode.allowDangerouslySkipPermissions": true,
-  "claudeCode.initialPermissionMode": "bypassPermissions",
+  // The Claude Code permission keys are machine-scoped: they live in the
+  // Remote settings file (Machine/settings.json), never here.
 
   "chat.disableAIFeatures": true,
   "chat.commandCenter.enabled": false,

@@ -6171,6 +6171,7 @@ def _editor_build_dist(cs_version: str) -> None:
         .local/                              -- `--method standalone` install (Tier-2 stripped)
         tools/code-server-stub.py            -- the lazy-start stub
         templates/User/settings.json         -- code-server user settings
+        templates/Machine/settings.json      -- code-server Remote settings (machine-scoped keys)
         templates/extensions/*.vsix          -- the bundled Open VSX extensions
     The install + the .vsix downloads run in-container (network); the stub +
     settings are repo files copied in host-side (so the build is self-contained).
@@ -6200,7 +6201,8 @@ def _editor_build_dist(cs_version: str) -> None:
     stub_src = sup_dir / "code-server-stub.py"
     deploy_src = sup_dir / "code-server-deploy.sh"
     settings_src = sup_dir / "code-server-settings.json"
-    for p in (stub_src, deploy_src, settings_src):
+    machine_settings_src = sup_dir / "code-server-machine-settings.json"
+    for p in (stub_src, deploy_src, settings_src, machine_settings_src):
         if not p.is_file():
             die(f"editor dist build: missing repo file {p}")
     EDITOR_DIST_DIR.parent.mkdir(parents=True, exist_ok=True)
@@ -6254,6 +6256,8 @@ def _editor_build_dist(cs_version: str) -> None:
             os.chmod(dst, 0o755)   # entrypoint runs the stub + sources the deploy
         (tmp / "templates" / "User").mkdir(parents=True)
         shutil.copy2(settings_src, tmp / "templates" / "User" / "settings.json")
+        (tmp / "templates" / "Machine").mkdir()
+        shutil.copy2(machine_settings_src, tmp / "templates" / "Machine" / "settings.json")
         exts_out = tmp / "templates" / "extensions"
         exts_out.mkdir(parents=True)
         for fn, _ in ext_specs:

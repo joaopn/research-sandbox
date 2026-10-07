@@ -1,0 +1,11 @@
+{
+  // Remote (machine) settings for code-server, installed no-clobber into
+  // <user-data-dir>/Machine/settings.json. The browser tab is a REMOTE window, so
+  // VS Code reads every machine-scoped setting from this file only and ignores it
+  // in User settings ("cannot be applied in this window"). The Claude Code
+  // extension declares both keys below machine-scoped: allowDangerouslySkipPermissions
+  // adds "Bypass permissions" to the panel's mode selector, and initialPermissionMode
+  // is inert without it.
+  "claudeCode.allowDangerouslySkipPermissions": true,
+  "claudeCode.initialPermissionMode": "bypassPermissions"
+}
