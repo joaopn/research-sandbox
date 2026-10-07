@@ -45,6 +45,12 @@ RUN useradd -m -s /bin/bash -G sudo -u 1000 worker && \
 
 RUN su - worker -c "/opt/conda/bin/conda init bash"
 
+# The box user's conda environments + package cache live on the box's /workspace
+# and survive a box re-run; /opt/conda stays root-owned. Same file and same channel
+# move as rs-minimal-base (rationale in agent/user.condarc).
+COPY --chown=worker:worker agent/user.condarc /home/worker/.condarc
+RUN if [ -f /opt/conda/.condarc ]; then mv /opt/conda/.condarc /root/.condarc; fi
+
 # Keep ~/.local/bin on PATH so the boot-deployed agent launcher (cp'd from the
 # agent dist by the box entrypoint) is found. Same posture as rs-analysis-base.
 RUN su - worker -c 'echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.bashrc'

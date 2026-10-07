@@ -203,6 +203,8 @@ zero when fixed), and verify it on both the base branch and your branch before p
   recreate (a box re-run, a project stop + start). Anything you need afterwards — a venv, a
   tool install, a cache, notes — goes under `/workspace`. `pip install --user`, `npm -g` and
   apt are yours to run, and gone after the next recreate; a venv under `/workspace` is not.
+  Nor is a conda environment: `conda create -n <name>` puts it (and conda's package cache)
+  under `/workspace/.conda/`; conda's base install is root-owned and reset at every recreate.
 - Internet access for API calls and package installation (subject to the project's egress policy)
 - Git push/pull to Gitea (`origin` for push, `upstream` for fetch)
 

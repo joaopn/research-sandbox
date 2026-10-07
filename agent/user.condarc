@@ -1,0 +1,18 @@
+# The interactive user's conda config, baked into the image home (rs-minimal-base
+# for `research`, rs-ext-base for a box's `worker`). /opt/conda is RS's own
+# interpreter (the rs-* tools' shebangs, the reader's ABI-locked Python, the
+# research image's pip deps) and stays root-owned and image-managed; the user's
+# environments and package cache live on /workspace, the one filesystem that
+# survives a recreate. The cache sits beside the envs so conda hard-links into
+# them (same filesystem). Per-user, never /etc/conda: root's pkgs_dirs must
+# not point at /workspace, or a `sudo /opt/conda/bin/conda` would leave
+# root-owned files in the user's cache. The image's /opt/conda/.condarc
+# (channels: defaults) moves to /root/.condarc right after the COPY: conda MERGES
+# channel lists across config files, so leaving it would give the user defaults
+# on top of conda-forge.
+envs_dirs:
+  - /workspace/.conda/envs
+pkgs_dirs:
+  - /workspace/.conda/pkgs
+channels:
+  - conda-forge

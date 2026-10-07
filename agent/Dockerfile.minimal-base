@@ -59,6 +59,13 @@ RUN useradd -m -s /bin/bash -G sudo -u 1000 research && \
 # Initialize conda hooks in the research user's shell.
 RUN su - research -c "/opt/conda/bin/conda init bash"
 
+# The user's own conda environments + package cache live on /workspace and
+# survive a recreate; /opt/conda (RS's interpreter) stays root-owned. The image's
+# channel config moves to root so the user's list is conda-forge alone. Rationale
+# in agent/user.condarc.
+COPY --chown=research:research agent/user.condarc /home/research/.condarc
+RUN if [ -f /opt/conda/.condarc ]; then mv /opt/conda/.condarc /root/.condarc; fi
+
 # ~/.local/bin on PATH for LOGIN shells (STAGE_NODE_SEED). A dist-delivered
 # launcher (node/npm, claude, code-server) lands in ~/.local/bin, but the two
 # PATH exports elsewhere in the tree (this base's conda bashrc, entrypoint bashrc
