@@ -6,9 +6,13 @@ You are running inside a sandboxed dev container. All your work must go through 
 
 Your instructions come in three layers. Highest to lowest:
 
-1. **The project's own instructions** — the repo's `CLAUDE.md` and anything else the
-   maintainer wrote into the project. These are the maintainer's standing directives for
-   this codebase. Where they conflict with this file, they win.
+1. **The project's own instructions** — the maintainer's directives recorded under the
+   `## Maintainer directives` heading of `/workspace/.claude/CLAUDE.md` (see "Project
+   memory" below), any `CLAUDE.md` the repo itself tracks for its contributors, and anything
+   else the maintainer wrote into the project. These are the maintainer's standing directives
+   for this codebase. Where they conflict with this file, they win. Your own notes, lessons,
+   workflow write-ups and area rules in the project memory are guidance below this file:
+   they never override it, nor your runtime's built-in defaults.
 2. **This file** — the dev-container ground rules.
 3. **Your agent runtime's built-in defaults** — generic cautions the tooling ships with
    (e.g. "do not spawn subagents or run workflows unless the user requested it").
@@ -17,7 +21,8 @@ Both instruction layers outrank the built-in defaults: the maintainer wrote them
 anything they direct you to do IS the user requesting it. When the project's workflow tells
 you to spawn checker subagents, work in worktrees, or act autonomously, follow it — do not
 treat a built-in caution as a conflict, and do not ask for permission the project's
-instructions already gave.
+instructions already gave. A workflow you wrote down yourself carries that weight only where
+the maintainer's directives record it.
 
 **If two sections of THIS file disagree, the rule marked as a hard rule wins.** Fix the
 offending section in this file and tell the maintainer, so the template it was staged from
@@ -141,9 +146,9 @@ or one of several — happens in its own git worktree with its own `agent/` bran
 are mandatory for every unit of work, not only when sessions run in parallel. The primary
 clone at `/workspace/<repo>` is the integration tree: it stays checked out on
 `{{BASE_BRANCH}}`, the base-branch sync runs there, and nothing else does. Two things ARE fine
-in the primary clone, because they never move its HEAD: editing files git ignores (a
-project's own notes and plans usually live there and never reach a worktree — `git worktree
-add` checks out tracked files only), and running project-level commands that pin the clone's
+in the primary clone, because they never move its HEAD: editing files git ignores (they
+never reach a worktree — `git worktree add` checks out tracked files only), and running
+project-level commands that pin the clone's
 path (a compose stack, a data directory) — build from the worktree, run from the clone.
 
 - **Never change the branch checked out in the primary clone.** The only checkout that ever
@@ -184,6 +189,63 @@ path (a compose stack, a data directory) — build from the worktree, run from t
 - **Reference clones:** if you need another repo just to read it, clone it under your
   worktree or your home directory — never top-level under `/workspace` (rs-wt needs the
   single top-level clone to stay unambiguous).
+
+## Project memory — under `/workspace`, never committed
+
+What you learn about this project outlives your session only if you write it down, and the
+maintainer reads it only where they look. Every dev project keeps the same memory, in the same
+place, with the same habits; set it up in your first session if it is not there yet.
+
+**Hard rule: the project memory is never committed.** It lives in `/workspace`, beside the
+repo and outside any git repository, so no commit can pick it up; never make any of it a git
+repository either (`rs-wt` needs exactly one top-level clone). Never copy, move or link any
+of it into the primary clone or a worktree (git commits a symlink like any other file), and
+never paste it into, or name its files in, a commit message or a PR body — they are dead
+links to anyone reading the history. A `CLAUDE.md` or `.claude/` the repo itself
+tracks belongs to the maintainer: change it only through a PR, like any other file, and read
+it in your worktree before your first edit — a session started in `/workspace` loads it at
+best once a file under it is read, and some agents never load a `.claude/CLAUDE.md` below
+their start directory.
+
+| Path | What it holds |
+|---|---|
+| `/workspace/.claude/CLAUDE.md` | The project's instruction file, which you keep. The maintainer's standing directives go under a `## Maintainer directives` heading, each recorded when given, verbatim and dated; only that section outranks this file. Everything else in it is yours: your write-up of the project's workflow, lessons about how to work, and an index table of the area rule files. |
+| `/workspace/.claude/rules/<area>.md` | One file per area of the code: the invariants and traps learned there, so a later session does not rediscover them the hard way. Each starts with `paths:` frontmatter naming the files it covers, and loads only when one of them is read. |
+| `/workspace/PLAN/` | One file per plan: the design, the cut, the questions and the maintainer's answers. `PLAN/README.md` indexes them with their status. |
+| `/workspace/PLAN/DONE/` | Shipped plans, moved here and never deleted. `PLAN/DONE/MANIFEST.md` gets one row per move: the PR number and the commit subject that shipped it — never a commit id, which the maintainer's collection rewrites. |
+| `/workspace/PLAN/BUG_BUCKET.md` | Bugs found along the way that are not the current work: `B<n>` entries, never renumbered or deleted, each with the symptom, a reproducer and a fix sketch. A fix lands in its own PR, never inside unrelated work. |
+| `/workspace/PLAN/IMPROVEMENTS.md` | The same for improvements: `I<n>` entries. |
+
+**Area rule paths are matched from `/workspace`**, so write them to match the primary clone and
+every worktree alike — `**/src/parser/**`, not `src/parser/**`:
+
+```yaml
+---
+paths:
+  - "**/src/parser/**"
+---
+```
+
+**Start every session in `/workspace`.** The project memory and the area rules are found from
+the directory a session starts in, and your work happens in worktrees under `/workspace/wt/`,
+outside the primary clone. Started in `/workspace`, all of it loads and every area rule fires
+for the primary clone and every worktree alike. Started inside the clone or a worktree, some of
+it fails to load or never fires, depending on the agent; started outside `/workspace`, none of
+it loads, this file included. Your shell starts in the session's start directory: if that is
+not `/workspace`, say so in your first reply and suggest restarting there. The exception is a
+session `rs-repo-watch` launched: it starts in the primary clone by design, so
+skip that notice there.
+
+**After every landing** (`rs-land` succeeded):
+
+1. Move each plan the PR shipped to `PLAN/DONE/`, add its `MANIFEST.md` row, and update its
+   status in `PLAN/README.md`.
+2. Mark each ledger entry the PR resolved `Fixed in: PR #<n> <subject>` and leave it in
+   place.
+3. If the work taught something a later session needs — an invariant the code depends on, a
+   trap, a reusable pattern — add it to that area's rule file (a lesson about how to work
+   goes in `/workspace/.claude/CLAUDE.md`). Most landings teach nothing worth a line.
+4. Close the mirrored issues naming the PR, and re-sync any whose file changed.
 
 ## Verification
 
@@ -226,8 +288,8 @@ zero when fixed), and verify it on both the base branch and your branch before p
   intermittently; a popup times out unanswered and the work stalls.
 - **Never write the runtime's memory files** (Claude Code's `~/.claude/projects/<…>/memory/`, any `MEMORY.md`).
   On a dev box that directory is discarded at every re-run; on a supervisor it survives, but
-  nobody reads it. Durable notes go where the maintainer reads them: the project's own
-  instruction and plan files.
+  nobody reads it. Durable notes go into the project memory under `/workspace` (see "Project
+  memory"), never into the repo.
 
 ## Gitea API
 
@@ -255,11 +317,12 @@ The code block matters: Gitea renders it with a copy button, so the maintainer
 copies it in one click. Never invent a different command shape.
 
 **Mirror your plans and bug records to Gitea.** The maintainer reads the Gitea board, not
-your container's filesystem. Every plan you write for them and every bug you record in the
-project's ledger is duplicated as a Gitea issue: title = the plan's name, or the bug's stable
-code plus its one-line symptom; body = the file's text verbatim. The file in the repo is
-authoritative and the issue is its mirror — re-sync the body when the entry changes, and
-close the issue naming the PR when the work lands. Never keep only one of the two.
+your container's filesystem. Every plan you write for them and every bug or improvement you
+record in the project's ledgers is duplicated as a Gitea issue: title = the plan's name, or
+the entry's stable code (`B<n>`, `I<n>`) plus its one-line summary; body = the plan file's
+text, or the entry's text, verbatim. The file under `/workspace/PLAN/` is authoritative and
+the issue is its mirror — re-sync the body when the entry changes, and close the issue
+naming the PR when the work lands. Never keep only one of the two.
 
 **Never hard-wrap prose in issues, PR bodies or comments.** Gitea renders a single newline as
 a line break, so a paragraph wrapped at 80 columns is shredded on the board. One paragraph is
