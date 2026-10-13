@@ -4839,6 +4839,65 @@ def load_versions() -> dict[str, str]:
     return pins
 
 
+_VERSION_NUMERIC_RE = re.compile(r"v?(\d+(?:\.\d+)*)")
+
+
+def _version_older(value: str, base: str) -> bool:
+    """True iff `value` is a CLEAR numeric downgrade of `base`. Compares the
+    leading dotted-numeric run of each (a leading `v` stripped — node pins may
+    carry one), zero-padded to equal length so 1.0 == 1.0.0. Anything else reads
+    as not-older: a value with no numeric run, or equal numbers with a different
+    suffix (2.1.170-rc1 vs 2.1.170, 7.17.1rc1 vs 7.17.1) — this feeds a warning,
+    and a false one teaches the operator to ignore it."""
+    if value == base:
+        return False
+    a, b = _VERSION_NUMERIC_RE.match(value), _VERSION_NUMERIC_RE.match(base)
+    if not a or not b:
+        return False
+    x = [int(n) for n in a.group(1).split(".")]
+    y = [int(n) for n in b.group(1).split(".")]
+    width = max(len(x), len(y))
+    return x + [0] * (width - len(x)) < y + [0] * (width - len(y))
+
+
+def _warn_pins_below_base(what: str, bundled: dict[str, str]) -> list[str]:
+    """Warn — never refuse — when a dist build just BUNDLED a pin below the value
+    this installation's tracked versions.env ships. The usual cause is a stale
+    versions.local.env line: the override wins per key forever, so the effective
+    pin silently detaches from the base and every later build is old (an override
+    reading CLAUDE_CODE_VERSION=2.0.0 built a claude without --effort twice, and
+    nothing said so). A lower pin may be deliberate, so the build goes ahead.
+
+    Called at the END of each successful build. stderr is the one channel that
+    reaches every surface: the CLI terminal (the build's own output is captured),
+    and the broker build lane's full log, which the webui's Pull/Refresh dialog
+    streams into its log pane (a view-log step would be overwritten by the next
+    milestone). The line states the facts and names the file; it gives no shell
+    remedy, because the same text is browser-visible. Never raises: the build
+    already succeeded. Returns the printed lines."""
+    lines: list[str] = []
+    try:
+        base = _parse_env_pins(VERSIONS_FILE)
+        override = _parse_env_pins(VERSIONS_LOCAL_FILE)
+        for key, value in bundled.items():
+            if key not in base or not value or not _version_older(value, base[key]):
+                continue
+            # Reachable only from a Python caller: no product path passes a
+            # version that is not the effective pin.
+            source = ("is a local override (versions.local.env — the Software "
+                      "page marks it \"local\")"
+                      if override.get(key) == value else "was requested explicitly")
+            lines.append(f"warning: {what} was built with {key}={value}, below the "
+                         f"{base[key]} this installation ships (versions.env); the "
+                         f"lower value {source}. Containers set up from it afterwards "
+                         f"get the older version. Built anyway.")
+        for ln in lines:
+            print(ln, file=sys.stderr)
+    except Exception:
+        pass
+    return lines
+
+
 # ---------------------------------------------------------------------------
 # Agent dist — host-cached, version-pinned agent software copied into a box at
 # boot (STAGE_AGENT_DIST_S1). The image stays agent-less; the entrypoint deploys
@@ -5564,6 +5623,12 @@ def _agent_build_dist(agent: str, version: str) -> None:
          "extra_pins": extras,
          "pulled_at": datetime.datetime.now(datetime.timezone.utc).isoformat()},
         indent=2) + "\n")
+    bundled = {spec["version_key"]: version}
+    if ext:
+        bundled[ext["version_key"]] = ext_ver
+    for key, val in extras.items():
+        bundled[spec["extra_pins"][key]] = val
+    _warn_pins_below_base(f"the {agent} agent dist", bundled)
 
 
 def agent_pull(agent: str = "claude", version: str | None = None,
@@ -6206,6 +6271,7 @@ def _editor_build_dist(cs_version: str) -> None:
     versions = load_versions()
     ext_specs: list[tuple[str, str]] = []   # (vsix filename, download url)
     ext_versions: dict[str, str] = {}
+    bundled = {_CODE_SERVER_VERSION_KEY: cs_version}   # pin key -> bundled value
     for e in _EDITOR_EXTENSIONS:
         ev = versions.get(e["version_key"])
         if not ev:
@@ -6215,6 +6281,7 @@ def _editor_build_dist(cs_version: str) -> None:
         ext_specs.append((_editor_ext_vsix_name(e),
                           _OPEN_VSX_VSIX_URL.format(ns=e["ns"], name=e["name"], ver=ev)))
         ext_versions[f"{e['ns']}.{e['name']}"] = ev
+        bundled[e["version_key"]] = ev
     sup_dir = SCRIPT_DIR / "container" / "supervisor"
     stub_src = sup_dir / "code-server-stub.py"
     deploy_src = sup_dir / "code-server-deploy.sh"
@@ -6293,6 +6360,7 @@ def _editor_build_dist(cs_version: str) -> None:
         {"code_server_version": cs_version, "extensions": ext_versions,
          "pulled_at": datetime.datetime.now(datetime.timezone.utc).isoformat()},
         indent=2) + "\n")
+    _warn_pins_below_base("the editor dist", bundled)
 
 
 def editor_pull(cs_version: str | None = None, progress=None) -> dict:
@@ -6563,6 +6631,8 @@ def _reader_build_dist(nbconvert_ver: str, markdown_ver: str) -> None:
          "python": py_abi,
          "pulled_at": datetime.datetime.now(datetime.timezone.utc).isoformat()},
         indent=2) + "\n")
+    _warn_pins_below_base("the reader dist", {_NBCONVERT_VERSION_KEY: nbconvert_ver,
+                                              _MARKDOWN_VERSION_KEY: markdown_ver})
 
 
 def reader_pull(nbconvert_ver: str | None = None, markdown_ver: str | None = None,
@@ -6785,6 +6855,7 @@ def _node_build_dist(node_ver: str) -> None:
         {"node_version": node_ver, "npm_version": npm_ver,
          "pulled_at": datetime.datetime.now(datetime.timezone.utc).isoformat()},
         indent=2) + "\n")
+    _warn_pins_below_base("the node seed", {_NODE_VERSION_KEY: node_ver})
 
 
 def node_pull(node_ver: str | None = None, progress=None) -> dict:
