@@ -5148,14 +5148,32 @@ _AGENT_ERR_TAIL = 2000
 # way to make the container posture independent of it. It is a DEFAULT, not a
 # lock: an operator flipping "Enable Remote Control for all sessions" in /config
 # or the IDE panel rewrites this same key at user scope. Resolver read out of the
-# pinned 2.1.258 dist and 2.1.263 (byte-equivalent logic). This is one of THREE
-# writers (setup.sh heredoc, the sandbox-box entrypoint printf) — pytest-pinned
-# as a lockstep.
+# pinned 2.1.258 dist and 2.1.263 (byte-equivalent logic).
+# `feedbackDrafts: "off"` removes Claude-drafted feedback: the SendFeedback tool,
+# with which the agent queues a feedback draft to Anthropic on its own
+# initiative for the user to review and send, plus its session notice and the
+# /feedback draft flow. An ABSENT key reads as "notify", and the tool then
+# appears whenever a REMOTELY SERVED rollout flag is on, so like Remote Control
+# it can switch on with no version change. The value is a string enum
+# ("notify"/"quiet"/"off"); a boolean fails the schema. It is a DEFAULT, not a
+# lock: the /config row "Claude-drafted feedback" (shown whenever the feature is
+# available to the logged-in account) rewrites this same user-scope key, so an
+# operator can turn it back on. The binary reads this key from policy, flag and
+# USER settings only, never project/local scope, so the project-scope writers
+# carry nothing (it would be inert there), and a cloned repo's own
+# .claude/settings.json cannot turn it back on. Headless `claude -p` sessions
+# (workers, role-MCPs) never have the tool (the binary excludes the sdk-*
+# entrypoints); the key matters for the interactive ones. Read out of the pinned
+# 2.1.258 dist. The hard-off CLAUDE_CODE_SEND_FEEDBACK=0 env switch is
+# deliberately NOT set: it also hides the /config row, leaving no way back.
+# This is one of THREE writers (setup.sh heredoc, the sandbox-box entrypoint
+# printf) — pytest-pinned as a lockstep.
 _AGENT_SETTINGS_JSON = json.dumps(
     {"permissions": {"defaultMode": "bypassPermissions"}, "theme": "dark",
      "env": {"CLAUDE_CODE_DISABLE_MOUSE_CLICKS": "1"},
      "attribution": {"commit": "", "pr": "", "sessionUrl": False},
-     "remoteControlAtStartup": False},
+     "remoteControlAtStartup": False,
+     "feedbackDrafts": "off"},
     indent=2) + "\n"
 _AGENT_INSTALL["claude"]["config"]["content"] = _AGENT_SETTINGS_JSON
 

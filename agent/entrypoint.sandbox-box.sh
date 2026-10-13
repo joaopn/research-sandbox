@@ -108,13 +108,14 @@ echo "${RS_SANDBOX_NAME}" > ~/.rs-role
 # attribution OFF (co-author trailer, PR footer, AND the private session link —
 # three keys) and `remoteControlAtStartup: false` keeps the Remote Control bridge
 # (/rc) OFF by default (an absent key falls to the rollout default, which
-# auto-starts it; rationale for both at rscore._AGENT_SETTINGS_JSON). This
+# auto-starts it), and `feedbackDrafts: "off"` keeps Claude-drafted feedback OFF
+# by default (rationale for all three at rscore._AGENT_SETTINGS_JSON). This
 # printf, that constant, and the supervisor setup.sh heredoc are a three-writer
 # mirror, pytest-pinned; keep the JSON on ONE line (the pin json-loads it off
 # this line).
 mkdir -p ~/.claude
 if [[ ! -f ~/.claude/settings.json ]]; then
-    printf '%s\n' '{"permissions": {"defaultMode": "bypassPermissions"}, "theme": "dark", "env": {"CLAUDE_CODE_DISABLE_MOUSE_CLICKS": "1"}, "attribution": {"commit": "", "pr": "", "sessionUrl": false}, "remoteControlAtStartup": false}' \
+    printf '%s\n' '{"permissions": {"defaultMode": "bypassPermissions"}, "theme": "dark", "env": {"CLAUDE_CODE_DISABLE_MOUSE_CLICKS": "1"}, "attribution": {"commit": "", "pr": "", "sessionUrl": false}, "remoteControlAtStartup": false, "feedbackDrafts": "off"}' \
         > ~/.claude/settings.json
 fi
 

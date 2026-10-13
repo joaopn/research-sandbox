@@ -4,7 +4,8 @@
 # attribution OFF (co-author trailer, PR footer, AND the private session link —
 # three keys, the session link is a separate switch) and the Remote Control
 # bridge (/rc) OFF by default (`remoteControlAtStartup: false` — an absent key
-# falls to the rollout default, which auto-starts it; rationale for both at
+# falls to the rollout default, which auto-starts it) and Claude-drafted feedback
+# OFF by default (`feedbackDrafts: "off"`; rationale for all three at
 # rscore._AGENT_SETTINGS_JSON). This heredoc, that constant, and the sandbox-box
 # entrypoint's printf fallback are a three-writer mirror, pytest-pinned; this
 # one alone adds the rs-audit-stop Stop hook. Credentials are NOT staged here —
@@ -34,6 +35,7 @@ if [[ ! -f ~/.claude/settings.json ]]; then
     "sessionUrl": false
   },
   "remoteControlAtStartup": false,
+  "feedbackDrafts": "off",
   "hooks": {
     "Stop": [
       {
