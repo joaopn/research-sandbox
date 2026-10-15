@@ -9256,29 +9256,36 @@ function appendExportedPortsSection(box, project) {
         for (const b of boxNames) boxSel.appendChild(el("option", { value: b }, [b]));
     }
 
+    // Rows are built first and swapped in at the end, so two overlapping loads
+    // (the initial one and a quick Add) can never interleave their rows.
     async function loadPorts() {
-        listWrap.innerHTML = "";
         let body;
         try {
             const res = await fetch(
                 `/broker/project/${encodeURIComponent(project.name)}/ports`);
             try { body = await res.json(); } catch (e) { body = {}; }
             if (!res.ok || !body.ok || !body.result) {
-                listWrap.appendChild(el("div", { class: "config-empty" },
+                listWrap.replaceChildren(el("div", { class: "config-empty" },
                     [mgmtErrText(body) || "Couldn't load ports."]));
                 return;
             }
         } catch (e) {
-            listWrap.appendChild(el("div", { class: "config-empty" },
+            listWrap.replaceChildren(el("div", { class: "config-empty" },
                 ["Couldn't load ports."]));
             return;
         }
         const ports = body.result.ports || [];
         if (ports.length === 0) {
-            listWrap.appendChild(el("div", { class: "config-empty" },
+            listWrap.replaceChildren(el("div", { class: "config-empty" },
                 ["No ports exported yet."]));
             return;
         }
+        // A web-page tab's own address, for an app that admits only its
+        // declared public URL. Read from the ALREADY-loaded services — never
+        // fetched here, so opening this box allocates nothing; a project whose
+        // tabs were never loaded simply shows no address yet.
+        const svcs = state.projectServices[project.name] || {};
+        const rows = [];
         for (const e of ports) {
             const isPt = !!e.passthrough;
             const rmKey = isPt ? e.host_port : e.port;
@@ -9298,11 +9305,19 @@ function appendExportedPortsSection(box, project) {
                 : (e.box
                     ? `${e.label} — box ${e.box}:${e.app_port}`
                     : `${e.port} — ${e.label}`);
-            listWrap.appendChild(el("div", { class: "config-box-row" }, [
+            // The address goes AFTER the ✕ as its own block line, so the label
+            // and ✕ keep their one-line layout and a row without one is unchanged.
+            const addr = isPt ? "" : ((svcs[`port-${e.port}`] || {}).origin_url || "");
+            rows.push(el("div", { class: "config-box-row" }, [
                 el("span", { class: "config-box-name" }, [text]),
                 rm,
+                ...(addr ? [el("span", {
+                    class: "config-port-addr",
+                    title: "This tab's address — give it to an app that asks for its public URL",
+                }, [addr.replace(/\/$/, "")])] : []),
             ]));
         }
+        listWrap.replaceChildren(...rows);
     }
 
     async function addPort() {
@@ -9327,8 +9342,10 @@ function appendExportedPortsSection(box, project) {
                 return;
             }
             portI.value = ""; labelI.value = "";
-            await loadPorts();
+            // Refresh first: it drops the cached services, so the list below
+            // can show the new tab's address once the project re-activates.
             await refreshAfterBoxChange(project.name);
+            await loadPorts();
         } finally {
             addBtn.disabled = false;
         }
@@ -9347,8 +9364,13 @@ function appendExportedPortsSection(box, project) {
                 alert("Couldn't remove port: " + (mgmtErrText(body) || res.status));
                 return;
             }
-            await loadPorts();
-            await refreshAfterBoxChange(project.name);
+            if (passthrough) {
+                await loadPorts();
+                await refreshAfterBoxChange(project.name);
+            } else {
+                await refreshAfterBoxChange(project.name);
+                await loadPorts();
+            }
         } catch (e) { /* best-effort */ }
     }
 

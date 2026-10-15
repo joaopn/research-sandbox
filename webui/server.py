@@ -2526,10 +2526,12 @@ def _filter_headers(headers, drop: frozenset[str]) -> "CIMultiDict[str]":
     return out
 
 
-async def _proxy_ws(request: web.Request,
-                    upstream_url: str) -> web.StreamResponse:
+async def _proxy_ws(request: web.Request, upstream_url: str,
+                    forward: dict[str, str] | None = None) -> web.StreamResponse:
     """WS pass-through. Opens upstream first so a failure returns a clean
-    502 to the browser instead of a bare close frame after handshake."""
+    502 to the browser instead of a bare close frame after handshake.
+    `forward` (exported-port tabs only — see origin_proxy_handler) is sent
+    as upstream headers; None leaves the call exactly as it always was."""
     client_subprotocols: list[str] = []
     sec_proto = request.headers.get("Sec-WebSocket-Protocol")
     if sec_proto:
@@ -2546,6 +2548,7 @@ async def _proxy_ws(request: web.Request,
                 protocols=client_subprotocols,
                 heartbeat=30,
                 max_msg_size=0,
+                **({"headers": forward} if forward else {}),
             )
         except Exception as e:
             await sess.close()
@@ -2597,11 +2600,15 @@ async def _proxy_ws(request: web.Request,
         await sess.close()
 
 
-async def _proxy_http(request: web.Request,
-                      upstream_url: str) -> web.StreamResponse:
+async def _proxy_http(request: web.Request, upstream_url: str,
+                      forward: dict[str, str] | None = None) -> web.StreamResponse:
     """HTTP pass-through. Streams body both directions; preserves status,
-    headers (minus hop-by-hop), and any Set-Cookie from upstream."""
+    headers (minus hop-by-hop), and any Set-Cookie from upstream.
+    `forward` (exported-port tabs only — see origin_proxy_handler) REPLACES
+    those request headers upstream; None keeps the request exactly as before."""
     headers_in = _filter_headers(request.headers, HOP_BY_HOP_HEADERS)
+    for k, v in (forward or {}).items():
+        headers_in[k] = v
 
     # Stream the body upstream rather than buffering — code-server's
     # editor saves (an .ipynb, a large prose file) need to flow through
@@ -2805,9 +2812,24 @@ async def origin_proxy_handler(request: web.Request) -> web.StreamResponse:
     if request.query_string:
         upstream_url += "?" + request.query_string
 
+    # An exported-port tab is the operator's own app, so it sees the address
+    # the browser actually used, the way a standard reverse proxy presents it:
+    # Host = <webui host>:<origin port>, and X-Forwarded-Proto = https (the
+    # origin ports only ever serve TLS). Apps that admit only their declared
+    # public URL (OpenKnowledge's --external-url) match on the Host, and build
+    # their own links and websocket URLs (wss://, not a mixed-content ws://)
+    # from the scheme. Every other lane (the gitea sentinel, code-server, the
+    # reader, box editors) keeps the URL-derived internal Host and has no
+    # forwarding header added — untouched.
+    browser_host = request.headers.get("Host")
+    forward = ({"Host": browser_host, "X-Forwarded-Proto": "https"}
+               if browser_host and project != GITEA_ORIGIN_KEY
+               and service_id.startswith(services.EXPORTED_PORT_ID_PREFIX)
+               else None)
+
     if is_ws:
-        return await _proxy_ws(request, upstream_url)
-    return await _proxy_http(request, upstream_url)
+        return await _proxy_ws(request, upstream_url, forward)
+    return await _proxy_http(request, upstream_url, forward)
 
 
 async def index_handler(request: web.Request) -> web.Response:

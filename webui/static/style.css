@@ -391,6 +391,15 @@ html.mobile .project-rail .rail-separator { cursor: default; }
     padding-top: 8px;
     border-top: 1px solid var(--border);
 }
+/* A web-page port's tab address (Ports section): one long unbroken URL in a
+   280px box, so it must wrap anywhere; user-select:all makes one click take it. */
+.project-config-box .config-port-addr {
+    display: block;
+    color: var(--fg-muted);
+    font-size: 11px;
+    overflow-wrap: anywhere;
+    user-select: all;
+}
 .project-config-box .config-hint {
     margin-top: 8px;
     color: var(--fg-faint);

@@ -6,7 +6,7 @@
   "substrate": "docker",
   "agents": ["claude"],
   "services": { "node": true },
-  "setup": "npm install -g @inkeep/open-knowledge",
+  "setup": "npm install -g @inkeep/open-knowledge@0.86.16",
   "description": "A markdown editor and knowledge base for LLM wikis, specs and notes — wired to your agent.",
-  "greeting": "OpenKnowledge — a markdown knowledge base for LLM wikis, specs and notes.\n\nThe `ok` CLI is installed and on your PATH (node is seeded in this box). Store\nworkflows auto-INSTALL but never auto-configure, so scaffold it yourself:\n\n  ok init          scaffold /workspace + wire up your AI editor (one time)\n  ok start --open  serve the web editor\n  claude           the agent (complete /login first — the box boots credential-less)\n"
+  "greeting": "OpenKnowledge — a markdown knowledge base for LLM wikis, specs and notes.\n\nThe `ok` CLI (0.86.16, pinned) is installed and on your PATH (node is seeded\nin this box). Store workflows auto-INSTALL but never auto-configure, so set it\nup yourself:\n\n  1. cd /workspace && ok init     scaffold the knowledge base + wire up claude\n  2. In the webui, open this project's ⚙ → Ports, add port 8080 as a Web page\n     (label it OpenKnowledge), and copy the address shown under it.\n  3. OK_ALLOW_EXTERNAL=1 ok start -p 8080 --no-open-browser \\\n        --idle-shutdown off --external-url <that address>\n     then open the OpenKnowledge tab. The editor only answers at that exact\n     address, so pass it verbatim. OK_ALLOW_EXTERNAL=1 lets it accept the\n     webui's proxied requests; the webui login is what guards the tab.\n  4. claude                        the agent (complete /login first — the box\n                                   boots credential-less)\n"
 }
