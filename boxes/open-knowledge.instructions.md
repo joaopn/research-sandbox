@@ -7,6 +7,7 @@ If `/workspace/.tools-inventory.md` exists, read it first — it lists the tools
 ## The knowledge base is `/workspace/notes`, and nothing else
 
 - Every note, page and source you write goes under `/workspace/notes`. Files elsewhere in `/workspace` (this file, `.claude/`, the MCP files, `.rs-greeting`) are the box's own housekeeping, not content — never write notes there and never move them into `notes/`.
+- Project folders the user gives this box appear **read-only** under `/mnt/<folder>` (`ls /mnt`). Read source material there and cite it; you cannot change it, and what you write from it goes into `/workspace/notes`.
 - OpenKnowledge registers its tools for Claude Code only; another agent works on the files in `notes/` directly. As Claude Code you were started in `/workspace/notes` so that those tools load. If they are missing, check that you are running in `/workspace/notes` (`pwd`) and that `/workspace/notes/.mcp.json` exists (the user runs `ok init` there once), and say so; do not work around it by writing files by hand into a knowledge base you cannot see through the tools.
 - Prefer OpenKnowledge's tools over raw file edits inside `notes/`: the user watches edits land in the editor, and the tools keep links and the project's own structure consistent. OpenKnowledge's own skill (`/workspace/notes/.claude/skills/open-knowledge/`) describes how it expects you to work.
 

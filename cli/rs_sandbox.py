@@ -29,6 +29,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -76,6 +77,13 @@ _NODE_SETUP_STEP = (
 # The box's greeting, printed by its terminal tab when it opens a session
 # (webui services.pi_isolated_service → greet-and-shell.sh <this path>).
 GREETING_FILE = ".rs-greeting"
+# Read-only folders: a top-level project folder ticked for a box is mounted
+# read-only at FOLDER_MOUNT_ROOT/<name>. MIRROR of rscore.BOX_FOLDER_NAME_RE
+# (pytest-pinned equal; this file cannot import rscore). Names reach the
+# runtime's --mount syntax, where "," and "=" carry meaning, so the charset is
+# closed; "." and ".." are refused separately (valid_folder_name).
+_FOLDER_NAME_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
+FOLDER_MOUNT_ROOT = "/mnt"
 BOX_IMAGE = "rs-sandbox-box:latest"
 # Browser variant: + @playwright/mcp + Chromium, wired into the box's claude.
 BOX_IMAGE_BROWSER = "rs-sandbox-box-browser:latest"
@@ -167,6 +175,12 @@ rs-sandbox — isolated boxes for running un-vetted code
                               --repo/--ref/--setup seed a byo box from a repo. A dev
                               box takes --repo <name> (an attached gitea repo) and
                               boots with the fork cloned + hardened.
+  rs-sandbox create … --folders=a,b
+                              mount top-level project folders read-only in the
+                              box at /mnt/<folder> (not on a dev box)
+  rs-sandbox folders <name> [--set=a,b]
+                              show or replace a box's read-only folders (a
+                              change restarts the box fresh; --set= clears)
   rs-sandbox list [--json]    show boxes (+ any baked extensions) and their state
   rs-sandbox stop <name>      stop a box (keeps its workspace; start to resume)
   rs-sandbox start <name>     (re)start a stopped box from its saved entry
@@ -437,6 +451,77 @@ def _compose_setup(preset_setup: str, node: bool) -> str:
     return _NODE_SETUP_STEP + ("\n" + preset_setup if preset_setup else "")
 
 
+def valid_folder_name(name: object) -> bool:
+    return (isinstance(name, str) and bool(_FOLDER_NAME_RE.match(name))
+            and name not in (".", ".."))
+
+
+def _parse_folders(raw: str | None) -> list[str]:
+    """A --folders/--set list → sorted unique names, dying on a bad name before
+    any state write. Sorted so a reordered request compares equal to the record."""
+    names = _parse_csv(raw)
+    for n in names:
+        if not valid_folder_name(n):
+            die(f"invalid folder name {n[:64]!r} (letters, digits, '.', '_' "
+                f"or '-' only)")
+    return sorted(set(names))
+
+
+def _entry_folders(entry: dict) -> list[str]:
+    """The folder names a box's record carries (never for a dev box: dev boxes
+    take no folders, so a tampered dev entry mounts nothing)."""
+    if entry.get("dev"):
+        return []
+    raw = entry.get("folders")
+    return [f for f in raw if isinstance(f, str)] if isinstance(raw, list) else []
+
+
+def _folder_mounts(folders: list[str]) -> tuple[list[str], list[str], list[dict]]:
+    """Check each ticked folder NOW and build its read-only mount: (argv, the
+    names kept, warnings). A name that is not a real top-level folder at this
+    moment — gone, a link, a file, unreadable, or a name the pattern refuses —
+    is skipped with a structured warning ({folder, reason}; the folder omitted
+    for a bad name) and never reaches the runtime. lstat, never stat: a link is
+    refused, not followed (its target resolves differently on the host). The
+    mount is --mount, not -v: a source deleted after this check fails the run
+    instead of being re-created empty and root-owned."""
+    argv: list[str] = []
+    kept: list[str] = []
+    warnings: list[dict] = []
+    for name in folders:
+        if not valid_folder_name(name):
+            warnings.append({"reason": "bad-name"})
+            continue
+        src = WORKSPACE / name
+        try:
+            st = os.lstat(src)
+        except FileNotFoundError:
+            warnings.append({"folder": name, "reason": "missing"})
+            continue
+        except OSError:
+            warnings.append({"folder": name, "reason": "unreadable"})
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            warnings.append({"folder": name, "reason": "link"})
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            warnings.append({"folder": name, "reason": "not-a-folder"})
+            continue
+        argv += ["--mount", f"type=bind,source={src},"
+                            f"target={FOLDER_MOUNT_ROOT}/{name},readonly"]
+        kept.append(name)
+    return argv, kept, warnings
+
+
+def _warning_text(name: str, w: dict) -> str:
+    """Human line for one folder warning (the in-box CLI's stderr only; the
+    host builds its own wording from the structured form)."""
+    folder = w.get("folder")
+    what = f"folder {folder!r}" if folder else "a folder with an invalid name"
+    return (f"warning: box {name!r} starts without read-only {what} "
+            f"({w.get('reason')})")
+
+
 def _write_mcp_preset(ws: Path, preset: dict) -> None:
     """Write /workspace/.mcp-preset.json — source-3 of the entrypoint's
     wholesale .mcp.json regen — from the preset's declared mcp_servers;
@@ -652,7 +737,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
              dev: dict | None = None, dev_subnet: str = "", branch: str = "",
              loopback_ports: list[dict] | None = None,
              model: str = "", effort: str = "", fetch: bool = False,
-             node: bool = False) -> None:
+             node: bool = False, folders: list[str] | None = None) -> list[dict]:
     """docker run a box in the local inner dockerd. ``browser`` selects the
     Chromium-equipped image; ``agent`` (any staged agent|none): any agent mounts
     the project's MERGED copy-source and exports RS_BOX_AGENT=claude (the baked
@@ -664,7 +749,10 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     agent env this box's claude reads (a box tab runs a login shell, not the
     agent, so there is no argv to inject — it must ride the environment). The
     workspace dir is pre-staged + uid-1000-owned (see _stage_box_workspace) so
-    dockerd's auto-create on -v doesn't land it root-owned."""
+    dockerd's auto-create on -v doesn't land it root-owned. ``folders`` → one
+    read-only /mnt/<name> mount per folder that passes its check now; returns
+    the structured warnings for the ones skipped (data only — never printed
+    here: a failed op relays this command's stderr verbatim)."""
     sub = f"pi-isolated/{name}"
     (WORKSPACE / sub).mkdir(parents=True, exist_ok=True)
     cname = box_container(name)
@@ -708,6 +796,11 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
                   f"runtime is not staged in this project; its setup cannot "
                   f"finish until the project is restarted with node pulled",
                   file=sys.stderr)
+    # Read-only folders, re-checked at every run (skip + warn). Never for a dev
+    # box (it takes none). Empty for a box without folders, so its argv is
+    # byte-identical to a folder-less run.
+    folder_mounts, _kept, folder_warnings = (
+        _folder_mounts(folders) if (folders and not dev) else ([], [], []))
     # Publish the box's code-server stub (8443) onto the supervisor netns at
     # editor_port so the webui can reach it at rs-project-<proj>:<editor_port>.
     editor_publish = (["-p", f"{editor_port}:8443"]
@@ -784,6 +877,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         *agent_mount,
         *editor_mount,
         *node_mount,
+        *folder_mounts,
         *editor_publish,
         *loopback_publish,
         "-e", f"RS_SERVICE_CODE_SERVER={'enabled' if editor else 'disabled'}",
@@ -842,6 +936,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         _install_repo_watch(cname)
     # F3 Slice 2b: launch the in-box loopback forwarders for the freshly-run box.
     _launch_box_forwarders(cname, lp_list)
+    return folder_warnings
 
 
 def _launch_box_forwarders(cname: str, loopback_ports: list[dict]) -> None:
@@ -860,7 +955,7 @@ def _launch_box_forwarders(cname: str, loopback_ports: list[dict]) -> None:
                   file=sys.stderr)
 
 
-def _rerun_box(name: str, entry: dict) -> None:
+def _rerun_box(name: str, entry: dict) -> list[dict]:
     """Re-run a box from its saved entry (restart/start after a recreate). Re-
     renders the proxy MCP source (allowlist may have changed) non-strictly, then
     re-runs from the stored axes. CLAUDE.md persists on the volume (no-clobber).
@@ -886,7 +981,7 @@ def _rerun_box(name: str, entry: dict) -> None:
               f"resolvable; keeping the box's existing .mcp-preset.json",
               file=sys.stderr)
     is_dev = bool(entry.get("dev"))
-    _run_box(name, entry["ip"], browser=bool(entry.get("browser")),
+    return _run_box(name, entry["ip"], browser=bool(entry.get("browser")),
              agent=entry.get("agent", "none"), editor=bool(entry.get("editor")),
              editor_port=int(entry.get("editor_port") or 0),
              clone_repo=(entry.get("repo") or "") if not is_dev else "",
@@ -916,7 +1011,9 @@ def _rerun_box(name: str, entry: dict) -> None:
              # from the stored entry on every re-run.
              fetch=bool(entry.get("fetch")),
              # From the STORED entry: the node step is composed at each run.
-             node=bool(entry.get("node")))
+             node=bool(entry.get("node")),
+             # Every recorded name, re-checked at this run (skip + warn).
+             folders=_entry_folders(entry))
 
 
 def _box_entry(entries: dict[str, dict], name: str) -> dict:
@@ -951,6 +1048,9 @@ def cmd_create(args: argparse.Namespace) -> None:
     ref, setup = (args.ref or "").strip(), (args.setup or "").strip()
     branch = (args.branch or "").strip()
     mcps = _parse_csv(args.mcps)
+    # Read-only folders: the shape is refused here, before any state write; the
+    # real-folder check runs at every box run (skip + warn), this one included.
+    folders = _parse_folders(args.folders)
     if branch and not is_dev:
         die("--branch is only valid for a dev box; a byo box pins its clone "
             "with --ref (which also accepts a tag or commit)")
@@ -968,6 +1068,8 @@ def cmd_create(args: argparse.Namespace) -> None:
         if args.fetch:
             die("--fetch is not valid for a dev box (it works its own fork; "
                 "the read-only fetch surface is for non-dev boxes)")
+        if folders:
+            die("a dev box does not take read-only folders")
         # Two-gate lockstep with box_add: base-image only (the catalog forces
         # dev presets to image:'base'). Only an explicit --browser dies;
         # --no-browser/absent resolve to base below anyway.
@@ -1112,6 +1214,10 @@ def cmd_create(args: argparse.Namespace) -> None:
         # halves on every restart/recreate (docker run wiring is fixed at run),
         # and so the host-side reconciles can find this box.
         entry["fetch"] = True
+    if folders:
+        # Every ticked name is kept (sorted): each run re-checks each one, so a
+        # folder that is gone now and comes back is mounted again at a restart.
+        entry["folders"] = folders
     if is_clone:
         entry.update({"repo": repo, "ref": ref, "setup": setup})
     if is_dev:
@@ -1120,14 +1226,17 @@ def cmd_create(args: argparse.Namespace) -> None:
                       "gitea_user": args.gitea_user.strip()})
     entries[name] = entry
     save(entries)
-    _run_box(name, ip, browser=browser, agent=agent, editor=editor,
-             editor_port=editor_port, clone_repo=repo if is_clone else "",
-             clone_ref=ref, clone_setup=setup, preset_setup=preset_setup,
-             dev=dev_info, dev_subnet=dev_subnet, branch=branch,
-             model=model, effort=effort, fetch=fetch, node=node)
+    warnings = _run_box(name, ip, browser=browser, agent=agent, editor=editor,
+                        editor_port=editor_port,
+                        clone_repo=repo if is_clone else "",
+                        clone_ref=ref, clone_setup=setup,
+                        preset_setup=preset_setup, dev=dev_info,
+                        dev_subnet=dev_subnet, branch=branch, model=model,
+                        effort=effort, fetch=fetch, node=node, folders=folders)
     print(json.dumps({"name": name, "ip": ip, "preset": args.preset,
                       "browser": browser, "agent": agent, "editor": editor,
                       "editor_port": editor_port or None, "fetch": fetch,
+                      "folders": folders, "warnings": warnings,
                       "container": box_container(name)}, indent=2))
 
 
@@ -1139,8 +1248,11 @@ def cmd_restart(args: argparse.Namespace) -> None:
     recreate-loop caller's clarity."""
     _require_dind_project()
     entry = _box_entry(load(), args.name)
-    _rerun_box(args.name, entry)
-    print(f"box {args.name!r}: restarted at {entry['ip']}")
+    warnings = _rerun_box(args.name, entry)
+    # JSON: the host relaunch loop reads the folder warnings from it (its two
+    # callers otherwise check only the exit status).
+    print(json.dumps({"name": args.name, "ip": entry["ip"],
+                      "warnings": warnings}))
 
 
 def cmd_expose(args: argparse.Namespace) -> None:
@@ -1155,15 +1267,17 @@ def cmd_expose(args: argparse.Namespace) -> None:
     lp_list = entry.get("loopback_ports") or []
     for lp in lp_list:
         if isinstance(lp, dict) and lp.get("app_port") == app_port:
-            print(json.dumps({"pub_super": lp["pub_super"], "app_port": app_port}))
+            print(json.dumps({"pub_super": lp["pub_super"], "app_port": app_port,
+                              "warnings": []}))
             return
     pub = allocate_loopback_pub(entries)
     lp_list.append({"app_port": app_port, "pub_super": pub})
     entry["loopback_ports"] = lp_list
     entries[args.name] = entry
     save(entries)
-    _rerun_box(args.name, entry)
-    print(json.dumps({"pub_super": pub, "app_port": app_port}))
+    warnings = _rerun_box(args.name, entry)
+    print(json.dumps({"pub_super": pub, "app_port": app_port,
+                      "warnings": warnings}))
 
 
 def cmd_unexpose(args: argparse.Namespace) -> None:
@@ -1178,13 +1292,15 @@ def cmd_unexpose(args: argparse.Namespace) -> None:
                if not (isinstance(lp, dict) and lp.get("app_port") == args.app_port)]
     if len(lp_list) == len(old):
         # Nothing was exposed on this app_port — a true no-op, don't restart the box.
-        print(json.dumps({"ok": True, "app_port": args.app_port, "changed": False}))
+        print(json.dumps({"ok": True, "app_port": args.app_port, "changed": False,
+                          "warnings": []}))
         return
     entry["loopback_ports"] = lp_list
     entries[args.name] = entry
     save(entries)
-    _rerun_box(args.name, entry)
-    print(json.dumps({"ok": True, "app_port": args.app_port, "changed": True}))
+    warnings = _rerun_box(args.name, entry)
+    print(json.dumps({"ok": True, "app_port": args.app_port, "changed": True,
+                      "warnings": warnings}))
 
 
 def cmd_stop(args: argparse.Namespace) -> None:
@@ -1226,10 +1342,24 @@ def cmd_start(args: argparse.Namespace) -> None:
             ins = _docker("inspect", "-f", "{{json .HostConfig.ExtraHosts}}", cname)
             # Quoted JSON form — a bare substring would false-match a prefix ip.
             if f"\"rs-gitea:{gitea_ip}\"" not in (ins.stdout or ""):
-                _rerun_box(args.name, entry)
+                _print_warnings(args.name, _rerun_box(args.name, entry))
                 print(f"box {args.name!r}: re-run at {entry['ip']} "
                       f"(gitea address changed while parked)")
                 return
+    # Read-only folders are re-checked at every start: a parked box whose folder
+    # mounts no longer match what the check keeps now (a folder gone, now a
+    # link, or back again) is re-run — its mounts are fixed at docker run.
+    folders = _entry_folders(entry)
+    if exists and folders:
+        _argv, kept, skipped = _folder_mounts(folders)
+        want = {f"{FOLDER_MOUNT_ROOT}/{n}" for n in kept}
+        if _container_folder_mounts(cname) != want:
+            _print_warnings(args.name, _rerun_box(args.name, entry))
+            print(f"box {args.name!r}: re-run at {entry['ip']} "
+                  f"(its read-only folders changed while parked)")
+            return
+        # Mounts already match; still say which ticked folders it lacks.
+        _print_warnings(args.name, skipped)
     if exists:
         r = _docker("start", cname)
         if r.returncode != 0:
@@ -1240,8 +1370,77 @@ def cmd_start(args: argparse.Namespace) -> None:
         # _rerun_box branches above/below relaunch via _run_box.
         _launch_box_forwarders(cname, entry.get("loopback_ports") or [])
     else:
-        _rerun_box(args.name, entry)
+        _print_warnings(args.name, _rerun_box(args.name, entry))
     print(f"box {args.name!r}: started at {entry['ip']}")
+
+
+def _print_warnings(name: str, warnings: list[dict]) -> None:
+    for w in warnings:
+        print(_warning_text(name, w), file=sys.stderr)
+
+
+def _container_folder_mounts(cname: str) -> set[str] | None:
+    """The read-only folder mounts an existing box container carries: the
+    destinations of its bind mounts under FOLDER_MOUNT_ROOT. None — which never
+    equals a wanted set, so the caller re-runs — when the container cannot be
+    read or carries a folder mount that is not a read-only bind."""
+    r = _docker("container", "inspect", "-f", "{{json .Mounts}}", cname)
+    if r.returncode != 0:
+        return None
+    try:
+        mounts = json.loads(r.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(mounts, list):
+        return None
+    out: set[str] = set()
+    for m in mounts:
+        if not isinstance(m, dict):
+            return None
+        dest = m.get("Destination")
+        if isinstance(dest, str) and dest.startswith(FOLDER_MOUNT_ROOT + "/"):
+            if m.get("Type") != "bind" or m.get("RW") is not False:
+                return None
+            out.add(dest)
+    return out
+
+
+def cmd_folders(args: argparse.Namespace) -> None:
+    """Show (no --set) or replace (--set=a,b; --set= clears) a box's read-only
+    folders. A change is saved and the box re-run (its mounts are fixed at
+    docker run); an unchanged set on a running box does nothing, while a box
+    whose container is not running is re-run (the recovery for a box a daemon
+    restart left down on a deleted folder). Text reaching the browser names no
+    command (the host relays a failure verbatim)."""
+    _require_dind_project()
+    if not _NAME_RE.match(args.name):
+        die("invalid box name")
+    entries = load()
+    entry = entries.get(args.name)
+    if not isinstance(entry, dict) or entry.get("kind") != KIND:
+        die(f"no box named {args.name!r} in this project")
+    if args.set is None:
+        print(json.dumps({"name": args.name, "folders": _entry_folders(entry)}))
+        return
+    if entry.get("dev"):
+        die("a dev box does not take read-only folders")
+    new = _parse_folders(args.set)
+    old = sorted(set(_entry_folders(entry)))
+    running = _docker("container", "inspect", "-f", "{{.State.Running}}",
+                      box_container(args.name)).stdout.strip() == "true"
+    if new == old and running:
+        print(json.dumps({"name": args.name, "folders": new, "changed": False,
+                          "warnings": []}))
+        return
+    if new:
+        entry["folders"] = new
+    else:
+        entry.pop("folders", None)
+    entries[args.name] = entry
+    save(entries)
+    warnings = _rerun_box(args.name, entry)
+    print(json.dumps({"name": args.name, "folders": new, "changed": True,
+                      "warnings": warnings}))
 
 
 def cmd_discard(args: argparse.Namespace) -> None:
@@ -1285,6 +1484,7 @@ def cmd_list(args: argparse.Namespace) -> None:
         agent = e.get("agent", "none") if e.get("kind") == KIND else None
         rows.append({"name": name, "kind": e.get("kind"), "ip": e.get("ip"),
                      "browser": bool(e.get("browser")), "agent": agent,
+                     "dev": bool(e.get("dev")), "folders": _entry_folders(e),
                      "state": states.get(cname, "absent")})
     if args.json:
         print(json.dumps(rows, indent=2))
@@ -1353,7 +1553,19 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--gitea-user", default="", dest="gitea_user",
                    help="(dev preset) the box's gitea consumer username, minted "
                         "host-side by box add (per-consumer forks)")
+    c.add_argument("--folders", default="",
+                   help="comma-separated top-level project folders to mount "
+                        "read-only at /mnt/<folder> (pass as --folders=a,b; "
+                        "rejected on a dev preset)")
     c.set_defaults(func=cmd_create)
+
+    fo = sub.add_parser("folders",
+                        help="show or replace a box's read-only folders")
+    fo.add_argument("name")
+    fo.add_argument("--set", default=None,
+                    help="the new comma-separated folder list (--set=a,b; "
+                         "--set= clears); restarts the box fresh when it changes")
+    fo.set_defaults(func=cmd_folders)
 
     lst = sub.add_parser("list", help="list sandboxes (boxes + baked)")
     lst.add_argument("--json", action="store_true")

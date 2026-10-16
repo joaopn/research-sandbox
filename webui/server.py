@@ -1003,7 +1003,10 @@ async def broker_box_add_handler(request: web.Request) -> web.Response:
             "fetch": bool(body.get("fetch")), "mcps": body.get("mcps"),
             "repo": body.get("repo"), "ref": body.get("ref"),
             "setup": body.get("setup"), "branch": body.get("branch"),
-            "model": body.get("model"), "effort": body.get("effort")}
+            "model": body.get("model"), "effort": body.get("effort"),
+            # Read-only folders (a list of top-level folder names) — raw; the
+            # broker request validates the shape, box_add the folders.
+            "folders": body.get("folders")}
     return await _start_op(request, "box_add", args, BROKER_OP_TIMEOUT_S,
                            op_seed=project)
 
@@ -1029,6 +1032,27 @@ async def broker_box_remove_handler(request: web.Request) -> web.Response:
         args["keep_workspace"] = bool(req_body.get("keep_workspace"))
     return await _start_op(request, "box_remove", args, BROKER_OP_TIMEOUT_S,
                            op_seed=project)
+
+
+async def broker_box_folders_handler(request: web.Request) -> web.Response:
+    """POST /broker/project/{name}/box-folders {name, folders} — replace a box's
+    read-only folders (gated, origin-checked). Synchronous relay like a box port
+    add: the broker re-runs the one box and answers once it runs again. The
+    broker's BOX_FOLDERS_WEBUI_FIELDS is the input boundary; this dict is the
+    hand-picked second filter in front of it (keep the two in lockstep)."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    project = request.match_info.get("name", "")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    args = {"project": project, "name": body.get("name"),
+            "folders": body.get("folders")}
+    status, reply = await _relay(request, "box_folders", args)
+    return web.json_response(reply, status=status)
 
 
 async def broker_boxes_handler(request: web.Request) -> web.Response:
@@ -2990,6 +3014,9 @@ def main() -> None:
     app.router.add_get("/broker/project/{name}/boxes", broker_boxes_handler)
     app.router.add_get(
         "/broker/project/{name}/box-presets", broker_box_presets_handler)
+    # Box folders change — a fixed segment, so it too precedes {action}.
+    app.router.add_post(
+        "/broker/project/{name}/box-folders", broker_box_folders_handler)
     # Dev-box provision (webui-first B) — a fixed segment that MUST precede the
     # {action} catch-all below (first-match-wins, else "dev-box" is swallowed
     # as an action).

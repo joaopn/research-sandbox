@@ -37,6 +37,7 @@ Worker names are **project-permanent** once used, including after `rs-worker des
 ## Filesystem conventions
 
 - `/workspace/shared/data/<name>/` — project input data, read-only. Each subdir is one host path the PI passed via `--data` at project create (basename → subdir). The parent `/workspace/shared/data/` itself is just the namespace; the actual data lives one level down. Never write here.
+- `/workspace/shared/` — what workers read, and what the PI may give a box read-only (a box sees a given folder at `/mnt/<folder>`). Put there what should be shared. A relative link between two folders a box was given resolves inside the box; an absolute link (`/workspace/...`), or one into a folder the box was not given, shows as broken there.
 - `/workspace/plan/draft/<name>.md` — proposal you wrote, **not yet PI-approved**. The only place you ever write a worker's plan. Auto-removed by `rs-worker spawn` once the plan has been promoted to canonical.
 - `/workspace/plan/<name>.md` — canonical plan for live or down workers, reflecting what the worker is currently doing. **Written only by `rs-worker spawn`** (from the file you pass to `--plan`). Never edit by hand: rewriting this file before approval destroys the prior canonical plan with no undo. Archived to `plan/archive/<name>.md` only on `rs-worker destroy`.
 - `/workspace/.workers/<name>.json` — registry entry. Read-only for you. See *Worker registry schema* below.

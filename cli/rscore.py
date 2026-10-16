@@ -49,6 +49,7 @@ import secrets
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import io
@@ -153,6 +154,167 @@ _PROJECT_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]*\Z")
 # python), so the box_* verbs re-declare the validation here; keep both in
 # agreement. The agent enum twin (_BOX_AGENTS) sits below KNOWN_AGENTS.
 _BOX_NAME_RE = re.compile(r"\A[a-z][a-z0-9-]*\Z")
+
+# Read-only folders for boxes (OK_BOX slice 2): a top-level project folder
+# mounted read-only in a box at /mnt/<name>. LOCKSTEP COPY of
+# rs_sandbox._FOLDER_NAME_RE (pytest-pinned equal). The names reach the box
+# runtime's --mount syntax, where "," and "=" carry meaning — hence the closed
+# charset; "." and ".." are refused separately (_valid_box_folder).
+BOX_FOLDER_NAME_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
+# Structured box-tool warning reasons → the operator-facing wording. A closed
+# table: an unknown reason gets a generic line, never the tool's own text.
+_BOX_FOLDER_REASONS = {
+    "missing": "it no longer exists",
+    "link": "it is a link now",
+    "not-a-folder": "it is no longer a folder",
+    "unreadable": "it could not be read",
+}
+
+
+def _valid_box_folder(name: object) -> bool:
+    return (isinstance(name, str) and bool(BOX_FOLDER_NAME_RE.match(name))
+            and name not in (".", ".."))
+
+
+def _coerce_box_folders(raw: Any) -> tuple[str, ...]:
+    """A request's folder list → sorted unique names (sorted so a reordered
+    request compares equal to a box's record). Refusals echo at most a
+    truncated form of a bad name."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, (list, tuple)):
+        raise ValidationError("folders must be a list of folder names")
+    for n in raw:
+        if not _valid_box_folder(n):
+            shown = (n[:64] if isinstance(n, str) else type(n).__name__)
+            raise ValidationError(
+                f"invalid folder name {shown!r} (letters, digits, '.', '_' or "
+                f"'-' only)")
+    return tuple(sorted(set(raw)))
+
+
+def _box_folder_choices(workspace_path: "Path") -> list[dict]:
+    """The project's top-level folders a box may be given read-only: plain
+    names first, hidden ones after, each {name, usable, reason}. Links and plain
+    files are never listed (a link's target resolves differently on the host and
+    in the project container); a folder whose name a mount cannot carry is
+    listed unusable with the reason. An entry that cannot be read is skipped."""
+    try:
+        with os.scandir(workspace_path) as it:
+            entries = list(it)
+    except OSError:
+        raise ValidationError("could not read this project's folders")
+    plain: list[dict] = []
+    hidden: list[dict] = []
+    for e in entries:
+        try:
+            if not e.is_dir(follow_symlinks=False):
+                continue
+        except OSError:
+            continue
+        ok = _valid_box_folder(e.name)
+        row = {"name": e.name, "usable": ok,
+               "reason": "" if ok else
+               "its name has characters a folder mount cannot carry"}
+        (hidden if e.name.startswith(".") else plain).append(row)
+    by_name = lambda r: r["name"]  # noqa: E731
+    return sorted(plain, key=by_name) + sorted(hidden, key=by_name)
+
+
+def _box_folder_choices_or_note(workspace_path: "Path") -> "tuple[list, str]":
+    """The two READS degrade: a listing that fails yields no choices plus a
+    note, so the box window still opens (a box without folders can always be
+    added) — only the folders change refuses on it."""
+    try:
+        return _box_folder_choices(workspace_path), ""
+    except ValidationError as e:
+        return [], str(e)
+
+
+def _check_box_folders(workspace_path: "Path", names: "Sequence[str]") -> None:
+    """Refuse a name that is not a real top-level folder right now (the host
+    half of the check; the box tool re-checks at every box run). lstat only —
+    nothing is opened or followed. Wording names only the validated folder,
+    never the error text (it carries the host path)."""
+    for n in names:
+        try:
+            st = os.lstat(workspace_path / n)
+        except FileNotFoundError:
+            raise ValidationError(f"{n!r} is not a folder of this project")
+        except OSError:
+            raise ValidationError(f"folder {n!r} could not be read")
+        if stat.S_ISLNK(st.st_mode):
+            raise ValidationError(
+                f"{n!r} is a link; a box can only be given real folders")
+        if not stat.S_ISDIR(st.st_mode):
+            raise ValidationError(f"{n!r} is not a folder")
+
+
+def _box_folder_warnings(raw: Any, box: Any) -> list[str]:
+    """The box tool's structured folder warnings → operator lines, built here
+    from a re-validated box name and folder name (the tool's own text never
+    reaches a view log or the browser). Tolerant: anything malformed — or an
+    older box tool that prints no warnings — reads as none."""
+    if not isinstance(raw, list):
+        return []
+    who = f"box {box!r}" if (isinstance(box, str) and _BOX_NAME_RE.match(box)) \
+        else "a box"
+    out: list[str] = []
+    for w in raw:
+        if not isinstance(w, dict):
+            continue
+        folder = w.get("folder")
+        reason = w.get("reason")
+        why = (_BOX_FOLDER_REASONS.get(reason) if isinstance(reason, str)
+               else None) or "it could not be given to the box"
+        if _valid_box_folder(folder):
+            out.append(f"{who} started without read-only folder {folder!r}: "
+                       f"{why}")
+        else:
+            out.append(f"{who} started without one of its read-only folders: "
+                       f"its name is not valid")
+    return out
+
+
+def _report_box_restart_warnings(name: str, stdout: Any, progress) -> None:
+    """The folders a re-run box started without (the supervisor-recreate box
+    relaunch loop): stderr for the CLI, a `warning` progress line for the
+    webui's start/update list (`progress` is None from the CLI). Tolerant —
+    the relaunch loop must never fail a start."""
+    for line in _box_folder_warnings(
+            _parse_box_tool_json(stdout).get("warnings"), name):
+        print(f"warning: {line}", file=sys.stderr)
+        if progress is not None:
+            progress.step("warning", line)
+
+
+def _parse_box_tool_json(stdout: Any) -> dict:
+    """Tolerant parse of a box-tool reply whose operation already happened:
+    anything but a JSON object reads as {} (an older box tool prints text)."""
+    try:
+        data = json.loads(stdout or "")
+    except (ValueError, TypeError, RecursionError):
+        # ValueError covers JSONDecodeError and the int-digit limit; the
+        # output comes from a tool the project container controls.
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+# The box tool's parser answers an option or command it does not know with exit
+# status 2 and its usage text — which names commands, so it must never reach the
+# browser. A project not restarted since read-only folders shipped still runs the
+# older tool; this is the fixed text shown instead.
+_OLD_BOX_TOOL_MSG = ("this project's box tool predates read-only folders — "
+                     "restart the project, then retry")
+
+
+def _is_old_box_tool(r: "subprocess.CompletedProcess") -> bool:
+    """The older tool's parser refusing exactly the folder option or command
+    (never some other option a current tool rejects)."""
+    err = (r.stderr or "") + (r.stdout or "")
+    return r.returncode == 2 and (
+        ("unrecognized arguments" in err and ("--folders" in err or "--set" in err))
+        or ("invalid choice" in err and "'folders'" in err))
 
 
 def valid_project_name(name: str) -> bool:
@@ -1373,6 +1535,10 @@ class BoxAddRequest:
     # run). REJECTED on a dev preset — the agent's own box must not hold the
     # read-all-forks operator token; gated in box_add, which has the catalog.
     fetch: bool = False
+    # Top-level project folders mounted read-only in the box at /mnt/<name>
+    # (sorted, unique). Shape here; the real-folder check is in box_add (host)
+    # and at every box run (the box tool). Rejected on a dev preset.
+    folders: tuple[str, ...] = ()
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "BoxAddRequest":
@@ -1475,7 +1641,29 @@ class BoxAddRequest:
             mcps=tuple(mcps), repo=(kw.get("repo") or "").strip(),
             ref=(kw.get("ref") or "").strip(), setup=(kw.get("setup") or ""),
             branch=branch, model=_model, effort=_effort,
-            fetch=bool(kw.get("fetch", False)))
+            fetch=bool(kw.get("fetch", False)),
+            folders=_coerce_box_folders(kw.get("folders")))
+
+
+@dataclass(frozen=True)
+class BoxFoldersRequest:
+    """Replace a box's read-only folders (the project's ⚙ panel). ``folders`` is
+    the whole new set (empty clears); a change restarts the box fresh."""
+    project: str
+    name: str
+    folders: tuple[str, ...] = ()
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "BoxFoldersRequest":
+        name = kw.get("name")
+        if not (isinstance(name, str) and _BOX_NAME_RE.match(name)):
+            raise ValidationError(
+                "box name must be lowercase, start with a letter, and contain "
+                "only letters, digits, or '-'")
+        if not isinstance(kw.get("folders"), (list, tuple)):
+            raise ValidationError("folders must be a list of folder names")
+        return cls(project=_require_name(kw.get("project")), name=name,
+                   folders=_coerce_box_folders(kw.get("folders")))
 
 
 @dataclass(frozen=True)
@@ -2715,6 +2903,17 @@ class BoxAddResult:
     editor: bool
     container: str
     fetch: bool = False
+    folders: list = field(default_factory=list)     # as requested (validated)
+    warnings: list = field(default_factory=list)    # host-built folder lines
+
+
+@dataclass
+class BoxFoldersResult:
+    project: str
+    name: str
+    folders: list                                   # as requested (validated)
+    changed: bool
+    warnings: list = field(default_factory=list)
 
 
 @dataclass
@@ -2728,7 +2927,11 @@ class BoxListResult:
     """The project's sandbox boxes with live container state. No credentials in
     any row — safe to serialise straight into the broker reply."""
     project: str
-    boxes: list[dict]                       # {name, ip, agent, browser, state}
+    boxes: list[dict]                       # {name, ip, agent, browser, state, dev, folders}
+    # The project's top-level folders a box may be given (the box-types read
+    # carries the same list): the ⚙ Box folders section reads both from here.
+    folder_choices: list = field(default_factory=list)
+    folder_choices_error: str = ""          # set when the listing failed
 
 
 @dataclass
@@ -2739,6 +2942,10 @@ class BoxPresetsResult:
     project: str
     presets: list[dict]                     # {name,image,agent_default,clone,editor_default,repo,description,source,dev}
     allowed_mcps: list[str]
+    # The project's top-level folders ({name, usable, reason}) — the box
+    # window's Read-only folders group.
+    folders: list = field(default_factory=list)
+    folders_error: str = ""                 # set when the listing failed
 
 
 @dataclass
@@ -2749,6 +2956,7 @@ class PortAddResult:
     ports: list[dict]                       # full entry list after the add ({port,label}
                                             # + optional box/app_port or
                                             # passthrough/host_port/count fields)
+    warnings: list = field(default_factory=list)    # box arm: folder lines
 
 
 @dataclass
@@ -2756,6 +2964,7 @@ class PortRemoveResult:
     project: str
     port: int
     ports: list[dict]
+    warnings: list = field(default_factory=list)    # box arm: folder lines
 
 
 @dataclass
@@ -3454,7 +3663,7 @@ def start(req: StartStopRequest, cfg: "Config" | None = None,
             _start_docker_substrate(c["project"], cfg)
         else:
             progress.step("recreate", "recreating supervisor")
-            _recreate_supervisor(c["project"], cfg)
+            _recreate_supervisor(c["project"], cfg, progress=progress)
         results.append(ActionResult(c["name"], c["project"], "start", "ok"))
     return results
 
@@ -3730,6 +3939,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         force_restage=req.rebuild,
         post_create_hook=hook,
         service_flags=flags_override,
+        progress=progress,
     )
 
     # The recreate wrote authoritative service labels, so a live-toggle override for
@@ -7596,6 +7806,7 @@ def _recreate_supervisor(
     force_restage: bool = False,
     post_create_hook=None,
     service_flags: dict[str, bool] | None = None,
+    progress=None,
 ) -> None:
     """Stash creds → stop+rm → create new container from SUPERVISOR_IMAGE
     → optional post-create hook → start → re-inject route → re-stage inner
@@ -7831,6 +8042,8 @@ def _recreate_supervisor(
         if r.returncode != 0:
             print(f"warning: failed to restart sandbox box {name!r}: "
                   f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
+            continue
+        _report_box_restart_warnings(name, r.stdout, progress)
 
 
 def _container_project_type(container: str) -> str:
@@ -9203,6 +9416,8 @@ def _restart_dev_boxes(project: str, cfg: "Config", gitea_ip: str) -> None:
                   file=sys.stderr)
         else:
             print(f"dev/fetch box {name!r} re-run against the new gitea address")
+            # A fetch box may carry read-only folders: report any it lacks.
+            _report_box_restart_warnings(name, r.stdout, None)
 
 
 def _resolve_dev_branch(repo: str, branch: str) -> str:
@@ -10936,6 +11151,9 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
             "'ref' (which also accepts a tag or commit)")
     effective_branch = ""
     if is_dev_preset:
+        # First in the block: refuse before any mirror/gitea work below.
+        if req.folders:
+            raise ValidationError("a dev box does not take read-only folders")
         if req.mcps:
             raise ValidationError(
                 "a dev box cannot take MCPs (its dedicated bridge has no path "
@@ -11023,6 +11241,11 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
             parts.append(f"field(s) not declared by this preset: "
                          f"{', '.join(extra)}")
         raise ValidationError("; ".join(parts))
+    # Read-only folders: each must be a real top-level folder right now (after
+    # the dev gate, so dev+folders gets the dev refusal; before every side
+    # effect, so a refusal creates nothing).
+    if req.folders:
+        _check_box_folders(workspace_path, req.folders)
     # Lazily stand up the box harness. On research this stages rs-sandbox + delivers
     # the needed box image on first use (research create/recreate never touch boxes
     # — the frozen lane); on sandbox-dind (eager-staged) it no-ops. want_browser
@@ -11175,6 +11398,10 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         argv += ["--branch", effective_branch]
     if box_user:
         argv += ["--gitea-user", box_user]
+    # One argv word (`--folders=…`): a name may start with "-", which the box
+    # tool's parser would read as an option if it stood alone.
+    if req.folders:
+        argv.append("--folders=" + ",".join(req.folders))
     progress.step("create-box", "creating the box")
     r = run(argv, capture_output=True)
     if r.returncode != 0:
@@ -11185,6 +11412,8 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
             run(["docker", "exec", "-u", "research", container, "sh", "-c",
                  'rm -f "$HOME/.rs-box-env/$1"', "sh", f"{req.name}.env"],
                 capture_output=True)
+        if req.folders and _is_old_box_tool(r):
+            die(_OLD_BOX_TOOL_MSG)
         die(f"failed to add box: {(r.stderr or r.stdout).strip()}")
     try:
         info = json.loads(r.stdout)            # rs-sandbox create prints the entry
@@ -11195,6 +11424,11 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     # that would escape dispatch's invariant; box_list is already .get()-defensive.
     if not isinstance(info, dict) or not all(k in info for k in ("name", "ip", "container")):
         die(f"unexpected rs-sandbox output shape: {r.stdout.strip()!r}")
+    # Folders the box started without (read tolerantly: an older box tool
+    # reports none). One progress line each, built here from validated names.
+    folder_warnings = _box_folder_warnings(info.get("warnings"), info.get("name"))
+    for line in folder_warnings:
+        progress.step("warning", line)
     # Editor readiness gate (create()'s editor-gate shape): the box's stub only
     # listens ~15-30s after `docker run` (in-box extension installs first), and
     # the webui re-fetches the tab set the moment this op completes — without
@@ -11230,7 +11464,8 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
                         agent=info.get("agent", "none"),
                         editor=bool(info.get("editor", req.editor)),
                         container=info["container"],
-                        fetch=bool(info.get("fetch", req.fetch)))
+                        fetch=bool(info.get("fetch", req.fetch)),
+                        folders=list(req.folders), warnings=folder_warnings)
 
 
 def box_remove(req: "BoxRemoveRequest", progress=None) -> BoxRemoveResult:  # type: ignore[name-defined]
@@ -11307,10 +11542,60 @@ def box_list(req: "BoxListRequest", _progress=None) -> BoxListResult:  # type: i
         die(f"could not parse rs-sandbox output: {r.stdout.strip()!r}")
     boxes = [{"name": e.get("name"), "ip": e.get("ip"),
               "agent": e.get("agent", "none"), "browser": bool(e.get("browser")),
-              "state": e.get("state")}
+              "state": e.get("state"),
+              # Read tolerantly (an older box tool's rows carry neither) and
+              # filtered to valid names (the record is container-writable).
+              "dev": bool(e.get("dev")),
+              "folders": [f for f in (e.get("folders") or [])
+                          if _valid_box_folder(f)]
+                         if isinstance(e.get("folders"), list) else []}
              for e in rows
              if isinstance(e, dict) and e.get("kind") == extension.SANDBOX_KIND]
-    return BoxListResult(project=req.project, boxes=boxes)
+    choices, choices_error = _box_folder_choices_or_note(
+        workspace_path_for(req.project, load_config()))
+    return BoxListResult(project=req.project, boxes=boxes,
+                         folder_choices=choices,
+                         folder_choices_error=choices_error)
+
+
+def box_folders(req: "BoxFoldersRequest", _progress=None) -> BoxFoldersResult:  # type: ignore[name-defined]
+    """Replace a box's read-only folders via the in-box `rs-sandbox folders`
+    (which saves the set and re-runs the box when it changed). The host check
+    applies only to names the box does not carry yet: a recorded folder that is
+    gone right now stays in the set (the box tool skips it at each run and
+    mounts it again once it is back), so saving another change never drops it
+    and never refuses on it. Inline like a box port add — it re-runs one box and
+    returns once it runs again, without waiting for the box's setup."""
+    cfg = load_config()
+    container = _running_dind_supervisor(req.project)
+    ws = workspace_path_for(req.project, cfg)
+    try:
+        entries = extension.load(ws)
+    except (OSError, ValueError, RecursionError):
+        raise ValidationError("could not read this project's boxes")
+    entry = entries.get(req.name) if isinstance(entries, dict) else None
+    if not isinstance(entry, dict) or entry.get("kind") != extension.SANDBOX_KIND:
+        raise ValidationError(f"no box named {req.name!r} in this project")
+    if entry.get("dev"):
+        raise ValidationError("a dev box does not take read-only folders")
+    raw = entry.get("folders")
+    recorded = ({f for f in raw if isinstance(f, str)}
+                if isinstance(raw, list) else set())
+    _check_box_folders(ws, [n for n in req.folders if n not in recorded])
+    # One argv word (`--set=…`; `--set=` clears): a name may start with "-".
+    r = run(["docker", "exec", container, "rs-sandbox", "folders", req.name,
+             "--set=" + ",".join(req.folders)], capture_output=True)
+    if r.returncode != 0:
+        if _is_old_box_tool(r):
+            die(_OLD_BOX_TOOL_MSG)
+        die(f"failed to change the box's folders: "
+            f"{(r.stderr or r.stdout).strip()}")
+    # Tolerant: the box has already been re-run when this is read.
+    info = _parse_box_tool_json(r.stdout)
+    return BoxFoldersResult(
+        project=req.project, name=req.name, folders=list(req.folders),
+        changed=info.get("changed") is not False,
+        warnings=_box_folder_warnings(info.get("warnings"), req.name))
 
 
 def box_presets(req: "BoxPresetsRequest", _progress=None) -> BoxPresetsResult:  # type: ignore[name-defined]
@@ -11347,8 +11632,11 @@ def box_presets(req: "BoxPresetsRequest", _progress=None) -> BoxPresetsResult:  
                for e in catalog]
     allowed = sorted(x["name"] for x in load_project_allowlist(req.project, cfg)
                      if x.get("name"))
+    folders, folders_error = _box_folder_choices_or_note(
+        workspace_path_for(req.project, cfg))
     return BoxPresetsResult(project=req.project, presets=presets,
-                            allowed_mcps=allowed)
+                            allowed_mcps=allowed, folders=folders,
+                            folders_error=folders_error)
 
 
 # --- exported-port registry (STAGE_EXPORTED_PORTS) --------------------------
@@ -11458,8 +11746,11 @@ def port_add(req: "PortAddRequest", _progress=None) -> PortAddResult:  # type: i
                       "box": req.box, "app_port": req.port})
         ports.sort(key=lambda e: e["port"])
         _write_exported_ports(ws, ports)
+        # The expose re-ran the box: report the folders it started without.
         return PortAddResult(project=req.project, port=pub, label=req.label,
-                             ports=ports)
+                             ports=ports,
+                             warnings=_box_folder_warnings(info.get("warnings"),
+                                                           req.box))
     if req.passthrough:
         span_lo, span_hi = req.host_port, req.host_port + req.count - 1
         # GLOBAL fail-closed collision gate over every project's registry.
@@ -11530,18 +11821,24 @@ def port_remove(req: "PortRemoveRequest", _progress=None) -> PortRemoveResult:  
         return e.get("port") == req.port and not e.get("passthrough")
 
     gone = next((e for e in existing if _match(e)), None)
+    warnings: list[str] = []
     if gone and gone.get("box"):
         container = _running_dind_supervisor(req.project)
         r = run(["docker", "exec", container, "rs-sandbox", "unexpose",
                  gone["box"], str(gone["app_port"])], capture_output=True)
         if r.returncode != 0:
             die(f"failed to unexpose box port: {(r.stderr or r.stdout).strip()}")
+        # Tolerant: the box has already been re-run — a parse must never stop
+        # the registry write below.
+        warnings = _box_folder_warnings(
+            _parse_box_tool_json(r.stdout).get("warnings"), gone["box"])
     ports = [e for e in existing if not _match(e)]
     _write_exported_ports(ws, ports)
     # Reap the top-level forwarder for a supervisor/docker entry (a box entry's
     # forwarder died with the box's rm+run in unexpose — the reconcile skips it).
     _reconcile_loopback_bridges(req.project, cfg)
-    return PortRemoveResult(project=req.project, port=req.port, ports=ports)
+    return PortRemoveResult(project=req.project, port=req.port, ports=ports,
+                            warnings=warnings)
 
 
 def port_list(req: "PortListRequest", _progress=None) -> PortListResult:  # type: ignore[name-defined]

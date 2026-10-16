@@ -4996,11 +4996,23 @@ function opChecklist(verb) {
         ref.row.classList.add(bad ? "failed" : "ok");
         ref.icon.textContent = bad ? "✗" : "✓";
     };
-    return { listEl, markDone, markMsg };
+    // One row per `warning` step (e.g. a box that started without one of its
+    // read-only folders): its message, marked ⚠ — the op still succeeded.
+    // A unique row key each, so two warnings never merge into one row.
+    const markWarn = (msg) => {
+        const ref = addRow("warn-" + Object.keys(items).length, msg);
+        // Above any stage still pending, so it reads in the order it happened.
+        const pending = listEl.querySelector(".op-check.pending:not(:last-child)");
+        if (pending && pending !== ref.row) listEl.insertBefore(ref.row, pending);
+        ref.row.classList.remove("pending");
+        ref.row.classList.add("warn");
+        ref.icon.textContent = "⚠";
+    };
+    return { listEl, markDone, markMsg, markWarn };
 }
 
 async function mgmtTailOp(view, backdrop, card, opId, title, verb, onDone) {
-    const { listEl, markDone } = opChecklist(verb);
+    const { listEl, markDone, markWarn } = opChecklist(verb);
 
     // The failure reason — populated ONLY on failure; the running/done state is
     // conveyed by the checklist + the foot button, with no status chatter above.
@@ -5035,6 +5047,7 @@ async function mgmtTailOp(view, backdrop, card, opId, title, verb, onDone) {
                 let rec; try { rec = JSON.parse(line); } catch (e) { continue; }
                 if (rec.status === "done") { sawTerminal = true; terminalOk = true; }
                 else if (rec.status === "failed") { sawTerminal = true; terminalOk = false; }
+                else if (rec.step === "warning" && rec.msg) markWarn(rec.msg);
                 else markDone(rec.step);
             }
         }
@@ -5330,6 +5343,13 @@ function showLifecycleNotice(project, verb, opId, outcome) {
     host.appendChild(notice);
 }
 
+// What a ticked read-only folder means for the operator — shown under the
+// folder checkboxes in the box window and the ⚙ Box folders section.
+const BOX_FOLDERS_HINT =
+    "A ticked folder appears in the box under /mnt/<folder>, read-only. " +
+    "Everything in it can be read inside the box, including any logins or " +
+    "tokens it holds.";
+
 // Phase 2 of a start/stop/update op box. Same checklist as mgmtTailOp, plus a
 // "Continue in background" button (and a backdrop click) that closes the box
 // while the action carries on under a watcher. `opts.replay` re-shows a FINISHED
@@ -5337,7 +5357,7 @@ function showLifecycleNotice(project, verb, opId, outcome) {
 async function lifecycleTail(view, backdrop, card, opId, title, verb, project,
                              onDone, opts) {
     const replay = !!(opts && opts.replay);
-    const { listEl, markDone, markMsg } = opChecklist(verb);
+    const { listEl, markDone, markMsg, markWarn } = opChecklist(verb);
     const waitEl = el("div", { class: "op-waiting" });
     const failEl = el("div", { class: "op-fail" });
     const bgBtn = el("button", { class: "btn btn-secondary" }, ["Continue in background"]);
@@ -5374,6 +5394,7 @@ async function lifecycleTail(view, backdrop, card, opId, title, verb, project,
         }
         waitEl.textContent = "";
         if (entry) lifecycleSetQueued(project, opId, false);
+        if (rec.step === "warning" && rec.msg) { markWarn(rec.msg); return; }
         if (verb === "agents_update" && rec.msg) markMsg(rec.msg);
         else markDone(rec.step);
     }, () => dismissed);
@@ -6832,7 +6853,7 @@ async function refreshAfterBoxChange(project) {
 // open the window — a box can't be added on a stopped/non-dind supervisor anyway,
 // and a malformed box-registry ValidationError must be shown, not swallowed.
 async function mgmtBoxAddDialog(project) {
-    let presets, allowed;
+    let presets, allowed, folderChoices = [], folderChoicesError = "";
     // The agents a box in THIS project can deploy: the set the project staged
     // (claude is always staged as the box copy-source; the marker adds the rest).
     // Never the host's global staged list — a box cannot get what its project
@@ -6855,6 +6876,8 @@ async function mgmtBoxAddDialog(project) {
         }
         presets = body.result.presets || [];
         allowed = body.result.allowed_mcps || [];
+        folderChoices = body.result.folders || [];
+        folderChoicesError = body.result.folders_error || "";
     } catch (e) {
         alert("Can't add a box: broker unreachable.");
         return;
@@ -7024,6 +7047,32 @@ async function mgmtBoxAddDialog(project) {
             ? mcpBoxes.map((b) => el("label", { class: "mgmt-check" }, [b.cb, " " + b.name]))
             : [el("div", { class: "config-empty" }, ["No MCPs allowed for this project yet."])]);
 
+    // Read-only folders: the project's top-level folders as the server lists
+    // them (plain names first, hidden after; links and plain files never
+    // listed; a name a mount cannot carry shown greyed with the reason).
+    // Nothing is ticked by default. Hidden for a dev preset (it takes none).
+    const folderBoxes = [];
+    const folderList = el("div", { class: "config-mcp-picker box-folder-picker" },
+        folderChoices.length
+            ? folderChoices.map((f) => {
+                const cb = el("input", { type: "checkbox" });
+                if (f.usable) folderBoxes.push({ name: f.name, cb });
+                else cb.disabled = true;
+                return el("label", {
+                    class: "mgmt-check" + (f.usable ? "" : " box-folder-unusable"),
+                    title: f.usable ? "" : f.reason,
+                }, [cb, " " + f.name,
+                    ...(f.usable ? [] : [el("span", { class: "box-folder-reason" },
+                                            [" — " + f.reason])])]);
+            })
+            : [el("div", { class: "config-empty" }, [
+                folderChoicesError || "This project has no folders yet."])]);
+    const foldersGroup = el("div", { class: "box-opt-group" }, [
+        el("div", { class: "box-opt-caption" }, ["Read-only folders"]),
+        folderList,
+        el("div", { class: "hint" }, [BOX_FOLDERS_HINT]),
+    ]);
+
     // BYO clone fields — shown only for a clone preset.
     const repoI = el("input", { type: "text", autocomplete: "off",
                                 placeholder: "https://github.com/user/repo.git" });
@@ -7133,6 +7182,9 @@ async function mgmtBoxAddDialog(project) {
         browserCb.checked = !isDev && selectedPreset.image === "browser";
         browserCard.classList.toggle("selected", browserCb.checked);
         browserCard.classList.toggle("disabled", isDev);
+        // A dev box takes no read-only folders: untick + hide the group.
+        if (isDev) for (const b of folderBoxes) b.cb.checked = false;
+        foldersGroup.style.display = isDev ? "none" : "";
         // Show the BYO clone fields only when the preset clones AND the repo isn't
         // baked into the preset (a baked-repo preset like paper-orchestra hides them);
         // a dev preset shows the attached-repo picker instead.
@@ -7195,6 +7247,7 @@ async function mgmtBoxAddDialog(project) {
                     el("div", { class: "box-opt-caption" }, ["MCP tools"]),
                     mcpList,
                 ]),
+                foldersGroup,
             ]),
             fieldsGroup,
             byoGroup,
@@ -7274,6 +7327,8 @@ async function mgmtBoxAddDialog(project) {
                 fetch: fetchCb.checked,
                 mcps: mcpBoxes.filter((b) => b.cb.checked).map((b) => b.name),
             };
+            const folders = folderBoxes.filter((b) => b.cb.checked).map((b) => b.name);
+            if (folders.length) payload.folders = folders;
             // Agent is always explicit now (the preset default is pre-selected,
             // not a sentinel).
             if (agentS.value) payload.agent = agentS.value;
@@ -8572,6 +8627,7 @@ function makeProjectConfigBox(project) {
         "Hidden tabs stay enabled on the supervisor — this only controls what shows here.",
     ]));
     appendExportedPortsSection(box, project);
+    appendBoxFoldersSection(box, project, enabled);
     appendEditorExtensionSection(box, project, enabled);
     appendModelsSection(box, project, enabled);
     appendAgentsSection(box, project, enabled);
@@ -9230,11 +9286,149 @@ async function fillPassthroughList(view, table) {
     }
 }
 
+// ⚙ Box folders: which top-level project folders a box reads, read-only at
+// /mnt/<folder>. Shown on a dind project that has boxes; dev boxes are not
+// listed (they take none). Reads the boxes list — each box's folders + dev
+// flag, plus the project's folder choices — and saves the whole new set for
+// one box. A recorded folder that is not a usable folder right now stays
+// ticked and marked "missing", so saving another change keeps it (unticking
+// it removes it). Saving restarts the box fresh; an unchanged set does
+// nothing on a running box.
+function appendBoxFoldersSection(box, project, enabled) {
+    const isDind = !!(enabled && enabled.supervisor && enabled.supervisor.box_harness);
+    const hasBoxes = Object.keys(enabled || {}).some((id) => id.startsWith("pi-iso-"));
+    if (!isDind || !hasBoxes) return;
+    const section = el("div", { class: "config-section" });
+    section.appendChild(el("div", { class: "config-section-label" }, ["Box folders"]));
+    const content = el("div", {}, [el("div", { class: "config-empty" }, ["Loading…"])]);
+    section.appendChild(content);
+    box.appendChild(section);
+    (async () => {
+        let res = null, b = null;
+        try {
+            res = await fetch(`/broker/project/${encodeURIComponent(project.name)}/boxes`);
+            try { b = await res.json(); } catch (e) { b = {}; }
+        } catch (e) { b = null; }
+        if (!b || !res.ok || !b.ok || !b.result) {
+            content.replaceChildren(el("div", { class: "config-empty" },
+                [(b && mgmtErrText(b)) || "Couldn't load the boxes."]));
+            return;
+        }
+        const boxes = (b.result.boxes || []).filter((x) => !x.dev);
+        const choices = b.result.folder_choices || [];
+        const choicesError = b.result.folder_choices_error || "";
+        if (!boxes.length) {
+            content.replaceChildren(el("div", { class: "config-empty" },
+                ["No box here takes folders."]));
+            return;
+        }
+        const sel = el("select", { class: "config-port-box" },
+                       boxes.map((x) => el("option", { value: x.name }, [x.name])));
+        const list = el("div", { class: "box-folder-picker" });
+        const status = el("div", { class: "config-hint" });
+        const saveBtn = el("button", { class: "btn btn-secondary" }, ["Save"]);
+        let rows = [];    // [{name, cb}] — exactly what Save sends when ticked
+        const current = () => boxes.find((x) => x.name === sel.value) || boxes[0];
+        const draw = () => {
+            const recorded = new Set(current().folders || []);
+            const usable = new Set(choices.filter((c) => c.usable).map((c) => c.name));
+            rows = [];
+            const els = [];
+            for (const c of choices) {
+                const cb = el("input", { type: "checkbox" });
+                cb.checked = recorded.has(c.name);
+                if (c.usable) rows.push({ name: c.name, cb });
+                else cb.disabled = true;
+                els.push(el("label", {
+                    class: "config-check" + (c.usable ? "" : " box-folder-unusable"),
+                    title: c.usable ? "" : c.reason,
+                }, [cb, el("span", {}, [c.usable ? c.name : `${c.name} — ${c.reason}`])]));
+            }
+            for (const n of recorded) {
+                if (usable.has(n)) continue;
+                const cb = el("input", { type: "checkbox" });
+                cb.checked = true;
+                rows.push({ name: n, cb });
+                // "missing" only when the listing worked; when it failed, the
+                // folder may well be there — the note below says why.
+                els.push(el("label", {
+                    class: "config-check" + (choicesError ? "" : " box-folder-missing"),
+                    title: choicesError ? "" :
+                        "Not a folder of this project right now — the box starts " +
+                        "without it, and mounts it again at its next restart once " +
+                        "it is back.",
+                }, [cb, el("span", {}, [choicesError ? n : `${n} — missing`])]));
+            }
+            if (choicesError) {
+                els.push(el("div", { class: "config-empty" }, [choicesError]));
+            } else if (!els.length) {
+                els.push(el("div", { class: "config-empty" },
+                            ["This project has no folders yet."]));
+            }
+            list.replaceChildren(...els);
+        };
+        sel.onchange = () => { status.replaceChildren(); draw(); };
+        saveBtn.onclick = async () => {
+            const cur = current();
+            const folders = rows.filter((r) => r.cb.checked).map((r) => r.name);
+            saveBtn.disabled = true;
+            status.replaceChildren(el("div", {}, ["Saving…"]));
+            try {
+                const r = await fetch(
+                    `/broker/project/${encodeURIComponent(project.name)}/box-folders`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ name: cur.name, folders }),
+                    });
+                let rb; try { rb = await r.json(); } catch (e) { rb = {}; }
+                if (!r.ok || !rb.ok || !rb.result) {
+                    status.replaceChildren(el("div", {},
+                        ["Couldn't save: " + (mgmtErrText(rb) || r.status)]));
+                    return;
+                }
+                const out = rb.result;
+                cur.folders = Array.isArray(out.folders) ? out.folders : folders;
+                draw();
+                const lines = [el("div", {}, [out.changed
+                    ? "Saved — the box restarted fresh." : "Nothing changed."])];
+                for (const w of (Array.isArray(out.warnings) ? out.warnings : [])) {
+                    lines.push(el("div", { class: "config-box-warn" }, ["⚠ " + w]));
+                }
+                status.replaceChildren(...lines);
+                if (out.changed) await refreshAfterBoxChange(project.name);
+            } catch (e) {
+                status.replaceChildren(el("div", {}, ["Couldn't save: connection failed."]));
+            } finally {
+                saveBtn.disabled = false;
+            }
+        };
+        draw();
+        content.replaceChildren(
+            el("div", { class: "config-box-row" }, [sel, saveBtn]),
+            list,
+            el("div", { class: "config-hint" }, [
+                BOX_FOLDERS_HINT + " Saving restarts the box fresh: its agent must " +
+                "log in again and its setup (for example OpenKnowledge's install) " +
+                "runs again. Files in the box's own folder are untouched.",
+            ]),
+            status,
+        );
+    })();
+}
+
 function appendExportedPortsSection(box, project) {
     const section = el("div", { class: "config-section" });
     section.appendChild(el("div", { class: "config-section-label" }, ["Ports"]));
     const listWrap = el("div", { class: "config-ports-list" });
     section.appendChild(listWrap);
+    // Folders a box started without after a port change re-ran it (the box
+    // arm of add/remove returns them as lines).
+    const warnEl = el("div", { class: "config-hint config-box-warn" });
+    section.appendChild(warnEl);
+    const showWarnings = (result) => {
+        const lines = (result && Array.isArray(result.warnings)) ? result.warnings : [];
+        warnEl.replaceChildren(...lines.map((l) => el("div", {}, ["⚠ " + l])));
+    };
 
     const portI = el("input", { type: "number", min: "1", max: "65535",
                                 class: "config-port-num", placeholder: "port" });
@@ -9341,6 +9535,7 @@ function appendExportedPortsSection(box, project) {
                 alert("Couldn't add port: " + (mgmtErrText(body) || res.status));
                 return;
             }
+            showWarnings(body.result);
             portI.value = ""; labelI.value = "";
             // Refresh first: it drops the cached services, so the list below
             // can show the new tab's address once the project re-activates.
@@ -9364,6 +9559,7 @@ function appendExportedPortsSection(box, project) {
                 alert("Couldn't remove port: " + (mgmtErrText(body) || res.status));
                 return;
             }
+            showWarnings(body.result);
             if (passthrough) {
                 await loadPorts();
                 await refreshAfterBoxChange(project.name);

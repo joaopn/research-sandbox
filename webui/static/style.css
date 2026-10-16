@@ -17,6 +17,7 @@
     --btn-danger-bg: #7c3a3a;
     --btn-danger-bg-hover: #8c4a4a;
     --error-fg: #e88;
+    --warn-fg: #d29922;   /* amber: a done op that carries a warning line */
     --status-up: #6c6;
     --status-down: #555;
     --status-error: #e66;
@@ -908,6 +909,8 @@ html.mobile .project-rail .rail-separator { cursor: default; }
 .op-check.ok .op-check-icon { color: var(--status-up); }
 .op-check.failed { color: var(--error-fg); }
 .op-check.failed .op-check-icon { color: var(--status-error); }
+.op-check.warn { color: var(--fg-base); }
+.op-check.warn .op-check-icon { color: var(--warn-fg); }
 /* The lifecycle lane's "waiting for another project action to finish" line. */
 .op-waiting { color: var(--fg-muted); font-size: 13px; font-style: italic; }
 .op-waiting:empty { display: none; }
@@ -1459,6 +1462,12 @@ html.mobile .project-rail .rail-separator { cursor: default; }
 /* MCP picker checkboxes: undo the .field input/label bleed (width:100%,
    uppercase block label) so the tickbox sits left of its name. */
 .box-settings .config-mcp-picker { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+/* Read-only folders: a folder whose name a mount cannot carry is greyed with
+   its reason; a recorded folder that is gone right now is marked "missing". */
+.box-folder-unusable, .box-folder-missing { opacity: 0.6; }
+.box-folder-reason { color: var(--fg-faint); }
+.project-config-box .box-folder-picker { display: flex; flex-direction: column; margin-top: 6px; }
+.project-config-box .config-box-warn { color: var(--warn-fg); }
 .box-settings .mgmt-check {
     display: inline-flex;
     align-items: center;

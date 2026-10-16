@@ -678,8 +678,25 @@ BOX_ADD_WEBUI_FIELDS = frozenset({"project", "name", "preset", "agent", "editor"
                                   "branch",
                                   # This box's own agent model/effort; unset ⇒ the
                                   # project's `box` default from the marker.
-                                  "model", "effort"})
+                                  "model", "effort",
+                                  # Read-only folders. These name a mount
+                                  # SOURCE — the class the host-root boundary
+                                  # forbids in general — and are relayable only
+                                  # because the source is confined: a plain
+                                  # top-level name (closed charset, no "/", not
+                                  # "."/".."), mounted from /workspace/<name>
+                                  # INSIDE the project container (a path that
+                                  # container already holds) into its own inner
+                                  # box. The host only lstat()s the entry; no
+                                  # host path is reachable. Rejected on dev.
+                                  "folders"})
 BOX_TARGET_WEBUI_FIELDS = frozenset({"project", "name"})
+# The ⚙ Box folders change: the whole new set for one box (same boundary
+# argument as `folders` above). Inline like port_add's box arm — it re-runs one
+# box and returns once it runs again — and refused while the project has a
+# start/stop/update in flight (_INLINE_PROJECT_KEY). No step-up: no data is
+# destroyed; the box's own folder is untouched.
+BOX_FOLDERS_WEBUI_FIELDS = frozenset({"project", "name", "folders"})
 # box_remove additionally accepts keep_workspace (a bool, not host-shaped): when
 # set the box is removed but its artifacts stay on disk. The step-up `proof`
 # stays OUT of the set (verified + consumed in dispatch, never forwarded).
@@ -696,6 +713,12 @@ def _verb_box_remove(args: dict, progress=None) -> dict:
     safe = {k: v for k, v in args.items() if k in BOX_REMOVE_WEBUI_FIELDS}
     req = rscore.BoxRemoveRequest.from_kwargs(**safe)  # may raise ValidationError
     return dataclasses.asdict(rscore.box_remove(req, progress=progress))
+
+
+def _verb_box_folders(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in BOX_FOLDERS_WEBUI_FIELDS}
+    req = rscore.BoxFoldersRequest.from_kwargs(**safe)  # may raise ValidationError
+    return dataclasses.asdict(rscore.box_folders(req))
 
 
 def _verb_box_list(args: dict, _progress=None) -> dict:
@@ -1024,6 +1047,7 @@ VERBS = {
     "box_remove": _verb_box_remove,
     "box_list": _verb_box_list,
     "box_presets": _verb_box_presets,
+    "box_folders": _verb_box_folders,
     "port_add": _verb_port_add,
     "port_remove": _verb_port_remove,
     "port_list": _verb_port_list,
@@ -1565,7 +1589,7 @@ _PROC_READABLE = Path("/proc/self/cmdline").exists()
 # exists, so this closes that window).
 _INLINE_PROJECT_KEY = {
     "destroy": "name",
-    "box_add": "project", "box_remove": "project",
+    "box_add": "project", "box_remove": "project", "box_folders": "project",
     "port_add": "project", "port_remove": "project",
 }
 # Inline verbs that take the host-wide lifecycle flock (non-blocking).

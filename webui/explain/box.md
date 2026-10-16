@@ -41,6 +41,33 @@ Independent of the type:
   Gitea into a git clone here (read-only; off by default; not on dev boxes).
 - **MCP tools** — wire any of the project's allowed MCP servers into the box's
   agent through the inner proxy.
+- **Read-only folders** — give the box any of the project's top-level folders.
+  A ticked folder appears in the box under `/mnt/<folder>` and cannot be changed
+  from the box — by its agent, by `sudo`, by anything. Nothing is ticked by
+  default. Not on dev boxes.
+
+## Read-only folders
+
+The box window lists every top-level folder of the project (plain names first,
+hidden ones after; links and plain files are not offered, and a folder whose
+name a mount cannot carry is shown greyed). Change a box's folders later in the
+project's ⚙ panel under **Box folders**: saving restarts the box fresh, so its
+agent logs in again and its setup runs again; the box's own files are untouched.
+
+Everything in a ticked folder is readable inside the box, **credentials
+included**: `workers/` holds a copy of the project's Claude login in each
+worker's folder, `pi-isolated/` holds every box's own files (other boxes'
+notes, clones and configuration), `.orchestrator/` holds the project's wiring, `.creds-stash/`
+holds the login while the project restarts, and a sandbox-dind project's setup
+clone keeps the GitHub token it was cloned with in its git settings.
+
+A ticked folder that is gone when the box starts (deleted, renamed, replaced by
+a link or a file) is skipped: the box starts without it and says so in the
+progress list or the ⚙ panel, and mounts it again at its next restart (a
+project restart, a port change, a folders change) once it is back. Links
+between folders: a relative link between two folders the box was given works
+inside the box; an absolute link, or one into a folder it was not given, shows
+as broken.
 
 ## Orchestration
 

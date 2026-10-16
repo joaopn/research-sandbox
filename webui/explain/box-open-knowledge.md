@@ -32,6 +32,9 @@ The box's terminal tab prints these steps when it opens:
   OpenKnowledge and logs the agent out, and OpenKnowledge reinstalls in the
   background. The notes in `notes/` are untouched; wait for `ok --version`, then
   repeat steps 3 and 4.
+- **Source material:** give the box project folders under **Read-only folders**
+  (in the box window, or later in ⚙ → Box folders); they appear in the box under
+  `/mnt/<folder>`, read-only, beside the knowledge base.
 - OpenKnowledge registers its tools for **Claude Code** only; a box running
   another agent works on the notes as plain files.
 - **Leave Browser off** for this box: the browser image carries an older node,
