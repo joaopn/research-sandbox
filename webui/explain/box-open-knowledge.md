@@ -26,6 +26,32 @@ The box's terminal tab prints these steps when it opens:
 4. In a second window, `cd /workspace/notes && claude` and log in. Starting the
    agent in `notes/` is what gives it OpenKnowledge's tools.
 
+## Keeping history on Gitea
+
+With **Gitea history** ticked in the box window (shown when this host's Gitea is
+enabled), the box's `notes/` is a clone of a private repo `notes/<project>.<box>`
+on the shared Gitea, and OpenKnowledge's own sync pushes every edit once you turn
+on **"pull and push"** sync in its settings (once, after `ok init`). The repo
+opens in the box's `<box> (GIT)` tab.
+
+- The box has its own Gitea account. It can add to the notes' `main` history
+  but never delete or rewrite it: `main` refuses force-pushes and deletion (tags
+  and other branches are not protected), and
+  the account cannot delete or rename the repo or create repos of its own. It can
+  fork its notes repo into its own name; such a copy disappears with the box.
+- Nobody else's account can see the repo; the Gitea tab (the site admin) can.
+- Removing the box archives the repo (read-only, history kept) and deletes the
+  box's account; adding a box with the **same name in the same project** again
+  continues that history. Destroying the project does the same for each box.
+- The box's terminal message says whether history is on and, if not, why and
+  what to do. If the Gitea side itself could not be set up, the box is created
+  without history and the add dialog alone says so (remove the box and add it
+  again to retry). History needs a box name that Gitea accepts (not `git`, `wiki`,
+  `rss`, `atom`, `keys`, `gpg` or `png`, short enough for a 40-character
+  account name, and with no two of `-` `.` `_` next to each other or at the end
+  of the project's or the box's name), and it does not combine with rs-fetch on
+  the same box.
+
 ## Notes
 
 - **A fresh restart** (registering a port, restarting the project) stops

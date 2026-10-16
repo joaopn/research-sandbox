@@ -176,6 +176,14 @@ def _valid_box_folder(name: object) -> bool:
             and name not in (".", ".."))
 
 
+def _coerce_history_flag(raw: Any) -> bool:
+    if raw is None:
+        return False
+    if not isinstance(raw, bool):
+        raise ValidationError("history must be true or false when given")
+    return raw
+
+
 def _coerce_box_folders(raw: Any) -> tuple[str, ...]:
     """A request's folder list → sorted unique names (sorted so a reordered
     request compares equal to a box's record). Refusals echo at most a
@@ -263,6 +271,13 @@ def _box_folder_warnings(raw: Any, box: Any) -> list[str]:
     for w in raw:
         if not isinstance(w, dict):
             continue
+        if w.get("kind") == "history":
+            out.append(f"{who} started without its Gitea history: "
+                       f"{_BOX_HISTORY_REASONS.get(w.get('reason'), _BOX_HISTORY_REASONS[''])}"
+                       if isinstance(w.get("reason"), str)
+                       else f"{who} started without its Gitea history: "
+                            f"{_BOX_HISTORY_REASONS['']}")
+            continue
         folder = w.get("folder")
         reason = w.get("reason")
         why = (_BOX_FOLDER_REASONS.get(reason) if isinstance(reason, str)
@@ -300,6 +315,16 @@ def _parse_box_tool_json(stdout: Any) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+# Structured history warning reasons (kind "history") → fixed wording; "" is
+# the generic line. Every one names a browser remedy.
+_BOX_HISTORY_REASONS = {
+    "no-address": "its Gitea address was not staged; restart the project",
+    "no-token": "its Gitea access was not staged; restart the project",
+    "token-copy-failed": "its Gitea access could not be copied in; restart the project",
+    "": "restart the project to restore it",
+}
+
+
 # The box tool's parser answers an option or command it does not know with exit
 # status 2 and its usage text — which names commands, so it must never reach the
 # browser. A project not restarted since read-only folders shipped still runs the
@@ -313,8 +338,11 @@ def _is_old_box_tool(r: "subprocess.CompletedProcess") -> bool:
     (never some other option a current tool rejects)."""
     err = (r.stderr or "") + (r.stdout or "")
     return r.returncode == 2 and (
-        ("unrecognized arguments" in err and ("--folders" in err or "--set" in err))
-        or ("invalid choice" in err and "'folders'" in err))
+        ("unrecognized arguments" in err
+         and any(o in err for o in ("--folders", "--set", "--history-user",
+                                    "--history-repo")))
+        or ("invalid choice" in err
+            and any(c in err for c in ("'folders'", "'history-heal'"))))
 
 
 def valid_project_name(name: str) -> bool:
@@ -1539,6 +1567,9 @@ class BoxAddRequest:
     # (sorted, unique). Shape here; the real-folder check is in box_add (host)
     # and at every box run (the box tool). Rejected on a dev preset.
     folders: tuple[str, ...] = ()
+    # Keep this box's notes history on the shared Gitea (a gitea_history
+    # preset only; gated in box_add, which has the catalog and the Gitea).
+    history: bool = False
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "BoxAddRequest":
@@ -1642,7 +1673,8 @@ class BoxAddRequest:
             ref=(kw.get("ref") or "").strip(), setup=(kw.get("setup") or ""),
             branch=branch, model=_model, effort=_effort,
             fetch=bool(kw.get("fetch", False)),
-            folders=_coerce_box_folders(kw.get("folders")))
+            folders=_coerce_box_folders(kw.get("folders")),
+            history=_coerce_history_flag(kw.get("history")))
 
 
 @dataclass(frozen=True)
@@ -2905,6 +2937,8 @@ class BoxAddResult:
     fetch: bool = False
     folders: list = field(default_factory=list)     # as requested (validated)
     warnings: list = field(default_factory=list)    # host-built folder lines
+    # Gitea history outcome: "" (not asked) or one fixed operator line.
+    history: str = ""
 
 
 @dataclass
@@ -2920,6 +2954,7 @@ class BoxFoldersResult:
 class BoxRemoveResult:
     project: str
     name: str
+    warnings: list = field(default_factory=list)    # history retirement lines
 
 
 @dataclass
@@ -2946,6 +2981,9 @@ class BoxPresetsResult:
     # window's Read-only folders group.
     folders: list = field(default_factory=list)
     folders_error: str = ""                 # set when the listing failed
+    # Whether this host's Gitea is enabled (the history switch is offered only
+    # then) — a host file check, never a Gitea call.
+    gitea_enabled: bool = False
 
 
 @dataclass
@@ -3623,6 +3661,21 @@ def destroy(req: DestroyRequest, cfg: "Config" | None = None,
                 gitea.archive_fork(host_port, e["user"], e["repo"])
         for e in entries:
             gitea.delete_consumer_token(e["user"])
+    except Exception:
+        pass
+    # Gitea history boxes: archive each notes repo + delete its account and
+    # token, in their own per-row arm (a dev-arm error cannot skip them, and
+    # they cannot skip the prune below).
+    try:
+        hist_rows = [e for e in gitea.project_entries(project)
+                     if e.get("class") == gitea.HISTORY_CLASS]
+        if hist_rows:
+            for line in _retire_history_rows(project, hist_rows, container):
+                print(f"warning: {line}", file=sys.stderr)
+                progress.step("warning", line)
+    except Exception:
+        pass
+    try:
         gitea.prune_project(project)
     except Exception:
         pass
@@ -9015,7 +9068,12 @@ def _stage_dev_gitea(project: str, cfg: "Config", gitea_ip: str = "",
         return
     entries = [e for e in gitea.project_entries(project)
                if e.get("class") == "agent" and e.get("repo")]
-    ip = gitea_ip or next((e["gitea_ip"] for e in entries if e.get("gitea_ip")), "")
+    # Gitea-history rows: their tokens are staged below like the dev ones, but
+    # they never become dev-gitea.json rows (those are the dev boxes' wiring).
+    hist_entries = [e for e in gitea.project_entries(project)
+                    if e.get("class") == gitea.HISTORY_CLASS and e.get("user")]
+    ip = gitea_ip or next((e["gitea_ip"] for e in entries + hist_entries
+                           if e.get("gitea_ip")), "")
     if not ip and container_exists(gitea.GITEA_CONTAINER):
         network = project_network_for(project)
         if network_exists(network):
@@ -9067,9 +9125,10 @@ def _stage_dev_gitea(project: str, cfg: "Config", gitea_ip: str = "",
         tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         tmp.replace(payload_path)
     container = container_name_for(project)
-    if not entries or not container_running(container):
+    if not (entries or hist_entries) or not container_running(container):
         return
-    for user in sorted({e["user"] for e in entries if e.get("user")}):
+    for user in sorted({e["user"] for e in entries + hist_entries
+                        if e.get("user")}):
         tok_path = gitea.consumer_token_path(user)
         try:
             tok = tok_path.read_text().strip()
@@ -9182,7 +9241,8 @@ def _stage_fetch_wiring(container: str, *, serving: bool = True) -> None:
                 owner = ""
         if not owner:
             owner = next((e.get("user") for e in ledger
-                          if e.get("repo") == repo and e.get("user")), "")
+                          if e.get("repo") == repo and e.get("user")
+                          and e.get("class") != gitea.HISTORY_CLASS), "")
         if owner:
             rows.append({"repo": repo, "user": owner})
     if not container_running(container):
@@ -9393,6 +9453,18 @@ def _restart_dev_boxes(project: str, cfg: "Config", gitea_ip: str) -> None:
         return
     ws = workspace_path_for(project, cfg)
     for name, e in sorted(extension.load(ws).items()):
+        # Gitea-history boxes: the address is rewritten IN PLACE (no re-run —
+        # OpenKnowledge and the agent keep running), unconditionally on every
+        # pass (idempotent; a box keeps no host-visible address to compare).
+        if (isinstance(e, dict) and e.get("kind") == extension.SANDBOX_KIND
+                and isinstance(e.get("history"), dict) and not e.get("dev")):
+            r = run(["docker", "exec", container, "rs-sandbox", "history-heal",
+                     name], capture_output=True)
+            if r.returncode != 0:
+                print(f"warning: history box {name!r} could not take the new "
+                      f"Gitea address: {(r.stderr or r.stdout).strip()}",
+                      file=sys.stderr)
+            continue
         if not (isinstance(e, dict) and e.get("kind") == extension.SANDBOX_KIND
                 and (e.get("dev") or e.get("fetch"))):
             continue
@@ -11071,6 +11143,183 @@ def _stage_box_env_files(project: str, container: str) -> None:
                   f"restage", file=sys.stderr)
 
 
+# --- Gitea history for a box (OK_BOX slice 3) --------------------------------
+
+# The in-box status file is a box-controlled path read on the serial thread:
+# `-f` refuses a FIFO, and the read itself is bounded (a few bytes, a few
+# seconds — a healthy read is instant; at expiry the outcome reads unknown).
+HISTORY_STATUS_READ_TIMEOUT_S = 5
+_HISTORY_CODE_RE = re.compile(r"\A[a-z]+(?::[a-z-]+)?\Z")
+_HISTORY_GITEA_FAILED_LINE = ("History: off — the Gitea side could not be set "
+                              "up; the box was created without history. Remove "
+                              "the box and add it again to retry.")
+_OLD_BOX_TOOL_HISTORY_MSG = ("this project's box tool predates Gitea history — "
+                             "restart the project, then retry")
+
+
+def _history_status_line(code: str, repo: str) -> str:
+    """A box's history outcome code → one fixed operator line (unknown → a
+    generic one). Every "off" line names a browser-only remedy."""
+    where = f"notes/{repo}"
+    return {
+        "on": (f"History: on — the notes are kept in the Gitea repo {where} "
+               f"(the box's (GIT) tab). Turn on \"pull and push\" sync in "
+               f"OpenKnowledge's settings once, after ok init."),
+        "off:no-address": ("History: off — the box started without its Gitea "
+                           "address; restart the project to restore it."),
+        "off:no-token": ("History: off — the box started without its Gitea "
+                         "access; restart the project to restore it."),
+        "off:clone-failed": ("History: off — the notes repo could not be "
+                             "cloned; restart the project before writing notes "
+                             "(a fresh box retries the clone)."),
+        "off:not-a-clone": ("History: off — the box's notes folder already "
+                            "holds files that are not a clone of its notes repo; "
+                            "move the whole notes folder aside in the box, then "
+                            "restart the project."),
+        "off:push-failed": ("History: off for now — the first push failed; it is "
+                            "retried at the box's next fresh start (a project "
+                            "restart)."),
+    }.get(code, "History: off — the box's history setup did not report back; "
+                "check the box's terminal message.")
+
+
+def _read_history_status(container: str, box_container: str) -> str:
+    r = run(["docker", "exec", container, "docker", "exec", box_container,
+             "timeout", str(HISTORY_STATUS_READ_TIMEOUT_S), "sh", "-c",
+             'f="$HOME/.rs-history-status"; [ -f "$f" ] && [ ! -L "$f" ] && head -c 64 "$f"'],
+            capture_output=True)
+    code = (r.stdout or "").strip() if r.returncode == 0 else ""
+    return code if _HISTORY_CODE_RE.match(code) else ""
+
+
+def _box_entry_saved(workspace_path: "Path", name: str | None) -> bool:
+    """Did the box tool save this box's record? Unreadable → treated as saved
+    (everything is kept; the box's Remove cleans up)."""
+    try:
+        return bool(name) and name in extension.load(workspace_path)
+    except (OSError, ValueError, RecursionError):
+        return True
+
+
+def _retire_history_rows(project: str, rows: list[dict], container: str) -> list[str]:
+    """Retire each history row: resume the Gitea (short budget, SystemExit
+    caught), archive the repo, delete the account and token (host + staged),
+    prune the row. Per-row, never raising; returns operator lines."""
+    out: list[str] = []
+    serving = True
+    try:
+        _resume_gitea(require=True, tries=GITEA_RESUME_WAIT_TRIES)
+    except SystemExit:
+        serving = False
+    for e in rows:
+        user, repo = e.get("user") or "", e.get("repo") or ""
+        try:
+            if serving and user and repo:
+                out += gitea.retire_history(_gitea_host_port(), user, repo)
+            else:
+                if user:
+                    gitea.delete_consumer_token(user)
+                why = ("Gitea is not answering" if not serving
+                       else "its record is incomplete")
+                out.append(f"the notes repo {gitea.HISTORY_ORG}/{repo} could not "
+                           f"be archived ({why}); archive it from the Gitea tab")
+        except Exception:                    # never let one row stop the rest
+            out.append(f"the notes repo {gitea.HISTORY_ORG}/{repo} could not be "
+                       f"retired cleanly")
+        try:
+            gitea.prune_entry(project, repo, box=e.get("box"),
+                              klass=gitea.HISTORY_CLASS)
+        except Exception:
+            pass
+        if user and container_running(container):
+            run(["docker", "exec", "-u", "research", container, "sh", "-c",
+                 'rm -f "$HOME/.dev-tokens/$1"', "sh", f"{user}.token"],
+                capture_output=True)
+    return out
+
+
+def _gate_box_history(req: "BoxAddRequest", catalog: dict, container: str,
+                      workspace_path: "Path") -> dict:
+    """Every Gitea-history refusal, before any side effect; the Gitea-touching
+    claims last. Returns the claim (names + leftover) for the provisioning."""
+    if not catalog.get(req.preset, {}).get("gitea_history"):
+        raise ValidationError(
+            f"box type {req.preset!r} does not keep history on Gitea")
+    if req.fetch:
+        raise ValidationError(
+            "a box keeping history on Gitea cannot also take rs-fetch (the "
+            "fetch wiring re-creates the box when the Gitea moves)")
+    if not gitea.bootstrap_present():
+        raise ValidationError(
+            "this box keeps history on Gitea, but Gitea is not enabled on this "
+            "host yet — enable it from the Management page, then retry")
+    if not req.name:
+        raise ValidationError(
+            "a box keeping history on Gitea needs a name (its Gitea account "
+            "and notes repo are named after it)")
+    problem = gitea.history_name_problem(req.project, req.name)
+    if problem:
+        raise ValidationError(problem)
+    try:
+        existing = extension.load(workspace_path)
+    except (OSError, ValueError, RecursionError):
+        raise ValidationError("could not read this project's boxes")
+    if req.name in existing:
+        raise ValidationError(
+            f"a box named {req.name!r} already exists in this project")
+    # An older box tool would answer the history options with usage text after
+    # the Gitea work; probe it first. Absent → the harness step stages the
+    # current one.
+    r = run(["docker", "exec", container, "rs-sandbox", "create", "--help"],
+            capture_output=True)
+    if r.returncode == 0 and "--history-user" not in (r.stdout or ""):
+        raise ValidationError(_OLD_BOX_TOOL_HISTORY_MSG)
+    try:
+        _resume_gitea(require=True, tries=GITEA_RESUME_WAIT_TRIES)
+    except SystemExit:
+        raise ValidationError("Gitea is not answering right now; retry in a moment")
+    try:
+        return gitea.history_claim(_gitea_host_port(), req.project, req.name,
+                                   gitea.load_attachments())
+    except gitea.GiteaError as e:
+        raise ValidationError(str(e))
+
+
+def _provision_box_history(req: "BoxAddRequest", claim: dict, container: str,
+                           cfg: "Config") -> bool:
+    """Connect the Gitea to the project's network, create/reuse the repo and the
+    account, record the row, stage the token into the project container. Any
+    failure cleans up the record and token and returns False."""
+    user, repo = claim["user"], claim["repo"]
+    try:
+        ip = _connect_gitea_to_project_network(project_network_for(req.project))
+        if not ip:
+            raise gitea.GiteaError("the Gitea has no address on this project")
+        gitea.provision_history(_gitea_host_port(), user, repo,
+                                leftover=bool(claim.get("leftover")))
+        gitea.record_attachment(req.project, gitea.HISTORY_CLASS, repo, ip,
+                                box=req.name, user=user)
+        _stage_dev_gitea(req.project, cfg, gitea_ip=ip)
+        return True
+    except (gitea.GiteaError, SystemExit, OSError) as e:
+        print(f"warning: Gitea history setup for box {req.name!r} failed: {e}",
+              file=sys.stderr)
+        _cleanup_box_history(req.project, req.name, user, repo, container)
+        return False
+
+
+def _cleanup_box_history(project: str, box: str | None, user: str, repo: str,
+                         container: str) -> None:
+    """Drop a history row and its token (host + staged); the account stays
+    (the next add of this name treats it as a leftover)."""
+    gitea.prune_entry(project, repo, box=box, klass=gitea.HISTORY_CLASS)
+    gitea.delete_consumer_token(user)
+    if container_running(container):
+        run(["docker", "exec", "-u", "research", container, "sh", "-c",
+             'rm -f "$HOME/.dev-tokens/$1"', "sh", f"{user}.token"],
+            capture_output=True)
+
+
 def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignore[name-defined]
     """Create a sandbox box in a running sandbox-dind supervisor by driving its
     in-box `rs-sandbox create`. Validated fields only reach the list-form argv
@@ -11154,6 +11403,8 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         # First in the block: refuse before any mirror/gitea work below.
         if req.folders:
             raise ValidationError("a dev box does not take read-only folders")
+        if req.history:
+            raise ValidationError("a dev box cannot keep notes history on Gitea")
         if req.mcps:
             raise ValidationError(
                 "a dev box cannot take MCPs (its dedicated bridge has no path "
@@ -11246,6 +11497,10 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     # effect, so a refusal creates nothing).
     if req.folders:
         _check_box_folders(workspace_path, req.folders)
+    # Gitea history: every refusal here, before any side effect (the claims
+    # that need the Gitea run last, so a cheap refusal never starts it).
+    hist_claim = (_gate_box_history(req, catalog, container, workspace_path)
+                  if req.history else None)
     # Lazily stand up the box harness. On research this stages rs-sandbox + delivers
     # the needed box image on first use (research create/recreate never touch boxes
     # — the frozen lane); on sandbox-dind (eager-staged) it no-ops. want_browser
@@ -11365,6 +11620,18 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
             host_file.unlink(missing_ok=True)
             die(f"failed to stage the box env file into the supervisor: "
                 f"{(r.stderr or r.stdout).strip()}")
+    # Gitea history provisioning — LAST before the create, so no refusal can
+    # follow it. A failure here drops the history record and token, leaves the
+    # account as a leftover, and the box is created without history.
+    history_line = ""
+    history_args: list[str] = []
+    if hist_claim is not None:
+        progress.step("history", "setting up Gitea history")
+        if _provision_box_history(req, hist_claim, container, cfg):
+            history_args = [f"--history-user={hist_claim['user']}",
+                            f"--history-repo={hist_claim['repo']}"]
+        else:
+            history_line = _HISTORY_GITEA_FAILED_LINE
     argv = ["docker", "exec", container, "rs-sandbox", "create"]
     if req.name:
         argv.append(req.name)
@@ -11402,6 +11669,7 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     # tool's parser would read as an option if it stood alone.
     if req.folders:
         argv.append("--folders=" + ",".join(req.folders))
+    argv += history_args
     progress.step("create-box", "creating the box")
     r = run(argv, capture_output=True)
     if r.returncode != 0:
@@ -11412,8 +11680,14 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
             run(["docker", "exec", "-u", "research", container, "sh", "-c",
                  'rm -f "$HOME/.rs-box-env/$1"', "sh", f"{req.name}.env"],
                 capture_output=True)
-        if req.folders and _is_old_box_tool(r):
-            die(_OLD_BOX_TOOL_MSG)
+        # History wiring made for a box that never got a record: drop it (the
+        # account stays as a leftover). A saved record keeps everything for
+        # the box's Remove.
+        if history_args and not _box_entry_saved(workspace_path, req.name):
+            _cleanup_box_history(req.project, req.name, hist_claim["user"],
+                                 hist_claim["repo"], container)
+        if (req.folders or history_args) and _is_old_box_tool(r):
+            die(_OLD_BOX_TOOL_MSG if req.folders else _OLD_BOX_TOOL_HISTORY_MSG)
         die(f"failed to add box: {(r.stderr or r.stdout).strip()}")
     try:
         info = json.loads(r.stdout)            # rs-sandbox create prints the entry
@@ -11426,7 +11700,12 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         die(f"unexpected rs-sandbox output shape: {r.stdout.strip()!r}")
     # Folders the box started without (read tolerantly: an older box tool
     # reports none). One progress line each, built here from validated names.
-    folder_warnings = _box_folder_warnings(info.get("warnings"), info.get("name"))
+    raw_warnings = info.get("warnings")
+    folder_warnings = _box_folder_warnings(
+        # A history warning at the add is said once, by the history line below.
+        [w for w in raw_warnings if not (isinstance(w, dict) and w.get("kind") == "history")]
+        if (isinstance(raw_warnings, list) and history_args) else raw_warnings,
+        info.get("name"))
     for line in folder_warnings:
         progress.step("warning", line)
     # Editor readiness gate (create()'s editor-gate shape): the box's stub only
@@ -11446,7 +11725,7 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     # with no MCP config yet (a running session never reloads it).
     # A node preset always has a setup to run (the node step), with or without
     # its own.
-    if catalog.get(req.preset, {}).get("setup") or needs_node:
+    if catalog.get(req.preset, {}).get("setup") or needs_node or history_args:
         progress.step("setup", "waiting for the preset setup to finish")
         if not _wait_for_box_setup_done(container, info["container"]):
             # Two causes land here and the wording must carry BOTH: a genuinely
@@ -11457,6 +11736,14 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
                   f"{BOX_SETUP_READY_TIMEOUT_S}s — it may still be installing, "
                   f"or it may be failing (a failed setup restarts the box and "
                   f"retries); check the box's tab before starting the agent")
+    # The box's own history outcome: a fixed code it wrote, mapped to fixed
+    # text here (the box's text never reaches the browser).
+    if history_args:
+        history_line = _history_status_line(
+            _read_history_status(container, info["container"]), hist_claim["repo"])
+    if history_line:
+        progress.step("note" if history_line.startswith("History: on") else "warning",
+                      history_line)
     progress.step("ready", "box ready")
     return BoxAddResult(project=req.project, name=info["name"], ip=info["ip"],
                         preset=info.get("preset", req.preset),
@@ -11465,7 +11752,8 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
                         editor=bool(info.get("editor", req.editor)),
                         container=info["container"],
                         fetch=bool(info.get("fetch", req.fetch)),
-                        folders=list(req.folders), warnings=folder_warnings)
+                        folders=list(req.folders), warnings=folder_warnings,
+                        history=history_line)
 
 
 def box_remove(req: "BoxRemoveRequest", progress=None) -> BoxRemoveResult:  # type: ignore[name-defined]
@@ -11516,6 +11804,18 @@ def box_remove(req: "BoxRemoveRequest", progress=None) -> BoxRemoveResult:  # ty
                      f"{entry['user']}.token"], capture_output=True)
         gitea.prune_entry(req.project, entry.get("repo"), box=req.name)
         _stage_dev_gitea(req.project, load_config())
+    # Gitea history: archive the notes repo (read-only, history kept), delete
+    # the box's account (with any fork it made) and its token. The Gitea is
+    # resumed for it when stopped (the call: a removed box's repo is always
+    # archived); nothing here may escape the broker or skip the prune.
+    warnings: list[str] = []
+    hist = next((e for e in gitea.project_entries(req.project)
+                 if e.get("class") == gitea.HISTORY_CLASS
+                 and e.get("box") == req.name), None)
+    if hist is not None:
+        warnings = _retire_history_rows(req.project, [hist], container)
+        for line in warnings:
+            progress.step("warning", line)
     # Preset-field env cleanup (best-effort, the dev-token posture): the host
     # store copy AND the supervisor-home copy the box was staged from — a
     # removed box must not leave its key at rest anywhere.
@@ -11524,7 +11824,7 @@ def box_remove(req: "BoxRemoveRequest", progress=None) -> BoxRemoveResult:  # ty
         run(["docker", "exec", "-u", "research", container, "sh", "-c",
              'rm -f "$HOME/.rs-box-env/$1"', "sh", f"{req.name}.env"],
             capture_output=True)
-    return BoxRemoveResult(project=req.project, name=req.name)
+    return BoxRemoveResult(project=req.project, name=req.name, warnings=warnings)
 
 
 def box_list(req: "BoxListRequest", _progress=None) -> BoxListResult:  # type: ignore[name-defined]
@@ -11628,7 +11928,9 @@ def box_presets(req: "BoxPresetsRequest", _progress=None) -> BoxPresetsResult:  
                 # Drives the dialog's dev-preset branch (repo picker instead of
                 # the BYO fields; MCP group disabled — both S2 gates reject
                 # mcps on a dev box).
-                "dev": bool(e.get("dev"))}
+                "dev": bool(e.get("dev")),
+                # Offers the box window's "Keep history on Gitea" switch.
+                "gitea_history": bool(e.get("gitea_history"))}
                for e in catalog]
     allowed = sorted(x["name"] for x in load_project_allowlist(req.project, cfg)
                      if x.get("name"))
@@ -11636,7 +11938,8 @@ def box_presets(req: "BoxPresetsRequest", _progress=None) -> BoxPresetsResult:  
         workspace_path_for(req.project, cfg))
     return BoxPresetsResult(project=req.project, presets=presets,
                             allowed_mcps=allowed, folders=folders,
-                            folders_error=folders_error)
+                            folders_error=folders_error,
+                            gitea_enabled=gitea.bootstrap_present())
 
 
 # --- exported-port registry (STAGE_EXPORTED_PORTS) --------------------------
@@ -12054,12 +12357,14 @@ def dev_detach(req: "DevDetachRequest", _progress=None) -> DevDetachResult:  # t
                if e.get("class") == "agent" and e.get("repo")]
     if req.repo is None:
         targets = list(entries)
-        gitea.prune_project(req.project)
+        # Dev rows only: the project's Gitea-history rows are not dev wiring.
+        gitea.prune_project(req.project, klass="agent")
         remaining = []
     else:
         targets = [e for e in entries
                    if e.get("repo") == req.repo and e.get("box") is None]
-        remaining = gitea.prune_entry(req.project, req.repo, box=None)
+        remaining = gitea.prune_entry(req.project, req.repo, box=None,
+                                      klass="agent")
     if targets and container_running(gitea.GITEA_CONTAINER):
         host_port = _gitea_host_port()
         for e in targets:
@@ -12162,7 +12467,8 @@ def dev_status(_req: "DevStatusRequest", _progress=None) -> DevStatusResult:  # 
             repos.append(row)
     attachments = [{"project": e.get("project"), "repo": e.get("repo")}
                    for e in gitea.load_attachments()
-                   if e.get("project") and e.get("repo")]
+                   if e.get("project") and e.get("repo")
+                   and e.get("class") != gitea.HISTORY_CLASS]
     # Reviewer-token state rides OUTSIDE `if running:` — it is orthogonal to
     # gitea's state (a pure local file read; the no-start posture holds).
     return DevStatusResult(gitea={"exists": exists, "running": running},
@@ -12212,7 +12518,8 @@ def dev_repo_status(req: "DevRepoStatusRequest", _progress=None) -> DevRepoStatu
         row["fetch_enabled"] = gitea.fetch_enabled(req.repo)
     attachments = [{"project": e.get("project")}
                    for e in gitea.load_attachments()
-                   if e.get("project") and e.get("repo") == req.repo]
+                   if e.get("project") and e.get("repo") == req.repo
+                   and e.get("class") != gitea.HISTORY_CLASS]
     # Same posture as dev_status: the token state is a local file read,
     # populated outside `if running:`.
     return DevRepoStatusResult(gitea={"exists": exists, "running": running},

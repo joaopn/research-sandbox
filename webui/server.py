@@ -1006,7 +1006,10 @@ async def broker_box_add_handler(request: web.Request) -> web.Response:
             "model": body.get("model"), "effort": body.get("effort"),
             # Read-only folders (a list of top-level folder names) — raw; the
             # broker request validates the shape, box_add the folders.
-            "folders": body.get("folders")}
+            "folders": body.get("folders"),
+            # Keep the notes' history on Gitea — RAW like `browser`: the broker
+            # request refuses anything but a bool.
+            "history": body.get("history")}
     return await _start_op(request, "box_add", args, BROKER_OP_TIMEOUT_S,
                            op_seed=project)
 
@@ -2101,6 +2104,16 @@ async def project_services_handler(request: web.Request) -> web.Response:
             # A dev box is repo-specific by construction — always exactly one.
             fork_tabs.append((f"{project}.{name}", f"{name} (GIT)",
                               entry["gitea_user"], entry["repo"]))
+    # Gitea-history boxes: their notes repo, in their OWN list — never the
+    # fork list above, every entry of which also gets a Fetch tab (a notes
+    # repo must not). The path is the organisation's repo, not the account's.
+    history_tabs: list[tuple[str, str, str]] = []     # (consumer, label, repo)
+    for name, entry in sorted(sandbox_map.items()):
+        hist = entry.get("history")
+        if (entry.get("kind") == "sandbox" and not entry.get("dev")
+                and isinstance(hist, dict) and isinstance(hist.get("repo"), str)):
+            history_tabs.append((f"{project}.{name}", f"{name} (GIT)",
+                                 hist["repo"]))
     # Probe only when there is something to gate (the sibling blocks guard the
     # same way): gitea unreachable ⇒ no fork tabs at all, never a tab that 502s.
     if fork_tabs and await tcp_probe(GITEA_UPSTREAM_HOST, GITEA_UPSTREAM_PORT):
@@ -2118,6 +2131,12 @@ async def project_services_handler(request: web.Request) -> web.Response:
             spec = services.dev_fetch_service(f"{repo} (FETCH)", repo)
             if spec is not None:
                 out[f"{services.DEV_FETCH_ID_PREFIX}{repo}"] = spec
+
+    if history_tabs and await tcp_probe(GITEA_UPSTREAM_HOST, GITEA_UPSTREAM_PORT):
+        for consumer, label, repo in history_tabs:
+            spec = services.dev_fork_service(label, services.HISTORY_ORG, repo)
+            if spec is not None:
+                out[f"{services.DEV_FORK_ID_PREFIX}{consumer}:{repo}"] = spec
 
     # The PROJECT-WIDE Fetch tab: shown whenever THIS project carries an opt-in
     # rs-fetch surface, INDEPENDENT of the dev-consumer tabs above (a project can

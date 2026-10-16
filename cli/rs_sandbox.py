@@ -74,6 +74,101 @@ _NODE_SETUP_STEP = (
     f'[ -e "$HOME/.local/bin/node" ] || '
     f'{{ mkdir -p "$HOME/.local" && cp -a {NODE_DIST_MOUNT}/.local/. "$HOME/.local/"; }} '
     f'|| exit 1')
+# --- Gitea history (OK_BOX slice 3) ----------------------------------------
+# A history box's notes/ is a clone of its private notes repo on the shared
+# Gitea; OpenKnowledge's own sync pushes it. The host provisions the repo, the
+# box's own account and its token (staged into this project container at
+# DEV_TOKENS_DIR/<user>.token); this tool copies the token into the box's home
+# BEFORE first start (never `docker -e` — it would sit in `docker inspect`, the
+# run's command line and every box process's environment) and composes an
+# RS-owned setup step that wires notes/ to the repo. Only non-secret names ride
+# the environment.
+HISTORY_TOKEN_IN_BOX = "/home/worker/.rs-history.token"
+# The Gitea's port inside the install — MIRROR of gitea.GITEA_INNER_PORT
+# (pytest-pinned; this file cannot import cli/gitea.py).
+HISTORY_GITEA_PORT = "3000"
+_HISTORY_NAME_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
+_IPV4_RE = re.compile(r"\A(?:\d{1,3}\.){3}\d{1,3}\Z")
+# The clone of a notes repo and its first push (one empty commit) are small:
+# 60 s covers a slow link with room to spare, and bounds a Gitea that accepts
+# the connection but stalls; at expiry the step records clone-/push-failed
+# (never fatal) and the next fresh start of the box retries it.
+HISTORY_PUSH_TIMEOUT_S = 60
+# The step's shell. Reads only the environment and the 0600 token file; writes
+# the 0600 include file (by temp file + rename, only when absent in setup mode —
+# a heal replaces it), the commit identity, the clone, a fixed status CODE in
+# ~/.rs-history-status, and a fixed paragraph in the box's terminal message
+# (replaced, never appended). git's own output is never captured anywhere.
+# RS_HIST_MODE: "setup" (once per container fs, in front of the preset's setup)
+# or "heal" (a running/started box after the Gitea's address changed).
+_HISTORY_SCRIPT = r"""
+T="$HOME/.rs-history.token"; S="$HOME/.rs-history-status"; N=/workspace/notes
+INC="$HOME/.rs-history.gitconfig"
+URL="http://rs-gitea:@@PORT@@/notes/$RS_HISTORY_REPO.git"
+_rs_hist_text() {
+  case "$1" in
+    on) printf '%s\n' "History: on. These notes are kept in the Gitea repo notes/$RS_HISTORY_REPO (this box's (GIT) tab in the webui)." "Turn on \"pull and push\" sync in OpenKnowledge's settings once, after ok init, so edits are pushed.";;
+    off:no-address|off:no-token) printf '%s\n' "History: off. This box started without its Gitea access; restart the project to restore it.";;
+    off:clone-failed) printf '%s\n' "History: off. The notes repo could not be cloned; restart the project before writing notes (a fresh box retries the clone).";;
+    off:not-a-clone) printf '%s\n' "History: off. /workspace/notes already holds files that are not a clone of the notes repo; move the whole notes folder aside in this box (mv /workspace/notes /workspace/notes.old), then restart the project.";;
+    off:push-failed) printf '%s\n' "History: off for now. The first push to the notes repo failed; it is retried at the next fresh start of this box.";;
+    *) printf '%s\n' "History: off.";;
+  esac
+}
+_rs_hist_greet() {
+  G=/workspace/.rs-greeting
+  [ -f "$G" ] && [ ! -L "$G" ] || return 0
+  tmp=$(mktemp /workspace/.rs-greeting.XXXXXX) || return 0
+  awk '/^--- Gitea history ---$/{skip=1} !skip{print} /^--- end of Gitea history ---$/{skip=0}' "$G" > "$tmp" 2>/dev/null
+  { printf '%s\n' "--- Gitea history ---"; _rs_hist_text "$1"; printf '%s\n' "--- end of Gitea history ---"; } >> "$tmp"
+  mv -f "$tmp" "$G"
+}
+_rs_hist_status() { printf '%s\n' "$1" > "$S"; _rs_hist_greet "$1"; }
+[ -n "$RS_HISTORY_GITEA" ] || { _rs_hist_status off:no-address; exit 0; }
+[ -s "$T" ] || { _rs_hist_status off:no-token; exit 0; }
+if [ "$RS_HIST_MODE" = heal ] || [ ! -e "$INC" ]; then
+  tmp=$(mktemp "$INC.XXXXXX") || { _rs_hist_status off:no-token; exit 0; }
+  chmod 600 "$tmp"
+  printf '[url "http://%s:%s@%s:@@PORT@@/"]\n\tinsteadOf = http://rs-gitea:@@PORT@@/\n' "$RS_HISTORY_USER" "$(cat "$T")" "$RS_HISTORY_GITEA" > "$tmp"
+  mv -f "$tmp" "$INC"
+fi
+git config --global --get-all include.path 2>/dev/null | grep -qxF "$INC" || git config --global --add include.path "$INC"
+git config --global user.name "$RS_HISTORY_USER"
+git config --global user.email "$RS_HISTORY_USER@rs.invalid"
+# A heal before the box's own setup finished touches only the address: the
+# setup is still cloning/pushing and owns the status.
+if [ "$RS_HIST_MODE" = heal ] && [ ! -f "$HOME/.rs-box-setup-done" ]; then exit 0; fi
+# Clone only into NOTHING or a real empty folder — never over a file or a link
+# named notes (anything else falls to the not-a-clone check below).
+if [ "$RS_HIST_MODE" != heal ] && { { [ ! -e "$N" ] && [ ! -L "$N" ]; } || { [ -d "$N" ] && [ ! -L "$N" ] && [ -z "$(ls -A "$N" 2>/dev/null)" ]; }; }; then
+  # Clone under a FRESH hidden name, then move it into place with one rename
+  # (`mv -T`): the rename lands only onto an absent path or a still-empty
+  # folder and refuses if anything was written into notes/ meanwhile, so the
+  # operator's files are never touched. git cleans up only the folder it
+  # created itself on a failure; a clone killed outright stays under its hidden
+  # name (nothing here deletes anything) and the next fresh start clones anew.
+  TC=$(mktemp -u /workspace/.rs-notes-clone.XXXXXX) || { _rs_hist_status off:clone-failed; exit 0; }
+  GIT_TERMINAL_PROMPT=0 timeout @@PUSH@@ git clone -q "$URL" "$TC" >/dev/null 2>&1 || { _rs_hist_status off:clone-failed; exit 0; }
+  git -C "$TC" rev-parse --verify -q HEAD >/dev/null 2>&1 || git -C "$TC" symbolic-ref HEAD refs/heads/main
+  mv -T "$TC" "$N" 2>/dev/null || { _rs_hist_status off:not-a-clone; exit 0; }
+fi
+# A heal never clones: an empty notes/ without a clone stays clone-failed (the
+# setup's verdict), never relabelled as "not a clone".
+if [ "$RS_HIST_MODE" = heal ] && [ ! -d "$N/.git" ] && [ -z "$(ls -A "$N" 2>/dev/null)" ]; then
+  _rs_hist_status off:clone-failed; exit 0
+fi
+[ "$(git -C "$N" config --get remote.origin.url 2>/dev/null)" = "$URL" ] || { _rs_hist_status off:not-a-clone; exit 0; }
+if ! git -C "$N" rev-parse -q --verify main@{u} >/dev/null 2>&1; then
+  git -C "$N" rev-parse --verify -q HEAD >/dev/null 2>&1 || git -C "$N" commit -q --allow-empty -m "Start the notes" >/dev/null 2>&1
+  GIT_TERMINAL_PROMPT=0 timeout @@PUSH@@ git -C "$N" push -q -u origin main >/dev/null 2>&1 || { _rs_hist_status off:push-failed; exit 0; }
+fi
+_rs_hist_status on
+""".replace("@@PORT@@", HISTORY_GITEA_PORT).replace("@@PUSH@@", str(HISTORY_PUSH_TIMEOUT_S))
+# Composed into the setup as a SUBSHELL with `|| true`: an exit inside it ends
+# only the subshell, so the preset's own setup still runs after it and the
+# step can never be the setup's failing status.
+_HISTORY_SETUP_STEP = "( RS_HIST_MODE=setup\n" + _HISTORY_SCRIPT + ") || true"
+
 # The box's greeting, printed by its terminal tab when it opens a session
 # (webui services.pi_isolated_service → greet-and-shell.sh <this path>).
 GREETING_FILE = ".rs-greeting"
@@ -442,13 +537,15 @@ def _write_greeting(ws: Path, preset: dict) -> None:
               file=sys.stderr)
 
 
-def _compose_setup(preset_setup: str, node: bool) -> str:
+def _compose_setup(preset_setup: str, node: bool, history: bool = False) -> str:
     """The setup text a box runs once per container filesystem: the RS node
-    step in front of the preset's own setup for a node box, else the preset's
-    setup unchanged (a non-node box runs byte-identically)."""
-    if not node:
+    step, then the RS history step, in front of the preset's own setup; a box
+    with neither runs its preset setup byte-identically."""
+    steps = ([_NODE_SETUP_STEP] if node else []) + \
+            ([_HISTORY_SETUP_STEP] if history else [])
+    if not steps:
         return preset_setup
-    return _NODE_SETUP_STEP + ("\n" + preset_setup if preset_setup else "")
+    return "\n".join(steps + ([preset_setup] if preset_setup else []))
 
 
 def valid_folder_name(name: object) -> bool:
@@ -465,6 +562,18 @@ def _parse_folders(raw: str | None) -> list[str]:
             die(f"invalid folder name {n[:64]!r} (letters, digits, '.', '_' "
                 f"or '-' only)")
     return sorted(set(names))
+
+
+def _entry_history(entry: dict) -> dict | None:
+    """A box record's validated history names, or None (never for a dev box,
+    and never names the pattern refuses — the record is container-writable)."""
+    h = entry.get("history")
+    if entry.get("dev") or not isinstance(h, dict):
+        return None
+    user, repo = h.get("user"), h.get("repo")
+    if not all(isinstance(v, str) and _HISTORY_NAME_RE.match(v) for v in (user, repo)):
+        return None
+    return {"user": user, "repo": repo}
 
 
 def _entry_folders(entry: dict) -> list[str]:
@@ -490,22 +599,22 @@ def _folder_mounts(folders: list[str]) -> tuple[list[str], list[str], list[dict]
     warnings: list[dict] = []
     for name in folders:
         if not valid_folder_name(name):
-            warnings.append({"reason": "bad-name"})
+            warnings.append({"kind": "folder", "reason": "bad-name"})
             continue
         src = WORKSPACE / name
         try:
             st = os.lstat(src)
         except FileNotFoundError:
-            warnings.append({"folder": name, "reason": "missing"})
+            warnings.append({"kind": "folder", "folder": name, "reason": "missing"})
             continue
         except OSError:
-            warnings.append({"folder": name, "reason": "unreadable"})
+            warnings.append({"kind": "folder", "folder": name, "reason": "unreadable"})
             continue
         if stat.S_ISLNK(st.st_mode):
-            warnings.append({"folder": name, "reason": "link"})
+            warnings.append({"kind": "folder", "folder": name, "reason": "link"})
             continue
         if not stat.S_ISDIR(st.st_mode):
-            warnings.append({"folder": name, "reason": "not-a-folder"})
+            warnings.append({"kind": "folder", "folder": name, "reason": "not-a-folder"})
             continue
         argv += ["--mount", f"type=bind,source={src},"
                             f"target={FOLDER_MOUNT_ROOT}/{name},readonly"]
@@ -514,8 +623,11 @@ def _folder_mounts(folders: list[str]) -> tuple[list[str], list[str], list[dict]
 
 
 def _warning_text(name: str, w: dict) -> str:
-    """Human line for one folder warning (the in-box CLI's stderr only; the
-    host builds its own wording from the structured form)."""
+    """Human line for one warning (the in-box CLI's stderr only; the host
+    builds its own wording from the structured form)."""
+    if w.get("kind") == "history":
+        return (f"warning: box {name!r} starts without Gitea history "
+                f"({w.get('reason')})")
     folder = w.get("folder")
     what = f"folder {folder!r}" if folder else "a folder with an invalid name"
     return (f"warning: box {name!r} starts without read-only {what} "
@@ -602,13 +714,16 @@ FETCH_WIRING_FILE = DEV_TOKENS_DIR / "fetch-wiring.json"
 def _staged_gitea_ip() -> str:
     """The project's gitea address from the host-staged non-secret wiring file,
     or "" (pre-gitea project / not wired). Tolerant read — a plain box run must
-    never fail because the dev lane doesn't exist."""
+    never fail because the dev lane doesn't exist. Only a dotted IPv4 address is
+    returned: the file is writable from the project container, and the value
+    lands in --add-host and in a history box's git settings."""
     try:
         data = json.loads(DEV_GITEA_JSON.read_text())
     except (OSError, json.JSONDecodeError):
         return ""
     ip = data.get("gitea_ip") if isinstance(data, dict) else ""
-    return ip.strip() if isinstance(ip, str) else ""
+    ip = ip.strip() if isinstance(ip, str) else ""
+    return ip if _IPV4_RE.match(ip) else ""
 
 
 def _stage_box_fetch(cname: str) -> None:
@@ -737,7 +852,8 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
              dev: dict | None = None, dev_subnet: str = "", branch: str = "",
              loopback_ports: list[dict] | None = None,
              model: str = "", effort: str = "", fetch: bool = False,
-             node: bool = False, folders: list[str] | None = None) -> list[dict]:
+             node: bool = False, folders: list[str] | None = None,
+             history: dict | None = None) -> list[dict]:
     """docker run a box in the local inner dockerd. ``browser`` selects the
     Chromium-equipped image; ``agent`` (any staged agent|none): any agent mounts
     the project's MERGED copy-source and exports RS_BOX_AGENT=claude (the baked
@@ -867,7 +983,32 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
             model_env += ["-e", f"CLAUDE_CODE_EFFORT_LEVEL={effort}"]
     # Preset setup script rides env argv deliberately: it is user-VISIBLE
     # catalog data (the window shows it), never a field value.
-    setup = _compose_setup(preset_setup, node)
+    # Gitea history: only non-secret names ride the environment (the address,
+    # the account, the repo); the token is a 0600 file copied in before the
+    # first start, below. A missing address or token never stops the box — it
+    # starts without history and says so (a `history` warning; the in-box step
+    # records the same reason). Never for a dev box.
+    hist = history if (history and not dev) else None
+    hist_env: list[str] = []
+    hist_token = None
+    history_warnings: list[dict] = []
+    if hist:
+        hist_ip = _staged_gitea_ip()
+        hist_env = ["-e", f"RS_HISTORY_GITEA={hist_ip}",
+                    "-e", f"RS_HISTORY_USER={hist['user']}",
+                    "-e", f"RS_HISTORY_REPO={hist['repo']}"]
+        tok = DEV_TOKENS_DIR / f"{hist['user']}.token"
+        try:
+            hist_token = tok if tok.read_text().strip() else None
+        except OSError:
+            hist_token = None
+        if not hist_ip:
+            history_warnings.append({"kind": "history", "reason": "no-address"})
+        elif hist_token is None:
+            history_warnings.append({"kind": "history", "reason": "no-token"})
+    # Preset setup script rides env argv deliberately: it is user-VISIBLE
+    # catalog data (the window shows it), never a field value.
+    setup = _compose_setup(preset_setup, node, history=bool(hist))
     setup_env = (["-e", f"RS_BOX_SETUP={setup}"] if setup else [])
     common = [
         "--name", cname,
@@ -889,6 +1030,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         *model_env,
         *agent_env,
         *setup_env,
+        *hist_env,
         *clone_env,
         *dev_env,
         "--label", "research.sandbox=1",
@@ -896,7 +1038,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         image,
     ]
     env_src = Path.home() / ".rs-box-env" / f"{name}.env"
-    if env_src.is_file():
+    if env_src.is_file() or hist_token is not None:
         # Preset input fields: deliver ~/.rs-box.env BEFORE first boot via
         # create → cp → start — never -e (inner `docker inspect` would carry
         # the values) and never the workspace (host/webui-readable). The cp is
@@ -911,7 +1053,15 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         if r.returncode != 0:
             die(f"docker create failed for box {name!r}:\n"
                 f"{(r.stderr or r.stdout).strip()}")
-        r = _docker("cp", str(env_src), f"{cname}:/home/worker/.rs-box.env")
+        if hist_token is not None:
+            # The history token: never fatal — a failed copy starts the box
+            # without history (its step then records off:no-token).
+            rt = _docker("cp", str(hist_token), f"{cname}:{HISTORY_TOKEN_IN_BOX}")
+            if rt.returncode != 0:
+                history_warnings.append({"kind": "history",
+                                         "reason": "token-copy-failed"})
+        r = _docker("cp", str(env_src), f"{cname}:/home/worker/.rs-box.env") \
+            if env_src.is_file() else _docker("container", "inspect", cname)
         if r.returncode == 0:
             r = _docker("start", cname)
         if r.returncode != 0:
@@ -936,7 +1086,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         _install_repo_watch(cname)
     # F3 Slice 2b: launch the in-box loopback forwarders for the freshly-run box.
     _launch_box_forwarders(cname, lp_list)
-    return folder_warnings
+    return folder_warnings + history_warnings
 
 
 def _launch_box_forwarders(cname: str, loopback_ports: list[dict]) -> None:
@@ -1013,7 +1163,8 @@ def _rerun_box(name: str, entry: dict) -> list[dict]:
              # From the STORED entry: the node step is composed at each run.
              node=bool(entry.get("node")),
              # Every recorded name, re-checked at this run (skip + warn).
-             folders=_entry_folders(entry))
+             folders=_entry_folders(entry),
+             history=_entry_history(entry))
 
 
 def _box_entry(entries: dict[str, dict], name: str) -> dict:
@@ -1051,6 +1202,23 @@ def cmd_create(args: argparse.Namespace) -> None:
     # Read-only folders: the shape is refused here, before any state write; the
     # real-folder check runs at every box run (skip + warn), this one included.
     folders = _parse_folders(args.folders)
+    # Gitea history: the host provisions the account/repo/token first and passes
+    # the names; refused on a dev preset, a preset without gitea_history, and
+    # together with --fetch (two-gate lockstep with box_add).
+    h_user = (getattr(args, "history_user", "") or "").strip()
+    h_repo = (getattr(args, "history_repo", "") or "").strip()
+    history = None
+    if h_user or h_repo:
+        if not (h_user and h_repo and _HISTORY_NAME_RE.match(h_user)
+                and _HISTORY_NAME_RE.match(h_repo)):
+            die("history needs both a valid account and repo name")
+        if is_dev:
+            die("a dev box cannot keep notes history on Gitea")
+        if not preset.get("gitea_history"):
+            die(f"box type {args.preset!r} does not keep history on Gitea")
+        if args.fetch:
+            die("a box keeping history on Gitea cannot also take rs-fetch")
+        history = {"user": h_user, "repo": h_repo}
     if branch and not is_dev:
         die("--branch is only valid for a dev box; a byo box pins its clone "
             "with --ref (which also accepts a tag or commit)")
@@ -1218,6 +1386,9 @@ def cmd_create(args: argparse.Namespace) -> None:
         # Every ticked name is kept (sorted): each run re-checks each one, so a
         # folder that is gone now and comes back is mounted again at a restart.
         entry["folders"] = folders
+    if history:
+        # Names only — the token is re-read from the staged file at every run.
+        entry["history"] = history
     if is_clone:
         entry.update({"repo": repo, "ref": ref, "setup": setup})
     if is_dev:
@@ -1232,7 +1403,8 @@ def cmd_create(args: argparse.Namespace) -> None:
                         clone_ref=ref, clone_setup=setup,
                         preset_setup=preset_setup, dev=dev_info,
                         dev_subnet=dev_subnet, branch=branch, model=model,
-                        effort=effort, fetch=fetch, node=node, folders=folders)
+                        effort=effort, fetch=fetch, node=node, folders=folders,
+                        history=history)
     print(json.dumps({"name": name, "ip": ip, "preset": args.preset,
                       "browser": browser, "agent": agent, "editor": editor,
                       "editor_port": editor_port or None, "fetch": fetch,
@@ -1369,6 +1541,11 @@ def cmd_start(args: argparse.Namespace) -> None:
         # processes died with the stop — relaunch them (F3 Slice 2b). The
         # _rerun_box branches above/below relaunch via _run_box.
         _launch_box_forwarders(cname, entry.get("loopback_ports") or [])
+        # A parked history box missed any Gitea address change: rewrite its
+        # address in place and retry a missing first push (no re-run).
+        hist = _entry_history(entry)
+        if hist:
+            _history_heal(cname, hist)
     else:
         _print_warnings(args.name, _rerun_box(args.name, entry))
     print(f"box {args.name!r}: started at {entry['ip']}")
@@ -1403,6 +1580,40 @@ def _container_folder_mounts(cname: str) -> set[str] | None:
                 return None
             out.add(dest)
     return out
+
+
+def _history_heal(cname: str, hist: dict) -> bool:
+    """Rewrite a RUNNING history box's Gitea address in place (the 0600
+    include file, by temp file + rename) and retry a missing first push — the
+    same step as the setup's, in heal mode. Only the address, account and repo
+    ride the command (`-e`); the token is read inside the box from its own
+    0600 file. OpenKnowledge and the agent keep running."""
+    ip = _staged_gitea_ip()
+    if not ip:
+        return False
+    r = _docker("exec", "-u", "worker", "-e", "RS_HIST_MODE=heal",
+                "-e", f"RS_HISTORY_GITEA={ip}",
+                "-e", f"RS_HISTORY_USER={hist['user']}",
+                "-e", f"RS_HISTORY_REPO={hist['repo']}",
+                cname, "bash", "-c", _HISTORY_SCRIPT)
+    return r.returncode == 0
+
+
+def cmd_history_heal(args: argparse.Namespace) -> None:
+    """Host-driven heal after the Gitea's address changed: every RUNNING box
+    of this name with history gets the new address in place."""
+    _require_dind_project()
+    if not _NAME_RE.match(args.name):
+        die("invalid box name")
+    entry = load().get(args.name)
+    hist = _entry_history(entry) if isinstance(entry, dict) else None
+    if not hist:
+        die(f"box {args.name!r} keeps no history")
+    cname = box_container(args.name)
+    running = _docker("container", "inspect", "-f", "{{.State.Running}}",
+                      cname).stdout.strip() == "true"
+    healed = running and _history_heal(cname, hist)
+    print(json.dumps({"name": args.name, "healed": bool(healed)}))
 
 
 def cmd_folders(args: argparse.Namespace) -> None:
@@ -1553,6 +1764,11 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--gitea-user", default="", dest="gitea_user",
                    help="(dev preset) the box's gitea consumer username, minted "
                         "host-side by box add (per-consumer forks)")
+    c.add_argument("--history-user", default="", dest="history_user",
+                   help="(gitea_history preset) the box's Gitea account, minted "
+                        "host-side by box add; pass with --history-repo")
+    c.add_argument("--history-repo", default="", dest="history_repo",
+                   help="(gitea_history preset) the box's notes repo name")
     c.add_argument("--folders", default="",
                    help="comma-separated top-level project folders to mount "
                         "read-only at /mnt/<folder> (pass as --folders=a,b; "
@@ -1566,6 +1782,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="the new comma-separated folder list (--set=a,b; "
                          "--set= clears); restarts the box fresh when it changes")
     fo.set_defaults(func=cmd_folders)
+
+    hh = sub.add_parser("history-heal",
+                        help="rewrite a running history box's Gitea address in place")
+    hh.add_argument("name")
+    hh.set_defaults(func=cmd_history_heal)
 
     lst = sub.add_parser("list", help="list sandboxes (boxes + baked)")
     lst.add_argument("--json", action="store_true")

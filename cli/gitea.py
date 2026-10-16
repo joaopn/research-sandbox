@@ -1247,6 +1247,84 @@ class GiteaClient:
         except GiteaError:
             pass                                 # already gone — best-effort teardown
 
+    # --- history (OK_BOX slice 3): organisation / repo / user primitives ---
+
+    def get_login(self, username: str) -> str | None:
+        """The STORED login of <username> (gitea matches names ignoring letter
+        case, so the stored spelling is how a case variant is told apart), or
+        None on a definitive 404. Anything else raises."""
+        try:
+            data = self._api("GET", f"/users/{username}")
+        except GiteaError as e:
+            if e.status == 404:
+                return None
+            raise
+        return str((data or {}).get("login") or username) if isinstance(data, dict) \
+            else username
+
+    def org_state(self, name: str) -> str:
+        """"org" | "user" (the name is taken by a plain user) | "absent"."""
+        try:
+            self._api("GET", f"/orgs/{name}")
+            return "org"
+        except GiteaError as e:
+            if e.status != 404:
+                raise
+        return "user" if self.get_login(name) is not None else "absent"
+
+    def create_private_org(self, name: str) -> None:
+        self._api("POST", "/orgs", {"username": name, "visibility": "private"})
+
+    def repo_info(self, owner: str, repo: str) -> dict | None:
+        """The repo JSON, or None on a definitive 404 (strict otherwise)."""
+        try:
+            data = self._api("GET", f"/repos/{owner}/{repo}")
+        except GiteaError as e:
+            if e.status == 404:
+                return None
+            raise
+        return data if isinstance(data, dict) else {}
+
+    def create_org_repo(self, org: str, repo: str) -> None:
+        """A PRIVATE repo under <org> (gitea's API creates PUBLIC repos by
+        default — privacy is what keeps the shared read-only account out),
+        empty, default branch `main`."""
+        self._api("POST", f"/orgs/{org}/repos",
+                  {"name": repo, "private": True, "default_branch": "main",
+                   "auto_init": False})
+
+    def set_archived(self, owner: str, repo: str, archived: bool) -> None:
+        self._api("PATCH", f"/repos/{owner}/{repo}", {"archived": archived})
+
+    def ensure_branch_protection(self, owner: str, repo: str, branch: str) -> None:
+        """Protect <branch> against force-push and deletion (gitea's defaults
+        for a rule: `enable_force_push` false, deletion blocked) while keeping
+        normal pushes open to writers. Create-if-absent: an un-archived repo
+        keeps its rule."""
+        rules = self._api("GET", f"/repos/{owner}/{repo}/branch_protections") or []
+        if any(isinstance(r, dict) and r.get("rule_name") == branch for r in rules):
+            return
+        self._api("POST", f"/repos/{owner}/{repo}/branch_protections",
+                  {"rule_name": branch, "enable_push": True})
+
+    def create_user_strict(self, username: str, password: str) -> None:
+        """Create a user, REFUSING to adopt an existing one (create_user's
+        idempotent skip would adopt a user someone else just made)."""
+        self._api("POST", "/admin/users", {
+            "username": username,
+            "password": password,
+            "email": consumer_email(username),
+            "must_change_password": False,
+        })
+
+    def forbid_repo_creation(self, username: str) -> None:
+        """max_repo_creation 0 (the admin edit needs login_name + source_id
+        with it — measured). Forks still bypass the limit by gitea's default;
+        the history leftover rule accounts for that."""
+        self._api("PATCH", f"/admin/users/{username}",
+                  {"login_name": username, "source_id": 0,
+                   "max_repo_creation": 0})
+
     def delete_user(self, username: str) -> None:
         """Delete a user AND its repos (purge=true; gitea refuses to delete a
         user that still owns repos otherwise). RAISES — deliberately not the
@@ -1466,7 +1544,7 @@ def retired_identity(host_port: str, user: str) -> bool:
             and not consumer_token_path(user).is_file())
 
 
-def user_repos(host_port: str, user: str) -> list[dict]:
+def user_repos(host_port: str, user: str, *, detail: bool = False) -> list[dict]:
     """Every repo <user> owns: [{repo, archived}] — the STRICT enumeration, a
     GiteaError PROPAGATES.
 
@@ -1501,8 +1579,14 @@ def user_repos(host_port: str, user: str) -> list[dict]:
     for r in rows:
         if not isinstance(r, dict):
             continue
-        out.append({"repo": r.get("name") or "",
-                    "archived": bool(r.get("archived"))})
+        row = {"repo": r.get("name") or "", "archived": bool(r.get("archived"))}
+        if detail:
+            # Fork lineage, for the history box's leftover rule (a box user may
+            # own forks of its own notes repo — measured — and nothing else).
+            parent = r.get("parent") if isinstance(r.get("parent"), dict) else {}
+            row["fork"] = bool(r.get("fork"))
+            row["parent"] = str(parent.get("full_name") or "")
+        out.append(row)
     return out
 
 
@@ -2253,6 +2337,184 @@ def upstream_sync(client: "GiteaClient", fork_owner: str, repo: str,
     return result("diverged")
 
 
+# --- Gitea history for notes boxes (OK_BOX slice 3) --------------------------
+#
+# A history box's notes are pushed to a PRIVATE repo `notes/<project>.<box>` of a
+# private ORGANISATION, by the box's own user (`agent-<project>.<box>`, the dev
+# naming) as a write collaborator who is never an organisation member and cannot
+# create repos (it can still fork — measured, accepted by the maintainer). `main`
+# is protected against force-push and deletion (OpenKnowledge never force-pushes —
+# measured), so the notes' main history only grows. The ledger row's class is
+# HISTORY_CLASS; its `repo` is the notes repo NAME, which can equal a mirror name
+# (mirror names may contain `.`), so every mirror-keyed reader filters on class.
+
+HISTORY_ORG = "notes"
+HISTORY_CLASS = "history"
+HISTORY_TOKEN_SCOPES = "write:repository"
+HISTORY_BRANCH = "main"
+# Box names gitea refuses as a repo-name ending (`.git` `.wiki` `.rss` `.atom`)
+# or a user-name ending (`.keys` `.gpg` `.png` `.rss` `.atom`) — measured on
+# 1.25.1; the notes repo is `<project>.<box>` and the user `agent-<project>.<box>`.
+HISTORY_RESERVED_BOX_NAMES = frozenset({"git", "wiki", "rss", "atom", "keys",
+                                        "gpg", "png"})
+# Every repo unit a notes repo does not need, off at create (the wiki above all:
+# its own unprotected git repo would be rewritable through the box's token).
+HISTORY_REPO_UNITS_OFF = {"has_wiki": False, "has_issues": False,
+                          "has_pull_requests": False, "has_projects": False,
+                          "has_releases": False, "has_packages": False,
+                          "has_actions": False}
+_SEPARATOR_RUN = re.compile(r"[-._]{2}")
+
+
+def history_names(project: str, box: str) -> tuple[str, str]:
+    """(gitea user, notes repo name) for a history box — never truncated."""
+    return f"{AGENT_USER_PREFIX}{project}.{box}", f"{project}.{box}"
+
+
+def history_name_problem(project: str, box: str) -> str:
+    """Why <project>/<box> cannot have Gitea history, or "" when it can.
+    Operator-facing (browser-reachable): names the rule, never a command."""
+    user, _repo = history_names(project, box)
+    # The project's own name first: when IT is the cause, no box name helps.
+    proj_part = f"{AGENT_USER_PREFIX}{project}."
+    if (len(proj_part) + 1 > GITEA_USERNAME_MAX
+            or _SEPARATOR_RUN.search(proj_part[:-1])
+            or not proj_part[-2].isalnum()):
+        return ("this project's name cannot keep history on Gitea (its Gitea "
+                "account names would be too long, or put two of '-', '.', '_' "
+                "next to each other); history needs a project with a shorter or "
+                "plainer name")
+    if box.lower() in HISTORY_RESERVED_BOX_NAMES:
+        return (f"a box named {box!r} cannot keep history on Gitea (Gitea "
+                f"reserves that name); choose another box name")
+    if len(user) > GITEA_USERNAME_MAX:
+        return (f"this project and box name are too long to keep history on "
+                f"Gitea (its account name {user!r} would exceed "
+                f"{GITEA_USERNAME_MAX} characters); choose a shorter box name")
+    if _SEPARATOR_RUN.search(user) or not user[-1].isalnum():
+        return ("this project and box name cannot keep history on Gitea (its "
+                "account name would put two of '-', '.', '_' next to each "
+                "other or end in one); choose another box name")
+    return ""
+
+
+def history_claim(host_port: str, project: str, box: str,
+                  ledger: list[dict]) -> dict:
+    """Decide, READ-ONLY, whether <project>/<box> may take its history names.
+    Returns {"user", "repo", "leftover": bool}; raises GiteaError(message) on a
+    refusal (the message is operator-facing) — the caller maps it to a
+    ValidationError. Order: every refusal is decided before anything is
+    deleted or created (the caller deletes a leftover only afterwards)."""
+    user, repo = history_names(project, box)
+    lowered = user.lower()
+    for e in ledger:
+        if (str(e.get("user") or "").lower() == lowered
+                and not (e.get("project") == project and e.get("box") == box)):
+            raise GiteaError(
+                f"the Gitea account {user!r} is in use by another box (Gitea "
+                f"ignores letter case, so a project whose name differs only in "
+                f"case counts); choose another box name")
+    client = GiteaClient(api_base(host_port), read_admin_token())
+    if client.org_state(HISTORY_ORG) == "user":
+        raise GiteaError(
+            f"a Gitea user named {HISTORY_ORG!r} exists, so the notes "
+            f"organisation cannot be created; rename or remove that user under "
+            f"Site Administration in the Gitea tab")
+    info = client.repo_info(HISTORY_ORG, repo)
+    if info is not None and str(info.get("name") or repo) != repo:
+        raise GiteaError(
+            f"a notes repo {HISTORY_ORG}/{info.get('name')} of a project whose "
+            f"name differs only in letter case exists; remove it under Site "
+            f"Administration in the Gitea tab, or choose another box name")
+    login = client.get_login(user)
+    if login is None:
+        return {"user": user, "repo": repo, "leftover": False}
+    if login != user:
+        raise GiteaError(
+            f"the Gitea account {login!r} is in use by another box (Gitea "
+            f"ignores letter case); choose another box name")
+    own_parent = f"{HISTORY_ORG}/{repo}".lower()
+    for r in user_repos(host_port, user, detail=True):
+        if not (r.get("fork") and r.get("parent", "").lower() == own_parent):
+            raise GiteaError(
+                f"the Gitea account {user!r} already exists and owns repos (an "
+                f"earlier dev box of this name?); purge it from the Development "
+                f"page, or choose another box name")
+    # Exists, owns nothing but forks of its own notes repo, claimed by no other
+    # row: a leftover (a failed add, or an account a removal could not delete).
+    return {"user": user, "repo": repo, "leftover": True}
+
+
+def history_token_path(user: str) -> Path:
+    return consumer_token_path(user)
+
+
+def mint_history_token(user: str) -> None:
+    """A FRESH write:repository token for a just-created user. Any surviving
+    file is a dead token (its user was deleted) — remove it, then mint; the
+    fixed `rs-dev` token name cannot collide on a fresh user."""
+    delete_consumer_token(user)
+    _write_secret(consumer_token_path(user),
+                  _mint_token(user, HISTORY_TOKEN_SCOPES))
+
+
+def provision_history(host_port: str, user: str, repo: str, *,
+                      leftover: bool) -> None:
+    """Create (or reuse) the organisation, the notes repo (un-archiving a
+    removed box's), its units and branch protection, then the box's user as a
+    non-member write collaborator unable to create repos, then its token. Run
+    only after history_claim decided; every GiteaError propagates (the caller
+    treats it as "box created without history")."""
+    client = GiteaClient(api_base(host_port), read_admin_token())
+    if client.org_state(HISTORY_ORG) == "absent":
+        client.create_private_org(HISTORY_ORG)
+    info = client.repo_info(HISTORY_ORG, repo)
+    if info is None:
+        client.create_org_repo(HISTORY_ORG, repo)
+    elif info.get("archived"):
+        client.set_archived(HISTORY_ORG, repo, False)
+    client.set_repo_features(HISTORY_ORG, repo, HISTORY_REPO_UNITS_OFF)
+    client.ensure_branch_protection(HISTORY_ORG, repo, HISTORY_BRANCH)
+    if leftover:
+        client.delete_user(user)            # purge: it owns at most notes forks
+    client.create_user_strict(user, _random_password())
+    client.forbid_repo_creation(user)
+    client.grant_collaborator(HISTORY_ORG, repo, user, "write")
+    mint_history_token(user)
+
+
+def retire_history(host_port: str, user: str, repo: str) -> list[str]:
+    """Archive the notes repo (read-only, history kept), delete the box's user
+    (with any fork it made) and its token. Each step is attempted; failures
+    come back as fixed operator lines, never raised."""
+    warnings: list[str] = []
+    try:
+        client = GiteaClient(api_base(host_port), read_admin_token())
+    except GiteaError:
+        delete_consumer_token(user)
+        return [f"the notes repo {HISTORY_ORG}/{repo} could not be archived "
+                f"(Gitea is not set up); its token was deleted"]
+    try:
+        if client.repo_info(HISTORY_ORG, repo) is not None:
+            client.set_archived(HISTORY_ORG, repo, True)
+    except GiteaError:
+        warnings.append(f"the notes repo {HISTORY_ORG}/{repo} could not be "
+                        f"archived; archive it from the Gitea tab")
+    try:
+        if client.get_login(user) is not None:
+            client.delete_user(user)
+    except GiteaError:
+        warnings.append(f"the Gitea account {user!r} could not be deleted; the "
+                        f"next box of this name replaces it")
+    delete_consumer_token(user)
+    return warnings
+
+
+def _random_password() -> str:
+    import secrets
+    return secrets.token_urlsafe(24)
+
+
 # --- attachment record ------------------------------------------------------
 #
 # The CONSUMER ledger: which agent works which repo. Entries:
@@ -2260,8 +2522,8 @@ def upstream_sync(client: "GiteaClient", fork_owner: str, repo: str,
 #    "box": str | None, "user": str}
 # box=None → the project's own dev agent; box=<name> → that dev box. `user` is
 # the consumer's gitea username (agent_username(consumer_for(...))). `class` is
-# ALWAYS "agent" (the control class was retired); kept for record-shape
-# stability. Dedupe key = (project, class, repo, box) — a box entry and the
+# "agent" for every dev consumer, or HISTORY_CLASS for a notes box's history
+# (its `repo` is then the notes repo name and `user` its own account). Dedupe key = (project, class, repo, box) — a box entry and the
 # project's own entry for the SAME repo coexist. Host-only state, never
 # bind-mounted, so a plain tmp+rename is correct (no inode pin).
 
@@ -2305,14 +2567,16 @@ def record_attachment(project: str, klass: str, repo: str | None,
 
 
 def prune_entry(project: str, repo: str | None,
-                box: str | None = None) -> list[dict]:
-    """Remove one consumer entry (project, repo, box). Returns the project's
-    REMAINING entries so the caller decides network disconnect / token
-    cleanup (the detach-to-zero rule)."""
+                box: str | None = None, *, klass: str | None = None) -> list[dict]:
+    """Remove one consumer entry (project, repo, box) — of class <klass> when
+    given (a history row and a dev row can share a repo NAME). Returns the
+    project's REMAINING entries so the caller decides network disconnect /
+    token cleanup (the detach-to-zero rule)."""
     kept, remaining = [], []
     for e in load_attachments():
         if (e.get("project") == project and e.get("repo") == repo
-                and e.get("box") == box):
+                and e.get("box") == box
+                and (klass is None or e.get("class") == klass)):
             continue
         kept.append(e)
         if e.get("project") == project:
@@ -2321,10 +2585,13 @@ def prune_entry(project: str, repo: str | None,
     return remaining
 
 
-def prune_project(project: str) -> None:
-    """Drop ALL of a project's entries (destroy path)."""
+def prune_project(project: str, *, klass: str | None = None) -> None:
+    """Drop ALL of a project's entries (destroy path), or only those of class
+    <klass> (dev detach-all must keep the project's history rows)."""
     save_attachments_atomic(
-        [e for e in load_attachments() if e.get("project") != project])
+        [e for e in load_attachments()
+         if not (e.get("project") == project
+                 and (klass is None or e.get("class") == klass))])
 
 
 def project_entries(project: str) -> list[dict]:
@@ -2332,10 +2599,12 @@ def project_entries(project: str) -> list[dict]:
 
 
 def attached_projects(repo: str) -> list[str]:
-    """Projects holding an entry that references `repo` (the refuse-while-attached
-    guard for repo remove)."""
+    """Projects holding a DEV entry that references the mirror `repo` (the
+    refuse-while-attached guard for repo remove). History rows are excluded:
+    their `repo` is a notes repo name, which can equal a mirror's."""
     return sorted({e["project"] for e in load_attachments()
-                   if e.get("repo") == repo and e.get("project")})
+                   if e.get("repo") == repo and e.get("project")
+                   and e.get("class") != HISTORY_CLASS})
 
 
 # --- review verdict ledger (STAGE_DEV_GITEA S4) -------------------------------

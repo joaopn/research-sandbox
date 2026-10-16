@@ -105,7 +105,11 @@ _ALLOWED_KEYS = {"name", "image", "agent_default", "clone", "description",
                  # node: the project's pinned node seed is copied into the box
                  # home as an RS step in front of the setup; greeting: the
                  # message the box's terminal tab prints when it opens.
-                 "node", "greeting"}
+                 "node", "greeting",
+                 # gitea_history: the box may keep its notes' history on the
+                 # shared Gitea (built-in presets only — load_registry refuses
+                 # it on an operator-registered type).
+                 "gitea_history"}
 
 
 class BoxCatalogError(Exception):
@@ -270,9 +274,17 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
     if "greeting" in m and not _is_str(m["greeting"]):
         out.append(p("greeting must be a non-empty string"))
 
+    # gitea_history: RS provisions a private notes repo + a box account on the
+    # shared Gitea and wires the box's notes/ to it (OpenKnowledge's own sync
+    # pushes). It needs the node+setup lane the built-in carries.
+    if "gitea_history" in m and not isinstance(m["gitea_history"], bool):
+        out.append(p(f"gitea_history must be a boolean, got "
+                     f"{m.get('gitea_history')!r}"))
+
     # The dev lane stays isolated: a dev preset carries none of the new keys.
     if m.get("dev"):
-        for k in ("setup", "fields", "mcp_servers", "node", "greeting"):
+        for k in ("setup", "fields", "mcp_servers", "node", "greeting",
+                  "gitea_history"):
             if k in m:
                 out.append(p(f"dev:true forbids {k!r}"))
 
@@ -359,6 +371,13 @@ def load_registry(path: Path = REGISTRY_PATH) -> dict[str, dict]:
         ev = _validate_entry(name, m)
         if ev:
             raise BoxCatalogError("registry: " + "; ".join(ev))
+        # Gitea history wires an RS-owned Gitea account into the box; only a
+        # built-in type may ask for it (the loader is the one place that
+        # knows where an entry came from).
+        if isinstance(m, dict) and m.get("gitea_history"):
+            raise BoxCatalogError(
+                f"registry: entry {name!r}: gitea_history is reserved for the "
+                f"built-in box types")
         out[name] = m
     return out
 

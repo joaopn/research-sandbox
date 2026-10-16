@@ -689,7 +689,12 @@ BOX_ADD_WEBUI_FIELDS = frozenset({"project", "name", "preset", "agent", "editor"
                                   # container already holds) into its own inner
                                   # box. The host only lstat()s the entry; no
                                   # host path is reachable. Rejected on dev.
-                                  "folders"})
+                                  "folders",
+                                  # Keep the box's notes history on the shared
+                                  # Gitea (a bool; gitea_history presets only,
+                                  # gated in box_add). No secret rides it —
+                                  # the account and token are minted host-side.
+                                  "history"})
 BOX_TARGET_WEBUI_FIELDS = frozenset({"project", "name"})
 # The ⚙ Box folders change: the whole new set for one box (same boundary
 # argument as `folders` above). Inline like port_add's box arm — it re-runs one

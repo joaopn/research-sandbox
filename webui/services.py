@@ -221,6 +221,10 @@ def passthrough_service(host_port: int, label: str, count: int = 1) -> dict | No
 # from every other prefix (`pi-iso-`, `box-editor-`, `port-`).
 DEV_FORK_ID_PREFIX = "git-"
 
+# The organisation that owns every Gitea-history notes repo — MIRROR of
+# cli/gitea.py::HISTORY_ORG (the webui image carries no cli/; pytest-pinned).
+HISTORY_ORG = "notes"
+
 # gitea usernames and repo names are alnum + `.`/`-`/`_`. The value is baked into
 # BOTH the iframe path on the shared gitea origin AND the tab id, so anything
 # outside that charset (a `/` retargeting the frame elsewhere in gitea, a `:`

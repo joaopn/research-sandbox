@@ -5008,11 +5008,21 @@ function opChecklist(verb) {
         ref.row.classList.add("warn");
         ref.icon.textContent = "⚠";
     };
-    return { listEl, markDone, markMsg, markWarn };
+    // A `note` step: an informational outcome line (e.g. "History: on …"),
+    // its message as a ✓ row of its own.
+    const markNote = (msg) => {
+        const ref = addRow("note-" + Object.keys(items).length, msg);
+        const pending = listEl.querySelector(".op-check.pending:not(:last-child)");
+        if (pending && pending !== ref.row) listEl.insertBefore(ref.row, pending);
+        ref.row.classList.remove("pending");
+        ref.row.classList.add("ok");
+        ref.icon.textContent = "✓";
+    };
+    return { listEl, markDone, markMsg, markWarn, markNote };
 }
 
 async function mgmtTailOp(view, backdrop, card, opId, title, verb, onDone) {
-    const { listEl, markDone, markWarn } = opChecklist(verb);
+    const { listEl, markDone, markWarn, markNote } = opChecklist(verb);
 
     // The failure reason — populated ONLY on failure; the running/done state is
     // conveyed by the checklist + the foot button, with no status chatter above.
@@ -5048,6 +5058,7 @@ async function mgmtTailOp(view, backdrop, card, opId, title, verb, onDone) {
                 if (rec.status === "done") { sawTerminal = true; terminalOk = true; }
                 else if (rec.status === "failed") { sawTerminal = true; terminalOk = false; }
                 else if (rec.step === "warning" && rec.msg) markWarn(rec.msg);
+                else if (rec.step === "note" && rec.msg) markNote(rec.msg);
                 else markDone(rec.step);
             }
         }
@@ -6854,6 +6865,7 @@ async function refreshAfterBoxChange(project) {
 // and a malformed box-registry ValidationError must be shown, not swallowed.
 async function mgmtBoxAddDialog(project) {
     let presets, allowed, folderChoices = [], folderChoicesError = "";
+    let giteaEnabled = false;
     // The agents a box in THIS project can deploy: the set the project staged
     // (claude is always staged as the box copy-source; the marker adds the rest).
     // Never the host's global staged list — a box cannot get what its project
@@ -6878,6 +6890,7 @@ async function mgmtBoxAddDialog(project) {
         allowed = body.result.allowed_mcps || [];
         folderChoices = body.result.folders || [];
         folderChoicesError = body.result.folders_error || "";
+        giteaEnabled = !!body.result.gitea_enabled;
     } catch (e) {
         alert("Can't add a box: broker unreachable.");
         return;
@@ -7013,6 +7026,41 @@ async function mgmtBoxAddDialog(project) {
         if (fetchCard.classList.contains("disabled")) return;
         fetchCb.checked = !fetchCb.checked;
         fetchCard.classList.toggle("selected", fetchCb.checked);
+    };
+
+    // Keep history on Gitea (a gitea_history preset, on a host whose Gitea is
+    // enabled): the box's notes are pushed to a private notes repo by
+    // OpenKnowledge's own sync. Mutually exclusive with rs-fetch (box_add
+    // refuses the pair). historyCb is the detached value holder.
+    const historyCb = el("input", { type: "checkbox" });
+    const historyCard = el("div", {
+        class: "box-opt-card",
+        title: "Push this box's notes to a private repo on the shared Gitea " +
+               "(OpenKnowledge's own sync, once \"pull and push\" sync is on). " +
+               "The box can add to the notes' main history but never delete or " +
+               "rewrite it.",
+    }, [el("span", { class: "box-opt-name" }, ["Gitea history"])]);
+    const historyHint = el("div", { class: "hint" }, [
+        "The notes are pushed to a private Gitea repo (the box's (GIT) tab). " +
+        "The box can add to their main history but never delete or rewrite it. " +
+        "Removing the box keeps the history read-only; adding a box with the " +
+        "same name in this project again continues it.",
+    ]);
+    const syncHistory = () => {
+        historyCard.classList.toggle("selected", historyCb.checked);
+        historyHint.style.display = historyCb.checked ? "" : "none";
+        // rs-fetch cannot ride a history box.
+        if (historyCb.checked) {
+            fetchCb.checked = false;
+            fetchCard.classList.remove("selected");
+        }
+        fetchCard.classList.toggle("disabled",
+            !!selectedPreset.dev || historyCb.checked);
+    };
+    historyCard.onclick = () => {
+        if (historyCard.classList.contains("disabled")) return;
+        historyCb.checked = !historyCb.checked;
+        syncHistory();
     };
 
     // Browser (spawn-time image toggle, tri-state server-side): checked ⇒ the
@@ -7176,6 +7224,11 @@ async function mgmtBoxAddDialog(project) {
             fetchCard.classList.remove("selected");
         }
         fetchCard.classList.toggle("disabled", isDev);
+        // The history switch follows the preset (and the host's Gitea).
+        const offersHistory = !!selectedPreset.gitea_history && giteaEnabled && !isDev;
+        if (!offersHistory) historyCb.checked = false;
+        historyCard.style.display = offersHistory ? "" : "none";
+        syncHistory();
         // Browser follows the preset's image default on every preset switch; a
         // dev preset forces it off + disabled (base-image only — both gates
         // reject the combination, so the dialog must not offer it).
@@ -7241,7 +7294,9 @@ async function mgmtBoxAddDialog(project) {
                 ]),
                 el("div", { class: "box-opt-group" }, [
                     el("div", { class: "box-opt-caption" }, ["Extensions"]),
-                    el("div", { class: "box-opt-cards" }, [editorCard, fetchCard, browserCard]),
+                    el("div", { class: "box-opt-cards" },
+                       [editorCard, fetchCard, browserCard, historyCard]),
+                    historyHint,
                 ]),
                 el("div", { class: "box-opt-group" }, [
                     el("div", { class: "box-opt-caption" }, ["MCP tools"]),
@@ -7265,6 +7320,9 @@ async function mgmtBoxAddDialog(project) {
             }
             if (fieldInputs.length && !n) {
                 return "This box type needs a name (its inputs are stored per box).";
+            }
+            if (historyCb.checked && !n) {
+                return "A box keeping history on Gitea needs a name (its notes repo is named after it).";
             }
             if (selectedPreset.clone && repoI.value.trim() && !refI.value.trim()) {
                 return "A repo requires a ref (pin the clone).";
@@ -7329,6 +7387,7 @@ async function mgmtBoxAddDialog(project) {
             };
             const folders = folderBoxes.filter((b) => b.cb.checked).map((b) => b.name);
             if (folders.length) payload.folders = folders;
+            if (historyCb.checked) payload.history = true;
             // Agent is always explicit now (the preset default is pre-selected,
             // not a sentinel).
             if (agentS.value) payload.agent = agentS.value;
