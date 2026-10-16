@@ -967,8 +967,7 @@ html.mobile .project-rail .rail-separator { cursor: default; }
     padding: 10px 12px;
     cursor: pointer;
     color: var(--fg-base);
-    font-size: 13px;
-    font-weight: 600;
+    font-size: 13px;   /* = .project-rail .project, normal weight: reads like the names above */
 }
 .nav-entry:hover { background: var(--border); }
 .nav-entry.active {
@@ -976,6 +975,16 @@ html.mobile .project-rail .rail-separator { cursor: default; }
     box-shadow: 2px 0 0 var(--fg-accent) inset;
 }
 .nav-entry .mgmt-gear, .nav-entry .nav-icon { font-size: 14px; }
+/* One fixed box per icon so every label starts at the same x: the glyphs differ
+   in advance width (a colour emoji is ~1.2-1.3em, ⑂ and a text-style ⚙ are far
+   narrower), and an auto-width icon let each label start where its glyph ended.
+   1.5em of the icon's own 14px holds the widest emoji with slack; flex-shrink 0
+   keeps a narrow rail from squeezing one box and not another. */
+.nav-entry .nav-icon {
+    flex-shrink: 0;
+    width: 1.5em;
+    text-align: center;
+}
 
 /* Workflows screen — clickable workflow cards. */
 .workflows-screen { max-width: 900px; }
