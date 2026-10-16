@@ -109,7 +109,14 @@ _ALLOWED_KEYS = {"name", "image", "agent_default", "clone", "description",
                  # gitea_history: the box may keep its notes' history on the
                  # shared Gitea (built-in presets only — load_registry refuses
                  # it on an operator-registered type).
-                 "gitea_history"}
+                 "gitea_history",
+                 # web: a web app the box runs itself and the webui shows as a
+                 # tab — {port, label, start}; built-in presets only.
+                 "web"}
+
+# The box's own internal service ports (its editor stub and the reader), which
+# a preset's web app may not take. MIRROR of what the box images bind.
+BOX_INTERNAL_PORTS = (8443, 8444)
 
 
 class BoxCatalogError(Exception):
@@ -281,10 +288,31 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
         out.append(p(f"gitea_history must be a boolean, got "
                      f"{m.get('gitea_history')!r}"))
 
+    # web: the box keeps `start` running with the tab's address in
+    # $RS_WEB_ADDRESS, and the webui shows `port` as a tab named `label`. It
+    # needs a setup: the box reports the app ready only once its setup is done.
+    if "web" in m:
+        w = m["web"]
+        if not isinstance(w, dict) or set(w) != {"port", "label", "start"}:
+            out.append(p("web must be an object with exactly port, label, start"))
+        else:
+            port = w.get("port")
+            if (not isinstance(port, int) or isinstance(port, bool)
+                    or not 1 <= port <= 65535 or port in BOX_INTERNAL_PORTS):
+                out.append(p(f"web.port must be a TCP port other than "
+                             f"{'/'.join(map(str, BOX_INTERNAL_PORTS))}, got {port!r}"))
+            if not _is_str(w.get("label")):
+                out.append(p("web.label must be a non-empty string"))
+            if not _is_str(w.get("start")):
+                out.append(p("web.start must be a non-empty string"))
+        if not _is_str(m.get("setup")):
+            out.append(p("web requires a setup (the app is reported ready only "
+                         "after the setup ran)"))
+
     # The dev lane stays isolated: a dev preset carries none of the new keys.
     if m.get("dev"):
         for k in ("setup", "fields", "mcp_servers", "node", "greeting",
-                  "gitea_history"):
+                  "gitea_history", "web"):
             if k in m:
                 out.append(p(f"dev:true forbids {k!r}"))
 
@@ -378,6 +406,12 @@ def load_registry(path: Path = REGISTRY_PATH) -> dict[str, dict]:
             raise BoxCatalogError(
                 f"registry: entry {name!r}: gitea_history is reserved for the "
                 f"built-in box types")
+        # A web app runs a start command the box keeps alive and gets a tab
+        # without being asked for one: built-in types only, like history.
+        if isinstance(m, dict) and "web" in m:
+            raise BoxCatalogError(
+                f"registry: entry {name!r}: web is reserved for the built-in "
+                f"box types")
         out[name] = m
     return out
 

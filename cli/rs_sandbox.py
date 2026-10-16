@@ -107,7 +107,7 @@ INC="$HOME/.rs-history.gitconfig"
 URL="http://rs-gitea:@@PORT@@/notes/$RS_HISTORY_REPO.git"
 _rs_hist_text() {
   case "$1" in
-    on) printf '%s\n' "History: on. These notes are kept in the Gitea repo notes/$RS_HISTORY_REPO (this box's (GIT) tab in the webui)." "Turn on \"pull and push\" sync in OpenKnowledge's settings once, after ok init, so edits are pushed.";;
+    on) printf '%s\n' "History: on. These notes are kept in the Gitea repo notes/$RS_HISTORY_REPO (this box's (GIT) tab in the webui)." "Pull-and-push sync is turned on when OpenKnowledge first starts here, so edits are pushed.";;
     off:no-address|off:no-token) printf '%s\n' "History: off. This box started without its Gitea access; restart the project to restore it.";;
     off:clone-failed) printf '%s\n' "History: off. The notes repo could not be cloned; restart the project before writing notes (a fresh box retries the clone).";;
     off:not-a-clone) printf '%s\n' "History: off. /workspace/notes already holds files that are not a clone of the notes repo; move the whole notes folder aside in this box (mv /workspace/notes /workspace/notes.old), then restart the project.";;
@@ -158,11 +158,20 @@ if [ "$RS_HIST_MODE" = heal ] && [ ! -d "$N/.git" ] && [ -z "$(ls -A "$N" 2>/dev
   _rs_hist_status off:clone-failed; exit 0
 fi
 [ "$(git -C "$N" config --get remote.origin.url 2>/dev/null)" = "$URL" ] || { _rs_hist_status off:not-a-clone; exit 0; }
+PUSHED=
 if ! git -C "$N" rev-parse -q --verify main@{u} >/dev/null 2>&1; then
   git -C "$N" rev-parse --verify -q HEAD >/dev/null 2>&1 || git -C "$N" commit -q --allow-empty -m "Start the notes" >/dev/null 2>&1
   GIT_TERMINAL_PROMPT=0 timeout @@PUSH@@ git -C "$N" push -q -u origin main >/dev/null 2>&1 || { _rs_hist_status off:push-failed; exit 0; }
+  PUSHED=1
 fi
 _rs_hist_status on
+# A heal that just completed the first push turned history on under a running
+# web app that started while it was still off: restart that app so it starts
+# with history on (OpenKnowledge then turns on its sync). Only on this change —
+# every other heal leaves the app running.
+if [ "$RS_HIST_MODE" = heal ] && [ -n "$PUSHED" ] && [ -x /usr/local/bin/rs-web-restart ]; then
+  /usr/local/bin/rs-web-restart >/dev/null 2>&1 || true
+fi
 """.replace("@@PORT@@", HISTORY_GITEA_PORT).replace("@@PUSH@@", str(HISTORY_PUSH_TIMEOUT_S))
 # Composed into the setup as a SUBSHELL with `|| true`: an exit inside it ends
 # only the subshell, so the preset's own setup still runs after it and the
@@ -395,6 +404,37 @@ def allocate_loopback_pub(entries: dict[str, dict]) -> int:
         f"({BOX_LOOPBACK_PORT_LO}-{BOX_LOOPBACK_PORT_HI}); unexpose a port first")
 
 
+# --- Preset web apps: the tab's address ------------------------------------
+# The address a web-app box is told (the webui tab's exact origin). MIRROR of
+# rscore.valid_web_address and of the box's /usr/local/bin/rs-web-set — the
+# three are pinned by one shared vector set. A hostname is at most 253
+# characters (the DNS limit), an IPv6 literal at most 45 inside its brackets.
+_WEB_HOST_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_WEB_ADDRESS_RE = re.compile(
+    r"\Ahttps://(?P<host>" + _WEB_HOST_LABEL + r"(?:\." + _WEB_HOST_LABEL
+    + r")*|\[[0-9A-Fa-f:.]{2,45}\]):(?P<port>[1-9][0-9]{0,4})\Z")
+WEB_HOST_MAX = 253
+
+
+def valid_web_address(addr: object) -> bool:
+    if not isinstance(addr, str):
+        return False
+    m = _WEB_ADDRESS_RE.match(addr)
+    return bool(m) and len(m.group("host")) <= WEB_HOST_MAX \
+        and int(m.group("port")) <= 65535
+
+
+# MIRROR of the box's rs-web-set: how long it probes for the app at most, and
+# how long one probe may take (its last probe starts only if it can finish
+# inside the wait). WEB_SET_MARGIN_S covers the exec itself plus the read and
+# write of the address file. The whole call holds the serial broker, so the sum
+# stays a few seconds — far under the webui relay's 30 s.
+WEB_READY_WAIT_S = 4
+WEB_PROBE_TIMEOUT_S = 1
+WEB_SET_MARGIN_S = 3
+WEB_SET_TIMEOUT_S = WEB_READY_WAIT_S + WEB_PROBE_TIMEOUT_S + WEB_SET_MARGIN_S
+
+
 def auto_name(entries: dict[str, dict]) -> str:
     used = {int(m.group(1)) for n in entries if (m := _AUTO_RE.match(n))}
     i = 1
@@ -574,6 +614,22 @@ def _entry_history(entry: dict) -> dict | None:
     if not all(isinstance(v, str) and _HISTORY_NAME_RE.match(v) for v in (user, repo)):
         return None
     return {"user": user, "repo": repo}
+
+
+def _entry_web(entry: dict) -> dict | None:
+    """A box record's validated web app ({port, label, start}), or None (never
+    for a dev box — the record is container-writable and feeds the box env)."""
+    w = entry.get("web")
+    if entry.get("dev") or not isinstance(w, dict):
+        return None
+    port, label, start = w.get("port"), w.get("label"), w.get("start")
+    if (not isinstance(port, int) or isinstance(port, bool)
+            or not 1 <= port <= 65535):
+        return None
+    if not (isinstance(label, str) and label.strip()
+            and isinstance(start, str) and start.strip()):
+        return None
+    return {"port": port, "label": label, "start": start}
 
 
 def _entry_folders(entry: dict) -> list[str]:
@@ -853,7 +909,8 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
              loopback_ports: list[dict] | None = None,
              model: str = "", effort: str = "", fetch: bool = False,
              node: bool = False, folders: list[str] | None = None,
-             history: dict | None = None) -> list[dict]:
+             history: dict | None = None,
+             web: dict | None = None) -> list[dict]:
     """docker run a box in the local inner dockerd. ``browser`` selects the
     Chromium-equipped image; ``agent`` (any staged agent|none): any agent mounts
     the project's MERGED copy-source and exports RS_BOX_AGENT=claude (the baked
@@ -1010,6 +1067,12 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     # catalog data (the window shows it), never a field value.
     setup = _compose_setup(preset_setup, node, history=bool(hist))
     setup_env = (["-e", f"RS_BOX_SETUP={setup}"] if setup else [])
+    # A preset web app: the box's rs-web-loop keeps `start` running with the
+    # tab's address (catalog data, like the setup). Never for a dev box; a box
+    # without one gets no new env.
+    web_env = ([ "-e", f"RS_BOX_WEB_START={web['start']}",
+                 "-e", f"RS_BOX_WEB_PORT={web['port']}"]
+               if (web and not dev) else [])
     common = [
         "--name", cname,
         *net_args,
@@ -1030,6 +1093,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         *model_env,
         *agent_env,
         *setup_env,
+        *web_env,
         *hist_env,
         *clone_env,
         *dev_env,
@@ -1164,7 +1228,10 @@ def _rerun_box(name: str, entry: dict) -> list[dict]:
              node=bool(entry.get("node")),
              # Every recorded name, re-checked at this run (skip + warn).
              folders=_entry_folders(entry),
-             history=_entry_history(entry))
+             history=_entry_history(entry),
+             # The web app snapshotted at create (a catalog edit does not reach
+             # an existing box; a vanished preset does not take its tab away).
+             web=_entry_web(entry))
 
 
 def _box_entry(entries: dict[str, dict], name: str) -> dict:
@@ -1247,9 +1314,9 @@ def cmd_create(args: argparse.Namespace) -> None:
         # The catalog validator forbids these on dev presets; a tampered staged
         # catalog is the only way here — die rather than run half-wired.
         if any(preset.get(k) for k in ("fields", "setup", "mcp_servers",
-                                       "node", "greeting")):
+                                       "node", "greeting", "web")):
             die("a dev preset cannot carry fields/setup/mcp_servers/node/"
-                "greeting; fix the box type in the catalog")
+                "greeting/web; fix the box type in the catalog")
         # Per-consumer forks: the box's gitea identity is minted HOST-side
         # (research/webui box add) before this runs and arrives as
         # --gitea-user; a bare in-supervisor `rs-sandbox create` cannot mint
@@ -1389,6 +1456,16 @@ def cmd_create(args: argparse.Namespace) -> None:
     if history:
         # Names only — the token is re-read from the staged file at every run.
         entry["history"] = history
+    # A preset web app: snapshot it, and publish its port BEFORE the first run
+    # (a -p is fixed at docker run), so the box never needs a second run to
+    # get its tab. The host registers the tab from the printed pub_super.
+    web = _entry_web({"web": preset.get("web")}) if not is_dev else None
+    loopback_ports: list[dict] = []
+    if web:
+        entry["web"] = web
+        loopback_ports = [{"app_port": web["port"],
+                           "pub_super": allocate_loopback_pub(entries)}]
+        entry["loopback_ports"] = loopback_ports
     if is_clone:
         entry.update({"repo": repo, "ref": ref, "setup": setup})
     if is_dev:
@@ -1404,12 +1481,17 @@ def cmd_create(args: argparse.Namespace) -> None:
                         preset_setup=preset_setup, dev=dev_info,
                         dev_subnet=dev_subnet, branch=branch, model=model,
                         effort=effort, fetch=fetch, node=node, folders=folders,
-                        history=history)
-    print(json.dumps({"name": name, "ip": ip, "preset": args.preset,
-                      "browser": browser, "agent": agent, "editor": editor,
-                      "editor_port": editor_port or None, "fetch": fetch,
-                      "folders": folders, "warnings": warnings,
-                      "container": box_container(name)}, indent=2))
+                        history=history, loopback_ports=loopback_ports,
+                        web=web)
+    out = {"name": name, "ip": ip, "preset": args.preset,
+           "browser": browser, "agent": agent, "editor": editor,
+           "editor_port": editor_port or None, "fetch": fetch,
+           "folders": folders, "warnings": warnings,
+           "container": box_container(name)}
+    if web:
+        out["web"] = {"pub_super": loopback_ports[0]["pub_super"],
+                      "app_port": web["port"]}
+    print(json.dumps(out, indent=2))
 
 
 def cmd_restart(args: argparse.Namespace) -> None:
@@ -1587,7 +1669,9 @@ def _history_heal(cname: str, hist: dict) -> bool:
     include file, by temp file + rename) and retry a missing first push — the
     same step as the setup's, in heal mode. Only the address, account and repo
     ride the command (`-e`); the token is read inside the box from its own
-    0600 file. OpenKnowledge and the agent keep running."""
+    0600 file. OpenKnowledge and the agent keep running — except when this heal
+    completes the first push: then the web app restarts so it starts with
+    history on."""
     ip = _staged_gitea_ip()
     if not ip:
         return False
@@ -1614,6 +1698,35 @@ def cmd_history_heal(args: argparse.Namespace) -> None:
                       cname).stdout.strip() == "true"
     healed = running and _history_heal(cname, hist)
     print(json.dumps({"name": args.name, "healed": bool(healed)}))
+
+
+def cmd_web_address(args: argparse.Namespace) -> None:
+    """Hand a web-app box the address its tab is opened at, and report whether
+    the app answers there: {changed, ready}. The whole exchange is ONE in-box
+    exec of the baked rs-web-set as the box user (it reads, compares, writes,
+    wakes the box's loop and probes), so every file touch stays inside the box
+    and the serial broker pays one hop. Anything short of a clean answer reads
+    as not ready — the tab then simply waits and asks again."""
+    _require_dind_project()
+    if not _NAME_RE.match(args.name):
+        die("invalid box name")
+    if not valid_web_address(args.address):
+        die("invalid web address")
+    entry = load().get(args.name)
+    web = _entry_web(entry) if isinstance(entry, dict) else None
+    if not web:
+        die(f"box {args.name!r} runs no web app")
+    r = _docker("exec", "-u", "worker", box_container(args.name),
+                "timeout", str(WEB_SET_TIMEOUT_S), "rs-web-set", args.address)
+    changed = ready = False
+    try:
+        info = json.loads((r.stdout or "").strip().splitlines()[-1])
+        if isinstance(info, dict):
+            changed = info.get("changed") is True
+            ready = info.get("ready") is True
+    except (ValueError, IndexError, RecursionError):
+        pass
+    print(json.dumps({"name": args.name, "changed": changed, "ready": ready}))
 
 
 def cmd_folders(args: argparse.Namespace) -> None:
@@ -1787,6 +1900,13 @@ def build_parser() -> argparse.ArgumentParser:
                         help="rewrite a running history box's Gitea address in place")
     hh.add_argument("name")
     hh.set_defaults(func=cmd_history_heal)
+
+    wa = sub.add_parser("web-address",
+                        help="tell a web-app box its tab's address; report "
+                             "whether the app answers there")
+    wa.add_argument("name")
+    wa.add_argument("address")
+    wa.set_defaults(func=cmd_web_address)
 
     lst = sub.add_parser("list", help="list sandboxes (boxes + baked)")
     lst.add_argument("--json", action="store_true")

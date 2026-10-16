@@ -216,6 +216,16 @@ def _origin_port_for(project: str, service_id: str) -> int | None:
     return None
 
 
+def _origin_port_lookup(project: str, service_id: str) -> int | None:
+    """The origin port ALREADY allocated to (project, service_id), or None.
+    Never allocates: a box's web-app address is the origin its tab was opened
+    at, which the services listing allocated before the tab could open."""
+    for port, entry in ORIGIN_PORTS.items():
+        if entry["project"] == project and entry["service"] == service_id:
+            return port
+    return None
+
+
 def _origin_ports_free(project: str) -> None:
     """Release every port allocated to `project` (called on destroy). A freed
     port later reassigned inherits the old origin's leftover browser storage —
@@ -1139,6 +1149,43 @@ async def broker_port_remove_handler(request: web.Request) -> web.Response:
         if port_n is not None:
             _origin_port_free_one(
                 project, f"{services.EXPORTED_PORT_ID_PREFIX}{port_n}")
+    return web.json_response(reply, status=status)
+
+
+async def broker_web_address_handler(request: web.Request) -> web.Response:
+    """POST /broker/project/{name}/web-address {service} — a box's own web-app
+    tab is being opened: tell the box the address the tab is opened at and
+    relay whether the app answers there ({changed, ready}). The address is
+    derived HERE from the request (the browser's host + the tab's allocated
+    origin port, no trailing slash) — the client names the tab, never an
+    address. Origin-checked; gated by the Management session via _relay."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    project = request.match_info.get("name", "")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    service = body.get("service")
+    prefix = services.EXPORTED_PORT_ID_PREFIX
+    raw = service[len(prefix):] if (isinstance(service, str)
+                                    and service.startswith(prefix)) else ""
+    if not raw.isdigit():
+        return web.json_response(
+            {"ok": False, "error": {"kind": "validation",
+                                    "message": "not a web-app tab"}})
+    origin_port = _origin_port_lookup(project, service)
+    if origin_port is None:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "validation",
+                                    "message": "this tab has no address yet; "
+                                               "reload the page"}})
+    address = f"https://{_request_host(request)}:{origin_port}"
+    status, reply = await _relay(request, "box_web_address",
+                                 {"project": project, "port": int(raw),
+                                  "address": address})
     return web.json_response(reply, status=status)
 
 
@@ -2164,7 +2211,8 @@ async def project_services_handler(request: web.Request) -> web.Response:
             # origin slot — a 66-wide span would exhaust the 65-wide origin
             # pool on its own.
             continue
-        spec = services.exported_port_service(int(e["port"]), e["label"])
+        spec = services.exported_port_service(
+            int(e["port"]), e["label"], follow_address=e.get("web") is True)
         if spec is not None:
             psid = f"{services.EXPORTED_PORT_ID_PREFIX}{int(e['port'])}"
             url = _origin_url(request, project, psid)
@@ -2280,6 +2328,8 @@ def _read_exported_ports(project: str) -> list[dict]:
             if isinstance(box, str) and box and isinstance(app_port, int) \
                     and not isinstance(app_port, bool):
                 entry["box"], entry["app_port"] = box, app_port
+                if e.get("web") is True:
+                    entry["web"] = True
             pt, hp, cnt = e.get("passthrough"), e.get("host_port"), e.get("count", 1)
             if (pt is True and isinstance(hp, int) and not isinstance(hp, bool)
                     and isinstance(cnt, int) and not isinstance(cnt, bool)
@@ -3073,6 +3123,8 @@ def main() -> None:
     app.router.add_post("/broker/project/{name}/port", broker_port_add_handler)
     app.router.add_post(
         "/broker/project/{name}/port-remove", broker_port_remove_handler)
+    app.router.add_post(
+        "/broker/project/{name}/web-address", broker_web_address_handler)
     app.router.add_post(
         "/broker/project/{name}/{action}", broker_project_action_handler)
     # op-log tail + status (GETs, session-gated; the more specific /log first).

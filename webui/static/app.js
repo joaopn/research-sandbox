@@ -7036,7 +7036,7 @@ async function mgmtBoxAddDialog(project) {
     const historyCard = el("div", {
         class: "box-opt-card",
         title: "Push this box's notes to a private repo on the shared Gitea " +
-               "(OpenKnowledge's own sync, once \"pull and push\" sync is on). " +
+               "(OpenKnowledge's own sync, which the box turns on). " +
                "The box can add to the notes' main history but never delete or " +
                "rewrite it.",
     }, [el("span", { class: "box-opt-name" }, ["Gitea history"])]);
@@ -9541,6 +9541,10 @@ function appendExportedPortsSection(box, project) {
         const rows = [];
         for (const e of ports) {
             const isPt = !!e.passthrough;
+            // A box's own web-app tab belongs to the box (removing the box
+            // removes it) and is told its address by itself: no ✕, no
+            // address line.
+            const isWeb = e.web === true;
             const rmKey = isPt ? e.host_port : e.port;
             const rm = el("button", { class: "close-tab-btn",
                                       title: `Remove ${isPt ? "claim" : "port"} ${rmKey}` }, ["✕"]);
@@ -9560,10 +9564,10 @@ function appendExportedPortsSection(box, project) {
                     : `${e.port} — ${e.label}`);
             // The address goes AFTER the ✕ as its own block line, so the label
             // and ✕ keep their one-line layout and a row without one is unchanged.
-            const addr = isPt ? "" : ((svcs[`port-${e.port}`] || {}).origin_url || "");
+            const addr = (isPt || isWeb) ? "" : ((svcs[`port-${e.port}`] || {}).origin_url || "");
             rows.push(el("div", { class: "config-box-row" }, [
                 el("span", { class: "config-box-name" }, [text]),
-                rm,
+                ...(isWeb ? [] : [rm]),
                 ...(addr ? [el("span", {
                     class: "config-port-addr",
                     title: "This tab's address — give it to an app that asks for its public URL",
@@ -10697,9 +10701,10 @@ async function openHttpService(project, serviceId, svc) {
     document.getElementById("terminal-area").appendChild(container);
 
     const key = tkey(project.name, serviceId);
-    state.terminals[key] = {
-        kind: "http", container, project, service: serviceId,
-    };
+    // This pane's own entry: a refresh or teardown replaces or deletes it, and
+    // every wait below checks it is still the registered one.
+    const me = { kind: "http", container, project, service: serviceId };
+    state.terminals[key] = me;
 
     // A PASS-THROUGH claim renders a LAUNCHER pane — the app is encrypted
     // and/or multi-port, so nothing embeds: the buttons open
@@ -10816,6 +10821,48 @@ async function openHttpService(project, serviceId, svc) {
         status.textContent = "No origin port available for this service.";
         return;
     }
+    // A box's own web app answers only at the exact address its tab is opened
+    // at: tell the box first, and wait until the app answers there. The pane
+    // may be torn down (a refresh) while this waits — then stop, mounting
+    // nothing. Whatever the outcome, the iframe loads in the end.
+    if (svc.follow_address) {
+        if (state.terminals[key] !== me) return;
+        const label = svc.label || "the app";
+        status.textContent = `Starting ${label} at this address…`;
+        const url = `/broker/project/${encodeURIComponent(project.name)}/web-address`;
+        const out = await waitForWebApp({
+            post: async () => {
+                const res = await fetch(url, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ service: serviceId }),
+                });
+                let b; try { b = await res.json(); } catch (_) { b = {}; }
+                return { status: res.status, body: b };
+            },
+            sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+            isCurrent: () => state.terminals[key] === me,
+            attempts: WEB_READY_ATTEMPTS,
+            pollMs: WEB_READY_POLL_MS,
+        });
+        if (out.state === "gone") return;
+        if (out.state === "timeout") {
+            status.textContent = `${label} has not answered yet. The box's ` +
+                `terminal tab shows why if it does not come up.`;
+        } else if (out.state === "error") {
+            status.textContent = `Could not hand ${label} its address ` +
+                `(${out.message}); loading it anyway.`;
+        }
+        if (out.state !== "ready") {
+            // Keep the reason visible above the frame until dismissed.
+            const close = el("button", { class: "close-tab-btn",
+                                         title: "Dismiss" }, ["✕"]);
+            const banner = el("div", { class: "http-status http-banner" },
+                [el("span", {}, [status.textContent]), close]);
+            close.onclick = () => banner.remove();
+            container.appendChild(banner);   // overlays the frame's top edge
+        }
+    }
     const iframe = el("iframe", {
         class: "http-iframe",
         src: svc.origin_url,
@@ -10840,6 +10887,46 @@ async function openHttpService(project, serviceId, svc) {
     container.appendChild(iframe);
 
     state.terminals[key].iframe = iframe;
+}
+
+// A box's own web-app tab: how often the tab asks the box again while the app
+// is not answering yet, and how many times. The box answers "not ready" at
+// once while its setup still installs the app (about a minute, measured, after
+// a fresh restart), so the asks are spaced by the delay; 40 × 3 s covers twice
+// that install. Once the setup is done, one ask waits a few seconds in the box.
+const WEB_READY_POLL_MS = 3000;
+const WEB_READY_ATTEMPTS = 40;
+
+// Ask the box (through `post`) until its web app answers at this tab's
+// address. Returns {state}: "ready"; "timeout" after `attempts`; "gone" when
+// the pane was torn down meanwhile (`isCurrent` turned false — nothing more is
+// posted); "error" (with a message) on any other refusal or a dead transport.
+// A refusal of kind "busy" (the project is starting, stopping or updating) is
+// waited out like "not ready". Standalone so it can run outside a page.
+async function waitForWebApp({ post, sleep, isCurrent, attempts, pollMs }) {
+    for (let i = 0; i < attempts; i++) {
+        let r;
+        try {
+            r = await post();
+        } catch (e) {
+            if (!isCurrent()) return { state: "gone" };
+            return { state: "error", message: "the webui is not reachable" };
+        }
+        if (!isCurrent()) return { state: "gone" };
+        const b = (r && r.body) || {};
+        if (r.status === 200 && b.ok && b.result) {
+            if (b.result.ready === true) return { state: "ready" };
+        } else if (!(r.status === 200 && b.error && b.error.kind === "busy")) {
+            const msg = (b.error && b.error.message) ||
+                (r.status === 401 ? "Management is logged out" :
+                 r.status === 503 ? "Management is not reachable" :
+                 `error ${r.status}`);
+            return { state: "error", message: msg };
+        }
+        await sleep(pollMs);
+        if (!isCurrent()) return { state: "gone" };
+    }
+    return { state: "timeout" };
 }
 
 async function handleControl(project, serviceId, term, ws, ctrl) {

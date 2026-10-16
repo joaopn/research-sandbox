@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# rs-web-set <address> — the host's one call into a web-app box: record the
+# address the box's webui tab is opened at, wake the box's rs-web-loop if it
+# changed, and report whether the app answers there. Prints one JSON line,
+# {"changed":…,"ready":…}. Run as the box user, by `rs-sandbox web-address`,
+# under that command's timeout (which also bounds a stalled read).
+
+# MIRROR of rs-sandbox's WEB_READY_WAIT_S / WEB_PROBE_TIMEOUT_S (pinned): the
+# whole call holds the serial broker, so it probes for a few seconds at most —
+# a few times OpenKnowledge's measured 0.66 s restart, so an address change
+# completes inside one call. Anything longer (an install after a fresh start)
+# is waited out by the webui between calls. A probe starts only when it can
+# finish inside the wait, and probes are spaced WEB_PROBE_INTERVAL_S apart.
+WEB_READY_WAIT_S=4
+WEB_PROBE_TIMEOUT_S=1
+WEB_PROBE_INTERVAL_S=0.25
+WEB_HOST_MAX=253
+WEB_ADDRESS_MAX_BYTES=267
+ADDR_FILE=/workspace/.rs-web-address
+
+A="${1:-}"
+out() { printf '{"changed":%s,"ready":%s}\n' "$1" "$2"; exit 0; }
+
+# The address rule, MIRROR of rs-sandbox / rscore valid_web_address (one shared
+# vector set pins all three): https:// + a hostname, IPv4 or [IPv6] + :port.
+L='[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?'
+RE="^https://(${L}(\.${L})*|\[[0-9A-Fa-f:.]{2,45}\]):([1-9][0-9]{0,4})$"
+if ! [[ "$A" =~ $RE ]]; then
+    echo "invalid address" >&2; exit 2
+fi
+hp="${A#https://}"
+host="${hp%:*}"
+port="${hp##*:}"
+if [ "${#host}" -gt "$WEB_HOST_MAX" ] || [ "$port" -gt 65535 ]; then
+    echo "invalid address" >&2; exit 2
+fi
+
+cur=""
+if [ -f "$ADDR_FILE" ] && [ ! -L "$ADDR_FILE" ]; then
+    cur="$(head -c "$WEB_ADDRESS_MAX_BYTES" "$ADDR_FILE" 2>/dev/null)"
+fi
+changed=false
+if [ "$cur" != "$A" ]; then
+    t="$(mktemp /workspace/.rs-web-address.XXXXXX)" || out false false
+    if printf '%s' "$A" > "$t" && mv -T "$t" "$ADDR_FILE"; then
+        changed=true
+    else
+        rm -f -- "$t"
+        out false false
+    fi
+    P="$HOME/.rs-web-loop.pid"
+    pid=""
+    [ -f "$P" ] && [ ! -L "$P" ] && pid="$(head -c 16 "$P" 2>/dev/null | tr -cd '0-9')"
+    if [ -n "$pid" ] && tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null \
+            | grep -qxF /usr/local/bin/rs-web-loop; then
+        kill -USR1 "$pid" 2>/dev/null
+    fi
+fi
+
+# Until the box's setup has run, nothing can answer: say so at once.
+[ -e "$HOME/.rs-box-setup-done" ] || out "$changed" false
+[ -n "${RS_BOX_WEB_PORT:-}" ] || out "$changed" false
+
+now_us() { local t="${EPOCHREALTIME/./}"; echo $((10#$t)); }
+end=$(( $(now_us) + WEB_READY_WAIT_S * 1000000 ))
+while [ $(( $(now_us) + WEB_PROBE_TIMEOUT_S * 1000000 )) -le "$end" ]; do
+    # -f: an HTTP error (an instance still on the old address refuses this
+    # Host with a 403) is not an answer.
+    if curl -sf -o /dev/null --max-time "$WEB_PROBE_TIMEOUT_S" \
+            -H "Host: $hp" "http://127.0.0.1:${RS_BOX_WEB_PORT}/"; then
+        out "$changed" true
+    fi
+    sleep "$WEB_PROBE_INTERVAL_S"
+done
+out "$changed" false

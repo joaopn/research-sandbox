@@ -816,6 +816,22 @@ html.mobile .project-rail .rail-separator { cursor: default; }
     color: var(--fg-faint);
     font-size: 13px;
 }
+/* A note laid over the top edge of an http pane's frame (a box web app that
+   has not answered yet), so the frame keeps its full size; dismissible. The
+   pane is the positioned ancestor (.terminal-instance is absolute). */
+.http-banner {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    background: var(--pane-bg);
+    border-bottom: 1px solid var(--border, transparent);
+}
 
 .welcome {
     padding: 32px;

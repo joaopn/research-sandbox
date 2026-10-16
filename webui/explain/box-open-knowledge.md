@@ -1,8 +1,8 @@
 # OpenKnowledge box
 
 A knowledge-base box — **OpenKnowledge** (a markdown editor and knowledge base
-for LLM wikis, specs and notes) with node and the pinned `ok` CLI installed. The
-agent is on by default.
+for LLM wikis, specs and notes) with node and the pinned `ok` CLI installed,
+started by the box itself in its own tab. The agent is on by default.
 
 ## What it is
 
@@ -12,27 +12,33 @@ agent edits the same notes through OpenKnowledge's own tools — you watch its
 edits land while you write beside it. Everything else in the box is its own
 housekeeping; only `notes/` is content.
 
-## Starting it
+## Using it
 
-The box's terminal tab prints these steps when it opens:
+Adding the box gives the project an **OpenKnowledge** tab. Open it: the box
+starts OpenKnowledge at the address the tab is opened at, which takes about a
+second (OpenKnowledge accepts only that exact address, so opening the tab under
+another host name moves it there, and an editor still open under the old name
+stops saving). After a fresh restart of the box the tab waits about a minute
+while the box reinstalls OpenKnowledge.
 
-1. In this project's **⚙ → Ports**, pick the box, add port **8080** as a
-   **Web page**, and copy the address shown under it. The box restarts fresh;
-   reconnect its tab and wait until `ok --version` answers (OpenKnowledge
-   reinstalls, about a minute).
-2. `cd /workspace/notes && ok init` — once, the first time.
-3. `OK_ALLOW_EXTERNAL=1 ok start -p 8080 --no-open-browser --idle-shutdown off
-   --external-url <that address>`, then open the OpenKnowledge tab.
-4. In a second window, `cd /workspace/notes && claude` and log in. Starting the
-   agent in `notes/` is what gives it OpenKnowledge's tools.
+To work with the agent, open the box's terminal tab, start a second window and
+run `cd /workspace/notes && claude`, then log in. Starting the agent in `notes/`
+is what gives it OpenKnowledge's tools.
+
+If the tab does not come up, the box's terminal tab says why:
+`cat /workspace/.rs-web.log` shows OpenKnowledge's own output, and
+`rs-web-restart` restarts it. The tab cannot be removed in ⚙ → Ports; removing
+the box removes it.
 
 ## Keeping history on Gitea
 
 With **Gitea history** ticked in the box window (shown when this host's Gitea is
 enabled), the box's `notes/` is a clone of a private repo `notes/<project>.<box>`
-on the shared Gitea, and OpenKnowledge's own sync pushes every edit once you turn
-on **"pull and push"** sync in its settings (once, after `ok init`). The repo
-opens in the box's `<box> (GIT)` tab.
+on the shared Gitea, and OpenKnowledge's own sync pushes every edit: the box
+turns on **pull and push** sync when OpenKnowledge first starts on the repo
+(changing it later in OpenKnowledge's settings is kept). While history is off
+for a reason a restart can fix, the box waits rather than start OpenKnowledge
+without it. The repo opens in the box's `<box> (GIT)` tab.
 
 - The box has its own Gitea account. It can add to the notes' `main` history
   but never delete or rewrite it: `main` refuses force-pushes and deletion (tags
@@ -54,10 +60,9 @@ opens in the box's `<box> (GIT)` tab.
 
 ## Notes
 
-- **A fresh restart** (registering a port, restarting the project) stops
-  OpenKnowledge and logs the agent out, and OpenKnowledge reinstalls in the
-  background. The notes in `notes/` are untouched; wait for `ok --version`, then
-  repeat steps 3 and 4.
+- **A fresh restart** (restarting the project, changing the box's folders)
+  logs the agent out and reinstalls OpenKnowledge, which then starts again by
+  itself. The notes in `notes/` are untouched.
 - **Source material:** give the box project folders under **Read-only folders**
   (in the box window, or later in ⚙ → Box folders); they appear in the box under
   `/mnt/<folder>`, read-only, beside the knowledge base.

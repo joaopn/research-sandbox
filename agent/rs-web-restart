@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# rs-web-restart — restart this box's web app (OpenKnowledge in an
+# OpenKnowledge box). It asks the box's rs-web-loop, which stops the app and
+# starts it again at the same address; it never stops the app itself.
+
+touch "$HOME/.rs-web-restart" || exit 1
+P="$HOME/.rs-web-loop.pid"
+pid=""
+[ -f "$P" ] && [ ! -L "$P" ] && pid="$(head -c 16 "$P" 2>/dev/null | tr -cd '0-9')"
+# Signal only the loop: a pid left from an earlier boot may now be anything.
+if [ -n "$pid" ] && tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null \
+        | grep -qxF /usr/local/bin/rs-web-loop; then
+    kill -USR1 "$pid" 2>/dev/null
+fi
+echo "restart requested; the web app's log is /workspace/.rs-web.log"
+exit 0

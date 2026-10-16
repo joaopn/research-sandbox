@@ -763,6 +763,18 @@ def _verb_port_remove(args: dict, _progress=None) -> dict:
     return dataclasses.asdict(rscore.port_remove(req))
 
 
+# A box's web-app tab being opened: the webui server derives the address from
+# the request it arrived on (the tab's exact origin); the project + the tab's
+# registry port pick the box. In-box, never host-shaped.
+BOX_WEB_ADDRESS_WEBUI_FIELDS = frozenset({"project", "port", "address"})
+
+
+def _verb_box_web_address(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in BOX_WEB_ADDRESS_WEBUI_FIELDS}
+    req = rscore.BoxWebAddressRequest.from_kwargs(**safe)  # may raise ValidationError
+    return dataclasses.asdict(rscore.box_web_address(req))
+
+
 def _verb_port_list(args: dict, _progress=None) -> dict:
     safe = {k: v for k, v in args.items() if k == "project"}
     req = rscore.PortListRequest.from_kwargs(**safe)  # may raise ValidationError
@@ -1055,6 +1067,7 @@ VERBS = {
     "box_folders": _verb_box_folders,
     "port_add": _verb_port_add,
     "port_remove": _verb_port_remove,
+    "box_web_address": _verb_box_web_address,
     "port_list": _verb_port_list,
     "dev_repo_remove": _verb_dev_repo_remove,
     "dev_repo_list": _verb_dev_repo_list,
@@ -1596,6 +1609,7 @@ _INLINE_PROJECT_KEY = {
     "destroy": "name",
     "box_add": "project", "box_remove": "project", "box_folders": "project",
     "port_add": "project", "port_remove": "project",
+    "box_web_address": "project",
 }
 # Inline verbs that take the host-wide lifecycle flock (non-blocking).
 _INLINE_EXCLUSIVE = frozenset({"create", "destroy"})

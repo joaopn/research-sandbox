@@ -173,13 +173,17 @@ def pi_isolated_editor_service(name: str, port: int) -> dict | None:
 EXPORTED_PORT_ID_PREFIX = "port-"
 
 
-def exported_port_service(port: int, label: str) -> dict | None:
+def exported_port_service(port: int, label: str,
+                          follow_address: bool = False) -> dict | None:
     """Synthesize the http tab spec for an exported port, or None if the port is
-    outside the valid TCP range. Labelled with the operator-supplied label."""
+    outside the valid TCP range. Labelled with the operator-supplied label.
+    `follow_address` marks a box's own web-app tab: before loading it, the SPA
+    tells the box the address the tab is opened at (the app answers only
+    there) and waits until the app answers."""
     port = int(port)
     if not (1 <= port <= 65535):
         return None
-    return {
+    spec = {
         "label": label,
         "kind": "http",
         "always_on": False,
@@ -188,6 +192,9 @@ def exported_port_service(port: int, label: str) -> dict | None:
         "upstream_path": "/",
         "surface": "visual",
     }
+    if follow_address:
+        spec["follow_address"] = True
+    return spec
 
 
 # Pass-through claims (STAGE_PASSTHROUGH_PORTS): a raw-TCP host-port claim

@@ -2089,6 +2089,44 @@ class PortListRequest:
         return cls(project=_require_name(kw.get("project")))
 
 
+# The address a web-app box is told: the exact origin of its webui tab,
+# https:// + a hostname, IPv4 or [IPv6] + :port, nothing else. MIRROR of
+# rs_sandbox.valid_web_address and of the box's rs-web-set (one shared vector
+# set pins all three). A hostname is at most 253 characters (the DNS limit),
+# an IPv6 literal at most 45 inside its brackets.
+_WEB_HOST_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_WEB_ADDRESS_RE = re.compile(
+    r"\Ahttps://(?P<host>" + _WEB_HOST_LABEL + r"(?:\." + _WEB_HOST_LABEL
+    + r")*|\[[0-9A-Fa-f:.]{2,45}\]):(?P<port>[1-9][0-9]{0,4})\Z")
+WEB_HOST_MAX = 253
+
+
+def valid_web_address(addr: object) -> bool:
+    if not isinstance(addr, str):
+        return False
+    m = _WEB_ADDRESS_RE.match(addr)
+    return bool(m) and len(m.group("host")) <= WEB_HOST_MAX \
+        and int(m.group("port")) <= 65535
+
+
+@dataclass(frozen=True)
+class BoxWebAddressRequest:
+    """Tell a box its web-app tab's address. `port` is the tab's registry port
+    (the box's publish port); `address` is derived by the webui server from the
+    request it was opened through, never typed by anyone."""
+    project: str
+    port: int
+    address: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "BoxWebAddressRequest":
+        address = kw.get("address")
+        if not valid_web_address(address):
+            raise ValidationError("not a valid tab address")
+        return cls(project=_require_name(kw.get("project")),
+                   port=_coerce_app_port(kw.get("port")), address=address)
+
+
 # ---------------------------------------------------------------------------
 # Dev lane (STAGE_DEV_GITEA S1) — shared-gitea repo lifecycle + attachment
 # ---------------------------------------------------------------------------
@@ -3009,6 +3047,14 @@ class PortRemoveResult:
 class PortListResult:
     project: str
     ports: list[dict]                       # [{port, label}] — no secrets
+
+
+@dataclass
+class BoxWebAddressResult:
+    project: str
+    port: int
+    changed: bool                           # the box was told a new address
+    ready: bool                             # the app answers at that address
 
 
 # ===========================================================================
@@ -11163,8 +11209,8 @@ def _history_status_line(code: str, repo: str) -> str:
     where = f"notes/{repo}"
     return {
         "on": (f"History: on — the notes are kept in the Gitea repo {where} "
-               f"(the box's (GIT) tab). Turn on \"pull and push\" sync in "
-               f"OpenKnowledge's settings once, after ok init."),
+               f"(the box's (GIT) tab). Pull-and-push sync is turned on when "
+               f"OpenKnowledge first starts there."),
         "off:no-address": ("History: off — the box started without its Gitea "
                            "address; restart the project to restore it."),
         "off:no-token": ("History: off — the box started without its Gitea "
@@ -11236,6 +11282,69 @@ def _retire_history_rows(project: str, rows: list[dict], container: str) -> list
                  'rm -f "$HOME/.dev-tokens/$1"', "sh", f"{user}.token"],
                 capture_output=True)
     return out
+
+
+# The one refusal for a box type with its own web app on a project whose box
+# tool or box images predate web apps. A restart cannot fix it: a project
+# keeps the box images it was created with.
+_WEB_BOX_TOO_OLD_MSG = ("this project's boxes predate box types that start "
+                        "their own web app — create a new project to use this "
+                        "box type")
+# The in-image path of the web-app loop: its presence tells a current box
+# image from an older one. LOCKSTEP with agent/Dockerfile.sandbox-box's COPY.
+BOX_WEB_LOOP_PATH = "/usr/local/bin/rs-web-loop"
+
+
+def _gate_box_web(container: str, want_browser: bool) -> None:
+    """Refuse a web-app box on a project whose box tool or box image predates
+    web apps. A missing tool passes (a research project stages it later), and
+    so does a missing image (its lazy delivery then brings the current one)."""
+    r = run(["docker", "exec", container, "rs-sandbox", "--help"],
+            capture_output=True)
+    if r.returncode == 0 and "web-address" not in (r.stdout or ""):
+        raise ValidationError(_WEB_BOX_TOO_OLD_MSG)
+    image = SANDBOX_BOX_BROWSER_IMAGE if want_browser else SANDBOX_BOX_IMAGE
+    if run(["docker", "exec", container, "docker", "image", "inspect", image],
+           capture_output=True).returncode != 0:
+        return
+    r = run(["docker", "exec", container, "docker", "run", "--rm",
+             "--network", "none", "--entrypoint", "test", image,
+             "-x", BOX_WEB_LOOP_PATH], capture_output=True)
+    if r.returncode != 0:
+        raise ValidationError(_WEB_BOX_TOO_OLD_MSG)
+
+
+_WEB_TAB_MISSING_LINE = ("The box was added without its {label} tab; remove "
+                         "the box and add it again.")
+
+
+def _register_box_web_tab(workspace_path: "Path", info: dict, web_spec: dict,
+                          progress, want_name: str | None = None) -> None:
+    """Write the exported-port entry {port: pub_super, label, box, app_port,
+    web: true} for a just-created web-app box (port_add's box-branch dedupe +
+    sort). An output without a usable publish port keeps the box, untabbed,
+    with a warning step."""
+    label = str(web_spec.get("label") or "")
+    app_port = web_spec.get("port")
+    web = info.get("web")
+    pub = web.get("pub_super") if isinstance(web, dict) else None
+    if (not isinstance(pub, int) or isinstance(pub, bool)
+            or not _EXPORT_BOX_LOOPBACK_PORT_LO <= pub <= _EXPORT_BOX_LOOPBACK_PORT_HI
+            or not isinstance(app_port, int) or isinstance(app_port, bool)):
+        progress.step("warning", _WEB_TAB_MISSING_LINE.format(label=label))
+        return
+    box = info.get("name")
+    # The tool's output is data: the name must be a box name, and this add's.
+    if not (isinstance(box, str) and _BOX_NAME_RE.match(box)) \
+            or (want_name and box != want_name):
+        progress.step("warning", _WEB_TAB_MISSING_LINE.format(label=label))
+        return
+    ports = [e for e in read_exported_ports(workspace_path)
+             if not (e.get("box") == box and e.get("app_port") == app_port)]
+    ports.append({"port": pub, "label": label, "box": box,
+                  "app_port": app_port, "web": True})
+    ports.sort(key=lambda e: e["port"])
+    _write_exported_ports(workspace_path, ports)
 
 
 def _gate_box_history(req: "BoxAddRequest", catalog: dict, container: str,
@@ -11497,6 +11606,12 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     # effect, so a refusal creates nothing).
     if req.folders:
         _check_box_folders(workspace_path, req.folders)
+    # A box type with its own web app needs a box tool and box image that
+    # carry the web-app machinery; both probes run before the history gate
+    # (which may start the Gitea), so this refusal starts nothing.
+    web_spec = catalog.get(req.preset, {}).get("web")
+    if web_spec:
+        _gate_box_web(container, want_browser)
     # Gitea history: every refusal here, before any side effect (the claims
     # that need the Gitea run last, so a cheap refusal never starts it).
     hist_claim = (_gate_box_history(req, catalog, container, workspace_path)
@@ -11708,6 +11823,12 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         info.get("name"))
     for line in folder_warnings:
         progress.step("warning", line)
+    # The box type's own web app: register its tab now, from the publish port
+    # the box tool allocated before the box's first run. The label and app
+    # port come from this host's catalog copy, never from the tool's output.
+    if web_spec:
+        _register_box_web_tab(workspace_path, info, web_spec, progress,
+                              want_name=req.name)
     # Editor readiness gate (create()'s editor-gate shape): the box's stub only
     # listens ~15-30s after `docker run` (in-box extension installs first), and
     # the webui re-fetches the tab set the moment this op completes — without
@@ -11930,7 +12051,9 @@ def box_presets(req: "BoxPresetsRequest", _progress=None) -> BoxPresetsResult:  
                 # mcps on a dev box).
                 "dev": bool(e.get("dev")),
                 # Offers the box window's "Keep history on Gitea" switch.
-                "gitea_history": bool(e.get("gitea_history"))}
+                "gitea_history": bool(e.get("gitea_history")),
+                # The type starts its own web app in a tab of its own.
+                "web": bool(e.get("web"))}
                for e in catalog]
     allowed = sorted(x["name"] for x in load_project_allowlist(req.project, cfg)
                      if x.get("name"))
@@ -11958,7 +12081,10 @@ def read_exported_ports(workspace_path: "Path") -> list[dict]:  # type: ignore[n
     optional {box:str, app_port:int} on an inner-box entry (F3 Slice 2b): `port` is
     the supervisor-netns publish port (pub_super) the resolver dials, `app_port` the
     box's own 127.0.0.1 port, `box` the box name — the pair the unexpose/sweep paths
-    need. Missing/malformed → []; a plain {port,label} stays a top-level entry.
+    need. Such an entry may also carry {web:true}: the box's own web app's tab,
+    registered at box create (kept only when exactly True on a valid box entry, so
+    every other entry round-trips byte-identically). Missing/malformed → []; a
+    plain {port,label} stays a top-level entry.
     A pass-through claim (STAGE_PASSTHROUGH_PORTS) additionally carries
     {passthrough:true, host_port:int, count:int>=1 (absent == 1)} — accepted only
     when ALL of those hold, else the entry DEGRADES to a plain {port,label}
@@ -11987,6 +12113,8 @@ def read_exported_ports(workspace_path: "Path") -> list[dict]:  # type: ignore[n
             if isinstance(box, str) and box and isinstance(app_port, int) \
                     and not isinstance(app_port, bool):
                 entry["box"], entry["app_port"] = box, app_port
+                if e.get("web") is True:
+                    entry["web"] = True
             pt, hp, cnt = e.get("passthrough"), e.get("host_port"), e.get("count", 1)
             if (pt is True and isinstance(hp, int) and not isinstance(hp, bool)
                     and isinstance(cnt, int) and not isinstance(cnt, bool)
@@ -12043,10 +12171,18 @@ def port_add(req: "PortAddRequest", _progress=None) -> PortAddResult:  # type: i
             die(f"unexpected rs-sandbox expose output shape: {r.stdout.strip()!r}")
         # Register by pub_super (the tab port); keep the app_port + box for
         # unexpose/sweep. Idempotent on (box, app_port) — drop a prior entry.
-        ports = [e for e in read_exported_ports(ws)
+        # The box's own web-app tab keeps its flag through a re-add (a relabel),
+        # so it is still told its address.
+        old = read_exported_ports(ws)
+        was_web = any(e.get("box") == req.box and e.get("app_port") == req.port
+                      and e.get("web") is True for e in old)
+        ports = [e for e in old
                  if not (e.get("box") == req.box and e.get("app_port") == req.port)]
-        ports.append({"port": pub, "label": req.label,
-                      "box": req.box, "app_port": req.port})
+        new_entry = {"port": pub, "label": req.label,
+                     "box": req.box, "app_port": req.port}
+        if was_web:
+            new_entry["web"] = True
+        ports.append(new_entry)
         ports.sort(key=lambda e: e["port"])
         _write_exported_ports(ws, ports)
         # The expose re-ran the box: report the folders it started without.
@@ -12124,6 +12260,11 @@ def port_remove(req: "PortRemoveRequest", _progress=None) -> PortRemoveResult:  
         return e.get("port") == req.port and not e.get("passthrough")
 
     gone = next((e for e in existing if _match(e)), None)
+    # A box type's own web-app tab belongs to the box (the box keeps running
+    # the app); only removing the box removes it.
+    if gone and gone.get("web") is True:
+        raise ValidationError("This tab belongs to the box; remove the box to "
+                              "remove it.")
     warnings: list[str] = []
     if gone and gone.get("box"):
         container = _running_dind_supervisor(req.project)
@@ -12142,6 +12283,28 @@ def port_remove(req: "PortRemoveRequest", _progress=None) -> PortRemoveResult:  
     _reconcile_loopback_bridges(req.project, cfg)
     return PortRemoveResult(project=req.project, port=req.port, ports=ports,
                             warnings=warnings)
+
+
+def box_web_address(req: "BoxWebAddressRequest", _progress=None) -> BoxWebAddressResult:  # type: ignore[name-defined]
+    """Hand a web-app box the address its tab is opened at; report whether the
+    app answers there. The port must be a box's own web-app tab in THIS
+    project's registry — the client names a tab, never a box. Anything short of
+    a clean answer from the box reads as not ready: the tab waits and asks
+    again."""
+    cfg = load_config()
+    ws = workspace_path_for(req.project, cfg)
+    entry = next((e for e in read_exported_ports(ws)
+                  if e.get("port") == req.port and e.get("web") is True
+                  and e.get("box")), None) if ws.is_dir() else None
+    if entry is None:
+        raise ValidationError("this tab is not a box's own web app")
+    container = _running_dind_supervisor(req.project)
+    r = run(["docker", "exec", container, "rs-sandbox", "web-address",
+             entry["box"], req.address], capture_output=True)
+    info = _parse_box_tool_json(r.stdout) if r.returncode == 0 else {}
+    return BoxWebAddressResult(project=req.project, port=req.port,
+                               changed=info.get("changed") is True,
+                               ready=info.get("ready") is True)
 
 
 def port_list(req: "PortListRequest", _progress=None) -> PortListResult:  # type: ignore[name-defined]

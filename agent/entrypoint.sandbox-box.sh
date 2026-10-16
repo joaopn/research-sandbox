@@ -238,6 +238,16 @@ fi
 # source serves the boot and the live wiring. A collision exits 1 = the boot stops.
 python3 /usr/local/lib/rs-box/box-render-mcp.py
 
+# --- Preset web app (RS_BOX_WEB_START): keep it running in the background ---
+# rs-web-loop starts the app once the webui has told this box the address its
+# tab is opened at (/workspace/.rs-web-address) and restarts it when that
+# changes. Home is image-resident, so a plain stop/start keeps the last boot's
+# loop pid and any unconsumed restart request: remove both, by name, first.
+if [[ -n "${RS_BOX_WEB_START:-}" ]]; then
+    rm -f ~/.rs-web-loop.pid ~/.rs-web-restart
+    /usr/local/bin/rs-web-loop >/dev/null 2>&1 &
+fi
+
 echo "sandbox-box[${RS_SANDBOX_NAME}]: ready (workspace at /workspace)"
 
 # Idle. byobu sessions are created on first webui-tab / attach connect.

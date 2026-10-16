@@ -48,6 +48,15 @@ RUN chmod +x /opt/dev/repo-watch.sh /opt/dev/rs-repo-watch /opt/dev/rs-wt \
 COPY cli/rs_loopback_fwd.py /usr/local/bin/rs-loopback-fwd
 RUN chmod +x /usr/local/bin/rs-loopback-fwd
 
+# Preset web apps: rs-web-loop keeps the box's web app running at its webui
+# tab's address (started by the entrypoint when RS_BOX_WEB_START is set),
+# rs-web-set is the host's one call that hands it the address, rs-web-restart
+# is the operator's restart command. rs-sandbox probes for rs-web-loop's path
+# to tell this image from one that predates web apps.
+COPY agent/rs-web-loop agent/rs-web-set agent/rs-web-restart /usr/local/bin/
+RUN chmod +x /usr/local/bin/rs-web-loop /usr/local/bin/rs-web-set \
+    /usr/local/bin/rs-web-restart
+
 USER worker
 WORKDIR /workspace
 # tini (PID 1) comes from rs-ext-base.

@@ -1,6 +1,6 @@
 # OpenKnowledge box
 
-You are an agent in a disposable **OpenKnowledge box** — a confined container whose knowledge base is the folder `/workspace/notes`. OpenKnowledge serves that folder as a live markdown editor the user watches in a webui tab, and its MCP server (registered by `ok init` in `/workspace/notes/.mcp.json`) gives you its read, search and write tools.
+You are an agent in a disposable **OpenKnowledge box** — a confined container whose knowledge base is the folder `/workspace/notes`. OpenKnowledge serves that folder as a live markdown editor the user watches in a webui tab, and its MCP server (registered by `ok init` in `/workspace/notes/.mcp.json`) gives you its read, search and write tools. The box starts OpenKnowledge by itself (its output is in `/workspace/.rs-web.log`; `rs-web-restart` restarts it).
 
 If `/workspace/.tools-inventory.md` exists, read it first — it lists the tools wired into this box.
 
@@ -9,7 +9,7 @@ If `/workspace/.tools-inventory.md` exists, read it first — it lists the tools
 - Every note, page and source you write goes under `/workspace/notes`. Files elsewhere in `/workspace` (this file, `.claude/`, the MCP files, `.rs-greeting`) are the box's own housekeeping, not content — never write notes there and never move them into `notes/`.
 - Project folders the user gives this box appear **read-only** under `/mnt/<folder>` (`ls /mnt`). Read source material there and cite it; you cannot change it, and what you write from it goes into `/workspace/notes`.
 - If the box keeps history on Gitea (its terminal message says "History: on"), OpenKnowledge itself commits and pushes `/workspace/notes`. Never change its git remotes, never force-push, never rewrite or delete history there — the Gitea refuses it, and the user's history is the point.
-- OpenKnowledge registers its tools for Claude Code only; another agent works on the files in `notes/` directly. As Claude Code you were started in `/workspace/notes` so that those tools load. If they are missing, check that you are running in `/workspace/notes` (`pwd`) and that `/workspace/notes/.mcp.json` exists (the user runs `ok init` there once), and say so; do not work around it by writing files by hand into a knowledge base you cannot see through the tools.
+- OpenKnowledge registers its tools for Claude Code only; another agent works on the files in `notes/` directly. As Claude Code you were started in `/workspace/notes` so that those tools load. If they are missing, check that you are running in `/workspace/notes` (`pwd`) and that `/workspace/notes/.mcp.json` exists (the box runs `ok init` there when it starts OpenKnowledge), and say so; do not work around it by writing files by hand into a knowledge base you cannot see through the tools.
 - Prefer OpenKnowledge's tools over raw file edits inside `notes/`: the user watches edits land in the editor, and the tools keep links and the project's own structure consistent. OpenKnowledge's own skill (`/workspace/notes/.claude/skills/open-knowledge/`) describes how it expects you to work.
 
 ## Sources and attribution
@@ -18,7 +18,7 @@ Cite where a statement comes from — a file you were given, a web page, the use
 
 ## Restarts
 
-A fresh restart of this box (registering a port, a project restart) stops OpenKnowledge and logs you out; the notes in `/workspace/notes` are untouched. The user restarts OpenKnowledge and you from the steps the box's terminal shows.
+A fresh restart of this box (a project restart, a folder change) logs you out and reinstalls OpenKnowledge, which the box then starts again by itself; the notes in `/workspace/notes` are untouched. The user starts you again from `/workspace/notes`.
 
 This box is disposable; sign the agent in inside: `claude` then `/login` (Claude
 Code), or `pi` then `/login` with an API key (pi: OpenRouter, the intended path, or any

@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# rs-web-loop — keeps a box's web app running at the address its webui tab is
+# opened at. Started in the background by the box entrypoint, as the box user,
+# when the box's type declares a web app (RS_BOX_WEB_START is the app's start
+# command, RS_BOX_WEB_PORT its port).
+#
+# The address FILE (/workspace/.rs-web-address, written by rs-web-set) is the
+# source of truth; USR1 only cuts a wait short. Each pass: read the address and
+# any restart request, stop the app if its address changed or a restart was
+# asked for, start it if it is not running and an address is known, then wait.
+# A signal that lands just before the wait is not lost: the next pass, at most
+# WEB_RECHECK_S later, still sees the file.
+#
+# No `set -e`: a failure inside a pass must never end the loop.
+
+START="${RS_BOX_WEB_START:-}"
+[ -n "$START" ] || exit 0
+
+ADDR_FILE=/workspace/.rs-web-address
+LOG=/workspace/.rs-web.log
+PID_FILE="$HOME/.rs-web-loop.pid"
+RESTART_FILE="$HOME/.rs-web-restart"
+
+# The bound on how late a missed wake-up is applied; the normal path is woken
+# at once by USR1, so this only costs anything when a signal was lost.
+WEB_RECHECK_S=10
+# How long a stopped app gets to exit before it is killed. OpenKnowledge exits
+# about 0.6 s after TERM (measured); a few seconds absorbs a busy box.
+WEB_STOP_GRACE_S=5
+# The pause before restarting an app that ended by itself, so a start command
+# that fails at once cannot spin. A deliberate restart (new address, a restart
+# request) skips it.
+WEB_RESTART_BACKOFF_S=5
+# The longest address rs-web-set accepts: "https://" + a 253-character host +
+# ":" + a 5-digit port.
+WEB_ADDRESS_MAX_BYTES=267
+
+woke=0
+trap 'woke=1' USR1
+printf '%s\n' "$$" > "$PID_FILE"
+
+app=""         # the running app's pid (it leads its own process group)
+app_addr=""    # the address it was started with
+not_before=0   # no start before this $SECONDS value (the backoff)
+
+read_address() {
+    if [ -f "$ADDR_FILE" ] && [ ! -L "$ADDR_FILE" ]; then
+        head -c "$WEB_ADDRESS_MAX_BYTES" "$ADDR_FILE" 2>/dev/null
+    fi
+}
+
+# A child that exited but is not yet reaped still answers kill -0; read its
+# state instead, so a finished app never reads as running.
+alive() {
+    [ -n "$1" ] && [ -r "/proc/$1/status" ] \
+        && ! grep -q '^State:[[:space:]]*Z' "/proc/$1/status" 2>/dev/null
+}
+
+stop_app() {
+    kill -TERM -- "-$app" 2>/dev/null
+    local i=0
+    while alive "$app" && [ "$i" -lt $((WEB_STOP_GRACE_S * 10)) ]; do
+        sleep 0.1; i=$((i + 1))
+    done
+    alive "$app" && kill -KILL -- "-$app" 2>/dev/null
+    wait "$app" 2>/dev/null
+    app=""
+}
+
+start_app() {
+    # setsid execs in place here (a background child of a script is not a
+    # group leader), so $! is the app's pid and leads its group. Each run
+    # replaces the log with its own output, stderr included.
+    PATH="$HOME/.local/bin:$PATH" RS_WEB_ADDRESS="$1" \
+        setsid bash -c "$START" > "$LOG" 2>&1 &
+    app=$!
+    app_addr="$1"
+}
+
+# Wait up to $1 seconds, ending early on USR1 or when the app exits (so a
+# crash is restarted after the backoff, not after the next recheck).
+wait_for() {
+    [ "$woke" = 1 ] && { woke=0; return; }
+    sleep "$1" & local sp=$!
+    if [ "$woke" != 1 ]; then
+        if [ -n "$app" ]; then wait -n "$sp" "$app" 2>/dev/null
+        else wait "$sp" 2>/dev/null; fi
+    fi
+    kill "$sp" 2>/dev/null
+    wait "$sp" 2>/dev/null
+    woke=0
+}
+
+while true; do
+    addr="$(read_address)"
+    restart=0
+    if [ -e "$RESTART_FILE" ]; then
+        restart=1
+        rm -f "$RESTART_FILE"
+    fi
+    if [ -n "$app" ] && alive "$app"; then
+        if [ "$addr" != "$app_addr" ] || [ "$restart" = 1 ]; then
+            stop_app
+            not_before=0
+        fi
+    elif [ -n "$app" ]; then
+        # It ended by itself: reap it, end anything left in its group (a child
+        # still holding the port would fail every restart), and pace the next
+        # start unless one was asked for or the address changed meanwhile.
+        wait "$app" 2>/dev/null
+        kill -KILL -- "-$app" 2>/dev/null
+        app=""
+        if [ "$restart" = 1 ] || [ "$addr" != "$app_addr" ]; then
+            not_before=0
+        else
+            not_before=$((SECONDS + WEB_RESTART_BACKOFF_S))
+        fi
+    elif [ "$restart" = 1 ]; then
+        not_before=0
+    fi
+    wait_s=$WEB_RECHECK_S
+    if [ -z "$app" ] && [ -n "$addr" ]; then
+        if [ "$SECONDS" -ge "$not_before" ]; then
+            start_app "$addr"
+        elif [ $((not_before - SECONDS)) -lt "$wait_s" ]; then
+            wait_s=$((not_before - SECONDS))
+        fi
+    fi
+    wait_for "$wait_s"
+done
