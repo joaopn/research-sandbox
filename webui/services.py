@@ -19,8 +19,8 @@ import re
 # and either spawns / reuses the code-server child behind 127.0.0.1.
 # Tab order in the SPA = SERVICES dict insertion order. Editor (code-
 # server) is the primary work surface (notebooks, file editing, code-
-# reading); it leads. Supervisor (the in-container Claude Code session
-# via byobu) follows. Boxes are synthesized per-project (pi-iso-<name>),
+# reading); it leads. The project's terminal (byobu in its top-level
+# container) follows. Boxes are synthesized per-project (pi-iso-<name>),
 # not static entries here.
 SERVICES = {
     "code-server": {
@@ -46,11 +46,14 @@ SERVICES = {
         "default_port": 8445,
         "upstream_path": "/",
     },
-    # The supervisor's interactive Claude session, attached via SSH +
-    # byobu. The new-session lands in bash (NON-login, as before) after
-    # cat-ing the workflow greeting if one was staged (STAGE_SPAWN_GREETING):
-    # the research workflow ships no greeting yet, so this is a clean no-op
-    # today — the mechanism is in place for a later manifest-only add.
+    # The project's terminal: byobu in its top-level container, attached via
+    # SSH. Its static label names the research supervisor; every other project
+    # type is relabelled SHELL_TAB_LABEL by project_services_handler. The id
+    # stays `supervisor` everywhere. The new-session lands in bash (NON-login,
+    # as before) after cat-ing the workflow greeting if one was staged
+    # (STAGE_SPAWN_GREETING): the research workflow ships no greeting yet, so
+    # this is a clean no-op today — the mechanism is in place for a later
+    # manifest-only add.
     # The service id was once `xterm` (named after the renderer)
     # and is now `supervisor` (named after what it actually connects
     # to). Existing projects' `research.service.xterm` labels are
@@ -70,11 +73,18 @@ SERVICES = {
         ),
     },
     # (The agent-less `management` tab was retired in STAGE_SANDBOX_DIND_AGENT —
-    # sandbox-dind now runs an agent and shows the Supervisor tab like research.)
+    # sandbox-dind shows this same terminal tab, labelled SHELL_TAB_LABEL.)
     # Boxes (kind="sandbox") are NOT static entries — they're per-project and
     # arbitrarily named, synthesized on demand as `pi-iso-<name>` tabs by
     # project_services_handler (see pi_isolated_service below).
 }
+
+# The terminal tab's label for every project whose top-level container is not
+# the research supervisor (image rs-supervisor): the dind workflows on
+# rs-sandbox-dind (dev, sandbox-dind, store dind workflows) and every
+# docker-substrate project. Their terminal is a shell: an agent may run there,
+# but no research supervisor.
+SHELL_TAB_LABEL = "Shell (CLI)"
 
 
 # Boxes (kind="sandbox") are per-project and arbitrarily named, so they can't be

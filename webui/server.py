@@ -1977,22 +1977,23 @@ async def project_services_handler(request: web.Request) -> web.Response:
         ])
         probe_up = {sid: up for (sid, _), up in zip(probe_jobs, results)}
 
-    # A bare docker box (substrate=docker) has no claude-supervisor — its
-    # "Supervisor" tab is really a plain login shell (ssh+byobu bash on the
-    # rs-minimal image, which still ships ssh+byobu+code-server). Relabel it
-    # "Shell" so the tab is honest, but KEEP it — it's the box's only terminal.
-    # Substrate read off the same marker; it stays hidden from the user (Q7).
+    # Only the research lab's top-level container is a supervisor (image
+    # rs-supervisor: dind substrate, type research). Every other project — the
+    # rs-sandbox-dind workflows (dev, sandbox-dind, store dind ones) and every
+    # docker-substrate project (type derives to research there) — gets its
+    # terminal tab relabelled SHELL_TAB_LABEL, while the id stays `supervisor`.
+    # Both read off the project marker; the substrate stays hidden from the user.
     is_docker = _read_project_substrate(project) == "docker"
+    has_supervisor = not is_docker and _read_project_type(project) == "research"
 
     out: dict[str, dict] = {}
     for sid, svc in services.SERVICES.items():
-        # Flavor gate (STAGE_SANDBOX_DIND_AGENT): sandbox-dind now runs an agent, so
-        # it shows the Supervisor tab like research — the agent-less Management tab is
-        # retired. The Editor (code-server) tab is port-probed below; sandbox-dind
+        # Every flavor shows the terminal tab (labelled per has_supervisor above).
+        # The Editor (code-server) tab is port-probed below; sandbox-dind
         # defaults the editor OFF (lean), so its probe fails and the Editor tab
         # auto-omits unless --enable code-server.
         if sid == "supervisor" and is_docker:
-            out[sid] = {**svc, "label": "Shell (CLI)"}   # honest label for a bare box
+            out[sid] = {**svc, "label": services.SHELL_TAB_LABEL}
             continue
         if sid == "supervisor":
             # Box harness is a standing dind utility (STAGE_DIND_UNIFY): ANY non-docker
@@ -2000,7 +2001,9 @@ async def project_services_handler(request: web.Request) -> web.Response:
             # box_harness so the SPA shows the box "+" control. (Reached only for
             # non-docker — the docker case continued above.) Copy the spec — never
             # mutate the shared SERVICES dict.
-            out[sid] = {**svc, "box_harness": not is_docker}
+            out[sid] = {**svc, "box_harness": not is_docker,
+                        **({} if has_supervisor
+                           else {"label": services.SHELL_TAB_LABEL})}
             continue
         if svc.get("always_on"):
             out[sid] = svc
