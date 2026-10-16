@@ -56,6 +56,26 @@ AGENT_DIST_MOUNT = "/opt/agent-dist"
 # AGENT_DIST_MOUNT. The box's entrypoint deploys it only when RS_SERVICE_CODE_SERVER
 # is enabled (forwarded from the project's flag) AND the mount is populated.
 EDITOR_DIST_MOUNT = "/opt/editor-dist"
+# Node seed (STAGE_NODE_SEED), staged into the supervisor the same way. MIRROR of
+# rscore.NODE_DIST_MOUNT (pytest-pinned). A box whose preset asks for node
+# RO-mounts it and copies it into its own ~/.local as the first step of its
+# run-once setup (_NODE_SETUP_STEP), so the box images carry no node of their own.
+NODE_DIST_MOUNT = "/opt/node-dist"
+# The populated-seed sentinel (a regular file in the seed, never a link).
+NODE_DIST_BIN = f"{NODE_DIST_MOUNT}/.local/bin/node"
+# The RS-owned step composed in front of a node box's preset setup, at every
+# run (never stored on the entry). No-clobber: a node the box already has —
+# e.g. one it upgraded itself — is kept. A failed copy ends the setup with a
+# non-zero status, so the run-once sentinel is not written and the box retries,
+# like any failed setup. npm's global prefix follows the node binary
+# (~/.local), so `npm install -g` needs no sudo.
+_NODE_SETUP_STEP = (
+    f'[ -e "$HOME/.local/bin/node" ] || '
+    f'{{ mkdir -p "$HOME/.local" && cp -a {NODE_DIST_MOUNT}/.local/. "$HOME/.local/"; }} '
+    f'|| exit 1')
+# The box's greeting, printed by its terminal tab when it opens a session
+# (webui services.pi_isolated_service → greet-and-shell.sh <this path>).
+GREETING_FILE = ".rs-greeting"
 BOX_IMAGE = "rs-sandbox-box:latest"
 # Browser variant: + @playwright/mcp + Chromium, wired into the box's claude.
 BOX_IMAGE_BROWSER = "rs-sandbox-box-browser:latest"
@@ -376,6 +396,45 @@ def _stage_box_workspace(name: str, preset: dict, mcps: list[str],
     (ws / ".mcp-proxy.json").write_text(
         json.dumps({"mcpServers": servers}, indent=2, sort_keys=True) + "\n")
     _write_mcp_preset(ws, preset)
+    _write_greeting(ws, preset)
+
+
+def _write_greeting(ws: Path, preset: dict) -> None:
+    """Write the preset's greeting to the box's /workspace/.rs-greeting (create
+    and every re-run, so a catalog edit lands at restart). NEVER removed: no
+    product path wrote this file before presets could carry a greeting, so a
+    box without one may hold a greeting someone wrote by hand."""
+    text = preset.get("greeting") or ""
+    if not text.strip():
+        return
+    # The folder is writable from inside the box, so never OPEN what sits at the
+    # path (a planted link could point at any supervisor file; a planted FIFO
+    # would block this write — and the project restart it runs in — forever):
+    # write a fresh temp file (O_EXCL|O_NOFOLLOW refuses anything pre-planted
+    # there) and rename it over the path, which replaces a link, FIFO or device
+    # node without opening it. A directory at the path fails the rename → warn.
+    path = ws / GREETING_FILE
+    tmp = ws / (GREETING_FILE + ".tmp")
+    try:
+        if tmp.is_symlink() or tmp.exists():
+            tmp.unlink()
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o644)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text if text.endswith("\n") else text + "\n")
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"rs-sandbox: warning: could not write the box greeting: {e}",
+              file=sys.stderr)
+
+
+def _compose_setup(preset_setup: str, node: bool) -> str:
+    """The setup text a box runs once per container filesystem: the RS node
+    step in front of the preset's own setup for a node box, else the preset's
+    setup unchanged (a non-node box runs byte-identically)."""
+    if not node:
+        return preset_setup
+    return _NODE_SETUP_STEP + ("\n" + preset_setup if preset_setup else "")
 
 
 def _write_mcp_preset(ws: Path, preset: dict) -> None:
@@ -592,7 +651,8 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
              clone_ref: str = "", clone_setup: str = "", preset_setup: str = "",
              dev: dict | None = None, dev_subnet: str = "", branch: str = "",
              loopback_ports: list[dict] | None = None,
-             model: str = "", effort: str = "", fetch: bool = False) -> None:
+             model: str = "", effort: str = "", fetch: bool = False,
+             node: bool = False) -> None:
     """docker run a box in the local inner dockerd. ``browser`` selects the
     Chromium-equipped image; ``agent`` (any staged agent|none): any agent mounts
     the project's MERGED copy-source and exports RS_BOX_AGENT=claude (the baked
@@ -633,6 +693,21 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     # STAGE_BOX_EXT_UX). Only mount when this box opted in AND the dist is staged.
     editor_mount = (["-v", f"{EDITOR_DIST_MOUNT}:{EDITOR_DIST_MOUNT}:ro"]
                     if (editor and os.path.isdir(EDITOR_DIST_MOUNT)) else [])
+    # Node seed mount, only for a box whose entry asks for node AND only when the
+    # staged seed is populated: a bare -v on a missing source would make the
+    # inner dockerd create an empty root-owned /opt/node-dist, which a later
+    # on-demand stage would replace — leaving this box mounted on the deleted
+    # folder. Without the mount the setup's node step fails and the box retries
+    # its setup until a restart after the seed is staged.
+    node_mount: list[str] = []
+    if node:
+        if os.path.isfile(NODE_DIST_BIN):
+            node_mount = ["-v", f"{NODE_DIST_MOUNT}:{NODE_DIST_MOUNT}:ro"]
+        else:
+            print(f"rs-sandbox: warning: box {name!r} needs node, but the node "
+                  f"runtime is not staged in this project; its setup cannot "
+                  f"finish until the project is restarted with node pulled",
+                  file=sys.stderr)
     # Publish the box's code-server stub (8443) onto the supervisor netns at
     # editor_port so the webui can reach it at rs-project-<proj>:<editor_port>.
     editor_publish = (["-p", f"{editor_port}:8443"]
@@ -699,7 +774,8 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
             model_env += ["-e", f"CLAUDE_CODE_EFFORT_LEVEL={effort}"]
     # Preset setup script rides env argv deliberately: it is user-VISIBLE
     # catalog data (the window shows it), never a field value.
-    setup_env = (["-e", f"RS_BOX_SETUP={preset_setup}"] if preset_setup else [])
+    setup = _compose_setup(preset_setup, node)
+    setup_env = (["-e", f"RS_BOX_SETUP={setup}"] if setup else [])
     common = [
         "--name", cname,
         *net_args,
@@ -707,6 +783,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         "-v", f"{WORKSPACE}/{sub}:/workspace",
         *agent_mount,
         *editor_mount,
+        *node_mount,
         *editor_publish,
         *loopback_publish,
         "-e", f"RS_SERVICE_CODE_SERVER={'enabled' if editor else 'disabled'}",
@@ -801,7 +878,9 @@ def _rerun_box(name: str, entry: dict) -> None:
     # staged file rather than failing the restart (today a restart never
     # resolves the preset at all; that must not regress).
     try:
-        _write_mcp_preset(ws, resolve_preset(entry.get("preset") or "empty"))
+        preset = resolve_preset(entry.get("preset") or "empty")
+        _write_mcp_preset(ws, preset)
+        _write_greeting(ws, preset)
     except SystemExit:
         print(f"rs-sandbox: warning: preset {entry.get('preset')!r} no longer "
               f"resolvable; keeping the box's existing .mcp-preset.json",
@@ -835,7 +914,9 @@ def _rerun_box(name: str, entry: dict) -> None:
              effort=entry.get("effort") or "",
              # Same reasoning: the rs-fetch add-host + staging must re-apply
              # from the stored entry on every re-run.
-             fetch=bool(entry.get("fetch")))
+             fetch=bool(entry.get("fetch")),
+             # From the STORED entry: the node step is composed at each run.
+             node=bool(entry.get("node")))
 
 
 def _box_entry(entries: dict[str, dict], name: str) -> dict:
@@ -895,9 +976,10 @@ def cmd_create(args: argparse.Namespace) -> None:
                 "base-image only)")
         # The catalog validator forbids these on dev presets; a tampered staged
         # catalog is the only way here — die rather than run half-wired.
-        if preset.get("fields") or preset.get("setup") or preset.get("mcp_servers"):
-            die("a dev preset cannot carry fields/setup/mcp_servers; fix the "
-                "box type in the catalog")
+        if any(preset.get(k) for k in ("fields", "setup", "mcp_servers",
+                                       "node", "greeting")):
+            die("a dev preset cannot carry fields/setup/mcp_servers/node/"
+                "greeting; fix the box type in the catalog")
         # Per-consumer forks: the box's gitea identity is minted HOST-side
         # (research/webui box add) before this runs and arrives as
         # --gitea-user; a bare in-supervisor `rs-sandbox create` cannot mint
@@ -982,6 +1064,14 @@ def cmd_create(args: argparse.Namespace) -> None:
             "staged in this project — install the editor from the Software "
             "page if it is missing on this host, then stop and start the "
             "project to stage it, and retry")
+    # A node box copies the project's staged node seed at boot. Refuse before any
+    # state write when it is missing (the host box add stages it on demand, so
+    # this is reached only by a direct run or a seed removed since). Webui-safe:
+    # the text reaches the browser through the op tail.
+    node = bool(preset.get("node"))
+    if node and not os.path.isfile(NODE_DIST_BIN):
+        die("this box type needs node, but node is not staged in this project "
+            "— pull node under Management → Software, then retry")
     dev_subnet = ""
     if is_dev:
         # Dev boxes live on their own pinned /24, NOT the rs-inner pool: no
@@ -1008,6 +1098,10 @@ def cmd_create(args: argparse.Namespace) -> None:
              "model": model, "effort": effort}
     if editor:
         entry["editor_port"] = editor_port
+    if node:
+        # The node step is composed at every run from this flag (_compose_setup),
+        # never stored: preset_setup stays the preset's own text.
+        entry["node"] = True
     if preset_setup:
         # Snapshot (like the clone entries' setup): _rerun_box re-passes it so
         # a recreate — which wipes the container fs and the run-once sentinel —
@@ -1030,7 +1124,7 @@ def cmd_create(args: argparse.Namespace) -> None:
              editor_port=editor_port, clone_repo=repo if is_clone else "",
              clone_ref=ref, clone_setup=setup, preset_setup=preset_setup,
              dev=dev_info, dev_subnet=dev_subnet, branch=branch,
-             model=model, effort=effort, fetch=fetch)
+             model=model, effort=effort, fetch=fetch, node=node)
     print(json.dumps({"name": name, "ip": ip, "preset": args.preset,
                       "browser": browser, "agent": agent, "editor": editor,
                       "editor_port": editor_port or None, "fetch": fetch,

@@ -84,7 +84,7 @@ def is_reserved_field(name: str) -> bool:
 # here; an unlisted built-in and every BYO operator type fall after, by name.
 # Product order, not operator data — a constant here, not a manifest field.
 _BUILTIN_ORDER = ("empty", "websearcher", "zotero", "data-wrangler", "byo",
-                  "paper-orchestra")
+                  "paper-orchestra", "open-knowledge")
 
 # `instructions` is folded in from the sibling .md (built-ins) or carried inline
 # (BYO), so it is an allowed key on the normalized entry the validator sees.
@@ -101,7 +101,11 @@ _ALLOWED_KEYS = {"name", "image", "agent_default", "clone", "description",
                  # password input; values travel as a private env file);
                  # mcp_servers: preset-declared stdio MCP entries, staged as a
                  # third merge source for the box's .mcp.json.
-                 "setup", "fields", "mcp_servers"}
+                 "setup", "fields", "mcp_servers",
+                 # node: the project's pinned node seed is copied into the box
+                 # home as an RS step in front of the setup; greeting: the
+                 # message the box's terminal tab prints when it opens.
+                 "node", "greeting"}
 
 
 class BoxCatalogError(Exception):
@@ -250,9 +254,25 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
                 if cextras:
                     out.append(q(f"unknown keys: {sorted(cextras)}"))
 
+    # node: copied into the box home by an RS step that runs in front of the
+    # preset's own setup (the run-once setup block). A clone preset's per-box
+    # setup runs earlier, in a login shell, so it could never see that node —
+    # hence clone:false, the same rule setup has.
+    if "node" in m:
+        if not isinstance(m["node"], bool):
+            out.append(p(f"node must be a boolean, got {m.get('node')!r}"))
+        elif m["node"] and m.get("clone") is not False:
+            out.append(p("node requires clone:false (node arrives in front of the "
+                         "preset setup, after a clone preset's own setup ran)"))
+
+    # greeting: the text the box's terminal tab prints when it opens a session
+    # (written to the box's /workspace/.rs-greeting).
+    if "greeting" in m and not _is_str(m["greeting"]):
+        out.append(p("greeting must be a non-empty string"))
+
     # The dev lane stays isolated: a dev preset carries none of the new keys.
     if m.get("dev"):
-        for k in ("setup", "fields", "mcp_servers"):
+        for k in ("setup", "fields", "mcp_servers", "node", "greeting"):
             if k in m:
                 out.append(p(f"dev:true forbids {k!r}"))
 

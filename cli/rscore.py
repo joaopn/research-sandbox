@@ -6908,6 +6908,16 @@ def _deploy_node(container: str) -> None:
                f"cp -a {NODE_DIST_MOUNT}/.local/. /home/research/.local/ )"])
 
 
+def _node_dist_staged_in(container: str) -> bool:
+    """True iff the node seed is staged in the supervisor (the populated-seed
+    sentinel, `_editor_dist_staged_in`'s twin). Lets box add stage it on demand
+    ONLY when absent: a re-stage replaces the directory, which would leave every
+    running node box mounted on the deleted folder."""
+    return run(["docker", "exec", container, "test", "-e",
+                f"{NODE_DIST_MOUNT}/.local/bin/{_NODE_BIN}"],
+               capture_output=True).returncode == 0
+
+
 def _stage_node_dist(supervisor: str, *, deploy_local: bool = False) -> None:
     """Stage the host node seed into a RUNNING supervisor (STAGE_NODE_SEED). Real
     files at NODE_DIST_MOUNT via the shared uid-0 tar stream (never docker cp — the
@@ -10986,6 +10996,16 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
             "this box requests rs-fetch, but the dev lane (Gitea) is not "
             "enabled on this host yet — enable Gitea from the Management "
             "page, then retry")
+    # Node gate: a node box copies the project's staged node seed at boot. Both
+    # probes run ONLY for a node preset (no other box add gains a docker exec).
+    # Refuse when neither the project nor the host has the seed; the host-has-it
+    # case is staged after the harness step below.
+    needs_node = bool(catalog.get(req.preset, {}).get("node"))
+    node_staged = needs_node and _node_dist_staged_in(container)
+    if needs_node and not node_staged and not node_dist_present():
+        raise ValidationError(
+            "this box type needs node, but node is not installed on this host "
+            "yet — pull node under Management → Software, then retry")
     # Fields gate (after the dev gate, so dev+fields gets the dev refusal):
     # provided names must EQUAL the preset's declared set — every declared
     # field is required, undeclared ones refused. Messages name KEYS only;
@@ -11029,6 +11049,12 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
                 "this box requests the editor, but the editor software is not "
                 "installed on this host yet — install it from the Software "
                 "page, then retry")
+    # Node seed on demand (the editor-dist precedent above): a project created or
+    # last restarted before node was pulled has no seed staged. Stage it only
+    # when absent — never a re-stage (see _node_dist_staged_in).
+    if needs_node and not node_staged:
+        progress.step("node", "staging node into the project")
+        _stage_node_dist(container)
     # Dev preset: wire gitea + mint the BOX's own consumer (user + fork +
     # token) BEFORE the box runs — ordering is load-bearing: connect → provision
     # → ledger → staging (the token lands in ~/.dev-tokens for rs-sandbox to
@@ -11184,7 +11210,9 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     # USABLE — the setup installs the preset's software and the .mcp.json merge
     # runs after it, so returning early invites starting the agent into a box
     # with no MCP config yet (a running session never reloads it).
-    if catalog.get(req.preset, {}).get("setup"):
+    # A node preset always has a setup to run (the node step), with or without
+    # its own.
+    if catalog.get(req.preset, {}).get("setup") or needs_node:
         progress.step("setup", "waiting for the preset setup to finish")
         if not _wait_for_box_setup_done(container, info["container"]):
             # Two causes land here and the wording must carry BOTH: a genuinely
