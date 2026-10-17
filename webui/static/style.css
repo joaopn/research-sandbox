@@ -453,9 +453,17 @@ html.mobile .project-rail .rail-separator { cursor: default; }
     border-top: 1px solid var(--border);
     cursor: pointer;
     font-size: 12px;
-    text-align: left;
+    /* Icon + label laid out like a .nav-entry, so "Lock vault" starts at the
+       nav labels' x (same 12px padding, 16px icon box, 8px gap). */
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    text-align: left;   /* a button centres its text; keep a wrapped label left like the nav's */
 }
 .project-rail .rail-footer .lock-btn:hover { color: var(--fg-base); background: var(--border); }
+/* The padlock draws a size smaller than the nav icons (it is a footer action,
+   not a page), centred in the same 16px box; it takes the button's colour. */
+.project-rail .rail-footer .lock-btn .nav-icon svg { width: 14px; height: 14px; }
 
 .main-area {
     flex: 1;
@@ -993,17 +1001,23 @@ html.mobile .project-rail .rail-separator { cursor: default; }
     background: var(--bg-active);
     box-shadow: 2px 0 0 var(--fg-accent) inset;
 }
-.nav-entry .mgmt-gear, .nav-entry .nav-icon { font-size: 14px; }
-/* One fixed box per icon so every label starts at the same x: the glyphs differ
-   in advance width (a colour emoji is ~1.2-1.3em, ⑂ and a text-style ⚙ are far
-   narrower), and an auto-width icon let each label start where its glyph ended.
-   1.5em of the icon's own 14px holds the widest emoji with slack; flex-shrink 0
-   keeps a narrow rail from squeezing one box and not another. */
-.nav-entry .nav-icon {
+.nav-entry .mgmt-gear { font-size: 14px; }
+/* One fixed 16px box per line icon (app.js NAV_ICON_SVG), shared by the bottom
+   nav and the Lock vault button, so every label starts at the same x;
+   flex-shrink 0 keeps a narrow rail from squeezing one box and not another. */
+.nav-icon {
     flex-shrink: 0;
-    width: 1.5em;
-    text-align: center;
+    width: 16px;
+    height: 16px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
 }
+.nav-icon svg { width: 16px; height: 16px; display: block; }
+/* The icons are stroked in currentColor: muted beside the label at rest, the
+   label's own colour on hover and on the open page. */
+.nav-entry .nav-icon { color: var(--fg-muted); }
+.nav-entry:hover .nav-icon, .nav-entry.active .nav-icon { color: var(--fg-base); }
 
 /* Workflows screen — clickable workflow cards. */
 .workflows-screen { max-width: 900px; }

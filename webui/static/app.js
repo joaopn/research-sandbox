@@ -1293,7 +1293,7 @@ function makeProjectRail() {
 
     // Theme + Editor-zoom moved to the Settings page; the footer keeps Lock vault.
     const footer = el("div", { class: "rail-footer" }, [
-        el("button", { class: "lock-btn", onclick: lockVault }, ["Lock vault"]),
+        el("button", { class: "lock-btn", onclick: lockVault }, [navIcon("lock"), "Lock vault"]),
     ]);
     rail.appendChild(footer);
     return rail;
@@ -1312,21 +1312,93 @@ function makeProjectRail() {
 function makeBottomNav() {
     const mk = (cls, icon, label, title, open) => {
         const e = el("div", { class: "nav-entry " + cls, title },
-                     [el("span", { class: "nav-icon" }, [icon]), el("span", {}, [label])]);
+                     [navIcon(icon), el("span", {}, [label])]);
         e.onclick = (ev) => { ev.stopPropagation(); open(); };
         return e;
     };
     // Explain docs are ephemeral floating popovers now (dismissed on outside
     // click), not persistent rail tabs — so the bottom nav has no doc entries.
     return el("div", { class: "rail-nav-group" }, [
-        mk("workflows-entry", "🛍", "New Project",
+        mk("workflows-entry", "newProject", "New Project",
            "New Project — pick a workflow, or import an existing project", openWorkflows),
-        mk("development-entry", "⑂", "Development",
+        mk("development-entry", "development", "Development",
            "Development — dev repos, PRs, fetch commands (shared Gitea)", openDevelopment),
-        mk("management-entry", "🗂", "Management",
+        mk("management-entry", "management", "Management",
            "Host project management (broker)", openManagement),
-        mk("settings-entry", "⚙", "Settings", "UI settings + software", openSettings),
+        mk("settings-entry", "settings", "Settings", "UI settings + software", openSettings),
     ]);
+}
+
+// Line icons for the bottom nav and the Lock vault button: one stroke style,
+// coloured by currentColor so they follow every theme and the hover/active
+// states (style.css .nav-icon). Settings is sliders, not a gear, so it cannot
+// be mistaken for a project row's ⚙.
+//
+// Icon geometry from Lucide (https://lucide.dev): folder-plus, git-branch,
+// server, sliders-horizontal, lock.
+//   ISC License. Copyright (c) for portions of Lucide are held by Cole Bemis
+//   2013-2022 as part of Feather (MIT). All other copyright (c) for Lucide are
+//   held by Lucide Contributors 2022.
+//   Permission to use, copy, modify, and/or distribute this software for any
+//   purpose with or without fee is hereby granted, provided that the above
+//   copyright notice and this permission notice appear in all copies.
+//   THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+//   WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+//   MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+//   SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+//   WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+//   ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR
+//   IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+//   Portions derived from Feather: The MIT License (MIT), Copyright (c)
+//   2013-2022 Cole Bemis. Permission is hereby granted, free of charge, to any
+//   person obtaining a copy of this software and associated documentation files
+//   (the "Software"), to deal in the Software without restriction, including
+//   without limitation the rights to use, copy, modify, merge, publish,
+//   distribute, sublicense, and/or sell copies of the Software, and to permit
+//   persons to whom the Software is furnished to do so, subject to the
+//   following conditions: The above copyright notice and this permission notice
+//   shall be included in all copies or substantial portions of the Software.
+//   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+//   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+//   FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+//   DEALINGS IN THE SOFTWARE.
+const NAV_ICON_SVG = (() => {
+    const svg = (body) =>
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"' +
+        ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"' +
+        ' xmlns="http://www.w3.org/2000/svg">' + body + '</svg>';
+    return {
+        newProject: svg(
+            '<path d="M12 10v6"/><path d="M9 13h6"/>' +
+            '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>'),
+        development: svg(
+            '<line x1="6" x2="6" y1="3" y2="15"/><circle cx="18" cy="6" r="3"/>' +
+            '<circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>'),
+        management: svg(
+            '<rect width="20" height="8" x="2" y="2" rx="2" ry="2"/>' +
+            '<rect width="20" height="8" x="2" y="14" rx="2" ry="2"/>' +
+            '<line x1="6" x2="6.01" y1="6" y2="6"/><line x1="6" x2="6.01" y1="18" y2="18"/>'),
+        settings: svg(
+            '<line x1="21" x2="14" y1="4" y2="4"/><line x1="10" x2="3" y1="4" y2="4"/>' +
+            '<line x1="21" x2="12" y1="12" y2="12"/><line x1="8" x2="3" y1="12" y2="12"/>' +
+            '<line x1="21" x2="16" y1="20" y2="20"/><line x1="12" x2="3" y1="20" y2="20"/>' +
+            '<line x1="14" x2="14" y1="2" y2="6"/><line x1="8" x2="8" y1="10" y2="14"/>' +
+            '<line x1="16" x2="16" y1="18" y2="22"/>'),
+        lock: svg(
+            '<rect width="18" height="11" x="3" y="11" rx="2" ry="2"/>' +
+            '<path d="M7 11V7a5 5 0 0 1 10 0v4"/>'),
+    };
+})();
+
+// An icon box holding one NAV_ICON_SVG entry. innerHTML, never el("svg"):
+// createElement makes an HTML-namespace <svg> that renders nothing.
+function navIcon(key) {
+    const span = el("span", { class: "nav-icon" });
+    span.innerHTML = NAV_ICON_SVG[key];
+    return span;
 }
 
 // Re-render just the bottom nav group in place (no full rail rebuild) so a host
