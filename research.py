@@ -356,6 +356,8 @@ def _print_create_report(res, cfg) -> None:
     # was actually cloned. Non-secret — the report never carries the PAT.
     clone_block = (f"  Cloned:    {res.repo} → {res.clone_dir}\n"
                    if getattr(res, "clone_dir", "") else "")
+    history_block = (f"  {res.history_line}\n"
+                     if getattr(res, "history_line", "") else "")
     # Agent dists (STAGE_MULTI_AGENT): shown when the create deployed some — a
     # docker box's set, or sandbox-dind's claude (deploy_local); accurate either
     # way ("~/.local" is exactly where both land). Research stays empty.
@@ -368,7 +370,7 @@ Project '{res.project}' is running.
   Container: {res.container}
   Workspace: {res.workspace}
   Workflow:  {res.workflow}
-{clone_block}{agent_block}  Network:   {res.network} (egress: {res.egress})
+{clone_block}{history_block}{agent_block}  Network:   {res.network} (egress: {res.egress})
   Substrate: {res.substrate}
   DIND mode: {res.dind_mode}
   Inner FW:  {inner_fw}
@@ -424,6 +426,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         mcp=args.mcp,
         repo=args.repo, ref=args.ref, setup=args.setup_script,
         fetch=args.fetch,
+        history=args.history,
         github_pat=os.environ.get("RS_GITHUB_PAT") or "",   # never a CLI flag
         # Key material never rides a flag or an env VALUE — only a file path
         # (RS_GITHUB_SSH_KEY_FILE). The identity is not secret, so plain flags.
@@ -2342,6 +2345,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "dev; on dind this wires the supervisor — boxes have "
                         "their own per-box toggle). Requires the dev lane "
                         "(gitea) enabled.")
+    c.add_argument("--history", action="store_true",
+                   help="keep the notes' history on the shared gitea (a "
+                        "workflow that supports it, e.g. open-knowledge): the "
+                        "project's own account pushes notes/ to a private repo "
+                        "notes/<project>. Requires the dev lane (gitea) enabled; "
+                        "not with --fetch.")
     cag = c.add_mutually_exclusive_group()
     cag.add_argument("--agent", "--agents", dest="agents", action=_AppendAgents,
                      default=None, metavar="AGENT[,AGENT...]",

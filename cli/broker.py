@@ -376,6 +376,10 @@ def _verb_workflows(_args: dict, _progress=None) -> dict:
         # raises ValidationError here — fail-early on the Workflows page, the
         # SSH-port-block posture — so a misconfiguration is seen, not hidden.
         "data_roots": [str(r) for r in rscore.data_mount_roots()],
+        # Whether the install's Gitea is enabled: the create form offers a
+        # history workflow's "Keep history on Gitea" switch only then (the
+        # box window's listing carries the same bit).
+        "gitea_enabled": gitea.bootstrap_present(),
         "default_workflow": rscore.DEFAULT_WORKFLOW,
     }
 
@@ -582,6 +586,11 @@ CREATE_WEBUI_FIELDS = frozenset({
     # from_kwargs refuses it on the dev workflow and floors it on gitea
     # bootstrap (fail-early).
     "fetch",
+    # Keep the notes' history on Gitea (a `gitea_history` workflow): IN-BOX
+    # like `fetch` — it wires the project's own git to its own notes repo; no
+    # path, host port or mount. from_kwargs refuses it with fetch, without
+    # Gitea, on a workflow that lacks it, and on a name too long for it.
+    "history",
 })
 
 # The webui-settable subset of UpdateRequest fields. `rebuild`/`keep_claude` are

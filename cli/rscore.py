@@ -915,6 +915,12 @@ class CreateRequest:
     # (a built-in's sibling workflows/<name>.instructions.md). DERIVED like
     # `greeting`; staged no-clobber at create. "" ⇒ nothing staged.
     instructions: str = ""
+    # Keep the notes' history on the shared Gitea (a workflow with
+    # `gitea_history`, docker web-app workflows only): the project's own
+    # account `notes-<project>` pushes notes/ to `notes/<project>`. An IN-BOX
+    # capability (it wires the project's own git, no host path or port), so it
+    # is broker-openable (CREATE_WEBUI_FIELDS) like `fetch`.
+    history: bool = False
     # Dev lane (STAGE_DEV_GITEA S2). dev_lane is DERIVED from the workflow
     # manifest's `dev: true` (data, never the workflow name — the flavor-
     # derivation discipline); dev_repo is the MANDATORY-on-a-dev-workflow gitea
@@ -1022,6 +1028,27 @@ class CreateRequest:
                     "this workflow's setup is fixed; create the project "
                     "without a setup of its own")
         instructions = manifest.get("instructions") or ""
+        # Gitea history — every refusal that needs no network, here; the
+        # Gitea-touching claim is create's pre-flight. Texts reach the browser.
+        history = _coerce_history_flag(kw.get("history"))
+        if history:
+            if not manifest.get("gitea_history"):
+                raise ValidationError(
+                    f"workflow {workflow_id!r} does not keep history on Gitea")
+            if fetch:
+                raise ValidationError(
+                    "a project keeping history on Gitea cannot also take "
+                    "rs-fetch (its notes account would answer for every Gitea "
+                    "fetch in the project)")
+            if not gitea.bootstrap_present():
+                raise ValidationError(
+                    "this project keeps history on Gitea, but Gitea is not "
+                    "enabled on this host yet — enable it from the Management "
+                    "page, then retry")
+            problem = gitea.project_history_name_problem(
+                _require_name(kw.get("name")))
+            if problem:
+                raise ValidationError(problem)
         if repo:
             if not ref:
                 raise ValidationError(
@@ -1287,6 +1314,7 @@ class CreateRequest:
             greeting=greeting,
             web=web,
             instructions=instructions,
+            history=history,
             dev_lane=dev_lane,
             dev_repo=dev_repo,
             dev_branch=dev_branch,
@@ -1479,6 +1507,8 @@ class CreateResult:
     repo: str = ""
     clone_dir: str = ""                     # /workspace/<basename> if a repo cloned
     agents: list[str] = field(default_factory=list)   # agent dists deployed into a docker box
+    # The Gitea-history outcome line ("" when the project keeps none).
+    history_line: str = ""
 
 
 @dataclass
@@ -3223,6 +3253,21 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         _refuse_retired_identity(gitea.agent_username(
             gitea.consumer_for(project)))
 
+    # Gitea history: the claim needs the Gitea, so it is decided here — beside
+    # the dev lane's retired-identity check, before any port, workspace or
+    # container exists (from_kwargs already refused everything network-free).
+    history_claim: dict | None = None
+    if req.history:
+        try:
+            _resume_gitea(require=True, tries=GITEA_RESUME_WAIT_TRIES)
+        except SystemExit:
+            raise ValidationError("Gitea is not answering right now; retry in a moment")
+        try:
+            history_claim = gitea.project_history_claim(
+                _gitea_host_port(), project, gitea.load_attachments())
+        except gitea.GiteaError as e:
+            raise ValidationError(str(e))
+
     print(f"=== Creating project: {project} ===")
     # Pre-flight (raises ValidationError, nothing standing yet): the port the
     # project owns until destroy, recorded in its marker below.
@@ -3404,6 +3449,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
 
     granted: list[str] = []
     workers_enabled: list[str] = []
+    history_line = ""
 
     clone_dir = ""
     if is_docker:
@@ -3435,6 +3481,19 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             _stage_project_instructions(container_name, req.instructions)
         if req.web:
             _register_project_web_tab(workspace_path, req.web)
+        # Gitea history, in the box's order and BEFORE the setup: the setup's
+        # marker lets OpenKnowledge start, which must never happen in a notes/
+        # that history has not yet cloned (the pending mark holds it back).
+        hist_row: dict | None = None
+        if history_claim is not None:
+            hist_row = _provision_project_history(project, history_claim,
+                                                  container_name, cfg)
+            if hist_row is not None:
+                _write_marker_history(workspace_path)
+                if not _run_project_history(container_name, hist_row):
+                    raise HarnessError("history step failed",
+                                       "the project's history status could not "
+                                       "be written")
         # 6'. Light-path harness: clone the workflow repo + run setup on the box
         #     (after inject_route, so egress works). Raises HarnessError on
         #     failure (box left standing). Create-time only, except for a web-app
@@ -3445,6 +3504,14 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             use_ssh=bool(req.github_ssh_key))
         if req.web:
             _mark_project_setup_done(container_name)
+        if history_claim is not None:
+            if hist_row is None:
+                history_line = _PROJECT_HISTORY_GITEA_FAILED_LINE
+            else:
+                code = _read_project_history_status(container_name)
+                history_line = _project_history_status_line(code, hist_row["repo"])
+            progress.step("note" if history_line.startswith("History: on")
+                          else "warning", history_line)
         progress.step("ready", "project ready")
     else:
         # 6. Wait for inner dockerd, then stage the inner images.
@@ -3697,6 +3764,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         repo=req.repo,
         clone_dir=clone_dir,
         agents=deployed_agents,
+        history_line=history_line,
     )
 
 
@@ -8268,8 +8336,8 @@ def _start_docker_substrate(project: str, cfg: "Config",  # type: ignore[name-de
     # finished setup is never re-run. This is what "stop the project and
     # start it again" in its texts means.
     web = _project_web(container)
-    if web and not _project_setup_done(container):
-        _rerun_project_setup(container, web, progress or _NULL_PROGRESS)
+    if web:
+        _retry_project_steps(project, container, web, progress or _NULL_PROGRESS)
 
 
 def _without_mount(mounts: list[str], dst: str) -> list[str]:
@@ -8427,9 +8495,11 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
     # loopback forwarders for the project's registered exported ports.
     _reconcile_loopback_bridges(project, cfg)
     # The rm + run reset the home, so a web-app project's setup (its install)
-    # is gone: re-run it, after node is back. The tab waits through it.
+    # is gone — and with history, its Gitea wiring too: re-run both, history
+    # first, after node is back. The tab waits through it.
     if md.get("web"):
-        _rerun_project_setup(container, md["web"], progress or _NULL_PROGRESS)
+        _rebuild_project_steps(project, container, md["web"], cfg,
+                               progress or _NULL_PROGRESS)
 
 
 def _live_toggle_editor(project: str, cfg: "Config", container: str,  # type: ignore[name-defined]
@@ -11341,7 +11411,10 @@ def _retire_history_rows(project: str, rows: list[dict], container: str) -> list
         user, repo = e.get("user") or "", e.get("repo") or ""
         try:
             if serving and user and repo:
-                out += gitea.retire_history(_gitea_host_port(), user, repo)
+                out += gitea.retire_history(
+                    _gitea_host_port(), user, repo,
+                    replaced_by=("the next box of this name" if e.get("box")
+                                 else "a project re-created under this name"))
             else:
                 if user:
                     gitea.delete_consumer_token(user)
@@ -11518,6 +11591,349 @@ def _gate_box_web(container: str, want_browser: bool) -> None:
              "-x", BOX_WEB_LOOP_PATH], capture_output=True)
     if r.returncode != 0:
         raise ValidationError(_WEB_BOX_TOO_OLD_MSG)
+
+
+# --- A docker project's Gitea history (a workflow's `gitea_history`) -----------
+# The box's in-box history step, run host-side in the project container as its
+# user. rscore cannot import the box tool, so it keeps a BYTE-PINNED copy of
+# rs_sandbox._HISTORY_SCRIPT (template + the same two substitutions, from
+# mirrored constants) and derives the project's variant from it by a fixed list
+# of exact replacements, each of which must match once — the box's bytes never
+# change. The project's account and repo come from gitea.project_history_names.
+# MIRROR of rs_sandbox.HISTORY_GITEA_PORT / HISTORY_PUSH_TIMEOUT_S (pinned).
+_HISTORY_GITEA_PORT = "3000"
+_HISTORY_PUSH_TIMEOUT_S = 60
+_BOX_HISTORY_SCRIPT = r"""
+T="$HOME/.rs-history.token"; S="$HOME/.rs-history-status"; N=/workspace/notes
+INC="$HOME/.rs-history.gitconfig"
+URL="http://rs-gitea:@@PORT@@/notes/$RS_HISTORY_REPO.git"
+_rs_hist_text() {
+  case "$1" in
+    on) printf '%s\n' "History: on. These notes are kept in the Gitea repo notes/$RS_HISTORY_REPO (this box's (GIT) tab in the webui)." "Pull-and-push sync is turned on when OpenKnowledge first starts here, so edits are pushed.";;
+    off:no-address|off:no-token) printf '%s\n' "History: off. This box started without its Gitea access; restart the project to restore it.";;
+    off:clone-failed) printf '%s\n' "History: off. The notes repo could not be cloned; restart the project before writing notes (a fresh box retries the clone).";;
+    off:not-a-clone) printf '%s\n' "History: off. /workspace/notes already holds files that are not a clone of the notes repo; move the whole notes folder aside in this box (mv /workspace/notes /workspace/notes.old), then restart the project.";;
+    off:push-failed) printf '%s\n' "History: off for now. The first push to the notes repo failed; it is retried at the next fresh start of this box.";;
+    *) printf '%s\n' "History: off.";;
+  esac
+}
+_rs_hist_greet() {
+  G=/workspace/.rs-greeting
+  [ -f "$G" ] && [ ! -L "$G" ] || return 0
+  tmp=$(mktemp /workspace/.rs-greeting.XXXXXX) || return 0
+  awk '/^--- Gitea history ---$/{skip=1} !skip{print} /^--- end of Gitea history ---$/{skip=0}' "$G" > "$tmp" 2>/dev/null
+  { printf '%s\n' "--- Gitea history ---"; _rs_hist_text "$1"; printf '%s\n' "--- end of Gitea history ---"; } >> "$tmp"
+  mv -f "$tmp" "$G"
+}
+_rs_hist_status() { printf '%s\n' "$1" > "$S"; _rs_hist_greet "$1"; }
+[ -n "$RS_HISTORY_GITEA" ] || { _rs_hist_status off:no-address; exit 0; }
+[ -s "$T" ] || { _rs_hist_status off:no-token; exit 0; }
+if [ "$RS_HIST_MODE" = heal ] || [ ! -e "$INC" ]; then
+  tmp=$(mktemp "$INC.XXXXXX") || { _rs_hist_status off:no-token; exit 0; }
+  chmod 600 "$tmp"
+  printf '[url "http://%s:%s@%s:@@PORT@@/"]\n\tinsteadOf = http://rs-gitea:@@PORT@@/\n' "$RS_HISTORY_USER" "$(cat "$T")" "$RS_HISTORY_GITEA" > "$tmp"
+  mv -f "$tmp" "$INC"
+fi
+git config --global --get-all include.path 2>/dev/null | grep -qxF "$INC" || git config --global --add include.path "$INC"
+git config --global user.name "$RS_HISTORY_USER"
+git config --global user.email "$RS_HISTORY_USER@rs.invalid"
+# A heal before the box's own setup finished touches only the address: the
+# setup is still cloning/pushing and owns the status.
+if [ "$RS_HIST_MODE" = heal ] && [ ! -f "$HOME/.rs-box-setup-done" ]; then exit 0; fi
+# Clone only into NOTHING or a real empty folder — never over a file or a link
+# named notes (anything else falls to the not-a-clone check below).
+if [ "$RS_HIST_MODE" != heal ] && { { [ ! -e "$N" ] && [ ! -L "$N" ]; } || { [ -d "$N" ] && [ ! -L "$N" ] && [ -z "$(ls -A "$N" 2>/dev/null)" ]; }; }; then
+  # Clone under a FRESH hidden name, then move it into place with one rename
+  # (`mv -T`): the rename lands only onto an absent path or a still-empty
+  # folder and refuses if anything was written into notes/ meanwhile, so the
+  # operator's files are never touched. git cleans up only the folder it
+  # created itself on a failure; a clone killed outright stays under its hidden
+  # name (nothing here deletes anything) and the next fresh start clones anew.
+  TC=$(mktemp -u /workspace/.rs-notes-clone.XXXXXX) || { _rs_hist_status off:clone-failed; exit 0; }
+  GIT_TERMINAL_PROMPT=0 timeout @@PUSH@@ git clone -q "$URL" "$TC" >/dev/null 2>&1 || { _rs_hist_status off:clone-failed; exit 0; }
+  git -C "$TC" rev-parse --verify -q HEAD >/dev/null 2>&1 || git -C "$TC" symbolic-ref HEAD refs/heads/main
+  mv -T "$TC" "$N" 2>/dev/null || { _rs_hist_status off:not-a-clone; exit 0; }
+fi
+# A heal never clones: an empty notes/ without a clone stays clone-failed (the
+# setup's verdict), never relabelled as "not a clone".
+if [ "$RS_HIST_MODE" = heal ] && [ ! -d "$N/.git" ] && [ -z "$(ls -A "$N" 2>/dev/null)" ]; then
+  _rs_hist_status off:clone-failed; exit 0
+fi
+[ "$(git -C "$N" config --get remote.origin.url 2>/dev/null)" = "$URL" ] || { _rs_hist_status off:not-a-clone; exit 0; }
+PUSHED=
+if ! git -C "$N" rev-parse -q --verify main@{u} >/dev/null 2>&1; then
+  git -C "$N" rev-parse --verify -q HEAD >/dev/null 2>&1 || git -C "$N" commit -q --allow-empty -m "Start the notes" >/dev/null 2>&1
+  GIT_TERMINAL_PROMPT=0 timeout @@PUSH@@ git -C "$N" push -q -u origin main >/dev/null 2>&1 || { _rs_hist_status off:push-failed; exit 0; }
+  PUSHED=1
+fi
+_rs_hist_status on
+# A heal that just completed the first push turned history on under a running
+# web app that started while it was still off: restart that app so it starts
+# with history on (OpenKnowledge then turns on its sync). Only on this change —
+# every other heal leaves the app running.
+if [ "$RS_HIST_MODE" = heal ] && [ -n "$PUSHED" ] && [ -x /usr/local/bin/rs-web-restart ]; then
+  /usr/local/bin/rs-web-restart >/dev/null 2>&1 || true
+fi
+""".replace("@@PORT@@", _HISTORY_GITEA_PORT).replace(
+    "@@PUSH@@", str(_HISTORY_PUSH_TIMEOUT_S))
+
+# The project variant's text table (the terminal greeting's history paragraph).
+_PROJECT_HISTORY_TEXT = r"""_rs_hist_text() {
+  case "$1" in
+    on) printf '%s\n' "History: on. These notes are kept in the Gitea repo notes/$RS_HISTORY_REPO (this project's (GIT) tab in the webui)." "Pull-and-push sync is turned on when OpenKnowledge first starts here, so edits are pushed.";;
+    off:no-address|off:no-token) printf '%s\n' "History: off. This project started without its Gitea access; stop the project and start it again to restore it.";;
+    off:clone-failed) printf '%s\n' "History: off. The notes repo could not be cloned; stop the project and start it again before writing notes (the start retries the clone).";;
+    off:not-a-clone) printf '%s\n' "History: off. /workspace/notes already holds files that are not a clone of the notes repo; move the whole notes folder aside (mv /workspace/notes /workspace/notes.old), then stop the project and start it again.";;
+    off:push-failed) printf '%s\n' "History: off for now. The first push to the notes repo failed; it is retried when the project is next started.";;
+    *) printf '%s\n' "History: off.";;
+  esac
+}
+"""
+_REMOTE_CHECK_LINE = ('[ "$(git -C "$N" config --get remote.origin.url 2>/dev/null)" '
+                      '= "$URL" ] || { _rs_hist_status off:not-a-clone; exit 0; }\n')
+
+
+def _derive_project_history_script(box: str) -> str:
+    """The box's history step, made the project's: the token the project
+    stages (no second copy), its greeting file, its text table, and the
+    commit identity set in the notes repo only (the project keeps the human's
+    own global identity), after the remote check — so a fresh clone and an
+    existing one both get it before the first commit."""
+    t0 = box.index("_rs_hist_text() {")
+    t1 = box.index("esac\n}\n", t0) + len("esac\n}\n")
+    swaps = [
+        ('T="$HOME/.rs-history.token"', 'T="$HOME/.dev-tokens/$RS_HISTORY_USER.token"'),
+        ("G=/workspace/.rs-greeting\n", "G=/workspace/.orchestrator/greeting\n"),
+        ("mktemp /workspace/.rs-greeting.XXXXXX", "mktemp /workspace/.orchestrator/.greeting.XXXXXX"),
+        ('git config --global user.name "$RS_HISTORY_USER"\n', ""),
+        ('git config --global user.email "$RS_HISTORY_USER@rs.invalid"\n', ""),
+        (_REMOTE_CHECK_LINE, _REMOTE_CHECK_LINE
+         + 'git -C "$N" config user.name "$RS_HISTORY_USER"\n'
+         + 'git -C "$N" config user.email "$RS_HISTORY_USER@rs.invalid"\n'),
+        (box[t0:t1], _PROJECT_HISTORY_TEXT),
+    ]
+    out = box
+    for old, new in swaps:
+        if out.count(old) != 1:
+            raise RuntimeError(f"history script anchor not unique: {old[:40]!r}")
+        out = out.replace(old, new)
+    return out
+
+
+PROJECT_HISTORY_SCRIPT = _derive_project_history_script(_BOX_HISTORY_SCRIPT)
+# The host waits for one run of it at most this long: the script bounds its
+# clone and its first push by _HISTORY_PUSH_TIMEOUT_S each and does nothing
+# else slow; the margin covers the exec itself. Past it the run is cut and the
+# status stays `off:pending` (OpenKnowledge waits; the next start retries).
+PROJECT_HISTORY_RUN_TIMEOUT_S = 2 * _HISTORY_PUSH_TIMEOUT_S + _WEB_SET_MARGIN_S
+# What the host writes into the status file before each run (and when it skips
+# one): OpenKnowledge's start script waits on any `off` it does not know, so
+# it can never start in an un-cloned notes/ while history is undecided.
+HISTORY_PENDING = "off:pending"
+# How long a rebuild waits for the entrypoint's own home restore before the
+# history step (it writes global git settings the restore would overwrite).
+# ~/.rs-role is written right after the restore and the agent dists' copy —
+# local file copies, seconds — and BEFORE the editor deploy that create gives
+# EDITOR_READY_TIMEOUT_S, so the same budget is ample by construction. At
+# expiry the step is skipped (status `off:pending`) and the next start runs it.
+HOME_RESTORE_WAIT_S = EDITOR_READY_TIMEOUT_S
+
+_PROJECT_HISTORY_GITEA_FAILED_LINE = (
+    "History: off — the Gitea side could not be set up; the project was created "
+    "without history. Destroy the project and create it again to retry.")
+
+
+def _project_history_status_line(code: str, repo: str) -> str:
+    """A project's history outcome code → one fixed operator line (unknown →
+    a generic one). Every "off" line names a browser-only remedy."""
+    return {
+        "on": (f"History: on — the notes are kept in the Gitea repo "
+               f"{gitea.HISTORY_ORG}/{repo} (the project's (GIT) tab). "
+               f"Pull-and-push sync is turned on when OpenKnowledge first "
+               f"starts there."),
+        "off:no-address": ("History: off — the project started without its "
+                           "Gitea address; stop the project and start it again "
+                           "to restore it."),
+        "off:no-token": ("History: off — the project started without its Gitea "
+                         "access; stop the project and start it again to "
+                         "restore it."),
+        "off:clone-failed": ("History: off — the notes repo could not be "
+                             "cloned; stop the project and start it again before "
+                             "writing notes (the start retries the clone)."),
+        "off:not-a-clone": ("History: off — the project's notes folder already "
+                            "holds files that are not a clone of its notes "
+                            "repo; move the whole notes folder aside in the "
+                            "project's terminal, then stop the project and start "
+                            "it again."),
+        "off:push-failed": ("History: off for now — the first push failed; it "
+                            "is retried when the project is next started."),
+        HISTORY_PENDING: ("History: off — the history setup did not finish; "
+                          "stop the project and start it again."),
+    }.get(code, "History: off — the project's history setup did not report "
+                "back; stop the project and start it again.")
+
+
+def _project_history_row(project: str) -> dict | None:
+    """The project's own history ledger row (class history, no box) with its
+    account and repo names, or None."""
+    try:
+        rows = gitea.project_entries(project)
+    except Exception:
+        return None
+    return next((e for e in rows
+                 if e.get("class") == gitea.HISTORY_CLASS and e.get("box") is None
+                 and isinstance(e.get("user"), str) and e.get("user")
+                 and isinstance(e.get("repo"), str) and e.get("repo")), None)
+
+
+def _read_project_history_status(container: str) -> str:
+    """The project's history status code (the box read's guards: a regular
+    file only, a few bytes, bounded), or "" when unreadable."""
+    r = run(["docker", "exec", "-u", "research", container,
+             "timeout", str(HISTORY_STATUS_READ_TIMEOUT_S), "sh", "-c",
+             'f="$HOME/.rs-history-status"; [ -f "$f" ] && [ ! -L "$f" ] && head -c 64 "$f"'],
+            capture_output=True)
+    code = (r.stdout or "").strip() if r.returncode == 0 else ""
+    return code if _HISTORY_CODE_RE.match(code) else ""
+
+
+def _write_history_pending(container: str) -> bool:
+    """Mark history undecided, by a fresh file renamed over the status file —
+    never by opening it (a FIFO there would hang the host) — under the status
+    read's bound (a few bytes; anything slower is a planted obstacle)."""
+    r = run(["docker", "exec", "-u", "research", container,
+             "timeout", str(HISTORY_STATUS_READ_TIMEOUT_S), "sh", "-c",
+             't=$(mktemp "$HOME/.rs-history-status.XXXXXX") || exit 1; '
+             'if printf "%s\\n" "$1" > "$t" && mv -T "$t" "$HOME/.rs-history-status"; '
+             'then exit 0; fi; rm -f -- "$t"; exit 1',
+             "sh", HISTORY_PENDING], capture_output=True)
+    return r.returncode == 0
+
+
+def _run_project_history(container: str, row: dict) -> bool:
+    """Mark history pending, then run the history step once (bounded). False
+    only when the pending mark could not be written — the caller then holds
+    the setup back too, so OpenKnowledge cannot start in an un-cloned notes/.
+    The step's own outcome is read from the status file, never from here."""
+    if not _write_history_pending(container):
+        return False
+    run(["docker", "exec", "-u", "research",
+         "-e", "RS_HIST_MODE=setup",
+         "-e", f"RS_HISTORY_GITEA={gitea.GITEA_CONTAINER}",
+         "-e", f"RS_HISTORY_USER={row['user']}",
+         "-e", f"RS_HISTORY_REPO={row['repo']}",
+         container, "timeout", str(PROJECT_HISTORY_RUN_TIMEOUT_S),
+         "bash", "-c", PROJECT_HISTORY_SCRIPT], capture_output=True)
+    return True
+
+
+def _wait_for_home_restore(container: str) -> bool:
+    deadline = time.monotonic() + HOME_RESTORE_WAIT_S
+    while True:
+        if run(["docker", "exec", "-u", "research", container,
+                "timeout", str(HISTORY_STATUS_READ_TIMEOUT_S), "sh", "-c",
+                'test -e "$HOME/.rs-role"'], capture_output=True).returncode == 0:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(1)
+
+
+def _provision_project_history(project: str, claim: dict, container: str,
+                               cfg: "Config") -> dict | None:  # type: ignore[name-defined]
+    """The box's provisioning order for a project: connect the Gitea, create
+    or reuse the repo and the account, record the row (no box), stage the
+    token. Any failure cleans up the record and token and returns None."""
+    user, repo = claim["user"], claim["repo"]
+    try:
+        ip = _connect_gitea_to_project_network(project_network_for(project))
+        if not ip:
+            raise gitea.GiteaError("the Gitea has no address on this project")
+        gitea.provision_history(_gitea_host_port(), user, repo,
+                                leftover=bool(claim.get("leftover")))
+        gitea.record_attachment(project, gitea.HISTORY_CLASS, repo, ip,
+                                box=None, user=user)
+        _stage_dev_gitea(project, cfg, gitea_ip=ip)
+        return {"user": user, "repo": repo}
+    except (gitea.GiteaError, SystemExit, OSError) as e:
+        print(f"warning: Gitea history setup for project {project!r} failed: {e}",
+              file=sys.stderr)
+        _cleanup_box_history(project, None, user, repo, container)
+        return None
+
+
+def _warn_history_not_on(container: str, row: dict, progress) -> bool:
+    """After a history run on a rebuild or start: a `warning` row (the only
+    step those tails draw) unless history is on. True when it is on."""
+    code = _read_project_history_status(container)
+    if code != "on":
+        progress.step("warning", _project_history_status_line(code, row["repo"]))
+    return code == "on"
+
+
+def _rebuild_project_steps(project: str, container: str, web: dict,
+                           cfg: "Config", progress) -> None:  # type: ignore[name-defined]
+    """After an editor-toggle rebuild of a web-app project: history (when the
+    project keeps it), then the setup. The token is re-staged first — a host
+    file streamed in, using the ledger's Gitea address, so a stopped Gitea
+    costs nothing here. History waits for the entrypoint's own home restore;
+    past HOME_RESTORE_WAIT_S it is skipped (pending, retried at the next
+    start). A pending mark that cannot be written holds the setup back too."""
+    row = _project_history_row(project)
+    if row is not None:
+        _stage_dev_gitea(project, cfg, serving=False)
+        if _wait_for_home_restore(container):
+            held = not _run_project_history(container, row)
+        else:
+            print("warning: the project's home was not ready in time; history is "
+                  "left to the next start", file=sys.stderr)
+            held = not _write_history_pending(container)
+        if held:
+            progress.step("warning", _project_history_status_line(HISTORY_PENDING,
+                                                                  row["repo"]))
+            return
+        _warn_history_not_on(container, row, progress)
+    _rerun_project_setup(container, web, progress)
+
+
+def _retry_project_steps(project: str, container: str, web: dict, progress) -> None:
+    """A plain start of a web-app project retries what did not finish: history
+    when the project keeps it and it is not on, then the setup when its marker
+    is absent. One wake from the host at most: the setup's marker step
+    already restarts the app; otherwise a history that just turned on
+    restarts it here, so OpenKnowledge starts with history on (its sync
+    setting). The loop may also start an app that was waiting for history by
+    itself once history is on; a second start is harmless."""
+    row = _project_history_row(project)
+    turned_on = False
+    if row is not None and _read_project_history_status(container) != "on":
+        if not _run_project_history(container, row):
+            progress.step("warning", _project_history_status_line(HISTORY_PENDING,
+                                                                  row["repo"]))
+            return
+        turned_on = _warn_history_not_on(container, row, progress)
+    if not _project_setup_done(container):
+        _rerun_project_setup(container, web, progress)
+    elif turned_on:
+        run(["docker", "exec", "-u", "research", container, "rs-web-restart"],
+            capture_output=True)
+
+
+def _write_marker_history(workspace_path: "Path") -> None:
+    """Record `history: true` in project.json, keeping every other key — the
+    webui's only signal for the project's (GIT) tab (it reads nothing else
+    of history; the repo name is derived from the project name)."""
+    f = workspace_path / ".orchestrator" / "project.json"
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    data["history"] = True
+    tmp = f.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(f)
 
 
 _WEB_TAB_MISSING_LINE = ("The box was added without its {label} tab; remove "

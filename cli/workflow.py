@@ -75,7 +75,7 @@ PORT_MIN, PORT_MAX = 1, 65535
 _ALLOWED_KEYS = {"name", "substrate", "image_overlay", "repo", "ref", "setup",
                  "tabs", "mcp_exports", "resources", "services", "description",
                  "greeting", "title", "group", "tags", "agents", "dev", "web",
-                 "instructions"}
+                 "instructions", "gitea_history"}
 _WEB_KEYS = {"port", "label", "start"}
 # MIRROR of rscore's top-level exported-port rule (_EXPORT_RESERVED_PORTS and
 # the box editor + box loopback bands, _EXPORT_BOX_EDITOR_PORT_LO ..
@@ -300,6 +300,17 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
         if repo is not None or ref is not None:
             out.append(p("web forbids repo/ref (the setup re-runs in /workspace)"))
 
+    # gitea_history — the project may keep its notes' history on the shared
+    # Gitea (the box catalog's key). Only a web-app workflow: the history step
+    # writes into the image-resident home, and only a web-app project re-runs
+    # its steps after a rebuild.
+    if "gitea_history" in m:
+        if not isinstance(m["gitea_history"], bool):
+            out.append(p(f"gitea_history must be a boolean, got "
+                         f"{m.get('gitea_history')!r}"))
+        elif m["gitea_history"] and "web" not in m:
+            out.append(p("gitea_history requires web"))
+
     # instructions — the agent's CLAUDE.md, staged into a docker project's
     # /workspace at create. Folded in from the built-in's sibling file.
     if "instructions" in m:
@@ -402,9 +413,10 @@ def load_registry(path: Path = REGISTRY_PATH) -> dict[str, dict]:
         if ev:
             raise WorkflowError(f"registry: " + "; ".join(ev))
         # A web app is started without being asked for and gets a tab of its
-        # own, and instructions are staged into the project: built-in
-        # workflows only (the loader is the one place that knows the source).
-        for k in ("web", "instructions"):
+        # own, instructions are staged into the project, and history wires an
+        # RS-owned Gitea account in: built-in workflows only (the loader is the
+        # one place that knows the source).
+        for k in ("web", "instructions", "gitea_history"):
             if isinstance(m, dict) and k in m:
                 raise WorkflowError(
                     f"registry: entry {name!r}: {k} is reserved for the "

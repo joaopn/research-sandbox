@@ -2161,6 +2161,13 @@ async def project_services_handler(request: web.Request) -> web.Response:
                 and isinstance(hist, dict) and isinstance(hist.get("repo"), str)):
             history_tabs.append((f"{project}.{name}", f"{name} (GIT)",
                                  hist["repo"]))
+    # A docker project keeping its own notes' history: the marker's flag is the
+    # ONLY thing read (`is True`); the repo name is derived from the project
+    # name this request already authenticated, never read from a file the
+    # container can write — a tampered name could otherwise point the tab at
+    # another project's notes under the operator's Gitea session.
+    if _read_project_marker(project).get("history") is True:
+        history_tabs.append((project, f"{project} (GIT)", project))
     # Probe only when there is something to gate (the sibling blocks guard the
     # same way): gitea unreachable ⇒ no fork tabs at all, never a tab that 502s.
     if fork_tabs and await tcp_probe(GITEA_UPSTREAM_HOST, GITEA_UPSTREAM_PORT):

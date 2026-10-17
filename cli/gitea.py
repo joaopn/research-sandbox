@@ -2483,10 +2483,13 @@ def provision_history(host_port: str, user: str, repo: str, *,
     mint_history_token(user)
 
 
-def retire_history(host_port: str, user: str, repo: str) -> list[str]:
-    """Archive the notes repo (read-only, history kept), delete the box's user
-    (with any fork it made) and its token. Each step is attempted; failures
-    come back as fixed operator lines, never raised."""
+def retire_history(host_port: str, user: str, repo: str, *,
+                   replaced_by: str = "the next box of this name") -> list[str]:
+    """Archive the notes repo (read-only, history kept), delete the box's (or
+    project's) user (with any fork it made) and its token. Each step is
+    attempted; failures come back as fixed operator lines, never raised.
+    `replaced_by` names what later takes the account over, for the line that
+    says it could not be deleted."""
     warnings: list[str] = []
     try:
         client = GiteaClient(api_base(host_port), read_admin_token())
@@ -2504,10 +2507,87 @@ def retire_history(host_port: str, user: str, repo: str) -> list[str]:
         if client.get_login(user) is not None:
             client.delete_user(user)
     except GiteaError:
-        warnings.append(f"the Gitea account {user!r} could not be deleted; the "
-                        f"next box of this name replaces it")
+        warnings.append(f"the Gitea account {user!r} could not be deleted; "
+                        f"{replaced_by} replaces it")
     delete_consumer_token(user)
     return warnings
+
+
+# --- Gitea history for an OpenKnowledge PROJECT ---------------------------------
+#
+# A docker project of a history workflow keeps its notes in `notes/<project>`,
+# pushed by its own account `notes-<project>`. NOT the box shape without the box
+# (`agent-<project>`): that is exactly the dev lane's account for a dev project
+# of the same name, and the dev lane keeps retired accounts, so the two would
+# block each other. The repo can never equal a box's `<project>.<box>` (project
+# names carry no '.'). Same organisation, class, scopes, protection and units
+# as a box's (provision_history / retire_history serve both).
+PROJECT_HISTORY_USER_PREFIX = "notes-"
+
+
+def project_history_names(project: str) -> tuple[str, str]:
+    """(gitea user, notes repo name) for a project's history — never truncated."""
+    return f"{PROJECT_HISTORY_USER_PREFIX}{project}", project
+
+
+def project_history_name_problem(project: str) -> str:
+    """Why project <project> cannot keep history on Gitea, or "" when it can.
+    Operator-facing (browser-reachable): names the rule, never a command."""
+    user, _repo = project_history_names(project)
+    if len(user) > GITEA_USERNAME_MAX:
+        return (f"this project's name is too long to keep history on Gitea "
+                f"(its account name {user!r} would exceed {GITEA_USERNAME_MAX} "
+                f"characters); choose a name of at most "
+                f"{GITEA_USERNAME_MAX - len(PROJECT_HISTORY_USER_PREFIX)} "
+                f"characters")
+    if _SEPARATOR_RUN.search(user) or not user[-1].isalnum():
+        return ("this project's name cannot keep history on Gitea (its account "
+                "name would put two of '-', '.', '_' next to each other or end "
+                "in one); choose another project name")
+    return ""
+
+
+def project_history_claim(host_port: str, project: str,
+                          ledger: list[dict]) -> dict:
+    """history_claim for a PROJECT: decide, READ-ONLY, whether <project> may
+    take its history names. Returns {"user", "repo", "leftover": bool}; raises
+    GiteaError(message) on a refusal (operator-facing, project-worded)."""
+    user, repo = project_history_names(project)
+    lowered = user.lower()
+    for e in ledger:
+        if (str(e.get("user") or "").lower() == lowered
+                and not (e.get("project") == project and e.get("box") is None)):
+            raise GiteaError(
+                f"the Gitea account {user!r} is in use by another project (Gitea "
+                f"ignores letter case, so a project whose name differs only in "
+                f"case counts); choose another project name")
+    client = GiteaClient(api_base(host_port), read_admin_token())
+    if client.org_state(HISTORY_ORG) == "user":
+        raise GiteaError(
+            f"a Gitea user named {HISTORY_ORG!r} exists, so the notes "
+            f"organisation cannot be created; rename or remove that user under "
+            f"Site Administration in the Gitea tab")
+    info = client.repo_info(HISTORY_ORG, repo)
+    if info is not None and str(info.get("name") or repo) != repo:
+        raise GiteaError(
+            f"a notes repo {HISTORY_ORG}/{info.get('name')} of a project whose "
+            f"name differs only in letter case exists; remove it under Site "
+            f"Administration in the Gitea tab, or choose another project name")
+    login = client.get_login(user)
+    if login is None:
+        return {"user": user, "repo": repo, "leftover": False}
+    if login != user:
+        raise GiteaError(
+            f"the Gitea account {login!r} is in use by another project (Gitea "
+            f"ignores letter case); choose another project name")
+    own_parent = f"{HISTORY_ORG}/{repo}".lower()
+    for r in user_repos(host_port, user, detail=True):
+        if not (r.get("fork") and r.get("parent", "").lower() == own_parent):
+            raise GiteaError(
+                f"the Gitea account {user!r} already exists and owns repos; "
+                f"remove it under Site Administration in the Gitea tab, or "
+                f"choose another project name")
+    return {"user": user, "repo": repo, "leftover": True}
 
 
 def _random_password() -> str:

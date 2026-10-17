@@ -6010,7 +6010,7 @@ const MODEL_PICKER_SPECS = [
     ["role", "Role-MCPs", "Tool services workers call — one session per tool-call."],
 ];
 
-function mgmtCreateDialog(view, manifest, agents, nodePresent, dataRoots) {
+function mgmtCreateDialog(view, manifest, agents, nodePresent, dataRoots, giteaEnabled) {
     manifest = manifest || {};
     agents = Array.isArray(agents) ? agents : [];
     dataRoots = Array.isArray(dataRoots) ? dataRoots : [];
@@ -6091,8 +6091,40 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataRoots) {
                "to dev containers. Needs Gitea enabled (Management page).",
     }, [el("span", { class: "box-opt-name" }, ["rs-fetch"])]);
     fetchCard.onclick = () => {
+        if (fetchCard.classList.contains("disabled")) return;
         fetchCb.checked = !fetchCb.checked;
         fetchCard.classList.toggle("selected", fetchCb.checked);
+    };
+    // Keep history on Gitea — offered for a workflow that keeps it
+    // (`gitea_history`) on a host whose Gitea is enabled, as the box window
+    // does. Mutually exclusive with rs-fetch (from_kwargs refuses the pair).
+    // Checked → `history: true`.
+    const showHistory = !!manifest.gitea_history && !!giteaEnabled;
+    const projHistoryCb = el("input", { type: "checkbox" });
+    const projHistoryCard = el("div", {
+        class: "box-opt-card",
+        title: "Push this project's notes to a private repo on the shared Gitea " +
+               "(OpenKnowledge's own sync, which the project turns on). " +
+               "The project can add to the notes' main history but never delete " +
+               "or rewrite it.",
+    }, [el("span", { class: "box-opt-name" }, ["Gitea history"])]);
+    const projHistoryHint = el("div", { class: "hint" }, [
+        "The notes are pushed to a private Gitea repo (the project's (GIT) tab). " +
+        "The project can add to their main history but never delete or rewrite " +
+        "it. Destroying the project keeps the history read-only; creating a " +
+        "project with the same name again continues it.",
+    ]);
+    projHistoryHint.style.display = "none";
+    projHistoryCard.onclick = () => {
+        projHistoryCb.checked = !projHistoryCb.checked;
+        projHistoryCard.classList.toggle("selected", projHistoryCb.checked);
+        projHistoryHint.style.display = projHistoryCb.checked ? "" : "none";
+        // rs-fetch cannot ride a history project.
+        if (projHistoryCb.checked) {
+            fetchCb.checked = false;
+            fetchCard.classList.remove("selected");
+        }
+        fetchCard.classList.toggle("disabled", projHistoryCb.checked);
     };
     // Reader (mobile artifact viewer, STAGE_READER) — dind-only + default OFF.
     // Checked → enable:["reader"] (merged with worker presets in the payload). The
@@ -6274,9 +6306,11 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataRoots) {
             // isDocker fork — the docker box is where node-based store
             // workflows (open-knowledge) run.
             el("div", { class: "box-opt-cards" },
-               isDocker ? [editorCard, fetchCard, nodeCard]
+               isDocker ? [editorCard, fetchCard, nodeCard,
+                           ...(showHistory ? [projHistoryCard] : [])]
                         : (isDev ? [editorCard, readerCard, nodeCard]
                                  : [editorCard, fetchCard, readerCard, nodeCard])),
+            ...(showHistory ? [projHistoryHint] : []),
         ]),
     ]);
 
@@ -6528,6 +6562,8 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataRoots) {
             // Opt-in rs-fetch — any non-dev workflow (this payload branch never
             // runs for dev, and the card is hidden there). Sent only when checked.
             if (fetchCb.checked) payload.fetch = true;
+            // Gitea history — only where the card is offered.
+            if (showHistory && projHistoryCb.checked) payload.history = true;
             // Build ONE merged enable array so the reader tickbox and the worker
             // presets don't clobber each other (the broker drops silently, so a
             // second assignment would just lose the other's tokens). Worker presets
@@ -6665,6 +6701,7 @@ function renderWorkflowsScreen(view, result) {
     // Host-declared browser-mountable data roots: the create dialog's data-mount
     // control exists only when this is non-empty. Refetched per render (no cache).
     const dataRoots = Array.isArray(result.data_roots) ? result.data_roots : [];
+    const giteaEnabled = !!result.gitea_enabled;   // offers a history workflow's switch
     const explain = new Set(state.explainIndex || []);
     // A card's section: its declared group, else Store — the catch-all for a
     // group-less manifest (e.g. a future BYO entry).
@@ -6696,7 +6733,8 @@ function renderWorkflowsScreen(view, result) {
             el("div", { class: "workflows-card-desc" }, [m.description || ""]),
             el("div", { class: "workflows-card-actions" }, [tagsEl, action]),
         ]);
-        card.onclick = () => mgmtCreateDialog(view, m, agents, nodePresent, dataRoots);
+        card.onclick = () => mgmtCreateDialog(view, m, agents, nodePresent, dataRoots,
+                                              giteaEnabled);
         return card;
     };
     // Partition into the three sections, then render Research → Base → Store —
