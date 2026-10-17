@@ -905,6 +905,16 @@ class CreateRequest:
     # /workspace/.orchestrator/greeting at create for the management/research
     # flavor; "" ⇒ no file staged.
     greeting: str = ""
+    # A web app the project runs itself and shows as a tab that follows the
+    # browser's address: the workflow manifest's `web` ({port, label, start};
+    # built-in docker workflows only). DERIVED in from_kwargs like `greeting` —
+    # never a user/broker input, so it stays out of CREATE_WEBUI_FIELDS. {} ⇒ no
+    # web app, and the project is created exactly as before.
+    web: dict = field(default_factory=dict)
+    # The agent's CLAUDE.md for a docker project: the manifest's `instructions`
+    # (a built-in's sibling workflows/<name>.instructions.md). DERIVED like
+    # `greeting`; staged no-clobber at create. "" ⇒ nothing staged.
+    instructions: str = ""
     # Dev lane (STAGE_DEV_GITEA S2). dev_lane is DERIVED from the workflow
     # manifest's `dev: true` (data, never the workflow name — the flavor-
     # derivation discipline); dev_repo is the MANDATORY-on-a-dev-workflow gitea
@@ -994,6 +1004,24 @@ class CreateRequest:
         ref = (kw.get("ref") or manifest.get("ref") or "").strip()
         setup = (kw.get("setup") or manifest.get("setup") or "").strip()
         github_pat = kw.get("github_pat") or ""
+        # A workflow that runs its own web app re-runs its setup after every
+        # rebuild of the container, so the setup is the manifest's and only
+        # the manifest's, and it runs in /workspace: a typed setup would run
+        # once and then be replaced, and a typed repo would put the first run
+        # inside the clone. (The browser hides those fields for it; this is
+        # the gate.) Both texts reach the browser verbatim.
+        web = dict(manifest.get("web") or {})
+        if web:
+            if (kw.get("repo") or "").strip() or (kw.get("ref") or "").strip():
+                raise ValidationError(
+                    "this workflow starts its own app and takes no git repo; "
+                    "create the project without one")
+            typed = (kw.get("setup") or "").strip()
+            if typed and typed != (manifest.get("setup") or "").strip():
+                raise ValidationError(
+                    "this workflow's setup is fixed; create the project "
+                    "without a setup of its own")
+        instructions = manifest.get("instructions") or ""
         if repo:
             if not ref:
                 raise ValidationError(
@@ -1257,6 +1285,8 @@ class CreateRequest:
             agents=agents,
             service_defaults=service_defaults,
             greeting=greeting,
+            web=web,
+            instructions=instructions,
             dev_lane=dev_lane,
             dev_repo=dev_repo,
             dev_branch=dev_branch,
@@ -3143,6 +3173,10 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         die(f"image {substrate_image} not found. Run `research setup` first.")
     if not container_running(ROUTER_CONTAINER):
         die(f"{ROUTER_CONTAINER} is not running. Run `research setup` first.")
+    # A workflow that starts its own web app needs the loop baked into the
+    # image; refuse before anything exists (and before any Gitea resume).
+    if is_docker and req.web:
+        _gate_project_web_image()
 
     # The `docker` substrate is a single runc container — no sysbox runtime, no
     # inner dockerd. dind_mode is meaningless there; mark it "none" so the label
@@ -3316,6 +3350,10 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         service_flags=service_flags,
         agent_pair=model_pairs["supervisor"],
         agents=deployed_agents,
+        # The setup is the manifest's (from_kwargs refuses any other for a
+        # web-app workflow), so the env carries exactly what create runs.
+        web=({"start": req.web["start"], "port": req.web["port"],
+              "setup": req.setup} if is_docker and req.web else None),
     )
     if extra_mounts:
         docker_args = docker_args[:-1] + extra_mounts + [docker_args[-1]]
@@ -3390,12 +3428,23 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         #      fires on rs-minimal (its /home/research is image-resident).
         _stage_git_auth(container_name, req.github_ssh_key,
                         req.git_user_name, req.git_user_email, progress)
+        # The workflow's agent instructions and its web app's tab, BEFORE the
+        # setup: a failed setup raises out of create, and nothing later would
+        # stage either (a start retries only the setup).
+        if req.instructions:
+            _stage_project_instructions(container_name, req.instructions)
+        if req.web:
+            _register_project_web_tab(workspace_path, req.web)
         # 6'. Light-path harness: clone the workflow repo + run setup on the box
-        #     (after inject_route, so egress works). Create-time only; raises
-        #     HarnessError on failure (box left standing).
+        #     (after inject_route, so egress works). Raises HarnessError on
+        #     failure (box left standing). Create-time only, except for a web-app
+        #     workflow: its marker is written here, the rebuild and a start re-run
+        #     the setup while the marker is missing (_rerun_project_setup).
         clone_dir = _run_light_harness(
             container_name, req.repo, req.ref, req.setup, req.github_pat, progress,
             use_ssh=bool(req.github_ssh_key))
+        if req.web:
+            _mark_project_setup_done(container_name)
         progress.step("ready", "project ready")
     else:
         # 6. Wait for inner dockerd, then stage the inner images.
@@ -3759,7 +3808,7 @@ def start(req: StartStopRequest, cfg: "Config" | None = None,
         print(f"=== Starting project: {c['project']} ===")
         if _container_substrate(c["name"]) == Substrate.DOCKER.value:
             progress.step("start", "starting container")
-            _start_docker_substrate(c["project"], cfg)
+            _start_docker_substrate(c["project"], cfg, progress)
         else:
             progress.step("recreate", "recreating supervisor")
             _recreate_supervisor(c["project"], cfg, progress=progress)
@@ -5017,6 +5066,7 @@ def build_supervisor_docker_args(
     service_flags: dict[str, bool] | None = None,
     agent_pair: dict[str, str] | None = None,
     agents: "Sequence[str]" = (),
+    web: dict | None = None,
 ) -> list[str]:
     is_docker = substrate == Substrate.DOCKER.value
     args = [
@@ -5042,6 +5092,17 @@ def build_supervisor_docker_args(
         # without it default to dind-sysbox (_container_substrate).
         "--label", f"{SUBSTRATE_LABEL}={substrate}",
     ]
+    # A docker project's web app (WEB_ENV_*): its start command and port start
+    # the entrypoint's rs-web-loop, and its setup text is what the host re-runs
+    # after a rebuild. Host-written here and read back from the container's own
+    # environment at a rebuild or start (_read_supervisor_metadata), which
+    # nothing inside the container can change. After SSH_PASSWORD on purpose:
+    # _supervisor_ssh_pass splits the env on newlines, and these values carry
+    # them. None ⇒ nothing emitted, the container exactly as before.
+    if web:
+        args += ["-e", f"{WEB_ENV_START}={web['start']}",
+                 "-e", f"{WEB_ENV_PORT}={web['port']}",
+                 "-e", f"{WEB_ENV_SETUP}={web['setup']}"]
     # The docker substrate has no inner dockerd — no DIND boot, no runtime flag.
     if not is_docker:
         args += ["-e", "DOCKER_DIND=true"]
@@ -7747,6 +7808,8 @@ def _read_supervisor_metadata(container: str) -> dict:
         service_flags[sid] = True
 
     return {
+        # A docker project's web app, exactly as create wrote it (None ⇒ none).
+        "web": _web_from_env(env),
         "ssh_port": ssh_port,
         "ssh_pass": env.get("SSH_PASSWORD", ""),
         "dind_mode": labels.get(DIND_MODE_LABEL, "privileged"),
@@ -8166,7 +8229,8 @@ def _container_substrate(container: str) -> str:
     return s or Substrate.DIND_SYSBOX.value
 
 
-def _start_docker_substrate(project: str, cfg: "Config") -> None:  # type: ignore[name-defined]
+def _start_docker_substrate(project: str, cfg: "Config",  # type: ignore[name-defined]
+                            progress=None) -> None:
     """Start a stopped `docker`-substrate project. Unlike a sysbox supervisor
     (which loses its implicit volume bindings on stop and must be recreated), a
     plain runc container starts cleanly with `docker start`. Only the router
@@ -8199,6 +8263,13 @@ def _start_docker_substrate(project: str, cfg: "Config") -> None:  # type: ignor
     # F3 Slice 1: re-establish loopback forwarders for the project's registered
     # exported ports (the container's netns/processes reset on stop/start).
     _reconcile_loopback_bridges(project, cfg)
+    # A web-app project whose setup did not finish (it failed at create or
+    # after a rebuild) retries it now: the home survived the stop, so a
+    # finished setup is never re-run. This is what "stop the project and
+    # start it again" in its texts means.
+    web = _project_web(container)
+    if web and not _project_setup_done(container):
+        _rerun_project_setup(container, web, progress or _NULL_PROGRESS)
 
 
 def _without_mount(mounts: list[str], dst: str) -> list[str]:
@@ -8263,13 +8334,15 @@ def _update_docker_substrate(req: "UpdateRequest", cfg: "Config",  # type: ignor
     flags = _compute_service_flags(enable_services, disable_services, base=base)
     progress.step("recreate", "recreating box")
     print(f"=== Updating project: {project} (editor toggle) ===")
-    _recreate_docker_substrate(project, cfg, service_flags=flags)
+    _recreate_docker_substrate(project, cfg, service_flags=flags,
+                               progress=progress)
     return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
                         workers_enabled=[], workers_disabled=[])
 
 
 def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[name-defined]
-                               service_flags: dict[str, bool]) -> None:
+                               service_flags: dict[str, bool],
+                               progress=None) -> None:
     """Recreate a `docker`-substrate (plain runc) box to apply a service-flag
     change. Far simpler than _recreate_supervisor: no inner dockerd, no image
     re-staging, no creds-stash dance (the box re-auths in place — greenfield-
@@ -8321,7 +8394,10 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
         # The docker box's agent set lives in its recovered per-agent mounts
         # (`-v <cache>/<a>:/opt/agent-dist/<a>:ro`, docker-run fixed) — the same
         # source the entrypoint's per-agent loop reads, so env and deploy agree.
-        agents=_agents_from_mounts(md["extra_mounts"]))
+        agents=_agents_from_mounts(md["extra_mounts"]),
+        # The web app exactly as the old container carried it (its own env,
+        # host-written at create; nothing inside the container can change it).
+        web=md.get("web"))
     # Recovered binds minus any prior editor-dist mount (agent-dist + --data mounts
     # pass through); re-derive the editor mount from the new flag (mirrors create).
     extra = _without_mount(md["extra_mounts"], EDITOR_DIST_MOUNT)
@@ -8350,6 +8426,10 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
     # F3 Slice 1: the rm + run above wiped the container fs + netns — re-establish
     # loopback forwarders for the project's registered exported ports.
     _reconcile_loopback_bridges(project, cfg)
+    # The rm + run reset the home, so a web-app project's setup (its install)
+    # is gone: re-run it, after node is back. The tab waits through it.
+    if md.get("web"):
+        _rerun_project_setup(container, md["web"], progress or _NULL_PROGRESS)
 
 
 def _live_toggle_editor(project: str, cfg: "Config", container: str,  # type: ignore[name-defined]
@@ -11295,6 +11375,132 @@ _WEB_BOX_TOO_OLD_MSG = ("this project's boxes predate box types that start "
 BOX_WEB_LOOP_PATH = "/usr/local/bin/rs-web-loop"
 
 
+# --- A docker project's own web app (a workflow manifest's `web`) -----------
+# The project runs the box's mechanism: rs-web-loop/rs-web-set/rs-web-restart
+# are baked into rs-minimal at the same paths, its entrypoint starts the loop
+# when WEB_ENV_START is set, and the host hands it the tab's address. The env
+# names are the box's own (rs_sandbox passes them to a web box), so the scripts
+# stay one set. The setup text rides the env too, because the host re-runs it
+# after every rebuild (the rebuild resets the image-resident home).
+WEB_ENV_START = "RS_BOX_WEB_START"
+WEB_ENV_PORT = "RS_BOX_WEB_PORT"
+WEB_ENV_SETUP = "RS_BOX_SETUP"
+# The setup marker, in the project user's home: rs-web-loop starts nothing and
+# rs-web-set reports not-ready until it exists. LOCKSTEP with both scripts.
+WEB_SETUP_DONE = ".rs-box-setup-done"
+# MIRROR of rs_sandbox's WEB_READY_WAIT_S / WEB_PROBE_TIMEOUT_S /
+# WEB_SET_MARGIN_S (pinned — rscore cannot import that tool): the bound on one
+# in-project rs-web-set call, which holds the serial broker.
+_WEB_READY_WAIT_S = 4
+_WEB_PROBE_TIMEOUT_S = 1
+_WEB_SET_MARGIN_S = 3
+WEB_SET_TIMEOUT_S = _WEB_READY_WAIT_S + _WEB_PROBE_TIMEOUT_S + _WEB_SET_MARGIN_S
+
+_WEB_IMAGE_TOO_OLD_MSG = (
+    "the project image predates workflows that start their own app; rebuild "
+    "the images under Management → Software → Rebuild all, then create the "
+    "project again")
+_WEB_SETUP_FAILED_LINE = (
+    "The project's web app could not be installed, so it stays stopped; stop "
+    "the project and start it again to retry.")
+_WEB_NOT_RUNNING_MSG = "the project is not running; start it to open this tab"
+
+
+def _web_from_env(env: dict) -> dict | None:
+    """A docker project's web app from its container env ({start, port,
+    setup}), or None when the project has none (or the three are not all
+    there, which create never writes)."""
+    start, setup = env.get(WEB_ENV_START), env.get(WEB_ENV_SETUP)
+    try:
+        port = int(env.get(WEB_ENV_PORT, ""))
+    except ValueError:
+        return None
+    if not start or not setup:
+        return None
+    return {"start": start, "port": port, "setup": setup}
+
+
+def _project_web(container: str) -> dict | None:
+    """The web app a docker project's container was created with — read from
+    its own env, which works on a stopped container too. None ⇒ none."""
+    r = run(["docker", "container", "inspect", "-f", "{{json .Config.Env}}",
+             container], capture_output=True)
+    if r.returncode != 0:
+        return None
+    try:
+        entries = json.loads(r.stdout)
+    except ValueError:
+        return None
+    env: dict[str, str] = {}
+    for entry in entries if isinstance(entries, list) else []:
+        if isinstance(entry, str) and "=" in entry:
+            k, v = entry.split("=", 1)
+            env[k] = v
+    return _web_from_env(env)
+
+
+def _gate_project_web_image() -> None:
+    """Refuse a web-app project on an rs-minimal image built before the web
+    scripts were baked: its tab would wait for an app nothing starts. One short
+    offline container run; before anything is created."""
+    r = run(["docker", "run", "--rm", "--network", "none", "--entrypoint",
+             "test", MINIMAL_IMAGE, "-x", BOX_WEB_LOOP_PATH], capture_output=True)
+    if r.returncode != 0:
+        raise ValidationError(_WEB_IMAGE_TOO_OLD_MSG)
+
+
+def _stage_project_instructions(container: str, text: str) -> None:
+    """The workflow's agent instructions as /workspace/CLAUDE.md, no-clobber,
+    written as the project user (the dev lane's form), so the agent owns the
+    file whatever the host's uid and an edited copy is never replaced."""
+    run(["docker", "exec", "-i", "-u", "research", container, "sh", "-c",
+         '[ -e /workspace/CLAUDE.md ] || cat > /workspace/CLAUDE.md'],
+        input=text, capture_output=True)
+
+
+def _register_project_web_tab(workspace_path: "Path", web: dict) -> None:
+    """The top-level tab entry {port, label, web: true} for the project's own
+    web app (port_add's plain-branch dedupe + sort). Written right after the
+    container is up, before the setup, so a failed setup never leaves the
+    project without the tab."""
+    ports = [e for e in read_exported_ports(workspace_path)
+             if not (e.get("port") == web["port"] and not e.get("passthrough"))]
+    ports.append({"port": web["port"], "label": web["label"], "web": True})
+    ports.sort(key=lambda e: e["port"])
+    _write_exported_ports(workspace_path, ports)
+
+
+def _mark_project_setup_done(container: str) -> None:
+    """Write the setup marker and wake the loop (rs-web-restart signals it
+    only after checking the pid file names the loop), so the app starts now
+    rather than at the loop's next recheck. HarnessError on failure."""
+    _light_exec(container,
+                f'touch "$HOME/{WEB_SETUP_DONE}" && rs-web-restart >/dev/null',
+                step="workflow setup marker", github_pat="")
+
+
+def _project_setup_done(container: str) -> bool:
+    return run(["docker", "exec", "-u", "research", container, "sh", "-c",
+                f'test -e "$HOME/{WEB_SETUP_DONE}"'],
+               capture_output=True).returncode == 0
+
+
+def _rerun_project_setup(container: str, web: dict, progress) -> None:
+    """Re-run a web-app project's setup in /workspace (the rebuild or an
+    earlier failure left it unfinished), then mark it done. Warn and continue
+    on failure: the rebuild or start itself took effect, the app stays
+    stopped, and the next start retries. The only two callers are the
+    editor-toggle rebuild and a plain start."""
+    print("running the workflow setup (it installs the project's web app)...")
+    try:
+        _light_exec(container, web["setup"], step="workflow setup",
+                    github_pat="", workdir="/workspace")
+        _mark_project_setup_done(container)
+    except HarnessError as e:
+        print(f"warning: {e.log_msg}: {e.client_detail}", file=sys.stderr)
+        progress.step("warning", _WEB_SETUP_FAILED_LINE)
+
+
 def _gate_box_web(container: str, want_browser: bool) -> None:
     """Refuse a web-app box on a project whose box tool or box image predates
     web apps. A missing tool passes (a research project stages it later), and
@@ -12083,8 +12289,11 @@ def read_exported_ports(workspace_path: "Path") -> list[dict]:  # type: ignore[n
     box's own 127.0.0.1 port, `box` the box name — the pair the unexpose/sweep paths
     need. Such an entry may also carry {web:true}: the box's own web app's tab,
     registered at box create (kept only when exactly True on a valid box entry, so
-    every other entry round-trips byte-identically). Missing/malformed → []; a
-    plain {port,label} stays a top-level entry.
+    every other entry round-trips byte-identically). A top-level entry may carry
+    {web:true} too: a docker project's own web app (kept only when exactly True
+    and the raw entry has none of box/passthrough/host_port — so a degraded box
+    entry or a pass-through claim never turns into a tab nobody can remove).
+    Missing/malformed → []; a plain {port,label} stays a top-level entry.
     A pass-through claim (STAGE_PASSTHROUGH_PORTS) additionally carries
     {passthrough:true, host_port:int, count:int>=1 (absent == 1)} — accepted only
     when ALL of those hold, else the entry DEGRADES to a plain {port,label}
@@ -12115,6 +12324,9 @@ def read_exported_ports(workspace_path: "Path") -> list[dict]:  # type: ignore[n
                 entry["box"], entry["app_port"] = box, app_port
                 if e.get("web") is True:
                     entry["web"] = True
+            elif e.get("web") is True and not any(
+                    k in e for k in ("box", "passthrough", "host_port")):
+                entry["web"] = True
             pt, hp, cnt = e.get("passthrough"), e.get("host_port"), e.get("count", 1)
             if (pt is True and isinstance(hp, int) and not isinstance(hp, bool)
                     and isinstance(cnt, int) and not isinstance(cnt, bool)
@@ -12231,9 +12443,17 @@ def port_add(req: "PortAddRequest", _progress=None) -> PortAddResult:  # type: i
     # Plain (page-tab) entry: dedupe on `port` among NON-passthrough entries
     # only — a pass-through claim targeting the same project-side port is a
     # DIFFERENT registration (identity = host_port) and must survive this add.
-    ports = [e for e in read_exported_ports(ws)
+    # A project's own web-app tab keeps its flag through a re-add (a relabel),
+    # as the box branch does, so it still follows the browser's address.
+    old = read_exported_ports(ws)
+    was_web = any(e.get("port") == req.port and e.get("web") is True
+                  and not e.get("box") and not e.get("passthrough") for e in old)
+    ports = [e for e in old
              if not (e.get("port") == req.port and not e.get("passthrough"))]
-    ports.append({"port": req.port, "label": req.label})
+    new_entry = {"port": req.port, "label": req.label}
+    if was_web:
+        new_entry["web"] = True
+    ports.append(new_entry)
     ports.sort(key=lambda e: e["port"])
     _write_exported_ports(ws, ports)
     _reconcile_loopback_bridges(req.project, cfg)
@@ -12261,10 +12481,14 @@ def port_remove(req: "PortRemoveRequest", _progress=None) -> PortRemoveResult:  
 
     gone = next((e for e in existing if _match(e)), None)
     # A box type's own web-app tab belongs to the box (the box keeps running
-    # the app); only removing the box removes it.
+    # the app); only removing the box removes it. A project's own web-app tab
+    # belongs to the project the same way. Fixed texts: the label is free text.
     if gone and gone.get("web") is True:
-        raise ValidationError("This tab belongs to the box; remove the box to "
-                              "remove it.")
+        if gone.get("box"):
+            raise ValidationError("This tab belongs to the box; remove the box "
+                                  "to remove it.")
+        raise ValidationError("This tab belongs to the project; it goes when "
+                              "the project is destroyed.")
     warnings: list[str] = []
     if gone and gone.get("box"):
         container = _running_dind_supervisor(req.project)
@@ -12294,14 +12518,40 @@ def box_web_address(req: "BoxWebAddressRequest", _progress=None) -> BoxWebAddres
     cfg = load_config()
     ws = workspace_path_for(req.project, cfg)
     entry = next((e for e in read_exported_ports(ws)
-                  if e.get("port") == req.port and e.get("web") is True
-                  and e.get("box")), None) if ws.is_dir() else None
+                  if e.get("port") == req.port and e.get("web") is True),
+                 None) if ws.is_dir() else None
     if entry is None:
         raise ValidationError("this tab is not a box's own web app")
+    if not entry.get("box"):
+        return _project_web_address(req)
     container = _running_dind_supervisor(req.project)
     r = run(["docker", "exec", container, "rs-sandbox", "web-address",
              entry["box"], req.address], capture_output=True)
     info = _parse_box_tool_json(r.stdout) if r.returncode == 0 else {}
+    return BoxWebAddressResult(project=req.project, port=req.port,
+                               changed=info.get("changed") is True,
+                               ready=info.get("ready") is True)
+
+
+def _project_web_address(req: "BoxWebAddressRequest") -> BoxWebAddressResult:  # type: ignore[name-defined]
+    """box_web_address for a docker project's own web app: the same baked
+    rs-web-set, run directly in the project container as its user (a docker
+    project has no box tool), under the box tool's own timeout."""
+    container = container_name_for(req.project)
+    if not container_running(container):
+        raise ValidationError(_WEB_NOT_RUNNING_MSG)
+    if _container_substrate(container) != Substrate.DOCKER.value:
+        raise ValidationError("this tab is not a box's own web app")
+    r = run(["docker", "exec", "-u", "research", container, "timeout",
+             str(WEB_SET_TIMEOUT_S), "rs-web-set", req.address],
+            capture_output=True)
+    info = {}
+    if r.returncode == 0:
+        try:
+            last = json.loads((r.stdout or "").strip().splitlines()[-1])
+            info = last if isinstance(last, dict) else {}
+        except (ValueError, IndexError, RecursionError):
+            info = {}
     return BoxWebAddressResult(project=req.project, port=req.port,
                                changed=info.get("changed") is True,
                                ready=info.get("ready") is True)

@@ -18,7 +18,7 @@ or any provider pi supports — not the Claude subscription), whichever this pro
 
 ## Your shell has no terminal
 
-<!-- LOCKSTEP (verbatim block, eight homes): container/supervisor/CLAUDE.md and boxes/{byo,data-wrangler,dev,open-knowledge,paper-orchestra,websearcher,zotero}.instructions.md carry this section byte-for-byte between these two markers — change one, change all (pytest-pinned). Headless surfaces (the worker template, the role.md files) deliberately do not carry it. -->
+<!-- LOCKSTEP (verbatim block, nine homes): container/supervisor/CLAUDE.md, boxes/{byo,data-wrangler,dev,open-knowledge,paper-orchestra,websearcher,zotero}.instructions.md and workflows/open-knowledge.instructions.md carry this section byte-for-byte between these two markers — change one, change all (pytest-pinned). Headless surfaces (the worker template, the role.md files) deliberately do not carry it. -->
 
 Wherever this session is hosted — a byobu tab or the VS Code extension — the commands you run get **no terminal**: stdin is empty (end-of-file), stdout is a file, `[[ -t 1 ]]` is false. Consequences, and the forms that work:
 

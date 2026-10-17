@@ -1153,7 +1153,7 @@ async def broker_port_remove_handler(request: web.Request) -> web.Response:
 
 
 async def broker_web_address_handler(request: web.Request) -> web.Response:
-    """POST /broker/project/{name}/web-address {service} — a box's own web-app
+    """POST /broker/project/{name}/web-address {service} — a web-app
     tab is being opened: tell the box the address the tab is opened at and
     relay whether the app answers there ({changed, ready}). The address is
     derived HERE from the request (the browser's host + the tab's allocated
@@ -2301,7 +2301,9 @@ def _read_exported_ports(project: str) -> list[dict]:
     import rscore — keep the two byte-equivalent in effect): a pass-through
     claim carries {passthrough:true, host_port:int non-bool, count:int non-bool
     >=1 (key absent == 1)}; any malformed member DEGRADES the entry to a plain
-    {port,label} — never dropped, never trusted."""
+    {port,label} — never dropped, never trusted. {web:true} survives on a valid
+    box entry, and on a top-level entry whose raw keys carry none of
+    box/passthrough/host_port (a docker project's own web app)."""
     workspace = _project_workspace(project)
     if workspace is None:
         return []
@@ -2330,6 +2332,9 @@ def _read_exported_ports(project: str) -> list[dict]:
                 entry["box"], entry["app_port"] = box, app_port
                 if e.get("web") is True:
                     entry["web"] = True
+            elif e.get("web") is True and not any(
+                    k in e for k in ("box", "passthrough", "host_port")):
+                entry["web"] = True
             pt, hp, cnt = e.get("passthrough"), e.get("host_port"), e.get("count", 1)
             if (pt is True and isinstance(hp, int) and not isinstance(hp, bool)
                     and isinstance(cnt, int) and not isinstance(cnt, bool)

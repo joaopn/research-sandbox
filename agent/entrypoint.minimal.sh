@@ -9,7 +9,8 @@
 # Authority-without-agency does not apply here — there is simply nothing to
 # manage and no agent to hijack.
 #
-# Expected env: PROJECT, SSH_PASSWORD, HOST_GID, RS_SERVICE_CODE_SERVER.
+# Expected env: PROJECT, SSH_PASSWORD, HOST_GID, RS_SERVICE_CODE_SERVER;
+# RS_BOX_WEB_START/RS_BOX_WEB_PORT/RS_BOX_SETUP for a workflow with a web app.
 
 set -euo pipefail
 
@@ -127,6 +128,19 @@ if [[ "${RS_SERVICE_CODE_SERVER:-disabled}" == "enabled" ]] \
    && [[ -e /opt/editor-dist/.local/bin/code-server ]] \
    && [[ ! -e /usr/bin/code-server ]]; then
     bash /opt/editor-dist/tools/code-server-deploy.sh || true
+fi
+
+# --- Workflow web app (RS_BOX_WEB_START): keep it running in the background ---
+# The env names are the box's (the same rs-web-loop serves both), so the loop
+# and its helpers stay one set of scripts. rs-web-loop starts the app once the
+# host has run the workflow's setup (~/.rs-box-setup-done) and the webui has
+# told this container the address its tab is opened at. Home is image-resident,
+# so a plain stop/start keeps the last boot's loop pid and any unconsumed
+# restart request: remove both, by name, first. A project without a web app
+# boots exactly as before.
+if [[ -n "${RS_BOX_WEB_START:-}" ]]; then
+    rm -f ~/.rs-web-loop.pid ~/.rs-web-restart
+    /usr/local/bin/rs-web-loop >/dev/null 2>&1 &
 fi
 
 echo "=== Minimal substrate ready ==="

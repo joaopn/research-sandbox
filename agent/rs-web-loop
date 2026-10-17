@@ -2,7 +2,8 @@
 # rs-web-loop — keeps a box's web app running at the address its webui tab is
 # opened at. Started in the background by the box entrypoint, as the box user,
 # when the box's type declares a web app (RS_BOX_WEB_START is the app's start
-# command, RS_BOX_WEB_PORT its port).
+# command, RS_BOX_WEB_PORT its port). A lightweight project whose workflow
+# declares a web app starts it the same way from its own entrypoint.
 #
 # The address FILE (/workspace/.rs-web-address, written by rs-web-set) is the
 # source of truth; USR1 only cuts a wait short. Each pass: read the address and
@@ -10,6 +11,10 @@
 # asked for, start it if it is not running and an address is known, then wait.
 # A signal that lands just before the wait is not lost: the next pass, at most
 # WEB_RECHECK_S later, still sees the file.
+#
+# Nothing starts before the setup marker exists. A box writes it before this
+# loop starts, so a box never waits here; a project starts this loop at boot
+# and its host runs the setup afterwards, then wakes the loop.
 #
 # No `set -e`: a failure inside a pass must never end the loop.
 
@@ -20,6 +25,10 @@ ADDR_FILE=/workspace/.rs-web-address
 LOG=/workspace/.rs-web.log
 PID_FILE="$HOME/.rs-web-loop.pid"
 RESTART_FILE="$HOME/.rs-web-restart"
+SETUP_DONE="$HOME/.rs-box-setup-done"
+# What the app's log says while the setup has not finished, so a log read
+# after a failed setup does not show an earlier run's output.
+WAITING_LINE="The web app is waiting for its setup to finish; if it does not, stop the project and start it again."
 
 # The bound on how late a missed wake-up is applied; the normal path is woken
 # at once by USR1, so this only costs anything when a signal was lost.
@@ -42,6 +51,7 @@ printf '%s\n' "$$" > "$PID_FILE"
 app=""         # the running app's pid (it leads its own process group)
 app_addr=""    # the address it was started with
 not_before=0   # no start before this $SECONDS value (the backoff)
+waiting_noted=0  # the waiting line is in the log
 
 read_address() {
     if [ -f "$ADDR_FILE" ] && [ ! -L "$ADDR_FILE" ]; then
@@ -75,6 +85,17 @@ start_app() {
         setsid bash -c "$START" > "$LOG" 2>&1 &
     app=$!
     app_addr="$1"
+}
+
+# Put the waiting line in the log by renaming a fresh file over it, never by
+# opening the log here: whatever sits at the log path (a FIFO would block
+# this loop for good) is replaced, not written through.
+note_waiting() {
+    local t
+    t="$(mktemp /workspace/.rs-web.log.XXXXXX)" || return
+    if ! { printf '%s\n' "$WAITING_LINE" > "$t" && mv -T "$t" "$LOG"; }; then
+        rm -f -- "$t"
+    fi
 }
 
 # Wait up to $1 seconds, ending early on USR1 or when the app exits (so a
@@ -119,7 +140,12 @@ while true; do
         not_before=0
     fi
     wait_s=$WEB_RECHECK_S
-    if [ -z "$app" ] && [ -n "$addr" ]; then
+    if [ ! -e "$SETUP_DONE" ]; then
+        if [ "$waiting_noted" = 0 ]; then
+            note_waiting
+            waiting_noted=1
+        fi
+    elif [ -z "$app" ] && [ -n "$addr" ]; then
         if [ "$SECONDS" -ge "$not_before" ]; then
             start_app "$addr"
         elif [ $((not_before - SECONDS)) -lt "$wait_s" ]; then

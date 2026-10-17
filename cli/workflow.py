@@ -68,9 +68,22 @@ PATH_RE = re.compile(r"^/[A-Za-z0-9/_.-]*$")
 # A TCP port: the kernel's 1–65535 range. Not a tuning knob — the protocol bound.
 PORT_MIN, PORT_MAX = 1, 65535
 
+# A web app the project runs itself and the webui shows as a tab that follows
+# the browser's address: {port, label, start} (the box preset's `web`; built-in
+# docker workflows only). `instructions` is the agent's CLAUDE.md, folded in
+# from the sibling workflows/<name>.instructions.md of a built-in (never JSON).
 _ALLOWED_KEYS = {"name", "substrate", "image_overlay", "repo", "ref", "setup",
                  "tabs", "mcp_exports", "resources", "services", "description",
-                 "greeting", "title", "group", "tags", "agents", "dev"}
+                 "greeting", "title", "group", "tags", "agents", "dev", "web",
+                 "instructions"}
+_WEB_KEYS = {"port", "label", "start"}
+# MIRROR of rscore's top-level exported-port rule (_EXPORT_RESERVED_PORTS and
+# the box editor + box loopback bands, _EXPORT_BOX_EDITOR_PORT_LO ..
+# _EXPORT_BOX_LOOPBACK_PORT_HI): a workflow's web app becomes a top-level
+# exported port, so its port must be one that rule accepts. This module stays
+# importable without rscore, hence the copy (pytest-pinned to the original).
+WEB_RESERVED_PORTS = frozenset({22, 8443, 8445})
+WEB_RESERVED_BAND = (8500, 8699)  # inclusive
 _TAB_KEYS = {"name", "port", "kind", "path"}
 _EXPORT_KEYS = {"name", "port", "transport"}
 _RESOURCE_KEYS = {"memory", "cpus"}
@@ -257,6 +270,44 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
                               and all(_is_str(a) for a in m["agents"])):
         out.append(p(f"agents must be a list of non-empty strings, got {m.get('agents')!r}"))
 
+    # web — the project keeps `start` running with its tab's address in
+    # $RS_WEB_ADDRESS and the webui shows `port` as a tab named `label`. Only the
+    # docker substrate's image carries the loop that runs it. It needs a setup
+    # (the app is started only once the setup has run, and the setup is re-run
+    # in /workspace after a rebuild — so no repo clone, which would run it
+    # inside the clone the first time and in /workspace afterwards).
+    if "web" in m:
+        w = m["web"]
+        if not isinstance(w, dict) or set(w) != _WEB_KEYS:
+            out.append(p("web must be an object with exactly port, label, start"))
+        else:
+            port = w.get("port")
+            if (not _valid_port(port) or port in WEB_RESERVED_PORTS
+                    or WEB_RESERVED_BAND[0] <= port <= WEB_RESERVED_BAND[1]):
+                out.append(p(f"web.port must be a TCP port other than "
+                             f"{sorted(WEB_RESERVED_PORTS)} and "
+                             f"{WEB_RESERVED_BAND[0]}-{WEB_RESERVED_BAND[1]}, "
+                             f"got {port!r}"))
+            if not _is_str(w.get("label")):
+                out.append(p("web.label must be a non-empty string"))
+            if not _is_str(w.get("start")):
+                out.append(p("web.start must be a non-empty string"))
+        if m.get("substrate") != "docker":
+            out.append(p("web applies only to the docker substrate"))
+        if not _is_str(setup):
+            out.append(p("web requires a setup (the app starts only after the "
+                         "setup ran)"))
+        if repo is not None or ref is not None:
+            out.append(p("web forbids repo/ref (the setup re-runs in /workspace)"))
+
+    # instructions — the agent's CLAUDE.md, staged into a docker project's
+    # /workspace at create. Folded in from the built-in's sibling file.
+    if "instructions" in m:
+        if not _is_str(m["instructions"]):
+            out.append(p("instructions must be a non-empty string"))
+        if m.get("substrate") != "docker":
+            out.append(p("instructions apply only to the docker substrate"))
+
     extras = set(m) - _ALLOWED_KEYS
     if extras:
         out.append(p(f"unknown keys: {sorted(extras)}"))
@@ -300,6 +351,16 @@ def load_builtins(builtin_dir: Path = BUILTIN_DIR) -> dict[str, dict]:
             m = json.loads(f.read_text())
         except json.JSONDecodeError as e:
             raise WorkflowError(f"builtin {f.name}: not valid JSON: {e}") from e
+        # A built-in's agent instructions live in a sibling markdown file
+        # (readable as a document), folded in here, never in the JSON.
+        if isinstance(m, dict):
+            if "instructions" in m:
+                raise WorkflowError(
+                    f"builtin {f.name}: 'instructions' belongs in the sibling "
+                    f"{f.stem}.instructions.md, not the JSON")
+            sidecar = builtin_dir / f"{f.stem}.instructions.md"
+            if sidecar.is_file():
+                m["instructions"] = sidecar.read_text()
         errs = _validate_entry(f.stem, m)
         if errs:
             raise WorkflowError(f"builtin {f.name}: " + "; ".join(errs))
@@ -340,6 +401,14 @@ def load_registry(path: Path = REGISTRY_PATH) -> dict[str, dict]:
         ev = _validate_entry(name, m)
         if ev:
             raise WorkflowError(f"registry: " + "; ".join(ev))
+        # A web app is started without being asked for and gets a tab of its
+        # own, and instructions are staged into the project: built-in
+        # workflows only (the loader is the one place that knows the source).
+        for k in ("web", "instructions"):
+            if isinstance(m, dict) and k in m:
+                raise WorkflowError(
+                    f"registry: entry {name!r}: {k} is reserved for the "
+                    f"built-in workflows")
         out[name] = m
     return out
 

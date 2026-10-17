@@ -6307,6 +6307,12 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataRoots) {
     cloneCb.checked = hasClonePreset;
     cloneGroup.style.display = hasClonePreset ? "" : "none";
     cloneCb.onchange = () => { cloneGroup.style.display = cloneCb.checked ? "" : "none"; };
+    // A workflow that starts its own web app runs its own fixed setup in
+    // /workspace and takes no repo (as the box window offers none): no clone
+    // group at all, and nothing from it is posted (the server refuses a typed
+    // repo or setup for it).
+    const showClone = showInBox && !manifest.web;
+    if (!showClone) cloneCb.checked = false;
 
     // Mount host data (read-only, at /workspace/shared/data/<name>/ — the
     // webui path to what the host CLI's --data does). Offered ONLY when the
@@ -6397,7 +6403,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataRoots) {
             ...modelFields,
             enableField,
             settingsRegion,
-            ...(showInBox ? [cloneToggle, cloneGroup] : []),
+            ...(showClone ? [cloneToggle, cloneGroup] : []),
             ...(showData ? [dataToggle, dataGroup] : []),
             el("div", { class: "hint" }, [
                 "Creating stages container images and can take 10–30s (longer cold).",
@@ -6428,7 +6434,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataRoots) {
                 return "A dev project needs at least one agent to work its repo.";
             }
             // Mirror from_kwargs: an in-box repo needs a ref (pin the clone).
-            if (showInBox && cloneCb.checked && repoI.value.trim() && !refI.value.trim()) {
+            if (showClone && cloneCb.checked && repoI.value.trim() && !refI.value.trim()) {
                 return "A workflow repo requires a ref.";
             }
             // Mirror the broker gate's first refusal (an absolute host path); the
@@ -9614,8 +9620,8 @@ function appendExportedPortsSection(box, project) {
         for (const e of ports) {
             const isPt = !!e.passthrough;
             // A box's own web-app tab belongs to the box (removing the box
-            // removes it) and is told its address by itself: no ✕, no
-            // address line.
+            // removes it), a docker project's to the project, and each is told
+            // its address by itself: no ✕, no address line.
             const isWeb = e.web === true;
             const rmKey = isPt ? e.host_port : e.port;
             const rm = el("button", { class: "close-tab-btn",
@@ -10893,8 +10899,9 @@ async function openHttpService(project, serviceId, svc) {
         status.textContent = "No origin port available for this service.";
         return;
     }
-    // A box's own web app answers only at the exact address its tab is opened
-    // at: tell the box first, and wait until the app answers there. The pane
+    // A box's (or a docker project's) own web app answers only at the exact
+    // address its tab is opened at: tell it first, and wait until the app
+    // answers there. The pane
     // may be torn down (a refresh) while this waits — then stop, mounting
     // nothing. Whatever the outcome, the iframe loads in the end.
     if (svc.follow_address) {
@@ -10919,7 +10926,7 @@ async function openHttpService(project, serviceId, svc) {
         });
         if (out.state === "gone") return;
         if (out.state === "timeout") {
-            status.textContent = `${label} has not answered yet. The box's ` +
+            status.textContent = `${label} has not answered yet. The ` +
                 `terminal tab shows why if it does not come up.`;
         } else if (out.state === "error") {
             status.textContent = `Could not hand ${label} its address ` +
