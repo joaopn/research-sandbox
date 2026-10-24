@@ -59,6 +59,17 @@ const PBKDF2_ITERATIONS = 600000;
 const LOGIN_PROOF_SALT_STR = "rs-broker-login-v1";
 const LOGIN_PROOF_ITERATIONS = 600000;
 const PROBE_INTERVAL_MS = 15000;
+// The rail's host CPU/RAM bars refresh on their own cadence. Each tick is two
+// /proc reads server-side and one tiny request, so cost does not set it; it
+// is how fresh the RAM figure is and how often the CPU minute moves on (the
+// CPU figure is a difference of two counter readings, exact at any cadence) —
+// slower than ~10 s, memory you just claimed (a build you started) shows up
+// late.
+const HOST_STATS_INTERVAL_MS = 5000;
+// The CPU bar is the average over this window, not the last tick: a per-tick
+// figure swings with every short burst and reads as noise beside the rail.
+const CPU_AVG_WINDOW_MS = 60000;
+const BYTES_PER_GB = 1024 ** 3;   // GB as free/htop/docker print it (2^30)
 // Column layout: up to three side-by-side groups, each a width fraction of
 // the terminal area. The floor keeps every column usable — below ~15% of a
 // typical desktop area neither a tab strip nor a terminal has workable
@@ -425,6 +436,10 @@ const state = {
     terminals: {},           // "${project}:${service}" -> { term, fitAddon, ws, container, project, service }
     probeTimer: null,
     servicesTimer: null,
+    hostStatsTimer: null,
+    hostStats: null,         // last painted {cpu: 0..1 | null, memUsed, memTotal}; null = no data, bars hidden
+    hostCpuSamples: [],      // raw {t, busy, total} jiffies samples of the last CPU_AVG_WINDOW_MS
+    hostStatsInFlight: false,  // one request at a time: a stalled webui must not pile them up
     theme: null,
     termTheme: null,         // persisted: TERM_THEMES id, or null = follow the interface theme
     railPinned: false,       // persisted: keep rail in flex flow (push layout)
@@ -892,6 +907,7 @@ async function renderDashboard(opts = {}) {
     schedulePolling();
     paintProjectBadges();
     scheduleServicesRefresh();
+    scheduleHostStats();
 
     // Project-less strips need the fallback opener chip (softlock guard).
     ensureMobileChip();
@@ -921,6 +937,12 @@ async function renderDashboard(opts = {}) {
     } else {
         tryBrokerLogin().then(() => {
             syncSidebarFromBroker();
+            // The timer's first sample ran before the session existed (401);
+            // sample again now (restarting the tick, so the next sample is a
+            // full interval later) so the bars appear without waiting — but
+            // only then: with figures cached (a reload kept the session
+            // cookie) there is nothing to fix.
+            if (!state.hostStats) scheduleHostStats();
             // Start/stop/update keep running on the broker across a reload;
             // re-learn them so their labels and completion notices come back.
             seedLifecycleFromBroker();
@@ -1286,6 +1308,11 @@ function makeProjectRail() {
     // (Import-an-existing-project moved into the New Project page as a box —
     // openAddProjectModal is reached from there now, not a rail button.)
     rail.appendChild(el("div", { class: "rail-spacer" }));
+    // Host CPU/RAM bars, directly above the nav group's divider — painted from
+    // the cached sample so a rail rebuild never blanks them.
+    const hostStats = makeHostStats();
+    paintHostStats(hostStats);
+    rail.appendChild(hostStats);
     // Workflows + Management + Settings sit together at the BOTTOM of the rail —
     // the host-side create + lifecycle + UI surfaces, distinct from the vault
     // bookmarks above.
@@ -7831,6 +7858,137 @@ function scheduleServicesRefresh() {
     state.servicesTimer = setInterval(refreshActiveServices, PROBE_INTERVAL_MS);
 }
 
+// ---- host CPU / RAM bars (rail bottom) -------------------------------------
+// Host-wide figures from GET /broker/host-stats — a webui-local /proc read,
+// gated on the Management session (that path is the session cookie's Path).
+// The server returns raw counters; the CPU figure is the busy share of the
+// jiffies that passed between THIS page's oldest sample of the last minute
+// and its newest — a true one-minute average, so a single busy tick does not
+// make the bar jump. No data (locked, no session, unreadable /proc) = the
+// block is hidden — never a placeholder or a hint.
+
+function makeHostStats() {
+    const bar = (key, label, title) => el("div", { class: "host-stat-bar", "data-stat": key, title }, [
+        el("div", { class: "host-stat-fill" }),
+        el("span", { class: "host-stat-label" }, [label]),
+        el("span", { class: "host-stat-text" }),
+    ]);
+    return el("div", { class: "host-stats" }, [
+        bar("cpu", "CPU:", "Host CPU in use, averaged over the last minute"),
+        bar("ram", "RAM:", "Host memory in use / total"),
+    ]);
+}
+
+// Paint one stats block from state.hostStats. Takes the node rather than
+// querying the document: inside refreshProjectRail the block being built is
+// not attached yet, and a query would find the outgoing rail's.
+function paintHostStats(node) {
+    if (!node) return;
+    const s = state.hostStats;
+    node.hidden = !s;
+    if (!s) return;
+    const set = (key, frac, text) => {
+        const bar = node.querySelector(`.host-stat-bar[data-stat="${key}"]`);
+        bar.querySelector(".host-stat-fill").style.width =
+            frac == null ? "0%" : (Math.min(1, Math.max(0, frac)) * 100).toFixed(1) + "%";
+        bar.querySelector(".host-stat-text").textContent = text;
+    };
+    set("cpu", s.cpu, s.cpu == null ? "…" : `${Math.round(s.cpu * 100)} %`);
+    set("ram", s.memUsed / s.memTotal,
+        `${(s.memUsed / BYTES_PER_GB).toFixed(1)}/${(s.memTotal / BYTES_PER_GB).toFixed(1)} GB`);
+}
+
+// The painted figures are older than the CPU window: the webui has not
+// answered for a minute (refused, hung, or replying with something that is
+// not the stats). Drop them rather than show minute-old numbers as live.
+function dropStaleHostStats() {
+    const last = state.hostCpuSamples[state.hostCpuSamples.length - 1];
+    if (!state.hostStats || (last && Date.now() - last.t <= CPU_AVG_WINDOW_MS)) return;
+    state.hostStats = null;
+    state.hostCpuSamples = [];
+    paintHostStats(document.querySelector(".project-rail .host-stats"));
+}
+
+async function refreshHostStats() {
+    // Nobody is looking: skip the request. The sample window is pruned by
+    // age, so a long hidden spell ages its samples out by itself.
+    if (!state.vault || document.hidden) return;
+    if (state.hostStatsInFlight) { dropStaleHostStats(); return; }
+    state.hostStatsInFlight = true;
+    let res = null;
+    let body = null;
+    try {
+        res = await fetch("/broker/host-stats");
+        if (res.ok) body = await res.json();
+    } catch (e) {
+        res = null;
+    } finally {
+        state.hostStatsInFlight = false;
+    }
+    if (!state.vault) return;   // locked while the request was in flight
+    // A transport blip (no response, or a 200 we could not read) keeps what
+    // is painted and the minute of samples; the next tick retries — until
+    // the newest good sample is a minute old.
+    if (!res || (res.ok && body === null)) { dropStaleHostStats(); return; }
+    const r = body && body.ok && body.result;
+    if (!r || !r.cpu || !r.mem || !(r.mem.total > 0)) {
+        // An answer that says no: no session (401 — the poll keeps running,
+        // so a later Management login brings the bars back), unreadable
+        // /proc (503), or an error from a proxy in front of the webui.
+        state.hostStats = null;
+        state.hostCpuSamples = [];
+    } else {
+        const now = Date.now();
+        // x.t <= now: a clock set backwards restarts the window rather than
+        // stretching it over samples stamped in the "future".
+        const samples = state.hostCpuSamples.filter((x) => x.t <= now && now - x.t <= CPU_AVG_WINDOW_MS);
+        // No sample in the window (first reading, or the first after a long
+        // hidden spell) → no CPU figure yet, never the one from before.
+        let cpu = samples.length && state.hostStats ? state.hostStats.cpu : null;
+        if (samples.length) {
+            const first = samples[0];
+            const dTotal = r.cpu.total - first.total;
+            // total includes iowait, which the kernel can run backwards: a
+            // non-positive window keeps the last figure, and the share is
+            // clamped so a wobble never paints past either end.
+            if (dTotal > 0) cpu = Math.min(1, Math.max(0, (r.cpu.busy - first.busy) / dTotal));
+        }
+        samples.push({ t: now, busy: r.cpu.busy, total: r.cpu.total });
+        state.hostCpuSamples = samples;
+        state.hostStats = {
+            cpu,
+            memUsed: Math.max(0, r.mem.total - r.mem.available),
+            memTotal: r.mem.total,
+        };
+    }
+    paintHostStats(document.querySelector(".project-rail .host-stats"));
+}
+
+// Coming back to a tab whose newest sample is at least a tick old (a tick was
+// skipped while hidden): sample at once so RAM is current immediately, and
+// restart the tick so an overdue throttled one cannot follow milliseconds
+// later. A hidden spell shorter than a tick needs nothing.
+function installHostStatsResume() {
+    document.addEventListener("visibilitychange", () => {
+        if (document.hidden || !state.vault) return;
+        const last = state.hostCpuSamples[state.hostCpuSamples.length - 1];
+        if (!last || Date.now() - last.t >= HOST_STATS_INTERVAL_MS) scheduleHostStats(true);
+    });
+}
+
+// (Re)start the tick. Every out-of-band sample goes through here, so the next
+// tick is always a full interval after it. A shell re-render (breakpoint
+// flip, Layout change) already paints the cached figures, so it samples at
+// once only when nothing is cached — or when `now` asks for it.
+function scheduleHostStats(now) {
+    if (state.hostStatsTimer) clearInterval(state.hostStatsTimer);
+    state.hostStatsTimer = null;
+    // Locked meanwhile (a login still pending at lock time): start nothing.
+    if (!state.vault) return;
+    if (now || !state.hostStats) refreshHostStats();
+    state.hostStatsTimer = setInterval(refreshHostStats, HOST_STATS_INTERVAL_MS);
+}
+
 // Tab-visible fingerprint: the sorted service ids plus their labels. A newly-
 // listening port adds an id; a re-add relabels; a stopped listener drops one —
 // all move the signature, so the guard in refreshActiveServices fires only then.
@@ -7931,6 +8089,9 @@ function formatBytes(n) {
 function lockVault() {
     if (state.probeTimer) { clearInterval(state.probeTimer); state.probeTimer = null; }
     if (state.servicesTimer) { clearInterval(state.servicesTimer); state.servicesTimer = null; }
+    if (state.hostStatsTimer) { clearInterval(state.hostStatsTimer); state.hostStatsTimer = null; }
+    state.hostStats = null;
+    state.hostCpuSamples = [];
     for (const t of Object.values(state.terminals)) {
         try { if (t.ws) t.ws.close(); } catch (_) {}
         try { if (t.term) t.term.dispose(); } catch (_) {}
@@ -11105,6 +11266,7 @@ window.addEventListener("DOMContentLoaded", () => {
     installGlobalTermRefit();
     installMobileProjectsOutsideClose();
     installRailOutsideClickHandlers();
+    installHostStatsResume();
     if (loadStored()) renderUnlock();
     else renderSetup();
 });

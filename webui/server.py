@@ -1704,6 +1704,53 @@ async def dev_gitea_session_handler(request: web.Request) -> web.Response:
     return response
 
 
+def _read_host_stats() -> dict:
+    """Host-wide CPU counters + memory, from this container's /proc. rs-webui
+    runs under the docker daemon's default runtime with no lxcfs — runc in the
+    shipped setup — so /proc/stat and /proc/meminfo are the HOST kernel's, not
+    a cgroup slice. Raw counters only — the browser turns its own samples of
+    the last minute into a CPU percentage, so every viewer's figure covers its
+    own window and nothing is kept here.
+
+    cpu: the first eight fields of the aggregate `cpu` line (user nice system
+    idle iowait irq softirq steal, in jiffies; guest/guest_nice are already
+    counted inside user/nice). busy = total - idle - iowait.
+    mem: MemTotal and MemAvailable in bytes (used = total - available, what
+    `free` calls used; reclaimable page cache counts as available)."""
+    with open("/proc/stat") as f:
+        fields = [int(x) for x in f.readline().split()[1:9]]
+    total = sum(fields)
+    idle = fields[3] + (fields[4] if len(fields) > 4 else 0)
+    mem = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            key, _, rest = line.partition(":")
+            if key in ("MemTotal", "MemAvailable"):
+                mem[key] = int(rest.split()[0]) * 1024
+    return {
+        "cpu": {"busy": total - idle, "total": total},
+        "mem": {"total": mem["MemTotal"], "available": mem["MemAvailable"]},
+    }
+
+
+async def broker_host_stats_handler(request: web.Request) -> web.Response:
+    """GET /broker/host-stats — the rail's CPU/RAM bars. Gated on the
+    management session like the op-log reads (no broker round-trip: the
+    numbers are read here, not relayed). It lives under /broker/ because that
+    is the session cookie's Path; the gate matters because every project can
+    reach this server over its network. Two small /proc reads, inline — it
+    opens no project tree, so it is safe on the rail's timer."""
+    if _broker_session(request) is None:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+    try:
+        stats = _read_host_stats()
+    except (OSError, ValueError, KeyError, IndexError):
+        return web.json_response(
+            {"ok": False, "error": {"kind": "unavailable"}}, status=503)
+    return web.json_response({"ok": True, "result": stats})
+
+
 async def broker_op_log_handler(request: web.Request) -> web.Response:
     """GET /broker/op/{op_id}/log?from=<n> — the view-log byte-slice since `n`
     plus the new EOF. Reads the RO-mounted view file directly (out-of-band from
@@ -3072,6 +3119,7 @@ def main() -> None:
     app.router.add_post("/broker/login", broker_login_handler)
     app.router.add_post("/broker/logout", broker_logout_handler)
     app.router.add_get("/broker/projects", broker_projects_handler)
+    app.router.add_get("/broker/host-stats", broker_host_stats_handler)
     app.router.add_get("/broker/lifecycle", broker_lifecycle_handler)
     app.router.add_get("/broker/workflows", broker_workflows_handler)
     app.router.add_get("/broker/models", broker_models_handler)
