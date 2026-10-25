@@ -432,6 +432,16 @@ const state = {
     activeService: null,     // string | null
     serviceRegistry: null,   // { [serviceId]: spec } from /services
     projectServices: {},     // { [projectName]: { [serviceId]: spec } }
+    // Detected web apps (STAGE_AUTO_PORTS). detectPaused: a gated tab fetch
+    // answered 401, so tabs come from plain /services until the next
+    // successful Management sign-in (loginGen counts those, so a stale 401
+    // landing after a fresh sign-in cannot re-pause). detectInFlight /
+    // detectPending: one detect=1 per project at a time, one queued behind it.
+    detectPaused: false,
+    lastDetection: {},       // { [projectName]: the marker of its last tab fetch }
+    loginGen: 0,
+    detectInFlight: {},
+    detectPending: {},
     projectLastService: {},  // { [projectName]: serviceId } — per-project landing memory (in-memory; reload/restart resets to the editor default)
     terminals: {},           // "${project}:${service}" -> { term, fitAddon, ws, container, project, service }
     probeTimer: null,
@@ -874,15 +884,63 @@ async function fetchServiceRegistry() {
     return state.serviceRegistry;
 }
 
-async function fetchProjectServices(projectName) {
+// `carry` (a box change on the open project): the previous map, whose detected
+// tabs are kept while this fetch cannot speak for them (withheld etc.), so a
+// box change never makes an on-screen app column vanish for one refresh. A
+// project switch passes none: a returning project starts from a fresh
+// detection rather than from tabs seen earlier.
+async function fetchProjectServices(projectName, carry, onScreen) {
     if (state.projectServices[projectName]) return state.projectServices[projectName];
-    try {
-        const res = await fetch(`/services/${encodeURIComponent(projectName)}`);
-        state.projectServices[projectName] = await res.json();
-    } catch (e) {
-        state.projectServices[projectName] = {};
+    const r = await fetchProjectTabs(projectName, false);
+    state.lastDetection[projectName] = r ? r.detection : "fallback";
+    state.projectServices[projectName] = !r ? {}
+        : (carry ? mergeDetectedTabs(r.services, carry, onScreen || onScreenServiceIds(),
+                                     r.detection, r.opened)
+                 : r.services);
+    // The gated route serves a snapshot only to the session that just saw it;
+    // otherwise the detected tabs join one detection later — fire it now.
+    if (r && r.detection === "withheld") {
+        setTimeout(() => {
+            if (state.activeProject === projectName) refreshActiveServices();
+        }, 0);
     }
     return state.projectServices[projectName];
+}
+
+// A project's tabs: through the session-gated route (which adds detected web
+// apps) when the layout is not the phone's and detection is not paused,
+// otherwise the plain /services/<project>. Returns {services, detection,
+// opened} or null on a transport failure. `detection` is the server's marker
+// ("" = authoritative; busy/unavailable/withheld/off), or "fallback" when the
+// tabs came from /services. A 401 pauses detection (no sign-in attempt of its
+// own: it waits for the next unlock or Management sign-in); any other
+// non-200 falls back for this call only.
+async function fetchProjectTabs(projectName, detect) {
+    const name = encodeURIComponent(projectName);
+    if (!mobileModeActive() && !state.detectPaused) {
+        const gen = state.loginGen;
+        let res = null;
+        try {
+            res = await fetch(`/broker/project/${name}/services?detect=${detect ? 1 : 0}`);
+        } catch (_) { res = null; }
+        if (res && res.status === 200) {
+            let b = null;
+            try { b = await res.json(); } catch (_) { b = null; }
+            if (b && b.ok && b.services) {
+                return { services: b.services, detection: b.detection || "",
+                         opened: b.opened || [] };
+            }
+        } else if (res && res.status === 401 && gen === state.loginGen) {
+            state.detectPaused = true;
+        }
+    }
+    try {
+        const res = await fetch(`/services/${name}`);
+        if (!res.ok) return null;
+        return { services: await res.json(), detection: "fallback", opened: [] };
+    } catch (_) {
+        return null;
+    }
 }
 
 async function renderDashboard(opts = {}) {
@@ -1007,10 +1065,17 @@ async function tryBrokerLogin() {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ proof: state.loginProof }),
         });
+        if (res.status === 200) noteBrokerLogin();
         return res.status === 200;
     } catch (e) {
         return false;   // broker/webui unreachable — Management is opt-in
     }
+}
+
+// A Management sign-in succeeded: detected tabs may be fetched again.
+function noteBrokerLogin() {
+    state.loginGen += 1;
+    state.detectPaused = false;
 }
 
 // ---- rail expand / pin -----------------------------------------------------
@@ -2105,7 +2170,7 @@ async function renderMgmtLogin(view, onSuccess) {
             });
         } catch (e) { return renderMgmtUnavailable(view); }
     }
-    if (res && res.status === 200) return route(view);
+    if (res && res.status === 200) { noteBrokerLogin(); return route(view); }
     if (res && res.status === 403) return renderMgmtRejected(view);
     if (res && res.status === 503) return renderMgmtUnavailable(view);
     // 401 (password mismatch), 429 (rate-limited), or a missing proof:
@@ -6990,12 +7055,14 @@ function boxOpView() { return el("div"); }
 // re-loads on the next config-box open (the config box is dismissed when the op
 // modal takes a pointer-down).
 async function refreshAfterBoxChange(project) {
-    delete state.projectServices[project];
     // Re-activate only when the project's own view is what is on screen: this
     // also runs when an update finishes in the background, and re-activating
     // closes whatever host page (Management, Workflows) the operator moved on to.
+    // activateProject drops the cached tabs itself, carrying detected ones over.
     if (state.activeProject === project && !state.hostPage) {
-        try { await activateProject(project); } catch (e) { /* best-effort */ }
+        try { await activateProject(project, { carry: true }); } catch (e) { /* best-effort */ }
+    } else {
+        delete state.projectServices[project];
     }
 }
 
@@ -7856,6 +7923,14 @@ function schedulePolling() {
 function scheduleServicesRefresh() {
     if (state.servicesTimer) clearInterval(state.servicesTimer);
     state.servicesTimer = setInterval(refreshActiveServices, PROBE_INTERVAL_MS);
+    // The refresh does nothing while the tab is in the background; catch up
+    // once the moment it is visible again. Installed once per page.
+    if (!state.visibilityRefreshInstalled) {
+        state.visibilityRefreshInstalled = true;
+        document.addEventListener("visibilitychange", () => {
+            if (!document.hidden) refreshActiveServices();
+        });
+    }
 }
 
 // ---- host CPU / RAM bars (rail bottom) -------------------------------------
@@ -7989,33 +8064,167 @@ function scheduleHostStats(now) {
     state.hostStatsTimer = setInterval(refreshHostStats, HOST_STATS_INTERVAL_MS);
 }
 
-// Tab-visible fingerprint: the sorted service ids plus their labels. A newly-
-// listening port adds an id; a re-add relabels; a stopped listener drops one —
+// Tab-visible fingerprint: the sorted service ids plus their labels, the
+// detected/stopped marks and the address. A newly-listening port adds an id; a
+// re-add relabels; a stopped listener drops one; a hand-add clears `detected`; a
+// stopped detected app gains `stopped`; a freed address changes `origin_url` —
 // all move the signature, so the guard in refreshActiveServices fires only then.
 function serviceTabsSignature(map) {
     return Object.keys(map || {}).sort()
-        .map((id) => `${id}\x00${(map[id] && map[id].label) || ""}`)
+        .map((id) => {
+            const s = map[id] || {};
+            return `${id}\x00${s.label || ""}\x00${s.detected ? 1 : 0}` +
+                `${s.stopped ? 1 : 0}\x00${s.origin_url || ""}`;
+        })
         .join("\x01");
 }
 
+// Repaint the strip's underline on `serviceId` without activating anything
+// (a re-render drops it); desktop columns repaint their own actives.
+function markActiveTab(serviceId) {
+    document.querySelectorAll("#service-tabs .tab").forEach((t) => t.classList.remove("active"));
+    const tabEl = document.querySelector(`#service-tabs .tab[data-service="${CSS.escape(serviceId)}"]`);
+    if (tabEl) tabEl.classList.add("active");
+    if (!mobileModeActive()) paintColumnActives();
+}
+
+// The service ids on screen right now: the focused tab and every column's
+// shown tab (an app in one column beside the agent's terminal is on screen).
+function onScreenServiceIds() {
+    return [state.activeService, ...(state.columnActive || [])].filter(Boolean);
+}
+
+// Fold the current detected tabs into a fresh tab map BEFORE the signature
+// comparison, so a kept tab never redraws the strip on its own. `detection`
+// is the fetch's marker:
+//   ""        authoritative — a vanished detected tab stays only while on
+//             screen, marked stopped;
+//   busy / unavailable / withheld — detection unknown: every detected tab
+//             is kept as it was;
+//   fallback  (/services) — on-screen detected tabs kept, unmarked (detection
+//             is unavailable, not negative); off-screen ones dropped;
+//   off       — detected tabs dropped.
+// On every gated reply (all but fallback) a kept tab keeps its address only
+// while that address is still on the payload's Opened apps list — so a Remove
+// made in another browser is seen. Pure: no DOM, no state.
+function mergeDetectedTabs(fresh, current, onScreen, detection, opened) {
+    const out = Object.assign({}, fresh || {});
+    if (detection === "off") return out;
+    const unknown = detection === "busy" || detection === "unavailable"
+        || detection === "withheld";
+    const urls = new Set((opened || []).map((o) => o.origin_url));
+    for (const [id, spec] of Object.entries(current || {})) {
+        if (!spec || !spec.detected || id in out) continue;
+        const shown = onScreen.includes(id);
+        if (!unknown && !shown) continue;
+        const kept = Object.assign({}, spec);
+        if (detection === "") kept.stopped = true;
+        if (detection !== "fallback" && kept.origin_url && !urls.has(kept.origin_url)) {
+            delete kept.origin_url;
+        }
+        out[id] = kept;
+    }
+    return out;
+}
+
+// Which open http panes of `projectName` must close because their tab's
+// address went away or changed. A pane counts only if it loaded a per-project
+// address (editor, box editor, port tabs — never Gitea, Fetch or launcher
+// panes, which record none). Missing means: the tab is in the fresh map with
+// no address or a different one, or a port-<n> tab is absent from a payload
+// authoritative for it (a hand-added one: always; a detected one: an
+// authoritative detection, or detection switched off — its address was freed). An editor absent from a reply is no change — its
+// tab is probe-gated and its address cannot change while the project lives.
+// Pure: returns [{key, id, reopen}] where reopen says what replaces it.
+function panesToClose(terminals, projectName, prev, fresh, detection, onScreen) {
+    const out = [];
+    for (const [key, t] of Object.entries(terminals || {})) {
+        if (!t || t.kind !== "http" || !t.loadedUrl) continue;
+        if (!t.project || t.project.name !== projectName) continue;
+        const id = t.service;
+        const spec = fresh[id];
+        let gone;
+        if (spec) {
+            gone = !spec.origin_url || spec.origin_url !== t.loadedUrl;
+        } else if (id.startsWith("port-")) {
+            const was = (prev || {})[id];
+            gone = !(was && was.detected) || detection === "" || detection === "off";
+        } else {
+            gone = false;
+        }
+        if (!gone) continue;
+        let reopen = "none";
+        if (spec && onScreen.includes(id)) reopen = spec.origin_url ? "open" : "note";
+        out.push({ key, id, reopen });
+    }
+    return out;
+}
+
+const TAB_ADDRESS_FREED_TEXT = "This app's view was closed because its tab " +
+    "address was freed. Click the tab to reopen it.";
+const CLICK_TO_OPEN_TEXT = "Click the tab to open this app.";
+
+// Apply panesToClose to the live DOM: tear each pane down the way
+// refreshService does, then reopen an on-screen one in place (never moving
+// focus) or leave the one-line note as that tab's pane entry — registered
+// disconnected, so the column engine positions it and a click takes
+// activateService's disconnected branch, which removes it and reopens.
+function followTabAddresses(projectName, prev, fresh, detection, onScreenIds) {
+    const onScreen = onScreenIds || onScreenServiceIds();
+    for (const c of panesToClose(state.terminals, projectName, prev, fresh,
+                                 detection, onScreen)) {
+        const t = state.terminals[c.key];
+        try { if (t.container) t.container.remove(); } catch (_) {}
+        delete state.terminals[c.key];
+        if (c.reopen === "open") {
+            activateService(c.id, { background: c.id !== state.activeService });
+        } else if (c.reopen === "note") {
+            const container = el("div", { class: "terminal-instance http-instance" }, [
+                el("div", { class: "http-status" }, [TAB_ADDRESS_FREED_TEXT]),
+            ]);
+            const area = document.getElementById("terminal-area");
+            if (area) area.appendChild(container);
+            state.terminals[c.key] = {
+                kind: "http", container, service: c.id, disconnected: true, note: true,
+                project: state.vault.projects.find((p) => p.name === projectName),
+            };
+        }
+    }
+    if (!mobileModeActive()) applyColumnLayout();
+}
+
 async function refreshActiveServices() {
+    // A background browser tab does nothing (the visibilitychange listener
+    // refreshes once on return).
+    if (document.hidden) return;
     const name = state.activeProject;
     if (!name) return;
-    let fresh;
+    // One detection per project at a time; one more is queued behind it.
+    if (state.detectInFlight[name]) { state.detectPending[name] = true; return; }
+    state.detectInFlight[name] = true;
+    let r;
     try {
-        const res = await fetch(`/services/${encodeURIComponent(name)}`);
-        if (!res.ok) return;
-        fresh = await res.json();
-    } catch (_) {
-        return;   // transient; the next tick retries
+        r = await fetchProjectTabs(name, true);
+    } finally {
+        state.detectInFlight[name] = false;
     }
+    if (state.detectPending[name]) {
+        state.detectPending[name] = false;
+        setTimeout(() => { if (state.activeProject === name) refreshActiveServices(); }, 0);
+    }
+    if (!r) return;   // transient; the next tick retries
     // The active project (or the whole vault) may have changed while the fetch
     // was in flight — bail rather than render stale tabs onto a different view.
     if (state.activeProject !== name) return;
     const current = state.projectServices[name] || {};
+    const fresh = mergeDetectedTabs(r.services, current, onScreenServiceIds(),
+                                    r.detection, r.opened);
     if (serviceTabsSignature(fresh) === serviceTabsSignature(current)) return;
     state.projectServices[name] = fresh;
     renderServiceTabs(name, fresh);
+    // A pane whose tab's address went away or changed closes (or reopens on
+    // the new one) before the re-activation below can resurface it.
+    followTabAddresses(name, current, fresh, r.detection);
     // The column engine must reconcile on THIS signature-change path too —
     // a vanished service's tab would otherwise linger in its column strip
     // and an appeared one would never join. Reconciliation is pure (no
@@ -8026,7 +8235,15 @@ async function refreshActiveServices() {
     // open pane is torn down. If the active service vanished (a listener stopped),
     // fall back to the first visible tab — mirrors setServiceHidden.
     const visible = visibleServiceIds(name, fresh);
-    if (state.activeService && visible.includes(state.activeService)) {
+    const activeEntry = state.activeService
+        ? state.terminals[tkey(name, state.activeService)] : null;
+    if (state.activeService && visible.includes(state.activeService)
+            && activeEntry && activeEntry.note) {
+        // The focused tab's view was closed because its address was freed:
+        // keep the note on screen (re-activating would reserve an address
+        // again by itself); only repaint the underline the re-render dropped.
+        markActiveTab(state.activeService);
+    } else if (state.activeService && visible.includes(state.activeService)) {
         activateService(state.activeService);
     } else if (visible.length > 0) {
         // Mobile: visible[0] is code-server whenever the editor is enabled
@@ -8760,7 +8977,7 @@ function installColumnSplitterDrag(splitter, boundary) {
 
 // ---- project / service activation ------------------------------------------
 
-async function activateProject(name) {
+async function activateProject(name, opts) {
     closeManagement();   // leaving the management view for a project tab
     document.querySelectorAll(".project-rail .project").forEach((r) => r.classList.remove("active"));
     const row = document.querySelector(`.project[data-name="${CSS.escape(name)}"]`);
@@ -8778,6 +8995,10 @@ async function activateProject(name) {
     if (mobileModeActive()) setMobileProjectsView(false);
 
     state.activeProject = name;
+    // What is on screen for THIS project before the reset below: a box change
+    // re-activates the open project, whose columns must keep their detected
+    // apps; a switch from another project has nothing of this one on screen.
+    const onScreen = (opts && opts.carry) ? onScreenServiceIds() : [];
     // Column actives are per-project session state — reset before anything
     // reads them; the engine reseeds each column's active from its layout.
     state.columnActive = [];
@@ -8787,11 +9008,22 @@ async function activateProject(name) {
     // few seconds to boot) surfaces on re-select — without a full page reload.
     // fetchProjectServices otherwise caches the first probe forever. Idiomatic:
     // mirrors the delete-then-reactivate busts already used on service toggles.
+    const prev = state.projectServices[name] || null;
     delete state.projectServices[name];
-    const enabled = await fetchProjectServices(name);
+    const enabled = await fetchProjectServices(name, (opts && opts.carry) ? prev : null,
+                                               onScreen);
 
     renderServiceTabs(name, enabled);
     applyColumnLayout();
+    // A pane whose tab's address changed while the project was not shown (a
+    // port removed and re-added elsewhere) closes before the landing reuses it.
+    // (Skipped if the operator switched elsewhere during the fetch above:
+    // the reopen would act on whichever project is active now.)
+    if (prev && state.activeProject === name) {
+        const marker = state.lastDetection[name];
+        followTabAddresses(name, prev, enabled,
+                           marker === undefined ? "fallback" : marker, onScreen);
+    }
 
     // Landing tab: a project reopens on whatever it last had open this session
     // (per-project memory). A project with no remembered tab — never opened, or
@@ -8825,7 +9057,9 @@ async function activateProject(name) {
                 || visible[0];
         }
     }
-    activateService(next);
+    // keepNote: landing on a tab whose view was closed (its address freed)
+    // keeps the note — returning to a project is not the operator opening it.
+    activateService(next, { keepNote: true });
 
     // Auto-open every OTHER column's active tab so no pane sits empty after
     // activation (the generalization of the retired pin auto-open — up to
@@ -8924,6 +9158,7 @@ function makeProjectConfigBox(project) {
         box.appendChild(section);
         // Ports render even with no tabs loaded — register before you start serving.
         appendExportedPortsSection(box, project);
+        appendDetectedAppsSection(box, project);
         appendSidebarSection(box, project);
         return box;
     }
@@ -8963,6 +9198,7 @@ function makeProjectConfigBox(project) {
         "Hidden tabs stay enabled on the supervisor — this only controls what shows here.",
     ]));
     appendExportedPortsSection(box, project);
+    appendDetectedAppsSection(box, project);
     appendBoxFoldersSection(box, project, enabled);
     appendEditorExtensionSection(box, project, enabled);
     appendModelsSection(box, project, enabled);
@@ -9945,6 +10181,95 @@ function appendExportedPortsSection(box, project) {
     loadPorts();
 }
 
+// Detected web apps (STAGE_AUTO_PORTS) in the project's Ports settings: the
+// per-project detection switch (for every browser), the apps opened so far
+// (each holding one of the limited tab addresses) with Remove, and the paused
+// note. Fetched here through the gated route with alloc=0 — opening this box
+// never allocates an address — and never written into the tab map.
+const DETECTION_PAUSED_TEXT = "Detection is paused until you unlock again or open Management.";
+
+function appendDetectedAppsSection(box, project) {
+    const section = el("div", { class: "config-section" });
+    section.appendChild(el("div", { class: "config-section-label" }, ["Detected apps"]));
+    const body = el("div", {});
+    section.appendChild(body);
+    box.appendChild(section);
+    const name = encodeURIComponent(project.name);
+
+    async function load() {
+        if (state.detectPaused) {
+            body.replaceChildren(el("div", { class: "config-hint" }, [DETECTION_PAUSED_TEXT]));
+            return;
+        }
+        let res = null, b = {};
+        try {
+            res = await fetch(`/broker/project/${name}/services?detect=0&alloc=0`);
+            try { b = await res.json(); } catch (_) { b = {}; }
+        } catch (_) { res = null; }
+        if (res && res.status === 401) {
+            body.replaceChildren(el("div", { class: "config-hint" }, [DETECTION_PAUSED_TEXT]));
+            return;
+        }
+        if (!res) {
+            body.replaceChildren(el("div", { class: "config-empty" },
+                ["Couldn't load detected apps."]));
+            return;
+        }
+        if (!b.ok) {
+            body.replaceChildren(el("div", { class: "config-empty" },
+                ["Couldn't load detected apps."]));
+            return;
+        }
+        const on = b.detection_enabled !== false;
+        const cb = el("input", { type: "checkbox" });
+        cb.checked = on;
+        cb.onchange = async () => {
+            cb.disabled = true;
+            try {
+                const r = await fetch(`/broker/project/${name}/ports/detection`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ enabled: cb.checked }),
+                });
+                let rb = {}; try { rb = await r.json(); } catch (_) { rb = {}; }
+                if (!r.ok || !rb.ok) alert("Couldn't change detection: " + (mgmtErrText(rb) || r.status));
+            } finally {
+                await load();
+                if (state.activeProject === project.name) refreshActiveServices();
+            }
+        };
+        const rows = [el("label", { class: "mgmt-check" }, [cb,
+            el("span", {}, ["Give web apps running in this project a tab by themselves"])])];
+        const opened = b.opened || [];
+        if (opened.length) {
+            rows.push(el("div", { class: "config-hint" }, [
+                "Opened apps — each keeps a tab address until removed:"]));
+            for (const o of opened) {
+                const rm = el("button", { class: "close-tab-btn",
+                                          title: `Remove ${o.port}` }, ["✕"]);
+                rm.onclick = async () => {
+                    rm.disabled = true;
+                    try {
+                        const r = await fetch(`/broker/project/${name}/ports/${o.port}/origin`,
+                                              { method: "DELETE" });
+                        let rb = {}; try { rb = await r.json(); } catch (_) { rb = {}; }
+                        if (!r.ok || !rb.ok) alert("Couldn't remove: " + (mgmtErrText(rb) || r.status));
+                    } finally {
+                        await load();
+                        if (state.activeProject === project.name) refreshActiveServices();
+                    }
+                };
+                rows.push(el("div", { class: "config-box-row" }, [
+                    el("span", { class: "config-box-name" }, [`${o.port} — ${o.label}`]),
+                    rm,
+                ]));
+            }
+        }
+        body.replaceChildren(...rows);
+    }
+    load();
+}
+
 function mgmtEditorToggle(name, on, isDocker) {
     const word = on ? "Disable" : "Enable";
     // dind deploys/removes the editor live (no recreate); docker must recreate the
@@ -10453,6 +10778,17 @@ function makeServiceTab(id, ctx, colIdx = 0) {
     refreshBtn.innerHTML = REFRESH_TAB_SVG;
     refreshBtn.onclick = (ev) => { ev.stopPropagation(); refreshService(id); };
     const kids = [refreshBtn, el("span", {}, [svc.label || id])];
+    // A detected web app (STAGE_AUTO_PORTS): Hide is the per-project tab
+    // hiding. (To keep its tab when the app is down, add the port by hand in
+    // the Ports section — same id, so the address carries over.)
+    if (svc.detected) {
+        const hide = el("button", { class: "close-tab-btn", title: "Hide this tab" }, ["✕"]);
+        hide.onclick = (ev) => {
+            ev.stopPropagation();
+            if (ctx.project) setServiceHidden(ctx.project, id, true);
+        };
+        kids.push(hide);
+    }
     // A real box tab (box_kind === "sandbox") carries a ✕ that discards the box
     // in place — box deletion lives on the tab, not in a sidebar settings panel.
     const boxHarness = !!(ctx.enabled["supervisor"] && ctx.enabled["supervisor"].box_harness);
@@ -10467,8 +10803,8 @@ function makeServiceTab(id, ctx, colIdx = 0) {
         };
         kids.push(closeBtn);
     }
-    const tab = el("div", {
-        class: "tab",
+    const tabAttrs = {
+        class: "tab" + (svc.detected ? " tab-detected" : "") + (svc.stopped ? " tab-stopped" : ""),
         "data-service": id,
         "data-column": String(colIdx),
         // Surface stamp for the mobile CSS (visual tabs are hidden there);
@@ -10482,9 +10818,18 @@ function makeServiceTab(id, ctx, colIdx = 0) {
         // synthesizes on the captured tab after a real drag.
         onclick: () => {
             if (consumeTabDragClick()) return;
-            activateService(id);
+            // click: an operator open — the only kind that may reserve a
+            // detected app's tab address.
+            activateService(id, { click: true });
         },
-    }, kids);
+    };
+    // el() sets every attribute it is given, so a title exists only on a
+    // detected tab (a null would render as the text "null").
+    if (svc.detected) {
+        tabAttrs.title = svc.stopped ? "Detected automatically — the app has stopped"
+                                     : "Detected automatically";
+    }
+    const tab = el("div", tabAttrs, kids);
     armTabDrag(tab, id, ctx);
     return tab;
 }
@@ -10509,7 +10854,7 @@ function refreshService(serviceId) {
         try { if (t.container) t.container.remove(); } catch (_) {}
         delete state.terminals[key];
     }
-    activateService(serviceId);
+    activateService(serviceId, { click: true });   // the tab's own ⟳: an operator open
 }
 
 function activateService(serviceId, opts) {
@@ -10569,7 +10914,9 @@ function activateService(serviceId, opts) {
 
     const key = tkey(state.activeProject, serviceId);
     const existing = state.terminals[key];
-    if (existing && !existing.disconnected) {
+    const keptNote = !!(existing && existing.disconnected && existing.note
+                        && opts && opts.keepNote);
+    if (existing && (!existing.disconnected || keptNote)) {
         if (existing.container) existing.container.classList.remove("hidden");
         // Un-hide first, sync second, fit third: the pane is visible here, so
         // a pending font-size change applies with a correct re-measure before
@@ -10592,7 +10939,7 @@ function activateService(serviceId, opts) {
     if (svc.kind === "ssh") {
         openSshTerminal(project, serviceId, svc);
     } else if (svc.kind === "http") {
-        openHttpService(project, serviceId, svc);
+        openHttpService(project, serviceId, svc, opts);
     } else {
         const parent = document.getElementById("terminal-area");
         const placeholder = el("div", { class: "welcome" }, [
@@ -10971,7 +11318,7 @@ async function mountGiteaFork(container, status, giteaPath) {
     container.appendChild(iframe);
 }
 
-async function openHttpService(project, serviceId, svc) {
+async function openHttpService(project, serviceId, svc, opts) {
     const container = el("div", { class: "terminal-instance http-instance" });
     const status = el("div", { class: "http-status" }, ["Authenticating…"]);
     container.appendChild(status);
@@ -11007,6 +11354,16 @@ async function openHttpService(project, serviceId, svc) {
     if (svc.fetch_repo || svc.fetch_all) {
         container.classList.add("dev-fetch-pane");
         await renderProjectFetchPane(container, svc.fetch_repo || null);
+        return;
+    }
+
+    // A detected web app with no address yet is opened only by the operator
+    // (a click on its tab or its ⟳). A landing, a column's auto-open or a
+    // fallback leaves a note to click instead: reserving one of the limited
+    // tab addresses is the operator's act, never a side effect.
+    if (svc.detected && !svc.origin_url && !(opts && opts.click)) {
+        status.textContent = CLICK_TO_OPEN_TEXT;
+        me.disconnected = true; me.note = true;
         return;
     }
 
@@ -11090,6 +11447,40 @@ async function openHttpService(project, serviceId, svc) {
         await persistVault();
     }
 
+    // A detected web app (STAGE_AUTO_PORTS) has no address until it is first
+    // opened: reserve one now (an operator act, like adding a port by hand),
+    // and write it into the tab map so a redraw keeps it.
+    if (svc && svc.detected && !svc.origin_url) {
+        if (state.terminals[key] !== me) return;
+        status.textContent = "Opening…";
+        const port = serviceId.slice("port-".length);
+        const gen = state.loginGen;
+        let res = null, b = {};
+        try {
+            res = await fetch(`/broker/project/${encodeURIComponent(project.name)}` +
+                              `/ports/${encodeURIComponent(port)}/origin`, { method: "POST" });
+            try { b = await res.json(); } catch (_) { b = {}; }
+        } catch (_) { res = null; }
+        if (state.terminals[key] !== me) return;
+        // A failed open leaves its pane as a disconnected note: a click then
+        // takes activateService's teardown-and-reopen branch (a retry), and
+        // no refresh or landing retries by itself.
+        if (res && res.status === 401) {
+            if (gen === state.loginGen) state.detectPaused = true;
+            status.textContent = DETECTION_PAUSED_TEXT + " Then click the tab again.";
+            me.disconnected = true; me.note = true;
+            return;
+        }
+        if (!b.ok || !b.origin_url) {
+            status.textContent = ((b.error && b.error.message) || "Couldn't open this app.") +
+                " Click the tab to try again.";
+            me.disconnected = true; me.note = true;
+            return;
+        }
+        svc.origin_url = b.origin_url;
+        const cur = (state.projectServices[project.name] || {})[serviceId];
+        if (cur) cur.origin_url = b.origin_url;
+    }
     // Mount the iframe at the service's own browser origin (a dedicated
     // webui port per container — /services/<project> allocates it and hands
     // back origin_url). The session cookie minted above is host-keyed and
@@ -11165,6 +11556,9 @@ async function openHttpService(project, serviceId, svc) {
     container.appendChild(iframe);
 
     state.terminals[key].iframe = iframe;
+    // The address this pane loaded: followTabAddresses closes the pane when
+    // its tab's address goes away or changes.
+    state.terminals[key].loadedUrl = svc.origin_url;
 }
 
 // A box's own web-app tab: how often the tab asks the box again while the app
