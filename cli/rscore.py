@@ -38,14 +38,18 @@ from __future__ import annotations
 
 import argparse
 import base64
+import bisect
 import datetime
 import enum
 import fcntl
+import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import secrets
+import selectors
 import shlex
 import shutil
 import socket
@@ -65,7 +69,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 # rscore lives in cli/; make sibling helper modules importable even when
 # imported directly (e.g. by the broker), not only via research.py.
@@ -2149,6 +2153,31 @@ class PortListRequest:
         return cls(project=_require_name(kw.get("project")))
 
 
+@dataclass(frozen=True)
+class PortDetectRequest:
+    """Which web apps are listening in a project's own container right now.
+    `deadline` is the wall-clock time the caller stops waiting for the reply;
+    a request reached after it (the serial broker was busy) is skipped."""
+    project: str
+    deadline: float
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "PortDetectRequest":
+        deadline = kw.get("deadline")
+        # bool is an int subclass; NaN/inf pass a bare float() and would make
+        # the budget arithmetic meaningless.
+        try:
+            ok = (not isinstance(deadline, bool)
+                  and isinstance(deadline, (int, float))
+                  and math.isfinite(deadline) and math.isfinite(float(deadline)))
+        except OverflowError:           # a 400-digit JSON integer
+            ok = False
+        if not ok:
+            raise ValidationError("deadline must be a finite number")
+        return cls(project=_require_name(kw.get("project")),
+                   deadline=float(deadline))
+
+
 # The address a web-app box is told: the exact origin of its webui tab,
 # https:// + a hostname, IPv4 or [IPv6] + :port, nothing else. MIRROR of
 # rs_sandbox.valid_web_address and of the box's rs-web-set (one shared vector
@@ -3107,6 +3136,16 @@ class PortRemoveResult:
 class PortListResult:
     project: str
     ports: list[dict]                       # [{port, label}] — no secrets
+
+
+@dataclass
+class PortDetectResult:
+    project: str
+    running: bool               # False: container stopped/missing, or no workspace
+    partial: bool               # True: budget ran out / deadline near — keep the old view
+    lookup_ran: bool            # the inner `docker ps` lookup ran on this call
+    lookup_failed: bool         # it ran and failed: publish status is unknown
+    ports: list[dict]           # see port_detect
 
 
 @dataclass
@@ -12979,6 +13018,462 @@ def port_list(req: "PortListRequest", _progress=None) -> PortListResult:  # type
     if not ws.is_dir():
         return PortListResult(project=req.project, ports=[])
     return PortListResult(project=req.project, ports=read_exported_ports(ws))
+
+
+# --- detected ports (STAGE_AUTO_PORTS) --------------------------------------
+# The webui asks, on its tab-strip refresh, which web apps are listening in a
+# project's own container, so a published app gets a tab without a hand-added
+# port. Everything read here comes from inside a container whose agent is root
+# there, so every value is parsed as untrusted.
+
+# A healthy detection (one exec reading the socket tables, plus the inner docker
+# lookup when the listener set changed) measured ~0.35 s on a privileged dind
+# project (2026-10-25). The broker runs every verb on ONE serial thread, so the
+# budget is also the most a wedged project costs every other Management action
+# per refresh of each browser that has it open: ~10x the measured cost leaves
+# headroom for a loaded host, and staying under a third of the webui's 15 s
+# refresh keeps a few wedged projects from occupying the broker between ticks.
+PORT_DETECT_BUDGET_S = 4.0
+
+# The most bytes kept from one exec. Everything the exec prints is container-
+# controlled (the agent can replace `cat` or `docker`), and every later step is
+# linear or n·log n in it, so this cap is what bounds the host-side work. Real
+# socket tables are fixed-width rows (~150 bytes for tcp, ~180 for tcp6): 1 MiB
+# holds ~6000 listeners, two orders of magnitude past any real project, and
+# parses in milliseconds. Over the cap the call reports partial.
+PORT_DETECT_MAX_OUTPUT_BYTES = 1 << 20
+
+_TCP_LISTEN = "0A"
+# Docker container names: [a-zA-Z0-9][a-zA-Z0-9_.-]+ (the daemon's own rule),
+# here also at most DETECTED_LABEL_MAX characters. The name becomes a tab label,
+# and a label wider than a strip can show is unreadable anyway; a longer name is
+# SKIPPED (the tab falls back to the port number), never cut, so a shortened
+# name cannot pass for another container. It also bounds the reply, which
+# repeats the name in every row the container publishes.
+DETECTED_LABEL_MAX = 128
+_DOCKER_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,%d}\Z" % (DETECTED_LABEL_MAX - 1))
+# An inode is a kernel unsigned long: at most 20 decimal digits.
+_INODE_RE = re.compile(r"\A[0-9]{1,20}\Z")
+_NETNS_RE = re.compile(r"\Anet:\[[0-9]+\]\Z")
+
+# project → {"key": frozenset((port, inode)), "published": {host_port:
+# {"name", "container_port", "pid", "netns"}}}. Lives in the broker process
+# (serial, so no lock); a CLI caller simply starts cold every time.
+_PORT_DETECT_STATE: dict[str, dict] = {}
+
+
+def parse_proc_net_tcp(text: str, v6: bool) -> list[tuple[Any, int, int]]:
+    """LISTEN rows of a /proc/net/tcp{,6} table → [(ip, port, inode)]. Rows that
+    do not parse are dropped (the table comes from an untrusted container)."""
+    out: list[tuple[Any, int, int]] = []
+    hexlen = 32 if v6 else 8
+    for line in text.splitlines()[1:]:
+        f = line.split()
+        if len(f) < 10 or f[3] != _TCP_LISTEN:
+            continue
+        addr, _, port_hex = f[1].partition(":")
+        if len(addr) != hexlen or not port_hex:
+            continue
+        if len(port_hex) > 4 or not _INODE_RE.match(f[9]):
+            continue
+        try:
+            raw = bytes.fromhex(addr)
+            port = int(port_hex, 16)
+            inode = int(f[9])
+        except ValueError:
+            continue
+        # The kernel prints each 32-bit word in host (little-endian) order.
+        raw = b"".join(raw[i:i + 4][::-1] for i in range(0, len(raw), 4))
+        ip = ipaddress.IPv6Address(raw) if v6 else ipaddress.IPv4Address(raw)
+        if 1 <= port <= 65535 and inode > 0:
+            out.append((ip, port, inode))
+    return out
+
+
+def own_address(hostname_text: str, hosts_text: str) -> Any:
+    """The container's project-network address: its /etc/hosts line for its
+    own hostname (what gethostbyname(gethostname()) resolves, the address the
+    loopback forwarder binds). None when absent or unparseable."""
+    name = (hostname_text.split() or [""])[0]
+    if not name:
+        return None
+    for line in hosts_text.splitlines():
+        f = line.split("#", 1)[0].split()
+        if len(f) >= 2 and name in f[1:]:
+            try:
+                ip = ipaddress.ip_address(f[0])
+            except ValueError:
+                continue
+            if not ip.is_loopback:
+                return ip
+    return None
+
+
+def listen_class(ip: Any, own: Any) -> str:
+    """'all' (wildcard), 'own' (the project-network address), 'localhost', or
+    'other' (another local address: docker0, rs-inner, a compose gateway)."""
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    if ip.is_unspecified:
+        return "all"
+    if ip.is_loopback:
+        return "localhost"
+    if own is not None and ip == own:
+        return "own"
+    return "other"
+
+
+def _parse_docker_ps_ports(text: str) -> list[dict]:
+    """`docker ps --format '{{.ID}}\\t{{.Names}}\\t{{.Ports}}'` → the published
+    tcp ranges, [{"id", "name", "hp", "hp_end", "cp"}] (a single port is a
+    one-port range). Kept as ranges, never expanded: the output is
+    container-controlled, so a range is not trusted to be small."""
+    out: list[dict] = []
+    for line in text.splitlines():
+        f = line.split("\t")
+        if len(f) != 3 or not re.fullmatch(r"[0-9a-f]{12,64}", f[0]):
+            continue
+        name = f[1].split(",")[0].strip()
+        for item in f[2].split(","):
+            m = re.fullmatch(r"\s*(?:\[[0-9a-fA-F:]*\]|[0-9.]*):([0-9]{1,5})"
+                             r"(?:-([0-9]{1,5}))?->([0-9]{1,5})(?:-([0-9]{1,5}))?/tcp\s*",
+                             item)
+            if not m:
+                continue
+            hp, cp = int(m.group(1)), int(m.group(3))
+            hp_end = int(m.group(2)) if m.group(2) else hp
+            cp_end = int(m.group(4)) if m.group(4) else cp
+            # A range (-p 8000-8001:8000-8001) maps port by port; anything
+            # else that does not line up is skipped rather than guessed.
+            if hp_end - hp != cp_end - cp or hp_end < hp \
+                    or not (1 <= hp and hp_end <= 65535 and 1 <= cp and cp_end <= 65535):
+                continue
+            out.append({"id": f[0], "name": name, "hp": hp, "hp_end": hp_end,
+                        "cp": cp})
+    return out
+
+
+def _range_lookup(ranges: list[tuple[int, int, Any]]) -> Callable[[int], Any]:
+    """A membership lookup over (lo, hi_inclusive, value) ranges in O(log n) per
+    port: `lookup(port)` → the value of a range holding it, or None. Overlaps
+    (only forged data has them) resolve to some covering range, never to work
+    proportional to their width."""
+    rs = sorted(ranges, key=lambda r: r[0])
+    los = [r[0] for r in rs]
+    # Running maximum of hi, so one bisect finds whether ANY range at or left
+    # of the insertion point reaches the port.
+    reach, best = [], None
+    for r in rs:
+        if best is None or r[1] > best[1]:
+            best = r
+        reach.append(best)
+
+    def lookup(port: int) -> Any:
+        i = bisect.bisect_right(los, port) - 1
+        if i < 0:
+            return None
+        r = reach[i]
+        return r[2] if r[1] >= port else None
+    return lookup
+
+
+def _sections(text: str, mark: str) -> dict[str, str]:
+    """Split exec output on per-call `@@<mark> <section>` lines. The mark is a
+    fresh random token per call, so a static file inside the container cannot
+    forge a section boundary (a root agent watching the exec can, but it only
+    ever forges its own project's view, and every section is parsed as
+    untrusted anyway)."""
+    out: dict[str, str] = {}
+    cur, buf = None, []
+    prefix = f"@@{mark} "
+    for line in text.splitlines():
+        if line.startswith(prefix):
+            if cur is not None:
+                out[cur] = "\n".join(buf)
+            cur, buf = line[len(prefix):].strip(), []
+        elif cur is not None:
+            buf.append(line)
+    if cur is not None:
+        out[cur] = "\n".join(buf)
+    return out
+
+
+def _proc_read_script(mark: str, pids: list[int], outer: bool) -> str:
+    """One `sh -c` script reading the outer tables (when `outer`) and, per pid,
+    its network-namespace link and its own tables. Every value interpolated is a
+    validated int or the hex mark; nothing from the container reaches it."""
+    parts = []
+    if outer:
+        for sec, path in (("tcp", "/proc/net/tcp"), ("tcp6", "/proc/net/tcp6"),
+                          ("hostname", "/etc/hostname"), ("hosts", "/etc/hosts")):
+            parts.append(f"echo '@@{mark} {sec}'; cat {path} 2>/dev/null")
+    for pid in pids:
+        p = int(pid)
+        parts.append(f"echo '@@{mark} ns {p}'; readlink /proc/{p}/ns/net 2>/dev/null")
+        parts.append(f"echo '@@{mark} tcp {p}'; cat /proc/{p}/net/tcp 2>/dev/null")
+        parts.append(f"echo '@@{mark} tcp6 {p}'; cat /proc/{p}/net/tcp6 2>/dev/null")
+    parts.append("true")
+    return "; ".join(parts)
+
+
+def _exec_in(container: str, script: str, timeout_s: float) -> str | None:
+    """Run `script` as root in `container` under both an in-container `timeout`
+    and a host-side subprocess timeout (the host one alone would leave the inner
+    command running). None on any failure or timeout."""
+    if timeout_s <= 0:
+        return None
+    secs = max(1, int(timeout_s))
+    try:
+        sel = selectors.DefaultSelector()   # not select(): fd numbers past 1024
+    except OSError:                         # out of descriptors
+        return None
+    try:
+        proc = subprocess.Popen(_exec_argv(container, secs, script),
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:                     # e.g. an argument past the kernel's limit
+        sel.close()
+        return None
+    deadline = time.monotonic() + timeout_s
+    chunks: list[bytes] = []
+    size = 0
+    rc = None
+    try:
+        fd = proc.stdout.fileno()
+        sel.register(fd, selectors.EVENT_READ)
+        while True:
+            wait = deadline - time.monotonic()
+            if wait <= 0 or not sel.select(wait):
+                return None
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > PORT_DETECT_MAX_OUTPUT_BYTES:
+                return None
+            chunks.append(chunk)
+        rc = proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    finally:
+        sel.close()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        proc.stdout.close()
+    # errors="replace": the output is container-written (/etc/hosts, the
+    # inner docker), and an invalid byte must not escape as an exception.
+    return b"".join(chunks).decode("utf-8", "replace") if rc == 0 else None
+
+
+def _exec_argv(container: str, secs: int, script: str) -> list[str]:
+    return ["docker", "exec", "-u", "0", container, "timeout", str(secs),
+            "sh", "-c", script]
+
+
+def _inner_listener(secs: dict[str, str], pid: int, recorded_ns: str,
+                    container_port: int,
+                    parsed: dict | None = None) -> tuple[bool, str, str]:
+    """(readable, inner key, netns) for one inner container: the key is "" while
+    nothing inside listens on container_port, else a short digest of that
+    listener's socket inodes (it changes when the app restarts inside). A
+    digest, not the inode list: one container port reached from many host
+    ports would otherwise repeat a container-controlled list in every row.
+    Readable only when the namespace link is non-empty, well formed and matches
+    the one recorded at lookup (an empty match would let a reused pid read as
+    the container), and the table has its header line. `parsed` caches, for
+    the call, each pid's table as {port: inodes} and each (pid, port) digest,
+    so a container behind many ports is parsed and digested once."""
+    ns = secs.get(f"ns {pid}", "").strip()
+    table = secs.get(f"tcp {pid}", "")
+    if not _NETNS_RE.match(ns) or (recorded_ns and ns != recorded_ns) \
+            or not table.strip():
+        return False, "", ns
+    cache = parsed if parsed is not None else {}
+    by_port = cache.get(pid)
+    if by_port is None:
+        by_port = {}
+        for ip, port, i in parse_proc_net_tcp(table, False) + \
+                parse_proc_net_tcp(secs.get(f"tcp6 {pid}", ""), True):
+            if listen_class(ip, None) != "localhost":
+                by_port.setdefault(port, set()).add(i)
+        cache[pid] = by_port
+    dkey = (pid, container_port)
+    if dkey not in cache:
+        inodes = sorted(by_port.get(container_port, ()))
+        cache[dkey] = hashlib.sha256(",".join(map(str, inodes)).encode()
+                                     ).hexdigest()[:16] if inodes else ""
+    return True, cache[dkey], ns
+
+
+def port_detect(req: "PortDetectRequest", _progress=None) -> PortDetectResult:  # type: ignore[name-defined]
+    """Web-app candidates listening in `req.project`'s own container.
+
+    One row per port: {port, inodes, label, published, inner_readable,
+    inner_key}. Kept: listeners on all interfaces or on the project-network
+    address. Dropped: localhost and other local addresses, ports a hand-added
+    port could not use (`_coerce_export_port`), hand-added page ports, and
+    pass-through spans. For a port the inner docker publishes, `inner_key`
+    fingerprints the app's OWN listener inside its container ("" while it
+    isn't listening yet) and `inner_readable` says whether that could be read
+    at all. An agent can make its own project's reads exceed the output cap
+    or the argument limit; that only ever leaves its own view at "partial".
+    Writes nothing, launches nothing."""
+    budget = min(PORT_DETECT_BUDGET_S, req.deadline - time.time())
+    empty = dict(project=req.project, lookup_ran=False, lookup_failed=False,
+                 ports=[])
+    if budget < PORT_DETECT_BUDGET_S:
+        # The caller gives up before a full budget could run (the broker was
+        # busy): skip, and let it keep its previous view.
+        return PortDetectResult(running=True, partial=True, **empty)
+    started = time.monotonic()
+
+    def left() -> float:
+        return budget - (time.monotonic() - started)
+
+    cfg = load_config()
+    ws = workspace_path_for(req.project, cfg)
+    container = container_name_for(req.project)
+    gone = PortDetectResult(running=False, partial=False, **empty)
+    if not ws.is_dir():
+        _PORT_DETECT_STATE.pop(req.project, None)
+        return gone
+    # One bounded inspect answers "exists", "running" and the substrate: a
+    # container wedged on the host daemon must not hold the serial thread.
+    try:
+        insp = run(["docker", "container", "inspect", "-f",
+                    "{{.State.Running}}|{{index .Config.Labels \"%s\"}}"
+                    % SUBSTRATE_LABEL, container],
+                   capture_output=True, timeout=left(), errors="replace")
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        return PortDetectResult(running=True, partial=True, **empty)
+    running, _, substrate = insp.stdout.strip().partition("|")
+    if insp.returncode != 0 or running != "true":
+        _PORT_DETECT_STATE.pop(req.project, None)
+        return gone
+    dind = (substrate or Substrate.DIND_SYSBOX.value) != Substrate.DOCKER.value
+    state = _PORT_DETECT_STATE.get(req.project) or {}
+    # Deep enough that recording a namespace below never edits the cache
+    # unless this call ends up storing its own state.
+    published: dict[int, dict] = {hp: dict(v) for hp, v in
+                                  state.get("published", {}).items()}
+
+    mark = secrets.token_hex(8)
+    # `published` holds only ports that were listening at the last good
+    # lookup, so this set is as small as that listening set.
+    cached_pids = sorted({v["pid"] for v in published.values()})
+    out = _exec_in(container, _proc_read_script(mark, cached_pids, True), left())
+    if out is None:
+        return PortDetectResult(running=True, partial=True, **empty)
+    secs = _sections(out, mark)
+
+    own = own_address(secs.get("hostname", ""), secs.get("hosts", ""))
+    rows = parse_proc_net_tcp(secs.get("tcp", ""), False) + \
+        parse_proc_net_tcp(secs.get("tcp6", ""), True)
+    try:
+        registry = read_exported_ports(ws)
+    except Exception:
+        # The file is writable from inside the container and the shared
+        # reader does not catch every malformation (B149): keep the old view.
+        return PortDetectResult(running=True, partial=True, **empty)
+    page_ports = {int(e["port"]) for e in registry if not e.get("passthrough")}
+    # Spans as ranges, never expanded: the registry file is writable from
+    # inside the container, so a claim's count is not trusted to be small.
+    in_span = _range_lookup([(int(e["port"]), int(e["port"]) + int(e.get("count", 1)) - 1, True)
+                             for e in registry if e.get("passthrough")])
+    by_port: dict[int, set[int]] = {}
+    for ip, port, inode in rows:
+        if listen_class(ip, own) not in ("all", "own"):
+            continue
+        if port in page_ports or in_span(port):
+            continue
+        try:
+            _coerce_export_port(port)
+        except ValidationError:
+            continue
+        by_port.setdefault(port, set()).add(inode)
+    key = frozenset((p, i) for p, ins in by_port.items() for i in ins)
+
+    # The inner docker lookup: when the listener set changed since the last
+    # good lookup, or a cached pid's namespace no longer reads as recorded.
+    lookup_ran = lookup_failed = False
+    # Only a pid whose namespace was readable can be judged stale: where the
+    # inner view is unavailable (recorded "") the outer inode set still
+    # catches a container restart, since docker-proxy re-binds on one.
+    stale_pid = any(
+        v["netns"] and secs.get(f"ns {v['pid']}", "").strip() != v["netns"]
+        for hp, v in published.items() if hp in by_port)
+    if dind and (key != state.get("key") or stale_pid):
+        lookup_ran = True
+        ps = _exec_in(container, "docker ps --format "
+                      "'{{.ID}}\t{{.Names}}\t{{.Ports}}'", left())
+        found = None
+        if ps is not None:
+            # Map only the ports actually listening; a range is looked up,
+            # never walked.
+            covering = _range_lookup([(r["hp"], r["hp_end"], r)
+                                      for r in _parse_docker_ps_ports(ps)])
+            found = {}
+            for port in by_port:
+                r = covering(port)
+                if r is not None:
+                    found[port] = {"id": r["id"], "name": r["name"],
+                                   "container_port": r["cp"] + (port - r["hp"])}
+        pids: dict[str, int] = {}
+        if found:
+            ids = " ".join(sorted({v["id"] for v in found.values()}))
+            insp = _exec_in(container, "docker inspect -f '{{.Id}} {{.State.Pid}}' "
+                            + ids, left())
+            for line in (insp or "").splitlines():
+                f = line.split()
+                if len(f) == 2 and re.fullmatch(r"[0-9a-f]{64}", f[0]) \
+                        and re.fullmatch(r"[0-9]{1,10}", f[1]) and int(f[1]) > 0:
+                    # `docker ps` prints 12-character ids: index by that
+                    # prefix, a lookup instead of a scan per port.
+                    pids.setdefault(f[0][:12], int(f[1]))
+            if insp is None:
+                found = None
+        if found is None:
+            lookup_failed = True        # keep the previous view; retry next call
+        else:
+            published = {}
+            for hp, v in found.items():
+                pid = pids.get(v["id"][:12])
+                if pid is None or not _DOCKER_NAME_RE.match(v["name"]):
+                    continue
+                published[hp] = {"name": v["name"],
+                                 "container_port": v["container_port"],
+                                 "pid": pid, "netns": ""}
+            new_pids = sorted({v["pid"] for hp, v in published.items()
+                               if hp in by_port})
+            more = _exec_in(container, _proc_read_script(mark, new_pids, False),
+                            left()) if new_pids else ""
+            if more is None:
+                # The budget ran out reading the new containers: report
+                # partial, so the caller keeps its previous view rather than
+                # reading every published port as un-inspectable.
+                return PortDetectResult(running=True, partial=True, **empty)
+            secs.update(_sections(more, mark))
+
+    ports: list[dict] = []
+    parsed: dict = {}   # pid → {port: inodes}; (pid, port) → digest (see _inner_listener)
+    for port in sorted(by_port):
+        row = {"port": port, "inodes": sorted(by_port[port]), "label": str(port),
+               "published": False, "inner_readable": None, "inner_key": ""}
+        v = published.get(port)
+        if v is not None:
+            readable, inner, ns = _inner_listener(secs, v["pid"], v["netns"],
+                                                  v["container_port"], parsed)
+            if readable and not v["netns"]:
+                v["netns"] = ns
+            row.update(label=v["name"], published=True,
+                       inner_readable=readable, inner_key=inner)
+        ports.append(row)
+    if not lookup_failed:
+        _PORT_DETECT_STATE[req.project] = {"key": key, "published": published}
+    return PortDetectResult(project=req.project, running=True, partial=False,
+                            lookup_ran=lookup_ran, lookup_failed=lookup_failed,
+                            ports=ports)
 
 
 # ---------------------------------------------------------------------------

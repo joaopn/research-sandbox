@@ -784,6 +784,18 @@ def _verb_box_web_address(args: dict, _progress=None) -> dict:
     return dataclasses.asdict(rscore.box_web_address(req))
 
 
+# Detected ports (STAGE_AUTO_PORTS): which web apps listen in the project's own
+# container. A read: the webui calls it on its tab-strip refresh. `deadline` is
+# a plain number (the webui's give-up time), never host-shaped.
+PORT_DETECT_WEBUI_FIELDS = frozenset({"project", "deadline"})
+
+
+def _verb_port_detect(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in PORT_DETECT_WEBUI_FIELDS}
+    req = rscore.PortDetectRequest.from_kwargs(**safe)  # may raise ValidationError
+    return dataclasses.asdict(rscore.port_detect(req))
+
+
 def _verb_port_list(args: dict, _progress=None) -> dict:
     safe = {k: v for k, v in args.items() if k == "project"}
     req = rscore.PortListRequest.from_kwargs(**safe)  # may raise ValidationError
@@ -1078,6 +1090,7 @@ VERBS = {
     "port_remove": _verb_port_remove,
     "box_web_address": _verb_box_web_address,
     "port_list": _verb_port_list,
+    "port_detect": _verb_port_detect,
     "dev_repo_remove": _verb_dev_repo_remove,
     "dev_repo_list": _verb_dev_repo_list,
     "dev_attach": _verb_dev_attach,
@@ -1116,6 +1129,12 @@ STEP_UP_VERBS = frozenset({"destroy", "box_remove", "dev_repo_remove",
 # surface. `list`/`status` expose no SSH password, so they stay open (a
 # same-uid peer already reads them via the CLI).
 OPEN_VERBS = frozenset({"list", "status"})
+
+# Token-gated verbs whose SUCCESSFUL calls leave no audit line: the webui polls
+# them on every tab-strip refresh of an open project, so auditing each success
+# would bury real events (maintainer ruling 2026-10-24). Their refusals are
+# still audited like any other verb's.
+UNAUDITED_SUCCESS_VERBS = frozenset({"port_detect"})
 
 # Auth verbs live OUTSIDE VERBS — they grant no docker capability, so they are
 # handled on a distinct path in dispatch and never reach rscore. `logout`
@@ -1617,7 +1636,7 @@ _PROC_READABLE = Path("/proc/self/cmdline").exists()
 _INLINE_PROJECT_KEY = {
     "destroy": "name",
     "box_add": "project", "box_remove": "project", "box_folders": "project",
-    "port_add": "project", "port_remove": "project",
+    "port_add": "project", "port_remove": "project", "port_detect": "project",
     "box_web_address": "project",
 }
 # Inline verbs that take the host-wide lifecycle flock (non-blocking).
@@ -2243,6 +2262,8 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
             lc_lock.close()                       # releases the flock
 
     # Audit write verbs only (reads stay open + low-value/noisy).
+    if verb in UNAUDITED_SUCCESS_VERBS and outcome == "ok":
+        return reply
     if verb not in OPEN_VERBS:
         return _audited(principal, outcome, reply)
     return reply
