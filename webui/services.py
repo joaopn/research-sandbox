@@ -197,6 +197,103 @@ def exported_port_service(port: int, label: str,
     return spec
 
 
+# Detected web apps (STAGE_AUTO_PORTS): ports the broker reports listening in a
+# project's own container get a `port-<n>` tab marked `detected`, the SAME id a
+# hand-added port has — so adding the port by hand in Ports keeps the tab's browser address.
+# Whether a listener is a web app is decided by one `HEAD / HTTP/1.0`; the pure
+# halves of that decision live here so they are testable outside the image.
+CHECK_PASS = "pass"         # the reply starts with HTTP/
+CHECK_BYTES = "bytes"       # something answered, but not HTTP (redis, a greeting)
+CHECK_SILENT = "silent"     # connected, then closed or timed out with nothing said
+CHECK_REFUSED = "refused"   # nothing accepted the connection
+
+
+def classify_http_reply(connected: bool, data: bytes | None) -> str:
+    """The outcome of one web check: `data` is what was read before the reply
+    timeout or the close (None/b"" = nothing)."""
+    if not connected:
+        return CHECK_REFUSED
+    if not data:
+        return CHECK_SILENT
+    return CHECK_PASS if data.startswith(b"HTTP/") else CHECK_BYTES
+
+
+def detected_needs_check(row: dict) -> bool:
+    """A docker-published port is checked only once the app inside its container
+    listens (a non-empty inner_key) — while it boots, a check could only fail.
+    Where the inner view is unavailable, or the port is held directly by an
+    app, it is checked as soon as it appears."""
+    if row.get("published") and row.get("inner_readable") is True:
+        return bool(row.get("inner_key"))
+    return True
+
+
+def detected_check_key(row: dict) -> tuple:
+    """What a cached outcome is valid for: the port's own sockets plus the app's
+    listener inside its container. Either changing (a restart, a dev server
+    started later inside an already-published container) means a new check."""
+    return (tuple(sorted(row.get("inodes") or [])), str(row.get("inner_key") or ""))
+
+
+def detected_outcome_cacheable(outcome: str, row: dict,
+                               publish_unknown: bool = False) -> bool:
+    """Which outcomes stand until the key changes. A refusal never does (nothing
+    is listening at this moment). A silent reply does, except where silence may
+    only mean "still starting": a published port whose inner view is
+    unavailable (its app may simply not be up yet), or any port when the inner docker
+    lookup failed and whether it is published is unknown. Those are re-checked
+    every refresh."""
+    if outcome == CHECK_REFUSED:
+        return False
+    if outcome == CHECK_SILENT and (publish_unknown or (
+            row.get("published") and row.get("inner_readable") is False)):
+        return False
+    return True
+
+
+def span_membership(spans: list[tuple[int, int]]):
+    """`member(port)` → True when `port` lies in any (first port, count) span, in
+    O(log n): the registry the spans come from is writable from inside the
+    project container, so neither the number of spans nor a count is trusted
+    to be small, and nothing is expanded."""
+    import bisect
+    rs = sorted((lo, lo + max(int(n), 1) - 1) for lo, n in spans)
+    los, reach, best = [lo for lo, _ in rs], [], None
+    for lo, hi in rs:
+        best = hi if best is None or hi > best else best
+        reach.append(best)
+
+    def member(port: int) -> bool:
+        i = bisect.bisect_right(los, port) - 1
+        return i >= 0 and reach[i] >= port
+    return member
+
+
+def detected_check_order(key: tuple, tried: tuple | None) -> tuple:
+    """Sort key for the check batch: a port never tried with its current key
+    first, then re-checks of an already-tried key, the longest-waiting first.
+    `tried` is (key, monotonic time) of the last check started, or None."""
+    if tried is None or tried[0] != key:
+        return (0, 0.0)
+    return (1, tried[1])
+
+
+def opened_detected_ports(origin_entries: list[dict], project: str,
+                          registered_page_ports: set[int]) -> list[int]:
+    """`port-<n>` addresses `project` holds that no hand-added page port uses:
+    opened detected apps, plus slots left behind by a removed box or port —
+    every one the operator can free from the Ports section."""
+    out: set[int] = set()
+    for e in origin_entries:
+        sid = e.get("service", "")
+        if e.get("project") != project or not sid.startswith(EXPORTED_PORT_ID_PREFIX):
+            continue
+        raw = sid[len(EXPORTED_PORT_ID_PREFIX):]
+        if raw.isdigit() and int(raw) not in registered_page_ports:
+            out.add(int(raw))
+    return sorted(out)
+
+
 # Pass-through claims (STAGE_PASSTHROUGH_PORTS): a raw-TCP host-port claim
 # surfaced as a LAUNCHER tab — the pane opens https://<host>:<host_port> in a
 # NEW browser tab (encrypted and/or multi-port apps the page-relay tab

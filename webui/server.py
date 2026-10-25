@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import signal
+import socket
 import ssl
 import struct
 import time
@@ -61,6 +62,29 @@ SESSION_TTL_SECONDS = 8 * 60 * 60
 # Used both by the legacy /probe endpoint and by project_services_handler's
 # enumeration. 3s is the number /probe shipped with in W1; kept consistent.
 TCP_PROBE_TIMEOUT_SECONDS = 3.0
+
+# The web check of a detected app (STAGE_AUTO_PORTS) waits this long for the
+# first reply bytes after sending `HEAD /` (the connect itself keeps the probe
+# timeout above). Measured dev servers answer in milliseconds (busybox httpd and
+# vite under 10 ms, 2026-10-25); the wait matters only for servers that build a
+# page before answering it. A timeout is cached as "not a web app" until the
+# socket is re-created, so take most of the 15 s tab-strip refresh window. A
+# refresh that runs long only delays that project's next one (the browser keeps
+# one detection per project in flight), so the bound is about how late a tab
+# may appear, not about overlap.
+HTTP_CHECK_REPLY_TIMEOUT_S = 10.0
+
+# How many web checks run at once across the whole webui, and how many one
+# detection starts. Each check holds a socket, and the webui runs with the
+# container's default soft limit of 1024 descriptors (measured: `docker exec
+# rs-webui` reports 1024/524288) shared with every browser connection, SSH
+# session and broker call. A real project has a handful of web ports, so 32
+# checks in flight use about 3% of the limit while never slowing a normal
+# refresh; a container that opens thousands of listeners has the rest checked
+# 32 at a time on later refreshes — ports not yet tried with their current
+# sockets first, then re-checks in the order they were last tried, so no port
+# waits forever behind others — and costs the webui at most 32 sockets.
+HTTP_CHECK_CONCURRENCY = 32
 
 # Read-side mount of the host PROJECTS_DIR. The per-project markers (the
 # rail badge, the config box's flavor), the services/ports registries and the
@@ -797,6 +821,12 @@ async def _run_op(op_id: str, verb: str, args: dict,
         # Release the project's per-editor origin ports (the startup sweep
         # backstops CLI-side destroys that happen while the webui is down).
         _origin_ports_free(str(args.get("name", "")))
+        # A recreated same-name project starts with detection on and nothing
+        # remembered (STAGE_AUTO_PORTS).
+        _detection_forget(str(args.get("name", "")), release=False)
+        if str(args.get("name", "")) in DETECTION_OFF:
+            DETECTION_OFF.discard(str(args.get("name", "")))
+            _detection_off_save()
     entry["result"] = reply
     entry["state"] = "ok" if reply.get("ok") else "failed"
 
@@ -2045,11 +2075,15 @@ def _request_host(request: web.Request) -> str:
     return host.rsplit(":", 1)[0] if ":" in host else host
 
 
-def _origin_url(request: web.Request, project: str, service_id: str) -> str | None:
+def _origin_url(request: web.Request, project: str, service_id: str,
+                allocate: bool = True) -> str | None:
     """Absolute per-container origin for an http service, or None on pool
     exhaustion. Only ever called for kind=http admissions — allocating for an
-    ssh-kind tab would burn a pool port on a surface that never uses it."""
-    port = _origin_port_for(project, service_id)
+    ssh-kind tab would burn a pool port on a surface that never uses it.
+    `allocate=False` only looks up an address already held (the Ports
+    section's listing must never allocate)."""
+    port = (_origin_port_for(project, service_id) if allocate
+            else _origin_port_lookup(project, service_id))
     if port is None:
         return None
     return f"https://{_request_host(request)}:{port}/"
@@ -2079,6 +2113,16 @@ async def project_services_handler(request: web.Request) -> web.Response:
     surface is wider than this filter (covers `.creds/` etc.), so adding
     new file reads here doesn't expand the webui's trust posture."""
     project = request.match_info.get("project", "")
+    return web.json_response(await _assemble_services(
+        request, project, _read_exported_ports(project)))
+
+
+async def _assemble_services(request: web.Request, project: str,
+                             registry: list[dict], allocate: bool = True) -> dict:
+    """The tab set of `project` — the body of GET /services/<project>, shared
+    with the session-gated GET /broker/project/<name>/services (which adds the
+    detected tabs). `registry` is the project's exported-ports list, read ONCE
+    by the caller. `allocate=False` resolves every address without allocating."""
     upstream = f"{PROJECT_CONTAINER_PREFIX}{project}"
 
     # Probe every kind=http service in parallel up-front, then iterate
@@ -2133,7 +2177,7 @@ async def project_services_handler(request: web.Request) -> web.Response:
                 # Copied spec (never mutate the shared SERVICES dict) with the
                 # per-container browser origin the iframe should load. Only
                 # http-kind admissions allocate — see _origin_url.
-                url = _origin_url(request, project, sid)
+                url = _origin_url(request, project, sid, allocate)
                 out[sid] = {**svc, **({"origin_url": url} if url else {})}
 
     # Synthesized per-box tabs: boxes (kind="sandbox", STAGE_SANDBOX_PROJECT.md)
@@ -2166,7 +2210,7 @@ async def project_services_handler(request: web.Request) -> web.Response:
             espec = services.pi_isolated_editor_service(name, int(entry["editor_port"]))
             if espec is not None:
                 esid = f"{services.PI_ISOLATED_EDITOR_ID_PREFIX}{name}"
-                url = _origin_url(request, project, esid)
+                url = _origin_url(request, project, esid, allocate)
                 out[esid] = {**espec, **({"origin_url": url} if url else {})}
 
     # One tab per dev CONSUMER that got a fork at spawn — the dev-workflow
@@ -2259,7 +2303,7 @@ async def project_services_handler(request: web.Request) -> web.Response:
     # exported port is asked for by hand.) The SSRF posture is unchanged: the origin
     # proxy still re-derives + membership-checks the upstream per request in
     # _resolve_origin_upstream_port, so a port that isn't registered never proxies.
-    for e in _read_exported_ports(project):
+    for e in registry:
         if e.get("passthrough"):
             # Claims get a pass- LAUNCHER tab below, NEVER a page tab or an
             # origin slot — a 66-wide span would exhaust the 65-wide origin
@@ -2269,13 +2313,13 @@ async def project_services_handler(request: web.Request) -> web.Response:
             int(e["port"]), e["label"], follow_address=e.get("web") is True)
         if spec is not None:
             psid = f"{services.EXPORTED_PORT_ID_PREFIX}{int(e['port'])}"
-            url = _origin_url(request, project, psid)
+            url = _origin_url(request, project, psid, allocate)
             out[psid] = {**spec, **({"origin_url": url} if url else {})}
 
     # Pass-through claims (STAGE_PASSTHROUGH_PORTS): one launcher tab per
     # claim, keyed on its host_port — no origin allocation, no session mint;
     # the SPA opens https://<this host>:<host_port> in a NEW browser tab.
-    for e in _read_exported_ports(project):
+    for e in registry:
         if not e.get("passthrough") or e.get("box"):
             continue
         spec = services.passthrough_service(int(e["host_port"]), e["label"],
@@ -2284,7 +2328,437 @@ async def project_services_handler(request: web.Request) -> web.Response:
             ptid = f"{services.PASSTHROUGH_ID_PREFIX}{int(e['host_port'])}"
             out[ptid] = {**spec, "passthrough_host": _request_host(request),
                          "passthrough_port": int(e["host_port"])}
-    return web.json_response(out)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Detected web apps (STAGE_AUTO_PORTS)
+#
+# The SPA's tab-strip refresh of the active project asks the broker (through
+# the session-gated route below) which ports listen in the project's own
+# container; each that answers one `HEAD /` with HTTP/ gets a `port-<n>` tab
+# marked detected. Nothing here runs unless a browser with a Management
+# session asks, and the detected tabs never reach the unauthenticated
+# GET /services/<project> (that route is reachable from every project
+# network, and would publish the agent's container names).
+# ---------------------------------------------------------------------------
+
+# Projects whose operator switched detection OFF (persisted beside the origin
+# table; absent = on, so a recreated project starts with detection on once
+# destroy or the startup sweep has removed its name).
+DETECTION_OFF_FILE = STATE_DIR / "detection-off.json"
+DETECTION_OFF: set[str] = set()
+# project → {"seq": int, "rows": {port: {"label": str, "passed": bool}}}: the
+# last SUCCESSFUL detection. In memory only — a view of what is running, not
+# state; a webui restart starts empty.
+DETECT_SNAPSHOTS: dict[str, dict] = {}
+# (project, port) → (check key, outcome) for outcomes that stand until the
+# port's sockets change (services.detected_outcome_cacheable).
+DETECT_CHECKS: dict[tuple[str, int], tuple[tuple, str]] = {}
+# (project, port) → (check key, monotonic time) of the last check STARTED, for
+# the batch order: untried keys first, then the longest-waiting re-check.
+DETECT_TRIED: dict[tuple[str, int], tuple[tuple, float]] = {}
+# project → the one detection in flight. It runs as its OWN task, so a browser
+# that disconnects cannot cancel it for the others that joined.
+DETECT_INFLIGHT: dict[str, asyncio.Task] = {}
+# webui session cookie → (project, seq) of the last detection it ran or joined
+# (the detect=0 rule: serve a snapshot only to a session that just saw it).
+DETECT_CREDIT: dict[str, tuple[str, int]] = {}
+_DETECT_SEQ = [0]
+# Created on first use (the event loop must exist): HTTP_CHECK_CONCURRENCY.
+_CHECK_SLOTS: list[asyncio.Semaphore] = []
+
+POOL_FULL_TEXT = ("No tab address is free. Free one under Opened apps, or "
+                  "remove a port, in a project's Ports section.")
+NOT_DETECTED_TEXT = "This app is not detected as a web app right now."
+REGISTERED_PORT_TEXT = ("This port was added by hand; remove it from its own "
+                        "row in the Ports section.")
+UNREADABLE_PORTS_TEXT = ("The project's port list can't be read right now, so "
+                         "nothing was removed.")
+
+
+def _detection_off_load() -> None:
+    DETECTION_OFF.clear()
+    try:
+        data = json.loads(DETECTION_OFF_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(data, list):
+        DETECTION_OFF.update(n for n in data
+                             if isinstance(n, str) and PROJECT_NAME_RE.match(n))
+
+
+def _detection_off_save() -> None:
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = DETECTION_OFF_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(sorted(DETECTION_OFF)))
+        tmp.replace(DETECTION_OFF_FILE)
+    except OSError as e:
+        log.error(f"detection switch persist failed: {e}")
+
+
+def _detection_sweep() -> None:
+    """Startup GC beside _origin_table_sweep: forget switch settings of
+    projects gone from disk (same unreadable-root guard)."""
+    try:
+        if not PROJECTS_ROOT.is_dir():
+            return
+    except OSError:
+        return
+    gone = {n for n in DETECTION_OFF if _project_workspace(n) is None}
+    if gone:
+        DETECTION_OFF.difference_update(gone)
+        _detection_off_save()
+
+
+def _page_ports_and_spans(registry: list[dict]) -> tuple[set[int], list[tuple[int, int]]]:
+    """Hand-added page ports, and each pass-through claim's project-side span as
+    (first port, count) — kept as ranges, never expanded: the registry is
+    writable from inside the container, so a count is not trusted to be small."""
+    page = {int(e["port"]) for e in registry if not e.get("passthrough")}
+    spans = [(int(e["port"]), int(e.get("count", 1)))
+             for e in registry if e.get("passthrough")]
+    return page, spans
+
+
+def _in_spans(port: int, spans: list[tuple[int, int]]) -> bool:
+    return services.span_membership(spans)(port)
+
+
+def _opened_detected(project: str, registry: list[dict]) -> list[int]:
+    page, _ = _page_ports_and_spans(registry)
+    return services.opened_detected_ports(list(ORIGIN_PORTS.values()), project, page)
+
+
+def _registry_readable(project: str) -> bool:
+    """False when the project's port registry exists but cannot be parsed. The
+    tolerant reader then returns [], indistinguishable from "no ports" — and
+    the file is writable from inside the container. Listing opened apps,
+    Remove and switch-off all decide "hand-added or not" from it, so they
+    refuse (or skip) instead of freeing a hand-added port's address."""
+    workspace = _project_workspace(project)
+    if workspace is None:
+        return False
+    f = workspace / ".orchestrator" / "exported-ports.json"
+    if not f.exists():
+        return True
+    try:
+        return isinstance(json.loads(f.read_text()), list)
+    except Exception:
+        return False
+
+
+def _detection_forget(project: str, release: bool = True) -> None:
+    """Drop a project's snapshot and cached checks; with `release`, also free
+    the addresses its opened detected apps hold (switch-off). Destroy frees
+    every address of the project itself."""
+    DETECT_SNAPSHOTS.pop(project, None)
+    for table in (DETECT_CHECKS, DETECT_TRIED):
+        for k in [k for k in table if k[0] == project]:
+            del table[k]
+    if release and _registry_readable(project):
+        for n in _opened_detected(project, _read_exported_ports(project)):
+            _origin_port_free_one(project, f"{services.EXPORTED_PORT_ID_PREFIX}{n}")
+
+
+async def _http_check(project: str, address: str, port: int) -> str:
+    """One `HEAD / HTTP/1.0` to the project's container at `address`:`port`
+    (the address is resolved once per detection, not per check), holding one
+    of the webui-wide check slots for its whole length."""
+    if not _CHECK_SLOTS:
+        _CHECK_SLOTS.append(asyncio.Semaphore(HTTP_CHECK_CONCURRENCY))
+    async with _CHECK_SLOTS[0]:
+        return await _http_check_once(project, address, port)
+
+
+async def _http_check_once(project: str, address: str, port: int) -> str:
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(address, port), timeout=TCP_PROBE_TIMEOUT_SECONDS)
+    except (OSError, ValueError, asyncio.TimeoutError):
+        outcome = services.classify_http_reply(False, None)
+    else:
+        data = b""
+        try:
+            writer.write(b"HEAD / HTTP/1.0\r\n\r\n")
+            await writer.drain()
+            data = await asyncio.wait_for(reader.readexactly(5),
+                                          timeout=HTTP_CHECK_REPLY_TIMEOUT_S)
+        except asyncio.IncompleteReadError as e:
+            data = e.partial
+        except (OSError, ValueError, asyncio.TimeoutError):
+            pass
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+        outcome = services.classify_http_reply(True, data)
+    log.info(f"auto-ports: check {project}:{port} -> {outcome}")
+    return outcome
+
+
+async def _resolve_project(project: str) -> str | None:
+    """The project container's address, resolved once per detection. None when
+    it does not resolve (gone, or a name no resolver accepts)."""
+    try:
+        infos = await asyncio.wait_for(asyncio.get_running_loop().getaddrinfo(
+            f"{PROJECT_CONTAINER_PREFIX}{project}", None, type=socket.SOCK_STREAM),
+            timeout=TCP_PROBE_TIMEOUT_SECONDS)
+    except (OSError, ValueError, asyncio.TimeoutError):
+        return None
+    return infos[0][4][0] if infos else None
+
+
+async def _run_detection(project: str, token: str) -> tuple[str, int]:
+    """One detection: the broker read, the web checks, a stored snapshot.
+    Returns (marker, snapshot seq). Any failure inside reads as "unavailable"
+    through _detect_shared."""
+    try:
+        reply = await broker_call(
+            "port_detect", {"project": project,
+                            "deadline": time.time() + BROKER_CALL_TIMEOUT_S},
+            token=token, timeout=BROKER_CALL_TIMEOUT_S)
+    except (BrokerUnavailable, BrokerForbidden):
+        return "unavailable", 0
+    except Exception:
+        log.exception("auto-ports: detection failed")
+        return "unavailable", 0
+    if not reply.get("ok"):
+        kind = (reply.get("error") or {}).get("kind")
+        return ("unauthorized" if kind == "unauthorized"
+                else "busy" if kind == "busy" else "unavailable"), 0
+    res = reply.get("result") or {}
+    if res.get("partial"):
+        return "unavailable", 0
+    rows = res.get("ports") if res.get("running") else []
+    if not isinstance(rows, list):
+        return "unavailable", 0
+    rows = [r for r in rows if isinstance(r, dict) and isinstance(r.get("port"), int)
+            and not isinstance(r.get("port"), bool) and 1 <= r["port"] <= 65535]
+    outcomes: dict[int, str | None] = {}
+    candidates: list[tuple[tuple, dict, tuple]] = []
+    for r in rows:
+        key = services.detected_check_key(r)
+        if not services.detected_needs_check(r):
+            outcomes[r["port"]] = None
+            continue
+        cached = DETECT_CHECKS.get((project, r["port"]))
+        if cached and cached[0] == key:
+            outcomes[r["port"]] = cached[1]
+            continue
+        order = services.detected_check_order(key, DETECT_TRIED.get((project, r["port"])))
+        candidates.append((order, r, key))
+    # A batch of at most HTTP_CHECK_CONCURRENCY; the rest wait their turn with
+    # no outcome (so no tab yet) and nothing cached.
+    candidates.sort(key=lambda c: (c[0], c[1]["port"]))
+    pending = [(r, key) for _, r, key in candidates[:HTTP_CHECK_CONCURRENCY]]
+    now = time.monotonic()
+    for r, key in pending:
+        DETECT_TRIED[(project, r["port"])] = (key, now)
+    address = await _resolve_project(project) if pending else None
+    if pending and address is None:
+        results = [services.CHECK_REFUSED] * len(pending)
+    else:
+        results = await asyncio.gather(*[_http_check(project, address, r["port"])
+                                         for r, _ in pending])
+    if project in DETECTION_OFF:
+        return "off", 0                 # switched off while this ran
+    if _project_workspace(project) is None:
+        return "unavailable", 0         # destroyed while this ran: store nothing
+    publish_unknown = bool(res.get("lookup_failed"))
+    for (r, key), outcome in zip(pending, results):
+        outcomes[r["port"]] = outcome
+        if services.detected_outcome_cacheable(outcome, r, publish_unknown):
+            DETECT_CHECKS[(project, r["port"])] = (key, outcome)
+        else:
+            DETECT_CHECKS.pop((project, r["port"]), None)
+    live = {r["port"] for r in rows}
+    for table in (DETECT_CHECKS, DETECT_TRIED):
+        for k in [k for k in table if k[0] == project and k[1] not in live]:
+            del table[k]
+    _DETECT_SEQ[0] += 1
+    DETECT_SNAPSHOTS[project] = {"seq": _DETECT_SEQ[0], "rows": {
+        r["port"]: {"label": str(r.get("label") or r["port"]),
+                    "passed": outcomes.get(r["port"]) == services.CHECK_PASS}
+        for r in rows}}
+    return "ok", _DETECT_SEQ[0]
+
+
+async def _detect_shared(project: str, token: str, cookie: str) -> str:
+    """Join the project's detection in flight, or start it. Only the session
+    whose token made a call can be told it is unauthorized; a joiner hears
+    "unavailable" and tries with its own token next time."""
+    task = DETECT_INFLIGHT.get(project)
+    initiator = task is None
+    if initiator:
+        task = asyncio.ensure_future(_run_detection(project, token))
+        DETECT_INFLIGHT[project] = task
+
+        def _done(t, p=project):
+            if DETECT_INFLIGHT.get(p) is t:
+                DETECT_INFLIGHT.pop(p, None)
+        task.add_done_callback(_done)
+    try:
+        marker, seq = await asyncio.shield(task)
+    except Exception:
+        marker, seq = "unavailable", 0
+    if marker == "unauthorized" and not initiator:
+        marker = "unavailable"
+    if marker == "ok" and cookie:
+        for c in [c for c in DETECT_CREDIT if c not in BROKER_SESSIONS]:
+            del DETECT_CREDIT[c]
+        DETECT_CREDIT[cookie] = (project, seq)
+    return marker
+
+
+def _detected_admits(project: str, port: int) -> bool:
+    """The origin router's second admission rule: a detected app the operator
+    opened (it holds an address) that last passed its web check, and is not
+    inside a pass-through span."""
+    if project in DETECTION_OFF:
+        return False
+    row = (DETECT_SNAPSHOTS.get(project) or {}).get("rows", {}).get(port)
+    if not row or not row.get("passed"):
+        return False
+    if _origin_port_lookup(project, f"{services.EXPORTED_PORT_ID_PREFIX}{port}") is None:
+        return False
+    _, spans = _page_ports_and_spans(_read_exported_ports(project))
+    return not _in_spans(port, spans)
+
+
+async def broker_project_services_handler(request: web.Request) -> web.Response:
+    """GET /broker/project/{name}/services?detect=0|1&alloc=0|1 — the project's
+    tabs as GET /services/<project> has them, plus its detected tabs, its
+    opened apps and the detection switch (session-gated). detect=1 (the
+    periodic refresh) runs a detection; detect=0 never calls the broker.
+    alloc=0 allocates no address (the Ports section's listing)."""
+    s = _broker_session(request)
+    if s is None:
+        return web.json_response({"ok": False, "error": {"kind": "unauthorized"}},
+                                 status=401)
+    project = request.match_info.get("name", "")
+    if _project_workspace(project) is None:
+        return web.json_response({"ok": False, "error": {"kind": "not_found"}},
+                                 status=404)
+    detect = request.query.get("detect") == "1"
+    allocate = request.query.get("alloc", "1") != "0"
+    cookie = request.cookies.get(BROKER_COOKIE, "")
+    if project in DETECTION_OFF:
+        marker = "off"
+    elif detect:
+        marker = await _detect_shared(project, s["broker_token"], cookie)
+        if marker == "unauthorized":
+            # Answer 401 WITHOUT dropping the webui session: the SPA pauses
+            # detection on it, and the rest of the session (host stats, say)
+            # survives a broker restart until a Management action meets it.
+            return web.json_response(
+                {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+        if marker == "ok":
+            marker = ""
+    else:
+        snap = DETECT_SNAPSHOTS.get(project)
+        credit = DETECT_CREDIT.get(cookie)
+        marker = "" if (snap and credit == (project, snap["seq"])) else "withheld"
+    registry = _read_exported_ports(project)
+    out = await _assemble_services(request, project, registry, allocate)
+    enabled = project not in DETECTION_OFF       # read after the last await
+    page, spans = _page_ports_and_spans(registry)
+    in_span = services.span_membership(spans)
+    snap = DETECT_SNAPSHOTS.get(project) or {}
+    if marker == "":
+        for n, row in sorted(snap.get("rows", {}).items()):
+            psid = f"{services.EXPORTED_PORT_ID_PREFIX}{n}"
+            if not row.get("passed") or n in page or in_span(n) or psid in out:
+                continue
+            spec = services.exported_port_service(n, row["label"])
+            if spec is None:
+                continue
+            port = _origin_port_lookup(project, psid)
+            out[psid] = {**spec, "detected": True,
+                         **({"origin_url": f"https://{_request_host(request)}:{port}/"}
+                            if port is not None else {})}
+    opened = []
+    for n in (_opened_detected(project, registry) if _registry_readable(project) else []):
+        port = _origin_port_lookup(project, f"{services.EXPORTED_PORT_ID_PREFIX}{n}")
+        if port is None:
+            continue
+        row = snap.get("rows", {}).get(n) or {}
+        opened.append({"port": n, "label": row.get("label") or str(n),
+                       "origin_url": f"https://{_request_host(request)}:{port}/"})
+    return web.json_response({"ok": True, "services": out, "detection": marker,
+                              "detection_enabled": enabled, "opened": opened})
+
+
+async def broker_detected_origin_handler(request: web.Request) -> web.Response:
+    """POST /broker/project/{name}/ports/{port}/origin — reserve a tab address
+    for a detected app the operator is opening; DELETE — free it (Remove under
+    Opened apps). Session-gated and origin-checked."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    if _broker_session(request) is None:
+        return web.json_response({"ok": False, "error": {"kind": "unauthorized"}},
+                                 status=401)
+    project = request.match_info.get("name", "")
+    raw = request.match_info.get("port", "")
+    if _project_workspace(project) is None or not raw.isdigit():
+        return web.json_response({"ok": False, "error": {"kind": "not_found"}},
+                                 status=404)
+    n = int(raw)
+    psid = f"{services.EXPORTED_PORT_ID_PREFIX}{n}"
+    page, spans = _page_ports_and_spans(_read_exported_ports(project))
+    if request.method == "DELETE":
+        if not _registry_readable(project):
+            return web.json_response({"ok": False, "error": {
+                "kind": "validation", "message": UNREADABLE_PORTS_TEXT}})
+        if n in page:
+            return web.json_response({"ok": False, "error": {
+                "kind": "validation", "message": REGISTERED_PORT_TEXT}})
+        _origin_port_free_one(project, psid)
+        return web.json_response({"ok": True})
+    row = (DETECT_SNAPSHOTS.get(project) or {}).get("rows", {}).get(n)
+    if (project in DETECTION_OFF or not row or not row.get("passed")
+            or n in page or _in_spans(n, spans)):
+        return web.json_response({"ok": False, "error": {
+            "kind": "validation", "message": NOT_DETECTED_TEXT}})
+    port = _origin_port_for(project, psid)
+    if port is None:
+        return web.json_response({"ok": False, "error": {
+            "kind": "pool_full", "message": POOL_FULL_TEXT}})
+    return web.json_response({"ok": True, "origin_url":
+                              f"https://{_request_host(request)}:{port}/"})
+
+
+async def broker_detection_switch_handler(request: web.Request) -> web.Response:
+    """POST /broker/project/{name}/ports/detection {enabled} — the per-project
+    detection switch, for every browser. Turning it off drops the snapshot and
+    frees the addresses of the project's opened detected apps."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    if _broker_session(request) is None:
+        return web.json_response({"ok": False, "error": {"kind": "unauthorized"}},
+                                 status=401)
+    project = request.match_info.get("name", "")
+    if _project_workspace(project) is None:
+        return web.json_response({"ok": False, "error": {"kind": "not_found"}},
+                                 status=404)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    enabled = body.get("enabled") if isinstance(body, dict) else None
+    if not isinstance(enabled, bool):
+        return web.json_response({"ok": False, "error": {
+            "kind": "validation", "message": "enabled must be true or false"}})
+    if enabled:
+        DETECTION_OFF.discard(project)
+    else:
+        DETECTION_OFF.add(project)
+        _detection_forget(project)
+    _detection_off_save()
+    return web.json_response({"ok": True, "detection_enabled": enabled})
 
 
 def _read_project_extensions(project: str) -> dict[str, dict]:
@@ -2843,6 +3317,9 @@ def _resolve_origin_upstream_port(project: str, service_id: str) -> int | None:
                       if not e.get("passthrough")}
         if raw.isdigit() and int(raw) in registered:
             return int(raw)
+        # A detected app (STAGE_AUTO_PORTS) the operator opened.
+        if raw.isdigit() and _detected_admits(project, int(raw)):
+            return int(raw)
         return None
     return None
 
@@ -3181,6 +3658,16 @@ def main() -> None:
     # and a browser won't send it to any other path prefix.
     app.router.add_post("/broker/dev/gitea-session", dev_gitea_session_handler)
     app.router.add_post("/broker/project/{name}/port", broker_port_add_handler)
+    # Detected web apps (STAGE_AUTO_PORTS): multi-segment, so the {action}
+    # catch-all cannot shadow them; registered before it all the same.
+    app.router.add_get("/broker/project/{name}/services",
+                       broker_project_services_handler)
+    app.router.add_post("/broker/project/{name}/ports/detection",
+                        broker_detection_switch_handler)
+    app.router.add_post("/broker/project/{name}/ports/{port}/origin",
+                        broker_detected_origin_handler)
+    app.router.add_delete("/broker/project/{name}/ports/{port}/origin",
+                          broker_detected_origin_handler)
     app.router.add_post(
         "/broker/project/{name}/port-remove", broker_port_remove_handler)
     app.router.add_post(
@@ -3205,6 +3692,8 @@ def main() -> None:
 
     _origin_table_load()
     _origin_table_sweep()
+    _detection_off_load()
+    _detection_sweep()
 
     # Pass-through block sanity — IN-container netns (the fixed 7777 + the
     # origin range as THIS container binds them). research.py's webui-start
