@@ -401,6 +401,26 @@ html.mobile .project-rail .rail-separator { cursor: default; }
     overflow-wrap: anywhere;
     user-select: all;
 }
+/* A setting row (Extensions, Models, Agents, Ports …): name, a muted state word,
+   then its buttons, spaced apart; the row wraps inside the 280px box. */
+.project-config-box .config-box-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 2px;
+}
+.project-config-box .config-box-name { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
+.project-config-box .config-box-meta { color: var(--fg-muted); font-size: 12px; }
+/* A setting row whose buttons do not fit (Agents: Update + Add) wraps them to
+   the right-hand side of the next line, not under the name. */
+.project-config-box .config-box-row:has(> .config-box-meta) { justify-content: flex-end; }
+/* A port row (Ports list, Opened apps) keeps a long label and its ✕ on one line:
+   a zero basis lets the label wrap beside the ✕ instead of pushing it down. */
+.project-config-box .config-box-row:has(> .close-tab-btn) > .config-box-name { flex-basis: 0; }
+.project-config-box .config-box-row > .close-tab-btn { flex-shrink: 0; }
+/* The address still takes its own full-width line under the label. */
+.project-config-box .config-box-row > .config-port-addr { flex-basis: 100%; }
 .project-config-box .config-hint {
     margin-top: 8px;
     color: var(--fg-faint);
