@@ -992,6 +992,7 @@ async function renderDashboard(opts = {}) {
     if (opts.skipBrokerLogin) {
         syncSidebarFromBroker();
         seedLifecycleFromBroker();
+        seedSoftwareFromBroker();
     } else {
         tryBrokerLogin().then(() => {
             syncSidebarFromBroker();
@@ -1001,9 +1002,11 @@ async function renderDashboard(opts = {}) {
             // only then: with figures cached (a reload kept the session
             // cookie) there is nothing to fix.
             if (!state.hostStats) scheduleHostStats();
-            // Start/stop/update keep running on the broker across a reload;
-            // re-learn them so their labels and completion notices come back.
+            // Start/stop/update and software builds keep running on the
+            // broker across a reload; re-learn them so their labels and
+            // completion notices come back.
             seedLifecycleFromBroker();
+            seedSoftwareFromBroker();
         });
     }
 }
@@ -1895,6 +1898,8 @@ async function renderSoftwareInto(view) {
         return renderMgmtVerbError(view, body, renderSoftwareInto);
     }
     renderSoftwareScreen(view, body.result);
+    paintSoftwareLabels();
+    seedSoftwareFromBroker();
 }
 
 function renderSoftwareScreen(view, result) {
@@ -1909,17 +1914,21 @@ function renderSoftwareScreen(view, result) {
 
     const refresh = el("button", { class: "btn-small" }, ["Refresh"]);
     refresh.onclick = () => renderSoftwareInto(view);
-    const rebuildBtn = el("button", { class: "btn-small" }, ["Rebuild all"]);
-    rebuildBtn.onclick = () => mgmtBuildDialog(view, {
+    const rebuildBtn = el("button", { class: "btn-small sw-fleet-btn" }, ["Rebuild all"]);
+    rebuildBtn.onclick = () => softwareInFlight.has("fleet") ? null : mgmtBuildDialog(view, {
         title: "Rebuild the image fleet",
         tailTitle: "Rebuilding the image fleet",
         confirmLabel: "Rebuild all",
         payload: { verb: "rebuild" },
-        body: [el("p", {}, ["Rebuild every image at the current effective pins — a long operation (often 10–15 min), one image at a time on the host. The rest of the webui stays responsive while it runs."])],
+        body: [el("p", {}, ["Rebuild every image at the current effective pins — a long operation (often 10–15 min), one image at a time on the host. You can send it to the background and keep working; a notice reports when it ends."])],
     });
     view.appendChild(el("div", { class: "mgmt-header" }, [
         el("h2", {}, ["Software — dists, images, pins"]),
         el("div", { class: "mgmt-toolbar" }, [refresh, rebuildBtn]),
+    ]));
+    // The fleet rebuild has no row of its own: its in-flight line sits here.
+    view.appendChild(el("div", { class: "sw-fleet-line", "data-swtarget": "fleet" }, [
+        el("span", { class: "sw-status" }, []),
     ]));
 
     const cell = (v, cls) =>
@@ -1933,8 +1942,10 @@ function renderSoftwareScreen(view, result) {
     };
     const pullBtn = (payload, tip) => {
         const b = el("button", { class: "btn-small" }, ["Pull"]);
-        b.onclick = () => mgmtBuildDialog(view, {
-            title: "Pull dist", tailTitle: "Pulling dist", confirmLabel: "Pull",
+        b.onclick = () => softwareInFlight.has(swTarget(payload.verb, payload.agent)) ? null : mgmtBuildDialog(view, {
+            title: "Pull dist",
+            tailTitle: softwareTitle(payload.verb, swTarget(payload.verb, payload.agent)),
+            confirmLabel: "Pull",
             payload: payload, body: [el("p", {}, [tip])],
         });
         return b;
@@ -1942,8 +1953,9 @@ function renderSoftwareScreen(view, result) {
     // Refresh = preview upstream, then (only if newer) bump the untracked override
     // pin + re-pull via the build lane. distLabel names the dist in the dialog.
     const refreshBtn = (distLabel, checkPayload, buildPayload) => {
-        const b = el("button", { class: "btn-small" }, ["Refresh"]);
-        b.onclick = () => mgmtRefreshDialog(view, {
+        const b = el("button", { class: "btn-small sw-refresh-btn" }, ["Refresh"]);
+        const target = swTarget(buildPayload.verb, buildPayload.agent);
+        b.onclick = () => (softwareInFlight.has(target) || softwareChecking.has(target)) ? null : mgmtRefreshDialog(view, {
             title: "Refresh " + distLabel, tailTitle: "Refreshing " + distLabel,
             distLabel: distLabel, checkPayload: checkPayload, buildPayload: buildPayload,
         });
@@ -1957,12 +1969,12 @@ function renderSoftwareScreen(view, result) {
         el("span", {}, ["Status"]), el("span", {}, [""]),
     ])];
     for (const a of agents) {
-        distRows.push(el("div", { class: "sw-row" }, [
+        distRows.push(el("div", { class: "sw-row", "data-swtarget": swTarget("agent_pull", a.agent) }, [
             el("span", { class: "sw-name" }, ["agent: " + a.agent]),
             cell(a.present ? "yes" : "no"),
             cell(a.cached_version, "sw-mono"),
             cell(a.effective_pin, "sw-mono"),
-            distStatus(a),
+            el("span", { class: "sw-status" }, [distStatus(a)]),
             el("span", { class: "sw-act" }, [
                 pullBtn(
                     { verb: "agent_pull", agent: a.agent },
@@ -2005,12 +2017,12 @@ function renderSoftwareScreen(view, result) {
         }
     }
     const nExt = Object.keys(editor.extensions || {}).length;
-    distRows.push(el("div", { class: "sw-row" }, [
+    distRows.push(el("div", { class: "sw-row", "data-swtarget": "editor" }, [
         el("span", { class: "sw-name" }, ["editor: code-server" + (nExt ? ` (+${nExt} ext)` : "")]),
         cell(editor.present ? "yes" : "no"),
         cell(editor.cached_version, "sw-mono"),
         cell(editor.effective_pin, "sw-mono"),
-        distStatus(editor),
+        el("span", { class: "sw-status" }, [distStatus(editor)]),
         el("span", { class: "sw-act" }, [
             pullBtn(
                 { verb: "editor_pull" },
@@ -2023,13 +2035,13 @@ function renderSoftwareScreen(view, result) {
     ]));
     // Reader dist (STAGE_READER): nbconvert is the primary/refreshable pin;
     // markdown rides bundled. The cell shows the nbconvert version.
-    distRows.push(el("div", { class: "sw-row" }, [
+    distRows.push(el("div", { class: "sw-row", "data-swtarget": "reader" }, [
         el("span", { class: "sw-name" }, ["reader: nbconvert"
             + (reader.markdown_version ? ` (+md ${reader.markdown_version})` : "")]),
         cell(reader.present ? "yes" : "no"),
         cell(reader.cached_version, "sw-mono"),
         cell(reader.effective_pin, "sw-mono"),
-        distStatus(reader),
+        el("span", { class: "sw-status" }, [distStatus(reader)]),
         el("span", { class: "sw-act" }, [
             pullBtn(
                 { verb: "reader_pull" },
@@ -2043,13 +2055,13 @@ function renderSoftwareScreen(view, result) {
     // Node seed (STAGE_NODE_SEED): Pull ONLY — node is a seed, not a managed dist,
     // so there is no Refresh (bump NODE_VERSION in versions.env by hand, then Pull).
     // The npm version rides in the name for parity with the reader's markdown note.
-    distRows.push(el("div", { class: "sw-row" }, [
+    distRows.push(el("div", { class: "sw-row", "data-swtarget": "node" }, [
         el("span", { class: "sw-name" }, ["node"
             + (node.npm_version ? ` (npm ${node.npm_version})` : "")]),
         cell(node.present ? "yes" : "no"),
         cell(node.cached_version, "sw-mono"),
         cell(node.effective_pin, "sw-mono"),
-        distStatus(node),
+        el("span", { class: "sw-status" }, [distStatus(node)]),
         el("span", { class: "sw-act" }, [
             pullBtn(
                 { verb: "node_pull" },
@@ -2138,8 +2150,10 @@ async function renderManagementInto(view) {
     // (so opening / logging into Management surfaces running projects there too).
     syncSidebarFromBroker(body.result || []);
     // Pick up actions started elsewhere (another tab, before a reload) and
-    // restart any watcher a session expiry stalled.
+    // restart any watcher a session expiry stalled — a 401 lands here after
+    // the login card, so software builds' watchers restart here too.
     seedLifecycleFromBroker();
+    seedSoftwareFromBroker();
 }
 
 function mgmtCard(view, children) {
@@ -5483,13 +5497,29 @@ async function seedLifecycleFromBroker() {
 
 // Corner notice for an action that finished in the background. It stays until
 // dismissed (an outcome nobody saw is the failure this exists to prevent);
-// clicking it reopens the op box, already complete, with the reason.
-function showLifecycleNotice(project, verb, opId, outcome) {
+// clicking it runs `onOpen` (reopen the op box, already complete, with the
+// reason) — unless another dialog is open.
+function showOpNotice(text, ok, onOpen) {
     let host = document.getElementById("op-notices");
     if (!host) {
         host = el("div", { id: "op-notices", class: "op-notices" });
         document.body.appendChild(host);
     }
+    const body = el("button", { class: "op-notice-body", title: "Show the details" }, [text]);
+    const close = el("button", { class: "op-notice-close", title: "Dismiss",
+                                 "aria-label": "Dismiss" }, ["×"]);
+    const notice = el("div", { class: "op-notice" + (ok ? "" : " failed"),
+                               role: "status" }, [body, close]);
+    close.onclick = () => notice.remove();
+    body.onclick = () => {
+        if (document.querySelector(".modal-backdrop")) return;
+        notice.remove();
+        onOpen();
+    };
+    host.appendChild(notice);
+}
+
+function showLifecycleNotice(project, verb, opId, outcome) {
     const past = { start: "started", stop: "stopped", update: "updated",
                    agents_update: "agents updated" }[verb] || "finished";
     const noun = { agents_update: "agent update" }[verb] || verb;
@@ -5498,15 +5528,7 @@ function showLifecycleNotice(project, verb, opId, outcome) {
     const text = outcome.interrupted
         ? `${project}: the ${noun} was interrupted`
         : outcome.ok ? `${project} ${past}` : failed;
-    const body = el("button", { class: "op-notice-body", title: "Show the details" }, [text]);
-    const close = el("button", { class: "op-notice-close", title: "Dismiss",
-                                 "aria-label": "Dismiss" }, ["×"]);
-    const notice = el("div", { class: "op-notice" + (outcome.ok ? "" : " failed"),
-                               role: "status" }, [body, close]);
-    close.onclick = () => notice.remove();
-    body.onclick = () => {
-        if (document.querySelector(".modal-backdrop")) return;
-        notice.remove();
+    showOpNotice(text, outcome.ok, () => {
         const backdrop = el("div", { class: "modal-backdrop" });
         const card = el("div", { class: "card" });
         backdrop.appendChild(card);
@@ -5514,8 +5536,7 @@ function showLifecycleNotice(project, verb, opId, outcome) {
         lifecycleTail(null, backdrop, card, opId,
                       `${LIFECYCLE_TITLES[verb] || "Working on"} ${project}`,
                       verb, project, null, { replay: true });
-    };
-    host.appendChild(notice);
+    });
 }
 
 // What a ticked read-only folder means for the operator — shown under the
@@ -5660,6 +5681,237 @@ function mgmtConfirmThenTail(view, cfg) {
     return backdrop;
 }
 
+// ---- software: builds in flight -------------------------------------------
+// The broker runs one software build at a time; a later one waits its turn
+// (its view log carries a `queue` milestone while it waits), and a second build
+// of the SAME target is refused. The build box can be sent to the background;
+// a watcher then carries the op to its end and a corner notice reports it. The
+// registry is keyed by target — the unit the broker's refusal keys on, so one
+// entry per target is exact. Value: {opId, verb, agent, queued, modal,
+// watching, stalled}; `modal` = an open box is tailing it, `watching` = a
+// background watcher is. A 401/403 stalls the watcher (entry kept) and the next
+// seed restarts it.
+const softwareInFlight = new Map();
+// Op ids this page saw finish: a seed racing a finishing child (holder gone,
+// per-op lock not yet) must not revive one and post a second notice.
+const softwareFinished = new Set();
+// Targets whose Refresh check was closed before it answered: their Refresh
+// stays off until it does, so checks cannot pile up on the broker.
+const softwareChecking = new Set();
+
+// Mirrors the broker's _build_target (same default agent as the verb).
+function swTarget(verb, agent) {
+    if (verb === "agent_pull" || verb === "agent_refresh") return "agent:" + (agent || "claude");
+    if (verb === "editor_pull" || verb === "editor_refresh") return "editor";
+    if (verb === "reader_pull" || verb === "reader_refresh") return "reader";
+    if (verb === "node_pull") return "node";
+    if (verb === "rebuild") return "fleet";
+    return verb;
+}
+
+function swTargetName(target) {
+    if (target.startsWith("agent:")) return target.slice("agent:".length) + " agent";
+    return { editor: "editor", reader: "reader", node: "node", fleet: "image fleet" }[target] || target;
+}
+
+function swLabel(entry) {
+    if (entry.queued) return "queued…";
+    if (entry.verb === "rebuild") return "rebuilding the image fleet…";
+    return /_refresh$/.test(entry.verb) ? "refreshing…" : "pulling…";
+}
+
+function swRegister(target, opId, verb, agent) {
+    const entry = { opId, verb, agent: agent || null, queued: false, modal: false,
+                    watching: false, stalled: false };
+    softwareInFlight.set(target, entry);
+    paintSoftwareLabels();
+    return entry;
+}
+
+function swSetQueued(target, opId, queued) {
+    const entry = softwareInFlight.get(target);
+    if (!entry || entry.opId !== opId || entry.queued === queued) return;
+    entry.queued = queued;
+    paintSoftwareLabels();
+}
+
+// Repaint every Software surface stamped with a target: a dist row (its Status
+// cell + its Pull/Refresh, off while that target is in flight — the broker
+// would refuse them) and the fleet line under the header (+ Rebuild all). A
+// row whose build ended while the page could not re-render says so and keeps
+// its buttons off: its render-time status describes the dist BEFORE the build.
+function paintSoftwareLabels() {
+    for (const row of document.querySelectorAll("[data-swtarget]")) {
+        const target = row.getAttribute("data-swtarget");
+        const stateEl = row.querySelector(".sw-status");
+        const buttons = target === "fleet"
+            ? document.querySelectorAll(".sw-fleet-btn")
+            : row.querySelectorAll(".sw-act button");
+        const entry = softwareInFlight.get(target);
+        if (entry) {
+            if (stateEl) stateEl.textContent = swLabel(entry);
+            buttons.forEach((b) => {
+                b.disabled = true;
+                b.title = entry.queued ? "Waiting for another build to finish"
+                                       : "This is being built right now";
+            });
+            row.setAttribute("data-inflight", "1");
+            row.removeAttribute("data-swfinished");
+        } else if (row.getAttribute("data-inflight")) {
+            // Not "Refresh" alone: each row has a Refresh button of its own,
+            // which starts a version check — the page's is the one meant here.
+            if (stateEl && target === "fleet") {
+                stateEl.textContent = "The image fleet rebuild finished — press Refresh at the top of the page to see it.";
+            } else if (stateEl) {
+                stateEl.textContent = "finished";
+                stateEl.title = "Press Refresh at the top of the page to see the new version";
+            }
+            row.removeAttribute("data-inflight");
+            row.setAttribute("data-swfinished", "1");
+        }
+        if (target !== "fleet") {
+            const refresh = row.querySelector(".sw-refresh-btn");
+            if (refresh && softwareChecking.has(target)) {
+                refresh.disabled = true;
+                refresh.title = "Still checking upstream";
+            }
+        }
+    }
+}
+
+// The Software section, when it is on screen (Settings open, section rendered).
+function softwareView() {
+    if (state.hostPage !== "settings") return null;
+    const sw = document.querySelector("#management-view .sw-embed");
+    return sw && sw.isConnected ? sw : null;
+}
+
+// Re-show a finished build from its logs (the notice's click): read-only, no
+// registry, Done just closes it.
+function softwareReplay(opId, title) {
+    if (document.querySelector(".modal-backdrop")) return;
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const card = el("div", { class: "card sw-build-card" });
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+    const view = softwareView();
+    mgmtTailBuildLog(view, backdrop, card, opId, title, () => {},
+                     view ? renderSoftwareInto : undefined);
+}
+
+function softwareTitle(verb, target) {
+    if (verb === "rebuild") return "Rebuilding the image fleet";
+    return (/_refresh$/.test(verb) ? "Refreshing " : "Pulling ") + swTargetName(target);
+}
+
+function softwareNoticeText(entry, target, outcome) {
+    const name = swTargetName(target);
+    const what = entry.verb === "rebuild" ? "rebuild" : /_refresh$/.test(entry.verb) ? "refresh" : "pull";
+    if (entry.verb === "rebuild") {
+        if (outcome.interrupted) return "The image fleet rebuild was interrupted";
+        return outcome.ok ? "Image fleet rebuilt" : "The image fleet rebuild failed";
+    }
+    if (outcome.interrupted) return `${name}: the ${what} was interrupted`;
+    return outcome.ok ? `${name} ${what === "refresh" ? "refreshed" : "pulled"}`
+                      : `${name}: the ${what} failed`;
+}
+
+// The one completion path (open box or watcher): drop the entry, repaint. A
+// watcher's completion also posts the corner notice and refreshes the Software
+// section when it is on screen — but never under an open dialog, and never
+// while the section holds the operator's own input.
+function softwareFinish(target, opId, outcome, background) {
+    const entry = softwareInFlight.get(target);
+    if (!entry || entry.opId !== opId) return;
+    softwareInFlight.delete(target);
+    softwareFinished.add(opId);
+    paintSoftwareLabels();
+    if (!background) return;
+    showOpNotice(softwareNoticeText(entry, target, outcome), outcome.ok,
+                 () => softwareReplay(opId, softwareTitle(entry.verb, target)));
+    const view = softwareView();
+    if (view && !document.querySelector(".modal-backdrop") && !mgmtViewHoldsInput(view)) {
+        renderSoftwareInto(view);
+    }
+}
+
+// Background watcher for one in-flight build (a dismissed box, or a build this
+// page learned from GET /broker/software/active). The double-start guard is
+// `watching`, set before the first await.
+async function softwareWatch(target) {
+    const entry = softwareInFlight.get(target);
+    if (!entry || entry.watching || entry.modal) return;
+    entry.watching = true;
+    entry.stalled = false;
+    const opId = entry.opId;
+    const st = { opId, from: 0, terminal: null };
+    const res = await lifecyclePoll(
+        st,
+        (rec) => swSetQueued(target, opId, rec.step === "queue"),
+        () => softwareInFlight.get(target) !== entry);
+    if (res === null) return;                   // superseded
+    if (res.auth) { entry.watching = false; entry.stalled = true; return; }
+    softwareFinish(target, opId, res, true);
+}
+
+// Learn every build in flight on the broker (after the broker login, and on
+// each Software render). Entries this page already tracks keep their state;
+// stalled watchers restart. 401/503 → nothing (Management is opt-in).
+async function seedSoftwareFromBroker() {
+    let res;
+    try { res = await fetch("/broker/software/active"); } catch (e) { return; }
+    if (!res.ok) return;
+    let body; try { body = await res.json(); } catch (e) { return; }
+    const ops = (body && body.ok && body.result && Array.isArray(body.result.ops))
+        ? body.result.ops : [];
+    for (const op of ops) {
+        if (!op || typeof op.target !== "string" || typeof op.op_id !== "string"
+                || typeof op.verb !== "string" || softwareFinished.has(op.op_id)) continue;
+        if (softwareInFlight.get(op.target)) continue;   // tracked already
+        const entry = swRegister(op.target, op.op_id, op.verb, op.agent);
+        entry.queued = op.state === "queued";
+        softwareWatch(op.target);
+    }
+    for (const [target, entry] of softwareInFlight) {
+        if (entry.stalled && !entry.watching && !entry.modal) softwareWatch(target);
+    }
+    paintSoftwareLabels();
+}
+
+// Phase 2 of a build box: the streaming log tail, closable. Registers the op
+// so the page shows it in flight; dismissing hands it to a watcher; an end
+// reached while the box is open drops it (no notice — the operator saw it).
+async function softwareTail(view, backdrop, card, opId, title, target, payload) {
+    const entry = swRegister(target, opId, payload.verb, payload.agent);
+    entry.modal = true;
+    let ended = false;
+    const dismiss = () => {
+        backdrop.remove();
+        if (ended) {
+            // Closed after the end by a click outside: land where Done lands,
+            // or the finished row keeps its stale version and its buttons off.
+            if (view && view.isConnected) renderSoftwareInto(view);
+            return;
+        }
+        if (!entry.modal) return;
+        entry.modal = false;
+        softwareWatch(target);
+    };
+    await mgmtTailBuildLog(view, backdrop, card, opId, title, undefined,
+                           renderSoftwareInto, {
+        onDismiss: dismiss,
+        onRecord: (rec) => swSetQueued(target, opId, rec.step === "queue"),
+        onEnd: (outcome) => {
+            ended = true;
+            entry.modal = false;
+            softwareFinish(target, opId, outcome, false);
+        },
+    });
+    // Session expired mid-tail: the build carries on at the broker. Keep the
+    // entry (stalled) so the next seed after re-login picks it back up.
+    if (!ended && entry.modal) { entry.modal = false; entry.stalled = true; }
+}
+
 // ---- software: build lane (pull / rebuild) ---------------------------------
 // A build runs on the broker's DETACHED child (F2 Slice 2): the POST returns an
 // op_id at once, then we stream the RAW build log from /fulllog (the authenticated
@@ -5670,6 +5922,7 @@ function mgmtConfirmThenTail(view, cfg) {
 // view-log is the completion signal.
 async function mgmtTailBuildLog(view, backdrop, card, opId, title, onDone,
                                 onLogin, opts) {
+    opts = opts || {};
     const phaseEl = el("div", { class: "op-phase" }, ["starting…"]);
     const pre = el("pre", { class: "sw-buildlog" }, [""]);
     const failEl = el("div", { class: "op-fail" });
@@ -5681,31 +5934,44 @@ async function mgmtTailBuildLog(view, backdrop, card, opId, title, onDone,
         // review dialog passes its own Fetch-tab re-render.
         if (onDone) onDone(); else renderSoftwareInto(view);
     };
-    card.innerHTML = "";
-    card.appendChild(el("h2", {}, [title]));
-    card.appendChild(phaseEl);
-    card.appendChild(pre);
-    card.appendChild(failEl);
-    card.appendChild(el("div", { class: "btn-row" }, [doneBtn]));
-
-    let logFrom = 0, viewFrom = 0, done = false, ok = false, sawTerminal = false, interrupted = false;
-    // Dismissable mode (opts.onDismiss — passed ONLY by the review dialog):
-    // a backdrop click closes the modal and hands the op to the caller's
-    // background watcher; `cancelled` exits the loop without touching onDone
-    // or the DOM. Build/dev-box/repo-remove tails pass no opts and keep
-    // modal-until-done — a state-changing op should hold the operator.
+    // Dismissable mode (opts.onDismiss — the review dialog and the Software
+    // page's builds): a "Continue in background" button and a backdrop click
+    // close the modal and hand the op to the caller's background watcher;
+    // `cancelled` exits the loop without touching onDone or the DOM. The
+    // button goes at the end (nothing left to continue); the backdrop click
+    // stays the caller's, whose handler knows whether the op already ended.
+    // Dev-box / repo-remove tails pass no opts and keep modal-until-done.
     let cancelled = false;
-    if (opts && opts.onDismiss) {
+    const bgBtn = opts.onDismiss
+        ? el("button", { class: "btn btn-secondary" }, ["Continue in background"]) : null;
+    if (opts.onDismiss) {
+        bgBtn.onclick = () => { cancelled = true; opts.onDismiss(); };
         backdrop.onclick = (e) => {
             if (e.target !== backdrop) return;
             cancelled = true;
             opts.onDismiss();
         };
     }
-    // Liveness probe (via the build lock) — the terminal-first tail has no other
-    // signal, so a hard-killed child (OOM / kill -9 / power-loss) that never wrote
-    // a terminal would spin the modal forever. null on a transient error → assume
-    // still alive and keep polling; only an explicit false ends the wait.
+    card.innerHTML = "";
+    card.appendChild(el("h2", {}, [title]));
+    card.appendChild(phaseEl);
+    card.appendChild(pre);
+    card.appendChild(failEl);
+    card.appendChild(el("div", { class: "btn-row" }, bgBtn ? [bgBtn, doneBtn] : [doneBtn]));
+
+    let logFrom = 0, viewFrom = 0, done = false, ok = false, sawTerminal = false, interrupted = false;
+    // A replay from a corner notice may have no page behind it (view null):
+    // an expired session then just closes the box — there is no view to land
+    // a login card in.
+    const statusRedirect = (status) => {
+        if (view) return mgmtStatusRedirect(view, status, onLogin);
+        return (status === 401 || status === 403 || status === 503) ? () => undefined : null;
+    };
+    // Liveness probe (the op's per-op lock, via build_alive) — the
+    // terminal-first tail has no other signal, so a hard-killed child (OOM /
+    // kill -9 / power-loss) that never wrote a terminal would spin the modal
+    // forever. null on a transient error → assume still alive and keep
+    // polling; only an explicit false ends the wait.
     const checkAlive = async () => {
         try {
             const r = await fetch(`/broker/op/${encodeURIComponent(opId)}/alive`);
@@ -5716,7 +5982,7 @@ async function mgmtTailBuildLog(view, backdrop, card, opId, title, onDone,
     };
     const drainFull = async () => {
         const r = await fetch(`/broker/op/${encodeURIComponent(opId)}/fulllog?from=${logFrom}`);
-        const redirect = mgmtStatusRedirect(view, r.status, onLogin);
+        const redirect = statusRedirect(r.status);
         if (redirect) return redirect;
         const b = await r.json();
         if (b.ok && b.exists && b.data) {
@@ -5729,7 +5995,7 @@ async function mgmtTailBuildLog(view, backdrop, card, opId, title, onDone,
     };
     const drainView = async () => {
         const r = await fetch(`/broker/op/${encodeURIComponent(opId)}/log?from=${viewFrom}`);
-        const redirect = mgmtStatusRedirect(view, r.status, onLogin);
+        const redirect = statusRedirect(r.status);
         if (redirect) return redirect;
         const b = await r.json();
         if (b.started !== false && b.data) {
@@ -5739,7 +6005,12 @@ async function mgmtTailBuildLog(view, backdrop, card, opId, title, onDone,
                 let rec; try { rec = JSON.parse(line); } catch (e) { continue; }
                 if (rec.status === "done") { sawTerminal = true; ok = true; }
                 else if (rec.status === "failed") { sawTerminal = true; ok = false; }
-                else if (rec.msg) phaseEl.textContent = rec.msg;
+                else {
+                    if (rec.msg) phaseEl.textContent = rec.msg;
+                    if (opts.onRecord) {
+                        try { opts.onRecord(rec); } catch (e) { /* the caller's repaint is best-effort */ }
+                    }
+                }
             }
         }
         return null;
@@ -5771,10 +6042,39 @@ async function mgmtTailBuildLog(view, backdrop, card, opId, title, onDone,
     // on cancelled/auth exits or a hard-killed interrupt), before the
     // operator touches Done — the page behind the open modal resolves
     // immediately; the Done click keeps its full re-render landing.
-    if (sawTerminal && opts && opts.onTerminal) {
+    if (sawTerminal && opts.onTerminal) {
         try { opts.onTerminal(ok); } catch (e) { /* cell resolve is best-effort */ }
     }
-    try { await drainFull(); } catch (e) { /* best-effort trailing bytes */ }
+    // opts.onEnd — the op is over, by a terminal OR as interrupted (never on
+    // the cancelled/auth exits): the caller's in-flight registry drops it.
+    if (opts.onEnd) {
+        try { opts.onEnd({ ok: sawTerminal && ok, msg: "", interrupted: !sawTerminal }); }
+        catch (e) { /* the caller's bookkeeping is best-effort */ }
+    }
+    if (bgBtn) bgBtn.remove();
+    // The full log can be far longer than one tail chunk (a finished fleet
+    // rebuild is megabytes, and a replay starts from 0): read on to its end so
+    // where it failed or died is on screen. The reads end at the first empty
+    // one: a finished child writes nothing more, and an interrupted build's
+    // orphaned docker work (B151) writes far slower than these back-to-back
+    // reads catch up. Collected first and set once: appending per chunk
+    // re-lays the whole text each time.
+    {
+        phaseEl.textContent = "loading the rest of the log…";
+        let rest = "";
+        for (;;) {
+            let b;
+            try {
+                const r = await fetch(`/broker/op/${encodeURIComponent(opId)}/fulllog?from=${logFrom}`);
+                if (!r.ok) break;
+                b = await r.json();
+            } catch (e) { break; }
+            if (!b.ok || !b.exists || !b.data || b.next === logFrom) break;
+            rest += b.data;
+            logFrom = b.next;
+        }
+        if (rest) { pre.textContent += rest; pre.scrollTop = pre.scrollHeight; }
+    }
     if (interrupted) {
         phaseEl.textContent = "interrupted";
         failEl.textContent = "Interrupted — the process stopped without finishing. Check the log above.";
@@ -5813,14 +6113,15 @@ function mgmtBuildDialog(view, cfg) {
             go.disabled = false; cancel.disabled = false; go.textContent = cfg.confirmLabel;
             errEl.textContent = "Broker unreachable."; return;
         }
-        const redirect = mgmtStatusRedirect(view, res.status);
+        const redirect = mgmtStatusRedirect(view, res.status, renderSoftwareInto);
         if (redirect) { backdrop.remove(); return redirect(); }
         let body; try { body = await res.json(); } catch (e) { body = {}; }
         if (!body.ok || !body.op_id) {
             go.disabled = false; cancel.disabled = false; go.textContent = cfg.confirmLabel;
             errEl.textContent = "Failed: " + mgmtErrText(body); return;
         }
-        await mgmtTailBuildLog(view, backdrop, card, body.op_id, cfg.tailTitle || cfg.title);
+        await softwareTail(view, backdrop, card, body.op_id, cfg.tailTitle || cfg.title,
+                           swTarget(cfg.payload.verb, cfg.payload.agent), cfg.payload);
     };
     backdrop.appendChild(card);
     document.body.appendChild(backdrop);
@@ -5853,18 +6154,42 @@ async function mgmtRefreshDialog(view, cfg) {
         bodyEl.appendChild(closeRow());
     };
 
+    // The check runs on the broker's one request slot for a few seconds; the
+    // box can be closed meanwhile. A closed check's reply is dropped, and the
+    // row's Refresh stays off until it arrives (no second check stacks behind).
+    const target = swTarget(cfg.buildPayload.verb, cfg.buildPayload.agent);
+    let closed = false;
+    const closeCheck = el("button", { class: "btn btn-secondary" }, ["Close"]);
+    closeCheck.onclick = () => {
+        closed = true;
+        backdrop.remove();
+        softwareChecking.add(target);
+        paintSoftwareLabels();
+    };
     bodyEl.appendChild(el("p", { class: "mgmt-loading" }, ["Checking upstream…"]));
-    let res;
+    bodyEl.appendChild(el("div", { class: "btn-row" }, [closeCheck]));
+    let res, body;
     try {
         res = await fetch("/broker/software/refresh-check", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(cfg.checkPayload),
         });
-    } catch (e) { fail("Broker unreachable."); return backdrop; }
-    const redirect = mgmtStatusRedirect(view, res.status);
+        try { body = await res.json(); } catch (e) { body = {}; }
+    } catch (e) { res = null; }
+    if (softwareChecking.delete(target) && !softwareInFlight.has(target)) {
+        for (const row of document.querySelectorAll("[data-swtarget]")) {
+            // A finished row keeps its buttons off until the page is redrawn.
+            if (row.getAttribute("data-swtarget") !== target
+                    || row.getAttribute("data-swfinished")) continue;
+            const b = row.querySelector(".sw-refresh-btn");
+            if (b) { b.disabled = false; b.title = ""; }
+        }
+    }
+    if (closed) return null;
+    if (res === null) { fail("Broker unreachable."); return backdrop; }
+    const redirect = mgmtStatusRedirect(view, res.status, renderSoftwareInto);
     if (redirect) { backdrop.remove(); return redirect(); }
-    let body; try { body = await res.json(); } catch (e) { body = {}; }
     if (!body.ok || !body.result) {
         fail("Could not resolve upstream: " + mgmtErrText(body)); return backdrop;
     }
@@ -5940,11 +6265,12 @@ async function mgmtRefreshDialog(view, cfg) {
                 body: JSON.stringify(cfg.buildPayload),
             });
         } catch (e) { reset(); errEl.textContent = "Broker unreachable."; return; }
-        const rd = mgmtStatusRedirect(view, r.status);
+        const rd = mgmtStatusRedirect(view, r.status, renderSoftwareInto);
         if (rd) { backdrop.remove(); return rd(); }
         let b; try { b = await r.json(); } catch (e) { b = {}; }
         if (!b.ok || !b.op_id) { reset(); errEl.textContent = "Failed: " + mgmtErrText(b); return; }
-        await mgmtTailBuildLog(view, backdrop, card, b.op_id, cfg.tailTitle || cfg.title);
+        await softwareTail(view, backdrop, card, b.op_id, cfg.tailTitle || cfg.title,
+                           target, cfg.buildPayload);
     };
     bodyEl.appendChild(el("div", { class: "btn-row" }, [cancel, go]));
     bodyEl.appendChild(errEl);

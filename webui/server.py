@@ -1007,6 +1007,16 @@ async def broker_lifecycle_handler(request: web.Request) -> web.Response:
     return web.json_response(body, status=status)
 
 
+async def broker_software_active_handler(request: web.Request) -> web.Response:
+    """GET /broker/software/active — every software build in flight on the
+    broker's build lane, {ops:[{op_id, verb, target, agent?, state}]} (gated).
+    The Software page seeds its "pulling…" / "queued…" labels and background
+    watchers from this after a reload, so the in-flight view does not depend on
+    a page's memory. SameSite=Strict cookie is the CSRF defense for this read."""
+    status, body = await _relay(request, "build_active")
+    return web.json_response(body, status=status)
+
+
 async def broker_box_add_handler(request: web.Request) -> web.Response:
     """POST /broker/project/{name}/box {name?,preset?,agent?,editor?,fetch?,
     mcps?,repo?,ref?,setup?} — add a box to a running dind project (gated,
@@ -3598,6 +3608,7 @@ def main() -> None:
     app.router.add_get("/broker/projects", broker_projects_handler)
     app.router.add_get("/broker/host-stats", broker_host_stats_handler)
     app.router.add_get("/broker/lifecycle", broker_lifecycle_handler)
+    app.router.add_get("/broker/software/active", broker_software_active_handler)
     app.router.add_get("/broker/workflows", broker_workflows_handler)
     app.router.add_get("/broker/models", broker_models_handler)
     app.router.add_post("/broker/models/default", broker_models_default_handler)

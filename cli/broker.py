@@ -120,13 +120,24 @@ _OP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 # that, for this closed verb set, is certainly malformed.
 MAX_REQUEST_BYTES = 64 * 1024
 
-# The build lock (host-only, NOT under run/) serialises the build lane: one
-# agent-pull / editor-pull / fleet-rebuild at a time. It records the detached
-# child's pid so a second request tells a LIVE build from a crashed one
-# (stale-pid recovery — a dead pid is reclaimable). Content: {pid, op_id, verb}.
-# ONE path, rscore's: an agent update (rscore, which cannot import broker)
-# reads this lock to refuse while an agent download is being built.
+# The build lane (software pulls / refreshes / the fleet rebuild) runs one build
+# at a time; a later one waits its turn. Three host-only files, never under run/:
+#   * BUILD_LOCK — the HOLDER {pid, op_id, verb} of the build that is RUNNING.
+#     The child writes it with its own pid once it holds the queue flock and
+#     clears it (only if it still names its op) before releasing the flock.
+#     ONE path, rscore's: an agent update (rscore, which cannot import broker)
+#     reads it to refuse while an agent download is being built — a build that
+#     is only waiting never appears in it.
+#   * BUILD_LOCKS_DIR — one {pid, verb, target, agent?} file per op, written by
+#     the PARENT after a successful spawn and unlinked by the child's finally.
+#     It is what makes a build "in flight" (waiting or running) for the
+#     same-target refusal, build_active and build_alive.
+#   * BUILD_QUEUE_LOCK — the host-wide flock a build child BLOCKS on (that wait
+#     is the queue). The kernel drops it when its holder dies, so a hard-killed
+#     build can never wedge the builds behind it.
 BUILD_LOCK = rscore.BUILD_LOCK_PATH
+BUILD_LOCKS_DIR = BROKER_DIR / "build-locks"
+BUILD_QUEUE_LOCK = BROKER_DIR / "build-queue.lock"
 
 # The argv marker each detached lane child carries (`research.py broker <marker>
 # <op_id> …`). The spawn puts it there and the liveness check reads it back from
@@ -137,9 +148,9 @@ _REVIEW_CHILD_ARG = "__run-review"
 _DEV_BOX_CHILD_ARG = "__run-dev-box"
 
 # Per-op liveness markers for the PARALLEL review lane (STAGE_DEV_GITEA S4).
-# Reviews deliberately do NOT share BUILD_LOCK (they run N-at-a-time by PI
-# decision, and run_build's finally releases the GLOBAL lock — a review riding
-# that lane would unlink a concurrent build's lock). One {pid} file per op_id,
+# Reviews deliberately do NOT ride the build lane (they run N-at-a-time by PI
+# decision, and the build lane runs one build at a time — a review there would
+# wait behind every build). One {pid} file per op_id,
 # written by the PARENT after a successful spawn, unlinked by the child's
 # finally — build_alive covers review ops through these. Host-only, never
 # under run/ (same reasoning as BUILD_LOCK).
@@ -470,8 +481,8 @@ def _verb_op_full_tail(args: dict, _progress=None) -> dict:
 
 
 def _verb_build_alive(args: dict, _progress=None) -> dict:
-    """Token-gated liveness probe for a build op: {alive:true} iff the build lock
-    holds THIS op_id and its pid is a running build child for it. The
+    """Token-gated liveness probe for a build op: {alive:true} iff THIS op's
+    per-op build lock names a live build child for it (waiting or running). The
     terminal-first build tail has no other liveness signal, so a child
     hard-killed (OOM / kill -9 / power-loss) before its finally writes a
     view-log terminal would wedge the browser modal forever; this
@@ -482,11 +493,9 @@ def _verb_build_alive(args: dict, _progress=None) -> dict:
     op_id = args.get("op_id")
     if not isinstance(op_id, str) or not _OP_ID_RE.match(op_id):
         raise rscore.ValidationError(f"op_id is not a safe basename: {op_id!r}")
-    holder = _build_lock_holder()
-    pid = holder.get("pid") if holder else None
-    alive = (holder is not None and holder.get("op_id") == op_id
-             and isinstance(pid, int)
-             and _lane_child_alive(pid, _BUILD_CHILD_ARG, op_id))
+    # A build op is alive while its child lives, waiting or running — a
+    # waiting build's tail must never read "interrupted".
+    alive = _build_op(op_id) is not None
     # Review + dev-box ops: the parallel lanes have no global lock — liveness
     # comes from the per-op lock files (same terminal-first property: the
     # children write done/fail before their finally unlinks the lock).
@@ -503,6 +512,16 @@ def _verb_lifecycle_active(_args: dict, _progress=None) -> dict:
     comes from the broker and not from a page's memory. A safe read (in VERBS,
     runs inline): tolerant of vanished/garbled lock files, never creates one."""
     return {"ops": _live_lifecycle_ops()}
+
+
+def _verb_build_active(_args: dict, _progress=None) -> dict:
+    """Token-gated read: every software build in flight on the build lane,
+    {op_id, verb, target, agent?, state: running|queued}, oldest first. The
+    browser seeds its "pulling…" / "queued…" labels from this after a reload,
+    so the in-flight view comes from the broker and not from a page's memory.
+    A safe read (in VERBS, runs inline): tolerant of vanished/garbled lock
+    files, never creates one."""
+    return {"ops": _live_build_ops()}
 
 
 # start/stop take ONLY the project name over the socket: `all` (every project
@@ -1085,6 +1104,7 @@ VERBS = {
     "op_full_tail": _verb_op_full_tail,
     "build_alive": _verb_build_alive,
     "lifecycle_active": _verb_lifecycle_active,
+    "build_active": _verb_build_active,
     # start / stop / update are NOT here: they run on the lifecycle lane
     # (LIFECYCLE_DISPATCH), so the inline path cannot hold the accept thread
     # for a supervisor recreate.
@@ -1161,10 +1181,11 @@ AUTH_VERBS = frozenset({"login", "logout"})
 # DELIBERATELY absent from VERBS: the inline-exec path (dispatch's `table.get`
 # over VERBS) physically cannot resolve a build verb, so no future edit can run a
 # build on the accept thread. dispatch's build branch is the sole entry — it
-# token-gates, validates, checks the lock, spawns a DETACHED child, and returns
-# started:true at once. The child (run_build) owns the op-log, points fd 1/2 at
-# the HOST-ONLY full log (the raw firehose the authenticated op_full_tail relays),
-# emits coarse view-log milestones, and always releases the lock.
+# token-gates, validates, refuses a second build of the same target, spawns a
+# DETACHED child, and returns started:true at once. The child (run_build) owns
+# the op-log, points fd 1/2 at the HOST-ONLY full log (the raw firehose the
+# authenticated op_full_tail relays), waits its turn on the build queue, emits
+# coarse view-log milestones, and always releases its locks.
 # ---------------------------------------------------------------------------
 
 # Only `agent` is browser-relayable (an enum); editor/rebuild take no args.
@@ -1236,9 +1257,12 @@ def _build_lock_holder() -> dict | None:
 
 
 def _build_in_progress() -> bool:
-    """True iff a build lock names a RUNNING build child for its op. A lock whose
-    child is dead, a zombie, or whose pid now belongs to another process is a
-    crashed child → stale → reclaimable (False)."""
+    """True iff the holder names a RUNNING build child for its op (a waiting
+    build is never the holder). A holder whose child is dead, a zombie, or
+    whose pid now belongs to another process is stale (False). No product path
+    calls this since the build queue (the same-target refusal reads the per-op
+    locks; an agent update reads the holder through rscore); it stays as the
+    broker-side read of the holder, which archived pins exercise."""
     holder = _build_lock_holder()
     if holder is None:
         return False
@@ -1258,12 +1282,131 @@ def _release_build_lock() -> None:
         BUILD_LOCK.unlink()
 
 
+def _clear_build_holder(op_id: str) -> None:
+    # Only our own record: the holder is written under the queue flock, which
+    # this child still holds, so nothing else can have replaced it meanwhile —
+    # but a child that never got the flock must not touch another build's.
+    holder = _build_lock_holder()
+    if isinstance(holder, dict) and holder.get("op_id") == op_id:
+        _release_build_lock()
+
+
+# What a build works on — the unit the same-target refusal keys on: a Pull and
+# a Refresh of one dist are the same work, different dists queue freely.
+_BUILD_TARGETS = {
+    "agent_pull": "agent", "agent_refresh": "agent",
+    "editor_pull": "editor", "editor_refresh": "editor",
+    "reader_pull": "reader", "reader_refresh": "reader",
+    "node_pull": "node",
+    "rebuild": "fleet",
+}
+# Browser-facing names for the refusal text.
+_BUILD_TARGET_NAMES = {"editor": "the editor download", "reader": "the reader download",
+                       "node": "the node runtime", "fleet": "the image fleet"}
+
+
+def _build_target(verb: str, args: dict) -> str:
+    base = _BUILD_TARGETS[verb]
+    if base == "agent":
+        # The same default the verb applies, so {} and {"agent": "claude"}
+        # are one target.
+        return f"agent:{args.get('agent', rscore.DEFAULT_AGENT)}"
+    return base
+
+
+def _build_target_name(target: str) -> str:
+    if target.startswith("agent:"):
+        return f"the {target[len('agent:'):]} agent download"
+    return _BUILD_TARGET_NAMES.get(target, target)
+
+
+def _build_op_lock_path(op_id: str) -> Path:
+    return BUILD_LOCKS_DIR / f"{op_id}.json"
+
+
+def _write_build_op_lock(op_id: str, pid: int, verb: str, target: str,
+                         agent: str | None) -> None:
+    BUILD_LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+    rec = {"pid": pid, "verb": verb, "target": target}
+    if agent is not None:
+        rec["agent"] = agent
+    _build_op_lock_path(op_id).write_text(json.dumps(rec))
+
+
+def _release_build_op_lock(op_id: str) -> None:
+    with contextlib.suppress(FileNotFoundError, OSError):
+        _build_op_lock_path(op_id).unlink()
+
+
+def _build_op(op_id: str) -> dict | None:
+    """This build op's lock record if it is in flight (its child is alive),
+    else None. Tolerant: a vanished, unreadable or garbled file reads as not
+    in flight."""
+    try:
+        rec = json.loads(_build_op_lock_path(op_id).read_text())
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+    if not isinstance(rec, dict):
+        return None
+    pid = rec.get("pid")
+    if not isinstance(pid, int) or not _lane_child_alive(pid, _BUILD_CHILD_ARG, op_id):
+        return None
+    return rec
+
+
+def _live_build_ops() -> list[dict]:
+    """Every build in flight, oldest first: {op_id, verb, target, agent?, state}.
+    A read — never creates the directory, never raises on a bad file."""
+    try:
+        found = list(BUILD_LOCKS_DIR.glob("*.json"))
+    except (FileNotFoundError, OSError):
+        return []
+    stamped = []
+    for path in found:
+        try:
+            stamped.append((path.stat().st_mtime, path))
+        except OSError:                           # finished between glob and stat
+            continue
+    holder = _build_lock_holder()
+    running = holder.get("op_id") if isinstance(holder, dict) else None
+    out = []
+    for _mtime, path in sorted(stamped):
+        op_id = path.name[: -len(".json")]
+        if not _OP_ID_RE.match(op_id):
+            continue
+        rec = _build_op(op_id)
+        if rec is None:
+            continue
+        op = {"op_id": op_id, "verb": rec.get("verb"), "target": rec.get("target"),
+              "state": "running" if running == op_id else "queued"}
+        if isinstance(rec.get("agent"), str):
+            op["agent"] = rec["agent"]
+        out.append(op)
+    return out
+
+
+def _prune_dead_build_locks() -> None:
+    """Drop per-op build lock files whose child is gone (a hard kill, or a child
+    that ended before the parent wrote its lock). Called only from the lane's
+    write path — reads never mutate."""
+    try:
+        paths = list(BUILD_LOCKS_DIR.glob("*.json"))
+    except (FileNotFoundError, OSError):
+        return
+    for path in paths:
+        op_id = path.name[: -len(".json")]
+        if _build_op(op_id) is None:
+            with contextlib.suppress(FileNotFoundError, OSError):
+                path.unlink()
+
+
 def _spawn_build_child(op_id: str, verb: str, args: dict) -> int:
     """Spawn the DETACHED build child (`broker __run-build`). Mirrors start()'s
     Popen: start_new_session=True so a SIGTERM to the daemon's process group (or a
     broker restart) doesn't kill an in-flight build; stdout/stderr → BROKER_LOG is
     only a startup backstop — run_build re-points fd 1/2 at its host-only full log
-    once it has an _OpLog. Returns the child pid the parent records in build.lock."""
+    once it has an _OpLog. Returns the child pid the parent records in the op's
+    per-op build lock."""
     BROKER_DIR.mkdir(parents=True, exist_ok=True)
     research_py = rscore.SCRIPT_DIR / "research.py"
     log = open(BROKER_LOG, "a")
@@ -1282,15 +1425,23 @@ def run_build(op_id: str, verb: str, args_json: str) -> None:
     """The DETACHED build child (invoked by `broker __run-build`). Owns the op-log
     for one build: points fd 1/2 at the HOST-ONLY full log (so docker build's
     inherited stdout/stderr + all prints stream there for the authenticated tail),
-    runs the build verb DIRECTLY from BUILD_DISPATCH (NEVER dispatch() — that would
-    re-hit the build branch and fork-bomb), writes a terminal done/fail to the
-    mounted view-log, and ALWAYS releases the lock. The view-log fail reason is a
+    waits its turn on the build queue flock (a `queue` milestone first when
+    another build holds it), marks itself the holder, runs the build verb
+    DIRECTLY from BUILD_DISPATCH (NEVER dispatch() — that would re-hit the build
+    branch and fork-bomb), writes a terminal done/fail to the mounted view-log,
+    and ALWAYS releases in the order terminal → op-log close → holder (only its
+    own) → per-op lock → flock, so a reader that sees the op gone could already
+    read its terminal. An unknown verb or an unwritable op-log releases only its own
+    per-op lock — never the holder, which belongs to whichever build runs. The view-log fail reason is a
     COARSE allowlist-safe token, NEVER str(exception) — a build error can carry a
     host path, and _Progress flushes straight to the mounted file; the raw detail's
     only home is the full log (already streamed via the fd redirect). A RAW
     exception prints nothing on its own, so its arm print_exc()s to that full log
     FIRST — without it a crashed child leaves an EMPTY log and is undiagnosable
     from the browser tail AND the host."""
+    if verb not in BUILD_DISPATCH:
+        _release_build_op_lock(op_id)
+        return
     try:
         args = json.loads(args_json)
     except ValueError:
@@ -1298,8 +1449,10 @@ def run_build(op_id: str, verb: str, args_json: str) -> None:
     try:
         op = make_oplog(op_id, verb, args)
     except (ValueError, OSError):
-        _release_build_lock()
+        _release_build_op_lock(op_id)
         return
+    lock_f = None
+    held = False
     try:
         # fd-level redirect: contextlib.redirect_stdout swaps only sys.stdout and
         # misses the subprocess's inherited OS fd 1/2, so use dup2 on the real fds,
@@ -1308,6 +1461,18 @@ def run_build(op_id: str, verb: str, args_json: str) -> None:
         os.dup2(op.full.fileno(), 2)
         sys.stdout = os.fdopen(1, "w", buffering=1, closefd=False)
         sys.stderr = os.fdopen(2, "w", buffering=1, closefd=False)
+        BROKER_DIR.mkdir(parents=True, exist_ok=True)
+        lock_f = open(BUILD_QUEUE_LOCK, "a")      # close-on-exec: no build subprocess inherits it
+        try:
+            fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            op.progress.step("queue", "waiting for another build to finish")
+            fcntl.flock(lock_f, fcntl.LOCK_EX)
+            # Its turn came: say so at once, so the "queued" label and the
+            # box's waiting line clear before the build's own first step.
+            op.progress.step("start", "starting")
+        held = True
+        _write_build_lock(os.getpid(), op_id, verb)
         BUILD_DISPATCH[verb](args, op.progress)
         op.progress.done()
     except rscore.ValidationError:
@@ -1323,7 +1488,11 @@ def run_build(op_id: str, verb: str, args_json: str) -> None:
         op.progress.fail("build failed")          # coarse token; detail is in the full log
     finally:
         op.close()
-        _release_build_lock()
+        if held:
+            _clear_build_holder(op_id)
+        _release_build_op_lock(op_id)
+        if lock_f is not None:
+            lock_f.close()                        # releases the flock
 
 
 # ---------------------------------------------------------------------------
@@ -1334,9 +1503,9 @@ def run_build(op_id: str, verb: str, args_json: str) -> None:
 # ephemeral locked containers and may run N-at-a-time (PI decision). review_pr
 # lives in its OWN table, absent from VERBS (the inline path structurally
 # cannot run a multi-minute review on the accept thread) AND absent from
-# BUILD_DISPATCH (that lane serialises on BUILD_LOCK, and run_build's finally
-# releases the GLOBAL lock — a review there would unlink a concurrent build's
-# lock). Per-op review-lock files give build_alive its liveness signal.
+# BUILD_DISPATCH (that lane runs one build at a time — a review there would
+# wait behind every build). Per-op review-lock files give build_alive its
+# liveness signal.
 # ---------------------------------------------------------------------------
 
 
@@ -1450,8 +1619,7 @@ def run_review(op_id: str, args_json: str) -> None:
 # A GitHub migrate can block ~120s and must never sit on the serial accept
 # thread, so both verbs live in their OWN table — absent from VERBS (the
 # inline path structurally cannot reach them), absent from BUILD_DISPATCH
-# (that lane serialises on the GLOBAL build.lock, which run_build's finally
-# releases unconditionally), absent from REVIEW_DISPATCH (that branch filters
+# (that lane runs one build at a time), absent from REVIEW_DISPATCH (that branch filters
 # review fields). Per-op locks give build_alive its liveness signal, exactly
 # like reviews. ONE deliberate deviation from the review-lane mirror: the
 # child args carry the per-repo GitHub PAT, so they ride the child's STDIN —
@@ -1964,10 +2132,11 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
 
     # Build lane — the SOLE entry for a build verb (BUILD_DISPATCH is absent from
     # VERBS, so the inline-exec path below can never reach one). Placed before the
-    # VERBS `table.get`: token-gate → op_id + pre-spawn arg validation → lock →
-    # spawn a DETACHED child → return started:true at once. The child owns the
-    # op-log and releases the lock; nothing here runs the build on the accept
-    # thread. Uses `verbs is None` so an alternate table passed by a test can't
+    # VERBS `table.get`: token-gate → op_id + pre-spawn arg validation →
+    # same-target refusal → spawn a DETACHED child → its per-op lock → return
+    # started:true at once. The child owns the op-log, waits its turn on the
+    # build queue and releases its locks; nothing here runs the build on the
+    # accept thread. Uses `verbs is None` so an alternate table passed by a test can't
     # accidentally re-route builds (the daemon always passes the real BUILD path).
     if verbs is None and verb in BUILD_DISPATCH:
         if not isinstance(args, dict):
@@ -1980,8 +2149,14 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
         if not isinstance(op_id, str) or not _OP_ID_RE.match(op_id):
             return _audited(principal, "bad_request",
                             _err("bad_request", "a valid op_id is required"))
+        # An op_id names this op's lock and logs; reusing one that is still in
+        # flight would overwrite them and hide the first build from every check.
+        if _build_op(op_id) is not None:
+            return _audited(principal, "bad_request",
+                            _err("bad_request", "this op_id is already in use"))
         # Pre-spawn arg validation: a bad agent must NOT spawn a child — the client
         # already holds started:true and would never see a child-side failure.
+        agent = None
         if verb in ("agent_pull", "agent_refresh"):
             agent = args.get("agent", rscore.DEFAULT_AGENT)
             if agent not in rscore.KNOWN_AGENTS:
@@ -1989,14 +2164,35 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
                                 _err("validation",
                                      f"unknown agent {agent!r} (known: "
                                      f"{', '.join(rscore.KNOWN_AGENTS)})"))
-        if _build_in_progress():
+        # Builds of DIFFERENT targets queue (the child waits on the flock); a
+        # second build of the same target, running or waiting, would only redo
+        # the same work, so it is refused.
+        target = _build_target(verb, args)
+        if any(op["target"] == target for op in _live_build_ops()):
             return _audited(principal, "busy",
-                            _err("busy", "a build is already running"))
+                            _err("busy", f"{_build_target_name(target)} is already "
+                                         "being built or is waiting its turn"))
         if spawn_build is None:              # tests: gate + validate, never spawn
             return _audited(principal, "ok",
                             {"ok": True, "result": {"op_id": op_id, "started": True}})
-        pid = spawn_build(op_id, verb, args)     # detached child
-        _write_build_lock(pid, op_id, verb)      # PARENT writes, in the serial section
+        _prune_dead_build_locks()
+        # strerror, never str(e): the latter carries a host path, and this
+        # message reaches the browser verbatim.
+        try:
+            pid = spawn_build(op_id, verb, args)     # detached child
+        except OSError as e:
+            return _audited(principal, "failed",
+                            _err("failed", f"could not start the build: {e.strerror or 'I/O error'}"))
+        try:
+            _write_build_op_lock(op_id, pid, verb, target, agent)   # PARENT, post-spawn
+        except OSError as e:
+            # A child with no lock file is invisible to every refusal and to the
+            # browser — never leave one running behind a "failed" reply. It is a
+            # session leader (start_new_session), so its group is its own.
+            with contextlib.suppress(OSError):
+                os.killpg(pid, signal.SIGKILL)
+            return _audited(principal, "failed",
+                            _err("failed", f"could not start the build: {e.strerror or 'I/O error'}"))
         return _audited(principal, "ok",
                         {"ok": True, "result": {"op_id": op_id, "started": True}})
 
