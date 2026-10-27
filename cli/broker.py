@@ -128,6 +128,14 @@ MAX_REQUEST_BYTES = 64 * 1024
 # reads this lock to refuse while an agent download is being built.
 BUILD_LOCK = rscore.BUILD_LOCK_PATH
 
+# The argv marker each detached lane child carries (`research.py broker <marker>
+# <op_id> …`). The spawn puts it there and the liveness check reads it back from
+# /proc, so one constant per lane keeps the two from drifting. The build marker
+# is rscore's, which an agent update reads through rscore.agent_build_running.
+_BUILD_CHILD_ARG = rscore._BUILD_CHILD_ARG.decode()
+_REVIEW_CHILD_ARG = "__run-review"
+_DEV_BOX_CHILD_ARG = "__run-dev-box"
+
 # Per-op liveness markers for the PARALLEL review lane (STAGE_DEV_GITEA S4).
 # Reviews deliberately do NOT share BUILD_LOCK (they run N-at-a-time by PI
 # decision, and run_build's finally releases the GLOBAL lock — a review riding
@@ -463,9 +471,10 @@ def _verb_op_full_tail(args: dict, _progress=None) -> dict:
 
 def _verb_build_alive(args: dict, _progress=None) -> dict:
     """Token-gated liveness probe for a build op: {alive:true} iff the build lock
-    holds THIS op_id with a LIVE pid. The terminal-first build tail has no other
-    liveness signal, so a child hard-killed (OOM / kill -9 / power-loss) before its
-    finally writes a view-log terminal would wedge the browser modal forever; this
+    holds THIS op_id and its pid is a running build child for it. The
+    terminal-first build tail has no other liveness signal, so a child
+    hard-killed (OOM / kill -9 / power-loss) before its finally writes a
+    view-log terminal would wedge the browser modal forever; this
     lets the tail detect that and stop. A safe read (in VERBS, runs inline). NB:
     run_build writes the terminal BEFORE releasing the lock, so a normal finish is
     seen as a terminal first — alive:false only ever means 'no longer running',
@@ -476,7 +485,8 @@ def _verb_build_alive(args: dict, _progress=None) -> dict:
     holder = _build_lock_holder()
     pid = holder.get("pid") if holder else None
     alive = (holder is not None and holder.get("op_id") == op_id
-             and isinstance(pid, int) and _alive(pid))
+             and isinstance(pid, int)
+             and _lane_child_alive(pid, _BUILD_CHILD_ARG, op_id))
     # Review + dev-box ops: the parallel lanes have no global lock — liveness
     # comes from the per-op lock files (same terminal-first property: the
     # children write done/fail before their finally unlinks the lock).
@@ -1226,13 +1236,16 @@ def _build_lock_holder() -> dict | None:
 
 
 def _build_in_progress() -> bool:
-    """True iff a build lock is held by a LIVE process. A lock whose pid is dead
-    is a crashed child → stale → reclaimable (False)."""
+    """True iff a build lock names a RUNNING build child for its op. A lock whose
+    child is dead, a zombie, or whose pid now belongs to another process is a
+    crashed child → stale → reclaimable (False)."""
     holder = _build_lock_holder()
     if holder is None:
         return False
     pid = holder.get("pid")
-    return isinstance(pid, int) and _alive(pid)
+    op_id = holder.get("op_id")
+    return (isinstance(pid, int) and isinstance(op_id, str)
+            and _lane_child_alive(pid, _BUILD_CHILD_ARG, op_id))
 
 
 def _write_build_lock(pid: int, op_id: str, verb: str) -> None:
@@ -1256,7 +1269,7 @@ def _spawn_build_child(op_id: str, verb: str, args: dict) -> int:
     log = open(BROKER_LOG, "a")
     try:
         proc = subprocess.Popen(
-            [sys.executable, str(research_py), "broker", "__run-build",
+            [sys.executable, str(research_py), "broker", _BUILD_CHILD_ARG,
              op_id, verb, json.dumps(args)],
             stdout=log, stderr=log, start_new_session=True,
             cwd=str(rscore.SCRIPT_DIR))
@@ -1354,14 +1367,15 @@ def _release_review_lock(op_id: str) -> None:
 
 
 def _review_lock_alive(op_id: str) -> bool:
-    """True iff this op's review lock holds a LIVE pid (a dead pid is a crashed
-    child — reads as not-alive, the wedge-escape signal)."""
+    """True iff this op's review lock names a RUNNING review child for this op
+    (a dead, zombie or reused pid is a crashed child — reads as not-alive, the
+    wedge-escape signal)."""
     try:
         holder = json.loads(_review_lock_path(op_id).read_text())
     except (FileNotFoundError, ValueError, OSError):
         return False
     pid = holder.get("pid") if isinstance(holder, dict) else None
-    return isinstance(pid, int) and _alive(pid)
+    return isinstance(pid, int) and _lane_child_alive(pid, _REVIEW_CHILD_ARG, op_id)
 
 
 def _spawn_review_child(op_id: str, args: dict) -> int:
@@ -1374,7 +1388,7 @@ def _spawn_review_child(op_id: str, args: dict) -> int:
     log = open(BROKER_LOG, "a")
     try:
         proc = subprocess.Popen(
-            [sys.executable, str(research_py), "broker", "__run-review",
+            [sys.executable, str(research_py), "broker", _REVIEW_CHILD_ARG,
              op_id, json.dumps(args)],
             stdout=log, stderr=log, start_new_session=True,
             cwd=str(rscore.SCRIPT_DIR))
@@ -1493,14 +1507,15 @@ def _release_dev_box_lock(op_id: str) -> None:
 
 
 def _dev_box_lock_alive(op_id: str) -> bool:
-    """True iff this op's dev-box lock holds a LIVE pid (mirrors
-    _review_lock_alive — a dead pid reads as not-alive, the wedge-escape)."""
+    """True iff this op's dev-box lock names a RUNNING dev-box child for this op
+    (mirrors _review_lock_alive — a dead, zombie or reused pid reads as
+    not-alive, the wedge-escape)."""
     try:
         holder = json.loads(_dev_box_lock_path(op_id).read_text())
     except (FileNotFoundError, ValueError, OSError):
         return False
     pid = holder.get("pid") if isinstance(holder, dict) else None
-    return isinstance(pid, int) and _alive(pid)
+    return isinstance(pid, int) and _lane_child_alive(pid, _DEV_BOX_CHILD_ARG, op_id)
 
 
 def _spawn_dev_box_child(op_id: str, verb: str, args: dict) -> int:
@@ -1519,7 +1534,7 @@ def _spawn_dev_box_child(op_id: str, verb: str, args: dict) -> int:
     log = open(BROKER_LOG, "a")
     try:
         proc = subprocess.Popen(
-            [sys.executable, str(research_py), "broker", "__run-dev-box",
+            [sys.executable, str(research_py), "broker", _DEV_BOX_CHILD_ARG,
              op_id, verb],
             stdin=subprocess.PIPE, stdout=log, stderr=log,
             start_new_session=True, cwd=str(rscore.SCRIPT_DIR))
@@ -1658,8 +1673,10 @@ def _release_lifecycle_lock(op_id: str) -> None:
         _lifecycle_lock_path(op_id).unlink()
 
 
-def _lifecycle_child_alive(pid: int, op_id: str) -> bool:
-    """True iff `pid` is a RUNNING lane child for THIS op. A bare `kill(pid, 0)`
+def _lane_child_alive(pid: int, child_arg: str, op_id: str) -> bool:
+    """True iff `pid` is a RUNNING lane child for THIS op, on the lane whose
+    argv marker is `child_arg` (build, review, dev-box and lifecycle children
+    all carry `<marker> <op_id>` on their command line). A bare `kill(pid, 0)`
     is not enough here: the daemon never waits on its lane children, so a
     hard-killed one lingers as a zombie (which `kill` still reaches) until the
     daemon next spawns something, and after a reboot a leftover lock can name a
@@ -1675,7 +1692,11 @@ def _lifecycle_child_alive(pid: int, op_id: str) -> bool:
     except OSError:
         return _alive(pid)
     argv = raw.split(b"\0")
-    return (_LIFECYCLE_CHILD_ARG.encode() in argv) and (op_id.encode() in argv)
+    return (child_arg.encode() in argv) and (op_id.encode() in argv)
+
+
+def _lifecycle_child_alive(pid: int, op_id: str) -> bool:
+    return _lane_child_alive(pid, _LIFECYCLE_CHILD_ARG, op_id)
 
 
 def _lifecycle_op(op_id: str) -> dict | None:
