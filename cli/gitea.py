@@ -49,7 +49,7 @@ from typing import Any
 GITEA_CONTAINER = "rs-gitea"
 GITEA_INNER_PORT = "3000"
 GITEA_DATA_VOLUME = "rs-gitea-data"
-DEFAULT_GITEA_VERSION = "1.25.1"
+DEFAULT_GITEA_VERSION = "28.2.0"
 DEFAULT_GITEA_HOST_PORT = "3000"
 
 DEV_DIR = Path.home() / ".research-sandbox" / "dev"

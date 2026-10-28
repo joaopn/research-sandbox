@@ -8853,6 +8853,85 @@ def _connect_registry_to_project_network(network: str) -> None:
 # Shared rs-gitea (STAGE_DEV_GITEA S1) — the dev lane's registry-pattern sibling
 # ---------------------------------------------------------------------------
 
+# A Gitea version as it may appear in a pin: dotted digits only. It becomes part
+# of an image reference and a container label, so nothing else gets through.
+_GITEA_VERSION_RE = re.compile(r"\d+(?:\.\d+)*")
+
+# The first Gitea release whose egress settings moved: `[migrations]
+# ALLOWED_DOMAINS` and `[webhook] ALLOWED_HOST_LIST` became deprecated
+# fallbacks, and the webhook allowlist stopped restricting PUBLIC hosts unless
+# `[security] EGRESS_MODE = strict` is set (measured: a webhook to a non-GitHub
+# host is blocked by 1.25.1 and delivered by 28.2.0 under the old settings).
+GITEA_EGRESS_SETTINGS_VERSION = "28"
+
+# The container label naming the gitea release it runs — set at `docker run`.
+GITEA_VERSION_LABEL = "research.gitea.version"
+
+
+def _gitea_pinned_version(pins: dict[str, str]) -> str:
+    """The Gitea version the pins ask for, validated before it reaches docker."""
+    version = pins.get("GITEA_VERSION", gitea.DEFAULT_GITEA_VERSION)
+    if not _GITEA_VERSION_RE.fullmatch(version):
+        die(f"GITEA_VERSION {version!r} is not a version number")
+    return version
+
+
+def _gitea_env(version: str) -> dict[str, str]:
+    """The environment every gitea `docker run` gets, for that gitea VERSION.
+
+    The egress allowlists are a lockstep with the version: on a release older
+    than GITEA_EGRESS_SETTINGS_VERSION the new setting names mean nothing (the
+    migration restriction would silently disappear), and on a newer one the old
+    names leave webhooks free to reach any public host."""
+    env = {
+        "INSTALL_LOCK": "true",
+        "GITEA__service__DISABLE_REGISTRATION": "true",
+        "GITEA__service__REQUIRE_SIGNIN_VIEW": "true",
+        "GITEA__server__DISABLE_SSH": "true",
+        "GITEA__server__ROOT_URL": f"http://{gitea.GITEA_CONTAINER}:{gitea.GITEA_INNER_PORT}/",
+    }
+    # GitHub migration hits api.github.com (metadata) + codeload.github.com
+    # (archives) besides github.com (clone), so allow the apex + its
+    # subdomains — still tight (SSRF-guarded to GitHub only).
+    migrate_hosts = "github.com,*.github.com"
+    if _version_older(version, GITEA_EGRESS_SETTINGS_VERSION):
+        env["GITEA__migrations__ALLOWED_DOMAINS"] = migrate_hosts
+        env["GITEA__webhook__ALLOWED_HOST_LIST"] = "github.com"
+    else:
+        env["GITEA__migrations__ALLOWED_HOST_LIST"] = migrate_hosts
+        env["GITEA__migrations__EGRESS_MODE"] = "strict"
+        env["GITEA__security__ALLOWED_HOST_LIST"] = "github.com"
+        env["GITEA__security__EGRESS_MODE"] = "strict"
+    return env
+
+
+def _run_gitea_container(image: str, volume: str, version: str,
+                         host_port: str) -> None:
+    """`docker run` the shared gitea on ``volume``. The one place the container's
+    shape is decided, so every creator produces the same container. The version
+    label is what status reads to name the running release."""
+    cmd = [
+        "docker", "run", "-d",
+        "--name", gitea.GITEA_CONTAINER,
+        "--network", ROUTER_NETWORK,
+        "--restart", "unless-stopped",
+        "--label", f"{GITEA_VERSION_LABEL}={version}",
+        "-p", f"127.0.0.1:{host_port}:{gitea.GITEA_INNER_PORT}",
+        "-v", f"{volume}:/data",
+    ]
+    for k, v in _gitea_env(version).items():
+        cmd += ["-e", f"{k}={v}"]
+    cmd.append(image)
+    r = run(cmd, capture_output=True)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip()
+        if "already allocated" in err or "address already in use" in err:
+            die(f"host port {host_port} is already in use; set GITEA_HOST_PORT "
+                f"in versions.env to a free port and retry. (docker: "
+                f"{err[-200:]})")
+        die(f"failed to start {gitea.GITEA_CONTAINER}: {err[-300:]}")
+
+
 def _provision_gitea(progress=None) -> None:
     """Provision the shared Gitea on rs-sandbox — the DELIBERATE Enable action,
     and the SOLE creator (deliberate-create / auto-resume model). Triad: running
@@ -8887,42 +8966,13 @@ def _provision_gitea(progress=None) -> None:
         progress.step("start", "starting gitea")
         run_check(["docker", "start", gitea.GITEA_CONTAINER])
     else:
-        image = "gitea/gitea:" + pins.get("GITEA_VERSION", gitea.DEFAULT_GITEA_VERSION)
+        version = _gitea_pinned_version(pins)
+        image = "gitea/gitea:" + version
         progress.step("pull", "pulling the gitea image")
         if not run_quiet(["docker", "image", "inspect", image]):
             print(f"pulling {image}...")
             run_check(["docker", "pull", image])
-        env = {
-            "INSTALL_LOCK": "true",
-            "GITEA__service__DISABLE_REGISTRATION": "true",
-            "GITEA__service__REQUIRE_SIGNIN_VIEW": "true",
-            # GitHub migration hits api.github.com (metadata) + codeload.github.com
-            # (archives) besides github.com (clone), so allow the apex + its
-            # subdomains — still tight (SSRF-guarded to GitHub only).
-            "GITEA__migrations__ALLOWED_DOMAINS": "github.com,*.github.com",
-            "GITEA__webhook__ALLOWED_HOST_LIST": "github.com",
-            "GITEA__server__DISABLE_SSH": "true",
-            "GITEA__server__ROOT_URL": f"http://{gitea.GITEA_CONTAINER}:{gitea.GITEA_INNER_PORT}/",
-        }
-        cmd = [
-            "docker", "run", "-d",
-            "--name", gitea.GITEA_CONTAINER,
-            "--network", ROUTER_NETWORK,
-            "--restart", "unless-stopped",
-            "-p", f"127.0.0.1:{host_port}:{gitea.GITEA_INNER_PORT}",
-            "-v", f"{gitea.GITEA_DATA_VOLUME}:/data",
-        ]
-        for k, v in env.items():
-            cmd += ["-e", f"{k}={v}"]
-        cmd.append(image)
-        r = run(cmd, capture_output=True)
-        if r.returncode != 0:
-            err = (r.stderr or r.stdout or "").strip()
-            if "already allocated" in err or "address already in use" in err:
-                die(f"host port {host_port} is already in use; set GITEA_HOST_PORT "
-                    f"in versions.env to a free port and retry. (docker: "
-                    f"{err[-200:]})")
-            die(f"failed to start {gitea.GITEA_CONTAINER}: {err[-300:]}")
+        _run_gitea_container(image, gitea.GITEA_DATA_VOLUME, version, host_port)
         print(f"started {gitea.GITEA_CONTAINER} (shared dev gitea on "
               f"{ROUTER_NETWORK})")
     # We just started (or created) the container: its app is NOT serving the
