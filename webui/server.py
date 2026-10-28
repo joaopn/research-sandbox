@@ -1589,6 +1589,67 @@ async def broker_dev_review_handler(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "op_id": op_id})
 
 
+async def broker_dev_gitea_upgrade_handler(request: web.Request) -> web.Response:
+    """POST /broker/dev/gitea-upgrade {passphrase, proof} — upgrade the shared
+    Gitea to the shipped release (gated, origin-checked, STEP-UP). Minutes of
+    work, so it runs on the broker's detached dev lane: the broker_dev_box_handler
+    shape — mint an op_id, relay synchronously (the broker spawns and returns at
+    once), hand back {op_id} for the terminal-first log tail. The passphrase is a
+    SECRET: it rides this body and the broker envelope only (no _start_op, so no
+    OP_RUNS copy, never a log). `proof` is forwarded explicitly — this handler
+    hand-picks its args, and a dropped proof reads as a wrong password."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    s = _broker_session(request)
+    if s is None:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    args = {"passphrase": body.get("passphrase"), "proof": body.get("proof")}
+    op_id = _mint_op_id("dev-gitea", "upgrade")
+    try:
+        reply = await broker_call("dev_gitea_upgrade", args,
+                                  token=s["broker_token"], op_id=op_id,
+                                  timeout=BROKER_CALL_TIMEOUT_S)
+    except BrokerUnavailable:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "broker_unavailable"}}, status=503)
+    except BrokerForbidden:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "forbidden"}}, status=403)
+    if (not reply.get("ok")
+            and reply.get("error", {}).get("kind") == "unauthorized"):
+        BROKER_SESSIONS.pop(request.cookies.get(BROKER_COOKIE), None)
+        return web.json_response(
+            {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+    if not reply.get("ok"):
+        return web.json_response(reply, status=200)   # refusal → app error
+    return web.json_response({"ok": True, "op_id": op_id})
+
+
+async def broker_dev_gitea_discard_previous_handler(request: web.Request) -> web.Response:
+    """POST /broker/dev/gitea-discard-previous {proof} — delete the Gitea release
+    kept after an upgrade, with its data and pre-upgrade backup (gated,
+    origin-checked, STEP-UP). Mints an op for the confirm-and-tail dialog, whose
+    only success path needs an op_id (the board-discard precedent)."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    args = {"proof": body.get("proof")}
+    return await _start_op(request, "dev_gitea_discard_previous", args,
+                           BROKER_OP_TIMEOUT_S, op_seed="dev-gitea")
+
+
 async def broker_dev_box_handler(request: web.Request) -> web.Response:
     """POST /broker/project/{name}/dev-box {url, pat?, name?, agent?, editor?} —
     provision a dev box from a GitHub URL (mirror+fork+attach+create as ONE
@@ -3653,6 +3714,10 @@ def main() -> None:
     app.router.add_post("/broker/dev/fetch-enabled",
                         broker_dev_fetch_enabled_handler)
     app.router.add_post("/broker/dev/gitea-start", broker_dev_gitea_start_handler)
+    app.router.add_post("/broker/dev/gitea-upgrade",
+                        broker_dev_gitea_upgrade_handler)
+    app.router.add_post("/broker/dev/gitea-discard-previous",
+                        broker_dev_gitea_discard_previous_handler)
     app.router.add_post("/broker/dev/passwd", broker_dev_passwd_handler)
     app.router.add_get("/broker/dev/board-export",
                        broker_dev_board_export_status_handler)

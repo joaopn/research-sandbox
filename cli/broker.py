@@ -101,7 +101,7 @@ PROGRESS_VERBS = frozenset({"create", "update", "destroy", "start", "stop",
                             "box_add", "box_remove", "dev_gitea_start",
                             "dev_passwd", "dev_repo_remove",
                             "dev_purge_consumer", "dev_board_export",
-                            "dev_board_discard"})
+                            "dev_board_discard", "dev_gitea_discard_previous"})
 
 # op_id names a file, so it is validated as a safe basename before it ever does:
 # first char alnum, rest alnum/dot/dash/underscore — no path separator, no
@@ -1089,6 +1089,14 @@ def _verb_dev_board_discard(args: dict, progress=None) -> dict:
     return dataclasses.asdict(rscore.dev_board_discard(req, progress))
 
 
+def _verb_dev_gitea_discard_previous(_args: dict, progress=None) -> dict:
+    # Remove the Gitea release kept after an upgrade: its container, its data,
+    # the backup taken just before the upgrade. STEP-UP gated — it deletes the
+    # only way back. A progress verb, so the confirm dialog has an op to tail.
+    req = rscore.DevGiteaDiscardPreviousRequest.from_kwargs()
+    return dataclasses.asdict(rscore.dev_gitea_discard_previous(req, progress))
+
+
 # The closed lifecycle vocabulary — the host-root boundary. Adding a verb here
 # is a deliberate, security-reviewed edit; never a docker passthrough.
 VERBS = {
@@ -1138,6 +1146,7 @@ VERBS = {
     "dev_board_export": _verb_dev_board_export,
     "dev_board_status": _verb_dev_board_status,
     "dev_board_discard": _verb_dev_board_discard,
+    "dev_gitea_discard_previous": _verb_dev_gitea_discard_previous,
     # NOTE: there is deliberately NO dev_board_import. Restoring is destructive
     # enough that it stays a host-side act; deny-by-default does the enforcing —
     # a verb absent from this table is unreachable through dispatch's table.get.
@@ -1150,7 +1159,8 @@ VERBS = {
 # soft-delete + rate-limit land before the webui is exposed beyond localhost).
 STEP_UP_VERBS = frozenset({"destroy", "box_remove", "dev_repo_remove",
                            "dev_passwd", "dev_purge_consumer",
-                           "dev_board_export", "dev_board_discard"})
+                           "dev_board_export", "dev_board_discard",
+                           "dev_gitea_upgrade", "dev_gitea_discard_previous"})
 
 # Deny-by-default gating: a verb in VERBS but NOT in this read allowlist
 # requires a valid session token. Inverting the set (vs an explicit *gated*
@@ -1641,6 +1651,18 @@ def _verb_dev_project_provision(args: dict, progress=None) -> dict:
     return rscore.dev_project_provision(req, progress)
 
 
+# The upgrade's one browser field: the passphrase for the backup it takes
+# first. The step-up proof is read by dispatch BEFORE this filter and never
+# reaches the child.
+DEV_GITEA_UPGRADE_WEBUI_FIELDS = frozenset({"passphrase"})
+
+
+def _verb_dev_gitea_upgrade(args: dict, progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in DEV_GITEA_UPGRADE_WEBUI_FIELDS}
+    req = rscore.DevGiteaUpgradeRequest.from_kwargs(**safe)  # may raise ValidationError
+    return dataclasses.asdict(rscore.dev_gitea_upgrade(req, progress))
+
+
 # The lane's SINGLE source of truth: verb → (webui field allowlist, request
 # class for the dispatch-side PRE-SPAWN shape validation, verb fn the child
 # executes). DEV_BOX_DISPATCH is DERIVED below so the two key sets cannot
@@ -1654,7 +1676,20 @@ _DEV_LANE_VERBS = {
     "dev_project_provision": (
         DEV_PROJECT_WEBUI_FIELDS, rscore.DevProjectProvisionRequest,
         _verb_dev_project_provision),
+    # Upgrading the shared gitea: minutes of work (a backup, a copy, a
+    # migration), so it runs detached; the passphrase travels on stdin.
+    "dev_gitea_upgrade": (
+        DEV_GITEA_UPGRADE_WEBUI_FIELDS, rscore.DevGiteaUpgradeRequest,
+        _verb_dev_gitea_upgrade),
 }
+
+# Lane verbs whose failure text is written for the operator and carries no host
+# path by construction (their ValidationError and HarnessError.log_msg texts),
+# so the view log shows it instead of the lane's coarse token. The upgrade's
+# operator needs to know whether Gitea is back or down; "failed" says neither.
+_DEV_LANE_OPERATOR_TEXT = frozenset({"dev_gitea_upgrade"})
+# The coarse token a lane verb's unexpected failure shows; provisions keep theirs.
+_DEV_LANE_FAIL_TOKEN = {"dev_gitea_upgrade": "upgrade failed"}
 
 # The child-only vocabulary — NOT in VERBS / BUILD_DISPATCH / REVIEW_DISPATCH.
 DEV_BOX_DISPATCH = {v: spec[2] for v, spec in _DEV_LANE_VERBS.items()}
@@ -1664,9 +1699,80 @@ def _dev_box_lock_path(op_id: str) -> Path:
     return DEV_BOX_LOCKS_DIR / f"{op_id}.json"
 
 
-def _write_dev_box_lock(op_id: str, pid: int) -> None:
+def _write_dev_box_lock(op_id: str, pid: int, verb: str = "") -> None:
+    # The verb is recorded so the Gitea gate can see an upgrade from its spawn,
+    # before its child reaches the gitea lock.
     DEV_BOX_LOCKS_DIR.mkdir(parents=True, exist_ok=True)
-    _dev_box_lock_path(op_id).write_text(json.dumps({"pid": pid}))
+    _dev_box_lock_path(op_id).write_text(json.dumps({"pid": pid, "verb": verb}))
+
+
+def _live_dev_lane_ops() -> list[dict]:
+    """Every dev-lane op whose child is alive: [{op_id, verb}]."""
+    out = []
+    try:
+        names = sorted(DEV_BOX_LOCKS_DIR.glob("*.json"))
+    except OSError:
+        return out
+    for path in names:
+        op_id = path.stem
+        if not _dev_box_lock_alive(op_id):
+            continue
+        try:
+            verb = json.loads(path.read_text()).get("verb") or ""
+        except (OSError, ValueError, AttributeError):
+            verb = ""
+        out.append({"op_id": op_id, "verb": verb})
+    return out
+
+
+def _live_review_ops() -> list[str]:
+    """The op_ids of every review whose child is alive."""
+    try:
+        names = sorted(REVIEW_LOCKS_DIR.glob("*.json"))
+    except OSError:
+        return []
+    return [p.stem for p in names if _review_lock_alive(p.stem)]
+
+
+# Actions that touch gitea and are refused while an upgrade or a restore holds
+# it: they would stop, start, write to or read from a gitea whose data is being
+# moved. Applied at every dispatch site that can reach them (inline, the dev
+# lane, the review lane, the lifecycle lane).
+_GITEA_GATED_VERBS = frozenset({
+    "create", "destroy", "box_add", "box_remove",
+    "dev_repo_remove", "dev_purge_consumer", "dev_passwd",
+    "dev_set_active_fork", "dev_sync", "dev_attach", "dev_detach",
+    "dev_board_export", "dev_gitea_start",
+    "dev_box_provision", "dev_project_provision", "dev_gitea_upgrade",
+    "review_pr",
+    "start", "stop", "update", "agents_update",
+})
+
+
+def _gitea_held(verb: str = "") -> str | None:
+    """Why gitea-touching work must wait, or None: an upgrade or a restore holds
+    gitea (its child holds the gitea lock, or an upgrade was spawned and its
+    child has not reached the lock yet), or an interrupted upgrade left an
+    unverified release that only Recover may settle — anything written to it
+    now would be thrown away. Enable is exempt from the second: it IS Recover."""
+    if any(op["verb"] == "dev_gitea_upgrade" for op in _live_dev_lane_ops()):
+        return rscore.GITEA_BUSY_MSG
+    reason = rscore._gitea_held_reason()
+    if reason and reason != rscore.GITEA_BUSY_MSG and verb in _PERSISTENT_HOLD_EXEMPT:
+        return None
+    return reason
+
+
+# Verbs the PERSISTENT hold (an interrupted or damaged upgrade record, as
+# opposed to a live upgrade or restore) lets through: Enable is how Recover
+# runs, and project start/stop/update/create WRITE to gitea only through
+# _resume_gitea, which refuses or skips on such a record by itself (their other
+# contact is best-effort reads that fall back on error; a fetch create refuses
+# on the record before it builds anything) — holding
+# them would stop every project on the host over a dev-lane problem. The
+# fork-archiving verbs (destroy, box_remove, detach) and every dev verb stay held.
+_PERSISTENT_HOLD_EXEMPT = frozenset({"dev_gitea_start", "start", "stop", "update",
+                                     "agents_update", "create"})
 
 
 def _release_dev_box_lock(op_id: str) -> None:
@@ -1755,10 +1861,12 @@ def run_dev_box(op_id: str, verb: str) -> None:
         op.progress.done()
     except rscore.ValidationError as e:
         print(f"validation: {e}")                 # full log — status-only, PAT-free
-        op.progress.fail("invalid request")
+        op.progress.fail(str(e) if verb in _DEV_LANE_OPERATOR_TEXT
+                         else "invalid request")
     except SystemExit:
-        op.progress.fail("provision failed")      # die() already printed to the full log
-    except (rscore.HarnessError, Exception):
+        # die() already printed to the full log
+        op.progress.fail(_DEV_LANE_FAIL_TOKEN.get(verb, "provision failed"))
+    except (rscore.HarnessError, Exception) as e:
         # A RAW exception prints nothing on its own — without this the full log
         # is EMPTY and the failure is undiagnosable (bit the first acceptance
         # run: a NameError died silently behind the coarse token). Stdout/stderr
@@ -1767,7 +1875,10 @@ def run_dev_box(op_id: str, verb: str) -> None:
         # the PAT (never in an exception message by the GiteaError/HarnessError
         # constructions) cannot ride it.
         traceback.print_exc()
-        op.progress.fail("provision failed")      # coarse token; detail is in the full log
+        if isinstance(e, rscore.HarnessError) and verb in _DEV_LANE_OPERATOR_TEXT:
+            op.progress.fail(e.log_msg)           # operator text, path-free by construction
+        else:                                     # coarse token; detail is in the full log
+            op.progress.fail(_DEV_LANE_FAIL_TOKEN.get(verb, "provision failed"))
     finally:
         op.close()
         _release_dev_box_lock(op_id)
@@ -2212,6 +2323,9 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
         if not isinstance(op_id, str) or not _OP_ID_RE.match(op_id):
             return _audited(principal, "bad_request",
                             _err("bad_request", "a valid op_id is required"))
+        held = _gitea_held(verb)
+        if held:
+            return _audited(principal, "busy", _err("busy", held))
         # Pre-spawn validation: a bad request must NOT spawn a child — the
         # client already holds started:true and would never see a child-side
         # failure. Shape via from_kwargs + two sub-ms host file gates.
@@ -2265,6 +2379,18 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
         if not isinstance(op_id, str) or not _OP_ID_RE.match(op_id):
             return _audited(principal, "bad_request",
                             _err("bad_request", "a valid op_id is required"))
+        # Step-up for the lane verbs that need it (the upgrade). The proof is
+        # read from the RAW args, before the field filter below drops it, so it
+        # never reaches the child's stdin, the op log or the verb.
+        if verb in STEP_UP_VERBS:
+            step_proof = args.get("proof")
+            if not isinstance(step_proof, str) or not broker_auth.verify_password(step_proof):
+                return _audited(principal, "step_up_fail",
+                                _err("step_up_required",
+                                     "this action requires re-entering your password"))
+        held = _gitea_held(verb)
+        if held:
+            return _audited(principal, "busy", _err("busy", held))
         # Pre-spawn validation: per-verb shape via from_kwargs + one cheap
         # file gate — a bad request must NOT spawn a child (the client already
         # holds started:true and would never see a child-side failure).
@@ -2288,11 +2414,24 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
                             _err("busy", f"{safe.get('project')} is starting, "
                                          "stopping or updating — try again "
                                          "when it finishes"))
+        if verb == "dev_gitea_upgrade":
+            # Refuse here what the child would refuse anyway, so the browser
+            # hears it at once instead of from a failed tail. The child asks
+            # again under the gitea lock.
+            refusal = rscore.gitea_upgrade_refusal()
+            if refusal:
+                return _audited(principal, "validation", _err("validation", refusal))
+            # Nothing that reaches gitea may be in flight: a provision, a review
+            # or a project start/stop would lose gitea under it.
+            if _live_dev_lane_ops() or _live_review_ops() or _live_lifecycle_ops():
+                return _audited(principal, "busy",
+                                _err("busy", "other work that uses Gitea is "
+                                             "running — try again when it finishes"))
         if spawn_dev_box is None:           # tests: gate + validate, never spawn
             return _audited(principal, "ok",
                             {"ok": True, "result": {"op_id": op_id, "started": True}})
         pid = spawn_dev_box(op_id, verb, safe)   # detached child, args via stdin
-        _write_dev_box_lock(op_id, pid)          # PARENT writes, post-spawn only
+        _write_dev_box_lock(op_id, pid, verb)    # PARENT writes, post-spawn only
         return _audited(principal, "ok",
                         {"ok": True, "result": {"op_id": op_id, "started": True}})
 
@@ -2316,6 +2455,9 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
         if not isinstance(op_id, str) or not _OP_ID_RE.match(op_id):
             return _audited(principal, "bad_request",
                             _err("bad_request", "a valid op_id is required"))
+        held = _gitea_held(verb)
+        if held:
+            return _audited(principal, "busy", _err("busy", held))
         # An op_id names this op's lock and logs; reusing one that is still in
         # flight would overwrite them and hide the first op from every check.
         if _lifecycle_op(op_id) is not None:
@@ -2396,6 +2538,9 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
     # `verbs is None` only: a test's stub table never touches the real lock.
     lc_lock = None
     if verbs is None:
+        held = _gitea_held(verb) if verb in _GITEA_GATED_VERBS else None
+        if held:
+            return _audited(principal, "busy", _err("busy", held))
         project_key = _INLINE_PROJECT_KEY.get(verb)
         if project_key is not None and _project_in_flight(args.get(project_key)):
             return _audited(principal, "busy",

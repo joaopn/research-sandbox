@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import bisect
 import datetime
 import enum
@@ -2422,6 +2423,26 @@ class DevGiteaStartRequest:
 
 
 @dataclass(frozen=True)
+class DevGiteaUpgradeRequest:
+    """Upgrade the shared gitea to the shipped release. ``passphrase`` encrypts
+    the backup taken just before the upgrade, and is validated exactly like the
+    board export's (it is the same kind of artifact)."""
+    passphrase: str = field(repr=False)
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "DevGiteaUpgradeRequest":
+        return cls(passphrase=DevBoardExportRequest.from_kwargs(
+            passphrase=kw.get("passphrase")).passphrase)
+
+
+@dataclass(frozen=True)
+class DevGiteaDiscardPreviousRequest:
+    @classmethod
+    def from_kwargs(cls, **_kw: Any) -> "DevGiteaDiscardPreviousRequest":
+        return cls()
+
+
+@dataclass(frozen=True)
 class DevPasswdRequest:
     """Set the sandbox-admin gitea password — the human's interactive gitea
     identity. ``password`` is a SECRET (repr=False): it reaches only the gitea
@@ -2947,7 +2968,7 @@ class DevSyncResult:
 
 @dataclass
 class DevStatusResult:
-    gitea: dict                                 # {"exists": bool, "running": bool}
+    gitea: dict                                 # {"exists", "running", "version", "target", "upgrade", "upgrading"}
     repos: list[dict]                           # gitea.repo_status rows (running only)
     attachments: list[dict]                     # [{project, repo}] (agent-class)
     reviewer: dict                              # {"present": bool, "set_at": str} — token state, never token material
@@ -2969,6 +2990,19 @@ class DevRepoStatusResult:
 @dataclass
 class DevGiteaStartResult:
     running: bool
+
+
+@dataclass
+class DevGiteaUpgradeResult:
+    from_version: str
+    to_version: str
+    backup: str                                 # the pre-upgrade backup's host path
+
+
+@dataclass
+class DevGiteaDiscardPreviousResult:
+    version: str                                # the release that was discarded
+    backup_removed: bool
 
 
 @dataclass
@@ -3295,12 +3329,21 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     # Gitea history: the claim needs the Gitea, so it is decided here — beside
     # the dev lane's retired-identity check, before any port, workspace or
     # container exists (from_kwargs already refused everything network-free).
+    # The fetch surface's only gitea check runs after the container exists, so a
+    # gitea held by an upgrade (or left unsettled by an interrupted one) is
+    # refused HERE, before anything is built, rather than dying half-wired.
+    if req.fetch:
+        held = _gitea_held_reason()
+        if held:
+            raise ValidationError(held)
     history_claim: dict | None = None
     if req.history:
         try:
             _resume_gitea(require=True, tries=GITEA_RESUME_WAIT_TRIES)
         except SystemExit:
-            raise ValidationError("Gitea is not answering right now; retry in a moment")
+            # An upgrade holding gitea is not fixed by retrying in a moment.
+            raise ValidationError(_gitea_held_reason()
+                                  or "Gitea is not answering right now; retry in a moment")
         try:
             history_claim = gitea.project_history_claim(
                 _gitea_host_port(), project, gitea.load_attachments())
@@ -5142,8 +5185,12 @@ def remove_project_network(project: str) -> None:
     # exit non-zero silently when the container isn't on this network.
     # rs-gitea (if the project ever attached a dev repo) is disconnected too —
     # same endpoints-remain reason (STAGE_DEV_GITEA S1).
+    # The gitea kept aside by an upgrade too: it is stopped, and docker lets a
+    # network go while a STOPPED container is still attached, after which that
+    # container can never start again — which would break the upgrade's
+    # rollback or Recover.
     for svc in (ROUTER_CONTAINER, WEBUI_CONTAINER, REGISTRY_CONTAINER,
-                gitea.GITEA_CONTAINER):
+                gitea.GITEA_CONTAINER, GITEA_PREVIOUS_CONTAINER):
         run(["docker", "network", "disconnect", network, svc],
             capture_output=True)
     run(["docker", "network", "rm", network], capture_output=True)
@@ -8866,6 +8913,9 @@ GITEA_EGRESS_SETTINGS_VERSION = "28"
 
 # The container label naming the gitea release it runs — set at `docker run`.
 GITEA_VERSION_LABEL = "research.gitea.version"
+# The restart policy every gitea container is created with, and what an upgrade's
+# rollback puts back on the old container after keeping it aside with none.
+GITEA_RESTART_POLICY = "unless-stopped"
 
 
 def _gitea_pinned_version(pins: dict[str, str]) -> str:
@@ -8914,7 +8964,7 @@ def _run_gitea_container(image: str, volume: str, version: str,
         "docker", "run", "-d",
         "--name", gitea.GITEA_CONTAINER,
         "--network", ROUTER_NETWORK,
-        "--restart", "unless-stopped",
+        "--restart", GITEA_RESTART_POLICY,
         "--label", f"{GITEA_VERSION_LABEL}={version}",
         "-p", f"127.0.0.1:{host_port}:{gitea.GITEA_INNER_PORT}",
         "-v", f"{volume}:/data",
@@ -8942,19 +8992,31 @@ def _provision_gitea(progress=None) -> None:
     gitea-enable`) — never lazily. A stopped-but-enabled gitea is RESUMED by
     _resume_gitea, which never creates; only this function ever CREATES it.
 
-    Stale-token guard: if the tokens exist but the container AND its volume are
-    gone, die with a remedy — a fresh gitea would reject the stale admin token
-    silently, so surface it rather than half-work."""
+    Stale-token guard: if the tokens exist but the container AND every copy of
+    its data are gone, die with a remedy — a fresh gitea would reject the stale
+    admin token silently, so surface it rather than half-work.
+
+    Upgrade-aware: an upgrade that was cut off before its new release proved
+    itself (a record short of `committed`) is finished here by putting the old
+    release back — the button reads Recover in that state. A create picks its
+    data volume through _gitea_data_volume, so a gitea whose container was
+    removed after an upgrade comes back on the upgraded copy. The start and
+    create arms hold the gitea lock SHARED, so neither can start a container
+    while an upgrade or a restore is moving its data."""
     progress = progress or _NULL_PROGRESS
-    if (gitea.bootstrap_present()
-            and not container_exists(gitea.GITEA_CONTAINER)
-            and not volume_exists(gitea.GITEA_DATA_VOLUME)):
-        die(f"stale dev-lane tokens from a removed {gitea.GITEA_CONTAINER}; "
-            f"rm {gitea.ADMIN_TOKEN_PATH} and {gitea.OPERATOR_TOKEN_PATH} to "
-            f"re-enable on the next `research dev gitea-enable`.")
     pins = load_versions()
     host_port = pins.get("GITEA_HOST_PORT", gitea.DEFAULT_GITEA_HOST_PORT)
-    if container_running(gitea.GITEA_CONTAINER):
+    # The record is read BEFORE the already-running shortcut: an upgrade killed
+    # after its new release started leaves that unverified release running, and
+    # the shortcut would bless it.
+    try:
+        rec = _read_upgrade_record()
+    except ValidationError as e:
+        die(str(e))
+    if rec is not None and rec["phase"] != "committed" and gitea_upgrading():
+        die(GITEA_BUSY_MSG)
+    if container_running(gitea.GITEA_CONTAINER) and (
+            rec is None or rec["phase"] == "committed"):
         # Already up — but a prior attempt may have started it and then FAILED
         # bootstrap (leaving no tokens). So fall through to the bootstrap-if-absent
         # step rather than early-returning; the wait+bootstrap runs at most once
@@ -8962,28 +9024,53 @@ def _provision_gitea(progress=None) -> None:
         progress.step("bootstrap", "checking gitea accounts")
         _bootstrap_gitea_if_absent(host_port)
         return
-    if container_exists(gitea.GITEA_CONTAINER):
-        progress.step("start", "starting gitea")
-        run_check(["docker", "start", gitea.GITEA_CONTAINER])
-    else:
-        version = _gitea_pinned_version(pins)
-        image = "gitea/gitea:" + version
-        progress.step("pull", "pulling the gitea image")
-        if not run_quiet(["docker", "image", "inspect", image]):
-            print(f"pulling {image}...")
-            run_check(["docker", "pull", image])
-        _run_gitea_container(image, gitea.GITEA_DATA_VOLUME, version, host_port)
-        print(f"started {gitea.GITEA_CONTAINER} (shared dev gitea on "
-              f"{ROUTER_NETWORK})")
-    # We just started (or created) the container: its app is NOT serving the
-    # instant `docker start` returns (sqlite reopen + http bind take a moment).
-    # Wait for readiness BEFORE any caller touches the API — an already-bootstrapped
-    # restart would otherwise race the first post-restart API call (the "not
-    # private" cascade the harness caught). The pure-already-running path above
-    # skips this (gitea was already serving from a prior call).
-    _wait_for_gitea(host_port)
-    progress.step("bootstrap", "checking gitea accounts")
-    _bootstrap_gitea_if_absent(host_port)
+    if rec is not None and rec["phase"] != "committed":
+        progress.step("recover", "finishing an interrupted upgrade")
+        _recover_interrupted_upgrade(rec, progress)
+        progress.step("bootstrap", "checking gitea accounts")
+        _bootstrap_gitea_if_absent(host_port)
+        return
+    if (gitea.bootstrap_present()
+            and not container_exists(gitea.GITEA_CONTAINER)
+            and rec is None and not _gitea_data_volume_candidates()):
+        die(f"stale dev-lane tokens from a removed {gitea.GITEA_CONTAINER}; "
+            f"rm {gitea.ADMIN_TOKEN_PATH} and {gitea.OPERATOR_TOKEN_PATH} to "
+            f"re-enable on the next `research dev gitea-enable`.")
+    try:
+        with _gitea_lock(exclusive=False, blocking=False):
+            if container_running(gitea.GITEA_CONTAINER):
+                progress.step("bootstrap", "checking gitea accounts")
+                _bootstrap_gitea_if_absent(host_port)
+                return
+            if container_exists(gitea.GITEA_CONTAINER):
+                progress.step("start", "starting gitea")
+                run_check(["docker", "start", gitea.GITEA_CONTAINER])
+            else:
+                version = _gitea_pinned_version(pins)
+                image = "gitea/gitea:" + version
+                try:
+                    volume = _gitea_data_volume()
+                except ValidationError as e:
+                    die(str(e))
+                progress.step("pull", "pulling the gitea image")
+                if not run_quiet(["docker", "image", "inspect", image]):
+                    print(f"pulling {image}...")
+                    run_check(["docker", "pull", image])
+                _run_gitea_container(image, volume, version, host_port)
+                print(f"started {gitea.GITEA_CONTAINER} (shared dev gitea on "
+                      f"{ROUTER_NETWORK})")
+            # We just started (or created) the container: its app is NOT serving
+            # the instant `docker start` returns (sqlite reopen + http bind take a
+            # moment). Wait for readiness BEFORE any caller touches the API — an
+            # already-bootstrapped restart would otherwise race the first
+            # post-restart API call (the "not private" cascade the harness
+            # caught). The pure-already-running path above skips this (gitea was
+            # already serving from a prior call).
+            _wait_for_gitea(host_port)
+            progress.step("bootstrap", "checking gitea accounts")
+            _bootstrap_gitea_if_absent(host_port)
+    except _GiteaLockBusy:
+        die(GITEA_BUSY_MSG)
 
 
 def _resume_gitea(*, require: bool, tries: int | None = None) -> bool:
@@ -8997,15 +9084,51 @@ def _resume_gitea(*, require: bool, tries: int | None = None) -> bool:
     surfaces on the eventual Enable, whose _provision_gitea guard names the real
     remedy; here the operator is simply told to enable first."""
     host_port = load_versions().get("GITEA_HOST_PORT", gitea.DEFAULT_GITEA_HOST_PORT)
+    # An upgrade that has not committed owns gitea: in progress, the running
+    # container may be an unverified release mid-migration; cut off, only
+    # Recover may decide what runs. A file read, so the no-lock arms stay cheap
+    # (and the record is absent on every host that never upgraded). A restore
+    # writes no record, so its own wiring pass, run while it holds the lock,
+    # is unaffected.
+    try:
+        rec = _read_upgrade_record()
+    except ValidationError as e:
+        if require:
+            die(str(e))
+        return False
+    if rec is not None and rec["phase"] != "committed":
+        if not require:
+            return False
+        if gitea_upgrading():
+            die(GITEA_BUSY_MSG)
+        die(GITEA_INTERRUPTED_MSG)
+    # The running and absent arms take no lock and create no file: a host that
+    # never enabled gitea must stay untouched by `research start`'s wiring pass.
     if container_running(gitea.GITEA_CONTAINER):
         _bootstrap_gitea_if_absent(host_port, tries=tries)
         return True
     if container_exists(gitea.GITEA_CONTAINER):
-        run_check(["docker", "start", gitea.GITEA_CONTAINER])
-        _wait_for_gitea(host_port, tries=tries)
-        _bootstrap_gitea_if_absent(host_port, tries=tries)
+        # The stopped arm starts a container, so it holds the lock SHARED and
+        # re-checks under it: an upgrade or a restore may have stopped gitea to
+        # move its data, and a start now would land on a half-copied volume.
+        try:
+            with _gitea_lock(exclusive=False, blocking=False):
+                if not container_running(gitea.GITEA_CONTAINER):
+                    if not container_exists(gitea.GITEA_CONTAINER):
+                        die("Gitea isn't enabled — enable it in Management → "
+                            "Infrastructure first")
+                    run_check(["docker", "start", gitea.GITEA_CONTAINER])
+                    _wait_for_gitea(host_port, tries=tries)
+                _bootstrap_gitea_if_absent(host_port, tries=tries)
+        except _GiteaLockBusy:
+            die(GITEA_BUSY_MSG)
         return True
     if require:
+        if gitea_upgrading():
+            die(GITEA_BUSY_MSG)
+        # An uncommitted record was refused at the top. With a committed one
+        # (or none) a missing container is what Enable fixes — the page offers
+        # exactly that button, so name it.
         die("Gitea isn't enabled — enable it in Management → Infrastructure first")
     return False
 
@@ -9188,6 +9311,18 @@ def wire_gitea_to_projects() -> None:
     # below is load-bearing and not belt-and-braces. Do not delete it on the
     # strength of `require=False`. `except SystemExit` specifically: die() raises
     # it, and `except Exception` would sail past while looking correct.
+    # An interrupted (or damaged) upgrade record means the running container
+    # may be an unverified release that Recover will remove: wiring projects to
+    # it would rewrite their recorded addresses and restart dev boxes against
+    # it. Recover wires everything itself once it has settled the record. The
+    # record alone is checked — not the lock — because a restore runs this pass
+    # while holding the lock itself.
+    try:
+        rec = _read_upgrade_record()
+    except ValidationError:
+        return
+    if rec is not None and rec["phase"] != "committed":
+        return
     serving = True
     try:
         _resume_gitea(require=False, tries=GITEA_RESUME_WAIT_TRIES)
@@ -13802,6 +13937,13 @@ def dev_status(_req: "DevStatusRequest", _progress=None) -> DevStatusResult:  # 
     docker-start containers, nor sit in a readiness wait on the serial thread."""
     exists = container_exists(gitea.GITEA_CONTAINER)
     running = bool(exists and container_running(gitea.GITEA_CONTAINER))
+    # The release, the shipped one and any upgrade state ride every reply —
+    # pure docker inspects and host files, so the no-start posture holds.
+    info = gitea_version_info()
+    # While an upgrade or a restore holds gitea, its API is down or answering
+    # from a database being migrated: report that, and touch nothing.
+    if info["upgrading"]:
+        running = False
     repos: list[dict] = []
     if running:
         host_port = _gitea_host_port()
@@ -13845,7 +13987,7 @@ def dev_status(_req: "DevStatusRequest", _progress=None) -> DevStatusResult:  # 
                    and e.get("class") != gitea.HISTORY_CLASS]
     # Reviewer-token state rides OUTSIDE `if running:` — it is orthogonal to
     # gitea's state (a pure local file read; the no-start posture holds).
-    return DevStatusResult(gitea={"exists": exists, "running": running},
+    return DevStatusResult(gitea={"exists": exists, "running": running, **info},
                            repos=repos, attachments=attachments,
                            reviewer=gitea.reviewer_token_state())
 
@@ -14251,150 +14393,176 @@ def dev_board_import(req: "DevBoardImportRequest",
     # Running: the safety export is a dump of the LIVE instance, and the image
     # has to be read off the container before it is stopped.
     _resume_gitea(require=True)
-    image = _live_gitea_image()
-
-    progress.step("verify", "checking the backup opens")
-    try:
-        gitea.verify_export(path=src, passphrase=req.passphrase, image=image,
-                            timeout=_left("checking the backup"))
-    except gitea.GiteaError as e:
-        raise HarnessError("gitea restore: the backup did not open", str(e))
-
-    safety = ""
-    if req.safety_export:
-        progress.step("safety", "backing up what is here now")
-        stamp = datetime.datetime.now(
-            datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
-        # In a `pre-restore/` subdirectory beside the file being restored, NOT
-        # alongside it. The ordinary restore reads the resident backup, so
-        # writing next to it would drop full instance dumps — each carrying the
-        # server's keys — straight into the directory the page describes as
-        # holding exactly one backup. They accumulate (one per restore) and
-        # nothing reclaims them, so at minimum they must not make that statement
-        # false. Timestamped, so a second attempt cannot overwrite the first
-        # attempt's rollback.
-        keep = src.parent / "pre-restore"
+    # EXCLUSIVE for the whole restore, blocking: an upgrade moving the data at
+    # the same moment would copy a half-replaced volume, and a status probe must
+    # never make the restore fail. Everything below runs in this process while
+    # it holds the lock, so it starts gitea with plain `docker start`s and the
+    # wiring pass's own resume finds gitea running (or refuses harmlessly).
+    with _gitea_lock(exclusive=True, blocking=True):
+        # An interrupted upgrade may have left an unverified release running on
+        # a copy that Recover will throw away: a restore into it would be lost.
         try:
-            keep.mkdir(parents=True, exist_ok=True)
-            keep.chmod(0o700)
-        except OSError as e:
-            # The mkdir is the half that can genuinely fail — a read-only mount,
-            # a directory the operator cannot write — and without this it is a
-            # raw traceback on the one destructive command in the lane. Nothing
-            # has been touched yet, so this is a clean refusal.
-            raise HarnessError(
-                "gitea restore: could not write the safety backup",
-                f"{e} — nothing was changed. Move the backup somewhere "
-                f"writable, or pass --no-safety-export to skip it")
-        out = keep / (src.name + f".pre-restore-{stamp}.gpg")
+            rec = _read_upgrade_record()
+        except ValidationError as e:
+            raise HarnessError("gitea restore: the upgrade record is damaged", str(e))
+        if rec is not None and rec["phase"] != "committed":
+            raise HarnessError("gitea restore: an upgrade was interrupted",
+                               GITEA_INTERRUPTED_MSG + "; nothing was replaced")
+        if not container_running(gitea.GITEA_CONTAINER):
+            raise HarnessError("gitea restore: Gitea is not running",
+                               "Gitea stopped while the restore waited for it; "
+                               "nothing was replaced")
+        # Read under the lock: an upgrade that finished while this waited has
+        # changed both the image and the volume.
+        image = _live_gitea_image()
+        data_volume = _container_data_volume(gitea.GITEA_CONTAINER)
+        if not data_volume:
+            raise HarnessError("gitea restore: Gitea's data volume is unknown",
+                               "the running Gitea has no named data volume; "
+                               "nothing was replaced")
+
+        progress.step("verify", "checking the backup opens")
         try:
-            gitea.dump_instance(container=gitea.GITEA_CONTAINER,
-                                passphrase=req.passphrase, out_path=out,
-                                image=image, timeout=_left("the safety backup"))
+            gitea.verify_export(path=src, passphrase=req.passphrase, image=image,
+                                timeout=_left("checking the backup"))
         except gitea.GiteaError as e:
-            raise HarnessError("gitea restore: the safety backup failed", str(e))
-        safety = str(out)
-        # Printed BEFORE the destruction starts, so it is on screen even if
-        # everything after this goes wrong.
-        print(f"safety backup of the current instance: {safety}")
-        print("  (safety backups are kept, one per restore, and are yours to "
-              "remove when you no longer want them)")
+            raise HarnessError("gitea restore: the backup did not open", str(e))
 
-    # Resolved BEFORE the stop, deliberately. `_left` raises when the budget is
-    # spent, and raising AFTER `docker stop` would leave gitea down over a
-    # failure that changed nothing — inverting the very invariant the rest of
-    # this function is built around.
-    replace_budget = _left("the replace", floor=BOARD_REPLACE_MIN_RUN_S)
-    # Read before the stop so BOTH the success and the refusal arms can wait for
-    # readiness; it is a file read and cannot fail in a way worth branching on.
-    host_port_for_restore = load_versions().get(
-        "GITEA_HOST_PORT", gitea.DEFAULT_GITEA_HOST_PORT)
-    progress.step("stop", "stopping gitea")
-    run_check(["docker", "stop", gitea.GITEA_CONTAINER])
-    progress.step("replace", "replacing the database and repositories")
-    try:
-        gitea.restore_instance(volume=gitea.GITEA_DATA_VOLUME, image=image,
-                               passphrase=req.passphrase, path=src,
-                               timeout=replace_budget)
-    except gitea.RestoreRefused as e:
-        # A PRE-FLIGHT refusal, and only that: the volume is provably untouched,
-        # so the instance that was running a moment ago should be running again
-        # rather than left down by a check that changed nothing.
-        #
-        # It is brought back the SAME way the success path brings it back, not
-        # with a bare `docker start`. This arm is the EXPECTED outcome of the
-        # case the Backup page warns about — a backup from a gitea that no
-        # longer exists — so it is a path operators will actually take, and a
-        # stop/start moves gitea's address on every project network. Without the
-        # re-wire each dev box keeps the address baked at its own launch and
-        # silently loses push until someone runs a host start.
-        started = run(["docker", "start", gitea.GITEA_CONTAINER],
-                      capture_output=True)
-        if started.returncode == 0:
+        safety = ""
+        if req.safety_export:
+            progress.step("safety", "backing up what is here now")
+            stamp = datetime.datetime.now(
+                datetime.timezone.utc).strftime("%Y%m%d-%H%M%S")
+            # In a `pre-restore/` subdirectory beside the file being restored, NOT
+            # alongside it. The ordinary restore reads the resident backup, so
+            # writing next to it would drop full instance dumps — each carrying the
+            # server's keys — straight into the directory the page describes as
+            # holding exactly one backup. They accumulate (one per restore) and
+            # nothing reclaims them, so at minimum they must not make that statement
+            # false. Timestamped, so a second attempt cannot overwrite the first
+            # attempt's rollback.
+            keep = src.parent / "pre-restore"
             try:
-                _wait_for_gitea(host_port_for_restore)
-                wire_gitea_to_projects()
-            except SystemExit:
-                # Readiness or wiring failed on top of the refusal. Say both
-                # things rather than replacing the refusal with a vaguer error.
+                keep.mkdir(parents=True, exist_ok=True)
+                keep.chmod(0o700)
+            except OSError as e:
+                # The mkdir is the half that can genuinely fail — a read-only mount,
+                # a directory the operator cannot write — and without this it is a
+                # raw traceback on the one destructive command in the lane. Nothing
+                # has been touched yet, so this is a clean refusal.
                 raise HarnessError(
-                    "gitea restore refused, and gitea did not come back",
-                    f"{e} — and gitea did not answer after being started again; "
-                    f"check it before using the dev lane")
-            raise HarnessError("gitea restore refused", str(e))
-        raise HarnessError(
-            "gitea restore refused, and gitea could not be started again",
-            f"{e} — and starting gitea back up failed, so it is currently DOWN")
-    except gitea.GiteaError as e:
-        # Anything else: the replace may have got part way, or the container
-        # doing it may still be running. Starting gitea here would point it at a
-        # half-written database, or add a second writer to the same volume.
-        # Leave it stopped and say so — being down is recoverable, a corrupted
-        # database started and migrated is not.
-        raise HarnessError(
-            "gitea restore failed part way",
-            f"{e} — gitea has been left STOPPED because its data may be "
-            f"partly replaced; restore again from a good backup"
-            + (f", or from the safety backup at {safety}" if safety else
-               " (no safety backup was taken, because --no-safety-export was "
-               "given)")
-            + " before starting it")
+                    "gitea restore: could not write the safety backup",
+                    f"{e} — nothing was changed. Move the backup somewhere "
+                    f"writable, or pass --no-safety-export to skip it")
+            out = keep / (src.name + f".pre-restore-{stamp}.gpg")
+            try:
+                gitea.dump_instance(container=gitea.GITEA_CONTAINER,
+                                    passphrase=req.passphrase, out_path=out,
+                                    image=image, timeout=_left("the safety backup"))
+            except gitea.GiteaError as e:
+                raise HarnessError("gitea restore: the safety backup failed", str(e))
+            safety = str(out)
+            # Printed BEFORE the destruction starts, so it is on screen even if
+            # everything after this goes wrong.
+            print(f"safety backup of the current instance: {safety}")
+            print("  (safety backups are kept, one per restore, and are yours to "
+                  "remove when you no longer want them)")
 
-    # From here the DATA IS ALREADY RESTORED. Every failure below is about
-    # bringing gitea back, not about the restore — and it must say so, because
-    # the operator's next decision (restore again? from what?) depends entirely
-    # on which of the two it was. This arm carries HIGHER stakes than the refusal
-    # arm above, so it cannot be handled more crudely than it: a bare run_check
-    # here would die() with "command failed: docker start" and skip the re-wire,
-    # never mentioning that the restore itself succeeded.
-    progress.step("start", "starting gitea on the restored data")
-    started = run(["docker", "start", gitea.GITEA_CONTAINER], capture_output=True)
-    if started.returncode != 0:
-        raise HarnessError(
-            "gitea restored, but it could not be started again",
-            f"the restore COMPLETED and your data is in place — but starting "
-            f"gitea failed, so it is currently DOWN. Start it and the dev boxes "
-            f"will pick up its address on the next host start.")
-    try:
-        # The COLD-BOOT budget, explicitly not the resume budget that
-        # wire_gitea_to_projects would use on its own. Gitea coming up on a
-        # restored database re-applies migrations and rebuilds the search index
-        # this restore deliberately deleted, which is minutes of work on a large
-        # instance — GITEA_RESUME_WAIT_TRIES is documented as sized for a WARM
-        # restart and would time out, and its caller SWALLOWS that timeout and
-        # wires from recorded rows. That would let this verb report success
-        # against an instance that is not answering.
-        _wait_for_gitea(host_port_for_restore)
-    except SystemExit:
-        raise HarnessError(
-            "gitea restored, but it did not come back up",
-            f"the restore COMPLETED and your data is in place — but gitea did "
-            f"not answer in time after being started. It may still be applying "
-            f"migrations on the restored database; check it, then run a host "
-            f"start so the dev boxes pick up its address.")
-    progress.step("wire", "re-attaching gitea to the projects")
-    wire_gitea_to_projects()
-    return DevBoardImportResult(restored_from=str(src), safety_export=safety)
+        # Resolved BEFORE the stop, deliberately. `_left` raises when the budget is
+        # spent, and raising AFTER `docker stop` would leave gitea down over a
+        # failure that changed nothing — inverting the very invariant the rest of
+        # this function is built around.
+        replace_budget = _left("the replace", floor=BOARD_REPLACE_MIN_RUN_S)
+        # Read before the stop so BOTH the success and the refusal arms can wait for
+        # readiness; it is a file read and cannot fail in a way worth branching on.
+        host_port_for_restore = load_versions().get(
+            "GITEA_HOST_PORT", gitea.DEFAULT_GITEA_HOST_PORT)
+        progress.step("stop", "stopping gitea")
+        run_check(["docker", "stop", gitea.GITEA_CONTAINER])
+        progress.step("replace", "replacing the database and repositories")
+        try:
+            gitea.restore_instance(volume=data_volume, image=image,
+                                   passphrase=req.passphrase, path=src,
+                                   timeout=replace_budget)
+        except gitea.RestoreRefused as e:
+            # A PRE-FLIGHT refusal, and only that: the volume is provably untouched,
+            # so the instance that was running a moment ago should be running again
+            # rather than left down by a check that changed nothing.
+            #
+            # It is brought back the SAME way the success path brings it back, not
+            # with a bare `docker start`. This arm is the EXPECTED outcome of the
+            # case the Backup page warns about — a backup from a gitea that no
+            # longer exists — so it is a path operators will actually take, and a
+            # stop/start moves gitea's address on every project network. Without the
+            # re-wire each dev box keeps the address baked at its own launch and
+            # silently loses push until someone runs a host start.
+            started = run(["docker", "start", gitea.GITEA_CONTAINER],
+                          capture_output=True)
+            if started.returncode == 0:
+                try:
+                    _wait_for_gitea(host_port_for_restore)
+                    wire_gitea_to_projects()
+                except SystemExit:
+                    # Readiness or wiring failed on top of the refusal. Say both
+                    # things rather than replacing the refusal with a vaguer error.
+                    raise HarnessError(
+                        "gitea restore refused, and gitea did not come back",
+                        f"{e} — and gitea did not answer after being started again; "
+                        f"check it before using the dev lane")
+                raise HarnessError("gitea restore refused", str(e))
+            raise HarnessError(
+                "gitea restore refused, and gitea could not be started again",
+                f"{e} — and starting gitea back up failed, so it is currently DOWN")
+        except gitea.GiteaError as e:
+            # Anything else: the replace may have got part way, or the container
+            # doing it may still be running. Starting gitea here would point it at a
+            # half-written database, or add a second writer to the same volume.
+            # Leave it stopped and say so — being down is recoverable, a corrupted
+            # database started and migrated is not.
+            raise HarnessError(
+                "gitea restore failed part way",
+                f"{e} — gitea has been left STOPPED because its data may be "
+                f"partly replaced; restore again from a good backup"
+                + (f", or from the safety backup at {safety}" if safety else
+                   " (no safety backup was taken, because --no-safety-export was "
+                   "given)")
+                + " before starting it")
+
+        # From here the DATA IS ALREADY RESTORED. Every failure below is about
+        # bringing gitea back, not about the restore — and it must say so, because
+        # the operator's next decision (restore again? from what?) depends entirely
+        # on which of the two it was. This arm carries HIGHER stakes than the refusal
+        # arm above, so it cannot be handled more crudely than it: a bare run_check
+        # here would die() with "command failed: docker start" and skip the re-wire,
+        # never mentioning that the restore itself succeeded.
+        progress.step("start", "starting gitea on the restored data")
+        started = run(["docker", "start", gitea.GITEA_CONTAINER], capture_output=True)
+        if started.returncode != 0:
+            raise HarnessError(
+                "gitea restored, but it could not be started again",
+                f"the restore COMPLETED and your data is in place — but starting "
+                f"gitea failed, so it is currently DOWN. Start it and the dev boxes "
+                f"will pick up its address on the next host start.")
+        try:
+            # The COLD-BOOT budget, explicitly not the resume budget that
+            # wire_gitea_to_projects would use on its own. Gitea coming up on a
+            # restored database re-applies migrations and rebuilds the search index
+            # this restore deliberately deleted, which is minutes of work on a large
+            # instance — GITEA_RESUME_WAIT_TRIES is documented as sized for a WARM
+            # restart and would time out, and its caller SWALLOWS that timeout and
+            # wires from recorded rows. That would let this verb report success
+            # against an instance that is not answering.
+            _wait_for_gitea(host_port_for_restore)
+        except SystemExit:
+            raise HarnessError(
+                "gitea restored, but it did not come back up",
+                f"the restore COMPLETED and your data is in place — but gitea did "
+                f"not answer in time after being started. It may still be applying "
+                f"migrations on the restored database; check it, then run a host "
+                f"start so the dev boxes pick up its address.")
+        progress.step("wire", "re-attaching gitea to the projects")
+        wire_gitea_to_projects()
+        return DevBoardImportResult(restored_from=str(src), safety_export=safety)
 
 
 def dev_board_status(_req: "DevBoardStatusRequest",
@@ -14463,6 +14631,694 @@ def _live_gitea_image() -> str:
         raise HarnessError("could not resolve the running gitea image",
                            "the gitea container is not inspectable")
     return ref
+
+
+# ---------------------------------------------------------------------------
+# Upgrading the shared gitea in place of its data: the new release runs on a
+# COPY, the old container and its volume are kept untouched until the operator
+# discards them, and a failure puts the old one back. Gitea migrates its
+# database forward on first start and an older release refuses a migrated
+# database (measured, 1.25.1 against 28.2.0), so a copy taken before the start
+# is the only way back.
+# ---------------------------------------------------------------------------
+
+# The kept old container, between a successful upgrade and Discard.
+GITEA_PREVIOUS_CONTAINER = "rs-gitea-previous"
+# The one-shot helper that copies the data. Named, so a copy cut off by a kill
+# can be found and removed — an unnamed one would keep the target volume
+# mounted and refuse every later removal of it.
+GITEA_COPY_CONTAINER = "rs-gitea-upgrade-copy"
+# Label on every data volume an upgrade creates; its value is the release the
+# volume was made for. The original `rs-gitea-data` carries none.
+GITEA_DATA_LABEL = "research.gitea.data"
+# What a data volume an upgrade creates is called, for the release it serves.
+_GITEA_UPGRADE_VOLUME_PREFIX = gitea.GITEA_DATA_VOLUME + "-"
+# The only volume names Discard will ever remove.
+_GITEA_DATA_VOLUME_RE = re.compile(
+    re.escape(gitea.GITEA_DATA_VOLUME) + r"(?:-\d+(?:\.\d+)*)?")
+# The phases an upgrade passes through, in order. Only the last one means the
+# new release proved itself; every earlier one rolls back.
+GITEA_UPGRADE_PHASES = ("preparing", "copying", "switching", "starting",
+                        "committed")
+# The refusal every Gitea-touching action gives while an upgrade or a restore
+# holds the instance. Browser-facing.
+GITEA_BUSY_MSG = ("Gitea is being upgraded or restored — try again when it "
+                  "finishes")
+# Bound on the pre-upgrade backup. Reasoned exactly like BOARD_IMPORT_TIMEOUT_S
+# and set to it: the upgrade runs in a detached child with no client clock to
+# stay under, so the only cost of a generous bound is a longer wait on a wedged
+# docker, while a tight one would refuse a large instance's upgrade outright.
+# This is ONE dump-and-verify pass of the three that bound was sized for, so it
+# is generous by construction, and expiring only refuses — nothing has been
+# stopped yet when the backup runs.
+GITEA_UPGRADE_DUMP_TIMEOUT_S = BOARD_IMPORT_TIMEOUT_S
+# Readiness of the NEW release on the copied data. GITEA_BOOT_WAIT_TRIES is
+# sized for a cold boot of an empty database; this start also migrates every
+# table forward, which scales with the instance (measured: a small instance
+# went from 1.25.1 to 28.2.0 in about four seconds). The two ways to be wrong
+# are lopsided. Too short rolls back an upgrade that would have succeeded — safe,
+# but the operator pays for the backup and the copy again and may never get
+# through on a big instance. Too long only keeps the operator watching a wedged
+# start for longer, in a tail that names the step. So it is ten cold-boot
+# budgets, about ten minutes.
+GITEA_UPGRADE_READY_TRIES = GITEA_BOOT_WAIT_TRIES * 10
+
+
+GITEA_INTERRUPTED_MSG = ("an earlier Gitea upgrade was interrupted — use Recover "
+                         "in Management → Infrastructure first")
+
+
+def _gitea_held_reason() -> str | None:
+    """Why gitea is not available for ordinary work because of an upgrade or a
+    restore, or None. Browser-facing text; pure reads."""
+    if gitea_upgrading():
+        return GITEA_BUSY_MSG
+    try:
+        rec = _read_upgrade_record()
+    except ValidationError as e:
+        return str(e)
+    if rec is not None and rec["phase"] != "committed":
+        return GITEA_INTERRUPTED_MSG
+    return None
+
+
+def _gitea_lock_path() -> Path:
+    # Derived at CALL time, not import: archived pins redirect gitea.DEV_DIR.
+    return gitea.DEV_DIR / "gitea.lock"
+
+
+def _gitea_upgrade_record_path() -> Path:
+    return gitea.DEV_DIR / "gitea-upgrade.json"
+
+
+class _GiteaLockBusy(Exception):
+    """A non-blocking acquisition of the gitea lock found it held."""
+
+
+@contextlib.contextmanager
+def _gitea_lock(*, exclusive: bool, blocking: bool):
+    """Hold the gitea lock. EXCLUSIVE is taken by the actions that replace or
+    move gitea's data (an upgrade, a restore, Discard, the recovery of an
+    interrupted upgrade); SHARED by the arms that start a stopped gitea, so a
+    start can never land on data that is being copied or replaced. flock, so
+    the kernel releases it when its holder dies — there is no stale state to
+    recover. Opened without truncation: the file carries no content."""
+    # An OS failure here becomes a die(): every caller is a verb, and a raw
+    # OSError would escape the broker's dispatch as a truncated reply.
+    try:
+        if not gitea.DEV_DIR.is_dir():
+            gitea.DEV_DIR.mkdir(parents=True, exist_ok=True)
+        fd = os.open(_gitea_lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        die(f"the Gitea lock could not be opened ({e.strerror or 'I/O error'})")
+    try:
+        op = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        if not blocking:
+            op |= fcntl.LOCK_NB
+        try:
+            fcntl.flock(fd, op)
+        except BlockingIOError:
+            raise _GiteaLockBusy()
+        yield
+    finally:
+        os.close(fd)
+
+
+def gitea_upgrading() -> bool:
+    """True while an upgrade or a restore holds gitea. A probe: a non-blocking
+    SHARED attempt released at once, so it never blocks and never conflicts with
+    another start. A missing lock file means nothing ever held it — and the probe
+    creates none, so a host that never enabled gitea stays file-free."""
+    try:
+        fd = os.open(_gitea_lock_path(), os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return False
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+
+
+def _read_upgrade_record() -> dict | None:
+    """The upgrade record, or None when no upgrade is in progress or kept.
+
+    A record that exists but cannot be read is NOT treated as absent: it is
+    the one thing that says which volume holds the data, and guessing could
+    point a start at the wrong one. It raises, and every caller refuses."""
+    path = _gitea_upgrade_record_path()
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise ValidationError(f"the Gitea upgrade record cannot be read ({e.strerror})")
+    try:
+        rec = json.loads(raw)
+    except ValueError:
+        rec = None
+    keys = ("from_version", "to_version", "from_volume", "to_volume", "phase")
+    if (not isinstance(rec, dict)
+            or not all(isinstance(rec.get(k), str) for k in keys)
+            or rec["phase"] not in GITEA_UPGRADE_PHASES):
+        raise ValidationError("the Gitea upgrade record is damaged, so it is "
+                              "not safe to tell which copy of Gitea's data is "
+                              "the live one")
+    return rec
+
+
+def _write_upgrade_record(rec: dict) -> None:
+    """Atomically replace the record (a fixed temp name, then rename)."""
+    path = _gitea_upgrade_record_path()
+    tmp = path.with_name(path.name + ".tmp")
+    gitea.DEV_DIR.mkdir(parents=True, exist_ok=True)
+    tmp.write_text(json.dumps(rec, indent=2) + "\n")
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+
+
+def _set_upgrade_phase(rec: dict, phase: str) -> None:
+    rec["phase"] = phase
+    _write_upgrade_record(rec)
+
+
+def _clear_upgrade_record() -> None:
+    with contextlib.suppress(FileNotFoundError):
+        _gitea_upgrade_record_path().unlink()
+
+
+def _container_data_volume(name: str) -> str | None:
+    """The named volume a container mounts at /data, or None (no container, or
+    /data is not a named volume)."""
+    r = run(["docker", "container", "inspect", name, "-f",
+             '{{range .Mounts}}{{if and (eq .Destination "/data") '
+             '(eq .Type "volume")}}{{.Name}}{{end}}{{end}}'],
+            capture_output=True)
+    vol = (r.stdout or "").strip()
+    return vol if r.returncode == 0 and vol else None
+
+
+def _volume_in_use(volume: str) -> bool:
+    """Whether any container, running or not, mounts the volume."""
+    r = run(["docker", "ps", "-a", "-q", "--filter", f"volume={volume}"],
+            capture_output=True)
+    return r.returncode != 0 or bool((r.stdout or "").strip())
+
+
+def _gitea_data_volume_candidates() -> list[str]:
+    """Every volume that could hold gitea's data when no record says which:
+    the original name plus every volume an upgrade created."""
+    out = []
+    if volume_exists(gitea.GITEA_DATA_VOLUME):
+        out.append(gitea.GITEA_DATA_VOLUME)
+    r = run(["docker", "volume", "ls", "-q", "--filter",
+             f"label={GITEA_DATA_LABEL}"], capture_output=True)
+    for v in (r.stdout or "").split():
+        if v not in out:
+            out.append(v)
+    return out
+
+
+def _gitea_data_volume() -> str:
+    """Which volume holds gitea's data.
+
+    The live container's mount when there is one. Without a container, the
+    upgrade record decides: the new copy once the upgrade committed, the
+    original before that. Without a record, the one existing candidate, or the
+    first-enable name when there is none. More than one candidate and no record
+    to choose between them refuses rather than guess — starting gitea on the
+    wrong copy would quietly lose everything written since."""
+    live = _container_data_volume(gitea.GITEA_CONTAINER)
+    if live:
+        return live
+    rec = _read_upgrade_record()
+    if rec is not None:
+        return rec["to_volume"] if rec["phase"] == "committed" else rec["from_volume"]
+    found = _gitea_data_volume_candidates()
+    if len(found) > 1:
+        raise ValidationError(
+            "more than one copy of Gitea's data exists ("
+            + ", ".join(found) + ") and nothing records which one is current, "
+            "so Gitea was not started on either")
+    return found[0] if found else gitea.GITEA_DATA_VOLUME
+
+
+def _running_gitea_version(container: str = gitea.GITEA_CONTAINER) -> str:
+    """The release a gitea container runs: its label, else its image tag. ""
+    when neither reads as a version — the upgrade refuses on that rather than
+    compare against something it cannot parse."""
+    r = run(["docker", "container", "inspect", container, "-f",
+             '{{index .Config.Labels "' + GITEA_VERSION_LABEL + '"}}|'
+             '{{.Config.Image}}'], capture_output=True)
+    if r.returncode != 0:
+        return ""
+    label, _, image = (r.stdout or "").strip().partition("|")
+    for cand in (label, image.rpartition(":")[2] if ":" in image else ""):
+        if cand and _GITEA_VERSION_RE.fullmatch(cand):
+            return cand
+    return ""
+
+
+def gitea_version_info() -> dict:
+    """What the Infrastructure row shows: the running release, the shipped one,
+    any upgrade in progress or kept, and whether one holds gitea right now.
+    Pure reads — docker inspects and host files — so a page load can call it."""
+    exists = container_exists(gitea.GITEA_CONTAINER)
+    try:
+        target = _gitea_pinned_version(load_versions())
+    except SystemExit:
+        target = ""
+    upgrade = None
+    try:
+        rec = _read_upgrade_record()
+    except ValidationError:
+        rec = {"phase": "damaged", "from_version": "", "to_version": ""}
+    if rec is not None:
+        upgrade = {"phase": rec["phase"], "from_version": rec["from_version"],
+                   "to_version": rec["to_version"],
+                   "backup": rec.get("backup") or ""}
+    return {
+        "version": _running_gitea_version() if exists else "",
+        "target": target,
+        "upgrade": upgrade,
+        "upgrading": gitea_upgrading(),
+    }
+
+
+def _gitea_upgrade_backup_path(to_version: str) -> Path:
+    # One file per kept upgrade, at a name derived from the release it went to;
+    # a second upgrade cannot start while one is kept, so these never pile up.
+    return (BOARD_EXPORT_DIR / "pre-upgrade"
+            / f"{Path(BOARD_EXPORT_NAME).stem}-before-{to_version}.gpg")
+
+
+def gitea_upgrade_refusal() -> str | None:
+    """Why an upgrade cannot start right now, or None. Cheap reads only (docker
+    inspects and host files), so the broker can ask before it spawns anything;
+    the upgrade asks again once it holds the lock. Every text is browser-facing."""
+    try:
+        rec = _read_upgrade_record()
+    except ValidationError as e:
+        return str(e)
+    if rec is not None and rec["phase"] != "committed":
+        return GITEA_INTERRUPTED_MSG
+    if not container_exists(gitea.GITEA_CONTAINER):
+        return "Gitea isn't enabled — enable it in Management → Infrastructure first"
+    if rec is not None:
+        return (f"the previous version ({rec['from_version']}) is still kept "
+                f"— discard it first")
+    if container_exists(GITEA_PREVIOUS_CONTAINER):
+        return ("a previous Gitea container is still kept, but nothing records "
+                "which upgrade it belongs to, so a second upgrade would not know "
+                "what to keep")
+    running = _running_gitea_version()
+    if not running:
+        return "the running Gitea's version cannot be read, so it cannot be compared"
+    try:
+        target = _gitea_pinned_version(load_versions())
+    except SystemExit:
+        return "the shipped Gitea version is not a version number"
+    if not _version_older(running, target):
+        return f"Gitea {running} is already up to date (this software ships {target})"
+    if volume_exists(_GITEA_UPGRADE_VOLUME_PREFIX + target) \
+            and not _reclaimable_upgrade_volume(target):
+        return (f"a data volume for {target} already exists and is not a "
+                f"leftover of an earlier attempt, so the upgrade would not "
+                f"have a fresh place to copy to")
+    return None
+
+
+def _reclaimable_upgrade_volume(target: str) -> bool:
+    """Whether an existing `rs-gitea-data-<target>` is the leftover of an
+    upgrade attempt that was rolled back: labelled by an upgrade for exactly
+    this release, mounted by no container, and named by no record (a committed
+    upgrade's copy always has one). Anything else is refused, never removed."""
+    name = _GITEA_UPGRADE_VOLUME_PREFIX + target
+    r = run(["docker", "volume", "ls", "-q", "--filter",
+             f"label={GITEA_DATA_LABEL}={target}"], capture_output=True)
+    if r.returncode != 0 or name not in (r.stdout or "").split():
+        return False
+    try:
+        if _read_upgrade_record() is not None:
+            return False
+    except ValidationError:
+        return False
+    return not _volume_in_use(name)
+
+
+def _measure_kib(image: str, volume: str, script: str) -> int | None:
+    """Run a one-line measurement in a throwaway container with the volume
+    mounted read-only at /from; the script prints one integer (KiB)."""
+    r = run(["docker", "run", "--rm", "--entrypoint", "sh",
+             "-v", f"{volume}:/from:ro", image, "-c", script],
+            capture_output=True)
+    out = (r.stdout or "").strip()
+    return int(out) if r.returncode == 0 and out.isdigit() else None
+
+
+def _start_gitea_unlocked(host_port: str, *, tries: int | None = None) -> None:
+    """Start the gitea container and wait until it answers, taking no lock —
+    for callers that already hold it EXCLUSIVE (a second open of the lock in
+    the same process would refuse itself)."""
+    if not container_running(gitea.GITEA_CONTAINER):
+        run_check(["docker", "start", gitea.GITEA_CONTAINER])
+    _wait_for_gitea(host_port, tries=tries)
+
+
+def _wait_for_gitea_version(host_port: str, want: str, *, tries: int) -> None:
+    """Wait until gitea answers its version endpoint WITH THE ADMIN TOKEN and
+    reports ``want``. One call proves three things: the new release is serving,
+    it is the release asked for, and the stored token still authenticates
+    against the migrated database. die()s when the tries run out."""
+    url = f"http://127.0.0.1:{host_port}/api/v1/version"
+    token = gitea.read_admin_token()
+    seen = ""
+    for _ in range(tries):
+        # A release that exited (or that docker is restarting after a crash)
+        # will not answer however long this waits; stop at once so the
+        # rollback starts now rather than after the whole budget.
+        st = run(["docker", "container", "inspect", gitea.GITEA_CONTAINER, "-f",
+                  "{{.State.Running}} {{.State.Restarting}} {{.RestartCount}}"],
+                 capture_output=True)
+        state = (st.stdout or "").split()
+        if st.returncode != 0 or len(state) != 3 or state[0] != "true" \
+                or state[1] != "false" or state[2] != "0":
+            die(f"gitea {want} exited instead of starting")
+        req = urllib.request.Request(url, headers={"Authorization": f"token {token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=GITEA_PROBE_MAX_TIME_S) as resp:
+                seen = str(json.loads(resp.read().decode() or "{}").get("version") or "")
+                if seen == want:
+                    return
+        except (OSError, ValueError):
+            pass
+        time.sleep(1)
+    die(f"gitea did not answer as {want} in time"
+        + (f" (it reported {seen})" if seen else ""))
+
+
+def _restore_previous_gitea(rec: dict, host_port: str, progress) -> bool:
+    """Put the release from before an upgrade back on its untouched data, from
+    whatever state an upgrade left. Every step tolerates the state not being
+    there; each is by name. Returns whether gitea answers afterwards. Clears the
+    record only when it does — otherwise the record is what lets Recover finish
+    the job later. Caller holds the lock EXCLUSIVE."""
+    progress.step("rollback", f"putting Gitea {rec['from_version']} back")
+    old_image = "gitea/gitea:" + rec["from_version"]
+    live = _container_data_volume(gitea.GITEA_CONTAINER)
+    if not container_exists(GITEA_PREVIOUS_CONTAINER) and (
+            not container_exists(gitea.GITEA_CONTAINER) or live == rec["to_volume"]):
+        # The kept container is gone and nothing original remains to restart:
+        # the old release will be RECREATED below.
+        if not volume_exists(rec["from_volume"]):
+            # ...unless its untouched data is gone too: nothing to put back,
+            # so leave whatever runs alone.
+            return False
+        # Have its image BEFORE the new container is taken down, so an
+        # offline host keeps what it has. (A rollback from before the rename
+        # still has the original rs-gitea and never gets here.)
+        if not run_quiet(["docker", "image", "inspect", old_image]):
+            if run(["docker", "pull", old_image], capture_output=True).returncode != 0:
+                return False
+    if _container_data_volume(gitea.GITEA_CONTAINER) == rec["to_volume"]:
+        run(["docker", "rm", "-f", gitea.GITEA_CONTAINER], capture_output=True)
+    run(["docker", "rm", "-f", GITEA_COPY_CONTAINER], capture_output=True)
+    if container_exists(GITEA_PREVIOUS_CONTAINER):
+        if container_exists(gitea.GITEA_CONTAINER):
+            # Something else holds the name — never remove a container this
+            # code did not make. Leave both; the caller reports Gitea down.
+            return False
+        run(["docker", "rename", GITEA_PREVIOUS_CONTAINER, gitea.GITEA_CONTAINER],
+            capture_output=True)
+    elif not container_exists(gitea.GITEA_CONTAINER):
+        # The kept container was removed by hand, but the original volume is
+        # never written by an upgrade, so the old release can be recreated on
+        # it exactly as it ran — its own version, never the shipped pin (which
+        # would migrate the only untouched copy forward).
+        try:
+            _run_gitea_container(old_image, rec["from_volume"],
+                                 rec["from_version"], host_port)
+        except SystemExit:
+            return False
+    if not container_exists(gitea.GITEA_CONTAINER):
+        return False
+    run(["docker", "update", f"--restart={GITEA_RESTART_POLICY}",
+         gitea.GITEA_CONTAINER], capture_output=True)
+    healthy = True
+    try:
+        _start_gitea_unlocked(host_port)
+    except SystemExit:
+        healthy = False
+    if (volume_exists(rec["to_volume"]) and not _volume_in_use(rec["to_volume"])
+            and rec["to_volume"] != rec["from_volume"]):
+        run(["docker", "volume", "rm", rec["to_volume"]], capture_output=True)
+    if healthy:
+        # Cleared even when the copy could not be removed: Gitea is back on its
+        # original data, and a leftover copy is reclaimed by the next upgrade
+        # (_reclaimable_upgrade_volume), so it cannot block a retry.
+        with contextlib.suppress(OSError):
+            _clear_upgrade_record()
+        progress.step("restored", f"Gitea {rec['from_version']} is back")
+    return healthy
+
+
+def _wire_after_gitea_moved() -> None:
+    """Reconnect every project to a gitea that was just recreated or renamed
+    (its address on each project network may have changed). Best-effort: the
+    data question is already settled by the time this runs."""
+    try:
+        wire_gitea_to_projects()
+    except SystemExit:
+        print("warning: reconnecting the projects to Gitea did not finish; "
+              "a host start reconnects them", file=sys.stderr)
+
+
+def dev_gitea_upgrade(req: "DevGiteaUpgradeRequest", progress=None) -> DevGiteaUpgradeResult:  # type: ignore[name-defined]
+    """Upgrade the shared gitea to the shipped release, keeping the old one.
+
+    Order, and why it is the design: everything that can fail without changing
+    anything runs first (the checks, the image pull, the space checks, the
+    backup), so those failures are plain refusals. Only then is gitea stopped.
+    From that point an upgrade record names the phase, and any failure before
+    the new release proves itself puts the old release back on its untouched
+    volume. The new release runs on a COPY; the old container and volume stay
+    as `rs-gitea-previous` until Discard."""
+    progress = progress or _NULL_PROGRESS
+    host_port = _gitea_host_port()
+    progress.step("wait", "waiting for other Gitea work to finish")
+    rollback_outcome = None
+    with _gitea_lock(exclusive=True, blocking=True):
+        refusal = gitea_upgrade_refusal()
+        if refusal:
+            raise ValidationError(refusal)
+        progress.step("gitea", "making sure Gitea is running")
+        try:
+            _start_gitea_unlocked(host_port)
+        except SystemExit:
+            raise HarnessError("Gitea is not answering, so it was not upgraded; "
+                               "nothing was changed")
+        old_image = _live_gitea_image()
+        from_version = _running_gitea_version()
+        from_volume = _container_data_volume(gitea.GITEA_CONTAINER)
+        if not from_volume:
+            raise ValidationError("Gitea's data is not on a named volume, so it "
+                                  "cannot be copied")
+        to_version = _gitea_pinned_version(load_versions())
+        to_volume = _GITEA_UPGRADE_VOLUME_PREFIX + to_version
+        new_image = "gitea/gitea:" + to_version
+
+        progress.step("pull", f"fetching Gitea {to_version}")
+        if not run_quiet(["docker", "image", "inspect", new_image]):
+            r = run(["docker", "pull", new_image], capture_output=True)
+            if r.returncode != 0:
+                raise HarnessError(f"Gitea {to_version} could not be downloaded; "
+                                   f"nothing was changed")
+
+        progress.step("space", "checking there is room for a copy")
+        need = _measure_kib(old_image, from_volume, "du -sk /from | cut -f1")
+        docker_free = _measure_kib(old_image, from_volume,
+                                   "df -Pk /from | tail -1 | awk '{print $4}'")
+        if need is None or docker_free is None:
+            raise HarnessError("the size of Gitea's data could not be measured; "
+                               "nothing was changed")
+        if docker_free < need:
+            raise HarnessError("there is not enough free disk space for a copy "
+                               "of Gitea's data; nothing was changed")
+        backup = _gitea_upgrade_backup_path(to_version)
+        probe_dir = backup.parent
+        while not probe_dir.exists() and probe_dir != probe_dir.parent:
+            probe_dir = probe_dir.parent
+        if shutil.disk_usage(probe_dir).free < need * 1024:
+            raise HarnessError("there is not enough free disk space for the "
+                               "pre-upgrade backup; nothing was changed")
+
+        progress.step("backup", "backing up the instance before upgrading")
+        try:
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            backup.parent.chmod(0o700)
+        except OSError:
+            raise HarnessError("the pre-upgrade backup could not be written; "
+                               "nothing was changed")
+        try:
+            gitea.dump_instance(container=gitea.GITEA_CONTAINER,
+                                passphrase=req.passphrase, out_path=backup,
+                                image=old_image,
+                                timeout=GITEA_UPGRADE_DUMP_TIMEOUT_S)
+        except gitea.GiteaError:
+            raise HarnessError("the pre-upgrade backup failed; nothing was "
+                               "changed — try again")
+
+        if volume_exists(to_volume):
+            # gitea_upgrade_refusal (re-run under the lock above) only lets this
+            # through for a leftover of a rolled-back attempt.
+            progress.step("reclaim", "removing the copy a failed attempt left")
+            r = run(["docker", "volume", "rm", to_volume], capture_output=True)
+            if r.returncode != 0:
+                raise HarnessError("a copy left by an earlier attempt could not "
+                                   "be removed; nothing was changed")
+        rec = {"from_version": from_version, "to_version": to_version,
+               "from_volume": from_volume, "to_volume": to_volume,
+               "backup": str(backup), "phase": "preparing"}
+        try:
+            _write_upgrade_record(rec)
+        except OSError:
+            raise HarnessError("the upgrade record could not be written; "
+                               "nothing was changed")
+        try:
+            progress.step("stop", f"stopping Gitea {from_version}")
+            run_check(["docker", "stop", gitea.GITEA_CONTAINER])
+            _set_upgrade_phase(rec, "copying")
+            progress.step("copy", "copying Gitea's data")
+            run_check(["docker", "volume", "create", "--label",
+                       f"{GITEA_DATA_LABEL}={to_version}", to_volume])
+            run(["docker", "rm", "-f", GITEA_COPY_CONTAINER], capture_output=True)
+            # As root: the volume holds files owned by root (the ssh host keys)
+            # and by git, and `cp -a` keeps both only when root copies.
+            run_check(["docker", "run", "--rm", "--name", GITEA_COPY_CONTAINER,
+                       "--entrypoint", "sh",
+                       "-v", f"{from_volume}:/from:ro", "-v", f"{to_volume}:/to",
+                       old_image, "-c", "cp -a /from/. /to/"])
+            # The two settings 28.x deprecated stay in the copied app.ini
+            # otherwise: the image only adds and updates entries from the
+            # environment, never removes them. Section-scoped, because
+            # ALLOWED_HOST_LIST is also the NEW key's name in two other
+            # sections. As the file's owner (uid 1000), so the rewritten file
+            # stays gitea's.
+            run_check(["docker", "run", "--rm", "--entrypoint", "sh",
+                       "--user", "1000:1000", "-v", f"{to_volume}:/to",
+                       old_image, "-c",
+                       "sed -i "
+                       "-e '/^\\[migrations\\]/,/^\\[/{/^ALLOWED_DOMAINS[[:space:]]*=/d}' "
+                       "-e '/^\\[webhook\\]/,/^\\[/{/^ALLOWED_HOST_LIST[[:space:]]*=/d}' "
+                       "/to/gitea/conf/app.ini"])
+            progress.step("switch", f"keeping Gitea {from_version} aside")
+            run_check(["docker", "rename", gitea.GITEA_CONTAINER,
+                       GITEA_PREVIOUS_CONTAINER])
+            _set_upgrade_phase(rec, "switching")
+            run_check(["docker", "update", "--restart=no", GITEA_PREVIOUS_CONTAINER])
+            progress.step("start", f"starting Gitea {to_version} on the copy")
+            _run_gitea_container(new_image, to_volume, to_version, host_port)
+            _set_upgrade_phase(rec, "starting")
+            progress.step("ready", f"waiting for Gitea {to_version} to finish "
+                                   f"migrating")
+            _wait_for_gitea_version(host_port, to_version,
+                                    tries=GITEA_UPGRADE_READY_TRIES)
+            _set_upgrade_phase(rec, "committed")
+        except (SystemExit, HarnessError, ValidationError, Exception) as e:
+            # SystemExit is a BaseException: named explicitly or it escapes.
+            print(f"upgrade failed after gitea was stopped: {e!r}", file=sys.stderr)
+            rollback_outcome = _restore_previous_gitea(rec, host_port, progress)
+    progress.step("wire", "reconnecting the projects to Gitea")
+    _wire_after_gitea_moved()
+    if rollback_outcome is True:
+        raise HarnessError(f"Gitea {to_version} did not start; {from_version} is "
+                           f"back on its untouched data")
+    if rollback_outcome is False:
+        raise HarnessError(f"Gitea {to_version} did not start, and {from_version} "
+                           f"could not be started again — Gitea is down; use "
+                           f"Recover in Management → Infrastructure")
+    return DevGiteaUpgradeResult(from_version=from_version, to_version=to_version,
+                                 backup=str(backup))
+
+
+def _recover_interrupted_upgrade(rec: dict, progress) -> None:
+    """Enable's recovery arm: an upgrade record that never reached `committed`
+    and nothing holding the lock means the upgrade was cut off. Put the old
+    release back exactly as the upgrade's own rollback would have."""
+    host_port = _gitea_host_port()
+    if (not container_exists(GITEA_PREVIOUS_CONTAINER)
+            and not volume_exists(rec["from_volume"])):
+        die(f"Gitea {rec['from_version']}'s data is missing, so the interrupted "
+            f"upgrade cannot be undone; nothing was changed")
+    try:
+        with _gitea_lock(exclusive=True, blocking=False):
+            ok = _restore_previous_gitea(rec, host_port, progress)
+    except _GiteaLockBusy:
+        die(GITEA_BUSY_MSG)
+    _wire_after_gitea_moved()
+    if not ok:
+        die(f"Gitea {rec['from_version']} could not be started again; it is down")
+
+
+def dev_gitea_discard_previous(_req: "DevGiteaDiscardPreviousRequest",
+                               progress=None) -> DevGiteaDiscardPreviousResult:  # type: ignore[name-defined]
+    """Remove the release kept after a successful upgrade: its container, its
+    data volume, the backup taken just before the upgrade, and the record.
+    This deletes the only way back, so it checks that it is removing exactly
+    what the record says was kept and never the live data.
+
+    Retryable: each piece already gone counts as removed, so a Discard cut off
+    part way (or a kept container removed by hand) is finished by pressing it
+    again rather than leaving a record nothing can clear."""
+    progress = progress or _NULL_PROGRESS
+    try:
+        with _gitea_lock(exclusive=True, blocking=False):
+            rec = _read_upgrade_record()
+            if rec is None or rec["phase"] != "committed":
+                raise ValidationError("there is no previous Gitea version kept")
+            if not container_running(gitea.GITEA_CONTAINER):
+                raise ValidationError("Gitea is not running, so the kept "
+                                      "previous version is not discarded — "
+                                      "it may still be needed")
+            live = _container_data_volume(gitea.GITEA_CONTAINER)
+            old = rec["from_volume"]
+            if (not old or old == live or old == rec["to_volume"]
+                    or not _GITEA_DATA_VOLUME_RE.fullmatch(old)):
+                raise ValidationError("the upgrade record does not name a kept "
+                                      "copy that is safe to remove, so nothing "
+                                      "was removed")
+            if container_exists(GITEA_PREVIOUS_CONTAINER):
+                if _container_data_volume(GITEA_PREVIOUS_CONTAINER) != old:
+                    raise ValidationError("the kept previous Gitea does not "
+                                          "match the upgrade record, so nothing "
+                                          "was removed")
+                progress.step("container", "removing the previous Gitea container")
+                run_check(["docker", "rm", GITEA_PREVIOUS_CONTAINER])
+            if volume_exists(old):
+                progress.step("volume", "removing the previous Gitea's data")
+                run_check(["docker", "volume", "rm", old])
+            removed_backup = False
+            backup = rec.get("backup") or ""
+            try:
+                if backup and Path(backup) == _gitea_upgrade_backup_path(rec["to_version"]):
+                    try:
+                        Path(backup).unlink()
+                        removed_backup = True
+                    except FileNotFoundError:
+                        pass
+                _clear_upgrade_record()
+            except OSError as e:
+                raise HarnessError("discarding the previous Gitea did not finish",
+                                   f"the previous container and its data are "
+                                   f"removed, but a file could not be "
+                                   f"({e.strerror or 'I/O error'}); press "
+                                   f"Discard again")
+    except _GiteaLockBusy:
+        raise ValidationError(GITEA_BUSY_MSG)
+    return DevGiteaDiscardPreviousResult(version=rec["from_version"],
+                                         backup_removed=removed_backup)
 
 
 def dev_passwd(req: "DevPasswdRequest", progress=None) -> DevPasswdResult:  # type: ignore[name-defined]

@@ -2124,6 +2124,69 @@ def cmd_dev_gitea_enable(_args: argparse.Namespace) -> None:
     print("Gitea enabled.")
 
 
+def _read_new_passphrase(what: str) -> str:
+    """A passphrase for a new encrypted backup: twice on a terminal (a typo is a
+    lost backup, and verification cannot catch it), one unstripped line when
+    piped (the request refuses whitespace rather than normalising it)."""
+    import getpass
+    if not sys.stdin.isatty():
+        return sys.stdin.readline().rstrip("\n")
+    try:
+        pp = getpass.getpass(f"{what} passphrase (input hidden): ")
+        again = getpass.getpass("Confirm passphrase: ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        die("aborted; nothing was changed")
+    if pp != again:
+        die("the two passphrases did not match; nothing was changed")
+    return pp
+
+
+def cmd_dev_gitea_upgrade(_args: argparse.Namespace) -> None:
+    """Upgrade the shared Gitea to the release this software ships (the CLI twin
+    of Management → Infrastructure's Upgrade). Backs the instance up first, runs
+    the new release on a copy of the data and keeps the old one until it is
+    discarded; a failure puts the old one back."""
+    info = rscore.gitea_version_info()
+    refusal = rscore.gitea_upgrade_refusal()
+    if refusal:
+        die(refusal)
+    print(f"Upgrading Gitea {info['version']} to {info['target']}. Gitea is "
+          f"unavailable for the duration, and running dev boxes are re-run once.")
+    pp = _read_new_passphrase("Pre-upgrade backup")
+    req = _build(rscore.DevGiteaUpgradeRequest, passphrase=pp)
+    try:
+        res = rscore.dev_gitea_upgrade(req)
+    except rscore.ValidationError as e:
+        die(str(e))
+    except rscore.HarnessError as e:
+        die(e.log_msg)
+    print(f"Gitea upgraded from {res.from_version} to {res.to_version}.")
+    print(f"  pre-upgrade backup: {res.backup}")
+    print(f"  Gitea {res.from_version} and its data are kept until you discard "
+          f"them (research dev gitea-discard-previous).")
+
+
+def cmd_dev_gitea_discard_previous(args: argparse.Namespace) -> None:
+    """Remove the Gitea release kept after an upgrade: container, data and the
+    pre-upgrade backup. This is the only way back, so it asks first."""
+    info = rscore.gitea_version_info()
+    up = info.get("upgrade") or {}
+    if up.get("phase") != "committed":
+        die("there is no previous Gitea version kept")
+    if not args.yes and not confirm(
+            f"Delete Gitea {up['from_version']}, its data and the pre-upgrade "
+            f"backup? This cannot be undone. Type 'yes': "):
+        die("aborted; nothing was removed")
+    try:
+        res = _call(rscore.dev_gitea_discard_previous,
+                    _build(rscore.DevGiteaDiscardPreviousRequest))
+    except rscore.HarnessError as e:
+        die(e.log_msg + (f" ({e.client_detail})" if e.client_detail else ""))
+    print(f"Discarded Gitea {res.version}"
+          + (" and its pre-upgrade backup." if res.backup_removed else "."))
+
+
 def cmd_dev_reviewer_token(_args: argparse.Namespace) -> None:
     """Store the dedicated reviewer account's long-lived setup-token — the
     one-time setup step for the sandboxed reviewer. Mint the token first with
@@ -2835,6 +2898,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="enable the shared Gitea backend (create if absent, else resume) — "
              "the CLI twin of the webui Management → Infrastructure button")
     dvge.set_defaults(func=cmd_dev_gitea_enable)
+    dvgu = dv_sub.add_parser(
+        "gitea-upgrade",
+        help="upgrade the shared Gitea to the release this software ships, "
+             "keeping the old one until it is discarded — the CLI twin of the "
+             "webui Management → Infrastructure Upgrade button")
+    dvgu.set_defaults(func=cmd_dev_gitea_upgrade)
+    dvgd = dv_sub.add_parser(
+        "gitea-discard-previous",
+        help="delete the Gitea release kept after an upgrade (its container, "
+             "data and pre-upgrade backup)")
+    dvgd.add_argument("--yes", action="store_true", help="do not ask first")
+    dvgd.set_defaults(func=cmd_dev_gitea_discard_previous)
     dvrt = dv_sub.add_parser(
         "reviewer-token",
         help="store the dedicated reviewer account's long-lived setup-token "

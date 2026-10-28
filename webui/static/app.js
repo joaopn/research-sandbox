@@ -3864,6 +3864,9 @@ function renderDevFetchScreen(view, body, result) {
     const gitea = result.gitea || {};
     const repos = Array.isArray(result.repos) ? result.repos : [];
     const attachments = Array.isArray(result.attachments) ? result.attachments : [];
+    // Before the not-enabled check: mid-upgrade the container is briefly
+    // renamed aside, and "isn't enabled" would be a lie.
+    if (devGiteaHeldNotice(body, gitea)) return;
     if (!gitea.exists) {
         const enable = el("button", { class: "btn-small" }, ["Enable Gitea"]);
         enable.onclick = () =>
@@ -4037,6 +4040,7 @@ function renderDevReposScreen(view, body, result) {
     // The list itself comes from gitea's search API, so a stopped gitea has
     // nothing to enumerate and nothing to toggle — the same Enable prompt as
     // the Fetch tab, not a special case.
+    if (devGiteaHeldNotice(body, gitea)) return;
     if (!gitea.exists || !gitea.running) {
         const enable = el("button", { class: "btn-small" }, ["Enable Gitea"]);
         enable.onclick = () =>
@@ -4600,6 +4604,7 @@ async function renderProjectFetchPane(container, repo) {
     container.innerHTML = "";
     const result = data.result;
     const gitea = result.gitea || {};
+    if (devGiteaHeldNotice(container, gitea)) return;
     if (!gitea.exists || !gitea.running) {
         const openDev = el("button", { class: "btn-small" },
                            ["Open Development"]);
@@ -4841,6 +4846,29 @@ async function appendInfraSection(view) {
             devEnableGiteaDialog(view, () => renderManagementInto(view));
         return b;
     };
+    const rerender = () => renderManagementInto(view);
+    const up = g.upgrade || null;
+    // While an upgrade or a restore holds Gitea, nothing here can act on it:
+    // say so instead of offering buttons that would only be refused.
+    if (g.upgrading) {
+        row.appendChild(el("span", { class: "type-badge" },
+                           ["being upgraded or restored…"]));
+        return;
+    }
+    // An upgrade that was cut off before the new version proved itself: Enable
+    // finishes it by putting the previous version back, so the button says so.
+    if (up && up.phase !== "committed") {
+        row.appendChild(el("span", { class: "type-badge" },
+                           [up.phase === "damaged"
+                               ? "upgrade record damaged"
+                               : `upgrade to ${up.to_version} interrupted`]));
+        if (up.phase !== "damaged") {
+            const rec = el("button", { class: "btn-small" }, ["Recover"]);
+            rec.onclick = () => devEnableGiteaDialog(view, rerender);
+            row.appendChild(rec);
+        }
+        return;
+    }
     if (!g.exists) {
         row.appendChild(el("span", { class: "type-badge" }, ["not enabled"]));
         row.appendChild(enableBtn());
@@ -4849,14 +4877,39 @@ async function appendInfraSection(view) {
     row.appendChild(el("span",
                        { class: g.running ? "state-running" : "state-stopped" },
                        [g.running ? "running" : "stopped"]));
+    if (g.version) row.appendChild(el("span", { class: "type-badge" }, [g.version]));
     if (!g.running) {
         row.appendChild(enableBtn());
     }
     // Enabled (running or stopped — the verb resumes a stopped gitea itself).
     const pwBtn = el("button", { class: "btn-small" }, ["Set Gitea password"]);
-    pwBtn.onclick = () =>
-        devGiteaPasswdDialog(view, () => renderManagementInto(view));
+    pwBtn.onclick = () => devGiteaPasswdDialog(view, rerender);
     row.appendChild(pwBtn);
+    if (up && up.phase === "committed") {
+        row.appendChild(el("span", { class: "type-badge" },
+                           [`previous version ${up.from_version} kept`]));
+        const discard = el("button", { class: "btn-small" }, ["Discard previous version"]);
+        discard.onclick = () => devGiteaDiscardPreviousDialog(view, g, rerender);
+        row.appendChild(discard);
+    } else if (g.running && g.version && g.target
+               && devVersionOlder(g.version, g.target)) {
+        const upBtn = el("button", { class: "btn-small" }, [`Upgrade to ${g.target}`]);
+        upBtn.onclick = () => devGiteaUpgradeDialog(view, g, rerender);
+        row.appendChild(upBtn);
+    }
+}
+
+// True when dotted-number version a is older than b ("1.25.1" < "28.2.0").
+// Display only: the broker decides for real and refuses when it disagrees.
+function devVersionOlder(a, b) {
+    const pa = String(a).split(".").map((n) => parseInt(n, 10));
+    const pb = String(b).split(".").map((n) => parseInt(n, 10));
+    if (pa.some(isNaN) || pb.some(isNaN)) return false;
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+        const x = pa[i] || 0, y = pb[i] || 0;
+        if (x !== y) return x < y;
+    }
+    return false;
 }
 
 // The reviewer's model/effort DEFAULT (the fifth model_catalog type). Unlike
@@ -5031,7 +5084,10 @@ const OP_CHECKLISTS = {
         { key: "validate", label: "checking the project" },
         { key: "discard", label: "discarding the box" },
     ],
-    // Keys LOCKSTEP with rscore._provision_gitea's progress.step() calls.
+    // Keys LOCKSTEP with rscore._provision_gitea's progress.step() calls. The
+    // Recover arm's steps (recover / rollback / restored) are deliberately NOT
+    // listed: they happen only when an interrupted upgrade is being finished,
+    // and unlisted keys are appended as they arrive.
     dev_gitea_start: [
         { key: "pull", label: "pulling the gitea image" },
         { key: "start", label: "starting gitea" },
@@ -5050,6 +5106,11 @@ const OP_CHECKLISTS = {
     // Keys LOCKSTEP with rscore `dev_board_discard`'s progress.step() call.
     dev_board_discard: [
         { key: "discard", label: "removing the backup" },
+    ],
+    // Keys LOCKSTEP with rscore `dev_gitea_discard_previous`'s progress.step() calls.
+    dev_gitea_discard_previous: [
+        { key: "container", label: "removing the previous Gitea container" },
+        { key: "volume", label: "removing the previous Gitea's data" },
     ],
 };
 
@@ -5071,6 +5132,121 @@ function devEnableGiteaDialog(view, onDone) {
         request: () => fetch("/broker/dev/gitea-start", { method: "POST" }),
         onDone: (ok) => { if (onDone) onDone(ok); },
     });
+}
+
+// Upgrade the shared Gitea to the release this software ships (Management →
+// Infrastructure). A detached broker op (the dev lane), so it tails the build
+// log terminal-first like a dev box. Step-up: the master password is retyped
+// and derived client-side; the backup passphrase rides the body to the broker
+// and on to the child's stdin, never a log.
+function devGiteaUpgradeDialog(view, g, onDone) {
+    const pp1 = el("input", { type: "password", autocomplete: "new-password" });
+    const pp2 = el("input", { type: "password", autocomplete: "new-password" });
+    const masterI = el("input", { type: "password", autocomplete: "current-password" });
+    mgmtConfirmThenTail(view, {
+        title: `Upgrade Gitea to ${g.target}`,
+        tailTitle: `Upgrading Gitea to ${g.target}`,
+        verb: "dev_gitea_upgrade",
+        tailMode: "buildlog",
+        confirmLabel: "Upgrade",
+        body: [
+            el("p", {}, [
+                `Gitea ${g.version} is upgraded to ${g.target}. First the whole `
+                + "instance is backed up; then Gitea stops, its data is copied, "
+                + `and ${g.target} starts on the copy. If ${g.target} does not `
+                + `start, ${g.version} is put back on its untouched data.`,
+            ]),
+            el("p", {}, [
+                "While it runs (usually a minute or two) Gitea is unavailable, "
+                + "and other actions that use it wait. Afterwards every running "
+                + "dev box is restarted once to pick up Gitea's new address — "
+                + "an agent session running inside a dev box at that moment is "
+                + "interrupted.",
+            ]),
+            el("p", {}, [
+                `${g.version} and its data stay on this machine, taking as `
+                + "much disk space as all your repositories, until you discard "
+                + "them. Upgrading is one-way: once anything is written to "
+                + `${g.target}, going back means losing it.`,
+            ]),
+            el("p", {}, [
+                "Choose a passphrase for the backup. It is not your master "
+                + "password, and there is no way to recover it.",
+            ]),
+            el("div", { class: "field" }, [
+                el("label", {}, ["Backup passphrase"]), pp1,
+            ]),
+            el("div", { class: "field" }, [
+                el("label", {}, ["Repeat it"]), pp2,
+            ]),
+            el("div", { class: "field" }, [
+                el("label", {}, ["Re-enter your master password"]), masterI,
+            ]),
+        ],
+        // The board export's checks, for the same reasons (devBoardExportDialog).
+        validate: () => {
+            if (pp1.value.length < 8) return "Passphrase must be at least 8 characters.";
+            if (pp1.value !== pp1.value.trim()) {
+                return "Passphrase must not start or end with a space.";
+            }
+            if (pp1.value !== pp2.value) return "Passphrases do not match.";
+            if (!masterI.value) return "Re-enter your master password.";
+            return null;
+        },
+        request: async () => fetch("/broker/dev/gitea-upgrade", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                passphrase: pp1.value,
+                proof: await deriveLoginProof(masterI.value),
+            }),
+        }),
+        onDone: (ok) => { if (onDone) onDone(ok); },
+        focus: () => pp1.focus(),
+    });
+}
+
+// Delete the Gitea release kept after an upgrade. Step-up: it removes the only
+// way back.
+function devGiteaDiscardPreviousDialog(view, g, onDone) {
+    const up = g.upgrade || {};
+    const masterI = el("input", { type: "password", autocomplete: "current-password" });
+    mgmtConfirmThenTail(view, {
+        title: `Discard Gitea ${up.from_version}`,
+        tailTitle: `Discarding Gitea ${up.from_version}`,
+        verb: "dev_gitea_discard_previous",
+        confirmLabel: "Discard",
+        danger: true,
+        body: [
+            el("p", {}, [
+                `Deletes Gitea ${up.from_version}, its copy of the data, and the `
+                + "backup taken just before the upgrade. After this there is no "
+                + `way back to ${up.from_version}. Do it once ${up.to_version} has `
+                + "worked for you.",
+            ]),
+            el("div", { class: "field" }, [
+                el("label", {}, ["Re-enter your master password"]), masterI,
+            ]),
+        ],
+        validate: () => masterI.value ? null : "Re-enter your master password.",
+        request: async () => fetch("/broker/dev/gitea-discard-previous", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ proof: await deriveLoginProof(masterI.value) }),
+        }),
+        onDone: (ok) => { if (onDone) onDone(ok); },
+        focus: () => masterI.focus(),
+    });
+}
+
+// The one-line notice every Gitea-backed page shows while an upgrade (or a
+// restore) holds Gitea, instead of a "stopped" card whose Enable would only be
+// refused. Returns true when it rendered.
+function devGiteaHeldNotice(container, gitea) {
+    if (!gitea || !gitea.upgrading) return false;
+    container.appendChild(el("div", { class: "mgmt-empty" }, [
+        el("span", {}, ["Gitea is being upgraded or restored. This page works "
+                        + "again when that finishes."]),
+    ]));
+    return true;
 }
 
 // Set the sandbox-admin gitea password (Management → Infrastructure). Step-up:
@@ -5155,10 +5331,11 @@ function opChecklist(verb) {
         return items[key];
     };
     for (const it of checklist) addRow(it.key, it.label);
-    const markDone = (key) => {
+    const markDone = (key, msg) => {
         // A conditional stage not pre-listed (e.g. update enable/disable) appends
-        // already-checked as it arrives.
-        const ref = items[key] || addRow(key, key);
+        // already-checked as it arrives, labelled by its message when it has one
+        // (a raw step key reads as jargon: "recover", "rollback").
+        const ref = items[key] || addRow(key, msg || key);
         ref.row.classList.remove("pending");
         ref.row.classList.add("ok");
         ref.icon.textContent = "✓";
@@ -5237,7 +5414,7 @@ async function mgmtTailOp(view, backdrop, card, opId, title, verb, onDone) {
                 else if (rec.status === "failed") { sawTerminal = true; terminalOk = false; }
                 else if (rec.step === "warning" && rec.msg) markWarn(rec.msg);
                 else if (rec.step === "note" && rec.msg) markNote(rec.msg);
-                else markDone(rec.step);
+                else markDone(rec.step, rec.msg);
             }
         }
         return null;
@@ -5592,7 +5769,7 @@ async function lifecycleTail(view, backdrop, card, opId, title, verb, project,
         if (entry) lifecycleSetQueued(project, opId, false);
         if (rec.step === "warning" && rec.msg) { markWarn(rec.msg); return; }
         if (verb === "agents_update" && rec.msg) markMsg(rec.msg);
-        else markDone(rec.step);
+        else markDone(rec.step, rec.msg);
     }, () => dismissed);
     if (res === null) return;                   // sent to the background
     if (res.auth) {
@@ -5960,6 +6137,7 @@ async function mgmtTailBuildLog(view, backdrop, card, opId, title, onDone,
     card.appendChild(el("div", { class: "btn-row" }, bgBtn ? [bgBtn, doneBtn] : [doneBtn]));
 
     let logFrom = 0, viewFrom = 0, done = false, ok = false, sawTerminal = false, interrupted = false;
+    let failMsg = "";
     // A replay from a corner notice may have no page behind it (view null):
     // an expired session then just closes the box — there is no view to land
     // a login card in.
@@ -6004,7 +6182,13 @@ async function mgmtTailBuildLog(view, backdrop, card, opId, title, onDone,
                 if (!line.trim()) continue;
                 let rec; try { rec = JSON.parse(line); } catch (e) { continue; }
                 if (rec.status === "done") { sawTerminal = true; ok = true; }
-                else if (rec.status === "failed") { sawTerminal = true; ok = false; }
+                else if (rec.status === "failed") {
+                    sawTerminal = true; ok = false;
+                    // The broker's failure text, when the lane writes one for
+                    // the operator (the Gitea upgrade says whether the old
+                    // release is back or Gitea is down).
+                    failMsg = rec.msg || "";
+                }
                 else {
                     if (rec.msg) phaseEl.textContent = rec.msg;
                     if (opts.onRecord) {
@@ -6079,7 +6263,16 @@ async function mgmtTailBuildLog(view, backdrop, card, opId, title, onDone,
         phaseEl.textContent = "interrupted";
         failEl.textContent = "Interrupted — the process stopped without finishing. Check the log above.";
     } else if (ok) { phaseEl.textContent = "done"; }
-    else { phaseEl.textContent = "failed"; failEl.textContent = "Failed — see the log above."; }
+    else {
+        phaseEl.textContent = "failed";
+        // Only a lane's operator text is worth repeating; the coarse tokens
+        // other lanes write would just say "failed" twice.
+        const coarse = ["build failed", "review failed", "invalid request",
+                        "provision failed", "upgrade failed", "failed"];
+        failEl.textContent = (failMsg && !coarse.includes(failMsg))
+            ? `Failed — ${failMsg}. See the log above.`
+            : "Failed — see the log above.";
+    }
     doneBtn.textContent = "Done";
     doneBtn.disabled = false;
 }
