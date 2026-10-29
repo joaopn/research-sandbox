@@ -1160,7 +1160,8 @@ VERBS = {
 STEP_UP_VERBS = frozenset({"destroy", "box_remove", "dev_repo_remove",
                            "dev_passwd", "dev_purge_consumer",
                            "dev_board_export", "dev_board_discard",
-                           "dev_gitea_upgrade", "dev_gitea_discard_previous"})
+                           "dev_gitea_upgrade", "dev_gitea_discard_previous",
+                           "dev_gitea_rollback"})
 
 # Deny-by-default gating: a verb in VERBS but NOT in this read allowlist
 # requires a valid session token. Inverting the set (vs an explicit *gated*
@@ -1663,6 +1664,17 @@ def _verb_dev_gitea_upgrade(args: dict, progress=None) -> dict:
     return dataclasses.asdict(rscore.dev_gitea_upgrade(req, progress))
 
 
+# Going back takes no browser field: the step-up proof is its only input, and
+# dispatch reads (and drops) it before this filter.
+DEV_GITEA_ROLLBACK_WEBUI_FIELDS: frozenset = frozenset()
+
+
+def _verb_dev_gitea_rollback(args: dict, progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in DEV_GITEA_ROLLBACK_WEBUI_FIELDS}
+    req = rscore.DevGiteaRollbackRequest.from_kwargs(**safe)
+    return dataclasses.asdict(rscore.dev_gitea_rollback(req, progress))
+
+
 # The lane's SINGLE source of truth: verb → (webui field allowlist, request
 # class for the dispatch-side PRE-SPAWN shape validation, verb fn the child
 # executes). DEV_BOX_DISPATCH is DERIVED below so the two key sets cannot
@@ -1681,15 +1693,21 @@ _DEV_LANE_VERBS = {
     "dev_gitea_upgrade": (
         DEV_GITEA_UPGRADE_WEBUI_FIELDS, rscore.DevGiteaUpgradeRequest,
         _verb_dev_gitea_upgrade),
+    # Going back from an upgrade: the old release's start (and possibly its
+    # image pull) plus the projects' reconnect — detached for the same reason.
+    "dev_gitea_rollback": (
+        DEV_GITEA_ROLLBACK_WEBUI_FIELDS, rscore.DevGiteaRollbackRequest,
+        _verb_dev_gitea_rollback),
 }
 
 # Lane verbs whose failure text is written for the operator and carries no host
 # path by construction (their ValidationError and HarnessError.log_msg texts),
 # so the view log shows it instead of the lane's coarse token. The upgrade's
 # operator needs to know whether Gitea is back or down; "failed" says neither.
-_DEV_LANE_OPERATOR_TEXT = frozenset({"dev_gitea_upgrade"})
+_DEV_LANE_OPERATOR_TEXT = frozenset({"dev_gitea_upgrade", "dev_gitea_rollback"})
 # The coarse token a lane verb's unexpected failure shows; provisions keep theirs.
-_DEV_LANE_FAIL_TOKEN = {"dev_gitea_upgrade": "upgrade failed"}
+_DEV_LANE_FAIL_TOKEN = {"dev_gitea_upgrade": "upgrade failed",
+                        "dev_gitea_rollback": "rollback failed"}
 
 # The child-only vocabulary — NOT in VERBS / BUILD_DISPATCH / REVIEW_DISPATCH.
 DEV_BOX_DISPATCH = {v: spec[2] for v, spec in _DEV_LANE_VERBS.items()}
@@ -1734,28 +1752,34 @@ def _live_review_ops() -> list[str]:
     return [p.stem for p in names if _review_lock_alive(p.stem)]
 
 
-# Actions that touch gitea and are refused while an upgrade or a restore holds
-# it: they would stop, start, write to or read from a gitea whose data is being
-# moved. Applied at every dispatch site that can reach them (inline, the dev
-# lane, the review lane, the lifecycle lane).
+# The dev-lane verbs that move Gitea's data: from their spawn until their child
+# releases the gitea lock, everything else that reaches Gitea waits.
+_GITEA_MOVING_VERBS = frozenset({"dev_gitea_upgrade", "dev_gitea_rollback"})
+
+# Actions that touch gitea and are refused while an upgrade, a go-back or a
+# restore holds it: they would stop, start, write to or read from a gitea whose
+# data is being moved. Applied at every dispatch site that can reach them
+# (inline, the dev lane, the review lane, the lifecycle lane).
 _GITEA_GATED_VERBS = frozenset({
     "create", "destroy", "box_add", "box_remove",
     "dev_repo_remove", "dev_purge_consumer", "dev_passwd",
     "dev_set_active_fork", "dev_sync", "dev_attach", "dev_detach",
     "dev_board_export", "dev_gitea_start",
     "dev_box_provision", "dev_project_provision", "dev_gitea_upgrade",
+    "dev_gitea_rollback", "dev_gitea_discard_previous",
     "review_pr",
     "start", "stop", "update", "agents_update",
 })
 
 
 def _gitea_held(verb: str = "") -> str | None:
-    """Why gitea-touching work must wait, or None: an upgrade or a restore holds
-    gitea (its child holds the gitea lock, or an upgrade was spawned and its
-    child has not reached the lock yet), or an interrupted upgrade left an
-    unverified release that only Recover may settle — anything written to it
-    now would be thrown away. Enable is exempt from the second: it IS Recover."""
-    if any(op["verb"] == "dev_gitea_upgrade" for op in _live_dev_lane_ops()):
+    """Why gitea-touching work must wait, or None: an upgrade, a go-back or a
+    restore holds gitea (its child holds the gitea lock, or an upgrade or a
+    go-back was spawned and its child has not reached the lock yet), or an
+    interrupted upgrade or go-back left a state only Recover may settle —
+    anything written to Gitea now would be thrown away. Enable is exempt from
+    the second: it IS Recover."""
+    if any(op["verb"] in _GITEA_MOVING_VERBS for op in _live_dev_lane_ops()):
         return rscore.GITEA_BUSY_MSG
     reason = rscore._gitea_held_reason()
     if reason and reason != rscore.GITEA_BUSY_MSG and verb in _PERSISTENT_HOLD_EXEMPT:
@@ -2414,11 +2438,12 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
                             _err("busy", f"{safe.get('project')} is starting, "
                                          "stopping or updating — try again "
                                          "when it finishes"))
-        if verb == "dev_gitea_upgrade":
+        if verb in _GITEA_MOVING_VERBS:
             # Refuse here what the child would refuse anyway, so the browser
             # hears it at once instead of from a failed tail. The child asks
             # again under the gitea lock.
-            refusal = rscore.gitea_upgrade_refusal()
+            refusal = (rscore.gitea_upgrade_refusal() if verb == "dev_gitea_upgrade"
+                       else rscore.gitea_rollback_refusal())
             if refusal:
                 return _audited(principal, "validation", _err("validation", refusal))
             # Nothing that reaches gitea may be in flight: a provision, a review

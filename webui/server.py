@@ -1598,6 +1598,24 @@ async def broker_dev_gitea_upgrade_handler(request: web.Request) -> web.Response
     SECRET: it rides this body and the broker envelope only (no _start_op, so no
     OP_RUNS copy, never a log). `proof` is forwarded explicitly — this handler
     hand-picks its args, and a dropped proof reads as a wrong password."""
+    return await _relay_dev_gitea_lane(request, "dev_gitea_upgrade", "upgrade",
+                                       ("passphrase", "proof"))
+
+
+async def broker_dev_gitea_rollback_handler(request: web.Request) -> web.Response:
+    """POST /broker/dev/gitea-rollback {proof} — go back from a successful
+    upgrade to the release kept beside it (gated, origin-checked, STEP-UP). On
+    the broker's detached dev lane like the upgrade; the proof is its only
+    field."""
+    return await _relay_dev_gitea_lane(request, "dev_gitea_rollback", "rollback",
+                                       ("proof",))
+
+
+async def _relay_dev_gitea_lane(request: web.Request, verb: str, kind: str,
+                                fields: tuple) -> web.Response:
+    """The dev-lane relay both Gitea moves share: the hand-picked ``fields``
+    from the body, an op_id minted here, a synchronous relay (the broker
+    spawns and answers at once), and {op_id} back for the log tail."""
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")
     s = _broker_session(request)
@@ -1610,10 +1628,10 @@ async def broker_dev_gitea_upgrade_handler(request: web.Request) -> web.Response
         body = {}
     if not isinstance(body, dict):
         body = {}
-    args = {"passphrase": body.get("passphrase"), "proof": body.get("proof")}
-    op_id = _mint_op_id("dev-gitea", "upgrade")
+    args = {k: body.get(k) for k in fields}
+    op_id = _mint_op_id("dev-gitea", kind)
     try:
-        reply = await broker_call("dev_gitea_upgrade", args,
+        reply = await broker_call(verb, args,
                                   token=s["broker_token"], op_id=op_id,
                                   timeout=BROKER_CALL_TIMEOUT_S)
     except BrokerUnavailable:
@@ -3716,6 +3734,8 @@ def main() -> None:
     app.router.add_post("/broker/dev/gitea-start", broker_dev_gitea_start_handler)
     app.router.add_post("/broker/dev/gitea-upgrade",
                         broker_dev_gitea_upgrade_handler)
+    app.router.add_post("/broker/dev/gitea-rollback",
+                        broker_dev_gitea_rollback_handler)
     app.router.add_post("/broker/dev/gitea-discard-previous",
                         broker_dev_gitea_discard_previous_handler)
     app.router.add_post("/broker/dev/passwd", broker_dev_passwd_handler)

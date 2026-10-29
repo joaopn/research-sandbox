@@ -2148,11 +2148,15 @@ def cmd_dev_gitea_upgrade(_args: argparse.Namespace) -> None:
     the new release on a copy of the data and keeps the old one until it is
     discarded; a failure puts the old one back."""
     info = rscore.gitea_version_info()
+    # No lock is held here, so the probe is safe; a record mid-move is busy,
+    # not interrupted.
+    if rscore.gitea_upgrading():
+        die(rscore.GITEA_BUSY_MSG)
     refusal = rscore.gitea_upgrade_refusal()
     if refusal:
         die(refusal)
     print(f"Upgrading Gitea {info['version']} to {info['target']}. Gitea is "
-          f"unavailable for the duration, and running dev boxes are re-run once.")
+          f"unavailable for the duration, and a running dev box may be re-run once.")
     pp = _read_new_passphrase("Pre-upgrade backup")
     req = _build(rscore.DevGiteaUpgradeRequest, passphrase=pp)
     try:
@@ -2164,7 +2168,8 @@ def cmd_dev_gitea_upgrade(_args: argparse.Namespace) -> None:
     print(f"Gitea upgraded from {res.from_version} to {res.to_version}.")
     print(f"  pre-upgrade backup: {res.backup}")
     print(f"  Gitea {res.from_version} and its data are kept until you discard "
-          f"them (research dev gitea-discard-previous).")
+          f"them (research dev gitea-discard-previous); until then you can go "
+          f"back to it (research dev gitea-rollback).")
 
 
 def cmd_dev_gitea_discard_previous(args: argparse.Namespace) -> None:
@@ -2172,8 +2177,13 @@ def cmd_dev_gitea_discard_previous(args: argparse.Namespace) -> None:
     pre-upgrade backup. This is the only way back, so it asks first."""
     info = rscore.gitea_version_info()
     up = info.get("upgrade") or {}
-    if up.get("phase") != "committed":
+    if up.get("phase") is None:
         die("there is no previous Gitea version kept")
+    if up["phase"] == "damaged":
+        die(rscore._gitea_held_reason() or "the Gitea upgrade record is damaged")
+    if up["phase"] != "committed":
+        # The lock first: a record mid-move is busy, not interrupted.
+        die(rscore._gitea_held_reason() or rscore._gitea_interrupted_msg(up))
     if not args.yes and not confirm(
             f"Delete Gitea {up['from_version']}, its data and the pre-upgrade "
             f"backup? This cannot be undone. Type 'yes': "):
@@ -2185,6 +2195,32 @@ def cmd_dev_gitea_discard_previous(args: argparse.Namespace) -> None:
         die(e.log_msg + (f" ({e.client_detail})" if e.client_detail else ""))
     print(f"Discarded Gitea {res.version}"
           + (" and its pre-upgrade backup." if res.backup_removed else "."))
+
+
+def cmd_dev_gitea_rollback(args: argparse.Namespace) -> None:
+    """Go back from a successful upgrade to the Gitea release kept beside it
+    (the CLI twin of Management → Infrastructure's Go back). Everything written
+    to the new release since the upgrade is deleted, so it asks first."""
+    # Asked here, not inside the refusal: the verb re-asks that under its own
+    # exclusive lock, where this probe would read its own holder as busy.
+    if rscore.gitea_upgrading():
+        die(rscore.GITEA_BUSY_MSG)
+    refusal = rscore.gitea_rollback_refusal()
+    if refusal:
+        die(refusal)
+    up = rscore.gitea_version_info().get("upgrade") or {}
+    if not args.yes and not confirm(
+            f"Go back to Gitea {up['from_version']}? Everything written to Gitea "
+            f"since the upgrade to {up['to_version']} is deleted, and dev projects, "
+            f"boxes and mirrors set up since then lose their Gitea side. "
+            f"Type 'yes': "):
+        die("aborted; nothing was changed")
+    try:
+        res = _call(rscore.dev_gitea_rollback, _build(rscore.DevGiteaRollbackRequest))
+    except rscore.HarnessError as e:
+        die(e.log_msg + (f" ({e.client_detail})" if e.client_detail else ""))
+    print(f"Gitea {res.version} is back; {res.left_version} and everything written "
+          f"to it since the upgrade are no longer in Gitea.")
 
 
 def cmd_dev_reviewer_token(_args: argparse.Namespace) -> None:
@@ -2910,6 +2946,13 @@ def build_parser() -> argparse.ArgumentParser:
              "data and pre-upgrade backup)")
     dvgd.add_argument("--yes", action="store_true", help="do not ask first")
     dvgd.set_defaults(func=cmd_dev_gitea_discard_previous)
+    dvgr = dv_sub.add_parser(
+        "gitea-rollback",
+        help="go back from an upgrade to the Gitea release kept beside it, "
+             "deleting everything written since — the CLI twin of the webui "
+             "Management → Infrastructure Go back button")
+    dvgr.add_argument("--yes", action="store_true", help="do not ask first")
+    dvgr.set_defaults(func=cmd_dev_gitea_rollback)
     dvrt = dv_sub.add_parser(
         "reviewer-token",
         help="store the dedicated reviewer account's long-lived setup-token "

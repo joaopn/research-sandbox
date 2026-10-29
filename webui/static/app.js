@@ -2524,6 +2524,9 @@ async function renderDevBackupTab(view, body) {
     const info = (art && art.ok && art.result) ? art.result : {};
 
     if (!running) {
+        // Only in place of Enable: a held Gitea with a backup already on disk
+        // still shows where that file is.
+        if (devGiteaHeldNotice(body, gstate)) return;
         const enable = el("button", { class: "btn-small" }, ["Enable Gitea"]);
         enable.onclick = () => devEnableGiteaDialog(view, rerender);
         const retry = el("button", { class: "btn-small" }, ["Retry"]);
@@ -2832,6 +2835,11 @@ async function renderDevGiteaTab(view, body) {
         return;
     }
     const gstate = dev.result.gitea || {};
+    if (gstate.upgrading || (gstate.upgrade && gstate.upgrade.phase !== "committed")) {
+        body.innerHTML = "";               // the "Opening Gitea…" line
+        devGiteaHeldNotice(body, gstate);
+        return;
+    }
     if (!gstate.running) {
         body.innerHTML = "";
         const enable = el("button", { class: "btn-small" }, ["Enable Gitea"]);
@@ -4852,17 +4860,24 @@ async function appendInfraSection(view) {
     // say so instead of offering buttons that would only be refused.
     if (g.upgrading) {
         row.appendChild(el("span", { class: "type-badge" },
-                           ["being upgraded or restored…"]));
+                           ["being upgraded, put back or restored…"]));
         return;
     }
-    // An upgrade that was cut off before the new version proved itself: Enable
-    // finishes it by putting the previous version back, so the button says so.
+    // An upgrade cut off before the new version proved itself, or going back
+    // cut off part way: Enable finishes either by putting the previous version
+    // back, so the button says so.
     if (up && up.phase !== "committed") {
         row.appendChild(el("span", { class: "type-badge" },
                            [up.phase === "damaged"
                                ? "upgrade record damaged"
-                               : `upgrade to ${up.to_version} interrupted`]));
-        if (up.phase !== "damaged") {
+                               : up.phase === "rolling-back"
+                                   ? `going back to ${up.from_version} interrupted`
+                                   : `upgrade to ${up.to_version} interrupted`]));
+        if (up.phase === "rolling-back") {
+            const rec = el("button", { class: "btn-small" }, ["Recover"]);
+            rec.onclick = () => devGiteaRecoverRollbackDialog(view, up, rerender);
+            row.appendChild(rec);
+        } else if (up.phase !== "damaged") {
             const rec = el("button", { class: "btn-small" }, ["Recover"]);
             rec.onclick = () => devEnableGiteaDialog(view, rerender);
             row.appendChild(rec);
@@ -4888,6 +4903,9 @@ async function appendInfraSection(view) {
     if (up && up.phase === "committed") {
         row.appendChild(el("span", { class: "type-badge" },
                            [`previous version ${up.from_version} kept`]));
+        const back = el("button", { class: "btn-small" }, [`Go back to ${up.from_version}`]);
+        back.onclick = () => devGiteaRollbackDialog(view, g, rerender);
+        row.appendChild(back);
         const discard = el("button", { class: "btn-small" }, ["Discard previous version"]);
         discard.onclick = () => devGiteaDiscardPreviousDialog(view, g, rerender);
         row.appendChild(discard);
@@ -5158,16 +5176,17 @@ function devGiteaUpgradeDialog(view, g, onDone) {
             ]),
             el("p", {}, [
                 "While it runs (usually a minute or two) Gitea is unavailable, "
-                + "and other actions that use it wait. Afterwards every running "
-                + "dev box is restarted once to pick up Gitea's new address — "
-                + "an agent session running inside a dev box at that moment is "
+                + "and other actions that use it wait. Afterwards a running dev "
+                + "box may be restarted once to pick up Gitea's new address — "
+                + "an agent session running inside it at that moment is "
                 + "interrupted.",
             ]),
             el("p", {}, [
                 `${g.version} and its data stay on this machine, taking as `
                 + "much disk space as all your repositories, until you discard "
-                + "them. Upgrading is one-way: once anything is written to "
-                + `${g.target}, going back means losing it.`,
+                + `them. Until then you can go back to ${g.version}, but `
+                + `everything written to ${g.target} in the meantime is lost `
+                + "when you do.",
             ]),
             el("p", {}, [
                 "Choose a passphrase for the backup. It is not your master "
@@ -5237,15 +5256,95 @@ function devGiteaDiscardPreviousDialog(view, g, onDone) {
     });
 }
 
-// The one-line notice every Gitea-backed page shows while an upgrade (or a
-// restore) holds Gitea, instead of a "stopped" card whose Enable would only be
-// refused. Returns true when it rendered.
+// Go back from a successful upgrade to the release kept beside it. A detached
+// broker op (the dev lane), tailed like the upgrade. Step-up: it deletes
+// everything written to the new release.
+function devGiteaRollbackDialog(view, g, onDone) {
+    const up = g.upgrade || {};
+    const masterI = el("input", { type: "password", autocomplete: "current-password" });
+    mgmtConfirmThenTail(view, {
+        title: `Go back to Gitea ${up.from_version}`,
+        tailTitle: `Going back to Gitea ${up.from_version}`,
+        verb: "dev_gitea_rollback",
+        tailMode: "buildlog",
+        confirmLabel: "Go back",
+        danger: true,
+        body: [
+            el("p", {}, [
+                `Gitea ${up.to_version} is replaced by ${up.from_version}, on its `
+                + "data exactly as it was at the moment of the upgrade. "
+                + `Everything written to Gitea since then is deleted with ${up.to_version}'s `
+                + "data: issues, comments, pull requests, reviews, board changes "
+                + "and pushes. Agents keep the commits in their own clones and "
+                + "can push them again.",
+            ]),
+            el("p", {}, [
+                "Dev projects, dev boxes and mirrors set up since the upgrade "
+                + "lose their Gitea side, so their agents cannot push. Ones "
+                + "removed since then come back on the Gitea side, and their "
+                + "names cannot be reused. A Gitea password set since the "
+                + `upgrade goes back to the earlier one, and a Gitea backup taken `
+                + `on ${up.to_version} cannot be restored into ${up.from_version}.`,
+            ]),
+            el("p", {}, [
+                "While it runs Gitea is unavailable, and a running dev box may "
+                + "be restarted once afterwards. You can upgrade again later.",
+            ]),
+            el("div", { class: "field" }, [
+                el("label", {}, ["Re-enter your master password"]), masterI,
+            ]),
+        ],
+        validate: () => masterI.value ? null : "Re-enter your master password.",
+        request: async () => fetch("/broker/dev/gitea-rollback", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ proof: await deriveLoginProof(masterI.value) }),
+        }),
+        onDone: (ok) => { if (onDone) onDone(ok); },
+        focus: () => masterI.focus(),
+    });
+}
+
+// Recover for a go-back that was cut off: Enable finishes it, which deletes
+// the work done on the new release, so this dialog says so before it runs.
+function devGiteaRecoverRollbackDialog(view, up, onDone) {
+    mgmtConfirmThenTail(view, {
+        title: `Finish going back to Gitea ${up.from_version}`,
+        tailTitle: `Going back to Gitea ${up.from_version}`,
+        verb: "dev_gitea_start",
+        confirmLabel: "Recover",
+        danger: true,
+        body: [el("p", {}, [
+            `Going back to ${up.from_version} did not finish. Recover puts `
+            + `${up.from_version} back on its data from the moment of the upgrade `
+            + `and then deletes ${up.to_version}'s data, with everything written `
+            + "to it since the upgrade.",
+        ])],
+        request: () => fetch("/broker/dev/gitea-start", { method: "POST" }),
+        onDone: (ok) => { if (onDone) onDone(ok); },
+    });
+}
+
+// The one-line notice every Gitea-backed page shows while an upgrade, a
+// go-back or a restore holds Gitea, instead of a "stopped" card whose Enable
+// would only be refused — or, after one was cut off, would finish it without
+// the warning Management's Recover gives. Returns true when it rendered.
 function devGiteaHeldNotice(container, gitea) {
-    if (!gitea || !gitea.upgrading) return false;
-    container.appendChild(el("div", { class: "mgmt-empty" }, [
-        el("span", {}, ["Gitea is being upgraded or restored. This page works "
-                        + "again when that finishes."]),
-    ]));
+    if (!gitea) return false;
+    const up = gitea.upgrade;
+    let text = null;
+    if (gitea.upgrading) {
+        text = "Gitea is being upgraded, put back or restored. This page works "
+            + "again when that finishes.";
+    } else if (up && up.phase === "damaged") {
+        text = "Gitea's upgrade record is damaged, so it is not safe to tell which "
+            + "copy of Gitea's data is current. This page works again once the "
+            + "record is repaired.";
+    } else if (up && up.phase !== "committed") {
+        text = "An earlier Gitea upgrade or going back did not finish. Settle it "
+            + "under Management → Infrastructure first.";
+    }
+    if (!text) return false;
+    container.appendChild(el("div", { class: "mgmt-empty" }, [el("span", {}, [text])]));
     return true;
 }
 
@@ -6268,7 +6367,8 @@ async function mgmtTailBuildLog(view, backdrop, card, opId, title, onDone,
         // Only a lane's operator text is worth repeating; the coarse tokens
         // other lanes write would just say "failed" twice.
         const coarse = ["build failed", "review failed", "invalid request",
-                        "provision failed", "upgrade failed", "failed"];
+                        "provision failed", "upgrade failed", "rollback failed",
+                        "failed"];
         failEl.textContent = (failMsg && !coarse.includes(failMsg))
             ? `Failed — ${failMsg}. See the log above.`
             : "Failed — see the log above.";
