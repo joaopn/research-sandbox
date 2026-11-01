@@ -141,20 +141,21 @@ mkdir -p /workspace/.claude /workspace/.orchestrator/logs \
          /workspace/logbook/supervisor /workspace/logbook/pi \
          /workspace/shared /workspace/workers \
          /workspace/.workers /workspace/staging /workspace/results
-# /workspace/shared/data is the parent dir for `--data PATHS` bind-mounts
-# (one RO mount per host path at /workspace/shared/data/<basename>/).
-# Docker auto-creates it root-owned when any --data mount lands; we mkdir
-# it here only when no --data was passed, so the worker bind-mount of the
-# whole shared/ tree doesn't trip over a missing path.
-[[ -d /workspace/shared/data ]] || mkdir -p /workspace/shared/data
-# Same reclaim as /workspace above: `--data` bind-mounts force docker to
-# auto-create /workspace/shared root-owned BEFORE the entrypoint runs,
-# which breaks role-MCP enable (it mkdirs /workspace/shared/<role>/ as
-# the research user). Idempotent: if research.py's host-side pre-create
-# already won the race (newer projects), this is a no-op.
-if [[ "$(stat -c %U /workspace/shared)" != "research" ]]; then
-    sudo chown research:research /workspace/shared 2>/dev/null || true
-fi
+# /workspace/mnt is the parent of the project's mounted folders (`--mount
+# PATHS` / the dialog's "Mount folders": one RO bind per host path at
+# /workspace/mnt/<basename>/). Docker auto-creates it root-owned when any
+# such mount lands; mkdir it here when none did, so the worker and role-MCP
+# binds of the whole mnt/ tree never trip over a missing path.
+[[ -d /workspace/mnt ]] || mkdir -p /workspace/mnt
+# Same reclaim as /workspace above, for both parents a mount or the host-side
+# pre-create can leave root-owned before the entrypoint runs (a root-owned
+# shared/ breaks role-MCP enable, which mkdirs /workspace/shared/<role>/ as
+# the research user). Idempotent.
+for d in /workspace/mnt /workspace/shared; do
+    if [[ "$(stat -c %U "$d")" != "research" ]]; then
+        sudo chown research:research "$d" 2>/dev/null || true
+    fi
+done
 
 if [[ ! -f /workspace/.claude/CLAUDE.md ]]; then
     cp /opt/claude-templates/CLAUDE.md /workspace/.claude/CLAUDE.md

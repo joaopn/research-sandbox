@@ -36,7 +36,7 @@ Worker names are **project-permanent** once used, including after `rs-worker des
 
 ## Filesystem conventions
 
-- `/workspace/shared/data/<name>/` — project input data, read-only. Each subdir is one host path the PI passed via `--data` at project create (basename → subdir). The parent `/workspace/shared/data/` itself is just the namespace; the actual data lives one level down. Never write here.
+- `/workspace/mnt/<name>/` — host folders mounted read-only at project creation (`--mount`, or the dialog's "Mount folders"), one subfolder per host path (basename → subfolder). Workers and role services see them at the same path; a box only when the PI ticks `mnt` for it. The parent `/workspace/mnt/` itself is just the namespace; the folders live one level down. Never write here.
 - `/workspace/shared/` — what workers read, and what the PI may give a box read-only (a box sees a given folder at `/mnt/<folder>`). Put there what should be shared. A relative link between two folders a box was given resolves inside the box; an absolute link (`/workspace/...`), or one into a folder the box was not given, shows as broken there.
 - `/workspace/plan/draft/<name>.md` — proposal you wrote, **not yet PI-approved**. The only place you ever write a worker's plan. Auto-removed by `rs-worker spawn` once the plan has been promoted to canonical.
 - `/workspace/plan/<name>.md` — canonical plan for live or down workers, reflecting what the worker is currently doing. **Written only by `rs-worker spawn`** (from the file you pass to `--plan`). Never edit by hand: rewriting this file before approval destroys the prior canonical plan with no undo. Archived to `plan/archive/<name>.md` only on `rs-worker destroy`.
@@ -138,7 +138,7 @@ One or two sentences. What specifically is this worker answering this cycle?
 as prior-session memory.)
 
 ## Inputs
-Explicit paths the worker needs (e.g. /workspace/shared/data/<name>/…).
+Explicit paths the worker needs (e.g. /workspace/mnt/<name>/…).
 Any assumptions about format, schema, size.
 
 ## Deliverables
@@ -213,7 +213,7 @@ rs-worker spawn <name> --plan /workspace/plan/draft/<name>.md \
     [--data-mount /some/extra/path]
 ```
 
-`--plan` is **mandatory** and points at the PI-approved draft (see *Planning protocol*); the harness promotes it to canonical and removes the draft. `/workspace/shared/` is auto-mounted RO into every worker — `--data-mount` is only for paths outside `/workspace/shared/` (rare). `--mcps` is the structured truth for tool wiring (see *MCP servers* above); pass it whenever the plan's `## MCPs` lists anything other than `(none)`.
+`--plan` is **mandatory** and points at the PI-approved draft (see *Planning protocol*); the harness promotes it to canonical and removes the draft. `/workspace/shared/` and `/workspace/mnt/` are auto-mounted RO into every worker — `--data-mount` is only for paths outside both (rare). `--mcps` is the structured truth for tool wiring (see *MCP servers* above); pass it whenever the plan's `## MCPs` lists anything other than `(none)`.
 
 **One worker per thematic question.** Parallel facets of one PI question → multiple workers, all spawned before the first `rs-worker wait`. They run in parallel in the inner docker daemon.
 

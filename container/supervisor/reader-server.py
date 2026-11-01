@@ -103,7 +103,7 @@ READER_TEXT_SNIFF_BYTES = 4096
 # branch only — markdown and notebook rendering are unbounded, as they were before
 # this branch existed, so a huge .ipynb can still buffer whole. The render path
 # holds the whole body in memory and caches it, while a research project's
-# shared/data/ routinely holds multi-GB files. 4 MiB clears any real source file
+# mnt/ (the mounted folders) routinely holds multi-GB files. 4 MiB clears any real source file
 # by several times (the largest tracked file in this repo is 585 KB) and is about
 # as much monospace as a phone browser will lay out as one <pre>; ten times higher
 # would start evicting a notebook the operator is still scrolling out of the cache
@@ -491,7 +491,7 @@ def _listing(real: Path, rel: str) -> bytes:
             # non-UTF-8 bytes has no URL form at all. Skip the row: before the
             # deny-list, only the handful of agent-written folders could hold such
             # a name, and now one foreign file anywhere (a clone, a share dropped
-            # in shared/data/) would otherwise take the whole listing down with an
+            # in mnt/) would otherwise take the whole listing down with an
             # unsent response rather than lose one row.
             continue
         got = _resolve(quoted)                  # re-classify on realpath
@@ -622,7 +622,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         real, rel = got
         if not real.is_file():          # see the same guard in _route_view
             return self._fail(404, "not found")
-        # STREAM raw bytes rather than read the whole file into memory: shared/data/
+        # STREAM raw bytes rather than read the whole file into memory: mnt/
         # routinely holds multi-GB research files, and a few concurrent large GETs
         # would OOM the memory-capped supervisor. stat FIRST (a failure there 404s
         # cleanly, before any header is sent); then stream the body in kernel-sized

@@ -5,7 +5,7 @@ Stdlib only. Subcommand layout:
 
     research start                     # start shared infra (router)
     research stop                      # stop shared infra
-    research project create <name> [--data PATHS] [--profile python]
+    research project create <name> [--mount PATHS] [--profile python]
                                    [--dind auto|sysbox|privileged]
                                    [--memory SIZE] [--cpus N]
                                    [--egress open|locked] [--ssh-port N]
@@ -304,13 +304,13 @@ def _print_create_report(res, cfg) -> None:
     inner_fw = "on" if res.inner_firewall else "off"
     mcps_line = ", ".join(res.mcps) if res.mcps else "(none)"
     role_mcps_line = ", ".join(res.workers) if res.workers else "(none)"
-    if res.data_mounts:
-        data_lines = "\n".join(
-            f"             /workspace/shared/data/{b}/  ←  {src}"
-            for b, src in sorted(res.data_mounts.items()))
-        data_block = f"  Data (RO):\n{data_lines}\n"
+    if res.mounts:
+        mount_lines = "\n".join(
+            f"             /workspace/mnt/{b}/  ←  {src}"
+            for b, src in sorted(res.mounts.items()))
+        mount_block = f"  Mounted folders (RO):\n{mount_lines}\n"
     else:
-        data_block = ""
+        mount_block = ""
 
     # Webui block — show URL + import string only when rs-webui is up.
     if container_running(WEBUI_CONTAINER):
@@ -376,7 +376,7 @@ Project '{res.project}' is running.
   Inner FW:  {inner_fw}
   MCPs:      {mcps_line}
   Role-MCPs: {role_mcps_line}
-{data_block}  SSH:       research@localhost -p {res.ssh_port}   password: {res.ssh_password}
+{mount_block}  SSH:       research@localhost -p {res.ssh_port}   password: {res.ssh_password}
 {webui_block}
 Next steps:
 {next_steps}
@@ -419,7 +419,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         rscore.CreateRequest,
         name=args.name, workflow=args.workflow,
         egress=args.egress, dind=args.dind,
-        profile=args.profile, data=args.data, memory=args.memory,
+        profile=args.profile, mount=args.mount, memory=args.memory,
         cpus=args.cpus, ssh_port=args.ssh_port,
         inner_firewall=args.inner_firewall, enable=args.enable,
         disable=args.disable, role_mcp_upstream=args.role_mcp_upstream,
@@ -2361,11 +2361,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "`research workflow list` for the catalog; e.g. "
                         "'sandbox-dind' (agent-less DIND box host), 'sandbox' (a single "
                         "confined docker container).")
-    c.add_argument("--data", metavar="PATHS",
-                   help="comma-separated host paths, each mounted RO at "
-                        "/workspace/shared/data/<basename>/ (e.g. "
-                        "`--data /home/me/raw,/srv/parsed` lands as "
-                        "/workspace/shared/data/raw and .../parsed). "
+    c.add_argument("--mount", metavar="PATHS",
+                   help="comma-separated host folders, each mounted RO at "
+                        "/workspace/mnt/<basename>/ (e.g. "
+                        "`--mount /home/me/raw,/srv/parsed` lands as "
+                        "/workspace/mnt/raw and .../parsed). "
                         "Missing paths are mkdir -p'd. Basename collisions "
                         "across the list are a hard error.")
     c.add_argument("--profile", default="python", help="supervisor image profile")

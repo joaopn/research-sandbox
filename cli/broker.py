@@ -86,7 +86,7 @@ BROKER_LOG = BROKER_DIR / "broker.log"
 #   * View log → under run/ (RO-mounted into the webui at /run/rs-broker). Holds
 #     only allowlist-emit milestones (step key + safe description). Webui-visible.
 #   * Full log → under BROKER_DIR (the parent — HOST-ONLY, never mounted). Holds
-#     the verb's raw stdout+stderr, which carries host paths ("created data
+#     the verb's raw stdout+stderr, which carries host paths ("created mount
 #     directory: <abs path>", "=== Creating project: … ==="). Must stay outside
 #     the mount.
 BROKER_OPLOG_DIR = BROKER_RUN_DIR / "oplogs"        # .view.log — webui-visible
@@ -113,7 +113,7 @@ _OP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 # Max bytes in a single request frame. Lifecycle requests are tiny (a verb name
 # + a handful of short fields/lists); even a create with many --enable tokens
-# and several long --data host paths stays well under a few KiB. 64 KiB leaves
+# and several long --mount host paths stays well under a few KiB. 64 KiB leaves
 # generous headroom for any legitimate request while bounding the memory a
 # hostile peer can force from one frame. At ~6 KiB a legit create with several
 # long paths could brush the ceiling; at ~640 KiB we'd be allocating for input
@@ -388,13 +388,13 @@ def _verb_workflows(_args: dict, _progress=None) -> dict:
         # real gate is from_kwargs' node floor. Same "only offer what's deployable"
         # motive as `agents` staged-state.
         "node_present": rscore.node_dist_present(),
-        # The host-declared browser-mountable data roots (RESOLVED, as the gate
-        # compares them). The create form shows its data-mount control ONLY
-        # when this is non-empty (no dead-end control; the declaration is a
-        # host-side bootstrap step the browser never names). A malformed entry
-        # raises ValidationError here — fail-early on the Workflows page, the
-        # SSH-port-block posture — so a misconfiguration is seen, not hidden.
-        "data_roots": [str(r) for r in rscore.data_mount_roots()],
+        # The host-declared browser-mountable roots (RESOLVED, as the gate
+        # compares them). The create form shows its "Mount folders" control
+        # ONLY when this is non-empty (no dead-end control; the declaration is
+        # a host-side bootstrap step the browser never names). A malformed
+        # entry raises ValidationError here — fail-early on the Workflows page,
+        # the SSH-port-block posture — so a misconfiguration is seen, not hidden.
+        "mount_roots": [str(r) for r in rscore.mount_roots()],
         # Whether the install's Gitea is enabled: the create form offers a
         # history workflow's "Keep history on Gitea" switch only then (the
         # box window's listing carries the same bit).
@@ -559,7 +559,7 @@ def _verb_start(args: dict, progress=None) -> list[dict]:
 
 # The webui-settable subset of CreateRequest fields — the broker's input
 # boundary for `create`. Only these names are forwarded to from_kwargs, so a
-# relayed request can NEVER set a bind-mount source (`data`), pin a host
+# relayed request can NEVER set a bind-mount source (`mount`), pin a host
 # `ssh_port`, toggle `inner_firewall`, supply a `role_mcp_upstream`, or reach
 # any future path/host-shaped field — those stay CLI-only. Deny-by-default,
 # mirroring OPEN_VERBS: a new CreateRequest field is unreachable from the webui
@@ -567,9 +567,9 @@ def _verb_start(args: dict, progress=None) -> list[dict]:
 # (name regex, workflow membership, egress enum, enable/disable token lists).
 # `workflow` is the user-facing selector (substrate + flavor are derived from its
 # manifest, never relayed); the old `type` flag is gone (WORKFLOW_TAXONOMY_S3).
-# ONE gated exception lives OUTSIDE this set: `data` (a bind-mount SOURCE) is
+# ONE gated exception lives OUTSIDE this set: `mount` (a bind-mount SOURCE) is
 # honoured by _verb_create only through rscore's root gate — every relayed path
-# must resolve inside a host-declared DATA_MOUNT_ROOTS subtree — and is never
+# must resolve inside a host-declared MOUNT_ROOTS subtree — and is never
 # forwarded raw. It stays absent here on purpose: this set's contract ("never a
 # path/host-shaped field") is byte-for-byte unchanged, and the gate is the one
 # visibly-special line a reviewer has to look at.
@@ -644,18 +644,18 @@ UPDATE_WEBUI_FIELDS = frozenset({
 
 def _verb_create(args: dict, progress=None) -> dict:
     safe = {k: v for k, v in args.items() if k in CREATE_WEBUI_FIELDS}
-    # The webui data mounts (the maintainer-ruled, gated revision of the
-    # host-root boundary): a relayed `data` never reaches from_kwargs raw. Each
+    # The webui's mounted folders (the maintainer-ruled, gated revision of the
+    # host-root boundary): a relayed `mount` never reaches from_kwargs raw. Each
     # path is resolved (symlinks followed) and refused unless it lies at or
-    # under a root the operator declared host-side in .env (DATA_MOUNT_ROOTS,
-    # read fresh per request — no restart). What from_kwargs receives is the
+    # under a root the operator declared host-side in .env (MOUNT_ROOTS, read
+    # fresh per request — no restart). What from_kwargs receives is the
     # RESOLVED tuple. A refusal is a ValidationError BEFORE any side effect
     # (dispatch's validation envelope; nothing created). The coercion mirrors
     # from_kwargs' own (_as_tuple: a browser list or a comma string).
-    raw_data = args.get("data")
-    if raw_data is not None:
-        safe["data"] = rscore.resolve_data_paths_within_roots(
-            rscore._as_tuple(raw_data), rscore.data_mount_roots())
+    raw_mount = args.get("mount")
+    if raw_mount is not None:
+        safe["mount"] = rscore.resolve_mount_paths_within_roots(
+            rscore._as_tuple(raw_mount), rscore.mount_roots())
     req = rscore.CreateRequest.from_kwargs(**safe)  # may raise ValidationError
     return dataclasses.asdict(rscore.create(req, progress=progress))
 

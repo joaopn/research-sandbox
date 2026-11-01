@@ -427,7 +427,7 @@ def _mount_source(path: str) -> str:
     Two hazards, both silent. A relative path is refused by docker with an
     unhelpful error, and a path containing ':' RE-PARSES the spec into different
     fields entirely — so a file named `a:b` would mount something else, or
-    nothing, with no diagnostic. `_prepare_data_mounts` (rscore) resolves for the
+    nothing, with no diagnostic. `_prepare_mounts` (rscore) resolves for the
     same reason; the ':' refusal is explicit here because this path comes from an
     `--out`/positional argument rather than a validated config field.
     """

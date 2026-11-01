@@ -97,12 +97,19 @@ if [[ -f /workspace/.gitconfig-stash ]]; then
     echo "restored git identity from /workspace/.gitconfig-stash"
 fi
 
-# --- Workspace: only the orchestrator dir (extensions.json + project.json). No
-#     plan/logbook/workers tree — there are no workers and no supervisor agent.
+# --- Workspace: the orchestrator dir (extensions.json + project.json) and the
+#     parent of the mounted folders (--mount lands at /workspace/mnt/<name>/;
+#     docker auto-creates the parent root-owned when a mount lands, so reclaim
+#     it like /workspace). No plan/logbook/workers tree — there are no workers
+#     and no supervisor agent.
 if [[ "$(stat -c %U /workspace)" != "research" ]]; then
     sudo chown research:research /workspace 2>/dev/null || true
 fi
 mkdir -p /workspace/.orchestrator/logs
+[[ -d /workspace/mnt ]] || mkdir -p /workspace/mnt
+if [[ "$(stat -c %U /workspace/mnt)" != "research" ]]; then
+    sudo chown research:research /workspace/mnt 2>/dev/null || true
+fi
 
 # --- Start dockerd (DIND) in the background (hosts the inner boxes) ---
 if [[ "${DOCKER_DIND:-}" == "true" ]] && command -v dockerd >/dev/null 2>&1; then

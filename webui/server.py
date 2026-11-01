@@ -868,7 +868,7 @@ async def broker_create_handler(request: web.Request) -> web.Response:
     create a project (gated, origin-checked). Returns {op_id} immediately and
     runs the broker `create` as a background task; the browser tails the op log.
     The broker's CREATE_WEBUI_FIELDS allow-list is the real input boundary (it
-    drops `ssh_port`/any other path-shaped field; `data` is honoured only
+    drops `ssh_port`/any other path-shaped field; `mount` is honoured only
     through the broker's host-declared root gate), so the body is forwarded
     as-is. The longer create timeout bounds the background broker call (cold
     create stages inner images synchronously)."""

@@ -68,7 +68,7 @@ What specifically is this worker answering this cycle?
 as prior-session memory.)
 
 ## Inputs
-Explicit paths the worker needs (e.g. /workspace/shared/data/<name>/...).
+Explicit paths the worker needs (e.g. /workspace/mnt/<name>/...).
 Any assumptions about format, schema, size.
 
 ## Deliverables
@@ -421,7 +421,7 @@ project destroy <name|--all>       Remove container + workspace + network + cred
 
 ```
 --workflow <name>          Workflow selector (default: research). See `workflow list`.
---data <paths>             Comma-separated host paths, each RO at /workspace/shared/data/<basename>/
+--mount <paths>            Comma-separated host folders, each RO at /workspace/mnt/<basename>/
 --egress {open,locked}     Egress policy (research→open, sandbox→locked)
 --enable / --disable <ids> Worker services to (de)activate at create
 --mcp <names>              MCPs to auto-allow: 'all-enabled' (default), 'none', or a CSV of registry names

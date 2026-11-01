@@ -6721,10 +6721,10 @@ const MODEL_PICKER_SPECS = [
     ["role", "Role-MCPs", "Tool services workers call — one session per tool-call."],
 ];
 
-function mgmtCreateDialog(view, manifest, agents, nodePresent, dataRoots, giteaEnabled) {
+function mgmtCreateDialog(view, manifest, agents, nodePresent, mountRoots, giteaEnabled) {
     manifest = manifest || {};
     agents = Array.isArray(agents) ? agents : [];
-    dataRoots = Array.isArray(dataRoots) ? dataRoots : [];
+    mountRoots = Array.isArray(mountRoots) ? mountRoots : [];
     const workflow = manifest.name || "research";
     const isDocker = manifest.substrate === "docker";
     const hasWorkerLayer = !!manifest.has_worker_layer;
@@ -7059,35 +7059,36 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataRoots, giteaE
     const showClone = showInBox && !manifest.web;
     if (!showClone) cloneCb.checked = false;
 
-    // Mount host data (read-only, at /workspace/shared/data/<name>/ — the
-    // webui path to what the host CLI's --data does). Offered ONLY when the
-    // host declared mountable roots (the workflows verb's `data_roots`): no
+    // Mount folders (read-only, at /workspace/mnt/<name>/ — the webui path
+    // to what the host CLI's --mount does). Offered ONLY when the host
+    // declared mountable roots (the workflows verb's `mount_roots`): no
     // roots ⇒ no control at all (no dead-end control, and the browser never
     // names the host-side declaration). The broker is the gate — every path is
     // resolved server-side and refused outside the declared roots — so the
     // check below is an affordance. Not on the dev dialog: that POSTs to the
-    // detached dev lane, whose field set has no `data`. Same shape as the clone
+    // detached dev lane, whose field set has no `mount`. Same shape as the clone
     // group: a `.mgmt-check` toggle OUTSIDE any `.field` (the `.field` bleed
     // rule), the group collapsed until ticked.
-    const showData = !isDev && dataRoots.length > 0;
-    const dataCb = el("input", { type: "checkbox" });
-    const dataToggle = el("label", { class: "mgmt-check" }, [dataCb, " mount host data"]);
-    const dataI = el("input", { type: "text", autocomplete: "off",
-                                placeholder: dataRoots[0] ? dataRoots[0] + "/my-dataset" : "" });
-    const dataGroup = el("div", { class: "mgmt-docker-group" }, [
-        el("div", { class: "field" }, [el("label", {}, ["Host paths (comma-separated)"]), dataI]),
+    const showMount = !isDev && mountRoots.length > 0;
+    const mountCb = el("input", { type: "checkbox" });
+    const mountToggle = el("label", { class: "mgmt-check" }, [mountCb, " Mount folders"]);
+    const mountI = el("input", { type: "text", autocomplete: "off",
+                                placeholder: mountRoots[0] ? mountRoots[0] + "/my-dataset" : "" });
+    const mountGroup = el("div", { class: "mgmt-docker-group" }, [
+        el("div", { class: "field" }, [el("label", {}, ["Host paths (comma-separated)"]), mountI]),
         el("div", { class: "hint" }, [
-            "Each path is mounted read-only at /workspace/shared/data/<name>/ inside " +
+            "Each folder is mounted read-only at /workspace/mnt/<name>/ inside " +
             "the project (its final directory name), visible to the agent, every " +
-            "worker and every role service; a path that does not exist yet is " +
+            "worker and every role service, and to a box when ticked for it; a " +
+            "path that does not exist yet is " +
             "created. Paths must lie under one of the mountable roots declared " +
-            "on this host: " + dataRoots.join(", ") + ".",
+            "on this host: " + mountRoots.join(", ") + ".",
         ]),
     ]);
-    dataGroup.style.display = "none";
-    dataCb.onchange = () => { dataGroup.style.display = dataCb.checked ? "" : "none"; };
+    mountGroup.style.display = "none";
+    mountCb.onchange = () => { mountGroup.style.display = mountCb.checked ? "" : "none"; };
     // The tokens the payload sends: split on commas, trimmed, empties dropped.
-    const dataPaths = () => dataI.value.split(",").map((s) => s.trim()).filter((s) => s);
+    const mountPaths = () => mountI.value.split(",").map((s) => s.trim()).filter((s) => s);
 
     // Dev variant inputs — its OWN url/PAT fields, NOT the light-path repoI/patI
     // (different semantics: this URL is mirrored into the shared Gitea and the
@@ -7149,7 +7150,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataRoots, giteaE
             enableField,
             settingsRegion,
             ...(showClone ? [cloneToggle, cloneGroup] : []),
-            ...(showData ? [dataToggle, dataGroup] : []),
+            ...(showMount ? [mountToggle, mountGroup] : []),
             el("div", { class: "hint" }, [
                 "Creating stages container images and can take 10–30s (longer cold).",
             ]),
@@ -7184,13 +7185,13 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataRoots, giteaE
             }
             // Mirror the broker gate's first refusal (an absolute host path); the
             // root check itself is server-side only.
-            if (showData && dataCb.checked) {
-                const paths = dataPaths();
+            if (showMount && mountCb.checked) {
+                const paths = mountPaths();
                 // Ticked with nothing typed would silently create a project with no
                 // mount (the payload omits an empty list) — say so instead.
-                if (!paths.length) return "Enter at least one host path to mount, or untick \"mount host data\".";
+                if (!paths.length) return "Enter at least one host folder to mount, or untick \"Mount folders\".";
                 const bad = paths.find((s) => !s.startsWith("/"));
-                if (bad) return "Data paths must be absolute host paths (got: " + bad + ").";
+                if (bad) return "Mounted folders must be absolute host paths (got: " + bad + ").";
             }
             // Mirror the from_kwargs auth refusals so they surface in the form
             // rather than as a failed op. Read the key the same way the payload
@@ -7289,13 +7290,13 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataRoots, giteaE
             // reader; the docker box is exactly where node-based workflows run.
             if (nodeCb.checked) enableTokens.push("node");
             if (enableTokens.length) payload.enable = enableTokens;
-            // Data mounts ride as a LIST only when ticked and non-empty. Lockstep:
-            // `data` is deliberately NOT in CREATE_WEBUI_FIELDS — the broker
-            // honours it through its root gate (_verb_create) and refuses
-            // anything outside DATA_MOUNT_ROOTS before creating anything.
-            if (showData && dataCb.checked) {
-                const paths = dataPaths();
-                if (paths.length) payload.data = paths;
+            // Mounted folders ride as a LIST only when ticked and non-empty.
+            // Lockstep: `mount` is deliberately NOT in CREATE_WEBUI_FIELDS — the
+            // broker honours it through its root gate (_verb_create) and refuses
+            // anything outside MOUNT_ROOTS before creating anything.
+            if (showMount && mountCb.checked) {
+                const paths = mountPaths();
+                if (paths.length) payload.mount = paths;
             }
             if (showInBox) {
                 // ALWAYS send the explicit selection, [] included. An omitted key
@@ -7409,9 +7410,9 @@ function renderWorkflowsScreen(view, result) {
     }
     agents.forEach((a) => { if (a) a.isDefault = a.name === defaultAgent; });
     const nodePresent = !!result.node_present;   // STAGE_NODE_SEED: Node tickbox affordance
-    // Host-declared browser-mountable data roots: the create dialog's data-mount
+    // Host-declared browser-mountable roots: the create dialog's "Mount folders"
     // control exists only when this is non-empty. Refetched per render (no cache).
-    const dataRoots = Array.isArray(result.data_roots) ? result.data_roots : [];
+    const mountRoots = Array.isArray(result.mount_roots) ? result.mount_roots : [];
     const giteaEnabled = !!result.gitea_enabled;   // offers a history workflow's switch
     const explain = new Set(state.explainIndex || []);
     // A card's section: its declared group, else Store — the catch-all for a
@@ -7444,7 +7445,7 @@ function renderWorkflowsScreen(view, result) {
             el("div", { class: "workflows-card-desc" }, [m.description || ""]),
             el("div", { class: "workflows-card-actions" }, [tagsEl, action]),
         ]);
-        card.onclick = () => mgmtCreateDialog(view, m, agents, nodePresent, dataRoots,
+        card.onclick = () => mgmtCreateDialog(view, m, agents, nodePresent, mountRoots,
                                               giteaEnabled);
         return card;
     };

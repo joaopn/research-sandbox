@@ -687,6 +687,13 @@ def cmd_spawn(args: argparse.Namespace) -> None:
             target="/workspace/shared", source=str(WORKSPACE / "shared"),
             type="bind", read_only=True,
         ),
+        # So is mnt/ — the host folders mounted at project creation (--mount);
+        # the binds inside it ride along (a recursive bind). The supervisor
+        # entrypoint creates the folder, so the bind source always exists.
+        docker.types.Mount(
+            target="/workspace/mnt", source=str(WORKSPACE / "mnt"),
+            type="bind", read_only=True,
+        ),
     ]
     # Agent dist: RO copy-source the worker entrypoint cp's into its own ~/.local
     # at boot (no bake; STAGE_AGENT_DIST slice 2). The supervisor stages this at

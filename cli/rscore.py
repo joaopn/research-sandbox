@@ -865,7 +865,7 @@ class CreateRequest:
     egress: Egress | None = None          # None ⇒ config/flavor default at run time
     dind: DindMode | None = None          # None ⇒ cfg.default_dind at run time
     profile: str = "python"               # accepted for CLI parity; currently unused
-    data: tuple[str, ...] = ()
+    mount: tuple[str, ...] = ()
     memory: str = ""                      # "" ⇒ cfg.default_memory
     cpus: str = ""
     ssh_port: int | None = None
@@ -1302,7 +1302,7 @@ class CreateRequest:
             dind=_as_enum(DindMode, kw.get("dind"),
                           field_name="--dind", default=None),
             profile=kw.get("profile") or "python",
-            data=_as_tuple(kw.get("data")),
+            mount=_as_tuple(kw.get("mount")),
             memory=kw.get("memory") or "",
             cpus=kw.get("cpus") or "",
             ssh_port=ssh_port,
@@ -1504,7 +1504,7 @@ class CreateResult:
     workflow: str
     ssh_port: int
     ssh_password: str                       # in-memory only
-    data_mounts: dict[str, str] = field(default_factory=dict)   # basename → host src
+    mounts: dict[str, str] = field(default_factory=dict)        # basename → host src
     mcps: list[str] = field(default_factory=list)               # granted (best-effort)
     workers: list[str] = field(default_factory=list)            # enabled (all-or-abort)
     # Light-path harness result (non-secret; for the report). NEVER github_pat —
@@ -1887,21 +1887,21 @@ def project_ssh_port_range() -> tuple[int, int]:
     return lo, hi
 
 
-# Browser-mountable data roots (the webui create dialog's data mounts). The
+# Browser-mountable roots (the webui create dialog's "Mount folders"). The
 # operator declares, once and host-side, the subtrees a BROWSER-created project
-# may bind-mount read-only under /workspace/shared/data/<basename>/; the broker
+# may bind-mount read-only under /workspace/mnt/<basename>/; the broker
 # refuses any relayed path that does not resolve (symlinks followed) to a
 # location at or under one of them. Host-side by construction: the webui can
 # never widen this list (it lives in the tracked .env, which no broker verb
 # writes). Read FRESH per request through read_env_value, like the SSH-port
 # block above — an edit takes effect on the next create with no restart. The
-# host CLI's --data is NOT gated: that caller already holds a host shell. The
+# host CLI's --mount is NOT gated: that caller already holds a host shell. The
 # key name is a lockstep with .env.example (pytest-pinned).
-DATA_MOUNT_ROOTS_KEY = "DATA_MOUNT_ROOTS"
+MOUNT_ROOTS_KEY = "MOUNT_ROOTS"
 
 
 def _resolve_host_path(raw: str, what: str) -> Path:
-    """Resolve an absolute host path string for the data-mount gate.
+    """Resolve an absolute host path string for the mount gate.
 
     Non-strict, so a not-yet-existing tail (a directory create() will mkdir)
     resolves as far as it exists; symlinks are followed, which is the whole
@@ -1919,34 +1919,34 @@ def _resolve_host_path(raw: str, what: str) -> Path:
         raise ValidationError(f"{what} is not a usable host path: {raw!r}")
 
 
-def data_mount_roots() -> tuple[Path, ...]:
+def mount_roots() -> tuple[Path, ...]:
     """The declared browser-mountable roots from .env, RESOLVED and de-duplicated
     (order kept). Unset or empty ⇒ (). A relative entry raises ValidationError
     naming the KEY only (the text reaches the browser verbatim through the
     workflows and create verbs — no file, no remedy), same wording rule as
     project_ssh_port_range."""
-    raw = read_env_value(DATA_MOUNT_ROOTS_KEY)
+    raw = read_env_value(MOUNT_ROOTS_KEY)
     roots: list[Path] = []
     for entry in raw.split(","):
         entry = entry.strip()
         if not entry:
             continue
-        r = _resolve_host_path(entry, f"{DATA_MOUNT_ROOTS_KEY} entry")
+        r = _resolve_host_path(entry, f"{MOUNT_ROOTS_KEY} entry")
         if r not in roots:
             roots.append(r)
     return tuple(roots)
 
 
-def resolve_data_paths_within_roots(paths: Sequence[str],
-                                    roots: Sequence[Path]) -> tuple[str, ...]:
-    """The browser data-mount gate: resolve each requested host path and refuse
+def resolve_mount_paths_within_roots(paths: Sequence[str],
+                                     roots: Sequence[Path]) -> tuple[str, ...]:
+    """The browser mount gate: resolve each requested host path and refuse
     it unless it is one of ``roots`` or lies strictly under one. Returns the
     RESOLVED paths as strings, de-duplicated (two spellings of one target — a
     symlink and its target — collapse here, else create()'s own basename
     collision check would self-collide), in request order.
 
     Deliberately NOT checked here: basename collisions and exists-but-not-a-dir
-    — create()'s data block keeps those for both front-ends. The refusal text
+    — create()'s mount block keeps those for both front-ends. The refusal text
     shows the RESOLVED path so a symlink escape is visible for what it is.
     Residual (accepted): a symlink swapped between this resolve and create()'s
     own resolve of the same string is a host-side race that needs write access
@@ -1956,13 +1956,13 @@ def resolve_data_paths_within_roots(paths: Sequence[str],
         raw = raw.strip()
         if not raw:
             continue
-        p = _resolve_host_path(raw, "data path")
+        p = _resolve_host_path(raw, "mount path")
         if not roots:
             raise ValidationError(
-                "no mountable data roots are declared on this host")
+                "no mountable roots are declared on this host")
         if not any(p == r or r in p.parents for r in roots):
             raise ValidationError(
-                f"data path {p} is outside the declared mountable roots "
+                f"mount path {p} is outside the declared mountable roots "
                 f"({', '.join(str(r) for r in roots)})")
         s = str(p)
         if s not in out:
@@ -1970,11 +1970,12 @@ def resolve_data_paths_within_roots(paths: Sequence[str],
     return tuple(out)
 
 
-def _prepare_data_mounts(paths: Sequence[str]) -> tuple[dict[str, Path], list[str]]:
-    """Turn the requested data paths into (basename → host source, docker -v
-    args), creating a missing directory (so a producer can start writing into
-    it later). Shared by both front-ends — the CLI's --data and the webui's
-    root-gated data field — so every refusal text here reaches the browser
+def _prepare_mounts(paths: Sequence[str]) -> tuple[dict[str, Path], list[str]]:
+    """Turn the requested host folders into (basename → host source, docker -v
+    args), each landing read-only at /workspace/mnt/<basename>/, creating a
+    missing directory (so a producer can start writing into it later). Shared
+    by both front-ends — the CLI's --mount and the webui's root-gated `mount`
+    field — so every refusal text here reaches the browser
     verbatim: flag-neutral, no host-filesystem remedy. Refusals are die()
     (a `failed` envelope through the broker; the CLI's normal exit), and a
     filesystem error while preparing a path (a file where a directory is
@@ -1983,7 +1984,7 @@ def _prepare_data_mounts(paths: Sequence[str]) -> tuple[dict[str, Path], list[st
     truncated reply. Missing-path creation is the ONLY side effect and only
     happens for a path the caller was allowed to name."""
     extra_mounts: list[str] = []
-    data_basenames: dict[str, Path] = {}
+    basenames: dict[str, Path] = {}
     for raw in paths:
         raw = raw.strip()
         if not raw:
@@ -1991,22 +1992,22 @@ def _prepare_data_mounts(paths: Sequence[str]) -> tuple[dict[str, Path], list[st
         p = Path(raw).expanduser().resolve()
         try:
             if p.exists() and not p.is_dir():
-                die(f"data path exists but is not a directory: {p}")
+                die(f"mount path exists but is not a directory: {p}")
             if not p.exists():
                 p.mkdir(parents=True, exist_ok=True)
-                print(f"created data directory: {p}")
+                print(f"created mount directory: {p}")
         except OSError as e:
-            die(f"data path cannot be prepared: {p} ({e.strerror or e})")
+            die(f"mount path cannot be prepared: {p} ({e.strerror or e})")
         base = p.name
         if not base:
-            die(f"data path has no basename (refusing to mount root): {p}")
-        if base in data_basenames:
-            die(f"data basename collision: {base!r} appears in both "
-                f"{data_basenames[base]} and {p}; each mounted path needs "
+            die(f"mount path has no basename (refusing to mount root): {p}")
+        if base in basenames:
+            die(f"mount basename collision: {base!r} appears in both "
+                f"{basenames[base]} and {p}; each mounted path needs "
                 "a distinct final directory name.")
-        data_basenames[base] = p
-        extra_mounts += ["-v", f"{p}:/workspace/shared/data/{base}:ro"]
-    return data_basenames, extra_mounts
+        basenames[base] = p
+        extra_mounts += ["-v", f"{p}:/workspace/mnt/{base}:ro"]
+    return basenames, extra_mounts
 
 
 def _coerce_export_port(value: Any) -> int:
@@ -3311,13 +3312,13 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     if egress not in ("open", "locked"):
         die(f"invalid --egress value: {egress!r} (expected open|locked)")
 
-    # Optional data bind-mounts (the CLI's --data, or the webui's data field
-    # after the broker's root gate — resolve_data_paths_within_roots hands
-    # this RESOLVED absolute paths), RO inside the container, each at
-    # /workspace/shared/data/<basename>/. Pure host-side preparation, no
-    # container yet: a refusal here leaves nothing but a directory created
-    # inside a path the caller was allowed to name.
-    data_basenames, extra_mounts = _prepare_data_mounts(req.data)
+    # Optional host-folder bind-mounts (the CLI's --mount, or the webui's
+    # `mount` field after the broker's root gate — resolve_mount_paths_within_roots
+    # hands this RESOLVED absolute paths), RO inside the container, each at
+    # /workspace/mnt/<basename>/. Pure host-side preparation, no container
+    # yet: a refusal here leaves nothing but a directory created inside a path
+    # the caller was allowed to name.
+    mount_basenames, extra_mounts = _prepare_mounts(req.mount)
 
     # Dev lane: resolve the base branch to a CONCRETE name BEFORE any side
     # effect. It has to be concrete because the clone and the agent's CLAUDE.md
@@ -3853,7 +3854,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         workflow=req.workflow,
         ssh_port=int(ssh_port),
         ssh_password=ssh_pass,
-        data_mounts={b: str(src) for b, src in data_basenames.items()},
+        mounts={b: str(src) for b, src in mount_basenames.items()},
         mcps=granted,
         workers=workers_enabled,
         repo=req.repo,
@@ -7941,7 +7942,7 @@ def _read_supervisor_metadata(container: str) -> dict:
     labels = (data.get("Config") or {}).get("Labels") or {}
 
     # Bind-mounts other than /workspace and the privileged-DIND volume —
-    # i.e. user-supplied --data paths under /workspace/shared/data/<basename>/.
+    # i.e. user-supplied --mount folders under /workspace/mnt/<basename>/.
     extra_mounts: list[str] = []
     for m in data.get("Mounts") or []:
         dst_in = m.get("Destination", "")
@@ -8514,7 +8515,7 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
     change. Far simpler than _recreate_supervisor: no inner dockerd, no image
     re-staging, no creds-stash dance (the box re-auths in place — greenfield-
     disposable). Workspace bind-mount, network, SSH port/password, agent-dist
-    mounts, and extra --data mounts all survive (recovered from the container's
+    mounts, and extra --mount folders all survive (recovered from the container's
     metadata before rm); the editor-dist mount is re-derived from the NEW
     code-server flag (host-cache sourced, so it just re-applies)."""
     container = container_name_for(project)
@@ -8565,7 +8566,7 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
         # The web app exactly as the old container carried it (its own env,
         # host-written at create; nothing inside the container can change it).
         web=md.get("web"))
-    # Recovered binds minus any prior editor-dist mount (agent-dist + --data mounts
+    # Recovered binds minus any prior editor-dist mount (agent-dist + --mount folders
     # pass through); re-derive the editor mount from the new flag (mirrors create).
     extra = _without_mount(md["extra_mounts"], EDITOR_DIST_MOUNT)
     if service_flags.get("code-server") and editor_dist_present():
@@ -10880,41 +10881,6 @@ def _role_mcp_inner_running(supervisor: str, role: str) -> bool:
     return r.returncode == 0 and r.stdout.strip() == "true"
 
 
-def _data_mount_args_from_supervisor(supervisor: str) -> list[str]:
-    """Harvest `--data` bind-mounts from the supervisor and return docker
-    `-v` args that propagate them RO into an inner container at the same
-    paths. Role-MCPs and PI containers gain visibility into the project's
-    `/workspace/shared/data/<basename>/` dirs that workers already see via
-    their RO mount of `<workspace>/shared/`.
-
-    Symmetric exposure: every inner container sees every `--data` path
-    the operator passed at `project create`. Per-role narrower visibility
-    would need a new flag (deferred — `--data` stays project-level).
-
-    The destination path inside the supervisor is itself a valid path on
-    the supervisor's filesystem (it's a bind-mount from the host); the
-    inner dockerd can bind that same path into a child container with
-    no further translation. We RO-pin it regardless of the supervisor's
-    own mount mode (operator may have writable `--data` in the future;
-    inner containers stay RO for the security posture)."""
-    r = run(["docker", "inspect", supervisor, "--format", "{{json .Mounts}}"],
-            capture_output=True)
-    if r.returncode != 0:
-        return []
-    try:
-        mounts = json.loads(r.stdout)
-    except json.JSONDecodeError:
-        return []
-    args: list[str] = []
-    for m in mounts:
-        if m.get("Type") != "bind":
-            continue
-        dst = m.get("Destination") or ""
-        if dst.startswith("/workspace/shared/data/"):
-            args += ["-v", f"{dst}:{dst}:ro"]
-    return args
-
-
 def _role_mcp_start(supervisor: str, project: str, cfg: "Config",
                     role: str, *, force_restage: bool = False) -> None:
     """Run the role-MCP container in the supervisor's inner dockerd.
@@ -11000,9 +10966,12 @@ def _role_mcp_start(supervisor: str, project: str, cfg: "Config",
         "-e", f"RS_ROLE_MAX_CONCURRENT_CALLS={int(mcc)}",
         "--label", f"research.role_mcp={role}",
         "--label", f"research.project={project}",
-        # Project --data paths, propagated RO at the same mount points
-        # the supervisor + workers see them at.
-        *_data_mount_args_from_supervisor(supervisor),
+        # The project's mounted folders (/workspace/mnt/<name>, --mount), RO at
+        # the same path the supervisor and the workers see them at: one bind
+        # of the parent, which the supervisor entrypoint guarantees exists;
+        # the host binds inside it ride along (a recursive bind), so a folder
+        # set at create is visible here without per-folder harvesting.
+        "-v", "/workspace/mnt:/workspace/mnt:ro",
         image,
     ]
     run_check(docker_args)

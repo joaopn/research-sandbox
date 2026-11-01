@@ -113,7 +113,7 @@ The shipped store workflows (`research workflow list`):
 | `scientific-agent-skills` | k-dense-ai/scientific-agent-skills | sandbox |
 
 ```bash
-python research.py project create lab --workflow research --data ~/data
+python research.py project create lab --workflow research --mount ~/data
 python research.py project create pipeline --workflow social-data-pipeline
 python research.py workflow list                 # the full catalog
 ```
@@ -160,15 +160,15 @@ The research flow, end to end on the CLI (the browser UI does all of this withou
 
 ```bash
 python research.py start                                   # 1. shared infra
-python research.py project create myproj --data /path/to/data   # 2. create
+python research.py project create myproj --mount /path/to/data  # 2. create
 python research.py project attach myproj                    # 3. sign in to Claude
 #   inside byobu:  claude  → complete OAuth → /exit → Ctrl-A D → exit
 #   (or VSCode Remote-SSH to research@localhost:<ssh-port> and use the Claude Code extension)
 ```
 
-Each `--data` path is mounted **read-only** at `/workspace/shared/data/<basename>/` (comma-separated for several). Credentials live **inside** the supervisor (never on the host), are copied into each worker at spawn, and are deleted on `destroy`.
+Each `--mount` folder is mounted **read-only** at `/workspace/mnt/<basename>/` (comma-separated for several). Credentials live **inside** the supervisor (never on the host), are copied into each worker at spawn, and are deleted on `destroy`.
 
-**4. Run a thread.** Describe what you want in plain English — *"Is the response-time distribution in `/workspace/shared/data/<name>/` heavy-tailed, and what does a typical user look like?"* The supervisor proposes worker plans, you say "go", it spawns workers, reviews their staged outputs, and asks you to accept.
+**4. Run a thread.** Describe what you want in plain English — *"Is the response-time distribution in `/workspace/mnt/<name>/` heavy-tailed, and what does a typical user look like?"* The supervisor proposes worker plans, you say "go", it spawns workers, reviews their staged outputs, and asks you to accept.
 
 **5. End the session.** Type `/log`. The supervisor writes a session log + per-topic executive summaries and shuts workers down cleanly.
 
@@ -247,7 +247,7 @@ python research.py start [--rebuild]                # build images + router + ca
 python research.py stop                             # stop ALL shared infra (projects untouched)
 
 # project lifecycle
-python research.py project create <name> [--workflow W] [--data PATHS] [--egress open|locked] [opts]
+python research.py project create <name> [--workflow W] [--mount PATHS] [--egress open|locked] [opts]
 python research.py project attach | ssh | status | list <name>
 python research.py project stop | start | destroy <name|--all>
 python research.py project update <name> [--rebuild] [--enable IDS] [--disable IDS]
@@ -287,7 +287,7 @@ research-sandbox/
 └── external/                     Vendored reference code (not a dependency)
 ```
 
-Per-project workspace at `container_volumes/<proj>/workspace/`: `results/`, `logbook/{pi,supervisor}/`, `workers/<name>/work/`, `plan/`, `staging/`, `shared/data/<basename>/`, and `.orchestrator/{role-mcps,mcp-allow}.json` (the per-project registries).
+Per-project workspace at `container_volumes/<proj>/workspace/`: `results/`, `logbook/{pi,supervisor}/`, `workers/<name>/work/`, `plan/`, `staging/`, `mnt/<basename>/`, and `.orchestrator/{role-mcps,mcp-allow}.json` (the per-project registries).
 
 ## ◾ Roadmap
 
