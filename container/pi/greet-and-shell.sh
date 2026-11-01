@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # greet-and-shell.sh — print a starting message (MOTD), then drop into a login
-# shell. Baked into rs-ext-base, so every box tab (rs-pi-iso-<name>) can call
+# shell. Baked into rs-ext-base, so every box tab (rs-box-<name>) can call
 # it as the byobu new-session
 # command WITHOUT nesting single-quotes inside the tab's `docker exec … bash
 # -lc '…'` wrapper — the helper takes the greeting path as $1 instead.
@@ -11,6 +11,6 @@
 # ~/.local/bin on PATH and `claude` resolves (BUG_BUCKET B6).
 #
 # $1 — path to the greeting file. Missing/empty file is a clean no-op (the
-# pi-isolated case points at the not-yet-conventional /workspace/.rs-greeting).
+# box case points at the not-yet-conventional /workspace/.rs-greeting).
 cat "$1" 2>/dev/null
 exec bash -l

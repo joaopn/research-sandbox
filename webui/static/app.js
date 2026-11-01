@@ -7670,7 +7670,7 @@ function boxOpView() { return el("div"); }
 
 // After a box add/remove: the supervisor updated extensions.json, so the project's
 // tab set changed. Invalidate the cached services and, if the project is open,
-// re-activate it to surface the new / removed pi-iso tab. The box list itself
+// re-activate it to surface the new / removed box-term tab. The box list itself
 // re-loads on the next config-box open (the config box is dismissed when the op
 // modal takes a pointer-down).
 async function refreshAfterBoxChange(project) {
@@ -10487,7 +10487,7 @@ async function fillPassthroughList(view, table) {
 // nothing on a running box.
 function appendBoxFoldersSection(box, project, enabled) {
     const isDind = !!(enabled && enabled.supervisor && enabled.supervisor.box_harness);
-    const hasBoxes = Object.keys(enabled || {}).some((id) => id.startsWith("pi-iso-"));
+    const hasBoxes = Object.keys(enabled || {}).some((id) => id.startsWith("box-term-"));
     if (!isDind || !hasBoxes) return;
     const section = el("div", { class: "config-section" });
     section.appendChild(el("div", { class: "config-section-label" }, ["Box folders"]));
@@ -10626,13 +10626,13 @@ function appendExportedPortsSection(box, project) {
     const labelI = el("input", { type: "text", class: "config-port-label",
                                  placeholder: "label" });
     const addBtn = el("button", { class: "btn btn-secondary" }, ["Add"]);
-    // Box selector (F3 Slice 2b): a dind project's boxes each surface a pi-iso-<name>
+    // Box selector (F3 Slice 2b): a dind project's boxes each surface a box-term-<name>
     // service; the operator can expose a 127.0.0.1 port on one of them, or on the
     // supervisor (value ""). Absent when the project has no boxes.
     const svcs = (state.projectServices && state.projectServices[project.name]) || {};
     const boxNames = Object.keys(svcs)
-        .filter((id) => id.startsWith("pi-iso-"))
-        .map((id) => id.slice("pi-iso-".length))
+        .filter((id) => id.startsWith("box-term-"))
+        .map((id) => id.slice("box-term-".length))
         .sort();
     let boxSel = null;
     if (boxNames.length) {
@@ -11388,7 +11388,7 @@ function renderServiceTabs(projectName, enabled) {
 // inside defaultTabOrder as the never-arranged default. colIdx stamps
 // data-column — the tab's group — read by the drag's strip-drop resolution
 // and paintColumnActives.
-// A pi-iso-* tab is a disposable BOX (gets the ✕) when box_kind === "sandbox".
+// A box-term-* tab is a disposable BOX (gets the ✕) when box_kind === "sandbox".
 function makeServiceTab(id, ctx, colIdx = 0) {
     const svc = ctx.enabled[id];
     const refreshBtn = el("button", {
@@ -11411,8 +11411,8 @@ function makeServiceTab(id, ctx, colIdx = 0) {
     // A real box tab (box_kind === "sandbox") carries a ✕ that discards the box
     // in place — box deletion lives on the tab, not in a sidebar settings panel.
     const boxHarness = !!(ctx.enabled["supervisor"] && ctx.enabled["supervisor"].box_harness);
-    if (boxHarness && id.startsWith("pi-iso-") && svc.box_kind === "sandbox") {
-        const boxName = id.slice("pi-iso-".length);
+    if (boxHarness && id.startsWith("box-term-") && svc.box_kind === "sandbox") {
+        const boxName = id.slice("box-term-".length);
         const closeBtn = el("button", {
             class: "close-tab-btn", title: `Remove box "${boxName}"`,
         }, ["✕"]);

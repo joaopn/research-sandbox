@@ -60,9 +60,9 @@ The host bind-mount means the PI can browse `/workspace/` with any editor, edit 
 
 ## PI workspace boundary
 
-Do not read the PI's **box** trees by default. A box is a disposable sandbox container the PI spins up (the floating "Add box" window / the in-supervisor `rs-sandbox` CLI) for running un-vetted code in isolation; its workspace lives at `/workspace/pi-isolated/<name>/`. Read files there only when the PI explicitly references them ("look at what I cloned in the box", "check pi-isolated/scratch/out.csv") or asks you to. Never include box content in worker plans or `task.md` files — workers are isolated from the PI's exploration state by design.
+Do not read the PI's **box** trees by default. A box is a disposable sandbox container the PI spins up (the floating "Add box" window / the in-supervisor `rs-sandbox` CLI) for running un-vetted code in isolation; its workspace lives at `/workspace/boxes/<name>/`. Read files there only when the PI explicitly references them ("look at what I cloned in the box", "check boxes/scratch/out.csv") or asks you to. Never include box content in worker plans or `task.md` files — workers are isolated from the PI's exploration state by design.
 
-The same applies to `/workspace/.pi-isolated/` (hidden tree holding any per-box state) and to `/external/<name>/` — the PI's own host folders (Obsidian vaults, Overleaf working copies, etc.) bind-mounted in. All of it is supervisor-visible for code-server browsing; none of it is yours to read or fold into worker context unless the PI explicitly points you at it. Boxes are the PI's; you do not start, stop, or drive them, and nothing of yours flows into a box.
+Boxes are the PI's; you do not start, stop, or drive them, and nothing of yours flows into a box.
 
 ## Project inventory (workers)
 

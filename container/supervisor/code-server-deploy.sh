@@ -4,9 +4,9 @@
 # an interactive container's entrypoint ONLY when the caller has already checked the
 # coexistence guard: RS_SERVICE_CODE_SERVER=enabled, the /opt/editor-dist mount is
 # populated, and no system bake exists (! -e /usr/bin/code-server). Single source of
-# truth for the deploy so the three interactive entrypoints (pi / pi-isolated /
-# sandbox-box) don't each duplicate it. Mirrors the baked code-server block in
-# entrypoint.minimal.sh, but cp's the binary from the dist into our OWN ~/.local.
+# truth for the deploy so the interactive entrypoints (minimal / sandbox-dind /
+# supervisor / sandbox-box) don't each duplicate it. Each of them guards the call
+# the same way; the deploy cp's the binary from the dist into our OWN ~/.local.
 set -uo pipefail
 
 DIST="${EDITOR_DIST_MOUNT:-/opt/editor-dist}"

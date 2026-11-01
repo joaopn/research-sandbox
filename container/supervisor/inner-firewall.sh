@@ -31,7 +31,7 @@ PROXY_IP="${RS_INNER_PROXY_IP:-192.168.99.2}"
 # Role-MCP↔mcp-proxy traffic stays on the rs-inner bridge (L2) and bypasses
 # FORWARD entirely, so the proxy path doesn't need a hole here.
 ROLE_MCP_RANGE="${RS_INNER_ROLE_MCP_RANGE:-192.168.99.4/29}"
-# PI-direct boxes (rs-pi-iso-<name>, allocated by rs-sandbox at .14-.25)
+# PI-direct boxes (rs-box-<name>, allocated by rs-sandbox at .14-.25)
 # live in 192.168.99.10-99.25 — sixteen addresses, the box allocator's
 # slots plus a reservation. They run interactive `claude` sessions inside
 # byobu, which talk directly to api.anthropic.com (L3 egress, FORWARD

@@ -31,12 +31,12 @@
       <text x="240" y="136">Management host (dind)</text></g>
   </a>
   <a href="#components">
-    <g class="node"><title>rs-pi-iso-&lt;name&gt; boxes you create/destroy via rs-sandbox; isolated from each other and the host; boot un-authed.</title>
+    <g class="node"><title>rs-box-&lt;name&gt; boxes you create/destroy via rs-sandbox; isolated from each other and the host; boot un-authed.</title>
       <rect x="60" y="220" width="150" height="48" rx="8"/>
       <text x="135" y="244">Isolated box</text></g>
   </a>
   <a href="#components">
-    <g class="node"><title>rs-pi-iso-&lt;name&gt; boxes you create/destroy via rs-sandbox; isolated from each other and the host; boot un-authed.</title>
+    <g class="node"><title>rs-box-&lt;name&gt; boxes you create/destroy via rs-sandbox; isolated from each other and the host; boot un-authed.</title>
       <rect x="270" y="220" width="150" height="48" rx="8"/>
       <text x="345" y="244">Isolated box</text></g>
   </a>

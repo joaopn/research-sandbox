@@ -179,7 +179,7 @@ fi
 _HISTORY_SETUP_STEP = "( RS_HIST_MODE=setup\n" + _HISTORY_SCRIPT + ") || true"
 
 # The box's greeting, printed by its terminal tab when it opens a session
-# (webui services.pi_isolated_service → greet-and-shell.sh <this path>).
+# (webui services.box_term_service → greet-and-shell.sh <this path>).
 GREETING_FILE = ".rs-greeting"
 # Read-only folders: a top-level project folder ticked for a box is mounted
 # read-only at FOLDER_MOUNT_ROOT/<name>. MIRROR of rscore.BOX_FOLDER_NAME_RE
@@ -304,9 +304,9 @@ def die(msg: str) -> NoReturn:
 
 
 def box_container(name: str) -> str:
-    # iso- family: reuses the webui tab synthesis (pi_isolated_service) and the
+    # Box family: reuses the webui tab synthesis (box_term_service) and the
     # _recreate_supervisor restart delegation, which both key on this name.
-    return f"rs-pi-iso-{name}"
+    return f"rs-box-{name}"
 
 
 def _docker(*args: str) -> subprocess.CompletedProcess:
@@ -524,7 +524,7 @@ def _stage_box_workspace(name: str, preset: dict, mcps: list[str],
     ``base_branch`` (dev boxes) is substituted for BASE_BRANCH_TOKEN in the
     instructions, so the agent reads a literal branch name rather than a
     template. Empty for every other preset, whose text carries no token."""
-    ws = WORKSPACE / f"pi-isolated/{name}"
+    ws = WORKSPACE / f"boxes/{name}"
     ws.mkdir(parents=True, exist_ok=True)
     instr = (preset.get("instructions") or "").strip()
     if base_branch:
@@ -926,7 +926,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     read-only /mnt/<name> mount per folder that passes its check now; returns
     the structured warnings for the ones skipped (data only — never printed
     here: a failed op relays this command's stderr verbatim)."""
-    sub = f"pi-isolated/{name}"
+    sub = f"boxes/{name}"
     (WORKSPACE / sub).mkdir(parents=True, exist_ok=True)
     cname = box_container(name)
     image = BOX_IMAGE_BROWSER if browser else BOX_IMAGE
@@ -1176,7 +1176,7 @@ def _rerun_box(name: str, entry: dict) -> list[dict]:
     A dev entry re-resolves its gitea wiring FRESH (staged file + token) so the
     re-run bakes the CURRENT gitea IP into --add-host — this is the stale-IP heal."""
     mcps = [m for m in (entry.get("upstream_mcps") or []) if isinstance(m, str)]
-    ws = WORKSPACE / f"pi-isolated/{name}"
+    ws = WORKSPACE / f"boxes/{name}"
     ws.mkdir(parents=True, exist_ok=True)
     servers = _build_proxy_mcps(mcps, strict=False)
     (ws / ".mcp-proxy.json").write_text(
@@ -1777,15 +1777,15 @@ def cmd_discard(args: argparse.Namespace) -> None:
         # dockerd after a recreate may never have re-created it).
         _docker("network", "rm", f"{DEV_NET_PREFIX}{args.name}")
     # Drop the entry (box is gone either way). --keep-workspace leaves the
-    # box's artifacts on disk under pi-isolated/<name>/ for later retrieval;
+    # box's artifacts on disk under boxes/<name>/ for later retrieval;
     # the default is full teardown — a box is disposable.
     del entries[args.name]
     save(entries)
     if args.keep_workspace:
         print(f"box {args.name!r}: discarded (workspace preserved at "
-              f"pi-isolated/{args.name}/)")
+              f"boxes/{args.name}/)")
     else:
-        shutil.rmtree(WORKSPACE / f"pi-isolated/{args.name}", ignore_errors=True)
+        shutil.rmtree(WORKSPACE / f"boxes/{args.name}", ignore_errors=True)
         print(f"box {args.name!r}: discarded")
 
 

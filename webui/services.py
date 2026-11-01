@@ -20,7 +20,7 @@ import re
 # Tab order in the SPA = SERVICES dict insertion order. Editor (code-
 # server) is the primary work surface (notebooks, file editing, code-
 # reading); it leads. The project's terminal (byobu in its top-level
-# container) follows. Boxes are synthesized per-project (pi-iso-<name>),
+# container) follows. Boxes are synthesized per-project (box-term-<name>),
 # not static entries here.
 SERVICES = {
     "code-server": {
@@ -75,8 +75,8 @@ SERVICES = {
     # (The agent-less `management` tab was retired in STAGE_SANDBOX_DIND_AGENT —
     # sandbox-dind shows this same terminal tab, labelled SHELL_TAB_LABEL.)
     # Boxes (kind="sandbox") are NOT static entries — they're per-project and
-    # arbitrarily named, synthesized on demand as `pi-iso-<name>` tabs by
-    # project_services_handler (see pi_isolated_service below).
+    # arbitrarily named, synthesized on demand as `box-term-<name>` tabs by
+    # project_services_handler (see box_term_service below).
 }
 
 # The terminal tab's label for every project whose top-level container is not
@@ -88,20 +88,20 @@ SHELL_TAB_LABEL = "Shell (CLI)"
 
 
 # Boxes (kind="sandbox") are per-project and arbitrarily named, so they can't be
-# static SERVICES entries. Their tab id is `pi-iso-<name>` and the tab is
+# static SERVICES entries. Their tab id is `box-term-<name>` and the tab is
 # synthesized on demand: project_services_handler adds one per box entry in the
 # project's extensions.json, and `resolve()` reconstructs the command
 # server-side for the ssh handler.
 import re as _re
 
-PI_ISOLATED_ID_PREFIX = "pi-iso-"
+BOX_TERM_ID_PREFIX = "box-term-"
 # Same grammar as the box NAME_RE. Validated before the name is interpolated
 # into the docker-exec command string — a non-matching id is rejected (404)
 # rather than executed, closing shell-injection via the URL.
-_PI_ISOLATED_NAME_RE = _re.compile(r"^[a-z][a-z0-9-]*$")
+_BOX_NAME_RE = _re.compile(r"^[a-z][a-z0-9-]*$")
 
 
-def pi_isolated_service(name: str) -> dict | None:
+def box_term_service(name: str) -> dict | None:
     """Synthesize the tab/service spec for box ``name``, or None if the name
     fails validation.
 
@@ -116,7 +116,7 @@ def pi_isolated_service(name: str) -> dict | None:
     writes the box's CLAUDE.md / greeting at create). Using the helper also keeps
     the path out of single-quotes, so there's no nesting in this tab's
     ``docker exec … bash -c '…'`` wrapper."""
-    if not _PI_ISOLATED_NAME_RE.match(name):
+    if not _BOX_NAME_RE.match(name):
         return None
     return {
         "label": f"{name} (CLI)",
@@ -125,7 +125,7 @@ def pi_isolated_service(name: str) -> dict | None:
         "renderer": "xterm.js",
         "default_port": 22,
         "command": (
-            f"docker exec -it rs-pi-iso-{name} bash -c "
+            f"docker exec -it rs-box-{name} bash -c "
             "'byobu attach -t pi 2>/dev/null || "
             "byobu new-session -s pi -c /workspace -- "
             "/opt/pi-templates/greet-and-shell.sh /workspace/.rs-greeting'"
@@ -136,18 +136,19 @@ def pi_isolated_service(name: str) -> dict | None:
 # A box that opted into the editor publishes its code-server stub onto the
 # supervisor netns (inner `docker run -p <editor_port>:8443`), so the webui reaches
 # it at rs-project-<proj>:<editor_port> like any http service. The editor tab's id
-# uses a DISTINCT prefix (NOT `pi-iso-`): the box-remove ✕ in the SPA is gated on
-# `id.startsWith("pi-iso-")`, which must stay on the terminal tab only, and a
-# `pi-iso-editor-<name>` id would also collide with the terminal-tab id of a box
-# literally named `editor-<name>`. `box-editor-` sidesteps both.
-PI_ISOLATED_EDITOR_ID_PREFIX = "box-editor-"
+# uses a DISTINCT fixed prefix: the box-remove ✕ in the SPA is gated on
+# `id.startsWith("box-term-")`, which must stay on the terminal tab only. The two
+# prefixes are chosen so neither is a prefix of the other — a shared stem such as
+# `box-<name>` / `box-editor-<name>` would collide for a box literally named
+# `editor-<name>`; `box-term-` / `box-editor-` cannot.
+BOX_EDITOR_ID_PREFIX = "box-editor-"
 
 
-def pi_isolated_editor_service(name: str, port: int) -> dict | None:
+def box_editor_service(name: str, port: int) -> dict | None:
     """Synthesize the http editor tab for box ``name`` (its code-server published
     at supervisor-netns ``port``), or None if the name fails validation. Labelled
     with the bare box name — the terminal tab carries the ``(CLI)`` suffix."""
-    if not _PI_ISOLATED_NAME_RE.match(name):
+    if not _BOX_NAME_RE.match(name):
         return None
     return {
         "label": name,
@@ -322,7 +323,7 @@ def passthrough_service(host_port: int, label: str, count: int = 1) -> dict | No
 
 # A dev consumer's gitea FORK (the dev-workflow project's own agent, or a dev
 # box) — one tab per consumer+repo, linking to that fork's home page. Distinct
-# from every other prefix (`pi-iso-`, `box-editor-`, `port-`).
+# from every other prefix (`box-term-`, `box-editor-`, `port-`).
 DEV_FORK_ID_PREFIX = "git-"
 
 # The organisation that owns every Gitea-history notes repo — MIRROR of
@@ -359,7 +360,7 @@ def dev_fork_service(label: str, user: str, repo: str) -> dict | None:
 # A dev repo's Fetch window as a project-strip tab — one tab per DISTINCT repo
 # among the project's dev consumers (content is repo-scoped + active-fork
 # steered, so agent+box on the same repo share one tab). Distinct from every
-# other prefix (`git-`, `pi-iso-`, `box-editor-`, `port-`).
+# other prefix (`git-`, `box-term-`, `box-editor-`, `port-`).
 DEV_FETCH_ID_PREFIX = "fetch-"
 
 
@@ -421,14 +422,14 @@ def project_fetch_service(label: str) -> dict:
 
 
 def resolve(service_id: str) -> dict | None:
-    """Static registry lookup, falling back to a synthesized PI-isolated
-    spec for `pi-iso-<name>` ids. Used by the ssh handler so it can run the
+    """Static registry lookup, falling back to a synthesized box
+    spec for `box-term-<name>` ids. Used by the ssh handler so it can run the
     command for a per-project agent that isn't in the static registry."""
     svc = SERVICES.get(service_id)
     if svc is not None:
         return svc
-    if service_id.startswith(PI_ISOLATED_ID_PREFIX):
-        return pi_isolated_service(service_id[len(PI_ISOLATED_ID_PREFIX):])
+    if service_id.startswith(BOX_TERM_ID_PREFIX):
+        return box_term_service(service_id[len(BOX_TERM_ID_PREFIX):])
     return None
 
 

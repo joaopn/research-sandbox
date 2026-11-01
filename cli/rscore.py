@@ -9744,7 +9744,7 @@ def _reconcile_loopback_bridges(project: str, cfg: "Config") -> None:  # type: i
     ANY substrate — a docker box (F3 Slice 1) OR a research/sandbox-dind
     supervisor (Slice 2a, Fork-B). The forwarder binds that container's own bridge
     IP at each registered port and relays to 127.0.0.1, so a loopback app is
-    reachable at rs-project-<name>:<port>. Inner boxes (rs-pi-iso-<name>) are NOT
+    reachable at rs-project-<name>:<port>. Inner boxes (rs-box-<name>) are NOT
     reached here — they live one netns down and are published/forwarded by
     rs-sandbox (Slice 2b); this only ever exec's the top-level container.
     Host-orchestrated: the launches are host `docker exec -d` (the container has
@@ -9903,7 +9903,7 @@ def _restart_dev_boxes(project: str, cfg: "Config", gitea_ip: str) -> None:
         if not (isinstance(e, dict) and e.get("kind") == extension.SANDBOX_KIND
                 and (e.get("dev") or e.get("fetch"))):
             continue
-        cname = e.get("container") or f"rs-pi-iso-{name}"
+        cname = e.get("container") or f"rs-box-{name}"
         ins = run(["docker", "exec", container, "docker", "inspect", "-f",
                    "{{.State.Running}} {{json .HostConfig.ExtraHosts}}", cname],
                   capture_output=True)

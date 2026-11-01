@@ -1985,7 +1985,7 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
         return web.Response(status=403, text="Origin rejected")
 
     service_id = request.match_info.get("service", "")
-    # resolve() (not get()) so per-project PI-isolated tabs (`pi-iso-<name>`,
+    # resolve() (not get()) so per-project box terminal tabs (`box-term-<name>`,
     # not in the static registry) resolve to a synthesized spec. The
     # synthesizer validates the name before building the docker-exec command,
     # so a malformed id returns None → 404 rather than executing.
@@ -2270,7 +2270,7 @@ async def _assemble_services(request: web.Request, project: str,
                 out[sid] = {**svc, **({"origin_url": url} if url else {})}
 
     # Synthesized per-box tabs: boxes (kind="sandbox", STAGE_SANDBOX_PROJECT.md)
-    # ride the rs-pi-iso-<name> container/tab conventions. Same data-plane
+    # ride the rs-box-<name> container/tab conventions. Same data-plane
     # discipline — read off the /projects:ro bind-mount, no SSH/docker socket,
     # lifecycle reflects on next page load. A box that opted into the editor ALSO
     # gets an http editor tab — its code-server stub is published onto the
@@ -2291,14 +2291,14 @@ async def _assemble_services(request: web.Request, project: str,
     for name, entry in sorted(sandbox_map.items()):
         if entry.get("kind") != "sandbox":
             continue
-        spec = services.pi_isolated_service(name)
+        spec = services.box_term_service(name)
         if spec is not None:
             # Stamp box_kind so the SPA shows the per-tab box "✕" (terminal tab only).
-            out[f"{services.PI_ISOLATED_ID_PREFIX}{name}"] = {**spec, "box_kind": "sandbox"}
+            out[f"{services.BOX_TERM_ID_PREFIX}{name}"] = {**spec, "box_kind": "sandbox"}
         if box_editor_up.get(name):
-            espec = services.pi_isolated_editor_service(name, int(entry["editor_port"]))
+            espec = services.box_editor_service(name, int(entry["editor_port"]))
             if espec is not None:
-                esid = f"{services.PI_ISOLATED_EDITOR_ID_PREFIX}{name}"
+                esid = f"{services.BOX_EDITOR_ID_PREFIX}{name}"
                 url = _origin_url(request, project, esid, allocate)
                 out[esid] = {**espec, **({"origin_url": url} if url else {})}
 
@@ -3385,10 +3385,10 @@ def _resolve_origin_upstream_port(project: str, service_id: str) -> int | None:
     svc = services.get(service_id)
     if svc is not None:
         return int(svc.get("default_port", 0)) or None
-    if service_id.startswith(services.PI_ISOLATED_EDITOR_ID_PREFIX):
+    if service_id.startswith(services.BOX_EDITOR_ID_PREFIX):
         # Box editor: the box must still exist with the editor enabled; its
         # editor_port is published onto the supervisor netns (rs_sandbox.py).
-        name = service_id[len(services.PI_ISOLATED_EDITOR_ID_PREFIX):]
+        name = service_id[len(services.BOX_EDITOR_ID_PREFIX):]
         entry = _read_project_extensions(project).get(name)
         if (entry and entry.get("kind") == "sandbox"
                 and entry.get("editor") and entry.get("editor_port")):

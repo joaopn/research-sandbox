@@ -754,7 +754,7 @@ html.mobile .project-rail .rail-separator { cursor: default; }
     z-index: 5;
 }
 
-/* Per-box ✕ on a sandbox-dind box tab (pi-iso-*). Ghost-icon styling like
+/* Per-box ✕ on a sandbox-dind box tab (box-term-*). Ghost-icon styling like
    the refresh button; reddens on hover to read as a destructive control. */
 .service-tabs .tab .close-tab-btn {
     background: transparent;

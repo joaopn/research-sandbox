@@ -23,7 +23,7 @@ Reach for **research** if you want the supervising agent + worker pipeline;
 
 The management container (`rs-sandbox-dind`) boots the inner Docker daemon and the
 `rs-inner` bridge itself (it has no supervisor MCP-reload path), then you use the
-in-container `rs-sandbox` CLI to create blank isolated boxes (`rs-pi-iso-<name>`).
+in-container `rs-sandbox` CLI to create blank isolated boxes (`rs-box-<name>`).
 Boxes draw from the PI IP range, sit behind the project's (locked-by-default)
 router egress, and boot un-authed — containment is router + no-creds + container
 isolation. Agents and the editor are delivered per-box from the host-cached dists.
@@ -36,7 +36,7 @@ RSORCHESTRATIONSVG
 
 - **Management host** — `rs-sandbox-dind`, agent-less; runs the inner Docker daemon
   and `rs-inner` bridge; you drive it via its shell + `rs-sandbox`.
-- **Isolated boxes** — `rs-pi-iso-<name>` containers you create/destroy on demand;
+- **Isolated boxes** — `rs-box-<name>` containers you create/destroy on demand;
   isolated from each other and the host.
 - **rs-router** — the project's egress filter (locked by default) for every box.
 

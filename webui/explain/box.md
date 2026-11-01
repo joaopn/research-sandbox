@@ -56,7 +56,7 @@ agent logs in again and its setup runs again; the box's own files are untouched.
 
 Everything in a ticked folder is readable inside the box, **credentials
 included**: `workers/` holds a copy of the project's Claude login in each
-worker's folder, `pi-isolated/` holds every box's own files (other boxes'
+worker's folder, `boxes/` holds every box's own files (other boxes'
 notes, clones and configuration), `.orchestrator/` holds the project's wiring, `.creds-stash/`
 holds the login while the project restarts, and a sandbox-dind project's setup
 clone keeps the GitHub token it was cloned with in its git settings.

@@ -75,11 +75,12 @@ def generic_image_ref(host_base: str, pins: dict[str, str] | None = None) -> str
 
 
 def container_name(name: str, kind: str | None = None) -> str:
-    """Inner-dockerd container name for a box: ``rs-pi-iso-<name>``. Boxes ride
-    the iso- family so the webui tab synthesis + iso- label selection work. The
+    """Inner-dockerd container name for a box: ``rs-box-<name>`` — the same
+    name the box tool derives (rs_sandbox.box_container) and the webui tab
+    synthesis execs into. The
     ``kind`` arg is accepted (callers pass the entry's kind) but no longer
     branches — every surviving entry is a ``"sandbox"`` box."""
-    return f"rs-pi-iso-{name}"
+    return f"rs-box-{name}"
 
 
 # ---------------------------------------------------------------------------
