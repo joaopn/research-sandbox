@@ -431,7 +431,7 @@ project destroy <name|--all>       Remove container + workspace + network + cred
 --inner-firewall           Defense-in-depth ACL on the supervisor's inner bridge
 --dind {auto,sysbox,privileged}   Container runtime (default: auto)
 --ssh-port <port>          Explicit SSH host port
---agent / --agents <a[,b]> (docker-substrate boxes) agent dist(s) to deploy at boot
+--agent / --agents <a[,b]> agent dist(s) to deploy at boot (docker boxes: the full set; a sandbox-dind or dev supervisor: exactly the set, with claude still offered to its boxes)
 --repo URL --ref SHA       clone repo@ref into /workspace/<name> at create (docker boxes and sandbox-dind supervisors)
 --setup-script <snippet>   Shell snippet run once after checkout (RS_GITHUB_PAT for a private clone)
 --git-user-name / --git-user-email   git commit identity configured in the box at create

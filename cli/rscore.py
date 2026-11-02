@@ -8214,12 +8214,15 @@ def _stage_editor_dist(supervisor: str, *, deploy_local: bool = False) -> None:
     entrypoint runs at container-START, BEFORE this post-start staging, so its
     dist block saw an empty /opt/editor-dist and no-op'd — this exec is what
     actually brings the supervisor's own editor up (mirrors `_stage_agent_dist`'s
-    deploy_local). The research supervisor passes the RESOLVED code-server flag
-    (NOT an unconditional True): the deploy script does not re-check
-    RS_SERVICE_CODE_SERVER, so a `--disable code-server` supervisor must not cp the
-    binary or launch the stub. The sandbox-dind management supervisor passes
-    deploy_local=False — it deploys NO editor of its own (its boxes RO-mount the
-    staged dist and deploy theirs); staging still runs so that mount is populated."""
+    deploy_local). Create and recreate pass the RESOLVED code-server flag for BOTH
+    supervisor flavors (research and sandbox-dind: a sandbox-dind supervisor runs
+    its own editor like the research one), NOT an unconditional True, because the
+    deploy script does not re-check RS_SERVICE_CODE_SERVER — a `--disable
+    code-server` supervisor must not cp the binary or launch the stub. The live
+    editor enable deploys directly (`_deploy_supervisor_editor`) when the dist is
+    already staged, and calls this with deploy_local=True only when it is not.
+    Box-add's on-demand stage keeps the default False: it only populates the mount
+    its box RO-mounts, never the supervisor's own editor."""
     if not editor_dist_present():
         die("no cached editor dist to stage — pull it under Management → Software first")
     _stage_dist_tree(supervisor, EDITOR_DIST_DIR, EDITOR_DIST_MOUNT, "editor")

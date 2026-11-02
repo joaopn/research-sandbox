@@ -597,9 +597,11 @@ CREATE_WEBUI_FIELDS = frozenset({
     # github_pat, GitHub-host gate).
     "github_ssh_key", "git_user_name", "git_user_email",
     # agents: the agent-dist SET — in-box field (STAGE_MULTI_AGENT; was the single
-    # `agent`). A docker box deploys the full set at boot; sandbox-dind honors
-    # claude on/off for its supervisor (an explicit [] = agent-less, distinct from
-    # an ABSENT key = the workflow's preset — from_kwargs keeps the two apart).
+    # `agent`). A docker box deploys the full set at boot; a sandbox-dind/dev
+    # supervisor deploys exactly the selected set into its own ~/.local and
+    # stages it plus claude for its boxes (an explicit [] = agent-less, distinct
+    # from an ABSENT key = the workflow's preset — from_kwargs keeps the two
+    # apart).
     # Per-agent dist-must-exist is enforced in from_kwargs. Lockstep boundary
     # edit: the webui form POSTs `agents:[...]` when its agent cards are shown
     # (a field not in this set is silently dropped).

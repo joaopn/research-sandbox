@@ -2525,9 +2525,10 @@ def build_parser() -> argparse.ArgumentParser:
                           "`research agent pull` first). Repeatable, or a comma "
                           f"list. Known: {', '.join(rscore.KNOWN_AGENTS)}. Unset "
                           "=> the workflow's agent preset. Docker boxes deploy "
-                          "the full set; sandbox-dind honors claude on/off for "
-                          "its supervisor; the research workflow ignores this "
-                          "(its fleet always runs claude).")
+                          "the full set; a sandbox-dind or dev supervisor "
+                          "deploys exactly the chosen set (its boxes can still "
+                          "be given claude); the research workflow ignores "
+                          "this (its fleet always runs claude).")
     cag.add_argument("--no-agents", dest="no_agents", action="store_true",
                      help="create with NO agent wired (an explicit empty set — "
                           "overrides the workflow's agent preset; on sandbox-dind "

@@ -7,6 +7,10 @@
 # truth for the deploy so the interactive entrypoints (minimal / sandbox-dind /
 # supervisor / sandbox-box) don't each duplicate it. Each of them guards the call
 # the same way; the deploy cp's the binary from the dist into our OWN ~/.local.
+# The host also runs it post-start through `docker exec` (a supervisor's editor
+# deploy at create/recreate, and the live editor enable); that caller gates on the
+# resolved code-server flag instead of the env guard, and step 0 below checks the
+# dist is populated (a supervisor has no system bake).
 set -uo pipefail
 
 DIST="${EDITOR_DIST_MOUNT:-/opt/editor-dist}"
