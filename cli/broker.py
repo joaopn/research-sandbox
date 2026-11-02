@@ -1452,19 +1452,26 @@ def _live_build_ops() -> list[dict]:
     return out
 
 
-def _prune_dead_build_locks() -> None:
-    """Drop per-op build lock files whose child is gone (a hard kill, or a child
-    that ended before the parent wrote its lock). Called only from the lane's
-    write path — reads never mutate."""
+def _prune_dead_op_locks(locks_dir: Path, in_flight) -> None:
+    """Drop the per-op lock files in `locks_dir` whose child is gone (a hard
+    kill, or a child that ended before the parent wrote its lock).
+    `in_flight(op_id)` is the lane's own liveness read, so a file is removed only
+    when that read says its child is not running this op. Removes named files
+    one by one, never the directory. Called only from each lane's write path in
+    the parent, before it writes the new op's lock — reads never mutate."""
     try:
-        paths = list(BUILD_LOCKS_DIR.glob("*.json"))
+        paths = list(locks_dir.glob("*.json"))
     except (FileNotFoundError, OSError):
         return
     for path in paths:
         op_id = path.name[: -len(".json")]
-        if _build_op(op_id) is None:
+        if not in_flight(op_id):
             with contextlib.suppress(FileNotFoundError, OSError):
                 path.unlink()
+
+
+def _prune_dead_build_locks() -> None:
+    _prune_dead_op_locks(BUILD_LOCKS_DIR, lambda op_id: _build_op(op_id) is not None)
 
 
 def _spawn_build_child(op_id: str, verb: str, args: dict) -> int:
@@ -1612,6 +1619,10 @@ def _review_lock_alive(op_id: str) -> bool:
         return False
     pid = holder.get("pid") if isinstance(holder, dict) else None
     return isinstance(pid, int) and _lane_child_alive(pid, _REVIEW_CHILD_ARG, op_id)
+
+
+def _prune_dead_review_locks() -> None:
+    _prune_dead_op_locks(REVIEW_LOCKS_DIR, _review_lock_alive)
 
 
 def _spawn_review_child(op_id: str, args: dict) -> int:
@@ -1872,6 +1883,10 @@ def _dev_box_lock_alive(op_id: str) -> bool:
     return isinstance(pid, int) and _lane_child_alive(pid, _DEV_BOX_CHILD_ARG, op_id)
 
 
+def _prune_dead_dev_box_locks() -> None:
+    _prune_dead_op_locks(DEV_BOX_LOCKS_DIR, _dev_box_lock_alive)
+
+
 def _spawn_dev_box_child(op_id: str, verb: str, args: dict) -> int:
     """Spawn the DETACHED dev-lane child (`broker __run-dev-box <op_id>
     <verb>`). Mirrors _spawn_review_child EXCEPT the args JSON rides the
@@ -2119,18 +2134,7 @@ def _project_in_flight(project) -> bool:
 
 
 def _prune_dead_lifecycle_locks() -> None:
-    """Drop lock files whose child is gone (a hard kill, or a child that ended
-    before the parent wrote its lock). Called only from the lane's write path —
-    reads never mutate."""
-    try:
-        paths = list(LIFECYCLE_LOCKS_DIR.glob("*.json"))
-    except (FileNotFoundError, OSError):
-        return
-    for path in paths:
-        op_id = path.name[: -len(".json")]
-        if _lifecycle_op(op_id) is None:
-            with contextlib.suppress(FileNotFoundError, OSError):
-                path.unlink()
+    _prune_dead_op_locks(LIFECYCLE_LOCKS_DIR, lambda op_id: _lifecycle_op(op_id) is not None)
 
 
 def _try_lifecycle_flock():
@@ -2434,6 +2438,7 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
         if spawn_review is None:            # tests: gate + validate, never spawn
             return _audited(principal, "ok",
                             {"ok": True, "result": {"op_id": op_id, "started": True}})
+        _prune_dead_review_locks()
         pid = spawn_review(op_id, safe)          # detached child, FILTERED args
         _write_review_lock(op_id, pid)           # PARENT writes, post-spawn only
         return _audited(principal, "ok",
@@ -2512,6 +2517,7 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
         if spawn_dev_box is None:           # tests: gate + validate, never spawn
             return _audited(principal, "ok",
                             {"ok": True, "result": {"op_id": op_id, "started": True}})
+        _prune_dead_dev_box_locks()
         pid = spawn_dev_box(op_id, verb, safe)   # detached child, args via stdin
         _write_dev_box_lock(op_id, pid, verb)    # PARENT writes, post-spawn only
         return _audited(principal, "ok",
