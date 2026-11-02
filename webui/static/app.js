@@ -1098,8 +1098,12 @@ function applyRailWidth(px) {
 }
 
 // Splitter on the rail's right edge — same pointer-capture pattern as
-// the W8 terminal-area splitter so the drag survives moving the cursor
-// across iframes / xterm canvases.
+// the terminal-area splitter so the drag survives moving the cursor
+// across iframes / xterm canvases. A sidebar rebuild (an op finishing,
+// the broker sync) replaces this splitter mid-drag: capture is dropped
+// and the release lands elsewhere, so lostpointercapture is the cancel
+// path. Engines deliver it at the document or at the detached element,
+// so both are listened to; the release handler removes them FIRST.
 function installRailSplitterDrag(splitter) {
     let dragging = false;
     let pointerId = null;
@@ -1113,9 +1117,12 @@ function installRailSplitterDrag(splitter) {
         applyRailWidth(w);
         state.railWidth = w;
     };
+    const onLost = (ev) => { if (ev.pointerId === pointerId) onUp(); };
     const onUp = () => {
         if (!dragging) return;
         dragging = false;
+        splitter.removeEventListener("lostpointercapture", onLost);
+        document.removeEventListener("lostpointercapture", onLost);
         splitter.classList.remove("dragging");
         try { if (pointerId != null) splitter.releasePointerCapture(pointerId); } catch (_) {}
         pointerId = null;
@@ -1144,6 +1151,8 @@ function installRailSplitterDrag(splitter) {
         splitter.addEventListener("pointermove", onMove);
         splitter.addEventListener("pointerup", onUp);
         splitter.addEventListener("pointercancel", onUp);
+        splitter.addEventListener("lostpointercapture", onLost);
+        document.addEventListener("lostpointercapture", onLost);
         document.body.style.userSelect = "none";
     };
 }
