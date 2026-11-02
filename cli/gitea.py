@@ -974,6 +974,15 @@ def _migrate_500_hint(pat_sent: bool) -> str:
 
 # --- the REST client --------------------------------------------------------
 
+def _name_collision(repo: str) -> GiteaError:
+    """sandbox-admin/<repo> exists and is NOT a mirror: the operator's own repo
+    colliding on name. One message for both places that find it (the migrate's
+    resume path and its 409 arm), so they cannot drift."""
+    return GiteaError(
+        f"{ADMIN_USER}/{repo} exists as a non-mirror repo (name "
+        f"collision); remove it manually or use a different repo name")
+
+
 class GiteaClient:
     """Bounded admin-token client. Every call is API_TIMEOUT_S-bounded; failures
     raise GiteaError with method/path/status only."""
@@ -1113,9 +1122,7 @@ class GiteaClient:
                 # A NON-empty, non-mirror repo under sandbox-admin is the human's
                 # own repo (Q5: sandbox-admin is the operator's interactive gitea
                 # identity) that collides on name — NEVER delete data.
-                raise GiteaError(
-                    f"{ADMIN_USER}/{repo} exists as a non-mirror repo (name "
-                    f"collision); remove it manually or use a different repo name")
+                raise _name_collision(repo)
             # An EMPTY repo carries no data, so the stub-heal deletes + re-migrates.
             # Two in-model quirks (converge, harmless): a zero-commit GitHub source
             # stays empty after a SUCCESSFUL migrate, so each re-add re-migrates it;
@@ -1149,6 +1156,30 @@ class GiteaClient:
         try:
             self._api("POST", "/repos/migrate", body, timeout=MIGRATE_TIMEOUT_S)
         except GiteaError as e:
+            if e.status == 409:
+                # 409: a repo of this name ALREADY exists, so it is never ours to
+                # sweep — an out-of-band creator's, or one the exists-check above
+                # misread as absent (it reads every error, a timeout included, as
+                # absent). Re-read it ONCE and classify it like the resume path;
+                # an unreadable record re-raises the original 409 unchanged.
+                info = None
+                try:
+                    info = self._api("GET", f"/repos/{ADMIN_USER}/{repo}")
+                except GiteaError:
+                    pass
+                if not isinstance(info, dict):
+                    raise
+                if info.get("mirror") and not info.get("empty"):
+                    self.trigger_sync(repo)     # healthy mirror → refresh + done
+                    return
+                if not info.get("empty"):
+                    raise _name_collision(repo) from None
+                # Empty: possibly another migrate still cloning into it — deleting
+                # it would kill that migrate, so leave it and say so.
+                raise GiteaError(
+                    f"{ADMIN_USER}/{repo} already exists but is still empty — "
+                    f"another migrate of it may still be running; retry once it "
+                    f"finishes", status=409) from None
             # Gitea CREATES the repo record and THEN clones into it, so a clone
             # that fails (no such GitHub repo, a bad PAT on a private source)
             # leaves a data-free mirror stub that `dev repo list` shows forever
