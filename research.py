@@ -221,7 +221,7 @@ def cmd_stop(_: argparse.Namespace) -> None:
     if not _stop_infra_container(WEBUI_CONTAINER):
         failed.append(WEBUI_CONTAINER)
     failed += _stop_shared_mcps()
-    for cname in (gitea.GITEA_CONTAINER, REGISTRY_CONTAINER):
+    for cname in (gitea.GITEA_CONTAINER, REGISTRY_PUSH_CONTAINER, REGISTRY_CONTAINER):
         if not _stop_infra_container(cname):
             failed.append(cname)
     # The router leg keeps its return inspected so a compose-level refusal is
