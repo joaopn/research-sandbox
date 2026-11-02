@@ -944,6 +944,11 @@ async function fetchProjectTabs(projectName, detect) {
 }
 
 async function renderDashboard(opts = {}) {
+    // clearBody() detaches every terminal container, so no terminal may
+    // survive this rebuild: tear them all down first (see the helper below).
+    // Every caller inherits it — a mid-session re-render (Management attach,
+    // project import, layout flip) must not leave a blank terminal area.
+    teardownAllTerminals();
     clearBody();
     await fetchServiceRegistry();
 
@@ -1011,17 +1016,23 @@ async function renderDashboard(opts = {}) {
     }
 }
 
-// Tear down EVERY terminal (all projects) ahead of a full shell re-render.
+// Tear down EVERY terminal (all projects) ahead of a full shell re-render;
+// renderDashboard calls it before clearBody(), so every re-render owns it.
 // clearBody() detaches the containers; a surviving state.terminals entry
 // would then hit activateService's fast-path, un-hide a detached container,
 // and leave the terminal area blank until the ws happens to drop. Byobu
 // sessions persist server-side, so closed terminals reconnect on the next
-// activation (scrollback is lost — accepted for a mode flip).
+// activation (scrollback is lost — accepted for a re-render).
+// The containers are not removed here: clearBody() wipes the whole body
+// right after. onclose is nulled before close() (refreshService's idiom):
+// the close event fires asynchronously, after the re-render has re-opened
+// the same keys, and the old handler would mark the FRESH entry
+// disconnected — its next activation would then needlessly reconnect.
 // Deliberately keeps state.activeProject: the re-render re-activates it.
 function teardownAllTerminals() {
     for (const k of Object.keys(state.terminals)) {
         const t = state.terminals[k];
-        try { if (t.ws) t.ws.close(); } catch (_) {}
+        try { if (t.ws) { t.ws.onclose = null; t.ws.close(); } } catch (_) {}
         try { if (t.term) t.term.dispose(); } catch (_) {}
         delete state.terminals[k];
     }
@@ -1030,9 +1041,9 @@ function teardownAllTerminals() {
 // Full shell re-render on a layout-mode change (breakpoint crossing in auto
 // mode, or the Settings Layout selector). hostPage is cleared because the
 // rebuilt DOM has no open host page — a stale value would make the next
-// host-nav tap hit the toggle-closed branch and appear dead.
+// host-nav tap hit the toggle-closed branch and appear dead. The terminal
+// teardown happens inside renderDashboard.
 async function rerenderShell() {
-    teardownAllTerminals();
     // The key-bar Ctrl latch must not survive the rebuild: the bar is
     // destroyed without a hide transition here, and on a mobile→desktop flip
     // no new bar exists to ever clear it — the next typed character would be
