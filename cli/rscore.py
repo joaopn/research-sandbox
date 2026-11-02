@@ -772,10 +772,32 @@ def _light_clone_basename(repo: str) -> str:
     return base
 
 
+# The shell prelude every operator- or workflow-supplied setup script runs
+# behind (B56). Setup text runs in a PLAIN non-interactive `bash -c`, never a
+# login shell: a login shell rebuilds PATH from /etc/profile and drops the
+# image's ENV PATH entry /opt/conda/bin, so `pip` (and every other conda console
+# script) exits 127 and `python3` resolves to the system /usr/bin/python3. The
+# prelude gives back the two things the login shell legitimately added:
+# conda's `conda` shell FUNCTION (sourced from conda.sh, so `conda activate
+# <env>` works; a function is not inherited by a child shell, so it must be
+# sourced in the same shell that runs the setup) and ~/.local/bin, where the
+# dist-delivered launchers (node/npm, claude) live. Order matters: conda.sh
+# prepends condabin whenever CONDA_SHLVL is unset (it is, in every image), so
+# it is sourced FIRST and ~/.local/bin is prepended after it to stay first.
+# The final export always succeeds, so the setup's exit status is its own.
+# MIRRORED as _SETUP_PRELUDE in agent/entrypoint.sandbox-box.sh (the box
+# lineage's setup runners; that script cannot import this) — pytest-pinned.
+SETUP_SHELL_PRELUDE = ('if [ -f /etc/profile.d/conda.sh ]; then '
+                       '. /etc/profile.d/conda.sh; fi; '
+                       'export PATH="$HOME/.local/bin:$PATH"')
+
+
 def _light_exec(container: str, script: str, *, step: str, github_pat: str,
                 workdir: str | None = None) -> None:
     """Run one harness `script` via ``docker exec -u research [-w workdir] bash
-    -lc`` (the box's unprivileged user). `capture_output=True` so the output
+    -c`` (the box's unprivileged user), behind SETUP_SHELL_PRELUDE: a plain
+    shell keeps the image's PATH (conda's pip/python), the prelude restores
+    ~/.local/bin and the conda function. `capture_output=True` so the output
     NEVER enters the broker's teed stderr → the durable full log. On failure
     raise HarnessError (NOT die()): step-name only as log_msg, the captured
     stderr (literal PAT scrubbed) as client_detail — the split-sink contract
@@ -784,7 +806,7 @@ def _light_exec(container: str, script: str, *, step: str, github_pat: str,
     cmd = ["docker", "exec", "-u", "research"]
     if workdir:
         cmd += ["-w", workdir]
-    cmd += [container, "bash", "-lc", script]
+    cmd += [container, "bash", "-c", SETUP_SHELL_PRELUDE + "\n" + script]
     r = run(cmd, capture_output=True)
     if r.returncode != 0:
         detail = (r.stderr or r.stdout or "").strip()
@@ -822,7 +844,7 @@ def _run_light_harness(container: str, repo: str, ref: str, setup: str,
         elif github_pat:
             # Token-in-remote so it persists in .git/config for later `git pull`
             # (PI decision). https-validated; the token reaches git as an argv
-            # element via bash -lc, never a host shell (run() is list-form).
+            # element via bash -c, never a host shell (run() is list-form).
             clone_url = "https://x-access-token:" + github_pat + "@" + repo[len("https://"):]
         progress.step("clone-repo", "cloning workflow repo")
         _light_exec(

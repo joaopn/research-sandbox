@@ -70,13 +70,16 @@ RUN if [ -f /opt/conda/.condarc ]; then mv /opt/conda/.condarc /root/.condarc; f
 # launcher (node/npm, claude, code-server) lands in ~/.local/bin, but the two
 # PATH exports elsewhere in the tree (this base's conda bashrc, entrypoint bashrc
 # lines) all live in ~/.bashrc — which Debian's skel early-`return`s for a
-# NON-interactive shell. The workflow `setup` harness runs `bash -lc` (a login,
-# NON-interactive shell: ~/.profile sources ~/.bashrc, which returns immediately),
-# so ~/.local/bin is otherwise NOT on PATH there — and `npm install -g` can't run
-# (npm's launcher shebangs `#!/usr/bin/env node`, so npm itself needs node on
-# PATH even when invoked by absolute path). /etc/profile.d/*.sh is sourced by
-# /etc/profile for ALL login shells regardless of interactivity, so this covers
-# `bash -lc`. Generic on purpose (not node-specific): it fixes PATH for every
+# NON-interactive shell. A login, NON-interactive shell (`bash -lc`, `sh -lc`:
+# ~/.profile sources ~/.bashrc, which returns immediately) therefore has no
+# ~/.local/bin on PATH — and `npm install -g` can't run there (npm's launcher
+# shebangs `#!/usr/bin/env node`, so npm itself needs node on PATH even when
+# invoked by absolute path). /etc/profile.d/*.sh is sourced by /etc/profile for
+# ALL login shells regardless of interactivity, so this covers every `bash -lc`
+# (`research project attach`, a byobu tab). The workflow `setup` harness no
+# longer uses a login shell (it would also drop /opt/conda/bin — B56); it runs
+# plain `bash -c` behind rscore.SETUP_SHELL_PRELUDE, which prepends
+# ~/.local/bin itself. Generic on purpose (not node-specific): it fixes PATH for every
 # dist-delivered launcher. Additive + idempotent — a no-op if PATH already
 # resolved. The interactive ~/.bashrc exports stay (they serve byobu shells).
 RUN printf '%s\n' 'export PATH="$HOME/.local/bin:$PATH"' \
