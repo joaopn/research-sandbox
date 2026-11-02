@@ -17,6 +17,14 @@ Regenerated WHOLESALE every run from three sources:
   source-3 = /workspace/.mcp-preset.json — preset-declared stdio MCPs.
 A name collision is a hard error (exit 1: the boot refuses to start) so a
 project MCP cannot silently shadow the baked browser tooling.
+
+In a box that deploys pi, the image's denied tools (/opt/sandbox-box/
+denied-tools.json, {server: [tool, ...]} — the browser box's two script-running
+Playwright tools, the same list claude's managed settings deny) are marked
+`hidden` in that server's `toolExposure`, so pi registers them but can never
+call them. claude ignores the key. No file (a base box, an older image) means no
+hiding; an unreadable one in a pi box stops the render before anything is
+written (running pi with the deny silently off is the failure this prevents).
 """
 import json
 import os
@@ -179,12 +187,35 @@ def pi_trust_workspace() -> None:
         print(f"sandbox-box: could not write {trust}: {e}", file=sys.stderr)
 
 
+# The image's denied tools, for pi only (claude's deny is the image's managed
+# settings). Read BEFORE pi_trust_workspace(): the host's live re-render keys
+# "wired" on trust.json, so a refused render must leave it unwritten.
+denied_path = Path("/opt/sandbox-box/denied-tools.json")
+denied: dict = {}
+if pi_agent_dir and denied_path.is_file():
+    try:
+        denied = json.loads(denied_path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        print(f"sandbox-box: denied-tools.json unreadable: {e}; refusing to start",
+              file=sys.stderr)
+        sys.exit(1)
+    if not isinstance(denied, dict) or not all(
+            isinstance(v, list) and all(isinstance(t, str) and t for t in v)
+            for v in denied.values()):
+        print("sandbox-box: denied-tools.json must map each server to a list of "
+              "tool names; refusing to start", file=sys.stderr)
+        sys.exit(1)
+
 pi_trust_workspace()
 if servers:
     if pi_agent_dir:
-        for cfg in servers.values():
+        for n, cfg in servers.items():
             if isinstance(cfg, dict):
                 cfg.setdefault("exposure", "direct")
+                if denied.get(n):
+                    te = cfg.get("toolExposure")
+                    cfg["toolExposure"] = {**(te if isinstance(te, dict) else {}),
+                                           **dict.fromkeys(denied[n], "hidden")}
     write_atomic(mcp_path, json.dumps({"mcpServers": servers}, indent=2, sort_keys=True) + "\n")
     if pi_agent_dir:
         pi_link_set()

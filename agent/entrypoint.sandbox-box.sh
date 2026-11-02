@@ -232,7 +232,10 @@ fi
 # does; pi's default hides them behind its scripting tool, and it has no global
 # default) — claude ignores the key. pi's `mcp list` shell command trusts a
 # project only by its trust.json (never the dist's defaultProjectTrust), so
-# /workspace is recorded trusted there too. Without pi: none of the three.
+# /workspace is recorded trusted there too. In a browser box the image's denied
+# Playwright tools (/opt/sandbox-box/denied-tools.json, the same list claude's
+# managed settings deny) are marked `hidden` in pi's per-tool exposure on that
+# server's entry. Without pi: none of these.
 # The render lives in agent/box-render-mcp.py (baked at this path): the host also
 # streams it into a RUNNING box when an agent change gives the box pi, so one
 # source serves the boot and the live wiring. A collision exits 1 = the boot stops.

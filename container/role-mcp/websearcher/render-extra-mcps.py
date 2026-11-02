@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Render the websearcher role's three image-baked JSON artifacts.
+"""Render the Playwright MCP's image-baked JSON artifacts.
 
-Run at image build time by Dockerfile.websearcher. Reads the YAML
+Run at image build time by Dockerfile.websearcher (the websearcher ROLE) and
+by Dockerfile.sandbox-box-browser (the browser BOX). Reads the YAML
 source-of-truth (extra-mcps.yaml) and emits:
 
   --out-extra <path>             The substrate's image-baked merge
@@ -20,14 +21,26 @@ source-of-truth (extra-mcps.yaml) and emits:
                                  (the highest-precedence permission
                                  scope per Claude Code's docs). Carries
                                  permissions.deny derived from YAML's
-                                 denied_tools mapping, prefixed with
+                                 denied_tools mapping (box scope:
+                                 box_denied_tools), prefixed with
                                  `mcp__<mcp-server-name>__`.
+
+  --deny-scope {role,box}        Which deny list the managed settings
+                                 carry: `role` (default) = denied_tools;
+                                 `box` = box_denied_tools, the browser
+                                 box's list for every agent in the box.
+
+  --out-denied <path>            Optional. The same scoped tools as
+                                 {server: [tool, ...]}; the box's MCP
+                                 render marks them `hidden` for pi. Built
+                                 by the same computation as the managed
+                                 settings, so the two agents cannot drift.
 
 Placeholders resolved at render time:
   __PLAYWRIGHT_MCP_BIN__  -> --bin <path>
   __CONFIG_PATH__         -> --out-config <path>
 
-After writing the three files it CHECKS THE TOOL LIST: it starts each
+After writing the files it CHECKS THE TOOL LIST: it starts each
 server exactly as rendered, asks for its tools over stdio (initialize, then
 tools/list — no browser is launched for that), and fails when a tool is in
 neither `denied_tools` nor `allowed_tools`. So a Playwright bump that adds a
@@ -73,11 +86,42 @@ TERM_GRACE_S = 5
 MCP_PROTOCOL_VERSION = "2025-03-26"
 
 
+SCOPES = ("role", "box")
+
+
 class ToolsCheckError(Exception):
     """The tool list could not be read, or it holds an unreviewed tool."""
 
 
-def render(yaml_text: str, bin_path: str, config_path: str
+def scoped_denied(spec: dict, scope: str) -> list[str]:
+    """The sorted denied tool names for `scope`. Validates `box_denied_tools`
+    in BOTH scopes (a YAML is valid or not whoever renders it): a list of
+    non-empty strings, no duplicates, each a `denied_tools` key, so a box can
+    never block a tool the YAML never reviewed nor one the role keeps. The box
+    scope refuses a YAML without the list: a box image must never fall back to
+    the role's list or to none."""
+    if scope not in SCOPES:
+        raise ValueError(f"deny scope must be one of {', '.join(SCOPES)}, got {scope!r}")
+    denied_tools = spec.get("denied_tools") or {}
+    box = spec.get("box_denied_tools")
+    if box is not None:
+        if not isinstance(box, list) or not all(isinstance(t, str) and t.strip() for t in box):
+            raise ValueError("box_denied_tools must be a list of non-empty tool names")
+        dups = sorted({t for t in box if box.count(t) > 1})
+        if dups:
+            raise ValueError(f"box_denied_tools names a tool twice: {', '.join(dups)}")
+        outside = sorted(set(box) - set(denied_tools))
+        if outside:
+            raise ValueError("box_denied_tools must name only denied_tools entries; "
+                             f"not denied there: {', '.join(outside)}")
+    if scope == "role":
+        return sorted(denied_tools)
+    if box is None:
+        raise ValueError("the box deny scope needs a box_denied_tools list in the YAML")
+    return sorted(box)
+
+
+def render(yaml_text: str, bin_path: str, config_path: str, scope: str = "role"
            ) -> tuple[dict, dict, dict]:
     spec = yaml.safe_load(yaml_text)
     if not isinstance(spec, dict):
@@ -134,10 +178,12 @@ def render(yaml_text: str, bin_path: str, config_path: str
     # Tool-restriction rules in Claude Code use the format `mcp__<server>__<tool>`
     # where <server> is the key under spawn-mcp.json's mcpServers (here:
     # whatever the YAML's mcpServers key is — typically "playwright"). Build
-    # the deny array by Cartesian product of mcpServers names × denied_tools.
+    # the deny array by Cartesian product of mcpServers names × the scope's
+    # denied tools (the role: denied_tools; the box: box_denied_tools).
+    scoped = scoped_denied(spec, scope)
     deny_rules: list[str] = []
     for server_name in sorted(out_servers):
-        for tool_name in sorted(denied_tools):
+        for tool_name in scoped:
             deny_rules.append(f"mcp__{server_name}__{tool_name}")
     managed_settings = {
         "permissions": {
@@ -298,6 +344,11 @@ def main(argv: list[str]) -> int:
                         "ALSO the value substituted into __CONFIG_PATH__")
     p.add_argument("--out-managed-settings", required=True, type=Path,
                    help="Destination for the Claude Code managed-settings JSON")
+    p.add_argument("--deny-scope", choices=SCOPES, default="role",
+                   help="role (default): denied_tools; box: box_denied_tools")
+    p.add_argument("--out-denied", type=Path,
+                   help="Optional destination for {server: [denied tool, ...]} "
+                        "in the chosen scope (the browser box's pi deny)")
     args = p.parse_args(argv)
 
     # Fail LOUD at build if --bin resolved empty. The Dockerfiles pass
@@ -313,11 +364,14 @@ def main(argv: list[str]) -> int:
 
     yaml_text = args.yaml.read_text()
     extra, mcp_config, managed_settings = render(
-        yaml_text, args.bin, str(args.out_config))
-    for path, data in (
-            (args.out_extra, extra),
-            (args.out_config, mcp_config),
-            (args.out_managed_settings, managed_settings)):
+        yaml_text, args.bin, str(args.out_config), args.deny_scope)
+    outputs = [(args.out_extra, extra),
+               (args.out_config, mcp_config),
+               (args.out_managed_settings, managed_settings)]
+    if args.out_denied is not None:
+        tools = scoped_denied(yaml.safe_load(yaml_text), args.deny_scope)
+        outputs.append((args.out_denied, {name: tools for name in extra["mcpServers"]}))
+    for path, data in outputs:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
     # After the writes: the server reads its --config file at start.

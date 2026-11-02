@@ -20,10 +20,10 @@ this box.
 
 ## Denied browser tools (image-enforced)
 
-`browser_evaluate`, `browser_handle_dialog`, `browser_drag`,
-`browser_file_upload`, `browser_pdf_save`, `browser_install`, `browser_resize`,
-`browser_run_code_unsafe`, `browser_drop` are blocked by baked managed-settings (prompt-injection / out-of-scope). Never
-call them — they will fail at call-time.
+`browser_evaluate` and `browser_run_code_unsafe` (they run arbitrary script — a
+prompt-injection path) are blocked for every agent in this box: Claude Code's
+baked managed settings deny them, and pi's server entry marks them hidden. Never
+call them — they will fail at call-time. Every other browser tool is yours to use.
 
 ## Untrusted content (load-bearing)
 

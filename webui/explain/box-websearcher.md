@@ -18,8 +18,9 @@ box's for the whole session and keeps state across turns; it dies with the box.
 
 ## Notes
 
-- `browser_evaluate` (arbitrary in-page JS) is **denied** at the client layer —
-  page content is treated as untrusted data, not instructions.
+- `browser_evaluate` and `browser_run_code_unsafe` (arbitrary JavaScript) are
+  **denied** for every agent in the box — page content is treated as untrusted
+  data, not instructions. Every other browser tool is usable.
 - Add **MCP tools** for project-specific lookups on top of the browser.
 - Boots credential-free: run `claude` then `/login` inside. Outputs live in
   `/workspace`; egress follows the project's router policy.

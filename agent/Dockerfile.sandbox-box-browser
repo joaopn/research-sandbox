@@ -6,9 +6,12 @@ FROM rs-sandbox-box:latest
 # is heavy, so base-image presets stay lean.
 #
 # This lifts ONLY the playwright tool bundle from the websearcher image (same
-# version pins, same render-extra-mcps.py source-of-truth, same managed-settings
-# deny of browser_evaluate) — NOT its role.md / harness. The box's claude gets
-# browser tools; the PI drives them however they like.
+# version pins, same render-extra-mcps.py source-of-truth) — NOT its role.md /
+# harness, and NOT its full deny list: the box denies only the two tools that
+# run arbitrary script (browser_evaluate, browser_run_code_unsafe — the YAML's
+# box_denied_tools), for EVERY agent in the box (claude through the managed
+# settings, pi through the box render reading denied-tools.json). The box's
+# agents get the other browser tools; the PI drives them however they like.
 #
 # Version pins are deliberate (rebuild + project recreate to bump), same
 # discipline as the websearcher image they mirror.
@@ -41,17 +44,20 @@ RUN npm install -g "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" && \
     chmod -R a+rX ${PLAYWRIGHT_BROWSERS_PATH} && \
     rm -rf /var/lib/apt/lists/*
 
-# Render the three image-baked artifacts from the SAME source-of-truth the
-# websearcher role uses:
+# Render the four image-baked artifacts from the SAME source-of-truth the
+# websearcher role uses, in the BOX deny scope:
 #   /opt/sandbox-box/extra-mcps.json          — the playwright MCP server decl;
 #                                               the box entrypoint copies it to
 #                                               /workspace/.mcp.json so the box's
 #                                               claude auto-discovers it.
 #   /opt/sandbox-box/playwright-mcp-config.json — Chromium launch flags
 #                                               (referenced via --config).
-#   /etc/claude-code/managed-settings.json    — denies browser_evaluate et al.
+#   /etc/claude-code/managed-settings.json    — claude's deny of the box list
 #                                               (highest-precedence permission
 #                                               scope; not bypassable).
+#   /opt/sandbox-box/denied-tools.json        — the same list for pi: the box's
+#                                               MCP render marks those tools
+#                                               `hidden` on the server's entry.
 COPY container/role-mcp/websearcher/extra-mcps.yaml      /tmp/extra-mcps.yaml
 COPY container/role-mcp/websearcher/render-extra-mcps.py /tmp/render-extra-mcps.py
 RUN /opt/conda/bin/python3 /tmp/render-extra-mcps.py \
@@ -59,8 +65,10 @@ RUN /opt/conda/bin/python3 /tmp/render-extra-mcps.py \
         --bin                  "$(command -v playwright-mcp)" \
         --out-extra            /opt/sandbox-box/extra-mcps.json \
         --out-config           /opt/sandbox-box/playwright-mcp-config.json \
-        --out-managed-settings /etc/claude-code/managed-settings.json && \
-    chmod 644 /etc/claude-code/managed-settings.json && \
+        --out-managed-settings /etc/claude-code/managed-settings.json \
+        --deny-scope           box \
+        --out-denied           /opt/sandbox-box/denied-tools.json && \
+    chmod 644 /etc/claude-code/managed-settings.json /opt/sandbox-box/denied-tools.json && \
     rm /tmp/extra-mcps.yaml /tmp/render-extra-mcps.py
 
 # Entrypoint is inherited from rs-sandbox-box — it copies the baked
