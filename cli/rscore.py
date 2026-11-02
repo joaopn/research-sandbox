@@ -11463,7 +11463,18 @@ def _refuse_retired_identity(user: str) -> None:
     still correct, only the pointer degrades. 'A different name' is an equal
     remedy in every arm, never a fallback, and no arm implies purging is
     immediate for a STILL-ATTACHED project (there the sequence is detach,
-    purge, attach, and the purge verb's ledger gate refuses until then)."""
+    purge, attach, and the purge verb's ledger gate refuses until then).
+
+    A FOURTH state hides behind the first two reads: Gitea resolves a user
+    name ignoring letter case, so for project `foo` the existence probe and
+    the ownership read both answer for an account stored as `agent-Foo` —
+    while the token-file probe is exact-case and finds nothing. The stored
+    spelling (gitea.stored_login, read only in the retired arm) tells the
+    variant apart. A variant claimed by a ledger row or holding its token file
+    is ANOTHER live project or box: the refusal says the name is in use and
+    offers only a different name — never archive or purge, which would
+    destroy that project's live work. A variant with neither is genuinely
+    retired: the three arms above apply to it, under its stored name."""
     host_port = _gitea_host_port()
     try:
         retired = gitea.retired_identity(host_port, user)
@@ -11474,11 +11485,32 @@ def _refuse_retired_identity(user: str) -> None:
             f"could not check the dev identity {user!r} against Gitea: {e}")
     if not retired:
         return
-    head = (f"the dev identity {user!r} still exists in Gitea from an earlier "
-            f"project or box of this name, and its access token cannot be "
-            f"reissued. ")
     try:
-        owned = gitea.user_repos(host_port, user)
+        login = gitea.stored_login(host_port, user)
+    except gitea.GiteaError as e:
+        raise ValidationError(
+            f"could not check the dev identity {user!r} against Gitea: {e}")
+    if login is None:
+        login = user                 # deleted between the two reads
+    if login == user:
+        head = (f"the dev identity {user!r} still exists in Gitea from an "
+                f"earlier project or box of this name, and its access token "
+                f"cannot be reissued. ")
+    else:
+        lowered = login.lower()
+        claimed = any(str(e.get("user") or "").lower() == lowered
+                      for e in gitea.load_attachments())
+        if claimed or gitea.consumer_token_path(login).is_file():
+            raise ValidationError(
+                f"the Gitea account {login!r} is in use by another project or "
+                f"box, and it also answers for {user!r} (Gitea ignores letter "
+                f"case, so a project whose name differs only in case counts); "
+                f"use a different name")
+        head = (f"the retired dev identity {login!r} still exists in Gitea "
+                f"from an earlier project or box, and it blocks {user!r} "
+                f"because Gitea ignores letter case. ")
+    try:
+        owned = gitea.user_repos(host_port, login)
     except gitea.GiteaError:
         owned = None
     if owned is None:

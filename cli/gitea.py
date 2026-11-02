@@ -1607,6 +1607,22 @@ def retired_identity(host_port: str, user: str) -> bool:
             and not consumer_token_path(user).is_file())
 
 
+def stored_login(host_port: str, user: str) -> str | None:
+    """The STORED spelling of the gitea account that answers to <user>, or None
+    when no account does (a definitive 404).
+
+    Gitea resolves a user name ignoring letter case, so `agent-foo` answers
+    for an existing `agent-Foo` — and every read keyed on the name
+    (retired_identity's existence probe, user_repos) then reports on THAT
+    account. The stored spelling is the only way to tell a case variant from
+    the account itself: callers compare it to the name they derived. STRICT,
+    like retired_identity: anything but a 404 raises, because a caller that
+    misread an outage as 'not a variant' would point the operator at purging
+    another project's live identity. Read-only."""
+    client = GiteaClient(api_base(host_port), read_admin_token())
+    return client.get_login(user)
+
+
 def user_repos(host_port: str, user: str, *, detail: bool = False) -> list[dict]:
     """Every repo <user> owns: [{repo, archived}] — the STRICT enumeration, a
     GiteaError PROPAGATES.
