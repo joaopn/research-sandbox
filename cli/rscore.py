@@ -16191,7 +16191,13 @@ def dev_repo_list(_req: "DevRepoListRequest", _progress=None) -> DevRepoListResu
     # rather than a hoisted map read: one function is one place for a test to
     # stub, and the archived pins that drive these verbs stub exactly it.
     for row in repos:
-        row["fetch_enabled"] = gitea.fetch_enabled(row.get("repo"))
+        name = row.get("repo")
+        row["fetch_enabled"] = gitea.fetch_enabled(name)
+        # The floor every dev-lane WRITE gates on (the host mirror stamp),
+        # reported beside the list so a repo gitea holds but this host never
+        # added reads as such instead of failing at the first write. A host
+        # file stat, so the no-start posture holds; a nameless row is not added.
+        row["added"] = bool(name) and gitea.mirror_present(name)
     return DevRepoListResult(repos=repos)
 
 
@@ -16416,6 +16422,13 @@ def dev_status(_req: "DevStatusRequest", _progress=None) -> DevStatusResult:  # 
             # unlike the fields repo_status computes, this one is knowable even
             # when gitea cannot answer for the repo (it is a local file read).
             row["fetch_enabled"] = gitea.fetch_enabled(name)
+            # The read reports the same floor the writes gate on: gitea can
+            # hold a mirror this host has no stamp for (another RS home sharing
+            # the one gitea, or reset dev-lane records), and every stamp-gated
+            # write refuses it. Carrying it on BOTH arms lets the page show the
+            # disagreement instead of a control that always refuses. A pure
+            # host-file stat — the no-start posture holds.
+            row["added"] = gitea.mirror_present(name)
             repos.append(row)
     attachments = [{"project": e.get("project"), "repo": e.get("repo")}
                    for e in gitea.load_attachments()
@@ -16470,6 +16483,7 @@ def dev_repo_status(req: "DevRepoStatusRequest", _progress=None) -> DevRepoStatu
             row = {"repo": req.repo, "error": str(e)}
         # Same annotation as dev_status, on both arms, for the same reason.
         row["fetch_enabled"] = gitea.fetch_enabled(req.repo)
+        row["added"] = gitea.mirror_present(req.repo)
     attachments = [{"project": e.get("project")}
                    for e in gitea.load_attachments()
                    if e.get("project") and e.get("repo") == req.repo

@@ -4257,15 +4257,21 @@ function renderDevReposScreen(view, body, result) {
 // key is merely absent) about a repo whose fork state is unknown. The toggle
 // stays live there on purpose: a sick repo is exactly the one you reach for the
 // hide button on, and the preference is a local file read that works regardless.
+// The one exception, on either arm, is a repo this host has not added (gitea
+// holds it, this host's dev-lane records do not): the switch is disabled and the
+// row says why, since every write on it would be refused.
 function devRepoInventoryRow(view, body, r, worked) {
     const toggle = devFetchToggle(view, body, r);
+    const notAdded = devRepoNotAdded(r);
     if (r.error) {
+        const errCell = [
+            el("div", { class: "dev-repo-name" }, [r.repo || ""]),
+            el("div", { class: "dev-pr-meta dev-review-failed" },
+               [String(r.error)]),
+        ];
+        if (notAdded) errCell.push(devRepoNotAddedNote());
         return el("tr", { class: "dev-repos-degraded" }, [
-            el("td", {}, [
-                el("div", { class: "dev-repo-name" }, [r.repo || ""]),
-                el("div", { class: "dev-pr-meta dev-review-failed" },
-                   [String(r.error)]),
-            ]),
+            el("td", {}, errCell),
             el("td", { class: "dev-repos-num" }, ["—"]),
             el("td", { class: "dev-repos-num" }, ["—"]),
             el("td", { class: "dev-repos-opt" }, ["—"]),
@@ -4291,6 +4297,7 @@ function devRepoInventoryRow(view, body, r, worked) {
         });
         nameCell.push(line);
     }
+    if (notAdded) nameCell.push(devRepoNotAddedNote());
     return el("tr", {}, [
         el("td", {}, nameCell),
         devCountCell(r.open_issues),
@@ -4300,6 +4307,27 @@ function devRepoInventoryRow(view, body, r, worked) {
         el("td", { class: "dev-pr-meta dev-repos-opt" },
            [worked.length ? worked.join(", ") : "—"]),
         el("td", {}, [toggle]),
+    ]);
+}
+
+// A repo gitea holds but this host has not added: the dev-lane writes gate on
+// this host's own record of the repo, and dev_status reports that record as
+// `added`. Tolerant exactly like the rs-fetch flag: only an explicit `false`
+// counts, so a row from a broker that predates the key stays fully live.
+function devRepoNotAdded(r) {
+    return !!r && r.added === false;
+}
+
+// What the operator reads on a not-added row. Plain text, naming no CLI
+// command: re-entering the repo's GitHub URL in a dev project or dev box create
+// adds it on this host (on an existing mirror that only syncs it).
+function devRepoNotAddedNote() {
+    return el("div", { class: "dev-pr-meta dev-repo-not-added" }, [
+        "Not added on this host: Gitea holds this mirror, but this host’s "
+        + "dev-lane records don’t (another RS install sharing this Gitea added "
+        + "it, or these records were reset). Its rs-fetch switch works once it "
+        + "is added here — creating a dev project or a dev box from its GitHub "
+        + "URL adds it.",
     ]);
 }
 
@@ -4321,13 +4349,22 @@ function devFetchToggle(view, body, r) {
               + "name. Click to show it again.",
     }, [on ? "Enabled" : "Disabled"]);
     // A refusal is REPORTED, not swallowed. The verb's gate is reachable in
-    // normal use — the repo was removed in another tab, or it is listed from
-    // gitea while this host holds no mirror stamp for it — and without this the
-    // only feedback is the button silently snapping back, which reads as the
-    // page being broken. The message is server text (already written to be
-    // browser-safe, naming no CLI command) and goes in as a TEXT node.
+    // normal use — the repo was removed in another tab, or this host's record
+    // of it went away after the tab rendered — and without this the only
+    // feedback is the button silently snapping back, which reads as the page
+    // being broken. The message is server text (already written to be
+    // browser-safe, naming no CLI command) and goes in as a TEXT node. A repo
+    // the read already reports as not added never gets a click handler: the
+    // switch shows its state, disabled, and the row carries the note.
     const err = el("span", { class: "dev-pr-meta dev-review-failed" }, []);
     err.hidden = true;
+    if (devRepoNotAdded(r)) {
+        btn.disabled = true;
+        btn.title = "This repo isn’t added on this host, so its rs-fetch "
+            + "switch can’t change yet. Creating a dev project or a dev box "
+            + "from its GitHub URL adds it here.";
+        return el("span", { class: "dev-fetch-cell" }, [btn, err]);
+    }
     btn.onclick = async () => {
         btn.disabled = true;
         btn.textContent = "…";

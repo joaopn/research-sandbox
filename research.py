@@ -2165,7 +2165,14 @@ def cmd_dev_repo_list(_args: argparse.Namespace) -> None:
         return
     for r in sorted(res.repos, key=lambda e: e.get("repo") or ""):
         state = "on" if r.get("fetch_enabled", True) else "off"
-        print(f"  {r.get('repo')}  [rs-fetch: {state}]")
+        # Gitea holds the mirror but this host's dev-lane records do not (a
+        # second RS home on the same gitea, or reset records): every write
+        # that gates on the record refuses it until it is re-added, which on
+        # a healthy existing mirror only syncs it and restores the record.
+        # A row without the key (an older rscore) reads as added.
+        added = "" if r.get("added", True) is not False else \
+            "  [not added on this host — re-add: research dev repo add <github-url>]"
+        print(f"  {r.get('repo')}  [rs-fetch: {state}]{added}")
 
 
 def cmd_dev_repo_fetch(args: argparse.Namespace) -> None:
