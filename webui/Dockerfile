@@ -56,4 +56,8 @@ RUN useradd -m -u 1000 webui \
 USER webui
 
 EXPOSE 7777
+# The listen contract this image implements: every listener on the address
+# inside WEBUI_LISTEN_SUBNET (B156). `research webui start` rebuilds an image
+# without it — an older image binds every address and ignores the subnet.
+LABEL research.webui.listen="subnet"
 CMD ["python", "-u", "server.py"]

@@ -4413,6 +4413,11 @@ INNER_NETWORK = "rs-inner"
 INNER_GUARD_BIN = "/usr/local/bin/rs-inner-guard"
 WEBUI_IMAGE = "rs-webui:latest"
 WEBUI_CONTAINER = "rs-webui"
+# The listen contract (B156): an image carrying this label binds every listener
+# on the webui's address inside WEBUI_LISTEN_SUBNET; an image without it is older
+# and binds every address (webui/Dockerfile carries the label).
+WEBUI_LISTEN_LABEL = "research.webui.listen"
+WEBUI_LISTEN_LABEL_VALUE = "subnet"
 ROUTER_CONTAINER = "rs-router"
 ROUTER_NETWORK = "rs-sandbox"
 # Local extension-image registry (STAGE_FEATURE_STAGING C1). The in-container
@@ -5071,14 +5076,41 @@ def _resume_webui() -> bool:
     the container's own ports/env/uid, so none of the compose-time setup needs
     re-running — but it does NOT re-probe, so a port taken while the fleet was
     down surfaces as docker's raw bind error; the warning names the verb that
-    rebinds readably."""
+    rebinds readably.
+
+    A webui created from an image that predates the narrowed listen address
+    (B156) is never brought back: stopped, it stays down; still running, it is
+    stopped — both with a warning naming `research webui start`, which says so
+    when the stop itself failed (`research start` then exits non-zero). Returns
+    False in those cases and when a start failed, True otherwise."""
     # Container-scoped: bare `docker inspect` would match the rs-webui IMAGE and
     # turn a deliberate `research webui stop` into a "could not start" warning on
     # every `research start`.
     if not _container_present(WEBUI_CONTAINER):
         return True
+    # A webui created from an image that predates the narrowed listen address
+    # binds every address (B156). Judged from the CONTAINER's own copy of the
+    # image label — the container runs the image it was created from, whatever
+    # the rs-webui:latest tag points at now.
+    current = webui_container_has_listen_contract()
     if container_running(WEBUI_CONTAINER):
-        return True
+        if current:
+            return True
+        # Still up from before the upgrade, reachable from every project: stop
+        # it (fail closed — the UI is down until it is rebuilt) and say why,
+        # truthfully: the stop helper reports its own failure.
+        stopped = _stop_infra_container(WEBUI_CONTAINER)
+        print(f"warning: {WEBUI_CONTAINER} runs an image built before the webui "
+              f"listened on the router network only, so it is reachable from "
+              f"every project; " + ("stopped it" if stopped else "COULD NOT stop it")
+              + " — run `research webui start`, which rebuilds or recreates it",
+              file=sys.stderr)
+        return False
+    if not current:
+        print(f"warning: {WEBUI_CONTAINER} was built before the webui listened on "
+              f"the router network only; not resuming it — run `research webui "
+              f"start`, which rebuilds or recreates it", file=sys.stderr)
+        return False
     if not _start_infra_container(WEBUI_CONTAINER):
         print(f"warning: run `research webui start` to rebind {WEBUI_CONTAINER}",
               file=sys.stderr)
@@ -16832,10 +16864,17 @@ def pin_shared_gateway(container: str) -> bool:
     state = _gateway_priority(container, ROUTER_NETWORK)
     if state in (GATEWAY_CONTAINER_ABSENT, GATEWAY_PRIORITY):
         return False
+    # The webui binds its listeners on its rs-sandbox address at process start
+    # (B156); a reconnect can hand that endpoint a different address (when a
+    # lower one is free), which would leave a RUNNING webui listening on a dead
+    # address. Read by name first: nothing else here may issue another inspect.
+    restart_webui = container == WEBUI_CONTAINER and container_running(container)
     if state != GATEWAY_ENDPOINT_ABSENT:
         run_check(["docker", "network", "disconnect", ROUTER_NETWORK, container])
     run_check(["docker", "network", "connect", "--gw-priority",
                str(GATEWAY_PRIORITY), ROUTER_NETWORK, container])
+    if restart_webui:
+        run_check(["docker", "restart", container])
     return True
 
 
@@ -17028,11 +17067,79 @@ def _stage_webui_cert(cert_pem: bytes, key_pem: bytes,
         ])
 
 
+def webui_listen_subnet() -> str:
+    """The router network's IPv4 subnet, which the webui binds inside (B156).
+    Dies with a one-line remedy when the network is absent (the router brings
+    it up) or carries no IPv4 subnet — never with docker's raw error."""
+    r = run(["docker", "network", "inspect", ROUTER_NETWORK,
+             "-f", "{{json .IPAM.Config}}"], capture_output=True)
+    if r.returncode != 0:
+        die(f"the router network {ROUTER_NETWORK} does not exist yet; run "
+            f"`research start` first")
+    try:
+        entries = json.loads(r.stdout or "null") or []
+    except json.JSONDecodeError:
+        entries = []
+    for e in entries:
+        sub = e.get("Subnet") if isinstance(e, dict) else None
+        try:
+            if sub and ipaddress.ip_network(sub).version == 4:
+                return str(ipaddress.ip_network(sub))
+        except ValueError:
+            continue
+    die(f"the router network {ROUTER_NETWORK} has no IPv4 subnet; the webui "
+        f"cannot choose its listen address")
+
+
+def webui_image_has_listen_contract() -> bool:
+    """Does the webui image bind inside the passed subnet (its label)? An image
+    without the label binds every address."""
+    r = run(["docker", "image", "inspect", WEBUI_IMAGE, "-f",
+             f'{{{{index .Config.Labels "{WEBUI_LISTEN_LABEL}"}}}}'],
+            capture_output=True)
+    return r.returncode == 0 and r.stdout.strip() == WEBUI_LISTEN_LABEL_VALUE
+
+
+def webui_container_has_listen_contract() -> bool:
+    """Was the existing webui CONTAINER created from an image with the listen
+    contract? Docker copies image labels onto the container, so this reads the
+    image the container actually runs, not what the tag points at now."""
+    r = run(["docker", "container", "inspect", WEBUI_CONTAINER, "-f",
+             f'{{{{index .Config.Labels "{WEBUI_LISTEN_LABEL}"}}}}'],
+            capture_output=True)
+    return r.returncode == 0 and r.stdout.strip() == WEBUI_LISTEN_LABEL_VALUE
+
+
+def webui_container_subnet() -> str:
+    """The WEBUI_LISTEN_SUBNET the existing webui container was created with
+    ("" when absent or when the container does not exist)."""
+    r = run(["docker", "container", "inspect", WEBUI_CONTAINER,
+             "-f", "{{json .Config.Env}}"], capture_output=True)
+    if r.returncode != 0:
+        return ""
+    try:
+        env = json.loads(r.stdout or "null") or []
+    except json.JSONDecodeError:
+        return ""
+    for kv in env:
+        if isinstance(kv, str) and kv.startswith("WEBUI_LISTEN_SUBNET="):
+            return kv.split("=", 1)[1]
+    return ""
+
+
 def _webui_recreate_in_place() -> None:
     """Tear down + bring up the webui container so it re-reads the TLS
-    volume on next start. No image rebuild; preserves WEBUI_BIND/PORT."""
+    volume on next start. No image rebuild; preserves WEBUI_BIND/PORT and
+    passes the router network's subnet the webui binds inside (B156)."""
     bind = read_env_value("WEBUI_BIND") or "127.0.0.1"
     port = read_env_value("WEBUI_PORT") or "7777"
+    if not webui_image_has_listen_contract():
+        # recreating an older image would reopen the webui to every project
+        # (B156) while the subnet in its environment reads as satisfied
+        die("the webui image predates the narrowed listen address; run "
+            "`research webui start`, which rebuilds it and picks up the staged "
+            "certificate")
+    os.environ["WEBUI_LISTEN_SUBNET"] = webui_listen_subnet()
     os.environ["WEBUI_BIND"] = bind
     os.environ["WEBUI_PORT"] = port
     if container_exists(WEBUI_CONTAINER):

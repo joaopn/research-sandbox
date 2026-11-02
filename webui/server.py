@@ -39,11 +39,16 @@ log = logging.getLogger("webui")
 
 STATIC_DIR = Path(__file__).parent / "static"
 TLS_DIR = Path(os.environ.get("WEBUI_TLS_DIR", "/app/tls"))
-LISTEN_HOST = os.environ.get("WEBUI_HOST", "0.0.0.0")
+# Listen address: NOT a module setting. main() derives it from the router
+# network's subnet (WEBUI_LISTEN_SUBNET, passed by `research webui start`) via
+# services.listen_address, so every listener binds the webui's rs-sandbox
+# address and nothing else — a connection from a project network is refused at
+# the socket (B156). There is deliberately no wildcard default.
 # Listen port is fixed to match the Dockerfile's EXPOSE; the host-side
 # WEBUI_PORT only changes the host:container mapping in docker-compose,
 # never the in-container listen port.
 LISTEN_PORT = 7777
+LOOPBACK_HOST = "127.0.0.1"
 HOST_BIND = os.environ.get("WEBUI_BIND", "127.0.0.1")
 
 # Container DNS prefix — the webui reaches each supervisor at
@@ -3663,6 +3668,15 @@ def ensure_tls(cert_path: Path, key_path: Path, bind: str) -> ssl.SSLContext:
 
 
 def main() -> None:
+    try:
+        listen_host = services.listen_address(os.environ.get("WEBUI_LISTEN_SUBNET", ""))
+    except ValueError as e:
+        # Bootstrap tier: the webui cannot start, so no browser surface exists
+        # to show this; the container restart-loops with the remedy in its log.
+        log.error(f"cannot choose the listen address: {e}; restart the webui "
+                  f"with `research webui start`, which passes the router "
+                  f"network's subnet")
+        raise SystemExit(1)
     cert_path = TLS_DIR / "cert.pem"
     key_path = TLS_DIR / "key.pem"
     ssl_ctx = ensure_tls(cert_path, key_path, HOST_BIND)
@@ -3814,7 +3828,12 @@ def main() -> None:
         # implicitly, and losing it would silently drop request logging.
         root_runner = web.AppRunner(app, access_log=log)
         await root_runner.setup()
-        await web.TCPSite(root_runner, LISTEN_HOST, LISTEN_PORT,
+        await web.TCPSite(root_runner, listen_host, LISTEN_PORT,
+                          ssl_context=ssl_ctx).start()
+        # Loopback reaches only this container (tests and diagnostics run
+        # inside it); the root app only — every listener a browser or a
+        # project could reach stays on the rs-sandbox address.
+        await web.TCPSite(root_runner, LOOPBACK_HOST, LISTEN_PORT,
                           ssl_context=ssl_ctx).start()
         origin_runner = web.AppRunner(origin_app, access_log=log)
         await origin_runner.setup()
@@ -3823,7 +3842,7 @@ def main() -> None:
         # failure here propagates loudly (container restart-loop, visible in
         # docker logs) — it cannot happen under docker's own port mapping.
         for p in range(ORIGIN_PORT_LO, ORIGIN_PORT_HI + 1):
-            await web.TCPSite(origin_runner, LISTEN_HOST, p,
+            await web.TCPSite(origin_runner, listen_host, p,
                               ssl_context=ssl_ctx).start()
         # Pass-through block: PLAIN TCP servers — no ssl_ctx, deliberately.
         # The traffic is forwarded untouched; TLS, if any, is the claimed
@@ -3831,10 +3850,10 @@ def main() -> None:
         pt_servers = []
         for p in range(PASSTHROUGH_PORT_LO, PASSTHROUGH_PORT_HI + 1):
             pt_servers.append(await asyncio.start_server(
-                passthrough_conn_handler, LISTEN_HOST, p))
+                passthrough_conn_handler, listen_host, p))
         log.info(
             f"Research Sandbox webui listening on "
-            f"https://{LISTEN_HOST}:{LISTEN_PORT} "
+            f"https://{listen_host}:{LISTEN_PORT} (and loopback) "
             f"(+ origin ports {ORIGIN_PORT_LO}-{ORIGIN_PORT_HI}, "
             f"pass-through {PASSTHROUGH_PORT_LO}-{PASSTHROUGH_PORT_HI})")
         # Park until SIGTERM/SIGINT, then clean up both runners so `docker

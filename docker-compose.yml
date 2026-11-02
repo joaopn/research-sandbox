@@ -70,6 +70,10 @@ services:
       - WEBUI_ORIGIN_PORT_HI=${WEBUI_ORIGIN_PORT_HI:-10164}
       - WEBUI_PASSTHROUGH_PORT_LO=${WEBUI_PASSTHROUGH_PORT_LO:-10200}
       - WEBUI_PASSTHROUGH_PORT_HI=${WEBUI_PASSTHROUGH_PORT_HI:-10299}
+      # The router network's subnet: the webui binds every listener on its own
+      # address inside it (B156). Set by `research webui start`; an empty value
+      # stops the webui with that remedy in its log.
+      - WEBUI_LISTEN_SUBNET=${WEBUI_LISTEN_SUBNET:-}
       - RS_PROJECTS_ROOT=/projects
       - RS_BROKER_SOCKET=/run/rs-broker/broker.sock
     volumes:

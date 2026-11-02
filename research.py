@@ -190,6 +190,16 @@ def cmd_start(args: argparse.Namespace) -> None:
     # that can wait on a readiness probe, and nothing above depends on it, so an
     # unhealthy gitea must not delay work that never needed it.
     wire_gitea_to_projects()
+    # A webui from before the narrowed listen address that _resume_webui could
+    # not stop still answers every project: the fleet is otherwise up, but the
+    # start must not report success over an open hole (B156). Re-read here
+    # rather than trusting the resume's return, so the verdict is the state.
+    if (rscore.container_running(WEBUI_CONTAINER)
+            and not rscore.webui_container_has_listen_contract()):
+        die(f"{WEBUI_CONTAINER} still runs an image built before the webui listened "
+            f"on the router network only, so it is reachable from every project, "
+            f"and it could not be stopped; run `research webui start`, which "
+            f"rebuilds or recreates it")
     print("up.")
 
 
@@ -1757,6 +1767,19 @@ def cmd_webui(args: argparse.Namespace) -> None:
         new_port = getattr(args, "port", None)
         rebuild = getattr(args, "rebuild", False)
         recreate = False
+        # The webui listens only on its address inside the router network
+        # (B156). Read before anything is rewritten or removed: a missing
+        # network stops here with its remedy and leaves everything as it was.
+        listen_subnet = rscore.webui_listen_subnet()
+        os.environ["WEBUI_LISTEN_SUBNET"] = listen_subnet
+        if run_quiet(["docker", "image", "inspect", WEBUI_IMAGE]) \
+                and not rscore.webui_image_has_listen_contract():
+            print("the webui image predates the narrowed listen address; rebuilding it")
+            rebuild = True
+        # container-scoped: a bare inspect also matches the rs-webui IMAGE
+        if rscore._container_present(WEBUI_CONTAINER) \
+                and rscore.webui_container_subnet() != listen_subnet:
+            recreate = True
         if new_bind and new_bind != bind:
             update_env_key("WEBUI_BIND", new_bind)
             bind = new_bind
@@ -1807,7 +1830,8 @@ def cmd_webui(args: argparse.Namespace) -> None:
         # the broker (running as the operator) can't bind its socket there.
         broker.BROKER_RUN_DIR.mkdir(parents=True, exist_ok=True)
         if (recreate or rebuild) and container_exists(WEBUI_CONTAINER):
-            reason = "bind/port changed" if recreate else "rebuild requested"
+            reason = ("bind/port/listen subnet changed" if recreate
+                      else "rebuild requested")
             print(f"{reason}; recreating webui...")
             run(["docker", "rm", "-f", WEBUI_CONTAINER], capture_output=True)
 

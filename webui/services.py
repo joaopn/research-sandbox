@@ -9,7 +9,47 @@ via supervisor docker labels (`research.service.<id>=...`), read by
 project_services_handler.
 """
 
+import ipaddress
 import re
+import socket
+
+# The listen address (B156): the webui must REACH every project network (it SSHes
+# to supervisors by container DNS) but LISTEN only where the operator's browser
+# arrives — the router network (`rs-sandbox`), onto whose address docker's
+# published ports are mapped (the gateway pin). `research webui start` passes that
+# network's subnet in; the address is found here by a route lookup, never by an
+# interface name (a project network can own `eth1` and the default route).
+# The port of the UDP `connect` used for the lookup: a UDP connect sends nothing,
+# it only selects a route and a source address, so any port works; the discard
+# port names that intent.
+LISTEN_PROBE_PORT = 9
+
+
+def listen_address(subnet: str) -> str:
+    """The container's own address inside `subnet` (IPv4 CIDR, no host bits),
+    found as the source the kernel picks toward the subnet's first host. A
+    missing, malformed or IPv6 subnet, no route at all, or a route that leaves
+    by another network (the container is not attached to that subnet) raises
+    ValueError naming the subnet — the caller stops the webui with its remedy."""
+    if not subnet:
+        raise ValueError("no listen subnet given (WEBUI_LISTEN_SUBNET is empty)")
+    try:
+        net = ipaddress.ip_network(subnet, strict=True)
+    except ValueError as e:
+        raise ValueError(f"listen subnet {subnet!r} is not a network: {e}") from None
+    if net.version != 4:
+        raise ValueError(f"listen subnet {subnet} is not IPv4")
+    first = next(net.hosts(), None) if net.num_addresses > 1 else net.network_address
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((str(first), LISTEN_PROBE_PORT))
+            src = s.getsockname()[0]
+    except OSError as e:
+        raise ValueError(f"no route toward the listen subnet {subnet} ({e})") from None
+    if ipaddress.ip_address(src) not in net:
+        raise ValueError(f"this container has no address in the listen subnet "
+                         f"{subnet} (the route there leaves from {src})")
+    return src
 
 # Each entry's `command` is what the SSH-kind service runs after auth — the
 # byobu invocation lands the user in /workspace, the supervisor's project root.
