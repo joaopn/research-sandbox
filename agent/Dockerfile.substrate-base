@@ -78,5 +78,12 @@ JSON
 # dockerd access. Deferred from rs-minimal-base, where the group didn't exist.
 RUN usermod -aG docker research
 
+# The always-on inner-bridge guard (B143, box half): both dind leaves run it
+# after the inner daemon is ready, mcp-reload re-runs it after every allowlist
+# change, and the host re-runs it after staging the dev wiring. Baked here so
+# the research and sandbox-dind leaves carry the same bytes.
+COPY container/supervisor/inner-guard.sh /usr/local/bin/rs-inner-guard
+RUN chmod +x /usr/local/bin/rs-inner-guard
+
 # No skel snapshot, no USER switch, no ENTRYPOINT here — the leaf images add
 # their flavor layer, snapshot the home, and set the entrypoint.

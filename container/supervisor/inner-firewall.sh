@@ -16,6 +16,14 @@
 #
 # Idempotent: rebuilds the RS-INNER-FW chain on every invocation. Default OFF
 # (gated by RS_INNER_FIREWALL=1 in entrypoint.supervisor.sh).
+#
+# This chain sits at FORWARD position 1, BEFORE Docker's DOCKER-USER jump. What
+# it lets through it RETURNs (never ACCEPTs), so evaluation continues into
+# DOCKER-USER — where the always-on inner guard (inner-guard.sh) drops what
+# leaves toward the project's neighbours — and into Docker's own chains, whose
+# inter-bridge isolation now applies to these sources too (an ACCEPT here used
+# to let rs-inner sources reach rs-dev-* and docker0 containers directly).
+# What this chain drops is unchanged: the final DROP below.
 
 set -euo pipefail
 
@@ -64,10 +72,10 @@ if ! sudo iptables -C FORWARD -s "$SUBNET" -j "$CHAIN" 2>/dev/null; then
     sudo iptables -I FORWARD 1 -s "$SUBNET" -j "$CHAIN"
 fi
 
-sudo iptables -A "$CHAIN" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-sudo iptables -A "$CHAIN" -s "$PROXY_IP" -j ACCEPT
-sudo iptables -A "$CHAIN" -s "$ROLE_MCP_RANGE" -j ACCEPT
-sudo iptables -A "$CHAIN" -m iprange --src-range "$PI_RANGE_LO-$PI_RANGE_HI" -j ACCEPT
+sudo iptables -A "$CHAIN" -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+sudo iptables -A "$CHAIN" -s "$PROXY_IP" -j RETURN
+sudo iptables -A "$CHAIN" -s "$ROLE_MCP_RANGE" -j RETURN
+sudo iptables -A "$CHAIN" -m iprange --src-range "$PI_RANGE_LO-$PI_RANGE_HI" -j RETURN
 sudo iptables -A "$CHAIN" -m limit --limit 10/min --limit-burst 5 \
     -j LOG --log-prefix "rs-inner-fw drop: " --log-level warning
 sudo iptables -A "$CHAIN" -j DROP

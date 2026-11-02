@@ -154,7 +154,14 @@ if [[ "${DOCKER_DIND:-}" == "true" ]] && command -v dockerd >/dev/null 2>&1; the
     # image isn't staged yet (the host stages it post-start in create()), so the
     # proxy spawn just warns; create()'s cone re-runs mcp-reload after staging.
     # Mirrors entrypoint.supervisor.sh.
-    /usr/local/bin/mcp-reload || echo "WARNING: mcp-reload failed at boot" >&2
+    /usr/local/bin/mcp-reload || echo "WARNING: mcp-reload (or the inner guard it re-runs) failed at boot" >&2
+
+    # Inner-bridge guard (always on): boxes must not reach the project
+    # container, the host at the bridge gateway, the registry or any other
+    # on-bridge neighbour; they keep the internet, gitea's HTTP port and the
+    # proxy's registered upstreams. Mirrors entrypoint.supervisor.sh.
+    /usr/local/bin/rs-inner-guard || \
+        echo "WARNING: inner guard failed to apply" >&2
 fi
 
 # --- SSH ---

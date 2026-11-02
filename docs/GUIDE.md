@@ -211,6 +211,8 @@ python research.py mcp add mymcp --kind external --host host.docker.internal:900
 python research.py mcp add mymcp --kind external --host 10.0.5.42:8443
 ```
 
+A DNS name given to `--host` is resolved on the machine running `research`, once, when the MCP is allowed into a project (`project create`, `project mcp allow`, `project mcp sync`), and that address is what the router, the project's proxy and the project's inner guard then use; a name that does not resolve there refuses the allow. If the address behind a name changes, deny and re-allow the MCP.
+
 Auth headers (e.g. for hosted MCPs):
 
 ```bash

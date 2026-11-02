@@ -4405,6 +4405,10 @@ SANDBOX_BOX_IMAGE = "rs-sandbox-box:latest"
 # box preset (image="browser"). Registry-delivered like the plain box.
 SANDBOX_BOX_BROWSER_IMAGE = "rs-sandbox-box-browser:latest"
 INNER_NETWORK = "rs-inner"
+# The always-on inner-bridge guard baked into the substrate base (both dind
+# leaves): run by the entrypoints, by mcp-reload, and by the host right after
+# the dev wiring is staged (its gitea exception reads that file).
+INNER_GUARD_BIN = "/usr/local/bin/rs-inner-guard"
 WEBUI_IMAGE = "rs-webui:latest"
 WEBUI_CONTAINER = "rs-webui"
 ROUTER_CONTAINER = "rs-router"
@@ -7978,6 +7982,7 @@ _SUPERVISOR_FILE_MAP: list[tuple[str, str, bool]] = [
     ("container/supervisor/mcp_render_config.py",       "/opt/mcp-proxy-tools/mcp_render_config.py",         False),
     ("container/supervisor/mcp-reload.sh",              "/usr/local/bin/mcp-reload",                         True),
     ("container/supervisor/inner-firewall.sh",          "/usr/local/bin/rs-inner-firewall",                  True),
+    ("container/supervisor/inner-guard.sh",             INNER_GUARD_BIN,                                     True),
     ("container/supervisor/CLAUDE.md",                  "/opt/claude-templates/CLAUDE.md",                   False),
     ("container/supervisor/setup.sh",                   "/opt/claude-templates/setup.sh",                    True),
     ("container/supervisor/logbook_supervisor_template.md", "/opt/claude-templates/logbook_supervisor_template.md", False),
@@ -7995,11 +8000,16 @@ _SUPERVISOR_DIR_MAP: list[tuple[str, str]] = [
 ]
 
 # The rs-sandbox-dind leaf has none of the supervisor's agent files — its
-# file-only-update surface is just rs-sandbox + its own entrypoint. (code-server
-# / byobu live in the shared base, so changes there are a base rebuild, not a
-# file-copy.)
+# file-only-update surface is rs-sandbox, the proxy tooling it bakes, the inner
+# guard and its own entrypoint. (code-server / byobu live in the shared base,
+# so changes there are a base rebuild, not a file-copy.)
 _SANDBOX_DIND_FILE_MAP: list[tuple[str, str, bool]] = [
     ("cli/rs_sandbox.py",              "/usr/local/bin/rs-sandbox", True),
+    # The proxy tooling this leaf bakes (Dockerfile.sandbox-dind): mcp-reload
+    # re-runs the inner guard, so a file-only update must carry both.
+    ("container/supervisor/mcp_render_config.py", "/opt/mcp-proxy-tools/mcp_render_config.py", False),
+    ("container/supervisor/mcp-reload.sh", "/usr/local/bin/mcp-reload",  True),
+    ("container/supervisor/inner-guard.sh", INNER_GUARD_BIN,        True),
     ("agent/entrypoint.sandbox-dind.sh", "/entrypoint.sh",            True),
 ]
 
@@ -9683,6 +9693,7 @@ def _stage_dev_gitea(project: str, cfg: "Config", gitea_ip: str = "",
         tmp = payload_path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         tmp.replace(payload_path)
+        _rerun_inner_guard(project)
     container = container_name_for(project)
     if not (entries or hist_entries) or not container_running(container):
         return
@@ -9717,6 +9728,27 @@ def _stage_dev_gitea(project: str, cfg: "Config", gitea_ip: str = "",
                       if e.get("box") is None and e.get("user")), "")
     if proj_user:
         _stage_dev_git_credentials(container, proj_user)
+
+
+def _rerun_inner_guard(project: str) -> None:
+    """Re-apply the inner-bridge guard inside a RUNNING dind project after the
+    dev wiring was staged: the guard's gitea exception is read from that file,
+    which is absent at a project's first boot and appears only when the host
+    wires gitea in. Skipped for the `docker` substrate (no inner bridge, no
+    guard; this staging site is reached from its start path too) and for a
+    stopped container (its next boot runs the guard itself). A failure warns
+    and continues — the guard's own posture; a container from before the
+    guard existed warns here on every start until `project update` copies the
+    script in."""
+    container = container_name_for(project)
+    if not container_running(container):
+        return
+    if _container_substrate(container) == Substrate.DOCKER.value:
+        return
+    r = run(["docker", "exec", container, INNER_GUARD_BIN], capture_output=True)
+    if r.returncode != 0:
+        print(f"warning: inner guard re-run in {container} failed: "
+              f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
 
 
 def _stage_dev_fetch(container: str) -> None:
@@ -10733,6 +10765,18 @@ def _shared_mcps(only_enabled: bool = False) -> list[tuple[str, dict]]:
     return out
 
 
+def _resolve_mcp_host(host_addr: str) -> str:
+    """An external MCP's `--host` as one IPv4 address: a literal passes through,
+    a name is resolved on the host (the same machine the router and the
+    project's proxy reach it from). Raises OSError when it does not resolve
+    and UnicodeError when the name itself is malformed."""
+    try:
+        return str(ipaddress.IPv4Address(host_addr))
+    except ValueError:
+        pass
+    return socket.gethostbyname(host_addr)
+
+
 def _probe_mcp(name: str, entry: dict) -> tuple[bool, str]:
     if entry["kind"] == "external":
         host = entry.get("host_address", "host.docker.internal")
@@ -10796,7 +10840,21 @@ def _allow_mcp_for_project(project: str, cfg: "Config", mcp_name: str,
 
     if entry["kind"] == "external":
         host_addr = entry.get("host_address", "host.docker.internal")
-        ip = resolve_host_gateway() if host_addr == "host.docker.internal" else host_addr
+        if host_addr == "host.docker.internal":
+            ip = resolve_host_gateway()
+        else:
+            # The allowlist carries one ADDRESS every consumer keys on — the
+            # router's allow rule, the proxy's upstream dial and the inner
+            # guard's exception pair. A name registered with `--host` is
+            # resolved here, once, like host.docker.internal is; a name that
+            # does not resolve refuses the allow instead of writing a value
+            # the guard would have to skip (and the proxy then be dropped on).
+            try:
+                ip = _resolve_mcp_host(host_addr)
+            except (OSError, UnicodeError) as e:
+                # gaierror for an unknown name; UnicodeError from the idna
+                # codec for a malformed label (empty, or over 63 characters)
+                return False, f"external MCP host {host_addr!r} does not resolve: {e}"
         port = entry["host_port"]
     else:  # shared
         cname = mcp_container_name_for(mcp_name)

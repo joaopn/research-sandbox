@@ -106,6 +106,10 @@ Each project sits inside multiple boundaries that must all be crossed for a work
 
 `--inner-firewall` adds an iptables ACL on the supervisor's `rs-inner` bridge. Bridge-boundary, not intra-bridge — which means worker-to-mcp-proxy on the same bridge is L2-switched and unfiltered (the path we want allowed), while worker-to-anywhere-off-bridge is L3-routed and filtered. Default-OFF until the opt-in path has been dogfooded; the firewall is independent of the rs-router policy and complements it.
 
+### 7. Inner-bridge guard (always on)
+
+Every box, worker and role service is a container of the project's *inner* Docker daemon and leaves the project by NAT through the project container, so without a guard it reaches everything one hop from the project: the project container itself (its sshd, its editor), the host at the project bridge's gateway (its sshd), the box registry, Gitea, the webui — none of which the egress router sees. The guard runs in every dind project at boot and drops new connections from the inner bridges toward private addresses and toward the project container, keeping exactly what the lanes use: the internet, Gitea's HTTP port at the staged address (dev, fetch and history boxes clone and push through it), and the MCP proxy's registered upstreams. Details under "Inner-bridge guard" below.
+
 ## ◾ Host hardening (operator-applied)
 
 RS installs nothing on the host outside its own containers: it never writes a host firewall rule, never changes a host service, and never checks whether you did. Two paths out of a project can only be closed on the host, so this section lists them as suggestions you apply yourself, with your own privileges.
@@ -170,17 +174,43 @@ Plus per-MCP ACCEPT rules added by `project mcp-allow`, which take precedence ov
 
 The egress mode is set at `rs-router` and applies to *all* traffic from the project's subnet, including the supervisor's own outbound (e.g. for Claude Code's own API calls — those need 443 in either mode) and worker traffic.
 
+## ◾ Inner-bridge guard (always on)
+
+`rs-inner-guard` installs two chains in the project container's own iptables at every boot, re-applies them after every MCP allowlist change (through `mcp-reload`) and after the host stages the project's Gitea wiring. Both are rebuilt in one transaction, so a live jump never points at an empty chain.
+
+```
+RS-INNER-GUARD (jumped to from DOCKER-USER, i.e. FORWARD):
+  RETURN  -i <uplink>                 (traffic entering from the project network: the webui's probes into boxes, the published SSH port)
+  RETURN  RELATED,ESTABLISHED
+  DROP    ctstate DNAT                (a box reaching a published port through the project's address, whichever box it lands on)
+  RETURN  ! -o <uplink>               (inner-to-inner: Docker's own isolation decides)
+  RETURN  -d <gitea address> -p tcp --dport 3000                                 (when the project's Gitea wiring is staged)
+  RETURN  -i <rs-inner bridge> -s 192.168.99.2 -d <ip> -p tcp --dport <port>   (one per upstream in the project's MCP allowlist)
+  DROP    -d 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16
+
+RS-INNER-GUARD-IN (jumped to from INPUT):
+  RETURN  -i lo                       (the inner daemon's embedded DNS forwards to the project's own resolver here)
+  RETURN  -i <uplink>
+  RETURN  RELATED,ESTABLISHED
+  DROP
+```
+
+The uplink is the interface of the project's default route. The Gitea address and the upstream pairs are read from the project's staged wiring and validated as one IPv4 address and one port each; a value that fails validation is announced and skipped, the drops stand regardless. What the guard closes, measured: a box's connection to its project's sshd and editor, to the host's sshd at the bridge gateway, to the registry, and to another box's published port. What it keeps: the internet (a public destination's next hop is the private router, but the rule keys on the destination), Gitea over HTTP, the proxy's upstreams, and everything the project initiates toward its boxes. Residuals: boxes on one bridge still reach each other directly (a dev box has its own bridge for that reason); a box's `ping` of its gateway fails; the project's own root can remove the rules — that side is the operator's host hardening above.
+
 ## ◾ Inner-bridge firewall
 
 `--inner-firewall` (opt-in) installs a chain in the supervisor's local iptables:
 
 ```
 RS-INNER-FW chain (jumped to from FORWARD for source=192.168.99.0/24):
-  ACCEPT  RELATED,ESTABLISHED    (return traffic)
-  ACCEPT  -s 192.168.99.2        (mcp-proxy's pinned IP — its egress to upstreams)
+  RETURN  RELATED,ESTABLISHED    (return traffic)
+  RETURN  -s 192.168.99.2        (mcp-proxy's pinned IP — its egress to upstreams)
+  RETURN  role-MCP and box source ranges
   LOG     (rate-limited)
   DROP
 ```
+
+What the chain lets through RETURNs rather than ACCEPTs, so the always-on inner guard (above) and Docker's own inter-bridge isolation still apply to it.
 
 Worker → mcp-proxy on rs-inner is L2-bridged and bypasses FORWARD entirely (so always allowed). Worker → anywhere off-bridge is L3-routed through the supervisor's netns and hits the chain — DROPped unless from the proxy's IP. This lets the proxy still make its upstream calls while preventing workers from making direct off-bridge connections within the supervisor.
 

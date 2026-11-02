@@ -7,10 +7,22 @@
 # mutations (via `docker exec rs-project-<proj> /usr/local/bin/mcp-reload`).
 set -euo pipefail
 
+# The inner-bridge guard excepts exactly the proxy's registered upstreams, so
+# every reload that may have changed the allowlist re-runs it — on EVERY exit
+# path below (the host's allow/deny reload takes the SIGHUP path). A guard
+# failure fails the reload, so `research project mcp allow` reports it rather
+# than leaving the new upstream silently dropped.
+rs_inner_guard() {
+    if [[ -x /usr/local/bin/rs-inner-guard ]]; then
+        /usr/local/bin/rs-inner-guard
+    fi
+}
+
 python3 /opt/mcp-proxy-tools/mcp_render_config.py
 
 if ! docker info >/dev/null 2>&1; then
     echo "mcp-reload: inner dockerd not reachable; skipping" >&2
+    rs_inner_guard
     exit 0
 fi
 
@@ -21,11 +33,13 @@ docker network inspect rs-inner >/dev/null 2>&1 \
 if docker inspect mcp-proxy >/dev/null 2>&1; then
     docker kill -s HUP mcp-proxy >/dev/null
     echo "mcp-proxy: reloaded"
+    rs_inner_guard
     exit 0
 fi
 
 if ! docker image inspect rs-mcp-proxy:latest >/dev/null 2>&1; then
     echo "mcp-proxy: image rs-mcp-proxy:latest not staged; cannot start" >&2
+    rs_inner_guard
     exit 0
 fi
 
@@ -42,3 +56,4 @@ docker run -d \
     -v /workspace/.orchestrator/logs:/var/log/mcp-proxy:rw \
     rs-mcp-proxy:latest >/dev/null
 echo "mcp-proxy: started"
+rs_inner_guard
