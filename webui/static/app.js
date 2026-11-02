@@ -10013,14 +10013,17 @@ async function activateProject(name, opts) {
     delete state.projectServices[name];
     const enabled = await fetchProjectServices(name, (opts && opts.carry) ? prev : null,
                                                onScreen);
+    // The operator may have switched to another project during the fetch:
+    // that switch owns the screen now, so this one stops here (the
+    // refreshActiveServices idiom). The fetched map stays cached for the next
+    // visit.
+    if (state.activeProject !== name) return;
 
     renderServiceTabs(name, enabled);
     applyColumnLayout();
     // A pane whose tab's address changed while the project was not shown (a
     // port removed and re-added elsewhere) closes before the landing reuses it.
-    // (Skipped if the operator switched elsewhere during the fetch above:
-    // the reopen would act on whichever project is active now.)
-    if (prev && state.activeProject === name) {
+    if (prev) {
         const marker = state.lastDetection[name];
         followTabAddresses(name, prev, enabled,
                            marker === undefined ? "fallback" : marker, onScreen);
