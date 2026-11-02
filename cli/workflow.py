@@ -82,7 +82,7 @@ _WEB_KEYS = {"port", "label", "start"}
 # _EXPORT_BOX_LOOPBACK_PORT_HI): a workflow's web app becomes a top-level
 # exported port, so its port must be one that rule accepts. This module stays
 # importable without rscore, hence the copy (pytest-pinned to the original).
-WEB_RESERVED_PORTS = frozenset({22, 8443, 8445})
+WEB_RESERVED_PORTS = frozenset({22, 8443, 8444, 8445})
 WEB_RESERVED_BAND = (8500, 8699)  # inclusive
 _TAB_KEYS = {"name", "port", "kind", "path"}
 _EXPORT_KEYS = {"name", "port", "transport"}

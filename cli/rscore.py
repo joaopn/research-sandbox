@@ -2114,17 +2114,21 @@ class BoxPresetsRequest:
 # `port`/`label` act on the project's own supervisor netns — neither is
 # host-shaped, so both are broker-relayable. The TCP port space is the OS/protocol
 # bound (1-65535), not an invented cap. Reserved: the supervisor's own ssh (22) +
-# editor-stub (8443) + reader (8445) ports and the per-box editor publish range
-# (8500-8599) + the per-box loopback publish range (8600-8699) — registering one
-# would synthesize a confusing duplicate tab onto a netns port the webui already
-# serves (or collide with an allocated box publish). Lockstep: 22 ==
-# services.SERVICES["supervisor"].default_port; 8443 ==
-# services.SERVICES["code-server"].default_port; 8445 ==
+# editor-stub (8443) + editor-upstream (8444) + reader (8445) ports and the
+# per-box editor publish range (8500-8599) + the per-box loopback publish range
+# (8600-8699) — registering one would synthesize a confusing duplicate tab onto a
+# netns port the webui already serves (or collide with an allocated box publish).
+# 8444 is code-server itself, auth-less and loopback-only behind the 8443 stub:
+# registering it would make the loopback forwarder put it on the project bridge,
+# and a pass-through claim would hand it to the network with no webui session in
+# front. Lockstep: 22 == services.SERVICES["supervisor"].default_port; 8443 ==
+# services.SERVICES["code-server"].default_port == CODE_SERVER_STUB_PORT;
+# 8444 == CODE_SERVER_UPSTREAM_PORT (and code-server-deploy.sh's default); 8445 ==
 # services.SERVICES["reader"].default_port == READER_PORT; 8500-8599 ==
 # rs_sandbox.BOX_EDITOR_PORT_LO/HI; 8600-8699 == rs_sandbox.BOX_LOOPBACK_PORT_LO/HI.
 _PORT_MIN = 1
 _PORT_MAX = 65535
-_EXPORT_RESERVED_PORTS = frozenset({22, 8443, 8445})
+_EXPORT_RESERVED_PORTS = frozenset({22, 8443, 8444, 8445})
 _EXPORT_BOX_EDITOR_PORT_LO = 8500
 _EXPORT_BOX_EDITOR_PORT_HI = 8599  # inclusive
 _EXPORT_BOX_LOOPBACK_PORT_LO = 8600
