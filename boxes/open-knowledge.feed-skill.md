@@ -7,7 +7,7 @@ argument-hint: "[what to feed, optional]"
 
 # /ok — feed the knowledge base (Claude Code: `/ok`; pi: `/skill:ok`)
 
-Your feed folder is `{{MAILBOX_PATH}}ok/`, inside your mailbox. The project's OpenKnowledge box reads every agent's feed folder when its user runs `/ok-ingest` there; nothing you write here reaches the knowledge base before that. Nothing of this runs unasked: the user types `/ok`, you do what is below, and you stop.
+Your feed folder is `{{MAILBOX_PATH}}ok/`, inside your mailbox. The project's OpenKnowledge box (one created with "Share files") reads every sharing agent's feed folder when its user runs `/ok-ingest` there; nothing you write here reaches the knowledge base before that. Nothing of this runs unasked: the user types `/ok`, you do what is below, and you stop.
 
 ## First run: write the charter
 

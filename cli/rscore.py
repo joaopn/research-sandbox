@@ -174,16 +174,22 @@ _BOX_FOLDER_REASONS = {
     "not-a-folder": "it is no longer a folder",
     "unreadable": "it could not be read",
 }
-# The same table for the box's mailbox mount (kind "mailbox"): the reserved
-# `shared/` folder inside the box workspace, which only the box itself can
-# replace after RS created it.
+# The same table for a sharing box's mailbox mounts (kind "mailbox"): the
+# reserved `shared/` folder inside the box workspace, which only the box itself
+# can replace after RS created it; its folder under shared/.boxes/; and the
+# project agent's mailbox ("agent" — only that one mount is dropped).
 _BOX_MAILBOX_REASONS = {
-    "missing": "the reserved shared/ folder in its workspace could not be created; it runs without shared/ until it is",
-    "link": "shared/ in its workspace is a link now; it runs without shared/ until that folder is restored",
-    "not-a-folder": "shared/ in its workspace is no longer a folder; it runs without shared/ until that folder is restored",
-    "unreadable": "shared/ in its workspace could not be read; it runs without shared/ until that folder is restored",
-    "no-source": "its mailbox folder could not be created in the project's shared/ (something else sits at that name); it runs without shared/ until it can be",
+    "missing": "the reserved shared/ folder in its workspace could not be created; it runs without its mailbox until it is",
+    "link": "shared/ in its workspace is a link now; it runs without its mailbox until that folder is restored",
+    "not-a-folder": "shared/ in its workspace is no longer a folder; it runs without its mailbox until that folder is restored",
+    "unreadable": "shared/ in its workspace could not be read; it runs without its mailbox until that folder is restored",
+    "no-source": "its mailbox folder could not be created in the project's shared/.boxes/ (something else sits at that name); it runs without its mailbox until it can be",
 }
+# The project agent's mailbox alone could not be mounted into a sharing box.
+_BOX_MAILBOX_AGENT_LINE = ("started without the project agent's mailbox: something "
+                           "that is not a folder sits at shared/agent or "
+                           "shared/.boxes/agent; it still reads the other boxes' "
+                           "mailboxes and writes its own")
 # The same for a skill the box tool stages into an agent's workspace (kind
 # "skill": the feed skill a box type offers to every other agent, a box type's
 # own ingest skill). The remedy is webui-doable, so the line names it: the
@@ -194,9 +200,11 @@ _BOX_SKILL_REASONS = {
     "no-text": "the box type offering it is no longer in the catalog",
 }
 _BOX_SKILL_REASON_DEFAULT = "it could not be written; the skill is written again by the next add of a box whose type offers it"
-# Every box, worker and the project agent owns a mailbox /workspace/shared/<name>/
-# (the owner writes it, everyone else reads it, it outlives its owner). One
-# namespace, compared case-folded: these names are taken — the project agent's
+# Every worker and the project agent owns a mailbox /workspace/shared/<name>/,
+# and so does every box created sharing files with the project, at
+# shared/.boxes/<name>/ (the owner writes it, everyone else reads it, it
+# outlives its owner). One name namespace for all three, compared case-folded
+# (a box that does not share still takes its name): these names are taken — the project agent's
 # own `agent`, and every role service type (a role already publishes into
 # shared/<role>/). The in-supervisor box and worker tools carry MIRROR copies
 # (they are staged standalone); pytest-pinned equal.
@@ -231,13 +239,6 @@ def _coerce_box_folders(raw: Any) -> tuple[str, ...]:
             raise ValidationError(
                 f"invalid folder name {shown!r} (letters, digits, '.', '_' or "
                 f"'-' only)")
-        if n == MAILBOX_ROOT:
-            # Every box sees shared/ already (the mailbox mount at
-            # /workspace/shared); the picker never offers it, so this is a
-            # stale client — refuse rather than mount it a second time.
-            raise ValidationError(
-                f"{MAILBOX_ROOT!r} is already visible in every box at "
-                f"/workspace/{MAILBOX_ROOT}; it cannot be a read-only folder")
     return tuple(sorted(set(raw)))
 
 
@@ -259,9 +260,6 @@ def _box_folder_choices(workspace_path: "Path") -> list[dict]:
             if not e.is_dir(follow_symlinks=False):
                 continue
         except OSError:
-            continue
-        if e.name == MAILBOX_ROOT:
-            # Mounted into every box already (read-only, the mailbox view).
             continue
         ok = _valid_box_folder(e.name)
         row = {"name": e.name, "usable": ok,
@@ -321,11 +319,14 @@ def _box_folder_warnings(raw: Any, box: Any) -> list[str]:
                        else f"{who} started without its Gitea history: "
                             f"{_BOX_HISTORY_REASONS['']}")
             continue
+        if w.get("kind") == "mailbox" and w.get("reason") == "agent":
+            out.append(f"{who} {_BOX_MAILBOX_AGENT_LINE}")
+            continue
         if w.get("kind") == "mailbox":
             reason = w.get("reason")
             why = (_BOX_MAILBOX_REASONS.get(reason) if isinstance(reason, str)
                    else None) or ("shared/ in its workspace could not be used; it "
-                                  "runs without shared/ until that folder is restored")
+                                  "runs without its mailbox until that folder is restored")
             out.append(f"{who} started without its mailbox: {why}")
             continue
         if w.get("kind") == "skill":
@@ -411,6 +412,10 @@ _BOX_HISTORY_REASONS = {
 # older tool; this is the fixed text shown instead.
 _OLD_BOX_TOOL_MSG = ("this project's box tool predates read-only folders — "
                      "restart the project, then retry")
+# Every add passes --share or --no-share, so a tool older than file sharing
+# refuses every add: this is the line shown for it.
+_OLD_BOX_TOOL_SHARE_MSG = ("this project's box tool predates file sharing — "
+                           "restart the project, then retry")
 
 
 def _is_old_box_tool(r: "subprocess.CompletedProcess") -> bool:
@@ -420,7 +425,7 @@ def _is_old_box_tool(r: "subprocess.CompletedProcess") -> bool:
     return r.returncode == 2 and (
         ("unrecognized arguments" in err
          and any(o in err for o in ("--folders", "--set", "--history-user",
-                                    "--history-repo")))
+                                    "--history-repo", "--share", "--no-share")))
         or ("invalid choice" in err
             and any(c in err for c in ("'folders'", "'history-heal'"))))
 
@@ -1711,6 +1716,10 @@ class BoxAddRequest:
     # Keep this box's notes history on the shared Gitea (a gitea_history
     # preset only; gated in box_add, which has the catalog and the Gitea).
     history: bool = False
+    # Share files with the project (tri-state like browser): True/False is
+    # the caller's choice, None takes the box type's share_default (resolved
+    # in box_add, which has the catalog). Recorded at create, never changed.
+    share: bool | None = None
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "BoxAddRequest":
@@ -1751,6 +1760,9 @@ class BoxAddRequest:
         browser = kw.get("browser")
         if browser is not None and not isinstance(browser, bool):
             raise ValidationError("browser must be true or false when given")
+        share = kw.get("share")
+        if share is not None and not isinstance(share, bool):
+            raise ValidationError("share must be true or false when given")
         # Preset input-field values. ⚠ Every message in this block names the
         # KEY and the rule, NEVER the value — a deliberate deviation from the
         # surrounding {x!r}-echoing idiom: ValidationError text reaches the
@@ -1815,7 +1827,8 @@ class BoxAddRequest:
             branch=branch, model=_model, effort=_effort,
             fetch=bool(kw.get("fetch", False)),
             folders=_coerce_box_folders(kw.get("folders")),
-            history=_coerce_history_flag(kw.get("history")))
+            history=_coerce_history_flag(kw.get("history")),
+            share=share)
 
 
 @dataclass(frozen=True)
@@ -2887,6 +2900,7 @@ class DevBoxProvisionRequest:
     branch: str = ""                            # base branch ("" ⇒ the repo's default)
     model: str = ""                             # agent model for the box ("" ⇒ project's box default)
     effort: str = ""
+    share: bool | None = None                   # share files with the project (None ⇒ the dev type's default: off)
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "DevBoxProvisionRequest":
@@ -2923,11 +2937,12 @@ class DevBoxProvisionRequest:
             project=kw.get("project"), name=name, preset="dev",
             agent=kw.get("agent"), editor=kw.get("editor"), repo=repo,
             branch=kw.get("branch"),
-            model=kw.get("model"), effort=kw.get("effort"))
+            model=kw.get("model"), effort=kw.get("effort"),
+            share=kw.get("share"))
         return cls(project=box.project, url=url, repo=repo,
                    pat=(pat or "").strip(), name=box.name, agent=box.agent,
                    editor=box.editor, branch=box.branch,
-                   model=box.model, effort=box.effort)
+                   model=box.model, effort=box.effort, share=box.share)
 
 
 @dataclass(frozen=True)
@@ -3213,7 +3228,7 @@ class BoxListResult:
     """The project's sandbox boxes with live container state. No credentials in
     any row — safe to serialise straight into the broker reply."""
     project: str
-    boxes: list[dict]                       # {name, ip, agent, browser, state, dev, folders}
+    boxes: list[dict]                       # {name, ip, agent, browser, state, dev, folders, share}
     # The project's top-level folders a box may be given (the box-types read
     # carries the same list): the ⚙ Box folders section reads both from here.
     folder_choices: list = field(default_factory=list)
@@ -12854,6 +12869,19 @@ def _register_box_web_tab(workspace_path: "Path", info: dict, web_spec: dict,
     _write_exported_ports(workspace_path, ports)
 
 
+def _require_share_aware_box_tool(container: str, help_out=None) -> None:
+    """Refuse, before any Gitea work, when the project's box tool predates
+    file sharing: every add passes --share/--no-share, so an older tool would
+    take a dev box's or a history box's Gitea provisioning and only then
+    refuse the create (which cleans none of it up). A tool that cannot be
+    asked (absent, a failed exec) is not judged here — the create reports."""
+    r = help_out if help_out is not None else run(
+        ["docker", "exec", container, "rs-sandbox", "create", "--help"],
+        capture_output=True)
+    if r.returncode == 0 and "--share" not in (r.stdout or ""):
+        raise ValidationError(_OLD_BOX_TOOL_SHARE_MSG)
+
+
 def _gate_box_history(req: "BoxAddRequest", catalog: dict, container: str,
                       workspace_path: "Path") -> dict:
     """Every Gitea-history refusal, before any side effect; the Gitea-touching
@@ -12890,6 +12918,9 @@ def _gate_box_history(req: "BoxAddRequest", catalog: dict, container: str,
             capture_output=True)
     if r.returncode == 0 and "--history-user" not in (r.stdout or ""):
         raise ValidationError(_OLD_BOX_TOOL_HISTORY_MSG)
+    # A tool with history but older than file sharing would take the Gitea
+    # work and then refuse the always-passed --share/--no-share.
+    _require_share_aware_box_tool(container, help_out=r)
     try:
         _resume_gitea(require=True, tries=GITEA_RESUME_WAIT_TRIES)
     except SystemExit:
@@ -13008,6 +13039,12 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     # base unless the request overrides).
     want_browser = (req.browser if req.browser is not None
                     else catalog.get(req.preset, {}).get("image") == "browser")
+    # Sharing files with the project, resolved the same way (the box type's
+    # share_default when the caller did not say) and ALWAYS passed explicitly
+    # below: a box tool older than sharing then refuses the add instead of
+    # giving every box the old mailbox mounts.
+    want_share = (req.share if req.share is not None
+                  else catalog.get(req.preset, {}).get("share_default") is True)
     # Collision pre-flight: the box entrypoint's .mcp.json merge REFUSES on a
     # name collision, and under --restart unless-stopped that is a silent
     # crash-loop (box_add reports success; the tab never comes up; the signal
@@ -13190,6 +13227,9 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     # read at `docker run`). 4c-a: no project-level fork rides this path.
     box_user = ""
     if catalog.get(req.preset, {}).get("dev"):
+        # Before any Gitea work: an older box tool would refuse the create
+        # only after the consumer, fork and ledger row below exist.
+        _require_share_aware_box_tool(container)
         _resume_gitea(require=True)     # a dev box NEEDS gitea; never create
         network = project_network_for(req.project)
         ip = _connect_gitea_to_project_network(network)
@@ -13320,6 +13360,7 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     # tool's parser would read as an option if it stood alone.
     if req.folders:
         argv.append("--folders=" + ",".join(req.folders))
+    argv.append("--share" if want_share else "--no-share")
     argv += history_args
     progress.step("create-box", "creating the box")
     r = run(argv, capture_output=True)
@@ -13337,8 +13378,15 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         if history_args and not _box_entry_saved(workspace_path, req.name):
             _cleanup_box_history(req.project, req.name, hist_claim["user"],
                                  hist_claim["repo"], container)
-        if (req.folders or history_args) and _is_old_box_tool(r):
-            die(_OLD_BOX_TOOL_MSG if req.folders else _OLD_BOX_TOOL_HISTORY_MSG)
+        if _is_old_box_tool(r):
+            # Every add passes --share/--no-share, so any old tool refuses;
+            # name the newest feature it lacks that this add asked for.
+            err = (r.stderr or "") + (r.stdout or "")
+            if req.folders and "--folders" in err:
+                die(_OLD_BOX_TOOL_MSG)
+            if history_args and "--history-" in err:
+                die(_OLD_BOX_TOOL_HISTORY_MSG)
+            die(_OLD_BOX_TOOL_SHARE_MSG)
         die(f"failed to add box: {(r.stderr or r.stdout).strip()}")
     try:
         info = json.loads(r.stdout)            # rs-sandbox create prints the entry
@@ -13505,7 +13553,9 @@ def box_list(req: "BoxListRequest", _progress=None) -> BoxListResult:  # type: i
               "dev": bool(e.get("dev")),
               "folders": [f for f in (e.get("folders") or [])
                           if _valid_box_folder(f)]
-                         if isinstance(e.get("folders"), list) else []}
+                         if isinstance(e.get("folders"), list) else [],
+              # True only for the literal True the box tool reports.
+              "share": e.get("share") is True}
              for e in rows
              if isinstance(e, dict) and e.get("kind") == extension.SANDBOX_KIND]
     choices, choices_error = _box_folder_choices_or_note(
@@ -13589,7 +13639,9 @@ def box_presets(req: "BoxPresetsRequest", _progress=None) -> BoxPresetsResult:  
                 # Offers the box window's "Keep history on Gitea" switch.
                 "gitea_history": bool(e.get("gitea_history")),
                 # The type starts its own web app in a tab of its own.
-                "web": bool(e.get("web"))}
+                "web": bool(e.get("web")),
+                # Pre-ticks the box window's "Share files" card.
+                "share_default": e.get("share_default") is True}
                for e in catalog]
     allowed = sorted(x["name"] for x in load_project_allowlist(req.project, cfg)
                      if x.get("name"))
@@ -16239,7 +16291,7 @@ def dev_box_provision(req: "DevBoxProvisionRequest", progress=None) -> dict:  # 
     box = box_add(BoxAddRequest.from_kwargs(
         project=req.project, name=req.name, preset="dev", agent=req.agent,
         editor=req.editor, repo=req.repo, branch=req.branch,
-        model=req.model, effort=req.effort), progress)
+        model=req.model, effort=req.effort, share=req.share), progress)
     return {"project": req.project, "repo": req.repo, "box": box.name,
             "container": box.container}
 

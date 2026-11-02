@@ -1062,6 +1062,9 @@ async def broker_box_add_handler(request: web.Request) -> web.Response:
             # Read-only folders (a list of top-level folder names) — raw; the
             # broker request validates the shape, box_add the folders.
             "folders": body.get("folders"),
+            # Share files with the project — RAW and TRI-STATE like `browser`
+            # (absent ⇒ the box type's default; bool() would force it off).
+            "share": body.get("share"),
             # Keep the notes' history on Gitea — RAW like `browser`: the broker
             # request refuses anything but a bool.
             "history": body.get("history")}
@@ -1705,7 +1708,10 @@ async def broker_dev_box_handler(request: web.Request) -> web.Response:
     args = {"project": project, "url": body.get("url"), "pat": body.get("pat"),
             "name": body.get("name"), "agent": body.get("agent"),
             "editor": bool(body.get("editor")), "branch": body.get("branch"),
-            "model": body.get("model"), "effort": body.get("effort")}
+            "model": body.get("model"), "effort": body.get("effort"),
+            # Share files — RAW like the plain box route's (tri-state; the
+            # broker request refuses anything but a bool or absent).
+            "share": body.get("share")}
     op_id = _mint_op_id(project, "dev-box")
     try:
         reply = await broker_call("dev_box_provision", args,

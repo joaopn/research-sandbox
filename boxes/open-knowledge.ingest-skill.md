@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 # /ok-ingest — take the feeds into the knowledge base
 
-Every agent of this project (the project's own agent, each box with an agent) can feed this knowledge base with `/ok`: it writes notes into its own mailbox, under `/workspace/shared/<name>/ok/`, following a charter it wrote with its user in `/workspace/shared/<name>/ok/CHARTER.md`, with one line per note in `/workspace/shared/<name>/ok/LOG.md`. Those folders are read-only here. Nothing of this runs unasked: the user types `/ok-ingest`, you do what is below, and you stop.
+Every agent of this project that shares files (the project's own agent, each box created with "Share files" that runs an agent) can feed this knowledge base with `/ok`: it writes notes into its own mailbox, under `/workspace/shared/<name>/ok/`, following a charter it wrote with its user in `/workspace/shared/<name>/ok/CHARTER.md`, with one line per note in `/workspace/shared/<name>/ok/LOG.md`. Those folders are read-only here. Nothing of this runs unasked: the user types `/ok-ingest`, you do what is below, and you stop.
 
 Your record of what has been taken in is the page `ok-ingest-record.md` at the root of this knowledge base (create it on the first run): one line per ingested note, `<mailbox name>/<note file>`.
 

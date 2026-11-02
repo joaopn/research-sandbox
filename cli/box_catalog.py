@@ -118,7 +118,11 @@ _ALLOWED_KEYS = {"name", "image", "agent_default", "clone", "description",
                  # skill is offered to every OTHER agent of the project (each
                  # box, the project agent); an ingest skill is the preset's
                  # own. Built-in presets only; staged by the box tool.
-                 "feed_skill", "ingest_skill"}
+                 "feed_skill", "ingest_skill",
+                 # share_default: the box window's "Share files" card starts
+                 # ticked for this type (a default only — the operator sees and
+                 # can untick it at creation; any type may carry it).
+                 "share_default"}
 
 # The skill texts ride the catalog like `instructions` does: a sibling file per
 # key, folded at load, never inline in the JSON. The skill's slash-command name
@@ -320,6 +324,11 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
     if "gitea_history" in m and not isinstance(m["gitea_history"], bool):
         out.append(p(f"gitea_history must be a boolean, got "
                      f"{m.get('gitea_history')!r}"))
+
+    # share_default: pre-ticks "Share files" in the box window.
+    if "share_default" in m and not isinstance(m["share_default"], bool):
+        out.append(p(f"share_default must be a boolean, got "
+                     f"{m.get('share_default')!r}"))
 
     # web: the box keeps `start` running with the tab's address in
     # $RS_WEB_ADDRESS, and the webui shows `port` as a tab named `label`. It

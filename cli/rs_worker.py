@@ -155,10 +155,11 @@ def worker_dir(name: str) -> Path:
     return WORKSPACE / "workers" / name / "work"
 
 
-# Mailboxes: every worker, box and the project agent owns /workspace/shared/<name>/
-# — read-write for the owner, read-only for everyone else (a worker already sees
-# all of shared/ read-only; its own folder is mounted read-write on top), never
-# deleted with its owner. One namespace with the boxes, compared case-folded.
+# Mailboxes: every worker and the project agent owns /workspace/shared/<name>/
+# (a box created sharing files owns shared/.boxes/<name>/) — read-write for the
+# owner, read-only for everyone else (a worker already sees all of shared/
+# read-only; its own folder is mounted read-write on top), never deleted with
+# its owner. One name namespace with the boxes, compared case-folded.
 MAILBOX_ROOT = "shared"
 # MIRROR of rscore's reserved set ("agent" + every role-MCP type name in
 # cli/role_mcp.py ROLE_IPS; pytest-pinned). This tool is baked standalone.

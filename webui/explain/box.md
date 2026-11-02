@@ -45,22 +45,32 @@ Independent of the type:
   A ticked folder appears in the box under `/mnt/<folder>` and cannot be changed
   from the box — by its agent, by `sudo`, by anything. Nothing is ticked by
   default. Not on dev boxes.
-- **Mailbox** — every box has one, dev boxes included: `/workspace/shared/<box>/`
-  is the one project folder the box writes, and all of `/workspace/shared/`
-  (the other boxes', the workers' and the project agent's mailboxes, the role
-  services' publications) is readable in it. The mailbox stays when the box is
-  removed; a box added later under the same name writes into it again.
-  When the project has an OpenKnowledge box, every other box and the project's
-  own agent have a user-only command `/ok` that writes knowledge-base notes
-  into their mailbox, and the OpenKnowledge box's `/ok-ingest` brings them in;
-  neither runs unasked.
+- **Share files** — off by default (the OpenKnowledge type starts with it
+  ticked), and set when the box is created: to change it, remove the box and
+  add it again. A box that shares gets a mailbox, `/workspace/shared/<box>/`
+  — the one project folder it writes, which the project agent, the workers
+  and the other sharing boxes read — and reads, under `/workspace/shared/`,
+  the project agent's mailbox and the other sharing boxes' mailboxes,
+  including boxes added after it. It never sees the workers' or the role
+  services' output unless you tick `shared` as a read-only folder. A box that
+  does not share has no mailbox and no `/workspace/shared` (only what you tick
+  as read-only folders), and nothing it writes is put where the project agent
+  or the workers look. On the project side a sharing box's mailbox is
+  `shared/.boxes/<box>/`; it stays when the box is removed, and a sharing box
+  added later under the same name writes into it again. When the project has
+  a sharing OpenKnowledge box, every other sharing box and the project's own
+  agent have a user-only command `/ok` that writes knowledge-base notes into
+  their mailbox, and the OpenKnowledge box's `/ok-ingest` brings them in;
+  neither runs unasked. The ⚙ panel's **Box folders** section names the boxes
+  that share.
 
 ## Read-only folders
 
 The box window lists every top-level folder of the project (plain names first,
 hidden ones after; links and plain files are not offered, a folder whose
-name a mount cannot carry is shown greyed, and `shared/` is not listed because
-every box sees it already — see **Mailbox** above). Change a box's folders later in the
+name a mount cannot carry is shown greyed). Ticking `shared` gives the box
+every mailbox and every role service's publication, read-only at
+`/mnt/shared` — the way to show a box the workers' output. Change a box's folders later in the
 project's ⚙ panel under **Box folders**: saving restarts the box fresh, so its
 agent logs in again and its setup runs again; the box's own files are untouched.
 

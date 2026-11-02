@@ -5815,14 +5815,25 @@ function showLifecycleNotice(project, verb, opId, outcome) {
     });
 }
 
-// What every box gets without ticking anything — shown under the name field
-// in the box window. One namespace with the workers: a taken name is refused
-// by the server, a folder that already exists is adopted (kept from a box of
-// that name removed earlier, or made by hand).
-const BOX_MAILBOX_HINT =
-    "The box writes to /workspace/shared/<name>/ (its mailbox, kept when the " +
-    "box is removed; a name that already has one writes into it) and reads " +
-    "every mailbox under /workspace/shared/.";
+// What ticking "Share files" means — shown under the card in the box window
+// while it is ticked. A box that does not share sees no shared/ at all. A
+// mailbox folder that already exists under the name is adopted (kept from a
+// sharing box of that name removed earlier).
+const BOX_SHARE_HINT =
+    "The box gets a mailbox, /workspace/shared/<name>/, which the project " +
+    "agent, the workers and the other boxes that share files read; it is " +
+    "kept when the box is removed, and a box added later under the same name " +
+    "writes into it again. The box reads the project agent's mailbox and the " +
+    "other sharing boxes' mailboxes, never the workers' (tick shared as a " +
+    "read-only folder for that). Set when the box is created; to change it, " +
+    "remove the box and add it again.";
+// The ⚙ panel's line naming the boxes that share files.
+function boxShareLine(rows) {
+    const names = (rows || []).filter((x) => x && x.share === true).map((x) => x.name);
+    return names.length
+        ? "Shares files with the project: " + names.join(", ") + "."
+        : "No box here shares files with the project.";
+}
 
 // What a ticked read-only folder means for the operator — shown under the
 // folder checkboxes in the box window and the ⚙ Box folders section.
@@ -7902,6 +7913,26 @@ async function mgmtBoxAddDialog(project) {
         syncHistory();
     };
 
+    // Share files with the project (off by default; the box type may pre-tick
+    // it — applyPreset seeds it from share_default). Set at creation only.
+    // shareCb is the detached value holder; the payload always sends it.
+    const shareCb = el("input", { type: "checkbox" });
+    const shareCard = el("div", {
+        class: "box-opt-card",
+        title: "Give this box a mailbox the project agent and the workers read, " +
+               "and let it read the project agent's and the other sharing " +
+               "boxes' mailboxes. Off: the box has no mailbox and no /workspace/shared.",
+    }, [el("span", { class: "box-opt-name" }, ["Share files"])]);
+    const shareHint = el("div", { class: "hint" }, [BOX_SHARE_HINT]);
+    const syncShare = () => {
+        shareCard.classList.toggle("selected", shareCb.checked);
+        shareHint.style.display = shareCb.checked ? "" : "none";
+    };
+    shareCard.onclick = () => {
+        shareCb.checked = !shareCb.checked;
+        syncShare();
+    };
+
     // Browser (spawn-time image toggle, tri-state server-side): checked ⇒ the
     // Playwright + headless Chromium box image, unchecked ⇒ the base image. The
     // preset's image is only the DEFAULT (applyPreset seeds the checkbox from
@@ -8068,6 +8099,9 @@ async function mgmtBoxAddDialog(project) {
         if (!offersHistory) historyCb.checked = false;
         historyCard.style.display = offersHistory ? "" : "none";
         syncHistory();
+        // Share files follows the type's default on every preset switch.
+        shareCb.checked = selectedPreset.share_default === true;
+        syncShare();
         // Browser follows the preset's image default on every preset switch; a
         // dev preset forces it off + disabled (base-image only — both gates
         // reject the combination, so the dialog must not offer it).
@@ -8114,8 +8148,7 @@ async function mgmtBoxAddDialog(project) {
         confirmLabel: "Add box",
         cardClass: "box-add-card",
         body: [
-            el("div", { class: "field" }, [el("label", {}, ["Name (optional)"]), nameI,
-                el("div", { class: "hint" }, [BOX_MAILBOX_HINT])]),
+            el("div", { class: "field" }, [el("label", {}, ["Name (optional)"]), nameI]),
             el("div", { class: "field" }, [
                 el("div", { class: "box-type-label" }, ["Box type", overviewBtn]),
                 el("div", { class: "box-preset-cards" }, cards),
@@ -8135,8 +8168,9 @@ async function mgmtBoxAddDialog(project) {
                 el("div", { class: "box-opt-group" }, [
                     el("div", { class: "box-opt-caption" }, ["Extensions"]),
                     el("div", { class: "box-opt-cards" },
-                       [editorCard, fetchCard, browserCard, historyCard]),
+                       [editorCard, fetchCard, browserCard, historyCard, shareCard]),
                     historyHint,
+                    shareHint,
                 ]),
                 el("div", { class: "box-opt-group" }, [
                     el("div", { class: "box-opt-caption" }, ["MCP tools"]),
@@ -8195,6 +8229,8 @@ async function mgmtBoxAddDialog(project) {
                     editor: editorCb.checked,
                     // Unconditional — the validator above guarantees non-empty.
                     branch: devBranchI.value.trim(),
+                    // Always explicit, like the plain box payload.
+                    share: shareCb.checked,
                 };
                 if (agentS.value) payload.agent = agentS.value;
                 // The dev preset posts to a DIFFERENT route (the detached
@@ -8224,6 +8260,9 @@ async function mgmtBoxAddDialog(project) {
                 browser: browserCb.checked,
                 fetch: fetchCb.checked,
                 mcps: mcpBoxes.filter((b) => b.cb.checked).map((b) => b.name),
+                // Always explicit: the card's state IS the choice (applyPreset
+                // seeded it from the type's default).
+                share: shareCb.checked,
             };
             const folders = folderBoxes.filter((b) => b.cb.checked).map((b) => b.name);
             if (folders.length) payload.folders = folders;
@@ -8262,23 +8301,25 @@ async function mgmtBoxAddDialog(project) {
     });
 }
 
+// The remove dialog's mailbox sentence: only a box that shares files has one.
+const BOX_REMOVE_MAILBOX_NOTE =
+    "If it shares files with the project, its mailbox under shared/.boxes/ " +
+    "stays either way.";
+
 function mgmtBoxRemoveDialog(project, box) {
     const pwI = el("input", { type: "password", autocomplete: "current-password" });
     const keepCb = el("input", { type: "checkbox" });
     const warn = el("p", {}, [
         `This discards box "${box}" in "${project}" — its container and ` +
-        "workspace are wiped. This cannot be undone. Its mailbox under " +
-        "shared/ stays either way.",
+        "workspace are wiped. This cannot be undone. " + BOX_REMOVE_MAILBOX_NOTE,
     ]);
     // Toggle the warning copy: preserving artifacts is recoverable, wiping is not.
     keepCb.onchange = () => {
         warn.textContent = keepCb.checked
             ? `This removes box "${box}" in "${project}" — its container is torn ` +
-              "down but its workspace artifacts stay on disk. Its mailbox under " +
-              "shared/ stays either way."
+              "down but its workspace artifacts stay on disk. " + BOX_REMOVE_MAILBOX_NOTE
             : `This discards box "${box}" in "${project}" — its container and ` +
-              "workspace are wiped. This cannot be undone. Its mailbox under " +
-              "shared/ stays either way.";
+              "workspace are wiped. This cannot be undone. " + BOX_REMOVE_MAILBOX_NOTE;
     };
     mgmtConfirmThenTail(boxOpView(), {
         title: `Remove box "${box}"`,
@@ -10519,11 +10560,15 @@ function appendBoxFoldersSection(box, project, enabled) {
                 [(b && mgmtErrText(b)) || "Couldn't load the boxes."]));
             return;
         }
-        const boxes = (b.result.boxes || []).filter((x) => !x.dev);
+        const allBoxes = b.result.boxes || [];
+        const boxes = allBoxes.filter((x) => !x.dev);
         const choices = b.result.folder_choices || [];
         const choicesError = b.result.folder_choices_error || "";
+        // Which boxes share files — every box, dev boxes included (fixed at
+        // creation, so a line to read, not a control).
+        const shareLine = el("div", { class: "config-hint" }, [boxShareLine(allBoxes)]);
         if (!boxes.length) {
-            content.replaceChildren(el("div", { class: "config-empty" },
+            content.replaceChildren(shareLine, el("div", { class: "config-empty" },
                 ["No box here takes folders."]));
             return;
         }
@@ -10609,6 +10654,7 @@ function appendBoxFoldersSection(box, project, enabled) {
         };
         draw();
         content.replaceChildren(
+            shareLine,
             el("div", { class: "config-box-row" }, [sel, saveBtn]),
             list,
             el("div", { class: "config-hint" }, [

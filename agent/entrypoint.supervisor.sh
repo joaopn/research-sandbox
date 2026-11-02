@@ -157,8 +157,9 @@ for d in /workspace/mnt /workspace/shared; do
     fi
 done
 # The project agent's own mailbox (/workspace/shared/<name>/ is the one folder
-# each box, worker and this agent writes for the others; every box and worker
-# sees all of shared/ read-only), and its two skills homes — empty, so a skill
+# each worker and this agent writes for the others, shared/.boxes/<box>/ each
+# box created sharing files; every worker sees all of shared/ read-only, a
+# sharing box only shared/.boxes/ and shared/agent/), and its two skills homes — empty, so a skill
 # staged into them later is picked up by a running session. The research user
 # owns them: this runs as research.
 mkdir -p /workspace/shared/agent /workspace/.claude/skills /workspace/.pi/skills

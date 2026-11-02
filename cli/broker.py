@@ -732,7 +732,12 @@ BOX_ADD_WEBUI_FIELDS = frozenset({"project", "name", "preset", "agent", "editor"
                                   # Gitea (a bool; gitea_history presets only,
                                   # gated in box_add). No secret rides it —
                                   # the account and token are minted host-side.
-                                  "history"})
+                                  "history",
+                                  # Share files with the project (a bool or
+                                  # absent ⇒ the type's default). Names no
+                                  # mount source: RS fixes the sources (the
+                                  # project's shared/.boxes/ and shared/agent/).
+                                  "share"})
 BOX_TARGET_WEBUI_FIELDS = frozenset({"project", "name"})
 # The ⚙ Box folders change: the whole new set for one box (same boundary
 # argument as `folders` above). Inline like port_add's box arm — it re-runs one
@@ -891,7 +896,11 @@ DEV_BOX_WEBUI_FIELDS = frozenset({"project", "url", "pat", "name", "agent",
                                   # dropped HERE and again in the verb's kwarg list,
                                   # and the box would silently run the default —
                                   # on the box type where the choice matters most.
-                                  "model", "effort"})
+                                  "model", "effort",
+                                  # Share files with the project (bool or absent
+                                  # ⇒ off, the dev type's default) — like the
+                                  # plain box window's field.
+                                  "share"})
 # The dev-project provision boundary (the Workflows page's dev card): minimal
 # and deliberate. Adding a field here is a boundary edit — never open a
 # path/host-shaped one. `workflow` threads the manifest the dialog was opened
