@@ -1329,8 +1329,14 @@ async function attachIntoVault(name) {
     const info = body.result;   // {name, host, port, username, password}
     const existing = state.vault.projects.find((p) => p.name === info.name);
     if (existing) {
-        existing.host = info.host; existing.port = info.port;
-        existing.username = info.username; existing.password = info.password;
+        // Only a transient (_jit) row takes the keyring's coordinates. A saved
+        // bookmark (manual Import) keeps the ones the operator entered: copying
+        // the keyring password onto it would let persistVault write it into the
+        // encrypted vault, and would overwrite what the operator typed.
+        if (existing._jit) {
+            existing.host = info.host; existing.port = info.port;
+            existing.username = info.username; existing.password = info.password;
+        }
     } else {
         const row = {
             name: info.name, host: info.host, port: info.port,
@@ -7885,9 +7891,14 @@ async function mgmtAttach(view, name, btn) {
     const info = body.result;   // {name, host, port, username, password}
     const existing = state.vault.projects.find((p) => p.name === info.name);
     if (existing) {
-        // Refresh creds in place; preserve its persisted/transient status.
-        existing.host = info.host; existing.port = info.port;
-        existing.username = info.username; existing.password = info.password;
+        // Only a transient (_jit) row takes the keyring's coordinates. A saved
+        // bookmark (manual Import) keeps the ones the operator entered: copying
+        // the keyring password onto it would let persistVault write it into the
+        // encrypted vault, and would overwrite what the operator typed.
+        if (existing._jit) {
+            existing.host = info.host; existing.port = info.port;
+            existing.username = info.username; existing.password = info.password;
+        }
     } else {
         const row = {
             name: info.name, host: info.host, port: info.port,
