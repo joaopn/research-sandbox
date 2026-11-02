@@ -46,9 +46,16 @@ TLS_DIR = Path(os.environ.get("WEBUI_TLS_DIR", "/app/tls"))
 # address and nothing else — a connection from a project network is refused at
 # the socket (B156). There is deliberately no wildcard default.
 # Listen port is fixed to match the Dockerfile's EXPOSE; the host-side
-# WEBUI_PORT only changes the host:container mapping in docker-compose,
-# never the in-container listen port.
+# WEBUI_PORT changes the host:container mapping in docker-compose, never the
+# in-container listen port.
 LISTEN_PORT = 7777
+# The HOST port the operator's browser reaches the UI on (WEBUI_PORT, passed in
+# by compose) — distinct from LISTEN_PORT. Used ONLY to namespace the cookie
+# names (services.broker_cookie_name / session_cookie_name, B73): cookies are
+# host-keyed and port-blind, so two webuis at one hostname are told apart by
+# this port alone. The default is a lockstep with compose's ${WEBUI_PORT:-7777};
+# int() makes a malformed value fail loudly at start, like ORIGIN_PORT_LO.
+PUBLISHED_PORT = int(os.environ.get("WEBUI_PORT", "7777"))
 LOOPBACK_HOST = "127.0.0.1"
 HOST_BIND = os.environ.get("WEBUI_BIND", "127.0.0.1")
 
@@ -135,8 +142,9 @@ SESSIONS: dict[str, dict] = {}
 # app) is served on its OWN published webui port, giving it an isolated
 # browser-storage origin (an origin is scheme+host+port; code-server keeps
 # layout/Ports-view/recents in origin-scoped storage). Cookies are host-keyed
-# and port-blind, so the root origin's rs_session_<project> cookie reaches
-# these ports with no extra handshake — cookies shared, storage isolated.
+# and port-blind, so the root origin's session cookie for a project
+# (services.session_cookie_name) reaches these ports with no extra handshake —
+# cookies shared, storage isolated.
 #
 # The LO/HI defaults mirror .env.example / docker-compose.yml (a 3-file
 # lockstep); docker publishes exactly this range at container start, so a
@@ -166,7 +174,8 @@ ORIGIN_PORTS_FILE = STATE_DIR / "origin-ports.json"
 # its "project". A leading '-' is unreachable under the project-name regex
 # (alnum first char), so the sentinel can never collide with a real project —
 # and the cookie-gate code works verbatim (the cookie name derives from
-# entry["project"] → rs_session_-gitea-). Minted by /broker/dev/gitea-session,
+# entry["project"] → services.session_cookie_name(PUBLISHED_PORT, "-gitea-")).
+# Minted by /broker/dev/gitea-session,
 # which is Management-session-anchored (the broker cookie is Path=/broker — the
 # reason the mint route lives under /broker/ — and never reaches port-root
 # origins, which is why the mint sets a dedicated Path=/ cookie).
@@ -419,7 +428,9 @@ BROKER_OP_TIMEOUT_S = 600
 # from the per-project SSH SESSIONS map. Process-memory only; a webui restart
 # drops them (re-login), mirroring the broker's own in-daemon token store.
 BROKER_SESSIONS: dict[str, dict] = {}
-BROKER_COOKIE = "rs_broker"
+# Namespaced by the published UI port (B73): a second webui at the same
+# hostname must not overwrite this one's Management login.
+BROKER_COOKIE = services.broker_cookie_name(PUBLISHED_PORT)
 
 # Whether the last broker reply said the daemon runs older code than is on the
 # host ("stale": true in the envelope). One webui, one operator: the last reply
@@ -1946,7 +1957,7 @@ async def dev_gitea_session_handler(request: web.Request) -> web.Response:
     response = web.json_response(
         {"ok": True, "url": f"https://{_request_host(request)}:{port}/"})
     response.set_cookie(
-        f"rs_session_{GITEA_ORIGIN_KEY}", token,
+        services.session_cookie_name(PUBLISHED_PORT, GITEA_ORIGIN_KEY), token,
         path="/",
         httponly=True, secure=True, samesite="Strict",
         max_age=SESSION_TTL_SECONDS,
@@ -3376,8 +3387,10 @@ async def session_handler(request: web.Request) -> web.Response:
 
     Body: JSON `{host, port?, username?, password, fingerprint?}` (the
     same shape the SSH `connect` message uses on /ws). On success the
-    response sets `Set-Cookie: rs_session_<proj>=<token>; Path=/;
-    Secure; HttpOnly; SameSite=Strict`."""
+    response sets `Set-Cookie: rs_session_<webui port>_<proj>=<token>;
+    Path=/; Secure; HttpOnly; SameSite=Strict` — the name carries this webui's
+    published port (services.session_cookie_name) so a second webui at the
+    same hostname keeps its own cookie (B73)."""
     if not origin_ok(request):
         return web.Response(status=403, text="origin rejected")
 
@@ -3427,7 +3440,7 @@ async def session_handler(request: web.Request) -> web.Response:
     response = web.json_response(
         {"ok": True, "fingerprint": validator.actual_fp})
     response.set_cookie(
-        f"rs_session_{project}", token,
+        services.session_cookie_name(PUBLISHED_PORT, project), token,
         path="/",
         httponly=True, secure=True, samesite="Strict",
         max_age=SESSION_TTL_SECONDS,
@@ -3755,7 +3768,9 @@ async def origin_proxy_handler(request: web.Request) -> web.StreamResponse:
     """Catch-all for the per-editor origin ports (ORIGIN_PORT_LO..HI): resolve
     WHICH container this port serves from the allocation table, gate on the
     project's session cookie (host-keyed and port-blind, so the /session mint
-    on the root origin reaches us for free), re-derive the upstream from the
+    on the root origin reaches us for free; its name carries this webui's
+    published port, so another webui's cookie for the same project is never
+    read here — B73), re-derive the upstream from the
     live registries, and reverse-proxy at PORT-ROOT — no path prefix, no
     strip, which is code-server's native deployment shape."""
     sock = request.transport.get_extra_info("sockname") if request.transport else None
@@ -3765,7 +3780,8 @@ async def origin_proxy_handler(request: web.Request) -> web.StreamResponse:
         return web.Response(status=404, text="no editor assigned to this port")
     project, service_id = entry["project"], entry["service"]
 
-    cookie = request.cookies.get(f"rs_session_{project}")
+    cookie = request.cookies.get(
+        services.session_cookie_name(PUBLISHED_PORT, project))
     if not cookie or not _session_valid(cookie, project):
         return web.Response(status=401, text="session required")
 

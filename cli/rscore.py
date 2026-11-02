@@ -10821,19 +10821,34 @@ def _gitea_pinned_version(pins: dict[str, str]) -> str:
     return version
 
 
-def _gitea_env(version: str) -> dict[str, str]:
+def _gitea_env(version: str, webui_port: str | None = None) -> dict[str, str]:
     """The environment every gitea `docker run` gets, for that gitea VERSION.
 
     The egress allowlists are a lockstep with the version: on a release older
     than GITEA_EGRESS_SETTINGS_VERSION the new setting names mean nothing (the
     migration restriction would silently disappear), and on a newer one the old
-    names leave webhooks free to reach any public host."""
+    names leave webhooks free to reach any public host.
+
+    Gitea's own session and remember-me cookie names carry the webui's
+    published port (``webui_port``, default the configured WEBUI_PORT): gitea
+    is reached through the webui's origin ports at the operator's hostname, and
+    browsers key cookies on the hostname alone, so a second RS's gitea at the
+    same hostname would otherwise share — and overwrite — this one's login
+    (B73). The suffix only has to DIFFER between two installs, so the value
+    captured when the container is created stays correct if WEBUI_PORT later
+    changes. These two are the only cookie names gitea lets a config set (its
+    CSRF cookie is gone in 28.x and was a fixed name before)."""
+    if webui_port is None:
+        # Same fallback as `research webui start` (compose's ${WEBUI_PORT:-7777}).
+        webui_port = read_env_value("WEBUI_PORT") or "7777"
     env = {
         "INSTALL_LOCK": "true",
         "GITEA__service__DISABLE_REGISTRATION": "true",
         "GITEA__service__REQUIRE_SIGNIN_VIEW": "true",
         "GITEA__server__DISABLE_SSH": "true",
         "GITEA__server__ROOT_URL": f"http://{gitea.GITEA_CONTAINER}:{gitea.GITEA_INNER_PORT}/",
+        "GITEA__session__COOKIE_NAME": f"i_like_gitea_{webui_port}",
+        "GITEA__security__COOKIE_REMEMBER_NAME": f"gitea_incredible_{webui_port}",
     }
     # GitHub migration hits api.github.com (metadata) + codeload.github.com
     # (archives) besides github.com (clone), so allow the apex + its

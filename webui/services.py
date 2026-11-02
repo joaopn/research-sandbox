@@ -98,6 +98,26 @@ def self_signed_regen_reason(files_present: bool, covers_bind: bool,
         return "certificate does not cover the bind address"
     return None
 
+
+# Cookie names (B73). Browsers key cookies on the hostname alone and ignore the
+# port, so two RS webuis reached at one hostname (an outer and a nested RS, say)
+# would overwrite each other's sessions under fixed names: logging into one
+# signs the operator out of the other, and one webui's Gitea mint kills the
+# other's Gitea tab. Two webuis at one hostname differ only by the host port the
+# browser reaches each UI on (both publish it), so that port namespaces every
+# cookie name the webui mints and reads. The mint and the read use the same
+# helper and the same port, so they agree by construction.
+def broker_cookie_name(webui_port: int) -> str:
+    """The Management-session cookie's name for the webui published on
+    ``webui_port``."""
+    return f"rs_broker_{int(webui_port)}"
+
+
+def session_cookie_name(webui_port: int, project: str) -> str:
+    """The origin-gate cookie's name for ``project`` (or the shared-gitea
+    sentinel) on the webui published on ``webui_port``."""
+    return f"rs_session_{int(webui_port)}_{project}"
+
 # Each entry's `command` is what the SSH-kind service runs after auth — the
 # byobu invocation lands the user in /workspace, the supervisor's project root.
 # `default_port` is the in-container port the webui reaches via container DNS

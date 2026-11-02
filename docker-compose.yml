@@ -48,8 +48,9 @@ services:
         gw_priority: 1
     ports:
       # WEBUI_PORT is the *host* port; container always listens on 7777
-      # internally (matches EXPOSE in webui/Dockerfile). Only WEBUI_BIND
-      # crosses the boundary because the TLS cert SAN needs to cover it.
+      # internally (matches EXPOSE in webui/Dockerfile). WEBUI_BIND also
+      # crosses the boundary because the TLS cert SAN needs to cover it, and
+      # WEBUI_PORT does (environment, below) to namespace the cookie names.
       - "${WEBUI_BIND:-127.0.0.1}:${WEBUI_PORT:-7777}:7777"
       # Per-editor browser-origin range: one listener per port inside the
       # container, one isolated browser-storage origin per in-project HTTP
@@ -67,6 +68,10 @@ services:
       - "${WEBUI_BIND:-127.0.0.1}:${WEBUI_PASSTHROUGH_PORT_LO:-10200}-${WEBUI_PASSTHROUGH_PORT_HI:-10299}:${WEBUI_PASSTHROUGH_PORT_LO:-10200}-${WEBUI_PASSTHROUGH_PORT_HI:-10299}"
     environment:
       - WEBUI_BIND=${WEBUI_BIND:-127.0.0.1}
+      # Namespaces the session cookie names, so two webuis reached at one
+      # hostname keep separate logins (B73). Default lockstep with the port
+      # mapping above and webui/server.py's PUBLISHED_PORT.
+      - WEBUI_PORT=${WEBUI_PORT:-7777}
       - WEBUI_ORIGIN_PORT_LO=${WEBUI_ORIGIN_PORT_LO:-10100}
       - WEBUI_ORIGIN_PORT_HI=${WEBUI_ORIGIN_PORT_HI:-10164}
       - WEBUI_PASSTHROUGH_PORT_LO=${WEBUI_PASSTHROUGH_PORT_LO:-10200}
