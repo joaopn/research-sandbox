@@ -30,25 +30,29 @@ set -euo pipefail
 SUBNET="${RS_INNER_SUBNET:-192.168.99.0/24}"
 PROXY_IP="${RS_INNER_PROXY_IP:-192.168.99.2}"
 # Role-MCP containers (echo-mcp, wrangler, librarian, websearcher, …) live
-# in 192.168.99.4-99.11 (a /29 — eight addresses, covers the four B.0-B.3
-# role-MCPs plus a small reservation). Their containers spawn `claude -p`
-# subprocesses that talk directly to api.anthropic.com — L3 egress that
-# crosses the bridge boundary and hits FORWARD. Without an ACCEPT, the
-# spawned claude can't reach Anthropic and every send_job stalls.
+# in 192.168.99.4-99.9: the four built roles at .4-.7 plus .8-.9 reserved
+# for future roles (cli/role_mcp.py ROLE_IPS). Their containers spawn
+# `claude -p` subprocesses that talk directly to api.anthropic.com — L3
+# egress that crosses the bridge boundary and hits FORWARD. Without a
+# RETURN here, the spawned claude can't reach Anthropic and every send_job
+# stalls.
 #
 # Role-MCP↔mcp-proxy traffic stays on the rs-inner bridge (L2) and bypasses
 # FORWARD entirely, so the proxy path doesn't need a hole here.
-ROLE_MCP_RANGE="${RS_INNER_ROLE_MCP_RANGE:-192.168.99.4/29}"
+#
+# An explicit iprange, never a CIDR: a CIDR whose start is not aligned to its
+# prefix length is silently canonicalised by iptables (192.168.99.4/29 becomes
+# 192.168.99.0/29, i.e. .0-.7), which let analysis workers at .3 out and cut
+# the reserved role slots off. Workers themselves are pinned far away from
+# every range below (rs-worker's pool, 192.168.99.128-.254).
+ROLE_RANGE_LO="${RS_INNER_ROLE_MCP_RANGE_LO:-192.168.99.4}"
+ROLE_RANGE_HI="${RS_INNER_ROLE_MCP_RANGE_HI:-192.168.99.9}"
 # PI-direct boxes (rs-box-<name>, allocated by rs-sandbox at .14-.25)
 # live in 192.168.99.10-99.25 — sixteen addresses, the box allocator's
 # slots plus a reservation. They run interactive `claude` sessions inside
 # byobu, which talk directly to api.anthropic.com (L3 egress, FORWARD
 # path), so they need the same ACCEPT shape as role-MCPs.
-# Using `iprange` rather than a CIDR because .10-.25 does not align to a
-# clean prefix; iprange avoids the CIDR-canonicalization ambiguity that
-# `192.168.99.4/29` has (the comment claims .4-.11, but the canonical
-# prefix is .0-.7 — a known tracking item in BUG_BUCKET for the role-MCP
-# range, not re-introduced here).
+# An iprange for the same reason as the role range above.
 PI_RANGE_LO="${RS_INNER_PI_RANGE_LO:-192.168.99.10}"
 PI_RANGE_HI="${RS_INNER_PI_RANGE_HI:-192.168.99.25}"
 CHAIN="RS-INNER-FW"
@@ -74,10 +78,10 @@ fi
 
 sudo iptables -A "$CHAIN" -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
 sudo iptables -A "$CHAIN" -s "$PROXY_IP" -j RETURN
-sudo iptables -A "$CHAIN" -s "$ROLE_MCP_RANGE" -j RETURN
+sudo iptables -A "$CHAIN" -m iprange --src-range "$ROLE_RANGE_LO-$ROLE_RANGE_HI" -j RETURN
 sudo iptables -A "$CHAIN" -m iprange --src-range "$PI_RANGE_LO-$PI_RANGE_HI" -j RETURN
 sudo iptables -A "$CHAIN" -m limit --limit 10/min --limit-burst 5 \
     -j LOG --log-prefix "rs-inner-fw drop: " --log-level warning
 sudo iptables -A "$CHAIN" -j DROP
 
-echo "inner-firewall: applied (subnet=$SUBNET proxy_ip=$PROXY_IP role_mcp_range=$ROLE_MCP_RANGE pi_range=$PI_RANGE_LO-$PI_RANGE_HI)"
+echo "inner-firewall: applied (subnet=$SUBNET proxy_ip=$PROXY_IP role_range=$ROLE_RANGE_LO-$ROLE_RANGE_HI pi_range=$PI_RANGE_LO-$PI_RANGE_HI)"

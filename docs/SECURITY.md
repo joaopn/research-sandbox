@@ -213,10 +213,13 @@ The uplink is the interface of the project's default route. The Gitea address an
 RS-INNER-FW chain (jumped to from FORWARD for source=192.168.99.0/24):
   RETURN  RELATED,ESTABLISHED    (return traffic)
   RETURN  -s 192.168.99.2        (mcp-proxy's pinned IP — its egress to upstreams)
-  RETURN  role-MCP and box source ranges
+  RETURN  192.168.99.4-192.168.99.9    (role services)
+  RETURN  192.168.99.10-192.168.99.25   (boxes)
   LOG     (rate-limited)
   DROP
 ```
+
+Analysis workers are pinned to 192.168.99.128-192.168.99.254, outside every range the chain lets through, so a worker can never end up on an address the chain lets through. An inner network created after this change also hands any container joined without a fixed address an address from that same pool; a privileged-dind project keeps the inner network it was created with across a recreate, so there an un-pinned container can still take a low address until the project is destroyed and created again.
 
 What the chain lets through RETURNs rather than ACCEPTs, so the always-on inner guard (above) and Docker's own inter-bridge isolation still apply to it.
 

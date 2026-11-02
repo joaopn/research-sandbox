@@ -27,9 +27,11 @@ from typing import Any
 # Registry — names, images, pinned inner-bridge IPs
 # ---------------------------------------------------------------------------
 
-# Pinned IPs on rs-inner (192.168.99.0/24). See `.claude/CLAUDE.md`
-# load-bearing-IPs rule. Range .4-.9 is reserved for role-MCPs; .10-.19
-# reserved for PI role containers; .2 is mcp-proxy; .3 reserved for gitea.
+# Pinned IPs on rs-inner (192.168.99.0/24): .2 mcp-proxy, .4-.9 role-MCPs
+# (the inner firewall's role range), .10-.25 boxes (its box range; the box
+# allocator uses .14-.25), .128-.254 analysis workers (rs-worker's pool, never
+# let out). Keep inner-firewall.sh, mcp-reload.sh, rs_sandbox.BOX_IP_* and
+# rs_worker.WORKER_IP_* in step with this table.
 #
 # Order is the canonical allocation: echo-mcp is .4 (B.0 test target),
 # websearcher .5 (B.1), librarian .6 (B.2), wrangler .7 (B.3). New roles

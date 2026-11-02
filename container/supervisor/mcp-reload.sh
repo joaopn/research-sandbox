@@ -102,8 +102,15 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 # Ensure rs-inner exists so the proxy and any spawned worker share it.
+# Addresses below .128 are pinned by hand (proxy .2, role services .4-.9,
+# boxes .14-.25 — the inner firewall lets some of them out), so docker's own
+# allocation is confined to 192.168.99.128/25: a container joined without
+# --ip can never land on a let-through or pinned address. rs-worker pins
+# every worker inside that same pool (WORKER_IP_LO/HI). The gateway is named
+# because docker otherwise takes the first address of the ip-range for it.
 docker network inspect rs-inner >/dev/null 2>&1 \
-    || docker network create --subnet 192.168.99.0/24 rs-inner >/dev/null
+    || docker network create --subnet 192.168.99.0/24 --gateway 192.168.99.1 \
+        --ip-range 192.168.99.128/25 rs-inner >/dev/null
 
 # Sets `state` (a docker State.Status, or "absent") and `img` (the image id
 # the container runs) for mcp-proxy.
@@ -172,8 +179,8 @@ proxy_converge() {
             fi
             # Pin mcp-proxy to a known IP on rs-inner so the inner-firewall
             # (opt-in) can distinguish proxy-originated egress from worker
-            # egress without depending on br_netfilter. Workers spawn later and
-            # get auto-allocated IPs from .3 onward.
+            # egress without depending on br_netfilter. Workers spawn later on
+            # addresses from .128 up.
             docker run -d \
                 --name mcp-proxy \
                 --network rs-inner \

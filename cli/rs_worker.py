@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -55,6 +56,19 @@ LABEL_INTERACTIVE = "research.interactive"
 LABEL_MCPS = "research.mcps"
 
 INNER_NETWORK = "rs-inner"
+# Every worker is pinned to an address in 192.168.99.128-.254. The opt-in
+# inner firewall lets the proxy (.2), the role services (.4-.9) and the boxes
+# (.10-.25) out of rs-inner by SOURCE ADDRESS, so a worker must never sit on
+# any of those; left to docker, a worker takes the lowest free address and
+# lands right in them. Lockstep: mcp-reload.sh creates rs-inner with
+# --ip-range 192.168.99.128/25 (the same pool, for containers joined without
+# --ip), inner-firewall.sh's ranges, role_mcp.ROLE_IPS, rs_sandbox.BOX_IP_*.
+# The pool is the largest aligned block above every pinned slot (127
+# concurrent workers, far beyond what one project can run), leaving the lower
+# half of the /24 for pinned services.
+WORKER_IP_PREFIX = "192.168.99."
+WORKER_IP_LO = 128
+WORKER_IP_HI = 254  # inclusive; .255 is the broadcast address
 ALLOWLIST_PATH = Path("/workspace/.orchestrator/mcp-allow.json")
 # Sibling registry for role-MCPs (echo-mcp, wrangler, librarian, ...). Workers
 # reach role-MCPs through the same proxy URL pattern as external MCPs
@@ -220,6 +234,86 @@ def _client() -> docker.DockerClient:
 def die(msg: str, code: int = 1) -> "NoReturn":  # type: ignore[name-defined]
     print(f"rs-worker: {msg}", file=sys.stderr)
     sys.exit(code)
+
+
+class WorkerAddressPoolExhausted(Exception):
+    """Every address in the worker pool is held by a running container."""
+
+
+def _ips_in_use(cli, network: str) -> set:
+    """The IPv4 addresses held on `network`, without their prefix length.
+
+    Network inspect reports each endpoint as e.g. "192.168.99.130/24"
+    (measured, docker 29); an endpoint without an IPv4 address reports "".
+    """
+    used = set()
+    containers = cli.networks.get(network).attrs.get("Containers") or {}
+    for ep in containers.values():
+        raw = (ep or {}).get("IPv4Address") or ""
+        if not raw:
+            continue
+        try:
+            used.add(str(ipaddress.ip_interface(raw).ip))
+        except ValueError:
+            continue
+    return used
+
+
+def _is_address_conflict(err: APIError) -> bool:
+    """docker's refusal of a static address another container holds.
+
+    Measured on docker 29: the CREATE succeeds and the START fails with
+    "failed to set up container networking: Address already in use". If the
+    wording ever changes this stops matching and the spawn fails instead of
+    retrying (fail closed: no worker is started anywhere, let alone on a
+    let-through address).
+    """
+    return "address already in use" in str(err).lower()
+
+
+def _run_worker_container(cli, image: str, *, name: str, **run_kwargs):
+    """Create + start a worker container pinned to a free pool address.
+
+    Walks the pool lowest-first, skipping the addresses network inspect shows
+    as held. Another container can still take a candidate between that read
+    and the start (a concurrent spawn); docker refuses the duplicate, and the
+    container this call created is removed and the next candidate tried. Any
+    other error removes the container this call created and propagates, so
+    the caller's rollback leaves the spawn re-invokable under the same name.
+    Create + start rather than containers.run: run leaves the created
+    container behind when the start fails, which would block the retry.
+    """
+    in_use = _ips_in_use(cli, INNER_NETWORK)
+    for octet in range(WORKER_IP_LO, WORKER_IP_HI + 1):
+        ip = f"{WORKER_IP_PREFIX}{octet}"
+        if ip in in_use:
+            continue
+        container = None
+        try:
+            container = cli.containers.create(
+                image,
+                name=name,
+                detach=True,
+                network=INNER_NETWORK,
+                networking_config={
+                    INNER_NETWORK: cli.api.create_endpoint_config(ipv4_address=ip),
+                },
+                **run_kwargs,
+            )
+            container.start()
+            return container
+        except APIError as e:
+            if container is not None:
+                try:
+                    container.remove(force=True)
+                except APIError:
+                    pass
+            if _is_address_conflict(e):
+                continue
+            raise
+    raise WorkerAddressPoolExhausted(
+        f"{WORKER_IP_PREFIX}{WORKER_IP_LO}-{WORKER_IP_PREFIX}{WORKER_IP_HI}"
+    )
 
 
 def _print_json(obj) -> None:
@@ -821,16 +915,14 @@ def cmd_spawn(args: argparse.Namespace) -> None:
 
     # --- run ---
     try:
-        container = cli.containers.run(
-            image,
+        container = _run_worker_container(
+            cli, image,
             name=cname,
-            detach=True,
             mounts=mounts,
             environment=env,
             labels=labels,
-            network=INNER_NETWORK,
         )
-    except APIError as e:
+    except (APIError, WorkerAddressPoolExhausted) as e:
         # Rollback so spawn is re-invokable. Fresh: drop workdir + registry.
         # Respawn: restore prior registry (state=down). Workdir is already
         # the preserved bind-mount; don't touch it.
@@ -842,6 +934,9 @@ def cmd_spawn(args: argparse.Namespace) -> None:
                 pass
         else:
             registry_write_atomic(args.name, existing)  # type: ignore[arg-type]
+        if isinstance(e, WorkerAddressPoolExhausted):
+            die(f"worker address pool exhausted ({e} in use); "
+                "shut down a finished worker first")
         die(f"docker run failed: {e}")
 
     # Promote: a draft proposal at plan/draft/<name>.md has now been promoted
