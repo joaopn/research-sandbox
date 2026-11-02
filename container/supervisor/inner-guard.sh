@@ -32,12 +32,12 @@
 #                      the published SSH port) returns untouched.
 #   RS-INNER-GUARD-IN  jumped from INPUT: every NEW connection to the project
 #                      container itself from any interface but the uplink and
-#                      loopback is dropped. Loopback carries the inner
-#                      daemon's embedded DNS (a box's resolver forwards to the
-#                      project's 127.0.0.11), so it must return first.
+#                      loopback is dropped. Loopback is the project's own
+#                      traffic to itself (its resolver, its services), so it
+#                      returns first.
 #
 # The uplink is the interface of the default route, read at run time. The
-# four private ranges mirror router/scripts/apply-rules.sh. The proxy pin is
+# four private ranges mirror router/scripts/rules-lib.sh (PRIVATE_RANGES). The proxy pin is
 # RS_INNER_PROXY_IP (inner-firewall.sh's default); the gitea port is
 # cli/gitea.py GITEA_INNER_PORT — a lockstep literal also carried by
 # cli/rs_sandbox.py DEV_GITEA_URL, cli/rs_fetch.py, container/dev/rs-land,

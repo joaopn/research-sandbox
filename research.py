@@ -146,14 +146,13 @@ def cmd_start(args: argparse.Namespace) -> None:
         einfo = rscore.editor_pull()
         print(f"pulled code-server {einfo['code_server_version']}")
     print("starting router...")
+    # The router is always built from this tree (cached: seconds): its
+    # firewall scripts live in its image, and a start that reused an older
+    # image would hand the current resolver list to a script that ignores it
+    # and silently keep the old rules. Compose recreates the container only
+    # when the built image id differs; the re-wiring below handles that.
     compose_up = ["docker", "compose", "-f", str(SCRIPT_DIR / "docker-compose.yml"),
-                  "up", "-d"]
-    # When the user asks for a rebuild, force-rebuild the router image too —
-    # otherwise compose reuses the cached image and edits to router/scripts/
-    # or router/Dockerfile silently don't reach the running container.
-    if args.rebuild:
-        compose_up.append("--build")
-    compose_up.append("router")
+                  "up", "-d", "--build", "router"]
     run_check(compose_up)
     # Every shared container RS connects to project networks must keep its
     # default route on rs-sandbox (docker would otherwise pick the first
@@ -167,6 +166,16 @@ def cmd_start(args: argparse.Namespace) -> None:
     # every per-project network. Re-attach so subsequent `project update`
     # calls find rs-router on rs-net-<project>.
     wire_router_to_projects()
+    # Every bridge's rules re-applied with the configured resolvers (the
+    # router keeps each bridge's mode in its own records): a SANDBOX_DNS
+    # change, or an upgrade whose records predate the resolver-pinned rules,
+    # takes effect here. Running projects keep their previous resolvers until
+    # recreated, so say so when something moved.
+    changed = rscore.reapply_firewall_rules(rscore.load_config().sandbox_dns)
+    if changed:
+        print(f"re-applied the router's rules: {len(changed)} bridge(s) now allow DNS "
+              f"to {','.join(rscore.load_config().sandbox_dns)} only; a running project "
+              f"keeps the resolvers it was started with until recreated")
     # Re-attach the image registry to existing projects after a restart that
     # recreated it. LAZY: no-op until a project has stood the registry up (first
     # box delivery — sandbox-dind create or research box_add). STAGE_FEATURE_STAGING C1.
@@ -3087,7 +3096,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    load_config()
+    try:
+        load_config()
+    except rscore.ValidationError as e:
+        # A refused .env value (e.g. a SANDBOX_DNS entry that is not a public
+        # IPv4 address) is one line, before anything is touched, on every verb.
+        die(str(e))
     args = build_parser().parse_args()
     args.func(args)
 

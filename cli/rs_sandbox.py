@@ -15,7 +15,7 @@ Boxes run the clean ``rs-sandbox-box`` image (FROM rs-analysis-base — python,
 claude, byobu, git, ping; NO PI artifact-contract). They are auth-free (run
 ``claude`` + ``/login`` inside one if you want an LLM). Egress is NOT gated
 here — it is the project-wide router policy (a sandbox-dind project defaults to
-``locked``: 80/443/53 + ICMP, RFC1918 blocked — usable but contained).
+``locked``: 80/443 + DNS to the configured resolvers, no ICMP, RFC1918 blocked — usable but contained).
 
 Self-contained by necessity (only this file is baked, like rs-worker), so the
 box-pool bounds + extensions.json shape are duplicated here. Stdlib only; shells
@@ -360,7 +360,7 @@ rs-sandbox — isolated boxes for running un-vetted code
 
 Boxes are auth-free: an agent box still has NO credentials — run `claude` then
 /login inside. Outbound network is the project's router policy (sandbox projects
-default to 'locked': 80/443/53 + ping only). This Management shell has authority
+default to 'locked': 80/443 + DNS to the configured resolvers, no ping). This Management shell has authority
 over every box, so it deliberately runs no agent — never paste box artifacts into
 an LLM here.
 """

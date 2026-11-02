@@ -209,6 +209,17 @@ if [[ -f /opt/claude-templates/setup.sh ]]; then
     source /opt/claude-templates/setup.sh
 fi
 
+# --- The inner daemon's resolvers: the project's own, handed over by the host
+#     as RS_SANDBOX_DNS (comma-separated, validated public IPv4 literals). Every
+#     inner container — the default bridge included, which would otherwise fall
+#     back to Google's resolvers — then resolves through the resolvers the
+#     locked router rules admit. Rendered here, outside the mirrored cgroup
+#     block below. ---
+DNS_FLAGS=""
+for _dns in $(echo "${RS_SANDBOX_DNS:-}" | tr ',' ' '); do
+    DNS_FLAGS="$DNS_FLAGS --dns $_dns"
+done
+
 # --- Start dockerd (DIND) in the background ---
 if [[ "${DOCKER_DIND:-}" == "true" ]] && command -v dockerd >/dev/null 2>&1; then
     echo "Starting dockerd..."
@@ -226,7 +237,7 @@ if [[ "${DOCKER_DIND:-}" == "true" ]] && command -v dockerd >/dev/null 2>&1; the
     if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then
         sudo sh -c 'mkdir -p /sys/fs/cgroup/init || :; xargs -rn1 < /sys/fs/cgroup/cgroup.procs > /sys/fs/cgroup/init/cgroup.procs || :; sed -e "s/ / +/g" -e "s/^/+/" < /sys/fs/cgroup/cgroup.controllers > /sys/fs/cgroup/cgroup.subtree_control || :'
     fi
-    sudo sh -c 'dockerd > /tmp/dockerd.log 2>&1 &'
+    sudo sh -c "dockerd $DNS_FLAGS > /tmp/dockerd.log 2>&1 &"
     # Wait up to 30s for the socket.
     for _ in $(seq 1 30); do
         if docker info >/dev/null 2>&1; then

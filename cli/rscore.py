@@ -547,7 +547,8 @@ def workflow_is_sandbox_dind(manifest: dict) -> bool:
 # GitHub SSH auth for the light-path box (optional, alternative to github_pat).
 #
 # Port 443 is LOAD-BEARING, not a preference: router/scripts/apply-rules.sh
-# ACCEPTs only ICMP/80/443/53 and then DROPs under `locked` egress — the
+# ACCEPTs only 80/443 and DNS to the configured resolvers, then DROPs under
+# `locked` egress — the
 # sandbox-dind default — so a port-22 clone would hang. ssh.github.com:443 is
 # GitHub's own alternate SSH endpoint and works under BOTH egress modes, so this
 # one config is universal rather than a locked-mode workaround.
@@ -4690,16 +4691,50 @@ def run_quiet(cmd: list[str]) -> bool:
 # ---------------------------------------------------------------------------
 
 
+DEFAULT_SANDBOX_DNS = "9.9.9.9,149.112.112.112"
+# The address ranges a resolver may NOT sit in: the four private ranges every
+# project bridge drops in both egress modes (router/scripts/rules-lib.sh
+# PRIVATE_RANGES; the inner guard container/supervisor/inner-guard.sh carries
+# the same four) plus loopback. A resolver there is unreachable from every
+# project by construction, so it is refused with its reason instead of
+# failing every lookup silently. Keep the three lists in lockstep.
+PRIVATE_RESOLVER_RANGES = (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "127.0.0.0/8",
+)
+
+
+def validated_sandbox_dns(raw: str) -> list[str]:
+    """`SANDBOX_DNS` as a list of public IPv4 literals, or a ValidationError
+    naming the first offending value. Every consumer needs literals: the
+    router's per-resolver accepts (`iptables -d` would resolve a NAME at
+    insert time and remove a different address later), the project's `--dns`
+    and its inner daemon's `--dns` (both refuse anything but an IP)."""
+    servers = list(dict.fromkeys(s.strip() for s in raw.split(",") if s.strip()))
+    if not servers:
+        raise ValidationError("SANDBOX_DNS is empty: set at least one public IPv4 "
+                              "resolver (e.g. 9.9.9.9,149.112.112.112)")
+    private = [ipaddress.ip_network(r) for r in PRIVATE_RESOLVER_RANGES]
+    for s in servers:
+        try:
+            addr = ipaddress.IPv4Address(s)
+        except ValueError:
+            raise ValidationError(f"SANDBOX_DNS entry {s!r} is not an IPv4 address "
+                                  "(names and IPv6 are not accepted: the router "
+                                  "rules and the inner daemon take literals)")
+        if any(addr in n for n in private):
+            raise ValidationError(f"SANDBOX_DNS entry {s!r} is a private or loopback "
+                                  "address, which every project bridge drops; use "
+                                  "a publicly routable resolver")
+    return servers
+
+
 class Config:
     def __init__(self) -> None:
         self.projects_dir: str = (
             os.environ.get("PROJECTS_DIR") or str(SCRIPT_DIR / "container_volumes")
         )
-        self.sandbox_dns: list[str] = [
-            s.strip()
-            for s in os.environ.get("SANDBOX_DNS", "9.9.9.9,149.112.112.112").split(",")
-            if s.strip()
-        ]
+        self.sandbox_dns: list[str] = validated_sandbox_dns(
+            os.environ.get("SANDBOX_DNS", DEFAULT_SANDBOX_DNS))
         self.default_profile: str = os.environ.get("DEFAULT_PROFILE", "python")
         self.default_memory: str = os.environ.get("DEFAULT_MEMORY", "")
         # Per-role-MCP container memory cap. Blast-radius backstop: if a
@@ -5280,20 +5315,104 @@ def inject_route(container: str, router_ip: str) -> None:
     ])
 
 
-def apply_firewall_rules(network: str, mode: str) -> None:
+# The router's entrypoint writes this file after it has replayed every
+# persisted rule record (router/scripts/rules-lib.sh READY_MARKER); the host
+# waits for it before any rule call so a `research start` never interleaves
+# its re-application with the boot replay (two apply runs for one subnet
+# interleave remove-then-append). The replay is one apply per record, about
+# fifteen iptables calls each: a fleet of a few dozen projects replays in
+# seconds; a minute is generous and a stall past it is a router problem to
+# surface, not to wait on.
+ROUTER_READY_MARKER = "/run/rs-router-ready"
+ROUTER_READY_WAIT_S = 60
+# One poll per second: the replay finishes in seconds, so a finer cadence
+# buys nothing and a coarser one adds a whole poll of latency to every
+# rule call.
+ROUTER_READY_POLL_S = 1
+# Present only on a router image that writes the marker at all; an older
+# image never will, so the wait is skipped with a message instead of spent.
+ROUTER_REAPPLY_SCRIPT = "/scripts/reapply-rules.sh"
+
+
+def _wait_router_ready() -> bool:
+    """True once the router's boot replay is done (its ready marker exists).
+    False at once when the router is not running (a wait for a boot replay
+    has no meaning then; the caller's own call fails as it always did) or
+    when its image predates the marker (message: run `research start`, which
+    rebuilds it); False after a warning when the marker did not appear within
+    the bound. The caller proceeds either way."""
+    import time
+    if not container_running(ROUTER_CONTAINER):
+        return False
+    r = run(["docker", "exec", ROUTER_CONTAINER, "test", "-e", ROUTER_REAPPLY_SCRIPT],
+            capture_output=True)
+    if r.returncode == 1:
+        # `test -e` said no — or the container stopped between the two checks,
+        # which docker also reports as rc 1: only the former is an old image.
+        if container_running(ROUTER_CONTAINER):
+            print(f"warning: {ROUTER_CONTAINER} runs an image without the resolver-pinned "
+                  f"rule scripts; run `research start` to rebuild it (rules applied with "
+                  f"the old shape until then)", file=sys.stderr)
+        return False
+    if r.returncode != 0:
+        # the exec itself failed (a daemon or runtime error): no wait, no verdict
+        return False
+    deadline = time.time() + ROUTER_READY_WAIT_S
+    while True:
+        r = run(["docker", "exec", ROUTER_CONTAINER, "test", "-f", ROUTER_READY_MARKER],
+                capture_output=True)
+        if r.returncode == 0:
+            return True
+        if time.time() >= deadline:
+            print(f"warning: {ROUTER_CONTAINER} did not report its rule replay done "
+                  f"within {ROUTER_READY_WAIT_S}s; applying rules anyway", file=sys.stderr)
+            return False
+        time.sleep(ROUTER_READY_POLL_S)
+
+
+def apply_firewall_rules(network: str, mode: str, resolvers: "list[str] | None" = None) -> None:
+    """Apply a bridge's egress rules on the router. `resolvers` defaults to the
+    configured `SANDBOX_DNS` — resolved here, inside, so the two callers (and
+    their archived pins) stay two-positional."""
+    if resolvers is None:
+        resolvers = load_config().sandbox_dns
     subnet = get_network_subnet(network)
+    _wait_router_ready()
     run_check([
         "docker", "exec", ROUTER_CONTAINER,
-        "/scripts/apply-rules.sh", subnet, mode,
+        "/scripts/apply-rules.sh", subnet, mode, ",".join(resolvers),
     ])
 
 
 def remove_firewall_rules(network: str) -> None:
+    """Remove a bridge's rules. The configured resolvers ride along so a subnet
+    whose record on the router was lost still ends with no rule (the script
+    deletes the record's resolvers and the passed ones)."""
     if not network_exists(network):
         return
     subnet = get_network_subnet(network)
-    run(["docker", "exec", ROUTER_CONTAINER, "/scripts/remove-rules.sh", subnet],
+    _wait_router_ready()
+    run(["docker", "exec", ROUTER_CONTAINER, "/scripts/remove-rules.sh", subnet,
+         ",".join(load_config().sandbox_dns)],
         capture_output=True)
+
+
+def reapply_firewall_rules(resolvers: "list[str]") -> list[str]:
+    """Re-apply every recorded bridge's rules on the router with `resolvers`
+    (`research start`, after the router is up). Returns the `changed …` lines
+    the router printed — one per locked bridge whose applied resolver list
+    differed — so the caller can say how many bridges moved. A failure warns:
+    the records on the router still describe what IS applied."""
+    _wait_router_ready()
+    r = run(["docker", "exec", ROUTER_CONTAINER, "/scripts/reapply-rules.sh",
+             ",".join(resolvers)], capture_output=True)
+    if r.returncode != 0:
+        print(f"warning: re-applying the router's rules failed: "
+              f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
+    elif r.stderr and r.stderr.strip():
+        # the router's own per-record warnings (a legacy record, a failed apply)
+        print(r.stderr.strip(), file=sys.stderr)
+    return [ln for ln in (r.stdout or "").splitlines() if ln.startswith("changed ")]
 
 
 def ensure_project_network(project: str, mode: str) -> tuple[str, str]:
@@ -5434,6 +5553,13 @@ def build_supervisor_docker_args(
     args += _agent_env_args(agents, "/home/research")
     for s in dns_servers:
         args += ["--dns", s]
+    # The same resolvers for the project's INNER docker daemon (both dind
+    # entrypoints start `dockerd --dns <each>` from this): every inner
+    # container — default bridge included — then resolves through the
+    # configured resolvers, which are the only ones the locked router rules
+    # admit. Unused by the `docker` substrate (no inner daemon).
+    if dns_servers:
+        args += ["-e", f"RS_SANDBOX_DNS={','.join(dns_servers)}"]
 
     if dind_mode == "sysbox":
         args += ["--runtime=sysbox-runc", "--pids-limit=4096"]
@@ -16227,8 +16353,13 @@ def review_pr(req: "ReviewRequest", progress=None) -> dict:  # type: ignore[name
         # child's stopped container otherwise lingers visibly until this or
         # the lane sweep removes it (accepted).
         run(["docker", "rm", "-f", name], capture_output=True)
+        # The reviewer resolves through the configured resolvers like every
+        # project container: without `--dns`, its embedded resolver forwards to
+        # the operator host's resolvers, which the locked rules on rs-reviewer
+        # drop (DNS is open to the configured resolvers only).
+        dns_args = [a for s in load_config().sandbox_dns for a in ("--dns", s)]
         run_check(["docker", "run", "-d", "--name", name,
-                   "--network", REVIEWER_NETWORK,
+                   "--network", REVIEWER_NETWORK, *dns_args,
                    "-v", f"{tmp}:/review",
                    "-v", f"{agent_dist_path(DEFAULT_AGENT)}:/opt/agent-dist/claude:ro",
                    MINIMAL_BASE_IMAGE, "sh", "-lc",

@@ -22,7 +22,7 @@ you want to spin *several* isolated boxes yourself.
 ## How it works
 
 `create --workflow sandbox` launches one runc container with its default route
-injected through `rs-router`, defaulting to **locked** egress (80/443/53 + ICMP,
+injected through `rs-router`, defaulting to **locked** egress (80/443, DNS to the configured resolvers only, no ICMP,
 RFC1918 blocked) — enough for pip/apt/an LLM API, but not arbitrary ports or the
 host LAN. There is no inner Docker daemon and no agent baked in. Add the editor
 with `--enable code-server`; add an agent's CLI with `--agent <name>` (deployed

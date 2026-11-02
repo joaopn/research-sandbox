@@ -61,7 +61,7 @@ Worth being explicit:
 - **The key and the git identity transit host disk during a container swap.** A sysbox `project start` and a docker-box editor toggle both destroy the container, so `~/.ssh/` and `~/.gitconfig` are moved into the project workspace (`.ssh-stash`, `.gitconfig-stash`) and moved back at next boot — the same mechanism the Claude credentials already use. The window is the swap itself, not the project's running lifetime. `~/.git-credentials` is deliberately *not* carried, so a dev supervisor's gitea token is never parked on host disk.
 - **External-MCP tokens you put in the registry are visible to the supervisor.** `${VAR}` interpolation resolves on registry load; the resolved value is in the supervisor's view. Treat any token in `~/.research-sandbox/mcp-registry.json` as exposed at the supervisor's trust level.
 - **The host port your `external` MCP listens on must be chosen carefully.** rs-router rules are dest-IP-and-port-keyed. If another service runs on the same port the registry pointed at, the project would reach it. Admin discipline, not code-enforced.
-- **Workers' direct internet egress is allowed by default.** `--egress open` lets workers reach anywhere except RFC1918. If you want strict "MCP-mediated only" egress, use `--egress locked` (HTTP/HTTPS/DNS/ICMP) and/or `--inner-firewall`. Even then, "locked" allows arbitrary HTTPS endpoints — true offline-only would be a separate egress mode.
+- **Workers' direct internet egress is allowed by default.** `--egress open` lets workers reach anywhere except RFC1918. If you want strict "MCP-mediated only" egress, use `--egress locked` (HTTP/HTTPS, and DNS to the configured resolvers only) and/or `--inner-firewall`. Even then, "locked" allows arbitrary HTTPS endpoints — true offline-only would be a separate egress mode.
 
 ## ◾ Isolation layers
 
@@ -84,7 +84,7 @@ Each project sits inside multiple boundaries that must all be crossed for a work
 - iptables FORWARD rules keyed on the project subnet:
   - Default: drop RFC1918 destinations (host's LAN, other docker bridges).
   - `--egress open`: allow everything else.
-  - `--egress locked`: allow only TCP/80, TCP/443, UDP/53, ICMP.
+  - `--egress locked`: allow only TCP/80, TCP/443, and UDP/TCP 53 to the resolvers configured in `SANDBOX_DNS`; no ICMP (errors still arrive as related traffic; echo does not).
   - Per-MCP allow rules added by `project mcp-allow`: ACCEPT specifically for `(project_subnet, mcp_ip, mcp_port)`.
 - Rules are persisted under `/etc/sandbox/rules/` in the router so they survive a router restart.
 
@@ -168,7 +168,7 @@ Set per-project at `project create`:
 | Mode | What's allowed |
 |---|---|
 | `open` (default) | All TCP/UDP/ICMP outbound except RFC1918 destinations |
-| `locked` | TCP/80, TCP/443, UDP/53, ICMP only |
+| `locked` | TCP/80, TCP/443, and UDP/TCP 53 to the configured resolvers (`SANDBOX_DNS`) only; no ICMP |
 
 Plus per-MCP ACCEPT rules added by `project mcp-allow`, which take precedence over the egress policy for the specific destination IP+port.
 
@@ -189,7 +189,7 @@ RS-INNER-GUARD (jumped to from DOCKER-USER, i.e. FORWARD):
   DROP    -d 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16
 
 RS-INNER-GUARD-IN (jumped to from INPUT):
-  RETURN  -i lo                       (the inner daemon's embedded DNS forwards to the project's own resolver here)
+  RETURN  -i lo                       (the project's own loopback traffic)
   RETURN  -i <uplink>
   RETURN  RELATED,ESTABLISHED
   DROP

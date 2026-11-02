@@ -42,7 +42,7 @@ GENERIC_REGISTRY_IMAGES: dict[str, tuple[str, str]] = {
 # no new firewall rule — the whole .10-.25 PI range is already ACCEPTed by
 # inner-firewall.sh. Egress is NOT gated per box; it is controlled project-wide
 # at the router (a sandbox-dind project defaults to `--egress locked` →
-# 80/443/53/ICMP only, RFC1918 blocked — usable for an LLM / pip while contained).
+# 80/443 + DNS to the configured resolvers only, no ICMP, RFC1918 blocked — usable for an LLM / pip while contained).
 #
 # kind value for boxes (owned by the in-supervisor rs-sandbox CLI). The host
 # references this in the _recreate_supervisor restart loop to delegate restarts

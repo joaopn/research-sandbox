@@ -118,7 +118,7 @@ python research.py project create pipeline --workflow social-data-pipeline
 python research.py workflow list                 # the full catalog
 ```
 
-The sandbox flavors default to **`--egress locked`** (80/443/DNS/ICMP only, RFC1918 blocked) — containment first. `research` defaults to open egress (it needs pip/apt). Override either with `--egress`.
+The sandbox flavors default to **`--egress locked`** (80/443 and DNS to the configured resolvers only, no ICMP, RFC1918 blocked) — containment first. `research` defaults to open egress (it needs pip/apt). Override either with `--egress`.
 
 ## ◾ Prerequisites
 
@@ -235,7 +235,7 @@ The **container is the security boundary**; agents run under `bypassPermissions`
 - **DIND isolation.** DIND supervisors run under **sysbox-runc** (user-namespace isolation, no `--privileged`); their inner Docker daemon runs workers as ordinary containers. The bare `sandbox` workflow is a single runc container.
 - **Inner-bridge guard (always on).** A box, worker or role service cannot open a connection to its own project container, to the host at the project bridge, to the registry or to another box's published port; it keeps the internet, Gitea's HTTP port and the MCP proxy's registered upstreams. Applied inside every dind project at boot; see `docs/SECURITY.md#-inner-bridge-guard-always-on`.
 - **Host hardening (operator-applied).** RS installs nothing on the host. Two paths only the host can close — a project's root routing around `rs-router`, and a project reaching the host's own services — are closed by two generic firewall rules the operator installs once; every bridge RS creates for a project or the reviewer carries an `rsn` interface prefix for exactly that. The rules, their order and the sshd bind are in [docs/SECURITY.md](docs/SECURITY.md#-host-hardening-operator-applied).
-- **Per-project network + egress filter.** Each project gets its own bridge, route-injected through `rs-router`, whose iptables FORWARD rules key on the project subnet. **Open** mode allows outbound except RFC1918; **locked** mode allows only 80/443/DNS/ICMP. RFC1918 is dropped unconditionally. Sandbox flavors default to locked.
+- **Per-project network + egress filter.** Each project gets its own bridge, route-injected through `rs-router`, whose iptables FORWARD rules key on the project subnet. **Open** mode allows outbound except RFC1918; **locked** mode allows only 80/443 and DNS to the resolvers configured in `SANDBOX_DNS` (no ICMP). RFC1918 is dropped unconditionally. Sandbox flavors default to locked.
 - **MCP gating.** Workers reach MCPs only through the per-project **mcp-proxy**, and only those in the project's allowlist. An optional **inner-bridge firewall** (`--inner-firewall`) further confines worker→proxy traffic.
 - **Broker = the host-root boundary.** The opt-in broker is the *only* component with docker access. It serves a **closed verb vocabulary** over a 0600 unix socket (length-prefixed JSON, `SO_PEERCRED` same-uid check — no network listener). Every verb dispatches to a fixed lifecycle function over a validated request; **no docker passthrough**. Reads (`list`/`status`) are open at the socket; every write verb is **token-gated** (deny-by-default), `destroy` and box-remove additionally require **step-up re-auth**. Rich-input verbs forward only an explicit **field allow-list** — a relayed request can never reach a host path, a bind-mount source, or a host port. The network-facing webui holds no docker socket and relays everything through the broker behind its session.
 

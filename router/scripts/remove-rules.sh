@@ -1,30 +1,26 @@
 #!/bin/sh
-# remove-rules.sh <subnet>
-# Removes all FORWARD rules matching a source subnet.
+# remove-rules.sh <subnet> [resolvers]
+# Removes every FORWARD rule this router ever emitted for a source subnet — the
+# legacy shapes, and the per-resolver DNS accepts for the resolvers named in the
+# subnet's record (what was applied) plus the ones passed (the host's current
+# configuration, so a subnet whose record was lost still ends rule-less) — then
+# removes the record. Per-MCP allows live in their own records and are left.
 set -e
 
 SUBNET="$1"
+RESOLVERS="${2:-}"
 
 if [ -z "$SUBNET" ]; then
-    echo "Usage: remove-rules.sh <subnet>" >&2
+    echo "Usage: remove-rules.sh <subnet> [resolvers]" >&2
     exit 1
 fi
 
-# Remove all FORWARD rules matching this source subnet
-while iptables -D FORWARD -s "$SUBNET" -d 10.0.0.0/8 -j DROP 2>/dev/null; do :; done
-while iptables -D FORWARD -s "$SUBNET" -d 172.16.0.0/12 -j DROP 2>/dev/null; do :; done
-while iptables -D FORWARD -s "$SUBNET" -d 192.168.0.0/16 -j DROP 2>/dev/null; do :; done
-while iptables -D FORWARD -s "$SUBNET" -d 169.254.0.0/16 -j DROP 2>/dev/null; do :; done
-while iptables -D FORWARD -s "$SUBNET" -p icmp -j ACCEPT 2>/dev/null; do :; done
-while iptables -D FORWARD -s "$SUBNET" -p tcp --dport 80 -j ACCEPT 2>/dev/null; do :; done
-while iptables -D FORWARD -s "$SUBNET" -p tcp --dport 443 -j ACCEPT 2>/dev/null; do :; done
-while iptables -D FORWARD -s "$SUBNET" -p udp --dport 53 -j ACCEPT 2>/dev/null; do :; done
-while iptables -D FORWARD -s "$SUBNET" -p tcp --dport 53 -j ACCEPT 2>/dev/null; do :; done
-while iptables -D FORWARD -s "$SUBNET" -j DROP 2>/dev/null; do :; done
-while iptables -D FORWARD -s "$SUBNET" -j ACCEPT 2>/dev/null; do :; done
+. /scripts/rules-lib.sh
 
-# Remove persisted config
-RULEFILE="/etc/sandbox/rules/$(echo "$SUBNET" | tr '/' '_')"
-rm -f "$RULEFILE"
+delete_subnet_rules "$SUBNET" "$RESOLVERS"
+
+# Remove the record last: a kill before this line leaves a record that still
+# names the (now deleted) set, which the next apply or reapply simply redoes.
+rm -f "$(rulefile_for "$SUBNET")"
 
 echo "Removed rules for $SUBNET"
