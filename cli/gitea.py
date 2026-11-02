@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import datetime
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -970,6 +971,14 @@ class GiteaClient:
             raise GiteaError(f"gitea {method} {path} unreachable: {e.reason}") from None
         except OSError as e:                    # timeout surfaces here
             raise GiteaError(f"gitea {method} {path} failed: {e}") from None
+        except http.client.HTTPException as e:
+            # A torn body (IncompleteRead) or a malformed status line
+            # (BadStatusLine): urllib wraps neither. AFTER OSError so
+            # RemoteDisconnected (both) keeps its message. Type name only: the
+            # str() of BadStatusLine is the peer's raw status line. No status:
+            # a torn 200 is not a definitive answer.
+            raise GiteaError(
+                f"gitea {method} {path} failed: {type(e).__name__}") from None
         if status not in ok:
             raise GiteaError(f"gitea {method} {path} -> HTTP {status}",
                              status=status)
@@ -977,7 +986,7 @@ class GiteaClient:
             return None
         try:
             return json.loads(raw)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):  # non-UTF-8 body
             return None
 
     def repo_exists(self, owner: str, repo: str) -> bool:
@@ -1259,6 +1268,9 @@ class GiteaClient:
             raise GiteaError(f"gitea GET {path} unreachable: {e.reason}") from None
         except OSError as e:
             raise GiteaError(f"gitea GET {path} failed: {e}") from None
+        except http.client.HTTPException as e:   # torn chunked body / bad status line
+            raise GiteaError(
+                f"gitea GET {path} failed: {type(e).__name__}") from None
         if len(raw) > max_bytes:
             raise GiteaError(
                 f"gitea GET {path} -> diff exceeds the review cap "
@@ -1298,6 +1310,9 @@ class GiteaClient:
             raise GiteaError(f"gitea GET {path} unreachable: {e.reason}") from None
         except OSError as e:
             raise GiteaError(f"gitea GET {path} failed: {e}") from None
+        except http.client.HTTPException as e:   # torn chunked body / bad status line
+            raise GiteaError(
+                f"gitea GET {path} failed: {type(e).__name__}") from None
         if len(raw) > max_bytes:
             raise GiteaError(
                 f"gitea GET {path} -> diff exceeds the review cap "
