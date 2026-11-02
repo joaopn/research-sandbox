@@ -245,7 +245,8 @@ skip that notice there.
 3. If the work taught something a later session needs — an invariant the code depends on, a
    trap, a reusable pattern — add it to that area's rule file (a lesson about how to work
    goes in `/workspace/.claude/CLAUDE.md`). Most landings teach nothing worth a line.
-4. Close the mirrored issues naming the PR, and re-sync any whose file changed.
+4. Close the mirrored issues naming the PR — `rs-board done <issue> --pr <N>`, which also
+   removes each card — and re-sync any whose file changed.
 
 ## Verification
 
@@ -328,6 +329,49 @@ naming the PR when the work lands. Never keep only one of the two.
 a line break, so a paragraph wrapped at 80 columns is shredded on the board. One paragraph is
 one line; separate paragraphs with a blank line (lists, tables and fenced code keep their own
 lines).
+
+## The area boards
+
+The maintainer stacks the repository's open issues on Gitea project boards: one board per
+`area:*` label, titled by the bare area (`webui`, `dev-lane`, …); a repository with no area
+label yet has one board titled after the repository. Every board has five columns, Inbox the
+default:
+
+| Column | Meaning |
+|---|---|
+| **Now** | an agent is on it, or its PR is open and waits for review |
+| **Next** | the maintainer's stack, top first |
+| **Decide** | a blocking question waits for the maintainer |
+| **Inbox** | filed, not placed yet |
+| **Backlog** | the maintainer's parking lot |
+
+Every open issue is a card on its area board; closing an issue removes its card; pull
+requests are never cards (a card shows the PR that references its issue). The card's text is
+the issue title, its tags are the other labels. Never drive the boards by hand: every move
+goes through `rs-board`, on PATH in every dev container (`rs-board --dry-run <verb>` prints
+the writes and makes none).
+
+- **Session start: `rs-board reconcile`.** It creates a missing board or label, adds a card for
+  every open issue without one, removes the cards of closed issues, re-homes a card whose area
+  changed, moves a card carrying `decision:blocking` or `decision:open` from Inbox to Decide,
+  and drops either label from a card the maintainer dragged out of Decide (the column wins
+  over the label). It never touches Now, Next or Backlog otherwise. Read its `report:` lines.
+- **"Work on the next issue" = `rs-board next [--area X]`:** a card the maintainer dragged
+  into Now first, then the top of Next in the maintainer's order (`priority:high` first across
+  boards; a Next card still carrying `decision:blocking` is skipped and named); when several
+  boards tie it lists them and you ask which. Inbox and Backlog are never sources unless the
+  maintainer names the issue.
+- **Start = `rs-board start N --branch agent/<name>`** (card to Now, the branch commented on
+  the issue; refuses a card another branch is on). **Ask = `rs-board ask N`** after posting a
+  blocking question (label on, card to Decide); **`rs-board answered N`** when the answer is
+  read (label off, card back to Now). **Stop early = `rs-board stop N --reason …`** (card to
+  the bottom of Next). **Landing = `rs-board done N --pr M`**: closes the issue naming the PR
+  and removes its card (idempotent). Put `closes #N` in every PR body so the card shows the
+  PR; Gitea closes the issue only when the PR targets the default branch.
+- **Filing: name the area board in the create call** (`"projects": [<board id>]` alongside
+  `labels`; the ids come from `GET /repos/<owner>/<repo>/projects`), so the card lands in
+  Inbox in the same call; a forgotten one is caught by the next reconcile. Keep titles short:
+  the card is the title.
 
 ## Your shell has no terminal
 

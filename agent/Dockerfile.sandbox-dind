@@ -43,8 +43,12 @@ COPY container/dev/rs-wt /usr/local/bin/rs-wt
 # delete) rides the same bake; like rs-repo-watch it exits with a remedy when
 # no dev wiring is staged, so it is inert on a non-dev project.
 COPY container/dev/rs-land /usr/local/bin/rs-land
+# rs-board (the per-area kanban boards on the shared Gitea: reconcile / next /
+# start / ask / answered / stop / done) rides the same bake; it refuses with a
+# remedy on a Gitea without the board API or on a non-dev project.
+COPY container/dev/rs-board /usr/local/bin/rs-board
 RUN chmod +x /opt/dev/repo-watch.sh /usr/local/bin/rs-repo-watch \
-    /usr/local/bin/rs-wt /usr/local/bin/rs-land
+    /usr/local/bin/rs-wt /usr/local/bin/rs-land /usr/local/bin/rs-board
 
 COPY agent/entrypoint.sandbox-dind.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

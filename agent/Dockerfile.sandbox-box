@@ -31,16 +31,17 @@ COPY agent/entrypoint.sandbox-box.sh /entrypoint.sh
 COPY agent/box-render-mcp.py /usr/local/lib/rs-box/box-render-mcp.py
 RUN chmod +x /entrypoint.sh
 
-# Dev-lane tooling (STAGE_DEV_GITEA): the repo-watch loop + its prompt + the
-# manual post-auth launcher — ALL under /opt/dev, deliberately OFF PATH
-# (command-relevance): only a dev-preset box gets the launcher symlinked to
-# /usr/local/bin (rs-sandbox's _install_repo_watch, at the box's docker run);
-# on other boxes the files are inert and invisible to tab-completion.
+# Dev-lane tooling: the repo-watch loop + its prompt + the launchers
+# (rs-repo-watch, rs-wt, rs-land, rs-board) — ALL under /opt/dev, deliberately
+# OFF PATH (command-relevance): only a dev-preset box gets the launchers
+# symlinked to /usr/local/bin (rs-sandbox's _install_repo_watch, at the box's
+# docker run); on other boxes the files are inert and invisible to
+# tab-completion.
 COPY container/dev/repo-watch.sh container/dev/repo-watch-prompt.md \
      container/dev/rs-repo-watch container/dev/rs-wt container/dev/rs-land \
-     /opt/dev/
+     container/dev/rs-board /opt/dev/
 RUN chmod +x /opt/dev/repo-watch.sh /opt/dev/rs-repo-watch /opt/dev/rs-wt \
-    /opt/dev/rs-land
+    /opt/dev/rs-land /opt/dev/rs-board
 
 # F3 loopback forwarder (STAGE loopback-bridge): republishes a 127.0.0.1-bound
 # in-box service onto the box's bridge IP so the -p <pub_super>:<app_port> publish

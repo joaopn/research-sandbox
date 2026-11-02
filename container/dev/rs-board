@@ -1,0 +1,697 @@
+#!/opt/conda/bin/python
+"""rs-board — drive the repository's area boards on the shared Gitea.
+
+One Gitea project board per `area:*` label, titled by the bare area name
+(a repository with no area label yet keeps ONE board titled after the
+repository); five columns Now / Next / Decide / Inbox / Backlog, Inbox the
+default; every open issue of the area is a card on its board; closing an
+issue removes its card; pull requests are never cards.
+
+Verbs (each honours --dry-run, which prints the planned writes and makes none):
+  next [--area A]       what to work on: maintainer-dragged Now cards first,
+                        then the top of Next (priority:high first across boards)
+  start N --branch B    move #N to Now and comment the branch
+  ask N                 add decision:blocking, move #N to Decide
+  answered N            drop decision:blocking, move #N back to Now
+  stop N                move #N back to Next (bottom), comment
+  done N [--pr M]       close #N naming the PR, remove its card (idempotent)
+  place N --column C    put #N in column C on the maintainer's say-so (lands
+                        at the bottom of C)
+  reconcile             create missing boards, columns and the labels this
+                        tool reads; add, remove, re-home cards; a decision
+                        label in Inbox -> Decide, dropped elsewhere; report
+                        what a script must not decide
+
+Wiring resolution (mirrors rs-land):
+  - dev BOX: GITEA_URL/GITEA_TOKEN/GITEA_USER/REPO_NAME arrive as container
+    env — used as-is (the API base is <GITEA_URL>/api/v1).
+  - dev PROJECT (supervisor): the agent_user-bearing row of the host-staged
+    /workspace/.orchestrator/dev-gitea.json + its token file under
+    ~/.dev-tokens/. The repository owner is the agent's own user, never the
+    row's active-fork `user` (which may be a box's).
+
+Pure API by design: no git subprocess anywhere. The token travels ONLY as
+the Authorization header — never argv, never inside a URL, never in output.
+
+Standalone by design: image-baked into both dev surfaces (sandbox-dind
+/usr/local/bin; box /opt/dev + the dev-box symlink), so it cannot import
+cli/ modules — the constants below carry their locksteps.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+# MIRROR-PAIR LOCKSTEP (five-way): the shared-Gitea base URL every dev
+# surface talks to. cli/gitea.py GITEA_CONTAINER + GITEA_INNER_PORT,
+# cli/rs_sandbox.py DEV_GITEA_URL, rs-wt's GITEA_ORIGIN_PREFIX and rs-land's
+# DEV_GITEA_URL — this file is image-baked standalone and cannot import any
+# of them. Pinned by the unit test.
+DEV_GITEA_URL = "http://rs-gitea:3000"
+
+# Quick-call bound, mirroring cli/gitea.py API_TIMEOUT_S (the dev lane's
+# established bound for metadata calls against the always-local gitea; rs-land
+# carries the same). Bounded at all so a wedged gitea cannot hang a session.
+API_TIMEOUT_S = 15
+
+# Gitea's project-board REST API (repository projects, columns, cards) shipped
+# in v28.0.0; v1.27.x is the last release without it (release list, measured
+# 2026-11-02). A lower major has nothing this tool can drive.
+BOARDS_MIN_MAJOR = 28
+
+COLUMNS = ["Now", "Next", "Decide", "Inbox", "Backlog"]
+DEFAULT_COLUMN = "Inbox"
+AREA_PREFIX = "area:"
+BLOCKING = "decision:blocking"
+OPEN = "decision:open"  # a question posted, work proceeding under the recommendation
+DECIDE_LABELS = (BLOCKING, OPEN)  # either one parks an Inbox card in Decide
+PRIORITY = "priority:high"
+# The labels this tool reads, created by `reconcile` when a repository lacks
+# them. Colours copied from the research-sandbox dev repository, where the
+# boards were dogfooded, so every dev repository's tags look alike.
+LABEL_COLOURS = {
+    BLOCKING: ("e11d21", "a maintainer ruling is required before any work can start; the question block is on the issue"),
+    OPEN: ("f9a825", "a choice the maintainer owns is recorded on the issue; work proceeds under the posted recommendation"),
+    PRIORITY: ("b60205", "maintainer-flagged: schedule ahead of other open work"),
+}
+WORKING_PREFIX = "Working on it: branch "
+STOPPED_PREFIX = "Stopped without finishing: "
+LANDED_PREFIX = "Landed in PR #"
+CLOSED_PREFIX = "Closed without a PR."
+PAGE = 50  # Gitea's page size for issues, columns and column issues
+# A placeholder id a dry run hands out for a board, column or label it would
+# create; every reader of an id guards on it, so a dry run never sends one.
+NEW = "<new "
+
+# Refusal messages quote gitea's own error detail — bounded so a pathological
+# body cannot flood the terminal (rs-land's bound).
+_DETAIL_MAX_CHARS = 300
+
+
+class ApiError(RuntimeError):
+    """An answered HTTP error (status set) or an unreachable gitea (status
+    None). The two are distinct by construction: an unverifiable state must
+    never read as a 404."""
+
+    def __init__(self, msg, status=None):
+        super().__init__(msg)
+        self.status = status
+
+
+# ---------------------------------------------------------------- wiring
+def resolve_wiring():
+    """Box env first, else the supervisor's staged wiring (the rs-land
+    resolution, mirrored). Returns (api base, token, owner, repo, agent user)."""
+    token = os.environ.get("GITEA_TOKEN") or ""
+    if token:
+        url = os.environ.get("GITEA_URL") or ""
+        user = os.environ.get("GITEA_USER") or ""
+        repo = os.environ.get("REPO_NAME") or ""
+        if not (url and user and repo):
+            raise RuntimeError("GITEA_URL/GITEA_USER/REPO_NAME must be set alongside GITEA_TOKEN")
+        return url.rstrip("/") + "/api/v1", token, user, repo, user
+    dev_json = (Path(os.environ.get("RS_WORKSPACE") or "/workspace")
+                / ".orchestrator" / "dev-gitea.json")
+    if not dev_json.is_file():
+        raise RuntimeError(f"no dev wiring ({dev_json} missing); run "
+                           f"'research dev attach <project> --repo <repo>' first")
+    try:
+        data = json.loads(dev_json.read_text())
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"cannot read dev wiring: {e}")
+    rows = [r for r in (data.get("repos") or [])
+            if isinstance(r, dict) and r.get("repo") and r.get("agent_user")]
+    if not rows:
+        raise RuntimeError("this project's own agent works no repo (box-only wiring?); "
+                           "run 'research dev attach' first")
+    row = rows[0]
+    token_base = row.get("token_file") or row["agent_user"] + ".token"
+    token_file = Path.home() / ".dev-tokens" / token_base
+    try:
+        token = token_file.read_text().strip()
+    except OSError:
+        token = ""
+    if not token:
+        raise RuntimeError(f"token missing at {token_file}; re-run 'research dev attach' "
+                           f"(it re-stages the token)")
+    return DEV_GITEA_URL + "/api/v1", token, row["agent_user"], row["repo"], row["agent_user"]
+
+
+# ---------------------------------------------------------------- transport
+class Gitea:
+    """The thin HTTP layer; the unit test substitutes a fake with the same
+    four methods (get, post, patch, delete) and the same `repo` prefix."""
+
+    def __init__(self, base, token, owner, repo):
+        self.base = base.rstrip("/")
+        self.token = token
+        self.repo = f"/repos/{owner}/{repo}"
+        self.repo_name = repo
+
+    def _call(self, method, path, body=None, params=None):
+        url = self.base + path
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Authorization", "token " + self.token)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=API_TIMEOUT_S) as r:
+                raw = r.read()
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:_DETAIL_MAX_CHARS]
+            raise ApiError(f"{method} {path} -> HTTP {e.code}: {detail}", status=e.code) from None
+        except (urllib.error.URLError, OSError) as e:
+            raise ApiError(f"{method} {path}: Gitea unreachable ({getattr(e, 'reason', e)})") from None
+        if not raw.strip():
+            return None
+        try:
+            return json.loads(raw)
+        except ValueError:
+            raise ApiError(f"{method} {path}: unparseable reply ({raw[:_DETAIL_MAX_CHARS]!r})") from None
+
+    def get(self, path, params=None):
+        return self._call("GET", path, params=params)
+
+    def post(self, path, body=None):
+        return self._call("POST", path, body=body)
+
+    def patch(self, path, body=None):
+        return self._call("PATCH", path, body=body)
+
+    def delete(self, path):
+        return self._call("DELETE", path)
+
+
+def paged(get, path, params=None):
+    """Every Gitea listing used here is paged at PAGE; the last page is an
+    empty list; a short page is also the last. PAGE is stock Gitea's
+    MAX_RESPONSE_ITEMS (the shared Gitea is RS-provisioned with the default);
+    an operator cap below it would truncate listings silently."""
+    out, page = [], 1
+    while True:
+        chunk = get(path, dict(params or {}, limit=PAGE, page=page))
+        if not chunk:
+            return out
+        out.extend(chunk)
+        if len(chunk) < PAGE:
+            return out
+        page += 1
+
+
+def check_version(g):
+    """Fail closed: only a readable version at or above the board API's first
+    major lets a verb run. The endpoint refuses anonymous reads on the shared
+    Gitea, so this is also the first authenticated call."""
+    try:
+        v = g.get("/version")
+    except ApiError as e:
+        raise RuntimeError(f"could not read the Gitea version ({e}); refusing to guess whether it has project boards")
+    text = str((v or {}).get("version") or "")
+    m = re.match(r"\s*v?(\d+)", text)
+    if not m:
+        raise RuntimeError(f"could not parse the Gitea version {text!r}; refusing to guess whether it has project boards")
+    if int(m.group(1)) < BOARDS_MIN_MAJOR:
+        raise RuntimeError(f"the shared Gitea is {text}; project boards need Gitea {BOARDS_MIN_MAJOR}.x or newer — "
+                           f"upgrade it from Management → Infrastructure → Upgrade (or `research dev gitea-upgrade` on the host)")
+    return text
+
+
+def is_new(x):
+    return str(x).startswith(NEW)
+
+
+# ---------------------------------------------------------------- the model
+class Board:
+    """Everything the verbs need, read once per invocation: the labels, every
+    board of the repository with its columns and cards, the open issues.
+    Writes go through `plan`, which prints under --dry-run."""
+
+    def __init__(self, g, agent_user, dry_run=False, out=print):
+        self.g, self.agent_user, self.dry_run, self.out = g, agent_user, dry_run, out
+        self.planned = []
+        self.labels = {l["name"]: l["id"] for l in self._repo_read(g.repo + "/labels")}
+        self.areas = sorted(n[len(AREA_PREFIX):] for n in self.labels if n.startswith(AREA_PREFIX))
+        # No area label yet: one board titled after the repository holds every issue.
+        self.pseudo = None if self.areas else g.repo_name
+        if self.pseudo:
+            self.areas = [self.pseudo]
+        self.boards = {}      # title -> project dict (with "columns": {title: column dict}); every board, not only areas
+        self.dup_boards = {}  # title -> count when > 1
+        self.cards = {}       # issue id -> (board title, column title): the one card the tool keeps
+        self.strays = []      # (issue, board title, column title): further cards of an issue, removed by reconcile
+        self.open = self._repo_read(g.repo + "/issues", {"state": "open", "type": "issues"})
+        self.by_number = {i["number"]: i for i in self.open}
+        self.by_id = {i["id"]: i for i in self.open}
+        self._load_boards()
+
+    # ---- reads
+    def _repo_read(self, path, params=None):
+        """A paged listing under the repository; a 404 here is a repository
+        this token cannot see, or (issues only) a unit that is off. Measured
+        on 28.2.0: the projects API answers even with the repository's
+        projects unit switched off, so for boards a 404 is always the wiring."""
+        try:
+            return paged(self.g.get, path, params)
+        except ApiError as e:
+            if e.status == 404:
+                what = path.rsplit('/', 1)[1]
+                cause = "the repository is not visible to it" + (", or its issues unit is off" if what == "issues" else "")
+                raise RuntimeError(f"{self.g.repo} is not reachable with this token ({what} answered 404: {cause}); "
+                                   f"check the wiring: GITEA_USER/REPO_NAME on a box, the agent_user row of dev-gitea.json on a project")
+            raise
+
+    def _load_boards(self):
+        # Measured on 28.2.0: the listing returns OPEN boards only, and the API
+        # adds an issue to a second board without complaint (201, two cards),
+        # so one card per issue is this tool's rule, not Gitea's: the card on
+        # the issue's area board wins, every other card is a stray.
+        projects = self._repo_read(self.g.repo + "/projects")
+        titles = {}
+        for p in projects:
+            titles.setdefault(p["title"], []).append(p)
+        for title, found in titles.items():
+            if len(found) > 1:
+                self.dup_boards[title] = len(found)
+                continue
+            p = found[0]
+            p["columns"] = {}
+            for c in paged(self.g.get, f"{self.g.repo}/projects/{p['id']}/columns"):
+                p["columns"][c["title"]] = c
+                for issue in paged(self.g.get, f"{self.g.repo}/projects/{p['id']}/columns/{c['id']}/issues"):
+                    self.by_id.setdefault(issue["id"], issue)
+                    here = (title, c["title"])
+                    cur = self.cards.get(issue["id"])
+                    if cur is None:
+                        self.cards[issue["id"]] = here
+                    elif cur[0] != self.area_of(self.by_id[issue["id"]]) and title == self.area_of(self.by_id[issue["id"]]):
+                        self.strays.append((self.by_id[issue["id"]],) + cur)
+                        self.cards[issue["id"]] = here
+                    else:
+                        self.strays.append((self.by_id[issue["id"]],) + here)
+            self.boards[title] = p
+
+    @staticmethod
+    def label_names(issue):
+        return {l["name"] for l in issue.get("labels") or []}
+
+    def area_of(self, issue):
+        if self.pseudo:
+            return self.pseudo
+        areas = [n[len(AREA_PREFIX):] for n in self.label_names(issue) if n.startswith(AREA_PREFIX)]
+        return areas[0] if len(areas) == 1 else None
+
+    def column_cards(self, area, column):
+        """Cards of one column in the board's (the maintainer's) order."""
+        b = self.boards.get(area)
+        if not b or column not in b["columns"]:
+            return []
+        c = b["columns"][column]
+        if is_new(b["id"]) or is_new(c["id"]):
+            return []  # a board or column the dry run would create has no cards yet
+        return paged(self.g.get, f"{self.g.repo}/projects/{b['id']}/columns/{c['id']}/issues")
+
+    def working_comment(self, number):
+        """The branch of the CURRENT stint on #number: the agent's latest
+        `Working on it` comment not followed by its own `Stopped`, `Landed` or
+        `Closed` comment. The comments endpoint is unpaged on 28.2.0 (measured
+        with a 60-comment thread: every comment, whatever limit/page say)."""
+        branch = None
+        for c in self.g.get(f"{self.g.repo}/issues/{number}/comments") or []:
+            if c["user"]["login"] != self.agent_user:
+                continue
+            body = c["body"]
+            if body.startswith(WORKING_PREFIX):
+                branch = body[len(WORKING_PREFIX):].split("\n", 1)[0].strip()
+            elif body.startswith((STOPPED_PREFIX, LANDED_PREFIX, CLOSED_PREFIX)):
+                branch = None
+        return branch
+
+    # ---- writes, all through plan()
+    def plan(self, why, method, path, body=None):
+        self.planned.append((why, method, path, body))
+        self.out(("DRY " if self.dry_run else "") + why)
+        if self.dry_run:
+            return None
+        return getattr(self.g, method)(path, body) if body is not None else getattr(self.g, method)(path)
+
+    def ensure_labels(self):
+        """Create the labels this tool reads when the repository lacks them."""
+        for name, (colour, description) in LABEL_COLOURS.items():
+            if name in self.labels:
+                continue
+            l = self.plan(f"create label {name}", "post", f"{self.g.repo}/labels",
+                          {"name": name, "color": "#" + colour, "description": description})
+            self.labels[name] = f"{NEW}label {name}>" if self.dry_run else l["id"]
+
+    def ensure_board(self, area):
+        """Create the area's board and columns when missing; idempotent."""
+        if area in self.dup_boards:
+            raise RuntimeError(f"two boards are titled {area!r}; delete one, then retry")
+        b = self.boards.get(area)
+        if not b:
+            what = ("Open issues of this repository" if area == self.pseudo
+                    else f"Open issues labelled {AREA_PREFIX}{area}")
+            b = self.plan(f"create board {area}", "post", f"{self.g.repo}/projects",
+                          {"title": area, "card_type": "text_only", "template_type": "none",
+                           "description": f"{what}, stacked by the maintainer; driven by rs-board"})
+            if self.dry_run:
+                b = {"id": f"{NEW}{area}>", "title": area}
+            b["columns"] = {}
+            self.boards[area] = b
+        for title in COLUMNS:
+            if title not in b["columns"]:
+                c = self.plan(f"create column {area}/{title}", "post",
+                              f"{self.g.repo}/projects/{b['id']}/columns", {"title": title})
+                if self.dry_run:
+                    c = {"id": f"{NEW}{area}/{title}>", "title": title, "default": title == DEFAULT_COLUMN}
+                b["columns"][title] = c
+                if title == DEFAULT_COLUMN:
+                    self.plan(f"set default column {area}/{title}", "post",
+                              f"{self.g.repo}/projects/{b['id']}/columns/{c['id']}/default")
+        return b
+
+    def column_id(self, area, title):
+        b = self.boards.get(area)
+        if not b or title not in b["columns"]:
+            raise RuntimeError(f"board {area!r} has no column {title!r}; run `rs-board reconcile`")
+        return b["columns"][title]["id"]
+
+    def move(self, issue, column, why=""):
+        """Put the issue's card in `column` of its area's board (add when it
+        has none; remove from another board first — an issue is on at most
+        one board, so an area change is a removal plus an add)."""
+        area = self.area_of(issue)
+        if area is None:
+            n = len([x for x in self.label_names(issue) if x.startswith(AREA_PREFIX)])
+            raise RuntimeError(f"#{issue['number']} has {n} area labels; fix the labels first")
+        b = self.boards.get(area)
+        if b is None:
+            raise RuntimeError(f"no board for area {area!r}; run `rs-board reconcile`")
+        cur = self.cards.get(issue["id"])
+        label = why or f"#{issue['number']} -> {area}/{column}"
+        if cur and cur[0] != area:
+            old = self.boards[cur[0]]
+            self.plan(f"{label}: remove from {cur[0]}/{cur[1]}", "delete",
+                      f"{self.g.repo}/projects/{old['id']}/columns/{old['columns'][cur[1]]['id']}/issues/{issue['id']}")
+            del self.cards[issue["id"]]  # a refused add then leaves the index honest: no card
+            cur = None
+        cid = self.column_id(area, column)
+        if cur is None:
+            self.plan(f"{label}: add", "post", f"{self.g.repo}/projects/{b['id']}/columns/{cid}/issues/{issue['id']}")
+        elif cur[1] != column:
+            self.plan(f"{label}: move from {cur[1]}", "post",
+                      f"{self.g.repo}/projects/{b['id']}/issues/{issue['id']}/move", {"column_id": cid})
+        else:
+            return
+        self.cards[issue["id"]] = (area, column)
+
+    def remove(self, issue, why=""):
+        cur = self.cards.get(issue["id"])
+        if not cur:
+            return
+        self.remove_card(issue, cur, why or f"#{issue['number']}: remove card from {cur[0]}/{cur[1]}")
+        del self.cards[issue["id"]]
+
+    def remove_card(self, issue, where, why):
+        b = self.boards[where[0]]
+        self.plan(why, "delete", f"{self.g.repo}/projects/{b['id']}/columns/{b['columns'][where[1]]['id']}/issues/{issue['id']}")
+
+    def set_label(self, issue, name, on):
+        lid = self.labels.get(name)
+        if lid is None:
+            raise RuntimeError(f"label {name!r} does not exist on this repository; run `rs-board reconcile` "
+                               f"(it creates the labels rs-board reads)")
+        if on and name not in self.label_names(issue):
+            self.plan(f"#{issue['number']}: add label {name}", "post", f"{self.g.repo}/issues/{issue['number']}/labels", {"labels": [lid]})
+            issue.setdefault("labels", []).append({"id": lid, "name": name})
+        elif not on and name in self.label_names(issue):
+            self.plan(f"#{issue['number']}: drop label {name}", "delete", f"{self.g.repo}/issues/{issue['number']}/labels/{lid}")
+            issue["labels"] = [l for l in issue["labels"] if l["name"] != name]
+
+    def comment(self, issue, body):
+        self.plan(f"#{issue['number']}: comment {body.splitlines()[0]!r}", "post", f"{self.g.repo}/issues/{issue['number']}/comments", {"body": body})
+
+    def issue(self, number, must_be_open=False):
+        """An open issue from the index, else one read on demand (a closed
+        issue is only ever read one at a time, never listed whole)."""
+        i = self.by_number.get(number)
+        if i is None:
+            try:
+                i = self.g.get(f"{self.g.repo}/issues/{number}")
+            except ApiError as e:
+                if e.status == 404:
+                    raise RuntimeError(f"#{number} is not an issue of this repository")
+                raise
+            if i.get("pull_request"):
+                raise RuntimeError(f"#{number} is a pull request (pull requests are never cards)")
+            self.by_number[number] = i
+            self.by_id.setdefault(i["id"], i)
+        if must_be_open and i["state"] != "open":
+            raise RuntimeError(f"#{number} is closed")
+        return i
+
+
+# ---------------------------------------------------------------- the verbs
+def verb_next(b, area=None):
+    """Print what to work on; exit 0 with one pick, 2 with none or several."""
+    areas = [area] if area else [a for a in b.areas if a in b.boards]
+    if area and area not in b.boards:
+        raise RuntimeError(f"no board for area {area!r}")
+    dragged, tops, taken = [], [], []
+    for a in areas:
+        for i in b.column_cards(a, "Now"):
+            if i["state"] != "open" or i.get("pull_request"):
+                continue
+            branch = b.working_comment(i["number"])
+            (taken if branch else dragged).append((a, i, branch))
+        for i in b.column_cards(a, "Next"):
+            if i["state"] != "open" or i.get("pull_request"):
+                continue
+            if BLOCKING in b.label_names(i):
+                b.out(f"skipped: #{i['number']} [{a}] is in Next but still carries {BLOCKING}; answer it or run reconcile")
+                continue
+            tops.append((a, i))
+            break
+    for a, i, branch in taken:
+        b.out(f"in Now: #{i['number']} [{a}] {i['title']}  (branch {branch})")
+    if dragged:
+        b.out("the maintainer dragged into Now (take the first):")
+        for a, i, _ in dragged:
+            b.out(f"  #{i['number']} [{a}] {i['title']}")
+        picks = dragged[:1]
+    else:
+        tier = lambda i: 0 if PRIORITY in b.label_names(i) else 1
+        if tops:
+            best = min(tier(i) for _, i in tops)
+            picks = [(a, i, None) for a, i in tops if tier(i) == best]
+        else:
+            picks = []
+        if not picks:
+            b.out("nothing in Next" + (f" on {area}" if area else " on any board"))
+        elif len(picks) == 1 or area:
+            a, i, _ = picks[0]
+            b.out(f"next: #{i['number']} [{a}] {i['title']}" + ("  (priority:high)" if tier(i) == 0 else ""))
+            picks = picks[:1]
+        else:
+            b.out("top of Next on several boards, same tier; ask the maintainer which:")
+            for a, i, _ in picks:
+                b.out(f"  #{i['number']} [{a}] {i['title']}")
+    if len(picks) == 1:
+        a, i, _ = picks[0]
+        b.out(f"start with: rs-board start {i['number']} --branch agent/<name>")
+        return 0
+    return 2
+
+
+def verb_start(b, number, branch):
+    i = b.issue(number, must_be_open=True)
+    if BLOCKING in b.label_names(i):
+        raise RuntimeError(f"#{number} still carries {BLOCKING}; read the answer and run `rs-board answered {number}`, or ask the maintainer")
+    cur = b.cards.get(i["id"])
+    other = b.working_comment(number) if cur and cur[1] == "Now" else None
+    if other and other != branch:
+        raise RuntimeError(f"#{number} is already in Now on branch {other}; pick another card or ask the maintainer")
+    b.move(i, "Now", f"start #{number}")
+    if other != branch:
+        b.comment(i, f"{WORKING_PREFIX}{branch}")
+    return 0
+
+
+def verb_ask(b, number):
+    i = b.issue(number, must_be_open=True)
+    if BLOCKING not in b.labels:  # the remedy before any write, not after the move
+        b.set_label(i, BLOCKING, True)
+    b.move(i, "Decide", f"ask #{number}")
+    b.set_label(i, BLOCKING, True)
+    return 0
+
+
+def verb_answered(b, number):
+    i = b.issue(number, must_be_open=True)
+    b.move(i, "Now", f"answered #{number}")
+    b.set_label(i, BLOCKING, False)
+    return 0
+
+
+def verb_stop(b, number, reason):
+    i = b.issue(number, must_be_open=True)
+    b.move(i, "Next", f"stop #{number}")  # move first: a failed comment leaves a live branch on a Next card, which start does not refuse
+    b.comment(i, STOPPED_PREFIX + reason)
+    return 0
+
+
+def verb_done(b, number, pr):
+    i = b.issue(number)
+    if i["state"] == "open":
+        b.comment(i, f"{LANDED_PREFIX}{pr}." if pr else CLOSED_PREFIX)
+        b.plan(f"#{number}: close", "patch", f"{b.g.repo}/issues/{number}", {"state": "closed"})
+    b.remove(i, f"done #{number}: remove card")
+    for s_issue, title, col in b.strays:
+        if s_issue["id"] == i["id"]:
+            b.remove_card(i, (title, col), f"done #{number}: remove its card on {title}/{col} too")
+    return 0
+
+
+def verb_place(b, number, column):
+    """A placement the maintainer asked for in so many words: the one way a
+    script touches Now/Next/Backlog besides start/stop."""
+    if column not in COLUMNS:
+        raise RuntimeError(f"column {column!r} is not one of {COLUMNS}")
+    i = b.issue(number, must_be_open=True)
+    b.move(i, column, f"place #{number}")
+    return 0
+
+
+def verb_reconcile(b):
+    reports = []
+    b.ensure_labels()
+    for area in b.areas:
+        if area in b.dup_boards:
+            reports.append(f"area {area}: {b.dup_boards[area]} boards carry this title; delete the extra one (nothing done on this area)")
+            continue
+        b.ensure_board(area)
+        bd = b.boards.get(area)
+        if bd and any(is_new(c["id"]) for c in bd["columns"].values()):
+            reports.append(f"board {area}: columns planned above; order and default are checked once they exist")
+        elif bd:
+            extra = [t for t in bd["columns"] if t not in COLUMNS]
+            if extra:
+                reports.append(f"board {area}: unknown columns {extra} (left alone)")
+            order = [c["title"] for c in sorted(bd["columns"].values(), key=lambda c: c.get("sorting", 0))]
+            if [t for t in order if t in COLUMNS] != COLUMNS:
+                reports.append(f"board {area}: columns are ordered {order}, expected {COLUMNS} (left alone)")
+            default = [t for t, c in bd["columns"].items() if c.get("default")]
+            if default and default != [DEFAULT_COLUMN]:
+                reports.append(f"board {area}: default column is {default}, expected {DEFAULT_COLUMN} (left alone)")
+    # cards
+    for i in b.open:
+        area = b.area_of(i)
+        if area is None:
+            n = len([x for x in b.label_names(i) if x.startswith(AREA_PREFIX)])
+            where = f"; its card stays on {b.cards[i['id']][0]}" if i["id"] in b.cards else "; no card placed"
+            reports.append(f"#{i['number']} carries {n} area labels (needs exactly one){where}")
+            continue
+        if area in b.dup_boards or area not in b.boards:
+            continue
+        cur = b.cards.get(i["id"])
+        decision = [l for l in DECIDE_LABELS if l in b.label_names(i)]
+        if cur is None:
+            col = "Decide" if decision else DEFAULT_COLUMN
+            b.move(i, col, f"#{i['number']} has no card -> {area}/{col}")
+        elif cur[0] != area:
+            col = "Decide" if decision and cur[1] == DEFAULT_COLUMN else cur[1] if cur[1] in COLUMNS else DEFAULT_COLUMN
+            b.move(i, col, f"#{i['number']} area changed -> {area}/{col}")
+        elif decision and cur[1] == DEFAULT_COLUMN:
+            b.move(i, "Decide", f"#{i['number']} carries {'+'.join(decision)} in Inbox")
+        elif decision and cur[1] != "Decide":
+            for l in decision:
+                b.set_label(i, l, False)
+            reports.append(f"#{i['number']} carried {'+'.join(decision)} but sits in {cur[1]} by the maintainer's hand: label dropped, the column wins")
+    for i, title, col in b.strays:
+        if i["state"] != "open" or i.get("pull_request"):
+            b.remove_card(i, (title, col), f"#{i['number']} is {'a pull request' if i.get('pull_request') else 'closed'}: remove its card on {title}/{col} too")
+        elif b.area_of(i) is None:  # which card is right is the maintainer's call: the labels decide at the next pass
+            reports.append(f"#{i['number']} also has a card on {title}/{col}; fix the labels first, then reconcile keeps one")
+        else:
+            b.remove_card(i, (title, col), f"#{i['number']} also had a card on {title}/{col}: remove it, one card per issue")
+    for iid in list(b.cards):
+        i = b.by_id.get(iid)
+        if i is None:
+            continue
+        if i["state"] != "open":
+            b.remove(i, f"#{i['number']} is closed: remove card")
+        elif i.get("pull_request"):
+            b.remove(i, f"#{i['number']} is a pull request: remove card")
+    for title, n in b.dup_boards.items():
+        if title not in b.areas:
+            reports.append(f"{n} boards are titled {title!r}; their cards are invisible to rs-board until one is deleted")
+    for title in b.boards:
+        if title in b.areas:
+            continue
+        n = sum(1 for t, _ in b.cards.values() if t == title)
+        if n:  # a maintainer's own board is silent while it holds no issue card
+            reports.append(f"board {title!r} is not an area board and holds {n} cards; its cards move to their area boards as they get an area label")
+        elif title == b.g.repo_name:  # the tool's own leftover from before the first area label
+            reports.append(f"board {title!r} is not an area board and holds 0 cards; delete it when you like")
+    for a in b.areas:
+        if a not in b.boards:
+            continue
+        for i in b.column_cards(a, "Now"):
+            if i["state"] == "open" and not i.get("pull_request") and not b.working_comment(i["number"]):
+                reports.append(f"#{i['number']} [{a}] is in Now by the maintainer's hand: the next idle session takes it")
+    b.out(f"planned writes: {len(b.planned)}" + (" (dry run, nothing written)" if b.dry_run else ""))
+    for r in reports:
+        b.out("report: " + r)
+    return 0
+
+
+def main(argv=None, gitea=None, agent_user=None, out=print):
+    ap = argparse.ArgumentParser(prog="rs-board", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dry-run", action="store_true", help="print the planned writes, make none")
+    sub = ap.add_subparsers(dest="verb", required=True)
+    p = sub.add_parser("next"); p.add_argument("--area")
+    p = sub.add_parser("start"); p.add_argument("number", type=int); p.add_argument("--branch", required=True)
+    p = sub.add_parser("ask"); p.add_argument("number", type=int)
+    p = sub.add_parser("answered"); p.add_argument("number", type=int)
+    p = sub.add_parser("stop"); p.add_argument("number", type=int); p.add_argument("--reason", default="see the comment above")
+    p = sub.add_parser("done"); p.add_argument("number", type=int); p.add_argument("--pr", type=int)
+    p = sub.add_parser("place"); p.add_argument("number", type=int); p.add_argument("--column", required=True)
+    sub.add_parser("reconcile")
+    a = ap.parse_args(argv)
+    if gitea is None:
+        base, token, owner, repo, agent_user = resolve_wiring()
+        gitea = Gitea(base, token, owner, repo)
+    check_version(gitea)
+    b = Board(gitea, agent_user, dry_run=a.dry_run, out=out)
+    if a.verb == "next":
+        return verb_next(b, a.area)
+    if a.verb == "start":
+        return verb_start(b, a.number, a.branch)
+    if a.verb == "ask":
+        return verb_ask(b, a.number)
+    if a.verb == "answered":
+        return verb_answered(b, a.number)
+    if a.verb == "stop":
+        return verb_stop(b, a.number, a.reason)
+    if a.verb == "done":
+        return verb_done(b, a.number, a.pr)
+    if a.verb == "place":
+        return verb_place(b, a.number, a.column)
+    return verb_reconcile(b)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except RuntimeError as e:
+        print("rs-board:", e, file=sys.stderr)
+        sys.exit(1)
