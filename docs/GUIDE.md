@@ -423,7 +423,7 @@ project destroy <name|--all>       Remove container + workspace + network + cred
 
 ```
 --workflow <name>          Workflow selector (default: research). See `workflow list`.
---mount <paths>            Comma-separated host folders, each RO at /workspace/mnt/<basename>/
+--mount <paths>            Comma-separated host folders (repeatable), each RO at /workspace/mnt/<basename>/
 --egress {open,locked}     Egress policy (research→open, sandbox→locked)
 --enable / --disable <ids> Worker services to (de)activate at create
 --mcp <names>              MCPs to auto-allow: 'all-enabled' (default), 'none', or a CSV of registry names

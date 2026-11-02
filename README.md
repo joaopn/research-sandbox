@@ -166,7 +166,7 @@ python research.py project attach myproj                    # 3. sign in to Clau
 #   (or VSCode Remote-SSH to research@localhost:<ssh-port> and use the Claude Code extension)
 ```
 
-Each `--mount` folder is mounted **read-only** at `/workspace/mnt/<basename>/` (comma-separated for several). From the webui, the create dialog's **Add folders** takes paths relative to RS's `data/` folder instead: put datasets there (or mount another disk into it on the host). A project's folders can be changed later in its ⚙ panel's **Sharing** box; the change applies the next time the project starts. Credentials live **inside** the supervisor (never on the host), are copied into each worker at spawn, and are deleted on `destroy`.
+Each `--mount` folder is mounted **read-only** at `/workspace/mnt/<basename>/` (comma-separated, or repeat the flag). From the webui, the create dialog's **Add folders** takes paths relative to RS's `data/` folder instead: put datasets there (or mount another disk into it on the host). A project's folders can be changed later in its ⚙ panel's **Sharing** box; the change applies the next time the project starts. Credentials live **inside** the supervisor (never on the host), are copied into each worker at spawn, and are deleted on `destroy`.
 
 **4. Run a thread.** Describe what you want in plain English — *"Is the response-time distribution in `/workspace/mnt/<name>/` heavy-tailed, and what does a typical user look like?"* The supervisor proposes worker plans, you say "go", it spawns workers, reviews their staged outputs, and asks you to accept.
 

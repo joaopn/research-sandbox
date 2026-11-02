@@ -446,7 +446,12 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         rscore.CreateRequest,
         name=args.name, workflow=args.workflow,
         egress=args.egress, dind=args.dind,
-        profile=args.profile, mount=args.mount, memory=args.memory,
+        # --mount is repeatable; join the flags into the comma form so the
+        # request sees exactly what one comma-separated flag produces (a list
+        # would be taken element-by-element, leaving "/b,/c" as one path).
+        profile=args.profile,
+        mount=",".join(args.mount) if args.mount else None,
+        memory=args.memory,
         cpus=args.cpus, ssh_port=args.ssh_port,
         inner_firewall=args.inner_firewall, enable=args.enable,
         disable=args.disable, role_mcp_upstream=args.role_mcp_upstream,
@@ -2422,13 +2427,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "`research workflow list` for the catalog; e.g. "
                         "'sandbox-dind' (agent-less DIND box host), 'sandbox' (a single "
                         "confined docker container).")
-    c.add_argument("--mount", metavar="PATHS",
-                   help="comma-separated host folders, each mounted RO at "
+    c.add_argument("--mount", metavar="PATHS", action="append",
+                   help="comma-separated host folders (the flag may also be "
+                        "repeated), each mounted RO at "
                         "/workspace/mnt/<basename>/ (e.g. "
                         "`--mount /home/me/raw,/srv/parsed` lands as "
                         "/workspace/mnt/raw and .../parsed). "
                         "Missing paths are mkdir -p'd. Basename collisions "
-                        "across the list are a hard error.")
+                        "across all the folders named are a hard error.")
     c.add_argument("--profile", default="python", help="supervisor image profile")
     c.add_argument("--dind", choices=["auto", "sysbox", "privileged"],
                    help="DIND mode (default: auto — sysbox if available, else privileged)")
