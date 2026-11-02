@@ -3245,8 +3245,15 @@ def _project_summary(name: str) -> dict:
 
 
 def _project_disk_bytes(name: str) -> dict:
-    """Sum st_size over every regular entry under a project's workspace —
-    {disk_bytes: N}, or {error: not_found}. This is the ONE tree walk the
+    """Sum st_size over every entry under a project's workspace, counting
+    each file ONCE however many hard links point at it (a conda package
+    cache hard-links into every env, so per-link counting multiplied the
+    figure) — {disk_bytes: N}, or {error: not_found}. The figure is apparent
+    bytes (st_size, not allocated blocks); a symlink counts its own size and
+    is never followed. A file whose other link lies outside the workspace
+    still counts once here: its bytes are reachable from this workspace.
+    The inode set is per call, so a link shared between two projects counts
+    once in each project's figure. This is the ONE tree walk the
     webui performs, and it runs only when the Management page's "Measure
     sizes" button asks for it: on a host with a 110k-file dev workspace it
     costs seconds and more than a core, which is why it is no longer on any
@@ -3256,12 +3263,20 @@ def _project_disk_bytes(name: str) -> dict:
     if workspace is None:
         return {"error": "not_found"}
     disk_bytes = 0
+    # (st_dev, st_ino) of every multi-link inode already counted; single-link
+    # files never enter it, so it holds only the hard-linked inodes.
+    seen: set[tuple[int, int]] = set()
     for dirpath, _dirnames, filenames in os.walk(workspace, followlinks=False):
         for fname in filenames:
             try:
                 st = os.stat(os.path.join(dirpath, fname), follow_symlinks=False)
             except OSError:
                 continue
+            if st.st_nlink > 1:
+                key = (st.st_dev, st.st_ino)
+                if key in seen:
+                    continue
+                seen.add(key)
             disk_bytes += st.st_size
     return {"disk_bytes": disk_bytes}
 
