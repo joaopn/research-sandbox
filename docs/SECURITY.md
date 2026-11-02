@@ -8,6 +8,7 @@ Threat model, isolation layers, and what is and isn't enforced.
 [◾ What is enforced](#-what-is-enforced)
 [◾ What is not enforced](#-what-is-not-enforced)
 [◾ Isolation layers](#-isolation-layers)
+[◾ Host hardening (operator-applied)](#-host-hardening-operator-applied)
 [◾ MCP server contract](#-mcp-server-contract)
 [◾ Egress modes](#-egress-modes)
 [◾ Inner-bridge firewall](#-inner-bridge-firewall)
@@ -104,6 +105,32 @@ Each project sits inside multiple boundaries that must all be crossed for a work
 ### 6. Inner-bridge firewall (opt-in)
 
 `--inner-firewall` adds an iptables ACL on the supervisor's `rs-inner` bridge. Bridge-boundary, not intra-bridge — which means worker-to-mcp-proxy on the same bridge is L2-switched and unfiltered (the path we want allowed), while worker-to-anywhere-off-bridge is L3-routed and filtered. Default-OFF until the opt-in path has been dogfooded; the firewall is independent of the rs-router policy and complements it.
+
+## ◾ Host hardening (operator-applied)
+
+RS installs nothing on the host outside its own containers: it never writes a host firewall rule, never changes a host service, and never checks whether you did. Two paths out of a project can only be closed on the host, so this section lists them as suggestions you apply yourself, with your own privileges.
+
+**What is open without them.** A project container's root (a user-namespaced root under sysbox, a real root under privileged dind) holds `CAP_NET_ADMIN` over the container's own network stack — the inner Docker daemon needs it — so it can replace the default route RS injected — pointing it at the bridge's gateway instead of `rs-router` — and the host forwards and masquerades that traffic like any Docker network: the egress policy is bypassed. The same gateway address is the host itself, so any host service listening on all interfaces (sshd by default) answers to a project directly, without passing the router. Both hold for the sysbox and privileged dind substrates; a plain `docker`-substrate project (the `sandbox` workflow) has Docker's default capability set, which lacks `CAP_NET_ADMIN`, and cannot re-route.
+
+**Every bridge RS creates for a project or the reviewer has a recognisable host interface name.** Those bridges (`rs-net-<project>` and `rs-reviewer`) get a host interface named `rsn` followed by twelve hex characters, instead of Docker's `br-<id>`, so two generic rules cover every project, present and future, and are installed once. The shared `rs-sandbox` bridge, through which the shared containers reach the internet, deliberately keeps Docker's `br-*` name so rule 1 never matches it. Projects created before this naming keep their `br-*` interface and are covered only after a destroy + recreate; an `rs-reviewer` network from an earlier version likewise — while no review runs, detach the router and remove it by hand (`docker network disconnect rs-reviewer rs-router 2>/dev/null; docker network rm rs-reviewer` — the router may still be attached from the last review, and a network removed under a stopped router would brick the router's next start), and the next review recreates it with the prefix.
+
+**Order matters.** Run `research start` on this version of RS first: it pins every shared container's default route (router, webui, registry, Gitea) to `rs-sandbox`, which Docker otherwise places on a project bridge. Installed before that, the first rule below would drop the router's own outbound traffic.
+
+**Rule 1 — containment.** New connections entering from an RS bridge may not leave by any other interface. This closes the re-route (the project's traffic can only go to neighbours on its own bridge, where `rs-router` is) and leaves intact: the router path (on-bridge), published ports (connections enter from outside; replies are established traffic), same-project neighbours, and external MCPs (the router reaches `host.docker.internal` from `rs-sandbox`, not from a project bridge).
+
+```bash
+sudo iptables -I DOCKER-USER 1 -i rsn+ ! -o rsn+ -m conntrack --ctstate NEW -j DROP
+```
+
+**Rule 2 — the host itself.** New connections from an RS bridge to the host are dropped. This closes the host's sshd (and anything else bound to `0.0.0.0`) from every project and from every box inside one.
+
+```bash
+sudo iptables -I INPUT 1 -i rsn+ -m conntrack --ctstate NEW -j DROP
+```
+
+Both rules are idempotent to check (`iptables -C …` with the same arguments) and to remove (`iptables -D …`). Persist them with your distribution's mechanism (`iptables-persistent`, a `DOCKER-USER` snippet in your firewall tool); Docker recreates its own chains at daemon start but leaves `DOCKER-USER` and `INPUT` to you. On Docker's nftables backend there is no `DOCKER-USER` chain: the same two expressions go into a chain of your own on the `forward` and `input` hooks that runs before Docker's — `iifname "rsn*" oifname != "rsn*" ct state new drop` and `iifname "rsn*" ct state new drop`.
+
+**sshd.** Independently of rule 2, bind the host's sshd to the address you actually use (`ListenAddress <LAN address>` in `sshd_config`) rather than every interface; a service that does not listen on the bridges has nothing to be reached at.
 
 ## ◾ MCP server contract
 

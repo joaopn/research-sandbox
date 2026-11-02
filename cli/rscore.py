@@ -4383,6 +4383,53 @@ REGISTRY_CACHE_DIR = Path.home() / ".research-sandbox" / "registry"
 CONTAINER_PREFIX = "rs-project-"
 DOCKER_VOLUME_PREFIX = "rs-docker-"
 PROJECT_NETWORK_PREFIX = "rs-net-"
+# Host-side interface name of every bridge RS creates (project networks and the
+# reviewer's). Docker's default is `br-<12 hex of the network id>`, which an
+# operator cannot tell apart from any other compose network on the host. A fixed
+# prefix lets the host-hardening rules in docs/SECURITY.md match every bridge RS
+# creates for a project or the reviewer with one `-i rsn+` — installed once,
+# never per project. The shared rs-sandbox bridge deliberately keeps docker's
+# name: the shared containers' egress leaves through it and must not match.
+# The kernel caps an interface name at 15 characters (IFNAMSIZ), so the name
+# is the prefix plus the first 12 hex of the network NAME's sha256:
+# deterministic from the name alone (the option is create-time, so the network
+# id is not available yet), unique enough that a collision needs two RS
+# networks with the same sha256 prefix.
+BRIDGE_IFNAME_PREFIX = "rsn"
+BRIDGE_IFNAME_HEX = 12
+# Linux IFNAMSIZ minus the terminating NUL: the longest interface name the
+# kernel (and docker's bridge driver) accepts.
+IFNAME_MAX = 15
+assert len(BRIDGE_IFNAME_PREFIX) + BRIDGE_IFNAME_HEX <= IFNAME_MAX
+BRIDGE_NAME_OPTION = "com.docker.network.bridge.name"
+# Shared containers that RS later `docker network connect`s to project networks
+# (router, webui, registry, gitea) must keep their default route on rs-sandbox:
+# docker otherwise puts it on the alphabetically-first network, and `rs-net-*`
+# sorts before `rs-sandbox`. Gateway priority (Engine 28.0 client and daemon,
+# compose 2.33.1 — the release that added `gw_priority`; 2.33.0 silently drops
+# the attribute) pins it declaratively. The floor check fails CLOSED: a version
+# that cannot be read refuses, because a daemon that ignores the priority would
+# leave every shared container's egress on a project bridge, which the
+# operator's host-hardening rules then drop.
+GATEWAY_PRIORITY = 1
+GATEWAY_NETWORK_RUN_ARG = f"name={ROUTER_NETWORK},gw-priority={GATEWAY_PRIORITY}"
+ENGINE_VERSION_FLOOR = "28.0.0"
+COMPOSE_VERSION_FLOOR = "2.33.1"
+
+
+def bridge_ifname(network: str) -> str:
+    """The host interface name RS gives the bridge of ``network`` (see
+    BRIDGE_IFNAME_PREFIX)."""
+    digest = hashlib.sha256(network.encode()).hexdigest()
+    return BRIDGE_IFNAME_PREFIX + digest[:BRIDGE_IFNAME_HEX]
+
+
+def network_create_args(network: str) -> list[str]:
+    """`docker network create` argv for an RS bridge: the prefixed host
+    interface name is the only option. One builder for every RS-created outer
+    network, so the project and reviewer bridges cannot drift apart."""
+    return ["docker", "network", "create",
+            "-o", f"{BRIDGE_NAME_OPTION}={bridge_ifname(network)}", network]
 PROJECT_LABEL = "research.project"
 DIND_MODE_LABEL = "research.dind"
 # Project flavor: "research" (default — supervisor agent + workers) or
@@ -5216,7 +5263,7 @@ def ensure_project_network(project: str, mode: str) -> tuple[str, str]:
     """
     network = project_network_for(project)
     if not network_exists(network):
-        run_check(["docker", "network", "create", network])
+        run_check(network_create_args(network))
     run(["docker", "network", "connect", network, ROUTER_CONTAINER],
         capture_output=True)
     router_ip = get_router_ip(network)
@@ -8919,7 +8966,7 @@ def _ensure_registry_running() -> None:
     r = run([
         "docker", "run", "-d",
         "--name", REGISTRY_CONTAINER,
-        "--network", ROUTER_NETWORK,
+        "--network", GATEWAY_NETWORK_RUN_ARG,
         "--restart", "unless-stopped",
         "-p", f"127.0.0.1:{host_port}:{REGISTRY_INNER_PORT}",
         "-v", f"{REGISTRY_CACHE_DIR}:/var/lib/registry",
@@ -9013,7 +9060,7 @@ def _run_gitea_container(image: str, volume: str, version: str,
     cmd = [
         "docker", "run", "-d",
         "--name", gitea.GITEA_CONTAINER,
-        "--network", ROUTER_NETWORK,
+        "--network", GATEWAY_NETWORK_RUN_ARG,
         "--restart", GITEA_RESTART_POLICY,
         "--label", f"{GITEA_VERSION_LABEL}={version}",
         "-p", f"127.0.0.1:{host_port}:{gitea.GITEA_INNER_PORT}",
@@ -15796,8 +15843,7 @@ def _ensure_reviewer_network() -> str:
             # Tolerant create (belt-and-braces under the lock): proceed iff
             # the network exists afterwards — a non-rscore creator winning a
             # race is tolerable, a daemon-down create failure stays fail-loud.
-            r = run(["docker", "network", "create", REVIEWER_NETWORK],
-                    capture_output=True)
+            r = run(network_create_args(REVIEWER_NETWORK), capture_output=True)
             if r.returncode != 0 and not network_exists(REVIEWER_NETWORK):
                 die(f"command failed: docker network create "
                     f"{REVIEWER_NETWORK}\n{(r.stderr or '').strip()}")
@@ -16166,6 +16212,116 @@ def review_pr(req: "ReviewRequest", progress=None) -> dict:  # type: ignore[name
     finally:
         run(["docker", "rm", "-f", name], capture_output=True)
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# Sentinels for _gateway_priority: the container does not exist at all, or it
+# exists without an endpoint on the network (a half-done heal, or a hand
+# `docker network disconnect`). Only the second is something to repair.
+GATEWAY_CONTAINER_ABSENT = "container-absent"
+GATEWAY_ENDPOINT_ABSENT = "endpoint-absent"
+
+
+def _gateway_priority(container: str, network: str) -> int | str:
+    """The gateway priority of ``container``'s endpoint on ``network``,
+    GATEWAY_CONTAINER_ABSENT when there is no such container, or
+    GATEWAY_ENDPOINT_ABSENT when the container exists but has no endpoint
+    there (a stopped container keeps its endpoints in inspect, so it is
+    healed where it stands)."""
+    r = run(["docker", "container", "inspect", "-f",
+             "{{json .NetworkSettings.Networks}}", container],
+            capture_output=True)
+    if r.returncode != 0:
+        # Absence is the one failure that means "nothing to pin"; anything
+        # else (daemon hiccup, permission) must not read as absence — a shared
+        # container left unpinned loses its egress under the operator's
+        # host-hardening rules, so the heal fails loudly like the floor does.
+        err = r.stderr or ""
+        if "No such container" in err or "No such object" in err:
+            return GATEWAY_CONTAINER_ABSENT
+        die(f"could not inspect {container} to pin its default gateway: "
+            f"{(err or r.stdout or '').strip()[-200:]}")
+    try:
+        nets = json.loads((r.stdout or "").strip() or "null") or {}
+    except json.JSONDecodeError as e:
+        die(f"could not read {container}'s network settings: {e}")
+    ep = nets.get(network)
+    if not isinstance(ep, dict):
+        return GATEWAY_ENDPOINT_ABSENT
+    return int(ep.get("GwPriority") or 0)
+
+
+def pin_shared_gateway(container: str) -> bool:
+    """Make rs-sandbox the default-gateway network of one shared container,
+    persistently: disconnect its rs-sandbox endpoint and reconnect it with the
+    gateway priority. Docker recomputes the default route from endpoint
+    priorities at every container start, so an in-place route edit would
+    expire at the next restart while this survives it (measured). Works on
+    running and stopped containers alike; published ports follow the gateway
+    endpoint. A container that exists but has NO rs-sandbox endpoint — a heal
+    whose reconnect failed, or a hand disconnect — is connected with the
+    priority (connect only), so the heal repairs its own half-done state
+    instead of skipping it forever. No-op (False) when the container is absent
+    or already pinned; True when it re-wired."""
+    state = _gateway_priority(container, ROUTER_NETWORK)
+    if state in (GATEWAY_CONTAINER_ABSENT, GATEWAY_PRIORITY):
+        return False
+    if state != GATEWAY_ENDPOINT_ABSENT:
+        run_check(["docker", "network", "disconnect", ROUTER_NETWORK, container])
+    run_check(["docker", "network", "connect", "--gw-priority",
+               str(GATEWAY_PRIORITY), ROUTER_NETWORK, container])
+    return True
+
+
+def shared_gateway_containers() -> list[str]:
+    """Every shared container RS connects to project networks — the set whose
+    default route must stay on rs-sandbox. The kept-aside previous gitea is
+    included so a rollback starts pinned."""
+    return [ROUTER_CONTAINER, WEBUI_CONTAINER, REGISTRY_CONTAINER,
+            gitea.GITEA_CONTAINER, GITEA_PREVIOUS_CONTAINER]
+
+
+def pin_shared_gateways() -> list[str]:
+    """Heal every existing shared container created before gateway pinning
+    (or resumed by a plain `docker start`); returns the ones re-wired. Runs at
+    `research start` right after the router is up, before anything else, so a
+    later step that dies cannot skip it."""
+    return [c for c in shared_gateway_containers() if pin_shared_gateway(c)]
+
+
+def _version_from_output(r: subprocess.CompletedProcess) -> str | None:
+    """The leading dotted-numeric version in a command's stdout, or None when
+    the command failed or printed nothing numeric — the floor refuses both."""
+    if r.returncode != 0:
+        return None
+    m = _VERSION_NUMERIC_RE.match((r.stdout or "").strip())
+    return m.group(1) if m else None
+
+
+def check_engine_floor() -> None:
+    """Refuse `research start` below the Engine / compose versions that honour
+    gateway priority (see GATEWAY_PRIORITY). Fail-closed: an unreadable
+    version refuses too — `_version_older` alone reads "not older" for a
+    missing compose plugin, which is the right posture for a warning and the
+    wrong one for a floor whose absence breaks every shared container's egress
+    once the operator's host-hardening rules are in place."""
+    checks = [
+        ("docker client", ["docker", "version", "-f", "{{.Client.Version}}"],
+         ENGINE_VERSION_FLOOR),
+        ("docker engine", ["docker", "version", "-f", "{{.Server.Version}}"],
+         ENGINE_VERSION_FLOOR),
+        ("docker compose", ["docker", "compose", "version", "--short"],
+         COMPOSE_VERSION_FLOOR),
+    ]
+    for what, cmd, floor in checks:
+        got = _version_from_output(run(cmd, capture_output=True))
+        if got is None:
+            die(f"could not read the {what} version ({' '.join(cmd)}); "
+                f"research-sandbox needs {what} >= {floor} (gateway priority "
+                f"for the shared containers).")
+        if _version_older(got, floor):
+            die(f"{what} {got} is too old; research-sandbox needs {what} >= "
+                f"{floor} (gateway priority keeps the shared containers' "
+                f"default route on {ROUTER_NETWORK}).")
 
 
 def wire_webui_to_projects() -> None:

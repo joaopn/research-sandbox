@@ -3,7 +3,11 @@ services:
     build: ./router
     container_name: rs-router
     networks:
-      - rs-sandbox
+      # gw_priority keeps the default route on rs-sandbox once the router is
+      # connected to the per-project networks (docker would otherwise pick the
+      # first network by name, and rs-net-* sorts before rs-sandbox).
+      rs-sandbox:
+        gw_priority: 1
     cap_add:
       - NET_ADMIN
       - NET_RAW
@@ -33,7 +37,10 @@ services:
     # uid-equality contract, value-agnostic (defaults to the baked 1000).
     user: "${WEBUI_UID:-1000}:${WEBUI_GID:-1000}"
     networks:
-      - rs-sandbox
+      # Same gateway pin as the router: the webui is connected to every
+      # project network and must keep its default route on rs-sandbox.
+      rs-sandbox:
+        gw_priority: 1
     ports:
       # WEBUI_PORT is the *host* port; container always listens on 7777
       # internally (matches EXPOSE in webui/Dockerfile). Only WEBUI_BIND
@@ -97,8 +104,12 @@ volumes:
 
 networks:
   # Shared infrastructure network: has internet via Docker gateway.
-  # Per-project networks (rs-net-<name>) are created by research.py as
-  # --internal and routed through rs-router.
+  # Per-project networks (rs-net-<name>) are plain bridges created by
+  # research.py (host interface `rsn<hash>`), routed through rs-router by a
+  # default route injected into each project container.
+  # NEVER give this network the `rsn` bridge-name prefix the per-project and
+  # reviewer bridges carry: the operator's containment rule in docs/SECURITY.md
+  # keys on `rsn+`, and the shared containers' egress leaves through THIS bridge.
   rs-sandbox:
     name: rs-sandbox
     driver: bridge

@@ -129,6 +129,7 @@ def cmd_start(args: argparse.Namespace) -> None:
     browser UI if a `research stop` took it down, spawn the enabled shared MCPs,
     and re-wire gitea last."""
     _preflight()
+    rscore.check_engine_floor()
     _build_images(force=args.rebuild)
     # Ensure the fleet agent dist exists so research projects can deploy claude at
     # create/boot (no bake; STAGE_AGENT_DIST slice 2). PULL-ONLY-IF-ABSENT — never
@@ -154,6 +155,13 @@ def cmd_start(args: argparse.Namespace) -> None:
         compose_up.append("--build")
     compose_up.append("router")
     run_check(compose_up)
+    # Every shared container RS connects to project networks must keep its
+    # default route on rs-sandbox (docker would otherwise pick the first
+    # project network by name). New containers are born pinned; this heals the
+    # ones created before gateway pinning, running or stopped, FIRST — before
+    # any step below that could die and skip it.
+    for c in rscore.pin_shared_gateways():
+        print(f"pinned {c}'s default gateway to {rscore.ROUTER_NETWORK}")
     # If the router was recreated (compose --build, or simply a fresh `up`
     # after `stop`), it lost its `docker network connect` attachments to
     # every per-project network. Re-attach so subsequent `project update`
@@ -1731,6 +1739,11 @@ def cmd_webui(args: argparse.Namespace) -> None:
         return
 
     if action == "start":
+        # Same floor as `research start`, before anything is removed or
+        # rebuilt: a compose below it drops the webui's gateway priority
+        # silently and the container would be born with its default route on a
+        # project bridge. A refusal here leaves the running webui untouched.
+        rscore.check_engine_floor()
         new_bind = getattr(args, "bind", None)
         new_port = getattr(args, "port", None)
         rebuild = getattr(args, "rebuild", False)
