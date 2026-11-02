@@ -18269,6 +18269,24 @@ def _detect_tailscale_fqdn() -> str | None:
     return fqdn.rstrip(".") or None
 
 
+def _detect_tailscale_ipv4() -> str | None:
+    """Read the host's tailnet IPv4 from `tailscale ip -4` (one bare
+    address per line). Returns the first line that parses as an IPv4
+    address, or None if tailscale isn't installed, the command fails, or
+    no line parses. No range check: a tailnet can use a custom IP pool."""
+    if shutil.which("tailscale") is None:
+        return None
+    r = run(["tailscale", "ip", "-4"], capture_output=True)
+    if r.returncode != 0:
+        return None
+    for line in (r.stdout or "").splitlines():
+        try:
+            return str(ipaddress.IPv4Address(line.strip()))
+        except ValueError:
+            continue
+    return None
+
+
 def _webui_tls_volume() -> str:
     """Resolve the docker volume name actually mounted at /app/tls in
     rs-webui. Falls back to the literal name pinned in docker-compose.yml

@@ -1631,9 +1631,19 @@ def cmd_webui_cert_tailscale() -> None:
     print()
     if bind in ("127.0.0.1", "::1", "localhost"):
         print(f"  note: WEBUI_BIND={bind} only accepts loopback connections")
-        print(f"  to reach via tailnet, run:")
-        print(f"    research webui start --bind 0.0.0.0")
+        # Never recommend 0.0.0.0 here: a webui published on every address
+        # is reachable from every project at its own bridge gateway.
+        print("  to reach it over the tailnet, bind this host's tailnet address:")
+        ts_ip = _detect_tailscale_ipv4()
+        if ts_ip:
+            print(f"    research webui start --bind {ts_ip}")
+        else:
+            print("  (could not read this host's tailnet IPv4; "
+                  "find it with: tailscale ip -4)")
+            print("    research webui start --bind <that address>")
         print(f"  then open https://{fqdn}:{port}/")
+        print("  (docs/SECURITY.md lists what a non-loopback bind exposes "
+              "and the host rules that narrow it)")
     elif bind == "0.0.0.0":
         print(f"  open https://{fqdn}:{port}/ — cert is publicly trusted")
     else:
