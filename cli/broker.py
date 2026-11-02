@@ -2450,8 +2450,8 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
     # other table). Mirrors the review branch: token → op_id → per-verb
     # pre-spawn validation → spawn → the parent writes a PER-OP lock only
     # AFTER a successful spawn (gate-before-sink). NO lock check — provisions
-    # run N-at-a-time; a same-repo double-submit is the documented
-    # migrate-resume quirk (the duplicate-review posture). The spawn passes
+    # run N-at-a-time; two provisions mirroring the same repo serialise inside
+    # gitea.add_repo on its per-repo host lock. The spawn passes
     # the FILTERED args over the child's stdin (they carry the PAT — see
     # _spawn_dev_box_child); the verb rides the child's argv.
     if verbs is None and verb in DEV_BOX_DISPATCH:

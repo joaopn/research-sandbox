@@ -30,7 +30,9 @@ no secret — the passphrase reaches the container on stdin and lives only in a
 
 from __future__ import annotations
 
+import contextlib
 import datetime
+import fcntl
 import hashlib
 import http.client
 import json
@@ -287,6 +289,55 @@ def consumer_token_path(user: str) -> Path:
 
 def mirror_stamp_path(repo: str) -> Path:
     return MIRRORS_DIR / repo
+
+
+# Per-repo ADD locks: one empty file per repo ever added, held (flock) for the
+# whole of add_repo so two adds of the same repo on this host run one after the
+# other. A SIBLING of MIRRORS_DIR, never inside it: every FILE in MIRRORS_DIR
+# reads as a mirrored repo (the rs-fetch wiring enumerates it), and a dot-prefix
+# would not set a lock apart (`.github` is a legal repo name).
+MIRROR_LOCKS_DIRNAME = "mirror-locks"
+
+
+def mirror_lock_path(repo: str) -> Path:
+    """Derived from MIRRORS_DIR at CALL time (archived pins redirect
+    MIRRORS_DIR, not DEV_DIR — in production its parent IS DEV_DIR), and
+    lower-cased because gitea repo names are case-insensitive: `Hello-World`
+    and `hello-world` are one gitea repo and must share one lock. The name is
+    already validated (no separators, no dot names) by the request parser."""
+    return MIRRORS_DIR.parent / MIRROR_LOCKS_DIRNAME / f"{repo.lower()}.lock"
+
+
+@contextlib.contextmanager
+def _mirror_lock(repo: str):
+    """Hold the per-repo add lock. Two provisions of one NEW repo used to race
+    gitea's create-then-clone window: the second saw the first's in-flight
+    record as an empty stub and deleted it, so both failed. flock, so the kernel
+    releases a dead holder's lock — no stale state, and the file is never
+    removed. The wait is INDEFINITE by design: the holder's own work is already
+    bounded (MIGRATE_TIMEOUT_S for the migrate, API_TIMEOUT_S per other call),
+    so a timeout constant here would only rename a wedged gitea. An OS failure
+    is a GiteaError so callers report it on the channel they already handle."""
+    path = mirror_lock_path(repo)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        raise GiteaError(f"the host lock for mirroring {repo} could not be "
+                         f"opened ({e.strerror or 'I/O error'})") from None
+    except ValueError as e:                 # e.g. an embedded NUL in the name
+        raise GiteaError(f"the host lock for mirroring {repo} could not be "
+                         f"opened ({e})") from None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"waiting for another add of {repo} to finish",
+                  file=sys.stderr, flush=True)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
 
 
 def mirror_present(repo: str) -> bool:
@@ -1068,9 +1119,10 @@ class GiteaClient:
             # An EMPTY repo carries no data, so the stub-heal deletes + re-migrates.
             # Two in-model quirks (converge, harmless): a zero-commit GitHub source
             # stays empty after a SUCCESSFUL migrate, so each re-add re-migrates it;
-            # and a re-run WHILE the first migrate is still cloning server-side sees
-            # empty and restarts from zero — the D2 "re-run heals" posture assumes
-            # the user waits for the prior add to return, not a tight retry loop.
+            # and a re-add after a migrate that OUTRAN MIGRATE_TIMEOUT_S (still
+            # cloning server-side) sees empty and restarts from zero. Concurrent
+            # adds on this host never reach here mid-clone: add_repo serialises
+            # them on the per-repo lock.
             self.delete_repo(ADMIN_USER, repo)
         body = {
             "clone_addr": url,
@@ -1498,14 +1550,18 @@ def add_repo(host_port: str, url: str, repo: str, pat: str | None = None) -> Non
     the box dev path, and an explicit dev attach. Resumable: migrate is
     exists-checked upstream; re-stamping is a no-op. ``pat`` is the per-repo
     GitHub token (private source = bool(pat)); in memory for this call only."""
-    client = GiteaClient(api_base(host_port), read_admin_token())
-    client.migrate_mirror(url, repo, pat)
-    # The mirror's OWN units, set where the mirror is minted. migrate_mirror
-    # early-returns on a healthy existing mirror, so THIS call — not the migrate
-    # — is what heals an already-added mirror's units on a re-add.
-    client.set_repo_features(ADMIN_USER, repo, MIRROR_FEATURES)
-    MIRRORS_DIR.mkdir(parents=True, exist_ok=True)
-    mirror_stamp_path(repo).write_text("")
+    # The whole add runs under the per-repo lock: a second add of the same
+    # repo waits here, then finds the first's finished mirror and takes the
+    # healthy resume path. Adds of different repos stay parallel.
+    with _mirror_lock(repo):
+        client = GiteaClient(api_base(host_port), read_admin_token())
+        client.migrate_mirror(url, repo, pat)
+        # The mirror's OWN units, set where the mirror is minted. migrate_mirror
+        # early-returns on a healthy existing mirror, so THIS call — not the
+        # migrate — is what heals an already-added mirror's units on a re-add.
+        client.set_repo_features(ADMIN_USER, repo, MIRROR_FEATURES)
+        MIRRORS_DIR.mkdir(parents=True, exist_ok=True)
+        mirror_stamp_path(repo).write_text("")
 
 
 # Live mirror reads. Named 'state'/'has' rather than a *_present name: beside
