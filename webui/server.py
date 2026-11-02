@@ -185,24 +185,30 @@ GITEA_UPSTREAM_PORT = 3000
 # never from here, so a removed box or exported port stops proxying at once.
 ORIGIN_PORTS: dict[int, dict] = {}
 
+# The assignments found OUTSIDE the configured range at THIS start
+# ({"port", "project", "service"}, sorted by port): their tabs get a new
+# address with fresh browser-side state, and the Management page names them
+# instead of the range change dropping them in silence. Memory only, never
+# persisted, and never used to pick an upstream — nothing but the notice
+# route reads it, so the identity-only table discipline above is untouched.
+ORIGIN_PORTS_DROPPED: list[dict] = []
+
 
 def _origin_table_load() -> None:
-    """Populate ORIGIN_PORTS from disk (tolerant: missing/invalid file or
-    out-of-range entries → skipped). Called once at startup."""
+    """Populate ORIGIN_PORTS from disk (tolerant: a missing/invalid file or a
+    malformed entry → skipped). Entries outside the configured range are kept
+    OUT of the live table but recorded in ORIGIN_PORTS_DROPPED for the
+    Management notice. Called once at startup; never rewrites the file."""
     ORIGIN_PORTS.clear()
+    ORIGIN_PORTS_DROPPED.clear()
     try:
         data = json.loads(ORIGIN_PORTS_FILE.read_text())
     except (OSError, json.JSONDecodeError):
         return
-    if not isinstance(data, dict):
-        return
-    for k, v in data.items():
-        if (k.isdigit() and ORIGIN_PORT_LO <= int(k) <= ORIGIN_PORT_HI
-                and isinstance(v, dict)
-                and isinstance(v.get("project"), str)
-                and isinstance(v.get("service"), str)):
-            ORIGIN_PORTS[int(k)] = {"project": v["project"],
-                                    "service": v["service"]}
+    kept, dropped = services.partition_origin_table(
+        data, ORIGIN_PORT_LO, ORIGIN_PORT_HI)
+    ORIGIN_PORTS.update(kept)
+    ORIGIN_PORTS_DROPPED[:] = dropped
 
 
 def _origin_table_save() -> None:
@@ -265,6 +271,9 @@ def _origin_ports_free(project: str) -> None:
         del ORIGIN_PORTS[p]
     if stale:
         _origin_table_save()
+    # A destroyed project's moved-address notice is moot.
+    ORIGIN_PORTS_DROPPED[:] = [e for e in ORIGIN_PORTS_DROPPED
+                               if e["project"] != project]
 
 
 def _origin_port_free_one(project: str, service_id: str) -> None:
@@ -299,6 +308,26 @@ def _origin_table_sweep() -> None:
         del ORIGIN_PORTS[p]
     if stale:
         _origin_table_save()
+    # A project destroyed while the webui was down is not reported as moved
+    # (same predicate, same readability gate: an unreadable mount reports
+    # every dropped entry rather than none).
+    ORIGIN_PORTS_DROPPED[:] = [
+        e for e in ORIGIN_PORTS_DROPPED
+        if e["project"] == GITEA_ORIGIN_KEY
+        or _project_workspace(e["project"]) is not None]
+
+
+def _origin_dropped_log() -> None:
+    """One startup warning naming every out-of-range assignment that survived
+    the sweep — called AFTER `_origin_table_sweep`, so the log names exactly
+    what the Management notice lists."""
+    if not ORIGIN_PORTS_DROPPED:
+        return
+    names = ", ".join(f"{e['project']}/{e['service']}@{e['port']}"
+                      for e in ORIGIN_PORTS_DROPPED)
+    log.warning(f"origin ports outside the range {ORIGIN_PORT_LO}-"
+                f"{ORIGIN_PORT_HI}: {names} — these tabs get a new address, "
+                "where their browser-side state starts fresh")
 
 
 class HostKeyValidator(asyncssh.SSHClient):
@@ -1294,6 +1323,39 @@ async def broker_passthrough_handler(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "result": {
         "lo": PASSTHROUGH_PORT_LO, "hi": PASSTHROUGH_PORT_HI,
         "claimed": rows, "ambiguous": ambiguous}})
+
+
+async def broker_origin_dropped_handler(request: web.Request) -> web.Response:
+    """GET /broker/origin-ports/dropped — the tabs whose address fell outside
+    the origin-port range at this webui's start, in the operator's words, for
+    the Management notice. Webui-LOCAL (no broker call), gated by the
+    management session cookie; under /broker/ ON PURPOSE (that cookie is
+    Path=/broker). Raw project/service ids are not returned."""
+    if _broker_session(request) is None:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+    rows = []
+    for e in ORIGIN_PORTS_DROPPED:
+        d = services.describe_origin_entry(e["project"], e["service"],
+                                           GITEA_ORIGIN_KEY)
+        rows.append({"port": e["port"], "where": d["where"],
+                     "what": d["what"]})
+    return web.json_response({"ok": True, "result": {
+        "lo": ORIGIN_PORT_LO, "hi": ORIGIN_PORT_HI, "dropped": rows}})
+
+
+async def broker_origin_dropped_dismiss_handler(
+        request: web.Request) -> web.Response:
+    """POST /broker/origin-ports/dropped/dismiss — clear the moved-address
+    notice (origin-checked, session-gated). Lasts for this webui process
+    only: the list is never persisted."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    if _broker_session(request) is None:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+    ORIGIN_PORTS_DROPPED.clear()
+    return web.json_response({"ok": True})
 
 
 async def broker_dev_handler(request: web.Request) -> web.Response:
@@ -3888,6 +3950,11 @@ def main() -> None:
     # swallowed as actions).
     app.router.add_get("/broker/project/{name}/ports", broker_ports_handler)
     app.router.add_get("/broker/passthrough", broker_passthrough_handler)
+    # The moved-address notice (webui-local; under /broker/ for the cookie path).
+    app.router.add_get("/broker/origin-ports/dropped",
+                       broker_origin_dropped_handler)
+    app.router.add_post("/broker/origin-ports/dropped/dismiss",
+                        broker_origin_dropped_dismiss_handler)
     app.router.add_get("/broker/dev", broker_dev_handler)
     app.router.add_get("/broker/dev/commits", broker_dev_commits_handler)
     app.router.add_get("/broker/dev/repo-status", broker_dev_repo_status_handler)
@@ -3953,6 +4020,7 @@ def main() -> None:
 
     _origin_table_load()
     _origin_table_sweep()
+    _origin_dropped_log()
     _detection_off_load()
     _detection_sweep()
 

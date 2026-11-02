@@ -1309,6 +1309,17 @@ html.mobile .project-rail .rail-separator { cursor: default; }
 .mgmt-header h2 { font-size: 16px; font-weight: 600; }
 .mgmt-toolbar { display: flex; gap: 8px; flex-wrap: wrap; }
 .mgmt-empty { color: var(--fg-muted); font-size: 14px; }
+/* The moved-address notice (Management): tabs whose address fell outside the
+   tab address range at the webui's last start. Amber edge = the warn token. */
+.mgmt-origin-notice {
+    margin: 0 0 16px; padding: 10px 14px; border-radius: 4px; font-size: 13px;
+    background: var(--bg-input); border: 1px solid var(--border);
+    border-left: 3px solid var(--warn-fg); color: var(--fg-muted); max-width: 860px;
+}
+.mgmt-origin-notice[hidden] { display: none; }
+.mgmt-origin-title { font-weight: 600; color: var(--fg-base); margin-bottom: 4px; }
+.mgmt-origin-notice p { margin: 0 0 6px; }
+.mgmt-origin-list { margin: 0 0 8px; padding-left: 18px; }
 
 .mgmt-table { display: flex; flex-direction: column; gap: 1px; }
 .mgmt-row {

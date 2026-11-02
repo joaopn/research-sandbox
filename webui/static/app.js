@@ -2298,6 +2298,8 @@ function renderMgmtTable(view, projects) {
         el("h2", {}, ["Management — host projects (live)"]),
         el("div", { class: "mgmt-toolbar" }, [create, refresh, measure]),
     ]));
+    // Above both branches, so a host with no projects still sees it.
+    appendOriginNotice(view);   // async fill, placeholder appended now
     if (projects.length === 0) {
         view.appendChild(el("div", { class: "mgmt-empty" }, ["No projects on this host."]));
         appendPassthroughSection(view, []);   // async, fire-and-forget; above Infra
@@ -10854,6 +10856,61 @@ function buildPassthroughClaimForm(opts) {
     wrap.appendChild(errEl);
     wrap.appendChild(hint);
     return wrap;
+}
+
+// Management → the moved-address notice: tabs whose browser address fell
+// outside the tab address range at the webui's last start, so they opened on a
+// new address where the browser's saved state for them starts fresh. The
+// placeholder is appended SYNCHRONOUSLY and filled async (section order must
+// not depend on fetch timing, like the sections below). Advisory only: any
+// failure leaves it hidden — the page's own read already routed 401/503, so it
+// never redirects. No CLI is ever mentioned here.
+function appendOriginNotice(view) {
+    const box = el("div", { class: "mgmt-origin-notice" });
+    box.hidden = true;
+    view.appendChild(box);
+    fillOriginNotice(box);
+    return box;
+}
+
+async function fillOriginNotice(box) {
+    let body = null;
+    try {
+        const res = await fetch("/broker/origin-ports/dropped");
+        if (res.status !== 200) return;
+        try { body = await res.json(); } catch (e) { return; }
+    } catch (e) {
+        return;
+    }
+    if (!body || !body.ok || !body.result || !Array.isArray(body.result.dropped)) return;
+    const dropped = body.result.dropped;
+    if (dropped.length === 0) return;
+    const dismiss = el("button", { class: "btn-small" }, ["Dismiss"]);
+    dismiss.onclick = async () => {
+        try {
+            const res = await fetch("/broker/origin-ports/dropped/dismiss", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: "{}",
+            });
+            if (res.status === 200) box.hidden = true;
+        } catch (e) {
+            // Connection failed: leave the notice up so the operator can retry.
+        }
+    };
+    box.appendChild(el("div", { class: "mgmt-origin-title" },
+        ["Some tabs moved to a new address"]));
+    box.appendChild(el("p", {}, [
+        "The range of tab addresses changed, and these tabs' previous ports " +
+        "are outside it. They now open on a new address, where what the " +
+        "browser kept for them (an editor's layout, open files and Recents " +
+        "list, a web app's saved settings) starts fresh. Project files and " +
+        "agent sessions are not affected.",
+    ]));
+    box.appendChild(el("ul", { class: "mgmt-origin-list" }, dropped.map((d) =>
+        el("li", {}, [`${d.where} — ${d.what} (was port ${d.port})`]))));
+    box.appendChild(dismiss);
+    box.hidden = false;
 }
 
 // Management → Pass-through ports: the host-global view — the block, every

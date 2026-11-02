@@ -335,6 +335,54 @@ def opened_detected_ports(origin_entries: list[dict], project: str,
     return sorted(out)
 
 
+def partition_origin_table(data, lo: int, hi: int) -> tuple[dict, list[dict]]:
+    """Split the persisted origin-port table (`{"<port>": {"project",
+    "service"}}`) by the configured range [lo, hi]. Returns `(kept, out_of_range)`:
+    `kept` maps int port → {"project", "service"} for every well-formed entry in
+    range (the webui's live table); `out_of_range` lists every well-formed entry
+    OUTSIDE the range as {"port", "project", "service"}, sorted by port — the
+    assignments a range change took away, which the webui reports instead of
+    dropping in silence. A malformed entry (non-digit key, wrong shape) is in
+    neither: it names no tab the operator could recognise. Non-dict data →
+    `({}, [])`."""
+    kept: dict[int, dict] = {}
+    out_of_range: list[dict] = []
+    if not isinstance(data, dict):
+        return kept, out_of_range
+    for k, v in data.items():
+        if not (isinstance(k, str) and k.isdigit() and isinstance(v, dict)
+                and isinstance(v.get("project"), str)
+                and isinstance(v.get("service"), str)):
+            continue
+        port = int(k)
+        if lo <= port <= hi:
+            kept[port] = {"project": v["project"], "service": v["service"]}
+        else:
+            out_of_range.append({"port": port, "project": v["project"],
+                                 "service": v["service"]})
+    out_of_range.sort(key=lambda e: e["port"])
+    return kept, out_of_range
+
+
+def describe_origin_entry(project: str, service: str, gitea_key: str) -> dict:
+    """An origin-table entry in the operator's words: `{"where", "what"}`.
+    `where` is the project name, or the Development page for the shared-Gitea
+    entry (its project is the sentinel `gitea_key`, which server.py owns).
+    `what` names the tab: a static service by its label (Editor, Reader), a box
+    editor by its box name, an app tab by its port; an unknown id stays as is."""
+    if project == gitea_key:
+        return {"where": "Development page", "what": "Gitea"}
+    if service.startswith(BOX_EDITOR_ID_PREFIX):
+        what = f"{service[len(BOX_EDITOR_ID_PREFIX):]} (box editor)"
+    elif service.startswith(EXPORTED_PORT_ID_PREFIX):
+        what = f"app on port {service[len(EXPORTED_PORT_ID_PREFIX):]}"
+    elif service in SERVICES:
+        what = SERVICES[service]["label"]
+    else:
+        what = service
+    return {"where": project, "what": what}
+
+
 # Pass-through claims (STAGE_PASSTHROUGH_PORTS): a raw-TCP host-port claim
 # surfaced as a LAUNCHER tab — the pane opens https://<host>:<host_port> in a
 # NEW browser tab (encrypted and/or multi-port apps the page-relay tab
