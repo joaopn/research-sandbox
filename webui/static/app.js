@@ -4182,15 +4182,12 @@ function renderDevReposScreen(view, body, result) {
     ]);
     const rows = [];
     for (const r of repos) {
-        // Deduplicated PROJECT names. The payload cannot say more: dev_status
-        // drops the ledger's `box` discriminator, so one project hosting two dev
-        // boxes on a repo contributes three indistinguishable rows. An EMPTY
+        // Deduplicated PROJECT names (devWorkedByProjects says why). An EMPTY
         // list does NOT mean nobody is working the repo — provision_consumer
         // mints a fork with no ledger row at all — so this column is rendered
         // plainly, never as a warning state.
-        const worked = [...new Set(attachments.filter((a) => a && a.repo === r.repo)
-                                              .map((a) => a.project)
-                                              .filter(Boolean))];
+        const worked = devWorkedByProjects(
+            attachments.filter((a) => a && a.repo === r.repo).map((a) => a.project));
         rows.push(devRepoInventoryRow(view, body, r, worked));
     }
     body.appendChild(el("div", { class: "dev-repos-wrap" }, [
@@ -4374,6 +4371,15 @@ function devListShortfall(listed, total, one, many) {
     return "";
 }
 
+// Project names for a repo's "worked by" — deduplicated, first-seen order.
+// The read verbs project the attachment ledger without its `box` field, so a
+// project whose own agent works a repo AND hosts dev boxes on it arrives as
+// one identical entry per consumer; the line names PROJECTS, and a project
+// is either working the repo or not.
+function devWorkedByProjects(names) {
+    return [...new Set((Array.isArray(names) ? names : []).filter(Boolean))];
+}
+
 // Build ONE dev repo's card — shared by the Development Fetch tab (unscoped)
 // and the per-project Fetch pane (scoped). view/body host the review dialog's
 // redirects and error cards (the host page, or the pane container — both work:
@@ -4401,6 +4407,7 @@ const DEV_PR_ROWS_SHOWN = 10;
 const devPrListExpanded = new Set();
 function buildDevRepoCard(view, body, r, attached, opts) {
     const scoped = !!(opts && opts.scoped);
+    const workedBy = devWorkedByProjects(attached);
     const rerender = (opts && opts.rerender)
         || (() => renderDevFetchTab(view, body));
     // The 401 post-login landing must be VIEW-rooted: renderMgmtLogin wipes
@@ -4553,8 +4560,8 @@ function buildDevRepoCard(view, body, r, attached, opts) {
         // the LIVE fork state and fails closed), so a stale page cannot delete.
         const blocker = live.length
             ? `still has a live agent fork (${live.map((f) => f.user).join(", ")})`
-            : (attached.length
-                ? `still worked by ${attached.join(", ")}`
+            : (workedBy.length
+                ? `still worked by ${workedBy.join(", ")}`
                 : "");
         const remove = el("button", {
             class: "btn-small btn-danger",
@@ -4700,9 +4707,9 @@ function buildDevRepoCard(view, body, r, attached, opts) {
     if (branchShort) {
         rows.push(el("div", { class: "dev-pr-meta" }, [branchShort]));
     }
-    if (attached.length) {
+    if (workedBy.length) {
         rows.push(el("div", { class: "dev-pr-meta dev-attached" },
-                     ["worked by: " + attached.join(", ")]));
+                     ["worked by: " + workedBy.join(", ")]));
     }
     // Retired identities, with the purge that frees their names. !scoped for
     // the same reason as Remove and the fork dropdown: a per-project pane must
