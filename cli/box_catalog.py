@@ -112,7 +112,21 @@ _ALLOWED_KEYS = {"name", "image", "agent_default", "clone", "description",
                  "gitea_history",
                  # web: a web app the box runs itself and the webui shows as a
                  # tab — {port, label, start}; built-in presets only.
-                 "web"}
+                 "web",
+                 # feed_skill / ingest_skill: SKILL.md texts folded from the
+                 # sibling <name>.feed-skill.md / <name>.ingest-skill.md. A feed
+                 # skill is offered to every OTHER agent of the project (each
+                 # box, the project agent); an ingest skill is the preset's
+                 # own. Built-in presets only; staged by the box tool.
+                 "feed_skill", "ingest_skill"}
+
+# The skill texts ride the catalog like `instructions` does: a sibling file per
+# key, folded at load, never inline in the JSON. The skill's slash-command name
+# is the `name` of its frontmatter, which is also the folder the box tool
+# writes it under (`<home>/<name>/SKILL.md`) — so it must be a path-safe name
+# and unique across the built-ins (two feeds sharing a name would overwrite
+# each other in every box).
+SKILL_SIDECARS = {"feed_skill": "feed-skill", "ingest_skill": "ingest-skill"}
 
 # The box's own internal service ports (its editor stub and the reader), which
 # a preset's web app may not take. MIRROR of what the box images bind.
@@ -121,6 +135,25 @@ BOX_INTERNAL_PORTS = (8443, 8444)
 
 class BoxCatalogError(Exception):
     pass
+
+
+def skill_name(text: Any) -> str:
+    """The `name:` of a SKILL.md's YAML frontmatter (the block between the
+    file's first line `---` and the next `---`), or "" when the text has no
+    frontmatter or no name there. MIRRORED in cli/rs_sandbox.py (staged
+    standalone; pytest-pinned on the same samples)."""
+    if not isinstance(text, str):
+        return ""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return ""
+    for ln in lines[1:]:
+        if ln.strip() == "---":
+            return ""
+        key, sep, val = ln.partition(":")
+        if sep and key.strip() == "name":
+            return val.strip()
+    return ""
 
 
 def _is_str(v: Any) -> bool:
@@ -309,10 +342,21 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
             out.append(p("web requires a setup (the app is reported ready only "
                          "after the setup ran)"))
 
+    # feed_skill / ingest_skill: a SKILL.md text whose frontmatter names the
+    # skill; the name is a folder the box tool creates, so it is path-safe.
+    for k in SKILL_SIDECARS:
+        if k in m:
+            if not _is_str(m[k]):
+                out.append(p(f"{k} must be a non-empty string"))
+            elif not NAME_RE.match(skill_name(m[k])):
+                out.append(p(f"{k}: the SKILL.md frontmatter must carry a "
+                             f"`name:` matching {NAME_RE.pattern!r}, got "
+                             f"{skill_name(m[k])!r}"))
+
     # The dev lane stays isolated: a dev preset carries none of the new keys.
     if m.get("dev"):
         for k in ("setup", "fields", "mcp_servers", "node", "greeting",
-                  "gitea_history", "web"):
+                  "gitea_history", "web", "feed_skill", "ingest_skill"):
             if k in m:
                 out.append(p(f"dev:true forbids {k!r}"))
 
@@ -359,6 +403,16 @@ def load_builtins(builtin_dir: Path = BUILTIN_DIR) -> dict[str, dict]:
         sidecar = builtin_dir / f"{f.stem}.instructions.md"
         if isinstance(m, dict):
             m["instructions"] = sidecar.read_text() if sidecar.is_file() else ""
+        for key, suffix in SKILL_SIDECARS.items():
+            if isinstance(m, dict) and key in m:
+                raise BoxCatalogError(
+                    f"builtin {f.name}: {key!r} belongs in the sibling "
+                    f"{f.stem}.{suffix}.md, not the JSON")
+            skill_file = builtin_dir / f"{f.stem}.{suffix}.md"
+            # Folded only when the sidecar exists: the validator requires a
+            # non-empty text, and most presets carry no skill at all.
+            if isinstance(m, dict) and skill_file.is_file():
+                m[key] = skill_file.read_text()
         errs = _validate_entry(f.stem, m)
         if errs:
             raise BoxCatalogError(f"builtin {f.name}: " + "; ".join(errs))
@@ -369,6 +423,19 @@ def load_builtins(builtin_dir: Path = BUILTIN_DIR) -> dict[str, dict]:
         if nm in out:
             raise BoxCatalogError(f"duplicate built-in box preset {nm!r}")
         out[nm] = m
+    # One skill name, one text: the box tool writes each skill under its
+    # frontmatter name, so two built-ins whose skills share a name would
+    # overwrite each other in every box.
+    seen: dict[str, str] = {}
+    for nm, m in out.items():
+        for key in SKILL_SIDECARS:
+            if key in m:
+                sn = skill_name(m[key])
+                if sn in seen:
+                    raise BoxCatalogError(
+                        f"builtin {nm}.json: its {key} is named {sn!r}, which "
+                        f"{seen[sn]} already uses; skill names are unique")
+                seen[sn] = f"{nm}.json's skill"
     return out
 
 
@@ -412,6 +479,13 @@ def load_registry(path: Path = REGISTRY_PATH) -> dict[str, dict]:
             raise BoxCatalogError(
                 f"registry: entry {name!r}: web is reserved for the built-in "
                 f"box types")
+        # A skill is text every agent of the project reads as instructions:
+        # built-in types only, like history and the web app.
+        for key in SKILL_SIDECARS:
+            if isinstance(m, dict) and key in m:
+                raise BoxCatalogError(
+                    f"registry: entry {name!r}: {key} is reserved for the "
+                    f"built-in box types")
         out[name] = m
     return out
 

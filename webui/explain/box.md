@@ -50,6 +50,10 @@ Independent of the type:
   (the other boxes', the workers' and the project agent's mailboxes, the role
   services' publications) is readable in it. The mailbox stays when the box is
   removed; a box added later under the same name writes into it again.
+  When the project has an OpenKnowledge box, every other box and the project's
+  own agent have a user-only command `/ok` that writes knowledge-base notes
+  into their mailbox, and the OpenKnowledge box's `/ok-ingest` brings them in;
+  neither runs unasked.
 
 ## Read-only folders
 

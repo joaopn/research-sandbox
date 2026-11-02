@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import errno
 import os
 import re
 import shutil
@@ -214,6 +215,42 @@ MAILBOX_PARAGRAPH = """\
 
 Your mailbox is `/workspace/shared/{name}/`: the one place in the project you write for others. Everything else under `/workspace/shared/` is read-only here — the other agents' mailboxes and the role services' publications. The mailbox is kept when this box is removed.
 """
+# Skills RS stages into the project's agents. A box type may offer a FEED
+# skill to every other agent of the project (each box, the project agent) and
+# carry an INGEST skill of its own; the texts ride the staged catalog
+# (feed_skill / ingest_skill, folded by cli/box_catalog.py), the names are
+# their SKILL.md frontmatter `name:`. The feed skills recorded so far live in
+# .orchestrator/skills.json — names of box types only, never text (the
+# folder is mounted read-only into the webui and the role containers) —
+# written here alone, never cleared: a removed box leaves the feed where it
+# is and a later box of that type writes it again.
+# Resolved from ORCH at every call (a function, not a module constant): the
+# archived pins redirect ORCH to a scratch folder, and a path fixed at import
+# would make every one of them write the operator's real project (measured:
+# the first run of this slice's pins left a skills.json in this dev project).
+SKILLS_JSON_NAME = "skills.json"
+SKILLS_JSON_VERSION = 1
+
+
+def skills_json() -> Path:
+    return ORCH / SKILLS_JSON_NAME
+# The two skills homes an agent reads under its workspace (Claude Code: the
+# first; pi: the second), both reserved at box creation (BOX_RESERVED_DIRS)
+# and present in the project agent's workspace from boot. An ingest skill is
+# for the agent OpenKnowledge's tools are registered with, Claude Code only.
+SKILL_HOMES = (".claude/skills", ".pi/skills")
+INGEST_SKILL_HOMES = (".claude/skills",)
+SKILL_FILE = "SKILL.md"
+# The temp name the writer renames over SKILL_FILE; unlinked before each write
+# (a stale one — left by an interrupted staging or planted — would fail the
+# exclusive create forever) and after a failed rename.
+SKILL_TMP = ".SKILL.md.tmp"
+# Replaced in a feed skill's text at staging by the destination agent's own
+# mailbox path (/workspace/shared/<name>/), so no agent reads a placeholder.
+MAILBOX_PATH_TOKEN = "{{MAILBOX_PATH}}"
+# The project agent's name in the mailbox namespace (its mailbox is
+# shared/agent/, its skills homes are under /workspace itself).
+AGENT_NAME = "agent"
 BOX_IMAGE = "rs-sandbox-box:latest"
 # Browser variant: + @playwright/mcp + Chromium, wired into the box's claude.
 BOX_IMAGE_BROWSER = "rs-sandbox-box-browser:latest"
@@ -315,6 +352,11 @@ rs-sandbox — isolated boxes for running un-vetted code
   rs-sandbox stop <name>      stop a box (keeps its workspace; start to resume)
   rs-sandbox start <name>     (re)start a stopped box from its saved entry
   rs-sandbox discard <name>   stop the box AND wipe its workspace
+  rs-sandbox skills list|stage [--preset TYPE]
+                              the skills RS writes into the agents: a box type's
+                              feed skill goes to every other box and the project
+                              agent, its own ingest skill to its box; stage
+                              (re)writes them (--preset also records a type's feed)
 
 Boxes are auth-free: an agent box still has NO credentials — run `claude` then
 /login inside. Outbound network is the project's router policy (sandbox projects
@@ -716,6 +758,259 @@ def _write_greeting(ws: Path, preset: dict) -> None:
               file=sys.stderr)
 
 
+# --- skills ------------------------------------------------------------------
+
+def _skill_name(text: object) -> str:
+    """The `name:` of a SKILL.md's YAML frontmatter, or "". MIRROR of
+    box_catalog.skill_name (this file is staged standalone); pytest-pinned on
+    the same samples."""
+    if not isinstance(text, str):
+        return ""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return ""
+    for ln in lines[1:]:
+        if ln.strip() == "---":
+            return ""
+        key, sep, val = ln.partition(":")
+        if sep and key.strip() == "name":
+            return val.strip()
+    return ""
+
+
+def load_skills() -> list[str]:
+    """The box types whose feed skill is recorded for this project, in the
+    order they were recorded. Absent or unreadable → none."""
+    try:
+        data = json.loads(skills_json().read_text())
+    except (OSError, ValueError):
+        return []
+    feeds = data.get("feeds") if isinstance(data, dict) else None
+    if not isinstance(feeds, list):
+        return []
+    return [f for f in feeds if isinstance(f, str) and _NAME_RE.match(f)]
+
+
+def save_skills(feeds: list[str]) -> None:
+    ORCH.mkdir(parents=True, exist_ok=True)
+    target = skills_json()
+    tmp = target.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps({"version": SKILLS_JSON_VERSION,
+                               "feeds": list(feeds)}, indent=2) + "\n")
+    tmp.replace(target)
+
+
+def _skill_text(preset_name: str, key: str) -> str:
+    """The skill text a box type carries under `key` in the STAGED catalog —
+    "" when the type is not there (a built-in removed since) or has none.
+    The dict, not resolve_preset: an absent type is a warning here, never a
+    refusal."""
+    text = load_box_catalog().get(preset_name, {}).get(key)
+    return text if isinstance(text, str) else ""
+
+
+def _skill_reason(e: OSError) -> str:
+    """Why a skill write stopped: a component (or the file itself) that is not
+    the plain folder/file RS reserved — a link (ELOOP from O_NOFOLLOW), a file
+    or FIFO (ENOTDIR), a folder at the file's name (EISDIR/EEXIST) — or any
+    other error (permissions, a full disk)."""
+    if e.errno in (errno.ENOTDIR, errno.ELOOP, errno.EISDIR, errno.EEXIST,
+                   errno.ENOTEMPTY):
+        return "not-a-folder"
+    return "unwritable"
+
+
+def _write_skill(ws: Path, home: str, skill: str, text: str) -> str:
+    """Write <ws>/<home>/<skill>/SKILL.md without following anything below
+    <ws>: the root is opened O_DIRECTORY|O_NOFOLLOW, every further component
+    is opened the same way RELATIVE TO ITS PARENT'S DESCRIPTOR (made with
+    mkdir(dir_fd=) when absent), and the file lands as a temp file created
+    O_EXCL|O_NOFOLLOW inside the skill folder's descriptor and renamed over
+    SKILL.md with dir_fds — a rename replaces a planted link, FIFO or file
+    without opening it and fails on a folder. O_NONBLOCK on the directory
+    opens so a FIFO at a component returns at once whatever the kernel's
+    check order. The walk is the check: returns "" when written, else the
+    structured reason (the destination is skipped, never repaired — the
+    owner replaced what RS reserved)."""
+    dflags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+    fds: list[int] = []
+    try:
+        try:
+            fd = os.open(ws, dflags)
+        except OSError as e:
+            return _skill_reason(e)
+        fds.append(fd)
+        for part in (*Path(home).parts, skill):
+            try:
+                nfd = os.open(part, dflags, dir_fd=fd)
+            except FileNotFoundError:
+                try:
+                    try:
+                        os.mkdir(part, 0o755, dir_fd=fd)
+                    except FileExistsError:
+                        pass            # a sibling staging made it meanwhile: open it
+                    nfd = os.open(part, dflags, dir_fd=fd)
+                except OSError as e:
+                    return _skill_reason(e)
+            except OSError as e:
+                return _skill_reason(e)
+            fds.append(nfd)
+            fd = nfd
+        try:
+            try:
+                os.unlink(SKILL_TMP, dir_fd=fd)
+            except FileNotFoundError:
+                pass
+            tfd = os.open(SKILL_TMP,
+                          os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                          0o644, dir_fd=fd)
+            with os.fdopen(tfd, "w") as fh:
+                fh.write(text)
+            os.rename(SKILL_TMP, SKILL_FILE, src_dir_fd=fd, dst_dir_fd=fd)
+        except OSError as e:
+            try:
+                os.unlink(SKILL_TMP, dir_fd=fd)
+            except OSError:
+                pass
+            return _skill_reason(e)
+        return ""
+    finally:
+        for f in fds:
+            os.close(f)
+
+
+def _stage_skill_into(ws: Path, who: str, skill: str, text: str,
+                      homes: tuple[str, ...]) -> list[dict]:
+    """Write one skill into each of an agent's skills homes under `ws`, the
+    token replaced by that agent's mailbox path. One structured warning per
+    (agent, skill) when any home could not take it — data for the host, which
+    builds the operator's line from re-validated names."""
+    text = text.replace(MAILBOX_PATH_TOKEN, f"/workspace/{MAILBOX_ROOT}/{who}/")
+    first = ""
+    for home in homes:
+        reason = _write_skill(ws, home, skill, text)
+        first = first or reason          # every home is tried; one warning
+    if first:
+        return [{"kind": "skill", "skill": skill, "box": who, "reason": first}]
+    return []
+
+
+def _box_workspace(name: str) -> Path:
+    return WORKSPACE / "boxes" / name
+
+
+def _feed_destinations(entries: dict[str, dict],
+                       provider: str) -> list[tuple[Path, str]]:
+    """Every agent a feed skill goes to: each recorded box (the entries, never
+    the boxes/ directory — a discard that kept a workspace leaves a dead folder
+    there) whose type is not the one offering it, agent or not (one rule), and
+    the project agent."""
+    out: list[tuple[Path, str]] = []
+    for name, e in entries.items():
+        if (isinstance(e, dict) and e.get("kind") == KIND
+                and isinstance(name, str) and _NAME_RE.match(name)
+                and e.get("preset") != provider):
+            out.append((_box_workspace(name), name))
+    out.append((WORKSPACE, AGENT_NAME))
+    return out
+
+
+def _stage_feed(provider: str) -> list[dict]:
+    """Record a box type's feed skill for this project and write it into every
+    other box's workspace and the project agent's. Called when a box of a
+    feed-carrying type is created, and by `rs-sandbox skills stage`."""
+    feeds = load_skills()
+    if provider not in feeds:
+        save_skills([*feeds, provider])
+    text = _skill_text(provider, "feed_skill")
+    skill = _skill_name(text)
+    if not text or not _NAME_RE.match(skill):
+        # No destination at all: the warning names the box TYPE (`preset`),
+        # not a skill and not an agent.
+        return [{"kind": "skill", "preset": provider, "reason": "no-text"}]
+    out: list[dict] = []
+    for ws, who in _feed_destinations(load(), provider):
+        out += _stage_skill_into(ws, who, skill, text, SKILL_HOMES)
+    return out
+
+
+def _stage_recorded_feeds(ws: Path, who: str, own_preset: str) -> list[dict]:
+    """The feed skills recorded so far, written into one agent's workspace —
+    never the feed its own box type offers (an OpenKnowledge box does not
+    feed itself)."""
+    out: list[dict] = []
+    for provider in load_skills():
+        if provider == own_preset:
+            continue
+        text = _skill_text(provider, "feed_skill")
+        skill = _skill_name(text)
+        if not text or not _NAME_RE.match(skill):
+            out.append({"kind": "skill", "preset": provider, "box": who,
+                        "reason": "no-text"})
+            continue
+        out += _stage_skill_into(ws, who, skill, text, SKILL_HOMES)
+    return out
+
+
+def _stage_ingest(ws: Path, who: str, preset: dict) -> list[dict]:
+    """A box type's own ingest skill, written into its box's workspace (the
+    Claude Code home only) before the box first runs."""
+    text = preset.get("ingest_skill")
+    if not isinstance(text, str) or not text:
+        return []
+    skill = _skill_name(text)
+    if not _NAME_RE.match(skill):
+        return [{"kind": "skill", "preset": str(preset.get("name") or ""),
+                 "box": who, "reason": "no-text"}]
+    return _stage_skill_into(ws, who, skill, text, INGEST_SKILL_HOMES)
+
+
+def _skills_present(ws: Path) -> dict[str, object]:
+    """{home: [skill names whose SKILL.md is a plain file]} for one workspace
+    (the `skills list` verb). The same descriptor walk as the writer, so a
+    link the owner planted at a home is never followed: that home reads
+    "not-a-folder" instead of a list."""
+    dflags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+    out: dict[str, object] = {}
+    for home in SKILL_HOMES:
+        fds: list[int] = []
+        try:
+            fd = os.open(ws, dflags)
+            fds.append(fd)
+            for part in Path(home).parts:
+                fd = os.open(part, dflags, dir_fd=fd)
+                fds.append(fd)
+            names: list[str] = []
+            for entry in sorted(os.listdir(fd)):
+                # The skill folder is opened like every other component (a
+                # link there is never followed, so a planted link cannot probe
+                # a path outside the workspace through this listing), and only
+                # a name the catalog could have produced is reported.
+                if not _NAME_RE.match(entry):
+                    continue
+                try:
+                    efd = os.open(entry, dflags, dir_fd=fd)
+                except OSError:
+                    continue
+                try:
+                    st = os.stat(SKILL_FILE, dir_fd=efd, follow_symlinks=False)
+                except OSError:
+                    continue
+                finally:
+                    os.close(efd)
+                if stat.S_ISREG(st.st_mode):
+                    names.append(entry)
+            out[home] = names
+        except FileNotFoundError:
+            out[home] = []                     # no such home: nothing there
+        except OSError as e:
+            out[home] = _skill_reason(e) if fds else "unreadable"
+        finally:
+            for f in fds:
+                os.close(f)
+    return out
+
+
 def _compose_setup(preset_setup: str, node: bool, history: bool = False) -> str:
     """The setup text a box runs once per container filesystem: the RS node
     step, then the RS history step, in front of the preset's own setup; a box
@@ -834,9 +1129,27 @@ _MAILBOX_REASON_TEXT = {
 }
 
 
+_SKILL_REASON_TEXT = {
+    "not-a-folder": "something that is not a folder sits where the skill goes in its workspace",
+    "unwritable": "the skill file could not be written in its workspace",
+    "no-text": "the box type offering it is no longer in the catalog",
+}
+
+
 def _warning_text(name: str, w: dict) -> str:
     """Human line for one warning (the in-box CLI's stderr only; the host
     builds its own wording from the structured form)."""
+    if w.get("kind") == "skill":
+        if w.get("reason") == "no-text":
+            who = ("no agent" if "box" not in w else "the project agent"
+                   if w.get("box") == AGENT_NAME else f"box {w.get('box')!r}")
+            return (f"warning: {who} got the feed skill of box type "
+                    f"{w.get('preset')!r} ({_SKILL_REASON_TEXT['no-text']})")
+        who = ("the project agent" if w.get("box") == AGENT_NAME
+               else f"box {w.get('box')!r}")
+        why = _SKILL_REASON_TEXT.get(w.get("reason"), "it could not be written")
+        return (f"warning: {who} did not get the /{w.get('skill')} skill ({why}); "
+                f"`rs-sandbox skills stage` writes it again")
     if w.get("kind") == "history":
         return (f"warning: box {name!r} starts without Gitea history "
                 f"({w.get('reason')})")
@@ -1603,6 +1916,15 @@ def cmd_create(args: argparse.Namespace) -> None:
     # Stage CLAUDE.md + .mcp-proxy.json BEFORE the run (M2: the entrypoint reads
     # them at boot). strict=True → die on an MCP not in the project allowlist.
     _stage_box_workspace(name, preset, mcps, strict=True, base_branch=branch)
+    # The skills this box starts with, written before the run like CLAUDE.md:
+    # its own type's ingest skill (OpenKnowledge's start script copies it into
+    # notes/ after `ok init`, so it must be there before the box first runs)
+    # and every feed skill recorded for the project — never the feed its own
+    # type offers. A destination that is no longer a plain folder is skipped
+    # with a warning; the box runs either way (a skill is optional).
+    skill_warnings = _stage_ingest(_box_workspace(name), name, preset)
+    skill_warnings += _stage_recorded_feeds(_box_workspace(name), name,
+                                            args.preset)
     # Agent model + effort (STAGE_MODEL_SELECT). Explicit flags win; otherwise the
     # project's `box` default from the marker, read verbatim (the host resolved and
     # effort-drop-checked it at create — nothing here can validate). Persisted on
@@ -1655,7 +1977,12 @@ def cmd_create(args: argparse.Namespace) -> None:
                       "gitea_user": args.gitea_user.strip()})
     entries[name] = entry
     save(entries)
-    warnings = _run_box(name, ip, browser=browser, agent=agent, editor=editor,
+    # A box type that offers a feed skill: record it and write it into every
+    # other box and the project agent now (the entry is saved, so this box is
+    # among the entries and excluded by its type).
+    if preset.get("feed_skill"):
+        skill_warnings += _stage_feed(args.preset)
+    warnings = skill_warnings + _run_box(name, ip, browser=browser, agent=agent, editor=editor,
                         editor_port=editor_port,
                         clone_repo=repo if is_clone else "",
                         clone_ref=ref, clone_setup=setup,
@@ -2015,6 +2342,45 @@ def cmd_discard(args: argparse.Namespace) -> None:
         print(f"box {args.name!r}: discarded (mailbox shared/{args.name}/ kept)")
 
 
+def cmd_skills(args: argparse.Namespace) -> None:
+    """`skills list`: the feed skills recorded for this project and where each
+    skill is present. `skills stage [--preset P]`: record P's feed (as adding a
+    box of that type does) and (re)write every recorded feed into every box and
+    the project agent, and each box type's own ingest skill into its box — the
+    repair for a box added at the same moment as the type offering a feed, or
+    a skill file that was lost. A feed is picked up live by a running agent; a
+    box type's own skill reaches a running OpenKnowledge box at its next app
+    start (its start script copies it into notes/). JSON on stdout."""
+    _require_dind_project()
+    entries = load()
+    boxes = {n: e for n, e in entries.items()
+             if isinstance(e, dict) and e.get("kind") == KIND and _NAME_RE.match(n)}
+    if args.action == "list":
+        present = {AGENT_NAME: _skills_present(WORKSPACE)}
+        for n in sorted(boxes):
+            present[n] = _skills_present(_box_workspace(n))
+        print(json.dumps({"feeds": load_skills(), "skills": present}, indent=2))
+        return
+    warnings: list[dict] = []
+    if args.preset:
+        if not _NAME_RE.match(args.preset):
+            die(f"invalid box type name {args.preset!r}")
+        if not _skill_text(args.preset, "feed_skill"):
+            die(f"box type {args.preset!r} offers no feed skill")
+        warnings += _stage_feed(args.preset)
+    for provider in load_skills():
+        if provider != args.preset:
+            warnings += _stage_feed(provider)
+    catalog = load_box_catalog()
+    for n, e in boxes.items():
+        preset = catalog.get(e.get("preset") or "")
+        if isinstance(preset, dict):
+            warnings += _stage_ingest(_box_workspace(n), n, preset)
+    for w in warnings:
+        print(f"rs-sandbox: {_warning_text(w.get('box', ''), w)}", file=sys.stderr)
+    print(json.dumps({"feeds": load_skills(), "warnings": warnings}, indent=2))
+
+
 def cmd_list(args: argparse.Namespace) -> None:
     # Show every sandbox in the project — boxes (kind="sandbox") AND any baked
     # sandbox (e.g. websearcher), so the Management surface sees them all.
@@ -2133,6 +2499,27 @@ def build_parser() -> argparse.ArgumentParser:
     wa.add_argument("name")
     wa.add_argument("address")
     wa.set_defaults(func=cmd_web_address)
+
+    sk = sub.add_parser("skills",
+                        help="the skills RS stages into the project's agents: "
+                             "the feed skills box types offer to every other "
+                             "agent, and a box type's own ingest skill")
+    sks = sk.add_subparsers(dest="action", required=True)
+    skl = sks.add_parser("list", help="the recorded feed skills, and the skills "
+                                      "present in each agent's workspace")
+    skl.set_defaults(func=cmd_skills)
+    sks_st = sks.add_parser(
+        "stage",
+        help="(re)write every recorded feed skill into every box and the "
+             "project agent, and each box type's own skill into its box — "
+             "the repair when a box was added at the same moment as the box "
+             "type offering a feed, or a skill file was lost (a box type's "
+             "own skill reaches a running OpenKnowledge box at its next app "
+             "start)")
+    sks_st.add_argument("--preset", default="",
+                        help="also record this box type's feed skill, as "
+                             "adding a box of that type does")
+    sks_st.set_defaults(func=cmd_skills)
 
     lst = sub.add_parser("list", help="list sandboxes (boxes + baked)")
     lst.add_argument("--json", action="store_true")

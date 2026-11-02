@@ -184,6 +184,16 @@ _BOX_MAILBOX_REASONS = {
     "unreadable": "shared/ in its workspace could not be read; it runs without shared/ until that folder is restored",
     "no-source": "its mailbox folder could not be created in the project's shared/ (something else sits at that name); it runs without shared/ until it can be",
 }
+# The same for a skill the box tool stages into an agent's workspace (kind
+# "skill": the feed skill a box type offers to every other agent, a box type's
+# own ingest skill). The remedy is webui-doable, so the line names it: the
+# skill is written again by the next add of a box whose type offers it.
+_BOX_SKILL_REASONS = {
+    "not-a-folder": "something that is not a folder sits where the skill goes in its workspace; the skill is written again by the next add of a box whose type offers it",
+    "unwritable": "the skill file could not be written in its workspace; the skill is written again by the next add of a box whose type offers it",
+    "no-text": "the box type offering it is no longer in the catalog",
+}
+_BOX_SKILL_REASON_DEFAULT = "it could not be written; the skill is written again by the next add of a box whose type offers it"
 # Every box, worker and the project agent owns a mailbox /workspace/shared/<name>/
 # (the owner writes it, everyone else reads it, it outlives its owner). One
 # namespace, compared case-folded: these names are taken — the project agent's
@@ -317,6 +327,36 @@ def _box_folder_warnings(raw: Any, box: Any) -> list[str]:
                    else None) or ("shared/ in its workspace could not be used; it "
                                   "runs without shared/ until that folder is restored")
             out.append(f"{who} started without its mailbox: {why}")
+            continue
+        if w.get("kind") == "skill":
+            # The destination is the warning's own `box`: the box being added
+            # (its own ingest skill, a recorded feed), another box's name (the
+            # fan-out of a new feed), or "agent" for the project agent.
+            dest = w.get("box")
+            if dest == "agent":
+                to = "the project agent"
+            elif isinstance(dest, str) and _BOX_NAME_RE.match(dest):
+                to = f"box {dest!r}"
+            else:
+                to = "one of the project's agents"
+            reason = w.get("reason")
+            if reason == "no-text":
+                # The feed of a box TYPE could not be written (the type is
+                # gone from the catalog): `preset` names the type, never a
+                # skill; `box` is absent when no destination was reached.
+                preset = w.get("preset")
+                of = (f"box type {preset!r}" if isinstance(preset, str)
+                      and _BOX_NAME_RE.match(preset) else "a box type")
+                head = f"{to} got no feed skill from {of}" if "box" in w \
+                    else f"the feed skill of {of} was written nowhere"
+                out.append(f"{head}: {_BOX_SKILL_REASONS['no-text']}")
+                continue
+            skill = w.get("skill")
+            what = (f"the /{skill} skill" if isinstance(skill, str)
+                    and _BOX_NAME_RE.match(skill) else "one of its skills")
+            why = (_BOX_SKILL_REASONS.get(reason) if isinstance(reason, str)
+                   else None) or _BOX_SKILL_REASON_DEFAULT
+            out.append(f"{to} did not get {what}: {why}")
             continue
         folder = w.get("folder")
         reason = w.get("reason")
