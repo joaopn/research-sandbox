@@ -169,11 +169,31 @@ if [[ -n "${GITEA_TOKEN:-}" && -n "${GITEA_URL:-}" && -n "${REPO_NAME:-}" ]]; th
     git -C "${DEV_REPO_DIR}" fetch upstream --quiet || true
 fi
 
+# --- Setup shell prelude (both setup runners below) ------------------------
+# Every box setup runs in a PLAIN `bash -c`, NEVER a login shell: a login shell
+# rebuilds PATH from /etc/profile and LOSES the image's ENV PATH /opt/conda/bin
+# (pip → exit 127, python3 → the system one; B56 — and this box lineage forks
+# off BEFORE minimal-base's profile.d ~/.local/bin drop-in, so a login shell here
+# has neither conda nor ~/.local/bin). This entrypoint already sourced
+# ~/.rs-box.env above, so a setup inherits the field values AND the full image
+# environment. The prelude, run in the SAME shell as the setup, gives back what a
+# login shell legitimately added: conda's `conda` function (sourced FIRST — a
+# function is not inherited by a child shell, and conda.sh prepends condabin
+# when CONDA_SHLVL is unset) so `conda activate <env>` works, then ~/.local/bin
+# first on PATH so a setup can run a dist launcher or the console script it just
+# installed (pip install --user X && X --init). Its last command always
+# succeeds, so the setup's exit status is its own (set -e below still fails the
+# boot on a failing setup). Single-quoted: $HOME/$PATH expand in the child.
+# MIRRORS rscore.SETUP_SHELL_PRELUDE (the light-path setup harness) byte for
+# byte — a pytest pins the two together.
+_SETUP_PRELUDE='if [ -f /etc/profile.d/conda.sh ]; then . /etc/profile.d/conda.sh; fi; export PATH="$HOME/.local/bin:$PATH"'
+
 # --- BYO clone (byo preset): clone repo@ref + run setup --------------------
 # RS_BOX_CLONE_REPO/REF/SETUP are set only for a `byo` box: clone VISIBLY to
 # /workspace/<repo-name>, pin REF (no drift), run SETUP in the clone (every boot —
 # the container ~ resets on recreate; expected idempotent + cheap). SETUP runs in
-# THIS box shell (the value arrived as host -e argv, never via a host shell).
+# THIS box shell (the value arrived as host -e argv, never via a host shell),
+# behind the setup shell prelude above (plain shell, not a login shell).
 if [[ -n "${RS_BOX_CLONE_REPO:-}" ]]; then
     REPO_DIR="/workspace/$(basename "${RS_BOX_CLONE_REPO%.git}")"
     if [[ ! -d "${REPO_DIR}/.git" ]]; then
@@ -188,7 +208,7 @@ if [[ -n "${RS_BOX_CLONE_REPO:-}" ]]; then
     fi
     if [[ -n "${RS_BOX_CLONE_SETUP:-}" ]]; then
         echo "sandbox-box[${RS_SANDBOX_NAME}]: running setup"
-        ( cd "${REPO_DIR}" && bash -lc "${RS_BOX_CLONE_SETUP}" )
+        ( cd "${REPO_DIR}" && bash -c "${_SETUP_PRELUDE}"$'\n'"${RS_BOX_CLONE_SETUP}" )
     fi
 fi
 
@@ -203,15 +223,9 @@ fi
 # --restart unless-stopped until healed (byo parity — deliberate, not a bug).
 if [[ -n "${RS_BOX_SETUP:-}" && ! -f ~/.rs-box-setup-done ]]; then
     echo "sandbox-box[${RS_SANDBOX_NAME}]: running preset setup"
-    # Plain bash -c, NOT -l: a login shell rebuilds PATH from /etc/profile and
-    # LOSES the image's conda/docker ENV PATH (pip → exit 127; the bare-python3
-    # class — and this box lineage forks off BEFORE minimal-base's profile.d
-    # PATH drop-in, so a login shell here has neither conda nor ~/.local/bin).
-    # This entrypoint already sourced ~/.rs-box.env above, so the setup inherits
-    # the field values AND the full image environment. The ~/.local/bin prepend
-    # lets a setup that installs a console script also RUN it
-    # (pip install --user X && X --init).
-    ( cd /workspace && PATH="$HOME/.local/bin:$PATH" bash -c "${RS_BOX_SETUP}" )
+    # Plain bash -c behind the setup shell prelude (defined above the byo
+    # block): never a login shell, conda function + ~/.local/bin restored.
+    ( cd /workspace && bash -c "${_SETUP_PRELUDE}"$'\n'"${RS_BOX_SETUP}" )
     touch ~/.rs-box-setup-done
 fi
 
