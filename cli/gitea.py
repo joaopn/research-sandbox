@@ -351,7 +351,7 @@ def _gitea_admin(argv: list[str]) -> subprocess.CompletedProcess:
 # stderr the way `rscore.dev_passwd` does — that verb scrubs because ITS secret
 # rides argv into `docker exec`; this one's does not.
 #
-# Four mechanical facts, each measured, each fatal if dropped:
+# Five mechanical facts, each measured, each fatal if dropped:
 #   - `gitea dump` REFUSES to run as root, so the exec is `-u git`.
 #   - the dump takes `--tempdir`; pointed at a per-run `mktemp -d` under a trap,
 #     residue becomes impossible rather than swept. With the default tempdir it
@@ -365,11 +365,21 @@ def _gitea_admin(argv: list[str]) -> subprocess.CompletedProcess:
 #     and 0 WITHOUT it. Without pipefail a `gitea dump` that dies mid-stream is
 #     encrypted as a truncated archive and the export reports success — a silent
 #     corrupt backup, which is the worst outcome this module can produce.
+#   - the trap stops gpg's agent BEFORE removing the tempdir. `gpg --symmetric`
+#     auto-starts a gpg-agent whose sockets live in GNUPGHOME; when the script
+#     ends the agent unlinks its own sockets while busybox `rm -rf` is walking
+#     that directory, `rm` fails on the vanished entry, and under `set -e` that
+#     fails the whole backup (measured on the pinned image: 8 runs in 200; with
+#     `gpgconf --kill gpg-agent` first, 0 in 200). The kill names GNUPGHOME inline
+#     because the trap is armed before the export: a failure in between must not
+#     point gpgconf at $HOME/.gnupg inside the persistent volume. It is
+#     best-effort (`|| :`) so a missing gpgconf or an absent agent never becomes a
+#     failure of its own, and the script's real exit status is left untouched.
 _DUMP_SCRIPT = r"""
 set -eu
 set -o pipefail
 T=$(mktemp -d)
-trap 'rm -rf "$T"' EXIT INT TERM
+trap 'GNUPGHOME="$T/gnupg" gpgconf --kill gpg-agent 2>/dev/null || :; rm -rf "$T"' EXIT INT TERM
 export GNUPGHOME="$T/gnupg"
 mkdir -p "$GNUPGHOME"
 chmod 700 "$GNUPGHOME"
