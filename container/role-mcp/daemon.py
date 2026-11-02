@@ -74,13 +74,17 @@ SPAWN_MCP_CONFIG = Path(os.environ.get("RS_ROLE_SPAWN_MCP_CONFIG",
 SPAWN_SH = Path(os.environ.get("RS_ROLE_SPAWN_SH",
                                 "/opt/role-mcp/spawn.sh"))
 
-# Substrate (B.1-substrate) concurrency cap. Daemon-side counter refuses
-# send_job calls beyond this with a structured `concurrency_limit` tool
-# error — no spawn, no resource waste on calls that wouldn't run. 0
-# disables the cap. Set by _role_mcp_start from the persisted role-mcps.json
-# entry; see Config.default_role_mcp_max_concurrent_calls for size
-# reasoning.
-MAX_CONCURRENT_CALLS = int(os.environ.get("RS_ROLE_MAX_CONCURRENT_CALLS", "0"))
+# Concurrency cap. Daemon-side counter refuses send_job calls beyond this
+# with a structured `concurrency_limit` tool error — no spawn, no resource
+# waste on calls that wouldn't run. An explicit 0 disables the cap. The
+# launcher (_role_mcp_start) always passes the project's chosen value from
+# the persisted role-mcps.json entry; the default here is what a container
+# started any other way gets (a bare `docker run` of a role image, a test
+# fixture), so it must be the same capped value, never uncapped.
+# LOCKSTEP: the default mirrors cli/rscore.py::Config.default_role_mcp_max_concurrent_calls
+# (size reasoning lives there). The two files cannot import each other —
+# the role image bakes no cli/ module — so a pytest pins the pair equal.
+MAX_CONCURRENT_CALLS = int(os.environ.get("RS_ROLE_MAX_CONCURRENT_CALLS", "3"))
 
 # Daemon-side bound on a `mode=sync` send_job, in seconds. 0 = unbounded.
 # Why a bound exists: every call spawns a fresh `claude -p` (~1 min cold

@@ -5469,7 +5469,10 @@ class Config:
         # Non-browser roles (wrangler, echo-mcp) effectively uncapped in
         # practice — their per-call footprint is tiny. Set to 0 to disable
         # the cap entirely. Override per .env or per-role at enable:
-        # `--max-concurrent-calls 6`.
+        # `--max-concurrent-calls 6`. LOCKSTEP: the role daemon carries the
+        # same literal as its own default (container/role-mcp/daemon.py::MAX_CONCURRENT_CALLS)
+        # for a role container started outside _role_mcp_start; a pytest
+        # pins the pair equal.
         self.default_role_mcp_max_concurrent_calls: int = int(
             os.environ.get("DEFAULT_ROLE_MCP_MAX_CONCURRENT_CALLS", "3"))
         self.default_dind: str = os.environ.get("DEFAULT_DIND", "auto")
