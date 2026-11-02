@@ -1560,9 +1560,9 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
                     if (editor and os.path.isdir(EDITOR_DIST_MOUNT)) else [])
     # Node seed mount, only for a box whose entry asks for node AND only when the
     # staged seed is populated: a bare -v on a missing source would make the
-    # inner dockerd create an empty root-owned /opt/node-dist, which a later
-    # on-demand stage would replace — leaving this box mounted on the deleted
-    # folder. Without the mount the setup's node step fails and the box retries
+    # inner dockerd create an empty root-owned /opt/node-dist, and the box's
+    # setup would run against that empty folder before any on-demand stage
+    # filled it. Without the mount the setup's node step fails and the box retries
     # its setup until a restart after the seed is staged.
     node_mount: list[str] = []
     if node:

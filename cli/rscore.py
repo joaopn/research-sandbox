@@ -4217,6 +4217,11 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     # Flag-gated like the agent mount above — a default-off sandbox mounts nothing
     # (lean); --enable code-server + a pulled dist wires it, and the entrypoint
     # dist block cp's it into the box's own ~/.local at first boot.
+    # A re-download REPLACES the host cache directory, so a RUNNING docker box's
+    # mount of it (editor here, node below) reads empty until the box's next
+    # start or recreate, which binds the new directory. Harmless by design: the
+    # box copies from these mounts only at boot (the entrypoint dist block, and
+    # _deploy_node at create/recreate), never while running.
     if is_docker and service_flags.get("code-server") and editor_dist_present():
         docker_args = (docker_args[:-1]
                        + ["-v", f"{EDITOR_DIST_DIR}:{EDITOR_DIST_MOUNT}:ro"]
@@ -8321,34 +8326,67 @@ def _stage_editor_dist(supervisor: str, *, deploy_local: bool = False) -> None:
         _deploy_supervisor_editor(supervisor)
 
 
+# The only directories _stage_dist_tree may empty and refill, each with its own
+# emptying command written out in full: the path a delete runs under is spelled
+# literally in the source, never put together from a value, so nothing a caller
+# passes can reach it. A mount without an entry here is refused.
+_DIST_TREE_EMPTY = {
+    EDITOR_DIST_MOUNT: "find /opt/editor-dist -mindepth 1 -delete",
+    READER_DIST_MOUNT: "find /opt/reader-dist -mindepth 1 -delete",
+    NODE_DIST_MOUNT: "find /opt/node-dist -mindepth 1 -delete",
+}
+
+
 def _stage_dist_tree(supervisor: str, src: Path, mount: str, label: str) -> None:
     """Stream a host dist tree into a RUNNING supervisor as uid-0 — the shared
-    tar-over-stdin core of `_stage_editor_dist` / `_stage_reader_dist`. Mirrors
-    `_stage_agent_dist`'s uid-0 tar stream (the sysbox-uid-shift + docker-cp-nesting
-    dragons; see that helper): build the archive normalized to uid/gid 0 and stream
-    it into the container's `tar -x` via `docker exec -i` stdin (no host temp file,
-    no `docker cp` of a tree we'd then need to chown/rm), extract to `mount`, chown
-    to 1000:1000. `stdout→DEVNULL` so the large stdin write can't deadlock on
-    backpressure. `label` names the dist in the failure message only."""
-    def _root_owned(ti: tarfile.TarInfo) -> tarfile.TarInfo:
-        ti.uid = ti.gid = 0
-        ti.uname = ti.gname = ""
-        return ti
-    extract = (f"rm -rf {mount} && mkdir -p {mount} && "
+    tar-over-stdin core of `_stage_editor_dist` / `_stage_reader_dist` /
+    `_stage_node_dist`. Mirrors `_stage_agent_dist`'s uid-0 tar stream (the
+    sysbox-uid-shift + docker-cp-nesting dragons; see that helper): build the
+    archive normalized to uid/gid 0 and stream it into the container's `tar -x`
+    via `docker exec -i` stdin (no host temp file, no `docker cp` of a tree we'd
+    then need to chown/rm), extract to `mount`, chown to 1000:1000.
+    `stdout→DEVNULL` so the large stdin write can't deadlock on backpressure.
+    `label` names the dist in the failure message only.
+    The restage is IN PLACE: the directory's contents are replaced, the directory
+    itself stays, so every running box that bind-mounts it keeps seeing it (a
+    replaced directory would leave those mounts reading an empty folder).
+    When the container side stops reading early (it exited), the write's broken
+    pipe is caught and the container's own stderr is reported, never a traceback.
+    `mount` must be a key of `_DIST_TREE_EMPTY` (a programming error otherwise)."""
+    empty = _DIST_TREE_EMPTY.get(mount)
+    if empty is None:
+        raise ValueError(f"_stage_dist_tree: {mount!r} is not a dist mount")
+    # In place: the CONTENTS go, the directory stays. Boxes bind-mount this path
+    # (`-v /opt/editor-dist:/opt/editor-dist:ro`, likewise node), and a mount is
+    # pinned to the directory it was made on — `rm -rf` + `mkdir` would leave every
+    # running box reading an empty directory (measured for the agent dist twin).
+    extract = (f"mkdir -p {mount} && {empty} && "
                f"tar -C {mount} -x && chown -R 1000:1000 {mount}")
     proc = subprocess.Popen(
         ["docker", "exec", "-i", "-u", "0", supervisor, "sh", "-c", extract],
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    broken = False
     try:
+        # The try spans the whole `with`: after a broken pipe inside it,
+        # TarFile.__exit__ flushes the stream again and raises a second
+        # BrokenPipeError out of the block (the `_stream_agent_dists` shape).
         with tarfile.open(fileobj=proc.stdin, mode="w|") as tf:   # streaming; symlinks preserved
             for entry in sorted(os.listdir(src)):
                 tf.add(os.path.join(src, entry), arcname=entry, filter=_root_owned)
+    except BrokenPipeError:
+        broken = True
     finally:
         if proc.stdin:
-            proc.stdin.close()
+            try:
+                proc.stdin.close()
+            except BrokenPipeError:
+                broken = True
     _, err = proc.communicate()
+    detail = (err.decode(errors="replace") if err else "").strip()
+    if broken:
+        die(f"staging {label} dist into {supervisor} failed: "
+            f"{detail or 'the container stopped reading the transfer'}")
     if proc.returncode != 0:
-        detail = (err.decode(errors="replace") if err else "").strip()
         die(f"staging {label} dist into {supervisor} failed: "
             f"{detail or 'tar extract returned non-zero'}")
 
@@ -8732,8 +8770,9 @@ def _deploy_node(container: str) -> None:
 def _node_dist_staged_in(container: str) -> bool:
     """True iff the node seed is staged in the supervisor (the populated-seed
     sentinel, `_editor_dist_staged_in`'s twin). Lets box add stage it on demand
-    ONLY when absent: a re-stage replaces the directory, which would leave every
-    running node box mounted on the deleted folder."""
+    ONLY when absent: a re-stage is safe for running node boxes (it refills the
+    directory in place, see `_stage_dist_tree`) but still streams the whole seed,
+    so it is spent only when the seed is missing."""
     return run(["docker", "exec", container, "test", "-e",
                 f"{NODE_DIST_MOUNT}/.local/bin/{_NODE_BIN}"],
                capture_output=True).returncode == 0
@@ -9967,6 +10006,8 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
         pi_pair=_read_pi_pair(workspace_path))
     # Recovered binds minus any prior editor-dist mount (agent-dist + --mount folders
     # pass through); re-derive the editor mount from the new flag (mirrors create).
+    # The recreate is also what re-binds a mount that a re-download orphaned (the
+    # host cache directory is swapped; see the mount comment in create()).
     extra = _without_mount(folder_mounts, EDITOR_DIST_MOUNT)
     if service_flags.get("code-server") and editor_dist_present():
         extra += ["-v", f"{EDITOR_DIST_DIR}:{EDITOR_DIST_MOUNT}:ro"]
@@ -14491,7 +14532,7 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
                 "page, then retry")
     # Node seed on demand (the editor-dist precedent above): a project created or
     # last restarted before node was pulled has no seed staged. Stage it only
-    # when absent — never a re-stage (see _node_dist_staged_in).
+    # when absent — a re-stage would cost a full stream (see _node_dist_staged_in).
     if needs_node and not node_staged:
         progress.step("node", "staging node into the project")
         _stage_node_dist(container)
