@@ -160,12 +160,29 @@ _PROJECT_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_-]*\Z")
 # agreement. The agent enum twin (_BOX_AGENTS) sits below KNOWN_AGENTS.
 _BOX_NAME_RE = re.compile(r"\A[a-z][a-z0-9-]*\Z")
 
-# Read-only folders for boxes (OK_BOX slice 2): a top-level project folder
-# mounted read-only in a box at /mnt/<name>. LOCKSTEP COPY of
-# rs_sandbox._FOLDER_NAME_RE (pytest-pinned equal). The names reach the box
-# runtime's --mount syntax, where "," and "=" carry meaning — hence the closed
-# charset; "." and ".." are refused separately (_valid_box_folder).
+# Read-only folders for boxes: a project folder, given by its path relative to
+# the workspace (`data`, `results/run3`), mounted read-only in a box at
+# /mnt/<path>. Each "/"-separated level matches BOX_FOLDER_NAME_RE — a LOCKSTEP
+# COPY of rs_sandbox._FOLDER_NAME_RE (pytest-pinned equal). The paths reach the
+# box runtime's --mount syntax, where "," and "=" carry meaning — hence the
+# closed charset; "." and ".." levels are refused separately (_valid_box_folder).
 BOX_FOLDER_NAME_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
+# The project's inner Docker resolves a box folder anywhere in the project
+# container and follows a link that appears between RS's check and the box's
+# run. These top-level folders hold what inner containers write (each box's own
+# workspace, each worker's work folder, every mailbox, each role service's
+# state, the MCP proxy's logs), so a path BELOW one of them could be swapped for
+# a link by a less-trusted agent: refused. The folders themselves stay givable
+# (RS creates them; only the project agent and the operator write the top
+# level). Compared case-folded (a case-insensitive projects folder would let
+# `Boxes/…` name `boxes/…`). MIRROR of rs_sandbox.FOLDER_RESERVED_TREES
+# (pytest-pinned equal).
+BOX_FOLDER_RESERVED_TREES = (".orchestrator", ".role-mcps", "boxes", "shared",
+                             "workers")
+# mnt/<folder> is a host folder the project mounted: whoever writes that folder
+# on the host could swap a sub-folder of it for a link, so a box gets the whole
+# mounted folder (or all of mnt/), never a path below one. Compared case-folded.
+BOX_FOLDER_MOUNTED_ROOT = "mnt"
 # Structured box-tool warning reasons → the operator-facing wording. A closed
 # table: an unknown reason gets a generic line, never the tool's own text.
 _BOX_FOLDER_REASONS = {
@@ -217,6 +234,22 @@ def _valid_box_folder(name: object) -> bool:
             and name not in (".", ".."))
 
 
+def _valid_box_folder_path(path: object) -> bool:
+    """A normalised box folder path: one or more valid levels joined by "/",
+    never below a reserved tree or a mounted host folder (mnt/<folder>);
+    reserved names compared case-folded. A reserved folder itself (`shared`
+    included: the way to show a box the workers' output) stays givable."""
+    if not isinstance(path, str):
+        return False
+    parts = path.split("/")
+    if not all(_valid_box_folder(c) for c in parts):
+        return False
+    if parts[0].casefold() == BOX_FOLDER_MOUNTED_ROOT and len(parts) > 2:
+        return False
+    return not (len(parts) > 1
+                and parts[0].casefold() in BOX_FOLDER_RESERVED_TREES)
+
+
 def _coerce_history_flag(raw: Any) -> bool:
     if raw is None:
         return False
@@ -226,25 +259,43 @@ def _coerce_history_flag(raw: Any) -> bool:
 
 
 def _coerce_box_folders(raw: Any) -> tuple[str, ...]:
-    """A request's folder list → sorted unique names (sorted so a reordered
-    request compares equal to a box's record). Refusals echo at most a
-    truncated form of a bad name."""
+    """A request's folder paths → sorted unique normalised paths (a trailing
+    "/" dropped; sorted so a reordered request compares equal to a box's
+    record). Refusals echo at most a truncated form of a bad path."""
     if raw is None:
         return ()
     if not isinstance(raw, (list, tuple)):
-        raise ValidationError("folders must be a list of folder names")
+        raise ValidationError("folders must be a list of folder paths")
+    out = []
     for n in raw:
-        if not _valid_box_folder(n):
-            shown = (n[:64] if isinstance(n, str) else type(n).__name__)
+        shown = (n[:64] if isinstance(n, str) else type(n).__name__)
+        if not isinstance(n, str):
+            raise ValidationError(f"invalid folder path {shown!r}")
+        if n.startswith("/") or n.startswith("~"):
             raise ValidationError(
-                f"invalid folder name {shown!r} (letters, digits, '.', '_' or "
-                f"'-' only)")
-    return tuple(sorted(set(raw)))
+                f"folder path {shown!r} must be relative to the project's "
+                f"workspace (for example data or results/run3)")
+        p = n.rstrip("/")
+        parts = p.split("/")
+        if not p or not all(_valid_box_folder(c) for c in parts):
+            raise ValidationError(
+                f"invalid folder path {shown!r} (names of letters, digits, "
+                f"'.', '_' or '-' joined by '/')")
+        if len(parts) > 1 and parts[0].casefold() in BOX_FOLDER_RESERVED_TREES:
+            raise ValidationError(
+                f"{shown!r} is inside {parts[0]!r}, which other agents write "
+                f"to; only the whole {parts[0]!r} folder can be given")
+        if parts[0].casefold() == BOX_FOLDER_MOUNTED_ROOT and len(parts) > 2:
+            raise ValidationError(
+                f"{shown!r} is inside a mounted host folder; only the whole "
+                f"{(parts[0] + '/' + parts[1])[:64]!r} folder can be given")
+        out.append(p)
+    return tuple(sorted(set(out)))
 
 
 def _box_folder_choices(workspace_path: "Path") -> list[dict]:
-    """The project's top-level folders a box may be given read-only: plain
-    names first, hidden ones after, each {name, usable, reason}. Links and plain
+    """The project's top-level folders, shown as examples under a box's folder
+    field: plain names first, hidden ones after, each {name, usable, reason}. Links and plain
     files are never listed (a link's target resolves differently on the host and
     in the project container); a folder whose name a mount cannot carry is
     listed unusable with the reason. An entry that cannot be read is skipped."""
@@ -281,22 +332,28 @@ def _box_folder_choices_or_note(workspace_path: "Path") -> "tuple[list, str]":
 
 
 def _check_box_folders(workspace_path: "Path", names: "Sequence[str]") -> None:
-    """Refuse a name that is not a real top-level folder right now (the host
-    half of the check; the box tool re-checks at every box run). lstat only —
-    nothing is opened or followed. Wording names only the validated folder,
-    never the error text (it carries the host path)."""
+    """Refuse a path that is not a real folder of the project right now, level
+    by level: every level must be a folder and none a link (the host half of
+    the check; the box tool re-checks every level at every box run). lstat
+    only — nothing is opened or followed. Wording names only the validated
+    path, never the error text (it carries the host path)."""
     for n in names:
-        try:
-            st = os.lstat(workspace_path / n)
-        except FileNotFoundError:
-            raise ValidationError(f"{n!r} is not a folder of this project")
-        except OSError:
-            raise ValidationError(f"folder {n!r} could not be read")
-        if stat.S_ISLNK(st.st_mode):
-            raise ValidationError(
-                f"{n!r} is a link; a box can only be given real folders")
-        if not stat.S_ISDIR(st.st_mode):
-            raise ValidationError(f"{n!r} is not a folder")
+        parts = n.split("/")
+        cur = workspace_path
+        for i, c in enumerate(parts):
+            cur = cur / c
+            here = "/".join(parts[:i + 1])
+            try:
+                st = os.lstat(cur)
+            except FileNotFoundError:
+                raise ValidationError(f"{n!r} is not a folder of this project")
+            except OSError:
+                raise ValidationError(f"folder {n!r} could not be read")
+            if stat.S_ISLNK(st.st_mode):
+                raise ValidationError(
+                    f"{here!r} is a link; a box can only be given real folders")
+            if not stat.S_ISDIR(st.st_mode):
+                raise ValidationError(f"{here!r} is not a folder")
 
 
 def _box_folder_warnings(raw: Any, box: Any) -> list[str]:
@@ -363,7 +420,7 @@ def _box_folder_warnings(raw: Any, box: Any) -> list[str]:
         reason = w.get("reason")
         why = (_BOX_FOLDER_REASONS.get(reason) if isinstance(reason, str)
                else None) or "it could not be given to the box"
-        if _valid_box_folder(folder):
+        if _valid_box_folder_path(folder):
             out.append(f"{who} started without read-only folder {folder!r}: "
                        f"{why}")
         else:
@@ -416,6 +473,30 @@ _OLD_BOX_TOOL_MSG = ("this project's box tool predates read-only folders — "
 # refuses every add: this is the line shown for it.
 _OLD_BOX_TOOL_SHARE_MSG = ("this project's box tool predates file sharing — "
                            "restart the project, then retry")
+
+
+# An older box tool refuses a folder path below the top level with its own
+# exit-1 text (not the usage text above), so a request carrying one asks the
+# tool first: the current tool's help for the folder option shows a nested
+# example (FOLDER_PATHS_HELP_MARKER), an older one's does not.
+_OLD_BOX_TOOL_PATHS_MSG = ("this project's box tool predates folder paths "
+                           "below the top level — restart the project, then "
+                           "retry")
+FOLDER_PATHS_HELP_MARKER = "a,b/c"
+
+
+def _gate_box_tool_folder_paths(container: str, command: str,
+                                folders: "Sequence[str]") -> None:
+    """Refuse a nested folder path that the project's box tool would not take.
+    Only asked when a path has a "/"; an absent tool (research's lazy staging
+    is about to put the current one in) or an unreadable help answers nothing
+    and lets the request through — the tool's own refusal still stands."""
+    if not any("/" in f for f in folders):
+        return
+    r = run(["docker", "exec", container, "rs-sandbox", command, "--help"],
+            capture_output=True)
+    if r.returncode == 0 and FOLDER_PATHS_HELP_MARKER not in (r.stdout or ""):
+        raise ValidationError(_OLD_BOX_TOOL_PATHS_MSG)
 
 
 def _is_old_box_tool(r: "subprocess.CompletedProcess") -> bool:
@@ -1766,9 +1847,10 @@ class BoxAddRequest:
     # run). REJECTED on a dev preset — the agent's own box must not hold the
     # read-all-forks operator token; gated in box_add, which has the catalog.
     fetch: bool = False
-    # Top-level project folders mounted read-only in the box at /mnt/<name>
-    # (sorted, unique). Shape here; the real-folder check is in box_add (host)
-    # and at every box run (the box tool). Rejected on a dev preset.
+    # Project folder paths (relative to the workspace) mounted read-only in the
+    # box at /mnt/<path> (sorted, unique). Shape here; the real-folder check of
+    # every level is in box_add (host) and at every box run (the box tool).
+    # Rejected on a dev preset.
     folders: tuple[str, ...] = ()
     # Keep this box's notes history on the shared Gitea (a gitea_history
     # preset only; gated in box_add, which has the catalog and the Gitea).
@@ -1904,7 +1986,7 @@ class BoxFoldersRequest:
                 "box name must be lowercase, start with a letter, and contain "
                 "only letters, digits, or '-'")
         if not isinstance(kw.get("folders"), (list, tuple)):
-            raise ValidationError("folders must be a list of folder names")
+            raise ValidationError("folders must be a list of folder paths")
         return cls(project=_require_name(kw.get("project")), name=name,
                    folders=_coerce_box_folders(kw.get("folders")))
 
@@ -3293,8 +3375,8 @@ class BoxListResult:
     any row — safe to serialise straight into the broker reply."""
     project: str
     boxes: list[dict]                       # {name, ip, agent, browser, state, dev, folders, share}
-    # The project's top-level folders a box may be given (the box-types read
-    # carries the same list): the ⚙ Box folders section reads both from here.
+    # The project's top-level folders (the box-types read carries the same
+    # list): the ⚙ Box folders section shows them as examples under its field.
     folder_choices: list = field(default_factory=list)
     folder_choices_error: str = ""          # set when the listing failed
 
@@ -3307,8 +3389,8 @@ class BoxPresetsResult:
     project: str
     presets: list[dict]                     # {name,image,agent_default,clone,editor_default,repo,description,source,dev}
     allowed_mcps: list[str]
-    # The project's top-level folders ({name, usable, reason}) — the box
-    # window's Read-only folders group.
+    # The project's top-level folders ({name, usable, reason}) — listed as
+    # examples under the box window's folder field.
     folders: list = field(default_factory=list)
     folders_error: str = ""                 # set when the listing failed
     # Whether this host's Gitea is enabled (the history switch is offered only
@@ -13482,11 +13564,13 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
             parts.append(f"field(s) not declared by this preset: "
                          f"{', '.join(extra)}")
         raise ValidationError("; ".join(parts))
-    # Read-only folders: each must be a real top-level folder right now (after
-    # the dev gate, so dev+folders gets the dev refusal; before every side
-    # effect, so a refusal creates nothing).
+    # Read-only folders: every level of each path must be a real folder right
+    # now, and the project's box tool must take nested paths (after the dev
+    # gate, so dev+folders gets the dev refusal; before every side effect, so
+    # a refusal creates nothing).
     if req.folders:
         _check_box_folders(workspace_path, req.folders)
+        _gate_box_tool_folder_paths(container, "create", req.folders)
     # A box type with its own web app needs a box tool and box image that
     # carry the web-app machinery; both probes run before the history gate
     # (which may start the Gitea), so this refusal starts nothing.
@@ -13857,10 +13941,10 @@ def box_list(req: "BoxListRequest", _progress=None) -> BoxListResult:  # type: i
               "agent": e.get("agent", "none"), "browser": bool(e.get("browser")),
               "state": e.get("state"),
               # Read tolerantly (an older box tool's rows carry neither) and
-              # filtered to valid names (the record is container-writable).
+              # filtered to valid paths (the record is container-writable).
               "dev": bool(e.get("dev")),
               "folders": [f for f in (e.get("folders") or [])
-                          if _valid_box_folder(f)]
+                          if _valid_box_folder_path(f)]
                          if isinstance(e.get("folders"), list) else [],
               # True only for the literal True the box tool reports.
               "share": e.get("share") is True}
@@ -13897,6 +13981,7 @@ def box_folders(req: "BoxFoldersRequest", _progress=None) -> BoxFoldersResult:  
     recorded = ({f for f in raw if isinstance(f, str)}
                 if isinstance(raw, list) else set())
     _check_box_folders(ws, [n for n in req.folders if n not in recorded])
+    _gate_box_tool_folder_paths(container, "folders", req.folders)
     # One argv word (`--set=…`; `--set=` clears): a name may start with "-".
     r = run(["docker", "exec", container, "rs-sandbox", "folders", req.name,
              "--set=" + ",".join(req.folders)], capture_output=True)

@@ -41,9 +41,10 @@ Independent of the type:
   Gitea into a git clone here (read-only; off by default; not on dev boxes).
 - **MCP tools** — wire any of the project's allowed MCP servers into the box's
   agent through the inner proxy.
-- **Read-only folders** — give the box any of the project's top-level folders.
-  A ticked folder appears in the box under `/mnt/<folder>` and cannot be changed
-  from the box — by its agent, by `sudo`, by anything. Nothing is ticked by
+- **Read-only folders** — tick **Add folders** and type the project folders the
+  box should read, comma-separated, as paths in the project (`data`,
+  `results/run3`). Each appears in the box under `/mnt/<path>` and cannot be
+  changed from the box — by its agent, by `sudo`, by anything. None by
   default. Not on dev boxes.
 - **Share files** — off by default (the OpenKnowledge type starts with it
   ticked), and set when the box is created: to change it, remove the box and
@@ -52,9 +53,9 @@ Independent of the type:
   and the other sharing boxes read — and reads, under `/workspace/shared/`,
   the project agent's mailbox and the other sharing boxes' mailboxes,
   including boxes added after it. It never sees the workers' or the role
-  services' output unless you tick `shared` as a read-only folder. A box that
-  does not share has no mailbox and no `/workspace/shared` (only what you tick
-  as read-only folders), and nothing it writes is put where the project agent
+  services' output unless you give it `shared` as a read-only folder. A box
+  that does not share has no mailbox and no `/workspace/shared` (only what you
+  give it as read-only folders), and nothing it writes is put where the project agent
   or the workers look. On the project side a sharing box's mailbox is
   `shared/.boxes/<box>/`; it stays when the box is removed, and a sharing box
   added later under the same name writes into it again. When the project has
@@ -66,25 +67,32 @@ Independent of the type:
 
 ## Read-only folders
 
-The box window lists every top-level folder of the project (plain names first,
-hidden ones after; links and plain files are not offered, a folder whose
-name a mount cannot carry is shown greyed). Ticking `shared` gives the box
-every mailbox and every role service's publication, read-only at
-`/mnt/shared` — the way to show a box the workers' output. Change a box's folders later in the
-project's ⚙ panel under **Box folders**: saving restarts the box fresh, so its
-agent logs in again and its setup runs again; the box's own files are untouched.
+A folder is given by its path in the project, any depth (`data`,
+`results/run3`); the box window lists the project's top-level folders under the
+field as a reminder. Every level of the path must be a real folder — a link or
+a file anywhere along it is refused. Giving `shared` gives the box every
+mailbox and every role service's publication, read-only at `/mnt/shared` — the
+way to show a box the workers' output. Inside `boxes/`, `workers/`, `shared/`,
+`.role-mcps/` and `.orchestrator/` only the whole folder can be given: other
+agents write there, and a folder they could swap for a link would hand the box
+what the link points at. For the same reason a host folder mounted at
+`mnt/<name>` is given whole, never a folder inside it. Change a box's folders
+later in the project's ⚙ panel under **Box folders** (the same comma-separated
+field): saving restarts the box fresh, so its agent logs in again and its setup
+runs again; the box's own files are untouched.
 
-Everything in a ticked folder is readable inside the box, **credentials
+Everything in a given folder is readable inside the box, **credentials
 included**: `workers/` holds a copy of the project's Claude login in each
 worker's folder, `boxes/` holds every box's own files (other boxes'
 notes, clones and configuration), `.orchestrator/` holds the project's wiring, `.creds-stash/`
 holds the login while the project restarts, and a sandbox-dind project's setup
 clone keeps the GitHub token it was cloned with in its git settings.
 
-A ticked folder that is gone when the box starts (deleted, renamed, replaced by
-a link or a file) is skipped: the box starts without it and says so in the
-progress list or the ⚙ panel, and mounts it again at its next restart (a
-project restart, a port change, a folders change) once it is back. Links
+A given folder that is gone when the box starts (deleted, renamed, a level
+replaced by a link or a file) is skipped: the box starts without it and says
+so in the progress list (or in the ⚙ panel when a save there restarts it), and
+mounts it again at its next restart (a project restart, a port change, a
+folders change) once it is back. Links
 between folders: a relative link between two folders the box was given works
 inside the box; an absolute link, or one into a folder it was not given, shows
 as broken.

@@ -182,13 +182,26 @@ _HISTORY_SETUP_STEP = "( RS_HIST_MODE=setup\n" + _HISTORY_SCRIPT + ") || true"
 # The box's greeting, printed by its terminal tab when it opens a session
 # (webui services.box_term_service → greet-and-shell.sh <this path>).
 GREETING_FILE = ".rs-greeting"
-# Read-only folders: a top-level project folder ticked for a box is mounted
-# read-only at FOLDER_MOUNT_ROOT/<name>. MIRROR of rscore.BOX_FOLDER_NAME_RE
-# (pytest-pinned equal; this file cannot import rscore). Names reach the
-# runtime's --mount syntax, where "," and "=" carry meaning, so the charset is
-# closed; "." and ".." are refused separately (valid_folder_name).
+# Read-only folders: a project folder given to a box by its path relative to
+# the workspace (`data`, `results/run3`) is mounted read-only at
+# FOLDER_MOUNT_ROOT/<path>. Each "/"-separated level matches _FOLDER_NAME_RE, a
+# MIRROR of rscore.BOX_FOLDER_NAME_RE (pytest-pinned equal; this file cannot
+# import rscore). Paths reach the runtime's --mount syntax, where "," and "="
+# carry meaning, so the charset is closed; "." and ".." levels are refused
+# separately (valid_folder_name).
 _FOLDER_NAME_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
 FOLDER_MOUNT_ROOT = "/mnt"
+# The top-level folders inner containers write into (box workspaces, worker
+# folders, mailboxes, role-service state, the MCP proxy's logs): the daemon
+# follows a link that appears between the check and the run, so a path below
+# one of them is refused; the folder itself stays givable. Compared
+# case-folded. MIRROR of rscore.BOX_FOLDER_RESERVED_TREES (pytest-pinned equal).
+FOLDER_RESERVED_TREES = (".orchestrator", ".role-mcps", "boxes", "shared",
+                         "workers")
+# A host folder the project mounted (mnt/<folder>) is given whole, never a path
+# below it: whoever writes it on the host could swap a sub-folder for a link.
+# MIRROR of rscore.BOX_FOLDER_MOUNTED_ROOT (pytest-pinned equal).
+FOLDER_MOUNTED_ROOT = "mnt"
 # Mailboxes: every worker and the project agent owns /workspace/shared/<name>/
 # (read-write for the owner, read-only for everyone else, never deleted with its
 # owner). A box has one only when it was created SHARING files with the project
@@ -199,7 +212,7 @@ FOLDER_MOUNT_ROOT = "/mnt"
 # shared/.boxes/ read-only (every other sharing box's mailbox, including boxes
 # shared after it started), the project agent's shared/agent/ read-only, and its
 # own folder read-write on top. Never the workers' or the role services'
-# folders (those reach a box only as the read-only folder `shared`, ticked).
+# folders (those reach a box only as the read-only folder `shared`, given).
 # One name namespace with the workers and the project agent, compared
 # case-folded (worker names may carry upper case, box names may not, and a
 # case-insensitive projects dir would merge "Stats" and "stats").
@@ -357,16 +370,17 @@ rs-sandbox — isolated boxes for running un-vetted code
                               --repo/--ref/--setup seed a byo box from a repo. A dev
                               box takes --repo <name> (an attached gitea repo) and
                               boots with the fork cloned + hardened.
-  rs-sandbox create … --folders=a,b
-                              mount top-level project folders read-only in the
-                              box at /mnt/<folder> (not on a dev box)
+  rs-sandbox create … --folders=a,b/c
+                              mount project folders (paths relative to the
+                              workspace) read-only in the box at /mnt/<path>
+                              (not on a dev box)
   rs-sandbox create … --share | --no-share
                               share files with the project (a mailbox the agent
                               and workers read; reads the agent's and the other
                               sharing boxes' mailboxes). Absent: the box type's
                               default (off unless it says otherwise); set at
                               creation only
-  rs-sandbox folders <name> [--set=a,b]
+  rs-sandbox folders <name> [--set=a,b/c]
                               show or replace a box's read-only folders (a
                               change restarts the box fresh; --set= clears)
   rs-sandbox list [--json]    show boxes (+ any baked extensions) and their state
@@ -1113,15 +1127,40 @@ def valid_folder_name(name: object) -> bool:
             and name not in (".", ".."))
 
 
+def valid_folder_path(path: object) -> bool:
+    """A normalised folder path: valid levels joined by "/", never below a
+    reserved tree or a mounted host folder; reserved names compared case-folded
+    (mirror of rscore._valid_box_folder_path)."""
+    if not isinstance(path, str):
+        return False
+    parts = path.split("/")
+    if not all(valid_folder_name(c) for c in parts):
+        return False
+    if parts[0].casefold() == FOLDER_MOUNTED_ROOT and len(parts) > 2:
+        return False
+    return not (len(parts) > 1 and parts[0].casefold() in FOLDER_RESERVED_TREES)
+
+
 def _parse_folders(raw: str | None) -> list[str]:
-    """A --folders/--set list → sorted unique names, dying on a bad name before
-    any state write. Sorted so a reordered request compares equal to the record."""
-    names = _parse_csv(raw)
-    for n in names:
-        if not valid_folder_name(n):
-            die(f"invalid folder name {n[:64]!r} (letters, digits, '.', '_' "
-                f"or '-' only)")
-    return sorted(set(names))
+    """A --folders/--set list → sorted unique normalised paths (a trailing "/"
+    dropped), dying on a bad path before any state write. Sorted so a
+    reordered request compares equal to the record."""
+    out = []
+    for n in _parse_csv(raw):
+        p = n.rstrip("/")
+        parts = p.split("/")
+        if n.startswith(("/", "~")) or not p \
+                or not all(valid_folder_name(c) for c in parts):
+            die(f"invalid folder path {n[:64]!r} (relative to the workspace; "
+                f"names of letters, digits, '.', '_' or '-' joined by '/')")
+        if len(parts) > 1 and parts[0].casefold() in FOLDER_RESERVED_TREES:
+            die(f"{n[:64]!r} is inside {parts[0]!r}, which other agents write "
+                f"to; only the whole {parts[0]!r} folder can be given")
+        if parts[0].casefold() == FOLDER_MOUNTED_ROOT and len(parts) > 2:
+            die(f"{n[:64]!r} is inside a mounted host folder; only the whole "
+                f"{(parts[0] + '/' + parts[1])[:64]!r} folder can be given")
+        out.append(p)
+    return sorted(set(out))
 
 
 def _entry_history(entry: dict) -> dict | None:
@@ -1153,7 +1192,7 @@ def _entry_web(entry: dict) -> dict | None:
 
 
 def _entry_folders(entry: dict) -> list[str]:
-    """The folder names a box's record carries (never for a dev box: dev boxes
+    """The folder paths a box's record carries (never for a dev box: dev boxes
     take no folders, so a tampered dev entry mounts nothing)."""
     if entry.get("dev"):
         return []
@@ -1161,38 +1200,47 @@ def _entry_folders(entry: dict) -> list[str]:
     return [f for f in raw if isinstance(f, str)] if isinstance(raw, list) else []
 
 
+def _folder_level_problem(name: str) -> str | None:
+    """Why a folder path cannot be mounted right now (a warning reason), or
+    None. Every level is lstat'ed — a link at any level is refused, never
+    followed (the inner daemon would follow it anywhere in this container)."""
+    cur = WORKSPACE
+    for c in name.split("/"):
+        cur = cur / c
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            return "missing"
+        except OSError:
+            return "unreadable"
+        if stat.S_ISLNK(st.st_mode):
+            return "link"
+        if not stat.S_ISDIR(st.st_mode):
+            return "not-a-folder"
+    return None
+
+
 def _folder_mounts(folders: list[str]) -> tuple[list[str], list[str], list[dict]]:
-    """Check each ticked folder NOW and build its read-only mount: (argv, the
-    names kept, warnings). A name that is not a real top-level folder at this
-    moment — gone, a link, a file, unreadable, or a name the pattern refuses —
-    is skipped with a structured warning ({folder, reason}; the folder omitted
-    for a bad name) and never reaches the runtime. lstat, never stat: a link is
-    refused, not followed (its target resolves differently on the host). The
-    mount is --mount, not -v: a source deleted after this check fails the run
-    instead of being re-created empty and root-owned."""
+    """Check each folder NOW and build its read-only mount: (argv, the paths
+    kept, warnings). A path that is not a real folder at this moment — a level
+    gone, a link, a file, unreadable, or a path the rule refuses — is skipped
+    with a structured warning ({folder, reason}; the folder omitted for a bad
+    path) and never reaches the runtime. The mount is --mount, not -v: a source
+    deleted after this check fails the run instead of being re-created empty
+    and root-owned. A parent and its child may both be listed: dockerd applies
+    binds by destination depth."""
     argv: list[str] = []
     kept: list[str] = []
     warnings: list[dict] = []
     for name in folders:
-        if not valid_folder_name(name):
+        if not valid_folder_path(name):
             warnings.append({"kind": "folder", "reason": "bad-name"})
             continue
-        src = WORKSPACE / name
-        try:
-            st = os.lstat(src)
-        except FileNotFoundError:
-            warnings.append({"kind": "folder", "folder": name, "reason": "missing"})
+        problem = _folder_level_problem(name)
+        if problem:
+            warnings.append({"kind": "folder", "folder": name, "reason": problem})
             continue
-        except OSError:
-            warnings.append({"kind": "folder", "folder": name, "reason": "unreadable"})
-            continue
-        if stat.S_ISLNK(st.st_mode):
-            warnings.append({"kind": "folder", "folder": name, "reason": "link"})
-            continue
-        if not stat.S_ISDIR(st.st_mode):
-            warnings.append({"kind": "folder", "folder": name, "reason": "not-a-folder"})
-            continue
-        argv += ["--mount", f"type=bind,source={src},"
+        argv += ["--mount", f"type=bind,source={WORKSPACE / name},"
                             f"target={FOLDER_MOUNT_ROOT}/{name},readonly"]
         kept.append(name)
     return argv, kept, warnings
@@ -1479,7 +1527,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     agent, so there is no argv to inject — it must ride the environment). The
     workspace dir is pre-staged + uid-1000-owned (see _stage_box_workspace) so
     dockerd's auto-create on -v doesn't land it root-owned. ``folders`` → one
-    read-only /mnt/<name> mount per folder that passes its check now; returns
+    read-only /mnt/<path> mount per folder path that passes its check now; returns
     the structured warnings for the ones skipped (data only — never printed
     here: a failed op relays this command's stderr verbatim)."""
     sub = f"boxes/{name}"
@@ -2055,7 +2103,7 @@ def cmd_create(args: argparse.Namespace) -> None:
         # and so the host-side reconciles can find this box.
         entry["fetch"] = True
     if folders:
-        # Every ticked name is kept (sorted): each run re-checks each one, so a
+        # Every given path is kept (sorted): each run re-checks each one, so a
         # folder that is gone now and comes back is mounted again at a restart.
         entry["folders"] = folders
     if share:
@@ -2228,7 +2276,7 @@ def cmd_start(args: argparse.Namespace) -> None:
             print(f"box {args.name!r}: re-run at {entry['ip']} "
                   f"(its read-only folders changed while parked)")
             return
-        # Mounts already match; still say which ticked folders it lacks.
+        # Mounts already match; still say which given folders it lacks.
         _print_warnings(args.name, skipped)
     # The mailbox mounts likewise: a reserved target replaced while parked
     # would fail a plain `docker start` with docker's own text, a box parked
@@ -2594,9 +2642,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--history-repo", default="", dest="history_repo",
                    help="(gitea_history preset) the box's notes repo name")
     c.add_argument("--folders", default="",
-                   help="comma-separated top-level project folders to mount "
-                        "read-only at /mnt/<folder> (pass as --folders=a,b; "
-                        "rejected on a dev preset)")
+                   help="comma-separated project folder paths, relative to the "
+                        "workspace, to mount read-only at /mnt/<path> (pass as "
+                        "--folders=a,b/c; rejected on a dev preset)")
     # Tri-state like --browser: absent (None) takes the box type's
     # share_default; recorded at create, never changed afterwards.
     c.add_argument("--share", action=argparse.BooleanOptionalAction, default=None,
@@ -2613,7 +2661,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="show or replace a box's read-only folders")
     fo.add_argument("name")
     fo.add_argument("--set", default=None,
-                    help="the new comma-separated folder list (--set=a,b; "
+                    help="the new comma-separated folder path list (--set=a,b/c; "
                          "--set= clears); restarts the box fresh when it changes")
     fo.set_defaults(func=cmd_folders)
 

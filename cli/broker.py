@@ -725,13 +725,17 @@ BOX_ADD_WEBUI_FIELDS = frozenset({"project", "name", "preset", "agent", "editor"
                                   # Read-only folders. These name a mount
                                   # SOURCE — the class the host-root boundary
                                   # forbids in general — and are relayable only
-                                  # because the source is confined: a plain
-                                  # top-level name (closed charset, no "/", not
-                                  # "."/".."), mounted from /workspace/<name>
-                                  # INSIDE the project container (a path that
-                                  # container already holds) into its own inner
-                                  # box. The host only lstat()s the entry; no
-                                  # host path is reachable. Rejected on dev.
+                                  # because the source is confined: a path
+                                  # RELATIVE to the workspace (closed-charset
+                                  # levels, no "."/"..", nothing below the
+                                  # trees other agents write or below a
+                                  # mounted host folder), mounted from
+                                  # /workspace/<path> INSIDE the project
+                                  # container by its own inner daemon, every
+                                  # level lstat'ed (no link followed) at add
+                                  # and at each run. The host only lstat()s
+                                  # the levels; no host path is reachable.
+                                  # Rejected on dev.
                                   "folders",
                                   # Keep the box's notes history on the shared
                                   # Gitea (a bool; gitea_history presets only,

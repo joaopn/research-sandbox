@@ -1573,11 +1573,27 @@ html.mobile .project-rail .rail-separator { cursor: default; }
 /* MCP picker checkboxes: undo the .field input/label bleed (width:100%,
    uppercase block label) so the tickbox sits left of its name. */
 .box-settings .config-mcp-picker { display: flex; flex-wrap: wrap; gap: 6px 14px; }
-/* Read-only folders: a folder whose name a mount cannot carry is greyed with
-   its reason; a recorded folder that is gone right now is marked "missing". */
-.box-folder-unusable, .box-folder-missing { opacity: 0.6; }
-.box-folder-reason { color: var(--fg-faint); }
-.project-config-box .box-folder-picker { display: flex; flex-direction: column; margin-top: 6px; }
+/* Read-only folders: the "Add folders" tickbox opens its path field under it
+   (the field inherits the .field input look in the box window). */
+.box-folders-entry { margin-top: 6px; }
+/* The ⚙ Box folders path field: the box window's input look, full width. */
+.project-config-box .config-folders-input {
+    width: 100%;
+    box-sizing: border-box;
+    margin-top: 6px;
+    padding: 6px 8px;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--fg-base);
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 13px;
+}
+.project-config-box .config-folders-input:focus {
+    outline: none;
+    border-color: var(--bg-input-focus-border);
+}
+html.mobile .project-config-box .config-folders-input { font-size: 16px; }
 .project-config-box .config-box-warn { color: var(--warn-fg); }
 .box-settings .mgmt-check {
     display: inline-flex;

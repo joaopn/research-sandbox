@@ -5887,12 +5887,39 @@ function boxShareLine(rows) {
         : "No box here shares files with the project.";
 }
 
-// What a ticked read-only folder means for the operator — shown under the
-// folder checkboxes in the box window and the ⚙ Box folders section.
+// What a box's read-only folder means for the operator — shown under the
+// folder field in the box window and the ⚙ Box folders section.
 const BOX_FOLDERS_HINT =
-    "A ticked folder appears in the box under /mnt/<folder>, read-only. " +
-    "Everything in it can be read inside the box, including any logins or " +
-    "tokens it holds.";
+    "Comma-separated paths relative to the project's workspace, for example " +
+    "data, results/run3. Each appears in the box under /mnt/<path>, " +
+    "read-only. Everything in it can be read inside the box, including any " +
+    "logins or tokens it holds. Give shared to show the box every mailbox " +
+    "and the workers' output. Inside boxes, workers, shared, .role-mcps and " +
+    ".orchestrator (other agents write there) and inside a folder under mnt " +
+    "(a host folder), only the whole folder can be given.";
+
+// A comma-separated folder field → its trimmed, non-empty entries. The server
+// is the gate (it normalises and refuses); this only splits.
+function parseFolderList(text) {
+    return String(text || "").split(",").map((t) => t.trim()).filter((t) => t);
+}
+
+// A courtesy check before the round trip: a folder path is relative. Returns
+// the operator line for the first absolute entry, or null.
+function folderListProblem(paths) {
+    const bad = paths.find((p) => p.startsWith("/") || p.startsWith("~"));
+    return bad ? "Folder paths are relative to the project's workspace (got: " +
+                 bad + ")." : null;
+}
+
+// The project's top-level folders as an example line under a folder field
+// (the server lists them; an unusable name is left out).
+function folderChoicesLine(choices, error) {
+    if (error) return error;
+    const names = (choices || []).filter((c) => c.usable).map((c) => c.name);
+    return names.length ? "Folders at the top of this project: " + names.join(", ")
+                        : "This project has no folders yet.";
+}
 
 // Phase 2 of a start/stop/update op box. Same checklist as mgmtTailOp, plus a
 // "Continue in background" button (and a backdrop click) that closes the box
@@ -7264,7 +7291,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, mountRoots, gitea
         el("div", { class: "hint" }, [
             "Each folder is mounted read-only at /workspace/mnt/<name>/ inside " +
             "the project (its final directory name), visible to the agent, every " +
-            "worker and every role service, and to a box when ticked for it; a " +
+            "worker and every role service, and to a box when given to it; a " +
             "path that does not exist yet is " +
             "created. Paths must lie under one of the mountable roots declared " +
             "on this host: " + mountRoots.join(", ") + ".",
@@ -8139,30 +8166,27 @@ async function mgmtBoxAddDialog(project) {
             ? mcpBoxes.map((b) => el("label", { class: "mgmt-check" }, [b.cb, " " + b.name]))
             : [el("div", { class: "config-empty" }, ["No MCPs allowed for this project yet."])]);
 
-    // Read-only folders: the project's top-level folders as the server lists
-    // them (plain names first, hidden after; links and plain files never
-    // listed; a name a mount cannot carry shown greyed with the reason).
-    // Nothing is ticked by default. Hidden for a dev preset (it takes none).
-    const folderBoxes = [];
-    const folderList = el("div", { class: "config-mcp-picker box-folder-picker" },
-        folderChoices.length
-            ? folderChoices.map((f) => {
-                const cb = el("input", { type: "checkbox" });
-                if (f.usable) folderBoxes.push({ name: f.name, cb });
-                else cb.disabled = true;
-                return el("label", {
-                    class: "mgmt-check" + (f.usable ? "" : " box-folder-unusable"),
-                    title: f.usable ? "" : f.reason,
-                }, [cb, " " + f.name,
-                    ...(f.usable ? [] : [el("span", { class: "box-folder-reason" },
-                                            [" — " + f.reason])])]);
-            })
-            : [el("div", { class: "config-empty" }, [
-                folderChoicesError || "This project has no folders yet."])]);
+    // Read-only folders: one "Add folders" tickbox opening a field of
+    // workspace-relative paths (the server validates and checks every level).
+    // The project's top-level folders are listed under it as examples. Off by
+    // default; hidden for a dev preset (it takes none).
+    const foldersCb = el("input", { type: "checkbox" });
+    const foldersI = el("input", { type: "text", autocomplete: "off",
+                                   placeholder: "data, results/run3" });
+    const foldersEntry = el("div", { class: "box-folders-entry" }, [
+        foldersI,
+        el("div", { class: "hint" }, [BOX_FOLDERS_HINT]),
+        el("div", { class: "hint" }, [folderChoicesLine(folderChoices, folderChoicesError)]),
+    ]);
+    foldersEntry.style.display = "none";
+    foldersCb.onchange = () => {
+        foldersEntry.style.display = foldersCb.checked ? "" : "none";
+        if (foldersCb.checked) foldersI.focus();
+    };
     const foldersGroup = el("div", { class: "box-opt-group" }, [
         el("div", { class: "box-opt-caption" }, ["Read-only folders"]),
-        folderList,
-        el("div", { class: "hint" }, [BOX_FOLDERS_HINT]),
+        el("label", { class: "mgmt-check" }, [foldersCb, " Add folders"]),
+        foldersEntry,
     ]);
 
     // BYO clone fields — shown only for a clone preset.
@@ -8283,7 +8307,10 @@ async function mgmtBoxAddDialog(project) {
         browserCard.classList.toggle("selected", browserCb.checked);
         browserCard.classList.toggle("disabled", isDev);
         // A dev box takes no read-only folders: untick + hide the group.
-        if (isDev) for (const b of folderBoxes) b.cb.checked = false;
+        if (isDev) {
+            foldersCb.checked = false;
+            foldersEntry.style.display = "none";
+        }
         foldersGroup.style.display = isDev ? "none" : "";
         // Show the BYO clone fields only when the preset clones AND the repo isn't
         // baked into the preset (a baked-repo preset like paper-orchestra hides them);
@@ -8375,6 +8402,12 @@ async function mgmtBoxAddDialog(project) {
             if (selectedPreset.clone && repoI.value.trim() && !refI.value.trim()) {
                 return "A repo requires a ref (pin the clone).";
             }
+            if (!selectedPreset.dev && foldersCb.checked) {
+                const paths = parseFolderList(foldersI.value);
+                if (!paths.length) return "Enter at least one folder, or untick \"Add folders\".";
+                const bad = folderListProblem(paths);
+                if (bad) return bad;
+            }
             if (selectedPreset.dev
                     && !devUrlI.value.trim().startsWith("https://github.com/")) {
                 return "A dev box needs a GitHub repo URL (https://github.com/owner/repo).";
@@ -8438,7 +8471,7 @@ async function mgmtBoxAddDialog(project) {
                 // seeded it from the type's default).
                 share: shareCb.checked,
             };
-            const folders = folderBoxes.filter((b) => b.cb.checked).map((b) => b.name);
+            const folders = foldersCb.checked ? parseFolderList(foldersI.value) : [];
             if (folders.length) payload.folders = folders;
             if (historyCb.checked) payload.history = true;
             // Agent is always explicit now (the preset default is pre-selected,
@@ -10706,14 +10739,14 @@ async function fillPassthroughList(view, table) {
     }
 }
 
-// ⚙ Box folders: which top-level project folders a box reads, read-only at
-// /mnt/<folder>. Shown on a dind project that has boxes; dev boxes are not
-// listed (they take none). Reads the boxes list — each box's folders + dev
-// flag, plus the project's folder choices — and saves the whole new set for
-// one box. A recorded folder that is not a usable folder right now stays
-// ticked and marked "missing", so saving another change keeps it (unticking
-// it removes it). Saving restarts the box fresh; an unchanged set does
-// nothing on a running box.
+// ⚙ Box folders: which project folders a box reads, read-only at /mnt/<path>.
+// Shown on a dind project that has boxes; dev boxes are not listed (they take
+// none). Reads the boxes list — each box's folder paths + dev flag, plus the
+// project's top-level folders for the example line — and saves the whole new
+// set for one box from the same comma-separated field the box window uses. A
+// recorded folder that is gone right now stays in the field, so saving
+// another change keeps it (deleting it from the field removes it). Saving
+// restarts the box fresh; an unchanged set does nothing on a running box.
 function appendBoxFoldersSection(box, project, enabled) {
     const isDind = !!(enabled && enabled.supervisor && enabled.supervisor.box_harness);
     const hasBoxes = Object.keys(enabled || {}).some((id) => id.startsWith("box-term-"));
@@ -10748,53 +10781,19 @@ function appendBoxFoldersSection(box, project, enabled) {
         }
         const sel = el("select", { class: "config-port-box" },
                        boxes.map((x) => el("option", { value: x.name }, [x.name])));
-        const list = el("div", { class: "box-folder-picker" });
+        const foldersI = el("input", { type: "text", autocomplete: "off",
+                                       class: "config-folders-input",
+                                       placeholder: "data, results/run3" });
         const status = el("div", { class: "config-hint" });
         const saveBtn = el("button", { class: "btn btn-secondary" }, ["Save"]);
-        let rows = [];    // [{name, cb}] — exactly what Save sends when ticked
         const current = () => boxes.find((x) => x.name === sel.value) || boxes[0];
-        const draw = () => {
-            const recorded = new Set(current().folders || []);
-            const usable = new Set(choices.filter((c) => c.usable).map((c) => c.name));
-            rows = [];
-            const els = [];
-            for (const c of choices) {
-                const cb = el("input", { type: "checkbox" });
-                cb.checked = recorded.has(c.name);
-                if (c.usable) rows.push({ name: c.name, cb });
-                else cb.disabled = true;
-                els.push(el("label", {
-                    class: "config-check" + (c.usable ? "" : " box-folder-unusable"),
-                    title: c.usable ? "" : c.reason,
-                }, [cb, el("span", {}, [c.usable ? c.name : `${c.name} — ${c.reason}`])]));
-            }
-            for (const n of recorded) {
-                if (usable.has(n)) continue;
-                const cb = el("input", { type: "checkbox" });
-                cb.checked = true;
-                rows.push({ name: n, cb });
-                // "missing" only when the listing worked; when it failed, the
-                // folder may well be there — the note below says why.
-                els.push(el("label", {
-                    class: "config-check" + (choicesError ? "" : " box-folder-missing"),
-                    title: choicesError ? "" :
-                        "Not a folder of this project right now — the box starts " +
-                        "without it, and mounts it again at its next restart once " +
-                        "it is back.",
-                }, [cb, el("span", {}, [choicesError ? n : `${n} — missing`])]));
-            }
-            if (choicesError) {
-                els.push(el("div", { class: "config-empty" }, [choicesError]));
-            } else if (!els.length) {
-                els.push(el("div", { class: "config-empty" },
-                            ["This project has no folders yet."]));
-            }
-            list.replaceChildren(...els);
-        };
+        const draw = () => { foldersI.value = (current().folders || []).join(", "); };
         sel.onchange = () => { status.replaceChildren(); draw(); };
         saveBtn.onclick = async () => {
             const cur = current();
-            const folders = rows.filter((r) => r.cb.checked).map((r) => r.name);
+            const folders = parseFolderList(foldersI.value);
+            const bad = folderListProblem(folders);
+            if (bad) { status.replaceChildren(el("div", {}, [bad])); return; }
             saveBtn.disabled = true;
             status.replaceChildren(el("div", {}, ["Saving…"]));
             try {
@@ -10830,12 +10829,13 @@ function appendBoxFoldersSection(box, project, enabled) {
         content.replaceChildren(
             shareLine,
             el("div", { class: "config-box-row" }, [sel, saveBtn]),
-            list,
+            foldersI,
             el("div", { class: "config-hint" }, [
                 BOX_FOLDERS_HINT + " Saving restarts the box fresh: its agent must " +
                 "log in again and its setup (for example OpenKnowledge's install) " +
                 "runs again. Files in the box's own folder are untouched.",
             ]),
+            el("div", { class: "config-hint" }, [folderChoicesLine(choices, choicesError)]),
             status,
         );
     })();

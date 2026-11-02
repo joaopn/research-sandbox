@@ -1059,7 +1059,7 @@ async def broker_box_add_handler(request: web.Request) -> web.Response:
             "repo": body.get("repo"), "ref": body.get("ref"),
             "setup": body.get("setup"), "branch": body.get("branch"),
             "model": body.get("model"), "effort": body.get("effort"),
-            # Read-only folders (a list of top-level folder names) — raw; the
+            # Read-only folders (a list of workspace-relative paths) — raw; the
             # broker request validates the shape, box_add the folders.
             "folders": body.get("folders"),
             # Share files with the project — RAW and TRI-STATE like `browser`
