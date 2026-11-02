@@ -5815,6 +5815,15 @@ function showLifecycleNotice(project, verb, opId, outcome) {
     });
 }
 
+// What every box gets without ticking anything — shown under the name field
+// in the box window. One namespace with the workers: a taken name is refused
+// by the server, a folder that already exists is adopted (kept from a box of
+// that name removed earlier, or made by hand).
+const BOX_MAILBOX_HINT =
+    "The box writes to /workspace/shared/<name>/ (its mailbox, kept when the " +
+    "box is removed; a name that already has one writes into it) and reads " +
+    "every mailbox under /workspace/shared/.";
+
 // What a ticked read-only folder means for the operator — shown under the
 // folder checkboxes in the box window and the ⚙ Box folders section.
 const BOX_FOLDERS_HINT =
@@ -8105,7 +8114,8 @@ async function mgmtBoxAddDialog(project) {
         confirmLabel: "Add box",
         cardClass: "box-add-card",
         body: [
-            el("div", { class: "field" }, [el("label", {}, ["Name (optional)"]), nameI]),
+            el("div", { class: "field" }, [el("label", {}, ["Name (optional)"]), nameI,
+                el("div", { class: "hint" }, [BOX_MAILBOX_HINT])]),
             el("div", { class: "field" }, [
                 el("div", { class: "box-type-label" }, ["Box type", overviewBtn]),
                 el("div", { class: "box-preset-cards" }, cards),
@@ -8257,15 +8267,18 @@ function mgmtBoxRemoveDialog(project, box) {
     const keepCb = el("input", { type: "checkbox" });
     const warn = el("p", {}, [
         `This discards box "${box}" in "${project}" — its container and ` +
-        "workspace are wiped. This cannot be undone.",
+        "workspace are wiped. This cannot be undone. Its mailbox under " +
+        "shared/ stays either way.",
     ]);
     // Toggle the warning copy: preserving artifacts is recoverable, wiping is not.
     keepCb.onchange = () => {
         warn.textContent = keepCb.checked
             ? `This removes box "${box}" in "${project}" — its container is torn ` +
-              "down but its workspace artifacts stay on disk."
+              "down but its workspace artifacts stay on disk. Its mailbox under " +
+              "shared/ stays either way."
             : `This discards box "${box}" in "${project}" — its container and ` +
-              "workspace are wiped. This cannot be undone.";
+              "workspace are wiped. This cannot be undone. Its mailbox under " +
+              "shared/ stays either way.";
     };
     mgmtConfirmThenTail(boxOpView(), {
         title: `Remove box "${box}"`,

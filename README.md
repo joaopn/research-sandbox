@@ -287,7 +287,7 @@ research-sandbox/
 └── external/                     Vendored reference code (not a dependency)
 ```
 
-Per-project workspace at `container_volumes/<proj>/workspace/`: `results/`, `logbook/{pi,supervisor}/`, `workers/<name>/work/`, `plan/`, `staging/`, `mnt/<basename>/`, and `.orchestrator/{role-mcps,mcp-allow}.json` (the per-project registries).
+Per-project workspace at `container_volumes/<proj>/workspace/`: `results/`, `logbook/{pi,supervisor}/`, `workers/<name>/work/`, `boxes/<box>/`, `shared/<name>/` (one mailbox per box, worker and the project agent — read-write for its owner, read-only for everyone else, kept when its owner goes), `plan/`, `staging/`, `mnt/<basename>/`, and `.orchestrator/{role-mcps,mcp-allow}.json` (the per-project registries).
 
 ## ◾ Roadmap
 

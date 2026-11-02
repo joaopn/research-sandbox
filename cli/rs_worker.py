@@ -24,6 +24,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -152,6 +153,55 @@ def container_name(name: str) -> str:
 
 def worker_dir(name: str) -> Path:
     return WORKSPACE / "workers" / name / "work"
+
+
+# Mailboxes: every worker, box and the project agent owns /workspace/shared/<name>/
+# — read-write for the owner, read-only for everyone else (a worker already sees
+# all of shared/ read-only; its own folder is mounted read-write on top), never
+# deleted with its owner. One namespace with the boxes, compared case-folded.
+MAILBOX_ROOT = "shared"
+# MIRROR of rscore's reserved set ("agent" + every role-MCP type name in
+# cli/role_mcp.py ROLE_IPS; pytest-pinned). This tool is baked standalone.
+RESERVED_MAILBOX_NAMES = ("agent", "echo-mcp", "librarian", "websearcher", "wrangler")
+# The worker template's token for the worker's own name (its mailbox path).
+WORKER_NAME_TOKEN = "{{WORKER_NAME}}"
+
+
+def mailbox_dir(name: str) -> Path:
+    return WORKSPACE / MAILBOX_ROOT / name
+
+
+def _mailbox_name_clash(name: str) -> str:
+    """Why this worker name cannot own a mailbox, or "": a reserved name, or
+    a box's name (.orchestrator/extensions.json), compared case-folded. The
+    box tool refuses a worker's name the same way (two gates, one namespace)."""
+    folded = name.casefold()
+    if folded in {r.casefold() for r in RESERVED_MAILBOX_NAMES}:
+        return (f"{name!r} is a reserved name (the project agent's mailbox or a "
+                f"role service's folder under shared/); pick another")
+    try:
+        boxes = json.loads((WORKSPACE / ".orchestrator" / "extensions.json").read_text())
+    except (OSError, ValueError):
+        boxes = {}
+    if isinstance(boxes, dict) and any(
+            isinstance(b, str) and b.casefold() == folded for b in boxes):
+        return (f"{name!r} is a box's name in this project; pick another")
+    return ""
+
+
+def _ensure_mailbox(name: str) -> Path:
+    """The worker's mailbox, created where the owner is before the spawn (a
+    bind source must exist); a folder already there is adopted — the mailbox
+    outlives its worker by design."""
+    for d in (WORKSPACE / MAILBOX_ROOT, mailbox_dir(name)):
+        try:
+            st = os.lstat(d)
+        except FileNotFoundError:
+            os.mkdir(d)
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            raise NotADirectoryError(str(d))
+    return mailbox_dir(name)
 
 
 def staging_link(name: str) -> Path:
@@ -518,14 +568,18 @@ def _stage_workdir(name: str, plan_text: str, fresh: bool) -> Path:
     # Current-session brief, rewritten every spawn.
     (wdir / "task.md").write_text(plan_text.rstrip() + "\n")
 
-    # Worker CLAUDE.md — always rewrite so template edits land on respawn.
+    # Worker CLAUDE.md — always rewrite so template edits land on respawn. The
+    # template names the worker's own mailbox through WORKER_NAME_TOKEN.
     if WORKER_CLAUDE_MD_TEMPLATE.is_file():
-        (wdir / "CLAUDE.md").write_text(WORKER_CLAUDE_MD_TEMPLATE.read_text())
+        (wdir / "CLAUDE.md").write_text(
+            WORKER_CLAUDE_MD_TEMPLATE.read_text().replace(WORKER_NAME_TOKEN, name))
     else:
         (wdir / "CLAUDE.md").write_text(
             "# Analysis Worker\n\nTask in /workspace/task.md. Per-cycle "
             "deliverables in /workspace/outputs/<slug>/. Maintain "
-            "/workspace/research_log.md. Touch /workspace/DONE on shutdown.\n"
+            "/workspace/research_log.md. Touch /workspace/DONE on shutdown. "
+            f"Your mailbox is /workspace/{MAILBOX_ROOT}/{name}/ (read-write; "
+            f"the rest of /workspace/{MAILBOX_ROOT}/ is read-only).\n"
         )
 
     # research_log.md + skeleton reference:
@@ -568,6 +622,9 @@ def _stage_workdir(name: str, plan_text: str, fresh: bool) -> Path:
 def cmd_spawn(args: argparse.Namespace) -> None:
     if not _valid_name(args.name):
         die(f"name must be alphanumeric (plus '-' or '_'): {args.name!r}")
+    clash = _mailbox_name_clash(args.name)
+    if clash:
+        die(clash)
 
     if not ORCH_CREDS.is_file():
         die(
@@ -643,6 +700,15 @@ def cmd_spawn(args: argparse.Namespace) -> None:
     if args.interactive:
         die("--interactive mode is reserved for a later stage; not implemented yet")
 
+    # --- the worker's mailbox: created where the owner is, before any staging
+    #     write (a bind source must exist); a folder already there is adopted,
+    #     anything else at that name refuses the spawn with nothing written ---
+    try:
+        mailbox = _ensure_mailbox(args.name)
+    except OSError:
+        die(f"the mailbox folder shared/{args.name}/ could not be created "
+            f"(something that is not a folder sits at that name)")
+
     # --- stage workdir + canonical plan ---
     wdir = _stage_workdir(args.name, plan_text, fresh=fresh)
 
@@ -682,10 +748,19 @@ def cmd_spawn(args: argparse.Namespace) -> None:
         docker.types.Mount(
             target="/workspace", source=str(wdir), type="bind", read_only=False
         ),
-        # Project shared/ is RO-mounted into every worker by default.
+        # Project shared/ is RO-mounted into every worker by default — every
+        # mailbox and every role's publications, read-only...
         docker.types.Mount(
             target="/workspace/shared", source=str(WORKSPACE / "shared"),
             type="bind", read_only=True,
+        ),
+        # ...and the worker's OWN mailbox read-write on top of it (dockerd
+        # applies mounts by destination depth, so the parent lands first
+        # whatever the order of this list). Created above the spawn.
+        docker.types.Mount(
+            target=f"/workspace/{MAILBOX_ROOT}/{args.name}",
+            source=str(mailbox),
+            type="bind", read_only=False,
         ),
         # So is mnt/ — the host folders mounted at project creation (--mount);
         # the binds inside it ride along (a recursive bind). The supervisor
@@ -1064,6 +1139,7 @@ def cmd_destroy(args: argparse.Namespace) -> None:
         if reg:
             msg.append(f"  cycles accepted: {len(reg.get('cycles', []))}")
         msg.append(f"  results/:  preserved at {results_dir(args.name)}")
+        msg.append(f"  mailbox:   preserved at {mailbox_dir(args.name)}")
         msg.append(f"  registry:  tombstoned; name {args.name!r} will be reserved")
         msg.append("Pass --yes to confirm destruction.")
         die("\n".join(msg))

@@ -37,7 +37,8 @@ Worker names are **project-permanent** once used, including after `rs-worker des
 ## Filesystem conventions
 
 - `/workspace/mnt/<name>/` — host folders mounted read-only at project creation (`--mount`, or the dialog's "Mount folders"), one subfolder per host path (basename → subfolder). Workers and role services see them at the same path; a box only when the PI ticks `mnt` for it. The parent `/workspace/mnt/` itself is just the namespace; the folders live one level down. Never write here.
-- `/workspace/shared/` — what workers read, and what the PI may give a box read-only (a box sees a given folder at `/mnt/<folder>`). Put there what should be shared. A relative link between two folders a box was given resolves inside the box; an absolute link (`/workspace/...`), or one into a folder the box was not given, shows as broken there.
+- `/workspace/shared/<name>/` — the mailbox of the box, worker or agent called `<name>`: its owner writes it, everyone else reads it, and it outlives its owner (a removed box or a destroyed worker leaves its mailbox in place). Every worker and every box sees all of `/workspace/shared/` read-only and its own folder read-write; the role services publish into `/workspace/shared/<role>/` the same way. **Yours is `/workspace/shared/agent/`** — the one place you write for the boxes and the workers; read the others' mailboxes to pick up what they left for you. `shared/` is never offered as a read-only folder for a box (it is mounted into every box already).
+- `/workspace/<folder>` given to a box read-only appears there at `/mnt/<folder>`. A relative link between two folders a box was given resolves inside the box; an absolute link (`/workspace/...`), or one into a folder the box was not given, shows as broken there.
 - `/workspace/plan/draft/<name>.md` — proposal you wrote, **not yet PI-approved**. The only place you ever write a worker's plan. Auto-removed by `rs-worker spawn` once the plan has been promoted to canonical.
 - `/workspace/plan/<name>.md` — canonical plan for live or down workers, reflecting what the worker is currently doing. **Written only by `rs-worker spawn`** (from the file you pass to `--plan`). Never edit by hand: rewriting this file before approval destroys the prior canonical plan with no undo. Archived to `plan/archive/<name>.md` only on `rs-worker destroy`.
 - `/workspace/.workers/<name>.json` — registry entry. Read-only for you. See *Worker registry schema* below.
@@ -62,7 +63,7 @@ The host bind-mount means the PI can browse `/workspace/` with any editor, edit 
 
 Do not read the PI's **box** trees by default. A box is a disposable sandbox container the PI spins up (the floating "Add box" window / the in-supervisor `rs-sandbox` CLI) for running un-vetted code in isolation; its workspace lives at `/workspace/boxes/<name>/`. Read files there only when the PI explicitly references them ("look at what I cloned in the box", "check boxes/scratch/out.csv") or asks you to. Never include box content in worker plans or `task.md` files — workers are isolated from the PI's exploration state by design.
 
-Boxes are the PI's; you do not start, stop, or drive them, and nothing of yours flows into a box.
+Boxes are the PI's; you do not start, stop, or drive them. What flows into a box is `/workspace/shared/` (your mailbox and the others', read-only there) and the read-only folders the PI ticks; nothing else of yours does, and a box's own mailbox `/workspace/shared/<box>/` is what flows back.
 
 ## Project inventory (workers)
 

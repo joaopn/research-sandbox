@@ -188,6 +188,32 @@ GREETING_FILE = ".rs-greeting"
 # closed; "." and ".." are refused separately (valid_folder_name).
 _FOLDER_NAME_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
 FOLDER_MOUNT_ROOT = "/mnt"
+# Mailboxes: every box, worker and the project agent owns /workspace/shared/<name>/
+# (read-write for the owner, read-only for everyone else, never deleted with its
+# owner). A box gets the whole of shared/ read-only at /workspace/shared and its
+# own folder read-write on top. One namespace with the workers and the project
+# agent, compared case-folded (worker names may carry upper case, box names may
+# not, and a case-insensitive projects dir would merge "Stats" and "stats").
+MAILBOX_ROOT = "shared"
+# MIRROR of rscore's reserved set ("agent" + every role-MCP type name in
+# cli/role_mcp.py ROLE_IPS; pytest-pinned): a role publishes into shared/<role>/
+# already, and "agent" is the project agent's own mailbox. rs-sandbox is staged
+# standalone, so it cannot import either module.
+RESERVED_MAILBOX_NAMES = ("agent", "echo-mcp", "librarian", "websearcher", "wrangler")
+# The paths RS reserves inside a box workspace at creation, before the first
+# run: the mailbox mount target and the two skills homes an agent reads (a skill
+# staged later is picked up live). Created with lstat + mkdir only when absent;
+# a later non-folder at one of them is the box's own damage to a reserved folder
+# and is skipped with a warning at the next run, never repaired.
+BOX_RESERVED_DIRS = (MAILBOX_ROOT, ".claude/skills", ".pi/skills")
+# Appended after the preset's instructions when the box's CLAUDE.md is first
+# written (every preset, the agent-less `empty` included — the mailbox exists
+# for every box). No preset file carries it; {name} is the box's name.
+MAILBOX_PARAGRAPH = """\
+## Mailbox
+
+Your mailbox is `/workspace/shared/{name}/`: the one place in the project you write for others. Everything else under `/workspace/shared/` is read-only here — the other agents' mailboxes and the role services' publications. The mailbox is kept when this box is removed.
+"""
 BOX_IMAGE = "rs-sandbox-box:latest"
 # Browser variant: + @playwright/mcp + Chromium, wired into the box's claude.
 BOX_IMAGE_BROWSER = "rs-sandbox-box-browser:latest"
@@ -438,7 +464,9 @@ WEB_SET_TIMEOUT_S = WEB_READY_WAIT_S + WEB_PROBE_TIMEOUT_S + WEB_SET_MARGIN_S
 def auto_name(entries: dict[str, dict]) -> str:
     used = {int(m.group(1)) for n in entries if (m := _AUTO_RE.match(n))}
     i = 1
-    while i in used:
+    # Skip a number a worker took (`box-1` as a worker name, live or
+    # tombstoned): an auto-named box must never die with "pick another".
+    while i in used or _name_clashes(f"box-{i}"):
         i += 1
     return f"box-{i}"
 
@@ -511,6 +539,112 @@ def _build_proxy_mcps(mcps: list[str], *, strict: bool) -> dict:
     return servers
 
 
+def _reserve_box_paths(ws: Path) -> None:
+    """Create the paths RS reserves inside a box workspace (BOX_RESERVED_DIRS)
+    where nothing sits yet: lstat, then mkdir only when absent — mkdir never
+    follows the final component, and an existing object of any kind is left
+    exactly as it is (the check at run time decides what to do about it).
+    Parents are created the same way, one component at a time."""
+    for rel in BOX_RESERVED_DIRS:
+        cur = ws
+        for part in Path(rel).parts:
+            cur = cur / part
+            try:
+                st = os.lstat(cur)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(cur)
+                except OSError as e:
+                    print(f"rs-sandbox: warning: could not reserve {cur}: {e}",
+                          file=sys.stderr)
+                    break
+                continue
+            except OSError:
+                break
+            if not stat.S_ISDIR(st.st_mode):
+                # A link, file or FIFO where RS reserved a folder: the box's
+                # own doing. Stop here — lstat and mkdir resolve every
+                # INTERMEDIATE component, so walking on would create through
+                # a planted link. The run-time check reports the target.
+                break
+
+
+def _ensure_mailbox(name: str) -> Path:
+    """The box's mailbox, /workspace/shared/<name>/, created where the owner
+    is (as this uid) before the box first runs — a bind source must exist. A
+    folder already there is adopted (the operator made it, or a box of this
+    name existed before: the mailbox outlives its box by design)."""
+    root = WORKSPACE / MAILBOX_ROOT
+    box = root / name
+    for d in (root, box):
+        try:
+            st = os.lstat(d)
+        except FileNotFoundError:
+            os.mkdir(d)
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            # A file or a link of that name in the project's shared/: a bind
+            # from it would fail or follow; never replaced here.
+            raise NotADirectoryError(str(d))
+    return box
+
+
+def _mailbox_mounts(name: str, ws: Path) -> tuple[list[str], list[dict]]:
+    """The two mailbox mounts for a box run — all of shared/ read-only at
+    /workspace/shared, the box's own shared/<name>/ read-write on top (dockerd
+    applies mounts by destination depth, so the parent lands first whatever
+    the argv order) — or no mounts plus a structured warning when the reserved
+    mount target inside the box workspace is no longer a plain folder: a link,
+    a file or a FIFO there is the box's own doing (RS created the folder before
+    the first run), and a bind onto it would fail the run or follow the link.
+    lstat only, never followed, never repaired."""
+    target = ws / MAILBOX_ROOT
+    try:
+        st = os.lstat(target)
+    except FileNotFoundError:
+        # Reserved at creation and re-reserved by the caller; absent here means
+        # the mkdir failed — start without the mailbox and say so.
+        return [], [{"kind": "mailbox", "reason": "missing"}]
+    except OSError:
+        return [], [{"kind": "mailbox", "reason": "unreadable"}]
+    if stat.S_ISLNK(st.st_mode):
+        return [], [{"kind": "mailbox", "reason": "link"}]
+    if not stat.S_ISDIR(st.st_mode):
+        return [], [{"kind": "mailbox", "reason": "not-a-folder"}]
+    try:
+        box = _ensure_mailbox(name)
+    except OSError:
+        # The project-side source (shared/<name>/) could not be made or is
+        # not a folder: the box runs without its mailbox and says so.
+        return [], [{"kind": "mailbox", "reason": "no-source"}]
+    return ["--mount", f"type=bind,source={WORKSPACE / MAILBOX_ROOT},"
+                       f"target=/workspace/{MAILBOX_ROOT},readonly",
+            "--mount", f"type=bind,source={box},"
+                       f"target=/workspace/{MAILBOX_ROOT}/{name}"], []
+
+
+def _name_clashes(name: str) -> str:
+    """Why this box name cannot own a mailbox, or "" — the in-supervisor half
+    of the two-gate lockstep with rscore.box_add: a reserved name (the project
+    agent's `agent`, a role service's publish folder) or a worker's name, live
+    or tombstoned (.workers/*.json, worker names are project-permanent), each
+    compared case-folded."""
+    folded = name.casefold()
+    if folded in {r.casefold() for r in RESERVED_MAILBOX_NAMES}:
+        return (f"{name!r} is a reserved name (the project agent's mailbox or "
+                f"a role service's folder under shared/); pick another")
+    reg = WORKSPACE / ".workers"
+    try:
+        stems = [p.stem for p in reg.iterdir() if p.suffix == ".json"]
+    except OSError:
+        stems = []
+    for w in stems:
+        if w.casefold() == folded:
+            return (f"{name!r} is a worker's name in this project (workers keep "
+                    f"their names for good); pick another")
+    return ""
+
+
 def _stage_box_workspace(name: str, preset: dict, mcps: list[str],
                          *, strict: bool, base_branch: str = "") -> None:
     """Write the box's CLAUDE.md (instructions) + .mcp-proxy.json (the stable
@@ -530,8 +664,13 @@ def _stage_box_workspace(name: str, preset: dict, mcps: list[str],
     if base_branch:
         instr = instr.replace(BASE_BRANCH_TOKEN, base_branch)
     claude_md = ws / "CLAUDE.md"
-    if instr and not claude_md.exists():
-        claude_md.write_text(instr + "\n")
+    if not claude_md.exists():
+        # The preset's text, then the generic Mailbox paragraph (after the
+        # preset's own closing block; no preset file carries it). Written for
+        # every preset: the mailbox exists whether or not the box runs an agent.
+        claude_md.write_text((instr + "\n\n" if instr else "")
+                             + MAILBOX_PARAGRAPH.format(name=name))
+    _reserve_box_paths(ws)
     # bypassPermissions for the box editor's in-IDE claude — the VS Code Claude
     # extension reads PROJECT settings from the open folder's .claude/, not just
     # ~/.claude. No hooks (the box is the security boundary); no-clobber.
@@ -601,6 +740,12 @@ def _parse_folders(raw: str | None) -> list[str]:
         if not valid_folder_name(n):
             die(f"invalid folder name {n[:64]!r} (letters, digits, '.', '_' "
                 f"or '-' only)")
+        if n == MAILBOX_ROOT:
+            # Every box already sees shared/ read-only at /workspace/shared (the
+            # mailbox mount); offering it as a read-only folder too would mount
+            # it twice. The picker never lists it; a stale client's name is refused.
+            die(f"{MAILBOX_ROOT!r} is already visible in every box at "
+                f"/workspace/{MAILBOX_ROOT}; it cannot be a read-only folder")
     return sorted(set(names))
 
 
@@ -678,12 +823,26 @@ def _folder_mounts(folders: list[str]) -> tuple[list[str], list[str], list[dict]
     return argv, kept, warnings
 
 
+# Mailbox warning reasons → the in-supervisor stderr wording (the host renders
+# its own table from the structured reason; this one never reaches a browser).
+_MAILBOX_REASON_TEXT = {
+    "missing": "the reserved shared/ folder in its workspace could not be created",
+    "link": "shared/ inside its workspace is a link now",
+    "not-a-folder": "shared/ inside its workspace is no longer a folder",
+    "unreadable": "shared/ inside its workspace could not be read",
+    "no-source": "its mailbox folder could not be created in the project's shared/",
+}
+
+
 def _warning_text(name: str, w: dict) -> str:
     """Human line for one warning (the in-box CLI's stderr only; the host
     builds its own wording from the structured form)."""
     if w.get("kind") == "history":
         return (f"warning: box {name!r} starts without Gitea history "
                 f"({w.get('reason')})")
+    if w.get("kind") == "mailbox":
+        why = _MAILBOX_REASON_TEXT.get(w.get("reason"), "its mailbox could not be mounted")
+        return f"warning: box {name!r} starts without its mailbox mount ({why})"
     folder = w.get("folder")
     what = f"folder {folder!r}" if folder else "a folder with an invalid name"
     return (f"warning: box {name!r} starts without read-only {what} "
@@ -974,6 +1133,10 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     # byte-identical to a folder-less run.
     folder_mounts, _kept, folder_warnings = (
         _folder_mounts(folders) if (folders and not dev) else ([], [], []))
+    # The mailbox, every box (dev boxes too): re-reserve what is absent, then
+    # check the mount target and build the two mounts (skip + warn otherwise).
+    _reserve_box_paths(WORKSPACE / sub)
+    mailbox_mounts, mailbox_warnings = _mailbox_mounts(name, WORKSPACE / sub)
     # Publish the box's code-server stub (8443) onto the supervisor netns at
     # editor_port so the webui can reach it at rs-project-<proj>:<editor_port>.
     editor_publish = (["-p", f"{editor_port}:8443"]
@@ -1082,6 +1245,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         *editor_mount,
         *node_mount,
         *folder_mounts,
+        *mailbox_mounts,
         *editor_publish,
         *loopback_publish,
         "-e", f"RS_SERVICE_CODE_SERVER={'enabled' if editor else 'disabled'}",
@@ -1150,7 +1314,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         _install_repo_watch(cname)
     # F3 Slice 2b: launch the in-box loopback forwarders for the freshly-run box.
     _launch_box_forwarders(cname, lp_list)
-    return folder_warnings + history_warnings
+    return folder_warnings + mailbox_warnings + history_warnings
 
 
 def _launch_box_forwarders(cname: str, loopback_ports: list[dict]) -> None:
@@ -1254,6 +1418,12 @@ def cmd_create(args: argparse.Namespace) -> None:
         die(f"invalid box name {name!r} (must match {_NAME_RE.pattern})")
     elif name in entries:
         die(f"sandbox {name!r} already exists; discard it or pick another name")
+    # One mailbox namespace with the workers and the project agent (the host
+    # box_add gates an explicit name the same way; an auto-named box is gated
+    # only here). Before any state write.
+    clash = _name_clashes(name)
+    if clash:
+        die(clash)
     preset = resolve_preset(args.preset)
     is_clone = bool(preset.get("clone"))
     is_dev = bool(preset.get("dev"))
@@ -1419,6 +1589,17 @@ def cmd_create(args: argparse.Namespace) -> None:
         ip = allocate_ip(entries)
     # A box editor publishes onto a per-box supervisor-netns port (0 = no editor).
     editor_port = allocate_editor_port(entries) if editor else 0
+    # The last refusal before any write: an MCP outside the project allowlist
+    # (the staging below recomputes this; it is pure).
+    _build_proxy_mcps(mcps, strict=True)
+    # The mailbox is created where the owner is, before the first run (a bind
+    # source must exist); an existing folder of that name is adopted. Before
+    # the workspace staging, so a refusal here creates nothing.
+    try:
+        _ensure_mailbox(name)
+    except OSError:
+        die(f"the mailbox folder shared/{name}/ could not be created in this "
+            f"project (something that is not a folder sits at that name)")
     # Stage CLAUDE.md + .mcp-proxy.json BEFORE the run (M2: the entrypoint reads
     # them at boot). strict=True → die on an MCP not in the project allowlist.
     _stage_box_workspace(name, preset, mcps, strict=True, base_branch=branch)
@@ -1614,6 +1795,22 @@ def cmd_start(args: argparse.Namespace) -> None:
             return
         # Mounts already match; still say which ticked folders it lacks.
         _print_warnings(args.name, skipped)
+    # The mailbox mounts likewise: a reserved target replaced while parked
+    # would fail a plain `docker start` with docker's own text, and a box
+    # parked without its mailbox whose folder is back would start without it.
+    if exists:
+        ws = WORKSPACE / f"boxes/{args.name}"
+        ws.mkdir(parents=True, exist_ok=True)   # as every run does, before reserving
+        _reserve_box_paths(ws)
+        m_argv, m_warnings = _mailbox_mounts(args.name, ws)
+        want_m = {f"/workspace/{MAILBOX_ROOT}": "ro",
+                  f"/workspace/{MAILBOX_ROOT}/{args.name}": "rw"} if m_argv else {}
+        if _container_mailbox_mounts(cname) != want_m:
+            _print_warnings(args.name, _rerun_box(args.name, entry))
+            print(f"box {args.name!r}: re-run at {entry['ip']} "
+                  f"(its mailbox mounts changed while parked)")
+            return
+        _print_warnings(args.name, m_warnings)
     if exists:
         r = _docker("start", cname)
         if r.returncode != 0:
@@ -1636,6 +1833,33 @@ def cmd_start(args: argparse.Namespace) -> None:
 def _print_warnings(name: str, warnings: list[dict]) -> None:
     for w in warnings:
         print(_warning_text(name, w), file=sys.stderr)
+
+
+def _container_mailbox_mounts(cname: str) -> dict[str, str] | None:
+    """The mailbox binds an existing box container carries, destination →
+    "ro"/"rw" for every bind under /workspace/shared. None — which never
+    equals a wanted set, so the caller re-runs — when the container cannot
+    be read."""
+    r = _docker("container", "inspect", "-f", "{{json .Mounts}}", cname)
+    if r.returncode != 0:
+        return None
+    try:
+        mounts = json.loads(r.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(mounts, list):
+        return None
+    root = f"/workspace/{MAILBOX_ROOT}"
+    out: dict[str, str] = {}
+    for m in mounts:
+        if not isinstance(m, dict):
+            return None
+        dest = m.get("Destination")
+        if isinstance(dest, str) and (dest == root or dest.startswith(root + "/")):
+            if m.get("Type") != "bind":
+                return None
+            out[dest] = "rw" if m.get("RW") else "ro"
+    return out
 
 
 def _container_folder_mounts(cname: str) -> set[str] | None:
@@ -1781,12 +2005,14 @@ def cmd_discard(args: argparse.Namespace) -> None:
     # the default is full teardown — a box is disposable.
     del entries[args.name]
     save(entries)
+    # The mailbox shared/<name>/ is never deleted: it outlives its box by
+    # design (a box re-added under this name writes into it again).
     if args.keep_workspace:
         print(f"box {args.name!r}: discarded (workspace preserved at "
-              f"boxes/{args.name}/)")
+              f"boxes/{args.name}/; mailbox shared/{args.name}/ kept)")
     else:
         shutil.rmtree(WORKSPACE / f"boxes/{args.name}", ignore_errors=True)
-        print(f"box {args.name!r}: discarded")
+        print(f"box {args.name!r}: discarded (mailbox shared/{args.name}/ kept)")
 
 
 def cmd_list(args: argparse.Namespace) -> None:

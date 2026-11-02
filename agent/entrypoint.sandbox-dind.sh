@@ -97,19 +97,26 @@ if [[ -f /workspace/.gitconfig-stash ]]; then
     echo "restored git identity from /workspace/.gitconfig-stash"
 fi
 
-# --- Workspace: the orchestrator dir (extensions.json + project.json) and the
+# --- Workspace: the orchestrator dir (extensions.json + project.json), the
 #     parent of the mounted folders (--mount lands at /workspace/mnt/<name>/;
 #     docker auto-creates the parent root-owned when a mount lands, so reclaim
-#     it like /workspace). No plan/logbook/workers tree — there are no workers
-#     and no supervisor agent.
+#     it like /workspace), the mailboxes' parent shared/ (every box gets all of
+#     it read-only and its own shared/<box>/ read-write; the project agent's
+#     is shared/agent/) and the agent's two skills homes (empty; a skill staged
+#     later is picked up live). No plan/logbook/workers tree — there are no
+#     workers; the agent, when one is selected, keeps its templates elsewhere.
 if [[ "$(stat -c %U /workspace)" != "research" ]]; then
     sudo chown research:research /workspace 2>/dev/null || true
 fi
 mkdir -p /workspace/.orchestrator/logs
 [[ -d /workspace/mnt ]] || mkdir -p /workspace/mnt
-if [[ "$(stat -c %U /workspace/mnt)" != "research" ]]; then
-    sudo chown research:research /workspace/mnt 2>/dev/null || true
-fi
+[[ -d /workspace/shared ]] || mkdir -p /workspace/shared
+for d in /workspace/mnt /workspace/shared; do
+    if [[ "$(stat -c %U "$d")" != "research" ]]; then
+        sudo chown research:research "$d" 2>/dev/null || true
+    fi
+done
+mkdir -p /workspace/shared/agent /workspace/.claude/skills /workspace/.pi/skills
 
 # --- Start dockerd (DIND) in the background (hosts the inner boxes) ---
 if [[ "${DOCKER_DIND:-}" == "true" ]] && command -v dockerd >/dev/null 2>&1; then

@@ -45,12 +45,18 @@ Independent of the type:
   A ticked folder appears in the box under `/mnt/<folder>` and cannot be changed
   from the box — by its agent, by `sudo`, by anything. Nothing is ticked by
   default. Not on dev boxes.
+- **Mailbox** — every box has one, dev boxes included: `/workspace/shared/<box>/`
+  is the one project folder the box writes, and all of `/workspace/shared/`
+  (the other boxes', the workers' and the project agent's mailboxes, the role
+  services' publications) is readable in it. The mailbox stays when the box is
+  removed; a box added later under the same name writes into it again.
 
 ## Read-only folders
 
 The box window lists every top-level folder of the project (plain names first,
-hidden ones after; links and plain files are not offered, and a folder whose
-name a mount cannot carry is shown greyed). Change a box's folders later in the
+hidden ones after; links and plain files are not offered, a folder whose
+name a mount cannot carry is shown greyed, and `shared/` is not listed because
+every box sees it already — see **Mailbox** above). Change a box's folders later in the
 project's ⚙ panel under **Box folders**: saving restarts the box fresh, so its
 agent logs in again and its setup runs again; the box's own files are untouched.
 

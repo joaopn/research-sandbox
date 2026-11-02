@@ -156,6 +156,12 @@ for d in /workspace/mnt /workspace/shared; do
         sudo chown research:research "$d" 2>/dev/null || true
     fi
 done
+# The project agent's own mailbox (/workspace/shared/<name>/ is the one folder
+# each box, worker and this agent writes for the others; every box and worker
+# sees all of shared/ read-only), and its two skills homes — empty, so a skill
+# staged into them later is picked up by a running session. The research user
+# owns them: this runs as research.
+mkdir -p /workspace/shared/agent /workspace/.claude/skills /workspace/.pi/skills
 
 if [[ ! -f /workspace/.claude/CLAUDE.md ]]; then
     cp /opt/claude-templates/CLAUDE.md /workspace/.claude/CLAUDE.md

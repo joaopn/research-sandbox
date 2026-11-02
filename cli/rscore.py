@@ -174,6 +174,24 @@ _BOX_FOLDER_REASONS = {
     "not-a-folder": "it is no longer a folder",
     "unreadable": "it could not be read",
 }
+# The same table for the box's mailbox mount (kind "mailbox"): the reserved
+# `shared/` folder inside the box workspace, which only the box itself can
+# replace after RS created it.
+_BOX_MAILBOX_REASONS = {
+    "missing": "the reserved shared/ folder in its workspace could not be created; it runs without shared/ until it is",
+    "link": "shared/ in its workspace is a link now; it runs without shared/ until that folder is restored",
+    "not-a-folder": "shared/ in its workspace is no longer a folder; it runs without shared/ until that folder is restored",
+    "unreadable": "shared/ in its workspace could not be read; it runs without shared/ until that folder is restored",
+    "no-source": "its mailbox folder could not be created in the project's shared/ (something else sits at that name); it runs without shared/ until it can be",
+}
+# Every box, worker and the project agent owns a mailbox /workspace/shared/<name>/
+# (the owner writes it, everyone else reads it, it outlives its owner). One
+# namespace, compared case-folded: these names are taken — the project agent's
+# own `agent`, and every role service type (a role already publishes into
+# shared/<role>/). The in-supervisor box and worker tools carry MIRROR copies
+# (they are staged standalone); pytest-pinned equal.
+MAILBOX_ROOT = "shared"
+RESERVED_MAILBOX_NAMES = ("agent", *sorted(role_mcp.ROLE_IPS))
 
 
 def _valid_box_folder(name: object) -> bool:
@@ -203,6 +221,13 @@ def _coerce_box_folders(raw: Any) -> tuple[str, ...]:
             raise ValidationError(
                 f"invalid folder name {shown!r} (letters, digits, '.', '_' or "
                 f"'-' only)")
+        if n == MAILBOX_ROOT:
+            # Every box sees shared/ already (the mailbox mount at
+            # /workspace/shared); the picker never offers it, so this is a
+            # stale client — refuse rather than mount it a second time.
+            raise ValidationError(
+                f"{MAILBOX_ROOT!r} is already visible in every box at "
+                f"/workspace/{MAILBOX_ROOT}; it cannot be a read-only folder")
     return tuple(sorted(set(raw)))
 
 
@@ -224,6 +249,9 @@ def _box_folder_choices(workspace_path: "Path") -> list[dict]:
             if not e.is_dir(follow_symlinks=False):
                 continue
         except OSError:
+            continue
+        if e.name == MAILBOX_ROOT:
+            # Mounted into every box already (read-only, the mailbox view).
             continue
         ok = _valid_box_folder(e.name)
         row = {"name": e.name, "usable": ok,
@@ -282,6 +310,13 @@ def _box_folder_warnings(raw: Any, box: Any) -> list[str]:
                        if isinstance(w.get("reason"), str)
                        else f"{who} started without its Gitea history: "
                             f"{_BOX_HISTORY_REASONS['']}")
+            continue
+        if w.get("kind") == "mailbox":
+            reason = w.get("reason")
+            why = (_BOX_MAILBOX_REASONS.get(reason) if isinstance(reason, str)
+                   else None) or ("shared/ in its workspace could not be used; it "
+                                  "runs without shared/ until that folder is restored")
+            out.append(f"{who} started without its mailbox: {why}")
             continue
         folder = w.get("folder")
         reason = w.get("reason")
@@ -4262,7 +4297,8 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     if touched:
         _clear_service_override(workspace_path, touched)
 
-    # Sandbox projects have no /workspace/.claude/ by design — skip the refresh.
+    # A sandbox-dind project has no staged templates under /workspace/.claude/
+    # (its entrypoint creates only the empty skills home there) — skip the refresh.
     refreshed = False
     if not req.keep_claude and _container_project_type(container) != PROJECT_TYPE_SANDBOX_DIND:
         progress.step("refresh", "refreshing workspace templates")
@@ -12259,6 +12295,26 @@ def _cleanup_box_history(project: str, box: str | None, user: str, repo: str,
             capture_output=True)
 
 
+def _mailbox_name_clash(name: str, workspace_path: "Path") -> str:
+    """Why a box of this name cannot own a mailbox, or "". Reads the worker
+    registry files directly (<workspace>/.workers/<name>.json, tombstones
+    included); an unreadable registry reads as no workers. Wording names only
+    the validated box name."""
+    folded = name.casefold()
+    if folded in {r.casefold() for r in RESERVED_MAILBOX_NAMES}:
+        return (f"{name!r} is a reserved name (the project agent's mailbox or a "
+                f"role service's folder under shared/); pick another")
+    try:
+        stems = [p.stem for p in (workspace_path / ".workers").iterdir()
+                 if p.suffix == ".json"]
+    except OSError:
+        stems = []
+    if any(w.casefold() == folded for w in stems):
+        return (f"{name!r} is a worker's name in this project (workers keep "
+                f"their names for good); pick another")
+    return ""
+
+
 def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignore[name-defined]
     """Create a sandbox box in a running sandbox-dind supervisor by driving its
     in-box `rs-sandbox create`. Validated fields only reach the list-form argv
@@ -12279,6 +12335,15 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
             raise ValidationError(
                 f"this project carries {', '.join(carried)} — add {req.agent!r} to "
                 f"the project (Config → Agents) before giving a box to it")
+    # One mailbox namespace with the workers and the project agent: a reserved
+    # name or a worker's name (live or tombstoned — .workers/*.json, project-
+    # permanent), compared case-folded. Host half of the two-gate lockstep with
+    # rs-sandbox create (which also gates an auto-named box). Before the
+    # catalog staging below, so a refusal writes nothing.
+    if req.name is not None:
+        clash = _mailbox_name_clash(req.name, workspace_path)
+        if clash:
+            raise ValidationError(clash)
     # Refresh the staged box-preset catalog (Q1→live: an operator-registered type in
     # box-registry.json becomes usable on this already-created project). strict=True
     # → a malformed registry surfaces as ValidationError, not a half-built box.
