@@ -1842,7 +1842,7 @@ def cmd_webui(args: argparse.Namespace) -> None:
         # every refusal that comes before the old webui is removed (B58); a
         # renewed certificate recreates the webui onto the new files.
         renewed = rscore.refresh_webui_tailscale_cert()
-        if (recreate or user_changed or renewed or rebuild) and container_exists(WEBUI_CONTAINER):
+        if (recreate or user_changed or renewed or rebuild) and rscore._container_present(WEBUI_CONTAINER):
             reason = ("bind/port/listen subnet changed" if recreate
                       else "the webui runs as another user" if user_changed
                       else "the Tailscale certificate was renewed" if renewed
@@ -1854,7 +1854,7 @@ def cmd_webui(args: argparse.Namespace) -> None:
             wire_webui_to_projects()
             print(f"webui already running at https://{bind}:{port}")
             return
-        if container_exists(WEBUI_CONTAINER):
+        if rscore._container_present(WEBUI_CONTAINER):
             run(["docker", "rm", "-f", WEBUI_CONTAINER], capture_output=True)
         if rebuild or not run_quiet(["docker", "image", "inspect", WEBUI_IMAGE]):
             print("building webui image...")
@@ -1874,7 +1874,7 @@ def cmd_webui(args: argparse.Namespace) -> None:
         return
 
     if action == "stop":
-        if not container_exists(WEBUI_CONTAINER):
+        if not rscore._container_present(WEBUI_CONTAINER):
             print("webui not running.")
             return
         print("stopping webui...")
@@ -1886,7 +1886,7 @@ def cmd_webui(args: argparse.Namespace) -> None:
         if container_running(WEBUI_CONTAINER):
             print(f"webui: running")
             print(f"  https://{bind}:{port}")
-        elif container_exists(WEBUI_CONTAINER):
+        elif rscore._container_present(WEBUI_CONTAINER):
             print("webui: stopped (container exists)")
         else:
             print(f"webui: not running  (configured bind {bind}:{port})")

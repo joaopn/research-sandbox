@@ -5835,9 +5835,10 @@ def _container_present(name: str) -> bool:
     webui is the one fleet member where that collides: docker-compose.yml gives
     it `image: rs-webui:latest` AND `container_name: rs-webui`. So after
     `research webui stop` (which REMOVES the container and leaves the image)
-    bare inspect still says "exists", and a resume would `docker start` a
-    container that is not there. Measured: bare inspect rc=0, `docker container
-    inspect` rc=1, in exactly that state."""
+    bare inspect still says "exists". Measured: bare inspect rc=0, `docker
+    container inspect` rc=1, in exactly that state. Every webui presence read
+    goes through this predicate; `container_exists` stays for names that can
+    never equal an image name."""
     return run_quiet(["docker", "container", "inspect", name])
 
 
@@ -18750,10 +18751,10 @@ def check_engine_floor() -> None:
 
 def wire_webui_to_projects() -> None:
     """Connect rs-webui to every existing per-project network. Idempotent;
-    no-op when the webui isn't running. Called at webui start and after
+    no-op when there is no webui container. Called at webui start and after
     every `project create` so the webui sees fresh projects without a
     restart."""
-    if not container_exists(WEBUI_CONTAINER):
+    if not _container_present(WEBUI_CONTAINER):
         return
     r = run(["docker", "network", "ls",
              "--filter", f"name=^{PROJECT_NETWORK_PREFIX}",
@@ -18860,7 +18861,7 @@ def _webui_tls_volume() -> str:
     when rs-webui isn't running yet. This avoids a previous bug where the
     helper wrote to a bare `rs-webui-tls` volume while compose mounted a
     project-prefixed one (`research-sandbox_rs-webui-tls`)."""
-    if container_exists(WEBUI_CONTAINER):
+    if _container_present(WEBUI_CONTAINER):
         r = run(["docker", "inspect", WEBUI_CONTAINER, "-f",
                  "{{range .Mounts}}{{if eq .Destination \"/app/tls\"}}"
                  "{{.Name}}{{end}}{{end}}"], capture_output=True)
@@ -19364,7 +19365,7 @@ def _webui_recreate_in_place(broker_run_dir: Path) -> None:
     except ValidationError as e:
         die(f"{e} — fix WEBUI_PASSTHROUGH_PORT_LO/HI in .env")
     os.environ.update(env)
-    if container_exists(WEBUI_CONTAINER):
+    if _container_present(WEBUI_CONTAINER):
         run(["docker", "rm", "-f", WEBUI_CONTAINER], capture_output=True)
     _ensure_webui_volume_ownership(os.getuid(), os.getgid())
     docker_compose("--profile", "webui", "up", "-d", "webui")
