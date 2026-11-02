@@ -12767,17 +12767,6 @@ def _derive_auto_upstreams(role: str, project: str, cfg: "Config") -> list[str]:
     )
 
 
-def _derive_extension_auto_upstreams(project: str, cfg: "Config") -> list[str]:
-    """Auto-wired upstream set for a baked extension: EVERY MCP currently
-    allowed for the project. Deliberately wider than the worker's
-    ``_derive_auto_upstreams`` (which filters by the registry ``roles`` claim) —
-    an extension is a PI-facing surface with no role-claim concept, so "auto"
-    means "everything the project can reach." Sorted for minimal diffs."""
-    return sorted(
-        e["name"] for e in load_project_allowlist(project, cfg) if e.get("name")
-    )
-
-
 def _role_mcp_enable(project: str, cfg: "Config", role: str,
                      upstreams: list[str] | None,
                      *, force_auto: bool = False,
@@ -12785,9 +12774,8 @@ def _role_mcp_enable(project: str, cfg: "Config", role: str,
                      max_concurrent_calls: int | None = None) -> None:
     """Validate + write the per-project role-mcps.json entry + start the
     container + reload the supervisor's mcp-proxy so its config includes
-    the role-MCP route. Idempotent. The worker surface is fully independent
-    of the same-named extension (no auto-mirror) — enable an extension via
-    ``research project extension enable``.
+    the role-MCP route. Idempotent. Enables the worker-facing service only;
+    nothing else is started or enabled alongside it.
 
     Upstream-source state machine:
       - ``upstreams=list, force_auto=False``: explicit pin. Survives sync.
