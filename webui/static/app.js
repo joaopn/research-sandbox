@@ -5139,7 +5139,13 @@ function opSleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 // Conditional stages a verb may or may not emit (e.g. update's enable/disable/
 // refresh on a recreate, or create's data-dir setup) are deliberately NOT
 // pre-listed — they append already-checked as they arrive, so a missing optional
-// stage never leaves a stuck pending row.
+// stage never leaves a stuck pending row. A listed stage that a successful op
+// did not need on its path (start on the docker substrate, a project already
+// running, a live editor toggle) is removed when the op ends (dropPending).
+// Keyed by verb, plus `create_docker`: the docker substrate's create, chosen by
+// the create dialog. It lists only the stages every docker create emits BEFORE
+// any optional one (git credentials, clone, setup, history line, ready), so
+// those append ticked in the order they happen.
 const OP_CHECKLISTS = {
     create: [
         { key: "validate", label: "checking prerequisites" },
@@ -5147,6 +5153,11 @@ const OP_CHECKLISTS = {
         { key: "create-container", label: "creating supervisor container" },
         { key: "stage-images", label: "staging inner images" },
         { key: "wire", label: "enabling workers and sandboxes" },
+    ],
+    create_docker: [
+        { key: "validate", label: "checking prerequisites" },
+        { key: "network", label: "creating project network" },
+        { key: "create-container", label: "creating project container" },
     ],
     destroy: [
         { key: "validate", label: "locating project" },
@@ -5512,7 +5523,7 @@ function opChecklist(verb) {
         // A conditional stage not pre-listed (e.g. update enable/disable) appends
         // already-checked as it arrives, labelled by its message when it has one
         // (a raw step key reads as jargon: "recover", "rollback").
-        const ref = items[key] || addRow(key, msg || key);
+        const ref = (items[key] && !items[key].dropped) ? items[key] : addRow(key, msg || key);
         ref.row.classList.remove("pending");
         ref.row.classList.add("ok");
         ref.icon.textContent = "✓";
@@ -5550,11 +5561,22 @@ function opChecklist(verb) {
         ref.row.classList.add("ok");
         ref.icon.textContent = "✓";
     };
-    return { listEl, markDone, markMsg, markWarn, markNote };
+    // Called once a SUCCESSFUL op's terminal record has been read (every
+    // milestone before it is drained by then): a listed stage still pending was
+    // not needed on this path, so its row is not part of what happened. A failed
+    // or interrupted op keeps them — there they mean "stopped before this". The
+    // entries stay in `items` (marked dropped) so the row-key counters never
+    // shrink; a later markDone on a dropped key would append a fresh row.
+    const dropPending = () => {
+        for (const ref of Object.values(items)) {
+            if (ref.row.classList.contains("pending")) { ref.row.remove(); ref.dropped = true; }
+        }
+    };
+    return { listEl, markDone, markMsg, markWarn, markNote, dropPending };
 }
 
 async function mgmtTailOp(view, backdrop, card, opId, title, verb, onDone) {
-    const { listEl, markDone, markWarn, markNote } = opChecklist(verb);
+    const { listEl, markDone, markWarn, markNote, dropPending } = opChecklist(verb);
 
     // The failure reason — populated ONLY on failure; the running/done state is
     // conveyed by the checklist + the foot button, with no status chatter above.
@@ -5626,6 +5648,9 @@ async function mgmtTailOp(view, backdrop, card, opId, title, verb, onDone) {
     // Final drain: the terminal milestone may have landed between this tick's
     // /log and /status fetches, so the trailing stage row is settled.
     try { await drainLog(); } catch (e) { /* best-effort */ }
+    // Only once the log's own terminal was read: status alone can say ok while
+    // the last drain failed, and a stage that ran must not be swept unread.
+    if (ok && sawTerminal) dropPending();
     if (!ok) failEl.textContent = "Failed — " + mgmtOpFailMsg(result);
     doneBtn.textContent = "Done";
     doneBtn.disabled = false;
@@ -6009,7 +6034,7 @@ function folderChoicesLine(choices, error) {
 async function lifecycleTail(view, backdrop, card, opId, title, verb, project,
                              onDone, opts) {
     const replay = !!(opts && opts.replay);
-    const { listEl, markDone, markMsg, markWarn } = opChecklist(verb);
+    const { listEl, markDone, markMsg, markWarn, dropPending } = opChecklist(verb);
     const waitEl = el("div", { class: "op-waiting" });
     const failEl = el("div", { class: "op-fail" });
     const bgBtn = el("button", { class: "btn btn-secondary" }, ["Continue in background"]);
@@ -6064,6 +6089,8 @@ async function lifecycleTail(view, backdrop, card, opId, title, verb, project,
     backdrop.onclick = null;
     waitEl.textContent = "";
     bgBtn.remove();
+    // res.ok comes only from a read terminal `done`, so every stage is drained.
+    if (res.ok) dropPending();
     if (!res.ok) failEl.textContent = lifecycleFailText(res);
     doneBtn.textContent = "Done";
     doneBtn.disabled = false;
@@ -6128,7 +6155,8 @@ function mgmtConfirmThenTail(view, cfg) {
                                    () => { if (cfg.onDone) cfg.onDone(true); });
         } else {
             await mgmtTailOp(view, backdrop, card, body.op_id,
-                             cfg.tailTitle || cfg.title, cfg.verb, cfg.onDone);
+                             cfg.tailTitle || cfg.title, cfg.checklist || cfg.verb,
+                             cfg.onDone);
         }
     };
     backdrop.appendChild(card);
@@ -7437,6 +7465,8 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
         // entry (GET /broker/op/<id> stays "unknown" by design), so it needs
         // the terminal-first build-log tail, not the checklist tail.
         tailMode: () => (isDev ? "buildlog" : undefined),
+        // The docker substrate stages no inner images and wires no workers.
+        checklist: isDocker ? "create_docker" : undefined,
         body: [
             el("div", { class: "field" }, [
                 el("label", {}, ["Workflow"]),
