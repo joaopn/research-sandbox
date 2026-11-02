@@ -12866,11 +12866,11 @@ def _role_mcp_start(supervisor: str, project: str, cfg: "Config",
         "--network", INNER_NETWORK,
         "--ip", ip,
         "--restart", "unless-stopped",
-        # tini at PID 1 reaps zombies. Belt-and-suspenders with per-MCP
-        # `dumb-init` wrappers in image-baked extras (B.1) — if a wrapped
-        # stdio MCP dies uncleanly, grandchildren reparent to container
-        # PID 1 and tini reaps them.
-        "--init",
+        # No --init: the role image's own ENTRYPOINT tini is PID 1 and reaps
+        # zombies, including the grandchildren of a `dumb-init`-wrapped stdio
+        # MCP that dies uncleanly (they reparent to PID 1). Adding --init
+        # would put docker-init at PID 1 and push that tini to PID 2, where
+        # it warns at every boot that it is not running as PID 1.
         # Blast-radius backstop. OOM-killer takes the role container,
         # not the supervisor. See Config.default_role_mcp_memory comment
         # for the size reasoning.

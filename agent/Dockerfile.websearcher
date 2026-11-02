@@ -31,7 +31,7 @@ ARG PYYAML_VERSION=6.0.3
 # dumb-init wraps the Playwright stdio server at runtime (see
 # extra-mcps.yaml's command field) so the Playwright -> Chromium ->
 # renderer subprocess tree reaps cleanly when the spawned claude exits.
-# Belt-and-suspenders with the substrate's container-level --init flag.
+# Belt-and-suspenders with the container's PID-1 tini (the image ENTRYPOINT).
 RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - && \
     apt-get update && \
     apt-get install -y --no-install-recommends nodejs dumb-init && \

@@ -177,8 +177,8 @@ def _atomic_write_text(path: Path, text: str) -> None:
 def _pid_alive(pid: int) -> bool:
     """Signal-0 existence check. ProcessLookupError means the process is
     gone. PermissionError means the process EXISTS but the daemon (uid
-    1000 / worker) lacks signaling rights — typically a root-owned
-    process like docker-init at PID 1. For the "is the process alive"
+    1000 / worker) lacks signaling rights — a process owned by another
+    uid (e.g. root). For the "is the process alive"
     semantic, PermissionError is alive: signal 0 doesn't deliver, it
     just probes existence, and the kernel checked permission only after
     confirming the process exists. Treating PermissionError as "not

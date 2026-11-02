@@ -31,4 +31,7 @@ USER worker
 WORKDIR /workspace
 
 # tini comes from analysis-base. PID 1 is tini; entrypoint is daemon.py.
+# The launcher passes no --init, so this tini is the container's only init
+# and reaps every orphan (a second init would push it off PID 1 and it
+# would warn at every boot).
 ENTRYPOINT ["/usr/bin/tini", "--", "/entrypoint.sh"]

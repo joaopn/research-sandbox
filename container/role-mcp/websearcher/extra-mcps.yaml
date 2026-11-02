@@ -60,8 +60,9 @@
 mcpServers:
   playwright:
     # dumb-init subreaper for the Playwright -> Chromium -> renderer
-    # subprocess tree. Pairs with the substrate's container-level --init
-    # flag (which reaps at PID 1) as belt-and-suspenders.
+    # subprocess tree. Pairs with the image's PID-1 tini (the role-MCP
+    # base ENTRYPOINT), which reaps whatever escapes it, as
+    # belt-and-suspenders.
     command: dumb-init
     args:
       - "--"
