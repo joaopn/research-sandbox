@@ -3654,7 +3654,7 @@ class DevReviewsResult:
 
 @dataclass
 class DevRepoStatusResult:
-    gitea: dict                                 # {"exists": bool, "running": bool}
+    gitea: dict                                 # {"exists", "running", "version", "target", "upgrade", "upgrading"} — dev_status's
     repo: dict                                  # ONE repo_status row (+reviews), {} when not running, {repo, error} degraded
     attachments: list[dict]                     # [{project}] — this repo's consumers
     reviewer: dict                              # {"present": bool, "set_at": str} — token state, never token material
@@ -16352,14 +16352,13 @@ def dev_sync(req: "DevSyncRequest", _progress=None) -> DevSyncResult:  # type: i
     return DevSyncResult(repo=req.repo)
 
 
-def dev_status(_req: "DevStatusRequest", _progress=None) -> DevStatusResult:  # type: ignore[name-defined]
-    """The Development-page read: gitea state + per-repo mirror/PR/branch
-    status + agent attachments. A READ — never starts gitea, never waits: an
-    absent or STOPPED gitea reports running:false with no repos immediately
-    (`dev_gitea_start` is the explicit enable verb; `dev_sync`, a user-initiated
-    write, resumes an enabled gitea). Deliberately no _provision_gitea/
-    _resume_gitea on any path: a page-load read must neither create nor
-    docker-start containers, nor sit in a readiness wait on the serial thread."""
+def _dev_gitea_state() -> dict:
+    """The gitea dict BOTH Development reads return (dev_status and its
+    per-repo sibling dev_repo_status) — one source, so the two cannot drift:
+    the per-repo Fetch pane renders through the same held-gitea notice as the
+    Development page and needs the same fields. A READ with the verbs'
+    no-start posture: docker inspects, host files and a non-blocking shared
+    flock probe that creates nothing."""
     exists = container_exists(gitea.GITEA_CONTAINER)
     running = bool(exists and container_running(gitea.GITEA_CONTAINER))
     # The release, the shipped one and any upgrade state ride every reply —
@@ -16369,8 +16368,20 @@ def dev_status(_req: "DevStatusRequest", _progress=None) -> DevStatusResult:  # 
     # from a database being migrated: report that, and touch nothing.
     if info["upgrading"]:
         running = False
+    return {"exists": exists, "running": running, **info}
+
+
+def dev_status(_req: "DevStatusRequest", _progress=None) -> DevStatusResult:  # type: ignore[name-defined]
+    """The Development-page read: gitea state + per-repo mirror/PR/branch
+    status + agent attachments. A READ — never starts gitea, never waits: an
+    absent or STOPPED gitea reports running:false with no repos immediately
+    (`dev_gitea_start` is the explicit enable verb; `dev_sync`, a user-initiated
+    write, resumes an enabled gitea). Deliberately no _provision_gitea/
+    _resume_gitea on any path: a page-load read must neither create nor
+    docker-start containers, nor sit in a readiness wait on the serial thread."""
+    g = _dev_gitea_state()
     repos: list[dict] = []
-    if running:
+    if g["running"]:
         host_port = _gitea_host_port()
         try:
             listed = [r["repo"] for r in gitea.list_repos(host_port)
@@ -16412,7 +16423,7 @@ def dev_status(_req: "DevStatusRequest", _progress=None) -> DevStatusResult:  # 
                    and e.get("class") != gitea.HISTORY_CLASS]
     # Reviewer-token state rides OUTSIDE `if running:` — it is orthogonal to
     # gitea's state (a pure local file read; the no-start posture holds).
-    return DevStatusResult(gitea={"exists": exists, "running": running, **info},
+    return DevStatusResult(gitea=g,
                            repos=repos, attachments=attachments,
                            reviewer=gitea.reviewer_token_state())
 
@@ -16440,11 +16451,13 @@ def dev_repo_status(req: "DevRepoStatusRequest", _progress=None) -> DevRepoStatu
     path; absent/stopped -> running:false with an empty row immediately).
     There is no enumeration here, so nothing stays page-fatal: an unknown or
     sick repo degrades to a {repo, error} row (repo_status raises GiteaError
-    on the mirror GET's 404), which the pane renders inline (B37 posture)."""
-    exists = container_exists(gitea.GITEA_CONTAINER)
-    running = bool(exists and container_running(gitea.GITEA_CONTAINER))
+    on the mirror GET's 404), which the pane renders inline (B37 posture).
+    The gitea dict is dev_status's own (release, upgrade state, and running
+    forced false while an upgrade or a restore holds gitea), so the pane shows
+    the held notice instead of reading a Gitea whose data is being moved."""
+    g = _dev_gitea_state()
     row: dict = {}
-    if running:
+    if g["running"]:
         try:
             row = gitea.repo_status(_gitea_host_port(), req.repo)
             # The badge feed, selected exactly as dev_status does it — the
@@ -16463,7 +16476,7 @@ def dev_repo_status(req: "DevRepoStatusRequest", _progress=None) -> DevRepoStatu
                    and e.get("class") != gitea.HISTORY_CLASS]
     # Same posture as dev_status: the token state is a local file read,
     # populated outside `if running:`.
-    return DevRepoStatusResult(gitea={"exists": exists, "running": running},
+    return DevRepoStatusResult(gitea=g,
                                repo=row, attachments=attachments,
                                reviewer=gitea.reviewer_token_state())
 
