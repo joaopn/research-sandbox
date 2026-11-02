@@ -11864,11 +11864,10 @@ def _read_marker_agents(workspace_path: "Path") -> list[str]:
 
 def _write_marker_agents(workspace_path: "Path", agents: list[str]) -> None:
     """Write the agent set into project.json, keeping every other key intact —
-    and REFUSING on an unreadable marker rather than clobbering it (the B31
-    shape the two read-modify-write precedents accept for a backfill is NOT
-    acceptable for a live operator update: `type`, `substrate`, `workflow`,
+    and REFUSING on an unreadable marker rather than clobbering it, like every
+    read-modify-write writer of the marker: `type`, `substrate`, `workflow`,
     `models`, `box_image_pins`, `ssh_port` would all vanish, and the recreate +
-    the webui flavor gate read every one of them)."""
+    the webui flavor gate read every one of them."""
     f = workspace_path / ".orchestrator" / "project.json"
     try:
         data = json.loads(f.read_text())
@@ -12010,14 +12009,32 @@ def _read_box_pins(workspace_path: "Path") -> dict[str, str]:
 
 def _write_box_pins(workspace_path: "Path", box_pins: dict[str, str]) -> None:
     """Backfill the box-image pins into project.json (greenfield recreate), keeping
-    every other marker key intact."""
+    every other marker key intact. An ABSENT marker is written fresh; an existing
+    but unreadable (or non-object) one is REFUSED with a warning and left exactly
+    as it is, never rewritten holding only the pins: `type`, `substrate`,
+    `workflow`, `agents`, `models`, `ssh_port` would all vanish. A warning, not a
+    raise, because this runs mid-recreate after the new container is started (the
+    _write_box_digests posture); the next recreate after a repair backfills again.
+    Temp + rename, so a concurrent reader never sees a torn file."""
     f = workspace_path / ".orchestrator" / "project.json"
     try:
         data = json.loads(f.read_text())
-    except (OSError, json.JSONDecodeError):
+    except FileNotFoundError:
         data = {}
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"warning: box-image pins not recorded: the project marker {f} "
+              f"is unreadable ({e}); repair it and restart the project",
+              file=sys.stderr)
+        return
+    if not isinstance(data, dict):
+        print(f"warning: box-image pins not recorded: the project marker {f} "
+              f"is not a JSON object; repair it and restart the project",
+              file=sys.stderr)
+        return
     data["box_image_pins"] = box_pins
-    f.write_text(json.dumps(data, indent=2) + "\n")
+    tmp = f.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(f)
 
 
 def _read_box_digests(workspace_path: "Path") -> dict[str, str]:
@@ -12090,17 +12107,31 @@ def _read_models(workspace_path: "Path") -> dict[str, dict[str, str]]:
 
 def _write_models(workspace_path: "Path", models: dict[str, dict[str, str]]) -> None:
     """Write the per-type model pairs into project.json, KEEPING EVERY OTHER MARKER
-    KEY INTACT (mirrors _write_box_pins). A naive whole-file rewrite would silently
-    drop `type`, `substrate`, `workflow`, `agents`, and `box_image_pins` — which the
-    webui's flavor gate and every box recreate read — and the damage would surface
-    far from its cause."""
+    KEY INTACT. A naive whole-file rewrite would silently drop `type`, `substrate`,
+    `workflow`, `agents`, and `box_image_pins` — which the webui's flavor gate and
+    every box recreate read — and the damage would surface far from its cause. So
+    an ABSENT marker is written fresh, but an existing unreadable (or non-object)
+    one raises ValidationError and is left untouched: this runs inside `update`
+    before any side effect, so the refusal reaches the operator cleanly (the
+    _write_marker_agents posture). Temp + rename, so a concurrent reader never sees
+    a torn file."""
     f = workspace_path / ".orchestrator" / "project.json"
     try:
         data = json.loads(f.read_text())
-    except (OSError, json.JSONDecodeError):
+    except FileNotFoundError:
         data = {}
+    except (OSError, json.JSONDecodeError) as e:
+        raise ValidationError(
+            f"cannot change the agent models: the project marker {f} is unreadable "
+            f"({e}); repair it before changing models")
+    if not isinstance(data, dict):
+        raise ValidationError(
+            f"cannot change the agent models: the project marker {f} is not a "
+            f"JSON object; repair it before changing models")
     data["models"] = models
-    f.write_text(json.dumps(data, indent=2) + "\n")
+    tmp = f.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(f)
 
 
 def _apply_model_changes(workspace_path: "Path",
