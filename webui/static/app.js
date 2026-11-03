@@ -6774,14 +6774,43 @@ async function mgmtRefreshDialog(view, cfg) {
     // keys, so every branch below is skipped and their rendering is unchanged.
     const extLatest = body.result.ext_latest || "";
     const extCurrent = body.result.ext_current || "(unset)";
-    const extMoved = !!extLatest && body.result.ext_current !== body.result.ext_latest;
+    // The broker says when upstream is OLDER than a pin (downgrade /
+    // ext_downgrade). Refresh never moves a pin backwards — the build lane
+    // re-checks the same rule — so an older upstream is "nothing to do" for that
+    // pin. The comparison lives on the server; this only reads its verdict.
+    const cliDown = !!body.result.downgrade;
+    const extDown = !!body.result.ext_downgrade;
+    // Moved is inequality on the RAW values, never the "(unset)" display text.
+    const cliMoved = body.result.current !== body.result.latest && !cliDown;
+    const extMoved = !!extLatest && body.result.ext_current !== body.result.ext_latest
+        && !extDown;
     bodyEl.innerHTML = "";
-    // Up-to-date is equality on the RAW values ("" == "" for an unset pin at an
-    // unresolved upstream would be odd, but the resolver returns a concrete
-    // version); a stale cached dist at the same pin is covered by Pull. EITHER pin
-    // moving disqualifies up-to-date — the CLI and the extension publish
-    // independently, so an extension-only bump is a real case.
-    if (body.result.current === body.result.latest && !extMoved) {
+    // A stale cached dist at the same pin is covered by Pull. EITHER pin moving
+    // disqualifies up-to-date — the CLI and the extension publish independently,
+    // so an extension-only bump is a real case.
+    if (!cliMoved && !extMoved && (cliDown || extDown)) {
+        if (cliDown) {
+            bodyEl.appendChild(el("p", {}, [
+                cfg.distLabel + ": upstream latest ",
+                el("span", { class: "sw-mono" }, [latest]),
+                " is older than the pin ",
+                el("span", { class: "sw-mono" }, [current]),
+                " — nothing to do.",
+            ]));
+        }
+        if (extDown) {
+            bodyEl.appendChild(el("p", {}, [
+                "editor extension: upstream latest ",
+                el("span", { class: "sw-mono" }, [extLatest]),
+                " is older than the pin ",
+                el("span", { class: "sw-mono" }, [extCurrent]),
+                " — nothing to do.",
+            ]));
+        }
+        bodyEl.appendChild(closeRow());
+        return backdrop;
+    }
+    if (!cliMoved && !extMoved) {
         const kids = [
             cfg.distLabel + " is already at the upstream version ",
             el("span", { class: "sw-mono" }, [latest]),
@@ -6794,25 +6823,27 @@ async function mgmtRefreshDialog(view, cfg) {
         bodyEl.appendChild(closeRow());
         return backdrop;
     }
-    // Either pin moving gets us here, so ONE of them may be unchanged — label it
-    // rather than drawing an arrow between two identical versions. An unchanged
-    // pin is also not written to the override, so "both pins" would overstate it.
-    const cliMoved = body.result.current !== body.result.latest;
-    bodyEl.appendChild(el("p", {}, [
-        cfg.distLabel + ": pin ",
-        el("span", { class: "sw-mono" }, [current]),
-        cliMoved ? " → upstream " : " — already at upstream ",
-        el("span", { class: "sw-mono" }, [latest]),
+    // Either pin moving gets us here, so ONE of them may be unchanged or held at
+    // a pin newer than upstream — label it rather than drawing an arrow. A pin
+    // that does not move is not written to the override, so "both pins" would
+    // overstate it.
+    const pinLine = (label, cur, up, moved, down) => el("p", {}, down ? [
+        label + ": pin ",
+        el("span", { class: "sw-mono" }, [cur]),
+        " — kept (upstream ",
+        el("span", { class: "sw-mono" }, [up]),
+        " is older).",
+    ] : [
+        label + ": pin ",
+        el("span", { class: "sw-mono" }, [cur]),
+        moved ? " → upstream " : " — already at upstream ",
+        el("span", { class: "sw-mono" }, [up]),
         ".",
-    ]));
+    ]);
+    bodyEl.appendChild(pinLine(cfg.distLabel, current, latest, cliMoved, cliDown));
     if (extLatest) {
-        bodyEl.appendChild(el("p", {}, [
-            "editor extension: pin ",
-            el("span", { class: "sw-mono" }, [extCurrent]),
-            extMoved ? " → upstream " : " — already at upstream ",
-            el("span", { class: "sw-mono" }, [extLatest]),
-            ".",
-        ]));
+        bodyEl.appendChild(pinLine("editor extension", extCurrent, extLatest,
+                                   extMoved, extDown));
     }
     bodyEl.appendChild(el("p", {}, [
         (extLatest && cliMoved && extMoved)

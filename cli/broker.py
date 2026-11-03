@@ -467,19 +467,26 @@ def _verb_agent_refresh_check(args: dict, _progress=None) -> dict:
     current, latest, ext_current, ext_latest = rscore.agent_refresh_check(agent)
     # ext_* are absent-as-"" for an agent declaring no companion extension; the
     # webui branches on ext_latest being truthy, so an ext-less agent renders
-    # exactly as it does today.
+    # exactly as it does today. downgrade/ext_downgrade say that upstream is OLDER
+    # than the pin, which Refresh never applies (rscore.refresh_target — the same
+    # policy the build lane re-checks child-side), so the dialog offers nothing.
     return {"current": current, "latest": latest,
-            "ext_current": ext_current, "ext_latest": ext_latest}
+            "ext_current": ext_current, "ext_latest": ext_latest,
+            "downgrade": rscore.refresh_target(current, latest) != latest,
+            "ext_downgrade": bool(ext_latest)
+                             and rscore.refresh_target(ext_current, ext_latest) != ext_latest}
 
 
 def _verb_editor_refresh_check(_args: dict, _progress=None) -> dict:
     current, latest = rscore.editor_refresh_check()
-    return {"current": current, "latest": latest}
+    return {"current": current, "latest": latest,
+            "downgrade": rscore.refresh_target(current, latest) != latest}
 
 
 def _verb_reader_refresh_check(_args: dict, _progress=None) -> dict:
     current, latest = rscore.reader_refresh_check()
-    return {"current": current, "latest": latest}
+    return {"current": current, "latest": latest,
+            "downgrade": rscore.refresh_target(current, latest) != latest}
 
 
 def _verb_op_full_tail(args: dict, _progress=None) -> dict:

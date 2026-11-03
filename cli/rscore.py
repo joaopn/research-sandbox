@@ -6497,6 +6497,26 @@ def _version_older(value: str, base: str) -> bool:
     return x + [0] * (width - len(x)) < y + [0] * (width - len(y))
 
 
+def refresh_target(current: str, latest: str) -> str:
+    """The version Refresh moves a pin to: upstream `latest`, unless that is a
+    CLEAR numeric downgrade of the effective pin `current` — then `current` (the
+    pin is kept, "nothing to do"). Refresh only ever moves a pin forward or
+    sideways: the versions.local.env override wins per key forever, so writing a
+    lower upstream (a yanked release, a lagging registry) would detach the pin at
+    an older version and the below-base build warning would then blame a line
+    Refresh itself wrote. An unset pin ("") always takes latest; a suffix-only
+    difference is not a downgrade (`_version_older`'s semantics). The ONE policy
+    every Refresh surface shares — the CLI, the broker preview and the build lane
+    — so they cannot disagree."""
+    return current if _version_older(latest, current) else latest
+
+
+def _refresh_older_note(label: str, current: str, latest: str) -> str:
+    """The plain line a refused downgrade prints — browser-visible through the
+    build lane's view log, so it states the facts and names no shell remedy."""
+    return f"{label}upstream latest {latest} is older than the pin {current} — nothing to do"
+
+
 def _warn_pins_below_base(what: str, bundled: dict[str, str]) -> list[str]:
     """Warn — never refuse — when a dist build just BUNDLED a pin below the value
     this installation's tracked versions.env ships. The usual cause is a stale
@@ -8234,25 +8254,38 @@ def agent_refresh(agent: str = "claude", progress=None) -> dict:
     bumped:False, TOCTOU-safe). `progress` (the broker build-lane sink;
     _NULL_PROGRESS on the CLI) gets coarse view-log milestones — agent enum +
     _AGENT_VERSION_RE-guarded version only, never a host path — while the raw
-    resolve+build firehose streams to the host-only full log. Up-to-date is
-    equality-only across both pins (mirrors the CLI `agent refresh`): no
-    dist-presence check, so it never writes a redundant override entry; the
-    milestone points at Pull for a stale cached dist."""
+    resolve+build firehose streams to the host-only full log. Each pin moves to
+    refresh_target(effective, upstream): never to an OLDER upstream, which is
+    "nothing to do" for that pin (mirrors the CLI `agent refresh`). Up-to-date
+    means neither target differs from its effective pin; no dist-presence check,
+    so it never writes a redundant override entry; the milestone points at Pull
+    for a stale cached dist. When one pin moves and the other is held, the held
+    target equals its effective pin, so agent_apply_refresh's inequality guard
+    leaves it unwritten. The result's version/ext_version are the targets."""
     progress = progress or _NULL_PROGRESS
     progress.step("resolve", f"resolving upstream {agent} version")
     current, latest, ext_current, ext_latest = agent_refresh_check(agent)
-    ext_moved = bool(ext_latest) and ext_current != ext_latest
-    if current == latest and not ext_moved:
-        progress.step("uptodate", f"pins already at upstream {latest}"
-                      + (f" / extension {ext_latest}" if ext_latest else "")
-                      + " — use Pull to (re)build the dist")
-        return {"agent": agent, "version": latest,
-                "ext_version": ext_latest or None, "bumped": False}
-    progress.step("bump", f"bumping pin to {latest}"
-                  + (f" / extension {ext_latest}" if ext_latest else ""))
-    agent_apply_refresh(agent, latest, ext_latest)
-    return {"agent": agent, "version": latest,
-            "ext_version": ext_latest or None, "bumped": True}
+    cli_to = refresh_target(current, latest)
+    ext_to = refresh_target(ext_current, ext_latest) if ext_latest else ext_current
+    if cli_to == current and ext_to == ext_current:
+        older = []
+        if latest != current:
+            older.append(_refresh_older_note("", current, latest))
+        if ext_latest and ext_latest != ext_current:
+            older.append(_refresh_older_note("extension ", ext_current, ext_latest))
+        if older:
+            progress.step("uptodate", "; ".join(older))
+        else:
+            progress.step("uptodate", f"pins already at upstream {latest}"
+                          + (f" / extension {ext_latest}" if ext_latest else "")
+                          + " — use Pull to (re)build the dist")
+        return {"agent": agent, "version": current,
+                "ext_version": ext_current or None, "bumped": False}
+    progress.step("bump", f"bumping pin to {cli_to}"
+                  + (f" / extension {ext_to}" if ext_latest else ""))
+    agent_apply_refresh(agent, cli_to, ext_to)
+    return {"agent": agent, "version": cli_to,
+            "ext_version": ext_to or None, "bumped": True}
 
 
 def agent_list() -> list[dict]:
@@ -8466,22 +8499,25 @@ def editor_apply_refresh(cs_version: str) -> None:
 
 def editor_refresh(progress=None) -> dict:
     """Build-lane refresh for the editor dist — the twin of agent_refresh. Resolve
-    upstream code-server, and if newer than the effective CODE_SERVER_VERSION pin,
-    bump the untracked override + rebuild (via editor_apply_refresh; bundled
-    extensions stay at their own pins). Re-resolves child-side (no client version
-    crosses); up-to-date is equality-only and points at Pull for a stale cached
-    dist. Milestones carry only the _AGENT_VERSION_RE-guarded version; the raw
-    build streams to the host-only full log."""
+    upstream code-server, and if it differs from the effective CODE_SERVER_VERSION
+    pin and is not OLDER (refresh_target), bump the untracked override + rebuild
+    (via editor_apply_refresh; bundled extensions stay at their own pins).
+    Re-resolves child-side (no client version crosses); an equal or older upstream
+    is "nothing to do", and the equal case points at Pull for a stale cached dist.
+    Milestones carry only the _AGENT_VERSION_RE-guarded version; the raw build
+    streams to the host-only full log."""
     progress = progress or _NULL_PROGRESS
     progress.step("resolve", "resolving upstream code-server version")
     current, latest = editor_refresh_check()
-    if current == latest:
-        progress.step("uptodate", f"pin already at upstream {latest} — "
-                      "use Pull to (re)build the dist")
-        return {"code_server_version": latest, "bumped": False}
-    progress.step("bump", f"bumping pin to {latest}")
-    editor_apply_refresh(latest)
-    return {"code_server_version": latest, "bumped": True}
+    target = refresh_target(current, latest)
+    if target == current:
+        progress.step("uptodate", _refresh_older_note("", current, latest)
+                      if latest != current else
+                      f"pin already at upstream {latest} — use Pull to (re)build the dist")
+        return {"code_server_version": current, "bumped": False}
+    progress.step("bump", f"bumping pin to {target}")
+    editor_apply_refresh(target)
+    return {"code_server_version": target, "bumped": True}
 
 
 def _deploy_supervisor_editor(container: str) -> None:
@@ -8772,20 +8808,23 @@ def reader_apply_refresh(nbconvert_ver: str) -> None:
 
 def reader_refresh(progress=None) -> dict:
     """Build-lane refresh for the reader dist — the twin of editor_refresh. Resolve
-    upstream nbconvert, and if newer than the effective NBCONVERT_VERSION pin, bump
-    the untracked override + rebuild. Re-resolves child-side (no client version
-    crosses); up-to-date is equality-only and points at Pull for a stale cached
-    dist. Milestones carry only the _AGENT_VERSION_RE-guarded version."""
+    upstream nbconvert, and if it differs from the effective NBCONVERT_VERSION pin
+    and is not OLDER (refresh_target), bump the untracked override + rebuild.
+    Re-resolves child-side (no client version crosses); an equal or older upstream
+    is "nothing to do", and the equal case points at Pull for a stale cached dist.
+    Milestones carry only the _AGENT_VERSION_RE-guarded version."""
     progress = progress or _NULL_PROGRESS
     progress.step("resolve", "resolving upstream nbconvert version")
     current, latest = reader_refresh_check()
-    if current == latest:
-        progress.step("uptodate", f"pin already at upstream {latest} — "
-                      "use Pull to (re)build the dist")
-        return {"nbconvert_version": latest, "bumped": False}
-    progress.step("bump", f"bumping pin to {latest}")
-    reader_apply_refresh(latest)
-    return {"nbconvert_version": latest, "bumped": True}
+    target = refresh_target(current, latest)
+    if target == current:
+        progress.step("uptodate", _refresh_older_note("", current, latest)
+                      if latest != current else
+                      f"pin already at upstream {latest} — use Pull to (re)build the dist")
+        return {"nbconvert_version": current, "bumped": False}
+    progress.step("bump", f"bumping pin to {target}")
+    reader_apply_refresh(target)
+    return {"nbconvert_version": target, "bumped": True}
 
 
 def _deploy_supervisor_reader(container: str) -> None:

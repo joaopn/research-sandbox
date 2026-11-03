@@ -519,29 +519,46 @@ def cmd_agent_refresh(args: argparse.Namespace) -> None:
     tracked base — so it's a per-instance change, never a committed one — and it
     also moves this instance's next `start --rebuild` version (load_versions
     overlays the override for build-arg threading). Either pin moving is enough to
-    offer the bump: the CLI and the extension publish independently."""
+    offer the bump: the CLI and the extension publish independently. A pin never
+    moves to an OLDER upstream (rscore.refresh_target, the policy every Refresh
+    surface shares): that pin is "nothing to do"."""
     agent = args.agent
     current, latest, ext_current, ext_latest = rscore.agent_refresh_check(agent)
-    ext_moved = bool(ext_latest) and ext_current != ext_latest
-    if current == latest and not ext_moved:
-        print(f"{agent}: up to date (effective pin {current} == upstream {latest})")
+    cli_to = rscore.refresh_target(current, latest)
+    ext_to = rscore.refresh_target(ext_current, ext_latest) if ext_latest else ext_current
+    cli_moved = cli_to != current
+    ext_moved = bool(ext_latest) and ext_to != ext_current
+    if not cli_moved and not ext_moved:
+        if current == latest:
+            print(f"{agent}: up to date (effective pin {current} == upstream {latest})")
+        else:
+            print(f"{agent}: upstream latest {latest} is older than the effective "
+                  f"pin {current} — nothing to do")
         if ext_latest:
-            print(f"  extension: {ext_current} == upstream {ext_latest}")
+            if ext_current == ext_latest:
+                print(f"  extension: {ext_current} == upstream {ext_latest}")
+            else:
+                print(f"  extension: upstream latest {ext_latest} is older than the "
+                      f"pin {ext_current} — nothing to do")
         if not rscore.dist_present(agent):
             print(f"  (no dist cached yet — run `research agent pull --agent {agent}`)")
         return
     # Either-moved got us here, so ONE of these may not have moved — say so rather
     # than printing `X → upstream X`, which reads as a transition that isn't one
     # (and no longer happens: an unchanged pin is not written to the override).
-    if current != latest:
+    if cli_moved:
         print(f"{agent}: effective pin {current or '(unset)'} → upstream {latest}")
-    else:
+    elif current == latest:
         print(f"{agent}: pin {current} already at upstream (unchanged)")
+    else:
+        print(f"{agent}: pin {current} kept (upstream {latest} is older)")
     if ext_latest:
         if ext_moved:
             print(f"  extension: {ext_current or '(unset)'} → upstream {ext_latest}")
-        else:
+        elif ext_current == ext_latest:
             print(f"  extension: {ext_current} already at upstream (unchanged)")
+        else:
+            print(f"  extension: pin {ext_current} kept (upstream {ext_latest} is older)")
     print("  (this also moves this instance's next `start --rebuild` version)")
     if not args.yes:
         try:
@@ -551,9 +568,9 @@ def cmd_agent_refresh(args: argparse.Namespace) -> None:
         if resp not in ("y", "yes"):
             print("aborted; versions.local.env unchanged")
             return
-    rscore.agent_apply_refresh(agent, latest, ext_latest)
-    print(f"bumped versions.local.env + pulled {agent} {latest}"
-          + (f" (extension {ext_latest})" if ext_latest else "")
+    rscore.agent_apply_refresh(agent, cli_to, ext_to)
+    print(f"bumped versions.local.env + pulled {agent} {cli_to}"
+          + (f" (extension {ext_to})" if ext_latest else "")
           + " (untracked; no commit needed)")
 
 
@@ -579,10 +596,16 @@ def cmd_editor_refresh(args: argparse.Namespace) -> None:
     """HITL: check upstream code-server, offer to bump the local pin + re-pull.
     The bump (CODE_SERVER_VERSION) lands in the untracked versions.local.env
     override, not the tracked base — a per-instance change, never a committed one
-    — and it also moves this instance's next `start --rebuild` version."""
+    — and it also moves this instance's next `start --rebuild` version. An OLDER
+    upstream is "nothing to do" (rscore.refresh_target)."""
     current, latest = rscore.editor_refresh_check()
-    if current == latest:
-        print(f"editor: up to date (effective pin {current} == upstream {latest})")
+    target = rscore.refresh_target(current, latest)
+    if target == current:
+        if current == latest:
+            print(f"editor: up to date (effective pin {current} == upstream {latest})")
+        else:
+            print(f"editor: upstream latest {latest} is older than the effective "
+                  f"CODE_SERVER_VERSION {current} — nothing to do")
         if not rscore.editor_dist_present():
             print("  (no dist cached yet — run `research editor pull`)")
         return
@@ -596,8 +619,8 @@ def cmd_editor_refresh(args: argparse.Namespace) -> None:
         if resp not in ("y", "yes"):
             print("aborted; versions.local.env unchanged")
             return
-    rscore.editor_apply_refresh(latest)
-    print(f"bumped versions.local.env + pulled editor code-server {latest} "
+    rscore.editor_apply_refresh(target)
+    print(f"bumped versions.local.env + pulled editor code-server {target} "
           "(untracked; no commit needed)")
 
 
@@ -621,10 +644,16 @@ def cmd_reader_refresh(args: argparse.Namespace) -> None:
     """HITL: check upstream nbconvert, offer to bump the local pin + re-pull. The
     bump (NBCONVERT_VERSION) lands in the untracked versions.local.env override,
     never the tracked base. markdown is a bundled pin — bump it by hand-editing
-    versions.env, then `research reader pull` (mirrors the editor's extensions)."""
+    versions.env, then `research reader pull` (mirrors the editor's extensions).
+    An OLDER upstream is "nothing to do" (rscore.refresh_target)."""
     current, latest = rscore.reader_refresh_check()
-    if current == latest:
-        print(f"reader: up to date (effective nbconvert pin {current} == upstream {latest})")
+    target = rscore.refresh_target(current, latest)
+    if target == current:
+        if current == latest:
+            print(f"reader: up to date (effective nbconvert pin {current} == upstream {latest})")
+        else:
+            print(f"reader: upstream latest {latest} is older than the effective "
+                  f"NBCONVERT_VERSION {current} — nothing to do")
         if not rscore.reader_dist_present():
             print("  (no dist cached yet — run `research reader pull`)")
         return
@@ -637,8 +666,8 @@ def cmd_reader_refresh(args: argparse.Namespace) -> None:
         if resp not in ("y", "yes"):
             print("aborted; versions.local.env unchanged")
             return
-    rscore.reader_apply_refresh(latest)
-    print(f"bumped versions.local.env + pulled reader dist (nbconvert {latest}) "
+    rscore.reader_apply_refresh(target)
+    print(f"bumped versions.local.env + pulled reader dist (nbconvert {target}) "
           "(untracked; no commit needed)")
 
 
