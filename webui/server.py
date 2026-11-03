@@ -16,6 +16,7 @@ import secrets
 import signal
 import socket
 import ssl
+import stat
 import struct
 import time
 from datetime import datetime, timedelta, timezone
@@ -2560,22 +2561,51 @@ def _opened_detected(project: str, registry: list[dict]) -> list[int]:
     return services.opened_detected_ports(list(ORIGIN_PORTS.values()), project, page)
 
 
+# Size cap of the port registry; the reasoning lives beside rscore's
+# EXPORTED_PORTS_MAX_BYTES, which this must equal (this image cannot import it).
+EXPORTED_PORTS_MAX_BYTES = 1 << 20
+
+
+def _load_port_registry(f):
+    """The JSON list in the port registry file `f`; [] when `f` is absent;
+    None when it is there but unusable: not a regular file (a FIFO, a
+    directory, a symlink), larger than EXPORTED_PORTS_MAX_BYTES, not UTF-8,
+    not JSON, or not a list. The file is writable from inside the project's
+    container, so the open never blocks, never follows a link, and reads at
+    most one byte past the cap. MIRRORED byte-for-byte in webui/server.py
+    and cli/rscore.py — keep the two identical."""
+    try:
+        fd = os.open(f, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                return None
+            raw = fh.read(EXPORTED_PORTS_MAX_BYTES + 1)
+        if len(raw) > EXPORTED_PORTS_MAX_BYTES:
+            return None
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    return data if isinstance(data, list) else None
+
+
 def _registry_readable(project: str) -> bool:
     """False when the project's port registry exists but cannot be parsed. The
     tolerant reader then returns [], indistinguishable from "no ports" — and
     the file is writable from inside the container. Listing opened apps,
     Remove and switch-off all decide "hand-added or not" from it, so they
-    refuse (or skip) instead of freeing a hand-added port's address."""
+    refuse (or skip) instead of freeing a hand-added port's address. It
+    applies the same bounded, non-blocking load as _read_exported_ports, so
+    the two always agree on what the registry holds."""
     workspace = _project_workspace(project)
     if workspace is None:
         return False
-    f = workspace / ".orchestrator" / "exported-ports.json"
-    if not f.exists():
-        return True
-    try:
-        return isinstance(json.loads(f.read_text()), list)
-    except Exception:
-        return False
+    return _load_port_registry(
+        workspace / ".orchestrator" / "exported-ports.json") is not None
 
 
 def _detection_forget(project: str, release: bool = True) -> None:
@@ -2960,18 +2990,13 @@ def _read_exported_ports(project: str) -> list[dict]:
     >=1 (key absent == 1)}; any malformed member DEGRADES the entry to a plain
     {port,label} — never dropped, never trusted. {web:true} survives on a valid
     box entry, and on a top-level entry whose raw keys carry none of
-    box/passthrough/host_port (a docker project's own web app)."""
+    box/passthrough/host_port (a docker project's own web app). Oversize,
+    non-regular and symlinked files read as missing (_load_port_registry)."""
     workspace = _project_workspace(project)
     if workspace is None:
         return []
-    f = workspace / ".orchestrator" / "exported-ports.json"
-    if not f.is_file():
-        return []
-    try:
-        data = json.loads(f.read_text())
-    except (OSError, json.JSONDecodeError):
-        return []
-    if not isinstance(data, list):
+    data = _load_port_registry(workspace / ".orchestrator" / "exported-ports.json")
+    if not data:
         return []
     out: list[dict] = []
     for e in data:

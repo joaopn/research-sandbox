@@ -14989,6 +14989,47 @@ def exported_ports_path(workspace_path: "Path") -> "Path":  # type: ignore[name-
     return workspace_path / ".orchestrator" / "exported-ports.json"
 
 
+# The registry is broker-written with indent=2: one entry is ~60-150 bytes plus
+# its label, so 1 MiB holds several thousand entries — far past any tab strip a
+# person can use. At that size one json.loads costs a few ms, which a reader on
+# the serial broker thread (port_detect, polled every 15 s per open browser) and
+# on the webui event loop (every tab listing / origin request) can afford; at 10x
+# it is tens of ms per call per poll on both, and at half it is still thousands
+# of entries, so the value is not tight. The file is writable from inside the
+# project's container, so the cap is what bounds a forged one. A registry past
+# it reads as empty, and the next broker write replaces it — the same as an
+# unparseable file. Same magnitude as PORT_DETECT_MAX_OUTPUT_BYTES. Mirrored in
+# webui/server.py (that image cannot import this module).
+EXPORTED_PORTS_MAX_BYTES = 1 << 20
+
+
+def _load_port_registry(f):
+    """The JSON list in the port registry file `f`; [] when `f` is absent;
+    None when it is there but unusable: not a regular file (a FIFO, a
+    directory, a symlink), larger than EXPORTED_PORTS_MAX_BYTES, not UTF-8,
+    not JSON, or not a list. The file is writable from inside the project's
+    container, so the open never blocks, never follows a link, and reads at
+    most one byte past the cap. MIRRORED byte-for-byte in webui/server.py
+    and cli/rscore.py — keep the two identical."""
+    try:
+        fd = os.open(f, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                return None
+            raw = fh.read(EXPORTED_PORTS_MAX_BYTES + 1)
+        if len(raw) > EXPORTED_PORTS_MAX_BYTES:
+            return None
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    return data if isinstance(data, list) else None
+
+
 def read_exported_ports(workspace_path: "Path") -> list[dict]:  # type: ignore[name-defined]
     """Tolerant read of the exported-port registry → [{port:int, label:str}], plus
     optional {box:str, app_port:int} on an inner-box entry (F3 Slice 2b): `port` is
@@ -15000,7 +15041,8 @@ def read_exported_ports(workspace_path: "Path") -> list[dict]:  # type: ignore[n
     {web:true} too: a docker project's own web app (kept only when exactly True
     and the raw entry has none of box/passthrough/host_port — so a degraded box
     entry or a pass-through claim never turns into a tab nobody can remove).
-    Missing/malformed → []; a plain {port,label} stays a top-level entry.
+    Missing/malformed → [], and so are oversize, non-regular and symlinked
+    files (_load_port_registry); a plain {port,label} stays a top-level entry.
     A pass-through claim (STAGE_PASSTHROUGH_PORTS) additionally carries
     {passthrough:true, host_port:int, count:int>=1 (absent == 1)} — accepted only
     when ALL of those hold, else the entry DEGRADES to a plain {port,label}
@@ -15008,14 +15050,8 @@ def read_exported_ports(workspace_path: "Path") -> list[dict]:  # type: ignore[n
     MIRROR of this rule (the webui image can't import this module) — keep the two
     byte-equivalent in effect. Host-written but webui-read, so never trust the
     shape."""
-    f = exported_ports_path(workspace_path)
-    if not f.is_file():
-        return []
-    try:
-        data = json.loads(f.read_text())
-    except (OSError, json.JSONDecodeError):
-        return []
-    if not isinstance(data, list):
+    data = _load_port_registry(exported_ports_path(workspace_path))
+    if not data:
         return []
     out: list[dict] = []
     for e in data:
@@ -15625,8 +15661,9 @@ def port_detect(req: "PortDetectRequest", _progress=None) -> PortDetectResult:  
     try:
         registry = read_exported_ports(ws)
     except Exception:
-        # The file is writable from inside the container and the shared
-        # reader does not catch every malformation (B149): keep the old view.
+        # The shared reader returns [] for anything malformed (B149); this is
+        # defence in depth, so a future reader regression keeps the old view
+        # instead of escaping the verb.
         return PortDetectResult(running=True, partial=True, **empty)
     page_ports = {int(e["port"]) for e in registry if not e.get("passthrough")}
     # Spans as ranges, never expanded: the registry file is writable from
