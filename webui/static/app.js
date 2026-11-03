@@ -2277,6 +2277,13 @@ function renderMgmtRejected(view) {
     ]);
 }
 
+// The broker `list` state of a project whose container is gone while
+// something of it (workspace, network, DIND volume) is still on the host.
+// LOCKSTEP with rscore.ORPHANED_STATE.
+const ORPHANED_STATE = "orphaned";
+const ORPHANED_TITLE = "Its container is gone (for example after the host's Docker " +
+    "was reset). Destroy removes the workspace and everything else left of it.";
+
 function renderMgmtTable(view, projects) {
     view.innerHTML = "";
     // The Workflows page is the create entry point now (the workflow picker is
@@ -2313,14 +2320,20 @@ function renderMgmtTable(view, projects) {
     const fill = {};   // project name → {badge, size} elements to populate async
     for (const p of projects) {
         const running = p.state === "running";
+        const orphaned = p.state === ORPHANED_STATE;
         const badge = el("span", { class: "type-badge" });          // filled by mgmtFillStatus
         const sizeEl = el("span", { class: "mgmt-size" }, ["—"]);   // filled by Measure sizes
         fill[p.project] = { badge, size: sizeEl };
-        const power = el("button", { class: "btn-small" }, [running ? "Stop" : "Start"]);
-        power.onclick = () => mgmtAction(view, p.project, running ? "stop" : "start");
         // Attach + Update need a live supervisor (bridge endpoint / recreate);
-        // only offered while running. Destroy is always available.
-        const actions = [power];
+        // only offered while running. Destroy is always available. An
+        // orphaned project (its container is gone) offers ONLY Destroy: there
+        // is no container to start or stop.
+        const actions = [];
+        if (!orphaned) {
+            const power = el("button", { class: "btn-small" }, [running ? "Stop" : "Start"]);
+            power.onclick = () => mgmtAction(view, p.project, running ? "stop" : "start");
+            actions.push(power);
+        }
         if (running) {
             const attach = el("button", { class: "btn-small" }, ["Attach"]);
             attach.onclick = () => mgmtAttach(view, p.project, attach);
@@ -2333,8 +2346,10 @@ function renderMgmtTable(view, projects) {
         actions.push(destroy);
         rows.push(el("div", { class: "mgmt-row", "data-project": p.project }, [
             el("span", { class: "mgmt-name" }, [el("span", { class: "mgmt-name-text" }, [p.project]), badge]),
-            el("span", { class: "mgmt-state " + (running ? "state-running" : "state-stopped"),
-                         "data-state": p.state }, [p.state]),
+            el("span", Object.assign(
+                { class: "mgmt-state " + (running ? "state-running" : "state-stopped"),
+                  "data-state": p.state },
+                orphaned ? { title: ORPHANED_TITLE } : {}), [p.state]),
             el("span", { class: "mgmt-ssh" }, [p.ssh || "—"]),
             sizeEl,
             el("span", { class: "mgmt-actions" }, actions),
@@ -10467,9 +10482,11 @@ async function mgmtAgentsUpdateDialog(name, deployed, hasBoxes, local) {
 // The "Sidebar" section — drop this browser's bookmark for a project. It is the
 // ONLY way to get rid of a row whose project is no longer here: the sidebar is a
 // per-browser list, and the one other place that ever removed a row is the
-// completion hook of Management's Destroy — which is unreachable for a project
-// with no supervisor container, because that table lists containers, so a project
-// destroyed elsewhere (or a box on another host, entered by hand) had no exit at all.
+// completion hook of Management's Destroy. That table also lists a project whose
+// container is gone while its workspace, network or volume remain (an orphaned
+// row, Destroy only), but a project with NOTHING left on this host — destroyed
+// elsewhere, or a box on another host entered by hand — is in no table at all
+// and has only this exit.
 //
 // Appended at BOTH exits of makeProjectConfigBox on purpose. The early one is
 // taken while a row has never been opened; the full one the moment it IS opened,
@@ -10760,7 +10777,8 @@ function renderPassthroughLauncher(container, status, svc) {
 // (projectName fixed) and the Management "Pass-through ports" subsection
 // (projects picker: ALL broker-known rows, stopped included — a claim on a
 // stopped project takes effect at its next start, same contract as the
-// per-project section). Payload discipline: host_port is OMITTED when it
+// per-project section — orphaned excluded: a project whose container is gone
+// can never use a claim). Payload discipline: host_port is OMITTED when it
 // equals the app port and count is OMITTED when 1 — the server defaults
 // them, and an explicit null/0 refuses loudly by design (never send
 // placeholders).
@@ -10924,7 +10942,8 @@ async function appendPassthroughSection(view, projects) {
         el("h3", { class: "mgmt-infra-title" }, ["Pass-through ports"]),
         table,
     ]);
-    const names = (projects || []).map((p) => p.project);
+    const names = (projects || []).filter((p) => p.state !== ORPHANED_STATE)
+        .map((p) => p.project);
     wrap.appendChild(buildPassthroughClaimForm({
         projects: names,
         onClaimed: async (project) => {
