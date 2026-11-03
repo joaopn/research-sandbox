@@ -1701,6 +1701,14 @@ html.mobile .project-rail .rail-separator { cursor: default; }
    a branch-less or all-hidden card must not carry a phantom gap slot. */
 .dev-branch-wrap { display: flex; flex-direction: column; gap: 6px; }
 .dev-branch-wrap:empty { display: none; }
+/* Open PRs past the card's shown count, behind the "Show more" toggle. Same
+   column + gap re-application as .dev-branch-wrap. Collapsed is a class, not
+   the [hidden] attribute: this rule's display:flex would override the UA's
+   [hidden] { display: none }. The button must not stretch across the card's
+   flex column. */
+.dev-pr-more { display: flex; flex-direction: column; gap: 6px; }
+.dev-pr-more.collapsed { display: none; }
+.dev-pr-more-btn { align-self: flex-start; }
 .dev-pr-id { color: var(--fg-muted); min-width: 42px; }
 .dev-pr-title {
     flex: 1;

@@ -4270,6 +4270,19 @@ function devUpstreamText(u) {
 //   rerender — the re-render target after Sync / fork change / a review lands
 //              (the CLOSE landing; the 401 post-login landing is the distinct
 //              view-rooted onLogin derived below).
+//
+// Open PRs past DEV_PR_ROWS_SHOWN collapse behind a "Show more" toggle, so the
+// branch rows below stay near the top of a busy card. Ten rows (about 300 px)
+// keep the branch rows within the first screen of a laptop with room to spare:
+// at 5 the operator expands for any moderately busy fork; at 20+ the branches
+// are back below the fold, which is the thing this exists to stop. A card with
+// no more PRs than this renders exactly as before.
+const DEV_PR_ROWS_SHOWN = 10;
+// Repos whose PR list the operator expanded. Session memory only (never the
+// vault): it keeps the list open across card re-renders (Sync, a fork change, a
+// review landing) until the page reloads. Keyed by repo — the Development page
+// and a project's pane showing the same repo share it.
+const devPrListExpanded = new Set();
 function buildDevRepoCard(view, body, r, attached, opts) {
     const scoped = !!(opts && opts.scoped);
     const rerender = (opts && opts.rerender)
@@ -4432,7 +4445,18 @@ function buildDevRepoCard(view, body, r, attached, opts) {
     }
     const rows = [el("div", { class: "dev-repo-head" }, head)];
     const reviews = (r.reviews && typeof r.reviews === "object") ? r.reviews : {};
+    // PR rows past DEV_PR_ROWS_SHOWN go into one wrapper that collapses as a
+    // whole: each row's commits panel and its lazily-inserted verdict panel are
+    // the row's SIBLINGS, so they land in the wrapper with it and hide with it.
+    // Collapsed is display:none, never detached, so the review watcher still
+    // finds the stamped cells inside (it only checks isConnected). Built only
+    // when there is overflow: a shorter list renders exactly as before.
+    const prMore = prs.length > DEV_PR_ROWS_SHOWN
+        ? el("div", { class: "dev-pr-more" }) : null;
+    let prIndex = 0;
     for (const p of prs) {
+        const into = (prMore && prIndex >= DEV_PR_ROWS_SHOWN) ? prMore : null;
+        prIndex += 1;
         const commitsUi = devCommitsExpander(view, body, r.repo,
                                              { pr: p.number }, rerender,
                                              onLogin, autoCommit);
@@ -4461,8 +4485,36 @@ function buildDevRepoCard(view, body, r, attached, opts) {
         devRenderPrReviewCell(revCell, r.repo, p, v,
                               { view, body, rerender, onLogin });
         cells.push(revCell);
-        rows.push(el("div", { class: "dev-pr-row" }, cells));
-        rows.push(commitsUi.panel);
+        const prRow = el("div", { class: "dev-pr-row" }, cells);
+        if (into) {
+            into.append(prRow, commitsUi.panel);
+        } else {
+            rows.push(prRow);
+            rows.push(commitsUi.panel);
+        }
+    }
+    if (prMore) {
+        // The button sits ABOVE the hidden rows, so expanding reveals them
+        // below it and "Show fewer" stays where it was clicked (no jump).
+        const moreBtn = el("button", { class: "btn-small dev-pr-more-btn" });
+        const paintMore = (open) => {
+            prMore.classList.toggle("collapsed", !open);
+            moreBtn.textContent = open
+                ? "Show fewer"
+                : `Show more (${prs.length} total open PRs)`;
+        };
+        // The direction comes from THIS card's wrapper, never from the Set: a
+        // card built before another surface expanded the same repo is still
+        // collapsed, and reading the Set would make its first click a no-op.
+        moreBtn.onclick = () => {
+            const open = prMore.classList.contains("collapsed");
+            if (open) devPrListExpanded.add(r.repo);
+            else devPrListExpanded.delete(r.repo);
+            paintMore(open);
+        };
+        paintMore(devPrListExpanded.has(r.repo));
+        rows.push(moreBtn);
+        rows.push(prMore);
     }
     // The sync sentence joins "No open PRs." when there are none, and is its
     // own faint line under the PR rows otherwise. The tooltip names the branch
