@@ -1,4 +1,4 @@
-// rs-rules v0.4.0
+// rs-rules v0.5.0
 //
 // Claude Code's rules capability for pi, one-to-one, as an RS-owned extension.
 // Shipped inside the pi dist (share/pi-agent/rs/rs-rules.ts) and named from the
@@ -34,16 +34,23 @@
 // Not reproduced, by decision: `claudeMdExcludes`, `@path` imports,
 // `--setting-sources`.
 //
+// And Claude Code's shell directory: a `cd` in one `bash` call carries over to
+// the next as long as it stays inside the session's start directory; a command
+// that leaves it is followed by "Shell cwd was reset to <start>" and the next
+// command starts there again; relative paths given to read, edit, write, grep,
+// find and ls resolve against that same current directory.
+//
 // Every handler is wrapped: a failure warns and returns nothing (a thrown
 // tool_call handler would BLOCK the tool — the catch is load-bearing).
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const RS_RULES_VERSION = "0.4.0";
+export const RS_RULES_VERSION = "0.5.0";
 
 // The system-prompt SECTION the launch rules ride in (pi wraps it as
 // `<project_rules>…</project_rules>`). A section, never a returned
@@ -662,8 +669,11 @@ export function discoverNested(dir: string, root: string, warn: (m: string) => v
 // Target normalisation (pi's own path handling, reproduced).
 // ---------------------------------------------------------------------------
 
-export function normalizeTarget(raw: string, cwd: string, home: string): string {
-  let p = String(raw ?? "").trim();
+// pi's own spelling rules for a tool path, without resolving it: a leading `@`,
+// a file:// URL, unicode spaces, a leading `~`.
+export function expandToolPath(raw: string, home: string, trim = true): string {
+  let p = String(raw ?? "");
+  if (trim) p = p.trim();
   if (p.startsWith("@")) p = p.slice(1);
   if (p.startsWith("file://")) {
     try {
@@ -674,8 +684,90 @@ export function normalizeTarget(raw: string, cwd: string, home: string): string 
   }
   p = p.replace(/[\u00a0\u1680\u2000-\u200b\u202f\u205f\u3000\ufeff]/g, " ");
   if (p === "~" || p.startsWith("~/")) p = path.join(home, p.slice(1));
-  const abs = path.resolve(cwd, p);
+  return p;
+}
+
+export function normalizeTarget(raw: string, cwd: string, home: string): string {
+  const abs = path.resolve(cwd, expandToolPath(raw, home));
   return realpathOrNull(abs) ?? path.normalize(abs);
+}
+
+// ---------------------------------------------------------------------------
+// The shell's directory.
+// ---------------------------------------------------------------------------
+
+export const SHELL_CWD_SECTION = "rs_shell_cwd";
+export const CWD_FILE_PREFIX = "rs-cwd-";
+export const RESET_NOTICE = (start: string) => `Shell cwd was reset to ${start}`;
+// The shells whose syntax the command prefix uses (`trap … EXIT`, `cd --`, `>|`).
+export const POSIX_SHELLS = ["bash", "sh", "dash", "zsh"];
+// The file tools whose `path` follows the shell's directory; for the last three
+// `path` is optional and defaults to the session's directory.
+export const PATH_TOOLS_REQUIRED = ["read", "edit", "write"];
+export const PATH_TOOLS_OPTIONAL = ["grep", "find", "ls"];
+
+// A single-quoted shell word.
+export function shellQuote(s: string): string {
+  return "'" + s.replace(/'/g, `'\\''`) + "'";
+}
+
+// Whether `target` is `base` or below it (both absolute, already real paths).
+export function isInside(base: string, target: string): boolean {
+  const rel = path.relative(base, target);
+  return rel === "" || (rel !== ".." && !rel.startsWith(".." + path.sep) && !path.isAbsolute(rel));
+}
+
+// Whether a configured shellPath is one the prefix works in; none = pi's default
+// (bash, else sh).
+export function shellIsPosix(shellPath: unknown): boolean {
+  if (shellPath === undefined || shellPath === null || shellPath === "") return true;
+  if (typeof shellPath !== "string") return false;
+  return POSIX_SHELLS.includes(path.basename(shellPath.trim()));
+}
+
+// The lines put in front of a command: record where it ends (also on `exit`;
+// a killed command records nothing), then start in `dir` unless that is the
+// start directory already.
+export function shellPrefix(file: string, dir: string, start: string): string {
+  const trap = `trap ${shellQuote(`pwd -P >| ${shellQuote(file)} 2>/dev/null`)} EXIT\n`;
+  return dir === start ? trap : trap + `cd -- ${shellQuote(dir)} || exit 1\n`;
+}
+
+// Where the next command starts, from what a command recorded: inside the start
+// directory → there; outside → back at the start with the notice; nothing
+// recorded (its own EXIT trap replaced ours, or it was killed) → null (keep).
+export function cwdAfter(recorded: string | null, start: string): { dir: string; notice: string | null } | null {
+  if (recorded === null) return null;
+  const d = recorded.trim();
+  if (!d || !path.isAbsolute(d)) return null;
+  const real = realpathOrNull(d) ?? d;
+  return isInside(start, real) ? { dir: real, notice: null } : { dir: start, notice: RESET_NOTICE(start) };
+}
+
+// A tool path made absolute against the shell's directory, or null when it is
+// already absolute (pi's spelling rules applied first, untrimmed as pi resolves
+// the path it acts on, never a realpath).
+export function followPath(raw: string, cwdNow: string, home: string): string | null {
+  const p = expandToolPath(raw, home, false);
+  if (path.isAbsolute(p)) return null;
+  return path.resolve(cwdNow, p);
+}
+
+// The shellPath values that may be in force: the project's .pi/settings.json
+// (pi skips it for an untrusted project) and the agent dir's settings.json. Both
+// must be POSIX for the prefix to be used.
+function configuredShellPaths(cwd: string, home: string): unknown[] {
+  const read = (f: string): Record<string, unknown> | null => {
+    try {
+      return JSON.parse(fs.readFileSync(f, "utf8"));
+    } catch {
+      return null;
+    }
+  };
+  const agentDir = process.env.PI_CODING_AGENT_DIR
+    ? expandToolPath(process.env.PI_CODING_AGENT_DIR, home)
+    : path.join(home, ".pi", "agent");
+  return [read(path.join(cwd, ".pi", "settings.json"))?.shellPath, read(path.join(agentDir, "settings.json"))?.shellPath];
 }
 
 function relTo(base: string, target: string): string | null {
@@ -752,7 +844,9 @@ interface ToolCallEvt {
 }
 interface ToolResultEvt extends ToolCallEvt {
   content: unknown[];
+  structuredContent?: unknown;
   isError?: boolean;
+  parentToolCallId?: string;
 }
 
 export default function rsRules(pi: ExtensionAPI) {
@@ -763,6 +857,17 @@ export default function rsRules(pi: ExtensionAPI) {
   const readMap = new Map<string, number>(); // realpath -> mtimeMs at the read
   let uiCtx: ExtensionContext | null = null;
   let registration: { dispose(): void } | null = null;
+  // The shell's directory (see the header): the session's start directory (real
+  // path), where the next command starts, and the calls in flight.
+  let startDir = "";
+  let cwdNow = "";
+  let shellOn = false;
+  let seq = 0;
+  let appliedSeq = 0;
+  const sessionTag = crypto.randomBytes(6).toString("hex");
+  const inFlight = new Map<string, { seq: number; file: string; topLevel: boolean; notice: string | null }>();
+  const cwdFiles = new Set<string>(); // every per-call file named, removed by name
+  const fileNotices = new Map<string, string>(); // toolCallId -> reset notice for a file tool's result
 
   const hasUI = () => !!(uiCtx && (uiCtx as any).hasUI);
   const parentUI = (): ((line: string) => void) | null => {
@@ -952,6 +1057,7 @@ export default function rsRules(pi: ExtensionAPI) {
       }
       rediscover(ctx);
       rebuildFromBranch(ctx);
+      resetShell(ctx);
       const launch = disc!.rules.filter((r) => !r.paths).length + (disc!.claudeMd ? 1 : 0) + (disc!.claudeLocal ? 1 : 0);
       const scoped = disc!.rules.filter((r) => !!r.paths).length;
       if ((ctx as any).hasUI && launch + scoped > 0) {
@@ -965,6 +1071,12 @@ export default function rsRules(pi: ExtensionAPI) {
   // (/new, resume, fork, reload): the registration is per session id.
   pi.on("session_shutdown", async (_event, _ctx) => {
     guarded("session_shutdown", () => unregister());
+    // Per-call files a command wrote after its result came back (a yielded
+    // command), and those of calls still in flight: removed by name.
+    guarded("session_shutdown", () => {
+      for (const f of [...cwdFiles]) removeCwdFile(f);
+      inFlight.clear();
+    });
   });
 
   pi.on("before_agent_start", async (event: any, ctx) => {
@@ -988,9 +1100,72 @@ export default function rsRules(pi: ExtensionAPI) {
       const sections = event.systemPromptOptions.sections;
       if (parts.length === 0) delete sections[RS_RULES_SECTION];
       else sections[RS_RULES_SECTION] = "# Project rules (rs-rules)\n\n" + parts.join("\n\n");
+      if (!startDir) resetShell(ctx);
+      if (shellOn) {
+        sections[SHELL_CWD_SECTION] =
+          `The bash tool keeps its working directory between calls inside ${startDir}: a \`cd\` carries over to the next command; ` +
+          `a command that ends outside it is followed by "${RESET_NOTICE(startDir)}" and the next command starts there again. ` +
+          "Relative paths given to read, edit, write, grep, find and ls resolve against that same current directory.";
+      } else delete sections[SHELL_CWD_SECTION];
       return undefined;
     });
   });
+
+  // Forgotten only once removed: a file not there yet (a yielded command still
+  // running, a call in flight) stays named for session_shutdown.
+  const removeCwdFile = (file: string) => {
+    try {
+      fs.unlinkSync(file);
+      cwdFiles.delete(file);
+    } catch {
+      /* absent: nothing recorded yet */
+    }
+  };
+
+  // Start the shell directory over for a session: its start directory, and
+  // whether the configured shell can take the prefix.
+  const resetShell = (ctx: ExtensionContext) => {
+    startDir = realpathOrNull(ctx.cwd) ?? path.resolve(ctx.cwd);
+    cwdNow = startDir;
+    shellOn = configuredShellPaths(ctx.cwd, home).every(shellIsPosix);
+    seq = 0;
+    appliedSeq = 0;
+  };
+
+  // A bash call: run it from the remembered directory and record where it ends.
+  const prepareBash = (ev: ToolCallEvt & { parentToolCallId?: string }) => {
+    if (!shellOn || typeof ev.input?.command !== "string") return;
+    let notice: string | null = null;
+    if (cwdNow !== startDir && !isDir(cwdNow)) {
+      cwdNow = startDir; // the directory went away (a removed worktree)
+      notice = RESET_NOTICE(startDir);
+    }
+    const id = crypto.createHash("sha256").update(`${ev.toolCallId}\0${crypto.randomBytes(8).toString("hex")}`).digest("hex").slice(0, 20);
+    const file = path.join(os.tmpdir(), `${CWD_FILE_PREFIX}${sessionTag}-${id}`);
+    cwdFiles.add(file);
+    inFlight.set(ev.toolCallId, { seq: ++seq, file, topLevel: !ev.parentToolCallId, notice });
+    ev.input.command = shellPrefix(file, cwdNow, startDir) + ev.input.command;
+  };
+
+  // A file tool: a relative path (or, for grep/find/ls, none) follows the shell;
+  // a remembered directory that went away falls back to the start directory
+  // here too, with the notice on this tool's result.
+  const followShell = (ev: ToolCallEvt) => {
+    if (!shellOn || cwdNow === startDir || !ev.input) return;
+    if (!isDir(cwdNow)) {
+      cwdNow = startDir;
+      fileNotices.set(ev.toolCallId, RESET_NOTICE(startDir));
+      return;
+    }
+    const raw = ev.input.path;
+    if (PATH_TOOLS_OPTIONAL.includes(ev.toolName) && (raw === undefined || raw === null || raw === "")) {
+      ev.input.path = cwdNow;
+      return;
+    }
+    if (typeof raw !== "string") return;
+    const abs = followPath(raw, cwdNow, home);
+    if (abs !== null) ev.input.path = abs;
+  };
 
   pi.on("tool_call", async (event: any, ctx) => {
     return guarded("tool_call", () => {
@@ -999,20 +1174,82 @@ export default function rsRules(pi: ExtensionAPI) {
         const reason = subagentLaunchRefusal(ev.input);
         return reason === null ? undefined : { block: true, reason };
       }
+      if (ev.toolName === "bash") {
+        prepareBash(ev);
+        return undefined;
+      }
+      if (PATH_TOOLS_REQUIRED.includes(ev.toolName) || PATH_TOOLS_OPTIONAL.includes(ev.toolName)) followShell(ev);
       if (ev.toolName !== "edit" && ev.toolName !== "write") return undefined;
       const target = normalizeTarget(String(ev.input?.path ?? ""), ctx.cwd, home);
       const mt = mtimeOf(target);
       if (mt === null) return undefined; // a new file: never blocked
       const seen = readMap.get(target);
-      if (seen === undefined) return { block: true, reason: NOT_READ_MSG };
-      if (seen !== mt) return { block: true, reason: STALE_READ_MSG };
+      if (seen === undefined) return blocked(ev, NOT_READ_MSG);
+      if (seen !== mt) return blocked(ev, STALE_READ_MSG);
       return undefined;
     });
   });
 
+  // A refusal; a blocked call gets no tool_result, so a pending reset notice for
+  // it rides the refusal's reason instead.
+  const blocked = (ev: ToolCallEvt, reason: string) => {
+    const notice = fileNotices.get(ev.toolCallId);
+    if (notice === undefined) return { block: true, reason };
+    fileNotices.delete(ev.toolCallId);
+    return { block: true, reason: `${reason}\n${notice}` };
+  };
+
+  // After a bash call: where it ended decides where the next one starts (only a
+  // call the model made itself moves it; the last one in the order the calls
+  // were made wins over a sibling that finished later).
+  const finishBash = (ev: ToolResultEvt) => {
+    const call = inFlight.get(ev.toolCallId);
+    if (!call) return undefined;
+    inFlight.delete(ev.toolCallId);
+    let recorded: string | null = null;
+    try {
+      recorded = fs.readFileSync(call.file, "utf8");
+    } catch {
+      recorded = null;
+    }
+    removeCwdFile(call.file);
+    let notice = call.notice;
+    if (call.topLevel) {
+      const next = cwdAfter(recorded, startDir);
+      if (next && call.seq > appliedSeq) {
+        appliedSeq = call.seq;
+        cwdNow = next.dir;
+        if (next.notice) notice = next.notice;
+      }
+    }
+    if (!notice) return undefined;
+    const content = Array.isArray(ev.content) ? [...ev.content] : [];
+    content.push({ type: "text", text: notice });
+    return ev.structuredContent === undefined ? { content } : { content, structuredContent: ev.structuredContent };
+  };
+
+  // A file tool's result with the reset notice appended (structured result kept).
+  const withNotice = (ev: ToolResultEvt, res: { content: unknown[] } | undefined) => {
+    const notice = fileNotices.get(ev.toolCallId);
+    if (notice === undefined) return res;
+    fileNotices.delete(ev.toolCallId);
+    const content = [...(res ? res.content : Array.isArray(ev.content) ? ev.content : [])];
+    content.push({ type: "text", text: notice });
+    return ev.structuredContent === undefined ? { content } : { content, structuredContent: ev.structuredContent };
+  };
+
   pi.on("tool_result", async (event: any, ctx) => {
     return guarded("tool_result", () => {
       const ev = event as ToolResultEvt;
+      if (ev.toolName === "bash") return finishBash(ev);
+      return withNotice(ev, fileToolResult(ev, ctx));
+    });
+  });
+
+  // The rules' half of a file tool's result: the read set, the recorded target,
+  // the scoped rules that attach.
+  const fileToolResult = (ev: ToolResultEvt, ctx: ExtensionContext): { content: unknown[] } | undefined => {
+    {
       if (!["read", "edit", "write"].includes(ev.toolName) || ev.isError) return undefined;
       const target = normalizeTarget(String(ev.input?.path ?? ""), ctx.cwd, home);
       const mt = mtimeOf(target);
@@ -1044,8 +1281,8 @@ export default function rsRules(pi: ExtensionAPI) {
       const content = Array.isArray(ev.content) ? [...ev.content] : [];
       content.push({ type: "text", text: blocks.join("\n\n") });
       return { content };
-    });
-  });
+    }
+  };
 
   pi.on("session_compact", async (_event, _ctx) => {
     guarded("session_compact", () => {
