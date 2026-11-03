@@ -163,9 +163,10 @@ MIRROR_INTERVAL = "10m"
 LIST_LIMIT = 100
 # The Development-page read bound (repo_status: up to FIVE metadata GETs per
 # repo on the broker's serial thread — forks list, mirror info, fork info,
-# pulls, branches; an EMPTY or fork-less repo stops at three/two — plus the
-# upstream-sync decoration, which spends only what those five LEFT of
-# REPO_STATUS_BUDGET_S below, so it never moves the per-repo worst). A
+# the FIRST page of pulls, the FIRST page of branches; an EMPTY or fork-less
+# repo stops at three/two — plus the continuation pages of those two lists
+# and then the upstream-sync decoration, which spend only what those five
+# LEFT of REPO_STATUS_BUDGET_S below, so neither moves the per-repo worst). A
 # local-bridge gitea answers these in ms and a DOWN one refuses instantly —
 # the bound only matters for a HALF-UP gitea, where the quick-call
 # API_TIMEOUT_S (15s) would blow the webui's 30s relay window at a single
@@ -178,12 +179,22 @@ STATUS_TIMEOUT_S = 5
 # One repo_status read's whole wall-time budget: the five-read worst the
 # rationale above already accepts (5 x STATUS_TIMEOUT_S, inside the webui's 30s
 # relay window), named rather than re-derived. The five reads keep their own
-# per-call bound; the upstream-sync decoration that follows them gets only the
-# REMAINDER of this budget, so a half-up gitea drops the sentence instead of
-# pushing one repo's read past the window. Approximate in the same way every
+# per-call bound; the continuation pages of the PR and branch lists, and then
+# the upstream-sync decoration, get only the REMAINDER of this budget, so a
+# half-up gitea shortens a long list (the card says how many did not load) or
+# drops the sentence instead of pushing one repo's read past the window.
+# Approximate in the same way every
 # STATUS_TIMEOUT_S bound is: urlopen's timeout bounds each blocking socket
 # operation, not the call as a whole.
 REPO_STATUS_BUDGET_S = 5 * STATUS_TIMEOUT_S
+# Rows per page when repo_status reads the active fork's open PRs and branches.
+# 50 is gitea's server-side list clamp default (api.MAX_RESPONSE_ITEMS —
+# measured: limit=100 returns 50 rows): asking for more is silently clamped,
+# asking for less only adds round trips inside REPO_STATUS_BUDGET_S. Nothing
+# depends on it MATCHING the server's clamp: the paging loop is driven by
+# X-Total-Count, so a gitea configured with a lower clamp still pages to the
+# end (and without the header, a short page ends the list).
+LIST_PAGE_SIZE = 50
 # Bounded wait for gitea's async fork (202) to materialize. A small-repo fork is
 # near-instant; 30×1s covers a busy gitea without hanging. At 5s a loaded gitea
 # false-fails; at 300s a wedged fork would hold the caller 5 min.
@@ -2085,17 +2096,112 @@ def _count_or_none(value: Any) -> "int | None":
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def _total_count(headers: dict) -> "int | None":
+    """X-Total-Count as a non-negative int, or None when it is absent or not a
+    number. Never raises: on a list read the header only steers paging, and a
+    missing one falls back to the short-page rule."""
+    raw = headers.get("x-total-count")
+    try:
+        n = int(raw) if isinstance(raw, str) else -1
+    except ValueError:
+        n = -1
+    return n if n >= 0 else None
+
+
+class _ListPager:
+    """One gitea list read by repo_status, paged LIST_PAGE_SIZE rows at a time.
+
+    Two phases, so repo_status can read BOTH lists' first pages before either
+    list's continuation: first() is one of the per-call-bounded reads and
+    raises like one (row-level degradation, B37); rest() spends only what is
+    left of the caller's deadline and never raises — a later page that fails or
+    finds the budget spent stops the list with the rows already read, and
+    total() lets the card say how many are missing.
+
+    The list is finished when the rows read reach X-Total-Count, when a page
+    without a usable count comes back short, when a page is empty or not a list,
+    or when a page adds no new row (de-duplicated by `key`) — the last rule ends
+    a server that repeats a page even with a frozen clock."""
+
+    def __init__(self, client: "GiteaClient", path: str, key: str) -> None:
+        self._client = client
+        self._path = path
+        self._sep = "&" if "?" in path else "?"
+        self._key = key
+        self._seen: set = set()
+        self._page = 0
+        self._header_total: "int | None" = None
+        self.rows: list[dict] = []
+        self.done = False
+
+    def _read(self, timeout: float) -> None:
+        self._page += 1
+        headers: dict = {}
+        body = self._client._api(
+            "GET", f"{self._path}{self._sep}limit={LIST_PAGE_SIZE}"
+                   f"&page={self._page}",
+            timeout=timeout, headers_out=headers)
+        n = _total_count(headers)
+        if n is not None:
+            self._header_total = n
+        if not isinstance(body, list) or not body:
+            self.done = True
+            return
+        added = 0
+        for row in body:
+            if not isinstance(row, dict):
+                continue
+            k = row.get(self._key)
+            k = k if isinstance(k, (str, int)) else repr(k)
+            if k in self._seen:
+                continue
+            self._seen.add(k)
+            self.rows.append(row)
+            added += 1
+        if not added:
+            self.done = True
+        elif self._header_total is not None:
+            self.done = len(self.rows) >= self._header_total
+        else:
+            self.done = len(body) < LIST_PAGE_SIZE
+
+    def first(self) -> None:
+        self._read(STATUS_TIMEOUT_S)
+
+    def rest(self, deadline_at: float) -> None:
+        while not self.done:
+            # Checked BEFORE the call: urlopen raises ValueError on a negative
+            # timeout and misreads 0 (the _Deadline reason).
+            left = deadline_at - _monotonic()
+            if left <= 0:
+                return
+            try:
+                self._read(min(STATUS_TIMEOUT_S, left))
+            except GiteaError:
+                return
+
+    def total(self) -> "int | None":
+        """Gitea's count when it sent one; else the rows read when the list
+        finished; else None — stopped early with the size unknown."""
+        if self._header_total is not None:
+            return self._header_total
+        return len(self.rows) if self.done else None
+
+
 def repo_status(host_port: str, repo: str) -> dict:
     """Per-repo Development-page status: mirror sync time + the ACTIVE fork's
     open PRs + branches (multi-fork reads are steered by the active-fork map —
     the deliberate simplification; no cross-fork aggregation), plus the forks
     list + active marker for the Management dropdown, plus `upstream` — where
     the active fork's recorded base stands against the mirror (upstream_sync;
-    None when unknown). STATUS_TIMEOUT_S-bounded GETs inside one
-    REPO_STATUS_BUDGET_S; fields are picked by NAME, so no secret can enter
-    the result."""
-    # Taken at entry: the upstream-sync decoration below spends only what the
-    # reads before it leave of REPO_STATUS_BUDGET_S.
+    None when unknown). Both lists are PAGED to the end (_ListPager), and
+    `prs_total` / `branches_total` carry how many gitea says exist (None when a
+    list stopped early with no count) so the card can say what did not load.
+    STATUS_TIMEOUT_S-bounded GETs inside one REPO_STATUS_BUDGET_S; fields are
+    picked by NAME, so no secret can enter the result."""
+    # Taken at entry: the list continuation pages and the upstream-sync
+    # decoration below spend only what the reads before them leave of
+    # REPO_STATUS_BUDGET_S.
     deadline_at = _monotonic() + REPO_STATUS_BUDGET_S
     client = GiteaClient(api_base(host_port), read_admin_token())
     forks = list_forks(host_port, repo)
@@ -2103,6 +2209,9 @@ def repo_status(host_port: str, repo: str) -> dict:
     info = client._api("GET", f"/repos/{ADMIN_USER}/{repo}",
                        timeout=STATUS_TIMEOUT_S) or {}
     prs_raw, branches_raw = [], []
+    # A fork-less or empty repo's lists are complete and empty, not unknown.
+    prs_total: "int | None" = 0
+    branches_total: "int | None" = 0
     fork_empty = False
     # The ACTIVE fork's own gitea repo id — what a review verdict is filed
     # under, so the badge feed can tell this fork's PR #N from another
@@ -2136,13 +2245,22 @@ def repo_status(host_port: str, repo: str) -> dict:
         open_issues = _count_or_none(fork_info.get("open_issues_count"))
         open_prs = _count_or_none(fork_info.get("open_pr_counter"))
         if not fork_empty:
-            prs_raw = client._api(
-                "GET",
-                f"/repos/{active}/{repo}/pulls?state=open&limit={LIST_LIMIT}",
-                timeout=STATUS_TIMEOUT_S) or []
-            branches_raw = client._api(
-                "GET", f"/repos/{active}/{repo}/branches",
-                timeout=STATUS_TIMEOUT_S) or []
+            # Gitea pages both lists (30 rows by default, 50 at most), so one
+            # read showed only the first page — on a busy fork that hid the
+            # base branch (it sorts after every agent/ branch). Both FIRST
+            # pages are read before either continuation, so the per-call
+            # bounded reads are exactly the ones above; the branch list
+            # continues first, because a missing base branch costs the most.
+            pulls = _ListPager(client, f"/repos/{active}/{repo}/pulls?state=open",
+                               "number")
+            heads = _ListPager(client, f"/repos/{active}/{repo}/branches",
+                               "name")
+            pulls.first()
+            heads.first()
+            heads.rest(deadline_at)
+            pulls.rest(deadline_at)
+            prs_raw, branches_raw = pulls.rows, heads.rows
+            prs_total, branches_total = pulls.total(), heads.total()
     prs = []
     for p in prs_raw if isinstance(prs_raw, list) else []:
         if not isinstance(p, dict):
@@ -2184,7 +2302,9 @@ def repo_status(host_port: str, repo: str) -> dict:
             "open_issues": open_issues,
             "open_prs": open_prs,
             "prs": prs,
+            "prs_total": prs_total,
             "branches": branches,
+            "branches_total": branches_total,
             "upstream": upstream}
 
 

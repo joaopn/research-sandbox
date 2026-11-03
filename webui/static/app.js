@@ -4357,6 +4357,23 @@ function devUpstreamText(u) {
         + "upstream yet.";
 }
 
+// The note under a card's PR or branch list when it is shorter than the fork's
+// real list: repo_status pages both lists to the end, but a slow gitea can run
+// out of the per-repo time budget (or fail a later page) first. `total` is
+// gitea's count (an integer), null when the read stopped early without one, or
+// undefined on a reply that predates the field — which, like a complete list,
+// says nothing. Worded for every stop reason, not only the clock.
+function devListShortfall(listed, total, one, many) {
+    const tail = " — the rest could not be loaded. Reload to try again.";
+    if (total === null) {
+        return `Showing the first ${listed} ${listed === 1 ? one : many}${tail}`;
+    }
+    if (Number.isInteger(total) && total > listed) {
+        return `Showing ${listed} of ${total} ${total === 1 ? one : many}${tail}`;
+    }
+    return "";
+}
+
 // Build ONE dev repo's card — shared by the Development Fetch tab (unscoped)
 // and the per-project Fetch pane (scoped). view/body host the review dialog's
 // redirects and error cards (the host page, or the pane container — both work:
@@ -4428,13 +4445,20 @@ function buildDevRepoCard(view, body, r, attached, opts) {
             ]),
         ]);
     }
+    // The counts are gitea's totals when the reply carries them, so a list
+    // cut short (the note under it) still shows the fork's real size; never
+    // fewer than the rows listed (a PR closed mid-read can lower the count).
+    const realCount = (listed, total) =>
+        (Number.isInteger(total) ? Math.max(listed, total) : listed);
+    const prCount = realCount(prs.length, r.prs_total);
+    const branchCount = realCount(branches.length, r.branches_total);
     const meta = (r.private ? "private · " : "")
         + (r.empty
             // The quiet empty state (B37): a zero-commit source, or a
             // fresh consumer fork before the agent's first push.
             ? "empty — the agent hasn't pushed yet"
-            : `${prs.length} open PR${prs.length === 1 ? "" : "s"} · `
-              + `${branches.length} branch${branches.length === 1 ? "" : "es"}`)
+            : `${prCount} open PR${prCount === 1 ? "" : "s"} · `
+              + `${branchCount} branch${branchCount === 1 ? "" : "es"}`)
         + (r.mirror_synced_at ? ` · synced ${r.mirror_synced_at}` : "");
     // Active-fork control (per-consumer forks): a plain badge with one
     // live fork; a dropdown at ≥2 — the Management-steered GLOBAL
@@ -4615,6 +4639,9 @@ function buildDevRepoCard(view, body, r, attached, opts) {
         rows.push(moreBtn);
         rows.push(prMore);
     }
+    const prShort = devListShortfall(prs.length, r.prs_total,
+                                     "open PR", "open PRs");
+    if (prShort) rows.push(el("div", { class: "dev-pr-meta" }, [prShort]));
     // The sync sentence joins "No open PRs." when there are none, and is its
     // own faint line under the PR rows otherwise. The tooltip names the branch
     // pair (the sentence compares ONE branch) and the freshness caveat:
@@ -4668,6 +4695,11 @@ function buildDevRepoCard(view, body, r, attached, opts) {
     hideBox.onchange = paintBranches;
     paintBranches();
     rows.push(branchWrap);
+    const branchShort = devListShortfall(branches.length, r.branches_total,
+                                         "branch", "branches");
+    if (branchShort) {
+        rows.push(el("div", { class: "dev-pr-meta" }, [branchShort]));
+    }
     if (attached.length) {
         rows.push(el("div", { class: "dev-pr-meta dev-attached" },
                      ["worked by: " + attached.join(", ")]));
