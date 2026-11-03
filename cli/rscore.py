@@ -12992,7 +12992,8 @@ def _role_mcp_enable(project: str, cfg: "Config", role: str,
         write ``upstream_source=auto``. The re-mark path.
       - ``upstreams=None, force_auto=False``:
           - if no existing entry: first-time enable — auto-derive, write
-            ``upstream_source=auto``. Empty result emits the M8 warning.
+            ``upstream_source=auto``. Empty result warns, unless the role
+            ships image-baked tools (``role_mcp.ROLE_BAKED_MCPS``).
           - if an entry exists: idempotent re-run — preserve current
             ``upstream_source`` and ``upstream_mcps``. No silent flips."""
     role_mcp.validate_role(role)
@@ -13010,15 +13011,24 @@ def _role_mcp_enable(project: str, cfg: "Config", role: str,
     elif force_auto or existing is None:
         chosen_upstreams = _derive_auto_upstreams(role, project, cfg)
         chosen_source = "auto"
-        if not chosen_upstreams:
+        # An image-baked role (websearcher) has tools of its own: no
+        # proxy-routed upstream is its normal state, so say nothing. For
+        # any other role it means the worker has no MCP tools at all. The
+        # text names only verbs that parse, and carries no "error: " —
+        # the broker relays stderr to the browser only after the first
+        # "error: ", so this line stays CLI / host-log only.
+        if not chosen_upstreams and role not in role_mcp.ROLE_BAKED_MCPS:
             print(
-                f"warning: no registered MCPs claim role {role!r}; "
-                f"role-mcp {role!r} starting with empty inventory. "
-                f"Add a registry entry with `research mcp add ... "
-                f"--roles {role}` (then `research project mcp sync "
-                f"{project}`), or pin explicit upstreams with "
-                f"`research project role-mcp enable {project} {role} "
-                f"--upstream <csv>`.",
+                f"warning: worker {role!r} has no MCP tools: no MCP allowed "
+                f"for project {project!r} claims role {role!r}, and its "
+                f"image bakes none. To wire one, register it with "
+                f"`research mcp add <name> --kind external --host "
+                f"<host:port> --roles {role}` (skip if already registered "
+                f"with that role), enable it with `research mcp enable "
+                f"<name>`, then allow it and re-wire the worker with "
+                f"`research project mcp sync {project}`; or pin MCPs "
+                f"already allowed for the project with `research project "
+                f"worker enable {project} {role} --upstream <csv>`.",
                 file=sys.stderr,
             )
     else:

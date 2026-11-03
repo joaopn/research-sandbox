@@ -59,6 +59,20 @@ ROLE_IMAGES: dict[str, str] = {
     "wrangler":     "rs-wrangler:latest",
 }
 
+# The stdio MCP servers each role's image bakes in, by role. A role listed
+# here has tools of its own, so an empty proxy-routed upstream set is its
+# normal state, not a misconfiguration (`_role_mcp_enable` stays silent
+# for it; the container's tools-inventory.md says the same). Source of
+# truth: the `mcpServers:` keys of `container/role-mcp/<role>/extra-mcps.yaml`
+# as COPYed by `agent/Dockerfile.<role>`. Mirrored here because the host
+# CLI is stdlib-only and cannot read the image or parse YAML; a pytest pins
+# this table to the role Dockerfiles, so a role that gains or loses baked
+# tools must update it. (Same shape as box_catalog.BAKED_BROWSER_MCPS,
+# which is the browser BOX image's fact and deliberately not reused.)
+ROLE_BAKED_MCPS: dict[str, tuple[str, ...]] = {
+    "websearcher": ("playwright",),
+}
+
 # Fixed listen port inside every role-MCP container. Each container is
 # in its own network namespace, so the constant doesn't collide with
 # anything — no port-mapping arithmetic. Workers reach via the proxy.
