@@ -1988,8 +1988,12 @@ def cmd_dev_board_import(args: argparse.Namespace) -> None:
         # mistake on the one destructive command in the lane is a traceback.
         res = _call(rscore.dev_board_import, req)
     except rscore.HarnessError as e:
-        die("could not restore the gitea instance"
-            + (f" ({e.client_detail})" if e.client_detail else ""))
+        # The verb's OWN headline, unlike the sibling board commands' generic
+        # prefix: this verb's failures differ in kind (refused before anything
+        # changed / failed part way / restored but gitea is down), each arm words
+        # its headline for the operator, and a generic "could not restore" in
+        # front of "the restore COMPLETED" contradicted its own detail.
+        die(e.log_msg + (f" ({e.client_detail})" if e.client_detail else ""))
     print(f"restored from {res.restored_from}")
     if res.safety_export:
         print(f"the instance as it was is kept at {res.safety_export}")

@@ -843,7 +843,14 @@ def restore_instance(*, volume: str, image: str, passphrase: str,
     attachments, avatars and LFS objects are IN the archive but are left alone,
     so rows can point at files this did not bring back.
     """
-    src = _mount_source(str(path))
+    try:
+        src = _mount_source(str(path))
+    except GiteaError as e:
+        # A PRE-FLIGHT refusal: nothing has run — no container, no mount — so the
+        # volume is untouched and the caller must start gitea again rather than
+        # leave it stopped as if the replace had got part way. Reachable when the
+        # file is moved or removed between the caller's verify pass and here.
+        raise RestoreRefused(str(e)) from None
     try:
         r = subprocess.run(
             ["docker", "run", "--rm", "-i", "--entrypoint", "sh",

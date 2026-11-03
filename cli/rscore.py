@@ -10675,6 +10675,18 @@ BOARD_IMPORT_TIMEOUT_S = 1800
 # spent, and their instance is still running.
 BOARD_REPLACE_MIN_RUN_S = 300
 
+# How much of docker's own output a failed `docker start` of gitea shows the
+# operator, from the END. Measured on docker 29: a start whose published port is
+# taken prints ~315 characters on two lines, "Error response from daemon: failed to
+# set up container networking: driver failed programming external connectivity on
+# endpoint <name> (<64-hex id>): Bind for 127.0.0.1:<port> failed: port is already
+# allocated" plus a short trailer naming the container. The reason sits just
+# before that trailer, so a tail keeps it: 300 keeps everything from "container
+# networking" on, half of it keeps only the bind clause, and ten times it lets a
+# pathological multi-KB output flood a one-line error. It is also what the enable
+# path already shows for the same container's failed start.
+_GITEA_START_ERR_TAIL_CHARS = 300
+
 # Where a browser-initiated export lands. This is the ONLY definition — the
 # webui is told the path rather than deriving one, because it runs in a container
 # and cannot know the operator's home.
@@ -16160,6 +16172,17 @@ def dev_board_export(req: "DevBoardExportRequest", progress=None, *,
     )
 
 
+def _docker_start_cause(r: "subprocess.CompletedProcess") -> str:
+    """Docker's own reason for a failed `docker start`, as a short parenthesis.
+
+    Empty when docker printed nothing, so a caller never renders "(docker: )".
+    Whitespace is collapsed BEFORE the tail is cut, so docker's two-line message
+    reads as one line inside the operator's one-line error.
+    """
+    err = " ".join((r.stderr or r.stdout or "").split())
+    return f" (docker: {err[-_GITEA_START_ERR_TAIL_CHARS:]})" if err else ""
+
+
 def dev_board_import(req: "DevBoardImportRequest",
                      progress=None) -> DevBoardImportResult:  # type: ignore[name-defined]
     """Restore the whole gitea instance from an encrypted backup.
@@ -16338,7 +16361,8 @@ def dev_board_import(req: "DevBoardImportRequest",
                 raise HarnessError("gitea restore refused", str(e))
             raise HarnessError(
                 "gitea restore refused, and gitea could not be started again",
-                f"{e} — and starting gitea back up failed, so it is currently DOWN")
+                f"{e} — and starting gitea back up failed, so it is currently DOWN"
+                f"{_docker_start_cause(started)}")
         except gitea.GiteaError as e:
             # Anything else: the replace may have got part way, or the container
             # doing it may still be running. Starting gitea here would point it at a
@@ -16367,7 +16391,8 @@ def dev_board_import(req: "DevBoardImportRequest",
             raise HarnessError(
                 "gitea restored, but it could not be started again",
                 f"the restore COMPLETED and your data is in place — but starting "
-                f"gitea failed, so it is currently DOWN. Start it and the dev boxes "
+                f"gitea failed, so it is currently DOWN"
+                f"{_docker_start_cause(started)}. Start it and the dev boxes "
                 f"will pick up its address on the next host start.")
         try:
             # The COLD-BOOT budget, explicitly not the resume budget that
