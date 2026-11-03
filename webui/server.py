@@ -2985,10 +2985,16 @@ def _read_exported_ports(project: str) -> list[dict]:
     proxying immediately (no stale-allow window).
 
     MIRROR of rscore.read_exported_ports' acceptance rule (this image can't
-    import rscore — keep the two byte-equivalent in effect): a pass-through
-    claim carries {passthrough:true, host_port:int non-bool, count:int non-bool
-    >=1 (key absent == 1)}; any malformed member DEGRADES the entry to a plain
-    {port,label} — never dropped, never trusted. {web:true} survives on a valid
+    import rscore — keep the two acceptance blocks byte-identical): a
+    pass-through claim carries {passthrough:true, host_port:int non-bool,
+    count:int non-bool >=1 (key absent == 1)}, and both of its spans
+    (host_port..host_port+count-1 and port..port+count-1) must be TCP ports
+    (1-65535); any malformed member or out-of-range span DEGRADES the entry to
+    a plain {port,label} — never dropped, never trusted. The file is
+    container-writable and the relay does arithmetic over these spans, so a
+    hand-written count must never reach it unbounded; the bound is the
+    protocol's, not the configured block's, so no claim the port verb wrote
+    ever degrades here. {web:true} survives on a valid
     box entry, and on a top-level entry whose raw keys carry none of
     box/passthrough/host_port (a docker project's own web app). Oversize,
     non-regular and symlinked files read as missing (_load_port_registry)."""
@@ -3020,7 +3026,8 @@ def _read_exported_ports(project: str) -> list[dict]:
             pt, hp, cnt = e.get("passthrough"), e.get("host_port"), e.get("count", 1)
             if (pt is True and isinstance(hp, int) and not isinstance(hp, bool)
                     and isinstance(cnt, int) and not isinstance(cnt, bool)
-                    and cnt >= 1):
+                    and cnt >= 1 and 1 <= hp and hp + cnt - 1 <= 65535
+                    and 1 <= port and port + cnt - 1 <= 65535):
                 entry["passthrough"], entry["host_port"] = True, hp
                 if cnt > 1:
                     entry["count"] = cnt
@@ -3505,35 +3512,86 @@ def _resolve_origin_upstream_port(project: str, service_id: str) -> int | None:
     return None
 
 
-def _passthrough_claims() -> dict[int, dict | None]:
-    """host_port → claim {project, port, label, host_port, count} for every
-    pass-through claim on disk, or None where two projects claim the same host
-    port (ambiguous ⇒ the relay refuses — fail closed). Scans EVERY project
-    registry per call, uncached (the SSRF membership discipline: a removed
-    claim stops relaying on the very next connection, and no client byte ever
-    picks the destination — the arrival port is the only routing key).
-    Box-bearing rows are never claims: the verb refuses the combination, and a
-    hand-crafted row is skipped here exactly like the reconcile skips it."""
-    claims: dict[int, dict | None] = {}
+def _passthrough_rows() -> list[tuple[str, dict]]:
+    """(project, entry) for every pass-through claim on disk, in project-name
+    order. Scans EVERY project registry per call, uncached (the SSRF membership
+    discipline: a removed claim stops relaying on the very next connection, and
+    no client byte ever picks the destination — the arrival port is the only
+    routing key). Box-bearing rows are never claims: the verb refuses the
+    combination, and a hand-crafted row is skipped here exactly like the
+    reconcile skips it. Costs one pass over the rows; nothing here expands a
+    claim's count (the registry is container-writable)."""
+    rows: list[tuple[str, dict]] = []
     try:
         names = sorted(d.name for d in PROJECTS_ROOT.iterdir() if d.is_dir())
     except OSError:
-        return {}
+        return []
     for name in names:
         if _project_workspace(name) is None:
             continue
         for e in _read_exported_ports(name):
             if not e.get("passthrough") or e.get("box"):
                 continue
-            for i in range(e.get("count", 1)):
-                hp = e["host_port"] + i
-                if hp in claims:
-                    claims[hp] = None          # duplicate ⇒ ambiguous ⇒ refuse
-                else:
-                    claims[hp] = {"project": name, "port": e["port"] + i,
-                                  "label": e["label"],
-                                  "host_port": e["host_port"],
-                                  "count": e.get("count", 1)}
+            rows.append((name, e))
+    return rows
+
+
+def _passthrough_member(name: str, e: dict, host_port: int) -> dict:
+    """The claim record for one host port of a claim's span."""
+    return {"project": name, "port": e["port"] + (host_port - e["host_port"]),
+            "label": e["label"], "host_port": e["host_port"],
+            "count": e.get("count", 1)}
+
+
+def _passthrough_claim_for(arrival: int) -> dict | None:
+    """The claim covering host port ``arrival``, or None when no claim covers
+    it or two do (ambiguous ⇒ the relay refuses — fail closed). The relay's
+    per-connection lookup: ONE arithmetic pass over the rows, so its cost never
+    grows with a claim's count, however the file was written."""
+    found: dict | None = None
+    for name, e in _passthrough_rows():
+        hp = e["host_port"]
+        if hp <= arrival <= hp + e.get("count", 1) - 1:
+            if found is not None:
+                return None                    # duplicate ⇒ ambiguous ⇒ refuse
+            found = _passthrough_member(name, e, arrival)
+    return found
+
+
+def _passthrough_claims() -> dict[int, dict | None]:
+    """host_port → claim {project, port, label, host_port, count} for every
+    host port a pass-through claim on disk covers, or None where two claims
+    cover the same host port (ambiguous). The Management listing's map (the
+    relay itself resolves one port with _passthrough_claim_for). Built by a
+    boundary sweep, never by expanding each claim: every claim adds
+    (+1 coverage, +its index) at its first host port and takes them back one
+    past its last, so a segment covered once maps to the one claim whose index
+    the running sum holds, and a segment covered twice or more maps to None.
+    Cost: one sort of the boundaries plus one entry per covered host port,
+    which the readers' 1-65535 span bound caps."""
+    rows = _passthrough_rows()
+    edges: dict[int, list[int]] = {}
+    for idx, (_name, e) in enumerate(rows):
+        lo, hi = e["host_port"], e["host_port"] + e.get("count", 1)
+        edges.setdefault(lo, [0, 0])
+        edges.setdefault(hi, [0, 0])
+        edges[lo][0] += 1
+        edges[lo][1] += idx
+        edges[hi][0] -= 1
+        edges[hi][1] -= idx
+    claims: dict[int, dict | None] = {}
+    cover = idx_sum = 0
+    keys = sorted(edges)
+    for k, nxt in zip(keys, keys[1:]):
+        cover += edges[k][0]
+        idx_sum += edges[k][1]
+        if cover == 1:
+            name, e = rows[idx_sum]
+            for hp in range(k, nxt):
+                claims[hp] = _passthrough_member(name, e, hp)
+        elif cover > 1:
+            for hp in range(k, nxt):
+                claims[hp] = None
     return claims
 
 
@@ -3569,7 +3627,7 @@ async def passthrough_conn_handler(reader: asyncio.StreamReader,
     an unclaimed or ambiguous port closes with ZERO bytes written."""
     sock = writer.get_extra_info("sockname")
     arrival = int(sock[1]) if sock else 0
-    claim = _passthrough_claims().get(arrival)
+    claim = _passthrough_claim_for(arrival)
     if not claim:
         writer.close()
         return

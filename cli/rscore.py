@@ -11363,14 +11363,31 @@ def _reconcile_loopback_bridges(project: str, cfg: "Config") -> None:  # type: i
     # (F3 Slice 2b) is published + forwarded by rs-sandbox inside the box; binding
     # its pub_super on the supervisor's eth0 here would double-bind against the -p
     # publish (N2). A pass-through claim expands to its whole project-side span —
-    # the forwarder bridges every port the webui relay dials.
-    desired_set: set[int] = set()
+    # the forwarder bridges every port the webui relay dials. The registry is
+    # container-writable, so the spans are MERGED as intervals before anything
+    # is expanded: many overlapping rows cost one sort, never rows x count, and
+    # each port is produced once. A claim's span is bounded to 1-65535 by
+    # read_exported_ports, so the merged expansion is too. Same result as the
+    # sorted set of every row's ports.
+    intervals: list[tuple[int, int]] = []
     for e in read_exported_ports(workspace_path_for(project, cfg)):
         if e.get("box"):
             continue
         span = int(e.get("count", 1)) if e.get("passthrough") else 1
-        desired_set.update(int(e["port"]) + i for i in range(span))
-    desired = sorted(desired_set)
+        first = int(e["port"])
+        intervals.append((first, first + span - 1))
+    intervals.sort()
+    desired: list[int] = []
+    cur_lo = cur_hi = None
+    for lo, hi in intervals:
+        if cur_hi is not None and lo <= cur_hi + 1:
+            cur_hi = max(cur_hi, hi)
+            continue
+        if cur_hi is not None:
+            desired.extend(range(cur_lo, cur_hi + 1))
+        cur_lo, cur_hi = lo, hi
+    if cur_hi is not None:
+        desired.extend(range(cur_lo, cur_hi + 1))
     # Teardown ALWAYS runs first (even when desired is empty) so a removed port's
     # forwarder is reaped. The kill is GUARDED by a /proc/<pid>/cmdline content
     # check — identical to the liveness probe (F1): a bare `kill $(cat pidfile)`
@@ -15045,11 +15062,20 @@ def read_exported_ports(workspace_path: "Path") -> list[dict]:  # type: ignore[n
     files (_load_port_registry); a plain {port,label} stays a top-level entry.
     A pass-through claim (STAGE_PASSTHROUGH_PORTS) additionally carries
     {passthrough:true, host_port:int, count:int>=1 (absent == 1)} — accepted only
-    when ALL of those hold, else the entry DEGRADES to a plain {port,label}
-    (never dropped, never trusted). webui/server.py::_read_exported_ports is the
-    MIRROR of this rule (the webui image can't import this module) — keep the two
-    byte-equivalent in effect. Host-written but webui-read, so never trust the
-    shape."""
+    when ALL of those hold AND both spans, host_port..host_port+count-1 and
+    port..port+count-1, are TCP ports (1-65535); else the entry DEGRADES to a
+    plain {port,label} (never dropped, never trusted). The span bound exists
+    because the file sits in the workspace, which the project container can
+    rewrite, and every consumer does arithmetic over these spans: without it a
+    hand-written count would be expanded port by port. It is the protocol bound,
+    not the configured pass-through block, so every claim the port verb could
+    have written under ANY block reads back unchanged whatever the operator
+    later does to the block. It is not exactly the verb's set: the verb also
+    refuses the reserved project-side ports (_coerce_export_port), which this
+    reader does not check. webui/server.py::_read_exported_ports is the MIRROR
+    of this rule (the webui image can't import this module) — keep the two
+    acceptance blocks byte-identical. Host-written but webui-read, and
+    container-writable, so never trust the shape."""
     data = _load_port_registry(exported_ports_path(workspace_path))
     if not data:
         return []
@@ -15073,7 +15099,8 @@ def read_exported_ports(workspace_path: "Path") -> list[dict]:  # type: ignore[n
             pt, hp, cnt = e.get("passthrough"), e.get("host_port"), e.get("count", 1)
             if (pt is True and isinstance(hp, int) and not isinstance(hp, bool)
                     and isinstance(cnt, int) and not isinstance(cnt, bool)
-                    and cnt >= 1):
+                    and cnt >= 1 and 1 <= hp and hp + cnt - 1 <= 65535
+                    and 1 <= port and port + cnt - 1 <= 65535):
                 entry["passthrough"], entry["host_port"] = True, hp
                 if cnt > 1:
                     entry["count"] = cnt
