@@ -2588,10 +2588,11 @@ def _remove_mount_points(workspace_path: Path, names: Sequence[str],
     Called once the new container runs. From the host first, through a handle
     on workspace/mnt opened WITHOUT following a link (the project's agent can
     write its workspace and could put a link there; the host never follows
-    it). Where the host user may not (a docker project's /workspace/mnt stays
-    root-owned: only the dind entrypoints hand it back) or the folder is a
-    link, from inside the container as root, still a non-recursive rmdir of
-    that one name. Best-effort: a folder that is not empty or cannot be
+    it). Where the host user may not (a docker project whose root-owned
+    /workspace/mnt could not be handed back — _reclaim_mount_root runs just
+    before this on the docker recreate, the dind entrypoints at boot) or the
+    folder is a link, from inside the container as root, still a
+    non-recursive rmdir of that one name. Best-effort: a folder that is not empty or cannot be
     removed stays. Residual: on a privileged dind project a box restarted by
     its inner daemon with the old folder in its binds can make it again."""
     if not names:
@@ -2616,6 +2617,25 @@ def _remove_mount_points(workspace_path: Path, names: Sequence[str],
     finally:
         if fd is not None:
             os.close(fd)
+
+
+def _make_mount_points(workspace_path: Path, basenames) -> None:
+    """mkdir <workspace>/mnt/<basename>/ for every mounted folder, as the
+    operator, before the container exists — so docker reuses an operator-owned
+    directory instead of creating a root-owned mountpoint (and a root-owned
+    mnt/) inside the workspace bind, which destroy could then not remove.
+    Best-effort: a folder that cannot be made (an mnt/ that a project destroyed
+    before this fix left root-owned) warns and is left to docker, exactly as
+    before, never a refused create. Nothing is created when there are no
+    mounts."""
+    for base in basenames:
+        path = workspace_path / "mnt" / base
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            print(f"warning: could not prepare the mount point {path} "
+                  f"({e.strerror or e}); the container will create it",
+                  file=sys.stderr)
 
 
 def _coerce_export_port(value: Any) -> int:
@@ -4012,6 +4032,9 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     workspace_path.mkdir(parents=True, exist_ok=True)
     os.chmod(workspace_path, 0o2770)
     (workspace_path / "shared").mkdir(parents=True, exist_ok=True)
+    # The mounted folders' mountpoints, made by the operator now so docker does
+    # not create them (and mnt/) root-owned inside the workspace bind.
+    _make_mount_points(workspace_path, mount_basenames)
     if dind_mode == "privileged" and not volume_exists(docker_volume_name_for(project)):
         run_check(["docker", "volume", "create", docker_volume_name_for(project)])
 
@@ -4201,6 +4224,10 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
 
     clone_dir = ""
     if is_docker:
+        # A re-create over a project folder an old destroy left behind can
+        # still carry a root-owned mnt/ that the mountpoint step above could
+        # not use; hand it back now (a no-op on every other create).
+        _reclaim_mount_root(container_name, workspace_path)
         # No inner dockerd: nothing to stage, no proxy, no worker/extension cone.
         # Node seed (STAGE_NODE_SEED, D2 — the RACE FIX): deploy node HOST-SIDE and
         # SYNCHRONOUSLY, BEFORE the light-path setup runs. `docker run` returns while
@@ -4559,6 +4586,17 @@ def destroy(req: DestroyRequest, cfg: "Config" | None = None,
     progress.step("cleanup", "removing workspace, volume and network")
     if project_root.exists():
         shutil.rmtree(project_root, ignore_errors=True)
+        stuck = _project_root_leftovers(project_root)
+        if stuck:
+            # The rest of the project is still torn down below: what is left
+            # is only files, and saying so is the honest outcome.
+            msg = (f"{len(stuck)} item(s) of the project folder could not be "
+                   f"removed and are left on the host under {project_root} "
+                   f"(first: {stuck[0]})")
+            print(f"warning: {msg}", file=sys.stderr)
+            for path in stuck:
+                print(f"  left: {path}", file=sys.stderr)
+            progress.step("warning", msg)
     if volume_exists(docker_volume):
         run(["docker", "volume", "rm", docker_volume], capture_output=True)
     remove_project_network(project)
@@ -4597,6 +4635,34 @@ def destroy(req: DestroyRequest, cfg: "Config" | None = None,
     # Preset-field env store for this project's boxes — host-only, never
     # mounted; the boxes died with the project, so their keys go too.
     shutil.rmtree(BOX_ENV_DIR / project, ignore_errors=True)
+
+
+def _project_root_leftovers(project_root: Path) -> list[str]:
+    """What destroy's removal of the project folder left behind, found by a
+    READ-ONLY walk after the delete (the delete itself is unchanged; whether
+    destroy should delete the folder at all is I16's open question). Returns
+    the leaves of what survived: every file or link, every empty folder, and
+    every folder whose contents cannot be listed. An empty list means the
+    folder is gone."""
+    if not os.path.lexists(project_root):
+        return []
+    if project_root.is_symlink() or not project_root.is_dir():
+        return [str(project_root)]
+    left: list[str] = []
+
+    def unlistable(err: OSError) -> None:
+        left.append(str(err.filename))
+
+    for dirpath, dirnames, filenames in os.walk(project_root, onerror=unlistable):
+        # os.walk lists a link to a folder under dirnames and does not follow it.
+        for name in dirnames:
+            if os.path.islink(os.path.join(dirpath, name)):
+                left.append(os.path.join(dirpath, name))
+        for name in filenames:
+            left.append(os.path.join(dirpath, name))
+        if not dirnames and not filenames:
+            left.append(dirpath)
+    return left
 
 
 def start(req: StartStopRequest, cfg: "Config" | None = None,
@@ -9677,6 +9743,34 @@ def _docker_folders_pending(project: str, cfg: "Config", progress=None) -> bool:
     return True
 
 
+def _reclaim_mount_root(container: str, workspace_path: Path) -> None:
+    """Hand an old project's root-owned /workspace/mnt back to the project user.
+
+    Before mountpoints were pre-created at create, docker made <workspace>/mnt
+    root-owned on the host when it set up the first mounted folder; on the
+    docker substrate nothing reclaimed it (the dind entrypoints do, at boot),
+    so destroy could never remove the project folder. The same stub can sit
+    under a re-create over a folder an old destroy left behind. Gated host-side
+    on the stub's exact signature (the folder exists and root owns it), so a
+    healthy project costs no call. Non-recursive: the mounted folders under it
+    are never touched. Best-effort: a failed heal warns and never fails the
+    verb."""
+    mnt = workspace_path / "mnt"
+    try:
+        if not mnt.is_dir() or mnt.stat().st_uid != 0:
+            return
+    except OSError:
+        return
+    r = run(["docker", "exec", "-u", "0", container,
+             "chown", "research:research", "/workspace/mnt"],
+            capture_output=True)
+    if r.returncode != 0:
+        reason = (r.stderr or "").strip() or f"exit {r.returncode}"
+        print(f"warning: the project's mnt folder is still owned by root, so "
+              f"destroying the project will leave it behind ({reason})",
+              file=sys.stderr)
+
+
 def _start_docker_substrate(project: str, cfg: "Config",  # type: ignore[name-defined]
                             progress=None) -> None:
     """Start a stopped `docker`-substrate project. Unlike a sysbox supervisor
@@ -9687,6 +9781,9 @@ def _start_docker_substrate(project: str, cfg: "Config",  # type: ignore[name-de
     sysbox-specific, and the docker substrate has no sysbox bindings to lose."""
     container = container_name_for(project)
     run_check(["docker", "start", container])
+    # A project created before mountpoints were pre-created: hand its
+    # root-owned mnt/ back so destroy can remove the folder (no-op otherwise).
+    _reclaim_mount_root(container, workspace_path_for(project, cfg))
     network = project_network_for(project)
     inject_route(container, get_router_ip(network))
     _heal_docker_dev_gitea(project, cfg, network)
@@ -9853,6 +9950,7 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
 
     print(f"creating new container from {MINIMAL_IMAGE}...")
     run_check(["docker", *docker_args])
+    _reclaim_mount_root(container, workspace_path)
     # The old container (the only one that mounted them) is gone, so a removed
     # folder's mount point is an ordinary empty folder now.
     _remove_mount_points(workspace_path, gone_mounts, container)
