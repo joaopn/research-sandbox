@@ -5382,6 +5382,7 @@ const OP_CHECKLISTS = {
     box_add: [
         { key: "validate", label: "checking the project" },
         { key: "create-box", label: "creating the box" },
+        { key: "boot", label: "starting the box" },
         { key: "ready", label: "box ready" },
     ],
     box_remove: [
@@ -8882,7 +8883,10 @@ async function mgmtBoxAddDialog(project) {
                 body: JSON.stringify(payload),
             });
         },
-        onDone: async (ok) => { if (ok) await refreshAfterBoxChange(project); },
+        // Refresh on failure too: a box that failed to start stays in the
+        // list (stopped) for the operator to remove; other failed adds leave
+        // no box, and the refresh is then a harmless re-fetch.
+        onDone: async () => { await refreshAfterBoxChange(project); },
         focus: () => nameI.focus(),
     });
 }

@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import calendar
 import contextlib
 import bisect
 import datetime
@@ -6100,6 +6101,169 @@ def _wait_for_box_setup_done(supervisor: str, box_container: str,
             return True
         time.sleep(2)
     return False
+
+
+# Box boot bound. The boot now INCLUDES the preset/repo setup (the longest
+# step — the BOX_SETUP_READY_TIMEOUT_S reasoning above applies unchanged) plus
+# a clone, so it reuses that bound. When it expires box_add skips the setup
+# wait (its sentinel is written before the ready line, so it cannot appear
+# sooner), which keeps boot + the 60 s editor wait inside the webui's 600 s op
+# window — never longer than the 300 s + 60 s box_add could already take.
+BOX_BOOT_TIMEOUT_S = BOX_SETUP_READY_TIMEOUT_S
+
+# The entrypoint's last line before it idles (agent/entrypoint.sandbox-box.sh,
+# byte-identical in every box image ever shipped; pytest-pinned lockstep).
+# Nothing after it can fail, so its presence means some boot reached its end.
+BOX_BOOT_READY_MARKER = "sandbox-box[{name}]: ready"
+
+# Lines of a failed boot shown in the add's failure text. `set -e` stops the
+# boot AT the failing command, so the cause is the last few lines: a git error
+# is one line, a pip resolver error ~5-15, a Python traceback ~10-30. Fewer
+# risks cutting a traceback's head; many more buries the cause in the
+# browser's op tail.
+BOX_BOOT_LOG_TAIL_LINES = 20
+
+# Character cap on that tail (keeps the END). docker splits log lines at
+# 16 KiB, so 20 lines alone could still be ~320 KiB in a failure text relayed
+# to the browser and the op log; ~20 lines x ~200 chars is what a reader takes in.
+BOX_BOOT_LOG_TAIL_CHARS = 4000
+
+# Grace added to the failed boot's FinishedAt when the tail is bounded with
+# `docker logs --until`. FinishedAt comes from the runtime's exit event, while
+# the log copier stamps each line when the daemon READS it, so the failed
+# boot's last line (the one carrying the cause) can be stamped just after
+# FinishedAt. docker's restart manager waits at least 100 ms (its initial
+# backoff, doubling per restart) before the next boot, which then needs
+# container start + its first command before printing, so nothing of the next
+# boot is stamped before FinishedAt + 100 ms. Half the value halves the
+# copier-lag margin for no gain; ten times would admit the next boot's lines.
+BOX_BOOT_LOG_UNTIL_GRACE_NS = 100_000_000
+
+_DOCKER_TS_RE = re.compile(
+    r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?Z")
+# ANSI CSI / OSC escapes, then every C0/C1 control char except \t and \n.
+_ANSI_ESC_RE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[@-_]")
+_CTRL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def _box_log_until(finished_at: str) -> "str | None":
+    """docker's RFC3339Nano FinishedAt + the grace, as the Unix `sec.nanos`
+    form `docker logs --until` accepts; None when there is no usable time
+    (docker's zero time, another zone form, anything unparseable). UTC by
+    construction (calendar.timegm, never the local-time mktime) and integer
+    arithmetic throughout. RFC3339Nano trims trailing zeros, so a fraction is
+    right-padded to 9 digits (`.12` is 120 ms, not 12 ns)."""
+    m = _DOCKER_TS_RE.fullmatch(finished_at or "")
+    if not m:
+        return None
+    try:
+        tm = time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    if tm.tm_year <= 1:
+        return None
+    nanos = int(m.group(2).ljust(9, "0")) if m.group(2) else 0
+    total = (calendar.timegm(tm) * 10**9 + nanos
+             + BOX_BOOT_LOG_UNTIL_GRACE_NS)
+    return f"{total // 10**9}.{total % 10**9:09d}"
+
+
+def _wait_for_box_boot(supervisor: str, box_container: str, box_name: str,
+                       timeout: int = BOX_BOOT_TIMEOUT_S
+                       ) -> "tuple[str, str, str]":
+    """Hold until a just-created box finished its boot (clone, checkout,
+    setup — everything its entrypoint runs under `set -e`) or failed it.
+
+    Returns ("ready", "", ""), ("failed", <state words>, <FinishedAt>) or
+    ("timeout", "", ""). The ready probe runs FIRST: the ready line appears
+    only once some boot reached its end and nothing after it can fail, so a
+    box whose first boot failed but whose restart completed reads ready. Any
+    restart before that = failed (the box runs --restart unless-stopped, so a
+    failing boot would otherwise loop forever while the add said ready). A
+    failing inspect is not a verdict — keep polling. The grep runs in the
+    supervisor so a long box log never crosses to the host every poll; the
+    container and marker ride argv, never the script text."""
+    import time
+
+    marker = BOX_BOOT_READY_MARKER.format(name=box_name)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if run(["docker", "exec", supervisor, "sh", "-c",
+                'docker logs "$1" 2>&1 | grep -qF -- "$2"',
+                "sh", box_container, marker],
+               capture_output=True).returncode == 0:
+            return ("ready", "", "")
+        r = run(["docker", "exec", supervisor, "docker", "container",
+                 "inspect", "-f",
+                 "{{.State.Status}} {{.State.Restarting}} {{.RestartCount}} "
+                 "{{.State.FinishedAt}}",
+                 box_container], capture_output=True)
+        words = (r.stdout or "").split() if r.returncode == 0 else []
+        if len(words) == 4 and words[2].isdigit():
+            status, restarting, count, finished = words
+            restarts = int(count)
+            if restarting == "true" or status != "running" or restarts > 0:
+                plural = "" if restarts == 1 else "s"
+                return ("failed", f"{status}, {restarts} restart{plural}",
+                        finished)
+        time.sleep(2)
+    return ("timeout", "", "")
+
+
+def _sanitize_box_log(text: str, secrets: "list[str]") -> str:
+    """Box log text is box-controlled DATA on its way to the browser and the
+    op log: strip terminal escapes and control chars (keep \\t and \\n),
+    replace every secret field value with ***, then keep the last
+    BOX_BOOT_LOG_TAIL_CHARS chars (redact before the cut, so a secret can
+    never straddle it)."""
+    text = _ANSI_ESC_RE.sub("", text)
+    text = text.replace("\r\n", "\n")
+    text = _CTRL_CHARS_RE.sub("", text)
+    for s in sorted({s for s in secrets if s}, key=len, reverse=True):
+        text = text.replace(s, "***")
+    text = text.strip("\n")
+    if len(text) > BOX_BOOT_LOG_TAIL_CHARS:
+        text = "…" + text[-BOX_BOOT_LOG_TAIL_CHARS:]
+    return text
+
+
+def _read_box_boot_log(supervisor: str, box_container: str,
+                       finished_at: str) -> "str | None":
+    """The failed boot's last BOX_BOOT_LOG_TAIL_LINES lines, or None.
+
+    Anchored when FinishedAt is usable: docker applies --tail BEFORE --until,
+    so the two are never combined — `--until` returns the whole log up to the
+    failed boot's end and the line cap is applied by `tail` in the supervisor
+    (only N lines cross to the host). Capture-then-tail keeps docker's exit
+    code as the script's without pipefail. An anchored read that fails (an
+    inner CLI without --until) is retried once as a plain `--tail` read."""
+    n = str(BOX_BOOT_LOG_TAIL_LINES)
+    until = _box_log_until(finished_at)
+    if until is not None:
+        r = run(["docker", "exec", supervisor, "sh", "-c",
+                 'out=$(docker logs --until "$1" "$2" 2>&1) || exit 1; '
+                 'printf "%s\\n" "$out" | tail -n "$3"',
+                 "sh", until, box_container, n], capture_output=True)
+        if r.returncode == 0:
+            return r.stdout or ""
+    r = run(["docker", "exec", supervisor, "sh", "-c",
+             'docker logs "$@" 2>&1', "sh", "--tail", n, box_container],
+            capture_output=True)
+    return (r.stdout or "") if r.returncode == 0 else None
+
+
+def _box_boot_failure_text(supervisor: str, box_container: str,
+                           box_name: str, state: str, finished_at: str,
+                           secrets: "list[str]") -> str:
+    """The failed boot's log, sanitised and redacted, as the indented block
+    the add's failure message carries. The text around it is fixed and names
+    no CLI command (it reaches the browser)."""
+    raw = _read_box_boot_log(supervisor, box_container, finished_at)
+    shown = _sanitize_box_log(raw, secrets) if raw else ""
+    if not shown.strip():
+        return "(the box printed nothing)"
+    return "\n".join("    " + line for line in shown.split("\n"))
 
 
 def stage_worker_image(container: str, image: str, force: bool = False) -> None:
@@ -15024,6 +15188,40 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     if web_spec:
         _register_box_web_tab(workspace_path, info, web_spec, progress,
                               want_name=req.name)
+    # Boot hold: `rs-sandbox create` returns once the box RUNS, but its clone,
+    # checkout and setup run afterwards in the entrypoint under `set -e` and
+    # --restart unless-stopped — a failing one restarted forever while this
+    # add said ready. Wait for the boot's ready line; a restart before it
+    # fails the add with the failed boot's own log and stops the box (kept,
+    # for Remove). Ahead of the editor wait so a crash-looping editor box
+    # fails here instead of burning that wait.
+    progress.step("boot", "waiting for the box to start")
+    boot, boot_state, boot_finished = _wait_for_box_boot(
+        container, info["container"], info["name"])
+    if boot == "failed":
+        stopped = run(["docker", "exec", container, "rs-sandbox", "stop",
+                       info["name"]], capture_output=True).returncode == 0
+        secrets = [v for f in (catalog.get(req.preset, {}).get("fields") or [])
+                   if isinstance(f, dict) and f.get("secret") is True
+                   for v in [req.field_values.get(f.get("name"))] if v]
+        # Unlike the history line below (a fixed code → fixed text), this
+        # text DOES carry the box's own output: the operator needs the cause
+        # in the browser. It is sanitised, secret-redacted and capped as data.
+        tail = _box_boot_failure_text(container, info["container"],
+                                      info["name"], boot_state, boot_finished,
+                                      secrets)
+        what = ("it has been stopped" if stopped
+                else "it could not be stopped and keeps retrying")
+        die(f"box {info['name']!r} failed to start ({boot_state}); {what}. "
+            f"The end of its startup log:\n{tail}\n"
+            f"Remove the box and add it again once the cause above is fixed "
+            f"(for example a repository ref that exists, or a setup command "
+            f"that succeeds).")
+    boot_timed_out = boot == "timeout"
+    if boot_timed_out:
+        print(f"warning: box {info['name']!r} still starting after "
+              f"{BOX_BOOT_TIMEOUT_S}s — it may still be cloning or installing; "
+              f"check the box's tab before starting the agent")
     # Editor readiness gate (create()'s editor-gate shape): the box's stub only
     # listens ~15-30s after `docker run` (in-box extension installs first), and
     # the webui re-fetches the tab set the moment this op completes — without
@@ -15041,7 +15239,12 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     # with no MCP config yet (a running session never reloads it).
     # A node preset always has a setup to run (the node step), with or without
     # its own.
-    if catalog.get(req.preset, {}).get("setup") or needs_node or history_args:
+    # Skipped after a boot timeout: the sentinel is written before the ready
+    # line, so it cannot appear sooner, and a second full wait would push the
+    # add past the webui's op window.
+    if (not boot_timed_out
+            and (catalog.get(req.preset, {}).get("setup") or needs_node
+                 or history_args)):
         progress.step("setup", "waiting for the preset setup to finish")
         if not _wait_for_box_setup_done(container, info["container"]):
             # Two causes land here and the wording must carry BOTH: a genuinely
