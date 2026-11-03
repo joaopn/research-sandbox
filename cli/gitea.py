@@ -713,6 +713,42 @@ LIVE_ID=$(sed -n 's/^INTERNAL_TOKEN *= *//p' "$CONF" | head -1 || true)
 [ -n "$ARCH_ID" ] && [ -n "$LIVE_ID" ] || { echo "RESTORE-REFUSED no-identity"; exit 5; }
 [ "$ARCH_ID" = "$LIVE_ID" ] || { echo "RESTORE-REFUSED foreign-archive"; exit 6; }
 
+# --- refuse an archive from a newer gitea release ---------------------------
+# The same instance can move to a newer release and come back to the older one
+# on its old data (going back after an upgrade keeps the instance identity), so
+# the identity check above cannot see this. A backup taken on the newer release
+# carries a database the newer release has already migrated, and gitea has no
+# downgrade: the older release refuses that database at start, so gitea would
+# not come up after the restore.
+# The deciding fact is gitea's own schema migration number, row id 1 of table
+# `version` — exactly what gitea compares at boot. Measured: 1.25.1 is at 323,
+# 28.2.0 at 358. `gitea dump` writes it, in both releases, as exactly one line
+#   INSERT INTO `version` (`id`, `version`) VALUES (1,323);
+# User content cannot forge that line: the dump escapes a newline inside a value
+# (1.25.1 as ' || X'0a' || ', 28.2.0 as unistr('...\u000a...'), both measured),
+# so no value ever starts a line, and the pattern is anchored at both ends. The
+# live number is the running release's own: gitea
+# migrates its database at every boot, and a restore runs only on a gitea that
+# has been up. An older or equal backup is allowed (an older one is migrated
+# forward at the next start, which is the upgrade path itself); a newer one is
+# refused.
+# No `head -1`: two matching lines leave a newline in ARCH_V, which the digit
+# test rejects, so an ambiguous dump fails closed instead of trusting the first.
+# `-readonly` because nothing above the marker may change the volume (measured:
+# it creates no file, not even when the database is missing). A live database
+# left with a hot journal by a killed gitea cannot be read that way; that is a
+# no-db-version refusal, gitea is started again (which rolls the journal back),
+# and a retry passes. Every substitution ends in `|| true`: under `set -eu` a
+# failing one would end the script before its refusal could print. An
+# unreadable number on either side fails CLOSED, since there is then no telling
+# whether the running release can open the backup.
+DB=/data/gitea/gitea.db
+ARCH_V=$(sed -n 's/^INSERT INTO `version` (`id`, `version`) VALUES (1, *\([0-9][0-9]*\));$/\1/p' /x/ex/gitea-db.sql || true)
+LIVE_V=$(sqlite3 -readonly "$DB" 'SELECT version FROM version WHERE id = 1;' 2>/dev/null || true)
+case "$ARCH_V" in ''|*[!0-9]*) echo "RESTORE-REFUSED no-db-version"; exit 11;; esac
+case "$LIVE_V" in ''|*[!0-9]*) echo "RESTORE-REFUSED no-db-version"; exit 11;; esac
+[ "$ARCH_V" -le "$LIVE_V" ] || { echo "RESTORE-REFUSED newer-archive"; exit 12; }
+
 # --- replace ---------------------------------------------------------------
 # EVERYTHING above this line is non-destructive: the decrypt, the unpack and
 # every pre-flight. This marker is what lets the caller tell a failure that
@@ -734,8 +770,8 @@ OWNER=$(stat -c '%u:%g' "$CONF" || true)
 # line above it is a read or a check; every line below it may have changed the
 # volume. Any command inserted into that gap would be misclassified on failure —
 # reported as "your data may be half-replaced" when it changed nothing — so the
-# gap is kept empty on purpose and a test asserts it.
-DB=/data/gitea/gitea.db
+# gap is kept empty on purpose and a test asserts it. ($DB is set above, where
+# the version check first reads it.)
 echo "RESTORE-POINT-OF-NO-RETURN"
 rm -f "$DB" "$DB-wal" "$DB-shm"
 sqlite3 "$DB" < /x/ex/gitea-db.sql
@@ -769,6 +805,16 @@ _RESTORE_REFUSALS = {
     "no-repos-in-archive": "the backup contains no repository tree",
     "no-sqlite": "the gitea image has no sqlite3, so the database in the backup "
                  "cannot be loaded",
+    "newer-archive": "this backup was taken on a newer Gitea release than the "
+                     "one running now. The running release cannot open a "
+                     "database that a newer release has already upgraded, so "
+                     "Gitea would not start after the restore. Upgrade Gitea to "
+                     "the release the backup was taken on, or a later one, and "
+                     "restore it then",
+    "no-db-version": "the database version of the backup or of the running "
+                     "gitea could not be read, so there is no telling whether "
+                     "the running release can open this backup — refusing "
+                     "rather than risking a gitea that will not start",
 }
 
 
