@@ -6967,28 +6967,149 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, mountRoots, gitea
     ]);
     if (!hasWorkerLayer) enableField.style.display = "none";
 
-    // The agent-set cards (rendered in the Settings region below): docker box,
-    // sandbox-dind and the dev variant.
-    // Staged agents only — one independent on/off box each (STAGE_MULTI_AGENT),
-    // the broker's default agent on. Un-staged KNOWN_AGENTS are omitted: the form never offers
-    // an agent that isn't deployable yet (pull it under Management → Software), so
-    // the POSTed set always validates in from_kwargs.
-    const stagedAgents = agents
-        .filter((a) => a && a.staged)
-        .map((a) => a.name);
-    // Multi-select (independent on/off set) — so each agent is its OWN toggle card
-    // (cb stays the value-holder), NOT the box window's single-select radio agent.
+    // The Agents section (I33): a heading whose badges turn agents on and off,
+    // and one tab per agent that is on, holding that agent's model settings.
+    // The badges show what the project container will actually RUN, which the
+    // create path decides per workflow (code-dictated, not a preference):
+    //  - a workflow with no agent selection (research, identified as today's
+    //    "no agent cards" test, never by name) runs Claude whatever is sent, so
+    //    its Claude badge is on and fixed and no agent set goes on the wire;
+    //  - a Docker-in-Docker workflow (sandbox-dind, dev, social-data-pipeline)
+    //    runs an agent only when one is selected, and then always runs Claude
+    //    too, so turning pi on turns Claude on and holds it there;
+    //  - a docker-substrate workflow deploys exactly the badges that are on.
+    // Staged agents only, the broker's default agent on: un-staged agents are
+    // omitted so the POSTed set always validates in from_kwargs.
+    const claudeOnlyWorkflow = !(showInBox || isDev);
+    const dindAgents = !isDocker && !claudeOnlyWorkflow;
+    const stagedAgents = claudeOnlyWorkflow
+        ? ["claude"]
+        : agents.filter((a) => a && a.staged).map((a) => a.name);
+    const AGENT_LABELS = { claude: "Claude", pi: "pi" };
+    const agentLabel = (name) => AGENT_LABELS[name] || name;
+    // Multi-select (independent on/off set): each agent is its OWN badge (cb
+    // stays the value-holder), NOT the box window's single-select radio agent.
     const agentChecks = stagedAgents.map((name) => {
         const cb = el("input", { type: "checkbox", value: name });
-        if (agents.some((a) => a && a.name === name && a.isDefault)) cb.checked = true;   // the default agent on
-        const card = el("div", { class: "box-opt-card" + (cb.checked ? " selected" : "") },
-                        [el("span", { class: "box-opt-name" }, [name])]);
-        card.onclick = () => {
-            cb.checked = !cb.checked;
-            card.classList.toggle("selected", cb.checked);
-        };
+        if (claudeOnlyWorkflow
+            || agents.some((a) => a && a.name === name && a.isDefault)) cb.checked = true;
+        const card = el("div", { class: "box-opt-card agent-badge" },
+                        [el("span", { class: "box-opt-name" }, [agentLabel(name)])]);
         return { name, cb, card };
     });
+    const agentOn = (name) => agentChecks.some((c) => c.name === name && c.cb.checked);
+    // Claude is held on (not toggleable) on a Claude-only workflow, and on a
+    // Docker-in-Docker workflow while pi is on.
+    const claudeHeld = () => claudeOnlyWorkflow || (dindAgents && agentOn("pi"));
+
+    // pi's tab: its starting model (free text, `provider/model` — pi lists
+    // models only after you log into a provider inside the project) and thinking
+    // level. Written into pi's settings when they are first installed; a model
+    // picked inside pi later is kept. The pattern mirrors rscore.PI_MODEL_RE
+    // (an affordance; the server refuses anything else).
+    const PI_MODEL_PATTERN = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._:~@+\/-]+$/;
+    const PI_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+    const piModelI = el("input", {
+        type: "text", autocomplete: "off", spellcheck: "false",
+        placeholder: "provider/model, e.g. openrouter/anthropic/claude-opus-latest",
+    });
+    const piThinkingS = el("select", {}, [
+        el("option", { value: "" }, ["pi's default"]),
+        ...PI_THINKING_LEVELS.map((lv) => el("option", { value: lv }, [lv])),
+    ]);
+    const piPanel = el("div", { class: "agent-tab-panel" }, [
+        el("div", { class: "field" }, [
+            el("label", {}, ["Agent"]),
+            el("div", { class: "model-row agent-pi-row" }, [
+                el("div", { class: "model-cell agent-pi-model" }, [
+                    el("span", { class: "model-cap" }, ["model"]), piModelI,
+                ]),
+                el("div", { class: "model-cell" }, [
+                    el("span", { class: "model-cap" }, ["thinking"]), piThinkingS,
+                ]),
+            ]),
+            el("div", { class: "hint" }, [
+                "The model pi starts on. pi lists its models only once you log into " +
+                "a provider inside the project, so write the id as pi shows it there " +
+                "(provider/model). Empty: pi picks. A model you choose inside pi " +
+                "later is kept.",
+            ]),
+        ]),
+    ]);
+    const claudePanel = el("div", { class: "agent-tab-panel" },
+        modelFields.length ? modelFields : [el("div", { class: "hint" }, [
+            "Model choices are unavailable right now; Claude starts on its defaults.",
+        ])]);
+    const agentPanels = { claude: claudePanel, pi: piPanel };
+    const agentTabsRow = el("div", { class: "agent-tabs" });
+    const agentPanelsWrap = el("div", { class: "agent-tab-panels" },
+        stagedAgents.filter((n) => agentPanels[n]).map((n) => agentPanels[n]));
+    const agentsHint = el("div", { class: "hint" });
+    let activeAgentTab = "";
+    const syncAgents = () => {
+        if (claudeHeld()) agentChecks.forEach((c) => { if (c.name === "claude") c.cb.checked = true; });
+        agentChecks.forEach((c) => {
+            const held = c.name === "claude" && claudeHeld();
+            c.card.classList.toggle("selected", c.cb.checked);
+            c.card.classList.toggle("locked", held);
+            c.card.title = !held ? ""
+                : claudeOnlyWorkflow ? "This workflow runs Claude."
+                : "pi in this project's container comes with Claude.";
+        });
+        const on = stagedAgents.filter((n) => agentOn(n) && agentPanels[n]);
+        if (!on.includes(activeAgentTab)) activeAgentTab = on[0] || "";
+        agentTabsRow.innerHTML = "";
+        on.forEach((n) => {
+            const t = el("button", { type: "button",
+                                     class: "agent-tab" + (n === activeAgentTab ? " active" : "") },
+                         [agentLabel(n)]);
+            t.onclick = () => { activeAgentTab = n; syncAgents(); };
+            agentTabsRow.appendChild(t);
+        });
+        agentTabsRow.style.display = on.length ? "" : "none";
+        Object.keys(agentPanels).forEach((n) => {
+            agentPanels[n].style.display = n === activeAgentTab ? "" : "none";
+        });
+        // Visible text, not only the badge's tooltip (a phone has no hover):
+        // why Claude cannot be turned off while pi is on.
+        agentsHint.textContent = !stagedAgents.length
+            ? "No agents available yet — pull one under Management → Software."
+            : (dindAgents && agentOn("pi"))
+                ? "pi in this project's container comes with Claude, so Claude stays on."
+            : on.length ? ""
+            : isDev ? "A dev project needs at least one agent."
+            : "No agent: the project starts without one.";
+        agentsHint.style.display = agentsHint.textContent ? "" : "none";
+    };
+    agentChecks.forEach((c) => {
+        c.card.onclick = () => {
+            if (c.name === "claude" && claudeHeld()) return;
+            c.cb.checked = !c.cb.checked;
+            syncAgents();
+        };
+    });
+    const agentsSection = el("div", { class: "field agents-section" }, [
+        el("div", { class: "agents-head" }, [
+            el("label", {}, ["Agents"]),
+            el("div", { class: "box-opt-cards agent-badges" }, agentChecks.map((c) => c.card)),
+        ]),
+        agentTabsRow,
+        agentPanelsWrap,
+        agentsHint,
+    ]);
+    syncAgents();
+    // The model halves of the payload, by agent: Claude's pairs only while
+    // Claude is on (a project without Claude has no Claude to configure), pi's
+    // values only while pi is on and only when set (empty = pi's own pick).
+    const agentModelPayload = () => {
+        const out = agentOn("claude") ? modelPayload() : {};
+        if (agentOn("pi")) {
+            const m = piModelI.value.trim();
+            if (m) out.pi_model = m;
+            if (piThinkingS.value) out.pi_thinking = piThinkingS.value;
+        }
+        return out;
+    };
     const repoI = el("input", { type: "text", autocomplete: "off",
                                 placeholder: "https://github.com/user/repo.git" });
     const refI = el("input", { type: "text", autocomplete: "off",
@@ -7066,20 +7187,12 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, mountRoots, gitea
     ]);
     authGroup.style.display = "none";
     authCb.onchange = () => { authGroup.style.display = authCb.checked ? "" : "none"; };
-    // Settings region — agent + editor as bordered cards inside a single bordered
-    // box (mirrors the box window). Editor is universal; agents on showInBox
-    // (docker box / sandbox-dind) and on the dev variant. No raw
-    // <input> lives here (only cards), so the .field input{width:100%} bleed doesn't apply.
+    // Settings region — the extensions as bordered cards inside a single
+    // bordered box (mirrors the box window); the agents have their own section
+    // above (I33). No raw <input> lives here (only cards), so the
+    // .field input{width:100%} bleed doesn't apply.
     const settingsRegion = el("div", { class: "field box-settings" }, [
         el("div", { class: "box-settings-label" }, ["Settings"]),
-        ...(showInBox || isDev ? [el("div", { class: "box-opt-group" }, [
-            el("div", { class: "box-opt-caption" }, ["Agents"]),
-            agentChecks.length
-                ? el("div", { class: "box-opt-cards" }, agentChecks.map((c) => c.card))
-                : el("div", { class: "hint" }, [
-                      "No agents available yet — pull one under Management → Software.",
-                  ]),
-        ])] : []),
         el("div", { class: "box-opt-group" }, [
             el("div", { class: "box-opt-caption" }, ["Extensions"]),
             // Node is substrate-agnostic (all flavors); reader is dind-only;
@@ -7218,7 +7331,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, mountRoots, gitea
             el("div", { class: "field" }, [el("label", {}, ["Project name"]), nameI]),
             ...(isDev ? [devGroup] : []),
             el("div", { class: "field" }, [el("label", {}, ["Egress"]), egressS]),
-            ...modelFields,
+            agentsSection,
             enableField,
             settingsRegion,
             ...(showClone ? [cloneToggle, cloneGroup] : []),
@@ -7250,6 +7363,12 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, mountRoots, gitea
             // set too): a dev project exists for an agent to work its repo.
             if (isDev && !agentChecks.some((c) => c.cb.checked)) {
                 return "A dev project needs at least one agent to work its repo.";
+            }
+            // Mirror rscore.PI_MODEL_RE: pi's model id is written provider/model.
+            if (agentOn("pi") && piModelI.value.trim()
+                && !PI_MODEL_PATTERN.test(piModelI.value.trim())) {
+                return "Write pi's model as provider/model, e.g. " +
+                       "openrouter/anthropic/claude-opus-latest.";
             }
             // Mirror from_kwargs: an in-box repo needs a ref (pin the clone).
             if (showClone && cloneCb.checked && repoI.value.trim() && !refI.value.trim()) {
@@ -7301,11 +7420,12 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, mountRoots, gitea
                     // Unconditional — the validator above guarantees non-empty.
                     branch: devBranchI.value.trim(),
                     egress: egressS.value,
-                    // A dev project has no worker layer, so modelPayload() yields
-                    // supervisor_* only — exactly the pair in
-                    // DEV_PROJECT_WEBUI_FIELDS. A field absent from that set is
-                    // dropped silently by the broker, so this is a lockstep.
-                    ...modelPayload(),
+                    // A dev project has no worker layer, so the Claude half yields
+                    // supervisor_* only, and the pi half pi_model/pi_thinking —
+                    // exactly the fields in DEV_PROJECT_WEBUI_FIELDS. A field
+                    // absent from that set is dropped silently by the broker,
+                    // so this is a lockstep.
+                    ...agentModelPayload(),
                     // ALWAYS the explicit selection (never omitted): an absent
                     // key would fall back to the workflow's preset, silently
                     // replacing what the operator ticked. The validator above
@@ -7336,10 +7456,12 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, mountRoots, gitea
                 name: nameI.value.trim(),
                 workflow: workflow,
                 egress: egressS.value,
-                // supervisor_* always; worker_*/role_* only where a worker layer
-                // exists (from_kwargs rejects them elsewhere, and the pickers are
-                // filtered to match). Every key is in CREATE_WEBUI_FIELDS.
-                ...modelPayload(),
+                // supervisor_* while Claude is on (always, on research);
+                // worker_*/role_* only where a worker layer exists (from_kwargs
+                // rejects them elsewhere, and the pickers are filtered to match);
+                // pi_model/pi_thinking while pi is on. Every key is in
+                // CREATE_WEBUI_FIELDS.
+                ...agentModelPayload(),
             };
             // Editor on by default; unchecking disables the code-server service.
             if (!editorCb.checked) payload.disable = ["code-server"];

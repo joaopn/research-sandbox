@@ -470,6 +470,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         supervisor_effort=args.supervisor_effort,
         worker_model=args.worker_model, worker_effort=args.worker_effort,
         role_model=args.role_model, role_effort=args.role_effort,
+        pi_model=args.pi_model, pi_thinking=args.pi_thinking,
     )
     try:
         res = rscore.create(req, cfg)
@@ -2512,6 +2513,15 @@ def build_parser() -> argparse.ArgumentParser:
                           "overrides the workflow's agent preset; on sandbox-dind "
                           "the supervisor boots without claude while boxes keep "
                           "their own agent toggle). Refused on the dev workflow.")
+    c.add_argument("--pi-model", dest="pi_model", default="", metavar="PROVIDER/MODEL",
+                   help="pi's starting model, e.g. openrouter/anthropic/claude-opus-latest "
+                        "(written into pi's settings when they are first installed; a "
+                        "model picked inside pi later is kept). Needs pi among the "
+                        "agents; not on the research workflow.")
+    c.add_argument("--pi-thinking", dest="pi_thinking", default="",
+                   choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
+                   help="pi's starting thinking level: "
+                        f"{', '.join(rscore.PI_THINKING_LEVELS)}. Needs pi among the agents.")
     c.add_argument("--dev-repo", dest="dev_repo", metavar="REPO",
                    help="REQUIRED with a dev workflow (--workflow dev): the name "
                         "of a repo added via `research dev repo add` — the agent "

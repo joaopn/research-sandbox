@@ -1773,6 +1773,9 @@ async def broker_dev_project_handler(request: web.Request) -> web.Response:
             "disable": body.get("disable"),
             "supervisor_model": body.get("supervisor_model"),
             "supervisor_effort": body.get("supervisor_effort"),
+            # pi's starting model + thinking level (the dialog's pi tab).
+            "pi_model": body.get("pi_model"),
+            "pi_thinking": body.get("pi_thinking"),
             # The agent set; an absent key relays as None ⇒ the workflow preset.
             "agents": body.get("agents")}
     op_id = _mint_op_id(name if isinstance(name, str) and name else "dev",

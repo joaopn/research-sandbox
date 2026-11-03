@@ -937,6 +937,19 @@ def model_default_set(req: "ModelDefaultSetRequest") -> dict:  # type: ignore[na
             "overridden": req.type in data}
 
 
+# pi's starting model + thinking level, chosen at create (the create dialog's pi
+# tab). pi's model list exists only once a provider is logged in inside the
+# project, so the model is a free-text `provider/model` id, held to ONE strict
+# pattern: it is written into pi's settings by a merge that reads it from the
+# environment (never a shell line), and the pattern is the first wall. It admits
+# every id pi 1.5.0 ships (`openrouter/~anthropic/claude-opus-latest`,
+# `openrouter/anthropic/claude-fable-5:batch`, Bedrock's `…-v1:0`); an
+# operator-defined pi model with other characters is refused.
+PI_MODEL_RE = re.compile(r"\A[A-Za-z0-9._-]+/[A-Za-z0-9._:~@+/-]+\Z")
+# pi's `defaultThinkingLevel` values (pi 1.5.0 docs/settings.md). Mirror.
+PI_THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+
+
 @dataclass(frozen=True)
 class CreateRequest:
     name: str
@@ -1046,6 +1059,11 @@ class CreateRequest:
     worker_effort: str = ""
     role_model: str = ""
     role_effort: str = ""
+    # pi's starting model (`provider/model`) and thinking level; "" = pi's own
+    # pick. Valid only where the workflow deploys its selected agents and pi is
+    # among them (see PI_MODEL_RE for why the model is free text).
+    pi_model: str = ""
+    pi_thinking: str = ""
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "CreateRequest":
@@ -1373,6 +1391,11 @@ class CreateRequest:
         rol_m, rol_e = _resolve_model_pair(
             "role", kw.get("role_model") or "", kw.get("role_effort") or "",
             catalog=catalog, pairs=model_pairs)
+        pi_model, pi_thinking = _validated_pi_pair(
+            kw.get("pi_model"), kw.get("pi_thinking"),
+            deploys_agents=(substrate is Substrate.DOCKER
+                            or project_type is ProjectType.SANDBOX_DIND),
+            agents=agents)
         return cls(
             name=_require_name(kw.get("name")),
             workflow=workflow_id,
@@ -1408,7 +1431,41 @@ class CreateRequest:
             supervisor_model=sup_m, supervisor_effort=sup_e,
             worker_model=wrk_m, worker_effort=wrk_e,
             role_model=rol_m, role_effort=rol_e,
+            pi_model=pi_model, pi_thinking=pi_thinking,
         )
+
+
+def _validated_pi_pair(model: Any, thinking: Any, *, deploys_agents: bool,
+                       agents: "Sequence[str]") -> tuple[str, str]:
+    """Shape-check pi's starting model + thinking level. Refused unless the
+    workflow deploys its selected agents (the docker substrate and the
+    sandbox-dind type, exactly create()'s `deployed_agents` condition — research
+    stages Claude only) and pi is among them: a value with nothing to land on is
+    a dead-end field. The texts reach the browser verbatim, so they name the
+    dialog's fields, never a command-line flag."""
+    for v, what in ((model, "pi model"), (thinking, "pi thinking level")):
+        if v is not None and not isinstance(v, str):
+            raise ValidationError(f"the {what} must be a string")
+    model = (model or "").strip()
+    thinking = (thinking or "").strip()
+    if not (model or thinking):
+        return "", ""
+    if not deploys_agents:
+        raise ValidationError(
+            "this workflow runs Claude only, so it takes no pi model or thinking level")
+    if "pi" not in agents:
+        raise ValidationError(
+            "a pi model or thinking level needs pi among the project's agents")
+    if model and not PI_MODEL_RE.match(model):
+        raise ValidationError(
+            f"pi model {model!r} must be written provider/model, e.g. "
+            f"openrouter/anthropic/claude-opus-latest (the provider takes letters, "
+            f"digits and . _ -; the model also : ~ @ + /)")
+    if thinking and thinking not in PI_THINKING_LEVELS:
+        raise ValidationError(
+            f"pi thinking level {thinking!r} is not one of "
+            f"{', '.join(PI_THINKING_LEVELS)}")
+    return model, thinking
 
 
 @dataclass(frozen=True)
@@ -2971,6 +3028,10 @@ class DevProjectProvisionRequest:
     # workflow's create dialog.
     supervisor_model: str = ""
     supervisor_effort: str = ""
+    # pi's starting model + thinking level (the dialog's pi tab), validated by
+    # the same CreateRequest delegation (pi must be among the agents).
+    pi_model: str = ""
+    pi_thinking: str = ""
     # The project's agent SET. None ⇒ the workflow's preset (a body without the
     # key); an explicit list is validated by the CreateRequest delegation below
     # (known agents, pulled dists, and the dev floor: at least one agent).
@@ -3014,6 +3075,8 @@ class DevProjectProvisionRequest:
             egress=egress, enable=enable, disable=disable,
             supervisor_model=kw.get("supervisor_model"),
             supervisor_effort=kw.get("supervisor_effort"),
+            pi_model=kw.get("pi_model"),
+            pi_thinking=kw.get("pi_thinking"),
             agents=raw_agents,
             dev_repo_preflight=False)
         return cls(name=cr.name, url=url, repo=repo, workflow=workflow,
@@ -3021,6 +3084,7 @@ class DevProjectProvisionRequest:
                    enable=enable, disable=disable,
                    supervisor_model=cr.supervisor_model,
                    supervisor_effort=cr.supervisor_effort,
+                   pi_model=cr.pi_model, pi_thinking=cr.pi_thinking,
                    agents=None if raw_agents is None else cr.agents)
 
 
@@ -3516,6 +3580,13 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         # marker key drives the conditional re-stage of the fetch surface at
         # start/recreate (_project_has_fetch_consumers).
         marker["fetch"] = True
+    # pi's starting model + thinking level, only when the create chose one
+    # (from_kwargs already refused it where pi is not deployed). Every deploy
+    # site reads it back from here (_read_pi_pair).
+    pi_pair = ({"model": req.pi_model, "thinking": req.pi_thinking}
+               if (req.pi_model or req.pi_thinking) else None)
+    if pi_pair:
+        marker["pi_models"] = {"agent": pi_pair}
     (orch_dir / "project.json").write_text(json.dumps(marker, indent=2) + "\n")
     # Starting message (STAGE_SPAWN_GREETING) for the workflow's main shell, read
     # by the Management/Supervisor tab on first byobu new-session. Manifest-
@@ -3582,6 +3653,9 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         service_flags=service_flags,
         agent_pair=model_pairs["supervisor"],
         agents=deployed_agents,
+        # Docker substrate only: its boot installs pi's settings and merges the
+        # pair from this env; a dind supervisor gets it on the host-side deploy.
+        pi_pair=pi_pair if is_docker else None,
         # The setup is the manifest's (from_kwargs refuses any other for a
         # web-app workflow), so the env carries exactly what create runs.
         web=({"start": req.web["start"], "port": req.web["port"],
@@ -3714,8 +3788,10 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             # _dind_stage_set — its launchers + claude's settings) whenever the
             # create selected ANY agent (deploy_local=bool(req.agents)); an
             # agent-less create leaves the supervisor unwired.
-            _stage_agent_dist(container_name, _dind_stage_set(req.agents),
-                              deploy_local=bool(req.agents))
+            _report_warnings(_stage_agent_dist(
+                container_name, _dind_stage_set(req.agents),
+                deploy_local=bool(req.agents),
+                **({"pi_pair": pi_pair} if pi_pair else {})), progress)
             # Editor dist staged whenever cached so any box can RO-mount
             # /opt/editor-dist; deploy_local follows the RESOLVED code-server
             # flag (default ON since the editor-by-default slice — a
@@ -4252,7 +4328,8 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         # deploy_local derived from the marker like every other call site (Option
         # C: an agent-less project's supervisor stays unwired); the validator
         # already refuses an empty set, so this is True for every real add.
-        _stage_agent_dist(container, staged, deploy_local=bool(marker_now))
+        _report_warnings(_stage_agent_dist(container, staged, deploy_local=bool(marker_now),
+                                           **_pi_pair_kwargs(workspace_path)), progress)
         # Running boxes follow live (an Add delivers the new agent wired; a
         # request that adds nothing is an Update). The editor extension: an Add
         # installs it only where none is (a supervisor that just gained claude);
@@ -5578,6 +5655,7 @@ def build_supervisor_docker_args(
     agent_pair: dict[str, str] | None = None,
     agents: "Sequence[str]" = (),
     web: dict | None = None,
+    pi_pair: dict[str, str] | None = None,
 ) -> list[str]:
     is_docker = substrate == Substrate.DOCKER.value
     args = [
@@ -5648,6 +5726,9 @@ def build_supervisor_docker_args(
     # (claude only), sandbox-dind supervisor and docker box all run a login
     # shell in the tab. The container user's home is research on all three.
     args += _agent_env_args(agents, "/home/research")
+    # pi's starting pair (docker substrate: the boot merges it into the pi
+    # settings it installs). None/empty → nothing, as before the pi tab.
+    args += _pi_env_args(pi_pair)
     for s in dns_servers:
         args += ["--dns", s]
     # The same resolvers for the project's INNER docker daemon (both dind
@@ -6625,7 +6706,8 @@ def _dind_stage_set(agents: "Sequence[str]") -> list[str]:
 
 
 def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,),
-                      *, deploy_local: bool = True, docker: bool = False) -> None:
+                      *, deploy_local: bool = True, docker: bool = False,
+                      pi_pair: dict[str, str] | None = None) -> list[str]:
     """Stage the host agent dists — the SET `agents`, merged — into a RUNNING
     supervisor (STAGE_AGENT_DIST slice 2; N agents since STAGE_PI_AGENT).
     Real files at AGENT_DIST_MOUNT — the inner fleet (worker / role-MCP /
@@ -6649,6 +6731,12 @@ def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,
     agent selection (marker `agents` on recreate): False leaves the supervisor
     UNWIRED (agent-less create, Option C) while the dist is still staged so its
     rs-sandbox-box boxes (FROM rs-analysis-base — no bake now) can deploy it.
+
+    `pi_pair` (the marker's pi starting model + thinking level, callers pass it
+    only when the project chose one) is merged into pi's settings in the SAME
+    no-clobber branch that installs them, so an existing settings file is never
+    touched. Returns the operator-facing warnings (a merge that could not apply
+    the pair; never fatal — pi then starts on its own default).
 
     Two dragons handled here:
       • The re-stage replaces the shared copy's CONTENTS and keeps the directory:
@@ -6692,13 +6780,15 @@ def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,
         # deploys from it in the SAME exec (a mktemp path cannot cross to a
         # second exec, nor can a trap clean up after one). Absolute paths: the
         # exec runs as root.
+        pi_file = f"/home/research/{PI_AGENT_DIR_REL}/settings.json"
+        pi_merge = (" && " + _pi_defaults_merge(pi_file)) if pi_pair else ""
         settings = "".join(
             f"( [ -e /home/research/.claude/settings.json ] || [ ! -f \"$d/claude/settings.json\" ] || "
             f"cp \"$d/claude/settings.json\" /home/research/.claude/settings.json )\n"
             if a == DEFAULT_AGENT else
-            f"( [ ! -f \"$d/pi/settings.json\" ] || [ -e /home/research/{PI_AGENT_DIR_REL}/settings.json ] || "
+            f"( [ ! -f \"$d/pi/settings.json\" ] || [ -e {pi_file} ] || "
             f"{{ mkdir -p /home/research/{PI_AGENT_DIR_REL} && "
-            f"cp \"$d/pi/settings.json\" /home/research/{PI_AGENT_DIR_REL}/settings.json; }} )\n"
+            f"cp \"$d/pi/settings.json\" {pi_file}{pi_merge}; }} )\n"
             if a == "pi" else ""
             for a in agents)
         script = ("set -e\n"
@@ -6710,7 +6800,8 @@ def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,
                   "cp -af \"$d/local/.\" /home/research/.local/\n"
                   + settings +
                   "chown -R 1000:1000 /home/research/.local /home/research/.claude\n")
-        cmd = ["docker", "exec", "-i", "-u", "0", supervisor, "sh", "-c", script]
+        cmd = ["docker", "exec", "-i", "-u", "0", *_pi_env_args(pi_pair), supervisor,
+               "sh", "-c", script]
     else:
         # In place: the CONTENTS go, the directory stays. Every box, worker and
         # role service bind-mounts this path, and a mount is pinned to the
@@ -6738,8 +6829,11 @@ def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,
     if proc.returncode != 0:
         die(f"staging {label} dist into {supervisor} failed: "
             f"{detail or 'tar extract returned non-zero'}")
+    warnings: list[str] = []
     if docker:
-        return
+        if PI_DEFAULTS_SENTINEL in detail:
+            warnings.append(_PI_DEFAULTS_WARNING)
+        return warnings
     if deploy_local:
         # /opt/agent-dist is now research-owned, so cp -a preserves cleanly. -f
         # (force) is load-bearing for the update-agent RE-deploy: the existing
@@ -6761,11 +6855,19 @@ def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,
         # && chain would let a failed `cp -af` above fall through to the chown
         # and exit 0.
         pi_dir = f"/home/research/{PI_AGENT_DIR_REL}"
+        # The starting pair, when the project chose one, is merged inside the
+        # SAME install branch (after the copy, before the trailing chown, which
+        # fixes the root-written temp file's owner); the fragment always exits
+        # 0, so it can never fail the install.
+        pi_merge = (" && " + _pi_defaults_merge(f"{pi_dir}/settings.json")
+                    if pi_pair and "pi" in agents else "")
         pi_settings = (
             f"( [ ! -f {AGENT_DIST_MOUNT}/pi/settings.json ] || [ -e {pi_dir}/settings.json ] || "
-            f"{{ mkdir -p {pi_dir} && cp {AGENT_DIST_MOUNT}/pi/settings.json {pi_dir}/settings.json; }} ) && "
+            f"{{ mkdir -p {pi_dir} && cp {AGENT_DIST_MOUNT}/pi/settings.json {pi_dir}/settings.json"
+            f"{pi_merge}; }} ) && "
             if "pi" in agents else "")
-        run_check(["docker", "exec", "-u", "0", supervisor, "sh", "-c",
+        r = run_check(["docker", "exec", "-u", "0", *(_pi_env_args(pi_pair) if pi_merge else []),
+                   supervisor, "sh", "-c",
                    f"mkdir -p /home/research/.local /home/research/.claude && "
                    f"cp -af {AGENT_DIST_MOUNT}/local/. /home/research/.local/ && "
                    f"( [ -e /home/research/.claude/settings.json ] || "
@@ -6773,6 +6875,9 @@ def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,
                    f"/home/research/.claude/settings.json ) && "
                    + pi_settings +
                    f"chown -R 1000:1000 /home/research/.local /home/research/.claude"])
+        if pi_merge and PI_DEFAULTS_SENTINEL in (r.stderr or ""):
+            warnings.append(_PI_DEFAULTS_WARNING)
+    return warnings
 
 
 def _root_owned(ti: tarfile.TarInfo) -> tarfile.TarInfo:
@@ -8679,8 +8784,9 @@ def _recreate_supervisor(
         # carry no agent label). Editor gated like research. No bake, so a
         # recreate must redeploy. Before the role-MCP relaunch below.
         marker_agents = _read_marker_agents(workspace_path)
-        _stage_agent_dist(container, _dind_stage_set(marker_agents),
-                          deploy_local=bool(marker_agents))
+        _report_warnings(_stage_agent_dist(container, _dind_stage_set(marker_agents),
+                                           deploy_local=bool(marker_agents),
+                                           **_pi_pair_kwargs(workspace_path)), progress)
         if editor_dist_present():
             _stage_editor_dist(container, deploy_local=flags.get("code-server", True))
         # Reader dist re-staged (STAGE_READER): survives the recreate so a
@@ -9027,7 +9133,11 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
         agents=_agents_from_mounts(md["extra_mounts"]),
         # The web app exactly as the old container carried it (its own env,
         # host-written at create; nothing inside the container can change it).
-        web=md.get("web"))
+        web=md.get("web"),
+        # The rebuilt container boots on a fresh home and re-installs pi's
+        # settings, so the create-time pair rides along again (marker-sourced,
+        # like the Claude pair above).
+        pi_pair=_read_pi_pair(workspace_path))
     # Recovered binds minus any prior editor-dist mount (agent-dist + --mount folders
     # pass through); re-derive the editor mount from the new flag (mirrors create).
     extra = _without_mount(md["extra_mounts"], EDITOR_DIST_MOUNT)
@@ -11069,7 +11179,8 @@ def project_add_agents(project: str, agents: "Sequence[str]",
             die("this project has no agents to update")
         _refuse_during_agent_build()
         progress.step("agents", f"deploying {'+'.join(marker_agents)} into the project")
-        _stage_agent_dist(container, marker_agents, docker=True)
+        _report_warnings(_stage_agent_dist(container, marker_agents, docker=True,
+                                           **_pi_pair_kwargs(workspace_path)), progress)
         if not _install_agent_extensions(
                 ["docker", "exec", "-u", "1000", "-e", "HOME=/home/research", container],
                 "/home/research", True):
@@ -11087,7 +11198,8 @@ def project_add_agents(project: str, agents: "Sequence[str]",
     staged = [DEFAULT_AGENT] if is_research else _dind_stage_set(marker_agents)
     deploy_local = is_research or bool(marker_agents)
     progress.step("agents", f"staging {'+'.join(staged)} into the project")
-    _stage_agent_dist(container, staged, deploy_local=deploy_local)
+    _report_warnings(_stage_agent_dist(container, staged, deploy_local=deploy_local,
+                                       **_pi_pair_kwargs(workspace_path)), progress)
     if deploy_local and not _install_agent_extensions(
             ["docker", "exec", "-u", "1000", "-e", "HOME=/home/research", container],
             "/home/research", True):
@@ -11287,6 +11399,104 @@ def _agent_flag_env_args(pair: dict[str, str] | None) -> list[str]:
     if pair.get("effort"):
         args += ["-e", f"RS_AGENT_EFFORT={pair['effort']}"]
     return args
+
+
+# ---------------------------------------------------------------------------
+# pi's starting model + thinking level (the create dialog's pi tab).
+#
+# Delivered into pi's SETTINGS, never as a launch flag: measured on pi 1.5.0, a
+# `--model provider/id` on a provider nobody has logged into yet stops pi from
+# starting at all ("No API key found"), which is every fresh project, whereas a
+# settings default naming a model the provider lacks is skipped silently. The
+# pair is merged ONLY where pi's canonical settings were just installed (a
+# no-clobber install), so it is a starting default: what the researcher picks in
+# pi later is theirs. Three install sites carry the merge: the docker-substrate
+# boot (agent/entrypoint.minimal.sh, from RS_PI_* env set at docker run), the
+# dind deploy and the docker Update deploy (_stage_agent_dist, from the same env
+# on its docker exec). The values never enter a shell line: jq reads them from
+# the environment, and PI_MODEL_RE holds the model to a strict charset first.
+# ---------------------------------------------------------------------------
+
+# One stderr line the merge prints when it could not apply the pair; the deploy
+# reads it back and reports a warning (a failed merge is never fatal: pi starts
+# on its own default).
+PI_DEFAULTS_SENTINEL = "RS_PI_DEFAULTS_NOT_APPLIED"
+_PI_DEFAULTS_WARNING = ("pi's chosen model and thinking level could not be written into "
+                        "its settings; pi starts on its own default (choose inside pi "
+                        "with /model)")
+# The jq program: the provider/model half only when a model was given, the
+# thinking level only when one was. No parentheses (the dind command's grouped
+# pi fragment is parenthesis-free by pin).
+PI_DEFAULTS_JQ = ('if $p == "" then . else .defaultProvider = $p | .defaultModel = $m end'
+                  ' | if $t == "" then . else .defaultThinkingLevel = $t end')
+
+
+def _pi_defaults_merge(settings: str) -> str:
+    """A POSIX sh fragment merging RS_PI_MODEL / RS_PI_THINKING (environment)
+    into the pi settings file at `settings`, keeping every other key (temp file
+    + rename). Exits 0 always: with neither variable set it does nothing; a
+    failed merge removes the temp file and prints PI_DEFAULTS_SENTINEL on
+    stderr. `settings` is an RS-built path, never user text."""
+    tmp = f"{settings}.rs-tmp"
+    return (f'{{ [ -z "${{RS_PI_MODEL:-}}${{RS_PI_THINKING:-}}" ] || '
+            f'{{ jq --arg p "${{RS_PI_MODEL%%/*}}" --arg m "${{RS_PI_MODEL#*/}}" '
+            f'--arg t "${{RS_PI_THINKING:-}}" \'{PI_DEFAULTS_JQ}\' {settings} > {tmp} '
+            f'&& mv {tmp} {settings}; }} || '
+            f'{{ rm -f {tmp}; echo {PI_DEFAULTS_SENTINEL} >&2; }}; }}')
+
+
+def _pi_env_args(pair: dict[str, str] | None) -> list[str]:
+    """`-e` args carrying pi's starting pair (docker run / docker exec). Absent
+    or empty values emit nothing, so a project without a pi choice is
+    byte-identical to one created before the pi tab existed."""
+    if not pair:
+        return []
+    args: list[str] = []
+    if pair.get("model"):
+        args += ["-e", f"RS_PI_MODEL={pair['model']}"]
+    if pair.get("thinking"):
+        args += ["-e", f"RS_PI_THINKING={pair['thinking']}"]
+    return args
+
+
+def _read_pi_pair(workspace_path: "Path") -> dict[str, str] | None:
+    """The marker's `pi_models.agent` pair, or None when the project chose
+    none (or predates the pi tab). Tolerant: an unreadable marker reads as no
+    choice, and only well-formed string values pass (the marker is
+    container-writable; the values still reach pi only through the merge,
+    which reads them from the environment)."""
+    try:
+        data = json.loads((workspace_path / ".orchestrator" / "project.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    blk = data.get("pi_models") if isinstance(data, dict) else None
+    pair = blk.get("agent") if isinstance(blk, dict) else None
+    if not isinstance(pair, dict):
+        return None
+    model = pair.get("model") if isinstance(pair.get("model"), str) else ""
+    thinking = pair.get("thinking") if isinstance(pair.get("thinking"), str) else ""
+    if model and not PI_MODEL_RE.match(model):
+        model = ""
+    if thinking not in PI_THINKING_LEVELS:
+        thinking = ""
+    return {"model": model, "thinking": thinking} if (model or thinking) else None
+
+
+def _pi_pair_kwargs(workspace_path: "Path") -> dict:
+    """`_stage_agent_dist` keyword args for the marker's pi pair: empty when the
+    project has none, so those calls keep their exact arguments."""
+    pair = _read_pi_pair(workspace_path)
+    return {"pi_pair": pair} if pair else {}
+
+
+def _report_warnings(lines: "Sequence[str]", progress=None) -> None:
+    """Operator-facing warnings from a deploy step: stderr for the CLI, a
+    `warning` progress line for the webui (`progress` may be None). `lines`
+    may be None (a stubbed deploy in a test returns nothing)."""
+    for line in lines or ():
+        print(f"warning: {line}", file=sys.stderr)
+        if progress is not None:
+            progress.step("warning", line)
 
 
 def _stage_box_catalog(workspace_path: "Path", *, strict: bool) -> list[dict]:
@@ -16420,6 +16630,7 @@ def dev_project_provision(req: "DevProjectProvisionRequest", progress=None) -> d
         egress=req.egress, enable=req.enable, disable=req.disable,
         supervisor_model=req.supervisor_model,
         supervisor_effort=req.supervisor_effort,
+        pi_model=req.pi_model, pi_thinking=req.pi_thinking,
         agents=req.agents)
     create(cr, progress=progress)
     return {"project": req.name, "repo": req.repo}

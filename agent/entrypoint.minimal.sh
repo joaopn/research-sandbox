@@ -89,6 +89,25 @@ if [[ -d /opt/agent-dist ]]; then
             if [[ ! -e "$pi_dir/settings.json" ]]; then
                 { mkdir -p "$pi_dir" && cp "$agent_src"pi/settings.json "$pi_dir/settings.json"; } \
                     || echo "warning: could not install pi's settings into $pi_dir" >&2
+                # The project's chosen starting model + thinking level (the
+                # create dialog's pi tab, RS_PI_* set at docker run), merged into
+                # the settings just installed and nowhere else (this branch runs
+                # only when there were none): a later choice made inside pi is
+                # never reset. jq reads the values from the environment (never a
+                # shell line); a failed merge leaves pi on its own default.
+                # Mirrors rscore's PI_DEFAULTS_JQ (pinned).
+                # (Read through ${VAR:-} only: this boot runs under set -u, and a
+                # thinking level chosen without a model leaves RS_PI_MODEL unset.)
+                pi_model="${RS_PI_MODEL:-}"
+                if [[ -e "$pi_dir/settings.json" && -n "$pi_model${RS_PI_THINKING:-}" ]]; then
+                    { jq --arg p "${pi_model%%/*}" --arg m "${pi_model#*/}" \
+                         --arg t "${RS_PI_THINKING:-}" \
+                         'if $p == "" then . else .defaultProvider = $p | .defaultModel = $m end | if $t == "" then . else .defaultThinkingLevel = $t end' \
+                         "$pi_dir/settings.json" > "$pi_dir/settings.json.rs-tmp" \
+                      && mv "$pi_dir/settings.json.rs-tmp" "$pi_dir/settings.json"; } \
+                        || { rm -f "$pi_dir/settings.json.rs-tmp"
+                             echo "warning: could not write pi's chosen model into its settings; pi starts on its own default" >&2; }
+                fi
             fi
         fi
     done

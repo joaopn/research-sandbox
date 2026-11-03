@@ -1633,6 +1633,46 @@ html.mobile .project-rail .rail-separator { cursor: default; }
 }
 .model-row select:disabled { opacity: 0.55; }
 
+/* Create dialog — the Agents section (I33): a heading whose badges turn agents
+   on and off, one tab per agent that is on, and that agent's settings below.
+   The badges are .box-opt-card toggles (selected = on, locked = held on); the
+   heading's <label> is the .field group title, so it keeps the house style. */
+.agents-section .agents-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+}
+.agents-section .agents-head > label { margin: 0; }
+.agent-badge { padding: 4px 12px; }
+.agent-tabs {
+    display: flex;
+    gap: 2px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 10px;
+}
+.agent-tab {
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    padding: 6px 14px;
+    font-size: 13px;
+    color: var(--fg-muted);
+    cursor: pointer;
+}
+.agent-tab:hover { color: var(--fg-base); }
+.agent-tab.active {
+    color: var(--fg-base);
+    border-bottom-color: var(--accent, #4a9eff);
+}
+.agent-tab-panel > .field:last-child { margin-bottom: 0; }
+/* pi's model id is free text: let it take the row's spare width. The input sits
+   in a .field, whose input rule already gives it the house padding and border. */
+.agent-pi-row { align-items: flex-end; }
+.agent-pi-model { flex: 1 1 260px; min-width: 0; }
+
 /* Box window: the agent cards and the model/effort row sit on one line — "which
    agent, and which model it runs on" is one decision. The row hides itself when no
    agent is selected (a blank box runs nothing, so it has no model). */

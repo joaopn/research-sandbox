@@ -609,6 +609,11 @@ CREATE_WEBUI_FIELDS = frozenset({
     "supervisor_model", "supervisor_effort",
     "worker_model", "worker_effort",
     "role_model", "role_effort",
+    # pi's starting model (`provider/model`) + thinking level: IN-BOX like the
+    # Claude pairs (they land in pi's own settings inside the container — no
+    # path, host port or mount); from_kwargs holds the model to a strict
+    # charset and refuses both where pi is not deployed.
+    "pi_model", "pi_thinking",
     # Opt-in rs-fetch (any non-dev workflow): an IN-BOX capability toggle —
     # stages the read-only fetch tool + operator token + wiring INSIDE the
     # container (the supervisor, on dind); no path, no host port, no mount.
@@ -917,6 +922,10 @@ DEV_PROJECT_WEBUI_FIELDS = frozenset({"name", "workflow", "url", "pat",
                                       # agent the researcher talks to. Same as any
                                       # other non-research workflow's create dialog.
                                       "supervisor_model", "supervisor_effort",
+                                      # pi's starting model + thinking level
+                                      # (the dialog's pi tab), validated by the
+                                      # same create delegation.
+                                      "pi_model", "pi_thinking",
                                       # The project's agent SET (an enum list,
                                       # in-box): absent ⇒ the workflow preset;
                                       # validated pre-spawn by the create
