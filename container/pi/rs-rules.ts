@@ -1,4 +1,4 @@
-// rs-rules v0.2.0
+// rs-rules v0.3.0
 //
 // Claude Code's rules capability for pi, one-to-one, as an RS-owned extension.
 // Shipped inside the pi dist (share/pi-agent/rs/rs-rules.ts) and named from the
@@ -19,6 +19,10 @@
 //   - Claude's read-before-edit rule: an `edit`, or a `write` of an existing file,
 //     is refused while the file has not been read this session, and refused again
 //     when the file changed on disk since it was read — with Claude's own texts.
+// One guard beyond the rules, for the subagent tool pi-subagents adds: a launch
+// of a single child with no brief is refused before any child starts (Claude
+// Code's Task tool requires its prompt; pi-subagents treats the single child's
+// `task` as optional and would start a child on an empty task).
 // Not reproduced, by decision: `claudeMdExcludes`, `@path` imports,
 // `--setting-sources`.
 //
@@ -30,7 +34,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-export const RS_RULES_VERSION = "0.2.0";
+export const RS_RULES_VERSION = "0.3.0";
 
 // The system-prompt SECTION the launch rules ride in (pi wraps it as
 // `<project_rules>…</project_rules>`). A section, never a returned
@@ -51,6 +55,14 @@ export const STALE_READ_MSG =
   "File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.";
 
 export const ENTRY_TYPE = "rs-rules";
+
+// The subagent tool pi-subagents registers, and the refusal of a single-child
+// launch that carries no brief.
+export const SUBAGENT_TOOL = "subagent";
+export const NO_BRIEF_MSG = (agent: string) =>
+  `subagent: this launch names agent '${agent}' but carries no brief. ` +
+  "Put the full, self-contained brief in `task` and call again.";
+export const RESUME_HINT = ' To continue an existing run, use action: "resume" with id and message.';
 
 // On resume, a file whose mtime is later than its read entry's timestamp by more
 // than this is stale. The slack covers the write-then-append ordering of a
@@ -641,6 +653,33 @@ function relTo(base: string, target: string): string | null {
 }
 
 // ---------------------------------------------------------------------------
+// The subagent brief guard.
+// ---------------------------------------------------------------------------
+
+const nonEmptyString = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
+const present = (o: unknown, key: string): boolean =>
+  !!o && typeof o === "object" && !Array.isArray(o) && (o as Record<string, unknown>)[key] !== undefined &&
+  (o as Record<string, unknown>)[key] !== null;
+
+// The refusal for a `subagent` call, or null when the call passes. Refused: a
+// launch of ONE child — it names an agent and carries none of the shapes that
+// are not a single launch (an `action`, a `workflow` or an inline workflow
+// script `options.script`, a `tasks` batch, a `chain`) — whose `task` is
+// missing, not a string, or whitespace only. Every other shape passes untouched:
+// pi-subagents validates its own shapes (an empty `action` string, say, is its
+// own error), the guard only closes the one it accepts.
+export function subagentLaunchRefusal(input: unknown): string | null {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return null;
+  const p = input as Record<string, unknown>;
+  if (!nonEmptyString(p.agent)) return null;
+  if (present(p, "action") || present(p, "workflow") || present(p, "tasks") || present(p, "chain")) return null;
+  if (present(p.options, "script")) return null;
+  if (nonEmptyString(p.task)) return null;
+  const resume = nonEmptyString(p.id) && nonEmptyString(p.message);
+  return NO_BRIEF_MSG(p.agent.trim()) + (resume ? RESUME_HINT : "");
+}
+
+// ---------------------------------------------------------------------------
 // The extension.
 // ---------------------------------------------------------------------------
 
@@ -808,6 +847,10 @@ export default function rsRules(pi: ExtensionAPI) {
   pi.on("tool_call", async (event: any, ctx) => {
     return guarded("tool_call", () => {
       const ev = event as ToolCallEvt;
+      if (ev.toolName === SUBAGENT_TOOL) {
+        const reason = subagentLaunchRefusal(ev.input);
+        return reason === null ? undefined : { block: true, reason };
+      }
       if (ev.toolName !== "edit" && ev.toolName !== "write") return undefined;
       const target = normalizeTarget(String(ev.input?.path ?? ""), ctx.cwd, home);
       const mt = mtimeOf(target);
