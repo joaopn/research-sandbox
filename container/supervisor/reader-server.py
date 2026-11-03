@@ -45,6 +45,7 @@ import http.server
 import logging
 import mimetypes
 import os
+import re
 import shutil
 import socketserver
 import threading
@@ -421,10 +422,152 @@ def _breadcrumb(rel: str) -> str:
     return f'<div class="rd-crumb">{" / ".join(links)}</div>'
 
 
+# Markdown inside an HTML wrapper. A README commonly wraps its title, badges and
+# intro in `<div align="center">` (or a `<details>` FAQ, a `<p align>`), with blank
+# lines inside; GitHub renders the markdown in there, but python-markdown keeps a
+# block-level raw-HTML element opaque, so the reader showed `# Title` and the
+# badge links as source. Its own md_in_html extension parses an element's inside
+# only when the element carries `markdown="1"`, which no README writes — so a small
+# preprocessor supplies that attribute on every block-level opening tag that does
+# not already carry one, and md_in_html then does the parsing (and strips the
+# attribute from the output).
+#
+# The elements whose content is raw text: never inject inside them, so a `<div>`
+# line inside a `<pre>` or a `<script>` stays literal. Mirrors md_in_html's own
+# `raw_tags`, which keeps these raw even when they carry the attribute.
+_MD_RAW_TAGS = ("canvas", "math", "option", "pre", "script", "style", "textarea")
+# Registration priority: after `fenced_code_block` (25), so fenced code has already
+# been stashed into placeholders and a `<div>` line inside a fence is invisible
+# here; before md_in_html's `html_block` (20), which reads the attribute.
+_MD_WRAPPER_PRIORITY = 22
+# An opening tag's attribute run, quote-aware: a `>` inside a quoted value is part
+# of the value, not the end of the tag. The three alternatives start with disjoint
+# characters, so matching is linear.
+_MD_ATTR_RUN = r"""((?:"[^"]*"|'[^']*'|[^'">])*)"""
+# Quoted attribute values, blanked before reading the run's attribute NAMES, so a
+# value such as `title="rendered with markdown"` is never read as the attribute.
+_MD_QUOTED_VALUE = re.compile(r""""[^"]*"|'[^']*'""")
+# An author-written `markdown` attribute (any value, `markdown="0"` included): the
+# author decided, so nothing is injected. Matched on the blanked run, where a
+# quoted value reads `""`, hence the quote characters in the lookbehind class.
+_MD_ATTR_NAME = re.compile(r"""(?:^|[\s"'])markdown(?=\s*=|\s|/?$)""", re.I)
+_MD_EXTENSIONS: list | None = None
+
+
+def _md_ends_html_at_blank(lines: list, i: int, name: str, rest: str) -> bool:
+    """Whether markdown inside the `<name>` element opened on `lines[i]` (`rest`
+    is that line after the opening tag) is parsed, by GitHub's rule: an HTML block
+    runs to the first blank line and stays raw HTML up to it; markdown resumes
+    after it. md_in_html parses an attributed element's WHOLE inside, so the
+    attribute is supplied only when that reads the same as GitHub: a blank line
+    comes before the element closes, and no line before that blank line is
+    indented 4+ columns (md_in_html would make such a line, typically
+    pretty-printed HTML, an escaped code block; GitHub and the plain render keep
+    it as HTML). An element closed before any blank line (a one-line
+    `<div>**x**</div>`, an all-contributors `<table>`) keeps today's raw render.
+    The scan stops at the first blank line or the close, whichever comes first."""
+    tag_open = re.compile(r"<" + re.escape(name) + r"(?=[\s/>])", re.I)
+    tag_close = re.compile(r"</" + re.escape(name) + r"\s*>", re.I)
+    depth = 1 + len(tag_open.findall(rest)) - len(tag_close.findall(rest))
+    if depth <= 0:
+        return False
+    for line in lines[i + 1:]:
+        if not line.strip():
+            return True
+        flat = line.expandtabs(4)
+        if len(flat) - len(flat.lstrip(" ")) >= 4:
+            return False
+        depth += len(tag_open.findall(line)) - len(tag_close.findall(line))
+        if depth <= 0:
+            return False
+    return False
+
+
+def _markdown_extensions() -> list:
+    """The extension list `_render_markdown` passes to python-markdown, built on
+    first use: the classes subclass python-markdown's, and the module must stay
+    importable without the package (it is imported lazily, like nbconvert)."""
+    global _MD_EXTENSIONS
+    if _MD_EXTENSIONS is not None:
+        return _MD_EXTENSIONS
+    from markdown.extensions import Extension
+    from markdown.preprocessors import Preprocessor
+
+    raw = "|".join(_MD_RAW_TAGS)
+    raw_open = re.compile(r"^ {0,3}<(?:" + raw + r")(?=[\s/>])", re.I)
+    raw_close = re.compile(r"</(?:" + raw + r")\s*>", re.I)
+
+    class _WrapperMarkdown(Preprocessor):
+        def run(self, lines):
+            # Longest name first, so `<details>` is never read as `<del>`-ish
+            # prefixes; the lookahead after the name rejects `<divider>`.
+            tags = sorted(set(self.md.block_level_elements) - set(_MD_RAW_TAGS),
+                          key=len, reverse=True)
+            # Column 0-3, as python-markdown starts an HTML block; 4+ spaces is
+            # an indented code block and is never touched.
+            open_tag = re.compile(r"^( {0,3})<(" + "|".join(map(re.escape, tags))
+                                  + r")(?=[\s/>])" + _MD_ATTR_RUN + ">", re.I)
+            depth = 0
+            out = []
+            for i, line in enumerate(lines):
+                if depth == 0:
+                    m = open_tag.match(line)
+                    if m:
+                        names = _MD_QUOTED_VALUE.sub('""', m.group(3))
+                        if (not _MD_ATTR_NAME.search(names)
+                                and not names.rstrip().endswith("/")
+                                and _md_ends_html_at_blank(
+                                    lines, i, m.group(2), line[m.end():])):
+                            line = (f'{m.group(1)}<{m.group(2)}{m.group(3)}'
+                                    f' markdown="1">' + line[m.end():])
+                # A raw element opens only where a raw HTML block would start
+                # (the line opens with it); a `<script>` mentioned in prose or a
+                # code span is not one. Its closes count anywhere on the line.
+                if raw_open.match(line):
+                    depth += 1
+                if depth > 0:
+                    depth = max(depth - len(raw_close.findall(line)), 0)
+                out.append(line)
+            return out
+
+    class _WrapperMarkdownExtension(Extension):
+        def extendMarkdown(self, md):
+            md.preprocessors.register(_WrapperMarkdown(md), "rs_md_in_wrappers",
+                                      _MD_WRAPPER_PRIORITY)
+
+    _MD_EXTENSIONS = ["fenced_code", "tables", "sane_lists", "md_in_html",
+                      _WrapperMarkdownExtension()]
+    return _MD_EXTENSIONS
+
+
 def _render_markdown(text: str, rel: str) -> bytes:
+    """Render a `.md` file as GitHub would, including markdown inside a block-level
+    HTML wrapper (see `_markdown_extensions`).
+
+    Trust posture, unchanged by the wrapper handling: raw HTML in a `.md` has
+    always passed through verbatim (python-markdown has no sanitizer and none is
+    configured — the same posture as a rendered notebook, contained by the
+    reader's own per-project origin). The wrapper handling only decides whether
+    the markdown INSIDE that HTML is parsed, so it widens nothing.
+
+    Only an element whose HTML block ends at a blank line before the element
+    closes is parsed (`_md_ends_html_at_blank`); pretty-printed HTML with no
+    blank line inside, or indented 4+ columns before the first one, renders
+    exactly as before.
+
+    Accepted traces, all invisible: an injected `markdown="1"` can remain in the
+    DOM on inner elements of an author's `markdown="0"` element, in comment text,
+    and on a block tag inside a `<pre>`/`<script>` that opened after another tag
+    on the same line (`<div><pre>`) or after a same-line close
+    (`<pre>a</pre><pre>`). md_in_html keeps raw-tag content raw, so what the
+    reader sees is what it saw before. Known differences from GitHub:
+    non-block content between the opening tag and the first blank line (an
+    `<img>`, text) is parsed as a markdown paragraph where GitHub keeps it raw,
+    and a `<td>` with a blank line inside gets span-level parsing. As on GitHub,
+    a line indented 4+ columns AFTER that blank line is a code block. A
+    multi-line opening tag is left as it was."""
     import markdown  # stdlib-cheap once installed; part of the dist
-    body = markdown.markdown(
-        text, extensions=["fenced_code", "tables", "sane_lists"])
+    body = markdown.markdown(text, extensions=_markdown_extensions())
     return _page(rel or "workspace", _breadcrumb(rel) + body)
 
 
