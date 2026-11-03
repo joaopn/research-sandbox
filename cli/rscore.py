@@ -4578,13 +4578,16 @@ def destroy(req: DestroyRequest, cfg: "Config" | None = None,
             progress=None) -> None:  # type: ignore[name-defined]
     """Tear a project down: container + workspace dir + DIND volume + network,
     plus its router MCP-allow rules. Confirmation is the front-end's job — this
-    verb just destroys. die()s if the project doesn't exist."""
+    verb just destroys. A project whose container is already gone (a reset
+    docker store, a hand `docker rm`) is destroyed too: whatever of it remains
+    is removed. die()s only when nothing of the project remains."""
     if cfg is None:
         cfg = load_config()
     progress = progress or _NULL_PROGRESS
     project = req.name
     container = container_name_for(project)
-    if not container_exists(container):
+    remnants = project_remnants(project, cfg)
+    if not remnants:
         die(f"project {project!r} does not exist")
     progress.step("validate", "located project")
 
@@ -4608,10 +4611,19 @@ def destroy(req: DestroyRequest, cfg: "Config" | None = None,
                      "/scripts/mcp-deny.sh", subnet, ip, str(port)],
                     capture_output=True)
 
+    # The milestone is emitted in both arms: the webui's destroy checklist
+    # pre-lists it, so skipping it would leave a stuck pending row.
     progress.step("remove-container", "removing container")
-    run(["docker", "rm", "-f", container], capture_output=True)
+    if "container" in remnants:
+        run(["docker", "rm", "-f", container], capture_output=True)
+    else:
+        progress.step("note", "its container was already gone")
     progress.step("cleanup", "removing workspace, volume and network")
-    if project_root.exists():
+    # The project folder goes only when it holds RS's workspace (or the
+    # container still stood, the reach destroy always had): a stale network
+    # or volume must never delete an unrelated folder that shares the name.
+    if project_root.exists() and ("workspace" in remnants
+                                  or "container" in remnants):
         shutil.rmtree(project_root, ignore_errors=True)
         stuck = _project_root_leftovers(project_root)
         if stuck:
@@ -4759,7 +4771,13 @@ def stop(req: StartStopRequest, cfg: "Config" | None = None,
 
 
 def list_projects(cfg: "Config" | None = None) -> list[ProjectSummary]:  # type: ignore[name-defined]
-    """Every supervisor container with its state + SSH endpoint (if running)."""
+    """Every supervisor container with its state + SSH endpoint (if running),
+    then one ORPHANED_STATE row per project that has no container but still
+    has something destroy would remove (a workspace, a network, a DIND
+    volume) — so the webui's Destroy reaches it. Listed orphans are exactly
+    the names project_remnants() reports without a container."""
+    if cfg is None:
+        cfg = load_config()
     out: list[ProjectSummary] = []
     for c in get_supervisor_containers():
         ssh = None
@@ -4767,6 +4785,28 @@ def list_projects(cfg: "Config" | None = None) -> list[ProjectSummary]:  # type:
             port = get_ssh_port(c["name"])
             ssh = f"localhost:{port}" if port else None
         out.append(ProjectSummary(project=c["project"], state=c["state"], ssh=ssh))
+    have = {s.project for s in out}
+    orphans: set[str] = set()
+    root = Path(cfg.projects_dir).expanduser().resolve()
+    if root.is_dir():
+        for child in root.iterdir():
+            if valid_project_name(child.name) and _has_workspace_dir(child):
+                orphans.add(child.name)
+    # docker's name filter is a SUBSTRING match: re-check the prefix. A failed
+    # `ls` contributes nothing (the container listing above already dies on a
+    # dead daemon).
+    for kind, prefix in (("network", PROJECT_NETWORK_PREFIX),
+                         ("volume", DOCKER_VOLUME_PREFIX)):
+        r = run(["docker", kind, "ls", "--filter", f"name={prefix}",
+                 "--format", "{{.Name}}"], capture_output=True)
+        if r.returncode != 0:
+            continue
+        for line in r.stdout.splitlines():
+            name = line.strip()
+            if name.startswith(prefix) and valid_project_name(name[len(prefix):]):
+                orphans.add(name[len(prefix):])
+    for name in sorted(orphans - have):
+        out.append(ProjectSummary(project=name, state=ORPHANED_STATE, ssh=None))
     return out
 
 
@@ -5891,6 +5931,40 @@ def workspace_path_for(project: str, cfg: "Config") -> Path:
 
 def project_network_for(project: str) -> str:
     return f"{PROJECT_NETWORK_PREFIX}{project}"
+
+
+# list_projects' state for a project with no container but leftovers on the
+# host. LOCKSTEP with webui/static/app.js `const ORPHANED_STATE`.
+ORPHANED_STATE = "orphaned"
+
+
+def _has_workspace_dir(project_root: Path) -> bool:
+    """True when <project_root>/workspace is a directory. create only ever
+    mkdirs the workspace (never the bare root), so this is what every RS
+    leftover has — a foreign folder that merely carries a valid project name
+    under a shared projects_dir is never counted. An unreadable child is not
+    a leftover (Path.is_dir raises on EACCES before Python 3.14)."""
+    try:
+        return (project_root / "workspace").is_dir()
+    except OSError:
+        return False
+
+
+def project_remnants(project: str, cfg: "Config") -> list[str]:
+    """What of this project is still on the host, in teardown order: any of
+    "container", "workspace", "volume", "network". Empty = nothing to
+    destroy. The container probe is `docker container inspect` (a bare
+    inspect falls through to an image of the same name)."""
+    out: list[str] = []
+    if run_quiet(["docker", "container", "inspect", container_name_for(project)]):
+        out.append("container")
+    if _has_workspace_dir(project_root_for(project, cfg)):
+        out.append("workspace")
+    if volume_exists(docker_volume_name_for(project)):
+        out.append("volume")
+    if network_exists(project_network_for(project)):
+        out.append("network")
+    return out
 
 
 def wait_for_inner_dockerd(container: str, timeout: int = 60) -> None:

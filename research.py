@@ -747,25 +747,34 @@ def cmd_project_destroy(args: argparse.Namespace) -> None:
             names.append(nm)
     # Build + existence-check EVERY project up front: a bad name aborts before
     # anything is destroyed (no half-done batch).
+    # A project counts as existing while ANYTHING of it remains (its container,
+    # workspace, DIND volume or network) — one whose container is gone is
+    # destroyable too.
     reqs = [_build(rscore.DestroyRequest, name=nm) for nm in names]
+    remnants = {}
     for req in reqs:
-        if not container_exists(container_name_for(req.name)):
+        remnants[req.name] = rscore.project_remnants(req.name, cfg)
+        if not remnants[req.name]:
             die(f"project {req.name!r} does not exist")
 
     print(f"=== Destroy: {', '.join(r.name for r in reqs)} ===\n")
     print("This will permanently delete, for each project:")
     for req in reqs:
-        container = container_name_for(req.name)
-        project_root = project_root_for(req.name, cfg)
-        docker_volume = docker_volume_name_for(req.name)
-        network = project_network_for(req.name)
+        left = remnants[req.name]
         print(f"  {req.name}:")
-        print(f"    - supervisor container ({container})")
-        print(f"    - workspace directory on host: {project_root}")
-        print("        (includes .claude/ creds snapshot, plans, all worker outputs)")
-        if volume_exists(docker_volume):
-            print(f"    - DIND volume ({docker_volume})")
-        print(f"    - per-project network ({network})")
+        if "container" in left:
+            print(f"    - supervisor container ({container_name_for(req.name)})")
+        else:
+            print("    (its container is already gone)")
+        # Same condition destroy deletes the project folder under.
+        root = project_root_for(req.name, cfg)
+        if "workspace" in left or ("container" in left and root.exists()):
+            print(f"    - workspace directory on host: {root}")
+            print("        (includes .claude/ creds snapshot, plans, all worker outputs)")
+        if "volume" in left:
+            print(f"    - DIND volume ({docker_volume_name_for(req.name)})")
+        if "network" in left:
+            print(f"    - per-project network ({project_network_for(req.name)})")
     print()
     # One confirmation for the whole batch.
     if not confirm("Type 'yes' to confirm: "):
