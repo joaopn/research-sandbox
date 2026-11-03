@@ -1667,7 +1667,7 @@ def cmd_webui_cert_tailscale() -> None:
 
     if container_running(WEBUI_CONTAINER):
         print("recreating webui to pick up new cert...")
-        _webui_recreate_in_place()
+        _webui_recreate_in_place(broker.BROKER_RUN_DIR)
 
     bind = read_env_value("WEBUI_BIND") or "127.0.0.1"
     port = read_env_value("WEBUI_PORT") or "7777"
@@ -1694,51 +1694,6 @@ def cmd_webui_cert_tailscale() -> None:
               "the trusted cert")
         print(f"  (connections via {bind} directly will see a name-mismatch "
               f"warning — the cert covers {fqdn} only)")
-
-
-WEBUI_IMAGE_UID = 1000   # baked uid in webui/Dockerfile (USER webui)
-
-
-def _ensure_webui_volume_ownership(uid: int, gid: int) -> None:
-    """The rs-webui-tls / rs-webui-state named volumes initialize owned by the
-    image's baked uid (1000). When the webui runs as a different uid (the
-    uid-equality contract on a non-1000 host), it can't write its TLS cert or
-    persist the origin-port map there — chown both volumes to the runtime uid
-    first. No-op on the common uid==1000 host."""
-    if (uid, gid) == (WEBUI_IMAGE_UID, WEBUI_IMAGE_UID):
-        return
-    run(["docker", "run", "--rm", "-u", "0",
-         "-v", "rs-webui-tls:/app/tls", "-v", "rs-webui-state:/app/state",
-         WEBUI_IMAGE,
-         "chown", "-R", f"{uid}:{gid}", "/app/tls", "/app/state"],
-        capture_output=True)
-
-
-# Defaults for the per-editor browser-origin port range (see .env.example).
-# 65 ports bounds concurrent editor origins well above a single operator's
-# realistic use (projects × boxes + exported apps) while keeping the squat
-# footprint small; the 101xx block dodges the common dev-tool squatters
-# (3000/8xxx dev servers, 9000 minio/portainer, 9090 prometheus). Exhaustion
-# and busy-port conflicts both fail loudly, never silently.
-WEBUI_ORIGIN_PORT_LO_DEFAULT = 10100
-WEBUI_ORIGIN_PORT_HI_DEFAULT = 10164
-
-
-def _webui_origin_port_range() -> tuple[int, int]:
-    """Resolve WEBUI_ORIGIN_PORT_LO/HI from .env (the same read_env_value
-    pattern as WEBUI_BIND/WEBUI_PORT — the abort message's remedy is 'edit
-    .env', so the read path must honor it). die()s on a malformed range."""
-    try:
-        lo = int(read_env_value("WEBUI_ORIGIN_PORT_LO")
-                 or WEBUI_ORIGIN_PORT_LO_DEFAULT)
-        hi = int(read_env_value("WEBUI_ORIGIN_PORT_HI")
-                 or WEBUI_ORIGIN_PORT_HI_DEFAULT)
-    except ValueError:
-        die("WEBUI_ORIGIN_PORT_LO/HI in .env must be integers")
-    if not (0 < lo <= hi < 65536):
-        die(f"invalid webui origin port range {lo}-{hi} "
-            "(need 0 < LO <= HI < 65536); fix WEBUI_ORIGIN_PORT_LO/HI in .env")
-    return lo, hi
 
 
 def _webui_probe_ports(bind: str, ports: list[int]) -> None:
@@ -1821,11 +1776,11 @@ def cmd_webui(args: argparse.Namespace) -> None:
         new_port = getattr(args, "port", None)
         rebuild = getattr(args, "rebuild", False)
         recreate = False
+        user_changed = False
         # The webui listens only on its address inside the router network
         # (B156). Read before anything is rewritten or removed: a missing
         # network stops here with its remedy and leaves everything as it was.
         listen_subnet = rscore.webui_listen_subnet()
-        os.environ["WEBUI_LISTEN_SUBNET"] = listen_subnet
         if run_quiet(["docker", "image", "inspect", WEBUI_IMAGE]) \
                 and not rscore.webui_image_has_listen_contract():
             print("the webui image predates the narrowed listen address; rebuilding it")
@@ -1834,6 +1789,12 @@ def cmd_webui(args: argparse.Namespace) -> None:
         if rscore._container_present(WEBUI_CONTAINER) \
                 and rscore.webui_container_subnet() != listen_subnet:
             recreate = True
+        # A webui running as another uid cannot reach the broker's 0700 run dir
+        # (an in-place recreate before this fix ran it as compose's 1000 default).
+        # None means there is no webui container, so nothing to heal.
+        running_as = rscore.webui_container_user()
+        if running_as is not None and running_as != f"{os.getuid()}:{os.getgid()}":
+            user_changed = True
         if new_bind and new_bind != bind:
             update_env_key("WEBUI_BIND", new_bind)
             bind = new_bind
@@ -1842,21 +1803,18 @@ def cmd_webui(args: argparse.Namespace) -> None:
             update_env_key("WEBUI_PORT", new_port)
             port = new_port
             recreate = True
-        os.environ["WEBUI_BIND"] = bind
-        os.environ["WEBUI_PORT"] = port
         # Per-editor browser-origin range (origin isolation): resolved from
-        # .env, exported for compose's ports/environment interpolation. The
-        # UI port must sit outside the range — the range is published 1:1
-        # (host port == container port) while 7777 maps from WEBUI_PORT.
+        # .env for the overlap checks below (webui_compose_env exports it for
+        # compose's interpolation). The UI port must sit outside the range —
+        # the range is published 1:1 (host port == container port) while 7777
+        # maps from WEBUI_PORT.
         origin_lo, origin_hi = _webui_origin_port_range()
         if origin_lo <= int(port) <= origin_hi:
             die(f"WEBUI_PORT={port} falls inside the origin port range "
                 f"{origin_lo}-{origin_hi}; move one of them in .env")
-        os.environ["WEBUI_ORIGIN_PORT_LO"] = str(origin_lo)
-        os.environ["WEBUI_ORIGIN_PORT_HI"] = str(origin_hi)
         # Pass-through block (STAGE_PASSTHROUGH_PORTS): resolved from .env via
         # rscore (the SAME helper PortAddRequest validation uses — one
-        # definition), exported for compose's ports/environment interpolation.
+        # definition), for the overlap checks below.
         # These are HOST-netns overlap checks against the HOST port numbers;
         # webui/server.py keeps its own IN-container guard against the fixed
         # 7777 — different netns, both correct, do not "harmonize" them.
@@ -1870,21 +1828,16 @@ def cmd_webui(args: argparse.Namespace) -> None:
         if not (pt_hi < origin_lo or origin_hi < pt_lo):
             die(f"the pass-through block {pt_lo}-{pt_hi} overlaps the origin "
                 f"port range {origin_lo}-{origin_hi}; move one of them in .env")
-        os.environ["WEBUI_PASSTHROUGH_PORT_LO"] = str(pt_lo)
-        os.environ["WEBUI_PASSTHROUGH_PORT_HI"] = str(pt_hi)
-        # Run the webui as the operator's uid so it can connect to the broker's
-        # 0600 socket and pass its SO_PEERCRED check (the uid-equality contract,
-        # value-agnostic — not hardcoded to 1000). Expose only the broker's
-        # socket subdir, never all of ~/.research-sandbox.
-        os.environ["WEBUI_UID"] = str(os.getuid())
-        os.environ["WEBUI_GID"] = str(os.getgid())
-        os.environ["RS_BROKER_DIR"] = str(broker.BROKER_RUN_DIR)
-        # Pre-create the socket subdir operator-owned, so the bind-mount source
-        # exists before `up` — otherwise docker auto-creates it root-owned and
-        # the broker (running as the operator) can't bind its socket there.
-        broker.BROKER_RUN_DIR.mkdir(parents=True, exist_ok=True)
-        if (recreate or rebuild) and container_exists(WEBUI_CONTAINER):
+        # Everything compose interpolates for the webui, the operator's uid/gid
+        # and the broker's socket subdir included, from the ONE helper the
+        # in-place recreate uses too (it also pre-creates that subdir).
+        try:
+            os.environ.update(rscore.webui_compose_env(bind, port, listen_subnet, broker.BROKER_RUN_DIR))
+        except ValidationError as e:
+            die(f"{e} — fix WEBUI_PASSTHROUGH_PORT_LO/HI in .env")
+        if (recreate or user_changed or rebuild) and container_exists(WEBUI_CONTAINER):
             reason = ("bind/port/listen subnet changed" if recreate
+                      else "the webui runs as another user" if user_changed
                       else "rebuild requested")
             print(f"{reason}; recreating webui...")
             run(["docker", "rm", "-f", WEBUI_CONTAINER], capture_output=True)

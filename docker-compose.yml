@@ -36,7 +36,8 @@ services:
     build: ./webui
     image: rs-webui:latest
     container_name: rs-webui
-    # Run as the operator's uid (set by `research webui start`) so the webui can
+    # Run as the operator's uid (set by every research path that brings the
+    # webui up — `webui start` and the in-place recreate) so the webui can
     # connect to the broker's 0600 socket and pass its SO_PEERCRED check — the
     # uid-equality contract, value-agnostic (defaults to the baked 1000).
     user: "${WEBUI_UID:-1000}:${WEBUI_GID:-1000}"
@@ -105,8 +106,8 @@ volumes:
   # which silently diverges from the helper's target.
   rs-webui-tls:
     name: rs-webui-tls
-  # Same literal-name pinning as rs-webui-tls: the ownership helper in
-  # research.py chowns this volume by name pre-start on uid≠1000 hosts.
+  # Same literal-name pinning as rs-webui-tls: the webui ownership helper
+  # chowns this volume by name before every `up` on uid≠1000 hosts.
   rs-webui-state:
     name: rs-webui-state
 

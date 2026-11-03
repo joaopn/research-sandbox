@@ -2190,6 +2190,33 @@ def webui_passthrough_port_range() -> tuple[int, int]:
     return lo, hi
 
 
+# Defaults for the per-editor browser-origin port range (see .env.example).
+# 65 ports bounds concurrent editor origins well above a single operator's
+# realistic use (projects × boxes + exported apps) while keeping the squat
+# footprint small; the 101xx block dodges the common dev-tool squatters
+# (3000/8xxx dev servers, 9000 minio/portainer, 9090 prometheus). Exhaustion
+# and busy-port conflicts both fail loudly, never silently.
+WEBUI_ORIGIN_PORT_LO_DEFAULT = 10100
+WEBUI_ORIGIN_PORT_HI_DEFAULT = 10164
+
+
+def _webui_origin_port_range() -> tuple[int, int]:
+    """Resolve WEBUI_ORIGIN_PORT_LO/HI from .env (the same read_env_value
+    pattern as WEBUI_BIND/WEBUI_PORT — the abort message's remedy is 'edit
+    .env', so the read path must honor it). die()s on a malformed range."""
+    try:
+        lo = int(read_env_value("WEBUI_ORIGIN_PORT_LO")
+                 or WEBUI_ORIGIN_PORT_LO_DEFAULT)
+        hi = int(read_env_value("WEBUI_ORIGIN_PORT_HI")
+                 or WEBUI_ORIGIN_PORT_HI_DEFAULT)
+    except ValueError:
+        die("WEBUI_ORIGIN_PORT_LO/HI in .env must be integers")
+    if not (0 < lo <= hi < 65536):
+        die(f"invalid webui origin port range {lo}-{hi} "
+            "(need 0 < LO <= HI < 65536); fix WEBUI_ORIGIN_PORT_LO/HI in .env")
+    return lo, hi
+
+
 # Project SSH-port block: every project is handed ONE host port from here at
 # create and owns it until destroy (recorded in its marker; see
 # allocate_ssh_port). Defaults = the range the allocator always used: 2240
@@ -18861,6 +18888,24 @@ def _stage_webui_cert(cert_pem: bytes, key_pem: bytes,
         ])
 
 
+WEBUI_IMAGE_UID = 1000   # baked uid in webui/Dockerfile (USER webui)
+
+
+def _ensure_webui_volume_ownership(uid: int, gid: int) -> None:
+    """The rs-webui-tls / rs-webui-state named volumes initialize owned by the
+    image's baked uid (1000). When the webui runs as a different uid (the
+    uid-equality contract on a non-1000 host), it can't write its TLS cert or
+    persist the origin-port map there — chown both volumes to the runtime uid
+    first. No-op on the common uid==1000 host."""
+    if (uid, gid) == (WEBUI_IMAGE_UID, WEBUI_IMAGE_UID):
+        return
+    run(["docker", "run", "--rm", "-u", "0",
+         "-v", "rs-webui-tls:/app/tls", "-v", "rs-webui-state:/app/state",
+         WEBUI_IMAGE,
+         "chown", "-R", f"{uid}:{gid}", "/app/tls", "/app/state"],
+        capture_output=True)
+
+
 def webui_listen_subnet() -> str:
     """The router network's IPv4 subnet, which the webui binds inside (B156).
     Dies with a one-line remedy when the network is absent (the router brings
@@ -18921,10 +18966,67 @@ def webui_container_subnet() -> str:
     return ""
 
 
-def _webui_recreate_in_place() -> None:
+def webui_container_user() -> str | None:
+    """The `uid:gid` the existing webui container runs as (its Config.User).
+
+    None when the container-scoped inspect fails, i.e. there is no webui
+    container (a bare inspect would also answer for the rs-webui IMAGE); ""
+    when the container carries no user (it then runs as the image's baked
+    uid). The None/str split IS the presence read, so callers need no second
+    inspect."""
+    r = run(["docker", "container", "inspect", WEBUI_CONTAINER,
+             "-f", "{{.Config.User}}"], capture_output=True)
+    if r.returncode != 0:
+        return None
+    return (r.stdout or "").strip()
+
+
+def webui_compose_env(bind: str, port: str, listen_subnet: str,
+                      broker_run_dir: Path) -> dict[str, str]:
+    """Every variable the webui's compose service takes from the caller, so
+    each path that brings the webui up (`research webui start`, the in-place
+    recreate) passes the same set: the listen subnet, bind and port, the
+    origin and pass-through port ranges from .env, the operator's uid/gid
+    (the webui must run as the operator to reach the broker's 0700 run dir
+    and pass its SO_PEERCRED check; compose would fall back to 1000) and the
+    broker's run dir, mounted read-only as the socket's parent.
+
+    PROJECTS_DIR and HOME are not in the set: compose reads PROJECTS_DIR from
+    .env itself and HOME is the operator's own. `broker_run_dir` is passed in
+    because this module cannot import the broker (it imports this module).
+
+    Side effect, after every read has succeeded: the broker run dir is
+    created, operator-owned, so the bind-mount source exists before `up` —
+    otherwise docker creates it root-owned and the broker (running as the
+    operator) cannot bind its socket there. A malformed origin range dies; a
+    malformed pass-through block raises ValidationError (the caller adds the
+    .env remedy); neither leaves anything behind."""
+    origin_lo, origin_hi = _webui_origin_port_range()
+    pt_lo, pt_hi = webui_passthrough_port_range()
+    env = {
+        "WEBUI_LISTEN_SUBNET": listen_subnet,
+        "WEBUI_BIND": bind,
+        "WEBUI_PORT": port,
+        "WEBUI_ORIGIN_PORT_LO": str(origin_lo),
+        "WEBUI_ORIGIN_PORT_HI": str(origin_hi),
+        "WEBUI_PASSTHROUGH_PORT_LO": str(pt_lo),
+        "WEBUI_PASSTHROUGH_PORT_HI": str(pt_hi),
+        "WEBUI_UID": str(os.getuid()),
+        "WEBUI_GID": str(os.getgid()),
+        "RS_BROKER_DIR": str(broker_run_dir),
+    }
+    broker_run_dir.mkdir(parents=True, exist_ok=True)
+    return env
+
+
+def _webui_recreate_in_place(broker_run_dir: Path) -> None:
     """Tear down + bring up the webui container so it re-reads the TLS
-    volume on next start. No image rebuild; preserves WEBUI_BIND/PORT and
-    passes the router network's subnet the webui binds inside (B156)."""
+    volume on next start. No image rebuild; passes the same compose
+    environment `research webui start` does (webui_compose_env: bind, port,
+    the router network's subnet the webui binds inside (B156), the port
+    ranges, the operator's uid/gid and the broker run dir), and gives the
+    TLS/state volumes to the operator's uid before `up` (the cert staging
+    writes them as 1000). Every refusal comes before anything is touched."""
     bind = read_env_value("WEBUI_BIND") or "127.0.0.1"
     port = read_env_value("WEBUI_PORT") or "7777"
     if not webui_image_has_listen_contract():
@@ -18933,11 +19035,15 @@ def _webui_recreate_in_place() -> None:
         die("the webui image predates the narrowed listen address; run "
             "`research webui start`, which rebuilds it and picks up the staged "
             "certificate")
-    os.environ["WEBUI_LISTEN_SUBNET"] = webui_listen_subnet()
-    os.environ["WEBUI_BIND"] = bind
-    os.environ["WEBUI_PORT"] = port
+    try:
+        env = webui_compose_env(bind, port, webui_listen_subnet(),
+                                broker_run_dir)
+    except ValidationError as e:
+        die(f"{e} — fix WEBUI_PASSTHROUGH_PORT_LO/HI in .env")
+    os.environ.update(env)
     if container_exists(WEBUI_CONTAINER):
         run(["docker", "rm", "-f", WEBUI_CONTAINER], capture_output=True)
+    _ensure_webui_volume_ownership(os.getuid(), os.getgid())
     docker_compose("--profile", "webui", "up", "-d", "webui")
     wire_webui_to_projects()
 
