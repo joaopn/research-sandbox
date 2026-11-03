@@ -3361,10 +3361,11 @@ async function devRefreshCommitCells(repo, sha, ctx) {
 // `rs-fetch <repo> <locator> --commit <sha>` and per-commit review affordances
 // (Review / reviewed-badge / Retry, fed by the dev_commits result's sha-keyed
 // ledger entries). view/body are threaded in for devReviewDialog
-// (status-redirect routing + the onDone re-render); `rerender`/`onLogin`
-// (optional) ride through to it — the close landing and the view-rooted 401
-// landing respectively (absent ⇒ the Fetch-tab default / the Management
-// landing; see devReviewDialog for why they differ).
+// (status-redirect routing + the "done — refresh" fallback's re-render);
+// `rerender`/`onLogin` (optional) ride through to it — the clicked-refresh
+// landing and the view-rooted 401 landing respectively (absent ⇒ the
+// Fetch-tab default / the Management landing; see devReviewDialog for why
+// they differ).
 //
 // The broker read stays click-triggered by design — the page read must never
 // fan out per-row — but it is now ONE PAGE PER EXPLICIT CLICK, not once per
@@ -3817,9 +3818,13 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
 // moment the terminal lands. A review already running for this subject no-ops up
 // front: the modal guard only stops concurrent DIALOGS, not a duplicate of a
 // detached review a stale row still offers.
-// `rerender` (optional) is the CLOSE landing (fires with view/body intact):
-// the Development page passes its Fetch-tab re-render, the per-project Fetch
-// pane passes itself. `onLogin` (optional) is the 401 POST-LOGIN landing and
+// `rerender` (optional) is the landing for the click-driven "done — refresh"
+// fallback and for dialogs opened from repainted cells (fires with view/body
+// intact): the Development page passes its Fetch-tab re-render, the
+// per-project Fetch pane passes itself. Done itself never re-renders the page
+// — that would collapse every open commit list and drop its paging — it only
+// closes the box, resolving the cells first when a hard-killed op left them
+// unresolved. `onLogin` (optional) is the 401 POST-LOGIN landing and
 // must be VIEW-rooted — renderMgmtLogin wipes `view` (mgmtCard), detaching
 // any body-scoped target — so the scoped pane (where view === the pane
 // container) passes its own renderer and Development passes NOTHING (the
@@ -3853,6 +3858,11 @@ async function devReviewDialog(view, body, repo, sel, rerender, onLogin) {
         if (sel.commit) devRefreshCommitCells(repo, sel.commit, cctx);
         else devResolvePrReviewCell(key, repo, sel.pr, cctx);
     };
+    // Done's landing: close the box and leave the page alone — a full card
+    // rebuild would collapse every open commit list and drop its paging.
+    // After a real terminal the cells are already repainted; only a
+    // hard-killed op (no terminal record) still needs its cells resolved.
+    const closeLeavesPage = () => { if (!terminalSeen) resolveCells(); };
     // Hand the running op to the background watcher (the dismissal path).
     const registerDetached = () => {
         devReviewsInFlight.set(key, { opId: opId, watching: false,
@@ -3916,9 +3926,9 @@ async function devReviewDialog(view, body, repo, sel, rerender, onLogin) {
         return;
     }
     opId = b.op_id;
-    await mgmtTailBuildLog(view, backdrop, card, b.op_id, title, onDone,
-                           onLogin, { onDismiss: dismiss,
-                                      onTerminal: resolveCells });
+    await mgmtTailBuildLog(view, backdrop, card, b.op_id, title,
+                           closeLeavesPage, onLogin,
+                           { onDismiss: dismiss, onTerminal: resolveCells });
 }
 
 async function renderDevFetchTab(view, body) {
@@ -4389,9 +4399,10 @@ function devWorkedByProjects(names) {
 //              selector; steering from a pane would silently re-steer every
 //              consumer's rs-fetch/review reads) — the plain `fork:` badge
 //              shows instead.
-//   rerender — the re-render target after Sync / fork change / a review lands
-//              (the CLOSE landing; the 401 post-login landing is the distinct
-//              view-rooted onLogin derived below).
+//   rerender — the re-render target after Sync / fork change / a clicked
+//              "done — refresh" (a finished review's Done only closes its
+//              box; the 401 post-login landing is the distinct view-rooted
+//              onLogin derived below).
 //
 // Open PRs past DEV_PR_ROWS_SHOWN collapse behind a "Show more" toggle, so the
 // branch rows below stay near the top of a busy card. Ten rows (about 300 px)
@@ -4760,7 +4771,8 @@ function buildDevRepoCard(view, body, r, attached, opts) {
 //
 // The pane is a SNAPSHOT, not a live view: activateService unhides an existing
 // instance without re-fetching, so a repo mirrored elsewhere after this pane
-// first rendered appears on the next Sync / review rerender or page reload.
+// first rendered appears on the next Sync, "done — refresh" click or page
+// reload.
 async function renderProjectFetchPane(container, repo) {
     const all = !repo;
     container.innerHTML = "";
@@ -6527,7 +6539,7 @@ async function mgmtTailBuildLog(view, backdrop, card, opId, title, onDone,
         if (doneBtn.disabled) return;
         backdrop.remove();
         // Default: the Software page (the original build-lane caller); the dev
-        // review dialog passes its own Fetch-tab re-render.
+        // review dialog passes a close that leaves the page as it is.
         if (onDone) onDone(); else renderSoftwareInto(view);
     };
     // Dismissable mode (opts.onDismiss — the review dialog and the Software
@@ -6644,7 +6656,8 @@ async function mgmtTailBuildLog(view, backdrop, card, opId, title, onDone,
     // ONLY by the review dialog): fires ONCE, on a REAL terminal only (never
     // on cancelled/auth exits or a hard-killed interrupt), before the
     // operator touches Done — the page behind the open modal resolves
-    // immediately; the Done click keeps its full re-render landing.
+    // immediately; the Done click is the caller's onDone (the review
+    // dialog's only resolves the cells a hard-killed op left unresolved).
     if (sawTerminal && opts.onTerminal) {
         try { opts.onTerminal(ok); } catch (e) { /* cell resolve is best-effort */ }
     }
