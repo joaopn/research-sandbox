@@ -3402,7 +3402,9 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
     // The mirror-boundary note, shown only when the mirror HAS this branch but
     // its head is not among the loaded rows. A fifth PERSISTENT region, not a
     // foot message: foot() wipes itself on every load (including every failure
-    // arm), and not a row either — the rows region stays append-only.
+    // arm), and not a row either — rows are never rebuilt or reordered (the
+    // one insertion above an existing row is the mirror-head divider, when a
+    // later page's probe names a row already on screen).
     const divergeEl = el("div", { class: "dev-pr-meta dev-commits-diverge" });
     divergeEl.style.display = "none";
     const toolsEl = el("div", { class: "dev-commits-tools" });
@@ -3424,12 +3426,16 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
     // The mirror's head sha for THIS branch ("" = no counterpart upstream, a
     // PR locator, or an unverifiable probe — the server collapses all three,
     // deliberately: a probe failure must never be renderable as a claim), and
-    // whether we have drawn its divider on any loaded page. headSeen is never
-    // reset: if the mirror advances mid-session the divider stays where it is,
-    // which under-reports what has landed — conservative, and it costs at most
-    // an over-fetch that rs-fetch's patch-id walk skips. It clears when the
-    // card re-renders and builds a fresh expander, not on a re-expand (which
-    // does not reload).
+    // whether we have drawn its divider on any loaded page. The divider is
+    // drawn either when the head's row arrives in a new page, or — when a
+    // page's probe failed and a later one succeeds — over the row already on
+    // screen (placeDividerOnLoaded), so one failed read cannot leave a false
+    // "doesn't contain the mirror's head" at the end of the walk. headSeen is
+    // never reset: if the mirror advances mid-session the divider stays where
+    // it is, which under-reports what has landed — conservative, and it costs
+    // at most an over-fetch that rs-fetch's patch-id walk skips. It clears
+    // when the card re-renders and builds a fresh expander, not on a
+    // re-expand (which does not reload).
     let mirrorHead = "";
     let headSeen = false;
     // How many rows sat ABOVE the divider when it was drawn — the set the
@@ -3438,7 +3444,9 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
     // is never redrawn, so a click-time lookup could disagree with the line
     // on screen (or find nothing) after the mirror advances mid-session.
     // Complete by construction: rows load newest-first, so every row above
-    // the head's is already rendered when the head's row lands.
+    // the head's is already rendered when the head's row lands — and when the
+    // line is placed over a row already on screen, the rows above it are
+    // exactly the ones before it in loadedOrder.
     let aheadCount = 0;
     // The history was walked to its end (an empty page, or a last page) —
     // distinguishes "head not loaded yet" from "head not in this branch".
@@ -3446,6 +3454,7 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
     const selected = new Set();          // full shas ticked in select mode
     const loadedOrder = [];              // display order (newest-first)
     const checks = new Map();            // full sha → its row's checkbox
+    const rowEls = new Map();            // full sha → its row element
     // Context for the module-level review-cell renderer + watcher restarts:
     // the buttons and the terminal refresh need the locator and the landing
     // closures this expander was threaded.
@@ -3661,6 +3670,29 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
         divergeEl.style.display = "";
     };
 
+    // The boundary marker. One builder for both places it is drawn, so the
+    // two cannot drift.
+    const mirrorDivider = () => el("div", { class: "dev-commit-divider" }, [
+        el("span", { class: "dev-pr-meta" }, ["Mirror head"]),
+    ]);
+    // A page's probe can name a row that an EARLIER page already put on
+    // screen: page 1's probe failed (the server reports "" for that), and a
+    // later page's succeeded. renderRows only compares the new page's rows,
+    // so without this the walk would end claiming the branch lacks a head
+    // that is right there. Called on every page right after the head is
+    // re-read; a no-op on page 1 (nothing loaded) and once a line is drawn
+    // (drawn ONCE — the flap and the advanced-mirror cases keep the first
+    // line). The Select-ahead set is still captured here, at draw time: the
+    // rows above the line are the ones before the head in display order.
+    const placeDividerOnLoaded = () => {
+        if (!mirrorHead || headSeen) return;
+        const at = loadedOrder.indexOf(mirrorHead);
+        if (at < 0) return;
+        headSeen = true;
+        aheadCount = at;
+        rowsEl.insertBefore(mirrorDivider(), rowEls.get(mirrorHead));
+    };
+
     // Append one page's rows. Per-commit review verdicts: ledger entries keyed
     // by FULL sha. All verdict strings are MODEL OUTPUT → text nodes only. No
     // stale marker — a commit is immutable. The review UI lives in a stamped
@@ -3680,12 +3712,12 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
             // Drawn ONCE (!headSeen): the head sha is re-read per page, so a
             // mirror that advanced between clicks must not draw a second line
             // — the first one stays, which is the conservative posture above.
+            // A head that names a row from an EARLIER page is placed by
+            // placeDividerOnLoaded before this page renders.
             if (mirrorHead && !headSeen && c.sha === mirrorHead) {
                 headSeen = true;
                 aheadCount = loadedOrder.length;
-                rowsEl.appendChild(el("div", { class: "dev-commit-divider" }, [
-                    el("span", { class: "dev-pr-meta" }, ["Mirror head"]),
-                ]));
+                rowsEl.appendChild(mirrorDivider());
             }
             loadedOrder.push(c.sha);
             const check = el("input", { type: "checkbox",
@@ -3698,14 +3730,16 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
             };
             const cell = el("span", { class: "dev-review-cell" });
             cell.setAttribute("data-rkey", devReviewKey(repo, c.sha));
-            rowsEl.appendChild(el("div", { class: "dev-commit-row" }, [
+            const row = el("div", { class: "dev-commit-row" }, [
                 check,
                 devCopyBtn(() => cmdFor(c.sha)),
                 el("span", { class: "dev-pr-id" }, [c.sha.slice(0, 9)]),
                 el("span", { class: "dev-pr-title" }, [c.subject || ""]),
                 el("span", { class: "dev-pr-meta" }, [c.date || ""]),
                 cell,
-            ]));
+            ]);
+            rowEls.set(c.sha, row);
+            rowsEl.appendChild(row);
             devRenderCommitReviewCell(cell, repo, c.sha,
                                       reviews[c.sha] || null, ctx);
         }
@@ -3762,9 +3796,11 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
             ? data.result.reviews : {};
         // Past the cursor guard, so a refused page cannot change the marker,
         // and above the empty-page return, so both updateDiverge call sites
-        // read the same fresh value.
+        // read the same fresh value — and see a line placed over a row an
+        // earlier page loaded.
         mirrorHead = typeof data.result.mirror_head === "string"
             ? data.result.mirror_head : "";
+        placeDividerOnLoaded();
         if (!commits.length) {
             // has_more is "a FULL page came back", so a history that is an
             // exact multiple of the page size offers one button that fetches
