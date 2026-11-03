@@ -421,6 +421,11 @@ BROKER_OP_TIMEOUT_S = 600
 BROKER_SESSIONS: dict[str, dict] = {}
 BROKER_COOKIE = "rs_broker"
 
+# Whether the last broker reply said the daemon runs older code than is on the
+# host ("stale": true in the envelope). One webui, one operator: the last reply
+# wins, and the first reply from a restarted broker clears it.
+_BROKER_CODE = {"stale": False}
+
 # Per-operation progress (WEBUI_OPLOG). The broker writes a per-op view log
 # under run/oplogs/; run/ is RO-mounted at the socket's parent dir, so the
 # webui reads the view file directly — out-of-band from the one-shot socket, so
@@ -537,6 +542,7 @@ async def broker_call(verb: str, args: dict | None = None, *,
         except Exception:
             pass
     reply = json.loads(body)
+    _BROKER_CODE["stale"] = reply.get("stale") is True
     if (not reply.get("ok")
             and reply.get("error", {}).get("kind") == "forbidden"):
         raise BrokerForbidden(reply["error"].get("message", "forbidden"))
@@ -1970,7 +1976,10 @@ async def broker_host_stats_handler(request: web.Request) -> web.Response:
     except (OSError, ValueError, KeyError, IndexError):
         return web.json_response(
             {"ok": False, "error": {"kind": "unavailable"}}, status=503)
-    return web.json_response({"ok": True, "result": stats})
+    # The broker's code-drift flag rides along: read from the last relayed
+    # reply, never a broker round trip of its own.
+    return web.json_response({"ok": True, "result": stats,
+                              "broker_stale": _BROKER_CODE["stale"]})
 
 
 async def broker_op_log_handler(request: web.Request) -> web.Response:

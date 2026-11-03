@@ -450,6 +450,7 @@ const state = {
     hostStats: null,         // last painted {cpu: 0..1 | null, memUsed, memTotal}; null = no data, bars hidden
     hostCpuSamples: [],      // raw {t, busy, total} jiffies samples of the last CPU_AVG_WINDOW_MS
     hostStatsInFlight: false,  // one request at a time: a stalled webui must not pile them up
+    brokerStale: false,      // the broker runs older code than is on the host (from /broker/host-stats)
     theme: null,
     termTheme: null,         // persisted: TERM_THEMES id, or null = follow the interface theme
     railPinned: false,       // persisted: keep rail in flex flow (push layout)
@@ -8999,6 +9000,8 @@ function makeHostStats() {
     return el("div", { class: "host-stats" }, [
         bar("cpu", "CPU:", "Host CPU in use, averaged over the last minute"),
         bar("ram", "RAM:", "Host memory in use / total"),
+        el("div", { class: "host-stat-note", "data-stat": "stale", hidden: "" },
+            ["The broker is running older code than is installed on the host — restart the broker to load it."]),
     ]);
 }
 
@@ -9019,6 +9022,7 @@ function paintHostStats(node) {
     set("cpu", s.cpu, s.cpu == null ? "…" : `${Math.round(s.cpu * 100)} %`);
     set("ram", s.memUsed / s.memTotal,
         `${(s.memUsed / BYTES_PER_GB).toFixed(1)}/${(s.memTotal / BYTES_PER_GB).toFixed(1)} GB`);
+    node.querySelector('.host-stat-note[data-stat="stale"]').hidden = !state.brokerStale;
 }
 
 // The painted figures are older than the CPU window: the webui has not
@@ -9053,6 +9057,7 @@ async function refreshHostStats() {
     // is painted and the minute of samples; the next tick retries — until
     // the newest good sample is a minute old.
     if (!res || (res.ok && body === null)) { dropStaleHostStats(); return; }
+    state.brokerStale = !!(body && body.ok && body.broker_stale === true);
     const r = body && body.ok && body.result;
     if (!r || !r.cpu || !r.mem || !(r.mem.total > 0)) {
         // An answer that says no: no session (401 — the poll keeps running,
@@ -9357,6 +9362,7 @@ function lockVault() {
     if (state.hostStatsTimer) { clearInterval(state.hostStatsTimer); state.hostStatsTimer = null; }
     state.hostStats = null;
     state.hostCpuSamples = [];
+    state.brokerStale = false;
     for (const t of Object.values(state.terminals)) {
         try { if (t.ws) t.ws.close(); } catch (_) {}
         try { if (t.term) t.term.dispose(); } catch (_) {}

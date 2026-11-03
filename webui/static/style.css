@@ -1066,6 +1066,18 @@ html.mobile .project-rail .rail-separator { cursor: default; }
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
 }
+/* The broker runs older code than the host has (app.js paintHostStats). A
+   sentence, so it wraps; width 0 + min-width 100% keeps it from widening the
+   shrink-to-fit mobile drawer, like the bars. */
+.host-stat-note {
+    width: 0;
+    min-width: 100%;
+    font-size: 11px;
+    line-height: 14px;
+    color: var(--warn-fg);
+    white-space: normal;
+}
+.host-stat-note[hidden] { display: none; }
 .nav-entry {
     display: flex;
     align-items: center;
