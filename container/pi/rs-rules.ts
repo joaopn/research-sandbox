@@ -1,4 +1,4 @@
-// rs-rules v0.3.0
+// rs-rules v0.4.0
 //
 // Claude Code's rules capability for pi, one-to-one, as an RS-owned extension.
 // Shipped inside the pi dist (share/pi-agent/rs/rs-rules.ts) and named from the
@@ -23,6 +23,14 @@
 // of a single child with no brief is refused before any child starts (Claude
 // Code's Task tool requires its prompt; pi-subagents treats the single child's
 // `task` as optional and would start a child on an empty task).
+// And it reaches every subagent pi itself runs: at session start it registers its
+// own file with pi-subagents as a required child extension, so every child of the
+// session — foreground and background — loads it too and gets the same launch
+// rules, scoped rules and read-before-edit refusal (a Claude Code subagent gets
+// the project's instructions; a foreground pi-subagents child otherwise loads no
+// extension at all). Agents on pi-subagents' external-CLI runners (claude-code,
+// codex-exec, …) are other programs and load nothing of pi's; a launch whose
+// capability ceiling denies extensions is refused by pi-subagents.
 // Not reproduced, by decision: `claudeMdExcludes`, `@path` imports,
 // `--setting-sources`.
 //
@@ -33,8 +41,9 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 
-export const RS_RULES_VERSION = "0.3.0";
+export const RS_RULES_VERSION = "0.4.0";
 
 // The system-prompt SECTION the launch rules ride in (pi wraps it as
 // `<project_rules>…</project_rules>`). A section, never a returned
@@ -63,6 +72,29 @@ export const NO_BRIEF_MSG = (agent: string) =>
   `subagent: this launch names agent '${agent}' but carries no brief. ` +
   "Put the full, self-contained brief in `task` and call again.";
 export const RESUME_HINT = ' To continue an existing run, use action: "resume" with id and message.';
+
+// The id this extension registers under with pi-subagents, and where the
+// pi download ships pi-subagents relative to this file: share/pi-agent/rs/
+// holds rs-rules.ts and pi-subagents/package.json, a wrapper whose `version`
+// names the folder the package is installed in.
+export const CHILD_EXTENSION_ID = "rs-rules";
+export const SUBAGENTS_WRAPPER = path.join("pi-subagents", "package.json");
+export const SUBAGENTS_API = path.join("node_modules", "pi-subagents", "bundle", "required-child-extensions.js");
+// Set on the process by an instance that has a UI, to a function showing a
+// warning on that UI. A foreground subagent runs inside its parent's process
+// without a UI, and its stderr is the parent's screen: when this is set, an
+// instance without a UI hands its warnings to the parent's UI ("rs-rules
+// (subagent): …"); when it is not set (a headless `pi -p`, a background child's
+// own process) it writes them to stderr as before.
+export const UI_FLAG = Symbol.for("rs-rules.ui.v1");
+// Discovery warnings already shown on an interactive UI in this process: project
+// root + message (labels are relative to the root). An instance with its own UI
+// always shows its warnings (a `/rules reload` that still finds a broken file
+// says so again) and records them here; a foreground child forwarding to the
+// parent's UI skips what is recorded, so it never repeats the parent's warnings,
+// while a rule file only the child reaches (another root, a subdirectory the
+// parent never touched) is shown once.
+export const WARNED = Symbol.for("rs-rules.warned.v1");
 
 // On resume, a file whose mtime is later than its read entry's timestamp by more
 // than this is stale. The slack covers the write-then-append ordering of a
@@ -680,6 +712,36 @@ export function subagentLaunchRefusal(input: unknown): string | null {
 }
 
 // ---------------------------------------------------------------------------
+// Reaching subagents.
+// ---------------------------------------------------------------------------
+
+// This file's absolute path (what pi-subagents is told to load), or null.
+export function selfPath(): string | null {
+  try {
+    return fileURLToPath(import.meta.url);
+  } catch {
+    return null;
+  }
+}
+
+// The absolute path of the shipped pi-subagents' registration module, found
+// from this file's folder through the wrapper's `version`; null when the
+// wrapper, its version or the module is missing. Never a scan of the version
+// folders: older ones stay behind after a re-deploy.
+export function subagentsApiPath(self: string | null): string | null {
+  if (!self) return null;
+  try {
+    const dir = path.dirname(self);
+    const ver = JSON.parse(fs.readFileSync(path.join(dir, SUBAGENTS_WRAPPER), "utf8"))?.version;
+    if (typeof ver !== "string" || !/^[0-9A-Za-z][0-9A-Za-z.+-]*$/.test(ver)) return null;
+    const api = path.join(dir, path.dirname(SUBAGENTS_WRAPPER), ver, SUBAGENTS_API);
+    return isFile(api) ? api : null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // The extension.
 // ---------------------------------------------------------------------------
 
@@ -700,15 +762,37 @@ export default function rsRules(pi: ExtensionAPI) {
   const attached = new Set<string>();
   const readMap = new Map<string, number>(); // realpath -> mtimeMs at the read
   let uiCtx: ExtensionContext | null = null;
+  let registration: { dispose(): void } | null = null;
+
+  const hasUI = () => !!(uiCtx && (uiCtx as any).hasUI);
+  const parentUI = (): ((line: string) => void) | null => {
+    const f = (globalThis as any)[UI_FLAG];
+    return typeof f === "function" ? f : null;
+  };
 
   const warn = (msg: string) => {
     const line = `rs-rules: ${msg}`;
     try {
-      if (uiCtx && (uiCtx as any).hasUI) (uiCtx as any).ui.notify(line, "warning");
+      if (hasUI()) (uiCtx as any).ui.notify(line, "warning");
+      else if (parentUI()) (parentUI() as (l: string) => void)(`rs-rules (subagent): ${msg}`);
       else process.stderr.write(line + "\n");
     } catch {
       /* never throw out of a warning */
     }
+  };
+  // Discovery warnings name the project's rule files (see WARNED): shown and
+  // recorded with a UI, skipped when already recorded on the forwarding path;
+  // stderr keeps every one, as before.
+  let discoveryRoot = "";
+  const discoveryWarn = (msg: string) => {
+    if (hasUI() || parentUI()) {
+      const g = globalThis as any;
+      const seen: Set<string> = g[WARNED] instanceof Set ? g[WARNED] : (g[WARNED] = new Set<string>());
+      const key = `${discoveryRoot}\0${msg}`;
+      if (!hasUI() && seen.has(key)) return;
+      seen.add(key);
+    }
+    warn(msg);
   };
 
   const guarded = <T>(name: string, fn: () => T): T | undefined => {
@@ -720,8 +804,40 @@ export default function rsRules(pi: ExtensionAPI) {
     }
   };
 
+  const guardedAsync = async (name: string, fn: () => Promise<void>): Promise<void> => {
+    try {
+      await fn();
+    } catch (e) {
+      warn(`${name} failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
+  const unregister = () => {
+    const r = registration;
+    registration = null;
+    if (r) r.dispose();
+  };
+
+  // Register this file as a required child extension for the session, so every
+  // subagent it launches loads it. pi-subagents missing (removed by hand) → no
+  // registration and, with a UI, one warning; never an error.
+  const registerForChildren = async (ctx: ExtensionContext) => {
+    unregister();
+    const self = selfPath();
+    const api = subagentsApiPath(self);
+    if (!self || !api) {
+      if ((ctx as any).hasUI) warn("pi-subagents not found beside rs-rules: subagents will not load the project rules");
+      return;
+    }
+    const mod = await import(api);
+    const sessionId = (ctx.sessionManager as any).getSessionId();
+    registration = mod.registerRequiredChildExtensions({ sessionId, extensions: [{ id: CHILD_EXTENSION_ID, path: self }] });
+  };
+
   const rediscover = (ctx: ExtensionContext) => {
-    disc = discoverRules(ctx.cwd, home, warn);
+    const r = findProjectRoot(ctx.cwd, home);
+    discoveryRoot = realpathOrNull(r) ?? r;
+    disc = discoverRules(ctx.cwd, home, discoveryWarn);
     nested.clear();
   };
 
@@ -750,7 +866,7 @@ export default function rsRules(pi: ExtensionAPI) {
       for (const s of segs) {
         dir = path.join(dir, s);
         const real = realpathOrNull(dir) ?? dir;
-        if (!nested.has(real)) nested.set(real, discoverNested(dir, disc.root, warn));
+        if (!nested.has(real)) nested.set(real, discoverNested(dir, disc.root, discoveryWarn));
         for (const rule of nested.get(real) as Rule[]) {
           const rel = relTo(rule.base, target);
           if (rel !== null) out.push({ rule, rel });
@@ -770,11 +886,29 @@ export default function rsRules(pi: ExtensionAPI) {
     } catch {
       return;
     }
+    // Where each recorded call's file is: the absolute target the extension
+    // recorded beside the call (from 0.4.0 on). A call recorded without one is
+    // resolved the old way, against the session's directory — except in a
+    // session branched from another (a fork-context subagent, a /fork): its
+    // copied entries were recorded in the PARENT's directory, which the header
+    // does not keep (measured: a fork-context child's header carries the child's
+    // launch directory), so such a call is not taken as a read (fail-closed: the
+    // file must be read again before an edit).
+    const resolved = new Map<string, string>(); // toolCallId -> recorded target
+    let base: string | null = ctx.cwd;
+    try {
+      const h = (ctx.sessionManager as any).getHeader?.();
+      if (h?.parentSession) base = null;
+      else if (typeof h?.cwd === "string" && h.cwd) base = h.cwd;
+    } catch {
+      /* keep ctx.cwd */
+    }
     for (const entry of entries) {
       if (entry?.type === "custom" && entry.customType === ENTRY_TYPE) {
         const data = entry.data ?? {};
         if (data.reset) attached.clear();
         if (typeof data.attached === "string") attached.add(data.attached);
+        if (typeof data.read === "string" && typeof data.toolCallId === "string") resolved.set(data.toolCallId, data.read);
         continue;
       }
       if (entry?.type !== "message") continue;
@@ -788,7 +922,10 @@ export default function rsRules(pi: ExtensionAPI) {
       } else if (msg?.role === "toolResult") {
         const call = pending.get(msg.toolCallId);
         if (!call || msg.isError) continue;
-        const target = normalizeTarget(String(call.args.path ?? ""), ctx.cwd, home);
+        const recorded = resolved.get(msg.toolCallId);
+        resolved.delete(msg.toolCallId); // a provider may reuse ids across turns: one record, one call
+        if (recorded === undefined && base === null) continue;
+        const target = recorded ?? normalizeTarget(String(call.args.path ?? ""), base as string, home);
         const mt = mtimeOf(target);
         if (mt === null) continue;
         // A file changed on disk AFTER that read (entry timestamps are wall
@@ -809,6 +946,10 @@ export default function rsRules(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     guarded("session_start", () => {
       uiCtx = ctx;
+      if ((ctx as any).hasUI) {
+        const ui = (ctx as any).ui;
+        (globalThis as any)[UI_FLAG] = (line: string) => ui.notify(line, "warning");
+      }
       rediscover(ctx);
       rebuildFromBranch(ctx);
       const launch = disc!.rules.filter((r) => !r.paths).length + (disc!.claudeMd ? 1 : 0) + (disc!.claudeLocal ? 1 : 0);
@@ -817,6 +958,13 @@ export default function rsRules(pi: ExtensionAPI) {
         (ctx as any).ui.notify(`rs-rules: ${launch} launch, ${scoped} path-scoped`, "info");
       }
     });
+    await guardedAsync("subagent registration", () => registerForChildren(ctx));
+  });
+
+  // pi emits this on the old instance before session_start on the new one
+  // (/new, resume, fork, reload): the registration is per session id.
+  pi.on("session_shutdown", async (_event, _ctx) => {
+    guarded("session_shutdown", () => unregister());
   });
 
   pi.on("before_agent_start", async (event: any, ctx) => {
@@ -868,7 +1016,16 @@ export default function rsRules(pi: ExtensionAPI) {
       if (!["read", "edit", "write"].includes(ev.toolName) || ev.isError) return undefined;
       const target = normalizeTarget(String(ev.input?.path ?? ""), ctx.cwd, home);
       const mt = mtimeOf(target);
-      if (mt !== null) readMap.set(target, mt); // a read, or a write/edit we just made: the file is current
+      if (mt !== null) {
+        readMap.set(target, mt); // a read, or a write/edit we just made: the file is current
+        // The absolute target, recorded beside the call so a rebuild never
+        // re-resolves the relative path against another directory.
+        try {
+          pi.appendEntry(ENTRY_TYPE, { read: target, toolCallId: ev.toolCallId });
+        } catch {
+          /* a session that cannot persist still tracks the read for this run */
+        }
+      }
       if (!disc) rediscover(ctx);
       const blocks: string[] = [];
       for (const { rule, rel } of candidates(target)) {
