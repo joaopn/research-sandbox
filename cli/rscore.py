@@ -4570,6 +4570,24 @@ _OPEN_VSX_CLAUDE_EXT_API = "https://open-vsx.org/api/Anthropic/claude-code/linux
 # from the full package document's dist-tags). One home each; pytest-pinned.
 _PI_NPM_PACKAGE = "@earendil-works/pi-coding-agent"
 _PI_LATEST_URL = "https://registry.npmjs.org/@earendil-works%2Fpi-coding-agent/latest"
+# pi-subagents (I27): the third-party pi extension package that gives pi
+# subagents, shipped INSIDE the pi dist at the PI_SUBAGENTS_VERSION pin. It is
+# npm-installed under a VERSION folder below a fixed RS-written wrapper package
+# (_PI_SUBAGENTS_DIR/package.json, whose `pi` manifest points into that folder):
+# every deploy site overlays local/ onto ~/.local without deleting anything, so
+# a fixed install path would keep a newer version's dropped skill or prompt files
+# loading forever; a version folder leaves an older one inert instead. pi's
+# canonical settings name the wrapper (`packages`); an existing project's
+# settings (installed no-clobber) get the entry once from the launcher's
+# marker-gated heal (container/pi/settings-heal.mjs). Paths are relative to
+# share/pi-agent (the dist's pi tree); the marker is relative to pi's agent dir.
+# One home each — the recipe, `files`, `built_check`, the launcher and the
+# canonical settings all derive from these.
+_PI_SUBAGENTS_NPM = "pi-subagents"
+_PI_SUBAGENTS_DIR = "rs/pi-subagents"
+_PI_SETTINGS_HEAL_SRC = SCRIPT_DIR / "container" / "pi" / "settings-heal.mjs"
+_PI_SETTINGS_HEAL = f"rs/{_PI_SETTINGS_HEAL_SRC.name}"
+_PI_HEAL_MARKER = ".rs-heal/pi-subagents-package"
 # Claude Code's upstream version-resolve endpoint (verified against its
 # bootstrap.sh: the installer curls this to turn "latest" into a concrete
 # version; the body is a bare semver string). Read by VERSION_SOURCES and
@@ -4659,6 +4677,9 @@ VERSION_SOURCES: dict[str, dict[str, str]] = {
     "CLAUDE_CODE_VERSION": {"kind": "text", "url": _CLAUDE_LATEST_URL},
     # pi (npm): the CLI pin `agent refresh --agent pi` moves.
     "PI_CODING_AGENT_VERSION": {"kind": "npm", "pkg": _PI_NPM_PACKAGE},
+    # pi-subagents (npm), shipped inside the pi dist; no refresh lane moves it
+    # yet — `images outdated` reports when upstream is ahead of the pin.
+    "PI_SUBAGENTS_VERSION": {"kind": "npm", "pkg": _PI_SUBAGENTS_NPM},
 }
 
 # Per-supervisor service registry. KNOWN_SERVICES lists every kind the webui
@@ -5887,10 +5908,12 @@ _AGENT_INSTALL = {
     # launcher (`launcher_symlink` False); no companion editor extension (none
     # exists). `extra_pins` are build-time pins beside the agent's own version,
     # resolved through load_versions() at build (an unset one dies), passed as
-    # extra `.format` keys (the recipe uses `node_ver`; the `files` callables may
-    # read the rest, as the rules extension's header check reads `rules_ver`) and
-    # recorded in the sidecar, so software_status can tell a stale node / rules
-    # extension from a current one. `layout_ver` is the one extra pin NOTHING
+    # extra `.format` keys (the recipe uses `node_ver` and `subagents_ver`; the
+    # `files` callables may read any, as the rules extension's header check reads
+    # `rules_ver` and the pi-subagents wrapper reads `subagents_ver`; `built_check`
+    # entries are formatted with them too) and recorded in the sidecar, so
+    # software_status can tell a stale node / rules extension / pi-subagents from
+    # a current one. `layout_ver` is the one extra pin NOTHING
     # reads at build: it versions the dist's TREE LAYOUT (RS_PI_DIST_LAYOUT,
     # bumped whenever a deploy site starts depending on a new path in the dist)
     # and exists only to be recorded, so a download built before a layout change
@@ -5907,8 +5930,11 @@ _AGENT_INSTALL = {
     # `cd`, `pwd -P` and parameter expansion are shell builtins).
     "pi": {
         "version_key": "PI_CODING_AGENT_VERSION",
+        # APPENDED order matters: the Software page lists the sub-rows in this
+        # order, and archived pins index the first three.
         "extra_pins": {"node_ver": "NODE_VERSION", "rules_ver": "RS_PI_RULES_VERSION",
-                       "layout_ver": "RS_PI_DIST_LAYOUT"},
+                       "layout_ver": "RS_PI_DIST_LAYOUT",
+                       "subagents_ver": "PI_SUBAGENTS_VERSION"},
         "install": (
             "mkdir -p ~/.local/bin ~/.local/share/pi-agent/node ~/.local/share/pi-agent/pi"
             " ~/.local/share/pi-agent/agent/extensions"
@@ -5920,6 +5946,14 @@ _AGENT_INSTALL = {
             " && npm install -g --ignore-scripts --prefix ~/.local/share/pi-agent/pi"
             " --no-fund --no-audit --loglevel=error"
             f" {_PI_NPM_PACKAGE}@{{ver}}"
+            # pi-subagents into its version folder below the fixed wrapper (see
+            # _PI_SUBAGENTS_DIR). Peers omitted: pi supplies its own packages to
+            # extensions, and a physical copy of one breaks pi's module mapping
+            # (what `pi install` does too); no install scripts.
+            f" && mkdir -p ~/.local/share/pi-agent/{_PI_SUBAGENTS_DIR}/{{subagents_ver}}"
+            f" && npm install --prefix ~/.local/share/pi-agent/{_PI_SUBAGENTS_DIR}/{{subagents_ver}}"
+            " --omit=peer --ignore-scripts --no-fund --no-audit --loglevel=error"
+            f" {_PI_SUBAGENTS_NPM}@{{subagents_ver}}"
             " && printf '%s\\n'"
             " '#!/bin/sh'"
             " '# RS launcher for pi: resolves the private node + the bundled cli.js'"
@@ -5930,20 +5964,32 @@ _AGENT_INSTALL = {
             " '[ -n \"$PI_CODING_AGENT_DIR\" ] || export PI_CODING_AGENT_DIR=\"$d/share/pi-agent/agent\"'"
             " '[ -n \"$PI_TELEMETRY\" ] || export PI_TELEMETRY=0'"
             " 'PATH=\"${{PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}}:$d/share/pi-agent/node/bin\"; export PATH'"
+            # The one-time settings heal (container/pi/settings-heal.mjs): only
+            # while its marker is absent; its stdout goes to stderr and its stdin
+            # is empty (pi's RPC and print modes own both); no `set -e`, so pi
+            # starts whatever the heal did. The marker test expands a leading `~`
+            # the way pi and the heal do (a variable's `~` is not expanded by sh),
+            # or a `~` agent dir would re-run the heal at every start and re-add
+            # an entry the operator removed. (Plain string: `.format` turns the
+            # doubled braces into the shell's single ones.)
+            " '# One-time RS settings heal: adds the shipped pi-subagents to the'"
+            " '# settings of pi once; never stops pi from starting.'"
+            " 'rs_agd=$PI_CODING_AGENT_DIR; case $rs_agd in \"~\") rs_agd=$HOME ;; \"~/\"*) rs_agd=$HOME/${{rs_agd#??}} ;; esac'"
+            f" '[ -e \"$rs_agd/{_PI_HEAL_MARKER}\" ] || \"$d/share/pi-agent/node/bin/node\""
+            f" \"$d/share/pi-agent/{_PI_SETTINGS_HEAL}\" {_PI_HEAL_MARKER}"
+            f" \"$d/share/pi-agent/{_PI_SUBAGENTS_DIR}\" >&2 </dev/null'"
             " 'exec \"$d/share/pi-agent/node/bin/node\" \"$d/share/pi-agent/pi/lib/node_modules/"
             "@earendil-works/pi-coding-agent/dist/bundle/cli.js\" \"$@\"'"
             " > ~/.local/bin/pi && chmod 755 ~/.local/bin/pi"
-            # The trim: build-time tools (corepack, npx, node headers, docs) and the
-            # 25 foreign esbuild platform binaries (284 MB) — 727 MB → ~380 MB. npm
+            # The trim: build-time tools (corepack, npx, node headers, docs). npm
             # STAYS (12 MB): pi's self-update and package installs spawn it. Its
             # bin/npm is a relative symlink, so the kept tree stays $HOME-agnostic.
+            # (pi before 1.5 also carried 25 foreign esbuild platform binaries,
+            # 284 MB, trimmed by a loop that is gone: pi 1.5 ships none.)
             " && rm -rf ~/.local/share/pi-agent/node/include ~/.local/share/pi-agent/node/share/doc"
             " ~/.local/share/pi-agent/node/share/man"
             " ~/.local/share/pi-agent/node/lib/node_modules/corepack"
             " ~/.local/share/pi-agent/node/bin/npx ~/.local/share/pi-agent/node/bin/corepack"
-            " && for d in ~/.local/share/pi-agent/pi/lib/node_modules/@earendil-works/"
-            "pi-coding-agent/node_modules/@esbuild/*; do case \"$d\" in */linux-x64) ;;"
-            " *) rm -rf \"$d\";; esac; done"
         ),
         "bin": "pi",
         "launcher_symlink": False,
@@ -5968,6 +6014,12 @@ _AGENT_INSTALL = {
             # canonical settings below (a global-settings path resolves relative
             # to the agent dir).
             {"path": "local/share/pi-agent/rs/rs-rules.ts", "content": None},      # → _rs_rules_source (bound below)
+            # pi-subagents' fixed wrapper package (its manifest points into the
+            # version folder the recipe installs) and the launcher's one-time
+            # settings heal — dist content beside the rules extension, re-laid by
+            # every deploy. APPENDED: an archived pin reads files[0].
+            {"path": f"local/share/pi-agent/{_PI_SUBAGENTS_DIR}/package.json", "content": None},  # → _pi_subagents_wrapper
+            {"path": f"local/share/pi-agent/{_PI_SETTINGS_HEAL}", "content": None},  # → _pi_settings_heal_source
         ],
         "built_check": [
             "share/pi-agent/pi/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
@@ -5975,6 +6027,11 @@ _AGENT_INSTALL = {
             # is_file follows the in-tree relative link: an npm-less dist (a
             # failed or truncated node extract) is never cached.
             "share/pi-agent/node/bin/npm",
+            # The pinned pi-subagents' extension entry: `.format`-ed with the
+            # extra pins by _agent_build_dist (a dist whose npm install of it
+            # silently failed is never cached).
+            f"share/pi-agent/{_PI_SUBAGENTS_DIR}/{{subagents_ver}}/node_modules/"
+            f"{_PI_SUBAGENTS_NPM}/bundle/index.js",
         ],
     },
 }
@@ -6112,7 +6169,11 @@ def _pi_settings_json(pins: dict) -> str:
     prompt; install telemetry off (also PI_TELEMETRY=0, exported by the
     launcher); dark theme like claude's. `tuiMode: regular` keeps the
     terminal's own scrollback and selection as before pi 1.0, whose default
-    became a fullscreen TUI. No `packages`: MCP is pi's built-in extension."""
+    became a fullscreen TUI. MCP is pi's built-in extension (no package for it);
+    `packages` names only the pi-subagents copy the dist ships (its fixed
+    wrapper; an existing project's settings get the same entry once from the
+    launcher's heal, which computes it as the wrapper's path relative to the
+    agent dir — this literal in the default layout)."""
     return json.dumps(
         {"defaultProjectTrust": "always",
          "enableInstallTelemetry": False,
@@ -6120,8 +6181,41 @@ def _pi_settings_json(pins: dict) -> str:
          "tuiMode": "regular",
          # The RS-owned rules extension, shipped beside the agent dir (see the
          # registry row's `files`); the path is relative to the agent dir.
-         "extensions": [f"../rs/{_RS_RULES_SRC.name}"]},
+         "extensions": [f"../rs/{_RS_RULES_SRC.name}"],
+         # pi-subagents, shipped in the dist the same way (relative to the agent
+         # dir, which is share/pi-agent/agent).
+         "packages": [f"../{_PI_SUBAGENTS_DIR}"]},
         indent=2) + "\n"
+
+
+def _pi_subagents_wrapper(pins: dict) -> str:
+    """The fixed wrapper package pi loads pi-subagents through (see
+    _PI_SUBAGENTS_DIR). Its `pi` manifest mirrors pi-subagents' own (extension
+    bundle, skills, prompts — 0.84.0's manifest, checked by the pytest against a
+    pulled dist) with every path inside the pinned version folder; `version` is
+    the pin, because pi's "Extension Updates" notice reads the version and the
+    changelog from the package root, and `changelogPath` points at the nested
+    changelog (pi requires it inside the root, which it is)."""
+    ver = pins["subagents_ver"]
+    base = f"./{ver}/node_modules/{_PI_SUBAGENTS_NPM}"
+    return json.dumps(
+        {"name": "rs-pi-subagents",
+         "version": ver,
+         "private": True,
+         "description": f"{_PI_SUBAGENTS_NPM} {ver} as shipped in RS's pi download",
+         "pi": {"extensions": [f"{base}/bundle/index.js"],
+                "skills": [f"{base}/skills"],
+                "prompts": [f"{base}/prompts"],
+                "changelogPath": f"{base}/CHANGELOG.md"}},
+        indent=2) + "\n"
+
+
+def _pi_settings_heal_source(pins: dict) -> str:
+    """The launcher's one-time settings heal, copied into the dist verbatim."""
+    try:
+        return _PI_SETTINGS_HEAL_SRC.read_text()
+    except OSError as e:
+        die(f"the pi settings heal is missing: {_PI_SETTINGS_HEAL_SRC} ({e})")
 
 # The RS-owned pi extension that gives pi Claude Code's `.claude/rules/`
 # behaviour (path-scoped rules, the project instruction files, the
@@ -6151,7 +6245,9 @@ def _rs_rules_source(pins: dict) -> str:
 # Bound by PATH, not list position: a row added or dropped must not shift a
 # callable onto the wrong file (and an unknown path is a KeyError at import).
 _PI_FILE_CONTENT = {"pi/settings.json": _pi_settings_json,
-                    "local/share/pi-agent/rs/rs-rules.ts": _rs_rules_source}
+                    "local/share/pi-agent/rs/rs-rules.ts": _rs_rules_source,
+                    f"local/share/pi-agent/{_PI_SUBAGENTS_DIR}/package.json": _pi_subagents_wrapper,
+                    f"local/share/pi-agent/{_PI_SETTINGS_HEAL}": _pi_settings_heal_source}
 for _f in _AGENT_INSTALL["pi"]["files"]:
     _f["content"] = _PI_FILE_CONTENT[_f["path"]]
 del _f   # a module global would ride `from rscore import *`
@@ -6433,11 +6529,13 @@ def _agent_build_dist(agent: str, version: str) -> None:
                      MINIMAL_BASE_IMAGE, "sh", "-lc", script], capture_output=True)
             # `built_check` paths are relative to the CAPTURED ~/.local and are
             # tested HERE, before the tree moves under dest/local — a dist whose
-            # vendored component silently failed to install is never cached.
+            # vendored component silently failed to install is never cached. A
+            # check path may name an extra pin (`{subagents_ver}`): formatted
+            # with the resolved extras, like the recipe.
             if (r.returncode == 0 and os.path.lexists(captured / "bin" / bin_)
                     and (not ext
                          or (captured / AGENT_EXT_SUBDIR / ext["file"]).is_file())
-                    and all((captured / rel).is_file()
+                    and all((captured / rel.format(**extras)).is_file()
                             for rel in (spec.get("built_check") or []))):
                 built = True
                 break

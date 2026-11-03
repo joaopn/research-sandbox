@@ -473,6 +473,8 @@ editor show | pull | refresh                      Manage the code-server (editor
 
 pi reads `.claude/rules/` (path-scoped rules), `.claude/CLAUDE.md`, `CLAUDE.local.md` and a subdirectory's `CLAUDE.md` like Claude Code does, through the RS-owned `rs-rules` extension the pi dist carries (`/rules` inside pi lists what it found); it also refuses an edit of a file that was not read first, as Claude Code does.
 
+pi also carries subagents: the pi dist ships the `pi-subagents` extension package at the `PI_SUBAGENTS_VERSION` pin (the Software page's pi row shows it as `subagents`), named in pi's settings. A project whose pi settings predate it gets the entry added once, the first time pi starts after the project's pi download is redeployed (a dev or sandbox-dind project: its next stop and start, Update or agent Add; a docker project: its next Update or editor toggle; a box: an Update or Add while it runs, or its re-creation); a hand-installed `npm:pi-subagents` entry is replaced by the shipped copy. Removing the entry afterwards sticks on a dev or sandbox-dind project (across a stop and start too); a box or a docker project that is re-created starts from the shipped settings again, entry included.
+
 ### Browser UI + broker (optional)
 
 ```
