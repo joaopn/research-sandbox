@@ -158,8 +158,9 @@ def consumer_email(username: str) -> str:
 # guard. It's only a BACKSTOP anyway: `dev sync <repo>` (and the resume path)
 # trigger an immediate pull when the human wants GitHub changes reflected now.
 MIRROR_INTERVAL = "10m"
-# `repos/search` page cap for `dev repo list`. A single-operator dev lane holds
-# far fewer mirrors than this; truncation (loud, above) means "add pagination".
+# Page size user_repos asks for when it enumerates one account's repos for the
+# fail-closed purge gate, which refuses a full page rather than guess what lies
+# beyond it.
 LIST_LIMIT = 100
 # The Development-page read bound (repo_status: up to FIVE metadata GETs per
 # repo on the broker's serial thread — forks list, mirror info, fork info,
@@ -1760,9 +1761,8 @@ def user_repos(host_port: str, user: str, *, detail: bool = False) -> list[dict]
     # NO SILENT CAP on a fail-closed gate. A full page means there may be more
     # repos we never saw, and "we did not see a live fork" would then be an
     # artefact of pagination — fail-OPEN in the delete direction, the one
-    # direction that cannot be taken back. list_repos WARNS here because it
-    # feeds a display; this feeds a delete, so it takes the posture stated three
-    # lines up: an unverifiable state is never a licence to delete.
+    # direction that cannot be taken back. This feeds a delete, so it takes the
+    # posture stated above: an unverifiable state is never a licence to delete.
     if len(rows) >= LIST_LIMIT:
         raise GiteaError(
             f"{user!r} owns at least {LIST_LIMIT} repos — cannot enumerate them "
@@ -1950,19 +1950,32 @@ def remove_repo(host_port: str, repo: str) -> list[str]:
 
 
 def list_repos(host_port: str) -> list[dict]:
-    """The mirrors under sandbox-admin — one bounded `repos/search` call, no
-    per-repo fan-out (keeps the total inside the relay budget). LIST_LIMIT caps
-    the page: a single-operator dev lane holds far fewer than this; if it ever
-    truncates, the fix is pagination, not a bigger magic number."""
+    """The mirrors: every repo sandbox-admin owns, read from that account's own
+    repo list and paged to the end (one request below LIST_PAGE_SIZE mirrors),
+    no per-repo fan-out.
+
+    Not the global `repos/search`: gitea answers it with at most one clamped
+    page (50 rows, ordered by name) over EVERY account's repos, and consumer
+    forks (archived ones are never deleted), notes repos and other accounts'
+    repos fill that window, so mirrors dropped off the list in silence.
+
+    Every page is a read that RAISES on failure, so a failing page never yields
+    a partial list: the callers keep their enumeration page-fatal. An
+    ABSENT admin account owns nothing and maps to [] (as user_repos does)."""
     client = GiteaClient(api_base(host_port), read_admin_token())
-    data = client._api("GET", f"/repos/search?limit={LIST_LIMIT}&q=") or {}
-    rows = data.get("data") or []
-    if len(rows) >= LIST_LIMIT:
-        # Loud, not silent (the no-silent-caps rule): surface truncation rather
-        # than quietly return a short list.
-        print(f"warning: dev repo list truncated at {LIST_LIMIT} results")
+    # Keyed on id, which is unique across owners (a name is unique only per
+    # owner), so the pager's de-dup stays sound even for a misrouted reply.
+    pager = _ListPager(client, f"/users/{ADMIN_USER}/repos", "id")
+    try:
+        pager.all()
+    except GiteaError as e:
+        if e.status == 404:
+            return []
+        raise
     out = []
-    for r in rows:
+    for r in pager.rows:
+        # Defensive: the route lists only that owner's repos (measured); the
+        # filter keeps a misrouted reply from surfacing someone else's repo.
         owner = (r.get("owner") or {}).get("login")
         if owner == ADMIN_USER:
             out.append({"repo": r.get("name"), "mirror": bool(r.get("mirror")),
@@ -2109,7 +2122,8 @@ def _total_count(headers: dict) -> "int | None":
 
 
 class _ListPager:
-    """One gitea list read by repo_status, paged LIST_PAGE_SIZE rows at a time.
+    """One gitea list read (repo_status's PR and branch lists, list_repos),
+    paged LIST_PAGE_SIZE rows at a time.
 
     Two phases, so repo_status can read BOTH lists' first pages before either
     list's continuation: first() is one of the per-call-bounded reads and
@@ -2121,7 +2135,10 @@ class _ListPager:
     The list is finished when the rows read reach X-Total-Count, when a page
     without a usable count comes back short, when a page is empty or not a list,
     or when a page adds no new row (de-duplicated by `key`) — the last rule ends
-    a server that repeats a page even with a frozen clock."""
+    a server that repeats a page even with a frozen clock.
+
+    all() is the third entry point, for an enumeration with no deadline of its
+    own (list_repos): every page, each raising on failure."""
 
     def __init__(self, client: "GiteaClient", path: str, key: str) -> None:
         self._client = client
@@ -2134,7 +2151,7 @@ class _ListPager:
         self.rows: list[dict] = []
         self.done = False
 
-    def _read(self, timeout: float) -> None:
+    def _read(self, timeout: "float | None") -> None:
         self._page += 1
         headers: dict = {}
         body = self._client._api(
@@ -2167,6 +2184,15 @@ class _ListPager:
 
     def first(self) -> None:
         self._read(STATUS_TIMEOUT_S)
+
+    def all(self) -> None:
+        """Every page, each a per-call-bounded read (the client's default
+        API_TIMEOUT_S, the bound the single list read had before) that RAISES
+        on failure, so a failing page never yields a partial list. Always
+        ends: each read either finishes the list or adds at least one new row,
+        and a page adding none finishes it."""
+        while not self.done:
+            self._read(None)
 
     def rest(self, deadline_at: float) -> None:
         while not self.done:
