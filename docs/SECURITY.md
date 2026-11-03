@@ -94,7 +94,7 @@ Each project sits inside multiple boundaries that must all be crossed for a work
 - Renders config from `/workspace/.orchestrator/mcp-proxy/config.json` (which is in turn rendered from the per-project allowlist).
 - Routes `/<name>/<rest>` → `<upstream-ip>:<port>/<rest>`. Pinning `Host: mcp-proxy:8888` on every upstream request gives MCP servers a stable allowlist value.
 - Rejects `..` segments (incl. URL-encoded) in the upstream path.
-- Audit log at `/workspace/.orchestrator/logs/mcp-proxy.jsonl` — one JSON line per request, with `{ts, src, mcp, method, path, status, bytes_in, bytes_out}`.
+- Audit log at `/workspace/.orchestrator/logs/mcp-proxy.jsonl` — one JSON line per request, with `{ts, src, mcp, method, path, status, bytes_in, bytes_out}`. A `status` of 499 means the client disconnected before its response was delivered: the proxy shut the upstream connection down, and the record also carries `error` and, when the upstream had answered, `upstream_status`.
 
 ### 5. Worker config (`.mcp.json`)
 

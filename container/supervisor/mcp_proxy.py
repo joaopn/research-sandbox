@@ -19,6 +19,10 @@ and rs-router's iptables gates network reachability). It only does:
     the final response. Worker-side following can't work — relative
     ``Location`` headers resolve into the proxy's URL space, not the
     upstream's.
+  - Client disconnects propagate: when the worker hangs up before its
+    response was delivered, the upstream connection is shut down (the
+    upstream sees the caller leave instead of a connection held open until
+    it answers) and the request is logged with status 499
   - Audit log to /var/log/mcp-proxy/mcp-proxy.jsonl, one JSON line per request
   - SIGHUP reload of /etc/mcp-proxy/config.json
 
@@ -36,9 +40,12 @@ Config schema (rendered by the supervisor):
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
+import select
 import signal
+import socket
 import sys
 import threading
 import time
@@ -112,7 +119,192 @@ class _TransparentRedirect(urllib.request.HTTPRedirectHandler):
         )
 
 
-_OPENER = urllib.request.build_opener(_TransparentRedirect())
+class _ClientWatch:
+    """Watch one forwarded request's client socket while the request is in
+    flight, and shut the upstream connection(s) down when the client leaves.
+
+    Without it the forwarding thread sits in a blocking upstream read (a
+    sync role call, an idle SSE stream) with nothing looking at the client:
+    a worker that hangs up leaves the thread and the upstream connection
+    pinned until the upstream answers, and the upstream never learns its
+    caller is gone.
+
+    One watcher thread per IN-FLIGHT request (not per connection): it
+    blocks in poll() on the client socket and a wake pipe, without a
+    timeout. A FIN, an RST or an error on the client socket aborts: every
+    upstream socket registered for the request is shut down, which wakes
+    the forwarding thread's blocked read and sends FIN upstream. Data from
+    the client while its request is outstanding is not a disconnect (see
+    ``_client_sent_data``). ``finish()`` ends the window in which an abort
+    can happen; ``stop()`` joins the thread and releases its fds.
+
+    Upstream sockets are registered as ``dup()`` copies, shut down and
+    closed only under the lock: a shutdown therefore always acts on the
+    request's own connection, never on a descriptor number another thread
+    has since reused.
+
+    Documented boundaries:
+      - A client that HALF-closes (``shutdown(SHUT_WR)``) after sending its
+        request is treated as gone: a FIN cannot be told apart from a killed
+        process at the socket level. This is nginx's default
+        (``proxy_ignore_client_abort off``); no MCP client half-closes.
+      - A client that leaves while the upstream TCP connect is still in
+        progress releases nothing until that connect returns (bounded by the
+        kernel's connect timeout); the connection is then shut down at once
+        and the request fails as a disconnect.
+      - Benign race, close-delimited response bodies only: a client that
+        closes in the instant between the last byte of such a body and the
+        proxy's final empty read is logged 499 although everything was
+        delivered; nothing is cut short. Content-Length and chunked bodies
+        cannot hit it (see ``Handler._stream_response``).
+    """
+
+    def __init__(self, client_sock):
+        self._client = client_sock
+        self._lock = threading.Lock()
+        self.aborted = False
+        self._done = False
+        self._upstreams = []
+        self._thread = None
+        self._closed = False
+        # Created last: nothing after it can raise, so a failed constructor
+        # never leaks the pipe.
+        self._wake_r, self._wake_w = os.pipe()
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._watch, name="mcp-proxy-watch", daemon=True)
+        self._thread.start()
+
+    def _watch(self) -> None:
+        # Every exit path RETURNS: once the client is at EOF poll() reports
+        # it readable forever, so looping on after an abort would spin.
+        poller = select.poll()
+        poller.register(self._client.fileno(), select.POLLIN)
+        poller.register(self._wake_r, select.POLLIN)
+        while True:
+            events = poller.poll()
+            if any(fd == self._wake_r for fd, _ in events):
+                return
+            if any(ev & (select.POLLHUP | select.POLLERR | select.POLLNVAL)
+                   for _, ev in events):
+                self.abort()
+                return
+            try:
+                data = self._client.recv(
+                    1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+            except BlockingIOError:
+                continue                # spurious readiness
+            except OSError:
+                self.abort()            # ECONNRESET: the client reset
+                return
+            if not data:
+                self.abort()            # FIN: the client closed
+                return
+            self._client_sent_data()
+            return
+
+    def _client_sent_data(self) -> None:
+        """The client sent bytes while its request is outstanding
+        (pipelining, or the unread rest of a chunked request body). That is
+        not a disconnect: stop watching and let the request proceed exactly
+        as an unwatched one would. The peek consumed nothing, so the next
+        request on the connection is intact."""
+
+    def abort(self) -> None:
+        with self._lock:
+            if self._done or self.aborted:
+                return
+            self.aborted = True
+            for sock in self._upstreams:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def register(self, sock) -> None:
+        """Called from the forwarding thread right after an upstream
+        connection connects (every redirect hop included)."""
+        with self._lock:
+            if self.aborted:
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                raise ConnectionAbortedError("client disconnected")
+            if self._done:
+                return
+            try:
+                self._upstreams.append(sock.dup())
+            except OSError:
+                pass    # out of fds: this upstream stays unwatched
+
+    def finish(self) -> bool:
+        """Close the abort window; return whether the request was aborted."""
+        with self._lock:
+            self._done = True
+            return self.aborted
+
+    def stop(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        with self._lock:
+            self._done = True
+            upstreams, self._upstreams = self._upstreams, []
+            for sock in upstreams:
+                sock.close()
+        try:
+            os.write(self._wake_w, b"x")
+        except OSError:
+            pass
+        # join() on a never-started thread raises RuntimeError.
+        if self._thread is not None and self._thread.ident is not None:
+            self._thread.join()
+        os.close(self._wake_r)
+        os.close(self._wake_w)
+
+
+class _NoWatch:
+    """Stand-in when a watch cannot be set up (out of fds or threads): the
+    request is forwarded unwatched, exactly as before watches existed."""
+    aborted = False
+
+    def register(self, sock) -> None:
+        pass
+
+    def finish(self) -> bool:
+        return False
+
+    def stop(self) -> None:
+        pass
+
+
+_NO_WATCH = _NoWatch()
+
+# The watch of the request the current thread is forwarding. Thread-local
+# rather than carried on the Request because _TransparentRedirect mints a
+# new Request per hop; every hop connects on the forwarding thread.
+_current = threading.local()
+
+
+class _WatchedHTTPConnection(http.client.HTTPConnection):
+    def connect(self):
+        super().connect()
+        watch = getattr(_current, "watch", None)
+        if watch is not None:
+            watch.register(self.sock)
+
+
+class _WatchedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_WatchedHTTPConnection, req)
+
+
+# build_opener drops its default HTTPHandler when given an instance of a
+# subclass, so every upstream connection goes through the watched class.
+_OPENER = urllib.request.build_opener(
+    _WatchedHTTPHandler(), _TransparentRedirect())
 
 config_lock = threading.RLock()
 config: dict = {}
@@ -228,15 +420,38 @@ class Handler(BaseHTTPRequestHandler):
             upstream_url, data=body, headers=out_headers, method=method,
         )
         client_ip = self.client_address[0]
+        watch = _NO_WATCH
+        try:
+            try:
+                watch = _ClientWatch(self.connection)
+                watch.start()
+            except (OSError, RuntimeError) as e:
+                sys.stderr.write(
+                    f"client watch unavailable ({e}); forwarding unwatched\n")
+                watch.stop()
+                watch = _NO_WATCH
+            _current.watch = watch
+            self._forward(req, watch, name, method, upstream_path,
+                          client_ip, body_len)
+        finally:
+            _current.watch = None
+            watch.stop()
+
+    def _forward(self, req, watch, name, method, upstream_path,
+                 client_ip, body_len):
         try:
             with _OPENER.open(req, timeout=UPSTREAM_TIMEOUT) as resp:
-                self._stream_response(resp, name, method, upstream_path,
-                                      client_ip, body_len)
+                self._stream_response(resp, watch, name, method,
+                                      upstream_path, client_ip, body_len)
         except urllib.error.HTTPError as e:
             try:
                 err_body = e.read()
             except Exception:
                 err_body = b""
+            if watch.finish():
+                self._client_gone(name, method, upstream_path, client_ip,
+                                  body_len, upstream_status=e.code)
+                return
             self.send_response(e.code)
             for h, v in e.headers.items():
                 if h.lower() in HOP_BY_HOP:
@@ -252,16 +467,25 @@ class Handler(BaseHTTPRequestHandler):
                 "bytes_in": body_len, "bytes_out": len(err_body),
             })
         except urllib.error.URLError as e:
+            if watch.finish():
+                self._client_gone(name, method, upstream_path, client_ip,
+                                  body_len)
+                return
             self._error(502, name=name,
                         message=f"upstream unreachable: {e.reason}",
                         method=method, src=client_ip,
                         path=upstream_path, bytes_in=body_len)
         except Exception as e:  # pragma: no cover
+            # An aborted getresponse() (RemoteDisconnected) lands here.
+            if watch.finish():
+                self._client_gone(name, method, upstream_path, client_ip,
+                                  body_len)
+                return
             self._error(500, name=name, message=f"proxy error: {e}",
                         method=method, src=client_ip,
                         path=upstream_path, bytes_in=body_len)
 
-    def _stream_response(self, resp, name, method, upstream_path,
+    def _stream_response(self, resp, watch, name, method, upstream_path,
                           client_ip, body_len):
         ctype = resp.headers.get("Content-Type", "")
         is_sse = "text/event-stream" in ctype.lower()
@@ -273,22 +497,69 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         chunk_size = 1024 if is_sse else 8192
         bytes_out = 0
-        try:
-            while True:
+        read_error = None
+        client_failed = False
+        while True:
+            try:
                 chunk = resp.read(chunk_size)
-                if not chunk:
-                    break
+            except (OSError, http.client.HTTPException) as e:
+                read_error = e
+                break
+            if not chunk:
+                break
+            try:
                 self.wfile.write(chunk)
                 if is_sse:
                     self.wfile.flush()
-                bytes_out += len(chunk)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        audit({
+            except (BrokenPipeError, ConnectionResetError):
+                client_failed = True
+                break
+            bytes_out += len(chunk)
+        aborted = watch.finish()
+        # 499 only when the client left BEFORE the response was delivered
+        # (nginx's rule). A client that reads a complete response and then
+        # hangs up may trip the watch before finish(); that is a normal end.
+        gone = client_failed or (aborted and (
+            read_error is not None or not self._delivered_in_full(resp)))
+        # An upstream reset with the client still there keeps its old record
+        # (the upstream's status); any other read failure goes to _proxy's
+        # error branches as before.
+        if read_error is not None and not gone and not isinstance(
+                read_error, (BrokenPipeError, ConnectionResetError)):
+            raise read_error
+        record = {
             "src": client_ip, "mcp": name, "method": method,
             "path": upstream_path, "status": resp.status,
             "bytes_in": body_len, "bytes_out": bytes_out,
             **({"sse": True} if is_sse else {}),
+        }
+        if gone:
+            self.close_connection = True
+            record.update(status=499, upstream_status=resp.status,
+                          error="client disconnected")
+        audit(record)
+
+    @staticmethod
+    def _delivered_in_full(resp) -> bool:
+        """Whether a read loop that ended without an error read the whole
+        body. A chunked body ends cleanly only at its terminating chunk (a
+        cut one raises IncompleteRead). A Content-Length body is complete
+        when no length remains (HEAD/204/304 have length 0); a cut one
+        returns b"" with length left. A close-delimited body cannot be told
+        from a cut one."""
+        if resp.chunked:
+            return True
+        return resp.length == 0
+
+    def _client_gone(self, name, method, path, client_ip, body_len, **extra):
+        """The client left before its response was sent: write nothing,
+        drop the connection, and audit status 499 (nginx's "client closed
+        request", a status no upstream sends)."""
+        self.close_connection = True
+        audit({
+            "src": client_ip, "mcp": name, "method": method, "path": path,
+            "status": 499, "error": "client disconnected",
+            "bytes_in": body_len, **extra,
         })
 
     def _error(self, code, name, message, **kw):
