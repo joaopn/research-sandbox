@@ -163,9 +163,13 @@ def cmd_call(a):
     task = " ".join(a.task)
     args = {"caller": a.caller, "mode": a.mode, "task": task}
     if a.mode == "sync":
-        # The daemon's own sync bound answers first whenever it is set; this
-        # arm exists for an unbounded daemon (RS_ROLE_SYNC_TIMEOUT_S=0): the
-        # job keeps running under an id the daemon never returned (jobs/).
+        # The daemon's own sync bound answers first whenever it is set (the
+        # default --wait is above it); this arm fires for an unbounded
+        # daemon (RS_ROLE_SYNC_TIMEOUT_S=0) or a --wait below the bound.
+        # When this process exits, its connection closes and the daemon
+        # cancels the call: the spawn is killed, the job reads
+        # failed/cancelled under an id the daemon never returned (jobs/),
+        # and the slot is freed.
         try:
             r = rpc("tools/call", {"name": "send_job", "arguments": args}, a.wait)
         except (socket.timeout, urllib.error.URLError, TimeoutError, OSError, ValueError) as e:

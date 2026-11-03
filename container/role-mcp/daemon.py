@@ -514,9 +514,11 @@ class Spawner:
             return False, f"spawn failed: {e}"
 
         # COVERAGE INVARIANT: from here on a pid exists, and cancellation
-        # (tool_send_job's sync bound via asyncio.wait_for) can land at any
-        # await. Every such await MUST sit inside this try so the kill
-        # fires; an await added to run() outside it leaks a live spawn.
+        # (tool_send_job's sync bound via asyncio.wait_for, a direct
+        # caller's disconnect cancelling its request handler, a daemon
+        # shutdown) can land at any await. Every such await MUST sit inside
+        # this try so the kill fires; an await added to run() outside it
+        # leaks a live spawn.
         try:
             await self.jobs.mark_pid(call_id, proc.pid)
             stdout, stderr = await proc.communicate()
@@ -531,13 +533,14 @@ class Spawner:
             # session and still holds them could wedge this await.
             await proc.wait()
             # Every call leaves a trace. This handler cannot know WHY it was
-            # cancelled — the sync bound and a daemon shutdown (aiohttp
-            # cancels in-flight handlers and the async _bg tasks on SIGTERM)
-            # both land here — so it records the neutral `cancelled`; the
-            # one caller that knows the bound fired (tool_send_job's
-            # timeout arm) upgrades the note to `sync_timeout`. Summarize
-            # therefore never learns "this query blows the sync budget"
-            # from a routine project stop.
+            # cancelled — the sync bound, a direct caller hanging up on a
+            # sync call (handler_cancellation, see main()) and a daemon
+            # shutdown (aiohttp cancels in-flight handlers and the async _bg
+            # tasks on SIGTERM) all land here — so it records the neutral
+            # `cancelled`; the one caller that knows the bound fired
+            # (tool_send_job's timeout arm) upgrades the note to
+            # `sync_timeout`. Summarize therefore never learns "this query
+            # blows the sync budget" from a routine project stop.
             if not memory_path.is_file():
                 _write_memory_stub(
                     memory_path, caller, call_id,
@@ -790,20 +793,48 @@ async def tool_send_job(jobs: JobTable, spawner: Spawner,
         # builtin does not match, and an unmatched timeout would escape to
         # the generic arm with the slot never freed: the exact leak this
         # bound exists to close. SYNC_TIMEOUT_S is read here at call time.
+        #
+        # The outer CancelledError arm is the other half of the slot
+        # release. This request's handler task is cancelled when the caller
+        # hangs up (handler_cancellation, see main()) or the daemon stops;
+        # a cancel landing while run() is in flight is thrown into it —
+        # its handler kills the group and writes the `cancelled` stub —
+        # and then arrives here, where nothing else would ever call
+        # mark_failed: without this arm the slot stays taken until a daemon
+        # restart and the job file reads `running`. It wraps EVERY await after register(), the result
+        # bookkeeping and the timeout arm's own mark_failed included, so a
+        # cancel landing on any of their lock acquires is still recorded.
+        # A bound expiry is never a CancelledError on Python >= 3.11, so
+        # the two arms never both fire. The re-raise is required: the
+        # connection is gone, and aiohttp must not try to answer on it.
+        # Residual, not hardened: a SECOND cancel landing during this arm's
+        # own mark_failed (only a daemon stop racing a hang-up) leaves the
+        # job `running` until the next boot's reconcile_on_startup sweeps
+        # it (pid dead -> failed).
         try:
-            ok, result = await asyncio.wait_for(
-                spawner.run(call_id, caller, task),
-                timeout=SYNC_TIMEOUT_S if SYNC_TIMEOUT_S > 0 else None,
+            try:
+                ok, result = await asyncio.wait_for(
+                    spawner.run(call_id, caller, task),
+                    timeout=SYNC_TIMEOUT_S if SYNC_TIMEOUT_S > 0 else None,
+                )
+            except asyncio.TimeoutError:
+                await jobs.mark_failed(call_id, "sync_timeout")
+                _note_sync_timeout(caller, call_id)
+                raise SyncTimeoutError(call_id)
+            if ok:
+                await jobs.mark_done(call_id, result)
+                return {"call_id": call_id, "result": result}
+            await jobs.mark_failed(call_id, result)
+            return {"call_id": call_id, "error": result}
+        except asyncio.CancelledError:
+            await jobs.mark_failed(call_id, "cancelled")
+            print(
+                f"role-mcp[{ROLE}]: cancelled sync send_job call_id={call_id} "
+                f"(caller disconnected or daemon stopping); spawn killed, "
+                f"slot freed",
+                file=sys.stderr,
             )
-        except asyncio.TimeoutError:
-            await jobs.mark_failed(call_id, "sync_timeout")
-            _note_sync_timeout(caller, call_id)
-            raise SyncTimeoutError(call_id)
-        if ok:
-            await jobs.mark_done(call_id, result)
-            return {"call_id": call_id, "result": result}
-        await jobs.mark_failed(call_id, result)
-        return {"call_id": call_id, "error": result}
+            raise
 
     # async: spawn detached, return immediately.
     async def _bg() -> None:
@@ -1052,8 +1083,21 @@ def main() -> None:
         d.mkdir(parents=True, exist_ok=True)
     app = build_app()
     print(f"role-mcp[{ROLE}]: listening on 0.0.0.0:{PORT}/mcp", file=sys.stderr)
+    # handler_cancellation: when a caller's connection closes mid-request,
+    # aiohttp cancels that request's handler (its default leaves it running
+    # to completion with nobody to answer). For a sync send_job that kills
+    # the spawn's process group and frees the concurrency slot (run()'s
+    # cancel handler + tool_send_job's CancelledError arm); for
+    # summarize_memories it kills the spawn before anything is appended, so
+    # the watermarks stay put and the next summarize re-reads the same logs.
+    # Async send_jobs are detached tasks and never cancelled by a hang-up.
+    # The disconnect that reaches this daemon is the one on ITS socket: a
+    # direct caller (rs-role-mcp, curl) whose process exits, or the
+    # mcp-proxy's connection going away. A worker calling through the
+    # proxy is cancelled only once the proxy closes its upstream leg when
+    # the worker hangs up — the proxy does not do that today.
     web.run_app(app, host="0.0.0.0", port=PORT, print=None,
-                handle_signals=True)
+                handle_signals=True, handler_cancellation=True)
 
 
 if __name__ == "__main__":
