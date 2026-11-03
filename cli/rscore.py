@@ -11451,7 +11451,7 @@ def _refuse_retired_identity(user: str) -> None:
     verbatim), so: no CLI verb anywhere in it. It classifies the identity by
     what it OWNS (user_repos — the same strict read the purge gate uses),
     because the Development page lists a retired identity ONLY through an
-    archived fork it owns. Three states, three remedies, none of them a lie:
+    archived fork it owns. Four states, four remedies, none of them a lie:
       * archived fork(s) only — the page shows a Purge row under each of those
         repos: point at them by name.
       * a LIVE fork — the create-crashed-after-fork orphan (B52): no row (the
@@ -11459,6 +11459,16 @@ def _refuse_retired_identity(user: str) -> None:
         fork, so the honest route is archive-in-the-Gitea-tab, THEN the page.
       * nothing at all — the create-crashed-before-fork orphan (B52): no row
         anywhere; the browser route is Site Administration in the Gitea tab.
+      * a copy of a history box's notes — the account of an earlier box that
+        kept history on Gitea (same `agent-<project>.<box>` name), whose
+        deletion Gitea refused after the box user had forked its own notes
+        repo (forks bypass its repo-creation cap). The page lists consumer
+        forks per MIRROR, and a fork of `notes/...` has no mirror, so no row
+        ever appears; Gitea refuses a plain delete of a user that still owns
+        a repo, so the remedy is Site Administration with the purge option
+        (or delete the copy first, then the user). Any notes copy wins over a
+        mixed set: the purge verb refuses a live fork, and Site Administration
+        is the one route that works for every mix.
     A classification failure falls back to the generic text: the refusal is
     still correct, only the pointer degrades. 'A different name' is an equal
     remedy in every arm, never a fallback, and no arm implies purging is
@@ -11474,7 +11484,7 @@ def _refuse_retired_identity(user: str) -> None:
     is ANOTHER live project or box: the refusal says the name is in use and
     offers only a different name — never archive or purge, which would
     destroy that project's live work. A variant with neither is genuinely
-    retired: the three arms above apply to it, under its stored name."""
+    retired: the four arms above apply to it, under its stored name."""
     host_port = _gitea_host_port()
     try:
         retired = gitea.retired_identity(host_port, user)
@@ -11510,7 +11520,7 @@ def _refuse_retired_identity(user: str) -> None:
                 f"from an earlier project or box, and it blocks {user!r} "
                 f"because Gitea ignores letter case. ")
     try:
-        owned = gitea.user_repos(host_port, login)
+        owned = gitea.user_repos(host_port, login, detail=True)
     except gitea.GiteaError:
         owned = None
     if owned is None:
@@ -11518,6 +11528,22 @@ def _refuse_retired_identity(user: str) -> None:
             head + "Purge that retired identity from the Development page (it "
             "is listed under its repo while it still has a fork), or use a "
             "different name")
+    # A fork whose parent is in the history ORG (`notes/`, with the slash: a
+    # project's history user is `notes-<project>`, a different owner).
+    notes_prefix = gitea.HISTORY_ORG + "/"
+    notes = sorted(r["parent"] for r in owned
+                   if r.get("fork") and str(r.get("parent") or "").lower()
+                   .startswith(notes_prefix))
+    if notes:
+        raise ValidationError(
+            head + f"It is the account of an earlier box that kept history on "
+            f"Gitea, and it holds a copy of that box's notes "
+            f"({', '.join(notes)}), so it is not shown on the Development page. "
+            f"Gitea refuses to delete a user that still owns a repository: "
+            f"delete the user under Site Administration in the Gitea tab with "
+            f"its purge option ticked (that removes its copy too; the notes "
+            f"repo itself is not affected), or delete its copy first and then "
+            f"the user; or use a different name")
     # A malformed row carries an empty name (user_repos emits `name or ""`);
     # never print "listed under , X".
     live = sorted(r["repo"] for r in owned
