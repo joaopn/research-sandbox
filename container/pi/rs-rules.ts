@@ -1,4 +1,4 @@
-// rs-rules v0.5.0
+// rs-rules v0.6.0
 //
 // Claude Code's rules capability for pi, one-to-one, as an RS-owned extension.
 // Shipped inside the pi dist (share/pi-agent/rs/rs-rules.ts) and named from the
@@ -40,6 +40,30 @@
 // command starts there again; relative paths given to read, edit, write, grep,
 // find and ls resolve against that same current directory.
 //
+// MCP servers from a parent folder. Claude finds `.mcp.json` from a subfolder;
+// pi reads project servers only from `<cwd>/.pi/mcp.json`, with no walk-up. So
+// at session start, when the session folder has no `.pi/mcp.json` of its own,
+// the extension registers the servers of the NEAREST parent folder's
+// `.pi/mcp.json` (in a box that file is the link to the box's `.mcp.json`),
+// only when pi would trust that parent folder (its entry in the agent dir's
+// trust.json, else the global `defaultProjectTrust: "always"`), and entries are
+// passed as written except three rules pi applies to project files: an http
+// entry with `auth` is skipped, an override of a global server (an entry with
+// no `command`, `url` or `type`) is skipped, and a stdio entry's `cwd` is
+// resolved against the parent folder (pi spawns stdio servers in the session
+// folder).
+// Settings extensions load before pi's built-ins and handlers run in load
+// order, so these registrations exist when the built-in MCP reads them at its
+// own session start: they connect at once and the first request declares them.
+// Fail-closed divergences: a command-line trust override, another extension's
+// project_trust answer and a session-only trust choice are invisible here, so
+// the extension may decline where pi in that folder would have trusted it.
+// Residuals an extension cannot change: a server's `roots` and `!command`
+// values are evaluated in the session folder; a same-name server in the global
+// mcp.json wins over a registered one; the parent file's `autoEnableCodemode`
+// is not carried; the shell command `pi mcp list` (which loads no extension)
+// does not list these servers from a subfolder.
+//
 // Every handler is wrapped: a failure warns and returns nothing (a thrown
 // tool_call handler would BLOCK the tool — the catch is load-bearing).
 
@@ -50,7 +74,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const RS_RULES_VERSION = "0.5.0";
+export const RS_RULES_VERSION = "0.6.0";
 
 // The system-prompt SECTION the launch rules ride in (pi wraps it as
 // `<project_rules>…</project_rules>`). A section, never a returned
@@ -777,6 +801,151 @@ function relTo(base: string, target: string): string | null {
 }
 
 // ---------------------------------------------------------------------------
+// MCP servers of the nearest parent folder (see the header).
+// ---------------------------------------------------------------------------
+
+export interface AncestorMcpFile {
+  dir: string; // the parent folder, as reached by the lexical walk
+  file: string; // <dir>/.pi/mcp.json
+}
+
+const piMcpFile = (dir: string) => path.join(dir, ".pi", "mcp.json");
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function stripBom(text: string): string {
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+}
+
+// pi's own `~` rule: exactly `~` and `~/…` are home-relative, nothing else.
+function expandHome(p: string, home: string): string {
+  if (p === "~") return home;
+  if (p.startsWith("~/")) return path.join(home, p.slice(2));
+  return p;
+}
+
+// The nearest folder STRICTLY above `cwd` holding `.pi/mcp.json`, or null when
+// `cwd` has its own (pi reads that one itself and never merges two projects'
+// files) or no parent has one. `existsSync` follows links, as pi's check does,
+// so a dangling link counts as absent at every level.
+export function findAncestorMcpFile(cwd: string): AncestorMcpFile | null {
+  let dir = path.resolve(cwd);
+  if (fs.existsSync(piMcpFile(dir))) return null;
+  for (;;) {
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+    const file = piMcpFile(dir);
+    if (fs.existsSync(file)) return { dir, file };
+  }
+}
+
+// pi's agent dir: PI_CODING_AGENT_DIR (`~` expanded) else ~/.pi/agent.
+export function piAgentDir(env: Record<string, string | undefined>, home: string): string {
+  const v = env.PI_CODING_AGENT_DIR;
+  if (v) return expandHome(v, home);
+  return path.join(home, ".pi", "agent");
+}
+
+// Would pi trust `dir` as a project folder? Mirrors pi's decision for a folder
+// that has a `.pi/mcp.json`: the session must be trusted, then the nearest
+// trust.json entry for realpath(dir) walking up (null entries skipped), else
+// the GLOBAL settings' `defaultProjectTrust: "always"`. The trust store is read
+// the way pi reads it (one BOM stripped, a plain object, every value
+// true/false/null) and an invalid store refuses outright. Never throws.
+export function ancestorTrusted(dir: string, agentDir: string, sessionTrusted: boolean): { trusted: boolean; reason?: string } {
+  if (!sessionTrusted) return { trusted: false, reason: "the session's own folder is not trusted" };
+  const storePath = path.join(agentDir, "trust.json");
+  let store: Record<string, unknown> = {};
+  if (fs.existsSync(storePath)) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(stripBom(fs.readFileSync(storePath, "utf8")));
+    } catch (e) {
+      return { trusted: false, reason: `trust store ${storePath} unreadable: ${e instanceof Error ? e.message : String(e)}` };
+    }
+    if (!isRecord(parsed)) return { trusted: false, reason: `trust store ${storePath} unreadable: expected an object` };
+    for (const [key, value] of Object.entries(parsed)) {
+      if (value !== true && value !== false && value !== null) {
+        return { trusted: false, reason: `trust store ${storePath} unreadable: value for ${JSON.stringify(key)} must be true, false, or null` };
+      }
+    }
+    store = parsed;
+  }
+  let cur = realpathOrNull(dir) ?? path.resolve(dir);
+  for (;;) {
+    const v = store[cur];
+    if (v === true) return { trusted: true };
+    if (v === false) return { trusted: false, reason: `${dir} is not trusted (${storePath}: ${JSON.stringify(cur)} is false)` };
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  let defaultTrust: unknown;
+  try {
+    const settings = JSON.parse(stripBom(fs.readFileSync(path.join(agentDir, "settings.json"), "utf8")));
+    if (isRecord(settings)) defaultTrust = settings.defaultProjectTrust;
+  } catch {
+    /* missing or unparsable: the default ("ask") applies */
+  }
+  if (defaultTrust === "always") return { trusted: true };
+  return { trusted: false, reason: `${dir} is not trusted (no trust entry, and defaultProjectTrust is not "always")` };
+}
+
+function isHttpEntry(v: Record<string, unknown>): boolean {
+  return typeof v.url === "string" && (v.type === undefined || v.type === "http" || v.type === "streamable-http");
+}
+
+function isStdioEntry(v: Record<string, unknown>): boolean {
+  return !isHttpEntry(v) && typeof v.command === "string" && (v.type === undefined || v.type === "stdio");
+}
+
+// The servers of the parent folder's file, ready to register: every entry as
+// written, except an http entry with `auth` (skipped — pi refuses `auth` in a
+// project file, so a repository cannot pick where a credential goes), an entry
+// with no `command`, `url` or `type` (skipped — in a project file that is an
+// override of a global server's settings, which a registration cannot be: a
+// same-name global server always wins over a registered one) and a
+// stdio entry's `cwd` (absent → `dir`; `~` / `~/…` kept for pi to expand;
+// anything else resolved against `dir`, which keeps an absolute path). A
+// malformed entry is passed through for pi's own validation to refuse.
+export function ancestorServers(file: string, dir: string): { servers: Array<[string, unknown]>; skipped: string[]; error?: string } {
+  const servers: Array<[string, unknown]> = [];
+  const skipped: string[] = [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stripBom(fs.readFileSync(file, "utf8")));
+  } catch (e) {
+    return { servers, skipped, error: `${file}: ${e instanceof Error ? e.message : String(e)}` };
+  }
+  if (!isRecord(parsed) || (parsed.mcpServers !== undefined && !isRecord(parsed.mcpServers))) {
+    return { servers, skipped, error: `${file}: expected an object with an "mcpServers" object` };
+  }
+  for (const [name, value] of Object.entries((parsed.mcpServers ?? {}) as Record<string, unknown>)) {
+    if (isRecord(value) && value.command === undefined && value.url === undefined && value.type === undefined) {
+      skipped.push(`${name}: an override of a global server, which pi applies only in ${dir} itself`);
+      continue;
+    }
+    if (isRecord(value) && "url" in value && value.auth) {
+      skipped.push(`${name}: auth is only allowed in the global mcp.json`);
+      continue;
+    }
+    if (isRecord(value) && isStdioEntry(value)) {
+      const cfg: Record<string, unknown> = { ...value };
+      const cwd = value.cwd;
+      if (cwd === undefined) cfg.cwd = dir;
+      else if (typeof cwd === "string" && cwd !== "~" && !cwd.startsWith("~/")) cfg.cwd = path.resolve(dir, cwd);
+      servers.push([name, cfg]);
+      continue;
+    }
+    servers.push([name, value]);
+  }
+  return { servers, skipped };
+}
+
+// ---------------------------------------------------------------------------
 // The subagent brief guard.
 // ---------------------------------------------------------------------------
 
@@ -914,6 +1083,53 @@ export default function rsRules(pi: ExtensionAPI) {
       await fn();
     } catch (e) {
       warn(`${name} failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
+  // Names this instance registered from a parent folder's `.pi/mcp.json`.
+  const mcpRegistered = new Set<string>();
+
+  const syncAncestorMcp = (ctx: ExtensionContext) => {
+    const wanted = new Map<string, unknown>();
+    // The file walk first: a session with no parent file never consults trust.
+    const found = findAncestorMcpFile(ctx.cwd);
+    if (found) {
+      const sessionTrusted = (ctx as any).isProjectTrusted() === true;
+      const t = ancestorTrusted(found.dir, piAgentDir(process.env, home), sessionTrusted);
+      if (!t.trusted) {
+        warn(`MCP servers of ${found.file} not registered: ${t.reason}`);
+      } else {
+        const r = ancestorServers(found.file, found.dir);
+        if (r.error) warn(`MCP servers not registered: ${r.error}`);
+        for (const s of r.skipped) warn(`MCP server ${s} (${found.file}), skipped`);
+        for (const [name, cfg] of r.servers) wanted.set(name, cfg);
+      }
+    }
+    for (const name of [...mcpRegistered]) {
+      if (wanted.has(name)) continue;
+      mcpRegistered.delete(name);
+      try {
+        pi.unregisterMcpServer(name);
+      } catch (e) {
+        warn(`MCP server ${name}: unregister failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+    for (const [name, cfg] of wanted) {
+      try {
+        pi.registerMcpServer(name, cfg as any);
+        mcpRegistered.add(name);
+      } catch (e) {
+        warn(`MCP server ${name} (${found?.file}) not registered: ${e instanceof Error ? e.message : String(e)}`);
+        // A config this instance registered earlier must not stay connected
+        // after the file changed it into one pi refuses.
+        if (mcpRegistered.delete(name)) {
+          try {
+            pi.unregisterMcpServer(name);
+          } catch {
+            /* already gone */
+          }
+        }
+      }
     }
   };
 
@@ -1064,6 +1280,9 @@ export default function rsRules(pi: ExtensionAPI) {
         (ctx as any).ui.notify(`rs-rules: ${launch} launch, ${scoped} path-scoped`, "info");
       }
     });
+    // Separately guarded: a failure in one half never stops the other. Before
+    // the await below, so the built-in MCP's own session_start finds them.
+    guarded("mcp", () => syncAncestorMcp(ctx));
     await guardedAsync("subagent registration", () => registerForChildren(ctx));
   });
 
