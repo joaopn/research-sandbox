@@ -95,7 +95,13 @@ RUN printf '%s\n' 'export PATH="$HOME/.local/bin:$PATH"' \
 RUN install -d -o research -g research /home/research/.byobu /home/research/.byobu/bin
 COPY --chown=research:research agent/byobu-status      /home/research/.byobu/status
 COPY --chown=research:research agent/byobu-bin-rolename /home/research/.byobu/bin/60_rolename
+COPY --chown=research:research agent/byobu-tmux.conf   /home/research/.byobu/.tmux.conf
 RUN chmod +x /home/research/.byobu/bin/60_rolename
+
+# Turn tmux extended keys off at every interactive bash prompt, so a killed
+# Claude Code/pi cannot leave its pane with a dead Ctrl+C (agent/bash-tmux-keys.sh).
+COPY agent/bash-tmux-keys.sh /etc/rs-bash-tmux-keys.sh
+RUN printf '\n%s\n' '[ -r /etc/rs-bash-tmux-keys.sh ] && . /etc/rs-bash-tmux-keys.sh' >> /etc/bash.bashrc
 
 # No skel snapshot, no USER switch, no ENTRYPOINT here — the leaf images add
 # their flavor layer, snapshot the home, and set the entrypoint.

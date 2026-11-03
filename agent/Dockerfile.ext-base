@@ -72,7 +72,13 @@ RUN chmod +x /opt/pi-templates/greet-and-shell.sh
 RUN install -d -o worker -g worker /home/worker/.byobu /home/worker/.byobu/bin
 COPY --chown=worker:worker agent/byobu-status       /home/worker/.byobu/status
 COPY --chown=worker:worker agent/byobu-bin-rolename /home/worker/.byobu/bin/60_rolename
+COPY --chown=worker:worker agent/byobu-tmux.conf    /home/worker/.byobu/.tmux.conf
 RUN chmod +x /home/worker/.byobu/bin/60_rolename
+
+# Turn tmux extended keys off at every interactive bash prompt, so a killed
+# Claude Code/pi cannot leave its pane with a dead Ctrl+C (agent/bash-tmux-keys.sh).
+COPY agent/bash-tmux-keys.sh /etc/rs-bash-tmux-keys.sh
+RUN printf '\n%s\n' '[ -r /etc/rs-bash-tmux-keys.sh ] && . /etc/rs-bash-tmux-keys.sh' >> /etc/bash.bashrc
 
 # Home skel for the (rare) volume-mount first-boot restore path. The box
 # entrypoint guards the dist cp on launcher-absence (not ~/.bashrc-absence), so an
