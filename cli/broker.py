@@ -36,6 +36,13 @@ also keeps the stderr-capture below race-free. Anything slow never runs on
 that one thread: builds, reviews, dev provisions and project start/stop/update
 each run in a DETACHED child (the lanes below), so the daemon keeps answering
 while they work.
+
+The daemon imports its `cli/` modules once, at start, and serves those bytes
+until it is restarted. So it records what it loaded (a content hash per loaded
+`cli/` file, in BROKER_CODE_STAMP) and says when the files on disk no longer
+match: `broker status` / `broker start` print it, and every reply from such a
+daemon carries `"stale": true` (absent otherwise). It keeps serving either way;
+restarting is the operator's call.
 """
 
 from __future__ import annotations
@@ -43,6 +50,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import fcntl
+import hashlib
 import io
 import json
 import os
@@ -79,6 +87,10 @@ BROKER_DIR = Path.home() / ".research-sandbox"
 BROKER_RUN_DIR = BROKER_DIR / "run"
 BROKER_SOCKET = BROKER_RUN_DIR / "broker.sock"
 BROKER_PIDFILE = BROKER_DIR / "broker.pid"
+# What the running daemon loaded: {"pid", "root", "files": {"cli/x.py": sha256}}.
+# Host-only (NOT under run/): it names repo paths. Written by serve() before the
+# socket exists, removed by name with the pidfile.
+BROKER_CODE_STAMP = BROKER_DIR / "broker.code.json"
 BROKER_LOG = BROKER_DIR / "broker.log"
 
 # Per-operation progress logs (WEBUI_OPLOG). Two dirs straddling the webui mount
@@ -2782,6 +2794,17 @@ class _Handler(socketserver.StreamRequestHandler):
                             spawn_lifecycle=_spawn_lifecycle_child))
 
     def _send(self, reply: dict) -> None:
+        # A daemon serving code older than what is on disk says so on every
+        # reply. The check is a diagnostic: nothing it does may cost a reply.
+        stamp = getattr(self.server, "code_stamp", None)
+        if stamp is not None:
+            try:
+                stale = bool(stamp.stale_files())
+            except Exception as e:
+                print(f"broker: code check failed: {e}", flush=True)
+                stale = False
+            if stale:
+                reply = {**reply, "stale": True}
         data = json.dumps(reply).encode()
         self.wfile.write(_LEN.pack(len(data)) + data)
 
@@ -2811,7 +2834,17 @@ def serve() -> None:
     # under run/ (webui-mounted RO); full log under BROKER_DIR (host-only).
     BROKER_OPLOG_DIR.mkdir(parents=True, exist_ok=True)
     BROKER_FULLLOG_DIR.mkdir(parents=True, exist_ok=True)
-    server = _Server(str(BROKER_SOCKET), _Handler)
+    # Record what this daemon loaded BEFORE binding: `start()` reports the
+    # broker started as soon as the socket exists, and a `status` right after
+    # must find the record. A failed bind removes our own record again.
+    stamp = _CodeStamp.capture()
+    _write_code_stamp(stamp)
+    try:
+        server = _Server(str(BROKER_SOCKET), _Handler)
+    except BaseException:
+        _drop_own_code_stamp()
+        raise
+    server.code_stamp = stamp
     # In-daemon session-token store: issued on login, never persisted, flushed
     # by construction on restart. The handler reaches it via self.server.tokens.
     server.tokens = broker_auth.TokenStore()
@@ -2877,6 +2910,152 @@ def client_call(verb: str, args: dict | None = None, *,
 # ---------------------------------------------------------------------------
 
 
+def _hash_file(path) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+class _CodeStamp:
+    """The `cli/` files a daemon loaded, by content hash, and whether the bytes
+    under `root` still match. Content, not mtime: a touch or a checkout and
+    back is not a change; an edit then a revert clears. A per-file stat key
+    (mtime_ns, size, inode) caches the verdict, so a reply costs one stat per
+    loaded file and a file is re-hashed only when that key moves."""
+
+    def __init__(self, root, hashes: dict) -> None:
+        self.root = Path(root)
+        self.hashes = dict(hashes)
+        self._cache: dict = {}      # rel -> (stat key, changed?) — one per file
+
+    @classmethod
+    def capture(cls, modules=None, root=None) -> "_CodeStamp":
+        """Hash every loaded module whose file lies under `<root>/cli/`. A file
+        that cannot be read now is left out (nothing to compare against)."""
+        root = Path(root if root is not None else rscore.SCRIPT_DIR).resolve()
+        cli = root / "cli"
+        stamp = cls(root, {})
+        for mod in list((sys.modules if modules is None else modules).values()):
+            f = getattr(mod, "__file__", None)
+            if not f or not str(f).endswith(".py"):
+                continue
+            try:
+                path = Path(f).resolve()
+                if not path.is_relative_to(cli):
+                    continue
+                rel = path.relative_to(root).as_posix()
+                st = os.stat(path)
+                stamp.hashes[rel] = _hash_file(path)
+            except (OSError, ValueError, RuntimeError):
+                continue
+            stamp._cache[rel] = ((st.st_mtime_ns, st.st_size, st.st_ino), False)
+        return stamp
+
+    @classmethod
+    def from_record(cls, record, root=None) -> "_CodeStamp":
+        """Rebuild from a BROKER_CODE_STAMP record. `root` compares the SAME
+        loaded hashes against another tree's files (default: the record's)."""
+        if not isinstance(record, dict):
+            raise ValueError("code record is not an object")
+        files, rec_root = record.get("files"), record.get("root")
+        if (not isinstance(files, dict) or not isinstance(rec_root, str)
+                or not all(isinstance(k, str) and isinstance(v, str)
+                           for k, v in files.items())):
+            raise ValueError("code record is malformed")
+        return cls(root if root is not None else rec_root, files)
+
+    def to_record(self, pid: int) -> dict:
+        return {"pid": pid, "root": str(self.root), "files": self.hashes}
+
+    def stale_files(self) -> list:
+        """Sorted repo-relative names whose bytes under `root` differ from what
+        was loaded. Missing, unreadable, a directory now, gone between stat
+        and read — any OSError — counts as changed. Never raises for a file."""
+        out = []
+        for rel, want in self.hashes.items():
+            path = self.root / rel
+            try:
+                st = os.stat(path)
+                key = (st.st_mtime_ns, st.st_size, st.st_ino)
+                hit = self._cache.get(rel)
+                if hit is not None and hit[0] == key:
+                    changed = hit[1]
+                else:
+                    changed = _hash_file(path) != want
+                    self._cache[rel] = (key, changed)
+            except OSError:
+                self._cache.pop(rel, None)
+                changed = True
+            if changed:
+                out.append(rel)
+        return sorted(out)
+
+
+def _write_code_stamp(stamp: _CodeStamp) -> None:
+    """Best-effort: a failed write is logged and the daemon carries on (the
+    in-memory stamp still marks its replies). The tmp name is pid-unique and
+    removed by name on failure."""
+    tmp = BROKER_CODE_STAMP.with_name(f"{BROKER_CODE_STAMP.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(stamp.to_record(os.getpid())))
+        os.replace(tmp, BROKER_CODE_STAMP)
+    except OSError as e:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        print(f"broker: could not record the loaded code in {BROKER_CODE_STAMP}: {e}",
+              flush=True)
+
+
+def _drop_own_code_stamp() -> None:
+    """Remove BROKER_CODE_STAMP only when it is THIS process's record (another
+    daemon's survives). Never raises: it runs while an exception propagates."""
+    try:
+        rec = json.loads(BROKER_CODE_STAMP.read_text())
+        pid = rec.get("pid") if isinstance(rec, dict) else None
+        if type(pid) is int and pid == os.getpid():
+            BROKER_CODE_STAMP.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"broker: could not clear {BROKER_CODE_STAMP}: {e}", flush=True)
+
+
+_RESTART = "research broker stop && research broker start"
+
+
+def _code_report(pid: int, caller_root=None) -> tuple:
+    """Lines saying whether the daemon `pid` runs the code on disk, and whether
+    that is an alarm. Compared against the tree the daemon was started from;
+    when the caller is in another tree, that tree is compared too."""
+    caller = Path(caller_root if caller_root is not None else rscore.SCRIPT_DIR).resolve()
+    try:
+        rec = json.loads(BROKER_CODE_STAMP.read_text())
+        rec_pid = rec.get("pid") if isinstance(rec, dict) else None
+        if type(rec_pid) is not int or rec_pid != pid:
+            raise ValueError("record names another daemon")
+        stamp = _CodeStamp.from_record(rec)
+    except (OSError, ValueError):
+        return ([ "  code: UNKNOWN — no record of the code this broker loaded "
+                  "(it predates code tracking)",
+                 f"    restart it to load the code on disk: {_RESTART}"], True)
+    lines, alarm = [], False
+    stale = stamp.stale_files()
+    if stale:
+        lines += [f"  code: STALE — changed since the broker started: {', '.join(stale)}",
+                  f"    restart it to load the code on disk: {_RESTART}"]
+        alarm = True
+    else:
+        lines.append("  code: current")
+    if caller != stamp.root:
+        lines.append(f"  started from: {stamp.root} (not this tree)")
+        mine = _CodeStamp.from_record(rec, root=caller).stale_files()
+        if mine:
+            lines += [f"  this tree: DIFFERS from the code the broker loaded: {', '.join(mine)}",
+                      f"    to run this tree's code, restart the broker from here: {_RESTART}"]
+            alarm = True
+        else:
+            lines.append("  this tree: matches the code the broker loaded")
+    return lines, alarm
+
+
 def _read_pid():
     try:
         return int(BROKER_PIDFILE.read_text().strip())
@@ -2902,11 +3081,17 @@ def _running() -> bool:
 def _clear_pidfile() -> None:
     with contextlib.suppress(FileNotFoundError):
         BROKER_PIDFILE.unlink()
+    with contextlib.suppress(FileNotFoundError):
+        BROKER_CODE_STAMP.unlink()
 
 
 def start() -> None:
     if _running():
-        print(f"broker already running (pid {_read_pid()}, socket {BROKER_SOCKET})")
+        pid = _read_pid()
+        print(f"broker already running (pid {pid}, socket {BROKER_SOCKET})")
+        lines, alarm = _code_report(pid)
+        if alarm:
+            print("\n".join(lines))
         return
     BROKER_DIR.mkdir(parents=True, exist_ok=True)
     research_py = rscore.SCRIPT_DIR / "research.py"
@@ -2954,6 +3139,7 @@ def status() -> None:
         missing = "" if BROKER_SOCKET.exists() else "  (MISSING!)"
         print(f"broker running (pid {pid})")
         print(f"  socket: {BROKER_SOCKET}{missing}")
+        print("\n".join(_code_report(pid)[0]))
     else:
         print("broker not running")
 
