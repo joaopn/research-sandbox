@@ -5927,25 +5927,30 @@ function infoIcon(text) {
     return { icon, detail };
 }
 
-// A bordered box (the box window's Settings look) whose title is a button that
-// folds its contents away; it opens collapsed. Deliberately NOT a `.field`: its
-// label/input rules would restyle the tickboxes inside (the `.field` bleed).
-// Collapsing only hides: every control keeps its value and is still sent.
-function collapsibleBox(title, children, extraClass) {
+// A bordered box (the box window's Settings look, or `baseClass`'s) whose title
+// is a button that folds its contents away; it opens collapsed. Deliberately
+// NOT a `.field`: its label/input rules would restyle the tickboxes inside (the
+// `.field` bleed). Collapsing only hides: every control keeps its value and is
+// still sent.
+function collapsibleBox(title, children, extraClass, baseClass) {
     const caret = el("span", { class: "box-collapse-caret" }, ["▸"]);
     const head = el("button", { type: "button", class: "box-collapse-head",
                                 "aria-expanded": "false" }, [caret, title]);
-    const box = el("div", { class: "box-settings box-collapsible" +
+    const box = el("div", { class: (baseClass || "box-settings") + " box-collapsible" +
                                    (extraClass ? " " + extraClass : "") }, [
         head,
         el("div", { class: "box-collapse-body" }, children),
     ]);
-    head.onclick = () => {
-        const open = box.classList.toggle("open");
-        caret.textContent = open ? "▾" : "▸";
-        head.setAttribute("aria-expanded", open ? "true" : "false");
-    };
+    head.onclick = () => setCollapsibleOpen(box, !box.classList.contains("open"));
     return box;
+}
+
+// Open or fold a collapsibleBox, keeping its caret and aria-expanded in step.
+function setCollapsibleOpen(box, open) {
+    if (box.classList.contains("open") !== open) box.classList.toggle("open");
+    const head = box.children[0];
+    head.children[0].textContent = open ? "▾" : "▸";
+    head.setAttribute("aria-expanded", open ? "true" : "false");
 }
 
 // A comma-separated folder field → its trimmed, non-empty entries. The server
@@ -7264,33 +7269,28 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
     ]);
     authGroup.style.display = "none";
     authCb.onchange = () => { authGroup.style.display = authCb.checked ? "" : "none"; };
-    // Settings region — the extensions as bordered cards inside a single
-    // bordered box (mirrors the box window); the agents have their own section
-    // above (I33). No raw <input> lives here (only cards), so the
-    // .field input{width:100%} bleed doesn't apply.
-    const settingsRegion = el("div", { class: "field box-settings" }, [
-        el("div", { class: "box-settings-label" }, ["Settings"]),
-        el("div", { class: "box-opt-group" }, [
-            el("div", { class: "box-opt-caption" }, ["Extensions"]),
-            // Node is substrate-agnostic (all flavors); reader is dind-only;
-            // rs-fetch is any-workflow-but-dev (the dev supervisor is the
-            // agent's own container — from_kwargs refuses it, so no dead-end
-            // control there). Node must appear on BOTH branches of the
-            // isDocker fork — the docker box is where node-based store
-            // workflows (open-knowledge) run.
-            el("div", { class: "box-opt-cards" },
-               isDocker ? [editorCard, fetchCard, nodeCard,
-                           ...(showHistory ? [projHistoryCard] : [])]
-                        : (isDev ? [editorCard, readerCard, nodeCard]
-                                 : [editorCard, fetchCard, readerCard, nodeCard])),
-            ...(showHistory ? [projHistoryHint] : []),
-        ]),
-    ]);
+    // The Extensions box — the extensions as bordered cards in a box that
+    // opens folded, like the box window's; the agents have their own section
+    // above (I33). Folding only hides: the payload reads every card as before.
+    const extensionsBox = collapsibleBox("Extensions", [
+        // Node is substrate-agnostic (all flavors); reader is dind-only;
+        // rs-fetch is any-workflow-but-dev (the dev supervisor is the
+        // agent's own container — from_kwargs refuses it, so no dead-end
+        // control there). Node must appear on BOTH branches of the
+        // isDocker fork — the docker box is where node-based store
+        // workflows (open-knowledge) run.
+        el("div", { class: "box-opt-cards" },
+           isDocker ? [editorCard, fetchCard, nodeCard,
+                       ...(showHistory ? [projHistoryCard] : [])]
+                    : (isDev ? [editorCard, readerCard, nodeCard]
+                             : [editorCard, fetchCard, readerCard, nodeCard])),
+        ...(showHistory ? [projHistoryHint] : []),
+    ], "create-extensions");
 
     // Clone-a-repo group: the light-path repo/ref/setup fields, shown only when
-    // the operator opts in (and only showInBox). Agent moved out to Settings
-    // above; the PAT moved down into the collapsed Authentication sub-box, which
-    // now holds every credential/identity field for the clone.
+    // the operator opts in (and only showInBox). The agents have their own
+    // section above; the PAT moved down into the collapsed Authentication
+    // sub-box, which now holds every credential/identity field for the clone.
     const cloneCb = el("input", { type: "checkbox" });
     const cloneToggle = el("label", { class: "mgmt-check" }, [cloneCb, " clone a git repo"]);
     const cloneGroup = el("div", { class: "mgmt-docker-group" }, [
@@ -7358,15 +7358,12 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
     };
     // The tokens the payload sends: split on commas, trimmed, empties dropped.
     const mountPaths = () => parseFolderList(mountI.value);
-    // The Sharing box: everything that adds folders to the project, in a
-    // bordered sub-box like Settings. Deliberately NOT a `.field` (Settings is
-    // one, and its label/input rules would restyle the tickbox and its label);
-    // the `.create-sharing` margin stands in for `.field`'s.
-    const sharingBox = el("div", { class: "box-settings create-sharing" }, [
-        el("div", { class: "box-settings-label" }, ["Sharing"]),
+    // The Sharing box: everything that adds folders to the project, in a box
+    // that opens folded, like Extensions above it.
+    const sharingBox = collapsibleBox("Sharing", [
         mountToggle,
         mountGroup,
-    ]);
+    ], "create-sharing");
 
     // Dev variant inputs — its OWN url/PAT fields, NOT the light-path repoI/patI
     // (different semantics: this URL is mirrored into the shared Gitea and the
@@ -7426,7 +7423,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             el("div", { class: "field" }, [el("label", {}, ["Egress"]), egressS]),
             agentsSection,
             enableField,
-            settingsRegion,
+            extensionsBox,
             ...(showClone ? [cloneToggle, cloneGroup] : []),
             sharingBox,
             el("div", { class: "hint" }, [
@@ -7471,10 +7468,16 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             // data-folder check itself is server-side only.
             if (mountCb.checked) {
                 const paths = mountPaths();
+                // A folder error opens Sharing (it may have been folded since
+                // the tick) and puts the cursor in the field it names.
+                const bad = paths.find((s) => s.startsWith("/") || s.startsWith("~"));
+                if (!paths.length || bad) {
+                    setCollapsibleOpen(sharingBox, true);
+                    mountI.focus();
+                }
                 // Ticked with nothing typed would silently create a project with no
                 // mount (the payload omits an empty list) — say so instead.
                 if (!paths.length) return "Enter at least one folder, or untick \"Add folders\".";
-                const bad = paths.find((s) => s.startsWith("/") || s.startsWith("~"));
                 if (bad) return "Folder paths are relative to RS's data folder (got: " + bad + ").";
             }
             // Mirror the from_kwargs auth refusals so they surface in the form
@@ -10093,17 +10096,32 @@ function openProjectConfigBox(project, anchorEl) {
 
     // position: fixed, anchored under the gear, clamped to the viewport. The
     // rail can shrink to RAIL_WIDTH_MIN, so the box overlays outside the
-    // rail rather than trying to fit inside it.
+    // rail rather than trying to fit inside it. The gear's spot is read once:
+    // a rail rebuild while the box is open may detach the gear itself.
     const r = anchorEl.getBoundingClientRect();
-    const bw = box.offsetWidth;
-    const bh = box.offsetHeight;
-    let left = r.left;
-    let top = r.bottom + 4;
-    if (left + bw > window.innerWidth - 8) left = window.innerWidth - 8 - bw;
-    if (left < 8) left = 8;
-    if (top + bh > window.innerHeight - 8) top = Math.max(8, r.top - 4 - bh);
-    box.style.left = `${Math.round(left)}px`;
-    box.style.top = `${Math.round(top)}px`;
+    // The box is capped to the room left below its top (style.css reads
+    // --config-room), so sections that load or unfold later scroll inside it
+    // instead of running off the window; the cap is lifted while measuring.
+    const place = () => {
+        box.style.removeProperty("--config-room");
+        const bw = box.offsetWidth;
+        const bh = box.offsetHeight;
+        let left = r.left;
+        let top = r.bottom + 4;
+        if (left + bw > window.innerWidth - 8) left = window.innerWidth - 8 - bw;
+        if (left < 8) left = 8;
+        if (top + bh > window.innerHeight - 8) top = Math.max(8, r.top - 4 - bh);
+        box.style.left = `${Math.round(left)}px`;
+        box.style.top = `${Math.round(top)}px`;
+        box.style.setProperty("--config-room",
+                              `${Math.max(0, Math.round(window.innerHeight - 8 - top))}px`);
+    };
+    place();
+    // Unfolding Sharing grows the box; place it again with the new height (it
+    // runs after the fold's own click handler, which is set first), so it can
+    // move up to show what unfolded.
+    const sharingHead = box.querySelector(".config-sharing > .box-collapse-head");
+    if (sharingHead) sharingHead.addEventListener("click", place);
 
     document.addEventListener("pointerdown", onConfigOutsidePointer, true);
 }
@@ -10827,13 +10845,13 @@ async function fillPassthroughList(view, table) {
 // ⚙ Sharing: everything that shares folders with the project, in one bordered
 // box on every project (stopped ones and ones whose tabs never loaded too) —
 // the project's own folders, then, on a dind project with boxes, Box folders.
-// `enabled` is null in the panel's short form (no tabs loaded), where only the
-// project's folders show.
+// It opens folded at every gear open; openProjectConfigBox re-places the panel
+// when it unfolds. `enabled` is null in the panel's short form (no tabs
+// loaded), where only the project's folders show.
 function appendSharingSection(box, project, enabled) {
-    const sharing = el("div", { class: "config-sharing" }, [
-        el("div", { class: "config-sharing-label" }, ["Sharing"]),
-    ]);
-    box.appendChild(sharing);
+    const sharingBox = collapsibleBox("Sharing", [], null, "config-sharing");
+    box.appendChild(sharingBox);
+    const sharing = sharingBox.children[1];
     appendProjectFoldersSection(sharing, project);
     if (enabled) appendBoxFoldersSection(sharing, project, enabled);
 }

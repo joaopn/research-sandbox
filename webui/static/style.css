@@ -360,6 +360,11 @@ html.mobile .project-rail .rail-separator { cursor: default; }
     padding: 10px 12px;
     font-size: 13px;
     color: var(--fg-base);
+    /* Scroll rather than run off the bottom: openProjectConfigBox sets
+       --config-room to the room below the box's top (the phone rule below
+       caps it lower). */
+    max-height: var(--config-room, calc(100vh - 16px));
+    overflow-y: auto;
 }
 .project-config-box .config-title {
     font-weight: 600;
@@ -1538,10 +1543,6 @@ html.mobile .project-rail .rail-separator { cursor: default; }
     padding: 10px 12px;
 }
 .box-settings-label { font-weight: 600; color: var(--fg-base); margin-bottom: 8px; }
-/* The create dialog's Sharing box (app.js sharingBox): a bordered box like
-   Settings but not a .field, so it takes .field's bottom margin here, plus a
-   top margin so the inline clone tickbox above does not sit on its border. */
-.create-sharing { margin: 8px 0 12px; }
 /* The box window's Extensions and Sharing boxes (app.js collapsibleBox): the
    same bordered box below Settings, taking .field's bottom margin since they
    are not one. The title is a button that folds the contents; closed by
@@ -1568,6 +1569,9 @@ html.mobile .project-rail .rail-separator { cursor: default; }
 .box-collapsible:not(.open) > .box-collapse-body { display: none; }
 /* A phone has no hover and a fingertip is wider than one text line. */
 html.mobile .box-collapse-head { padding: 8px 0; }
+/* The create dialog's Sharing box: a top margin so the inline clone tickbox
+   above does not sit on its border. */
+.box-collapsible.create-sharing { margin-top: 8px; }
 .box-opt-group { margin: 8px 0; }
 .box-opt-caption {
     font-size: 12px;
@@ -1644,16 +1648,16 @@ html.mobile .box-collapse-head { padding: 8px 0; }
 html.mobile .project-config-box .config-folders-input { font-size: 16px; }
 .project-config-box .config-box-warn { color: var(--warn-fg); }
 /* The ⚙ Sharing box (app.js appendSharingSection): the project's folders and,
-   on a project with boxes, Box folders, in one bordered sub-box like the create
-   dialog's Sharing box. */
+   on a project with boxes, Box folders, in one bordered sub-box that opens
+   folded, like the create dialog's Sharing box. */
 .project-config-box .config-sharing {
     margin: 10px 0 4px;
     padding: 6px 8px;
     border: 1px solid var(--border);
     border-radius: 6px;
 }
-.project-config-box .config-sharing-label { font-weight: 600; margin-bottom: 6px; }
-.project-config-box .config-sharing > .config-section + .config-section { margin-top: 10px; }
+.project-config-box .config-sharing.open > .box-collapse-head { margin-bottom: 6px; }
+.project-config-box .config-sharing .box-collapse-body > .config-section + .config-section { margin-top: 10px; }
 .project-config-box .config-save-row { justify-content: flex-end; }
 .box-settings .mgmt-check {
     display: inline-flex;
