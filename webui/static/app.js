@@ -6844,10 +6844,10 @@ const MODEL_PICKER_SPECS = [
     ["role", "Role-MCPs", "Tool services workers call — one session per tool-call."],
 ];
 
-function mgmtCreateDialog(view, manifest, agents, nodePresent, mountRoots, giteaEnabled) {
+function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEnabled) {
     manifest = manifest || {};
     agents = Array.isArray(agents) ? agents : [];
-    mountRoots = Array.isArray(mountRoots) ? mountRoots : [];
+    dataDir = typeof dataDir === "string" ? dataDir : "";
     const workflow = manifest.name || "research";
     const isDocker = manifest.substrate === "docker";
     const hasWorkerLayer = !!manifest.has_worker_layer;
@@ -7295,36 +7295,43 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, mountRoots, gitea
     const showClone = showInBox && !manifest.web;
     if (!showClone) cloneCb.checked = false;
 
-    // Mount folders (read-only, at /workspace/mnt/<name>/ — the webui path
-    // to what the host CLI's --mount does). Offered ONLY when the host
-    // declared mountable roots (the workflows verb's `mount_roots`): no
-    // roots ⇒ no control at all (no dead-end control, and the browser never
-    // names the host-side declaration). The broker is the gate — every path is
-    // resolved server-side and refused outside the declared roots — so the
-    // check below is an affordance. Not on the dev dialog: that POSTs to the
-    // detached dev lane, whose field set has no `mount`. Same shape as the clone
-    // group: a `.mgmt-check` toggle OUTSIDE any `.field` (the `.field` bleed
-    // rule), the group collapsed until ticked.
-    const showMount = !isDev && mountRoots.length > 0;
+    // Add folders (read-only, at /workspace/mnt/<name>/ — the webui path to
+    // what the host CLI's --mount does), on every workflow, dev included.
+    // Paths are RELATIVE to RS's data folder; the broker appends the folder and
+    // refuses anything else (an absolute path, "..", a link, a location outside
+    // it), so the check below is an affordance. Same shape as the clone group:
+    // a `.mgmt-check` toggle OUTSIDE any `.field` (the `.field` bleed rule),
+    // the group collapsed until ticked; the explanation rides an ⓘ.
     const mountCb = el("input", { type: "checkbox" });
-    const mountToggle = el("label", { class: "mgmt-check" }, [mountCb, " Mount folders"]);
+    const mountToggle = el("label", { class: "mgmt-check" }, [mountCb, " Add folders"]);
     const mountI = el("input", { type: "text", autocomplete: "off",
-                                placeholder: mountRoots[0] ? mountRoots[0] + "/my-dataset" : "" });
+                                placeholder: "my-dataset, surveys/2024" });
+    const mountInfo = infoIcon(
+        "Comma-separated paths relative to RS's data folder on this host" +
+        (dataDir ? " (" + dataDir + ")" : "") + ", for example my-dataset or " +
+        "surveys/2024. Each is mounted read-only at /workspace/mnt/<last name>/ " +
+        "inside the project: the agent, every worker and every role service " +
+        "see it, and a box when it is given to it. A folder that does not exist " +
+        "yet is created. Put datasets in the data folder, or mount another disk " +
+        "into it on the host; a link pointing out of it is refused.");
     const mountGroup = el("div", { class: "mgmt-docker-group" }, [
-        el("div", { class: "field" }, [el("label", {}, ["Host paths (comma-separated)"]), mountI]),
+        el("div", { class: "box-opt-caption" }, ["Folders in RS's data folder ", mountInfo.icon]),
+        mountInfo.detail,
+        // Wrapped in a .field for the shared input style (and the 16px mobile
+        // rule that stops iOS zooming on focus); no <label> inside, so the
+        // .field label bleed does not apply.
+        el("div", { class: "field" }, [mountI]),
         el("div", { class: "hint" }, [
-            "Each folder is mounted read-only at /workspace/mnt/<name>/ inside " +
-            "the project (its final directory name), visible to the agent, every " +
-            "worker and every role service, and to a box when given to it; a " +
-            "path that does not exist yet is " +
-            "created. Paths must lie under one of the mountable roots declared " +
-            "on this host: " + mountRoots.join(", ") + ".",
+            "Read-only in the project at /workspace/mnt/<name>/.",
         ]),
     ]);
     mountGroup.style.display = "none";
-    mountCb.onchange = () => { mountGroup.style.display = mountCb.checked ? "" : "none"; };
+    mountCb.onchange = () => {
+        mountGroup.style.display = mountCb.checked ? "" : "none";
+        if (mountCb.checked) mountI.focus();
+    };
     // The tokens the payload sends: split on commas, trimmed, empties dropped.
-    const mountPaths = () => mountI.value.split(",").map((s) => s.trim()).filter((s) => s);
+    const mountPaths = () => parseFolderList(mountI.value);
 
     // Dev variant inputs — its OWN url/PAT fields, NOT the light-path repoI/patI
     // (different semantics: this URL is mirrored into the shared Gitea and the
@@ -7386,7 +7393,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, mountRoots, gitea
             enableField,
             settingsRegion,
             ...(showClone ? [cloneToggle, cloneGroup] : []),
-            ...(showMount ? [mountToggle, mountGroup] : []),
+            mountToggle, mountGroup,
             el("div", { class: "hint" }, [
                 "Creating stages container images and can take 10–30s (longer cold).",
             ]),
@@ -7425,15 +7432,15 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, mountRoots, gitea
             if (showClone && cloneCb.checked && repoI.value.trim() && !refI.value.trim()) {
                 return "A workflow repo requires a ref.";
             }
-            // Mirror the broker gate's first refusal (an absolute host path); the
-            // root check itself is server-side only.
-            if (showMount && mountCb.checked) {
+            // Mirror the broker gate's first refusal (an absolute path); the
+            // data-folder check itself is server-side only.
+            if (mountCb.checked) {
                 const paths = mountPaths();
                 // Ticked with nothing typed would silently create a project with no
                 // mount (the payload omits an empty list) — say so instead.
-                if (!paths.length) return "Enter at least one host folder to mount, or untick \"Mount folders\".";
-                const bad = paths.find((s) => !s.startsWith("/"));
-                if (bad) return "Mounted folders must be absolute host paths (got: " + bad + ").";
+                if (!paths.length) return "Enter at least one folder, or untick \"Add folders\".";
+                const bad = paths.find((s) => s.startsWith("/") || s.startsWith("~"));
+                if (bad) return "Folder paths are relative to RS's data folder (got: " + bad + ").";
             }
             // Mirror the from_kwargs auth refusals so they surface in the form
             // rather than as a failed op. Read the key the same way the payload
@@ -7493,6 +7500,12 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, mountRoots, gitea
                 if (readerCb.checked) devEnable.push("reader");
                 if (nodeCb.checked) devEnable.push("node");
                 if (devEnable.length) payload.enable = devEnable;
+                // Folders ride as a LIST only when ticked and non-empty; the
+                // dev request resolves them against RS's data folder.
+                if (mountCb.checked) {
+                    const paths = mountPaths();
+                    if (paths.length) payload.mount = paths;
+                }
                 return fetch("/broker/dev/project", {
                     method: "POST", headers: { "Content-Type": "application/json" },
                     body: JSON.stringify(payload),
@@ -7535,11 +7548,11 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, mountRoots, gitea
             // reader; the docker box is exactly where node-based workflows run.
             if (nodeCb.checked) enableTokens.push("node");
             if (enableTokens.length) payload.enable = enableTokens;
-            // Mounted folders ride as a LIST only when ticked and non-empty.
+            // Folders ride as a LIST only when ticked and non-empty.
             // Lockstep: `mount` is deliberately NOT in CREATE_WEBUI_FIELDS — the
-            // broker honours it through its root gate (_verb_create) and refuses
-            // anything outside MOUNT_ROOTS before creating anything.
-            if (showMount && mountCb.checked) {
+            // broker honours it through its data-folder gate (_verb_create) and
+            // refuses anything outside RS's data folder before creating anything.
+            if (mountCb.checked) {
                 const paths = mountPaths();
                 if (paths.length) payload.mount = paths;
             }
@@ -7655,9 +7668,9 @@ function renderWorkflowsScreen(view, result) {
     }
     agents.forEach((a) => { if (a) a.isDefault = a.name === defaultAgent; });
     const nodePresent = !!result.node_present;   // STAGE_NODE_SEED: Node tickbox affordance
-    // Host-declared browser-mountable roots: the create dialog's "Mount folders"
-    // control exists only when this is non-empty. Refetched per render (no cache).
-    const mountRoots = Array.isArray(result.mount_roots) ? result.mount_roots : [];
+    // RS's data folder, named in the create dialog's "Add folders" ⓘ (every
+    // browser folder path is relative to it). Refetched per render (no cache).
+    const dataDir = typeof result.data_dir === "string" ? result.data_dir : "";
     const giteaEnabled = !!result.gitea_enabled;   // offers a history workflow's switch
     const explain = new Set(state.explainIndex || []);
     // A card's section: its declared group, else Store — the catch-all for a
@@ -7690,7 +7703,7 @@ function renderWorkflowsScreen(view, result) {
             el("div", { class: "workflows-card-desc" }, [m.description || ""]),
             el("div", { class: "workflows-card-actions" }, [tagsEl, action]),
         ]);
-        card.onclick = () => mgmtCreateDialog(view, m, agents, nodePresent, mountRoots,
+        card.onclick = () => mgmtCreateDialog(view, m, agents, nodePresent, dataDir,
                                               giteaEnabled);
         return card;
     };

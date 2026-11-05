@@ -2115,86 +2115,176 @@ def project_ssh_port_range() -> tuple[int, int]:
     return lo, hi
 
 
-# Browser-mountable roots (the webui create dialog's "Mount folders"). The
-# operator declares, once and host-side, the subtrees a BROWSER-created project
-# may bind-mount read-only under /workspace/mnt/<basename>/; the broker
-# refuses any relayed path that does not resolve (symlinks followed) to a
-# location at or under one of them. Host-side by construction: the webui can
-# never widen this list (it lives in the tracked .env, which no broker verb
-# writes). Read FRESH per request through read_env_value, like the SSH-port
-# block above — an edit takes effect on the next create with no restart. The
-# host CLI's --mount is NOT gated: that caller already holds a host shell. The
-# key name is a lockstep with .env.example (pytest-pinned).
-MOUNT_ROOTS_KEY = "MOUNT_ROOTS"
+# The browser's project folders (the create dialog's "Add folders", on every
+# workflow, dev included) are paths RELATIVE to RS's own data folder,
+# <RS folder>/data/ — fixed, never a setting (maintainer, 2026-11-05). A
+# configurable base would be exactly the widening the host-root ruling forbids
+# ("only accept relative paths, and in the backend append the host's path").
+# The projects folder is NOT a usable base: a project's workspace carries its
+# logins while it restarts and its git/ssh material, so mounting another
+# project's folder would hand over its credentials. The folder is gitignored.
+# Datasets are put there; a host bind mount of another disk into it works, a
+# link pointing out of it does not (links are refused at every level, below).
+# The host CLI's --mount is NOT gated: that caller already holds a host shell.
+DATA_DIR_NAME = "data"
 
 
-def _resolve_host_path(raw: str, what: str) -> Path:
-    """Resolve an absolute host path string for the mount gate.
+def rs_data_dir() -> Path:
+    """<RS folder>/data — a pure function of the repo root. Reading it never
+    creates it: the folder appears when the first create mounts something
+    (``_prepare_mounts`` makes a missing path, parents included)."""
+    return SCRIPT_DIR / DATA_DIR_NAME
 
-    Non-strict, so a not-yet-existing tail (a directory create() will mkdir)
-    resolves as far as it exists; symlinks are followed, which is the whole
-    point — the gate compares REAL locations. A relative or ``~`` path would
-    resolve against the broker's cwd/home, so it is refused outright. resolve()
-    raises ValueError/OSError on a path the OS cannot lstat (an embedded NUL
-    from a JSON body, an over-long component); those become ValidationError
-    so the broker answers with an envelope instead of a truncated reply (its
-    dispatch maps only ValidationError/HarnessError/SystemExit)."""
-    if not raw.startswith("/"):
-        raise ValidationError(f"{what} must be an absolute host path: {raw}")
+
+def _data_folder_problem(data: Path) -> str:
+    """Why RS's data folder cannot take mounts right now, or "". Absent is
+    fine (the first create makes it). Wording names the folder by role only:
+    the text reaches the browser verbatim."""
     try:
-        return Path(raw).resolve()
+        st = os.lstat(data)
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return "RS's data folder could not be read"
+    if stat.S_ISLNK(st.st_mode):
+        return "RS's data folder is a link; it must be a real folder"
+    if not stat.S_ISDIR(st.st_mode):
+        return "RS's data folder is not a folder"
+    return ""
+
+
+def _data_level_problem(data: Path, parts: Sequence[str]) -> str:
+    """Why the path ``parts`` under the data folder cannot be mounted, or "":
+    every EXISTING level must be a real folder (lstat only, nothing followed);
+    the first missing level ends the walk (create makes the rest). Wording
+    names only the relative path."""
+    cur = data
+    for i, c in enumerate(parts):
+        cur = cur / c
+        here = "/".join(parts[:i + 1])[:64]
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            return ""
+        except OSError:
+            return f"folder {here!r} could not be read"
+        if stat.S_ISLNK(st.st_mode):
+            return (f"{here!r} is a link; only real folders in RS's data "
+                    f"folder can be mounted")
+        if not stat.S_ISDIR(st.st_mode):
+            return f"{here!r} is not a folder"
+    return ""
+
+
+def resolve_data_mount_paths(paths: Sequence[str]) -> tuple[str, ...]:
+    """The browser mount gate: each requested path is RELATIVE to RS's data
+    folder; the backend appends the folder. Returns the absolute host paths,
+    de-duplicated, in request order — what CreateRequest.mount takes.
+
+    Refused, before any side effect, with text naming only the relative path
+    (never a host path): an absolute or ``~`` path; an empty, ``.`` or ``..``
+    level or a character outside the closed folder charset (it reaches
+    docker's ``-v src:dst:ro`` spec, where ``:`` and ``,`` carry meaning); a
+    link or a file at any EXISTING level (a link could point anywhere the RS
+    user can read; the host daemon follows it); a location that does not
+    resolve strictly under the data folder (belt and braces over the level
+    walk, which already rules it out); two paths with the same last name
+    (both would mount at /workspace/mnt/<name>/); and a data folder that is a
+    link, not a folder, or overlaps the projects folder (either inside the
+    other). A missing tail is fine — create makes it, as before.
+    Residual (accepted): a level swapped for a link between this check and
+    create's mount needs write access inside the data folder on the host."""
+    # Nothing asked for ⇒ nothing to check: a create with no folders must never
+    # be refused over the data folder's state.
+    if not any(isinstance(p, str) and p.strip() for p in paths):
+        if any(not isinstance(p, str) for p in paths):
+            raise ValidationError("invalid folder path")
+        return ()
+    data = rs_data_dir()
+    problem = _data_folder_problem(data)
+    if problem:
+        raise ValidationError(problem)
+    # A bad .env value: its own ValidationError passes through as itself;
+    # anything else (a non-integer setting, an unreadable file) becomes a
+    # path-free ValidationError, the only kind the broker's dispatch maps.
+    try:
+        cfg = load_config()
+    except ValidationError:
+        raise
     except (ValueError, OSError):
-        raise ValidationError(f"{what} is not a usable host path: {raw!r}")
-
-
-def mount_roots() -> tuple[Path, ...]:
-    """The declared browser-mountable roots from .env, RESOLVED and de-duplicated
-    (order kept). Unset or empty ⇒ (). A relative entry raises ValidationError
-    naming the KEY only (the text reaches the browser verbatim through the
-    workflows and create verbs — no file, no remedy), same wording rule as
-    project_ssh_port_range."""
-    raw = read_env_value(MOUNT_ROOTS_KEY)
-    roots: list[Path] = []
-    for entry in raw.split(","):
-        entry = entry.strip()
-        if not entry:
-            continue
-        r = _resolve_host_path(entry, f"{MOUNT_ROOTS_KEY} entry")
-        if r not in roots:
-            roots.append(r)
-    return tuple(roots)
-
-
-def resolve_mount_paths_within_roots(paths: Sequence[str],
-                                     roots: Sequence[Path]) -> tuple[str, ...]:
-    """The browser mount gate: resolve each requested host path and refuse
-    it unless it is one of ``roots`` or lies strictly under one. Returns the
-    RESOLVED paths as strings, de-duplicated (two spellings of one target — a
-    symlink and its target — collapse here, else create()'s own basename
-    collision check would self-collide), in request order.
-
-    Deliberately NOT checked here: basename collisions and exists-but-not-a-dir
-    — create()'s mount block keeps those for both front-ends. The refusal text
-    shows the RESOLVED path so a symlink escape is visible for what it is.
-    Residual (accepted): a symlink swapped between this resolve and create()'s
-    own resolve of the same string is a host-side race that needs write access
-    inside a declared root — the trust the declaration already grants."""
+        raise ValidationError("RS's settings could not be read")
+    try:
+        data_real = data.resolve()
+        projects = Path(cfg.projects_dir).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        raise ValidationError("RS's data folder could not be resolved")
+    # A data-folder path that is not valid UTF-8 would fail every later step
+    # that prints, logs or records it (after a folder was already made), so it
+    # is refused here, once.
+    try:
+        str(data_real).encode()
+    except UnicodeEncodeError:
+        raise ValidationError(
+            "RS's folder path is not valid UTF-8, so folders cannot be "
+            "mounted from the browser")
+    # The file system's own limits (a level's name, the whole path), read from
+    # the existing RS folder: a path over them is refused here rather than
+    # failing half-made in create's mkdir with a host path in its text.
+    try:
+        name_max = os.pathconf(SCRIPT_DIR, "PC_NAME_MAX")
+        path_max = os.pathconf(SCRIPT_DIR, "PC_PATH_MAX")
+    except (OSError, ValueError):
+        name_max = path_max = None
+    if (projects == data_real or projects in data_real.parents
+            or data_real in projects.parents):
+        raise ValidationError(
+            "RS's data folder and the projects folder overlap, so folders "
+            "cannot be mounted from the browser")
     out: list[str] = []
+    lasts: dict[str, str] = {}
     for raw in paths:
-        raw = raw.strip()
-        if not raw:
+        shown = raw[:64] if isinstance(raw, str) else type(raw).__name__
+        if not isinstance(raw, str):
+            raise ValidationError(f"invalid folder path {shown!r}")
+        n = raw.strip()
+        if not n:
             continue
-        p = _resolve_host_path(raw, "mount path")
-        if not roots:
+        if n.startswith(("/", "~")):
             raise ValidationError(
-                "no mountable roots are declared on this host")
-        if not any(p == r or r in p.parents for r in roots):
+                f"folder path {shown!r} must be relative to RS's data folder "
+                f"(for example my-dataset or surveys/2024)")
+        rel = n.rstrip("/")
+        parts = rel.split("/")
+        if not rel or not all(_valid_box_folder(c) for c in parts):
             raise ValidationError(
-                f"mount path {p} is outside the declared mountable roots "
-                f"({', '.join(str(r) for r in roots)})")
-        s = str(p)
-        if s not in out:
-            out.append(s)
+                f"invalid folder path {shown!r} (names of letters, digits, "
+                f"'.', '_' or '-' joined by '/')")
+        # pathconf answers -1 when the file system states no limit.
+        if ((name_max is not None and name_max > 0
+             and any(len(c.encode()) > name_max for c in parts))
+                or (path_max is not None and path_max > 0
+                    and len(os.fsencode(data_real / rel)) >= path_max)):
+            raise ValidationError(f"folder path {shown!r} is too long")
+        problem = _data_level_problem(data, parts)
+        if problem:
+            raise ValidationError(problem)
+        try:
+            target = (data_real / rel).resolve()
+        except (OSError, RuntimeError, ValueError):
+            raise ValidationError(f"folder path {shown!r} could not be resolved")
+        if data_real not in target.parents:
+            raise ValidationError(
+                f"folder path {shown!r} is not inside RS's data folder")
+        s = str(target)
+        if s in out:
+            continue
+        last = parts[-1]
+        if last in lasts:
+            raise ValidationError(
+                f"{lasts[last]!r} and {rel[:64]!r} would both mount at "
+                f"/workspace/mnt/{last}/; each folder needs a distinct last name")
+        lasts[last] = rel[:64]
+        out.append(s)
     return tuple(out)
 
 
@@ -2202,8 +2292,8 @@ def _prepare_mounts(paths: Sequence[str]) -> tuple[dict[str, Path], list[str]]:
     """Turn the requested host folders into (basename → host source, docker -v
     args), each landing read-only at /workspace/mnt/<basename>/, creating a
     missing directory (so a producer can start writing into it later). Shared
-    by both front-ends — the CLI's --mount and the webui's root-gated `mount`
-    field — so every refusal text here reaches the browser
+    by both front-ends — the CLI's --mount and the webui's data-folder-gated
+    `mount` field — so every refusal text here reaches the browser
     verbatim: flag-neutral, no host-filesystem remedy. Refusals are die()
     (a `failed` envelope through the broker; the CLI's normal exit), and a
     filesystem error while preparing a path (a file where a directory is
@@ -2218,14 +2308,20 @@ def _prepare_mounts(paths: Sequence[str]) -> tuple[dict[str, Path], list[str]]:
         if not raw:
             continue
         p = Path(raw).expanduser().resolve()
+        # A path inside RS's data folder (the browser's) is named relative to
+        # it, so no host path reaches the browser through these texts.
+        try:
+            shown = f"{p.relative_to(rs_data_dir().resolve())} (in RS's data folder)"
+        except (ValueError, OSError, RuntimeError):
+            shown = str(p)
         try:
             if p.exists() and not p.is_dir():
-                die(f"mount path exists but is not a directory: {p}")
+                die(f"mount path exists but is not a directory: {shown}")
             if not p.exists():
                 p.mkdir(parents=True, exist_ok=True)
                 print(f"created mount directory: {p}")
         except OSError as e:
-            die(f"mount path cannot be prepared: {p} ({e.strerror or e})")
+            die(f"mount path cannot be prepared: {shown} ({e.strerror or e})")
         base = p.name
         if not base:
             die(f"mount path has no basename (refusing to mount root): {p}")
@@ -3118,6 +3214,10 @@ class DevProjectProvisionRequest:
     # key); an explicit list is validated by the CreateRequest delegation below
     # (known agents, pulled dists, and the dev floor: at least one agent).
     agents: tuple[str, ...] | None = None
+    # Read-only project folders: relayed RELATIVE to RS's data folder and
+    # resolved here, so the broker's pre-spawn check and the child's re-run
+    # both pass the same gate; holds the absolute host paths afterwards.
+    mount: tuple[str, ...] = ()
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "DevProjectProvisionRequest":
@@ -3151,6 +3251,7 @@ class DevProjectProvisionRequest:
         # UNSET-vs-EXPLICIT split: an absent key stays None (the preset), an
         # explicit [] reaches the dev floor's agent-less refusal pre-spawn.
         raw_agents = kw.get("agents")
+        mount = resolve_data_mount_paths(_as_tuple(kw.get("mount")))
         cr = CreateRequest.from_kwargs(
             name=kw.get("name"), workflow=workflow, dev_repo=repo,
             dev_branch=kw.get("branch"),
@@ -3167,7 +3268,8 @@ class DevProjectProvisionRequest:
                    supervisor_model=cr.supervisor_model,
                    supervisor_effort=cr.supervisor_effort,
                    pi_model=cr.pi_model, pi_thinking=cr.pi_thinking,
-                   agents=None if raw_agents is None else cr.agents)
+                   agents=None if raw_agents is None else cr.agents,
+                   mount=mount)
 
 
 @dataclass
@@ -3550,7 +3652,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         die(f"invalid --egress value: {egress!r} (expected open|locked)")
 
     # Optional host-folder bind-mounts (the CLI's --mount, or the webui's
-    # `mount` field after the broker's root gate — resolve_mount_paths_within_roots
+    # `mount` field after the broker's data-folder gate — resolve_data_mount_paths
     # hands this RESOLVED absolute paths), RO inside the container, each at
     # /workspace/mnt/<basename>/. Pure host-side preparation, no container
     # yet: a refusal here leaves nothing but a directory created inside a path
@@ -16716,7 +16818,7 @@ def dev_project_provision(req: "DevProjectProvisionRequest", progress=None) -> d
         supervisor_model=req.supervisor_model,
         supervisor_effort=req.supervisor_effort,
         pi_model=req.pi_model, pi_thinking=req.pi_thinking,
-        agents=req.agents)
+        agents=req.agents, mount=req.mount)
     create(cr, progress=progress)
     return {"project": req.name, "repo": req.repo}
 

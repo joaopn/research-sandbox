@@ -1777,7 +1777,9 @@ async def broker_dev_project_handler(request: web.Request) -> web.Response:
             "pi_model": body.get("pi_model"),
             "pi_thinking": body.get("pi_thinking"),
             # The agent set; an absent key relays as None ⇒ the workflow preset.
-            "agents": body.get("agents")}
+            "agents": body.get("agents"),
+            # Read-only folders, relative to RS's data folder (the broker gates).
+            "mount": body.get("mount")}
     op_id = _mint_op_id(name if isinstance(name, str) and name else "dev",
                         "dev-project")
     try:

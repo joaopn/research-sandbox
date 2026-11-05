@@ -142,7 +142,7 @@ mkdir -p /workspace/.claude /workspace/.orchestrator/logs \
          /workspace/shared /workspace/workers \
          /workspace/.workers /workspace/staging /workspace/results
 # /workspace/mnt is the parent of the project's mounted folders (`--mount
-# PATHS` / the dialog's "Mount folders": one RO bind per host path at
+# PATHS` / the create dialog's "Add folders": one RO bind per host path at
 # /workspace/mnt/<basename>/). Docker auto-creates it root-owned when any
 # such mount lands; mkdir it here when none did, so the worker and role-MCP
 # binds of the whole mnt/ tree never trip over a missing path.

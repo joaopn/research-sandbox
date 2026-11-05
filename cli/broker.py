@@ -388,13 +388,11 @@ def _verb_workflows(_args: dict, _progress=None) -> dict:
         # real gate is from_kwargs' node floor. Same "only offer what's deployable"
         # motive as `agents` staged-state.
         "node_present": rscore.node_dist_present(),
-        # The host-declared browser-mountable roots (RESOLVED, as the gate
-        # compares them). The create form shows its "Mount folders" control
-        # ONLY when this is non-empty (no dead-end control; the declaration is
-        # a host-side bootstrap step the browser never names). A malformed
-        # entry raises ValidationError here — fail-early on the Workflows page,
-        # the SSH-port-block posture — so a misconfiguration is seen, not hidden.
-        "mount_roots": [str(r) for r in rscore.mount_roots()],
+        # RS's data folder, the base every browser folder path is relative to
+        # (the create form's "Add folders" names it in its hint so the operator
+        # knows where datasets go). Fixed, never a setting; reading it never
+        # creates it.
+        "data_dir": str(rscore.rs_data_dir()),
         # Whether the install's Gitea is enabled: the create form offers a
         # history workflow's "Keep history on Gitea" switch only then (the
         # box window's listing carries the same bit).
@@ -568,9 +566,9 @@ def _verb_start(args: dict, progress=None) -> list[dict]:
 # `workflow` is the user-facing selector (substrate + flavor are derived from its
 # manifest, never relayed); the old `type` flag is gone (WORKFLOW_TAXONOMY_S3).
 # ONE gated exception lives OUTSIDE this set: `mount` (a bind-mount SOURCE) is
-# honoured by _verb_create only through rscore's root gate — every relayed path
-# must resolve inside a host-declared MOUNT_ROOTS subtree — and is never
-# forwarded raw. It stays absent here on purpose: this set's contract ("never a
+# honoured by _verb_create only through rscore's data-folder gate — every
+# relayed path is RELATIVE to RS's data folder, which the backend appends — and
+# is never forwarded raw. It stays absent here on purpose: this set's contract ("never a
 # path/host-shaped field") is byte-for-byte unchanged, and the gate is the one
 # visibly-special line a reviewer has to look at.
 CREATE_WEBUI_FIELDS = frozenset({
@@ -649,18 +647,17 @@ UPDATE_WEBUI_FIELDS = frozenset({
 
 def _verb_create(args: dict, progress=None) -> dict:
     safe = {k: v for k, v in args.items() if k in CREATE_WEBUI_FIELDS}
-    # The webui's mounted folders (the maintainer-ruled, gated revision of the
-    # host-root boundary): a relayed `mount` never reaches from_kwargs raw. Each
-    # path is resolved (symlinks followed) and refused unless it lies at or
-    # under a root the operator declared host-side in .env (MOUNT_ROOTS, read
-    # fresh per request — no restart). What from_kwargs receives is the
-    # RESOLVED tuple. A refusal is a ValidationError BEFORE any side effect
+    # The webui's mounted folders (the maintainer-ruled host-root boundary:
+    # "only accept relative paths, and in the backend append the host's
+    # path"): a relayed `mount` never reaches from_kwargs raw. Each path is
+    # RELATIVE to RS's data folder and refused unless it stays a real folder
+    # inside it (rscore.resolve_data_mount_paths). What from_kwargs receives is
+    # the absolute tuple. A refusal is a ValidationError BEFORE any side effect
     # (dispatch's validation envelope; nothing created). The coercion mirrors
     # from_kwargs' own (_as_tuple: a browser list or a comma string).
     raw_mount = args.get("mount")
     if raw_mount is not None:
-        safe["mount"] = rscore.resolve_mount_paths_within_roots(
-            rscore._as_tuple(raw_mount), rscore.mount_roots())
+        safe["mount"] = rscore.resolve_data_mount_paths(rscore._as_tuple(raw_mount))
     req = rscore.CreateRequest.from_kwargs(**safe)  # may raise ValidationError
     return dataclasses.asdict(rscore.create(req, progress=progress))
 
@@ -934,7 +931,14 @@ DEV_PROJECT_WEBUI_FIELDS = frozenset({"name", "workflow", "url", "pat",
                                       # in-box): absent ⇒ the workflow preset;
                                       # validated pre-spawn by the create
                                       # delegation, which refuses an empty set.
-                                      "agents"})
+                                      "agents",
+                                      # Read-only project folders: RELATIVE to
+                                      # RS's data folder, never a host path —
+                                      # the request's own from_kwargs resolves
+                                      # them (rscore.resolve_data_mount_paths),
+                                      # so the pre-spawn check and the child
+                                      # pass the same gate.
+                                      "mount"})
 # The gitea-password verb's input boundary: ONE field, a SECRET (repr=False on
 # the request, off the Result, never a durable sink). The step-up `proof` is
 # consumed in dispatch and never reaches this filter.
