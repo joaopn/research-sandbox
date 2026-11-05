@@ -1542,9 +1542,32 @@ html.mobile .project-rail .rail-separator { cursor: default; }
    Settings but not a .field, so it takes .field's bottom margin here, plus a
    top margin so the inline clone tickbox above does not sit on its border. */
 .create-sharing { margin: 8px 0 12px; }
-/* The box window's Sharing box (app.js, the box dialog body): the same bordered
-   box below Settings, taking .field's bottom margin since it is not one. */
-.box-sharing { margin: 0 0 12px; }
+/* The box window's Extensions and Sharing boxes (app.js collapsibleBox): the
+   same bordered box below Settings, taking .field's bottom margin since they
+   are not one. The title is a button that folds the contents; closed by
+   default, so the title carries no bottom margin until the box opens. */
+.box-collapsible { margin: 0 0 12px; }
+.box-collapse-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    margin: 0;
+    padding: 0;
+    background: none;
+    border: none;
+    font: inherit;
+    font-weight: 600;
+    color: var(--fg-base);
+    text-align: left;
+    cursor: pointer;
+}
+.box-collapse-head:hover .box-collapse-caret { color: var(--accent, #4a9eff); }
+.box-collapse-caret { width: 1em; color: var(--fg-muted); }
+.box-collapsible.open > .box-collapse-head { margin-bottom: 8px; }
+.box-collapsible:not(.open) > .box-collapse-body { display: none; }
+/* A phone has no hover and a fingertip is wider than one text line. */
+html.mobile .box-collapse-head { padding: 8px 0; }
 .box-opt-group { margin: 8px 0; }
 .box-opt-caption {
     font-size: 12px;

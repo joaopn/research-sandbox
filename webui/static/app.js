@@ -5927,6 +5927,27 @@ function infoIcon(text) {
     return { icon, detail };
 }
 
+// A bordered box (the box window's Settings look) whose title is a button that
+// folds its contents away; it opens collapsed. Deliberately NOT a `.field`: its
+// label/input rules would restyle the tickboxes inside (the `.field` bleed).
+// Collapsing only hides: every control keeps its value and is still sent.
+function collapsibleBox(title, children, extraClass) {
+    const caret = el("span", { class: "box-collapse-caret" }, ["▸"]);
+    const head = el("button", { type: "button", class: "box-collapse-head",
+                                "aria-expanded": "false" }, [caret, title]);
+    const box = el("div", { class: "box-settings box-collapsible" +
+                                   (extraClass ? " " + extraClass : "") }, [
+        head,
+        el("div", { class: "box-collapse-body" }, children),
+    ]);
+    head.onclick = () => {
+        const open = box.classList.toggle("open");
+        caret.textContent = open ? "▾" : "▸";
+        head.setAttribute("aria-expanded", open ? "true" : "false");
+    };
+    return box;
+}
+
 // A comma-separated folder field → its trimmed, non-empty entries. The server
 // is the gate (it normalises and refuses); this only splits.
 function parseFolderList(text) {
@@ -8423,27 +8444,25 @@ async function mgmtBoxAddDialog(project) {
                     ]),
                 ]),
                 el("div", { class: "box-opt-group" }, [
-                    el("div", { class: "box-opt-caption" }, ["Extensions"]),
-                    el("div", { class: "box-opt-cards" },
-                       [editorCard, fetchCard, browserCard, historyCard]),
-                    historyHint,
-                ]),
-                el("div", { class: "box-opt-group" }, [
                     el("div", { class: "box-opt-caption" }, ["MCP tools"]),
                     mcpList,
                 ]),
             ]),
-            // Sharing: what the box shares with the project — its mailbox
-            // (Share files, every box type) and the project folders it reads
-            // (hidden on a dev preset, which takes none). A bordered box like
-            // Settings but NOT a `.field`: its label/input rules would restyle
-            // the tickbox and its label (the `.field` bleed).
-            el("div", { class: "box-settings box-sharing" }, [
-                el("div", { class: "box-settings-label" }, ["Sharing"]),
+            // Extensions and Sharing: two boxes under Settings, both folded
+            // until opened (a box type's pre-selections still apply and are
+            // sent). Sharing is what the box shares with the project — its
+            // mailbox (Share files, every box type) and the project folders it
+            // reads (hidden on a dev preset, which takes none).
+            collapsibleBox("Extensions", [
+                el("div", { class: "box-opt-cards" },
+                   [editorCard, fetchCard, browserCard, historyCard]),
+                historyHint,
+            ], "box-extensions"),
+            collapsibleBox("Sharing", [
                 el("div", { class: "box-opt-cards" }, [shareCard]),
                 shareHint,
                 foldersGroup,
-            ]),
+            ], "box-sharing"),
             fieldsGroup,
             byoGroup,
             devGroup,
