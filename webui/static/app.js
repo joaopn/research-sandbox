@@ -5887,8 +5887,13 @@ function boxShareLine(rows) {
         : "No box here shares files with the project.";
 }
 
-// What a box's read-only folder means for the operator — shown under the
-// folder field in the box window and the ⚙ Box folders section.
+// The one line shown under a box's folder field (box window and ⚙ Box
+// folders); the full explanation below rides the section title's ⓘ.
+const BOX_FOLDERS_SHORT =
+    "Paths in the project, comma-separated. Read-only in the box at /mnt/<path>.";
+
+// What a box's read-only folder means for the operator — the ⓘ text beside
+// the folder section's title in the box window and the ⚙ Box folders section.
 const BOX_FOLDERS_HINT =
     "Comma-separated paths relative to the project's workspace, for example " +
     "data, results/run3. Each appears in the box under /mnt/<path>, " +
@@ -5897,6 +5902,25 @@ const BOX_FOLDERS_HINT =
     "and the workers' output. Inside boxes, workers, shared, .role-mcps and " +
     ".orchestrator (other agents write there) and inside a folder under mnt " +
     "(a host folder), only the whole folder can be given.";
+
+// A small ⓘ beside a section title. Its text shows on mouseover (the title
+// attribute) and, since a touch screen has no hover, a tap or Enter unfolds it
+// in `detail`, which the caller places under the title. Returns both nodes.
+function infoIcon(text) {
+    const detail = el("div", { class: "info-detail" }, [text]);
+    detail.style.display = "none";
+    const toggle = (ev) => {
+        ev.preventDefault(); ev.stopPropagation();
+        detail.style.display = detail.style.display === "none" ? "" : "none";
+    };
+    const icon = el("span", { class: "info-icon", title: text, tabindex: "0",
+                              role: "button", "aria-label": "More information",
+                              onclick: toggle,
+                              onkeydown: (ev) => {
+                                  if (ev.key === "Enter" || ev.key === " ") toggle(ev);
+                              } }, ["ⓘ"]);
+    return { icon, detail };
+}
 
 // A comma-separated folder field → its trimmed, non-empty entries. The server
 // is the gate (it normalises and refuses); this only splits.
@@ -8175,16 +8199,18 @@ async function mgmtBoxAddDialog(project) {
                                    placeholder: "data, results/run3" });
     const foldersEntry = el("div", { class: "box-folders-entry" }, [
         foldersI,
-        el("div", { class: "hint" }, [BOX_FOLDERS_HINT]),
-        el("div", { class: "hint" }, [folderChoicesLine(folderChoices, folderChoicesError)]),
+        el("div", { class: "hint" }, [BOX_FOLDERS_SHORT]),
     ]);
+    const foldersInfo = infoIcon(BOX_FOLDERS_HINT + "\n\n" +
+                                 folderChoicesLine(folderChoices, folderChoicesError));
     foldersEntry.style.display = "none";
     foldersCb.onchange = () => {
         foldersEntry.style.display = foldersCb.checked ? "" : "none";
         if (foldersCb.checked) foldersI.focus();
     };
     const foldersGroup = el("div", { class: "box-opt-group" }, [
-        el("div", { class: "box-opt-caption" }, ["Read-only folders"]),
+        el("div", { class: "box-opt-caption" }, ["Read-only folders ", foldersInfo.icon]),
+        foldersInfo.detail,
         el("label", { class: "mgmt-check" }, [foldersCb, " Add folders"]),
         foldersEntry,
     ]);
@@ -10752,7 +10778,8 @@ function appendBoxFoldersSection(box, project, enabled) {
     const hasBoxes = Object.keys(enabled || {}).some((id) => id.startsWith("box-term-"));
     if (!isDind || !hasBoxes) return;
     const section = el("div", { class: "config-section" });
-    section.appendChild(el("div", { class: "config-section-label" }, ["Box folders"]));
+    const label = el("div", { class: "config-section-label" }, ["Box folders"]);
+    section.appendChild(label);
     const content = el("div", {}, [el("div", { class: "config-empty" }, ["Loading…"])]);
     section.appendChild(content);
     box.appendChild(section);
@@ -10826,16 +10853,19 @@ function appendBoxFoldersSection(box, project, enabled) {
             }
         };
         draw();
+        // The full explanation rides the title's ⓘ (added once the list read
+        // succeeded, so it carries this project's folders).
+        const info = infoIcon(BOX_FOLDERS_HINT + " Saving restarts the box fresh: " +
+            "its agent must log in again and its setup (for example OpenKnowledge's " +
+            "install) runs again. Files in the box's own folder are untouched.\n\n" +
+            folderChoicesLine(choices, choicesError));
+        label.append(" ", info.icon);
         content.replaceChildren(
+            info.detail,
             shareLine,
             el("div", { class: "config-box-row" }, [sel, saveBtn]),
             foldersI,
-            el("div", { class: "config-hint" }, [
-                BOX_FOLDERS_HINT + " Saving restarts the box fresh: its agent must " +
-                "log in again and its setup (for example OpenKnowledge's install) " +
-                "runs again. Files in the box's own folder are untouched.",
-            ]),
-            el("div", { class: "config-hint" }, [folderChoicesLine(choices, choicesError)]),
+            el("div", { class: "config-hint" }, [BOX_FOLDERS_SHORT]),
             status,
         );
     })();

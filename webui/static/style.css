@@ -1576,6 +1576,24 @@ html.mobile .project-rail .rail-separator { cursor: default; }
 /* Read-only folders: the "Add folders" tickbox opens its path field under it
    (the field inherits the .field input look in the box window). */
 .box-folders-entry { margin-top: 6px; }
+/* A section title's ⓘ (infoIcon in app.js): the text shows on mouseover via
+   the title attribute; a tap unfolds .info-detail under the title. The ⚙
+   section label is uppercase, so the icon resets the transform. */
+.info-icon {
+    cursor: help;
+    color: var(--fg-faint);
+    font-size: 13px;
+    text-transform: none;
+    letter-spacing: 0;
+    margin-left: 2px;
+}
+.info-icon:hover, .info-icon:focus { color: var(--accent, #4a9eff); outline: none; }
+.info-detail {
+    font-size: 12px;
+    color: var(--fg-muted);
+    white-space: pre-line;
+    margin: 2px 0 6px;
+}
 /* The ⚙ Box folders path field: the box window's input look, full width. */
 .project-config-box .config-folders-input {
     width: 100%;
