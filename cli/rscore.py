@@ -589,15 +589,66 @@ def _resolve_workflow(workflow_id: str) -> tuple[dict, "ProjectType", "Substrate
     if m is None:
         raise ValidationError(
             f"unknown workflow {workflow_id!r}; the Workflows page lists the catalog")
-    substrate = Substrate(m["substrate"])  # manifest substrate is schema-validated
+    project_type, substrate = _workflow_flavor(m)
+    return m, project_type, substrate
+
+
+def _workflow_flavor(manifest: dict) -> tuple["ProjectType", "Substrate"]:
+    """The (project_type, substrate) a project created from this manifest gets
+    — pure, no catalog read, so callers that already hold a manifest (the
+    broker's `workflows` verb) derive the flavor exactly as create does. A docker
+    box is the research flavor, the rs-sandbox-dind overlay is the agent-less
+    sandbox-dind flavor, everything else is research. The manifest substrate is
+    schema-validated by the catalog loader."""
+    substrate = Substrate(manifest["substrate"])
     mgmt_overlay = SANDBOX_DIND_IMAGE.split(":", 1)[0]  # "rs-sandbox-dind"
-    if m["substrate"] == Substrate.DOCKER.value:
+    if substrate is Substrate.DOCKER:
         project_type = ProjectType.RESEARCH
-    elif m.get("image_overlay") == mgmt_overlay:
+    elif manifest.get("image_overlay") == mgmt_overlay:
         project_type = ProjectType.SANDBOX_DIND
     else:
         project_type = ProjectType.RESEARCH
-    return m, project_type, substrate
+    return project_type, substrate
+
+
+# The .env / environment key holding the operator's configured default egress
+# (Config.default_egress reads it; workflow_default_egress reads it the same way).
+DEFAULT_EGRESS_KEY = "DEFAULT_EGRESS"
+
+
+def default_egress_for(project_type, substrate, configured_default: str) -> str:
+    """The egress a create resolves when none is requested — the ONE rule create()
+    and the webui's create form both read. The sandbox-dind flavor and the docker
+    substrate are locked; everything else (the research flavor on dind) takes the
+    operator's configured default. `project_type` / `substrate` may be the enums
+    or their string values (str-mixin enums compare equal to their values)."""
+    if project_type == ProjectType.SANDBOX_DIND or substrate == Substrate.DOCKER:
+        return Egress.LOCKED.value
+    return configured_default
+
+
+def workflow_default_egress(manifest: dict) -> "str | None":
+    """The egress a create from this manifest resolves when none is requested,
+    for the webui's create form (the broker `workflows` verb). The configured
+    default is read with Config's precedence and nothing else — NOT through
+    load_config(), which can raise on an unrelated key and would write every .env
+    key into the broker's environment: the key's value when it is PRESENT in the
+    process environment (presence, not truthiness — an empty value must not fall
+    through to open), else the key from .env, else open. A .env that cannot be
+    read or decoded (OSError; UnicodeDecodeError is a ValueError), or a value
+    that is neither open nor locked, returns None: the caller omits the field
+    and the form falls back to locked, the stricter side."""
+    try:
+        if DEFAULT_EGRESS_KEY in os.environ:
+            configured = os.environ[DEFAULT_EGRESS_KEY]
+        else:
+            configured = read_env_value(DEFAULT_EGRESS_KEY) or Egress.OPEN.value
+    except (OSError, ValueError):
+        return None
+    if configured not in (Egress.OPEN.value, Egress.LOCKED.value):
+        return None
+    project_type, substrate = _workflow_flavor(manifest)
+    return default_egress_for(project_type, substrate, configured)
 
 
 def workflow_has_worker_layer(manifest: dict) -> bool:
@@ -3889,10 +3940,9 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     inner_firewall = req.inner_firewall and not is_docker
 
     # Egress. Sandbox flavor and the docker substrate default to `locked`;
-    # research to cfg default.
+    # research to cfg default — the shared rule the webui's create form reads too.
     egress = (req.egress.value if req.egress is not None else None) or (
-        "locked" if (project_type == PROJECT_TYPE_SANDBOX_DIND or is_docker)
-        else cfg.default_egress)
+        default_egress_for(project_type, substrate, cfg.default_egress))
     if egress not in ("open", "locked"):
         die(f"invalid --egress value: {egress!r} (expected open|locked)")
 
@@ -5347,7 +5397,7 @@ class Config:
         self.default_role_mcp_max_concurrent_calls: int = int(
             os.environ.get("DEFAULT_ROLE_MCP_MAX_CONCURRENT_CALLS", "3"))
         self.default_dind: str = os.environ.get("DEFAULT_DIND", "auto")
-        self.default_egress: str = os.environ.get("DEFAULT_EGRESS", "open")
+        self.default_egress: str = os.environ.get(DEFAULT_EGRESS_KEY, "open")
 
 
 def load_config() -> Config:

@@ -372,6 +372,13 @@ def _verb_workflows(_args: dict, _progress=None) -> dict:
         # box_capable (STAGE_SANDBOX_DIND_AGENT): the sandbox-dind flavor shows the
         # agents + light-path group in the create dialog. Derived from data.
         m["box_capable"] = rscore.workflow_is_sandbox_dind(m)
+        # default_egress: the egress a create from this workflow resolves when the
+        # request names none (the same rule create() applies), so the form starts
+        # on it. Omitted when the configured default is unreadable or invalid; the
+        # form then starts on locked, the stricter side.
+        egress = rscore.workflow_default_egress(m)
+        if egress is not None:
+            m["default_egress"] = egress
     return {
         "workflows": catalog,                     # full manifests (substrate,
                                                   # repo/ref/setup presets, source,

@@ -6875,6 +6875,16 @@ const MODEL_PICKER_SPECS = [
     ["role", "Role-MCPs", "Tool services workers call — one session per tool-call."],
 ];
 
+// The egress the create dialog starts on: the workflow's `default_egress` from the
+// broker's workflows read — the egress the server resolves for that workflow when
+// none is chosen — and locked, the stricter side, when the field is absent or
+// unrecognised (a broker older than this webui, or an unreadable configured
+// default). The form always sends the value it shows.
+function createEgressDefault(manifest) {
+    const v = manifest ? manifest.default_egress : undefined;
+    return (v === "open" || v === "locked") ? v : "locked";
+}
+
 function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEnabled) {
     manifest = manifest || {};
     agents = Array.isArray(agents) ? agents : [];
@@ -6925,10 +6935,11 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
         el("option", { value: "open" }, ["open"]),
         el("option", { value: "locked" }, ["locked"]),
     ]);
-    // Dev preselects locked (matches the flavor's own default; PI decision).
+    // Starts on the egress the server would resolve for this workflow (locked for
+    // dev, sandbox-dind and docker workflows; the configured default on research).
     // Locked still allows 80/443/DNS — pip/apt/LLM work; gitea rides the
     // project bridge directly and is egress-mode-independent.
-    if (isDev) egressS.value = "locked";
+    egressS.value = createEgressDefault(manifest);
     // Editor (code-server) is universal + on by default (STAGE_BOX_EXT_UX C).
     // Unchecking sends disable:["code-server"]; checked sends nothing (default-on).
     const editorCb = el("input", { type: "checkbox" });
