@@ -12,6 +12,7 @@ project_services_handler.
 import ipaddress
 import re
 import socket
+from datetime import datetime, timedelta, timezone
 
 # The listen address (B156): the webui must REACH every project network (it SSHes
 # to supervisors by container DNS) but LISTEN only where the operator's browser
@@ -50,6 +51,52 @@ def listen_address(subnet: str) -> str:
         raise ValueError(f"this container has no address in the listen subnet "
                          f"{subnet} (the route there leaves from {src})")
     return src
+
+
+# How long before its expiry the webui's TLS certificate counts as due for
+# renewal (B58). Let's Encrypt — and tailscaled's own renewal — re-issue a
+# 90-day certificate at about 30 days left, so a certificate below this margin
+# means renewal is overdue. For the webui's 825-day self-signed certificate,
+# regenerating 30 days early means an operator who restarts the webui (or the
+# host) at least monthly never meets an expired one. Half the margin still
+# works but halves the window in which a restart heals before the browser's
+# interstitial; ten times would rotate a fresh self-signed key — and the
+# browser exception the operator accepted — needlessly often.
+CERT_RENEW_BEFORE = timedelta(days=30)
+
+
+def cert_expiry_state(not_after: datetime | None, now: datetime) -> str:
+    """Classify a certificate's notAfter against `now`: "unknown" (unreadable),
+    "expired", "renew-due" (less than CERT_RENEW_BEFORE left) or "ok". A naive
+    datetime is read as UTC (cryptography's legacy accessor returns naive UTC)."""
+    if not_after is None:
+        return "unknown"
+    if not_after.tzinfo is None:
+        not_after = not_after.replace(tzinfo=timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    if not_after <= now:
+        return "expired"
+    if not_after - now < CERT_RENEW_BEFORE:
+        return "renew-due"
+    return "ok"
+
+
+def self_signed_regen_reason(files_present: bool, covers_bind: bool,
+                             expiry: str) -> str | None:
+    """Why the webui must regenerate its self-signed certificate, or None to
+    keep it. Missing files first, then the expiry, then the bind address."""
+    if not files_present:
+        return "no certificate yet"
+    if expiry == "expired":
+        return "certificate expired"
+    if expiry == "renew-due":
+        return f"certificate expires within {CERT_RENEW_BEFORE.days} days"
+    if expiry == "unknown":
+        return "certificate expiry unreadable"
+    if not covers_bind:
+        return "certificate does not cover the bind address"
+    return None
 
 # Each entry's `command` is what the SSH-kind service runs after auth — the
 # byobu invocation lands the user in /workspace, the supervisor's project root.

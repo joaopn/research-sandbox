@@ -484,6 +484,8 @@ webui  start [--bind IP] [--port N] [--rebuild]   Start the HTTPS browser UI
 webui  stop | status | import | cert-tailscale
 ```
 
+`cert-tailscale` stages a Tailscale certificate for the browser UI and also turns on its automatic renewal: from then on `research start` and `research webui start` ask Tailscale for a newer certificate and install it. An install whose Tailscale certificate was staged before this release runs `cert-tailscale` once to turn renewal on.
+
 ### Workflows
 
 ```

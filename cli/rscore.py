@@ -18869,23 +18869,41 @@ def _stage_webui_cert(cert_pem: bytes, key_pem: bytes,
         (td_path / "key.pem").write_bytes(key_pem)
         (td_path / ".custom").write_text(f"{provider}\n")
         # chown to UID 1000 — the in-container webui user. Without this
-        # the busybox-written files are root-owned, and any regen attempt
-        # (e.g. server.py falling back to self-signed when the marker is
-        # absent) hits Permission denied on the cert.pem write and the
-        # container restart-loops. chmod 644/600 then matches what the
-        # auto-generated cert flow uses.
-        run_check([
-            "docker", "run", "--rm",
-            "-v", f"{volume}:/tls",
-            "-v", f"{td_path}:/src:ro",
-            "busybox", "sh", "-c",
-            "cp /src/cert.pem /tls/cert.pem && "
-            "cp /src/key.pem  /tls/key.pem && "
-            "cp /src/.custom  /tls/.custom && "
-            "chown 1000:1000 /tls/cert.pem /tls/key.pem /tls/.custom && "
-            "chmod 644 /tls/cert.pem /tls/.custom && "
-            "chmod 600 /tls/key.pem"
-        ])
+        # the written files are root-owned, and any regen attempt (e.g.
+        # server.py falling back to self-signed when the marker is absent)
+        # hits Permission denied on the cert.pem write and the container
+        # restart-loops. chmod 644/600 then matches what the auto-generated
+        # cert flow uses.
+        if run_quiet(["docker", "image", "inspect", WEBUI_IMAGE]):
+            # The volume is writable by the webui, and the renewal at start
+            # stages here unattended: the stager never opens or follows an
+            # object it finds there (a planted FIFO would block a `cp`).
+            r = run([
+                "docker", "run", "--rm", "--network", "none", "-u", "0",
+                "--entrypoint", "python",
+                "-v", f"{volume}:/tls",
+                "-v", f"{td_path}:/src:ro",
+                WEBUI_IMAGE, "-I", "-c", _WEBUI_TLS_STAGE_PY,
+                "/tls", "/src", str(WEBUI_IMAGE_UID), str(WEBUI_IMAGE_UID),
+            ], capture_output=True, errors="replace")
+            if r.returncode != 0:
+                last = next((ln.strip() for ln in reversed((r.stderr or "").splitlines())
+                             if ln.strip()), f"exit {r.returncode}")
+                die(f"could not stage the webui certificate into its TLS volume: {last}")
+        else:
+            run_check([
+                "docker", "run", "--rm",
+                "-v", f"{volume}:/tls",
+                "-v", f"{td_path}:/src:ro",
+                "busybox", "sh", "-c",
+                "cp /src/cert.pem /tls/cert.pem && "
+                "cp /src/key.pem  /tls/key.pem && "
+                "cp /src/.custom  /tls/.custom && "
+                "chown 1000:1000 /tls/cert.pem /tls/key.pem /tls/.custom && "
+                "chmod 644 /tls/cert.pem /tls/.custom && "
+                "chmod 600 /tls/key.pem"
+            ])
+    _record_webui_tls_provider(provider, cert_pem)
 
 
 WEBUI_IMAGE_UID = 1000   # baked uid in webui/Dockerfile (USER webui)
@@ -18904,6 +18922,296 @@ def _ensure_webui_volume_ownership(uid: int, gid: int) -> None:
          WEBUI_IMAGE,
          "chown", "-R", f"{uid}:{gid}", "/app/tls", "/app/state"],
         capture_output=True)
+
+
+# The webui TLS renewal (B58). The TLS volume is mounted read-write into the
+# webui, so the host trusts nothing it finds there: the tailnet name comes only
+# from this HOST-side record of what RS last staged (written by
+# `_stage_webui_cert`, i.e. by `research webui cert-tailscale` and by the
+# renewal), JSON {"provider": "tailscale:<fqdn>", "cert_sha256": "<hex>"}.
+WEBUI_TLS_RECORD_PATH = Path.home() / ".research-sandbox" / "webui-tls-provider"
+
+# RFC 1035: a name is at most 255 octets on the wire, 253 characters in dotted
+# text. A longer "name" cannot have come from `tailscale status`, so it is
+# rejected like a malformed one. Derived, not a tuning knob.
+DNS_NAME_MAX_CHARS = 253
+
+# A DNS host name of two or more labels, ASCII letters/digits/hyphens, no label
+# starting or ending with a hyphen. With fullmatch this excludes every
+# argv-option shape (a leading "-") and every control or space character, which
+# is the property that matters before the name reaches `tailscale cert`.
+_TAILSCALE_FQDN_RE = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+", re.ASCII)
+
+# The marker is only ever compared for equality with a record whose name passed
+# the 253-character check; the longest marker RS writes is
+# "tailscale:<253 chars>\n". A larger file cannot equal any record, so reading
+# past this bound can never change the verdict (mismatch); half of it would turn
+# legitimate long names into a mismatch, ten times only lets more hostile bytes
+# into the host process.
+WEBUI_TLS_MARKER_MAX_BYTES = len("tailscale:") + DNS_NAME_MAX_CHARS + 1
+
+# Marks the throwaway that reads the webui's TLS marker, so an observer (the
+# acceptance harness's event count) can tell the bounded read apart from every
+# other container run from the same image; it carries no behaviour.
+WEBUI_TLS_READER_LABEL = "research.webui-tls-reader=1"
+
+# Runs inside a throwaway rs-webui container on a read-only mount of the TLS
+# volume. Never follows a symlink, never blocks on a FIFO (O_NONBLOCK; S_ISREG
+# refuses it before any read), reads at most cap+1 bytes, and emits hex so the
+# host never decodes webui bytes as text.
+_WEBUI_TLS_MARKER_READ_PY = """\
+import os, stat, sys
+path, cap = sys.argv[1], int(sys.argv[2])
+fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+st = os.fstat(fd)
+if not stat.S_ISREG(st.st_mode) or st.st_size > cap:
+    sys.exit(4)
+data = os.read(fd, cap + 1)
+if len(data) > cap:
+    sys.exit(4)
+sys.stdout.write(data.hex())
+"""
+
+# Runs as root inside a throwaway rs-webui container: argv <dst> <src> <uid>
+# <gid>. Each file is created fresh under a random temp name (O_EXCL|O_NOFOLLOW:
+# never opens an existing object), owned and moded on its descriptor, and only
+# then renamed onto its name through the directory descriptor (a rename neither
+# opens nor follows the target). A directory squatting a name aborts before any
+# rename; temps this run created are removed on every exit.
+_WEBUI_TLS_STAGE_PY = """\
+import os, secrets, stat, sys
+dst, src, uid, gid = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+files = (("cert.pem", 0o644), ("key.pem", 0o600), (".custom", 0o644))
+d = os.open(dst, os.O_RDONLY | os.O_DIRECTORY)
+for name, _ in files:
+    try:
+        if stat.S_ISDIR(os.lstat(name, dir_fd=d).st_mode):
+            sys.exit(name + " is a directory")
+    except FileNotFoundError:
+        pass
+staged = []
+try:
+    for name, mode in files:
+        with open(os.path.join(src, name), "rb") as f:
+            data = f.read()
+        tmp = ".rs-stage-" + secrets.token_hex(8)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=d)
+        staged.append(tmp)
+        with os.fdopen(fd, "wb") as w:
+            w.write(data)
+            os.fchown(w.fileno(), uid, gid)
+            os.fchmod(w.fileno(), mode)
+    for i, (name, _) in enumerate(files):
+        os.replace(staged[i], name, src_dir_fd=d, dst_dir_fd=d)
+        staged[i] = None
+finally:
+    for tmp in staged:
+        if tmp is not None:
+            try:
+                os.unlink(tmp, dir_fd=d)
+            except OSError:
+                pass
+"""
+
+
+def _record_webui_tls_provider(provider: str, cert_pem: bytes) -> None:
+    """Record, host-side, what `_stage_webui_cert` just staged. The old record
+    is removed first, so a failed write leaves renewal OFF rather than a stale
+    certificate hash that would restage at every start. Never dies."""
+    path = WEBUI_TLS_RECORD_PATH
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as e:
+        print(f"warning: could not remove the old webui certificate record {path} "
+              f"({e}); remove that file by hand — until then each start acts on "
+              f"that old record (it restages the certificate, or warns that the "
+              f"webui's certificate no longer matches it)", file=sys.stderr)
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps({
+            "provider": provider,
+            "cert_sha256": hashlib.sha256(cert_pem).hexdigest(),
+        }) + "\n", encoding="ascii")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"warning: could not record the webui certificate's provider at "
+              f"{path} ({e}); renewal at start stays off", file=sys.stderr)
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _read_webui_tls_record() -> dict | None:
+    """The host-side record: None when absent; {} when present but not a
+    record RS wrote (unreadable, not ASCII, not JSON, wrong shape)."""
+    path = WEBUI_TLS_RECORD_PATH
+    try:
+        text = path.read_text(encoding="ascii")
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {}
+    try:
+        rec = json.loads(text)
+    except ValueError:
+        return {}
+    if (isinstance(rec, dict) and isinstance(rec.get("provider"), str)
+            and isinstance(rec.get("cert_sha256"), str)):
+        return rec
+    return {}
+
+
+def _valid_tailscale_fqdn(fqdn: str) -> bool:
+    return (len(fqdn) <= DNS_NAME_MAX_CHARS
+            and _TAILSCALE_FQDN_RE.fullmatch(fqdn) is not None)
+
+
+def _read_webui_tls_marker(volume: str) -> str | None:
+    """The webui's `.custom` marker, read through the bounded reader in a
+    throwaway container on a read-only mount; None on any failure (absent, a
+    symlink, a FIFO, a directory, too large, not ASCII, a failed run)."""
+    try:
+        r = run(["docker", "run", "--rm", "--network", "none",
+                 "--label", WEBUI_TLS_READER_LABEL,
+                 "--entrypoint", "python",
+                 "-v", f"{volume}:/app/tls:ro", WEBUI_IMAGE,
+                 "-I", "-c", _WEBUI_TLS_MARKER_READ_PY,
+                 "/app/tls/.custom", str(WEBUI_TLS_MARKER_MAX_BYTES)],
+                capture_output=True, errors="replace")
+    except OSError:
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        return bytes.fromhex((r.stdout or "").strip()).decode("ascii")
+    except ValueError:
+        return None
+
+
+def _fetch_tailscale_cert(fqdn: str) -> tuple[bytes | None, bytes | None, str]:
+    """`tailscale cert` for `fqdn` into a temp dir: (cert, key, "") or
+    (None, None, the error). The same invocation `research webui
+    cert-tailscale` makes; never raises for a missing binary or file."""
+    with tempfile.TemporaryDirectory() as td:
+        cert_path = Path(td) / "cert.pem"
+        key_path = Path(td) / "key.pem"
+        try:
+            r = run(["tailscale", "cert",
+                     "--cert-file", str(cert_path),
+                     "--key-file", str(key_path),
+                     fqdn], capture_output=True)
+            if r.returncode != 0:
+                return None, None, ((r.stderr or r.stdout or "").strip()
+                                    or f"exit {r.returncode}")
+            return cert_path.read_bytes(), key_path.read_bytes(), ""
+        except OSError as e:
+            return None, None, f"{type(e).__name__}: {e}"
+
+
+def _webui_container_ids() -> tuple[int, int] | None:
+    """The uid:gid the existing webui container runs as; None when there is no
+    webui container. No recorded user, or a user NAME, is the image's uid."""
+    u = webui_container_user()
+    if u is None:
+        return None
+    uid_s, _, gid_s = u.partition(":")
+    if not gid_s:
+        gid_s = uid_s
+    if uid_s.isdigit() and gid_s.isdigit():
+        return int(uid_s), int(gid_s)
+    return WEBUI_IMAGE_UID, WEBUI_IMAGE_UID
+
+
+def refresh_webui_tailscale_cert() -> bool:
+    """Ask Tailscale for the current certificate of the name the operator
+    staged with `research webui cert-tailscale`, and install it when it is a
+    different one. True only when a new certificate was staged. Warns on
+    stderr and returns False on every failure; never aborts the caller."""
+    rec = _read_webui_tls_record()
+    if rec is None:
+        return False
+    if not run_quiet(["docker", "image", "inspect", WEBUI_IMAGE]):
+        return False
+    volume = _webui_tls_volume()
+    if not run_quiet(["docker", "volume", "inspect", volume]):
+        return False
+    path = WEBUI_TLS_RECORD_PATH
+    if not rec:
+        print(f"warning: {path} is not a record RS wrote; renewal skipped "
+              f"(run 'research webui cert-tailscale' to rewrite it)", file=sys.stderr)
+        return False
+    provider = rec["provider"]
+    if not provider.startswith("tailscale:"):
+        return False
+    fqdn = provider[len("tailscale:"):]
+    if not _valid_tailscale_fqdn(fqdn):
+        print(f"warning: {path} does not hold a valid Tailscale host name; renewal "
+              f"skipped (run 'research webui cert-tailscale' to rewrite it)",
+              file=sys.stderr)
+        return False
+    marker = _read_webui_tls_marker(volume)
+    if (marker or "").strip() != provider:
+        print(f"warning: the webui's certificate is no longer the Tailscale "
+              f"certificate RS staged for {fqdn}; renewal skipped. Run 'research "
+              f"webui cert-tailscale' to restage it, or delete {path} to stop "
+              f"renewing", file=sys.stderr)
+        return False
+    if shutil.which("tailscale") is None:
+        print(f"warning: the tailscale CLI is not on PATH, so the webui's "
+              f"certificate for {fqdn} is not renewed; browsers refuse it once it "
+              f"expires (run 'research webui cert-tailscale' once tailscale is "
+              f"back)", file=sys.stderr)
+        return False
+    cert, key, err = _fetch_tailscale_cert(fqdn)
+    if cert is None or key is None:
+        print(f"warning: could not renew the webui's Tailscale certificate for "
+              f"{fqdn}: {err} (run 'research webui cert-tailscale' to retry)",
+              file=sys.stderr)
+        return False
+    if hashlib.sha256(cert).hexdigest() == rec["cert_sha256"]:
+        return False
+    try:
+        _stage_webui_cert(cert, key, provider=provider)
+        ids = _webui_container_ids()
+        if ids is not None:
+            _ensure_webui_volume_ownership(*ids)
+    except (SystemExit, OSError) as e:
+        detail = f" ({e})" if isinstance(e, OSError) else " (see the error above)"
+        print(f"warning: could not install the renewed Tailscale certificate for "
+              f"{fqdn}{detail}; the webui keeps the one it has", file=sys.stderr)
+        return False
+    print(f"renewed the webui's Tailscale certificate for {fqdn}")
+    return True
+
+
+def renew_webui_cert_at_start() -> None:
+    """`research start`'s renewal: nothing when no Tailscale certificate was
+    ever staged (no host record — the default self-signed install, checked
+    first so it makes no docker call), and nothing when the webui container is
+    absent (`research webui stop` removed it — the operator's "no UI" signal).
+    After a renewal, a running webui with the listen contract is restarted onto
+    the new files (a restart re-reads the volume); a stopped one reads them at
+    its next start. Never dies."""
+    if _read_webui_tls_record() is None:
+        return
+    if not _container_present(WEBUI_CONTAINER):
+        return
+    if not refresh_webui_tailscale_cert():
+        return
+    if container_running(WEBUI_CONTAINER) and webui_container_has_listen_contract():
+        r = run(["docker", "restart", WEBUI_CONTAINER], capture_output=True)
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "").strip()
+            print(f"warning: could not restart {WEBUI_CONTAINER} onto the renewed "
+                  f"certificate: {err[-200:]}; it serves the new one after its next "
+                  f"restart", file=sys.stderr)
 
 
 def webui_listen_subnet() -> str:

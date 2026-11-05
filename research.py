@@ -183,6 +183,9 @@ def cmd_start(args: argparse.Namespace) -> None:
     # Bring the browser UI back if `research stop` took it down (existence is the
     # operator's signal — `research webui stop` removes the container).
     _resume_webui()
+    # Renew a Tailscale certificate the operator staged, restarting a running
+    # webui onto it (B58); a self-signed install makes no docker call here.
+    rscore.renew_webui_cert_at_start()
     _start_enabled_mcps()
     # Re-attach shared rs-gitea to the projects in the dev-lane attachment record.
     # SELECTIVE (only recorded projects), unlike the registry. No-op until a dev
@@ -1835,9 +1838,14 @@ def cmd_webui(args: argparse.Namespace) -> None:
             os.environ.update(rscore.webui_compose_env(bind, port, listen_subnet, broker.BROKER_RUN_DIR))
         except ValidationError as e:
             die(f"{e} — fix WEBUI_PASSTHROUGH_PORT_LO/HI in .env")
-        if (recreate or user_changed or rebuild) and container_exists(WEBUI_CONTAINER):
+        # A Tailscale certificate the operator staged is renewed here, after
+        # every refusal that comes before the old webui is removed (B58); a
+        # renewed certificate recreates the webui onto the new files.
+        renewed = rscore.refresh_webui_tailscale_cert()
+        if (recreate or user_changed or renewed or rebuild) and container_exists(WEBUI_CONTAINER):
             reason = ("bind/port/listen subnet changed" if recreate
                       else "the webui runs as another user" if user_changed
+                      else "the Tailscale certificate was renewed" if renewed
                       else "rebuild requested")
             print(f"{reason}; recreating webui...")
             run(["docker", "rm", "-f", WEBUI_CONTAINER], capture_output=True)

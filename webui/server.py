@@ -3852,6 +3852,18 @@ def cert_covers_bind(cert_path: Path, bind: str) -> bool:
         return any(isinstance(e, x509.DNSName) and e.value == bind for e in san)
 
 
+def cert_not_after(cert_path: Path) -> datetime | None:
+    """The certificate's notAfter (aware UTC), or None when it cannot be read."""
+    try:
+        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+    except Exception:
+        return None
+    after = getattr(cert, "not_valid_after_utc", None)
+    if after is None:
+        after = cert.not_valid_after   # older cryptography: naive UTC
+    return after
+
+
 def generate_self_signed(cert_path: Path, key_path: Path, bind: str) -> None:
     """Write a fresh self-signed cert+key covering localhost and `bind`."""
     log.info(f"Generating self-signed TLS cert at {cert_path} (bind={bind})")
@@ -3903,18 +3915,41 @@ def ensure_tls(cert_path: Path, key_path: Path, bind: str) -> ssl.SSLContext:
     # WEBUI_BIND is the IP the FQDN resolves to), and that's a valid
     # configuration: the browser sees the trusted cert when accessing via
     # the FQDN, which is the URL the user actually navigates to.
+    # A custom cert is never replaced here, even when it has expired: falling
+    # back to self-signed would swap a trusted-but-expired cert for an
+    # untrusted one and destroy the operator's marker. Renewal is the host's
+    # job (`research start` / `research webui start` renew a Tailscale cert);
+    # this log says when it is overdue.
+    present = cert_path.exists() and key_path.exists()
+    expiry = services.cert_expiry_state(
+        cert_not_after(cert_path) if present else None, datetime.now(timezone.utc))
     custom = cert_path.parent / ".custom"
     if custom.exists():
         provider = custom.read_text().strip() or "user-supplied"
         log.info(f"using {provider} cert (skipping self-signed regen)")
-        if not (cert_path.exists() and key_path.exists()):
+        if not present:
             log.error(
                 f".custom marker present but cert/key missing at "
                 f"{cert_path.parent} — falling back to self-signed")
             generate_self_signed(cert_path, key_path, bind)
-    elif not (cert_path.exists() and key_path.exists()) or \
-            not cert_covers_bind(cert_path, bind):
-        generate_self_signed(cert_path, key_path, bind)
+        elif expiry in ("expired", "renew-due"):
+            after = cert_not_after(cert_path)
+            when = after.strftime("%Y-%m-%d %H:%M UTC") if after else "unknown"
+            remedy = ("run `research webui cert-tailscale` on the host"
+                      if provider.startswith("tailscale:")
+                      else "replace the certificate in the webui's TLS volume")
+            if expiry == "expired":
+                log.error(f"the {provider} certificate EXPIRED on {when}; "
+                          f"browsers refuse it — {remedy}")
+            else:
+                log.warning(f"the {provider} certificate expires on {when}, "
+                            f"within {services.CERT_RENEW_BEFORE.days} days — {remedy}")
+    else:
+        reason = services.self_signed_regen_reason(
+            present, present and cert_covers_bind(cert_path, bind), expiry)
+        if reason:
+            log.info(f"regenerating the self-signed certificate: {reason}")
+            generate_self_signed(cert_path, key_path, bind)
     ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     ctx.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
     return ctx

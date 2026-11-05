@@ -270,6 +270,8 @@ python research.py worker list | enable | disable ...
 python research.py project worker enable | disable | stop | start | list | status <proj> [<name>]
 ```
 
+`webui cert-tailscale` stages a Tailscale certificate for the browser UI and also turns on its automatic renewal: from then on `research start` and `research webui start` ask Tailscale for a newer certificate and install it. An install whose Tailscale certificate was staged before this release runs `webui cert-tailscale` once to turn renewal on.
+
 **In-supervisor CLIs** (the supervisor's Claude uses these; you rarely call them directly): **`rs-worker`** — analysis-worker lifecycle (`spawn --plan`, `list`, `wait`, `finalize`/`accept`/`unstage`, `attach`/`tail`); **`rs-sandbox`** — box lifecycle on DIND projects (`create [name] --preset empty|websearcher|data-wrangler|byo [--agent claude] [--editor]`, `list`, `discard`).
 
 ## ◾ File structure
