@@ -2126,22 +2126,77 @@ function renderSoftwareScreen(view, result) {
     view.appendChild(el("div", { class: "sw-section" }, imgChildren));
 
     // --- Version pins (effective: base overlaid with the local override) ---
+    // A "local" row whose key this installation ships gets "Use repo version":
+    // it removes that one key from the local override (the pin_reset verb). The
+    // server decides which rows qualify (`resettable`, the same predicate the
+    // verb validates with), so the button is never offered for a refused key.
     const pinRows = [el("div", { class: "sw-row sw-row-head" }, [
         el("span", {}, ["Pin"]), el("span", {}, ["Value"]), el("span", {}, ["Source"]),
+        el("span", {}, [""]),
     ])];
     for (const p of pins) {
+        const errSpan = el("span", { class: "sw-pin-err sw-warn" }, []);
+        const act = [];
+        if (p.resettable) {
+            const btn = el("button", {
+                class: "btn-small",
+                title: "Put back " + p.base + ", the version this installation ships (removes the local override)",
+            }, ["Use repo version"]);
+            btn.onclick = () => pinResetClick(view, p.key, btn, errSpan);
+            act.push(btn);
+        }
         pinRows.push(el("div", { class: "sw-row" }, [
             el("span", { class: "sw-mono" }, [p.key]),
             el("span", { class: "sw-mono" }, [p.value]),
             p.override
-                ? el("span", { class: "sw-badge override", title: "from versions.local.env" }, ["local"])
+                ? el("span", {
+                    class: "sw-badge override",
+                    title: p.base != null
+                        ? "from versions.local.env — this installation ships " + p.base
+                        : "from versions.local.env",
+                }, ["local"])
                 : el("span", { class: "sw-badge base", title: "from versions.env" }, ["base"]),
+            el("span", { class: "sw-act" }, act),
+            errSpan,
         ]));
     }
     view.appendChild(el("div", { class: "sw-section" }, [
         el("h3", {}, ["Version pins"]),
         el("div", { class: "sw-table sw-pins" }, pinRows),
+        el("p", { class: "sw-pins-hint" }, [
+            "Use repo version changes the pin only. To apply it, Pull the download that bundles that pin, or use Rebuild all for an image pin (new projects and boxes pick it up).",
+        ]),
     ]));
+}
+
+// "Use repo version" on one pin row: POST the key, then re-read the whole page
+// (the row flips to "base"). Transport failures and 401/403/503 are the page's
+// (renderMgmtUnavailable / mgmtStatusRedirect); a broker refusal (busy, or a key
+// the verb refuses) is shown inline in the row and the button comes back.
+async function pinResetClick(view, key, btn, errSpan) {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    errSpan.textContent = "";
+    let res;
+    try {
+        res = await fetch("/broker/software/pin-reset", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ key: key }),
+        });
+    } catch (e) { return renderMgmtUnavailable(view); }
+    const redirect = mgmtStatusRedirect(view, res.status, renderSoftwareInto);
+    if (redirect) return redirect();
+    let body;
+    try { body = await res.json(); } catch (e) { return renderMgmtUnavailable(view); }
+    if (!res.ok || !body || !body.ok) {
+        // Reachable only on 200-with-parseable-JSON: the broker answered and the
+        // verb refused — show its words in the row, never the unreachable card.
+        errSpan.textContent = mgmtErrText(body);
+        btn.disabled = false;
+        return;
+    }
+    renderSoftwareInto(view);
 }
 
 function closeManagement() {

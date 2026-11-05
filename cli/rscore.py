@@ -6522,7 +6522,8 @@ def _warn_pins_below_base(what: str, bundled: dict[str, str]) -> list[str]:
             # Reachable only from a Python caller: no product path passes a
             # version that is not the effective pin.
             source = ("is a local override (versions.local.env — the Software "
-                      "page marks it \"local\")"
+                      "page marks it \"local\" and its Use repo version button "
+                      "puts the shipped value back)"
                       if override.get(key) == value else "was requested explicitly")
             lines.append(f"warning: {what} was built with {key}={value}, below the "
                          f"{base[key]} this installation ships (versions.env); the "
@@ -8051,6 +8052,140 @@ def _set_version_pin(key: str, value: str) -> None:
     VERSIONS_LOCAL_FILE.write_text("\n".join(out) + "\n")
 
 
+# Pins the webui's "Use repo version" button (the `pin_reset` verb) never resets,
+# even when versions.local.env overrides them:
+#   - host-port keys (REGISTRY_HOST_PORT, GITEA_HOST_PORT) live in the same files
+#     but are host configuration, not versions. A local value is the operator's
+#     answer to a port collision on their machine, so putting the repo value back
+#     would recreate the collision at the next start. Host-shaped settings stay
+#     off the browser surface. The match is by SUFFIX on purpose: a future
+#     host-shaped key that does not end in _HOST_PORT must be added here, or it
+#     becomes resettable.
+#   - shared-service versions (GITEA_VERSION, REGISTRY_VERSION) are read only when
+#     the shared gitea / registry container is CREATED, never by a rebuild, so a
+#     reset would not take effect on anything the operator sees. Gitea also
+#     migrates its database forward, so a pin set below the running release can
+#     leave a re-created container unable to read its own data. Gitea moves
+#     through the Infrastructure upgrade instead.
+_PIN_RESET_EXCLUDED_SUFFIXES = ("_HOST_PORT",)
+_PIN_RESET_EXCLUDED_KEYS = frozenset({"GITEA_VERSION", "REGISTRY_VERSION"})
+# The shape of a pin key, checked before the key is compared against anything.
+_PIN_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+
+
+def _pin_resettable(key: str, base: dict[str, str]) -> bool:
+    """True iff the browser may put `key` back to the value this installation
+    ships. This is the single predicate behind both PinResetRequest's validation
+    and software_status's per-row `resettable` flag, so the button is never
+    offered for a key the verb refuses, and the reverse."""
+    return (key in base and key not in _PIN_RESET_EXCLUDED_KEYS
+            and not key.endswith(_PIN_RESET_EXCLUDED_SUFFIXES))
+
+
+@dataclass(frozen=True)
+class PinResetRequest:
+    """Remove one key from the untracked versions.local.env override, so the pin
+    goes back to the tracked versions.env value (the Software page's "Use repo
+    version" button). Every refusal message is browser-visible."""
+    key: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "PinResetRequest":
+        key = kw.get("key")
+        if not isinstance(key, str) or not _PIN_KEY_RE.match(key):
+            raise ValidationError("key must be a version pin name")
+        base = _parse_env_pins(VERSIONS_FILE)
+        if _pin_resettable(key, base):
+            return cls(key=key)
+        # Refused: _pin_resettable decided; the branches below only pick the words.
+        if key not in base:
+            raise ValidationError(
+                f"{key} is not a version pin this installation ships")
+        if key.endswith(_PIN_RESET_EXCLUDED_SUFFIXES):
+            raise ValidationError(
+                f"{key} is host configuration, not a version; it is not reset "
+                "from here")
+        raise ValidationError(
+            f"{key} is the version of a shared service; it changes through "
+            "its own Infrastructure control, not from here")
+
+
+def _remove_version_pin(key: str) -> bool:
+    """Remove every override line for `key` from versions.local.env. Returns True
+    when a line was removed, and False when there was nothing to remove (no
+    override file, or no line for the key), in which case nothing is written or
+    created.
+
+    The existence gate is the reader's own: _parse_env_pins checks exists() on the
+    UNRESOLVED path, so a missing file, a dangling link and a symlink loop all
+    read as "no override" there, and here they read as "nothing to remove". The
+    gate comes before resolve() because on Python < 3.13 resolve() raises
+    RuntimeError on a loop that the existence check already reported as absent.
+    The gate sits INSIDE the try, because the existence check re-raises any
+    error other than "not there" (EACCES through a symlinked override, for
+    one), and dispatch catches only ValidationError/HarnessError/SystemExit.
+
+    Every non-comment line whose key matches goes, duplicates included
+    (_parse_env_pins lets the last one win, so one left behind would keep the
+    override alive). Comments, blanks and other keys are kept byte for byte, in
+    order. The write is atomic (a tmp sibling, then os.replace), so a build
+    child calling load_versions never reads a truncated file. A symlinked
+    override is edited at its real location and the link survives, and the
+    file's mode is carried over. The tracked versions.env is never touched.
+
+    Failures map to ValidationError with a pathless reason (strerror, never
+    str(e)): the text reaches the browser verbatim."""
+    tmp = None
+    try:
+        if not VERSIONS_LOCAL_FILE.exists():
+            return False
+        target = VERSIONS_LOCAL_FILE.resolve()
+        tmp = target.with_name("." + target.name + ".tmp")
+        lines = target.read_text(encoding="utf-8").splitlines()
+        out = [ln for ln in lines
+               if not (ln.strip() and not ln.strip().startswith("#")
+                       and ln.strip().split("=", 1)[0].strip() == key)]
+        if len(out) == len(lines):
+            return False
+        tmp.write_text("\n".join(out) + "\n" if out else "", encoding="utf-8")
+        shutil.copymode(target, tmp)
+        os.replace(tmp, target)
+        return True
+    except (OSError, UnicodeDecodeError, RuntimeError) as e:
+        if isinstance(e, UnicodeDecodeError):
+            reason = "it is not valid UTF-8 text"
+        elif isinstance(e, OSError):
+            reason = e.strerror or "it could not be read"
+        else:
+            # RuntimeError: resolve() on a symlink loop, Python < 3.13 only, and
+            # reachable only if the file turns into a loop between the gate and
+            # resolve(). Not pinned by a test: the box's Python cannot raise it.
+            reason = "it could not be read"
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass        # best-effort cleanup; the ValidationError is the answer
+        raise ValidationError(
+            "the local version override could not be updated: " + reason) from None
+
+
+def pin_reset(req: PinResetRequest) -> dict:
+    """Put one pin back to the value this installation ships, by removing its key
+    from the untracked override. A key with no override line is a no-op success
+    (removed: False): a double click or a stale page is not an error. The new
+    effective value comes back so the caller can show it.
+
+    Residual: an `agent/editor/reader refresh` run from the host CLI, outside the
+    broker, writes the override with a non-atomic write_text. A reset that reads
+    the file during that write could replace it with a partial copy and drop
+    other pins. The broker refuses a reset while a browser-started refresh is in
+    flight, but it cannot see a CLI run."""
+    removed = _remove_version_pin(req.key)
+    return {"key": req.key, "removed": removed,
+            "value": load_versions().get(req.key)}
+
+
 def agent_apply_refresh(agent: str, version: str, ext_version: str = "") -> None:
     """Bump the CLI pin to `version` and — when the agent declares a companion
     editor extension — its pin to `ext_version`, both in the untracked
@@ -9100,7 +9235,12 @@ def software_status() -> dict:
         for tag, _dockerfile in _image_build_specs()
     ]
 
-    pins = [{"key": k, "value": effective[k], "override": k in override}
+    # `base` is the shipped value (None for an override-only key); `resettable`
+    # is what the Software page's "Use repo version" button keys on, from the
+    # same predicate PinResetRequest validates with.
+    pins = [{"key": k, "value": effective[k], "override": k in override,
+             "base": base.get(k),
+             "resettable": k in override and _pin_resettable(k, base)}
             for k in effective]
 
     return {

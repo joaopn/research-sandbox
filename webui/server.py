@@ -713,6 +713,28 @@ async def broker_models_default_handler(request: web.Request) -> web.Response:
     return web.json_response(reply, status=status)
 
 
+async def broker_pin_reset_handler(request: web.Request) -> web.Response:
+    """POST /broker/software/pin-reset {key} — put one version pin back to the
+    value this installation ships, by removing its key from the untracked
+    versions.local.env override (the Software page's "Use repo version"
+    button). Origin-checked because it POSTs and writes host state. Args are
+    HAND-PICKED — this handler is the fourth leg of the request-field ↔
+    PIN_RESET_WEBUI_FIELDS ↔ app.js payload lockstep. The value passes through
+    raw; the broker-side request refuses anything that is not a resettable pin
+    with a clean envelope."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    args = {"key": body.get("key")}
+    status, reply = await _relay(request, "pin_reset", args)
+    return web.json_response(reply, status=status)
+
+
 async def broker_software_handler(request: web.Request) -> web.Response:
     """GET /broker/software — read-only status of the host's agent/editor/reader
     dists, the built image fleet, and the effective version pins (gated). Mirrors
@@ -3939,6 +3961,7 @@ def main() -> None:
     app.router.add_get("/broker/software", broker_software_handler)
     app.router.add_post("/broker/software/build", broker_build_handler)
     app.router.add_post("/broker/software/refresh-check", broker_refresh_check_handler)
+    app.router.add_post("/broker/software/pin-reset", broker_pin_reset_handler)
     app.router.add_post("/broker/project", broker_create_handler)
     # attach is a fixed segment registered before the {action} variable so it
     # routes to the keyring handler, not the start|stop|update|destroy dispatcher

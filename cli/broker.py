@@ -363,6 +363,19 @@ def _verb_model_default_set(args: dict, _progress=None) -> dict:
     return rscore.model_default_set(req)
 
 
+def _verb_pin_reset(args: dict, _progress=None) -> dict:
+    """Remove one key from the untracked versions.local.env override, so the pin
+    reads the tracked versions.env value again (the Software page's "Use repo
+    version" button). Token-gated (NOT in OPEN_VERBS), not step-up (reversible
+    config). Inline is fine: a sub-ms file edit, no docker, no network. Every
+    file error maps to ValidationError in rscore, so nothing but the three
+    dispatch-caught exceptions can escape. dispatch refuses it while a refresh
+    that writes the same file is in flight (_PIN_WRITING_BUILD_VERBS)."""
+    safe = {k: v for k, v in args.items() if k in PIN_RESET_WEBUI_FIELDS}
+    req = rscore.PinResetRequest.from_kwargs(**safe)
+    return rscore.pin_reset(req)
+
+
 def _verb_workflows(_args: dict, _progress=None) -> dict:
     """The store catalog for the webui create form: built-ins + BYO, plus the
     agent enum and the default workflow. The webui image carries no `cli/`, so
@@ -995,6 +1008,19 @@ DEV_BOARD_EXPORT_WEBUI_FIELDS = frozenset({"passphrase"})
 # control). Name-shaped catalog tokens + a bool only — nothing host-shaped;
 # the contract is full-pair-or-clear (no partial writes).
 MODEL_DEFAULT_WEBUI_FIELDS = frozenset({"type", "model", "effort", "clear"})
+# Put one version pin back to the shipped value (the Software page's "Use repo
+# version" button). One name-shaped token; the request refuses anything that is
+# not a resettable pin of the tracked versions.env.
+PIN_RESET_WEBUI_FIELDS = frozenset({"key"})
+# The build-lane verbs that WRITE versions.local.env (each refresh calls
+# rscore._set_version_pin, a read-modify-write of the whole file). A pin reset
+# landing between one's read and write would be silently undone, or would undo
+# the bump, so dispatch refuses a reset while any of these is running or queued.
+# Pulls and the fleet rebuild only READ pins, so they do not block a reset.
+_PIN_WRITING_BUILD_VERBS = frozenset({"agent_refresh", "editor_refresh",
+                                      "reader_refresh"})
+# Inline verbs that write versions.local.env and so wait for the verbs above.
+_PIN_WRITE_VERBS = frozenset({"pin_reset"})
 
 
 def _verb_dev_repo_remove(args: dict, progress=None) -> dict:
@@ -1173,6 +1199,7 @@ VERBS = {
     "workflows": _verb_workflows,
     "models": _verb_models,
     "model_default_set": _verb_model_default_set,
+    "pin_reset": _verb_pin_reset,
     "software_status": _verb_software_status,
     "agent_refresh_check": _verb_agent_refresh_check,
     "editor_refresh_check": _verb_editor_refresh_check,
@@ -2643,6 +2670,12 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
         held = _gitea_held(verb) if verb in _GITEA_GATED_VERBS else None
         if held:
             return _audited(principal, "busy", _err("busy", held))
+        if verb in _PIN_WRITE_VERBS and any(
+                op.get("verb") in _PIN_WRITING_BUILD_VERBS
+                for op in _live_build_ops()):
+            return _audited(principal, "busy",
+                            _err("busy", "a software refresh is running or queued "
+                                         "— try again when it finishes"))
         project_key = _INLINE_PROJECT_KEY.get(verb)
         if project_key is not None and _project_in_flight(args.get(project_key)):
             return _audited(principal, "busy",

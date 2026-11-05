@@ -23,3 +23,6 @@ external/
 # Untracked per-instance version-pin override (wins over the tracked versions.env
 # base; written by `research agent/editor refresh`). Local upgrades stay local.
 versions.local.env
+# Temp file of an interrupted "Use repo version" reset (the override is written
+# atomically through it); never commit it.
+.versions.local.env.tmp
