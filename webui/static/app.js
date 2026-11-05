@@ -7067,14 +7067,12 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
     //  - a workflow with no agent selection (research, identified as today's
     //    "no agent cards" test, never by name) runs Claude whatever is sent, so
     //    its Claude badge is on and fixed and no agent set goes on the wire;
-    //  - a Docker-in-Docker workflow (sandbox-dind, dev, social-data-pipeline)
-    //    runs an agent only when one is selected, and then always runs Claude
-    //    too, so turning pi on turns Claude on and holds it there;
-    //  - a docker-substrate workflow deploys exactly the badges that are on.
+    //  - every other workflow (Docker-in-Docker: sandbox-dind, dev,
+    //    social-data-pipeline; and the docker substrate) gives the project
+    //    container exactly the badges that are on, each toggling on its own.
     // Staged agents only, the broker's default agent on: un-staged agents are
     // omitted so the POSTed set always validates in from_kwargs.
     const claudeOnlyWorkflow = !(showInBox || isDev);
-    const dindAgents = !isDocker && !claudeOnlyWorkflow;
     const stagedAgents = claudeOnlyWorkflow
         ? ["claude"]
         : agents.filter((a) => a && a.staged).map((a) => a.name);
@@ -7091,9 +7089,8 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
         return { name, cb, card };
     });
     const agentOn = (name) => agentChecks.some((c) => c.name === name && c.cb.checked);
-    // Claude is held on (not toggleable) on a Claude-only workflow, and on a
-    // Docker-in-Docker workflow while pi is on.
-    const claudeHeld = () => claudeOnlyWorkflow || (dindAgents && agentOn("pi"));
+    // Claude is held on (not toggleable) only on a Claude-only workflow.
+    const claudeHeld = () => claudeOnlyWorkflow;
 
     // pi's tab: its starting model (free text, `provider/model` — pi lists
     // models only after you log into a provider inside the project) and thinking
@@ -7145,9 +7142,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             const held = c.name === "claude" && claudeHeld();
             c.card.classList.toggle("selected", c.cb.checked);
             c.card.classList.toggle("locked", held);
-            c.card.title = !held ? ""
-                : claudeOnlyWorkflow ? "This workflow runs Claude."
-                : "pi in this project's container comes with Claude.";
+            c.card.title = held ? "This workflow runs Claude." : "";
         });
         const on = stagedAgents.filter((n) => agentOn(n) && agentPanels[n]);
         if (!on.includes(activeAgentTab)) activeAgentTab = on[0] || "";
@@ -7163,12 +7158,8 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
         Object.keys(agentPanels).forEach((n) => {
             agentPanels[n].style.display = n === activeAgentTab ? "" : "none";
         });
-        // Visible text, not only the badge's tooltip (a phone has no hover):
-        // why Claude cannot be turned off while pi is on.
         agentsHint.textContent = !stagedAgents.length
             ? "No agents available yet — pull one under Management → Software."
-            : (dindAgents && agentOn("pi"))
-                ? "pi in this project's container comes with Claude, so Claude stays on."
             : on.length ? ""
             : isDev ? "A dev project needs at least one agent."
             : "No agent: the project starts without one.";
@@ -10248,19 +10239,22 @@ function appendAgentsSection(box, project, enabled) {
                 ? current.join(", ") + " (set at create)" : "none (set at create)";
             if (current.length) {
                 upd.disabled = false;
-                upd.onclick = () => mgmtAgentsUpdateDialog(project.name, current, false, true);
+                upd.onclick = () => mgmtAgentsUpdateDialog(project.name, current, false, current);
             }
             return;
         }
         // A dind project's shared copy always carries claude, so its boxes may
-        // run claude even when the project's own terminal runs no agent.
-        // The dialog names what is DEPLOYED: the staged set (a dind project's always
-        // carries claude; research stages claude), not the project's own selection.
+        // run claude even when the project's own terminal runs it not, or no
+        // agent at all. The dialog names what is DEPLOYED: the staged set (a dind
+        // project's always carries claude; research stages claude), and says which
+        // of those reach the project's own terminal (agents_local).
         const deployedSet = Array.isArray(st.agents_staged) && st.agents_staged.length
             ? st.agents_staged : ["claude"];
-        const ownTerminal = st.flavor !== "sandbox-dind" || current.length > 0;
+        const localSet = Array.isArray(st.agents_local)
+            ? st.agents_local.filter((a) => deployedSet.includes(a))
+            : (st.flavor !== "sandbox-dind" || current.length > 0) ? deployedSet : [];
         upd.disabled = false;
-        upd.onclick = () => mgmtAgentsUpdateDialog(project.name, deployedSet, true, ownTerminal);
+        upd.onclick = () => mgmtAgentsUpdateDialog(project.name, deployedSet, true, localSet);
         if (st.flavor !== "sandbox-dind") {
             if (meta) meta.textContent = "claude (fixed on a research project)";
             return;
@@ -10337,11 +10331,43 @@ function mgmtAgentsDialog(name, current, addable) {
     });
 }
 
+// What the Agents Update dialog says about where the versions go. `local`: the
+// agents in the project's own container (its terminal and editor), `deployed`:
+// the agents the update refreshes (the staged set), `hasBoxes`: a project whose
+// boxes are refreshed too. A pi-only Docker-in-Docker project still refreshes
+// Claude for its boxes, but its own terminal and editor carry no Claude.
+function agentsUpdateHint(local, deployed, hasBoxes) {
+    const terminalAll = local.length > 0 && deployed.every((a) => local.includes(a));
+    const who = local.length && hasBoxes && terminalAll
+        ? "The project's terminal and every running box that carries agents get these versions"
+        : local.length && hasBoxes
+            ? "The project's terminal gets the " + local.join(", ") + " version" +
+              (local.length > 1 ? "s" : "") + ", and every running box that carries " +
+              "agents gets the versions of the agents it carries"
+        : local.length ? "The project's terminal gets these versions"
+        : "Every running box that carries agents gets these versions";
+    const extHere = local.includes("claude");
+    const extBoxes = hasBoxes && deployed.includes("claude");
+    const ext = extHere
+        ? " Claude Code's editor extension returns to the cached version too (reload " +
+          "an open editor window to pick it up)."
+        : extBoxes
+            ? " Claude Code's editor extension in the boxes returns to the cached version " +
+              "too (reload an open editor window to pick it up); the project's own editor " +
+              "has none."
+        : "";
+    return "Applied live — nothing is recreated, and logins, sessions and settings " +
+        "are kept. " + who + ", including over an agent you updated yourself." + ext +
+        " Restart running agent sessions afterwards to use the new versions." +
+        (hasBoxes ? " A stopped box keeps its copy until it runs during an update " +
+            "or is re-created." : "");
+}
+
 // The Update dialog behind the Agents section: names the cached versions it will
 // deploy (the Software page's own data, flagging a row that reads stale), says
 // what an update does and does not touch, and runs `agents_update` on the
 // lifecycle lane (its op log names each box refreshed or not).
-async function mgmtAgentsUpdateDialog(name, deployed, hasBoxes, ownTerminal) {
+async function mgmtAgentsUpdateDialog(name, deployed, hasBoxes, local) {
     let rows = [];
     try {
         const res = await fetch("/broker/software");
@@ -10364,18 +10390,7 @@ async function mgmtAgentsUpdateDialog(name, deployed, hasBoxes, ownTerminal) {
             el("p", {}, ["Deploys the versions cached on this host:"]),
             versions.length ? el("ul", {}, versions)
                 : el("p", { class: "hint" }, ["(the cached versions could not be read)"]),
-            el("div", { class: "hint" }, [
-                "Applied live — nothing is recreated, and logins, sessions and settings " +
-                "are kept. " + (ownTerminal && hasBoxes ? "The project's terminal and every " +
-                "running box that carries agents get"
-                    : ownTerminal ? "The project's terminal gets"
-                    : "Every running box that carries agents gets") + " these versions, including over " +
-                "an agent you updated yourself; Claude Code's editor extension returns to " +
-                "the cached version too (reload an open editor window to pick it up). " +
-                "Restart running agent sessions afterwards to use the new versions." +
-                (hasBoxes ? " A stopped box keeps its copy until it runs during an update " +
-                    "or is re-created." : ""),
-            ]),
+            el("div", { class: "hint" }, [agentsUpdateHint(local, deployed, hasBoxes)]),
         ],
         request: () => fetch(`/broker/project/${encodeURIComponent(name)}/agents_update`, {
             method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
@@ -10482,40 +10497,51 @@ function removeProjectFromSidebar(project) {
 // On the docker substrate the model is fixed at create (update refuses it), so we
 // show a note rather than a control the broker would reject — the editor's docker
 // treatment, same reasoning.
+// The section is about Claude's model in the project's own container (plus, on
+// research, the workers' and role-MCPs'), so it goes when Claude is not there —
+// a pi-only or agent-less Docker-in-Docker project, a docker project without
+// Claude (modelsSectionHidden). Removed after the section's one status fetch.
 function appendModelsSection(box, project, enabled) {
     const section = el("div", { class: "config-section" });
     section.appendChild(el("div", { class: "config-section-label" }, ["Models"]));
     const isDocker = !(enabled.supervisor && enabled.supervisor.box_harness);
+    let row = null;
+    let btn = null;
     if (isDocker) {
         section.appendChild(el("div", { class: "config-empty" }, [
             "Set at create on this project type.",
         ]));
-        box.appendChild(section);
-        return;
+    } else {
+        row = el("div", { class: "config-box-row" }, [
+            el("span", { class: "config-box-name" }, ["Agent models"]),
+            el("span", { class: "config-box-meta" }, ["…"]),
+        ]);
+        btn = el("button", { class: "btn btn-secondary" }, ["Change"]);
+        btn.disabled = true;
+        row.appendChild(btn);
+        section.appendChild(row);
     }
-    const row = el("div", { class: "config-box-row" }, [
-        el("span", { class: "config-box-name" }, ["Agent models"]),
-        el("span", { class: "config-box-meta" }, ["…"]),
-    ]);
-    const btn = el("button", { class: "btn btn-secondary" }, ["Change"]);
-    btn.disabled = true;
-    row.appendChild(btn);
-    section.appendChild(row);
     box.appendChild(section);
 
     // The worker/role pickers only apply to a research-flavor project; elsewhere
     // there is no worker layer and the backend rejects those fields outright, so
     // offering them would be a dead end. `flavor` rides the status payload.
     (async () => {
-        const cat = await ensureModelCatalog();
+        const cat = isDocker ? null : await ensureModelCatalog();
         let flavor = "";
+        let st = null;
         try {
             const res = await fetch(
                 `/projects/status?names=${encodeURIComponent(project.name)}`);
             const body = await res.json();
-            const st = body && body[project.name];
+            st = body && body[project.name];
             flavor = (st && st.flavor) || "";
         } catch (e) { /* flavor unknown → agent picker only */ }
+        if (modelsSectionHidden(st)) {
+            section.remove();
+            return;
+        }
+        if (isDocker) return;
         const meta = row.querySelector(".config-box-meta");
         if (!cat) {
             if (meta) meta.textContent = "unavailable";
@@ -10526,6 +10552,13 @@ function appendModelsSection(box, project, enabled) {
         btn.disabled = false;
         btn.onclick = () => mgmtModelsDialog(project.name, cat, hasWorkerLayer);
     })();
+}
+
+// Whether Config → Models goes for this project: only on a positive answer — a
+// status reply whose agents_local is a list without claude. A failed fetch or a
+// reply without the field keeps the section, as before.
+function modelsSectionHidden(st) {
+    return !!st && Array.isArray(st.agents_local) && !st.agents_local.includes("claude");
 }
 
 // The dialog behind the Models section. Every picker starts at "— unchanged —",

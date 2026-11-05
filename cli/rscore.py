@@ -1407,10 +1407,10 @@ class CreateRequest:
         # ["claude"]; a bare `sandbox` box, with no preset, stays agent-less), while
         # an EXPLICIT EMPTY set ([] — the webui's deselect-all, the CLI --no-agents)
         # means agent-less and must NOT be shadowed by the preset. The docker box
-        # deploys the full set (per-agent mounts); sandbox-dind deploys the whole
-        # staged set (the selection plus claude, _dind_stage_set) into its OWN
-        # ~/.local whenever ANY agent is selected, and nothing when none is
-        # (Option C — /opt/agent-dist is always staged as the box copy-source);
+        # deploys the full set (per-agent mounts); sandbox-dind deploys exactly
+        # the selection into its OWN ~/.local, and nothing when none is, while
+        # /opt/agent-dist always carries the selection plus claude as the box
+        # copy-source (Option C, _dind_agent_sets);
         # research ignores the set (noted in create(),
         # fleet floor below). Dedup preserving order so a box never double-mounts.
         raw_agents = kw.get("agents")
@@ -1428,10 +1428,10 @@ class CreateRequest:
                 raise ValidationError(
                     f"agent {a!r}: no cached dist — pull it under Management → Software first")
         # A dev project's whole point is an agent working its repo — refuse a dev
-        # create with none. ANY agent qualifies (pi alone included): repo-watch
-        # runs claude, but the dind stage set floors on claude (_dind_stage_set)
-        # and a non-empty selection deploys that whole set into the supervisor's
-        # ~/.local, so a claude-less dev project still carries a runnable claude.
+        # create with none. ANY agent qualifies (pi alone included): the project
+        # container gets exactly the selection, and nothing in it needs claude
+        # when the operator picked pi (the reviewer runs from the host cache in
+        # its own container, the editor installs only the extensions present).
         if dev_lane and not agents:
             raise ValidationError(
                 "a dev project needs at least one agent to work its repo — it "
@@ -3904,8 +3904,8 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         print("note: --repo/--setup-script apply only to the light-path docker "
               "box / sandbox-dind; ignoring for this workflow", file=sys.stderr)
     # --agent(s) deploys an agent-dist set into the docker box (STAGE_MULTI_AGENT);
-    # sandbox-dind honors claude on/off for the supervisor's OWN ~/.local (the
-    # deploy_local gate in step 6 below — B1 single-agent). Only on the research/
+    # sandbox-dind deploys exactly that set into the supervisor's OWN ~/.local
+    # (step 6 below, _dind_agent_sets). Only on the research/
     # overlay workflow is the explicit set unwired (the fleet uses the floor), so
     # it's noted-and-ignored there.
     if (not is_docker and project_type != PROJECT_TYPE_SANDBOX_DIND
@@ -4054,6 +4054,10 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         # box-create, never on restart. (Research carries no frozen pins — it stages
         # boxes LAZILY via box_add against the current versions.env pins.)
         marker["box_image_pins"] = _box_image_pins(load_versions())
+        # The project container's own ~/.local gets EXACTLY the recorded agents
+        # (_dind_agent_sets); a marker without this key is from before that and
+        # keeps claude in it whenever it records any agent.
+        marker["agents_exact"] = True
     if req.fetch:
         # Opt-in rs-fetch (any non-dev workflow; gated in from_kwargs): the
         # marker key drives the conditional re-stage of the fetch surface at
@@ -4261,15 +4265,16 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         if is_management:
             # Sandbox-dind is the docker `sandbox` flavor + DIND
             # (STAGE_SANDBOX_DIND_AGENT): the supervisor RUNS an agent itself and
-            # gets the light-path harness. /opt/agent-dist is ALWAYS staged (the
-            # copy-source any box's agent toggle deploys from — Option C), but the
-            # supervisor's OWN ~/.local gets the whole staged set (claude included,
-            # _dind_stage_set — its launchers + claude's settings) whenever the
-            # create selected ANY agent (deploy_local=bool(req.agents)); an
-            # agent-less create leaves the supervisor unwired.
+            # gets the light-path harness. /opt/agent-dist is ALWAYS staged with
+            # the selection plus claude (the copy-source any box's agent toggle
+            # deploys from — Option C), while the supervisor's OWN ~/.local gets
+            # exactly the agents ticked (_dind_agent_sets over the marker just
+            # written: a pi-only project runs no claude itself); an agent-less
+            # create leaves the supervisor unwired.
+            staged, local = _dind_agent_sets(marker)
             _report_warnings(_stage_agent_dist(
-                container_name, _dind_stage_set(req.agents),
-                deploy_local=bool(req.agents),
+                container_name, staged, deploy_local=bool(local),
+                **_local_deploy_kwargs(staged, local),
                 **({"pi_pair": pi_pair} if pi_pair else {})), progress)
             # Editor dist staged whenever cached so any box can RO-mount
             # /opt/editor-dist; deploy_local follows the RESOLVED code-server
@@ -4810,20 +4815,21 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     # project already carries is an idempotent re-stage, never a recreate.
     if (req.agents is not None and not touched and not req.rebuild and not enable_workers
             and not disable_workers and not req.role_mcp_upstream and not model_changes):
-        marker_now = _read_marker_agents(workspace_path)
-        staged = _dind_stage_set(marker_now)
+        staged, local = _read_dind_agent_sets(workspace_path)
         progress.step("agents", f"staging {'+'.join(agents_added or staged)} into the project")
         # deploy_local derived from the marker like every other call site (Option
         # C: an agent-less project's supervisor stays unwired); the validator
-        # already refuses an empty set, so this is True for every real add.
-        _report_warnings(_stage_agent_dist(container, staged, deploy_local=bool(marker_now),
+        # already refuses an empty set, so this is True for every real add. The
+        # supervisor's own home gets the local set, the boxes the staged one.
+        _report_warnings(_stage_agent_dist(container, staged, deploy_local=bool(local),
+                                           **_local_deploy_kwargs(staged, local),
                                            **_pi_pair_kwargs(workspace_path)), progress)
         # Running boxes follow live (an Add delivers the new agent wired; a
         # request that adds nothing is an Update). The editor extension: an Add
         # installs it only where none is (a supervisor that just gained claude);
         # an Update forces the shipped version back.
         update_form = not agents_added
-        if marker_now and not _install_agent_extensions(
+        if local and not _install_agent_extensions(
                 ["docker", "exec", "-u", "1000", "-e", "HOME=/home/research", container],
                 "/home/research", update_form):
             progress.step("agents", "the project's editor extension could not be installed")
@@ -7187,15 +7193,95 @@ def _dind_stage_set(agents: "Sequence[str]") -> list[str]:
     """The agent set a dind supervisor stages as its fleet copy-source: the
     project's selected agents PLUS claude (Option C — /opt/agent-dist is always a
     claude copy-source for the boxes/fleet, so an agent-less or claude-less
-    project still stages it). Dedup, default first. Selecting ANY agent deploys
-    this whole set into the supervisor's own ~/.local (the merged tree is one
-    copy); the per-agent split is the deferred convergence."""
+    project still stages it). Dedup, default first. This is the BOX side only:
+    what the project container's own ~/.local gets is the local set of
+    _dind_agent_sets, which a project created since the per-agent deploy keeps
+    to exactly its recorded agents."""
     return list(dict.fromkeys([DEFAULT_AGENT, *agents]))
+
+
+def _marker_recorded_agents(marker: object) -> list[str]:
+    """The marker's recorded `agents`, tolerant: a non-dict marker, a missing or
+    non-list key reads as [], non-string entries are dropped, order kept, dedup."""
+    raw = marker.get("agents") if isinstance(marker, dict) else None
+    if not isinstance(raw, list):
+        return []
+    return list(dict.fromkeys(a for a in raw if isinstance(a, str)))
+
+
+def _dind_agent_sets(marker: object) -> tuple[list[str], list[str]]:
+    """(staged, local) for a Docker-in-Docker project (the sandbox-dind flavor:
+    sandbox-dind, dev, social-data-pipeline), from its marker dict. Every dind
+    caller takes both from here and never confuses them:
+      • staged — the box copy-source (/opt/agent-dist, the live box refresh, the
+        box-agent refusal): the recorded agents plus claude, _dind_stage_set.
+      • local — what the project container's OWN ~/.local and ~/.claude get:
+        exactly the recorded agents on a project created since the per-agent
+        deploy (marker `agents_exact: true`, written at create, or by the first
+        agent add to a project recorded with an empty set — _write_marker_agents);
+        on an older project the staged set whenever it records any agent (it has
+        carried claude since its create, and taking a tool away at a stop/start
+        is the surprising direction); [] when it records none (deploy nothing).
+    Research and the docker substrate never come through here (research stages
+    and runs claude; the docker substrate deploys exactly its record).
+    TOLERANT MIRROR in webui/server.py (_agents_local_from_marker) — keep the
+    pair in lockstep; _marker_local_agents is this side of it."""
+    recorded = _marker_recorded_agents(marker)
+    staged = _dind_stage_set(recorded)
+    if isinstance(marker, dict) and marker.get("agents_exact") is True:
+        local = recorded
+    elif recorded:
+        local = staged
+    else:
+        local = []
+    return staged, local
+
+
+def _read_marker_dict(workspace_path: "Path") -> dict:
+    """The whole .orchestrator/project.json, tolerant: {} when it is missing,
+    unreadable or not a JSON object (the _read_marker_agents posture)."""
+    f = workspace_path / ".orchestrator" / "project.json"
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _read_dind_agent_sets(workspace_path: "Path") -> tuple[list[str], list[str]]:
+    """_dind_agent_sets over the project's marker on disk."""
+    return _dind_agent_sets(_read_marker_dict(workspace_path))
+
+
+def _local_deploy_kwargs(staged: "Sequence[str]", local: "Sequence[str]") -> dict:
+    """The `local=` argument _stage_agent_dist takes ONLY when the project's own
+    container must get fewer agents than the staged set — compared as SETS
+    (_dind_stage_set puts claude first while a record is often [pi, claude]),
+    and only when anything is deployed at all. Otherwise nothing, so the merged
+    deploy command and its callers' exact kwargs stay as they were."""
+    return {"local": list(local)} if local and set(local) != set(staged) else {}
+
+
+def _marker_local_agents(marker: object) -> list[str]:
+    """Which agents are in a project container's own ~/.local, for ANY project,
+    from its marker — the rscore side of webui/server.py's
+    _agents_local_from_marker (the browser's `agents_local`), pinned equal over a
+    marker table. Order matters: the docker substrate first (its marker carries
+    `type: research`) → exactly the record; any other non-sandbox-dind project
+    (research, or no marker) → claude; sandbox-dind → _dind_agent_sets' local.
+    Always a subset of what the project stages."""
+    data = marker if isinstance(marker, dict) else {}
+    if data.get("substrate") == Substrate.DOCKER.value:
+        return _marker_recorded_agents(data)
+    if data.get("type") != PROJECT_TYPE_SANDBOX_DIND:
+        return [DEFAULT_AGENT]
+    return _dind_agent_sets(data)[1]
 
 
 def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,),
                       *, deploy_local: bool = True, docker: bool = False,
-                      pi_pair: dict[str, str] | None = None) -> list[str]:
+                      pi_pair: dict[str, str] | None = None,
+                      local: "Sequence[str] | None" = None) -> list[str]:
     """Stage the host agent dists — the SET `agents`, merged — into a RUNNING
     supervisor (STAGE_AGENT_DIST slice 2; N agents since STAGE_PI_AGENT).
     Real files at AGENT_DIST_MOUNT — the inner fleet (worker / role-MCP /
@@ -7219,6 +7305,16 @@ def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,
     agent selection (marker `agents` on recreate): False leaves the supervisor
     UNWIRED (agent-less create, Option C) while the dist is still staged so its
     rs-sandbox-box boxes (FROM rs-analysis-base — no bake now) can deploy it.
+
+    `local` (dind only; _dind_agent_sets' local set, passed through
+    _local_deploy_kwargs ONLY when it differs from `agents` as a set) is what
+    the supervisor's own home gets when it is fewer agents than the staged
+    copy-source — a pi-only project keeps claude in /opt/agent-dist for its
+    boxes, but not in its own ~/.local. It must be a subset of `agents`. Then
+    the deploy copies only the roots of each local agent's EXCLUSIVE subtrees
+    (_exclusive_local_roots), as positional arguments, never spliced into the
+    script. Every agent's settings install keys on membership of the LOCAL set
+    (claude's ~/.claude included). Without it the merged command is unchanged.
 
     `pi_pair` (the marker's pi starting model + thinking level, callers pass it
     only when the project chose one) is merged into pi's settings in the SAME
@@ -7244,6 +7340,18 @@ def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,
     agents = list(dict.fromkeys(agents))
     if not agents:
         raise ValueError("_stage_agent_dist needs at least one agent")
+    if local is not None:
+        if isinstance(local, str):
+            raise TypeError("_stage_agent_dist takes a sequence of local agent names, not a string")
+        if docker:
+            raise ValueError("a docker-substrate deploy is the project's whole set; no local subset")
+        local = list(dict.fromkeys(local))
+        if not set(local) <= set(agents):
+            raise ValueError(f"the local agents {local} must be a subset of the staged {agents}")
+    local_set = agents if local is None else local
+    subset = deploy_local and not docker and set(local_set) != set(agents)
+    if subset and not local_set:
+        raise ValueError("a local deploy needs at least one local agent")
     for agent in agents:
         if not dist_present(agent):
             die(f"no cached {agent} dist to stage — pull it under Management → Software first")
@@ -7304,7 +7412,8 @@ def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,
         cmd = ["docker", "exec", "-i", "-u", "0", supervisor, "sh", "-c", extract]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                             stderr=subprocess.PIPE)
-    outcome = _stream_agent_dists(proc, agents)
+    per_agent: dict[str, set[str]] = {}
+    outcome = _stream_agent_dists(proc, agents, per_agent)
     _, err = proc.communicate()
     detail = (err.decode(errors="replace") if err else "").strip()
     if outcome == "broken":
@@ -7331,38 +7440,57 @@ def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,
         # the settings.json install is NO-CLOBBER so a baked/propagated settings —
         # chiefly the research supervisor's hook-bearing one from setup.sh, which is
         # boot-ordered to land first — is preserved (STAGE_AGENT_DIST_SETTINGS).
-        # claude is in every staged set by construction (_dind_stage_set floors
-        # on it; research passes [DEFAULT_AGENT]), so its settings install is
-        # unconditional and a claude-only command is byte-identical to the
-        # single-agent one; an agent whose config must ALSO land outside
-        # ~/.local adds its own fragment here, gated on its membership.
+        # Each agent's config outside ~/.local is gated on its membership of
+        # the LOCAL set (the agents this container itself runs) — never on the
+        # staged set, which always holds claude on dind. When claude is local
+        # the command is byte-identical to the single-agent one.
         # pi's: no-clobber into its agent dir (a restored stash's settings win),
         # and source-guarded so a download from before the layout moved is a
         # no-op, never a failure. GROUPED in ( … ): sh gives && and || equal,
         # left-to-right precedence, so an unwrapped `|| … ||` spliced into this
         # && chain would let a failed `cp -af` above fall through to the chown
         # and exit 0.
+        claude_local = DEFAULT_AGENT in local_set
         pi_dir = f"/home/research/{PI_AGENT_DIR_REL}"
         # The starting pair, when the project chose one, is merged inside the
         # SAME install branch (after the copy, before the trailing chown, which
         # fixes the root-written temp file's owner); the fragment always exits
         # 0, so it can never fail the install.
         pi_merge = (" && " + _pi_defaults_merge(f"{pi_dir}/settings.json")
-                    if pi_pair and "pi" in agents else "")
+                    if pi_pair and "pi" in local_set else "")
         pi_settings = (
             f"( [ ! -f {AGENT_DIST_MOUNT}/pi/settings.json ] || [ -e {pi_dir}/settings.json ] || "
             f"{{ mkdir -p {pi_dir} && cp {AGENT_DIST_MOUNT}/pi/settings.json {pi_dir}/settings.json"
             f"{pi_merge}; }} ) && "
-            if "pi" in agents else "")
+            if "pi" in local_set else "")
+        claude_settings = (
+            f"( [ -e /home/research/.claude/settings.json ] || "
+            f"cp {AGENT_DIST_MOUNT}/claude/settings.json "
+            f"/home/research/.claude/settings.json ) && "
+            if claude_local else "")
+        homes = ("/home/research/.local /home/research/.claude" if claude_local
+                 else "/home/research/.local")
+        if subset:
+            # Fewer agents than the shared copy: copy only the local agents'
+            # exclusive subtrees, rebuilding their parents (--parents), the
+            # names as positional arguments after `--` (they come from a cache
+            # a third-party installer filled). Nothing is written into the
+            # box-mounted /opt/agent-dist.
+            roots = _exclusive_local_roots(per_agent, local_set, agents)
+            if not roots:
+                die(f"staging into {supervisor} failed: the cached "
+                    f"{'+'.join(local_set)} download lists no files of its own")
+            copy = (f"cd {AGENT_DIST_MOUNT}/local && "
+                    f'cp -af --parents -- "$@" /home/research/.local/ && ')
+            tail = ["sh", *roots]
+        else:
+            copy = f"cp -af {AGENT_DIST_MOUNT}/local/. /home/research/.local/ && "
+            tail = []
         r = run_check(["docker", "exec", "-u", "0", *(_pi_env_args(pi_pair) if pi_merge else []),
                    supervisor, "sh", "-c",
-                   f"mkdir -p /home/research/.local /home/research/.claude && "
-                   f"cp -af {AGENT_DIST_MOUNT}/local/. /home/research/.local/ && "
-                   f"( [ -e /home/research/.claude/settings.json ] || "
-                   f"cp {AGENT_DIST_MOUNT}/claude/settings.json "
-                   f"/home/research/.claude/settings.json ) && "
-                   + pi_settings +
-                   f"chown -R 1000:1000 /home/research/.local /home/research/.claude"])
+                   f"mkdir -p {homes} && "
+                   + copy + claude_settings + pi_settings +
+                   f"chown -R 1000:1000 {homes}", *tail])
         if pi_merge and PI_DEFAULTS_SENTINEL in (r.stderr or ""):
             warnings.append(_PI_DEFAULTS_WARNING)
     return warnings
@@ -7378,7 +7506,37 @@ class _DistChanged(Exception):
     """A cached download changed under a transfer (see _stream_agent_dists)."""
 
 
-def _stream_agent_dists(proc, agents: "Sequence[str]") -> object:
+def _exclusive_local_roots(per_agent: "dict[str, set[str]]", local: "Sequence[str]",
+                           staged: "Sequence[str]") -> list[str]:
+    """The paths under the merged `local/` that hold ONLY the `local` agents'
+    files, as few as possible: for each local agent, its names under `local/`
+    (prefix stripped — the dist's top level also carries `claude/`, `pi/` and
+    their settings, which are not ~/.local content) that no OTHER staged agent
+    lists, and whose parent another agent does list (or which sit at the top).
+    tar lists every ancestor of every file, so a directory no other agent lists
+    holds only this agent's files and is copied whole; a shared directory is
+    descended into. The shared editor-extension slot needs no special case: the
+    same rule yields the agent's own leaf there. Sorted, deduplicated."""
+    def under_local(names: "set[str]") -> set[str]:
+        return {n[len("local/"):] for n in names if n.startswith("local/")}
+    roots: list[str] = []
+    for agent in local:
+        mine = under_local(per_agent.get(agent, set()))
+        others: set[str] = set()
+        for other in staged:
+            if other != agent:
+                others |= under_local(per_agent.get(other, set()))
+        for name in sorted(mine):
+            if name in others:
+                continue
+            parent = name.rpartition("/")[0]
+            if not parent or parent in others:
+                roots.append(name)
+    return sorted(dict.fromkeys(roots))
+
+
+def _stream_agent_dists(proc, agents: "Sequence[str]",
+                        per_agent: "dict[str, set[str]] | None" = None) -> object:
     """Write every agent's cached dist into `proc`'s stdin as ONE tar stream,
     then the completion marker. Returns None on success, else "broken" (the
     container side stopped reading — its stderr says why), "changed" (the
@@ -7392,12 +7550,16 @@ def _stream_agent_dists(proc, agents: "Sequence[str]") -> object:
     block. A Pull that completes between two files raises nothing, and one
     caught between its delete and its replace lists an empty directory; the
     sidecar bytes before/after and the per-agent launcher check catch both,
-    BEFORE the marker is written."""
+    BEFORE the marker is written.
+    The names are collected PER AGENT (directory headers included) into
+    `per_agent` when the caller passes a dict — the subset deploy derives each
+    agent's exclusive subtrees from them."""
     before = {a: _sidecar_snapshot(a) for a in agents}
-    names: set[str] = set()
+    names_by_agent: dict[str, set[str]] = {a: set() for a in agents}
+    current: list[str] = [agents[0]] if agents else [""]
 
     def _collect(ti: tarfile.TarInfo) -> tarfile.TarInfo:
-        names.add(ti.name)
+        names_by_agent.setdefault(current[0], set()).add(ti.name)
         return _root_owned(ti)
 
     outcome: object = None
@@ -7407,16 +7569,19 @@ def _stream_agent_dists(proc, agents: "Sequence[str]") -> object:
             # (local/, local/bin/, …) is a no-op mkdir for tar -x; the FILE sets
             # never overlap (see _stage_agent_dist's docstring).
             for agent in agents:
+                current[0] = agent
                 src = agent_dist_path(agent)
                 for entry in sorted(os.listdir(src)):
                     tf.add(os.path.join(src, entry), arcname=entry, filter=_collect)
             for agent in agents:
-                if f"local/bin/{_AGENT_INSTALL[agent]['bin']}" not in names:
+                if f"local/bin/{_AGENT_INSTALL[agent]['bin']}" not in names_by_agent[agent]:
                     raise _DistChanged(agent)
                 if _sidecar_snapshot(agent) != before[agent]:
                     raise _DistChanged(agent)
             marker = tarfile.TarInfo(STAGE_MARKER)
             tf.addfile(_root_owned(marker), io.BytesIO(b""))
+            if per_agent is not None:
+                per_agent.update(names_by_agent)
     except BrokenPipeError:
         outcome = "broken"
     except (_DistChanged, FileNotFoundError, NotADirectoryError):
@@ -9274,14 +9439,15 @@ def _recreate_supervisor(
     # cmd_project_create's matching branch.
     if md_ptype == PROJECT_TYPE_SANDBOX_DIND:
         # Sandbox-dind (STAGE_SANDBOX_DIND_AGENT): always re-stage /opt/agent-dist
-        # (the box copy-source), but re-deploy the supervisor's OWN ~/.local only
-        # if the create selected claude — the workspace marker's `agents` is the
-        # source (stamped at create, survives on the bind-mount; dind containers
-        # carry no agent label). Editor gated like research. No bake, so a
-        # recreate must redeploy. Before the role-MCP relaunch below.
-        marker_agents = _read_marker_agents(workspace_path)
-        _report_warnings(_stage_agent_dist(container, _dind_stage_set(marker_agents),
-                                           deploy_local=bool(marker_agents),
+        # (the box copy-source, the staged set), and re-deploy the supervisor's
+        # OWN ~/.local with the local set — both from the workspace marker
+        # (stamped at create, survives on the bind-mount; dind containers carry
+        # no agent label), so a stop/start keeps exactly what the project ran.
+        # Editor gated like research. No bake, so a recreate must redeploy.
+        # Before the role-MCP relaunch below.
+        staged, local = _read_dind_agent_sets(workspace_path)
+        _report_warnings(_stage_agent_dist(container, staged, deploy_local=bool(local),
+                                           **_local_deploy_kwargs(staged, local),
                                            **_pi_pair_kwargs(workspace_path)), progress)
         if editor_dist_present():
             _stage_editor_dist(container, deploy_local=flags.get("code-server", True))
@@ -11643,7 +11809,15 @@ def _write_marker_agents(workspace_path: "Path", agents: list[str]) -> None:
     if not isinstance(data, dict):
         raise ValidationError(
             f"cannot update the agent set: the project marker {f} is not a JSON object")
-    data["agents"] = list(dict.fromkeys(agents))
+    new = list(dict.fromkeys(agents))
+    # A project recorded with an EMPTY set has no claude in its own container to
+    # preserve, so its first agent add makes it exact (_dind_agent_sets): adding
+    # pi gives exactly pi. Only a PRESENT, empty list: a marker with no `agents`
+    # key at all may still carry claude from its original create.
+    current = data.get("agents")
+    if isinstance(current, list) and not current and new:
+        data["agents_exact"] = True
+    data["agents"] = new
     f.write_text(json.dumps(data, indent=2) + "\n")
 
 
@@ -11734,10 +11908,14 @@ def project_add_agents(project: str, agents: "Sequence[str]",
         req = UpdateRequest.from_kwargs(name=project, agents=marker_agents + list(agents))
         return update(req, cfg, progress=progress)
     _refuse_during_agent_build()
-    staged = [DEFAULT_AGENT] if is_research else _dind_stage_set(marker_agents)
-    deploy_local = is_research or bool(marker_agents)
+    # The staged set feeds the shared copy and the boxes; the local set is what
+    # the supervisor's own home gets (research: claude, both).
+    staged, local = (([DEFAULT_AGENT], [DEFAULT_AGENT]) if is_research
+                     else _read_dind_agent_sets(workspace_path))
+    deploy_local = bool(local)
     progress.step("agents", f"staging {'+'.join(staged)} into the project")
     _report_warnings(_stage_agent_dist(container, staged, deploy_local=deploy_local,
+                                       **_local_deploy_kwargs(staged, local),
                                        **_pi_pair_kwargs(workspace_path)), progress)
     if deploy_local and not _install_agent_extensions(
             ["docker", "exec", "-u", "1000", "-e", "HOME=/home/research", container],
@@ -13845,11 +14023,12 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     container = _running_dind_supervisor(req.project)
     workspace_path = workspace_path_for(req.project, cfg)
     # An agent this project never staged cannot reach the box (the merged
-    # copy-source holds the project's set + claude) — refuse by name, before any
-    # side effect, rather than mint a box whose tab says "command not found"
-    # (STAGE_PI_AGENT; the docker-substrate update takes the same posture).
+    # copy-source holds the project's set + claude, even where the project's own
+    # container runs fewer) — refuse by name, before any side effect, rather
+    # than mint a box whose tab says "command not found" (STAGE_PI_AGENT; the
+    # docker-substrate update takes the same posture).
     if req.agent not in (None, "none"):
-        carried = _dind_stage_set(_read_marker_agents(workspace_path))
+        carried = _read_dind_agent_sets(workspace_path)[0]
         if req.agent not in carried:
             raise ValidationError(
                 f"this project carries {', '.join(carried)} — add {req.agent!r} to "

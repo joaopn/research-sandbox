@@ -3,10 +3,11 @@
 # sandbox flavor PLUS inner Docker (DIND) (STAGE_SANDBOX_DIND_AGENT).
 #
 # This boots the inner dockerd + the rs-inner bridge (via mcp-reload), ssh, and
-# (when enabled) the editor. The agent (claude) and the rs-sandbox box harness are
-# NOT baked into this image — they're staged post-start by the host: _stage_agent_dist
-# (deploy_local=True) deploys claude into ~/.local AND populates /opt/agent-dist for
-# any boxes; _stage_rs_sandbox installs /usr/local/bin/rs-sandbox (the box harness is
+# (when enabled) the editor. The agents and the rs-sandbox box harness are NOT
+# baked into this image — they're staged post-start by the host: _stage_agent_dist
+# populates /opt/agent-dist for any boxes (the ticked agents plus claude) and, when
+# the project has agents, deploys the ones it runs into ~/.local (exactly the
+# ticked ones); _stage_rs_sandbox installs /usr/local/bin/rs-sandbox (the box harness is
 # a standing dind utility now — STAGE_DIND_UNIFY). So this entrypoint has NO agent-cp
 # block — it mirrors the research supervisor, which also relies on the post-start
 # staging. The MCP proxy tooling (mcp-reload, mcp_render_config.py) IS baked, so

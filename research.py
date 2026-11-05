@@ -386,8 +386,8 @@ def _print_create_report(res, cfg) -> None:
     history_block = (f"  {res.history_line}\n"
                      if getattr(res, "history_line", "") else "")
     # Agent dists (STAGE_MULTI_AGENT): shown when the create deployed some — a
-    # docker box's set, or sandbox-dind's claude (deploy_local); accurate either
-    # way ("~/.local" is exactly where both land). Research stays empty.
+    # docker box's set, or sandbox-dind's selection (exactly what its own
+    # ~/.local gets); accurate either way. Research stays empty.
     agent_block = (f"  Agents:    {', '.join(res.agents)} (deployed to ~/.local)\n"
                    if getattr(res, "agents", None) else "")
 

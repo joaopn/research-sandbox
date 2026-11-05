@@ -3022,6 +3022,29 @@ def _read_project_marker(project: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+def _agents_local_from_marker(marker: object) -> list[str]:
+    """Which agents are in the project container's OWN ~/.local (its terminal
+    and editor), from the marker alone. TOLERANT MIRROR of
+    rscore._marker_local_agents (the webui image carries no cli/; a pytest
+    extracts this function and pins the pair equal over a marker table).
+    Docker substrate first (its marker carries `type: research`): exactly the
+    record. Not sandbox-dind (research, or no marker): claude. Sandbox-dind:
+    exactly the record on a project marked `agents_exact: true`; on an older
+    one, claude plus the record when it records any agent; else nothing.
+    Always a subset of _agents_staged."""
+    data = marker if isinstance(marker, dict) else {}
+    raw = data.get("agents")
+    recorded = (list(dict.fromkeys(a for a in raw if isinstance(a, str)))
+                if isinstance(raw, list) else [])
+    if data.get("substrate") == "docker":
+        return recorded
+    if data.get("type") != "sandbox-dind":
+        return ["claude"]
+    if data.get("agents_exact") is True:
+        return recorded
+    return list(dict.fromkeys(["claude", *recorded])) if recorded else []
+
+
 def _agents_staged(project: str) -> list[str]:
     marker = _read_project_marker(project)
     agents = [a for a in (marker.get("agents") or []) if isinstance(a, str)]
@@ -3120,6 +3143,10 @@ def _project_summary(name: str) -> dict:
         # image carries no cli/, so review + the harness enforce the pair); on
         # the docker substrate exactly the marker's set.
         "agents_staged": _agents_staged(name),
+        # What the project container ITSELF runs (its terminal and editor) — on
+        # a dind project fewer than the staged set when the operator did not
+        # tick claude. Config → Models and the Agents Update dialog read it.
+        "agents_local": _agents_local_from_marker(marker),
     }
 
 
