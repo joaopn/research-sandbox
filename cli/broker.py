@@ -755,6 +755,15 @@ BOX_FOLDERS_WEBUI_FIELDS = frozenset({"project", "name", "folders"})
 # set the box is removed but its artifacts stay on disk. The step-up `proof`
 # stays OUT of the set (verified + consumed in dispatch, never forwarded).
 BOX_REMOVE_WEBUI_FIELDS = BOX_TARGET_WEBUI_FIELDS | {"keep_workspace"}
+# The ⚙ Sharing box's project folders. The read takes the project only; the
+# write takes the whole new set of paths RELATIVE to RS's data folder — the
+# backend appends the folder and runs the same gate as create
+# (rscore.resolve_data_mount_paths), so no request can name a host path. The
+# write only records the set (applied at the project's next start) and is
+# refused while that project has a start/stop/update in flight
+# (_INLINE_PROJECT_KEY). No step-up: nothing is destroyed or restarted.
+PROJECT_FOLDERS_WEBUI_FIELDS = frozenset({"project"})
+PROJECT_FOLDERS_SET_WEBUI_FIELDS = frozenset({"project", "folders"})
 
 
 def _verb_box_add(args: dict, progress=None) -> dict:
@@ -773,6 +782,18 @@ def _verb_box_folders(args: dict, _progress=None) -> dict:
     safe = {k: v for k, v in args.items() if k in BOX_FOLDERS_WEBUI_FIELDS}
     req = rscore.BoxFoldersRequest.from_kwargs(**safe)  # may raise ValidationError
     return dataclasses.asdict(rscore.box_folders(req))
+
+
+def _verb_project_folders(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in PROJECT_FOLDERS_WEBUI_FIELDS}
+    req = rscore.ProjectFoldersRequest.from_kwargs(**safe)  # may raise ValidationError
+    return dataclasses.asdict(rscore.project_folders(req))
+
+
+def _verb_project_folders_set(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in PROJECT_FOLDERS_SET_WEBUI_FIELDS}
+    req = rscore.ProjectFoldersSetRequest.from_kwargs(**safe)  # may raise ValidationError
+    return dataclasses.asdict(rscore.project_folders_set(req))
 
 
 def _verb_box_list(args: dict, _progress=None) -> dict:
@@ -1150,6 +1171,8 @@ VERBS = {
     "box_list": _verb_box_list,
     "box_presets": _verb_box_presets,
     "box_folders": _verb_box_folders,
+    "project_folders": _verb_project_folders,
+    "project_folders_set": _verb_project_folders_set,
     "port_add": _verb_port_add,
     "port_remove": _verb_port_remove,
     "box_web_address": _verb_box_web_address,
@@ -1980,6 +2003,7 @@ _PROC_READABLE = Path("/proc/self/cmdline").exists()
 _INLINE_PROJECT_KEY = {
     "destroy": "name",
     "box_add": "project", "box_remove": "project", "box_folders": "project",
+    "project_folders_set": "project",
     "port_add": "project", "port_remove": "project", "port_detect": "project",
     "box_web_address": "project",
 }

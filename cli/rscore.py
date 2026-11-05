@@ -1992,6 +1992,34 @@ class BoxFoldersRequest:
 
 
 @dataclass(frozen=True)
+class ProjectFoldersRequest:
+    """Read a project's folders for the ⚙ Sharing box."""
+    project: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "ProjectFoldersRequest":
+        return cls(project=_require_name(kw.get("project")))
+
+
+@dataclass(frozen=True)
+class ProjectFoldersSetRequest:
+    """Record a project's folders (paths relative to RS's data folder; the
+    whole new set, empty clears). Applied at the project's next start, never
+    here. The paths are checked by the data-folder gate in the verb."""
+    project: str
+    folders: tuple[str, ...] = ()
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "ProjectFoldersSetRequest":
+        folders = kw.get("folders")
+        if not isinstance(folders, (list, tuple)) or not all(
+                isinstance(f, str) for f in folders):
+            raise ValidationError("folders must be a list of folder paths")
+        return cls(project=_require_name(kw.get("project")),
+                   folders=tuple(folders))
+
+
+@dataclass(frozen=True)
 class BoxRemoveRequest:
     """Discard a sandbox box. Wipes its workspace unless ``keep_workspace`` is
     set (then the box is removed but its artifacts stay on disk). The step-up
@@ -2319,7 +2347,7 @@ def _prepare_mounts(paths: Sequence[str]) -> tuple[dict[str, Path], list[str]]:
                 die(f"mount path exists but is not a directory: {shown}")
             if not p.exists():
                 p.mkdir(parents=True, exist_ok=True)
-                print(f"created mount directory: {p}")
+                print(f"created mount directory: {shown}")
         except OSError as e:
             die(f"mount path cannot be prepared: {shown} ({e.strerror or e})")
         base = p.name
@@ -2332,6 +2360,207 @@ def _prepare_mounts(paths: Sequence[str]) -> tuple[dict[str, Path], list[str]]:
         basenames[base] = p
         extra_mounts += ["-v", f"{p}:/workspace/mnt/{base}:ro"]
     return basenames, extra_mounts
+
+
+# The ⚙ Sharing box records a project's folders here, applied the next time the
+# project's container is re-created (a dind start or update, a docker start
+# while a change is waiting, a docker editor toggle) — never immediately
+# (maintainer, 2026-11-05: "1b (warn that it applies on restart)"). Beside the
+# workspace, never inside it: the project's agent can write its workspace, and
+# a record it could edit would let it add folders to itself. The record holds
+# paths relative to RS's data folder and is re-checked by the same gate when
+# it is applied. No record = the old container's folders are kept, as before.
+FOLDERS_RECORD_NAME = "folders.json"
+_MNT_DST_PREFIX = "/workspace/mnt/"
+
+
+def _folders_record_path(workspace_path: Path) -> Path:
+    return workspace_path.parent / FOLDERS_RECORD_NAME
+
+
+def _read_folders_record(workspace_path: Path) -> "tuple[str, ...] | None":
+    """The saved folder set, or None when nothing was saved. Raises ValueError
+    on a record that cannot be read or is not the shape this module writes."""
+    f = _folders_record_path(workspace_path)
+    try:
+        raw = f.read_text()
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as e:
+        raise ValueError("the saved folders could not be read") from e
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        raise ValueError("the saved folders could not be read") from e
+    folders = data.get("folders") if isinstance(data, dict) else None
+    if not isinstance(folders, list) or not all(isinstance(x, str) for x in folders):
+        raise ValueError("the saved folders could not be read")
+    return tuple(folders)
+
+
+def _write_folders_record(workspace_path: Path, folders: Sequence[str]) -> None:
+    """Write the record whole (a fresh name renamed over the old one)."""
+    f = _folders_record_path(workspace_path)
+    tmp = f.with_name(f.name + ".tmp")
+    tmp.write_text(json.dumps({"folders": list(folders)}, indent=2) + "\n")
+    os.replace(tmp, f)
+
+
+def _bind_spec(spec: str) -> "tuple[str, str, bool]":
+    """(source, destination, read-only) of a docker ``-v src:dst[:ro]`` spec.
+    A destination never holds ':'; a source may."""
+    ro = spec.endswith(":ro")
+    body = spec[:-3] if ro else spec
+    src, _, dst = body.rpartition(":")
+    return src, dst, ro
+
+
+def _split_folder_binds(extra_mounts: Sequence[str], data_real: Path) -> "tuple[list[str], dict[str, str], list[str]]":
+    """Split a container's recovered binds (``_read_supervisor_metadata``'s
+    flat ``-v`` list) into (binds kept as they are, the data-folder folders
+    {/workspace/mnt name: source}, the other /workspace/mnt names). A
+    data-folder folder lands at exactly /workspace/mnt/<one name> from a
+    source strictly inside RS's data folder; every other bind — agent and
+    editor caches, folders from outside the data folder — is kept untouched."""
+    keep: list[str] = []
+    data: dict[str, str] = {}
+    fixed: list[str] = []
+    i = 0
+    while i < len(extra_mounts):
+        a = extra_mounts[i]
+        if a != "-v" or i + 1 >= len(extra_mounts):
+            keep.append(a)
+            i += 1
+            continue
+        spec = extra_mounts[i + 1]
+        i += 2
+        src, dst, _ro = _bind_spec(spec)
+        name = dst[len(_MNT_DST_PREFIX):] if dst.startswith(_MNT_DST_PREFIX) else ""
+        if name and "/" not in name.rstrip("/"):
+            name = name.rstrip("/")
+            if data_real in Path(src).parents:
+                data[name] = src
+            else:
+                fixed.append(name)
+                keep += ["-v", spec]
+            continue
+        keep += ["-v", spec]
+    return keep, data, fixed
+
+
+@dataclass
+class _FolderPlan:
+    record: "tuple[str, ...] | None"   # what was saved (None: nothing)
+    sources: "tuple[str, ...] | None"  # the saved set, checked (None: no record / refused)
+    mounted: dict                      # {name: source} mounted from the data folder now
+    fixed: list                        # other /workspace/mnt names
+    keep: list                         # binds kept as they are
+    problem: str                       # why the saved set cannot apply, or ""
+
+    @property
+    def pending(self) -> bool:
+        return (self.sources is not None
+                and set(self.sources) != set(self.mounted.values()))
+
+
+def _check_fixed_names(sources: Sequence[str], fixed: Sequence[str]) -> None:
+    """Refuse a data-folder folder whose last name is already a folder set
+    when the project was created (both would mount at one place)."""
+    for s in sources:
+        name = Path(s).name
+        if name in fixed:
+            raise ValidationError(
+                f"{name!r} would mount at /workspace/mnt/{name}/, which a folder "
+                f"set when the project was created already uses; pick a "
+                f"folder with another last name")
+
+
+def _folder_plan(workspace_path: Path, extra_mounts: Sequence[str]) -> _FolderPlan:
+    """What the next re-creation does with the project's folders. No record ⇒
+    nothing is read beyond the record's absence (no settings, no data folder),
+    so a project never saved in ⚙ behaves exactly as before. A record is
+    re-checked by the browser gate and the fixed-name check; a refusal is
+    returned as ``problem`` (the saved set is then not applied)."""
+    try:
+        record = _read_folders_record(workspace_path)
+    except ValueError as e:
+        return _FolderPlan(None, None, {}, [], list(extra_mounts), str(e))
+    if record is None:
+        return _FolderPlan(None, None, {}, [], list(extra_mounts), "")
+    try:
+        data_real = rs_data_dir().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return _FolderPlan(record, None, {}, [], list(extra_mounts),
+                           "RS's data folder could not be resolved")
+    keep, mounted, fixed = _split_folder_binds(extra_mounts, data_real)
+    try:
+        sources = resolve_data_mount_paths(record)
+        _check_fixed_names(sources, fixed)
+    except ValidationError as e:
+        return _FolderPlan(record, None, mounted, fixed, keep, str(e))
+    return _FolderPlan(record, sources, mounted, fixed, keep, "")
+
+
+def _apply_folder_plan(workspace_path: Path, extra_mounts: Sequence[str],
+                       progress=None) -> "tuple[list[str], list[str]]":
+    """(the binds the re-created container gets, the /workspace/mnt names it no
+    longer has). Runs BEFORE the old container is touched: any refusal or
+    error leaves the old binds, with a warning line, and nothing else."""
+    plan = _folder_plan(workspace_path, extra_mounts)
+    if plan.problem:
+        _report_warnings([f"the saved project folders were not applied: "
+                          f"{plan.problem}; the project keeps its current "
+                          f"folders"], progress)
+        return list(extra_mounts), []
+    if plan.sources is None or not plan.pending:
+        return list(extra_mounts), []
+    try:
+        names, new_binds = _prepare_mounts(plan.sources)
+    except (SystemExit, OSError, RuntimeError, ValueError):
+        _report_warnings(["the saved project folders were not applied: a folder "
+                          "could not be prepared; the project keeps its current "
+                          "folders"], progress)
+        return list(extra_mounts), []
+    gone = [n for n in plan.mounted if n not in names and n not in plan.fixed]
+    return plan.keep + new_binds, gone
+
+
+def _remove_mount_points(workspace_path: Path, names: Sequence[str],
+                         container: str) -> None:
+    """Remove the now-empty mount points of folders a re-created container no
+    longer mounts (docker made them inside the workspace), one by name and only
+    when empty, so the agent does not see an empty folder where a dataset was.
+    Called once the new container runs. From the host first, through a handle
+    on workspace/mnt opened WITHOUT following a link (the project's agent can
+    write its workspace and could put a link there; the host never follows
+    it). Where the host user may not (a docker project's /workspace/mnt stays
+    root-owned: only the dind entrypoints hand it back) or the folder is a
+    link, from inside the container as root, still a non-recursive rmdir of
+    that one name. Best-effort: a folder that is not empty or cannot be
+    removed stays. Residual: on a privileged dind project a box restarted by
+    its inner daemon with the old folder in its binds can make it again."""
+    if not names:
+        return
+    try:
+        fd = os.open(workspace_path / "mnt",
+                     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        fd = None
+    try:
+        for n in names:
+            if fd is not None:
+                try:
+                    os.rmdir(n, dir_fd=fd)
+                    continue
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    pass
+            run(["docker", "exec", "-u", "0", container, "rmdir", "--",
+                 f"/workspace/mnt/{n}"], capture_output=True)
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def _coerce_export_port(value: Any) -> int:
@@ -3465,6 +3694,22 @@ class BoxFoldersResult:
 
 
 @dataclass
+class ProjectFoldersResult:
+    """The ⚙ Sharing box's view of a project's folders. Paths are relative to
+    RS's data folder and names are /workspace/mnt/<name> names: no host path,
+    except ``data_dir`` — the data folder's own location, shown so the operator
+    knows where to put datasets (the create dialog shows it too)."""
+    project: str
+    folders: list          # the saved set, or the mounted one when none was saved
+    mounted: list          # data-folder folders the container has right now
+    fixed: list            # other /workspace/mnt names, set at creation
+    pending: bool          # the saved set applies at the next start
+    problem: str           # why the saved set cannot be applied now, or ""
+    rebuilds: bool         # the applying start re-creates a docker project
+    data_dir: str
+
+
+@dataclass
 class BoxRemoveResult:
     project: str
     name: str
@@ -4323,8 +4568,17 @@ def start(req: StartStopRequest, cfg: "Config" | None = None,
             continue
         print(f"=== Starting project: {c['project']} ===")
         if _container_substrate(c["name"]) == Substrate.DOCKER.value:
-            progress.step("start", "starting container")
-            _start_docker_substrate(c["project"], cfg, progress)
+            # Folders saved in ⚙ change the container's binds, which only a
+            # re-creation can do on this substrate (the agent logs in again —
+            # the ⚙ warning says so).
+            if _docker_folders_pending(c["project"], cfg, progress):
+                progress.step("recreate", "re-creating the project with its new folders")
+                _recreate_docker_substrate(
+                    c["project"], cfg, service_flags=_read_service_flags(c["name"]),
+                    progress=progress, heal_gitea=True)
+            else:
+                progress.step("start", "starting container")
+                _start_docker_substrate(c["project"], cfg, progress)
         else:
             progress.step("recreate", "recreating supervisor")
             _recreate_supervisor(c["project"], cfg, progress=progress)
@@ -8878,9 +9132,14 @@ def _recreate_supervisor(
     was_running = container_running(container)
     workspace_path = workspace_path_for(project, cfg)
 
+    md = _read_supervisor_metadata(container)
+    # The project's folders, decided BEFORE anything is touched: a saved ⚙
+    # change that cannot apply leaves the old binds (and says so), and nothing
+    # here can fail after the logins were stashed or the container removed.
+    extra_mounts, gone_mounts = _apply_folder_plan(
+        workspace_path, md["extra_mounts"], progress)
     _stash_creds_for_rebuild(container, was_running, workspace_path)
     _stash_git_auth_for_rebuild(container, was_running, workspace_path)
-    md = _read_supervisor_metadata(container)
 
     # The sysbox recreate dance (rm + create + re-stage) exists because sysbox
     # loses its volume bindings on stop. A docker-substrate project is a plain
@@ -8933,8 +9192,8 @@ def _recreate_supervisor(
         # The deployed set, from the marker (research markers carry [] → no env).
         agents=_read_marker_agents(workspace_path),
     )
-    if md["extra_mounts"]:
-        docker_args = docker_args[:-1] + md["extra_mounts"] + [docker_args[-1]]
+    if extra_mounts:
+        docker_args = docker_args[:-1] + extra_mounts + [docker_args[-1]]
     # build_supervisor_docker_args emits ["run", "-d", ...]; convert to create.
     assert docker_args[0] == "run" and docker_args[1] == "-d"
     create_args = ["create"] + docker_args[2:]
@@ -8947,6 +9206,9 @@ def _recreate_supervisor(
 
     print(f"starting {container}...")
     run_check(["docker", "start", container])
+    # The old container (the only one that mounted them) is gone, so a removed
+    # folder's mount point is an ordinary empty folder now.
+    _remove_mount_points(workspace_path, gone_mounts, container)
 
     router_ip = get_router_ip(network)
     inject_route(container, router_ip)
@@ -9149,6 +9411,49 @@ def _container_substrate(container: str) -> str:
     return s or Substrate.DIND_SYSBOX.value
 
 
+def _heal_docker_dev_gitea(project: str, cfg: "Config", network: str) -> None:  # type: ignore[name-defined]
+    """Universal dev-lane heal on a docker project's start (STAGE_DEV_GITEA S3):
+    symmetric with the dind start path (whose heal rides _recreate_supervisor)
+    — a pre-gitea docker project started individually gets wired + staged here
+    instead of waiting for a global `research start`. Best-effort: gitea
+    sickness must never fail a project start; a gitea-less start is
+    byte-equivalent (gate below)."""
+    try:
+        if _resume_gitea(require=False):
+            ip = _connect_gitea_to_project_network(network)
+            if ip:
+                _stage_dev_gitea(project, cfg, gitea_ip=ip)
+    except SystemExit:
+        print("warning: rs-gitea unavailable; dev wiring not refreshed",
+              file=sys.stderr)
+
+
+def _docker_folders_pending(project: str, cfg: "Config", progress=None) -> bool:  # type: ignore[name-defined]
+    """Whether a docker project's start must re-create its container to apply
+    folders saved in ⚙. A saved set the gate now refuses is NOT pending (a
+    re-creation would apply nothing and cost the agent's login): the start
+    stays a plain start and says why the folders were not applied."""
+    md = _read_supervisor_metadata(container_name_for(project))
+    plan = _folder_plan(workspace_path_for(project, cfg), md["extra_mounts"])
+    if plan.problem:
+        _report_warnings([f"the saved project folders were not applied: "
+                          f"{plan.problem}; the project keeps its current "
+                          f"folders"], progress)
+        return False
+    if not plan.pending:
+        return False
+    # Prepare the folders now (the re-creation would make them anyway): a
+    # folder that cannot be made must not cost a rebuild that applies nothing.
+    try:
+        _prepare_mounts(plan.sources)
+    except (SystemExit, OSError, RuntimeError, ValueError):
+        _report_warnings(["the saved project folders were not applied: a folder "
+                          "could not be prepared; the project keeps its current "
+                          "folders"], progress)
+        return False
+    return True
+
+
 def _start_docker_substrate(project: str, cfg: "Config",  # type: ignore[name-defined]
                             progress=None) -> None:
     """Start a stopped `docker`-substrate project. Unlike a sysbox supervisor
@@ -9161,19 +9466,7 @@ def _start_docker_substrate(project: str, cfg: "Config",  # type: ignore[name-de
     run_check(["docker", "start", container])
     network = project_network_for(project)
     inject_route(container, get_router_ip(network))
-    # Universal dev-lane heal (STAGE_DEV_GITEA S3): symmetric with the dind
-    # start path (whose heal rides _recreate_supervisor) — a pre-gitea docker
-    # project started individually gets wired + staged here instead of waiting
-    # for a global `research start`. Best-effort: gitea sickness must never
-    # fail a project start; a gitea-less start is byte-equivalent (gate below).
-    try:
-        if _resume_gitea(require=False):
-            ip = _connect_gitea_to_project_network(network)
-            if ip:
-                _stage_dev_gitea(project, cfg, gitea_ip=ip)
-    except SystemExit:
-        print("warning: rs-gitea unavailable; dev wiring not refreshed",
-              file=sys.stderr)
+    _heal_docker_dev_gitea(project, cfg, network)
     # Opt-in fetch surface (marker-gated; universal staging RETIRED): a stop
     # keeps the container fs, but re-staging keeps the wiring fresh (gitea's
     # IP on this network can change across the stop).
@@ -9262,7 +9555,7 @@ def _update_docker_substrate(req: "UpdateRequest", cfg: "Config",  # type: ignor
 
 def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[name-defined]
                                service_flags: dict[str, bool],
-                               progress=None) -> None:
+                               progress=None, heal_gitea: bool = False) -> None:
     """Recreate a `docker`-substrate (plain runc) box to apply a service-flag
     change. Far simpler than _recreate_supervisor: no inner dockerd, no image
     re-staging, no creds-stash dance (the box re-auths in place — greenfield-
@@ -9276,6 +9569,11 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
     md = _read_supervisor_metadata(container)
     if md.get("substrate") != Substrate.DOCKER.value:
         die(f"_recreate_docker_substrate called for non-docker project {project!r}")
+    # The project's folders, decided before anything is touched (the same rule
+    # as _recreate_supervisor): a saved ⚙ change that cannot apply leaves the
+    # old binds and says so.
+    folder_mounts, gone_mounts = _apply_folder_plan(
+        workspace_path, md["extra_mounts"], progress)
 
     # Git auth (GitHub key + commit identity) rides the container's writable
     # layer, which the rm below destroys — carry it through the workspace
@@ -9324,7 +9622,7 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
         pi_pair=_read_pi_pair(workspace_path))
     # Recovered binds minus any prior editor-dist mount (agent-dist + --mount folders
     # pass through); re-derive the editor mount from the new flag (mirrors create).
-    extra = _without_mount(md["extra_mounts"], EDITOR_DIST_MOUNT)
+    extra = _without_mount(folder_mounts, EDITOR_DIST_MOUNT)
     if service_flags.get("code-server") and editor_dist_present():
         extra += ["-v", f"{EDITOR_DIST_DIR}:{EDITOR_DIST_MOUNT}:ro"]
     if extra:
@@ -9332,7 +9630,14 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
 
     print(f"creating new container from {MINIMAL_IMAGE}...")
     run_check(["docker", *docker_args])
+    # The old container (the only one that mounted them) is gone, so a removed
+    # folder's mount point is an ordinary empty folder now.
+    _remove_mount_points(workspace_path, gone_mounts, container)
     inject_route(container, get_router_ip(network))
+    # A start that re-creates the project (to apply saved folders) still owes
+    # the start path's Gitea repair, before the web steps below read it.
+    if heal_gitea:
+        _heal_docker_dev_gitea(project, cfg, network)
     # Node seed (STAGE_NODE_SEED, D3): the rm + run wiped ~/.local, so re-deploy node
     # into the fresh container fs. The node bind survived (recovered above; only the
     # EDITOR mount is stripped), so _deploy_node has a live copy-source. WITHOUT this,
@@ -14057,6 +14362,73 @@ def box_list(req: "BoxListRequest", _progress=None) -> BoxListResult:  # type: i
     return BoxListResult(project=req.project, boxes=boxes,
                          folder_choices=choices,
                          folder_choices_error=choices_error)
+
+
+def _project_folders_view(project: str, workspace_path: Path,
+                          md: dict) -> ProjectFoldersResult:
+    """The ⚙ view of one project's folders from its container metadata and
+    its record. Names only — never a host path (``data_dir`` aside)."""
+    data = rs_data_dir()
+    try:
+        data_real = data.resolve()
+    except (OSError, RuntimeError, ValueError):
+        raise ValidationError("RS's data folder could not be resolved")
+    _keep, mounted, fixed = _split_folder_binds(md["extra_mounts"], data_real)
+    mounted_rel = [str(Path(src).relative_to(data_real)) for src in mounted.values()]
+    plan = _folder_plan(workspace_path, md["extra_mounts"])
+    saved = plan.record
+    return ProjectFoldersResult(
+        project=project,
+        folders=list(saved) if saved is not None else mounted_rel,
+        mounted=mounted_rel,
+        fixed=sorted(fixed),
+        pending=plan.pending,
+        problem=plan.problem,
+        rebuilds=md.get("substrate") == Substrate.DOCKER.value,
+        data_dir=str(data))
+
+
+def _project_folders_md(project: str) -> dict:
+    container = container_name_for(project)
+    if not container_exists(container):
+        die(f"project {project!r} has no container right now")
+    return _read_supervisor_metadata(container)
+
+
+def project_folders(req: "ProjectFoldersRequest", _progress=None) -> ProjectFoldersResult:  # type: ignore[name-defined]
+    """The ⚙ Sharing box's read: the saved folders (or the mounted ones when
+    none were saved), what is mounted now, the folders set at creation that
+    the browser cannot change, and whether a saved change waits for the next
+    start. A docker inspect plus one small file read."""
+    cfg = load_config()
+    md = _project_folders_md(req.project)
+    return _project_folders_view(req.project, workspace_path_for(req.project, cfg), md)
+
+
+def project_folders_set(req: "ProjectFoldersSetRequest", _progress=None) -> ProjectFoldersResult:  # type: ignore[name-defined]
+    """Record a project's folders (paths relative to RS's data folder) for its
+    next start. Nothing restarts here (maintainer, 2026-11-05). The paths pass
+    the same gate as create, plus a check against the folders set at creation
+    (a shared last name would mount both at one place); a refusal records
+    nothing. The record is written beside the workspace, whole."""
+    cfg = load_config()
+    md = _project_folders_md(req.project)
+    workspace_path = workspace_path_for(req.project, cfg)
+    sources = resolve_data_mount_paths(req.folders)
+    try:
+        data_real = rs_data_dir().resolve()
+    except (OSError, RuntimeError, ValueError):
+        raise ValidationError("RS's data folder could not be resolved")
+    _keep, _mounted, fixed = _split_folder_binds(md["extra_mounts"], data_real)
+    _check_fixed_names(sources, fixed)
+    rel = [str(Path(s).relative_to(data_real)) for s in sources]
+    if not workspace_path.parent.is_dir():
+        raise ValidationError(f"project {req.project!r} has no folder on disk")
+    try:
+        _write_folders_record(workspace_path, rel)
+    except OSError:
+        raise ValidationError("the folders could not be saved")
+    return _project_folders_view(req.project, workspace_path, md)
 
 
 def box_folders(req: "BoxFoldersRequest", _progress=None) -> BoxFoldersResult:  # type: ignore[name-defined]

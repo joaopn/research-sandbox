@@ -5887,6 +5887,11 @@ function boxShareLine(rows) {
         : "No box here shares files with the project.";
 }
 
+// The ⚙ Project folders line under its field (the long form rides the ⓘ).
+const PROJECT_FOLDERS_SHORT =
+    "Paths in RS's data folder, comma-separated. Read-only in the project " +
+    "at /workspace/mnt/<name>/.";
+
 // The one line shown under a box's folder field (box window and ⚙ Box
 // folders); the full explanation below rides the section title's ⓘ.
 const BOX_FOLDERS_SHORT =
@@ -8219,8 +8224,11 @@ async function mgmtBoxAddDialog(project) {
     const foldersCb = el("input", { type: "checkbox" });
     const foldersI = el("input", { type: "text", autocomplete: "off",
                                    placeholder: "data, results/run3" });
+    // The input sits in a .field for the shared input style (the Sharing box
+    // around it is deliberately not one — see the dialog body); no <label>
+    // inside, so the .field label bleed does not apply.
     const foldersEntry = el("div", { class: "box-folders-entry" }, [
-        foldersI,
+        el("div", { class: "field" }, [foldersI]),
         el("div", { class: "hint" }, [BOX_FOLDERS_SHORT]),
     ]);
     const foldersInfo = infoIcon(BOX_FOLDERS_HINT + "\n\n" +
@@ -8417,14 +8425,23 @@ async function mgmtBoxAddDialog(project) {
                 el("div", { class: "box-opt-group" }, [
                     el("div", { class: "box-opt-caption" }, ["Extensions"]),
                     el("div", { class: "box-opt-cards" },
-                       [editorCard, fetchCard, browserCard, historyCard, shareCard]),
+                       [editorCard, fetchCard, browserCard, historyCard]),
                     historyHint,
-                    shareHint,
                 ]),
                 el("div", { class: "box-opt-group" }, [
                     el("div", { class: "box-opt-caption" }, ["MCP tools"]),
                     mcpList,
                 ]),
+            ]),
+            // Sharing: what the box shares with the project — its mailbox
+            // (Share files, every box type) and the project folders it reads
+            // (hidden on a dev preset, which takes none). A bordered box like
+            // Settings but NOT a `.field`: its label/input rules would restyle
+            // the tickbox and its label (the `.field` bleed).
+            el("div", { class: "box-settings box-sharing" }, [
+                el("div", { class: "box-settings-label" }, ["Sharing"]),
+                el("div", { class: "box-opt-cards" }, [shareCard]),
+                shareHint,
                 foldersGroup,
             ]),
             fieldsGroup,
@@ -10088,6 +10105,7 @@ function makeProjectConfigBox(project) {
         // Ports render even with no tabs loaded — register before you start serving.
         appendExportedPortsSection(box, project);
         appendDetectedAppsSection(box, project);
+        appendSharingSection(box, project, null);
         appendSidebarSection(box, project);
         return box;
     }
@@ -10128,7 +10146,7 @@ function makeProjectConfigBox(project) {
     ]));
     appendExportedPortsSection(box, project);
     appendDetectedAppsSection(box, project);
-    appendBoxFoldersSection(box, project, enabled);
+    appendSharingSection(box, project, enabled);
     appendEditorExtensionSection(box, project, enabled);
     appendModelsSection(box, project, enabled);
     appendAgentsSection(box, project, enabled);
@@ -10785,6 +10803,142 @@ async function fillPassthroughList(view, table) {
             "refuse connections until one of the claims is removed.",
         ]));
     }
+}
+
+// ⚙ Sharing: everything that shares folders with the project, in one bordered
+// box on every project (stopped ones and ones whose tabs never loaded too) —
+// the project's own folders, then, on a dind project with boxes, Box folders.
+// `enabled` is null in the panel's short form (no tabs loaded), where only the
+// project's folders show.
+function appendSharingSection(box, project, enabled) {
+    const sharing = el("div", { class: "config-sharing" }, [
+        el("div", { class: "config-sharing-label" }, ["Sharing"]),
+    ]);
+    box.appendChild(sharing);
+    appendProjectFoldersSection(sharing, project);
+    if (enabled) appendBoxFoldersSection(sharing, project, enabled);
+}
+
+// The ⚙ text for a saved folder change that waits for the next start. A dind
+// project applies it at its next start or Update; a docker project (a plain
+// sandbox) only at Stop then Start, which then re-creates its container.
+function projectFoldersPendingText(r) {
+    if (r.rebuilds) {
+        return "Saved. The change applies when the project next starts " +
+               "(Stop, then Start, in Management). That start rebuilds the " +
+               "project: its agent must log in again, and anything installed " +
+               "outside /workspace is gone.";
+    }
+    return "Saved. The change applies when the project next starts: Stop, " +
+           "then Start, or Update, in Management.";
+}
+
+// ⚙ Project folders: the project's folders in RS's data folder, read-only at
+// /workspace/mnt/<last name>/. Saving checks the paths exactly as create does
+// and RECORDS them; nothing restarts — they apply at the project's next start
+// (maintainer, 2026-11-05), and the section says so while a change waits.
+// Folders set when the project was created from outside the data folder are
+// listed by name and cannot be changed here.
+function appendProjectFoldersSection(box, project) {
+    const section = el("div", { class: "config-section" });
+    const label = el("div", { class: "config-section-label" }, ["Project folders"]);
+    section.appendChild(label);
+    const content = el("div", {}, [el("div", { class: "config-empty" }, ["Loading…"])]);
+    section.appendChild(content);
+    box.appendChild(section);
+    const url = `/broker/project/${encodeURIComponent(project.name)}/folders`;
+    (async () => {
+        let res = null, b = null;
+        try {
+            res = await fetch(url);
+            try { b = await res.json(); } catch (e) { b = {}; }
+        } catch (e) { b = null; }
+        if (!b || !res.ok || !b.ok || !b.result) {
+            content.replaceChildren(el("div", { class: "config-empty" },
+                [(b && mgmtErrText(b)) || "Couldn't load the folders."]));
+            return;
+        }
+        const first = b.result;
+        const foldersI = el("input", { type: "text", autocomplete: "off",
+                                       class: "config-folders-input",
+                                       placeholder: "my-dataset, surveys/2024" });
+        const saveBtn = el("button", { class: "btn btn-secondary" }, ["Save"]);
+        const fixedEl = el("div", { class: "config-hint" });
+        const pendingEl = el("div", { class: "config-hint" });
+        const status = el("div", { class: "config-hint" });
+        const draw = (r) => {
+            foldersI.value = (r.folders || []).join(", ");
+            const fixed = Array.isArray(r.fixed) ? r.fixed : [];
+            fixedEl.replaceChildren(...(fixed.length ? [
+                "Also mounted, set when the project was created (it cannot be " +
+                "changed here): " + fixed.map((n) => "/workspace/mnt/" + n).join(", "),
+            ] : []));
+            const lines = [];
+            if (r.problem) {
+                lines.push(el("div", { class: "config-box-warn" }, [
+                    "⚠ The saved folders cannot be applied: " + r.problem +
+                    ". The project keeps its current folders."]));
+            } else if (r.pending) {
+                lines.push(el("div", { class: "config-box-warn" },
+                              ["⚠ " + projectFoldersPendingText(r)]));
+            }
+            pendingEl.replaceChildren(...lines);
+        };
+        saveBtn.onclick = async () => {
+            const folders = parseFolderList(foldersI.value);
+            const bad = folders.find((p) => p.startsWith("/") || p.startsWith("~"));
+            if (bad) {
+                status.replaceChildren(el("div", {}, [
+                    "Folder paths are relative to RS's data folder (got: " + bad + ")."]));
+                return;
+            }
+            saveBtn.disabled = true;
+            status.replaceChildren(el("div", {}, ["Saving…"]));
+            try {
+                const r = await fetch(url, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ folders }),
+                });
+                let rb; try { rb = await r.json(); } catch (e) { rb = {}; }
+                if (!r.ok || !rb.ok || !rb.result) {
+                    status.replaceChildren(el("div", {},
+                        ["Couldn't save: " + (mgmtErrText(rb) || r.status)]));
+                    return;
+                }
+                draw(rb.result);
+                // A waiting change is announced by its own warning line
+                // (which starts "Saved."); only the no-op save needs a word.
+                status.replaceChildren(...(rb.result.pending || rb.result.problem ? [] : [
+                    el("div", {}, ["Saved — the project already has these folders."])]));
+            } catch (e) {
+                status.replaceChildren(el("div", {}, ["Couldn't save: connection failed."]));
+            } finally {
+                saveBtn.disabled = false;
+            }
+        };
+        draw(first);
+        const info = infoIcon(
+            "Comma-separated paths relative to RS's data folder on this host" +
+            (first.data_dir ? " (" + first.data_dir + ")" : "") + ", for example " +
+            "my-dataset or surveys/2024. Each is mounted read-only at " +
+            "/workspace/mnt/<last name>/ inside the project: the agent, every " +
+            "worker and every role service see it, and a box when it is given to " +
+            "it. A folder that does not exist yet is created; a link is refused. " +
+            "Saving does not restart anything: the change applies the next time " +
+            "the project starts, and a folder taken away disappears from the " +
+            "project then.");
+        label.append(" ", info.icon);
+        content.replaceChildren(
+            info.detail,
+            foldersI,
+            el("div", { class: "config-box-row config-save-row" }, [saveBtn]),
+            el("div", { class: "config-hint" }, [PROJECT_FOLDERS_SHORT]),
+            fixedEl,
+            pendingEl,
+            status,
+        );
+    })();
 }
 
 // ⚙ Box folders: which project folders a box reads, read-only at /mnt/<path>.

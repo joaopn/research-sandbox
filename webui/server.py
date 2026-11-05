@@ -1116,6 +1116,30 @@ async def broker_box_folders_handler(request: web.Request) -> web.Response:
     return web.json_response(reply, status=status)
 
 
+async def broker_project_folders_handler(request: web.Request) -> web.Response:
+    """GET /broker/project/{name}/folders — the ⚙ Sharing box's read (gated).
+    POST {folders} — record the project's folders, paths relative to RS's
+    data folder, for its next start (gated, origin-checked). Both relay
+    synchronously; the broker's PROJECT_FOLDERS*_WEBUI_FIELDS are the input
+    boundary and these dicts the hand-picked second filter in front of them
+    (keep the two in lockstep)."""
+    project = request.match_info.get("name", "")
+    if request.method == "GET":
+        status, reply = await _relay(request, "project_folders", {"project": project})
+        return web.json_response(reply, status=status)
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    args = {"project": project, "folders": body.get("folders")}
+    status, reply = await _relay(request, "project_folders_set", args)
+    return web.json_response(reply, status=status)
+
+
 async def broker_boxes_handler(request: web.Request) -> web.Response:
     """GET /broker/project/{name}/boxes — the project's sandbox boxes with live
     container state (gated). A fast read (no op log); relayed synchronously."""
@@ -3738,6 +3762,12 @@ def main() -> None:
     # Box folders change — a fixed segment, so it too precedes {action}.
     app.router.add_post(
         "/broker/project/{name}/box-folders", broker_box_folders_handler)
+    # The ⚙ Sharing box's project folders — the POST is a fixed segment, so it
+    # too precedes {action}.
+    app.router.add_get(
+        "/broker/project/{name}/folders", broker_project_folders_handler)
+    app.router.add_post(
+        "/broker/project/{name}/folders", broker_project_folders_handler)
     # Dev-box provision (webui-first B) — a fixed segment that MUST precede the
     # {action} catch-all below (first-match-wins, else "dev-box" is swallowed
     # as an action).
