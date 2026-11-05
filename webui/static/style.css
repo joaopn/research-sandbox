@@ -1538,6 +1538,10 @@ html.mobile .project-rail .rail-separator { cursor: default; }
     padding: 10px 12px;
 }
 .box-settings-label { font-weight: 600; color: var(--fg-base); margin-bottom: 8px; }
+/* The create dialog's Sharing box (app.js sharingBox): a bordered box like
+   Settings but not a .field, so it takes .field's bottom margin here, plus a
+   top margin so the inline clone tickbox above does not sit on its border. */
+.create-sharing { margin: 8px 0 12px; }
 .box-opt-group { margin: 8px 0; }
 .box-opt-caption {
     font-size: 12px;

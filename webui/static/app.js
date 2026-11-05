@@ -7332,6 +7332,15 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
     };
     // The tokens the payload sends: split on commas, trimmed, empties dropped.
     const mountPaths = () => parseFolderList(mountI.value);
+    // The Sharing box: everything that adds folders to the project, in a
+    // bordered sub-box like Settings. Deliberately NOT a `.field` (Settings is
+    // one, and its label/input rules would restyle the tickbox and its label);
+    // the `.create-sharing` margin stands in for `.field`'s.
+    const sharingBox = el("div", { class: "box-settings create-sharing" }, [
+        el("div", { class: "box-settings-label" }, ["Sharing"]),
+        mountToggle,
+        mountGroup,
+    ]);
 
     // Dev variant inputs — its OWN url/PAT fields, NOT the light-path repoI/patI
     // (different semantics: this URL is mirrored into the shared Gitea and the
@@ -7393,7 +7402,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             enableField,
             settingsRegion,
             ...(showClone ? [cloneToggle, cloneGroup] : []),
-            mountToggle, mountGroup,
+            sharingBox,
             el("div", { class: "hint" }, [
                 "Creating stages container images and can take 10–30s (longer cold).",
             ]),
