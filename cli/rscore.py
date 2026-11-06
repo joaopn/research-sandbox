@@ -4362,6 +4362,9 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
                 container_name, staged, deploy_local=bool(local),
                 **_local_deploy_kwargs(staged, local),
                 **({"pi_pair": pi_pair} if pi_pair else {})), progress)
+            # The working-mode suite (I33): into the shared copy for the boxes,
+            # and into the project container's own agents.
+            _report_warnings(_stage_harness(container_name, local), progress)
             # Editor dist staged whenever cached so any box can RO-mount
             # /opt/editor-dist; deploy_local follows the RESOLVED code-server
             # flag (default ON since the editor-by-default slice — a
@@ -4989,6 +4992,8 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         _report_warnings(_stage_agent_dist(container, staged, deploy_local=bool(local),
                                            **_local_deploy_kwargs(staged, local),
                                            **_pi_pair_kwargs(workspace_path)), progress)
+        # The working-mode suite (I33), before the box refresh below.
+        _report_warnings(_stage_harness(container, local), progress)
         # Running boxes follow live (an Add delivers the new agent wired; a
         # request that adds nothing is an Update). The editor extension: an Add
         # installs it only where none is (a supervisor that just gained claude);
@@ -7883,6 +7888,80 @@ def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,
     return warnings
 
 
+# The working-mode suite (I33): RS's `doer` / `checker` subagents, the `harness`
+# skill and the standing-mode rules file, for Claude Code and pi alike. Tracked
+# source, streamed into a Docker-in-Docker project's shared agent copy at every
+# stage (so it travels with RS's code, never with a cached download), and laid
+# into each agent's own config area by ONE installer that the project container
+# and every box run (container/harness/install.sh says what it writes).
+HARNESS_SRC = SCRIPT_DIR / "container" / "harness"
+HARNESS_STAGE_DIR = f"{AGENT_DIST_MOUNT}/rs-harness"
+HARNESS_INSTALLER = f"{HARNESS_STAGE_DIR}/install.sh"
+# Printed by the installer on stdout when it could not write a file (it always
+# exits 0: a missing suite never stops a start).
+HARNESS_FAILED_SENTINEL = "RS_HARNESS_INSTALL_FAILED"
+_HARNESS_WARNING = ("the working-mode files (doer, checker, the harness skill) could not "
+                    "all be installed into the project's agent; the agent runs without them")
+
+
+# The suite's files, named: what ships is exactly this list, never whatever else
+# a host checkout happens to hold in the folder (an editor's swap file, a stray).
+# The installer checks the same names before it writes anything.
+HARNESS_FILES = ("install.sh", "agents/doer.md", "agents/checker.md", "skill/SKILL.md",
+                 "modes/direct.md", "modes/planner-doer-checker.md")
+
+
+def _harness_tar() -> bytes:
+    """HARNESS_FILES as one root-owned tar (paths relative to HARNESS_SRC). A
+    missing file raises OSError, which `_stage_harness` turns into its warning."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for rel in HARNESS_FILES:
+            tar.add(HARNESS_SRC / rel, arcname=rel, filter=_root_owned)
+    return buf.getvalue()
+
+
+def _harness_env(agents: "Sequence[str]") -> list[str]:
+    """`-e` args for the installer: the agents it writes for."""
+    return ["-e", f"RS_HARNESS_AGENTS={' '.join(agents)}"]
+
+
+def _stage_harness(container: str, local: "Sequence[str]") -> list[str]:
+    """Stage the working-mode suite into a RUNNING Docker-in-Docker project
+    container and lay it into the container's own agents. Called right after
+    `_stage_agent_dist` at the four Docker-in-Docker staging points (that step
+    empties the shared copy in place, so the suite is re-streamed every time),
+    and before any live box refresh, which runs the same installer in the boxes.
+    Never research: its supervisor has its own role, and its boxes must never
+    find an installer. Two steps:
+      • the tracked files into HARNESS_STAGE_DIR (root writes /opt, then hands
+        the folder to uid 1000 like the rest of the shared copy) — always, so a
+        box finds the installer even when the project container runs no agent;
+      • the installer, as the agent user, when the container runs any agent
+        (`local`, the project's own set).
+    Returns the operator-facing warnings; NEVER dies — it runs in the middle of
+    a start, where a refusal would leave the project half up."""
+    try:
+        data = _harness_tar()
+    except OSError:
+        return [_HARNESS_WARNING]
+    r = subprocess.run(
+        ["docker", "exec", "-i", "-u", "0", container, "sh", "-c",
+         f"mkdir -p {HARNESS_STAGE_DIR} && tar -C {HARNESS_STAGE_DIR} -x && "
+         f"chown -R 1000:1000 {HARNESS_STAGE_DIR}"],
+        input=data, capture_output=True)
+    if r.returncode != 0:
+        return [_HARNESS_WARNING]
+    if not local:
+        return []
+    r = run(["docker", "exec", "-u", "1000", "-e", "HOME=/home/research",
+             *_harness_env(local), container, "sh", HARNESS_INSTALLER],
+            capture_output=True)
+    if r.returncode != 0 or HARNESS_FAILED_SENTINEL in (r.stdout or ""):
+        return [_HARNESS_WARNING]
+    return []
+
+
 def _root_owned(ti: tarfile.TarInfo) -> tarfile.TarInfo:
     ti.uid = ti.gid = 0
     ti.uname = ti.gname = ""
@@ -8099,6 +8178,16 @@ def _refresh_running_boxes(supervisor: str, agents: "Sequence[str]", progress,
         if ok and not _install_agent_extensions(
                 [*inner, "-u", "1000", "-e", f"HOME={_BOX_HOME}", box], _BOX_HOME, force_ext):
             progress.step("agents", f"box {box}: the editor extension could not be installed")
+        # The working-mode suite (I33): the same installer the box ran at its
+        # start, with the box's own mode and pairs from its environment and the
+        # agent set it now carries; skipped where the shared copy has no
+        # installer (a research project). Its own exec, never part of `deploy`.
+        if ok:
+            h = run([*inner, "-u", "1000", "-e", f"HOME={_BOX_HOME}", *_harness_env(agents),
+                     box, "sh", "-c", f"[ ! -f {HARNESS_INSTALLER} ] || sh {HARNESS_INSTALLER}"],
+                    capture_output=True)
+            if h.returncode != 0 or HARNESS_FAILED_SENTINEL in (h.stdout or ""):
+                progress.step("agents", f"box {box}: the working-mode files could not all be installed")
         (refreshed if ok else failed).append(box)
         progress.step("agents", f"box {box}: {'refreshed' if ok else 'NOT refreshed' + why}")
     progress.step("agents", f"{len(refreshed)} box(es) refreshed, {len(failed)} not refreshed"
@@ -10031,6 +10120,9 @@ def _recreate_supervisor(
         _report_warnings(_stage_agent_dist(container, staged, deploy_local=bool(local),
                                            **_local_deploy_kwargs(staged, local),
                                            **_pi_pair_kwargs(workspace_path)), progress)
+        # The working-mode suite (I33): the shared copy's was just emptied, and
+        # the boxes this start re-runs find the installer there.
+        _report_warnings(_stage_harness(container, local), progress)
         if editor_dist_present():
             _stage_editor_dist(container, deploy_local=flags.get("code-server", True))
         # Reader dist re-staged (STAGE_READER): survives the recreate so a
@@ -12634,6 +12726,10 @@ def project_add_agents(project: str, agents: "Sequence[str]",
     _report_warnings(_stage_agent_dist(container, staged, deploy_local=deploy_local,
                                        **_local_deploy_kwargs(staged, local),
                                        **_pi_pair_kwargs(workspace_path)), progress)
+    if not is_research:
+        # The working-mode suite (I33), before the box refresh below runs its
+        # installer in each box. Never research (its boxes must find none).
+        _report_warnings(_stage_harness(container, local), progress)
     if deploy_local and not _install_agent_extensions(
             ["docker", "exec", "-u", "1000", "-e", "HOME=/home/research", container],
             "/home/research", True):

@@ -26,18 +26,17 @@ the maintainer's directives record it.
 
 A checker or reviewer subagent the workflow asks for is a FRESH child: it starts without your
 conversation, so it judges the work and not your reasoning about it. Never fork your own
-session for it. Unless the project's instructions name another agent, launch it under the
-name your runtime ships:
+session for it. Unless the project's instructions name another agent, launch the ones RS
+ships, under the same names in Claude Code and pi:
 
-- **Claude Code** — the general-purpose agent.
-- **pi** — the `delegate` agent. pi's subagents have no `general-purpose` agent and refuse
-  an unknown name. `delegate` runs on your model, starts with no files read, and loads the
-  same project instructions, area rules and read-before-edit check as your session. pi's
-  `reviewer` agent has no shell: it sees only uncommitted changes, never a branch's diff
-  against its base, and cannot run a test. pi's external-CLI agents (`claude-code`,
-  `codex-exec`, `cursor-agent`) are other programs: pi's area rules and read-before-edit
-  check do not reach them.
+- **`checker`** — a read-only reviewer. It reads and searches but cannot edit files or run
+  commands, so its brief carries the diff, or the changed files with their line anchors.
+- **`doer`** — implementation help: one unit of work from a self-contained brief.
 - **Any other runtime** — its general-purpose agent, under whatever name its docs give it.
+
+Where no agent by those names exists (a box inside a research project, or a project not
+restarted since RS gained them), use the general-purpose agent in Claude Code or the
+`delegate` agent in pi.
 
 Put the whole brief in the task, self-contained: the child knows nothing you do not write
 there, and pi refuses a single-agent launch whose task is empty.

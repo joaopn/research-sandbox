@@ -1466,6 +1466,46 @@ def _install_repo_watch(cname: str) -> None:
                   f"failed: {(r.stderr or r.stdout).strip()}", file=sys.stderr)
 
 
+# The working-mode suite's installer in the project's shared agent copy (I33) —
+# MIRROR of rscore.HARNESS_INSTALLER / HARNESS_FAILED_SENTINEL (this file cannot
+# import rscore). Present on every Docker-in-Docker project the host staged it
+# into; absent on research, where a box therefore installs nothing.
+HARNESS_INSTALLER = f"{AGENT_DIST_MOUNT}/rs-harness/install.sh"
+HARNESS_FAILED_SENTINEL = "RS_HARNESS_INSTALL_FAILED"
+
+
+def _box_carried_agents() -> list[str]:
+    """Every agent an agent box receives: the shared copy is the project's
+    recorded set plus claude, deployed whole into each agent box — MIRROR of
+    rscore._dind_stage_set (pytest-pinned equal)."""
+    return list(dict.fromkeys(["claude", *_project_agents()]))
+
+
+def _install_harness(cname: str, agents: list[str]) -> None:
+    """Lay the working-mode suite (RS's doer/checker subagents, the harness
+    skill, the standing-mode rules file) into a freshly run agent box, as the
+    box user. Run from here rather than from the box image so it reaches boxes
+    whose project froze an older box image, and at every run, because a re-run
+    box starts from a fresh home. `agents` is what the box carries (the shared
+    copy deploys the project's whole set); the box's mode and pairs come from
+    its own environment (set at `docker run` from its entry).
+    DETACHED, after the box's own boot: the entrypoint copies the agents into
+    ~/.local while it boots, and pi's agent dir lives under ~/.local, so an
+    installer running alongside that copy makes the copy fail (measured: the
+    entrypoint died on `cannot create directory … File exists` and the box
+    restarted). The exec waits for ~/.rs-role, which the entrypoint writes after
+    its agent deploy. No time bound is needed: a pending exec dies with the
+    box's process when it stops or restarts. Never fatal; a failed install
+    leaves the box without the suite until the next refresh or re-run."""
+    r = _docker("exec", "-d", "-u", "1000", "-e", "HOME=/home/worker",
+                "-e", f"RS_HARNESS_AGENTS={' '.join(agents)}", cname, "sh", "-c",
+                # one-second poll: the boot copy takes seconds; finer buys nothing
+                f"until [ -e /home/worker/.rs-role ]; do sleep 1; done; sh {HARNESS_INSTALLER}")
+    if r.returncode != 0:
+        print(f"warning: the working-mode files could not be installed into box "
+              f"{cname!r}; it runs without them", file=sys.stderr)
+
+
 # Per-agent env for a BOX (home /home/worker) — MIRROR of rscore._agent_env
 # (this file is staged into the supervisor standalone and cannot import rscore;
 # the pytest pins the two equal after home substitution). Registry order; claude
@@ -1759,6 +1799,11 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     # command-relevance — see _install_repo_watch).
     if dev:
         _install_repo_watch(cname)
+    # The working-mode suite, wherever the box mounts the shared agent copy and
+    # the project staged an installer into it (never research). Checked in this
+    # container's own filesystem, where the shared copy is a real directory.
+    if agent_mount and os.path.isfile(HARNESS_INSTALLER):
+        _install_harness(cname, _box_carried_agents())
     # F3 Slice 2b: launch the in-box loopback forwarders for the freshly-run box.
     _launch_box_forwarders(cname, lp_list)
     return folder_warnings + mailbox_warnings + history_warnings
