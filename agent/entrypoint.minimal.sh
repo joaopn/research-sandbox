@@ -78,6 +78,24 @@ if [[ -d /opt/agent-dist ]]; then
         if [[ -f "$agent_src"claude/settings.json && ! -e ~/.claude/settings.json ]]; then
             mkdir -p ~/.claude
             cp "$agent_src"claude/settings.json ~/.claude/settings.json
+            # The project's chosen Claude model + effort (RS_CLAUDE_* set at
+            # docker run from the project's record), merged into the settings
+            # just installed and nowhere else: a later choice made inside
+            # Claude (/model, /effort) is never reset. jq reads the values as
+            # arguments, never shell text; a failed merge leaves Claude on its
+            # own default. Mirrors rscore's CLAUDE_SETTINGS_JQ (pinned).
+            claude_model="${RS_CLAUDE_MODEL:-}"
+            claude_effort="${RS_CLAUDE_EFFORT:-}"
+            if [[ -n "$claude_model$claude_effort" ]]; then
+                cmo=keep; [[ -n "$claude_model" ]] && cmo=set
+                ceo=keep; [[ -n "$claude_effort" ]] && ceo=set
+                { jq --arg mo "$cmo" --arg m "$claude_model" --arg eo "$ceo" --arg e "$claude_effort" \
+                     '(.model // "") as $old | (if $mo == "set" then $m else $old end) as $k | if $mo == "set" then .model = $m elif $mo == "clear" then del(.model) else . end | if $mo == "keep" then . else .env = ((.env // {}) + {"ANTHROPIC_MODEL": ""}) end | if $eo == "set" and $e == "max" then .env = ((.env // {}) + {"CLAUDE_CODE_EFFORT_LEVEL": "max"}) | del(.effortLevel) | if $k == "" or ((.modelSettings // {}) | has($k) | not) then . else .modelSettings[$k] |= del(.effortLevel) end elif $eo == "set" then .env = ((.env // {}) + {"CLAUDE_CODE_EFFORT_LEVEL": ""}) | .effortLevel = $e | if $k == "" then . else .modelSettings = ((.modelSettings // {}) | .[$k] = ((.[$k] // {}) + {"effortLevel": $e})) end elif $eo == "clear" then .env = ((.env // {}) + {"CLAUDE_CODE_EFFORT_LEVEL": ""}) | del(.effortLevel) | if $k == "" or ((.modelSettings // {}) | has($k) | not) then . else .modelSettings[$k] |= del(.effortLevel) end else . end' \
+                     ~/.claude/settings.json > ~/.claude/settings.json.rs-tmp \
+                  && mv ~/.claude/settings.json.rs-tmp ~/.claude/settings.json; } \
+                    || { rm -f ~/.claude/settings.json.rs-tmp
+                         echo "warning: could not write Claude's chosen model into its settings; Claude starts on its own default" >&2; }
+            fi
         fi
         # pi's canonical settings ride beside local/ (pi/settings.json) — no-clobber
         # into its agent dir, so what the operator changes in pi is never reset.

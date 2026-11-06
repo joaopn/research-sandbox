@@ -1017,7 +1017,10 @@ async def broker_project_action_handler(request: web.Request) -> web.Response:
                       "supervisor_model", "supervisor_effort",
                       "worker_model", "worker_effort",
                       "role_model", "role_effort",
-                      "agents"):
+                      "agents", "pi_model", "pi_thinking", "reset",
+                      "harness_mode", "doer_model", "checker_model",
+                      "pi_doer_model", "pi_doer_thinking",
+                      "pi_checker_model", "pi_checker_thinking"):
                 if req_body.get(k) is not None:
                     args[k] = req_body[k]
     if action == "destroy":
@@ -1211,6 +1214,16 @@ async def broker_project_folders_handler(request: web.Request) -> web.Response:
         body = {}
     args = {"project": project, "folders": body.get("folders")}
     status, reply = await _relay(request, "project_folders_set", args)
+    return web.json_response(reply, status=status)
+
+
+async def broker_project_agents_handler(request: web.Request) -> web.Response:
+    """GET /broker/project/{name}/agents — the ⚙ Agents box's read (gated,
+    read-only): the project's agents and what each one runs, read from the
+    agents' own settings files. Synchronous relay; the broker's
+    PROJECT_AGENTS_WEBUI_FIELDS is the input boundary."""
+    project = request.match_info.get("name", "")
+    status, reply = await _relay(request, "project_agents", {"project": project})
     return web.json_response(reply, status=status)
 
 
@@ -4068,6 +4081,9 @@ def main() -> None:
         "/broker/project/{name}/folders", broker_project_folders_handler)
     app.router.add_post(
         "/broker/project/{name}/folders", broker_project_folders_handler)
+    # The ⚙ Agents box's read (I33 slice 3).
+    app.router.add_get(
+        "/broker/project/{name}/agents", broker_project_agents_handler)
     # Dev-box provision (webui-first B) — a fixed segment that MUST precede the
     # {action} catch-all below (first-match-wins, else "dev-box" is swallowed
     # as an action).

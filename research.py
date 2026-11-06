@@ -847,11 +847,25 @@ def cmd_project_ssh(args: argparse.Namespace) -> None:
 
 def cmd_project_update(args: argparse.Namespace) -> None:
     agents = None
-    if args.agents:
-        # Additive: the marker's current set ∪ the requested agents.
-        current = rscore._read_marker_agents(
+    if args.agents or args.remove_agents:
+        # A missing project reads as "runs claude" below: say what is wrong.
+        if not container_exists(container_name_for(args.name)):
+            die(f"project {args.name!r} does not exist")
+        # From what runs in the project's own container (the server judges a
+        # removal against the same set): an older Docker-in-Docker record runs
+        # Claude whenever any agent is recorded, so the bare record would read
+        # as a removal of Claude.
+        current = rscore._project_running_agents(
             workspace_path_for(args.name, load_config()))
-        agents = list(current) + [a for a in args.agents if a not in current]
+        both = set(args.agents or []) & set(args.remove_agents or [])
+        if both:
+            die(f"an agent cannot be both added and removed: {', '.join(sorted(both))}")
+        absent = [a for a in (args.remove_agents or []) if a not in current]
+        if absent:
+            die(f"{', '.join(absent)} does not run in project {args.name!r} "
+                f"(it runs: {', '.join(current) or 'no agent'})")
+        agents = list(current) + [a for a in (args.agents or []) if a not in current]
+        agents = [a for a in agents if a not in (args.remove_agents or [])]
     req = _build(
         rscore.UpdateRequest,
         name=args.name, rebuild=args.rebuild, keep_claude=args.keep_claude,
@@ -862,6 +876,9 @@ def cmd_project_update(args: argparse.Namespace) -> None:
         worker_model=args.worker_model, worker_effort=args.worker_effort,
         role_model=args.role_model, role_effort=args.role_effort,
         agents=agents,
+        pi_model=args.pi_model, pi_thinking=args.pi_thinking,
+        reset=args.reset or [],
+        **{f: getattr(args, f) for f in rscore.HARNESS_FIELDS},
     )
     res = _call(rscore.update, req)
     print(f"\nproject {req.name!r} updated.")
@@ -2701,12 +2718,27 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--agent", dest="agents", action="append", metavar="AGENT",
                    help="repeatable: ADD an agent to a sandbox-dind project's "
                         f"set ({', '.join(rscore.KNOWN_AGENTS)}); applied live "
-                        "(no recreate) when nothing else changes. Agents are "
-                        "added, never removed.")
+                        "(no recreate) when nothing else changes.")
+    u.add_argument("--remove-agent", dest="remove_agents", action="append", metavar="AGENT",
+                   choices=rscore.KNOWN_AGENTS,
+                   help="repeatable: REMOVE an agent from a sandbox-dind project's "
+                        "own container (restarts the project; its login and settings "
+                        "are kept for a later re-add)")
     # Agent model/effort. Unset = LEAVE UNCHANGED (not "reset to the default").
     # A worker-only change touches no container at all; a role-only change re-runs
-    # just the role containers; only a supervisor change needs a recreate.
+    # just the role containers; the agent's own model is written into its settings
+    # file (no restart) on a current image.
     _add_model_flags(u, unset_note="unset = leave unchanged")
+    u.add_argument("--pi-model", dest="pi_model", default="", metavar="PROVIDER/MODEL",
+                   help="pi's starting model (written into pi's settings)")
+    u.add_argument("--pi-thinking", dest="pi_thinking", default="",
+                   choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
+                   help="pi's starting thinking level")
+    _add_harness_args(u, "project")
+    u.add_argument("--reset", action="append", metavar="FIELD",
+                   choices=rscore.UPDATE_RESETTABLE,
+                   help="repeatable: put a field back to its default "
+                        f"({', '.join(rscore.UPDATE_RESETTABLE)})")
     u.set_defaults(func=cmd_project_update)
 
     uc = proj_sub.add_parser(

@@ -46,6 +46,23 @@ AGENT_DIST_MOUNT = "/opt/agent-dist"
 # Claude Code CLI writes OAuth creds to a HIDDEN file (leading dot).
 ORCH_CREDS = Path.home() / ".claude" / ".credentials.json"
 ORCH_SETTINGS = Path.home() / ".claude" / "settings.json"
+
+
+# The supervisor settings keys that carry ITS agent's model and effort, removed
+# from every copy a worker or role service starts from. MIRROR of
+# rscore.AGENT_MODEL_SETTINGS_JQ (pinned).
+AGENT_MODEL_KEYS = ("model", "effortLevel", "modelSettings")
+AGENT_MODEL_ENV_KEYS = ("ANTHROPIC_MODEL", "CLAUDE_CODE_EFFORT_LEVEL")
+
+
+def _strip_agent_model(data: dict) -> None:
+    """Drop the supervisor agent's model and effort from a settings dict."""
+    for k in AGENT_MODEL_KEYS:
+        data.pop(k, None)
+    env = data.get("env")
+    if isinstance(env, dict):
+        for k in AGENT_MODEL_ENV_KEYS:
+            env.pop(k, None)
 WORKER_CLAUDE_MD_TEMPLATE = Path("/opt/claude-templates/worker.CLAUDE.md.template")
 
 LABEL_WORKER = "research.worker"
@@ -699,6 +716,11 @@ def _stage_workdir(name: str, plan_text: str, fresh: bool) -> Path:
         except json.JSONDecodeError:
             data = {}
         data.pop("hooks", None)
+        # Strip the supervisor's own model and effort too: they live in this
+        # file for the agent the researcher talks to, and a worker runs on
+        # its own --model/--effort — which an `env` effort entry here (`max`)
+        # would override (measured, Claude Code 2.1.258).
+        _strip_agent_model(data)
         dest = wdir / ".claude" / "settings.json"
         dest.write_text(json.dumps(data, indent=2) + "\n")
         os.chmod(dest, 0o600)

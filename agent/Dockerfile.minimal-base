@@ -1,4 +1,8 @@
 FROM continuumio/miniconda3:latest
+# The agent's model lives in its own settings file on every image built from
+# here (I33 slice 3): the host reads this label to choose that delivery over
+# the container setting an older image keeps (rscore.AGENT_SETTINGS_LABEL).
+LABEL research.agent-settings="1"
 
 # rs-minimal-base — the no-DIND shared substrate (WORKFLOW_TAXONOMY_S1.md image
 # carve). Holds everything common to a project container EXCEPT the

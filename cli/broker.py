@@ -685,9 +685,18 @@ UPDATE_WEBUI_FIELDS = frozenset({
     "supervisor_model", "supervisor_effort",
     "worker_model", "worker_effort",
     "role_model", "role_effort",
-    # The project's agent SET (STAGE_PI_AGENT): add-only, applied live on
-    # sandbox-dind (no recreate); an enum list, validated in from_kwargs.
+    # The project's agent SET (STAGE_PI_AGENT): applied live on sandbox-dind
+    # for an add; a removal (I33 slice 3) restarts the project; an enum list,
+    # validated in from_kwargs, removal rules in update().
     "agents",
+    # The ⚙ Agents box (I33 slice 3): pi's starting pair, the working mode and
+    # the doer/checker models — IN-BOX like the Claude pairs (written into the
+    # agents' own settings files and the project's record), shape-checked in
+    # from_kwargs, context-checked in update(); `reset` names the fields to put
+    # back to their default (field names from rscore.UPDATE_RESETTABLE only).
+    "pi_model", "pi_thinking", "reset",
+    "harness_mode", "doer_model", "checker_model", "pi_doer_model", "pi_doer_thinking",
+    "pi_checker_model", "pi_checker_thinking",
 })
 
 
@@ -814,6 +823,8 @@ BOX_REMOVE_WEBUI_FIELDS = BOX_TARGET_WEBUI_FIELDS | {"keep_workspace"}
 # refused while that project has a start/stop/update in flight
 # (_INLINE_PROJECT_KEY). No step-up: nothing is destroyed or restarted.
 PROJECT_FOLDERS_WEBUI_FIELDS = frozenset({"project"})
+# The ⚙ Agents box's read (I33 slice 3): the project only; read-only.
+PROJECT_AGENTS_WEBUI_FIELDS = frozenset({"project"})
 PROJECT_FOLDERS_SET_WEBUI_FIELDS = frozenset({"project", "folders"})
 
 
@@ -833,6 +844,12 @@ def _verb_box_folders(args: dict, _progress=None) -> dict:
     safe = {k: v for k, v in args.items() if k in BOX_FOLDERS_WEBUI_FIELDS}
     req = rscore.BoxFoldersRequest.from_kwargs(**safe)  # may raise ValidationError
     return dataclasses.asdict(rscore.box_folders(req))
+
+
+def _verb_project_agents(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in PROJECT_AGENTS_WEBUI_FIELDS}
+    req = rscore.ProjectAgentsRequest.from_kwargs(**safe)  # may raise ValidationError
+    return rscore.project_agents(req)
 
 
 def _verb_project_folders(args: dict, _progress=None) -> dict:
@@ -1247,6 +1264,7 @@ VERBS = {
     "box_presets": _verb_box_presets,
     "box_folders": _verb_box_folders,
     "project_folders": _verb_project_folders,
+    "project_agents": _verb_project_agents,
     "project_folders_set": _verb_project_folders_set,
     "port_add": _verb_port_add,
     "port_remove": _verb_port_remove,

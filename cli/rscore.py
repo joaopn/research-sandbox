@@ -1855,6 +1855,20 @@ class UpdateRequest:
     # the Stop hook) and on the docker substrate (agent mounts are docker-run
     # fixed).
     agents: tuple[str, ...] | None = None
+    # pi's starting model + thinking level, and the working mode with the
+    # doer/checker models (I33 slice 3): "" = unchanged, like every field
+    # here. Going back to the default is the separate `reset` list (field
+    # names), because "" cannot say it on this request.
+    pi_model: str = ""
+    pi_thinking: str = ""
+    harness_mode: str = ""
+    doer_model: str = ""
+    checker_model: str = ""
+    pi_doer_model: str = ""
+    pi_doer_thinking: str = ""
+    pi_checker_model: str = ""
+    pi_checker_thinking: str = ""
+    reset: tuple[str, ...] = ()
 
     def model_changes(self) -> dict[str, dict[str, str]]:
         """The per-type model/effort fields the caller actually SET, as
@@ -1882,9 +1896,18 @@ class UpdateRequest:
             v = kw.get(f) or ""
             if v and not isinstance(v, str):
                 raise ValidationError(f"{f} must be a string")
+            v = v.strip()
             if v:
                 catalog = catalog or _model_catalog_checked()
-                if f.endswith("_model") and v not in model_catalog.aliases(catalog):
+                # The agent's model (the one the operator talks to) is free
+                # text since it lives in Claude's own settings file, which also
+                # holds what Claude's own picker writes (`opus[1m]`, full ids):
+                # held to CLAUDE_MODEL_RE instead of the tier list.
+                if f == "supervisor_model":
+                    if not CLAUDE_MODEL_RE.match(v):
+                        raise ValidationError(
+                            f"Claude model {v!r} may use only letters, digits and . _ - [ ]")
+                elif f.endswith("_model") and v not in model_catalog.aliases(catalog):
                     raise ValidationError(
                         f"unknown model {v!r}; must be one of "
                         f"{model_catalog.aliases(catalog)}")
@@ -1899,16 +1922,17 @@ class UpdateRequest:
         # explicitly asked for the new model, so the model wins).
         for ctype in ("supervisor", "worker", "role"):
             m, e = vals[f"{ctype}_model"], vals[f"{ctype}_effort"]
-            if m and e and not model_catalog.supports_effort(m, e, catalog):
+            if m and e and not _claude_effort_ok(m, e, catalog):
+                # Reaches the browser (the ⚙ Agents box): names no flag.
                 raise ValidationError(
                     f"model {m!r} does not accept an effort level; "
-                    f"remove --{ctype}-effort")
+                    f"leave its effort at the default")
         agents: tuple[str, ...] | None = None
         if kw.get("agents") is not None:
+            # An empty set is a removal of every agent (I33 slice 3): allowed
+            # here, refused in update() where the workflow is known (a dev
+            # project keeps one).
             agents = tuple(dict.fromkeys(_as_tuple(kw.get("agents"))))
-            if not agents:
-                raise ValidationError(
-                    "an agent set cannot be empty on update — agents are added, never removed")
             for a in agents:
                 if a not in KNOWN_AGENTS:
                     raise ValidationError(
@@ -1916,6 +1940,40 @@ class UpdateRequest:
                 if not dist_present(a):
                     raise ValidationError(
                         f"agent {a!r}: no cached dist — pull it under Sandboxes → Software first")
+        # pi's pair and the working-mode fields: shape only here (which
+        # project, which agents: update() has the marker). A thinking level
+        # alone is allowed (it keeps pi's model), as at create.
+        pi_model = kw.get("pi_model") or ""
+        pi_thinking = kw.get("pi_thinking") or ""
+        for v, what in ((pi_model, "pi model"), (pi_thinking, "pi thinking level")):
+            if not isinstance(v, str):
+                raise ValidationError(f"the {what} must be a string")
+        pi_model, pi_thinking = pi_model.strip(), pi_thinking.strip()
+        if pi_model and not PI_MODEL_RE.match(pi_model):
+            raise ValidationError(
+                f"pi model {pi_model!r} must be written provider/model, e.g. "
+                f"openrouter/anthropic/claude-opus-latest")
+        if pi_thinking and pi_thinking not in PI_THINKING_LEVELS:
+            raise ValidationError(f"pi thinking level {pi_thinking!r} is not one of "
+                                  f"{', '.join(PI_THINKING_LEVELS)}")
+        raw_mode = kw.get("harness_mode")
+        harness = _harness_shape(kw)
+        # On UPDATE an explicit "none" is a request to go back to no mode, not
+        # "unchanged" (_harness_shape maps it to "" for create): carry it as a
+        # reset so it is never a silent no-op.
+        reset = list(dict.fromkeys(_as_tuple(kw.get("reset"))))
+        if isinstance(raw_mode, str) and raw_mode.strip() == "none" and "harness_mode" not in reset:
+            reset.append("harness_mode")
+        for r in reset:
+            if r not in UPDATE_RESETTABLE:
+                raise ValidationError(f"{r!r} cannot be reset (resettable: "
+                                      f"{', '.join(UPDATE_RESETTABLE)})")
+        given = {"supervisor_model": vals["supervisor_model"],
+                 "supervisor_effort": vals["supervisor_effort"],
+                 "pi_model": pi_model, "pi_thinking": pi_thinking, **harness}
+        both = [r for r in reset if given.get(r)]
+        if both:
+            raise ValidationError(f"{', '.join(both)} cannot be both set and reset in one change")
         return cls(
             name=_require_name(kw.get("name")),
             rebuild=bool(kw.get("rebuild", False)),
@@ -1924,6 +1982,9 @@ class UpdateRequest:
             disable=_as_tuple(kw.get("disable")),
             role_mcp_upstream=_as_tuple(kw.get("role_mcp_upstream")),
             agents=agents,
+            pi_model=pi_model, pi_thinking=pi_thinking,
+            reset=tuple(reset),
+            **harness,
             **vals,
         )
 
@@ -4359,6 +4420,15 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     # them back at every deploy (_read_harness).
     if _harness_set(req):
         marker["harness"] = _harness_set(req)
+    # The agent's model lives in its own settings file on an image that carries
+    # the label (I33 slice 3): on Docker-in-Docker the host writes the recorded
+    # Claude pair right after the deploy below (pending); the docker substrate's
+    # first boot merges it itself. An older image keeps the container setting
+    # and no record (a later image migrates the project once).
+    model_in_settings = _label_is_set("image", substrate_image)
+    if model_in_settings:
+        marker["agent_settings"] = {"v": 1, "pending": [] if is_docker else ["claude"],
+                                    "migrated": True}
     (orch_dir / "project.json").write_text(json.dumps(marker, indent=2) + "\n")
     # Starting message (STAGE_SPAWN_GREETING) for the workflow's main shell, read
     # by the Management/Supervisor tab on first byobu new-session. Manifest-
@@ -4424,6 +4494,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         substrate=substrate.value,
         service_flags=service_flags,
         agent_pair=model_pairs["supervisor"],
+        model_in_settings=model_in_settings,
         agents=deployed_agents,
         # Docker substrate only: its boot installs pi's settings and merges the
         # pair from this env; a dind supervisor gets it on the host-side deploy.
@@ -4577,6 +4648,10 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             # The working-mode suite (I33): into the shared copy for the boxes,
             # and into the project container's own agents.
             _report_warnings(_stage_harness(container_name, local, workspace_path), progress)
+            # The recorded Claude model into Claude's own settings (I33 slice 3).
+            _apply_agent_settings_pending(container_name, workspace_path, local,
+                                          claude_in_settings=model_in_settings,
+                                          progress=progress)
             # Editor dist staged whenever cached so any box can RO-mount
             # /opt/editor-dist; deploy_local follows the RESOLVED code-server
             # flag (default ON since the editor-by-default slice — a
@@ -4670,6 +4745,9 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             # is a claude mechanism; the supervision gate is redesigned before
             # another agent runs research — STAGE_PI_AGENT).
             _stage_agent_dist(container_name, [DEFAULT_AGENT])
+            _apply_agent_settings_pending(container_name, workspace_path, [DEFAULT_AGENT],
+                                          claude_in_settings=model_in_settings,
+                                          progress=progress)
             # Editor dist (STAGE_EDITOR_DIST): staged before the enable cone too so
             # interactive PI containers RO-mount a populated /opt/editor-dist.
             # deploy_local brings up the supervisor's OWN editor from the dist (no
@@ -5240,8 +5318,44 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     # worker/extension cone) and no sysbox store to re-stage. The ONE meaningful
     # update is toggling the editor (code-server), which recreates the plain runc
     # box; anything else is still refused (inside _update_docker_substrate).
-    if _container_substrate(container) == Substrate.DOCKER.value:
-        return _update_docker_substrate(req, cfg, project, container, progress)
+    docker = _container_substrate(container) == Substrate.DOCKER.value
+    # The agents' models, the working mode and an agent removal (I33 slice 3):
+    # checked against the project before anything is written. Whether Claude's
+    # model goes into its settings file is a property of the container's image
+    # (older images keep the container setting); asked only when it matters.
+    workspace_path = workspace_path_for(project, cfg)
+    claude_asked = bool(req.supervisor_model or req.supervisor_effort
+                        or set(req.reset) & {"supervisor_model", "supervisor_effort"})
+    claude_in_settings = claude_asked and _label_is_set("container", container)
+    plan = _agent_settings_plan(req, container, workspace_path, docker=docker,
+                                claude_in_settings=claude_in_settings)
+    if docker:
+        return _update_docker_substrate(req, cfg, project, container, progress, plan=plan)
+    # The agents' settings, adds or removals and model changes on a STOPPED
+    # project: saved in the record and applied at its next start (which
+    # recreates the container from the record — Claude's model included,
+    # whatever the old container's image — and relaunches the role services
+    # from it) — nothing is started.
+    if plan.any() or req.agents is not None or req.model_changes():
+        others = req.enable or req.disable or req.role_mcp_upstream or req.rebuild
+        if not others and not container_running(container):
+            agents_added = _validate_agents_update(req, container, workspace_path)
+            if agents_added:
+                _refuse_during_agent_build()
+            stopped_models = req.model_changes()
+            if plan.claude is not None:
+                stopped_models.pop("supervisor", None)
+            dropped = _apply_model_changes(workspace_path, stopped_models) if stopped_models else []
+            _agent_settings_commit(plan, workspace_path)
+            if agents_added:
+                _write_marker_agents(workspace_path,
+                                     list(_read_marker_agents(workspace_path)) + agents_added)
+            progress.step("saved", "saved; applied at the project's next start")
+            print(f"{project!r} is stopped: the change is saved and applied at its next start.")
+            return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
+                                effort_dropped=(["supervisor"] if plan.effort_dropped else [])
+                                + dropped,
+                                agents_added=agents_added)
     if not container_running(ROUTER_CONTAINER):
         die(f"{ROUTER_CONTAINER} is not running. Run `research start` first.")
     progress.step("validate", "validating update")
@@ -5301,12 +5415,52 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     if req.agents is not None:
         _refuse_during_agent_build()
     model_changes = req.model_changes()
-    effort_dropped: list[str] = []
+    # Claude's pair is the plan's (it decides the effort a model keeps, and the
+    # commit records it): never through _apply_model_changes. Written into the
+    # settings file below on a current container; an older container (its
+    # image predates settings-file models — the container setting outranks the
+    # file there) needs the recreate, which delivers it from the record.
+    claude_recreate = plan.claude is not None and not plan.claude_live
+    if plan.claude is not None:
+        model_changes.pop("supervisor", None)
+    effort_dropped: list[str] = ["supervisor"] if plan.effort_dropped else []
+    if plan.any():
+        enabled_roles = role_mcp.load_role_mcps(workspace_path) if disable_workers else {}
+        for role in disable_workers:
+            if role not in enabled_roles:
+                die(f"role-mcp {role!r} is not enabled for project {project!r}")
+    if plan.any() and (enable_services or disable_services):
+        # The service refusals (an unknown id, an always-on service) run here,
+        # before the agents' settings are written — never after (validation only).
+        _compute_service_flags(enable_services, disable_services)
     if model_changes:
-        effort_dropped = _apply_model_changes(workspace_path, model_changes)
+        effort_dropped += _apply_model_changes(workspace_path, model_changes)
+    _agent_settings_commit(plan, workspace_path)
     if agents_added:
         _write_marker_agents(workspace_path,
                              list(_read_marker_agents(workspace_path)) + agents_added)
+    if plan.any():
+        # Written into the agents' own files now (the container is running);
+        # an agent this update adds gets it right after its install below, a
+        # removal's restart re-applies whatever is still pending.
+        is_research_p = _container_project_type(container) != PROJECT_TYPE_SANDBOX_DIND
+        now_local = ([DEFAULT_AGENT] if is_research_p
+                     else _read_dind_agent_sets(workspace_path)[1])
+        if not plan.removed and not claude_recreate:
+            # An agent this update adds is written after its install below.
+            _apply_agent_settings_pending(container, workspace_path,
+                                          [a for a in now_local if a not in agents_added],
+                                          claude_in_settings=plan.claude_live,
+                                          progress=progress)
+            if plan.harness is not None and not is_research_p:
+                _report_warnings(_stage_harness(container, now_local, workspace_path), progress)
+        if not (touched or req.rebuild or enable_workers or disable_workers
+                or req.role_mcp_upstream or model_changes or agents_added or plan.removed
+                or claude_recreate):
+            progress.step("agents", "applied to the project's agents")
+            print(f"agent settings of {project!r} updated; each agent's next session uses them.")
+            return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
+                                effort_dropped=effort_dropped)
     # `live_ok` must exclude any model OR agent change: `--worker-model haiku
     # --enable code-server` would otherwise take the live-editor fast path, which
     # returns without ever applying the worker pair to anything (the pair is in
@@ -5315,7 +5469,8 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     # same shape for `--agent <other> --enable code-server`.
     live_ok = (not req.rebuild and not enable_workers and not disable_workers
                and not req.role_mcp_upstream and not model_changes
-               and not agents_added)
+               and not agents_added and not plan.removed and not claude_recreate
+               and not plan.any())
     if live_ok and touched == {"code-server"}:
         enable = "code-server" in _parse_service_list(enable_services)
         return _live_toggle_editor(project, cfg, container, workspace_path, enable, progress)
@@ -5333,7 +5488,8 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     # Gated on the REQUEST carrying an agent set (not on a delta): a set the
     # project already carries is an idempotent re-stage, never a recreate.
     if (req.agents is not None and not touched and not req.rebuild and not enable_workers
-            and not disable_workers and not req.role_mcp_upstream and not model_changes):
+            and not disable_workers and not req.role_mcp_upstream and not model_changes
+            and not plan.removed and not claude_recreate):
         staged, local = _read_dind_agent_sets(workspace_path)
         progress.step("agents", f"staging {'+'.join(agents_added or staged)} into the project")
         # deploy_local derived from the marker like every other call site (Option
@@ -5345,6 +5501,10 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
                                            **_pi_pair_kwargs(workspace_path)), progress)
         # The working-mode suite (I33), before the box refresh below.
         _report_warnings(_stage_harness(container, local, workspace_path), progress)
+        # The recorded models of an agent just installed (I33 slice 3).
+        _apply_agent_settings_pending(
+            container, workspace_path, local, progress=progress,
+            claude_in_settings=_label_is_set("container", container))
         # Running boxes follow live (an Add delivers the new agent wired; a
         # request that adds nothing is an Update). The editor extension: an Add
         # installs it only where none is (a supervisor that just gained claude);
@@ -5382,7 +5542,8 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     # `not agents_added` is load-bearing: `--worker-model haiku --agent <other>`
     # would otherwise return here with the marker claiming an agent nothing staged.
     if (model_changes and not touched and not req.rebuild and not enable_workers
-            and not disable_workers and not req.role_mcp_upstream and not agents_added):
+            and not disable_workers and not req.role_mcp_upstream and not agents_added
+            and not plan.removed and not claude_recreate):
         changed = set(model_changes)
         if changed == {"worker"}:
             progress.step("models", "applying the worker model")
@@ -6912,6 +7073,7 @@ def build_supervisor_docker_args(
     agents: "Sequence[str]" = (),
     web: dict | None = None,
     pi_pair: dict[str, str] | None = None,
+    model_in_settings: bool = False,
 ) -> list[str]:
     is_docker = substrate == Substrate.DOCKER.value
     args = [
@@ -6976,7 +7138,15 @@ def build_supervisor_docker_args(
     # their tab (not the agent), so there is no argv to inject and the pair must
     # ride the env the agent CLI reads. Callers pass the marker's `supervisor`
     # pair; an absent pair emits nothing (pre-STAGE_MODEL_SELECT project).
-    args += _model_env_args(agent_pair)
+    # On an image carrying AGENT_SETTINGS_LABEL the pair lives in Claude's own
+    # settings file instead (I33 slice 3): the host writes it after the deploy
+    # (Docker-in-Docker) or the docker substrate's first boot merges it from
+    # RS_CLAUDE_* — which, unlike ANTHROPIC_MODEL, never outranks the file.
+    if model_in_settings:
+        if is_docker:
+            args += _claude_boot_env_args(agent_pair)
+    else:
+        args += _model_env_args(agent_pair)
     # Per-agent config env for the deployed set (STAGE_PI_AGENT) — the
     # same human-launched channel as the model pair: research supervisor
     # (claude only), sandbox-dind supervisor and docker box all run a login
@@ -10446,6 +10616,8 @@ def _recreate_supervisor(
     md_ptype = md.get("project_type", PROJECT_TYPE_RESEARCH)
     substrate_image = (SANDBOX_DIND_IMAGE if md_ptype == PROJECT_TYPE_SANDBOX_DIND
                        else SUPERVISOR_IMAGE)
+    # Claude's model in its own settings file on a labelled image (I33 slice 3).
+    model_in_settings = _label_is_set("image", substrate_image)
     docker_args = build_supervisor_docker_args(
         container_name=container,
         project=project,
@@ -10470,6 +10642,7 @@ def _recreate_supervisor(
         # durable source (it survives the rm+create), so a recreate cannot revert
         # the researcher's model choice.
         agent_pair=_read_models(workspace_path).get("supervisor"),
+        model_in_settings=model_in_settings,
         # The deployed set, from the marker (research markers carry [] → no env).
         agents=_read_marker_agents(workspace_path),
     )
@@ -10518,8 +10691,16 @@ def _recreate_supervisor(
         # The working-mode suite (I33): the shared copy's was just emptied, and
         # the boxes this start re-runs find the installer there.
         _report_warnings(_stage_harness(container, local, workspace_path), progress)
+        # The agents' recorded models into their own settings, once (I33 slice 3).
+        _apply_agent_settings_pending(container, workspace_path, local,
+                                      claude_in_settings=model_in_settings, progress=progress)
         if editor_dist_present():
             _stage_editor_dist(container, deploy_local=flags.get("code-server", True))
+        # A project whose own container no longer runs Claude (removed from it)
+        # keeps no Claude in its editor either: the editor's extensions live in
+        # the workspace and would otherwise survive the restart.
+        if DEFAULT_AGENT not in local and flags.get("code-server", True):
+            _uninstall_claude_extension(container)
         # Reader dist re-staged (STAGE_READER): survives the recreate so a
         # reader-enabled project's tab comes back; deploy_local on the resolved flag.
         if reader_dist_present():
@@ -10582,6 +10763,8 @@ def _recreate_supervisor(
         # /opt/agent-dist the fleet mounts) — no bake, so a recreate must redeploy
         # it. Before the role-MCP relaunch loop below, which mounts that path.
         _stage_agent_dist(container, [DEFAULT_AGENT])
+        _apply_agent_settings_pending(container, workspace_path, [DEFAULT_AGENT],
+                                      claude_in_settings=model_in_settings, progress=progress)
         # Editor dist re-staged the same way (STAGE_EDITOR_DIST) so a recreated
         # supervisor's interactive PI/extension containers find a populated mount.
         # deploy_local re-deploys the supervisor's OWN editor (no bake now), gated
@@ -10799,6 +10982,13 @@ def _start_docker_substrate(project: str, cfg: "Config",  # type: ignore[name-de
     web = _project_web(container)
     if web:
         _retry_project_steps(project, container, web, progress or _NULL_PROGRESS)
+    # The agents' models saved while the project was stopped (I33 slice 3):
+    # the home survived the stop, so they are written into it now.
+    ws = workspace_path_for(project, cfg)
+    if _agent_settings_owed(ws):
+        _apply_agent_settings_pending(container, ws, list(_read_marker_agents(ws)),
+                                      claude_in_settings=_label_is_set("container", container),
+                                      progress=progress)
 
 
 def _without_mount(mounts: list[str], dst: str) -> list[str]:
@@ -10822,7 +11012,8 @@ def _without_mount(mounts: list[str], dst: str) -> list[str]:
 
 
 def _update_docker_substrate(req: "UpdateRequest", cfg: "Config",  # type: ignore[name-defined]
-                             project: str, container: str, progress) -> "UpdateResult":  # type: ignore[name-defined]
+                             project: str, container: str, progress,
+                             plan: "_AgentSettingsPlan | None" = None) -> "UpdateResult":  # type: ignore[name-defined]
     """`update` for a `docker`-substrate box: the only supported change is
     enabling/disabling the editor (code-server). Anything else (workers,
     role-mcp wiring, --rebuild, another service) is refused — docker has no
@@ -10850,15 +11041,43 @@ def _update_docker_substrate(req: "UpdateRequest", cfg: "Config",  # type: ignor
         die("the agent set is fixed at create on the docker substrate "
             "(a plain runc box); recreate the project to change it; to update its "
             "agents to the cached versions, use Update in the project's Config box")
-    if req.model_changes():
+    plan = plan or _AgentSettingsPlan()
+    model_changes = req.model_changes()
+    if plan.claude is not None:
+        # Claude's model lives in its settings file on a current image (I33
+        # slice 3); on an older container (a set OR a reset) it stays fixed.
+        model_changes.pop("supervisor", None)
+        if not plan.claude_live:
+            model_changes["supervisor"] = {}
+    if model_changes:
         die("the agent model is fixed at create on the docker substrate "
             "(a plain runc box); recreate the project to change it")
-    if (req.rebuild or enable_workers or disable_workers or req.role_mcp_upstream
-            or touched - {"code-server"} or not touched):
-        die("`update` on the docker substrate only supports enabling or disabling "
-            "the editor (code-server); destroy + recreate for anything else")
-    if enable_svcs and not editor_dist_present():
-        die("no editor dist cached — pull it under Sandboxes → Software first")
+    plan_only = plan.any() and not (req.enable or req.disable or req.rebuild
+                                    or req.role_mcp_upstream)
+    # Every refusal before anything is written (a refused request leaves the
+    # record untouched).
+    if not plan_only:
+        if (req.rebuild or enable_workers or disable_workers or req.role_mcp_upstream
+                or touched - {"code-server"} or not touched):
+            die("`update` on the docker substrate only supports enabling or disabling "
+                "the editor (code-server); destroy + recreate for anything else")
+        if enable_svcs and not editor_dist_present():
+            die("no editor dist cached — pull it under Sandboxes → Software first")
+    if plan.any():
+        # The agents' models: recorded, then written into the agents' own files
+        # (a stopped project gets them at its next start). Applied before an
+        # editor switch's recreate below, which builds the fresh container's
+        # first boot from the same record.
+        workspace_path = workspace_path_for(project, cfg)
+        _agent_settings_commit(plan, workspace_path)
+        if container_running(container):
+            _apply_agent_settings_pending(
+                container, workspace_path, list(_read_marker_agents(workspace_path)),
+                claude_in_settings=plan.claude_live, progress=progress)
+        if plan_only:
+            progress.step("agents", "applied to the project's agents")
+            return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
+                                effort_dropped=["supervisor"] if plan.effort_dropped else [])
     # After the last refusal; the recreate below reconciles from the clean file.
     _drop_reserved_port_entries(project, cfg, progress)
     base = _read_service_flags(container)
@@ -10904,6 +11123,9 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
     # container and it fails SILENTLY, then the rm takes the key with no error
     # on any surface. (_recreate_supervisor stashes before its stop for the
     # same reason.)
+    # Claude's model in its settings file on a labelled image: the fresh
+    # container's first boot merges the record (I33 slice 3).
+    boot_settings = _label_is_set("image", MINIMAL_IMAGE)
     _stash_git_auth_for_rebuild(container, was_running, workspace_path)
 
     if was_running:
@@ -10927,6 +11149,9 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
         service_flags=service_flags,
         # Marker-sourced, same reasoning as _recreate_supervisor.
         agent_pair=_read_models(workspace_path).get("supervisor"),
+        # Claude's model in its settings file on a labelled image: the fresh
+        # container's first boot merges it from the record (I33 slice 3).
+        model_in_settings=boot_settings,
         # The docker box's agent set lives in its recovered per-agent mounts
         # (`-v <cache>/<a>:/opt/agent-dist/<a>:ro`, docker-run fixed) — the same
         # source the entrypoint's per-agent loop reads, so env and deploy agree.
@@ -10982,6 +11207,11 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
     if md.get("web"):
         _rebuild_project_steps(project, container, md["web"], cfg,
                                progress or _NULL_PROGRESS)
+    # The fresh home's first boot merged the recorded models (RS_CLAUDE_* and
+    # RS_PI_* from the record): nothing is owed any more — a mark left would
+    # later overwrite a model picked inside the agent.
+    if boot_settings:
+        _clear_pending(workspace_path, ("claude", "pi"), mark_migrated=True)
 
 
 def _live_toggle_editor(project: str, cfg: "Config", container: str,  # type: ignore[name-defined]
@@ -13035,11 +13265,10 @@ def _write_marker_agents(workspace_path: "Path", agents: list[str]) -> None:
 
 def _validate_agents_update(req: "UpdateRequest", container: str,
                             workspace_path: "Path") -> list[str]:
-    """The agents an update ADDS, or [] when the request carries no agent change /
-    an already-complete set. Raises ValidationError (pre-side-effect, a clean
-    browser refusal) on: a research project (claude-only in this slice — its
-    supervision gate is a claude hook), a removal (slice 1 is add-only: a deployed
-    agent leaves only with a recreate), or an unreadable marker."""
+    """The agents an update ADDS to the record, or [] when the request carries no
+    agent change / an already-complete set. Raises ValidationError
+    (pre-side-effect, a clean browser refusal) on a research project (Claude
+    only) or a missing marker. A removal is checked by _agent_settings_plan."""
     if req.agents is None:
         return []
     if _container_project_type(container) != PROJECT_TYPE_SANDBOX_DIND:
@@ -13050,13 +13279,765 @@ def _validate_agents_update(req: "UpdateRequest", container: str,
     if not f.is_file():
         raise ValidationError(
             f"cannot update the agent set: the project marker {f} is missing")
+    # Additions are judged against what runs in the project's own container
+    # (an older record runs Claude without listing it), like removals in
+    # _agent_settings_plan, which update() runs before any write.
+    running = _project_running_agents(workspace_path)
+    return [a for a in req.agents if a not in running]
+
+
+# ---------------------------------------------------------------------------
+# The agent's model and effort live in the agent's own settings file (I33
+# slice 3). Claude Code keeps its default model in ~/.claude/settings.json
+# (`model`, where its own /model saves) and its effort there too (`effortLevel`,
+# and per model under `modelSettings`, where /effort saves); pi keeps its own
+# in its settings (`defaultProvider`/`defaultModel`/`defaultThinkingLevel`). RS
+# writes the project's choice into those files — a merge into the existing
+# file, never a new file — and the ⚙ panel reads them back, so a model picked
+# inside the agent shows up and a change needs no container restart.
+# Measured on the pinned Claude Code 2.1.258 (zero tokens, a fake API): the
+# container's ANTHROPIC_MODEL / CLAUDE_CODE_EFFORT_LEVEL outrank the file's
+# keys; the file's own `env` block outranks the container's; an empty entry
+# there neutralises the container's; `effortLevel` takes low..xhigh only (`max`
+# only through the environment); the per-model entry outranks the top-level
+# one; a running session keeps its model until its next start.
+# ---------------------------------------------------------------------------
+
+# A Claude model as Claude's own picker writes it: a tier (`opus`), a variant
+# (`opus[1m]`, `opusplan`) or a full id (`claude-sonnet-5`).
+CLAUDE_MODEL_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._\[\]-]*\Z")
+# The levels Claude's own `effortLevel` setting accepts (its settings schema in
+# 2.1.258); any other catalog level (`max`) rides the file's `env` block.
+CLAUDE_SETTINGS_EFFORTS = ("low", "medium", "high", "xhigh")
+# What a worker's or role service's copy of the supervisor's Claude settings
+# drops: the hooks (supervisor-only) and the supervisor agent's own model and
+# effort, which would override the copy's --model/--effort (an `env` effort
+# entry beats the flag — measured). MIRROR of rs_worker.AGENT_MODEL_KEYS /
+# AGENT_MODEL_ENV_KEYS (pinned).
+AGENT_MODEL_SETTINGS_JQ = ('del(.hooks, .model, .effortLevel, .modelSettings)'
+                           ' | if (.env | type) == "object"'
+                           ' then .env |= del(.ANTHROPIC_MODEL, .CLAUDE_CODE_EFFORT_LEVEL)'
+                           ' else . end')
+# The fields an update can set back to the default (UpdateRequest.reset).
+UPDATE_RESETTABLE = ("supervisor_model", "supervisor_effort", "pi_model", "pi_thinking",
+                     *HARNESS_FIELDS)
+# Images built with this label carry the settings-file delivery (the research
+# worker/role settings copy strips the model keys; the docker entrypoint merges
+# the create-time choice). A project on an older image keeps the container
+# setting (ANTHROPIC_MODEL) exactly as before.
+AGENT_SETTINGS_LABEL = "research.agent-settings"
+CLAUDE_EXT_ID = "anthropic.claude-code"
+AGENT_SETTINGS_ABSENT = "RS_AGENT_SETTINGS_ABSENT"
+AGENT_SETTINGS_FAILED = "RS_AGENT_SETTINGS_NOT_APPLIED"
+# Bounds on one agent's settings file, which the agent (or anything in the
+# container) can rewrite. Real files are a few KB; the cap only stops a file
+# replaced with something huge from being streamed and parsed — 1 MiB is two
+# orders of magnitude above any real one and still trivial to hold.
+AGENT_SETTINGS_MAX_BYTES = 1024 * 1024
+# A `docker exec` of `head`/`jq` on that file answers in well under a second;
+# the bound only stops a wedged exec from freezing the serial broker (the read
+# is a broker verb). Same class and value as HISTORY_STATUS_READ_TIMEOUT_S.
+AGENT_SETTINGS_EXEC_TIMEOUT_S = 5
+_AGENT_SETTINGS_WARNING = ("the {agent} model could not be written into its settings in the "
+                           "project; it is saved and applied at the project's next start")
+
+# Set or clear Claude's model and effort. $mo/$eo are "set", "clear" or "keep".
+# Any model or effort write also empties the matching `env` entry, which
+# neutralises a container setting left by a project created before this; `max`
+# is written there instead, the only place Claude accepts it. Mirrored (the
+# set-only half) by agent/entrypoint.minimal.sh — pinned.
+CLAUDE_SETTINGS_JQ = (
+    '(.model // "") as $old'
+    ' | (if $mo == "set" then $m else $old end) as $k'
+    ' | if $mo == "set" then .model = $m elif $mo == "clear" then del(.model) else . end'
+    ' | if $mo == "keep" then . else .env = ((.env // {}) + {"ANTHROPIC_MODEL": ""}) end'
+    ' | if $eo == "set" and $e == "max"'
+    ' then .env = ((.env // {}) + {"CLAUDE_CODE_EFFORT_LEVEL": "max"}) | del(.effortLevel)'
+    ' | if $k == "" or ((.modelSettings // {}) | has($k) | not) then .'
+    ' else .modelSettings[$k] |= del(.effortLevel) end'
+    ' elif $eo == "set"'
+    ' then .env = ((.env // {}) + {"CLAUDE_CODE_EFFORT_LEVEL": ""}) | .effortLevel = $e'
+    ' | if $k == "" then . else .modelSettings = ((.modelSettings // {})'
+    ' | .[$k] = ((.[$k] // {}) + {"effortLevel": $e})) end'
+    ' elif $eo == "clear"'
+    ' then .env = ((.env // {}) + {"CLAUDE_CODE_EFFORT_LEVEL": ""}) | del(.effortLevel)'
+    ' | if $k == "" or ((.modelSettings // {}) | has($k) | not) then .'
+    ' else .modelSettings[$k] |= del(.effortLevel) end'
+    ' else . end')
+# Set or clear pi's starting model and thinking level ($mo/$to as above).
+PI_SETTINGS_JQ = (
+    'if $mo == "set" then .defaultProvider = $p | .defaultModel = $m'
+    ' elif $mo == "clear" then del(.defaultProvider, .defaultModel) else . end'
+    ' | if $to == "set" then .defaultThinkingLevel = $t'
+    ' elif $to == "clear" then del(.defaultThinkingLevel) else . end')
+# Merge into an EXISTING file only (RS's own settings file carries the bypass,
+# attribution and other keys; creating one would skip them for good): temp
+# file + rename beside it. The values reach jq as argv words ("$@"), never as
+# shell text. Prints a sentinel instead of failing; the host reads it back.
+_AGENT_SETTINGS_SCRIPT = (
+    'f="$1"; shift\n'
+    f'[ -f "$f" ] || {{ echo {AGENT_SETTINGS_ABSENT}; exit 0; }}\n'
+    f'[ "$(wc -c < "$f")" -le {AGENT_SETTINGS_MAX_BYTES} ] || '
+    f'{{ echo {AGENT_SETTINGS_FAILED}; exit 0; }}\n'
+    'if jq "$@" "$f" > "$f.rs-tmp" && mv "$f.rs-tmp" "$f"; then exit 0; fi\n'
+    f'rm -f "$f.rs-tmp"; echo {AGENT_SETTINGS_FAILED}\n')
+_AGENT_HOME = "/home/research"
+
+
+def _agent_settings_path(agent: str, home: str = _AGENT_HOME) -> str:
+    """The settings file RS writes for `agent` in a container with `home`."""
+    if agent == "pi":
+        return f"{home}/{PI_AGENT_DIR_REL}/settings.json"
+    return f"{home}/.claude/settings.json"
+
+
+def _claude_effort_ok(model: str, effort: str, catalog: dict) -> bool:
+    """Whether `effort` may go with `model`: a catalog tier answers from the
+    catalog (haiku takes none); any other id (a full id, `opus[1m]`) takes any
+    catalog level — Claude decides what to send for it."""
+    if not effort:
+        return True
+    if effort not in catalog.get("efforts", ()):
+        return False
+    if model in model_catalog.aliases(catalog):
+        return model_catalog.supports_effort(model, effort, catalog)
+    return True
+
+
+def _label_is_set(kind: str, ref: str) -> bool:
+    """Whether the image or container `ref` carries AGENT_SETTINGS_LABEL=1.
+    Anything else (an older image, a failed inspect) reads as no."""
+    try:
+        r = run(["docker", kind, "inspect", "-f",
+                 '{{index .Config.Labels "' + AGENT_SETTINGS_LABEL + '"}}', ref],
+                capture_output=True, timeout=AGENT_SETTINGS_EXEC_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0 and (r.stdout or "").strip() == "1"
+
+
+def _claude_ops_from_pair(pair: "dict | None",
+                          fields: "Sequence[str] | None" = None) -> tuple[str, str, str, str]:
+    """(mo, m, eo, e) setting the file to the recorded pair: an empty half is
+    cleared (Claude's own default). `fields` names the halves to write
+    ("model", "effort"); the others are kept as the file has them (None: both)."""
+    pair = pair if isinstance(pair, dict) else {}
+    m = pair.get("model") if isinstance(pair.get("model"), str) else ""
+    e = pair.get("effort") if isinstance(pair.get("effort"), str) else ""
+    if m and not CLAUDE_MODEL_RE.match(m):
+        m = ""
+    if e and e not in CLAUDE_SETTINGS_EFFORTS and e != "max":
+        e = ""
+    mo = ("set" if m else "clear") if fields is None or "model" in fields else "keep"
+    eo = ("set" if e else "clear") if fields is None or "effort" in fields else "keep"
+    return (mo, m, eo, e)
+
+
+def _pi_ops_from_pair(pair: "dict | None",
+                      fields: "Sequence[str] | None" = None) -> tuple[str, str, str, str, str]:
+    """(mo, provider, model, to, thinking) setting pi's file to the pair;
+    `fields` ("model", "thinking") as for Claude."""
+    pair = pair if isinstance(pair, dict) else {}
+    m = pair.get("model") if isinstance(pair.get("model"), str) else ""
+    t = pair.get("thinking") if isinstance(pair.get("thinking"), str) else ""
+    if m and not PI_MODEL_RE.match(m):
+        m = ""
+    if t not in PI_THINKING_LEVELS:
+        t = ""
+    p, _, rest = m.partition("/")
+    mo = ("set" if m else "clear") if fields is None or "model" in fields else "keep"
+    to = ("set" if t else "clear") if fields is None or "thinking" in fields else "keep"
+    return (mo, p, rest, to, t)
+
+
+def _write_agent_settings(container: str, agent: str, pair: "dict | None",
+                          home: str = _AGENT_HOME,
+                          fields: "Sequence[str] | None" = None) -> str:
+    """Write the recorded pair into `agent`'s settings file in a RUNNING
+    container, as the agent user. "ok", "absent" (no settings file yet — the
+    agent was never installed there) or "failed". Never raises."""
+    if agent == "pi":
+        mo, p, m, to, t = _pi_ops_from_pair(pair, fields)
+        args = ["--arg", "mo", mo, "--arg", "p", p, "--arg", "m", m,
+                "--arg", "to", to, "--arg", "t", t, PI_SETTINGS_JQ]
+    else:
+        mo, m, eo, e = _claude_ops_from_pair(pair, fields)
+        args = ["--arg", "mo", mo, "--arg", "m", m, "--arg", "eo", eo, "--arg", "e", e,
+                CLAUDE_SETTINGS_JQ]
+    try:
+        r = run(["docker", "exec", "-u", "1000", "-e", f"HOME={home}", container,
+                 "sh", "-c", _AGENT_SETTINGS_SCRIPT, "sh", _agent_settings_path(agent, home),
+                 *args], capture_output=True, timeout=AGENT_SETTINGS_EXEC_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        return "failed"
+    out = r.stdout or ""
+    if r.returncode != 0 or AGENT_SETTINGS_FAILED in out:
+        return "failed"
+    if AGENT_SETTINGS_ABSENT in out:
+        return "absent"
+    return "ok"
+
+
+def _read_agent_settings(container: str, agent: str,
+                         home: str = _AGENT_HOME) -> "dict | None":
+    """`agent`'s settings file in a RUNNING container as a dict, or None (no
+    file, unreadable, not an object)."""
+    # A regular file only (a FIFO would block `cat` forever), and at most the
+    # cap (one byte over reads as unreadable).
+    try:
+        r = run(["docker", "exec", "-u", "1000", container, "sh", "-c",
+                 '[ -f "$1" ] && head -c "$2" "$1" 2>/dev/null', "sh",
+                 _agent_settings_path(agent, home), str(AGENT_SETTINGS_MAX_BYTES + 1)],
+                capture_output=True, timeout=AGENT_SETTINGS_EXEC_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        return None
+    if len(r.stdout or "") > AGENT_SETTINGS_MAX_BYTES:
+        return None
+    if r.returncode != 0 or not (r.stdout or "").strip():
+        return None
+    try:
+        data = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _marker_rmw(workspace_path: "Path", mutate, what: str) -> None:
+    """Read-modify-write the project marker: `mutate(data)` edits the dict in
+    place. Refuses an unreadable or non-object marker (never clobbers it), temp
+    file + rename. `what` names the change in the refusal."""
+    f = workspace_path / ".orchestrator" / "project.json"
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        raise ValidationError(f"cannot {what}: the project marker {f} is unreadable ({e}); "
+                              f"repair it first")
+    if not isinstance(data, dict):
+        raise ValidationError(f"cannot {what}: the project marker {f} is not a JSON object")
+    mutate(data)
+    tmp = f.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(f)
+
+
+def _agent_settings_block(data: dict) -> "dict | None":
+    blk = data.get("agent_settings")
+    return blk if isinstance(blk, dict) else None
+
+
+def _pending_fields(blk: "dict | None") -> dict:
+    """{agent: [halves]} of the pending agents that owe only some halves (an
+    agent pending without an entry owes its whole pair)."""
+    f = (blk or {}).get("fields")
+    if not isinstance(f, dict):
+        return {}
+    return {a: [x for x in v if isinstance(x, str)] for a, v in f.items()
+            if a in ("claude", "pi") and isinstance(v, list)}
+
+
+def _add_pending(data: dict, owed: "dict[str, Sequence[str] | None]") -> None:
+    """Mark the agents in `owed` as owing a settings write at the next deploy;
+    each maps to the halves it owes (None: the whole pair). Marks merge: an
+    agent already owing its whole pair keeps owing it."""
+    blk = _agent_settings_block(data) or {}
+    pending = [a for a in blk.get("pending", []) if a in ("claude", "pi")] \
+        if isinstance(blk.get("pending"), list) else []
+    fields = _pending_fields(blk)
+    for a, halves in owed.items():
+        whole = a in pending and a not in fields
+        if a not in pending:
+            pending.append(a)
+        if halves is None or whole:
+            fields.pop(a, None)
+        else:
+            fields[a] = sorted(set(fields.get(a, [])) | set(halves))
+    out = {"v": 1, "pending": pending, "migrated": bool(blk.get("migrated"))}
+    if fields:
+        out["fields"] = fields
+    data["agent_settings"] = out
+
+
+def _apply_agent_settings_pending(container: str, workspace_path: "Path",
+                                  local: "Sequence[str]", *, claude_in_settings: bool,
+                                  progress=None, home: str = _AGENT_HOME) -> None:
+    """Write the recorded model of every agent marked pending into its settings
+    file in the running `container` — called right after the agents are
+    deployed (create, every start, an add) and after a live change. `local`:
+    the agents installed in this container. A project created before this
+    (its record not yet `migrated`) is migrated once: its recorded Claude pair
+    is written only where Claude's file has no model yet, so a choice made
+    inside Claude is kept. Never raises — it runs in the middle of a start."""
+    try:
+        data = _read_marker_dict(workspace_path)
+        if not data:
+            return
+        blk = _agent_settings_block(data)
+        pending = set(a for a in (blk or {}).get("pending", []) if a in ("claude", "pi")) \
+            if isinstance((blk or {}).get("pending"), list) else set()
+        models = data.get("models") if isinstance(data.get("models"), dict) else {}
+        claude_pair = models.get("supervisor") if isinstance(models.get("supervisor"), dict) else None
+        pi_blk = data.get("pi_models") if isinstance(data.get("pi_models"), dict) else {}
+        pi_pair = pi_blk.get("agent") if isinstance(pi_blk.get("agent"), dict) else None
+        done: set[str] = set()
+        fields = _pending_fields(blk)
+        migrate_now = (claude_in_settings and DEFAULT_AGENT in local
+                       and not (blk or {}).get("migrated"))
+        migrated = False
+        for agent in ("claude", "pi"):
+            if agent not in local or (agent == "claude" and not claude_in_settings):
+                continue
+            pair = claude_pair if agent == "claude" else pi_pair
+            if agent not in pending:
+                # The one-time migration of an older project's Claude pair:
+                # written only where Claude's file has no model yet. Counted
+                # as done only once the file was read (a failed read retries
+                # at the next deploy).
+                if not (agent == "claude" and migrate_now):
+                    continue
+                cur = _read_agent_settings(container, "claude", home)
+                if cur is None:
+                    continue
+                # Migrate exactly what the old container setting delivered: the
+                # model when one is recorded (kept as the file has it when a
+                # /model choice is already there), the effort only alongside a
+                # recorded model with a recorded effort (_model_env_args emits
+                # nothing else) — never a clear of something it never set.
+                rec_m = (claude_pair or {}).get("model") or ""
+                rec_e = (claude_pair or {}).get("effort") or ""
+                halves = []
+                if rec_m and "model" not in cur:
+                    halves.append("model")
+                if rec_m and rec_e:
+                    halves.append("effort")
+                if not halves or _write_agent_settings(container, agent, pair, home,
+                                                       halves) == "ok":
+                    migrated = True
+                continue
+            res = _write_agent_settings(container, agent, pair, home, fields.get(agent))
+            if res == "ok":
+                done.add(agent)
+                if agent == "claude":
+                    migrated = True     # the record's pair is in the file now
+            else:
+                _report_warnings([_AGENT_SETTINGS_WARNING.format(agent=agent)], progress)
+        if not done and not migrated:
+            return
+
+        def mutate(d: dict) -> None:
+            b = _agent_settings_block(d) or {}
+            left = [a for a in (b.get("pending") or []) if a in ("claude", "pi") and a not in done] \
+                if isinstance(b.get("pending"), list) else []
+            f = {a: v for a, v in _pending_fields(b).items() if a in left}
+            out = {"v": 1, "pending": left, "migrated": bool(b.get("migrated")) or migrated}
+            if f:
+                out["fields"] = f
+            d["agent_settings"] = out
+        _marker_rmw(workspace_path, mutate, "record the applied agent settings")
+    except Exception as e:     # never stop a start over a settings write
+        _report_warnings([f"the agents' recorded models could not be applied ({e})"], progress)
+
+
+def _clear_pending(workspace_path: "Path", agents: "Sequence[str]",
+                   mark_migrated: bool = False) -> None:
+    """Drop `agents` from the pending marks (their record is in the files
+    already); `mark_migrated` also records the one-time migration as done (a
+    fresh home whose first boot merged the whole record). Never raises."""
+    def mutate(d: dict) -> None:
+        b = _agent_settings_block(d) or {}
+        left = [a for a in (b.get("pending") or []) if a not in agents] \
+            if isinstance(b.get("pending"), list) else []
+        f = {a: v for a, v in _pending_fields(b).items() if a in left}
+        out = {"v": 1, "pending": left, "migrated": bool(b.get("migrated")) or mark_migrated}
+        if f:
+            out["fields"] = f
+        d["agent_settings"] = out
+    try:
+        data = _read_marker_dict(workspace_path)
+        if data and (_agent_settings_block(data) is not None or mark_migrated):
+            _marker_rmw(workspace_path, mutate, "record the applied agent settings")
+    except Exception:
+        pass
+
+
+def _agent_settings_owed(workspace_path: "Path") -> bool:
+    """Whether the record owes a settings write (a pending agent, or the
+    one-time migration of a recorded Claude model) — read from the file alone,
+    so a start with nothing owed makes no container call."""
+    data = _read_marker_dict(workspace_path)
+    blk = _agent_settings_block(data)
+    if blk and isinstance(blk.get("pending"), list) and blk["pending"]:
+        return True
+    models = data.get("models") if isinstance(data.get("models"), dict) else {}
+    sup = models.get("supervisor") if isinstance(models.get("supervisor"), dict) else {}
+    return not (blk or {}).get("migrated") and bool(sup.get("model"))
+
+
+def _uninstall_claude_extension(container: str, home: str = _AGENT_HOME) -> None:
+    """Remove Claude Code's editor extension from the project's editor when the
+    project's own container no longer runs Claude (its extensions live in the
+    workspace and survive a restart). A no-op without an editor or the
+    extension; never raises."""
+    script = (f'cs="{home}/.local/bin/code-server"; [ -x "$cs" ] || exit 0\n'
+              f'U="{_CS_USER_DIR}"; E="$U/extensions"\n'
+              f'set -- "$E/{CLAUDE_EXT_ID}-"[0-9]*; [ -e "$1" ] || exit 0\n'
+              f'"$cs" --uninstall-extension {CLAUDE_EXT_ID} --extensions-dir "$E" '
+              f'--user-data-dir "$U" >/dev/null 2>&1 || true\n')
+    try:
+        run(["docker", "exec", "-u", "1000", "-e", f"HOME={home}", container, "sh", "-c", script],
+            capture_output=True)
+    except OSError:
+        pass
+
+
+@dataclass
+class _AgentSettingsPlan:
+    """What an update changes in the agents' settings (built and checked before
+    any write; see _agent_settings_plan)."""
+    claude: "dict | None" = None        # the new recorded Claude pair, or None
+    claude_live: bool = False           # written into the settings file (not via a recreate)
+    claude_fields: "list[str]" = field(default_factory=list)   # the halves asked ("model", "effort")
+    pi_fields: "list[str]" = field(default_factory=list)       # ("model", "thinking")
+    pi: "dict | None" = None            # the new pi pair ({} = cleared), or None
+    harness: "dict | None" = None       # the new harness map, or None
+    agents_new: "list[str] | None" = None
+    removed: list[str] = field(default_factory=list)
+    effort_dropped: bool = False
+
+    def any(self) -> bool:
+        return (self.claude is not None or self.pi is not None or self.harness is not None
+                or bool(self.removed))
+
+
+def _project_running_agents(workspace_path: "Path") -> list[str]:
+    """The agents in the project's own container, from its record: the docker
+    substrate runs exactly its record, research runs Claude, Docker-in-Docker
+    runs _dind_agent_sets' local set — which, for a record from before the
+    exact sets, includes Claude whenever any agent is recorded. A removal is
+    judged against this (never the bare record), and the CLI builds its
+    request from it, so the two agree with the panel (`agents_local`)."""
+    data = _read_marker_dict(workspace_path)
+    if data.get("substrate") == Substrate.DOCKER.value:
+        return list(_read_marker_agents(workspace_path))
+    if data.get("type") != PROJECT_TYPE_SANDBOX_DIND:
+        return [DEFAULT_AGENT]
+    return _dind_agent_sets(data)[1]
+
+
+def _workflow_is_dev(data: dict) -> bool:
+    """The project's workflow carries the `dev` flag (tolerant: an unknown
+    workflow reads as no)."""
+    wf = data.get("workflow")
+    if not isinstance(wf, str) or not wf:
+        return False
+    try:
+        manifest, _pt, _sub = _resolve_workflow(wf)
+    except (ValidationError, SystemExit, OSError, ValueError):
+        return False
+    return bool(manifest.get("dev"))
+
+
+def _agent_settings_plan(req: "UpdateRequest", container: str, workspace_path: "Path",
+                         *, docker: bool, claude_in_settings: bool) -> _AgentSettingsPlan:
+    """Check an update's agent-settings half against the project (its marker,
+    workflow, agents and boxes) and return what it changes. Raises
+    ValidationError before anything is written. Texts reach the browser
+    verbatim: they name the panel's fields, never a command."""
+    plan = _AgentSettingsPlan()
+    reset = set(req.reset)
+    claude_asked = bool(req.supervisor_model or req.supervisor_effort
+                        or reset & {"supervisor_model", "supervisor_effort"})
+    pi_asked = bool(req.pi_model or req.pi_thinking or reset & {"pi_model", "pi_thinking"})
+    harness_asked = any(getattr(req, f) for f in HARNESS_FIELDS) or bool(reset & set(HARNESS_FIELDS))
+    if not (claude_asked or pi_asked or harness_asked or req.agents is not None):
+        return plan
+    data = _read_marker_dict(workspace_path)
+    if not data:
+        raise ValidationError("cannot change the agents: the project's record is missing "
+                              "or unreadable")
+    is_research = (not docker) and data.get("type") != PROJECT_TYPE_SANDBOX_DIND
     current = list(_read_marker_agents(workspace_path))
-    missing = [a for a in current if a not in req.agents]
-    if missing:
-        raise ValidationError(
-            f"agents can be added, not removed ({', '.join(missing)} would be dropped); "
-            f"recreate the project to shed an agent")
-    return [a for a in req.agents if a not in current]
+    new_agents = list(req.agents) if req.agents is not None else current
+    # What runs in the project's own container now (see _project_running_agents).
+    running_now = _project_running_agents(workspace_path)
+    # Removal (I33 slice 3).
+    removed = ([a for a in running_now if a not in new_agents]
+               if req.agents is not None else [])
+    if docker:
+        local = new_agents
+    elif is_research:
+        local = [DEFAULT_AGENT]
+    else:
+        hypo = dict(data)
+        hypo["agents"] = new_agents
+        if removed:
+            hypo["agents_exact"] = True
+        _staged, local = _dind_agent_sets(hypo)
+    dev = _workflow_is_dev(data)
+    if removed:
+        if docker or is_research:
+            raise ValidationError("this project's agents are fixed when it is created")
+        if dev and not new_agents:
+            raise ValidationError("a dev project needs at least one agent")
+        if "pi" in removed:
+            try:
+                boxes = sorted(n for n, e in extension.load(workspace_path).items()
+                               if isinstance(e, dict) and e.get("agent") == "pi")
+            except Exception:
+                boxes = []
+            if boxes:
+                raise ValidationError(
+                    f"pi cannot be removed while these boxes run it: {', '.join(boxes)}; "
+                    f"remove those boxes first")
+        plan.removed = removed
+        plan.agents_new = new_agents
+    # Claude's model and effort.
+    if claude_asked:
+        if DEFAULT_AGENT not in local:
+            raise ValidationError("the project's own terminal does not run Claude")
+        models = _read_models(workspace_path)
+        old = dict(models.get("supervisor") or {}) if isinstance(models.get("supervisor"), dict) else {}
+        m = req.supervisor_model or ("" if "supervisor_model" in reset else old.get("model", ""))
+        e = req.supervisor_effort or ("" if "supervisor_effort" in reset else old.get("effort", ""))
+        catalog = _model_catalog_checked()
+        if e and not _claude_effort_ok(m, e, catalog):
+            if req.supervisor_effort:
+                raise ValidationError(f"model {m!r} does not accept an effort level")
+            e = ""
+            plan.effort_dropped = True
+        plan.claude = {"model": m, "effort": e}
+        plan.claude_live = claude_in_settings
+        plan.claude_fields = [h for h, asked in (
+            ("model", req.supervisor_model or "supervisor_model" in reset),
+            ("effort", req.supervisor_effort or "supervisor_effort" in reset
+             or plan.effort_dropped)) if asked]
+    # pi's starting model.
+    if pi_asked:
+        if is_research:
+            raise ValidationError("a research project runs Claude only")
+        if "pi" not in local:
+            raise ValidationError("the project's own terminal does not run pi")
+        blk = data.get("pi_models") if isinstance(data.get("pi_models"), dict) else {}
+        old = dict(blk.get("agent") or {}) if isinstance(blk.get("agent"), dict) else {}
+        m = req.pi_model or ("" if "pi_model" in reset else old.get("model", ""))
+        t = req.pi_thinking or ("" if "pi_thinking" in reset else old.get("thinking", ""))
+        plan.pi = {"model": m, "thinking": t} if (m or t) else {}
+        plan.pi_fields = [h for h, asked in (
+            ("model", req.pi_model or "pi_model" in reset),
+            ("thinking", req.pi_thinking or "pi_thinking" in reset)) if asked]
+    # The working mode and the doer/checker models.
+    if harness_asked or removed:
+        old_h = _read_harness(workspace_path)
+        new_h = dict(old_h)
+        for f in HARNESS_FIELDS:
+            v = getattr(req, f)
+            if v:
+                new_h[f] = v
+            elif f in reset:
+                new_h.pop(f, None)
+        # A removed agent's doer/checker models go with it.
+        if DEFAULT_AGENT in removed:
+            for f in _HARNESS_CLAUDE:
+                new_h.pop(f, None)
+        if "pi" in removed:
+            for f in _HARNESS_PI:
+                new_h.pop(f, None)
+        if harness_asked:
+            if is_research:
+                raise ValidationError("the working mode and the Doer and Checker models are "
+                                      "for dev projects and dev boxes")
+            set_now = {f: getattr(req, f) for f in HARNESS_FIELDS}
+            _validated_harness(set_now, dev=dev, agents=local)
+        if new_h != old_h:
+            plan.harness = new_h
+    if "pi" in removed and plan.pi is None:
+        blk = data.get("pi_models")
+        if isinstance(blk, dict) and blk.get("agent"):
+            plan.pi = {}
+    return plan
+
+
+def _agent_settings_commit(plan: _AgentSettingsPlan, workspace_path: "Path") -> None:
+    """Write the plan into the project's record (one read-modify-write), with
+    every changed agent marked pending: the live apply, the add or the next
+    start writes it into the agent's own file and clears the mark."""
+    if not plan.any():
+        return
+
+    def mutate(d: dict) -> None:
+        owed: dict = {}
+        if plan.claude is not None:
+            models = d.get("models") if isinstance(d.get("models"), dict) else {}
+            models = dict(models)
+            models["supervisor"] = dict(plan.claude)
+            d["models"] = models
+            # Owed even when this container cannot take it (an older image):
+            # the mark is consumed only where the file is the channel, so it
+            # waits for the first start on a current image — and is never
+            # lost to the one-time migration.
+            # A project not yet migrated owes the WHOLE pair: its container
+            # delivered both halves until now, and the first start on a
+            # current image drops that container setting.
+            migrated = bool((_agent_settings_block(d) or {}).get("migrated"))
+            owed["claude"] = (plan.claude_fields or None) if migrated else None
+        if plan.pi is not None:
+            blk = dict(d.get("pi_models")) if isinstance(d.get("pi_models"), dict) else {}
+            if plan.pi:
+                blk["agent"] = dict(plan.pi)
+            else:
+                blk.pop("agent", None)
+            if blk:
+                d["pi_models"] = blk
+            else:
+                d.pop("pi_models", None)
+            if "pi" not in plan.removed:
+                owed["pi"] = plan.pi_fields or None
+        if plan.harness is not None:
+            if plan.harness:
+                d["harness"] = dict(plan.harness)
+            else:
+                d.pop("harness", None)
+        if plan.agents_new is not None:
+            d["agents"] = list(dict.fromkeys(plan.agents_new))
+            d["agents_exact"] = True
+        if owed:
+            _add_pending(d, owed)
+    _marker_rmw(workspace_path, mutate, "change the agents")
+
+
+@dataclass(frozen=True)
+class ProjectAgentsRequest:
+    """Read what a project's agents run, for the ⚙ Agents box."""
+    project: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "ProjectAgentsRequest":
+        return cls(project=_require_name(kw.get("project")))
+
+
+def _clean_claude_model(v: Any) -> tuple[str, bool]:
+    """(value, unrecognised): a string held to CLAUDE_MODEL_RE, else ("", True)."""
+    if not isinstance(v, str) or not v:
+        return "", False
+    return (v, False) if CLAUDE_MODEL_RE.match(v) else ("", True)
+
+
+def _claude_effective(settings: "dict | None", env: dict) -> dict:
+    """What Claude will run, in Claude's own order (measured, 2.1.258): the
+    settings file's `env` entries, then the container's environment, then the
+    file's `model`; for effort the same two environments, then the per-model
+    level `/effort` saves, then the file's `effortLevel`. A present but empty
+    `env` entry in the file hides the container's (a project migrated by a
+    panel write). Values failing the character set read as unrecognised."""
+    st = settings if isinstance(settings, dict) else {}
+    senv = st.get("env") if isinstance(st.get("env"), dict) else {}
+
+    def layered(key: str, file_value: Any) -> Any:
+        if key in senv:
+            return senv[key] or file_value
+        return env.get(key) or file_value
+    model, bad_m = _clean_claude_model(layered("ANTHROPIC_MODEL", st.get("model")))
+    ms = st.get("modelSettings") if isinstance(st.get("modelSettings"), dict) else {}
+    per = ms.get(model) if model and isinstance(ms.get(model), dict) else {}
+    file_effort = per.get("effortLevel") or st.get("effortLevel")
+    effort = layered("CLAUDE_CODE_EFFORT_LEVEL", file_effort)
+    bad_e = False
+    if not isinstance(effort, str) or (effort and effort not in (*CLAUDE_SETTINGS_EFFORTS, "max")):
+        bad_e, effort = bool(effort), ""
+    return {"model": model, "effort": effort, "unrecognised": bad_m or bad_e}
+
+
+def _pi_effective(settings: "dict | None") -> dict:
+    """pi's starting model and thinking level from its settings file."""
+    st = settings if isinstance(settings, dict) else {}
+    p, m, t = st.get("defaultProvider"), st.get("defaultModel"), st.get("defaultThinkingLevel")
+    model = f"{p}/{m}" if isinstance(p, str) and isinstance(m, str) and p and m else ""
+    bad = False
+    if model and not PI_MODEL_RE.match(model):
+        model, bad = "", True
+    if not isinstance(t, str) or t not in PI_THINKING_LEVELS:
+        bad, t = bad or bool(t), ""
+    return {"model": model, "thinking": t, "unrecognised": bad}
+
+
+def _container_env(container: str) -> dict:
+    """The container's own environment (KEY → value), or {}."""
+    try:
+        r = run(["docker", "container", "inspect", "-f", "{{json .Config.Env}}", container],
+                capture_output=True, timeout=AGENT_SETTINGS_EXEC_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if r.returncode != 0:
+        return {}
+    try:
+        items = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return {}
+    out = {}
+    for it in items if isinstance(items, list) else []:
+        if isinstance(it, str) and "=" in it:
+            k, _, v = it.partition("=")
+            out[k] = v
+    return out
+
+
+def project_agents(req: ProjectAgentsRequest, _progress=None) -> dict:
+    """The ⚙ Agents box's read: the project's kind, its agents (recorded,
+    in its own container, in the copy its boxes use), and what each agent
+    runs. A running project's models are read from the agents' own settings
+    files — so a model picked inside the agent shows up — and a stopped one's
+    from the record. Values are held to the panel's character sets."""
+    cfg = load_config()
+    container = container_name_for(req.project)
+    if not container_exists(container):
+        raise ValidationError(f"no project named {req.project!r}")
+    ws = workspace_path_for(req.project, cfg)
+    data = _read_marker_dict(ws)
+    docker = data.get("substrate") == Substrate.DOCKER.value
+    research = not docker and data.get("type") != PROJECT_TYPE_SANDBOX_DIND
+    agents = [a for a in _read_marker_agents(ws) if a in KNOWN_AGENTS]
+    if docker:
+        staged, local = list(agents), list(agents)
+    elif research:
+        staged, local = [DEFAULT_AGENT], [DEFAULT_AGENT]
+    else:
+        staged, local = _dind_agent_sets(data)
+    running = container_running(container)
+    models = data.get("models") if isinstance(data.get("models"), dict) else {}
+    out: dict = {
+        "project": req.project, "running": running,
+        "kind": "docker" if docker else ("research" if research else "dind"),
+        "dev": _workflow_is_dev(data), "agents": agents,
+        "agents_local": local, "agents_staged": staged,
+        "model_in_settings": _label_is_set("container", container),
+        "harness": _read_harness(ws),
+    }
+    env = _container_env(container) if running else {}
+    if DEFAULT_AGENT in local:
+        rec = models.get("supervisor") if isinstance(models.get("supervisor"), dict) else {}
+        if running and out["model_in_settings"]:
+            out["claude"] = {**_claude_effective(_read_agent_settings(container, "claude"), env),
+                             "source": "settings"}
+        elif running:
+            out["claude"] = {**_claude_effective(None, env), "source": "container"}
+        else:
+            out["claude"] = {**_claude_effective({"model": rec.get("model"),
+                                                  "effortLevel": rec.get("effort")}, {}),
+                             "source": "saved"}
+    if "pi" in local:
+        rec = (data.get("pi_models") or {}).get("agent") if isinstance(data.get("pi_models"), dict) else None
+        if running:
+            out["pi"] = {**_pi_effective(_read_agent_settings(container, "pi")), "source": "settings"}
+        else:
+            m = rec.get("model", "") if isinstance(rec, dict) else ""
+            p, _, rest = m.partition("/") if isinstance(m, str) else ("", "", "")
+            out["pi"] = {**_pi_effective({"defaultProvider": p, "defaultModel": rest,
+                                          "defaultThinkingLevel": (rec or {}).get("thinking")}),
+                         "source": "saved"}
+    if research:
+        out["research_models"] = {t: {"model": (models.get(t) or {}).get("model", ""),
+                                      "effort": (models.get(t) or {}).get("effort", "")}
+                                  for t in ("worker", "role") if isinstance(models.get(t), dict)}
+    return out
 
 
 def _read_marker_substrate(workspace_path: "Path") -> str:
@@ -13349,6 +14330,20 @@ def _model_env_args(pair: dict[str, str] | None) -> list[str]:
     args = ["-e", f"ANTHROPIC_MODEL={pair['model']}"]
     if pair.get("effort"):
         args += ["-e", f"CLAUDE_CODE_EFFORT_LEVEL={pair['effort']}"]
+    return args
+
+
+def _claude_boot_env_args(pair: dict[str, str] | None) -> list[str]:
+    """`-e` args carrying the Claude pair to the docker substrate's first boot,
+    which merges them into the settings it installs (entrypoint.minimal.sh).
+    Empty halves emit nothing."""
+    if not pair:
+        return []
+    args: list[str] = []
+    if pair.get("model"):
+        args += ["-e", f"RS_CLAUDE_MODEL={pair['model']}"]
+    if pair.get("effort"):
+        args += ["-e", f"RS_CLAUDE_EFFORT={pair['effort']}"]
     return args
 
 
@@ -13784,7 +14779,9 @@ def _role_mcp_stage_creds(supervisor: str, role: str) -> None:
             # supervisor image only. Propagating it would break every
             # claude session in the role-MCP container with a "command
             # not found" error on every Stop event.
-            jq 'del(.hooks)' /home/research/.claude/settings.json \
+            # …and the supervisor agent's own model and effort, which live in
+            # this file and would override the role's own (I33 slice 3).
+            jq '{AGENT_MODEL_SETTINGS_JQ}' /home/research/.claude/settings.json \
                > /workspace/.role-mcps/{role}/.creds/settings.json
             chmod 600 /workspace/.role-mcps/{role}/.creds/settings.json
         fi
