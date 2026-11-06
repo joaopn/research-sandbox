@@ -1745,10 +1745,10 @@ html.mobile .project-config-box .config-folders-input { font-size: 16px; }
 }
 .model-row select:disabled { opacity: 0.55; }
 
-/* Create dialog — the Agents section (I33): a heading whose badges turn agents
-   on and off, one tab per agent that is on, and that agent's settings below.
-   The badges are .box-opt-card toggles (selected = on, locked = held on); the
-   heading's <label> is the .field group title, so it keeps the house style. */
+/* Create dialog — the Agents box (I33; a collapsible box, open by default): a
+   row of badges that turn agents on and off, one tab per agent that is on, and
+   that agent's settings below. The badges are .box-opt-card toggles (selected
+   = on, locked = held on); the box head carries the title. */
 .agents-section .agents-head {
     display: flex;
     align-items: center;
@@ -1757,6 +1757,8 @@ html.mobile .project-config-box .config-folders-input { font-size: 16px; }
     margin-bottom: 8px;
 }
 .agents-section .agents-head > label { margin: 0; }
+/* The Agents box opens with the badges on their own row under its head. */
+.agents-section.box-collapsible .agents-head { margin-bottom: 10px; }
 .agent-badge { padding: 4px 12px; }
 .agent-tabs {
     display: flex;

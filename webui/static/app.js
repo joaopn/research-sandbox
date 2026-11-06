@@ -7482,8 +7482,8 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
     ]);
     if (!hasWorkerLayer) enableField.style.display = "none";
 
-    // The Agents section (I33): a heading whose badges turn agents on and off,
-    // and one tab per agent that is on, holding that agent's model settings.
+    // The Agents box (I33): badges that turn agents on and off, and one tab
+    // per agent that is on, holding that agent's model settings.
     // The badges show what the project container will actually RUN, which the
     // create path decides per workflow (code-dictated, not a preference):
     //  - a workflow with no agent selection (research, identified as today's
@@ -7609,16 +7609,19 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             syncAgents();
         };
     });
-    const agentsSection = el("div", { class: "field agents-section" }, [
+    // A box like Extensions and Sharing, but open by default (the agents are
+    // the first thing most creates change). Folding only hides: the payload
+    // reads the badges, the switch and the tabs as before.
+    const agentsSection = collapsibleBox("Agents", [
         el("div", { class: "agents-head" }, [
-            el("label", {}, ["Agents"]),
             el("div", { class: "box-opt-cards agent-badges" }, agentChecks.map((c) => c.card)),
         ]),
         harnessSwitch ? harnessSwitch.node : null,
         agentTabsRow,
         agentPanelsWrap,
         agentsHint,
-    ]);
+    ], "agents-section");
+    setCollapsibleOpen(agentsSection, true);
     syncAgents();
     // The model halves of the payload, by agent: Claude's pairs only while
     // Claude is on (a project without Claude has no Claude to configure), pi's
@@ -7719,8 +7722,8 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
     authGroup.style.display = "none";
     authCb.onchange = () => { authGroup.style.display = authCb.checked ? "" : "none"; };
     // The Extensions box — the extensions as bordered cards in a box that
-    // opens folded, like the box window's; the agents have their own section
-    // above (I33). Folding only hides: the payload reads every card as before.
+    // opens folded, like the box window's; the agents have their own box
+    // above (I33), open by default. Folding only hides: the payload reads every card as before.
     const extensionsBox = collapsibleBox("Extensions", [
         // Node is substrate-agnostic (all flavors); reader is dind-only;
         // rs-fetch is any-workflow-but-dev (the dev supervisor is the
