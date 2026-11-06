@@ -11079,6 +11079,9 @@ function appendAgentsBox(box, project, enabled) {
     const section = collapsibleBox("Agents", [content], "config-agents", "config-sharing");
     setCollapsibleOpen(section, true);
     box.appendChild(section);
+    // The Box agents section's place (filled from the same read below).
+    const boxesHolder = el("div", {});
+    box.appendChild(boxesHolder);
     (async () => {
         let res = null, b = null;
         try {
@@ -11104,6 +11107,8 @@ function appendAgentsBox(box, project, enabled) {
             } catch (e) { /* no additions offered */ }
         }
         content.replaceChildren(...agentsBoxContent(project.name, d, cat, staged));
+        const boxesSection = boxAgentsSection(project.name, d, cat);
+        if (boxesSection) boxesHolder.replaceChildren(boxesSection);
     })();
 }
 
@@ -11285,6 +11290,246 @@ function agentsBoxContent(name, d, cat, staged) {
         el("div", { class: "config-box-row" }, [apply, upd]),
         applyMsg,
     ].filter((n) => n);
+}
+
+// The ⚙ Box agents section (I33 slice 3, the box half): a box's agent
+// settings after it was added — a Claude box's model and effort (any project),
+// and a dev box's working mode and Doer/Checker models (outside research
+// projects). Same data as the Agents box (its one read); same inline save as
+// ⚙ Box folders. A model change is written into the running box at once; a
+// working-mode change restarts the box fresh; a stopped box takes either when
+// it next starts.
+function boxAgentsSection(name, d, cat) {
+    const state = d.boxes_state;
+    // No boxes to speak of: a project without Docker-in-Docker ("none"), or a
+    // read from a broker that predates boxes in it (no state at all).
+    if (!state || state === "none") return null;
+    const content = el("div", {});
+    const section = collapsibleBox("Box agents", [content], "config-box-agents", "config-sharing");
+    setCollapsibleOpen(section, true);
+    if (state === "stopped") {
+        content.replaceChildren(el("div", { class: "config-empty" },
+            ["Start the project to change its boxes."]));
+        return section;
+    }
+    if (state === "old-tool") {
+        content.replaceChildren(el("div", { class: "config-empty" },
+            ["Restart the project to change its boxes here."]));
+        return section;
+    }
+    if (state !== "ok") {
+        content.replaceChildren(el("div", { class: "config-empty" },
+            ["Couldn't read the project's boxes."]));
+        return section;
+    }
+    const boxes = (Array.isArray(d.boxes) ? d.boxes : [])
+        .filter((b) => b.agent === "claude" || b.mode_editable);
+    if (!boxes.length) return null;
+    const sel = el("select", {}, boxes.map((b) =>
+        el("option", { value: b.name }, [b.name + " (" + (AGENTS_BOX_LABELS[b.agent] || b.agent) +
+                                         (b.running ? "" : ", stopped") + ")"])));
+    const rowsWrap = el("div", {});
+    const what = el("div", { class: "config-hint" });
+    const status = el("div", { class: "config-box-status" });
+    const saveBtn = el("button", { class: "btn btn-secondary" }, ["Save"]);
+    let cur = null;
+    const draw = () => {
+        const b = boxes.find((x) => x.name === sel.value) || boxes[0];
+        cur = boxAgentsRows(b, cat, () => { what.textContent = boxAgentsWhat(b, cur); });
+        rowsWrap.replaceChildren(cur.node);
+        what.textContent = boxAgentsWhat(b, cur);
+        status.replaceChildren();
+    };
+    sel.onchange = draw;
+    saveBtn.onclick = async () => {
+        const b = boxes.find((x) => x.name === sel.value) || boxes[0];
+        const p = boxAgentsPayload(b, cur);
+        if (p.error) { status.replaceChildren(el("div", {}, [p.error])); return; }
+        if (!p.changed) { status.replaceChildren(el("div", {}, ["Nothing to change."])); return; }
+        saveBtn.disabled = true;
+        status.replaceChildren(el("div", {}, ["Saving…"]));
+        try {
+            const r = await fetch(`/broker/project/${encodeURIComponent(name)}/box-settings`, {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(Object.assign({ name: b.name }, p.payload)),
+            });
+            let rb; try { rb = await r.json(); } catch (e) { rb = {}; }
+            if (!r.ok || !rb.ok || !rb.result) {
+                status.replaceChildren(el("div", {}, ["Couldn't save: " + (mgmtErrText(rb) || r.status)]));
+                return;
+            }
+            const out = rb.result;
+            const lines = [el("div", {}, [!out.changed ? "Nothing changed."
+                : out.restarted ? "Saved — the box restarted fresh."
+                : b.running ? "Saved — its next Claude session uses it."
+                : "Saved — the box takes it when it next starts."])];
+            if (out.effort_dropped) {
+                lines.push(el("div", {}, ["The effort went back to the default: this model takes none."]));
+            }
+            for (const w of (Array.isArray(out.warnings) ? out.warnings : [])) {
+                lines.push(el("div", { class: "config-box-warn" }, ["⚠ " + w]));
+            }
+            status.replaceChildren(...lines);
+            // What was saved is the new starting point for the next change —
+            // except a model the box could not take yet (a warning came back):
+            // the same values must stay sendable again.
+            // (A restart writes the model itself, so only a save without one can
+            // carry a model warning.)
+            if (p.next.claude && !out.restarted && (out.warnings || []).length) delete p.next.claude;
+            if (p.next.claude && out.effort_dropped) p.next.claude.effort = "";
+            Object.assign(b, p.next);
+            what.textContent = boxAgentsWhat(b, cur);
+            if (out.restarted) await refreshAfterBoxChange(name);
+        } catch (e) {
+            status.replaceChildren(el("div", {}, ["Couldn't save: connection failed."]));
+        } finally {
+            saveBtn.disabled = false;
+        }
+    };
+    draw();
+    content.replaceChildren(
+        el("div", { class: "config-box-row" }, [sel, saveBtn]),
+        rowsWrap, what, status,
+        el("div", { class: "config-hint" }, [
+            "A box starts from a fresh home whenever it is restarted fresh — at every " +
+            "project start, and when a working-mode, folder or port change restarts it — " +
+            "so a model picked inside the box with /model lasts until then — unless " +
+            "you save it here, which keeps what this section shows."]));
+    return section;
+}
+
+// One box's controls: Claude's model + effort (a Claude box), the working-mode
+// switch and its Doer/Checker rows (a dev box outside research).
+function boxAgentsRows(b, cat, onChange) {
+    const parts = [];
+    let modelI = null, effortS = null, sw = null, claudeRows = null, piRows = null;
+    if (b.agent === "claude") {
+        const init = b.claude || { model: "", effort: "" };
+        const listId = "box-agents-models-" + (++agentsBoxSeq);
+        modelI = el("input", { type: "text", autocomplete: "off", spellcheck: "false",
+                               list: listId, placeholder: "Claude's own default" });
+        modelI.value = init.model || "";
+        effortS = el("select", {}, [
+            el("option", { value: "" }, ["Claude's default"]),
+            ...AGENTS_BOX_CLAUDE_EFFORTS.map((lv) => el("option", { value: lv }, [lv])),
+        ]);
+        effortS.value = AGENTS_BOX_CLAUDE_EFFORTS.includes(init.effort) ? init.effort : "";
+        const syncEffort = (clear) => {
+            const tier = ((cat && cat.models) || []).find((m) => m.alias === modelI.value.trim());
+            const none = !!tier && Array.isArray(tier.efforts) && !tier.efforts.length;
+            if (none && clear) effortS.value = "";
+            effortS.disabled = none;
+        };
+        modelI.addEventListener("input", () => { syncEffort(true); onChange(); });
+        effortS.addEventListener("change", onChange);
+        syncEffort(false);
+        parts.push(
+            el("datalist", { id: listId },
+               ((cat && cat.models) || []).map((m) => el("option", { value: m.alias }, [m.label || m.alias]))),
+            el("div", { class: "field" }, [
+                el("label", {}, ["Agent"]),
+                el("div", { class: "model-row" }, [
+                    el("div", { class: "model-cell agent-pi-model" }, [
+                        el("span", { class: "model-cap" }, ["model"]), modelI]),
+                    el("div", { class: "model-cell" }, [
+                        el("span", { class: "model-cap" }, ["effort"]), effortS]),
+                ]),
+            ]),
+            init.unrecognised
+                ? el("div", { class: "hint" }, ["The box's settings hold a value RS does not recognise; it is shown empty."])
+                : null);
+    }
+    if (b.mode_editable) {
+        const h = b.harness || {};
+        claudeRows = b.agent === "claude" ? harnessClaudeRows(cat, h) : null;
+        piRows = b.agent === "pi" ? harnessPiRows(h) : null;
+        const rows = claudeRows || piRows;
+        const syncRows = () => {
+            const pdc = !!sw && sw.value() === "planner-doer-checker";
+            if (rows) rows.node.style.display = pdc && (!claudeRows || claudeRows.available) ? "" : "none";
+            onChange();
+        };
+        // `sw` is assigned after syncRows exists (the switch calls back while
+        // it is built — the TDZ lesson of the Agents box).
+        sw = harnessModeSwitch(() => syncRows(), h.harness_mode || "none");
+        parts.push(sw.node, rows ? rows.node : null);
+        syncRows();
+    }
+    return {
+        node: el("div", { class: "box-agents-rows" }, parts.filter((n) => n)),
+        model: () => (modelI ? modelI.value.trim() : null),
+        effort: () => (effortS ? effortS.value : null),
+        mode: () => (sw ? sw.value() : null),
+        rowsFields: () => (sw && sw.value() === "planner-doer-checker"
+            ? Object.assign({}, claudeRows ? claudeRows.fields() : {}, piRows ? piRows.fields() : {})
+            : {}),
+        piInvalid: () => (piRows && sw && sw.value() === "planner-doer-checker" ? piRows.invalid() : null),
+    };
+}
+
+// What the box settings Save sends: only what differs from what was read; an
+// emptied value as a reset. `next` is what the box holds after a save.
+function boxAgentsPayload(b, cur) {
+    const payload = {};
+    const reset = [];
+    const next = {};
+    let modeChanged = false;
+    const diff = (field, now, was) => {
+        if (now === null || now === was) return false;
+        if (now) payload[field] = now; else reset.push(field);
+        return true;
+    };
+    const claudeInit = b.claude || { model: "", effort: "" };
+    if (cur.model() !== null) {
+        const m = cur.model();
+        if (m && !AGENTS_BOX_CLAUDE_MODEL.test(m)) {
+            return { error: "Claude's model may use only letters, digits and . _ - [ ]." };
+        }
+        const mc = diff("model", m, claudeInit.model || "");
+        const ec = diff("effort", cur.effort(), claudeInit.effort || "");
+        // An effort goes with the model the box shows (its file may hold a
+        // /model pick the record does not): the host checks the pair.
+        if (ec && !mc && m) payload.model = m;
+        if (mc || ec) next.claude = Object.assign({}, claudeInit, { model: m, effort: cur.effort() });
+    }
+    if (cur.mode() !== null) {
+        const bad = cur.piInvalid();
+        if (bad) return { error: bad };
+        const h = b.harness || {};
+        const was = h.harness_mode || "none";
+        const mode = cur.mode();
+        const nh = Object.assign({}, h);
+        if (mode !== was) {
+            modeChanged = true;
+            if (mode === "none") { reset.push("harness_mode"); delete nh.harness_mode; }
+            else { payload.harness_mode = mode; nh.harness_mode = mode; }
+        }
+        const rows = cur.rowsFields();
+        Object.keys(rows).forEach((k) => {
+            const now = rows[k] || "", w = h[k] || "";
+            if (now !== w) {
+                modeChanged = true;
+                if (now) { payload[k] = now; nh[k] = now; } else { reset.push(k); delete nh[k]; }
+            }
+        });
+        if (modeChanged) next.harness = nh;
+    }
+    if (reset.length) payload.reset = reset;
+    const changed = Object.keys(payload).length > 0;
+    return { payload, changed, modeChanged, next };
+}
+
+// The line under a box's controls saying what Save will do.
+function boxAgentsWhat(b, cur) {
+    if (!cur) return "";
+    const p = boxAgentsPayload(b, cur);
+    if (p.error || !p.changed) return "";
+    if (!b.running) return "The box is stopped: Save keeps the change for its next start.";
+    if (p.modeChanged) {
+        return "Save restarts the box fresh: its sessions end, its agent signs in again " +
+               "and its setup runs again. Its files are kept.";
+    }
+    return "Save writes the model into the box at once; its next Claude session uses it.";
 }
 
 // The Apply of the ⚙ Agents box: what changed against what was read, as one
