@@ -1784,6 +1784,18 @@ html.mobile .project-config-box .config-folders-input { font-size: 16px; }
    in a .field, whose input rule already gives it the house padding and border. */
 .agent-pi-row { align-items: flex-end; }
 .agent-pi-model { flex: 1 1 260px; min-width: 0; }
+/* The working mode (I33): a 3-way switch of compact cards between the agent
+   badges and the tabs (create dialog) or under the agent row (box window); its
+   Doer/Checker rows sit in each agent's tab and show only in
+   Planner-doer-checker. */
+.harness-mode .box-opt-cards { margin-bottom: 4px; }
+.harness-mode-card { padding: 4px 12px; }
+.harness-rows { margin-top: 12px; }
+/* The rows follow the tab's last field: keep that field's closing gap off
+   (`.agent-tab-panel > .field:last-child` no longer matches it). */
+.agent-tab-panel > .field:has(+ .harness-rows) { margin-bottom: 0; }
+.box-harness { margin-top: 10px; }
+.box-harness .harness-mode { margin-bottom: 0; }
 
 /* Box window: the agent cards and the model/effort row sit on one line — "which
    agent, and which model it runs on" is one decision. The row hides itself when no

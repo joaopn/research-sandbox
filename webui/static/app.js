@@ -7169,6 +7169,144 @@ function createEgressDefault(manifest) {
     return (v === "open" || v === "locked") ? v : "locked";
 }
 
+// The working mode (I33) — dev projects and dev boxes. What the agent is told
+// about HOW to work, from nothing to the planner-doer-checker loop with RS's
+// own `doer` and `checker` subagents. Values mirror rscore.HARNESS_MODES.
+const HARNESS_MODE_SPECS = [
+    ["none", "None",
+     "Nothing about how to work: the agent follows the project's own instructions."],
+    ["direct", "Direct",
+     "The agent does the work itself, in the session you talk to."],
+    ["planner-doer-checker", "Planner-doer-checker",
+     "The agent plans with you; RS's doer subagent implements each unit and its " +
+     "checker subagent reviews it before it lands. More thorough, and it costs " +
+     "more tokens and time per unit."],
+];
+const HARNESS_PI_MODEL_PATTERN = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._:~@+\/-]+$/;
+const HARNESS_PI_THINKING = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+// The 3-way switch: one card per mode, None first and selected. onChange runs
+// after every change (and once at build) so the caller can show its rows.
+function harnessModeSwitch(onChange) {
+    let mode = "none";
+    const hint = el("div", { class: "hint" });
+    const cards = HARNESS_MODE_SPECS.map(([value, label]) => {
+        const card = el("div", { class: "box-opt-card harness-mode-card" },
+                        [el("span", { class: "box-opt-name" }, [label])]);
+        card.onclick = () => { mode = value; sync(); };
+        return { value, card };
+    });
+    const sync = () => {
+        cards.forEach((c) => c.card.classList.toggle("selected", c.value === mode));
+        hint.textContent = (HARNESS_MODE_SPECS.find((s) => s[0] === mode) || [])[2] || "";
+        if (onChange) onChange(mode);
+    };
+    const node = el("div", { class: "field harness-mode" }, [
+        el("label", {}, ["Working mode"]),
+        el("div", { class: "box-opt-cards" }, cards.map((c) => c.card)),
+        hint,
+    ]);
+    sync();
+    return { node, value: () => mode };
+}
+
+// Claude's Doer and Checker rows: a tier each, "same as the session" first.
+// No effort control: Claude Code runs every subagent at the effort the agent's
+// own row sets (the container-wide setting wins over a per-subagent one).
+function harnessClaudeRows(cat) {
+    const mk = () => el("select", {}, [
+        el("option", { value: "" }, ["same as the session"]),
+        ...((cat && cat.models) || []).map((m) =>
+            el("option", { value: m.alias }, [m.label || m.alias])),
+    ]);
+    const doerS = mk();
+    const checkerS = mk();
+    const row = (title, sel) => el("div", { class: "field" }, [
+        el("label", {}, [title]),
+        el("div", { class: "model-row" }, [
+            el("div", { class: "model-cell" }, [el("span", { class: "model-cap" }, ["model"]), sel]),
+        ]),
+    ]);
+    const node = el("div", { class: "harness-rows" }, [
+        row("Doer", doerS),
+        row("Checker", checkerS),
+        el("div", { class: "hint" }, [
+            "RS's doer implements a unit of work; its checker reviews it, read-only. " +
+            "Both run at the effort set for the agent.",
+        ]),
+    ]);
+    return {
+        node,
+        // Without a model catalog the selects would hold only "same as the
+        // session": callers keep the rows hidden then.
+        available: !!(cat && cat.models && cat.models.length),
+        value: () => {
+            const out = {};
+            if (doerS.value) out.doer_model = doerS.value;
+            if (checkerS.value) out.checker_model = checkerS.value;
+            return out;
+        },
+    };
+}
+
+// pi's Doer and Checker rows: the free-text model id + thinking level each,
+// like the Agent row of pi's tab (pi lists models only after a provider login).
+function harnessPiRows() {
+    const mk = (title) => {
+        const modelI = el("input", { type: "text", autocomplete: "off", spellcheck: "false",
+                                     placeholder: "provider/model (empty: pi's default)" });
+        const thinkS = el("select", {}, [
+            el("option", { value: "" }, ["pi's default"]),
+            ...HARNESS_PI_THINKING.map((lv) => el("option", { value: lv }, [lv])),
+        ]);
+        const node = el("div", { class: "field" }, [
+            el("label", {}, [title]),
+            el("div", { class: "model-row agent-pi-row" }, [
+                el("div", { class: "model-cell agent-pi-model" }, [
+                    el("span", { class: "model-cap" }, ["model"]), modelI,
+                ]),
+                el("div", { class: "model-cell" }, [
+                    el("span", { class: "model-cap" }, ["thinking"]), thinkS,
+                ]),
+            ]),
+        ]);
+        return { node, modelI, thinkS };
+    };
+    const doer = mk("Doer");
+    const checker = mk("Checker");
+    const node = el("div", { class: "harness-rows" }, [
+        doer.node, checker.node,
+        el("div", { class: "hint" }, [
+            "RS's doer implements a unit of work; its checker reviews it, read-only. " +
+            "Empty: pi's default model and thinking level.",
+        ]),
+    ]);
+    return {
+        node,
+        value: () => {
+            const out = {};
+            const dm = doer.modelI.value.trim(), cm = checker.modelI.value.trim();
+            if (dm) out.pi_doer_model = dm;
+            if (doer.thinkS.value) out.pi_doer_thinking = doer.thinkS.value;
+            if (cm) out.pi_checker_model = cm;
+            if (checker.thinkS.value) out.pi_checker_thinking = checker.thinkS.value;
+            return out;
+        },
+        // The client half of rscore's id pattern (the server refuses anything else).
+        invalid: () => {
+            const rows = [["Doer", doer], ["Checker", checker]];
+            for (let i = 0; i < rows.length; i++) {
+                const v = rows[i][1].modelI.value.trim();
+                if (v && !HARNESS_PI_MODEL_PATTERN.test(v)) {
+                    return "Write pi's " + rows[i][0] + " model as provider/model, e.g. " +
+                           "openrouter/anthropic/claude-opus-latest.";
+                }
+            }
+            return null;
+        },
+    };
+}
+
 function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEnabled) {
     manifest = manifest || {};
     agents = Array.isArray(agents) ? agents : [];
@@ -7414,6 +7552,21 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
         modelFields.length ? modelFields : [el("div", { class: "hint" }, [
             "Model choices are unavailable right now; Claude starts on its defaults.",
         ])]);
+    // The working mode (I33), dev workflows only: the switch sits between the
+    // badges and the tabs, and Planner-doer-checker adds Doer and Checker rows
+    // to every agent tab (the agents RS installs whatever the mode; the rows
+    // only matter where the loop launches them).
+    const harnessClaude = isDev ? harnessClaudeRows(cat) : null;
+    const harnessPi = isDev ? harnessPiRows() : null;
+    const syncHarnessRows = (mode) => {
+        const on = mode === "planner-doer-checker";
+        if (harnessClaude) harnessClaude.node.style.display = on && harnessClaude.available ? "" : "none";
+        if (harnessPi) harnessPi.node.style.display = on ? "" : "none";
+    };
+    const harnessSwitch = isDev ? harnessModeSwitch(syncHarnessRows) : null;
+    if (harnessClaude) claudePanel.appendChild(harnessClaude.node);
+    if (harnessPi) piPanel.appendChild(harnessPi.node);
+    syncHarnessRows(harnessSwitch ? harnessSwitch.value() : "none");
     const agentPanels = { claude: claudePanel, pi: piPanel };
     const agentTabsRow = el("div", { class: "agent-tabs" });
     const agentPanelsWrap = el("div", { class: "agent-tab-panels" },
@@ -7461,6 +7614,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             el("label", {}, ["Agents"]),
             el("div", { class: "box-opt-cards agent-badges" }, agentChecks.map((c) => c.card)),
         ]),
+        harnessSwitch ? harnessSwitch.node : null,
         agentTabsRow,
         agentPanelsWrap,
         agentsHint,
@@ -7475,6 +7629,15 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             const m = piModelI.value.trim();
             if (m) out.pi_model = m;
             if (piThinkingS.value) out.pi_thinking = piThinkingS.value;
+        }
+        // The working mode: sent only when it is not None, the Doer/Checker
+        // models only in Planner-doer-checker and only for an agent that is on
+        // (every key is in DEV_PROJECT_WEBUI_FIELDS).
+        const mode = harnessSwitch ? harnessSwitch.value() : "none";
+        if (mode !== "none") out.harness_mode = mode;
+        if (mode === "planner-doer-checker") {
+            if (agentOn("claude") && harnessClaude) Object.assign(out, harnessClaude.value());
+            if (agentOn("pi") && harnessPi) Object.assign(out, harnessPi.value());
         }
         return out;
     };
@@ -7747,6 +7910,10 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
                 && !PI_MODEL_PATTERN.test(piModelI.value.trim())) {
                 return "Write pi's model as provider/model, e.g. " +
                        "openrouter/anthropic/claude-opus-latest.";
+            }
+            if (harnessPi && agentOn("pi") && harnessSwitch.value() === "planner-doer-checker") {
+                const bad = harnessPi.invalid();
+                if (bad) return bad;
             }
             // Mirror from_kwargs: an in-box repo needs a ref (pin the clone).
             if (showClone && cloneCb.checked && repoI.value.trim() && !refI.value.trim()) {
@@ -8290,11 +8457,15 @@ async function mgmtBoxAddDialog(project) {
     // Never the host's global staged list — a box cannot get what its project
     // did not stage.
     let projectAgents = [];
+    // The project's flavor: a research project stages no working-mode suite, so
+    // its dev boxes get no working-mode controls (box_add refuses them there).
+    let projectFlavor = "";
     try {
         const sres = await fetch(`/projects/status?names=${encodeURIComponent(project)}`);
         const sbody = await sres.json();
         const st = sbody && sbody[project];
         if (st && Array.isArray(st.agents_staged)) projectAgents = st.agents_staged.slice();
+        if (st && typeof st.flavor === "string") projectFlavor = st.flavor;
     } catch (e) { /* only "None" is offered; a preset-default agent then submits with
                      no `agent` field and the server applies the preset default */ }
     try {
@@ -8410,6 +8581,33 @@ async function mgmtBoxAddDialog(project) {
         return card;
     });
     const agentCardsWrap = el("div", { class: "box-opt-cards" }, agentCards);
+    // The working mode (I33): a dev box with an agent, outside research. The
+    // Doer/Checker rows follow the box's ONE agent (Claude tiers or pi's id +
+    // thinking); the box's other agent, if the project carries two, runs its
+    // doer and checker on the session's model.
+    const boxHarnessClaude = harnessClaudeRows(boxCat);
+    const boxHarnessPi = harnessPiRows();
+    const boxHarnessOtherHint = el("div", { class: "hint" }, [
+        "The box's other agent, if the project has two, runs its doer and checker " +
+        "on the session's model.",
+    ]);
+    const syncBoxHarnessRows = (mode) => {
+        const pdc = mode === "planner-doer-checker";
+        boxHarnessClaude.node.style.display =
+            pdc && agentS.value === "claude" && boxHarnessClaude.available ? "" : "none";
+        boxHarnessPi.node.style.display = pdc && agentS.value === "pi" ? "" : "none";
+        boxHarnessOtherHint.style.display = pdc && projectAgents.length > 1 ? "" : "none";
+    };
+    const boxHarnessSwitch = harnessModeSwitch(syncBoxHarnessRows);
+    const boxHarnessGroup = el("div", { class: "box-opt-group box-harness" }, [
+        boxHarnessSwitch.node, boxHarnessClaude.node, boxHarnessPi.node, boxHarnessOtherHint,
+    ]);
+    const boxHarnessOn = () => !!(selectedPreset && selectedPreset.dev)
+        && agentS.value !== "none" && projectFlavor !== "research";
+    const syncBoxHarness = () => {
+        boxHarnessGroup.style.display = boxHarnessOn() ? "" : "none";
+        syncBoxHarnessRows(boxHarnessSwitch.value());
+    };
     function markAgent() {
         for (const { value, card } of agentCardEls) {
             card.classList.toggle("selected", value === agentS.value);
@@ -8419,6 +8617,8 @@ async function mgmtBoxAddDialog(project) {
         // here rather than at each call site means every path that can change the
         // agent — card click, preset pre-select, MCP coupling — keeps it honest.
         syncAgentModel();
+        // The working mode follows the agent (and the preset) the same way.
+        syncBoxHarness();
     }
 
     const editorCb = el("input", { type: "checkbox" });   // box-level toggle, default off
@@ -8739,6 +8939,7 @@ async function mgmtBoxAddDialog(project) {
                         boxModelRow,
                     ]),
                 ]),
+                boxHarnessGroup,
                 el("div", { class: "box-opt-group" }, [
                     el("div", { class: "box-opt-caption" }, ["MCP tools"]),
                     mcpList,
@@ -8798,6 +8999,11 @@ async function mgmtBoxAddDialog(project) {
             if (selectedPreset.dev && !devBranchI.value.trim()) {
                 return "A dev box needs a branch for the agent to work from.";
             }
+            if (boxHarnessOn() && agentS.value === "pi"
+                    && boxHarnessSwitch.value() === "planner-doer-checker") {
+                const bad = boxHarnessPi.invalid();
+                if (bad) return bad;
+            }
             return null;
         },
         // The dev preset runs on the broker's DETACHED dev-box lane: no
@@ -8829,6 +9035,17 @@ async function mgmtBoxAddDialog(project) {
                     const v = boxModelP.value();
                     if (v.model) payload.model = v.model;
                     if (v.effort) payload.effort = v.effort;
+                }
+                // The working mode, only where its controls show; the Doer/
+                // Checker models only in Planner-doer-checker, for the box's
+                // agent (lockstep: DEV_BOX_WEBUI_FIELDS).
+                if (boxHarnessOn()) {
+                    const mode = boxHarnessSwitch.value();
+                    if (mode !== "none") payload.harness_mode = mode;
+                    if (mode === "planner-doer-checker") {
+                        if (agentS.value === "claude") Object.assign(payload, boxHarnessClaude.value());
+                        if (agentS.value === "pi") Object.assign(payload, boxHarnessPi.value());
+                    }
                 }
                 return fetch(`/broker/project/${encodeURIComponent(project)}/dev-box`, {
                     method: "POST", headers: { "Content-Type": "application/json" },
