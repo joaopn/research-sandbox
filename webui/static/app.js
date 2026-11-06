@@ -2566,10 +2566,55 @@ const ORPHANED_STATE = "orphaned";
 const ORPHANED_TITLE = "Its container is gone (for example after the host's Docker " +
     "was reset). Destroy removes the workspace and everything else left of it.";
 
+// ---- the Management table: a real, sortable table ---------------------------
+// Click a column name to sort by it, again to reverse. Unknown values (a
+// workflow not read yet or absent, an SSH address the broker did not give, a
+// size not measured) sort LAST in both directions — "the biggest first" must
+// not open on a page of "—". Ties fall back to the project name A→Z. The
+// choice is kept in this browser like the other interface settings.
+const MGMT_SORT_STORE = "rs-webui-mgmt-sort";
+const MGMT_SORT_COLUMNS = [["name", "Project"], ["workflow", "Workflow"], ["state", "State"],
+                           ["ssh", "SSH"], ["size", "Size"]];
+const MGMT_SORT_DEFAULT = { key: "name", dir: "asc" };
+
+// A stored sort, validated; anything else is the default.
+function decodeMgmtSort(raw) {
+    let v = null;
+    try { v = JSON.parse(raw); } catch (_) { v = null; }
+    if (!v || typeof v !== "object") return { ...MGMT_SORT_DEFAULT };
+    const keyOk = MGMT_SORT_COLUMNS.some(([k]) => k === v.key);
+    if (!keyOk || (v.dir !== "asc" && v.dir !== "desc")) return { ...MGMT_SORT_DEFAULT };
+    return { key: v.key, dir: v.dir };
+}
+
+function loadMgmtSort() {
+    let raw = null;
+    try { raw = localStorage.getItem(MGMT_SORT_STORE); } catch (_) { raw = null; }
+    return decodeMgmtSort(raw);
+}
+
+function saveMgmtSort(sort) {
+    try { localStorage.setItem(MGMT_SORT_STORE, JSON.stringify(sort)); } catch (_) { /* per-browser convenience */ }
+}
+
+// Row models: {name, workflow, state, ssh, size} — size a number or null.
+function mgmtCompare(a, b, key, dir) {
+    const va = a[key], vb = b[key];
+    const missA = va === null || va === undefined || va === "";
+    const missB = vb === null || vb === undefined || vb === "";
+    if (missA !== missB) return missA ? 1 : -1;
+    if (!missA) {
+        const c = (typeof va === "number" && typeof vb === "number")
+            ? va - vb : String(va).localeCompare(String(vb));
+        if (c !== 0) return (dir === "desc" ? -1 : 1) * (c < 0 ? -1 : 1);
+    }
+    return String(a.name).localeCompare(String(b.name));
+}
+
 function renderMgmtTable(view, projects) {
     view.innerHTML = "";
-    // The Workflows page is the create entry point now (the workflow picker is
-    // its card grid); this button just routes there. mgmtCreateDialog is only
+    // The New Project box is the create entry point (the workflow picker is
+    // its card grid); this button just opens it. mgmtCreateDialog is only
     // ever opened from a workflows card, with a chosen workflow manifest.
     const create = el("button", { class: "btn-small" }, ["+ New project"]);
     create.onclick = () => openWorkflows();
@@ -2594,10 +2639,42 @@ function renderMgmtTable(view, projects) {
         view.appendChild(el("div", { class: "mgmt-empty" }, ["No projects on this host."]));
         return;
     }
-    const rows = [el("div", { class: "mgmt-row mgmt-row-head" }, [
-        el("span", {}, ["Project"]), el("span", {}, ["State"]),
-        el("span", {}, ["SSH"]), el("span", {}, ["Size"]), el("span", {}, ["Actions"]),
-    ])];
+    const sort = loadMgmtSort();
+    const models = [];
+    const tbody = el("tbody", {});
+    // Rows are built ONCE and re-ordered in place, so their buttons, busy
+    // labels and late-filled cells survive every re-sort.
+    const applySort = () => {
+        models.sort((a, b) => mgmtCompare(a, b, sort.key, sort.dir));
+        for (const m of models) tbody.appendChild(m.tr);
+        for (const th of heads) {
+            const on = th.getAttribute("data-sort") === sort.key;
+            if (on) th.setAttribute("aria-sort", sort.dir === "desc" ? "descending" : "ascending");
+            else th.removeAttribute("aria-sort");
+        }
+        sortSelect.value = sort.key;
+        sortDir.textContent = sort.dir === "desc" ? "↓" : "↑";
+        sortDir.title = sort.dir === "desc" ? "Descending — click to reverse" : "Ascending — click to reverse";
+    };
+    const setSort = (key, dir) => {
+        sort.key = key;
+        sort.dir = dir;
+        saveMgmtSort(sort);
+        applySort();
+    };
+    const heads = MGMT_SORT_COLUMNS.map(([key, label]) => {
+        const th = el("th", { scope: "col", class: "mgmt-sortable", "data-sort": key,
+                              title: "Sort by " + label.toLowerCase() }, [label]);
+        th.onclick = () => setSort(key, sort.key === key && sort.dir === "asc" ? "desc" : "asc");
+        return th;
+    });
+    // The phone layout has no column headers (each row is a card): the same
+    // sort, as a selector and a direction button above the cards.
+    const sortSelect = el("select", { class: "mgmt-sort-select", title: "Sort by" },
+        MGMT_SORT_COLUMNS.map(([key, label]) => el("option", { value: key }, [label])));
+    sortSelect.onchange = () => setSort(sortSelect.value, sort.dir);
+    const sortDir = el("button", { class: "btn-small mgmt-sort-dir" }, ["↑"]);
+    sortDir.onclick = () => setSort(sort.key, sort.dir === "asc" ? "desc" : "asc");
     const fill = {};   // project name → {badge, size} elements to populate async
     for (const p of projects) {
         const running = p.state === "running";
@@ -2625,28 +2702,52 @@ function renderMgmtTable(view, projects) {
         const destroy = el("button", { class: "btn-small btn-danger" }, ["Destroy"]);
         destroy.onclick = () => mgmtDestroyDialog(view, p.project);
         actions.push(destroy);
-        rows.push(el("div", { class: "mgmt-row", "data-project": p.project }, [
-            el("span", { class: "mgmt-name" }, [el("span", { class: "mgmt-name-text" }, [p.project]), badge]),
-            el("span", Object.assign(
+        const tr = el("tr", { class: "mgmt-prow", "data-project": p.project }, [
+            el("td", { class: "mgmt-pname" }, [el("span", { class: "mgmt-name-text" }, [p.project])]),
+            el("td", { class: "mgmt-workflow" }, [badge]),
+            el("td", Object.assign(
                 { class: "mgmt-state " + (running ? "state-running" : "state-stopped"),
                   "data-state": p.state },
                 orphaned ? { title: ORPHANED_TITLE } : {}), [p.state]),
-            el("span", { class: "mgmt-ssh" }, [p.ssh || "—"]),
-            sizeEl,
-            el("span", { class: "mgmt-actions" }, actions),
-        ]));
+            el("td", { class: "mgmt-ssh" }, [p.ssh || "—"]),
+            el("td", { class: "mgmt-size-cell" }, [sizeEl]),
+            el("td", { class: "mgmt-actions-cell" }, [el("div", { class: "mgmt-actions" }, actions)]),
+        ]);
+        models.push({ name: p.project, workflow: "", state: p.state || "", ssh: p.ssh || "",
+                      size: null, tr });
     }
-    view.appendChild(el("div", { class: "mgmt-table" }, rows));
+    const byName = {};
+    for (const m of models) byName[m.name] = m;
+    // Late data (the workflow badges, measured sizes) lands in the models and
+    // re-sorts when it is the column the table is sorted on.
+    const onData = (column, values) => {
+        for (const [name, v] of Object.entries(values)) {
+            if (byName[name]) byName[name][column] = v;
+        }
+        if (sort.key === column) applySort();
+    };
+    view.appendChild(el("div", { class: "mgmt-sortbar" }, [
+        el("span", { class: "mgmt-sortbar-label" }, ["Sort by"]), sortSelect, sortDir,
+    ]));
+    view.appendChild(el("div", { class: "mgmt-ptable-wrap" }, [
+        el("table", { class: "mgmt-ptable" }, [
+            el("thead", {}, [el("tr", {}, [...heads, el("th", { scope: "col" }, ["Actions"])])]),
+            tbody,
+        ]),
+    ]));
+    applySort();
     paintLifecycleLabels();   // rows with an action in flight: label + disabled buttons
-    mgmtFillStatus(fill);
-    measure.onclick = () => mgmtMeasureSizes(fill, measure);
+    mgmtFillStatus(fill, onData);
+    measure.onclick = () => mgmtMeasureSizes(fill, measure, onData);
 }
 
 // The broker `list` carries name/state/ssh; the project flavour (the badge)
 // comes off the same marker-only /projects/status call the rail uses (read
 // from the /projects:ro mount, joined here by name). Disk size is NOT read
 // here — see mgmtMeasureSizes.
-async function mgmtFillStatus(fill) {
+// `onData(column, {name: value})`, when given, receives what was filled (the
+// table keeps its sort models with it).
+async function mgmtFillStatus(fill, onData) {
     const names = Object.keys(fill);
     if (names.length === 0) return;
     let data;
@@ -2655,11 +2756,15 @@ async function mgmtFillStatus(fill) {
         if (!res.ok) return;
         data = await res.json();
     } catch (e) { return; }
+    const got = {};
     for (const [name, st] of Object.entries(data)) {
         const ref = fill[name];
         if (!ref) continue;
-        setTypeBadge(ref.badge, st && st.error !== "not_found" ? st.workflow : null);
+        const label = st && st.error !== "not_found" ? st.workflow : null;
+        setTypeBadge(ref.badge, label);
+        got[name] = label || "";
     }
+    if (onData) onData("workflow", got);
 }
 
 // "Measure sizes": the one place the webui asks the server to walk project
@@ -2670,11 +2775,15 @@ async function mgmtFillStatus(fill) {
 // writes into detached nodes, which is harmless — and hands the user a fresh,
 // enabled button, so a second click during a first walk starts a second walk:
 // accepted, the cost is bounded by clicks and the later answer is the fresher.
-async function mgmtMeasureSizes(fill, btn) {
+async function mgmtMeasureSizes(fill, btn, onData) {
     const names = Object.keys(fill);
     if (names.length === 0) return;
     btn.disabled = true;
     for (const ref of Object.values(fill)) ref.size.textContent = "…";
+    // Every listed name gets a value: a byte count, or null (unknown) when the
+    // walk named none for it or failed.
+    const got = {};
+    for (const name of names) got[name] = null;
     try {
         const res = await fetch(`/projects/disk?names=${encodeURIComponent(names.join(","))}`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -2682,12 +2791,14 @@ async function mgmtMeasureSizes(fill, btn) {
         for (const [name, st] of Object.entries(data)) {
             const ref = fill[name];
             if (!ref) continue;
-            ref.size.textContent = (st && typeof st.disk_bytes === "number")
-                ? formatBytes(st.disk_bytes) : "—";
+            const bytes = st && typeof st.disk_bytes === "number" ? st.disk_bytes : null;
+            ref.size.textContent = bytes !== null ? formatBytes(bytes) : "—";
+            got[name] = bytes;
         }
     } catch (e) {
         for (const ref of Object.values(fill)) ref.size.textContent = "?";
     } finally {
+        if (onData) onData("size", got);
         btn.disabled = false;
     }
 }
@@ -6112,7 +6223,7 @@ function paintLifecycleLabels() {
         }
         tag.textContent = lifecycleLabel(entry);
     }
-    for (const row of document.querySelectorAll(".mgmt-row[data-project]")) {
+    for (const row of document.querySelectorAll(".mgmt-prow[data-project]")) {
         const stateEl = row.querySelector(".mgmt-state");
         if (!stateEl) continue;
         const entry = lifecycleInFlight.get(row.getAttribute("data-project"));
@@ -6220,8 +6331,11 @@ function lifecycleFinish(project, opId, outcome, background) {
 
 function mgmtViewHoldsInput(view) {
     const active = document.activeElement;
+    // The table's own Sort by selector (phone) keeps focus after a pick; it is
+    // a view control, not the operator's typing, so it never holds a refresh.
     if (active && active !== document.body && view.contains(active)
-            && /^(INPUT|SELECT|TEXTAREA)$/.test(active.tagName)) return true;
+            && /^(INPUT|SELECT|TEXTAREA)$/.test(active.tagName)
+            && !active.classList.contains("mgmt-sort-select")) return true;
     return Array.from(view.querySelectorAll("input:not([type=checkbox]):not([type=radio]), textarea"))
         .some((i) => i.value !== "");
 }
