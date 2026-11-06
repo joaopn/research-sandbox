@@ -7498,8 +7498,10 @@ const HARNESS_PI_THINKING = ["off", "minimal", "low", "medium", "high", "xhigh",
 
 // The 3-way switch: one card per mode, None first and selected. onChange runs
 // after every change (and once at build) so the caller can show its rows.
-function harnessModeSwitch(onChange) {
+function harnessModeSwitch(onChange, initial) {
     let mode = "none";
+    // The ⚙ Agents box opens on the project's current mode.
+    if (HARNESS_MODE_SPECS.some((sp) => sp[0] === initial)) mode = initial;
     const hint = el("div", { class: "hint" });
     const cards = HARNESS_MODE_SPECS.map(([value, label]) => {
         const card = el("div", { class: "box-opt-card harness-mode-card" },
@@ -7524,14 +7526,26 @@ function harnessModeSwitch(onChange) {
 // Claude's Doer and Checker rows: a tier each, "same as the session" first.
 // No effort control: Claude Code runs every subagent at the effort the agent's
 // own row sets (the container-wide setting wins over a per-subagent one).
-function harnessClaudeRows(cat) {
-    const mk = () => el("select", {}, [
-        el("option", { value: "" }, ["same as the session"]),
-        ...((cat && cat.models) || []).map((m) =>
-            el("option", { value: m.alias }, [m.label || m.alias])),
-    ]);
-    const doerS = mk();
-    const checkerS = mk();
+function harnessClaudeRows(cat, initial) {
+    const init = initial || {};
+    const mk = (v) => {
+        const sel = el("select", {}, [
+            el("option", { value: "" }, ["same as the session"]),
+            ...((cat && cat.models) || []).map((m) =>
+                el("option", { value: m.alias }, [m.label || m.alias])),
+        ]);
+        // A recorded value (the ⚙ Agents box) is selected; one the catalog
+        // does not list (an older tier) is kept as its own entry.
+        if (v) {
+            if (![...sel.options].some((o) => o.value === v)) {
+                sel.appendChild(el("option", { value: v }, [v]));
+            }
+            sel.value = v;
+        }
+        return sel;
+    };
+    const doerS = mk(init.doer_model);
+    const checkerS = mk(init.checker_model);
     const row = (title, sel) => el("div", { class: "field" }, [
         el("label", {}, [title]),
         el("div", { class: "model-row" }, [
@@ -7557,19 +7571,25 @@ function harnessClaudeRows(cat) {
             if (checkerS.value) out.checker_model = checkerS.value;
             return out;
         },
+        // Every field, empty included — the ⚙ Agents box compares against the
+        // recorded values to find a change back to the default.
+        fields: () => ({ doer_model: doerS.value, checker_model: checkerS.value }),
     };
 }
 
 // pi's Doer and Checker rows: the free-text model id + thinking level each,
 // like the Agent row of pi's tab (pi lists models only after a provider login).
-function harnessPiRows() {
-    const mk = (title) => {
+function harnessPiRows(initial) {
+    const init = initial || {};
+    const mk = (title, model, think) => {
         const modelI = el("input", { type: "text", autocomplete: "off", spellcheck: "false",
                                      placeholder: "provider/model (empty: pi's default)" });
         const thinkS = el("select", {}, [
             el("option", { value: "" }, ["pi's default"]),
             ...HARNESS_PI_THINKING.map((lv) => el("option", { value: lv }, [lv])),
         ]);
+        if (model) modelI.value = model;
+        if (HARNESS_PI_THINKING.includes(think)) thinkS.value = think;
         const node = el("div", { class: "field" }, [
             el("label", {}, [title]),
             el("div", { class: "model-row agent-pi-row" }, [
@@ -7583,8 +7603,8 @@ function harnessPiRows() {
         ]);
         return { node, modelI, thinkS };
     };
-    const doer = mk("Doer");
-    const checker = mk("Checker");
+    const doer = mk("Doer", init.pi_doer_model, init.pi_doer_thinking);
+    const checker = mk("Checker", init.pi_checker_model, init.pi_checker_thinking);
     const node = el("div", { class: "harness-rows" }, [
         doer.node, checker.node,
         el("div", { class: "hint" }, [
@@ -7603,6 +7623,11 @@ function harnessPiRows() {
             if (checker.thinkS.value) out.pi_checker_thinking = checker.thinkS.value;
             return out;
         },
+        fields: () => ({
+            pi_doer_model: doer.modelI.value.trim(), pi_doer_thinking: doer.thinkS.value,
+            pi_checker_model: checker.modelI.value.trim(),
+            pi_checker_thinking: checker.thinkS.value,
+        }),
         // The client half of rscore's id pattern (the server refuses anything else).
         invalid: () => {
             const rows = [["Doer", doer], ["Checker", checker]];
@@ -11027,147 +11052,359 @@ function makeProjectConfigBox(project) {
     appendDetectedAppsSection(box, project);
     appendSharingSection(box, project, enabled);
     appendEditorExtensionSection(box, project, enabled);
-    appendModelsSection(box, project, enabled);
-    appendAgentsSection(box, project, enabled);
+    appendAgentsBox(box, project, enabled);
     appendSidebarSection(box, project);
     return box;
 }
 
-// The agents deployed in this project (the supervisor tab + every box), after
-// create. ADD-only, and LIVE on a sandbox-dind project: the merged agent set is
-// re-staged into the running supervisor with no recreate, so the tab can run the
-// new agent at once. A research project runs claude only in this slice (the
-// supervision gate is redesigned before another agent runs research); the docker
-// substrate fixes its agents at create — both show a note instead of Add. Update
-// (bring the deployed agents level with the cached versions, live) is offered on
-// every project type that has agents.
-function appendAgentsSection(box, project, enabled) {
-    const section = el("div", { class: "config-section" });
-    section.appendChild(el("div", { class: "config-section-label" }, ["Agents"]));
-    const isDocker = !(enabled.supervisor && enabled.supervisor.box_harness);
-    const row = el("div", { class: "config-box-row" }, [
-        el("span", { class: "config-box-name" }, ["Deployed agents"]),
-        el("span", { class: "config-box-meta" }, ["…"]),
-    ]);
-    // Update: bring the project's agents (its own terminal and every running box)
-    // level with the versions the Sandboxes → Software tab shows — live, nothing recreated.
-    const upd = el("button", { class: "btn btn-secondary" }, ["Update"]);
-    upd.disabled = true;
-    upd.title = isDocker
-        ? "Deploy the cached agent versions into this project"
-        : "Deploy the cached agent versions into this project and its running boxes";
-    const btn = el("button", { class: "btn btn-secondary" }, ["Add"]);
-    btn.disabled = true;
-    row.appendChild(upd);
-    if (!isDocker) row.appendChild(btn);
-    section.appendChild(row);
+// The ⚙ Agents box (I33 slice 3): what the create dialog's Agents box chose,
+// changed after create, in the same shape — the agent badges (switching a
+// deployed agent off removes it: the project restarts, the agent's login and
+// settings are kept), the working mode on a dev project, and one tab per agent
+// showing what it runs now, read from the agents' own settings files (a model
+// picked inside the agent with /model shows up). One Apply; its confirmation
+// says what each change costs. Update (bring the agents level with the cached
+// versions) stays beside it. A research project shows Claude's rows only (plus
+// its workers and role services); the docker substrate fixes its agent set at
+// create but its models are editable.
+const AGENTS_BOX_ORDER = ["claude", "pi"];
+const AGENTS_BOX_LABELS = { claude: "Claude", pi: "pi" };
+const AGENTS_BOX_CLAUDE_EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+// The client half of rscore.CLAUDE_MODEL_RE (the server refuses anything else).
+const AGENTS_BOX_CLAUDE_MODEL = /^[A-Za-z0-9][A-Za-z0-9._\[\]-]*$/;
+let agentsBoxSeq = 0;
+
+function appendAgentsBox(box, project, enabled) {
+    const content = el("div", {}, [el("div", { class: "config-empty" }, ["Loading…"])]);
+    const section = collapsibleBox("Agents", [content], "config-agents", "config-sharing");
+    setCollapsibleOpen(section, true);
     box.appendChild(section);
     (async () => {
-        const meta = row.querySelector(".config-box-meta");
-        let st = null;
+        let res = null, b = null;
         try {
-            const res = await fetch(
-                `/projects/status?names=${encodeURIComponent(project.name)}`);
-            const body = await res.json();
-            st = body && body[project.name];
-        } catch (e) { /* unavailable */ }
-        if (!st) { if (meta) meta.textContent = "unavailable"; return; }
-        const current = Array.isArray(st.agents) ? st.agents : [];
-        if (isDocker) {
-            // The docker substrate fixes its agent set at create; Update refreshes it.
-            if (meta) meta.textContent = current.length
-                ? current.join(", ") + " (set at create)" : "none (set at create)";
-            if (current.length) {
-                upd.disabled = false;
-                upd.onclick = () => mgmtAgentsUpdateDialog(project.name, current, false, current);
-            }
+            res = await fetch(`/broker/project/${encodeURIComponent(project.name)}/agents`);
+            try { b = await res.json(); } catch (e) { b = {}; }
+        } catch (e) { b = null; }
+        if (!b || !res.ok || !b.ok || !b.result) {
+            content.replaceChildren(el("div", { class: "config-empty" },
+                [(b && mgmtErrText(b)) || "Couldn't read the project's agents."]));
             return;
         }
-        // A dind project's shared copy always carries claude, so its boxes may
-        // run claude even when the project's own terminal runs it not, or no
-        // agent at all. The dialog names what is DEPLOYED: the staged set (a dind
-        // project's always carries claude; research stages claude), and says which
-        // of those reach the project's own terminal (agents_local).
-        const deployedSet = Array.isArray(st.agents_staged) && st.agents_staged.length
-            ? st.agents_staged : ["claude"];
-        const localSet = Array.isArray(st.agents_local)
-            ? st.agents_local.filter((a) => deployedSet.includes(a))
-            : (st.flavor !== "sandbox-dind" || current.length > 0) ? deployedSet : [];
-        upd.disabled = false;
-        upd.onclick = () => mgmtAgentsUpdateDialog(project.name, deployedSet, true, localSet);
-        if (st.flavor !== "sandbox-dind") {
-            if (meta) meta.textContent = "claude (fixed on a research project)";
-            return;
-        }
-        if (meta) meta.textContent = current.length ? current.join(", ") : "none";
-        // The host's staged dists — what CAN be added. Same payload the create
-        // form uses, so only a pulled dist is ever offered.
+        const d = b.result;
+        const cat = await ensureModelCatalog();
+        // What can be added: the host's pulled agents (the create form's read).
         let staged = [];
-        try {
-            const wres = await fetch("/broker/workflows");
-            const wbody = await wres.json();
-            const list = wbody && wbody.result && Array.isArray(wbody.result.agents)
-                ? wbody.result.agents : [];
-            staged = list.filter((a) => a && a.staged).map((a) => a.name);
-        } catch (e) { /* no additions offered */ }
-        const addable = staged.filter((a) => !current.includes(a));
-        if (!addable.length) {
-            btn.textContent = "All staged agents deployed";
-            return;
+        if (d.kind === "dind") {
+            try {
+                const wres = await fetch("/broker/workflows");
+                const wbody = await wres.json();
+                const list = wbody && wbody.result && Array.isArray(wbody.result.agents)
+                    ? wbody.result.agents : [];
+                staged = list.filter((a) => a && a.staged).map((a) => a.name);
+            } catch (e) { /* no additions offered */ }
         }
-        btn.disabled = false;
-        btn.onclick = () => mgmtAgentsDialog(project.name, current, addable);
+        content.replaceChildren(...agentsBoxContent(project.name, d, cat, staged));
     })();
 }
 
-// The dialog behind the Agents section: tick the agents to add; the request
-// carries the FULL resulting set (add-only — the broker refuses a removal).
-function mgmtAgentsDialog(name, current, addable) {
-    const checks = addable.map((a) => {
-        const cb = el("input", { type: "checkbox", value: a });
-        const card = el("div", { class: "box-opt-card" },
-                        [el("span", { class: "box-opt-name" }, [a])]);
-        card.onclick = () => {
-            cb.checked = !cb.checked;
-            card.classList.toggle("selected", cb.checked);
-        };
-        return { name: a, cb, card };
+function agentsBoxContent(name, d, cat, staged) {
+    const local = Array.isArray(d.agents_local) ? d.agents_local : [];
+    const harness = d.harness || {};
+    const isDind = d.kind === "dind";
+    const isResearch = d.kind === "research";
+    const on = new Set(isResearch ? ["claude"] : local);
+    // ---- the badges ----
+    const offered = AGENTS_BOX_ORDER.filter((a) =>
+        isResearch ? a === "claude" : (local.includes(a) || (isDind && staged.includes(a))));
+    const badges = offered.map((a) => {
+        const card = el("div", { class: "box-opt-card" + (on.has(a) ? " selected" : "") },
+                        [el("span", { class: "box-opt-name" }, [AGENTS_BOX_LABELS[a] || a])]);
+        if (isDind) {
+            card.onclick = () => {
+                if (on.has(a)) on.delete(a); else on.add(a);
+                card.classList.toggle("selected", on.has(a));
+                sync();
+            };
+        } else {
+            card.classList.add("disabled");
+            card.title = "This project's agents are fixed when it is created.";
+        }
+        return { a, card };
     });
+    // ---- Claude's tab ----
+    const listId = "agents-box-claude-models-" + (++agentsBoxSeq);
+    const claudeList = el("datalist", { id: listId },
+        ((cat && cat.models) || []).map((m) => el("option", { value: m.alias }, [m.label || m.alias])));
+    const claudeInit = d.claude || { model: "", effort: "" };
+    const claudeModelI = el("input", { type: "text", autocomplete: "off", spellcheck: "false",
+                                       list: listId, placeholder: "Claude's own default" });
+    claudeModelI.value = claudeInit.model || "";
+    const claudeEffortS = el("select", {}, [
+        el("option", { value: "" }, ["Claude's default"]),
+        ...AGENTS_BOX_CLAUDE_EFFORTS.map((lv) => el("option", { value: lv }, [lv])),
+    ]);
+    claudeEffortS.value = AGENTS_BOX_CLAUDE_EFFORTS.includes(claudeInit.effort) ? claudeInit.effort : "";
+    const claudeRows = harnessClaudeRows(cat, harness);
+    const researchPickers = isResearch && cat
+        ? MODEL_PICKER_SPECS.filter(([ct]) => ct !== "supervisor").map(([ct, title, hint]) =>
+            [ct, modelPicker(cat, ct, title, hint, { unchanged: true })])
+        : [];
+    const claudeNotes = [];
+    if (claudeInit.unrecognised) {
+        claudeNotes.push("Claude's settings hold a value RS does not recognise; it is shown empty.");
+    }
+    // An older docker-substrate container keeps Claude's model where it was
+    // put at create (the server refuses a change there); elsewhere an older
+    // container is restarted to take one.
+    const claudeFixed = d.kind === "docker" && !d.model_in_settings;
+    if (claudeFixed) {
+        claudeModelI.disabled = true;
+        claudeEffortS.disabled = true;
+        claudeNotes.push("Claude's model on this project is fixed when it is created.");
+    } else if (d.running && !d.model_in_settings) {
+        claudeNotes.push("This project's container predates settings-file models: changing " +
+                         "Claude's model or effort restarts the project.");
+    }
+    // A tier that takes no effort level (haiku): its effort stays the default,
+    // so the server's refusal is never reached from here.
+    // At build the picker only locks (what the file holds stays shown and is
+    // never sent unasked); a model typed by the operator also clears it.
+    const syncClaudeEffort = (clear) => {
+        if (claudeFixed) return;
+        const tier = ((cat && cat.models) || []).find((m) => m.alias === claudeModelI.value.trim());
+        const none = !!tier && Array.isArray(tier.efforts) && !tier.efforts.length;
+        if (none && clear) claudeEffortS.value = "";
+        claudeEffortS.disabled = none;
+    };
+    claudeModelI.addEventListener("input", () => syncClaudeEffort(true));
+    syncClaudeEffort(false);
+    const claudePanel = el("div", { class: "agent-tab-panel" }, [
+        claudeList,
+        el("div", { class: "field" }, [
+            el("label", {}, ["Agent"]),
+            el("div", { class: "model-row" }, [
+                el("div", { class: "model-cell agent-pi-model" }, [
+                    el("span", { class: "model-cap" }, ["model"]), claudeModelI]),
+                el("div", { class: "model-cell" }, [
+                    el("span", { class: "model-cap" }, ["effort"]), claudeEffortS]),
+            ]),
+        ]),
+        ...claudeNotes.map((t) => el("div", { class: "hint" }, [t])),
+        claudeRows.node,
+        ...researchPickers.map(([, p]) => p.node),
+    ]);
+    // ---- pi's tab ----
+    const piInit = d.pi || { model: "", thinking: "" };
+    let piTouched = false;
+    const piModelI = el("input", { type: "text", autocomplete: "off", spellcheck: "false",
+                                   placeholder: "provider/model (empty: pi's own pick)" });
+    piModelI.value = piInit.model || "";
+    const piThinkS = el("select", {}, [
+        el("option", { value: "" }, ["pi's default"]),
+        ...HARNESS_PI_THINKING.map((lv) => el("option", { value: lv }, [lv])),
+    ]);
+    piThinkS.value = HARNESS_PI_THINKING.includes(piInit.thinking) ? piInit.thinking : "";
+    piModelI.addEventListener("input", () => { piTouched = true; });
+    piThinkS.addEventListener("change", () => { piTouched = true; });
+    const piRows = harnessPiRows(harness);
+    const piPanel = el("div", { class: "agent-tab-panel" }, [
+        el("div", { class: "field" }, [
+            el("label", {}, ["Agent"]),
+            el("div", { class: "model-row agent-pi-row" }, [
+                el("div", { class: "model-cell agent-pi-model" }, [
+                    el("span", { class: "model-cap" }, ["model"]), piModelI]),
+                el("div", { class: "model-cell" }, [
+                    el("span", { class: "model-cap" }, ["thinking"]), piThinkS]),
+            ]),
+        ]),
+        piInit.unrecognised
+            ? el("div", { class: "hint" }, ["pi's settings hold a value RS does not recognise; it is shown empty."])
+            : null,
+        el("div", { class: "hint" }, [
+            "What pi's settings say now — a model picked inside pi shows here.",
+        ]),
+        piRows.node,
+    ]);
+    const panels = { claude: claudePanel, pi: piPanel };
+    // ---- the mode switch, the tabs ----
+    let active = null;
+    const tabsRow = el("div", { class: "agent-tabs" });
+    const panelsWrap = el("div", { class: "agent-tab-panels" });
+    // `sw` is assigned after `sync` exists: the switch calls its onChange while
+    // it is being built, and a `const sync` read before its line throws.
+    let sw = null;
+    const sync = () => {
+        const tabs = AGENTS_BOX_ORDER.filter((a) => on.has(a) && panels[a]);
+        if (!tabs.includes(active)) active = tabs[0] || null;
+        tabsRow.replaceChildren(...tabs.map((a) => {
+            const t = el("button", { type: "button",
+                                     class: "agent-tab" + (a === active ? " active" : "") },
+                         [AGENTS_BOX_LABELS[a] || a]);
+            t.onclick = () => { active = a; sync(); };
+            return t;
+        }));
+        panelsWrap.replaceChildren(...(active ? [panels[active]] : []));
+        const pdc = !!sw && sw.value() === "planner-doer-checker";
+        claudeRows.node.style.display = pdc && claudeRows.available ? "" : "none";
+        piRows.node.style.display = pdc ? "" : "none";
+    };
+    sw = d.dev ? harnessModeSwitch(() => sync(), harness.harness_mode || "none") : null;
+    sync();
+    // ---- Apply ----
+    const apply = el("button", { class: "btn btn-secondary" }, ["Apply"]);
+    const applyMsg = el("div", { class: "config-empty" });
+    apply.onclick = () => { applyMsg.textContent = agentsBoxApply(name, d, {
+        on, local, isDind, isResearch, harness, sw, claudeRows, piRows, researchPickers,
+        claude: { model: () => claudeModelI.value.trim(), effort: () => claudeEffortS.value,
+                  init: claudeInit },
+        pi: { model: () => piModelI.value.trim(), thinking: () => piThinkS.value,
+              init: piInit, touched: () => piTouched },
+    }) || ""; };
+    // ---- Update (the cached versions, live) ----
+    const upd = el("button", { class: "btn btn-secondary" }, ["Update"]);
+    const deployed = isResearch ? ["claude"]
+        : isDind ? (Array.isArray(d.agents_staged) && d.agents_staged.length ? d.agents_staged : ["claude"])
+        : (d.agents || []);
+    upd.disabled = !deployed.length || !d.running;
+    upd.title = d.running ? "Deploy the cached agent versions into this project"
+                          : "Start the project to update its agents";
+    upd.onclick = () => mgmtAgentsUpdateDialog(name, deployed, d.kind !== "docker",
+                                               isResearch ? ["claude"] : local);
+    return [
+        badges.length ? el("div", { class: "box-opt-cards agent-badges" }, badges.map((x) => x.card))
+                      : null,
+        d.kind === "docker"
+            ? el("div", { class: "hint" }, ["This project's agents are fixed when it is created."])
+            : null,
+        sw ? sw.node : null,
+        tabsRow,
+        panelsWrap,
+        d.running ? null : el("div", { class: "hint" }, [
+            "The project is stopped: a change is saved and applied at its next start; " +
+            "nothing is started."]),
+        el("div", { class: "config-box-row" }, [apply, upd]),
+        applyMsg,
+    ].filter((n) => n);
+}
+
+// The Apply of the ⚙ Agents box: what changed against what was read, as one
+// update; Claude's rows only when they differ (an unchanged value must never
+// cost a restart on an older container), pi's when touched (pi may run a
+// default picked inside it), an emptied row as an explicit reset. Returns a
+// line for the box when there is nothing to send.
+function agentsBoxApply(name, d, f) {
+    const payload = {};
+    const reset = [];
+    const lines = [];
+    const setOrReset = (field, now, was, line) => {
+        if (now === was) return;
+        if (now) payload[field] = now; else reset.push(field);
+        lines.push(line);
+    };
+    const restartNote = d.running ? " — restarts the project container" : "";
+    if (f.isDind) {
+        const next = AGENTS_BOX_ORDER.filter((a) => f.on.has(a));
+        const added = next.filter((a) => !f.local.includes(a));
+        const removed = f.local.filter((a) => !next.includes(a));
+        if (added.length || removed.length) {
+            payload.agents = next;
+            added.forEach((a) => lines.push(`Add ${AGENTS_BOX_LABELS[a] || a}: live, nothing restarted.`));
+            removed.forEach((a) => lines.push(
+                `Remove ${AGENTS_BOX_LABELS[a] || a}${restartNote}. Its login and settings are kept ` +
+                `for a later re-add` + (a === "claude" ? "; Claude Code leaves the project's editor too." : ".")));
+        }
+    }
+    const legacy = d.running && !d.model_in_settings;
+    if (f.on.has("claude") && !(d.kind === "docker" && !d.model_in_settings)) {
+        const cm = f.claude.model(), ce = f.claude.effort();
+        setOrReset("supervisor_model", cm, f.claude.init.model || "",
+                   `Claude's model: ${cm || "Claude's own default"}` + (legacy ? restartNote : "") + ".");
+        setOrReset("supervisor_effort", ce, f.claude.init.effort || "",
+                   `Claude's effort: ${ce || "Claude's default"}` + (legacy ? restartNote : "") + ".");
+    }
+    // pi's tab shows whenever pi is ticked — an agent added in this same Apply
+    // included (the server writes its model right after the install).
+    if (f.on.has("pi") && f.pi.touched()) {
+        const pm = f.pi.model(), pt = f.pi.thinking();
+        if (pm) payload.pi_model = pm; else reset.push("pi_model");
+        if (pt) payload.pi_thinking = pt; else reset.push("pi_thinking");
+        lines.push(`pi's model: ${pm || "pi's own pick"}, thinking ${pt || "pi's default"} — ` +
+                   "replaces a default picked inside pi.");
+    }
+    if (f.sw) {
+        const mode = f.sw.value();
+        const was = f.harness.harness_mode || "none";
+        if (mode !== was) {
+            if (mode === "none") reset.push("harness_mode"); else payload.harness_mode = mode;
+            const spec = HARNESS_MODE_SPECS.find((s) => s[0] === mode) || [mode, mode];
+            lines.push(`Working mode: ${spec[1]}.`);
+        }
+        if (mode === "planner-doer-checker") {
+            const rows = Object.assign({},
+                f.on.has("claude") && f.claudeRows.available ? f.claudeRows.fields() : {},
+                f.on.has("pi") ? f.piRows.fields() : {});
+            let changed = false;
+            Object.keys(rows).forEach((k) => {
+                const now = rows[k] || "", was2 = f.harness[k] || "";
+                if (now !== was2) {
+                    changed = true;
+                    if (now) payload[k] = now; else reset.push(k);
+                }
+            });
+            if (changed) lines.push("Doer and Checker models updated.");
+        }
+    }
+    f.researchPickers.forEach(([ct, p]) => {
+        const v = p.value();
+        if (v.model) payload[ct + "_model"] = v.model;
+        if (v.effort) payload[ct + "_effort"] = v.effort;
+        if (v.model || v.effort) {
+            lines.push(ct === "worker" ? "Workers' model: the next worker spawned uses it."
+                                       : "Role-MCPs' model: re-runs those services.");
+        }
+    });
+    if (reset.length) payload.reset = reset;
+    if (!lines.length) return "Nothing to change.";
+    const validate = () => {
+        const cm = payload.supervisor_model;
+        if (cm && !AGENTS_BOX_CLAUDE_MODEL.test(cm)) {
+            return "Claude's model may use only letters, digits and . _ - [ ].";
+        }
+        if (payload.pi_model && !HARNESS_PI_MODEL_PATTERN.test(payload.pi_model)) {
+            return "Write pi's model as provider/model, e.g. openrouter/anthropic/claude-opus-latest.";
+        }
+        if (f.sw && f.sw.value() === "planner-doer-checker" && f.on.has("pi")) {
+            const bad = f.piRows.invalid();
+            if (bad) return bad;
+        }
+        if (d.dev && f.isDind && !AGENTS_BOX_ORDER.some((a) => f.on.has(a))) {
+            return "A dev project needs at least one agent.";
+        }
+        return null;
+    };
     mgmtConfirmThenTail(boxOpView(), {
-        title: `Add an agent to ${name}`,
-        tailTitle: `Adding agents to ${name}`,
+        title: `Change the agents of ${name}`,
+        tailTitle: `Changing the agents of ${name}`,
         verb: "update",
         project: name,
-        confirmLabel: "Add",
+        confirmLabel: "Apply",
         body: [
-            el("p", {}, [
-                "Deployed now: " + (current.length ? current.join(", ") : "none") + ".",
-            ]),
-            el("div", { class: "box-opt-cards" }, checks.map((c) => c.card)),
+            el("ul", {}, lines.map((t) => el("li", {}, [t]))),
             el("div", { class: "hint" }, [
-                "Applied live — nothing is recreated. The project tab can run the " +
-                "new agent at once; sign in inside the tab: claude with /login; pi with " +
-                "/login inside `pi` and an API key (OpenRouter, the intended path, or any " +
-                "provider pi supports; the Claude subscription login is not used here). " +
-                "pi's login, sessions, settings (a default model saved in-app included), " +
-                "your own extensions and packages installed with `pi install` are kept " +
-                "across re-deploys of the agent set (an add, a recreate); a pi updated with " +
-                "`pi update` returns to the shipped version. Running boxes that carry " +
-                "agents get the new one now, set up the way a new box would be; a stopped " +
-                "box gets it the next time it runs during an add or update, or when " +
-                "re-created; new boxes get every deployed agent. Agents are added, never " +
-                "removed.",
+                d.running
+                    ? "Each agent's next session uses its new settings; a session running now " +
+                      "keeps them until it is restarted (switch the working mode in a running " +
+                      "session with /harness, or /skill:harness in pi)."
+                    : "The project is stopped: the change is saved and applied at its next " +
+                      "start; nothing is started.",
             ]),
         ],
-        validate: () => (checks.some((c) => c.cb.checked) ? null : "Tick at least one agent."),
-        request: () => {
-            const chosen = checks.filter((c) => c.cb.checked).map((c) => c.name);
-            const payload = { agents: current.concat(chosen.filter((a) => !current.includes(a))) };
-            return fetch(`/broker/project/${encodeURIComponent(name)}/update`, {
-                method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(payload),
-            });
-        },
+        validate,
+        request: () => fetch(`/broker/project/${encodeURIComponent(name)}/update`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+        }),
+        onDone: (ok) => { if (ok) closeProjectConfigBox(); },
     });
 }
 
@@ -11325,133 +11562,6 @@ function removeProjectFromSidebar(project) {
     ]);
     backdrop.appendChild(card);
     document.body.appendChild(backdrop);
-}
-
-// The "Models" surface (STAGE_MODEL_SELECT) — change which model each kind of
-// agent in this project runs on, after create. Goes through `update`, whose cost
-// differs sharply by type and which is why the section says so:
-//   * Workers  — touches NO container. `rs-worker spawn` reads the project marker
-//                per spawn, so the next worker picks it up; ones already running
-//                keep the model they started on.
-//   * Role-MCPs — re-runs just the role containers (their env is fixed at docker
-//                run). The supervisor, and your session in it, is untouched.
-//   * Agent    — recreates the supervisor (its env is fixed at docker run too).
-// On the docker substrate the model is fixed at create (update refuses it), so we
-// show a note rather than a control the broker would reject — the editor's docker
-// treatment, same reasoning.
-// The section is about Claude's model in the project's own container (plus, on
-// research, the workers' and role-MCPs'), so it goes when Claude is not there —
-// a pi-only or agent-less Docker-in-Docker project, a docker project without
-// Claude (modelsSectionHidden). Removed after the section's one status fetch.
-function appendModelsSection(box, project, enabled) {
-    const section = el("div", { class: "config-section" });
-    section.appendChild(el("div", { class: "config-section-label" }, ["Models"]));
-    const isDocker = !(enabled.supervisor && enabled.supervisor.box_harness);
-    let row = null;
-    let btn = null;
-    if (isDocker) {
-        section.appendChild(el("div", { class: "config-empty" }, [
-            "Set at create on this project type.",
-        ]));
-    } else {
-        row = el("div", { class: "config-box-row" }, [
-            el("span", { class: "config-box-name" }, ["Agent models"]),
-            el("span", { class: "config-box-meta" }, ["…"]),
-        ]);
-        btn = el("button", { class: "btn btn-secondary" }, ["Change"]);
-        btn.disabled = true;
-        row.appendChild(btn);
-        section.appendChild(row);
-    }
-    box.appendChild(section);
-
-    // The worker/role pickers only apply to a research-flavor project; elsewhere
-    // there is no worker layer and the backend rejects those fields outright, so
-    // offering them would be a dead end. `flavor` rides the status payload.
-    (async () => {
-        const cat = isDocker ? null : await ensureModelCatalog();
-        let flavor = "";
-        let st = null;
-        try {
-            const res = await fetch(
-                `/projects/status?names=${encodeURIComponent(project.name)}`);
-            const body = await res.json();
-            st = body && body[project.name];
-            flavor = (st && st.flavor) || "";
-        } catch (e) { /* flavor unknown → agent picker only */ }
-        if (modelsSectionHidden(st)) {
-            section.remove();
-            return;
-        }
-        if (isDocker) return;
-        const meta = row.querySelector(".config-box-meta");
-        if (!cat) {
-            if (meta) meta.textContent = "unavailable";
-            return;
-        }
-        const hasWorkerLayer = flavor === "research";
-        if (meta) meta.textContent = hasWorkerLayer ? "agent, workers, role-MCPs" : "agent";
-        btn.disabled = false;
-        btn.onclick = () => mgmtModelsDialog(project.name, cat, hasWorkerLayer);
-    })();
-}
-
-// Whether Config → Models goes for this project: only on a positive answer — a
-// status reply whose agents_local is a list without claude. A failed fetch or a
-// reply without the field keeps the section, as before.
-function modelsSectionHidden(st) {
-    return !!st && Array.isArray(st.agents_local) && !st.agents_local.includes("claude");
-}
-
-// The dialog behind the Models section. Every picker starts at "— unchanged —",
-// which is exactly what an empty field means on UPDATE (never "reset to the
-// default") — so what the researcher didn't touch is what stays.
-function mgmtModelsDialog(name, cat, hasWorkerLayer) {
-    const pickers = MODEL_PICKER_SPECS
-        .filter(([ctype]) => ctype === "supervisor" || hasWorkerLayer)
-        .map(([ctype, title, hint]) =>
-            [ctype, modelPicker(cat, ctype, title, hint, { unchanged: true })]);
-    mgmtConfirmThenTail(boxOpView(), {
-        title: `Models for ${name}`,
-        tailTitle: `Updating models on ${name}`,
-        verb: "update",
-        project: name,
-        confirmLabel: "Apply",
-        body: [
-            el("p", {}, [
-                "Anything left unchanged stays as it is.",
-            ]),
-            ...pickers.map(([, p]) => p.node),
-            el("div", { class: "hint" }, [
-                "Changing the workers' model touches no container — the next " +
-                "worker spawned picks it up. Changing the role-MCPs' model re-runs " +
-                "those containers. Changing the agent's model recreates the " +
-                "project container, interrupting work running in it.",
-            ]),
-        ],
-        validate: () => {
-            const any = pickers.some(([, p]) => {
-                const v = p.value();
-                return v.model || v.effort;
-            });
-            return any ? null : "Nothing to change.";
-        },
-        request: () => {
-            // Only the fields the researcher actually SET go on the wire: on
-            // UPDATE an absent field means "leave unchanged". Every key is in
-            // UPDATE_WEBUI_FIELDS.
-            const payload = {};
-            pickers.forEach(([ctype, p]) => {
-                const v = p.value();
-                if (v.model) payload[ctype + "_model"] = v.model;
-                if (v.effort) payload[ctype + "_effort"] = v.effort;
-            });
-            return fetch(`/broker/project/${encodeURIComponent(name)}/update`, {
-                method: "POST", headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(payload),
-            });
-        },
-    });
 }
 
 // The editor "Extensions" surface (STAGE_BOX_EXT_UX C) — host-container webui
