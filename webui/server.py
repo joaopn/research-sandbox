@@ -2684,6 +2684,13 @@ def _opened_detected(project: str, registry: list[dict]) -> list[int]:
 # EXPORTED_PORTS_MAX_BYTES, which this must equal (this image cannot import it).
 EXPORTED_PORTS_MAX_BYTES = 1 << 20
 
+# The reserved project-side ports (the project's ssh, the editor's front door,
+# the editor without its password, the reader). A registry entry on one, or a
+# pass-through claim whose span crosses one, is never forwarded. MIRROR of
+# rscore._EXPORT_RESERVED_PORTS (this image cannot import it; set-equality is
+# pytest-pinned, like cli/workflow.py's WEB_RESERVED_PORTS).
+_EXPORT_RESERVED_PORTS = frozenset({22, 8443, 8444, 8445})
+
 
 def _load_port_registry(f):
     """The JSON list in the port registry file `f`; [] when `f` is absent;
@@ -3115,7 +3122,11 @@ def _read_exported_ports(project: str) -> list[dict]:
     protocol's, not the configured block's, so no claim the port verb wrote
     ever degrades here. {web:true} survives on a valid
     box entry, and on a top-level entry whose raw keys carry none of
-    box/passthrough/host_port (a docker project's own web app). Oversize,
+    box/passthrough/host_port (a docker project's own web app). An entry on a
+    reserved project-side port (_EXPORT_RESERVED_PORTS), or an accepted claim
+    whose span crosses one, is SKIPPED — box entry or not — so no tab, page
+    relay or pass-through relay ever forwards it (the skip lines are
+    byte-identical with rscore's too). Oversize,
     non-regular and symlinked files read as missing (_load_port_registry)."""
     workspace = _project_workspace(project)
     if workspace is None:
@@ -3150,6 +3161,10 @@ def _read_exported_ports(project: str) -> list[dict]:
                 entry["passthrough"], entry["host_port"] = True, hp
                 if cnt > 1:
                     entry["count"] = cnt
+            span = entry.get("count", 1)
+            if port in _EXPORT_RESERVED_PORTS or (span > 1 and any(
+                    port <= r < port + span for r in _EXPORT_RESERVED_PORTS)):
+                continue
             out.append(entry)
     return out
 

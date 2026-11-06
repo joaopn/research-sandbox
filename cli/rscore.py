@@ -4083,7 +4083,8 @@ class PortAddResult:
     ports: list[dict]                       # full entry list after the add ({port,label}
                                             # + optional box/app_port or
                                             # passthrough/host_port/count fields)
-    warnings: list = field(default_factory=list)    # box arm: folder lines
+    warnings: list = field(default_factory=list)    # dropped reserved entries;
+                                                    # box arm: + folder lines
 
 
 @dataclass
@@ -4091,7 +4092,8 @@ class PortRemoveResult:
     project: str
     port: int
     ports: list[dict]
-    warnings: list = field(default_factory=list)    # box arm: folder lines
+    warnings: list = field(default_factory=list)    # dropped reserved entries;
+                                                    # box arm: + folder lines
 
 
 @dataclass
@@ -5098,6 +5100,11 @@ def start(req: StartStopRequest, cfg: "Config" | None = None,
         if not container_exists(c["name"]):
             results.append(ActionResult(c["name"], c.get("project"), "start", "skip:absent"))
             continue
+        # A reserved entry left in the port list is dropped and said once. On a
+        # running project the sweep's own reconcile reaps its forwarder; on a
+        # stopped one the start's container swap reconciles from the clean file.
+        if valid_project_name(c.get("project") or ""):
+            _drop_reserved_port_entries(c["project"], cfg, progress)
         if container_running(c["name"]):
             results.append(ActionResult(c["name"], c.get("project"), "start", "skip:already"))
             continue
@@ -5315,6 +5322,10 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     if live_ok and touched == {"reader"}:
         enable = "reader" in _parse_service_list(enable_services)
         return _live_toggle_reader(project, cfg, container, workspace_path, enable, progress)
+    # Every validation has passed (the live toggles above sweep after their own
+    # last refusal): drop a reserved entry left in the port list, said once,
+    # before any of the paths below returns.
+    _drop_reserved_port_entries(project, cfg, progress)
     # An agents-only update is LIVE: re-stage the merged set into the running
     # supervisor (its own ~/.local included) and return — no recreate, nothing
     # else in the project touched. Mixed with anything else it falls through to
@@ -10808,6 +10819,8 @@ def _update_docker_substrate(req: "UpdateRequest", cfg: "Config",  # type: ignor
             "the editor (code-server); destroy + recreate for anything else")
     if enable_svcs and not editor_dist_present():
         die("no editor dist cached — pull it under Sandboxes → Software first")
+    # After the last refusal; the recreate below reconciles from the clean file.
+    _drop_reserved_port_entries(project, cfg, progress)
     base = _read_service_flags(container)
     flags = _compute_service_flags(enable_services, disable_services, base=base)
     progress.step("recreate", "recreating box")
@@ -10939,9 +10952,12 @@ def _live_toggle_editor(project: str, cfg: "Config", container: str,  # type: ig
     service-override file so a later recreate/start honors it (the docker label is
     immutable on a running container). Far faster than _recreate_supervisor (no
     inner-image re-staging, no role-MCP/box relaunch)."""
+    if enable and not editor_dist_present():
+        die("no editor dist cached — pull it under Sandboxes → Software first")
+    # update's sweep, after this path's last refusal (a refused update leaves
+    # the port list as it was).
+    _drop_reserved_port_entries(project, cfg, progress)
     if enable:
-        if not editor_dist_present():
-            die("no editor dist cached — pull it under Sandboxes → Software first")
         progress.step("deploy", "deploying the editor")
         print(f"=== {project}: deploying the editor (live) ===")
         if _editor_dist_staged_in(container):     # common case: staged at create
@@ -10968,9 +10984,12 @@ def _live_toggle_reader(project: str, cfg: "Config", container: str,  # type: ig
     already staged at /opt/reader-dist; only the deploy was skipped when off) or kill
     its server. The choice persists to the service-override file so a later
     recreate/start honors it (the docker label is immutable on a running container)."""
+    if enable and not reader_dist_present():
+        die("no reader dist cached — pull it under Sandboxes → Software first")
+    # update's sweep, after this path's last refusal (a refused update leaves
+    # the port list as it was).
+    _drop_reserved_port_entries(project, cfg, progress)
     if enable:
-        if not reader_dist_present():
-            die("no reader dist cached — pull it under Sandboxes → Software first")
         progress.step("deploy", "deploying the reader")
         print(f"=== {project}: deploying the reader (live) ===")
         if _reader_dist_staged_in(container):     # common case: staged at create
@@ -15228,6 +15247,9 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     cfg = load_config()
     container = _running_dind_supervisor(req.project)
     workspace_path = workspace_path_for(req.project, cfg)
+    # A reserved entry left in the port list is dropped and said here, before
+    # the web-app tab write below would drop it silently.
+    _drop_reserved_port_entries(req.project, cfg, progress)
     # An agent this project never staged cannot reach the box (the merged
     # copy-source holds the project's set + claude, even where the project's own
     # container runs fewer) — refuse by name, before any side effect, rather
@@ -15764,6 +15786,9 @@ def box_remove(req: "BoxRemoveRequest", progress=None) -> BoxRemoveResult:  # ty
     progress = progress or _NULL_PROGRESS
     progress.step("validate", "checking the project")
     container = _running_dind_supervisor(req.project)
+    # Before the registry sweep below, which would drop a reserved entry
+    # silently: drop it here and say so.
+    _drop_reserved_port_entries(req.project, load_config(), progress)
     progress.step("discard", "discarding the box"
                   + (" (keeping artifacts)" if req.keep_workspace else ""))
     cmd = ["docker", "exec", container, "rs-sandbox", "discard", req.name]
@@ -16101,9 +16126,18 @@ def read_exported_ports(workspace_path: "Path") -> list[dict]:  # type: ignore[n
     have written under ANY block reads back unchanged whatever the operator
     later does to the block. It is not exactly the verb's set: the verb also
     refuses the reserved project-side ports (_coerce_export_port), which this
-    reader does not check. webui/server.py::_read_exported_ports is the MIRROR
-    of this rule (the webui image can't import this module) — keep the two
-    acceptance blocks byte-identical. Host-written but webui-read, and
+    reader does not check — except one: an entry whose port is a reserved
+    project-side port (_EXPORT_RESERVED_PORTS: the project's ssh, the editor
+    and its password-less upstream, the reader), or an accepted claim whose
+    project-side span crosses one, is SKIPPED, box entry or not (RS's own box
+    entries sit in 8600-8699). Such an entry was registered before the verb
+    refused it, or written by the project itself; nothing may forward it, and
+    the start/update/port/box verbs drop it from the file with a warning
+    (_drop_reserved_port_entries). The check is a set lookup plus at most four
+    comparisons, never an expansion of the span.
+    webui/server.py::_read_exported_ports is the MIRROR of this rule (the
+    webui image can't import this module) — keep the two acceptance blocks
+    and the two skip lines byte-identical. Host-written but webui-read, and
     container-writable, so never trust the shape."""
     data = _load_port_registry(exported_ports_path(workspace_path))
     if not data:
@@ -16133,16 +16167,163 @@ def read_exported_ports(workspace_path: "Path") -> list[dict]:  # type: ignore[n
                 entry["passthrough"], entry["host_port"] = True, hp
                 if cnt > 1:
                     entry["count"] = cnt
+            span = entry.get("count", 1)
+            if port in _EXPORT_RESERVED_PORTS or (span > 1 and any(
+                    port <= r < port + span for r in _EXPORT_RESERVED_PORTS)):
+                continue
             out.append(entry)
     return out
 
 
 def _write_exported_ports(workspace_path: "Path", ports: list[dict]) -> None:  # type: ignore[name-defined]
+    """Replace the registry with `ports`, atomically. The directory is
+    writable from inside the project's container, so the temp file is a
+    fresh, uniquely named one (mkstemp: O_CREAT|O_EXCL|O_NOFOLLOW) — a link
+    or file the project planted at any fixed temp path can never redirect or
+    block this host-side write. Serialised before the temp exists, so a
+    failure to serialise leaves nothing behind; a failed write unlinks its
+    own temp by name and re-raises. Mode 0644, as the file always had.
+    Residual: O_NOFOLLOW guards only the last component — a container that
+    replaces `.orchestrator` itself with a link still redirects the write."""
+    _write_port_registry_text(
+        workspace_path, json.dumps(ports, indent=2, sort_keys=True) + "\n")
+
+
+def _write_port_registry_text(workspace_path: "Path", text: str) -> None:  # type: ignore[name-defined]
+    """The atomic write behind _write_exported_ports (see there)."""
     p = exported_ports_path(workspace_path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(ports, indent=2, sort_keys=True) + "\n")
-    tmp.replace(p)
+    fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=".exported-ports.",
+                               suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            os.fchmod(fh.fileno(), 0o644)
+            fh.write(text)
+        os.replace(tmp, p)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# What each reserved project-side port is, for the warning that drops an entry
+# targeting one. Keys == _EXPORT_RESERVED_PORTS (pytest-pinned).
+_RESERVED_PORT_ROLES = {
+    22: "the project's ssh",
+    8443: "the editor's login front door",
+    8444: "the editor without its password",
+    8445: "the reader",
+}
+
+
+def _reserved_port_row(e: Any) -> tuple[str, int] | None:
+    """(how, reserved port) when the RAW registry row `e` targets a reserved
+    project-side port, else None — the rule read_exported_ports skips by,
+    applied to the raw row: its `port`, or an ACCEPTED claim's whole span (a
+    claim the reader degrades counts as its plain port). `how` is "claim" for
+    a pass-through claim, "forwarded" for a top-level entry the readers used
+    to forward, and "registered" for a row they never forwarded (a box entry,
+    or one without a usable label). Rows with no integer port are not ours to
+    judge and stay."""
+    if not isinstance(e, dict):
+        return None
+    port = e.get("port")
+    if not isinstance(port, int) or isinstance(port, bool):
+        return None
+    pt, hp, cnt = e.get("passthrough"), e.get("host_port"), e.get("count", 1)
+    claim = (pt is True and isinstance(hp, int) and not isinstance(hp, bool)
+             and isinstance(cnt, int) and not isinstance(cnt, bool)
+             and cnt >= 1 and 1 <= hp and hp + cnt - 1 <= 65535
+             and 1 <= port and port + cnt - 1 <= 65535)
+    span = cnt if claim else 1
+    hit = next((r for r in sorted(_EXPORT_RESERVED_PORTS)
+                if port <= r < port + span), None)
+    if hit is None:
+        return None
+    box, app_port = e.get("box"), e.get("app_port")
+    if not isinstance(e.get("label"), str) or (
+            isinstance(box, str) and box and isinstance(app_port, int)
+            and not isinstance(app_port, bool)):
+        return "registered", hit
+    return ("claim" if claim else "forwarded"), hit
+
+
+def _sweep_reserved_port_entries(workspace_path: "Path") -> list[dict]:  # type: ignore[name-defined]
+    """Drop every row targeting a reserved project-side port from the RAW
+    registry (_reserved_port_row) and return the dropped rows. Every other
+    row is written back as it was read, in order. Writes nothing when nothing
+    is dropped, when the file is absent, and when it is unusable (the readers
+    already treat that as empty). The rows kept are the project's own bytes,
+    so they are written compact and as UTF-8: an indented rewrite of a deeply
+    nested row can grow many times over and push a readable file past
+    EXPORTED_PORTS_MAX_BYTES, where every reader would see an empty list — a
+    rewrite still over the cap is refused (ValueError) and the file stays as
+    it was. The read and the write are adjacent — no exec between them — so a
+    concurrent registry write (the dev-box lane has no busy check against
+    this) has the smallest window. Raises what the write raises (OSError,
+    ValueError, RecursionError)."""
+    raw = _load_port_registry(exported_ports_path(workspace_path))
+    if not raw:
+        return []
+    keep, dropped = [], []
+    for e in raw:
+        (dropped if _reserved_port_row(e) else keep).append(e)
+    if dropped:
+        text = json.dumps(keep, ensure_ascii=False, separators=(",", ":")) + "\n"
+        if len(text.encode("utf-8")) > EXPORTED_PORTS_MAX_BYTES:
+            raise ValueError("the rewritten port list would exceed its size cap")
+        _write_port_registry_text(workspace_path, text)
+    return dropped
+
+
+def _reserved_port_line(project: str, e: dict) -> str:
+    how, port = _reserved_port_row(e)  # type: ignore[misc]
+    role = _RESERVED_PORT_ROLES.get(port, "a port RS uses itself")
+    if how == "claim":
+        return (f"pass-through port {e['host_port']} of project {project} was "
+                f"forwarded to port {port} although it is reserved ({role}); "
+                f"it is no longer forwarded")
+    if how == "registered":
+        return (f"port {port} of project {project} was registered although it "
+                f"is reserved ({role}); it is no longer registered")
+    return (f"port {port} of project {project} was forwarded although it is "
+            f"reserved ({role}); it is no longer forwarded")
+
+
+def _drop_reserved_port_entries(project: str, cfg: "Config",  # type: ignore[name-defined]
+                                progress=None) -> list[str]:
+    """Run the sweep for `project` and report each dropped row once: one
+    `warning:` line on stderr each, and a `warning` progress step when the
+    verb has a progress sink (the webui's op box). Returns the lines (the port
+    verbs carry them in their result's warnings). When something was dropped,
+    reconcile the loopback forwarders, so a forwarder already running on a
+    reserved port is reaped now (the reconcile self-gates on a running
+    container). Best-effort: a failure to rewrite the file is a warning,
+    never the end of the verb — the readers skip those rows anyway."""
+    ws = workspace_path_for(project, cfg)
+    try:
+        dropped = _sweep_reserved_port_entries(ws)
+    except (OSError, ValueError, RecursionError) as e:
+        line = (f"the port list of project {project} names a reserved port "
+                f"and could not be rewritten; that port is not forwarded")
+        print(f"warning: {line} ({e})", file=sys.stderr)
+        if progress is not None:
+            progress.step("warning", line)
+        return [line]
+    lines: list[str] = []
+    for e in dropped:
+        line = _reserved_port_line(project, e)
+        if line not in lines:
+            lines.append(line)
+    for line in lines:
+        print(f"warning: {line}", file=sys.stderr)
+        if progress is not None:
+            progress.step("warning", line)
+    if dropped:
+        _reconcile_loopback_bridges(project, cfg)
+    return lines
 
 
 def port_add(req: "PortAddRequest", _progress=None) -> PortAddResult:  # type: ignore[name-defined]
@@ -16166,6 +16347,9 @@ def port_add(req: "PortAddRequest", _progress=None) -> PortAddResult:  # type: i
     ws = workspace_path_for(req.project, cfg)
     if not ws.is_dir():
         die(f"project {req.project!r} has no workspace; create it first")
+    # Before the first read below: the reader hides a reserved row, so every
+    # write that follows would drop it silently — say so here, once.
+    swept = _drop_reserved_port_entries(req.project, cfg)
     if req.box:
         # A running dind supervisor is required (the box lives in its inner dockerd).
         container = _running_dind_supervisor(req.project)
@@ -16199,8 +16383,8 @@ def port_add(req: "PortAddRequest", _progress=None) -> PortAddResult:  # type: i
         # The expose re-ran the box: report the folders it started without.
         return PortAddResult(project=req.project, port=pub, label=req.label,
                              ports=ports,
-                             warnings=_box_folder_warnings(info.get("warnings"),
-                                                           req.box))
+                             warnings=swept + _box_folder_warnings(
+                                 info.get("warnings"), req.box))
     if req.passthrough:
         span_lo, span_hi = req.host_port, req.host_port + req.count - 1
         # GLOBAL fail-closed collision gate over every project's registry.
@@ -16238,7 +16422,7 @@ def port_add(req: "PortAddRequest", _progress=None) -> PortAddResult:  # type: i
         _write_exported_ports(ws, ports)
         _reconcile_loopback_bridges(req.project, cfg)
         return PortAddResult(project=req.project, port=req.host_port,
-                             label=req.label, ports=ports)
+                             label=req.label, ports=ports, warnings=swept)
     # Plain (page-tab) entry: dedupe on `port` among NON-passthrough entries
     # only — a pass-through claim targeting the same project-side port is a
     # DIFFERENT registration (identity = host_port) and must survive this add.
@@ -16257,7 +16441,7 @@ def port_add(req: "PortAddRequest", _progress=None) -> PortAddResult:  # type: i
     _write_exported_ports(ws, ports)
     _reconcile_loopback_bridges(req.project, cfg)
     return PortAddResult(project=req.project, port=req.port, label=req.label,
-                         ports=ports)
+                         ports=ports, warnings=swept)
 
 
 def port_remove(req: "PortRemoveRequest", _progress=None) -> PortRemoveResult:  # type: ignore[name-defined]
@@ -16266,6 +16450,9 @@ def port_remove(req: "PortRemoveRequest", _progress=None) -> PortRemoveResult:  
     if not ws.is_dir():
         # Nothing to remove and never auto-create a workspace from a remove.
         return PortRemoveResult(project=req.project, port=req.port, ports=[])
+    # Before the read: a reserved row is dropped (and said) here, so removing
+    # one succeeds — it is simply gone already.
+    swept = _drop_reserved_port_entries(req.project, cfg)
     existing = read_exported_ports(ws)
 
     # Matcher split by req.passthrough: a pass-through claim's identity is its
@@ -16299,6 +16486,7 @@ def port_remove(req: "PortRemoveRequest", _progress=None) -> PortRemoveResult:  
         # the registry write below.
         warnings = _box_folder_warnings(
             _parse_box_tool_json(r.stdout).get("warnings"), gone["box"])
+    warnings = swept + warnings
     ports = [e for e in existing if not _match(e)]
     _write_exported_ports(ws, ports)
     # Reap the top-level forwarder for a supervisor/docker entry (a box entry's

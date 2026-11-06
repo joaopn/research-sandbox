@@ -11541,6 +11541,15 @@ function renderPassthroughLauncher(container, status, svc) {
 // equals the app port and count is OMITTED when 1 — the server defaults
 // them, and an explicit null/0 refuses loudly by design (never send
 // placeholders).
+// The warning lines a port add/remove returns (a reserved entry it dropped from
+// the project's port list; the folders a re-run box started without), one ⚠
+// line each in `warnEl`, replacing what it showed. Shared by the four port
+// call sites: ⚙ Ports add/remove, the claim form, Sandboxes → Infrastructure's claim remove.
+function showPortWarnings(warnEl, result) {
+    const lines = (result && Array.isArray(result.warnings)) ? result.warnings : [];
+    warnEl.replaceChildren(...lines.map((l) => el("div", {}, ["⚠ " + l])));
+}
+
 function buildPassthroughClaimForm(opts) {
     const wrap = el("div", { class: "pt-claim-form" });
     let projSel = null;
@@ -11564,6 +11573,7 @@ function buildPassthroughClaimForm(opts) {
     const claimBtn = el("button", { class: "btn btn-secondary" }, ["Claim"]);
     const errEl = el("div", { class: "pt-claim-err" });
     errEl.style.display = "none";
+    const warnEl = el("div", { class: "config-hint config-box-warn" });
     const hint = el("div", { class: "config-hint" },
                     ["Loading the pass-through block…"]);
     (async () => {
@@ -11618,6 +11628,7 @@ function buildPassthroughClaimForm(opts) {
                 errEl.style.display = "";
                 return;
             }
+            showPortWarnings(warnEl, body.result);
             hostI.value = ""; countI.value = ""; appI.value = "";
             labelI.value = "";
             if (opts.onClaimed) await opts.onClaimed(project);
@@ -11631,6 +11642,7 @@ function buildPassthroughClaimForm(opts) {
     wrap.appendChild(el("div", { class: "config-box-row config-port-add" },
         [projSel, hostI, countI, appI, labelI, claimBtn].filter(Boolean)));
     wrap.appendChild(errEl);
+    wrap.appendChild(warnEl);
     wrap.appendChild(hint);
     return wrap;
 }
@@ -11697,16 +11709,19 @@ async function fillOriginNotice(box) {
 // the page must not depend on fetch timing). No CLI is ever mentioned here.
 async function appendPassthroughSection(view, projects) {
     const table = el("div", { class: "mgmt-pt-list" });
+    // Outside the table, which every refill empties: a remove's warnings stay.
+    const warnEl = el("div", { class: "config-hint config-box-warn" });
     const wrap = el("div", { class: "mgmt-infra" }, [
         el("h3", { class: "mgmt-infra-title" }, ["Pass-through ports"]),
         table,
+        warnEl,
     ]);
     const names = (projects || []).filter((p) => p.state !== ORPHANED_STATE)
         .map((p) => p.project);
     wrap.appendChild(buildPassthroughClaimForm({
         projects: names,
         onClaimed: async (project) => {
-            await fillPassthroughList(view, table);
+            await fillPassthroughList(view, table, warnEl);
             await refreshAfterBoxChange(project);
         },
         onStatus: (status) => {
@@ -11719,10 +11734,10 @@ async function appendPassthroughSection(view, projects) {
         },
     }));
     view.appendChild(wrap);
-    await fillPassthroughList(view, table);
+    await fillPassthroughList(view, table, warnEl);
 }
 
-async function fillPassthroughList(view, table) {
+async function fillPassthroughList(view, table, warnEl) {
     table.innerHTML = "";
     let body = null;
     try {
@@ -11766,7 +11781,8 @@ async function fillPassthroughList(view, table) {
                     alert("Couldn't remove: " + (mgmtErrText(b) || res.status));
                     return;
                 }
-                await fillPassthroughList(view, table);
+                if (warnEl) showPortWarnings(warnEl, b.result);
+                await fillPassthroughList(view, table, warnEl);
                 await refreshAfterBoxChange(c.project);
             } catch (e) { alert("Couldn't remove: connection failed."); }
         };
@@ -12032,14 +12048,12 @@ function appendExportedPortsSection(box, project) {
     section.appendChild(el("div", { class: "config-section-label" }, ["Ports"]));
     const listWrap = el("div", { class: "config-ports-list" });
     section.appendChild(listWrap);
-    // Folders a box started without after a port change re-ran it (the box
-    // arm of add/remove returns them as lines).
+    // The warning lines of an add/remove: a reserved entry dropped from the
+    // port list, and the folders a box started without after a port change
+    // re-ran it (the box arm).
     const warnEl = el("div", { class: "config-hint config-box-warn" });
     section.appendChild(warnEl);
-    const showWarnings = (result) => {
-        const lines = (result && Array.isArray(result.warnings)) ? result.warnings : [];
-        warnEl.replaceChildren(...lines.map((l) => el("div", {}, ["⚠ " + l])));
-    };
+    const showWarnings = (result) => showPortWarnings(warnEl, result);
 
     const portI = el("input", { type: "number", min: "1", max: "65535",
                                 class: "config-port-num", placeholder: "port" });
