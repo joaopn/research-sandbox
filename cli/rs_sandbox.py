@@ -1472,6 +1472,53 @@ def _install_repo_watch(cname: str) -> None:
 # into; absent on research, where a box therefore installs nothing.
 HARNESS_INSTALLER = f"{AGENT_DIST_MOUNT}/rs-harness/install.sh"
 HARNESS_FAILED_SENTINEL = "RS_HARNESS_INSTALL_FAILED"
+# The box's working mode and doer/checker models: field → the installer's
+# environment variable — MIRROR of rscore.HARNESS_ENV (pytest-pinned equal).
+# Stored on the box entry, passed as container environment at every run (the
+# installer exec and every later refresh exec inherit it).
+HARNESS_ENV = {
+    "harness_mode": "RS_HARNESS_MODE",
+    "doer_model": "RS_HARNESS_DOER_MODEL",
+    "checker_model": "RS_HARNESS_CHECKER_MODEL",
+    "pi_doer_model": "RS_HARNESS_PI_DOER_MODEL",
+    "pi_doer_thinking": "RS_HARNESS_PI_DOER_THINKING",
+    "pi_checker_model": "RS_HARNESS_PI_CHECKER_MODEL",
+    "pi_checker_thinking": "RS_HARNESS_PI_CHECKER_THINKING",
+}
+HARNESS_MODES = ("none", "direct", "planner-doer-checker")
+# Shape only (no model catalog here — the host checked the tiers): the
+# installer's own charsets, so a value that passes here passes there.
+_HARNESS_SHAPES = {
+    "harness_mode": re.compile(r"^(none|direct|planner-doer-checker)$"),
+    "doer_model": re.compile(r"^[A-Za-z0-9._-]+$"),
+    "checker_model": re.compile(r"^[A-Za-z0-9._-]+$"),
+    "pi_doer_model": re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._:~@+/-]+$"),
+    "pi_doer_thinking": re.compile(r"^(off|minimal|low|medium|high|xhigh|max)$"),
+    "pi_checker_model": re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._:~@+/-]+$"),
+    "pi_checker_thinking": re.compile(r"^(off|minimal|low|medium|high|xhigh|max)$"),
+}
+
+
+def _box_harness(args: argparse.Namespace, agent: str) -> dict:
+    """The box's working-mode settings from the create flags (set values only),
+    refused by name when malformed or when they cannot land: a box without an
+    agent has no mode, Claude's pair needs a Claude box, pi's a pi box."""
+    out = {}
+    for f in HARNESS_ENV:
+        v = (getattr(args, f, "") or "").strip()
+        if not v or (f == "harness_mode" and v == "none"):   # none = unset, as on the host
+            continue
+        if not _HARNESS_SHAPES[f].fullmatch(v):
+            die(f"invalid --{f.replace('_', '-')} value {v!r}")
+        out[f] = v
+    if out and agent == "none":
+        die("a box without an agent has no working mode")
+    if (out.get("doer_model") or out.get("checker_model")) and agent != "claude":
+        die("--doer-model/--checker-model apply to a claude box")
+    if any(out.get(f) for f in ("pi_doer_model", "pi_doer_thinking",
+                                "pi_checker_model", "pi_checker_thinking")) and agent != "pi":
+        die("the --pi-doer-*/--pi-checker-* settings apply to a pi box")
+    return out
 
 
 def _box_carried_agents() -> list[str]:
@@ -1554,7 +1601,8 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
              model: str = "", effort: str = "", fetch: bool = False,
              node: bool = False, folders: list[str] | None = None,
              history: dict | None = None,
-             web: dict | None = None, share: bool = False) -> list[dict]:
+             web: dict | None = None, share: bool = False,
+             harness: dict | None = None) -> list[dict]:
     """docker run a box in the local inner dockerd. ``browser`` selects the
     Chromium-equipped image; ``agent`` (any staged agent|none): any agent mounts
     the project's MERGED copy-source and exports RS_BOX_AGENT=claude (the baked
@@ -1688,6 +1736,13 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         model_env = ["-e", f"ANTHROPIC_MODEL={model}"]
         if effort:
             model_env += ["-e", f"CLAUDE_CODE_EFFORT_LEVEL={effort}"]
+    # The working mode and doer/checker models (from the STORED entry, like the
+    # model pair: env is fixed at run). Set values only, so a box without them
+    # runs byte-identical; the installer execs (here and the host's refresh)
+    # inherit them from the container.
+    for f, v in (harness or {}).items():
+        if v and f in HARNESS_ENV and agent != "none":
+            model_env += ["-e", f"{HARNESS_ENV[f]}={v}"]
     # Preset setup script rides env argv deliberately: it is user-VISIBLE
     # catalog data (the window shows it), never a field value.
     # Gitea history: only non-secret names ride the environment (the address,
@@ -1877,6 +1932,9 @@ def _rerun_box(name: str, entry: dict) -> list[dict]:
              # lands here) must re-apply the box's own pair or it evaporates.
              model=entry.get("model") or "",
              effort=entry.get("effort") or "",
+             # The working mode and doer/checker models, re-applied from the
+             # STORED entry like the model pair (env is fixed at docker run).
+             harness=entry.get("harness") if isinstance(entry.get("harness"), dict) else None,
              # Same reasoning: the rs-fetch add-host + staging must re-apply
              # from the stored entry on every re-run.
              fetch=bool(entry.get("fetch")),
@@ -2029,6 +2087,9 @@ def cmd_create(args: argparse.Namespace) -> None:
     # runs). LOCKSTEP with rscore.BoxAddRequest.from_kwargs's predicate.
     if agent not in ("claude", "none") and ((args.model or "").strip() or (args.effort or "").strip()):
         die(f"a model applies to a claude box; agent {agent!r} picks its model in-app")
+    # The working mode and doer/checker models: refused here, before any side
+    # effect, like the model pair above.
+    harness = _box_harness(args, agent)
     # Spawn-time tri-state (the host box_add threads --browser/--no-browser only
     # when the caller was explicit): None ⇒ the preset's image default. The
     # resolved value is persisted on the entry below, so _rerun_box re-applies
@@ -2131,6 +2192,8 @@ def cmd_create(args: argparse.Namespace) -> None:
              "preset": args.preset, "browser": browser, "agent": agent,
              "editor": editor, "upstream_mcps": mcps,
              "model": model, "effort": effort}
+    if harness:
+        entry["harness"] = harness
     if editor:
         entry["editor_port"] = editor_port
     if node:
@@ -2191,7 +2254,7 @@ def cmd_create(args: argparse.Namespace) -> None:
                         dev_subnet=dev_subnet, branch=branch, model=model,
                         effort=effort, fetch=fetch, node=node, folders=folders,
                         history=history, loopback_ports=loopback_ports,
-                        web=web, share=share)
+                        web=web, share=share, harness=harness or None)
     out = {"name": name, "ip": ip, "preset": args.preset,
            "browser": browser, "agent": agent, "editor": editor,
            "editor_port": editor_port or None, "fetch": fetch,
@@ -2653,6 +2716,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "box default; ignored for a model with no effort levels)")
     c.add_argument("--editor", action="store_true",
                    help="bundle the code-server editor into this box")
+    for f, help_ in (("harness_mode", "the working mode this box's agent starts in: "
+                                      "none, direct or planner-doer-checker"),
+                     ("doer_model", "Claude tier for the doer subagent (a claude box)"),
+                     ("checker_model", "Claude tier for the checker subagent (a claude box)"),
+                     ("pi_doer_model", "pi provider/model for the doer subagent (a pi box)"),
+                     ("pi_doer_thinking", "pi thinking level for the doer subagent"),
+                     ("pi_checker_model", "pi provider/model for the checker subagent"),
+                     ("pi_checker_thinking", "pi thinking level for the checker subagent")):
+        c.add_argument(f"--{f.replace('_', '-')}", dest=f, default="", help=help_)
     # Tri-state on purpose (first BooleanOptionalAction in this codebase):
     # --browser / --no-browser override the preset's image, ABSENT (None) keeps
     # the preset default — a store_true could not express "not specified".

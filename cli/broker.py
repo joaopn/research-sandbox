@@ -653,6 +653,11 @@ CREATE_WEBUI_FIELDS = frozenset({
     # path, host port or mount); from_kwargs holds the model to a strict
     # charset and refuses both where pi is not deployed.
     "pi_model", "pi_thinking",
+    # The working mode and the doer/checker models (dev workflows only, refused
+    # elsewhere in from_kwargs): IN-BOX — they land in the agent's own config
+    # files inside the container; tiers, pi ids and levels are shape-checked.
+    "harness_mode", "doer_model", "checker_model", "pi_doer_model", "pi_doer_thinking",
+    "pi_checker_model", "pi_checker_thinking",
     # Opt-in rs-fetch (any non-dev workflow): an IN-BOX capability toggle —
     # stages the read-only fetch tool + operator token + wiring INSIDE the
     # container (the supervisor, on dind); no path, no host port, no mount.
@@ -760,6 +765,11 @@ BOX_ADD_WEBUI_FIELDS = frozenset({"project", "name", "preset", "agent", "editor"
                                   # This box's own agent model/effort; unset ⇒ the
                                   # project's `box` default from the marker.
                                   "model", "effort",
+                                  # The box's working mode and doer/checker
+                                  # models (in-box; dev boxes only, gated in box_add).
+                                  "harness_mode", "doer_model", "checker_model",
+                                  "pi_doer_model", "pi_doer_thinking",
+                                  "pi_checker_model", "pi_checker_thinking",
                                   # Read-only folders. These name a mount
                                   # SOURCE — the class the host-root boundary
                                   # forbids in general — and are relayable only
@@ -965,6 +975,11 @@ DEV_BOX_WEBUI_FIELDS = frozenset({"project", "url", "pat", "name", "agent",
                                   # and the box would silently run the default —
                                   # on the box type where the choice matters most.
                                   "model", "effort",
+                                  # The box's working mode and doer/checker
+                                  # models (in-box; gated in box_add).
+                                  "harness_mode", "doer_model", "checker_model",
+                                  "pi_doer_model", "pi_doer_thinking",
+                                  "pi_checker_model", "pi_checker_thinking",
                                   # Share files with the project (bool or absent
                                   # ⇒ off, the dev type's default) — like the
                                   # plain box window's field.
@@ -989,6 +1004,11 @@ DEV_PROJECT_WEBUI_FIELDS = frozenset({"name", "workflow", "url", "pat",
                                       # (the dialog's pi tab), validated by the
                                       # same create delegation.
                                       "pi_model", "pi_thinking",
+                                      # The working mode and the doer/checker
+                                      # models, validated by the same delegation.
+                                      "harness_mode", "doer_model", "checker_model",
+                                      "pi_doer_model", "pi_doer_thinking",
+                                      "pi_checker_model", "pi_checker_thinking",
                                       # The project's agent SET (an enum list,
                                       # in-box): absent ⇒ the workflow preset;
                                       # validated pre-spawn by the create

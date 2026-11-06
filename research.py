@@ -479,6 +479,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         worker_model=args.worker_model, worker_effort=args.worker_effort,
         role_model=args.role_model, role_effort=args.role_effort,
         pi_model=args.pi_model, pi_thinking=args.pi_thinking,
+        **{f: getattr(args, f) for f in rscore.HARNESS_FIELDS},
     )
     try:
         res = rscore.create(req, cfg)
@@ -2356,6 +2357,30 @@ def cmd_workflow_list(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _add_harness_args(p: argparse.ArgumentParser, what: str) -> None:
+    """The working mode and the doer/checker models (dev projects and dev
+    boxes only), one flag per rscore.HARNESS_FIELDS entry."""
+    g = p.add_argument_group("working mode (dev only)")
+    g.add_argument("--harness-mode", dest="harness_mode", default="",
+                   choices=("",) + rscore.HARNESS_MODES, metavar="MODE",
+                   help=f"the working mode this {what}'s agent starts in: "
+                        f"{', '.join(rscore.HARNESS_MODES)} (default none)")
+    g.add_argument("--doer-model", dest="doer_model", default="", metavar="TIER",
+                   help="Claude tier for the doer subagent (default: the session's)")
+    g.add_argument("--checker-model", dest="checker_model", default="", metavar="TIER",
+                   help="Claude tier for the checker subagent (default: the session's)")
+    g.add_argument("--pi-doer-model", dest="pi_doer_model", default="",
+                   metavar="PROVIDER/MODEL", help="pi model for the doer subagent")
+    g.add_argument("--pi-doer-thinking", dest="pi_doer_thinking", default="",
+                   choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
+                   help="pi thinking level for the doer subagent")
+    g.add_argument("--pi-checker-model", dest="pi_checker_model", default="",
+                   metavar="PROVIDER/MODEL", help="pi model for the checker subagent")
+    g.add_argument("--pi-checker-thinking", dest="pi_checker_thinking", default="",
+                   choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
+                   help="pi thinking level for the checker subagent")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="research", description="Research Sandbox CLI")
     sub = p.add_subparsers(dest="command", required=True)
@@ -2549,6 +2574,7 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
                    help="pi's starting thinking level: "
                         f"{', '.join(rscore.PI_THINKING_LEVELS)}. Needs pi among the agents.")
+    _add_harness_args(c, "project")
     c.add_argument("--dev-repo", dest="dev_repo", metavar="REPO",
                    help="REQUIRED with a dev workflow (--workflow dev): the name "
                         "of a repo added via `research dev repo add` — the agent "

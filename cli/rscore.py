@@ -474,6 +474,8 @@ _OLD_BOX_TOOL_MSG = ("this project's box tool predates read-only folders — "
 # refuses every add: this is the line shown for it.
 _OLD_BOX_TOOL_SHARE_MSG = ("this project's box tool predates file sharing — "
                            "restart the project, then retry")
+_OLD_BOX_TOOL_HARNESS_MSG = ("this project's box tool predates the working mode — "
+                             "restart the project, then retry")
 
 
 # An older box tool refuses a folder path below the top level with its own
@@ -507,7 +509,8 @@ def _is_old_box_tool(r: "subprocess.CompletedProcess") -> bool:
     return r.returncode == 2 and (
         ("unrecognized arguments" in err
          and any(o in err for o in ("--folders", "--set", "--history-user",
-                                    "--history-repo", "--share", "--no-share")))
+                                    "--history-repo", "--share", "--no-share",
+                                    *(f"--{f.replace('_', '-')}" for f in HARNESS_FIELDS))))
         or ("invalid choice" in err
             and any(c in err for c in ("'folders'", "'history-heal'"))))
 
@@ -1219,6 +1222,15 @@ class CreateRequest:
     # among them (see PI_MODEL_RE for why the model is free text).
     pi_model: str = ""
     pi_thinking: str = ""
+    # The working mode and the doer/checker models (I33; HARNESS_FIELDS, "" =
+    # unset). Dev workflows only; validated in _validated_harness.
+    harness_mode: str = ""
+    doer_model: str = ""
+    checker_model: str = ""
+    pi_doer_model: str = ""
+    pi_doer_thinking: str = ""
+    pi_checker_model: str = ""
+    pi_checker_thinking: str = ""
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "CreateRequest":
@@ -1551,6 +1563,8 @@ class CreateRequest:
             deploys_agents=(substrate is Substrate.DOCKER
                             or project_type is ProjectType.SANDBOX_DIND),
             agents=agents)
+        harness = _validated_harness(_harness_shape(kw), dev=bool(manifest.get("dev")),
+                                     agents=agents)
         return cls(
             name=_require_name(kw.get("name")),
             workflow=workflow_id,
@@ -1587,7 +1601,122 @@ class CreateRequest:
             worker_model=wrk_m, worker_effort=wrk_e,
             role_model=rol_m, role_effort=rol_e,
             pi_model=pi_model, pi_thinking=pi_thinking,
+            **harness,
         )
+
+
+# The working mode and RS's doer/checker subagents (I33). One flat field set,
+# the same names in every request, allowlist, marker key and CLI flag, so a
+# lockstep is a name match. The installer (container/harness/install.sh) reads
+# them as these environment variables and re-checks every value itself.
+HARNESS_MODES = ("none", "direct", "planner-doer-checker")
+HARNESS_ENV = {
+    "harness_mode": "RS_HARNESS_MODE",
+    "doer_model": "RS_HARNESS_DOER_MODEL",
+    "checker_model": "RS_HARNESS_CHECKER_MODEL",
+    "pi_doer_model": "RS_HARNESS_PI_DOER_MODEL",
+    "pi_doer_thinking": "RS_HARNESS_PI_DOER_THINKING",
+    "pi_checker_model": "RS_HARNESS_PI_CHECKER_MODEL",
+    "pi_checker_thinking": "RS_HARNESS_PI_CHECKER_THINKING",
+}
+HARNESS_FIELDS = tuple(HARNESS_ENV)
+_HARNESS_CLAUDE = ("doer_model", "checker_model")
+_HARNESS_PI = ("pi_doer_model", "pi_doer_thinking", "pi_checker_model", "pi_checker_thinking")
+# The dialog's words for each field (the texts below reach the browser verbatim).
+_HARNESS_LABELS = {
+    "harness_mode": "working mode", "doer_model": "Doer model",
+    "checker_model": "Checker model", "pi_doer_model": "pi Doer model",
+    "pi_doer_thinking": "pi Doer thinking level", "pi_checker_model": "pi Checker model",
+    "pi_checker_thinking": "pi Checker thinking level",
+}
+
+
+def _harness_shape(kw: "dict") -> dict[str, str]:
+    """The seven fields from `kw`, stripped, each shape-checked on its own:
+    the mode is one of HARNESS_MODES, a Claude model is a catalog tier, a pi
+    model matches PI_MODEL_RE, a thinking level is one of pi's. Context-free
+    (which workflow, which agents) is the caller's: _validated_harness."""
+    out: dict[str, str] = {}
+    for f in HARNESS_FIELDS:
+        v = kw.get(f)
+        if v is not None and not isinstance(v, str):
+            raise ValidationError(f"the {_HARNESS_LABELS[f]} must be a string")
+        out[f] = (v or "").strip()
+    # An explicit "none" is the default spelled out: treat it as unset, so it
+    # never trips a dev-only gate or reaches a box tool that predates the flags.
+    if out["harness_mode"] == "none":
+        out["harness_mode"] = ""
+    if out["harness_mode"] and out["harness_mode"] not in HARNESS_MODES:
+        raise ValidationError(f"working mode {out['harness_mode']!r} is not one of "
+                              f"{', '.join(HARNESS_MODES)}")
+    if any(out[f] for f in _HARNESS_CLAUDE):
+        tiers = [m["alias"] for m in _model_catalog_checked()["models"]]
+        for f in _HARNESS_CLAUDE:
+            if out[f] and out[f] not in tiers:
+                raise ValidationError(f"{_HARNESS_LABELS[f]} {out[f]!r} is not one of "
+                                      f"{', '.join(tiers)}")
+    for f in ("pi_doer_model", "pi_checker_model"):
+        if out[f] and not PI_MODEL_RE.match(out[f]):
+            raise ValidationError(
+                f"{_HARNESS_LABELS[f]} {out[f]!r} must be written provider/model, e.g. "
+                f"openrouter/anthropic/claude-opus-latest")
+    for f in ("pi_doer_thinking", "pi_checker_thinking"):
+        if out[f] and out[f] not in PI_THINKING_LEVELS:
+            raise ValidationError(f"{_HARNESS_LABELS[f]} {out[f]!r} is not one of "
+                                  f"{', '.join(PI_THINKING_LEVELS)}")
+    return out
+
+
+def _validated_harness(values: dict[str, str], *, dev: bool,
+                       agents: "Sequence[str]") -> dict[str, str]:
+    """`values` (from _harness_shape) checked against where they would land:
+    only a dev workflow (or a dev box) takes them, Claude's pair needs Claude
+    among `agents`, pi's pair needs pi. Returns `values` unchanged."""
+    if not any(values.values()):
+        return values
+    if not dev:
+        raise ValidationError(
+            "the working mode and the Doer and Checker models are for dev projects and dev boxes")
+    if any(values[f] for f in _HARNESS_CLAUDE) and DEFAULT_AGENT not in agents:
+        raise ValidationError("the Doer and Checker models for Claude need Claude as an agent")
+    if any(values[f] for f in _HARNESS_PI) and "pi" not in agents:
+        raise ValidationError("the Doer and Checker models for pi need pi as an agent")
+    return values
+
+
+def _harness_set(obj: object) -> dict[str, str]:
+    """The non-empty harness fields of a request (or a dict)."""
+    get = obj.get if isinstance(obj, dict) else (lambda f: getattr(obj, f, ""))
+    return {f: get(f) for f in HARNESS_FIELDS if get(f)}
+
+
+def _read_harness(workspace_path: "Path") -> dict[str, str]:
+    """The marker's `harness` settings, tolerant: an unreadable marker, a
+    non-dict block or a value that fails its shape reads as unset (the marker is
+    container-writable; the installer re-checks every value it is given)."""
+    blk = _read_marker_dict(workspace_path).get("harness")
+    if not isinstance(blk, dict):
+        return {}
+    out: dict[str, str] = {}
+    for f in HARNESS_FIELDS:
+        v = blk.get(f)
+        if not isinstance(v, str) or not v:
+            continue
+        try:
+            _harness_shape({f: v})
+        except Exception:       # incl. an unreadable catalog: never stop a start
+            continue
+        out[f] = v
+    return out
+
+
+def _harness_settings_env(values: dict[str, str]) -> list[str]:
+    """`-e` args for the installer from harness settings (set values only)."""
+    args: list[str] = []
+    for f, v in values.items():
+        if v and f in HARNESS_ENV:
+            args += ["-e", f"{HARNESS_ENV[f]}={v}"]
+    return args
 
 
 def _validated_pi_pair(model: Any, thinking: Any, *, deploys_agents: bool,
@@ -1933,6 +2062,16 @@ class BoxAddRequest:
     # the caller's choice, None takes the box type's share_default (resolved
     # in box_add, which has the catalog). Recorded at create, never changed.
     share: bool | None = None
+    # The box's working mode and doer/checker models (HARNESS_FIELDS; dev
+    # boxes with an agent, outside research — gated in box_add, which has the
+    # catalog and the project type). Shape-checked here.
+    harness_mode: str = ""
+    doer_model: str = ""
+    checker_model: str = ""
+    pi_doer_model: str = ""
+    pi_doer_thinking: str = ""
+    pi_checker_model: str = ""
+    pi_checker_thinking: str = ""
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "BoxAddRequest":
@@ -2031,6 +2170,17 @@ class BoxAddRequest:
             raise ValidationError(
                 f"a model applies to a {DEFAULT_AGENT} box; agent {agent!r} picks "
                 f"its model in-app")
+        # The working mode and doer/checker models: shape here; the pairs follow
+        # the box's ONE agent (a defaulted agent is only ever claude or none, so
+        # an unset agent can take Claude's pair; box_add re-checks the
+        # effective agent with the catalog).
+        harness = _harness_shape(kw)
+        if any(harness[f] for f in _HARNESS_CLAUDE) and agent not in (None, DEFAULT_AGENT):
+            raise ValidationError("the Doer and Checker models for Claude apply to a Claude box")
+        if any(harness[f] for f in _HARNESS_PI) and agent != "pi":
+            raise ValidationError("the Doer and Checker models for pi apply to a pi box")
+        if any(harness.values()) and agent == "none":
+            raise ValidationError("a box without an agent has no working mode")
         return cls(
             project=_require_name(kw.get("project")), name=name, preset=preset,
             agent=agent, editor=bool(kw.get("editor", False)), browser=browser,
@@ -2041,7 +2191,7 @@ class BoxAddRequest:
             fetch=bool(kw.get("fetch", False)),
             folders=_coerce_box_folders(kw.get("folders")),
             history=_coerce_history_flag(kw.get("history")),
-            share=share)
+            share=share, **harness)
 
 
 @dataclass(frozen=True)
@@ -3490,6 +3640,15 @@ class DevBoxProvisionRequest:
     model: str = ""                             # agent model for the box ("" ⇒ project's box default)
     effort: str = ""
     share: bool | None = None                   # share files with the project (None ⇒ the dev type's default: off)
+    # The box's working mode and doer/checker models (HARNESS_FIELDS),
+    # validated by the same BoxAddRequest delegation.
+    harness_mode: str = ""
+    doer_model: str = ""
+    checker_model: str = ""
+    pi_doer_model: str = ""
+    pi_doer_thinking: str = ""
+    pi_checker_model: str = ""
+    pi_checker_thinking: str = ""
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "DevBoxProvisionRequest":
@@ -3527,11 +3686,12 @@ class DevBoxProvisionRequest:
             agent=kw.get("agent"), editor=kw.get("editor"), repo=repo,
             branch=kw.get("branch"),
             model=kw.get("model"), effort=kw.get("effort"),
-            share=kw.get("share"))
+            share=kw.get("share"), **{f: kw.get(f) for f in HARNESS_FIELDS})
         return cls(project=box.project, url=url, repo=repo,
                    pat=(pat or "").strip(), name=box.name, agent=box.agent,
                    editor=box.editor, branch=box.branch,
-                   model=box.model, effort=box.effort, share=box.share)
+                   model=box.model, effort=box.effort, share=box.share,
+                   **{f: getattr(box, f) for f in HARNESS_FIELDS})
 
 
 @dataclass(frozen=True)
@@ -3564,6 +3724,15 @@ class DevProjectProvisionRequest:
     # the same CreateRequest delegation (pi must be among the agents).
     pi_model: str = ""
     pi_thinking: str = ""
+    # The working mode and the doer/checker models (HARNESS_FIELDS), validated
+    # by the same CreateRequest delegation.
+    harness_mode: str = ""
+    doer_model: str = ""
+    checker_model: str = ""
+    pi_doer_model: str = ""
+    pi_doer_thinking: str = ""
+    pi_checker_model: str = ""
+    pi_checker_thinking: str = ""
     # The project's agent SET. None ⇒ the workflow's preset (a body without the
     # key); an explicit list is validated by the CreateRequest delegation below
     # (known agents, pulled dists, and the dev floor: at least one agent).
@@ -3614,6 +3783,7 @@ class DevProjectProvisionRequest:
             supervisor_effort=kw.get("supervisor_effort"),
             pi_model=kw.get("pi_model"),
             pi_thinking=kw.get("pi_thinking"),
+            **{f: kw.get(f) for f in HARNESS_FIELDS},
             agents=raw_agents,
             dev_repo_preflight=False)
         return cls(name=cr.name, url=url, repo=repo, workflow=workflow,
@@ -3622,6 +3792,7 @@ class DevProjectProvisionRequest:
                    supervisor_model=cr.supervisor_model,
                    supervisor_effort=cr.supervisor_effort,
                    pi_model=cr.pi_model, pi_thinking=cr.pi_thinking,
+                   **{f: getattr(cr, f) for f in HARNESS_FIELDS},
                    agents=None if raw_agents is None else cr.agents,
                    mount=mount)
 
@@ -4147,6 +4318,11 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
                if (req.pi_model or req.pi_thinking) else None)
     if pi_pair:
         marker["pi_models"] = {"agent": pi_pair}
+    # The working mode and the doer/checker models, only what the create chose
+    # (from_kwargs refused them outside a dev workflow). _stage_harness reads
+    # them back at every deploy (_read_harness).
+    if _harness_set(req):
+        marker["harness"] = _harness_set(req)
     (orch_dir / "project.json").write_text(json.dumps(marker, indent=2) + "\n")
     # Starting message (STAGE_SPAWN_GREETING) for the workflow's main shell, read
     # by the Management/Supervisor tab on first byobu new-session. Manifest-
@@ -4364,7 +4540,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
                 **({"pi_pair": pi_pair} if pi_pair else {})), progress)
             # The working-mode suite (I33): into the shared copy for the boxes,
             # and into the project container's own agents.
-            _report_warnings(_stage_harness(container_name, local), progress)
+            _report_warnings(_stage_harness(container_name, local, workspace_path), progress)
             # Editor dist staged whenever cached so any box can RO-mount
             # /opt/editor-dist; deploy_local follows the RESOLVED code-server
             # flag (default ON since the editor-by-default slice — a
@@ -4993,7 +5169,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
                                            **_local_deploy_kwargs(staged, local),
                                            **_pi_pair_kwargs(workspace_path)), progress)
         # The working-mode suite (I33), before the box refresh below.
-        _report_warnings(_stage_harness(container, local), progress)
+        _report_warnings(_stage_harness(container, local, workspace_path), progress)
         # Running boxes follow live (an Add delivers the new agent wired; a
         # request that adds nothing is an Update). The editor extension: an Add
         # installs it only where none is (a supervisor that just gained claude);
@@ -7926,7 +8102,8 @@ def _harness_env(agents: "Sequence[str]") -> list[str]:
     return ["-e", f"RS_HARNESS_AGENTS={' '.join(agents)}"]
 
 
-def _stage_harness(container: str, local: "Sequence[str]") -> list[str]:
+def _stage_harness(container: str, local: "Sequence[str]",
+                   workspace_path: "Path | None" = None) -> list[str]:
     """Stage the working-mode suite into a RUNNING Docker-in-Docker project
     container and lay it into the container's own agents. Called right after
     `_stage_agent_dist` at the four Docker-in-Docker staging points (that step
@@ -7938,7 +8115,8 @@ def _stage_harness(container: str, local: "Sequence[str]") -> list[str]:
         the folder to uid 1000 like the rest of the shared copy) — always, so a
         box finds the installer even when the project container runs no agent;
       • the installer, as the agent user, when the container runs any agent
-        (`local`, the project's own set).
+        (`local`, the project's own set), with the project's working mode and
+        doer/checker models from its marker (`workspace_path`; none ⇒ mode none).
     Returns the operator-facing warnings; NEVER dies — it runs in the middle of
     a start, where a refusal would leave the project half up."""
     try:
@@ -7954,8 +8132,10 @@ def _stage_harness(container: str, local: "Sequence[str]") -> list[str]:
         return [_HARNESS_WARNING]
     if not local:
         return []
+    settings = _read_harness(workspace_path) if workspace_path is not None else {}
     r = run(["docker", "exec", "-u", "1000", "-e", "HOME=/home/research",
-             *_harness_env(local), container, "sh", HARNESS_INSTALLER],
+             *_harness_env(local), *_harness_settings_env(settings),
+             container, "sh", HARNESS_INSTALLER],
             capture_output=True)
     if r.returncode != 0 or HARNESS_FAILED_SENTINEL in (r.stdout or ""):
         return [_HARNESS_WARNING]
@@ -10122,7 +10302,7 @@ def _recreate_supervisor(
                                            **_pi_pair_kwargs(workspace_path)), progress)
         # The working-mode suite (I33): the shared copy's was just emptied, and
         # the boxes this start re-runs find the installer there.
-        _report_warnings(_stage_harness(container, local), progress)
+        _report_warnings(_stage_harness(container, local, workspace_path), progress)
         if editor_dist_present():
             _stage_editor_dist(container, deploy_local=flags.get("code-server", True))
         # Reader dist re-staged (STAGE_READER): survives the recreate so a
@@ -12729,7 +12909,7 @@ def project_add_agents(project: str, agents: "Sequence[str]",
     if not is_research:
         # The working-mode suite (I33), before the box refresh below runs its
         # installer in each box. Never research (its boxes must find none).
-        _report_warnings(_stage_harness(container, local), progress)
+        _report_warnings(_stage_harness(container, local, workspace_path), progress)
     if deploy_local and not _install_agent_extensions(
             ["docker", "exec", "-u", "1000", "-e", "HOME=/home/research", container],
             "/home/research", True):
@@ -14750,6 +14930,25 @@ def _require_share_aware_box_tool(container: str, help_out=None) -> None:
         raise ValidationError(_OLD_BOX_TOOL_SHARE_MSG)
 
 
+def _require_harness_aware_box_tool(container: str) -> None:
+    """Refuse, before any Gitea work, when the project's box tool predates the
+    working-mode flags (a project not restarted since RS gained them): the add
+    would otherwise take a dev box's Gitea provisioning and only then refuse
+    the create. A tool that cannot be asked is not judged here."""
+    r = run(["docker", "exec", container, "rs-sandbox", "create", "--help"],
+            capture_output=True)
+    if r.returncode == 0 and "--harness-mode" not in (r.stdout or ""):
+        raise ValidationError(_OLD_BOX_TOOL_HARNESS_MSG)
+
+
+def _refuse_harness_on_research(container: str) -> None:
+    """A research project never stages the working-mode suite, so a box there
+    cannot take a mode or doer/checker models."""
+    if _container_project_type(container) != PROJECT_TYPE_SANDBOX_DIND:
+        raise ValidationError(
+            "a box in a research project has no working mode or doer and checker agents")
+
+
 def _gate_box_history(req: "BoxAddRequest", catalog: dict, container: str,
                       workspace_path: "Path") -> dict:
     """Every Gitea-history refusal, before any side effect; the Gitea-touching
@@ -14939,6 +15138,24 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         raise ValidationError(
             f"MCP(s) {bad} are not allowed for project {req.project!r}; allow them "
             f"first (`research project mcp allow ...`) or omit them")
+    # The working mode and doer/checker models: a dev box with an agent, in a
+    # project that stages the suite (never research), the pairs following the
+    # box's EFFECTIVE agent — all pure checks (one docker inspect for the
+    # project type, one box-tool probe), before any Gitea work and the box
+    # tool / image staging.
+    harness = _harness_set(req)
+    if harness:
+        harness_agent = req.agent if req.agent is not None else (
+            DEFAULT_AGENT if catalog.get(req.preset, {}).get("agent_default") else "none")
+        if not catalog.get(req.preset, {}).get("dev"):
+            raise ValidationError(
+                "the working mode and the Doer and Checker models are for dev boxes")
+        _refuse_harness_on_research(container)
+        if harness_agent == "none":
+            raise ValidationError("a box without an agent has no working mode")
+        _validated_harness({f: harness.get(f, "") for f in HARNESS_FIELDS}, dev=True,
+                           agents=[harness_agent])
+        _require_harness_aware_box_tool(container)
     # Dev preset (STAGE_DEV_GITEA S2): mirror the in-supervisor rs-sandbox gates
     # host-side for a clean pre-exec ValidationError (the two-gate lockstep).
     # `repo` carries NAME semantics here (an attached gitea repo), not the byo
@@ -15233,6 +15450,10 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         argv.append("--folders=" + ",".join(req.folders))
     argv.append("--share" if want_share else "--no-share")
     argv += history_args
+    # Only the set ones: a box without them keeps today's exact argv. One argv
+    # word each (`--x=value`): a pi model may start with "-" (the --folders case).
+    for f, v in harness.items():
+        argv.append(f"--{f.replace('_', '-')}={v}")
     progress.step("create-box", "creating the box")
     r = run(argv, capture_output=True)
     if r.returncode != 0:
@@ -15257,6 +15478,8 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
                 die(_OLD_BOX_TOOL_MSG)
             if history_args and "--history-" in err:
                 die(_OLD_BOX_TOOL_HISTORY_MSG)
+            if harness and any(f"--{f.replace('_', '-')}" in err for f in harness):
+                die(_OLD_BOX_TOOL_HARNESS_MSG)
             die(_OLD_BOX_TOOL_SHARE_MSG)
         die(f"failed to add box: {(r.stderr or r.stdout).strip()}")
     try:
@@ -18349,6 +18572,10 @@ def dev_box_provision(req: "DevBoxProvisionRequest", progress=None) -> dict:  # 
     the redirected stderr); the view log gets only run_dev_box's coarse
     tokens."""
     progress = progress or _NULL_PROGRESS
+    # A working mode on a research project's box would be refused by box_add —
+    # after the mirror below; refuse it before (research boxes get no suite).
+    if _harness_set(req):
+        _refuse_harness_on_research(_running_dind_supervisor(req.project))
     progress.step("repo", "mirroring the repo")
     dev_repo_add(DevRepoAddRequest.from_kwargs(url=req.url, pat=req.pat))
     # req.name is ALWAYS set here: from_kwargs derived+validated the default
@@ -18356,7 +18583,8 @@ def dev_box_provision(req: "DevBoxProvisionRequest", progress=None) -> dict:  # 
     box = box_add(BoxAddRequest.from_kwargs(
         project=req.project, name=req.name, preset="dev", agent=req.agent,
         editor=req.editor, repo=req.repo, branch=req.branch,
-        model=req.model, effort=req.effort, share=req.share), progress)
+        model=req.model, effort=req.effort, share=req.share,
+        **{f: getattr(req, f) for f in HARNESS_FIELDS}), progress)
     return {"project": req.project, "repo": req.repo, "box": box.name,
             "container": box.container}
 
@@ -18388,6 +18616,7 @@ def dev_project_provision(req: "DevProjectProvisionRequest", progress=None) -> d
         supervisor_model=req.supervisor_model,
         supervisor_effort=req.supervisor_effort,
         pi_model=req.pi_model, pi_thinking=req.pi_thinking,
+        **{f: getattr(req, f) for f in HARNESS_FIELDS},
         agents=req.agents, mount=req.mount)
     create(cr, progress=progress)
     return {"project": req.name, "repo": req.repo}

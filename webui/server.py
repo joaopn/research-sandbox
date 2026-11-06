@@ -1128,6 +1128,11 @@ async def broker_box_add_handler(request: web.Request) -> web.Response:
             "repo": body.get("repo"), "ref": body.get("ref"),
             "setup": body.get("setup"), "branch": body.get("branch"),
             "model": body.get("model"), "effort": body.get("effort"),
+            # The box's working mode and doer/checker models (lockstep with
+            # BOX_ADD_WEBUI_FIELDS; dev boxes only, gated in box_add).
+            **{f: body.get(f) for f in ("harness_mode", "doer_model", "checker_model",
+                                       "pi_doer_model", "pi_doer_thinking",
+                                       "pi_checker_model", "pi_checker_thinking")},
             # Read-only folders (a list of workspace-relative paths) — raw; the
             # broker request validates the shape, box_add the folders.
             "folders": body.get("folders"),
@@ -1835,6 +1840,11 @@ async def broker_dev_box_handler(request: web.Request) -> web.Response:
             "name": body.get("name"), "agent": body.get("agent"),
             "editor": bool(body.get("editor")), "branch": body.get("branch"),
             "model": body.get("model"), "effort": body.get("effort"),
+            # The box's working mode and doer/checker models (lockstep with
+            # DEV_BOX_WEBUI_FIELDS).
+            **{f: body.get(f) for f in ("harness_mode", "doer_model", "checker_model",
+                                       "pi_doer_model", "pi_doer_thinking",
+                                       "pi_checker_model", "pi_checker_thinking")},
             # Share files — RAW like the plain box route's (tri-state; the
             # broker request refuses anything but a bool or absent).
             "share": body.get("share")}
@@ -1902,6 +1912,11 @@ async def broker_dev_project_handler(request: web.Request) -> web.Response:
             # pi's starting model + thinking level (the dialog's pi tab).
             "pi_model": body.get("pi_model"),
             "pi_thinking": body.get("pi_thinking"),
+            # The working mode and the doer/checker models (lockstep with
+            # DEV_PROJECT_WEBUI_FIELDS; this handler forwards by name).
+            **{f: body.get(f) for f in ("harness_mode", "doer_model", "checker_model",
+                                       "pi_doer_model", "pi_doer_thinking",
+                                       "pi_checker_model", "pi_checker_thinking")},
             # The agent set; an absent key relays as None ⇒ the workflow preset.
             "agents": body.get("agents"),
             # Read-only folders, relative to RS's data folder (the broker gates).
