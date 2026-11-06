@@ -1521,6 +1521,130 @@ def _box_harness(args: argparse.Namespace, agent: str) -> dict:
     return out
 
 
+# ---------------------------------------------------------------------------
+# A Claude box's model + effort live in the box agent's own settings file (I33
+# slice 3, the box half), like the project agent's — never the container
+# environment, which outranks the file and would hide a /model pick. MIRRORS of
+# rscore (this file runs standalone in the project container and cannot import
+# it): CLAUDE_SETTINGS_JQ, _AGENT_SETTINGS_SCRIPT and its sentinels/cap,
+# CLAUDE_MODEL_RE and the effort levels — all pytest-pinned equal.
+# ---------------------------------------------------------------------------
+BOX_CLAUDE_SETTINGS_JQ = (
+    '(.model // "") as $old | (if $mo == "set" then $m else $old end) as $k | if $mo == "set" then .model = $m elif $mo == "clear" then del(.model) else . end | if $mo == "keep" then . else .env = ((.env // {}) + {"ANTHROPIC_MODEL": ""}) end | if $eo == "set" and $e == "max" then .env = ((.env // {}) + {"CLAUDE_CODE_EFFORT_LEVEL": "max"}) | del(.effortLevel) | if $k == "" or ((.modelSettings // {}) | has($k) | not) then . else .modelSettings[$k] |= del(.effortLevel) end elif $eo == "set" then .env = ((.env // {}) + {"CLAUDE_CODE_EFFORT_LEVEL": ""}) | .effortLevel = $e | if $k == "" then . else .modelSettings = ((.modelSettings // {}) | .[$k] = ((.[$k] // {}) + {"effortLevel": $e})) end elif $eo == "clear" then .env = ((.env // {}) + {"CLAUDE_CODE_EFFORT_LEVEL": ""}) | del(.effortLevel) | if $k == "" or ((.modelSettings // {}) | has($k) | not) then . else .modelSettings[$k] |= del(.effortLevel) end else . end')
+BOX_AGENT_SETTINGS_MAX_BYTES = 1048576
+BOX_AGENT_SETTINGS_ABSENT = "RS_AGENT_SETTINGS_ABSENT"
+BOX_AGENT_SETTINGS_FAILED = "RS_AGENT_SETTINGS_NOT_APPLIED"
+BOX_AGENT_SETTINGS_SCRIPT = (
+    'f="$1"; shift\n[ -f "$f" ] || { echo RS_AGENT_SETTINGS_ABSENT; exit 0; }\n[ "$(wc -c < "$f")" -le 1048576 ] || { echo RS_AGENT_SETTINGS_NOT_APPLIED; exit 0; }\nif jq "$@" "$f" > "$f.rs-tmp" && [ -s "$f.rs-tmp" ] && mv "$f.rs-tmp" "$f"; then exit 0; fi\nrm -f "$f.rs-tmp"; echo RS_AGENT_SETTINGS_NOT_APPLIED\n')
+BOX_CLAUDE_MODEL_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._\[\]-]*\Z")
+BOX_CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+BOX_CLAUDE_SETTINGS = "/home/worker/.claude/settings.json"
+# Present while a run's detached model write is still waiting for the boot: a
+# live write now would be reverted by it, so it reports "booting" instead. On
+# the container's own /dev/shm, a fresh tmpfs at every container start
+# (measured: gone after a stop/start and after a kill/start, while the home
+# keeps its files) — so it can never outlive the waiter that made it. A box run
+# before this (no marker ever) is never blocked.
+BOX_MODEL_PENDING = "/dev/shm/rs-box-model-pending"
+# A bound on one exec of the settings read/write (a `head`/`jq` on a small file
+# answers in well under a second); the host's own call is bounded too.
+BOX_AGENT_SETTINGS_EXEC_TIMEOUT_S = 5
+
+
+def _box_model_ops(new: dict, old: "dict | None" = None,
+                   halves: "list | None" = None) -> list[str]:
+    """jq `--arg` words for BOX_CLAUDE_SETTINGS_JQ. At a run (`old` None,
+    `halves` None) a half with a value is set and an empty one kept — never a
+    clear, the fresh home has nothing to clear. For a change, `halves` names
+    what changed: a changed half is set (or cleared when now empty), the other
+    kept, so a /model pick survives an effort-only change."""
+    m = new.get("model") or ""
+    e = new.get("effort") or ""
+    if m and not BOX_CLAUDE_MODEL_RE.match(m):
+        m = ""
+    if e not in BOX_CLAUDE_EFFORTS:
+        e = ""
+    if halves is None:
+        mo = "set" if m else "keep"
+        eo = "set" if e else "keep"
+    else:
+        mo = ("set" if m else "clear") if "model" in halves else "keep"
+        eo = ("set" if e else "clear") if "effort" in halves else "keep"
+    return ["--arg", "mo", mo, "--arg", "m", m, "--arg", "eo", eo, "--arg", "e", e,
+            BOX_CLAUDE_SETTINGS_JQ]
+
+
+def _write_box_model_detached(cname: str, ops: list[str]) -> None:
+    """After the box's boot (its role marker AND its settings file — the
+    entrypoint's fallback settings write comes after the marker), merge the pair
+    into the box agent's settings, as the box user. Detached like the
+    working-mode installer (the boot copies files while this waits); a pending
+    exec dies with the box. Never fatal."""
+    r = _docker("exec", "-d", "-u", "1000", "-e", "HOME=/home/worker", cname, "sh", "-c",
+                f"touch {BOX_MODEL_PENDING}; "
+                # one-second poll, as the installer's
+                "until [ -e /home/worker/.rs-role ] && [ -f \"$1\" ]; do sleep 1; done; "
+                f"( {BOX_AGENT_SETTINGS_SCRIPT} ); rm -f {BOX_MODEL_PENDING}",
+                "sh", BOX_CLAUDE_SETTINGS, *ops)
+    if r.returncode != 0:
+        print(f"warning: the model could not be written into box {cname!r}'s "
+              f"settings; it runs on Claude's own default", file=sys.stderr)
+
+
+def _write_box_model_now(cname: str, ops: list[str]) -> str:
+    """The same merge into a box whose boot is done, synchronously: "ok",
+    "booting" (no boot marker yet, or its run's model write is still waiting —
+    a write now would be reverted by it), "absent" (no settings file) or
+    "failed"."""
+    gate = ('[ -e /home/worker/.rs-role ] || { echo RS_BOX_BOOTING; exit 0; }\n'
+            f'[ ! -e {BOX_MODEL_PENDING} ] || {{ echo RS_BOX_BOOTING; exit 0; }}\n')
+    try:
+        r = subprocess.run(["docker", "exec", "-u", "1000", "-e", "HOME=/home/worker", cname,
+                            "sh", "-c", gate + BOX_AGENT_SETTINGS_SCRIPT, "sh",
+                            BOX_CLAUDE_SETTINGS, *ops], capture_output=True, text=True,
+                           timeout=BOX_AGENT_SETTINGS_EXEC_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        return "failed"
+    out = r.stdout or ""
+    if r.returncode != 0 or BOX_AGENT_SETTINGS_FAILED in out:
+        return "failed"
+    if "RS_BOX_BOOTING" in out:
+        return "booting"
+    return "absent" if BOX_AGENT_SETTINGS_ABSENT in out else "ok"
+
+
+
+def _harness_env_pairs(harness: "dict | None", agent: str) -> list[tuple[str, str]]:
+    """The RS_HARNESS_* variables a box runs with, from its entry: set values
+    only, `none` read as unset, nothing for an agent-less box. ONE helper for
+    what _run_box emits and what a start compares against."""
+    if agent == "none" or not isinstance(harness, dict):
+        return []
+    out = []
+    for f, var in HARNESS_ENV.items():
+        v = harness.get(f)
+        if not isinstance(v, str) or not v or (f == "harness_mode" and v == "none"):
+            continue
+        out.append((var, v))
+    return out
+
+
+def _container_harness_env(cname: str) -> set[tuple[str, str]]:
+    """The RS_HARNESS_* variables a box container carries now."""
+    r = _docker("container", "inspect", "-f", "{{json .Config.Env}}", cname)
+    try:
+        items = json.loads(r.stdout) if r.returncode == 0 else []
+    except ValueError:
+        items = []
+    out = set()
+    for it in items if isinstance(items, list) else []:
+        if isinstance(it, str) and it.startswith("RS_HARNESS_") and "=" in it:
+            k, _, v = it.partition("=")
+            if k != "RS_HARNESS_AGENTS":
+                out.add((k, v))
+    return out
+
+
 def _box_carried_agents() -> list[str]:
     """Every agent an agent box receives: the shared copy is the project's
     recorded set plus claude, deployed whole into each agent box — MIRROR of
@@ -1731,18 +1855,14 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     # from the stored entry on every restart / supervisor recreate.
     # The pair is claude's (ANTHROPIC_MODEL / CLAUDE_CODE_EFFORT_LEVEL); an
     # non-claude agent's box carries no RS-side model (the PI picks in-app).
+    # The pair now lives in the box agent's own settings file (written after
+    # the boot, below) — never the environment, which outranks the file.
     model_env: list[str] = []
-    if model and agent == "claude":
-        model_env = ["-e", f"ANTHROPIC_MODEL={model}"]
-        if effort:
-            model_env += ["-e", f"CLAUDE_CODE_EFFORT_LEVEL={effort}"]
-    # The working mode and doer/checker models (from the STORED entry, like the
-    # model pair: env is fixed at run). Set values only, so a box without them
-    # runs byte-identical; the installer execs (here and the host's refresh)
-    # inherit them from the container.
-    for f, v in (harness or {}).items():
-        if v and f in HARNESS_ENV and agent != "none":
-            model_env += ["-e", f"{HARNESS_ENV[f]}={v}"]
+    # The working mode and doer/checker models (from the STORED entry: env is
+    # fixed at run). Set values only, so a box without them runs byte-identical;
+    # the installer execs (here and the host's refresh) inherit them.
+    for var, v in _harness_env_pairs(harness, agent):
+        model_env += ["-e", f"{var}={v}"]
     # Preset setup script rides env argv deliberately: it is user-VISIBLE
     # catalog data (the window shows it), never a field value.
     # Gitea history: only non-secret names ride the environment (the address,
@@ -1859,6 +1979,10 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     # container's own filesystem, where the shared copy is a real directory.
     if agent_mount and os.path.isfile(HARNESS_INSTALLER):
         _install_harness(cname, _box_carried_agents())
+    # A Claude box's model + effort into its own settings file, after the boot
+    # — in every project, research included (no installer gate).
+    if agent_mount and agent == "claude" and (model or effort):
+        _write_box_model_detached(cname, _box_model_ops({"model": model, "effort": effort}))
     # F3 Slice 2b: launch the in-box loopback forwarders for the freshly-run box.
     _launch_box_forwarders(cname, lp_list)
     return folder_warnings + mailbox_warnings + history_warnings
@@ -1906,6 +2030,14 @@ def _rerun_box(name: str, entry: dict) -> list[dict]:
               f"resolvable; keeping the box's existing .mcp-preset.json",
               file=sys.stderr)
     is_dev = bool(entry.get("dev"))
+    if entry.get("model_pending"):
+        # This run lays the entry's pair into the fresh home: nothing is owed.
+        entries = load()
+        if isinstance(entries.get(name), dict):
+            entries[name].pop("model_pending", None)
+            save(entries)
+        entry = dict(entry)
+        entry.pop("model_pending", None)
     return _run_box(name, entry["ip"], browser=bool(entry.get("browser")),
              agent=entry.get("agent", "none"), editor=bool(entry.get("editor")),
              editor_port=int(entry.get("editor_port") or 0),
@@ -2404,11 +2536,33 @@ def cmd_start(args: argparse.Namespace) -> None:
                   f"(its mailbox mounts changed while parked)")
             return
         _print_warnings(args.name, m_warnings)
+    # The working mode and doer/checker models ride the container's environment
+    # (fixed at run): settings changed while parked re-run the box.
+    if exists and (_container_harness_env(cname)
+                   != set(_harness_env_pairs(entry.get("harness"), entry.get("agent", "none")))):
+        _print_warnings(args.name, _rerun_box(args.name, entry))
+        print(f"box {args.name!r}: re-run at {entry['ip']} "
+              f"(its working mode changed while parked)")
+        return
     if exists:
         r = _docker("start", cname)
         if r.returncode != 0:
             die(f"failed to start box {args.name!r}: "
                 f"{(r.stderr or r.stdout).strip()}")
+        # A model changed while parked: the home was kept, so write it now —
+        # only the halves that changed, and cleared only once written.
+        pend = entry.get("model_pending")
+        if pend and entry.get("agent") == "claude":
+            halves = [h for h in pend if h in ("model", "effort")] \
+                if isinstance(pend, list) else None
+            if _write_box_model_now(cname, _box_model_ops(entry, entry, halves or None)) == "ok":
+                entries = load()
+                if isinstance(entries.get(args.name), dict):
+                    entries[args.name].pop("model_pending", None)
+                    save(entries)
+            else:
+                print(f"warning: box {args.name!r}: its new model could not be written "
+                      f"yet; it is written at its next start", file=sys.stderr)
         # A plain `docker start` keeps the -p publishes but the exec'd forwarder
         # processes died with the stop — relaunch them (F3 Slice 2b). The
         # _rerun_box branches above/below relaunch via _run_box.
@@ -2634,6 +2788,141 @@ def _remove_own_folder(parent: Path, name: str) -> str | None:
         return "not-a-folder"
     shutil.rmtree(path, ignore_errors=True)
     return None
+
+
+def cmd_settings(args: argparse.Namespace) -> None:
+    """Replace a box's agent settings — the Claude model and effort and the
+    working-mode fields — with exactly the values given (the host resolves and
+    checks the full set; an empty value means none). A working-mode change
+    re-runs a running box fresh (that environment is fixed at run); a
+    model/effort-only change is written into the running box's settings file
+    (no restart); a box that is not running is only saved (its next start
+    re-runs it for a mode change, or writes the model). JSON out; warnings are
+    data the host turns into text."""
+    _require_dind_project()
+    if not _NAME_RE.match(args.name):
+        die("invalid box name")
+    entries = load()
+    entry = entries.get(args.name)
+    if not isinstance(entry, dict) or entry.get("kind") != KIND:
+        die(f"no box named {args.name!r} in this project")
+    agent = entry.get("agent", "none")
+    # Which groups the request writes (the host names them): a named model or
+    # effort half is written even when the record already holds that value —
+    # the box's file may differ (a /model pick); an unnamed group keeps the
+    # record's. Absent: every group (a hand call names everything it passes).
+    write = None if args.write is None else {w for w in args.write.split(",") if w}
+    named = (lambda g: True) if write is None else (lambda g: g in write)
+    model = (args.model or "").strip() if named("model") else (entry.get("model") or "")
+    effort = (args.effort or "").strip() if named("effort") else (entry.get("effort") or "")
+    if (named("model") or named("effort")) and (args.model or args.effort) and agent != "claude":
+        die("only a Claude box takes a model here")
+    if model and not BOX_CLAUDE_MODEL_RE.match(model):
+        die(f"invalid --model value {model!r}")
+    if effort and effort not in BOX_CLAUDE_EFFORTS:
+        die(f"invalid --effort value {effort!r}")
+    if named("harness"):
+        new_h = _box_harness(args, agent)
+    else:
+        new_h = entry.get("harness") if isinstance(entry.get("harness"), dict) else {}
+    old_h = dict(_harness_env_pairs(entry.get("harness"), agent))
+    harness_changed = old_h != dict(_harness_env_pairs(new_h, agent))
+    halves = [h for h, a, b in (("model", entry.get("model") or "", model),
+                                ("effort", entry.get("effort") or "", effort))
+              if a != b or (write is not None and h in write)]
+    if not harness_changed and not halves:
+        print(json.dumps({"name": args.name, "changed": False, "restarted": False,
+                          "warnings": []}))
+        return
+    entry["model"], entry["effort"] = model, effort
+    if new_h:
+        entry["harness"] = new_h
+    else:
+        entry.pop("harness", None)
+    cname = box_container(args.name)
+    running = _docker("container", "inspect", "-f", "{{.State.Running}}",
+                      cname).stdout.strip() == "true"
+    warnings: list[dict] = []
+    restarted = False
+    if running and harness_changed:
+        entry.pop("model_pending", None)
+        entries[args.name] = entry
+        save(entries)
+        warnings = _rerun_box(args.name, entry)
+        restarted = True
+    elif halves and agent == "claude":
+        pend = entry.get("model_pending")
+        prev = [h for h in pend if h in ("model", "effort")] if isinstance(pend, list) else []
+        owed = sorted(set(prev) | set(halves))        # an older pending half rides along
+        if running:
+            res = _write_box_model_now(cname, _box_model_ops(entry, entry, owed))
+            if res != "ok":
+                warnings.append({"kind": "model", "reason": res})
+        else:
+            res = "stopped"
+        if res == "ok":
+            entry.pop("model_pending", None)
+        else:
+            entry["model_pending"] = owed
+        entries[args.name] = entry
+        save(entries)
+    else:
+        entries[args.name] = entry
+        save(entries)
+    print(json.dumps({"name": args.name, "changed": True, "restarted": restarted,
+                      "warnings": warnings}))
+
+
+def cmd_agents(args: argparse.Namespace) -> None:
+    """Every box that runs an agent, for the host's ⚙ read: the entry's agent
+    settings, whether it runs, and — for a running Claude box — its settings
+    file (capped raw text) and the two container variables that outrank it, so
+    the host shows what the box runs. One call, each exec bounded."""
+    _require_dind_project()
+    rows = []
+    for name, e in sorted(load().items()):
+        if not isinstance(e, dict) or e.get("kind") != KIND:
+            continue
+        agent = e.get("agent", "none")
+        if agent == "none":
+            continue
+        cname = box_container(name)
+        try:
+            ins = subprocess.run(["docker", "container", "inspect", "-f",
+                                  "{{.State.Running}}|{{json .Config.Env}}", cname],
+                                 capture_output=True, text=True,
+                                 timeout=BOX_AGENT_SETTINGS_EXEC_TIMEOUT_S)
+            state, _, env_json = (ins.stdout or "").strip().partition("|")
+        except (OSError, subprocess.TimeoutExpired):
+            state, env_json = "", "[]"
+        running = state == "true"
+        env = {}
+        try:
+            for it in json.loads(env_json or "[]") or []:
+                if isinstance(it, str) and it.split("=", 1)[0] in (
+                        "ANTHROPIC_MODEL", "CLAUDE_CODE_EFFORT_LEVEL"):
+                    k, _, v = it.partition("=")
+                    env[k] = v
+        except ValueError:
+            pass
+        text = None
+        if running and agent == "claude":
+            try:
+                r = subprocess.run(["docker", "exec", "-u", "1000", cname, "sh", "-c",
+                                    '[ -f "$1" ] && head -c "$2" "$1" 2>/dev/null', "sh",
+                                    BOX_CLAUDE_SETTINGS, str(BOX_AGENT_SETTINGS_MAX_BYTES + 1)],
+                                   capture_output=True, text=True,
+                                   timeout=BOX_AGENT_SETTINGS_EXEC_TIMEOUT_S)
+                if r.returncode == 0 and len(r.stdout or "") <= BOX_AGENT_SETTINGS_MAX_BYTES:
+                    text = r.stdout
+            except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+                text = None
+        rows.append({"name": name, "agent": agent, "dev": bool(e.get("dev")),
+                     "running": running, "model": e.get("model") or "",
+                     "effort": e.get("effort") or "",
+                     "harness": e.get("harness") if isinstance(e.get("harness"), dict) else {},
+                     "settings": text, "env": env})
+    print(json.dumps(rows))
 
 
 def cmd_discard(args: argparse.Namespace) -> None:
@@ -2909,6 +3198,19 @@ def build_parser() -> argparse.ArgumentParser:
     sr.add_argument("name")
     sr.set_defaults(func=cmd_start)
 
+    st_ = sub.add_parser("settings", help="replace a box's agent settings (model, "
+                                         "effort, working mode) with the values given")
+    st_.add_argument("name")
+    st_.add_argument("--model", default="", help="the Claude model (empty: Claude's own default)")
+    st_.add_argument("--effort", default="", help="the Claude effort (empty: Claude's default)")
+    st_.add_argument("--write", default=None,
+                     help="the groups written (model,effort,harness); the others keep "
+                          "the box's record (default: all)")
+    for f in HARNESS_ENV:
+        st_.add_argument(f"--{f.replace('_', '-')}", dest=f, default="")
+    st_.set_defaults(func=cmd_settings)
+    ag = sub.add_parser("agents", help="every agent box with its settings (JSON)")
+    ag.set_defaults(func=cmd_agents)
     d = sub.add_parser("discard", help="stop a box and wipe its workspace")
     d.add_argument("name")
     d.add_argument("--keep-workspace", action="store_true",

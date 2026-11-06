@@ -510,6 +510,8 @@ _OLD_BOX_TOOL_SHARE_MSG = ("this project's box tool predates file sharing — "
                            "restart the project, then retry")
 _OLD_BOX_TOOL_HARNESS_MSG = ("this project's box tool predates the working mode — "
                              "restart the project, then retry")
+_OLD_BOX_TOOL_SETTINGS_MSG = ("this project's box tool predates changing a box's agent "
+                              "settings — restart the project, then retry")
 
 
 # An older box tool refuses a folder path below the top level with its own
@@ -546,7 +548,8 @@ def _is_old_box_tool(r: "subprocess.CompletedProcess") -> bool:
                                     "--history-repo", "--share", "--no-share",
                                     *(f"--{f.replace('_', '-')}" for f in HARNESS_FIELDS))))
         or ("invalid choice" in err
-            and any(c in err for c in ("'folders'", "'history-heal'"))))
+            and any(c in err for c in ("'folders'", "'history-heal'", "'settings'",
+                                       "'agents'"))))
 
 
 def valid_project_name(name: str) -> bool:
@@ -2308,6 +2311,63 @@ class BoxFoldersRequest:
             raise ValidationError("folders must be a list of folder paths")
         return cls(project=_require_name(kw.get("project")), name=name,
                    folders=_coerce_box_folders(kw.get("folders")))
+
+
+@dataclass(frozen=True)
+class BoxSettingsRequest:
+    """Change a box's agent settings after it was added (the ⚙ Box agents
+    section): the Claude model and effort, the working mode and the doer/checker
+    models. "" = unchanged (as on UpdateRequest); `reset` names the fields to put
+    back to their default. Shape only here; box_settings checks them against the
+    box."""
+    project: str
+    name: str
+    model: str = ""
+    effort: str = ""
+    harness_mode: str = ""
+    doer_model: str = ""
+    checker_model: str = ""
+    pi_doer_model: str = ""
+    pi_doer_thinking: str = ""
+    pi_checker_model: str = ""
+    pi_checker_thinking: str = ""
+    reset: tuple[str, ...] = ()
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "BoxSettingsRequest":
+        name = kw.get("name")
+        if not (isinstance(name, str) and _BOX_NAME_RE.match(name)):
+            raise ValidationError(
+                "box name must be lowercase, start with a letter, and contain "
+                "only letters, digits, or '-'")
+        vals = {}
+        for f in ("model", "effort"):
+            v = kw.get(f) or ""
+            if not isinstance(v, str):
+                raise ValidationError(f"the box's {f} must be a string")
+            vals[f] = v.strip()
+        if vals["model"] and not CLAUDE_MODEL_RE.match(vals["model"]):
+            raise ValidationError(
+                f"Claude model {vals['model']!r} may use only letters, digits and . _ - [ ]")
+        if vals["effort"]:
+            cat = _model_catalog_checked()
+            if vals["effort"] not in cat["efforts"]:
+                raise ValidationError(f"unknown effort level {vals['effort']!r}; must be one "
+                                      f"of {cat['efforts']}")
+        raw_mode = kw.get("harness_mode")
+        harness = _harness_shape(kw)
+        reset = list(dict.fromkeys(_as_tuple(kw.get("reset"))))
+        if isinstance(raw_mode, str) and raw_mode.strip() == "none" and "harness_mode" not in reset:
+            reset.append("harness_mode")
+        allowed = ("model", "effort", *HARNESS_FIELDS)
+        for r in reset:
+            if r not in allowed:
+                raise ValidationError(f"{r!r} cannot be reset (resettable: {', '.join(allowed)})")
+        both = [r for r in reset if ({**vals, **harness}).get(r)]
+        if both:
+            raise ValidationError(f"{', '.join(both)} cannot be both set and reset in one change")
+        return cls(project=_require_name(kw.get("project")), name=name, reset=tuple(reset),
+                   **vals, **harness)
 
 
 @dataclass(frozen=True)
@@ -4081,6 +4141,16 @@ class BoxFoldersResult:
     name: str
     folders: list                                   # as requested (validated)
     changed: bool
+    warnings: list = field(default_factory=list)
+
+
+@dataclass
+class BoxSettingsResult:
+    project: str
+    name: str
+    changed: bool
+    restarted: bool
+    effort_dropped: bool = False
     warnings: list = field(default_factory=list)
 
 
@@ -13379,7 +13449,9 @@ _AGENT_SETTINGS_SCRIPT = (
     f'[ -f "$f" ] || {{ echo {AGENT_SETTINGS_ABSENT}; exit 0; }}\n'
     f'[ "$(wc -c < "$f")" -le {AGENT_SETTINGS_MAX_BYTES} ] || '
     f'{{ echo {AGENT_SETTINGS_FAILED}; exit 0; }}\n'
-    'if jq "$@" "$f" > "$f.rs-tmp" && mv "$f.rs-tmp" "$f"; then exit 0; fi\n'
+    # an empty result (jq on a file caught mid-write by its creator) is never
+    # moved in: it would replace the agent's settings with nothing
+    'if jq "$@" "$f" > "$f.rs-tmp" && [ -s "$f.rs-tmp" ] && mv "$f.rs-tmp" "$f"; then exit 0; fi\n'
     f'rm -f "$f.rs-tmp"; echo {AGENT_SETTINGS_FAILED}\n')
 _AGENT_HOME = "/home/research"
 
@@ -14037,7 +14109,85 @@ def project_agents(req: ProjectAgentsRequest, _progress=None) -> dict:
         out["research_models"] = {t: {"model": (models.get(t) or {}).get("model", ""),
                                       "effort": (models.get(t) or {}).get("effort", "")}
                                   for t in ("worker", "role") if isinstance(models.get(t), dict)}
+    out["boxes"], out["boxes_state"] = ([], "none") if docker else \
+        _project_agent_boxes(container, running, research, ws)
     return out
+
+
+def _project_agent_boxes(container: str, running: bool, research: bool,
+                         ws: "Path") -> tuple[list, str]:
+    """The project's boxes that run an agent, for the ⚙ Box agents section:
+    (rows, state) — state "ok", "stopped" (the project is), "old-tool" (a box
+    tool from before this) or "unavailable". Each row: name, agent, dev,
+    running, whether its working mode can change, its Claude model/effort
+    (what the box runs — its settings file under its container variables, the
+    entry when it is not running) and its working-mode fields (re-checked; the
+    record is writable from inside the project). A project with no agent box
+    (its record says so — a box-less research project has no box tool at all)
+    reads as "ok" with no rows and costs no call. Never raises."""
+    try:
+        recorded = extension.load(ws)
+    except (OSError, ValueError, RecursionError):
+        recorded = {}
+    n = sum(1 for e in (recorded.values() if isinstance(recorded, dict) else [])
+            if isinstance(e, dict) and e.get("kind") == extension.SANDBOX_KIND
+            and e.get("agent", "none") != "none")
+    if not n:
+        return [], "ok"
+    if not running:
+        return [], "stopped"
+    # The box tool makes two bounded execs per agent box (its state + its
+    # settings file); one more bound covers its own start and record read.
+    try:
+        r = run(["docker", "exec", container, "rs-sandbox", "agents"],
+                capture_output=True, timeout=AGENT_SETTINGS_EXEC_TIMEOUT_S * (2 * n + 1))
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        return [], "unavailable"
+    if r.returncode != 0:
+        return [], ("old-tool" if _is_old_box_tool(r) else "unavailable")
+    try:
+        raw = json.loads(r.stdout or "[]")
+    except (ValueError, RecursionError):
+        return [], "unavailable"
+    rows = []
+    for b in raw if isinstance(raw, list) else []:
+        if not isinstance(b, dict):
+            continue
+        name, agent = b.get("name"), b.get("agent")
+        if not (isinstance(name, str) and _BOX_NAME_RE.match(name)) or agent not in KNOWN_AGENTS:
+            continue
+        h = b.get("harness") if isinstance(b.get("harness"), dict) else {}
+        harness = {}
+        for f in HARNESS_FIELDS:
+            v = h.get(f)
+            if isinstance(v, str) and v and not (f == "harness_mode" and v == "none"):
+                try:
+                    _harness_shape({f: v})
+                    harness[f] = v
+                except Exception:
+                    pass
+        row = {"name": name, "agent": agent, "dev": b.get("dev") is True,
+               "running": b.get("running") is True,
+               "mode_editable": b.get("dev") is True and not research,
+               "harness": harness}
+        if agent == "claude":
+            env = b.get("env") if isinstance(b.get("env"), dict) else {}
+            env = {k: v for k, v in env.items() if isinstance(v, str)}
+            settings = None
+            text = b.get("settings")
+            if row["running"] and isinstance(text, str) and len(text) <= AGENT_SETTINGS_MAX_BYTES:
+                try:
+                    settings = json.loads(text)
+                except (ValueError, RecursionError):
+                    settings = None
+            if row["running"]:
+                row["claude"] = {**_claude_effective(settings, env), "source": "settings"}
+            else:
+                row["claude"] = {**_claude_effective({"model": b.get("model"),
+                                                      "effortLevel": b.get("effort")}, {}),
+                                 "source": "saved"}
+        rows.append(row)
+    return rows, "ok"
 
 
 def _read_marker_substrate(workspace_path: "Path") -> str:
@@ -17036,6 +17186,115 @@ def box_folders(req: "BoxFoldersRequest", _progress=None) -> BoxFoldersResult:  
         project=req.project, name=req.name, folders=list(req.folders),
         changed=info.get("changed") is not False,
         warnings=_box_folder_warnings(info.get("warnings"), req.name))
+
+
+def box_settings(req: "BoxSettingsRequest", _progress=None) -> BoxSettingsResult:  # type: ignore[name-defined]
+    """Change a box's agent settings via the in-box `rs-sandbox settings`, which
+    saves them and either writes the model into the running box's settings file
+    (no restart) or, for a working-mode change, re-runs the box fresh; a box that
+    is not running applies them at its next start. Every check runs here first —
+    the box tool trusts them, as at box add: the model only on a Claude box (any
+    project), the working mode and doer/checker models only on a dev box outside
+    a research project, for the box's own agent. The box tool always receives
+    the full resolved set (an empty value means none)."""
+    cfg = load_config()
+    container = _running_dind_supervisor(req.project)
+    ws = workspace_path_for(req.project, cfg)
+    try:
+        entries = extension.load(ws)
+    except (OSError, ValueError, RecursionError):
+        raise ValidationError("could not read this project's boxes")
+    entry = entries.get(req.name) if isinstance(entries, dict) else None
+    if not isinstance(entry, dict) or entry.get("kind") != extension.SANDBOX_KIND:
+        raise ValidationError(f"no box named {req.name!r} in this project")
+    agent = entry.get("agent", "none")
+    if not isinstance(agent, str):
+        agent = "none"
+    reset = set(req.reset)
+    model_asked = bool(req.model or req.effort or reset & {"model", "effort"})
+    harness_asked = any(getattr(req, f) for f in HARNESS_FIELDS) or bool(reset & set(HARNESS_FIELDS))
+    if not (model_asked or harness_asked):
+        raise ValidationError("nothing to change")
+    if model_asked and agent != "claude":
+        raise ValidationError("only a box running Claude takes a model here; "
+                              "pi picks its model inside pi")
+    research = _container_project_type(container) != PROJECT_TYPE_SANDBOX_DIND
+    if harness_asked:
+        if research or not entry.get("dev") or agent == "none":
+            raise ValidationError("the working mode and the Doer and Checker models are "
+                                  "for dev boxes outside research projects")
+    # The full resolved set: the entry's values (re-checked — the record is
+    # writable from inside the project), with this request's changes applied.
+    def _entry_str(k: str) -> str:
+        v = entry.get(k)
+        return v if isinstance(v, str) else ""
+    model = req.model or ("" if "model" in reset else _entry_str("model"))
+    effort = req.effort or ("" if "effort" in reset else _entry_str("effort"))
+    if model and not CLAUDE_MODEL_RE.match(model):
+        model = ""
+    dropped = False
+    if effort:
+        cat = _model_catalog_checked()
+        if not _claude_effort_ok(model, effort, cat):
+            if req.effort:
+                raise ValidationError(f"model {model!r} does not accept an effort level; "
+                                      f"leave its effort at the default")
+            effort, dropped = "", True
+    old_h = entry.get("harness") if isinstance(entry.get("harness"), dict) else {}
+    harness: dict[str, str] = {}
+    for f in HARNESS_FIELDS:
+        v = old_h.get(f)
+        if isinstance(v, str) and v:
+            try:
+                _harness_shape({f: v})
+            except Exception:
+                v = ""
+        else:
+            v = ""
+        if getattr(req, f):
+            v = getattr(req, f)
+        elif f in reset:
+            v = ""
+        if v and not (f == "harness_mode" and v == "none"):
+            harness[f] = v
+    if harness_asked:
+        _validated_harness({f: harness.get(f, "") for f in HARNESS_FIELDS},
+                           dev=True, agents=[agent])
+    # The groups this change writes; the box tool keeps the others as its
+    # record has them — so a model-only change never touches the working mode,
+    # and a named model half is written even when the record already holds it
+    # (the box's file may differ: a /model pick).
+    write = [g for g, asked in (
+        ("model", req.model or "model" in reset),
+        ("effort", req.effort or "effort" in reset or dropped),
+        ("harness", harness_asked)) if asked]
+    argv = ["docker", "exec", container, "rs-sandbox", "settings", req.name,
+            f"--write={','.join(write)}",
+            f"--model={model if agent == 'claude' else ''}",
+            f"--effort={effort if agent == 'claude' else ''}",
+            *((f"--{f.replace('_', '-')}={harness.get(f, '')}" for f in HARNESS_FIELDS)
+              if harness_asked else ())]
+    r = run(argv, capture_output=True)
+    if r.returncode != 0:
+        if _is_old_box_tool(r):
+            die(_OLD_BOX_TOOL_SETTINGS_MSG)
+        die(f"failed to change the box's settings: {(r.stderr or r.stdout).strip()}")
+    info = _parse_box_tool_json(r.stdout)
+    warnings = []
+    for w in info.get("warnings") or []:
+        if isinstance(w, dict) and w.get("kind") == "model" and w.get("reason") == "booting":
+            warnings.append(f"box {req.name!r} is still starting — the model is saved; "
+                            f"save again in a moment to apply it now, or it is written "
+                            f"at the box's next start")
+        elif isinstance(w, dict) and w.get("kind") == "model":
+            warnings.append(f"the model could not be written into box {req.name!r} yet; "
+                            f"it is written at its next start")
+        elif isinstance(w, dict):
+            warnings += _box_folder_warnings([w], req.name)
+    return BoxSettingsResult(project=req.project, name=req.name,
+                             changed=info.get("changed") is not False,
+                             restarted=info.get("restarted") is True,
+                             effort_dropped=dropped, warnings=warnings)
 
 
 def box_presets(req: "BoxPresetsRequest", _progress=None) -> BoxPresetsResult:  # type: ignore[name-defined]

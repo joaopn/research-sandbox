@@ -1193,6 +1193,31 @@ async def broker_box_folders_handler(request: web.Request) -> web.Response:
     return web.json_response(reply, status=status)
 
 
+async def broker_box_settings_handler(request: web.Request) -> web.Response:
+    """POST /broker/project/{name}/box-settings — change a box's agent settings
+    (the ⚙ Box agents section; gated, origin-checked). Synchronous relay like a
+    box folders change (a working-mode change re-runs the one box). The broker's
+    BOX_SETTINGS_WEBUI_FIELDS is the input boundary; this dict is the
+    hand-picked second filter in front of it (keep the two in lockstep)."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    project = request.match_info.get("name", "")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    args = {"project": project}
+    for k in ("name", "model", "effort", "reset", "harness_mode", "doer_model",
+              "checker_model", "pi_doer_model", "pi_doer_thinking",
+              "pi_checker_model", "pi_checker_thinking"):
+        if body.get(k) is not None:
+            args[k] = body[k]
+    status, reply = await _relay(request, "box_settings", args)
+    return web.json_response(reply, status=status)
+
+
 async def broker_project_folders_handler(request: web.Request) -> web.Response:
     """GET /broker/project/{name}/folders — the ⚙ Sharing box's read (gated).
     POST {folders} — record the project's folders, paths relative to RS's
@@ -4075,6 +4100,10 @@ def main() -> None:
     # Box folders change — a fixed segment, so it too precedes {action}.
     app.router.add_post(
         "/broker/project/{name}/box-folders", broker_box_folders_handler)
+    # A box's agent settings (the ⚙ Box agents section) — a fixed segment, so
+    # it precedes {action}.
+    app.router.add_post(
+        "/broker/project/{name}/box-settings", broker_box_settings_handler)
     # The ⚙ Sharing box's project folders — the POST is a fixed segment, so it
     # too precedes {action}.
     app.router.add_get(
