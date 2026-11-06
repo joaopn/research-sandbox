@@ -430,6 +430,40 @@ def _box_folder_warnings(raw: Any, box: Any) -> list[str]:
     return out
 
 
+# `rs-sandbox discard`'s workspace warnings (kind "workspace") → fixed wording.
+_BOX_DISCARD_REASONS = {
+    "link-removed": "its workspace folder was a link: only the link was removed, "
+                    "and what it pointed to was left in place untouched",
+    "not-a-folder": "its workspace was not a folder, so it was left in place",
+    "bad-name": "its workspace was left in place because the box name is not a "
+                "plain folder name",
+    "parent-link": "the project's boxes folder is a link, so nothing was "
+                   "deleted and the box's workspace was left in place",
+}
+_BOX_DISCARD_REASON_DEFAULT = ("its workspace could not be examined or removed, "
+                               "so it was left in place")
+
+
+def _box_discard_warnings(raw: Any, box: Any) -> list[str]:
+    """The box tool's discard warnings → operator lines, built here from a
+    re-validated box name and a fixed text per reason (the tool's own text
+    never reaches a view log or the browser). Only kind "workspace" is read;
+    anything malformed, or an older tool's plain-text reply, reads as none."""
+    if not isinstance(raw, list):
+        return []
+    who = f"box {box!r}" if (isinstance(box, str) and _BOX_NAME_RE.match(box)) \
+        else "the box"
+    out: list[str] = []
+    for w in raw:
+        if not isinstance(w, dict) or w.get("kind") != "workspace":
+            continue
+        reason = w.get("reason")
+        why = (_BOX_DISCARD_REASONS.get(reason) if isinstance(reason, str)
+               else None) or _BOX_DISCARD_REASON_DEFAULT
+        out.append(f"{who} was removed, but {why}")
+    return out
+
+
 def _report_box_restart_warnings(name: str, stdout: Any, progress) -> None:
     """The folders a re-run box started without (the supervisor-recreate box
     relaunch loop): stderr for the CLI, a `warning` progress line for the
@@ -4009,7 +4043,7 @@ class ProjectFoldersResult:
 class BoxRemoveResult:
     project: str
     name: str
-    warnings: list = field(default_factory=list)    # history retirement lines
+    warnings: list = field(default_factory=list)    # workspace + history retirement lines
 
 
 @dataclass
@@ -4829,10 +4863,19 @@ def destroy(req: DestroyRequest, cfg: "Config" | None = None,
     # The project folder goes only when it holds RS's workspace (or the
     # container still stood, the reach destroy always had): a stale network
     # or volume must never delete an unrelated folder that shares the name.
-    if project_root.exists() and ("workspace" in remnants
-                                  or "container" in remnants):
-        shutil.rmtree(project_root, ignore_errors=True)
-        stuck = _project_root_leftovers(project_root)
+    # lexists, so a dangling link at the folder's name is handed over too
+    # (removed as a link, reported).
+    if os.path.lexists(project_root) and ("workspace" in remnants
+                                          or "container" in remnants):
+        # Path and parent from the one project_root, and the delete happens
+        # only when it is provably this project's own folder; a refusal is
+        # one warning (the leftovers walk is skipped) and the teardown goes on.
+        refused = _remove_own_folder(project_root.parent, project_root.name)
+        stuck = [] if refused else _project_root_leftovers(project_root)
+        if refused:
+            msg = _project_folder_refusal(project_root, refused)
+            print(f"warning: {msg}", file=sys.stderr)
+            progress.step("warning", msg)
         if stuck:
             # The rest of the project is still torn down below: what is left
             # is only files, and saying so is the honest outcome.
@@ -4879,14 +4922,135 @@ def destroy(req: DestroyRequest, cfg: "Config" | None = None,
     except Exception:
         pass
     # Preset-field env store for this project's boxes — host-only, never
-    # mounted; the boxes died with the project, so their keys go too.
-    shutil.rmtree(BOX_ENV_DIR / project, ignore_errors=True)
+    # mounted; the boxes died with the project, so their keys go too (each
+    # key file by name, never a recursive delete; anything else is reported).
+    for w in _remove_box_env_store(BOX_ENV_DIR, project):
+        print(f"warning: {w}", file=sys.stderr)
+        progress.step("warning", w)
+
+
+# The one name shape _remove_own_folder deletes under: a single plain path
+# component (no "", ".", "..", "/", trailing newline). MIRROR PAIR: cli/rscore.py
+# and cli/rs_sandbox.py carry this pattern and the function below byte-identical
+# (pytest-pinned); the box tool is baked standalone and cannot import rscore.
+_OWN_FOLDER_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+
+def _remove_own_folder(parent: Path, name: str) -> str | None:
+    """Delete <parent>/<name> with one recursive delete, only when it is
+    provably the caller's own folder: `name` is one plain component under the
+    caller's fixed `parent`, and the entry there is a real folder. MIRROR PAIR
+    (cli/rscore.py and cli/rs_sandbox.py, byte-identical, pytest-pinned).
+
+    Returns None when the folder was removed or was not there, else the reason
+    it was not deleted:
+      "bad-name"      `name` is not one plain component; nothing was touched
+      "link-removed"  the entry was a link: only the link was removed, never
+                      what it points to (the name is free again)
+      "link-kept"     the entry was a link that could not be removed
+      "not-a-folder"  the entry is a file or another non-folder; left in place
+      "unreadable"    the entry could not be examined; left in place
+
+    The delete never follows a link inside the folder: shutil.rmtree removes a
+    link without following it, and where shutil.rmtree.avoids_symlink_attacks
+    is True (Linux) it walks by file descriptor, so a folder swapped for a link
+    between this check and the delete is refused, not followed. Where it is
+    False (a macOS host) rmtree still never follows a link by design, but a
+    swap racing the walk is not guarded. Not covered anywhere: `parent` itself
+    swapped during the delete (rmtree takes no dir_fd on Python 3.9). A partial
+    delete is swallowed here; destroy reports what survived (box remove
+    does not yet)."""
+    if not isinstance(name, str) or not _OWN_FOLDER_NAME_RE.match(name):
+        return "bad-name"
+    path = Path(parent) / name
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return "unreadable"
+    if stat.S_ISLNK(st.st_mode):
+        try:
+            os.unlink(path)
+        except OSError:
+            return "link-kept"
+        return "link-removed"
+    if not stat.S_ISDIR(st.st_mode):
+        return "not-a-folder"
+    shutil.rmtree(path, ignore_errors=True)
+    return None
+
+
+def _project_folder_refusal(project_root: Path, reason: str) -> str:
+    """destroy's operator line for a project folder _remove_own_folder did not
+    delete (fixed text per reason code; no CLI verb)."""
+    if reason == "link-removed":
+        return (f"the project folder {project_root} was a link: only the link "
+                f"was removed, and what it pointed to was left in place untouched")
+    if reason == "not-a-folder":
+        return f"{project_root} is not a folder, so destroy left it in place"
+    if reason == "bad-name":
+        return (f"{project_root} does not end in a plain folder name, so "
+                f"destroy deleted nothing there")
+    return (f"the project folder {project_root} could not be examined or "
+            f"removed, so destroy left it in place")
+
+
+def _remove_box_env_store(env_root: Path, project: str) -> list[str]:
+    """Remove the project's preset-field key store <env_root>/<project> WITHOUT
+    a recursive delete: only RS writes there, one `<box>.env` file per box, so
+    each such file (or link: the link itself, never its target) is unlinked by
+    name and the folder is rmdir'd. Anything else found there — a `.env` that
+    is a folder, any other entry, or a store that is itself a link or a file —
+    is left untouched and reported. Never raises (destroy's last step must not
+    fail the op); returns the warning lines."""
+    store = env_root / project
+    try:
+        st = os.lstat(store)
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return [f"the box key store {store} could not be read, so it was left "
+                f"in place"]
+    if not stat.S_ISDIR(st.st_mode):
+        return [f"the box key store {store} is not a plain folder (a link or "
+                f"a file), so it was left in place untouched"]
+    try:
+        names = sorted(os.listdir(store))
+    except OSError:
+        return [f"the box key store {store} could not be listed, so it was left "
+                f"in place"]
+    kept: list[str] = []
+    for n in names:
+        p = store / n
+        try:
+            est = os.lstat(p)
+        except OSError:
+            kept.append(n)
+            continue
+        if (n.endswith(".env") and _BOX_NAME_RE.match(n[:-len(".env")])
+                and (stat.S_ISREG(est.st_mode) or stat.S_ISLNK(est.st_mode))):
+            try:
+                os.unlink(p)
+            except OSError:
+                kept.append(n)
+        else:
+            kept.append(n)
+    if kept:
+        return [f"{len(kept)} item(s) in the box key store {store} are not box "
+                f"keys or could not be removed, and were left in place "
+                f"(first: {kept[0]})"]
+    try:
+        os.rmdir(store)
+    except OSError:
+        return [f"the box key store {store} could not be removed"]
+    return []
 
 
 def _project_root_leftovers(project_root: Path) -> list[str]:
     """What destroy's removal of the project folder left behind, found by a
-    READ-ONLY walk after the delete (the delete itself is unchanged; whether
-    destroy should delete the folder at all is I16's open question). Returns
+    READ-ONLY walk after the delete (_remove_own_folder decides whether the
+    folder is destroy's to delete; a refused folder is never walked). Returns
     the leaves of what survived: every file or link, every empty folder, and
     every folder whose contents cannot be listed. An empty list means the
     folder is gone."""
@@ -15608,6 +15772,12 @@ def box_remove(req: "BoxRemoveRequest", progress=None) -> BoxRemoveResult:  # ty
     r = run(cmd, capture_output=True)
     if r.returncode != 0:
         die(f"failed to remove box {req.name!r}: {(r.stderr or r.stdout).strip()}")
+    # A workspace the box tool left in place (a link, a non-folder) is a
+    # structured warning; an older box tool prints plain text and reads as none.
+    warnings: list[str] = _box_discard_warnings(
+        _parse_box_tool_json(r.stdout).get("warnings"), req.name)
+    for line in warnings:
+        progress.step("warning", line)
     # F3 Slice 2b: sweep the discarded box's exported-port entries — its pub_super
     # publishes went with the box, so a lingering registry entry would be a dead
     # tab. (The box's forwarders died with its container; nothing to reap here.)
@@ -15646,14 +15816,14 @@ def box_remove(req: "BoxRemoveRequest", progress=None) -> BoxRemoveResult:  # ty
     # the box's account (with any fork it made) and its token. The Gitea is
     # resumed for it when stopped (the call: a removed box's repo is always
     # archived); nothing here may escape the broker or skip the prune.
-    warnings: list[str] = []
     hist = next((e for e in gitea.project_entries(req.project)
                  if e.get("class") == gitea.HISTORY_CLASS
                  and e.get("box") == req.name), None)
     if hist is not None:
-        warnings = _retire_history_rows(req.project, [hist], container)
-        for line in warnings:
+        hist_lines = _retire_history_rows(req.project, [hist], container)
+        for line in hist_lines:
             progress.step("warning", line)
+        warnings.extend(hist_lines)
     # Preset-field env cleanup (best-effort, the dev-token posture): the host
     # store copy AND the supervisor-home copy the box was staged from — a
     # removed box must not leave its key at rest anywhere.

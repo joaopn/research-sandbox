@@ -2584,8 +2584,70 @@ def cmd_folders(args: argparse.Namespace) -> None:
                       "warnings": warnings}))
 
 
+# The one name shape _remove_own_folder deletes under: a single plain path
+# component (no "", ".", "..", "/", trailing newline). MIRROR PAIR: cli/rscore.py
+# and cli/rs_sandbox.py carry this pattern and the function below byte-identical
+# (pytest-pinned); the box tool is baked standalone and cannot import rscore.
+_OWN_FOLDER_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+
+def _remove_own_folder(parent: Path, name: str) -> str | None:
+    """Delete <parent>/<name> with one recursive delete, only when it is
+    provably the caller's own folder: `name` is one plain component under the
+    caller's fixed `parent`, and the entry there is a real folder. MIRROR PAIR
+    (cli/rscore.py and cli/rs_sandbox.py, byte-identical, pytest-pinned).
+
+    Returns None when the folder was removed or was not there, else the reason
+    it was not deleted:
+      "bad-name"      `name` is not one plain component; nothing was touched
+      "link-removed"  the entry was a link: only the link was removed, never
+                      what it points to (the name is free again)
+      "link-kept"     the entry was a link that could not be removed
+      "not-a-folder"  the entry is a file or another non-folder; left in place
+      "unreadable"    the entry could not be examined; left in place
+
+    The delete never follows a link inside the folder: shutil.rmtree removes a
+    link without following it, and where shutil.rmtree.avoids_symlink_attacks
+    is True (Linux) it walks by file descriptor, so a folder swapped for a link
+    between this check and the delete is refused, not followed. Where it is
+    False (a macOS host) rmtree still never follows a link by design, but a
+    swap racing the walk is not guarded. Not covered anywhere: `parent` itself
+    swapped during the delete (rmtree takes no dir_fd on Python 3.9). A partial
+    delete is swallowed here; destroy reports what survived (box remove
+    does not yet)."""
+    if not isinstance(name, str) or not _OWN_FOLDER_NAME_RE.match(name):
+        return "bad-name"
+    path = Path(parent) / name
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return "unreadable"
+    if stat.S_ISLNK(st.st_mode):
+        try:
+            os.unlink(path)
+        except OSError:
+            return "link-kept"
+        return "link-removed"
+    if not stat.S_ISDIR(st.st_mode):
+        return "not-a-folder"
+    shutil.rmtree(path, ignore_errors=True)
+    return None
+
+
 def cmd_discard(args: argparse.Namespace) -> None:
+    """Remove a box: its container, its dev bridge, its registry entry and —
+    unless --keep-workspace — its workspace boxes/<name>/, which is deleted
+    only when it is provably the box's own folder (_remove_own_folder; a
+    project whose boxes/ folder is itself a link deletes nothing). A workspace
+    left in place does not fail the discard (the host's box cleanup must still
+    run): the outcome is JSON on stdout, {"name", "workspace": "kept" |
+    "removed" | "link-removed" | "refused", "mailbox_kept", "warnings":
+    [{"kind": "workspace", "reason": …}]}, plus a human line on stderr."""
     _require_dind_project()
+    if not _NAME_RE.match(args.name):
+        die("invalid box name")
     entries = load()
     entry = _box_entry(entries, args.name)
     _docker("rm", "-f", box_container(args.name))
@@ -2601,14 +2663,33 @@ def cmd_discard(args: argparse.Namespace) -> None:
     # A sharing box's mailbox shared/.boxes/<name>/ is never deleted: it
     # outlives its box by design (a sharing box re-added under this name
     # writes into it again).
+    share = bool(_entry_share(entry))
     kept = (f"; mailbox shared/{BOX_MAILBOX_DIR}/{args.name}/ kept"
-            if _entry_share(entry) else "")
+            if share else "")
+    warnings: list[dict] = []
     if args.keep_workspace:
-        print(f"box {args.name!r}: discarded (workspace preserved at "
-              f"boxes/{args.name}/{kept})")
+        workspace = "kept"
+        human = (f"box {args.name!r}: discarded (workspace preserved at "
+                 f"boxes/{args.name}/{kept})")
     else:
-        shutil.rmtree(WORKSPACE / f"boxes/{args.name}", ignore_errors=True)
-        print(f"box {args.name!r}: discarded{f' ({kept[2:]})' if kept else ''}")
+        boxes = WORKSPACE / "boxes"
+        # The parent check lives here, not in the mirrored helper: a boxes/
+        # that is a link would point every box's folder somewhere else.
+        reason = ("parent-link" if os.path.islink(boxes)
+                  else _remove_own_folder(boxes, args.name))
+        if reason is None:
+            workspace = "removed"
+            human = f"box {args.name!r}: discarded{f' ({kept[2:]})' if kept else ''}"
+        else:
+            workspace = "link-removed" if reason == "link-removed" else "refused"
+            warnings.append({"kind": "workspace", "reason": reason})
+            human = (f"box {args.name!r}: discarded; boxes/{args.name} "
+                     + ("was a link: only the link was removed"
+                        if reason == "link-removed"
+                        else f"was left in place ({reason})") + kept)
+    print(human, file=sys.stderr)
+    print(json.dumps({"name": args.name, "workspace": workspace,
+                      "mailbox_kept": share, "warnings": warnings}))
 
 
 def cmd_skills(args: argparse.Namespace) -> None:
