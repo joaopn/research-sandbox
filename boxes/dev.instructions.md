@@ -42,6 +42,20 @@ name your runtime ships:
 Put the whole brief in the task, self-contained: the child knows nothing you do not write
 there, and pi refuses a single-agent launch whose task is empty.
 
+When the workflow asks for a review of your diff, the last review must have seen the code you
+push: a code change made after it — a one-line tidy-up included — needs a fresh review of the
+full diff. Code is anything that runs or is read as behaviour: source (its strings included —
+messages, help text), configuration, test assertions and fixtures, and text shipped for an
+agent to follow (instructions, prompts) — for that text, an edit counts as code when it
+changes the meaning. Non-code changes need no fresh review: comments, docstrings, whitespace
+and re-wrapping that no program, tool or test reads; docs written for people, such as a
+README; an edit to agent text that leaves its meaning unchanged, such as a typo fix; commit
+messages and PR descriptions. A doc written for people counts as agent text when the
+project's instructions tell agents to follow it, such as a CONTRIBUTING file. A rebase that
+applies cleanly is not a code change; resolving its conflicts is. Say in the PR when non-code
+edits came after the last review. When you cannot tell whether an edit changes behaviour (or,
+for agent text, its meaning), treat it as code.
+
 **If two sections of THIS file disagree, the rule marked as a hard rule wins.** Fix the
 offending section in this file and tell the maintainer, so the template it was staged from
 gets fixed too — these files drift as they grow.
