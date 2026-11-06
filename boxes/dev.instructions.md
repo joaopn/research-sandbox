@@ -49,7 +49,9 @@ gets fixed too — these files drift as they grow.
 ## Git Remotes
 
 You have two remotes:
-- **`origin`** — your fork on Gitea (read-write). This is your workspace. You own it.
+- **`origin`** — your fork on Gitea (read-write). This is your workspace. Its open PRs are
+  not all yours: each belongs to the agent that opened it (see "Rebase only the open PRs that
+  are yours" below).
 - **`upstream`** — the mirror of the real GitHub repo (read-only). The maintainer's source of truth.
 
 Do not add other remotes.
@@ -111,12 +113,29 @@ yours to rewrite, and the rebases above are how it moves — it must always foll
 mirror's head with no merge commits. **Never merge the mirror into your base branch**: a merge
 commit on the base breaks the maintainer's per-commit collection, a content-free one included.
 
-After a sync rewrote your base, bring every open branch onto it, now: in its worktree
-(`rs-wt reopen <name>` if you had closed it) run `git fetch origin && git rebase
-origin/{{BASE_BRANCH}}`, then force-push the feature branch — otherwise an open PR shows
-commits that are no longer on the base and rs-land refuses to land it. Merged PRs and the
-archive tags keep pointing at your pre-collection commits; that is expected — the tags are the
-record of what landed, not part of the live line.
+After a sync rewrote your base, bring the open PR branches you are working on onto it, now:
+each in its worktree (`rs-wt reopen <name>` if you had closed it) run `git fetch origin &&
+git rebase origin/{{BASE_BRANCH}}`, then force-push the feature branch — otherwise an open PR
+shows commits that are no longer on the base and rs-land refuses to land it. This is never
+every open PR on the fork (the hard rule below); a PR you were only told to merge is brought
+level when you land it. Merged PRs and the archive tags keep pointing at your pre-collection
+commits; that is expected — the tags are the record of what landed, not part of the live line.
+
+**Rebase only the open PRs that are yours — hard rule.** An open PR is yours to rebase in
+exactly two cases: you are actively working on it (you opened it and are still carrying it,
+or the maintainer told you to take it over), or the maintainer told you to merge it. Every
+other open PR on the fork belongs to the agent that opened it — every agent in this container
+files under the same Gitea user and shares this clone, so "open on the fork" never means
+"yours". Never rebase, force-push or resolve the conflicts of an open PR outside those two
+cases, not even to bring it level after a sync: the agent that opened it has the context to
+resolve it, and a rebase and force-push move its branch under it, on Gitea and in this shared
+clone. A PR you were told to merge but are not working on (you are not carrying it and were
+not told to take it over) may be rebased only when the rebase applies cleanly; if it
+conflicts, `git rebase --abort`, say so on the PR and leave it to the agent that opened it or
+to the maintainer. If any PR you would rebase — one you were told to merge or to take over —
+has its branch checked out in another session's worktree, do not rebase it: tell the
+maintainer — never work in another session's tree. When you cannot tell whether a PR is
+yours, it is not.
 
 **STOP and ask** when a conflict cannot be resolved without altering the maintainer's content:
 `git rebase --abort`, comment on the issue saying what you saw, and wait. Do not `reset --hard`
@@ -132,11 +151,11 @@ can lose commits.
   To continue an existing `agent/` branch, `rs-wt reopen <name>`; to build on any other
   existing branch, start a new `agent/` branch from it with `rs-wt new <name> --base
   origin/<branch>`.
-- **Keep every branch with an open PR rebased onto the current `{{BASE_BRANCH}}`** as part
-  of normal work — when something else lands on the base branch, rebase your open PR
-  branches onto it and force-push them (the base branch moves only through the sync above),
-  so review always looks at
-  work sitting on the current base.
+- **Keep the branch of each open PR you are working on rebased onto the current
+  `{{BASE_BRANCH}}`** as part of normal work — when something else lands on the base branch,
+  rebase that branch onto it and force-push it, so review always looks at work sitting on the
+  current base. Only the PRs you are working on (the hard rule above); a PR you were only told
+  to merge is brought level when you land it (next bullet).
 - **Land your finished work with `rs-land <pr-number>`** once the maintainer approves the
   pull request. One command does the whole landing: it merges fast-forward-only, tags what
   landed as `<pr>-<feature>` (the branch name without its `agent/` prefix — the durable
@@ -145,8 +164,10 @@ can lose commits.
   force-push the feature branch (the base branch moves only through the sync above), and run
   it again; if that rebase
   had conflicts, describe the resolution in a PR comment and ask for a fresh review before
-  landing. If it keeps refusing for a reason you cannot fix, report the refusal text in a
-  PR comment and wait — do not work around it.
+  landing (on a PR you are working on; on one you were only told to merge, the hard rule
+  above applies — a conflicting rebase is aborted and left to its agent). If it keeps
+  refusing for a reason you cannot fix, report the refusal text in a PR comment and wait — do
+  not work around it.
 - **Commit often locally**, with small commits and clear messages.
 - **No attribution lines.** Never add a co-author trailer, an AI-generated footer, or a
   session link to a commit message or a PR description — the maintainer's repository carries
