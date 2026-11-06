@@ -1897,7 +1897,7 @@ def cmd_webui(args: argparse.Namespace) -> None:
 def cmd_dev_passwd(args: argparse.Namespace) -> None:
     """Set the sandbox-admin gitea password — the human's interactive gitea
     identity (the webui Development page's Gitea tab sign-in). Bootstrap mints
-    and DISCARDS a random one, so this (or the Management → Infrastructure
+    and DISCARDS a random one, so this (or the Sandboxes → Infrastructure
     dialog) is how the operator makes the gitea web UI passable."""
     import getpass
     pw = sys.stdin.readline().strip() if not sys.stdin.isatty() \
@@ -2189,7 +2189,7 @@ def cmd_dev_sync(args: argparse.Namespace) -> None:
 
 
 def cmd_dev_gitea_enable(_args: argparse.Namespace) -> None:
-    """Provision/enable the shared Gitea (the CLI twin of the webui Management →
+    """Provision/enable the shared Gitea (the CLI twin of the webui Sandboxes →
     Infrastructure button). The SOLE stand-up path — gitea is never lazily
     created anymore; this or the button creates it, and an enabled-but-stopped
     one auto-resumes at `research start`."""
@@ -2217,7 +2217,7 @@ def _read_new_passphrase(what: str) -> str:
 
 def cmd_dev_gitea_upgrade(_args: argparse.Namespace) -> None:
     """Upgrade the shared Gitea to the release this software ships (the CLI twin
-    of Management → Infrastructure's Upgrade). Backs the instance up first, runs
+    of Sandboxes → Infrastructure's Upgrade). Backs the instance up first, runs
     the new release on a copy of the data and keeps the old one until it is
     discarded; a failure puts the old one back."""
     info = rscore.gitea_version_info()
@@ -2272,7 +2272,7 @@ def cmd_dev_gitea_discard_previous(args: argparse.Namespace) -> None:
 
 def cmd_dev_gitea_rollback(args: argparse.Namespace) -> None:
     """Go back from a successful upgrade to the Gitea release kept beside it
-    (the CLI twin of Management → Infrastructure's Go back). Everything written
+    (the CLI twin of Sandboxes → Infrastructure's Go back). Everything written
     to the new release since the upgrade is deleted, so it asks first."""
     # Asked here, not inside the refusal: the verb re-asks that under its own
     # exclusive lock, where this probe would read its own holder as busy.
@@ -3041,13 +3041,13 @@ def build_parser() -> argparse.ArgumentParser:
     dvge = dv_sub.add_parser(
         "gitea-enable",
         help="enable the shared Gitea backend (create if absent, else resume) — "
-             "the CLI twin of the webui Management → Infrastructure button")
+             "the CLI twin of the webui Sandboxes → Infrastructure button")
     dvge.set_defaults(func=cmd_dev_gitea_enable)
     dvgu = dv_sub.add_parser(
         "gitea-upgrade",
         help="upgrade the shared Gitea to the release this software ships, "
              "keeping the old one until it is discarded — the CLI twin of the "
-             "webui Management → Infrastructure Upgrade button")
+             "webui Sandboxes → Infrastructure Upgrade button")
     dvgu.set_defaults(func=cmd_dev_gitea_upgrade)
     dvgd = dv_sub.add_parser(
         "gitea-discard-previous",
@@ -3059,7 +3059,7 @@ def build_parser() -> argparse.ArgumentParser:
         "gitea-rollback",
         help="go back from an upgrade to the Gitea release kept beside it, "
              "deleting everything written since — the CLI twin of the webui "
-             "Management → Infrastructure Go back button")
+             "Sandboxes → Infrastructure Go back button")
     dvgr.add_argument("--yes", action="store_true", help="do not ask first")
     dvgr.set_defaults(func=cmd_dev_gitea_rollback)
     dvrt = dv_sub.add_parser(

@@ -314,7 +314,7 @@ def api_get(path: str, token: str):
     except (URLError, OSError) as e:
         die(f"cannot reach gitea at {GITEA_BASE}: "
             f"{getattr(e, 'reason', e)} (is this surface wired for rs-fetch, "
-            f"and is Gitea enabled on the Management page? restarting this "
+            f"and is Gitea enabled on the Sandboxes page? restarting this "
             f"box/project refreshes the wiring)")
     try:
         return json.loads(raw) if raw else None

@@ -592,7 +592,7 @@ def _resolve_workflow(workflow_id: str) -> tuple[dict, "ProjectType", "Substrate
     m = catalog.get(workflow_id)
     if m is None:
         raise ValidationError(
-            f"unknown workflow {workflow_id!r}; the Workflows page lists the catalog")
+            f"unknown workflow {workflow_id!r}; New Project lists the catalog")
     project_type, substrate = _workflow_flavor(m)
     return m, project_type, substrate
 
@@ -1266,7 +1266,7 @@ class CreateRequest:
             raise ValidationError(
                 "this project requests rs-fetch, but the dev lane (Gitea) is "
                 "not enabled on this host yet — enable Gitea from the "
-                "Management page, then retry")
+                "Sandboxes page, then retry")
         # Per-flavor service defaults from the manifest (STAGE_EDITOR_DIST slice 2;
         # validated at catalog-load time): research/sandbox-dind omit `services` ⇒ {}
         # ⇒ editor on; `sandbox` declares {"code-server": false} ⇒ lean box.
@@ -1314,7 +1314,7 @@ class CreateRequest:
             if not gitea.bootstrap_present():
                 raise ValidationError(
                     "this project keeps history on Gitea, but Gitea is not "
-                    "enabled on this host yet — enable it from the Management "
+                    "enabled on this host yet — enable it from the Sandboxes "
                     "page, then retry")
             problem = gitea.project_history_name_problem(
                 _require_name(kw.get("name")))
@@ -1461,7 +1461,7 @@ class CreateRequest:
             # gone; the stage is N-agent now).
             if not dist_present(a):
                 raise ValidationError(
-                    f"agent {a!r}: no cached dist — pull it under Management → Software first")
+                    f"agent {a!r}: no cached dist — pull it under Sandboxes → Software first")
         # A dev project's whole point is an agent working its repo — refuse a dev
         # create with none. ANY agent qualifies (pi alone included): the project
         # container gets exactly the selection, and nothing in it needs claude
@@ -1480,7 +1480,7 @@ class CreateRequest:
         # above.) `research start` auto-pulls if absent, so this floor rarely trips.
         if substrate is Substrate.DIND_SYSBOX and not dist_present(DEFAULT_AGENT):
             raise ValidationError(
-                f"no cached {DEFAULT_AGENT} dist — pull it under Management → Software first")
+                f"no cached {DEFAULT_AGENT} dist — pull it under Sandboxes → Software first")
         # Editor floor (STAGE_EDITOR_DIST slice 2 — PI chose fail-fast): ANY
         # project whose editor will be ENABLED needs a pulled editor dist (no bake
         # anymore), so you never get a supervisor / box with a missing Editor tab.
@@ -1498,7 +1498,7 @@ class CreateRequest:
             svc_en, svc_dis, base=(service_defaults or None)).get("code-server", True)
         if editor_on and not editor_dist_present():
             raise ValidationError(
-                "no cached editor dist — pull it under Management → Software first")
+                "no cached editor dist — pull it under Sandboxes → Software first")
         # Reader floor + docker rejection (STAGE_READER). The reader is a
         # dind-only supervisor service: on the docker substrate nothing deploys it
         # (entrypoint.minimal.sh has no reader block, no dist mount), so an enabled
@@ -1517,20 +1517,20 @@ class CreateRequest:
                 "drop `--enable reader`")
         if reader_on and substrate is Substrate.DIND_SYSBOX and not reader_dist_present():
             raise ValidationError(
-                "no cached reader dist — pull it under Management → Software first")
+                "no cached reader dist — pull it under Sandboxes → Software first")
         # Node seed floor (STAGE_NODE_SEED). SUBSTRATE-AGNOSTIC (unlike the reader's
         # dind-only floor): node reaches all three flavors, so the check is a plain
         # dist-presence gate. Same flag-aware resolution as the floors above; node
         # defaults OFF, so an un-flagged create never trips this. Message names NO
         # CLI verb (it reaches the browser verbatim — the editor/reader die()s that
         # name `research … pull` are the B28 defect, deliberately not copied here);
-        # the pull path is surfaced by the webui Software panel + affordance instead.
+        # the pull path is surfaced by the webui Sandboxes → Software tab + affordance instead.
         node_on = _compute_service_flags(
             svc_en, svc_dis, base=(service_defaults or None)).get("node", False)
         if node_on and not node_dist_present():
             raise ValidationError(
                 "node is enabled but no node seed is cached — pull the node runtime "
-                "from the Software panel first")
+                "from Sandboxes → Software first")
         # Agent model + effort (STAGE_MODEL_SELECT). Resolve HERE — the one
         # pre-side-effect validation point — so a bad override file or an
         # impossible model/effort pair refuses the create cleanly instead of
@@ -1881,7 +1881,7 @@ class UpdateRequest:
                         f"unknown agent {a!r} (known: {', '.join(KNOWN_AGENTS)})")
                 if not dist_present(a):
                     raise ValidationError(
-                        f"agent {a!r}: no cached dist — pull it under Management → Software first")
+                        f"agent {a!r}: no cached dist — pull it under Sandboxes → Software first")
         return cls(
             name=_require_name(kw.get("name")),
             rebuild=bool(kw.get("rebuild", False)),
@@ -3567,7 +3567,7 @@ class ReviewRequest:
 class ModelDefaultSetRequest:
     """Set (or clear) one container type's default (model, effort) pair in the
     operator's untracked model-defaults override file — the write half of the
-    broker's `models` read verb (drives the Management → Infrastructure →
+    broker's `models` read verb (drives the Sandboxes → Infrastructure →
     Reviewer control; the verb itself accepts any catalog type, deliberately —
     equivalent in power to the documented hand-edit of the same file).
 
@@ -6914,8 +6914,8 @@ def _warn_pins_below_base(what: str, bundled: dict[str, str]) -> list[str]:
                 continue
             # Reachable only from a Python caller: no product path passes a
             # version that is not the effective pin.
-            source = ("is a local override (versions.local.env — the Software "
-                      "page marks it \"local\" and its Use repo version button "
+            source = ("is a local override (versions.local.env — Sandboxes → "
+                      "Software marks it \"local\" and its Use repo version button "
                       "puts the shipped value back)"
                       if override.get(key) == value else "was requested explicitly")
             lines.append(f"warning: {what} was built with {key}={value}, below the "
@@ -7073,7 +7073,7 @@ _AGENT_INSTALL = {
     # `cd`, `pwd -P` and parameter expansion are shell builtins).
     "pi": {
         "version_key": "PI_CODING_AGENT_VERSION",
-        # APPENDED order matters: the Software page lists the sub-rows in this
+        # APPENDED order matters: the Sandboxes → Software tab lists the sub-rows in this
         # order, and archived pins index the first three.
         "extra_pins": {"node_ver": "NODE_VERSION", "rules_ver": "RS_PI_RULES_VERSION",
                        "layout_ver": "RS_PI_DIST_LAYOUT",
@@ -7922,7 +7922,7 @@ def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,
         raise ValueError("a local deploy needs at least one local agent")
     for agent in agents:
         if not dist_present(agent):
-            die(f"no cached {agent} dist to stage — pull it under Management → Software first")
+            die(f"no cached {agent} dist to stage — pull it under Sandboxes → Software first")
     label = "+".join(agents)
     # SYSBOX UID SHIFT: a plain `docker cp` carries the HOST uid/gid of the cache
     # files; inside the sysbox supervisor those land as a foreign (unmapped) owner
@@ -8566,7 +8566,7 @@ def _pin_resettable(key: str, base: dict[str, str]) -> bool:
 @dataclass(frozen=True)
 class PinResetRequest:
     """Remove one key from the untracked versions.local.env override, so the pin
-    goes back to the tracked versions.env value (the Software page's "Use repo
+    goes back to the tracked versions.env value (the Sandboxes → Software tab's "Use repo
     version" button). Every refusal message is browser-visible."""
     key: str
 
@@ -9026,7 +9026,7 @@ def _stage_editor_dist(supervisor: str, *, deploy_local: bool = False) -> None:
     Box-add's on-demand stage keeps the default False: it only populates the mount
     its box RO-mounts, never the supervisor's own editor."""
     if not editor_dist_present():
-        die("no cached editor dist to stage — pull it under Management → Software first")
+        die("no cached editor dist to stage — pull it under Sandboxes → Software first")
     _stage_dist_tree(supervisor, EDITOR_DIST_DIR, EDITOR_DIST_MOUNT, "editor")
     if deploy_local:
         _deploy_supervisor_editor(supervisor)
@@ -9316,7 +9316,7 @@ def _stage_reader_dist(supervisor: str, *, deploy_local: bool = False) -> None:
     RESOLVED reader flag by the caller (reader-deploy.sh does not re-check
     RS_SERVICE_READER)."""
     if not reader_dist_present():
-        die("no cached reader dist to stage — pull it under Management → Software first")
+        die("no cached reader dist to stage — pull it under Sandboxes → Software first")
     _stage_dist_tree(supervisor, READER_DIST_DIR, READER_DIST_MOUNT, "reader")
     if deploy_local:
         _deploy_supervisor_reader(supervisor)
@@ -9494,7 +9494,7 @@ def _stage_node_dist(supervisor: str, *, deploy_local: bool = False) -> None:
     supervisor's OWN ~/.local (the dind flavors: sandbox-dind + research). Unlike the
     editor/reader there is no server to launch and no deploy script — just the cp."""
     if not node_dist_present():
-        die("no cached node seed to stage — pull it under Management → Software first")
+        die("no cached node seed to stage — pull it under Sandboxes → Software first")
     _stage_dist_tree(supervisor, NODE_DIST_DIR, NODE_DIST_MOUNT, "node")
     if deploy_local:
         _deploy_node(supervisor)
@@ -9608,7 +9608,7 @@ def rebuild(progress=None) -> None:
 
 def software_status() -> dict:
     """Read-only status of the host's agent/editor dists, the built image fleet,
-    and the effective version pins — the data behind the webui Software panel.
+    and the effective version pins — the data behind the webui Sandboxes → Software tab.
     Crash-proof by construction: every filesystem/subprocess touch is guarded and
     degrades rather than raising, so it never escapes the broker dispatch as an
     unhandled exception. No writes, no network (the upstream-freshness check is a
@@ -9736,7 +9736,7 @@ def software_status() -> dict:
     ]
 
     # `base` is the shipped value (None for an override-only key); `resettable`
-    # is what the Software page's "Use repo version" button keys on, from the
+    # is what the Sandboxes → Software tab's "Use repo version" button keys on, from the
     # same predicate PinResetRequest validates with.
     pins = [{"key": k, "value": effective[k], "override": k in override,
              "base": base.get(k),
@@ -10643,7 +10643,7 @@ def _update_docker_substrate(req: "UpdateRequest", cfg: "Config",  # type: ignor
         die("`update` on the docker substrate only supports enabling or disabling "
             "the editor (code-server); destroy + recreate for anything else")
     if enable_svcs and not editor_dist_present():
-        die("no editor dist cached — pull it under Management → Software first")
+        die("no editor dist cached — pull it under Sandboxes → Software first")
     base = _read_service_flags(container)
     flags = _compute_service_flags(enable_services, disable_services, base=base)
     progress.step("recreate", "recreating box")
@@ -10777,7 +10777,7 @@ def _live_toggle_editor(project: str, cfg: "Config", container: str,  # type: ig
     inner-image re-staging, no role-MCP/box relaunch)."""
     if enable:
         if not editor_dist_present():
-            die("no editor dist cached — pull it under Management → Software first")
+            die("no editor dist cached — pull it under Sandboxes → Software first")
         progress.step("deploy", "deploying the editor")
         print(f"=== {project}: deploying the editor (live) ===")
         if _editor_dist_staged_in(container):     # common case: staged at create
@@ -10806,7 +10806,7 @@ def _live_toggle_reader(project: str, cfg: "Config", container: str,  # type: ig
     recreate/start honors it (the docker label is immutable on a running container)."""
     if enable:
         if not reader_dist_present():
-            die("no reader dist cached — pull it under Management → Software first")
+            die("no reader dist cached — pull it under Sandboxes → Software first")
         progress.step("deploy", "deploying the reader")
         print(f"=== {project}: deploying the reader (live) ===")
         if _reader_dist_staged_in(container):     # common case: staged at create
@@ -11335,7 +11335,7 @@ def _provision_gitea(progress=None) -> None:
     -> ensure-bootstrap; exists-stopped -> docker start; absent -> pull + docker
     run. Home ROUTER_NETWORK (internet via the gateway for mirror sync); admin
     API on a 127.0.0.1 loopback port only. Stood up DELIBERATELY via
-    `dev_gitea_start` (webui Management -> Infrastructure, or `research dev
+    `dev_gitea_start` (webui Sandboxes -> Infrastructure, or `research dev
     gitea-enable`) — never lazily. A stopped-but-enabled gitea is RESUMED by
     _resume_gitea, which never creates; only this function ever CREATES it.
 
@@ -11464,7 +11464,7 @@ def _resume_gitea(*, require: bool, tries: int | None = None) -> bool:
             with _gitea_lock(exclusive=False, blocking=False):
                 if not container_running(gitea.GITEA_CONTAINER):
                     if not container_exists(gitea.GITEA_CONTAINER):
-                        die("Gitea isn't enabled — enable it in Management → "
+                        die("Gitea isn't enabled — enable it in Sandboxes → "
                             "Infrastructure first")
                     run_check(["docker", "start", gitea.GITEA_CONTAINER])
                     _wait_for_gitea(host_port, tries=tries)
@@ -11478,7 +11478,7 @@ def _resume_gitea(*, require: bool, tries: int | None = None) -> bool:
         # An uncommitted record was refused at the top. With a committed one
         # (or none) a missing container is what Enable fixes — the page offers
         # exactly that button, so name it.
-        die("Gitea isn't enabled — enable it in Management → Infrastructure first")
+        die("Gitea isn't enabled — enable it in Sandboxes → Infrastructure first")
     return False
 
 
@@ -14419,7 +14419,7 @@ WEB_SET_TIMEOUT_S = _WEB_READY_WAIT_S + _WEB_PROBE_TIMEOUT_S + _WEB_SET_MARGIN_S
 
 _WEB_IMAGE_TOO_OLD_MSG = (
     "the project image predates workflows that start their own app; rebuild "
-    "the images under Management → Software → Rebuild all, then create the "
+    "the images under Sandboxes → Software → Rebuild all, then create the "
     "project again")
 _WEB_SETUP_FAILED_LINE = (
     "The project's web app could not be installed, so it stays stopped; stop "
@@ -14963,7 +14963,7 @@ def _gate_box_history(req: "BoxAddRequest", catalog: dict, container: str,
     if not gitea.bootstrap_present():
         raise ValidationError(
             "this box keeps history on Gitea, but Gitea is not enabled on this "
-            "host yet — enable it from the Management page, then retry")
+            "host yet — enable it from the Sandboxes page, then retry")
     if not req.name:
         raise ValidationError(
             "a box keeping history on Gitea needs a name (its Gitea account "
@@ -15231,7 +15231,7 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     if req.fetch and not gitea.bootstrap_present():
         raise ValidationError(
             "this box requests rs-fetch, but the dev lane (Gitea) is not "
-            "enabled on this host yet — enable Gitea from the Management "
+            "enabled on this host yet — enable Gitea from the Sandboxes "
             "page, then retry")
     # Node gate: a node box copies the project's staged node seed at boot. Both
     # probes run ONLY for a node preset (no other box add gains a docker exec).
@@ -15242,7 +15242,7 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     if needs_node and not node_staged and not node_dist_present():
         raise ValidationError(
             "this box type needs node, but node is not installed on this host "
-            "yet — pull node under Management → Software, then retry")
+            "yet — pull node under Sandboxes → Software, then retry")
     # Fields gate (after the dev gate, so dev+fields gets the dev refusal):
     # provided names must EQUAL the preset's declared set — every declared
     # field is required, undeclared ones refused. Messages name KEYS only;
@@ -15301,8 +15301,8 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         else:
             raise ValidationError(
                 "this box requests the editor, but the editor software is not "
-                "installed on this host yet — install it from the Software "
-                "page, then retry")
+                "installed on this host yet — install it from Sandboxes → "
+                "Software, then retry")
     # Node seed on demand (the editor-dist precedent above): a project created or
     # last restarted before node was pulled has no seed staged. Stage it only
     # when absent — a re-stage would cost a full stream (see _node_dist_staged_in).
@@ -16052,7 +16052,7 @@ def port_add(req: "PortAddRequest", _progress=None) -> PortAddResult:  # type: i
                         continue                      # identical re-claim
                     die(f"host port {max(span_lo, e_lo)} is already claimed "
                         f"by project {pdir.name!r} — remove that claim from "
-                        f"its Ports section (or Management → Pass-through "
+                        f"its Ports section (or Sandboxes → Infrastructure → Pass-through "
                         f"ports) first")
         ports = [e for e in read_exported_ports(ws)
                  if not (e.get("passthrough")
@@ -17061,7 +17061,7 @@ def dev_repo_status(req: "DevRepoStatusRequest", _progress=None) -> DevRepoStatu
 
 
 def dev_gitea_start(_req: "DevGiteaStartRequest", progress=None) -> DevGiteaStartResult:  # type: ignore[name-defined]
-    """DELIBERATELY provision/enable gitea — the Management page's Infrastructure
+    """DELIBERATELY provision/enable gitea — the Sandboxes page's Infrastructure tab
     "Enable Gitea" button (and `research dev gitea-enable`). The SOLE stand-up
     path (deliberate-create / auto-resume model): it CREATES gitea from nothing
     (pull + run + bootstrap) or resumes a stopped one. Runs as a tailed op
@@ -17717,7 +17717,7 @@ GITEA_UPGRADE_READY_TRIES = GITEA_BOOT_WAIT_TRIES * 10
 
 
 GITEA_INTERRUPTED_MSG = ("an earlier Gitea upgrade was interrupted — use Recover "
-                         "in Management → Infrastructure first")
+                         "in Sandboxes → Infrastructure first")
 
 
 def _gitea_interrupted_msg(rec: dict) -> str:
@@ -17725,7 +17725,7 @@ def _gitea_interrupted_msg(rec: dict) -> str:
     or going back cut off."""
     if rec.get("phase") == "rolling-back":
         return (f"going back to Gitea {rec['from_version']} was interrupted — "
-                f"use Recover in Management → Infrastructure first")
+                f"use Recover in Sandboxes → Infrastructure first")
     return GITEA_INTERRUPTED_MSG
 
 
@@ -17966,7 +17966,7 @@ def gitea_upgrade_refusal() -> str | None:
     if rec is not None and rec["phase"] != "committed":
         return _gitea_interrupted_msg(rec)
     if not container_exists(gitea.GITEA_CONTAINER):
-        return "Gitea isn't enabled — enable it in Management → Infrastructure first"
+        return "Gitea isn't enabled — enable it in Sandboxes → Infrastructure first"
     if rec is not None:
         return (f"the previous version ({rec['from_version']}) is still kept "
                 f"— discard it first")
@@ -18299,7 +18299,7 @@ def dev_gitea_upgrade(req: "DevGiteaUpgradeRequest", progress=None) -> DevGiteaU
                  else "Gitea is down")
         raise HarnessError(f"Gitea {to_version} did not start, and {from_version} "
                            f"could not be started again — {state}; use "
-                           f"Recover in Management → Infrastructure")
+                           f"Recover in Sandboxes → Infrastructure")
     return DevGiteaUpgradeResult(from_version=from_version, to_version=to_version,
                                  backup=str(backup))
 
@@ -18438,7 +18438,7 @@ def gitea_rollback_refusal() -> str | None:
     if r.returncode != 0 or new not in (r.stdout or "").split():
         return unsafe
     if not container_exists(gitea.GITEA_CONTAINER):
-        return "Gitea isn't enabled — enable it in Management → Infrastructure first"
+        return "Gitea isn't enabled — enable it in Sandboxes → Infrastructure first"
     if _container_data_volume(gitea.GITEA_CONTAINER) != new:
         return (f"the Gitea container is not the {to} the upgrade started, so "
                 f"it is not replaced; nothing was changed")
@@ -18515,7 +18515,7 @@ def dev_gitea_rollback(_req: "DevGiteaRollbackRequest",
                                f"changed and {to} is still running")
         if was_running:
             raise HarnessError(f"Gitea {frm} could not be put back, and {to} "
-                               f"stopped — use Enable in Management → "
+                               f"stopped — use Enable in Sandboxes → "
                                f"Infrastructure to start it again")
         raise HarnessError(f"Gitea {frm} could not be put back; nothing was "
                            f"changed ({to} is stopped)")
@@ -18523,14 +18523,14 @@ def dev_gitea_rollback(_req: "DevGiteaRollbackRequest",
         keep = f"the data written on {to} is kept"
         if running:
             raise HarnessError(f"Gitea {frm} is not back ({keep}) — use "
-                               f"Recover in Management → Infrastructure")
+                               f"Recover in Sandboxes → Infrastructure")
         raise HarnessError(f"Gitea {frm} could not be started — Gitea is down "
-                           f"({keep}); use Recover in Management → Infrastructure")
+                           f"({keep}); use Recover in Sandboxes → Infrastructure")
     return DevGiteaRollbackResult(version=frm, left_version=to)
 
 
 def dev_passwd(req: "DevPasswdRequest", progress=None) -> DevPasswdResult:  # type: ignore[name-defined]
-    """Set the sandbox-admin gitea password (the Management → Infrastructure
+    """Set the sandbox-admin gitea password (the Sandboxes → Infrastructure
     dialog + `research dev passwd`). Requires an ENABLED gitea — resumes a
     stopped one, never creates (the not-enabled die() carries the enable remedy
     and no secret). The password rides `docker exec` argv into our own gitea
@@ -18591,7 +18591,7 @@ def dev_box_provision(req: "DevBoxProvisionRequest", progress=None) -> dict:  # 
 
 def dev_project_provision(req: "DevProjectProvisionRequest", progress=None) -> dict:  # type: ignore[name-defined]
     """Webui dev-workflow create: mirror + project-create as ONE action (the
-    Workflows page's dev card takes a GitHub URL + optional per-repo PAT). A
+    New Project dev card takes a GitHub URL + optional per-repo PAT). A
     COMPOSITION of the shipped verbs so every gate and secret discipline is
     reused, not re-derived: dev_repo_add (mirror-only; resumes gitea
     require=True — the deliberate-create model; resumable migrate) → create()
@@ -18956,7 +18956,7 @@ def review_pr(req: "ReviewRequest", progress=None) -> dict:  # type: ignore[name
             "project terminal, logged into the dedicated reviewer account) "
             "and store it with `research dev reviewer-token` (one-time setup)")
     if not dist_present(DEFAULT_AGENT):
-        die(f"no cached {DEFAULT_AGENT} dist — pull it under Management → Software first")
+        die(f"no cached {DEFAULT_AGENT} dist — pull it under Sandboxes → Software first")
     # The reviewer's (model, effort) — the fifth model_catalog type, resolved
     # LIVE per run (never marker-frozen: this runs in a fresh detached child
     # or a fresh CLI process, so a Management-page default change applies to

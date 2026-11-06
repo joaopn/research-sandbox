@@ -2131,8 +2131,8 @@ def cmd_create(args: argparse.Namespace) -> None:
     if editor and not os.path.isfile(
             os.path.join(EDITOR_DIST_MOUNT, ".local/bin/code-server")):
         die("this box requests the editor, but the editor files are not "
-            "staged in this project — install the editor from the Software "
-            "page if it is missing on this host, then stop and start the "
+            "staged in this project — install the editor from Sandboxes → "
+            "Software if it is missing on this host, then stop and start the "
             "project to stage it, and retry")
     # A node box copies the project's staged node seed at boot. Refuse before any
     # state write when it is missing (the host box add stages it on demand, so
@@ -2141,7 +2141,7 @@ def cmd_create(args: argparse.Namespace) -> None:
     node = bool(preset.get("node"))
     if node and not os.path.isfile(NODE_DIST_BIN):
         die("this box type needs node, but node is not staged in this project "
-            "— pull node under Management → Software, then retry")
+            "— pull node under Sandboxes → Software, then retry")
     dev_subnet = ""
     if is_dev:
         # Dev boxes live on their own pinned /24, NOT the rs-inner pool: no

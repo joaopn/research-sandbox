@@ -353,7 +353,7 @@ def _verb_models(_args: dict, _progress=None) -> dict:
 def _verb_model_default_set(args: dict, _progress=None) -> dict:
     """Write (or clear) one container type's default (model, effort) pair in
     the operator's untracked model-defaults override — the write half of
-    `models` (the Management → Infrastructure → Reviewer control). Token-gated
+    `models` (the Sandboxes → Infrastructure → Reviewer control). Token-gated
     (NOT in OPEN_VERBS); inline is fine — a sub-ms validated file write, no
     docker, no network. The request layer + verb map every catalog/OS error
     onto ValidationError, so nothing but the three dispatch-caught exceptions
@@ -365,7 +365,7 @@ def _verb_model_default_set(args: dict, _progress=None) -> dict:
 
 def _verb_pin_reset(args: dict, _progress=None) -> dict:
     """Remove one key from the untracked versions.local.env override, so the pin
-    reads the tracked versions.env value again (the Software page's "Use repo
+    reads the tracked versions.env value again (the Sandboxes → Software tab's "Use repo
     version" button). Token-gated (NOT in OPEN_VERBS), not step-up (reversible
     config). Inline is fine: a sub-ms file edit, no docker, no network. Every
     file error maps to ValidationError in rscore, so nothing but the three
@@ -436,7 +436,7 @@ def _verb_workflows(_args: dict, _progress=None) -> dict:
 def _verb_software_status(_args: dict, _progress=None) -> dict:
     """Read-only status of the host's agent/editor dists, the built image fleet,
     and the effective version pins (base + untracked override) — the data behind
-    the webui Software panel. Token-gated (NOT in OPEN_VERBS) — deny-by-default,
+    the webui Sandboxes → Software tab. Token-gated (NOT in OPEN_VERBS) — deny-by-default,
     like every other non-`list`/`status` verb. `software_status` is crash-proof by
     construction (guarded reads, degrade-not-raise); the belt-and-braces wrap maps
     any residual exception to a clean ValidationError envelope rather than letting
@@ -984,7 +984,7 @@ DEV_BOX_WEBUI_FIELDS = frozenset({"project", "url", "pat", "name", "agent",
                                   # ⇒ off, the dev type's default) — like the
                                   # plain box window's field.
                                   "share"})
-# The dev-project provision boundary (the Workflows page's dev card): minimal
+# The dev-project provision boundary (the New Project box's dev card): minimal
 # and deliberate. Adding a field here is a boundary edit — never open a
 # path/host-shaped one. `workflow` threads the manifest the dialog was opened
 # from (a BYO dev-flagged workflow creates what ITS manifest says); fail-closed
@@ -1031,11 +1031,11 @@ DEV_PASSWD_WEBUI_FIELDS = frozenset({"password"})
 # can steer where the artifact is written.
 DEV_BOARD_EXPORT_WEBUI_FIELDS = frozenset({"passphrase"})
 # Set/clear one container type's model+effort default in the operator's
-# untracked override file (the Management → Infrastructure → Reviewer
+# untracked override file (the Sandboxes → Infrastructure → Reviewer
 # control). Name-shaped catalog tokens + a bool only — nothing host-shaped;
 # the contract is full-pair-or-clear (no partial writes).
 MODEL_DEFAULT_WEBUI_FIELDS = frozenset({"type", "model", "effort", "clear"})
-# Put one version pin back to the shipped value (the Software page's "Use repo
+# Put one version pin back to the shipped value (the Sandboxes → Software tab's "Use repo
 # version" button). One name-shaped token; the request refuses anything that is
 # not a resettable pin of the tracked versions.env.
 PIN_RESET_WEBUI_FIELDS = frozenset({"key"})
@@ -1159,7 +1159,7 @@ def _verb_dev_gitea_start(_args: dict, progress=None) -> dict:
 
 
 def _verb_dev_passwd(args: dict, progress=None) -> dict:
-    # Set the sandbox-admin gitea password (the Management → Infrastructure
+    # Set the sandbox-admin gitea password (the Sandboxes → Infrastructure
     # dialog). Step-up gated (STEP_UP_VERBS): a stolen session cookie must not
     # suffice to mint a gitea-admin credential. The password is the single
     # allow-listed field; a change-password failure raises HarnessError so the
@@ -1760,7 +1760,7 @@ def run_review(op_id: str, args_json: str) -> None:
 # Dev provision lane (STAGE_DEV_GITEA webui-first B; dev-project create added)
 #
 # The review lane's parallel sibling for the URL-driven dev surfaces: the box
-# window's dev box (mirror+box-create) AND the Workflows page's dev project
+# window's dev box (mirror+box-create) AND the New Project box's dev project
 # (mirror+project-create), each one detached child (`broker __run-dev-box`).
 # A GitHub migrate can block ~120s and must never sit on the serial accept
 # thread, so both verbs live in their OWN table — absent from VERBS (the
@@ -2502,7 +2502,7 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
         if not rscore.dist_present(rscore.DEFAULT_AGENT):
             return _audited(principal, "validation",
                             _err("validation",
-                                 "no cached agent dist — pull it under Management → Software first"))
+                                 "no cached agent dist — pull it under Sandboxes → Software first"))
         if spawn_review is None:            # tests: gate + validate, never spawn
             return _audited(principal, "ok",
                             {"ok": True, "result": {"op_id": op_id, "started": True}})
@@ -2560,7 +2560,7 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
             return _audited(principal, "validation",
                             _err("validation",
                                  "Gitea isn't enabled — enable it under "
-                                 "Management → Infrastructure first"))
+                                 "Sandboxes → Infrastructure first"))
         # A dev box lands in a running project's container; one that is being
         # started, stopped or recreated right now would lose it mid-way.
         if verb == "dev_box_provision" and _project_in_flight(safe.get("project")):

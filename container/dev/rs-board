@@ -221,7 +221,7 @@ def check_version(g):
         raise RuntimeError(f"could not parse the Gitea version {text!r}; refusing to guess whether it has project boards")
     if int(m.group(1)) < BOARDS_MIN_MAJOR:
         raise RuntimeError(f"the shared Gitea is {text}; project boards need Gitea {BOARDS_MIN_MAJOR}.x or newer — "
-                           f"upgrade it from Management → Infrastructure → Upgrade (or `research dev gitea-upgrade` on the host)")
+                           f"upgrade it from Sandboxes → Infrastructure → Upgrade (or `research dev gitea-upgrade` on the host)")
     return text
 
 

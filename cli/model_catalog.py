@@ -321,7 +321,7 @@ def payload() -> dict:
     has no access to `models/` — it is outside the scoped ./webui build context —
     so this is its only source, and it pre-selects its controls from `defaults`).
     `overridden` lists the types the operator's untracked override file names, so
-    the Management page can badge them and offer reset-to-base."""
+    the Sandboxes page can badge them and offer reset-to-base."""
     catalog = load_catalog()
     return {"efforts": catalog["efforts"],
             "models": catalog["models"],

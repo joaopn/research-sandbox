@@ -561,6 +561,37 @@ html.mobile .project-rail .rail-separator { cursor: default; }
     border-radius: 4px;
     background: var(--bg-active);
 }
+/* Host pages (Development, Sandboxes) own the strip while open: .host-mode
+   hides every project-strip child except the Projects toggle and the page's
+   own .host-strip (chip + section tabs). The rule is important-flagged
+   because the column groups carry inline geometry; it is the only such rule
+   in this file, so it cannot win a specificity fight it was not meant to. The project's
+   strip is only hidden — leaving the page shows it again as it was. */
+.service-tabs.host-mode > :not(.projects-tab):not(.host-strip) { display: none !important; }
+.service-tabs .host-strip {
+    display: flex;
+    align-items: stretch;
+    flex-shrink: 0;
+}
+/* The page's sections, styled as tabs. Deliberately NOT .tab (the service-tab
+   code keys on .tab: global un-highlight, drag, the mobile whitelist), so the
+   three .tab rules are mirrored here. */
+.service-tabs .host-tab {
+    display: flex;
+    align-items: center;
+    padding: 0 14px;
+    background: var(--bg-card);
+    color: var(--fg-base);
+    border-right: 1px solid var(--border);
+    cursor: pointer;
+    font-size: 13px;
+    white-space: nowrap;
+}
+.service-tabs .host-tab.active {
+    background: var(--bg-active);
+    box-shadow: 0 -2px 0 var(--fg-accent) inset;
+}
+.service-tabs .host-tab:hover:not(.active) { background: var(--border); }
 /* Thin vertical rule between the Visual (editors / iframe surfaces) and CLI
    (terminals) tab groups. Rendered by renderServiceTabs only when both
    groups are non-empty, so it never orphans. */
@@ -1404,13 +1435,6 @@ html.mobile .project-rail .rail-separator { cursor: default; }
 .sw-fleet-line { font-size: 13px; color: var(--fg-accent); font-style: italic; }
 .sw-fleet-line .sw-status { display: block; margin: -6px 0 14px; }
 .sw-fleet-line .sw-status:empty { display: none; }
-/* The Software section folded into the Settings page — a divider above it and a
-   lightweight not-logged-in note. */
-.sw-embed { margin-top: 28px; padding-top: 20px; border-top: 1px solid var(--border); }
-.sw-embed-note {
-    display: flex; align-items: center; gap: 12px;
-    color: var(--fg-muted); font-size: 13px;
-}
 /* Build-lane dialog: a scrolling raw build-log tail (the authenticated stream of
    the host-only full log) + a coarse phase line. */
 .sw-build-card { width: 640px; max-width: 100%; }
@@ -1810,18 +1834,18 @@ html.mobile .project-config-box .config-folders-input { font-size: 16px; }
 }
 
 /* Development host page (STAGE_DEV_GITEA S3): Gitea iframe tab + the Fetch
-   copy list, plus the Management Infrastructure section. Every selector is
+   copy list, plus the Sandboxes → Infrastructure section. Every selector is
    self-scoped under dev-* / mgmt-infra (no bare input/label rules — the
    .field-bleed discipline). */
-.dev-tab-btn.active {
-    color: var(--fg-accent);
-    box-shadow: 0 -2px 0 var(--fg-accent) inset;
-}
 .dev-body { display: flex; flex-direction: column; gap: 10px; }
 .dev-gitea-frame {
     width: 100%;
-    /* Fill the host page under its header; gitea manages its own scrolling. */
-    height: calc(100dvh - 130px);
+    /* Fill the page below the top strip (36px + its 1px border) and the
+       host view's 16px top/bottom padding — the page has no header of its
+       own (its sections are strip tabs); gitea manages its own scrolling.
+       LOCKSTEP with .service-tabs' height and .management-view's padding;
+       the phone twin is under html.mobile. */
+    height: calc(100dvh - 69px);
     border: 1px solid var(--border);
     border-radius: 6px;
     background: var(--bg-card);
@@ -2188,7 +2212,11 @@ html.mobile .dashboard.mobile-projects .service-tabs .active-project {
    column tab groups or splitters ever exist here. + Add box and the per-box
    ✕ are SHOWN (dind box lifecycle from the phone; sheet-styled dialogs). */
 html.mobile .service-tabs { height: 52px; }
-html.mobile .service-tabs .tab { font-size: 14px; }
+html.mobile .service-tabs .tab,
+html.mobile .service-tabs .host-tab { font-size: 14px; }
+/* The Gitea frame under the 52px phone strip (+1px border) and the phone's
+   12px view padding — the desktop rule's twin. */
+html.mobile .dev-gitea-frame { height: calc(100dvh - 77px); }
 html.mobile .service-tabs .projects-tab,
 html.mobile .service-tabs .tab[data-surface="visual"]:not([data-service="reader"]):not([data-service^="git-"]):not([data-service^="fetch-"]):not([data-service^="pass-"]),
 html.mobile .service-tabs .refresh-tab-btn,
