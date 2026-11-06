@@ -5960,21 +5960,28 @@ def read_env_value(key: str) -> str:
 
 
 def update_env_key(key: str, value: str) -> None:
-    """Set or append KEY=VALUE in .env. Replaces a commented `# KEY=` line
-    in place if present, so .env stays diffable across edits."""
+    """Set or append KEY=VALUE in .env. Every active `KEY=` line is rewritten
+    (an active line below a commented template line used to survive, so a
+    healed WEBUI_BIND=0.0.0.0 stayed in the file — B162); with none, a
+    commented `# KEY=` line is replaced in place, so .env stays diffable
+    across edits; with neither, the line is appended."""
     env_file = SCRIPT_DIR / ".env"
     if not env_file.exists():
         env_file.write_text(f"{key}={value}\n")
         return
     lines = env_file.read_text().splitlines()
-    found = False
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith(f"{key}=") or stripped.startswith(f"# {key}="):
-            lines[i] = f"{key}={value}"
-            found = True
-            break
-    if not found:
+    def _key_of(text: str) -> str | None:
+        return text.partition("=")[0].strip() if "=" in text else None
+    # Matched the way read_env_value reads them (`KEY = v` included), so the
+    # line that is read is always the line that is rewritten.
+    active = [i for i, line in enumerate(lines)
+              if not line.strip().startswith("#") and _key_of(line.strip()) == key]
+    commented = [i for i, line in enumerate(lines)
+                 if line.strip().startswith("#")
+                 and _key_of(line.strip().lstrip("#").strip()) == key]
+    for i in active or commented[:1]:
+        lines[i] = f"{key}={value}"
+    if not active and not commented:
         lines.append(f"{key}={value}")
     env_file.write_text("\n".join(lines) + "\n")
 
@@ -6213,8 +6220,10 @@ def _resume_webui() -> bool:
     A webui created from an image that predates the narrowed listen address
     (B156) is never brought back: stopped, it stays down; still running, it is
     stopped — both with a warning naming `research webui start`, which says so
-    when the stop itself failed (`research start` then exits non-zero). Returns
-    False in those cases and when a start failed, True otherwise."""
+    when the stop itself failed (`research start` then exits non-zero). The
+    same holds for a webui whose container publishes on every address, or
+    whose published address cannot be read (B162; fail closed). Returns False
+    in those cases and when a start failed, True otherwise."""
     # Container-scoped: bare `docker inspect` would match the rs-webui IMAGE and
     # turn a deliberate `research webui stop` into a "could not start" warning on
     # every `research start`.
@@ -6227,7 +6236,18 @@ def _resume_webui() -> bool:
     current = webui_container_has_listen_contract()
     if container_running(WEBUI_CONTAINER):
         if current:
-            return True
+            # The container's own published address, not .env's: it is what
+            # the running container listens on (B162).
+            state = webui_bind_state()
+            if state == "ok":
+                return True
+            # "absent" right after the container was seen is a failed read:
+            # fail closed, like an unreadable bind
+            state = "wildcard" if state == "wildcard" else "unreadable"
+            stopped = _stop_infra_container(WEBUI_CONTAINER)
+            print(_webui_bind_warning(state, "stopped it" if stopped
+                                      else "COULD NOT stop it"), file=sys.stderr)
+            return False
         # Still up from before the upgrade, reachable from every project: stop
         # it (fail closed — the UI is down until it is rebuilt) and say why,
         # truthfully: the stop helper reports its own failure.
@@ -6243,11 +6263,31 @@ def _resume_webui() -> bool:
               f"the router network only; not resuming it — run `research webui "
               f"start`, which rebuilds or recreates it", file=sys.stderr)
         return False
+    # Read before the start: a `docker start` re-binds what the container
+    # was created with, whatever .env says now.
+    state = webui_bind_state()
+    if state != "ok":
+        state = "wildcard" if state == "wildcard" else "unreadable"
+        print(_webui_bind_warning(state, "not resuming it"), file=sys.stderr)
+        return False
     if not _start_infra_container(WEBUI_CONTAINER):
         print(f"warning: run `research webui start` to rebind {WEBUI_CONTAINER}",
               file=sys.stderr)
         return False
     return True
+
+
+def _webui_bind_warning(state: str, outcome: str) -> str:
+    """`research start`'s warning for a webui it will not keep up (B162):
+    `state` is webui_bind_state()'s "wildcard" or "unreadable", `outcome`
+    what was done about it."""
+    if state == "wildcard":
+        return (f"warning: {WEBUI_CONTAINER} is published on every address; "
+                f"{outcome} — {WEBUI_WILDCARD_REFUSAL}")
+    return (f"warning: could not read the address {WEBUI_CONTAINER} is published "
+            f"on, so RS does not keep it up; {outcome} — run `research webui "
+            f"start` (or `research webui start --bind <address>`), which "
+            f"recreates it on the configured address")
 
 
 def volume_exists(name: str) -> bool:
@@ -20191,6 +20231,120 @@ def webui_container_user() -> str | None:
     return (r.stdout or "").strip()
 
 
+# A webui published on every host address is reachable from every project at
+# its own bridge gateway (Docker's port forwarding DNATs any local address onto
+# the webui's router-network listener), so no path brings one up (B162). One
+# sentence, shared by `research webui start`'s refusal and `research start`'s
+# warning; the remedy names --bind because a plain `webui start` over a
+# wildcard .env refuses too.
+WEBUI_WILDCARD_REFUSAL = (
+    "the webui must not listen on every address, because every project could "
+    "then reach it at its own bridge gateway; run `research webui start --bind "
+    "<address>` with 127.0.0.1, this host's LAN address or its tailnet address "
+    "(it rewrites WEBUI_BIND in .env)")
+
+# webui_container_bind()'s answer when the container exists but the address it
+# publishes 7777 on cannot be read: distinct from None (no container) and from
+# "" (docker's spelling of every address).
+WEBUI_BIND_UNREADABLE = object()
+
+
+def _parse_webui_address(value: str):
+    """`value` as one IP address (an IPv6 literal may be bracketed;
+    `localhost` reads as 127.0.0.1), or None when it is not one."""
+    v = (value or "").strip()
+    if v == "localhost":
+        v = "127.0.0.1"
+    if v.startswith("[") and v.endswith("]"):
+        v = v[1:-1]
+    try:
+        return ipaddress.ip_address(v)
+    except ValueError:
+        return None
+
+
+def webui_bind_literal(value: str) -> str:
+    """The bind as compose must receive it: a published host address is an IP
+    literal only (docker rejects `localhost` there), so `localhost` becomes
+    127.0.0.1; anything else is returned stripped. Call after
+    webui_bind_address has accepted the value."""
+    v = (value or "").strip()
+    return "127.0.0.1" if v == "localhost" else v
+
+
+def _is_wildcard_address(addr) -> bool:
+    """0.0.0.0, ::, and ::ffff:0.0.0.0 in every spelling (ipv4_mapped exists
+    on IPv6 addresses only; Python 3.9 does not fold it into is_unspecified)."""
+    if addr.is_unspecified:
+        return True
+    mapped = getattr(addr, "ipv4_mapped", None)
+    return mapped is not None and mapped.is_unspecified
+
+
+def webui_bind_address(value: str):
+    """Validate the webui bind in effect (`--bind`, else .env's WEBUI_BIND) and
+    return it as an address. Raises ValidationError when it is not one IP
+    address, or when it is every address (B162) — callers check it before they
+    write .env or remove anything."""
+    addr = _parse_webui_address(value)
+    if addr is None:
+        raise ValidationError(
+            f"WEBUI_BIND must be one IP address (got {value!r}); set it in .env, or "
+            f"pass --bind <address>, to 127.0.0.1, this host's LAN address or its "
+            f"tailnet address")
+    if _is_wildcard_address(addr):
+        raise ValidationError(f"refusing WEBUI_BIND={value}: {WEBUI_WILDCARD_REFUSAL}")
+    return addr
+
+
+def webui_published_address(host_ip):
+    """A container HostIp (webui_container_bind's string answer) as an address:
+    "" is docker's every-address, so it reads as 0.0.0.0. None for anything that
+    does not parse (and for the unreadable sentinel)."""
+    if not isinstance(host_ip, str):
+        return None
+    if host_ip == "":
+        return ipaddress.ip_address("0.0.0.0")
+    return _parse_webui_address(host_ip)
+
+
+def webui_container_bind():
+    """The host address the existing webui CONTAINER publishes its UI port on,
+    read from the container's own port bindings (they survive a stop, and are
+    what the container will bind again on `docker start` — .env may have
+    changed since). One key suffices: compose publishes the UI port, the origin
+    range and the pass-through block from the one WEBUI_BIND.
+
+    None: no webui container (the container-scoped inspect is itself the
+    presence read). WEBUI_BIND_UNREADABLE: the container exists but carries no
+    readable binding for 7777/tcp. Otherwise the HostIp string, "" meaning
+    every address."""
+    r = run(["docker", "container", "inspect", WEBUI_CONTAINER,
+             "-f", "{{json .HostConfig.PortBindings}}"], capture_output=True)
+    if r.returncode != 0:
+        return None
+    try:
+        bindings = json.loads(r.stdout or "null")
+        host_ip = bindings["7777/tcp"][0]["HostIp"]
+    except (json.JSONDecodeError, TypeError, KeyError, IndexError):
+        return WEBUI_BIND_UNREADABLE
+    return host_ip if isinstance(host_ip, str) else WEBUI_BIND_UNREADABLE
+
+
+def webui_bind_state() -> str:
+    """"absent" (no webui container), "ok" (published on one address),
+    "wildcard" (published on every address, B162) or "unreadable" (the
+    container's binding cannot be read — treated like a wildcard: never
+    resumed, stopped when running)."""
+    host_ip = webui_container_bind()
+    if host_ip is None:
+        return "absent"
+    addr = webui_published_address(host_ip)
+    if addr is None:
+        return "unreadable"
+    return "wildcard" if _is_wildcard_address(addr) else "ok"
+
+
 def webui_compose_env(bind: str, port: str, listen_subnet: str,
                       broker_run_dir: Path) -> dict[str, str]:
     """Every variable the webui's compose service takes from the caller, so
@@ -20236,8 +20390,14 @@ def _webui_recreate_in_place(broker_run_dir: Path) -> None:
     the router network's subnet the webui binds inside (B156), the port
     ranges, the operator's uid/gid and the broker run dir), and gives the
     TLS/state volumes to the operator's uid before `up` (the cert staging
-    writes them as 1000). Every refusal comes before anything is touched."""
+    writes them as 1000). Every refusal comes before anything is touched,
+    the bind first: a wildcard or non-address WEBUI_BIND would bring the
+    webui back on every address (B162)."""
     bind = read_env_value("WEBUI_BIND") or "127.0.0.1"
+    try:
+        webui_bind_address(bind)
+    except ValidationError as e:
+        die(str(e))
     port = read_env_value("WEBUI_PORT") or "7777"
     if not webui_image_has_listen_contract():
         # recreating an older image would reopen the webui to every project
@@ -20246,7 +20406,7 @@ def _webui_recreate_in_place(broker_run_dir: Path) -> None:
             "`research webui start`, which rebuilds it and picks up the staged "
             "certificate")
     try:
-        env = webui_compose_env(bind, port, webui_listen_subnet(),
+        env = webui_compose_env(webui_bind_literal(bind), port, webui_listen_subnet(),
                                 broker_run_dir)
     except ValidationError as e:
         die(f"{e} — fix WEBUI_PASSTHROUGH_PORT_LO/HI in .env")

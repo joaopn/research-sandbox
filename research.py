@@ -203,6 +203,18 @@ def cmd_start(args: argparse.Namespace) -> None:
             f"on the router network only, so it is reachable from every project, "
             f"and it could not be stopped; run `research webui start`, which "
             f"rebuilds or recreates it")
+    # Same verdict for a webui published on every address (or on an address
+    # that cannot be read) that _resume_webui could not stop (B162): reachable
+    # from every project at its own bridge gateway.
+    if rscore.container_running(WEBUI_CONTAINER):
+        state = rscore.webui_bind_state()
+        if state == "wildcard":
+            die(f"{WEBUI_CONTAINER} is published on every address and could not "
+                f"be stopped; {rscore.WEBUI_WILDCARD_REFUSAL}")
+        if state != "ok":
+            die(f"{WEBUI_CONTAINER} is published on an address that could not be "
+                f"read and could not be stopped; run `research webui start --bind "
+                f"<address>`, which recreates it on one address")
     print("up.")
 
 
@@ -1632,6 +1644,14 @@ def cmd_webui_cert_tailscale() -> None:
     Wrangler webview, …) requires a publicly-trusted cert; Tailscale
     serves this for free on tailnet names with zero per-device CA
     install."""
+    # The in-place recreate below rebuilds the webui from .env, so a wildcard
+    # (or non-address) bind is refused before anything is requested or staged
+    # (B162).
+    bind = read_env_value("WEBUI_BIND") or "127.0.0.1"
+    try:
+        rscore.webui_bind_address(bind)
+    except ValidationError as e:
+        die(str(e))
     if shutil.which("tailscale") is None:
         die("tailscale CLI not on PATH. Install Tailscale first: "
             "https://tailscale.com/download")
@@ -1673,10 +1693,10 @@ def cmd_webui_cert_tailscale() -> None:
         print("recreating webui to pick up new cert...")
         _webui_recreate_in_place(broker.BROKER_RUN_DIR)
 
-    bind = read_env_value("WEBUI_BIND") or "127.0.0.1"
     port = read_env_value("WEBUI_PORT") or "7777"
     print()
-    if bind in ("127.0.0.1", "::1", "localhost"):
+    bind_ip = rscore._parse_webui_address(bind)
+    if bind_ip is not None and bind_ip.is_loopback:
         print(f"  note: WEBUI_BIND={bind} only accepts loopback connections")
         # Never recommend 0.0.0.0 here: a webui published on every address
         # is reachable from every project at its own bridge gateway.
@@ -1691,8 +1711,6 @@ def cmd_webui_cert_tailscale() -> None:
         print(f"  then open https://{fqdn}:{port}/")
         print("  (docs/SECURITY.md lists what a non-loopback bind exposes "
               "and the host rules that narrow it)")
-    elif bind == "0.0.0.0":
-        print(f"  open https://{fqdn}:{port}/ — cert is publicly trusted")
     else:
         print(f"  webui bound to {bind}; open https://{fqdn}:{port}/ to use "
               "the trusted cert")
@@ -1705,14 +1723,14 @@ def _webui_probe_ports(bind: str, ports: list[int]) -> None:
     on `bind` and die() naming every busy one plus the .env remedy. Runs after
     any `docker rm -f` of the old webui (so its own docker-proxy binds don't
     read as squatters) and immediately before `compose up`; docker's own bind
-    at `up` stays the authoritative TOCTOU backstop for the probe→up race."""
-    probe_addr = "" if bind == "0.0.0.0" else bind
+    at `up` stays the authoritative TOCTOU backstop for the probe→up race.
+    `bind` is never every address: `webui start` refuses that first (B162)."""
     busy = []
     for p in ports:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind((probe_addr, p))
+            s.bind((bind, p))
         except OSError:
             busy.append(p)
         finally:
@@ -1771,12 +1789,25 @@ def cmd_webui(args: argparse.Namespace) -> None:
         return
 
     if action == "start":
+        new_bind = getattr(args, "bind", None)
+        # The bind in effect must be one address, never every address (B162):
+        # checked before .env is rewritten or anything is removed, so a refusal
+        # leaves the running webui as it is. `--bind <address>` over a
+        # wildcard .env is the heal: accepted, written, recreated below.
+        try:
+            bind_addr = rscore.webui_bind_address(new_bind or bind)
+        except ValidationError as e:
+            die(str(e))
+        # Compose takes only an IP literal as the published address: an
+        # accepted `localhost` is written and passed on as 127.0.0.1 (the
+        # .env write happens below, with the other .env writes).
+        if new_bind:
+            new_bind = rscore.webui_bind_literal(new_bind)
         # Same floor as `research start`, before anything is removed or
         # rebuilt: a compose below it drops the webui's gateway priority
         # silently and the container would be born with its default route on a
         # project bridge. A refusal here leaves the running webui untouched.
         rscore.check_engine_floor()
-        new_bind = getattr(args, "bind", None)
         new_port = getattr(args, "port", None)
         rebuild = getattr(args, "rebuild", False)
         recreate = False
@@ -1793,6 +1824,15 @@ def cmd_webui(args: argparse.Namespace) -> None:
         if rscore._container_present(WEBUI_CONTAINER) \
                 and rscore.webui_container_subnet() != listen_subnet:
             recreate = True
+        # A container published on another address than the bind in effect —
+        # every address included, or one that cannot be read — is recreated,
+        # so "already running" never keeps a wildcard webui up (B162).
+        # Compared as addresses: `[::1]` in .env is the ::1 docker records.
+        # None means there is no webui container (its own presence read).
+        published = rscore.webui_container_bind()
+        if published is not None \
+                and rscore.webui_published_address(published) != bind_addr:
+            recreate = True
         # A webui running as another uid cannot reach the broker's 0700 run dir
         # (an in-place recreate before this fix ran it as compose's 1000 default).
         # None means there is no webui container, so nothing to heal.
@@ -1803,6 +1843,13 @@ def cmd_webui(args: argparse.Namespace) -> None:
             update_env_key("WEBUI_BIND", new_bind)
             bind = new_bind
             recreate = True
+        elif rscore.webui_bind_literal(bind) != bind:
+            # .env spells the same address in a form compose rejects
+            # (`localhost`): rewrite it; the container is judged above
+            print(f"WEBUI_BIND={bind} in .env rewritten as "
+                  f"{rscore.webui_bind_literal(bind)} (the form docker accepts)")
+            bind = rscore.webui_bind_literal(bind)
+            update_env_key("WEBUI_BIND", bind)
         if new_port and new_port != port:
             update_env_key("WEBUI_PORT", new_port)
             port = new_port
@@ -3141,8 +3188,9 @@ def build_parser() -> argparse.ArgumentParser:
     wus = wu_sub.add_parser("start",
                             help="start the webui (builds image if missing)")
     wus.add_argument("--bind",
-                     help="host IP to bind to (default 127.0.0.1; set to 0.0.0.0 "
-                          "to expose on LAN; updates .env, regenerates TLS cert SAN)")
+                     help="host IP to bind to (default 127.0.0.1; a LAN or tailnet "
+                          "address exposes it beyond this host; never 0.0.0.0; "
+                          "updates .env, regenerates TLS cert SAN)")
     wus.add_argument("--port",
                      help="host port to bind to (default 7777; updates .env). "
                           "Container always listens on 7777 internally")
