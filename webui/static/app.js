@@ -426,7 +426,7 @@ const state = {
                              // unlock, cleared on lock, NEVER persisted)
     vault: null,             // { version, projects, settings } | null
     activeProject: null,     // string | null
-    hostPage: null,          // "development" | "sandboxes" | "workflows" | "settings" | null
+    hostPage: null,          // "development" | "sandboxes" | null
     explainIndex: null,      // string[] of workflows with a rendered Explain doc (/static/explain/index.json); null = unfetched
     modelCatalog: null,      // { efforts, models, defaults, types } from /broker/models; null = unfetched. The webui image has no `models/` (it sits outside the ./webui build context), so this relay is the only source — and every picker pre-selects from its `defaults`, the same ones the verbs fall back to, so browser and CLI cannot diverge.
     activeService: null,     // string | null
@@ -955,6 +955,7 @@ async function renderDashboard(opts = {}) {
     // highlighted entry from state.hostPage. A stale value would also make the
     // next tap on that entry hit the toggle-closed branch and look dead.
     state.hostPage = null;
+    closeFloatBox();   // clearBody would drop its markup but leave its listeners
     clearBody();
     await fetchServiceRegistry();
 
@@ -1418,7 +1419,7 @@ function makeProjectRail() {
     // bookmarks above.
     rail.appendChild(makeBottomNav());
 
-    // Theme + Editor-zoom moved to the Settings page; the footer keeps Lock vault.
+    // Theme + Editor-zoom moved to the Settings box; the footer keeps Lock vault.
     const footer = el("div", { class: "rail-footer" }, [
         el("button", { class: "lock-btn", onclick: lockVault }, [navIcon("lock"), "Lock vault"]),
     ]);
@@ -1795,9 +1796,11 @@ function mobileLandingService(name, visible, enabled) {
 //    were. .host-tab is deliberately not .tab: the service-tab code (global
 //    un-highlight, drag, the mobile whitelist) keys on .tab and must never
 //    touch these.
-//  * LEGACY pages (Workflows, Settings) keep the old look: the project's tabs
-//    are hidden inline and the project chip stays (on a phone it is the only
-//    drawer opener).
+//  * LEGACY pages keep the old look: the project's tabs are hidden inline and
+//    the project chip stays (on a phone it is the only drawer opener). No page
+//    is legacy today — New Project and Settings are floating boxes over the
+//    page (openFloatBox) — but the mode stays the strip's safe default for a
+//    page with no HOST_PAGES entry.
 //
 // Every render goes into a FRESH .host-body inside the view (renderHostPage):
 // a slow fetch that answers after the operator switched tab or page then
@@ -1826,8 +1829,6 @@ const HOST_PAGES = {
 function hostPageRenderer(page) {
     if (page === "development") return renderDevelopmentInto;
     if (page === "sandboxes") return renderSandboxesInto;
-    if (page === "workflows") return renderWorkflowsInto;
-    if (page === "settings") return renderSettingsInto;
     return null;
 }
 
@@ -1956,7 +1957,78 @@ function openHostPage(page) {
 }
 
 function openSandboxes() { openHostPage("sandboxes"); }
-function openSettings() { openHostPage("settings"); }
+
+// ---- floating boxes: New Project and Settings --------------------------------
+// A panel centred over whatever is open, on a dimmed backdrop; opening one
+// changes no page and no project. Closed by its ✕, Escape, or a click on the
+// dim. The backdrop is .float-backdrop, NOT .modal-backdrop, on purpose: every
+// dialog's one-modal guard (`if (document.querySelector(".modal-backdrop"))`)
+// must still let the create / import dialogs open ABOVE the New Project box,
+// and the background re-renders that wait for "no open dialog" must not wait
+// on a box that can stay open indefinitely. Its z-index sits below the
+// dialogs, the corner notices and Explain, above everything on the page.
+//
+// Escape and the dim click both yield to what is above the box: Escape is
+// ignored while Explain or a dialog is open (they own it), and a press that
+// started while Explain was open only closes Explain. Both listeners are
+// document CAPTURE listeners registered at open, so they run before Explain's
+// (which re-registers at every Explain open) and see Explain still open.
+let floatBox = null;   // {kind, backdrop, onKey, onDown, explainAtDown, downOnBackdrop}
+
+function closeFloatBox() {
+    if (!floatBox) return;
+    const fb = floatBox;
+    floatBox = null;
+    fb.backdrop.remove();
+    document.removeEventListener("keydown", fb.onKey, true);
+    document.removeEventListener("pointerdown", fb.onDown, true);
+}
+
+function openFloatBox(kind, title, render) {
+    closeFloatBox();   // one at a time
+    if (mobileModeActive()) setMobileProjectsView(false);
+    const body = el("div", { class: "float-body" });
+    const close = el("button", { class: "float-close", title: "Close" }, ["✕"]);
+    close.onclick = () => closeFloatBox();
+    const card = el("div", { class: "card float-box float-" + kind }, [
+        el("div", { class: "float-head" }, [el("h2", {}, [title]), close]),
+        body,
+    ]);
+    const backdrop = el("div", { class: "float-backdrop" }, [card]);
+    const fb = { kind, backdrop, explainAtDown: false, downOnBackdrop: false };
+    fb.onDown = (ev) => {
+        fb.explainAtDown = !!explainBox;
+        fb.downOnBackdrop = ev.target === backdrop;
+    };
+    fb.onKey = (ev) => {
+        if (ev.key !== "Escape" || floatBox !== fb) return;
+        if (explainBox || document.querySelector(".modal-backdrop")) return;
+        // A terminal focused behind the Settings box must never see this ESC.
+        ev.stopPropagation();
+        ev.preventDefault();
+        closeFloatBox();
+    };
+    // Close only when the press ALSO began on the dim (a text selection
+    // dragged out of the box ends on it), and not when it closed Explain.
+    backdrop.onclick = (ev) => {
+        if (ev.target !== backdrop || !fb.downOnBackdrop || fb.explainAtDown) return;
+        closeFloatBox();
+    };
+    document.addEventListener("pointerdown", fb.onDown, true);
+    document.addEventListener("keydown", fb.onKey, true);
+    floatBox = fb;
+    document.body.appendChild(backdrop);
+    // The body is the view its content renders into: a sign-in landing or a
+    // dialog's Done re-renders it through its stamp (rerenderView).
+    body.__rsRender = render;
+    render(body);
+    return body;
+}
+
+// New Project: the workflow cards (renderWorkflowsInto).
+function openWorkflows() { openFloatBox("workflows", "New Project", renderWorkflowsInto); }
+// Settings: the interface settings.
+function openSettings() { openFloatBox("settings", "Settings", renderSettingsInto); }
 
 // Clicking the already-open host tab deselects it (temporary-tab feel): drop
 // back to the project that was open before, or the welcome area if none.
@@ -1988,12 +2060,13 @@ function renderSandboxesInto(view) {
     return renderManagementInto(view);
 }
 
-// Settings page: the local UI settings (interface + terminal theme, layout,
-// editor zoom, CLI width + font size — all client-side).
+// Settings (a floating box): the local UI settings (interface + terminal
+// theme, layout, editor zoom, CLI width + font size — all client-side). They
+// apply at once against the page behind the box; the font size goes through
+// the deferred syncTermFontSize like every other site.
 function renderSettingsInto(view) {
     view.innerHTML = "";
     view.appendChild(el("div", { class: "settings-screen" }, [
-        el("h2", { class: "workflows-title" }, ["Settings"]),
         el("div", { class: "field" }, [
             el("label", {}, ["Interface theme"]),
             makeThemeSelector(),
@@ -7134,7 +7207,7 @@ async function mgmtRefreshDialog(view, cfg) {
 
 // ---- create -----------------------------------------------------------------
 // The create form for ONE chosen workflow (the workflows card is the picker —
-// see renderWorkflowsScreen). The Workflows page fetched the catalog and passes the
+// see renderWorkflowsScreen). The New Project box fetched the catalog and passes the
 // selected manifest + the agent enum; this builds the rest of the form. The
 // broker's CREATE_WEBUI_FIELDS allow-list is the real input boundary (it silently
 // DROPS any field not in the set), so every key the payload sends below is in that
@@ -8218,24 +8291,34 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
                 body: JSON.stringify(payload),
             });
         },
-        // On success, surface the new (running) project in the sidebar — JIT-fetch
-        // its creds the same way Attach does, then refresh the rail behind the box.
+        // The New Project box under this dialog has done its job either way:
+        // the dialog has shown the outcome, and a dev create's tail cannot tell
+        // success from failure here. On success, surface the new (running)
+        // project in the sidebar — JIT-fetch its creds the same way Attach does,
+        // then refresh the rail — and the Sandboxes table when it is on screen.
         onDone: async (ok) => {
+            if (floatBox && floatBox.backdrop.contains(view)) closeFloatBox();
             if (!ok) return;
             if (await attachIntoVault(nameI.value.trim())) refreshProjectRail();
+            const table = hostBody();
+            if (table && state.hostPage === "sandboxes" && sandboxesActiveTab === "management"
+                    && !mgmtViewHoldsInput(table)) {
+                renderManagementInto(table);
+            }
         },
         focus: () => nameI.focus(),
     });
 }
 
 // ---- workflows screen (clickable workflow cards) ---------------------------
-// The Workflows page is the create entry point: a grid of workflow cards.
-// Clicking a card opens mgmtCreateDialog prefilled to that workflow. Gated
+// The New Project box is the create entry point: a grid of workflow cards.
+// Clicking a card opens mgmtCreateDialog prefilled to that workflow, ABOVE the
+// box (Cancel comes back to the cards; the box is the dialog's view, so its
+// sign-in landing has somewhere visible to draw). Gated
 // behind the management session (the broker `workflows` verb is token-gated) — a
 // 401 routes through the same login screen, returning here on success. Substrate
 // is never shown (Q7): a card is a workflow, not a containment runtime.
 
-function openWorkflows() { openHostPage("workflows"); }
 
 async function renderWorkflowsInto(view) {
     view.innerHTML = "";
@@ -8342,7 +8425,6 @@ function renderWorkflowsScreen(view, result) {
             el("div", { class: "workflows-grid" }, buckets[key]),
         ]));
     view.appendChild(el("div", { class: "workflows-screen" }, [
-        el("h2", { class: "workflows-title" }, ["New Project"]),
         el("div", { class: "hint workflows-sub" },
            ["Pick a workflow to create a project, or import an existing one."]),
         ...sections,
@@ -9909,6 +9991,7 @@ function formatBytes(n) {
 }
 
 function lockVault() {
+    closeFloatBox();
     if (state.probeTimer) { clearInterval(state.probeTimer); state.probeTimer = null; }
     if (state.servicesTimer) { clearInterval(state.servicesTimer); state.servicesTimer = null; }
     if (state.hostStatsTimer) { clearInterval(state.hostStatsTimer); state.hostStatsTimer = null; }
@@ -10250,7 +10333,11 @@ function openAddProjectModal() {
         try {
             await persistVault();
             backdrop.remove();
+            // The rebuild closes any open page; Import (from the New Project
+            // box) must not change the page underneath, so reopen it.
+            const page = state.hostPage;
             await renderDashboard();
+            if (page) openHostPage(page);
         } catch (e) {
             errEl.textContent = "Save failed: " + e.message;
         }

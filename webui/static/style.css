@@ -964,6 +964,50 @@ html.mobile .project-rail .rail-separator { cursor: default; }
     overflow-y: auto;
 }
 
+/* Floating boxes (New Project, Settings): a panel over whatever page is open.
+   z-index 50 — above everything on the page (the terminal search bar is 10,
+   the splitters and the rail drop caret below that), below the dialogs (100,
+   so the create / import dialogs open on top), the corner notices (90) and
+   Explain (1000). A lighter dim than a dialog's: the page behind stays
+   readable (Settings changes apply to it live). */
+.float-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 6vh 16px 16px;
+    z-index: 50;
+}
+.float-backdrop .float-box {
+    width: min(900px, 100%);
+    max-width: none;
+    min-width: 0;
+    max-height: 88vh;
+    overflow-y: auto;
+    padding: 20px 24px 24px;
+}
+.float-backdrop .float-settings { width: min(560px, 100%); }
+.float-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+.float-head h2 { margin: 0; font-size: 18px; }
+.float-close {
+    background: none;
+    border: none;
+    color: var(--fg-muted);
+    font-size: 16px;
+    line-height: 1;
+    padding: 4px 6px;
+    cursor: pointer;
+}
+.float-close:hover { color: var(--fg-base); }
+
 /* Two-phase op box — phase-2 expected-stage checklist (WEBUI_OPLOG). */
 .op-checklist {
     margin: 0 0 4px;
@@ -1145,7 +1189,6 @@ html.mobile .project-rail .rail-separator { cursor: default; }
 
 /* Workflows screen — clickable workflow cards. */
 .workflows-screen { max-width: 900px; }
-.workflows-title { margin: 0 0 4px; }
 .workflows-sub { margin-bottom: 16px; }
 .workflows-grid {
     display: grid;
@@ -2311,7 +2354,7 @@ html.mobile .project-config-box {
    otherwise leaves the page zoomed after unlocking the vault. */
 html.mobile .field input, html.mobile .field textarea { font-size: 16px; }
 
-/* Host pages (Management / Workflows / Settings) squeezed to one column. */
+/* Host pages and the floating boxes' content squeezed to one column. */
 html.mobile .management-view { padding: 12px; }
 html.mobile .workflows-screen,
 html.mobile .settings-screen,
@@ -2349,6 +2392,13 @@ html.mobile .modal-backdrop .card {
     max-width: 94vw;
     max-height: 90dvh;
     overflow-y: auto;
+}
+/* The floating boxes as phone sheets: full width, from just under the top. */
+html.mobile .float-backdrop { padding: 8px 3vw; }
+html.mobile .float-backdrop .float-box {
+    width: 94vw;
+    max-height: calc(100dvh - 16px);
+    padding: 16px;
 }
 
 /* Pass-through launcher pane (pass-<n> tabs) + the shared claim form + the
