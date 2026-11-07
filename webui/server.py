@@ -724,6 +724,36 @@ async def broker_models_default_handler(request: web.Request) -> web.Response:
     return web.json_response(reply, status=status)
 
 
+async def broker_settings_handler(request: web.Request) -> web.Response:
+    """GET /broker/settings — the host settings (the Sandboxes → Infrastructure
+    → Settings section: the project task cap, its default and bounds, and the
+    problem text when the settings file is damaged). SameSite=Strict cookie is
+    the CSRF defense for this read (mirrors /broker/models)."""
+    status, body = await _relay(request, "host_settings")
+    return web.json_response(body, status=status)
+
+
+async def broker_settings_set_handler(request: web.Request) -> web.Response:
+    """POST /broker/settings {pids_limit} | {reset:true} — save the project
+    task cap or put it back to the default. Origin-checked because it POSTs and
+    writes host state. Args are HAND-PICKED — this handler is the fourth leg of
+    the request-field ↔ HOST_SETTINGS_SET_WEBUI_FIELDS ↔ app.js payload
+    lockstep. An absent key is sent as absent (never a default), so the
+    broker-side request sees exactly what the browser sent and refuses bad
+    shapes with a clean envelope."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    args = {k: body[k] for k in ("pids_limit", "reset") if k in body}
+    status, reply = await _relay(request, "host_settings_set", args)
+    return web.json_response(reply, status=status)
+
+
 async def broker_pin_reset_handler(request: web.Request) -> web.Response:
     """POST /broker/software/pin-reset {key} — put one version pin back to the
     value this installation ships, by removing its key from the untracked
@@ -4080,6 +4110,8 @@ def main() -> None:
     app.router.add_get("/broker/workflows", broker_workflows_handler)
     app.router.add_get("/broker/models", broker_models_handler)
     app.router.add_post("/broker/models/default", broker_models_default_handler)
+    app.router.add_get("/broker/settings", broker_settings_handler)
+    app.router.add_post("/broker/settings", broker_settings_set_handler)
     app.router.add_get("/broker/software", broker_software_handler)
     app.router.add_post("/broker/software/build", broker_build_handler)
     app.router.add_post("/broker/software/refresh-check", broker_refresh_check_handler)

@@ -2218,6 +2218,22 @@ html.mobile .dev-repos-table .dev-repos-opt { display: none; }
 /* Verb-refusal text beside the reviewer model controls (the 200+{ok:false}
    arm of the transport-vs-verb split renders inline, not as a page card). */
 .mgmt-reviewer-err { color: var(--error-fg); font-size: 12px; }
+/* Sandboxes → Infrastructure → Settings (the project task cap). Self-scoped
+   classes only — no bare input rule (the .field-bleed discipline). */
+.mgmt-settings-row { flex-wrap: wrap; }
+.mgmt-settings-num {
+    width: 9em;
+    padding: 4px 8px;
+    background: var(--bg-input);
+    color: var(--fg-base);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 13px;
+}
+.mgmt-settings-num:focus { outline: none; border-color: var(--bg-input-focus-border); }
+.mgmt-settings-note { color: var(--fg-muted); font-size: 12px; }
+.mgmt-settings-hint { color: var(--fg-muted); font-size: 12px; margin: 6px 10px 0; }
 
 /* ===================== Mobile shell (html.mobile) ==========================
    Applied by app.js (mobileModeActive: width <= the 768px breakpoint, or the

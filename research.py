@@ -33,6 +33,7 @@ import datetime
 import ipaddress
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -774,13 +775,44 @@ def cmd_project_stop(args: argparse.Namespace) -> None:
 
 def cmd_project_start(args: argparse.Namespace) -> None:
     req = _build(rscore.StartStopRequest, name=args.name, all=args.all)
-    for r in rscore.start(req):
+    # _call: start reads the host task cap, and a damaged settings file is a
+    # ValidationError — one line, not a traceback.
+    for r in _call(rscore.start, req):
         if r.outcome == "skip:absent":
             print(f"skip: {r.name} does not exist")
         elif r.outcome == "skip:already":
             print(f"skip: {r.project} already running")
         else:
             print(f"start: {r.project}")
+
+
+def _print_host_settings(s: dict) -> None:
+    p = s["pids_limit"]
+    if s.get("error"):
+        die(f"{s['error']}; `research settings pids-limit default` replaces it")
+    origin = (f"saved; the default is {p['default']}" if p["saved"]
+              else "the default")
+    print(f"pids-limit: {p['value']} ({origin}; allowed {p['min']}-{p['max']})")
+
+
+def cmd_settings(args: argparse.Namespace) -> None:
+    """Show or change the host settings (the webui's Sandboxes →
+    Infrastructure → Settings). Projects pick a change up at their next start."""
+    if args.settings_action is None:
+        _print_host_settings(rscore.host_settings())
+        return
+    raw = args.value.strip().lower()
+    if raw == "default":
+        req = _build(rscore.HostSettingsSetRequest, reset=True)
+    else:
+        # Plain ASCII digits only, as the webui field accepts: int() alone
+        # would also take "1_000" and non-ASCII digits.
+        if not re.fullmatch(r"[0-9]+", raw):
+            die(f"pids-limit takes a whole number or 'default', not {args.value!r}")
+        req = _build(rscore.HostSettingsSetRequest, pids_limit=int(raw))
+    _print_host_settings(_call(rscore.host_settings_set, req))
+    print("each project uses it from its next start (running projects keep "
+          "their current limit until then)")
 
 
 def cmd_project_destroy(args: argparse.Namespace) -> None:
@@ -3213,6 +3245,22 @@ def build_parser() -> argparse.ArgumentParser:
     ndp.set_defaults(func=cmd_node_pull)
     nds = nd_sub.add_parser("show", help="show the cached node seed + version")
     nds.set_defaults(func=cmd_node_show)
+
+    st = sub.add_parser(
+        "settings",
+        help="show or change host settings (the webui's Sandboxes → "
+             "Infrastructure → Settings)")
+    st.set_defaults(func=cmd_settings)
+    st_sub = st.add_subparsers(dest="settings_action")
+    stp = st_sub.add_parser(
+        "pids-limit",
+        help="the task limit (threads + processes) of every project container; "
+             f"default {rscore.PROJECT_PIDS_LIMIT_DEFAULT}. Each project picks "
+             "a change up at its next start")
+    stp.add_argument("value", metavar="N|default",
+                     help=f"a whole number from 1 to {rscore.PROJECT_PIDS_LIMIT_MAX}, "
+                          "or 'default'")
+    stp.set_defaults(func=cmd_settings)
 
     wu = sub.add_parser("webui", help="manage the optional browser UI container")
     wu_sub = wu.add_subparsers(dest="webui_action", required=True)

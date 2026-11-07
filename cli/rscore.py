@@ -4367,6 +4367,9 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         else SUPERVISOR_IMAGE)
 
     progress.step("validate", "checking prerequisites")
+    # The task cap from the host settings — read here, before anything exists,
+    # so a damaged settings file refuses the create cleanly.
+    pids_limit = project_pids_limit()
 
     # Verify prerequisites.
     if not run_quiet(["docker", "image", "inspect", substrate_image]):
@@ -4605,6 +4608,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         # Docker substrate only: its boot installs pi's settings and merges the
         # pair from this env; a dind supervisor gets it on the host-side deploy.
         pi_pair=pi_pair if is_docker else None,
+        pids_limit=pids_limit,
         # The setup is the manifest's (from_kwargs refuses any other for a
         # web-app workflow), so the env carries exactly what create runs.
         web=({"start": req.web["start"], "port": req.web["port"],
@@ -5275,6 +5279,9 @@ def start(req: StartStopRequest, cfg: "Config" | None = None,
     if not container_running(ROUTER_CONTAINER):
         die(f"{ROUTER_CONTAINER} is not running. Run `research start` first.")
     progress.step("validate", "checking project")
+    # Every start (re)applies the host task cap; a damaged settings file
+    # refuses here, before the port-list sweep below touches anything.
+    project_pids_limit()
     if req.all:
         containers = get_supervisor_containers()
     else:
@@ -5465,6 +5472,9 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     if not container_running(ROUTER_CONTAINER):
         die(f"{ROUTER_CONTAINER} is not running. Run `research start` first.")
     progress.step("validate", "validating update")
+    # A running project's update may recreate it with the host task cap: a
+    # damaged settings file refuses here, before the marker writes below.
+    project_pids_limit()
 
     print(f"=== Updating project: {project} ===")
 
@@ -6208,6 +6218,152 @@ def load_config() -> Config:
             if k and k not in os.environ:
                 os.environ[k] = v
     return Config()
+
+
+# ---------------------------------------------------------------------------
+# Host settings — operator choices edited in Sandboxes → Infrastructure →
+# Settings (and `research settings`). They live in the operator's home, outside
+# every project, so nothing inside a project can change them.
+# ---------------------------------------------------------------------------
+
+# Read at call time through the module attribute, so tests can repoint it.
+HOST_SETTINGS_PATH = Path.home() / ".research-sandbox" / "settings.json"
+# The task cap (threads and processes together) of every project container
+# unless the operator saves another. Measured for B175: a dev project running a
+# nested review demo plus four private harness runners holds about 8,000 tasks
+# (each nested webui alone ~1,250, one docker-proxy per published port), so
+# 16384 leaves about 2x headroom; the maintainer chose it as the default for
+# every project type. The cap reserves nothing — it only bounds how much of the
+# host's thread pool one runaway project can take.
+PROJECT_PIDS_LIMIT_DEFAULT = 16384
+# The kernel's PID_MAX_LIMIT on 64-bit (2^22): the highest value a cgroup's
+# pids.max accepts. Measured: `docker run --pids-limit=4194305` fails at create
+# ("write file pids.max: Invalid argument"), so a larger saved value would make
+# every project start fail.
+PROJECT_PIDS_LIMIT_MAX = 4194304
+_HOST_SETTINGS_REMEDY = ("use Back to default in Sandboxes → Infrastructure → "
+                         "Settings to replace it")
+
+
+def _valid_pids_limit(value: Any) -> bool:
+    # bool is an int subclass: JSON `true` must not read as a cap of 1.
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and 1 <= value <= PROJECT_PIDS_LIMIT_MAX)
+
+
+def _read_host_settings() -> tuple[dict, str | None]:
+    """(settings, problem). An absent file is ({}, None). A file that cannot be
+    read, is not JSON or is not an object reads as ({}, problem); an object
+    holding an invalid known value comes back WITHOUT that key, plus the
+    problem — so a writer can keep the rest. Problem texts carry no host path
+    (they reach the browser verbatim)."""
+    try:
+        raw = HOST_SETTINGS_PATH.read_bytes()
+    except FileNotFoundError:
+        return {}, None
+    except OSError as e:
+        return {}, f"cannot be read ({e.strerror or 'read failed'})"
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError):
+        return {}, "is not valid JSON"
+    if not isinstance(data, dict):
+        return {}, "does not hold a settings object"
+    if "pids_limit" in data and not _valid_pids_limit(data["pids_limit"]):
+        data = {k: v for k, v in data.items() if k != "pids_limit"}
+        return data, ("holds an invalid task limit (a whole number from 1 to "
+                      f"{PROJECT_PIDS_LIMIT_MAX} is expected)")
+    return data, None
+
+
+def project_pids_limit() -> int:
+    """The task cap a project container gets when it is created or started.
+    Fail-closed: a damaged settings file refuses (ValidationError) rather than
+    silently falling back — a saved LOWER cap must never quietly become the
+    default. Callers read it before their first side effect."""
+    data, problem = _read_host_settings()
+    if problem:
+        raise ValidationError(f"the RS settings file on the host {problem}; "
+                              f"{_HOST_SETTINGS_REMEDY}")
+    return data.get("pids_limit", PROJECT_PIDS_LIMIT_DEFAULT)
+
+
+def host_settings() -> dict:
+    """The Settings page payload. Never raises for a damaged file: it reports
+    the problem so the page can still offer Back to default."""
+    data, problem = _read_host_settings()
+    saved = "pids_limit" in data and not problem
+    return {
+        "pids_limit": {
+            "value": None if problem else data.get("pids_limit",
+                                                   PROJECT_PIDS_LIMIT_DEFAULT),
+            "saved": saved,
+            "default": PROJECT_PIDS_LIMIT_DEFAULT,
+            "min": 1,
+            "max": PROJECT_PIDS_LIMIT_MAX,
+        },
+        "error": f"the RS settings file on the host {problem}" if problem else None,
+    }
+
+
+@dataclass(frozen=True)
+class HostSettingsSetRequest:
+    """Save the project task cap, or put it back to the default (`reset`).
+    Exactly one of the two; the cap is a whole number in 1..PROJECT_PIDS_LIMIT_MAX
+    (no "unlimited" — maintainer decision on B175)."""
+    pids_limit: int | None = None
+    reset: bool = False
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "HostSettingsSetRequest":
+        reset = kw.get("reset")
+        if reset is None:
+            reset = False
+        if not isinstance(reset, bool):
+            raise ValidationError("reset must be true or false")
+        value = kw.get("pids_limit")
+        if reset:
+            if value is not None:
+                raise ValidationError(
+                    "send either a task limit or a reset to the default, not both")
+            return cls(reset=True)
+        if value is None:
+            raise ValidationError("a task limit is required")
+        if not _valid_pids_limit(value):
+            raise ValidationError("the task limit must be a whole number from 1 "
+                                  f"to {PROJECT_PIDS_LIMIT_MAX}")
+        return cls(pids_limit=value)
+
+
+def host_settings_set(req: HostSettingsSetRequest) -> dict:
+    """Save one setting and return the page payload. A damaged file is REPLACED
+    rather than refused (unlike the model-defaults override): the browser has
+    no other remedy, and only what cannot be read is lost — an object with one
+    bad value keeps its other keys. Atomic tmp + replace; only host processes
+    read the file (nothing bind-mounts it)."""
+    data, _problem = _read_host_settings()
+    if req.reset:
+        data.pop("pids_limit", None)
+    else:
+        data["pids_limit"] = req.pids_limit
+    target = HOST_SETTINGS_PATH
+    tmp = None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # A unique temp name: the CLI and the broker can save at once.
+        fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=target.name + ".")
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        os.replace(tmp, target)
+    except OSError as e:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        raise ValidationError("cannot save the RS settings file on the host "
+                              f"({e.strerror or 'write failed'})") from e
+    return host_settings()
 
 
 def read_env_value(key: str) -> str:
@@ -7180,7 +7336,11 @@ def build_supervisor_docker_args(
     web: dict | None = None,
     pi_pair: dict[str, str] | None = None,
     model_in_settings: bool = False,
+    pids_limit: int | None = None,
 ) -> list[str]:
+    # pids_limit: the project's task cap, read by the caller (project_pids_limit)
+    # BEFORE its first side effect. None (archived pins, direct callers) means
+    # the default — this builder never reads a file, so it stays pure.
     is_docker = substrate == Substrate.DOCKER.value
     args = [
         "run", "-d",
@@ -7272,10 +7432,14 @@ def build_supervisor_docker_args(
         args += ["-e", f"RS_SANDBOX_DNS={','.join(dns_servers)}"]
 
     if dind_mode == "sysbox":
-        args += ["--runtime=sysbox-runc", "--pids-limit=4096"]
+        args += ["--runtime=sysbox-runc"]
     elif dind_mode == "privileged":
-        args += ["--privileged", "--pids-limit=4096",
+        args += ["--privileged",
                  "-v", f"{docker_volume_name_for(project)}:/var/lib/docker"]
+    # The task cap (threads + processes) — every substrate, the docker one
+    # included (it had none before B175). The host setting, default 16384.
+    args.append(f"--pids-limit="
+                f"{PROJECT_PIDS_LIMIT_DEFAULT if pids_limit is None else pids_limit}")
 
     if memory:
         args += [f"--memory={memory}"]
@@ -10690,6 +10854,11 @@ def _recreate_supervisor(
     workspace_path = workspace_path_for(project, cfg)
 
     md = _read_supervisor_metadata(container)
+    # The task cap from the host settings, read before anything is touched: a
+    # damaged settings file refuses here, never after the container is gone.
+    # Every start and update of a dind project recreates through here, which
+    # is how an existing project picks up a changed setting.
+    pids_limit = project_pids_limit()
     # The project's folders, decided BEFORE anything is touched: a saved ⚙
     # change that cannot apply leaves the old binds (and says so), and nothing
     # here can fail after the logins were stashed or the container removed.
@@ -10751,6 +10920,7 @@ def _recreate_supervisor(
         model_in_settings=model_in_settings,
         # The deployed set, from the marker (research markers carry [] → no env).
         agents=_read_marker_agents(workspace_path),
+        pids_limit=pids_limit,
     )
     if extra_mounts:
         docker_args = docker_args[:-1] + extra_mounts + [docker_args[-1]]
@@ -11056,6 +11226,22 @@ def _reclaim_mount_root(container: str, workspace_path: Path) -> None:
               file=sys.stderr)
 
 
+def _apply_project_pids_limit(container: str, pids_limit: int) -> None:
+    """Set a STOPPED docker-substrate container's task cap (`docker update`
+    works on a stopped container; measured). Best-effort: a daemon that cannot
+    set pids limits (rootless, or no pids controller) WARNS and the project
+    starts with the cap it had — `docker run` there likewise only warns and
+    drops the limit, so refusing the start would strand a project that runs
+    today."""
+    r = run(["docker", "update", f"--pids-limit={pids_limit}", container],
+            capture_output=True)
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip().splitlines()
+        print(f"warning: could not set the task limit of {container} to "
+              f"{pids_limit}; it starts with its previous limit"
+              + (f" ({err[-1][-200:]})" if err else ""), file=sys.stderr)
+
+
 def _start_docker_substrate(project: str, cfg: "Config",  # type: ignore[name-defined]
                             progress=None) -> None:
     """Start a stopped `docker`-substrate project. Unlike a sysbox supervisor
@@ -11065,6 +11251,10 @@ def _start_docker_substrate(project: str, cfg: "Config",  # type: ignore[name-de
     This is the deliberate exception to the 'sysbox can't stop/start' rule: it is
     sysbox-specific, and the docker substrate has no sysbox bindings to lose."""
     container = container_name_for(project)
+    # The task cap from the host settings, applied to the stopped container
+    # before it starts: an existing project picks up a changed setting here
+    # without a re-creation (which would make its agents log in again).
+    _apply_project_pids_limit(container, project_pids_limit())
     run_check(["docker", "start", container])
     # A project created before mountpoints were pre-created: hand its
     # root-owned mnt/ back so destroy can remove the folder (no-op otherwise).
@@ -11169,6 +11359,10 @@ def _update_docker_substrate(req: "UpdateRequest", cfg: "Config",  # type: ignor
                 "the editor (code-server); destroy + recreate for anything else")
         if enable_svcs and not editor_dist_present():
             die("no editor dist cached — pull it under Sandboxes → Software first")
+        # The editor switch recreates the box with the host task cap: a
+        # damaged settings file refuses here, before the agents' record and
+        # the port list below are written.
+        project_pids_limit()
     if plan.any():
         # The agents' models: recorded, then written into the agents' own files
         # (a stopped project gets them at its next start). Applied before an
@@ -11212,6 +11406,8 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
     md = _read_supervisor_metadata(container)
     if md.get("substrate") != Substrate.DOCKER.value:
         die(f"_recreate_docker_substrate called for non-docker project {project!r}")
+    # The task cap, read before anything is touched (as _recreate_supervisor).
+    pids_limit = project_pids_limit()
     # The project's folders, decided before anything is touched (the same rule
     # as _recreate_supervisor): a saved ⚙ change that cannot apply leaves the
     # old binds and says so.
@@ -11268,7 +11464,8 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
         # The rebuilt container boots on a fresh home and re-installs pi's
         # settings, so the create-time pair rides along again (marker-sourced,
         # like the Claude pair above).
-        pi_pair=_read_pi_pair(workspace_path))
+        pi_pair=_read_pi_pair(workspace_path),
+        pids_limit=pids_limit)
     # Recovered binds minus any prior editor-dist mount (agent-dist + --mount folders
     # pass through); re-derive the editor mount from the new flag (mirrors create).
     # The recreate is also what re-binds a mount that a re-download orphaned (the

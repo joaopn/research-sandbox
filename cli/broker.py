@@ -350,6 +350,23 @@ def _verb_models(_args: dict, _progress=None) -> dict:
         raise rscore.ValidationError(str(e))
 
 
+def _verb_host_settings(_args: dict, _progress=None) -> dict:
+    """The host settings (the Sandboxes → Infrastructure → Settings section).
+    Token-gated read; never raises for a damaged file — the payload names the
+    problem so the page can still offer Back to default."""
+    return rscore.host_settings()
+
+
+def _verb_host_settings_set(args: dict, _progress=None) -> dict:
+    """Save the project task cap, or reset it to the default. Token-gated,
+    inline (a validated sub-ms file write). Projects pick it up at their next
+    start or re-creation; nothing running is touched. Every failure is a
+    ValidationError (the request and the writer map their own)."""
+    safe = {k: v for k, v in args.items() if k in HOST_SETTINGS_SET_WEBUI_FIELDS}
+    req = rscore.HostSettingsSetRequest.from_kwargs(**safe)
+    return rscore.host_settings_set(req)
+
+
 def _verb_model_default_set(args: dict, _progress=None) -> dict:
     """Write (or clear) one container type's default (model, effort) pair in
     the operator's untracked model-defaults override — the write half of
@@ -1072,6 +1089,9 @@ DEV_BOARD_EXPORT_WEBUI_FIELDS = frozenset({"passphrase"})
 # control). Name-shaped catalog tokens + a bool only — nothing host-shaped;
 # the contract is full-pair-or-clear (no partial writes).
 MODEL_DEFAULT_WEBUI_FIELDS = frozenset({"type", "model", "effort", "clear"})
+# Save the project task cap or put it back to the default (the Sandboxes →
+# Infrastructure → Settings section). A number and a bool — nothing host-shaped.
+HOST_SETTINGS_SET_WEBUI_FIELDS = frozenset({"pids_limit", "reset"})
 # Put one version pin back to the shipped value (the Sandboxes → Software tab's "Use repo
 # version" button). One name-shaped token; the request refuses anything that is
 # not a resettable pin of the tracked versions.env.
@@ -1263,6 +1283,8 @@ VERBS = {
     "workflows": _verb_workflows,
     "models": _verb_models,
     "model_default_set": _verb_model_default_set,
+    "host_settings": _verb_host_settings,
+    "host_settings_set": _verb_host_settings_set,
     "pin_reset": _verb_pin_reset,
     "software_status": _verb_software_status,
     "agent_refresh_check": _verb_agent_refresh_check,

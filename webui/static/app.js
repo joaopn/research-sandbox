@@ -2459,6 +2459,7 @@ async function renderInfraInto(view) {
     // the section order is deterministic regardless of fetch timing.
     appendPassthroughSection(view, body.result || []);
     appendInfraSection(view);
+    appendSettingsSection(view);
     syncSidebarFromBroker(body.result || []);
 }
 
@@ -5512,6 +5513,125 @@ function devVersionOlder(a, b) {
         if (x !== y) return x < y;
     }
     return false;
+}
+
+// Sandboxes → Infrastructure → Settings: host-wide choices that are not a
+// service — today the task cap every project container gets (threads and
+// processes together). The section's static DOM is appended synchronously,
+// like the sections above it, so the page order never depends on fetch
+// timing; the row then fills from GET /broker/settings. A read failure is a
+// quiet badge in the row (the page's Refresh retries), never a page card.
+const SETTINGS_PIDS_LABEL = "Task limit per project container";
+
+async function appendSettingsSection(view) {
+    const row = el("div", { class: "mgmt-row mgmt-infra-row mgmt-settings-row" }, [
+        el("span", {}, [SETTINGS_PIDS_LABEL]),
+        el("span", { class: "mgmt-loading" }, ["…"]),
+    ]);
+    view.appendChild(el("div", { class: "mgmt-infra" }, [
+        el("h3", { class: "mgmt-infra-title" }, ["Settings"]),
+        row,
+        el("div", { class: "mgmt-settings-hint" }, [
+            "Threads and processes together, per project. Saving changes "
+            + "no running project: each one picks the value up the next "
+            + "time it starts."]),
+    ]));
+    let body = null;
+    try {
+        const res = await fetch("/broker/settings");
+        if (res.ok) body = await res.json();
+    } catch (e) { /* the quiet badge below */ }
+    if (!body) {
+        row.replaceChildren(el("span", {}, [SETTINGS_PIDS_LABEL]),
+                            el("span", { class: "type-badge" }, ["unavailable"]));
+        return;
+    }
+    if (!body.ok) {
+        // A broker started before this setting existed does not know the
+        // verb: the same quiet badge as an unreachable read. Any other refusal
+        // is the broker's own message, beside the label.
+        const unknown = body.error && body.error.kind === "unknown_verb";
+        row.replaceChildren(el("span", {}, [SETTINGS_PIDS_LABEL]),
+                            unknown
+                                ? el("span", { class: "type-badge" }, ["unavailable"])
+                                : el("span", { class: "mgmt-reviewer-err" }, [mgmtErrText(body)]));
+        return;
+    }
+    fillSettingsRow(view, row, body.result || {}, "");
+}
+
+function fillSettingsRow(view, row, settings, notice) {
+    const p = settings.pids_limit || {};
+    const lo = p.min || 1;
+    const hi = p.max || 0;
+    const input = el("input", { type: "number", class: "mgmt-settings-num",
+                                min: String(lo), max: String(hi), step: "1" });
+    input.value = p.value !== null && p.value !== undefined ? String(p.value) : "";
+    const errEl = el("span", { class: "mgmt-reviewer-err" }, []);
+    if (settings.error) {
+        errEl.textContent = settings.error + "; Back to default replaces it.";
+    }
+    const noteEl = el("span", { class: "mgmt-settings-note" }, [notice || ""]);
+    let busy = false;
+    const post = async (payload, done) => {
+        // One request at a time: Enter held down or a double click must not
+        // stack saves.
+        if (busy) return;
+        busy = true;
+        try {
+            await postOnce(payload, done);
+        } finally {
+            busy = false;
+        }
+    };
+    const postOnce = async (payload, done) => {
+        errEl.textContent = "";
+        noteEl.textContent = "";
+        let res, body = null;
+        try {
+            res = await fetch("/broker/settings", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+            });
+        } catch (e) { return renderMgmtUnavailable(view); }
+        const redirect = mgmtStatusRedirect(view, res.status);
+        if (redirect) return redirect();
+        try { body = await res.json(); } catch (e) { return renderMgmtUnavailable(view); }
+        if (!res.ok || !body.ok) {
+            // Reachable only on 200-with-parseable-JSON (the relay peels
+            // 401/403/503 off above): the broker ANSWERED and the verb
+            // refused — its message beside the controls, never a page card.
+            errEl.textContent = mgmtErrText(body);
+            return;
+        }
+        fillSettingsRow(view, row, body.result || {}, done);
+    };
+    const save = el("button", { class: "btn-small" }, ["Save"]);
+    save.onclick = () => {
+        const raw = input.value.trim();
+        const n = /^[0-9]+$/.test(raw) ? Number(raw) : NaN;
+        if (!Number.isSafeInteger(n) || n < lo || (hi && n > hi)) {
+            errEl.textContent = `Enter a whole number from ${lo} to ${hi}.`;
+            return;
+        }
+        post({ pids_limit: n },
+             "Saved. Each project uses it from its next start.");
+    };
+    input.onkeydown = (ev) => { if (ev.key === "Enter") save.onclick(); };
+    const children = [el("span", {}, [SETTINGS_PIDS_LABEL]), input, save];
+    if (!settings.error) {
+        children.push(el("span", { class: "type-badge" },
+                         [p.saved ? `saved · default ${p.default}` : "default"]));
+    }
+    if (p.saved || settings.error) {
+        const reset = el("button", { class: "btn-small" }, ["Back to default"]);
+        reset.onclick = () => post({ reset: true },
+                                   "Back to the default. Each project uses it from its next start.");
+        children.push(reset);
+    }
+    children.push(noteEl, errEl);
+    row.replaceChildren(...children);
 }
 
 // The reviewer's model/effort DEFAULT (the fifth model_catalog type). Unlike
