@@ -37,6 +37,14 @@ Independent of the type:
   it; its instructions assume the browser tools, so un-checking it there leaves
   them pointing at tools the box doesn't have). Heavier image — leave it off
   unless the box needs the web. Not available on dev boxes.
+- **Trusted browser** — shown once Browser is on, off by default. A browser box
+  is *restricted* unless this is ticked: nine risky actions a web page could
+  talk the agent into (running page script or code, uploading or dropping
+  files, dragging, answering dialogs, saving PDFs, installing browsers,
+  resizing the window) are blocked for every agent, and the browser ignores
+  Playwright settings in the box's environment. A trusted browser gives the
+  agents every browser tool and honours those settings. Chosen when the box is
+  added; to change it, remove the box and add it again.
 - **rs-fetch** — wire the box to pull dev-lane agent commits from the shared
   Gitea into a git clone here (read-only; off by default; not on dev boxes).
 - **MCP tools** — wire any of the project's allowed MCP servers into the box's

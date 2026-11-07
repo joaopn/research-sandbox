@@ -13,18 +13,28 @@ Regenerated WHOLESALE every run from three sources:
   source-1 = /workspace/.mcp-proxy.json  — proxy MCP servers the host wrote at
              create/restart from the project allowlist (may be absent/empty).
   source-2 = /opt/sandbox-box/extra-mcps.json — image-baked stdio MCPs (the
-             browser box's Playwright); base boxes don't carry the file.
+             browser box's Playwright, restricted: started through the
+             environment-clearing wrapper); base boxes don't carry the file.
+             A TRUSTED browser box (RS_BOX_BROWSER=trusted, which rs-sandbox
+             sets only on an image that supports it) uses
+             /opt/sandbox-box/extra-mcps.trusted.json instead — the same
+             declaration without the wrapper; with the env but without that
+             file (impossible through rs-sandbox) the box stays restricted.
   source-3 = /workspace/.mcp-preset.json — preset-declared stdio MCPs.
 A name collision is a hard error (exit 1: the boot refuses to start) so a
 project MCP cannot silently shadow the baked browser tooling.
 
-In a box that deploys pi, the image's denied tools (/opt/sandbox-box/
-denied-tools.json, {server: [tool, ...]} — the browser box's two script-running
-Playwright tools, the same list claude's managed settings deny) are marked
-`hidden` in that server's `toolExposure`, so pi registers them but can never
-call them. claude ignores the key. No file (a base box, an older image) means no
-hiding; an unreadable one in a pi box stops the render before anything is
-written (running pi with the deny silently off is the failure this prevents).
+In a restricted browser box that deploys pi, the image's denied tools
+(/opt/sandbox-box/denied-tools.json, {server: [tool, ...]} — the same list
+claude's managed settings deny: nine risky Playwright tools, two on an image
+built before trusted boxes) are marked `hidden` in that server's
+`toolExposure`, so pi registers them but can never call them. claude ignores
+the key. No file (a base box) means no hiding; an unreadable one in a
+restricted pi box stops the render before anything is written (running pi with
+the deny silently off is the failure this prevents). A trusted box never reads
+the file. A browser box's tool inventory gains a "Browser" section naming the
+mode and, when restricted, the blocked tools (read best-effort for that: a
+claude-only box never stops over it).
 """
 import json
 import os
@@ -32,7 +42,15 @@ import sys
 from pathlib import Path
 
 proxy_path = Path("/workspace/.mcp-proxy.json")
-extras_path = Path("/opt/sandbox-box/extra-mcps.json")
+restricted_extras_path = Path("/opt/sandbox-box/extra-mcps.json")
+trusted_extras_path = Path("/opt/sandbox-box/extra-mcps.trusted.json")
+# Trusted only when BOTH say so: the box's run (rs-sandbox sets the variable
+# only for a trusted box on an image that supports it) and the image (the
+# trusted declaration exists). Anything else — absent, empty, another value, an
+# image without the file — is the restricted default.
+browser_trusted = (os.environ.get("RS_BOX_BROWSER") == "trusted"
+                   and trusted_extras_path.is_file())
+extras_path = trusted_extras_path if browser_trusted else restricted_extras_path
 mcp_path = Path("/workspace/.mcp.json")
 inv_path = Path("/workspace/.tools-inventory.md")
 
@@ -192,7 +210,7 @@ def pi_trust_workspace() -> None:
 # "wired" on trust.json, so a refused render must leave it unwritten.
 denied_path = Path("/opt/sandbox-box/denied-tools.json")
 denied: dict = {}
-if pi_agent_dir and denied_path.is_file():
+if pi_agent_dir and not browser_trusted and denied_path.is_file():
     try:
         denied = json.loads(denied_path.read_text())
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
@@ -205,6 +223,34 @@ if pi_agent_dir and denied_path.is_file():
         print("sandbox-box: denied-tools.json must map each server to a list of "
               "tool names; refusing to start", file=sys.stderr)
         sys.exit(1)
+
+def browser_section() -> str:
+    """The tool inventory's "Browser" section in a browser box (the image's
+    baked declaration exists), "" otherwise. Restricted names the blocked
+    tools from the image's own list, so an older image's shorter list reads
+    as what it is. Best-effort: an absent or unreadable list never stops the
+    render (the pi refusal above is the only one)."""
+    if not restricted_extras_path.is_file():
+        return ""
+    if browser_trusted:
+        return ("\n## Browser\n\nTrusted: every browser tool is available, "
+                "for every agent in this box.\n")
+    blocked: set = set()
+    try:
+        data = json.loads(denied_path.read_text())
+        if isinstance(data, dict):
+            for v in data.values():
+                if isinstance(v, list):
+                    blocked.update(x for x in v if isinstance(x, str) and x)
+    except (OSError, UnicodeDecodeError, ValueError):
+        pass
+    if not blocked:
+        return ("\n## Browser\n\nRestricted: the list of blocked browser tools "
+                "could not be read.\n")
+    names = ", ".join(f"`{x}`" for x in sorted(blocked))
+    return ("\n## Browser\n\nRestricted: these browser tools are blocked for "
+            f"every agent in this box (a call is refused): {names}.\n")
+
 
 pi_trust_workspace()
 if servers:
@@ -236,7 +282,8 @@ if servers:
         f"boot: a server added to it"
         + (f" (also by `pi mcp add -l`, which writes through the link)" if pi_agent_dir else "")
         + f" lasts until the box restarts.\n\n"
-        f"| Name | Type | Location |\n|---|---|---|\n" + "\n".join(rows) + "\n")
+        f"| Name | Type | Location |\n|---|---|---|\n" + "\n".join(rows) + "\n"
+        + browser_section())
 else:
     for p in (mcp_path, inv_path):
         if p.exists():

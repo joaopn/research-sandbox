@@ -18,9 +18,11 @@ box's for the whole session and keeps state across turns; it dies with the box.
 
 ## Notes
 
-- `browser_evaluate` and `browser_run_code_unsafe` (arbitrary JavaScript) are
-  **denied** for every agent in the box — page content is treated as untrusted
-  data, not instructions. Every other browser tool is usable.
+- The browser is **restricted** by default: nine risky browser tools (running
+  page script or code, file upload and drop, drag, dialog handling, PDF save,
+  browser install, window resize) are denied for every agent in the box — page
+  content is treated as untrusted data, not instructions. Tick **Trusted
+  browser** when adding the box to give its agents every browser tool.
 - Add **MCP tools** for project-specific lookups on top of the browser.
 - Boots credential-free: run `claude` then `/login` inside. Outputs live in
   `/workspace`; egress follows the project's router policy.

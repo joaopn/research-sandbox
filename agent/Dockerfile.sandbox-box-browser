@@ -6,12 +6,19 @@ FROM rs-sandbox-box:latest
 # is heavy, so base-image presets stay lean.
 #
 # This lifts ONLY the playwright tool bundle from the websearcher image (same
-# version pins, same render-extra-mcps.py source-of-truth) — NOT its role.md /
-# harness, and NOT its full deny list: the box denies only the two tools that
-# run arbitrary script (browser_evaluate, browser_run_code_unsafe — the YAML's
-# box_denied_tools), for EVERY agent in the box (claude through the managed
-# settings, pi through the box render reading denied-tools.json). The box's
-# agents get the other browser tools; the PI drives them however they like.
+# version pins, same render-extra-mcps.py source-of-truth and deny list) — NOT
+# its role.md / harness. Two modes, chosen per box at create:
+#   restricted (the IMAGE DEFAULT) — the role's reviewed deny list for EVERY
+#     agent in the box (claude through the managed settings below, pi through
+#     the box render reading denied-tools.json), and the server starts through
+#     playwright-env-clear, so no runtime PLAYWRIGHT_MCP_* variable widens its
+#     tool list. A guardrail against page content steering the agent, not a
+#     wall: the agent keeps its shell and sudo.
+#   trusted — rs-sandbox lays an empty-deny managed-settings file over the
+#     baked one (read-only, at docker run) and sets RS_BOX_BROWSER=trusted, and
+#     the box render then uses extra-mcps.trusted.json (no wrapper) and hides
+#     nothing from pi. rs-sandbox does that only on an image carrying the
+#     research.box.browser-trust label below; anything else runs restricted.
 #
 # Version pins are deliberate (rebuild + project recreate to bump), same
 # discipline as the websearcher image they mirror.
@@ -44,20 +51,35 @@ RUN npm install -g "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" && \
     chmod -R a+rX ${PLAYWRIGHT_BROWSERS_PATH} && \
     rm -rf /var/lib/apt/lists/*
 
-# Render the four image-baked artifacts from the SAME source-of-truth the
-# websearcher role uses, in the BOX deny scope:
-#   /opt/sandbox-box/extra-mcps.json          — the playwright MCP server decl;
-#                                               the box entrypoint copies it to
-#                                               /workspace/.mcp.json so the box's
-#                                               claude auto-discovers it.
+# The capability marker rs-sandbox and the host gate read (docker image
+# inspect): this image can run a TRUSTED browser box. An image without it (one
+# built before trusted boxes existed) only ever runs restricted.
+LABEL research.box.browser-trust=1
+
+# The environment-clearing wrapper the restricted server starts through. Copied
+# BEFORE the render: the render starts the wrapped server to check its tools.
+COPY agent/playwright-env-clear.sh /usr/local/lib/rs-box/playwright-env-clear
+RUN chmod 755 /usr/local/lib/rs-box/playwright-env-clear
+
+# Render the image-baked artifacts from the SAME source-of-truth the
+# websearcher role uses (restricted = the role's deny list):
+#   /opt/sandbox-box/extra-mcps.json          — the playwright MCP server decl,
+#                                               started through the wrapper (the
+#                                               restricted default); the box
+#                                               render merges it into
+#                                               /workspace/.mcp.json.
+#   /opt/sandbox-box/extra-mcps.trusted.json  — the same decl without the
+#                                               wrapper (a trusted box).
 #   /opt/sandbox-box/playwright-mcp-config.json — Chromium launch flags
 #                                               (referenced via --config).
-#   /etc/claude-code/managed-settings.json    — claude's deny of the box list
+#   /etc/claude-code/managed-settings.json    — claude's deny of the list
 #                                               (highest-precedence permission
-#                                               scope; not bypassable).
+#                                               scope; a trusted box gets an
+#                                               empty one laid over it).
 #   /opt/sandbox-box/denied-tools.json        — the same list for pi: the box's
 #                                               MCP render marks those tools
-#                                               `hidden` on the server's entry.
+#                                               `hidden` on the server's entry
+#                                               (restricted only).
 COPY container/role-mcp/websearcher/extra-mcps.yaml      /tmp/extra-mcps.yaml
 COPY container/role-mcp/websearcher/render-extra-mcps.py /tmp/render-extra-mcps.py
 RUN /opt/conda/bin/python3 /tmp/render-extra-mcps.py \
@@ -66,14 +88,16 @@ RUN /opt/conda/bin/python3 /tmp/render-extra-mcps.py \
         --out-extra            /opt/sandbox-box/extra-mcps.json \
         --out-config           /opt/sandbox-box/playwright-mcp-config.json \
         --out-managed-settings /etc/claude-code/managed-settings.json \
-        --deny-scope           box \
-        --out-denied           /opt/sandbox-box/denied-tools.json && \
-    chmod 644 /etc/claude-code/managed-settings.json /opt/sandbox-box/denied-tools.json && \
+        --out-denied           /opt/sandbox-box/denied-tools.json \
+        --wrap                 /usr/local/lib/rs-box/playwright-env-clear \
+        --out-extra-unwrapped  /opt/sandbox-box/extra-mcps.trusted.json && \
+    chmod 644 /etc/claude-code/managed-settings.json /opt/sandbox-box/denied-tools.json \
+              /opt/sandbox-box/extra-mcps.json /opt/sandbox-box/extra-mcps.trusted.json && \
     rm /tmp/extra-mcps.yaml /tmp/render-extra-mcps.py
 
-# Entrypoint is inherited from rs-sandbox-box — it copies the baked
-# extra-mcps.json to /workspace/.mcp.json when present (this image), so no
-# per-image entrypoint is needed.
+# Entrypoint is inherited from rs-sandbox-box — its box render merges the
+# baked declaration (restricted or trusted, by RS_BOX_BROWSER) into
+# /workspace/.mcp.json, so no per-image entrypoint is needed.
 
 USER worker
 WORKDIR /workspace

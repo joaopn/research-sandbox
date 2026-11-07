@@ -20,10 +20,16 @@ this box.
 
 ## Denied browser tools (image-enforced)
 
+A browser box is **restricted** unless it was added as a trusted browser. In a
+restricted box these nine browser tools are blocked for every agent (Claude
+Code's managed settings deny them, and pi's server entry marks them hidden):
 `browser_evaluate` and `browser_run_code_unsafe` (they run arbitrary script — a
-prompt-injection path) are blocked for every agent in this box: Claude Code's
-baked managed settings deny them, and pi's server entry marks them hidden. Never
-call them — they will fail at call-time. Every other browser tool is yours to use.
+prompt-injection path), `browser_file_upload`, `browser_drop`, `browser_drag`,
+`browser_handle_dialog`, `browser_pdf_save`, `browser_install` and
+`browser_resize`. Never call them there — they fail at call-time. A **trusted**
+box blocks none of them. Which one this box is: the "Browser" line of the
+terminal greeting and the "Browser" section of `/workspace/.tools-inventory.md`
+(it lists exactly what is blocked here). Every tool not blocked is yours to use.
 
 ## Untrusted content (load-bearing)
 

@@ -9060,6 +9060,37 @@ async function mgmtBoxAddDialog(project) {
         if (browserCard.classList.contains("disabled")) return;
         browserCb.checked = !browserCb.checked;
         browserCard.classList.toggle("selected", browserCb.checked);
+        syncTrusted();
+    };
+
+    // Trusted browser (off by default = restricted): shown only while Browser
+    // is selected; unticked whenever the browser goes off or the preset
+    // changes. Set at creation only. trustedCb is the detached value holder;
+    // the payload sends it only together with the browser.
+    const trustedCb = el("input", { type: "checkbox" });
+    const trustedCard = el("div", {
+        class: "box-opt-card",
+        title: "Give this box's agents every browser tool. Without it the " +
+               "browser is restricted: nine risky actions a web page could " +
+               "talk the agent into (running page script or code, uploading " +
+               "or dropping files, dragging, answering dialogs, saving PDFs, " +
+               "installing browsers, resizing) are blocked for every agent.",
+    }, [el("span", { class: "box-opt-name" }, ["Trusted browser"])]);
+    const trustedHint = el("div", { class: "hint" }, [
+        "Every browser tool is available to the agents in this box, and extra " +
+        "Playwright features can be switched on in its environment. Only for " +
+        "pages you trust: a page's text can steer the agent. Fixed once the " +
+        "box is added.",
+    ]);
+    const syncTrusted = () => {
+        if (!browserCb.checked) trustedCb.checked = false;
+        trustedCard.style.display = browserCb.checked ? "" : "none";
+        trustedCard.classList.toggle("selected", trustedCb.checked);
+        trustedHint.style.display = trustedCb.checked ? "" : "none";
+    };
+    trustedCard.onclick = () => {
+        trustedCb.checked = !trustedCb.checked;
+        syncTrusted();
     };
 
     // MCP picker over the project's allowed MCPs. Checking ≥1 forces the agent on
@@ -9220,6 +9251,9 @@ async function mgmtBoxAddDialog(project) {
         browserCb.checked = !isDev && selectedPreset.image === "browser";
         browserCard.classList.toggle("selected", browserCb.checked);
         browserCard.classList.toggle("disabled", isDev);
+        // A preset switch always starts restricted.
+        trustedCb.checked = false;
+        syncTrusted();
         // A dev box takes no read-only folders: untick + hide the group.
         if (isDev) {
             foldersCb.checked = false;
@@ -9293,7 +9327,8 @@ async function mgmtBoxAddDialog(project) {
             // reads (hidden on a dev preset, which takes none).
             collapsibleBox("Extensions", [
                 el("div", { class: "box-opt-cards" },
-                   [editorCard, fetchCard, browserCard, historyCard]),
+                   [editorCard, fetchCard, browserCard, trustedCard, historyCard]),
+                trustedHint,
                 historyHint,
             ], "box-extensions"),
             collapsibleBox("Sharing", [
@@ -9403,6 +9438,8 @@ async function mgmtBoxAddDialog(project) {
                 // surprise, and the tri-state's None stays reachable only for
                 // callers that genuinely omit the field (CLI).
                 browser: browserCb.checked,
+                // Only with the browser (both gates refuse it without).
+                trusted_browser: browserCb.checked && trustedCb.checked,
                 fetch: fetchCb.checked,
                 mcps: mcpBoxes.filter((b) => b.cb.checked).map((b) => b.name),
                 // Always explicit: the card's state IS the choice (applyPreset

@@ -3,7 +3,8 @@
 # Single source-of-truth: this YAML drives the derived artifacts below at
 # image build by render-extra-mcps.py (the websearcher ROLE image writes the
 # first three; the browser BOX image writes the same three under its own paths
-# plus the fourth, and renders its deny list from `box_denied_tools`):
+# plus the last two, for its restricted mode — the default — with the same
+# deny list; a trusted browser box gets none of the deny):
 #
 #   /opt/role-mcp/role/extra-mcps.json
 #       — substrate's image-baked merge hook reads this and merges
@@ -18,13 +19,17 @@
 #   /etc/claude-code/managed-settings.json
 #       — Claude Code managed settings (highest-precedence permission
 #         scope; cannot be overridden by user/project/CLI). Carries
-#         a `permissions.deny` array derived from `denied_tools` below
-#         (the browser box: from `box_denied_tools`).
+#         a `permissions.deny` array derived from `denied_tools` below.
 #
 #   /opt/sandbox-box/denied-tools.json  (browser box only)
-#       — the same box deny list as {server: [tool, ...]}; the box's MCP
+#       — the same deny list as {server: [tool, ...]}; the box's MCP
 #         render marks those tools `hidden` on the server's entry for pi,
-#         so both agents in the box lose the same tools.
+#         so both agents in a restricted box lose the same tools.
+#
+#   /opt/sandbox-box/extra-mcps.trusted.json  (browser box only)
+#       — the server declaration without the environment-clearing
+#         wrapper the restricted declaration starts through; a trusted
+#         browser box uses it, with no deny for either agent.
 #
 # Two placeholders are resolved in the rendered extra-mcps.json:
 #   __PLAYWRIGHT_MCP_BIN__  -> $(command -v playwright-mcp)
@@ -113,11 +118,11 @@ chromium_args:
 # (SB2) is direct to the Playwright MCP and does NOT pass through
 # Claude Code's permission layer — so denied tools STILL appear in
 # tools-inventory.md. role.md notes this so the spawned claude
-# doesn't try to call them. role.md enumerates this list for the model, and boxes/websearcher.instructions.md
-# enumerates `box_denied_tools` — keep each in step with its list.
+# doesn't try to call them. role.md and boxes/websearcher.instructions.md
+# enumerate this list for the model — keep both in step with it.
 #
-# This is the websearcher ROLE's list; the browser box denies only
-# `box_denied_tools` (below).
+# The websearcher ROLE and a RESTRICTED browser box (the default) deny this
+# list; a TRUSTED browser box denies nothing.
 #
 # REVIEWED OR THE BUILD FAILS: every tool the pinned Playwright MCP exposes
 # must be named here or under `allowed_tools` below. The renderer starts the
@@ -166,19 +171,6 @@ denied_tools:
     workflows are out of scope for AT-driven research) and browser_drag
     (interaction primitive of last resort), and a route for injected text to
     push data into page state.
-
-# The browser BOX's deny list — for every agent in the box: claude through the
-# box image's managed settings, pi through a `hidden` per-tool exposure on the
-# server's entry (both rendered from this list, so the two cannot drift). The
-# maintainer's ruling: a researcher drives a box's browser themselves, so a box
-# blocks only the two tools that run arbitrary script (in the page, or in the
-# Playwright server process); every other tool `denied_tools` names is usable in
-# a box. Each name here must be a `denied_tools` key (reviewed, with its reason
-# above) — the renderer refuses anything else, and refuses to render a box with
-# this list missing.
-box_denied_tools:
-  - browser_evaluate
-  - browser_run_code_unsafe
 
 # The tools the role keeps, each reviewed. A tool appears in exactly one of
 # the two mappings; the build fails on overlap.

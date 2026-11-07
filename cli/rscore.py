@@ -357,6 +357,15 @@ def _check_box_folders(workspace_path: "Path", names: "Sequence[str]") -> None:
                 raise ValidationError(f"{here!r} is not a folder")
 
 
+# Why a trusted browser box ran restricted (the box tool's `browser` warning).
+_BOX_BROWSER_REASONS = {
+    "no-trusted-image": "this project's browser box image predates trusted browsers",
+    "no-policy-file": "the trusted browser's policy file could not be written in "
+                      "the project; it runs restricted until a start of the box or "
+                      "the project can write it",
+}
+
+
 def _box_folder_warnings(raw: Any, box: Any) -> list[str]:
     """The box tool's structured folder warnings → operator lines, built here
     from a re-validated box name and folder name (the tool's own text never
@@ -369,6 +378,12 @@ def _box_folder_warnings(raw: Any, box: Any) -> list[str]:
     out: list[str] = []
     for w in raw:
         if not isinstance(w, dict):
+            continue
+        if w.get("kind") == "browser":
+            why = (_BOX_BROWSER_REASONS.get(w.get("reason"))
+                   if isinstance(w.get("reason"), str) else None) \
+                or "it could not run trusted"
+            out.append(f"{who} started with a restricted browser: {why}")
             continue
         if w.get("kind") == "history":
             out.append(f"{who} started without its Gitea history: "
@@ -512,6 +527,15 @@ _OLD_BOX_TOOL_HARNESS_MSG = ("this project's box tool predates the working mode 
                              "restart the project, then retry")
 _OLD_BOX_TOOL_SETTINGS_MSG = ("this project's box tool predates changing a box's agent "
                               "settings — restart the project, then retry")
+_OLD_BOX_TOOL_TRUSTED_MSG = ("this project's box tool predates trusted browsers — "
+                             "restart the project, then retry")
+# The browser image, not the tool: frozen per project (a sandbox project's box
+# image pins; a privileged research project's kept image), so a restart does
+# not help.
+_TRUSTED_BROWSER_TOO_OLD_MSG = ("this project's browser box image predates trusted "
+                                "browsers — a trusted browser box needs a new project")
+# MIRROR of rs_sandbox.BROWSER_TRUST_LABEL (the box tool is staged standalone).
+BROWSER_TRUST_LABEL = "research.box.browser-trust"
 
 
 # An older box tool refuses a folder path below the top level with its own
@@ -546,6 +570,7 @@ def _is_old_box_tool(r: "subprocess.CompletedProcess") -> bool:
         ("unrecognized arguments" in err
          and any(o in err for o in ("--folders", "--set", "--history-user",
                                     "--history-repo", "--share", "--no-share",
+                                    "--trusted-browser",
                                     *(f"--{f.replace('_', '-')}" for f in HARNESS_FIELDS))))
         or ("invalid choice" in err
             and any(c in err for c in ("'folders'", "'history-heal'", "'settings'",
@@ -2160,6 +2185,10 @@ class BoxAddRequest:
     # the caller's choice, None takes the box type's share_default (resolved
     # in box_add, which has the catalog). Recorded at create, never changed.
     share: bool | None = None
+    # A trusted browser (every browser tool, runtime PLAYWRIGHT_MCP_* honoured)
+    # instead of the restricted default. Needs the browser on (resolved in
+    # box_add, which has the catalog); recorded at create, never changed.
+    trusted_browser: bool = False
     # The box's working mode and doer/checker models (HARNESS_FIELDS; dev
     # boxes with an agent, outside research — gated in box_add, which has the
     # catalog and the project type). Shape-checked here.
@@ -2213,6 +2242,13 @@ class BoxAddRequest:
         share = kw.get("share")
         if share is not None and not isinstance(share, bool):
             raise ValidationError("share must be true or false when given")
+        # Plain bool (absent = restricted). An explicit browser=false can be
+        # refused here; a preset's default image is resolved in box_add.
+        trusted_browser = kw.get("trusted_browser", False)
+        if not isinstance(trusted_browser, bool):
+            raise ValidationError("trusted_browser must be true or false")
+        if trusted_browser and browser is False:
+            raise ValidationError("a trusted browser needs the browser on")
         # Preset input-field values. ⚠ Every message in this block names the
         # KEY and the rule, NEVER the value — a deliberate deviation from the
         # surrounding {x!r}-echoing idiom: ValidationError text reaches the
@@ -2289,7 +2325,7 @@ class BoxAddRequest:
             fetch=bool(kw.get("fetch", False)),
             folders=_coerce_box_folders(kw.get("folders")),
             history=_coerce_history_flag(kw.get("history")),
-            share=share, **harness)
+            share=share, trusted_browser=trusted_browser, **harness)
 
 
 @dataclass(frozen=True)
@@ -15911,6 +15947,31 @@ def _gate_box_web(container: str, want_browser: bool) -> None:
         raise ValidationError(_WEB_BOX_TOO_OLD_MSG)
 
 
+def _browser_image_trust(container: str) -> str:
+    """The project's browser box image vs trusted browsers: "yes" (it carries
+    the label), "no" (it exists without it) or "absent" (not in the project —
+    research delivers it lazily)."""
+    r = run(["docker", "exec", container, "docker", "image", "inspect", "-f",
+             "{{index .Config.Labels \"" + BROWSER_TRUST_LABEL + "\"}}",
+             SANDBOX_BOX_BROWSER_IMAGE], capture_output=True)
+    if r.returncode != 0:
+        return "absent"
+    return "yes" if (r.stdout or "").strip() == "1" else "no"
+
+
+def _gate_box_trusted_browser(container: str) -> None:
+    """Refuse a trusted browser box, before any side effect, when the project's
+    box tool or browser image predates trusted browsers. An absent tool or
+    image passes here (research stages and delivers them next); box_add asks
+    the image again after that delivery."""
+    r = run(["docker", "exec", container, "rs-sandbox", "create", "--help"],
+            capture_output=True)
+    if r.returncode == 0 and "--trusted-browser" not in (r.stdout or ""):
+        raise ValidationError(_OLD_BOX_TOOL_TRUSTED_MSG)
+    if _browser_image_trust(container) == "no":
+        raise ValidationError(_TRUSTED_BROWSER_TOO_OLD_MSG)
+
+
 # --- A docker project's Gitea history (a workflow's `gitea_history`) -----------
 # The box's in-box history step, run host-side in the project container as its
 # user. rscore cannot import the box tool, so it keeps a BYTE-PINNED copy of
@@ -16480,6 +16541,11 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     # base unless the request overrides).
     want_browser = (req.browser if req.browser is not None
                     else catalog.get(req.preset, {}).get("image") == "browser")
+    # A trusted browser needs the browser on — a pure check, so here, before
+    # every side effect (a dev preset resolves to the base image, so this
+    # refuses a trusted dev box before the dev block touches the Gitea).
+    if req.trusted_browser and not want_browser:
+        raise ValidationError("a trusted browser needs the browser on")
     # Sharing files with the project, resolved the same way (the box type's
     # share_default when the caller did not say) and ALWAYS passed explicitly
     # below: a box tool older than sharing then refuses the add instead of
@@ -16646,6 +16712,11 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     web_spec = catalog.get(req.preset, {}).get("web")
     if web_spec:
         _gate_box_web(container, want_browser)
+    # A trusted browser needs a box tool and a browser image that know trusted
+    # browsers (the browser-off refusal ran with the image resolution above).
+    # Before the history gate, like the web-app probes.
+    if req.trusted_browser:
+        _gate_box_trusted_browser(container)
     # Gitea history: every refusal here, before any side effect (the claims
     # that need the Gitea run last, so a cheap refusal never starts it).
     hist_claim = (_gate_box_history(req, catalog, container, workspace_path)
@@ -16658,6 +16729,11 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     progress.step("harness", "ensuring the box harness")
     _ensure_box_harness(container, project_network_for(req.project),
                         workspace_path, want_browser)
+    # The image is in the project now. A sandbox project's lazy delivery uses
+    # its frozen pins, which may predate trusted browsers: ask again, before
+    # the history provisioning, the dev wiring and the create.
+    if req.trusted_browser and _browser_image_trust(container) != "yes":
+        raise ValidationError(_TRUSTED_BROWSER_TOO_OLD_MSG)
     # Editor dist on demand (the staged-catalog Q1-live precedent above): an
     # editor box RO-mounts the supervisor's /opt/editor-dist, and a project
     # created before the host had a cached editor dist never got it staged —
@@ -16801,6 +16877,8 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     # two resolvers stay in agreement by construction).
     if req.browser is not None:
         argv.append("--browser" if req.browser else "--no-browser")
+    if req.trusted_browser:
+        argv.append("--trusted-browser")
     if req.fetch:
         argv.append("--fetch")
     if req.mcps:
@@ -16853,6 +16931,8 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
                 die(_OLD_BOX_TOOL_HISTORY_MSG)
             if harness and any(f"--{f.replace('_', '-')}" in err for f in harness):
                 die(_OLD_BOX_TOOL_HARNESS_MSG)
+            if req.trusted_browser and "--trusted-browser" in err:
+                die(_OLD_BOX_TOOL_TRUSTED_MSG)
             die(_OLD_BOX_TOOL_SHARE_MSG)
         die(f"failed to add box: {(r.stderr or r.stdout).strip()}")
     try:
@@ -17062,6 +17142,8 @@ def box_list(req: "BoxListRequest", _progress=None) -> BoxListResult:  # type: i
         die(f"could not parse rs-sandbox output: {r.stdout.strip()!r}")
     boxes = [{"name": e.get("name"), "ip": e.get("ip"),
               "agent": e.get("agent", "none"), "browser": bool(e.get("browser")),
+              # True only for the literal True the box tool reports.
+              "browser_trusted": e.get("browser_trusted") is True,
               "state": e.get("state"),
               # Read tolerantly (an older box tool's rows carry neither) and
               # filtered to valid paths (the record is container-writable).

@@ -758,6 +758,10 @@ def _verb_destroy(args: dict, progress=None) -> dict:
 # presets in box_add.
 BOX_ADD_WEBUI_FIELDS = frozenset({"project", "name", "preset", "agent", "editor",
                                   "browser",
+                                  # A trusted browser (in-box: which tool policy
+                                  # the box's agents run under) — a plain bool;
+                                  # needs the browser, gated in box_add.
+                                  "trusted_browser",
                                   # Values for the preset's DECLARED input
                                   # fields ({NAME: value}; may carry secrets —
                                   # request field is repr=False, values reach

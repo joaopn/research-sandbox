@@ -33,6 +33,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import NoReturn
 
@@ -288,6 +289,22 @@ BOX_IMAGE_BROWSER = "rs-sandbox-box-browser:latest"
 # constant; a host pytest pins the two equal. Used by cmd_create's collision
 # die (two-gate lockstep with box_add's host-side pre-flight).
 BAKED_BROWSER_MCPS = ("playwright",)
+# Trusted browser boxes. A browser box is RESTRICTED by default — the image's
+# own policy: the reviewed deny list for every agent, and a Playwright server
+# that ignores runtime PLAYWRIGHT_MCP_* variables. A TRUSTED one (chosen at
+# create, recorded on the entry, fixed after) runs with an empty-deny Claude
+# Code policy laid read-only over the image's and RS_BOX_BROWSER=trusted, which
+# the box's MCP render reads to drop pi's hiding and the clearing wrapper.
+# Applied only when the image carries the label (an image built before trusted
+# boxes runs restricted, with a `browser` warning): fail closed.
+BROWSER_TRUST_LABEL = "research.box.browser-trust"
+MANAGED_SETTINGS_IN_BOX = "/etc/claude-code/managed-settings.json"
+# The empty-deny policy file, in this (the supervisor) user's home — never under
+# /workspace, so no box can write it. A recreate wipes the home; every trusted
+# run (and a plain start) writes it again first.
+TRUSTED_POLICY_DIR = ".rs-box-policy"
+TRUSTED_POLICY_NAME = "trusted-managed-settings.json"
+TRUSTED_POLICY = {"permissions": {"deny": []}}
 IP_PREFIX = "192.168.99."
 # Box IP pool — the .14-.25 PI sub-range (shared with BYO sandboxes; the whole
 # .10-.25 PI range is ACCEPTed by the inner firewall, so no per-box rule).
@@ -1265,9 +1282,18 @@ _SKILL_REASON_TEXT = {
 }
 
 
+_BROWSER_REASON_TEXT = {
+    "no-trusted-image": "its browser image predates trusted browsers",
+    "no-policy-file": "the trusted browser's policy file could not be written",
+}
+
+
 def _warning_text(name: str, w: dict) -> str:
     """Human line for one warning (the in-box CLI's stderr only; the host
     builds its own wording from the structured form)."""
+    if w.get("kind") == "browser":
+        why = _BROWSER_REASON_TEXT.get(w.get("reason"), "it cannot run trusted")
+        return (f"warning: box {name!r} starts with a restricted browser ({why})")
     if w.get("kind") == "skill":
         if w.get("reason") == "no-text":
             who = ("no agent" if "box" not in w else "the project agent"
@@ -1645,6 +1671,18 @@ def _container_harness_env(cname: str) -> set[tuple[str, str]]:
     return out
 
 
+def _container_browser_trusted(cname: str) -> bool:
+    """True when the box container was RUN trusted (its environment carries
+    RS_BOX_BROWSER=trusted, which _run_box sets only together with the policy
+    mount)."""
+    r = _docker("container", "inspect", "-f", "{{json .Config.Env}}", cname)
+    try:
+        items = json.loads(r.stdout) if r.returncode == 0 else []
+    except ValueError:
+        items = []
+    return isinstance(items, list) and "RS_BOX_BROWSER=trusted" in items
+
+
 def _box_carried_agents() -> list[str]:
     """Every agent an agent box receives: the shared copy is the project's
     recorded set plus claude, deployed whole into each agent box — MIRROR of
@@ -1717,6 +1755,54 @@ def _project_box_pair() -> dict:
     return pair if isinstance(pair, dict) else {}
 
 
+def _image_supports_trusted(image: str) -> bool:
+    """True only when `image` carries the trusted-browser label with the exact
+    value "1". An absent label (or an image without any labels) prints an
+    empty string and a missing image fails the inspect: both are False."""
+    r = _docker("image", "inspect", "-f",
+                "{{index .Config.Labels \"" + BROWSER_TRUST_LABEL + "\"}}", image)
+    return r.returncode == 0 and (r.stdout or "").strip() == "1"
+
+
+def _write_trusted_policy() -> Path | None:
+    """Write the empty-deny Claude Code policy a trusted box mounts read-only,
+    and return its path; None when it cannot be written (something that is not
+    a folder at the folder's name, a folder at the file's name, a full disk) —
+    the caller then runs the box restricted. A fresh temp file in the same
+    folder (mkstemp: O_EXCL, a unique name, so two runs never share one) is
+    renamed over the path; the content never changes, so a running box that
+    mounted the previous file sees the same policy."""
+    folder = Path.home() / TRUSTED_POLICY_DIR
+    path = folder / TRUSTED_POLICY_NAME
+    try:
+        folder.mkdir(mode=0o700, exist_ok=True)
+        if folder.is_symlink() or not folder.is_dir():
+            return None
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            return None
+        fd, tmp = tempfile.mkstemp(dir=folder, prefix=TRUSTED_POLICY_NAME + ".")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                fh.write(json.dumps(TRUSTED_POLICY) + "\n")
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        return None
+    return path
+
+
+def _entry_browser_trusted(entry: dict) -> bool:
+    """The trusted-browser record: only the literal True on a browser box
+    counts (the record is container-writable, like _entry_share)."""
+    return entry.get("browser_trusted") is True and bool(entry.get("browser"))
+
+
 def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
              editor: bool = False, editor_port: int = 0, clone_repo: str = "",
              clone_ref: str = "", clone_setup: str = "", preset_setup: str = "",
@@ -1726,7 +1812,8 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
              node: bool = False, folders: list[str] | None = None,
              history: dict | None = None,
              web: dict | None = None, share: bool = False,
-             harness: dict | None = None) -> list[dict]:
+             harness: dict | None = None,
+             trusted_browser: bool = False) -> list[dict]:
     """docker run a box in the local inner dockerd. ``browser`` selects the
     Chromium-equipped image; ``agent`` (any staged agent|none): any agent mounts
     the project's MERGED copy-source and exports RS_BOX_AGENT=claude (the baked
@@ -1746,6 +1833,25 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     (WORKSPACE / sub).mkdir(parents=True, exist_ok=True)
     cname = box_container(name)
     image = BOX_IMAGE_BROWSER if browser else BOX_IMAGE
+    # A trusted browser: both halves or neither (fail closed — restricted with
+    # a `browser` warning when the image cannot honour it or the policy file
+    # cannot be written). `--mount`, never `-v`: on a privileged-dind recreate
+    # the inner daemon restarts the old container before this re-run writes
+    # the (wiped) policy file again, and `-v` would make dockerd create a
+    # root-owned FOLDER at the missing source; `--mount` just fails that start.
+    trust_args: list[str] = []
+    browser_warnings: list[dict] = []
+    if browser and trusted_browser:
+        if not _image_supports_trusted(image):
+            browser_warnings.append({"kind": "browser", "reason": "no-trusted-image"})
+        else:
+            policy = _write_trusted_policy()
+            if policy is None:
+                browser_warnings.append({"kind": "browser", "reason": "no-policy-file"})
+            else:
+                trust_args = ["-e", "RS_BOX_BROWSER=trusted",
+                              "--mount", f"type=bind,source={policy},"
+                                         f"target={MANAGED_SETTINGS_IN_BOX},readonly"]
     _docker("rm", "-f", cname)  # idempotent
     # Guard the mount so a missing source can't turn a box run into a cryptic mount
     # error; the box's entrypoint absence-guard surfaces it as "claude not found".
@@ -1908,6 +2014,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         *node_mount,
         *folder_mounts,
         *mailbox_mounts,
+        *trust_args,
         *editor_publish,
         *loopback_publish,
         "-e", f"RS_SERVICE_CODE_SERVER={'enabled' if editor else 'disabled'}",
@@ -1985,7 +2092,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         _write_box_model_detached(cname, _box_model_ops({"model": model, "effort": effort}))
     # F3 Slice 2b: launch the in-box loopback forwarders for the freshly-run box.
     _launch_box_forwarders(cname, lp_list)
-    return folder_warnings + mailbox_warnings + history_warnings
+    return folder_warnings + mailbox_warnings + history_warnings + browser_warnings
 
 
 def _launch_box_forwarders(cname: str, loopback_ports: list[dict]) -> None:
@@ -2078,6 +2185,9 @@ def _rerun_box(name: str, entry: dict) -> list[dict]:
              # The web app snapshotted at create (a catalog edit does not reach
              # an existing box; a vanished preset does not take its tab away).
              web=_entry_web(entry),
+             # Fixed at create, re-applied from the STORED entry at every run
+             # (the env and the policy mount are fixed at docker run).
+             trusted_browser=_entry_browser_trusted(entry),
              # From the STORED entry: True only when its create recorded it
              # (an entry from before sharing was a choice does not share).
              share=_entry_share(entry))
@@ -2241,6 +2351,20 @@ def cmd_create(args: argparse.Namespace) -> None:
     if clash:
         die(f"preset MCP server name(s) {', '.join(clash)} collide with "
             f"selected MCP(s); deselect or rename them")
+    # Trusted browser: chosen here, recorded, fixed after. Two-gate lockstep
+    # with box_add (which refuses the same three first, before any host side
+    # effect); this gate covers the in-supervisor path. Before any state write.
+    # The text reaches the browser through the op tail: no CLI names in it.
+    # getattr: callers that build the namespace by hand predate the option.
+    trusted_browser = bool(getattr(args, "trusted_browser", False))
+    if trusted_browser:
+        if is_dev:
+            die("a dev box cannot have a trusted browser (dev boxes have no browser)")
+        if not browser:
+            die("a trusted browser needs the browser on")
+        if not _image_supports_trusted(BOX_IMAGE_BROWSER):
+            die("this project's browser box image predates trusted browsers; "
+                "a trusted browser box needs a new project")
     # A fields preset needs its env file staged BEFORE the run. The sanctioned
     # path (the project's Add-box window) stages it; a direct in-supervisor run
     # is the power path — stage ~/.rs-box-env/<name>.env yourself.
@@ -2346,6 +2470,11 @@ def cmd_create(args: argparse.Namespace) -> None:
         # Every given path is kept (sorted): each run re-checks each one, so a
         # folder that is gone now and comes back is mounted again at a restart.
         entry["folders"] = folders
+    if trusted_browser:
+        # The literal True is the only record (_entry_browser_trusted); a
+        # restricted box carries no key, exactly like one created before
+        # trusted browsers existed.
+        entry["browser_trusted"] = True
     if share:
         # The literal True is the only sharing record (_entry_share); a box
         # that does not share carries no key, exactly like a box created
@@ -2386,9 +2515,11 @@ def cmd_create(args: argparse.Namespace) -> None:
                         dev_subnet=dev_subnet, branch=branch, model=model,
                         effort=effort, fetch=fetch, node=node, folders=folders,
                         history=history, loopback_ports=loopback_ports,
-                        web=web, share=share, harness=harness or None)
+                        web=web, share=share, harness=harness or None,
+                        trusted_browser=trusted_browser)
     out = {"name": name, "ip": ip, "preset": args.preset,
-           "browser": browser, "agent": agent, "editor": editor,
+           "browser": browser, "browser_trusted": trusted_browser,
+           "agent": agent, "editor": editor,
            "editor_port": editor_port or None, "fetch": fetch,
            "folders": folders, "share": share, "warnings": warnings,
            "container": box_container(name)}
@@ -2543,6 +2674,26 @@ def cmd_start(args: argparse.Namespace) -> None:
         _print_warnings(args.name, _rerun_box(args.name, entry))
         print(f"box {args.name!r}: re-run at {entry['ip']} "
               f"(its working mode changed while parked)")
+        return
+    # A browser box whose container does not run in the mode its record names
+    # (a trusted box that came up restricted — its policy could not be written,
+    # or its image lacked trusted support at that run) is re-run, so a start
+    # tries trusted again; the env and the mount are fixed at docker run.
+    if exists and entry.get("browser") \
+            and _container_browser_trusted(cname) != _entry_browser_trusted(entry):
+        _print_warnings(args.name, _rerun_box(args.name, entry))
+        print(f"box {args.name!r}: re-run at {entry['ip']} "
+              f"(its browser did not run in its recorded mode)")
+        return
+    # A trusted browser box mounts the policy file from this home, which a
+    # recreate wiped: write it before a plain start (the container already
+    # passed the image check at its run). When it cannot be written, re-run
+    # instead — restricted, with a `browser` warning — rather than fail on
+    # docker's own mount error.
+    if exists and _entry_browser_trusted(entry) and _write_trusted_policy() is None:
+        _print_warnings(args.name, _rerun_box(args.name, entry))
+        print(f"box {args.name!r}: re-run at {entry['ip']} "
+              f"(its trusted browser policy could not be written)")
         return
     if exists:
         r = _docker("start", cname)
@@ -3043,7 +3194,8 @@ def cmd_list(args: argparse.Namespace) -> None:
         # sandboxes carry no agent key, so render their column as `-`.
         agent = e.get("agent", "none") if e.get("kind") == KIND else None
         rows.append({"name": name, "kind": e.get("kind"), "ip": e.get("ip"),
-                     "browser": bool(e.get("browser")), "agent": agent,
+                     "browser": bool(e.get("browser")),
+                     "browser_trusted": _entry_browser_trusted(e), "agent": agent,
                      "dev": bool(e.get("dev")), "folders": _entry_folders(e),
                      "share": _entry_share(e),
                      "state": states.get(cname, "absent")})
@@ -3102,6 +3254,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="override the preset's image: --browser runs the "
                         "Playwright+Chromium box image, --no-browser the base "
                         "image (default: the preset's image)")
+    c.add_argument("--trusted-browser", action="store_true",
+                   help="a trusted browser: every browser tool for every agent "
+                        "in the box and runtime PLAYWRIGHT_MCP_* variables "
+                        "honoured (default: restricted — the reviewed deny "
+                        "list); needs the browser; fixed after create")
     c.add_argument("--fetch", action="store_true",
                    help="wire this box for rs-fetch (read-only fetch of "
                         "dev-lane agent commits from the shared gitea); the "

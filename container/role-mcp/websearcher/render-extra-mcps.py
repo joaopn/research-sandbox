@@ -21,27 +21,33 @@ source-of-truth (extra-mcps.yaml) and emits:
                                  (the highest-precedence permission
                                  scope per Claude Code's docs). Carries
                                  permissions.deny derived from YAML's
-                                 denied_tools mapping (box scope:
-                                 box_denied_tools), prefixed with
+                                 denied_tools mapping, prefixed with
                                  `mcp__<mcp-server-name>__`.
 
-  --deny-scope {role,box}        Which deny list the managed settings
-                                 carry: `role` (default) = denied_tools;
-                                 `box` = box_denied_tools, the browser
-                                 box's list for every agent in the box.
-
-  --out-denied <path>            Optional. The same scoped tools as
-                                 {server: [tool, ...]}; the box's MCP
-                                 render marks them `hidden` for pi. Built
-                                 by the same computation as the managed
+  --out-denied <path>            Optional. The same denied tools as
+                                 {server: [tool, ...]}; the browser box's
+                                 MCP render marks them `hidden` for pi.
+                                 Built from the same list as the managed
                                  settings, so the two agents cannot drift.
+
+  --wrap <path>                  Optional. Insert <path> right after the
+                                 first `--` of each server's args (after
+                                 `dumb-init --`), so the server starts
+                                 through it. The browser box passes its
+                                 environment-clearing wrapper here (a
+                                 restricted box ignores PLAYWRIGHT_MCP_*
+                                 variables); the role passes nothing.
+
+  --out-extra-unwrapped <path>   Optional, with --wrap. The same server
+                                 declaration WITHOUT the wrapper (the
+                                 browser box's trusted declaration).
 
 Placeholders resolved at render time:
   __PLAYWRIGHT_MCP_BIN__  -> --bin <path>
   __CONFIG_PATH__         -> --out-config <path>
 
 After writing the files it CHECKS THE TOOL LIST: it starts each
-server exactly as rendered, asks for its tools over stdio (initialize, then
+server exactly as rendered (both declarations when --wrap is given), asks for its tools over stdio (initialize, then
 tools/list — no browser is launched for that), and fails when a tool is in
 neither `denied_tools` nor `allowed_tools`. So a Playwright bump that adds a
 tool fails the image build until the YAML reviews it.
@@ -86,42 +92,26 @@ TERM_GRACE_S = 5
 MCP_PROTOCOL_VERSION = "2025-03-26"
 
 
-SCOPES = ("role", "box")
-
-
 class ToolsCheckError(Exception):
     """The tool list could not be read, or it holds an unreviewed tool."""
 
 
-def scoped_denied(spec: dict, scope: str) -> list[str]:
-    """The sorted denied tool names for `scope`. Validates `box_denied_tools`
-    in BOTH scopes (a YAML is valid or not whoever renders it): a list of
-    non-empty strings, no duplicates, each a `denied_tools` key, so a box can
-    never block a tool the YAML never reviewed nor one the role keeps. The box
-    scope refuses a YAML without the list: a box image must never fall back to
-    the role's list or to none."""
-    if scope not in SCOPES:
-        raise ValueError(f"deny scope must be one of {', '.join(SCOPES)}, got {scope!r}")
-    denied_tools = spec.get("denied_tools") or {}
-    box = spec.get("box_denied_tools")
-    if box is not None:
-        if not isinstance(box, list) or not all(isinstance(t, str) and t.strip() for t in box):
-            raise ValueError("box_denied_tools must be a list of non-empty tool names")
-        dups = sorted({t for t in box if box.count(t) > 1})
-        if dups:
-            raise ValueError(f"box_denied_tools names a tool twice: {', '.join(dups)}")
-        outside = sorted(set(box) - set(denied_tools))
-        if outside:
-            raise ValueError("box_denied_tools must name only denied_tools entries; "
-                             f"not denied there: {', '.join(outside)}")
-    if scope == "role":
-        return sorted(denied_tools)
-    if box is None:
-        raise ValueError("the box deny scope needs a box_denied_tools list in the YAML")
-    return sorted(box)
+def wrap_servers(extra: dict, wrap: str) -> dict:
+    """A copy of `extra` with `wrap` inserted right after the first `--` of
+    each server's args (the YAML's `dumb-init --`), so the server is exec'd
+    through it. A server without a `--` is refused: there is no place where
+    the wrapper would run before the server rather than as its argument."""
+    out: dict[str, dict] = {}
+    for name, server in extra["mcpServers"].items():
+        args = list(server["args"])
+        if "--" not in args:
+            raise ValueError(f"mcpServers.{name}.args has no `--` to put the wrapper after")
+        k = args.index("--") + 1
+        out[name] = {**server, "args": args[:k] + [wrap] + args[k:]}
+    return {"mcpServers": out}
 
 
-def render(yaml_text: str, bin_path: str, config_path: str, scope: str = "role"
+def render(yaml_text: str, bin_path: str, config_path: str
            ) -> tuple[dict, dict, dict]:
     spec = yaml.safe_load(yaml_text)
     if not isinstance(spec, dict):
@@ -178,12 +168,10 @@ def render(yaml_text: str, bin_path: str, config_path: str, scope: str = "role"
     # Tool-restriction rules in Claude Code use the format `mcp__<server>__<tool>`
     # where <server> is the key under spawn-mcp.json's mcpServers (here:
     # whatever the YAML's mcpServers key is — typically "playwright"). Build
-    # the deny array by Cartesian product of mcpServers names × the scope's
-    # denied tools (the role: denied_tools; the box: box_denied_tools).
-    scoped = scoped_denied(spec, scope)
+    # the deny array by Cartesian product of mcpServers names × denied_tools.
     deny_rules: list[str] = []
     for server_name in sorted(out_servers):
-        for tool_name in scoped:
+        for tool_name in sorted(denied_tools):
             deny_rules.append(f"mcp__{server_name}__{tool_name}")
     managed_settings = {
         "permissions": {
@@ -344,12 +332,20 @@ def main(argv: list[str]) -> int:
                         "ALSO the value substituted into __CONFIG_PATH__")
     p.add_argument("--out-managed-settings", required=True, type=Path,
                    help="Destination for the Claude Code managed-settings JSON")
-    p.add_argument("--deny-scope", choices=SCOPES, default="role",
-                   help="role (default): denied_tools; box: box_denied_tools")
     p.add_argument("--out-denied", type=Path,
                    help="Optional destination for {server: [denied tool, ...]} "
-                        "in the chosen scope (the browser box's pi deny)")
+                        "(the browser box's pi deny)")
+    p.add_argument("--wrap",
+                   help="Optional wrapper inserted after each server's `--` "
+                        "in --out-extra (the browser box's environment clearing)")
+    p.add_argument("--out-extra-unwrapped", type=Path,
+                   help="With --wrap: destination for the declaration without "
+                        "the wrapper (the browser box's trusted declaration)")
     args = p.parse_args(argv)
+    if args.out_extra_unwrapped is not None and not args.wrap:
+        p.error("--out-extra-unwrapped needs --wrap")
+    if args.wrap is not None and not args.wrap.strip():
+        p.error("--wrap is empty")
 
     # Fail LOUD at build if --bin resolved empty. The Dockerfiles pass
     # `$(command -v playwright-mcp)`, which yields "" (not an error) if the
@@ -363,22 +359,30 @@ def main(argv: list[str]) -> int:
                 "changed (check `command -v playwright-mcp` in the Dockerfile)")
 
     yaml_text = args.yaml.read_text()
-    extra, mcp_config, managed_settings = render(
-        yaml_text, args.bin, str(args.out_config), args.deny_scope)
+    plain, mcp_config, managed_settings = render(
+        yaml_text, args.bin, str(args.out_config))
+    extra = wrap_servers(plain, args.wrap) if args.wrap else plain
     outputs = [(args.out_extra, extra),
                (args.out_config, mcp_config),
                (args.out_managed_settings, managed_settings)]
+    checked = [extra]
+    if args.out_extra_unwrapped is not None:
+        outputs.append((args.out_extra_unwrapped, plain))
+        checked.append(plain)
     if args.out_denied is not None:
-        tools = scoped_denied(yaml.safe_load(yaml_text), args.deny_scope)
+        tools = sorted(yaml.safe_load(yaml_text).get("denied_tools") or {})
         outputs.append((args.out_denied, {name: tools for name in extra["mcpServers"]}))
     for path, data in outputs:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
     # After the writes: the server reads its --config file at start.
     denied, allowed = reviewed_tools(yaml_text)
+    # Every declaration written is started once: the unwrapped one too, since
+    # this is the only build-time proof that the trusted command starts at all.
     try:
-        for line in check_tools(extra, denied, allowed):
-            print(f"render-extra-mcps: {line}")
+        for decl in checked:
+            for line in check_tools(decl, denied, allowed):
+                print(f"render-extra-mcps: {line}")
     except ToolsCheckError as e:
         print(f"render-extra-mcps: tool check failed:\n{e}", file=sys.stderr)
         return 1
