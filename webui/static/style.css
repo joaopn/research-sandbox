@@ -346,18 +346,35 @@ html.mobile .project-rail .rail-separator { cursor: default; }
 
 /* Per-project floating config box — position: fixed in JS so it overlays
    outside the (possibly narrow) rail rather than being clipped by it.
-   Hosts the Tabs visibility checkboxes now; structured for more sections
-   later. */
+   Its sections sit in folded boxes (.config-fold) stacked into columns
+   (.config-col, built by app.js layoutConfigFolds: as many columns as fit at
+   --config-box-min, each box into the shortest), each column at most
+   --config-box-max wide, so a panel dragged wider (resize, the corner) shows
+   them side by side with no gaps under short boxes.
+   --config-box-min is the old panel's cap, the width every section was laid
+   out for; --config-box-max fits the Agents model cell (260px basis) beside
+   its effort picker on one line. The panel opens one box wide. The drag is
+   width only: the height already follows the content up to the room on
+   screen (--config-room). openProjectConfigBox remembers a dragged width
+   and caps the drag at the window edge (--config-room-w). */
 .project-config-box {
+    --config-box-min: 280px;
+    --config-box-max: 420px;
+    --config-pad: 12px;
+    --config-gap: 8px;
     position: fixed;
     z-index: 200;
-    min-width: 200px;
-    max-width: 280px;
+    box-sizing: border-box;
+    /* one box plus the panel's padding and 1px borders */
+    width: calc(var(--config-box-max) + 2 * var(--config-pad) + 2px);
+    min-width: calc(var(--config-box-min) + 2 * var(--config-pad) + 2px);
+    max-width: var(--config-room-w, calc(100vw - 16px));
+    resize: horizontal;
     background: var(--bg-card);
     border: 1px solid var(--border-strong);
     border-radius: 6px;
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
-    padding: 10px 12px;
+    padding: 10px var(--config-pad);
     font-size: 13px;
     color: var(--fg-base);
     /* Scroll rather than run off the bottom: openProjectConfigBox sets
@@ -390,15 +407,8 @@ html.mobile .project-rail .rail-separator { cursor: default; }
 .project-config-box .config-check input { cursor: pointer; }
 .project-config-box .config-check.floor { opacity: 0.6; cursor: default; }
 .project-config-box .config-empty { color: var(--fg-faint); font-size: 12px; }
-/* The Sidebar section: the one action in this box that removes something, so it
-   is ruled off from the per-project settings above it. */
-.project-config-box .config-section.config-danger {
-    margin-top: 10px;
-    padding-top: 8px;
-    border-top: 1px solid var(--border);
-}
-/* A web-page port's tab address (Ports section): one long unbroken URL in a
-   280px box, so it must wrap anywhere; user-select:all makes one click take it. */
+/* A web-page port's tab address (Ports box): one long unbroken URL in a
+   narrow box, so it must wrap anywhere; user-select:all makes one click take it. */
 .project-config-box .config-port-addr {
     display: block;
     color: var(--fg-muted);
@@ -406,8 +416,8 @@ html.mobile .project-rail .rail-separator { cursor: default; }
     overflow-wrap: anywhere;
     user-select: all;
 }
-/* A setting row (Extensions, Models, Agents, Ports …): name, a muted state word,
-   then its buttons, spaced apart; the row wraps inside the 280px box. */
+/* A setting row (Extensions, Agents, Ports …): name, a muted state word,
+   then its buttons, spaced apart; the row wraps inside its box. */
 .project-config-box .config-box-row {
     display: flex;
     flex-wrap: wrap;
@@ -1787,17 +1797,37 @@ html.mobile .box-collapse-head { padding: 8px 0; }
 }
 html.mobile .project-config-box .config-folders-input { font-size: 16px; }
 .project-config-box .config-box-warn { color: var(--warn-fg); }
-/* The ⚙ Sharing box (app.js appendSharingSection): the project's folders and,
-   on a project with boxes, Box folders, in one bordered sub-box that opens
-   folded, like the create dialog's Sharing box. */
-.project-config-box .config-sharing {
-    margin: 10px 0 4px;
+/* The ⚙ panel's boxes (app.js makeProjectConfigBox + layoutConfigFolds):
+   bordered folds stacked in equal columns, each column at most one box wide.
+   Before the stacking runs the folds sit directly in .config-boxes, one per
+   line. The margin is 0 here (not .box-collapsible's) because the gaps space
+   them. */
+.project-config-box .config-boxes {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--config-gap);
+    align-items: flex-start;
+}
+.project-config-box .config-boxes > .config-fold { flex: 1 1 100%; }
+.project-config-box .config-col {
+    flex: 1 1 0;
+    min-width: 0;
+    max-width: var(--config-box-max);
+    display: flex;
+    flex-direction: column;
+    gap: var(--config-gap);
+}
+.project-config-box .config-fold {
+    box-sizing: border-box;
+    margin: 0;
     padding: 6px 8px;
     border: 1px solid var(--border);
     border-radius: 6px;
 }
-.project-config-box .config-sharing.open > .box-collapse-head { margin-bottom: 6px; }
-.project-config-box .config-sharing .box-collapse-body > .config-section + .config-section { margin-top: 10px; }
+.project-config-box .config-fold.open > .box-collapse-head { margin-bottom: 6px; }
+.project-config-box .config-fold .box-collapse-body > .config-section + .config-section { margin-top: 10px; }
+/* Box agents sits under the Agents box's own controls, not beside a section. */
+.project-config-box .config-box-agents { margin-top: 10px; }
 .project-config-box .config-save-row { justify-content: flex-end; }
 .box-settings .mgmt-check {
     display: inline-flex;
@@ -2401,10 +2431,14 @@ html.mobile .term-keybar .key.active {
 /* The per-project ⚙ config box (opened from the Projects view rows) is the
    mobile enable/disable surface for the whitelisted tabs (Editor/Reader
    toggles live there). The JS position clamp handles x/y but not height —
-   cap it so Tabs + Extensions + Ports never exceed a phone viewport. */
+   cap it so its boxes never exceed a phone viewport. One column, no drag
+   corner, and never wider than the screen (the desktop minimum would be). */
 html.mobile .project-config-box {
     max-height: 70dvh;
     overflow-y: auto;
+    resize: none;
+    min-width: 0;
+    width: min(calc(var(--config-box-max) + 2 * var(--config-pad) + 2px), calc(100vw - 16px));
 }
 
 /* 16px inputs stop iOS Safari's auto-zoom-on-focus (fires below 16px), which

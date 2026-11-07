@@ -46,6 +46,9 @@ const RAIL_WIDTH_DEFAULT = 200;
 // status strip. Same posture as COLUMN_MIN_FRAC.
 const RAIL_WIDTH_MIN = 80;
 const RAIL_WIDTH_MAX = 480;
+// The ⚙ project settings panel's width after the operator dragged its corner
+// (one width for every project's panel; the default lives in style.css).
+const CONFIG_PANEL_WIDTH_KEY = "rs-webui-config-panel-width";
 const PBKDF2_ITERATIONS = 600000;
 // Unified login, split derivations: the ONE master password yields (a) the
 // vault key (PBKDF2 over the random per-vault salt above — never transmitted)
@@ -11085,9 +11088,12 @@ function visibleServiceIds(projectName, enabled) {
 }
 
 let projectConfigBox = null;
+// Watches the open panel for a drag of its corner, to remember the width.
+let projectConfigResize = null;
 
 function closeProjectConfigBox() {
     if (!projectConfigBox) return;
+    if (projectConfigResize) { projectConfigResize.disconnect(); projectConfigResize = null; }
     projectConfigBox.remove();
     projectConfigBox = null;
     document.removeEventListener("pointerdown", onConfigOutsidePointer, true);
@@ -11115,6 +11121,21 @@ function openProjectConfigBox(project, anchorEl) {
 
     const box = makeProjectConfigBox(project);
     box.dataset.project = project.name;
+    // The width the operator last dragged the panel to, shrunk to the window
+    // (desktop only: the phone panel has no drag corner). Applied BEFORE the
+    // first place(), which reads the width. `applied` is the inline width this
+    // code set, so the observer below saves only a drag, never this.
+    const mobile = mobileModeActive();
+    let applied = "";
+    if (!mobile) {
+        let saved = NaN;
+        try { saved = parseInt(localStorage.getItem(CONFIG_PANEL_WIDTH_KEY) || "", 10); }
+        catch (e) { /* storage blocked: the default width */ }
+        if (Number.isFinite(saved) && saved > 0) {
+            applied = `${Math.min(saved, window.innerWidth - 16)}px`;
+            box.style.width = applied;
+        }
+    }
     document.body.appendChild(box);
     projectConfigBox = box;
 
@@ -11127,7 +11148,15 @@ function openProjectConfigBox(project, anchorEl) {
     // --config-room), so sections that load or unfold later scroll inside it
     // instead of running off the window; the cap is lifted while measuring.
     const place = () => {
+        // A drag pushed past the window edge leaves an inline width wider than
+        // the panel shows (the cap below holds it): bring it back to the shown
+        // width before the cap is lifted, or measuring would grow the panel to
+        // a width the operator never saw (and the observer would save it).
+        if (box.style.width && box.offsetWidth < parseFloat(box.style.width)) {
+            box.style.width = `${box.offsetWidth}px`;
+        }
         box.style.removeProperty("--config-room");
+        box.style.removeProperty("--config-room-w");
         const bw = box.offsetWidth;
         const bh = box.offsetHeight;
         let left = r.left;
@@ -11139,36 +11168,132 @@ function openProjectConfigBox(project, anchorEl) {
         box.style.top = `${Math.round(top)}px`;
         box.style.setProperty("--config-room",
                               `${Math.max(0, Math.round(window.innerHeight - 8 - top))}px`);
+        // A drag of the corner stops at the window's right edge.
+        box.style.setProperty("--config-room-w",
+                              `${Math.max(0, Math.round(window.innerWidth - 8 - left))}px`);
     };
-    place();
-    // Unfolding Sharing grows the box; place it again with the new height (it
-    // runs after the fold's own click handler, which is set first), so it can
-    // move up to show what unfolded.
-    const sharingHead = box.querySelector(".config-sharing > .box-collapse-head");
-    if (sharingHead) sharingHead.addEventListener("click", place);
+    // Stack the boxes for the panel's width (it is attached, so they measure),
+    // then place the panel.
+    const grid = box.querySelector(".config-boxes");
+    const reflow = () => {
+        if (grid) layoutConfigFolds(grid);
+        place();
+    };
+    reflow();
+    // Unfolding or folding a box changes its height: stack again and place the
+    // panel again (this runs after the fold's own click handler, which is set
+    // first), so it can move up to show what unfolded.
+    for (const head of box.querySelectorAll(".config-fold > .box-collapse-head")) {
+        head.addEventListener("click", reflow);
+    }
+    // A drag of the corner writes the panel's inline width: stack the boxes
+    // again for the new width (not placed again, so the panel stays under the
+    // pointer), and remember the width as rendered (a drag pushed past the
+    // window edge is capped on screen).
+    if (!mobile && typeof ResizeObserver === "function") {
+        let last = applied;
+        // Keyed on the panel's outer width, which a scrollbar does not change:
+        // keyed on the inner width, a re-stack that adds or drops the
+        // scrollbar would change the column count again, every frame.
+        let panelWidth = box.offsetWidth;
+        projectConfigResize = new ResizeObserver(() => {
+            if (grid && box.offsetWidth !== panelWidth) {
+                panelWidth = box.offsetWidth;
+                layoutConfigFolds(grid);
+            }
+            if (!box.style.width || box.style.width === last) return;
+            last = box.style.width;
+            try { localStorage.setItem(CONFIG_PANEL_WIDTH_KEY, String(Math.round(box.offsetWidth))); }
+            catch (e) { /* storage blocked: the width lasts until the panel closes */ }
+        });
+        projectConfigResize.observe(box);
+    }
 
     document.addEventListener("pointerdown", onConfigOutsidePointer, true);
 }
 
+// Stack the panel's boxes masonry-style (maintainer 2026-11-07): as many
+// columns as the width fits at --config-box-min each (style.css; one on a
+// phone), and each box, in the panel's order, into the column that is
+// shortest at that moment (the leftmost on a tie). A box's place depends only
+// on the boxes before it, so unfolding one never moves it, only those after.
+// Re-run whenever a box folds or unfolds and whenever the width changes;
+// moving the nodes keeps every control's value (there are no frames inside),
+// but a moved node loses focus and emptying the columns scrolls the panel to
+// the top, so both are put back afterwards.
+function layoutConfigFolds(container) {
+    const folds = container.__folds || [];
+    const panel = container.parentNode;
+    const scrolled = panel ? panel.scrollTop : 0;
+    const act = document.activeElement;
+    const inside = !!act && act !== document.body && container.contains(act);
+    let selStart = null, selEnd = null;
+    if (inside) {
+        try { selStart = act.selectionStart; selEnd = act.selectionEnd; }
+        catch (e) { /* not a text control */ }
+    }
+    const cs = getComputedStyle(container);
+    const min = parseFloat(cs.getPropertyValue("--config-box-min"));
+    const gap = parseFloat(cs.getPropertyValue("--config-gap")) || 0;
+    const n = min > 0 ? Math.max(1, Math.floor((container.clientWidth + gap) / (min + gap))) : 1;
+    const cols = [];
+    for (let i = 0; i < n; i++) cols.push(el("div", { class: "config-col" }));
+    container.replaceChildren(...cols);
+    const heights = cols.map(() => 0);
+    for (const f of folds) {
+        let k = 0;
+        for (let i = 1; i < n; i++) if (heights[i] < heights[k]) k = i;
+        cols[k].appendChild(f);
+        heights[k] = cols[k].offsetHeight;
+    }
+    if (panel) panel.scrollTop = scrolled;
+    if (inside && document.activeElement !== act && container.contains(act)) {
+        act.focus({ preventScroll: true });
+        if (selStart !== null && selEnd !== null) {
+            try { act.setSelectionRange(selStart, selEnd); }
+            catch (e) { /* not a text control */ }
+        }
+    }
+}
+
+// The panel is a set of folded boxes (maintainer 2026-11-07): Tabs and
+// Extensions open, Agents, Sharing, Ports and Sidebar folded, in that order,
+// stacked into columns by layoutConfigFolds once the panel is on screen. Each
+// box is as wide as style.css allows, so a panel dragged wide shows them side
+// by side. Every section builder below fills the BODY of its box. Which boxes
+// are open is not remembered.
 function makeProjectConfigBox(project) {
-    const box = el("div", { class: "project-config-box" });
-    box.appendChild(el("div", { class: "config-title" }, [project.name]));
+    const panel = el("div", { class: "project-config-box" });
+    panel.appendChild(el("div", { class: "config-title" }, [project.name]));
+    const folds = el("div", { class: "config-boxes" });
+    // The boxes in the panel's order: layoutConfigFolds reads it, since the
+    // columns hold them in a different order.
+    folds.__folds = [];
+    panel.appendChild(folds);
+    const fold = (title, name, open) => {
+        const f = collapsibleBox(title, [], "config-fold-" + name, "config-fold");
+        setCollapsibleOpen(f, open);
+        folds.appendChild(f);
+        folds.__folds.push(f);
+        return f.children[1];
+    };
 
     const section = el("div", { class: "config-section" });
-    section.appendChild(el("div", { class: "config-section-label" }, ["Tabs"]));
+    const tabsBox = fold("Tabs", "tabs", true);
 
     const enabled = state.projectServices[project.name];
     if (!enabled || Object.keys(enabled).length === 0) {
         section.appendChild(el("div", { class: "config-empty" }, [
             "No tabs yet — open this project once to load its services.",
         ]));
-        box.appendChild(section);
+        tabsBox.appendChild(section);
+        appendSharingSection(fold("Sharing", "sharing", false), project, null);
         // Ports render even with no tabs loaded — register before you start serving.
-        appendExportedPortsSection(box, project);
-        appendDetectedAppsSection(box, project);
-        appendSharingSection(box, project, null);
-        appendSidebarSection(box, project);
-        return box;
+        const portsBox = fold("Ports", "ports", false);
+        appendExportedPortsSection(portsBox, project);
+        appendDetectedAppsSection(portsBox, project);
+        appendSidebarSection(fold("Sidebar", "sidebar", false), project);
+        return panel;
     }
 
     const hidden = new Set(project.hidden_services || []);
@@ -11201,17 +11326,18 @@ function makeProjectConfigBox(project) {
     }
     refreshFloor();
 
-    box.appendChild(section);
-    box.appendChild(el("div", { class: "config-hint" }, [
+    tabsBox.appendChild(section);
+    tabsBox.appendChild(el("div", { class: "config-hint" }, [
         "Hidden tabs stay enabled on the supervisor — this only controls what shows here.",
     ]));
-    appendExportedPortsSection(box, project);
-    appendDetectedAppsSection(box, project);
-    appendSharingSection(box, project, enabled);
-    appendEditorExtensionSection(box, project, enabled);
-    appendAgentsBox(box, project, enabled);
-    appendSidebarSection(box, project);
-    return box;
+    appendEditorExtensionSection(fold("Extensions", "extensions", true), project, enabled);
+    appendAgentsBox(fold("Agents", "agents", false), project, enabled);
+    appendSharingSection(fold("Sharing", "sharing", false), project, enabled);
+    const portsBox = fold("Ports", "ports", false);
+    appendExportedPortsSection(portsBox, project);
+    appendDetectedAppsSection(portsBox, project);
+    appendSidebarSection(fold("Sidebar", "sidebar", false), project);
+    return panel;
 }
 
 // The ⚙ Agents box (I33 slice 3): what the create dialog's Agents box chose,
@@ -11232,10 +11358,9 @@ const AGENTS_BOX_CLAUDE_MODEL = /^[A-Za-z0-9][A-Za-z0-9._\[\]-]*$/;
 let agentsBoxSeq = 0;
 
 function appendAgentsBox(box, project, enabled) {
+    // `box` is the panel's Agents box (makeProjectConfigBox).
     const content = el("div", {}, [el("div", { class: "config-empty" }, ["Loading…"])]);
-    const section = collapsibleBox("Agents", [content], "config-agents", "config-sharing");
-    setCollapsibleOpen(section, true);
-    box.appendChild(section);
+    box.appendChild(content);
     // The Box agents section's place (filled from the same read below).
     const boxesHolder = el("div", {});
     box.appendChild(boxesHolder);
@@ -11462,8 +11587,9 @@ function boxAgentsSection(name, d, cat) {
     // read from a broker that predates boxes in it (no state at all).
     if (!state || state === "none") return null;
     const content = el("div", {});
-    const section = collapsibleBox("Box agents", [content], "config-box-agents", "config-sharing");
-    setCollapsibleOpen(section, true);
+    // A sub-heading inside the panel's Agents box, not a box of its own.
+    const section = el("div", { class: "config-section config-box-agents" }, [
+        el("div", { class: "config-section-label" }, ["Box agents"]), content]);
     if (state === "stopped") {
         content.replaceChildren(el("div", { class: "config-empty" },
             ["Start the project to change its boxes."]));
@@ -11892,8 +12018,8 @@ async function mgmtAgentsUpdateDialog(name, deployed, hasBoxes, local) {
 // or not. A tail-only append would hide the affordance in half the cases it
 // exists for — including the reported one.
 function appendSidebarSection(box, project) {
-    const section = el("div", { class: "config-section config-danger" });
-    section.appendChild(el("div", { class: "config-section-label" }, ["Sidebar"]));
+    // `box` is the panel's Sidebar box, last and folded (makeProjectConfigBox).
+    const section = el("div", { class: "config-section" });
     const btn = el("button", { class: "btn-small btn-danger" }, ["Remove from sidebar"]);
     btn.onclick = () => removeProjectFromSidebar(project);
     section.appendChild(btn);
@@ -11973,8 +12099,8 @@ function removeProjectFromSidebar(project) {
 // the container — supported on BOTH substrates now (dind via _recreate_supervisor,
 // docker via _recreate_docker_substrate). Universal (renders on every flavor).
 function appendEditorExtensionSection(box, project, enabled) {
+    // `box` is the panel's Extensions box; its title is the heading.
     const section = el("div", { class: "config-section" });
-    section.appendChild(el("div", { class: "config-section-label" }, ["Extensions"]));
     const editorOn = Object.prototype.hasOwnProperty.call(enabled, "code-server");
     const row = el("div", { class: "config-box-row" }, [
         el("span", { class: "config-box-name" }, ["Editor"]),
@@ -12319,12 +12445,10 @@ async function fillPassthroughList(view, table, warnEl) {
 // It opens folded at every gear open; openProjectConfigBox re-places the panel
 // when it unfolds. `enabled` is null in the panel's short form (no tabs
 // loaded), where only the project's folders show.
+// `box` is the panel's Sharing box (makeProjectConfigBox).
 function appendSharingSection(box, project, enabled) {
-    const sharingBox = collapsibleBox("Sharing", [], null, "config-sharing");
-    box.appendChild(sharingBox);
-    const sharing = sharingBox.children[1];
-    appendProjectFoldersSection(sharing, project);
-    if (enabled) appendBoxFoldersSection(sharing, project, enabled);
+    appendProjectFoldersSection(box, project);
+    if (enabled) appendBoxFoldersSection(box, project, enabled);
 }
 
 // The ⚙ text for a saved folder change that waits for the next start. A dind
@@ -12556,8 +12680,9 @@ function appendBoxFoldersSection(box, project, enabled) {
 }
 
 function appendExportedPortsSection(box, project) {
+    // `box` is the panel's Ports box; its title is the heading (Detected apps
+    // follows in the same box, under its own sub-heading).
     const section = el("div", { class: "config-section" });
-    section.appendChild(el("div", { class: "config-section-label" }, ["Ports"]));
     const listWrap = el("div", { class: "config-ports-list" });
     section.appendChild(listWrap);
     // The warning lines of an add/remove: a reserved entry dropped from the
