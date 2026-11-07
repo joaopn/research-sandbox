@@ -353,10 +353,11 @@ html.mobile .project-rail .rail-separator { cursor: default; }
    them side by side with no gaps under short boxes.
    --config-box-min is the old panel's cap, the width every section was laid
    out for; --config-box-max fits the Agents model cell (260px basis) beside
-   its effort picker on one line. The panel opens one box wide. The drag is
-   width only: the height already follows the content up to the room on
-   screen (--config-room). openProjectConfigBox remembers a dragged width
-   and caps the drag at the window edge (--config-room-w). */
+   its effort picker on one line. The panel opens one box wide, as tall as
+   its content up to the room on screen (--config-room). The corner drags
+   both ways (maintainer 2026-11-07); openProjectConfigBox remembers a
+   dragged width and height, even a height taller than what is unfolded, and
+   the caps hold the drag inside the window (--config-room-w, --config-room). */
 .project-config-box {
     --config-box-min: 280px;
     --config-box-max: 420px;
@@ -369,7 +370,7 @@ html.mobile .project-rail .rail-separator { cursor: default; }
     width: calc(var(--config-box-max) + 2 * var(--config-pad) + 2px);
     min-width: calc(var(--config-box-min) + 2 * var(--config-pad) + 2px);
     max-width: var(--config-room-w, calc(100vw - 16px));
-    resize: horizontal;
+    resize: both;
     background: var(--bg-card);
     border: 1px solid var(--border-strong);
     border-radius: 6px;

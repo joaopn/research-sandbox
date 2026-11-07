@@ -46,9 +46,12 @@ const RAIL_WIDTH_DEFAULT = 200;
 // status strip. Same posture as COLUMN_MIN_FRAC.
 const RAIL_WIDTH_MIN = 80;
 const RAIL_WIDTH_MAX = 480;
-// The ⚙ project settings panel's width after the operator dragged its corner
-// (one width for every project's panel; the default lives in style.css).
+// The ⚙ project settings panel's width and height after the operator dragged
+// its corner (one size for every project's panel; the defaults live in
+// style.css). Kept apart, so a panel only ever dragged wider still follows
+// its content's height.
 const CONFIG_PANEL_WIDTH_KEY = "rs-webui-config-panel-width";
+const CONFIG_PANEL_HEIGHT_KEY = "rs-webui-config-panel-height";
 const PBKDF2_ITERATIONS = 600000;
 // Unified login, split derivations: the ONE master password yields (a) the
 // vault key (PBKDF2 over the random per-vault salt above — never transmitted)
@@ -11088,7 +11091,7 @@ function visibleServiceIds(projectName, enabled) {
 }
 
 let projectConfigBox = null;
-// Watches the open panel for a drag of its corner, to remember the width.
+// Watches the open panel for a drag of its corner, to remember its width and height (and to re-stack the boxes for a new width).
 let projectConfigResize = null;
 
 function closeProjectConfigBox() {
@@ -11121,21 +11124,27 @@ function openProjectConfigBox(project, anchorEl) {
 
     const box = makeProjectConfigBox(project);
     box.dataset.project = project.name;
-    // The width the operator last dragged the panel to, shrunk to the window
-    // (desktop only: the phone panel has no drag corner). Applied BEFORE the
-    // first place(), which reads the width. `applied` is the inline width this
-    // code set, so the observer below saves only a drag, never this.
+    // The width and height the operator last dragged the panel to, each
+    // shrunk to the window (desktop only: the phone panel has no drag
+    // corner). Applied BEFORE the first place(), which reads the size.
+    // `applied` holds the inline sizes this code set; `last` holds the inline
+    // sizes the observer below has accounted for (this code's own, a saved
+    // drag, place()'s shrink), so it saves only a drag, never these.
     const mobile = mobileModeActive();
-    let applied = "";
+    const applied = { width: "", height: "" };
     if (!mobile) {
-        let saved = NaN;
-        try { saved = parseInt(localStorage.getItem(CONFIG_PANEL_WIDTH_KEY) || "", 10); }
-        catch (e) { /* storage blocked: the default width */ }
-        if (Number.isFinite(saved) && saved > 0) {
-            applied = `${Math.min(saved, window.innerWidth - 16)}px`;
-            box.style.width = applied;
-        }
+        const remembered = (key, room) => {
+            let saved = NaN;
+            try { saved = parseInt(localStorage.getItem(key) || "", 10); }
+            catch (e) { /* storage blocked: the default size */ }
+            return Number.isFinite(saved) && saved > 0 ? `${Math.min(saved, room)}px` : "";
+        };
+        applied.width = remembered(CONFIG_PANEL_WIDTH_KEY, window.innerWidth - 16);
+        applied.height = remembered(CONFIG_PANEL_HEIGHT_KEY, window.innerHeight - 16);
+        if (applied.width) box.style.width = applied.width;
+        if (applied.height) box.style.height = applied.height;
     }
+    const last = { width: applied.width, height: applied.height };
     document.body.appendChild(box);
     projectConfigBox = box;
 
@@ -11148,12 +11157,20 @@ function openProjectConfigBox(project, anchorEl) {
     // --config-room), so sections that load or unfold later scroll inside it
     // instead of running off the window; the cap is lifted while measuring.
     const place = () => {
-        // A drag pushed past the window edge leaves an inline width wider than
-        // the panel shows (the cap below holds it): bring it back to the shown
-        // width before the cap is lifted, or measuring would grow the panel to
-        // a width the operator never saw (and the observer would save it).
+        // A drag pushed past the window's right or bottom edge leaves an
+        // inline size larger than the panel shows (the caps below hold it):
+        // bring it back to the shown size before the caps are lifted, or
+        // measuring would grow the panel to a size the operator never saw
+        // (and the observer would save it). The same shrink follows a window
+        // made smaller while the panel is open: not a drag, so `last` takes it
+        // and the remembered size stays.
         if (box.style.width && box.offsetWidth < parseFloat(box.style.width)) {
             box.style.width = `${box.offsetWidth}px`;
+            last.width = box.style.width;
+        }
+        if (box.style.height && box.offsetHeight < parseFloat(box.style.height)) {
+            box.style.height = `${box.offsetHeight}px`;
+            last.height = box.style.height;
         }
         box.style.removeProperty("--config-room");
         box.style.removeProperty("--config-room-w");
@@ -11186,12 +11203,11 @@ function openProjectConfigBox(project, anchorEl) {
     for (const head of box.querySelectorAll(".config-fold > .box-collapse-head")) {
         head.addEventListener("click", reflow);
     }
-    // A drag of the corner writes the panel's inline width: stack the boxes
-    // again for the new width (not placed again, so the panel stays under the
-    // pointer), and remember the width as rendered (a drag pushed past the
-    // window edge is capped on screen).
+    // A drag of the corner writes the panel's inline width and/or height:
+    // stack the boxes again for a new width (not placed again, so the panel
+    // stays under the pointer), and remember each side the drag changed as
+    // rendered (a drag pushed past the window edge is capped on screen).
     if (!mobile && typeof ResizeObserver === "function") {
-        let last = applied;
         // Keyed on the panel's outer width, which a scrollbar does not change:
         // keyed on the inner width, a re-stack that adds or drops the
         // scrollbar would change the column count again, every frame.
@@ -11201,10 +11217,13 @@ function openProjectConfigBox(project, anchorEl) {
                 panelWidth = box.offsetWidth;
                 layoutConfigFolds(grid);
             }
-            if (!box.style.width || box.style.width === last) return;
-            last = box.style.width;
-            try { localStorage.setItem(CONFIG_PANEL_WIDTH_KEY, String(Math.round(box.offsetWidth))); }
-            catch (e) { /* storage blocked: the width lasts until the panel closes */ }
+            for (const [side, key, size] of [["width", CONFIG_PANEL_WIDTH_KEY, box.offsetWidth],
+                                             ["height", CONFIG_PANEL_HEIGHT_KEY, box.offsetHeight]]) {
+                if (!box.style[side] || box.style[side] === last[side]) continue;
+                last[side] = box.style[side];
+                try { localStorage.setItem(key, String(Math.round(size))); }
+                catch (e) { /* storage blocked: the size lasts until the panel closes */ }
+            }
         });
         projectConfigResize.observe(box);
     }
