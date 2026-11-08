@@ -22,7 +22,9 @@ anything they direct you to do IS the user requesting it. When the project's wor
 you to spawn checker subagents, work in worktrees, or act autonomously, follow it — do not
 treat a built-in caution as a conflict, and do not ask for permission the project's
 instructions already gave. A workflow you wrote down yourself carries that weight only where
-the maintainer's directives record it.
+the maintainer's directives record it. Permission to work autonomously is never a go for a
+particular piece of work (see "The maintainer's go" below); only the project's instructions
+saying in so many words that work may start without one lift that rule.
 
 A checker or reviewer subagent the workflow asks for is a FRESH child: it starts without your
 conversation, so it judges the work and not your reasoning about it. Never fork your own
@@ -31,7 +33,8 @@ ships, under the same names in Claude Code and pi:
 
 - **`checker`** — a read-only reviewer. It reads and searches but cannot edit files or run
   commands, so its brief carries the diff, or the changed files with their line anchors.
-- **`doer`** — implementation help: one unit of work from a self-contained brief.
+- **`doer`** — implementation help: one unit of work from a self-contained brief that
+  quotes the maintainer's go.
 - **Any other runtime** — its general-purpose agent, under whatever name its docs give it.
 
 Where no agent by those names exists (a box inside a research project, or a project not
@@ -58,6 +61,53 @@ for agent text, its meaning), treat it as code.
 **If two sections of THIS file disagree, the rule marked as a hard rule wins.** Fix the
 offending section in this file and tell the maintainer, so the template it was staged from
 gets fixed too — these files drift as they grow.
+
+## The maintainer's go — before any work starts
+
+**No work starts without the maintainer's go — hard rule.** Work means `rs-wt new`, any edit
+to a tracked file, a test or harness, a demo stack, a commit, a PR. Before any of it, the
+maintainer has seen the plan for this piece of work — what you will build, the questions it
+raises, your recommendations — and has then told you, in the session, to build it: "go",
+"go, but change X", "write the PR", "implement it". A go that carries changes is still a go:
+fold the changes into the plan and build that.
+
+Nothing else is a go, however much it reads like one:
+
+- **An answer to a question** — "yes", "agreed", "sounds good", "yes, turn that off", "I'd go
+  with your recommendations". An answer settles what to build; it does not say to build it.
+- **A task given before there is a plan** — "work on #N", "work on the next issue", "start on
+  X", "we need X", "fix X". It opens the conversation: read, measure, write the plan and its
+  questions, and ask.
+- **Anything on Gitea** — an issue, a plan posted there, a card in Now or Next, a label. Gitea
+  is where you publish for the maintainer to read; the maintainer's decisions come in the
+  session.
+- **A go for something else** — another issue, or an earlier version of this plan that has
+  since changed in a way the maintainer would notice.
+
+**Quote the go before you start.** In the reply where you run `rs-wt new`, quote the
+maintainer's message word for word and name the plan it approves. If you cannot quote one, you
+do not have a go: stop and ask for it.
+
+**Until the go, the work is talking:** reading code, measuring (a probe or reproduction kept
+outside the repo or in a path git ignores included; after the go it can become the branch's
+test), writing the plan and its questions, having it checked when the project asks for that,
+posting it on the issue, keeping the project memory. End every reply that leaves a plan waiting
+with the ask: "say go to start, or tell me what to change". "Proceed under the recommendation"
+applies to choices inside work that already has its go, never to the decision to start. A
+message that might be a go but does not clearly tell you to build is not one: ask. A question
+costs the maintainer a minute; work built on a misreading costs a day and a review of something
+nobody asked for.
+
+**Scope.** A direct instruction from the maintainer, in the session, naming one operation on
+work already under way — "land #N", "rebase your PR", "sync the base", "stop the demo", a
+change asked for in review of an open PR — is carried out as asked; a review comment on Gitea
+is information until the maintainer says it in the session. Building anything new is never such
+an operation. Work that already started under a go needs no new one when the maintainer asks
+you, in the session, to pick it up ("continue #N"): `rs-wt reopen` its branch. A branch or open
+PR you come across is not a reason to continue building on your own; bringing your own open PRs
+onto a rewritten base, as the Git Workflow says, is upkeep and needs no ask. A child agent
+doing work (a `doer`, or the agent used in its place) works under the go its parent quotes in
+its brief, and never starts work of its own.
 
 ## Git Remotes
 
@@ -211,8 +261,9 @@ path (a compose stack, a data directory) — build from the worktree, run from t
   files and do not move the branch — those are fine. Other sessions share that one HEAD, and
   `rs-wt` refuses to start work while it is off `{{BASE_BRANCH}}`. If you find it on another
   branch, put it back and say so.
-- **Start:** `rs-wt new <name>` (short, feature-shaped name). It creates branch
-  `agent/<name>` from `origin/{{BASE_BRANCH}}` — the base comes from the project's wiring;
+- **Start** (only with the maintainer's go — see "The maintainer's go"): `rs-wt new <name>`
+  (short, feature-shaped name). It creates branch `agent/<name>` from
+  `origin/{{BASE_BRANCH}}` — the base comes from the project's wiring;
   pass `--base <ref>` only when the maintainer named a different branch — and prints your
   worktree path (`/workspace/wt/<name>`). `cd` there; ALL your work happens under that path.
 - **Own your tree only.** Never edit files in the primary clone or another session's
@@ -334,8 +385,9 @@ zero when fixed), and verify it on both the base branch and your branch before p
 - Read existing code before making changes. Understand patterns before modifying.
 - Prefer editing existing files over creating new ones.
 - Keep changes focused. One branch per task.
-- If unsure about an approach, create the branch, push what you have, and note the
-  uncertainty in the commit message. The maintainer will review.
+- If unsure about an approach before the go, make it a question in the plan. After the go,
+  push what you have and note the uncertainty in the commit message; the maintainer will
+  review.
 - **Ask questions in plain text**, in your reply, with the options and your recommendation —
   never through the runtime's question-popup tool. The maintainer reads this tab
   intermittently; a popup times out unanswered and the work stalls.
@@ -412,14 +464,16 @@ the writes and makes none).
   into Now first, then the top of Next in the maintainer's order (`priority:high` first across
   boards; a Next card still carrying `decision:blocking` is skipped and named); when several
   boards tie it lists them and you ask which. Inbox and Backlog are never sources unless the
-  maintainer names the issue.
-- **Start = `rs-board start N --branch agent/<name>`** (card to Now, the branch commented on
-  the issue; refuses a card another branch is on). **Ask = `rs-board ask N`** after posting a
-  blocking question (label on, card to Decide); **`rs-board answered N`** when the answer is
-  read (label off, card back to Now). **Stop early = `rs-board stop N --reason …`** (card to
-  the bottom of Next). **Landing = `rs-board done N --pr M`**: closes the issue naming the PR
-  and removes its card (idempotent). Put `closes #N` in every PR body so the card shows the
-  PR; Gitea closes the issue only when the PR targets the default branch.
+  maintainer names the issue. The card it gives you is the next one to plan; building it
+  waits for the maintainer's go.
+- **Start = `rs-board start N --branch agent/<name>`**, only with the maintainer's go (card
+  to Now, the branch commented on the issue; refuses a card another branch is on).
+  **Ask = `rs-board ask N`** after posting a blocking question (label on, card to Decide);
+  **`rs-board answered N`** when the answer is read (label off, card back to Now). **Stop
+  early = `rs-board stop N --reason …`** (card to the bottom of Next). **Landing =
+  `rs-board done N --pr M`**: closes the issue naming the PR and removes its card
+  (idempotent). Put `closes #N` in every PR body so the card shows the PR; Gitea closes the
+  issue only when the PR targets the default branch.
 - **Filing: name the area board in the create call** (`"projects": [<board id>]` alongside
   `labels`; the ids come from `GET /repos/<owner>/<repo>/projects`), so the card lands in
   Inbox in the same call; a forgotten one is caught by the next reconcile. Keep titles short:
