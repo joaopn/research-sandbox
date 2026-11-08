@@ -217,6 +217,11 @@ COMMITS_PAGE_SIZE = 5
 # and gitea 404s that route while the unit is off. The MIRROR is a read-only
 # upstream nobody watches, and gitea's DefaultMirrorRepoUnits DOES include
 # issues — so issues are turned OFF there, leaving exactly ONE place to file.
+# The mirror's WIKI is off for the same kind of reason: every consumer holds a
+# read grant on the mirror, so its wiki would be one wiki readable by every
+# agent on the repo. Each consumer's fork keeps its own wiki (FORK_FEATURES),
+# which is not shared through the mirror. (The migrate's "wiki": False only
+# skips importing GitHub's wiki; it leaves gitea's default mirror wiki unit on.)
 # Unnamed units are PRESERVED by gitea's Edit (each is touched only when its
 # option is non-nil), so a mirror keeps its code unit and its private flag.
 FORK_FEATURES = {"has_issues": True, "has_pull_requests": True,
@@ -236,7 +241,7 @@ FORK_FEATURES = {"has_issues": True, "has_pull_requests": True,
                  "allow_rebase": True,
                  "allow_fast_forward_only_merge": True,
                  "default_merge_style": "fast-forward-only"}
-MIRROR_FEATURES = {"has_issues": False}
+MIRROR_FEATURES = {"has_issues": False, "has_wiki": False}
 
 
 class GiteaError(Exception):
