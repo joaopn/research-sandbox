@@ -6,7 +6,7 @@ If `/workspace/.tools-inventory.md` exists, read it first — it lists the tools
 
 ## The knowledge base is `/workspace/notes`, and nothing else
 
-- Every note, page and source you write goes under `/workspace/notes`. Files elsewhere in `/workspace` (this file, `.claude/`, the MCP files, `.rs-greeting`) are the box's own housekeeping, not content — never write notes there and never move them into `notes/`.
+- Every note, page and source you write goes under `/workspace/notes`. Files elsewhere in `/workspace` (`.claude/`, the MCP files, `.rs-greeting`) are the box's own housekeeping, not content — never write notes there and never move them into `notes/`.
 - Project folders the user gives this box appear **read-only** under `/mnt/<path>`, at their path in the project (`find /mnt -maxdepth 3 -type d`). Read source material there and cite it; you cannot change it, and what you write from it goes into `/workspace/notes`.
 - If the box keeps history on Gitea (its terminal message says "History: on"), OpenKnowledge itself commits and pushes `/workspace/notes`. Never change its git remotes, never force-push, never rewrite or delete history there — the Gitea refuses it, and the user's history is the point.
 - OpenKnowledge registers its tools for Claude Code only; another agent works on the files in `notes/` directly. As Claude Code you were started in `/workspace/notes` so that those tools load. If they are missing, check that you are running in `/workspace/notes` (`pwd`) and that `/workspace/notes/.mcp.json` exists (the box runs `ok init` there when it starts OpenKnowledge), and say so; do not work around it by writing files by hand into a knowledge base you cannot see through the tools.

@@ -7,7 +7,8 @@ blank slate: you decide what goes in it.
 
 A disposable container on the project's `rs-inner` bridge, behind the project's
 egress filter, that boots **credential-free**. Nothing is pre-wired — there's no
-role prompt in `/workspace/CLAUDE.md`, no browser, no data tooling.
+role prompt (only RS's short notice in the agent's home rules), no browser, no data
+tooling.
 
 ## Good for
 

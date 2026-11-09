@@ -164,8 +164,24 @@ done
 # owns them: this runs as research.
 mkdir -p /workspace/shared/agent /workspace/.claude/skills /workspace/.pi/skills
 
-if [[ ! -f /workspace/.claude/CLAUDE.md ]]; then
-    cp /opt/claude-templates/CLAUDE.md /workspace/.claude/CLAUDE.md
+# --- RS's research instructions → ~/.claude/rules/rs-instructions.md, at every
+#     boot, after the saved home is back and before dockerd. Claude Code (and
+#     RS's pi extension) load every rule file in that folder in every session
+#     and subagent. Never the workspace: /workspace/.claude/ is the user's own.
+#     ONE `&&` chain with ONE failure branch: on the left of `||` the shell
+#     ignores `set -e`, so a `;`-list would install a cut-short file and carry
+#     on; every command in the failure branch ends `|| :` so nothing there can
+#     abort the boot. The byte count is computed INSIDE the chain (a missing
+#     template must not abort the boot either). RS's OLD layout — the link
+#     /workspace/CLAUDE.md -> .claude/CLAUDE.md — blocks the write: the agent
+#     would read two copies; the host's start reports the error.
+RS_INSTR_NOTICE=/opt/claude-templates/rs-instructions-notice.md
+RS_INSTR_TEXT=/opt/claude-templates/CLAUDE.md
+RS_INSTR_DIR=/home/research/.claude/rules
+if [ -L /workspace/CLAUDE.md ] && [ "$(readlink /workspace/CLAUDE.md)" = .claude/CLAUDE.md ]; then
+    echo "error: /workspace/CLAUDE.md is RS's old link to .claude/CLAUDE.md; RS's instructions were not written (remove the link, then stop the project and start it again)" >&2 || :
+else
+    tmp=; want=; mkdir -p "$RS_INSTR_DIR" && want=$({ cat "$RS_INSTR_NOTICE" && printf '\n' && cat "$RS_INSTR_TEXT"; } | wc -c) && tmp=$(mktemp "$RS_INSTR_DIR/.rs-instructions.XXXXXX") && { cat "$RS_INSTR_NOTICE" && printf '\n' && cat "$RS_INSTR_TEXT"; } >"$tmp" && [ "$(wc -c <"$tmp")" -eq "$want" ] && chmod 0444 "$tmp" && mv -fT "$tmp" "$RS_INSTR_DIR/rs-instructions.md" || { [ -z "$tmp" ] || rm -f "$tmp" || :; echo "warning: RS's instructions could not be written into the agent's home; the next start writes them again" >&2 || :; }
 fi
 
 # bypassPermissions for the supervisor editor's in-IDE claude — the VS Code Claude
@@ -190,12 +206,6 @@ for tmpl in logbook_supervisor_template.md logbook_pi_template.md; do
     dst="/workspace/.claude/$tmpl"
     [[ -f "$src" && ! -f "$dst" ]] && cp "$src" "$dst" || true
 done
-
-# The /workspace/CLAUDE.md is what Claude Code auto-discovers when started from
-# /workspace. Symlink into .claude/CLAUDE.md to keep the single source of truth.
-if [[ ! -e /workspace/CLAUDE.md ]]; then
-    ln -s .claude/CLAUDE.md /workspace/CLAUDE.md
-fi
 
 # --- Claude Code settings (bypassPermissions + the rs-audit-stop Stop hook).
 #     setup.sh is a template from the image, copied+run once per fresh home.

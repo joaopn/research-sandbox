@@ -58,9 +58,10 @@ applies cleanly is not a code change; resolving its conflicts is. Say in the PR 
 edits came after the last review. When you cannot tell whether an edit changes behaviour (or,
 for agent text, its meaning), treat it as code.
 
-**If two sections of THIS file disagree, the rule marked as a hard rule wins.** Fix the
-offending section in this file and tell the maintainer, so the template it was staged from
-gets fixed too — these files drift as they grow.
+**If two sections of THIS file disagree, the rule marked as a hard rule wins.** RS writes
+this file and replaces it at every start, so do not edit it: tell the maintainer which
+sections disagree, so the template it is written from gets fixed — these files drift as
+they grow.
 
 ## The maintainer's go — before any work starts
 
@@ -338,7 +339,7 @@ the directory a session starts in, and your work happens in worktrees under `/wo
 outside the primary clone. Started in `/workspace`, all of it loads and every area rule fires
 for the primary clone and every worktree alike. Started inside the clone or a worktree, some of
 it fails to load or never fires, depending on the agent; started outside `/workspace`, none of
-it loads, this file included. Your shell starts in the session's start directory: if that is
+it loads (this file still does: it is RS's rule file in your home folder). Your shell starts in the session's start directory: if that is
 not `/workspace`, say so in your first reply and suggest restarting there. The exception is a
 session `rs-repo-watch` launched: it starts in the primary clone by design, so
 skip that notice there.

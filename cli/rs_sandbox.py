@@ -235,9 +235,9 @@ RESERVED_MAILBOX_NAMES = ("agent", "echo-mcp", "librarian", "websearcher", "wran
 # warning at the next run, never repaired.
 BOX_RESERVED_DIRS = (".claude/skills", ".pi/skills")
 BOX_SHARE_RESERVED = (MAILBOX_ROOT,)
-# Appended after the preset's instructions when a SHARING box's CLAUDE.md is
-# first written (any preset, the agent-less `empty` included). No preset file
-# carries it; {name} is the box's name.
+# Appended after the preset's instructions in a SHARING box's RS instructions
+# (any preset, the agent-less `empty` included). No preset file carries it;
+# {name} is the box's name.
 MAILBOX_PARAGRAPH = """\
 ## Mailbox
 
@@ -365,7 +365,8 @@ DEV_TOKENS_DIR = Path(os.environ.get("HOME", "/home/research")) / ".dev-tokens"
 DEV_GITEA_URL = "http://rs-gitea:3000"
 
 # The placeholder the dev instructions carry for the box's base branch,
-# substituted at the CLAUDE.md write so no template token reaches the agent.
+# substituted where RS composes the box's text so no template token reaches
+# the agent.
 # MIRROR-PAIR LOCKSTEP with cli/rscore.py's BASE_BRANCH_TOKEN — this file is
 # streamed into the supervisor standalone and cannot import rscore.
 BASE_BRANCH_TOKEN = "{{BASE_BRANCH}}"
@@ -432,6 +433,14 @@ def box_container(name: str) -> str:
 
 def _docker(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["docker", *args], capture_output=True, text=True)
+
+
+def _docker_input(data: bytes, *args: str) -> subprocess.CompletedProcess:
+    """`_docker` with BYTES on stdin, binary mode (the text must reach the box
+    as the UTF-8 the host counted, whatever the locale), bounded like the
+    host's twin."""
+    return subprocess.run(["docker", *args], input=data, capture_output=True,
+                          timeout=RS_INSTR_EXEC_TIMEOUT_S)
 
 
 def _require_dind_project() -> None:
@@ -595,6 +604,199 @@ def resolve_preset(name: str) -> dict:
     if name == "empty":
         return _EMPTY_PRESET
     die(f"unknown box preset {name!r} (available: {sorted(catalog) or ['empty']})")
+
+
+# ---------------------------------------------------------------------------
+# RS's instructions in the box's home rules folder
+# ---------------------------------------------------------------------------
+# A box's RS text (the notice, the preset's instructions with the base branch,
+# the Mailbox paragraph when it shares) is written as
+# ~/.claude/rules/rs-instructions.md in the box user's home, read-only by mode,
+# at create, at every re-run and at the box's own plain start — never into the
+# box's /workspace, which is the user's. Where RS's OLD /workspace/CLAUDE.md is
+# still in the box's folder, nothing is written and the box tool reports it
+# ({"kind": "instructions", "reason": "old-file"}); the host fails the
+# operation about the box (or, on a shared dev-lane side path, warns).
+# MIRROR of container/rs-instructions-notice.md (this file is staged
+# standalone and cannot read the repo) — pinned byte-equal.
+RS_INSTRUCTIONS_NOTICE = (
+    "> RS writes this file and replaces it whenever RS starts, re-creates or "
+    "re-runs this container (and at some other RS operations). It is marked "
+    "read-only, and any change made to it is lost at the next replacement. Your "
+    "own instructions go in `/workspace/.claude/CLAUDE.md` (Claude Code and pi "
+    "both read it), rules in `/workspace/.claude/rules/`, pi's own settings and "
+    "skills in `/workspace/.pi/`.\n")
+# The box record's flag set after the first successful write (or at create):
+# from then on a CLAUDE.md in the box's folder is the user's and never checked.
+OLD_INSTRUCTIONS_FLAG = "old_instructions_cleared"
+# MIRROR PAIR with rscore.NO_BRANCH_PLACEHOLDER / NO_BRANCH_SENTENCE — pinned.
+NO_BRANCH_PLACEHOLDER = "<base>"
+NO_BRANCH_SENTENCE = (
+    "RS had no base branch recorded for this container when it wrote this file, "
+    "so `<base>` below stands for it: it is the default branch of the `upstream` "
+    "remote (`git remote show upstream`, the `HEAD branch` line) unless the "
+    "maintainer names another.")
+RS_INSTR_WRITTEN = "RS_INSTRUCTIONS_WRITTEN"
+RS_INSTR_FAILED = "RS_INSTRUCTIONS_NOT_WRITTEN"
+RS_INSTR_OLD = "RS_INSTRUCTIONS_OLD_FILE"
+RS_INSTR_KEPT = "RS_INSTRUCTIONS_KEPT"
+# MIRROR PAIR with rscore.RS_INSTR_EXEC_TIMEOUT_S (same reasoning there).
+RS_INSTR_EXEC_TIMEOUT_S = 30
+# MIRROR PAIR with rscore.RS_INSTR_SCRIPT — pinned equal (the reasoning for
+# every step is there).
+RS_INSTR_SCRIPT = (
+    'if [ "$2" = 1 ] && { [ -L /workspace/CLAUDE.md ] || [ -e /workspace/CLAUDE.md ]; }; '
+    f'then echo {RS_INSTR_OLD}; exit 0; fi\n'
+    'if [ "$3" = 1 ] && [ -e "$HOME/.claude/rules/rs-instructions.md" ]; '
+    f'then echo {RS_INSTR_KEPT}; exit 0; fi\n'
+    'tmp=; mkdir -p "$HOME/.claude/rules" && '
+    'tmp=$(mktemp "$HOME/.claude/rules/.rs-instructions.XXXXXX") && '
+    'cat >"$tmp" && [ "$(wc -c <"$tmp")" -eq "$1" ] && chmod 0444 "$tmp" && '
+    'mv -fT "$tmp" "$HOME/.claude/rules/rs-instructions.md" && '
+    f'echo {RS_INSTR_WRITTEN} || '
+    f'{{ [ -z "$tmp" ] || rm -f "$tmp" || :; echo {RS_INSTR_FAILED} || :; }}\n')
+BOX_HOME = "/home/worker"
+OLD_INSTRUCTIONS_RUN_ERROR = (
+    "`/workspace/boxes/{box}/CLAUDE.md` is the instructions file RS used to write "
+    "for box '{box}'; RS's new instructions are not written while it exists, so "
+    "the box's agent still reads the old one. Remove or rename it from the "
+    "project's terminal or editor, then stop the project and start it again.")
+_INSTR_REASON_TEXT = {
+    "type-gone": "its box type is no longer in the project's box catalog; it got "
+                 "only RS's notice as its instructions",
+    "catalog-unreadable": "the project's box catalog could not be read; its RS "
+                          "instructions were not refreshed",
+    "not-written": "RS's instructions could not be written into its home",
+    "flag-not-recorded": "RS's instructions were written, but its record could "
+                         "not note it",
+}
+OLD_INSTRUCTIONS_CREATE_ERROR = (
+    "the folder kept from an earlier box named {box} holds `CLAUDE.md`, that box's "
+    "instructions file. Remove or rename `/workspace/boxes/{box}/CLAUDE.md` from the "
+    "project's terminal or editor, then add the box again.")
+
+
+def load_box_catalog_three_way() -> "tuple[bool, dict[str, dict]]":
+    """(readable, catalog) of the staged box catalog: a missing file is
+    readable and empty (as load_box_catalog reads it); a file that cannot be
+    read, is not UTF-8, is not JSON, nests too deeply or is not a list is
+    unreadable — never folded into "empty"."""
+    try:
+        text = BOX_CATALOG_JSON.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return True, {}
+    except (OSError, ValueError):
+        return False, {}
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError):
+        return False, {}
+    if not isinstance(data, list):
+        return False, {}
+    return True, {e["name"]: e for e in data
+                  if isinstance(e, dict) and isinstance(e.get("name"), str)}
+
+
+def _compose_box_text(name: str, entry: dict, catalog: dict) -> "tuple[str, bool, bool]":
+    """(text, covered, type_gone) for a box from its record and a READABLE
+    catalog: the notice, then the preset's instructions with the base branch
+    (`<base>` and the sentence when none is recorded), then the Mailbox
+    paragraph when it shares. `covered`: RS used to write a CLAUDE.md for this
+    kind of box (instructions, sharing, or a type gone from the catalog — RS
+    cannot tell what it wrote there)."""
+    preset_name = entry.get("preset") or "empty"
+    preset = catalog.get(preset_name)
+    if preset is None and preset_name == "empty":
+        preset = _EMPTY_PRESET
+    type_gone = preset is None
+    instr = ((preset or {}).get("instructions") or "")
+    instr = instr.strip() if isinstance(instr, str) else ""
+    sentence = ""
+    if BASE_BRANCH_TOKEN in instr:
+        branch = entry.get("branch") if isinstance(entry.get("branch"), str) else ""
+        if branch:
+            instr = instr.replace(BASE_BRANCH_TOKEN, branch)
+        else:
+            instr = instr.replace(BASE_BRANCH_TOKEN, NO_BRANCH_PLACEHOLDER)
+            sentence = NO_BRANCH_SENTENCE
+    share = _entry_share(entry)
+    body = "\n\n".join(t for t in (
+        sentence, instr, MAILBOX_PARAGRAPH.format(name=name).strip() if share else "")
+        if t)
+    text = RS_INSTRUCTIONS_NOTICE.rstrip("\n") + "\n" + ("\n" + body + "\n" if body else "")
+    return text, bool(instr) or share or type_gone, type_gone
+
+
+def _exec_box_instructions(cname: str, text: str, *, check_old: bool,
+                           keep_existing: bool = False) -> str:
+    """Write `text` into the RUNNING box as uid 1000: "written", "old",
+    "kept" or "failed". UTF-8 bytes in binary mode (`_docker` is text-mode)."""
+    data = text.encode("utf-8")
+    try:
+        r = _docker_input(data, "exec", "-i", "-u", "1000", "-e", f"HOME={BOX_HOME}", cname,
+                          "sh", "-c", RS_INSTR_SCRIPT, "sh", str(len(data)),
+                          "1" if check_old else "0", "1" if keep_existing else "0")
+    except (OSError, subprocess.TimeoutExpired):
+        return "failed"
+    out = (r.stdout or b"").decode("utf-8", "replace")
+    if RS_INSTR_OLD in out:
+        return "old"
+    if RS_INSTR_KEPT in out and r.returncode == 0:
+        return "kept"
+    if r.returncode == 0 and RS_INSTR_WRITTEN in out and RS_INSTR_FAILED not in out:
+        return "written"
+    return "failed"
+
+
+def _write_box_instructions(name: str, cname: str) -> list[dict]:
+    """Write RS's instructions into the RUNNING box `name` (container `cname`)
+    and return its structured warnings (kind "instructions"). An unreadable
+    catalog writes nothing and checks nothing (a re-run's home starts empty,
+    so the box has no file until the catalog reads again; a plain start keeps
+    the file it has)."""
+    try:
+        entry = load().get(name)
+    except (OSError, ValueError, RecursionError):
+        entry = None
+    if not isinstance(entry, dict):
+        return [{"kind": "instructions", "reason": "not-written"}]
+    ok, catalog = load_box_catalog_three_way()
+    if not ok:
+        return [{"kind": "instructions", "reason": "catalog-unreadable"}]
+    text, covered, type_gone = _compose_box_text(name, entry, catalog)
+    cleared = entry.get(OLD_INSTRUCTIONS_FLAG) is True
+    warnings: list[dict] = []
+    if type_gone:
+        warnings.append({"kind": "instructions", "reason": "type-gone"})
+    outcome = _exec_box_instructions(cname, text, check_old=covered and not cleared)
+    if outcome == "old":
+        return warnings + [{"kind": "instructions", "reason": "old-file"}]
+    if outcome != "written":
+        return warnings + [{"kind": "instructions", "reason": "not-written"}]
+    if not cleared:
+        try:
+            entries = load()
+            if isinstance(entries.get(name), dict):
+                entries[name][OLD_INSTRUCTIONS_FLAG] = True
+                save(entries)
+        except (OSError, ValueError, RecursionError, SystemExit):
+            warnings.append({"kind": "instructions", "reason": "flag-not-recorded"})
+    return warnings
+
+
+def _refuse_old_instructions_at_create(name: str) -> None:
+    """die() when the box's folder kept from an earlier box of that name holds
+    RS's old CLAUDE.md (a file or a link, dangling included): it belongs to
+    that box. The host gates the same before any side effect; this covers the
+    auto-named box only the tool sees."""
+    try:
+        os.lstat(WORKSPACE / "boxes" / name / "CLAUDE.md")
+    except FileNotFoundError:
+        return
+    except OSError:
+        die(f"could not check the folder of box {name!r} in the project; check "
+            f"that /workspace/boxes/{name} is a folder")
+    die(OLD_INSTRUCTIONS_CREATE_ERROR.format(box=name))
 
 
 def _parse_csv(s: str | None) -> list[str]:
@@ -800,33 +1002,16 @@ def _name_clashes(name: str) -> str:
 
 
 def _stage_box_workspace(name: str, preset: dict, mcps: list[str],
-                         *, strict: bool, base_branch: str = "",
-                         share: bool = False) -> None:
-    """Write the box's CLAUDE.md (instructions) + .mcp-proxy.json (the stable
-    proxy source-1) into the box's workspace dir BEFORE the container starts —
-    the entrypoint reads them at boot. CLAUDE.md is first-boot no-clobber (a PI
-    edit survives a restart); .mcp-proxy.json is overwritten every create/restart
-    so an allowlist change re-renders. The entrypoint regenerates /workspace/.mcp.json
-    wholesale from .mcp-proxy.json + the image-baked stdio MCPs (idempotent across
-    reboots — a fresh proxy-only source each boot).
-
-    ``base_branch`` (dev boxes) is substituted for BASE_BRANCH_TOKEN in the
-    instructions, so the agent reads a literal branch name rather than a
-    template. Empty for every other preset, whose text carries no token."""
+                         *, strict: bool, share: bool = False) -> None:
+    """Write the box's .mcp-proxy.json (the stable proxy source-1) into the
+    box's workspace dir BEFORE the container starts — the entrypoint reads it
+    at boot; it is overwritten every create/restart so an allowlist change
+    re-renders. The entrypoint regenerates /workspace/.mcp.json wholesale from
+    .mcp-proxy.json + the image-baked stdio MCPs (idempotent across reboots — a
+    fresh proxy-only source each boot). RS's instructions are NOT written here:
+    they go into the box's home once it runs (_write_box_instructions)."""
     ws = WORKSPACE / f"boxes/{name}"
     ws.mkdir(parents=True, exist_ok=True)
-    instr = (preset.get("instructions") or "").strip()
-    if base_branch:
-        instr = instr.replace(BASE_BRANCH_TOKEN, base_branch)
-    claude_md = ws / "CLAUDE.md"
-    # The preset's text, then — for a sharing box only — the generic Mailbox
-    # paragraph (after the preset's own closing block; no preset file carries
-    # it). Nothing to write (an instruction-less preset that does not share)
-    # writes no file, as before mailboxes existed.
-    text = "\n\n".join(t for t in (
-        instr, MAILBOX_PARAGRAPH.format(name=name).strip() if share else "") if t)
-    if text and not claude_md.exists():
-        claude_md.write_text(text + "\n")
     _reserve_box_paths(ws, share)
     # bypassPermissions for the box editor's in-IDE claude — the VS Code Claude
     # extension reads PROJECT settings from the open folder's .claude/, not just
@@ -1305,6 +1490,12 @@ def _warning_text(name: str, w: dict) -> str:
         why = _SKILL_REASON_TEXT.get(w.get("reason"), "it could not be written")
         return (f"warning: {who} did not get the /{w.get('skill')} skill ({why}); "
                 f"`rs-sandbox skills stage` writes it again")
+    if w.get("kind") == "instructions":
+        if w.get("reason") == "old-file":
+            return ("error: " + OLD_INSTRUCTIONS_RUN_ERROR.format(box=name))
+        why = _INSTR_REASON_TEXT.get(w.get("reason"),
+                                     "RS's instructions were not written")
+        return f"warning: box {name!r}: {why}"
     if w.get("kind") == "history":
         return (f"warning: box {name!r} starts without Gitea history "
                 f"({w.get('reason')})")
@@ -2071,6 +2262,9 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         if r.returncode != 0:
             die(f"docker run failed for box {name!r}:\n"
                 f"{(r.stderr or r.stdout).strip()}")
+    # RS's instructions into the fresh home, now that the box runs (its boot
+    # only mkdir -p's ~/.claude and writes its settings no-clobber).
+    instr_warnings = _write_box_instructions(name, cname)
     # Opt-in fetch surface: rs-fetch + the operator token + the global fetch
     # wiring into the fresh box — ONLY when this box opted in (the universal
     # staging is retired; a dev box never gets it — the flag is rejected on
@@ -2092,7 +2286,8 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         _write_box_model_detached(cname, _box_model_ops({"model": model, "effort": effort}))
     # F3 Slice 2b: launch the in-box loopback forwarders for the freshly-run box.
     _launch_box_forwarders(cname, lp_list)
-    return folder_warnings + mailbox_warnings + history_warnings + browser_warnings
+    return (folder_warnings + mailbox_warnings + history_warnings + browser_warnings
+            + instr_warnings)
 
 
 def _launch_box_forwarders(cname: str, loopback_ports: list[dict]) -> None:
@@ -2114,8 +2309,8 @@ def _launch_box_forwarders(cname: str, loopback_ports: list[dict]) -> None:
 def _rerun_box(name: str, entry: dict) -> list[dict]:
     """Re-run a box from its saved entry (restart/start after a recreate). Re-
     renders the proxy MCP source (allowlist may have changed) non-strictly, then
-    re-runs from the stored axes. CLAUDE.md persists on the volume (no-clobber).
-    A dev entry re-resolves its gitea wiring FRESH (staged file + token) so the
+    re-runs from the stored axes; _run_box writes RS's instructions into the
+    fresh home (the box's coverage is read from the catalog there). A dev entry re-resolves its gitea wiring FRESH (staged file + token) so the
     re-run bakes the CURRENT gitea IP into --add-host — this is the stale-IP heal."""
     mcps = [m for m in (entry.get("upstream_mcps") or []) if isinstance(m, str)]
     ws = WORKSPACE / f"boxes/{name}"
@@ -2219,6 +2414,10 @@ def cmd_create(args: argparse.Namespace) -> None:
     clash = _name_clashes(name)
     if clash:
         die(clash)
+    # A folder kept from an earlier box of this name that still holds RS's old
+    # CLAUDE.md belongs to that box: refuse before any state write (the host
+    # gates an explicit name the same way before its own side effects).
+    _refuse_old_instructions_at_create(name)
     preset = resolve_preset(args.preset)
     is_clone = bool(preset.get("clone"))
     is_dev = bool(preset.get("dev"))
@@ -2299,11 +2498,9 @@ def cmd_create(args: argparse.Namespace) -> None:
                 "--gitea-user is required here")
         # Same reasoning as --gitea-user: the host resolves the base branch
         # against the mirror (existence-checked, ""-means-repo-default) BEFORE
-        # this runs and passes it concretely. Requiring it here is what makes
-        # the token-survives case UNREACHABLE: an empty branch would skip
-        # _stage_box_workspace's substitution and write a CLAUDE.md whose every
-        # git recipe reads `git checkout {{BASE_BRANCH}}` — a failure visible
-        # only inside the agent's own session.
+        # this runs and passes it concretely, so a new dev box always records
+        # its branch (the instructions composer falls back to `<base>` and a
+        # sentence only for a record that carries none).
         if not branch:
             die("a dev box is created via `research project box add` (or the "
                 "webui box window), which resolves its base branch against the "
@@ -2421,11 +2618,10 @@ def cmd_create(args: argparse.Namespace) -> None:
             die(f"the mailbox folder shared/{BOX_MAILBOX_DIR}/{name}/ could not "
                 f"be created in this project (something that is not a folder "
                 f"sits at that name)")
-    # Stage CLAUDE.md + .mcp-proxy.json BEFORE the run (M2: the entrypoint reads
-    # them at boot). strict=True → die on an MCP not in the project allowlist.
-    _stage_box_workspace(name, preset, mcps, strict=True, base_branch=branch,
-                         share=share)
-    # The skills this box starts with, written before the run like CLAUDE.md:
+    # Stage .mcp-proxy.json BEFORE the run (M2: the entrypoint reads it at
+    # boot). strict=True → die on an MCP not in the project allowlist.
+    _stage_box_workspace(name, preset, mcps, strict=True, share=share)
+    # The skills this box starts with, written before the run like the MCP source:
     # its own type's ingest skill (OpenKnowledge's start script copies it into
     # notes/ after `ok init`, so it must be there before the box first runs)
     # and every feed skill recorded for the project — never the feed its own
@@ -2445,6 +2641,9 @@ def cmd_create(args: argparse.Namespace) -> None:
     model = (args.model or "").strip() or (_pair.get("model") or "")
     effort = (args.effort or "").strip() or (_pair.get("effort") or "")
     entry = {"kind": KIND, "ip": ip, "container": box_container(name),
+             # A new box never had RS's old CLAUDE.md (refused above): its
+             # folder is never checked for one again.
+             OLD_INSTRUCTIONS_FLAG: True,
              "preset": args.preset, "browser": browser, "agent": agent,
              "editor": editor, "upstream_mcps": mcps,
              "model": model, "effort": effort}
@@ -2617,7 +2816,7 @@ def cmd_start(args: argparse.Namespace) -> None:
         ins = _docker("inspect", "-f", "{{json .HostConfig.ExtraHosts}}", cname)
         # Quoted JSON form — a bare substring would false-match a prefix ip.
         if f"\"rs-gitea:{dev['gitea_ip']}\"" not in (ins.stdout or ""):
-            _rerun_box(args.name, entry)
+            _print_warnings(args.name, _rerun_box(args.name, entry))
             print(f"box {args.name!r}: re-run at {entry['ip']} "
                   f"(gitea address changed while parked)")
             return
@@ -2700,6 +2899,10 @@ def cmd_start(args: argparse.Namespace) -> None:
         if r.returncode != 0:
             die(f"failed to start box {args.name!r}: "
                 f"{(r.stderr or r.stdout).strip()}")
+        # RS's instructions: this branch never reaches _run_box, so it writes
+        # them itself (the home was kept; an unreadable catalog leaves the
+        # file as it is).
+        _print_warnings(args.name, _write_box_instructions(args.name, cname))
         # A model changed while parked: the home was kept, so write it now —
         # only the halves that changed, and cleared only once written.
         pend = entry.get("model_pending")

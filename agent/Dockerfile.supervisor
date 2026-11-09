@@ -39,6 +39,13 @@ RUN chmod +x /usr/local/bin/rs-role-mcp
 RUN mkdir -p /opt/claude-templates /opt/claude-templates/commands
 COPY container/supervisor/setup.sh /opt/claude-templates/setup.sh
 COPY container/supervisor/CLAUDE.md /opt/claude-templates/CLAUDE.md
+# The notice at the top of RS's instructions file, which the entrypoint writes
+# with the template above into ~/.claude/rules/rs-instructions.md at every boot.
+COPY container/rs-instructions-notice.md /opt/claude-templates/rs-instructions-notice.md
+# This image's boot writes RS's instructions into the agent's home and never
+# into /workspace: the host refuses to start a research project on an image
+# without it (its old boot script put RS's text into the project's folders).
+LABEL research.instructions-layout=home
 COPY container/supervisor/commands/ /opt/claude-templates/commands/
 COPY container/supervisor/logbook_supervisor_template.md /opt/claude-templates/logbook_supervisor_template.md
 COPY container/supervisor/logbook_pi_template.md /opt/claude-templates/logbook_pi_template.md

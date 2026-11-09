@@ -2719,8 +2719,8 @@ def build_parser() -> argparse.ArgumentParser:
                     "freshly-created container before its first start. With "
                     "--rebuild, all three images are rebuilt first and the "
                     "new container comes from the rebuilt image. After the "
-                    "recreate, /workspace/.claude/ template copies (CLAUDE.md, "
-                    "slash commands, logbook templates) are refreshed from "
+                    "recreate, /workspace/.claude/ template copies (slash "
+                    "commands, logbook templates) are refreshed from "
                     "/opt/claude-templates/* unless --keep-claude is given.",
     )
     u.add_argument("name")
@@ -2728,10 +2728,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="rebuild images first (required for Dockerfile / "
                         "mcp-proxy / worker-image changes)")
     u.add_argument("--keep-claude", action="store_true",
-                   help="preserve the project's /workspace/.claude/* files "
-                        "instead of overwriting them with the latest "
-                        "templates (default: refresh, so role-doc and "
-                        "slash-command edits propagate)")
+                   help="preserve the project's slash commands and logbook "
+                        "templates in /workspace/.claude/ instead of "
+                        "overwriting them with the latest templates "
+                        "(default: refresh, so slash-command edits propagate)")
     u.add_argument("--enable", metavar="IDS",
                    help=f"comma-separated tokens to enable. Matched by "
                         f"name against services ({','.join(KNOWN_SERVICES)}) "

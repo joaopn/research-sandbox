@@ -220,7 +220,7 @@ def box_term_service(name: str) -> dict | None:
     The shell is reached via the shared greet helper (STAGE_SPAWN_GREETING),
     which cats a greeting then `exec bash -l` (full PATH, claude included). The
     greeting path is the box convention ``/workspace/.rs-greeting`` (rs-sandbox
-    writes the box's CLAUDE.md / greeting at create). Using the helper also keeps
+    writes the box's greeting at create). Using the helper also keeps
     the path out of single-quotes, so there's no nesting in this tab's
     ``docker exec … bash -c '…'`` wrapper."""
     if not _BOX_NAME_RE.match(name):

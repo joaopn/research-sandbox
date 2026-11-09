@@ -349,7 +349,7 @@ Generally safe — the supervisor reads its own logbook + the registry on the ne
 <details>
 <summary><strong>Where does the supervisor's prompt come from?</strong></summary>
 
-`container/supervisor/CLAUDE.md` is baked into the supervisor image and copied to `/workspace/.claude/CLAUDE.md` on first boot. Editing the workspace copy applies to that one project; editing the source and rebuilding applies to new projects.
+`container/supervisor/CLAUDE.md` is baked into the supervisor image and written, under a short notice, into the agent's home folder as `~/.claude/rules/rs-instructions.md` at every start. That copy is replaced at every start; your own instructions for one project go in its `/workspace/.claude/CLAUDE.md`, which RS never writes. Editing the source and rebuilding applies to every research project at its next start.
 
 </details>
 

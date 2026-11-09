@@ -70,8 +70,8 @@ PORT_MIN, PORT_MAX = 1, 65535
 
 # A web app the project runs itself and the webui shows as a tab that follows
 # the browser's address: {port, label, start} (the box preset's `web`; built-in
-# docker workflows only). `instructions` is the agent's CLAUDE.md, folded in
-# from the sibling workflows/<name>.instructions.md of a built-in (never JSON).
+# docker workflows only). `instructions` is RS's text for the project's agent
+# (written into its home rules folder), folded in from the sibling workflows/<name>.instructions.md of a built-in (never JSON).
 _ALLOWED_KEYS = {"name", "substrate", "image_overlay", "repo", "ref", "setup",
                  "tabs", "mcp_exports", "resources", "services", "description",
                  "greeting", "title", "group", "tags", "agents", "dev", "web",
@@ -311,8 +311,8 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
         elif m["gitea_history"] and "web" not in m:
             out.append(p("gitea_history requires web"))
 
-    # instructions — the agent's CLAUDE.md, staged into a docker project's
-    # /workspace at create. Folded in from the built-in's sibling file.
+    # instructions — RS's text for a docker project's agent, written into its
+    # home rules folder at every start. Folded in from the built-in's sibling file.
     if "instructions" in m:
         if not _is_str(m["instructions"]):
             out.append(p("instructions must be a non-empty string"))

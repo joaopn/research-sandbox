@@ -112,8 +112,9 @@ RSORCHESTRATIONSVG
 ## How it works
 
 **+ Add box** creates the box in the project's inner Docker daemon with a pinned
-IP on `rs-inner`. The chosen type's instructions land in the box's
-`/workspace/CLAUDE.md`; any selected MCPs are wired to `mcp-proxy:8888` so the
+IP on `rs-inner`. The chosen type's instructions land in the box agent's home
+rules folder (`~/.claude/rules/rs-instructions.md`, rewritten at every start; the
+box's own `/workspace/.claude/` is yours); any selected MCPs are wired to `mcp-proxy:8888` so the
 box's agent reaches them by name. Egress is the project's router policy (a
 sandbox-dind project defaults to locked). Discard a box from the `✕` on its tab —
 its container and workspace go with it.

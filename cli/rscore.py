@@ -367,6 +367,35 @@ _BOX_BROWSER_REASONS = {
 }
 
 
+# The box tool's instructions warnings (kind "instructions") → fixed wording.
+# "old-file" is not a warning: it is handed back on its own channel
+# (_box_old_instructions) and fails the operation about that box.
+_BOX_INSTR_REASONS = {
+    "type-gone": "started with only RS's notice as its instructions: its box type "
+                 "is no longer in the project's box catalog",
+    "catalog-unreadable": "started without RS's instructions: the project's box "
+                          "catalog could not be read; the next start writes them "
+                          "again",
+    "not-written": "started without RS's instructions: they could not be written "
+                   "into its home; the next start writes them again",
+    "flag-not-recorded": "got RS's instructions, but its record could not note it; "
+                         "its folder is checked for RS's old instructions file again "
+                         "at the next start",
+}
+_BOX_INSTR_REASON_DEFAULT = ("started without RS's instructions; the next start "
+                             "writes them again")
+
+
+def _box_old_instructions(raw: Any) -> bool:
+    """Whether the box tool's reply reports RS's old instructions file in the
+    box's folder (nothing was written; the calling operation fails, or — on the
+    shared dev-lane side path — warns)."""
+    if not isinstance(raw, list):
+        return False
+    return any(isinstance(w, dict) and w.get("kind") == "instructions"
+               and w.get("reason") == "old-file" for w in raw)
+
+
 def _box_folder_warnings(raw: Any, box: Any) -> list[str]:
     """The box tool's structured folder warnings → operator lines, built here
     from a re-validated box name and folder name (the tool's own text never
@@ -385,6 +414,14 @@ def _box_folder_warnings(raw: Any, box: Any) -> list[str]:
                    if isinstance(w.get("reason"), str) else None) \
                 or "it could not run trusted"
             out.append(f"{who} started with a restricted browser: {why}")
+            continue
+        if w.get("kind") == "instructions":
+            reason = w.get("reason")
+            if reason == "old-file":
+                continue                # its own channel: _box_old_instructions
+            why = (_BOX_INSTR_REASONS.get(reason) if isinstance(reason, str)
+                   else None) or _BOX_INSTR_REASON_DEFAULT
+            out.append(f"{who} {why}")
             continue
         if w.get("kind") == "history":
             out.append(f"{who} started without its Gitea history: "
@@ -480,16 +517,18 @@ def _box_discard_warnings(raw: Any, box: Any) -> list[str]:
     return out
 
 
-def _report_box_restart_warnings(name: str, stdout: Any, progress) -> None:
+def _report_box_restart_warnings(name: str, stdout: Any, progress) -> bool:
     """The folders a re-run box started without (the supervisor-recreate box
     relaunch loop): stderr for the CLI, a `warning` progress line for the
     webui's start/update list (`progress` is None from the CLI). Tolerant —
-    the relaunch loop must never fail a start."""
-    for line in _box_folder_warnings(
-            _parse_box_tool_json(stdout).get("warnings"), name):
+    the relaunch loop never fails a start for these. Returns whether the box
+    reported RS's old instructions file (the caller decides: error or warning)."""
+    raw = _parse_box_tool_json(stdout).get("warnings")
+    for line in _box_folder_warnings(raw, name):
         print(f"warning: {line}", file=sys.stderr)
         if progress is not None:
             progress.step("warning", line)
+    return _box_old_instructions(raw)
 
 
 def _parse_box_tool_json(stdout: Any) -> dict:
@@ -1231,10 +1270,6 @@ class CreateRequest:
     # never a user/broker input, so it stays out of CREATE_WEBUI_FIELDS. {} ⇒ no
     # web app, and the project is created exactly as before.
     web: dict = field(default_factory=dict)
-    # The agent's CLAUDE.md for a docker project: the manifest's `instructions`
-    # (a built-in's sibling workflows/<name>.instructions.md). DERIVED like
-    # `greeting`; staged no-clobber at create. "" ⇒ nothing staged.
-    instructions: str = ""
     # Keep the notes' history on the shared Gitea (a workflow with
     # `gitea_history`, docker web-app workflows only): the project's own
     # account `notes-<project>` pushes notes/ to `notes/<project>`. An IN-BOX
@@ -1361,7 +1396,6 @@ class CreateRequest:
                 raise ValidationError(
                     "this workflow's setup is fixed; create the project "
                     "without a setup of its own")
-        instructions = manifest.get("instructions") or ""
         # Gitea history — every refusal that needs no network, here; the
         # Gitea-touching claim is create's pre-flight. Texts reach the browser.
         history = _coerce_history_flag(kw.get("history"))
@@ -1654,7 +1688,6 @@ class CreateRequest:
             service_defaults=service_defaults,
             greeting=greeting,
             web=web,
-            instructions=instructions,
             history=history,
             dev_lane=dev_lane,
             dev_repo=dev_repo,
@@ -3305,8 +3338,8 @@ def _valid_branch_name(branch: Any) -> bool:
 
 
 # The placeholder the dev instructions carry for the container's base branch.
-# Substituted HOST-side at both CLAUDE.md write points (_run_dev_clone here and
-# rs_sandbox._stage_box_workspace), so no template token ever reaches an agent.
+# Substituted HOST-side wherever RS composes the text (_dev_text here and the
+# box tool's composer), so no template token ever reaches an agent.
 # MIRROR-PAIR LOCKSTEP with cli/rs_sandbox.py's BASE_BRANCH_TOKEN — rs_sandbox is
 # streamed into the supervisor as a standalone file and cannot import rscore.
 BASE_BRANCH_TOKEN = "{{BASE_BRANCH}}"
@@ -4385,6 +4418,17 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     # Verify prerequisites.
     if not run_quiet(["docker", "image", "inspect", substrate_image]):
         die(f"image {substrate_image} not found. Run `research setup` first.")
+    # A research image from before RS's home-folder instructions layout would
+    # copy RS's text into the project's own folders at its first boot and
+    # report success: refuse before anything exists. Keyed on the IMAGE (the
+    # Docker substrate derives the research type too, and rs-minimal carries
+    # no such label).
+    if substrate_image == SUPERVISOR_IMAGE:
+        layout = _image_instructions_layout(substrate_image)
+        if layout is None:
+            raise ValidationError(OLD_INSTRUCTIONS_LABEL_CREATE_ERROR)
+        if layout != INSTRUCTIONS_LAYOUT_HOME:
+            raise ValidationError(OLD_INSTRUCTIONS_IMAGE_CREATE_ERROR)
     if not container_running(ROUTER_CONTAINER):
         die(f"{ROUTER_CONTAINER} is not running. Run `research setup` first.")
     # A workflow that starts its own web app needs the loop baked into the
@@ -4514,7 +4558,14 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
               "models": model_pairs,
               # The project's own record of its SSH host port (allocate_ssh_port
               # keys on it across stops; start/recreate read it back).
-              "ssh_port": ssh_port}
+              "ssh_port": ssh_port,
+              # Whether the workflow is a dev one, resolved once here: RS's
+              # instructions for the project are decided from this record, so a
+              # custom workflow removed later cannot change them.
+              "dev": bool(req.dev_lane),
+              # A new project never had RS's old /workspace/CLAUDE.md (the
+              # leftover check above refused one), so the check never runs.
+              OLD_INSTRUCTIONS_FLAG: True}
     if project_type == PROJECT_TYPE_SANDBOX_DIND:
         # Freeze the box-image pins (lane-3): sandbox-dind eager-stages the box
         # harness (STAGE_DIND_UNIFY — the harness is a standing dind utility now,
@@ -4716,11 +4767,12 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         #      fires on rs-minimal (its /home/research is image-resident).
         _stage_git_auth(container_name, req.github_ssh_key,
                         req.git_user_name, req.git_user_email, progress)
-        # The workflow's agent instructions and its web app's tab, BEFORE the
-        # setup: a failed setup raises out of create, and nothing later would
-        # stage either (a start retries only the setup).
-        if req.instructions:
-            _stage_project_instructions(container_name, req.instructions)
+        # RS's instructions (the workflow's own, or the notice alone) and the
+        # web app's tab, BEFORE the setup: a failed setup raises out of create,
+        # and a start retries only the setup. A new project's old-file check
+        # never runs (its marker records the flag).
+        _write_project_instructions(project, container_name, workspace_path,
+                                    progress=progress, has_file=False)
         if req.web:
             _register_project_web_tab(workspace_path, req.web)
         # Gitea history, in the box's order and BEFORE the setup: the setup's
@@ -4777,6 +4829,12 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             # The working-mode suite (I33): into the shared copy for the boxes,
             # and into the project container's own agents.
             _report_warnings(_stage_harness(container_name, local, workspace_path), progress)
+            # RS's instructions into the agent's home (the dev text with the
+            # request's resolved base branch, else the notice alone).
+            _write_project_instructions(
+                project, container_name, workspace_path, progress=progress,
+                branch=effective_dev_branch if req.dev_repo else None,
+                has_file=False)
             # The recorded Claude model into Claude's own settings (I33 slice 3).
             _apply_agent_settings_pending(container_name, workspace_path, local,
                                           claude_in_settings=model_in_settings,
@@ -5306,6 +5364,9 @@ def start(req: StartStopRequest, cfg: "Config" | None = None,
     else:
         containers = [{"name": container_name_for(req.name), "project": req.name}]
     results: list[ActionResult] = []
+    # Old instructions files met on the way: raised once, after every project
+    # started, so `--all` still starts them all.
+    found: list[OldInstructions] = []
     for c in containers:
         if not container_exists(c["name"]):
             results.append(ActionResult(c["name"], c.get("project"), "start", "skip:absent"))
@@ -5327,14 +5388,15 @@ def start(req: StartStopRequest, cfg: "Config" | None = None,
                 progress.step("recreate", "re-creating the project with its new folders")
                 _recreate_docker_substrate(
                     c["project"], cfg, service_flags=_read_service_flags(c["name"]),
-                    progress=progress, heal_gitea=True)
+                    progress=progress, heal_gitea=True, found=found)
             else:
                 progress.step("start", "starting container")
-                _start_docker_substrate(c["project"], cfg, progress)
+                _start_docker_substrate(c["project"], cfg, progress, found=found)
         else:
             progress.step("recreate", "recreating supervisor")
-            _recreate_supervisor(c["project"], cfg, progress=progress)
+            found += _recreate_supervisor(c["project"], cfg, progress=progress) or []
         results.append(ActionResult(c["name"], c["project"], "start", "ok"))
+    _raise_old_instructions(found, name_project=bool(req.all))
     return results
 
 
@@ -5581,6 +5643,10 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     if agents_added:
         _write_marker_agents(workspace_path,
                              list(_read_marker_agents(workspace_path)) + agents_added)
+    # Old instructions files met by a writer below: raised once at the end of
+    # whichever path this update takes.
+    found: list[OldInstructions] = []
+    wrote_instructions = False
     if plan.any():
         # Written into the agents' own files now (the container is running);
         # an agent this update adds gets it right after its install below, a
@@ -5596,11 +5662,17 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
                                           progress=progress)
             if plan.harness is not None and not is_research_p:
                 _report_warnings(_stage_harness(container, now_local, workspace_path), progress)
+                # A working-mode change rewrites RS's instructions too (the
+                # home survives; the recreate path would write them again).
+                found += _write_project_instructions(project, container, workspace_path,
+                                                     progress=progress, has_file=True)
+                wrote_instructions = True
         if not (touched or req.rebuild or enable_workers or disable_workers
                 or req.role_mcp_upstream or model_changes or agents_added or plan.removed
                 or claude_recreate):
             progress.step("agents", "applied to the project's agents")
             print(f"agent settings of {project!r} updated; each agent's next session uses them.")
+            _raise_old_instructions(found)
             return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
                                 effort_dropped=effort_dropped)
     # `live_ok` must exclude any model OR agent change: `--worker-model haiku
@@ -5643,6 +5715,11 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
                                            **_pi_pair_kwargs(workspace_path)), progress)
         # The working-mode suite (I33), before the box refresh below.
         _report_warnings(_stage_harness(container, local, workspace_path), progress)
+        # RS's instructions into the agent's home (it survives; boxes are not
+        # rewritten at an Update).
+        if not wrote_instructions:
+            found += _write_project_instructions(project, container, workspace_path,
+                                                 progress=progress, has_file=True)
         # The recorded models of an agent just installed (I33 slice 3).
         _apply_agent_settings_pending(
             container, workspace_path, local, progress=progress,
@@ -5667,6 +5744,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
                   f"and {len(refreshed)} running box(es).")
         if not_refreshed:
             print(f"warning: not refreshed: {', '.join(not_refreshed)}", file=sys.stderr)
+        _raise_old_instructions(found)
         return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
                             effort_dropped=effort_dropped, agents_added=agents_added,
                             boxes_refreshed=refreshed, boxes_not_refreshed=not_refreshed)
@@ -5691,12 +5769,14 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
             progress.step("models", "applying the worker model")
             print("worker model updated; the next `rs-worker spawn` picks it up "
                   "(no container touched).")
+            _raise_old_instructions(found)
             return UpdateResult(project=project, rebuilt=False,
                                 refreshed_claude=False,
                                 effort_dropped=effort_dropped)
         if changed == {"role"}:
             progress.step("models", "applying the role model")
             _restart_role_mcps_for_models(project, cfg, workspace_path)
+            _raise_old_instructions(found)
             return UpdateResult(project=project, rebuilt=False,
                                 refreshed_claude=False,
                                 effort_dropped=effort_dropped)
@@ -5733,13 +5813,13 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         workers_disabled.append(role)
 
     progress.step("recreate", "recreating supervisor")
-    _recreate_supervisor(
+    found += _recreate_supervisor(
         project, cfg,
         force_restage=req.rebuild,
         post_create_hook=hook,
         service_flags=flags_override,
         progress=progress,
-    )
+    ) or []
 
     # The recreate wrote authoritative service labels, so a live-toggle override for
     # any EXPLICITLY-changed service is now redundant — clear it so a stale override
@@ -5766,6 +5846,8 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         _role_mcp_enable(project, cfg, role, role_mcp_explicit.get(role))
         workers_enabled.append(role)
 
+    # After the last step, so everything above still ran.
+    _raise_old_instructions(found)
     return UpdateResult(
         project=project, rebuilt=req.rebuild, refreshed_claude=refreshed,
         workers_enabled=workers_enabled, workers_disabled=workers_disabled,
@@ -6508,6 +6590,26 @@ def _refuse_leftover_settings(project: str, workspace_path: "Path", *,
             f"cannot create project {project!r}: an earlier project of that name "
             f"left its settings folder unusable (a link, not a folder, or not "
             f"readable); destroy that project first")
+    # RS's old instructions file in the leftover belongs to the earlier
+    # project: the new one never inherits it (lstat: a dangling link counts).
+    try:
+        os.lstat(workspace_path / "CLAUDE.md")
+    except FileNotFoundError:
+        return
+    except PermissionError:
+        if unopenable_ok:
+            return                      # looked at again after the mode reset
+        raise ValidationError(
+            f"cannot create project {project!r}: an earlier project of that name "
+            f"left its folder unreadable; destroy that project first")
+    except OSError:
+        raise ValidationError(
+            f"cannot create project {project!r}: an earlier project of that name "
+            f"left its folder in a state RS cannot check; destroy that project first")
+    raise ValidationError(
+        f"cannot create project {project!r}: an earlier project named {project!r} "
+        f"left its folder here, and it holds `/workspace/CLAUDE.md`; destroy that "
+        f"project first")
 
 
 def _settings_folder_refusal(workspace_path: "Path") -> str:
@@ -10639,6 +10741,7 @@ _SUPERVISOR_FILE_MAP: list[tuple[str, str, bool]] = [
     ("container/supervisor/inner-firewall.sh",          "/usr/local/bin/rs-inner-firewall",                  True),
     ("container/supervisor/inner-guard.sh",             INNER_GUARD_BIN,                                     True),
     ("container/supervisor/CLAUDE.md",                  "/opt/claude-templates/CLAUDE.md",                   False),
+    ("container/rs-instructions-notice.md",             "/opt/claude-templates/rs-instructions-notice.md",   False),
     ("container/supervisor/setup.sh",                   "/opt/claude-templates/setup.sh",                    True),
     ("container/supervisor/logbook_supervisor_template.md", "/opt/claude-templates/logbook_supervisor_template.md", False),
     ("container/supervisor/logbook_pi_template.md",     "/opt/claude-templates/logbook_pi_template.md",      False),
@@ -10925,7 +11028,7 @@ def _recreate_supervisor(
     post_create_hook=None,
     service_flags: dict[str, bool] | None = None,
     progress=None,
-) -> None:
+) -> "list[OldInstructions]":
     """Stash creds → stop+rm → create new container from SUPERVISOR_IMAGE
     → optional post-create hook → start → re-inject route → re-stage inner
     images → respawn mcp-proxy. The only safe shape on sysbox: stop+start
@@ -10939,7 +11042,11 @@ def _recreate_supervisor(
 
     The post-create hook runs against the not-yet-started container —
     used by `cmd_project_update` to docker-cp edited files in before the
-    entrypoint reads them."""
+    entrypoint reads them.
+
+    Returns the old instructions files it met (RS's instructions were not
+    written there); the calling verb raises them once, after its last step."""
+    found: list[OldInstructions] = []
     container = container_name_for(project)
     was_running = container_running(container)
     workspace_path = workspace_path_for(project, cfg)
@@ -11058,6 +11165,11 @@ def _recreate_supervisor(
         # The working-mode suite (I33): the shared copy's was just emptied, and
         # the boxes this start re-runs find the installer there.
         _report_warnings(_stage_harness(container, local, workspace_path), progress)
+        # RS's instructions into the agent's home, BEFORE the box-pin backfill
+        # below can synthesize a marker. The saved home carried the previous
+        # file across the recreate.
+        found += _write_project_instructions(project, container, workspace_path,
+                                             progress=progress, has_file=True)
         # The agents' recorded models into their own settings, once (I33 slice 3).
         _apply_agent_settings_pending(container, workspace_path, local,
                                       claude_in_settings=model_in_settings, progress=progress)
@@ -11132,6 +11244,17 @@ def _recreate_supervisor(
         _stage_agent_dist(container, [DEFAULT_AGENT])
         _apply_agent_settings_pending(container, workspace_path, [DEFAULT_AGENT],
                                       claude_in_settings=model_in_settings, progress=progress)
+        # The research boot wrote RS's instructions itself unless RS's old
+        # link stands (or the image is from before the layout): say so at the
+        # end of the operation.
+        found += _research_instructions_check(project, container)
+        # A research project's boxes take their RS text from the staged box
+        # catalog at every re-run below: refresh it from this RS release first
+        # (only when the project has boxes; a box-less research project is left
+        # exactly as it was).
+        if any(isinstance(e, dict) and e.get("kind") == extension.SANDBOX_KIND
+               for e in extension.load(workspace_path).values()):
+            _stage_box_catalog(workspace_path, strict=False)
         # Editor dist re-staged the same way (STAGE_EDITOR_DIST) so a recreated
         # supervisor's interactive PI/extension containers find a populated mount.
         # deploy_local re-deploys the supervisor's OWN editor (no bake now), gated
@@ -11222,7 +11345,9 @@ def _recreate_supervisor(
             print(f"warning: failed to restart sandbox box {name!r}: "
                   f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
             continue
-        _report_box_restart_warnings(name, r.stdout, progress)
+        if _report_box_restart_warnings(name, r.stdout, progress):
+            found.append(OldInstructions("box", project, name))
+    return found
 
 
 def _container_project_type(container: str) -> str:
@@ -11334,13 +11459,15 @@ def _apply_project_pids_limit(container: str, pids_limit: int) -> None:
 
 
 def _start_docker_substrate(project: str, cfg: "Config",  # type: ignore[name-defined]
-                            progress=None) -> None:
+                            progress=None, *,
+                            found: "list[OldInstructions] | None" = None) -> None:
     """Start a stopped `docker`-substrate project. Unlike a sysbox supervisor
     (which loses its implicit volume bindings on stop and must be recreated), a
     plain runc container starts cleanly with `docker start`. Only the router
     default route — dropped with the container's netns on stop — is re-injected.
     This is the deliberate exception to the 'sysbox can't stop/start' rule: it is
-    sysbox-specific, and the docker substrate has no sysbox bindings to lose."""
+    sysbox-specific, and the docker substrate has no sysbox bindings to lose.
+    An old instructions file met is appended to `found` (the verb raises)."""
     container = container_name_for(project)
     # The task cap from the host settings, applied to the stopped container
     # before it starts: an existing project picks up a changed setting here
@@ -11362,6 +11489,12 @@ def _start_docker_substrate(project: str, cfg: "Config",  # type: ignore[name-de
     # F3 Slice 1: re-establish loopback forwarders for the project's registered
     # exported ports (the container's netns/processes reset on stop/start).
     _reconcile_loopback_bridges(project, cfg)
+    # RS's instructions into the agent's home (which survived the stop),
+    # before the setup retry, so a failing setup still leaves the file.
+    old = _write_project_instructions(project, container, workspace_path_for(project, cfg),
+                                      progress=progress, has_file=True)
+    if found is not None:
+        found += old
     # A web-app project whose setup did not finish (it failed at create or
     # after a rebuild) retries it now: the home survived the stop, so a
     # finished setup is never re-run. This is what "stop the project and
@@ -11475,22 +11608,26 @@ def _update_docker_substrate(req: "UpdateRequest", cfg: "Config",  # type: ignor
     flags = _compute_service_flags(enable_services, disable_services, base=base)
     progress.step("recreate", "recreating box")
     print(f"=== Updating project: {project} (editor toggle) ===")
+    found: list[OldInstructions] = []
     _recreate_docker_substrate(project, cfg, service_flags=flags,
-                               progress=progress)
+                               progress=progress, found=found)
+    _raise_old_instructions(found)
     return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
                         workers_enabled=[], workers_disabled=[])
 
 
 def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[name-defined]
                                service_flags: dict[str, bool],
-                               progress=None, heal_gitea: bool = False) -> None:
+                               progress=None, heal_gitea: bool = False,
+                               found: "list[OldInstructions] | None" = None) -> None:
     """Recreate a `docker`-substrate (plain runc) box to apply a service-flag
     change. Far simpler than _recreate_supervisor: no inner dockerd, no image
     re-staging, no creds-stash dance (the box re-auths in place — greenfield-
     disposable). Workspace bind-mount, network, SSH port/password, agent-dist
     mounts, and extra --mount folders all survive (recovered from the container's
     metadata before rm); the editor-dist mount is re-derived from the NEW
-    code-server flag (host-cache sourced, so it just re-applies)."""
+    code-server flag (host-cache sourced, so it just re-applies). An old
+    instructions file met is appended to `found` (the verb raises)."""
     container = container_name_for(project)
     was_running = container_running(container)
     workspace_path = workspace_path_for(project, cfg)
@@ -11595,6 +11732,12 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
     # F3 Slice 1: the rm + run above wiped the container fs + netns — re-establish
     # loopback forwarders for the project's registered exported ports.
     _reconcile_loopback_bridges(project, cfg)
+    # RS's instructions into the fresh home, before the setup re-run, so a
+    # failing setup still leaves the file.
+    old = _write_project_instructions(project, container, workspace_path,
+                                      progress=progress, has_file=False)
+    if found is not None:
+        found += old
     # The rm + run reset the home, so a web-app project's setup (its install)
     # is gone — and with history, its Gitea wiring too: re-run both, history
     # first, after node is back. The tab waits through it.
@@ -11677,14 +11820,15 @@ def _live_toggle_reader(project: str, cfg: "Config", container: str,  # type: ig
 
 
 def _refresh_workspace_claude_templates(container: str) -> None:
-    """Overwrite /workspace/.claude/{CLAUDE.md, logbook_*_template.md,
-    commands/} from /opt/claude-templates/. The entrypoint's first-boot
-    `if-not-present` guard means existing projects never see template
-    edits otherwise — this closes that loop. Slash-commands dir is
-    rebuilt from scratch (so removed slash commands actually disappear),
-    not merged."""
+    """Overwrite /workspace/.claude/{logbook_*_template.md, commands/} from
+    /opt/claude-templates/. The entrypoint's first-boot `if-not-present`
+    guard means existing projects never see template edits otherwise — this
+    closes that loop. Slash-commands dir is rebuilt from scratch (so removed
+    slash commands actually disappear), not merged. RS's research
+    instructions are NOT copied here any more: the boot script writes them
+    into the agent's home at every start (the recreate before this did), and
+    /workspace/.claude/CLAUDE.md is the user's own file."""
     run_check(["docker", "exec", container, "sh", "-eu", "-c", r"""
-        cp -f /opt/claude-templates/CLAUDE.md /workspace/.claude/CLAUDE.md
         cp -f /opt/claude-templates/logbook_supervisor_template.md \
               /workspace/.claude/logbook_supervisor_template.md
         cp -f /opt/claude-templates/logbook_pi_template.md \
@@ -12528,7 +12672,7 @@ def _connect_gitea_to_project_network(network: str) -> str:
     return r.stdout.strip()
 
 
-def wire_gitea_to_projects() -> None:
+def wire_gitea_to_projects(progress=None) -> None:
     """Re-attach rs-gitea after a host `start`/recreate — UNIVERSAL network
     wiring, like wire_registry_to_projects (STAGE_DEV_GITEA S3: every project
     is wired once gitea exists), refreshing each record entry's gitea_ip on
@@ -12630,7 +12774,7 @@ def wire_gitea_to_projects() -> None:
         # the fetch half of the reconcile targets. _restart_dev_boxes
         # self-gates (gitea_ip + container_running) and its entry filter skips
         # projects with neither dev nor fetch boxes — the stable no-op.
-        _restart_dev_boxes(project, cfg, ip)
+        _restart_dev_boxes(project, cfg, ip, progress)
 
 
 def _stage_dev_git_credentials(container: str, user: str, *,
@@ -13129,7 +13273,8 @@ exit 0'''
               file=sys.stderr)
 
 
-def _restart_dev_boxes(project: str, cfg: "Config", gitea_ip: str) -> None:
+def _restart_dev_boxes(project: str, cfg: "Config", gitea_ip: str,
+                       progress=None) -> None:
     """F1 auto-heal (STAGE_DEV_GITEA S2): re-run any RUNNING dev OR
     rs-fetch-enabled box whose baked /etc/hosts entry does not match the
     CURRENTLY staged gitea address (both kinds bake the same rs-gitea
@@ -13145,7 +13290,10 @@ def _restart_dev_boxes(project: str, cfg: "Config", gitea_ip: str) -> None:
     box is left parked — rs-sandbox's own start path reconciles it. Dev boxes
     are enumerated HOST-side from the bind-mounted extensions.json. Best-
     effort: a failure warns and leaves the box to a manual
-    `rs-sandbox restart <name>`."""
+    `rs-sandbox restart <name>`. A box that reports RS's old instructions file
+    is a warning on stderr and on `progress` when given (the browser's Gitea
+    Recover follows only progress steps): every caller is an operation about
+    something else, so it never fails."""
     container = container_name_for(project)
     if not gitea_ip or not container_running(container):
         return
@@ -13187,7 +13335,12 @@ def _restart_dev_boxes(project: str, cfg: "Config", gitea_ip: str) -> None:
         else:
             print(f"dev/fetch box {name!r} re-run against the new gitea address")
             # A fetch box may carry read-only folders: report any it lacks.
-            _report_box_restart_warnings(name, r.stdout, None)
+            if _report_box_restart_warnings(name, r.stdout, progress):
+                # A side effect of a shared dev-lane operation: the box's old
+                # instructions file is a WARNING here, never this operation's
+                # failure; the project's next start fails with the error.
+                _report_warnings([OLD_INSTRUCTIONS_BOX_SIDE_WARNING.format(
+                    box=_shown_box(name), project=project)], progress)
 
 
 def _resolve_dev_branch(repo: str, branch: str) -> str:
@@ -13376,11 +13529,9 @@ def _run_dev_clone(container: str, repo: str, user: str, branch: str,
     GitHub-PAT-shaped). Secret discipline: the credentials line
     reaches the container via STDIN (never exec argv); the clone script itself
     carries NO token (the helper file supplies auth); failures raise
-    HarnessError with the token literal scrubbed (via _light_exec). Also stages
-    the dev instructions as /workspace/CLAUDE.md, no-clobber — the same text
-    the dev box preset stages, from boxes/dev.instructions.md, with the base
-    branch substituted in. ``branch`` is the CONCRETE name the host already
-    resolved (_resolve_dev_branch) — never empty. Returns the clone dir."""
+    HarnessError with the token literal scrubbed (via _light_exec).
+    ``branch`` is the CONCRETE name the host already resolved
+    (_resolve_dev_branch) — never empty. Returns the clone dir."""
     base = f"http://{gitea.GITEA_CONTAINER}:{gitea.GITEA_INNER_PORT}"
     progress.step("dev-clone", "cloning the dev fork")
     token = _stage_dev_git_credentials(container, user, strict=True)
@@ -13420,17 +13571,8 @@ def _run_dev_clone(container: str, repo: str, user: str, branch: str,
     # _light_exec's scrub parameter is generic "replace this literal" — here the
     # literal is the gitea agent token, not a GitHub PAT.
     _light_exec(container, script, step="dev fork clone", github_pat=token)
-    instr = box_catalog.BUILTIN_DIR / "dev.instructions.md"
-    if instr.is_file():
-        # WIRE the base branch into the agent's own instructions: the host holds
-        # the text here, so substitute the resolved name before it ever reaches
-        # the container — no template token can survive to the agent. (The box
-        # twin is rs_sandbox._stage_box_workspace; repo-watch-prompt.md is
-        # image-baked and read verbatim, so it uses $GITEA_BRANCH instead.)
-        text = instr.read_text().replace(BASE_BRANCH_TOKEN, branch)
-        run(["docker", "exec", "-i", "-u", "research", container, "sh", "-c",
-             '[ -e /workspace/CLAUDE.md ] || cat > /workspace/CLAUDE.md'],
-            input=text, capture_output=True)
+    # The dev instructions are RS's home-folder file now
+    # (_write_project_instructions); nothing is written into the workspace.
     return workdir
 
 
@@ -13953,6 +14095,528 @@ def _marker_rmw(workspace_path: "Path", mutate, what: str) -> None:
         raise ValidationError(f"cannot {what}: the project marker {orch_files.SHOWN_FOLDER}/project.json is not a JSON object")
     mutate(data)
     _write_marker(workspace_path, data, what)
+
+
+# ---------------------------------------------------------------------------
+# RS's instructions in the agent's home rules folder
+# ---------------------------------------------------------------------------
+# RS's text for each kind of container lives in ONE file outside the
+# workspace, `~/.claude/rules/rs-instructions.md` in the agent user's home:
+# Claude Code loads every rule file there in every session and subagent, and
+# RS's pi extension loads the same folder into pi. The file is owned by the
+# agent user with mode 0444 (read-only by MODE: RS's own steps re-own the home
+# to the agent user and never change modes); the folder stays an ordinary
+# writable folder. The notice at the top says RS replaces the file. The user's
+# own instructions live in /workspace/.claude/ and /workspace/.pi/, which RS
+# never writes. RS used to write /workspace/CLAUDE.md; where an old one is
+# still there, RS writes nothing new and the operation fails with an error
+# saying what to do (it never renames, moves or deletes the file).
+RS_INSTRUCTIONS_NOTICE_FILE = SCRIPT_DIR / "container" / "rs-instructions-notice.md"
+RS_INSTRUCTIONS_REL = ".claude/rules/rs-instructions.md"
+# The marker / box-record flag set after the first successful write: from then
+# on a /workspace/CLAUDE.md is the user's own file and never checked again.
+OLD_INSTRUCTIONS_FLAG = "old_instructions_cleared"
+# The sentence a dev text carries when no base branch is recorded (`<base>`
+# stands where the name would be). MIRROR PAIR with rs_sandbox.NO_BRANCH_SENTENCE
+# (the box tool is staged standalone) — pinned equal.
+NO_BRANCH_PLACEHOLDER = "<base>"
+NO_BRANCH_SENTENCE = (
+    "RS had no base branch recorded for this container when it wrote this file, "
+    "so `<base>` below stands for it: it is the default branch of the `upstream` "
+    "remote (`git remote show upstream`, the `HEAD branch` line) unless the "
+    "maintainer names another.")
+RS_INSTR_WRITTEN = "RS_INSTRUCTIONS_WRITTEN"
+RS_INSTR_FAILED = "RS_INSTRUCTIONS_NOT_WRITTEN"
+RS_INSTR_OLD = "RS_INSTRUCTIONS_OLD_FILE"
+RS_INSTR_KEPT = "RS_INSTRUCTIONS_KEPT"
+# One `docker exec` writing a few KB into the container's home answers in well
+# under a second; the bound only stops a wedged exec from holding a start (and
+# the serial broker) forever. Generous on purpose: a timeout here costs a
+# warning and leaves the file to the next start, so it must not fire on a box
+# that is merely slow under a parallel image build.
+RS_INSTR_EXEC_TIMEOUT_S = 30
+# The write, as the agent user (uid 1000, HOME set by the caller). $1 is the
+# byte count the host sent, $2 is 1 when the container's old
+# /workspace/CLAUDE.md must be checked first (a file or a link — a dangling
+# link fails -e), $3 is 1 when a file already in place is kept (a dev text
+# written without its branch never replaces one written with it). ONE `&&` chain with ONE failure branch: on the left of `||`
+# the shell ignores `set -e`, so a `;`-list would install a cut-short file and
+# report success. The temp name never ends in `.md` (the agents load only
+# `*.md`), `mktemp` creates it exclusively, the count catches a host that died
+# mid-stream (`cat` then sees end-of-file and exits 0), and `mv -T` makes a
+# folder planted at the target fail instead of receiving the file; a link at
+# the target is replaced, never followed. MIRROR PAIR with
+# rs_sandbox.RS_INSTR_SCRIPT — pinned equal.
+RS_INSTR_SCRIPT = (
+    'if [ "$2" = 1 ] && { [ -L /workspace/CLAUDE.md ] || [ -e /workspace/CLAUDE.md ]; }; '
+    f'then echo {RS_INSTR_OLD}; exit 0; fi\n'
+    'if [ "$3" = 1 ] && [ -e "$HOME/.claude/rules/rs-instructions.md" ]; '
+    f'then echo {RS_INSTR_KEPT}; exit 0; fi\n'
+    'tmp=; mkdir -p "$HOME/.claude/rules" && '
+    'tmp=$(mktemp "$HOME/.claude/rules/.rs-instructions.XXXXXX") && '
+    'cat >"$tmp" && [ "$(wc -c <"$tmp")" -eq "$1" ] && chmod 0444 "$tmp" && '
+    'mv -fT "$tmp" "$HOME/.claude/rules/rs-instructions.md" && '
+    f'echo {RS_INSTR_WRITTEN} || '
+    f'{{ [ -z "$tmp" ] || rm -f "$tmp" || :; echo {RS_INSTR_FAILED} || :; }}\n')
+# A failed read of a workflow catalog, the built-ins or the custom-workflow
+# registry (UnicodeDecodeError is a ValueError).
+_CATALOG_READ_ERRORS = (workflow.WorkflowError, OSError, ValueError, RecursionError)
+# What _marker_rmw lets escape besides its own ValidationError.
+_MARKER_WRITE_ERRORS = (ValidationError, OSError, ValueError, RecursionError)
+
+# Operator lines (browser-visible: project terms, never a host path or a CLI
+# verb, never a reader's exception text).
+_INSTR_UNKNOWN_KEEP = ("RS's instructions for this project were not refreshed "
+                       "because {what} could not be read; a copy from an earlier "
+                       "start, if there is one, stays in place until a start can "
+                       "read it")
+_INSTR_UNKNOWN_NONE = ("RS's instructions for this project were not written "
+                       "because {what} could not be read; the agent runs without "
+                       "them until a start can read it")
+_INSTR_WRITE_FAILED = ("RS's instructions could not be written into the "
+                       "project's agent home; the next start writes them again")
+_INSTR_FLAG_FAILED = ("RS's instructions were written, but the project's "
+                      "settings could not record it; the next start checks the "
+                      "project's old instructions file again")
+_INSTR_NO_LEDGER = ("RS's instructions for this project were written without its "
+                    "base branch because the dev record could not be read; the "
+                    "next start that can read it fills the branch in")
+_INSTR_LABELS_UNKNOWN = ("RS could not read this project's container labels, so "
+                         "its instructions were not refreshed; the next start "
+                         "tries again")
+OLD_INSTRUCTIONS_PROJECT_ERROR = (
+    "`/workspace/CLAUDE.md` is the instructions file RS used to write here. RS's "
+    "instructions now live in the agent's home folder and are no longer written "
+    "while this file exists, so the agent still reads the old one. Remove or "
+    "rename `/workspace/CLAUDE.md` from this project's terminal or editor, then "
+    "stop the project and start it again.")
+OLD_INSTRUCTIONS_BOX_ERROR = (
+    "`/workspace/boxes/{box}/CLAUDE.md` is the instructions file RS used to write "
+    "for box '{box}'. RS's instructions now live in the box's home folder and are "
+    "no longer written while this file exists, so the box's agent still reads the "
+    "old one. Remove or rename `/workspace/boxes/{box}/CLAUDE.md` from this "
+    "project's terminal or editor, then stop the project and start it again.")
+OLD_INSTRUCTIONS_BOX_SIDE_WARNING = (
+    "box '{box}' of project '{project}' was re-run without its new instructions: "
+    "`/workspace/boxes/{box}/CLAUDE.md` is the instructions file RS used to write "
+    "there and is still there, so the box's agent reads the old one. Remove or "
+    "rename it from the project's terminal or editor; until then the project's "
+    "next start fails")
+OLD_INSTRUCTIONS_RESEARCH_ERROR = (
+    "`/workspace/CLAUDE.md` is a link to `.claude/CLAUDE.md`, where RS used to put "
+    "the research instructions. RS's instructions now live in the agent's home "
+    "folder and are not written while this link exists, so the agent still reads "
+    "the old copy. Remove the link `/workspace/CLAUDE.md` from this project's "
+    "terminal or editor. `/workspace/.claude/CLAUDE.md` is still loaded as the "
+    "project's own instructions: remove or rename it too, unless you keep it as "
+    "your own. Then stop the project and start it again.")
+OLD_INSTRUCTIONS_IMAGE_ERROR = (
+    "this project's image is from before RS's new instructions layout; rebuild "
+    "RS's images with Rebuild all on Sandboxes → Software, then stop the project "
+    "and start it again")
+OLD_INSTRUCTIONS_UNCHECKED_ERROR = (
+    "RS could not check this project for its old instructions link; stop the "
+    "project and start it again")
+OLD_INSTRUCTIONS_IMAGE_CREATE_ERROR = (
+    "RS's research image is from before its new instructions layout; rebuild "
+    "RS's images with Rebuild all on Sandboxes → Software, then create the "
+    "project again")
+OLD_INSTRUCTIONS_LABEL_CREATE_ERROR = (
+    "RS could not read the research image's labels, so it could not check its "
+    "instructions layout; create the project again")
+OLD_INSTRUCTIONS_LABEL_ERROR = (
+    "RS could not read this project's image labels, so it could not check its "
+    "instructions layout; stop the project and start it again")
+# The supervisor image label marking the home-folder instructions layout (its
+# boot script writes ~/.claude/rules/rs-instructions.md and never re-creates
+# the old /workspace/CLAUDE.md link). Set by agent/Dockerfile.supervisor.
+INSTRUCTIONS_LAYOUT_LABEL = "research.instructions-layout"
+INSTRUCTIONS_LAYOUT_HOME = "home"
+
+
+@dataclass(frozen=True)
+class OldInstructions:
+    """An operation met an old instructions file (or an old research image)
+    and wrote nothing new: raised ONCE at the end of the top-level verb."""
+    kind: str          # "project" | "box" | "research" | "image" | "labels" | "unchecked"
+    project: str
+    box: str = ""
+
+    def text(self) -> str:
+        if self.kind == "box":
+            return OLD_INSTRUCTIONS_BOX_ERROR.format(box=_shown_box(self.box))
+        return {"project": OLD_INSTRUCTIONS_PROJECT_ERROR,
+                "research": OLD_INSTRUCTIONS_RESEARCH_ERROR,
+                "image": OLD_INSTRUCTIONS_IMAGE_ERROR,
+                "labels": OLD_INSTRUCTIONS_LABEL_ERROR,
+                "unchecked": OLD_INSTRUCTIONS_UNCHECKED_ERROR}[self.kind]
+
+
+def _shown_box(name: Any) -> str:
+    """A box name for operator text: the record is project-writable, so a
+    name that is not a valid box name is shown as `…`."""
+    return name if isinstance(name, str) and _BOX_NAME_RE.match(name) else "…"
+
+
+def _raise_old_instructions(found: "Sequence[OldInstructions]", *,
+                            name_project: bool = False) -> None:
+    """Raise the collected old-instructions errors as ONE ValidationError (the
+    broker prints its text exactly); nothing when there are none. Each text
+    once; `name_project` prefixes the project (start --all)."""
+    lines: list[str] = []
+    for f in found:
+        if not isinstance(f, OldInstructions):
+            continue
+        t = f.text()
+        if name_project:
+            t = f"project {f.project!r}: {t}"
+        if t not in lines:
+            lines.append(t)
+    if lines:
+        raise ValidationError("\n".join(lines))
+
+
+@dataclass
+class _InstrPlan:
+    """What the writer does for one project container. `text` None = unknown
+    (an input could not be read; `what` names it in project terms)."""
+    text: "str | None" = None
+    what: str = ""
+    check_old: bool = False
+    keep_existing: bool = False
+    cleared: bool = False
+    backfill: dict = field(default_factory=dict)
+
+
+def _rs_notice() -> str:
+    return RS_INSTRUCTIONS_NOTICE_FILE.read_text(encoding="utf-8")
+
+
+def _compose_rs_text(body: str) -> str:
+    """The notice, then the container's text (the notice alone for none)."""
+    notice = _rs_notice().rstrip("\n") + "\n"
+    body = (body or "").strip()
+    return notice + ("\n" + body + "\n" if body else "")
+
+
+def _dev_text(branch: str) -> str:
+    """The dev template with the base branch filled in; with none recorded,
+    `<base>` in its place plus the sentence saying how to find it."""
+    text = (box_catalog.BUILTIN_DIR / "dev.instructions.md").read_text(encoding="utf-8")
+    if branch:
+        return text.replace(BASE_BRANCH_TOKEN, branch)
+    return NO_BRANCH_SENTENCE + "\n\n" + text.replace(BASE_BRANCH_TOKEN,
+                                                      NO_BRANCH_PLACEHOLDER)
+
+
+def _read_marker_three_way(workspace_path: "Path") -> "tuple[str, dict]":
+    """("absent"|"unreadable"|"ok", data). PR 0's file reader under it: a link,
+    invalid UTF-8 and any other OSError are unreadable; so are invalid or too
+    deeply nested JSON and a non-object."""
+    try:
+        text = _read_marker_text(workspace_path)
+    except FileNotFoundError:
+        return "absent", {}
+    except OSError:
+        return "unreadable", {}
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError):
+        return "unreadable", {}
+    if not isinstance(data, dict):
+        return "unreadable", {}
+    return "ok", data
+
+
+def _resolve_workflow_three_way(wf: str) -> "tuple[str, dict]":
+    """("found", manifest) | ("missing", {}) | ("unknown", {}). The full
+    catalog first; when it cannot be read, the built-ins decide only if the
+    custom-workflow registry reads cleanly and lacks the name (a built-in that
+    later took a custom workflow's name must never decide it)."""
+    try:
+        catalog = {m["name"]: m for m in workflow.load_catalog()}
+    except _CATALOG_READ_ERRORS:
+        pass
+    else:
+        return ("found", catalog[wf]) if wf in catalog else ("missing", {})
+    try:
+        registry = workflow.load_registry()
+    except _CATALOG_READ_ERRORS:
+        return "unknown", {}
+    if wf in registry:
+        return "unknown", {}
+    try:
+        builtins = workflow.load_builtins()
+    except _CATALOG_READ_ERRORS:
+        return "unknown", {}
+    if wf in builtins:
+        return "found", builtins[wf]
+    return "unknown", {}
+
+
+def _read_attachments_three_way() -> "tuple[bool, list]":
+    """(readable, rows) of the dev lane's attachment ledger: a missing file is
+    readable and empty; anything unreadable is (False, [])."""
+    path = gitea.ATTACHMENTS_PATH
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return True, []
+    except (OSError, ValueError):
+        return False, []
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError):
+        return False, []
+    return (True, data) if isinstance(data, list) else (False, [])
+
+
+def _ledger_branch(project: str, rows: list) -> str:
+    """The project agent's recorded base branch: its `agent` row with no box
+    (history rows excluded); "" when none is recorded."""
+    for e in rows:
+        if (isinstance(e, dict) and e.get("project") == project
+                and e.get("class") == "agent" and e.get("box") is None):
+            b = e.get("branch")
+            return b if isinstance(b, str) else ""
+    return ""
+
+
+def _plan_project_instructions(project: str, workspace_path: "Path", *,
+                               branch: "str | None" = None) -> _InstrPlan:
+    """Decide the text for a project container from its marker (never from a
+    tolerant reader that folds unreadable into a default). `branch` (create)
+    is the request's resolved base branch, used instead of the ledger."""
+    state, data = _read_marker_three_way(workspace_path)
+    what = f"the project's settings ({orch_files.SHOWN_FOLDER}/project.json)"
+    if state != "ok" or not isinstance(data.get("type"), str):
+        # A marker without `type` is one a step synthesized (the box-pin
+        # backfill writes a pins-only marker): read as unknown, never as
+        # "not dev".
+        return _InstrPlan(what=what)
+    plan = _InstrPlan(cleared=data.get(OLD_INSTRUCTIONS_FLAG) is True)
+    wf = data.get("workflow") if isinstance(data.get("workflow"), str) and data.get("workflow") else ""
+    docker = data.get("substrate") == Substrate.DOCKER.value
+    resolved: "tuple[str, dict] | None" = None
+
+    def resolve() -> "tuple[str, dict]":
+        nonlocal resolved
+        if resolved is None:
+            resolved = _resolve_workflow_three_way(wf)
+        return resolved
+
+    if docker:
+        body, covered = "", False
+        if wf:
+            st, m = resolve()
+            if st == "unknown":
+                return _InstrPlan(what="the custom-workflow list")
+            if st == "found":
+                instr = m.get("instructions") if m.get("source", "builtin") == "builtin" else None
+                if isinstance(instr, str) and instr.strip():
+                    body, covered = instr, True
+            else:
+                covered = True        # gone from a readable catalog (F-L1)
+        plan.text = _compose_rs_text(body)
+        plan.check_old = covered and not plan.cleared
+        return plan
+
+    dev = data.get("dev")
+    if not isinstance(dev, bool):
+        if not wf:
+            dev = False
+        else:
+            st, m = resolve()
+            if st == "unknown":
+                return _InstrPlan(what="the custom-workflow list")
+            dev = bool(m.get("dev")) if st == "found" else False
+        plan.backfill["dev"] = dev
+    if dev:
+        if branch is None:
+            ok, rows = _read_attachments_three_way()
+            if not ok:
+                # A file already there is kept; with none, the `<base>` text.
+                plan.keep_existing, plan.what = True, "the dev record"
+                rows = []
+            branch = _ledger_branch(project, rows)
+        plan.text = _compose_rs_text(_dev_text(branch))
+        plan.check_old = not plan.cleared
+        return plan
+    plan.text = _compose_rs_text("")
+    if not plan.cleared and wf:
+        st, _m = resolve()
+        if st == "unknown":
+            return _InstrPlan(what="the custom-workflow list")
+        plan.check_old = st == "missing"     # F-L1: RS cannot tell what it wrote
+    return plan
+
+
+def _exec_rs_instructions(container: str, home: str, text: str, *,
+                          check_old: bool, keep_existing: bool = False) -> str:
+    """Write `text` as `<home>/.claude/rules/rs-instructions.md` in a RUNNING
+    container, as uid 1000: "written", "old" (the old /workspace/CLAUDE.md is
+    there and nothing was written), "kept" (`keep_existing` and a file is
+    there) or "failed". Sends UTF-8 BYTES in binary
+    mode (the host's locale must not re-encode the text) and passes their
+    count. Never raises."""
+    data = text.encode("utf-8")
+    try:
+        r = subprocess.run(
+            ["docker", "exec", "-i", "-u", "1000", "-e", f"HOME={home}", container,
+             "sh", "-c", RS_INSTR_SCRIPT, "sh", str(len(data)),
+             "1" if check_old else "0", "1" if keep_existing else "0"],
+            input=data, capture_output=True, timeout=RS_INSTR_EXEC_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        return "failed"
+    out = (r.stdout or b"").decode("utf-8", "replace")
+    if RS_INSTR_OLD in out:
+        return "old"
+    if RS_INSTR_KEPT in out and r.returncode == 0:
+        return "kept"
+    if r.returncode == 0 and RS_INSTR_WRITTEN in out and RS_INSTR_FAILED not in out:
+        return "written"
+    return "failed"
+
+
+def _image_instructions_layout(image: str) -> "str | None":
+    """The image's INSTRUCTIONS_LAYOUT_LABEL value ("" when it has none);
+    None when the inspect fails — an unknown, never "no label"."""
+    try:
+        r = run(["docker", "image", "inspect", "-f", '{{json .Config.Labels}}', image],
+                capture_output=True, timeout=RS_INSTR_EXEC_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        labels = json.loads(r.stdout or "null")
+    except (ValueError, RecursionError):
+        return None
+    if labels is None:
+        return ""
+    if not isinstance(labels, dict):
+        return None
+    v = labels.get(INSTRUCTIONS_LAYOUT_LABEL)
+    return v if isinstance(v, str) else ""
+
+
+def _container_layout_labels(container: str) -> "tuple[str, str] | None":
+    """(substrate, project type) from ONE inspect of the container's labels;
+    None when the inspect fails (never a default: the existing readers fall
+    back to research/dind-sysbox, which would read as "skip" in silence)."""
+    try:
+        r = run(["docker", "container", "inspect", "-f",
+                 '{{json .Config.Labels}}', container],
+                capture_output=True, timeout=RS_INSTR_EXEC_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        labels = json.loads(r.stdout or "null")
+    except (ValueError, RecursionError):
+        return None
+    if labels is None:
+        labels = {}
+    if not isinstance(labels, dict):
+        return None
+    sub = labels.get(SUBSTRATE_LABEL)
+    typ = labels.get(PROJECT_TYPE_LABEL)
+    return (sub if isinstance(sub, str) else "", typ if isinstance(typ, str) else "")
+
+
+def _research_instructions_check(project: str, container: str) -> "list[OldInstructions]":
+    """After a research recreate: the boot script writes RS's instructions
+    itself, unless the container's image is from before that layout (its old
+    boot script puts RS's text back into the project's folders: rebuild first)
+    or RS's old link /workspace/CLAUDE.md -> .claude/CLAUDE.md still stands.
+    Read from the NEW container's labels (an image label rides into them),
+    never the image tag, which a concurrent rebuild can move. A failed read is
+    its own error, never "no label"."""
+    try:
+        r = run(["docker", "container", "inspect", "-f", '{{json .Config.Labels}}',
+                 container], capture_output=True, timeout=RS_INSTR_EXEC_TIMEOUT_S)
+        labels = json.loads(r.stdout or "null") if r.returncode == 0 else ...
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError, ValueError,
+            RecursionError):
+        labels = ...
+    if labels is ...:
+        return [OldInstructions("labels", project)]
+    labels = labels if isinstance(labels, dict) else {}
+    if labels.get(INSTRUCTIONS_LAYOUT_LABEL) != INSTRUCTIONS_LAYOUT_HOME:
+        return [OldInstructions("image", project)]
+    try:
+        r = run(["docker", "exec", "-u", "1000", container, "sh", "-c",
+                 'if [ -L /workspace/CLAUDE.md ]; then '
+                 'printf "LINK:%s\\n" "$(readlink /workspace/CLAUDE.md)"; '
+                 'else echo NOLINK; fi'],
+                capture_output=True, timeout=RS_INSTR_EXEC_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        return [OldInstructions("unchecked", project)]
+    out = (r.stdout or "").strip() if r.returncode == 0 else ""
+    # Only the script's own tokens decide: `docker exec` exits 1 for its own
+    # failures too, which must never read as "no link".
+    if out == "LINK:.claude/CLAUDE.md":
+        return [OldInstructions("research", project)]
+    if out == "NOLINK" or out.startswith("LINK:"):
+        return []
+    return [OldInstructions("unchecked", project)]
+
+
+def _write_project_instructions(project: str, container: str, workspace_path: "Path",
+                                *, progress=None, branch: "str | None" = None,
+                                home: str = _AGENT_HOME,
+                                has_file: bool = True) -> "list[OldInstructions]":
+    """Write RS's instructions into a RUNNING project container (every host
+    site: create, recreate, the plain Docker start and recreate, the
+    agents-only Update, the live working-mode change, the Config box's agents
+    Update). Research is skipped (its boot script writes them), decided from
+    the container's labels. Every failure is a warning; an old
+    /workspace/CLAUDE.md is RETURNED, never raised here — the operation's
+    later steps must still run, and the verb raises once at its end."""
+    labels = _container_layout_labels(container)
+    if labels is None:
+        _report_warnings([_INSTR_LABELS_UNKNOWN], progress)
+        return []
+    sub, typ = labels
+    if not sub and not typ:
+        return []                       # a pre-label research project
+    if sub != Substrate.DOCKER.value and typ in ("", PROJECT_TYPE_RESEARCH):
+        return []                       # research: its boot script writes it
+    try:
+        plan = _plan_project_instructions(project, workspace_path, branch=branch)
+    except (OSError, ValueError):
+        # RS's own text (the notice, the dev template) could not be read: a
+        # broken install, never a reason to fail the operation around it.
+        _report_warnings([_INSTR_WRITE_FAILED], progress)
+        return []
+    if plan.text is None:
+        tmpl = _INSTR_UNKNOWN_KEEP if has_file else _INSTR_UNKNOWN_NONE
+        _report_warnings([tmpl.format(what=plan.what)], progress)
+        return []
+    outcome = _exec_rs_instructions(container, home, plan.text, check_old=plan.check_old,
+                                    keep_existing=plan.keep_existing)
+    if outcome == "old":
+        return [OldInstructions("project", project)]
+    if outcome == "kept":
+        _report_warnings([_INSTR_UNKNOWN_KEEP.format(what=plan.what)], progress)
+        return []
+    if outcome != "written":
+        _report_warnings([_INSTR_WRITE_FAILED], progress)
+        return []
+    if plan.keep_existing:
+        _report_warnings([_INSTR_NO_LEDGER], progress)
+    if plan.backfill or not plan.cleared:
+        def mutate(d: dict) -> None:
+            for k, v in plan.backfill.items():
+                if k not in d:
+                    d[k] = v
+            d[OLD_INSTRUCTIONS_FLAG] = True
+        try:
+            _marker_rmw(workspace_path, mutate, "record RS's instructions")
+        except _MARKER_WRITE_ERRORS:
+            _report_warnings([_INSTR_FLAG_FAILED], progress)
+    return []
 
 
 def _agent_settings_block(data: dict) -> "dict | None":
@@ -14607,10 +15271,14 @@ def project_add_agents(project: str, agents: "Sequence[str]",
         progress.step("agents", f"deploying {'+'.join(marker_agents)} into the project")
         _report_warnings(_stage_agent_dist(container, marker_agents, docker=True,
                                            **_pi_pair_kwargs(workspace_path)), progress)
+        # RS's instructions into the agent's home (it survives this Update).
+        found = _write_project_instructions(project, container, workspace_path,
+                                            progress=progress, has_file=True)
         if not _install_agent_extensions(
                 ["docker", "exec", "-u", "1000", "-e", "HOME=/home/research", container],
                 "/home/research", True):
             progress.step("agents", "the project's editor extension could not be installed")
+        _raise_old_instructions(found)
         return UpdateResult(project=project, rebuilt=False, refreshed_claude=False)
     is_research = _container_project_type(container) != PROJECT_TYPE_SANDBOX_DIND
     # Membership is against the MARKER (research: claude by construction), not
@@ -14634,11 +15302,16 @@ def project_add_agents(project: str, agents: "Sequence[str]",
         # The working-mode suite (I33), before the box refresh below runs its
         # installer in each box. Never research (its boxes must find none).
         _report_warnings(_stage_harness(container, local, workspace_path), progress)
+    # RS's instructions into the agent's home (it survives this Update;
+    # research is skipped inside — its boot script writes them).
+    found = _write_project_instructions(project, container, workspace_path,
+                                        progress=progress, has_file=True)
     if deploy_local and not _install_agent_extensions(
             ["docker", "exec", "-u", "1000", "-e", "HOME=/home/research", container],
             "/home/research", True):
         progress.step("agents", "the project's editor extension could not be installed")
     refreshed, not_refreshed = _refresh_running_boxes(container, staged, progress, force_ext=True)
+    _raise_old_instructions(found)
     return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
                         boxes_refreshed=refreshed, boxes_not_refreshed=not_refreshed)
 
@@ -14993,17 +15666,30 @@ def _stage_box_catalog(workspace_path: "Path", *, strict: bool) -> list[dict]:
     immediately; a parent-dir mount, not a single-file mount). Q1→live: box_add
     refreshes it (strict=True → BoxCatalogError surfaces, the caller maps it to
     ValidationError); create/recreate stage it best-effort (strict=False → a
-    malformed box-registry.json falls back to built-ins + warns, never blocks the
-    lifecycle verb)."""
+    malformed or unreadable box-registry.json leaves the catalog staged before
+    as it is, warns and returns the built-ins; nothing blocks the lifecycle
+    verb)."""
+    # Best-effort (strict=False) means NO read or write failure escapes: the
+    # registry read can also fail as an OSError, a UnicodeDecodeError
+    # (ValueError) or a RecursionError, and the write as any OSError — each
+    # would otherwise end a start half-way through its recreate.
     try:
         catalog = box_catalog.load_catalog()
-    except box_catalog.BoxCatalogError:
+    except (box_catalog.BoxCatalogError, OSError, ValueError, RecursionError):
         if strict:
             raise
-        print("warning: box-registry.json is malformed; staging built-in box "
-              "presets only until it is fixed", file=sys.stderr)
-        catalog = [{**m, "source": "builtin"}
-                   for m in box_catalog.load_builtins().values()]
+        # The box types are an INPUT that could not be read: leave the catalog
+        # staged before (box add stages it strictly) exactly as it is. Staging
+        # the built-ins alone would read as complete in the box tool and tell
+        # every custom-type box its type is gone. Returned for callers that
+        # want the built-ins (none of the non-strict callers gates on it).
+        print("warning: box-registry.json is malformed or unreadable; the box "
+              "types staged before are kept until it is fixed", file=sys.stderr)
+        try:
+            return [{**m, "source": "builtin"}
+                    for m in box_catalog.load_builtins().values()]
+        except (box_catalog.BoxCatalogError, OSError, ValueError, RecursionError):
+            return []
     # Through the no-follow settings folder (orch_files): a folder that is a
     # link refuses a box add (strict) and only warns at create/recreate.
     try:
@@ -15014,6 +15700,12 @@ def _stage_box_catalog(workspace_path: "Path", *, strict: bool) -> list[dict]:
         if strict:
             raise ValidationError(str(e))
         print(f"warning: the box types were not staged: {e}", file=sys.stderr)
+    except OSError:
+        if strict:
+            raise
+        print("warning: the box types could not be written into the project's "
+              "settings folder; its boxes keep the ones staged before",
+              file=sys.stderr)
     return catalog
 
 
@@ -16238,15 +16930,6 @@ def _gate_project_web_image() -> None:
         raise ValidationError(_WEB_IMAGE_TOO_OLD_MSG)
 
 
-def _stage_project_instructions(container: str, text: str) -> None:
-    """The workflow's agent instructions as /workspace/CLAUDE.md, no-clobber,
-    written as the project user (the dev lane's form), so the agent owns the
-    file whatever the host's uid and an edited copy is never replaced."""
-    run(["docker", "exec", "-i", "-u", "research", container, "sh", "-c",
-         '[ -e /workspace/CLAUDE.md ] || cat > /workspace/CLAUDE.md'],
-        input=text, capture_output=True)
-
-
 def _register_project_web_tab(workspace_path: "Path", web: dict) -> None:
     """The top-level tab entry {port, label, web: true} for the project's own
     web app (port_add's plain-branch dedupe + sort). Written right after the
@@ -16848,6 +17531,55 @@ def _mailbox_name_clash(name: str, workspace_path: "Path") -> str:
     return ""
 
 
+BOX_LEFTOVER_INSTRUCTIONS_ERROR = (
+    "the folder kept from an earlier box named {box} holds `CLAUDE.md`, that box's "
+    "instructions file. Remove or rename `/workspace/boxes/{box}/CLAUDE.md` from the "
+    "project's terminal or editor, then add the box again.")
+
+
+def _box_leftover_instructions(workspace_path: "Path", name: str) -> "bool | None":
+    """Whether the box's kept folder holds a CLAUDE.md (a file or a link, a
+    dangling one included): True / False, or None when it cannot be told.
+    Every component below the workspace is opened without following a link
+    (the folders are the project's own), so nothing outside it is probed."""
+    try:
+        bfd = os.open(workspace_path / "boxes", os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    try:
+        try:
+            dfd = os.open(name, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=bfd)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return None
+        try:
+            os.stat("CLAUDE.md", dir_fd=dfd, follow_symlinks=False)
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return None
+        finally:
+            os.close(dfd)
+    finally:
+        os.close(bfd)
+
+
+def _refuse_box_leftover_instructions(workspace_path: "Path", name: str) -> None:
+    """ValidationError when the box's kept folder holds RS's old CLAUDE.md, or
+    when that cannot be told (never read as "absent")."""
+    found = _box_leftover_instructions(workspace_path, name)
+    if found is False:
+        return
+    if found:
+        raise ValidationError(BOX_LEFTOVER_INSTRUCTIONS_ERROR.format(box=name))
+    raise ValidationError(f"could not check the folder of box {name!r} in the "
+                          f"project; check that /workspace/boxes/{name} is a folder")
+
+
 def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignore[name-defined]
     """Create a sandbox box in a running sandbox-dind supervisor by driving its
     in-box `rs-sandbox create`. Validated fields only reach the list-form argv
@@ -16881,6 +17613,12 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         clash = _mailbox_name_clash(req.name, workspace_path)
         if clash:
             raise ValidationError(clash)
+        # A folder kept from an earlier box of this name that still holds RS's
+        # old instructions file belongs to that box: refuse before ANY side
+        # effect (the Gitea consumer, fork and attachment of a dev box, the
+        # env file, the history account). The box tool repeats the check as
+        # its own first gate (it also sees auto-named boxes).
+        _refuse_box_leftover_instructions(workspace_path, req.name)
     # Refresh the staged box-preset catalog (Q1→live: an operator-registered type in
     # box-registry.json becomes usable on this already-created project). strict=True
     # → a malformed registry surfaces as ValidationError, not a half-built box.
@@ -17627,10 +18365,18 @@ def box_folders(req: "BoxFoldersRequest", _progress=None) -> BoxFoldersResult:  
             f"{(r.stderr or r.stdout).strip()}")
     # Tolerant: the box has already been re-run when this is read.
     info = _parse_box_tool_json(r.stdout)
+    warnings = _box_folder_warnings(info.get("warnings"), req.name)
+    if _box_old_instructions(info.get("warnings")):
+        # The folders changed and the box runs; RS's old instructions file in
+        # its folder kept the new ones from being written: say so as the
+        # operation's failure.
+        # The other lines of this re-run ride in the error text: this inline
+        # verb's reply carries only the error, never its stderr.
+        raise ValidationError("\n".join([OldInstructions("box", req.project, req.name).text(), *warnings]))
     return BoxFoldersResult(
         project=req.project, name=req.name, folders=list(req.folders),
         changed=info.get("changed") is not False,
-        warnings=_box_folder_warnings(info.get("warnings"), req.name))
+        warnings=warnings)
 
 
 def box_settings(req: "BoxSettingsRequest", _progress=None) -> BoxSettingsResult:  # type: ignore[name-defined]
@@ -17736,6 +18482,10 @@ def box_settings(req: "BoxSettingsRequest", _progress=None) -> BoxSettingsResult
                             f"it is written at its next start")
         elif isinstance(w, dict):
             warnings += _box_folder_warnings([w], req.name)
+    if _box_old_instructions(info.get("warnings")):
+        # The other lines of this re-run ride in the error text: this inline
+        # verb's reply carries only the error, never its stderr.
+        raise ValidationError("\n".join([OldInstructions("box", req.project, req.name).text(), *warnings]))
     return BoxSettingsResult(project=req.project, name=req.name,
                              changed=info.get("changed") is not False,
                              restarted=info.get("restarted") is True,
@@ -18136,10 +18886,15 @@ def port_add(req: "PortAddRequest", _progress=None) -> PortAddResult:  # type: i
         ports.sort(key=lambda e: e["port"])
         _write_exported_ports(ws, ports)
         # The expose re-ran the box: report the folders it started without.
+        warnings = swept + _box_folder_warnings(info.get("warnings"), req.box)
+        if _box_old_instructions(info.get("warnings")):
+            # The port is registered and the box runs; the old instructions
+            # file is the operation's failure (after the registry write).
+            # The other lines of this re-run ride in the error text: this inline
+            # verb's reply carries only the error, never its stderr.
+            raise ValidationError("\n".join([OldInstructions("box", req.project, req.box).text(), *warnings]))
         return PortAddResult(project=req.project, port=pub, label=req.label,
-                             ports=ports,
-                             warnings=swept + _box_folder_warnings(
-                                 info.get("warnings"), req.box))
+                             ports=ports, warnings=warnings)
     if req.passthrough:
         span_lo, span_hi = req.host_port, req.host_port + req.count - 1
         # GLOBAL fail-closed collision gate over every project's registry.
@@ -18239,14 +18994,21 @@ def port_remove(req: "PortRemoveRequest", _progress=None) -> PortRemoveResult:  
             die(f"failed to unexpose box port: {(r.stderr or r.stdout).strip()}")
         # Tolerant: the box has already been re-run — a parse must never stop
         # the registry write below.
-        warnings = _box_folder_warnings(
-            _parse_box_tool_json(r.stdout).get("warnings"), gone["box"])
+        raw = _parse_box_tool_json(r.stdout).get("warnings")
+        warnings = _box_folder_warnings(raw, gone["box"])
+        old_box = gone["box"] if _box_old_instructions(raw) else ""
+    else:
+        old_box = ""
     warnings = swept + warnings
     ports = [e for e in existing if not _match(e)]
     _write_exported_ports(ws, ports)
     # Reap the top-level forwarder for a supervisor/docker entry (a box entry's
     # forwarder died with the box's rm+run in unexpose — the reconcile skips it).
     _reconcile_loopback_bridges(req.project, cfg)
+    if old_box:
+        # The other lines of this re-run ride in the error text: this inline
+        # verb's reply carries only the error, never its stderr.
+        raise ValidationError("\n".join([OldInstructions("box", req.project, old_box).text(), *warnings]))
     return PortRemoveResult(project=req.project, port=req.port, ports=ports,
                             warnings=warnings)
 
@@ -18956,7 +19718,7 @@ def dev_attach(req: "DevAttachRequest", _progress=None) -> DevAttachResult:  # t
     # Unconditional reconcile: change detection lives per-box in
     # _restart_dev_boxes (against actual ExtraHosts) — a record-history
     # comparison cannot work here, detach deletes the prior entry.
-    _restart_dev_boxes(req.project, cfg, ip)
+    _restart_dev_boxes(req.project, cfg, ip, _progress)
     return DevAttachResult(project=req.project, repo=req.repo, gitea_ip=ip)
 
 
@@ -20252,12 +21014,13 @@ def _restore_previous_gitea(rec: dict, host_port: str, progress) -> bool:
     return healthy
 
 
-def _wire_after_gitea_moved() -> None:
+def _wire_after_gitea_moved(progress=None) -> None:
     """Reconnect every project to a gitea that was just recreated or renamed
     (its address on each project network may have changed). Best-effort: the
-    data question is already settled by the time this runs."""
+    data question is already settled by the time this runs. `progress` carries
+    a box's old-instructions warning to the browser."""
     try:
-        wire_gitea_to_projects()
+        wire_gitea_to_projects(progress)
     except SystemExit:
         print("warning: reconnecting the projects to Gitea did not finish; "
               "a host start reconnects them", file=sys.stderr)
@@ -20399,7 +21162,7 @@ def dev_gitea_upgrade(req: "DevGiteaUpgradeRequest", progress=None) -> DevGiteaU
             print(f"upgrade failed after gitea was stopped: {e!r}", file=sys.stderr)
             rollback_outcome = _restore_previous_gitea(rec, host_port, progress)
     progress.step("wire", "reconnecting the projects to Gitea")
-    _wire_after_gitea_moved()
+    _wire_after_gitea_moved(progress)
     if rollback_outcome is True:
         raise HarnessError(f"Gitea {to_version} did not start; {from_version} is "
                            f"back on its untouched data")
@@ -20436,7 +21199,7 @@ def _recover_interrupted_upgrade(rec: dict, progress) -> None:
                 _remove_pre_upgrade_backup(rec)
     except _GiteaLockBusy:
         die(GITEA_BUSY_MSG)
-    _wire_after_gitea_moved()
+    _wire_after_gitea_moved(progress)
     if not ok:
         die(f"Gitea {rec['from_version']} could not be put back"
             + ("" if container_running(gitea.GITEA_CONTAINER) else "; it is down"))
@@ -20621,7 +21384,7 @@ def dev_gitea_rollback(_req: "DevGiteaRollbackRequest",
             outcome = "changed"
         running = container_running(gitea.GITEA_CONTAINER)
     progress.step("wire", "reconnecting the projects to Gitea")
-    _wire_after_gitea_moved()
+    _wire_after_gitea_moved(progress)
     if outcome == "untouched":
         if running:
             raise HarnessError(f"Gitea {frm} could not be put back; nothing was "
