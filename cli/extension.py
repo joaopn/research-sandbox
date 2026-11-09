@@ -18,7 +18,11 @@ Stdlib only. Imported by research.py + rscore.py (box lifecycle) and by
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import orch_files  # noqa: E402  (no-follow access to <workspace>/.orchestrator)
 
 # GENERIC registry-delivered box images (STAGE_FEATURE_STAGING lane-3). Generic,
 # non-role images: the two blank-box images the in-supervisor rs-sandbox runs.
@@ -96,12 +100,13 @@ def extensions_path(workspace: Path) -> Path:
 
 
 def load(workspace: Path) -> dict[str, dict]:
-    p = extensions_path(workspace)
-    if not p.is_file():
-        return {}
+    """The project's box records; {} when the file is absent, unparseable, or
+    not usable (a link at the file or at the settings folder, or not a
+    regular file — the folder is container-writable, so nothing is read
+    through a link)."""
     try:
-        data = json.loads(p.read_text())
-    except json.JSONDecodeError:
+        data = json.loads(orch_files.read_text(workspace, "extensions.json"))
+    except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -110,9 +115,14 @@ def save(workspace: Path, data: dict[str, dict]) -> None:
     """Atomic-rename write. Parent dir is bind-mounted into the supervisor,
     so the rename is visible to in-supervisor consumers immediately
     (parent-dir mount, not file — the single-file-bind-mount rule doesn't
-    apply)."""
-    p = extensions_path(workspace)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    tmp.replace(p)
+    apply). The settings folder is opened without following a link and the
+    temp file is freshly named (orch_files); a settings folder that is a link
+    or not a folder refuses the change the way a die() does (an error line,
+    exit 1)."""
+    try:
+        orch_files.write_text(workspace, "extensions.json",
+                              json.dumps(data, indent=2, sort_keys=True) + "\n",
+                              create=True)
+    except orch_files.Unusable as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)

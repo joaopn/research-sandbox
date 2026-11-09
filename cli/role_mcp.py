@@ -20,8 +20,12 @@ table, but their lifecycle and ownership are distinct.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import orch_files  # noqa: E402  (no-follow access to <workspace>/.orchestrator)
 
 # ---------------------------------------------------------------------------
 # Registry — names, images, pinned inner-bridge IPs
@@ -102,12 +106,13 @@ def role_mcps_path(workspace: Path) -> Path:
 
 
 def load_role_mcps(workspace: Path) -> dict[str, dict]:
-    p = role_mcps_path(workspace)
-    if not p.is_file():
-        return {}
+    """The project's worker registry; {} when it is absent, unparseable, or
+    not usable (a link at the file or at the settings folder, or not a
+    regular file — the folder is container-writable, so nothing is read
+    through a link)."""
     try:
-        data = json.loads(p.read_text())
-    except json.JSONDecodeError:
+        data = json.loads(orch_files.read_text(workspace, "role-mcps.json"))
+    except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -116,12 +121,17 @@ def save_role_mcps(workspace: Path, data: dict[str, dict]) -> None:
     """Atomic-rename write. Parent dir is bind-mounted into the supervisor,
     so the rename is visible to in-supervisor consumers immediately (the
     single-file-bind-mount rule does not apply here — we bind-mount the
-    *parent dir*, not the file)."""
-    p = role_mcps_path(workspace)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    tmp.replace(p)
+    *parent dir*, not the file). The settings folder is opened without
+    following a link and the temp file is freshly named (orch_files); a
+    settings folder that is a link or not a folder refuses the change the way
+    a die() does (an error line, exit 1), so every caller handles it."""
+    try:
+        orch_files.write_text(workspace, "role-mcps.json",
+                              json.dumps(data, indent=2, sort_keys=True) + "\n",
+                              create=True)
+    except orch_files.Unusable as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------

@@ -2769,8 +2769,9 @@ def _load_port_registry(f):
     directory, a symlink), larger than EXPORTED_PORTS_MAX_BYTES, not UTF-8,
     not JSON, or not a list. The file is writable from inside the project's
     container, so the open never blocks, never follows a link, and reads at
-    most one byte past the cap. MIRRORED byte-for-byte in webui/server.py
-    and cli/rscore.py — keep the two identical."""
+    most one byte past the cap. MIRRORED in cli/rscore.py — keep the two
+    identical except the `dir_fd` rscore's copy takes (the host opens the
+    settings folder without following a link; this copy does not yet: B213)."""
     try:
         fd = os.open(f, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
     except FileNotFoundError:

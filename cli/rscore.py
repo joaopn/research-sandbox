@@ -84,6 +84,7 @@ import role_mcp  # noqa: E402
 import extension  # noqa: E402
 import workflow  # noqa: E402  (manifest store catalog; from_kwargs resolves --workflow)
 import gitea  # noqa: E402  (STAGE_DEV_GITEA: shared rs-gitea client + dev-lane host state)
+import orch_files  # noqa: E402  (no-follow access to <workspace>/.orchestrator; host-only)
 from broker_auth import MIN_PASSWORD_LENGTH  # noqa: E402  (single password-length floor: broker passwd + gitea passwd + the app.js mirror)
 
 
@@ -4334,6 +4335,16 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     if container_exists(container_name):
         die(f"project {project!r} already exists (container {container_name}). "
             f"Use destroy first.")
+    # A same-named create reuses a leftover workspace, whose settings folder a
+    # previous project's agent controlled: refuse a link there before any side
+    # effect (every write below opens the folder without following a link).
+    # The remedy differs from every other refusal: there is no project to go
+    # inside, only the leftover an earlier one of that name left behind.
+    # A workspace the earlier agent made unopenable is NOT refused here: create
+    # resets the workspace's mode below (before anything reads it), as it always
+    # did, while a destroy could not get into it to clear it. The check runs
+    # again right after that reset, so a link inside it still gets this text.
+    _refuse_leftover_settings(project, workspace_path, unopenable_ok=True)
 
     project_type = (PROJECT_TYPE_SANDBOX_DIND
                     if req.type is ProjectType.SANDBOX_DIND
@@ -4458,6 +4469,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     # 1. Workspace dir (host bind-mount) + optional privileged-DIND volume.
     workspace_path.mkdir(parents=True, exist_ok=True)
     os.chmod(workspace_path, 0o2770)
+    _refuse_leftover_settings(project, workspace_path, unopenable_ok=False)
     (workspace_path / "shared").mkdir(parents=True, exist_ok=True)
     # The mounted folders' mountpoints, made by the operator now so docker does
     # not create them (and mnt/) root-owned inside the workspace bind.
@@ -4474,8 +4486,11 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     #     supervisor recreate via the bind-mount; "type" is read by the webui off
     #     /projects:ro). "workflow" is provenance — what the user selected; the
     #     derived "type"/"substrate" are what the machinery branches on.
-    orch_dir = workspace_path / ".orchestrator"
-    orch_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with orch_files.open_folder(workspace_path, create=True):
+            pass
+    except orch_files.Unusable as e:
+        die(str(e))
     # The resolved agent set, with FOUR readers: the marker below, the docker-box
     # label+mount branch (gated `is_docker` — never fires for dind), the
     # CreateResult (surfaces in the create report), and — via the marker — the
@@ -4538,12 +4553,16 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     if model_in_settings:
         marker["agent_settings"] = {"v": 1, "pending": [] if is_docker else ["claude"],
                                     "migrated": True}
-    (orch_dir / "project.json").write_text(json.dumps(marker, indent=2) + "\n")
     # Starting message (STAGE_SPAWN_GREETING) for the workflow's main shell, read
     # by the Management/Supervisor tab on first byobu new-session. Manifest-
     # derived; skip on empty so research/docker (no greeting) stage no stray file.
-    if req.greeting:
-        (orch_dir / "greeting").write_text(req.greeting)
+    try:
+        orch_files.write_text(workspace_path, "project.json",
+                              json.dumps(marker, indent=2) + "\n")
+        if req.greeting:
+            orch_files.write_text(workspace_path, "greeting", req.greeting)
+    except orch_files.Unusable as e:
+        die(str(e))
 
     # 2. Per-project network + router wiring.
     progress.step("network", "creating project network")
@@ -5515,6 +5534,13 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     if "node" in touched:
         die("node is fixed at create — a project can install node itself if it "
             "needs it later")
+    # A worker enable (or an upstream change) records itself in the project's
+    # settings folder only AFTER the full recreate: refuse a folder the project
+    # replaced with a link now, not minutes later.
+    # A disable reads the same record: without this it would refuse as "not
+    # enabled", the wrong reason, while the worker keeps running.
+    if enable_workers or disable_workers or req.role_mcp_upstream:
+        _require_settings_folder(workspace_path)
     # Agent model/effort changes (STAGE_MODEL_SELECT). Merge them into the marker
     # FIRST — every downstream path (the live toggles, the full recreate, the
     # role-mcp restart) reads the marker, so writing it once here means each of
@@ -6439,15 +6465,80 @@ def _port_is_free(port: int) -> bool:
         return False
 
 
+def _read_marker_text(workspace_path: "Path") -> str:
+    """The project marker's text, read through the no-follow settings folder
+    (orch_files): FileNotFoundError when absent, orch_files.Unusable (an
+    OSError) when the marker or the folder is a link or not a regular file."""
+    return orch_files.read_text(workspace_path, "project.json")
+
+
+def _write_marker_text(workspace_path: "Path", data: dict) -> None:
+    """Replace the project marker with `data` (temp file + rename inside the
+    no-follow settings folder, a fresh temp name every time). Raises
+    orch_files.Unusable when the folder is a link or not a folder."""
+    orch_files.write_text(workspace_path, "project.json",
+                          json.dumps(data, indent=2) + "\n")
+
+
+def _write_marker(workspace_path: "Path", data: dict, what: str) -> None:
+    """_write_marker_text for a writer that refuses with ValidationError."""
+    try:
+        _write_marker_text(workspace_path, data)
+    except orch_files.Unusable as e:
+        raise ValidationError(f"cannot {what}: {e}")
+
+
+def _refuse_leftover_settings(project: str, workspace_path: "Path", *,
+                              unopenable_ok: bool) -> None:
+    """create's refusal of a leftover workspace whose settings folder an
+    earlier project of the same name left unusable. Its remedy differs from
+    every other refusal: there is no project to go inside, only the leftover
+    to destroy. `unopenable_ok` passes a workspace that cannot be opened at
+    all (create resets its mode next, as it always did)."""
+    try:
+        orch_files.check_folder(workspace_path)
+    except orch_files.WorkspaceUnopenable:
+        if unopenable_ok:
+            return
+        raise ValidationError(
+            f"cannot create project {project!r}: an earlier project of that name "
+            f"left its folder unreadable; destroy that project first")
+    except orch_files.Unusable:
+        raise ValidationError(
+            f"cannot create project {project!r}: an earlier project of that name "
+            f"left its settings folder unusable (a link, not a folder, or not "
+            f"readable); destroy that project first")
+
+
+def _settings_folder_refusal(workspace_path: "Path") -> str:
+    """The refusal text when the project's settings folder is a link or not a
+    folder, else "" (a folder, or nothing there yet)."""
+    try:
+        orch_files.check_folder(workspace_path)
+    except orch_files.Unusable as e:
+        return str(e)
+    except OSError:
+        return ""
+    return ""
+
+
+def _require_settings_folder(workspace_path: "Path") -> None:
+    """die() with the refusal when the settings folder is a link or not a
+    folder — the pre-flight of an operation that records its result there."""
+    refusal = _settings_folder_refusal(workspace_path)
+    if refusal:
+        die(refusal)
+
+
 def _read_marker_ssh_port(workspace_path: "Path") -> int | None:
     """The SSH port recorded in .orchestrator/project.json at create — the
     project's OWN record of its port, authoritative for start/recreate.
     Tolerant read (the _read_marker_agents shape): missing/unreadable marker
     or key, or a non-int, reads as None (a pre-change project; its container
-    binding is then the only record — see _recreate_supervisor)."""
-    f = workspace_path / ".orchestrator" / "project.json"
+    binding is then the only record — see _recreate_supervisor). A link at
+    the marker or at the settings folder reads as unreadable (orch_files)."""
     try:
-        data = json.loads(f.read_text())
+        data = json.loads(_read_marker_text(workspace_path))
     except (OSError, json.JSONDecodeError):
         return None
     port = data.get("ssh_port") if isinstance(data, dict) else None
@@ -8462,10 +8553,10 @@ def _dind_agent_sets(marker: object) -> tuple[list[str], list[str]]:
 
 def _read_marker_dict(workspace_path: "Path") -> dict:
     """The whole .orchestrator/project.json, tolerant: {} when it is missing,
-    unreadable or not a JSON object (the _read_marker_agents posture)."""
-    f = workspace_path / ".orchestrator" / "project.json"
+    unreadable (a link included — orch_files) or not a JSON object (the
+    _read_marker_agents posture)."""
     try:
-        data = json.loads(f.read_text())
+        data = json.loads(_read_marker_text(workspace_path))
     except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
@@ -11527,6 +11618,8 @@ def _live_toggle_editor(project: str, cfg: "Config", container: str,  # type: ig
     inner-image re-staging, no role-MCP/box relaunch)."""
     if enable and not editor_dist_present():
         die("no editor dist cached — pull it under Sandboxes → Software first")
+    # The choice is recorded in the settings folder: refuse a link there first.
+    _require_settings_folder(workspace_path)
     # update's sweep, after this path's last refusal (a refused update leaves
     # the port list as it was).
     _drop_reserved_port_entries(project, cfg, progress)
@@ -11559,6 +11652,8 @@ def _live_toggle_reader(project: str, cfg: "Config", container: str,  # type: ig
     recreate/start honors it (the docker label is immutable on a running container)."""
     if enable and not reader_dist_present():
         die("no reader dist cached — pull it under Sandboxes → Software first")
+    # The choice is recorded in the settings folder: refuse a link there first.
+    _require_settings_folder(workspace_path)
     # update's sweep, after this path's last refusal (a refused update leaves
     # the port list as it was).
     _drop_reserved_port_entries(project, cfg, progress)
@@ -11626,11 +11721,9 @@ def projects_using_mcp(mcp_name: str) -> list[str]:
     for p in sorted(root.iterdir()):
         if not p.is_dir():
             continue
-        allow_file = project_allowlist_path(p.name, cfg)
-        if not allow_file.is_file():
-            continue
         try:
-            data = json.loads(allow_file.read_text())
+            data = json.loads(orch_files.read_text(
+                workspace_path_for(p.name, cfg), "mcp-allow.json"))
         except (json.JSONDecodeError, OSError):
             continue
         if not isinstance(data, list):
@@ -11659,10 +11752,22 @@ def ensure_mcp_files(project: str, cfg: "Config") -> None:
     if not mcp_registry.REGISTRY_PATH.is_file():
         mcp_registry.REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
         mcp_registry.save_atomic(mcp_registry.empty())
-    allow = project_allowlist_path(project, cfg)
-    if not allow.is_file():
-        allow.parent.mkdir(parents=True, exist_ok=True)
-        allow.write_text("[]\n")
+    ws = workspace_path_for(project, cfg)
+    try:
+        orch_files.check_folder(ws)
+    except orch_files.Unusable as e:
+        die(str(e))
+    try:
+        orch_files.read_bytes(ws, "mcp-allow.json")
+    except FileNotFoundError:
+        try:
+            orch_files.write_text(ws, "mcp-allow.json", "[]\n", create=True)
+        except orch_files.Unusable as e:
+            die(str(e))
+    except OSError:
+        # There but not usable (a link, a non-file): never written through;
+        # the allowlist reads as empty and its next save replaces it.
+        pass
 
 
 def resolve_host_gateway() -> str:
@@ -11702,24 +11807,36 @@ def mcp_container_ip(name: str) -> str:
 
 
 def load_project_allowlist(project: str, cfg: "Config") -> list[dict]:
+    """The project's MCP allowlist; [] when it is absent or not usable (a link
+    at the file or at the settings folder, a non-regular file, bytes that are
+    not UTF-8 — orch_files: never read through a link). Valid UTF-8 that is
+    not a JSON array still refuses. The two corrupt cases differ on purpose:
+    "not usable" reads as empty so a planted link cannot block a destroy,
+    which reads this list; the project could empty its own list anyway."""
     p = project_allowlist_path(project, cfg)
-    if not p.is_file():
+    try:
+        text = orch_files.read_text(workspace_path_for(project, cfg), "mcp-allow.json")
+    except OSError:
         return []
     try:
-        data = json.loads(p.read_text())
+        data = json.loads(text)
     except json.JSONDecodeError as e:
-        die(f"allowlist {p} is invalid JSON: {e}")
+        die(f"allowlist {orch_files.SHOWN_FOLDER}/mcp-allow.json is invalid JSON: {e}")
     if not isinstance(data, list):
-        die(f"allowlist {p} must be a JSON array")
+        die(f"allowlist {orch_files.SHOWN_FOLDER}/mcp-allow.json must be a JSON array")
     return [e for e in data if isinstance(e, dict)]
 
 
 def save_project_allowlist(project: str, cfg: "Config", entries: list[dict]) -> None:
-    p = project_allowlist_path(project, cfg)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(entries, indent=2, sort_keys=True) + "\n")
-    tmp.replace(p)
+    """Replace the allowlist atomically through the no-follow settings folder
+    (a fresh temp name — orch_files); a settings folder that is a link or not
+    a folder refuses (die)."""
+    try:
+        orch_files.write_text(workspace_path_for(project, cfg), "mcp-allow.json",
+                              json.dumps(entries, indent=2, sort_keys=True) + "\n",
+                              create=True)
+    except orch_files.Unusable as e:
+        die(str(e))
 
 
 def _parse_kv(items: list[str], flag: str) -> dict[str, str]:
@@ -12622,7 +12739,6 @@ def _stage_dev_gitea(project: str, cfg: "Config", gitea_ip: str = "",
             if "<no value>" in ip:
                 ip = ""
     if ip:
-        payload_path = ws / ".orchestrator" / "dev-gitea.json"
         rows = []
         for repo in sorted({e["repo"] for e in entries}):
             repo_entries = [e for e in entries if e["repo"] == repo]
@@ -12657,11 +12773,17 @@ def _stage_dev_gitea(project: str, cfg: "Config", gitea_ip: str = "",
                          "branch": proj_branch,
                          "token_file": f"{proj_user}.token" if proj_user else ""})
         payload = {"gitea_ip": ip, "repos": rows}
-        payload_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = payload_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-        tmp.replace(payload_path)
-        _rerun_inner_guard(project)
+        try:
+            orch_files.write_text(ws, "dev-gitea.json",
+                                  json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                                  create=True)
+        except orch_files.Unusable as e:
+            # Every caller is mid-operation; the wiring file is not written
+            # through a link, and the rest of the staging goes on.
+            print(f"warning: the dev wiring of project {project!r} was not "
+                  f"written: {e}", file=sys.stderr)
+        else:
+            _rerun_inner_guard(project)
     container = container_name_for(project)
     if not (entries or hist_entries) or not container_running(container):
         return
@@ -13491,10 +13613,9 @@ def _project_has_fetch_consumers(workspace_path: "Path") -> bool:
     extensions.json. Drives the conditional re-stage of the supervisor-side
     fetch halves at start/recreate/wire (the universal staging is retired).
     Tolerant reads — missing/corrupt ⇒ False: an unflagged project must never
-    grow the surface from a bad file."""
-    f = workspace_path / ".orchestrator" / "project.json"
+    grow the surface from a bad file (or one read through a link)."""
     try:
-        if json.loads(f.read_text()).get("fetch") is True:
+        if json.loads(_read_marker_text(workspace_path)).get("fetch") is True:
             return True
     except (OSError, json.JSONDecodeError, AttributeError):
         pass
@@ -13528,10 +13649,9 @@ def _read_marker_agents(workspace_path: "Path") -> list[str]:
     sandbox-dind recreate's deploy_local). Tolerant read, the _read_box_pins shape:
     a missing/unreadable marker or key reads as [] — the recreate then comes back
     UNWIRED (accepted B31-family caveat; greenfield posture — pre-change non-docker
-    markers already carry [])."""
-    f = workspace_path / ".orchestrator" / "project.json"
+    markers already carry []). A link reads as unreadable (orch_files)."""
     try:
-        data = json.loads(f.read_text())
+        data = json.loads(_read_marker_text(workspace_path))
     except (OSError, json.JSONDecodeError):
         return []
     agents = data.get("agents")
@@ -13543,17 +13663,22 @@ def _write_marker_agents(workspace_path: "Path", agents: list[str]) -> None:
     and REFUSING on an unreadable marker rather than clobbering it, like every
     read-modify-write writer of the marker: `type`, `substrate`, `workflow`,
     `models`, `box_image_pins`, `ssh_port` would all vanish, and the recreate +
-    the webui flavor gate read every one of them."""
+    the webui flavor gate read every one of them. A link at the marker or at
+    the settings folder is unreadable (orch_files), never followed."""
     f = workspace_path / ".orchestrator" / "project.json"
     try:
-        data = json.loads(f.read_text())
+        data = json.loads(_read_marker_text(workspace_path))
+    except orch_files.Unusable as e:
+        # Its own text names the folder as the project sees it; the host path
+        # never reaches the browser.
+        raise ValidationError(f"cannot update the agent set: {e}")
     except (OSError, json.JSONDecodeError) as e:
         raise ValidationError(
-            f"cannot update the agent set: the project marker {f} is unreadable "
+            f"cannot update the agent set: the project marker {orch_files.SHOWN_FOLDER}/project.json is unreadable "
             f"({e}); repair it before changing agents")
     if not isinstance(data, dict):
         raise ValidationError(
-            f"cannot update the agent set: the project marker {f} is not a JSON object")
+            f"cannot update the agent set: the project marker {orch_files.SHOWN_FOLDER}/project.json is not a JSON object")
     new = list(dict.fromkeys(agents))
     # A project recorded with an EMPTY set has no claude in its own container to
     # preserve, so its first agent add makes it exact (_dind_agent_sets): adding
@@ -13563,7 +13688,7 @@ def _write_marker_agents(workspace_path: "Path", agents: list[str]) -> None:
     if isinstance(current, list) and not current and new:
         data["agents_exact"] = True
     data["agents"] = new
-    f.write_text(json.dumps(data, indent=2) + "\n")
+    _write_marker(workspace_path, data, "update the agent set")
 
 
 def _validate_agents_update(req: "UpdateRequest", container: str,
@@ -13579,9 +13704,13 @@ def _validate_agents_update(req: "UpdateRequest", container: str,
             "the agent set can only change on a sandbox-dind (dev / sandbox) project; "
             "a research-workflow project runs claude")
     f = workspace_path / ".orchestrator" / "project.json"
-    if not f.is_file():
+    try:
+        _read_marker_text(workspace_path)
+    except FileNotFoundError:
         raise ValidationError(
-            f"cannot update the agent set: the project marker {f} is missing")
+            f"cannot update the agent set: the project marker {orch_files.SHOWN_FOLDER}/project.json is missing")
+    except OSError as e:
+        raise ValidationError(f"cannot update the agent set: {e}")
     # Additions are judged against what runs in the project's own container
     # (an older record runs Claude without listing it), like removals in
     # _agent_settings_plan, which update() runs before any write.
@@ -13810,19 +13939,20 @@ def _read_agent_settings(container: str, agent: str,
 def _marker_rmw(workspace_path: "Path", mutate, what: str) -> None:
     """Read-modify-write the project marker: `mutate(data)` edits the dict in
     place. Refuses an unreadable or non-object marker (never clobbers it), temp
-    file + rename. `what` names the change in the refusal."""
+    file + rename. `what` names the change in the refusal. A link at the
+    marker or at the settings folder is refused, never followed (orch_files)."""
     f = workspace_path / ".orchestrator" / "project.json"
     try:
-        data = json.loads(f.read_text())
+        data = json.loads(_read_marker_text(workspace_path))
+    except orch_files.Unusable as e:
+        raise ValidationError(f"cannot {what}: {e}")
     except (OSError, json.JSONDecodeError) as e:
-        raise ValidationError(f"cannot {what}: the project marker {f} is unreadable ({e}); "
+        raise ValidationError(f"cannot {what}: the project marker {orch_files.SHOWN_FOLDER}/project.json is unreadable ({e}); "
                               f"repair it first")
     if not isinstance(data, dict):
-        raise ValidationError(f"cannot {what}: the project marker {f} is not a JSON object")
+        raise ValidationError(f"cannot {what}: the project marker {orch_files.SHOWN_FOLDER}/project.json is not a JSON object")
     mutate(data)
-    tmp = f.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n")
-    tmp.replace(f)
+    _write_marker(workspace_path, data, what)
 
 
 def _agent_settings_block(data: dict) -> "dict | None":
@@ -14057,8 +14187,15 @@ def _agent_settings_plan(req: "UpdateRequest", container: str, workspace_path: "
         return plan
     data = _read_marker_dict(workspace_path)
     if not data:
+        why = ""
+        try:
+            _read_marker_text(workspace_path)
+        except orch_files.Unusable as e:
+            why = f" ({e})"         # a link: name the settings folder
+        except (OSError, ValueError):
+            pass
         raise ValidationError("cannot change the agents: the project's record is missing "
-                              "or unreadable")
+                              f"or unreadable{why}")
     is_research = (not docker) and data.get("type") != PROJECT_TYPE_SANDBOX_DIND
     current = list(_read_marker_agents(workspace_path))
     new_agents = list(req.agents) if req.agents is not None else current
@@ -14426,10 +14563,10 @@ def _project_agent_boxes(container: str, running: bool, research: bool,
 def _read_marker_substrate(workspace_path: "Path") -> str:
     """The substrate stamped into .orchestrator/project.json at create. Tolerant
     (the _read_marker_agents shape): a missing/unreadable marker or key reads as
-    dind-sysbox, the substrate every pre-docker marker meant."""
-    f = workspace_path / ".orchestrator" / "project.json"
+    dind-sysbox, the substrate every pre-docker marker meant (a link reads as
+    unreadable — orch_files)."""
     try:
-        data = json.loads(f.read_text())
+        data = json.loads(_read_marker_text(workspace_path))
     except (OSError, json.JSONDecodeError):
         return Substrate.DIND_SYSBOX.value
     sub = data.get("substrate") if isinstance(data, dict) else None
@@ -14508,10 +14645,10 @@ def project_add_agents(project: str, agents: "Sequence[str]",
 
 def _read_box_pins(workspace_path: "Path") -> dict[str, str]:
     """The frozen box-image pins from .orchestrator/project.json, or {} for a
-    pre-migration project (greenfield → recreate backfills)."""
-    f = workspace_path / ".orchestrator" / "project.json"
+    pre-migration project (greenfield → recreate backfills); {} too when the
+    marker is unreadable (a link included — orch_files)."""
     try:
-        data = json.loads(f.read_text())
+        data = json.loads(_read_marker_text(workspace_path))
     except (OSError, json.JSONDecodeError):
         return {}
     pins = data.get("box_image_pins")
@@ -14526,35 +14663,37 @@ def _write_box_pins(workspace_path: "Path", box_pins: dict[str, str]) -> None:
     `workflow`, `agents`, `models`, `ssh_port` would all vanish. A warning, not a
     raise, because this runs mid-recreate after the new container is started (the
     _write_box_digests posture); the next recreate after a repair backfills again.
-    Temp + rename, so a concurrent reader never sees a torn file."""
+    Temp + rename, so a concurrent reader never sees a torn file. A link at
+    the marker or at the settings folder is unreadable (orch_files)."""
     f = workspace_path / ".orchestrator" / "project.json"
     try:
-        data = json.loads(f.read_text())
+        data = json.loads(_read_marker_text(workspace_path))
     except FileNotFoundError:
         data = {}
     except (OSError, json.JSONDecodeError) as e:
-        print(f"warning: box-image pins not recorded: the project marker {f} "
+        print(f"warning: box-image pins not recorded: the project marker {orch_files.SHOWN_FOLDER}/project.json "
               f"is unreadable ({e}); repair it and restart the project",
               file=sys.stderr)
         return
     if not isinstance(data, dict):
-        print(f"warning: box-image pins not recorded: the project marker {f} "
+        print(f"warning: box-image pins not recorded: the project marker {orch_files.SHOWN_FOLDER}/project.json "
               f"is not a JSON object; repair it and restart the project",
               file=sys.stderr)
         return
     data["box_image_pins"] = box_pins
-    tmp = f.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n")
-    tmp.replace(f)
+    try:
+        _write_marker_text(workspace_path, data)
+    except orch_files.Unusable as e:
+        print(f"warning: box-image pins not recorded: {e}", file=sys.stderr)
 
 
 def _read_box_digests(workspace_path: "Path") -> dict[str, str]:
     """The recorded box-image digests (`{repo: "sha256:…"}`) from
     .orchestrator/project.json, or {} for a project from before they were
-    recorded (its next delivery pulls by tag once and records what it got)."""
-    f = workspace_path / ".orchestrator" / "project.json"
+    recorded (its next delivery pulls by tag once and records what it got),
+    or when the marker is unreadable (a link included — orch_files)."""
     try:
-        data = json.loads(f.read_text())
+        data = json.loads(_read_marker_text(workspace_path))
     except (OSError, json.JSONDecodeError):
         return {}
     digests = data.get("box_image_digests")
@@ -14571,27 +14710,29 @@ def _write_box_digests(workspace_path: "Path", digests: dict[str, str]) -> None:
     LIVE project at every research delivery, and `type`, `substrate`,
     `workflow`, `agents`, `models`, `box_image_pins`, `ssh_port` would all
     vanish. Temp + rename, so the webui's concurrent read never sees a torn
-    file."""
+    file. A link at the marker or at the settings folder is unreadable
+    (orch_files), never followed."""
     if not digests:
         return
     f = workspace_path / ".orchestrator" / "project.json"
     try:
-        data = json.loads(f.read_text())
+        data = json.loads(_read_marker_text(workspace_path))
     except (OSError, json.JSONDecodeError) as e:
-        print(f"warning: box-image digests not recorded: the project marker {f} "
+        print(f"warning: box-image digests not recorded: the project marker {orch_files.SHOWN_FOLDER}/project.json "
               f"is unreadable ({e})", file=sys.stderr)
         return
     if not isinstance(data, dict):
-        print(f"warning: box-image digests not recorded: the project marker {f} "
+        print(f"warning: box-image digests not recorded: the project marker {orch_files.SHOWN_FOLDER}/project.json "
               f"is not an object", file=sys.stderr)
         return
     current = data.get("box_image_digests")
     merged = dict(current) if isinstance(current, dict) else {}
     merged.update(digests)
     data["box_image_digests"] = merged
-    tmp = f.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n")
-    tmp.replace(f)
+    try:
+        _write_marker_text(workspace_path, data)
+    except orch_files.Unusable as e:
+        print(f"warning: box-image digests not recorded: {e}", file=sys.stderr)
 
 
 def _read_models(workspace_path: "Path") -> dict[str, dict[str, str]]:
@@ -14606,10 +14747,10 @@ def _read_models(workspace_path: "Path") -> dict[str, dict[str, str]]:
     Every pair in here is already RESOLVED and mutually valid (see
     _resolve_all_model_pairs) — that is the contract the in-supervisor readers
     (rs-worker, rs-sandbox) depend on, since they read it verbatim and have no
-    catalog to validate against."""
-    f = workspace_path / ".orchestrator" / "project.json"
+    catalog to validate against. A link at the marker or at the settings
+    folder reads as unreadable (orch_files)."""
     try:
-        data = json.loads(f.read_text())
+        data = json.loads(_read_marker_text(workspace_path))
     except (OSError, json.JSONDecodeError):
         return {}
     models = data.get("models")
@@ -14625,24 +14766,25 @@ def _write_models(workspace_path: "Path", models: dict[str, dict[str, str]]) -> 
     one raises ValidationError and is left untouched: this runs inside `update`
     before any side effect, so the refusal reaches the operator cleanly (the
     _write_marker_agents posture). Temp + rename, so a concurrent reader never sees
-    a torn file."""
+    a torn file. A link at the marker or at the settings folder is
+    unreadable (orch_files), never followed."""
     f = workspace_path / ".orchestrator" / "project.json"
     try:
-        data = json.loads(f.read_text())
+        data = json.loads(_read_marker_text(workspace_path))
     except FileNotFoundError:
         data = {}
+    except orch_files.Unusable as e:
+        raise ValidationError(f"cannot change the agent models: {e}")
     except (OSError, json.JSONDecodeError) as e:
         raise ValidationError(
-            f"cannot change the agent models: the project marker {f} is unreadable "
+            f"cannot change the agent models: the project marker {orch_files.SHOWN_FOLDER}/project.json is unreadable "
             f"({e}); repair it before changing models")
     if not isinstance(data, dict):
         raise ValidationError(
-            f"cannot change the agent models: the project marker {f} is not a "
+            f"cannot change the agent models: the project marker {orch_files.SHOWN_FOLDER}/project.json is not a "
             f"JSON object; repair it before changing models")
     data["models"] = models
-    tmp = f.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n")
-    tmp.replace(f)
+    _write_marker(workspace_path, data, "change the agent models")
 
 
 def _apply_model_changes(workspace_path: "Path",
@@ -14809,7 +14951,7 @@ def _read_pi_pair(workspace_path: "Path") -> dict[str, str] | None:
     container-writable; the values still reach pi only through the merge,
     which reads them from the environment)."""
     try:
-        data = json.loads((workspace_path / ".orchestrator" / "project.json").read_text())
+        data = json.loads(_read_marker_text(workspace_path))
     except (OSError, json.JSONDecodeError):
         return None
     blk = data.get("pi_models") if isinstance(data, dict) else None
@@ -14862,11 +15004,16 @@ def _stage_box_catalog(workspace_path: "Path", *, strict: bool) -> list[dict]:
               "presets only until it is fixed", file=sys.stderr)
         catalog = [{**m, "source": "builtin"}
                    for m in box_catalog.load_builtins().values()]
-    p = workspace_path / ".orchestrator" / "box-catalog.json"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(catalog, indent=2, sort_keys=True) + "\n")
-    tmp.replace(p)
+    # Through the no-follow settings folder (orch_files): a folder that is a
+    # link refuses a box add (strict) and only warns at create/recreate.
+    try:
+        orch_files.write_text(workspace_path, "box-catalog.json",
+                              json.dumps(catalog, indent=2, sort_keys=True) + "\n",
+                              create=True)
+    except orch_files.Unusable as e:
+        if strict:
+            raise ValidationError(str(e))
+        print(f"warning: the box types were not staged: {e}", file=sys.stderr)
     return catalog
 
 
@@ -15024,6 +15171,12 @@ def _allow_mcp_for_project(project: str, cfg: "Config", mcp_name: str,
             return False, f"shared MCP container {cname} not running"
         ip = mcp_container_ip(mcp_name)
         port = entry["port"]
+
+    # The allowlist is written below: a settings folder that is a link refuses
+    # before the router opens anything.
+    refusal = _settings_folder_refusal(workspace_path_for(project, cfg))
+    if refusal:
+        return False, refusal
 
     network = project_network_for(project)
     subnet = get_network_subnet(network)
@@ -15724,22 +15877,25 @@ def _service_override_path(workspace_path: Path) -> Path:
 
 
 def _read_service_override(workspace_path: Path) -> dict[str, bool]:
-    f = _service_override_path(workspace_path)
-    if not f.is_file():
-        return {}
+    """{} when absent, unparseable or not usable (a link — orch_files)."""
     try:
-        d = json.loads(f.read_text())
+        d = json.loads(orch_files.read_text(workspace_path, "service-overrides.json"))
     except (OSError, json.JSONDecodeError):
         return {}
     return {k: bool(v) for k, v in d.items()} if isinstance(d, dict) else {}
 
 
 def _write_service_override(workspace_path: Path, sid: str, value: bool) -> None:
-    f = _service_override_path(workspace_path)
-    f.parent.mkdir(parents=True, exist_ok=True)
+    """Record a live toggle; a settings folder that is a link refuses (die —
+    the live toggles check it before their first side effect)."""
     cur = _read_service_override(workspace_path)
     cur[sid] = bool(value)
-    f.write_text(json.dumps(cur, indent=2, sort_keys=True) + "\n")
+    try:
+        orch_files.write_text(workspace_path, "service-overrides.json",
+                              json.dumps(cur, indent=2, sort_keys=True) + "\n",
+                              create=True)
+    except orch_files.Unusable as e:
+        die(str(e))
 
 
 def _clear_service_override(workspace_path: Path, sids) -> None:
@@ -15748,11 +15904,20 @@ def _clear_service_override(workspace_path: Path, sids) -> None:
         return
     for sid in sids:
         cur.pop(sid, None)
-    f = _service_override_path(workspace_path)
-    if cur:
-        f.write_text(json.dumps(cur, indent=2, sort_keys=True) + "\n")
-    else:
-        f.unlink(missing_ok=True)
+    # Runs after a recreate: a settings folder that turned into a link only
+    # warns (nothing is written or removed through it).
+    try:
+        if cur:
+            orch_files.write_text(workspace_path, "service-overrides.json",
+                                  json.dumps(cur, indent=2, sort_keys=True) + "\n")
+        else:
+            try:
+                orch_files.unlink(workspace_path, "service-overrides.json")
+            except FileNotFoundError:
+                pass
+    except orch_files.Unusable as e:
+        print(f"warning: the editor/reader choice was not cleared: {e}",
+              file=sys.stderr)
 
 
 def _apply_service_override(base: dict[str, bool], workspace_path: Path) -> dict[str, bool]:
@@ -16498,18 +16663,19 @@ def _retry_project_steps(project: str, container: str, web: dict, progress) -> N
 def _write_marker_history(workspace_path: "Path") -> None:
     """Record `history: true` in project.json, keeping every other key — the
     webui's only signal for the project's (GIT) tab (it reads nothing else
-    of history; the repo name is derived from the project name)."""
-    f = workspace_path / ".orchestrator" / "project.json"
+    of history; the repo name is derived from the project name). Best effort:
+    an unreadable marker (a link included — orch_files) is left as it is."""
     try:
-        data = json.loads(f.read_text())
+        data = json.loads(_read_marker_text(workspace_path))
     except (OSError, ValueError):
         return
     if not isinstance(data, dict):
         return
     data["history"] = True
-    tmp = f.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n")
-    tmp.replace(f)
+    try:
+        _write_marker_text(workspace_path, data)
+    except orch_files.Unusable:
+        return
 
 
 _WEB_TAB_MISSING_LINE = ("The box was added without its {label} tab; remove "
@@ -17631,8 +17797,11 @@ def box_presets(req: "BoxPresetsRequest", _progress=None) -> BoxPresetsResult:  
 # appears once the PI is actually listening on the port (webui probe-gated).
 
 
+EXPORTED_PORTS_NAME = "exported-ports.json"
+
+
 def exported_ports_path(workspace_path: "Path") -> "Path":  # type: ignore[name-defined]
-    return workspace_path / ".orchestrator" / "exported-ports.json"
+    return workspace_path / ".orchestrator" / EXPORTED_PORTS_NAME
 
 
 # The registry is broker-written with indent=2: one entry is ~60-150 bytes plus
@@ -17649,16 +17818,20 @@ def exported_ports_path(workspace_path: "Path") -> "Path":  # type: ignore[name-
 EXPORTED_PORTS_MAX_BYTES = 1 << 20
 
 
-def _load_port_registry(f):
+def _load_port_registry(f, dir_fd=None):
     """The JSON list in the port registry file `f`; [] when `f` is absent;
     None when it is there but unusable: not a regular file (a FIFO, a
     directory, a symlink), larger than EXPORTED_PORTS_MAX_BYTES, not UTF-8,
     not JSON, or not a list. The file is writable from inside the project's
     container, so the open never blocks, never follows a link, and reads at
-    most one byte past the cap. MIRRORED byte-for-byte in webui/server.py
-    and cli/rscore.py — keep the two identical."""
+    most one byte past the cap. MIRRORED in webui/server.py — keep the two
+    identical except the `dir_fd` this copy takes: rscore opens `f` relative
+    to the settings folder it opened without following a link (orch_files),
+    so a container that replaces `.orchestrator` itself redirects nothing;
+    the webui copy still opens by path (its reads are B213)."""
     try:
-        fd = os.open(f, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = os.open(f, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                     dir_fd=dir_fd)
     except FileNotFoundError:
         return []
     except OSError:
@@ -17714,7 +17887,13 @@ def read_exported_ports(workspace_path: "Path") -> list[dict]:  # type: ignore[n
     webui image can't import this module) — keep the two acceptance blocks
     and the two skip lines byte-identical. Host-written but webui-read, and
     container-writable, so never trust the shape."""
-    data = _load_port_registry(exported_ports_path(workspace_path))
+    try:
+        with orch_files.open_folder(workspace_path) as dfd:
+            data = _load_port_registry(EXPORTED_PORTS_NAME, dir_fd=dfd)
+    except FileNotFoundError:
+        data = []
+    except OSError:
+        data = None             # the settings folder is a link or not a folder
     if not data:
         return []
     out: list[dict] = []
@@ -17753,34 +17932,27 @@ def read_exported_ports(workspace_path: "Path") -> list[dict]:  # type: ignore[n
 def _write_exported_ports(workspace_path: "Path", ports: list[dict]) -> None:  # type: ignore[name-defined]
     """Replace the registry with `ports`, atomically. The directory is
     writable from inside the project's container, so the temp file is a
-    fresh, uniquely named one (mkstemp: O_CREAT|O_EXCL|O_NOFOLLOW) — a link
+    fresh, uniquely named one (O_CREAT|O_EXCL|O_NOFOLLOW) — a link
     or file the project planted at any fixed temp path can never redirect or
     block this host-side write. Serialised before the temp exists, so a
     failure to serialise leaves nothing behind; a failed write unlinks its
-    own temp by name and re-raises. Mode 0644, as the file always had.
-    Residual: O_NOFOLLOW guards only the last component — a container that
-    replaces `.orchestrator` itself with a link still redirects the write."""
-    _write_port_registry_text(
-        workspace_path, json.dumps(ports, indent=2, sort_keys=True) + "\n")
+    own temp by name and re-raises. Mode 0644, as the file always had. The
+    settings folder itself is opened without following a link
+    (orch_files): a container that replaces `.orchestrator` with a link
+    refuses the write (die) instead of redirecting it."""
+    try:
+        _write_port_registry_text(
+            workspace_path, json.dumps(ports, indent=2, sort_keys=True) + "\n")
+    except orch_files.Unusable as e:
+        die(str(e))
 
 
 def _write_port_registry_text(workspace_path: "Path", text: str) -> None:  # type: ignore[name-defined]
-    """The atomic write behind _write_exported_ports (see there)."""
-    p = exported_ports_path(workspace_path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=p.parent, prefix=".exported-ports.",
-                               suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            os.fchmod(fh.fileno(), 0o644)
-            fh.write(text)
-        os.replace(tmp, p)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    """The atomic write behind _write_exported_ports (see there): a fresh
+    temp name inside the no-follow settings folder (orch_files.write_text).
+    Raises orch_files.Unusable when the folder is a link or not a folder."""
+    orch_files.write_text(workspace_path, EXPORTED_PORTS_NAME, text,
+                          mode=0o644, create=True)
 
 
 # What each reserved project-side port is, for the warning that drops an entry
@@ -17838,8 +18010,13 @@ def _sweep_reserved_port_entries(workspace_path: "Path") -> list[dict]:  # type:
     it was. The read and the write are adjacent — no exec between them — so a
     concurrent registry write (the dev-box lane has no busy check against
     this) has the smallest window. Raises what the write raises (OSError,
-    ValueError, RecursionError)."""
-    raw = _load_port_registry(exported_ports_path(workspace_path))
+    ValueError, RecursionError). A settings folder that is a link reads as
+    unusable (orch_files), so nothing is written."""
+    try:
+        with orch_files.open_folder(workspace_path) as dfd:
+            raw = _load_port_registry(EXPORTED_PORTS_NAME, dir_fd=dfd)
+    except OSError:
+        raw = None
     if not raw:
         return []
     keep, dropped = [], []
@@ -17922,6 +18099,9 @@ def port_add(req: "PortAddRequest", _progress=None) -> PortAddResult:  # type: i
     ws = workspace_path_for(req.project, cfg)
     if not ws.is_dir():
         die(f"project {req.project!r} has no workspace; create it first")
+    # The registry is written below, after the box tool may have run: refuse
+    # a settings folder that is a link before anything happens.
+    _require_settings_folder(ws)
     # Before the first read below: the reader hides a reserved row, so every
     # write that follows would drop it silently — say so here, once.
     swept = _drop_reserved_port_entries(req.project, cfg)
