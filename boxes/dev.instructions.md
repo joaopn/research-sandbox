@@ -137,7 +137,8 @@ have landed PRs on your fork (`origin`); the maintainer may have collected your 
 pushed changes to GitHub (`upstream`).
 
 This flow runs **in the primary clone**, which is always checked out on `{{BASE_BRANCH}}` —
-it is the only git operation you run there yourself. Your own work never happens there (see
+apart from fetching and reading refs (see "Worktrees" below), it is the only git operation
+you run there yourself. Your own work never happens there (see
 "Worktrees (rs-wt) — every unit of work" below).
 
 ```bash
@@ -248,11 +249,13 @@ Every unit of work — a feature, a fix, a review follow-up, whether you are the
 or one of several — happens in its own git worktree with its own `agent/` branch. Worktrees
 are mandatory for every unit of work, not only when sessions run in parallel. The primary
 clone at `/workspace/<repo>` is the integration tree: it stays checked out on
-`{{BASE_BRANCH}}`, the base-branch sync runs there, and nothing else does. Two things ARE fine
-in the primary clone, because they never move its HEAD: editing files git ignores (they
-never reach a worktree — `git worktree add` checks out tracked files only), and running
-project-level commands that pin the clone's
-path (a compose stack, a data directory) — build from the worktree, run from the clone.
+`{{BASE_BRANCH}}`, the base-branch sync runs there, and nothing else does. Three things ARE
+fine in the primary clone, because they never move its HEAD: editing files git ignores (they
+never reach a worktree — `git worktree add` checks out tracked files only), running
+project-level commands that pin the clone's path (a compose stack, a data directory) — build
+from the worktree, run from the clone — and fetching `origin` to read its refs
+(`git -C /workspace/<repo> fetch origin`,
+`git -C /workspace/<repo> show origin/<branch>:<path>`), which changes no checked-out file.
 
 - **Never change the branch checked out in the primary clone.** The only checkout that ever
   runs there is `git checkout {{BASE_BRANCH}}` — the sync's first line, or putting the clone
@@ -345,7 +348,23 @@ skip that notice there.
 1. Move each plan the PR shipped to `PLAN/DONE/`, add its `MANIFEST.md` row, and update its
    status in `PLAN/README.md`.
 2. Mark each ledger entry the PR resolved `Fixed in: PR #<n> <subject>` and leave it in
-   place.
+   place. Find them by searching, not from memory: run
+   `git -C /workspace/<repo> fetch origin`, read the entries in `PLAN/BUG_BUCKET.md` and
+   `PLAN/IMPROVEMENTS.md` not yet marked fixed or superseded, and search them for the files
+   and functions the PR changed. For each one whose code the PR touched, check whether it
+   still holds on the branch the PR landed on, read through
+   `git -C /workspace/<repo> show origin/<branch>:<path>` (`{{BASE_BRANCH}}` unless the
+   maintainer pointed the PR elsewhere) and never from the primary clone's files, which have
+   not synced since the landing; check by reading the code, or with a probe kept outside the
+   repo. Fixing one that still holds is new work and waits for the maintainer's go. When the
+   PR removed what an entry is about or changed its premise, mark it
+   `Superseded by: PR #<n> <subject>` instead; when an entry stays open but its fix sketch
+   no longer fits, correct the sketch in place. If another session has started the entry's
+   issue (the issue's latest `Working on it: branch …` comment, with no `Stopped`, `Landed`
+   or `Closed` comment after it, names a branch that is not yours), keep the issue open:
+   comment on it naming the PR that resolved it, and name it in your report instead of
+   closing it in step 4. Say how many you found, zero included, in the reply that reports
+   the landing.
 3. If the work taught something a later session needs — an invariant the code depends on, a
    trap, a reusable pattern — add it to that area's rule file (a lesson about how to work
    goes in `/workspace/.claude/CLAUDE.md`). Most landings teach nothing worth a line.
@@ -493,7 +512,8 @@ record in the project's ledgers is duplicated as a Gitea issue: title = the plan
 the entry's stable code (`B<n>`, `I<n>`) plus its one-line summary; body = the plan file's
 text, or the entry's text, verbatim. The file under `/workspace/PLAN/` is authoritative and
 the issue is its mirror — re-sync the body when the entry changes, and close the issue
-naming the PR when the work lands. Never keep only one of the two.
+naming the PR when the work lands (an issue another session has started stays open — "After
+every landing", step 2). Never keep only one of the two.
 
 **Never hard-wrap prose in issues, PR bodies or comments.** Gitea renders a single newline as
 a line break, so a paragraph wrapped at 80 columns is shredded on the board. One paragraph is
