@@ -65,11 +65,12 @@ gets fixed too — these files drift as they grow.
 ## The maintainer's go — before any work starts
 
 **No work starts without the maintainer's go — hard rule.** Work means `rs-wt new`, any edit
-to a tracked file, a test or harness, a demo stack, a commit, a PR. Before any of it, the
-maintainer has seen the plan for this piece of work — what you will build, the questions it
-raises, your recommendations — and has then told you, in the session, to build it: "go",
-"go, but change X", "write the PR", "implement it". A go that carries changes is still a go:
-fold the changes into the plan and build that.
+to a tracked file, a test or harness, a demo stack, a commit, a PR. The wiki is not work in
+this sense: like the project memory, its pages and their commits need no go (see "The wiki").
+Before any work, the maintainer has seen the plan for this piece of work — what you will
+build, the questions it raises, your recommendations — and has then told you, in the session,
+to build it: "go", "go, but change X", "write the PR", "implement it". A go that carries
+changes is still a go: fold the changes into the plan and build that.
 
 Nothing else is a go, however much it reads like one:
 
@@ -350,6 +351,71 @@ skip that notice there.
    goes in `/workspace/.claude/CLAUDE.md`). Most landings teach nothing worth a line.
 4. Close the mirrored issues naming the PR — `rs-board done <issue> --pr <N>`, which also
    removes each card — and re-sync any whose file changed.
+5. Check the wiki against what the PR changed and update the pages it touched (see "The
+   wiki" below); most landings change nothing there.
+
+## The wiki — how the repository works, for the maintainer
+
+Your fork on Gitea has a wiki. It holds the repository's functional structure, written for
+the maintainer: how things are done, what connects to what, and the core design decisions
+and why they were taken. Its job is to keep the maintainer in the loop of how the system
+works, so write it the way you write to them: what happens for the person using the system
+first, mechanism only where it helps them follow it. It is not your project memory (the
+traps and invariants an agent needs live there), not a copy of the plans or the ledgers, and
+not code documentation. Keeping it needs no go (see "The maintainer's go"), and you say which
+pages you changed in the reply that reports the landing or the pass.
+
+- **Shape.** A `Home` page is the map: one paragraph on what the repository does, then a
+  table with one row per other page — a link to it and one line on what it covers. Each
+  other page covers one part of the system as the user meets it: what it does, what it
+  connects to (a diagram), the decisions that shaped it and why (a short paragraph each),
+  and a table wherever the subject is a matrix. Prefer a diagram or a table to a paragraph
+  that lists things.
+- **Diagrams are Mermaid blocks** (a fenced code block marked `mermaid`): Gitea draws them
+  in the page and they stay text you can edit. Use an image file only where Mermaid cannot
+  draw the thing.
+- **Pages go through the API**, as your fork's owner: `<owner>/<repo>` is the
+  `$GITEA_USER/$REPO_NAME` path of the Gitea API section — on a dev project's own agent, the
+  `agent_user` and `repo` of the wiring row whose `agent_user` is not empty, never its
+  `user`. If that repository's `has_wiki` is `false` (`GET /repos/<owner>/<repo>`), its wiki
+  is switched off: tell the maintainer instead of working around it.
+  - `POST /repos/<owner>/<repo>/wiki/new` with `title` and `content_base64` creates a
+    page; the wiki comes into existence with its first page.
+  - `GET /repos/<owner>/<repo>/wiki/pages` lists the pages with their `title` and `sub_url`,
+    30 to a page: add `?page=2`, `?page=3` … until you have the `X-Total-Count` it reports;
+    before the first page exists it answers 404.
+  - `GET /repos/<owner>/<repo>/wiki/page/<sub_url>` reads one; `PATCH` on the same path
+    replaces it and needs both the `title` that read returned and the new `content_base64`.
+    Read a page just before you replace it — another session may have changed it.
+  - Address a page by its `sub_url`, never by its title (a title with a dash in it is stored
+    under an escaped name), and link pages the same way: `[Dev lane](Dev-lane)`.
+- **An image goes in through the wiki's git repository**, once the wiki has its first page
+  (before that the clone is refused). Its URL is your `origin` URL with the trailing `.git`
+  replaced by `.wiki.git`. Clone it under your home directory, as `~/<repo>.wiki` (never
+  top-level under `/workspace`, which must hold exactly one clone), or `git pull` the clone
+  already there, and give it your own identity before the first commit — otherwise the
+  commit fails, or goes out under someone else's name:
+
+  ```
+  git -C ~/<repo>.wiki config user.name "$(git -C /workspace/<repo> config user.name)"
+  git -C ~/<repo>.wiki config user.email "$(git -C /workspace/<repo> config user.email)"
+  ```
+
+  Every session in the container shares that clone: pull before you add to it, and push
+  right after you commit. Then embed the image in a page by its file name:
+  `![what it shows](diagram.png)`.
+- **When.** At every landing (step 5 of "After every landing"), check whether the PR changed
+  how something works, what connects to what, or a core decision, and update the pages it
+  touched; most landings change nothing there. A part with no page yet gets one, and a row
+  on `Home`. When the maintainer asks for the wiki ("write the wiki", "update the wiki for
+  X"), do a full pass over what they named: read the code, compare it with the pages, and
+  rewrite what is out of date.
+- **Where it lives.** The wiki stays on Gitea: collection takes the code repository only, so
+  it does not reach GitHub. Archiving your fork (a destroyed project or box) archives the wiki
+  with it; removing the repository from the dev lane, or purging your identity, deletes it.
+  It is its own repository, outside the worktree rule, with no review step — edit it
+  directly, no worktree, no branch, no PR — and the maintainer and every fetch tool on the
+  dev lane can read it, so never put a token, a password or anything else secret in it.
 
 ## Verification
 
