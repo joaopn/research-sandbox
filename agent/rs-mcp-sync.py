@@ -105,6 +105,131 @@ def _entry_matches(entry: dict, url: str, token: str) -> bool:
     return entry.get("url") == url and headers.get("authorization") == "Bearer " + token
 
 
+# --- RS's lock on pi's home mcp.json -------------------------------------------
+# pi's own `pi mcp add/remove` writes this file without any lock (pi 1.5.0,
+# dist/extensions/mcp/config.js), and RS has two writers of it: a box's MCP
+# render and the MCP gateway sync. Both take THIS lock around their whole
+# read-decide-write, so neither loses the other's update. MIRROR: this block is
+# byte-identical in agent/box-render-mcp.py and agent/rs-mcp-sync.py (pinned).
+#
+# The lock is the directory `<mcp.json>.rs-lock` (a name pi never uses), made
+# with mkdir; its holder records `<pid> <start time>` in it and is the only one
+# that removes it (the record by name, then rmdir — never a recursive delete).
+# A lock whose recorded process is gone (no such pid, or a pid reused by a
+# process that started at another time) was left by a killed writer: it is
+# taken over by renaming it aside under a name unique to the taker, so two
+# takers can never both win, and the move is undone when the moved lock turns
+# out to name a live holder. Every writer of this file runs in the same
+# container (the box's own boot, an exec into it), so its pids are comparable.
+RS_LOCK_SUFFIX = ".rs-lock"
+RS_LOCK_OWNER = "owner"
+# How long a writer waits for the lock. The longest holder is the gateway sync,
+# which runs one pi command per wired server, each bounded by its own
+# one-minute timeout and measured at 0.2-0.4 s: one minute covers a healthy
+# pass of over a hundred servers, and a holder past that is stuck on a command
+# its own timeout is about to kill. A render that gives up only leaves pi's
+# servers as they were until the next boot or refresh (a warning).
+RS_LOCK_WAIT_S = 60
+# A holder keeps the lock for a read and a write (the render: milliseconds) or
+# for its pi commands (tenths of seconds each): a tenth of a second between
+# tries costs nothing next to either and keeps a waiter from spinning.
+RS_LOCK_POLL_S = 0.1
+
+
+def _rs_proc_start(pid: int):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _rs_lock_owner(lock: Path):
+    try:
+        parts = (lock / RS_LOCK_OWNER).read_text().split()
+    except OSError:
+        return None
+    return parts if len(parts) == 2 and parts[0].isdigit() else None
+
+
+def _rs_lock_stale(lock: Path) -> bool:
+    owner = _rs_lock_owner(lock)
+    if owner is None:
+        # Made but not yet recorded: a holder writes its record right after
+        # its mkdir, so only one this old was left half-made by a killed writer.
+        try:
+            return time.time() - os.lstat(lock).st_mtime > RS_LOCK_WAIT_S
+        except OSError:
+            return False
+    return _rs_proc_start(int(owner[0])) != owner[1]
+
+
+def _rs_lock_clear(lock: Path) -> None:
+    aside = lock.with_name(f"{lock.name}.stale.{os.getpid()}.{time.monotonic_ns()}")
+    try:
+        os.rename(lock, aside)
+    except OSError:
+        return                                   # another writer cleared it first
+    if not _rs_lock_stale(aside):
+        try:
+            os.rename(aside, lock)               # a live holder's lock: put it back
+        except OSError:
+            pass
+        return
+    try:
+        os.unlink(aside / RS_LOCK_OWNER)
+    except OSError:
+        pass
+    try:
+        os.rmdir(aside)
+    except OSError:
+        pass
+
+
+def rs_lock_take(target: Path):
+    """The lock on `target`, or None when it could not be had within
+    RS_LOCK_WAIT_S (the caller fails soft)."""
+    lock = target.with_name(target.name + RS_LOCK_SUFFIX)
+    me = f"{os.getpid()} {_rs_proc_start(os.getpid())}"
+    give_up = time.monotonic() + RS_LOCK_WAIT_S
+    while True:
+        try:
+            os.mkdir(lock, 0o700)
+        except FileExistsError:
+            if _rs_lock_stale(lock):
+                _rs_lock_clear(lock)
+                continue
+            if time.monotonic() >= give_up:
+                return None
+            time.sleep(RS_LOCK_POLL_S)
+            continue
+        except OSError:
+            return None
+        try:
+            fd = os.open(lock / RS_LOCK_OWNER, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(me + "\n")
+        except OSError:
+            try:
+                os.rmdir(lock)
+            except OSError:
+                pass
+            return None
+        return lock
+
+
+def rs_lock_release(lock) -> None:
+    """Remove our own lock: its record by name, then the folder — only while
+    the record is still ours."""
+    if lock is None or _rs_lock_owner(lock) != [str(os.getpid()), str(_rs_proc_start(os.getpid()))]:
+        return
+    try:
+        os.unlink(lock / RS_LOCK_OWNER)
+        os.rmdir(lock)
+    except OSError:
+        pass
+
+
 class Claude:
     name = "claude"
 
@@ -156,25 +281,47 @@ def apply_local(wanted: dict, home: Path) -> dict:
     for agent in (Claude(home), Pi(home)):
         if not agent.launcher.is_file():
             continue
-        existing = agent.existing()
-        result: dict = {}
-        for name, want in sorted(wanted.items()):
-            entry = existing.get(name)
-            if name in declared or (entry is not None and not _is_rs(entry)):
-                result[name] = "conflict"
+        # pi's list is also written by a box's MCP render: RS's lock on it is
+        # held around this agent's whole read-decide-write (its pi commands
+        # included); a lock that cannot be had fails every wired name.
+        lock = None
+        if isinstance(agent, Pi):
+            target = _pi_agent_dir(home) / "mcp.json"
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                lock = rs_lock_take(target)
+            except OSError:
+                lock = None
+            if lock is None:
+                out[agent.name] = {name: "failed" for name in sorted(wanted)}
                 continue
-            if entry is not None and _entry_matches(entry, want["url"], want["token"]):
-                result[name] = "kept"
-                continue
-            if entry is not None and not agent.remove(name):
-                result[name] = "failed"
-                continue
-            result[name] = "added" if agent.add(name, want["url"], want["token"]) else "failed"
-        for name, entry in sorted(existing.items()):
-            if name not in wanted and _is_rs(entry):
-                result[name] = "removed" if agent.remove(name) else "failed"
-        out[agent.name] = result
+        try:
+            out[agent.name] = _apply_agent(agent, wanted, declared)
+        finally:
+            rs_lock_release(lock)
     return out
+
+
+def _apply_agent(agent, wanted: dict, declared: set) -> dict:
+    """One agent's read-decide-write: RS's entries (the gateway header) only."""
+    existing = agent.existing()
+    result: dict = {}
+    for name, want in sorted(wanted.items()):
+        entry = existing.get(name)
+        if name in declared or (entry is not None and not _is_rs(entry)):
+            result[name] = "conflict"
+            continue
+        if entry is not None and _entry_matches(entry, want["url"], want["token"]):
+            result[name] = "kept"
+            continue
+        if entry is not None and not agent.remove(name):
+            result[name] = "failed"
+            continue
+        result[name] = "added" if agent.add(name, want["url"], want["token"]) else "failed"
+    for name, entry in sorted(existing.items()):
+        if name not in wanted and _is_rs(entry):
+            result[name] = "removed" if agent.remove(name) else "failed"
+    return result
 
 
 # --- the project side ----------------------------------------------------------

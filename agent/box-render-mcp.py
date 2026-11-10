@@ -50,6 +50,7 @@ claude-only box never stops over it).
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 proxy_path = Path("/workspace/.mcp-proxy.json")
@@ -146,6 +147,131 @@ def write_atomic(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+# --- RS's lock on pi's home mcp.json -------------------------------------------
+# pi's own `pi mcp add/remove` writes this file without any lock (pi 1.5.0,
+# dist/extensions/mcp/config.js), and RS has two writers of it: a box's MCP
+# render and the MCP gateway sync. Both take THIS lock around their whole
+# read-decide-write, so neither loses the other's update. MIRROR: this block is
+# byte-identical in agent/box-render-mcp.py and agent/rs-mcp-sync.py (pinned).
+#
+# The lock is the directory `<mcp.json>.rs-lock` (a name pi never uses), made
+# with mkdir; its holder records `<pid> <start time>` in it and is the only one
+# that removes it (the record by name, then rmdir — never a recursive delete).
+# A lock whose recorded process is gone (no such pid, or a pid reused by a
+# process that started at another time) was left by a killed writer: it is
+# taken over by renaming it aside under a name unique to the taker, so two
+# takers can never both win, and the move is undone when the moved lock turns
+# out to name a live holder. Every writer of this file runs in the same
+# container (the box's own boot, an exec into it), so its pids are comparable.
+RS_LOCK_SUFFIX = ".rs-lock"
+RS_LOCK_OWNER = "owner"
+# How long a writer waits for the lock. The longest holder is the gateway sync,
+# which runs one pi command per wired server, each bounded by its own
+# one-minute timeout and measured at 0.2-0.4 s: one minute covers a healthy
+# pass of over a hundred servers, and a holder past that is stuck on a command
+# its own timeout is about to kill. A render that gives up only leaves pi's
+# servers as they were until the next boot or refresh (a warning).
+RS_LOCK_WAIT_S = 60
+# A holder keeps the lock for a read and a write (the render: milliseconds) or
+# for its pi commands (tenths of seconds each): a tenth of a second between
+# tries costs nothing next to either and keeps a waiter from spinning.
+RS_LOCK_POLL_S = 0.1
+
+
+def _rs_proc_start(pid: int):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _rs_lock_owner(lock: Path):
+    try:
+        parts = (lock / RS_LOCK_OWNER).read_text().split()
+    except OSError:
+        return None
+    return parts if len(parts) == 2 and parts[0].isdigit() else None
+
+
+def _rs_lock_stale(lock: Path) -> bool:
+    owner = _rs_lock_owner(lock)
+    if owner is None:
+        # Made but not yet recorded: a holder writes its record right after
+        # its mkdir, so only one this old was left half-made by a killed writer.
+        try:
+            return time.time() - os.lstat(lock).st_mtime > RS_LOCK_WAIT_S
+        except OSError:
+            return False
+    return _rs_proc_start(int(owner[0])) != owner[1]
+
+
+def _rs_lock_clear(lock: Path) -> None:
+    aside = lock.with_name(f"{lock.name}.stale.{os.getpid()}.{time.monotonic_ns()}")
+    try:
+        os.rename(lock, aside)
+    except OSError:
+        return                                   # another writer cleared it first
+    if not _rs_lock_stale(aside):
+        try:
+            os.rename(aside, lock)               # a live holder's lock: put it back
+        except OSError:
+            pass
+        return
+    try:
+        os.unlink(aside / RS_LOCK_OWNER)
+    except OSError:
+        pass
+    try:
+        os.rmdir(aside)
+    except OSError:
+        pass
+
+
+def rs_lock_take(target: Path):
+    """The lock on `target`, or None when it could not be had within
+    RS_LOCK_WAIT_S (the caller fails soft)."""
+    lock = target.with_name(target.name + RS_LOCK_SUFFIX)
+    me = f"{os.getpid()} {_rs_proc_start(os.getpid())}"
+    give_up = time.monotonic() + RS_LOCK_WAIT_S
+    while True:
+        try:
+            os.mkdir(lock, 0o700)
+        except FileExistsError:
+            if _rs_lock_stale(lock):
+                _rs_lock_clear(lock)
+                continue
+            if time.monotonic() >= give_up:
+                return None
+            time.sleep(RS_LOCK_POLL_S)
+            continue
+        except OSError:
+            return None
+        try:
+            fd = os.open(lock / RS_LOCK_OWNER, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(me + "\n")
+        except OSError:
+            try:
+                os.rmdir(lock)
+            except OSError:
+                pass
+            return None
+        return lock
+
+
+def rs_lock_release(lock) -> None:
+    """Remove our own lock: its record by name, then the folder — only while
+    the record is still ours."""
+    if lock is None or _rs_lock_owner(lock) != [str(os.getpid()), str(_rs_proc_start(os.getpid()))]:
+        return
+    try:
+        os.unlink(lock / RS_LOCK_OWNER)
+        os.rmdir(lock)
+    except OSError:
+        pass
+
+
 pi_agent_dir = os.environ.get("RS_PI_AGENT_DIR") or ""
 # RS's mark on its own entries in pi's home MCP settings.
 RS_MARK = "rsManaged"
@@ -174,8 +300,29 @@ def pi_home_merge(rs_servers: dict) -> bool:
     server's name is declared in /workspace/.mcp.json). No file and nothing to add: no
     file is made. Returns True when the file now holds exactly RS's current
     entries (nothing to do counts); False, with a warning, when it was left
-    alone. Never raises."""
+    alone. Never raises. Holds RS's lock on the file around the whole
+    read-modify-write (the gateway sync takes the same one); a lock it cannot
+    have within its bound leaves the file alone, with a warning."""
     path = Path(pi_agent_dir) / "mcp.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"sandbox-box: could not make pi's agent folder for {path}: {e}", file=sys.stderr)
+        return False
+    lock = rs_lock_take(path)
+    if lock is None:
+        print(f"sandbox-box: could not write pi's MCP settings {path}: RS's lock on "
+              f"them could not be taken (another RS writer held it for over "
+              f"{RS_LOCK_WAIT_S}s, or the folder cannot be written); left alone this "
+              f"time, pi keeps the servers it had", file=sys.stderr)
+        return False
+    try:
+        return _pi_home_merge_locked(path, rs_servers)
+    finally:
+        rs_lock_release(lock)
+
+
+def _pi_home_merge_locked(path: Path, rs_servers: dict) -> bool:
     data: dict = {}
     try:
         if path.is_symlink() or path.exists():
@@ -210,7 +357,6 @@ def pi_home_merge(rs_servers: dict) -> bool:
         return True
     data["mcpServers"] = merged
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
         write_atomic(path, json.dumps(data, indent=2) + "\n")
     except OSError as e:
         print(f"sandbox-box: could not write pi's MCP settings {path}: {e}",
