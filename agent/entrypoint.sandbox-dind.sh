@@ -104,9 +104,9 @@ fi
 #     it like /workspace), the mailboxes' parent shared/ (a box created
 #     sharing files sees shared/.boxes/ and shared/agent/ read-only and its
 #     own shared/.boxes/<box>/ read-write; a box that does not share sees
-#     none of it; the project agent's mailbox is shared/agent/) and the
-#     agent's two skills homes (empty; a skill staged
-#     later is picked up live). No plan/logbook/workers tree — there are no
+#     none of it; the project agent's mailbox is shared/agent/). Nothing in
+#     /workspace/.claude/ or /workspace/.pi/: they are the user's (RS's skills
+#     go into the agent's home). No plan/logbook/workers tree — there are no
 #     workers; the agent, when one is selected, keeps its templates elsewhere.
 if [[ "$(stat -c %U /workspace)" != "research" ]]; then
     sudo chown research:research /workspace 2>/dev/null || true
@@ -119,7 +119,7 @@ for d in /workspace/mnt /workspace/shared; do
         sudo chown research:research "$d" 2>/dev/null || true
     fi
 done
-mkdir -p /workspace/shared/agent /workspace/.claude/skills /workspace/.pi/skills
+mkdir -p /workspace/shared/agent
 
 # --- The inner daemon's resolvers: the project's own, handed over by the host
 #     as RS_SANDBOX_DNS (comma-separated, validated public IPv4 literals). Every

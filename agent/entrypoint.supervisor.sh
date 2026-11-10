@@ -24,7 +24,8 @@
 # Startup order:
 #   1. GID remap (for bind mounts from host).
 #   2. Home-skel restore (volume hides image contents on first boot).
-#   3. Stage /workspace/.claude/ and .orchestrator/ if this is a fresh volume.
+#   3. Stage .orchestrator/ and the project tree if this is a fresh volume;
+#      RS's instructions and /log into the agent's home.
 #   4. dockerd (DIND) in the background, wait for socket.
 #   5. sshd.
 #   6. Claude Code settings (bypassPermissions).
@@ -136,7 +137,7 @@ fi
 if [[ "$(stat -c %U /workspace)" != "research" ]]; then
     sudo chown research:research /workspace 2>/dev/null || true
 fi
-mkdir -p /workspace/.claude /workspace/.orchestrator/logs \
+mkdir -p /workspace/.orchestrator/logs \
          /workspace/plan /workspace/plan/draft /workspace/plan/archive \
          /workspace/logbook/supervisor /workspace/logbook/pi \
          /workspace/shared /workspace/workers \
@@ -159,10 +160,10 @@ done
 # The project agent's own mailbox (/workspace/shared/<name>/ is the one folder
 # each worker and this agent writes for the others, shared/.boxes/<box>/ each
 # box created sharing files; every worker sees all of shared/ read-only, a
-# sharing box only shared/.boxes/ and shared/agent/), and its two skills homes — empty, so a skill
-# staged into them later is picked up by a running session. The research user
-# owns them: this runs as research.
-mkdir -p /workspace/shared/agent /workspace/.claude/skills /workspace/.pi/skills
+# sharing box only shared/.boxes/ and shared/agent/). The research user owns
+# it: this runs as research. Nothing in /workspace/.claude/ or /workspace/.pi/:
+# they are the user's (RS's files go into the agent's home).
+mkdir -p /workspace/shared/agent
 
 # --- RS's research instructions → ~/.claude/rules/rs-instructions.md, at every
 #     boot, after the saved home is back and before dockerd. Claude Code (and
@@ -184,28 +185,25 @@ else
     tmp=; want=; mkdir -p "$RS_INSTR_DIR" && want=$({ cat "$RS_INSTR_NOTICE" && printf '\n' && cat "$RS_INSTR_TEXT"; } | wc -c) && tmp=$(mktemp "$RS_INSTR_DIR/.rs-instructions.XXXXXX") && { cat "$RS_INSTR_NOTICE" && printf '\n' && cat "$RS_INSTR_TEXT"; } >"$tmp" && [ "$(wc -c <"$tmp")" -eq "$want" ] && chmod 0444 "$tmp" && mv -fT "$tmp" "$RS_INSTR_DIR/rs-instructions.md" || { [ -z "$tmp" ] || rm -f "$tmp" || :; echo "warning: RS's instructions could not be written into the agent's home; the next start writes them again" >&2 || :; }
 fi
 
-# bypassPermissions for the supervisor editor's in-IDE claude — the VS Code Claude
-# extension reads PROJECT settings from /workspace/.claude/, not just ~/.claude. No
-# hooks (the home ~/.claude/settings.json carries the rs-audit-stop hook); no-clobber.
-if [[ ! -f /workspace/.claude/settings.json ]]; then
-    printf '%s\n' '{"permissions": {"defaultMode": "bypassPermissions"}, "theme": "dark"}' \
-        > /workspace/.claude/settings.json
+# --- The supervisor's /log command → ~/.claude/commands/log.md (a user-level
+#     command, every folder), at every boot from the image's copy, after the
+#     saved home is back. The logbook templates it names are read from the
+#     image (/opt/claude-templates/), never copied. RS's OLD copy,
+#     /workspace/.claude/commands/log.md, blocks the write while the project
+#     record's old_files_cleared flag is unset (the host's start then reports
+#     it): RS writes no new copy while an old one is there; once the flag is
+#     set, a log.md there is the user's own and never stops this one. The
+#     flag is read in an `if` (exempt from set -e); the write is ONE `&&` chain
+#     with ONE failure branch, a temp name that does not end in `.md`, and
+#     `mv -T`; nothing here can abort the boot.
+RS_LOG_SRC=/opt/claude-templates/commands/log.md
+RS_LOG_DIR=/home/research/.claude/commands
+if python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("old_files_cleared") is True else 1)' /workspace/.orchestrator/project.json 2>/dev/null \
+   || { [ ! -L /workspace/.claude/commands/log.md ] && [ ! -e /workspace/.claude/commands/log.md ]; }; then
+    tmp=; mkdir -p "$RS_LOG_DIR" && tmp=$(mktemp "$RS_LOG_DIR/.log.md.XXXXXX") && cp "$RS_LOG_SRC" "$tmp" && chmod 0644 "$tmp" && mv -fT "$tmp" "$RS_LOG_DIR/log.md" || { [ -z "$tmp" ] || rm -f "$tmp" || :; echo "warning: RS's /log command could not be written into the agent's home; the next start writes it again" >&2 || :; }
+else
+    echo "error: /workspace/.claude/commands/log.md is RS's old copy of the /log command; RS's new one was not written (remove or rename it, then stop the project and start it again)" >&2 || :
 fi
-
-# Slash commands (project-level). The supervisor's `/log` lives here.
-mkdir -p /workspace/.claude/commands
-for src in /opt/claude-templates/commands/*.md; do
-    [[ -f "$src" ]] || continue
-    dst="/workspace/.claude/commands/$(basename "$src")"
-    [[ -f "$dst" ]] || cp "$src" "$dst"
-done
-
-# Two-stream logbook templates, referenced by /workspace/.claude/commands/log.md.
-for tmpl in logbook_supervisor_template.md logbook_pi_template.md; do
-    src="/opt/claude-templates/$tmpl"
-    dst="/workspace/.claude/$tmpl"
-    [[ -f "$src" && ! -f "$dst" ]] && cp "$src" "$dst" || true
-done
 
 # --- Claude Code settings (bypassPermissions + the rs-audit-stop Stop hook).
 #     setup.sh is a template from the image, copied+run once per fresh home.

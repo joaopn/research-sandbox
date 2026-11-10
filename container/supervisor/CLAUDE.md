@@ -267,7 +267,7 @@ Accept **requires** `--id "<one line: what this deliverable is>"` — it is reco
 
 ## /log (session end)
 
-The PI triggers `/log`. Follow the slash command at `/workspace/.claude/commands/log.md` exactly. In brief:
+The PI triggers `/log`. Follow the slash command at `~/.claude/commands/log.md` exactly (RS writes it into your home at every start). In brief:
 
 1. **Preconditions.** Every live worker must be `waiting`. If any is `working`, message them to stop/complete and wait; if any is `parked`, either wait for its wake (`rs-worker wait`) or message it to collect what it has and return to `waiting`. `/log` refuses while anything is `working` or `parked`.
 2. **Summary round.** For each live worker, send the summarize-and-prepare-for-shutdown message (template below). Wait for each to return to `waiting`.

@@ -58,7 +58,7 @@ Write exactly **one** supervisor session log at:
 
 `<YYYY-MM-DD>`: today's UTC date. `<HHMM>`: the `/log` command's start time, UTC, no separator (`1530`, not `15:30`). On filename collision, append `-2`, `-3`, … until free.
 
-Use `/workspace/.claude/logbook_supervisor_template.md` as the structure. Fill every section. Cover:
+Use `/opt/claude-templates/logbook_supervisor_template.md` as the structure. Fill every section. Cover:
 
 - **Approach** — why this session's decomposition; alternatives rejected; mid-flight iterations. Detailed, not terse — the next supervisor session reads this.
 - **Per-worker blocks** — one per worker touched this session (spawned fresh OR respawned from `down` OR iterated via message). For each:
@@ -87,7 +87,7 @@ For each group, write:
 
 `<topic-slug>`: kebab-case, 2–4 words, captures the topic. Collision handling: append `-2`, `-3`, …
 
-Use `/workspace/.claude/logbook_pi_template.md`. Each file's header must include:
+Use `/opt/claude-templates/logbook_pi_template.md`. Each file's header must include:
 
 ```
 **Date:** <YYYY-MM-DD>

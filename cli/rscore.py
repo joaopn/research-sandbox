@@ -1889,7 +1889,6 @@ class StartStopRequest:
 class UpdateRequest:
     name: str
     rebuild: bool = False
-    keep_claude: bool = False
     enable: tuple[str, ...] = ()
     disable: tuple[str, ...] = ()
     role_mcp_upstream: tuple[str, ...] = ()
@@ -2039,7 +2038,6 @@ class UpdateRequest:
         return cls(
             name=_require_name(kw.get("name")),
             rebuild=bool(kw.get("rebuild", False)),
-            keep_claude=bool(kw.get("keep_claude", False)),
             enable=_as_tuple(kw.get("enable")),
             disable=_as_tuple(kw.get("disable")),
             role_mcp_upstream=_as_tuple(kw.get("role_mcp_upstream")),
@@ -2126,7 +2124,6 @@ class ActionResult:
 class UpdateResult:
     project: str
     rebuilt: bool
-    refreshed_claude: bool
     workers_enabled: list[str] = field(default_factory=list)
     workers_disabled: list[str] = field(default_factory=list)
     # Container types whose STORED effort a model change invalidated and which
@@ -4567,7 +4564,10 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
               "dev": bool(req.dev_lane),
               # A new project never had RS's old /workspace/CLAUDE.md (the
               # leftover check above refused one), so the check never runs.
-              OLD_INSTRUCTIONS_FLAG: True}
+              OLD_INSTRUCTIONS_FLAG: True,
+              # Nor any other file RS used to write into its folders (refused
+              # the same way): its folders are never checked for them.
+              OLD_FILES_FLAG: True}
     if project_type == PROJECT_TYPE_SANDBOX_DIND:
         # The project container's own ~/.local gets EXACTLY the recorded agents
         # (_dind_agent_sets); a marker without this key is from before that and
@@ -5554,7 +5554,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
                                      list(_read_marker_agents(workspace_path)) + agents_added)
             progress.step("saved", "saved; applied at the project's next start")
             print(f"{project!r} is stopped: the change is saved and applied at its next start.")
-            return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
+            return UpdateResult(project=project, rebuilt=False,
                                 effort_dropped=(["supervisor"] if plan.effort_dropped else [])
                                 + dropped,
                                 agents_added=agents_added)
@@ -5681,7 +5681,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
             progress.step("agents", "applied to the project's agents")
             print(f"agent settings of {project!r} updated; each agent's next session uses them.")
             _raise_old_instructions(found)
-            return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
+            return UpdateResult(project=project, rebuilt=False,
                                 effort_dropped=effort_dropped)
     # `live_ok` must exclude any model OR agent change: `--worker-model haiku
     # --enable code-server` would otherwise take the live-editor fast path, which
@@ -5753,7 +5753,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         if not_refreshed:
             print(f"warning: not refreshed: {', '.join(not_refreshed)}", file=sys.stderr)
         _raise_old_instructions(found)
-        return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
+        return UpdateResult(project=project, rebuilt=False,
                             effort_dropped=effort_dropped, agents_added=agents_added,
                             boxes_refreshed=refreshed, boxes_not_refreshed=not_refreshed)
     # Granular model application — the point of writing the marker above. Only a
@@ -5779,14 +5779,12 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
                   "(no container touched).")
             _raise_old_instructions(found)
             return UpdateResult(project=project, rebuilt=False,
-                                refreshed_claude=False,
                                 effort_dropped=effort_dropped)
         if changed == {"role"}:
             progress.step("models", "applying the role model")
             _restart_role_mcps_for_models(project, cfg, workspace_path)
             _raise_old_instructions(found)
             return UpdateResult(project=project, rebuilt=False,
-                                refreshed_claude=False,
                                 effort_dropped=effort_dropped)
         # A `role` change alongside a `supervisor` change still needs the
         # recreate, which relaunches the role containers from the marker — so it
@@ -5837,15 +5835,6 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     if touched:
         _clear_service_override(workspace_path, touched)
 
-    # A sandbox-dind project has no staged templates under /workspace/.claude/
-    # (its entrypoint creates only the empty skills home there) — skip the refresh.
-    refreshed = False
-    if not req.keep_claude and _container_project_type(container) != PROJECT_TYPE_SANDBOX_DIND:
-        progress.step("refresh", "refreshing workspace templates")
-        print("refreshing /workspace/.claude/ from templates...")
-        _refresh_workspace_claude_templates(container)
-        refreshed = True
-
     # worker enables (idempotent on re-run). Fail-explicit.
     if enable_workers:
         progress.step("enable", "applying enables")
@@ -5857,7 +5846,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     # After the last step, so everything above still ran.
     _raise_old_instructions(found)
     return UpdateResult(
-        project=project, rebuilt=req.rebuild, refreshed_claude=refreshed,
+        project=project, rebuilt=req.rebuild,
         workers_enabled=workers_enabled, workers_disabled=workers_disabled,
         effort_dropped=effort_dropped, agents_added=agents_added)
 
@@ -6598,10 +6587,12 @@ def _refuse_leftover_settings(project: str, workspace_path: "Path", *,
             f"left its settings folder unusable (a link, not a folder, or not "
             f"readable); destroy that project first")
     # RS's old instructions file in the leftover belongs to the earlier
-    # project: the new one never inherits it (lstat: a dangling link counts).
+    # project: the new one never inherits it (lstat: a dangling link counts);
+    # so does every other file RS used to write into a project's folders.
     try:
         os.lstat(workspace_path / "CLAUDE.md")
     except FileNotFoundError:
+        _refuse_leftover_old_files(project, workspace_path)
         return
     except PermissionError:
         if unopenable_ok:
@@ -6617,6 +6608,18 @@ def _refuse_leftover_settings(project: str, workspace_path: "Path", *,
         f"cannot create project {project!r}: an earlier project named {project!r} "
         f"left its folder here, and it holds `/workspace/CLAUDE.md`; destroy that "
         f"project first")
+
+
+def _refuse_leftover_old_files(project: str, workspace_path: "Path") -> None:
+    """create's refusal of a leftover workspace holding any file RS used to
+    write into a project's folders (every kind's paths: the earlier project's
+    kind is not known) — they belong to that project."""
+    old = _project_old_files(workspace_path, research=True)
+    if old:
+        raise ValidationError(
+            f"cannot create project {project!r}: an earlier project named "
+            f"{project!r} left its folder here, and it holds files RS used to "
+            f"write there ({_shown_old_paths('', old)}); destroy that project first")
 
 
 def _settings_folder_refusal(workspace_path: "Path") -> str:
@@ -11221,6 +11224,17 @@ def _recreate_supervisor(
         # Re-stage the box-preset catalog (best-effort) so a directly-invoked
         # rs-sandbox resolves presets after a recreate (STAGE_BOX_EXT_UX).
         _stage_box_catalog(workspace_path, strict=False)
+        # An image whose own boot still writes into the project's .claude/ or
+        # .pi/ would put RS's files back after every removal: the start fails
+        # at its end with the Rebuild all remedy. On a current image, the
+        # project's own folders are checked for the files RS used to write
+        # there, and the project agent's skills go into its home.
+        image_items = _project_image_check(project, container)
+        found += image_items
+        if not image_items:
+            found += _project_files_check(project, workspace_path, research=False,
+                                          progress=progress)
+            found += _box_tool_home_skills(project, container, progress=progress)
     else:
         stage_worker_image(container, ANALYSIS_IMAGE, force=force_restage)
         # Re-stage the agent dist into the fresh container (its own ~/.local + the
@@ -11232,14 +11246,28 @@ def _recreate_supervisor(
         # The research boot wrote RS's instructions itself unless RS's old
         # link stands (or the image is from before the layout): say so at the
         # end of the operation.
-        found += _research_instructions_check(project, container)
-        # A research project's boxes take their RS text from the staged box
-        # catalog at every re-run below: refresh it from this RS release first
-        # (only when the project has boxes; a box-less research project is left
-        # exactly as it was).
-        if any(isinstance(e, dict) and e.get("kind") == extension.SANDBOX_KIND
-               for e in extension.load(workspace_path).values()):
+        research_items = _research_instructions_check(project, container)
+        found += research_items
+        # The box tool and the box catalog, at every start (a removed
+        # OpenKnowledge box's recorded feed still reaches the project agent's
+        # home, and the boxes below take their RS text from the catalog). New
+        # with RS keeping its files in the homes, so it warns, never fails the
+        # start in the middle of a re-creation.
+        try:
+            _stage_rs_sandbox(container)
             _stage_box_catalog(workspace_path, strict=False)
+            staged_tool = True
+        except SystemExit:
+            _report_warnings([_RESEARCH_STAGING_FAILED], progress)
+            staged_tool = False
+        # On a current image (the old one's boot puts the files back), the
+        # project's own folders are checked for the files RS used to write
+        # there, and the project agent's skills go into its home.
+        if not any(f.kind in ("image", "labels") for f in research_items):
+            found += _project_files_check(project, workspace_path, research=True,
+                                          progress=progress)
+            if staged_tool:
+                found += _box_tool_home_skills(project, container, progress=progress)
         # Editor dist re-staged the same way (STAGE_EDITOR_DIST) so a recreated
         # supervisor's interactive PI/extension containers find a populated mount.
         # deploy_local re-deploys the supervisor's OWN editor (no bake now), gated
@@ -11596,7 +11624,7 @@ def _update_docker_substrate(req: "UpdateRequest", cfg: "Config",  # type: ignor
                 claude_in_settings=plan.claude_live, progress=progress)
         if plan_only:
             progress.step("agents", "applied to the project's agents")
-            return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
+            return UpdateResult(project=project, rebuilt=False,
                                 effort_dropped=["supervisor"] if plan.effort_dropped else [])
     # After the last refusal; the recreate below reconciles from the clean file.
     _drop_reserved_port_entries(project, cfg, progress)
@@ -11608,7 +11636,7 @@ def _update_docker_substrate(req: "UpdateRequest", cfg: "Config",  # type: ignor
     _recreate_docker_substrate(project, cfg, service_flags=flags,
                                progress=progress, found=found)
     _raise_old_instructions(found)
-    return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
+    return UpdateResult(project=project, rebuilt=False,
                         workers_enabled=[], workers_disabled=[])
 
 
@@ -11778,7 +11806,7 @@ def _live_toggle_editor(project: str, cfg: "Config", container: str,  # type: ig
              "pkill -f code-server-stub.py; pkill -x code-server || true"],
             capture_output=True)
     _write_service_override(workspace_path, "code-server", enable)
-    return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
+    return UpdateResult(project=project, rebuilt=False,
                         workers_enabled=[], workers_disabled=[])
 
 
@@ -11811,27 +11839,8 @@ def _live_toggle_reader(project: str, cfg: "Config", container: str,  # type: ig
              "pkill -f reader-server.py || true"],
             capture_output=True)
     _write_service_override(workspace_path, "reader", enable)
-    return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
+    return UpdateResult(project=project, rebuilt=False,
                         workers_enabled=[], workers_disabled=[])
-
-
-def _refresh_workspace_claude_templates(container: str) -> None:
-    """Overwrite /workspace/.claude/{logbook_*_template.md, commands/} from
-    /opt/claude-templates/. The entrypoint's first-boot `if-not-present`
-    guard means existing projects never see template edits otherwise — this
-    closes that loop. Slash-commands dir is rebuilt from scratch (so removed
-    slash commands actually disappear), not merged. RS's research
-    instructions are NOT copied here any more: the boot script writes them
-    into the agent's home at every start (the recreate before this did), and
-    /workspace/.claude/CLAUDE.md is the user's own file."""
-    run_check(["docker", "exec", container, "sh", "-eu", "-c", r"""
-        cp -f /opt/claude-templates/logbook_supervisor_template.md \
-              /workspace/.claude/logbook_supervisor_template.md
-        cp -f /opt/claude-templates/logbook_pi_template.md \
-              /workspace/.claude/logbook_pi_template.md
-        rm -rf /workspace/.claude/commands
-        cp -a /opt/claude-templates/commands /workspace/.claude/commands
-    """])
 
 
 # ---------------------------------------------------------------------------
@@ -14854,6 +14863,151 @@ def _write_project_instructions(project: str, container: str, workspace_path: "P
     return []
 
 
+def _old_path_present(root: "Path", rel: str) -> bool:
+    """Whether `rel` is there below `root`, walked without following anything
+    (the folders are the project's own): absent → False; a link at any
+    component → True (a link counts as present, whatever it points to); the
+    final component in any form → True; a component that is not a folder →
+    False (nothing can be below it); any other error → True (never read as
+    "absent"). The box tool walks a box's folder the same way."""
+    parts = rel.split("/")
+    try:
+        fd = os.open(root, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        for i, part in enumerate(parts):
+            try:
+                st = os.stat(part, dir_fd=fd, follow_symlinks=False)
+            except (FileNotFoundError, NotADirectoryError):
+                return False
+            except OSError:
+                return True
+            if stat.S_ISLNK(st.st_mode) or i == len(parts) - 1:
+                return True
+            if not stat.S_ISDIR(st.st_mode):
+                return False
+            try:
+                nfd = os.open(part, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError:
+                return True
+            os.close(fd)
+            fd = nfd
+        return False
+    finally:
+        os.close(fd)
+
+
+def _listed_names(root: "Path", rel: str) -> "list[tuple[str, bool]]":
+    """[(name, is a real folder)] in root/rel, opened without following a
+    link (a link at rel lists nothing: its paths are reported by the fixed
+    probes); names that are not plain file names are skipped."""
+    out: list[tuple[str, bool]] = []
+    try:
+        fd = os.open(root, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return out
+    try:
+        try:
+            dfd = os.open(rel, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        except OSError:
+            return out
+        try:
+            for name in sorted(os.listdir(dfd)):
+                if not _OLD_NAME_RE.match(name) or name in (".", ".."):
+                    continue
+                try:
+                    st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                except OSError:
+                    continue
+                out.append((name, stat.S_ISDIR(st.st_mode)))
+        finally:
+            os.close(dfd)
+    finally:
+        os.close(fd)
+    return out
+
+
+def _project_old_files(workspace_path: "Path", *, research: bool) -> list[str]:
+    """The paths RS used to write into a project's own folders that are still
+    there: the project agent's /ok copies, and for a research project its
+    settings, /log command, logbook templates, the retired PI containers'
+    credential stash and the upgrade tool's copies. Host-side, never
+    following a link."""
+    rels = PROJECT_OLD_PATHS + (RESEARCH_OLD_PATHS if research else ())
+    found = [r for r in rels if _old_path_present(workspace_path, r)]
+    if research:
+        for role, is_dir in _listed_names(workspace_path, ".pi"):
+            if is_dir:
+                found += [f".pi/{role}/.creds/{f}" for f in RESEARCH_OLD_CREDS
+                          if _old_path_present(workspace_path, f".pi/{role}/.creds/{f}")]
+        found += [f".claude/{n}" for n, _d in _listed_names(workspace_path, ".claude")
+                  if n.endswith(OLD_UPGRADE_SUFFIX)]
+    return found
+
+
+def _project_files_check(project: str, workspace_path: "Path", *, research: bool,
+                         progress=None) -> "list[OldInstructions]":
+    """Check a sandbox-dind or research project's own folders for the files RS
+    used to write there, until the record's flag says none was left. Found →
+    RETURNED (the verb raises once at its end; RS writes no new copy, the box
+    tool reads the flag before writing the project agent's home skills); none
+    → the flag is set. An unreadable record checks nothing (a warning)."""
+    state, data = _read_marker_three_way(workspace_path)
+    if state != "ok":
+        _report_warnings([_FILES_UNKNOWN], progress)
+        return []
+    if data.get(OLD_FILES_FLAG) is True:
+        return []
+    found = _project_old_files(workspace_path, research=research)
+    if found:
+        return [OldInstructions("files", project, paths=tuple(found))]
+
+    def mutate(d: dict) -> None:
+        d[OLD_FILES_FLAG] = True
+    try:
+        _marker_rmw(workspace_path, mutate, "record the project's folders as checked")
+    except _MARKER_WRITE_ERRORS:
+        _report_warnings([_FILES_FLAG_FAILED], progress)
+    return []
+
+
+def _box_tool_home_skills(project: str, container: str, args: "Sequence[str]" = (),
+                          progress=None) -> "list[OldInstructions]":
+    """Run `rs-sandbox home-skills` in the project: RS's skills into the
+    project agent's home (and with --boxes / --box, into the boxes' homes).
+    Its warnings become warning steps; a box's old files come back as items
+    the verb raises at its end. An older box tool, or one that cannot run, is
+    a warning: never this operation's failure."""
+    try:
+        r = run(["docker", "exec", container, "rs-sandbox", "home-skills", *args],
+                capture_output=True)
+    except (OSError, UnicodeDecodeError):
+        _report_warnings([_FILES_SKILLS_FAILED], progress)
+        return []
+    if _is_old_box_tool(r):
+        _report_warnings([_OLD_BOX_TOOL_FILES_MSG], progress)
+        return []
+    if r.returncode != 0:
+        _report_warnings([_FILES_SKILLS_FAILED], progress)
+        return []
+    raw = _parse_box_tool_json(r.stdout).get("warnings")
+    found: list[OldInstructions] = []
+    lines: list[str] = []
+    for w in raw if isinstance(raw, list) else []:
+        if not isinstance(w, dict):
+            continue
+        if w.get("kind") == "old-files":
+            found.append(OldInstructions("box-files", project, str(w.get("box") or ""),
+                                         paths=_box_old_paths_of(w)))
+            continue
+        lines += _box_folder_warnings([w], w.get("box"))
+    _report_warnings(lines, progress)
+    return found
+
+
 def _agent_settings_block(data: dict) -> "dict | None":
     blk = data.get("agent_settings")
     return blk if isinstance(blk, dict) else None
@@ -15514,7 +15668,7 @@ def project_add_agents(project: str, agents: "Sequence[str]",
                 "/home/research", True):
             progress.step("agents", "the project's editor extension could not be installed")
         _raise_old_instructions(found)
-        return UpdateResult(project=project, rebuilt=False, refreshed_claude=False)
+        return UpdateResult(project=project, rebuilt=False)
     is_research = _container_project_type(container) != PROJECT_TYPE_SANDBOX_DIND
     # Membership is against the MARKER (research: claude by construction), not
     # the floored stage set — else `--agent claude` on an agent-less sandbox-dind

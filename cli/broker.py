@@ -799,7 +799,7 @@ CREATE_WEBUI_FIELDS = frozenset({
     "history",
 })
 
-# The webui-settable subset of UpdateRequest fields. `rebuild`/`keep_claude` are
+# The webui-settable subset of UpdateRequest fields. `rebuild` is
 # dropped on purpose: a webui update is the fast file-only recreate, and an
 # image rebuild (`rebuild=True`) would block the serially-handled daemon for the
 # whole multi-minute build — a self-inflicted DoS from the browser. Rebuilds
