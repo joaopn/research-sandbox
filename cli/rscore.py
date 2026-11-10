@@ -6658,9 +6658,19 @@ def _refuse_leftover_settings(project: str, workspace_path: "Path", *,
 
 def _refuse_leftover_old_files(project: str, workspace_path: "Path") -> None:
     """create's refusal of a leftover workspace holding any file RS used to
-    write into a project's folders (every kind's paths: the earlier project's
-    kind is not known) — they belong to that project."""
-    old = _project_old_files(workspace_path, research=True)
+    write into the earlier project's folders — they belong to that project.
+    The paths are the earlier project's kind's, read from its own record
+    (through the no-follow reader): none for a Docker-substrate project, the
+    project agent's for a sandbox-dind one (dev included), research's for a
+    research one. A record that cannot be read checks every kind's paths."""
+    state, data = _read_marker_three_way(workspace_path)
+    if state == "ok" and isinstance(data.get("type"), str):
+        if data.get("substrate") == Substrate.DOCKER.value:
+            return
+        old = _project_old_files(workspace_path,
+                                 research=data.get("type") == PROJECT_TYPE_RESEARCH)
+    else:
+        old = _project_old_files(workspace_path, research=True)
     if old:
         raise ValidationError(
             f"cannot create project {project!r}: an earlier project named "
