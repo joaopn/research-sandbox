@@ -383,8 +383,34 @@ _BOX_INSTR_REASONS = {
                          "its folder is checked for RS's old instructions file again "
                          "at the next start",
 }
+_BOX_FILES_FLAG_LINE = ("holds none of the files RS used to write into its folder, "
+                        "but its record could not note it; its folder is checked "
+                        "again at the next start")
 _BOX_INSTR_REASON_DEFAULT = ("started without RS's instructions; the next start "
                              "writes them again")
+
+
+def _box_old_paths_of(w: dict) -> "tuple[str, ...]":
+    """The old paths an old-files report names, re-validated (the report is
+    project-controlled)."""
+    raw = w.get("paths")
+    return tuple(p for p in raw if _known_old_rel(p, True)) if isinstance(raw, list) else ()
+
+
+def _box_old_items(project: str, box: Any, raw: Any) -> "list[OldInstructions]":
+    """The box tool's reply → the old-file items that fail the operation about
+    the box: RS's old instructions file, and the other files RS used to write
+    into its folder (the paths it found)."""
+    out: list[OldInstructions] = []
+    if _box_old_instructions(raw):
+        out.append(OldInstructions("box", project, box if isinstance(box, str) else ""))
+    for w in raw if isinstance(raw, list) else []:
+        if isinstance(w, dict) and w.get("kind") == "old-files":
+            out.append(OldInstructions("box-files", project,
+                                       box if isinstance(box, str) else "",
+                                       paths=_box_old_paths_of(w)))
+            break
+    return out
 
 
 def _box_old_instructions(raw: Any) -> bool:
@@ -423,6 +449,11 @@ def _box_folder_warnings(raw: Any, box: Any) -> list[str]:
             why = (_BOX_INSTR_REASONS.get(reason) if isinstance(reason, str)
                    else None) or _BOX_INSTR_REASON_DEFAULT
             out.append(f"{who} {why}")
+            continue
+        if w.get("kind") == "old-files":
+            continue                    # its own channel: _box_old_items
+        if w.get("kind") == "files":
+            out.append(f"{who} {_BOX_FILES_FLAG_LINE}")
             continue
         if w.get("kind") == "history":
             out.append(f"{who} started without its Gitea history: "
@@ -568,6 +599,12 @@ _OLD_BOX_TOOL_HARNESS_MSG = ("this project's box tool predates the working mode 
                              "restart the project, then retry")
 _OLD_BOX_TOOL_SETTINGS_MSG = ("this project's box tool predates changing a box's agent "
                               "settings — restart the project, then retry")
+# A box tool from before RS kept its files in the agents' homes would write
+# them into the box's folder again: box add refuses it, and the skills call of
+# an Update reports it.
+_OLD_BOX_TOOL_FILES_MSG = ("this project's box tool predates RS keeping its files "
+                           "in the agents' home folders — restart the project, "
+                           "then retry")
 _OLD_BOX_TOOL_TRUSTED_MSG = ("this project's box tool predates trusted browsers — "
                              "restart the project, then retry")
 # The browser image, not the tool: a project's box images move to the host's
@@ -614,7 +651,7 @@ def _is_old_box_tool(r: "subprocess.CompletedProcess") -> bool:
                                     *(f"--{f.replace('_', '-')}" for f in HARNESS_FIELDS))))
         or ("invalid choice" in err
             and any(c in err for c in ("'folders'", "'history-heal'", "'settings'",
-                                       "'agents'"))))
+                                       "'agents'", "'home-skills'"))))
 
 
 def valid_project_name(name: str) -> bool:
@@ -5743,6 +5780,15 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
             progress.step("agents", "the project's editor extension could not be installed")
         refreshed, not_refreshed = _refresh_running_boxes(
             container, staged, progress, force_ext=update_form)
+        # RS's skills into the agents' homes after the agent copy (an agent
+        # just added gets them, in the project agent and every box), once the
+        # project's own folders were checked for the files RS used to write
+        # there.
+        found += _project_files_check(
+            project, workspace_path,
+            research=_container_project_type(container) != PROJECT_TYPE_SANDBOX_DIND,
+            progress=progress)
+        found += _box_tool_home_skills(project, container, ["--boxes"], progress)
         if agents_added:
             print(f"added {', '.join(agents_added)} to {project!r}: the supervisor tab can "
                   f"run it now; {len(refreshed)} running box(es) got it too; a stopped box "
@@ -11369,8 +11415,9 @@ def _recreate_supervisor(
             print(f"warning: failed to restart sandbox box {name!r}: "
                   f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
             continue
-        if _report_box_restart_warnings(name, r.stdout, progress):
-            found.append(OldInstructions("box", project, name))
+        _report_box_restart_warnings(name, r.stdout, progress)
+        found += _box_old_items(project, name,
+                                _parse_box_tool_json(r.stdout).get("warnings"))
     return found
 
 
@@ -13355,12 +13402,19 @@ def _restart_dev_boxes(project: str, cfg: "Config", gitea_ip: str,
         else:
             print(f"dev/fetch box {name!r} re-run against the new gitea address")
             # A fetch box may carry read-only folders: report any it lacks.
-            if _report_box_restart_warnings(name, r.stdout, progress):
-                # A side effect of a shared dev-lane operation: the box's old
-                # instructions file is a WARNING here, never this operation's
-                # failure; the project's next start fails with the error.
-                _report_warnings([OLD_INSTRUCTIONS_BOX_SIDE_WARNING.format(
-                    box=_shown_box(name), project=project)], progress)
+            _report_box_restart_warnings(name, r.stdout, progress)
+            # A side effect of a shared dev-lane operation: RS's old files in
+            # the box's folder are a WARNING here, never this operation's
+            # failure; the project's next start fails with the error.
+            for item in _box_old_items(project, name,
+                                       _parse_box_tool_json(r.stdout).get("warnings")):
+                if item.kind == "box":
+                    _report_warnings([OLD_INSTRUCTIONS_BOX_SIDE_WARNING.format(
+                        box=_shown_box(name), project=project)], progress)
+                else:
+                    _report_warnings([OLD_FILES_BOX_SIDE_WARNING.format(
+                        box=_shown_box(name), project=project,
+                        paths=_shown_old_paths(name, item.paths))], progress)
 
 
 def _resolve_dev_branch(repo: str, branch: str) -> str:
@@ -15700,8 +15754,14 @@ def project_add_agents(project: str, agents: "Sequence[str]",
             "/home/research", True):
         progress.step("agents", "the project's editor extension could not be installed")
     refreshed, not_refreshed = _refresh_running_boxes(container, staged, progress, force_ext=True)
+    # RS's skills into the agents' homes after the agent copy (pi just added
+    # gets them, in the project agent and every box), once the project's own
+    # folders were checked for the files RS used to write there.
+    found += _project_files_check(project, workspace_path, research=is_research,
+                                  progress=progress)
+    found += _box_tool_home_skills(project, container, ["--boxes"], progress)
     _raise_old_instructions(found)
-    return UpdateResult(project=project, rebuilt=False, refreshed_claude=False,
+    return UpdateResult(project=project, rebuilt=False,
                         boxes_refreshed=refreshed, boxes_not_refreshed=not_refreshed)
 
 
@@ -18703,6 +18763,16 @@ def _require_share_aware_box_tool(container: str, help_out=None) -> None:
         raise ValidationError(_OLD_BOX_TOOL_SHARE_MSG)
 
 
+def _require_home_skills_box_tool(container: str) -> None:
+    """Refuse an add when the project's box tool predates RS keeping its files
+    in the agents' homes (a project not restarted since): its answer to the
+    home-skills command is the older parser's refusal."""
+    r = run(["docker", "exec", container, "rs-sandbox", "home-skills", "--help"],
+            capture_output=True)
+    if _is_old_box_tool(r):
+        raise ValidationError(_OLD_BOX_TOOL_FILES_MSG)
+
+
 def _require_harness_aware_box_tool(container: str) -> None:
     """Refuse, before any Gitea work, when the project's box tool predates the
     working-mode flags (a project not restarted since RS gained them): the add
@@ -18833,6 +18903,12 @@ BOX_LEFTOVER_INSTRUCTIONS_ERROR = (
     "project's terminal or editor, then add the box again.")
 
 
+BOX_LEFTOVER_FILES_ERROR = (
+    "the folder kept from an earlier box named {box} holds files RS used to write "
+    "there: {paths}. Remove or rename them from the project's terminal or editor, "
+    "then add the box again.")
+
+
 def _box_leftover_instructions(workspace_path: "Path", name: str) -> "bool | None":
     """Whether the box's kept folder holds a CLAUDE.md (a file or a link, a
     dangling one included): True / False, or None when it cannot be told.
@@ -18869,6 +18945,14 @@ def _refuse_box_leftover_instructions(workspace_path: "Path", name: str) -> None
     when that cannot be told (never read as "absent")."""
     found = _box_leftover_instructions(workspace_path, name)
     if found is False:
+        # Every other file RS used to write into a box's folder (every kind's
+        # paths: the earlier box's type is not known), walked from the
+        # project's folder without following a link.
+        old = [r for r in BOX_OLD_PATHS + OK_BOX_OLD_PATHS
+               if _old_path_present(workspace_path, f"boxes/{name}/{r}")]
+        if old:
+            raise ValidationError(BOX_LEFTOVER_FILES_ERROR.format(
+                box=name, paths=_shown_old_paths(name, old)))
         return
     if found:
         raise ValidationError(BOX_LEFTOVER_INSTRUCTIONS_ERROR.format(box=name))
@@ -19126,6 +19210,11 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     progress.step("harness", "ensuring the box harness")
     _ensure_box_harness(container, project_network_for(req.project),
                         workspace_path, want_browser)
+    # A box tool from before RS kept its files in the agents' homes would write
+    # them into the new box's folder (and set no record), so the project's next
+    # start would report files RS had just written: refuse it, before any Gitea
+    # work below. A tool that cannot be asked is not judged here.
+    _require_home_skills_box_tool(container)
     # The image is in the project now. An image the project already held is
     # the one its last start brought, which may predate trusted browsers on a
     # project not restarted since: ask again, before the history provisioning,
@@ -19352,6 +19441,9 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         info.get("name"))
     for line in folder_warnings:
         progress.step("warning", line)
+    # The box's folder holding RS's old files (only a history box is checked
+    # at its first run): the add fails at its end, the box kept for Remove.
+    create_old = _box_old_items(req.project, info.get("name"), raw_warnings)
     # The box type's own web app: register its tab now, from the publish port
     # the box tool allocated before the box's first run. The label and app
     # port come from this host's catalog copy, never from the tool's output.
@@ -19425,6 +19517,14 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
                   f"{BOX_SETUP_READY_TIMEOUT_S}s — it may still be installing, "
                   f"or it may be failing (a failed setup restarts the box and "
                   f"retries); check the box's tab before starting the agent")
+    # A box keeping history: its notes came from a clone, so its folder is
+    # checked for RS's old files once its setup has finished (its record's
+    # flag set then); one found fails the add, the box kept for Remove.
+    if history_args and not boot_timed_out:
+        files_found = _box_tool_home_skills(req.project, container,
+                                            ["--box", info["name"]], progress)
+        if files_found:
+            _raise_old_instructions(files_found)
     # The box's own history outcome: a fixed code it wrote, mapped to fixed
     # text here (the box's text never reaches the browser).
     if history_args:
@@ -19433,6 +19533,7 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     if history_line:
         progress.step("note" if history_line.startswith("History: on") else "warning",
                       history_line)
+    _raise_old_instructions(create_old)
     progress.step("ready", "box ready")
     return BoxAddResult(project=req.project, name=info["name"], ip=info["ip"],
                         preset=info.get("preset", req.preset),
@@ -19667,13 +19768,13 @@ def box_folders(req: "BoxFoldersRequest", _progress=None) -> BoxFoldersResult:  
     # Tolerant: the box has already been re-run when this is read.
     info = _parse_box_tool_json(r.stdout)
     warnings = _box_folder_warnings(info.get("warnings"), req.name)
-    if _box_old_instructions(info.get("warnings")):
-        # The folders changed and the box runs; RS's old instructions file in
-        # its folder kept the new ones from being written: say so as the
-        # operation's failure.
-        # The other lines of this re-run ride in the error text: this inline
-        # verb's reply carries only the error, never its stderr.
-        raise ValidationError("\n".join([OldInstructions("box", req.project, req.name).text(), *warnings]))
+    old_items = _box_old_items(req.project, req.name, info.get("warnings"))
+    if old_items:
+        # The folders changed and the box runs; RS's old files in its folder
+        # kept the new ones from being written: say so as the operation's
+        # failure. The other lines of this re-run ride in the error text: this
+        # inline verb's reply carries only the error, never its stderr.
+        raise ValidationError("\n".join([*(f.text() for f in old_items), *warnings]))
     return BoxFoldersResult(
         project=req.project, name=req.name, folders=list(req.folders),
         changed=info.get("changed") is not False,
@@ -19783,10 +19884,11 @@ def box_settings(req: "BoxSettingsRequest", _progress=None) -> BoxSettingsResult
                             f"it is written at its next start")
         elif isinstance(w, dict):
             warnings += _box_folder_warnings([w], req.name)
-    if _box_old_instructions(info.get("warnings")):
+    old_items = _box_old_items(req.project, req.name, info.get("warnings"))
+    if old_items:
         # The other lines of this re-run ride in the error text: this inline
         # verb's reply carries only the error, never its stderr.
-        raise ValidationError("\n".join([OldInstructions("box", req.project, req.name).text(), *warnings]))
+        raise ValidationError("\n".join([*(f.text() for f in old_items), *warnings]))
     return BoxSettingsResult(project=req.project, name=req.name,
                              changed=info.get("changed") is not False,
                              restarted=info.get("restarted") is True,
@@ -20188,12 +20290,13 @@ def port_add(req: "PortAddRequest", _progress=None) -> PortAddResult:  # type: i
         _write_exported_ports(ws, ports)
         # The expose re-ran the box: report the folders it started without.
         warnings = swept + _box_folder_warnings(info.get("warnings"), req.box)
-        if _box_old_instructions(info.get("warnings")):
-            # The port is registered and the box runs; the old instructions
-            # file is the operation's failure (after the registry write).
-            # The other lines of this re-run ride in the error text: this inline
-            # verb's reply carries only the error, never its stderr.
-            raise ValidationError("\n".join([OldInstructions("box", req.project, req.box).text(), *warnings]))
+        old_items = _box_old_items(req.project, req.box, info.get("warnings"))
+        if old_items:
+            # The port is registered and the box runs; RS's old files are the
+            # operation's failure (after the registry write). The other lines
+            # of this re-run ride in the error text: this inline verb's reply
+            # carries only the error, never its stderr.
+            raise ValidationError("\n".join([*(f.text() for f in old_items), *warnings]))
         return PortAddResult(project=req.project, port=pub, label=req.label,
                              ports=ports, warnings=warnings)
     if req.passthrough:
@@ -20297,19 +20400,19 @@ def port_remove(req: "PortRemoveRequest", _progress=None) -> PortRemoveResult:  
         # the registry write below.
         raw = _parse_box_tool_json(r.stdout).get("warnings")
         warnings = _box_folder_warnings(raw, gone["box"])
-        old_box = gone["box"] if _box_old_instructions(raw) else ""
+        old_items = _box_old_items(req.project, gone["box"], raw)
     else:
-        old_box = ""
+        old_items = []
     warnings = swept + warnings
     ports = [e for e in existing if not _match(e)]
     _write_exported_ports(ws, ports)
     # Reap the top-level forwarder for a supervisor/docker entry (a box entry's
     # forwarder died with the box's rm+run in unexpose — the reconcile skips it).
     _reconcile_loopback_bridges(req.project, cfg)
-    if old_box:
+    if old_items:
         # The other lines of this re-run ride in the error text: this inline
         # verb's reply carries only the error, never its stderr.
-        raise ValidationError("\n".join([OldInstructions("box", req.project, old_box).text(), *warnings]))
+        raise ValidationError("\n".join([*(f.text() for f in old_items), *warnings]))
     return PortRemoveResult(project=req.project, port=req.port, ports=ports,
                             warnings=warnings)
 

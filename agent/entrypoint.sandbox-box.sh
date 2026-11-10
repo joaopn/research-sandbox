@@ -5,10 +5,13 @@
 # An isolated box for running un-vetted code / scoped agent work. Deliberately
 # clean: NO artifact-contract (no published/ or internal/ dirs, no manifest verb,
 # no Stop-hook gate), NO credentials. The PI drives the box from the webui tab /
-# `project attach`. Instructions (CLAUDE.md) + the proxy MCP source (.mcp-proxy.json)
-# are pre-staged into /workspace by the host's `rs-sandbox create` BEFORE boot;
-# this entrypoint deploys the agent/editor, optionally clones a BYO repo, and
-# regenerates /workspace/.mcp.json from the MCP sources (+ pi's link to it).
+# `project attach`. The proxy MCP source (.mcp-proxy.json) is pre-staged into
+# /workspace and the box's skills into the read-only /opt/rs-box-skills by the
+# project's `rs-sandbox` BEFORE boot (RS's instructions go into the home once
+# the box runs); this entrypoint deploys the agent/editor, copies the skills into
+# the agents' homes, optionally clones a BYO repo, and regenerates
+# /workspace/.mcp.json from the MCP sources (+ pi's home MCP settings). RS
+# writes nothing into /workspace/.claude/ or /workspace/.pi/: they are the user's.
 #
 # Environment:
 #   RS_SANDBOX_NAME      — box name (e.g. box-1); used for the role marker + logs.
@@ -57,9 +60,9 @@ if ! grep -q '\.local/bin' ~/.bashrc 2>/dev/null; then
 fi
 # pi is never baked: it arrives with the dist above, or not at all. Whether its
 # launcher landed decides every piece of pi wiring the MCP render below adds
-# (the .pi/mcp.json link, the `exposure` key, the trust record) — a box without
-# pi gets none of it, and no .pi/ folder. The agent dir is pi's own env, else
-# the launcher's default.
+# (pi's home MCP settings, the `exposure` key, the trust record) and whether
+# pi's home gets the box's skills — a box without pi gets none of it. The agent
+# dir is pi's own env, else the launcher's default.
 RS_PI_AGENT_DIR=""
 if [[ -x ~/.local/bin/pi ]]; then
     RS_PI_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.local/share/pi-agent/agent}"
@@ -101,6 +104,36 @@ fi
 
 # Role marker for the byobu status-bar plugin (~/.byobu/bin/60_rolename).
 echo "${RS_SANDBOX_NAME}" > ~/.rs-role
+
+# --- RS's skills for this box's agents → their HOME skills folders. Staged by
+#     the project's rs-sandbox at /opt/rs-box-skills/<agent>/<skill>/SKILL.md
+#     (read-only); copied here after ~/.rs-role, so the agent copy above is done
+#     and a live write the project makes into this running box (it waits for
+#     ~/.rs-role) cannot meet a half-made home. File by file: a temp name unique
+#     to this boot, then a rename (`-T`: a folder at the target fails instead of
+#     receiving the file); only SKILL.md is copied, a dot-named folder skipped.
+#     Never fatal (a function called on the left of `||` runs without set -e):
+#     a skill that cannot be copied is a warning in this log. Nothing while the
+#     project marks this box's folder as still holding RS's old files.
+rs_copy_skills() {  # $1 = staged agent folder, $2 = that agent's home skills folder
+    local src n d tmp
+    for src in "$1"/*/SKILL.md; do
+        [ -f "$src" ] || continue
+        n=$(basename "$(dirname "$src")")
+        case "$n" in .*) continue ;; esac
+        d="$2/$n"
+        tmp=
+        mkdir -p "$d" && tmp="$d/.SKILL.md.$$.tmp" && cp "$src" "$tmp" \
+            && mv -fT "$tmp" "$d/SKILL.md" \
+            || { [ -z "$tmp" ] || rm -f "$tmp" || :; echo "warning: RS's /$n skill could not be copied into $2" >&2 || :; }
+    done
+}
+if [[ -d /opt/rs-box-skills && ! -e /opt/rs-box-skills/.old-files ]]; then
+    rs_copy_skills /opt/rs-box-skills/claude "$HOME/.claude/skills" || :
+    if [[ -n "$RS_PI_AGENT_DIR" ]]; then
+        rs_copy_skills /opt/rs-box-skills/pi "$RS_PI_AGENT_DIR/skills" || :
+    fi
+fi
 
 # bypassPermissions so an in-box `claude` doesn't prompt (the container is the
 # security boundary). Crucially NO `hooks` key — the supervisor's rs-audit-stop
@@ -239,19 +272,17 @@ fi
 # A name collision between the two is a hard error (refuse to start) so a project
 # MCP cannot silently shadow the baked browser tooling.
 # In a box that deploys pi (RS_PI_AGENT_DIR, set after the dist deploy above),
-# pi reads the SAME servers: pi's built-in MCP takes a project's servers from
-# <cwd>/.pi/mcp.json (never .mcp.json), in the identical `mcpServers` shape, so
-# /workspace/.pi/mcp.json is a symlink to ../.mcp.json. Every entry then carries
-# `"exposure": "direct"` (pi declares the tools to the model by name, as claude
-# does; pi's default hides them behind its scripting tool, and it has no global
-# default) — claude ignores the key. pi's `mcp list` shell command trusts a
-# project only by its trust.json (never the dist's defaultProjectTrust), so
-# /workspace is recorded trusted there too. In a RESTRICTED browser box (the
-# default) the image's denied Playwright tools (/opt/sandbox-box/denied-tools.json,
-# the same list claude's managed settings deny) are marked `hidden` in pi's
-# per-tool exposure on that server's entry; a TRUSTED one (RS_BOX_BROWSER=trusted
-# on an image with the trusted declaration) hides nothing and uses the unwrapped
-# server declaration. Without pi: none of the pi wiring.
+# pi reads the SAME servers from its HOME MCP settings (<agent dir>/mcp.json,
+# read in every folder, no trust needed): RS merges its entries there by name,
+# each marked `"rsManaged": true`, and leaves every other entry alone. Every RS
+# entry carries `"exposure": "direct"` (pi declares the tools to the model by
+# name, as claude does; pi's default hides them behind its scripting tool). In a
+# RESTRICTED browser box (the default) the image's denied Playwright tools
+# (/opt/sandbox-box/denied-tools.json, the same list claude's managed settings
+# deny) are marked `hidden` in pi's per-tool exposure on that server's entry; a
+# TRUSTED one (RS_BOX_BROWSER=trusted on an image with the trusted declaration)
+# hides nothing and uses the unwrapped server declaration. Without pi: none of
+# the pi wiring. Nothing goes into /workspace/.pi/.
 # The render lives in agent/box-render-mcp.py (baked at this path): the host also
 # streams it into a RUNNING box when an agent change gives the box pi, so one
 # source serves the boot and the live wiring. A collision exits 1 = the boot stops.

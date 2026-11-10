@@ -228,12 +228,11 @@ BOX_MAILBOX_DIR = ".boxes"
 # standalone, so it cannot import either module.
 RESERVED_MAILBOX_NAMES = ("agent", "echo-mcp", "librarian", "websearcher", "wrangler")
 # The paths RS reserves inside a box workspace at creation, before the first
-# run: the two skills homes an agent reads (a skill staged later is picked up
-# live), and — for a sharing box only (BOX_SHARE_RESERVED) — the mailbox mount
-# target. Created with lstat + mkdir only when absent; a later non-folder at one
-# of them is the box's own damage to a reserved folder and is skipped with a
-# warning at the next run, never repaired.
-BOX_RESERVED_DIRS = (".claude/skills", ".pi/skills")
+# run — a sharing box only (BOX_SHARE_RESERVED): the mailbox mount target.
+# Created with lstat + mkdir only when absent; a later non-folder there is the
+# box's own damage to a reserved folder and is skipped with a warning at the
+# next run, never repaired. RS creates nothing in a box's .claude/ or .pi/:
+# those are the user's.
 BOX_SHARE_RESERVED = (MAILBOX_ROOT,)
 # Appended after the preset's instructions in a SHARING box's RS instructions
 # (any preset, the agent-less `empty` included). No preset file carries it;
@@ -263,22 +262,51 @@ SKILLS_JSON_VERSION = 1
 
 def skills_json() -> Path:
     return ORCH / SKILLS_JSON_NAME
-# The two skills homes an agent reads under its workspace (Claude Code: the
-# first; pi: the second), both reserved at box creation (BOX_RESERVED_DIRS)
-# and present in the project agent's workspace from boot. An ingest skill is
-# for the agent OpenKnowledge's tools are registered with, Claude Code only.
-SKILL_HOMES = (".claude/skills", ".pi/skills")
-INGEST_SKILL_HOMES = (".claude/skills",)
+# The agents a skill is staged for, and the skills folder each reads in its
+# HOME (never the workspace: a workspace's .claude/ and .pi/ are the user's).
+# A feed skill goes to both; an ingest skill is for the agent OpenKnowledge's
+# tools are registered with, Claude Code only. pi's folder is under its
+# relocated agent dir (MIRROR of rscore.PI_AGENT_DIR_REL, pinned).
+SKILL_AGENTS = ("claude", "pi")
+INGEST_SKILL_AGENTS = ("claude",)
+PI_AGENT_DIR_REL = ".local/share/pi-agent/agent"
+AGENT_HOME_SKILLS = {"claude": ".claude/skills", "pi": f"{PI_AGENT_DIR_REL}/skills"}
 SKILL_FILE = "SKILL.md"
-# The temp name the writer renames over SKILL_FILE; unlinked before each write
-# (a stale one — left by an interrupted staging or planted — would fail the
-# exclusive create forever) and after a failed rename.
-SKILL_TMP = ".SKILL.md.tmp"
+
+
+def _skill_tmp() -> str:
+    """The temp name the writer renames over SKILL_FILE: unique per writing
+    process (two stagings, or a staging and a live write, may run at once),
+    unlinked after a failed rename. A box's boot copy takes only SKILL_FILE."""
+    return f".SKILL.md.{os.getpid()}.tmp"
+
+
+# Each box's skills are STAGED on the project side at
+# .orchestrator/box-skills/<box>/<agent>/<skill>/SKILL.md and mounted
+# read-only into the box at BOX_SKILLS_IN_BOX; the box's boot copies them into
+# its agents' homes once its ~/.rs-role is written, and RS writes them live
+# into a box already running. Files are written in place inside the box's
+# folder (never by replacing the folder: a running box's mount would keep the
+# deleted one), and box remove empties it by named files. A function of ORCH,
+# never a constant (the archived pins redirect ORCH).
+BOX_SKILLS_DIR = "box-skills"
+BOX_SKILLS_IN_BOX = "/opt/rs-box-skills"
+# Present in a box's staged folder while the box's workspace still holds files
+# RS used to write there (and its record's flag is unset): the box's boot then
+# copies no skill and its MCP render writes no pi home settings — RS writes no
+# new copy while an old one is there.
+BOX_OLD_FILES_MARK = ".old-files"
+
+
+def box_skills_root() -> Path:
+    return ORCH / BOX_SKILLS_DIR
+
+
 # Replaced in a feed skill's text at staging by the destination agent's own
 # mailbox path (/workspace/shared/<name>/), so no agent reads a placeholder.
 MAILBOX_PATH_TOKEN = "{{MAILBOX_PATH}}"
 # The project agent's name in the mailbox namespace (its mailbox is
-# shared/agent/, its skills homes are under /workspace itself).
+# shared/agent/; its skills are in its own home).
 AGENT_NAME = "agent"
 BOX_IMAGE = "rs-sandbox-box:latest"
 # A box run whose image is not in the project (browser-reachable: no command).
@@ -804,6 +832,16 @@ def _refuse_old_instructions_at_create(name: str) -> None:
     die(OLD_INSTRUCTIONS_CREATE_ERROR.format(box=name))
 
 
+def _refuse_old_files_at_create(name: str) -> None:
+    """die() when the folder kept from an earlier box of that name holds any
+    file RS used to write into a box's folder (every kind's paths: the earlier
+    box's type is not known): it belongs to that box. The host gates the same
+    before any side effect; this covers the auto-named box only the tool sees."""
+    old = _probe_old_paths(_box_workspace(name), BOX_OLD_PATHS + OK_BOX_OLD_PATHS)
+    if old:
+        die(OLD_FILES_CREATE_ERROR.format(box=name, paths=_shown_paths(name, old)))
+
+
 def _parse_csv(s: str | None) -> list[str]:
     return [t.strip() for t in (s or "").split(",") if t.strip()]
 
@@ -842,12 +880,12 @@ def _build_proxy_mcps(mcps: list[str], *, strict: bool) -> dict:
 
 
 def _reserve_box_paths(ws: Path, share: bool = False) -> None:
-    """Create the paths RS reserves inside a box workspace (BOX_RESERVED_DIRS,
-    plus BOX_SHARE_RESERVED for a sharing box) where nothing sits yet: lstat, then mkdir only when absent — mkdir never
+    """Create the paths RS reserves inside a box workspace (BOX_SHARE_RESERVED,
+    a sharing box only) where nothing sits yet: lstat, then mkdir only when absent — mkdir never
     follows the final component, and an existing object of any kind is left
     exactly as it is (the check at run time decides what to do about it).
     Parents are created the same way, one component at a time."""
-    for rel in (*BOX_RESERVED_DIRS, *(BOX_SHARE_RESERVED if share else ())):
+    for rel in (BOX_SHARE_RESERVED if share else ()):
         cur = ws
         for part in Path(rel).parts:
             cur = cur / part
@@ -1013,20 +1051,13 @@ def _stage_box_workspace(name: str, preset: dict, mcps: list[str],
     at boot; it is overwritten every create/restart so an allowlist change
     re-renders. The entrypoint regenerates /workspace/.mcp.json wholesale from
     .mcp-proxy.json + the image-baked stdio MCPs (idempotent across reboots — a
-    fresh proxy-only source each boot). RS's instructions are NOT written here:
-    they go into the box's home once it runs (_write_box_instructions)."""
+    fresh proxy-only source each boot). RS's instructions and skills are NOT
+    written here: they go into the box's home (_write_box_instructions, the
+    staged skills). RS writes nothing into the box's .claude/ or .pi/ (the
+    home settings carry the editor's bypass mode and theme)."""
     ws = WORKSPACE / f"boxes/{name}"
     ws.mkdir(parents=True, exist_ok=True)
     _reserve_box_paths(ws, share)
-    # bypassPermissions for the box editor's in-IDE claude — the VS Code Claude
-    # extension reads PROJECT settings from the open folder's .claude/, not just
-    # ~/.claude. No hooks (the box is the security boundary); no-clobber.
-    settings = ws / ".claude" / "settings.json"
-    if not settings.exists():
-        settings.parent.mkdir(parents=True, exist_ok=True)
-        settings.write_text(json.dumps(
-            {"permissions": {"defaultMode": "bypassPermissions"}, "theme": "dark"},
-            indent=2) + "\n")
     servers = _build_proxy_mcps(mcps, strict=strict)
     (ws / ".mcp-proxy.json").write_text(
         json.dumps({"mcpServers": servers}, indent=2, sort_keys=True) + "\n")
@@ -1129,16 +1160,17 @@ def _write_skill(ws: Path, home: str, skill: str, text: str) -> str:
     """Write <ws>/<home>/<skill>/SKILL.md without following anything below
     <ws>: the root is opened O_DIRECTORY|O_NOFOLLOW, every further component
     is opened the same way RELATIVE TO ITS PARENT'S DESCRIPTOR (made with
-    mkdir(dir_fd=) when absent), and the file lands as a temp file created
-    O_EXCL|O_NOFOLLOW inside the skill folder's descriptor and renamed over
-    SKILL.md with dir_fds — a rename replaces a planted link, FIFO or file
-    without opening it and fails on a folder. O_NONBLOCK on the directory
-    opens so a FIFO at a component returns at once whatever the kernel's
-    check order. The walk is the check: returns "" when written, else the
-    structured reason (the destination is skipped, never repaired — the
-    owner replaced what RS reserved)."""
+    mkdir(dir_fd=) when absent), and the file lands as a temp file (a name
+    unique to this process) created O_EXCL|O_NOFOLLOW inside the skill
+    folder's descriptor and renamed over SKILL.md with dir_fds — a rename
+    replaces a planted link, FIFO or file without opening it and fails on a
+    folder. O_NONBLOCK on the directory opens so a FIFO at a component returns
+    at once whatever the kernel's check order. The walk is the check: returns
+    "" when written, else the structured reason (the destination is skipped,
+    never repaired)."""
     dflags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
     fds: list[int] = []
+    tmp = _skill_tmp()
     try:
         try:
             fd = os.open(ws, dflags)
@@ -1163,18 +1195,17 @@ def _write_skill(ws: Path, home: str, skill: str, text: str) -> str:
             fd = nfd
         try:
             try:
-                os.unlink(SKILL_TMP, dir_fd=fd)
+                os.unlink(tmp, dir_fd=fd)
             except FileNotFoundError:
                 pass
-            tfd = os.open(SKILL_TMP,
-                          os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            tfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                           0o644, dir_fd=fd)
             with os.fdopen(tfd, "w") as fh:
                 fh.write(text)
-            os.rename(SKILL_TMP, SKILL_FILE, src_dir_fd=fd, dst_dir_fd=fd)
+            os.rename(tmp, SKILL_FILE, src_dir_fd=fd, dst_dir_fd=fd)
         except OSError as e:
             try:
-                os.unlink(SKILL_TMP, dir_fd=fd)
+                os.unlink(tmp, dir_fd=fd)
             except OSError:
                 pass
             return _skill_reason(e)
@@ -1184,47 +1215,362 @@ def _write_skill(ws: Path, home: str, skill: str, text: str) -> str:
             os.close(f)
 
 
-def _stage_skill_into(ws: Path, who: str, skill: str, text: str,
-                      homes: tuple[str, ...]) -> list[dict]:
-    """Write one skill into each of an agent's skills homes under `ws`, the
-    token replaced by that agent's mailbox path. One structured warning per
-    (agent, skill) when any home could not take it — data for the host, which
-    builds the operator's line from re-validated names."""
-    text = text.replace(MAILBOX_PATH_TOKEN, f"/workspace/{MAILBOX_ROOT}/{who}/")
-    first = ""
-    for home in homes:
-        reason = _write_skill(ws, home, skill, text)
-        first = first or reason          # every home is tried; one warning
-    if first:
-        return [{"kind": "skill", "skill": skill, "box": who, "reason": first}]
-    return []
+def _skill_for(text: str, who: str) -> str:
+    """A skill's text for one agent: the token replaced by that agent's own
+    mailbox path."""
+    return text.replace(MAILBOX_PATH_TOKEN, f"/workspace/{MAILBOX_ROOT}/{who}/")
 
 
 def _box_workspace(name: str) -> Path:
     return WORKSPACE / "boxes" / name
 
 
-def _feed_destinations(entries: dict[str, dict],
-                       provider: str) -> list[tuple[Path, str]]:
-    """Every agent a feed skill goes to: each recorded box that shares files
-    with the project (the entries, never the boxes/ directory — a discard
-    that kept a workspace leaves a dead folder there; a box that does not
-    share has no mailbox to write a feed into) whose type is not the one
-    offering it, agent or not (one rule), and the project agent."""
-    out: list[tuple[Path, str]] = []
-    for name, e in entries.items():
-        if (isinstance(e, dict) and e.get("kind") == KIND
-                and _entry_share(e)
-                and isinstance(name, str) and _NAME_RE.match(name)
-                and e.get("preset") != provider):
-            out.append((_box_workspace(name), name))
-    out.append((WORKSPACE, AGENT_NAME))
+def _recorded_feeds(exclude: str = "") -> "tuple[list[tuple[str, str]], list[dict]]":
+    """([(skill, text)] of every feed recorded for the project but the one box
+    type `exclude` offers, [no-text warnings without a destination])."""
+    out: list[tuple[str, str]] = []
+    warnings: list[dict] = []
+    for provider in load_skills():
+        if provider == exclude:
+            continue
+        text = _skill_text(provider, "feed_skill")
+        skill = _skill_name(text)
+        if not text or not _NAME_RE.match(skill):
+            warnings.append({"kind": "skill", "preset": provider, "reason": "no-text"})
+            continue
+        out.append((skill, text))
+    return out, warnings
+
+
+def _box_skill_set(name: str, entry: dict
+                   ) -> "tuple[list[tuple[str, str, tuple[str, ...]]], list[dict]]":
+    """The skills a box's agents get, as [(skill, text, agents)], and the
+    warnings: a box that shares files gets its own type's ingest skill (Claude
+    Code only) and every recorded feed but its own type's (both agents); a box
+    that does not share gets none (both are about the mailboxes)."""
+    if not _entry_share(entry):
+        return [], []
+    preset_name = entry.get("preset") or "empty"
+    out: list[tuple[str, str, tuple[str, ...]]] = []
+    warnings: list[dict] = []
+    ingest = _skill_text(preset_name, "ingest_skill")
+    if ingest:
+        skill = _skill_name(ingest)
+        if _NAME_RE.match(skill):
+            out.append((skill, _skill_for(ingest, name), INGEST_SKILL_AGENTS))
+        else:
+            warnings.append({"kind": "skill", "preset": preset_name, "box": name,
+                             "reason": "no-text"})
+    feeds, missing = _recorded_feeds(exclude=preset_name)
+    for w in missing:
+        warnings.append({**w, "box": name})
+    for skill, text in feeds:
+        out.append((skill, _skill_for(text, name), SKILL_AGENTS))
+    return out, warnings
+
+
+# --- RS's files RS used to write into a workspace ---------------------------
+# Before RS kept these in the agents' homes it wrote them into a box's
+# folder: the /ok feed skill (both agents), its Claude Code settings, pi's
+# MCP link, and for an OpenKnowledge box its ingest skill and the start
+# script's copy of it in notes/. While one is there (and the record's flag is
+# unset) RS writes no new copy and the operation about the box fails, listing
+# them. MIRROR of rscore.BOX_OLD_PATHS / OK_BOX_OLD_PATHS — pinned equal.
+OLD_FILES_FLAG = "old_files_cleared"
+BOX_OLD_PATHS = (".claude/skills/ok", ".pi/skills/ok", ".claude/settings.json",
+                 ".pi/mcp.json")
+OK_BOX_OLD_PATHS = (".claude/skills/ok-ingest", "notes/.claude/skills/ok-ingest")
+# The one box type RS wrote the ingest paths for.
+OK_PRESET = "open-knowledge"
+OLD_FILES_CREATE_ERROR = (
+    "the folder kept from an earlier box named {box} holds files RS used to write "
+    "there: {paths}. Remove or rename them from the project's terminal or editor, "
+    "then add the box again.")
+OLD_FILES_RUN_ERROR = (
+    "box '{box}' still holds files RS used to write into its folder: {paths}. RS "
+    "keeps these in the box agents' home folders now and writes no new copies "
+    "while they exist. Remove or rename them from the project's terminal or "
+    "editor, then stop the project and start it again.")
+
+
+def _old_path_present(root: Path, rel: str) -> bool:
+    """Whether `rel` is there below `root`, walked without following anything:
+    absent → False; a link at any component → True (a link counts as
+    present, whatever it points to); the final component in any form → True;
+    a component that is not a folder → False (nothing can be below it); any
+    other error → True (never read as "absent")."""
+    parts = rel.split("/")
+    try:
+        fd = os.open(root, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        for i, part in enumerate(parts):
+            try:
+                st = os.stat(part, dir_fd=fd, follow_symlinks=False)
+            except (FileNotFoundError, NotADirectoryError):
+                return False
+            except OSError:
+                return True
+            if stat.S_ISLNK(st.st_mode) or i == len(parts) - 1:
+                return True
+            if not stat.S_ISDIR(st.st_mode):
+                return False
+            try:
+                nfd = os.open(part, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError:
+                return True
+            os.close(fd)
+            fd = nfd
+        return False
+    finally:
+        os.close(fd)
+
+
+def _probe_old_paths(root: Path, rels: "tuple[str, ...]") -> list[str]:
+    return [rel for rel in rels if _old_path_present(root, rel)]
+
+
+def _box_old_rels(entry: dict) -> "tuple[str, ...]":
+    """The paths RS wrote into a box of this kind (only where it wrote them)."""
+    return BOX_OLD_PATHS + (OK_BOX_OLD_PATHS if entry.get("preset") == OK_PRESET else ())
+
+
+def _box_old_files(name: str, entry: dict) -> list[str]:
+    """The old paths in the box's folder; none once the record's flag is set
+    (a file the user makes after that is theirs)."""
+    if entry.get(OLD_FILES_FLAG) is True:
+        return []
+    return _probe_old_paths(_box_workspace(name), _box_old_rels(entry))
+
+
+def _shown_paths(name: str, rels: "list[str]") -> str:
+    return ", ".join(f"`/workspace/boxes/{name}/{r}`" for r in rels)
+
+
+def _record_old_files_cleared(name: str, cname: str, entry: dict) -> list[dict]:
+    """Set the box record's flag after a clean probe. A box keeping history is
+    checked again until its setup has finished once (~/.rs-box-setup-done):
+    its notes come from a clone that may be retried at a later start."""
+    if entry.get(OLD_FILES_FLAG) is True:
+        return []
+    if _entry_history(entry) and _docker(
+            "exec", cname, "test", "-e", f"{BOX_HOME}/.rs-box-setup-done").returncode != 0:
+        return []
+    try:
+        entries = load()
+        if isinstance(entries.get(name), dict):
+            entries[name][OLD_FILES_FLAG] = True
+            save(entries)
+    except (OSError, ValueError, RecursionError, SystemExit):
+        return [{"kind": "files", "reason": "flag-not-recorded"}]
+    return []
+
+
+def _open_dir_nofollow(path: "Path | str", dir_fd: "int | None" = None) -> int:
+    return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                   dir_fd=dir_fd)
+
+
+def _set_old_files_mark(bdir: Path, present: bool) -> bool:
+    """Create (or remove, by name) the box's old-files mark in its staged
+    folder. False when that could not be done."""
+    try:
+        fd = _open_dir_nofollow(bdir)
+    except OSError:
+        return False
+    try:
+        if present:
+            mfd = os.open(BOX_OLD_FILES_MARK, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW,
+                          0o644, dir_fd=fd)
+            os.close(mfd)
+        else:
+            try:
+                os.unlink(BOX_OLD_FILES_MARK, dir_fd=fd)
+            except FileNotFoundError:
+                pass
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _stage_box_home_skills(name: str, entry: dict
+                           ) -> "tuple[list[str], list[str], list[dict]]":
+    """Stage a box's skills on the project side BEFORE it runs, and return
+    (the read-only mount argv, the old paths found, warnings). While old paths
+    are there nothing is staged and the old-files mark tells the box's boot to
+    copy nothing. Never fatal: a staged folder that cannot be made means a box
+    that runs without its skills (a warning)."""
+    old = _box_old_files(name, entry)
+    root = box_skills_root()
+    bdir = root / name
+    try:
+        _ensure_dirs(ORCH, root, bdir)
+    except OSError:
+        return [], old, [{"kind": "skill", "box": name, "reason": "unwritable"}]
+    if not _set_old_files_mark(bdir, bool(old)):
+        return [], old, [{"kind": "skill", "box": name, "reason": "unwritable"}]
+    mount = ["--mount", f"type=bind,source={bdir},target={BOX_SKILLS_IN_BOX},readonly"]
+    if old:
+        return mount, old, []
+    skills, warnings = _box_skill_set(name, entry)
+    for skill, text, agents in skills:
+        first = ""
+        for agent in agents:
+            reason = _write_skill(bdir, agent, skill, text)
+            first = first or reason          # every agent is tried; one warning
+        if first:
+            warnings.append({"kind": "skill", "skill": skill, "box": name,
+                             "reason": first})
+    return mount, [], warnings
+
+
+def _staged_skills(bdir: Path, agent: str) -> "list[tuple[str, bytes]]":
+    """[(skill, SKILL.md bytes)] staged for one agent of a box, read without
+    following a link (the folder is project-writable)."""
+    out: list[tuple[str, bytes]] = []
+    try:
+        bfd = _open_dir_nofollow(bdir)
+    except OSError:
+        return out
+    try:
+        try:
+            afd = _open_dir_nofollow(agent, dir_fd=bfd)
+        except OSError:
+            return out
+        try:
+            for skill in sorted(os.listdir(afd)):
+                if not _NAME_RE.match(skill):
+                    continue
+                try:
+                    sfd = _open_dir_nofollow(skill, dir_fd=afd)
+                except OSError:
+                    continue
+                try:
+                    ffd = os.open(SKILL_FILE, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                  dir_fd=sfd)
+                    try:
+                        if stat.S_ISREG(os.fstat(ffd).st_mode):
+                            with os.fdopen(ffd, "rb") as fh:
+                                ffd = -1
+                                out.append((skill, fh.read()))
+                    finally:
+                        if ffd >= 0:
+                            os.close(ffd)
+                except OSError:
+                    pass
+                finally:
+                    os.close(sfd)
+        finally:
+            os.close(afd)
+    finally:
+        os.close(bfd)
     return out
 
 
+# A live skill write into a RUNNING box, as its user: $1 the skill folder in
+# the agent's home, $2 the byte count sent. A temp name unique to this exec
+# (the box's boot copy may run at the same time), the count catches a cut
+# stream, `mv -T` makes a folder at the target fail instead of receiving it.
+LIVE_SKILL_SCRIPT = (
+    'tmp=; mkdir -p "$1" && tmp="$1/.SKILL.md.$$.tmp" && cat >"$tmp" && '
+    '[ "$(wc -c <"$tmp")" -eq "$2" ] && mv -fT "$tmp" "$1/SKILL.md" && '
+    'echo RS_SKILL_WRITTEN || { [ -z "$tmp" ] || rm -f "$tmp" || :; '
+    'echo RS_SKILL_NOT_WRITTEN || :; }')
+
+
+def _live_box_skills(name: str, cname: str) -> list[dict]:
+    """Write a box's staged skills into its RUNNING agents' homes — only once
+    its boot has written ~/.rs-role (before that, the boot copy takes the
+    staged files itself), pi's only where pi is installed, nothing while the
+    old-files mark is there."""
+    bdir = box_skills_root() / name
+    if os.path.lexists(bdir / BOX_OLD_FILES_MARK):
+        return []
+    if _docker("exec", cname, "test", "-e", f"{BOX_HOME}/.rs-role").returncode != 0:
+        return []
+    has_pi = _docker("exec", cname, "test", "-x",
+                     f"{BOX_HOME}/.local/bin/pi").returncode == 0
+    warnings: list[dict] = []
+    for agent in SKILL_AGENTS:
+        if agent == "pi" and not has_pi:
+            continue
+        for skill, data in _staged_skills(bdir, agent):
+            dest = f"{BOX_HOME}/{AGENT_HOME_SKILLS[agent]}/{skill}"
+            try:
+                r = _docker_input(data, "exec", "-i", "-u", "1000", "-e", f"HOME={BOX_HOME}",
+                                  cname, "sh", "-c", LIVE_SKILL_SCRIPT, "sh", dest,
+                                  str(len(data)))
+                ok = (r.returncode == 0 and b"RS_SKILL_WRITTEN" in (r.stdout or b"")
+                      and b"RS_SKILL_NOT_WRITTEN" not in (r.stdout or b""))
+            except (OSError, subprocess.TimeoutExpired):
+                ok = False
+            if not ok:
+                warnings.append({"kind": "skill", "skill": skill, "box": name,
+                                 "reason": "unwritable"})
+    return warnings
+
+
+def _box_running(cname: str) -> bool:
+    r = _docker("container", "inspect", "-f", "{{.State.Running}}", cname)
+    return r.returncode == 0 and (r.stdout or "").strip() == "true"
+
+
+def _restage_box(name: str, entry: dict) -> list[dict]:
+    """Stage a box's skills again and write them live into it when it runs
+    (a new feed, an agent added). Its old files are reported by its next run
+    or start, never here."""
+    _mount, old, warnings = _stage_box_home_skills(name, entry)
+    if old:
+        return []
+    cname = box_container(name)
+    if _box_running(cname):
+        warnings += _live_box_skills(name, cname)
+    return warnings
+
+
+def _project_files_cleared() -> bool:
+    """The project record's flag: set by the host once the project agent's
+    folders hold none of the files RS used to write there."""
+    try:
+        data = json.loads((ORCH / "project.json").read_text())
+    except (OSError, ValueError, RecursionError):
+        return False
+    return isinstance(data, dict) and data.get(OLD_FILES_FLAG) is True
+
+
+def _stage_agent_home_skills() -> list[dict]:
+    """Every recorded feed into the project agent's own home (Claude Code's
+    skills folder, and pi's where the project runs pi) — this tool runs as
+    that agent's user. Nothing while the project's flag is unset: the host's
+    check of the project's folders reports the old files then."""
+    if not _project_files_cleared():
+        return []
+    feeds, warnings = _recorded_feeds()
+    warnings = [{**w, "box": AGENT_NAME} for w in warnings]
+    agents = ["claude"] + (["pi"] if "pi" in _project_agents() else [])
+    home = Path.home()
+    for skill, text in feeds:
+        first = ""
+        for agent in agents:
+            reason = _write_skill(home, AGENT_HOME_SKILLS[agent], skill,
+                                  _skill_for(text, AGENT_NAME))
+            first = first or reason          # every agent is tried; one warning
+        if first:
+            warnings.append({"kind": "skill", "skill": skill, "box": AGENT_NAME,
+                             "reason": first})
+    return warnings
+
+
 def _stage_feed(provider: str) -> list[dict]:
-    """Record a box type's feed skill for this project and write it into every
-    other box's workspace and the project agent's. Called when a box of a
+    """Record a box type's feed skill for this project and write it to every
+    other agent: each box that shares files (the entries, never the boxes/
+    directory) whose type is not the one offering it — staged, and live into
+    a running one — and the project agent's home. Called when a box of a
     feed-carrying type is created, and by `rs-sandbox skills stage`."""
     feeds = load_skills()
     if provider not in feeds:
@@ -1236,63 +1582,92 @@ def _stage_feed(provider: str) -> list[dict]:
         # not a skill and not an agent.
         return [{"kind": "skill", "preset": provider, "reason": "no-text"}]
     out: list[dict] = []
-    for ws, who in _feed_destinations(load(), provider):
-        out += _stage_skill_into(ws, who, skill, text, SKILL_HOMES)
-    return out
+    for name, e in load().items():
+        if (isinstance(e, dict) and e.get("kind") == KIND and _entry_share(e)
+                and isinstance(name, str) and _NAME_RE.match(name)
+                and e.get("preset") != provider):
+            out += _restage_box(name, e)
+    return out + _stage_agent_home_skills()
 
 
-def _stage_recorded_feeds(ws: Path, who: str, own_preset: str) -> list[dict]:
-    """The feed skills recorded so far, written into one agent's workspace —
-    never the feed its own box type offers (an OpenKnowledge box does not
-    feed itself)."""
-    out: list[dict] = []
-    for provider in load_skills():
-        if provider == own_preset:
-            continue
-        text = _skill_text(provider, "feed_skill")
-        skill = _skill_name(text)
-        if not text or not _NAME_RE.match(skill):
-            out.append({"kind": "skill", "preset": provider, "box": who,
-                        "reason": "no-text"})
-            continue
-        out += _stage_skill_into(ws, who, skill, text, SKILL_HOMES)
-    return out
+def _remove_staged_skills(name: str) -> None:
+    """Empty a removed box's staged folder by named files (each SKILL.md, a
+    temp name a writer left, the old-files mark) and remove the emptied
+    folders with rmdir — never a recursive delete — so a later box of the same
+    name never inherits them. Best-effort: anything else there stays."""
+    try:
+        rfd = _open_dir_nofollow(box_skills_root())
+    except OSError:
+        return
+    try:
+        try:
+            bfd = _open_dir_nofollow(name, dir_fd=rfd)
+        except OSError:
+            return
+        try:
+            for agent in SKILL_AGENTS:
+                try:
+                    afd = _open_dir_nofollow(agent, dir_fd=bfd)
+                except OSError:
+                    continue
+                try:
+                    for skill in os.listdir(afd):
+                        if not _NAME_RE.match(skill):
+                            continue
+                        try:
+                            sfd = _open_dir_nofollow(skill, dir_fd=afd)
+                        except OSError:
+                            continue
+                        try:
+                            for f in os.listdir(sfd):
+                                if f == SKILL_FILE or re.fullmatch(r"\.SKILL\.md\.\d+\.tmp", f):
+                                    try:
+                                        os.unlink(f, dir_fd=sfd)
+                                    except OSError:
+                                        pass
+                        finally:
+                            os.close(sfd)
+                        try:
+                            os.rmdir(skill, dir_fd=afd)
+                        except OSError:
+                            pass
+                finally:
+                    os.close(afd)
+                try:
+                    os.rmdir(agent, dir_fd=bfd)
+                except OSError:
+                    pass
+            try:
+                os.unlink(BOX_OLD_FILES_MARK, dir_fd=bfd)
+            except OSError:
+                pass
+        finally:
+            os.close(bfd)
+        try:
+            os.rmdir(name, dir_fd=rfd)
+        except OSError:
+            pass
+    finally:
+        os.close(rfd)
 
 
-def _stage_ingest(ws: Path, who: str, preset: dict) -> list[dict]:
-    """A box type's own ingest skill, written into its box's workspace (the
-    Claude Code home only) before the box first runs."""
-    text = preset.get("ingest_skill")
-    if not isinstance(text, str) or not text:
-        return []
-    skill = _skill_name(text)
-    if not _NAME_RE.match(skill):
-        return [{"kind": "skill", "preset": str(preset.get("name") or ""),
-                 "box": who, "reason": "no-text"}]
-    return _stage_skill_into(ws, who, skill, text, INGEST_SKILL_HOMES)
-
-
-def _skills_present(ws: Path) -> dict[str, object]:
-    """{home: [skill names whose SKILL.md is a plain file]} for one workspace
-    (the `skills list` verb). The same descriptor walk as the writer, so a
-    link the owner planted at a home is never followed: that home reads
-    "not-a-folder" instead of a list."""
+def _skills_present(root: Path, homes: "dict[str, str]") -> dict[str, object]:
+    """{agent: [skill names whose SKILL.md is a plain file]} under `root`, one
+    folder per agent (the `skills list` verb): a box's staged folder, or the
+    project agent's home. The same no-follow walk as the writer, so a link at a
+    folder is never followed: that agent reads "not-a-folder" instead."""
     dflags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
     out: dict[str, object] = {}
-    for home in SKILL_HOMES:
+    for agent, home in homes.items():
         fds: list[int] = []
         try:
-            fd = os.open(ws, dflags)
+            fd = os.open(root, dflags)
             fds.append(fd)
             for part in Path(home).parts:
                 fd = os.open(part, dflags, dir_fd=fd)
                 fds.append(fd)
             names: list[str] = []
             for entry in sorted(os.listdir(fd)):
-                # The skill folder is opened like every other component (a
-                # link there is never followed, so a planted link cannot probe
-                # a path outside the workspace through this listing), and only
-                # a name the catalog could have produced is reported.
                 if not _NAME_RE.match(entry):
                     continue
                 try:
@@ -1307,11 +1682,11 @@ def _skills_present(ws: Path) -> dict[str, object]:
                     os.close(efd)
                 if stat.S_ISREG(st.st_mode):
                     names.append(entry)
-            out[home] = names
+            out[agent] = names
         except FileNotFoundError:
-            out[home] = []                     # no such home: nothing there
+            out[agent] = []                    # no such folder: nothing there
         except OSError as e:
-            out[home] = _skill_reason(e) if fds else "unreadable"
+            out[agent] = _skill_reason(e) if fds else "unreadable"
         finally:
             for f in fds:
                 os.close(f)
@@ -1466,8 +1841,8 @@ _MAILBOX_REASON_TEXT = {
 
 
 _SKILL_REASON_TEXT = {
-    "not-a-folder": "something that is not a folder sits where the skill goes in its workspace",
-    "unwritable": "the skill file could not be written in its workspace",
+    "not-a-folder": "something that is not a folder sits where the skill goes in its home folder or in the project's staged copy",
+    "unwritable": "the skill file could not be written into its home folder or the project's staged copy",
     "no-text": "the box type offering it is no longer in the catalog",
 }
 
@@ -1501,6 +1876,13 @@ def _warning_text(name: str, w: dict) -> str:
         why = _INSTR_REASON_TEXT.get(w.get("reason"),
                                      "RS's instructions were not written")
         return f"warning: box {name!r}: {why}"
+    if w.get("kind") == "old-files":
+        paths = [x for x in (w.get("paths") or []) if isinstance(x, str)]
+        return "error: " + OLD_FILES_RUN_ERROR.format(box=name, paths=_shown_paths(name, paths))
+    if w.get("kind") == "files":
+        return (f"warning: box {name!r}: its folder holds none of the files RS used "
+                f"to write there, but its record could not note it; it is checked "
+                f"again at the next start")
     if w.get("kind") == "history":
         return (f"warning: box {name!r} starts without Gitea history "
                 f"({w.get('reason')})")
@@ -2206,6 +2588,15 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     web_env = ([ "-e", f"RS_BOX_WEB_START={web['start']}",
                  "-e", f"RS_BOX_WEB_PORT={web['port']}"]
                if (web and not dev) else [])
+    # The box's skills, staged on the project side and mounted read-only (its
+    # boot copies them into its agents' homes); while its folder still holds a
+    # file RS used to write there, nothing is staged and the run reports them.
+    try:
+        box_entry = load().get(name)
+    except (OSError, ValueError, RecursionError):
+        box_entry = None
+    box_entry = box_entry if isinstance(box_entry, dict) else {}
+    skills_mount, old_files, skill_warnings = _stage_box_home_skills(name, box_entry)
     common = [
         "--name", cname,
         *net_args,
@@ -2216,6 +2607,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         *node_mount,
         *folder_mounts,
         *mailbox_mounts,
+        *skills_mount,
         *trust_args,
         *editor_publish,
         *loopback_publish,
@@ -2276,6 +2668,9 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     # RS's instructions into the fresh home, now that the box runs (its boot
     # only mkdir -p's ~/.claude and writes its settings no-clobber).
     instr_warnings = _write_box_instructions(name, cname)
+    # The record's flag once its folder held none of RS's old files.
+    files_warnings = ([{"kind": "old-files", "paths": old_files}] if old_files
+                      else _record_old_files_cleared(name, cname, box_entry))
     # Opt-in fetch surface: rs-fetch + the operator token + the global fetch
     # wiring into the fresh box — ONLY when this box opted in (the universal
     # staging is retired; a dev box never gets it — the flag is rejected on
@@ -2300,7 +2695,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     # The box's home is fresh: give its agents their wired MCP servers back.
     _mcp_sync_box(name)
     return (folder_warnings + mailbox_warnings + history_warnings + browser_warnings
-            + instr_warnings)
+            + instr_warnings + skill_warnings + files_warnings)
 
 
 def _mcp_sync_box(name: str) -> None:
@@ -2448,6 +2843,7 @@ def cmd_create(args: argparse.Namespace) -> None:
     # CLAUDE.md belongs to that box: refuse before any state write (the host
     # gates an explicit name the same way before its own side effects).
     _refuse_old_instructions_at_create(name)
+    _refuse_old_files_at_create(name)
     preset = resolve_preset(args.preset)
     is_clone = bool(preset.get("clone"))
     is_dev = bool(preset.get("dev"))
@@ -2651,18 +3047,10 @@ def cmd_create(args: argparse.Namespace) -> None:
     # Stage .mcp-proxy.json BEFORE the run (M2: the entrypoint reads it at
     # boot). strict=True → die on an MCP not in the project allowlist.
     _stage_box_workspace(name, preset, mcps, strict=True, share=share)
-    # The skills this box starts with, written before the run like the MCP source:
-    # its own type's ingest skill (OpenKnowledge's start script copies it into
-    # notes/ after `ok init`, so it must be there before the box first runs)
-    # and every feed skill recorded for the project — never the feed its own
-    # type offers. A destination that is no longer a plain folder is skipped
-    # with a warning; the box runs either way (a skill is optional). Both are
-    # about the mailboxes, so a box that does not share gets neither.
+    # The skills this box starts with (its own type's ingest skill, every feed
+    # recorded for the project but its own type's) are staged by the run below,
+    # before the box starts, and copied into its agents' homes by its boot.
     skill_warnings: list[dict] = []
-    if share:
-        skill_warnings += _stage_ingest(_box_workspace(name), name, preset)
-        skill_warnings += _stage_recorded_feeds(_box_workspace(name), name,
-                                                args.preset)
     # Agent model + effort (STAGE_MODEL_SELECT). Explicit flags win; otherwise the
     # project's `box` default from the marker, read verbatim (the host resolved and
     # effort-drop-checked it at create — nothing here can validate). Persisted on
@@ -2674,6 +3062,10 @@ def cmd_create(args: argparse.Namespace) -> None:
              # A new box never had RS's old CLAUDE.md (refused above): its
              # folder is never checked for one again.
              OLD_INSTRUCTIONS_FLAG: True,
+             # Nor any other file RS used to write into a box's folder (refused
+             # above) — except a box keeping history, whose notes come from a
+             # clone made after this: it is checked until its setup finished.
+             **({} if history else {OLD_FILES_FLAG: True}),
              "preset": args.preset, "browser": browser, "agent": agent,
              "editor": editor, "upstream_mcps": mcps,
              "model": model, "effort": effort}
@@ -2919,12 +3311,22 @@ def cmd_start(args: argparse.Namespace) -> None:
     # passed the image check at its run). When it cannot be written, re-run
     # instead — restricted, with a `browser` warning — rather than fail on
     # docker's own mount error.
+    # A box last run before RS staged its skills outside its workspace has no
+    # staged-skills mount (fixed at docker run): re-run it.
+    if exists and not _container_has_skills_mount(cname):
+        _print_warnings(args.name, _rerun_box(args.name, entry))
+        print(f"box {args.name!r}: re-run at {entry['ip']} "
+              f"(it was run before its skills were kept outside its workspace)")
+        return
     if exists and _entry_browser_trusted(entry) and _write_trusted_policy() is None:
         _print_warnings(args.name, _rerun_box(args.name, entry))
         print(f"box {args.name!r}: re-run at {entry['ip']} "
               f"(its trusted browser policy could not be written)")
         return
     if exists:
+        # The skills staged again before the boot copies them (a feed recorded
+        # while the box was parked); none while old files are there.
+        _m, old_files, skill_warnings = _stage_box_home_skills(args.name, entry)
         r = _docker("start", cname)
         if r.returncode != 0:
             die(f"failed to start box {args.name!r}: "
@@ -2933,6 +3335,9 @@ def cmd_start(args: argparse.Namespace) -> None:
         # them itself (the home was kept; an unreadable catalog leaves the
         # file as it is).
         _print_warnings(args.name, _write_box_instructions(args.name, cname))
+        _print_warnings(args.name, skill_warnings + (
+            [{"kind": "old-files", "paths": old_files}] if old_files
+            else _record_old_files_cleared(args.name, cname, entry)))
         # A model changed while parked: the home was kept, so write it now —
         # only the halves that changed, and cleared only once written.
         pend = entry.get("model_pending")
@@ -2966,6 +3371,14 @@ def cmd_start(args: argparse.Namespace) -> None:
 def _print_warnings(name: str, warnings: list[dict]) -> None:
     for w in warnings:
         print(_warning_text(name, w), file=sys.stderr)
+
+
+def _container_has_skills_mount(cname: str) -> bool:
+    """Whether an existing box container mounts its staged skills folder (a
+    container that cannot be read reads as False: the caller re-runs it)."""
+    r = _docker("container", "inspect", "-f",
+                "{{range .Mounts}}{{.Destination}}\n{{end}}", cname)
+    return r.returncode == 0 and BOX_SKILLS_IN_BOX in (r.stdout or "").split()
 
 
 def _container_mailbox_mounts(cname: str) -> dict[str, tuple[str, str]] | None:
@@ -3335,6 +3748,9 @@ def cmd_discard(args: argparse.Namespace) -> None:
     # the default is full teardown — a box is disposable.
     del entries[args.name]
     save(entries)
+    # Its staged skills go with it, by named files (a later box of this name
+    # never inherits them).
+    _remove_staged_skills(args.name)
     # A sharing box's mailbox shared/.boxes/<name>/ is never deleted: it
     # outlives its box by design (a sharing box re-added under this name
     # writes into it again).
@@ -3369,46 +3785,75 @@ def cmd_discard(args: argparse.Namespace) -> None:
 
 def cmd_skills(args: argparse.Namespace) -> None:
     """`skills list`: the feed skills recorded for this project and where each
-    skill is present. `skills stage [--preset P]`: record P's feed (as adding a
-    box of that type does) and (re)write every recorded feed into every box that
-    shares files and the project agent, and each box type's own ingest skill
-    into its box when that box shares — the
-    repair for a box added at the same moment as the type offering a feed, or
-    a skill file that was lost. A feed is picked up live by a running agent; a
-    box type's own skill reaches a running OpenKnowledge box at its next app
-    start (its start script copies it into notes/). JSON on stdout."""
+    skill is: the project agent's home, and each box's staged copy (its boot
+    copies that into its agents' homes). `skills stage [--preset P]`: record
+    P's feed (as adding a box of that type does) and write every recorded feed
+    again into the project agent's home and every box that shares files
+    (staged, and live into a running one), with each box type's own ingest
+    skill — the repair for a skill file that was lost. JSON on stdout."""
     _require_dind_project()
     entries = load()
     boxes = {n: e for n, e in entries.items()
              if isinstance(e, dict) and e.get("kind") == KIND and _NAME_RE.match(n)}
     if args.action == "list":
-        present = {AGENT_NAME: _skills_present(WORKSPACE)}
+        present = {AGENT_NAME: _skills_present(
+            Path.home(), {a: AGENT_HOME_SKILLS[a] for a in SKILL_AGENTS})}
         for n in sorted(boxes):
-            present[n] = _skills_present(_box_workspace(n))
+            present[n] = _skills_present(box_skills_root() / n,
+                                         {a: a for a in SKILL_AGENTS})
         print(json.dumps({"feeds": load_skills(), "skills": present}, indent=2))
         return
-    warnings: list[dict] = []
     if args.preset:
         if not _NAME_RE.match(args.preset):
             die(f"invalid box type name {args.preset!r}")
         if not _skill_text(args.preset, "feed_skill"):
             die(f"box type {args.preset!r} offers no feed skill")
-        warnings += _stage_feed(args.preset)
-    for provider in load_skills():
-        if provider != args.preset:
-            warnings += _stage_feed(provider)
-    catalog = load_box_catalog()
-    for n, e in boxes.items():
-        # An ingest skill reads the mailboxes: a box that does not share
-        # files gets none.
-        if not _entry_share(e):
-            continue
-        preset = catalog.get(e.get("preset") or "")
-        if isinstance(preset, dict):
-            warnings += _stage_ingest(_box_workspace(n), n, preset)
+        feeds = load_skills()
+        if args.preset not in feeds:
+            save_skills([*feeds, args.preset])
+    warnings = _stage_agent_home_skills()
+    for n in sorted(boxes):
+        warnings += _restage_box(n, boxes[n])
     for w in warnings:
         print(f"rs-sandbox: {_warning_text(w.get('box', ''), w)}", file=sys.stderr)
     print(json.dumps({"feeds": load_skills(), "warnings": warnings}, indent=2))
+
+
+def cmd_home_skills(args: argparse.Namespace) -> None:
+    """Write RS's skills into the agents' HOMES: the recorded feeds into the
+    project agent's own home (once the project's flag says its folders hold
+    none of RS's old files); with --boxes, every box's staged skills again and
+    live into each running one (an agent added: pi gets them); with --box N,
+    that one box, its old files checked and its record's flag set once there
+    are none (a box keeping history, once its setup has finished). JSON on
+    stdout: {"warnings": [...]}, an old-files kind carrying the box's name."""
+    _require_dind_project()
+    warnings = _stage_agent_home_skills()
+    entries = load()
+    if args.box:
+        if not _NAME_RE.match(args.box):
+            die("invalid box name")
+        names = [args.box]
+        _box_entry(entries, args.box)
+    elif args.boxes:
+        names = sorted(n for n, e in entries.items()
+                       if isinstance(e, dict) and e.get("kind") == KIND
+                       and isinstance(n, str) and _NAME_RE.match(n))
+    else:
+        names = []
+    for n in names:
+        e = entries[n]
+        cname = box_container(n)
+        _m, old, w = _stage_box_home_skills(n, e)
+        if old:
+            warnings.append({"kind": "old-files", "box": n, "paths": old})
+            continue
+        if _box_running(cname):
+            if args.box:
+                w += _record_old_files_cleared(n, cname, e)
+            w += _live_box_skills(n, cname)
+        warnings += [{**x, "box": x.get("box", n)} for x in w]
+    print(json.dumps({"warnings": warnings}, indent=2))
 
 
 def cmd_list(args: argparse.Namespace) -> None:
@@ -3562,21 +4007,29 @@ def build_parser() -> argparse.ArgumentParser:
                              "agent, and a box type's own ingest skill")
     sks = sk.add_subparsers(dest="action", required=True)
     skl = sks.add_parser("list", help="the recorded feed skills, and the skills "
-                                      "present in each agent's workspace")
+                                      "in the project agent's home and each box's "
+                                      "staged copy")
     skl.set_defaults(func=cmd_skills)
     sks_st = sks.add_parser(
         "stage",
-        help="(re)write every recorded feed skill into every box that shares "
-             "files and the project agent, and each sharing box type's own "
-             "skill into its box — "
-             "the repair when a box was added at the same moment as the box "
-             "type offering a feed, or a skill file was lost (a box type's "
-             "own skill reaches a running OpenKnowledge box at its next app "
-             "start)")
+        help="(re)write every recorded feed skill into the project agent's home "
+             "and every box that shares files (staged, and live into a running "
+             "one), and each sharing box type's own skill into its box — the "
+             "repair when a skill file was lost")
     sks_st.add_argument("--preset", default="",
                         help="also record this box type's feed skill, as "
                              "adding a box of that type does")
     sks_st.set_defaults(func=cmd_skills)
+
+    hs = sub.add_parser("home-skills",
+                        help="write RS's skills into the agents' home folders: "
+                             "the project agent's, and with --boxes every box's "
+                             "(staged and live), or with --box one box's")
+    hs.add_argument("--boxes", action="store_true",
+                    help="every box too: staged again, and live into a running one")
+    hs.add_argument("--box", default="",
+                    help="one box: its old files checked, staged, live when it runs")
+    hs.set_defaults(func=cmd_home_skills)
 
     lst = sub.add_parser("list", help="list sandboxes (boxes + baked)")
     lst.add_argument("--json", action="store_true")
