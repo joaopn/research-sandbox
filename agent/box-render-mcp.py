@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render /workspace/.mcp.json (and pi's wiring) inside a sandbox box.
+"""Render /workspace/.mcp.json (and pi's home MCP settings) inside a sandbox box.
 
 Moved verbatim out of agent/entrypoint.sandbox-box.sh so it has ONE source and
 two callers: the box image bakes it and the entrypoint runs the baked copy at
@@ -23,6 +23,17 @@ Regenerated WHOLESALE every run from three sources:
   source-3 = /workspace/.mcp-preset.json — preset-declared stdio MCPs.
 A name collision is a hard error (exit 1: the boot refuses to start) so a
 project MCP cannot silently shadow the baked browser tooling.
+
+In a box that deploys pi (RS_PI_AGENT_DIR set), pi reads the same servers from
+its home MCP settings, <agent dir>/mcp.json (read in every folder, no trust
+needed). RS merges its entries there by name, each marked "rsManaged": true:
+every run replaces exactly the marked entries (its stale names removed), the
+user's own entries are kept, and an unmarked entry with an RS server's name is
+the user's — left alone and named in a warning. An unreadable or non-object
+file is left alone with a warning; the render never fails over pi's file.
+Nothing is written into /workspace/.pi/. While the project marks this box's
+folder as still holding RS's old files (/opt/rs-box-skills/.old-files), pi's
+home file is not written: RS writes no new copy while an old one is there.
 
 In a restricted browser box that deploys pi, the image's denied tools
 (/opt/sandbox-box/denied-tools.json, {server: [tool, ...]} — the same list
@@ -128,55 +139,63 @@ if preset_path.is_file():
 def write_atomic(path: Path, text: str) -> None:
     """Write via a temp file + rename: an agent session reading the file while a
     LIVE re-render runs (an agent added to a running box) must never see it
-    half-written."""
-    tmp = path.with_name(path.name + ".rs-tmp")
+    half-written. The temp name is unique to this run (the boot's render and a
+    live one can overlap; both compute the same result)."""
+    tmp = path.with_name(f"{path.name}.rs-tmp.{os.getpid()}")
     tmp.write_text(text)
     os.replace(tmp, path)
 
 
-pi_link = Path("/workspace/.pi/mcp.json")
-PI_LINK_TARGET = "../.mcp.json"
 pi_agent_dir = os.environ.get("RS_PI_AGENT_DIR") or ""
+# RS's mark on its own entries in pi's home MCP settings.
+RS_MARK = "rsManaged"
+old_files_mark = Path("/opt/rs-box-skills/.old-files")
 
 
-def pi_link_is_ours() -> bool:
-    return pi_link.is_symlink() and os.readlink(pi_link) == PI_LINK_TARGET
-
-
-def pi_link_set() -> None:
-    """Point /workspace/.pi/mcp.json at the rendered file — idempotent across
-    boots. Anything else at that path (a file the PI made while no link existed,
-    a link of their own) is the PI's: never touched, the link is skipped and pi
-    uses theirs. Never fatal (set -e would crash-loop the box over pi wiring)."""
+def pi_home_merge(rs_servers: dict) -> bool:
+    """Merge RS's servers into pi's home mcp.json by name: drop every entry
+    RS marked before, add each of `rs_servers` marked, keep everything else.
+    An unmarked entry with an RS server's name is the user's: kept, RS's is
+    not added, and the name is warned about. No file and nothing to add: no
+    file is made. Returns True when the file now holds exactly RS's current
+    entries (nothing to do counts); False, with a warning, when it was left
+    alone. Never raises."""
+    path = Path(pi_agent_dir) / "mcp.json"
+    data: dict = {}
     try:
-        if pi_link_is_ours():
-            return
-        if pi_link.is_symlink() or pi_link.exists() or (
-                pi_link.parent.exists() and not pi_link.parent.is_dir()):
-            print(f"sandbox-box: {pi_link} is the PI's own file; pi will not see "
-                  f"the box's MCP servers (remove it to restore the link)", file=sys.stderr)
-            return
-        pi_link.parent.mkdir(exist_ok=True)
-        tmp = pi_link.with_name(pi_link.name + ".rs-tmp")
-        if tmp.is_symlink() or tmp.exists():
-            tmp.unlink()
-        os.symlink(PI_LINK_TARGET, tmp)
-        os.replace(tmp, pi_link)
-    except OSError as e:
-        print(f"sandbox-box: could not link {pi_link}: {e}", file=sys.stderr)
-
-
-def pi_link_clear() -> None:
-    """Remove OUR link (never a PI's file), and the .pi/ folder when that leaves
-    it empty. Never fatal."""
+        if path.is_symlink() or path.exists():
+            data = json.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError) as e:
+        print(f"sandbox-box: pi's MCP settings {path} could not be read ({e}); "
+              f"left alone, pi does not see the box's MCP servers", file=sys.stderr)
+        return False
+    if not isinstance(data, dict) or not isinstance(data.get("mcpServers", {}), dict):
+        print(f"sandbox-box: pi's MCP settings {path} are not the expected shape; "
+              f"left alone, pi does not see the box's MCP servers", file=sys.stderr)
+        return False
+    current = data.get("mcpServers", {})
+    merged = {n: c for n, c in current.items()
+              if not (isinstance(c, dict) and c.get(RS_MARK) is True)}
+    clashes = sorted(n for n in rs_servers if n in merged)
+    for n, cfg in rs_servers.items():
+        if n in merged:
+            continue
+        merged[n] = {**(cfg if isinstance(cfg, dict) else {}), RS_MARK: True}
+    if clashes:
+        print(f"sandbox-box: pi's MCP settings already hold your own "
+              f"{', '.join(map(repr, clashes))}; kept, so pi does not get the "
+              f"box's server(s) of that name", file=sys.stderr)
+    if merged == current and (path.exists() or not merged):
+        return True
+    data["mcpServers"] = merged
     try:
-        if pi_link_is_ours():
-            pi_link.unlink()
-        if pi_link.parent.is_dir() and not pi_link.parent.is_symlink() \
-                and not any(pi_link.parent.iterdir()):
-            pi_link.parent.rmdir()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_atomic(path, json.dumps(data, indent=2) + "\n")
     except OSError as e:
-        print(f"sandbox-box: could not remove {pi_link}: {e}", file=sys.stderr)
+        print(f"sandbox-box: could not write pi's MCP settings {path}: {e}",
+              file=sys.stderr)
+        return False
+    return True
 
 
 def pi_trust_workspace() -> None:
@@ -190,7 +209,7 @@ def pi_trust_workspace() -> None:
         data = json.loads(trust.read_text()) if trust.exists() else {}
         if not isinstance(data, dict):
             raise ValueError("not a JSON object")
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         print(f"sandbox-box: leaving {trust} alone ({e})", file=sys.stderr)
         return
     if "/workspace" in data:
@@ -198,16 +217,15 @@ def pi_trust_workspace() -> None:
     data["/workspace"] = True
     try:
         trust.parent.mkdir(parents=True, exist_ok=True)
-        tmp = trust.with_name(trust.name + ".rs-tmp")
-        tmp.write_text(json.dumps(data, indent=2) + "\n")
-        os.replace(tmp, trust)
+        write_atomic(trust, json.dumps(data, indent=2) + "\n")
     except OSError as e:
         print(f"sandbox-box: could not write {trust}: {e}", file=sys.stderr)
 
 
 # The image's denied tools, for pi only (claude's deny is the image's managed
-# settings). Read BEFORE pi_trust_workspace(): the host's live re-render keys
-# "wired" on trust.json, so a refused render must leave it unwritten.
+# settings). Read BEFORE pi's home settings and trust record are written: the
+# host's live re-render keys "wired" on trust.json, so a refused render must
+# leave it unwritten.
 denied_path = Path("/opt/sandbox-box/denied-tools.json")
 denied: dict = {}
 if pi_agent_dir and not browser_trusted and denied_path.is_file():
@@ -252,21 +270,24 @@ def browser_section() -> str:
             f"every agent in this box (a call is refused): {names}.\n")
 
 
-pi_trust_workspace()
+def pi_servers() -> dict:
+    """RS's servers as pi reads them: each with `exposure: direct` and, in a
+    restricted browser box, the denied tools hidden — copies, so
+    /workspace/.mcp.json (claude's) carries none of pi's keys."""
+    out: dict = {}
+    for n, cfg in servers.items():
+        c = dict(cfg) if isinstance(cfg, dict) else {}
+        c.setdefault("exposure", "direct")
+        if denied.get(n):
+            te = c.get("toolExposure")
+            c["toolExposure"] = {**(te if isinstance(te, dict) else {}),
+                                 **dict.fromkeys(denied[n], "hidden")}
+        out[n] = c
+    return out
+
+
 if servers:
-    if pi_agent_dir:
-        for n, cfg in servers.items():
-            if isinstance(cfg, dict):
-                cfg.setdefault("exposure", "direct")
-                if denied.get(n):
-                    te = cfg.get("toolExposure")
-                    cfg["toolExposure"] = {**(te if isinstance(te, dict) else {}),
-                                           **dict.fromkeys(denied[n], "hidden")}
     write_atomic(mcp_path, json.dumps({"mcpServers": servers}, indent=2, sort_keys=True) + "\n")
-    if pi_agent_dir:
-        pi_link_set()
-    else:
-        pi_link_clear()
     rows = []
     for n, cfg in sorted(servers.items()):
         t = cfg.get("type", "?") if isinstance(cfg, dict) else "?"
@@ -277,15 +298,21 @@ if servers:
         f"# Tools wired into this box\n\n"
         f"Rendered at boot from .mcp-proxy.json (project MCPs) + image-baked + preset tools.\n"
         f"claude auto-discovers /workspace/.mcp.json"
-        + (f" (pi reads it through /workspace/.pi/mcp.json)" if pi_agent_dir else "")
+        + (f"; pi reads the same servers from its own MCP settings in its home "
+           f"folder (`mcp.json` in pi's agent folder), where RS's entries carry "
+           f"`\"rsManaged\": true` and are replaced at every boot while your own "
+           f"entries are kept" if pi_agent_dir else "")
         + f" — call tools by name. /workspace/.mcp.json is rewritten at every "
-        f"boot: a server added to it"
-        + (f" (also by `pi mcp add -l`, which writes through the link)" if pi_agent_dir else "")
-        + f" lasts until the box restarts.\n\n"
+        f"boot: a server added to it lasts until the box restarts.\n\n"
         f"| Name | Type | Location |\n|---|---|---|\n" + "\n".join(rows) + "\n"
         + browser_section())
 else:
     for p in (mcp_path, inv_path):
         if p.exists():
             p.unlink()
-    pi_link_clear()
+# pi's home settings, then its trust record — only once the merge succeeded
+# (the trust record is what the host reads as "wired"). Never while the box's
+# folder still holds RS's old files. Never a reason for a non-zero exit.
+if pi_agent_dir and not old_files_mark.exists():
+    if pi_home_merge(pi_servers()):
+        pi_trust_workspace()

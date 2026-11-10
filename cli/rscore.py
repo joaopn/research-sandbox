@@ -8068,7 +8068,8 @@ _AGENT_INSTALL = {
         # NO mcp.json and NO trust.json: on pi >= 1.0 both are the PI's own state
         # (`pi mcp add`, `/mcp` toggles, trust answers) — the supervisor's
         # `cp -af` overlay deploy would clobber theirs. A box's MCP servers reach
-        # pi through the box entrypoint's `.pi/mcp.json` link instead.
+        # pi through the box's MCP render instead, which merges only RS's own
+        # marked entries into pi's home mcp.json.
         "files": [
             # pi's canonical settings ride BESIDE local/ (like claude's
             # claude/settings.json): every deploy site installs them NO-CLOBBER into
@@ -9241,10 +9242,13 @@ def _refresh_running_boxes(supervisor: str, agents: "Sequence[str]", progress,
     chown; then, only where pi is present but not yet wired (its trust record
     for /workspace missing — pi just arrived, or an earlier render failed), the
     box's MCP render (agent/box-render-mcp.py, streamed from the host so an
-    older box image is wired too) — never otherwise, because it regenerates
-    .mcp.json wholesale and would drop servers added by hand; then the editor extension
+    older box image is wired too; it merges RS's servers into pi's home MCP
+    settings) — never otherwise, because it regenerates .mcp.json wholesale
+    and would drop servers added by hand; then the editor extension
     (forced on an Update, install-if-absent on an Add). A box that fails is
-    reported by NAME and never stops the others. Returns (refreshed, failed)."""
+    reported by NAME and never stops the others; a box still booting (no
+    ~/.rs-role yet) is reported not refreshed and left to its boot. Returns
+    (refreshed, failed)."""
     refreshed: list[str] = []
     failed: list[str] = []
     pi_dir = f"{_BOX_HOME}/{PI_AGENT_DIR_REL}"
@@ -9267,6 +9271,15 @@ def _refresh_running_boxes(supervisor: str, agents: "Sequence[str]", progress,
         return [], ["(the box list)"]
     for box in boxes:
         inner = ["docker", "exec", supervisor, "docker", "exec"]
+        # A box still booting copies the agents and renders its MCP settings
+        # itself: nothing is written into it before its boot wrote ~/.rs-role
+        # (a write during the boot copy once crashed a box).
+        if run([*inner, box, "test", "-e", f"{_BOX_HOME}/.rs-role"],
+               capture_output=True).returncode != 0:
+            failed.append(box)
+            progress.step("agents", f"box {box}: NOT refreshed (it is still starting; "
+                                    f"it takes the project's agents as it starts)")
+            continue
         ok = run([*inner, "-u", "0", box, "sh", "-c", deploy], capture_output=True).returncode == 0
         why = "" if ok else " (the agent copy did not land)"
         needs_render = (ok and run([*inner, box, "test", "-x", f"{_BOX_HOME}/.local/bin/pi"],
