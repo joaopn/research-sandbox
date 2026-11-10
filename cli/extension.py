@@ -3,7 +3,7 @@
 After STAGE_BOX_EXT_UX the PI-role / BYO-isolated *enable* lineage is gone
 (retired greenfield). What remains here is the shared substrate the box
 surface (``kind="sandbox"`` boxes, owned by the in-supervisor ``rs-sandbox``
-CLI) leans on: the generic box-image registry refs, the inner-container
+CLI) leans on: the box-image registry locator, the inner-container
 name / workspace-subdir / label conventions, and the per-project
 ``extensions.json`` state file (boxes write their entries here).
 
@@ -24,20 +24,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import orch_files  # noqa: E402  (no-follow access to <workspace>/.orchestrator)
 
-# GENERIC registry-delivered box images (STAGE_FEATURE_STAGING lane-3). Generic,
-# non-role images: the two blank-box images the in-supervisor rs-sandbox runs.
-# Mapping: host image base -> (registry repo, versions.env pin key). A project's
-# inner dockerd pulls rs-registry:5000/<repo>@<digest>; the project records the
-# host image id it holds (project.json `box_images`, rscore._bring_box_image),
-# which is what moves it to a new build, not the pin. ``EXT_REGISTRY`` is the
-# inner-pull locator and MUST match the inner daemon's insecure-registries entry
-# (agent/Dockerfile.substrate-base). The host build also tags rs-<base>:<pin>
-# (rscore._build_images), a label only.
+# The registry-delivered box images: the two blank-box images the in-supervisor
+# rs-sandbox runs (rscore._BOX_IMAGES names them and their registry repos). A
+# project's inner dockerd pulls rs-registry:5000/<repo>@<digest>; the project
+# records the host image id it holds (project.json `box_images`,
+# rscore._bring_box_image), which is what moves it to a new build.
+# ``EXT_REGISTRY`` is the inner-pull locator and MUST match the inner daemon's
+# insecure-registries entry (agent/Dockerfile.substrate-base).
 EXT_REGISTRY = "rs-registry:5000"
-GENERIC_REGISTRY_IMAGES: dict[str, tuple[str, str]] = {
-    "rs-sandbox-box":         ("sandbox-box", "SANDBOX_BOX_VERSION"),
-    "rs-sandbox-box-browser": ("sandbox-box-browser", "SANDBOX_BOX_BROWSER_VERSION"),
-}
 
 # --- Sandbox-project boxes (kind="sandbox") -------------------------------
 # Box flavor (STAGE_SANDBOX_PROJECT.md): blank rs-sandbox-box containers the PI

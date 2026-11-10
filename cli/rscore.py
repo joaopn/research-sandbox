@@ -5879,7 +5879,7 @@ ROLE_MCP_BASE_IMAGE = "rs-role-mcp-base:latest"
 # Clean, research-DECOUPLED base for the box node images (STAGE_FEATURE_STAGING
 # C1). FROM miniconda3 (NOT rs-analysis-base) — sibling of rs-minimal-base, forked
 # on rebuild-blast-radius. The lane-3 generic box images (sandbox-box[-browser])
-# FROM it. See cli/extension.py GENERIC_REGISTRY_IMAGES.
+# FROM it. See _BOX_IMAGES (the box images and their registry repos).
 EXT_BASE_IMAGE = "rs-ext-base:latest"
 # Disposable box image for the agent-less sandbox-project flavor
 # (STAGE_SANDBOX_PROJECT.md). FROM rs-ext-base (lane-3) — lean (no data-science
@@ -10349,8 +10349,7 @@ def _image_build_specs() -> list:
     skipped SILENTLY here — this is a pure query with no side channel (the
     operator warning lives on the build path, re-derived in _build_images). Shared
     with software_status so the panel's image fleet is exactly the build fleet,
-    never a drifting copy of the tag list. Excludes the lane-3 :<pin> snapshot
-    retags — they're derived from the same pins the panel already shows."""
+    never a drifting copy of the tag list."""
     specs = [
         # No-DIND base MUST build first: rs-substrate-base AND rs-minimal both
         # FROM it (WORKFLOW_TAXONOMY_S1.md carve).
@@ -10426,21 +10425,6 @@ def _build_images(force: bool, progress=None) -> None:
             *build_args,
             str(SCRIPT_DIR),
         ])
-    progress.step("retag", "retagging generic images")
-
-    # Lane-3 generic images (STAGE_FEATURE_STAGING): retag each :latest with its
-    # content-snapshot pin, a label for people (a project's delivery keys on the
-    # image id, _bring_box_image, never on this tag). :latest stays for
-    # the FROM chains (sandbox-box-browser FROM rs-sandbox-box:latest) + the
-    # SANDBOX_BOX_IMAGE / rs-sandbox BOX_IMAGE constants + the inner retag target.
-    for host_base, (_repo, vkey) in sorted(extension.GENERIC_REGISTRY_IMAGES.items()):
-        pin = pins.get(vkey)
-        if not pin:
-            print(f"warning: {host_base} missing pin {vkey} in versions.env; "
-                  f"skipping snapshot retag", file=sys.stderr)
-            continue
-        if run_quiet(["docker", "image", "inspect", f"{host_base}:latest"]):
-            run_check(["docker", "tag", f"{host_base}:latest", f"{host_base}:{pin}"])
 
 
 def rebuild(progress=None) -> None:
@@ -14471,8 +14455,8 @@ def _plan_project_instructions(project: str, workspace_path: "Path", *,
     state, data = _read_marker_three_way(workspace_path)
     what = f"the project's settings ({orch_files.SHOWN_FOLDER}/project.json)"
     if state != "ok" or not isinstance(data.get("type"), str):
-        # A marker without `type` is one a step synthesized (the box-pin
-        # backfill writes a pins-only marker): read as unknown, never as
+        # A marker without `type` is not one RS writes (older versions'
+        # box-pin backfill could synthesize one): read as unknown, never as
         # "not dev".
         return _InstrPlan(what=what)
     plan = _InstrPlan(cleared=data.get(OLD_INSTRUCTIONS_FLAG) is True)
