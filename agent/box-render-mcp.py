@@ -32,8 +32,10 @@ user's own entries are kept, and an unmarked entry with an RS server's name is
 the user's — left alone and named in a warning. An unreadable or non-object
 file is left alone with a warning; the render never fails over pi's file.
 Nothing is written into /workspace/.pi/. While the project marks this box's
-folder as still holding RS's old files (/opt/rs-box-skills/.old-files), pi's
-home file is not written: RS writes no new copy while an old one is there.
+folder as still holding RS's old files (/opt/rs-box-skills/.old-files), or
+the box runs without that staged folder (it was last run before RS kept its
+files outside the box's folder, so its folder was never checked), pi's home
+file is not written: RS writes no new copy while an old one may be there.
 The entries in /workspace/.mcp.json carry pi's keys too in a box with pi
 (claude ignores them): an old /workspace/.pi/mcp.json link still in place
 reads that file, and the restricted browser's deny must reach pi through it.
@@ -315,6 +317,7 @@ def is_gateway(entry) -> bool:
     return isinstance(headers, dict) and any(
         isinstance(h, str) and h.lower() == GATEWAY_MARK_HEADER.lower() for h in headers)
 old_files_mark = Path("/opt/rs-box-skills/.old-files")
+staged_skills = old_files_mark.parent
 
 
 def pi_home_merge(rs_servers: dict) -> bool:
@@ -512,7 +515,10 @@ else:
             p.unlink()
 # pi's home settings, then its trust record — only once the merge succeeded
 # (the trust record is what the host reads as "wired"). Never while the box's
-# folder still holds RS's old files. Never a reason for a non-zero exit.
-if pi_agent_dir and not old_files_mark.exists():
+# folder still holds RS's old files, and never in a box last run before RS
+# staged its skills outside the box's folder (no staged folder, hence no mark
+# to read: its folder was never checked; the next run of the box mounts it).
+# Never a reason for a non-zero exit.
+if pi_agent_dir and staged_skills.is_dir() and not old_files_mark.exists():
     if pi_home_merge(pi_servers()):
         pi_trust_workspace()
