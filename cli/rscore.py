@@ -19531,13 +19531,12 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
                   f"or it may be failing (a failed setup restarts the box and "
                   f"retries); check the box's tab before starting the agent")
     # A box keeping history: its notes came from a clone, so its folder is
-    # checked for RS's old files once its setup has finished (its record's
-    # flag set then); one found fails the add, the box kept for Remove.
+    # checked for RS's old files once the setup made it (its record's flag set
+    # then); one found fails the add at its end, after the history outcome is
+    # reported, the box kept for Remove.
     if history_args and not boot_timed_out:
-        files_found = _box_tool_home_skills(req.project, container,
+        create_old += _box_tool_home_skills(req.project, container,
                                             ["--box", info["name"]], progress)
-        if files_found:
-            _raise_old_instructions(files_found)
     # The box's own history outcome: a fixed code it wrote, mapped to fixed
     # text here (the box's text never reaches the browser).
     if history_args:
