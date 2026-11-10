@@ -46,6 +46,8 @@ COPY container/rs-instructions-notice.md /opt/claude-templates/rs-instructions-n
 # into /workspace: the host refuses to start a research project on an image
 # without it (its old boot script put RS's text into the project's folders).
 LABEL research.instructions-layout=home
+# The inner guard in this image lets a box reach the shared MCP gateway.
+LABEL research.mcp-gateway-guard=1
 COPY container/supervisor/commands/ /opt/claude-templates/commands/
 COPY container/supervisor/logbook_supervisor_template.md /opt/claude-templates/logbook_supervisor_template.md
 COPY container/supervisor/logbook_pi_template.md /opt/claude-templates/logbook_pi_template.md

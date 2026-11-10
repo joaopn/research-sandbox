@@ -188,7 +188,7 @@ DEV_BOX_LOCKS_DIR = BROKER_DIR / "dev-box-locks"
 #   * LIFECYCLE_HOLDER — {op_id} of the lane op currently holding the flock, so a
 #     reader can tell running from queued.
 LIFECYCLE_LOCKS_DIR = BROKER_DIR / "lifecycle-locks"
-LIFECYCLE_LOCK = BROKER_DIR / "lifecycle.lock"
+LIFECYCLE_LOCK = rscore.LIFECYCLE_LOCK_PATH      # one path for the lane and the host verbs
 LIFECYCLE_HOLDER = BROKER_DIR / "lifecycle.holder"
 
 # Max bytes returned per op_full_tail poll. Bounds ONE reply frame — a fleet-build
@@ -437,6 +437,39 @@ def _verb_mcp_server_test(args: dict, _progress=None) -> dict:
 
 def _verb_mcp_server_list_reset(_args: dict, _progress=None) -> dict:
     return rscore.mcp_server_list_reset(blocking=False, deadline=rscore._mcp_deadline())
+
+
+def _verb_mcp_wiring(args: dict, _progress=None) -> dict:
+    """Who is wired to what, what each project last reported applying (host
+    file reads), and what can be wired (one bounded container listing). No
+    exec into any container."""
+    safe = {k: v for k, v in args.items() if k in MCP_WIRING_WEBUI_FIELDS}
+    project = safe.get("project")
+    if project is not None and not isinstance(project, str):
+        raise rscore.ValidationError("the project name is not valid")
+    out = rscore.mcp_wiring(project)
+    # What can be wired (one bounded container listing).
+    out["targets"] = rscore.mcp_targets(rscore._mcp_deadline())
+    return out
+
+
+def _verb_mcp_wire(args: dict, _progress=None) -> dict:
+    """Wire one consumer. Inline: one deadline for every docker call in it (a
+    full change measures under a second per server and agent); refused `busy`
+    while that project is in the lifecycle lane (_INLINE_PROJECT_KEY) or while
+    a build-lane action is replacing the gateway."""
+    # Taken FIRST: every step below shares it.
+    deadline = rscore._mcp_deadline()
+    if any(op.get("state") == "running"
+           and op.get("target") in ("mcp-gateway", "fleet") for op in _live_build_ops()):
+        raise rscore.ValidationError(MCP_GATEWAY_RESTARTING)
+    safe = {k: v for k, v in args.items() if k in MCP_WIRE_WEBUI_FIELDS}
+    req = rscore.McpWireRequest.from_kwargs(**safe)
+    return rscore.mcp_wire(req, blocking=False, deadline=deadline)
+
+
+def _verb_mcp_grants_reset(_args: dict, _progress=None) -> dict:
+    return rscore.mcp_grants_reset(blocking=False, deadline=rscore._mcp_deadline())
 
 
 def _verb_mcp_gateway_start(_args: dict, progress=None) -> dict:
@@ -1178,6 +1211,9 @@ MCP_SERVER_ADD_WEBUI_FIELDS = frozenset({"name", "url", "description", "headers"
 MCP_SERVER_EDIT_WEBUI_FIELDS = frozenset({"name", "url", "description",
                                           "headers_set", "headers_remove"})
 MCP_SERVER_NAME_WEBUI_FIELDS = frozenset({"name"})
+# Wiring one consumer (a project's agents, or one of its boxes) to servers.
+MCP_WIRE_WEBUI_FIELDS = frozenset({"project", "box", "servers"})
+MCP_WIRING_WEBUI_FIELDS = frozenset({"project"})
 # Put one version pin back to the shipped value (the Sandboxes → Software tab's "Use repo
 # version" button). One name-shaped token; the request refuses anything that is
 # not a resettable pin of the tracked versions.env.
@@ -1377,6 +1413,9 @@ VERBS = {
     "mcp_server_remove": _verb_mcp_server_remove,
     "mcp_server_test": _verb_mcp_server_test,
     "mcp_server_list_reset": _verb_mcp_server_list_reset,
+    "mcp_wiring": _verb_mcp_wiring,
+    "mcp_wire": _verb_mcp_wire,
+    "mcp_grants_reset": _verb_mcp_grants_reset,
     "pin_reset": _verb_pin_reset,
     "software_status": _verb_software_status,
     "agent_refresh_check": _verb_agent_refresh_check,
@@ -2253,6 +2292,7 @@ _INLINE_PROJECT_KEY = {
     "project_folders_set": "project",
     "port_add": "project", "port_remove": "project", "port_detect": "project",
     "box_web_address": "project",
+    "mcp_wire": "project",
 }
 # Inline verbs that take the host-wide lifecycle flock (non-blocking).
 _INLINE_EXCLUSIVE = frozenset({"create", "destroy"})

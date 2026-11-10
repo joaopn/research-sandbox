@@ -195,6 +195,28 @@ REJECTED=0
 SKIPPED_NO_BRIDGE=0
 GITEA_IP=""
 MCP_PAIRS=0
+# The shared MCP gateway sits at ONE fixed address in every project: the last
+# usable host address of the project's own network (the uplink's network).
+# Computed here, from this container's own interface — nothing writes it down,
+# so there is nothing to keep in step. Boxes (rs-inner) and dev boxes (their
+# own bridges) reach it through this one exception; the gateway itself decides
+# who may use which server. A range with no such address adds no rule.
+MCP_GATEWAY_PORT=8888
+MCP_GATEWAY_IP="$(ip -o -4 addr show dev "$UPLINK" 2>/dev/null \
+    | awk '{for (i = 1; i <= NF; i++) if ($i == "inet") {print $(i + 1); exit}}' \
+    | python3 -c '
+import ipaddress, sys
+try:
+    net = ipaddress.ip_interface(sys.stdin.read().strip()).network
+    if net.version == 4 and net.num_addresses >= 4:
+        print(net.broadcast_address - 1)
+except ValueError:
+    pass
+' 2>/dev/null || true)"
+if [[ -n "$MCP_GATEWAY_IP" ]]; then
+    RULES+="-A ${FWD_CHAIN} -d ${MCP_GATEWAY_IP} -p tcp --dport ${MCP_GATEWAY_PORT} -j RETURN
+"
+fi
 while read -r kind a b; do
     case "$kind" in
         gitea)

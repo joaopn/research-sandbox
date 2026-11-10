@@ -4368,6 +4368,8 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     if container_exists(container_name):
         die(f"project {project!r} already exists (container {container_name}). "
             f"Use destroy first.")
+    # Wiring left behind by an earlier project of this name belongs to nothing.
+    mcp_forget_dead_project(project)
     # A same-named create reuses a leftover workspace, whose settings folder a
     # previous project's agent controlled: refuse a link there before any side
     # effect (every write below opens the folder without following a link).
@@ -5150,7 +5152,18 @@ def destroy(req: DestroyRequest, cfg: "Config" | None = None,
             progress.step("warning", msg)
     if volume_exists(docker_volume):
         run(["docker", "volume", "rm", docker_volume], capture_output=True)
-    remove_project_network(project)
+    # The project's MCP wiring goes BEFORE its network: the range returns to
+    # docker's pool, and no token may stay valid for it. A table that cannot
+    # be changed is a warning — the dead project's tokens exist nowhere else.
+    warn = _mcp_drop_rows(project)
+    if warn:
+        print(f"warning: {warn}", file=sys.stderr)
+        progress.step("warning", warn)
+    # Under the lifecycle flock when it can be had at once (the broker's inline
+    # destroy already holds it): a fleet-wide gateway attach must not re-attach
+    # the gateway between the disconnects and the removal.
+    with _lifecycle_flock_if_free():
+        remove_project_network(project)
     # Retire the project's dev-lane consumers (best-effort — a destroy must not
     # die on a corrupt record or a sick gitea): archive every consumer fork
     # (history kept, users stay inert) + delete their host token files, THEN
@@ -5978,7 +5991,7 @@ BRIDGE_NAME_OPTION = "com.docker.network.bridge.name"
 # operator's host-hardening rules then drop.
 GATEWAY_PRIORITY = 1
 GATEWAY_NETWORK_RUN_ARG = f"name={ROUTER_NETWORK},gw-priority={GATEWAY_PRIORITY}"
-ENGINE_VERSION_FLOOR = "28.0.0"
+ENGINE_VERSION_FLOOR = "29.0.0"
 COMPOSE_VERSION_FLOOR = "2.33.1"
 
 
@@ -7474,6 +7487,27 @@ def ensure_project_network(project: str, mode: str) -> tuple[str, str]:
     return network, router_ip
 
 
+@contextlib.contextmanager
+def _lifecycle_flock_if_free():
+    """Hold the host-wide lifecycle flock for the block when nobody else has
+    it; proceed without it otherwise (the holder is this very action's own
+    broker, or a lane action that touches other projects)."""
+    lock_f = None
+    try:
+        LIFECYCLE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        lock_f = open(LIFECYCLE_LOCK_PATH, "a")
+        fcntl.flock(lock_f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        if lock_f is not None:
+            lock_f.close()
+        lock_f = None
+    try:
+        yield
+    finally:
+        if lock_f is not None:
+            lock_f.close()
+
+
 def remove_project_network(project: str) -> None:
     network = project_network_for(project)
     remove_firewall_rules(network)
@@ -7490,7 +7524,8 @@ def remove_project_network(project: str) -> None:
     # container can never start again — which would break the upgrade's
     # rollback or Recover.
     for svc in (ROUTER_CONTAINER, WEBUI_CONTAINER, REGISTRY_CONTAINER,
-                gitea.GITEA_CONTAINER, GITEA_PREVIOUS_CONTAINER):
+                gitea.GITEA_CONTAINER, GITEA_PREVIOUS_CONTAINER,
+                MCP_GATEWAY_CONTAINER):
         run(["docker", "network", "disconnect", network, svc],
             capture_output=True)
     run(["docker", "network", "rm", network], capture_output=True)
@@ -11268,6 +11303,12 @@ def _recreate_supervisor(
     # the supervisor halves; restage BEFORE the box relaunch loop below, whose
     # _rerun_box create→cp→start reads them (the order-is-load-bearing class).
     _stage_box_env_files(project, container)
+    # The project's wired MCP servers, BEFORE its boxes come back (each box's
+    # start runs the staged tool). A sandbox-dind project was already given
+    # them with its instructions above; research (which writes its own
+    # instructions at boot) gets them here.
+    if md_ptype != PROJECT_TYPE_SANDBOX_DIND:
+        mcp_sync_project(project, container, progress=progress)
     # F3 Slice 2a: the sysbox recreate reset the supervisor's netns/processes —
     # re-establish loopback forwarders for its registered exported ports (Fork-B).
     _reconcile_loopback_bridges(project, cfg)
@@ -14639,6 +14680,11 @@ def _write_project_instructions(project: str, container: str, workspace_path: "P
     the container's labels. Every failure is a warning; an old
     /workspace/CLAUDE.md is RETURNED, never raised here — the operation's
     later steps must still run, and the verb raises once at its end."""
+    # Every site that calls this is a project coming up or gaining an agent:
+    # the same moment its agents need their wired MCP servers (a no-op, with
+    # no docker call, for a project that has no wiring). A research recreate
+    # does not come through here; _recreate_supervisor calls it itself.
+    mcp_sync_project(project, container, progress=progress)
     labels = _container_layout_labels(container)
     if labels is None:
         _report_warnings([_INSTR_LABELS_UNKNOWN], progress)
@@ -15892,6 +15938,9 @@ def _mcp_gateway_up(deadline: float | None = None) -> tuple[bool, str]:
             # The operator's uid: the rendered list is 0600 in a 0700 folder.
             "--user", f"{os.getuid()}:{os.getgid()}",
             "--add-host", "host.docker.internal:host-gateway",
+            # It sits on every project's network: it must never pass packets
+            # between them (a container forwards by default; measured).
+            "--sysctl", "net.ipv4.ip_forward=0",
             "--restart", "unless-stopped",
             # The DIRECTORY: the rendered file is replaced by rename.
             "-v", f"{mcp_servers.GATEWAY_DIR}:/etc/mcp-gateway:ro",
@@ -15902,6 +15951,11 @@ def _mcp_gateway_up(deadline: float | None = None) -> tuple[bool, str]:
         err = [l for l in (r.stderr or r.stdout or "").splitlines() if l.strip()]
         return False, ("the MCP gateway could not be started"
                        + (f" ({err[0].strip()[:200]})" if err else ""))
+    # A created gateway is on rs-sandbox only: put it back into every project
+    # (deadline None = the CLI or a build-lane child, which may wait for the
+    # lifecycle flock; no inline verb reaches this branch).
+    if state == "absent" and deadline is None:
+        mcp_gateway_attach_all()
     return True, "the MCP gateway was started"
 
 
@@ -15920,22 +15974,31 @@ def _mcp_gateway_build() -> bool:
 
 
 def start_mcp_gateway_with_fleet(rebuild: bool = False) -> None:
-    """`research start`'s step: build the gateway's image when it is missing
-    (or on --rebuild) and bring the gateway up — or WARN and carry on: nothing
-    else in the fleet depends on it."""
+    """`research start`'s step: build the gateway's image and bring the gateway
+    up — or WARN and carry on: nothing else in the fleet depends on it. The
+    image is built at EVERY start (cached: seconds), as the router's is: the
+    host's wiring code and the gateway's program must be the same version, and
+    a start after an upgrade would otherwise keep running the old program.
+    `rebuild` is accepted for the caller's symmetry; the build is the same."""
     try:
-        if rebuild or not _mcp_gateway_image_id(None):
+        if True:
             print(f"building {MCP_GATEWAY_IMAGE}...")
             if not _mcp_gateway_build():
                 if not _mcp_gateway_image_id(None):
                     raise ValidationError("the MCP gateway's image could not be built")
                 print(f"warning: {MCP_GATEWAY_IMAGE} could not be rebuilt; the "
-                      "gateway keeps its previous image", file=sys.stderr)
+                      "gateway keeps its previous image, which may be older "
+                      "than this version of RS: wired MCP servers can be "
+                      "refused until a start builds it", file=sys.stderr)
         ok, msg = _mcp_gateway_up()
     except ValidationError as e:
         ok, msg = False, str(e)
     if ok:
         print(msg)
+        # Always, at every fleet start: a gateway that was already running (a
+        # host reboot restarts it by itself) is attached and its ranges
+        # recorded too. Idempotent.
+        mcp_gateway_attach_all()
     else:
         print(f"warning: {msg}; MCP servers are unavailable until it runs",
               file=sys.stderr)
@@ -16077,6 +16140,15 @@ class McpServerEditRequest:
             headers_set=headers_set, headers_remove=tuple(remove))
 
 
+def _mcp_servers_with_wiring(rows: list) -> list:
+    """Each server row plus who is wired to it ([[project, consumer], ...])."""
+    state, grants, _why = mcp_servers.read_grants()
+    for row in rows:
+        row["wired"] = ([list(pair) for pair in mcp_servers.wired_to(grants, row["name"])]
+                        if state == mcp_servers.OK else [])
+    return rows
+
+
 def mcp_server_list(deadline: float | None = None) -> dict:
     """The MCP page's payload: the servers (header NAMES only), the gateway's
     state, and what is wrong with the list when it cannot be used. Never raises
@@ -16088,7 +16160,7 @@ def mcp_server_list(deadline: float | None = None) -> dict:
     elif state == mcp_servers.NEWER:
         error = mcp_servers.NEWER_TEXT
     return {
-        "servers": mcp_servers.public_view(data),
+        "servers": _mcp_servers_with_wiring(mcp_servers.public_view(data)),
         "gateway": mcp_gateway_state(deadline),
         "list": state,
         "error": error,
@@ -16141,10 +16213,35 @@ def mcp_server_edit(req: McpServerEditRequest, *, blocking: bool = True,
 
 def mcp_server_remove(req: McpServerNameRequest, *, blocking: bool = True,
                       deadline: float | None = None) -> dict:
-    def change(data: dict) -> None:
-        if data["servers"].pop(req.name, None) is None:
-            raise mcp_servers.ServerListError(f"no server named {req.name} is on the list")
-    _mcp_change(change, blocking=blocking, deadline=deadline)
+    """Take a server off the list and unwire it everywhere — in the table
+    only: the gateway refuses it at once, and each agent's leftover entry goes
+    at that container's next start or wiring change. A wiring table that
+    cannot be used refuses the removal before anything is written; the list is
+    saved first, so a failure in between leaves a table naming a server that
+    is gone (refused by the gateway), never a listed server that lost its
+    wiring."""
+    try:
+        with mcp_servers.lock(blocking=blocking):
+            data = mcp_servers.load()
+            if req.name not in data["servers"]:
+                raise mcp_servers.ServerListError(
+                    f"no server named {req.name} is on the list")
+            grants = mcp_servers.load_grants()
+            del data["servers"][req.name]
+            mcp_servers.save(data)
+            mcp_servers.render(data)
+            touched = False
+            for row in grants["projects"].values():
+                for consumer in row["consumers"].values():
+                    if req.name in consumer["servers"]:
+                        consumer["servers"].remove(req.name)
+                        touched = True
+            if touched:
+                mcp_servers.save_grants(grants)
+                mcp_servers.render_grants(grants)
+    except mcp_servers.ServerListError as e:
+        raise _mcp_list_error(e) from None
+    _mcp_gateway_hup(deadline)
     return mcp_server_list(deadline)
 
 
@@ -16161,6 +16258,21 @@ def mcp_server_list_reset(*, blocking: bool = True,
             if state != mcp_servers.DAMAGED:
                 raise mcp_servers.ServerListError(
                     "the MCP server list is readable; nothing was replaced")
+            # Nobody stays wired to a name on the discarded list (a server
+            # added later under an old name must not inherit its consumers).
+            # A wiring table that cannot be used is left for its own remedy.
+            # The TABLE first: if its save fails the list is still damaged and
+            # this reset can be run again; the other order would leave a
+            # readable list (no reset any more) with everyone still wired.
+            gstate, grants, _gwhy = mcp_servers.read_grants()
+            if gstate == mcp_servers.OK and any(
+                    c["servers"] for row in grants["projects"].values()
+                    for c in row["consumers"].values()):
+                for row in grants["projects"].values():
+                    for c in row["consumers"].values():
+                        c["servers"] = []
+                mcp_servers.save_grants(grants)
+                mcp_servers.render_grants(grants)
             mcp_servers.save(mcp_servers.empty())
             mcp_servers.render(mcp_servers.empty())
     except mcp_servers.ServerListError as e:
@@ -16201,6 +16313,516 @@ def mcp_server_test(req: McpServerNameRequest) -> dict:
     except (ValueError, KeyError, IndexError, TypeError, RecursionError):
         return row("unreachable", "the MCP gateway gave an answer that could not be read")
     return row(outcome, detail[:_MCP_PROBE_DETAIL_MAX], status)
+
+
+# --- wiring: the gateway in each project, and what each consumer may use ------
+# The gateway is attached to every project network at ONE fixed address — the
+# last usable host address of that network's range — so the project container
+# and its boxes all reach it at the same place and nothing has to be healed
+# when the gateway is re-created. Attaching at a chosen address on a network
+# docker picked the range for needs Engine 29.0 (28.x refuses; measured), which
+# is why ENGINE_VERSION_FLOOR is what it is.
+MCP_GATEWAY_PORT = 8888
+# Set on both dind images: their inner guard lets a box reach the gateway.
+MCP_GUARD_LABEL = "research.mcp-gateway-guard"
+MCP_SYNC_SCRIPT = SCRIPT_DIR / "agent" / "rs-mcp-sync.py"
+MCP_SYNC_HOME_DIR = ".rs-mcp"
+MCP_APPLIED_FILE = "mcp-applied.json"
+# The project marker says what was applied; it is written inside the project,
+# so the host reads it bounded and maps every value to this vocabulary.
+MCP_APPLIED_MAX_BYTES = 256 * 1024     # a few hundred consumers' worth of short lines
+_MCP_APPLIED_STATES = frozenset({"applied", "pending", "no agent", "failed"})
+_MCP_APPLIED_OUTCOMES = frozenset({"added", "kept", "removed", "conflict", "failed"})
+# The host-wide lifecycle flock (the broker's lane lock lives here so the host
+# verbs can take it too: a fleet-wide gateway attach and a destroy removing a
+# network must not interleave).
+LIFECYCLE_LOCK_PATH = Path.home() / ".research-sandbox" / "lifecycle.lock"
+# Networks that ALWAYS exist inside a Docker-in-Docker project: its inner
+# docker0 and the pinned inner bridges (rs-inner .99, the dev bridges .100-.111).
+# A project whose own network range overlaps one of them cannot reach its last
+# address, so wiring it is refused. LOCKSTEP with agent/Dockerfile.substrate-base
+# (bip) and cli/rs_sandbox.py (the pinned bridges); pytest-pinned.
+_MCP_INNER_FIXED_RANGES = ("172.17.0.0/16",) + tuple(
+    f"192.168.{n}.0/24" for n in range(99, 112))
+MCP_OLD_IMAGE_BOX = ("this project was made before boxes could reach the MCP "
+                     "gateway; Stop and Start it (after Rebuild all under "
+                     "Sandboxes → Software) and wire its boxes then")
+MCP_GATEWAY_ABSENT = ("the MCP gateway has not been started yet; use Start on "
+                      "this page first")
+
+
+def _mcp_project_subnet(project: str, deadline: float | None) -> str:
+    r = _mcp_docker(["docker", "network", "inspect", project_network_for(project),
+                     "-f", "{{(index .IPAM.Config 0).Subnet}}"], deadline)
+    subnet = r.stdout.strip() if r.returncode == 0 else ""
+    try:
+        if ipaddress.ip_network(subnet).version != 4:
+            raise ValueError
+    except ValueError:
+        raise ValidationError(
+            f"the network of project {project} could not be read") from None
+    return subnet
+
+
+def _mcp_gateway_attach(project: str, deadline: float | None, *,
+                        dind: bool) -> str:
+    """Attach the gateway to one project's network at its fixed address.
+    Returns the network's range. Idempotent; every refusal is a sentence."""
+    subnet = _mcp_project_subnet(project, deadline)
+    net = ipaddress.ip_network(subnet)
+    if dind and any(net.overlaps(ipaddress.ip_network(r)) for r in _MCP_INNER_FIXED_RANGES):
+        raise ValidationError(
+            f"project {project}'s network uses an address range ({subnet}) that "
+            "the networks inside the project also use, so nothing in it could "
+            "reach the MCP gateway; it cannot be wired")
+    try:
+        address = mcp_servers.gateway_address(subnet)
+    except ValueError:
+        raise ValidationError(
+            f"project {project}'s network has no room for the MCP gateway") from None
+    network = project_network_for(project)
+    r = _mcp_docker(["docker", "network", "connect", "--ip", address, network,
+                     MCP_GATEWAY_CONTAINER], deadline)
+    if r.returncode != 0:
+        # Already attached is success only at the fixed address.
+        # A RUNNING gateway must hold the address live. A stopped one reports
+        # no live address, so its configured one counts — but only then: a
+        # connect that failed because the address is taken also leaves the
+        # configured address behind on a running gateway (measured).
+        at = _mcp_docker(["docker", "container", "inspect", "-f",
+                          '{{.State.Running}}|{{with index .NetworkSettings.Networks "'
+                          + network + '"}}{{.IPAddress}}|{{with .IPAMConfig}}'
+                          '{{.IPv4Address}}{{end}}{{end}}',
+                          MCP_GATEWAY_CONTAINER], deadline)
+        running, live, configured = (at.stdout.strip().split("|") + ["", ""])[:3]
+        held = live if running == "true" else configured
+        if at.returncode != 0 or held != address:
+            raise ValidationError(
+                f"the MCP gateway could not be given its address in project "
+                f"{project}'s network (the address is in use, or the host's "
+                "container service refuses a chosen address)")
+    return subnet
+
+
+def _mcp_note_subnets(subnets: dict) -> None:
+    """Record each wired project's network range (file work only) and re-render
+    when one changed. A table that cannot be used is left alone."""
+    try:
+        with mcp_servers.lock():
+            state, data, _why = mcp_servers.read_grants()
+            if state != mcp_servers.OK:
+                return
+            changed = False
+            for project, subnet in subnets.items():
+                row = data["projects"].get(project)
+                if row is not None and row["subnet"] != subnet:
+                    row["subnet"] = subnet
+                    changed = True
+            if changed:
+                mcp_servers.save_grants(data)
+                mcp_servers.render_grants(data)
+    except mcp_servers.ServerListError as e:
+        print(f"warning: {e}", file=sys.stderr)
+        return
+    if changed:
+        _mcp_gateway_hup(None)
+
+
+def _project_networks() -> list[str]:
+    try:
+        r = run(["docker", "network", "ls", "--format", "{{.Name}}",
+                 "--filter", f"name=^{PROJECT_NETWORK_PREFIX}"], capture_output=True)
+    except OSError:
+        return []
+    return sorted(n for n in (r.stdout or "").split() if n.startswith(PROJECT_NETWORK_PREFIX))
+
+
+def mcp_gateway_attach_all() -> None:
+    """Attach the gateway to EVERY project network (after it was created, and at
+    every `research start`). Never on the broker's accept thread: it waits for
+    the lifecycle flock, so it cannot interleave with a destroy removing a
+    network. Every failure is a warning."""
+    subnets: dict = {}
+    try:
+        LIFECYCLE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(LIFECYCLE_LOCK_PATH, "a") as lock_f:
+            fcntl.flock(lock_f, fcntl.LOCK_EX)
+            for network in _project_networks():
+                project = network[len(PROJECT_NETWORK_PREFIX):]
+                container = container_name_for(project)
+                labels = _container_layout_labels(container)
+                dind = labels is not None and labels[0] != Substrate.DOCKER.value
+                try:
+                    subnets[project] = _mcp_gateway_attach(project, None, dind=dind)
+                except ValidationError as e:
+                    # A network that vanished mid-loop is a destroyed project.
+                    if network in _project_networks():
+                        print(f"warning: {e}", file=sys.stderr)
+    except OSError as e:
+        print(f"warning: the MCP gateway could not be attached to the projects "
+              f"({e.strerror or 'lock failed'})", file=sys.stderr)
+        return
+    _mcp_note_subnets(subnets)
+
+
+def _mcp_wanted(row: dict | None) -> dict:
+    """What a project's sync tool is told: names and tokens per consumer (a
+    secret: it goes to the project container's home, never to .orchestrator)."""
+    wanted: dict = {"agent": {"servers": {}}, "boxes": {}}
+    for key, c in ((row or {}).get("consumers") or {}).items():
+        servers = {name: c["token"] for name in c["servers"]}
+        if key == mcp_servers.AGENT_CONSUMER:
+            wanted["agent"] = {"servers": servers}
+        else:
+            wanted["boxes"][key[len(mcp_servers.BOX_CONSUMER_PREFIX):]] = {"servers": servers}
+    return wanted
+
+
+# Writes the two files from one JSON document on stdin: the tool (0700) and the
+# wanted sets (0600), each through a temp + rename in a 0700 folder.
+_MCP_STAGE_SNIPPET = (
+    "import json, os, sys\n"
+    "d = json.loads(sys.stdin.buffer.read())\n"
+    "base = os.path.join(os.path.expanduser('~'), sys.argv[1])\n"
+    "os.makedirs(base, mode=0o700, exist_ok=True)\n"
+    "os.chmod(base, 0o700)\n"
+    "for name, mode, text in (('sync.py', 0o700, d['sync']),\n"
+    "                         ('wanted.json', 0o600, json.dumps(d['wanted']))):\n"
+    "    tmp = os.path.join(base, '.' + name + '.new')\n"
+    "    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)\n"
+    "    with os.fdopen(fd, 'w') as f:\n"
+    "        f.write(text)\n"
+    "    os.chmod(tmp, mode)\n"
+    "    os.replace(tmp, os.path.join(base, name))\n"
+)
+
+
+def _mcp_stage(container: str, wanted: dict, deadline: float | None) -> bool:
+    """Put the sync tool and the wanted sets into a RUNNING project container's
+    home (as its user, over stdin). False when it could not be done."""
+    try:
+        payload = json.dumps({"sync": MCP_SYNC_SCRIPT.read_text(), "wanted": wanted})
+        left = None if deadline is None else deadline - time.monotonic()
+        if left is not None and left <= 0:
+            return False
+        r = run(["docker", "exec", "-i", "-u", "1000", "-e", f"HOME={_AGENT_HOME}",
+                 container, "python3", "-c", _MCP_STAGE_SNIPPET, MCP_SYNC_HOME_DIR],
+                input=payload, capture_output=True, timeout=left)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
+def _mcp_sync_cmd(container: str, scope: list[str], detach: bool) -> list[str]:
+    return ["docker", "exec", *(["-d"] if detach else []), "-u", "1000",
+            "-e", f"HOME={_AGENT_HOME}", container, "python3",
+            f"{_AGENT_HOME}/{MCP_SYNC_HOME_DIR}/sync.py", *scope]
+
+
+def mcp_sync_project(project: str, container: str, *, progress=None) -> None:
+    """A project came up (or gained an agent): attach the gateway, stage the
+    tool and the wanted sets, and let the project apply its own agents' wiring
+    in the background. Boxes apply theirs when they start (rs-sandbox runs the
+    staged tool). Does nothing — no docker call — for a project with no wiring;
+    every failure is a warning."""
+    try:
+        state, data, _why = mcp_servers.read_grants()
+    except OSError:
+        return
+    row = data["projects"].get(project) if state == mcp_servers.OK else None
+    if not row or not row["consumers"]:
+        return
+    labels = _container_layout_labels(container)
+    dind = labels is not None and labels[0] != Substrate.DOCKER.value
+    try:
+        if _mcp_gateway_container(None)[0] != "absent":
+            _mcp_note_subnets({project: _mcp_gateway_attach(project, None, dind=dind)})
+        if not _mcp_stage(container, _mcp_wanted(row), None):
+            raise ValidationError("the project's MCP servers could not be staged")
+        run(_mcp_sync_cmd(container, ["--agent"], detach=True), capture_output=True)
+    except (ValidationError, OSError) as e:
+        _report_warnings([f"{e}; its agents get their MCP servers at the next "
+                          "start or wiring change"], progress)
+
+
+def _mcp_read_applied(project: str) -> dict:
+    """What the project says it applied, per consumer — read without any exec,
+    bounded, and mapped to the fixed vocabulary (the file is the project's)."""
+    try:
+        # Bounded AT the read: the file is the project's to write.
+        raw = orch_files.read_bytes(workspace_path_for(project, load_config()),
+                                    MCP_APPLIED_FILE, max_bytes=MCP_APPLIED_MAX_BYTES)
+    except (OSError, orch_files.Unusable, orch_files.WorkspaceUnopenable):
+        return {}
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError):
+        return {}
+    out: dict = {}
+    if not isinstance(data, dict):
+        return out
+    for key, entry in data.items():
+        if mcp_servers.consumer_problem(key) or not isinstance(entry, dict) \
+                or entry.get("state") not in _MCP_APPLIED_STATES:
+            continue
+        agents: dict = {}
+        raw_agents = entry.get("agents")
+        for agent in ("claude", "pi"):
+            servers = raw_agents.get(agent) if isinstance(raw_agents, dict) else None
+            if isinstance(servers, dict):
+                agents[agent] = {n: o for n, o in servers.items()
+                                 if isinstance(n, str) and mcp_servers.NAME_RE.match(n)
+                                 and o in _MCP_APPLIED_OUTCOMES}
+        out[key] = {"state": entry["state"], "agents": agents}
+    return out
+
+
+def mcp_wiring(project: str | None = None) -> dict:
+    """The wiring as the page shows it: per project and consumer, the servers
+    and what the project last reported applying. No exec, no docker call."""
+    state, data, why = mcp_servers.read_grants()
+    error = None
+    if state == mcp_servers.DAMAGED:
+        error = mcp_servers.GRANTS_DAMAGED_TEXT.format(why=why)
+    elif state == mcp_servers.NEWER:
+        error = mcp_servers.GRANTS_NEWER_TEXT
+    projects: dict = {}
+    for name, row in sorted(data["projects"].items()):
+        if project is not None and name != project:
+            continue
+        applied = _mcp_read_applied(name)
+        projects[name] = {
+            key: {"servers": sorted(c["servers"]), "applied": applied.get(key)}
+            for key, c in sorted(row["consumers"].items())}
+    return {"table": state, "error": error, "projects": projects}
+
+
+def mcp_targets(deadline: float | None = None) -> list:
+    """What the page can offer to wire: each project, whether its own agent
+    can be wired, and its boxes. ONE bounded container listing; the boxes come
+    from each project's own record (a host file read)."""
+    fmt = ("{{.Names}}\t{{.State}}\t{{.Label \"" + SUBSTRATE_LABEL + "\"}}\t{{.Label \""
+           + PROJECT_TYPE_LABEL + "\"}}\t{{.Label \"" + MCP_GUARD_LABEL + "\"}}")
+    r = _mcp_docker(["docker", "ps", "-a", "--filter", f"label={PROJECT_LABEL}",
+                     "--format", fmt], deadline)
+    prefix = container_name_for("")
+    cfg = load_config()
+    out = []
+    for line in (r.stdout or "").splitlines() if r.returncode == 0 else []:
+        parts = (line.split("\t") + [""] * 5)[:5]
+        cname, state, substrate, ptype, guard = parts
+        if not cname.startswith(prefix) or not _PROJECT_NAME_RE.match(cname[len(prefix):]):
+            continue
+        project = cname[len(prefix):]
+        dind = (substrate or Substrate.DIND_SYSBOX.value) != Substrate.DOCKER.value
+        research = dind and ptype in ("", PROJECT_TYPE_RESEARCH)
+        boxes: list = []
+        if dind:
+            try:
+                boxes = sorted(n for n in extension.load(workspace_path_for(project, cfg))
+                               if isinstance(n, str) and not mcp_servers.consumer_problem("box:" + n))
+            except Exception:  # noqa: BLE001 — an unreadable record offers no boxes
+                boxes = []
+        out.append({"project": project, "running": state == "running",
+                    "agent": not research, "boxes": boxes,
+                    "boxes_wirable": guard == "1"})
+    return sorted(out, key=lambda t: t["project"])
+
+
+@dataclass(frozen=True)
+class McpWireRequest:
+    """Set the servers one consumer has: a project's own agents (no box) or one
+    of its boxes. An empty list unwires it."""
+    project: str
+    box: str | None
+    servers: tuple
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "McpWireRequest":
+        project = kw.get("project")
+        if not isinstance(project, str) or not _PROJECT_NAME_RE.match(project):
+            raise ValidationError("a project name is required")
+        box = kw.get("box")
+        if box is not None and (not isinstance(box, str)
+                                or mcp_servers.consumer_problem("box:" + box)):
+            raise ValidationError("the box name is not valid")
+        servers = kw.get("servers")
+        if not isinstance(servers, (list, tuple)) or not all(
+                isinstance(n, str) and mcp_servers.NAME_RE.match(n) for n in servers):
+            raise ValidationError("the servers must be a list of server names")
+        if len(set(servers)) != len(servers):
+            raise ValidationError("a server is named twice")
+        return cls(project=project, box=box, servers=tuple(sorted(servers)))
+
+
+def mcp_wire(req: McpWireRequest, *, blocking: bool = True,
+             deadline: float | None = None) -> dict:
+    """Wire one consumer. Order: refuse what cannot work → the gateway into
+    the project's network (a refusal there writes nothing) → the table (the
+    gateway's truth) → the project applies it to its agents. Returns the
+    project's wiring and what was applied ({"state": "pending"} for a stopped
+    project or box)."""
+    container = container_name_for(req.project)
+    r = _mcp_docker(["docker", "container", "inspect", "-f",
+                     "{{.State.Running}} {{json .Config.Labels}}", container], deadline)
+    if r.returncode != 0:
+        raise ValidationError(f"there is no project named {req.project}")
+    running_s, _, labels_s = r.stdout.strip().partition(" ")
+    try:
+        labels = json.loads(labels_s) or {}
+    except (ValueError, RecursionError):
+        labels = {}
+    running = running_s == "true"
+    dind = labels.get(SUBSTRATE_LABEL, Substrate.DIND_SYSBOX.value) != Substrate.DOCKER.value
+    research = dind and labels.get(PROJECT_TYPE_LABEL, PROJECT_TYPE_RESEARCH) \
+        in ("", PROJECT_TYPE_RESEARCH)
+    if req.box is None and research:
+        raise ValidationError(
+            "a research project's own agent plans and delegates; MCP servers "
+            "there are for its workers and its boxes, so it cannot be wired")
+    if req.box is not None:
+        if not dind:
+            raise ValidationError(f"project {req.project} has no boxes")
+        try:
+            boxes = extension.load(workspace_path_for(req.project, load_config()))
+        except Exception:  # noqa: BLE001 — a record that cannot be read has no boxes
+            boxes = {}
+        if req.box not in boxes:
+            raise ValidationError(f"project {req.project} has no box named {req.box}")
+        if req.servers and labels.get(MCP_GUARD_LABEL) != "1":
+            raise ValidationError(MCP_OLD_IMAGE_BOX)
+    if _mcp_gateway_container(deadline)[0] == "absent":
+        raise ValidationError(MCP_GATEWAY_ABSENT)
+    subnet = _mcp_gateway_attach(req.project, deadline, dind=dind)
+    key = mcp_servers.consumer_key(req.box)
+    try:
+        with mcp_servers.lock(blocking=blocking):
+            known = mcp_servers.load()["servers"]
+            unknown = [n for n in req.servers if n not in known]
+            if unknown:
+                raise mcp_servers.ServerListError(
+                    f"no server named {unknown[0]} is on the list")
+            data = mcp_servers.load_grants()
+            known_row = data["projects"].get(req.project)
+            if not req.servers and (known_row is None or key not in known_row["consumers"]):
+                # Unwiring what was never wired: nothing to write, nothing to tell.
+                return {"wiring": mcp_wiring(req.project), "consumer": key,
+                        "applied": {"state": "pending"}}
+            row = data["projects"].setdefault(
+                req.project, {"subnet": subnet, "consumers": {}})
+            row["subnet"] = subnet
+            consumer = row["consumers"].get(key)
+            if req.servers:
+                if consumer is None:
+                    consumer = row["consumers"][key] = {
+                        "token": mcp_servers.new_token(), "servers": []}
+                consumer["servers"] = list(req.servers)
+            elif consumer is not None:
+                # Kept with an empty list (not dropped): the project still
+                # needs to be told to remove the entries it added.
+                consumer["servers"] = []
+            mcp_servers.save_grants(data)
+            mcp_servers.render_grants(data)
+            wanted = _mcp_wanted(row)
+    except mcp_servers.ServerListError as e:
+        raise _mcp_list_error(e) from None
+    _mcp_gateway_hup(deadline)
+    applied: dict = {"state": "pending"}
+    if running and _mcp_stage(container, wanted, deadline):
+        scope = ["--agent"] if req.box is None else ["--box", req.box]
+        try:
+            left = None if deadline is None else deadline - time.monotonic()
+            if left is not None and left <= 0:
+                # Nothing left of the deadline: let the project apply it in
+                # the background rather than start an exec only to abandon it.
+                run(_mcp_sync_cmd(container, scope, detach=True), capture_output=True)
+                raise subprocess.TimeoutExpired("sync", 0)
+            out = run(_mcp_sync_cmd(container, scope, detach=False),
+                      capture_output=True, timeout=left)
+            got = json.loads(out.stdout or "null") if out.returncode == 0 else None
+            if isinstance(got, dict):
+                applied = _mcp_read_applied(req.project).get(key) or {"state": "pending"}
+        except subprocess.TimeoutExpired:
+            applied = {"state": "applying"}     # the tool finishes on its own
+        except (OSError, ValueError, RecursionError):
+            pass
+    return {"wiring": mcp_wiring(req.project), "consumer": key, "applied": applied}
+
+
+def mcp_grants_reset(*, blocking: bool = True, deadline: float | None = None) -> dict:
+    """Replace a DAMAGED wiring table with an empty one — the page's explicit
+    remedy. Refuses a readable table and a newer-version one."""
+    try:
+        with mcp_servers.lock(blocking=blocking):
+            state, _data, _why = mcp_servers.read_grants()
+            if state == mcp_servers.NEWER:
+                raise mcp_servers.ServerListError(mcp_servers.GRANTS_NEWER_TEXT)
+            if state != mcp_servers.DAMAGED:
+                raise mcp_servers.ServerListError(
+                    "the MCP wiring table is readable; nothing was replaced")
+            mcp_servers.save_grants(mcp_servers.grants_empty())
+            mcp_servers.render_grants(mcp_servers.grants_empty())
+    except mcp_servers.ServerListError as e:
+        raise _mcp_list_error(e) from None
+    _mcp_gateway_hup(deadline)
+    return mcp_wiring()
+
+
+def _mcp_drop_rows(project: str, box: str | None = None) -> str | None:
+    """Forget a destroyed project's wiring, or a removed box's. Returns a
+    warning sentence when the table could not be changed, else None."""
+    try:
+        with mcp_servers.lock():
+            state, data, _why = mcp_servers.read_grants()
+            if state != mcp_servers.OK:
+                return ("the MCP wiring table could not be read, so this "
+                        "wiring was not removed from it")
+            row = data["projects"].get(project)
+            if row is None:
+                return None
+            if box is None:
+                del data["projects"][project]
+            elif row["consumers"].pop(mcp_servers.consumer_key(box), None) is None:
+                return None
+            mcp_servers.save_grants(data)
+            mcp_servers.render_grants(data)
+    except mcp_servers.ServerListError as e:
+        return str(e)
+    try:
+        _mcp_gateway_hup(None)
+    except ValidationError:
+        pass
+    return None
+
+
+def mcp_forget_dead_project(project: str) -> None:
+    """A project is about to be CREATED under this name: wiring recorded for an
+    earlier project of the same name (a destroy that could not drop it) belongs
+    to nothing — that project's containers, and with them its tokens, are gone.
+    It is dropped here, so the new project starts with none. Rows that are
+    there and cannot be removed (the table cannot be saved) refuse the create,
+    with the page's own remedy. A table that cannot be READ is not a reason to
+    refuse every create: the new project simply starts unwired, and the page
+    shows that table's own error and remedy. (The list lock is taken blocking
+    here and in destroy, on the broker's accept thread: an accepted exception
+    to the one-attempt rule — holders do file work only, so the wait is the
+    length of one small file write.)"""
+    if not mcp_project_has_rows(project):
+        return
+    warn = _mcp_drop_rows(project)
+    if warn:
+        raise ValidationError(
+            f"MCP wiring from an earlier project named {project} is still "
+            f"recorded and could not be removed ({warn}); repair the wiring "
+            "under Sandboxes → MCP, then create this project")
+
+
+def mcp_project_has_rows(project: str) -> bool:
+    try:
+        state, data, _why = mcp_servers.read_grants()
+    except OSError:
+        return False
+    return state == mcp_servers.OK and project in data["projects"]
 
 
 def _supervisor_mcp_reload(container_name: str) -> None:
@@ -18618,6 +19240,10 @@ def box_remove(req: "BoxRemoveRequest", progress=None) -> BoxRemoveResult:  # ty
     # store copy AND the supervisor-home copy the box was staged from — a
     # removed box must not leave its key at rest anywhere.
     (BOX_ENV_DIR / req.project / f"{req.name}.env").unlink(missing_ok=True)
+    warn = _mcp_drop_rows(req.project, req.name)
+    if warn:
+        progress.step("warning", warn)
+        warnings.append(warn)
     if container_running(container):
         run(["docker", "exec", "-u", "research", container, "sh", "-c",
              'rm -f "$HOME/.rs-box-env/$1"', "sh", f"{req.name}.env"],
@@ -22503,7 +23129,8 @@ def shared_gateway_containers() -> list[str]:
     default route must stay on rs-sandbox. The kept-aside previous gitea is
     included so a rollback starts pinned."""
     return [ROUTER_CONTAINER, WEBUI_CONTAINER, REGISTRY_CONTAINER,
-            REGISTRY_PUSH_CONTAINER, gitea.GITEA_CONTAINER, GITEA_PREVIOUS_CONTAINER]
+            REGISTRY_PUSH_CONTAINER, gitea.GITEA_CONTAINER, GITEA_PREVIOUS_CONTAINER,
+            MCP_GATEWAY_CONTAINER]
 
 
 def pin_shared_gateways() -> list[str]:

@@ -16,9 +16,12 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
+import ipaddress
 import json
 import os
 import re
+import secrets
 import tempfile
 import urllib.parse
 from pathlib import Path
@@ -259,3 +262,172 @@ def public_view(data: dict[str, Any]) -> list[dict[str, Any]]:
              "description": e.get("description", ""),
              "headers": sorted(e.get("headers", {}))}
             for name, e in sorted(data["servers"].items())]
+
+
+# --- wiring: which consumer may use which server ------------------------------
+# A consumer is one project's own agents ("agent") or one of its boxes
+# ("box:<name>"). Each has a token; the gateway forwards a call only for a known
+# token, arriving from that project's network, to a server on that consumer's
+# list. The table holds the tokens in clear (0600, host only); what the gateway
+# mounts holds their SHA-256.
+
+GRANTS_PATH = STATE_DIR / "mcp-grants.json"
+GRANTS_RENDERED_NAME = "grants.json"
+GRANTS_VERSION = 1
+AGENT_CONSUMER = "agent"
+BOX_CONSUMER_PREFIX = "box:"
+# Project and box names as RS itself validates them (ASCII alnum first, then
+# alnum, dash, underscore); re-checked here because the table is a file.
+_NAME_PART_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
+
+GRANTS_DAMAGED_TEXT = ("the MCP wiring table on the host cannot be used ({why}); "
+                       "use Start with no wiring in Sandboxes → MCP to replace "
+                       "it (every project's wiring is discarded)")
+GRANTS_NEWER_TEXT = ("the MCP wiring table on the host was written by a newer "
+                     "version of RS than the one running; update RS to use it "
+                     "(nothing was changed)")
+
+
+def grants_empty() -> dict[str, Any]:
+    return {"version": GRANTS_VERSION, "projects": {}}
+
+
+def new_token() -> str:
+    """32 random bytes, hex: no `$`, no leading `!`, so both agents store and
+    send it literally."""
+    return secrets.token_hex(32)
+
+
+def consumer_key(box: str | None) -> str:
+    return AGENT_CONSUMER if box is None else BOX_CONSUMER_PREFIX + box
+
+
+def consumer_problem(key: Any) -> str | None:
+    if key == AGENT_CONSUMER:
+        return None
+    if isinstance(key, str) and key.startswith(BOX_CONSUMER_PREFIX) \
+            and _NAME_PART_RE.match(key[len(BOX_CONSUMER_PREFIX):]):
+        return None
+    return "a consumer is the project's agent or one of its boxes"
+
+
+def _subnet_ok(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return ipaddress.ip_network(value).version == 4
+    except ValueError:
+        return False
+
+
+def _grants_shape_problem(data: dict) -> str | None:
+    projects = data.get("projects")
+    if set(data) != {"version", "projects"} or not isinstance(projects, dict):
+        return "it does not have the expected shape"
+    for project, row in projects.items():
+        if not isinstance(project, str) or not _NAME_PART_RE.match(project) \
+                or not isinstance(row, dict) or set(row) != {"subnet", "consumers"} \
+                or not _subnet_ok(row["subnet"]) or not isinstance(row["consumers"], dict):
+            return "it holds a project that is not valid"
+        for key, c in row["consumers"].items():
+            if consumer_problem(key) or not isinstance(c, dict) \
+                    or set(c) != {"token", "servers"} \
+                    or not isinstance(c["token"], str) or not _TOKEN_RE.match(c["token"]) \
+                    or not isinstance(c["servers"], list) \
+                    or not all(isinstance(n, str) and NAME_RE.match(n) for n in c["servers"]) \
+                    or len(set(c["servers"])) != len(c["servers"]):
+                return "it holds a consumer that is not valid"
+    return None
+
+
+def judge_grants(raw: bytes) -> tuple[str, dict[str, Any], str | None]:
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError):
+        return DAMAGED, grants_empty(), "it is not valid JSON"
+    if not isinstance(data, dict):
+        return DAMAGED, grants_empty(), "it does not hold a table object"
+    version = data.get("version")
+    if isinstance(version, int) and not isinstance(version, bool) \
+            and version > GRANTS_VERSION:
+        return NEWER, grants_empty(), None
+    if isinstance(version, bool) or version != GRANTS_VERSION:
+        return DAMAGED, grants_empty(), "it does not have the expected shape"
+    problem = _grants_shape_problem(data)
+    if problem:
+        return DAMAGED, grants_empty(), problem
+    return OK, data, None
+
+
+def read_grants(path: Path | None = None) -> tuple[str, dict[str, Any], str | None]:
+    """The ONE reader of the wiring table: (state, data, why). Absent = empty."""
+    path = GRANTS_PATH if path is None else path
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return OK, grants_empty(), None
+    except OSError as e:
+        return DAMAGED, grants_empty(), f"it cannot be read: {e.strerror or 'read failed'}"
+    return judge_grants(raw)
+
+
+def load_grants() -> dict[str, Any]:
+    state, data, why = read_grants()
+    if state == NEWER:
+        raise ServerListError(GRANTS_NEWER_TEXT)
+    if state == DAMAGED:
+        raise ServerListError(GRANTS_DAMAGED_TEXT.format(why=why))
+    return data
+
+
+def save_grants(data: dict[str, Any]) -> None:
+    try:
+        _write_private(GRANTS_PATH, _dump(data))
+    except OSError as e:
+        raise ServerListError("cannot save the MCP wiring table on the host "
+                              f"({e.strerror or 'write failed'})") from e
+
+
+def token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def rendered_grants(data: dict[str, Any]) -> dict[str, Any]:
+    """What the gateway mounts: tokens as digests only, and each project's
+    network range (a call must arrive from inside it)."""
+    consumers: dict[str, Any] = {}
+    subnets: dict[str, str] = {}
+    for project, row in data["projects"].items():
+        subnets[project] = row["subnet"]
+        for key, c in row["consumers"].items():
+            consumers[token_digest(c["token"])] = {
+                "project": project, "consumer": key, "servers": list(c["servers"])}
+    return {"version": GRANTS_VERSION, "consumers": consumers, "subnets": subnets}
+
+
+def render_grants(data: dict[str, Any]) -> None:
+    try:
+        GATEWAY_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(GATEWAY_DIR, 0o700)
+        _write_private(GATEWAY_DIR / GRANTS_RENDERED_NAME, _dump(rendered_grants(data)))
+    except OSError as e:
+        raise ServerListError("cannot write the MCP gateway's wiring table on "
+                              f"the host ({e.strerror or 'write failed'})") from e
+
+
+def gateway_address(subnet: str) -> str:
+    """The gateway's fixed address on a project network: the last usable host
+    address of that network's range. Raises ValueError for a range with no
+    room (a /31 or /32), which RS never creates."""
+    net = ipaddress.ip_network(subnet)
+    if net.version != 4 or net.num_addresses < 4:
+        raise ValueError("no room for a gateway address")
+    return str(net.broadcast_address - 1)
+
+
+def wired_to(data: dict[str, Any], server: str) -> list[tuple[str, str]]:
+    """(project, consumer) pairs that have `server`, sorted."""
+    return sorted((project, key)
+                  for project, row in data["projects"].items()
+                  for key, c in row["consumers"].items() if server in c["servers"])

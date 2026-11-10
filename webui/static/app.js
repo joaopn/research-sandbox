@@ -2145,7 +2145,19 @@ async function renderMcpInto(view) {
     if (!res.ok || !body.ok || !body.result) {
         return renderMgmtVerbError(view, body, renderMcpInto);
     }
-    renderMcpScreen(view, body.result);
+    // The wiring is a second read. If it cannot be had (a broker from before
+    // wiring existed, a passing failure) the servers still show, with a line
+    // where the Wiring section would be — never a page-wide error.
+    let wiring = null;
+    try {
+        const wres = await fetch("/broker/mcp/wiring");
+        if (wres.status === 401) return renderMgmtLogin(view, view.__rsRender || renderMcpInto);
+        if (wres.ok) {
+            const wbody = await wres.json();
+            if (wbody && wbody.ok && wbody.result) wiring = wbody.result;
+        }
+    } catch (e) { /* the line below */ }
+    renderMcpScreen(view, body.result, wiring);
 }
 
 // POST one MCP page action. Returns {status, body}; status 0 = the request
@@ -2372,7 +2384,173 @@ async function mcpStartGateway(view, btn, errEl) {
                            () => rerenderView(view), view.__rsRender || renderMcpInto);
 }
 
-function renderMcpScreen(view, result) {
+// What the last Save reported, shown once by the render that follows it (the
+// page re-reads itself after a Save so the server rows' counts are right).
+let mcpWiringFlash = null;
+
+const MCP_APPLIED_TEXT = {
+    added: "added; available from the agent’s next session",
+    kept: "already there",
+    removed: "removed",
+    conflict: "NOT added: the agent already has a server of that name",
+    failed: "could not be changed",
+};
+const MCP_APPLY_STATE_TEXT = {
+    pending: "Saved. It is applied when it next starts.",
+    applying: "Saved. It is still being applied in the container.",
+    "no agent": "Saved. No agent is deployed there yet.",
+    failed: "Saved, but it could not be applied in the container.",
+};
+
+// The lines for one consumer's last apply: one per agent and server, or the
+// one sentence of a state that is not "applied".
+function mcpAppliedLines(applied) {
+    if (!applied) return ["Not applied yet."];
+    if (applied.state !== "applied") {
+        return [MCP_APPLY_STATE_TEXT[applied.state] || "Not applied yet."];
+    }
+    const lines = [];
+    const agents = applied.agents || {};
+    for (const agent of Object.keys(agents).sort()) {
+        for (const name of Object.keys(agents[agent]).sort()) {
+            lines.push(agent + " / " + name + ": "
+                       + (MCP_APPLIED_TEXT[agents[agent][name]] || agents[agent][name]));
+        }
+    }
+    return lines.length ? lines : ["Nothing to change."];
+}
+
+// The Wiring section: pick a project, pick who in it, tick servers, Save.
+// `wiring` is the page's second read ({table, error, projects, targets}).
+function mcpWiringSection(view, servers, wiring) {
+    const section = el("div", { class: "mgmt-infra" }, [
+        el("h3", { class: "mgmt-infra-title" }, ["Wiring"])]);
+    if (!wiring) {
+        section.appendChild(el("div", { class: "mgmt-settings-hint" }, [
+            "The wiring could not be read. Refresh to try again."]));
+        return section;
+    }
+    if (wiring.error) {
+        const warn = el("div", { class: "mcp-list-error" }, [
+            el("div", { class: "error" }, [wiring.error])]);
+        if (wiring.table === "damaged") {
+            const reset = el("button", { class: "btn-small" }, ["Start with no wiring"]);
+            reset.onclick = () => mcpConfirmDialog(view, {
+                title: "Start with no wiring",
+                text: "The wiring table on the host cannot be read, so it is replaced "
+                    + "by an empty one. Every project’s and box’s wiring is "
+                    + "discarded; the gateway refuses them all until you wire them again.",
+                confirmLabel: "Discard and start empty",
+                path: "/broker/mcp/wiring-reset",
+                payload: {},
+            });
+            warn.appendChild(reset);
+        }
+        section.appendChild(warn);
+        return section;
+    }
+    const targets = Array.isArray(wiring.targets) ? wiring.targets : [];
+    section.appendChild(el("div", { class: "mgmt-settings-hint" }, [
+        "Give a project’s agent, or one of its boxes, the servers it may use. "
+        + "Nothing restarts; an agent sees a change in its next session."]));
+    if (!targets.length || !servers.length) {
+        section.appendChild(el("div", { class: "mgmt-settings-hint" }, [
+            !servers.length ? "Add a server first." : "There is no project to wire yet."]));
+        return section;
+    }
+    const projectSel = el("select", { class: "config-port-box mcp-wire-project" },
+        targets.map((t) => el("option", { value: t.project }, [t.project])));
+    const whoSel = el("select", { class: "config-port-box mcp-wire-who" });
+    const cards = el("div", { class: "box-opt-cards mcp-wire-cards" });
+    const note = el("div", { class: "mgmt-settings-hint" });
+    const status = el("div", { class: "mcp-wire-status" });
+    const save = el("button", { class: "btn btn-secondary" }, ["Save"]);
+    const ticked = new Set();
+    const target = () => targets.find((t) => t.project === projectSel.value) || targets[0];
+    const consumerKey = () => (whoSel.value === "" ? "agent" : "box:" + whoSel.value);
+    const current = () => {
+        const row = (wiring.projects || {})[projectSel.value] || {};
+        return row[consumerKey()] || null;
+    };
+    const drawCards = () => {
+        const cur = current();
+        ticked.clear();
+        for (const n of (cur ? cur.servers : [])) ticked.add(n);
+        cards.replaceChildren(...servers.map((srv) => {
+            const card = el("div", { class: "box-opt-card", title: srv.url }, [
+                el("span", { class: "box-opt-name" }, [srv.name])]);
+            card.classList.toggle("selected", ticked.has(srv.name));
+            card.onclick = () => {
+                if (ticked.has(srv.name)) ticked.delete(srv.name); else ticked.add(srv.name);
+                card.classList.toggle("selected", ticked.has(srv.name));
+            };
+            return card;
+        }));
+        status.replaceChildren(...(cur && cur.servers.length
+            ? mcpAppliedLines(cur.applied).map((l) => el("div", {}, [l])) : []));
+    };
+    const drawWho = () => {
+        const t = target();
+        const options = [];
+        if (t.agent) options.push(el("option", { value: "" }, ["The project’s agent"]));
+        for (const b of t.boxes) options.push(el("option", { value: b }, ["Box: " + b]));
+        whoSel.replaceChildren(...options);
+        const lines = [];
+        if (!t.agent) {
+            lines.push("A research project’s own agent plans and delegates; "
+                       + "its boxes can be wired here.");
+        }
+        if (t.boxes.length && !t.boxes_wirable) {
+            lines.push("This project was made before boxes could reach the MCP gateway: "
+                       + "Stop and Start it (after Rebuild all under Sandboxes → Software) "
+                       + "before wiring its boxes.");
+        }
+        if (!options.length) lines.push("Nothing in this project can be wired.");
+        note.replaceChildren(...lines.map((l) => el("div", {}, [l])));
+        save.disabled = !options.length;
+        if (options.length) drawCards(); else { cards.replaceChildren(); status.replaceChildren(); }
+    };
+    projectSel.onchange = drawWho;
+    whoSel.onchange = drawCards;
+    save.onclick = async () => {
+        const payload = { project: projectSel.value, servers: Array.from(ticked).sort() };
+        if (whoSel.value !== "") payload.box = whoSel.value;
+        save.disabled = true;
+        status.replaceChildren(el("div", {}, ["Saving…"]));
+        const { status: code, body } = await mcpPost("/broker/mcp/wire", payload);
+        if (code === 401) return renderMgmtLogin(view, view.__rsRender || renderMcpInto);
+        save.disabled = false;
+        if (code !== 200 || !body.ok || !body.result) {
+            status.replaceChildren(el("div", { class: "mcp-test-bad" }, [
+                code === 200 ? "Couldn’t save: " + mgmtErrText(body)
+                             : "Couldn’t save: connection failed."]));
+            return;
+        }
+        // Re-read the page (the server rows count who is wired) and show what
+        // this Save reported where the same selection is drawn again.
+        mcpWiringFlash = { project: payload.project, who: whoSel.value,
+                           lines: mcpAppliedLines(body.result.applied) };
+        rerenderView(view);
+    };
+    section.append(
+        el("div", { class: "config-box-row mcp-wire-row" }, [projectSel, whoSel, save]),
+        note, cards, status);
+    // Land on what the last Save touched, with its report.
+    const flash = mcpWiringFlash;
+    mcpWiringFlash = null;
+    if (flash && targets.some((t) => t.project === flash.project)) {
+        projectSel.value = flash.project;
+        drawWho();
+        whoSel.value = flash.who;
+        drawCards();
+        status.replaceChildren(...flash.lines.map((l) => el("div", {}, [l])));
+    } else {
+        drawWho();
+    }
+    return section;
+}
+
+function renderMcpScreen(view, result, wiring) {
     view.innerHTML = "";
     const servers = Array.isArray(result.servers) ? result.servers : [];
     const listOk = result.list === "ok";
@@ -2406,8 +2584,8 @@ function renderMcpScreen(view, result) {
         gwRow,
         el("div", { class: "mgmt-settings-hint" }, [
             "One shared container that holds every server's address and secrets. "
-            + "Projects and boxes will reach MCP servers only through it; giving "
-            + "a server to a project is not available yet."]),
+            + "Projects and boxes reach MCP servers only through it, and only the "
+            + "ones they are wired to below."]),
     ]);
     view.appendChild(section);
 
@@ -2445,14 +2623,22 @@ function renderMcpScreen(view, result) {
         const remove = el("button", { class: "btn-small" }, ["Remove"]);
         remove.onclick = () => mcpConfirmDialog(view, {
             title: "Remove " + srv.name,
-            text: "The server and its secret headers are taken off the list.",
+            text: "The server and its secret headers are taken off the list."
+                + (wired.length
+                    ? " It is wired to " + wiredNames.join(", ") + ": the gateway "
+                      + "refuses it for them at once, and each agent’s entry for it "
+                      + "goes the next time that project or box starts or is re-wired."
+                    : ""),
             confirmLabel: "Remove",
             path: "/broker/mcp/servers/remove",
             payload: { name: srv.name },
         });
         const secrets = (srv.headers || []).length
             ? "Secret headers: " + srv.headers.join(", ") : "";
-        const meta = [srv.description, secrets].filter(Boolean).join(" · ");
+        const wired = Array.isArray(srv.wired) ? srv.wired : [];
+        const wiredNames = wired.map((w) => w[0] + (w[1] === "agent" ? "" : " / " + w[1].slice(4)));
+        const wiredText = wired.length ? "Wired to: " + wiredNames.join(", ") : "";
+        const meta = [srv.description, secrets, wiredText].filter(Boolean).join(" · ");
         list.appendChild(el("div", { class: "mgmt-row mgmt-infra-row mcp-server-row",
                                      "data-mcp-server": srv.name }, [
             el("span", { class: "mcp-server-name" }, [srv.name]),
@@ -2464,6 +2650,7 @@ function renderMcpScreen(view, result) {
         rows.push({ name: srv.name, cell });
     }
     view.appendChild(list);
+    view.appendChild(mcpWiringSection(view, servers, wiring));
 }
 
 // Sandboxes → Software — the host's agent/editor/reader/node dists, the built

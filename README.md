@@ -122,7 +122,7 @@ The sandbox flavors default to **`--egress locked`** (80/443 and DNS to the conf
 
 ## ◾ Prerequisites
 
-- [Docker](https://www.docker.com/) Engine with Compose v2 (`docker compose`)
+- [Docker](https://www.docker.com/) Engine 29.0 or newer, with Compose v2 (`docker compose`, 2.33.1 or newer); `research start` refuses older versions and says which it found
 - [Python](https://www.python.org/) 3.9+ (host CLI is stdlib-only — conda, pyenv, system Python, anything works)
 - An [Anthropic Claude](https://www.anthropic.com/) subscription (Pro/Team or API access — you authenticate *inside* the project; there are no host-side API keys)
 
@@ -202,7 +202,7 @@ python research.py project mcp allow myproj arxiv
 
 `mcp add` writes the registry; `mcp enable` flips the per-MCP flag (and auto-allows it into new projects); `project mcp allow` refuses a disabled MCP; `research start` auto-launches every enabled *shared* MCP. Every MCP is reached through the per-project **mcp-proxy** at a single internal address — workers can't reach an MCP they weren't granted. The server must speak streamable-HTTP and follow a small contract; see [docs/GUIDE.md](docs/GUIDE.md).
 
-**The MCP page (Sandboxes → MCP).** A second, newer list holds MCP servers by address (`http://` or `https://`) with optional secret request headers, behind one shared gateway container. The page adds, edits, tests and removes them, and `research mcp server list | add | edit | remove | test` does the same from the host. Wiring these servers to projects and boxes is not available yet; until it is, projects use the registry above.
+**The MCP page (Sandboxes → MCP).** A second, newer list holds MCP servers by address (`http://` or `https://`) with optional secret request headers, behind one shared gateway container. The page adds, edits, tests and removes them, and wires them: pick a project, pick its agent or one of its boxes, tick the servers it may use. The agent sees a wired server in its next session, in Claude Code and pi alike; nothing restarts. From the host: `research mcp server list | add | edit | remove | test`, `research mcp wire <project> [--box NAME] --set a,b` and `research mcp wiring`. A research project's own agent is not wired (its workers still use the registry above); its boxes are.
 
 ### Worker services — `worker`
 

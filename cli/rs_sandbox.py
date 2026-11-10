@@ -2297,8 +2297,27 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         _write_box_model_detached(cname, _box_model_ops({"model": model, "effort": effort}))
     # F3 Slice 2b: launch the in-box loopback forwarders for the freshly-run box.
     _launch_box_forwarders(cname, lp_list)
+    # The box's home is fresh: give its agents their wired MCP servers back.
+    _mcp_sync_box(name)
     return (folder_warnings + mailbox_warnings + history_warnings + browser_warnings
             + instr_warnings)
+
+
+def _mcp_sync_box(name: str) -> None:
+    """Give a just-started box's agents the MCP servers it is wired to, in the
+    background: RS stages the tool (and what each box is wired to) into this
+    project's home when the project has any wiring; without the tool there is
+    nothing to do. The tool waits for the box to finish booting by itself and
+    records what it applied, so no box start ever waits on it or fails over it."""
+    tool = Path.home() / ".rs-mcp" / "sync.py"
+    if not tool.is_file():
+        return
+    try:
+        subprocess.Popen([sys.executable, str(tool), "--box", name],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
 
 
 def _launch_box_forwarders(cname: str, loopback_ports: list[dict]) -> None:
@@ -2932,6 +2951,8 @@ def cmd_start(args: argparse.Namespace) -> None:
         # processes died with the stop — relaunch them (F3 Slice 2b). The
         # _rerun_box branches above/below relaunch via _run_box.
         _launch_box_forwarders(cname, entry.get("loopback_ports") or [])
+        # Its wiring may have changed while it was parked.
+        _mcp_sync_box(args.name)
         # A parked history box missed any Gitea address change: rewrite its
         # address in place and retry a missing first push (no re-run).
         hist = _entry_history(entry)

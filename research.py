@@ -1192,6 +1192,65 @@ def cmd_mcp_server_remove(args: argparse.Namespace) -> None:
     print(f"removed MCP server {req.name!r}")
 
 
+MCP_APPLIED_SENTENCES = {
+    "added": "added; available from the agent's next session",
+    "kept": "already there",
+    "removed": "removed",
+    "conflict": "NOT added: the agent already has a server of that name",
+    "failed": "could not be changed",
+}
+MCP_STATE_SENTENCES = {
+    "pending": "saved; applied when it next starts",
+    "applying": "saved; still being applied in the container",
+    "no agent": "saved; no agent is deployed there",
+    "failed": "saved, but it could not be applied in the container",
+}
+
+
+def _print_mcp_applied(consumer: str, applied) -> None:
+    if not applied:
+        print(f"  {consumer}: not applied yet")
+        return
+    if applied.get("state") != "applied":
+        print(f"  {consumer}: {MCP_STATE_SENTENCES.get(applied.get('state'), 'not applied yet')}")
+        return
+    for agent, servers in sorted((applied.get("agents") or {}).items()):
+        for name, outcome in sorted(servers.items()):
+            print(f"  {consumer} / {agent} / {name}: "
+                  f"{MCP_APPLIED_SENTENCES.get(outcome, outcome)}")
+
+
+def cmd_mcp_wire(args: argparse.Namespace) -> None:
+    servers = [n for n in (args.set or "").split(",") if n.strip()]
+    req = _build(rscore.McpWireRequest, project=args.project, box=args.box,
+                 servers=[n.strip() for n in servers])
+    out = _call(rscore.mcp_wire, req)
+    print(f"wired {out['consumer']} of {req.project} to: "
+          f"{', '.join(req.servers) or '(nothing)'}")
+    _print_mcp_applied(out["consumer"], out["applied"])
+
+
+def cmd_mcp_wiring(args: argparse.Namespace) -> None:
+    out = _call(rscore.mcp_wiring, args.project)
+    if args.json:
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return
+    if out.get("error"):
+        die(out["error"])
+    if not out["projects"]:
+        print("(nothing is wired)")
+    for project, consumers in out["projects"].items():
+        print(project)
+        for consumer, row in consumers.items():
+            print(f"  {consumer}: {', '.join(row['servers']) or '(nothing)'}")
+            _print_mcp_applied("  " + consumer, row["applied"])
+
+
+def cmd_mcp_wiring_reset(_args: argparse.Namespace) -> None:
+    _call(rscore.mcp_grants_reset)
+    print("the damaged MCP wiring table was replaced by an empty one")
+
+
 def cmd_mcp_server_reset(_args: argparse.Namespace) -> None:
     _call(rscore.mcp_server_list_reset)
     print("the damaged MCP server list was replaced by an empty one")
@@ -3166,6 +3225,26 @@ def build_parser() -> argparse.ArgumentParser:
                      "to introduce itself as an MCP server")
     mst.add_argument("name", nargs="?")
     mst.set_defaults(func=cmd_mcp_server_test)
+
+    mw = mcp_sub.add_parser(
+        "wire", help="give a project's agent, or one of its boxes, a set of the "
+                     "gateway's servers (available from the agent's next session)")
+    mw.add_argument("project")
+    mw.add_argument("--box", default=None, metavar="NAME",
+                    help="wire this box instead of the project's own agent")
+    mw.add_argument("--set", required=True, metavar="A,B,C",
+                    help="the servers it has from now on; '' unwires it")
+    mw.set_defaults(func=cmd_mcp_wire)
+
+    mwl = mcp_sub.add_parser("wiring", help="who is wired to which gateway server")
+    mwl.add_argument("project", nargs="?")
+    mwl.add_argument("--json", action="store_true")
+    mwl.set_defaults(func=cmd_mcp_wiring)
+
+    mwr = mcp_sub.add_parser(
+        "wiring-reset", help="replace a DAMAGED wiring table by an empty one "
+                             "(every project's wiring is discarded)")
+    mwr.set_defaults(func=cmd_mcp_wiring_reset)
 
     # ----- worker catalog (host visibility) -----------------------------
     wk = sub.add_parser(

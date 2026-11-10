@@ -817,10 +817,22 @@ _MCP_SERVER_ACTIONS = {
     "test": ("mcp_server_test", ("name",)),
     "reset": ("mcp_server_list_reset", ()),
 }
+# The wiring actions (POST /broker/mcp/<action>): same handler factory.
+_MCP_WIRING_ACTIONS = {
+    "wire": ("mcp_wire", ("project", "box", "servers")),
+    "wiring-reset": ("mcp_grants_reset", ()),
+}
 
 
-def _mcp_server_action_handler(action: str):
-    verb, fields = _MCP_SERVER_ACTIONS[action]
+async def broker_mcp_wiring_handler(request: web.Request) -> web.Response:
+    """GET /broker/mcp/wiring — who is wired to which server and what each
+    project last reported applying (host file reads only). Session-gated."""
+    status, body = await _relay(request, "mcp_wiring")
+    return web.json_response(body, status=status)
+
+
+def _mcp_server_action_handler(action: str, table: dict | None = None):
+    verb, fields = (table or _MCP_SERVER_ACTIONS)[action]
 
     async def handler(request: web.Request) -> web.Response:
         """POST /broker/mcp/servers/<action> — origin-checked; an absent key is
@@ -4179,6 +4191,10 @@ def main() -> None:
     for _action in _MCP_SERVER_ACTIONS:
         app.router.add_post(f"/broker/mcp/servers/{_action}",
                             _mcp_server_action_handler(_action))
+    app.router.add_get("/broker/mcp/wiring", broker_mcp_wiring_handler)
+    for _action in _MCP_WIRING_ACTIONS:
+        app.router.add_post(f"/broker/mcp/{_action}",
+                            _mcp_server_action_handler(_action, _MCP_WIRING_ACTIONS))
     app.router.add_get("/broker/software", broker_software_handler)
     app.router.add_post("/broker/software/build", broker_build_handler)
     app.router.add_post("/broker/software/refresh-check", broker_refresh_check_handler)
