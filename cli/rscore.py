@@ -5783,11 +5783,16 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         # RS's skills into the agents' homes after the agent copy (an agent
         # just added gets them, in the project agent and every box), once the
         # project's own folders were checked for the files RS used to write
-        # there.
-        found += _project_files_check(
-            project, workspace_path,
-            research=_container_project_type(container) != PROJECT_TYPE_SANDBOX_DIND,
-            progress=progress)
+        # there — only on a container whose image carries the current layout:
+        # an older one's boot puts the files back, so a flag set now would hide
+        # them after the Rebuild all (the start path gates the same way).
+        image_items = _project_image_check(project, container)
+        found += image_items
+        if not image_items:
+            found += _project_files_check(
+                project, workspace_path,
+                research=_container_project_type(container) != PROJECT_TYPE_SANDBOX_DIND,
+                progress=progress)
         found += _box_tool_home_skills(project, container, ["--boxes"], progress)
         if agents_added:
             print(f"added {', '.join(agents_added)} to {project!r}: the supervisor tab can "
@@ -14815,7 +14820,8 @@ def _container_layout_labels(container: str) -> "tuple[str, str] | None":
 
 
 def _project_image_check(project: str, container: str) -> "list[OldInstructions]":
-    """After a sandbox-dind re-creation: the NEW container's image must carry
+    """After a sandbox-dind re-creation, and before a live agent change checks
+    a project's folders (either kind): the container's image must carry
     the current layout label (an image label rides into the container's;
     never the image tag, which a concurrent rebuild can move). A failed read
     is its own error, never "no label"."""
@@ -15779,9 +15785,14 @@ def project_add_agents(project: str, agents: "Sequence[str]",
     refreshed, not_refreshed = _refresh_running_boxes(container, staged, progress, force_ext=True)
     # RS's skills into the agents' homes after the agent copy (pi just added
     # gets them, in the project agent and every box), once the project's own
-    # folders were checked for the files RS used to write there.
-    found += _project_files_check(project, workspace_path, research=is_research,
-                                  progress=progress)
+    # folders were checked for the files RS used to write there — only on a
+    # container whose image carries the current layout (an older one's boot
+    # puts the files back; the start path gates the same way).
+    image_items = _project_image_check(project, container)
+    found += image_items
+    if not image_items:
+        found += _project_files_check(project, workspace_path, research=is_research,
+                                      progress=progress)
     found += _box_tool_home_skills(project, container, ["--boxes"], progress)
     _raise_old_instructions(found)
     return UpdateResult(project=project, rebuilt=False,
