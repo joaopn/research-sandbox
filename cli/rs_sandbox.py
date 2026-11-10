@@ -287,8 +287,9 @@ def _skill_tmp() -> str:
 # its agents' homes once its ~/.rs-role is written, and RS writes them live
 # into a box already running. Files are written in place inside the box's
 # folder (never by replacing the folder: a running box's mount would keep the
-# deleted one), and box remove empties it by named files. A function of ORCH,
-# never a constant (the archived pins redirect ORCH).
+# deleted one), and box remove empties it by named files. A function of
+# WORKSPACE read at each call, never a constant: a test that points WORKSPACE
+# at a scratch folder must never reach the real project's settings folder.
 BOX_SKILLS_DIR = "box-skills"
 BOX_SKILLS_IN_BOX = "/opt/rs-box-skills"
 # Present in a box's staged folder while the box's workspace still holds files
@@ -298,8 +299,12 @@ BOX_SKILLS_IN_BOX = "/opt/rs-box-skills"
 BOX_OLD_FILES_MARK = ".old-files"
 
 
+def _orch_now() -> Path:
+    return WORKSPACE / ".orchestrator"
+
+
 def box_skills_root() -> Path:
-    return ORCH / BOX_SKILLS_DIR
+    return _orch_now() / BOX_SKILLS_DIR
 
 
 # Replaced in a feed skill's text at staging by the destination agent's own
@@ -1409,7 +1414,7 @@ def _stage_box_home_skills(name: str, entry: dict
     root = box_skills_root()
     bdir = root / name
     try:
-        _ensure_dirs(ORCH, root, bdir)
+        _ensure_dirs(_orch_now(), root, bdir)
     except OSError:
         return [], old, [{"kind": "skill", "box": name, "reason": "unwritable"}]
     if not _set_old_files_mark(bdir, bool(old)):
@@ -1537,7 +1542,7 @@ def _project_files_cleared() -> bool:
     """The project record's flag: set by the host once the project agent's
     folders hold none of the files RS used to write there."""
     try:
-        data = json.loads((ORCH / "project.json").read_text())
+        data = json.loads((_orch_now() / "project.json").read_text())
     except (OSError, ValueError, RecursionError):
         return False
     return isinstance(data, dict) and data.get(OLD_FILES_FLAG) is True
