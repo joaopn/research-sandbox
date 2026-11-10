@@ -9247,6 +9247,14 @@ def _running_agent_boxes(supervisor: str) -> "list[str] | None":
 _BOX_HOME = "/home/worker"
 
 
+# MIRROR of rs_sandbox.BOX_SKILLS_IN_BOX / BOX_OLD_FILES_MARK (the box tool is
+# staged standalone): where a box run since the instruction-files move sees its
+# staged skills folder, and the mark the box tool leaves there while RS's old
+# files remain in the box's folder.
+BOX_SKILLS_IN_BOX = "/opt/rs-box-skills"
+BOX_OLD_FILES_MARK = ".old-files"
+
+
 def _refresh_running_boxes(supervisor: str, agents: "Sequence[str]", progress,
                            *, force_ext: bool) -> tuple[list[str], list[str]]:
     """Bring every RUNNING agent-bearing box of a dind project to the project's
@@ -9301,6 +9309,17 @@ def _refresh_running_boxes(supervisor: str, agents: "Sequence[str]", progress,
                                    capture_output=True).returncode == 0
                         and run([*inner, "-u", "1000", box, "sh", "-c", wired],
                                 capture_output=True).returncode != 0)
+        # The render writes pi's home settings only in a box run with its
+        # staged skills folder and no old-files mark; anywhere else it would
+        # only regenerate .mcp.json wholesale at every Update (dropping servers
+        # added by hand) and never record pi as wired. Such a box gets pi's
+        # servers at its next start, and says so.
+        if needs_render and run(
+                [*inner, box, "sh", "-c",
+                 f'[ -d {BOX_SKILLS_IN_BOX} ] && [ ! -e {BOX_SKILLS_IN_BOX}/{BOX_OLD_FILES_MARK} ]'],
+                capture_output=True).returncode != 0:
+            needs_render = False
+            progress.step("agents", f"box {box}: pi gets its MCP servers at the box's next start")
         if needs_render:
             env = dict(_agent_env("pi", _BOX_HOME))
             r = subprocess.run(
