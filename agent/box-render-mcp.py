@@ -158,22 +158,28 @@ def write_atomic(path: Path, text: str) -> None:
 # byte-identical in agent/box-render-mcp.py and agent/rs-mcp-sync.py (pinned).
 #
 # The lock is the directory `<mcp.json>.rs-lock` (a name pi never uses), made
-# with mkdir; its holder records `<pid> <start time>` in it and is the only one
-# that removes it (the record by name, then rmdir — never a recursive delete).
-# A lock whose recorded process is gone (no such pid, or a pid reused by a
-# process that started at another time) was left by a killed writer: it is
-# taken over by renaming it aside under a name unique to the taker, so two
-# takers can never both win, and the move is undone when the moved lock turns
-# out to name a live holder. Every writer of this file runs in the same
-# container (the box's own boot, an exec into it), so its pids are comparable.
+# with mkdir; its holder records `<pid> <start time>` in it (`-` when its start
+# time cannot be read) and is the only one that removes it (the record by
+# name, then rmdir — never a recursive delete). A lock whose recorded process
+# is gone (no such pid, or a pid reused by a process that started at another
+# time) was left by a killed writer and is removed by a taker. Takers are
+# serialized by the folder `<lock>.takeover` (mkdir): inside it the lock is
+# judged again, and since nobody can make a new lock while the stale one
+# exists and only a taker removes one, the lock judged stale there is exactly
+# the one removed — a live holder's lock is never touched. Every writer of
+# this file runs in the same container (the box's own boot, an exec into it),
+# so its pids are comparable.
 RS_LOCK_SUFFIX = ".rs-lock"
 RS_LOCK_OWNER = "owner"
+RS_LOCK_TAKEOVER = ".takeover"
 # How long a writer waits for the lock. The longest holder is the gateway sync,
 # which runs one pi command per wired server, each bounded by its own
 # one-minute timeout and measured at 0.2-0.4 s: one minute covers a healthy
 # pass of over a hundred servers, and a holder past that is stuck on a command
 # its own timeout is about to kill. A render that gives up only leaves pi's
-# servers as they were until the next boot or refresh (a warning).
+# servers as they were until the next boot or refresh (a warning). The same
+# bound ages out a lock left half-made, and a takeover folder left by a taker
+# killed inside its sub-millisecond section.
 RS_LOCK_WAIT_S = 60
 # A holder keeps the lock for a read and a write (the render: milliseconds) or
 # for its pi commands (tenths of seconds each): a tenth of a second between
@@ -189,12 +195,25 @@ def _rs_proc_start(pid: int):
         return None
 
 
+def _rs_me() -> str:
+    return f"{os.getpid()} {_rs_proc_start(os.getpid()) or '-'}"
+
+
 def _rs_lock_owner(lock: Path):
     try:
         parts = (lock / RS_LOCK_OWNER).read_text().split()
     except OSError:
         return None
     return parts if len(parts) == 2 and parts[0].isdigit() else None
+
+
+def _rs_alive(pid: str, start: str) -> bool:
+    """Whether the recorded holder still runs. An unknown start time, at the
+    take or now, falls back to whether the pid exists at all."""
+    now = _rs_proc_start(int(pid))
+    if start == "-" or now is None:
+        return os.path.exists(f"/proc/{pid}")
+    return now == start
 
 
 def _rs_lock_stale(lock: Path) -> bool:
@@ -206,36 +225,43 @@ def _rs_lock_stale(lock: Path) -> bool:
             return time.time() - os.lstat(lock).st_mtime > RS_LOCK_WAIT_S
         except OSError:
             return False
-    return _rs_proc_start(int(owner[0])) != owner[1]
+    return not _rs_alive(owner[0], owner[1])
 
 
 def _rs_lock_clear(lock: Path) -> None:
-    aside = lock.with_name(f"{lock.name}.stale.{os.getpid()}.{time.monotonic_ns()}")
+    guard = lock.with_name(lock.name + RS_LOCK_TAKEOVER)
     try:
-        os.rename(lock, aside)
-    except OSError:
-        return                                   # another writer cleared it first
-    if not _rs_lock_stale(aside):
+        os.mkdir(guard, 0o700)
+    except FileExistsError:
         try:
-            os.rename(aside, lock)               # a live holder's lock: put it back
+            if time.time() - os.lstat(guard).st_mtime > RS_LOCK_WAIT_S:
+                os.rmdir(guard)                  # left by a taker that was killed
         except OSError:
             pass
         return
+    except OSError:
+        return
     try:
-        os.unlink(aside / RS_LOCK_OWNER)
+        if _rs_lock_stale(lock):
+            try:
+                os.unlink(lock / RS_LOCK_OWNER)
+            except FileNotFoundError:
+                pass
+            os.rmdir(lock)
     except OSError:
         pass
-    try:
-        os.rmdir(aside)
-    except OSError:
-        pass
+    finally:
+        try:
+            os.rmdir(guard)
+        except OSError:
+            pass
 
 
 def rs_lock_take(target: Path):
     """The lock on `target`, or None when it could not be had within
     RS_LOCK_WAIT_S (the caller fails soft)."""
     lock = target.with_name(target.name + RS_LOCK_SUFFIX)
-    me = f"{os.getpid()} {_rs_proc_start(os.getpid())}"
+    me = _rs_me()
     give_up = time.monotonic() + RS_LOCK_WAIT_S
     while True:
         try:
@@ -243,7 +269,6 @@ def rs_lock_take(target: Path):
         except FileExistsError:
             if _rs_lock_stale(lock):
                 _rs_lock_clear(lock)
-                continue
             if time.monotonic() >= give_up:
                 return None
             time.sleep(RS_LOCK_POLL_S)
@@ -266,7 +291,7 @@ def rs_lock_take(target: Path):
 def rs_lock_release(lock) -> None:
     """Remove our own lock: its record by name, then the folder — only while
     the record is still ours."""
-    if lock is None or _rs_lock_owner(lock) != [str(os.getpid()), str(_rs_proc_start(os.getpid()))]:
+    if lock is None or _rs_lock_owner(lock) != _rs_me().split():
         return
     try:
         os.unlink(lock / RS_LOCK_OWNER)
