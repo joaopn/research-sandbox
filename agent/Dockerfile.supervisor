@@ -42,10 +42,12 @@ COPY container/supervisor/CLAUDE.md /opt/claude-templates/CLAUDE.md
 # The notice at the top of RS's instructions file, which the entrypoint writes
 # with the template above into ~/.claude/rules/rs-instructions.md at every boot.
 COPY container/rs-instructions-notice.md /opt/claude-templates/rs-instructions-notice.md
-# This image's boot writes RS's instructions into the agent's home and never
-# into /workspace: the host refuses to start a research project on an image
-# without it (its old boot script put RS's text into the project's folders).
-LABEL research.instructions-layout=home
+# This image's boot writes RS's files (its instructions, the /log command)
+# into the agent's home and nothing into /workspace/.claude/ or /workspace/.pi/:
+# the host refuses to create or start a research project on an image without
+# this value (an older boot script puts RS's files back into the project's
+# folders). MIRROR of rscore.INSTRUCTIONS_LAYOUT_HOME (pinned).
+LABEL research.instructions-layout=home-2
 # The inner guard in this image lets a box reach the shared MCP gateway.
 LABEL research.mcp-gateway-guard=1
 COPY container/supervisor/commands/ /opt/claude-templates/commands/

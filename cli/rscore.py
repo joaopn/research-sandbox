@@ -4420,12 +4420,12 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     # Verify prerequisites.
     if not run_quiet(["docker", "image", "inspect", substrate_image]):
         die(f"image {substrate_image} not found. Run `research setup` first.")
-    # A research image from before RS's home-folder instructions layout would
-    # copy RS's text into the project's own folders at its first boot and
+    # A research or sandbox-dind image from before RS's current layout would
+    # write RS's files into the project's own folders at its first boot and
     # report success: refuse before anything exists. Keyed on the IMAGE (the
     # Docker substrate derives the research type too, and rs-minimal carries
     # no such label).
-    if substrate_image == SUPERVISOR_IMAGE:
+    if substrate_image in (SUPERVISOR_IMAGE, SANDBOX_DIND_IMAGE):
         layout = _image_instructions_layout(substrate_image)
         if layout is None:
             raise ValidationError(OLD_INSTRUCTIONS_LABEL_CREATE_ERROR)
@@ -13608,6 +13608,10 @@ _BOX_IMAGE_SHOWN = {"sandbox-box": "the box image",
 # The reasons the step gives (browser-reachable: no host command, no path).
 BOX_IMAGE_NOT_BUILT = ("the box images are not built on this computer: Rebuild "
                        "all on Sandboxes → Software, then retry")
+# The host's box image is from before RS's current layout (or its labels
+# cannot be read): only a Rebuild all brings the new one.
+BOX_IMAGE_OLD_LAYOUT = ("the box images on this computer are out of date: Rebuild "
+                        "all on Sandboxes → Software, then retry")
 BOX_IMAGE_PUBLISH_FAILED = "publishing {image} into the box image registry failed"
 BOX_IMAGE_CONFIRM_FAILED = ("the box image registry did not confirm what it holds "
                             "for {image}")
@@ -13725,6 +13729,11 @@ def _bring_box_image(container: str, network: str, workspace_path: "Path",
     host_id = _host_box_image_id(host_base)
     if not host_id:
         return BoxImageResult(BOX_IMAGE_NOT_BUILT)
+    # An image from before RS's current layout boots into writing RS's files
+    # into the box's own folders: refused before anything is published or
+    # pulled. Read from that exact id, so a concurrent rebuild cannot move it.
+    if _image_instructions_layout(host_id) != INSTRUCTIONS_LAYOUT_HOME:
+        return BoxImageResult(BOX_IMAGE_OLD_LAYOUT)
     try:
         _connect_registry_to_project_network(network)
     except RegistryUnavailable as e:
@@ -14312,27 +14321,77 @@ OLD_INSTRUCTIONS_RESEARCH_ERROR = (
     "project's own instructions: remove or rename it too, unless you keep it as "
     "your own. Then stop the project and start it again.")
 OLD_INSTRUCTIONS_IMAGE_ERROR = (
-    "this project's image is from before RS's new instructions layout; rebuild "
-    "RS's images with Rebuild all on Sandboxes → Software, then stop the project "
-    "and start it again")
+    "this project type's image is out of date: rebuild RS's images with Rebuild "
+    "all on Sandboxes → Software, then stop the project and start it again")
 OLD_INSTRUCTIONS_UNCHECKED_ERROR = (
     "RS could not check this project for its old instructions link; stop the "
     "project and start it again")
 OLD_INSTRUCTIONS_IMAGE_CREATE_ERROR = (
-    "RS's research image is from before its new instructions layout; rebuild "
-    "RS's images with Rebuild all on Sandboxes → Software, then create the "
-    "project again")
+    "this project type's image is out of date: rebuild RS's images with Rebuild "
+    "all on Sandboxes → Software, then create the project again")
 OLD_INSTRUCTIONS_LABEL_CREATE_ERROR = (
-    "RS could not read the research image's labels, so it could not check its "
-    "instructions layout; create the project again")
+    "RS could not read this project type's image labels, so it could not check "
+    "that the image is up to date; create the project again")
 OLD_INSTRUCTIONS_LABEL_ERROR = (
     "RS could not read this project's image labels, so it could not check its "
     "instructions layout; stop the project and start it again")
-# The supervisor image label marking the home-folder instructions layout (its
-# boot script writes ~/.claude/rules/rs-instructions.md and never re-creates
-# the old /workspace/CLAUDE.md link). Set by agent/Dockerfile.supervisor.
+# The image label marking the layout where RS's files live in the agents'
+# homes: the boot script writes nothing into the workspace's .claude/ or .pi/
+# (and the research one writes ~/.claude/rules/rs-instructions.md and never
+# re-creates the old /workspace/CLAUDE.md link). Set by
+# agent/Dockerfile.supervisor, agent/Dockerfile.sandbox-dind and
+# agent/Dockerfile.sandbox-box (the browser box image inherits it). A new value
+# whenever an image's own boot stops writing into those folders: an image built
+# before it would put the files back after every removal.
 INSTRUCTIONS_LAYOUT_LABEL = "research.instructions-layout"
-INSTRUCTIONS_LAYOUT_HOME = "home"
+INSTRUCTIONS_LAYOUT_HOME = "home-2"
+# The project record's flag (the marker; a box's is its record's) set once a
+# check found none of the files RS used to write into the project's own
+# folders: from then on such a file is the user's and never checked again.
+OLD_FILES_FLAG = "old_files_cleared"
+# The paths RS used to write into a project's folders, per kind (only where it
+# wrote them): the project agent of a sandbox-dind or research project, the
+# research supervisor besides, and every box (MIRROR of rs_sandbox's pair —
+# pinned equal). Dev and plain Docker projects: none.
+PROJECT_OLD_PATHS = (".claude/skills/ok", ".pi/skills/ok")
+RESEARCH_OLD_PATHS = (".claude/settings.json", ".claude/commands/log.md",
+                      ".claude/logbook_supervisor_template.md",
+                      ".claude/logbook_pi_template.md", ".claude/logbook_template.md")
+# The credential stash of the retired PI containers, .pi/<role>/.creds/<file>
+# (any role folder), and the one-time upgrade tool's `*.before-upgrade`
+# copies in .claude/.
+RESEARCH_OLD_CREDS = (".credentials.json", "settings.json", "home_claude.json")
+OLD_UPGRADE_SUFFIX = ".before-upgrade"
+BOX_OLD_PATHS = (".claude/skills/ok", ".pi/skills/ok", ".claude/settings.json",
+                 ".pi/mcp.json")
+OK_BOX_OLD_PATHS = (".claude/skills/ok-ingest", "notes/.claude/skills/ok-ingest")
+OLD_FILES_PROJECT_ERROR = (
+    "this project still holds files RS used to write into its folders: {paths}. "
+    "RS keeps these in the agents' home folders now and writes no new copies "
+    "while they exist, so the agents still read the old ones. Remove or rename "
+    "them from this project's terminal or editor, then stop the project and "
+    "start it again.")
+OLD_FILES_BOX_ERROR = (
+    "box '{box}' still holds files RS used to write into its folder: {paths}. RS "
+    "keeps these in the box agents' home folders now and writes no new copies "
+    "while they exist. Remove or rename them from this project's terminal or "
+    "editor, then stop the project and start it again.")
+OLD_FILES_BOX_SIDE_WARNING = (
+    "box '{box}' of project '{project}' was re-run without RS's new copies of the "
+    "files it used to write into the box's folder: {paths} are still there. Remove "
+    "or rename them from the project's terminal or editor; until then the "
+    "project's next start fails")
+_FILES_UNKNOWN = ("RS could not read the project's settings, so it did not check "
+                  "the project's folders for the files it used to write there or "
+                  "refresh the project agent's skills; the next start tries again")
+_FILES_FLAG_FAILED = ("the project's folders hold none of the files RS used to "
+                      "write there, but the project's settings could not record "
+                      "it; the next start checks them again")
+_RESEARCH_STAGING_FAILED = ("the project's box tool or box catalog could not be "
+                            "staged at this start; the project agent's skills and "
+                            "its boxes keep what they had until the next start")
+_FILES_SKILLS_FAILED = ("RS's skills could not be refreshed in the agents' home "
+                        "folders; the next start writes them again")
 
 
 @dataclass(frozen=True)
@@ -14342,15 +14401,23 @@ class OldInstructions:
     kind: str          # "project" | "box" | "research" | "image" | "labels" | "unchecked"
                        # | "box-image" (a box image could not be brought up to
                        # date at a re-creation; `reason` is its fixed text)
+                       # | "files" / "box-files" (files RS used to write into
+                       # the project's / a box's folder; `paths` lists them)
     project: str
     box: str = ""
     reason: str = ""
+    paths: "tuple[str, ...]" = ()
 
     def text(self) -> str:
         if self.kind == "box":
             return OLD_INSTRUCTIONS_BOX_ERROR.format(box=_shown_box(self.box))
         if self.kind == "box-image":
             return self.reason
+        if self.kind == "files":
+            return OLD_FILES_PROJECT_ERROR.format(paths=_shown_old_paths("", self.paths))
+        if self.kind == "box-files":
+            return OLD_FILES_BOX_ERROR.format(
+                box=_shown_box(self.box), paths=_shown_old_paths(self.box, self.paths))
         return {"project": OLD_INSTRUCTIONS_PROJECT_ERROR,
                 "research": OLD_INSTRUCTIONS_RESEARCH_ERROR,
                 "image": OLD_INSTRUCTIONS_IMAGE_ERROR,
@@ -14362,6 +14429,36 @@ def _shown_box(name: Any) -> str:
     """A box name for operator text: the record is project-writable, so a
     name that is not a valid box name is shown as `…`."""
     return name if isinstance(name, str) and _BOX_NAME_RE.match(name) else "…"
+
+
+def _known_old_rel(rel: Any, box: bool) -> bool:
+    """Whether `rel` is one of the paths RS wrote (the box tool's report is
+    project-controlled: anything else is never shown)."""
+    if not isinstance(rel, str):
+        return False
+    if box:
+        return rel in BOX_OLD_PATHS + OK_BOX_OLD_PATHS
+    if rel in PROJECT_OLD_PATHS + RESEARCH_OLD_PATHS:
+        return True
+    parts = rel.split("/")
+    if (len(parts) == 4 and parts[0] == ".pi" and parts[2] == ".creds"
+            and parts[3] in RESEARCH_OLD_CREDS and _OLD_NAME_RE.match(parts[1])):
+        return True
+    return (len(parts) == 2 and parts[0] == ".claude" and parts[1].endswith(OLD_UPGRADE_SUFFIX)
+            and _OLD_NAME_RE.match(parts[1]) is not None)
+
+
+# A folder or file name shown back to the operator (the role folders and
+# upgrade copies are listed from the project's own folders).
+_OLD_NAME_RE = re.compile(r"\A[A-Za-z0-9._-]{1,128}\Z")
+
+
+def _shown_old_paths(box: str, paths: "Sequence[str]") -> str:
+    """The old paths as the project sees them, each re-validated; "" names
+    the files generically when none survives."""
+    base = f"/workspace/boxes/{_shown_box(box)}/" if box else "/workspace/"
+    shown = [f"`{base}{p}`" for p in paths if _known_old_rel(p, bool(box))]
+    return ", ".join(shown) or "files RS wrote there"
 
 
 def _raise_old_instructions(found: "Sequence[OldInstructions]", *,
@@ -14629,6 +14726,33 @@ def _container_layout_labels(container: str) -> "tuple[str, str] | None":
     sub = labels.get(SUBSTRATE_LABEL)
     typ = labels.get(PROJECT_TYPE_LABEL)
     return (sub if isinstance(sub, str) else "", typ if isinstance(typ, str) else "")
+
+
+def _project_image_check(project: str, container: str) -> "list[OldInstructions]":
+    """After a sandbox-dind re-creation: the NEW container's image must carry
+    the current layout label (an image label rides into the container's;
+    never the image tag, which a concurrent rebuild can move). A failed read
+    is its own error, never "no label"."""
+    labels = _container_labels(container)
+    if labels is None:
+        return [OldInstructions("labels", project)]
+    if labels.get(INSTRUCTIONS_LAYOUT_LABEL) != INSTRUCTIONS_LAYOUT_HOME:
+        return [OldInstructions("image", project)]
+    return []
+
+
+def _container_labels(container: str) -> "dict | None":
+    """The container's labels ({} for none); None when they cannot be read."""
+    try:
+        r = run(["docker", "container", "inspect", "-f", '{{json .Config.Labels}}',
+                 container], capture_output=True, timeout=RS_INSTR_EXEC_TIMEOUT_S)
+        if r.returncode != 0:
+            return None
+        labels = json.loads(r.stdout or "null")
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError, ValueError,
+            RecursionError):
+        return None
+    return labels if isinstance(labels, dict) else {}
 
 
 def _research_instructions_check(project: str, container: str) -> "list[OldInstructions]":

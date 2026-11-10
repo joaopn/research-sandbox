@@ -51,6 +51,11 @@ RUN chmod +x /opt/dev/repo-watch.sh /usr/local/bin/rs-repo-watch \
     /usr/local/bin/rs-wt /usr/local/bin/rs-land /usr/local/bin/rs-board
 
 COPY agent/entrypoint.sandbox-dind.sh /entrypoint.sh
+# This image's boot writes nothing into /workspace/.claude/ or /workspace/.pi/
+# (RS's files live in the agents' homes): the host refuses to create or start
+# a sandbox-dind project on an image without this value (an older boot made
+# folders there). MIRROR of rscore.INSTRUCTIONS_LAYOUT_HOME (pinned).
+LABEL research.instructions-layout=home-2
 RUN chmod +x /entrypoint.sh
 
 USER research

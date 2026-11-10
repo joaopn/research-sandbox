@@ -29,6 +29,12 @@ COPY agent/entrypoint.sandbox-box.sh /entrypoint.sh
 # The box's MCP render: run by the entrypoint at boot, and streamed by the host
 # into a running box when an agent change gives it pi (one source, two callers).
 COPY agent/box-render-mcp.py /usr/local/lib/rs-box/box-render-mcp.py
+# This image's boot writes nothing into the box's /workspace/.claude/ or
+# /workspace/.pi/ (pi's MCP settings and the skills go into the agents' homes):
+# a project refuses a host box image without this value before it publishes it
+# (an older boot re-creates /workspace/.pi/mcp.json at every start). The browser
+# image inherits it. MIRROR of rscore.INSTRUCTIONS_LAYOUT_HOME (pinned).
+LABEL research.instructions-layout=home-2
 RUN chmod +x /entrypoint.sh
 
 # Dev-lane tooling: the repo-watch loop + its prompt + the launchers
