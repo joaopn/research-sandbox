@@ -1,5 +1,5 @@
 ---
-name: harness
+name: rs-mode
 description: Switch this session's working mode — none, direct or planner-doer-checker. Only when the user asks for it.
 argument-hint: "none | direct | planner-doer-checker"
 disable-model-invocation: true

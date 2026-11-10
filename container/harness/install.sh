@@ -118,7 +118,8 @@ done
 DOER_DESC="Implements one unit of work from a self-contained brief (shipped by RS)."
 CHECKER_DESC="Reviews a change read-only - verifies against the code, asserts defects, flags forks (shipped by RS)."
 
-# skill DIR — the harness skill with its own copy of the mode texts.
+# skill DIR — the mode-switch skill (named rs-mode; its folder keeps the name
+# harness, so nothing is ever removed) with its own copy of the mode texts.
 skill() {
     put "$1/SKILL.md" < "$SRC/skill/SKILL.md" || FAILED=1
     put "$1/modes/direct.md" < "$SRC/modes/direct.md" || FAILED=1
@@ -173,7 +174,7 @@ if [ "$HAS_CLAUDE" = 1 ] || [ "$HAS_PI" = 1 ]; then
         {
             printf '%s\n' "# Working mode: $MODE (set by RS for this project)" '' \
                 'This sets how the session that talks with the user works. If you were launched as a subagent - `doer`, `checker` or any other child agent - ignore this file and do the task in your brief.' '' \
-                "Where the project's own instructions prescribe a different way of working, the project's instructions win. The user can switch this session's mode with the \`harness\` skill: \`/harness <mode>\` in Claude Code, \`/skill:harness <mode>\` in pi (none, direct or planner-doer-checker)." ''
+                "Where the project's own instructions prescribe a different way of working, the project's instructions win. The user can switch this session's mode with the \`rs-mode\` skill: \`/rs-mode <mode>\` in Claude Code, \`/skill:rs-mode <mode>\` in pi (none, direct or planner-doer-checker)." ''
             cat "$SRC/modes/$MODE.md"
         } | put "$RULE" || FAILED=1
     fi

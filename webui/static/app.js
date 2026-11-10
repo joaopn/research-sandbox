@@ -12502,7 +12502,7 @@ function agentsBoxApply(name, d, f) {
                 d.running
                     ? "Each agent's next session uses its new settings; a session running now " +
                       "keeps them until it is restarted (switch the working mode in a running " +
-                      "session with /harness, or /skill:harness in pi)."
+                      "session with /rs-mode, or /skill:rs-mode in pi)."
                     : "The project is stopped: the change is saved and applied at its next " +
                       "start; nothing is started.",
             ]),

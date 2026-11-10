@@ -2297,7 +2297,7 @@ def _box_carried_agents() -> list[str]:
 
 
 def _install_harness(cname: str, agents: list[str]) -> None:
-    """Lay the working-mode suite (RS's doer/checker subagents, the harness
+    """Lay the working-mode suite (RS's doer/checker subagents, the rs-mode
     skill, the standing-mode rules file) into a freshly run agent box, as the
     box user. Run from here rather than from the box image so it reaches boxes
     whose project has not been restarted since a rebuild, and at every run, because a re-run

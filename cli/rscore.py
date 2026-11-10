@@ -9006,7 +9006,7 @@ def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,
     return warnings
 
 
-# The working-mode suite (I33): RS's `doer` / `checker` subagents, the `harness`
+# The working-mode suite (I33): RS's `doer` / `checker` subagents, the `rs-mode`
 # skill and the standing-mode rules file, for Claude Code and pi alike. Tracked
 # source, streamed into a Docker-in-Docker project's shared agent copy at every
 # stage (so it travels with RS's code, never with a cached download), and laid
@@ -9018,7 +9018,7 @@ HARNESS_INSTALLER = f"{HARNESS_STAGE_DIR}/install.sh"
 # Printed by the installer on stdout when it could not write a file (it always
 # exits 0: a missing suite never stops a start).
 HARNESS_FAILED_SENTINEL = "RS_HARNESS_INSTALL_FAILED"
-_HARNESS_WARNING = ("the working-mode files (doer, checker, the harness skill) could not "
+_HARNESS_WARNING = ("the working-mode files (doer, checker, the rs-mode skill) could not "
                     "all be installed into the project's agent; the agent runs without them")
 
 
