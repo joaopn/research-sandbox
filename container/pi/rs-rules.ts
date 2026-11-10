@@ -44,8 +44,9 @@
 // pi reads project servers only from `<cwd>/.pi/mcp.json`, with no walk-up. So
 // at session start, when the session folder has no `.pi/mcp.json` of its own,
 // the extension registers the servers of the NEAREST parent folder's
-// `.pi/mcp.json` (in a box that file is the link to the box's `.mcp.json`),
-// only when pi would trust that parent folder (its entry in the agent dir's
+// `.pi/mcp.json` (a user's own file: RS's box servers reach pi through its home
+// mcp.json, read in every folder, and RS writes no `.pi/mcp.json`), only when
+// pi would trust that parent folder (its entry in the agent dir's
 // trust.json, else the global `defaultProjectTrust: "always"`), and entries are
 // passed as written except three rules pi applies to project files: an http
 // entry with `auth` is skipped, an override of a global server (an entry with

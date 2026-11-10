@@ -215,11 +215,11 @@ _BOX_MAILBOX_AGENT_LINE = ("started without the project agent's mailbox: somethi
 # own ingest skill). The remedy is webui-doable, so the line names it: the
 # skill is written again by the next add of a box whose type offers it.
 _BOX_SKILL_REASONS = {
-    "not-a-folder": "something that is not a folder sits where the skill goes in its workspace; the skill is written again by the next add of a box whose type offers it",
-    "unwritable": "the skill file could not be written in its workspace; the skill is written again by the next add of a box whose type offers it",
+    "not-a-folder": "something that is not a folder sits where the skill goes in its home folder or in the project's staged copy; the skill is written again at the next start",
+    "unwritable": "the skill file could not be written into its home folder or the project's staged copy; the skill is written again at the next start",
     "no-text": "the box type offering it is no longer in the catalog",
 }
-_BOX_SKILL_REASON_DEFAULT = "it could not be written; the skill is written again by the next add of a box whose type offers it"
+_BOX_SKILL_REASON_DEFAULT = "it could not be written; the skill is written again at the next start"
 # Every worker and the project agent owns a mailbox /workspace/shared/<name>/,
 # and so does every box created sharing files with the project, at
 # shared/.boxes/<name>/ (the owner writes it, everyone else reads it, it
