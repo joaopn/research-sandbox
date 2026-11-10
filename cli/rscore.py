@@ -9312,14 +9312,21 @@ def _refresh_running_boxes(supervisor: str, agents: "Sequence[str]", progress,
         # The render writes pi's home settings only in a box run with its
         # staged skills folder and no old-files mark; anywhere else it would
         # only regenerate .mcp.json wholesale at every Update (dropping servers
-        # added by hand) and never record pi as wired. Such a box gets pi's
-        # servers at its next start, and says so.
-        if needs_render and run(
-                [*inner, box, "sh", "-c",
-                 f'[ -d {BOX_SKILLS_IN_BOX} ] && [ ! -e {BOX_SKILLS_IN_BOX}/{BOX_OLD_FILES_MARK} ]'],
-                capture_output=True).returncode != 0:
-            needs_render = False
-            progress.step("agents", f"box {box}: pi gets its MCP servers at the box's next start")
+        # added by hand) and never record pi as wired. A box run before the
+        # folder existed gets pi's servers at its next start (every start
+        # re-runs it with the folder), and says so; a box with the mark gets
+        # them once RS's old files are gone, which the operation's own
+        # old-files error names, so nothing more is said for it.
+        if needs_render:
+            mounted = run([*inner, box, "sh", "-c", f"[ -d {BOX_SKILLS_IN_BOX} ]"],
+                          capture_output=True).returncode == 0
+            marked = mounted and run(
+                [*inner, box, "sh", "-c", f"[ -e {BOX_SKILLS_IN_BOX}/{BOX_OLD_FILES_MARK} ]"],
+                capture_output=True).returncode == 0
+            if not mounted or marked:
+                needs_render = False
+            if not mounted:
+                progress.step("agents", f"box {box}: pi gets its MCP servers at the box's next start")
         if needs_render:
             env = dict(_agent_env("pi", _BOX_HOME))
             r = subprocess.run(
