@@ -149,14 +149,29 @@ def write_atomic(path: Path, text: str) -> None:
 pi_agent_dir = os.environ.get("RS_PI_AGENT_DIR") or ""
 # RS's mark on its own entries in pi's home MCP settings.
 RS_MARK = "rsManaged"
+# The mark the project's MCP gateway sync (agent/rs-mcp-sync.py) puts on the
+# gateway servers it adds to the same file through `pi mcp add`: a header.
+# Those entries are that writer's alone — never pruned, replaced or rewritten
+# here, whatever else they carry. MIRROR of rs-mcp-sync's MARK_HEADER (pinned).
+GATEWAY_MARK_HEADER = "X-RS-MCP"
+
+
+def is_gateway(entry) -> bool:
+    headers = entry.get("headers") if isinstance(entry, dict) else None
+    return isinstance(headers, dict) and any(
+        isinstance(h, str) and h.lower() == GATEWAY_MARK_HEADER.lower() for h in headers)
 old_files_mark = Path("/opt/rs-box-skills/.old-files")
 
 
 def pi_home_merge(rs_servers: dict) -> bool:
     """Merge RS's servers into pi's home mcp.json by name: drop every entry
     RS marked before, add each of `rs_servers` marked, keep everything else.
-    An unmarked entry with an RS server's name is the user's: kept, RS's is
-    not added, and the name is warned about. No file and nothing to add: no
+    A gateway entry (the project's MCP gateway sync marks it with its header)
+    is never dropped or replaced, even if it also carried this mark. An
+    unmarked entry with an RS server's name is the user's or the gateway's:
+    kept, RS's is not added, and the name is warned about (a gateway clash is
+    also reported by the gateway sync, as a conflict, at its next run: the
+    server's name is declared in /workspace/.mcp.json). No file and nothing to add: no
     file is made. Returns True when the file now holds exactly RS's current
     entries (nothing to do counts); False, with a warning, when it was left
     alone. Never raises."""
@@ -175,8 +190,9 @@ def pi_home_merge(rs_servers: dict) -> bool:
         return False
     current = data.get("mcpServers", {})
     merged = {n: c for n, c in current.items()
-              if not (isinstance(c, dict) and c.get(RS_MARK) is True)}
-    clashes = sorted(n for n in rs_servers if n in merged)
+              if is_gateway(c) or not (isinstance(c, dict) and c.get(RS_MARK) is True)}
+    clashes = sorted(n for n in rs_servers if n in merged and not is_gateway(merged[n]))
+    gateway = sorted(n for n in rs_servers if n in merged and is_gateway(merged[n]))
     for n, cfg in rs_servers.items():
         if n in merged:
             continue
@@ -185,6 +201,11 @@ def pi_home_merge(rs_servers: dict) -> bool:
         print(f"sandbox-box: pi's MCP settings already hold your own "
               f"{', '.join(map(repr, clashes))}; kept, so pi does not get the "
               f"box's server(s) of that name", file=sys.stderr)
+    if gateway:
+        print(f"sandbox-box: pi's MCP settings already hold the project's MCP "
+              f"gateway server(s) {', '.join(map(repr, gateway))}, wired from the MCP "
+              f"page; kept, so pi does not get the box's own server(s) of that name",
+              file=sys.stderr)
     if merged == current and (path.exists() or not merged):
         return True
     data["mcpServers"] = merged
