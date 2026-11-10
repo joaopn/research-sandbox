@@ -2266,6 +2266,45 @@ html.mobile .dev-repos-table .dev-repos-opt { display: none; }
 .mgmt-settings-note { color: var(--fg-muted); font-size: 12px; }
 .mgmt-settings-hint { color: var(--fg-muted); font-size: 12px; margin: 6px 10px 0; }
 
+/* Sandboxes → MCP (the gateway's server list). Self-scoped classes only. */
+.mcp-server-row { flex-wrap: wrap; }
+.mcp-server-name { font-weight: 600; color: var(--fg-base); }
+.mcp-server-url {
+    flex: 1 1 16em;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--fg-muted);
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 12px;
+}
+.mcp-server-actions { display: flex; gap: 6px; }
+.mcp-server-meta { flex: 1 0 100%; color: var(--fg-muted); font-size: 12px; }
+.mcp-server-meta:empty { display: none; }
+.mcp-test { flex: 1 0 100%; font-size: 12px; color: var(--fg-muted); }
+.mcp-test:empty { display: none; }
+.mcp-test-ok { color: var(--fg-base); }
+.mcp-test-bad { color: var(--error-fg); }
+.mcp-list-error { margin: 10px 0; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.modal-backdrop .card.mcp-server-card { max-width: min(560px, 94vw); }
+.mcp-headers-title { font-size: 13px; font-weight: 600; margin-top: 12px; }
+.mcp-header-row { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
+.mcp-header-name, .mcp-header-value {
+    min-width: 0;
+    padding: 6px 8px;
+    background: var(--bg-input);
+    color: var(--fg-base);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 13px;
+}
+.mcp-header-name { flex: 1 1 9em; }
+.mcp-header-value { flex: 2 1 12em; }
+.mcp-header-name:focus, .mcp-header-value:focus { outline: none; border-color: var(--bg-input-focus-border); }
+.mcp-header-remove { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--fg-muted); white-space: nowrap; }
+.mcp-headers-more { margin: 8px 0 4px; }
+
 /* ===================== Mobile shell (html.mobile) ==========================
    Applied by app.js (mobileModeActive: width <= the 768px breakpoint, or the
    Settings Layout override). The desktop layout above is untouched — every

@@ -786,6 +786,68 @@ async def broker_software_handler(request: web.Request) -> web.Response:
     return web.json_response(body, status=status)
 
 
+# --- Sandboxes → MCP: the gateway's server list ------------------------------
+# MIRROR of cli/broker.py MAX_REQUEST_BYTES (the webui cannot import the
+# broker; a pytest pins the two equal). The broker refuses a larger frame
+# without reading it, which a large enough body turns into a broken pipe —
+# read here as "broker unreachable". An entry with secret headers is the one
+# request whose size the operator controls, so its size is refused here first.
+BROKER_MAX_REQUEST_BYTES = 64 * 1024
+
+
+def _broker_frame_len(verb: str, args: dict, token: str) -> int:
+    """The length of the frame broker_call would send (same encoding)."""
+    return len(json.dumps({"verb": verb, "args": args, "token": token}).encode())
+
+
+async def broker_mcp_servers_handler(request: web.Request) -> web.Response:
+    """GET /broker/mcp/servers — the gateway's servers (secret headers by NAME
+    only), the gateway's state and the list's state. Session-gated read."""
+    status, body = await _relay(request, "mcp_server_list")
+    return web.json_response(body, status=status)
+
+
+# verb per action, and the body keys each may carry — the hand-picked leg of
+# the request-field ↔ MCP_SERVER_*_WEBUI_FIELDS ↔ app.js payload lockstep.
+_MCP_SERVER_ACTIONS = {
+    "add": ("mcp_server_add", ("name", "url", "description", "headers")),
+    "edit": ("mcp_server_edit", ("name", "url", "description",
+                                 "headers_set", "headers_remove")),
+    "remove": ("mcp_server_remove", ("name",)),
+    "test": ("mcp_server_test", ("name",)),
+    "reset": ("mcp_server_list_reset", ()),
+}
+
+
+def _mcp_server_action_handler(action: str):
+    verb, fields = _MCP_SERVER_ACTIONS[action]
+
+    async def handler(request: web.Request) -> web.Response:
+        """POST /broker/mcp/servers/<action> — origin-checked; an absent key is
+        sent as absent so the broker-side request refuses bad shapes itself."""
+        if not origin_ok(request):
+            return web.Response(status=403, text="origin rejected")
+        s = _broker_session(request)
+        if s is None:
+            return web.json_response(
+                {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        args = {k: body[k] for k in fields if k in body}
+        if _broker_frame_len(verb, args, s["broker_token"]) > BROKER_MAX_REQUEST_BYTES:
+            return web.json_response(
+                {"ok": False, "error": {"kind": "validation", "message":
+                 "the entry is too large; shorten the description or the "
+                 "secret headers"}}, status=200)
+        status, reply = await _relay(request, verb, args)
+        return web.json_response(reply, status=status)
+    return handler
+
+
 # The fixed set of build verbs the browser may request (the input boundary — the
 # broker re-validates the agent enum pre-spawn). editor_*/rebuild take no args;
 # agent_pull/agent_refresh carry the agent enum. agent_refresh/editor_refresh
@@ -793,7 +855,7 @@ async def broker_software_handler(request: web.Request) -> web.Response:
 # child-side — no client-supplied version crosses).
 _BUILD_VERBS = frozenset({"agent_pull", "editor_pull", "reader_pull", "node_pull",
                           "agent_refresh", "editor_refresh", "reader_refresh",
-                          "rebuild"})
+                          "rebuild", "mcp_gateway_start"})
 
 
 async def broker_build_handler(request: web.Request) -> web.Response:
@@ -4113,6 +4175,10 @@ def main() -> None:
     app.router.add_post("/broker/models/default", broker_models_default_handler)
     app.router.add_get("/broker/settings", broker_settings_handler)
     app.router.add_post("/broker/settings", broker_settings_set_handler)
+    app.router.add_get("/broker/mcp/servers", broker_mcp_servers_handler)
+    for _action in _MCP_SERVER_ACTIONS:
+        app.router.add_post(f"/broker/mcp/servers/{_action}",
+                            _mcp_server_action_handler(_action))
     app.router.add_get("/broker/software", broker_software_handler)
     app.router.add_post("/broker/software/build", broker_build_handler)
     app.router.add_post("/broker/software/refresh-check", broker_refresh_check_handler)

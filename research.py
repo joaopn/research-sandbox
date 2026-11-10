@@ -188,6 +188,9 @@ def cmd_start(args: argparse.Namespace) -> None:
     # webui onto it (B58); a self-signed install makes no docker call here.
     rscore.renew_webui_cert_at_start()
     _start_enabled_mcps()
+    # The shared MCP gateway: nothing above or below depends on it, so a
+    # failure warns and the start carries on.
+    rscore.start_mcp_gateway_with_fleet(rebuild=args.rebuild)
     # Re-attach shared rs-gitea to the projects in the dev-lane attachment record.
     # SELECTIVE (only recorded projects), unlike the registry. No-op until a dev
     # repo has been attached. Runs LAST of the wiring passes: it is the only one
@@ -247,6 +250,8 @@ def cmd_stop(_: argparse.Namespace) -> None:
     if not _stop_infra_container(WEBUI_CONTAINER):
         failed.append(WEBUI_CONTAINER)
     failed += _stop_shared_mcps()
+    if not _stop_infra_container(rscore.MCP_GATEWAY_CONTAINER):
+        failed.append(rscore.MCP_GATEWAY_CONTAINER)
     for cname in (gitea.GITEA_CONTAINER, REGISTRY_PUSH_CONTAINER, REGISTRY_CONTAINER):
         if not _stop_infra_container(cname):
             failed.append(cname)
@@ -1113,6 +1118,104 @@ def cmd_mcp_disable(args: argparse.Namespace) -> None:
                   f"{len(denied)} project(s): {', '.join(denied)}")
     else:
         print(f"disabled {args.name!r}{suffix}")
+
+
+# --- the MCP gateway's server list (`research mcp server ...`) ---------------
+
+MCP_TEST_SENTENCES = {
+    "mcp": "answers as an MCP server",
+    "refused": "reachable, but it refuses the credentials",
+    "not_mcp": "reachable, but it does not speak MCP at that address",
+    "unreachable": "not reachable",
+    "unknown": "is not on the list",
+    "gateway_down": "could not be asked",
+}
+
+
+def _mcp_cli_headers(args: argparse.Namespace) -> dict:
+    """Secret headers from --header NAME=VALUE and --header-stdin NAME (one
+    line read from stdin per name, in order — read BEFORE any list lock)."""
+    headers: dict = {}
+    for item in args.header or []:
+        name, sep, value = item.partition("=")
+        if not sep:
+            die("--header takes NAME=VALUE")
+        headers[name] = value
+    for name in args.header_stdin or []:
+        line = sys.stdin.readline()
+        if not line:
+            die(f"no value on stdin for the header {name}")
+        headers[name] = line.rstrip("\r\n")
+    return headers
+
+
+def _print_mcp_servers(payload: dict) -> None:
+    if payload.get("error"):
+        print(f"warning: {payload['error']}", file=sys.stderr)
+    print(f"gateway: {payload['gateway']}")
+    for row in payload["servers"]:
+        secrets_note = (f"  [secret headers: {', '.join(row['headers'])}]"
+                        if row["headers"] else "")
+        print(f"  {row['name']}  {row['url']}{secrets_note}")
+        if row["description"]:
+            print(f"      {row['description']}")
+    if not payload["servers"]:
+        print("  (no servers)")
+
+
+def cmd_mcp_server_list(args: argparse.Namespace) -> None:
+    payload = _call(rscore.mcp_server_list)
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        _print_mcp_servers(payload)
+
+
+def cmd_mcp_server_add(args: argparse.Namespace) -> None:
+    req = _build(rscore.McpServerAddRequest, name=args.name, url=args.url,
+                 description=args.description, headers=_mcp_cli_headers(args))
+    _call(rscore.mcp_server_add, req)
+    print(f"added MCP server {req.name!r}")
+
+
+def cmd_mcp_server_edit(args: argparse.Namespace) -> None:
+    req = _build(rscore.McpServerEditRequest, name=args.name, url=args.url,
+                 description=args.description, headers_set=_mcp_cli_headers(args),
+                 headers_remove=args.remove_header or [])
+    _call(rscore.mcp_server_edit, req)
+    print(f"changed MCP server {req.name!r}")
+
+
+def cmd_mcp_server_remove(args: argparse.Namespace) -> None:
+    req = _build(rscore.McpServerNameRequest, name=args.name)
+    _call(rscore.mcp_server_remove, req)
+    print(f"removed MCP server {req.name!r}")
+
+
+def cmd_mcp_server_reset(_args: argparse.Namespace) -> None:
+    _call(rscore.mcp_server_list_reset)
+    print("the damaged MCP server list was replaced by an empty one")
+
+
+def cmd_mcp_server_test(args: argparse.Namespace) -> None:
+    if args.name is not None:
+        names = [_build(rscore.McpServerNameRequest, name=args.name).name]
+    else:
+        payload = _call(rscore.mcp_server_list)
+        if payload.get("error"):
+            die(payload["error"])
+        names = [row["name"] for row in payload["servers"]]
+        if not names:
+            print("(no servers)")
+            return
+    failed = False
+    for name in names:
+        res = rscore.mcp_server_test(rscore.McpServerNameRequest(name=name))
+        detail = f" — {res['detail']}" if res["detail"] else ""
+        print(f"{name}: {MCP_TEST_SENTENCES[res['outcome']]}{detail}")
+        failed = failed or res["outcome"] != "mcp"
+    if failed:
+        sys.exit(1)
 
 
 def cmd_worker_list(args: argparse.Namespace) -> None:
@@ -3016,6 +3119,53 @@ def build_parser() -> argparse.ArgumentParser:
     mts.add_argument("name", nargs="?",
                      help="MCP name; omit to test every registered MCP")
     mts.set_defaults(func=cmd_mcp_test)
+
+    # ----- the MCP gateway's server list ---------------------------------
+    msv = mcp_sub.add_parser(
+        "server", help="the shared MCP gateway's servers (the Sandboxes → MCP page's list)")
+    msv_sub = msv.add_subparsers(dest="server_command", required=True)
+
+    def _mcp_header_flags(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--header", action="append", metavar="NAME=VALUE",
+                       help="a secret request header the gateway adds (repeatable)")
+        p.add_argument("--header-stdin", action="append", metavar="NAME",
+                       help="a secret header whose value is one line read from "
+                            "stdin, so it stays out of the shell history (repeatable)")
+
+    msl = msv_sub.add_parser("list", help="list the gateway's servers (secrets by name only)")
+    msl.add_argument("--json", action="store_true")
+    msl.set_defaults(func=cmd_mcp_server_list)
+
+    msa = msv_sub.add_parser("add", help="add a server at an http:// or https:// address")
+    msa.add_argument("name")
+    msa.add_argument("--url", required=True, metavar="URL")
+    msa.add_argument("--description", default=None)
+    _mcp_header_flags(msa)
+    msa.set_defaults(func=cmd_mcp_server_add)
+
+    mse = msv_sub.add_parser("edit", help="change a server; what is not given stays as it is")
+    mse.add_argument("name")
+    mse.add_argument("--url", default=None, metavar="URL")
+    mse.add_argument("--description", default=None)
+    _mcp_header_flags(mse)
+    mse.add_argument("--remove-header", action="append", metavar="NAME",
+                     help="drop a secret header (repeatable)")
+    mse.set_defaults(func=cmd_mcp_server_edit)
+
+    msr = msv_sub.add_parser("remove", help="take a server off the list")
+    msr.add_argument("name")
+    msr.set_defaults(func=cmd_mcp_server_remove)
+
+    msx = msv_sub.add_parser(
+        "reset", help="replace a DAMAGED server list by an empty one (every "
+                      "server and secret on it is discarded); refuses a readable list")
+    msx.set_defaults(func=cmd_mcp_server_reset)
+
+    mst = msv_sub.add_parser(
+        "test", help="ask a server (default: every server), from the gateway, "
+                     "to introduce itself as an MCP server")
+    mst.add_argument("name", nargs="?")
+    mst.set_defaults(func=cmd_mcp_server_test)
 
     # ----- worker catalog (host visibility) -----------------------------
     wk = sub.add_parser(

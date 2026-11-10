@@ -202,6 +202,8 @@ python research.py project mcp allow myproj arxiv
 
 `mcp add` writes the registry; `mcp enable` flips the per-MCP flag (and auto-allows it into new projects); `project mcp allow` refuses a disabled MCP; `research start` auto-launches every enabled *shared* MCP. Every MCP is reached through the per-project **mcp-proxy** at a single internal address — workers can't reach an MCP they weren't granted. The server must speak streamable-HTTP and follow a small contract; see [docs/GUIDE.md](docs/GUIDE.md).
 
+**The MCP page (Sandboxes → MCP).** A second, newer list holds MCP servers by address (`http://` or `https://`) with optional secret request headers, behind one shared gateway container. The page adds, edits, tests and removes them, and `research mcp server list | add | edit | remove | test` does the same from the host. Wiring these servers to projects and boxes is not available yet; until it is, projects use the registry above.
+
 ### Worker services — `worker`
 
 Pipeline-side agents the supervisor's analysis workers call through the proxy (`research worker list`):

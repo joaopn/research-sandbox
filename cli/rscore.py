@@ -79,6 +79,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import box_catalog  # noqa: E402  (box-preset catalog; staged into the supervisor)
 import defaults  # noqa: E402
 import mcp_registry  # noqa: E402
+import mcp_servers  # noqa: E402  (the MCP gateway's server list; stdlib only)
 import model_catalog  # noqa: E402  (agent model/effort catalog + per-type defaults; HOST-side only — never staged/baked into a container, see _read_models)
 import role_mcp  # noqa: E402
 import extension  # noqa: E402
@@ -10450,8 +10451,21 @@ def _build_images(force: bool, progress=None) -> None:
 
 def rebuild(progress=None) -> None:
     """Rebuild the full image fleet (force). Thin public wrapper the broker build
-    lane calls; the CLI reaches _build_images directly via `start --rebuild`."""
+    lane calls; the CLI reaches _build_images directly via `start --rebuild`.
+    The shared MCP gateway's image is rebuilt with it, best-effort."""
     _build_images(True, progress=progress)
+    (progress or _NULL_PROGRESS).step("build", f"building {MCP_GATEWAY_IMAGE}")
+    if not _mcp_gateway_build():
+        print(f"warning: {MCP_GATEWAY_IMAGE} could not be rebuilt", file=sys.stderr)
+        return
+    # A RUNNING gateway is moved onto the new image here (a stopped one takes
+    # it at its next start): the page has no other way to restart it.
+    try:
+        if _mcp_gateway_container(None)[0] == "running":
+            ok, msg = _mcp_gateway_up()
+            print(msg if ok else f"warning: {msg}", file=sys.stderr if not ok else sys.stdout)
+    except ValidationError as e:
+        print(f"warning: {e}", file=sys.stderr)
 
 
 def software_status() -> dict:
@@ -15804,6 +15818,429 @@ def _probe_mcp(name: str, entry: dict) -> tuple[bool, str]:
     if r.returncode == 0:
         return True, ""
     return False, (r.stderr or r.stdout).strip()
+
+
+# ---------------------------------------------------------------------------
+# The shared MCP gateway (rs-mcpgw) and its server list
+# ---------------------------------------------------------------------------
+# One container beside the router and Gitea that holds the registered MCP
+# servers' addresses and secret headers (cli/mcp_servers.py). It is separate
+# from the older per-project machinery (mcp_registry + the in-project proxy),
+# which it does not read or touch. Named outside the `rs-mcp-<name>` namespace
+# of the older shared servers, and carrying no MCP_LABEL (their sweep keys on it).
+MCP_GATEWAY_CONTAINER = "rs-mcpgw"
+MCP_GATEWAY_IMAGE = "rs-mcpgw:latest"
+MCP_GATEWAY_PROGRAM = "/opt/mcp-gateway/gateway.py"
+# How long one Test may take, enforced INSIDE the probe as a total deadline.
+# Half the webui's 30 s bound on a broker call (webui/server.py
+# BROKER_CALL_TIMEOUT_S), so a probe plus the exec around it always answers
+# inside one relay; the _UPSTREAM_RESOLVE_MAX_TIME_S precedent. Shorter fails a
+# hosted server's cold start; longer cannot fit the relay.
+MCP_PROBE_TIMEOUT_S = 15
+# Backstop on the host's `docker exec` only: the probe ends itself at
+# MCP_PROBE_TIMEOUT_S, and 5 s covers the exec's own start and exit.
+MCP_PROBE_EXEC_TIMEOUT_S = 20
+# ONE deadline per inline verb: every docker call inside it gets the time left,
+# so no verb on the broker's accept thread can outlast the 30 s relay however
+# many calls it makes (5 s of margin for the relay's own queueing).
+MCP_INLINE_DEADLINE_S = 25
+
+MCP_GATEWAY_IMAGE_MISSING = "the MCP gateway's image is not built yet"
+_MCP_HOST_SLOW = "the host's container service did not answer in time"
+_MCP_HOST_DOWN = "the host's container service could not be reached"
+_MCP_PROBE_OUTCOMES = frozenset({"mcp", "refused", "not_mcp", "unreachable", "unknown"})
+# The gateway's own `detail` is a fixed vocabulary; the cap only bounds what a
+# replaced program could print (the longest real one is under 80 characters).
+_MCP_PROBE_DETAIL_MAX = 200
+
+
+def _mcp_deadline() -> float:
+    return time.monotonic() + MCP_INLINE_DEADLINE_S
+
+
+def _mcp_docker(cmd: list[str], deadline: float | None) -> subprocess.CompletedProcess:
+    """One docker call that takes what is left of the verb's deadline (None =
+    unbounded: the host command and the build-lane child). Never run_check:
+    its refusal carries the command line."""
+    try:
+        if deadline is None:
+            return run(cmd, capture_output=True)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise ValidationError(_MCP_HOST_SLOW)
+        return run(cmd, capture_output=True, timeout=left)
+    except subprocess.TimeoutExpired:
+        raise ValidationError(_MCP_HOST_SLOW) from None
+    except OSError:
+        raise ValidationError(_MCP_HOST_DOWN) from None
+
+
+def _mcp_gateway_image_id(deadline: float | None) -> str:
+    r = _mcp_docker(["docker", "image", "inspect", "-f", "{{.Id}}",
+                     MCP_GATEWAY_IMAGE], deadline)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def _mcp_gateway_container(deadline: float | None) -> tuple[str, str]:
+    """(state, image id) of the gateway CONTAINER: state is running | stopped |
+    absent. `docker container inspect`: the image shares the name."""
+    r = _mcp_docker(["docker", "container", "inspect", "-f",
+                     "{{.State.Running}} {{.Image}}", MCP_GATEWAY_CONTAINER], deadline)
+    if r.returncode != 0:
+        return "absent", ""
+    running, _, image = r.stdout.strip().partition(" ")
+    return ("running" if running == "true" else "stopped"), image
+
+
+def mcp_gateway_state(deadline: float | None = None) -> str:
+    """running | stopped | absent | image_missing (the last only when it is not
+    running: a running gateway is running whatever became of the tag)."""
+    state, _image = _mcp_gateway_container(deadline)
+    if state == "running":
+        return state
+    return state if _mcp_gateway_image_id(deadline) else "image_missing"
+
+
+def _mcp_gateway_up(deadline: float | None = None) -> tuple[bool, str]:
+    """Render the list and make the gateway running on the built image.
+    (ok, message); never raises for a state it can name. Refuses on a damaged
+    or newer-version list: the gateway never starts on a stale rendering."""
+    try:
+        with mcp_servers.lock():
+            mcp_servers.render(mcp_servers.load())
+    except mcp_servers.ServerListError as e:
+        return False, str(e)
+    want = _mcp_gateway_image_id(deadline)
+    if not want:
+        return False, MCP_GATEWAY_IMAGE_MISSING
+    state, image = _mcp_gateway_container(deadline)
+    if state != "absent" and image != want:
+        # A rebuild replaced the image: the old container goes, by its fixed name.
+        r = _mcp_docker(["docker", "rm", "-f", MCP_GATEWAY_CONTAINER], deadline)
+        if r.returncode != 0:
+            return False, "the old MCP gateway container could not be removed"
+        state = "absent"
+    if state == "running":
+        _mcp_docker(["docker", "kill", "-s", "HUP", MCP_GATEWAY_CONTAINER], deadline)
+        return True, "the MCP gateway is running"
+    if state == "stopped":
+        r = _mcp_docker(["docker", "start", MCP_GATEWAY_CONTAINER], deadline)
+    else:
+        r = _mcp_docker([
+            "docker", "run", "-d",
+            "--name", MCP_GATEWAY_CONTAINER,
+            "--network", GATEWAY_NETWORK_RUN_ARG,
+            # The operator's uid: the rendered list is 0600 in a 0700 folder.
+            "--user", f"{os.getuid()}:{os.getgid()}",
+            "--add-host", "host.docker.internal:host-gateway",
+            "--restart", "unless-stopped",
+            # The DIRECTORY: the rendered file is replaced by rename.
+            "-v", f"{mcp_servers.GATEWAY_DIR}:/etc/mcp-gateway:ro",
+            MCP_GATEWAY_IMAGE,
+        ], deadline)
+    if r.returncode != 0:
+        # The FIRST line is the cause; the last is often the client's help pointer.
+        err = [l for l in (r.stderr or r.stdout or "").splitlines() if l.strip()]
+        return False, ("the MCP gateway could not be started"
+                       + (f" ({err[0].strip()[:200]})" if err else ""))
+    return True, "the MCP gateway was started"
+
+
+def _mcp_gateway_build() -> bool:
+    """Build the gateway's one image from this tree (cached: seconds). Its
+    output goes to the caller's stdout. It is NOT in _image_build_specs: like
+    the router and the webui it is a host-daemon image built where it is
+    started, and a failed build must not stop the fleet."""
+    try:
+        r = run(["docker", "build",
+                 "-f", str(SCRIPT_DIR / "agent" / "Dockerfile.mcp-gateway"),
+                 "-t", MCP_GATEWAY_IMAGE, str(SCRIPT_DIR)])
+    except OSError:
+        return False
+    return r.returncode == 0
+
+
+def start_mcp_gateway_with_fleet(rebuild: bool = False) -> None:
+    """`research start`'s step: build the gateway's image when it is missing
+    (or on --rebuild) and bring the gateway up — or WARN and carry on: nothing
+    else in the fleet depends on it."""
+    try:
+        if rebuild or not _mcp_gateway_image_id(None):
+            print(f"building {MCP_GATEWAY_IMAGE}...")
+            if not _mcp_gateway_build():
+                if not _mcp_gateway_image_id(None):
+                    raise ValidationError("the MCP gateway's image could not be built")
+                print(f"warning: {MCP_GATEWAY_IMAGE} could not be rebuilt; the "
+                      "gateway keeps its previous image", file=sys.stderr)
+        ok, msg = _mcp_gateway_up()
+    except ValidationError as e:
+        ok, msg = False, str(e)
+    if ok:
+        print(msg)
+    else:
+        print(f"warning: {msg}; MCP servers are unavailable until it runs",
+              file=sys.stderr)
+
+
+def mcp_gateway_start(progress=None) -> dict:
+    """The page's Start (a build-lane verb: it may build). Builds the gateway's
+    one image when it is absent, then brings the container up. Every refusal
+    is a die(): the build lane shows the full log, where die's line lands (a
+    ValidationError would end there as a bare "invalid request")."""
+    progress = progress or _NULL_PROGRESS
+    try:
+        if not _mcp_gateway_image_id(None):
+            progress.step("build", f"building {MCP_GATEWAY_IMAGE}")
+            if not _mcp_gateway_build():
+                die("the MCP gateway's image could not be built (output above)")
+        progress.step("start", "starting the MCP gateway")
+        ok, msg = _mcp_gateway_up()
+    except ValidationError as e:
+        die(str(e))
+    if not ok:
+        die(msg)
+    print(msg)
+    return {"gateway": "running"}
+
+
+def _mcp_gateway_hup(deadline: float | None) -> None:
+    """Tell a RUNNING gateway to re-read the list. Never creates or starts it:
+    a stopped fleet stays stopped (the failure of the signal is that case)."""
+    _mcp_docker(["docker", "kill", "-s", "HUP", MCP_GATEWAY_CONTAINER], deadline)
+
+
+def _mcp_list_error(e: "mcp_servers.ServerListError") -> ValidationError:
+    return ValidationError(str(e))
+
+
+def _mcp_change(change: Callable[[dict], None], *, blocking: bool,
+                deadline: float | None) -> None:
+    """Read, change, save and render the list under its lock (file work only),
+    then signal the gateway. `blocking=False` is the broker's form."""
+    try:
+        with mcp_servers.lock(blocking=blocking):
+            data = mcp_servers.load()
+            change(data)
+            mcp_servers.save(data)
+            mcp_servers.render(data)
+    except mcp_servers.ServerListError as e:
+        raise _mcp_list_error(e) from None
+    _mcp_gateway_hup(deadline)
+
+
+def _mcp_name(value: Any) -> str:
+    if not isinstance(value, str) or not mcp_servers.NAME_RE.match(value):
+        raise ValidationError(
+            "a server name starts with a lowercase letter and holds only "
+            "lowercase letters, digits and dashes")
+    return value
+
+
+def _mcp_headers(value: Any) -> dict:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValidationError("the secret headers must be given as name and value pairs")
+    for hn, hv in value.items():
+        problem = mcp_servers.header_problem(hn, hv)
+        if problem:
+            raise ValidationError(problem)
+    return dict(value)
+
+
+def _mcp_description(value: Any) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str) or any(c in value for c in "\r\n\0"):
+        raise ValidationError("a description must be a single line of text")
+    return value.strip()
+
+
+def _mcp_url(value: Any) -> str:
+    try:
+        return mcp_servers.normalize_url(value)
+    except mcp_servers.ServerListError as e:
+        raise ValidationError(str(e)) from None
+
+
+@dataclass(frozen=True)
+class McpServerNameRequest:
+    name: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "McpServerNameRequest":
+        return cls(name=_mcp_name(kw.get("name")))
+
+
+@dataclass(frozen=True)
+class McpServerAddRequest:
+    name: str
+    url: str
+    description: str = ""
+    headers: dict = field(default_factory=dict)
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "McpServerAddRequest":
+        return cls(name=_mcp_name(kw.get("name")), url=_mcp_url(kw.get("url")),
+                   description=_mcp_description(kw.get("description")),
+                   headers=_mcp_headers(kw.get("headers")))
+
+
+@dataclass(frozen=True)
+class McpServerEditRequest:
+    """An absent field is left as it is. `headers_set` adds or replaces secret
+    headers; `headers_remove` names the ones to drop. A secret is never read
+    back, so there is no "unchanged" value to send."""
+    name: str
+    url: str | None = None
+    description: str | None = None
+    headers_set: dict = field(default_factory=dict)
+    headers_remove: tuple = ()
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "McpServerEditRequest":
+        remove = kw.get("headers_remove")
+        if remove is None:
+            remove = []
+        if not isinstance(remove, (list, tuple)) or not all(
+                isinstance(h, str) and mcp_servers.HEADER_NAME_RE.match(h)
+                for h in remove):
+            raise ValidationError("the headers to remove must be a list of header names")
+        headers_set = _mcp_headers(kw.get("headers_set"))
+        lowered = {h.lower() for h in headers_set}
+        if any(h.lower() in lowered for h in remove):
+            raise ValidationError("a header cannot be both set and removed")
+        return cls(
+            name=_mcp_name(kw.get("name")),
+            url=None if kw.get("url") is None else _mcp_url(kw.get("url")),
+            description=(None if kw.get("description") is None
+                         else _mcp_description(kw.get("description"))),
+            headers_set=headers_set, headers_remove=tuple(remove))
+
+
+def mcp_server_list(deadline: float | None = None) -> dict:
+    """The MCP page's payload: the servers (header NAMES only), the gateway's
+    state, and what is wrong with the list when it cannot be used. Never raises
+    for a damaged or newer list — the page must still render its remedy."""
+    state, data, why = mcp_servers.read()
+    error = None
+    if state == mcp_servers.DAMAGED:
+        error = mcp_servers.DAMAGED_TEXT.format(why=why)
+    elif state == mcp_servers.NEWER:
+        error = mcp_servers.NEWER_TEXT
+    return {
+        "servers": mcp_servers.public_view(data),
+        "gateway": mcp_gateway_state(deadline),
+        "list": state,
+        "error": error,
+        "probe_timeout_s": MCP_PROBE_TIMEOUT_S,
+    }
+
+
+def mcp_server_add(req: McpServerAddRequest, *, blocking: bool = True,
+                   deadline: float | None = None) -> dict:
+    def change(data: dict) -> None:
+        if req.name in data["servers"]:
+            raise mcp_servers.ServerListError(
+                f"a server named {req.name} is already on the list")
+        entry: dict = {"url": req.url}
+        if req.description:
+            entry["description"] = req.description
+        if req.headers:
+            entry["headers"] = dict(req.headers)
+        data["servers"][req.name] = entry
+    _mcp_change(change, blocking=blocking, deadline=deadline)
+    return mcp_server_list(deadline)
+
+
+def mcp_server_edit(req: McpServerEditRequest, *, blocking: bool = True,
+                    deadline: float | None = None) -> dict:
+    def change(data: dict) -> None:
+        entry = data["servers"].get(req.name)
+        if entry is None:
+            raise mcp_servers.ServerListError(f"no server named {req.name} is on the list")
+        if req.url is not None:
+            entry["url"] = req.url
+        if req.description is not None:
+            if req.description:
+                entry["description"] = req.description
+            else:
+                entry.pop("description", None)
+        headers = dict(entry.get("headers", {}))
+        # Header names compare without case (HTTP), so a replacement under
+        # another spelling replaces instead of sending the header twice.
+        drop = {h.lower() for h in req.headers_remove} | {h.lower() for h in req.headers_set}
+        headers = {h: v for h, v in headers.items() if h.lower() not in drop}
+        headers.update(req.headers_set)
+        if headers:
+            entry["headers"] = headers
+        else:
+            entry.pop("headers", None)
+    _mcp_change(change, blocking=blocking, deadline=deadline)
+    return mcp_server_list(deadline)
+
+
+def mcp_server_remove(req: McpServerNameRequest, *, blocking: bool = True,
+                      deadline: float | None = None) -> dict:
+    def change(data: dict) -> None:
+        if data["servers"].pop(req.name, None) is None:
+            raise mcp_servers.ServerListError(f"no server named {req.name} is on the list")
+    _mcp_change(change, blocking=blocking, deadline=deadline)
+    return mcp_server_list(deadline)
+
+
+def mcp_server_list_reset(*, blocking: bool = True,
+                          deadline: float | None = None) -> dict:
+    """Replace a DAMAGED list with an empty one — the page's explicit remedy.
+    Refuses a readable list and a newer-version one (nothing is discarded on a
+    guess). Check and write under one lock."""
+    try:
+        with mcp_servers.lock(blocking=blocking):
+            state, _data, _why = mcp_servers.read()
+            if state == mcp_servers.NEWER:
+                raise mcp_servers.ServerListError(mcp_servers.NEWER_TEXT)
+            if state != mcp_servers.DAMAGED:
+                raise mcp_servers.ServerListError(
+                    "the MCP server list is readable; nothing was replaced")
+            mcp_servers.save(mcp_servers.empty())
+            mcp_servers.render(mcp_servers.empty())
+    except mcp_servers.ServerListError as e:
+        raise _mcp_list_error(e) from None
+    _mcp_gateway_hup(deadline)
+    return mcp_server_list(deadline)
+
+
+def mcp_server_test(req: McpServerNameRequest) -> dict:
+    """Ask one server, from the gateway, to introduce itself. Always returns a
+    result row ({name, outcome, http_status, detail}); the outcomes are mcp |
+    refused | not_mcp | unreachable | unknown | gateway_down. "Gateway not
+    running" is read from the exec's own failure — no inspect first."""
+    def row(outcome: str, detail: str = "", status: Any = None) -> dict:
+        return {"name": req.name, "outcome": outcome, "http_status": status,
+                "detail": detail}
+    try:
+        r = run(["docker", "exec", MCP_GATEWAY_CONTAINER, "python3",
+                 MCP_GATEWAY_PROGRAM, "--probe", req.name,
+                 "--timeout", str(MCP_PROBE_TIMEOUT_S)],
+                capture_output=True, timeout=MCP_PROBE_EXEC_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return row("unreachable", "the MCP gateway did not answer in time")
+    except OSError:
+        return row("gateway_down", _MCP_HOST_DOWN)
+    if r.returncode != 0:
+        return row("gateway_down", "the MCP gateway is not running")
+    try:
+        out = json.loads((r.stdout or "").strip().splitlines()[-1])
+        outcome = out["outcome"]
+        status = out.get("http_status")
+        detail = out.get("detail") or ""
+        if outcome not in _MCP_PROBE_OUTCOMES or not isinstance(detail, str) \
+                or not (status is None or (isinstance(status, int)
+                                           and not isinstance(status, bool))):
+            raise ValueError("unexpected probe result")
+    except (ValueError, KeyError, IndexError, TypeError, RecursionError):
+        return row("unreachable", "the MCP gateway gave an answer that could not be read")
+    return row(outcome, detail[:_MCP_PROBE_DETAIL_MAX], status)
 
 
 def _supervisor_mcp_reload(container_name: str) -> None:

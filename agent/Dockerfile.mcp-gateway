@@ -1,0 +1,9 @@
+FROM python:3.12-alpine
+
+# The shared MCP gateway (rs-mcpgw). Runs as the operator's uid (--user), so it
+# can read the 0600 server list the host renders into /etc/mcp-gateway.
+RUN mkdir -p /opt/mcp-gateway /etc/mcp-gateway
+COPY container/mcp-gateway/gateway.py /opt/mcp-gateway/gateway.py
+
+EXPOSE 8888
+ENTRYPOINT ["python3", "-u", "/opt/mcp-gateway/gateway.py"]

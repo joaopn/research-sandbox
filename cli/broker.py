@@ -367,6 +367,50 @@ def _verb_host_settings_set(args: dict, _progress=None) -> dict:
     return rscore.host_settings_set(req)
 
 
+# --- the MCP gateway's server list (Sandboxes → MCP) -------------------------
+# All inline and token-gated. Each takes ONE deadline (rscore.MCP_INLINE_DEADLINE_S)
+# that every docker call inside it shares, and takes the list lock without
+# waiting (a busy list is a refusal): nothing here can hold the accept thread
+# past the webui's relay bound. The gateway's Start is NOT here — it may build,
+# so it is a build-lane verb (BUILD_DISPATCH).
+
+def _verb_mcp_server_list(_args: dict, _progress=None) -> dict:
+    return rscore.mcp_server_list(rscore._mcp_deadline())
+
+
+def _verb_mcp_server_add(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in MCP_SERVER_ADD_WEBUI_FIELDS}
+    req = rscore.McpServerAddRequest.from_kwargs(**safe)
+    return rscore.mcp_server_add(req, blocking=False, deadline=rscore._mcp_deadline())
+
+
+def _verb_mcp_server_edit(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in MCP_SERVER_EDIT_WEBUI_FIELDS}
+    req = rscore.McpServerEditRequest.from_kwargs(**safe)
+    return rscore.mcp_server_edit(req, blocking=False, deadline=rscore._mcp_deadline())
+
+
+def _verb_mcp_server_remove(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in MCP_SERVER_NAME_WEBUI_FIELDS}
+    req = rscore.McpServerNameRequest.from_kwargs(**safe)
+    return rscore.mcp_server_remove(req, blocking=False, deadline=rscore._mcp_deadline())
+
+
+def _verb_mcp_server_test(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in MCP_SERVER_NAME_WEBUI_FIELDS}
+    return rscore.mcp_server_test(rscore.McpServerNameRequest.from_kwargs(**safe))
+
+
+def _verb_mcp_server_list_reset(_args: dict, _progress=None) -> dict:
+    return rscore.mcp_server_list_reset(blocking=False, deadline=rscore._mcp_deadline())
+
+
+def _verb_mcp_gateway_start(_args: dict, progress=None) -> dict:
+    """Build-lane only: builds the gateway's one image when absent, then starts
+    the gateway."""
+    return rscore.mcp_gateway_start(progress=progress)
+
+
 def _verb_model_default_set(args: dict, _progress=None) -> dict:
     """Write (or clear) one container type's default (model, effort) pair in
     the operator's untracked model-defaults override — the write half of
@@ -1092,6 +1136,14 @@ MODEL_DEFAULT_WEBUI_FIELDS = frozenset({"type", "model", "effort", "clear"})
 # Save the project task cap or put it back to the default (the Sandboxes →
 # Infrastructure → Settings section). A number and a bool — nothing host-shaped.
 HOST_SETTINGS_SET_WEBUI_FIELDS = frozenset({"pids_limit", "reset"})
+
+# The MCP gateway's server list (Sandboxes → MCP). An address and header
+# NAMES are operator text; header VALUES are secrets that go only into the 0600
+# list on the host — never argv, env or a log (the audit line carries no args).
+MCP_SERVER_ADD_WEBUI_FIELDS = frozenset({"name", "url", "description", "headers"})
+MCP_SERVER_EDIT_WEBUI_FIELDS = frozenset({"name", "url", "description",
+                                          "headers_set", "headers_remove"})
+MCP_SERVER_NAME_WEBUI_FIELDS = frozenset({"name"})
 # Put one version pin back to the shipped value (the Sandboxes → Software tab's "Use repo
 # version" button). One name-shaped token; the request refuses anything that is
 # not a resettable pin of the tracked versions.env.
@@ -1285,6 +1337,12 @@ VERBS = {
     "model_default_set": _verb_model_default_set,
     "host_settings": _verb_host_settings,
     "host_settings_set": _verb_host_settings_set,
+    "mcp_server_list": _verb_mcp_server_list,
+    "mcp_server_add": _verb_mcp_server_add,
+    "mcp_server_edit": _verb_mcp_server_edit,
+    "mcp_server_remove": _verb_mcp_server_remove,
+    "mcp_server_test": _verb_mcp_server_test,
+    "mcp_server_list_reset": _verb_mcp_server_list_reset,
     "pin_reset": _verb_pin_reset,
     "software_status": _verb_software_status,
     "agent_refresh_check": _verb_agent_refresh_check,
@@ -1441,6 +1499,7 @@ BUILD_DISPATCH = {
     "editor_refresh": _verb_editor_refresh,
     "reader_refresh": _verb_reader_refresh,
     "rebuild": _verb_rebuild,
+    "mcp_gateway_start": _verb_mcp_gateway_start,
 }
 
 
@@ -1495,10 +1554,12 @@ _BUILD_TARGETS = {
     "reader_pull": "reader", "reader_refresh": "reader",
     "node_pull": "node",
     "rebuild": "fleet",
+    "mcp_gateway_start": "mcp-gateway",
 }
 # Browser-facing names for the refusal text.
 _BUILD_TARGET_NAMES = {"editor": "the editor download", "reader": "the reader download",
-                       "node": "the node runtime", "fleet": "the image fleet"}
+                       "node": "the node runtime", "fleet": "the image fleet",
+                       "mcp-gateway": "the MCP gateway"}
 
 
 def _build_target(verb: str, args: dict) -> str:

@@ -1826,7 +1826,7 @@ const HOST_PAGES = {
     sandboxes: {
         title: "Sandboxes",
         tabs: [["management", "Management"], ["infrastructure", "Infrastructure"],
-               ["software", "Software"]],
+               ["software", "Software"], ["mcp", "MCP"]],
         get: () => sandboxesActiveTab,
         set: (k) => { sandboxesActiveTab = k; },
     },
@@ -2063,6 +2063,13 @@ function renderSandboxesInto(view) {
         if (tab === "infrastructure") seedSoftwareFromBroker();   // Software seeds itself
         return tab === "infrastructure" ? renderInfraInto(view) : renderSoftwareInto(view);
     }
+    if (tab === "mcp") {
+        // Reads no project list for itself: the same session hooks as above.
+        syncSidebarFromBroker();
+        seedLifecycleFromBroker();
+        seedSoftwareFromBroker();
+        return renderMcpInto(view);
+    }
     return renderManagementInto(view);
 }
 
@@ -2098,6 +2105,364 @@ function renderSettingsInto(view) {
             makeTermFontSizeSelector(),
         ]),
     ]));
+}
+
+// Sandboxes → MCP: the shared MCP gateway and its server list. A server is an
+// address plus optional secret request headers; the page shows a secret's
+// NAME only and never receives its value back. Wiring a server to a project
+// or a box is not on this page yet. Every read is this page's own render or
+// one of its buttons — nothing here runs on a timer.
+const MCP_GATEWAY_START_TITLE = "Starting the MCP gateway";
+const MCP_GATEWAY_TEXT = {
+    running: "running",
+    stopped: "not running",
+    absent: "not running",
+    image_missing: "not running (its image is built when you start it)",
+};
+const MCP_OUTCOME_TEXT = {
+    mcp: "Answers as an MCP server",
+    refused: "Reachable, but it refuses the credentials",
+    not_mcp: "Reachable, but it does not speak MCP at that address",
+    unreachable: "Not reachable",
+    unknown: "Not on the list any more",
+    gateway_down: "Could not be asked: the MCP gateway is not running",
+};
+const MCP_TEST_RETRY_TEXT = "Could not ask, try again";
+
+async function renderMcpInto(view) {
+    view.innerHTML = "";
+    view.appendChild(el("div", { class: "mgmt-loading" }, ["Loading the MCP servers…"]));
+    let res;
+    try {
+        res = await fetch("/broker/mcp/servers");
+    } catch (e) { return renderMgmtUnavailable(view); }
+    if (res.status === 401) return renderMgmtLogin(view, view.__rsRender || renderMcpInto);
+    if (res.status === 403) return renderMgmtRejected(view);
+    if (res.status === 503) return renderMgmtUnavailable(view);
+    let body;
+    try { body = await res.json(); } catch (e) { return renderMgmtUnavailable(view); }
+    if (!res.ok || !body.ok || !body.result) {
+        return renderMgmtVerbError(view, body, renderMcpInto);
+    }
+    renderMcpScreen(view, body.result);
+}
+
+// POST one MCP page action. Returns {status, body}; status 0 = the request
+// itself failed. Never routes anywhere: each caller decides what a failure
+// paints, because a row's Test must not replace the page.
+async function mcpPost(path, payload) {
+    let res;
+    try {
+        res = await fetch(path, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload || {}),
+        });
+    } catch (e) { return { status: 0, body: {} }; }
+    let body; try { body = await res.json(); } catch (e) { body = {}; }
+    return { status: res.status, body };
+}
+
+function mcpTestText(result) {
+    const base = MCP_OUTCOME_TEXT[result.outcome] || MCP_OUTCOME_TEXT.unreachable;
+    return result.detail ? base + ": " + result.detail : base;
+}
+
+// Test one row and paint its cell in place. A session that ended lands on the
+// sign-in; every other failure (a busy or slow broker included) is a line on
+// this row — never the page-wide outage card.
+async function mcpTestRow(view, name, cell) {
+    cell.className = "mcp-test";
+    cell.textContent = "Asking…";
+    const { status, body } = await mcpPost("/broker/mcp/servers/test", { name });
+    if (status === 401) return renderMgmtLogin(view, view.__rsRender || renderMcpInto);
+    if (status !== 200 || !body.ok || !body.result) {
+        cell.className = "mcp-test mcp-test-bad";
+        cell.textContent = status === 200 && body.error
+            ? mgmtErrText(body) : MCP_TEST_RETRY_TEXT;
+        return;
+    }
+    cell.className = "mcp-test " + (body.result.outcome === "mcp" ? "mcp-test-ok" : "mcp-test-bad");
+    cell.textContent = mcpTestText(body.result);
+}
+
+// One after another: each is one bounded broker call, and the broker serves
+// one at a time anyway.
+async function mcpTestAll(view, rows, btn) {
+    btn.disabled = true;
+    try {
+        for (const r of rows) {
+            // A sign-in card (or any re-render) replaced the rows: stop, so a
+            // failed sign-in is never retried once per remaining row.
+            if (!view.isConnected || !r.cell.isConnected) return;
+            await mcpTestRow(view, r.name, r.cell);
+        }
+    } finally { btn.disabled = false; }
+}
+
+// The Add payload: only what was typed (the broker refuses bad shapes itself).
+function mcpAddPayload(f) {
+    const payload = { name: f.name.trim(), url: f.url.trim() };
+    if (f.description.trim()) payload.description = f.description.trim();
+    const headers = {};
+    for (const h of f.headers) {
+        if (h.name.trim()) headers[h.name.trim()] = h.value;
+    }
+    if (Object.keys(headers).length) payload.headers = headers;
+    return payload;
+}
+
+// The Edit payload: the address and description as they now read; a secret
+// header is sent only when a new value was typed, and named for removal when
+// its Remove box is ticked. An untouched secret is not sent at all.
+function mcpEditPayload(name, f) {
+    const payload = { name, url: f.url.trim(), description: f.description.trim() };
+    const set = {};
+    for (const h of f.headers) {
+        if (h.name.trim() && h.value) set[h.name.trim()] = h.value;
+    }
+    if (Object.keys(set).length) payload.headers_set = set;
+    if (f.remove.length) payload.headers_remove = f.remove.slice();
+    return payload;
+}
+
+// The Add / Edit dialog. `existing` is the list row being edited, or null.
+// Secret values are password inputs that start EMPTY in both modes: the page
+// never holds a saved secret, so there is nothing to refill them with.
+function mcpServerDialog(view, existing) {
+    if (document.querySelector(".modal-backdrop")) return null;
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const errEl = el("div", { class: "error" });
+    const nameI = el("input", { type: "text", autocomplete: "off",
+                                placeholder: "zotero" });
+    const urlI = el("input", { type: "text", autocomplete: "off",
+                               placeholder: "https://example.org/mcp" });
+    const descI = el("input", { type: "text", autocomplete: "off",
+                                placeholder: "what this server is for" });
+    if (existing) {
+        nameI.value = existing.name; nameI.disabled = true;
+        urlI.value = existing.url;
+        descI.value = existing.description || "";
+    }
+    const headerRows = [];            // new or replaced secrets: {nameI, valueI}
+    const removeBoxes = [];           // saved secrets: {name, cb}
+    const headersWrap = el("div", { class: "mcp-headers" });
+    const addHeaderRow = (fixedName) => {
+        const hn = el("input", { type: "text", autocomplete: "off",
+                                 class: "mcp-header-name", placeholder: "Authorization" });
+        const hv = el("input", { type: "password", autocomplete: "new-password",
+                                 class: "mcp-header-value",
+                                 placeholder: fixedName ? "new value (empty keeps it)" : "value" });
+        if (fixedName) { hn.value = fixedName; hn.disabled = true; }
+        const line = el("div", { class: "mcp-header-row" }, [hn, hv]);
+        if (fixedName) {
+            const cb = el("input", { type: "checkbox" });
+            removeBoxes.push({ name: fixedName, cb });
+            line.appendChild(el("span", { class: "mcp-header-remove" }, [cb, " remove"]));
+        }
+        headerRows.push({ nameI: hn, valueI: hv });
+        headersWrap.appendChild(line);
+    };
+    for (const hname of (existing ? existing.headers : [])) addHeaderRow(hname);
+    const moreBtn = el("button", { type: "button", class: "btn-small" }, ["Add a secret header"]);
+    moreBtn.onclick = () => addHeaderRow(null);
+    const cancel = el("button", { class: "btn btn-secondary" }, ["Cancel"]);
+    cancel.onclick = () => backdrop.remove();
+    const go = el("button", { class: "btn" }, [existing ? "Save" : "Add server"]);
+    const read = () => ({
+        name: nameI.value, url: urlI.value, description: descI.value,
+        headers: headerRows.map((h) => ({ name: h.nameI.value, value: h.valueI.value })),
+        remove: removeBoxes.filter((b) => b.cb.checked).map((b) => b.name),
+    });
+    go.onclick = async () => {
+        errEl.textContent = "";
+        const f = read();
+        const payload = existing ? mcpEditPayload(existing.name, f) : mcpAddPayload(f);
+        go.disabled = true; cancel.disabled = true;
+        const { status, body } = await mcpPost(
+            "/broker/mcp/servers/" + (existing ? "edit" : "add"), payload);
+        const redirect = mgmtStatusRedirect(view, status, view.__rsRender || renderMcpInto);
+        if (redirect) { backdrop.remove(); return redirect(); }
+        if (status !== 200 || !body.ok) {
+            go.disabled = false; cancel.disabled = false;
+            errEl.textContent = status === 200 ? mgmtErrText(body) : "Connection failed.";
+            return;
+        }
+        backdrop.remove();
+        rerenderView(view);
+    };
+    const card = el("div", { class: "card mcp-server-card" }, [
+        el("h2", {}, [existing ? "Edit MCP server" : "Add an MCP server"]),
+        el("div", { class: "field" }, [el("label", {}, ["Name"]), nameI]),
+        el("div", { class: "field" }, [el("label", {}, ["Address"]), urlI]),
+        el("div", { class: "hint" }, [
+            "An http:// or https:// address the gateway can reach: the internet, "
+            + "this machine (host.docker.internal) or your network. A key does "
+            + "not go in the address; add it as a secret header."]),
+        el("div", { class: "field" }, [el("label", {}, ["Description"]), descI]),
+        el("div", { class: "mcp-headers-title" }, ["Secret headers"]),
+        el("div", { class: "hint" }, [
+            "Sent to the server with every request, for example Authorization. "
+            + "A saved value is never shown again; it can be replaced or removed."]),
+        headersWrap,
+        el("div", { class: "mcp-headers-more" }, [moreBtn]),
+        el("div", { class: "btn-row" }, [cancel, go]),
+        errEl,
+    ]);
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+    return backdrop;
+}
+
+// A plain confirm for an action that answers at once (Remove, Start an empty
+// list): it POSTs, shows a refusal in place, and re-renders the page on success.
+function mcpConfirmDialog(view, cfg) {
+    if (document.querySelector(".modal-backdrop")) return null;
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const errEl = el("div", { class: "error" });
+    const cancel = el("button", { class: "btn btn-secondary" }, ["Cancel"]);
+    cancel.onclick = () => backdrop.remove();
+    const go = el("button", { class: "btn" }, [cfg.confirmLabel]);
+    go.onclick = async () => {
+        errEl.textContent = "";
+        go.disabled = true; cancel.disabled = true;
+        const { status, body } = await mcpPost(cfg.path, cfg.payload);
+        const redirect = mgmtStatusRedirect(view, status, view.__rsRender || renderMcpInto);
+        if (redirect) { backdrop.remove(); return redirect(); }
+        if (status !== 200 || !body.ok) {
+            go.disabled = false; cancel.disabled = false;
+            errEl.textContent = status === 200 ? mgmtErrText(body) : "Connection failed.";
+            return;
+        }
+        backdrop.remove();
+        rerenderView(view);
+    };
+    backdrop.appendChild(el("div", { class: "card" }, [
+        el("h2", {}, [cfg.title]),
+        el("p", {}, [cfg.text]),
+        el("div", { class: "btn-row" }, [cancel, go]),
+        errEl,
+    ]));
+    document.body.appendChild(backdrop);
+    return backdrop;
+}
+
+// Start the gateway: a background build-lane action (it builds the gateway's
+// small image first when that is missing), tailed here until it ends.
+async function mcpStartGateway(view, btn, errEl) {
+    if (document.querySelector(".modal-backdrop")) return;
+    errEl.textContent = "";
+    btn.disabled = true;
+    const { status, body } = await mcpPost("/broker/software/build",
+                                           { verb: "mcp_gateway_start" });
+    const redirect = mgmtStatusRedirect(view, status, view.__rsRender || renderMcpInto);
+    if (redirect) return redirect();
+    if (status !== 200 || !body.ok || !body.op_id) {
+        btn.disabled = false;
+        errEl.textContent = status === 200 ? mgmtErrText(body) : "Connection failed.";
+        return;
+    }
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const card = el("div", { class: "card sw-build-card" }, [
+        el("h2", {}, [MCP_GATEWAY_START_TITLE])]);
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+    await mgmtTailBuildLog(view, backdrop, card, body.op_id, MCP_GATEWAY_START_TITLE,
+                           () => rerenderView(view), view.__rsRender || renderMcpInto);
+}
+
+function renderMcpScreen(view, result) {
+    view.innerHTML = "";
+    const servers = Array.isArray(result.servers) ? result.servers : [];
+    const listOk = result.list === "ok";
+    const rows = [];
+
+    const refresh = el("button", { class: "btn-small" }, ["Refresh"]);
+    refresh.onclick = () => rerenderView(view);
+    const addBtn = el("button", { class: "btn-small" }, ["Add server"]);
+    addBtn.disabled = !listOk;
+    addBtn.onclick = () => mcpServerDialog(view, null);
+    const testAll = el("button", { class: "btn-small" }, ["Test all"]);
+    testAll.disabled = !servers.length;
+    testAll.onclick = () => mcpTestAll(view, rows, testAll);
+    view.appendChild(el("div", { class: "mgmt-header" }, [
+        el("div", { class: "mgmt-toolbar" }, [refresh, addBtn, testAll]),
+    ]));
+
+    // The gateway line: its state, and Start when it is not running.
+    const gwErr = el("span", { class: "mcp-test mcp-test-bad" });
+    const gwRow = el("div", { class: "mgmt-row mgmt-infra-row mcp-server-row" }, [
+        el("span", {}, ["MCP gateway"]),
+        el("span", { class: "type-badge" }, [MCP_GATEWAY_TEXT[result.gateway] || "unknown"]),
+    ]);
+    if (result.gateway !== "running") {
+        const start = el("button", { class: "btn-small" }, ["Start"]);
+        start.onclick = () => mcpStartGateway(view, start, gwErr);
+        gwRow.append(start, gwErr);
+    }
+    const section = el("div", { class: "mgmt-infra" }, [
+        el("h3", { class: "mgmt-infra-title" }, ["Gateway"]),
+        gwRow,
+        el("div", { class: "mgmt-settings-hint" }, [
+            "One shared container that holds every server's address and secrets. "
+            + "Projects and boxes will reach MCP servers only through it; giving "
+            + "a server to a project is not available yet."]),
+    ]);
+    view.appendChild(section);
+
+    if (result.error) {
+        const warn = el("div", { class: "mcp-list-error" }, [
+            el("div", { class: "error" }, [result.error])]);
+        if (result.list === "damaged") {
+            const reset = el("button", { class: "btn-small" }, ["Start an empty list"]);
+            reset.onclick = () => mcpConfirmDialog(view, {
+                title: "Start an empty list",
+                text: "The server list on the host cannot be read, so it is replaced "
+                    + "by an empty one. Every server and every secret on it is "
+                    + "discarded; you add the servers again afterwards.",
+                confirmLabel: "Discard and start empty",
+                path: "/broker/mcp/servers/reset",
+                payload: {},
+            });
+            warn.appendChild(reset);
+        }
+        view.appendChild(warn);
+    }
+
+    const list = el("div", { class: "mgmt-infra" }, [
+        el("h3", { class: "mgmt-infra-title" }, ["Servers"])]);
+    if (!servers.length && listOk) {
+        list.appendChild(el("div", { class: "mgmt-settings-hint" }, [
+            "No servers yet. Add one with its address."]));
+    }
+    for (const srv of servers) {
+        const cell = el("span", { class: "mcp-test" });
+        const test = el("button", { class: "btn-small" }, ["Test"]);
+        test.onclick = () => mcpTestRow(view, srv.name, cell);
+        const edit = el("button", { class: "btn-small" }, ["Edit"]);
+        edit.onclick = () => mcpServerDialog(view, srv);
+        const remove = el("button", { class: "btn-small" }, ["Remove"]);
+        remove.onclick = () => mcpConfirmDialog(view, {
+            title: "Remove " + srv.name,
+            text: "The server and its secret headers are taken off the list.",
+            confirmLabel: "Remove",
+            path: "/broker/mcp/servers/remove",
+            payload: { name: srv.name },
+        });
+        const secrets = (srv.headers || []).length
+            ? "Secret headers: " + srv.headers.join(", ") : "";
+        const meta = [srv.description, secrets].filter(Boolean).join(" · ");
+        list.appendChild(el("div", { class: "mgmt-row mgmt-infra-row mcp-server-row",
+                                     "data-mcp-server": srv.name }, [
+            el("span", { class: "mcp-server-name" }, [srv.name]),
+            el("span", { class: "mcp-server-url" }, [srv.url]),
+            el("span", { class: "mcp-server-actions" }, [test, edit, remove]),
+            el("div", { class: "mcp-server-meta" }, [meta]),
+            cell,
+        ]));
+        rows.push({ name: srv.name, cell });
+    }
+    view.appendChild(list);
 }
 
 // Sandboxes → Software — the host's agent/editor/reader/node dists, the built
@@ -6826,17 +7191,20 @@ function swTarget(verb, agent) {
     if (verb === "reader_pull" || verb === "reader_refresh") return "reader";
     if (verb === "node_pull") return "node";
     if (verb === "rebuild") return "fleet";
+    if (verb === "mcp_gateway_start") return "mcp-gateway";
     return verb;
 }
 
 function swTargetName(target) {
     if (target.startsWith("agent:")) return target.slice("agent:".length) + " agent";
-    return { editor: "editor", reader: "reader", node: "node", fleet: "image fleet" }[target] || target;
+    return { editor: "editor", reader: "reader", node: "node", fleet: "image fleet",
+             "mcp-gateway": "MCP gateway" }[target] || target;
 }
 
 function swLabel(entry) {
     if (entry.queued) return "queued…";
     if (entry.verb === "rebuild") return "rebuilding the image fleet…";
+    if (entry.verb === "mcp_gateway_start") return "starting…";
     return /_refresh$/.test(entry.verb) ? "refreshing…" : "pulling…";
 }
 
@@ -6920,6 +7288,7 @@ function softwareReplay(opId, title) {
 
 function softwareTitle(verb, target) {
     if (verb === "rebuild") return "Rebuilding the image fleet";
+    if (verb === "mcp_gateway_start") return MCP_GATEWAY_START_TITLE;
     return (/_refresh$/.test(verb) ? "Refreshing " : "Pulling ") + swTargetName(target);
 }
 
@@ -6929,6 +7298,10 @@ function softwareNoticeText(entry, target, outcome) {
     if (entry.verb === "rebuild") {
         if (outcome.interrupted) return "The image fleet rebuild was interrupted";
         return outcome.ok ? "Image fleet rebuilt" : "The image fleet rebuild failed";
+    }
+    if (entry.verb === "mcp_gateway_start") {
+        if (outcome.interrupted) return "Starting the MCP gateway was interrupted";
+        return outcome.ok ? "MCP gateway started" : "The MCP gateway could not be started";
     }
     if (outcome.interrupted) return `${name}: the ${what} was interrupted`;
     return outcome.ok ? `${name} ${what === "refresh" ? "refreshed" : "pulled"}`
