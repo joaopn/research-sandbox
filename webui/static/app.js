@@ -2125,7 +2125,8 @@ const MCP_OUTCOME_TEXT = {
     not_mcp: "Reachable, but it does not speak MCP at that address",
     unreachable: "Not reachable",
     unknown: "Not on the list any more",
-    gateway_down: "Could not be asked: the MCP gateway is not running",
+    gateway_down: "Could not be asked",
+    gateway_restarting: "Could not be asked yet",
 };
 const MCP_TEST_RETRY_TEXT = "Could not ask, try again";
 

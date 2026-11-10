@@ -396,9 +396,43 @@ def _verb_mcp_server_remove(args: dict, _progress=None) -> dict:
     return rscore.mcp_server_remove(req, blocking=False, deadline=rscore._mcp_deadline())
 
 
+MCP_GATEWAY_RESTARTING = "the MCP gateway is restarting; try again in a moment"
+
+
+def _mcp_gateway_is_restarting(deadline: float) -> bool:
+    """Whether a gateway that could not be asked is being (re)started by a
+    RUNNING build-lane op. The gateway's own Start passes through stopped and
+    absent, so any state counts. The fleet rebuild only ever REPLACES a running
+    gateway (remove, then run), so under it only an ABSENT container is a
+    restart — a gateway someone stopped stays "not running" for the whole
+    rebuild. Reads lock files, plus one bounded container inspect in the
+    rebuild case; refuses nothing (an inspect that fails reads as no restart)."""
+    targets = {op.get("target") for op in _live_build_ops()
+               if op.get("state") == "running" and isinstance(op.get("target"), str)}
+    if "mcp-gateway" in targets:
+        return True
+    if "fleet" not in targets:
+        return False
+    try:
+        return rscore._mcp_gateway_container(deadline)[0] == "absent"
+    except rscore.ValidationError:
+        return False
+
+
 def _verb_mcp_server_test(args: dict, _progress=None) -> dict:
+    """Test one server. "The gateway is not running" becomes "restarting"
+    while a build-lane op is starting or replacing it (see above); a host whose
+    container service cannot be reached is never relabelled."""
+    # Taken FIRST: the Test and the inspect below share one deadline, so the
+    # verb as a whole stays inside the relay bound.
+    deadline = rscore._mcp_deadline()
     safe = {k: v for k, v in args.items() if k in MCP_SERVER_NAME_WEBUI_FIELDS}
-    return rscore.mcp_server_test(rscore.McpServerNameRequest.from_kwargs(**safe))
+    out = rscore.mcp_server_test(rscore.McpServerNameRequest.from_kwargs(**safe))
+    if (out.get("outcome") == "gateway_down"
+            and out.get("detail") != rscore._MCP_HOST_DOWN
+            and _mcp_gateway_is_restarting(deadline)):
+        out = dict(out, outcome="gateway_restarting", detail=MCP_GATEWAY_RESTARTING)
+    return out
 
 
 def _verb_mcp_server_list_reset(_args: dict, _progress=None) -> dict:

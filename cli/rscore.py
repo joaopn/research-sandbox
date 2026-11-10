@@ -16213,7 +16213,8 @@ def mcp_server_list_reset(*, blocking: bool = True,
 def mcp_server_test(req: McpServerNameRequest) -> dict:
     """Ask one server, from the gateway, to introduce itself. Always returns a
     result row ({name, outcome, http_status, detail}); the outcomes are mcp |
-    refused | not_mcp | unreachable | unknown | gateway_down. "Gateway not
+    refused | not_mcp | unreachable | unknown | gateway_down (the broker turns
+    the last into gateway_restarting while a rebuild or a Start runs). "Gateway not
     running" is read from the exec's own failure — no inspect first."""
     def row(outcome: str, detail: str = "", status: Any = None) -> dict:
         return {"name": req.name, "outcome": outcome, "http_status": status,
