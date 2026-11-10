@@ -1355,15 +1355,38 @@ def _shown_paths(name: str, rels: "list[str]") -> str:
     return ", ".join(f"`/workspace/boxes/{name}/{r}`" for r in rels)
 
 
+def _history_cloned(name: str) -> bool:
+    """Whether a box keeping history has its notes clone: boxes/<b>/notes/.git
+    on the project side, both real folders (never through a link). Read from
+    the project's files, so it holds across every re-run of the box."""
+    cur = _box_workspace(name)
+    for part in ("notes", ".git"):
+        cur = cur / part
+        try:
+            if not stat.S_ISDIR(os.lstat(cur).st_mode):
+                return False
+        except OSError:
+            return False
+    return True
+
+
 def _record_old_files_cleared(name: str, cname: str, entry: dict) -> list[dict]:
     """Set the box record's flag after a clean probe. A box keeping history is
-    checked again until its setup has finished once (~/.rs-box-setup-done):
-    its notes come from a clone that may be retried at a later start."""
+    checked again until its notes clone exists (its notes come from a clone
+    that may be retried at a later start, and the clone could bring an old
+    file): the clone's folder on the project side decides, at any run. The
+    box's boot may have made the clone since the caller's probe, so its folder
+    is probed again here once the clone is there (the clone is moved into
+    place whole, so its files are there with its .git); an old file found then
+    is reported like the caller's."""
     if entry.get(OLD_FILES_FLAG) is True:
         return []
-    if _entry_history(entry) and _docker(
-            "exec", cname, "test", "-e", f"{BOX_HOME}/.rs-box-setup-done").returncode != 0:
-        return []
+    if _entry_history(entry):
+        if not _history_cloned(name):
+            return []
+        old = _box_old_files(name, entry)
+        if old:
+            return [{"kind": "old-files", "paths": old}]
     try:
         entries = load()
         if isinstance(entries.get(name), dict):
@@ -3069,7 +3092,7 @@ def cmd_create(args: argparse.Namespace) -> None:
              OLD_INSTRUCTIONS_FLAG: True,
              # Nor any other file RS used to write into a box's folder (refused
              # above) — except a box keeping history, whose notes come from a
-             # clone made after this: it is checked until its setup finished.
+             # clone made after this: it is checked until that clone exists.
              **({} if history else {OLD_FILES_FLAG: True}),
              "preset": args.preset, "browser": browser, "agent": agent,
              "editor": editor, "upstream_mcps": mcps,
@@ -3829,8 +3852,8 @@ def cmd_home_skills(args: argparse.Namespace) -> None:
     project agent's own home (once the project's flag says its folders hold
     none of RS's old files); with --boxes, every box's staged skills again and
     live into each running one (an agent added: pi gets them); with --box N,
-    that one box, its old files checked and its record's flag set once there
-    are none (a box keeping history, once its setup has finished). JSON on
+    that one box. Each box's old files are checked and its record's flag set
+    once there are none (a box keeping history, once its notes clone exists). JSON on
     stdout: {"warnings": [...]}, an old-files kind carrying the box's name."""
     _require_dind_project()
     warnings = _stage_agent_home_skills()
@@ -3853,9 +3876,9 @@ def cmd_home_skills(args: argparse.Namespace) -> None:
         if old:
             warnings.append({"kind": "old-files", "box": n, "paths": old})
             continue
-        if _box_running(cname):
-            if args.box:
-                w += _record_old_files_cleared(n, cname, e)
+        rec = _record_old_files_cleared(n, cname, e)
+        w += rec
+        if _box_running(cname) and not any(x.get("kind") == "old-files" for x in rec):
             w += _live_box_skills(n, cname)
         warnings += [{**x, "box": x.get("box", n)} for x in w]
     print(json.dumps({"warnings": warnings}, indent=2))
