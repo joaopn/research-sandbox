@@ -26,12 +26,13 @@ import orch_files  # noqa: E402  (no-follow access to <workspace>/.orchestrator)
 
 # GENERIC registry-delivered box images (STAGE_FEATURE_STAGING lane-3). Generic,
 # non-role images: the two blank-box images the in-supervisor rs-sandbox runs.
-# Mapping: host image base -> (registry repo, versions.env pin key); the snapshot
-# ref (rs-registry:5000/<repo>:<pin>) is pulled by a project's inner dockerd,
-# frozen into project.json (box_image_pins) at create. ``EXT_REGISTRY`` is the
+# Mapping: host image base -> (registry repo, versions.env pin key). A project's
+# inner dockerd pulls rs-registry:5000/<repo>@<digest>; the project records the
+# host image id it holds (project.json `box_images`, rscore._bring_box_image),
+# which is what moves it to a new build, not the pin. ``EXT_REGISTRY`` is the
 # inner-pull locator and MUST match the inner daemon's insecure-registries entry
-# (agent/Dockerfile.substrate-base). Lockstep: the host build tags
-# rs-<base>:<pin> (rscore._build_images).
+# (agent/Dockerfile.substrate-base). The host build also tags rs-<base>:<pin>
+# (rscore._build_images), a label only.
 EXT_REGISTRY = "rs-registry:5000"
 GENERIC_REGISTRY_IMAGES: dict[str, tuple[str, str]] = {
     "rs-sandbox-box":         ("sandbox-box", "SANDBOX_BOX_VERSION"),
@@ -54,28 +55,6 @@ GENERIC_REGISTRY_IMAGES: dict[str, tuple[str, str]] = {
 SANDBOX_KIND = "sandbox"
 
 VALID_KINDS = ("sandbox",)
-
-
-def generic_registry_ref(host_base: str, pin: str) -> str:
-    """The local-registry pull ref for a GENERIC image at an EXPLICIT pin —
-    ``rs-registry:5000/<repo>:<pin>``. The recreate/restart path passes the FROZEN
-    pin (from project.json / extensions.json) here, so a versions.env bump never
-    silently re-pulls a different version on restart."""
-    repo, _ = GENERIC_REGISTRY_IMAGES[host_base]
-    return f"{EXT_REGISTRY}/{repo}:{pin}"
-
-
-def generic_image_ref(host_base: str, pins: dict[str, str] | None = None) -> str:
-    """The MINT-path ref for a GENERIC image: resolve the pin from versions.env
-    (``pins`` = rscore.load_versions()) and format the registry ref. Mirrors
-    ``image_ref``'s pin-or-raise. Used at create/enable (the snapshot site) and as
-    the spawn fallback when a pre-migration entry carries no frozen ``image``."""
-    repo, vkey = GENERIC_REGISTRY_IMAGES[host_base]
-    pin = (pins or {}).get(vkey)
-    if not pin:
-        raise ValueError(
-            f"missing version pin {vkey} for {host_base!r}; add it to versions.env")
-    return f"{EXT_REGISTRY}/{repo}:{pin}"
 
 
 def container_name(name: str, kind: str | None = None) -> str:

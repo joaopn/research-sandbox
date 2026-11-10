@@ -2725,7 +2725,7 @@ function renderSoftwareScreen(view, result) {
         el("h3", {}, ["Version pins"]),
         el("div", { class: "sw-table sw-pins" }, pinRows),
         el("p", { class: "sw-pins-hint" }, [
-            "Use repo version changes the pin only. To apply it, Pull the download that bundles that pin, or use Rebuild all for an image pin (new projects and boxes pick it up).",
+            "Use repo version changes the pin only. To apply it, Pull the download that bundles that pin, or use Rebuild all for an image pin (new projects pick it up, and a project's boxes move to a new box image at its next start).",
         ]),
     ]));
 }

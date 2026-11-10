@@ -570,11 +570,10 @@ _OLD_BOX_TOOL_SETTINGS_MSG = ("this project's box tool predates changing a box's
                               "settings — restart the project, then retry")
 _OLD_BOX_TOOL_TRUSTED_MSG = ("this project's box tool predates trusted browsers — "
                              "restart the project, then retry")
-# The browser image, not the tool: frozen per project (a sandbox project's box
-# image pins; a privileged research project's kept image), so a restart does
-# not help.
+# The browser image, not the tool: a project's box images move to the host's
+# current ones at its next start (_bring_box_images_at_start), so a restart helps.
 _TRUSTED_BROWSER_TOO_OLD_MSG = ("this project's browser box image predates trusted "
-                                "browsers — a trusted browser box needs a new project")
+                                "browsers — restart the project, then retry")
 # MIRROR of rs_sandbox.BROWSER_TRUST_LABEL (the box tool is staged standalone).
 BROWSER_TRUST_LABEL = "research.box.browser-trust"
 
@@ -4568,13 +4567,6 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
               # leftover check above refused one), so the check never runs.
               OLD_INSTRUCTIONS_FLAG: True}
     if project_type == PROJECT_TYPE_SANDBOX_DIND:
-        # Freeze the box-image pins (lane-3): sandbox-dind eager-stages the box
-        # harness (STAGE_DIND_UNIFY — the harness is a standing dind utility now,
-        # no --with-boxes opt-in), so its boxes pull these snapshot refs at create +
-        # recreate; a versions.env bump reaches the project only on a fresh
-        # box-create, never on restart. (Research carries no frozen pins — it stages
-        # boxes LAZILY via box_add against the current versions.env pins.)
-        marker["box_image_pins"] = _box_image_pins(load_versions())
         # The project container's own ~/.local gets EXACTLY the recorded agents
         # (_dind_agent_sets); a marker without this key is from before that and
         # keeps claude in it whenever it records any agent.
@@ -4863,14 +4855,16 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
                 _stage_node_dist(container_name,
                                  deploy_local=service_flags.get("node", False))
             # Box harness (STAGE_DIND_UNIFY — a standing dind utility, no longer an
-            # opt-in): stage the rs-sandbox CLI (no longer baked) + deliver the box
-            # images (MINT site, push=True; pins were frozen into the marker above).
-            # Eager for sandbox-dind; research delivers the same harness LAZILY on
-            # first box_add (research create/recreate never touch boxes — frozen lane).
+            # opt-in): stage the rs-sandbox CLI (no longer baked) + bring both box
+            # images in and record them (the marker was written above). Eager for
+            # sandbox-dind; research brings the image a box needs on its first
+            # box_add (research create never touches boxes — frozen lane).
             _stage_rs_sandbox(container_name)
-            _write_box_digests(workspace_path, _deliver_box_images(
-                container_name, network, _box_image_pins(load_versions()),
-                push=True))
+            for _host_base, _repo, _latest in _BOX_IMAGES:
+                _result = _bring_box_image(container_name, network, workspace_path,
+                                           _host_base)
+                if _result.reason:
+                    die(_result.reason)
             # Stage the resolved box-preset catalog so the in-supervisor rs-sandbox
             # can resolve presets for a directly-invoked `rs-sandbox create`
             # (box_add refreshes it live; STAGE_BOX_EXT_UX). Best-effort.
@@ -5889,10 +5883,9 @@ ROLE_MCP_BASE_IMAGE = "rs-role-mcp-base:latest"
 EXT_BASE_IMAGE = "rs-ext-base:latest"
 # Disposable box image for the agent-less sandbox-project flavor
 # (STAGE_SANDBOX_PROJECT.md). FROM rs-ext-base (lane-3) — lean (no data-science
-# stack), no artifact-contract. Registry-delivered: the build retags :latest →
-# :<SANDBOX_BOX_VERSION>, the host pushes it, and a sandbox-dind project's inner
-# dockerd PULLS the snapshot ref (frozen in project.json) + retags it back to this
-# :latest the in-supervisor rs-sandbox runs.
+# stack), no artifact-contract. Registry-delivered: _bring_box_image publishes
+# this host image by its id, the project's inner dockerd pulls it by digest and
+# retags it back to this :latest the in-supervisor rs-sandbox runs.
 SANDBOX_BOX_IMAGE = "rs-sandbox-box:latest"
 # Browser variant — FROM rs-sandbox-box + @playwright/mcp + Chromium, wired
 # into the box's claude as a stdio MCP (the playwright bundle lifted from the
@@ -9235,7 +9228,7 @@ def _stage_rs_sandbox(container: str) -> None:
     old `COPY … /usr/local/bin/rs-sandbox` bake produced, just at runtime."""
     src = Path(__file__).resolve().parent / "rs_sandbox.py"
     if not src.is_file():
-        die(f"rs_sandbox.py not found at {src} — cannot stage the box harness")
+        die("this RS installation is missing its box tool; cannot stage the box harness")
     install = ("cat > /usr/local/bin/rs-sandbox && chmod 755 /usr/local/bin/rs-sandbox")
     proc = subprocess.Popen(
         ["docker", "exec", "-i", "-u", "0", container, "sh", "-c", install],
@@ -10436,7 +10429,8 @@ def _build_images(force: bool, progress=None) -> None:
     progress.step("retag", "retagging generic images")
 
     # Lane-3 generic images (STAGE_FEATURE_STAGING): retag each :latest with its
-    # content-snapshot pin so the registry PUSH ref carries it. :latest stays for
+    # content-snapshot pin, a label for people (a project's delivery keys on the
+    # image id, _bring_box_image, never on this tag). :latest stays for
     # the FROM chains (sandbox-box-browser FROM rs-sandbox-box:latest) + the
     # SANDBOX_BOX_IMAGE / rs-sandbox BOX_IMAGE constants + the inner retag target.
     for host_base, (_repo, vkey) in sorted(extension.GENERIC_REGISTRY_IMAGES.items()):
@@ -11179,9 +11173,8 @@ def _recreate_supervisor(
         # The working-mode suite (I33): the shared copy's was just emptied, and
         # the boxes this start re-runs find the installer there.
         _report_warnings(_stage_harness(container, local, workspace_path), progress)
-        # RS's instructions into the agent's home, BEFORE the box-pin backfill
-        # below can synthesize a marker. The saved home carried the previous
-        # file across the recreate.
+        # RS's instructions into the agent's home. The saved home carried the
+        # previous file across the recreate.
         found += _write_project_instructions(project, container, workspace_path,
                                              progress=progress, has_file=True)
         # The agents' recorded models into their own settings, once (I33 slice 3).
@@ -11203,50 +11196,9 @@ def _recreate_supervisor(
         if node_dist_present():
             _stage_node_dist(container, deploy_local=flags.get("node", False))
         # Box harness is a standing dind utility (STAGE_DIND_UNIFY — no --with-boxes
-        # gate): re-stage rs-sandbox (no bake) + re-deliver the box images for every
-        # sandbox-dind recreate.
+        # gate): re-stage rs-sandbox (no bake) for every sandbox-dind recreate. The
+        # box images are brought up to date before the box relaunch below.
         _stage_rs_sandbox(container)
-        # Box images: read FROZEN pins + PULL (RF1 — never re-push at recreate:
-        # the registry already holds the frozen pin from create, and re-pushing
-        # would die() if a versions.env bump left the host without the old tag).
-        # A pre-pins project has no pins → greenfield backfill (adopt current pins,
-        # push, pull, backfill project.json).
-        _box_pins = _read_box_pins(workspace_path)
-        if _box_pins:
-            # Recorded digests pin the pull. A project from before digests were
-            # recorded re-pushes its FROZEN pins from the host when the host
-            # still carries them (the one exception to never-re-push: the
-            # exception's own condition is the rule's reason) and pulls by
-            # those pushes' digests; otherwise it pulls by tag once and records
-            # the digest it resolved to.
-            _digests = _read_box_digests(workspace_path)
-            _missing = [repo for _hb, repo, _lt in _BOX_IMAGES if repo not in _digests]
-            _repush = bool(_missing) and all(
-                _host_has_box_tag(hb, _box_pins[repo]) for hb, repo, _lt in _BOX_IMAGES)
-            _delivered = None
-            if _repush:
-                # the re-push needs the host's push lane; neither a held
-                # loopback port nor a failed push must fail the RESTART — the
-                # pull side keeps working, so fall back to the tag pull
-                # (recorded once, like a host without the tag) and say so
-                try:
-                    _delivered = _deliver_box_images(container, network, _box_pins,
-                                                     push=True, digests=_digests)
-                except SystemExit:
-                    print("warning: the re-push of the box images failed (see the "
-                          "error above); they are pulled by tag once and pinned "
-                          "from the digest they resolve to", file=sys.stderr)
-                    _delivered = None
-            if _delivered is None:
-                _delivered = _deliver_box_images(container, network, _box_pins,
-                                                 push=False, digests=_digests)
-            if _delivered != _digests:
-                _write_box_digests(workspace_path, _delivered)
-        else:
-            _box_pins = _box_image_pins(load_versions())
-            _delivered = _deliver_box_images(container, network, _box_pins, push=True)
-            _write_box_pins(workspace_path, _box_pins)
-            _write_box_digests(workspace_path, _delivered)
         # Re-stage the box-preset catalog (best-effort) so a directly-invoked
         # rs-sandbox resolves presets after a recreate (STAGE_BOX_EXT_UX).
         _stage_box_catalog(workspace_path, strict=False)
@@ -11342,17 +11294,22 @@ def _recreate_supervisor(
     # entry (a stale baked/byo entry from a pre-overhaul project) is skipped —
     # the PI-role lineage is retired (greenfield: destroy + recreate).
     extension_entries = extension.load(workspace_path)
-    for name in sorted(extension_entries):
-        if extension_entries[name].get("kind") != extension.SANDBOX_KIND:
+    boxes = {name: e for name, e in extension_entries.items()
+             if isinstance(e, dict) and e.get("kind") == extension.SANDBOX_KIND}
+    # Boxes are a first-class standing dind utility (STAGE_DIND_UNIFY): research
+    # does not stage the box tool at re-creation, so it is staged here when the
+    # project has boxes (sandbox-dind staged it above).
+    if boxes and not run_quiet(["docker", "exec", container, "test", "-e",
+                                "/usr/local/bin/rs-sandbox"]):
+        _stage_rs_sandbox(container)
+    # Every box image the project holds or a box needs moves to the host's
+    # current one, before any box runs; the boxes of an image that could not
+    # are stopped, not relaunched, and the operation fails at its end.
+    not_current = _bring_box_images_at_start(project, container, network,
+                                             workspace_path, boxes, found)
+    for name in sorted(boxes):
+        if _box_image_of(boxes[name]) in not_current:
             continue
-        # Boxes are a first-class standing dind utility (STAGE_DIND_UNIFY): make
-        # the harness available before restarting. On research the box harness is
-        # NOT re-staged by the create/recreate branches above (frozen lane), so
-        # without this a research box's container is gone + rs-sandbox/image
-        # absent → the restart exec fails + dead tab. Inert on sandbox-dind
-        # (eager-staged) and for a box-less project (no kind="sandbox" entries).
-        _ensure_box_harness(container, network, workspace_path,
-                            bool(extension_entries[name].get("browser")))
         r = run(["docker", "exec", container, "rs-sandbox", "restart", name],
                 capture_output=True)
         if r.returncode != 0:
@@ -12074,6 +12031,21 @@ def _registry_instance_status(name: str) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+class RegistryUnavailable(Exception):
+    """The box image registry could not be brought up. `reason` is a fixed,
+    browser-safe text naming the cause (no command, no host file): the box-image
+    step returns it as its reason, `research start` warns with it."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _registry_port_held(host_port: str) -> RegistryUnavailable:
+    return RegistryUnavailable(f"the box image registry's port {host_port} on this "
+                               f"computer is held by another program")
+
+
 def _run_registry_instance(name: str, role: str, image: str, host_port: str) -> bool:
     """`docker run` one registry instance over the shared storage directory;
     True when this call created it. The read-only role gets the maintenance
@@ -12081,7 +12053,7 @@ def _run_registry_instance(name: str, role: str, image: str, host_port: str) -> 
     no switch. A held loopback port is classified FIRST: docker leaves a
     `created` container behind such a failure (measured), which a later
     `docker start` would bring up WITHOUT the port — so that leftover is
-    removed by name and the knob is named. A run that fails because a sibling
+    removed by name and the cause is named. A run that fails because a sibling
     caller created the same name meanwhile is accepted only when that
     container is RUNNING."""
     args = ["docker", "run", "-d", "--name", name,
@@ -12100,13 +12072,11 @@ def _run_registry_instance(name: str, role: str, image: str, host_port: str) -> 
     if "already allocated" in err or "address already in use" in err:
         if _registry_instance_status(name) == "created":
             run(["docker", "rm", name], capture_output=True)
-        die(f"host port {host_port} is already in use; set REGISTRY_HOST_PORT "
-            f"in versions.env to a free port and retry. (docker: "
-            f"{err[-200:]})")
+        raise _registry_port_held(host_port)
     if _registry_instance_status(name) == "running":
         # a concurrent caller won the creation race; its container serves
         return False
-    die(f"failed to start {name}: {err[-300:]}")
+    raise RegistryUnavailable(f"the box image registry ({name}) could not be started")
 
 
 def _push_port_bound() -> bool:
@@ -12115,18 +12085,15 @@ def _push_port_bound() -> bool:
 
 
 def _check_push_port(host_port: str) -> None:
-    """Die naming the knob when the push instance runs without its loopback
+    """Raise RegistryUnavailable naming the cause when the push instance runs without its loopback
     port (a `docker start` of a container whose port was taken meanwhile
     succeeds port-less — measured); the backstop after every arm. An instance
     that is not running at all (crashed at boot) is a different failure."""
     if not container_running(REGISTRY_PUSH_CONTAINER):
-        die(f"{REGISTRY_PUSH_CONTAINER} is not running after its start (the "
-            f"registry exited at boot); its container log says why")
+        raise RegistryUnavailable(f"the box image registry ({REGISTRY_PUSH_CONTAINER}) "
+                                  f"stopped right after its start")
     if not _push_port_bound():
-        die(f"{REGISTRY_PUSH_CONTAINER} is running without its loopback port "
-            f"{host_port}: something else holds it; free the port or set "
-            f"REGISTRY_HOST_PORT in versions.env to a free one, then start the "
-            f"fleet again")
+        raise _registry_port_held(host_port)
 
 
 def _attach_registry_to_all_projects() -> None:
@@ -12156,7 +12123,9 @@ def _pull_registry_image_if_needed(image: str) -> None:
             and not (container_exists(REGISTRY_CONTAINER)
                      and container_exists(REGISTRY_PUSH_CONTAINER)):
         print(f"pulling {image}...")
-        run_check(["docker", "pull", image])
+        if run(["docker", "pull", image], capture_output=True).returncode != 0:
+            raise RegistryUnavailable("the box image registry's own image could not "
+                                      "be downloaded")
 
 
 def _ensure_readonly_registry() -> None:
@@ -12184,7 +12153,10 @@ def _ensure_readonly_registry() -> None:
     if container_running(REGISTRY_CONTAINER):
         pass
     elif container_exists(REGISTRY_CONTAINER):
-        run_check(["docker", "start", REGISTRY_CONTAINER])
+        if run(["docker", "start", REGISTRY_CONTAINER],
+               capture_output=True).returncode != 0:
+            raise RegistryUnavailable(f"the box image registry ({REGISTRY_CONTAINER}) "
+                                      f"could not be started")
     else:
         created = _run_registry_instance(REGISTRY_CONTAINER, REGISTRY_ROLE_READONLY,
                                          image, host_port)
@@ -12197,9 +12169,10 @@ def _ensure_readonly_registry() -> None:
 
 def _ensure_push_registry() -> None:
     """The writable instance on the loopback port — what a PUSH needs (create,
-    research's first box of a kind, a pre-digest project's re-push) and what
+    research's first box of a kind, a start that moves a project to a new box
+    image build) and what
     `research start` brings up for the operator. Triad as above; a held
-    loopback port is named at every arm: at the run (the knob, the `created`
+    loopback port is named at every arm: at the run (the cause, the `created`
     leftover removed), at a failed `docker start` of the stopped instance
     (docker refuses the bind), and after a start that succeeded without the
     port (docker lets that happen on a second attempt — measured)."""
@@ -12209,7 +12182,7 @@ def _ensure_push_registry() -> None:
     if container_running(REGISTRY_PUSH_CONTAINER) and not _push_port_bound():
         # docker brought it up without the port on a retry while something
         # held it (measured); it can never regain the port in place, so it is
-        # recreated — the port may be free now, and if not the run names the knob
+        # recreated — the port may be free now, and if not the run names the cause
         print(f"recreating {REGISTRY_PUSH_CONTAINER}: it runs without its loopback port")
         run(["docker", "rm", "-f", REGISTRY_PUSH_CONTAINER], capture_output=True)
     if container_running(REGISTRY_PUSH_CONTAINER):
@@ -12219,10 +12192,9 @@ def _ensure_push_registry() -> None:
         if r.returncode != 0:
             err = (r.stderr or r.stdout or "").strip()
             if "already allocated" in err or "address already in use" in err:
-                die(f"host port {host_port} is already in use; free it or set "
-                    f"REGISTRY_HOST_PORT in versions.env to a free port and "
-                    f"retry. (docker: {err[-200:]})")
-            die(f"failed to start {REGISTRY_PUSH_CONTAINER}: {err[-300:]}")
+                raise _registry_port_held(host_port)
+            raise RegistryUnavailable(f"the box image registry "
+                                      f"({REGISTRY_PUSH_CONTAINER}) could not be started")
     else:
         if _run_registry_instance(REGISTRY_PUSH_CONTAINER, REGISTRY_ROLE_PUSH,
                                   image, host_port):
@@ -12239,7 +12211,7 @@ def _ensure_registry_running() -> None:
     leaves every pull-only delivery working and only the host's push lane
     missing until the next attempt. Pull-side callers use
     `_ensure_readonly_registry` alone; this is for the push callers (create,
-    research's lazy box delivery, a pre-digest project's re-push) and for
+    research's lazy box delivery, a start that publishes a new box image build) and for
     `research start`."""
     _ensure_readonly_registry()
     _ensure_push_registry()
@@ -12250,9 +12222,9 @@ def _connect_registry_to_project_network(network: str) -> None:
     inner dockerd pulls rs-registry:5000 by container DNS over its OWN subnet
     (L2) — never crossing the router's RFC1918 DROP. Ensures that instance
     exists first (lazy stand-up; the push instance is not needed to pull, so a
-    held loopback port never fails a pull-only delivery — a sandbox-dind
-    recreate, any delivery with recorded digests; a delivery that PUSHES, such
-    as research's lazy box delivery, needs the pair and names the knob).
+    held loopback port never fails a pull-only delivery — a re-creation whose
+    box images are current; a delivery that PUSHES needs the pair and names
+    the cause).
     Idempotent (a re-connect exits non-zero silently)."""
     _ensure_readonly_registry()
     run(["docker", "network", "connect", network, REGISTRY_CONTAINER],
@@ -13590,14 +13562,55 @@ def _run_dev_clone(container: str, repo: str, user: str, branch: str,
     return workdir
 
 
-def _registry_manifest_digest(host_port: str, repo: str, tag: str) -> str:
+# The two blank-box images, in build order (browser FROMs the plain box). Each:
+# (host image base, registry repo, the :latest tag the in-supervisor rs-sandbox
+# `docker run`s — see cli/rs_sandbox.py BOX_IMAGE).
+_BOX_IMAGES = [
+    ("rs-sandbox-box", "sandbox-box", SANDBOX_BOX_IMAGE),
+    ("rs-sandbox-box-browser", "sandbox-box-browser", SANDBOX_BOX_BROWSER_IMAGE),
+]
+
+# The project record of the box images it holds: {repo: {"id", "digest"}} —
+# the HOST image id that was published and the digest the registry served for
+# it. The id decides whether the project's image is the current one; the digest
+# is what the project pulls.
+BOX_IMAGES_KEY = "box_images"
+
+# How each box image is named to the operator.
+_BOX_IMAGE_SHOWN = {"sandbox-box": "the box image",
+                    "sandbox-box-browser": "the browser box image"}
+
+# The reasons the step gives (browser-reachable: no host command, no path).
+BOX_IMAGE_NOT_BUILT = ("the box images are not built on this computer: Rebuild "
+                       "all on Sandboxes → Software, then retry")
+BOX_IMAGE_PUBLISH_FAILED = "publishing {image} into the box image registry failed"
+BOX_IMAGE_CONFIRM_FAILED = ("the box image registry did not confirm what it holds "
+                            "for {image}")
+BOX_IMAGE_PULL_FAILED = "the project could not pull {image} from the box image registry"
+BOX_IMAGE_RECORD_FAILED = ("the project's record of {image} could not be written: "
+                           "its settings file " + orch_files.SHOWN_FOLDER +
+                           "/project.json could not be read or written; repair it "
+                           "from the project's terminal, then restart the project")
+
+
+@dataclass(frozen=True)
+class BoxImageResult:
+    """One run of _bring_box_image: `reason` empty = the image is in the
+    project and recorded; otherwise why not. `in_project` says whether the
+    project now holds the current image anyway (only a record write failed),
+    so its boxes keep running."""
+    reason: str = ""
+    in_project: bool = False
+
+
+def _registry_served_digest(host_port: str, repo: str, tag: str) -> str:
     """The digest the registry SERVES for a tag — a HEAD of the manifest on the
     loopback push port with the manifest media types offered — never the local
     daemon's `RepoDigests`, which can carry the local index digest while the
     registry holds a different single-platform manifest (measured): a recorded
-    digest the registry cannot serve would make every later recreate die at the
-    pull. A missing tag, repo or Accept header answers 404; a 200 without the
-    digest header is a registry that is not one. Both die naming the ref."""
+    digest the registry cannot serve would make every later pull fail. "" when
+    the registry does not answer with one (a missing tag, repo or Accept
+    header answers 404)."""
     url = f"http://127.0.0.1:{host_port}/v2/{repo}/manifests/{tag}"
     req = urllib.request.Request(url, method="HEAD",
                                  headers={"Accept": REGISTRY_MANIFEST_ACCEPT})
@@ -13607,160 +13620,209 @@ def _registry_manifest_digest(host_port: str, repo: str, tag: str) -> str:
     try:
         with opener.open(req, timeout=REGISTRY_MANIFEST_HEAD_TIMEOUT_S) as resp:
             digest = resp.headers.get("Docker-Content-Digest", "")
-    except (urllib.error.HTTPError, urllib.error.URLError, OSError) as e:
-        die(f"could not confirm what the registry serves for {repo}:{tag} after "
-            f"the push ({e}); nothing recorded")
-    if not digest.startswith("sha256:"):
-        die(f"the registry answered for {repo}:{tag} without a content digest; "
-            f"cannot record what was pushed")
-    return digest
+    except (urllib.error.HTTPError, urllib.error.URLError, OSError):
+        return ""
+    return digest if _is_sha256_ref(digest) else ""
 
 
-def _push_generic_image(host_base: str, pin: "str | None" = None) -> str:
-    """Publish a GENERIC lane-3 box image (rs-sandbox-box[-browser]) into the
-    local registry through the push instance and return the manifest digest the
-    registry serves for it. Keys on extension.GENERIC_REGISTRY_IMAGES and the
-    rs-<base>:<pin> host tag the build retag produced. `pin` defaults to the
-    current versions.env pin (the MINT site: create, research's lazy delivery);
-    a pre-digest project's first recreate passes ITS frozen pin, so a re-push
-    never moves a project to a newer version behind its marker's back."""
-    pins = load_versions()
-    repo, vkey = extension.GENERIC_REGISTRY_IMAGES[host_base]
-    if pin is None:
-        pin = pins.get(vkey)
-    if not pin:
-        die(f"missing version pin {vkey} for {host_base!r}; add it to "
-            f"versions.env and run `research start --rebuild`.")
-    host_tag = f"{host_base}:{pin}"
-    if not run_quiet(["docker", "image", "inspect", host_tag]):
-        die(f"image {host_tag} not built; run `research start --rebuild` first.")
-    _ensure_registry_running()
-    host_port = pins.get("REGISTRY_HOST_PORT", DEFAULT_REGISTRY_HOST_PORT)
-    push_ref = f"127.0.0.1:{host_port}/{repo}:{pin}"
-    run_check(["docker", "tag", host_tag, push_ref])
-    run_check(["docker", "push", push_ref])
-    digest = _registry_manifest_digest(host_port, repo, pin)
-    print(f"published {host_base} -> {extension.EXT_REGISTRY}/{repo}:{pin} ({digest})")
-    return digest
+def _is_sha256_ref(value: Any) -> bool:
+    return (isinstance(value, str) and value.startswith("sha256:")
+            and re.fullmatch(r"[0-9a-f]{64}", value[len("sha256:"):]) is not None)
 
 
-def _host_has_box_tag(host_base: str, pin: str) -> bool:
-    """Does the host daemon still carry rs-<base>:<pin> (a versions.env bump
-    leaves older pins behind)?"""
-    return run_quiet(["docker", "image", "inspect", f"{host_base}:{pin}"])
+def _host_box_image_id(host_base: str) -> str:
+    """The id of the host's current `rs-<base>:latest` (what Rebuild all built),
+    "" when the host has none."""
+    r = run(["docker", "image", "inspect", "-f", "{{.Id}}", f"{host_base}:latest"],
+            capture_output=True)
+    value = (r.stdout or "").strip() if r.returncode == 0 else ""
+    return value if _is_sha256_ref(value) else ""
 
 
-# The two blank-box images, in build order (browser FROMs the plain box). Each:
-# (host image base, registry repo key in project.json, the :latest tag the
-# in-supervisor rs-sandbox `docker run`s — see cli/rs_sandbox.py BOX_IMAGE).
-_BOX_IMAGES = [
-    ("rs-sandbox-box", "sandbox-box", SANDBOX_BOX_IMAGE),
-    ("rs-sandbox-box-browser", "sandbox-box-browser", SANDBOX_BOX_BROWSER_IMAGE),
-]
-
-
-def _box_image_pins(pins: dict[str, str]) -> dict[str, str]:
-    """{registry-repo: pin} for the two box images, from versions.env. die()s on a
-    missing pin (the mint site — create/greenfield-backfill — needs both)."""
-    out: dict[str, str] = {}
-    for host_base, repo, _latest in _BOX_IMAGES:
-        _, vkey = extension.GENERIC_REGISTRY_IMAGES[host_base]
-        pin = pins.get(vkey)
-        if not pin:
-            die(f"missing version pin {vkey} for {host_base!r}; add it to "
-                f"versions.env and run `research start --rebuild`.")
-        out[repo] = pin
-    return out
-
-
-def _inner_image_digest(supervisor: str, ref: str, repo: str) -> str:
-    """The registry digest of an image the inner daemon just pulled by TAG,
-    read from its RepoDigests entry for the pull locator (`rs-registry:5000/
-    <repo>@sha256:…`) — exactly the digest the registry served for the tag
-    (measured: a tag pull records the registry's manifest digest). Dies when
-    absent: a pull that recorded no digest is a pull we cannot pin."""
-    r = run(["docker", "exec", supervisor, "docker", "image", "inspect", ref,
-             "-f", "{{json .RepoDigests}}"], capture_output=True)
+def _read_box_image_record(workspace_path: "Path") -> dict[str, dict[str, str]]:
+    """The project's box-image record, valid entries only ({} when the marker
+    is absent or unreadable, a link included — orch_files). An entry without
+    a valid id AND digest is no entry: that image is published again."""
     try:
-        entries = json.loads(r.stdout or "null") if r.returncode == 0 else None
-    except json.JSONDecodeError:
-        entries = None
-    prefix = f"{extension.EXT_REGISTRY}/{repo}@"
-    for e in entries or []:
-        if isinstance(e, str) and e.startswith(prefix):
-            return e[len(prefix):]
-    die(f"the inner daemon of {supervisor} pulled {ref} but recorded no registry "
-        f"digest for it; cannot pin the box image")
+        data = json.loads(_read_marker_text(workspace_path))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    record = data.get(BOX_IMAGES_KEY) if isinstance(data, dict) else None
+    if not isinstance(record, dict):
+        return {}
+    return {repo: {"id": e["id"], "digest": e["digest"]}
+            for repo, e in record.items()
+            if isinstance(repo, str) and isinstance(e, dict)
+            and _is_sha256_ref(e.get("id")) and _is_sha256_ref(e.get("digest"))}
 
 
-def _deliver_box_images(supervisor: str, network: str, box_pins: dict[str, str],
-                        *, push: bool, only: "set[str] | None" = None,
-                        digests: "dict[str, str] | None" = None) -> dict[str, str]:
-    """Make the pinned box images available in a dind supervisor's inner dockerd,
-    registry-delivered, and return the `{repo: digest}` map that was delivered.
-    ``push`` (the MINT path — create, research's lazy delivery, the greenfield
-    recreate-backfill, and a pre-digest project's first recreate while the host
-    still has its pinned tag) first publishes the host images AT THE MARKER'S
-    PINS and pulls by the digest each push produced; otherwise a repo with a
-    recorded digest is pulled by `rs-registry:5000/<repo>@<digest>` — a tag can
-    no longer redirect it and a tampered blob fails the pull — and a repo
-    without one (a marker from before digests were recorded) is pulled by its
-    pinned tag once, the digest it resolved to being returned for the caller to
-    record. ``only`` restricts delivery to a subset of host-base names (default
-    None = both). Connects the read-only registry to the project network
-    (idempotent — survives recreate), and retags to the :latest the
-    in-supervisor rs-sandbox runs (so rs-sandbox is unchanged)."""
-    images = [tpl for tpl in _BOX_IMAGES if only is None or tpl[0] in only]
-    delivered: dict[str, str] = {}
-    if push:
-        for host_base, repo, _latest in images:
-            delivered[repo] = _push_generic_image(host_base, pin=box_pins[repo])
-    else:
-        for _host_base, repo, _latest in images:
-            d = (digests or {}).get(repo)
-            if isinstance(d, str) and d.startswith("sha256:"):
-                delivered[repo] = d
-    _connect_registry_to_project_network(network)
-    for _host_base, repo, latest_tag in images:
-        digest = delivered.get(repo)
-        if digest:
-            ref = f"{extension.EXT_REGISTRY}/{repo}@{digest}"
-        else:
-            ref = f"{extension.EXT_REGISTRY}/{repo}:{box_pins[repo]}"
-        run_check(["docker", "exec", supervisor, "docker", "pull", ref])
-        run_check(["docker", "exec", supervisor, "docker", "tag", ref, latest_tag])
-        if not digest:
-            delivered[repo] = _inner_image_digest(supervisor, ref, repo)
-    return delivered
+def _write_box_image_record(workspace_path: "Path", repo: str, image_id: str,
+                            digest: str) -> bool:
+    """Record one image's id and digest, merged into the marker in one temp +
+    rename write; every other key is kept. False, and nothing written, when
+    the marker is absent, unreadable or not an object: it is never written
+    fresh (that would leave a project record without its type)."""
+    try:
+        data = json.loads(_read_marker_text(workspace_path))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    current = data.get(BOX_IMAGES_KEY)
+    record = dict(current) if isinstance(current, dict) else {}
+    record[repo] = {"id": image_id, "digest": digest}
+    data[BOX_IMAGES_KEY] = record
+    try:
+        _write_marker_text(workspace_path, data)
+    except OSError:          # orch_files.Unusable included
+        return False
+    return True
+
+
+def _bring_box_image(container: str, network: str, workspace_path: "Path",
+                     host_base: str) -> BoxImageResult:
+    """Bring ONE box image into a project: the only way a box image enters a
+    project (create, a box add that finds it absent, every re-creation).
+
+    The host's `rs-<base>:latest` is the current image. When the project's
+    record holds that same id, it is pulled by the recorded digest and retagged
+    `:latest` inside (a fresh inner store needs it; a kept one gets back a
+    `:latest` it lost); a registry that no longer serves that digest (its
+    storage was lost) is treated like no record. Otherwise that exact id is
+    tagged under a name used by this call alone, published, the digest the
+    registry serves for that name read back, pulled by that digest, retagged,
+    and recorded — so what is recorded is what was published, whatever another
+    build or delivery does meanwhile. Each step fails with a fixed reason (no
+    reason is taken from a command's output) and no step prints a command
+    line."""
+    _, repo, latest_tag = next(t for t in _BOX_IMAGES if t[0] == host_base)
+    shown = _BOX_IMAGE_SHOWN[repo]
+    host_id = _host_box_image_id(host_base)
+    if not host_id:
+        return BoxImageResult(BOX_IMAGE_NOT_BUILT)
+    try:
+        _connect_registry_to_project_network(network)
+    except RegistryUnavailable as e:
+        return BoxImageResult(e.reason)
+
+    def pull(digest: str) -> bool:
+        ref = f"{extension.EXT_REGISTRY}/{repo}@{digest}"
+        return (run_quiet(["docker", "exec", container, "docker", "pull", ref])
+                and run_quiet(["docker", "exec", container, "docker", "tag", ref,
+                               latest_tag]))
+
+    recorded = _read_box_image_record(workspace_path).get(repo)
+    current = recorded is not None and recorded["id"] == host_id
+    if current and pull(recorded["digest"]):
+        return BoxImageResult()
+    # Not current, or current but its pull failed (the registry may have lost
+    # it): publish. When that pull failed, a publish that fails before its own
+    # pull reports the pull, the first cause.
+    pull_failed = BOX_IMAGE_PULL_FAILED.format(image=shown) if current else ""
+    try:
+        _ensure_registry_running()
+    except RegistryUnavailable as e:
+        return BoxImageResult(pull_failed or e.reason)
+    host_port = load_versions().get("REGISTRY_HOST_PORT", DEFAULT_REGISTRY_HOST_PORT)
+    tag = f"{host_id[len('sha256:'):][:12]}-{secrets.token_hex(4)}"
+    push_ref = f"127.0.0.1:{host_port}/{repo}:{tag}"
+    if not run_quiet(["docker", "tag", host_id, push_ref]):
+        return BoxImageResult(pull_failed or BOX_IMAGE_PUBLISH_FAILED.format(image=shown))
+    pushed = run_quiet(["docker", "push", push_ref])
+    # the host keeps no tag per delivery (it would hold every old build)
+    run_quiet(["docker", "image", "rm", push_ref])
+    if not pushed:
+        return BoxImageResult(pull_failed or BOX_IMAGE_PUBLISH_FAILED.format(image=shown))
+    digest = _registry_served_digest(host_port, repo, tag)
+    if not digest:
+        return BoxImageResult(pull_failed or BOX_IMAGE_CONFIRM_FAILED.format(image=shown))
+    if not pull(digest):
+        return BoxImageResult(BOX_IMAGE_PULL_FAILED.format(image=shown))
+    print(f"published {shown} into the project ({digest})")
+    if not _write_box_image_record(workspace_path, repo, host_id, digest):
+        return BoxImageResult(BOX_IMAGE_RECORD_FAILED.format(image=shown),
+                              in_project=True)
+    return BoxImageResult()
+
+
+def _inner_box_images_present(container: str) -> set[str]:
+    """The host bases whose `:latest` the project's inner store holds now."""
+    return {host_base for host_base, _repo, latest in _BOX_IMAGES
+            if run_quiet(["docker", "exec", container, "docker", "image",
+                          "inspect", latest])}
+
+
+def _box_image_of(entry: dict) -> str:
+    """The host base a box entry runs (its persisted, resolved `browser`)."""
+    return _BOX_IMAGES[1][0] if entry.get("browser") is True else _BOX_IMAGES[0][0]
+
+
+def _bring_box_images_at_start(project: str, container: str, network: str,
+                               workspace_path: "Path", boxes: dict[str, dict],
+                               found: list) -> set[str]:
+    """At a re-creation, before any box is relaunched: bring every box image the
+    project holds or a box needs up to the host's current one. For an image
+    that fails, its boxes are stopped (a privileged host's inner daemon has
+    restarted them on their own), its `:latest` is removed inside so nothing
+    re-runs them on the old image, and the reason is added to `found` for the
+    end of the operation. Returns the host bases whose boxes must not be
+    relaunched."""
+    wanted = _inner_box_images_present(container) | {
+        _box_image_of(e) for e in boxes.values()}
+    failed: set[str] = set()
+    for host_base, repo, latest in _BOX_IMAGES:
+        if host_base not in wanted:
+            continue
+        result = _bring_box_image(container, network, workspace_path, host_base)
+        if not result.reason:
+            continue
+        if result.in_project:
+            found.append(OldInstructions("box-image", project, reason=result.reason))
+            continue
+        failed.add(host_base)
+        stop_failed = False
+        users = [name for name, entry in sorted(boxes.items())
+                 if _box_image_of(entry) == host_base]
+        for name in users:
+            cname = extension.container_name(name)
+            if not run_quiet(["docker", "exec", container, "docker",
+                              "container", "inspect", cname]):
+                continue
+            if not run_quiet(["docker", "exec", container, "docker", "stop", cname]):
+                stop_failed = True
+        run_quiet(["docker", "exec", container, "docker", "image", "rm", "-f", latest])
+        kept = run_quiet(["docker", "exec", container, "docker", "image", "inspect",
+                          latest])
+        shown = _BOX_IMAGE_SHOWN[repo]
+        parts = []
+        if users:
+            parts.append("the boxes that use it could not all be stopped" if stop_failed
+                         else "the boxes that use it are stopped")
+        if kept:
+            parts.append("its old copy could not be removed from the project")
+        tail = ("; " + ", and ".join(parts)) if parts else ""
+        found.append(OldInstructions("box-image", project, reason=(
+            f"{shown} could not be brought up to date ({result.reason}){tail}")))
+    return failed
 
 
 def _ensure_box_harness(container: str, network: str, workspace_path: "Path",
                         want_browser: bool) -> None:
-    """Idempotently make the rs-sandbox box harness usable in a RUNNING dind
-    supervisor: stage the rs-sandbox CLI if absent, and deliver the ONE box image
-    this request needs (base, or browser when ``want_browser``) into the inner
-    store if absent. No-op where both are already present — every sandbox-dind
-    project eager-stages the harness at create/recreate, so this only does work on
-    the frozen research lane, which never touches boxes at create/recreate. This is
-    the SOLE box-delivery path for research (box_add + the recreate relaunch loop);
-    research create/recreate are untouched. Uses the project's frozen pins when
-    present (sandbox-dind) else the current versions.env pins (research has no
-    frozen box_image_pins — a versions.env bump can drift a research box's image,
-    acceptable)."""
+    """Make the box harness usable in a RUNNING dind project for a box add:
+    stage the rs-sandbox CLI if absent, and bring the ONE box image this box
+    needs (base, or browser when ``want_browser``) into the project when its
+    inner store does not hold it (research delivers lazily; a sandbox-dind
+    project whose start could not bring it up to date lost it). An image the
+    project holds is reused: it was brought up to date at the last start."""
     if not run_quiet(["docker", "exec", container, "test", "-e",
                       "/usr/local/bin/rs-sandbox"]):
         _stage_rs_sandbox(container)
     host_base, _repo, latest_tag = _BOX_IMAGES[1] if want_browser else _BOX_IMAGES[0]
     if not run_quiet(["docker", "exec", container, "docker", "image", "inspect",
                       latest_tag]):
-        pins = _read_box_pins(workspace_path) or _box_image_pins(load_versions())
-        delivered = _deliver_box_images(container, network, pins, push=True,
-                                        only={host_base})
-        # Research keeps no frozen pins, but it records the digest it just
-        # delivered (merged per repo; write-only here — every research delivery
-        # pushes and pulls by that push's digest, which is what closes the race
-        # between the host's push and the box's pull).
-        _write_box_digests(workspace_path, delivered)
+        result = _bring_box_image(container, network, workspace_path, host_base)
+        if result.reason:
+            raise ValidationError(result.reason)
 
 
 def _project_has_fetch_consumers(workspace_path: "Path") -> bool:
@@ -13802,7 +13864,7 @@ def _agents_from_mounts(extra_mounts: list[str]) -> list[str]:
 
 def _read_marker_agents(workspace_path: "Path") -> list[str]:
     """The agent set stamped into .orchestrator/project.json at create (drives the
-    sandbox-dind recreate's deploy_local). Tolerant read, the _read_box_pins shape:
+    sandbox-dind recreate's deploy_local). Tolerant read, the _read_box_image_record shape:
     a missing/unreadable marker or key reads as [] — the recreate then comes back
     UNWIRED (accepted B31-family caveat; greenfield posture — pre-change non-docker
     markers already carry []). A link reads as unreadable (orch_files)."""
@@ -13818,7 +13880,7 @@ def _write_marker_agents(workspace_path: "Path", agents: list[str]) -> None:
     """Write the agent set into project.json, keeping every other key intact —
     and REFUSING on an unreadable marker rather than clobbering it, like every
     read-modify-write writer of the marker: `type`, `substrate`, `workflow`,
-    `models`, `box_image_pins`, `ssh_port` would all vanish, and the recreate +
+    `models`, `box_images`, `ssh_port` would all vanish, and the recreate +
     the webui flavor gate read every one of them. A link at the marker or at
     the settings folder is unreadable (orch_files), never followed."""
     f = workspace_path / ".orchestrator" / "project.json"
@@ -14253,12 +14315,17 @@ class OldInstructions:
     """An operation met an old instructions file (or an old research image)
     and wrote nothing new: raised ONCE at the end of the top-level verb."""
     kind: str          # "project" | "box" | "research" | "image" | "labels" | "unchecked"
+                       # | "box-image" (a box image could not be brought up to
+                       # date at a re-creation; `reason` is its fixed text)
     project: str
     box: str = ""
+    reason: str = ""
 
     def text(self) -> str:
         if self.kind == "box":
             return OLD_INSTRUCTIONS_BOX_ERROR.format(box=_shown_box(self.box))
+        if self.kind == "box-image":
+            return self.reason
         return {"project": OLD_INSTRUCTIONS_PROJECT_ERROR,
                 "research": OLD_INSTRUCTIONS_RESEARCH_ERROR,
                 "image": OLD_INSTRUCTIONS_IMAGE_ERROR,
@@ -15330,98 +15397,6 @@ def project_add_agents(project: str, agents: "Sequence[str]",
                         boxes_refreshed=refreshed, boxes_not_refreshed=not_refreshed)
 
 
-def _read_box_pins(workspace_path: "Path") -> dict[str, str]:
-    """The frozen box-image pins from .orchestrator/project.json, or {} for a
-    pre-migration project (greenfield → recreate backfills); {} too when the
-    marker is unreadable (a link included — orch_files)."""
-    try:
-        data = json.loads(_read_marker_text(workspace_path))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    pins = data.get("box_image_pins")
-    return pins if isinstance(pins, dict) else {}
-
-
-def _write_box_pins(workspace_path: "Path", box_pins: dict[str, str]) -> None:
-    """Backfill the box-image pins into project.json (greenfield recreate), keeping
-    every other marker key intact. An ABSENT marker is written fresh; an existing
-    but unreadable (or non-object) one is REFUSED with a warning and left exactly
-    as it is, never rewritten holding only the pins: `type`, `substrate`,
-    `workflow`, `agents`, `models`, `ssh_port` would all vanish. A warning, not a
-    raise, because this runs mid-recreate after the new container is started (the
-    _write_box_digests posture); the next recreate after a repair backfills again.
-    Temp + rename, so a concurrent reader never sees a torn file. A link at
-    the marker or at the settings folder is unreadable (orch_files)."""
-    f = workspace_path / ".orchestrator" / "project.json"
-    try:
-        data = json.loads(_read_marker_text(workspace_path))
-    except FileNotFoundError:
-        data = {}
-    except (OSError, json.JSONDecodeError) as e:
-        print(f"warning: box-image pins not recorded: the project marker {orch_files.SHOWN_FOLDER}/project.json "
-              f"is unreadable ({e}); repair it and restart the project",
-              file=sys.stderr)
-        return
-    if not isinstance(data, dict):
-        print(f"warning: box-image pins not recorded: the project marker {orch_files.SHOWN_FOLDER}/project.json "
-              f"is not a JSON object; repair it and restart the project",
-              file=sys.stderr)
-        return
-    data["box_image_pins"] = box_pins
-    try:
-        _write_marker_text(workspace_path, data)
-    except orch_files.Unusable as e:
-        print(f"warning: box-image pins not recorded: {e}", file=sys.stderr)
-
-
-def _read_box_digests(workspace_path: "Path") -> dict[str, str]:
-    """The recorded box-image digests (`{repo: "sha256:…"}`) from
-    .orchestrator/project.json, or {} for a project from before they were
-    recorded (its next delivery pulls by tag once and records what it got),
-    or when the marker is unreadable (a link included — orch_files)."""
-    try:
-        data = json.loads(_read_marker_text(workspace_path))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    digests = data.get("box_image_digests")
-    if not isinstance(digests, dict):
-        return {}
-    return {k: v for k, v in digests.items()
-            if isinstance(k, str) and isinstance(v, str) and v.startswith("sha256:")}
-
-
-def _write_box_digests(workspace_path: "Path", digests: dict[str, str]) -> None:
-    """Merge box-image digests into project.json, per repo, keeping every other
-    key — and REFUSING (a warning, nothing written) on an unreadable marker
-    rather than clobbering it: unlike the one-time pin backfill this runs on a
-    LIVE project at every research delivery, and `type`, `substrate`,
-    `workflow`, `agents`, `models`, `box_image_pins`, `ssh_port` would all
-    vanish. Temp + rename, so the webui's concurrent read never sees a torn
-    file. A link at the marker or at the settings folder is unreadable
-    (orch_files), never followed."""
-    if not digests:
-        return
-    f = workspace_path / ".orchestrator" / "project.json"
-    try:
-        data = json.loads(_read_marker_text(workspace_path))
-    except (OSError, json.JSONDecodeError) as e:
-        print(f"warning: box-image digests not recorded: the project marker {orch_files.SHOWN_FOLDER}/project.json "
-              f"is unreadable ({e})", file=sys.stderr)
-        return
-    if not isinstance(data, dict):
-        print(f"warning: box-image digests not recorded: the project marker {orch_files.SHOWN_FOLDER}/project.json "
-              f"is not an object", file=sys.stderr)
-        return
-    current = data.get("box_image_digests")
-    merged = dict(current) if isinstance(current, dict) else {}
-    merged.update(digests)
-    data["box_image_digests"] = merged
-    try:
-        _write_marker_text(workspace_path, data)
-    except orch_files.Unusable as e:
-        print(f"warning: box-image digests not recorded: {e}", file=sys.stderr)
-
-
 def _read_models(workspace_path: "Path") -> dict[str, dict[str, str]]:
     """The project's frozen per-type (model, effort) pairs from
     .orchestrator/project.json, or {} for a pre-STAGE_MODEL_SELECT project.
@@ -15447,7 +15422,7 @@ def _read_models(workspace_path: "Path") -> dict[str, dict[str, str]]:
 def _write_models(workspace_path: "Path", models: dict[str, dict[str, str]]) -> None:
     """Write the per-type model pairs into project.json, KEEPING EVERY OTHER MARKER
     KEY INTACT. A naive whole-file rewrite would silently drop `type`, `substrate`,
-    `workflow`, `agents`, and `box_image_pins` — which the webui's flavor gate and
+    `workflow`, `agents`, and `box_images` — which the webui's flavor gate and
     every box recreate read — and the damage would surface far from its cause. So
     an ABSENT marker is written fresh, but an existing unreadable (or non-object)
     one raises ValidationError and is left untouched: this runs inside `update`
@@ -15486,7 +15461,7 @@ def _apply_model_changes(workspace_path: "Path",
     TOGETHER with an incompatible model already died in UpdateRequest.from_kwargs.)
 
     Writes through _write_models, which is read-modify-write: the marker's other
-    keys (`type`, `substrate`, `workflow`, `agents`, `box_image_pins`) survive."""
+    keys (`type`, `substrate`, `workflow`, `agents`, `box_images`) survive."""
     catalog = _model_catalog_checked()
     current = _read_models(workspace_path)
     if not current:
@@ -17284,11 +17259,10 @@ def _retire_history_rows(project: str, rows: list[dict], container: str) -> list
 
 
 # The one refusal for a box type with its own web app on a project whose box
-# tool or box images predate web apps. A restart cannot fix it: a project
-# keeps the box images it was created with.
+# tool or box images predate web apps. A restart fixes it: it re-stages the box
+# tool and moves the project's boxes to the host's current box images.
 _WEB_BOX_TOO_OLD_MSG = ("this project's boxes predate box types that start "
-                        "their own web app — create a new project to use this "
-                        "box type")
+                        "their own web app — restart the project, then retry")
 # The in-image path of the web-app loop: its presence tells a current box
 # image from an older one. LOCKSTEP with agent/Dockerfile.sandbox-box's COPY.
 BOX_WEB_LOOP_PATH = "/usr/local/bin/rs-web-loop"
@@ -18260,17 +18234,18 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     # that need the Gitea run last, so a cheap refusal never starts it).
     hist_claim = (_gate_box_history(req, catalog, container, workspace_path)
                   if req.history else None)
-    # Lazily stand up the box harness. On research this stages rs-sandbox + delivers
-    # the needed box image on first use (research create/recreate never touch boxes
-    # — the frozen lane); on sandbox-dind (eager-staged) it no-ops. want_browser
+    # Lazily stand up the box harness. On research this stages rs-sandbox + brings
+    # the needed box image in on first use (research create never touches boxes
+    # — the frozen lane); where the project holds the image it no-ops. want_browser
     # was resolved in the gate block above, so the image the box will run IS the
     # one delivered (a research project's lazy delivery keys on this).
     progress.step("harness", "ensuring the box harness")
     _ensure_box_harness(container, project_network_for(req.project),
                         workspace_path, want_browser)
-    # The image is in the project now. A sandbox project's lazy delivery uses
-    # its frozen pins, which may predate trusted browsers: ask again, before
-    # the history provisioning, the dev wiring and the create.
+    # The image is in the project now. An image the project already held is
+    # the one its last start brought, which may predate trusted browsers on a
+    # project not restarted since: ask again, before the history provisioning,
+    # the dev wiring and the create.
     if req.trusted_browser and _browser_image_trust(container) != "yes":
         raise ValidationError(_TRUSTED_BROWSER_TOO_OLD_MSG)
     # Editor dist on demand (the staged-catalog Q1-live precedent above): an
@@ -22653,9 +22628,8 @@ def wire_registry_to_projects() -> None:
     # rest of `research start` (the webui, the MCPs and gitea follow): warn.
     try:
         _ensure_registry_running()
-    except SystemExit:
-        # die() already printed the reason to stderr
-        print("warning: box-image registry not fully up (see the error above); "
+    except RegistryUnavailable as e:
+        print(f"warning: box-image registry not fully up ({e.reason}); "
               "start continues", file=sys.stderr)
     if not container_running(REGISTRY_CONTAINER):
         return

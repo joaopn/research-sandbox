@@ -281,6 +281,11 @@ MAILBOX_PATH_TOKEN = "{{MAILBOX_PATH}}"
 # shared/agent/, its skills homes are under /workspace itself).
 AGENT_NAME = "agent"
 BOX_IMAGE = "rs-sandbox-box:latest"
+# A box run whose image is not in the project (browser-reachable: no command).
+BOX_IMAGE_MISSING_MSG = ("box {name!r} cannot run: its box image is not in the "
+                         "project (the project's last start could not bring it up "
+                         "to date); restart the project, and if that fails, "
+                         "Rebuild all on Sandboxes → Software")
 # Browser variant: + @playwright/mcp + Chromium, wired into the box's claude.
 BOX_IMAGE_BROWSER = "rs-sandbox-box-browser:latest"
 # The browser image's baked stdio MCP server name(s). ⚠ MIRROR of
@@ -1885,7 +1890,7 @@ def _install_harness(cname: str, agents: list[str]) -> None:
     """Lay the working-mode suite (RS's doer/checker subagents, the harness
     skill, the standing-mode rules file) into a freshly run agent box, as the
     box user. Run from here rather than from the box image so it reaches boxes
-    whose project froze an older box image, and at every run, because a re-run
+    whose project has not been restarted since a rebuild, and at every run, because a re-run
     box starts from a fresh home. `agents` is what the box carries (the shared
     copy deploys the project's whole set); the box's mode and pairs come from
     its own environment (set at `docker run` from its entry).
@@ -2043,6 +2048,12 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
                 trust_args = ["-e", "RS_BOX_BROWSER=trusted",
                               "--mount", f"type=bind,source={policy},"
                                          f"target={MANAGED_SETTINGS_IN_BOX},readonly"]
+    # The box image must already be in the project: RS brings it in (a box add,
+    # a project start) and removes it when a start could not bring it up to
+    # date. A run never fetches one (`--pull never` below), and the container
+    # is left as it is when the image is missing.
+    if _docker("image", "inspect", image).returncode != 0:
+        die(BOX_IMAGE_MISSING_MSG.format(name=name))
     _docker("rm", "-f", cname)  # idempotent
     # Guard the mount so a missing source can't turn a box run into a cryptic mount
     # error; the box's entrypoint absence-guard surfaces it as "claude not found".
@@ -2237,7 +2248,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         # Each step checks its own rc; a cp/start failure removes the created
         # container so no Created husk sits behind the already-saved entry
         # (cmd_create writes the entry pre-run).
-        r = _docker("create", *common)
+        r = _docker("create", "--pull", "never", *common)
         if r.returncode != 0:
             die(f"docker create failed for box {name!r}:\n"
                 f"{(r.stderr or r.stdout).strip()}")
@@ -2258,7 +2269,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
                 f"{(r.stderr or r.stdout).strip()}")
     else:
         # No env file ⇒ the pre-existing single-step run, byte-identical.
-        r = _docker("run", "-d", *common)
+        r = _docker("run", "-d", "--pull", "never", *common)
         if r.returncode != 0:
             die(f"docker run failed for box {name!r}:\n"
                 f"{(r.stderr or r.stdout).strip()}")
@@ -2561,7 +2572,7 @@ def cmd_create(args: argparse.Namespace) -> None:
             die("a trusted browser needs the browser on")
         if not _image_supports_trusted(BOX_IMAGE_BROWSER):
             die("this project's browser box image predates trusted browsers; "
-                "a trusted browser box needs a new project")
+                "restart the project, then retry")
     # A fields preset needs its env file staged BEFORE the run. The sanctioned
     # path (the project's Add-box window) stages it; a direct in-supervisor run
     # is the power path — stage ~/.rs-box-env/<name>.env yourself.
