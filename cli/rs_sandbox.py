@@ -3334,11 +3334,6 @@ def cmd_start(args: argparse.Namespace) -> None:
         print(f"box {args.name!r}: re-run at {entry['ip']} "
               f"(its browser did not run in its recorded mode)")
         return
-    # A trusted browser box mounts the policy file from this home, which a
-    # recreate wiped: write it before a plain start (the container already
-    # passed the image check at its run). When it cannot be written, re-run
-    # instead — restricted, with a `browser` warning — rather than fail on
-    # docker's own mount error.
     # A box last run before RS staged its skills outside its workspace has no
     # staged-skills mount (fixed at docker run): re-run it.
     if exists and not _container_has_skills_mount(cname):
@@ -3346,6 +3341,11 @@ def cmd_start(args: argparse.Namespace) -> None:
         print(f"box {args.name!r}: re-run at {entry['ip']} "
               f"(it was run before its skills were kept outside its workspace)")
         return
+    # A trusted browser box mounts the policy file from this home, which a
+    # recreate wiped: write it before a plain start (the container already
+    # passed the image check at its run). When it cannot be written, re-run
+    # instead — restricted, with a `browser` warning — rather than fail on
+    # docker's own mount error.
     if exists and _entry_browser_trusted(entry) and _write_trusted_policy() is None:
         _print_warnings(args.name, _rerun_box(args.name, entry))
         print(f"box {args.name!r}: re-run at {entry['ip']} "
