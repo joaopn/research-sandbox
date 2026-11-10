@@ -9314,9 +9314,11 @@ def _refresh_running_boxes(supervisor: str, agents: "Sequence[str]", progress,
         # only regenerate .mcp.json wholesale at every Update (dropping servers
         # added by hand) and never record pi as wired. A box run before the
         # folder existed gets pi's servers at its next start (every start
-        # re-runs it with the folder), and says so; a box with the mark gets
-        # them once RS's old files are gone, which the operation's own
-        # old-files error names, so nothing more is said for it.
+        # re-runs it with the folder). A box with the mark gets them once RS's
+        # old files are gone: the mark is from its last run, so they may
+        # already be gone (the box tool clears the mark later in this same
+        # operation) or still there (the operation's old-files error names
+        # them); one message is true for both.
         if needs_render:
             mounted = run([*inner, box, "sh", "-c", f"[ -d {BOX_SKILLS_IN_BOX} ]"],
                           capture_output=True).returncode == 0
@@ -9327,6 +9329,9 @@ def _refresh_running_boxes(supervisor: str, agents: "Sequence[str]", progress,
                 needs_render = False
             if not mounted:
                 progress.step("agents", f"box {box}: pi gets its MCP servers at the box's next start")
+            elif marked:
+                progress.step("agents", f"box {box}: pi gets its MCP servers at the box's next start, "
+                                        f"once RS's old files are gone from its folder")
         if needs_render:
             env = dict(_agent_env("pi", _BOX_HOME))
             r = subprocess.run(
