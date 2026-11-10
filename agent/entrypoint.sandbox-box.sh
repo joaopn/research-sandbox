@@ -281,8 +281,10 @@ fi
 # (/opt/sandbox-box/denied-tools.json, the same list claude's managed settings
 # deny) are marked `hidden` in pi's per-tool exposure on that server's entry; a
 # TRUSTED one (RS_BOX_BROWSER=trusted on an image with the trusted declaration)
-# hides nothing and uses the unwrapped server declaration. Without pi: none of
-# the pi wiring. Nothing goes into /workspace/.pi/.
+# hides nothing and uses the unwrapped server declaration. The same keys stay on
+# the /workspace/.mcp.json entries (claude ignores them), so an old
+# /workspace/.pi/mcp.json link still in place carries the deny to pi too.
+# Without pi: none of the pi wiring. Nothing goes into /workspace/.pi/.
 # The render lives in agent/box-render-mcp.py (baked at this path): the host also
 # streams it into a RUNNING box when an agent change gives the box pi, so one
 # source serves the boot and the live wiring. A collision exits 1 = the boot stops.

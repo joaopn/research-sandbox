@@ -34,6 +34,9 @@ file is left alone with a warning; the render never fails over pi's file.
 Nothing is written into /workspace/.pi/. While the project marks this box's
 folder as still holding RS's old files (/opt/rs-box-skills/.old-files), pi's
 home file is not written: RS writes no new copy while an old one is there.
+The entries in /workspace/.mcp.json carry pi's keys too in a box with pi
+(claude ignores them): an old /workspace/.pi/mcp.json link still in place
+reads that file, and the restricted browser's deny must reach pi through it.
 
 In a restricted browser box that deploys pi, the image's denied tools
 (/opt/sandbox-box/denied-tools.json, {server: [tool, ...]} — the same list
@@ -439,8 +442,12 @@ def browser_section() -> str:
 
 def pi_servers() -> dict:
     """RS's servers as pi reads them: each with `exposure: direct` and, in a
-    restricted browser box, the denied tools hidden — copies, so
-    /workspace/.mcp.json (claude's) carries none of pi's keys."""
+    restricted browser box, the denied tools hidden (copies of the sources).
+    In a box with pi they go into pi's home settings AND /workspace/.mcp.json
+    (claude ignores both keys): a box from before RS kept pi's settings in its
+    home may still hold the old /workspace/.pi/mcp.json link until the operator
+    removes it, pi trusts /workspace and a project entry wins over the home
+    one, so the deny must reach pi through that file too — security first."""
     out: dict = {}
     for n, cfg in servers.items():
         c = dict(cfg) if isinstance(cfg, dict) else {}
@@ -454,7 +461,8 @@ def pi_servers() -> dict:
 
 
 if servers:
-    write_atomic(mcp_path, json.dumps({"mcpServers": servers}, indent=2, sort_keys=True) + "\n")
+    write_atomic(mcp_path, json.dumps({"mcpServers": pi_servers() if pi_agent_dir else servers},
+                                      indent=2, sort_keys=True) + "\n")
     rows = []
     for n, cfg in sorted(servers.items()):
         t = cfg.get("type", "?") if isinstance(cfg, dict) else "?"
