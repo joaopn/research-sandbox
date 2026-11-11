@@ -3978,7 +3978,8 @@ function devRenderPrReviewCell(cellEl, repo, p, v, ctx) {
         btn.onclick = () => {
             btn.disabled = true;
             devReviewDialog(ctx.view, ctx.body, repo, { pr: p.number },
-                            ctx.rerender, ctx.onLogin);
+                            ctx.rerender, ctx.onLogin,
+                            () => { btn.disabled = false; });
         };
         return btn;
     };
@@ -4162,7 +4163,8 @@ function devRenderCommitReviewCell(cell, repo, sha, v, ctx) {
             devReviewDialog(ctx.view, ctx.body, repo,
                             { commit: sha, pr: ctx.sel.pr,
                               branch: ctx.sel.branch },
-                            ctx.rerender, ctx.onLogin);
+                            ctx.rerender, ctx.onLogin,
+                            () => { rbtn.disabled = false; });
         };
         return rbtn;
     };
@@ -4722,9 +4724,17 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
 // the background watcher (commit cells via devRefreshCommitCells, PR cells
 // via devResolvePrReviewCell; "done — refresh" survives only as the degraded
 // fallback). With the box left OPEN, opts.onTerminal resolves the cells the
-// moment the terminal lands. A review already running for this subject no-ops up
-// front: the modal guard only stops concurrent DIALOGS, not a duplicate of a
-// detached review a stale row still offers.
+// moment the terminal lands. A review already running for this subject opens
+// no box: the modal guard only stops concurrent DIALOGS, not a duplicate of a
+// detached review a stale row still offers — that stale row is repainted to
+// "reviewing…" from the registry instead, and the running review's watcher
+// resolves it like any other in-flight review.
+// `onAbort` (optional) runs on every exit that does NOT start a review —
+// another box open, the broker unreachable, a session/availability landing,
+// the refusal box closed (Close or a backdrop click), a box dismissed before
+// a refused POST answered — so the caller re-enables the Review button it
+// disabled on click. A started review never calls it: the cell repaint
+// (reviewing…, then the verdict) replaces that button.
 // `rerender` (optional) is the landing for the click-driven "done — refresh"
 // fallback and for dialogs opened from repainted cells (fires with view/body
 // intact): the Development page passes its Fetch-tab re-render, the
@@ -4736,11 +4746,13 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
 // any body-scoped target — so the scoped pane (where view === the pane
 // container) passes its own renderer and Development passes NOTHING (the
 // pre-slice Management landing). The two are deliberately distinct values.
-async function devReviewDialog(view, body, repo, sel, rerender, onLogin) {
+async function devReviewDialog(view, body, repo, sel, rerender, onLogin,
+                               onAbort) {
     const loc = sel.commit ? sel.commit : "#" + String(sel.pr);
     const key = devReviewKey(repo, loc);
-    if (devReviewsInFlight.has(key)) return;
-    if (document.querySelector(".modal-backdrop")) return;
+    const abort = () => { if (onAbort) onAbort(); };
+    if (devReviewsInFlight.has(key)) { devMarkReviewingCells(key); return; }
+    if (document.querySelector(".modal-backdrop")) { abort(); return; }
     const onDone = rerender || (() => renderDevFetchTab(view, body));
     const title = sel.commit
         ? `Review ${repo} @${sel.commit.slice(0, 9)}`
@@ -4789,8 +4801,9 @@ async function devReviewDialog(view, body, repo, sel, rerender, onLogin) {
         dismissed = true;
         backdrop.remove();
         // Pre-op dismissal (the POST is still pending): the continuation
-        // below registers a successfully started op, or silently drops a
-        // refusal — the row then still offers Review, the honest state.
+        // below registers a successfully started op, or drops a refusal and
+        // re-enables the button (onAbort) — the row then still offers Review,
+        // the honest state.
         // Post-terminal dismissal: the cells already resolved via onTerminal —
         // re-registering would flash "reviewing…" and mint a watcher whose
         // registry entry lies until its first poll.
@@ -4808,6 +4821,7 @@ async function devReviewDialog(view, body, repo, sel, rerender, onLogin) {
             }),
         });
     } catch (e) {
+        abort();
         if (dismissed) return;
         backdrop.remove();
         return renderMgmtUnavailable(body);
@@ -4817,10 +4831,11 @@ async function devReviewDialog(view, body, repo, sel, rerender, onLogin) {
         // hand a successfully started op to the watcher.
         let b2; try { b2 = await res.json(); } catch (e) { b2 = {}; }
         if (b2.ok && b2.op_id) { opId = b2.op_id; registerDetached(); }
+        else abort();
         return;
     }
     const redirect = mgmtStatusRedirect(view, res.status, onLogin);
-    if (redirect) { backdrop.remove(); return redirect(); }
+    if (redirect) { backdrop.remove(); abort(); return redirect(); }
     let b; try { b = await res.json(); } catch (e) { b = {}; }
     if (!b.ok || !b.op_id) {
         card.innerHTML = "";
@@ -4828,7 +4843,12 @@ async function devReviewDialog(view, body, repo, sel, rerender, onLogin) {
         card.appendChild(el("div", { class: "error" },
                             ["Could not start the review: " + mgmtErrText(b)]));
         const close = el("button", { class: "btn btn-secondary" }, ["Close"]);
-        close.onclick = () => backdrop.remove();
+        // No op started, so either way out of the refusal box — Close or a
+        // backdrop click (which would otherwise still run dismiss) — gives
+        // the button back.
+        const closeRefused = () => { backdrop.remove(); abort(); };
+        close.onclick = closeRefused;
+        backdrop.onclick = (e) => { if (e.target === backdrop) closeRefused(); };
         card.appendChild(el("div", { class: "btn-row" }, [close]));
         return;
     }
