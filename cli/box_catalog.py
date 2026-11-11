@@ -58,13 +58,21 @@ FIELD_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 RESERVED_FIELD_PREFIXES = ("RS_", "GITEA_", "ANTHROPIC_", "CLAUDE_")
 RESERVED_FIELD_NAMES = frozenset({"PATH", "HOME", "USER", "SHELL", "TERM",
                                   "LOGNAME"})
-# ${NAME} / ${NAME:-default} tokens inside mcp_servers env values. The DELIVERY
-# CONTRACT (spike-verified on the discovery path at the pinned agent version):
-# the agent expands these from its own environment at config load — the staging
-# side never expands, so no field VALUE ever lands in a workspace file. Every
+# ${NAME} tokens inside mcp_servers env values. The DELIVERY CONTRACT
+# (spike-verified on the discovery path at the pinned agent version): the agent
+# expands these from its own environment at config load — the staging side
+# never expands, so no field VALUE ever lands in a workspace file. Every
 # reference must name a DECLARED field (kills the typo-expands-to-nothing
 # class), and references are ENV-ONLY: a ${ in command/args is rejected, so a
 # value can never reach the in-box argv (the security invariant stays literal).
+# The only accepted reference form is ${NAME} with NAME a declared field: pi
+# reads every other $/! form differently from Claude Code's substitution, so
+# _validate_entry refuses them (measured on pi 1.5.0):
+#   ${NAME:-default}  pi keeps it as literal text; claude applies the default
+#   $NAME             pi expands it; claude keeps it as text
+#   $$ and $!         pi turns them into $ and !; claude keeps them
+#   leading !         pi RUNS the value as a shell command; claude passes text
+# Every field is required and non-empty, so a :-default could never apply.
 _FIELD_REF_RE = re.compile(r"\$\{([^}]*)\}")
 
 # The browser image's baked stdio MCP server name(s) — source of truth is
@@ -258,11 +266,14 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
                     out.append(q(f"unknown keys: {sorted(fextras)}"))
 
     # mcp_servers: preset-declared stdio MCP entries. DELIVERY CONTRACT for
-    # field values: ${NAME}/${NAME:-default} references in env VALUES, expanded
-    # by the AGENT at config load (never by staging — no value ever lands in a
-    # workspace file). References are env-only and must name declared fields;
-    # a ${ in command/args is rejected outright so a field value can never
-    # reach the in-box argv.
+    # field values: ${NAME} references in env VALUES, expanded by the AGENT at
+    # config load (never by staging — no value ever lands in a workspace file).
+    # References are env-only and must name declared fields; a ${ in
+    # command/args is rejected outright so a field value can never reach the
+    # in-box argv. An env value is literal text plus ${NAME} references only:
+    # no other $ in it and no leading !, because pi reads those differently
+    # from Claude Code (see _FIELD_REF_RE). Errors name the env KEY, never the
+    # value (a preset may carry a literal secret in env).
     if "mcp_servers" in m:
         ms = m["mcp_servers"]
         if not isinstance(ms, dict):
@@ -291,13 +302,34 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
                                     for k, v in cfg["env"].items())):
                         out.append(q("env must be an object of string values"))
                     else:
-                        for ev in cfg["env"].values():
+                        for ek, ev in cfg["env"].items():
+                            if ev.startswith("!"):
+                                out.append(q(
+                                    f"env {ek!r} starts with '!', which pi "
+                                    f"runs as a shell command while Claude "
+                                    f"Code passes it as text; a preset env "
+                                    f"value cannot start with '!'"))
+                            bad_form = False
                             for tok in _FIELD_REF_RE.findall(ev):
-                                ref = tok.split(":-", 1)[0]
-                                if ref not in declared_fields:
+                                if not FIELD_NAME_RE.fullmatch(tok):
+                                    bad_form = True
+                                elif tok not in declared_fields:
                                     out.append(q(
                                         f"env references undeclared field "
-                                        f"{ref!r} (declare it in fields)"))
+                                        f"{tok!r} (declare it in fields)"))
+                            if bad_form:
+                                out.append(q(
+                                    f"env {ek!r} has a reference other than "
+                                    f"${{FIELD}} (such as "
+                                    f"${{FIELD:-default}}), which pi reads as "
+                                    f"literal text; every field is required, "
+                                    f"so write ${{FIELD}}"))
+                            if "$" in _FIELD_REF_RE.sub("", ev):
+                                out.append(q(
+                                    f"env {ek!r} has a '$' outside a "
+                                    f"${{FIELD}} reference; pi expands $NAME "
+                                    f"and turns $$ and $! into $ and !, where "
+                                    f"Claude Code keeps them as text"))
                 cextras = set(cfg) - {"command", "args", "env"}
                 if cextras:
                     out.append(q(f"unknown keys: {sorted(cextras)}"))
