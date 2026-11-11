@@ -4961,6 +4961,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         # 6. Wait for inner dockerd, then stage the inner images.
         progress.step("stage-images", "staging inner images")
         wait_for_inner_dockerd(container_name)
+        _check_inner_cgroup_delegation(container_name, dind_mode)
         is_management = project_type == PROJECT_TYPE_SANDBOX_DIND
         if is_management:
             # Sandbox-dind is the docker `sandbox` flavor + DIND
@@ -7211,6 +7212,53 @@ def wait_for_inner_dockerd(container: str, timeout: int = 60) -> None:
         time.sleep(1)
     die(f"inner dockerd did not become ready within {timeout}s "
         f"(check `docker logs {container}` and `docker exec {container} sudo cat /tmp/dockerd.log`)")
+
+
+# Reads the container's root cgroup: the controllers it may hand down and the
+# ones it did. Markers instead of line counts, because an empty
+# cgroup.subtree_control is zero bytes (no newline) on a real kernel, and the
+# separator starts with a newline so it cannot glue onto the last controller.
+_CGROUP_DELEGATION_PROBE = (
+    "set -e; if [ -f /sys/fs/cgroup/cgroup.controllers ]; then "
+    "echo controllers:; cat /sys/fs/cgroup/cgroup.controllers; "
+    'printf "\\nsubtree:\\n"; cat /sys/fs/cgroup/cgroup.subtree_control; '
+    "else echo cgroup-v1; fi"
+)
+
+
+def _check_inner_cgroup_delegation(container: str, dind_mode: str) -> None:
+    """Refuse to finish a privileged create/start whose cgroup controllers
+    were not delegated by the entrypoint (B124).
+
+    Without delegation the project's inner runtime cannot place any box
+    ("controller 'io' is not available") and box resource limits do not
+    apply. Under sysbox the entrypoint step is redundant best-effort, so no
+    probe is issued there. Called after the inner dockerd answered, so the
+    entrypoint's delegation step has already run."""
+    if dind_mode != "privileged":
+        return
+    r = run(["docker", "exec", container, "sh", "-c", _CGROUP_DELEGATION_PROBE],
+            capture_output=True)
+    if r.returncode != 0:
+        die("The project started, but the state of its resource controls "
+            f"could not be read: {(r.stderr or '').strip() or 'no detail'}")
+    tokens = (r.stdout or "").split()
+    if tokens == ["cgroup-v1"]:
+        return
+    if not tokens or tokens[0] != "controllers:" or tokens.count("subtree:") != 1:
+        die("The project started, but the state of its resource controls "
+            f"came back in an unexpected form: {(r.stdout or '').strip()!r}")
+    sep = tokens.index("subtree:")
+    controllers, delegated = tokens[1:sep], set(tokens[sep + 1:])
+    missing = [c for c in controllers if c not in delegated]
+    if missing:
+        die("The project started, but its resource controls were not handed "
+            "down to the boxes inside it (missing: "
+            f"{', '.join(missing)}). No box can start in this project, and box "
+            "resource limits would not apply. Stop the project and start it "
+            "again. If this message returns after a restart, this host does "
+            "not give resource control to privileged projects, and boxes "
+            "cannot run in this project here.")
 
 
 # The editor deploy cp's ~100-150MB into the container's ~/.local and launches the
@@ -11482,6 +11530,7 @@ def _recreate_supervisor(
     # named volume that survives rm; stage_worker_image is a no-op there
     # unless `force_restage` (i.e. images were rebuilt on the host).
     wait_for_inner_dockerd(container)
+    _check_inner_cgroup_delegation(container, md["dind_mode"])
     run(["docker", "exec", container, "docker", "rm", "-f", "mcp-proxy"],
         capture_output=True)
     # Sandbox flavor stages the blank box image (no analysis workers); see

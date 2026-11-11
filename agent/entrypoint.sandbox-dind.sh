@@ -137,16 +137,16 @@ if [[ "${DOCKER_DIND:-}" == "true" ]] && command -v dockerd >/dev/null 2>&1; the
     echo "Starting dockerd..."
     sudo rm -f /var/run/docker.pid /var/run/docker.sock
     # cgroup v2 nesting (the upstream docker-in-docker boot dance): a cgroup
-    # with processes cannot enable subtree controllers, and only sysbox sets
-    # delegation up for us — under --privileged the inner runtime tolerates
-    # the missing controllers and silently runs containers with NO resource
-    # limits. Move everything started so far into /init and delegate. Every
-    # write is best-effort (`|| :`): under sysbox this is redundant and any
-    # refused write must never regress the boot. MIRROR block — byte-identical
-    # in entrypoint.supervisor.sh (each dind leaf boots its substrate
-    # independently); pytest-pinned.
+    # with processes cannot enable subtree controllers; without delegation
+    # --privileged inner containers run with NO resource limits. Move the
+    # root's processes into /init and delegate; a process entering the root
+    # after the move (a host `docker exec`) fails the write busy, so the pass
+    # repeats while the root's process list changes (read with a builtin: a
+    # forked reader would sit in the root). Never fatal (`|| :`); redundant
+    # under sysbox; the host checks the outcome. MIRROR block — byte-identical
+    # in entrypoint.supervisor.sh; pytest-pinned.
     if [[ -f /sys/fs/cgroup/cgroup.controllers ]]; then
-        sudo sh -c 'mkdir -p /sys/fs/cgroup/init || :; xargs -rn1 < /sys/fs/cgroup/cgroup.procs > /sys/fs/cgroup/init/cgroup.procs || :; sed -e "s/ / +/g" -e "s/^/+/" < /sys/fs/cgroup/cgroup.controllers > /sys/fs/cgroup/cgroup.subtree_control || :'
+        sudo sh -c 'mkdir -p /sys/fs/cgroup/init || :; p=-; while :; do xargs -rn1 < /sys/fs/cgroup/cgroup.procs > /sys/fs/cgroup/init/cgroup.procs || :; sed -e "s/ / +/g" -e "s/^/+/" < /sys/fs/cgroup/cgroup.controllers > /sys/fs/cgroup/cgroup.subtree_control && break; q=; while read -r x; do q="$q $x"; done < /sys/fs/cgroup/cgroup.procs || break; [ "$q" != "$p" ] || break; p=$q; done' || :
     fi
     sudo sh -c "dockerd $DNS_FLAGS > /tmp/dockerd.log 2>&1 &"
     for _ in $(seq 1 30); do
