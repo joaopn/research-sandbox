@@ -119,8 +119,9 @@ def resolve_wiring():
     dev_json = (Path(os.environ.get("RS_WORKSPACE") or "/workspace")
                 / ".orchestrator" / "dev-gitea.json")
     if not dev_json.is_file():
-        raise RuntimeError(f"no dev wiring ({dev_json} missing); run "
-                           f"'research dev attach <project> --repo <repo>' first")
+        raise RuntimeError(f"no dev wiring ({dev_json} missing): this container is not a dev project or dev box, "
+                           f"or its dev wiring was never staged; on a dev project, ask the operator to restart it "
+                           f"(Stop, then Start, in Sandboxes → Management), which stages the wiring again")
     try:
         data = json.loads(dev_json.read_text())
     except (OSError, ValueError) as e:
@@ -128,8 +129,8 @@ def resolve_wiring():
     rows = [r for r in (data.get("repos") or [])
             if isinstance(r, dict) and r.get("repo") and r.get("agent_user")]
     if not rows:
-        raise RuntimeError("this project's own agent works no repo (box-only wiring?); "
-                           "run 'research dev attach' first")
+        raise RuntimeError("this project's own agent works no repository (its dev wiring names none for it): "
+                           "this is not a dev project; if one of its dev boxes works the repository, run this inside that box")
     row = rows[0]
     token_base = row.get("token_file") or row["agent_user"] + ".token"
     token_file = Path.home() / ".dev-tokens" / token_base
@@ -138,8 +139,9 @@ def resolve_wiring():
     except OSError:
         token = ""
     if not token:
-        raise RuntimeError(f"token missing at {token_file}; re-run 'research dev attach' "
-                           f"(it re-stages the token)")
+        raise RuntimeError(f"token missing at {token_file}: this project's dev-lane access token is not staged; "
+                           f"ask the operator to restart the project (Stop, then Start, in Sandboxes → Management), "
+                           f"which stages it again")
     return DEV_GITEA_URL + "/api/v1", token, row["agent_user"], row["repo"], row["agent_user"]
 
 
@@ -221,7 +223,7 @@ def check_version(g):
         raise RuntimeError(f"could not parse the Gitea version {text!r}; refusing to guess whether it has project boards")
     if int(m.group(1)) < BOARDS_MIN_MAJOR:
         raise RuntimeError(f"the shared Gitea is {text}; project boards need Gitea {BOARDS_MIN_MAJOR}.x or newer — "
-                           f"upgrade it from Sandboxes → Infrastructure → Upgrade (or `research dev gitea-upgrade` on the host)")
+                           f"upgrade it from Sandboxes → Infrastructure → Upgrade")
     return text
 
 

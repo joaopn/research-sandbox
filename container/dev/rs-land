@@ -112,8 +112,10 @@ def resolve_wiring() -> None:
     dev_json = (Path(os.environ.get("RS_WORKSPACE") or "/workspace")
                 / ".orchestrator" / "dev-gitea.json")
     if not dev_json.is_file():
-        die(f"no dev wiring ({dev_json} missing); run "
-            f"'research dev attach <project> --repo <repo>' first")
+        die(f"no dev wiring ({dev_json} missing): this container is not a "
+            f"dev project or dev box, or its dev wiring was never staged; on a "
+            f"dev project, ask the operator to restart it (Stop, then Start, "
+            f"in Sandboxes → Management), which stages the wiring again")
     try:
         data = json.loads(dev_json.read_text())
     except (OSError, ValueError) as e:
@@ -124,8 +126,9 @@ def resolve_wiring() -> None:
     rows = [r for r in (data.get("repos") or [])
             if isinstance(r, dict) and r.get("repo") and r.get("agent_user")]
     if not rows:
-        die("this project's own agent works no repo (box-only wiring?); "
-            "run 'research dev attach' first")
+        die("this project's own agent works no repository (its dev wiring "
+            "names none for it): this is not a dev project; if one of its dev "
+            "boxes works the repository, run this inside that box")
     row = rows[0]
     token_base = row.get("token_file") or row["agent_user"] + ".token"
     token_file = Path.home() / ".dev-tokens" / token_base
@@ -134,8 +137,10 @@ def resolve_wiring() -> None:
     except OSError:
         token = ""
     if not token:
-        die(f"token missing at {token_file}; re-run 'research dev attach' "
-            f"(it re-stages the token)")
+        die(f"token missing at {token_file}: this project's dev-lane access "
+            f"token is not staged; ask the operator to restart the project "
+            f"(Stop, then Start, in Sandboxes → Management), which stages it "
+            f"again")
     _WIRING.update(url=DEV_GITEA_URL, token=token,
                    user=row["agent_user"], repo=row["repo"])
 
