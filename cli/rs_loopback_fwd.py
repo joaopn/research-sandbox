@@ -6,8 +6,8 @@ many dev servers, notebook servers, and multi-process apps bind 127.0.0.1 by
 default, which is unreachable from outside the container's netns — that
 invisibility IS the container boundary. This tool, staged + launched by the host
 reconcile (rscore._reconcile_loopback_bridges) ONLY for an operator-registered
-exported port, republishes 127.0.0.1:<port> onto the box's own bridge IP at the
-SAME port, so the webui reaches it at rs-project-<name>:<port> exactly as it
+exported port, republishes the loopback service (127.0.0.1:<port>, else
+[::1]:<port>) onto the box's own bridge IP at the SAME port, so the webui reaches it at rs-project-<name>:<port> exactly as it
 reaches a 0.0.0.0-bound service. It never touches the host netns and runs entirely
 inside the box.
 
@@ -35,6 +35,15 @@ from pathlib import Path
 # rather than buffering whole. 64 KiB is a common pipe / TCP-window chunk.
 _CHUNK = 65536
 _PIDFILE_DIR = Path("/tmp/rs-loopback-fwd")
+# The loopback addresses a registered port's app may listen on, dialled in this
+# order per client connection. 127.0.0.1 first: the F3 contract is that a
+# registered port is assumed 127.0.0.1-bound, so that stays the primary case (and
+# decides which app wins if two different apps hold 127.0.0.1:<port> and
+# [::1]:<port>). ::1 second: in RS containers `localhost` resolves to ::1 before
+# 127.0.0.1, so a dev server started on its `localhost` default listens there and
+# was unreachable before this fallback. On a container with IPv6 off on lo the ::1
+# dial raises OSError like a refusal and is skipped.
+_LOOPBACK_HOSTS = ("127.0.0.1", "::1")
 
 
 def _bridge_ip() -> str:
@@ -63,12 +72,18 @@ async def _pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> N
 
 async def _handle(client_reader: asyncio.StreamReader,
                   client_writer: asyncio.StreamWriter, port: int) -> None:
-    try:
-        backend_reader, backend_writer = await asyncio.open_connection(
-            "127.0.0.1", port)
-    except OSError:
-        # App not up yet (ConnectionRefused) or gone — drop this client, keep
-        # serving; it resolves once the app starts listening.
+    for host in _LOOPBACK_HOSTS:
+        try:
+            backend_reader, backend_writer = await asyncio.open_connection(
+                host, port)
+            break
+        except OSError:
+            # Refused (nothing on this address) or the address is unavailable —
+            # try the next loopback address.
+            continue
+    else:
+        # No loopback address answered: app not up yet or gone — drop this
+        # client, keep serving; it resolves once the app starts listening.
         client_writer.close()
         return
     await asyncio.gather(
