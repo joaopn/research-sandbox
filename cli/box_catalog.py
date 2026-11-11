@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import re
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,10 @@ from typing import Any
 BUILTIN_DIR = Path(__file__).resolve().parent.parent / "boxes"
 REGISTRY_DIR = Path.home() / ".research-sandbox"
 REGISTRY_PATH = REGISTRY_DIR / "box-registry.json"
+# How a refusal names the registry. Browser-reachable (the broker relays a
+# BoxCatalogError's text verbatim), so it carries the file's NAME only, never
+# its folder: a host path must not reach the browser.
+REGISTRY_TEXT = f"the box type registry on the host ({REGISTRY_PATH.name})"
 
 VERSION = 1
 
@@ -425,6 +430,21 @@ def empty_registry() -> dict[str, Any]:
     return {"version": VERSION, "boxes": {}}
 
 
+def _read_builtin(f: Path) -> str:
+    """One of RS's own box type files, as UTF-8 text. A read or decode failure
+    is a BoxCatalogError naming the file's name only (the text reaches the
+    browser; the folder is a host path)."""
+    try:
+        return f.read_text(encoding="utf-8")
+    except OSError as e:
+        raise BoxCatalogError(
+            f"RS's built-in box type file {f.name} cannot be read "
+            f"({e.strerror or 'read failed'})") from e
+    except UnicodeDecodeError as e:
+        raise BoxCatalogError(
+            f"RS's built-in box type file {f.name} is not UTF-8 text") from e
+
+
 def load_builtins(builtin_dir: Path = BUILTIN_DIR) -> dict[str, dict]:
     """Read + validate every boxes/<name>.json built-in, folding the sibling
     boxes/<name>.instructions.md (if present) into `instructions`. Raises
@@ -433,17 +453,22 @@ def load_builtins(builtin_dir: Path = BUILTIN_DIR) -> dict[str, dict]:
     if not builtin_dir.is_dir():
         return out
     for f in sorted(builtin_dir.glob("*.json")):
+        text = _read_builtin(f)
         try:
-            m = json.loads(f.read_text())
+            m = json.loads(text)
         except json.JSONDecodeError as e:
             raise BoxCatalogError(f"builtin {f.name}: not valid JSON: {e}") from e
+        except (ValueError, RecursionError) as e:
+            raise BoxCatalogError(
+                f"builtin {f.name}: not valid JSON (nested too deeply or out "
+                f"of range)") from e
         if isinstance(m, dict) and "instructions" in m:
             raise BoxCatalogError(
                 f"builtin {f.name}: 'instructions' belongs in the sibling "
                 f"{f.stem}.instructions.md, not the JSON")
         sidecar = builtin_dir / f"{f.stem}.instructions.md"
         if isinstance(m, dict):
-            m["instructions"] = sidecar.read_text() if sidecar.is_file() else ""
+            m["instructions"] = _read_builtin(sidecar) if sidecar.is_file() else ""
         for key, suffix in SKILL_SIDECARS.items():
             if isinstance(m, dict) and key in m:
                 raise BoxCatalogError(
@@ -453,7 +478,7 @@ def load_builtins(builtin_dir: Path = BUILTIN_DIR) -> dict[str, dict]:
             # Folded only when the sidecar exists: the validator requires a
             # non-empty text, and most presets carry no skill at all.
             if isinstance(m, dict) and skill_file.is_file():
-                m[key] = skill_file.read_text()
+                m[key] = _read_builtin(skill_file)
         errs = _validate_entry(f.stem, m)
         if errs:
             raise BoxCatalogError(f"builtin {f.name}: " + "; ".join(errs))
@@ -483,13 +508,44 @@ def load_builtins(builtin_dir: Path = BUILTIN_DIR) -> dict[str, dict]:
 def load_registry(path: Path = REGISTRY_PATH) -> dict[str, dict]:
     """Read + validate the host-side BYO box registry. Missing file → {}. Entries
     are keyed by name and must NOT repeat it; the key is injected as `name` before
-    per-entry validation so one validator serves both shapes."""
-    if not path.is_file():
-        return {}
+    per-entry validation so one validator serves both shapes.
+
+    Every failure is a BoxCatalogError whose text carries no path (it reaches
+    the browser through the broker): an unreadable file or folder, something
+    other than a regular file at the path, bytes that are not UTF-8, or text
+    that is not JSON. Missing (a dangling link included) is "no operator
+    types", never a refusal. The existence check is an explicit stat() rather
+    than is_file(), whose handling of an unreadable folder differs across
+    Python versions (3.14 swallows it and would hide the operator's types)."""
     try:
-        data = json.loads(path.read_text())
+        st = path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return {}
+    except OSError as e:
+        raise BoxCatalogError(
+            f"{REGISTRY_TEXT} cannot be read ({e.strerror or 'read failed'})") from e
+    if not stat.S_ISREG(st.st_mode):
+        raise BoxCatalogError(f"{REGISTRY_TEXT} is not a file")
+    try:
+        raw = path.read_bytes()
+    except OSError as e:
+        raise BoxCatalogError(
+            f"{REGISTRY_TEXT} cannot be read ({e.strerror or 'read failed'})") from e
+    # Decoded explicitly (JSON is UTF-8): json.loads on bytes would guess a
+    # UTF-16 encoding from a byte-order mark. UnicodeDecodeError and
+    # JSONDecodeError are both ValueErrors, so they are caught first.
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except UnicodeDecodeError as e:
+        raise BoxCatalogError(f"{REGISTRY_TEXT} is not UTF-8 text") from e
     except json.JSONDecodeError as e:
-        raise BoxCatalogError(f"registry not valid JSON: {path}: {e}") from e
+        raise BoxCatalogError(
+            f"{REGISTRY_TEXT} is not valid JSON (line {e.lineno} column "
+            f"{e.colno}: {e.msg})") from e
+    except (ValueError, RecursionError) as e:
+        raise BoxCatalogError(
+            f"{REGISTRY_TEXT} is not valid JSON (nested too deeply or out of "
+            f"range)") from e
     errs = _validate_envelope(data)
     if errs:
         raise BoxCatalogError("registry validation failed:\n  " + "\n  ".join(errs))
@@ -536,8 +592,20 @@ def load_catalog(builtin_dir: Path = BUILTIN_DIR,
     """The box-preset catalog: built-ins + BYO, normalized to a single list of
     manifests sorted by name, each tagged with a non-schema `source`
     ('builtin'|'byo'). A BYO name shadowing a built-in is an error, not a silent
-    override (mirrors workflow.load_catalog)."""
-    builtins = load_builtins(builtin_dir)
+    override (mirrors workflow.load_catalog).
+
+    Raises only BoxCatalogError for a file it cannot read or parse, with a
+    pathless text: callers map it to a refusal and need no other catch."""
+    try:
+        builtins = load_builtins(builtin_dir)
+    except BoxCatalogError:
+        raise
+    except (OSError, ValueError, RecursionError) as e:
+        # The folder check, its listing and the sidecar checks in
+        # load_builtins sit outside _read_builtin; a broken RS install there
+        # still answers with a refusal, built from strerror, never str(e).
+        why = getattr(e, "strerror", None) or "a file is unreadable or malformed"
+        raise BoxCatalogError(f"RS's built-in box types cannot be read ({why})") from e
     byo = load_registry(registry_path)
     catalog: list[dict] = []
     for _nm, m in builtins.items():

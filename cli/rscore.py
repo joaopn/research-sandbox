@@ -16374,8 +16374,10 @@ def _stage_box_catalog(workspace_path: "Path", *, strict: bool) -> list[dict]:
     load (closing the unguarded-second-load-site gap). Host-side write into the
     bind-mounted workspace dir (atomic-rename → visible to the supervisor
     immediately; a parent-dir mount, not a single-file mount). Q1→live: box_add
-    refreshes it (strict=True → BoxCatalogError surfaces, the caller maps it to
-    ValidationError); create/recreate stage it best-effort (strict=False → a
+    refreshes it (strict=True → a box types file that cannot be read or parsed
+    surfaces as BoxCatalogError with a pathless text, the caller maps it to
+    ValidationError; a folder or write failure is raised as ValidationError
+    here); create/recreate stage it best-effort (strict=False → a
     malformed or unreadable box-registry.json leaves the catalog staged before
     as it is, warns and returns the built-ins; nothing blocks the lifecycle
     verb)."""
@@ -16410,9 +16412,13 @@ def _stage_box_catalog(workspace_path: "Path", *, strict: bool) -> list[dict]:
         if strict:
             raise ValidationError(str(e))
         print(f"warning: the box types were not staged: {e}", file=sys.stderr)
-    except OSError:
+    except OSError as e:
         if strict:
-            raise
+            # Browser-reachable: built from strerror, never str(e) (the
+            # workspace path).
+            raise ValidationError(
+                "the box types could not be written into the project's "
+                f"settings folder ({e.strerror or 'write failed'})") from e
         print("warning: the box types could not be written into the project's "
               "settings folder; its boxes keep the ones staged before",
               file=sys.stderr)
@@ -19362,7 +19368,9 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         _refuse_box_leftover_instructions(workspace_path, req.name)
     # Refresh the staged box-preset catalog (Q1→live: an operator-registered type in
     # box-registry.json becomes usable on this already-created project). strict=True
-    # → a malformed registry surfaces as ValidationError, not a half-built box.
+    # → a malformed or unreadable registry surfaces as ValidationError, not a
+    # half-built box; the catalog loader raises only BoxCatalogError, and its
+    # text names no host path.
     try:
         staged = _stage_box_catalog(workspace_path, strict=True)
     except box_catalog.BoxCatalogError as e:
@@ -20256,9 +20264,9 @@ def box_presets(req: "BoxPresetsRequest", _progress=None) -> BoxPresetsResult:  
     """The box-preset catalog (built-ins + the operator box-registry) + the
     project's allowed MCP names — drives the webui box window (preset cards + MCP
     picker). Gated on a running dind supervisor (boxes are a dind feature).
-    `box_catalog.load_catalog()` can raise `BoxCatalogError` on a malformed
-    box-registry.json — map it to ValidationError so it can't escape `dispatch`
-    (the verb-fn-raise rule)."""
+    `box_catalog.load_catalog()` raises `BoxCatalogError` (pathless text) for
+    any box types file it cannot read or parse — map it to ValidationError so
+    it can't escape `dispatch` (the verb-fn-raise rule)."""
     _running_dind_supervisor(req.project)
     cfg = load_config()
     try:
