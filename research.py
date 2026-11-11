@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime
+import errno
 import ipaddress
 import json
 import os
@@ -1935,17 +1936,47 @@ def _webui_probe_ports(bind: str, ports: list[int]) -> None:
     any `docker rm -f` of the old webui (so its own docker-proxy binds don't
     read as squatters) and immediately before `compose up`; docker's own bind
     at `up` stays the authoritative TOCTOU backstop for the probe→up race.
-    `bind` is never every address: `webui start` refuses that first (B162)."""
+    `bind` is never every address: `webui start` refuses that first (B162).
+    The socket family follows the bind (an IPv6 literal, bare or bracketed,
+    probes with an IPv6 socket), and only a port already in use counts as
+    busy: any other bind failure (an address this host does not have, IPv6
+    unavailable, a port this account may not bind) dies at once, named as
+    what it is, never reported as a held port (B187)."""
+    try:
+        addr = rscore.webui_bind_address(bind)
+    except ValidationError as e:
+        die(str(e))
+    family = socket.AF_INET6 if addr.version == 6 else socket.AF_INET
+    host = str(addr)
     busy = []
     for p in ports:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind((bind, p))
-        except OSError:
-            busy.append(p)
-        finally:
-            s.close()
+            with socket.socket(family, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind((host, p))
+        except OSError as e:
+            if e.errno == errno.EADDRINUSE:
+                busy.append(p)
+                continue
+            reason = e.strerror or str(e)
+            if e.errno == errno.EACCES:
+                die(f"cannot check webui port {p} on {bind}: binding it was "
+                    f"refused ({reason}).\n"
+                    "  This account may not bind ports below the host's "
+                    "unprivileged-port limit\n"
+                    "  (net.ipv4.ip_unprivileged_port_start), so the port "
+                    "cannot be checked; docker may still\n"
+                    "  be able to publish it. Move the webui's ports above "
+                    "that limit: WEBUI_PORT (or --port)\n"
+                    "  and the WEBUI_ORIGIN_PORT_LO/HI and "
+                    "WEBUI_PASSTHROUGH_PORT_LO/HI ranges in .env, then\n"
+                    "  re-run `research webui start`.")
+            die(f"cannot check webui port {p} on {bind}: binding it failed "
+                f"({reason}).\n"
+                "  WEBUI_BIND must be an address of this host that accepts "
+                "connections: set it in .env,\n"
+                "  or pass --bind <address>, then re-run "
+                "`research webui start`.")
     if busy:
         lo, hi = _webui_origin_port_range()
         try:
