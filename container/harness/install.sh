@@ -6,7 +6,7 @@
 # temp file + rename, so a reader never sees half a file):
 #   Claude Code (claude in RS_HARNESS_AGENTS):
 #     ~/.claude/agents/doer.md, ~/.claude/agents/checker.md
-#     ~/.claude/skills/harness/{SKILL.md,modes/direct.md,modes/planner-doer-checker.md}
+#     ~/.claude/skills/harness/{SKILL.md,modes/<mode>.md for every staged mode}
 #   pi (pi in RS_HARNESS_AGENTS), under pi's agent dir:
 #     agents/doer.md, agents/checker.md, skills/harness/{…same…}
 #   either (any agent): ~/.claude/rules/rs-harness.md — the standing mode.
@@ -20,7 +20,9 @@
 #                                     space or comma separated) — told by the
 #                                     caller, never guessed from ~/.local/bin (a
 #                                     box may still be copying its agent)
-#   RS_HARNESS_MODE                   none | direct | planner-doer-checker (else none)
+#   RS_HARNESS_MODE                   none, or a mode this staged suite carries
+#                                     (modes/<mode>.md; the host generated them
+#                                     from RS's catalog, modes.json) — else none
 #   RS_HARNESS_DOER_MODEL             Claude tier for doer (empty: the session's)
 #   RS_HARNESS_CHECKER_MODEL          Claude tier for checker
 #   RS_HARNESS_PI_DOER_MODEL          pi provider/model for doer (empty: pi's default)
@@ -85,8 +87,9 @@ checked() {
 }
 
 # Every source must be readable before anything is written: a missing one would
-# otherwise leave a frontmatter-only agent file that reads as a success.
-for f in agents/doer.md agents/checker.md skill/SKILL.md modes/direct.md modes/planner-doer-checker.md; do
+# otherwise leave a frontmatter-only agent file that reads as a success. A
+# mode's own rule body is checked when the mode is chosen, below.
+for f in agents/doer.md agents/checker.md skill/SKILL.md modes/LIST; do
     if [ ! -r "$SRC/$f" ]; then
         warn "the shipped file $f is missing; nothing installed"
         echo RS_HARNESS_INSTALL_FAILED
@@ -94,10 +97,15 @@ for f in agents/doer.md agents/checker.md skill/SKILL.md modes/direct.md modes/p
     fi
 done
 
+# The mode: none, or one whose rule body this suite carries. Its characters
+# first (MIRROR of rscore.HARNESS_MODE_ID_RE: lowercase words joined by single
+# hyphens), since the value becomes a path below and a newline must never
+# reach it; then the file.
 MODE=${RS_HARNESS_MODE:-none}
 case "$MODE" in
-    none|direct|planner-doer-checker) ;;
-    *) warn "unknown working mode; using none"; MODE=none ;;
+    none) ;;
+    [a-z]*[!a-z0-9-]*|*--*|*-|[!a-z]*) warn "unknown working mode; using none"; MODE=none ;;
+    *) [ -r "$SRC/modes/$MODE.md" ] || { warn "unknown working mode; using none"; MODE=none; } ;;
 esac
 DOER_MODEL=$(checked RS_HARNESS_DOER_MODEL "${RS_HARNESS_DOER_MODEL:-}" claude_tier_ok)
 CHECKER_MODEL=$(checked RS_HARNESS_CHECKER_MODEL "${RS_HARNESS_CHECKER_MODEL:-}" claude_tier_ok)
@@ -119,11 +127,14 @@ DOER_DESC="Implements one unit of work from a self-contained brief (shipped by R
 CHECKER_DESC="Reviews a change read-only - verifies against the code, asserts defects, flags forks (shipped by RS)."
 
 # skill DIR — the mode-switch skill (named rs-mode; its folder keeps the name
-# harness, so nothing is ever removed) with its own copy of the mode texts.
+# harness, so nothing is ever removed) with its own copy of every staged mode's
+# rule body.
 skill() {
     put "$1/SKILL.md" < "$SRC/skill/SKILL.md" || FAILED=1
-    put "$1/modes/direct.md" < "$SRC/modes/direct.md" || FAILED=1
-    put "$1/modes/planner-doer-checker.md" < "$SRC/modes/planner-doer-checker.md" || FAILED=1
+    for m in "$SRC"/modes/*.md; do
+        [ -r "$m" ] || continue
+        put "$1/modes/${m##*/}" < "$m" || FAILED=1
+    done
 }
 
 if [ "$HAS_CLAUDE" = 1 ]; then
@@ -164,6 +175,8 @@ if [ "$HAS_PI" = 1 ]; then
 fi
 
 if [ "$HAS_CLAUDE" = 1 ] || [ "$HAS_PI" = 1 ]; then
+    # The header's list of modes, as the host joined it (one line).
+    MODE_LIST=$(head -n 1 "$SRC/modes/LIST")
     RULE="$HOME/.claude/rules/rs-harness.md"
     if [ "$MODE" = none ]; then
         if [ -e "$RULE" ] && ! rm -f "$RULE"; then
@@ -174,7 +187,7 @@ if [ "$HAS_CLAUDE" = 1 ] || [ "$HAS_PI" = 1 ]; then
         {
             printf '%s\n' "# Working mode: $MODE (set by RS for this project)" '' \
                 'This sets how the session that talks with the user works. If you were launched as a subagent - `doer`, `checker` or any other child agent - ignore this file and do the task in your brief.' '' \
-                "Where the project's own instructions prescribe a different way of working, the project's instructions win. The user can switch this session's mode with the \`rs-mode\` skill: \`/rs-mode <mode>\` in Claude Code, \`/skill:rs-mode <mode>\` in pi (none, direct or planner-doer-checker)." ''
+                "Where the project's own instructions prescribe a different way of working, the project's instructions win. The user can switch this session's mode with the \`rs-mode\` skill: \`/rs-mode <mode>\` in Claude Code, \`/skill:rs-mode <mode>\` in pi ($MODE_LIST)." ''
             cat "$SRC/modes/$MODE.md"
         } | put "$RULE" || FAILED=1
     fi

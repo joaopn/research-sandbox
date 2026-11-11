@@ -2619,10 +2619,11 @@ def _add_harness_args(p: argparse.ArgumentParser, what: str) -> None:
     """The working mode and the doer/checker models (dev projects and dev
     boxes only), one flag per rscore.HARNESS_FIELDS entry."""
     g = p.add_argument_group("working mode (dev only)")
-    g.add_argument("--harness-mode", dest="harness_mode", default="",
-                   choices=("",) + rscore.HARNESS_MODES, metavar="MODE",
-                   help=f"the working mode this {what}'s agent starts in: "
-                        f"{', '.join(rscore.HARNESS_MODES)} (default none)")
+    # No `choices`: the modes come from RS's catalog, read only when a mode is
+    # set (rscore checks the value), so a broken catalog never breaks the parser.
+    g.add_argument("--harness-mode", dest="harness_mode", default="", metavar="MODE",
+                   help=f"the working mode this {what}'s agent starts in, one of "
+                        f"RS's working modes, e.g. direct (default none)")
     g.add_argument("--doer-model", dest="doer_model", default="", metavar="TIER",
                    help="Claude tier for the doer subagent (default: the session's)")
     g.add_argument("--checker-model", dest="checker_model", default="", metavar="TIER",

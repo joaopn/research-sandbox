@@ -434,6 +434,8 @@ const state = {
     activeProject: null,     // string | null
     hostPage: null,          // "development" | "sandboxes" | null
     explainIndex: null,      // string[] of workflows with a rendered Explain doc (/static/explain/index.json); null = unfetched
+    workingModes: null,      // [{id, label, description, subagents}] from /broker/working-modes; null = unfetched or failed (workingModesError says why)
+    workingModesError: "",
     modelCatalog: null,      // { efforts, models, defaults, types } from /broker/models; null = unfetched. The webui image has no `models/` (it sits outside the ./webui build context), so this relay is the only source — and every picker pre-selects from its `defaults`, the same ones the verbs fall back to, so browser and CLI cannot diverge.
     activeService: null,     // string | null
     serviceRegistry: null,   // { [serviceId]: spec } from /services
@@ -8168,29 +8170,75 @@ function createEgressDefault(manifest) {
 }
 
 // The working mode (I33) — dev projects and dev boxes. What the agent is told
-// about HOW to work, from nothing to the planner-doer-checker loop with RS's
-// own `doer` and `checker` subagents. Values mirror rscore.HARNESS_MODES.
-const HARNESS_MODE_SPECS = [
-    ["none", "None",
-     "Nothing about how to work: the agent follows the project's own instructions."],
-    ["direct", "Direct",
-     "The agent does the work itself, in the session you talk to."],
-    ["planner-doer-checker", "Planner-doer-checker",
-     "The agent plans with you; RS's doer subagent implements each unit and its " +
-     "checker subagent reviews it before it lands. More thorough, and it costs " +
-     "more tokens and time per unit."],
-];
+// about HOW to work. The modes are RS's catalog (container/harness/modes.json),
+// read through GET /broker/working-modes: each mode's id, label, description
+// and the subagents (`doer`, `checker`) it uses — which decides the Doer and
+// Checker rows. Its own read, apart from the model catalog, so either can fail
+// alone. Every surface that draws a switch awaits it first.
+async function ensureWorkingModes() {
+    if (state.workingModes) return state.workingModes;
+    const failed = "RS's working modes could not be loaded.";
+    try {
+        const res = await fetch("/broker/working-modes");
+        const body = await res.json().catch(() => null);
+        if (res.ok && body && body.ok && body.result && Array.isArray(body.result.modes)) {
+            state.workingModes = body.result.modes;
+            state.workingModesError = "";
+            return state.workingModes;
+        }
+        // A broken catalog's own message says what is wrong; anything else (a
+        // broker that predates the read, a transport failure) is one plain line.
+        state.workingModesError = body && body.ok === false && body.error
+            && body.error.kind === "validation" && body.error.message
+            ? body.error.message : failed;
+    } catch (e) {
+        state.workingModesError = failed;
+    }
+    return null;
+}
+
+// One mode's catalog entry (null for a mode RS does not list).
+function harnessModeSpec(id) {
+    return (state.workingModes || []).find((m) => m && m.id === id) || null;
+}
+
+// The subagents a mode uses — [] for none, direct, and a mode RS does not list.
+function harnessModeRoles(id) {
+    const m = harnessModeSpec(id);
+    return m && Array.isArray(m.subagents) ? m.subagents : [];
+}
 const HARNESS_PI_MODEL_PATTERN = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._:~@+\/-]+$/;
 const HARNESS_PI_THINKING = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
-// The 3-way switch: one card per mode, None first and selected. onChange runs
+// The switch: one card per catalog mode, None first and selected. onChange runs
 // after every change (and once at build) so the caller can show its rows.
+// `initial` (the ⚙ boxes: the recorded mode) is selected; a recorded mode the
+// catalog does not list gets its own card, never None, so an unrelated Apply
+// can never reset it. Without the catalog there are no cards: the hint says
+// why and what follows (a create surface starts in none; a ⚙ box keeps the
+// recorded mode), and value() keeps that mode, so nothing about it is sent.
 function harnessModeSwitch(onChange, initial) {
-    let mode = "none";
-    // The ⚙ Agents box opens on the project's current mode.
-    if (HARNESS_MODE_SPECS.some((sp) => sp[0] === initial)) mode = initial;
+    const creating = initial === undefined;
+    const keep = initial || "none";
+    const specs = (state.workingModes || []).map((m) => [m.id, m.label, m.description]);
+    if (!specs.length) {
+        const node = el("div", { class: "field harness-mode" }, [
+            el("label", {}, ["Working mode"]),
+            el("div", { class: "hint" }, [
+                (state.workingModesError || "RS's working modes could not be loaded.") +
+                (creating ? " New sessions start with no working mode."
+                          : " The working mode stays as it is."),
+            ]),
+        ]);
+        if (onChange) onChange(keep);
+        return { node, value: () => keep };
+    }
+    if (!specs.some((sp) => sp[0] === keep)) {
+        specs.push([keep, keep, "A working mode this RS does not list; it is kept until you pick another."]);
+    }
+    let mode = keep;
     const hint = el("div", { class: "hint" });
-    const cards = HARNESS_MODE_SPECS.map(([value, label]) => {
+    const cards = specs.map(([value, label]) => {
         const card = el("div", { class: "box-opt-card harness-mode-card" },
                         [el("span", { class: "box-opt-name" }, [label])]);
         card.onclick = () => { mode = value; sync(); };
@@ -8198,7 +8246,7 @@ function harnessModeSwitch(onChange, initial) {
     });
     const sync = () => {
         cards.forEach((c) => c.card.classList.toggle("selected", c.value === mode));
-        hint.textContent = (HARNESS_MODE_SPECS.find((s) => s[0] === mode) || [])[2] || "";
+        hint.textContent = (specs.find((s) => s[0] === mode) || [])[2] || "";
         if (onChange) onChange(mode);
     };
     const node = el("div", { class: "field harness-mode" }, [
@@ -8239,9 +8287,14 @@ function harnessClaudeRows(cat, initial) {
             el("div", { class: "model-cell" }, [el("span", { class: "model-cap" }, ["model"]), sel]),
         ]),
     ]);
+    const doerRow = row("Doer", doerS);
+    const checkerRow = row("Checker", checkerS);
+    // The roles the chosen mode uses (setRoles): only their rows show, and only
+    // their fields are read.
+    let roles = ["doer", "checker"];
     const node = el("div", { class: "harness-rows" }, [
-        row("Doer", doerS),
-        row("Checker", checkerS),
+        doerRow,
+        checkerRow,
         el("div", { class: "hint" }, [
             "RS's doer implements a unit of work; its checker reviews it, read-only. " +
             "Both run at the effort set for the agent.",
@@ -8252,15 +8305,25 @@ function harnessClaudeRows(cat, initial) {
         // Without a model catalog the selects would hold only "same as the
         // session": callers keep the rows hidden then.
         available: !!(cat && cat.models && cat.models.length),
+        setRoles: (r) => {
+            roles = r || [];
+            doerRow.style.display = roles.includes("doer") ? "" : "none";
+            checkerRow.style.display = roles.includes("checker") ? "" : "none";
+        },
         value: () => {
             const out = {};
-            if (doerS.value) out.doer_model = doerS.value;
-            if (checkerS.value) out.checker_model = checkerS.value;
+            if (roles.includes("doer") && doerS.value) out.doer_model = doerS.value;
+            if (roles.includes("checker") && checkerS.value) out.checker_model = checkerS.value;
             return out;
         },
-        // Every field, empty included — the ⚙ Agents box compares against the
-        // recorded values to find a change back to the default.
-        fields: () => ({ doer_model: doerS.value, checker_model: checkerS.value }),
+        // Every field of the shown roles, empty included — the ⚙ Agents box
+        // compares against the recorded values to find a change back to the default.
+        fields: () => {
+            const out = {};
+            if (roles.includes("doer")) out.doer_model = doerS.value;
+            if (roles.includes("checker")) out.checker_model = checkerS.value;
+            return out;
+        },
     };
 }
 
@@ -8292,6 +8355,11 @@ function harnessPiRows(initial) {
     };
     const doer = mk("Doer", init.pi_doer_model, init.pi_doer_thinking);
     const checker = mk("Checker", init.pi_checker_model, init.pi_checker_thinking);
+    // The roles the chosen mode uses (setRoles): only their rows show, and only
+    // their fields are read and checked.
+    let roles = ["doer", "checker"];
+    const shown = () => [["Doer", "doer", doer], ["Checker", "checker", checker]]
+        .filter((r) => roles.includes(r[1]));
     const node = el("div", { class: "harness-rows" }, [
         doer.node, checker.node,
         el("div", { class: "hint" }, [
@@ -8301,25 +8369,33 @@ function harnessPiRows(initial) {
     ]);
     return {
         node,
+        setRoles: (r) => {
+            roles = r || [];
+            doer.node.style.display = roles.includes("doer") ? "" : "none";
+            checker.node.style.display = roles.includes("checker") ? "" : "none";
+        },
         value: () => {
             const out = {};
-            const dm = doer.modelI.value.trim(), cm = checker.modelI.value.trim();
-            if (dm) out.pi_doer_model = dm;
-            if (doer.thinkS.value) out.pi_doer_thinking = doer.thinkS.value;
-            if (cm) out.pi_checker_model = cm;
-            if (checker.thinkS.value) out.pi_checker_thinking = checker.thinkS.value;
+            shown().forEach(([, role, r]) => {
+                const m = r.modelI.value.trim();
+                if (m) out[`pi_${role}_model`] = m;
+                if (r.thinkS.value) out[`pi_${role}_thinking`] = r.thinkS.value;
+            });
             return out;
         },
-        fields: () => ({
-            pi_doer_model: doer.modelI.value.trim(), pi_doer_thinking: doer.thinkS.value,
-            pi_checker_model: checker.modelI.value.trim(),
-            pi_checker_thinking: checker.thinkS.value,
-        }),
+        fields: () => {
+            const out = {};
+            shown().forEach(([, role, r]) => {
+                out[`pi_${role}_model`] = r.modelI.value.trim();
+                out[`pi_${role}_thinking`] = r.thinkS.value;
+            });
+            return out;
+        },
         // The client half of rscore's id pattern (the server refuses anything else).
         invalid: () => {
-            const rows = [["Doer", doer], ["Checker", checker]];
+            const rows = shown();
             for (let i = 0; i < rows.length; i++) {
-                const v = rows[i][1].modelI.value.trim();
+                const v = rows[i][2].modelI.value.trim();
                 if (v && !HARNESS_PI_MODEL_PATTERN.test(v)) {
                     return "Write pi's " + rows[i][0] + " model as provider/model, e.g. " +
                            "openrouter/anthropic/claude-opus-latest.";
@@ -8582,9 +8658,16 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
     const harnessClaude = isDev ? harnessClaudeRows(cat) : null;
     const harnessPi = isDev ? harnessPiRows() : null;
     const syncHarnessRows = (mode) => {
-        const on = mode === "planner-doer-checker";
-        if (harnessClaude) harnessClaude.node.style.display = on && harnessClaude.available ? "" : "none";
-        if (harnessPi) harnessPi.node.style.display = on ? "" : "none";
+        const roles = harnessModeRoles(mode);
+        const on = roles.length > 0;
+        if (harnessClaude) {
+            harnessClaude.setRoles(roles);
+            harnessClaude.node.style.display = on && harnessClaude.available ? "" : "none";
+        }
+        if (harnessPi) {
+            harnessPi.setRoles(roles);
+            harnessPi.node.style.display = on ? "" : "none";
+        }
     };
     const harnessSwitch = isDev ? harnessModeSwitch(syncHarnessRows) : null;
     if (harnessClaude) claudePanel.appendChild(harnessClaude.node);
@@ -8661,7 +8744,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
         // (every key is in DEV_PROJECT_WEBUI_FIELDS).
         const mode = harnessSwitch ? harnessSwitch.value() : "none";
         if (mode !== "none") out.harness_mode = mode;
-        if (mode === "planner-doer-checker") {
+        if (harnessModeRoles(mode).length) {
             if (agentOn("claude") && harnessClaude) Object.assign(out, harnessClaude.value());
             if (agentOn("pi") && harnessPi) Object.assign(out, harnessPi.value());
         }
@@ -8937,7 +9020,8 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
                 return "Write pi's model as provider/model, e.g. " +
                        "openrouter/anthropic/claude-opus-latest.";
             }
-            if (harnessPi && agentOn("pi") && harnessSwitch.value() === "planner-doer-checker") {
+            if (harnessPi && harnessSwitch && agentOn("pi")
+                    && harnessModeRoles(harnessSwitch.value()).length) {
                 const bad = harnessPi.invalid();
                 if (bad) return bad;
             }
@@ -9173,6 +9257,7 @@ async function renderWorkflowsInto(view) {
     // click) can render its pickers without an await. Best-effort: if it fails,
     // the dialog simply omits the pickers and the backend applies its defaults.
     await ensureModelCatalog();
+    await ensureWorkingModes();
     renderWorkflowsScreen(view, body.result);
 }
 
@@ -9520,6 +9605,7 @@ async function mgmtBoxAddDialog(project) {
     // future mixed-agent box expressible. Unset ⇒ box_add falls back to the same
     // `box` default from the project marker, so the picker and the fallback agree.
     const boxCat = await ensureModelCatalog();
+    await ensureWorkingModes();
     const boxModelP = boxCat
         ? modelPicker(boxCat, "box", "Agent",
                       "The model this box's agent runs on.", {})
@@ -9620,7 +9706,10 @@ async function mgmtBoxAddDialog(project) {
         "on the session's model.",
     ]);
     const syncBoxHarnessRows = (mode) => {
-        const pdc = mode === "planner-doer-checker";
+        const roles = harnessModeRoles(mode);
+        const pdc = roles.length > 0;
+        boxHarnessClaude.setRoles(roles);
+        boxHarnessPi.setRoles(roles);
         boxHarnessClaude.node.style.display =
             pdc && agentS.value === "claude" && boxHarnessClaude.available ? "" : "none";
         boxHarnessPi.node.style.display = pdc && agentS.value === "pi" ? "" : "none";
@@ -10063,7 +10152,7 @@ async function mgmtBoxAddDialog(project) {
                 return "A dev box needs a branch for the agent to work from.";
             }
             if (boxHarnessOn() && agentS.value === "pi"
-                    && boxHarnessSwitch.value() === "planner-doer-checker") {
+                    && harnessModeRoles(boxHarnessSwitch.value()).length) {
                 const bad = boxHarnessPi.invalid();
                 if (bad) return bad;
             }
@@ -10105,7 +10194,7 @@ async function mgmtBoxAddDialog(project) {
                 if (boxHarnessOn()) {
                     const mode = boxHarnessSwitch.value();
                     if (mode !== "none") payload.harness_mode = mode;
-                    if (mode === "planner-doer-checker") {
+                    if (harnessModeRoles(mode).length) {
                         if (agentS.value === "claude") Object.assign(payload, boxHarnessClaude.value());
                         if (agentS.value === "pi") Object.assign(payload, boxHarnessPi.value());
                     }
@@ -11957,6 +12046,7 @@ function appendAgentsBox(box, project, enabled) {
         }
         const d = b.result;
         const cat = await ensureModelCatalog();
+        await ensureWorkingModes();
         // What can be added: the host's pulled agents (the create form's read).
         let staged = [];
         if (d.kind === "dind") {
@@ -12111,7 +12201,10 @@ function agentsBoxContent(name, d, cat, staged) {
             return t;
         }));
         panelsWrap.replaceChildren(...(active ? [panels[active]] : []));
-        const pdc = !!sw && sw.value() === "planner-doer-checker";
+        const roles = sw ? harnessModeRoles(sw.value()) : [];
+        const pdc = roles.length > 0;
+        claudeRows.setRoles(roles);
+        piRows.setRoles(roles);
         claudeRows.node.style.display = pdc && claudeRows.available ? "" : "none";
         piRows.node.style.display = pdc ? "" : "none";
     };
@@ -12308,7 +12401,9 @@ function boxAgentsRows(b, cat, onChange) {
         piRows = b.agent === "pi" ? harnessPiRows(h) : null;
         const rows = claudeRows || piRows;
         const syncRows = () => {
-            const pdc = !!sw && sw.value() === "planner-doer-checker";
+            const roles = sw ? harnessModeRoles(sw.value()) : [];
+            const pdc = roles.length > 0;
+            if (rows) rows.setRoles(roles);
             if (rows) rows.node.style.display = pdc && (!claudeRows || claudeRows.available) ? "" : "none";
             onChange();
         };
@@ -12323,10 +12418,10 @@ function boxAgentsRows(b, cat, onChange) {
         model: () => (modelI ? modelI.value.trim() : null),
         effort: () => (effortS ? effortS.value : null),
         mode: () => (sw ? sw.value() : null),
-        rowsFields: () => (sw && sw.value() === "planner-doer-checker"
+        rowsFields: () => (sw && harnessModeRoles(sw.value()).length
             ? Object.assign({}, claudeRows ? claudeRows.fields() : {}, piRows ? piRows.fields() : {})
             : {}),
-        piInvalid: () => (piRows && sw && sw.value() === "planner-doer-checker" ? piRows.invalid() : null),
+        piInvalid: () => (piRows && sw && harnessModeRoles(sw.value()).length ? piRows.invalid() : null),
     };
 }
 
@@ -12444,10 +12539,10 @@ function agentsBoxApply(name, d, f) {
         const was = f.harness.harness_mode || "none";
         if (mode !== was) {
             if (mode === "none") reset.push("harness_mode"); else payload.harness_mode = mode;
-            const spec = HARNESS_MODE_SPECS.find((s) => s[0] === mode) || [mode, mode];
-            lines.push(`Working mode: ${spec[1]}.`);
+            const spec = harnessModeSpec(mode);
+            lines.push(`Working mode: ${spec ? spec.label : mode}.`);
         }
-        if (mode === "planner-doer-checker") {
+        if (harnessModeRoles(mode).length) {
             const rows = Object.assign({},
                 f.on.has("claude") && f.claudeRows.available ? f.claudeRows.fields() : {},
                 f.on.has("pi") ? f.piRows.fields() : {});
@@ -12481,7 +12576,7 @@ function agentsBoxApply(name, d, f) {
         if (payload.pi_model && !HARNESS_PI_MODEL_PATTERN.test(payload.pi_model)) {
             return "Write pi's model as provider/model, e.g. openrouter/anthropic/claude-opus-latest.";
         }
-        if (f.sw && f.sw.value() === "planner-doer-checker" && f.on.has("pi")) {
+        if (f.sw && harnessModeRoles(f.sw.value()).length && f.on.has("pi")) {
             const bad = f.piRows.invalid();
             if (bad) return bad;
         }

@@ -671,6 +671,17 @@ async def broker_projects_handler(request: web.Request) -> web.Response:
     return web.json_response(body, status=status)
 
 
+async def broker_working_modes_handler(request: web.Request) -> web.Response:
+    """GET /broker/working-modes — RS's working modes (id, label, description,
+    subagents) for the mode cards and the Doer/Checker rows (gated). The
+    catalog sits outside the webui image, so this relay is the browser's only
+    source; it is apart from /broker/models so either catalog can fail alone.
+    SameSite=Strict cookie is the CSRF defense for this read, mirroring
+    /broker/workflows."""
+    status, body = await _relay(request, "working_modes")
+    return web.json_response(body, status=status)
+
+
 async def broker_workflows_handler(request: web.Request) -> web.Response:
     """GET /broker/workflows — the store catalog (built-ins + BYO), the agent
     enum, and the default workflow, for the create form's pickers (gated). The
@@ -4184,6 +4195,7 @@ def main() -> None:
     app.router.add_get("/broker/software/active", broker_software_active_handler)
     app.router.add_get("/broker/workflows", broker_workflows_handler)
     app.router.add_get("/broker/models", broker_models_handler)
+    app.router.add_get("/broker/working-modes", broker_working_modes_handler)
     app.router.add_post("/broker/models/default", broker_models_default_handler)
     app.router.add_get("/broker/settings", broker_settings_handler)
     app.router.add_post("/broker/settings", broker_settings_set_handler)

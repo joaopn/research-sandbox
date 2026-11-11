@@ -1,0 +1,32 @@
+{
+  "modes": [
+    {
+      "id": "none",
+      "label": "None",
+      "description": "Nothing about how to work: the agent follows the project's own instructions.",
+      "pieces": [],
+      "subagents": []
+    },
+    {
+      "id": "direct",
+      "label": "Direct",
+      "description": "The agent does the work itself, in the session you talk to.",
+      "pieces": [
+        "direct"
+      ],
+      "subagents": []
+    },
+    {
+      "id": "planner-doer-checker",
+      "label": "Planner-doer-checker",
+      "description": "The agent plans with you; RS's doer subagent implements each unit and its checker subagent reviews it before it lands. More thorough, and it costs more tokens and time per unit.",
+      "pieces": [
+        "planner-doer-checker"
+      ],
+      "subagents": [
+        "doer",
+        "checker"
+      ]
+    }
+  ]
+}

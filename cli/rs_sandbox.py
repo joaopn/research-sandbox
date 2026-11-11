@@ -2117,11 +2117,18 @@ HARNESS_ENV = {
     "pi_checker_model": "RS_HARNESS_PI_CHECKER_MODEL",
     "pi_checker_thinking": "RS_HARNESS_PI_CHECKER_THINKING",
 }
-HARNESS_MODES = ("none", "direct", "planner-doer-checker")
+# The working mode is checked by its characters only — MIRROR of
+# rscore.HARNESS_MODE_ID_RE and install.sh's `case` (pytest-pinned): the host
+# checked it against RS's mode catalog, and this tool never reads the catalog.
+_HARNESS_MODE_ID_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
+# The `create` help's name for the mode value — MIRROR of
+# rscore.HARNESS_MODE_HELP_MARKER: the host reads it to tell this tool from one
+# with a fixed list of modes (no space or hyphen, so help wrapping never splits it).
+HARNESS_MODE_METAVAR = "MODE_ID"
 # Shape only (no model catalog here — the host checked the tiers): the
 # installer's own charsets, so a value that passes here passes there.
 _HARNESS_SHAPES = {
-    "harness_mode": re.compile(r"^(none|direct|planner-doer-checker)$"),
+    "harness_mode": _HARNESS_MODE_ID_RE,
     "doer_model": re.compile(r"^[A-Za-z0-9._-]+$"),
     "checker_model": re.compile(r"^[A-Za-z0-9._-]+$"),
     "pi_doer_model": re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._:~@+/-]+$"),
@@ -3946,15 +3953,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "box default; ignored for a model with no effort levels)")
     c.add_argument("--editor", action="store_true",
                    help="bundle the code-server editor into this box")
-    for f, help_ in (("harness_mode", "the working mode this box's agent starts in: "
-                                      "none, direct or planner-doer-checker"),
+    for f, help_ in (("harness_mode", "the working mode this box's agent starts in "
+                                      "(one of RS's working modes; default none)"),
                      ("doer_model", "Claude tier for the doer subagent (a claude box)"),
                      ("checker_model", "Claude tier for the checker subagent (a claude box)"),
                      ("pi_doer_model", "pi provider/model for the doer subagent (a pi box)"),
                      ("pi_doer_thinking", "pi thinking level for the doer subagent"),
                      ("pi_checker_model", "pi provider/model for the checker subagent"),
                      ("pi_checker_thinking", "pi thinking level for the checker subagent")):
-        c.add_argument(f"--{f.replace('_', '-')}", dest=f, default="", help=help_)
+        c.add_argument(f"--{f.replace('_', '-')}", dest=f, default="", help=help_,
+                       **({"metavar": HARNESS_MODE_METAVAR} if f == "harness_mode" else {}))
     # Tri-state on purpose (first BooleanOptionalAction in this codebase):
     # --browser / --no-browser override the preset's image, ABSENT (None) keeps
     # the preset default — a store_true could not express "not specified".

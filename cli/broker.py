@@ -350,6 +350,17 @@ def _verb_models(_args: dict, _progress=None) -> dict:
         raise rscore.ValidationError(str(e))
 
 
+def _verb_working_modes(_args: dict, _progress=None) -> dict:
+    """The working modes for the webui's mode cards and Doer/Checker rows: each
+    mode's id, label, description and the subagents it uses, from RS's catalog
+    (container/harness/modes.json — outside the webui image, so this in-broker
+    read is its only source). Its own verb, apart from `models`, so a broken
+    mode catalog never blanks the model pickers and a broken model catalog never
+    hides the mode switch. Token-gated (NOT in OPEN_VERBS). harness_catalog
+    raises only ValidationError (its text carries no host path)."""
+    return {"modes": rscore.harness_catalog_public()}
+
+
 def _verb_host_settings(_args: dict, _progress=None) -> dict:
     """The host settings (the Sandboxes → Infrastructure → Settings section).
     Token-gated read; never raises for a damaged file — the payload names the
@@ -1404,6 +1415,7 @@ VERBS = {
     "status": _verb_status,
     "workflows": _verb_workflows,
     "models": _verb_models,
+    "working_modes": _verb_working_modes,
     "model_default_set": _verb_model_default_set,
     "host_settings": _verb_host_settings,
     "host_settings_set": _verb_host_settings_set,

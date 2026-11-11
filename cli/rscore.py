@@ -597,6 +597,13 @@ _OLD_BOX_TOOL_SHARE_MSG = ("this project's box tool predates file sharing — "
                            "restart the project, then retry")
 _OLD_BOX_TOOL_HARNESS_MSG = ("this project's box tool predates the working mode — "
                              "restart the project, then retry")
+_OLD_BOX_TOOL_MODE_MSG = ("this project was started before this working mode existed — "
+                          "restart the project, then try again")
+# The current box tool's `create` help names the working-mode value with this
+# metavar (rs_sandbox.HARNESS_MODE_METAVAR, pytest-pinned equal); a tool from
+# before the mode catalog shows another. No space or hyphen, so argparse's
+# help wrapping can never split it.
+HARNESS_MODE_HELP_MARKER = "MODE_ID"
 _OLD_BOX_TOOL_SETTINGS_MSG = ("this project's box tool predates changing a box's agent "
                               "settings — restart the project, then retry")
 # A box tool from before RS kept its files in the agents' homes would write
@@ -1742,7 +1749,20 @@ class CreateRequest:
 # the same names in every request, allowlist, marker key and CLI flag, so a
 # lockstep is a name match. The installer (container/harness/install.sh) reads
 # them as these environment variables and re-checks every value itself.
-HARNESS_MODES = ("none", "direct", "planner-doer-checker")
+#
+# The modes themselves are data: container/harness/modes.json lists them (id,
+# label, description, the pieces its rule is built from, the subagents it
+# uses), read lazily by harness_catalog() — never at import, by the CLI parser
+# or by a reader of recorded settings, so a broken catalog errors only where a
+# mode is set, staged or listed. Only the host checks a mode against it; the
+# installer and the box tool check the characters (HARNESS_MODE_ID_RE, mirrored
+# in rs_sandbox._HARNESS_MODE_ID_RE and install.sh's `case`, pytest-pinned).
+HARNESS_MODE_ID_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
+# The roles the installer ships an agent file for: a mode may use only these.
+HARNESS_ROLES = ("doer", "checker")
+# The modes a box tool from before the catalog accepts (its list was fixed):
+# any other mode needs a project restarted since (_require_harness_aware_box_tool).
+HARNESS_ORIGINAL_MODES = ("none", "direct", "planner-doer-checker")
 HARNESS_ENV = {
     "harness_mode": "RS_HARNESS_MODE",
     "doer_model": "RS_HARNESS_DOER_MODEL",
@@ -1764,9 +1784,104 @@ _HARNESS_LABELS = {
 }
 
 
+def harness_catalog() -> list[dict]:
+    """The working modes from container/harness/modes.json, checked: a list of
+    {id, label, description, pieces, subagents} in display order, `none` first
+    with no pieces and no subagents, ids unique and matching HARNESS_MODE_ID_RE,
+    every piece a file under pieces/, subagents only from HARNESS_ROLES. Raises
+    ValidationError naming what is wrong (never a host path) — a broken catalog
+    is an error where a mode is used, never a silent fallback."""
+    def bad(why: str) -> ValidationError:
+        return ValidationError(f"RS's working-mode catalog is broken: {why}")
+    try:
+        raw = (HARNESS_SRC / "modes.json").read_bytes()
+    except OSError as e:
+        raise bad(f"modes.json cannot be read ({e.strerror or type(e).__name__})")
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError):
+        raise bad("modes.json is not valid JSON")
+    modes = data.get("modes") if isinstance(data, dict) else None
+    if not isinstance(modes, list) or not modes:
+        raise bad("modes.json has no list of modes")
+    out: list[dict] = []
+    seen: set[str] = set()
+    for m in modes:
+        if not isinstance(m, dict):
+            raise bad("a mode entry is not an object")
+        mid = m.get("id")
+        if not isinstance(mid, str) or not HARNESS_MODE_ID_RE.fullmatch(mid):
+            raise bad(f"mode id {mid!r} is not lowercase words joined by hyphens")
+        if mid in seen:
+            raise bad(f"mode {mid!r} is listed twice")
+        seen.add(mid)
+        label, desc = m.get("label"), m.get("description")
+        if not isinstance(label, str) or not label.strip():
+            raise bad(f"mode {mid!r} has no label")
+        if not isinstance(desc, str) or not desc.strip():
+            raise bad(f"mode {mid!r} has no description")
+        pieces, subs = m.get("pieces"), m.get("subagents")
+        if not isinstance(pieces, list) or not all(isinstance(x, str) for x in pieces):
+            raise bad(f"mode {mid!r}: pieces must be a list of names")
+        if not isinstance(subs, list) or not all(isinstance(x, str) for x in subs):
+            raise bad(f"mode {mid!r}: subagents must be a list of names")
+        for x in subs:
+            if x not in HARNESS_ROLES:
+                raise bad(f"mode {mid!r} uses subagent {x!r}, which RS does not ship "
+                          f"(only {', '.join(HARNESS_ROLES)})")
+        if len(set(subs)) != len(subs):
+            raise bad(f"mode {mid!r} names a subagent twice")
+        for x in pieces:
+            if not HARNESS_MODE_ID_RE.fullmatch(x):
+                raise bad(f"mode {mid!r} uses piece {x!r}, which does not exist")
+            try:
+                found = (HARNESS_SRC / "pieces" / f"{x}.md").is_file()
+            except OSError:
+                raise bad(f"mode {mid!r} uses piece {x!r}, which cannot be read")
+            if not found:
+                raise bad(f"mode {mid!r} uses piece {x!r}, which does not exist")
+        if mid == "none" and (pieces or subs):
+            raise bad("mode 'none' must have no pieces and no subagents")
+        if mid != "none" and not pieces:
+            raise bad(f"mode {mid!r} has no pieces")
+        out.append({"id": mid, "label": label, "description": desc,
+                    "pieces": list(pieces), "subagents": list(subs)})
+    if out[0]["id"] != "none":
+        raise bad("the first mode must be 'none'")
+    return out
+
+
+def harness_mode_ids() -> tuple[str, ...]:
+    """The catalog's mode ids, display order (raises like harness_catalog)."""
+    return tuple(m["id"] for m in harness_catalog())
+
+
+def harness_catalog_public() -> list[dict]:
+    """What the webui draws from: each mode's id, label, description and the
+    subagents it uses (its pieces are RS's business)."""
+    return [{k: m[k] for k in ("id", "label", "description", "subagents")}
+            for m in harness_catalog()]
+
+
+def _recorded_harness_ok(field: str, value: str) -> bool:
+    """A value already RECORDED (a marker or a box record, container-writable)
+    is kept when its shape holds — the mode by its characters only, never by
+    the catalog, so a changed or broken catalog never drops a recorded mode and
+    a writer copying the recorded set never erases one; every other field by
+    _harness_shape as before."""
+    if field == "harness_mode":
+        return bool(HARNESS_MODE_ID_RE.fullmatch(value))
+    try:
+        _harness_shape({field: value})
+    except Exception:       # incl. an unreadable model catalog: read as unset
+        return False
+    return True
+
+
 def _harness_shape(kw: "dict") -> dict[str, str]:
     """The seven fields from `kw`, stripped, each shape-checked on its own:
-    the mode is one of HARNESS_MODES, a Claude model is a catalog tier, a pi
+    the mode is one of the catalog's (harness_catalog, read only when a mode is
+    set), a Claude model is a catalog tier, a pi
     model matches PI_MODEL_RE, a thinking level is one of pi's. Context-free
     (which workflow, which agents) is the caller's: _validated_harness."""
     out: dict[str, str] = {}
@@ -1779,9 +1894,11 @@ def _harness_shape(kw: "dict") -> dict[str, str]:
     # never trips a dev-only gate or reaches a box tool that predates the flags.
     if out["harness_mode"] == "none":
         out["harness_mode"] = ""
-    if out["harness_mode"] and out["harness_mode"] not in HARNESS_MODES:
-        raise ValidationError(f"working mode {out['harness_mode']!r} is not one of "
-                              f"{', '.join(HARNESS_MODES)}")
+    if out["harness_mode"]:
+        ids = harness_mode_ids()
+        if out["harness_mode"] not in ids:
+            raise ValidationError(f"working mode {out['harness_mode']!r} is not one of "
+                                  f"{', '.join(ids)}")
     if any(out[f] for f in _HARNESS_CLAUDE):
         tiers = [m["alias"] for m in _model_catalog_checked()["models"]]
         for f in _HARNESS_CLAUDE:
@@ -1833,13 +1950,8 @@ def _read_harness(workspace_path: "Path") -> dict[str, str]:
     out: dict[str, str] = {}
     for f in HARNESS_FIELDS:
         v = blk.get(f)
-        if not isinstance(v, str) or not v:
-            continue
-        try:
-            _harness_shape({f: v})
-        except Exception:       # incl. an unreadable catalog: never stop a start
-            continue
-        out[f] = v
+        if isinstance(v, str) and v and _recorded_harness_ok(f, v):
+            out[f] = v
     return out
 
 
@@ -9022,20 +9134,80 @@ _HARNESS_WARNING = ("the working-mode files (doer, checker, the rs-mode skill) c
                     "all be installed into the project's agent; the agent runs without them")
 
 
-# The suite's files, named: what ships is exactly this list, never whatever else
-# a host checkout happens to hold in the folder (an editor's swap file, a stray).
-# The installer checks the same names before it writes anything.
-HARNESS_FILES = ("install.sh", "agents/doer.md", "agents/checker.md", "skill/SKILL.md",
-                 "modes/direct.md", "modes/planner-doer-checker.md")
+# The suite's tracked files that ship as they are: exactly this list, never
+# whatever else a host checkout holds in the folder (an editor's swap file, a
+# stray). The rest of the suite is generated from the catalog by
+# harness_suite_files(); the installer checks the names it needs before it
+# writes anything.
+HARNESS_FILES = ("install.sh", "agents/doer.md", "agents/checker.md")
+HARNESS_SKILL_TEMPLATE = "skill/SKILL.template.md"
+# Number words for the skill's "one of these three" (a catalog longer than this
+# list reads as digits — no mode count is assumed).
+_COUNT_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven",
+                "eight", "nine", "ten")
+
+
+def harness_mode_phrase(ids: "Sequence[str]") -> str:
+    """The modes as one phrase — "none, direct or planner-doer-checker" — the
+    ONE join for the rule header (modes/LIST) and the skill's description."""
+    ids = list(ids)
+    if len(ids) < 2:
+        return "".join(ids)
+    return f"{', '.join(ids[:-1])} or {ids[-1]}"
+
+
+def harness_suite_files() -> dict[str, bytes]:
+    """Every file of the staged suite, by its path in the suite: the tracked
+    HARNESS_FILES as they are, plus what the catalog generates — each mode's
+    rule body modes/<id>.md (its pieces as bytes, a newline between each — a
+    blank line, as every piece ends in one), modes/LIST
+    (the header's phrase) and skill/SKILL.md (the template's markers filled;
+    plain replacement, so the skill's literal $ARGUMENTS is untouched). Raises
+    ValidationError for a broken catalog, OSError for a missing tracked file."""
+    cat = harness_catalog()
+    ids = [m["id"] for m in cat]
+    files = {rel: (HARNESS_SRC / rel).read_bytes() for rel in HARNESS_FILES}
+    for m in cat:
+        if m["id"] == "none":
+            continue
+        # Bytes, joined as they are (no decoding: a piece is shipped verbatim).
+        files[f"modes/{m['id']}.md"] = b"\n".join(
+            (HARNESS_SRC / "pieces" / f"{x}.md").read_bytes() for x in m["pieces"])
+    files["modes/LIST"] = (harness_mode_phrase(ids) + "\n").encode("utf-8")
+    n = len(ids)
+    fill = {
+        "{{RS_MODE_PHRASE}}": harness_mode_phrase(ids),
+        "{{RS_MODE_HINT}}": " | ".join(ids),
+        "{{RS_MODE_BULLETS}}": "".join(
+            f"- **{i}** — read `modes/{i}.md` in this skill's folder and follow it "
+            f"from now on.\n" for i in ids if i != "none"),
+        "{{RS_MODE_COUNT}}": _COUNT_WORDS[n] if n < len(_COUNT_WORDS) else str(n),
+    }
+    try:
+        skill = (HARNESS_SRC / HARNESS_SKILL_TEMPLATE).read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValidationError("RS's working-mode catalog is broken: the skill template "
+                              "is not UTF-8 text")
+    for k, v in fill.items():
+        skill = skill.replace(k, v)
+    if "{{RS_MODE_" in skill:
+        raise ValidationError("RS's working-mode catalog is broken: the skill template "
+                              "has a marker RS does not fill")
+    files["skill/SKILL.md"] = skill.encode("utf-8")
+    return files
 
 
 def _harness_tar() -> bytes:
-    """HARNESS_FILES as one root-owned tar (paths relative to HARNESS_SRC). A
-    missing file raises OSError, which `_stage_harness` turns into its warning."""
+    """harness_suite_files() as one root-owned tar. A missing file raises
+    OSError and a broken catalog ValidationError; `_stage_harness` turns either
+    into its warning."""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
-        for rel in HARNESS_FILES:
-            tar.add(HARNESS_SRC / rel, arcname=rel, filter=_root_owned)
+        for rel, data in harness_suite_files().items():
+            ti = tarfile.TarInfo(rel)
+            ti.size = len(data)
+            ti.mode = 0o644
+            tar.addfile(_root_owned(ti), io.BytesIO(data))
     return buf.getvalue()
 
 
@@ -9065,6 +9237,8 @@ def _stage_harness(container: str, local: "Sequence[str]",
         data = _harness_tar()
     except OSError:
         return [_HARNESS_WARNING]
+    except ValidationError as e:      # a broken catalog: say what is broken
+        return [f"{_HARNESS_WARNING} ({e})"]
     r = subprocess.run(
         ["docker", "exec", "-i", "-u", "0", container, "sh", "-c",
          f"mkdir -p {HARNESS_STAGE_DIR} && tar -C {HARNESS_STAGE_DIR} -x && "
@@ -15697,12 +15871,9 @@ def _project_agent_boxes(container: str, running: bool, research: bool,
         harness = {}
         for f in HARNESS_FIELDS:
             v = h.get(f)
-            if isinstance(v, str) and v and not (f == "harness_mode" and v == "none"):
-                try:
-                    _harness_shape({f: v})
-                    harness[f] = v
-                except Exception:
-                    pass
+            if (isinstance(v, str) and v and not (f == "harness_mode" and v == "none")
+                    and _recorded_harness_ok(f, v)):
+                harness[f] = v
         row = {"name": name, "agent": agent, "dev": b.get("dev") is True,
                "running": b.get("running") is True,
                "mode_editable": b.get("dev") is True and not research,
@@ -18838,15 +19009,23 @@ def _require_home_skills_box_tool(container: str) -> None:
         raise ValidationError(_OLD_BOX_TOOL_FILES_MSG)
 
 
-def _require_harness_aware_box_tool(container: str) -> None:
-    """Refuse, before any Gitea work, when the project's box tool predates the
-    working-mode flags (a project not restarted since RS gained them): the add
-    would otherwise take a dev box's Gitea provisioning and only then refuse
-    the create. A tool that cannot be asked is not judged here."""
+def _require_harness_aware_box_tool(container: str, mode: str = "") -> None:
+    """Refuse, before any side effect, when the project's box tool cannot take
+    the request (a project not restarted since RS gained it): a tool without
+    the working-mode flags at all, or — for a `mode` beyond the three every
+    tool knows — a tool from before the catalog (its `create` help lacks
+    HARNESS_MODE_HELP_MARKER), which would refuse the mode with its own
+    flag-named text after a dev box's Gitea provisioning. A tool that cannot be
+    asked is not judged here."""
     r = run(["docker", "exec", container, "rs-sandbox", "create", "--help"],
             capture_output=True)
-    if r.returncode == 0 and "--harness-mode" not in (r.stdout or ""):
+    if r.returncode != 0:
+        return
+    out = r.stdout or ""
+    if "--harness-mode" not in out:
         raise ValidationError(_OLD_BOX_TOOL_HARNESS_MSG)
+    if mode and mode not in HARNESS_ORIGINAL_MODES and HARNESS_MODE_HELP_MARKER not in out:
+        raise ValidationError(_OLD_BOX_TOOL_MODE_MSG)
 
 
 def _refuse_harness_on_research(container: str) -> None:
@@ -19140,7 +19319,7 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
             raise ValidationError("a box without an agent has no working mode")
         _validated_harness({f: harness.get(f, "") for f in HARNESS_FIELDS}, dev=True,
                            agents=[harness_agent])
-        _require_harness_aware_box_tool(container)
+        _require_harness_aware_box_tool(container, harness.get("harness_mode", ""))
     # Dev preset (STAGE_DEV_GITEA S2): mirror the in-supervisor rs-sandbox gates
     # host-side for a clean pre-exec ValidationError (the two-gate lockstep).
     # `repo` carries NAME semantics here (an attached gitea repo), not the byo
@@ -19901,12 +20080,7 @@ def box_settings(req: "BoxSettingsRequest", _progress=None) -> BoxSettingsResult
     harness: dict[str, str] = {}
     for f in HARNESS_FIELDS:
         v = old_h.get(f)
-        if isinstance(v, str) and v:
-            try:
-                _harness_shape({f: v})
-            except Exception:
-                v = ""
-        else:
+        if not (isinstance(v, str) and v and _recorded_harness_ok(f, v)):
             v = ""
         if getattr(req, f):
             v = getattr(req, f)
@@ -19917,6 +20091,8 @@ def box_settings(req: "BoxSettingsRequest", _progress=None) -> BoxSettingsResult
     if harness_asked:
         _validated_harness({f: harness.get(f, "") for f in HARNESS_FIELDS},
                            dev=True, agents=[agent])
+        # The mode actually sent (a model-only change carries the recorded one).
+        _require_harness_aware_box_tool(container, harness.get("harness_mode", ""))
     # The groups this change writes; the box tool keeps the others as its
     # record has them — so a model-only change never touches the working mode,
     # and a named model half is written even when the record already holds it
@@ -22919,7 +23095,11 @@ def dev_box_provision(req: "DevBoxProvisionRequest", progress=None) -> dict:  # 
     # A working mode on a research project's box would be refused by box_add —
     # after the mirror below; refuse it before (research boxes get no suite).
     if _harness_set(req):
-        _refuse_harness_on_research(_running_dind_supervisor(req.project))
+        sup = _running_dind_supervisor(req.project)
+        _refuse_harness_on_research(sup)
+        # A mode the project's box tool predates would be refused by box_add's
+        # tool — after the mirror below; refuse it before.
+        _require_harness_aware_box_tool(sup, getattr(req, "harness_mode", "") or "")
     progress.step("repo", "mirroring the repo")
     dev_repo_add(DevRepoAddRequest.from_kwargs(url=req.url, pat=req.pat))
     # req.name is ALWAYS set here: from_kwargs derived+validated the default
