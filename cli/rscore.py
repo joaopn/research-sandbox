@@ -4520,6 +4520,9 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     if container_exists(container_name):
         die(f"project {project!r} already exists (container {container_name}). "
             f"Use destroy first.")
+    # A workspace folder the operator could not make refuses here, before any
+    # side effect (docker creates a missing projects folder root-owned).
+    _refuse_unwritable_projects_dir(project, workspace_path)
     # Wiring left behind by an earlier project of this name belongs to nothing.
     mcp_forget_dead_project(project)
     # A same-named create reuses a leftover workspace, whose settings folder a
@@ -6744,6 +6747,60 @@ def _write_marker(workspace_path: "Path", data: dict, what: str) -> None:
         _write_marker_text(workspace_path, data)
     except orch_files.Unusable as e:
         raise ValidationError(f"cannot {what}: {e}")
+
+
+def _refuse_unwritable_projects_dir(project: str, workspace_path: "Path") -> None:
+    """Refuse a create whose workspace folder the user RS runs as could not
+    make, before any side effect — instead of a PermissionError escaping from
+    the workspace mkdir (a traceback at the CLI, no reply at all through the
+    broker). It checks exactly what `workspace_path.mkdir(parents=True,
+    exist_ok=True)` needs and no more: an existing workspace (in any form) is
+    left to create's later steps, which reset and check it; otherwise the
+    nearest existing entry above it must be a folder this user can write in.
+    So a re-create over a leftover project folder the user can write in passes
+    even when the projects folder itself is not writable. Side-effect free.
+    The text reaches the browser: no path, no command."""
+    try:
+        os.lstat(workspace_path)
+        return
+    except (FileNotFoundError, NotADirectoryError):
+        pass
+    except OSError:
+        raise ValidationError(_UNWRITABLE_PROJECTS_DIR.format(project=project))
+    p = workspace_path.parent
+    while True:
+        try:
+            os.lstat(p)
+            break
+        except (FileNotFoundError, NotADirectoryError):
+            if p == p.parent:
+                raise ValidationError(
+                    _UNWRITABLE_PROJECTS_DIR.format(project=project))
+            p = p.parent
+        except OSError:
+            raise ValidationError(
+                _UNWRITABLE_PROJECTS_DIR.format(project=project))
+    try:
+        is_dir = stat.S_ISDIR(os.stat(p).st_mode)
+    except OSError:
+        is_dir = False  # a link that leads nowhere
+    if not is_dir:
+        raise ValidationError(_NOT_A_FOLDER_PROJECTS_DIR.format(project=project))
+    if not os.access(p, os.W_OK | os.X_OK):
+        raise ValidationError(_UNWRITABLE_PROJECTS_DIR.format(project=project))
+
+
+_NOT_A_FOLDER_PROJECTS_DIR = (
+    "cannot create project {project!r}: something on the path to the "
+    "project's folder (the projects folder, the project's folder in it, or a "
+    "folder above them) exists but is not a folder; RS needs folders there "
+    "that the user RS runs as can write in")
+_UNWRITABLE_PROJECTS_DIR = (
+    "cannot create project {project!r}: the user RS runs as cannot write in "
+    "the projects folder or in the project's folder in it (or, when the "
+    "projects folder does not exist yet, in the folder it would be created "
+    "in), for example because it belongs to another user or is read-only; RS "
+    "needs a projects folder that this user can write in")
 
 
 def _refuse_leftover_settings(project: str, workspace_path: "Path", *,
@@ -24604,6 +24661,27 @@ def webui_bind_state() -> str:
     return "wildcard" if _is_wildcard_address(addr) else "ok"
 
 
+def webui_projects_dir() -> "Path | None":
+    """The folder docker compose binds into the webui at /projects, resolved
+    the way compose resolves `${PROJECTS_DIR:-./container_volumes}` (no I/O):
+    an empty or unset value takes compose's default; a value whose first
+    character is not `/`, `.` or `~` is a volume NAME to compose (it rejects
+    the file), so None; a leading `~` becomes $HOME with the rest joined (no
+    `~user` lookup); a relative value is anchored at the compose file's folder
+    (SCRIPT_DIR, which `docker_compose` passes as `-f`). Relative and `~`
+    values are cleaned lexically, as compose's join does (`./a/../b` is
+    SCRIPT_DIR/b); an absolute value is kept as written, as compose keeps it.
+    The webui start creates this folder before `up`, so the two must agree."""
+    raw = os.environ.get("PROJECTS_DIR") or "./container_volumes"
+    if raw[0] not in "/.~":
+        return None
+    if raw.startswith("/"):
+        return Path(raw)
+    if raw.startswith("~"):
+        return Path(os.path.normpath(str(Path.home() / raw[1:].lstrip("/"))))
+    return Path(os.path.normpath(str(SCRIPT_DIR / raw)))
+
+
 def webui_compose_env(bind: str, port: str, listen_subnet: str,
                       broker_run_dir: Path) -> dict[str, str]:
     """Every variable the webui's compose service takes from the caller, so
@@ -24615,17 +24693,28 @@ def webui_compose_env(bind: str, port: str, listen_subnet: str,
     broker's run dir, mounted read-only as the socket's parent.
 
     PROJECTS_DIR and HOME are not in the set: compose reads PROJECTS_DIR from
-    .env itself and HOME is the operator's own. `broker_run_dir` is passed in
-    because this module cannot import the broker (it imports this module).
+    .env (or the environment) itself, resolving it exactly as
+    `webui_projects_dir` does, and HOME is the operator's own. `broker_run_dir`
+    is passed in because this module cannot import the broker (it imports this
+    module).
 
-    Side effect, after every read has succeeded: the broker run dir is
-    created, operator-owned, so the bind-mount source exists before `up` —
-    otherwise docker creates it root-owned and the broker (running as the
-    operator) cannot bind its socket there. A malformed origin range dies; a
+    Side effects, after every read has succeeded: the broker run dir and the
+    projects folder are created, operator-owned, so both bind-mount sources
+    exist before `up` — otherwise docker creates them root-owned: the broker
+    (running as the operator) cannot bind its socket there, and no project can
+    be created in the projects folder. A malformed origin range dies; a
     malformed pass-through block raises ValidationError (the caller adds the
-    .env remedy); neither leaves anything behind."""
+    .env remedy); a PROJECTS_DIR compose would not read as a folder dies;
+    none of these leaves anything behind. A projects folder that cannot be
+    created dies naming it (the broker run dir may already exist then)."""
     origin_lo, origin_hi = _webui_origin_port_range()
     pt_lo, pt_hi = webui_passthrough_port_range()
+    projects_dir = webui_projects_dir()
+    if projects_dir is None:
+        raw = os.environ.get("PROJECTS_DIR", "")
+        die(f"PROJECTS_DIR (in .env or the environment) must be an absolute "
+            f"path or start with ./ or ~ (got {raw!r}); docker compose reads "
+            f"any other value as a volume name, not a folder")
     env = {
         "WEBUI_LISTEN_SUBNET": listen_subnet,
         "WEBUI_BIND": bind,
@@ -24639,6 +24728,12 @@ def webui_compose_env(bind: str, port: str, listen_subnet: str,
         "RS_BROKER_DIR": str(broker_run_dir),
     }
     broker_run_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        projects_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        die(f"cannot create the projects folder {projects_dir}: {e.strerror}. "
+            f"Create it as the user running RS, or point PROJECTS_DIR in .env "
+            f"at a folder that user can write in.")
     return env
 
 
