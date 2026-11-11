@@ -524,6 +524,12 @@ _BOX_DISCARD_REASONS = {
                 "plain folder name",
     "parent-link": "the project's boxes folder is a link, so nothing was "
                    "deleted and the box's workspace was left in place",
+    "partial": "some of its workspace files could not be deleted (files "
+               "created as root inside the box, or files in a folder that is "
+               "not writable), so they were left in the box's folder under "
+               "/workspace/boxes in the project; remove them from the "
+               "project's terminal (root may be needed) before adding a box "
+               "of this name again",
 }
 _BOX_DISCARD_REASON_DEFAULT = ("its workspace could not be examined or removed, "
                                "so it was left in place")
@@ -5284,7 +5290,7 @@ def destroy(req: DestroyRequest, cfg: "Config" | None = None,
         # only when it is provably this project's own folder; a refusal is
         # one warning (the leftovers walk is skipped) and the teardown goes on.
         refused = _remove_own_folder(project_root.parent, project_root.name)
-        stuck = [] if refused else _project_root_leftovers(project_root)
+        stuck = [] if refused else _own_folder_leftovers(project_root)
         if refused:
             msg = _project_folder_refusal(project_root, refused)
             print(f"warning: {msg}", file=sys.stderr)
@@ -5382,8 +5388,8 @@ def _remove_own_folder(parent: Path, name: str) -> str | None:
     False (a macOS host) rmtree still never follows a link by design, but a
     swap racing the walk is not guarded. Not covered anywhere: `parent` itself
     swapped during the delete (rmtree takes no dir_fd on Python 3.9). A partial
-    delete is swallowed here; destroy reports what survived (box remove
-    does not yet)."""
+    delete is swallowed here; destroy and box remove report what survived
+    (_own_folder_leftovers)."""
     if not isinstance(name, str) or not _OWN_FOLDER_NAME_RE.match(name):
         return "bad-name"
     path = Path(parent) / name
@@ -5471,23 +5477,24 @@ def _remove_box_env_store(env_root: Path, project: str) -> list[str]:
     return []
 
 
-def _project_root_leftovers(project_root: Path) -> list[str]:
-    """What destroy's removal of the project folder left behind, found by a
-    READ-ONLY walk after the delete (_remove_own_folder decides whether the
-    folder is destroy's to delete; a refused folder is never walked). Returns
-    the leaves of what survived: every file or link, every empty folder, and
-    every folder whose contents cannot be listed. An empty list means the
-    folder is gone."""
-    if not os.path.lexists(project_root):
+def _own_folder_leftovers(folder: Path) -> list[str]:
+    """What survived a delete of an own folder (destroy's project folder, box
+    remove's boxes/<name>), found by a READ-ONLY walk after the delete;
+    _remove_own_folder decides whether the folder is the caller's to delete,
+    and a refused folder is never walked. MIRROR PAIR (cli/rscore.py and
+    cli/rs_sandbox.py, byte-identical, pytest-pinned). Returns the leaves of
+    what survived: every file or link, every empty folder, and every folder
+    whose contents cannot be listed. An empty list means the folder is gone."""
+    if not os.path.lexists(folder):
         return []
-    if project_root.is_symlink() or not project_root.is_dir():
-        return [str(project_root)]
+    if folder.is_symlink() or not folder.is_dir():
+        return [str(folder)]
     left: list[str] = []
 
     def unlistable(err: OSError) -> None:
         left.append(str(err.filename))
 
-    for dirpath, dirnames, filenames in os.walk(project_root, onerror=unlistable):
+    for dirpath, dirnames, filenames in os.walk(folder, onerror=unlistable):
         # os.walk lists a link to a folder under dirnames and does not follow it.
         for name in dirnames:
             if os.path.islink(os.path.join(dirpath, name)):

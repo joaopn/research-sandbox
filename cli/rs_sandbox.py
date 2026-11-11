@@ -3601,8 +3601,8 @@ def _remove_own_folder(parent: Path, name: str) -> str | None:
     False (a macOS host) rmtree still never follows a link by design, but a
     swap racing the walk is not guarded. Not covered anywhere: `parent` itself
     swapped during the delete (rmtree takes no dir_fd on Python 3.9). A partial
-    delete is swallowed here; destroy reports what survived (box remove
-    does not yet)."""
+    delete is swallowed here; destroy and box remove report what survived
+    (_own_folder_leftovers)."""
     if not isinstance(name, str) or not _OWN_FOLDER_NAME_RE.match(name):
         return "bad-name"
     path = Path(parent) / name
@@ -3622,6 +3622,35 @@ def _remove_own_folder(parent: Path, name: str) -> str | None:
         return "not-a-folder"
     shutil.rmtree(path, ignore_errors=True)
     return None
+
+
+def _own_folder_leftovers(folder: Path) -> list[str]:
+    """What survived a delete of an own folder (destroy's project folder, box
+    remove's boxes/<name>), found by a READ-ONLY walk after the delete;
+    _remove_own_folder decides whether the folder is the caller's to delete,
+    and a refused folder is never walked. MIRROR PAIR (cli/rscore.py and
+    cli/rs_sandbox.py, byte-identical, pytest-pinned). Returns the leaves of
+    what survived: every file or link, every empty folder, and every folder
+    whose contents cannot be listed. An empty list means the folder is gone."""
+    if not os.path.lexists(folder):
+        return []
+    if folder.is_symlink() or not folder.is_dir():
+        return [str(folder)]
+    left: list[str] = []
+
+    def unlistable(err: OSError) -> None:
+        left.append(str(err.filename))
+
+    for dirpath, dirnames, filenames in os.walk(folder, onerror=unlistable):
+        # os.walk lists a link to a folder under dirnames and does not follow it.
+        for name in dirnames:
+            if os.path.islink(os.path.join(dirpath, name)):
+                left.append(os.path.join(dirpath, name))
+        for name in filenames:
+            left.append(os.path.join(dirpath, name))
+        if not dirnames and not filenames:
+            left.append(dirpath)
+    return left
 
 
 def cmd_settings(args: argparse.Namespace) -> None:
@@ -3766,8 +3795,10 @@ def cmd_discard(args: argparse.Namespace) -> None:
     project whose boxes/ folder is itself a link deletes nothing). A workspace
     left in place does not fail the discard (the host's box cleanup must still
     run): the outcome is JSON on stdout, {"name", "workspace": "kept" |
-    "removed" | "link-removed" | "refused", "mailbox_kept", "warnings":
-    [{"kind": "workspace", "reason": …}]}, plus a human line on stderr."""
+    "removed" | "partial" | "link-removed" | "refused", "mailbox_kept",
+    "warnings": [{"kind": "workspace", "reason": …}]}, plus a human line on
+    stderr. "partial" means the delete ran and a read-only walk after it found
+    files that survived (reason "partial"); they are left in place."""
     _require_dind_project()
     if not _NAME_RE.match(args.name):
         die("invalid box name")
@@ -3803,9 +3834,19 @@ def cmd_discard(args: argparse.Namespace) -> None:
         # that is a link would point every box's folder somewhere else.
         reason = ("parent-link" if os.path.islink(boxes)
                   else _remove_own_folder(boxes, args.name))
-        if reason is None:
+        # A delete that removed only part of the folder (files created as
+        # root inside the box, a folder that is not writable) is reported,
+        # never read as removed: the same read-only walk destroy runs.
+        left = _own_folder_leftovers(boxes / args.name) if reason is None else []
+        if reason is None and not left:
             workspace = "removed"
             human = f"box {args.name!r}: discarded{f' ({kept[2:]})' if kept else ''}"
+        elif reason is None:
+            workspace = "partial"
+            warnings.append({"kind": "workspace", "reason": "partial"})
+            human = (f"box {args.name!r}: discarded; {len(left)} item(s) of "
+                     f"boxes/{args.name} could not be deleted and were left "
+                     f"in place (first: {left[0]}){kept}")
         else:
             workspace = "link-removed" if reason == "link-removed" else "refused"
             warnings.append({"kind": "workspace", "reason": reason})
