@@ -4959,7 +4959,6 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
                 history_line = _project_history_status_line(code, hist_row["repo"])
             progress.step("note" if history_line.startswith("History: on")
                           else "warning", history_line)
-        progress.step("ready", "project ready")
     else:
         # 6. Wait for inner dockerd, then stage the inner images.
         progress.step("stage-images", "staging inner images")
@@ -5213,6 +5212,10 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         if not _wait_for_service_ready(container_name, READER_PORT):
             print(f"warning: reader not listening on :{READER_PORT} after "
                   f"{EDITOR_READY_TIMEOUT_S}s; it should come up shortly")
+
+    # "ready" is the last milestone on both substrates: it follows every step
+    # that can still fail or wait (the fetch staging, the editor/reader gates).
+    progress.step("ready", "project ready")
 
     # 7. Return result (the front-end formats the report from this).
     return CreateResult(
