@@ -222,7 +222,8 @@ CLIENT_TIMEOUT_S = 10
 class _Tee:
     """Fan one text stream out to several sinks. Used to send the verb's
     captured stdout/stderr to the host-only full log while stderr also keeps
-    feeding the StringIO the dispatcher reads to build a die() error envelope."""
+    feeding the StringIO the dispatcher falls back on when a verb exits without
+    die() (see `_exit_reason`)."""
 
     def __init__(self, *sinks):
         self._sinks = sinks
@@ -2517,11 +2518,10 @@ def run_lifecycle(op_id: str, verb: str, args_json: str) -> None:
         # client-envelope-only half of the split sink.
         print(e.log_msg)
         op.progress.fail(e.log_msg)
-    except SystemExit:
-        # die() printed "error: <msg>" to stderr (teed into buf AND the full
-        # log); the same trim the inline dispatch path applies.
-        msg = buf.getvalue().strip() or "operation failed"
-        op.progress.fail(msg.split("error: ", 1)[-1])
+    except SystemExit as e:
+        # die() recorded its message on the exit; the same reason the inline
+        # dispatch path relays. The full log keeps every stderr line.
+        op.progress.fail(_exit_reason(e, buf.getvalue()))
     except Exception:
         traceback.print_exc()                     # a raw exception prints nothing on its own
         op.progress.fail("operation failed")      # coarse token; detail is in the full log
@@ -2536,6 +2536,22 @@ def run_lifecycle(op_id: str, verb: str, args_json: str) -> None:
 
 def _err(kind: str, message: str) -> dict:
     return {"ok": False, "error": {"kind": kind, "message": message}}
+
+
+def _exit_reason(exc: SystemExit, captured: str) -> str:
+    """The failure reason for a verb that exited: die()'s own message when die()
+    raised the exit, else the captured stderr after its first "error: " (a bare
+    sys.exit after its own error line), else "operation failed".
+
+    The message comes from the exception, not from re-parsing stderr: an
+    operation can catch an earlier die() and carry on (printing warnings), and
+    a final die() can itself carry tool stderr with "error: " lines in it
+    (run_check), so no cut of the captured text finds the final message."""
+    reason = getattr(exc, "die_message", None)
+    if isinstance(reason, str) and reason.strip():
+        return reason.strip()
+    msg = captured.strip() or "operation failed"
+    return msg.split("error: ", 1)[-1]
 
 
 def _auth_login(args: dict, tokens) -> dict:
@@ -2948,12 +2964,12 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
                             _err("bad_request", f"invalid op_id: {e}"))
     progress = op.progress if op is not None else None
 
-    # A verb that calls die() raises SystemExit after printing to stderr; capture
-    # that text so the failure message reaches the caller instead of the daemon
-    # log. When an op log is active, stdout+stderr also tee to the host-only
-    # full log — stderr to BOTH buf (for the die() envelope below) and the full
-    # log, stdout to the full log only. Serial request handling makes the global
-    # stream swap race-free.
+    # A verb that calls die() raises SystemExit after printing to stderr; the
+    # die() message reaches the caller instead of the daemon log, and the
+    # captured stderr is the fallback for a bare exit (`_exit_reason`). When an
+    # op log is active, stdout+stderr also tee to the host-only full log —
+    # stderr to BOTH buf (the fallback) and the full log, stdout to the full
+    # log only. Serial request handling makes the global stream swap race-free.
     buf = io.StringIO()
     out_stream = _Tee(op.full) if op is not None else None
     err_stream = _Tee(buf, op.full) if op is not None else buf
@@ -2981,10 +2997,10 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
         if op is not None:
             op.full.write(e.log_msg + "\n")
             op.progress.fail(e.log_msg)
-    except SystemExit:
-        msg = buf.getvalue().strip() or "operation failed"
-        # die() prints "error: <msg>"; trim the prefix for a clean envelope.
-        msg = msg.split("error: ", 1)[-1]
+    except SystemExit as e:
+        # die()'s own message (recorded on the exit), never an earlier caught
+        # die() or a warning printed in between.
+        msg = _exit_reason(e, buf.getvalue())
         reply, outcome = _err("failed", msg), "failed"
         if op is not None:
             op.progress.fail(msg)

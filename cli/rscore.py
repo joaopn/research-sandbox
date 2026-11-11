@@ -6382,8 +6382,16 @@ READER_PORT = 8445
 
 
 def die(msg: str, code: int = 1) -> "NoReturn":  # type: ignore[name-defined]
-    print(f"error: {msg}", file=sys.stderr)
-    sys.exit(code)
+    """Print "error: <msg>" to stderr and exit with `code`. The message is also
+    recorded on the raised SystemExit as `die_message`: the broker relays
+    exactly that text as an operation's failure reason, so an earlier die()
+    that a caller caught and recovered from, and any warning printed after it,
+    never reach the reason (cli/broker.py `_exit_reason`)."""
+    text = f"{msg}"
+    print(f"error: {text}", file=sys.stderr)
+    exc = SystemExit(code)          # what sys.exit(code) raises
+    exc.die_message = text
+    raise exc
 
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
@@ -17994,9 +18002,9 @@ def _role_mcp_enable(project: str, cfg: "Config", role: str,
         # An image-baked role (websearcher) has tools of its own: no
         # proxy-routed upstream is its normal state, so say nothing. For
         # any other role it means the worker has no MCP tools at all. The
-        # text names only verbs that parse, and carries no "error: " —
-        # the broker relays stderr to the browser only after the first
-        # "error: ", so this line stays CLI / host-log only.
+        # text names only verbs that parse. A failing operation's reason
+        # in the broker is die()'s own message alone, so this warning
+        # never becomes it; it stays in the CLI output and the full op log.
         if not chosen_upstreams and role not in role_mcp.ROLE_BAKED_MCPS:
             print(
                 f"warning: worker {role!r} has no MCP tools: no MCP allowed "
