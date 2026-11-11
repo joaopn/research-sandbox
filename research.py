@@ -468,15 +468,18 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         rscore.CreateRequest,
         name=args.name, workflow=args.workflow,
         egress=args.egress, dind=args.dind,
-        # --mount is repeatable; join the flags into the comma form so the
-        # request sees exactly what one comma-separated flag produces (a list
-        # would be taken element-by-element, leaving "/b,/c" as one path).
+        # --mount, --enable and --disable are repeatable; join the flags into
+        # the comma form so the request sees exactly what one comma-separated
+        # flag produces (a list would be taken element-by-element, leaving
+        # "/b,/c" or "websearcher,reader" as one token).
         profile=args.profile,
         mount=",".join(args.mount) if args.mount else None,
         memory=args.memory,
         cpus=args.cpus, ssh_port=args.ssh_port,
-        inner_firewall=args.inner_firewall, enable=args.enable,
-        disable=args.disable, role_mcp_upstream=args.role_mcp_upstream,
+        inner_firewall=args.inner_firewall,
+        enable=",".join(args.enable) if args.enable else None,
+        disable=",".join(args.disable) if args.disable else None,
+        role_mcp_upstream=args.role_mcp_upstream,
         mcp=args.mcp,
         repo=args.repo, ref=args.ref, setup=args.setup_script,
         fetch=args.fetch,
@@ -907,7 +910,9 @@ def cmd_project_update(args: argparse.Namespace) -> None:
     req = _build(
         rscore.UpdateRequest,
         name=args.name, rebuild=args.rebuild,
-        enable=args.enable, disable=args.disable,
+        # Repeatable flags joined into the comma form (as create does).
+        enable=",".join(args.enable) if args.enable else None,
+        disable=",".join(args.disable) if args.disable else None,
         role_mcp_upstream=args.role_mcp_upstream,
         supervisor_model=args.supervisor_model,
         supervisor_effort=args.supervisor_effort,
@@ -2767,8 +2772,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--inner-firewall", action="store_true",
                    help="enable defense-in-depth iptables ACL on the supervisor's "
                         "rs-inner bridge (workers can only reach mcp-proxy + DNS)")
-    c.add_argument("--enable", metavar="IDS",
-                   help=f"comma-separated tokens to force-enable. Tokens "
+    c.add_argument("--enable", metavar="IDS", action="append",
+                   help=f"comma-separated tokens to force-enable (the flag "
+                        f"may also be repeated). Tokens "
                         f"are matched by name against two registries: "
                         f"services ({','.join(KNOWN_SERVICES)}) and workers "
                         f"({','.join(sorted(role_mcp.ROLE_IMAGES))}). Worker "
@@ -2783,8 +2789,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "auto-derives upstreams from the registry × allow "
                         "intersection. Empty CSV (e.g. `wrangler=`) means "
                         "explicit no-upstreams.")
-    c.add_argument("--disable", metavar="IDS",
-                   help="comma-separated tokens to disable for this project, "
+    c.add_argument("--disable", metavar="IDS", action="append",
+                   help="comma-separated tokens (the flag may also be "
+                        "repeated) to disable for this project, "
                         "overruling the host default-enable sets: service ids "
                         "(supervisor is always-on) and worker services. "
                         "e.g. `--disable websearcher` skips a default-enabled "
@@ -2918,8 +2925,9 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--rebuild", action="store_true",
                    help="rebuild images first (required for Dockerfile / "
                         "mcp-proxy / worker-image changes)")
-    u.add_argument("--enable", metavar="IDS",
-                   help=f"comma-separated tokens to enable. Matched by "
+    u.add_argument("--enable", metavar="IDS", action="append",
+                   help=f"comma-separated tokens to enable (the flag may "
+                        f"also be repeated). Matched by "
                         f"name against services ({','.join(KNOWN_SERVICES)}) "
                         f"and workers ({','.join(sorted(role_mcp.ROLE_IMAGES))}). "
                         f"Anything else is treated as a service id.")
@@ -2928,8 +2936,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="repeatable: pin an explicit upstream list for a "
                         "worker activated via `--enable <role>` "
                         "(see `project create --help` for full semantics).")
-    u.add_argument("--disable", metavar="IDS",
-                   help="comma-separated service ids to disable "
+    u.add_argument("--disable", metavar="IDS", action="append",
+                   help="comma-separated service ids (the flag may also be "
+                        "repeated) to disable "
                         "(supervisor is always-on and cannot be "
                         "disabled), plus worker services to disable "
                         "for this project.")
