@@ -158,12 +158,11 @@ def consumer_email(username: str) -> str:
 # guard. It's only a BACKSTOP anyway: `dev sync <repo>` (and the resume path)
 # trigger an immediate pull when the human wants GitHub changes reflected now.
 MIRROR_INTERVAL = "10m"
-# Page size user_repos asks for when it enumerates one account's repos for the
-# fail-closed purge gate, which refuses a full page rather than guess what lies
-# beyond it.
-LIST_LIMIT = 100
 # The Development-page read bound (repo_status: up to FIVE metadata GETs per
-# repo on the broker's serial thread — forks list, mirror info, fork info,
+# repo on the broker's serial thread — forks list (its first LIST_PAGE_SIZE
+# rows; a mirror with more forks adds one STATUS_TIMEOUT_S-bounded read per
+# further page OUTSIDE the budget below, paid only on a half-up gitea that
+# answers page one and stalls a later page), mirror info, fork info,
 # the FIRST page of pulls, the FIRST page of branches; an EMPTY or fork-less
 # repo stops at three/two — plus the continuation pages of those two lists
 # and then the upstream-sync decoration, which spend only what those five
@@ -1859,27 +1858,23 @@ def user_repos(host_port: str, user: str, *, detail: bool = False) -> list[dict]
     closed; never add a best-effort wrapper for a gate to call.
 
     An ABSENT user maps to [] rather than raising — a purge of something already
-    gone is a no-op success, not an error (see purge_consumer)."""
+    gone is a no-op success, not an error (see purge_consumer).
+
+    Every page is read (gitea answers at most one clamped page per call): a
+    repo beyond the first page that went unseen would make "no live fork" an
+    artefact of pagination — fail-OPEN in the delete direction. Each page
+    RAISES on failure, so a failing page never yields a partial list."""
     client = GiteaClient(api_base(host_port), read_admin_token())
+    # Keyed on id, unique across owners (the list_repos precedent).
+    pager = _ListPager(client, f"/users/{user}/repos", "id")
     try:
-        raw = client._api("GET", f"/users/{user}/repos?limit={LIST_LIMIT}",
-                          timeout=STATUS_TIMEOUT_S) or []
+        pager.all(STATUS_TIMEOUT_S)
     except GiteaError as e:
         if e.status == 404:
             return []
         raise
-    rows = raw if isinstance(raw, list) else []
-    # NO SILENT CAP on a fail-closed gate. A full page means there may be more
-    # repos we never saw, and "we did not see a live fork" would then be an
-    # artefact of pagination — fail-OPEN in the delete direction, the one
-    # direction that cannot be taken back. This feeds a delete, so it takes the
-    # posture stated above: an unverifiable state is never a licence to delete.
-    if len(rows) >= LIST_LIMIT:
-        raise GiteaError(
-            f"{user!r} owns at least {LIST_LIMIT} repos — cannot enumerate them "
-            f"in one page, so its fork state cannot be verified")
     out = []
-    for r in rows:
+    for r in pager.rows:
         if not isinstance(r, dict):
             continue
         row = {"repo": r.get("name") or "", "archived": bool(r.get("archived"))}
@@ -2112,12 +2107,15 @@ def consumer_forks(host_port: str, repo: str) -> list[dict]:
         mean "safe to delete the mirror and every fork on it".
       * A STATUS read degrades to empty (list_forks).
       * The delete CASCADE warns and continues (remove_repo).
+
+    Every page is read, each RAISING on failure (never a partial list): a live
+    fork beyond gitea's first page must not read as "no live forks".
     """
     client = GiteaClient(api_base(host_port), read_admin_token())
-    raw = client._api("GET", f"/repos/{ADMIN_USER}/{repo}/forks",
-                      timeout=STATUS_TIMEOUT_S) or []
+    pager = _ListPager(client, f"/repos/{ADMIN_USER}/{repo}/forks", "id")
+    pager.all(STATUS_TIMEOUT_S)
     out = []
-    for f in raw if isinstance(raw, list) else []:
+    for f in pager.rows:
         if not isinstance(f, dict):
             continue
         owner = (f.get("owner") or {}).get("login") or ""
@@ -2249,7 +2247,8 @@ class _ListPager:
     a server that repeats a page even with a frozen clock.
 
     all() is the third entry point, for an enumeration with no deadline of its
-    own (list_repos): every page, each raising on failure."""
+    own (list_repos, and the destructive gates' user_repos and consumer_forks):
+    every page, each raising on failure."""
 
     def __init__(self, client: "GiteaClient", path: str, key: str) -> None:
         self._client = client
@@ -2296,14 +2295,16 @@ class _ListPager:
     def first(self) -> None:
         self._read(STATUS_TIMEOUT_S)
 
-    def all(self) -> None:
-        """Every page, each a per-call-bounded read (the client's default
-        API_TIMEOUT_S, the bound the single list read had before) that RAISES
-        on failure, so a failing page never yields a partial list. Always
+    def all(self, timeout: "float | None" = None) -> None:
+        """Every page, each a per-call-bounded read that RAISES on failure, so
+        a failing page never yields a partial list. `timeout` bounds each page
+        read (None: the client's default API_TIMEOUT_S — list_repos's bound;
+        user_repos and consumer_forks pass STATUS_TIMEOUT_S, the bound their
+        single read had before, which repo_status's budget assumes). Always
         ends: each read either finishes the list or adds at least one new row,
         and a page adding none finishes it."""
         while not self.done:
-            self._read(None)
+            self._read(timeout)
 
     def rest(self, deadline_at: float) -> None:
         while not self.done:
