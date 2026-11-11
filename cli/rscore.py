@@ -17964,6 +17964,44 @@ def _role_mcp_stop(supervisor: str, role: str) -> None:
         capture_output=True)
 
 
+# Bound on one role job file read by the host. The project (its agent or its
+# role daemon) can write anything under `<workspace>/.role-mcps/<role>/jobs/`,
+# so the host's read must be bounded: a planted multi-GB file would otherwise
+# be loaded whole, on the broker's lifecycle lane, under the host-wide
+# lifecycle lock. A `running` entry is the daemon's fixed register field set;
+# its only unbounded field is `caller`, which the daemon passes to the spawn
+# as an exec argument and as the `RS_CALLER` environment string, so a caller
+# longer than the kernel's per-string exec limit (MAX_ARG_STRLEN, 131072
+# bytes with the NUL) fails at spawn and no process ever runs. The daemon
+# serializes with JSON ASCII escaping, which turns one control byte into six,
+# so the largest entry of a call that really runs is about 768 KiB (measured:
+# 786,681 bytes for a 131071-byte control-byte caller). 1 MiB sits above that
+# worst case, so a file above it never describes a live call and skipping it
+# can never let a stop kill one; half the value would fall below the worst
+# case, and ten times only makes the lane read more junk. (An over-limit
+# caller's entry is briefly `running` with no pid between register and the
+# spawn failure; skipping it is harmless, there is no process.) The size is
+# checked from `fstat` first and enforced again by the bounded read, so a
+# file that grows after the fstat is still bounded.
+ROLE_MCP_JOB_MAX_BYTES = 1024 * 1024
+# The `jobs` folder (listed) and each job file. Portable flags only, so they
+# can be module-level; the O_PATH set for the levels above `jobs` is built at
+# call time by `_role_job_path_flags`.
+_ROLE_JOB_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_ROLE_JOB_READ_FLAGS = (os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
+                        | os.O_NOCTTY | os.O_CLOEXEC)
+
+
+def _role_job_path_flags() -> int:
+    """Flags for the levels above `jobs` (the workspace, `.role-mcps`,
+    `<role>`): O_PATH needs only search permission, as the old `is_dir()`
+    walk did, and O_NOFOLLOW|O_DIRECTORY refuses a link or a non-folder.
+    Built at call time because `os.O_PATH` is Linux-only and this module is
+    imported by the host CLI on every platform (the same reason every other
+    O_PATH use in the tree sits inside a function)."""
+    return os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
 def _role_mcp_in_flight(workspace_path: Path, role: str) -> list[dict]:
     """Read-only, host-side count of in-flight send_job calls, straight off
     the project volume (`<workspace>/.role-mcps/<role>/jobs/*.json` — the same
@@ -17971,20 +18009,63 @@ def _role_mcp_in_flight(workspace_path: Path, role: str) -> list[dict]:
     `running` is a live `claude -p` call (or a daemon-restart orphan the
     daemon would reap on its next boot; from the host the file state is the
     conservative signal — we'd rather refuse a stop than kill a real call).
-    Returns the running entries so the caller can name them in a refusal.
-    Pure read — no docker, no mutation, safe to call as a gate."""
-    jobs_dir = workspace_path / ".role-mcps" / role / "jobs"
-    if not jobs_dir.is_dir():
+    Returns the running entries (in file-name order) so the caller can name
+    them in a refusal. Pure read — no docker, no mutation, safe to call as a
+    gate.
+
+    The whole tree is project-writable, so it is read through descriptors,
+    each level relative to its parent: links are not followed at any level;
+    non-regular, multiply-linked and oversize files are skipped; reads are
+    bounded; unparseable content is skipped. The daemon writes every job file
+    as a fresh regular file renamed into place (one link, a few hundred
+    bytes), so nothing it writes is ever skipped. An unknown role, or a level
+    that is absent or not a real folder, yields no running jobs."""
+    try:
+        role_mcp.validate_role(role)
+    except ValueError:
         return []
+    path_flags = _role_job_path_flags()
     running: list[dict] = []
-    for p in sorted(jobs_dir.glob("*.json")):
+    fds: list[int] = []
+    try:
         try:
-            entry = json.loads(p.read_text())
-        except (json.JSONDecodeError, OSError):
-            continue
-        if isinstance(entry, dict) and entry.get("status") == "running":
-            running.append(entry)
-    return running
+            fds.append(os.open(workspace_path, path_flags))
+            for name in (".role-mcps", role):
+                fds.append(os.open(name, path_flags, dir_fd=fds[-1]))
+            fds.append(os.open("jobs", _ROLE_JOB_DIR_FLAGS, dir_fd=fds[-1]))
+            jobs_fd = fds[-1]
+            names = sorted(n for n in os.listdir(jobs_fd) if n.endswith(".json"))
+        except OSError:
+            return []
+        for name in names:
+            try:
+                fd = os.open(name, _ROLE_JOB_READ_FLAGS, dir_fd=jobs_fd)
+            except OSError:
+                continue
+            try:
+                cap = ROLE_MCP_JOB_MAX_BYTES
+                st = os.fstat(fd)
+                # `> 1`, never `!= 1`: a link count of 0 is the old inode of
+                # a live call the daemon just rewrote by rename (mark_pid);
+                # it still says `running` and is counted, as before.
+                if (not stat.S_ISREG(st.st_mode) or st.st_nlink > 1
+                        or st.st_size > cap):
+                    continue
+                with open(fd, "rb", closefd=False) as fh:
+                    raw = fh.read(cap + 1)
+                if len(raw) > cap:
+                    continue
+                entry = json.loads(raw.decode("utf-8"))
+            except (OSError, ValueError, RecursionError):
+                continue
+            finally:
+                os.close(fd)
+            if isinstance(entry, dict) and entry.get("status") == "running":
+                running.append(entry)
+        return running
+    finally:
+        for d in reversed(fds):
+            os.close(d)
 
 
 def _role_mcp_park(supervisor: str, role: str) -> None:
