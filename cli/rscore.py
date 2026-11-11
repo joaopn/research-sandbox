@@ -13103,6 +13103,29 @@ def wire_gitea_to_projects(progress=None) -> None:
         _restart_dev_boxes(project, cfg, ip, progress)
 
 
+def _dev_token_missing(who: str, user: str) -> str:
+    """The operator-facing core of every missing-consumer-token message: names
+    the consumer in project terms and its Gitea account, NEVER the host token
+    path (the line reaches the browser through a dev box add's or dev project
+    create's log tail) and never a CLI verb. "missing, empty or unreadable"
+    because every reader folds an OSError into an empty token."""
+    return (f"the Gitea access token of {who} (account {user!r}) "
+            f"is missing, empty or unreadable on this host")
+
+
+def _dev_consumer_label(entry: dict) -> tuple[str, str]:
+    """(who, what it loses) for a consumer ledger row, in project terms: a
+    history row is a notes history (the project's own when box is None), an
+    agent row is the project's agent (box None) or a dev box. Keyed on the
+    row's class and box, never on the account string — a history box's
+    account has the same agent- shape as a dev box's."""
+    box = entry.get("box")
+    if entry.get("class") == gitea.HISTORY_CLASS:
+        who = f"the notes history of box {box!r}" if box else "this project's notes history"
+        return who, "is no longer kept on the shared Gitea"
+    return (f"box {box!r}" if box else "this project's agent"), "cannot use the shared Gitea"
+
+
 def _stage_dev_git_credentials(container: str, user: str, *,
                                strict: bool = False) -> str:
     """Write a dev consumer's git credential store (~/.git-credentials) in a
@@ -13133,11 +13156,12 @@ def _stage_dev_git_credentials(container: str, user: str, *,
         tok = ""
     if not tok:
         if strict:
-            die(f"consumer token file for {user!r} is empty or missing; "
-                f"re-run the attach")
-        print(f"warning: consumer token missing at {tok_path}; skipped the "
-              f"git credential store re-derivation (re-attach to heal)",
-              file=sys.stderr)
+            die(_dev_token_missing("this project's agent", user)
+                + ", so its Gitea fork cannot be cloned")
+        print("warning: " + _dev_token_missing("this project's agent", user)
+              + "; its git credentials were not refreshed, so it cannot push "
+              "to or pull from its Gitea fork after the project's container "
+              "is recreated", file=sys.stderr)
         return ""
     r = run(["docker", "exec", "-i", "-u", "research", container, "sh", "-c",
              'umask 077 && cat > "$HOME/.git-credentials"'],
@@ -13257,6 +13281,11 @@ def _stage_dev_gitea(project: str, cfg: "Config", gitea_ip: str = "",
     container = container_name_for(project)
     if not (entries or hist_entries) or not container_running(container):
         return
+    # Who each consumer is, in project terms, for the missing-token warning
+    # (same source and filter as the loop's user set, so the lookup cannot
+    # miss; one account maps to one row class within a project's ledger).
+    label_of = {e["user"]: _dev_consumer_label(e) for e in entries + hist_entries
+                if e.get("user")}
     for user in sorted({e["user"] for e in entries + hist_entries
                         if e.get("user")}):
         tok_path = gitea.consumer_token_path(user)
@@ -13265,8 +13294,10 @@ def _stage_dev_gitea(project: str, cfg: "Config", gitea_ip: str = "",
         except OSError:
             tok = ""
         if not tok:
-            print(f"warning: consumer token missing at {tok_path}; skipped its "
-                  f"in-supervisor staging (re-attach or re-add the box)",
+            who, loss = label_of[user]
+            print("warning: " + _dev_token_missing(who, user)
+                  + f"; its copy in the project was not refreshed, so {who} "
+                  f"{loss} after the project's container is recreated",
                   file=sys.stderr)
             continue
         # Positional-arg sh so the (validated-name-derived) file name never
