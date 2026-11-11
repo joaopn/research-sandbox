@@ -2988,6 +2988,25 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
         reply, outcome = _err("failed", msg), "failed"
         if op is not None:
             op.progress.fail(msg)
+    except Exception as e:
+        # Backstop for an exception type the arms above do not map (a verb bug,
+        # an un-netted OSError). Without it the exception escapes dispatch and
+        # handle(): the client gets no reply at all, and the browser reads
+        # "Broker unreachable." while the broker is up. Placed LAST so the typed
+        # arms keep winning. The reply is the coarse token, never str(e): the
+        # text can carry a host path or a relayed secret. The reply is set
+        # FIRST and every side write is suppressed, so no logging failure can
+        # cost the reply. The traceback goes to the daemon's own stderr (the
+        # host-only broker log, where socketserver put it before); the
+        # browser-tailable full log gets the exception type name only.
+        reply, outcome = _err("failed", "operation failed"), "failed"
+        with contextlib.suppress(Exception):
+            traceback.print_exc()
+        if op is not None:
+            with contextlib.suppress(Exception):
+                op.full.write(f"unexpected error: {type(e).__name__}\n")
+            with contextlib.suppress(Exception):
+                op.progress.fail("operation failed")
     finally:
         if op is not None:
             op.close()
