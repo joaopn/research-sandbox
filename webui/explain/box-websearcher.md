@@ -5,7 +5,7 @@ search-oriented instructions. The agent is on by default.
 
 ## What it is
 
-A disposable container whose agent drives a headless Chromium through an
+A container whose agent drives a headless Chromium through an
 image-baked Playwright stdio MCP. Pages are read by their **accessibility tree**
 (image decode is off by design — it's faster and cheaper). The browser is the
 box's for the whole session and keeps state across turns; it dies with the box.
@@ -24,5 +24,6 @@ box's for the whole session and keeps state across turns; it dies with the box.
   content is treated as untrusted data, not instructions. Tick **Trusted
   browser** when adding the box to give its agents every browser tool.
 - Add **MCP tools** for project-specific lookups on top of the browser.
-- Boots credential-free: run `claude` then `/login` inside. Outputs live in
-  `/workspace`; egress follows the project's router policy.
+- Boots credential-free: sign the agent in inside (`claude` then `/login`, or
+  `pi` then `/login`). Outputs live in `/workspace`; egress follows the
+  project's router policy.

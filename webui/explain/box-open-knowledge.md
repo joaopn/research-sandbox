@@ -6,7 +6,7 @@ started by the box itself in its own tab. The agent is on by default.
 
 ## What it is
 
-A disposable container whose knowledge base is the folder `notes/` inside the
+A container whose knowledge base is the folder `notes/` inside the
 box. OpenKnowledge serves that folder as a live editor in a webui tab, and the
 agent edits the same notes through OpenKnowledge's own tools — you watch its
 edits land while you write beside it. Everything else in the box is its own
@@ -73,5 +73,5 @@ without it. The repo opens in the box's `<box> (GIT)` tab.
 - The agent's OpenKnowledge tools fetch the newest OpenKnowledge release when
   the agent starts (that is how `ok init` registers them), so the box needs
   network for them.
-- Boots credential-free: run `claude` then `/login` inside. Egress follows the
-  project's router policy.
+- Boots credential-free: sign the agent in inside (`claude` then `/login`, or
+  `pi` then `/login`). Egress follows the project's router policy.

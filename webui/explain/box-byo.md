@@ -6,7 +6,7 @@ box.
 
 ## What it is
 
-A disposable container seeded at boot with a repo cloned at a pinned ref and your
+A container seeded at boot with a repo cloned at a pinned ref and your
 optional setup command already run. The clone lives at `/workspace/<repo-name>`;
 the agent starts there and follows **the repo's own** conventions
 (`README` / `CLAUDE.md` / setup docs) — the box carries no project-specific
@@ -26,5 +26,5 @@ framing of its own.
 - **Setup** — a command run inside the box after the clone.
 
 Add **MCP tools** if the repo's work needs project MCP servers. Boots
-credential-free: run `claude` then `/login` inside. Outputs live in `/workspace`
-and persist across box stop/start.
+credential-free: sign the agent in inside (`claude` then `/login`, or `pi` then
+`/login`). Outputs live in `/workspace` and persist across box stop/start.

@@ -1,37 +1,61 @@
 # Boxes
 
-Disposable, isolated sub-containers you run **inside a dind project** (research
-or sandbox-dind) — for un-vetted code, a scoped agent task, or a quick browser /
-data session. Spin up as many as you like; throw them away when done.
+Isolated containers you add **inside a dind project** (sandbox-dind or
+research) — for un-vetted code, a scoped agent task, or a browser / data
+session. A box stays until you remove it: restarting the project brings its
+boxes back, and a box's files, in the project's `boxes/<name>/` folder, stay
+across restarts.
 
 ## What it is
 
 A box is a container in the project's inner Docker daemon, on the `rs-inner`
 bridge, behind the project's egress filter. It boots **credential-free** — even a
-box with an agent has no login until you run `claude` then `/login` inside it.
-Boxes are managed from the **+ Add box** button on the project's tab strip (and
-the in-supervisor `rs-sandbox` CLI).
+box with an agent has no login until you sign the agent in inside it (`claude`
+then `/login`, or `pi` then `/login` with an API key). Boxes are added from the
+**+** button (Add a box) on the project's tab strip (and the in-container
+`rs-sandbox` command).
 
 ## Box types
 
 Each **type** is a preset — the same two box images with different baked
 instructions + bundled capability:
 
-- **empty** — a clean box, no instructions, no capability. The blank slate.
-- **websearcher** — Playwright + headless Chromium baked in, with web-research
-  instructions.
+- **empty** — a clean box, no instructions, no capability, agent off. The
+  blank slate.
+- **websearcher** — Playwright + headless Chromium baked in, with instructions
+  for web research; its browser is restricted unless **Trusted browser** is
+  ticked.
 - **data-wrangler** — data-shaping instructions; add a database MCP to give it
   something to wrangle.
-- **byo** — clone a ref-pinned repo (with an optional setup command) and work in
-  it. Operators can register more types in `box-registry.json`.
+- **byo** — clone a ref-pinned repo (with an optional setup command run at
+  boot) and work in it.
+- **paper-orchestra** — clones the PaperOrchestra repo at boot; the editor is
+  on by default.
+- **open-knowledge** — an OpenKnowledge knowledge base in the box's `notes/`
+  folder, edited in its own tab beside the agent. **Share files** starts
+  ticked, and **Gitea history** is offered.
+- **zotero** — your Zotero library through the zotero MCP server, over the web
+  API. The window asks for an API key and a library ID, which the box keeps.
+- **dev** — a software-dev box from a GitHub URL and a branch: the repo is
+  mirrored and forked on the shared Gitea, the fork is cloned at boot, and work
+  is delivered as pull requests. The editor is on by default; MCP tools,
+  Browser, rs-fetch and read-only folders are not offered.
+
+Each type card's ⓘ opens that type's own page. Operators can register more
+types in `box-registry.json`.
 
 ## Toggles
 
 Independent of the type:
 
-- **Agent** — deploy `claude` into the box (defaults per type: empty off, the
-  others on). Selecting any MCP turns it on.
-- **Editor** — bundle the code-server editor (off by default).
+- **Agent** — None, or one of the project's agents. Picking any agent installs
+  every agent the project carries, each still signed out; the pick decides
+  which agent's settings the window shows. The type sets the default:
+  **empty** starts with None, every other type with the project's first
+  agent. Selecting any MCP rules out None. With Claude picked, a row beside it
+  sets the model and effort.
+- **Editor** — bundle the code-server editor. Off by default; the **dev** and
+  **paper-orchestra** types turn it on.
 - **Browser** — run the box on the Playwright + headless Chromium image so its
   agent can browse. The box type only sets the default (websearcher pre-checks
   it; its instructions assume the browser tools, so un-checking it there leaves
@@ -46,7 +70,12 @@ Independent of the type:
   agents every browser tool and honours those settings. Chosen when the box is
   added; to change it, remove the box and add it again.
 - **rs-fetch** — wire the box to pull dev-lane agent commits from the shared
-  Gitea into a git clone here (read-only; off by default; not on dev boxes).
+  Gitea into a git clone here (read-only; off by default; not on dev boxes;
+  not with Gitea history).
+- **Gitea history** — offered for the OpenKnowledge type when this host's Gitea
+  is enabled: the box's notes are pushed to a private repo on the shared
+  Gitea; the box can add to its main history but never delete or rewrite it.
+  Not with rs-fetch.
 - **MCP tools** — wire any of the project's allowed MCP servers into the box's
   agent through the inner proxy.
 - **Read-only folders** — tick **Add folders** and type the project folders the
@@ -111,10 +140,12 @@ RSORCHESTRATIONSVG
 
 ## How it works
 
-**+ Add box** creates the box in the project's inner Docker daemon with a pinned
+Adding a box creates it in the project's inner Docker daemon with a pinned
 IP on `rs-inner`. The chosen type's instructions land in the box agent's home
 rules folder (`~/.claude/rules/rs-instructions.md`, rewritten at every start; the
 box's own `/workspace/.claude/` is yours); any selected MCPs are wired to `mcp-proxy:8888` so the
 box's agent reaches them by name. Egress is the project's router policy (a
-sandbox-dind project defaults to locked). Discard a box from the `✕` on its tab —
-its container and workspace go with it.
+sandbox-dind project defaults to locked). Remove a box from the `✕` on its tab.
+By default its container and its files go; tick **preserve artifacts** in the
+remove dialog to keep its files in the project's `boxes/<name>/` folder. A
+sharing box's mailbox stays either way.
