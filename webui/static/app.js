@@ -10329,7 +10329,11 @@ function mgmtBoxRemoveDialog(project, box) {
 // create/destroy op completing, or syncSidebarFromBroker landing a late
 // project) replaces the whole <aside> and detaches the captured row, which
 // implicitly releases capture and sends the pointerup elsewhere — without it
-// the ghost leaks and body user-select sticks.
+// the ghost leaks and body user-select sticks. Where that event lands for a
+// detached row is engine-dependent: the Pointer Events spec fires it at the
+// document, older engines at the removed row. Both are listened to (the
+// sidebar splitter's two-listener shape); the document listener is filtered by
+// this press's pointerId, since every capture loss in the page bubbles there.
 // Press-vs-drag threshold: TAB_DRAG_SLOP_PX, one slop for every pointer drag
 // in the app.
 
@@ -10418,10 +10422,12 @@ function armProjectDrag(row, project) {
             showFeedback(target);
         };
         const cleanup = () => {
-            // lostpointercapture FIRST: the explicit release below fires it
-            // synchronously, and removing this listener before releasing is
-            // what prevents a re-entrant onCancel -> cleanup cycle.
+            // lostpointercapture FIRST (both listeners): the explicit release
+            // below fires it synchronously, bubbling to the document while the
+            // row is connected, and removing them before releasing is what
+            // prevents a re-entrant onCancel -> cleanup cycle.
             row.removeEventListener("lostpointercapture", onCancel);
+            document.removeEventListener("lostpointercapture", onDocLost);
             row.removeEventListener("pointermove", onMove);
             row.removeEventListener("pointerup", onUp);
             row.removeEventListener("pointercancel", onCancel);
@@ -10432,6 +10438,7 @@ function armProjectDrag(row, project) {
             document.body.style.userSelect = "";
         };
         const onCancel = () => { cleanup(); };
+        const onDocLost = (lv) => { if (lv.pointerId === ev.pointerId) onCancel(); };
         const onUp = async () => {
             const didDrag = dragging;
             const t = target;
@@ -10467,6 +10474,7 @@ function armProjectDrag(row, project) {
         row.addEventListener("pointerup", onUp);
         row.addEventListener("pointercancel", onCancel);
         row.addEventListener("lostpointercapture", onCancel);
+        document.addEventListener("lostpointercapture", onDocLost);
     };
 }
 
@@ -11579,9 +11587,13 @@ function applyColumnLayout() {
 // drag freezes (the original pane-splitter's discovery) — adjusting the two
 // adjacent ratios under the COLUMN_MIN_FRAC clamp. Geometry-only per frame
 // (a mid-drag strip rebuild would detach this very capture); persist + refit
-// on release. lostpointercapture is removed FIRST in the shared release
-// handler, before releasePointerCapture — the explicit release fires it
-// synchronously and remove-first prevents the re-entrant cycle (the tab
+// on release. lostpointercapture is a cancel path (an applyColumnLayout sweep
+// removes this splitter mid-drag) and is listened to on the splitter AND the
+// document — the Pointer Events spec fires it at the document for a detached
+// target, older engines at the removed splitter; the document listener is
+// filtered by this press's pointerId. Both are removed FIRST in the shared
+// release handler, before releasePointerCapture — the explicit release fires
+// it synchronously and remove-first prevents the re-entrant cycle (the tab
 // drag's discipline).
 function installColumnSplitterDrag(splitter, boundary) {
     splitter.onpointerdown = (ev) => {
@@ -11604,6 +11616,7 @@ function installColumnSplitterDrag(splitter, boundary) {
         };
         const onUp = async () => {
             splitter.removeEventListener("lostpointercapture", onUp);
+            document.removeEventListener("lostpointercapture", onDocLost);
             splitter.removeEventListener("pointermove", onMove);
             splitter.removeEventListener("pointerup", onUp);
             splitter.removeEventListener("pointercancel", onUp);
@@ -11614,6 +11627,7 @@ function installColumnSplitterDrag(splitter, boundary) {
             scheduleColumnRefit();
             await persistTabLayout(project, layout.columns, layout.ratios);
         };
+        const onDocLost = (lv) => { if (lv.pointerId === ev.pointerId) onUp(); };
         splitter.classList.add("dragging");
         document.body.style.userSelect = "none";
         try { splitter.setPointerCapture(ev.pointerId); } catch (_) {}
@@ -11621,6 +11635,7 @@ function installColumnSplitterDrag(splitter, boundary) {
         splitter.addEventListener("pointerup", onUp);
         splitter.addEventListener("pointercancel", onUp);
         splitter.addEventListener("lostpointercapture", onUp);
+        document.addEventListener("lostpointercapture", onDocLost);
     };
 }
 
@@ -14007,10 +14022,12 @@ function armTabDrag(tab, id, ctx) {
             showFeedback(target);
         };
         const cleanup = () => {
-            // lostpointercapture FIRST: the explicit release below fires it
-            // synchronously, and removing this listener before releasing is
-            // what prevents a re-entrant onCancel → cleanup cycle.
+            // lostpointercapture FIRST (both listeners): the explicit release
+            // below fires it synchronously, bubbling to the document while the
+            // tab is connected, and removing them before releasing is what
+            // prevents a re-entrant onCancel → cleanup cycle.
             tab.removeEventListener("lostpointercapture", onCancel);
+            document.removeEventListener("lostpointercapture", onDocLost);
             tab.removeEventListener("pointermove", onMove);
             tab.removeEventListener("pointerup", onUp);
             tab.removeEventListener("pointercancel", onCancel);
@@ -14022,6 +14039,7 @@ function armTabDrag(tab, id, ctx) {
             document.body.style.userSelect = "";
         };
         const onCancel = () => { cleanup(); };
+        const onDocLost = (lv) => { if (lv.pointerId === ev.pointerId) onCancel(); };
         const onUp = async () => {
             const didDrag = dragging;
             const t = target;
@@ -14051,14 +14069,18 @@ function armTabDrag(tab, id, ctx) {
         // A mid-drag strip re-render (refreshActiveServices on a service-set
         // signature change — e.g. a box editor's stub coming up) detaches the
         // captured tab, which implicitly releases capture and fires
-        // lostpointercapture at the detached element; the subsequent pointerup
-        // goes elsewhere, so WITHOUT this path neither onUp nor onCancel would
-        // run — the ghost would leak and body user-select would stick. The
-        // drag dies cleanly at the re-render instead (which also retires the
-        // stale-layout splice class — state.tabLayout is re-stashed by the
-        // engine on every rebuild). A plain click never reaches it: onUp
-        // removes this listener before the implicit post-pointerup release.
+        // lostpointercapture — at the document (the Pointer Events spec, for
+        // a disconnected target) or at the detached tab (older engines), so
+        // both are listened to, the document listener filtered by this
+        // press's pointerId; the subsequent pointerup goes elsewhere, so
+        // WITHOUT this path neither onUp nor onCancel would run — the ghost
+        // would leak and body user-select would stick. The drag dies cleanly
+        // at the re-render instead (which also retires the stale-layout
+        // splice class — state.tabLayout is re-stashed by the engine on every
+        // rebuild). A plain click never reaches it: onUp removes both
+        // listeners before the implicit post-pointerup release.
         tab.addEventListener("lostpointercapture", onCancel);
+        document.addEventListener("lostpointercapture", onDocLost);
     };
 }
 
