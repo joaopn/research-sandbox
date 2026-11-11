@@ -12,7 +12,11 @@ and rs-router's iptables gates network reachability). It only does:
 
   - URL rewrite ``/<name>/<rest>`` → ``http://<ip>:<port>/<rest>``
   - Header injection (e.g. Authorization) from config
-  - SSE pass-through (line-flushed) when upstream emits text/event-stream
+  - Streamed bodies (SSE included) are relayed piece by piece as the
+    upstream sends them. A body whose length the upstream did not state
+    (chunked or close-delimited) is relayed with ``Connection: close``, so
+    its end is the connection's close; an error reply states the length
+    of the bytes relayed (HEAD and 304 keep the upstream's)
   - Transparent 3xx redirect-following with method+body preserved, so a
     worker hitting ``/<name>/mcp`` against an upstream that 307s to
     ``/mcp/`` (Starlette ``redirect_slashes=True`` default) sees only
@@ -64,6 +68,12 @@ UPSTREAM_TIMEOUT = float(os.environ.get("MCP_PROXY_TIMEOUT", "86400"))  # 1 day
 # their DNS-rebinding-protection allowlist. The default matches the proxy's
 # rs-inner DNS name + listen port.
 PROXY_HOSTNAME = os.environ.get("MCP_PROXY_HOSTNAME", "mcp-proxy:8888")
+
+# Upper bound of one forwarded response piece. ``read1`` returns what one
+# upstream read holds and never waits to fill it, so this value only bounds
+# the memory held per piece, not when bytes are forwarded. Same size as the
+# MCP gateway's PIECE (container/mcp-gateway/gateway.py).
+RELAY_PIECE = 65536
 
 HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
@@ -452,12 +462,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._client_gone(name, method, upstream_path, client_ip,
                                   body_len, upstream_status=e.code)
                 return
+            # The whole error body has been read, so its length is known:
+            # state it, never the upstream's header (chunked + a stray
+            # Content-Length, an unparsable one, or a torn body whose read
+            # failed would otherwise leave the client waiting for bytes that
+            # never come). A bodiless reply (HEAD, 304) keeps the upstream's
+            # Content-Length, which describes the representation, not bytes
+            # on this wire.
+            bodiless = self._error_reply_bodiless(method, e.code)
             self.send_response(e.code)
             for h, v in e.headers.items():
                 if h.lower() in HOP_BY_HOP:
                     continue
+                if not bodiless and h.lower() == "content-length":
+                    continue
                 self.send_header(h, v)
-            if "content-length" not in {h.lower() for h in e.headers.keys()}:
+            if not bodiless or "content-length" not in {
+                    h.lower() for h in e.headers.keys()}:
                 self.send_header("Content-Length", str(len(err_body)))
             self.end_headers()
             self.wfile.write(err_body)
@@ -489,19 +510,33 @@ class Handler(BaseHTTPRequestHandler):
                           client_ip, body_len):
         ctype = resp.headers.get("Content-Type", "")
         is_sse = "text/event-stream" in ctype.lower()
+        # Decided before any read: http.client's length changes as the body
+        # is consumed.
+        framed = self._body_is_framed(resp)
         self.send_response(resp.status)
         for h, v in resp.headers.items():
             if h.lower() in HOP_BY_HOP:
                 continue
+            # An unframed body's upstream Content-Length (sent beside a
+            # chunked encoding, or unparsable) does not describe what is
+            # relayed.
+            if not framed and h.lower() == "content-length":
+                continue
             self.send_header(h, v)
+        if not framed:
+            # One request per connection: the body's end is the close, so
+            # a stream of unknown length needs no re-framing.
+            self.send_header("Connection", "close")
+            self.close_connection = True
         self.end_headers()
-        chunk_size = 1024 if is_sse else 8192
         bytes_out = 0
         read_error = None
         client_failed = False
         while True:
             try:
-                chunk = resp.read(chunk_size)
+                # read1 forwards what has arrived; read(n) would hold a
+                # short event until n bytes or the end of the body came.
+                chunk = resp.read1(RELAY_PIECE)
             except (OSError, http.client.HTTPException) as e:
                 read_error = e
                 break
@@ -509,8 +544,7 @@ class Handler(BaseHTTPRequestHandler):
                 break
             try:
                 self.wfile.write(chunk)
-                if is_sse:
-                    self.wfile.flush()
+                self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 client_failed = True
                 break
@@ -538,6 +572,23 @@ class Handler(BaseHTTPRequestHandler):
             record.update(status=499, upstream_status=resp.status,
                           error="client disconnected")
         audit(record)
+
+    @staticmethod
+    def _body_is_framed(resp) -> bool:
+        """Whether the relayed reply carries its own end: only when the
+        upstream stated a usable Content-Length. http.client sets ``length``
+        to None for a chunked reply that has a body (its framing is
+        hop-by-hop and dropped here) and for a missing, unparsable or
+        negative Content-Length (close-delimited), and to 0 for a bodiless
+        reply (HEAD, 204, 304, 1xx). Must be read before the body is."""
+        return resp.length is not None
+
+    @staticmethod
+    def _error_reply_bodiless(method, status) -> bool:
+        """Whether an upstream error reply carries no body: http.client's
+        own rule (HEAD, 204, 304, 1xx) restricted to the cases that reach
+        the error branch, HEAD and 304."""
+        return method == "HEAD" or status == 304
 
     @staticmethod
     def _delivered_in_full(resp) -> bool:
