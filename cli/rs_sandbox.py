@@ -1064,10 +1064,69 @@ def _stage_box_workspace(name: str, preset: dict, mcps: list[str],
     ws.mkdir(parents=True, exist_ok=True)
     _reserve_box_paths(ws, share)
     servers = _build_proxy_mcps(mcps, strict=strict)
-    (ws / ".mcp-proxy.json").write_text(
-        json.dumps({"mcpServers": servers}, indent=2, sort_keys=True) + "\n")
-    _write_mcp_preset(ws, preset)
+    _write_box_file_or_die(
+        ws, ".mcp-proxy.json",
+        json.dumps({"mcpServers": servers}, indent=2, sort_keys=True) + "\n",
+        at_create=True)
+    _write_mcp_preset(ws, preset, at_create=True)
     _write_greeting(ws, preset)
+
+
+def _write_box_file(ws: Path, fname: str, text: str) -> None:
+    """Write `text` to the box's /workspace/<fname> without ever OPENING what
+    sits at that name. The folder is writable from inside the box, so a link
+    planted there would point at any supervisor file (resolved on THIS side),
+    and a planted FIFO would block a plain write — and the project start it
+    runs in — forever. Instead: write a fresh temp file next to it
+    (O_EXCL|O_NOFOLLOW refuses anything re-planted there; a leftover at the
+    temp name, from a killed run or from the box, is removed first — unlink
+    never follows) and rename it over the path, which replaces a link, FIFO or
+    device node without opening it. A folder at either name fails. Raises the
+    original OSError (after removing the temp this call created); never
+    prints — each caller decides whether a failure warns or stops."""
+    path = ws / fname
+    tmp = ws / (fname + ".tmp")
+    if os.path.lexists(tmp):
+        os.unlink(tmp)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                 0o644)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            if os.path.lexists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _die_box_file(ws: Path, fname: str, e: OSError, *, at_create: bool,
+                  verb: str = "write") -> NoReturn:
+    """Stop with the fixed text for a box MCP file RS could not write or
+    remove. Names the object that failed: a rename onto a folder reports the
+    TARGET as filename2, an unlink or open of the temp name reports the temp
+    as filename, a failed write carries neither (then the file itself). Uses
+    strerror only — str(e) carries the supervisor's absolute path."""
+    failed = e.filename2 or e.filename
+    shown = os.path.basename(os.fspath(failed)) if failed else fname
+    template = BOX_FILE_CREATE_ERROR if at_create else BOX_FILE_RUN_ERROR
+    die(template.format(verb=verb, path=_shown_paths(ws.name, [shown]),
+                        box=ws.name,
+                        reason=e.strerror or type(e).__name__))
+
+
+def _write_box_file_or_die(ws: Path, fname: str, text: str, *,
+                           at_create: bool) -> None:
+    """_write_box_file for a file the box's boot depends on (its MCP servers):
+    a failure stops the create or re-run with a named error rather than
+    booting the box on a stale or absent list."""
+    try:
+        _write_box_file(ws, fname, text)
+    except OSError as e:
+        _die_box_file(ws, fname, e, at_create=at_create)
 
 
 def _write_greeting(ws: Path, preset: dict) -> None:
@@ -1078,22 +1137,11 @@ def _write_greeting(ws: Path, preset: dict) -> None:
     text = preset.get("greeting") or ""
     if not text.strip():
         return
-    # The folder is writable from inside the box, so never OPEN what sits at the
-    # path (a planted link could point at any supervisor file; a planted FIFO
-    # would block this write — and the project restart it runs in — forever):
-    # write a fresh temp file (O_EXCL|O_NOFOLLOW refuses anything pre-planted
-    # there) and rename it over the path, which replaces a link, FIFO or device
-    # node without opening it. A directory at the path fails the rename → warn.
-    path = ws / GREETING_FILE
-    tmp = ws / (GREETING_FILE + ".tmp")
+    # Written link- and FIFO-safe (_write_box_file). The greeting is cosmetic,
+    # so a failure (a folder at the path) only warns.
     try:
-        if tmp.is_symlink() or tmp.exists():
-            tmp.unlink()
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                     0o644)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(text if text.endswith("\n") else text + "\n")
-        os.replace(tmp, path)
+        _write_box_file(ws, GREETING_FILE,
+                        text if text.endswith("\n") else text + "\n")
     except OSError as e:
         print(f"rs-sandbox: warning: could not write the box greeting: {e}",
               file=sys.stderr)
@@ -1296,6 +1344,22 @@ OLD_FILES_RUN_ERROR = (
     "keeps these in the box agents' home folders now and writes no new copies "
     "while they exist. Remove or rename them from the project's terminal or "
     "editor, then stop the project and start it again.")
+# A box MCP file (.mcp-proxy.json, .mcp-preset.json) RS could not write or
+# remove (_die_box_file). The re-run text states what is true: the re-run
+# stops before the box's container is touched, so a running box keeps running
+# on its previous settings and a stopped one stays down.
+BOX_FILE_CREATE_ERROR = (
+    "RS could not {verb} {path} for box '{box}' ({reason}): the box reads its "
+    "MCP servers from that file, so whatever sits there must be a plain file "
+    "or nothing. Remove or rename it from the project's terminal or editor, "
+    "then add the box again.")
+BOX_FILE_RUN_ERROR = (
+    "RS could not {verb} {path} for box '{box}' ({reason}): the box reads its "
+    "MCP servers from that file, so whatever sits there must be a plain file "
+    "or nothing, and RS cannot re-run the box until it is (a box that is still "
+    "running keeps its previous settings). Remove or rename it from the "
+    "project's terminal or editor (or from /workspace in the box's own "
+    "terminal while the box runs), then stop the project and start it again.")
 
 
 def _old_path_present(root: Path, rel: str) -> bool:
@@ -1926,21 +1990,30 @@ def _warning_text(name: str, w: dict) -> str:
             f"({w.get('reason')})")
 
 
-def _write_mcp_preset(ws: Path, preset: dict) -> None:
+def _write_mcp_preset(ws: Path, preset: dict, *, at_create: bool = False) -> None:
     """Write /workspace/.mcp-preset.json — source-3 of the entrypoint's
     wholesale .mcp.json regen — from the preset's declared mcp_servers;
     REMOVE the file when the preset declares none (a preset that drops the key
     must not leave a stale merge source behind). The webui's RO /projects mount
     can read this file, so a field VALUE must NEVER enter it — the writer only
     handles catalog manifest data by construction; ${FIELD} references (never
-    expanded values) are what land here, expanded by the agent at config load."""
+    expanded values) are what land here, expanded by the agent at config load.
+    Written and removed without following or opening what the box may have
+    planted at the name (lexists, so a dangling link goes too); a failure
+    stops the create or re-run with the named error."""
     mp = ws / ".mcp-preset.json"
     servers = preset.get("mcp_servers") or {}
     if servers:
-        mp.write_text(json.dumps({"mcpServers": servers}, indent=2,
-                                 sort_keys=True) + "\n")
-    elif mp.exists():
-        mp.unlink()
+        _write_box_file_or_die(
+            ws, ".mcp-preset.json",
+            json.dumps({"mcpServers": servers}, indent=2, sort_keys=True) + "\n",
+            at_create=at_create)
+    elif os.path.lexists(mp):
+        try:
+            os.unlink(mp)
+        except OSError as e:
+            _die_box_file(ws, ".mcp-preset.json", e, at_create=at_create,
+                          verb="remove")
 
 
 # --- run / teardown ---------------------------------------------------------
@@ -2776,21 +2849,27 @@ def _rerun_box(name: str, entry: dict) -> list[dict]:
     ws = WORKSPACE / f"boxes/{name}"
     ws.mkdir(parents=True, exist_ok=True)
     servers = _build_proxy_mcps(mcps, strict=False)
-    (ws / ".mcp-proxy.json").write_text(
-        json.dumps({"mcpServers": servers}, indent=2, sort_keys=True) + "\n")
+    _write_box_file_or_die(
+        ws, ".mcp-proxy.json",
+        json.dumps({"mcpServers": servers}, indent=2, sort_keys=True) + "\n",
+        at_create=False)
     # Refresh the preset MCP source alongside the proxy source (write + remove
     # at BOTH sites): a catalog edit lands at restart, like an allowlist edit.
     # Tolerant — a preset since removed from the catalog keeps the existing
     # staged file rather than failing the restart (today a restart never
-    # resolves the preset at all; that must not regress).
+    # resolves the preset at all; that must not regress). Only the resolution
+    # sits in the try: a failed WRITE dies with its own error and must not
+    # read as an unresolvable preset.
     try:
         preset = resolve_preset(entry.get("preset") or "empty")
-        _write_mcp_preset(ws, preset)
-        _write_greeting(ws, preset)
     except SystemExit:
         print(f"rs-sandbox: warning: preset {entry.get('preset')!r} no longer "
               f"resolvable; keeping the box's existing .mcp-preset.json",
               file=sys.stderr)
+        preset = None
+    if preset is not None:
+        _write_mcp_preset(ws, preset)
+        _write_greeting(ws, preset)
     is_dev = bool(entry.get("dev"))
     if entry.get("model_pending"):
         # This run lays the entry's pair into the fresh home: nothing is owed.
