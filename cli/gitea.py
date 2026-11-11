@@ -247,6 +247,10 @@ MIRROR_FEATURES = {"has_issues": False, "has_wiki": False}
 class GiteaError(Exception):
     """Any gitea-side failure. Message carries only method/path/status — never a
     request/response body, so a token in a migrate payload can never leak here.
+    One sanitised exception: the mirror-source refusals (_mirror_source_error)
+    carry an 'owner/repo' slug derived from a mirror's recorded original_url,
+    rendered only when it has the exact GitHub repository shape — never the
+    raw value, so no userinfo or other host can appear.
 
     ``status`` is the HTTP status when one was actually received, else None. It
     exists so a caller can tell a DEFINITIVE 404 from "gitea is broken": _api
@@ -1000,6 +1004,94 @@ def _name_collision(repo: str) -> GiteaError:
         f"collision); remove it manually or use a different repo name")
 
 
+# A mirror is named by the GitHub repository's NAME alone (owner dropped), so
+# alice/tools and bob/tools both map to sandbox-admin/tools. Before the migrate
+# reuses or replaces an existing mirror record, the record's recorded source
+# (Gitea's `original_url` — measured on 28.2.0 to be the migrate's clone_addr
+# stored verbatim, i.e. the URL RS sent) must be the requested repository.
+_GITHUB_PREFIX = "https://github.com/"
+
+
+def _github_repo_id(url: Any) -> tuple[str, str] | None:
+    """(owner, repo) from a GitHub repository URL, by the same acceptance as
+    rscore._parse_github_repo (strip; the prefix; '/' stripped at both ends of
+    the rest; exactly two segments; one case-sensitive trailing '.git' off the
+    repo; no empty/'.'/'..'/backslash segment) — so "the same repository" means
+    what the parser means by it. One deliberate difference: the prefix matches
+    ignoring case, for a recorded value typed into Gitea's own UI (every URL
+    that passed the parser already matches it exactly). Case is kept for
+    display; None for anything else."""
+    if not isinstance(url, str) or not url.strip():
+        return None
+    u = url.strip()
+    if u[:len(_GITHUB_PREFIX)].lower() != _GITHUB_PREFIX:
+        return None
+    parts = u[len(_GITHUB_PREFIX):].strip("/").split("/")
+    if len(parts) != 2:
+        return None
+    owner, repo = parts
+    if repo.endswith(".git"):
+        repo = repo[: -len(".git")]
+    for seg in (owner, repo):
+        if seg in ("", ".", "..") or "\\" in seg:
+            return None
+    return owner, repo
+
+
+def _source_key(url: Any) -> tuple[str, str] | None:
+    """The comparison form of a mirror source: (owner, repo) lower-cased for a
+    GitHub repository URL (GitHub names are case-insensitive); ("", value
+    lower-cased) for any other non-blank string — never equal to a parsed key,
+    since a parsed owner is never empty; None when missing or blank."""
+    ident = _github_repo_id(url)
+    if ident is not None:
+        return ident[0].lower(), ident[1].lower()
+    if isinstance(url, str) and url.strip():
+        return "", url.strip().lower()
+    return None
+
+
+def _source_slug(url: Any) -> str | None:
+    """'owner/repo' for display, ONLY for the exact GitHub repository shape — a
+    recorded source of any other shape (another host, a userinfo-bearing URL)
+    is never echoed, so no secret or foreign address can reach a message."""
+    ident = _github_repo_id(url)
+    return None if ident is None else f"{ident[0]}/{ident[1]}"
+
+
+def _mirror_source_error(repo: str, info: dict, url: str, *,
+                         missing_ok: bool) -> GiteaError | None:
+    """None when the existing mirror record `info` mirrors the repository `url`
+    names; else the refusal (raised by the caller, like _name_collision). A
+    record with no recorded source is accepted only when `missing_ok` (an
+    empty record about to be replaced loses nothing and the re-migrate records
+    the requested source; a healthy mirror hands out its code, so its source
+    must be positively verified). Browser-reachable text: it names the webui
+    remedy, no CLI verb, no host path, no secret."""
+    recorded = info.get("original_url")
+    have = _source_key(recorded)
+    requested = _source_slug(url) or "the requested repository"
+    remedy = (f"remove it with its Remove button on the Development page's "
+              f"Fetch tab (if it is not listed there, switch its rs-fetch back "
+              f"on in the Repos tab first), then add {requested} again.")
+    if have is None:
+        if missing_ok:
+            return None
+        return GiteaError(
+            f"{ADMIN_USER}/{repo} already exists as a mirror, but Gitea does "
+            f"not record which repository it mirrors, so it cannot be reused "
+            f"for {requested}. If nothing works on it any more, {remedy}")
+    if have == _source_key(url):
+        return None
+    existing = _source_slug(recorded)
+    shown = existing or "a source that is not a GitHub repository URL"
+    return GiteaError(
+        f"{ADMIN_USER}/{repo} already mirrors {shown}, not {requested}. "
+        f"Mirrors are named by repository name alone, so only one GitHub "
+        f"repository named '{repo}' can be added at a time. If nothing works "
+        f"on {existing or 'it'} any more, {remedy}")
+
+
 class GiteaClient:
     """Bounded admin-token client. Every call is API_TIMEOUT_S-bounded; failures
     raise GiteaError with method/path/status only."""
@@ -1129,9 +1221,19 @@ class GiteaClient:
         private mirror keeps auto-syncing with no host-side copy — and a NEW PAT
         for an already-mirrored repo is NOT re-delivered (the healthy-mirror resume
         path above returns before the migrate): refresh = repo remove + re-add.
-        It never appears in a GiteaError."""
+        It never appears in a GiteaError. An existing mirror is reused or
+        replaced only when its recorded source is the requested repository
+        (_mirror_source_error) — the name alone can belong to another owner's."""
         if self.repo_exists(ADMIN_USER, repo):
             info = self._api("GET", f"/repos/{ADMIN_USER}/{repo}") or {}
+            if info.get("mirror"):
+                # Never sync another owner's mirror for this request, nor swap
+                # it out: an empty record with no recorded source is the B29
+                # stub (replaceable); a healthy one must name this repository.
+                err = _mirror_source_error(
+                    repo, info, url, missing_ok=bool(info.get("empty")))
+                if err is not None:
+                    raise err
             if info.get("mirror") and not info.get("empty"):
                 self.trigger_sync(repo)         # healthy mirror → refresh + done
                 return
@@ -1187,6 +1289,10 @@ class GiteaClient:
                 if not isinstance(info, dict):
                     raise
                 if info.get("mirror") and not info.get("empty"):
+                    err = _mirror_source_error(repo, info, url,
+                                               missing_ok=False)
+                    if err is not None:
+                        raise err from None
                     self.trigger_sync(repo)     # healthy mirror → refresh + done
                     return
                 if not info.get("empty"):
