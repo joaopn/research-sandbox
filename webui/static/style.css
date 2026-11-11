@@ -1925,10 +1925,10 @@ html.mobile .project-config-box .config-folders-input { font-size: 16px; }
    in a .field, whose input rule already gives it the house padding and border. */
 .agent-pi-row { align-items: flex-end; }
 .agent-pi-model { flex: 1 1 260px; min-width: 0; }
-/* The working mode (I33): a 3-way switch of compact cards between the agent
-   badges and the tabs (create dialog) or under the agent row (box window); its
-   Doer/Checker rows sit in each agent's tab and show only in
-   Planner-doer-checker. */
+/* The working mode (I33): a switch of compact cards, one per mode in RS's
+   catalog, between the agent badges and the tabs (create dialog) or under the
+   agent row (box window); its Doer/Checker rows sit in each agent's tab and
+   show only for the subagents the chosen mode uses. */
 .harness-mode .box-opt-cards { margin-bottom: 4px; }
 .harness-mode-card { padding: 4px 12px; }
 .harness-rows { margin-top: 12px; }

@@ -8258,6 +8258,14 @@ function harnessModeSwitch(onChange, initial) {
     return { node, value: () => mode };
 }
 
+// What the Doer/Checker rows' hint says about the roles the chosen mode uses.
+function harnessRolesHint(roles) {
+    const doer = roles.includes("doer"), checker = roles.includes("checker");
+    if (doer && checker) return "RS's doer implements a unit of work; its checker reviews it, read-only.";
+    if (doer) return "RS's doer implements a unit of work.";
+    return "RS's checker reviews the plan and the change, read-only.";
+}
+
 // Claude's Doer and Checker rows: a tier each, "same as the session" first.
 // No effort control: Claude Code runs every subagent at the effort the agent's
 // own row sets (the container-wide setting wins over a per-subagent one).
@@ -8292,14 +8300,11 @@ function harnessClaudeRows(cat, initial) {
     // The roles the chosen mode uses (setRoles): only their rows show, and only
     // their fields are read.
     let roles = ["doer", "checker"];
-    const node = el("div", { class: "harness-rows" }, [
-        doerRow,
-        checkerRow,
-        el("div", { class: "hint" }, [
-            "RS's doer implements a unit of work; its checker reviews it, read-only. " +
-            "Both run at the effort set for the agent.",
-        ]),
-    ]);
+    const hintN = el("div", { class: "hint" });
+    const hintText = () => harnessRolesHint(roles) + (roles.length > 1
+        ? " Both run at the effort set for the agent." : " It runs at the effort set for the agent.");
+    hintN.textContent = hintText();
+    const node = el("div", { class: "harness-rows" }, [doerRow, checkerRow, hintN]);
     return {
         node,
         // Without a model catalog the selects would hold only "same as the
@@ -8309,6 +8314,7 @@ function harnessClaudeRows(cat, initial) {
             roles = r || [];
             doerRow.style.display = roles.includes("doer") ? "" : "none";
             checkerRow.style.display = roles.includes("checker") ? "" : "none";
+            hintN.textContent = hintText();
         },
         value: () => {
             const out = {};
@@ -8360,19 +8366,17 @@ function harnessPiRows(initial) {
     let roles = ["doer", "checker"];
     const shown = () => [["Doer", "doer", doer], ["Checker", "checker", checker]]
         .filter((r) => roles.includes(r[1]));
-    const node = el("div", { class: "harness-rows" }, [
-        doer.node, checker.node,
-        el("div", { class: "hint" }, [
-            "RS's doer implements a unit of work; its checker reviews it, read-only. " +
-            "Empty: pi's default model and thinking level.",
-        ]),
-    ]);
+    const hintN = el("div", { class: "hint" });
+    const hintText = () => harnessRolesHint(roles) + " Empty: pi's default model and thinking level.";
+    hintN.textContent = hintText();
+    const node = el("div", { class: "harness-rows" }, [doer.node, checker.node, hintN]);
     return {
         node,
         setRoles: (r) => {
             roles = r || [];
             doer.node.style.display = roles.includes("doer") ? "" : "none";
             checker.node.style.display = roles.includes("checker") ? "" : "none";
+            hintN.textContent = hintText();
         },
         value: () => {
             const out = {};
@@ -8652,7 +8656,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             "Model choices are unavailable right now; Claude starts on its defaults.",
         ])]);
     // The working mode (I33), dev workflows only: the switch sits between the
-    // badges and the tabs, and Planner-doer-checker adds Doer and Checker rows
+    // badges and the tabs, and a mode that uses RS's subagents adds their rows
     // to every agent tab (the agents RS installs whatever the mode; the rows
     // only matter where the loop launches them).
     const harnessClaude = isDev ? harnessClaudeRows(cat) : null;
@@ -8740,7 +8744,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             if (piThinkingS.value) out.pi_thinking = piThinkingS.value;
         }
         // The working mode: sent only when it is not None, the Doer/Checker
-        // models only in Planner-doer-checker and only for an agent that is on
+        // models only for the subagents the mode uses and only for an agent that is on
         // (every key is in DEV_PROJECT_WEBUI_FIELDS).
         const mode = harnessSwitch ? harnessSwitch.value() : "none";
         if (mode !== "none") out.harness_mode = mode;
@@ -9697,12 +9701,12 @@ async function mgmtBoxAddDialog(project) {
     const agentCardsWrap = el("div", { class: "box-opt-cards" }, agentCards);
     // The working mode (I33): a dev box with an agent, outside research. The
     // Doer/Checker rows follow the box's ONE agent (Claude tiers or pi's id +
-    // thinking); the box's other agent, if the project carries two, runs its
-    // doer and checker on the session's model.
+    // thinking); the box's other agent, if the project carries two, runs RS's
+    // subagents on the session's model.
     const boxHarnessClaude = harnessClaudeRows(boxCat);
     const boxHarnessPi = harnessPiRows();
     const boxHarnessOtherHint = el("div", { class: "hint" }, [
-        "The box's other agent, if the project has two, runs its doer and checker " +
+        "The box's other agent, if the project has two, runs RS's subagents " +
         "on the session's model.",
     ]);
     const syncBoxHarnessRows = (mode) => {
@@ -10189,7 +10193,7 @@ async function mgmtBoxAddDialog(project) {
                     if (v.effort) payload.effort = v.effort;
                 }
                 // The working mode, only where its controls show; the Doer/
-                // Checker models only in Planner-doer-checker, for the box's
+                // Checker models only for the subagents the mode uses, for the box's
                 // agent (lockstep: DEV_BOX_WEBUI_FIELDS).
                 if (boxHarnessOn()) {
                     const mode = boxHarnessSwitch.value();
@@ -12554,7 +12558,10 @@ function agentsBoxApply(name, d, f) {
                     if (now) payload[k] = now; else reset.push(k);
                 }
             });
-            if (changed) lines.push("Doer and Checker models updated.");
+            if (changed) {
+                const names = harnessModeRoles(mode).map((r) => (r === "doer" ? "Doer" : "Checker"));
+                lines.push(`${names.join(" and ")} model${names.length > 1 ? "s" : ""} updated.`);
+            }
         }
     }
     f.researchPickers.forEach(([ct, p]) => {

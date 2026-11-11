@@ -9148,7 +9148,7 @@ _COUNT_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven",
 
 
 def harness_mode_phrase(ids: "Sequence[str]") -> str:
-    """The modes as one phrase — "none, direct or planner-doer-checker" — the
+    """The modes as one phrase — "none, direct, doer-checker or planner-doer-checker" — the
     ONE join for the rule header (modes/LIST) and the skill's description."""
     ids = list(ids)
     if len(ids) < 2:
@@ -9156,11 +9156,21 @@ def harness_mode_phrase(ids: "Sequence[str]") -> str:
     return f"{', '.join(ids[:-1])} or {ids[-1]}"
 
 
+def harness_subagents_line(subagents: "Sequence[str]") -> str:
+    """The line at the top of a mode's rule body naming the RS subagents it
+    uses — the ones its pieces may launch (implement-yourself refers to it)."""
+    names = [f"`{s}`" for s in subagents]
+    if not names:
+        return "This mode uses no subagents."
+    return f"This mode's subagents: {' and '.join(names)}."
+
+
 def harness_suite_files() -> dict[str, bytes]:
     """Every file of the staged suite, by its path in the suite: the tracked
     HARNESS_FILES as they are, plus what the catalog generates — each mode's
-    rule body modes/<id>.md (its pieces as bytes, a newline between each — a
-    blank line, as every piece ends in one), modes/LIST
+    rule body modes/<id>.md (a "## <label>" heading, the subagents line, then
+    its pieces as bytes, a newline between each — a blank line, as every piece
+    ends in one), modes/LIST
     (the header's phrase) and skill/SKILL.md (the template's markers filled;
     plain replacement, so the skill's literal $ARGUMENTS is untouched). Raises
     ValidationError for a broken catalog, OSError for a missing tracked file."""
@@ -9170,8 +9180,12 @@ def harness_suite_files() -> dict[str, bytes]:
     for m in cat:
         if m["id"] == "none":
             continue
-        # Bytes, joined as they are (no decoding: a piece is shipped verbatim).
-        files[f"modes/{m['id']}.md"] = b"\n".join(
+        # The mode's heading and its subagents line (generated here, so the
+        # /rs-mode switch, which reads only this body, carries them too), then
+        # its pieces as bytes, a newline between each (no decoding: a piece is
+        # shipped verbatim).
+        head = f"## {m['label']}\n\n{harness_subagents_line(m['subagents'])}\n\n"
+        files[f"modes/{m['id']}.md"] = head.encode("utf-8") + b"\n".join(
             (HARNESS_SRC / "pieces" / f"{x}.md").read_bytes() for x in m["pieces"])
     files["modes/LIST"] = (harness_mode_phrase(ids) + "\n").encode("utf-8")
     n = len(ids)

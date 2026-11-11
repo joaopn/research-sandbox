@@ -1,0 +1,1 @@
+**Questions go to the user.** A choice the code and the project's decisions do not settle is the user's. Ask it as a self-contained question: what is being decided, each option spelled out in terms of what the user will see and what it costs, and your recommendation. Lead with the effect for the user, not the internals. Neither you nor a child agent decides it silently.

@@ -1,0 +1,1 @@
+**Keep what was found.** A problem found along the way that is not this task (by you, or listed in a child agent's report) is not fixed inside it: record each one where the project keeps such notes, or report it to the user. None is dropped.

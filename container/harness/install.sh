@@ -124,7 +124,7 @@ for a in $(printf '%s' "${RS_HARNESS_AGENTS:-}" | tr ',' ' '); do
 done
 
 DOER_DESC="Implements one unit of work from a self-contained brief (shipped by RS)."
-CHECKER_DESC="Reviews a change read-only - verifies against the code, asserts defects, flags forks (shipped by RS)."
+CHECKER_DESC="Reviews a change or a plan read-only - verifies against the code, asserts defects, flags forks (shipped by RS)."
 
 # skill DIR — the mode-switch skill (named rs-mode; its folder keeps the name
 # harness, so nothing is ever removed) with its own copy of every staged mode's
