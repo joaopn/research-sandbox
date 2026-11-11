@@ -7995,6 +7995,11 @@ AGENT_DIST_DIR = Path.home() / ".research-sandbox" / "agent-dist"
 # that deploys an agent) — the single in-container copy-source path. The fleet
 # agent the supervisor + worker homes deploy (no bake; STAGE_AGENT_DIST slice 2).
 AGENT_DIST_MOUNT = "/opt/agent-dist"
+# The agent folder's emptying command, written out in full: the path a delete
+# runs under is spelled literally in the source, never put together from a
+# value (the rule _DIST_TREE_EMPTY follows for the editor, reader and node
+# folders). It names AGENT_DIST_MOUNT's path and must change with it.
+_AGENT_DIST_EMPTY = "find /opt/agent-dist -mindepth 1 -delete"
 DEFAULT_AGENT = "claude"
 # The last entry of every agent-dist stream (at the archive ROOT, never under
 # local/, so it can never reach a home). A stream cut between two files leaves
@@ -9025,7 +9030,7 @@ def _stage_agent_dist(supervisor: str, agents: "Sequence[str]" = (DEFAULT_AGENT,
         # role service bind-mounts this path, and a mount is pinned to the
         # directory it was made on — `rm -rf` + `mkdir` would leave every
         # existing mount reading an empty directory (measured).
-        extract = (f"mkdir -p {AGENT_DIST_MOUNT} && find {AGENT_DIST_MOUNT} -mindepth 1 -delete && "
+        extract = (f"mkdir -p {AGENT_DIST_MOUNT} && {_AGENT_DIST_EMPTY} && "
                    f"tar -C {AGENT_DIST_MOUNT} -x && "
                    f"{{ test -f {AGENT_DIST_MOUNT}/{STAGE_MARKER} || "
                    f"{{ echo 'the transfer was cut short' >&2; false; }}; }} && "
