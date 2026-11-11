@@ -1,4 +1,4 @@
-// rs-rules v0.6.0
+// rs-rules v0.7.0
 //
 // Claude Code's rules capability for pi, one-to-one, as an RS-owned extension.
 // Shipped inside the pi dist (share/pi-agent/rs/rs-rules.ts) and named from the
@@ -7,10 +7,15 @@
 // on the first line is pinned to RS_PI_RULES_VERSION in versions.env at build.
 //
 // What it reproduces (Claude Code's memory.md contract, item by item):
-//   - `.claude/CLAUDE.md` and `CLAUDE.local.md` at the project root, plus every
-//     `.claude/rules/**/*.md` WITHOUT a `paths:` frontmatter, and `~/.claude/rules`,
-//     go into the system prompt at launch, in Claude's order (user rules, project
-//     instructions, project rules).
+//   - `.claude/CLAUDE.md` and `CLAUDE.local.md` at the project root and in every
+//     folder above it (up to, not including, `/`; `~/.claude` is never a project
+//     folder), plus every `.claude/rules/**/*.md` WITHOUT a `paths:` frontmatter
+//     of those folders, and `~/.claude/rules`, go into the system prompt at
+//     launch. Launch order: user rules, then instruction files (every ancestor's
+//     `.claude/CLAUDE.md` and `CLAUDE.local.md`, farthest first, then the
+//     root's), then project rules (ancestors' farthest first, then the root's).
+//     A rule WITH `paths:` resolves its globs against the folder holding its
+//     `.claude/`.
 //   - a rule WITH `paths:` globs is attached to the result of the first `read` of
 //     a matching file (or the `write` that creates a new matching file), once per
 //     session, re-armed by compaction; a subdirectory's `.claude/rules/*.md` and
@@ -75,7 +80,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const RS_RULES_VERSION = "0.6.0";
+export const RS_RULES_VERSION = "0.7.0";
 
 // The system-prompt SECTION the launch rules ride in (pi wraps it as
 // `<project_rules>…</project_rules>`). A section, never a returned
@@ -623,9 +628,23 @@ function loadRule(file: string, kind: RuleKind, scope: RuleScope, base: string, 
 
 export interface Discovered {
   root: string; // realpath
-  rules: Rule[]; // user + project (root-level) rules, launch and scoped
+  rules: Rule[]; // user rules, then project rules of every ancestor (farthest first) and of the root, launch and scoped
   claudeMd: Rule | null; // <root>/.claude/CLAUDE.md
   claudeLocal: Rule | null; // <root>/CLAUDE.local.md
+  outer: Rule[]; // every ancestor's .claude/CLAUDE.md and CLAUDE.local.md, farthest first
+}
+
+// The folders strictly above `root` and strictly below `/`, farthest first
+// (Claude Code reads parent folders "up to (but not including) the root
+// directory /").
+export function ancestorDirs(root: string): string[] {
+  const out: string[] = [];
+  let dir = path.dirname(root);
+  while (path.dirname(dir) !== dir) {
+    out.unshift(dir);
+    dir = path.dirname(dir);
+  }
+  return out;
 }
 
 export function discoverRules(cwd: string, home: string, warn: (m: string) => void): Discovered {
@@ -639,6 +658,31 @@ export function discoverRules(cwd: string, home: string, warn: (m: string) => vo
       if (r) rules.push(r);
     }
   }
+  // Every folder above the root, farthest first: its rules (globs resolved
+  // against that folder) and its instruction files. Walked from the realpath
+  // root so labels and bases share one frame; `~/.claude` is the user dir.
+  const outer: Rule[] = [];
+  const homeReal = realpathOrNull(home) ?? path.resolve(home);
+  for (const a of ancestorDirs(root)) {
+    const isHome = (realpathOrNull(a) ?? a) === homeReal;
+    const acm = path.join(a, ".claude", "CLAUDE.md");
+    if (!isHome && isFile(acm)) {
+      const r = loadRule(acm, "claude_md", "project", a, path.relative(root, acm), warn);
+      if (r) outer.push(r);
+    }
+    const acl = path.join(a, "CLAUDE.local.md");
+    if (isFile(acl)) {
+      const r = loadRule(acl, "claude_local", "project", a, path.relative(root, acl), warn);
+      if (r) outer.push(r);
+    }
+    const aDir = path.join(a, ".claude", "rules");
+    if (!isHome && isDir(aDir)) {
+      for (const f of listMarkdown(aDir, warn)) {
+        const r = loadRule(f, "rule", "project", a, path.relative(root, f), warn);
+        if (r) rules.push(r);
+      }
+    }
+  }
   const projDir = path.join(root, ".claude", "rules");
   if (isDir(projDir)) {
     for (const f of listMarkdown(projDir, warn)) {
@@ -650,7 +694,7 @@ export function discoverRules(cwd: string, home: string, warn: (m: string) => vo
   const claudeMd = isFile(cm) ? loadRule(cm, "claude_md", "project", root, ".claude/CLAUDE.md", warn) : null;
   const cl = path.join(root, "CLAUDE.local.md");
   const claudeLocal = isFile(cl) ? loadRule(cl, "claude_local", "project", root, "CLAUDE.local.md", warn) : null;
-  return { root, rules, claudeMd, claudeLocal };
+  return { root, rules, claudeMd, claudeLocal, outer };
 }
 
 // A subdirectory's own rules: its `.claude/rules/**/*.md` (globs relative to
@@ -1275,7 +1319,8 @@ export default function rsRules(pi: ExtensionAPI) {
       rediscover(ctx);
       rebuildFromBranch(ctx);
       resetShell(ctx);
-      const launch = disc!.rules.filter((r) => !r.paths).length + (disc!.claudeMd ? 1 : 0) + (disc!.claudeLocal ? 1 : 0);
+      const launch =
+        disc!.rules.filter((r) => !r.paths).length + disc!.outer.length + (disc!.claudeMd ? 1 : 0) + (disc!.claudeLocal ? 1 : 0);
       const scoped = disc!.rules.filter((r) => !!r.paths).length;
       if ((ctx as any).hasUI && launch + scoped > 0) {
         (ctx as any).ui.notify(`rs-rules: ${launch} launch, ${scoped} path-scoped`, "info");
@@ -1314,6 +1359,7 @@ export default function rsRules(pi: ExtensionAPI) {
         parts.push(`## ${r.label}\n\n${r.body}`);
       };
       for (const r of d.rules) if (r.scope === "user" && !r.paths) push(r);
+      for (const r of d.outer) if (!already.has(r.id)) push(r);
       if (d.claudeMd && !already.has(d.claudeMd.id)) push(d.claudeMd);
       if (d.claudeLocal && !already.has(d.claudeLocal.id)) push(d.claudeLocal);
       for (const r of d.rules) if (r.scope === "project" && !r.paths) push(r);
@@ -1525,6 +1571,7 @@ export default function rsRules(pi: ExtensionAPI) {
         const d = disc as Discovered;
         const lines: string[] = [`rs-rules v${RS_RULES_VERSION} — root ${d.root}`];
         const state = (r: Rule) => (!r.paths ? "launch" : attached.has(r.id) ? "attached" : `pending on ${r.paths.join(", ")}`);
+        for (const r of d.outer) lines.push(`  ${r.label}: launch`);
         if (d.claudeMd) lines.push(`  ${d.claudeMd.label}: launch`);
         if (d.claudeLocal) lines.push(`  ${d.claudeLocal.label}: launch`);
         for (const r of d.rules) lines.push(`  ${r.label}: ${state(r)}`);
