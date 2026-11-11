@@ -5546,8 +5546,9 @@ def start(req: StartStopRequest, cfg: "Config" | None = None,
         print(f"=== Starting project: {c['project']} ===")
         if _container_substrate(c["name"]) == Substrate.DOCKER.value:
             # Folders saved in ⚙ change the container's binds, which only a
-            # re-creation can do on this substrate (the agent logs in again —
-            # the ⚙ warning says so).
+            # re-creation can do on this substrate (the agents' sign-ins and
+            # settings are carried across; anything else outside /workspace
+            # is gone — the ⚙ text says so).
             if _docker_folders_pending(c["project"], cfg, progress):
                 progress.step("recreate", "re-creating the project with its new folders")
                 _recreate_docker_substrate(
@@ -11308,8 +11309,8 @@ def _stash_git_auth_for_rebuild(
     rs-fetch's auto-commit names as its common failure.
 
     Deliberately SEPARATE from _stash_creds_for_rebuild, not a parameter on it:
-    _recreate_docker_substrate must gain this without gaining the Claude-creds
-    stash it pointedly does not have (that box re-auths in place).
+    the two are independent pieces of state, and both container swaps (the
+    Docker-in-Docker recreate and _recreate_docker_substrate) call both.
 
     ~/.git-credentials is deliberately NOT carried — it is RE-DERIVED instead
     (B62): _stage_dev_gitea re-writes it from the host token file
@@ -11721,8 +11722,9 @@ def _heal_docker_dev_gitea(project: str, cfg: "Config", network: str) -> None:  
 def _docker_folders_pending(project: str, cfg: "Config", progress=None) -> bool:  # type: ignore[name-defined]
     """Whether a docker project's start must re-create its container to apply
     folders saved in ⚙. A saved set the gate now refuses is NOT pending (a
-    re-creation would apply nothing and cost the agent's login): the start
-    stays a plain start and says why the folders were not applied."""
+    re-creation would apply nothing and still cost everything installed
+    outside /workspace): the start stays a plain start and says why the
+    folders were not applied."""
     md = _read_supervisor_metadata(container_name_for(project))
     plan = _folder_plan(workspace_path_for(project, cfg), md["extra_mounts"])
     if plan.problem:
@@ -11801,7 +11803,8 @@ def _start_docker_substrate(project: str, cfg: "Config",  # type: ignore[name-de
     container = container_name_for(project)
     # The task cap from the host settings, applied to the stopped container
     # before it starts: an existing project picks up a changed setting here
-    # without a re-creation (which would make its agents log in again).
+    # without a re-creation (which would cost everything installed outside
+    # /workspace).
     _apply_project_pids_limit(container, project_pids_limit())
     run_check(["docker", "start", container])
     # A project created before mountpoints were pre-created: hand its
@@ -11917,6 +11920,9 @@ def _update_docker_substrate(req: "UpdateRequest", cfg: "Config",  # type: ignor
         # damaged settings file refuses here, before the agents' record and
         # the port list below are written.
         project_pids_limit()
+        # The same for an image that cannot carry the agents' state across
+        # the re-creation.
+        _require_home_restore_image()
     if plan.any():
         # The agents' models: recorded, then written into the agents' own files
         # (a stopped project gets them at its next start). Applied before an
@@ -11951,13 +11957,15 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
                                progress=None, heal_gitea: bool = False,
                                found: "list[OldInstructions] | None" = None) -> None:
     """Recreate a `docker`-substrate (plain runc) box to apply a service-flag
-    change. Far simpler than _recreate_supervisor: no inner dockerd, no image
-    re-staging, no creds-stash dance (the box re-auths in place — greenfield-
-    disposable). Workspace bind-mount, network, SSH port/password, agent-dist
-    mounts, and extra --mount folders all survive (recovered from the container's
-    metadata before rm); the editor-dist mount is re-derived from the NEW
-    code-server flag (host-cache sourced, so it just re-applies). An old
-    instructions file met is appended to `found` (the verb raises)."""
+    change. Simpler than _recreate_supervisor (no inner dockerd, no image
+    re-staging), but the agents' state rides through the workspace the same
+    way: Claude's login and settings, ~/.claude.json and pi's agent dir are
+    stashed before the rm and the image's entrypoint restores them, so the
+    agents stay signed in. Workspace bind-mount, network, SSH port/password,
+    agent-dist mounts, and extra --mount folders all survive (recovered from
+    the container's metadata before rm); the editor-dist mount is re-derived
+    from the NEW code-server flag (host-cache sourced, so it just re-applies).
+    An old instructions file met is appended to `found` (the verb raises)."""
     container = container_name_for(project)
     was_running = container_running(container)
     workspace_path = workspace_path_for(project, cfg)
@@ -11966,26 +11974,30 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
         die(f"_recreate_docker_substrate called for non-docker project {project!r}")
     # The task cap, read before anything is touched (as _recreate_supervisor).
     pids_limit = project_pids_limit()
+    # An image that cannot restore the agents' state refuses here, before
+    # anything is touched (its stash would be made and never put back).
+    _require_home_restore_image()
     # The project's folders, decided before anything is touched (the same rule
     # as _recreate_supervisor): a saved ⚙ change that cannot apply leaves the
     # old binds and says so.
     folder_mounts, gone_mounts = _apply_folder_plan(
         workspace_path, md["extra_mounts"], progress)
 
-    # Git auth (GitHub key + commit identity) rides the container's writable
-    # layer, which the rm below destroys — carry it through the workspace
-    # bind-mount; the entrypoint restores it at next boot. Claude creds are
-    # deliberately NOT stashed here (this box re-auths in place).
+    # The agents' state (Claude's login and settings, ~/.claude.json, pi's
+    # agent dir) and the git auth (GitHub key + commit identity) ride the
+    # container's writable layer, which the rm below destroys — carry them
+    # through the workspace bind-mount; the entrypoint restores them at next
+    # boot, as the Docker-in-Docker recreate's does.
     #
     # MUST be before the stop, not merely before the rm: `was_running` is
-    # already latched above, and the stash's running fork is a `docker exec`
+    # already latched above, and the stashes' running fork is a `docker exec`
     # with capture_output and no returncode check — run it against a stopped
-    # container and it fails SILENTLY, then the rm takes the key with no error
-    # on any surface. (_recreate_supervisor stashes before its stop for the
-    # same reason.)
-    # Claude's model in its settings file on a labelled image: the fresh
-    # container's first boot merges the record (I33 slice 3).
+    # container and it fails SILENTLY, then the rm takes the state with no
+    # error on any surface. (_recreate_supervisor stashes before its stop for
+    # the same reason.)
+    # Claude's model in its settings file on a labelled image (I33 slice 3).
     boot_settings = _label_is_set("image", MINIMAL_IMAGE)
+    _stash_creds_for_rebuild(container, was_running, workspace_path)
     _stash_git_auth_for_rebuild(container, was_running, workspace_path)
 
     if was_running:
@@ -11995,6 +12007,10 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
     run_check(["docker", "rm", container])
 
     network = project_network_for(project)
+    # The docker box's agent set lives in its recovered per-agent mounts
+    # (`-v <cache>/<a>:/opt/agent-dist/<a>:ro`, docker-run fixed) — the same
+    # source the entrypoint's per-agent loop reads, so env and deploy agree.
+    agents = _agents_from_mounts(md["extra_mounts"])
     docker_args = build_supervisor_docker_args(
         container_name=container, project=project, network=network,
         workspace_path=workspace_path,
@@ -12009,19 +12025,17 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
         service_flags=service_flags,
         # Marker-sourced, same reasoning as _recreate_supervisor.
         agent_pair=_read_models(workspace_path).get("supervisor"),
-        # Claude's model in its settings file on a labelled image: the fresh
-        # container's first boot merges it from the record (I33 slice 3).
+        # Claude's model in its settings file on a labelled image: a first
+        # boot without a restored settings file merges it from the record
+        # (I33 slice 3); a restored one keeps its own.
         model_in_settings=boot_settings,
-        # The docker box's agent set lives in its recovered per-agent mounts
-        # (`-v <cache>/<a>:/opt/agent-dist/<a>:ro`, docker-run fixed) — the same
-        # source the entrypoint's per-agent loop reads, so env and deploy agree.
-        agents=_agents_from_mounts(md["extra_mounts"]),
+        agents=agents,
         # The web app exactly as the old container carried it (its own env,
         # host-written at create; nothing inside the container can change it).
         web=md.get("web"),
-        # The rebuilt container boots on a fresh home and re-installs pi's
-        # settings, so the create-time pair rides along again (marker-sourced,
-        # like the Claude pair above).
+        # pi's create-time pair rides along again (marker-sourced, like the
+        # Claude pair above): merged only where the boot installs pi's
+        # settings, i.e. when none were restored.
         pi_pair=_read_pi_pair(workspace_path),
         pids_limit=pids_limit)
     # Recovered binds minus any prior editor-dist mount (agent-dist + --mount folders
@@ -12062,23 +12076,39 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
     # F3 Slice 1: the rm + run above wiped the container fs + netns — re-establish
     # loopback forwarders for the project's registered exported ports.
     _reconcile_loopback_bridges(project, cfg)
-    # RS's instructions into the fresh home, before the setup re-run, so a
-    # failing setup still leaves the file.
-    old = _write_project_instructions(project, container, workspace_path,
-                                      progress=progress, has_file=False)
-    if found is not None:
-        found += old
-    # The rm + run reset the home, so a web-app project's setup (its install)
-    # is gone — and with history, its Gitea wiring too: re-run both, history
-    # first, after node is back. The tab waits through it.
+    # Everything below writes into the agents' home (RS's instructions, the
+    # MCP servers' config, the agents' settings), so it waits for the
+    # entrypoint's restore: a write landing before the restore would be
+    # deleted by it, or would make it move the stash INTO a re-created
+    # ~/.claude. Past HOME_RESTORE_WAIT_S all three are left to the next
+    # start, which writes them on every start.
+    home_ready = _wait_for_home_restore(container)
+    if home_ready:
+        # RS's instructions, before the setup re-run, so a failing setup
+        # still leaves the file (the restored home carries the previous one).
+        old = _write_project_instructions(project, container, workspace_path,
+                                          progress=progress, has_file=True)
+        if found is not None:
+            found += old
+    else:
+        _report_warnings([_HOME_NOT_READY_LINE], progress)
+    # The rm + run reset the rest of the home, so a web-app project's setup
+    # (its install) is gone — and with history, its Gitea wiring too: re-run
+    # both, history first, after node is back. The tab waits through it.
+    # History keeps its own bounded wait for the home: if the home came up
+    # just after the deadline above it still gets its chance (on a ready
+    # home that wait returns at its first poll).
     if md.get("web"):
         _rebuild_project_steps(project, container, md["web"], cfg,
                                progress or _NULL_PROGRESS)
-    # The fresh home's first boot merged the recorded models (RS_CLAUDE_* and
-    # RS_PI_* from the record): nothing is owed any more — a mark left would
-    # later overwrite a model picked inside the agent.
-    if boot_settings:
-        _clear_pending(workspace_path, ("claude", "pi"), mark_migrated=True)
+    # The restored settings files keep their own models (the boot merges the
+    # record only into a settings file it installs), so a model change saved
+    # while the project was stopped, or an older project's one-time
+    # migration, is written now — as the plain start does.
+    if home_ready and _agent_settings_owed(workspace_path):
+        _apply_agent_settings_pending(container, workspace_path, agents,
+                                      claude_in_settings=boot_settings,
+                                      progress=progress)
 
 
 def _live_toggle_editor(project: str, cfg: "Config", container: str,  # type: ignore[name-defined]
@@ -14363,6 +14393,20 @@ UPDATE_RESETTABLE = ("supervisor_model", "supervisor_effort", "pi_model", "pi_th
 # the create-time choice). A project on an older image keeps the container
 # setting (ANTHROPIC_MODEL) exactly as before.
 AGENT_SETTINGS_LABEL = "research.agent-settings"
+# rs-minimal images built with this label restore the agents' state (Claude's
+# login and settings, ~/.claude.json, pi's agent dir) that a docker re-creation
+# carries through the workspace. A re-creation on an older image refuses
+# instead of stashing state nothing would restore (_require_home_restore_image).
+HOME_RESTORE_LABEL = "research.home-restore"
+_HOME_RESTORE_IMAGE_TOO_OLD_MSG = (
+    "the project image predates keeping the agents' sign-ins and settings when "
+    "a project is re-created; rebuild the images under Sandboxes → Software → "
+    "Rebuild all, then try again")
+_HOME_NOT_READY_LINE = (
+    "the project was re-created, but its home was not ready in time: RS's "
+    "instructions, the agents' recorded settings and their connected MCP "
+    "servers are applied at its next start (Stop, then Start, in Sandboxes → "
+    "Management)")
 CLAUDE_EXT_ID = "anthropic.claude-code"
 AGENT_SETTINGS_ABSENT = "RS_AGENT_SETTINGS_ABSENT"
 AGENT_SETTINGS_FAILED = "RS_AGENT_SETTINGS_NOT_APPLIED"
@@ -14443,16 +14487,29 @@ def _claude_effort_ok(model: str, effort: str, catalog: dict) -> bool:
     return True
 
 
-def _label_is_set(kind: str, ref: str) -> bool:
-    """Whether the image or container `ref` carries AGENT_SETTINGS_LABEL=1.
-    Anything else (an older image, a failed inspect) reads as no."""
+def _label_is_set(kind: str, ref: str, *, label: str = AGENT_SETTINGS_LABEL) -> bool:
+    """Whether the image or container `ref` carries `label`=1 (by default
+    AGENT_SETTINGS_LABEL). Anything else (an older image, a failed inspect)
+    reads as no."""
     try:
         r = run(["docker", kind, "inspect", "-f",
-                 '{{index .Config.Labels "' + AGENT_SETTINGS_LABEL + '"}}', ref],
+                 '{{index .Config.Labels "' + label + '"}}', ref],
                 capture_output=True, timeout=AGENT_SETTINGS_EXEC_TIMEOUT_S)
     except (OSError, subprocess.TimeoutExpired):
         return False
     return r.returncode == 0 and (r.stdout or "").strip() == "1"
+
+
+def _require_home_restore_image() -> None:
+    """Refuse a docker re-creation on an rs-minimal image that cannot restore
+    the agents' state. Its host half would stash the logins into the workspace
+    and nothing would put them back; the next re-creation's stash (which skips
+    a stash already there) would then drop the operator's fresh login, and the
+    first one on a rebuilt image would restore the old stash. A failed inspect
+    (a missing image included) refuses the same way: Rebuild all is the remedy
+    there too. Before anything is touched."""
+    if not _label_is_set("image", MINIMAL_IMAGE, label=HOME_RESTORE_LABEL):
+        raise ValidationError(_HOME_RESTORE_IMAGE_TOO_OLD_MSG)
 
 
 def _claude_ops_from_pair(pair: "dict | None",
@@ -15468,28 +15525,6 @@ def _apply_agent_settings_pending(container: str, workspace_path: "Path",
         _marker_rmw(workspace_path, mutate, "record the applied agent settings")
     except Exception as e:     # never stop a start over a settings write
         _report_warnings([f"the agents' recorded models could not be applied ({e})"], progress)
-
-
-def _clear_pending(workspace_path: "Path", agents: "Sequence[str]",
-                   mark_migrated: bool = False) -> None:
-    """Drop `agents` from the pending marks (their record is in the files
-    already); `mark_migrated` also records the one-time migration as done (a
-    fresh home whose first boot merged the whole record). Never raises."""
-    def mutate(d: dict) -> None:
-        b = _agent_settings_block(d) or {}
-        left = [a for a in (b.get("pending") or []) if a not in agents] \
-            if isinstance(b.get("pending"), list) else []
-        f = {a: v for a, v in _pending_fields(b).items() if a in left}
-        out = {"v": 1, "pending": left, "migrated": bool(b.get("migrated")) or mark_migrated}
-        if f:
-            out["fields"] = f
-        d["agent_settings"] = out
-    try:
-        data = _read_marker_dict(workspace_path)
-        if data and (_agent_settings_block(data) is not None or mark_migrated):
-            _marker_rmw(workspace_path, mutate, "record the applied agent settings")
-    except Exception:
-        pass
 
 
 def _agent_settings_owed(workspace_path: "Path") -> bool:

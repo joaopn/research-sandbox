@@ -28,12 +28,44 @@ if [[ ! -f ~/.bashrc ]]; then
     cp -a /etc/research-skel/. ~/
 fi
 
+# --- Restore the agents' state stashed by a re-creation ---
+# This box keeps its filesystem across a plain docker stop/start, but
+# _recreate_docker_substrate (the editor switch, a start that applies saved
+# folders) does rm + run. _stash_creds_for_rebuild moves Claude's ~/.claude,
+# ~/.claude.json and pi's agent dir into the workspace before that rm; restore
+# them here, BEFORE the agent-dist loop below, so the restored settings win
+# its no-clobber installs (and the create-time model merges, which ride only
+# those installs, do not fire over them). The three blocks are the same as
+# entrypoint.sandbox-dind.sh's (pinned). ~/.rs-role, written after the loop,
+# is the host's signal that this restore is done (it waits for it before
+# writing into the home). The image carries LABEL research.home-restore=1.
+if [[ -d /workspace/.creds-stash ]]; then
+    sudo rm -rf /home/research/.claude
+    sudo mv /workspace/.creds-stash /home/research/.claude
+    sudo chown -R research:research /home/research/.claude
+    echo "restored Claude creds from /workspace/.creds-stash"
+fi
+if [[ -f /workspace/.creds-stash-home.json ]]; then
+    sudo mv /workspace/.creds-stash-home.json /home/research/.claude.json
+    sudo chown research:research /home/research/.claude.json
+    sudo chmod 600 /home/research/.claude.json
+    echo "restored ~/.claude.json from /workspace/.creds-stash-home.json"
+fi
+# pi's agent dir is restored WHOLE (auth.json, settings, sessions, trust,
+# mcp.json, `pi install` packages). Leaf only: never rm the parent share/.
+if [[ -d /workspace/.creds-stash-pi ]]; then
+    sudo mkdir -p /home/research/.local/share/pi-agent
+    sudo rm -rf /home/research/.local/share/pi-agent/agent
+    sudo mv /workspace/.creds-stash-pi /home/research/.local/share/pi-agent/agent
+    sudo chown -R research:research /home/research/.local
+    echo "restored pi auth from /workspace/.creds-stash-pi"
+fi
+
 # --- Git auth restore: the GitHub SSH key + the git commit identity ---
-#     This box keeps its filesystem across a plain docker stop/start, but
-#     _recreate_docker_substrate (any editor enable/disable) does rm + run —
-#     and staging git auth is create-time only. _stash_git_auth_for_rebuild
-#     mv's these into the workspace before that rm; restore them here, before
-#     anything that might want to use git.
+#     Same re-creation survival as the agents' state above: staging git auth
+#     is create-time only, and _stash_git_auth_for_rebuild mv's these into the
+#     workspace before the rm; restore them here, before anything that might
+#     want to use git.
 #
 #     Modes are re-asserted because a bind-mount round-trip can drift them and
 #     ssh refuses BOTH a group/other-readable key AND a group/other-writable

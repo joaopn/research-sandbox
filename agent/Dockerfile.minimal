@@ -13,6 +13,11 @@ RUN cp -a /home/research /etc/research-skel
 
 COPY agent/entrypoint.minimal.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+# The entrypoint restores the agents' state (Claude's login and settings,
+# ~/.claude.json, pi's agent dir) that a re-creation stashes into the
+# workspace; the host refuses a re-creation on an image without this label
+# (rscore.HOME_RESTORE_LABEL).
+LABEL research.home-restore="1"
 
 # Workflow web apps (the same three scripts the box images bake): rs-web-loop
 # keeps a workflow's web app running at its webui tab's address (started by the

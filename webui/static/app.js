@@ -12803,8 +12803,8 @@ function appendEditorExtensionSection(box, project, enabled) {
         el("span", { class: "config-box-name" }, ["Editor"]),
         el("span", { class: "config-box-meta" }, [editorOn ? "on" : "off"]),
     ]);
-    // A bare docker box has no creds-stash, so the recreate resets its in-box
-    // claude login (dind stashes creds across the supervisor recreate).
+    // A docker project re-creates its container for the switch (its agents'
+    // sign-ins and settings are carried across); dind deploys the editor live.
     const isDocker = !(enabled.supervisor && enabled.supervisor.box_harness);
     const btn = el("button", { class: "btn btn-secondary" },
                   [editorOn ? "Disable" : "Enable"]);
@@ -13154,9 +13154,9 @@ function appendSharingSection(box, project, enabled) {
 function projectFoldersPendingText(r) {
     if (r.rebuilds) {
         return "Saved. The change applies when the project next starts " +
-               "(Stop, then Start, in Sandboxes → Management). That start rebuilds the " +
-               "project: its agent must log in again, and anything installed " +
-               "outside /workspace is gone.";
+               "(Stop, then Start, in Sandboxes → Management). That start re-creates " +
+               "the project's container: its agents keep their sign-ins and settings, " +
+               "but anything installed outside /workspace is gone.";
     }
     return "Saved. The change applies when the project next starts: Stop, " +
            "then Start, or Update, in Sandboxes → Management.";
@@ -13663,15 +13663,11 @@ function mgmtEditorToggle(name, on, isDocker) {
     // runc container (its editor is a bind-mount, addable only at create).
     const body = [el("p", {}, [isDocker
         ? `${word} the code-server editor on "${name}". This recreates the ` +
-          "project's container (fresh container); running work in it is interrupted."
+          "project's container (fresh container); running work in it is interrupted. " +
+          "The agents keep their sign-ins and settings; anything installed " +
+          "outside /workspace is gone."
         : `${word} the code-server editor on "${name}". This deploys it live ` +
           "(no recreate) — it takes effect on the next page load."])];
-    if (isDocker) {
-        body.push(el("p", { class: "hint" }, [
-            "On a bare docker box this resets the in-box claude login — run " +
-            "`claude` then /login again inside afterwards.",
-        ]));
-    }
     mgmtConfirmThenTail(boxOpView(), {
         title: `${word} the editor on ${name}`,
         tailTitle: `${on ? "Disabling" : "Enabling"} the editor on ${name}`,
