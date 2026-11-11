@@ -2126,6 +2126,11 @@ def cmd_webui(args: argparse.Namespace) -> None:
         if not (pt_hi < origin_lo or origin_hi < pt_lo):
             die(f"the pass-through block {pt_lo}-{pt_hi} overlaps the origin "
                 f"port range {origin_lo}-{origin_hi}; move one of them in .env")
+        # A container publishing other ports than the ones in effect (a range or
+        # WEBUI_PORT edited in .env since it was created) is recreated, so
+        # "already running" never keeps the old ports up (B204). Read from the
+        # container's own port bindings, like the bind above; unreadable recreates.
+        ports_changed = rscore.webui_ports_changed(port, (origin_lo, origin_hi), (pt_lo, pt_hi))
         # Everything compose interpolates for the webui, the operator's uid/gid
         # and the broker's socket subdir included, from the ONE helper the
         # in-place recreate uses too (it also pre-creates that subdir).
@@ -2137,11 +2142,13 @@ def cmd_webui(args: argparse.Namespace) -> None:
         # every refusal that comes before the old webui is removed (B58); a
         # renewed certificate recreates the webui onto the new files.
         renewed = rscore.refresh_webui_tailscale_cert()
-        if (recreate or user_changed or renewed or rebuild) and rscore._container_present(WEBUI_CONTAINER):
+        if (recreate or user_changed or renewed or rebuild or ports_changed) \
+                and rscore._container_present(WEBUI_CONTAINER):
             reason = ("bind/port/listen subnet changed" if recreate
                       else "the webui runs as another user" if user_changed
                       else "the Tailscale certificate was renewed" if renewed
-                      else "rebuild requested")
+                      else "rebuild requested" if rebuild
+                      else "the published ports changed")
             print(f"{reason}; recreating webui...")
             run(["docker", "rm", "-f", WEBUI_CONTAINER], capture_output=True)
 

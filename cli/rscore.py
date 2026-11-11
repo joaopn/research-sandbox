@@ -24664,6 +24664,40 @@ def webui_bind_state() -> str:
     return "wildcard" if _is_wildcard_address(addr) else "ok"
 
 
+def webui_published_ports(port: str, origin: tuple[int, int],
+                          passthrough: tuple[int, int]) -> frozenset:
+    """The (container port key, host port) pairs compose publishes for the
+    webui with these values — docker-compose.yml's webui `ports:` (a lockstep,
+    pinned by a test): the UI's 7777/tcp on `port`, and every origin and
+    pass-through port 1:1. The address is not part of it (webui_container_bind
+    compares that)."""
+    pairs = {("7777/tcp", int(port))}
+    for lo, hi in (origin, passthrough):
+        pairs.update((f"{n}/tcp", n) for n in range(lo, hi + 1))
+    return frozenset(pairs)
+
+
+def webui_ports_changed(port: str, origin: tuple[int, int],
+                        passthrough: tuple[int, int]) -> bool:
+    """Does the existing webui CONTAINER publish other ports than compose would
+    publish for these values (a range or WEBUI_PORT changed since it was
+    created)? Read from its own HostConfig.PortBindings, like
+    webui_container_bind. False when there is no webui container (the
+    container-scoped inspect is the presence read); True when the bindings
+    cannot be read — fail closed, as an unreadable bind is."""
+    r = run(["docker", "container", "inspect", WEBUI_CONTAINER,
+             "-f", "{{json .HostConfig.PortBindings}}"], capture_output=True)
+    if r.returncode != 0:
+        return False
+    try:
+        bindings = json.loads(r.stdout or "null")
+        have = frozenset((key, int(b["HostPort"]))
+                         for key, lst in bindings.items() for b in lst)
+    except (json.JSONDecodeError, AttributeError, TypeError, KeyError, ValueError):
+        return True
+    return have != webui_published_ports(port, origin, passthrough)
+
+
 def webui_projects_dir() -> "Path | None":
     """The folder docker compose binds into the webui at /projects, resolved
     the way compose resolves `${PROJECTS_DIR:-./container_volumes}` (no I/O):
