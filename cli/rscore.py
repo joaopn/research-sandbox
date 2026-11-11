@@ -6827,15 +6827,12 @@ def _require_settings_folder(workspace_path: "Path") -> None:
 def _read_marker_ssh_port(workspace_path: "Path") -> int | None:
     """The SSH port recorded in .orchestrator/project.json at create — the
     project's OWN record of its port, authoritative for start/recreate.
-    Tolerant read (the _read_marker_agents shape): missing/unreadable marker
-    or key, or a non-int, reads as None (a pre-change project; its container
-    binding is then the only record — see _recreate_supervisor). A link at
-    the marker or at the settings folder reads as unreadable (orch_files)."""
-    try:
-        data = json.loads(_read_marker_text(workspace_path))
-    except (OSError, json.JSONDecodeError):
-        return None
-    port = data.get("ssh_port") if isinstance(data, dict) else None
+    Tolerant read (through _read_marker_dict): missing/unreadable/malformed
+    marker or key, or a non-int, reads as None (a pre-change project; its
+    container binding is then the only record — see _recreate_supervisor). A
+    link at the marker or at the settings folder reads as unreadable
+    (orch_files)."""
+    port = _read_marker_dict(workspace_path).get("ssh_port")
     return port if isinstance(port, int) and not isinstance(port, bool) else None
 
 
@@ -8922,13 +8919,13 @@ def _dind_agent_sets(marker: object) -> tuple[list[str], list[str]]:
 
 def _read_marker_dict(workspace_path: "Path") -> dict:
     """The whole .orchestrator/project.json, tolerant: {} when it is missing,
-    unreadable (a link included — orch_files) or not a JSON object (the
-    _read_marker_agents posture)."""
-    try:
-        data = json.loads(_read_marker_text(workspace_path))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    unreadable (a link included — orch_files), invalid JSON, nested too deeply
+    to parse, holding a number past the interpreter's digit limit, or not a
+    JSON object. THE tolerant reader of the record: every reader that only
+    needs a key takes it from here (one parse, _read_marker_three_way's), so
+    a malformed record reads as an empty one everywhere instead of raising
+    out of a start or another project's create."""
+    return _read_marker_three_way(workspace_path)[1]
 
 
 def _read_dind_agent_sets(workspace_path: "Path") -> tuple[list[str], list[str]]:
@@ -14102,13 +14099,10 @@ def _host_box_image_id(host_base: str) -> str:
 
 def _read_box_image_record(workspace_path: "Path") -> dict[str, dict[str, str]]:
     """The project's box-image record, valid entries only ({} when the marker
-    is absent or unreadable, a link included — orch_files). An entry without
-    a valid id AND digest is no entry: that image is published again."""
-    try:
-        data = json.loads(_read_marker_text(workspace_path))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    record = data.get(BOX_IMAGES_KEY) if isinstance(data, dict) else None
+    is absent, unreadable or malformed, a link included — _read_marker_dict).
+    An entry without a valid id AND digest is no entry: that image is
+    published again."""
+    record = _read_marker_dict(workspace_path).get(BOX_IMAGES_KEY)
     if not isinstance(record, dict):
         return {}
     return {repo: {"id": e["id"], "digest": e["digest"]}
@@ -14125,7 +14119,7 @@ def _write_box_image_record(workspace_path: "Path", repo: str, image_id: str,
     fresh (that would leave a project record without its type)."""
     try:
         data = json.loads(_read_marker_text(workspace_path))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError, RecursionError):
         return False
     if not isinstance(data, dict):
         return False
@@ -14298,11 +14292,8 @@ def _project_has_fetch_consumers(workspace_path: "Path") -> bool:
     fetch halves at start/recreate/wire (the universal staging is retired).
     Tolerant reads — missing/corrupt ⇒ False: an unflagged project must never
     grow the surface from a bad file (or one read through a link)."""
-    try:
-        if json.loads(_read_marker_text(workspace_path)).get("fetch") is True:
-            return True
-    except (OSError, json.JSONDecodeError, AttributeError):
-        pass
+    if _read_marker_dict(workspace_path).get("fetch") is True:
+        return True
     try:
         entries = extension.load(workspace_path)
     except Exception:
@@ -14330,15 +14321,11 @@ def _agents_from_mounts(extra_mounts: list[str]) -> list[str]:
 
 def _read_marker_agents(workspace_path: "Path") -> list[str]:
     """The agent set stamped into .orchestrator/project.json at create (drives the
-    sandbox-dind recreate's deploy_local). Tolerant read, the _read_box_image_record shape:
-    a missing/unreadable marker or key reads as [] — the recreate then comes back
-    UNWIRED (accepted B31-family caveat; greenfield posture — pre-change non-docker
-    markers already carry []). A link reads as unreadable (orch_files)."""
-    try:
-        data = json.loads(_read_marker_text(workspace_path))
-    except (OSError, json.JSONDecodeError):
-        return []
-    agents = data.get("agents")
+    sandbox-dind recreate's deploy_local). Tolerant read, through _read_marker_dict:
+    a missing/unreadable/malformed marker or key reads as [] — the recreate then
+    comes back UNWIRED (accepted B31-family caveat; greenfield posture — pre-change
+    non-docker markers already carry []). A link reads as unreadable (orch_files)."""
+    agents = _read_marker_dict(workspace_path).get("agents")
     return agents if isinstance(agents, list) else []
 
 
@@ -14356,7 +14343,7 @@ def _write_marker_agents(workspace_path: "Path", agents: list[str]) -> None:
         # Its own text names the folder as the project sees it; the host path
         # never reaches the browser.
         raise ValidationError(f"cannot update the agent set: {e}")
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         raise ValidationError(
             f"cannot update the agent set: the project marker {orch_files.SHOWN_FOLDER}/project.json is unreadable "
             f"({e}); repair it before changing agents")
@@ -14657,7 +14644,7 @@ def _marker_rmw(workspace_path: "Path", mutate, what: str) -> None:
         data = json.loads(_read_marker_text(workspace_path))
     except orch_files.Unusable as e:
         raise ValidationError(f"cannot {what}: {e}")
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         raise ValidationError(f"cannot {what}: the project marker {orch_files.SHOWN_FOLDER}/project.json is unreadable ({e}); "
                               f"repair it first")
     if not isinstance(data, dict):
@@ -16041,14 +16028,10 @@ def _project_agent_boxes(container: str, running: bool, research: bool,
 
 def _read_marker_substrate(workspace_path: "Path") -> str:
     """The substrate stamped into .orchestrator/project.json at create. Tolerant
-    (the _read_marker_agents shape): a missing/unreadable marker or key reads as
-    dind-sysbox, the substrate every pre-docker marker meant (a link reads as
-    unreadable — orch_files)."""
-    try:
-        data = json.loads(_read_marker_text(workspace_path))
-    except (OSError, json.JSONDecodeError):
-        return Substrate.DIND_SYSBOX.value
-    sub = data.get("substrate") if isinstance(data, dict) else None
+    (through _read_marker_dict): a missing/unreadable/malformed marker or key
+    reads as dind-sysbox, the substrate every pre-docker marker meant (a link
+    reads as unreadable — orch_files)."""
+    sub = _read_marker_dict(workspace_path).get("substrate")
     return sub if isinstance(sub, str) else Substrate.DIND_SYSBOX.value
 
 
@@ -16154,13 +16137,10 @@ def _read_models(workspace_path: "Path") -> dict[str, dict[str, str]]:
     Every pair in here is already RESOLVED and mutually valid (see
     _resolve_all_model_pairs) — that is the contract the in-supervisor readers
     (rs-worker, rs-sandbox) depend on, since they read it verbatim and have no
-    catalog to validate against. A link at the marker or at the settings
-    folder reads as unreadable (orch_files)."""
-    try:
-        data = json.loads(_read_marker_text(workspace_path))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    models = data.get("models")
+    catalog to validate against. A missing, unreadable or malformed marker
+    reads as {} (through _read_marker_dict); a link at the marker or at the
+    settings folder reads as unreadable (orch_files)."""
+    models = _read_marker_dict(workspace_path).get("models")
     return models if isinstance(models, dict) else {}
 
 
@@ -16182,7 +16162,7 @@ def _write_models(workspace_path: "Path", models: dict[str, dict[str, str]]) -> 
         data = {}
     except orch_files.Unusable as e:
         raise ValidationError(f"cannot change the agent models: {e}")
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         raise ValidationError(
             f"cannot change the agent models: the project marker {orch_files.SHOWN_FOLDER}/project.json is unreadable "
             f"({e}); repair it before changing models")
@@ -16353,15 +16333,11 @@ def _pi_env_args(pair: dict[str, str] | None) -> list[str]:
 
 def _read_pi_pair(workspace_path: "Path") -> dict[str, str] | None:
     """The marker's `pi_models.agent` pair, or None when the project chose
-    none (or predates the pi tab). Tolerant: an unreadable marker reads as no
-    choice, and only well-formed string values pass (the marker is
-    container-writable; the values still reach pi only through the merge,
-    which reads them from the environment)."""
-    try:
-        data = json.loads(_read_marker_text(workspace_path))
-    except (OSError, json.JSONDecodeError):
-        return None
-    blk = data.get("pi_models") if isinstance(data, dict) else None
+    none (or predates the pi tab). Tolerant: an unreadable or malformed marker
+    reads as no choice (_read_marker_dict), and only well-formed string values
+    pass (the marker is container-writable; the values still reach pi only
+    through the merge, which reads them from the environment)."""
+    blk = _read_marker_dict(workspace_path).get("pi_models")
     pair = blk.get("agent") if isinstance(blk, dict) else None
     if not isinstance(pair, dict):
         return None
@@ -19083,7 +19059,7 @@ def _write_marker_history(workspace_path: "Path") -> None:
     an unreadable marker (a link included — orch_files) is left as it is."""
     try:
         data = json.loads(_read_marker_text(workspace_path))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return
     if not isinstance(data, dict):
         return
