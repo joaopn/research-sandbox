@@ -1978,6 +1978,10 @@ def _warning_text(name: str, w: dict) -> str:
     if w.get("kind") == "history":
         return (f"warning: box {name!r} starts without Gitea history "
                 f"({w.get('reason')})")
+    if w.get("kind") == "status-bar":
+        return f"warning: box {name!r}: " + _STATUS_BAR_REASON_TEXT.get(
+            w.get("reason"), _STATUS_BAR_REASON_TEXT["failed"]).format(
+            agent="Claude" if w.get("agent") == "claude" else "pi")
     if w.get("kind") == "mailbox":
         why = _MAILBOX_REASON_TEXT.get(w.get("reason"), "its mailbox could not be mounted")
         if w.get("reason") == "agent":
@@ -2286,21 +2290,26 @@ def _box_model_ops(new: dict, old: "dict | None" = None,
             BOX_CLAUDE_SETTINGS_JQ]
 
 
-def _write_box_model_detached(cname: str, ops: list[str]) -> None:
+def _write_box_model_detached(cname: str, ops: list[str], status_bar: bool = False) -> None:
     """After the box's boot (its role marker AND its settings file — the
     entrypoint's fallback settings write comes after the marker), merge the pair
-    into the box agent's settings, as the box user. Detached like the
-    working-mode installer (the boot copies files while this waits); a pending
-    exec dies with the box. Never fatal."""
+    (`ops`; none: no model write) into the box agent's settings and, with
+    `status_bar`, turn RS's status bar on in its agents — as the box user, in
+    ONE exec, so the two never merge into Claude's file at once. Detached like
+    the working-mode installer (the boot copies files while this waits); a
+    pending exec dies with the box. Never fatal."""
+    model = f"( {BOX_AGENT_SETTINGS_SCRIPT} ); " if ops else ""
+    bar = (f"( set -- on {' '.join(BOX_STATUS_BAR_AGENTS)}; {BOX_STATUS_BAR_SCRIPT}"
+           f" ) >/dev/null; " if status_bar else "")
     r = _docker("exec", "-d", "-u", "1000", "-e", "HOME=/home/worker", cname, "sh", "-c",
                 f"touch {BOX_MODEL_PENDING}; "
                 # one-second poll, as the installer's
                 "until [ -e /home/worker/.rs-role ] && [ -f \"$1\" ]; do sleep 1; done; "
-                f"( {BOX_AGENT_SETTINGS_SCRIPT} ); rm -f {BOX_MODEL_PENDING}",
+                f"{model}{bar}rm -f {BOX_MODEL_PENDING}",
                 "sh", BOX_CLAUDE_SETTINGS, *ops)
     if r.returncode != 0:
-        print(f"warning: the model could not be written into box {cname!r}'s "
-              f"settings; it runs on Claude's own default", file=sys.stderr)
+        print(f"warning: the agent settings could not be written into box {cname!r}; "
+              f"its agents run on their own defaults", file=sys.stderr)
 
 
 def _write_box_model_now(cname: str, ops: list[str]) -> str:
@@ -2325,6 +2334,116 @@ def _write_box_model_now(cname: str, ops: list[str]) -> str:
     return "absent" if BOX_AGENT_SETTINGS_ABSENT in out else "ok"
 
 
+
+# ---------------------------------------------------------------------------
+# RS's status bar in a box's agents (#524). The project container holds the two
+# files at BOX_STATUS_BAR_DIR (staged by the host at every start); every run of
+# an agent box copies them into the box (root-owned, same path) and, when the
+# box's record has the bar on, writes it into the box's fresh home after its
+# boot. MIRRORS of rscore (this file runs standalone): STATUS_BAR_DIR,
+# STATUS_BAR_FILES' names, STATUS_BAR_AGENTS and STATUS_BAR_SCRIPT — pinned.
+# ---------------------------------------------------------------------------
+BOX_STATUS_BAR_DIR = "/usr/local/lib/rs"
+BOX_STATUS_BAR_FILES = ("rs-statusbar.py", "rs-statusbar.ts")
+BOX_STATUS_BAR_AGENTS = ("claude", "pi")
+BOX_STATUS_BAR_STATES = ("on", "off", "own", "absent", "failed")
+BOX_STATUS_BAR_SCRIPT = 'op="$1"; shift\ncs="$HOME/.claude/settings.json"; pd="$HOME/.local/share/pi-agent/agent"\npf="$pd/extensions/rs-statusbar.ts"\nfor a in "$@"; do\nif [ "$a" = claude ]; then\n  [ -f "$cs" ] || { echo claude=absent; continue; }\n  if [ "$op" = on ] || [ "$op" = off ]; then\n    if [ "$(wc -c < "$cs")" -le 1048576 ] && jq --arg op "$op" --arg cmd /usr/local/lib/rs/rs-statusbar.py --argjson ri 30 \'if $op == "on" then (if has("statusLine") then . else .statusLine = {"type": "command", "command": $cmd, "refreshInterval": $ri} end) elif $op == "off" then (if (.statusLine | type) == "object" and .statusLine.command == $cmd then del(.statusLine) else . end) else . end\' "$cs" > "$cs.rs-tmp" && [ -s "$cs.rs-tmp" ] && mv "$cs.rs-tmp" "$cs"; then :; else rm -f "$cs.rs-tmp"; echo claude=failed; continue; fi\n  fi\n  s=$(head -c 1048576 "$cs" | jq -r --arg cmd /usr/local/lib/rs/rs-statusbar.py \'if (.statusLine | type) == "object" and .statusLine.command == $cmd then "on" elif has("statusLine") then "own" else "off" end\' 2>/dev/null) || s=failed\n  echo "claude=${s:-failed}"\nelif [ "$a" = pi ]; then\n  [ -f "$pd/settings.json" ] || { echo pi=absent; continue; }\n  w=no\n  if [ "$op" = on ]; then w=yes; fi\n  if [ "$op" = refresh ] && [ -f "$pf" ] && [ ! -L "$pf" ]; then w=yes; fi\n  if [ "$w" = yes ]; then\n    if rm -f "$pf.rs-tmp" && mkdir -p "$pd/extensions" && cp /usr/local/lib/rs/rs-statusbar.ts "$pf.rs-tmp" && mv -f "$pf.rs-tmp" "$pf"; then :; else rm -f "$pf.rs-tmp"; echo pi=failed; continue; fi\n  fi\n  if [ "$op" = off ] && { [ -e "$pf" ] || [ -L "$pf" ]; }; then\n    rm -f "$pf" || { echo pi=failed; continue; }\n  fi\n  if [ -f "$pf" ]; then echo pi=on; else echo pi=off; fi\nfi\ndone\n'
+
+
+_STATUS_BAR_REASON_TEXT = {
+    "not-staged": ("its agents show no status bar: its files are not in the project "
+                   "container yet (the project's next start puts them there)"),
+    "own": ("{agent} has its own status line, so RS's status bar was not turned on "
+            "there; remove `statusLine` from its settings to use RS's"),
+    "failed": "the status bar could not be written; it is applied at its next start",
+    "booting": "the box is still starting; its status bar is applied at its next start",
+    "added": ("the agent just added shows no status bar yet; it gets it at the "
+              "project's next start"),
+}
+
+
+def _entry_status_bar(entry: dict) -> bool:
+    """The box's recorded switch: on unless the record says off (a box created
+    before the status bar takes the default)."""
+    return entry.get("status_bar") is not False
+
+
+def _parse_box_status_bar(out: str, agents: "list[str]") -> dict:
+    got: dict = {}
+    for line in (out or "").splitlines():
+        a, sep, v = line.strip().partition("=")
+        if sep and a in agents and v in BOX_STATUS_BAR_STATES and a not in got:
+            got[a] = v
+    return {a: got.get(a, "failed") for a in agents}
+
+
+def _stage_box_status_bar(cname: str) -> bool:
+    """Copy the two files from this project container into a running box, as
+    root at the same path. False when they are not here (a project not
+    started since RS gained the status bar) or the copy failed."""
+    for n in BOX_STATUS_BAR_FILES:
+        src = os.path.join(BOX_STATUS_BAR_DIR, n)
+        dst = f"{BOX_STATUS_BAR_DIR}/{n}"
+        try:
+            st = os.lstat(src)
+            if not stat.S_ISREG(st.st_mode):
+                return False
+            with open(src, "rb") as fh:
+                data = fh.read()
+            r = _docker_input(data, "exec", "-i", "-u", "0", cname, "sh", "-c",
+                              f"mkdir -p {BOX_STATUS_BAR_DIR} && cat > {dst}.rs-tmp && "
+                              f"chmod {st.st_mode & 0o777:o} {dst}.rs-tmp && "
+                              f"mv -f {dst}.rs-tmp {dst}")
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if r.returncode != 0:
+            return False
+    return True
+
+
+def _box_status_bar_now(cname: str, op: str,
+                        agents: "list[str] | None" = None) -> "dict | str":
+    """Run the status-bar script for the box's agents (`agents`: only these)
+    in a box whose boot is done: {agent: state}, or "booting" (as
+    _write_box_model_now)."""
+    agents = [a for a in (agents or BOX_STATUS_BAR_AGENTS) if a in BOX_STATUS_BAR_AGENTS]
+    gate = ('[ -e /home/worker/.rs-role ] || { echo RS_BOX_BOOTING; exit 0; }\n'
+            f'[ ! -e {BOX_MODEL_PENDING} ] || {{ echo RS_BOX_BOOTING; exit 0; }}\n')
+    try:
+        r = subprocess.run(["docker", "exec", "-u", "1000", "-e", "HOME=/home/worker", cname,
+                            "sh", "-c", gate + BOX_STATUS_BAR_SCRIPT, "sh", op, *agents],
+                           capture_output=True, text=True,
+                           timeout=BOX_AGENT_SETTINGS_EXEC_TIMEOUT_S)
+        out = r.stdout or ""
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        out = ""
+    if "RS_BOX_BOOTING" in out:
+        return "booting"
+    return _parse_box_status_bar(out, agents)
+
+
+def _status_bar_owed_done(states: "dict | str") -> bool:
+    """Whether a write reached every agent the box carries (an agent not
+    installed there owes nothing)."""
+    return isinstance(states, dict) and all(v in ("on", "off", "own", "absent")
+                                            for v in states.values())
+
+
+def _status_bar_warnings(states: "dict | str", on: bool) -> list[dict]:
+    """The box's status-bar outcome as data for the host: an agent whose own
+    status line kept RS's off, a write that did not land (it is applied at the
+    box's next start)."""
+    if states == "booting":
+        return [{"kind": "status-bar", "reason": "booting"}]
+    if not isinstance(states, dict):
+        return [{"kind": "status-bar", "reason": "failed"}]
+    out = []
+    for a, v in sorted(states.items()):
+        if v == "own" and on:
+            out.append({"kind": "status-bar", "reason": "own", "agent": a})
+        elif v == "failed":
+            out.append({"kind": "status-bar", "reason": "failed", "agent": a})
+    return out
 
 def _harness_env_pairs(harness: "dict | None", agent: str) -> list[tuple[str, str]]:
     """The RS_HARNESS_* variables a box runs with, from its entry: set values
@@ -2499,7 +2618,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
              history: dict | None = None,
              web: dict | None = None, share: bool = False,
              harness: dict | None = None,
-             trusted_browser: bool = False) -> list[dict]:
+             trusted_browser: bool = False, status_bar: bool = True) -> list[dict]:
     """docker run a box in the local inner dockerd. ``browser`` selects the
     Chromium-equipped image; ``agent`` (any staged agent|none): any agent mounts
     the project's MERGED copy-source and exports RS_BOX_AGENT=claude (the baked
@@ -2794,16 +2913,25 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     # container's own filesystem, where the shared copy is a real directory.
     if agent_mount and os.path.isfile(HARNESS_INSTALLER):
         _install_harness(cname, _box_carried_agents())
-    # A Claude box's model + effort into its own settings file, after the boot
-    # — in every project, research included (no installer gate).
-    if agent_mount and agent == "claude" and (model or effort):
-        _write_box_model_detached(cname, _box_model_ops({"model": model, "effort": effort}))
+    # RS's status bar (#524): the files into every agent box at every run (a
+    # later Enable needs them), so a fix reaches boxes at their next run.
+    bar_warnings: list[dict] = []
+    if agent_mount and not _stage_box_status_bar(cname):
+        bar_warnings.append({"kind": "status-bar", "reason": "not-staged"})
+        status_bar = False      # never a setting naming a script that is not there
+    # A Claude box's model + effort into its own settings file, and the status
+    # bar into its agents, after the boot — in every project, research included
+    # (no installer gate). The home is fresh: "off" has nothing to remove.
+    model_ops = (_box_model_ops({"model": model, "effort": effort})
+                 if agent == "claude" and (model or effort) else [])
+    if agent_mount and (model_ops or status_bar):
+        _write_box_model_detached(cname, model_ops, status_bar=status_bar)
     # F3 Slice 2b: launch the in-box loopback forwarders for the freshly-run box.
     _launch_box_forwarders(cname, lp_list)
     # The box's home is fresh: give its agents their wired MCP servers back.
     _mcp_sync_box(name)
     return (folder_warnings + mailbox_warnings + history_warnings + browser_warnings
-            + instr_warnings + skill_warnings + files_warnings)
+            + instr_warnings + skill_warnings + files_warnings + bar_warnings)
 
 
 def _mcp_sync_box(name: str) -> None:
@@ -2871,14 +2999,17 @@ def _rerun_box(name: str, entry: dict) -> list[dict]:
         _write_mcp_preset(ws, preset)
         _write_greeting(ws, preset)
     is_dev = bool(entry.get("dev"))
-    if entry.get("model_pending"):
-        # This run lays the entry's pair into the fresh home: nothing is owed.
+    if entry.get("model_pending") or entry.get("status_bar_pending"):
+        # This run lays the entry's pair and status bar into the fresh home:
+        # nothing is owed.
         entries = load()
         if isinstance(entries.get(name), dict):
             entries[name].pop("model_pending", None)
+            entries[name].pop("status_bar_pending", None)
             save(entries)
         entry = dict(entry)
         entry.pop("model_pending", None)
+        entry.pop("status_bar_pending", None)
     return _run_box(name, entry["ip"], browser=bool(entry.get("browser")),
              agent=entry.get("agent", "none"), editor=bool(entry.get("editor")),
              editor_port=int(entry.get("editor_port") or 0),
@@ -2922,6 +3053,7 @@ def _rerun_box(name: str, entry: dict) -> list[dict]:
              # Fixed at create, re-applied from the STORED entry at every run
              # (the env and the policy mount are fixed at docker run).
              trusted_browser=_entry_browser_trusted(entry),
+             status_bar=_entry_status_bar(entry),
              # From the STORED entry: True only when its create recorded it
              # (an entry from before sharing was a choice does not share).
              share=_entry_share(entry))
@@ -3215,6 +3347,9 @@ def cmd_create(args: argparse.Namespace) -> None:
         # that does not share carries no key, exactly like a box created
         # before sharing was a choice.
         entry["share"] = True
+    # RS's status bar (#524); a box without an agent has none.
+    status_bar = bool(getattr(args, "status_bar", True)) and agent != "none"
+    entry["status_bar"] = status_bar
     if history:
         # Names only — the token is re-read from the staged file at every run.
         entry["history"] = history
@@ -3251,7 +3386,7 @@ def cmd_create(args: argparse.Namespace) -> None:
                         effort=effort, fetch=fetch, node=node, folders=folders,
                         history=history, loopback_ports=loopback_ports,
                         web=web, share=share, harness=harness or None,
-                        trusted_browser=trusted_browser)
+                        status_bar=status_bar, trusted_browser=trusted_browser)
     out = {"name": name, "ip": ip, "preset": args.preset,
            "browser": browser, "browser_trusted": trusted_browser,
            "agent": agent, "editor": editor,
@@ -3452,6 +3587,24 @@ def cmd_start(args: argparse.Namespace) -> None:
         _print_warnings(args.name, skill_warnings + (
             [{"kind": "old-files", "paths": old_files}] if old_files
             else _record_old_files_cleared(args.name, cname, entry)))
+        # RS's status bar (#524): the files again (RS may have changed them
+        # since the box last ran), then a switch saved while it was parked —
+        # or, with none owed, pi's file rewritten with the current code where
+        # it is there. The home was kept, so nothing else is owed.
+        if entry.get("agent", "none") != "none":
+            on = _entry_status_bar(entry)
+            owed = bool(entry.get("status_bar_pending"))
+            if not _stage_box_status_bar(cname):
+                bar_w = [{"kind": "status-bar", "reason": "not-staged"}]
+            else:
+                res = _box_status_bar_now(cname, ("on" if on else "off") if owed else "refresh")
+                bar_w = _status_bar_warnings(res, on and owed)
+                if owed and _status_bar_owed_done(res):
+                    entries = load()
+                    if isinstance(entries.get(args.name), dict):
+                        entries[args.name].pop("status_bar_pending", None)
+                        save(entries)
+            _print_warnings(args.name, bar_w)
         # A model changed while parked: the home was kept, so write it now —
         # only the halves that changed, and cleared only once written.
         pend = entry.get("model_pending")
@@ -3772,11 +3925,22 @@ def cmd_settings(args: argparse.Namespace) -> None:
     halves = [h for h, a, b in (("model", entry.get("model") or "", model),
                                 ("effort", entry.get("effort") or "", effort))
               if a != b or (write is not None and h in write)]
-    if not harness_changed and not halves:
+    asked_bar = getattr(args, "status_bar", None)      # an older caller's namespace has none
+    bar = None if asked_bar is None or not named("status-bar") else asked_bar
+    # Only these agents (an agent just added to the box: the others keep what
+    # their own files say); absent: every agent the box carries.
+    bar_agents = [a for a in (getattr(args, "status_bar_agents", "") or "").split(",") if a]
+    if any(a not in BOX_STATUS_BAR_AGENTS for a in bar_agents):
+        die("invalid --status-bar-agents value")
+    if bar is not None and agent == "none":
+        die("a box without an agent has no status bar")
+    if not harness_changed and not halves and bar is None:
         print(json.dumps({"name": args.name, "changed": False, "restarted": False,
                           "warnings": []}))
         return
     entry["model"], entry["effort"] = model, effort
+    if bar is not None:
+        entry["status_bar"] = bar       # a re-run below lays it into the fresh home
     if new_h:
         entry["harness"] = new_h
     else:
@@ -3811,8 +3975,41 @@ def cmd_settings(args: argparse.Namespace) -> None:
     else:
         entries[args.name] = entry
         save(entries)
-    print(json.dumps({"name": args.name, "changed": True, "restarted": restarted,
-                      "warnings": warnings}))
+    states = None
+    if bar is not None:
+        # RS's status bar (#524): live into a running box (a re-run above laid
+        # the record into its fresh home already), else owed at its next start.
+        if running and not restarted:
+            res = (_box_status_bar_now(cname, "on" if bar else "off", bar_agents or None)
+                   if _stage_box_status_bar(cname) else "failed")
+            states = res if isinstance(res, dict) else None
+            if bar_agents:
+                # Only the agents just added: the box's owed write (to every
+                # agent) is neither cleared nor set — a miss comes with the
+                # box's next re-run, the other agents keep their files.
+                if not _status_bar_owed_done(res):
+                    warnings.append({"kind": "status-bar", "reason": "added"})
+                else:
+                    warnings += _status_bar_warnings(res, bar)
+            else:
+                warnings += _status_bar_warnings(res, bar)
+                if _status_bar_owed_done(res):
+                    entry.pop("status_bar_pending", None)
+                else:
+                    entry["status_bar_pending"] = True
+            entries[args.name] = entry
+            save(entries)
+        elif not running:
+            if bar_agents:
+                warnings.append({"kind": "status-bar", "reason": "added"})
+            else:
+                entry["status_bar_pending"] = True
+            entries[args.name] = entry
+            save(entries)
+    out = {"name": args.name, "changed": True, "restarted": restarted, "warnings": warnings}
+    if bar is not None:
+        out["status_bar"] = states
+    print(json.dumps(out))
 
 
 def cmd_agents(args: argparse.Namespace) -> None:
@@ -3848,22 +4045,37 @@ def cmd_agents(args: argparse.Namespace) -> None:
         except ValueError:
             pass
         text = None
-        if running and agent == "claude":
+        bar = None
+        if running:
+            # ONE exec per running box (the host bounds this call at two per
+            # box): the status bar's state in each agent, then — for a Claude
+            # box — its settings file after a marker line.
+            read = ('[ "$3" = claude ] || exit 0; echo RS_SETTINGS_TEXT; '
+                    '[ -f "$1" ] && head -c "$2" "$1" 2>/dev/null')
             try:
-                r = subprocess.run(["docker", "exec", "-u", "1000", cname, "sh", "-c",
-                                    '[ -f "$1" ] && head -c "$2" "$1" 2>/dev/null', "sh",
-                                    BOX_CLAUDE_SETTINGS, str(BOX_AGENT_SETTINGS_MAX_BYTES + 1)],
+                r = subprocess.run(["docker", "exec", "-u", "1000", "-e", "HOME=/home/worker",
+                                    cname, "sh", "-c",
+                                    f'( set -- read {" ".join(BOX_STATUS_BAR_AGENTS)}; '
+                                    f'{BOX_STATUS_BAR_SCRIPT} ); {read}', "sh",
+                                    BOX_CLAUDE_SETTINGS, str(BOX_AGENT_SETTINGS_MAX_BYTES + 1),
+                                    agent],
                                    capture_output=True, text=True,
                                    timeout=BOX_AGENT_SETTINGS_EXEC_TIMEOUT_S)
-                if r.returncode == 0 and len(r.stdout or "") <= BOX_AGENT_SETTINGS_MAX_BYTES:
-                    text = r.stdout
+                head, sep, body = (r.stdout or "").partition("RS_SETTINGS_TEXT\n")
+                bar = _parse_box_status_bar(head, list(BOX_STATUS_BAR_AGENTS))
+                if sep and r.returncode == 0 and len(body) <= BOX_AGENT_SETTINGS_MAX_BYTES:
+                    text = body
             except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
                 text = None
         rows.append({"name": name, "agent": agent, "dev": bool(e.get("dev")),
                      "running": running, "model": e.get("model") or "",
                      "effort": e.get("effort") or "",
                      "harness": e.get("harness") if isinstance(e.get("harness"), dict) else {},
-                     "settings": text, "env": env})
+                     "settings": text, "env": env,
+                     # RS's status bar: the record, and each agent's state when running
+                     "status_bar": _entry_status_bar(e),
+                     "status_bar_pending": bool(e.get("status_bar_pending")),
+                     "status_bar_agents": bar})
     print(json.dumps(rows))
 
 
@@ -4135,6 +4347,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "the box out of shared/ entirely. Absent: the box "
                         "type's default (off unless the type says otherwise). "
                         "Set at creation only.")
+    c.add_argument("--status-bar", action=argparse.BooleanOptionalAction, default=True,
+                   help="RS's status bar in the box's agents (default on); changed "
+                        "later with `settings --status-bar`")
     c.set_defaults(func=cmd_create)
 
     fo = sub.add_parser("folders",
@@ -4205,8 +4420,14 @@ def build_parser() -> argparse.ArgumentParser:
     st_.add_argument("--model", default="", help="the Claude model (empty: Claude's own default)")
     st_.add_argument("--effort", default="", help="the Claude effort (empty: Claude's default)")
     st_.add_argument("--write", default=None,
-                     help="the groups written (model,effort,harness); the others keep "
-                          "the box's record (default: all)")
+                     help="the groups written (model,effort,harness,status-bar); the "
+                          "others keep the box's record (default: all)")
+    st_.add_argument("--status-bar", dest="status_bar",
+                     action=argparse.BooleanOptionalAction, default=None,
+                     help="RS's status bar in the box's agents (absent: unchanged)")
+    st_.add_argument("--status-bar-agents", dest="status_bar_agents", default="",
+                     help="with --status-bar on a running box: only these agents "
+                          "(comma-separated; an agent just added)")
     for f in HARNESS_ENV:
         st_.add_argument(f"--{f.replace('_', '-')}", dest=f, default="")
     st_.set_defaults(func=cmd_settings)

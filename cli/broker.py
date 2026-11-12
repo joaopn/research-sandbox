@@ -809,6 +809,9 @@ CREATE_WEBUI_FIELDS = frozenset({
     # path, host port or mount. from_kwargs refuses it with fetch, without
     # Gitea, on a workflow that lacks it, and on a name too long for it.
     "history",
+    # RS's status bar in the project container's agents (#524): IN-BOX, a
+    # plain bool — it writes the agents' own settings inside the container.
+    "status_bar",
 })
 
 # The webui-settable subset of UpdateRequest fields. `rebuild` is
@@ -837,6 +840,9 @@ UPDATE_WEBUI_FIELDS = frozenset({
     "pi_model", "pi_thinking", "reset",
     "harness_mode", "doer_model", "checker_model", "pi_doer_model", "pi_doer_thinking",
     "pi_checker_model", "pi_checker_thinking",
+    # The ⚙ Extensions status-bar switch (#524): IN-BOX, a plain bool, live on
+    # a running project only (update refuses it otherwise).
+    "status_bar",
 })
 
 
@@ -947,7 +953,10 @@ BOX_ADD_WEBUI_FIELDS = frozenset({"project", "name", "preset", "agent", "editor"
                                   # absent ⇒ the type's default). Names no
                                   # mount source: RS fixes the sources (the
                                   # project's shared/.boxes/ and shared/agent/).
-                                  "share"})
+                                  "share",
+                                  # RS's status bar in the box's agents (a bool;
+                                  # in-box: the agents' own settings).
+                                  "status_bar"})
 BOX_TARGET_WEBUI_FIELDS = frozenset({"project", "name"})
 # The ⚙ Box folders change: the whole new set for one box (same boundary
 # argument as `folders` above). Inline like port_add's box arm — it re-runs one
@@ -964,7 +973,9 @@ BOX_FOLDERS_WEBUI_FIELDS = frozenset({"project", "name", "folders"})
 BOX_SETTINGS_WEBUI_FIELDS = frozenset({
     "project", "name", "model", "effort", "reset",
     "harness_mode", "doer_model", "checker_model", "pi_doer_model", "pi_doer_thinking",
-    "pi_checker_model", "pi_checker_thinking"})
+    "pi_checker_model", "pi_checker_thinking",
+    # The box's status-bar switch (#524; a bool, in-box).
+    "status_bar"})
 # box_remove additionally accepts keep_workspace (a bool, not host-shaped): when
 # set the box is removed but its artifacts stay on disk. The step-up `proof`
 # stays OUT of the set (verified + consumed in dispatch, never forwarded).
@@ -1160,7 +1171,9 @@ DEV_BOX_WEBUI_FIELDS = frozenset({"project", "url", "pat", "name", "agent",
                                   # Share files with the project (bool or absent
                                   # ⇒ off, the dev type's default) — like the
                                   # plain box window's field.
-                                  "share"})
+                                  "share",
+                                  # RS's status bar (#524; a bool, in-box).
+                                  "status_bar"})
 # The dev-project provision boundary (the New Project box's dev card): minimal
 # and deliberate. Adding a field here is a boundary edit — never open a
 # path/host-shaped one. `workflow` threads the manifest the dialog was opened
@@ -1197,7 +1210,9 @@ DEV_PROJECT_WEBUI_FIELDS = frozenset({"name", "workflow", "url", "pat",
                                       # them (rscore.resolve_data_mount_paths),
                                       # so the pre-spawn check and the child
                                       # pass the same gate.
-                                      "mount"})
+                                      "mount",
+                                      # RS's status bar (#524; a bool, in-box).
+                                      "status_bar"})
 # The gitea-password verb's input boundary: ONE field, a SECRET (repr=False on
 # the request, off the Result, never a durable sink). The step-up `proof` is
 # consumed in dispatch and never reaches this filter.

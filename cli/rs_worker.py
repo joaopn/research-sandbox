@@ -48,10 +48,11 @@ ORCH_CREDS = Path.home() / ".claude" / ".credentials.json"
 ORCH_SETTINGS = Path.home() / ".claude" / "settings.json"
 
 
-# The supervisor settings keys that carry ITS agent's model and effort, removed
+# The supervisor settings keys that carry ITS agent's model and effort, and its
+# status line (RS's status bar, #524 — a headless copy shows none), removed
 # from every copy a worker or role service starts from. MIRROR of
 # rscore.AGENT_MODEL_SETTINGS_JQ (pinned).
-AGENT_MODEL_KEYS = ("model", "effortLevel", "modelSettings")
+AGENT_MODEL_KEYS = ("model", "effortLevel", "modelSettings", "statusLine")
 AGENT_MODEL_ENV_KEYS = ("ANTHROPIC_MODEL", "CLAUDE_CODE_EFFORT_LEVEL")
 
 

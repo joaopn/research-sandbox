@@ -501,6 +501,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         worker_model=args.worker_model, worker_effort=args.worker_effort,
         role_model=args.role_model, role_effort=args.role_effort,
         pi_model=args.pi_model, pi_thinking=args.pi_thinking,
+        status_bar=args.status_bar,
         **{f: getattr(args, f) for f in rscore.HARNESS_FIELDS},
     )
     try:
@@ -921,6 +922,7 @@ def cmd_project_update(args: argparse.Namespace) -> None:
         agents=agents,
         pi_model=args.pi_model, pi_thinking=args.pi_thinking,
         reset=args.reset or [],
+        status_bar=args.status_bar,
         **{f: getattr(args, f) for f in rscore.HARNESS_FIELDS},
     )
     res = _call(rscore.update, req)
@@ -2878,6 +2880,10 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
                    help="pi's starting thinking level: "
                         f"{', '.join(rscore.PI_THINKING_LEVELS)}. Needs pi among the agents.")
+    c.add_argument("--status-bar", dest="status_bar", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="RS's status bar under the prompt of the project container's "
+                        "agents (default on)")
     _add_harness_args(c, "project")
     c.add_argument("--dev-repo", dest="dev_repo", metavar="REPO",
                    help="REQUIRED with a dev workflow (--workflow dev): the name "
@@ -2968,6 +2974,10 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--pi-thinking", dest="pi_thinking", default="",
                    choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
                    help="pi's starting thinking level")
+    u.add_argument("--status-bar", dest="status_bar", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="turn RS's status bar in the project container's agents on or "
+                        "off (a running project only; on its own)")
     _add_harness_args(u, "project")
     u.add_argument("--reset", action="append", metavar="FIELD",
                    choices=rscore.UPDATE_RESETTABLE,

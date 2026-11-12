@@ -69,7 +69,7 @@ import urllib.error
 # silently on a stdlib refactor. Used by the GitHub-host gate in from_kwargs.
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -423,6 +423,21 @@ def _box_old_instructions(raw: Any) -> bool:
                and w.get("reason") == "old-file" for w in raw)
 
 
+# The box tool's status-bar warnings (#524), by reason; texts reach the
+# browser, so they name the webui, never a command.
+_BOX_STATUS_BAR_REASONS = {
+    "not-staged": ("its agents show no status bar yet: the project has not been "
+                   "started since RS gained it; stop and start the project"),
+    "own": ("{agent} has its own status line, so RS's status bar was not turned on "
+            "there; remove `statusLine` from its settings to use RS's"),
+    "failed": "the status bar could not be written yet; it is applied at the box's next start",
+    "booting": ("the box is still starting; the status bar is saved and applied at "
+                "its next start"),
+    "added": ("the agent just added shows no status bar yet; it gets it at the "
+              "project's next start"),
+}
+
+
 def _box_folder_warnings(raw: Any, box: Any) -> list[str]:
     """The box tool's structured folder warnings → operator lines, built here
     from a re-validated box name and folder name (the tool's own text never
@@ -461,6 +476,13 @@ def _box_folder_warnings(raw: Any, box: Any) -> list[str]:
                        if isinstance(w.get("reason"), str)
                        else f"{who} started without its Gitea history: "
                             f"{_BOX_HISTORY_REASONS['']}")
+            continue
+        if w.get("kind") == "status-bar":
+            reason = w.get("reason") if isinstance(w.get("reason"), str) else ""
+            agent = "Claude" if w.get("agent") == "claude" else "pi" \
+                if w.get("agent") == "pi" else "an agent"
+            out.append(f"{who}: " + _BOX_STATUS_BAR_REASONS.get(
+                reason, _BOX_STATUS_BAR_REASONS["failed"]).format(agent=agent))
             continue
         if w.get("kind") == "mailbox" and w.get("reason") == "agent":
             out.append(f"{who} {_BOX_MAILBOX_AGENT_LINE}")
@@ -660,7 +682,7 @@ def _is_old_box_tool(r: "subprocess.CompletedProcess") -> bool:
         ("unrecognized arguments" in err
          and any(o in err for o in ("--folders", "--set", "--history-user",
                                     "--history-repo", "--share", "--no-share",
-                                    "--trusted-browser",
+                                    "--trusted-browser", "--status-bar", "--no-status-bar",
                                     *(f"--{f.replace('_', '-')}" for f in HARNESS_FIELDS))))
         or ("invalid choice" in err
             and any(c in err for c in ("'folders'", "'history-heal'", "'settings'",
@@ -1379,6 +1401,9 @@ class CreateRequest:
     pi_doer_thinking: str = ""
     pi_checker_model: str = ""
     pi_checker_thinking: str = ""
+    # RS's status bar in the project container's agents (#524): on by
+    # default, the New Project Extensions card. In-box (broker-openable).
+    status_bar: bool = True
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "CreateRequest":
@@ -1405,6 +1430,7 @@ class CreateRequest:
         # webui-safe (ValidationError text reaches the browser verbatim — no
         # CLI verbs).
         fetch = bool(kw.get("fetch", False))
+        status_bar = _status_bar_arg(kw.get("status_bar", True), default=True)
         if fetch and manifest.get("dev"):
             raise ValidationError(
                 "a dev project does not take the rs-fetch option (its "
@@ -1714,6 +1740,7 @@ class CreateRequest:
                                      agents=agents)
         return cls(
             name=_require_name(kw.get("name")),
+            status_bar=status_bar,
             workflow=workflow_id,
             type=project_type,
             substrate=substrate,
@@ -2085,6 +2112,9 @@ class UpdateRequest:
     pi_checker_model: str = ""
     pi_checker_thinking: str = ""
     reset: tuple[str, ...] = ()
+    # RS's status bar in the project container's agents (#524): None =
+    # unchanged. Applied live, on a running project only.
+    status_bar: bool | None = None
 
     def model_changes(self) -> dict[str, dict[str, str]]:
         """The per-type model/effort fields the caller actually SET, as
@@ -2199,9 +2229,19 @@ class UpdateRequest:
             agents=agents,
             pi_model=pi_model, pi_thinking=pi_thinking,
             reset=tuple(reset),
+            status_bar=_status_bar_arg(kw.get("status_bar")),
             **harness,
             **vals,
         )
+
+
+def _status_bar_arg(v: Any, default: "bool | None" = None) -> "bool | None":
+    """The status-bar switch from a request: a bool, or `default` when absent."""
+    if v is None:
+        return default
+    if not isinstance(v, bool):
+        raise ValidationError("the status bar switch must be true or false")
+    return v
 
 
 @dataclass(frozen=True)
@@ -2294,6 +2334,9 @@ class UpdateResult:
     # carries inner paths and never leaves the host).
     boxes_refreshed: list[str] = field(default_factory=list)
     boxes_not_refreshed: list[str] = field(default_factory=list)
+    # A status-bar switch (#524): the project container's row as it now reads
+    # (_status_bar_view); None when the update did not touch it.
+    status_bar: "dict | None" = None
 
 
 @dataclass
@@ -2385,6 +2428,8 @@ class BoxAddRequest:
     pi_doer_thinking: str = ""
     pi_checker_model: str = ""
     pi_checker_thinking: str = ""
+    # RS's status bar in the box's agents (#524): on by default.
+    status_bar: bool = True
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "BoxAddRequest":
@@ -2511,7 +2556,8 @@ class BoxAddRequest:
             fetch=bool(kw.get("fetch", False)),
             folders=_coerce_box_folders(kw.get("folders")),
             history=_coerce_history_flag(kw.get("history")),
-            share=share, trusted_browser=trusted_browser, **harness)
+            share=share, trusted_browser=trusted_browser,
+            status_bar=_status_bar_arg(kw.get("status_bar"), default=True), **harness)
 
 
 @dataclass(frozen=True)
@@ -2554,6 +2600,8 @@ class BoxSettingsRequest:
     pi_checker_model: str = ""
     pi_checker_thinking: str = ""
     reset: tuple[str, ...] = ()
+    # RS's status bar in the box's agents (#524): None = unchanged.
+    status_bar: bool | None = None
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "BoxSettingsRequest":
@@ -2589,7 +2637,7 @@ class BoxSettingsRequest:
         if both:
             raise ValidationError(f"{', '.join(both)} cannot be both set and reset in one change")
         return cls(project=_require_name(kw.get("project")), name=name, reset=tuple(reset),
-                   **vals, **harness)
+                   status_bar=_status_bar_arg(kw.get("status_bar")), **vals, **harness)
 
 
 @dataclass(frozen=True)
@@ -4017,6 +4065,7 @@ class DevBoxProvisionRequest:
     model: str = ""                             # agent model for the box ("" ⇒ project's box default)
     effort: str = ""
     share: bool | None = None                   # share files with the project (None ⇒ the dev type's default: off)
+    status_bar: bool = True                     # RS's status bar in the box's agents (#524)
     # The box's working mode and doer/checker models (HARNESS_FIELDS),
     # validated by the same BoxAddRequest delegation.
     harness_mode: str = ""
@@ -4063,11 +4112,13 @@ class DevBoxProvisionRequest:
             agent=kw.get("agent"), editor=kw.get("editor"), repo=repo,
             branch=kw.get("branch"),
             model=kw.get("model"), effort=kw.get("effort"),
-            share=kw.get("share"), **{f: kw.get(f) for f in HARNESS_FIELDS})
+            share=kw.get("share"), status_bar=kw.get("status_bar"),
+            **{f: kw.get(f) for f in HARNESS_FIELDS})
         return cls(project=box.project, url=url, repo=repo,
                    pat=(pat or "").strip(), name=box.name, agent=box.agent,
                    editor=box.editor, branch=box.branch,
                    model=box.model, effort=box.effort, share=box.share,
+                   status_bar=box.status_bar,
                    **{f: getattr(box, f) for f in HARNESS_FIELDS})
 
 
@@ -4118,6 +4169,8 @@ class DevProjectProvisionRequest:
     # resolved here, so the broker's pre-spawn check and the child's re-run
     # both pass the same gate; holds the absolute host paths afterwards.
     mount: tuple[str, ...] = ()
+    # RS's status bar in the project's agents (#524).
+    status_bar: bool = True
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "DevProjectProvisionRequest":
@@ -4161,7 +4214,7 @@ class DevProjectProvisionRequest:
             pi_model=kw.get("pi_model"),
             pi_thinking=kw.get("pi_thinking"),
             **{f: kw.get(f) for f in HARNESS_FIELDS},
-            agents=raw_agents,
+            agents=raw_agents, status_bar=kw.get("status_bar"),
             dev_repo_preflight=False)
         return cls(name=cr.name, url=url, repo=repo, workflow=workflow,
                    pat=(pat or "").strip(), branch=cr.dev_branch, egress=egress,
@@ -4171,7 +4224,7 @@ class DevProjectProvisionRequest:
                    pi_model=cr.pi_model, pi_thinking=cr.pi_thinking,
                    **{f: getattr(cr, f) for f in HARNESS_FIELDS},
                    agents=None if raw_agents is None else cr.agents,
-                   mount=mount)
+                   mount=mount, status_bar=cr.status_bar)
 
 
 @dataclass
@@ -4374,6 +4427,9 @@ class BoxSettingsResult:
     restarted: bool
     effort_dropped: bool = False
     warnings: list = field(default_factory=list)
+    # A status-bar switch (#524): the box's agents as they now read
+    # (_status_bar_view), None when not written live (a stopped box).
+    status_bar: "dict | None" = None
 
 
 @dataclass
@@ -4748,6 +4804,9 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     # them back at every deploy (_read_harness).
     if _harness_set(req):
         marker["harness"] = _harness_set(req)
+    # RS's status bar (#524): the choice, owed by every agent until its first
+    # write lands (an agent added later picks the choice up the same way).
+    marker["status_bar"] = _status_bar_block(req.status_bar, STATUS_BAR_AGENTS)
     # The agent's model lives in its own settings file on an image that carries
     # the label (I33 slice 3): on Docker-in-Docker the host writes the recorded
     # Claude pair right after the deploy below (pending); the docker substrate's
@@ -4992,6 +5051,13 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             _apply_agent_settings_pending(container_name, workspace_path, local,
                                           claude_in_settings=model_in_settings,
                                           progress=progress)
+            # RS's status bar (#524), before any box (the box tool copies the
+            # staged files on). A failure is a warning here: create's result
+            # carries the new project's sign-in, which an error would drop; the
+            # next start stages again and reports it as an error.
+            _status_bar_warnings(_apply_status_bar(project, container_name, workspace_path,
+                                                   local, boxes=True, progress=progress),
+                                 progress)
             # Editor dist staged whenever cached so any box can RO-mount
             # /opt/editor-dist; deploy_local follows the RESOLVED code-server
             # flag (default ON since the editor-by-default slice — a
@@ -5090,6 +5156,8 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             _apply_agent_settings_pending(container_name, workspace_path, [DEFAULT_AGENT],
                                           claude_in_settings=model_in_settings,
                                           progress=progress)
+            _status_bar_warnings(_apply_status_bar(project, container_name, workspace_path,
+                                                   [DEFAULT_AGENT], progress=progress), progress)
             # Editor dist (STAGE_EDITOR_DIST): staged before the enable cone too so
             # interactive PI containers RO-mount a populated /opt/editor-dist.
             # deploy_local brings up the supervisor's OWN editor from the dist (no
@@ -5194,6 +5262,17 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     # F3 Slice 1: bring up loopback forwarders for any already-registered exported
     # ports (inert on a fresh project's empty registry; self-gates on docker).
     _reconcile_loopback_bridges(project, cfg)
+    # RS's status bar (#524) on the docker substrate: its boot copies the
+    # agents into the home after `docker run` returns, so the write waits for
+    # the boot marker; a home not ready in time keeps the choice owed for the
+    # next start.
+    if is_docker and deployed_agents:
+        if _wait_for_home_restore(container_name):
+            _status_bar_warnings(_apply_status_bar(project, container_name, workspace_path,
+                                                   deployed_agents, progress=progress),
+                                 progress)
+        else:
+            _report_warnings([STATUS_BAR_HOME_NOT_READY], progress)
 
     # 6e. Http-service readiness gates: create reports "ready" only when each
     #     enabled http service is actually listening, so there's no post-create race
@@ -5682,6 +5761,9 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     container = container_name_for(project)
     if not container_exists(container):
         die(f"project {project!r} does not exist")
+    # RS's status bar (#524): its own change, live, on both substrates.
+    if req.status_bar is not None:
+        return _update_status_bar(req, cfg, project, container, progress)
     # The docker substrate has no in-container editable surface (no templates, no
     # worker/extension cone) and no sysbox store to re-stage. The ONE meaningful
     # update is toggling the editor (code-server), which recreates the plain runc
@@ -5898,6 +5980,9 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         _apply_agent_settings_pending(
             container, workspace_path, local, progress=progress,
             claude_in_settings=_label_is_set("container", container))
+        # RS's status bar (#524): an agent just added takes the recorded choice.
+        found += _apply_status_bar(project, container, workspace_path, local,
+                                   owe=agents_added, boxes=True, progress=progress)
         # Running boxes follow live (an Add delivers the new agent wired; a
         # request that adds nothing is an Update). The editor extension: an Add
         # installs it only where none is (a supervisor that just gained claude);
@@ -5909,6 +5994,13 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
             progress.step("agents", "the project's editor extension could not be installed")
         refreshed, not_refreshed = _refresh_running_boxes(
             container, staged, progress, force_ext=update_form)
+        # RS's status bar (#524): an agent just copied into a running box takes
+        # that box's choice (the box's other agents keep what their files say).
+        # Claude is never new to a box: every agent box carries it whatever the
+        # project container runs.
+        box_new = [a for a in agents_added if a != DEFAULT_AGENT]
+        if box_new:
+            _status_bar_into_boxes(container, workspace_path, refreshed, box_new, progress)
         # RS's skills into the agents' homes after the agent copy (an agent
         # just added gets them, in the project agent and every box), once the
         # project's own folders were checked for the files RS used to write
@@ -11666,6 +11758,10 @@ def _recreate_supervisor(
         # The agents' recorded models into their own settings, once (I33 slice 3).
         _apply_agent_settings_pending(container, workspace_path, local,
                                       claude_in_settings=model_in_settings, progress=progress)
+        # RS's status bar (#524): staged before the box relaunch below, whose
+        # box tool copies the files on into each agent box.
+        found += _apply_status_bar(project, container, workspace_path, local,
+                                   boxes=True, progress=progress)
         if editor_dist_present():
             _stage_editor_dist(container, deploy_local=flags.get("code-server", True))
         # A project whose own container no longer runs Claude (removed from it)
@@ -11707,6 +11803,8 @@ def _recreate_supervisor(
         _stage_agent_dist(container, [DEFAULT_AGENT])
         _apply_agent_settings_pending(container, workspace_path, [DEFAULT_AGENT],
                                       claude_in_settings=model_in_settings, progress=progress)
+        found += _apply_status_bar(project, container, workspace_path, [DEFAULT_AGENT],
+                                   progress=progress)
         # The research boot wrote RS's instructions itself unless RS's old
         # link stands (or the image is from before the layout): say so at the
         # end of the operation.
@@ -12000,6 +12098,14 @@ def _start_docker_substrate(project: str, cfg: "Config",  # type: ignore[name-de
         _apply_agent_settings_pending(container, ws, list(_read_marker_agents(ws)),
                                       claude_in_settings=_label_is_set("container", container),
                                       progress=progress)
+    # RS's status bar (#524): staged at every start (this start never runs the
+    # image again), the recorded choice where it is still owed.
+    bar = _apply_status_bar(project, container, ws, list(_read_marker_agents(ws)),
+                            progress=progress)
+    if found is not None:
+        found += bar
+    else:
+        _status_bar_warnings(bar, progress)
 
 
 def _without_mount(mounts: list[str], dst: str) -> list[str]:
@@ -12267,6 +12373,19 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
         _apply_agent_settings_pending(container, workspace_path, agents,
                                       claude_in_settings=boot_settings,
                                       progress=progress)
+    # RS's status bar (#524), into the restored home only (an earlier write is
+    # deleted by the restore); a home not ready leaves it owed for the next
+    # start (the line above already said so).
+    # The staged files live outside the home: staged whatever the home, so a
+    # restored setting never names a missing script.
+    bar = (_apply_status_bar(project, container, workspace_path, agents, progress=progress)
+           if home_ready else
+           ([] if _stage_status_bar(container)
+            else [OldInstructions("status-bar", project, reason=STATUS_BAR_NOT_STAGED)]))
+    if found is not None:
+        found += bar
+    else:
+        _status_bar_warnings(bar, progress)
 
 
 def _live_toggle_editor(project: str, cfg: "Config", container: str,  # type: ignore[name-defined]
@@ -14528,9 +14647,10 @@ CLAUDE_SETTINGS_EFFORTS = ("low", "medium", "high", "xhigh")
 # What a worker's or role service's copy of the supervisor's Claude settings
 # drops: the hooks (supervisor-only) and the supervisor agent's own model and
 # effort, which would override the copy's --model/--effort (an `env` effort
-# entry beats the flag — measured). MIRROR of rs_worker.AGENT_MODEL_KEYS /
+# entry beats the flag — measured), and its status line (#524: a headless copy
+# shows none). MIRROR of rs_worker.AGENT_MODEL_KEYS /
 # AGENT_MODEL_ENV_KEYS (pinned).
-AGENT_MODEL_SETTINGS_JQ = ('del(.hooks, .model, .effortLevel, .modelSettings)'
+AGENT_MODEL_SETTINGS_JQ = ('del(.hooks, .model, .effortLevel, .modelSettings, .statusLine)'
                            ' | if (.env | type) == "object"'
                            ' then .env |= del(.ANTHROPIC_MODEL, .CLAUDE_CODE_EFFORT_LEVEL)'
                            ' else . end')
@@ -14960,6 +15080,8 @@ class OldInstructions:
     kind: str          # "project" | "box" | "research" | "image" | "labels" | "unchecked"
                        # | "box-image" (a box image could not be brought up to
                        # date at a re-creation; `reason` is its fixed text)
+                       # | "status-bar" (the status bar could not be applied;
+                       # `reason` is its fixed text)
                        # | "files" / "box-files" (files RS used to write into
                        # the project's / a box's folder; `paths` lists them)
     project: str
@@ -14970,7 +15092,7 @@ class OldInstructions:
     def text(self) -> str:
         if self.kind == "box":
             return OLD_INSTRUCTIONS_BOX_ERROR.format(box=_shown_box(self.box))
-        if self.kind == "box-image":
+        if self.kind in ("box-image", "status-bar"):
             return self.reason
         if self.kind == "files":
             return OLD_FILES_PROJECT_ERROR.format(paths=_shown_old_paths("", self.paths))
@@ -15689,6 +15811,338 @@ def _agent_settings_owed(workspace_path: "Path") -> bool:
     return not (blk or {}).get("migrated") and bool(sup.get("model"))
 
 
+# ---------------------------------------------------------------------------
+# RS's status bar (#524): one line under the prompt of every interactive Claude
+# Code and pi agent, switched per container in the Extensions boxes. The two
+# files (container/statusbar/) are staged root-owned at STATUS_BAR_DIR in every
+# project container at every start (the box tool copies them on into each
+# agent box at every run), so a fix reaches existing projects without an agent
+# pull. "On" for Claude is its `statusLine` setting naming STATUS_BAR_CLAUDE
+# exactly — RS owns that key only then; "on" for pi is RS's file in the agent
+# folder's extensions/, which pi loads by itself. RS writes the recorded choice
+# once (create, a toggle, the first start of a project from before it); after
+# that what the agent's own file says is the state.
+# ---------------------------------------------------------------------------
+STATUS_BAR_SRC = Path(__file__).resolve().parent.parent / "container" / "statusbar"
+STATUS_BAR_DIR = "/usr/local/lib/rs"
+STATUS_BAR_CLAUDE = f"{STATUS_BAR_DIR}/rs-statusbar.py"
+STATUS_BAR_PI = f"{STATUS_BAR_DIR}/rs-statusbar.ts"
+# (file, mode): the Claude script is the command Claude runs; pi reads its file.
+STATUS_BAR_FILES = (("rs-statusbar.py", 0o755), ("rs-statusbar.ts", 0o644))
+STATUS_BAR_AGENTS = ("claude", "pi")
+# Claude Code reruns the command on its own events; the refresh keeps the cache
+# countdown moving while the agent is idle. The countdown shows whole minutes,
+# so twice a minute keeps it at most half a minute behind.
+STATUS_BAR_REFRESH_S = 30
+# Set ("on": only where the file has no statusLine — someone else's is kept)
+# or remove ("off": only RS's own) Claude's status line.
+STATUS_BAR_CLAUDE_JQ = (
+    'if $op == "on" then (if has("statusLine") then . else .statusLine ='
+    ' {"type": "command", "command": $cmd, "refreshInterval": $ri} end)'
+    ' elif $op == "off" then (if (.statusLine | type) == "object"'
+    ' and .statusLine.command == $cmd then del(.statusLine) else . end)'
+    ' else . end')
+STATUS_BAR_CLAUDE_STATE_JQ = (
+    'if (.statusLine | type) == "object" and .statusLine.command == $cmd then "on"'
+    ' elif has("statusLine") then "own" else "off" end')
+# One script for both agents, run as the agent user with HOME set: $1 the
+# operation ("on", "off", "refresh" — pi's file rewritten only where it is
+# there —, "read"), then the agents. Prints `<agent>=<state>` per agent: on,
+# off, own (Claude's file names someone else's status line), absent (the
+# agent is not installed in this home) or failed. Claude's file is merged in
+# place like the model writer's (an existing file only, temp + rename); pi's
+# file is replaced by rename and removed by its one name. MIRRORED byte for
+# byte by cli/rs_sandbox.py (BOX_STATUS_BAR_SCRIPT, pinned).
+STATUS_BAR_SCRIPT = (
+    'op="$1"; shift\n'
+    'cs="$HOME/.claude/settings.json"; pd="$HOME/.local/share/pi-agent/agent"\n'
+    'pf="$pd/extensions/rs-statusbar.ts"\n'
+    'for a in "$@"; do\n'
+    'if [ "$a" = claude ]; then\n'
+    '  [ -f "$cs" ] || { echo claude=absent; continue; }\n'
+    '  if [ "$op" = on ] || [ "$op" = off ]; then\n'
+    f'    if [ "$(wc -c < "$cs")" -le {AGENT_SETTINGS_MAX_BYTES} ] && jq --arg op "$op" '
+    f'--arg cmd {STATUS_BAR_CLAUDE} --argjson ri {STATUS_BAR_REFRESH_S} '
+    f"'{STATUS_BAR_CLAUDE_JQ}' \"$cs\" > \"$cs.rs-tmp\" && [ -s \"$cs.rs-tmp\" ] "
+    '&& mv "$cs.rs-tmp" "$cs"; then :; else rm -f "$cs.rs-tmp"; echo claude=failed; continue; fi\n'
+    '  fi\n'
+    f'  s=$(head -c {AGENT_SETTINGS_MAX_BYTES} "$cs" | jq -r --arg cmd {STATUS_BAR_CLAUDE} '
+    f"'{STATUS_BAR_CLAUDE_STATE_JQ}' 2>/dev/null) || s=failed\n"
+    '  echo "claude=${s:-failed}"\n'
+    'elif [ "$a" = pi ]; then\n'
+    '  [ -f "$pd/settings.json" ] || { echo pi=absent; continue; }\n'
+    '  w=no\n'
+    '  if [ "$op" = on ]; then w=yes; fi\n'
+    '  if [ "$op" = refresh ] && [ -f "$pf" ] && [ ! -L "$pf" ]; then w=yes; fi\n'
+    '  if [ "$w" = yes ]; then\n'
+    f'    if rm -f "$pf.rs-tmp" && mkdir -p "$pd/extensions" && cp {STATUS_BAR_PI} "$pf.rs-tmp" '
+    '&& mv -f "$pf.rs-tmp" "$pf"; then :; else rm -f "$pf.rs-tmp"; echo pi=failed; continue; fi\n'
+    '  fi\n'
+    '  if [ "$op" = off ] && { [ -e "$pf" ] || [ -L "$pf" ]; }; then\n'
+    '    rm -f "$pf" || { echo pi=failed; continue; }\n'
+    '  fi\n'
+    '  if [ -f "$pf" ]; then echo pi=on; else echo pi=off; fi\n'
+    'fi\n'
+    'done\n')
+STATUS_BAR_STATES = ("on", "off", "own", "absent", "failed")
+STATUS_BAR_NOT_STAGED = (
+    "the status bar's files could not be put into the project container, so its "
+    "agents show no status bar; stop and start the project to try again")
+STATUS_BAR_OWN_ERROR = (
+    "{who} has its own status line, so RS's status bar was not turned on there; "
+    "remove `statusLine` from its settings to use RS's")
+STATUS_BAR_NOT_WRITTEN = (
+    "the status bar could not be written into {who}'s settings; it is applied at "
+    "the project's next start")
+STATUS_BAR_STOPPED = "start the project to change the status bar"
+# A box's just-added agent the live write did not reach: nothing is owed on the
+# box's record (the box's other agents keep what their files say), so it comes
+# with the box's next re-run, which a project start makes.
+STATUS_BAR_ADDED_NOT_WRITTEN = (
+    "the agent just added shows no status bar yet; it gets it at the project's "
+    "next start")
+STATUS_BAR_HOME_NOT_READY = (
+    "the project's home was not ready in time for the status bar; it is applied "
+    "at the project's next start")
+
+
+def _stage_status_bar(container: str) -> bool:
+    """Put the two files at STATUS_BAR_DIR in a RUNNING container, as root,
+    each through a temp name and a rename (replacing what an earlier start
+    staged). False on any failure; never raises."""
+    for name, mode in STATUS_BAR_FILES:
+        dst = f"{STATUS_BAR_DIR}/{name}"
+        try:
+            text = (STATUS_BAR_SRC / name).read_text(encoding="utf-8")
+            r = run(["docker", "exec", "-i", "-u", "0", container, "sh", "-c",
+                     f"mkdir -p {STATUS_BAR_DIR} && cat > {dst}.rs-tmp && "
+                     f"chmod {mode:o} {dst}.rs-tmp && mv -f {dst}.rs-tmp {dst}"],
+                    input=text, encoding="utf-8", capture_output=True,
+                    timeout=AGENT_SETTINGS_EXEC_TIMEOUT_S)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return False
+        if r.returncode != 0:
+            return False
+    return True
+
+
+def _status_bar_exec(container: str, op: str, agents: "Sequence[str]",
+                     home: str = _AGENT_HOME) -> "dict[str, str]":
+    """Run STATUS_BAR_SCRIPT for `agents` in a RUNNING container as the agent
+    user: {agent: state}. An agent the script did not answer for reads
+    "failed". Never raises."""
+    agents = [a for a in agents if a in STATUS_BAR_AGENTS]
+    if not agents:
+        return {}
+    try:
+        r = run(["docker", "exec", "-u", "1000", "-e", f"HOME={home}", container,
+                 "sh", "-c", STATUS_BAR_SCRIPT, "sh", op, *agents],
+                capture_output=True, timeout=AGENT_SETTINGS_EXEC_TIMEOUT_S)
+        out = r.stdout or ""
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        out = ""
+    return _parse_status_bar_states(out, agents)
+
+
+def _parse_status_bar_states(out: str, agents: "Sequence[str]") -> "dict[str, str]":
+    """`<agent>=<state>` lines → {agent: state} for `agents` (anything else in
+    the container's output is ignored; a missing or unknown state is
+    "failed")."""
+    got: dict[str, str] = {}
+    for line in (out or "").splitlines():
+        a, sep, v = line.strip().partition("=")
+        if sep and a in agents and v in STATUS_BAR_STATES and a not in got:
+            got[a] = v
+    return {a: got.get(a, "failed") for a in agents}
+
+
+def _status_bar_record(data: dict, local: "Sequence[str]") -> "tuple[bool, list[str]]":
+    """(on, the agents owed a write) from the project record. A record from
+    before the status bar owes every agent in the container the default (on),
+    once."""
+    blk = data.get("status_bar")
+    if not isinstance(blk, dict):
+        # every agent, as at create: one added later takes the default too
+        return True, list(STATUS_BAR_AGENTS)
+    pend = blk.get("pending")
+    pending = [a for a in pend if a in STATUS_BAR_AGENTS] if isinstance(pend, list) else []
+    return blk.get("on") is not False, list(dict.fromkeys(pending))
+
+
+def _status_bar_block(on: bool, pending: "Sequence[str]") -> dict:
+    return {"on": bool(on), "pending": sorted(set(a for a in pending if a in STATUS_BAR_AGENTS))}
+
+
+def _who(agent: str, box: str = "") -> str:
+    name = "Claude" if agent == "claude" else agent
+    return f"{name} in box {_shown_box(box)}" if box else f"{name} in the project"
+
+
+def _apply_status_bar(project: str, container: str, workspace_path: "Path",
+                      local: "Sequence[str]", *, owe: "Sequence[str]" = (),
+                      boxes: bool = False, home: str = _AGENT_HOME,
+                      progress=None) -> "list[OldInstructions]":
+    """At every deploy of a RUNNING project container's agents (create, every
+    start, a live agent add): stage the files, write the recorded choice into
+    each agent that still owes it, and rewrite pi's file with the current code
+    where it is there. `owe`: agents just added to the container, which take
+    the recorded choice too. `boxes`: the container can hold boxes (Docker-in-
+    Docker), which copy the files from it at every run — staged then even when
+    the container runs no agent itself. Returns the end-of-operation errors
+    (the files could not be staged). Never raises — it runs in the middle of a
+    start."""
+    local = [a for a in local if a in STATUS_BAR_AGENTS]
+    if not local and not boxes:
+        return []
+    try:
+        if not _stage_status_bar(container):
+            return [OldInstructions("status-bar", project, reason=STATUS_BAR_NOT_STAGED)]
+        if not local:
+            return []
+        data = _read_marker_dict(workspace_path)
+        if not data:
+            return []
+        fresh = not isinstance(data.get("status_bar"), dict)
+        on, pending = _status_bar_record(data, local)
+        pending = list(dict.fromkeys([*pending, *(a for a in owe if a in STATUS_BAR_AGENTS)]))
+        owed = [a for a in local if a in pending]
+        states = _status_bar_exec(container, "on" if on else "off", owed, home) if owed else {}
+        if "pi" in local and "pi" not in owed:
+            states.update(_status_bar_exec(container, "refresh", ["pi"], home))
+        done = {a for a in owed if states.get(a) in ("on", "off", "own")}
+        _report_warnings([STATUS_BAR_NOT_WRITTEN.format(who=_who(a))
+                          for a in local if states.get(a) == "failed"], progress)
+        if not fresh and not done and not owe:
+            return []
+
+        def mutate(d: dict) -> None:
+            cur_on, cur_pending = _status_bar_record(d, local)
+            cur_pending = [*cur_pending, *(a for a in owe if a in STATUS_BAR_AGENTS)]
+            d["status_bar"] = _status_bar_block(cur_on, [a for a in cur_pending if a not in done])
+        _marker_rmw(workspace_path, mutate, "record the status bar")
+    except Exception as e:     # never stop a start over the status bar
+        _report_warnings([f"the status bar could not be applied ({e})"], progress)
+    return []
+
+
+def _status_bar_toggle(project: str, container: str, workspace_path: "Path",
+                       local: "Sequence[str]", on: bool, *,
+                       home: str = _AGENT_HOME) -> "tuple[dict[str, str], list[OldInstructions]]":
+    """The ⚙ switch on a RUNNING project container: stage the files, write the
+    choice into every agent there, record it (an agent the write did not reach
+    stays owed, written at the next start). Returns ({agent: state}, the
+    end-of-operation errors: an agent whose own status line kept RS's off, a
+    failed staging). An unreadable record is refused (ValidationError) before
+    anything in the container changes."""
+    local = [a for a in local if a in STATUS_BAR_AGENTS]
+    if _read_marker_three_way(workspace_path)[0] != "ok":
+        raise ValidationError("cannot change the status bar: the project's record "
+                              f"{orch_files.SHOWN_FOLDER}/project.json is missing or unreadable")
+    items: list[OldInstructions] = []
+    if not _stage_status_bar(container):
+        items.append(OldInstructions("status-bar", project, reason=STATUS_BAR_NOT_STAGED))
+        states = {a: "failed" for a in local}
+    else:
+        states = _status_bar_exec(container, "on" if on else "off", local, home)
+    # An agent not in the container yet stays owed (as at create): added later,
+    # by any path, it takes the choice at its first deploy.
+    owed = ([a for a in local if states.get(a) not in ("on", "off", "own")]
+            + [a for a in STATUS_BAR_AGENTS if a not in local])
+
+    def mutate(d: dict) -> None:
+        d["status_bar"] = _status_bar_block(on, owed)
+    _marker_rmw(workspace_path, mutate, "record the status bar")
+    if on:
+        items += [OldInstructions("status-bar", project,
+                                  reason=STATUS_BAR_OWN_ERROR.format(who=_who(a)))
+                  for a in local if states.get(a) == "own"]
+    items += [OldInstructions("status-bar", project,
+                              reason=STATUS_BAR_NOT_WRITTEN.format(who=_who(a)))
+              for a in local if states.get(a) == "failed"]
+    return states, items
+
+
+def _update_status_bar(req: "UpdateRequest", cfg: "Config", project: str,  # type: ignore[name-defined]
+                       container: str, progress) -> "UpdateResult":
+    """The ⚙ Extensions switch for the project container's own agents: live,
+    on a running project only (an Enable must read the agent's file to know
+    whether it would replace the agent's own status line), alone in its
+    request. Refusals come before any write; the errors of the switch itself
+    (an agent's own status line, a write that did not land) are raised at the
+    end, after every agent in the container was switched."""
+    if _dc_replace(req, status_bar=None) != UpdateRequest(name=req.name):
+        raise ValidationError("change the status bar on its own, not together with "
+                              "other settings")
+    if not container_running(container):
+        raise ValidationError(STATUS_BAR_STOPPED)
+    workspace_path = workspace_path_for(project, cfg)
+    local = [a for a in _project_running_agents(workspace_path) if a in STATUS_BAR_AGENTS]
+    if not local:
+        raise ValidationError("the project's own container runs no agent, so it has "
+                              "no status bar")
+    progress.step("status-bar", ("turning the status bar on" if req.status_bar
+                                 else "turning the status bar off"))
+    states, items = _status_bar_toggle(project, container, workspace_path, local,
+                                       bool(req.status_bar))
+    _raise_old_instructions(items)
+    print(f"status bar of {project!r} {'on' if req.status_bar else 'off'}; "
+          f"it shows from each agent's next session.")
+    return UpdateResult(project=project, rebuilt=False, status_bar=_status_bar_view(states))
+
+
+def _status_bar_into_boxes(container: str, workspace_path: "Path", boxes: "Sequence[str]",
+                           agents: "Sequence[str]", progress=None) -> None:
+    """After a live Add copied `agents` into the running boxes (`boxes`: their
+    CONTAINER names, as _refresh_running_boxes reports them): turn RS's status
+    bar on for those agents in each box whose record has it on, through the box
+    tool. Warnings only (the Add itself is done)."""
+    agents = [a for a in agents if a in STATUS_BAR_AGENTS]
+    if not agents or not boxes:
+        return
+    try:
+        entries = extension.load(workspace_path)
+    except (OSError, ValueError, RecursionError):
+        entries = {}
+    if not isinstance(entries, dict):
+        entries = {}
+    by_container = {extension.container_name(n): n for n in entries
+                    if isinstance(n, str) and _BOX_NAME_RE.match(n)}
+    for cname in boxes:
+        name = by_container.get(cname)
+        e = entries.get(name) if name else None
+        if (not isinstance(e, dict) or e.get("agent", "none") == "none"
+                or e.get("status_bar") is False):
+            continue
+        try:
+            r = run(["docker", "exec", container, "rs-sandbox", "settings", name,
+                     "--write=status-bar", "--status-bar",
+                     f"--status-bar-agents={','.join(agents)}"], capture_output=True)
+        except (OSError, UnicodeDecodeError):
+            r = None
+        if r is None or r.returncode != 0:
+            _report_warnings([f"box {name!r}: " + STATUS_BAR_ADDED_NOT_WRITTEN], progress)
+            continue
+        raw = _parse_box_tool_json(r.stdout).get("warnings")
+        _report_warnings(_box_folder_warnings(raw if isinstance(raw, list) else [], name),
+                         progress)
+
+
+def _status_bar_warnings(items: "Sequence[OldInstructions]", progress=None) -> None:
+    """Report status-bar errors as warning steps (create, where an error would
+    drop the result)."""
+    _report_warnings([i.text() for i in items], progress)
+
+
+def _status_bar_view(states: "dict[str, str]") -> dict:
+    """The ⚙ row for one container from its agents' states: on when any agent
+    carries RS's bar; `own` names the agents with their own status line;
+    `unknown` when no agent's state could be read."""
+    return {"on": any(v == "on" for v in states.values()),
+            "own": sorted(a for a, v in states.items() if v == "own"),
+            "unknown": bool(states) and all(v == "failed" for v in states.values()),
+            "agents": dict(states)}
+
+
 def _uninstall_claude_extension(container: str, home: str = _AGENT_HOME) -> None:
     """Remove Claude Code's editor extension from the project's editor when the
     project's own container no longer runs Claude (its extensions live in the
@@ -16061,6 +16515,18 @@ def project_agents(req: ProjectAgentsRequest, _progress=None) -> dict:
         out["research_models"] = {t: {"model": (models.get(t) or {}).get("model", ""),
                                       "effort": (models.get(t) or {}).get("effort", "")}
                                   for t in ("worker", "role") if isinstance(models.get(t), dict)}
+    # RS's status bar (#524) for the project container's own agents: what each
+    # agent's file says when running, else the record.
+    bar_local = [a for a in local if a in STATUS_BAR_AGENTS]
+    if bar_local:
+        rec_on, rec_pending = _status_bar_record(data, bar_local)
+        if running:
+            view = {**_status_bar_view(_status_bar_exec(container, "read", bar_local)),
+                    "source": "settings"}
+        else:
+            view = {"on": rec_on, "own": [], "agents": {}, "source": "saved"}
+        out["status_bar"] = {**view, "recorded": rec_on,
+                             "pending": [a for a in bar_local if a in rec_pending]}
     out["boxes"], out["boxes_state"] = ([], "none") if docker else \
         _project_agent_boxes(container, running, research, ws)
     return out
@@ -16119,6 +16585,17 @@ def _project_agent_boxes(container: str, running: bool, research: bool,
                "running": b.get("running") is True,
                "mode_editable": b.get("dev") is True and not research,
                "harness": harness}
+        # RS's status bar (#524): its agents' states when the box runs (an
+        # older box tool sends none), else the record.
+        raw = b.get("status_bar_agents")
+        states = ({a: v for a, v in raw.items() if a in STATUS_BAR_AGENTS
+                   and v in STATUS_BAR_STATES} if isinstance(raw, dict) else None)
+        recorded = b.get("status_bar") is not False
+        row["status_bar"] = {
+            **(_status_bar_view(states) if states is not None and row["running"]
+               else {"on": recorded, "own": [], "agents": {}}),
+            "recorded": recorded, "pending": b.get("status_bar_pending") is True,
+            "source": "settings" if states is not None and row["running"] else "saved"}
         if agent == "claude":
             env = b.get("env") if isinstance(b.get("env"), dict) else {}
             env = {k: v for k, v in env.items() if isinstance(v, str)}
@@ -19950,11 +20427,21 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     if req.folders:
         argv.append("--folders=" + ",".join(req.folders))
     argv.append("--share" if want_share else "--no-share")
+    # RS's status bar (#524): passed only when off, so a box tool from before
+    # it still adds a box with the default (its next run brings the bar).
+    if not req.status_bar:
+        argv.append("--no-status-bar")
     argv += history_args
     # Only the set ones: a box without them keeps today's exact argv. One argv
     # word each (`--x=value`): a pi model may start with "-" (the --folders case).
     for f, v in harness.items():
         argv.append(f"--{f.replace('_', '-')}={v}")
+    # RS's status bar (#524): the project's copy of its files, which the box
+    # tool copies into the box (a project running since before RS had them —
+    # its tool staged just now — would otherwise add a box without them). The
+    # tool reports a box that could not get them.
+    if req.agent != "none":
+        _stage_status_bar(container)
     progress.step("create-box", "creating the box")
     r = run(argv, capture_output=True)
     if r.returncode != 0:
@@ -20368,8 +20855,11 @@ def box_settings(req: "BoxSettingsRequest", _progress=None) -> BoxSettingsResult
     reset = set(req.reset)
     model_asked = bool(req.model or req.effort or reset & {"model", "effort"})
     harness_asked = any(getattr(req, f) for f in HARNESS_FIELDS) or bool(reset & set(HARNESS_FIELDS))
-    if not (model_asked or harness_asked):
+    bar_asked = req.status_bar is not None
+    if not (model_asked or harness_asked or bar_asked):
         raise ValidationError("nothing to change")
+    if bar_asked and agent == "none":
+        raise ValidationError("a box without an agent has no status bar")
     if model_asked and agent != "claude":
         raise ValidationError("only a box running Claude takes a model here; "
                               "pi picks its model inside pi")
@@ -20419,13 +20909,14 @@ def box_settings(req: "BoxSettingsRequest", _progress=None) -> BoxSettingsResult
     write = [g for g, asked in (
         ("model", req.model or "model" in reset),
         ("effort", req.effort or "effort" in reset or dropped),
-        ("harness", harness_asked)) if asked]
+        ("harness", harness_asked), ("status-bar", bar_asked)) if asked]
     argv = ["docker", "exec", container, "rs-sandbox", "settings", req.name,
             f"--write={','.join(write)}",
             f"--model={model if agent == 'claude' else ''}",
             f"--effort={effort if agent == 'claude' else ''}",
             *((f"--{f.replace('_', '-')}={harness.get(f, '')}" for f in HARNESS_FIELDS)
-              if harness_asked else ())]
+              if harness_asked else ()),
+            *((("--status-bar" if req.status_bar else "--no-status-bar"),) if bar_asked else ())]
     r = run(argv, capture_output=True)
     if r.returncode != 0:
         if _is_old_box_tool(r):
@@ -20433,8 +20924,13 @@ def box_settings(req: "BoxSettingsRequest", _progress=None) -> BoxSettingsResult
         die(f"failed to change the box's settings: {(r.stderr or r.stdout).strip()}")
     info = _parse_box_tool_json(r.stdout)
     warnings = []
+    bar_errors: list[str] = []
     for w in info.get("warnings") or []:
-        if isinstance(w, dict) and w.get("kind") == "model" and w.get("reason") == "booting":
+        if isinstance(w, dict) and w.get("kind") == "status-bar" and w.get("reason") == "own":
+            # An Enable that met the agent's own status line: the operation's
+            # error, raised at its end (the box's other agents were switched).
+            bar_errors += _box_folder_warnings([w], req.name)
+        elif isinstance(w, dict) and w.get("kind") == "model" and w.get("reason") == "booting":
             warnings.append(f"box {req.name!r} is still starting — the model is saved; "
                             f"save again in a moment to apply it now, or it is written "
                             f"at the box's next start")
@@ -20444,14 +20940,19 @@ def box_settings(req: "BoxSettingsRequest", _progress=None) -> BoxSettingsResult
         elif isinstance(w, dict):
             warnings += _box_folder_warnings([w], req.name)
     old_items = _box_old_items(req.project, req.name, info.get("warnings"))
-    if old_items:
+    if old_items or bar_errors:
         # The other lines of this re-run ride in the error text: this inline
         # verb's reply carries only the error, never its stderr.
-        raise ValidationError("\n".join([*(f.text() for f in old_items), *warnings]))
+        raise ValidationError("\n".join([*(f.text() for f in old_items), *bar_errors,
+                                         *warnings]))
+    raw = info.get("status_bar")
+    states = ({a: v for a, v in raw.items() if a in STATUS_BAR_AGENTS and v in STATUS_BAR_STATES}
+              if isinstance(raw, dict) else None)
     return BoxSettingsResult(project=req.project, name=req.name,
                              changed=info.get("changed") is not False,
                              restarted=info.get("restarted") is True,
-                             effort_dropped=dropped, warnings=warnings)
+                             effort_dropped=dropped, warnings=warnings,
+                             status_bar=_status_bar_view(states) if states is not None else None)
 
 
 def box_presets(req: "BoxPresetsRequest", _progress=None) -> BoxPresetsResult:  # type: ignore[name-defined]
@@ -23427,6 +23928,7 @@ def dev_box_provision(req: "DevBoxProvisionRequest", progress=None) -> dict:  # 
         project=req.project, name=req.name, preset="dev", agent=req.agent,
         editor=req.editor, repo=req.repo, branch=req.branch,
         model=req.model, effort=req.effort, share=req.share,
+        status_bar=req.status_bar,
         **{f: getattr(req, f) for f in HARNESS_FIELDS}), progress)
     return {"project": req.project, "repo": req.repo, "box": box.name,
             "container": box.container}
@@ -23460,7 +23962,7 @@ def dev_project_provision(req: "DevProjectProvisionRequest", progress=None) -> d
         supervisor_effort=req.supervisor_effort,
         pi_model=req.pi_model, pi_thinking=req.pi_thinking,
         **{f: getattr(req, f) for f in HARNESS_FIELDS},
-        agents=req.agents, mount=req.mount)
+        agents=req.agents, mount=req.mount, status_bar=req.status_bar)
     create(cr, progress=progress)
     return {"project": req.name, "repo": req.repo}
 
