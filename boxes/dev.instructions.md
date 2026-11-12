@@ -179,13 +179,16 @@ yours to rewrite, and the rebases above are how it moves — it must always foll
 mirror's head with no merge commits. **Never merge the mirror into your base branch**: a merge
 commit on the base breaks the maintainer's per-commit collection, a content-free one included.
 
-After a sync rewrote your base, bring the open PR branches you are working on onto it, now:
-each in its worktree (`rs-wt reopen <name>` if you had closed it) run `git fetch origin &&
-git rebase origin/{{BASE_BRANCH}}`, then force-push the feature branch — otherwise an open PR
-shows commits that are no longer on the base and rs-land refuses to land it. This is never
-every open PR on the fork (the hard rule below); a PR you were only told to merge is brought
-level when you land it. Merged PRs and the archive tags keep pointing at your pre-collection
-commits; that is expected — the tags are the record of what landed, not part of the live line.
+After a sync rewrote your base, bring the open PR branches you are working on onto it, now
+(when your working mode reviews the change before it is committed and that tree holds changes
+not yet reviewed and committed, right after their review and commit): each in its worktree
+(`rs-wt reopen <name>` if you had closed it) run
+`git fetch origin && git rebase origin/{{BASE_BRANCH}}`, then force-push the feature branch —
+otherwise an open PR shows commits that are no longer on the base and rs-land refuses to land
+it. This is never every open PR on the fork (the hard rule below); a PR you were only told to
+merge is brought level when you land it. Merged PRs and the archive tags keep pointing at your
+pre-collection commits; that is expected — the tags are the record of what landed, not part of
+the live line.
 
 **Rebase only the open PRs that are yours — hard rule.** An open PR is yours to rebase in
 exactly two cases: you are actively working on it (you opened it and are still carrying it,
@@ -234,15 +237,18 @@ can lose commits.
   above applies — a conflicting rebase is aborted and left to its agent). If it keeps
   refusing for a reason you cannot fix, report the refusal text in a PR comment and wait — do
   not work around it.
-- **Commit often locally**, with small commits and clear messages.
+- **Commit in small, well-scoped commits** with clear messages. When your working mode has
+  the change reviewed before it is committed, commit only after that review; otherwise commit
+  as you go. A child agent doing work (a `doer`, or the agent used in its place) commits only
+  when its brief says to.
 - **No attribution lines.** Never add a co-author trailer, an AI-generated footer, or a
   session link to a commit message or a PR description — the maintainer's repository carries
   no agent attribution, and a session link is a private URL. Your runtime is configured not
   to add them; if one appears anyway, remove it before pushing.
-- **Push when you finish a logical chunk of work** — a completed task or milestone, before a
-  risky operation, or when you want the maintainer to review. The maintainer collects your
-  work commit by commit, so a clean, linear sequence of well-scoped commits matters — not
-  just the final diff.
+- **Push your commits when you finish a logical chunk of work** — a completed task or
+  milestone, before a risky operation, or when you want the maintainer to review. The
+  maintainer collects your work commit by commit, so a clean, linear sequence of well-scoped
+  commits matters — not just the final diff.
 
 ## Worktrees (rs-wt) — every unit of work
 
@@ -472,8 +478,8 @@ zero when fixed), and verify it on both the base branch and your branch before p
 - Prefer editing existing files over creating new ones.
 - Keep changes focused. One branch per task.
 - If unsure about an approach before the go, make it a question in the plan. After the go,
-  push what you have and note the uncertainty in the commit message; the maintainer will
-  review.
+  proceed on your best judgement and note the uncertainty in the commit message or the PR
+  description; the maintainer will review.
 - **Ask questions in plain text**, in your reply, with the options and your recommendation —
   never through the runtime's question-popup tool. The maintainer reads this tab
   intermittently; a popup times out unanswered and the work stalls.
