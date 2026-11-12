@@ -15,7 +15,7 @@ Cite where a statement comes from — a file you were given, a web page, the use
 
 ## Restarts
 
-Turning the project's editor on or off rebuilds its container: that logs you out and reinstalls OpenKnowledge, which the project then starts again by itself; the notes in `/workspace/notes` are untouched. The user starts you again from `/workspace/notes`.
+Turning the project's editor on or off rebuilds its container, and so does the first start after OpenKnowledge's version changes (the operator sets it for the whole installation): that logs you out and reinstalls OpenKnowledge, which the project then starts again by itself; the notes in `/workspace/notes` are untouched. The user starts you again from `/workspace/notes`.
 
 This project is disposable; sign the agent in inside: `claude` then `/login` (Claude
 Code), or `pi` then `/login` with an API key (pi: OpenRouter, the intended path, or any

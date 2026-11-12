@@ -61,6 +61,7 @@ import sys
 import io
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
 # Explicit: `urllib.request` happens to bind `urllib.parse` today (its own module
@@ -4648,6 +4649,14 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     # image; refuse before anything exists (and before any Gitea resume).
     if is_docker and req.web:
         _gate_project_web_image()
+    # The app versions a built-in setup names ({{KEY}}), read and checked once,
+    # before anything exists: a broken pin refuses the create here. A web-app
+    # project's setup is filled with them where it runs, and its container
+    # records them (APP_PINS_LABEL); a Docker-in-Docker project hands them to
+    # its box tool. `web_pins` is the label value ("" when none is named).
+    app_pins = read_app_pins()
+    web_pins = (app_pins_label_value(req.setup, app_pins)
+                if is_docker and req.web else "")
 
     # The `docker` substrate is a single runc container — no sysbox runtime, no
     # inner dockerd. dind_mode is meaningless there; mark it "none" so the label
@@ -4894,7 +4903,8 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         # The setup is the manifest's (from_kwargs refuses any other for a
         # web-app workflow), so the env carries exactly what create runs.
         web=({"start": req.web["start"], "port": req.web["port"],
-              "setup": req.setup} if is_docker and req.web else None),
+              "setup": req.setup, "pins": web_pins}
+             if is_docker and req.web else None),
     )
     if extra_mounts:
         docker_args = docker_args[:-1] + extra_mounts + [docker_args[-1]]
@@ -5005,9 +5015,12 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         #     failure (box left standing). Create-time only, except for a web-app
         #     workflow: its marker is written here, the rebuild and a start re-run
         #     the setup while the marker is missing (_rerun_project_setup).
+        # A web-app setup runs with its app pins filled in (the env keeps the
+        # unfilled text, the label the values); any other setup runs as typed.
         clone_dir = _run_light_harness(
-            container_name, req.repo, req.ref, req.setup, req.github_pat, progress,
-            use_ssh=bool(req.github_ssh_key))
+            container_name, req.repo, req.ref,
+            fill_app_pins(req.setup, app_pins) if req.web else req.setup,
+            req.github_pat, progress, use_ssh=bool(req.github_ssh_key))
         if req.web:
             _mark_project_setup_done(container_name)
         if history_claim is not None:
@@ -5095,6 +5108,11 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             # can resolve presets for a directly-invoked `rs-sandbox create`
             # (box_add refreshes it live; STAGE_BOX_EXT_UX). Best-effort.
             _stage_box_catalog(workspace_path, strict=False)
+            # The app versions the box types name, for the box tool (a step of
+            # its own: the catalog step skips its write when the custom-type
+            # registry is broken). Best-effort at create: a box whose setup
+            # names a pin refuses until a start or box add stages them.
+            _stage_app_pins_warn(workspace_path, app_pins)
             # Optional GitHub SSH auth + git identity, BEFORE the clone (which
             # needs the key). Raises HarnessError on failure.
             _stage_git_auth(container_name, req.github_ssh_key,
@@ -5611,6 +5629,10 @@ def start(req: StartStopRequest, cfg: "Config" | None = None,
     # Every start (re)applies the host task cap; a damaged settings file
     # refuses here, before the port-list sweep below touches anything.
     project_pids_limit()
+    # The app versions (APP_PINS), read and checked once for the whole start,
+    # before anything is touched: a broken pin (only a hand-edited
+    # versions.local.env makes one) refuses the start, as the task cap does.
+    app_pins = read_app_pins()
     if req.all:
         containers = get_supervisor_containers()
     else:
@@ -5633,21 +5655,49 @@ def start(req: StartStopRequest, cfg: "Config" | None = None,
             continue
         print(f"=== Starting project: {c['project']} ===")
         if _container_substrate(c["name"]) == Substrate.DOCKER.value:
-            # Folders saved in ⚙ change the container's binds, which only a
-            # re-creation can do on this substrate (the agents' sign-ins and
-            # settings are carried across; anything else outside /workspace
-            # is gone — the ⚙ text says so).
-            if _docker_folders_pending(c["project"], cfg, progress):
-                progress.step("recreate", "re-creating the project with its new folders")
+            # Folders saved in ⚙ change the container's binds, and a changed
+            # app version (or a container from before managed app versions)
+            # its setup: only a re-creation can do either on this substrate
+            # (the agents' sign-ins and settings are carried across; anything
+            # else outside /workspace is gone — the ⚙ text says so).
+            app_owed, web_override, app_item = _app_pins_rebuild_owed(
+                c["project"], cfg, c["name"], app_pins)
+            if app_item is not None:
+                found.append(app_item)
+            if app_owed is None:            # no rebuild may run (see the helper)
+                app_owed = folders_owed = False
+            else:
+                folders_owed = _docker_folders_pending(c["project"], cfg, progress)
+            # An image that cannot carry the agents across a re-creation is
+            # probed here, before choosing it (the re-creation refuses it
+            # mid-operation): the project starts as it is and the start ends
+            # with the Rebuild all error, so `--all` still starts the rest.
+            if (app_owed or folders_owed) and not _label_is_set(
+                    "image", MINIMAL_IMAGE, label=HOME_RESTORE_LABEL):
+                found.append(OldInstructions("app-pins", c["project"],
+                                             reason=_HOME_RESTORE_IMAGE_TOO_OLD_MSG))
+                app_owed = folders_owed = False
+            if app_owed or folders_owed:
+                what = (_app_pins_progress_text(
+                    (web_override or _project_web(c["name"]) or {}).get("setup", ""),
+                    app_pins) if app_owed else "")
+                progress.step("recreate", (
+                    f"re-creating the project to install {what}"
+                    + (" and apply its new folders" if folders_owed else "")
+                    if what else
+                    "re-creating the project with its new folders" if folders_owed and not app_owed
+                    else "re-creating the project to bring its app up to date"))
                 _recreate_docker_substrate(
                     c["project"], cfg, service_flags=_read_service_flags(c["name"]),
-                    progress=progress, heal_gitea=True, found=found)
+                    progress=progress, heal_gitea=True, found=found,
+                    app_pins=app_pins, web_override=web_override)
             else:
                 progress.step("start", "starting container")
                 _start_docker_substrate(c["project"], cfg, progress, found=found)
         else:
             progress.step("recreate", "recreating supervisor")
-            found += _recreate_supervisor(c["project"], cfg, progress=progress) or []
+            found += _recreate_supervisor(c["project"], cfg, progress=progress,
+                                          app_pins=app_pins) or []
         results.append(ActionResult(c["name"], c["project"], "start", "ok"))
     _raise_old_instructions(found, name_project=bool(req.all))
     return results
@@ -5812,6 +5862,9 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     # A running project's update may recreate it with the host task cap: a
     # damaged settings file refuses here, before the marker writes below.
     project_pids_limit()
+    # The same for the app versions its boxes are re-run with (the docker
+    # editor switch reads them in its own refusal block).
+    app_pins = read_app_pins()
 
     print(f"=== Updating project: {project} ===")
 
@@ -6097,6 +6150,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         post_create_hook=hook,
         service_flags=flags_override,
         progress=progress,
+        app_pins=app_pins,
     ) or []
 
     # The recreate wrote authoritative service labels, so a live-toggle override for
@@ -6425,6 +6479,10 @@ VERSION_SOURCES: dict[str, dict[str, str]] = {
     # pi-subagents (npm), shipped inside the pi dist; no refresh lane moves it
     # yet — `images outdated` reports when upstream is ahead of the pin.
     "PI_SUBAGENTS_VERSION": {"kind": "npm", "pkg": _PI_SUBAGENTS_NPM},
+    # OpenKnowledge, an app pin (APP_PINS, which names the same package —
+    # pinned equal): the Software card's check and `research app refresh`
+    # resolve it here.
+    "OPEN_KNOWLEDGE_VERSION": {"kind": "npm", "pkg": "@inkeep/open-knowledge"},
 }
 
 # Per-supervisor service registry. KNOWN_SERVICES lists every kind the webui
@@ -8031,6 +8089,14 @@ def build_supervisor_docker_args(
         args += ["-e", f"{WEB_ENV_START}={web['start']}",
                  "-e", f"{WEB_ENV_PORT}={web['port']}",
                  "-e", f"{WEB_ENV_SETUP}={web['setup']}"]
+        # The app pins the setup was filled with (APP_PINS_LABEL), set by the
+        # caller from the same values it fills with. Only a caller that knows
+        # them passes "pins": without it no label is written, so a container
+        # can never claim pins its setup was not filled with (a missing label
+        # reads as "from before managed app versions" and the next start
+        # brings it up to date).
+        if "pins" in web:
+            args += ["--label", f"{APP_PINS_LABEL}={web['pins']}"]
     # The docker substrate has no inner dockerd — no DIND boot, no runtime flag.
     if not is_docker:
         args += ["-e", "DOCKER_DIND=true"]
@@ -8157,6 +8223,215 @@ def load_versions() -> dict[str, str]:
     pins = _parse_env_pins(VERSIONS_FILE)
     pins.update(_parse_env_pins(VERSIONS_LOCAL_FILE))
     return pins
+
+
+# --- App pins: versions a built-in setup text names as {{KEY}} ---------------
+# An app a built-in workflow or box type installs with npm (OpenKnowledge) is
+# pinned in versions.env like any other pin, but nothing builds it on the
+# host: the setup text names the pin and RS fills the effective value in at
+# every install. The table is the ONLY list of pins a setup may name, and only
+# the `setup` of a BUILT-IN box type or store workflow is ever filled (custom
+# types and typed setups are the operator's shell text, run exactly as
+# written). `label` is the Software card's name, `pkg` the npm package its
+# Refresh checks, `name` the CLI's (`research app refresh <name>`).
+APP_PINS: dict[str, dict[str, str]] = {
+    "OPEN_KNOWLEDGE_VERSION": {"label": "OpenKnowledge", "name": "open-knowledge",
+                               "pkg": "@inkeep/open-knowledge"},
+}
+# A pin-shaped placeholder: {{ + an upper-case pin name + }}. Anything else
+# with braces (a docker --format '{{.Names}}', a template) is ordinary text.
+APP_PIN_PLACEHOLDER_RE = re.compile(r"\{\{([A-Z][A-Z0-9_]*)\}\}")
+# The value goes into a shell command (npm install -g <pkg>@<value>), and a
+# Refresh takes it from npm's `latest` tag, which is upstream data — so it is
+# exactly a version number: X.Y.Z with an optional -prerelease of the same
+# safe characters. Never a dist-tag (`latest` would install unpinned), never
+# a range. MIRROR of rs_sandbox.APP_PIN_VERSION_RE (pinned equal).
+APP_PIN_VERSION_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.]+)?")
+# Where the host stages the app-pin values for the in-project box tool (in the
+# project's settings folder, beside box-catalog.json). MIRROR of
+# rs_sandbox.APP_PINS_JSON's name.
+APP_PINS_FILE = "app-pins.json"
+# The most a reader takes of that file. It holds one `"KEY": "X.Y.Z"` line per
+# app pin (well under 100 bytes each); 4 KiB is room for dozens, and a reader
+# that met a larger file (the project can write anything there) refuses it
+# instead of reading it whole. MIRROR of rs_sandbox.APP_PINS_MAX_BYTES.
+APP_PINS_MAX_BYTES = 4096
+# The docker label a web-app project's container carries: the pins its setup
+# was filled with ("KEY=value,…", empty when it names none). Written on EVERY
+# docker run of a web-app project, so a missing label means a container from
+# before managed app versions.
+APP_PINS_LABEL = "research.app-pins"
+# Browser-reachable refusal of a pin that is not a version number (only a
+# hand-edited versions.local.env can make one). Names the browser remedy.
+_APP_PIN_BAD_MSG = (
+    "the {label} version setting ({key}) is {what}; under Sandboxes → Software, "
+    "Use repo version on its row puts the version this installation ships back")
+
+
+_VERSIONS_NOT_TEXT = ("a version settings file (versions.env or versions.local.env) "
+                      "cannot be read as text")
+
+
+def _load_versions_or_refuse() -> dict[str, str]:
+    """load_versions, with a file that cannot be read as text (not UTF-8, or
+    an OSError) refused as a pathless ValidationError."""
+    try:
+        return load_versions()
+    except (OSError, ValueError):
+        raise ValidationError(_VERSIONS_NOT_TEXT) from None
+
+
+def named_app_pins(text: str) -> list[str]:
+    """The pin names a setup text names as {{KEY}}, in order, de-duplicated."""
+    out: list[str] = []
+    for m in APP_PIN_PLACEHOLDER_RE.finditer(text or ""):
+        if m.group(1) not in out:
+            out.append(m.group(1))
+    return out
+
+
+def read_app_pins() -> dict[str, str]:
+    """Every app pin's effective value, each checked to be a version number.
+    ValidationError (browser-reachable, before any side effect) on a pin that
+    is missing or not a version — the caller refuses its whole operation."""
+    pins = _load_versions_or_refuse()
+    out: dict[str, str] = {}
+    for key, spec in APP_PINS.items():
+        value = pins.get(key, "")
+        if not value:
+            raise ValidationError(_APP_PIN_BAD_MSG.format(
+                label=spec["label"], key=key, what="missing"))
+        if not APP_PIN_VERSION_RE.fullmatch(value):
+            raise ValidationError(_APP_PIN_BAD_MSG.format(
+                label=spec["label"], key=key, what="not a version number"))
+        out[key] = value
+    return out
+
+
+def fill_app_pins(text: str, pins: dict[str, str]) -> str:
+    """`text` with every {{KEY}} replaced by its value from `pins`. A name not
+    in `pins`, or a value that is not a version number, refuses
+    (ValidationError naming it) — an unfilled or unchecked placeholder never
+    reaches a shell."""
+    def sub(m: "re.Match[str]") -> str:
+        key = m.group(1)
+        value = pins.get(key)
+        if value is None:
+            raise ValidationError(f"the setup names an unknown version setting ({key})")
+        if not APP_PIN_VERSION_RE.fullmatch(value):
+            raise ValidationError(_APP_PIN_BAD_MSG.format(
+                label=APP_PINS.get(key, {}).get("label", key), key=key,
+                what="not a version number"))
+        return value
+    return APP_PIN_PLACEHOLDER_RE.sub(sub, text or "")
+
+
+def app_pins_label_value(setup: str, pins: dict[str, str]) -> str:
+    """The APP_PINS_LABEL value for a setup filled from `pins`: its named pins
+    as sorted `KEY=value`, comma-joined; "" when it names none. Unknown names
+    refuse like fill_app_pins."""
+    fill_app_pins(setup, pins)          # the same refusals, before any label
+    return ",".join(f"{k}={pins[k]}" for k in sorted(named_app_pins(setup)))
+
+
+def parse_app_pins_label(value: str) -> dict[str, str]:
+    """The pins a container's APP_PINS_LABEL records ({} for ""). Entries that
+    are not `KEY=<version>` for a known pin are dropped: a label is
+    host-written, so a malformed one can only come from outside RS, and its
+    pins then read as differing (the next start rebuilds)."""
+    out: dict[str, str] = {}
+    for part in (value or "").split(","):
+        key, sep, ver = part.partition("=")
+        if sep and key in APP_PINS and APP_PIN_VERSION_RE.fullmatch(ver):
+            out[key] = ver
+    return out
+
+
+def stage_app_pins(workspace_path: "Path", pins: dict[str, str]) -> None:
+    """Write the app-pin values into the project's settings folder for the
+    in-project box tool (only the app-pin keys, never the whole versions map,
+    which also holds host configuration). Through orch_files (no-follow,
+    temp + rename). Raises orch_files.Unusable / OSError for the caller."""
+    orch_files.write_text(workspace_path, APP_PINS_FILE,
+                          json.dumps({k: pins[k] for k in sorted(pins)},
+                                     indent=2, sort_keys=True) + "\n",
+                          create=True)
+
+
+# Fixed text for an app-pin staging failure, at create, a start or box add.
+_APP_PINS_NOT_STAGED = (
+    "the app versions could not be written into the project's settings folder, "
+    "so a box that installs OpenKnowledge refuses to start; start the project "
+    "again")
+
+
+def _stage_app_pins_warn(workspace_path: "Path", pins: dict[str, str]) -> bool:
+    """stage_app_pins, warning instead of raising (create and the start's
+    relaunch path, mid-operation). False when the file was not written."""
+    try:
+        stage_app_pins(workspace_path, pins)
+        return True
+    except (orch_files.Unusable, OSError):
+        print(f"warning: {_APP_PINS_NOT_STAGED}", file=sys.stderr)
+        return False
+
+
+# The box tool's structured app-pin refusal: {"refused": "app-pins", "name":
+# <box>, "reason": <one of these>} on stdout, exit 3. LOCKSTEP with
+# rs_sandbox._refuse_app_pins. The host builds the operator's text from the
+# reason (the tool's output comes from inside the project, never shown).
+# Each reason: (the cause, the browser remedy). The caller says what happened
+# to the box (stopped at a start, not added, left as it was on a re-run).
+_BOX_APP_PINS_REASONS = {
+    "missing": ("its app version could not be read from the project's settings "
+                "folder", "start the project again"),
+    "unreadable": ("its app version could not be read from the project's "
+                   "settings folder", "start the project again"),
+    "shape": ("the app version setting is not a version number",
+              "under Sandboxes → Software, Use repo version on its row puts the "
+              "shipped version back, then start the project again"),
+    "unknown-name": ("its setup names a version setting this RS does not know",
+                     "start the project again, and if this repeats, remove the "
+                     "box and add it again"),
+}
+# At box add there is no box yet: the remedy ends in adding it.
+_BOX_APP_PINS_ADD_REMEDY = {
+    "missing": "start the project again, then add the box",
+    "unreadable": "start the project again, then add the box",
+    "shape": ("under Sandboxes → Software, Use repo version on its row puts the "
+              "shipped version back; then add the box"),
+    "unknown-name": "start the project again, then add the box",
+}
+BOX_APP_PINS_EXIT = 3
+
+
+def _box_app_pins_refusal(stdout: Any) -> "str | None":
+    """The reason of a box tool's app-pin refusal, or None for any other
+    output (tolerant: the project container controls it)."""
+    data = _parse_box_tool_json(stdout)
+    reason = data.get("reason")
+    if data.get("refused") == "app-pins" and reason in _BOX_APP_PINS_REASONS:
+        return reason
+    return None
+
+
+def _box_app_pins_text(box: str, reason: str,
+                       outcome: str = "it was left as it was", *,
+                       at_add: bool = False) -> str:
+    cause, remedy = _BOX_APP_PINS_REASONS[reason]
+    if at_add:
+        remedy = _BOX_APP_PINS_ADD_REMEDY[reason]
+    return f"box {_shown_box(box)}: {cause}, so {outcome}; {remedy}"
+
+
+def _die_on_box_app_pins(r: Any, box: str) -> None:
+    """A failed box-tool call that re-ran a box between starts (folders,
+    settings, a port): when the tool refused for its app version — before it
+    touched the running box — die with the fixed text (never the tool's
+    output)."""
+    reason = _box_app_pins_refusal(getattr(r, "stdout", ""))
+    if reason is not None:
+        die(_box_app_pins_text(box, reason))
 
 
 _VERSION_NUMERIC_RE = re.compile(r"v?(\d+(?:\.\d+)*)")
@@ -10102,6 +10377,92 @@ def pin_reset(req: PinResetRequest) -> dict:
             "value": load_versions().get(req.key)}
 
 
+# npm's per-package `latest` manifest is a few KB (measured 4.6 KB for
+# OpenKnowledge), while the full package document is megabytes and grows with
+# every release — so the app check reads only the manifest, under a byte cap
+# with ample room (a larger answer is not a manifest), and under ONE total
+# deadline: the same bound and reasoning as the in-container upstream resolves
+# (_UPSTREAM_RESOLVE_MAX_TIME_S, inside the webui's relay window). urlopen's
+# own timeout is per socket operation and does not cover name resolution, so
+# the read runs in a daemon thread the caller stops waiting for.
+_NPM_LATEST_MAX_BYTES = 256 * 1024
+
+
+def _npm_latest_bounded(pkg: str) -> str:
+    """npm's `latest` version of `pkg`, or an exception (TimeoutError past the
+    deadline; anything the read raised). The caller maps every failure to its
+    own pathless text."""
+    url = ("https://registry.npmjs.org/" + pkg.replace("/", "%2F") + "/latest")
+    out: dict = {}
+
+    def read() -> None:
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "research-sandbox/app-refresh"})
+            with urllib.request.urlopen(req, timeout=_UPSTREAM_RESOLVE_MAX_TIME_S) as resp:
+                raw = resp.read(_NPM_LATEST_MAX_BYTES + 1)
+            if len(raw) > _NPM_LATEST_MAX_BYTES:
+                raise ValueError("answer too large for a manifest")
+            out["version"] = json.loads(raw.decode("utf-8"))["version"]
+        except BaseException as e:  # handed to the caller's thread
+            out["error"] = e
+    worker = threading.Thread(target=read, daemon=True)
+    worker.start()
+    worker.join(_UPSTREAM_RESOLVE_MAX_TIME_S)
+    if worker.is_alive():
+        raise TimeoutError("npm did not answer in time")
+    if "error" in out:
+        raise out["error"]
+    if not isinstance(out.get("version"), str):
+        raise ValueError("no version in npm's answer")
+    return out["version"]
+
+
+def app_refresh_check(key: str) -> tuple[str, str]:
+    """(effective pin, npm's latest) for an app pin (APP_PINS). Side-effect
+    free. A host-side GET of npm's small `latest` manifest under one total
+    deadline (_npm_latest_bounded). Every failure is a browser-safe ValidationError;
+    npm's answer must be a version number (it is upstream data and the value
+    goes into a shell command once written)."""
+    spec = APP_PINS.get(key) if isinstance(key, str) else None
+    if spec is None:
+        raise ValidationError(f"unknown app version setting {key!r}"
+                              if isinstance(key, str) and len(key) <= 64
+                              else "unknown app version setting")
+    current = _load_versions_or_refuse().get(key, "")
+    try:
+        latest = _npm_latest_bounded(spec["pkg"])
+    except Exception:  # network, HTTP, parse — none of their text reaches the page
+        raise ValidationError(f"could not check npm for the latest {spec['label']} "
+                              "release; try again later") from None
+    if not APP_PIN_VERSION_RE.fullmatch(latest):
+        raise ValidationError(f"npm's latest {spec['label']} release is not a plain "
+                              "version number; nothing was changed")
+    return current, latest
+
+
+def app_refresh(key: str) -> dict:
+    """Move an app pin to npm's latest, never down (refresh_target), in the
+    untracked override; written only when the effective value changes (a
+    redundant override would detach the pin from versions.env). Re-resolves
+    upstream itself — no version ever comes from the caller. OSError on the
+    write maps to a pathless ValidationError."""
+    current, latest = app_refresh_check(key)
+    target = refresh_target(current, latest)
+    changed = target != current
+    if changed:
+        try:
+            _set_version_pin(key, target)
+        except OSError as e:
+            raise ValidationError("the version setting could not be written "
+                                  f"({e.strerror or 'write failed'})") from None
+        except ValueError:          # a versions.local.env that is not UTF-8
+            raise ValidationError(_VERSIONS_NOT_TEXT) from None
+    return {"key": key, "label": APP_PINS[key]["label"], "previous": current,
+            "version": target, "latest": latest, "changed": changed,
+            "downgrade": target != latest}
+
+
 def agent_apply_refresh(agent: str, version: str, ext_version: str = "") -> None:
     """Bump the CLI pin to `version` and — when the agent declares a companion
     editor extension — its pin to `ext_version`, both in the untracked
@@ -11176,6 +11537,14 @@ def software_status() -> dict:
              "resettable": k in override and _pin_resettable(k, base)}
             for k in effective]
 
+    # App pins (APP_PINS): versions RS's built-in setups install from npm —
+    # nothing on the host to pull; the Software page's card checks npm and
+    # moves the pin (the app_refresh verbs), projects follow at their next start.
+    apps = [{"key": k, "label": spec["label"], "pkg": spec["pkg"],
+             "value": effective.get(k), "override": k in override,
+             "base": base.get(k)}
+            for k, spec in APP_PINS.items()]
+
     return {
         "docker_ok": docker_ok,
         "agents": agents,
@@ -11184,6 +11553,7 @@ def software_status() -> dict:
         "node": node,
         "images": images,
         "pins": pins,
+        "apps": apps,
     }
 
 
@@ -11613,6 +11983,7 @@ def _recreate_supervisor(
     post_create_hook=None,
     service_flags: dict[str, bool] | None = None,
     progress=None,
+    app_pins: "dict[str, str] | None" = None,
 ) -> "list[OldInstructions]":
     """Stash creds → stop+rm → create new container from SUPERVISOR_IMAGE
     → optional post-create hook → start → re-inject route → re-stage inner
@@ -11642,6 +12013,11 @@ def _recreate_supervisor(
     # Every start and update of a dind project recreates through here, which
     # is how an existing project picks up a changed setting.
     pids_limit = project_pids_limit()
+    # The app versions the boxes install (staged for the box tool before the
+    # relaunch below), read and checked before anything is touched; a start
+    # passes the ones it read once for every project.
+    if app_pins is None:
+        app_pins = read_app_pins()
     # The project's folders, decided BEFORE anything is touched: a saved ⚙
     # change that cannot apply leaves the old binds (and says so), and nothing
     # here can fail after the logins were stashed or the container removed.
@@ -11911,6 +12287,13 @@ def _recreate_supervisor(
     extension_entries = extension.load(workspace_path)
     boxes = {name: e for name, e in extension_entries.items()
              if isinstance(e, dict) and e.get("kind") == extension.SANDBOX_KIND}
+    # The app versions for the box tool, a step of its own (outside the box
+    # tool staging above, which may tolerate a failure, and the catalog step,
+    # which skips its write on a broken registry): every box re-run below
+    # fills its setup from this file. A failed write fails the operation at
+    # its end when the project has boxes; their runs refuse meanwhile.
+    if not _stage_app_pins_warn(workspace_path, app_pins) and boxes:
+        found.append(OldInstructions("app-pins", project, reason=_APP_PINS_NOT_STAGED))
     # Boxes are a first-class standing dind utility (STAGE_DIND_UNIFY): research
     # does not stage the box tool at re-creation, so it is staged here when the
     # project has boxes (sandbox-dind staged it above).
@@ -11928,8 +12311,29 @@ def _recreate_supervisor(
         r = run(["docker", "exec", container, "rs-sandbox", "restart", name],
                 capture_output=True)
         if r.returncode != 0:
-            print(f"warning: failed to restart sandbox box {name!r}: "
-                  f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
+            # A box whose app version could not be filled in is an error of
+            # the operation (fixed text from the tool's structured reason);
+            # any other failed restart stays a warning, as before.
+            refusal = _box_app_pins_refusal(r.stdout)
+            if refusal is not None:
+                # A privileged inner daemon has already restarted the old box
+                # (--restart unless-stopped), so it would keep running its old
+                # setup: stopped here, as a box whose image could not be
+                # brought up to date is (error, don't work around).
+                cname = extension.container_name(name)
+                stopped = (not run_quiet(["docker", "exec", container, "docker",
+                                          "container", "inspect", cname])
+                           or run_quiet(["docker", "exec", container, "docker",
+                                         "stop", cname]))
+                found.append(OldInstructions("app-pins", project, box=name,
+                                             reason=_box_app_pins_text(
+                                                 name, refusal,
+                                                 "it was stopped" if stopped else
+                                                 "it could not be stopped and still "
+                                                 "runs its old setup")))
+            else:
+                print(f"warning: failed to restart sandbox box {name!r}: "
+                      f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
             continue
         _report_box_restart_warnings(name, r.stdout, progress)
         found += _box_old_items(project, name,
@@ -12088,9 +12492,14 @@ def _start_docker_substrate(project: str, cfg: "Config",  # type: ignore[name-de
     # after a rebuild) retries it now: the home survived the stop, so a
     # finished setup is never re-run. This is what "stop the project and
     # start it again" in its texts means.
+    # Its setup is filled from the pins the container's label records (a
+    # container from before managed app versions has a literal setup and no
+    # label: nothing to fill).
     web = _project_web(container)
     if web:
-        _retry_project_steps(project, container, web, progress or _NULL_PROGRESS)
+        _retry_project_steps(project, container, web, progress or _NULL_PROGRESS,
+                             parse_app_pins_label(
+                                 (_container_labels(container) or {}).get(APP_PINS_LABEL, "")))
     # The agents' models saved while the project was stopped (I33 slice 3):
     # the home survived the stop, so they are written into it now.
     ws = workspace_path_for(project, cfg)
@@ -12187,6 +12596,19 @@ def _update_docker_substrate(req: "UpdateRequest", cfg: "Config",  # type: ignor
         # The same for an image that cannot carry the agents' state across
         # the re-creation.
         _require_home_restore_image()
+        # The rebuild fills the app's setup with the app versions (read and
+        # checked here), and brings a project from before managed app versions
+        # onto its built-in workflow's app; one whose record names none is
+        # refused here (a rebuild could only keep its old setup unlabelled).
+        app_pins = read_app_pins()
+        web_override = None
+        own_web = _project_web(container)
+        if own_web and APP_PINS_LABEL not in (_container_labels(container) or {}):
+            builtin = _builtin_project_web(project, cfg)
+            if builtin is None:
+                raise ValidationError(_APP_PINS_NO_WORKFLOW_SWITCH)
+            web_override = {"start": builtin["start"], "port": own_web["port"],
+                            "setup": builtin["setup"]}
     if plan.any():
         # The agents' models: recorded, then written into the agents' own files
         # (a stopped project gets them at its next start). Applied before an
@@ -12210,7 +12632,8 @@ def _update_docker_substrate(req: "UpdateRequest", cfg: "Config",  # type: ignor
     print(f"=== Updating project: {project} (editor toggle) ===")
     found: list[OldInstructions] = []
     _recreate_docker_substrate(project, cfg, service_flags=flags,
-                               progress=progress, found=found)
+                               progress=progress, found=found,
+                               app_pins=app_pins, web_override=web_override)
     _raise_old_instructions(found)
     return UpdateResult(project=project, rebuilt=False,
                         workers_enabled=[], workers_disabled=[])
@@ -12219,7 +12642,9 @@ def _update_docker_substrate(req: "UpdateRequest", cfg: "Config",  # type: ignor
 def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[name-defined]
                                service_flags: dict[str, bool],
                                progress=None, heal_gitea: bool = False,
-                               found: "list[OldInstructions] | None" = None) -> None:
+                               found: "list[OldInstructions] | None" = None,
+                               app_pins: "dict[str, str] | None" = None,
+                               web_override: "dict | None" = None) -> None:
     """Recreate a `docker`-substrate (plain runc) box to apply a service-flag
     change. Simpler than _recreate_supervisor (no inner dockerd, no image
     re-staging), but the agents' state rides through the workspace the same
@@ -12241,6 +12666,31 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
     # An image that cannot restore the agents' state refuses here, before
     # anything is touched (its stash would be made and never put back).
     _require_home_restore_image()
+    # The web app the new container runs, decided before anything is touched.
+    # `web_override` is the caller's (a start bringing an older container onto
+    # its built-in workflow's app). Otherwise the container's own — except a
+    # container from before managed app versions (no APP_PINS_LABEL), which
+    # takes its built-in workflow's current app here too, so whichever
+    # re-creation comes first (a start, an editor switch, saved folders) brings
+    # it up to date. When the record names no such workflow it keeps its own
+    # app and gets NO label (stamping one would claim pins its literal setup
+    # never had); the start reports it, an editor switch refused it already.
+    # The pins are read once (the caller's, else here, before any side effect).
+    if app_pins is None:
+        app_pins = read_app_pins()
+    web = md.get("web")
+    if web:
+        if web_override is not None:
+            web = dict(web_override)
+            web["pins"] = app_pins_label_value(web["setup"], app_pins)
+        elif APP_PINS_LABEL in (_container_labels(container) or {}):
+            web = dict(web, pins=app_pins_label_value(web["setup"], app_pins))
+        else:
+            builtin = _builtin_project_web(project, cfg)
+            if builtin is not None:
+                web = {"start": builtin["start"], "port": web["port"],
+                       "setup": builtin["setup"]}
+                web["pins"] = app_pins_label_value(web["setup"], app_pins)
     # The project's folders, decided before anything is touched (the same rule
     # as _recreate_supervisor): a saved ⚙ change that cannot apply leaves the
     # old binds and says so.
@@ -12294,9 +12744,11 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
         # (I33 slice 3); a restored one keeps its own.
         model_in_settings=boot_settings,
         agents=agents,
-        # The web app exactly as the old container carried it (its own env,
-        # host-written at create; nothing inside the container can change it).
-        web=md.get("web"),
+        # The web app decided above: as the old container carried it (its own
+        # env, host-written; nothing inside the container can change it), or
+        # its built-in workflow's current one — with the app pins it is filled
+        # with, recorded as APP_PINS_LABEL.
+        web=web,
         # pi's create-time pair rides along again (marker-sourced, like the
         # Claude pair above): merged only where the boot installs pi's
         # settings, i.e. when none were restored.
@@ -12362,9 +12814,10 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
     # History keeps its own bounded wait for the home: if the home came up
     # just after the deadline above it still gets its chance (on a ready
     # home that wait returns at its first poll).
-    if md.get("web"):
-        _rebuild_project_steps(project, container, md["web"], cfg,
-                               progress or _NULL_PROGRESS)
+    if web:
+        _rebuild_project_steps(project, container, web, cfg,
+                               progress or _NULL_PROGRESS,
+                               app_pins if "pins" in web else {})
     # The restored settings files keep their own models (the boot merges the
     # record only into a settings file it installs), so a model change saved
     # while the project was stopped, or an older project's one-time
@@ -15082,6 +15535,8 @@ class OldInstructions:
                        # date at a re-creation; `reason` is its fixed text)
                        # | "status-bar" (the status bar could not be applied;
                        # `reason` is its fixed text)
+                       # | "app-pins" (an app version could not be applied to
+                       # the project or a box; `reason` is its fixed text)
                        # | "files" / "box-files" (files RS used to write into
                        # the project's / a box's folder; `paths` lists them)
     project: str
@@ -15092,7 +15547,7 @@ class OldInstructions:
     def text(self) -> str:
         if self.kind == "box":
             return OLD_INSTRUCTIONS_BOX_ERROR.format(box=_shown_box(self.box))
-        if self.kind in ("box-image", "status-bar"):
+        if self.kind in ("box-image", "status-bar", "app-pins"):
             return self.reason
         if self.kind == "files":
             return OLD_FILES_PROJECT_ERROR.format(paths=_shown_old_paths("", self.paths))
@@ -19306,6 +19761,83 @@ def _project_web(container: str) -> dict | None:
     return _web_from_env(env)
 
 
+# A web-app project made before managed app versions, whose record no longer
+# names the built-in store workflow it came from: RS cannot know which setup
+# to bring it to. Browser-reachable; the start still runs (as it is).
+_APP_PINS_NO_WORKFLOW = (
+    "this project was created before RS kept its app's version up to date, and "
+    "its record (/workspace/.orchestrator/project.json) no longer names the "
+    "store workflow it was created from, so its app keeps the version it has")
+# The same met by an editor switch, which rebuilds the project and so cannot
+# keep the old setup without stamping it current: refused before anything.
+_APP_PINS_NO_WORKFLOW_SWITCH = (
+    "this project was created before RS kept its app's version up to date, and "
+    "its record (/workspace/.orchestrator/project.json) no longer names the "
+    "store workflow it was created from; the editor was not switched")
+
+
+def _builtin_project_web(project: str, cfg: "Config") -> "dict | None":  # type: ignore[name-defined]
+    """The app ({start, setup}) of the BUILT-IN store workflow the project's
+    record names — built-ins only, never the custom registry (a web app is a
+    built-in-only key, so a broken custom file can never block this). None
+    when the record names none with an app, or the built-ins cannot be read.
+    The record is project-writable: rewriting it can only pick another
+    built-in's setup to run in that project's own container."""
+    wid = _read_marker_dict(workspace_path_for(project, cfg)).get("workflow")
+    if not isinstance(wid, str):
+        return None
+    try:
+        m = workflow.load_builtins().get(wid)
+    except (workflow.WorkflowError, OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(m, dict):
+        return None
+    web, setup = m.get("web"), (m.get("setup") or "")
+    if not (isinstance(web, dict) and isinstance(web.get("start"), str)
+            and isinstance(setup, str) and setup.strip()):
+        return None
+    return {"start": web["start"], "setup": setup.strip()}
+
+
+def _app_pins_rebuild_owed(project: str, cfg: "Config", container: str,  # type: ignore[name-defined]
+                           app_pins: dict[str, str]
+                           ) -> "tuple[bool, dict | None, OldInstructions | None]":
+    """Whether a docker web-app project's start owes a rebuild for its app
+    versions: (owed, the web app the rebuild uses — None for the container's
+    own, an error item when it is owed but cannot be done). A container with
+    no APP_PINS_LABEL is from before managed app versions: it rebuilds onto
+    its built-in workflow's current app (keeping its port). Otherwise it is
+    owed exactly when the pins its setup names differ from the label.
+    `owed` is None when NO rebuild may run at all (a labelled setup naming a
+    pin this RS does not know: a rebuild would refuse mid-start), so the
+    start stays plain even with folders pending, and reports the item."""
+    web = _project_web(container)
+    if not web:
+        return False, None, None
+    labels = _container_labels(container)
+    if labels is None:
+        return False, None, None        # unreadable: the start itself will say
+    label = labels.get(APP_PINS_LABEL)
+    if label is None:
+        builtin = _builtin_project_web(project, cfg)
+        if builtin is None:
+            return False, None, OldInstructions("app-pins", project,
+                                                reason=_APP_PINS_NO_WORKFLOW)
+        return True, {"start": builtin["start"], "port": web["port"],
+                      "setup": builtin["setup"]}, None
+    try:
+        want = app_pins_label_value(web["setup"], app_pins)
+    except ValidationError as e:
+        return None, None, OldInstructions("app-pins", project, reason=str(e))
+    return want != label, None, None
+
+
+def _app_pins_progress_text(setup: str, app_pins: dict[str, str]) -> str:
+    """'OpenKnowledge 0.89.5' for the pins a setup names (a progress line)."""
+    return ", ".join(f"{APP_PINS[k]['label']} {app_pins[k]}"
+                     for k in named_app_pins(setup) if k in app_pins and k in APP_PINS)
+
+
 def _gate_project_web_image() -> None:
     """Refuse a web-app project on an rs-minimal image built before the web
     scripts were baked: its tab would wait for an app nothing starts. One short
@@ -19343,20 +19875,67 @@ def _project_setup_done(container: str) -> bool:
                capture_output=True).returncode == 0
 
 
-def _rerun_project_setup(container: str, web: dict, progress) -> None:
+def _rerun_project_setup(container: str, web: dict, progress,
+                         pins: "dict[str, str]") -> None:
     """Re-run a web-app project's setup in /workspace (the rebuild or an
-    earlier failure left it unfinished), then mark it done. Warn and continue
-    on failure: the rebuild or start itself took effect, the app stays
-    stopped, and the next start retries. The only two callers are the
-    editor-toggle rebuild and a plain start."""
+    earlier failure left it unfinished), then mark it done, its app pins
+    filled from `pins` — the values the container's label records (a rebuild
+    passes the ones it just labelled it with; a plain start reads its label),
+    so the label always tells what was installed. Warn and continue on
+    failure, a pin that cannot be filled included: the rebuild or start
+    itself took effect, the app stays stopped, and the next start retries.
+    The only callers are the rebuild and a plain start."""
     print("running the workflow setup (it installs the project's web app)...")
     try:
-        _light_exec(container, web["setup"], step="workflow setup",
+        setup = fill_app_pins(web["setup"], pins)
+    except ValidationError as e:
+        print(f"warning: {e}", file=sys.stderr)
+        progress.step("warning", _WEB_SETUP_FAILED_LINE)
+        return
+    try:
+        _light_exec(container, setup, step="workflow setup",
                     github_pat="", workdir="/workspace")
         _mark_project_setup_done(container)
     except HarnessError as e:
         print(f"warning: {e.log_msg}: {e.client_detail}", file=sys.stderr)
         progress.step("warning", _WEB_SETUP_FAILED_LINE)
+
+
+# The token a box tool that fills app versions names in `rs-sandbox --help`
+# (its description; hyphen-free so help wrapping cannot split it). LOCKSTEP
+# with rs_sandbox.build_parser.
+BOX_APP_PINS_HELP_TOKEN = "app_pins"
+_BOX_TOOL_NO_APP_PINS_MSG = (
+    "this project's box tool predates managed app versions, so it cannot "
+    "install this box type; stop the project and start it again, then add the box")
+
+
+def _gate_box_app_pins(container: str) -> None:
+    """Refuse adding a box whose setup names an app version when the
+    project's box tool cannot fill it in (a project left running across the
+    RS upgrade). A missing tool passes: box add stages the current one."""
+    r = run(["docker", "exec", container, "rs-sandbox", "--help"],
+            capture_output=True)
+    if r.returncode == 0 and BOX_APP_PINS_HELP_TOKEN not in (r.stdout or ""):
+        raise ValidationError(_BOX_TOOL_NO_APP_PINS_MSG)
+
+
+def _stage_app_pins_if_absent(workspace_path: "Path", pins: dict[str, str]) -> None:
+    """Write the app-pin file for the box tool when the project has none. A
+    failure refuses the add (its caller adds a box that needs it); a file
+    already there, readable or not, is left for the next start to rewrite."""
+    try:
+        orch_files.read_bytes(workspace_path, APP_PINS_FILE,
+                              max_bytes=APP_PINS_MAX_BYTES)
+        return
+    except FileNotFoundError:
+        pass
+    except (orch_files.Unusable, OSError):
+        return
+    try:
+        stage_app_pins(workspace_path, pins)
+    except (orch_files.Unusable, OSError):
+        raise ValidationError(_APP_PINS_NOT_STAGED) from None
 
 
 def _gate_box_web(container: str, want_browser: bool) -> None:
@@ -19682,7 +20261,8 @@ def _warn_history_not_on(container: str, row: dict, progress) -> bool:
 
 
 def _rebuild_project_steps(project: str, container: str, web: dict,
-                           cfg: "Config", progress) -> None:  # type: ignore[name-defined]
+                           cfg: "Config", progress,  # type: ignore[name-defined]
+                           pins: "dict[str, str]") -> None:
     """After an editor-toggle rebuild of a web-app project: history (when the
     project keeps it), then the setup. The token is re-staged first — a host
     file streamed in, using the ledger's Gitea address, so a stopped Gitea
@@ -19703,10 +20283,11 @@ def _rebuild_project_steps(project: str, container: str, web: dict,
                                                                   row["repo"]))
             return
         _warn_history_not_on(container, row, progress)
-    _rerun_project_setup(container, web, progress)
+    _rerun_project_setup(container, web, progress, pins)
 
 
-def _retry_project_steps(project: str, container: str, web: dict, progress) -> None:
+def _retry_project_steps(project: str, container: str, web: dict, progress,
+                         pins: "dict[str, str]") -> None:
     """A plain start of a web-app project retries what did not finish: history
     when the project keeps it and it is not on, then the setup when its marker
     is absent. One wake from the host at most: the setup's marker step
@@ -19723,7 +20304,7 @@ def _retry_project_steps(project: str, container: str, web: dict, progress) -> N
             return
         turned_on = _warn_history_not_on(container, row, progress)
     if not _project_setup_done(container):
-        _rerun_project_setup(container, web, progress)
+        _rerun_project_setup(container, web, progress, pins)
     elif turned_on:
         run(["docker", "exec", "-u", "research", container, "rs-web-restart"],
             capture_output=True)
@@ -20233,6 +20814,16 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     web_spec = catalog.get(req.preset, {}).get("web")
     if web_spec:
         _gate_box_web(container, want_browser)
+    # A box type whose setup names an app version ({{KEY}}, built-in types
+    # only): the pins are read and checked here, and the in-project box tool
+    # must fill them in — an older one (a project running since before managed
+    # app versions) would pass the placeholder to npm unfilled.
+    preset_entry = catalog.get(req.preset, {})
+    pinned_preset = (preset_entry.get("source") == "builtin"
+                     and bool(named_app_pins(preset_entry.get("setup") or "")))
+    app_pins = read_app_pins() if pinned_preset else {}
+    if pinned_preset:
+        _gate_box_app_pins(container)
     # A trusted browser needs a box tool and a browser image that know trusted
     # browsers (the browser-off refusal ran with the image resolution above).
     # Before the history gate, like the web-app probes.
@@ -20248,6 +20839,12 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     # was resolved in the gate block above, so the image the box will run IS the
     # one delivered (a research project's lazy delivery keys on this).
     progress.step("harness", "ensuring the box harness")
+    # The app versions for the box tool, written only when the project has
+    # none yet (a research project's first box: its create stages no box
+    # files); otherwise the file staged at the last start stays, so a box
+    # moves to a new version at the project's next start, never at an add.
+    if pinned_preset:
+        _stage_app_pins_if_absent(workspace_path, app_pins)
     _ensure_box_harness(container, project_network_for(req.project),
                         workspace_path, want_browser)
     # A box tool from before RS kept its files in the agents' homes would write
@@ -20458,6 +21055,10 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         if history_args and not _box_entry_saved(workspace_path, req.name):
             _cleanup_box_history(req.project, req.name, hist_claim["user"],
                                  hist_claim["repo"], container)
+        refusal = _box_app_pins_refusal(r.stdout)
+        if refusal is not None:
+            raise ValidationError(_box_app_pins_text(req.name, refusal,
+                                                     "it was not added", at_add=True))
         if _is_old_box_tool(r):
             # Every add passes --share/--no-share, so any old tool refuses;
             # name the newest feature it lacks that this add asked for.
@@ -20810,6 +21411,7 @@ def box_folders(req: "BoxFoldersRequest", _progress=None) -> BoxFoldersResult:  
     r = run(["docker", "exec", container, "rs-sandbox", "folders", req.name,
              "--set=" + ",".join(req.folders)], capture_output=True)
     if r.returncode != 0:
+        _die_on_box_app_pins(r, req.name)
         if _is_old_box_tool(r):
             die(_OLD_BOX_TOOL_MSG)
         die(f"failed to change the box's folders: "
@@ -20919,6 +21521,7 @@ def box_settings(req: "BoxSettingsRequest", _progress=None) -> BoxSettingsResult
             *((("--status-bar" if req.status_bar else "--no-status-bar"),) if bar_asked else ())]
     r = run(argv, capture_output=True)
     if r.returncode != 0:
+        _die_on_box_app_pins(r, req.name)
         if _is_old_box_tool(r):
             die(_OLD_BOX_TOOL_SETTINGS_MSG)
         die(f"failed to change the box's settings: {(r.stderr or r.stdout).strip()}")
@@ -21324,6 +21927,7 @@ def port_add(req: "PortAddRequest", _progress=None) -> PortAddResult:  # type: i
         r = run(["docker", "exec", container, "rs-sandbox", "expose",
                  req.box, str(req.port)], capture_output=True)
         if r.returncode != 0:
+            _die_on_box_app_pins(r, req.box)
             die(f"failed to expose box port: {(r.stderr or r.stdout).strip()}")
         try:
             info = json.loads(r.stdout)
@@ -21455,6 +22059,7 @@ def port_remove(req: "PortRemoveRequest", _progress=None) -> PortRemoveResult:  
         r = run(["docker", "exec", container, "rs-sandbox", "unexpose",
                  gone["box"], str(gone["app_port"])], capture_output=True)
         if r.returncode != 0:
+            _die_on_box_app_pins(r, gone["box"])
             die(f"failed to unexpose box port: {(r.stderr or r.stdout).strip()}")
         # Tolerant: the box has already been re-run — a parse must never stop
         # the registry write below.

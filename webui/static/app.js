@@ -2878,6 +2878,53 @@ function renderSoftwareScreen(view, result) {
     }
     view.appendChild(el("div", { class: "sw-section" }, imgChildren));
 
+    // --- Apps: versions RS's own project and box types install from npm ---
+    // (the app pins — OpenKnowledge). Nothing is built on the host: Check asks
+    // npm (the app_refresh_check verb), "Use <latest>" moves the pin (the
+    // app_refresh verb, which re-resolves upstream itself and never moves a pin
+    // down), and projects and boxes follow at their next start. The version in
+    // effect and its Source mirror the pin row below.
+    const apps = Array.isArray(result.apps) ? result.apps : [];
+    if (apps.length) {
+        const appRows = [el("div", { class: "sw-row sw-row-head" }, [
+            el("span", {}, ["App"]), el("span", {}, ["Version"]), el("span", {}, ["Source"]),
+            el("span", {}, ["Latest on npm"]), el("span", {}, [""]),
+        ])];
+        for (const a of apps) {
+            const latestCell = el("span", { class: "sw-mono" }, ["—"]);
+            const errSpan = el("span", { class: "sw-pin-err sw-warn" }, []);
+            const act = el("span", { class: "sw-act" }, []);
+            const check = el("button", {
+                class: "btn-small",
+                title: "Ask npm for the latest " + a.label + " release (changes nothing)",
+            }, ["Check"]);
+            check.onclick = () => appCheckClick(view, a, check, latestCell, act, errSpan);
+            act.appendChild(check);
+            appRows.push(el("div", { class: "sw-row" }, [
+                el("span", { class: "sw-name" }, [a.label]),
+                el("span", { class: "sw-mono" }, [a.value || "—"]),
+                a.override
+                    ? el("span", {
+                        class: "sw-badge override",
+                        title: a.base != null
+                            ? "from versions.local.env — this installation ships " + a.base
+                            : "from versions.local.env",
+                    }, ["local"])
+                    : el("span", { class: "sw-badge base", title: "from versions.env" }, ["base"]),
+                latestCell,
+                act,
+                errSpan,
+            ]));
+        }
+        view.appendChild(el("div", { class: "sw-section" }, [
+            el("h3", {}, ["Apps"]),
+            el("div", { class: "sw-table sw-apps" }, appRows),
+            el("p", { class: "sw-pins-hint" }, [
+                "Installed by RS's own project and box types. Every project and box using an app moves to the version shown here at its next start (or Update). An OpenKnowledge project is rebuilt once for it (about a minute): its notes and its agents' sign-ins stay, anything installed outside /workspace in it is gone, as with the editor switch. Use repo version on the app's row under Version pins puts the shipped version back.",
+            ]),
+        ]));
+    }
+
     // --- Version pins (effective: base overlaid with the local override) ---
     // A "local" row whose key this installation ships gets "Use repo version":
     // it removes that one key from the local override (the pin_reset verb). The
@@ -2945,6 +2992,80 @@ async function pinResetClick(view, key, btn, errSpan) {
     if (!res.ok || !body || !body.ok) {
         // Reachable only on 200-with-parseable-JSON: the broker answered and the
         // verb refused — show its words in the row, never the unreachable card.
+        errSpan.textContent = mgmtErrText(body);
+        btn.disabled = false;
+        return;
+    }
+    renderSoftwareInto(view);
+}
+
+// The Apps card's Check: ask npm for the app's latest release and, when it
+// is newer than the version in effect, offer "Use <latest>". Transport
+// failures and 401/403/503 are the page's (renderMgmtUnavailable /
+// mgmtStatusRedirect); a broker refusal shows its words in the row.
+async function appCheckClick(view, app, btn, latestCell, act, errSpan) {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    errSpan.textContent = "";
+    let res;
+    try {
+        res = await fetch("/broker/software/app-refresh-check", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ key: app.key }),
+        });
+    } catch (e) { return renderMgmtUnavailable(view); }
+    const redirect = mgmtStatusRedirect(view, res.status, renderSoftwareInto);
+    if (redirect) return redirect();
+    let body;
+    try { body = await res.json(); } catch (e) { return renderMgmtUnavailable(view); }
+    btn.disabled = false;
+    if (!res.ok || !body || !body.ok || !body.result) {
+        errSpan.className = "sw-pin-err sw-warn";
+        errSpan.textContent = mgmtErrText(body);
+        return;
+    }
+    const r = body.result;
+    latestCell.textContent = r.latest || "—";
+    for (const old of act.querySelectorAll(".sw-app-use")) old.remove();
+    // The broker decides "older than the pin" (downgrade): Refresh never moves
+    // a pin down, so that is nothing to do, like an equal version.
+    if (!r.latest || r.latest === r.current || r.downgrade) {
+        errSpan.className = "sw-pin-err";          // a note, not a warning
+        errSpan.textContent = r.downgrade
+            ? "npm's latest is older than the version in effect; nothing to do."
+            : "Up to date.";
+        return;
+    }
+    const use = el("button", {
+        class: "btn-small sw-app-use",
+        title: "Use " + app.label + " " + r.latest + " (the local override); projects and boxes follow at their next start",
+    }, ["Use " + r.latest]);
+    use.onclick = () => appUseClick(view, app, use, errSpan);
+    act.appendChild(use);
+}
+
+// "Use <latest>": move the app pin. The broker re-resolves npm itself, so
+// what is written is npm's latest at that moment (never a version from this
+// page); then the whole page is re-read (the row and its pin row turn "local").
+async function appUseClick(view, app, btn, errSpan) {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    errSpan.textContent = "";
+    let res;
+    try {
+        res = await fetch("/broker/software/app-refresh", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ key: app.key }),
+        });
+    } catch (e) { return renderMgmtUnavailable(view); }
+    const redirect = mgmtStatusRedirect(view, res.status, renderSoftwareInto);
+    if (redirect) return redirect();
+    let body;
+    try { body = await res.json(); } catch (e) { return renderMgmtUnavailable(view); }
+    if (!res.ok || !body || !body.ok) {
+        errSpan.className = "sw-pin-err sw-warn";
         errSpan.textContent = mgmtErrText(body);
         btn.disabled = false;
         return;

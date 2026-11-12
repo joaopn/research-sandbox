@@ -715,6 +715,46 @@ def cmd_node_show(args: argparse.Namespace) -> None:
           f"(npm {s.get('npm_version', '?')}) pulled {s.get('pulled_at', '?')}")
 
 
+def _app_pin_key(name: str) -> str:
+    for key, spec in rscore.APP_PINS.items():
+        if spec["name"] == name:
+            return key
+    die(f"unknown app {name!r} (known: "
+        f"{', '.join(s['name'] for s in rscore.APP_PINS.values())})")
+
+
+def cmd_app_check(args: argparse.Namespace) -> None:
+    # The Software page's Apps card, Check: npm's latest beside the version in
+    # effect; changes nothing.
+    key = _app_pin_key(args.app)
+    try:
+        current, latest = rscore.app_refresh_check(key)
+    except rscore.ValidationError as e:
+        die(str(e))
+    print(f"{args.app}: in effect {current or '(unset)'}, latest on npm {latest}"
+          + ("" if rscore.refresh_target(current, latest) == latest or current == latest
+             else " (older than the version in effect: nothing to do)"))
+
+
+def cmd_app_refresh(args: argparse.Namespace) -> None:
+    # The Apps card's "Use <latest>": move the app pin to npm's latest in the
+    # untracked versions.local.env (never down). Projects and boxes using it
+    # move at their next start (an OpenKnowledge project rebuilds once).
+    key = _app_pin_key(args.app)
+    try:
+        r = rscore.app_refresh(key)
+    except rscore.ValidationError as e:
+        die(str(e))
+    if r["changed"]:
+        print(f"{args.app}: {r['previous'] or '(unset)'} -> {r['version']} "
+              "(versions.local.env); projects and boxes using it move at their next start")
+    elif r["downgrade"]:
+        print(f"{args.app}: npm's latest {r['latest']} is older than the version in "
+              f"effect {r['version']}; nothing to do")
+    else:
+        print(f"{args.app}: already {r['version']}; nothing to do")
+
+
 def cmd_project_attach(args: argparse.Namespace) -> None:
     container = container_name_for(args.name)
     if not container_running(container):
@@ -3524,6 +3564,21 @@ def build_parser() -> argparse.ArgumentParser:
     ndp.set_defaults(func=cmd_node_pull)
     nds = nd_sub.add_parser("show", help="show the cached node seed + version")
     nds.set_defaults(func=cmd_node_show)
+
+    ap = sub.add_parser(
+        "app",
+        help="versions of the apps RS's own project and box types install "
+             "(OpenKnowledge); projects and boxes follow at their next start")
+    ap_sub = ap.add_subparsers(dest="subcommand", required=True)
+    app_names = [s["name"] for s in rscore.APP_PINS.values()]
+    apc = ap_sub.add_parser("check", help="npm's latest release beside the version in effect")
+    apc.add_argument("app", choices=app_names)
+    apc.set_defaults(func=cmd_app_check)
+    apr = ap_sub.add_parser("refresh",
+                            help="move the app's version to npm's latest (never down), "
+                                 "in versions.local.env")
+    apr.add_argument("app", choices=app_names)
+    apr.set_defaults(func=cmd_app_refresh)
 
     st = sub.add_parser(
         "settings",

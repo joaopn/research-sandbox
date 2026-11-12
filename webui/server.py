@@ -787,6 +787,36 @@ async def broker_pin_reset_handler(request: web.Request) -> web.Response:
     return web.json_response(reply, status=status)
 
 
+async def _app_refresh_relay(request: web.Request, verb: str) -> web.Response:
+    """The Software page's OpenKnowledge card (an app pin): `verb` is
+    app_refresh_check (npm's latest, a read) or app_refresh (move the pin to
+    it, never down). Origin-checked because they POST (the second writes host
+    state). Args are HAND-PICKED: only `key` crosses — the broker re-resolves
+    the version itself and refuses an unknown key (APP_REFRESH_WEBUI_FIELDS)."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    status, reply = await _relay(request, verb, {"key": body.get("key")})
+    return web.json_response(reply, status=status)
+
+
+async def broker_app_refresh_check_handler(request: web.Request) -> web.Response:
+    """POST /broker/software/app-refresh-check {key} — npm's latest release
+    of an app RS's built-in setups install, beside the version in effect."""
+    return await _app_refresh_relay(request, "app_refresh_check")
+
+
+async def broker_app_refresh_handler(request: web.Request) -> web.Response:
+    """POST /broker/software/app-refresh {key} — move an app pin to npm's
+    latest (the local override; projects and boxes follow at their next start)."""
+    return await _app_refresh_relay(request, "app_refresh")
+
+
 async def broker_software_handler(request: web.Request) -> web.Response:
     """GET /broker/software — read-only status of the host's agent/editor/reader
     dists, the built image fleet, and the effective version pins (gated). Mirrors
@@ -4220,6 +4250,8 @@ def main() -> None:
     app.router.add_post("/broker/software/build", broker_build_handler)
     app.router.add_post("/broker/software/refresh-check", broker_refresh_check_handler)
     app.router.add_post("/broker/software/pin-reset", broker_pin_reset_handler)
+    app.router.add_post("/broker/software/app-refresh-check", broker_app_refresh_check_handler)
+    app.router.add_post("/broker/software/app-refresh", broker_app_refresh_handler)
     app.router.add_post("/broker/project", broker_create_handler)
     # attach is a fixed segment registered before the {action} variable so it
     # routes to the keyring handler, not the start|stop|update|destroy dispatcher

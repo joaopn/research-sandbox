@@ -633,6 +633,91 @@ def load_box_catalog() -> dict[str, dict]:
     return {}
 
 
+# ---------------------------------------------------------------------------
+# App versions a built-in box type's setup names ({{KEY}})
+# ---------------------------------------------------------------------------
+# The host stages the app-pin values (OpenKnowledge's version) into the
+# project's settings folder at create, every start and a first box add; a box
+# whose record carries `pinned_setup: true` has its setup filled from that
+# file at every run, so it installs the version in effect at the project's
+# last start. Never fetched, never guessed: a missing, unreadable or
+# malformed value refuses the run with a structured reply the host turns
+# into fixed text. MIRRORS of rscore (pinned equal): the two patterns, the
+# size cap and the refusal shape.
+APP_PIN_PLACEHOLDER_RE = re.compile(r"\{\{([A-Z][A-Z0-9_]*)\}\}")
+APP_PIN_VERSION_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.]+)?")
+APP_PINS_MAX_BYTES = 4096
+BOX_APP_PINS_EXIT = 3
+
+
+def app_pins_json() -> Path:
+    """The staged app-pin file (a function of ORCH, which tests redirect)."""
+    return ORCH / "app-pins.json"
+
+
+def _refuse_app_pins(name: str, reason: str) -> NoReturn:
+    """Stop this run with the structured app-pin refusal (stdout JSON, exit
+    BOX_APP_PINS_EXIT): `reason` is missing | unreadable | shape |
+    unknown-name. Nothing about the box has changed yet when this is called."""
+    print(json.dumps({"refused": "app-pins", "name": name, "reason": reason}))
+    sys.stdout.flush()
+    raise SystemExit(BOX_APP_PINS_EXIT)
+
+
+def _load_app_pins(name: str) -> dict[str, str]:
+    """The staged app pins, read without following a link or blocking on a
+    FIFO, under APP_PINS_MAX_BYTES; refuses (missing / unreadable) otherwise."""
+    try:
+        fd = os.open(app_pins_json(), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        _refuse_app_pins(name, "missing")
+    except OSError:
+        _refuse_app_pins(name, "unreadable")
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            _refuse_app_pins(name, "unreadable")
+        raw = os.read(fd, APP_PINS_MAX_BYTES + 1)
+    except OSError:
+        _refuse_app_pins(name, "unreadable")
+    finally:
+        os.close(fd)
+    if len(raw) > APP_PINS_MAX_BYTES:
+        _refuse_app_pins(name, "unreadable")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError):
+        _refuse_app_pins(name, "unreadable")
+    if not isinstance(data, dict):
+        _refuse_app_pins(name, "unreadable")
+    return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def _fill_pinned_setup(name: str, setup: str) -> str:
+    """`setup` with every {{KEY}} filled from the staged app pins; refuses on
+    a name the file lacks (unknown-name) or a value that is not a version
+    number (shape). A setup naming none is returned as it is, unread."""
+    if not APP_PIN_PLACEHOLDER_RE.search(setup or ""):
+        return setup
+    pins = _load_app_pins(name)
+
+    def sub(m: "re.Match[str]") -> str:
+        value = pins.get(m.group(1))
+        if value is None:
+            _refuse_app_pins(name, "unknown-name")
+        if not APP_PIN_VERSION_RE.fullmatch(value):
+            _refuse_app_pins(name, "shape")
+        return value
+    return APP_PIN_PLACEHOLDER_RE.sub(sub, setup)
+
+
+def _preset_names_app_pins(preset: "dict | None") -> bool:
+    """Whether a resolved box type is a BUILT-IN whose setup names an app
+    version (only built-ins are ever filled; a custom type's text runs as
+    written)."""
+    return (isinstance(preset, dict) and preset.get("source") == "builtin"
+            and bool(APP_PIN_PLACEHOLDER_RE.search(preset.get("setup") or "")))
+
+
 def resolve_preset(name: str) -> dict:
     """Resolve a preset name against the staged catalog. 'empty' always resolves
     (blank-box floor) even with no staged catalog; anything else must be staged."""
@@ -2618,7 +2703,8 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
              history: dict | None = None,
              web: dict | None = None, share: bool = False,
              harness: dict | None = None,
-             trusted_browser: bool = False, status_bar: bool = True) -> list[dict]:
+             trusted_browser: bool = False, status_bar: bool = True,
+             pinned_setup: bool = False) -> list[dict]:
     """docker run a box in the local inner dockerd. ``browser`` selects the
     Chromium-equipped image; ``agent`` (any staged agent|none): any agent mounts
     the project's MERGED copy-source and exports RS_BOX_AGENT=claude (the baked
@@ -2657,6 +2743,10 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
                 trust_args = ["-e", "RS_BOX_BROWSER=trusted",
                               "--mount", f"type=bind,source={policy},"
                                          f"target={MANAGED_SETTINGS_IN_BOX},readonly"]
+    # A built-in type's setup that names app versions is filled from the
+    # staged pins first: a refusal here leaves the running box as it is.
+    if pinned_setup:
+        preset_setup = _fill_pinned_setup(name, preset_setup)
     # The box image must already be in the project: RS brings it in (a box add,
     # a project start) and removes it when a start could not bring it up to
     # date. A run never fetches one (`--pull never` below), and the container
@@ -2998,6 +3088,24 @@ def _rerun_box(name: str, entry: dict) -> list[dict]:
     if preset is not None:
         _write_mcp_preset(ws, preset)
         _write_greeting(ws, preset)
+    # A box of a built-in type whose setup now names an app version, created
+    # before RS kept that version up to date: its record's setup carries the
+    # literal version it was made with. Once, its setup (only its setup — the
+    # rest of the record stays as created) becomes the built-in type's current
+    # one and the record is marked, so every run from now on installs the
+    # version in effect. Literal `is True`: the record is project-writable.
+    if entry.get("pinned_setup") is not True and _preset_names_app_pins(preset):
+        healed = (preset.get("setup") or "").strip()
+        entries = load()
+        if isinstance(entries.get(name), dict):
+            entries[name]["preset_setup"] = healed
+            entries[name]["pinned_setup"] = True
+            save(entries)
+        entry = dict(entry, preset_setup=healed, pinned_setup=True)
+    # Checked before the record's pending marks are cleared below: a refused
+    # re-run leaves them owed (and the box untouched — _run_box fills again).
+    if entry.get("pinned_setup") is True:
+        _fill_pinned_setup(name, entry.get("preset_setup") or "")
     is_dev = bool(entry.get("dev"))
     if entry.get("model_pending") or entry.get("status_bar_pending"):
         # This run lays the entry's pair and status bar into the fresh home:
@@ -3019,6 +3127,7 @@ def _rerun_box(name: str, entry: dict) -> list[dict]:
              # Snapshot from the entry (a recreate wipes the fs + the run-once
              # sentinel, so the setup must re-run on the fresh filesystem).
              preset_setup=entry.get("preset_setup") or "",
+             pinned_setup=entry.get("pinned_setup") is True,
              dev=(_dev_run_info(entry["repo"], entry.get("gitea_user") or "")
                   if is_dev else None),
              dev_subnet=entry.get("dev_subnet") or "",
@@ -3238,6 +3347,11 @@ def cmd_create(args: argparse.Namespace) -> None:
     # path (the project's Add-box window) stages it; a direct in-supervisor run
     # is the power path — stage ~/.rs-box-env/<name>.env yourself.
     preset_setup = (preset.get("setup") or "").strip()
+    pinned_setup = _preset_names_app_pins(preset)
+    # The app versions are checked here, before any write (workspace, mailbox,
+    # record): a refused add leaves nothing behind.
+    if pinned_setup:
+        _fill_pinned_setup(name, preset_setup)
     if preset.get("fields"):
         if not (Path.home() / ".rs-box-env" / f"{name}.env").is_file():
             die(f"this box type takes input fields, but no env file is staged "
@@ -3328,6 +3442,10 @@ def cmd_create(args: argparse.Namespace) -> None:
         # a recreate — which wipes the container fs and the run-once sentinel —
         # re-runs the setup on the fresh filesystem.
         entry["preset_setup"] = preset_setup
+    if pinned_setup:
+        # A built-in type naming app versions: the snapshot stays unfilled and
+        # every run fills it from the pins staged at the project's last start.
+        entry["pinned_setup"] = True
     if fetch:
         # Persisted so _rerun_box re-applies the add-host + re-copies the fetch
         # halves on every restart/recreate (docker run wiring is fixed at run),
@@ -3386,7 +3504,8 @@ def cmd_create(args: argparse.Namespace) -> None:
                         effort=effort, fetch=fetch, node=node, folders=folders,
                         history=history, loopback_ports=loopback_ports,
                         web=web, share=share, harness=harness or None,
-                        status_bar=status_bar, trusted_browser=trusted_browser)
+                        status_bar=status_bar, trusted_browser=trusted_browser,
+                        pinned_setup=pinned_setup)
     out = {"name": name, "ip": ip, "preset": args.preset,
            "browser": browser, "browser_trusted": trusted_browser,
            "agent": agent, "editor": editor,
@@ -4263,7 +4382,12 @@ def cmd_list(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="rs-sandbox",
-        description="Sandbox-project box lifecycle (runs inside the supervisor).")
+        # "app_pins": this tool fills a built-in type's app versions from the
+        # staged app-pins file — the token rscore's box-add gate looks for
+        # (BOX_APP_PINS_HELP_TOKEN). Keep it in this text, hyphen-free: help
+        # wrapping may break a line at a hyphen and split the token.
+        description="Sandbox-project box lifecycle (runs inside the supervisor); "
+                    "fills app versions (app_pins).")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     c = sub.add_parser("create", help="spin an isolated box")

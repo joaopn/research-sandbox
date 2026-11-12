@@ -85,7 +85,7 @@ That's the **research** workflow. Leaner ones exist too — disposable docker-in
 `research webui start` serves a single-page app over HTTPS. With the **broker** running it's a full control plane; with it stopped it's a read-only terminal surface. It's the recommended way to drive everything short of authoring images.
 
 - **Workflow store.** New Project opens a grid of clickable workflow cards (Research / Base / Store) over the page. Click one → a prefilled create form → live progress as the project comes up. Per-card **Explain** docs deep-link the learning material (or the repo's README, for store cards).
-- **Sandboxes page.** Its Management tab lists the host's live projects in a sortable table and drives the **whole** lifecycle — create / start / stop / update / destroy / attach — each long op streaming a progress checklist. `destroy` requires typing the name *and* re-entering the management password (step-up). Its **Infrastructure** tab holds the pass-through ports and the shared services (Gitea, the reviewer); its **Software** tab the agent and editor downloads, the image fleet and the version pins.
+- **Sandboxes page.** Its Management tab lists the host's live projects in a sortable table and drives the **whole** lifecycle — create / start / stop / update / destroy / attach — each long op streaming a progress checklist. `destroy` requires typing the name *and* re-entering the management password (step-up). Its **Infrastructure** tab holds the pass-through ports and the shared services (Gitea, the reviewer); its **Software** tab the agent and editor downloads, the image fleet, the version pins, and the apps RS's own project and box types install (OpenKnowledge: check npm for a newer release and move every OpenKnowledge project and box to it at its next start).
 - **Per-project config (the ⚙ gear).** Show/hide terminal tabs, toggle the editor, and — on DIND projects — manage **boxes** (add/remove disposable sub-boxes with a preset + agent/editor/MCP toggles).
 - **Terminals + editor.** In-browser ssh/byobu terminals per service (xterm + host-key TOFU + Ctrl-F search) and the code-server editor in an iframe, plus a split-pane to pin one service beside another.
 - **Auth.** A client-side **vault password** encrypts your project bookmarks *in the browser* (never sent to the server). A separate **management password** (`broker passwd`) logs the Sandboxes page into the broker; the broker token lives server-side behind an opaque cookie. Signing in to **Claude** is still per-project (interactive `/login` inside the supervisor).
@@ -282,7 +282,7 @@ python research.py project worker enable | disable | stop | start | list | statu
 research-sandbox/
 ├── research.py                   Host CLI (Python stdlib only)
 ├── docker-compose.yml            Router + webui services
-├── versions.env                  Image / dist version pins
+├── versions.env                  Image / dist / app version pins
 ├── .env / .env.example           Host config (PROJECTS_DIR, SANDBOX_DNS, defaults)
 ├── workflows/*.json              Workflow manifests (research, sandbox-dind, sandbox, store)
 ├── boxes/*.json                  Box presets (empty, websearcher, data-wrangler, byo)

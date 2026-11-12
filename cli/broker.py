@@ -629,6 +629,28 @@ def _verb_reader_refresh_check(_args: dict, _progress=None) -> dict:
             "downgrade": rscore.refresh_target(current, latest) != latest}
 
 
+# An app pin (rscore.APP_PINS — OpenKnowledge): nothing to build, so the
+# check and the write are both inline. The check is a host-side npm GET
+# of npm's small `latest` manifest under one total deadline
+# (rscore._npm_latest_bounded, inside the webui's relay window);
+# the write re-resolves upstream itself and applies refresh_target — no
+# version ever crosses from the browser, only the key (APP_REFRESH_WEBUI_FIELDS).
+# The write is a _PIN_WRITE_VERBS member: refused while a pin-writing build
+# is in flight. Every failure is a pathless ValidationError in rscore.
+def _verb_app_refresh_check(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in APP_REFRESH_WEBUI_FIELDS}
+    key = safe.get("key")
+    current, latest = rscore.app_refresh_check(key)
+    return {"key": key, "label": rscore.APP_PINS[key]["label"],
+            "current": current, "latest": latest,
+            "downgrade": rscore.refresh_target(current, latest) != latest}
+
+
+def _verb_app_refresh(args: dict, _progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in APP_REFRESH_WEBUI_FIELDS}
+    return rscore.app_refresh(safe.get("key"))
+
+
 def _verb_op_full_tail(args: dict, _progress=None) -> dict:
     """Token-gated tail of a build op's HOST-ONLY full log — the raw docker/build
     firehose that carries host paths, deliberately never mounted, served ONLY
@@ -1245,6 +1267,8 @@ MCP_WIRING_WEBUI_FIELDS = frozenset({"project"})
 # version" button). One name-shaped token; the request refuses anything that is
 # not a resettable pin of the tracked versions.env.
 PIN_RESET_WEBUI_FIELDS = frozenset({"key"})
+# The app-pin check and write take the key alone (never a version).
+APP_REFRESH_WEBUI_FIELDS = frozenset({"key"})
 # The build-lane verbs that WRITE versions.local.env (each refresh calls
 # rscore._set_version_pin, a read-modify-write of the whole file). A pin reset
 # landing between one's read and write would be silently undone, or would undo
@@ -1253,7 +1277,7 @@ PIN_RESET_WEBUI_FIELDS = frozenset({"key"})
 _PIN_WRITING_BUILD_VERBS = frozenset({"agent_refresh", "editor_refresh",
                                       "reader_refresh"})
 # Inline verbs that write versions.local.env and so wait for the verbs above.
-_PIN_WRITE_VERBS = frozenset({"pin_reset"})
+_PIN_WRITE_VERBS = frozenset({"pin_reset", "app_refresh"})
 
 
 def _verb_dev_repo_remove(args: dict, progress=None) -> dict:
@@ -1447,6 +1471,8 @@ VERBS = {
     "pin_reset": _verb_pin_reset,
     "software_status": _verb_software_status,
     "agent_refresh_check": _verb_agent_refresh_check,
+    "app_refresh_check": _verb_app_refresh_check,
+    "app_refresh": _verb_app_refresh,
     "editor_refresh_check": _verb_editor_refresh_check,
     "reader_refresh_check": _verb_reader_refresh_check,
     "op_full_tail": _verb_op_full_tail,
