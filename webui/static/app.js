@@ -46,10 +46,10 @@ const RAIL_WIDTH_DEFAULT = 200;
 // status strip. Same posture as COLUMN_MIN_FRAC.
 const RAIL_WIDTH_MIN = 80;
 const RAIL_WIDTH_MAX = 480;
-// The ⚙ project settings panel's width and height after the operator dragged
-// its corner (one size for every project's panel; the defaults live in
-// style.css). Kept apart, so a panel only ever dragged wider still follows
-// its content's height.
+// The ⚙ project window's width and height after the operator dragged its
+// corner (one size for every project's window; the defaults live in
+// style.css). Kept apart, so a window only ever dragged wider keeps the
+// default height.
 const CONFIG_PANEL_WIDTH_KEY = "rs-webui-config-panel-width";
 const CONFIG_PANEL_HEIGHT_KEY = "rs-webui-config-panel-height";
 const PBKDF2_ITERATIONS = 600000;
@@ -1637,8 +1637,8 @@ function ensureProjectsTab() {
 // drawer CLOSES it instead of typing into a half-visible terminal. Mirrors
 // installRailOutsideClickHandlers' exclusion walk — the drawer itself, the
 // chip (its own onclick toggles; firing here too would double-toggle), the
-// per-row config gear + its floating box, and any modal all keep the drawer
-// open. Known accepted edge: taps INSIDE an iframe (reader) don't bubble to
+// per-row config gear (its ⚙ window closes the drawer as it opens), and any
+// modal all keep the drawer open. Known accepted edge: taps INSIDE an iframe (reader) don't bubble to
 // the document and won't close the drawer.
 function installMobileProjectsOutsideClose() {
     document.addEventListener("pointerdown", (ev) => {
@@ -1651,7 +1651,6 @@ function installMobileProjectsOutsideClose() {
             if (node.classList.contains("project-rail")) return;
             if (node.classList.contains("active-project")) return;
             if (node.classList.contains("project-config-btn")) return;
-            if (node.classList.contains("project-config-box")) return;
             if (node.classList.contains("modal-backdrop")) return;
         }
         setMobileProjectsView(false);
@@ -1966,7 +1965,7 @@ function openHostPage(page) {
 
 function openSandboxes() { openHostPage("sandboxes"); }
 
-// ---- floating boxes: New Project and Settings --------------------------------
+// ---- floating boxes: New Project, Settings and a project's ⚙ window ----------
 // A panel centred over whatever is open, on a dimmed backdrop; opening one
 // changes no page and no project. Closed by its ✕, Escape, or a click on the
 // dim. The backdrop is .float-backdrop, NOT .modal-backdrop, on purpose: every
@@ -1981,7 +1980,10 @@ function openSandboxes() { openHostPage("sandboxes"); }
 // started while Explain was open only closes Explain. Both listeners are
 // document CAPTURE listeners registered at open, so they run before Explain's
 // (which re-registers at every Explain open) and see Explain still open.
-let floatBox = null;   // {kind, backdrop, onKey, onDown, explainAtDown, downOnBackdrop}
+//
+// A box that holds listeners of its own (the ⚙ window's size watcher) sets
+// `onClose` on the record after opening; every close path runs it.
+let floatBox = null;   // {kind, backdrop, onKey, onDown, explainAtDown, downOnBackdrop, onClose}
 
 function closeFloatBox() {
     if (!floatBox) return;
@@ -1990,6 +1992,7 @@ function closeFloatBox() {
     fb.backdrop.remove();
     document.removeEventListener("keydown", fb.onKey, true);
     document.removeEventListener("pointerdown", fb.onDown, true);
+    if (fb.onClose) fb.onClose();
 }
 
 function openFloatBox(kind, title, render) {
@@ -9370,7 +9373,8 @@ function renderWorkflowsScreen(view, result) {
 // A workflow's Explain button opens its baked learning doc (static HTML with an
 // inline interactive SVG) as a FLOATING box centered over the page, dismissed on
 // an outside click or Escape — not a persistent host-page tab. Same outside-click
-// discipline as the project config box (pointerdown capture + composedPath).
+// discipline as the rail's outside-click handler (pointerdown capture +
+// composedPath).
 
 let explainBox = null;
 
@@ -9565,8 +9569,8 @@ function boxOpView() { return el("div"); }
 // After a box add/remove: the supervisor updated extensions.json, so the project's
 // tab set changed. Invalidate the cached services and, if the project is open,
 // re-activate it to surface the new / removed box-term tab. The box list itself
-// re-loads on the next config-box open (the config box is dismissed when the op
-// modal takes a pointer-down).
+// re-loads on the next ⚙ open (a dialog the ⚙ window opened closes the window
+// when its change finishes).
 async function refreshAfterBoxChange(project) {
     // Re-activate only when the project's own view is what is on screen: this
     // also runs when an update finishes in the background, and re-activating
@@ -10538,7 +10542,7 @@ function makeProjectRow(project) {
     }, ["⚙"]);
     configBtn.onclick = (ev) => {
         ev.stopPropagation();
-        openProjectConfigBox(project, configBtn);
+        openProjectConfigBox(project);
     };
     // "starting…" / "stopping…" / "updating…" / "queued…" while a lifecycle-lane
     // op is in flight for this project (paintLifecycleLabels keeps it current).
@@ -11764,7 +11768,7 @@ async function activateProject(name, opts) {
     }
 }
 
-// ---- per-project config box (tab visibility, future settings) --------------
+// ---- per-project ⚙ window (tab visibility and the project's settings) -------
 
 // `hidden_services` on the vault project entry lists service ids the user
 // hid via the config box. Visibility is a pure client-side filter — the
@@ -11779,215 +11783,147 @@ function visibleServiceIds(projectName, enabled) {
     return visible.length > 0 ? visible : ids;
 }
 
-let projectConfigBox = null;
-// Watches the open panel for a drag of its corner, to remember its width and height (and to re-stack the boxes for a new width).
-let projectConfigResize = null;
-
-function closeProjectConfigBox() {
-    if (!projectConfigBox) return;
-    if (projectConfigResize) { projectConfigResize.disconnect(); projectConfigResize = null; }
-    projectConfigBox.remove();
-    projectConfigBox = null;
-    document.removeEventListener("pointerdown", onConfigOutsidePointer, true);
+// The project ⚙ window (maintainer 2026-11-12): a floating box centred over
+// the page, its sections listed down the left (a row across the top on a
+// phone) and the one picked shown on the right. A steady size whichever
+// section shows (a taller one scrolls inside); the corner drags it, and the
+// dragged size is remembered for every project's window. Closed like the other
+// floating boxes (✕, Escape, the dim); a section's dialog opens above it and
+// closes it when its change finishes, so a section never shows stale state.
+// With a name, only that project's window closes: a change sent to the
+// background can finish while another project's window is open.
+function closeProjectConfigBox(name) {
+    if (!floatBox || floatBox.kind !== "project-config") return;
+    if (name !== undefined && floatBox.project !== name) return;
+    closeFloatBox();
 }
 
-// Capture-phase outside-click dismiss. Excludes the box itself and any
-// config gear (the gear's own click toggles the box; letting this close it
-// first would make the gear a no-op while one is open).
-function onConfigOutsidePointer(ev) {
-    if (!projectConfigBox) return;
-    const path = ev.composedPath ? ev.composedPath() : [];
-    for (const node of path) {
-        if (node === projectConfigBox) return;
-        if (node && node.classList && node.classList.contains("project-config-btn")) return;
-    }
-    closeProjectConfigBox();
-}
+function openProjectConfigBox(project) {
+    openFloatBox("project-config", project.name, (view) => {
+        view.innerHTML = "";
+        view.appendChild(makeProjectConfigBox(project));
+    });
+    const fb = floatBox;
+    fb.project = project.name;
+    const card = fb.backdrop.firstChild;
+    // The section styles are scoped under this class (style.css), and the
+    // rail's outside-press handler keeps an expanded rail open for a press
+    // inside it.
+    card.classList.add("project-config-box");
+    card.dataset.project = project.name;
+    // The phone window is the full-width sheet: no drag corner, no pinning.
+    if (mobileModeActive()) return;
 
-function openProjectConfigBox(project, anchorEl) {
-    // Toggle: a second click on the same row's gear closes the box; a click
-    // on a different row's gear swaps to that project's box.
-    const wasForThis = projectConfigBox && projectConfigBox.dataset.project === project.name;
-    closeProjectConfigBox();
-    if (wasForThis) return;
-
-    const box = makeProjectConfigBox(project);
-    box.dataset.project = project.name;
-    // The width and height the operator last dragged the panel to, each
-    // shrunk to the window (desktop only: the phone panel has no drag
-    // corner). Applied BEFORE the first place(), which reads the size.
-    // `applied` holds the inline sizes this code set; `last` holds the inline
-    // sizes the observer below has accounted for (this code's own, a saved
-    // drag, place()'s shrink), so it saves only a drag, never these.
-    const mobile = mobileModeActive();
-    const applied = { width: "", height: "" };
-    if (!mobile) {
-        const remembered = (key, room) => {
-            let saved = NaN;
-            try { saved = parseInt(localStorage.getItem(key) || "", 10); }
-            catch (e) { /* storage blocked: the default size */ }
-            return Number.isFinite(saved) && saved > 0 ? `${Math.min(saved, room)}px` : "";
-        };
-        applied.width = remembered(CONFIG_PANEL_WIDTH_KEY, window.innerWidth - 16);
-        applied.height = remembered(CONFIG_PANEL_HEIGHT_KEY, window.innerHeight - 16);
-        if (applied.width) box.style.width = applied.width;
-        if (applied.height) box.style.height = applied.height;
-    }
+    // The width and height the operator last dragged the window to, each
+    // shrunk to the room on screen; applied BEFORE the first place(), which
+    // reads the size. `last` holds the inline sizes the observer below has
+    // accounted for (these, a saved drag, place()'s shrinks), so it saves a
+    // drag and never a size this code wrote.
+    const remembered = (key, room) => {
+        let saved = NaN;
+        try { saved = parseInt(localStorage.getItem(key) || "", 10); }
+        catch (e) { /* storage blocked: the default size */ }
+        return Number.isFinite(saved) && saved > 0 ? `${Math.min(saved, room)}px` : "";
+    };
+    const applied = {
+        width: remembered(CONFIG_PANEL_WIDTH_KEY, window.innerWidth - 16),
+        height: remembered(CONFIG_PANEL_HEIGHT_KEY, window.innerHeight - 16),
+    };
+    if (applied.width) card.style.width = applied.width;
+    if (applied.height) card.style.height = applied.height;
     const last = { width: applied.width, height: applied.height };
-    document.body.appendChild(box);
-    projectConfigBox = box;
 
-    // position: fixed, anchored under the gear, clamped to the viewport. The
-    // rail can shrink to RAIL_WIDTH_MIN, so the box overlays outside the
-    // rail rather than trying to fit inside it. The gear's spot is read once:
-    // a rail rebuild while the box is open may detach the gear itself.
-    const r = anchorEl.getBoundingClientRect();
-    // The box is capped to the room left below its top (style.css reads
-    // --config-room), so sections that load or unfold later scroll inside it
-    // instead of running off the window; the cap is lifted while measuring.
-    const place = () => {
-        // A drag pushed past the window's right or bottom edge leaves an
-        // inline size larger than the panel shows (the caps below hold it):
-        // bring it back to the shown size before the caps are lifted, or
-        // measuring would grow the panel to a size the operator never saw
-        // (and the observer would save it). The same shrink follows a window
-        // made smaller while the panel is open: not a drag, so `last` takes it
-        // and the remembered size stays.
-        if (box.style.width && box.offsetWidth < parseFloat(box.style.width)) {
-            box.style.width = `${box.offsetWidth}px`;
-            last.width = box.style.width;
-        }
-        if (box.style.height && box.offsetHeight < parseFloat(box.style.height)) {
-            box.style.height = `${box.offsetHeight}px`;
-            last.height = box.style.height;
-        }
-        box.style.removeProperty("--config-room");
-        box.style.removeProperty("--config-room-w");
-        const bw = box.offsetWidth;
-        const bh = box.offsetHeight;
-        let left = r.left;
-        let top = r.bottom + 4;
-        if (left + bw > window.innerWidth - 8) left = window.innerWidth - 8 - bw;
-        if (left < 8) left = 8;
-        if (top + bh > window.innerHeight - 8) top = Math.max(8, r.top - 4 - bh);
-        box.style.left = `${Math.round(left)}px`;
-        box.style.top = `${Math.round(top)}px`;
-        box.style.setProperty("--config-room",
-                              `${Math.max(0, Math.round(window.innerHeight - 8 - top))}px`);
-        // A drag of the corner stops at the window's right edge.
-        box.style.setProperty("--config-room-w",
-                              `${Math.max(0, Math.round(window.innerWidth - 8 - left))}px`);
-    };
-    // Stack the boxes for the panel's width (it is attached, so they measure),
-    // then place the panel.
-    const grid = box.querySelector(".config-boxes");
-    const reflow = () => {
-        if (grid) layoutConfigFolds(grid);
-        place();
-    };
-    reflow();
-    // Unfolding or folding a box changes its height: stack again and place the
-    // panel again (this runs after the fold's own click handler, which is set
-    // first), so it can move up to show what unfolded.
-    for (const head of box.querySelectorAll(".config-fold > .box-collapse-head")) {
-        head.addEventListener("click", reflow);
-    }
-    // A drag of the corner writes the panel's inline width and/or height:
-    // stack the boxes again for a new width (not placed again, so the panel
-    // stays under the pointer), and remember each side the drag changed as
-    // rendered (a drag pushed past the window edge is capped on screen).
-    if (!mobile && typeof ResizeObserver === "function") {
-        // Keyed on the panel's outer width, which a scrollbar does not change:
-        // keyed on the inner width, a re-stack that adds or drops the
-        // scrollbar would change the column count again, every frame.
-        let panelWidth = box.offsetWidth;
-        projectConfigResize = new ResizeObserver(() => {
-            if (grid && box.offsetWidth !== panelWidth) {
-                panelWidth = box.offsetWidth;
-                layoutConfigFolds(grid);
+    // Pin the window in px (style.css makes it position: fixed): centred at
+    // open, then its top-left stays put, so a drag of the corner grows it
+    // right and down instead of re-centring under the pointer. The caps
+    // (--config-room-w/-h) stop a drag at the window's right and bottom edges.
+    const place = (centre) => {
+        // An inline size larger than what shows (a drag held by the caps, or a
+        // window made smaller) comes back to the shown size before the caps
+        // are lifted, or measuring would show a size the operator never saw.
+        // Not a drag, so `last` takes it and the remembered size stays.
+        for (const [side, shown] of [["width", card.offsetWidth], ["height", card.offsetHeight]]) {
+            if (card.style[side] && shown < parseFloat(card.style[side])) {
+                card.style[side] = `${shown}px`;
+                last[side] = card.style[side];
             }
-            for (const [side, key, size] of [["width", CONFIG_PANEL_WIDTH_KEY, box.offsetWidth],
-                                             ["height", CONFIG_PANEL_HEIGHT_KEY, box.offsetHeight]]) {
-                if (!box.style[side] || box.style[side] === last[side]) continue;
-                last[side] = box.style[side];
+        }
+        card.style.removeProperty("--config-room-w");
+        card.style.removeProperty("--config-room-h");
+        const w = card.offsetWidth;
+        const h = card.offsetHeight;
+        let left = centre ? (window.innerWidth - w) / 2 : parseFloat(card.style.left) || 8;
+        let top = centre ? (window.innerHeight - h) / 2 : parseFloat(card.style.top) || 8;
+        left = Math.max(8, Math.min(left, window.innerWidth - 8 - w));
+        top = Math.max(8, Math.min(top, window.innerHeight - 8 - h));
+        card.style.left = `${Math.round(left)}px`;
+        card.style.top = `${Math.round(top)}px`;
+        card.style.setProperty("--config-room-w",
+                               `${Math.max(0, Math.round(window.innerWidth - 8 - left))}px`);
+        card.style.setProperty("--config-room-h",
+                               `${Math.max(0, Math.round(window.innerHeight - 8 - top))}px`);
+    };
+    place(true);
+    // A window resized while the box is open keeps it on screen (same corner,
+    // moved in only as far as needed).
+    const onResize = () => place(false);
+    window.addEventListener("resize", onResize);
+
+    // A drag of the corner writes the inline width and/or height: remember
+    // each side whose inline size the drag wrote (a browser may write both),
+    // as rendered (a drag held by a cap is saved at the capped size).
+    let watcher = null;
+    if (typeof ResizeObserver === "function") {
+        watcher = new ResizeObserver(() => {
+            for (const [side, key, size] of [["width", CONFIG_PANEL_WIDTH_KEY, card.offsetWidth],
+                                             ["height", CONFIG_PANEL_HEIGHT_KEY, card.offsetHeight]]) {
+                if (!card.style[side] || card.style[side] === last[side]) continue;
+                last[side] = card.style[side];
                 try { localStorage.setItem(key, String(Math.round(size))); }
-                catch (e) { /* storage blocked: the size lasts until the panel closes */ }
+                catch (e) { /* storage blocked: the size lasts until the window closes */ }
             }
         });
-        projectConfigResize.observe(box);
+        watcher.observe(card);
     }
-
-    document.addEventListener("pointerdown", onConfigOutsidePointer, true);
-}
-
-// Stack the panel's boxes masonry-style (maintainer 2026-11-07): as many
-// columns as the width fits at --config-box-min each (style.css; one on a
-// phone), and each box, in the panel's order, into the column that is
-// shortest at that moment (the leftmost on a tie). A box's place depends only
-// on the boxes before it, so unfolding one never moves it, only those after.
-// Re-run whenever a box folds or unfolds and whenever the width changes;
-// moving the nodes keeps every control's value (there are no frames inside),
-// but a moved node loses focus and emptying the columns scrolls the panel to
-// the top, so both are put back afterwards.
-function layoutConfigFolds(container) {
-    const folds = container.__folds || [];
-    const panel = container.parentNode;
-    const scrolled = panel ? panel.scrollTop : 0;
-    const act = document.activeElement;
-    const inside = !!act && act !== document.body && container.contains(act);
-    let selStart = null, selEnd = null;
-    if (inside) {
-        try { selStart = act.selectionStart; selEnd = act.selectionEnd; }
-        catch (e) { /* not a text control */ }
-    }
-    const cs = getComputedStyle(container);
-    const min = parseFloat(cs.getPropertyValue("--config-box-min"));
-    const gap = parseFloat(cs.getPropertyValue("--config-gap")) || 0;
-    const n = min > 0 ? Math.max(1, Math.floor((container.clientWidth + gap) / (min + gap))) : 1;
-    const cols = [];
-    for (let i = 0; i < n; i++) cols.push(el("div", { class: "config-col" }));
-    container.replaceChildren(...cols);
-    const heights = cols.map(() => 0);
-    for (const f of folds) {
-        let k = 0;
-        for (let i = 1; i < n; i++) if (heights[i] < heights[k]) k = i;
-        cols[k].appendChild(f);
-        heights[k] = cols[k].offsetHeight;
-    }
-    if (panel) panel.scrollTop = scrolled;
-    if (inside && document.activeElement !== act && container.contains(act)) {
-        act.focus({ preventScroll: true });
-        if (selStart !== null && selEnd !== null) {
-            try { act.setSelectionRange(selStart, selEnd); }
-            catch (e) { /* not a text control */ }
-        }
-    }
-}
-
-// The panel is a set of folded boxes (maintainer 2026-11-07): Tabs and
-// Extensions open, Agents, Sharing, Ports and Sidebar folded, in that order,
-// stacked into columns by layoutConfigFolds once the panel is on screen. Each
-// box is as wide as style.css allows, so a panel dragged wide shows them side
-// by side. Every section builder below fills the BODY of its box. Which boxes
-// are open is not remembered.
-function makeProjectConfigBox(project) {
-    const panel = el("div", { class: "project-config-box" });
-    panel.appendChild(el("div", { class: "config-title" }, [project.name]));
-    const folds = el("div", { class: "config-boxes" });
-    // The boxes in the panel's order: layoutConfigFolds reads it, since the
-    // columns hold them in a different order.
-    folds.__folds = [];
-    panel.appendChild(folds);
-    const fold = (title, name, open) => {
-        const f = collapsibleBox(title, [], "config-fold-" + name, "config-fold");
-        setCollapsibleOpen(f, open);
-        folds.appendChild(f);
-        folds.__folds.push(f);
-        return f.children[1];
+    fb.onClose = () => {
+        window.removeEventListener("resize", onResize);
+        if (watcher) watcher.disconnect();
     };
+}
+
+// The window's content: the section list and one pane per section, Tabs,
+// Extensions, Agents, Sharing, Ports and Sidebar in that order (the short
+// form, for a project whose tabs never loaded: Tabs, Sharing, Ports,
+// Sidebar). It opens on Tabs; which section was picked is not remembered.
+// Every pane is built at open (the hidden ones are display:none), so each
+// section loads as it did when it was a folded box. Every section builder
+// below fills its pane.
+function makeProjectConfigBox(project) {
+    const tabs = el("div", { class: "config-tabs", role: "tablist" });
+    const panes = el("div", { class: "config-panes" });
+    const sections = [];
+    const select = (name) => {
+        for (const s of sections) {
+            const on = s.name === name;
+            s.tab.classList.toggle("active", on);
+            s.tab.setAttribute("aria-selected", on ? "true" : "false");
+            s.pane.style.display = on ? "" : "none";
+        }
+    };
+    const pane = (title, name) => {
+        const tab = el("button", { type: "button", class: "config-tab config-tab-" + name,
+                                   role: "tab" }, [title]);
+        const p = el("div", { class: "config-pane config-pane-" + name, role: "tabpanel" });
+        tab.onclick = () => select(name);
+        sections.push({ name, tab, pane: p });
+        tabs.appendChild(tab);
+        panes.appendChild(p);
+        return p;
+    };
+    const layout = el("div", { class: "config-layout" }, [tabs, panes]);
 
     const section = el("div", { class: "config-section" });
-    const tabsBox = fold("Tabs", "tabs", true);
+    const tabsBox = pane("Tabs", "tabs");
 
     const enabled = state.projectServices[project.name];
     if (!enabled || Object.keys(enabled).length === 0) {
@@ -11995,13 +11931,14 @@ function makeProjectConfigBox(project) {
             "No tabs yet — open this project once to load its services.",
         ]));
         tabsBox.appendChild(section);
-        appendSharingSection(fold("Sharing", "sharing", false), project, null);
+        appendSharingSection(pane("Sharing", "sharing"), project, null);
         // Ports render even with no tabs loaded — register before you start serving.
-        const portsBox = fold("Ports", "ports", false);
+        const portsBox = pane("Ports", "ports");
         appendExportedPortsSection(portsBox, project);
         appendDetectedAppsSection(portsBox, project);
-        appendSidebarSection(fold("Sidebar", "sidebar", false), project);
-        return panel;
+        appendSidebarSection(pane("Sidebar", "sidebar"), project);
+        select("tabs");
+        return layout;
     }
 
     const hidden = new Set(project.hidden_services || []);
@@ -12038,14 +11975,15 @@ function makeProjectConfigBox(project) {
     tabsBox.appendChild(el("div", { class: "config-hint" }, [
         "Hidden tabs stay enabled on the supervisor — this only controls what shows here.",
     ]));
-    appendEditorExtensionSection(fold("Extensions", "extensions", true), project, enabled);
-    appendAgentsBox(fold("Agents", "agents", false), project, enabled);
-    appendSharingSection(fold("Sharing", "sharing", false), project, enabled);
-    const portsBox = fold("Ports", "ports", false);
+    appendEditorExtensionSection(pane("Extensions", "extensions"), project, enabled);
+    appendAgentsBox(pane("Agents", "agents"), project, enabled);
+    appendSharingSection(pane("Sharing", "sharing"), project, enabled);
+    const portsBox = pane("Ports", "ports");
     appendExportedPortsSection(portsBox, project);
     appendDetectedAppsSection(portsBox, project);
-    appendSidebarSection(fold("Sidebar", "sidebar", false), project);
-    return panel;
+    appendSidebarSection(pane("Sidebar", "sidebar"), project);
+    select("tabs");
+    return layout;
 }
 
 // The ⚙ Agents box (I33 slice 3): what the create dialog's Agents box chose,
@@ -12066,7 +12004,7 @@ const AGENTS_BOX_CLAUDE_MODEL = /^[A-Za-z0-9][A-Za-z0-9._\[\]-]*$/;
 let agentsBoxSeq = 0;
 
 function appendAgentsBox(box, project, enabled) {
-    // `box` is the panel's Agents box (makeProjectConfigBox).
+    // `box` is the window's Agents pane (makeProjectConfigBox).
     const content = el("div", {}, [el("div", { class: "config-empty" }, ["Loading…"])]);
     box.appendChild(content);
     // The Box agents section's place (filled from the same read below).
@@ -12649,7 +12587,7 @@ function agentsBoxApply(name, d, f) {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
         }),
-        onDone: (ok) => { if (ok) closeProjectConfigBox(); },
+        onDone: (ok) => { if (ok) closeProjectConfigBox(name); },
     });
 }
 
@@ -12717,6 +12655,9 @@ async function mgmtAgentsUpdateDialog(name, deployed, hasBoxes, local) {
         request: () => fetch(`/broker/project/${encodeURIComponent(name)}/agents_update`, {
             method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
         }),
+        // The ⚙ window under this dialog shows the state from before the
+        // update: close it, as Apply does.
+        onDone: (ok) => { if (ok) closeProjectConfigBox(name); },
     });
 }
 
@@ -12735,7 +12676,7 @@ async function mgmtAgentsUpdateDialog(name, deployed, hasBoxes, local) {
 // or not. A tail-only append would hide the affordance in half the cases it
 // exists for — including the reported one.
 function appendSidebarSection(box, project) {
-    // `box` is the panel's Sidebar box, last and folded (makeProjectConfigBox).
+    // `box` is the window's Sidebar pane, the last section (makeProjectConfigBox).
     const section = el("div", { class: "config-section" });
     const btn = el("button", { class: "btn-small btn-danger" }, ["Remove from sidebar"]);
     btn.onclick = () => removeProjectFromSidebar(project);
@@ -12754,10 +12695,8 @@ function appendSidebarSection(box, project) {
 function removeProjectFromSidebar(project) {
     // A dialog is already open — the guard every other confirm here uses.
     if (document.querySelector(".modal-backdrop")) return;
-    // Close the config box FIRST. It is z-index 200 against the modal's 100 and
-    // is dismissed only by the NEXT pointerdown, so leaving it open floats an
-    // opaque card over the dialog — over its buttons on a narrow viewport —
-    // until the operator's first press.
+    // Close the ⚙ window FIRST: the row it belongs to is leaving the sidebar,
+    // so there is nothing for it to show once this dialog is answered.
     closeProjectConfigBox();
     const name = project.name;
 
@@ -12816,7 +12755,7 @@ function removeProjectFromSidebar(project) {
 // the container — supported on BOTH substrates now (dind via _recreate_supervisor,
 // docker via _recreate_docker_substrate). Universal (renders on every flavor).
 function appendEditorExtensionSection(box, project, enabled) {
-    // `box` is the panel's Extensions box; its title is the heading.
+    // `box` is the window's Extensions pane; its tab is the heading.
     const section = el("div", { class: "config-section" });
     const editorOn = Object.prototype.hasOwnProperty.call(enabled, "code-server");
     const row = el("div", { class: "config-box-row" }, [
@@ -13159,10 +13098,9 @@ async function fillPassthroughList(view, table, warnEl) {
 // ⚙ Sharing: everything that shares folders with the project, in one bordered
 // box on every project (stopped ones and ones whose tabs never loaded too) —
 // the project's own folders, then, on a dind project with boxes, Box folders.
-// It opens folded at every gear open; openProjectConfigBox re-places the panel
-// when it unfolds. `enabled` is null in the panel's short form (no tabs
-// loaded), where only the project's folders show.
-// `box` is the panel's Sharing box (makeProjectConfigBox).
+// `enabled` is null in the window's short form (no tabs loaded), where only
+// the project's folders show.
+// `box` is the window's Sharing pane (makeProjectConfigBox).
 function appendSharingSection(box, project, enabled) {
     appendProjectFoldersSection(box, project);
     if (enabled) appendBoxFoldersSection(box, project, enabled);
@@ -13397,7 +13335,7 @@ function appendBoxFoldersSection(box, project, enabled) {
 }
 
 function appendExportedPortsSection(box, project) {
-    // `box` is the panel's Ports box; its title is the heading (Detected apps
+    // `box` is the window's Ports pane; its tab is the heading (Detected apps
     // follows in the same box, under its own sub-heading).
     const section = el("div", { class: "config-section" });
     const listWrap = el("div", { class: "config-ports-list" });
@@ -13699,7 +13637,13 @@ function mgmtEditorToggle(name, on, isDocker) {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify(on ? { disable: ["code-server"] } : { enable: ["code-server"] }),
         }),
-        onDone: async (ok) => { if (ok) await refreshAfterBoxChange(name); },
+        // The ⚙ window under this dialog still shows the old state (and the
+        // old button): close it before the refresh.
+        onDone: async (ok) => {
+            if (!ok) return;
+            closeProjectConfigBox(name);
+            await refreshAfterBoxChange(name);
+        },
     });
 }
 
@@ -13719,7 +13663,12 @@ function mgmtReaderToggle(name, on) {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify(on ? { disable: ["reader"] } : { enable: ["reader"] }),
         }),
-        onDone: async (ok) => { if (ok) await refreshAfterBoxChange(name); },
+        // As the editor toggle: the ⚙ window under it closes on success.
+        onDone: async (ok) => {
+            if (!ok) return;
+            closeProjectConfigBox(name);
+            await refreshAfterBoxChange(name);
+        },
     });
 }
 

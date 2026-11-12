@@ -344,53 +344,97 @@ body {
 .project-rail .rail-separator.dragging { opacity: 0.4; }
 html.mobile .project-rail .rail-separator { cursor: default; }
 
-/* Per-project floating config box — position: fixed in JS so it overlays
-   outside the (possibly narrow) rail rather than being clipped by it.
-   Its sections sit in folded boxes (.config-fold) stacked into columns
-   (.config-col, built by app.js layoutConfigFolds: as many columns as fit at
-   --config-box-min, each box into the shortest), each column at most
-   --config-box-max wide, so a panel dragged wider (resize, the corner) shows
-   them side by side with no gaps under short boxes.
-   --config-box-min is the old panel's cap, the width every section was laid
-   out for; --config-box-max fits the Agents model cell (260px basis) beside
-   its effort picker on one line. The panel opens one box wide, as tall as
-   its content up to the room on screen (--config-room). The corner drags
-   both ways (maintainer 2026-11-07); openProjectConfigBox remembers a
-   dragged width and height, even a height taller than what is unfolded, and
-   the caps hold the drag inside the window (--config-room-w, --config-room). */
+/* The project ⚙ window (app.js openProjectConfigBox): a floating box whose
+   sections are listed down the left and shown one at a time on the right.
+   The section rules below are scoped under .project-config-box, which the
+   window's card carries (the pass-through form on Management reuses the row
+   classes and must not take these). The window keeps one size whichever
+   section shows; the pane scrolls.
+   Desktop: app.js pins the card in px (position: fixed, centred at open) so
+   the corner drag grows it right and down, and sets --config-room-w/-h to the
+   room right of and below its top-left, which caps a drag at the window
+   edges. Default width: the section list (--config-tabs-w), the 16px gap, a
+   pane as wide as the Agents model cell and its effort picker need on one
+   line (420px) plus a scrollbar's room (20px), and the card's two 24px side
+   paddings. Default height (--config-win-h): a laptop screen's usable height
+   (768px less the browser's chrome) less a margin; a taller section (Agents)
+   scrolls inside it. The minimum width keeps the list beside a pane at the
+   width every section was laid out for (280px), with the same gap and
+   paddings (64px). */
 .project-config-box {
-    --config-box-min: 280px;
-    --config-box-max: 420px;
-    --config-pad: 12px;
-    --config-gap: 8px;
-    position: fixed;
-    z-index: 200;
-    box-sizing: border-box;
-    /* one box plus the panel's padding and 1px borders */
-    width: calc(var(--config-box-max) + 2 * var(--config-pad) + 2px);
-    min-width: calc(var(--config-box-min) + 2 * var(--config-pad) + 2px);
-    max-width: var(--config-room-w, calc(100vw - 16px));
-    resize: both;
-    background: var(--bg-card);
-    border: 1px solid var(--border-strong);
-    border-radius: 6px;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
-    padding: 10px var(--config-pad);
+    --config-tabs-w: 130px;
+    --config-win-w: calc(var(--config-tabs-w) + 16px + 420px + 20px + 48px);
+    --config-win-h: 560px;
     font-size: 13px;
     color: var(--fg-base);
-    /* Scroll rather than run off the bottom: openProjectConfigBox sets
-       --config-room to the room below the box's top (the phone rule below
-       caps it lower). */
-    max-height: var(--config-room, calc(100vh - 16px));
-    overflow-y: auto;
 }
-.project-config-box .config-title {
-    font-weight: 600;
-    margin-bottom: 8px;
-    white-space: nowrap;
+.float-backdrop .float-box.float-project-config {
+    position: fixed;
+    box-sizing: border-box;
+    width: min(var(--config-win-w), calc(100vw - 16px));
+    height: min(var(--config-win-h), calc(100vh - 16px));
+    min-width: calc(var(--config-tabs-w) + 280px + 64px);
+    min-height: 240px;
+    max-width: var(--config-room-w, calc(100vw - 16px));
+    max-height: var(--config-room-h, calc(100vh - 16px));
+    display: flex;
+    flex-direction: column;
     overflow: hidden;
-    text-overflow: ellipsis;
+    resize: both;
 }
+.float-project-config .float-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+}
+.project-config-box .config-layout {
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    gap: 16px;
+}
+.project-config-box .config-tabs {
+    flex: 0 0 var(--config-tabs-w);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    overflow-y: auto;
+    border-right: 1px solid var(--border);
+    padding-right: 8px;
+}
+.project-config-box .config-tab {
+    text-align: left;
+    background: none;
+    border: none;
+    border-radius: 4px;
+    padding: 6px 10px;
+    color: var(--fg-muted);
+    font: inherit;
+    cursor: pointer;
+}
+.project-config-box .config-tab:hover { color: var(--fg-base); background: var(--border); }
+/* The picked section: the active-tab ground with an accent edge on the side
+   that faces its pane (the bottom on a phone, where the list is a row). */
+.project-config-box .config-tab.active {
+    color: var(--fg-base);
+    font-weight: 600;
+    background: var(--bg-active);
+    box-shadow: inset 2px 0 0 var(--fg-accent);
+}
+.project-config-box .config-panes {
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+}
+.project-config-box .config-pane {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-y: auto;
+    padding-right: 4px;
+}
+.project-config-box .config-pane > .config-section + .config-section { margin-top: 10px; }
 .project-config-box .config-section-label {
     font-size: 11px;
     text-transform: uppercase;
@@ -975,7 +1019,8 @@ html.mobile .project-rail .rail-separator { cursor: default; }
     overflow-y: auto;
 }
 
-/* Floating boxes (New Project, Settings): a panel over whatever page is open.
+/* Floating boxes (New Project, Settings, a project's ⚙ window): a panel over
+   whatever page is open.
    z-index 50 — above everything on the page (the terminal search bar is 10,
    the splitters and the rail drop caret below that), below the dialogs (100,
    so the create / import dialogs open on top), the corner notices (90) and
@@ -1798,35 +1843,6 @@ html.mobile .box-collapse-head { padding: 8px 0; }
 }
 html.mobile .project-config-box .config-folders-input { font-size: 16px; }
 .project-config-box .config-box-warn { color: var(--warn-fg); }
-/* The ⚙ panel's boxes (app.js makeProjectConfigBox + layoutConfigFolds):
-   bordered folds stacked in equal columns, each column at most one box wide.
-   Before the stacking runs the folds sit directly in .config-boxes, one per
-   line. The margin is 0 here (not .box-collapsible's) because the gaps space
-   them. */
-.project-config-box .config-boxes {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--config-gap);
-    align-items: flex-start;
-}
-.project-config-box .config-boxes > .config-fold { flex: 1 1 100%; }
-.project-config-box .config-col {
-    flex: 1 1 0;
-    min-width: 0;
-    max-width: var(--config-box-max);
-    display: flex;
-    flex-direction: column;
-    gap: var(--config-gap);
-}
-.project-config-box .config-fold {
-    box-sizing: border-box;
-    margin: 0;
-    padding: 6px 8px;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-}
-.project-config-box .config-fold.open > .box-collapse-head { margin-bottom: 6px; }
-.project-config-box .config-fold .box-collapse-body > .config-section + .config-section { margin-top: 10px; }
 /* Box agents sits under the Agents box's own controls, not beside a section. */
 .project-config-box .config-box-agents { margin-top: 10px; }
 .project-config-box .config-save-row { justify-content: flex-end; }
@@ -2480,18 +2496,33 @@ html.mobile .term-keybar .key.active {
     box-shadow: 0 -2px 0 var(--fg-accent) inset;
 }
 
-/* The per-project ⚙ config box (opened from the Projects view rows) is the
-   mobile enable/disable surface for the whitelisted tabs (Editor/Reader
-   toggles live there). The JS position clamp handles x/y but not height —
-   cap it so its boxes never exceed a phone viewport. One column, no drag
-   corner, and never wider than the screen (the desktop minimum would be). */
-html.mobile .project-config-box {
-    max-height: 70dvh;
-    overflow-y: auto;
+/* The ⚙ window on a phone: the floating boxes' full-width sheet at the
+   screen's height, no drag corner, not pinned; the section list becomes one
+   scrollable row of tabs over the pane (a left column would take a third of a
+   phone's width). It is the mobile enable/disable surface for the
+   whitelisted tabs (Editor/Reader live in Extensions). */
+html.mobile .float-backdrop .float-box.float-project-config {
+    position: static;
     resize: none;
     min-width: 0;
-    width: min(calc(var(--config-box-max) + 2 * var(--config-pad) + 2px), calc(100vw - 16px));
+    min-height: 0;
+    max-width: none;
+    width: 94vw;
+    height: calc(100dvh - 16px);
+    max-height: calc(100dvh - 16px);
 }
+html.mobile .project-config-box .config-layout { flex-direction: column; gap: 10px; }
+html.mobile .project-config-box .config-tabs {
+    flex: 0 0 auto;
+    flex-direction: row;
+    overflow-x: auto;
+    overflow-y: hidden;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    padding: 0 0 6px;
+}
+html.mobile .project-config-box .config-tab { flex: 0 0 auto; white-space: nowrap; }
+html.mobile .project-config-box .config-tab.active { box-shadow: inset 0 -2px 0 var(--fg-accent); }
 
 /* 16px inputs stop iOS Safari's auto-zoom-on-focus (fires below 16px), which
    otherwise leaves the page zoomed after unlocking the vault. */
