@@ -8705,6 +8705,22 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
     const agentPanelsWrap = el("div", { class: "agent-tab-panels" },
         stagedAgents.filter((n) => agentPanels[n]).map((n) => agentPanels[n]));
     const agentsHint = el("div", { class: "hint" });
+    // RS's status bar (#524): one line under the prompt of every agent in the
+    // project container, on by default. Shown only while an agent is on (the
+    // Agents box below hides it otherwise — no control that does nothing).
+    const statusBarCb = el("input", { type: "checkbox" });
+    statusBarCb.checked = true;
+    const statusBarCard = el("div", {
+        class: "box-opt-card selected",
+        title: "A status line under the agent's prompt: its model, how long the " +
+               "prompt cache stays warm, the session's cost split into cache reads, " +
+               "writes and output, and how full the context is. Turned off or on " +
+               "later in the project's ⚙ panel.",
+    }, [el("span", { class: "box-opt-name" }, ["Status bar"])]);
+    statusBarCard.onclick = () => {
+        statusBarCb.checked = !statusBarCb.checked;
+        statusBarCard.classList.toggle("selected", statusBarCb.checked);
+    };
     let activeAgentTab = "";
     const syncAgents = () => {
         if (claudeHeld()) agentChecks.forEach((c) => { if (c.name === "claude") c.cb.checked = true; });
@@ -8734,6 +8750,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             : isDev ? "A dev project needs at least one agent."
             : "No agent: the project starts without one.";
         agentsHint.style.display = agentsHint.textContent ? "" : "none";
+        statusBarCard.style.display = on.length ? "" : "none";
     };
     agentChecks.forEach((c) => {
         c.card.onclick = () => {
@@ -8865,10 +8882,10 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
         // isDocker fork — the docker box is where node-based store
         // workflows (open-knowledge) run.
         el("div", { class: "box-opt-cards" },
-           isDocker ? [editorCard, fetchCard, nodeCard,
+           isDocker ? [editorCard, statusBarCard, fetchCard, nodeCard,
                        ...(showHistory ? [projHistoryCard] : [])]
-                    : (isDev ? [editorCard, readerCard, nodeCard]
-                             : [editorCard, fetchCard, readerCard, nodeCard])),
+                    : (isDev ? [editorCard, statusBarCard, readerCard, nodeCard]
+                             : [editorCard, statusBarCard, fetchCard, readerCard, nodeCard])),
         ...(showHistory ? [projHistoryHint] : []),
     ], "create-extensions");
 
@@ -9122,6 +9139,8 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
                 };
                 const pat = devPatI.value.trim();
                 if (pat) payload.pat = pat;
+                // RS's status bar: sent while an agent is on (its card shows).
+                if (agentChecks.some((c) => c.cb.checked)) payload.status_bar = statusBarCb.checked;
                 if (!editorCb.checked) payload.disable = ["code-server"];
                 // ONE merged enable array (STAGE_NODE_SEED): reader + node must not
                 // clobber each other — the broker drops a field silently, so a second
@@ -9159,6 +9178,8 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             };
             // Editor on by default; unchecking disables the code-server service.
             if (!editorCb.checked) payload.disable = ["code-server"];
+            // RS's status bar: sent while an agent is on (its card shows).
+            if (agentChecks.some((c) => c.cb.checked)) payload.status_bar = statusBarCb.checked;
             // Opt-in rs-fetch — any non-dev workflow (this payload branch never
             // runs for dev, and the card is hidden there). Sent only when checked.
             if (fetchCb.checked) payload.fetch = true;
@@ -9764,6 +9785,8 @@ async function mgmtBoxAddDialog(project) {
         syncAgentModel();
         // The working mode follows the agent (and the preset) the same way.
         syncBoxHarness();
+        // So does the status bar: no agent, no status bar.
+        boxStatusBarCard.style.display = agentS.value && agentS.value !== "none" ? "" : "none";
     }
 
     const editorCb = el("input", { type: "checkbox" });   // box-level toggle, default off
@@ -9772,6 +9795,21 @@ async function mgmtBoxAddDialog(project) {
     editorCard.onclick = () => {
         editorCb.checked = !editorCb.checked;
         editorCard.classList.toggle("selected", editorCb.checked);
+    };
+    // RS's status bar in the box's agents (#524), on by default; shown only for
+    // a box that runs an agent (markAgent keeps it in step).
+    const boxStatusBarCb = el("input", { type: "checkbox" });
+    boxStatusBarCb.checked = true;
+    const boxStatusBarCard = el("div", {
+        class: "box-opt-card selected",
+        title: "A status line under the agent's prompt: its model, how long the " +
+               "prompt cache stays warm, the session's cost split into cache reads, " +
+               "writes and output, and how full the context is. Turned off or on " +
+               "later in the project's ⚙ panel.",
+    }, [el("span", { class: "box-opt-name" }, ["Status bar"])]);
+    boxStatusBarCard.onclick = () => {
+        boxStatusBarCb.checked = !boxStatusBarCb.checked;
+        boxStatusBarCard.classList.toggle("selected", boxStatusBarCb.checked);
     };
 
     // rs-fetch (opt-in fetch surface, default off). The card's `title` is the
@@ -10131,7 +10169,8 @@ async function mgmtBoxAddDialog(project) {
             // reads (hidden on a dev preset, which takes none).
             collapsibleBox("Extensions", [
                 el("div", { class: "box-opt-cards" },
-                   [editorCard, fetchCard, browserCard, trustedCard, historyCard]),
+                   [editorCard, boxStatusBarCard, fetchCard, browserCard, trustedCard,
+                    historyCard]),
                 trustedHint,
                 historyHint,
             ], "box-extensions"),
@@ -10206,6 +10245,7 @@ async function mgmtBoxAddDialog(project) {
                     share: shareCb.checked,
                 };
                 if (agentS.value) payload.agent = agentS.value;
+                if (agentS.value && agentS.value !== "none") payload.status_bar = boxStatusBarCb.checked;
                 // The dev preset posts to a DIFFERENT route (the detached
                 // provision lane), so the model must be threaded here too — it is
                 // the box type where the choice matters most, and a field missing
@@ -10256,6 +10296,8 @@ async function mgmtBoxAddDialog(project) {
             // Agent is always explicit now (the preset default is pre-selected,
             // not a sentinel).
             if (agentS.value) payload.agent = agentS.value;
+            // RS's status bar, only for an agent box (where its card shows).
+            if (agentS.value && agentS.value !== "none") payload.status_bar = boxStatusBarCb.checked;
             // Gated on the agent, exactly like the control's visibility — a blank
             // box (agent "none") runs no agent, so it sends no model.
             if (agentModelOn()) {
@@ -11975,8 +12017,11 @@ function makeProjectConfigBox(project) {
     tabsBox.appendChild(el("div", { class: "config-hint" }, [
         "Hidden tabs stay enabled on the supervisor — this only controls what shows here.",
     ]));
-    appendEditorExtensionSection(pane("Extensions", "extensions"), project, enabled);
-    appendAgentsBox(pane("Agents", "agents"), project, enabled);
+    // The Extensions pane's status-bar rows come from the Agents pane's read of
+    // the project's agents (one read per window), so they are filled after it.
+    const extensionsBox = pane("Extensions", "extensions");
+    const agentsRead = appendAgentsBox(pane("Agents", "agents"), project, enabled);
+    appendEditorExtensionSection(extensionsBox, project, enabled, agentsRead);
     appendSharingSection(pane("Sharing", "sharing"), project, enabled);
     const portsBox = pane("Ports", "ports");
     appendExportedPortsSection(portsBox, project);
@@ -12004,18 +12049,24 @@ const AGENTS_BOX_CLAUDE_MODEL = /^[A-Za-z0-9][A-Za-z0-9._\[\]-]*$/;
 let agentsBoxSeq = 0;
 
 function appendAgentsBox(box, project, enabled) {
-    // `box` is the window's Agents pane (makeProjectConfigBox).
+    // `box` is the window's Agents pane (makeProjectConfigBox). Returns its
+    // read of the project's agents, {res, b} (b null: the fetch itself failed),
+    // which the Extensions pane's status-bar rows reuse.
     const content = el("div", {}, [el("div", { class: "config-empty" }, ["Loading…"])]);
     box.appendChild(content);
     // The Box agents section's place (filled from the same read below).
     const boxesHolder = el("div", {});
     box.appendChild(boxesHolder);
-    (async () => {
+    const read = (async () => {
         let res = null, b = null;
         try {
             res = await fetch(`/broker/project/${encodeURIComponent(project.name)}/agents`);
             try { b = await res.json(); } catch (e) { b = {}; }
         } catch (e) { b = null; }
+        return { res, b };
+    })();
+    (async () => {
+        const { res, b } = await read;
         if (!b || !res.ok || !b.ok || !b.result) {
             content.replaceChildren(el("div", { class: "config-empty" },
                 [(b && mgmtErrText(b)) || "Couldn't read the project's agents."]));
@@ -12039,6 +12090,7 @@ function appendAgentsBox(box, project, enabled) {
         const boxesSection = boxAgentsSection(project.name, d, cat);
         if (boxesSection) boxesHolder.replaceChildren(boxesSection);
     })();
+    return read;
 }
 
 function agentsBoxContent(name, d, cat, staged) {
@@ -12754,7 +12806,7 @@ function removeProjectFromSidebar(project) {
 // on. The toggle goes through `update` enable/disable code-server, which RECREATES
 // the container — supported on BOTH substrates now (dind via _recreate_supervisor,
 // docker via _recreate_docker_substrate). Universal (renders on every flavor).
-function appendEditorExtensionSection(box, project, enabled) {
+function appendEditorExtensionSection(box, project, enabled, agentsRead) {
     // `box` is the window's Extensions pane; its tab is the heading.
     const section = el("div", { class: "config-section" });
     const editorOn = Object.prototype.hasOwnProperty.call(enabled, "code-server");
@@ -12785,8 +12837,132 @@ function appendEditorExtensionSection(box, project, enabled) {
         rrow.appendChild(rbtn);
         section.appendChild(rrow);
     }
+    // RS's status bar (#524): a row for the project container and one per box
+    // that runs an agent, from the panel's agents read (the Agents box shows
+    // that read's error; nothing here then).
+    const barHolder = el("div", {});
+    section.appendChild(barHolder);
+    if (agentsRead) {
+        agentsRead.then(({ res, b }) => {
+            if (!b || !res || !res.ok || !b.ok || !b.result) return;
+            barHolder.replaceChildren(...statusBarRows(project.name, b.result));
+        });
+    }
     box.appendChild(section);
 }
+
+const STATUS_BAR_AGENT_LABELS = { claude: "Claude", pi: "pi" };
+
+// The ⚙ Extensions status-bar rows from a project_agents result `d`.
+function statusBarRows(name, d) {
+    const rows = [];
+    if (d.status_bar) rows.push(statusBarRow(name, null, d.status_bar, !!d.running));
+    for (const bx of (Array.isArray(d.boxes) ? d.boxes : [])) {
+        if (bx && bx.status_bar) rows.push(statusBarRow(name, bx.name, bx.status_bar,
+                                                        !!d.running));
+    }
+    if (!d.running && d.boxes_state === "stopped") {
+        rows.push(el("div", { class: "config-hint" }, [
+            "The boxes' status bars show here while the project runs.",
+        ]));
+    }
+    return rows;
+}
+
+// One row: on or off as the container's agents read now (a stopped container:
+// its saved choice), each agent with its own status line named, and the switch
+// while the project runs. A stopped box in a running project takes a change at
+// its next start. A box switch repaints its row in place; the project's
+// switch goes through a dialog that closes the window when it finishes.
+function statusBarRow(name, box, sb, projectRunning) {
+    let on = !!sb.on;
+    let unknown = sb.unknown === true;
+    let own = Array.isArray(sb.own) ? sb.own : [];
+    let pending = box ? sb.pending === true
+        : Array.isArray(sb.pending) && sb.pending.length > 0;
+    const metaEl = el("span", { class: "config-box-meta" });
+    const row = el("div", { class: "config-box-row" }, [
+        el("span", { class: "config-box-name" }, [box ? `Status bar — box ${box}` : "Status bar"]),
+        metaEl,
+    ]);
+    const wrap = el("div", {}, [row]);
+    const btn = el("button", { class: "btn btn-secondary" });
+    const paint = () => {
+        const meta = [unknown ? "state unknown" : on ? "on" : "off"];
+        if (own.length) {
+            meta.push("own status line (" +
+                      own.map((a) => STATUS_BAR_AGENT_LABELS[a] || a).join(", ") + ")");
+        }
+        if (pending) meta.push("applied at its next start");
+        metaEl.textContent = meta.join(" · ");
+        btn.textContent = on ? "Disable" : "Enable";
+    };
+    paint();
+    if (!projectRunning) {
+        wrap.appendChild(el("div", { class: "config-hint" },
+                            ["Start the project to change the status bar."]));
+        return wrap;
+    }
+    const status = el("div", { class: "config-box-status" });
+    row.appendChild(btn);
+    wrap.appendChild(status);
+    // After a switch: the new state as the server read it back (a live write
+    // returns each agent's state), else the asked state — owed at the box's
+    // next start when no live state came back (stopped, or still booting).
+    const settle = (want, view, owed) => {
+        if (view && typeof view === "object") {
+            on = !!view.on;
+            unknown = view.unknown === true;
+            own = Array.isArray(view.own) ? view.own : [];
+            pending = false;
+        } else {
+            on = want;
+            unknown = false;
+            pending = !!owed;
+        }
+        paint();
+    };
+    if (box) {
+        btn.onclick = async () => {
+            const want = !on;
+            btn.disabled = true;
+            status.replaceChildren(el("div", {}, ["Saving…"]));
+            try {
+                const r = await fetch(`/broker/project/${encodeURIComponent(name)}/box-settings`, {
+                    method: "POST", headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ name: box, status_bar: want }),
+                });
+                let rb; try { rb = await r.json(); } catch (e) { rb = {}; }
+                if (!r.ok || !rb.ok || !rb.result) {
+                    status.replaceChildren(el("div", { class: "config-box-warn" },
+                        ["Couldn't change it: " + (mgmtErrText(rb) || r.status)]));
+                    return;
+                }
+                const out = rb.result;
+                settle(want, out.status_bar, !out.status_bar);
+                const lines = [el("div", {}, [out.status_bar
+                    ? `Status bar ${want ? "on" : "off"} — it shows from each agent's next session.`
+                    : "Saved — the box takes it when it next starts."])];
+                for (const w of (Array.isArray(out.warnings) ? out.warnings : [])) {
+                    lines.push(el("div", { class: "config-box-warn" }, ["⚠ " + w]));
+                }
+                status.replaceChildren(...lines);
+            } catch (e) {
+                status.replaceChildren(el("div", { class: "config-box-warn" },
+                                          ["Couldn't change it: the request failed."]));
+            } finally {
+                btn.disabled = false;
+            }
+        };
+    } else {
+        // Through a confirm dialog, like the Editor and Reader switches: the
+        // window closes when the change finishes (its rows never show the
+        // state from before it).
+        btn.onclick = () => mgmtStatusBarToggle(name, on);
+    }
+    return wrap;
+}
+
 
 // The exported-ports surface (STAGE_EXPORTED_PORTS): register a port the PI is
 // serving inside the supervisor (rs-project-<proj>:<port>) so it shows as an http
@@ -13664,6 +13840,32 @@ function mgmtReaderToggle(name, on) {
             body: JSON.stringify(on ? { disable: ["reader"] } : { enable: ["reader"] }),
         }),
         // As the editor toggle: the ⚙ window under it closes on success.
+        onDone: async (ok) => {
+            if (!ok) return;
+            closeProjectConfigBox(name);
+            await refreshAfterBoxChange(name);
+        },
+    });
+}
+
+// The project container's status-bar switch (#524): live, no recreate; the
+// agents pick it up in their next session.
+function mgmtStatusBarToggle(name, on) {
+    const word = on ? "Disable" : "Enable";
+    mgmtConfirmThenTail(boxOpView(), {
+        title: `${word} the status bar on ${name}`,
+        tailTitle: `${on ? "Disabling" : "Enabling"} the status bar on ${name}`,
+        verb: "update",
+        project: name,
+        confirmLabel: word,
+        body: [el("p", {}, [`${word} RS's status bar for the agents in "${name}"'s own ` +
+            "container. Nothing restarts; each agent shows the change from its next session. " +
+            "An agent with its own status line keeps it."])],
+        request: () => fetch(`/broker/project/${encodeURIComponent(name)}/update`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ status_bar: !on }),
+        }),
+        // As the editor and reader toggles: the ⚙ window under it closes on success.
         onDone: async (ok) => {
             if (!ok) return;
             closeProjectConfigBox(name);

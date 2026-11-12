@@ -1135,7 +1135,9 @@ async def broker_project_action_handler(request: web.Request) -> web.Response:
                       "agents", "pi_model", "pi_thinking", "reset",
                       "harness_mode", "doer_model", "checker_model",
                       "pi_doer_model", "pi_doer_thinking",
-                      "pi_checker_model", "pi_checker_thinking"):
+                      "pi_checker_model", "pi_checker_thinking",
+                      # the ⚙ Extensions status-bar switch (#524)
+                      "status_bar"):
                 if req_body.get(k) is not None:
                     args[k] = req_body[k]
     if action == "destroy":
@@ -1260,6 +1262,9 @@ async def broker_box_add_handler(request: web.Request) -> web.Response:
             # Share files with the project — RAW and TRI-STATE like `browser`
             # (absent ⇒ the box type's default; bool() would force it off).
             "share": body.get("share"),
+            # RS's status bar in the box's agents (#524) — RAW: absent means
+            # the default (on); the broker request refuses a non-bool.
+            "status_bar": body.get("status_bar"),
             # Keep the notes' history on Gitea — RAW like `browser`: the broker
             # request refuses anything but a bool.
             "history": body.get("history")}
@@ -1329,7 +1334,7 @@ async def broker_box_settings_handler(request: web.Request) -> web.Response:
     args = {"project": project}
     for k in ("name", "model", "effort", "reset", "harness_mode", "doer_model",
               "checker_model", "pi_doer_model", "pi_doer_thinking",
-              "pi_checker_model", "pi_checker_thinking"):
+              "pi_checker_model", "pi_checker_thinking", "status_bar"):
         if body.get(k) is not None:
             args[k] = body[k]
     status, reply = await _relay(request, "box_settings", args)
@@ -2003,7 +2008,9 @@ async def broker_dev_box_handler(request: web.Request) -> web.Response:
                                        "pi_checker_model", "pi_checker_thinking")},
             # Share files — RAW like the plain box route's (tri-state; the
             # broker request refuses anything but a bool or absent).
-            "share": body.get("share")}
+            "share": body.get("share"),
+            # RS's status bar (#524) — RAW, absent ⇒ on.
+            "status_bar": body.get("status_bar")}
     op_id = _mint_op_id(project, "dev-box")
     try:
         reply = await broker_call("dev_box_provision", args,
@@ -2076,7 +2083,9 @@ async def broker_dev_project_handler(request: web.Request) -> web.Response:
             # The agent set; an absent key relays as None ⇒ the workflow preset.
             "agents": body.get("agents"),
             # Read-only folders, relative to RS's data folder (the broker gates).
-            "mount": body.get("mount")}
+            "mount": body.get("mount"),
+            # RS's status bar (#524) — RAW, absent ⇒ on.
+            "status_bar": body.get("status_bar")}
     op_id = _mint_op_id(name if isinstance(name, str) and name else "dev",
                         "dev-project")
     try:
