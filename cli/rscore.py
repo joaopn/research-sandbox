@@ -8236,9 +8236,9 @@ _AGENT_INSTALL = {
         # url is the .vsix download (platform-pinned linux-x64 — the extension is
         # platform-specific; our containers are x86_64 linux); latest_url is the
         # sibling metadata GET whose JSON body carries latest_json_key at the top
-        # level. file = the saved basename, chosen as the extension id so
-        # code-server-deploy.sh's anchored skip-glob (<base>-[0-9]*) precisely
-        # matches the installed folder anthropic.claude-code-<ver>.
+        # level. file = the saved basename, the extension id with no version:
+        # code-server-deploy.sh reads the version from inside the .vsix and
+        # compares it with the editor's extensions.json entry for that id.
         "ext": {
             "id": "Anthropic.claude-code",
             "version_key": "CLAUDE_CODE_EXT_VERSION",
@@ -8690,9 +8690,9 @@ _CODE_SERVER_STRIP_EXTS = (
 # Editor-bundled VS Code extensions — downloaded fresh in-container at build so
 # the dist is self-contained. All are UNIVERSAL Open VSX packages (no platform
 # target); code-server-deploy.sh installs every .vsix in templates/extensions/ at
-# boot. Each is saved under its extension id (<ns>.<name>.vsix, no version) so the
-# deploy script's `*<base>*` skip-glob matches the installed folder
-# <ns>.<name>-<ver>. Versions are per-extension `manual` pins in versions.env.
+# boot when it is newer than the installed version. Each is saved under its
+# extension id (<ns>.<name>.vsix, no version); the deploy script reads the version
+# from inside the .vsix. Versions are per-extension `manual` pins in versions.env.
 _OPEN_VSX_VSIX_URL = (
     "https://open-vsx.org/api/{ns}/{name}/{ver}/file/{ns}.{name}-{ver}.vsix")
 _EDITOR_EXTENSIONS = (
@@ -9559,7 +9559,7 @@ def _ext_install_script(home: str, force: bool) -> str:
     downgrades, the editor's registry keeping exactly one active version (a
     superseded version folder stays on disk for the editor's own cleanup).
     Without force (an Add) it installs only an extension of which no version is
-    installed — the boot's own rule. Exits non-zero if any install failed."""
+    installed. Exits non-zero if any install failed."""
     cs = f"{home}/.local/bin/code-server"
     skip = "" if force else '    set -- "$E/$b-"[0-9]*; [ -e "$1" ] && continue\n'
     flag = " --force" if force else ""
