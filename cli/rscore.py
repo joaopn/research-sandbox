@@ -1785,13 +1785,19 @@ class CreateRequest:
 # them as these environment variables and re-checks every value itself.
 #
 # The modes themselves are data: container/harness/modes.json lists them (id,
-# label, description, the pieces its rule is built from, the subagents it
-# uses), read lazily by harness_catalog() — never at import, by the CLI parser
-# or by a reader of recorded settings, so a broken catalog errors only where a
+# its optional number for the /rs-mode switch, label, description, the pieces
+# its rule is built from, the subagents it uses), read lazily by
+# harness_catalog() — never at import, by the CLI parser or by a reader of
+# recorded settings, so a broken catalog errors only where a
 # mode is set, staged or listed. Only the host checks a mode against it; the
 # installer and the box tool check the characters (HARNESS_MODE_ID_RE, mirrored
 # in rs_sandbox._HARNESS_MODE_ID_RE and install.sh's `case`, pytest-pinned).
 HARNESS_MODE_ID_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
+# A mode's optional alias: the number the user may type instead of its id in
+# the /rs-mode switch (the number of agents the mode uses), written without
+# leading zeros so one number has one spelling. It never names a mode anywhere
+# else — the recorded mode, the CLI flag and the webui take ids only.
+HARNESS_MODE_ALIAS_RE = re.compile(r"0|[1-9][0-9]*")
 # The roles the installer ships an agent file for: a mode may use only these.
 HARNESS_ROLES = ("doer", "checker")
 # The modes a box tool from before the catalog accepts (its list was fixed):
@@ -1820,8 +1826,10 @@ _HARNESS_LABELS = {
 
 def harness_catalog() -> list[dict]:
     """The working modes from container/harness/modes.json, checked: a list of
-    {id, label, description, pieces, subagents} in display order, `none` first
-    with no pieces and no subagents, ids unique and matching HARNESS_MODE_ID_RE,
+    {id, alias, label, description, pieces, subagents} in display order, `none`
+    first with no pieces and no subagents, ids unique and matching
+    HARNESS_MODE_ID_RE, an alias optional ("" when absent) and, when given,
+    unique and matching HARNESS_MODE_ALIAS_RE,
     every piece a file under pieces/, subagents only from HARNESS_ROLES. Raises
     ValidationError naming what is wrong (never a host path) — a broken catalog
     is an error where a mode is used, never a silent fallback."""
@@ -1840,6 +1848,7 @@ def harness_catalog() -> list[dict]:
         raise bad("modes.json has no list of modes")
     out: list[dict] = []
     seen: set[str] = set()
+    aliases: set[str] = set()
     for m in modes:
         if not isinstance(m, dict):
             raise bad("a mode entry is not an object")
@@ -1849,6 +1858,17 @@ def harness_catalog() -> list[dict]:
         if mid in seen:
             raise bad(f"mode {mid!r} is listed twice")
         seen.add(mid)
+        alias = m.get("alias", "")
+        if alias != "":
+            if not isinstance(alias, str):
+                raise bad(f"mode {mid!r}: its alias must be a number written as text, "
+                          f"in quotes")
+            if not HARNESS_MODE_ALIAS_RE.fullmatch(alias):
+                raise bad(f"mode {mid!r}: alias {alias!r} is not a number written "
+                          f"without leading zeros")
+            if alias in aliases:
+                raise bad(f"alias {alias!r} is given to two modes")
+            aliases.add(alias)
         label, desc = m.get("label"), m.get("description")
         if not isinstance(label, str) or not label.strip():
             raise bad(f"mode {mid!r} has no label")
@@ -1878,7 +1898,7 @@ def harness_catalog() -> list[dict]:
             raise bad("mode 'none' must have no pieces and no subagents")
         if mid != "none" and not pieces:
             raise bad(f"mode {mid!r} has no pieces")
-        out.append({"id": mid, "label": label, "description": desc,
+        out.append({"id": mid, "alias": alias, "label": label, "description": desc,
                     "pieces": list(pieces), "subagents": list(subs)})
     if out[0]["id"] != "none":
         raise bad("the first mode must be 'none'")
@@ -9684,13 +9704,25 @@ _COUNT_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven",
                 "eight", "nine", "ten")
 
 
-def harness_mode_phrase(ids: "Sequence[str]") -> str:
-    """The modes as one phrase — "none, direct, doer-checker or planner-doer-checker" — the
-    ONE join for the rule header (modes/LIST) and the skill's description."""
-    ids = list(ids)
-    if len(ids) < 2:
-        return "".join(ids)
-    return f"{', '.join(ids[:-1])} or {ids[-1]}"
+def _harness_alias_note(m: dict) -> str:
+    """ " (or `2`)" after a mode's name in the skill's list; "" without an alias."""
+    return f" (or `{m['alias']}`)" if m.get("alias") else ""
+
+
+def harness_mode_names(modes: "Sequence[dict]") -> list[str]:
+    """Each catalog mode as the user may name it: "doer-checker (2)", or the
+    bare id when the mode has no alias."""
+    return [f"{m['id']} ({m['alias']})" if m.get("alias") else m["id"] for m in modes]
+
+
+def harness_mode_phrase(modes: "Sequence[dict]") -> str:
+    """The modes as one phrase — "none (0), direct (1), doer-checker (2) or
+    planner-doer-checker (3)" — the ONE join for the rule header (modes/LIST)
+    and the skill's description."""
+    names = harness_mode_names(modes)
+    if len(names) < 2:
+        return "".join(names)
+    return f"{', '.join(names[:-1])} or {names[-1]}"
 
 
 def harness_subagents_line(subagents: "Sequence[str]") -> str:
@@ -9724,15 +9756,19 @@ def harness_suite_files() -> dict[str, bytes]:
         head = f"## {m['label']}\n\n{harness_subagents_line(m['subagents'])}\n\n"
         files[f"modes/{m['id']}.md"] = head.encode("utf-8") + b"\n".join(
             (HARNESS_SRC / "pieces" / f"{x}.md").read_bytes() for x in m["pieces"])
-    files["modes/LIST"] = (harness_mode_phrase(ids) + "\n").encode("utf-8")
+    files["modes/LIST"] = (harness_mode_phrase(cat) + "\n").encode("utf-8")
     n = len(ids)
     fill = {
-        "{{RS_MODE_PHRASE}}": harness_mode_phrase(ids),
-        "{{RS_MODE_HINT}}": " | ".join(ids),
+        "{{RS_MODE_PHRASE}}": harness_mode_phrase(cat),
+        "{{RS_MODE_HINT}}": " | ".join(harness_mode_names(cat)),
+        # The template writes the none bullet itself; its alias note is filled here.
+        "{{RS_MODE_NONE_ALIAS}}": _harness_alias_note(cat[0]),
         "{{RS_MODE_BULLETS}}": "".join(
-            f"- **{i}** — read `modes/{i}.md` in this skill's folder and follow it "
-            f"from now on.\n" for i in ids if i != "none"),
+            f"- **{m['id']}**{_harness_alias_note(m)} — read `modes/{m['id']}.md` in this "
+            f"skill's folder and follow it from now on.\n" for m in cat if m["id"] != "none"),
         "{{RS_MODE_COUNT}}": _COUNT_WORDS[n] if n < len(_COUNT_WORDS) else str(n),
+        # A number the user typed is a mode too: the fallback must not ask about it.
+        "{{RS_MODE_OR_NUMBER}}": " or their numbers" if any(m["alias"] for m in cat) else "",
     }
     try:
         skill = (HARNESS_SRC / HARNESS_SKILL_TEMPLATE).read_bytes().decode("utf-8")

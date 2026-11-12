@@ -2,6 +2,7 @@
   "modes": [
     {
       "id": "none",
+      "alias": "0",
       "label": "None",
       "description": "Nothing about how to work: the agent follows the project's own instructions.",
       "pieces": [],
@@ -9,6 +10,7 @@
     },
     {
       "id": "direct",
+      "alias": "1",
       "label": "Direct",
       "description": "The agent does the work itself, in the session you talk to.",
       "pieces": [
@@ -23,6 +25,7 @@
     },
     {
       "id": "doer-checker",
+      "alias": "2",
       "label": "Doer-checker",
       "description": "The agent does the work itself; RS's checker subagent reviews the plan before any code is written and the change before it is committed. Lighter than planner-doer-checker.",
       "pieces": [
@@ -41,6 +44,7 @@
     },
     {
       "id": "planner-doer-checker",
+      "alias": "3",
       "label": "Planner-doer-checker",
       "description": "The agent plans with you; RS's doer subagent implements each unit and its checker subagent reviews it before it lands. More thorough, and it costs more tokens and time per unit.",
       "pieces": [
