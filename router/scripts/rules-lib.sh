@@ -39,7 +39,9 @@ file_resolvers() {  # <subnet> -> the RESOLVERS field of its record, if any
 # cleans them) and the per-resolver shapes for the union of the record's
 # resolvers and the ones passed (what is about to be applied). Literal on
 # purpose: a generic "every rule with this source" scan would also take the
-# per-MCP allows, which live in their own records.
+# per-MCP allows, which live in their own records and must survive an apply
+# or reapply. The host takes them separately at destroy and before a range is
+# reused (purge-mcp-allows.sh).
 delete_subnet_rules() {  # <subnet> [resolvers]
     s="$1"
     for r in $PRIVATE_RANGES; do

@@ -5244,7 +5244,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
 def destroy(req: DestroyRequest, cfg: "Config" | None = None,
             progress=None) -> None:  # type: ignore[name-defined]
     """Tear a project down: container + workspace dir + DIND volume + network,
-    plus its router MCP-allow rules. Confirmation is the front-end's job — this
+    plus everything the router holds for its network range. Confirmation is the front-end's job — this
     verb just destroys. A project whose container is already gone (a reset
     docker store, a hand `docker rm`) is destroyed too: whatever of it remains
     is removed. die()s only when nothing of the project remains."""
@@ -5262,21 +5262,23 @@ def destroy(req: DestroyRequest, cfg: "Config" | None = None,
     docker_volume = docker_volume_name_for(project)
     network = project_network_for(project)
 
-    # Clean up per-project MCP rules in the router so iptables doesn't
-    # accumulate orphan ACCEPTs after the project network is gone.
+    # Everything the router holds for the project's range goes before the
+    # container: its egress rules, every per-MCP allow and their records. The
+    # MCP allowlist is NOT read here: it lives in the project's own folder, so
+    # an emptied or replaced file would leave allows behind for the next
+    # project docker hands this range to. A router that is down now, or a
+    # purge that fails, is covered where a range is (re)used: create and the
+    # reviewer network purge it before applying their own rules.
     progress.step("router", "removing router rules")
     if network_exists(network) and container_running(ROUTER_CONTAINER):
         try:
-            subnet = get_network_subnet(network)
+            remove_firewall_rules(network)
+            purged = purge_router_range(network)
         except SystemExit:
-            subnet = ""
-        for ent in load_project_allowlist(project, cfg):
-            ip = ent.get("ip")
-            port = ent.get("port")
-            if subnet and isinstance(ip, str) and isinstance(port, int):
-                run(["docker", "exec", ROUTER_CONTAINER,
-                     "/scripts/mcp-deny.sh", subnet, ip, str(port)],
-                    capture_output=True)
+            purged = False
+        if not purged:
+            print(f"warning: {DESTROY_ROUTER_WARNING}", file=sys.stderr)
+            progress.step("warning", DESTROY_ROUTER_WARNING)
 
     # The milestone is emitted in both arms: the webui's destroy checklist
     # pre-lists it, so skipping it would leave a stuck pending row.
@@ -7682,6 +7684,15 @@ ROUTER_READY_POLL_S = 1
 # Present only on a router image that writes the marker at all; an older
 # image never will, so the wait is skipped with a message instead of spent.
 ROUTER_REAPPLY_SCRIPT = "/scripts/reapply-rules.sh"
+# The per-range purge (purge_router_range) is sent from THIS tree over stdin
+# and never run from the router image, so the host's code and the purge it
+# runs cannot skew: an older router image clears a range the same way.
+ROUTER_PURGE_SCRIPT_SRC = SCRIPT_DIR / "router" / "scripts" / "purge-mcp-allows.sh"
+# Shown in the webui's destroy checklist: fixed text, no command (true because
+# create and the reviewer network purge a range before they use it).
+DESTROY_ROUTER_WARNING = ("the router rules for this project's network range could "
+                          "not all be removed; they are cleared before any new "
+                          "project uses that range")
 
 
 def _wait_router_ready() -> bool:
@@ -7747,6 +7758,34 @@ def remove_firewall_rules(network: str) -> None:
         capture_output=True)
 
 
+def purge_router_range(network: str, *, strict: bool = False) -> bool:
+    """Remove every per-MCP allow and its record, and any other rule the router
+    still holds, for the network's source range. Run at destroy and BEFORE a
+    range gets its rules (project create, the reviewer network): docker hands a
+    freed range to the next network, and an allow left on it would reach a
+    project nobody approved it for. The script's bytes come from this tree
+    (ROUTER_PURGE_SCRIPT_SRC), fed to the router's shell over stdin.
+
+    strict (a range about to be used): any failure dies, as the rule apply
+    beside it does. Otherwise returns whether the purge ran and succeeded."""
+    subnet = get_network_subnet(network)
+    try:
+        script = ROUTER_PURGE_SCRIPT_SRC.read_text()
+    except OSError as e:
+        msg = f"the router purge script {ROUTER_PURGE_SCRIPT_SRC} could not be read: {e}"
+        if strict:
+            die(msg)
+        print(f"warning: {msg}", file=sys.stderr)
+        return False
+    _wait_router_ready()
+    argv = ["docker", "exec", "-i", ROUTER_CONTAINER, "sh", "-s", "--", subnet]
+    if strict:
+        run_check(argv, input=script)
+        return True
+    r = run(argv, input=script, capture_output=True)
+    return r.returncode == 0
+
+
 def reapply_firewall_rules(resolvers: "list[str]") -> list[str]:
     """Re-apply every recorded bridge's rules on the router with `resolvers`
     (`research start`, after the router is up). Returns the `changed …` lines
@@ -7766,7 +7805,8 @@ def reapply_firewall_rules(resolvers: "list[str]") -> list[str]:
 
 
 def ensure_project_network(project: str, mode: str) -> tuple[str, str]:
-    """Create per-project bridge network; connect router; apply firewall rules.
+    """Create per-project bridge network; connect router; purge whatever the
+    router still holds for its range; apply firewall rules.
 
     Note: NOT ``--internal``. Docker 29 silently drops ``-p`` port publishing on
     internal networks, which breaks SSH. Egress enforcement is provided by the
@@ -7780,6 +7820,9 @@ def ensure_project_network(project: str, mode: str) -> tuple[str, str]:
     run(["docker", "network", "connect", network, ROUTER_CONTAINER],
         capture_output=True)
     router_ip = get_router_ip(network)
+    # Before the apply (the purge's sweep would take the fresh rules): whatever
+    # an earlier network on this range left on the router goes first.
+    purge_router_range(network, strict=True)
     apply_firewall_rules(network, mode)
     return network, router_ip
 
@@ -7806,8 +7849,9 @@ def _lifecycle_flock_if_free():
 
 
 def remove_project_network(project: str) -> None:
+    # The router's rules for the range were removed by destroy's router step,
+    # before the container went.
     network = project_network_for(project)
-    remove_firewall_rules(network)
     # Disconnect every container research.py knows might be attached. The webui
     # (if running) was wired in by `wire_webui_to_projects()` and the registry
     # (if the project ever enabled an extension) by
@@ -12410,8 +12454,9 @@ def load_project_allowlist(project: str, cfg: "Config") -> list[dict]:
     at the file or at the settings folder, a non-regular file, bytes that are
     not UTF-8 — orch_files: never read through a link). Valid UTF-8 that is
     not a JSON array still refuses. The two corrupt cases differ on purpose:
-    "not usable" reads as empty so a planted link cannot block a destroy,
-    which reads this list; the project could empty its own list anyway."""
+    "not usable" reads as empty so a planted link cannot block a caller;
+    the project could empty its own list anyway (which is why destroy never
+    reads it: the router purge clears the range instead)."""
     p = project_allowlist_path(project, cfg)
     try:
         text = orch_files.read_text(workspace_path_for(project, cfg), "mcp-allow.json")
@@ -23560,7 +23605,9 @@ def _render_reviewer_prompt(template: str, title: str, body: str) -> str:
 
 def _ensure_reviewer_network() -> str:
     """Idempotent rs-reviewer bridge: create if absent, connect the router,
-    (re-)assert the LOCKED rules, return the router's IP on it. Rules are
+    purge the range, (re-)assert the LOCKED rules, return the router's IP on
+    it. The purge runs on every call too, so a reviewer network sitting on a
+    range an earlier project used is cleared at its next review. Rules are
     re-asserted on EVERY call (apply-rules.sh is remove-then-apply), so a
     router RECREATE heals at the next review; a plain router restart already
     self-heals via the router's own rules persist (/etc/sandbox/rules).
@@ -23588,6 +23635,9 @@ def _ensure_reviewer_network() -> str:
                     f"{REVIEWER_NETWORK}\n{(r.stderr or '').strip()}")
         run(["docker", "network", "connect", REVIEWER_NETWORK,
              ROUTER_CONTAINER], capture_output=True)
+        # On every call, before the apply: an rs-reviewer on a range an earlier
+        # project used must not keep that project's MCP allows.
+        purge_router_range(REVIEWER_NETWORK, strict=True)
         apply_firewall_rules(REVIEWER_NETWORK, "locked")
         # Proactive sweep of crashed reviews' leftovers (PI decision): a child
         # hard-killed between its docker run and its finally leaves a STOPPED

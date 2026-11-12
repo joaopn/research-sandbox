@@ -4,7 +4,8 @@
 # legacy shapes, and the per-resolver DNS accepts for the resolvers named in the
 # subnet's record (what was applied) plus the ones passed (the host's current
 # configuration, so a subnet whose record was lost still ends rule-less) — then
-# removes the record. Per-MCP allows live in their own records and are left.
+# removes the record. Per-MCP allows live in their own records and are left;
+# the host purges them separately (purge-mcp-allows.sh, fed over stdin).
 set -e
 
 SUBNET="$1"
