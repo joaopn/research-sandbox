@@ -3985,10 +3985,55 @@ async function renderDevGiteaTab(view, body) {
     body.appendChild(iframe);
 }
 
+// Copied commands are pasted into a terminal, and some of their values come
+// from an agent: Gitea accepts branch names such as `x$(>f)` or `a;>f`, so an
+// unquoted name would run the agent's command in the container where the
+// maintainer pastes (B243). shq leaves a value of characters no POSIX shell
+// treats specially unchanged (so ordinary names copy exactly as before) and
+// single-quotes anything else. A leading "=" is quoted too: zsh expands a
+// word starting with "=" to a command's path. Never give the regex the g
+// flag: .test() on a global regex keeps state between calls.
+const SHELL_PLAIN = /^[A-Za-z0-9._\/@%+=:,-]+$/;
+function shq(value) {
+    const s = String(value);
+    if (SHELL_PLAIN.test(s) && s[0] !== "=") return s;
+    return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+// Every copied rs-fetch command is built here. loc is {pr} or {branch}; sha
+// is optional. Returns null for a value no command may carry: an empty or
+// "-"-led repo or branch (quoting cannot help, rs-fetch would read it as an
+// option), a PR number that is not a positive integer, or a sha that is not
+// hex. Callers must call it at click time, never at render.
+function devFetchCommand(repo, loc, sha, autoCommit) {
+    const bad = (v) => typeof v !== "string" || !v || v[0] === "-";
+    if (bad(repo) || !loc) return null;
+    let cmd = "rs-fetch " + shq(repo);
+    if (loc.pr != null) {
+        if (!Number.isInteger(loc.pr) || loc.pr < 1) return null;
+        cmd += " --pr " + loc.pr;
+    } else {
+        if (bad(loc.branch)) return null;
+        cmd += " --branch " + shq(loc.branch);
+    }
+    if (sha != null) {
+        if (typeof sha !== "string" || !/^[0-9a-f]{7,64}$/i.test(sha)) return null;
+        cmd += " --commit " + sha;
+    }
+    return cmd + (autoCommit ? " --auto-commit" : "");
+}
+
 // cmd is a STRING (fixed command) or a FUNCTION (computed AT CLICK TIME —
 // the card's auto-commit tick box changes what a copy produces, so provider
 // buttons read the live state; their hover title stays generic because a
-// tooltip carrying a stale command would lie about the tick).
+// tooltip carrying a stale command would lie about the tick). A provider that
+// returns no command (devFetchCommand refused a value) writes nothing to the
+// clipboard, shows a cross, and KEEPS the explanation as the button's title: a
+// refusal does not depend on the tick, so it stays true, and a tooltip that
+// reverted after a second would rarely be seen.
+const DEV_COPY_REFUSED = "This command can't be copied: a value in it is not "
+    + "valid (a branch name starting with a dash, or an invalid PR number or "
+    + "commit id).";
 function devCopyBtn(cmd) {
     const isFn = typeof cmd === "function";
     const b = el("button", { class: "btn-small dev-copy",
@@ -3996,6 +4041,12 @@ function devCopyBtn(cmd) {
                                          : "Copy: " + cmd }, ["📋"]);
     b.onclick = async () => {
         const text = isFn ? cmd() : cmd;
+        if (typeof text !== "string" || !text) {
+            b.textContent = "✗";
+            b.title = DEV_COPY_REFUSED;
+            setTimeout(() => { b.textContent = "📋"; }, 1200);
+            return;
+        }
         try { await navigator.clipboard.writeText(text); } catch (e) { return; }
         b.textContent = "✓";
         setTimeout(() => { b.textContent = "📋"; }, 1200);
@@ -4459,10 +4510,9 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
 
     // The card's auto-commit tick rides every copied command; consulted at
     // CALL time (per-row copies pass a provider; Copy all builds at click).
-    const cmdFor = (sha) => (sel.pr != null
-        ? `rs-fetch ${repo} --pr ${sel.pr} --commit ${sha}`
-        : `rs-fetch ${repo} --branch ${sel.branch} --commit ${sha}`)
-        + (autoCommit && autoCommit() ? " --auto-commit" : "");
+    const cmdFor = (sha) => devFetchCommand(repo,
+        sel.pr != null ? { pr: sel.pr } : { branch: sel.branch }, sha,
+        !!(autoCommit && autoCommit()));
 
     const foot = (nodes) => {
         footEl.innerHTML = "";
@@ -4591,8 +4641,16 @@ function devCommitsExpander(view, body, repo, sel, rerender, onLogin,
     copyAllBtn.onclick = async () => {
         const shas = selectedOldestFirst();
         if (!shas.length) return;
-        const text = shas.map(cmdFor).join("\n") + "\n";
+        const cmds = shas.map(cmdFor);
+        if (cmds.some((c) => !c)) {
+            copyAllBtn.textContent = "✗ not copied";
+            copyAllBtn.title = DEV_COPY_REFUSED;
+            setTimeout(updateTools, 1200);
+            return;
+        }
+        const text = cmds.join("\n") + "\n";
         try { await navigator.clipboard.writeText(text); } catch (e) { return; }
+        copyAllBtn.title = "";
         copyAllBtn.textContent = `✓ ${shas.length} copied`;
         setTimeout(updateTools, 1200);
     };
@@ -5690,8 +5748,8 @@ function buildDevRepoCard(view, body, r, attached, opts) {
                                              { pr: p.number }, rerender,
                                              onLogin, autoCommit);
         const cells = [
-            devCopyBtn(() => `rs-fetch ${r.repo} --pr ${p.number}`
-                             + (autoCommit() ? " --auto-commit" : "")),
+            devCopyBtn(() => devFetchCommand(r.repo, { pr: p.number }, null,
+                                             autoCommit())),
             commitsUi.btn,
             el("span", { class: "dev-pr-id" }, [`#${p.number}`]),
             el("span", { class: "dev-pr-title" }, [p.title || ""]),
@@ -5789,8 +5847,8 @@ function buildDevRepoCard(view, body, r, attached, opts) {
                                                  { branch: b.name }, rerender,
                                                  onLogin, autoCommit);
             branchWrap.append(el("div", { class: "dev-branch-row" }, [
-                devCopyBtn(() => `rs-fetch ${r.repo} --branch ${b.name}`
-                                 + (autoCommit() ? " --auto-commit" : "")),
+                devCopyBtn(() => devFetchCommand(r.repo, { branch: b.name },
+                                                 null, autoCommit())),
                 commitsUi.btn,
                 el("span", { class: "dev-pr-title" }, [b.name || ""]),
                 el("span", { class: "dev-pr-meta" }, [b.committed_at || ""]),
