@@ -4845,6 +4845,12 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     if model_in_settings:
         marker["agent_settings"] = {"v": 1, "pending": [] if is_docker else ["claude"],
                                     "migrated": True}
+        # Docker-in-Docker: the pending write right after the deploy uses this
+        # code's settings program, so the effort is already written per tier.
+        # The docker substrate's first write is the image's boot script, which
+        # may be older: it gets the one re-write at its first stop and start.
+        if not is_docker:
+            marker["agent_settings"]["effort_tiers"] = True
     # Starting message (STAGE_SPAWN_GREETING) for the workflow's main shell, read
     # by the Management/Supervisor tab on first byobu new-session. Manifest-
     # derived; skip on empty so research/docker (no greeting) stage no stray file.
@@ -15314,12 +15320,17 @@ def _validate_agents_update(req: "UpdateRequest", container: str,
 # writes the project's choice into those files — a merge into the existing
 # file, never a new file — and the ⚙ panel reads them back, so a model picked
 # inside the agent shows up and a change needs no container restart.
-# Measured on the pinned Claude Code 2.1.258 (zero tokens, a fake API): the
+# Measured on Claude Code 2.1.258 and 2.1.325 (zero tokens, a fake API): the
 # container's ANTHROPIC_MODEL / CLAUDE_CODE_EFFORT_LEVEL outrank the file's
-# keys; the file's own `env` block outranks the container's; an empty entry
-# there neutralises the container's; `effortLevel` takes low..xhigh only (`max`
-# only through the environment); the per-model entry outranks the top-level
-# one; a running session keeps its model until its next start.
+# keys; the file's own `env` block outranks the container's (and `--effort`);
+# an empty entry there neutralises the container's; `effortLevel` takes
+# low..xhigh only (`max` only through the environment); a per-model entry
+# outranks the top-level one; a running session keeps its model until its next
+# start. Where the builds differ: 2.1.325 honours the top-level `effortLevel`
+# only for older models, matches a tier entry (`opus`) whatever form the model
+# is given in, and lets an entry under the model's full id (where /effort
+# saves) beat the tier's; 2.1.258 honours the top-level key for every model
+# and lets the tier entry win.
 # ---------------------------------------------------------------------------
 
 # A Claude model as Claude's own picker writes it: a tier (`opus`), a variant
@@ -15378,25 +15389,40 @@ _AGENT_SETTINGS_WARNING = ("the {agent} model could not be written into its sett
 # Set or clear Claude's model and effort. $mo/$eo are "set", "clear" or "keep".
 # Any model or effort write also empties the matching `env` entry, which
 # neutralises a container setting left by a project created before this; `max`
-# is written there instead, the only place Claude accepts it. Mirrored (the
-# set-only half) by agent/entrypoint.minimal.sh — pinned.
+# is written there instead, the only place Claude accepts it.
+# An effort write is the project's level for EVERY model: it first removes the
+# level from every per-model entry (Claude saves a /effort pick under the
+# model's full id, and newer builds let that entry beat the tier's — measured
+# on 2.1.325), then writes it at top level, under the chosen model and under
+# each tier of the catalog that takes an effort. Newer builds ignore the
+# top-level key for the current default models; both 2.1.258 and 2.1.325
+# honour the tier entry whatever form the model is given in. The tier list is
+# a literal because the docker boot script carries this text and has no
+# catalog (pinned equal to models/catalog.json). Shapes that are not objects
+# are left alone on a clear and replaced only where a level is written.
+# Mirrored byte for byte by rs_sandbox.BOX_CLAUDE_SETTINGS_JQ and
+# agent/entrypoint.minimal.sh — pinned.
 CLAUDE_SETTINGS_JQ = (
     '(.model // "") as $old'
     ' | (if $mo == "set" then $m else $old end) as $k'
     ' | if $mo == "set" then .model = $m elif $mo == "clear" then del(.model) else . end'
     ' | if $mo == "keep" then . else .env = ((.env // {}) + {"ANTHROPIC_MODEL": ""}) end'
-    ' | if $eo == "set" and $e == "max"'
-    ' then .env = ((.env // {}) + {"CLAUDE_CODE_EFFORT_LEVEL": "max"}) | del(.effortLevel)'
-    ' | if $k == "" or ((.modelSettings // {}) | has($k) | not) then .'
-    ' else .modelSettings[$k] |= del(.effortLevel) end'
-    ' elif $eo == "set"'
-    ' then .env = ((.env // {}) + {"CLAUDE_CODE_EFFORT_LEVEL": ""}) | .effortLevel = $e'
-    ' | if $k == "" then . else .modelSettings = ((.modelSettings // {})'
-    ' | .[$k] = ((.[$k] // {}) + {"effortLevel": $e})) end'
-    ' elif $eo == "clear"'
-    ' then .env = ((.env // {}) + {"CLAUDE_CODE_EFFORT_LEVEL": ""}) | del(.effortLevel)'
-    ' | if $k == "" or ((.modelSettings // {}) | has($k) | not) then .'
-    ' else .modelSettings[$k] |= del(.effortLevel) end'
+    ' | if $eo == "set" or $eo == "clear"'
+    ' then (if (.modelSettings | type) == "object"'
+    ' then .modelSettings |= with_entries('
+    'if (.value | type) == "object" then .value |= del(.effortLevel) else . end)'
+    ' else . end)'
+    ' | del(.effortLevel)'
+    ' | .env = ((.env // {}) + {"CLAUDE_CODE_EFFORT_LEVEL":'
+    ' (if $eo == "set" and $e == "max" then "max" else "" end)})'
+    ' | if $eo == "set" and $e != "max"'
+    ' then .effortLevel = $e'
+    ' | .modelSettings = (reduce (["fable","opus","sonnet"]'
+    ' + (if $k == "" then [] else [$k] end))[] as $t'
+    ' ((if (.modelSettings | type) == "object" then .modelSettings else {} end);'
+    ' .[$t] = ((if (.[$t] | type) == "object" then .[$t] else {} end)'
+    ' + {"effortLevel": $e})))'
+    ' else . end'
     ' else . end')
 # Set or clear pi's starting model and thinking level ($mo/$to as above).
 PI_SETTINGS_JQ = (
@@ -16401,6 +16427,8 @@ def _add_pending(data: dict, owed: "dict[str, Sequence[str] | None]") -> None:
     out = {"v": 1, "pending": pending, "migrated": bool(blk.get("migrated"))}
     if fields:
         out["fields"] = fields
+    if blk.get("effort_tiers"):
+        out["effort_tiers"] = True
     data["agent_settings"] = out
 
 
@@ -16413,7 +16441,11 @@ def _apply_agent_settings_pending(container: str, workspace_path: "Path",
     the agents installed in this container. A project created before this
     (its record not yet `migrated`) is migrated once: its recorded Claude pair
     is written only where Claude's file has no model yet, so a choice made
-    inside Claude is kept. Never raises — it runs in the middle of a start."""
+    inside Claude is kept. A migrated project whose record does not carry
+    `effort_tiers` yet gets its recorded Claude effort written once more, the
+    effort half only: files written before the per-tier settings program hold
+    the level where newer Claude Code builds ignore it. Never raises — it runs
+    in the middle of a start."""
     try:
         data = _read_marker_dict(workspace_path)
         if not data:
@@ -16430,6 +16462,14 @@ def _apply_agent_settings_pending(container: str, workspace_path: "Path",
         migrate_now = (claude_in_settings and DEFAULT_AGENT in local
                        and not (blk or {}).get("migrated"))
         migrated = False
+        # The one-time per-tier re-write of the recorded effort: only for a
+        # record already migrated when this call began (the migration's own
+        # write below goes through the same program, and where it writes no
+        # effort the old container delivered none).
+        retier_now = (claude_in_settings and DEFAULT_AGENT in local
+                      and bool((blk or {}).get("migrated"))
+                      and not (blk or {}).get("effort_tiers"))
+        tiered = False
         for agent in ("claude", "pi"):
             if agent not in local or (agent == "claude" and not claude_in_settings):
                 continue
@@ -16439,6 +16479,18 @@ def _apply_agent_settings_pending(container: str, workspace_path: "Path",
                 # written only where Claude's file has no model yet. Counted
                 # as done only once the file was read (a failed read retries
                 # at the next deploy).
+                if agent == "claude" and retier_now:
+                    rec_e = (claude_pair or {}).get("effort")
+                    if rec_e not in CLAUDE_SETTINGS_EFFORTS and rec_e != "max":
+                        tiered = True       # nothing recorded: nothing to re-write
+                    else:
+                        res = _write_agent_settings(container, agent, pair, home, ["effort"])
+                        if res == "ok":
+                            tiered = True
+                        elif res != "absent":   # no settings file yet: retried, silently
+                            _report_warnings([_AGENT_SETTINGS_WARNING.format(agent=agent)],
+                                             progress)
+                    continue
                 if not (agent == "claude" and migrate_now):
                     continue
                 cur = _read_agent_settings(container, "claude", home)
@@ -16458,16 +16510,18 @@ def _apply_agent_settings_pending(container: str, workspace_path: "Path",
                     halves.append("effort")
                 if not halves or _write_agent_settings(container, agent, pair, home,
                                                        halves) == "ok":
-                    migrated = True
+                    migrated = tiered = True
                 continue
             res = _write_agent_settings(container, agent, pair, home, fields.get(agent))
             if res == "ok":
                 done.add(agent)
                 if agent == "claude":
                     migrated = True     # the record's pair is in the file now
+                    if fields.get(agent) is None or "effort" in fields[agent]:
+                        tiered = True
             else:
                 _report_warnings([_AGENT_SETTINGS_WARNING.format(agent=agent)], progress)
-        if not done and not migrated:
+        if not done and not migrated and not tiered:
             return
 
         def mutate(d: dict) -> None:
@@ -16478,6 +16532,8 @@ def _apply_agent_settings_pending(container: str, workspace_path: "Path",
             out = {"v": 1, "pending": left, "migrated": bool(b.get("migrated")) or migrated}
             if f:
                 out["fields"] = f
+            if b.get("effort_tiers") or tiered:
+                out["effort_tiers"] = True
             d["agent_settings"] = out
         _marker_rmw(workspace_path, mutate, "record the applied agent settings")
     except Exception as e:     # never stop a start over a settings write
@@ -16485,16 +16541,21 @@ def _apply_agent_settings_pending(container: str, workspace_path: "Path",
 
 
 def _agent_settings_owed(workspace_path: "Path") -> bool:
-    """Whether the record owes a settings write (a pending agent, or the
-    one-time migration of a recorded Claude model) — read from the file alone,
-    so a start with nothing owed makes no container call."""
+    """Whether the record owes a settings write (a pending agent, the one-time
+    migration of a recorded Claude model, or the one-time per-tier re-write of
+    a recorded Claude effort in a project that runs Claude) — read from the
+    file alone, so a start with nothing owed makes no container call."""
     data = _read_marker_dict(workspace_path)
     blk = _agent_settings_block(data)
     if blk and isinstance(blk.get("pending"), list) and blk["pending"]:
         return True
     models = data.get("models") if isinstance(data.get("models"), dict) else {}
     sup = models.get("supervisor") if isinstance(models.get("supervisor"), dict) else {}
-    return not (blk or {}).get("migrated") and bool(sup.get("model"))
+    if not (blk or {}).get("migrated") and bool(sup.get("model")):
+        return True
+    agents = data.get("agents") if isinstance(data.get("agents"), list) else []
+    return (not (blk or {}).get("effort_tiers") and bool(sup.get("effort"))
+            and DEFAULT_AGENT in agents)
 
 
 # ---------------------------------------------------------------------------
@@ -17086,12 +17147,15 @@ def _clean_claude_model(v: Any) -> tuple[str, bool]:
 
 
 def _claude_effective(settings: "dict | None", env: dict) -> dict:
-    """What Claude will run, in Claude's own order (measured, 2.1.258): the
-    settings file's `env` entries, then the container's environment, then the
-    file's `model`; for effort the same two environments, then the per-model
-    level `/effort` saves, then the file's `effortLevel`. A present but empty
-    `env` entry in the file hides the container's (a project migrated by a
-    panel write). Values failing the character set read as unrecognised."""
+    """What RS's last write makes Claude run: the settings file's `env`
+    entries, then the container's environment, then the file's `model`; for
+    effort the same two environments, then the entry under the file's model
+    string, then the file's `effortLevel` (RS writes the same level in all of
+    them). A present but empty `env` entry in the file hides the container's
+    (a project migrated by a panel write). Not seen here: a level picked later
+    inside Claude with /effort when no model is chosen, or saved under the
+    model's full id while the file names an alias. Values failing the
+    character set read as unrecognised."""
     st = settings if isinstance(settings, dict) else {}
     senv = st.get("env") if isinstance(st.get("env"), dict) else {}
 
