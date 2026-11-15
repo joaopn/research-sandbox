@@ -7,6 +7,9 @@ Staged into rs-fetch surfaces beside rs-fetch. Run by hand:
     rs-sync <gitea owner>/<repo> <github owner>/<repo> --apply    # do it
     rs-sync <gitea owner>/<repo> <github owner>/<repo> --remove [--apply]
 
+--skip wiki and --skip board leave a part out; --wiki-overwrite lets a run
+commit (or a remove force-push) past edits made on the GitHub wiki.
+
 What goes over, one way (Gitea -> GitHub):
   * every closed issue, and every open issue that carries none of the
     labels in RS_SYNC_HOLD_LABELS, with its comments, as ONE dated import
@@ -14,7 +17,11 @@ What goes over, one way (Gitea -> GitHub):
     original creation, close and comment dates);
   * every merged pull request, as a closed, locked issue titled
     "[PR] <title>", labelled "merged-pr", listing the commits it landed as;
-  * the Gitea labels the mirrored items carry, each tagged " (rs-sync)".
+  * the Gitea labels the mirrored items carry, each tagged " (rs-sync)";
+  * the fork's wiki: the GitHub wiki's tree is replaced by the converted Gitea
+    tree, one commit per run whose message ends with a marker line;
+  * the fork's boards: one GitHub project with a Status and an Area field,
+    every open mirrored issue that is a card an item in the same column.
 Every mirrored item is locked. Later runs bring GitHub level with Gitea:
 new comments, edits, closes and label changes go over dated at the run.
 
@@ -44,10 +51,14 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import contextlib
+import fcntl
 import json
 import os
+import posixpath
 import re
 import stat
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -65,6 +76,7 @@ GITEA_TOKEN_PATH = Path.home() / ".dev-tokens" / "issue-reader.token"
 TOKENS_DIR = Path.home() / ".dev-tokens"
 DEFAULT_ENV = Path.home() / ".rs-sync.env"
 GITHUB_API = "https://api.github.com"
+GITHUB_WEB = "https://github.com"
 # The product's home, linked from the optional header line.
 RS_HOME = "https://github.com/joaopn/research-sandbox"
 
@@ -72,6 +84,9 @@ RS_HOME = "https://github.com/joaopn/research-sandbox"
 # fake GitHub). Unset in every real container.
 GITEA_BASE = os.environ.get("RS_SYNC_TEST_GITEA_URL") or GITEA_BASE
 GITHUB_API = os.environ.get("RS_SYNC_TEST_GITHUB_API") or GITHUB_API
+# The GitHub wiki is <this>/<owner>/<repo>.wiki.git (a local folder of bare
+# repos in the harness).
+GITHUB_WIKI_BASE = os.environ.get("RS_SYNC_TEST_GITHUB_WIKI_BASE") or GITHUB_WEB
 if os.environ.get("RS_SYNC_TEST_GITEA_TOKEN_FILE"):
     GITEA_TOKEN_PATH = Path(os.environ["RS_SYNC_TEST_GITEA_TOKEN_FILE"])
 _TEST_FAST = os.environ.get("RS_SYNC_TEST_FAST") == "1"
@@ -278,9 +293,13 @@ def parse_marker(body):
 class Ctx:
     """What a conversion needs: the fork, the target and the number table."""
 
-    def __init__(self, owner, repo, target, table):
+    def __init__(self, owner, repo, target, table, wiki=False):
         self.owner, self.repo, self.target = owner, repo, target
         self.table = table            # Gitea number -> GitHub number
+        # A wiki page: GitHub does not link #N there, so a mapped reference
+        # is written as the mirrored issue's URL; relative links resolve
+        # against the fork's wiki.
+        self.wiki = wiki
 
     def gh_url(self, m):
         return f"https://github.com/{self.target}/issues/{m}"
@@ -385,6 +404,8 @@ def _neutralise(s: str, shields: bool = False) -> str:
     def nxt(i):
         while i < len(s) and s[i] in (SHIELD_OPEN, SHIELD_CLOSE):
             i += 1
+        if s[i:i + 1] == WREF_OPEN:
+            return "h"          # a wiki reference may become a URL: treat it as one
         m = _ENT_RE.match(s, i)
         return _ent_char(m.group(0)) if m else s[i:i + 1]
 
@@ -449,23 +470,68 @@ _REF_RE = re.compile(
 # pass (_finish), which neutralises everything outside the shields and then
 # drops them. Private-use characters, stripped from the input.
 SHIELD_OPEN, SHIELD_CLOSE = "\ue000", "\ue001"
+# A wiki page's mapped reference waits as WREF_OPEN url WREF_SEP number
+# WREF_CLOSE until the final pass can see what follows it (private-use too).
+WREF_OPEN, WREF_SEP, WREF_CLOSE = "\ue002", "\ue003", "\ue004"
+_PRIVATE = (SHIELD_OPEN, SHIELD_CLOSE, WREF_OPEN, WREF_SEP, WREF_CLOSE)
+_WREF_RE = re.compile(re.escape(WREF_OPEN) + r"([^\ue002-\ue004]*)" + re.escape(WREF_SEP)
+                      + r"([0-9]+)" + re.escape(WREF_CLOSE))
+# GitHub's autolink ends a bare URL at whitespace or "<" and then drops
+# trailing ? ! . , : * _ ~ and an unmatched ")": only those may follow the
+# URL, or the link would swallow them and lead nowhere (#5/#6, #5's, #5.1).
+_URL_TAIL_OK = re.compile(r"[?!.,:*_~)]*")
+# cmark-gfm ends an autolink at ASCII whitespace only (a no-break or
+# ideographic space is part of the link), or at "<".
+_URL_END = " \t\n\r\f\v<"
+
+
+def _strip_private(t: str) -> str:
+    for c in _PRIVATE:
+        t = t.replace(c, "")
+    return t
 
 
 def _shield(t: str) -> str:
     return SHIELD_OPEN + t + SHIELD_CLOSE
 
 
+def _wiki_ref(m) -> str:
+    # Scan only the trimmed punctuation: the scan stops at the first other
+    # character (the next reference's marker included), so each one is
+    # bounded by the gap to the next and the pass stays linear.
+    s, t = m.string, _URL_TAIL_OK.match(m.string, m.end()).end()
+    clean = t == len(s) or s[t] in _URL_END
+    return m.group(1) if clean else "#" + m.group(2)
+
+
 def _finish(s: str) -> str:
     """The final pass over a whole converted text: neutralise every join the
     piecewise conversion made (an "@" from one piece before a name from the
-    next, say), leaving shielded references alone, then drop the shields."""
-    return _neutralise(s, shields=True).replace(SHIELD_OPEN, "").replace(SHIELD_CLOSE, "")
+    next, say), leaving shielded references alone, then drop the shields. A
+    wiki page's mapped reference becomes the mirror's URL where GitHub's
+    autolink ends it cleanly, else the plain #M (right number, unlinked)."""
+    s = _neutralise(s, shields=True)
+    # An "&" (or "&#") right before a shielded reference would read as an
+    # entity with it ("&" + "#64" + ";" is "@", "&#" + "x40rg/…" is "@rg/…"):
+    # a zero-width space keeps them apart.
+    s = re.sub("(&#?)" + SHIELD_OPEN, "\\1" + ZW + SHIELD_OPEN, s)
+    s = s.replace(SHIELD_OPEN, "").replace(SHIELD_CLOSE, "")
+    return _WREF_RE.sub(_wiki_ref, s) if WREF_OPEN in s else s
 _GITEA_HOST_RE = re.compile(r"^https?://%s(?::\d+)?(/.*)?$" % re.escape(GITEA_HOST), re.I)
 
 
 def _ref(ctx: Ctx, n: int) -> str:
+    """A reference to Gitea #n: its GitHub number, or neutralised when
+    unmapped. In a wiki page (where GitHub does not link #N) the mapped form
+    is the mirrored issue's URL, which the wiki links by itself: no link
+    syntax is added, so nothing can nest inside a link's text or show as
+    markup in code."""
     m = ctx.table.get(n)
-    return _shield(f"#{m}") if m else f"gitea#{ZW}{n}"
+    if not m:
+        return f"gitea#{ZW}{n}"
+    if ctx.wiki:
+        return _shield(WREF_OPEN + ctx.gh_url(m) + WREF_SEP + str(m) + WREF_CLOSE)
+    return _shield(f"#{m}")
 
 
 def _gitea_path(url: str, ctx: "Ctx | None" = None):
@@ -475,6 +541,18 @@ def _gitea_path(url: str, ctx: "Ctx | None" = None):
     not GitHub (a link copied from the webui's Gitea tab)."""
     if url.startswith("/") and not url.startswith("//"):
         return url
+    if ctx is not None and ctx.wiki and url and not url.startswith(("#", "//")) \
+            and not re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", url) \
+            and not url.lower().startswith("www."):
+        # A wiki page's relative link: Gitea resolves it against the fork's
+        # wiki. Another page or a file of the wiki stays as it is (GitHub's
+        # wiki resolves it the same way); anything above the wiki
+        # (../issues/5) is a Gitea path.
+        root = f"/{ctx.owner}/{ctx.repo}/wiki"
+        path = posixpath.normpath(root + "/" + re.split(r"[?#]", url, maxsplit=1)[0])
+        if path == root or path.startswith(root + "/"):
+            return None
+        return path
     m = _GITEA_HOST_RE.match(url)
     if m:
         return m.group(1) or "/"
@@ -639,7 +717,7 @@ def convert(ctx: Ctx, text) -> str:
     else is converted (see the region list above)."""
     if not text:
         return ""
-    text = text.replace(SHIELD_OPEN, "").replace(SHIELD_CLOSE, "")
+    text = _strip_private(text)
     lines = text.replace("\r\n", "\n").split("\n")
     out, buf = [], []
     fence = None
@@ -854,9 +932,11 @@ class GitHub:
             if gap > 0:
                 sleep(gap)
 
-    def call(self, method, path, body=None, accept=None, full_url=None, ok404=False):
+    def call(self, method, path, body=None, accept=None, full_url=None, ok404=False,
+             write=None):
         url = full_url or f"{self.base}{path}"
-        write = method in ("POST", "PATCH", "PUT", "DELETE")
+        if write is None:
+            write = method in ("POST", "PATCH", "PUT", "DELETE")
         waited = 0.0
         while True:
             if write:
@@ -926,8 +1006,10 @@ class GitHub:
         return rows
 
     def graphql(self, query, variables):
+        # A query is a read (no pacing); a mutation creates or changes content.
         _, out, _ = self.call("POST", "/graphql",
-                              {"query": query, "variables": variables})
+                              {"query": query, "variables": variables},
+                              write=query.lstrip().startswith("mutation"))
         if not isinstance(out, dict) or out.get("errors"):
             die(f"GitHub GraphQL failed: {_safe(json.dumps((out or {}).get('errors'))[:300], self.token)}")
         return out.get("data")
@@ -1085,7 +1167,7 @@ def pr_commit_lines(ctx, item, subjects_index) -> str:
     idx = subjects_index.get(item.get("base") or "")
     for s in item.get("subjects") or []:
         shas = (idx or {}).get(s) or []
-        subj = _finish(_convert_inline(ctx, s.replace(SHIELD_OPEN, "").replace(SHIELD_CLOSE, "")))
+        subj = _finish(_convert_inline(ctx, _strip_private(s)))
         if len(shas) == 1:
             lines.append(f"- {shas[0][:12]} {subj}")
         else:
@@ -1117,7 +1199,7 @@ def comment_parts(ctx, item, c, rid) -> list:
 
 
 def convert_title(ctx, title) -> str:
-    t = _finish(_convert_inline(ctx, (title or "").replace(SHIELD_OPEN, "").replace(SHIELD_CLOSE, "")))
+    t = _finish(_convert_inline(ctx, _strip_private(title or "")))
     if len(t) > GITHUB_TITLE_MAX:
         # never leave part of a number after a "#" or "GH-": it would link
         # a different issue
@@ -1266,7 +1348,7 @@ def parse_repo_arg(v: str, what: str):
     return m.group(1), m.group(2)
 
 
-def preflight_github(gh: GitHub, target: str):
+def preflight_github(gh: GitHub, target: str, board: bool = False):
     _, me, _ = gh.call("GET", "/user")
     if not isinstance(me, dict) or "id" not in me:
         die("GitHub: could not read the token's account")
@@ -1279,6 +1361,10 @@ def preflight_github(gh: GitHub, target: str):
     if "repo" not in scopes and need not in scopes:
         die(f"the GitHub token lacks the {need} scope (it has: "
             f"{', '.join(sorted(scopes)) or 'none'})")
+    if board and "project" not in scopes:
+        die(f"the GitHub token lacks the project scope, which the board needs "
+            f"(it has: {', '.join(sorted(scopes)) or 'none'}); add it to the "
+            f"token, or run with --skip board")
     full = repo.get("full_name") or target
     if full.lower() != target.lower():
         die(f"GitHub repo {target} was renamed or moved to {full}; run with that name")
@@ -1406,7 +1492,8 @@ def sync(args, env) -> None:
     apply = args.apply
     secrets = [env["RS_SYNC_GITHUB_TOKEN"]] + all_dev_tokens()
     gh = GitHub(GITHUB_API, env["RS_SYNC_GITHUB_TOKEN"])
-    me, repo_info, _ = preflight_github(gh, target)
+    skip = set(args.skip or [])
+    me, repo_info, _ = preflight_github(gh, target, board="board" not in skip)
     REPORT["github"] = {"repo": target, "account": me.get("login")}
     gitea_answers()
     try:
@@ -1468,6 +1555,21 @@ def sync(args, env) -> None:
                 f"not made by rs-sync; rename or delete it on GitHub, then "
                 f"run again")
 
+    # The wiki and the board: every read and refusal before any write.
+    wanted = {it["n"] for it in items if not it["closed"] and not it["pr"]}
+    wiki_state = board_state = None
+    if "wiki" in skip:
+        REPORT["wiki"] = {"skipped": "--skip wiki"}
+    else:
+        wiki_state = wiki_prepare(args, owner, repo, target, repo_info, gt["info"], gtok,
+                                  env["RS_SYNC_GITHUB_TOKEN"], secrets, "sync")
+    if "board" in skip:
+        REPORT["board"] = {"skipped": "--skip board"}
+    else:
+        board_state = board_prepare(g, gh, owner, repo, target, secrets,
+                                    public=not repo_info.get("private"))
+        board_desired(board_state["boards"], wanted)      # refuses an issue on two boards
+
     plan = {"create_labels": [p["name"] for p in to_create], "import": [],
             "edit": [], "comment_new": [], "comment_edit": [], "comment_delete": [],
             "state": [], "labels": [], "lock": [], "delete": []}
@@ -1481,6 +1583,18 @@ def sync(args, env) -> None:
         _fill_existing_plan(plan, items, have, ctx, rid, env, subjects_index, gt, g, owner, repo, dry=True)
         writes_est += sum(len(plan[k]) for k in ("edit", "comment_new", "comment_edit",
                                                  "comment_delete", "state", "labels", "lock", "delete"))
+        if wiki_state:
+            wiki_apply(wiki_state, Ctx(owner, repo, target, table, wiki=True), me,
+                       env["RS_SYNC_GITHUB_TOKEN"], secrets, dry=True)
+        if board_state:
+            node_of = {n: v["node_id"] for n, v in have["items"].items()}
+            board_apply(gh, board_state, owner, repo, target, wanted, node_of, dry=True)
+            bp = REPORT["board"]
+            # Creating a project is three writes; an item still to be
+            # imported is an add and two values.
+            writes_est += (3 if bp.get("create_project") else 0) + 3 * bp.get("after_import", 0) \
+                + sum(bp.get(k, 0) for k in ("project_settings", "fields", "add", "set",
+                                             "remove", "move"))
         REPORT["plan"] = {k: (v if len(v) <= 40 else v[:40] + [f"… {len(v) - 40} more"])
                           for k, v in plan.items()}
         REPORT["plan_counts"] = {k: len(v) for k, v in plan.items()}
@@ -1527,6 +1641,12 @@ def sync(args, env) -> None:
         table[n] = v["number"]
     _fill_existing_plan(plan, items, have, ctx, rid, env, subjects_index, gt, g, owner, repo,
                         dry=False, gh=gh, base=base, done=done, secrets=secrets)
+    if wiki_state:
+        wiki_apply(wiki_state, Ctx(owner, repo, target, table, wiki=True), me,
+                   env["RS_SYNC_GITHUB_TOKEN"], secrets, dry=False)
+    if board_state:
+        node_of = {n: v["node_id"] for n, v in have["items"].items()}
+        board_apply(gh, board_state, owner, repo, target, wanted, node_of, dry=False)
     REPORT["dry_run"] = False
 
 
@@ -1714,18 +1834,718 @@ def delete_issue(gh: GitHub, node_id):
 
 
 # ============================================================================
+# The wiki
+# ============================================================================
+
+# Where rs-sync keeps one bare git repository for the wiki work, reused by
+# every run and never deleted: both wikis are fetched into it and the new tree
+# is built from git objects, so no working tree (and nothing to clean up) is
+# ever needed. It holds copies of public wiki content only, never a token.
+CACHE_DIR = Path.home() / ".cache" / "rs-sync"
+# The bound on one git network call (ls-remote, fetch, push of a wiki). A wiki
+# with images is a few MB; at half this a slow link could cut a push off (the
+# next run retries it), at ten times it a hung connection would hold the
+# terminal for most of an hour. The same bound as one import's deadline.
+GIT_TIMEOUT_S = 300
+WIKI_SUBJECT = "Mirror the wiki of a private dev repo"
+_GIT_HELPER = ('!f() { test "$1" = get || exit 0; echo username=x-access-token; '
+               'echo "password=$RS_SYNC_GIT_TOKEN"; }; f')
+_BRANCH_RE = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9._-]*(?:/[A-Za-z0-9_-][A-Za-z0-9._-]*)*")
+_MARK_LINE_RE = re.compile(r"rs-sync v1 gitea:(%s)/(%s)" % (NAME_RE, NAME_RE))
+
+
+def wiki_marker(owner, repo) -> str:
+    return f"{MARKER_TAG} gitea:{owner}/{repo}"
+
+
+def is_wiki_commit(message: str, owner, repo) -> bool:
+    """A commit rs-sync made for this fork: its message's last line is exactly
+    the marker line."""
+    lines = (message or "").rstrip().split("\n")
+    m = _MARK_LINE_RE.fullmatch(lines[-1].strip()) if lines else None
+    return bool(m) and (m.group(1).lower(), m.group(2).lower()) == (owner.lower(), repo.lower())
+
+
+def _git_argv(args, token) -> list:
+    """git with the user's own config shut out (no hooks, no signing, no
+    stored credentials) and, when a token is needed, a one-shot helper that
+    reads it from the environment: the token never enters argv."""
+    argv = ["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false",
+            "-c", "credential.helper="]
+    if token:
+        argv += ["-c", "credential.helper=" + _GIT_HELPER]
+    return argv + list(args)
+
+
+def _git_env(token, extra=None) -> dict:
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("GIT_") and k != "RS_SYNC_GIT_TOKEN"}
+    env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1", "LC_ALL": "C"})
+    if token:
+        env["RS_SYNC_GIT_TOKEN"] = token
+    env.update(extra or {})
+    return env
+
+
+def _last_line(text: str) -> str:
+    lines = [l for l in (text or "").strip().splitlines() if l.strip()]
+    return lines[-1][:300] if lines else "no output"
+
+
+def run_git(args, token=None, data=None, extra_env=None, what="git"):
+    """(returncode, stdout bytes, stderr text with the token scrubbed)."""
+    try:
+        p = subprocess.run(_git_argv(args, token), input=data, capture_output=True,
+                           stdin=None if data is not None else subprocess.DEVNULL,
+                           env=_git_env(token, extra_env), timeout=GIT_TIMEOUT_S)
+    except FileNotFoundError:
+        die("git is not installed here; rs-sync needs it for the wiki (or run "
+            "with --skip wiki)")
+    except subprocess.TimeoutExpired:
+        die(f"{what} did not finish within {GIT_TIMEOUT_S} s; run again later")
+    return p.returncode, p.stdout, _safe(p.stderr.decode("utf-8", "replace"), token)
+
+
+_CACHES: dict = {}
+
+
+def wiki_cache() -> "WikiCache":
+    """The process's one WikiCache (its lock is held until the process ends;
+    a second open of the lock file would refuse against our own lock)."""
+    key = str(CACHE_DIR)
+    if key not in _CACHES:
+        _CACHES[key] = WikiCache()
+    return _CACHES[key]
+
+
+class WikiCache:
+    """The one bare repository the wiki work happens in, locked for the run."""
+
+    def __init__(self):
+        CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            self.lock_fd = os.open(CACHE_DIR / "wiki.lock",
+                                   os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        except OSError as e:
+            die(f"cannot open {CACHE_DIR / 'wiki.lock'} ({e.strerror})")
+        try:
+            fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(self.lock_fd)
+            die("another rs-sync run is using the wiki cache; wait for it to "
+                "finish, then run again")
+        self.dir = CACHE_DIR / "wiki.git"
+        if not (self.dir / "HEAD").is_file():
+            rc, _, err = run_git(["init", "--bare", "-q", str(self.dir)], what="git init")
+            if rc:
+                die(f"cannot create the wiki cache {self.dir} ({_last_line(err)})")
+        self.index = CACHE_DIR / "wiki.index"
+
+    def git(self, args, **kw):
+        return run_git(["--git-dir", str(self.dir)] + list(args), **kw)
+
+    def must(self, args, what, **kw) -> bytes:
+        rc, out, err = self.git(args, what=what, **kw)
+        if rc:
+            die(f"{what} failed ({_last_line(err)})")
+        return out
+
+
+def remote_head(cache: WikiCache, url, token, side):
+    """(branch, sha) of a wiki's default branch, or None when that wiki does
+    not exist (no first page yet, or switched off). Any other failure stops
+    the run: an unreadable wiki must never read as an empty one."""
+    rc, out, err = cache.git(["ls-remote", "--symref", url, "HEAD"], token=token,
+                             what=f"reading the {side} wiki")
+    if rc:
+        low = err.lower()
+        if "not found" in low or "does not appear to be a git repository" in low \
+                or "wiki is disabled" in low:
+            return None
+        die(f"could not read the {side} wiki ({_last_line(err)}); run again later")
+    branch = sha = None
+    for line in out.decode("utf-8", "replace").splitlines():
+        if line.startswith("ref: ") and line.endswith("\tHEAD"):
+            ref = line[5:-5]
+            if ref.startswith("refs/heads/"):
+                branch = ref[len("refs/heads/"):]
+        elif line.endswith("\tHEAD"):
+            sha = line.split("\t", 1)[0]
+    if not sha:
+        return None
+    if not branch or not _BRANCH_RE.fullmatch(branch) or ".." in branch \
+            or branch.endswith(".lock"):
+        die(f"the {side} wiki's default branch {branch!r} is not one rs-sync can use")
+    return branch, sha
+
+
+def fetch_wiki(cache: WikiCache, url, token, branch, ref, side) -> str:
+    cache.must(["fetch", "--no-tags", "-q", url, f"+refs/heads/{branch}:{ref}"],
+               f"fetching the {side} wiki", token=token)
+    return cache.must(["rev-parse", "--verify", ref + "^{commit}"],
+                      f"reading the {side} wiki").decode().strip()
+
+
+def wiki_commits(cache: WikiCache, revs) -> list:
+    """(sha, message) of the commits `revs` selects, children first."""
+    out = cache.must(["log", "-z", "--topo-order", "--format=%H%n%B"] + list(revs) + ["--"],
+                     "reading the GitHub wiki's history")
+    rows = []
+    for rec in out.decode("utf-8", "replace").split("\0"):
+        rec = rec.lstrip("\n")
+        if rec:
+            sha, _, msg = rec.partition("\n")
+            rows.append((sha.strip(), msg))
+    return rows
+
+
+def _describe(rows) -> str:
+    shown = [f"{sha[:10]} {(msg.strip().splitlines() or [''])[0][:60]!r}" for sha, msg in rows[:5]]
+    more = f" and {len(rows) - 5} more" if len(rows) > 5 else ""
+    return ", ".join(shown) + more
+
+
+def wiki_files(cache: WikiCache, ref) -> list:
+    """Every blob of a wiki tree as (mode, sha, path bytes, content bytes)."""
+    out = cache.must(["ls-tree", "-r", "-z", "--full-tree", ref], "reading the Gitea wiki")
+    files = []
+    for rec in out.split(b"\0"):
+        if not rec:
+            continue
+        meta, path = rec.split(b"\t", 1)
+        mode, kind, sha = meta.decode().split()
+        if kind != "blob":
+            REPORT.setdefault("wiki_entries_skipped", []).append(path.decode("utf-8", "replace"))
+            continue
+        data = cache.must(["cat-file", "blob", sha], "reading the Gitea wiki")
+        files.append((mode, sha, path, data))
+    return files
+
+
+def build_wiki_tree(cache: WikiCache, files, ctx: Ctx, secrets) -> tuple:
+    """The converted tree: markdown pages converted (a mapped reference becomes
+    the mirrored issue's URL), every other file copied as it is. Returns
+    (tree sha, pages converted). Each text is checked for a token first."""
+    entries, pages = [], 0
+    for mode, sha, path, data in files:
+        name = path.decode("utf-8", "replace")
+        if path.lower().endswith(b".md") and mode in ("100644", "100755"):
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                REPORT["wiki_pages_not_text"] = REPORT.get("wiki_pages_not_text", 0) + 1
+                entries.append((mode, sha, path))
+                continue
+            new = convert(ctx, text)
+            check_secrets([new], secrets, f"the wiki page {name}")
+            if new != text:
+                sha = cache.must(["hash-object", "-w", "--stdin"], "writing the wiki tree",
+                                 data=new.encode("utf-8")).decode().strip()
+            pages += 1
+        entries.append((mode, sha, path))
+    with contextlib.suppress(FileNotFoundError):
+        cache.index.unlink()
+    env = {"GIT_INDEX_FILE": str(cache.index)}
+    try:
+        cache.must(["update-index", "-z", "--index-info"], "writing the wiki tree",
+                   data=b"".join(f"{m} {s}\t".encode() + p + b"\0" for m, s, p in entries),
+                   extra_env=env)
+        tree = cache.must(["write-tree"], "writing the wiki tree", extra_env=env).decode().strip()
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            cache.index.unlink()
+    return tree, pages
+
+
+def wiki_prepare(args, owner, repo, target, repo_info, gt_info, gtok, gh_token, secrets,
+                 mode):
+    """Everything the wiki needs before any write: both wikis fetched, the
+    GitHub side checked for edits made there, the Gitea texts checked for
+    tokens. Returns a state dict, or None when there is nothing to do."""
+    gh_url = f"{GITHUB_WIKI_BASE.rstrip('/')}/{target}.wiki.git"
+    if mode == "remove":
+        if not repo_info.get("has_wiki"):
+            REPORT["wiki"] = {"skipped": "the GitHub wiki is switched off"}
+            return None
+        cache = wiki_cache()
+        head = remote_head(cache, gh_url, gh_token, "GitHub")
+        if head is None:
+            REPORT["wiki"] = {"skipped": "the GitHub wiki has no pages"}
+            return None
+        gh_sha = fetch_wiki(cache, gh_url, gh_token, head[0], "refs/rs-sync/github", "GitHub")
+        ours = [r for r in wiki_commits(cache, [gh_sha]) if is_wiki_commit(r[1], owner, repo)]
+        if not ours:
+            REPORT["wiki"] = {"skipped": "no rs-sync commit on the GitHub wiki"}
+            return None
+        first = ours[-1][0]
+        rc, out, _ = cache.git(["rev-parse", "--verify", "-q", first + "^1"], what="reading the GitHub wiki")
+        if rc:
+            die(f"the GitHub wiki's first commit is rs-sync's ({first[:10]}); there is no "
+                f"earlier state to restore. Delete its pages in the Wiki tab, or run with "
+                f"--skip wiki")
+        parent = out.decode().strip()
+        humans = [r for r in wiki_commits(cache, [gh_sha, "^" + parent])
+                  if not is_wiki_commit(r[1], owner, repo)]
+        if humans and not args.wiki_overwrite:
+            die(f"the GitHub wiki has edits made on GitHub since rs-sync's first commit "
+                f"({_describe(humans)}); a remove would drop them. Copy what should stay "
+                f"elsewhere, then run again with --wiki-overwrite")
+        REPORT["wiki"] = {"restore_to": parent[:10], "rs_sync_commits": len(ours),
+                          "github_edits_overwritten": len(humans)}
+        return {"cache": cache, "url": gh_url, "branch": head[0], "head": gh_sha,
+                "parent": parent}
+
+    if not gt_info.get("has_wiki", True):
+        REPORT["wiki"] = {"skipped": "the Gitea wiki is switched off"}
+        return None
+    cache = wiki_cache()
+    gitea_url = f"{GITEA_BASE.rstrip('/')}/{owner}/{repo}.wiki.git"
+    ghead = remote_head(cache, gitea_url, gtok, "Gitea")
+    if ghead is None:
+        REPORT["wiki"] = {"skipped": "the Gitea wiki has no pages"}
+        return None
+    g_sha = fetch_wiki(cache, gitea_url, gtok, ghead[0], "refs/rs-sync/gitea", "Gitea")
+    files = wiki_files(cache, g_sha)
+    if not files:
+        REPORT["wiki"] = {"skipped": "the Gitea wiki has no files"}
+        return None
+    for _, _, path, data in files:
+        check_secrets([path.decode("utf-8", "replace"), data.decode("utf-8", "replace")], secrets,
+                      f"the Gitea wiki file {_safe(path.decode('utf-8', 'replace'), *secrets)}")
+    if not repo_info.get("has_wiki"):
+        die(f"the wiki is switched off on {target}; turn it on in the repository "
+            f"settings, or run with --skip wiki")
+    head = remote_head(cache, gh_url, gh_token, "GitHub")
+    if head is None:
+        die(f"the GitHub wiki of {target} has no pages yet (GitHub creates it with "
+            f"the first page): create any page in the repository's Wiki tab, then "
+            f"run again")
+    gh_sha = fetch_wiki(cache, gh_url, gh_token, head[0], "refs/rs-sync/github", "GitHub")
+    rows = wiki_commits(cache, [gh_sha])
+    ours = [r[0] for r in rows if is_wiki_commit(r[1], owner, repo)]
+    humans = []
+    if ours:
+        humans = [r for r in wiki_commits(cache, [gh_sha, "^" + ours[0]])
+                  if not is_wiki_commit(r[1], owner, repo)]
+    if humans and not args.wiki_overwrite:
+        die(f"the GitHub wiki has edits made on GitHub since rs-sync's last commit "
+            f"({_describe(humans)}); a sync would replace them. Carry the edits into "
+            f"the Gitea wiki if they should stay, then run again with --wiki-overwrite")
+    gh_tree = cache.must(["rev-parse", "--verify", gh_sha + "^{tree}"],
+                         "reading the GitHub wiki").decode().strip()
+    return {"cache": cache, "url": gh_url, "branch": head[0], "head": gh_sha,
+            "tree": gh_tree, "files": files, "overwritten": len(humans)}
+
+
+def wiki_apply(state, ctx: Ctx, me, gh_token, secrets, dry):
+    """Commit the converted Gitea tree on top of the GitHub wiki's head and
+    push it; nothing when the tree is unchanged."""
+    cache = state["cache"]
+    tree, pages = build_wiki_tree(cache, state["files"], ctx, secrets)
+    changed = tree != state["tree"]
+    rep = {"pages": pages, "files": len(state["files"]) - pages, "changed": changed,
+           "github_edits_overwritten": state["overwritten"]}
+    REPORT["wiki"] = rep
+    if dry or not changed:
+        return
+    login = me.get("login") or "rs-sync"
+    email = f"{me.get('id')}+{login}@users.noreply.github.com"
+    ident = {"GIT_AUTHOR_NAME": login, "GIT_AUTHOR_EMAIL": email,
+             "GIT_COMMITTER_NAME": login, "GIT_COMMITTER_EMAIL": email}
+    msg = f"{WIKI_SUBJECT}\n\n{wiki_marker(ctx.owner, ctx.repo)}\n"
+    commit = cache.must(["commit-tree", tree, "-p", state["head"], "-F", "-"],
+                        "writing the wiki commit", data=msg.encode(),
+                        extra_env=ident).decode().strip()
+    rc, _, err = cache.git(["push", "-q", state["url"], f"{commit}:refs/heads/{state['branch']}"],
+                           token=gh_token, what="pushing the GitHub wiki")
+    if rc:
+        die(f"pushing the GitHub wiki failed ({_last_line(err)}); if it changed "
+            f"during the run, run again")
+    rep["commit"] = commit[:10]
+
+
+def wiki_restore(state, gh_token):
+    """Force the GitHub wiki back to the state before rs-sync's first commit,
+    leased on the head that was checked."""
+    cache = state["cache"]
+    rc, _, err = cache.git(["push", "-q",
+                            f"--force-with-lease=refs/heads/{state['branch']}:{state['head']}",
+                            state["url"], f"{state['parent']}:refs/heads/{state['branch']}"],
+                           token=gh_token, what="restoring the GitHub wiki")
+    if rc:
+        die(f"restoring the GitHub wiki failed ({_last_line(err)}); if it changed "
+            f"during the run, run again")
+    REPORT["wiki"]["restored"] = True
+
+
+# ============================================================================
+# The board
+# ============================================================================
+
+STATUS_FIELD = "Status"
+AREA_FIELD = "Area"
+# The colour of every option rs-sync writes: Gitea columns carry none.
+OPTION_COLOR = "GRAY"
+_BOARD_MARK_RE = re.compile(r"\(rs-sync v1 gitea:(%s)/(%s)\)\s*$" % (NAME_RE, NAME_RE))
+# GitHub's GraphQL connections answer at most 100 nodes a page.
+GRAPHQL_PAGE = 100
+
+
+def board_description(owner, repo) -> str:
+    return f"The boards of a private dev repo, mirrored with rs-sync ({wiki_marker(owner, repo)})"
+
+
+def board_marked(desc, owner, repo) -> bool:
+    m = _BOARD_MARK_RE.search(desc or "")
+    return bool(m) and (m.group(1).lower(), m.group(2).lower()) == (owner.lower(), repo.lower())
+
+
+def read_gitea_boards(g: Gitea, owner, repo) -> list:
+    """The fork's open boards, in creation order, each with its columns in
+    their order and each column's cards in their order (numbers)."""
+    base = f"/repos/{quote(owner)}/{quote(repo)}"
+    boards = []
+    for b in sorted(g.all(f"{base}/projects"), key=lambda b: b["id"]):
+        cols = []
+        for c in sorted(g.all(f"{base}/projects/{b['id']}/columns"),
+                        key=lambda c: (c.get("sorting") or 0, c["id"])):
+            cards = g.all(f"{base}/projects/{b['id']}/columns/{c['id']}/issues")
+            cols.append({"title": c.get("title") or "", "cards": [i["number"] for i in cards]})
+        boards.append({"title": b.get("title") or "", "columns": cols})
+    return boards
+
+
+def board_desired(boards, wanted_numbers) -> dict:
+    """What the GitHub project should hold: the Status options (the columns'
+    union, in board order), the Area options (the board titles), and the items
+    (an open mirrored issue that is a card), ordered by column, then board,
+    then the card's place. A wanted issue on two boards stops the run."""
+    statuses, areas, where = [], [], {}
+    for b in boards:
+        if b["title"] not in areas:
+            areas.append(b["title"])
+        for c in b["columns"]:
+            if c["title"] not in statuses:
+                statuses.append(c["title"])
+            for k, n in enumerate(c["cards"]):
+                if n not in wanted_numbers:
+                    continue
+                if n in where and where[n][1] != b["title"]:
+                    die(f"Gitea #{n} is a card on two boards ({where[n][1]!r} and "
+                        f"{b['title']!r}); the GitHub project gives an issue one area. "
+                        f"Remove one of the cards, then run again")
+                where.setdefault(n, (c["title"], b["title"], k))
+    order = sorted(where, key=lambda n: (statuses.index(where[n][0]),
+                                         areas.index(where[n][1]), where[n][2]))
+    return {"statuses": statuses, "areas": areas,
+            "items": [(n, where[n][0], where[n][1]) for n in order]}
+
+
+def plan_moves(current, desired) -> list:
+    """(item, after) moves that make the managed items' relative order equal
+    `desired` (after None = to the top); none when it already is."""
+    want = set(desired)
+    cur = [i for i in current if i in want]
+    moves = []
+    for k, item in enumerate(desired):
+        if k < len(cur) and cur[k] == item:
+            continue
+        moves.append((item, desired[k - 1] if k else None))
+        cur.remove(item)
+        cur.insert(k, item)
+    return moves
+
+
+Q_VIEWER = """query rsViewerProjects($after:String){viewer{id login projectsV2(first:%d,after:$after){
+pageInfo{hasNextPage endCursor} nodes{id number title shortDescription}}}}""" % GRAPHQL_PAGE
+Q_REPO = """query rsRepoId($o:String!,$n:String!){repository(owner:$o,name:$n){id}}"""
+Q_PROJECT = """query rsProject($id:ID!,$after:String){node(id:$id){... on ProjectV2{id title public
+shortDescription repositories(first:%d){nodes{id}} fields(first:%d){nodes{
+... on ProjectV2FieldCommon{id name dataType} ... on ProjectV2SingleSelectField{options{id name}}}}
+items(first:%d,after:$after,orderBy:{field:POSITION,direction:ASC}){pageInfo{hasNextPage endCursor}
+nodes{id content{... on Issue{id}} fieldValues(first:%d){nodes{
+... on ProjectV2ItemFieldSingleSelectValue{optionId field{... on ProjectV2FieldCommon{id}}}}}}}}}}""" % (
+    GRAPHQL_PAGE, GRAPHQL_PAGE, GRAPHQL_PAGE, GRAPHQL_PAGE)
+M_CREATE = """mutation rsCreateProject($o:ID!,$t:String!){createProjectV2(input:{ownerId:$o,title:$t}){projectV2{id}}}"""
+M_UPDATE = """mutation rsUpdateProject($p:ID!,$d:String!,$pub:Boolean!){updateProjectV2(input:{projectId:$p,shortDescription:$d,public:$pub}){projectV2{id}}}"""
+M_LINK = """mutation rsLinkProject($p:ID!,$r:ID!){linkProjectV2ToRepository(input:{projectId:$p,repositoryId:$r}){repository{id}}}"""
+M_FIELD_CREATE = """mutation rsCreateField($p:ID!,$n:String!,$o:[ProjectV2SingleSelectFieldOptionInput!]){createProjectV2Field(input:{projectId:$p,dataType:SINGLE_SELECT,name:$n,singleSelectOptions:$o}){projectV2Field{... on ProjectV2FieldCommon{id}}}}"""
+M_FIELD_UPDATE = """mutation rsUpdateField($f:ID!,$o:[ProjectV2SingleSelectFieldOptionInput!]){updateProjectV2Field(input:{fieldId:$f,singleSelectOptions:$o}){projectV2Field{... on ProjectV2FieldCommon{id}}}}"""
+M_ADD = """mutation rsAddItem($p:ID!,$c:ID!){addProjectV2ItemById(input:{projectId:$p,contentId:$c}){item{id}}}"""
+M_SET = """mutation rsSetValue($p:ID!,$i:ID!,$f:ID!,$v:String!){updateProjectV2ItemFieldValue(input:{projectId:$p,itemId:$i,fieldId:$f,value:{singleSelectOptionId:$v}}){projectV2Item{id}}}"""
+M_DELETE_ITEM = """mutation rsDeleteItem($p:ID!,$i:ID!){deleteProjectV2Item(input:{projectId:$p,itemId:$i}){deletedItemId}}"""
+M_MOVE = """mutation rsMoveItem($p:ID!,$i:ID!,$a:ID){updateProjectV2ItemPosition(input:{projectId:$p,itemId:$i,afterId:$a}){clientMutationId}}"""
+M_DELETE_PROJECT = """mutation rsDeleteProject($p:ID!){deleteProjectV2(input:{projectId:$p}){projectV2{id}}}"""
+
+
+def find_boards(gh: GitHub, owner, repo):
+    """The token account's id and every project of it carrying this fork's
+    marker."""
+    after, viewer, marked = None, None, []
+    while True:
+        d = gh.graphql(Q_VIEWER, {"after": after})
+        v = (d or {}).get("viewer") or {}
+        viewer = v.get("id")
+        conn = v.get("projectsV2") or {}
+        for p in conn.get("nodes") or []:
+            if p and board_marked(p.get("shortDescription"), owner, repo):
+                marked.append(p)
+        info = conn.get("pageInfo") or {}
+        if not info.get("hasNextPage"):
+            break
+        after = info.get("endCursor")
+        if not after:
+            die("GitHub GraphQL: the projects list says it has more pages but gives no cursor")
+    if not viewer:
+        die("GitHub GraphQL did not name the token's account")
+    return viewer, marked
+
+
+def read_board(gh: GitHub, pid) -> dict:
+    after, proj, items = None, None, []
+    while True:
+        d = gh.graphql(Q_PROJECT, {"id": pid, "after": after})
+        node = (d or {}).get("node")
+        if not isinstance(node, dict) or not node.get("id"):
+            die("GitHub GraphQL: the mirrored project could not be read")
+        proj = proj or node
+        conn = node.get("items") or {}
+        for it in conn.get("nodes") or []:
+            if not it:
+                continue
+            vals = {}
+            for fv in ((it.get("fieldValues") or {}).get("nodes") or []):
+                fid = ((fv or {}).get("field") or {}).get("id")
+                if fid and fv.get("optionId"):
+                    vals[fid] = fv["optionId"]
+            items.append({"id": it["id"], "content": (it.get("content") or {}).get("id"),
+                          "values": vals})
+        info = conn.get("pageInfo") or {}
+        if not info.get("hasNextPage"):
+            break
+        after = info.get("endCursor")
+        if not after:
+            die("GitHub GraphQL: the project's item list says it has more pages but gives no cursor")
+    fields = {}
+    for f in ((proj.get("fields") or {}).get("nodes") or []):
+        if f and f.get("name"):
+            fields[f["name"]] = {"id": f.get("id"), "type": f.get("dataType"),
+                                 "options": [(o["id"], o["name"]) for o in f.get("options") or []]}
+    return {"id": proj["id"], "public": proj.get("public"),
+            "desc": proj.get("shortDescription") or "",
+            "repos": {r["id"] for r in ((proj.get("repositories") or {}).get("nodes") or []) if r},
+            "fields": fields, "items": items}
+
+
+def _check_field_types(cur):
+    for name in (STATUS_FIELD, AREA_FIELD):
+        f = cur["fields"].get(name)
+        if f is not None and f["type"] != "SINGLE_SELECT":
+            die(f"the GitHub project already has a field named {name!r} that is not a "
+                f"single-select field; rename or delete it on GitHub, then run again")
+
+
+def board_prepare(g: Gitea, gh: GitHub, owner, repo, target, secrets=(), public=True):
+    """Reads and refusals before any write: the Gitea boards, the marked
+    project and its fields. `public`: the project is public only when the
+    GitHub repo is, so the board never shows more than the repo does."""
+    boards = read_gitea_boards(g, owner, repo)
+    check_secrets([b["title"] for b in boards] + [c["title"] for b in boards for c in b["columns"]],
+                  secrets, "a Gitea board or column title")
+    viewer, marked = find_boards(gh, owner, repo)
+    if len(marked) > 1:
+        die(f"{len(marked)} GitHub projects carry the marker of {owner}/{repo} "
+            f"(numbers {', '.join(str(p.get('number')) for p in marked)}); delete all "
+            f"but one, then run again")
+    o, r = target.split("/", 1)
+    d = gh.graphql(Q_REPO, {"o": o, "n": r})
+    repo_id = ((d or {}).get("repository") or {}).get("id")
+    if not repo_id:
+        die(f"GitHub GraphQL could not read {target}'s id")
+    cur = None
+    if marked:
+        cur = read_board(gh, marked[0]["id"])
+        _check_field_types(cur)
+    return {"boards": boards, "viewer": viewer, "project": marked[0] if marked else None,
+            "repo_id": repo_id, "cur": cur, "public": public}
+
+
+def _options(names):
+    return [{"name": n, "color": OPTION_COLOR, "description": ""} for n in names]
+
+
+def board_apply(gh: GitHub, state, owner, repo, target, wanted_numbers, node_of, dry):
+    """Bring the GitHub project level with the Gitea boards. In a dry run,
+    count what would be written."""
+    want = board_desired(state["boards"], wanted_numbers)
+    plan = {"create_project": False, "project_settings": 0, "fields": 0, "add": 0,
+            "set": 0, "remove": 0, "move": 0}
+    REPORT["board"] = plan
+    proj = state["project"]
+    no_columns = not want["statuses"]
+    if no_columns and proj is None:
+        plan["skipped"] = "the fork has no open Gitea boards with columns"
+        return
+    pending = [n for n, _, _ in want["items"] if not node_of.get(n)]
+    if pending:
+        plan["after_import"] = len(pending)
+    desc, public = board_description(owner, repo), state["public"]
+    managed_contents = {v for v in node_of.values() if v}
+    if proj is None:
+        plan["create_project"] = True
+        plan["fields"] = 2
+        plan["add"] = len(want["items"]) - len(pending)
+        plan["set"] = 2 * plan["add"]
+        if dry:
+            return
+        d = gh.graphql(M_CREATE, {"o": state["viewer"], "t": target.split("/", 1)[1]})
+        pid = (((d or {}).get("createProjectV2") or {}).get("projectV2") or {}).get("id")
+        if not pid:
+            die("GitHub did not return the new project's id")
+        # The marker first: a project without it would be found by no later
+        # run and removed by no --remove.
+        gh.graphql(M_UPDATE, {"p": pid, "d": desc, "pub": public})
+        gh.graphql(M_LINK, {"p": pid, "r": state["repo_id"]})
+        state["project"] = {"id": pid}
+        # From here the counts are of the writes actually made.
+        plan.update(fields=0, add=0, set=0)
+        cur = read_board(gh, pid)
+    elif dry:
+        cur = state["cur"]
+    else:
+        # Read again: the issue pass may have deleted issues, and GitHub
+        # drops their items with them.
+        cur = read_board(gh, proj["id"])
+        _check_field_types(cur)
+    pid = state["project"]["id"]
+
+    def remove_unwanted(keep):
+        for it in [i for i in cur["items"] if i["content"] in managed_contents
+                   and i["content"] not in keep]:
+            plan["remove"] += 1
+            if not dry:
+                gh.graphql(M_DELETE_ITEM, {"p": pid, "i": it["id"]})
+            cur["items"].remove(it)
+
+    if no_columns:
+        # The Gitea boards are gone: rs-sync's items go, as Gitea's cards did.
+        plan["skipped"] = "the fork has no open Gitea boards with columns; rs-sync's items are removed"
+        remove_unwanted(set())
+        return
+    if cur["desc"] != desc or bool(cur["public"]) != public:
+        plan["project_settings"] += 1
+        if not dry:
+            gh.graphql(M_UPDATE, {"p": pid, "d": desc, "pub": public})
+    if state["repo_id"] not in cur["repos"]:
+        plan["project_settings"] += 1
+        if not dry:
+            gh.graphql(M_LINK, {"p": pid, "r": state["repo_id"]})
+
+    # The two fields, with exactly the Gitea options in order.
+    fields_want = ((STATUS_FIELD, want["statuses"]), (AREA_FIELD, want["areas"]))
+    changed = False
+    for name, opts in fields_want:
+        f = cur["fields"].get(name)
+        if f is None:
+            plan["fields"] += 1
+            if not dry:
+                gh.graphql(M_FIELD_CREATE, {"p": pid, "n": name, "o": _options(opts)})
+            changed = True
+        elif [n for _, n in f["options"]] != opts:
+            plan["fields"] += 1
+            if not dry:
+                gh.graphql(M_FIELD_UPDATE, {"f": f["id"], "o": _options(opts)})
+            changed = True
+    if changed and dry:
+        # Option ids may change with the options: every wanted value would be set.
+        on_board = {i["content"] for i in cur["items"]}
+        plan["add"] = sum(1 for n, _, _ in want["items"]
+                          if node_of.get(n) and node_of[n] not in on_board)
+        plan["set"] = 2 * (len(want["items"]) - len(pending))
+        return
+    if changed:
+        cur = read_board(gh, pid)
+        for name, opts in fields_want:
+            f = cur["fields"].get(name)
+            if f is None or f["type"] != "SINGLE_SELECT" or [n for _, n in f["options"]] != opts:
+                # Without this every run would rewrite the field and reset
+                # every value, or fail on a missing option.
+                die(f"GitHub did not keep the project's {name} field as rs-sync wrote it "
+                    f"(options sent: {opts}); run again, and if this repeats, check the "
+                    f"Gitea {'column' if name == STATUS_FIELD else 'board'} titles")
+    sf, af = cur["fields"][STATUS_FIELD], cur["fields"][AREA_FIELD]
+    sopt = {n: i for i, n in sf["options"]}
+    aopt = {n: i for i, n in af["options"]}
+
+    # Items: the mirrored issues of this repo are rs-sync's; anything else on
+    # the project (a person's issue, a draft) is left alone.
+    by_content = {i["content"]: i for i in cur["items"] if i["content"] in managed_contents}
+    order = []
+    for n, status, area in want["items"]:
+        node = node_of.get(n)
+        if not node:
+            continue
+        it = by_content.get(node)
+        if it is None:
+            plan["add"] += 1
+            if dry:
+                plan["set"] += 2
+                continue
+            d = gh.graphql(M_ADD, {"p": pid, "c": node})
+            iid = (((d or {}).get("addProjectV2ItemById") or {}).get("item") or {}).get("id")
+            if not iid:
+                die(f"GitHub did not return the project item for Gitea #{n}")
+            it = {"id": iid, "content": node, "values": {}}
+            cur["items"].append(it)
+            by_content[node] = it
+        for fid, oid in ((sf["id"], sopt[status]), (af["id"], aopt[area])):
+            if it["values"].get(fid) != oid:
+                plan["set"] += 1
+                if not dry:
+                    gh.graphql(M_SET, {"p": pid, "i": it["id"], "f": fid, "v": oid})
+        order.append(it["id"])
+    remove_unwanted({node_of.get(n) for n, _, _ in want["items"]})
+    if dry and plan["add"]:
+        return
+    if plan["add"] and not dry:
+        # Where GitHub places a new item is not measured: read the order back.
+        cur = read_board(gh, pid)
+    listed = {i["id"] for i in cur["items"]}
+    unlisted = [i for i in order if i not in listed]
+    if unlisted:
+        die(f"GitHub does not list {len(unlisted)} new project item(s) yet; run again "
+            f"shortly to put them in order")
+    moves = plan_moves([i["id"] for i in cur["items"]], order)
+    plan["move"] = len(moves)
+    if not dry:
+        for item, after in moves:
+            gh.graphql(M_MOVE, {"p": pid, "i": item, "a": after})
+
+
+# ============================================================================
 # The remove
 # ============================================================================
 
 def remove(args, env) -> None:
     """Delete everything rs-sync mirrored for the named fork, from GitHub
     alone: the marked issues by the token's account (whatever the fork's repo
-    id), and the tagged labels no remaining issue carries."""
+    id), the marked project, the wiki as it was before rs-sync's first commit,
+    and the tagged labels no remaining issue carries. Every check comes before
+    the first deletion."""
     owner, repo = parse_repo_arg(args.gitea, "the Gitea repo")
     target = "/".join(parse_repo_arg(args.github, "the GitHub repo"))
     gh = GitHub(GITHUB_API, env["RS_SYNC_GITHUB_TOKEN"])
-    me, _, _ = preflight_github(gh, target)
+    skip = set(args.skip or [])
+    me, repo_info, _ = preflight_github(gh, target, board="board" not in skip)
     have = read_github(gh, target, me["id"], owner, repo, for_remove=True)
+    wiki_state = None
+    if "wiki" in skip:
+        REPORT["wiki"] = {"skipped": "--skip wiki"}
+    else:
+        wiki_state = wiki_prepare(args, owner, repo, target, repo_info, None, None,
+                                  env["RS_SYNC_GITHUB_TOKEN"], (), "remove")
+    projects = [] if "board" in skip else find_boards(gh, owner, repo)[1]
     o, r = target.split("/", 1)
     base = f"/repos/{quote(o)}/{quote(r)}"
     doomed = sorted(({"number": i["number"], "node_id": i.get("node_id")}
@@ -1742,6 +2562,9 @@ def remove(args, env) -> None:
               if (l.get("description") or "").endswith(LABEL_TAG)
               and l["name"].lower() not in remaining_labels]
     REPORT["remove"]["labels"] = [l["name"] for l in labels]
+    REPORT["remove"]["projects"] = [p.get("number") for p in projects]
+    if "board" in skip:
+        REPORT["board"] = {"skipped": "--skip board"}
     if not args.apply:
         REPORT["dry_run"] = True
         return
@@ -1749,6 +2572,10 @@ def remove(args, env) -> None:
     for v in doomed:
         delete_issue(gh, v["node_id"])
         deleted.append(v["number"])
+    for p in projects:
+        gh.graphql(M_DELETE_PROJECT, {"p": p["id"]})
+    if wiki_state:
+        wiki_restore(wiki_state, env["RS_SYNC_GITHUB_TOKEN"])
     for l in labels:
         gh.call("DELETE", f"{base}/labels/{quote(l['name'], safe='')}")
     REPORT["remove"]["deleted"] = deleted
@@ -1768,13 +2595,18 @@ def print_report():
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="rs-sync",
-        description="mirror a Gitea fork's issues and merged pull requests to "
-                    "a GitHub repo (a dry run unless --apply)")
+        description="mirror a Gitea fork's issues, merged pull requests, wiki and "
+                    "boards to a GitHub repo (a dry run unless --apply)")
     ap.add_argument("gitea", help="the Gitea fork, <owner>/<repo>")
     ap.add_argument("github", help="the GitHub repo, <owner>/<repo>")
     ap.add_argument("--apply", action="store_true", help="write to GitHub")
     ap.add_argument("--remove", action="store_true",
                     help="delete everything rs-sync mirrored for this fork")
+    ap.add_argument("--skip", action="append", choices=["wiki", "board"], default=[],
+                    help="leave the wiki or the board out (repeatable)")
+    ap.add_argument("--wiki-overwrite", action="store_true",
+                    help="commit over (or, with --remove, force-push past) edits made "
+                         "on the GitHub wiki")
     ap.add_argument("--env", default=str(DEFAULT_ENV),
                     help=f"the settings file (default {DEFAULT_ENV})")
     args = ap.parse_args(argv)
