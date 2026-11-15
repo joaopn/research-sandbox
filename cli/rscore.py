@@ -8872,7 +8872,9 @@ _AGENT_ERR_TAIL = 2000
 # (`sessionUrl: false`). THREE keys are load-bearing: the session link is a
 # SEPARATE switch in the binary — `commit: ""` alone still yields a bare
 # `Claude-Session:` line, and the deprecated `includeCoAuthoredBy: false` never
-# touches it. Verified against the pinned 2.1.258 dist. The session link is
+# touches it. Verified against the 2.1.258 dist; on 2.1.325 the settings
+# schema still carries the three keys with the same meaning and a real commit
+# under this block carried no trailer. The session link is
 # emitted only by remote/bridge-driven sessions (the field-reported trailer on a
 # public commit came from one); `sessionUrl: false` cuts it before that branch.
 # Disabling also flips the binary's own system-prompt line to "do not add
@@ -8891,7 +8893,8 @@ _AGENT_ERR_TAIL = 2000
 # way to make the container posture independent of it. It is a DEFAULT, not a
 # lock: an operator flipping "Enable Remote Control for all sessions" in /config
 # or the IDE panel rewrites this same key at user scope. Resolver read out of the
-# pinned 2.1.258 dist and 2.1.263 (byte-equivalent logic).
+# 2.1.258 dist and 2.1.263 (byte-equivalent logic); the 2.1.325 resolver reads
+# the same tiers in the same order.
 # `feedbackDrafts: "off"` removes Claude-drafted feedback: the SendFeedback tool,
 # with which the agent queues a feedback draft to Anthropic on its own
 # initiative for the user to review and send, plus its session notice and the
@@ -8906,8 +8909,9 @@ _AGENT_ERR_TAIL = 2000
 # carry nothing (it would be inert there), and a cloned repo's own
 # .claude/settings.json cannot turn it back on. Headless `claude -p` sessions
 # (workers, role-MCPs) never have the tool (the binary excludes the sdk-*
-# entrypoints); the key matters for the interactive ones. Read out of the pinned
-# 2.1.258 dist. The hard-off CLAUDE_CODE_SEND_FEEDBACK=0 env switch is
+# entrypoints); the key matters for the interactive ones. Read out of the
+# 2.1.258 dist; the 2.1.325 binary reads the key with the same default. The
+# hard-off CLAUDE_CODE_SEND_FEEDBACK=0 env switch is
 # deliberately NOT set: it also hides the /config row, leaving no way back.
 # This is one of THREE writers (setup.sh heredoc, the sandbox-box entrypoint
 # printf) — pytest-pinned as a lockstep.
