@@ -1,3 +1,4 @@
+<!-- rs-part: session -->
 # Dev Environment
 
 You are running inside a sandboxed dev container. All your work must go through git.
@@ -111,6 +112,7 @@ onto a rewritten base, as the Git Workflow says, is upkeep and needs no ask. A c
 doing work (a `doer`, or the agent used in its place) works under the go its parent quotes in
 its brief, and never starts work of its own.
 
+<!-- rs-part: work -->
 ## Git Remotes
 
 You have two remotes:
@@ -304,6 +306,7 @@ from the worktree, run from the clone — and fetching `origin` to read its refs
   worktree or your home directory — never top-level under `/workspace` (rs-wt needs the
   single top-level clone to stay unambiguous).
 
+<!-- rs-part: session -->
 ## Project memory — under `/workspace`, never committed
 
 What you learn about this project outlives your session only if you write it down, and the
@@ -443,6 +446,7 @@ pages you changed in the reply that reports the landing or the pass.
   directly, no worktree, no branch, no PR — and the maintainer and every fetch tool on the
   dev lane can read it, so never put a token, a password or anything else secret in it.
 
+<!-- rs-part: work -->
 ## Verification
 
 - Run tests before pushing. If tests exist, run them.
@@ -453,6 +457,7 @@ pages you changed in the reply that reports the landing or the pass.
 When fixing a bug, write a reproduction script first (exits non-zero while the bug exists,
 zero when fixed), and verify it on both the base branch and your branch before pushing.
 
+<!-- rs-part: all -->
 ## What You Have Access To
 
 - This workspace (the cloned repo at `/workspace/<repo>`)
@@ -472,6 +477,7 @@ zero when fixed), and verify it on both the base branch and your branch before p
 - The host filesystem (this is an isolated container)
 - The local network (LAN access is blocked)
 
+<!-- rs-part: work -->
 ## Working Style
 
 - Read existing code before making changes. Understand patterns before modifying.
@@ -488,6 +494,7 @@ zero when fixed), and verify it on both the base branch and your branch before p
   nobody reads it. Durable notes go into the project memory under `/workspace` (see "Project
   memory"), never into the repo.
 
+<!-- rs-part: session -->
 ## Gitea API
 
 Your Gitea API token is in `$GITEA_TOKEN`, the base URL is `$GITEA_URL/api/v1`,
@@ -572,6 +579,7 @@ the writes and makes none).
   Inbox in the same call; a forgotten one is caught by the next reconcile. Keep titles short:
   the card is the title.
 
+<!-- rs-part: work -->
 ## Your shell has no terminal
 
 <!-- LOCKSTEP (verbatim block, nine homes): container/supervisor/CLAUDE.md, boxes/{byo,data-wrangler,dev,open-knowledge,paper-orchestra,websearcher,zotero}.instructions.md and workflows/open-knowledge.instructions.md carry this section byte-for-byte between these two markers — change one, change all (pytest-pinned). Headless surfaces (the worker template, the role.md files) deliberately do not carry it. -->
