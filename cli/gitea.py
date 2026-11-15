@@ -1158,6 +1158,24 @@ def _source_key(url: Any) -> tuple[str, str] | None:
     return None
 
 
+# GitHub's owner and repository name characters. A source outside them is
+# never handed to the page: its rs-sync button pastes the value into a shell.
+_GITHUB_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def repo_source(url: Any) -> str | None:
+    """The mirror's GitHub 'owner/repo' for the Fetch tab's rs-sync copy
+    button: _source_slug's shape, and both parts within GitHub's name
+    characters and not starting with "-" (rs-sync refuses such a name); None
+    otherwise. The raw recorded value is never returned (it could carry
+    userinfo)."""
+    ident = _github_repo_id(url)
+    if ident is None or not all(_GITHUB_NAME_RE.fullmatch(p) and not p.startswith("-")
+                                for p in ident):
+        return None
+    return f"{ident[0]}/{ident[1]}"
+
+
 def _source_slug(url: Any) -> str | None:
     """'owner/repo' for display, ONLY for the exact GitHub repository shape — a
     recorded source of any other shape (another host, a userinfo-bearing URL)
@@ -2539,6 +2557,9 @@ def repo_status(host_port: str, repo: str) -> dict:
                 upstream = None
     return {"repo": repo,
             "private": bool(info.get("private")),
+            # The GitHub repo the mirror was made from (the rs-sync button's
+            # target); read off the mirror info above, no extra call.
+            "source": repo_source(info.get("original_url")),
             "mirror_synced_at": (info.get("mirror_updated")
                                  or info.get("updated_at") or ""),
             "forks": forks,

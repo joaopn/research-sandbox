@@ -1995,7 +1995,8 @@ html.mobile .project-config-box .config-folders-input { font-size: 16px; }
     max-width: none;
     min-width: 0;
 }
-.dev-repo-head { display: flex; align-items: center; gap: 10px; }
+/* wraps on a narrow screen (the rs-sync buttons widen the row) */
+.dev-repo-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .dev-repo-name { font-weight: 600; }
 .dev-repo-meta { color: var(--fg-muted); font-size: 12px; flex: 1; }
 /* The host path of the resident backup. Monospace because it is a path the

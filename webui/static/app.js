@@ -4030,26 +4030,27 @@ function devFetchCommand(repo, loc, sha, autoCommit) {
 // returns no command (devFetchCommand refused a value) writes nothing to the
 // clipboard, shows a cross, and KEEPS the explanation as the button's title: a
 // refusal does not depend on the tick, so it stays true, and a tooltip that
-// reverted after a second would rarely be seen.
+// reverted after a second would rarely be seen. `label` is the button's text,
+// restored after the click's ✓ or ✗.
 const DEV_COPY_REFUSED = "This command can't be copied: a value in it is not "
     + "valid (a branch name starting with a dash, or an invalid PR number or "
     + "commit id).";
-function devCopyBtn(cmd) {
+function devCopyBtn(cmd, label = "📋") {
     const isFn = typeof cmd === "function";
     const b = el("button", { class: "btn-small dev-copy",
                              title: isFn ? "Copy the rs-fetch command"
-                                         : "Copy: " + cmd }, ["📋"]);
+                                         : "Copy: " + cmd }, [label]);
     b.onclick = async () => {
         const text = isFn ? cmd() : cmd;
         if (typeof text !== "string" || !text) {
             b.textContent = "✗";
             b.title = DEV_COPY_REFUSED;
-            setTimeout(() => { b.textContent = "📋"; }, 1200);
+            setTimeout(() => { b.textContent = label; }, 1200);
             return;
         }
         try { await navigator.clipboard.writeText(text); } catch (e) { return; }
         b.textContent = "✓";
-        setTimeout(() => { b.textContent = "📋"; }, 1200);
+        setTimeout(() => { b.textContent = label; }, 1200);
     };
     return b;
 }
@@ -5169,7 +5170,10 @@ function devFetchLegend() {
         "prefilled and never commits unless the card's auto-commit box is ",
         "ticked (then each fetched commit lands locally with the agent's ",
         "original timestamps); ▸ lists a row's commits to fetch them one by ",
-        "one.",
+        "one. 📋 rs-sync copies the command that mirrors this fork's issues, ",
+        "merged PRs, wiki and board to the GitHub repo it was mirrored from; ",
+        "it shows what it would do, and adds nothing until run again with ",
+        "--apply.",
     ]);
 }
 
@@ -5701,6 +5705,16 @@ function buildDevRepoCard(view, body, r, attached, opts) {
              + "session, never deleted — they accumulate by design). "
              + "Untick to list them.",
     }, [hideBox, `hide agent/ (${agentBranches.length})`]);
+    // One rs-sync copy per LIVE fork, naming that fork: the command never
+    // depends on which fork is active. `source` is the GitHub repo the mirror
+    // was made from (null when it is not a plain GitHub owner/repo); the
+    // auto-commit tick does not apply to rs-sync, and a name rs-sync would
+    // refuse (a leading "-") gets no button.
+    const syncCopies = (typeof r.source === "string" && r.source
+                        && !String(r.repo || "").startsWith("-"))
+        ? live.map((f) => devCopyBtn(`rs-sync ${f.user}/${r.repo} ${r.source}`,
+                                     `📋 rs-sync ${f.user}`))
+        : [];
     const head = [
         el("span", { class: "dev-repo-name" }, [r.repo]),
         el("span", { class: "dev-repo-meta" }, [meta]),
@@ -5708,6 +5722,7 @@ function buildDevRepoCard(view, body, r, attached, opts) {
         acWrap,
         ...(agentBranches.length ? [hideWrap] : []),
         sync,
+        ...syncCopies,
     ];
     if (!scoped) {
         // Remove is offered only for a FINISHED repo — no live fork, nobody
