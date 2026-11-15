@@ -1,4 +1,4 @@
-// rs-rules v0.7.0
+// rs-rules v0.8.0
 //
 // Claude Code's rules capability for pi, one-to-one, as an RS-owned extension.
 // Shipped inside the pi dist (share/pi-agent/rs/rs-rules.ts) and named from the
@@ -80,7 +80,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const RS_RULES_VERSION = "0.7.0";
+export const RS_RULES_VERSION = "0.8.0";
 
 // The system-prompt SECTION the launch rules ride in (pi wraps it as
 // `<project_rules>…</project_rules>`). A section, never a returned
@@ -624,6 +624,56 @@ function loadRule(file: string, kind: RuleKind, scope: RuleScope, base: string, 
     for (const u of compiled.unexpanded) warn(`${label}: pattern ${JSON.stringify(u)} exceeds the brace-expansion budget and is used literally`);
   }
   return { id: real, file, label, kind, scope, base, paths, body, compiled };
+}
+
+// ---------------------------------------------------------------------------
+// Lean subagent roles. RS's `doer` and `checker` start with their own part of
+// RS's text and the project's instruction file, not with everything the
+// session loads (the user rules — RS's whole text and the working mode among
+// them — outer and local instruction files, unscoped project rules). RS's
+// instruction writer lays each role's part in ~/.claude/rs/roles/<role>.md and
+// RS's installer links it beside this extension; the link reading as a
+// non-empty file is what makes a role lean here, so a container RS wrote no
+// text into, or one without RS's installer, keeps today's section. Claude
+// Code gets the same through the role's own definition (it starts without the
+// instruction files and preloads the role's part and the workspace's two
+// instruction files), so both agents hand a child the same thing. Path-scoped
+// rules still attach on reads, as always.
+// ---------------------------------------------------------------------------
+
+// The workspace's instruction files, where RS's notice says they live
+// (`.claude/CLAUDE.md`, and the user's own `CLAUDE.md` beside it): the fixed
+// folder, not the session's nearest `.claude/`, so a child started inside a
+// clone gets the same files as under Claude Code.
+export const LEAN_PROJECT_DIR = "/workspace";
+
+// The RS role a child session runs as, from the tag pi-subagents puts first in
+// its system prompt; null for anything else (the main session, another agent,
+// a fork child, whose tag sits in the user message).
+export function leanRole(customPrompt: unknown): string | null {
+  if (typeof customPrompt !== "string") return null;
+  const m = /^<active_agent name="(doer|checker)"\/>/.exec(customPrompt);
+  return m ? m[1] : null;
+}
+
+// The rules of a lean child: the role's part, then the workspace's two
+// instruction files, each unless pi already carries it (`already`: real
+// paths; pi's own context loading may hand a child `CLAUDE.md`). null when
+// the role has no part here (no link, unreadable, empty): not lean.
+export function leanRules(role: string, home: string, projectDir: string, already: Set<string>): Rule[] | null {
+  const quiet = () => {};
+  const link = path.join(home, ".local", "share", "pi-agent", "rs", "roles", role + ".md");
+  if (!isFile(link)) return null;
+  const part = loadRule(link, "claude_md", "user", home, `RS's rules for a ${role} subagent`, quiet);
+  if (!part || part.body.length === 0) return null;
+  const out = [part];
+  for (const label of [".claude/CLAUDE.md", "CLAUDE.md"]) {
+    const file = path.join(projectDir, label);
+    if (!isFile(file)) continue;
+    const r = loadRule(file, "claude_md", "project", projectDir, label, quiet);
+    if (r && r.body.length > 0 && !already.has(r.id)) out.push(r);
+  }
+  return out;
 }
 
 export interface Discovered {
@@ -1358,11 +1408,17 @@ export default function rsRules(pi: ExtensionAPI) {
         if (r.body.length === 0) return;
         parts.push(`## ${r.label}\n\n${r.body}`);
       };
-      for (const r of d.rules) if (r.scope === "user" && !r.paths) push(r);
-      for (const r of d.outer) if (!already.has(r.id)) push(r);
-      if (d.claudeMd && !already.has(d.claudeMd.id)) push(d.claudeMd);
-      if (d.claudeLocal && !already.has(d.claudeLocal.id)) push(d.claudeLocal);
-      for (const r of d.rules) if (r.scope === "project" && !r.paths) push(r);
+      const role = leanRole(event.systemPromptOptions?.customPrompt);
+      const lean = role ? leanRules(role, home, LEAN_PROJECT_DIR, already) : null;
+      if (lean) {
+        for (const r of lean) push(r);
+      } else {
+        for (const r of d.rules) if (r.scope === "user" && !r.paths) push(r);
+        for (const r of d.outer) if (!already.has(r.id)) push(r);
+        if (d.claudeMd && !already.has(d.claudeMd.id)) push(d.claudeMd);
+        if (d.claudeLocal && !already.has(d.claudeLocal.id)) push(d.claudeLocal);
+        for (const r of d.rules) if (r.scope === "project" && !r.paths) push(r);
+      }
       const sections = event.systemPromptOptions.sections;
       if (parts.length === 0) delete sections[RS_RULES_SECTION];
       else sections[RS_RULES_SECTION] = "# Project rules (rs-rules)\n\n" + parts.join("\n\n");

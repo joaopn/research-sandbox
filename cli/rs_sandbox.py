@@ -765,6 +765,20 @@ RS_INSTR_OLD = "RS_INSTRUCTIONS_OLD_FILE"
 RS_INSTR_KEPT = "RS_INSTRUCTIONS_KEPT"
 # MIRROR PAIR with rscore.RS_INSTR_EXEC_TIMEOUT_S (same reasoning there).
 RS_INSTR_EXEC_TIMEOUT_S = 30
+# The parts of RS's text a `doer` or `checker` subagent starts with. A template
+# marks where a part begins with a whole line `<!-- rs-part: NAME -->` outside a
+# fenced block; NAME is `session` (the main session only), `work` (a doer) or
+# `all` (a doer and a checker). Text before the first marker is `all`, so a text
+# with no marker goes to both roles whole. Any other line, an unknown name
+# included, is ordinary text. The marker lines themselves are left out. The
+# writer derives the two role files from the text it is about to install, in
+# the same chain, into ~/.claude/rs/roles/<role>.md (RS's installer links them
+# into each agent; the first line is what a skill list shows for them).
+RS_ROLE_PARTS_AWK = (
+    'BEGIN{p="all"} /^(```|~~~)/{f=!f} '
+    '!f && /^<!-- rs-part: (all|work|session) -->$/{p=substr($0,15); sub(/ -->$/,"",p); next} '
+    'index(want," " p " "){print}')
+RS_ROLE_FIRST_LINE = "RS's rules for a {role} subagent. RS loads this when one is launched."
 # MIRROR PAIR with rscore.RS_INSTR_SCRIPT — pinned equal (the reasoning for
 # every step is there).
 RS_INSTR_SCRIPT = (
@@ -772,12 +786,22 @@ RS_INSTR_SCRIPT = (
     f'then echo {RS_INSTR_OLD}; exit 0; fi\n'
     'if [ "$3" = 1 ] && [ -e "$HOME/.claude/rules/rs-instructions.md" ]; '
     f'then echo {RS_INSTR_KEPT}; exit 0; fi\n'
-    'tmp=; mkdir -p "$HOME/.claude/rules" && '
+    'tmp=; t1=; t2=; r="$HOME/.claude/rules/rs-instructions.md"; d="$HOME/.claude/rs/roles"; '
+    'mkdir -p "$HOME/.claude/rules" "$d" && '
     'tmp=$(mktemp "$HOME/.claude/rules/.rs-instructions.XXXXXX") && '
     'cat >"$tmp" && [ "$(wc -c <"$tmp")" -eq "$1" ] && chmod 0444 "$tmp" && '
-    'mv -fT "$tmp" "$HOME/.claude/rules/rs-instructions.md" && '
+    't1=$(mktemp "$d/.doer.XXXXXX") && t2=$(mktemp "$d/.checker.XXXXXX") && '
+    f'{{ printf "%s\\n\\n" "{RS_ROLE_FIRST_LINE.format(role="doer")}" && '
+    f'awk -v want=" all work " \'{RS_ROLE_PARTS_AWK}\' "$tmp"; }} >"$t1" && '
+    f'{{ printf "%s\\n\\n" "{RS_ROLE_FIRST_LINE.format(role="checker")}" && '
+    f'awk -v want=" all " \'{RS_ROLE_PARTS_AWK}\' "$tmp"; }} >"$t2" && '
+    'chmod 0444 "$t1" "$t2" && '
+    '[ ! -d "$r" ] && [ ! -d "$d/doer.md" ] && [ ! -d "$d/checker.md" ] && '
+    'mv -fT "$t1" "$d/doer.md" && mv -fT "$t2" "$d/checker.md" && '
+    'mv -fT "$tmp" "$r" && '
     f'echo {RS_INSTR_WRITTEN} || '
-    f'{{ [ -z "$tmp" ] || rm -f "$tmp" || :; echo {RS_INSTR_FAILED} || :; }}\n')
+    f'{{ for f in "$tmp" "$t1" "$t2"; do [ -z "$f" ] || rm -f "$f" || :; done; '
+    f'echo {RS_INSTR_FAILED} || :; }}\n')
 BOX_HOME = "/home/worker"
 OLD_INSTRUCTIONS_RUN_ERROR = (
     "`/workspace/boxes/{box}/CLAUDE.md` is the instructions file RS used to write "

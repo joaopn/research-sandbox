@@ -5077,15 +5077,17 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
                 container_name, staged, deploy_local=bool(local),
                 **_local_deploy_kwargs(staged, local),
                 **({"pi_pair": pi_pair} if pi_pair else {})), progress)
-            # The working-mode suite (I33): into the shared copy for the boxes,
-            # and into the project container's own agents.
-            _report_warnings(_stage_harness(container_name, local, workspace_path), progress)
             # RS's instructions into the agent's home (the dev text with the
-            # request's resolved base branch, else the notice alone).
+            # request's resolved base branch, else the notice alone). Before
+            # the working-mode suite: its installer makes a role lean only
+            # where the writer has laid that role's part of the text.
             _write_project_instructions(
                 project, container_name, workspace_path, progress=progress,
                 branch=effective_dev_branch if req.dev_repo else None,
                 has_file=False)
+            # The working-mode suite (I33): into the shared copy for the boxes,
+            # and into the project container's own agents.
+            _report_warnings(_stage_harness(container_name, local, workspace_path), progress)
             # The recorded Claude model into Claude's own settings (I33 slice 3).
             _apply_agent_settings_pending(container_name, workspace_path, local,
                                           claude_in_settings=model_in_settings,
@@ -5996,12 +5998,13 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
                                           claude_in_settings=plan.claude_live,
                                           progress=progress)
             if plan.harness is not None and not is_research_p:
-                _report_warnings(_stage_harness(container, now_local, workspace_path), progress)
                 # A working-mode change rewrites RS's instructions too (the
-                # home survives; the recreate path would write them again).
+                # home survives; the recreate path would write them again),
+                # before the installer, which reads the role parts they lay.
                 found += _write_project_instructions(project, container, workspace_path,
                                                      progress=progress, has_file=True)
                 wrote_instructions = True
+                _report_warnings(_stage_harness(container, now_local, workspace_path), progress)
         if not (touched or req.rebuild or enable_workers or disable_workers
                 or req.role_mcp_upstream or model_changes or agents_added or plan.removed
                 or claude_recreate):
@@ -6048,13 +6051,13 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         _report_warnings(_stage_agent_dist(container, staged, deploy_local=bool(local),
                                            **_local_deploy_kwargs(staged, local),
                                            **_pi_pair_kwargs(workspace_path)), progress)
-        # The working-mode suite (I33), before the box refresh below.
-        _report_warnings(_stage_harness(container, local, workspace_path), progress)
         # RS's instructions into the agent's home (it survives; boxes are not
-        # rewritten at an Update).
+        # rewritten at an Update), before the installer below.
         if not wrote_instructions:
             found += _write_project_instructions(project, container, workspace_path,
                                                  progress=progress, has_file=True)
+        # The working-mode suite (I33), before the box refresh below.
+        _report_warnings(_stage_harness(container, local, workspace_path), progress)
         # The recorded models of an agent just installed (I33 slice 3).
         _apply_agent_settings_pending(
             container, workspace_path, local, progress=progress,
@@ -9699,6 +9702,33 @@ HARNESS_INSTALLER = f"{HARNESS_STAGE_DIR}/install.sh"
 HARNESS_FAILED_SENTINEL = "RS_HARNESS_INSTALL_FAILED"
 _HARNESS_WARNING = ("the working-mode files (doer, checker, the rs-mode skill) could not "
                     "all be installed into the project's agent; the agent runs without them")
+# Printed by the installer when an agent is deployed but too old for the lean
+# doer and checker (they start with only their part of RS's instructions); the
+# roles then keep their previous form. MIRRORS of the installer's floors
+# (CLAUDE_LEAN_FLOOR / PI_LEAN_FLOOR in container/harness/install.sh, pinned):
+# the lowest Claude Code build measured to honour the role switch, and the
+# first RS rules extension for pi that builds a lean child's section.
+HARNESS_CLAUDE_OLD_SENTINEL = "RS_HARNESS_CLAUDE_OLD"
+HARNESS_PI_OLD_SENTINEL = "RS_HARNESS_PI_OLD"
+HARNESS_CLAUDE_LEAN_FLOOR = "2.1.322"
+HARNESS_PI_LEAN_FLOOR = "0.8.0"
+_HARNESS_OLD_WARNINGS = (
+    (HARNESS_CLAUDE_OLD_SENTINEL,
+     f"Claude Code in {{where}} is older than {HARNESS_CLAUDE_LEAN_FLOOR}, so RS's doer and "
+     "checker still start with the full instructions; update the agent under "
+     "Sandboxes → Software, then start the project again"),
+    (HARNESS_PI_OLD_SENTINEL,
+     f"RS's rules for pi in {{where}} are older than {HARNESS_PI_LEAN_FLOOR}, so RS's doer and "
+     "checker still start with the full instructions; update the agent under "
+     "Sandboxes → Software, then start the project again"),
+)
+
+
+def _harness_old_warnings(stdout: "str | None", where: str) -> list[str]:
+    """The installer's "too old for the lean roles" lines as operator text."""
+    lines = (stdout or "").split()
+    return [text.format(where=where) for sentinel, text in _HARNESS_OLD_WARNINGS
+            if sentinel in lines]
 
 
 # The suite's tracked files that ship as they are: exactly this list, never
@@ -9816,10 +9846,12 @@ def _harness_env(agents: "Sequence[str]") -> list[str]:
 def _stage_harness(container: str, local: "Sequence[str]",
                    workspace_path: "Path | None" = None) -> list[str]:
     """Stage the working-mode suite into a RUNNING Docker-in-Docker project
-    container and lay it into the container's own agents. Called right after
-    `_stage_agent_dist` at the four Docker-in-Docker staging points (that step
-    empties the shared copy in place, so the suite is re-streamed every time),
-    and before any live box refresh, which runs the same installer in the boxes.
+    container and lay it into the container's own agents. Called at the
+    Docker-in-Docker staging points after `_stage_agent_dist` (that step
+    empties the shared copy in place, so the suite is re-streamed every time)
+    and after RS's instruction write (the installer makes a role lean only
+    where the writer laid its part), and before any live box refresh, which
+    runs the same installer in the boxes.
     Never research: its supervisor has its own role, and its boxes must never
     find an installer. Two steps:
       • the tracked files into HARNESS_STAGE_DIR (root writes /opt, then hands
@@ -9850,9 +9882,12 @@ def _stage_harness(container: str, local: "Sequence[str]",
              *_harness_env(local), *_harness_settings_env(settings),
              container, "sh", HARNESS_INSTALLER],
             capture_output=True)
-    if r.returncode != 0 or HARNESS_FAILED_SENTINEL in (r.stdout or ""):
+    if r.returncode != 0:
         return [_HARNESS_WARNING]
-    return []
+    out = _harness_old_warnings(r.stdout, "this project")
+    if HARNESS_FAILED_SENTINEL in (r.stdout or ""):
+        out.insert(0, _HARNESS_WARNING)
+    return out
 
 
 def _root_owned(ti: tarfile.TarInfo) -> tarfile.TarInfo:
@@ -10124,6 +10159,8 @@ def _refresh_running_boxes(supervisor: str, agents: "Sequence[str]", progress,
                     capture_output=True)
             if h.returncode != 0 or HARNESS_FAILED_SENTINEL in (h.stdout or ""):
                 progress.step("agents", f"box {box}: the working-mode files could not all be installed")
+            for line in _harness_old_warnings(h.stdout if h.returncode == 0 else "", f"box {box}"):
+                progress.step("agents", line)
         (refreshed if ok else failed).append(box)
         progress.step("agents", f"box {box}: {'refreshed' if ok else 'NOT refreshed' + why}")
     progress.step("agents", f"{len(refreshed)} box(es) refreshed, {len(failed)} not refreshed"
@@ -12170,13 +12207,13 @@ def _recreate_supervisor(
         _report_warnings(_stage_agent_dist(container, staged, deploy_local=bool(local),
                                            **_local_deploy_kwargs(staged, local),
                                            **_pi_pair_kwargs(workspace_path)), progress)
+        # RS's instructions into the agent's home. The saved home carried the
+        # previous file across the recreate. Before the installer below.
+        found += _write_project_instructions(project, container, workspace_path,
+                                             progress=progress, has_file=True)
         # The working-mode suite (I33): the shared copy's was just emptied, and
         # the boxes this start re-runs find the installer there.
         _report_warnings(_stage_harness(container, local, workspace_path), progress)
-        # RS's instructions into the agent's home. The saved home carried the
-        # previous file across the recreate.
-        found += _write_project_instructions(project, container, workspace_path,
-                                             progress=progress, has_file=True)
         # The agents' recorded models into their own settings, once (I33 slice 3).
         _apply_agent_settings_pending(container, workspace_path, local,
                                       claude_in_settings=model_in_settings, progress=progress)
@@ -15638,6 +15675,20 @@ RS_INSTR_KEPT = "RS_INSTRUCTIONS_KEPT"
 # warning and leaves the file to the next start, so it must not fire on a box
 # that is merely slow under a parallel image build.
 RS_INSTR_EXEC_TIMEOUT_S = 30
+# The parts of RS's text a `doer` or `checker` subagent starts with. A template
+# marks where a part begins with a whole line `<!-- rs-part: NAME -->` outside a
+# fenced block; NAME is `session` (the main session only), `work` (a doer) or
+# `all` (a doer and a checker). Text before the first marker is `all`, so a text
+# with no marker goes to both roles whole. Any other line, an unknown name
+# included, is ordinary text. The marker lines themselves are left out. The
+# writer derives the two role files from the text it is about to install, in
+# the same chain, into ~/.claude/rs/roles/<role>.md (RS's installer links them
+# into each agent; the first line is what a skill list shows for them).
+RS_ROLE_PARTS_AWK = (
+    'BEGIN{p="all"} /^(```|~~~)/{f=!f} '
+    '!f && /^<!-- rs-part: (all|work|session) -->$/{p=substr($0,15); sub(/ -->$/,"",p); next} '
+    'index(want," " p " "){print}')
+RS_ROLE_FIRST_LINE = "RS's rules for a {role} subagent. RS loads this when one is launched."
 # The write, as the agent user (uid 1000, HOME set by the caller). $1 is the
 # byte count the host sent, $2 is 1 when the container's old
 # /workspace/CLAUDE.md must be checked first (a file or a link — a dangling
@@ -15655,12 +15706,22 @@ RS_INSTR_SCRIPT = (
     f'then echo {RS_INSTR_OLD}; exit 0; fi\n'
     'if [ "$3" = 1 ] && [ -e "$HOME/.claude/rules/rs-instructions.md" ]; '
     f'then echo {RS_INSTR_KEPT}; exit 0; fi\n'
-    'tmp=; mkdir -p "$HOME/.claude/rules" && '
+    'tmp=; t1=; t2=; r="$HOME/.claude/rules/rs-instructions.md"; d="$HOME/.claude/rs/roles"; '
+    'mkdir -p "$HOME/.claude/rules" "$d" && '
     'tmp=$(mktemp "$HOME/.claude/rules/.rs-instructions.XXXXXX") && '
     'cat >"$tmp" && [ "$(wc -c <"$tmp")" -eq "$1" ] && chmod 0444 "$tmp" && '
-    'mv -fT "$tmp" "$HOME/.claude/rules/rs-instructions.md" && '
+    't1=$(mktemp "$d/.doer.XXXXXX") && t2=$(mktemp "$d/.checker.XXXXXX") && '
+    f'{{ printf "%s\\n\\n" "{RS_ROLE_FIRST_LINE.format(role="doer")}" && '
+    f'awk -v want=" all work " \'{RS_ROLE_PARTS_AWK}\' "$tmp"; }} >"$t1" && '
+    f'{{ printf "%s\\n\\n" "{RS_ROLE_FIRST_LINE.format(role="checker")}" && '
+    f'awk -v want=" all " \'{RS_ROLE_PARTS_AWK}\' "$tmp"; }} >"$t2" && '
+    'chmod 0444 "$t1" "$t2" && '
+    '[ ! -d "$r" ] && [ ! -d "$d/doer.md" ] && [ ! -d "$d/checker.md" ] && '
+    'mv -fT "$t1" "$d/doer.md" && mv -fT "$t2" "$d/checker.md" && '
+    'mv -fT "$tmp" "$r" && '
     f'echo {RS_INSTR_WRITTEN} || '
-    f'{{ [ -z "$tmp" ] || rm -f "$tmp" || :; echo {RS_INSTR_FAILED} || :; }}\n')
+    f'{{ for f in "$tmp" "$t1" "$t2"; do [ -z "$f" ] || rm -f "$f" || :; done; '
+    f'echo {RS_INSTR_FAILED} || :; }}\n')
 # A failed read of a workflow catalog, the built-ins or the custom-workflow
 # registry (UnicodeDecodeError is a ValueError).
 _CATALOG_READ_ERRORS = (workflow.WorkflowError, OSError, ValueError, RecursionError)
@@ -17440,14 +17501,15 @@ def project_add_agents(project: str, agents: "Sequence[str]",
     _report_warnings(_stage_agent_dist(container, staged, deploy_local=deploy_local,
                                        **_local_deploy_kwargs(staged, local),
                                        **_pi_pair_kwargs(workspace_path)), progress)
+    # RS's instructions into the agent's home (it survives this Update;
+    # research is skipped inside — its boot script writes them). Before the
+    # installer below.
+    found = _write_project_instructions(project, container, workspace_path,
+                                        progress=progress, has_file=True)
     if not is_research:
         # The working-mode suite (I33), before the box refresh below runs its
         # installer in each box. Never research (its boxes must find none).
         _report_warnings(_stage_harness(container, local, workspace_path), progress)
-    # RS's instructions into the agent's home (it survives this Update;
-    # research is skipped inside — its boot script writes them).
-    found = _write_project_instructions(project, container, workspace_path,
-                                        progress=progress, has_file=True)
     if deploy_local and not _install_agent_extensions(
             ["docker", "exec", "-u", "1000", "-e", "HOME=/home/research", container],
             "/home/research", True):
