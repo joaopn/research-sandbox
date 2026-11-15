@@ -43,6 +43,25 @@
       ]
     },
     {
+      "id": "checker-doer",
+      "alias": "2b",
+      "label": "Checker-doer",
+      "description": "The agent plans with you and reviews every change itself; RS's doer subagent implements each unit. No separate checker, so it is cheaper than planner-doer-checker, and the review is by the agent that wrote the plan.",
+      "pieces": [
+        "plan-units",
+        "go",
+        "implement-through-doers",
+        "tests",
+        "self-review",
+        "findings",
+        "questions",
+        "report"
+      ],
+      "subagents": [
+        "doer"
+      ]
+    },
+    {
       "id": "planner-doer-checker",
       "alias": "3",
       "label": "Planner-doer-checker",

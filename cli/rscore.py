@@ -628,6 +628,14 @@ _OLD_BOX_TOOL_HARNESS_MSG = ("this project's box tool predates the working mode 
                              "restart the project, then retry")
 _OLD_BOX_TOOL_MODE_MSG = ("this project was started before this working mode existed — "
                           "restart the project, then try again")
+# The project's box tool takes the mode, but the project's staged working-mode
+# files lack its rule (started before RS gained the mode): the box would run
+# with no working mode, so the add or change is refused instead.
+_UNSTAGED_MODE_MSG = ("this project's working-mode files do not include this mode — "
+                      "restart the project, then try again")
+# A mode recorded earlier that RS's catalog no longer lists: a restart cannot
+# bring it back.
+_RETIRED_MODE_MSG = "RS no longer offers this working mode — pick another one"
 # The current box tool's `create` help names the working-mode value with this
 # metavar (rs_sandbox.HARNESS_MODE_METAVAR, pytest-pinned equal); a tool from
 # before the mode catalog shows another. No space or hyphen, so argparse's
@@ -1785,19 +1793,21 @@ class CreateRequest:
 # them as these environment variables and re-checks every value itself.
 #
 # The modes themselves are data: container/harness/modes.json lists them (id,
-# its optional number for the /rs-mode switch, label, description, the pieces
-# its rule is built from, the subagents it uses), read lazily by
+# its optional short code for the /rs-mode switch, label, description, the
+# pieces its rule is built from, the subagents it uses), read lazily by
 # harness_catalog() — never at import, by the CLI parser or by a reader of
-# recorded settings, so a broken catalog errors only where a
-# mode is set, staged or listed. Only the host checks a mode against it; the
+# recorded settings, so a broken catalog errors only where a mode is set,
+# staged or listed, or a box is given one. Only the host checks a mode against it; the
 # installer and the box tool check the characters (HARNESS_MODE_ID_RE, mirrored
 # in rs_sandbox._HARNESS_MODE_ID_RE and install.sh's `case`, pytest-pinned).
 HARNESS_MODE_ID_RE = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
-# A mode's optional alias: the number the user may type instead of its id in
-# the /rs-mode switch (the number of agents the mode uses), written without
-# leading zeros so one number has one spelling. It never names a mode anywhere
-# else — the recorded mode, the CLI flag and the webui take ids only.
-HARNESS_MODE_ALIAS_RE = re.compile(r"0|[1-9][0-9]*")
+# A mode's optional alias: the short code the user may type instead of its id
+# in the /rs-mode switch — a number (mostly the number of agents the mode uses),
+# written without leading zeros so one number has one spelling, optionally
+# followed by one lowercase letter (`2b` tells a second two-agent mode apart).
+# It never names a mode anywhere else — the recorded mode, the CLI flag and the
+# webui take ids only.
+HARNESS_MODE_ALIAS_RE = re.compile(r"(?:0|[1-9][0-9]*)[a-z]?")
 # The roles the installer ships an agent file for: a mode may use only these.
 HARNESS_ROLES = ("doer", "checker")
 # The modes a box tool from before the catalog accepts (its list was fixed):
@@ -1829,7 +1839,8 @@ def harness_catalog() -> list[dict]:
     {id, alias, label, description, pieces, subagents} in display order, `none`
     first with no pieces and no subagents, ids unique and matching
     HARNESS_MODE_ID_RE, an alias optional ("" when absent) and, when given,
-    unique and matching HARNESS_MODE_ALIAS_RE,
+    unique and matching HARNESS_MODE_ALIAS_RE (a number without leading
+    zeros, optionally followed by one lowercase letter),
     every piece a file under pieces/, subagents only from HARNESS_ROLES. Raises
     ValidationError naming what is wrong (never a host path) — a broken catalog
     is an error where a mode is used, never a silent fallback."""
@@ -1861,11 +1872,11 @@ def harness_catalog() -> list[dict]:
         alias = m.get("alias", "")
         if alias != "":
             if not isinstance(alias, str):
-                raise bad(f"mode {mid!r}: its alias must be a number written as text, "
-                          f"in quotes")
+                raise bad(f"mode {mid!r}: its alias must be a short code written as "
+                          f"text, in quotes")
             if not HARNESS_MODE_ALIAS_RE.fullmatch(alias):
-                raise bad(f"mode {mid!r}: alias {alias!r} is not a number written "
-                          f"without leading zeros")
+                raise bad(f"mode {mid!r}: alias {alias!r} is not a number without "
+                          f"leading zeros, optionally followed by one lowercase letter")
             if alias in aliases:
                 raise bad(f"alias {alias!r} is given to two modes")
             aliases.add(alias)
@@ -9807,8 +9818,9 @@ def harness_suite_files() -> dict[str, bytes]:
             f"- **{m['id']}**{_harness_alias_note(m)} — read `modes/{m['id']}.md` in this "
             f"skill's folder and follow it from now on.\n" for m in cat if m["id"] != "none"),
         "{{RS_MODE_COUNT}}": _COUNT_WORDS[n] if n < len(_COUNT_WORDS) else str(n),
-        # A number the user typed is a mode too: the fallback must not ask about it.
-        "{{RS_MODE_OR_NUMBER}}": " or their numbers" if any(m["alias"] for m in cat) else "",
+        # A short code the user typed is a mode too: the fallback must not ask
+        # about it ("short codes", not "numbers": `2b` is not strictly a number).
+        "{{RS_MODE_OR_NUMBER}}": " or their short codes" if any(m["alias"] for m in cat) else "",
     }
     try:
         skill = (HARNESS_SRC / HARNESS_SKILL_TEMPLATE).read_bytes().decode("utf-8")
@@ -20751,8 +20763,10 @@ def _require_harness_aware_box_tool(container: str, mode: str = "") -> None:
     the working-mode flags at all, or — for a `mode` beyond the three every
     tool knows — a tool from before the catalog (its `create` help lacks
     HARNESS_MODE_HELP_MARKER), which would refuse the mode with its own
-    flag-named text after a dev box's Gitea provisioning. A tool that cannot be
-    asked is not judged here."""
+    flag-named text after a dev box's Gitea provisioning. Then, for any mode:
+    one RS's catalog no longer lists, or one whose rule the project's staged
+    working-mode files lack (the box would silently run with none). A tool or
+    container that cannot be asked is not judged here."""
     r = run(["docker", "exec", container, "rs-sandbox", "create", "--help"],
             capture_output=True)
     if r.returncode != 0:
@@ -20762,6 +20776,21 @@ def _require_harness_aware_box_tool(container: str, mode: str = "") -> None:
         raise ValidationError(_OLD_BOX_TOOL_HARNESS_MSG)
     if mode and mode not in HARNESS_ORIGINAL_MODES and HARNESS_MODE_HELP_MARKER not in out:
         raise ValidationError(_OLD_BOX_TOOL_MODE_MSG)
+    if not mode or mode == "none":
+        return
+    # The box installs the project's STAGED rule for its mode, detached, and
+    # falls back to none when the rule is missing (its warning is lost): so a
+    # mode RS no longer lists, or one the staged files lack, is refused here,
+    # before any side effect. The path goes to `sh` as an argument; an exec
+    # that fails (a stopped container) is not judged, like the help read.
+    if mode not in harness_mode_ids():
+        raise ValidationError(_RETIRED_MODE_MSG)
+    r = run(["docker", "exec", container, "sh", "-c",
+             'if [ -r "$1" ]; then echo present; else echo absent; fi', "sh",
+             f"{HARNESS_STAGE_DIR}/modes/{mode}.md"],
+            capture_output=True)
+    if r.returncode == 0 and (r.stdout or "").strip() == "absent":
+        raise ValidationError(_UNSTAGED_MODE_MSG)
 
 
 def _refuse_harness_on_research(container: str) -> None:
