@@ -566,7 +566,7 @@ chmod 700 "$GNUPGHOME"
 umask 077
 cat > "$T/pp"
 chmod 600 "$T/pp"
-gitea dump --tempdir "$T" --file -   | gpg --batch --symmetric --cipher-algo AES256         --pinentry-mode loopback --passphrase-file "$T/pp"
+gitea dump --skip-package-data --tempdir "$T" --file -   | gpg --batch --symmetric --cipher-algo AES256         --pinentry-mode loopback --passphrase-file "$T/pp"
 """
 
 # Verification decrypts into a tmpfs rather than to /dev/null: a zip's central
@@ -961,6 +961,11 @@ cp -a /x/ex/repos "$REPOROOT"
 # place they index content the restored database no longer has, and across a
 # gitea version change the old index is not even readable. Gitea rebuilds both.
 rm -rf /data/gitea/indexers /data/gitea/queues
+# Built images are not in a backup (the dump skips them), and the image store
+# is not part of the database: left in place it would hold files the restored
+# database knows nothing about, which nothing would ever remove. The path is
+# Gitea's default package store, the one this instance is created with.
+rm -rf /data/gitea/packages
 chown -R "$OWNER" "$DB" "$REPOROOT"
 echo "RESTORE-OK"
 """
@@ -1683,6 +1688,84 @@ class GiteaClient:
 
     def create_private_org(self, name: str) -> None:
         self._api("POST", "/orgs", {"username": name, "visibility": "private"})
+
+    # -- the image shelf (built images waiting to be published) -------------
+
+    def ensure_images_org(self) -> None:
+        """The private organisation built images live under, its read-only
+        team and the operator's membership of it — checked at every use and
+        created when missing, so an existing install and a restored older
+        database both get them. An `rs-images` that does not carry RS's marker
+        is someone else's and is refused, never adopted."""
+        try:
+            org = self._api("GET", f"/orgs/{IMAGES_ORG}")
+        except GiteaError as e:
+            if e.status != 404:
+                raise
+            try:
+                self._api("POST", "/orgs", {
+                    "username": IMAGES_ORG, "visibility": "private",
+                    "description": IMAGES_ORG_MARKER})
+            except GiteaError as e2:
+                if e2.status != 422:
+                    raise
+                # The name is a user's, or a sibling's first use created the
+                # organisation a moment ago: read again and accept only the
+                # marker.
+                try:
+                    org = self._api("GET", f"/orgs/{IMAGES_ORG}")
+                except GiteaError as e3:
+                    if e3.status != 404:    # an outage is not a name collision
+                        raise
+                    org = None
+                if not (isinstance(org, dict)
+                        and org.get("description") == IMAGES_ORG_MARKER):
+                    raise GiteaError(_images_org_collision(), status=422) from None
+        else:
+            if not (isinstance(org, dict)
+                    and org.get("description") == IMAGES_ORG_MARKER):
+                raise GiteaError(_images_org_collision(), status=409)
+        pager = _ListPager(self, f"/orgs/{IMAGES_ORG}/teams", "id")
+        pager.all()
+        team = next((t for t in pager.rows if t.get("name") == IMAGES_TEAM), None)
+        if team is None:
+            team = self._api("POST", f"/orgs/{IMAGES_ORG}/teams", {
+                "name": IMAGES_TEAM, "permission": "read",
+                "units_map": {"repo.packages": "read"},
+                "includes_all_repositories": False})
+        if not (isinstance(team, dict) and isinstance(team.get("id"), int)):
+            raise GiteaError("gitea returned no id for the image readers team")
+        self._api("PUT", f"/teams/{team['id']}/members/{OPERATOR_USER}")
+
+    def image_versions(self, name: "str | None" = None) -> list[dict]:
+        """Every stored version (a tag or a manifest checksum) of the image
+        `name`, or of every image when `name` is None. Every page, each raising
+        on failure; an absent organisation is an empty list."""
+        pager = _ListPager(self, f"/packages/{IMAGES_ORG}?type=container", "id")
+        try:
+            pager.all()
+        except GiteaError as e:
+            if e.status == 404:
+                return []
+            raise
+        return [r for r in pager.rows
+                if isinstance(r.get("name"), str)
+                and isinstance(r.get("version"), str)
+                and (name is None or r["name"] == name)]
+
+    def delete_image_versions(self, name: "str | None" = None,
+                              keep: "frozenset[str]" = frozenset()) -> int:
+        """Delete the versions image_versions(name) lists, except those named
+        in `keep`. Returns how many were deleted; the first failure raises."""
+        n = 0
+        for row in self.image_versions(name):
+            if row["version"] in keep:
+                continue
+            self._api("DELETE", "/packages/%s/container/%s/%s" % (
+                IMAGES_ORG, urllib.parse.quote(row["name"], safe=""),
+                urllib.parse.quote(row["version"], safe="")))
+            n += 1
+        return n
 
     def repo_info(self, owner: str, repo: str) -> dict | None:
         """The repo JSON, or None on a definitive 404 (strict otherwise)."""
@@ -2920,6 +3003,27 @@ HISTORY_ORG = "notes"
 HISTORY_CLASS = "history"
 HISTORY_TOKEN_SCOPES = "write:repository"
 HISTORY_BRANCH = "main"
+
+# The image shelf: a private organisation whose container packages are the
+# built images waiting to be published, one per repo. The marker is how RS
+# recognises the organisation as its own; it lives in Gitea (the description),
+# not in a host file, so it survives a restore and a second RS home.
+IMAGES_ORG = "rs-images"
+IMAGES_ORG_MARKER = ("Built images waiting to be published. Managed by "
+                     "research-sandbox; do not edit.")
+IMAGES_TEAM = "readers"
+
+
+def _images_org_collision() -> str:
+    return (f"the name {IMAGES_ORG!r} is already taken on Gitea by an account "
+            f"or organisation research-sandbox did not create; rename or delete "
+            f"it under Site Administration in the Gitea tab, then try again")
+
+
+def registry_base(host_port: str) -> str:
+    """The host-loopback registry root (the same publish as api_base)."""
+    return f"http://127.0.0.1:{host_port}"
+
 # Box names gitea refuses as a repo-name ending (`.git` `.wiki` `.rss` `.atom`)
 # or a user-name ending (`.keys` `.gpg` `.png` `.rss` `.atom`) — measured on
 # 1.25.1; the notes repo is `<project>.<box>` and the user `agent-<project>.<box>`.

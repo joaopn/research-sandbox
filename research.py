@@ -2404,6 +2404,31 @@ def cmd_dev_repo_remove(args: argparse.Namespace) -> None:
     print(f"removed {args.repo} (mirror + retired agent forks; {tail})")
 
 
+def cmd_dev_image_show(args: argparse.Namespace) -> None:
+    """The repo's built image on the local shelf (a READ — a stopped gitea
+    shows nothing, the dev_status posture)."""
+    res = _call(rscore.dev_image_show, _build(rscore.DevImageRequest, repo=args.repo))
+    if not res.running:
+        print("gitea is not running (enable/start it to read built images)")
+        return
+    if not res.present:
+        print(f"{args.repo}: no built image")
+        return
+    print(f"{args.repo}: built image {res.digest}")
+    print(f"  commit:   {res.commit or '(not recorded)'}")
+    print(f"  git tags: {', '.join(res.git_tags) or '(none)'}")
+    print(f"  source:   {res.source or '(not recorded)'}")
+    print(f"  created:  {res.created or '(not recorded)'}")
+    print(f"  size:     {res.size} bytes")
+
+
+def cmd_dev_image_discard(args: argparse.Namespace) -> None:
+    res = _call(rscore.dev_image_discard,
+                _build(rscore.DevImageRequest, repo=args.repo))
+    print(f"{args.repo}: built image removed" if res.removed
+          else f"{args.repo}: no built image to remove")
+
+
 def cmd_dev_fork_list(_args: argparse.Namespace) -> None:
     """Per-repo consumer forks + the active marker (a READ — a stopped gitea
     lists nothing, the dev_status posture)."""
@@ -3427,6 +3452,16 @@ def build_parser() -> argparse.ArgumentParser:
                       help="on = shown on the rs-fetch lists (the default for "
                            "every repo); off = hidden")
     dvrf.set_defaults(func=cmd_dev_repo_fetch)
+    dvi = dv_sub.add_parser(
+        "image", help="a repo's built image on the local shelf, waiting to be "
+                      "published")
+    dvi_sub = dvi.add_subparsers(dest="image_action", required=True)
+    dvis = dvi_sub.add_parser("show", help="show the repo's built image")
+    dvis.add_argument("repo")
+    dvis.set_defaults(func=cmd_dev_image_show)
+    dvid = dvi_sub.add_parser("discard", help="remove the repo's built image")
+    dvid.add_argument("repo")
+    dvid.set_defaults(func=cmd_dev_image_discard)
     dvrv = dv_sub.add_parser("reviews",
                              help="list every recorded review verdict, newest "
                                   "first (the ledger; no gitea needed)")

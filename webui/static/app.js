@@ -3668,7 +3668,10 @@ async function renderDevBackupTab(view, body) {
         "What it does not contain: the host's record of which project works "
         + "which repository, and the agents' own credentials. Those live "
         + "outside Gitea, so anything set up after a backup will need setting "
-        + "up again if you ever restore from it.",
+        + "up again if you ever restore from it. Packages stored in Gitea are "
+        + "left out too, and a restore removes the ones that are there. That "
+        + "includes built images waiting to be published: build those again "
+        + "from their commits.",
     ]));
     // THE WARNING (maintainer ruling, 2026-09-14). A backup can only ever be
     // restored into the Gitea that made it — the instance identity in its config
@@ -6141,6 +6144,7 @@ function devRepoRemoveDialog(view, body, repo) {
                 + "agent fork (including its commit history), the retired agent "
                 + "identities that own them (which frees their project or box "
                 + "names for reuse), the tokens of identities nothing else uses, "
+                + "the repo's built image if it has one, "
                 + "and the local record. It cannot be undone. The GitHub original "
                 + "is untouched.",
             ]),

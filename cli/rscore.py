@@ -79,6 +79,7 @@ from typing import Any, Callable, Sequence
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import box_catalog  # noqa: E402  (box-preset catalog; staged into the supervisor)
 import defaults  # noqa: E402
+import image_registry  # noqa: E402  (the image shelf's registry client; stdlib only)
 import mcp_registry  # noqa: E402
 import mcp_servers  # noqa: E402  (the MCP gateway's server list; stdlib only)
 import model_catalog  # noqa: E402  (agent model/effort catalog + per-type defaults; HOST-side only — never staged/baked into a container, see _read_models)
@@ -3616,6 +3617,23 @@ class DevRepoRemoveRequest:
 
 
 @dataclass(frozen=True)
+class DevImageRequest:
+    """`dev image show` / `dev image discard`: the repo whose built image is
+    read or removed. Validated like every other repo-naming dev request; that
+    the name can be an image name at all is checked by the verb, which says
+    so in words."""
+    repo: str
+
+    @classmethod
+    def from_kwargs(cls, **kw: Any) -> "DevImageRequest":
+        repo = kw.get("repo")
+        if not (isinstance(repo, str) and repo and repo not in (".", "..")
+                and "/" not in repo and "\\" not in repo):
+            raise ValidationError(f"invalid repo name {repo!r}")
+        return cls(repo=repo)
+
+
+@dataclass(frozen=True)
 class DevRepoListRequest:
     @classmethod
     def from_kwargs(cls, **_kw: Any) -> "DevRepoListRequest":
@@ -4274,6 +4292,25 @@ class DevRepoRemoveResult:
     # freed for reuse. Empty when every owner was kept (still recorded by a
     # project, or owning something else) or none existed.
     purged_users: list[str] = field(default_factory=list)
+
+
+@dataclass
+class DevImageShowResult:
+    repo: str
+    running: bool                   # False: Gitea is not running, nothing was read
+    present: bool = False
+    digest: str = ""
+    commit: str = ""
+    git_tags: list[str] = field(default_factory=list)
+    source: str = ""
+    created: str = ""
+    size: int = 0
+
+
+@dataclass
+class DevImageDiscardResult:
+    repo: str
+    removed: int                    # stored versions deleted; 0 = there was no image
 
 
 @dataclass
@@ -23062,6 +23099,16 @@ def dev_repo_remove(req: "DevRepoRemoveRequest", progress=None) -> DevRepoRemove
             f"{', '.join(live)}. Delete the dev project or box that owns the "
             f"work first (retiring it archives the fork), or archive the fork "
             f"in the Gitea tab if it is orphaned.")
+    # The repo's built image goes FIRST, and a failure stops the removal: once
+    # the mirror is gone the Development page has no card left to remove the
+    # image from.
+    progress.step("image", "removing the repo's built image")
+    try:
+        _discard_built_image(host_port, req.repo)
+    except gitea.GiteaError as e:
+        raise ValidationError(
+            f"could not remove {req.repo!r}'s built image ({e}); nothing was "
+            f"deleted. Try Remove again once Gitea answers.")
     # Milestone KEY "delete" is read by the archived remove harness; only the
     # message changed.
     progress.step("delete",
@@ -23072,6 +23119,66 @@ def dev_repo_remove(req: "DevRepoRemoveRequest", progress=None) -> DevRepoRemove
     except gitea.GiteaError as e:
         raise ValidationError(str(e))
     return DevRepoRemoveResult(repo=req.repo, purged_users=list(purged))
+
+
+def _image_name_for(repo: str) -> str:
+    try:
+        return image_registry.image_name(repo)
+    except ValueError:
+        die(f"repo {repo!r} has a name that cannot be used as an image name "
+            f"(image names are lower-case letters and digits joined by '.', "
+            f"'_' or '-'), so it has no built image")
+
+
+def _discard_built_image(host_port: str, repo: str) -> int:
+    """Delete every stored version of the repo's built image. 0 when the repo
+    has none, or when its name could never be an image name. Raises on a
+    failed read or delete — a caller never takes a partial removal for done."""
+    try:
+        name = image_registry.image_name(repo)
+    except ValueError:
+        return 0
+    client = gitea.GiteaClient(gitea.api_base(host_port), gitea.read_admin_token())
+    return client.delete_image_versions(name)
+
+
+def _clear_built_images(host_port: str) -> int:
+    """Delete every stored version of every built image (after a restore)."""
+    client = gitea.GiteaClient(gitea.api_base(host_port), gitea.read_admin_token())
+    return client.delete_image_versions()
+
+
+def dev_image_show(req: "DevImageRequest", _progress=None) -> DevImageShowResult:  # type: ignore[name-defined]
+    """The repo's built image, if it has one. A READ: it never starts Gitea
+    (the dev_status posture) and creates nothing."""
+    name = _image_name_for(req.repo)
+    if not container_running(gitea.GITEA_CONTAINER):
+        return DevImageShowResult(repo=req.repo, running=False)
+    try:
+        client = image_registry.RegistryClient(
+            gitea.registry_base(_gitea_host_port()), gitea.ADMIN_USER,
+            gitea.read_admin_token())
+        info = image_registry.image_info(client, f"{gitea.IMAGES_ORG}/{name}")
+    except (gitea.GiteaError, image_registry.RegistryError) as e:
+        raise ValidationError(f"could not read {req.repo!r}'s built image ({e})")
+    if info is None:
+        return DevImageShowResult(repo=req.repo, running=True)
+    return DevImageShowResult(repo=req.repo, running=True, present=True, **info)
+
+
+def dev_image_discard(req: "DevImageRequest", progress=None) -> DevImageDiscardResult:  # type: ignore[name-defined]
+    """Remove the repo's built image from the shelf. Removing when there is
+    none is `removed=0`, not an error."""
+    progress = progress or _NULL_PROGRESS
+    _image_name_for(req.repo)
+    _resume_gitea(require=True)
+    progress.step("image", "removing the built image")
+    try:
+        removed = _discard_built_image(_gitea_host_port(), req.repo)
+    except gitea.GiteaError as e:
+        raise ValidationError(
+            f"could not remove {req.repo!r}'s built image ({e})")
+    return DevImageDiscardResult(repo=req.repo, removed=removed)
 
 
 def dev_repo_list(_req: "DevRepoListRequest", _progress=None) -> DevRepoListResult:  # type: ignore[name-defined]
@@ -23926,6 +24033,22 @@ def dev_board_import(req: "DevBoardImportRequest",
                 f"start so the dev boxes pick up its address.")
         progress.step("wire", "re-attaching gitea to the projects")
         wire_gitea_to_projects()
+        # Built images are not part of a backup, and the restore removed the
+        # image store: what the restored database still lists has no data
+        # behind it. Clear those records, last, so that a failure here is
+        # reported after everything else is back.
+        progress.step("images", "clearing the record of built images")
+        try:
+            _clear_built_images(host_port_for_restore)
+        except gitea.GiteaError as e:
+            raise HarnessError(
+                "gitea restored, but the record of built images could not be "
+                "cleared",
+                f"the restore COMPLETED and gitea is running — but removing the "
+                f"restored record of built images failed ({e}). Those records "
+                f"have no data behind them: each is replaced the next time "
+                f"its repo is built, and discarding a repo's built image "
+                f"removes its record before that.")
         return DevBoardImportResult(restored_from=str(src), safety_export=safety)
 
 
