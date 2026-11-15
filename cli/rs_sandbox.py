@@ -2163,6 +2163,11 @@ def _ensure_dev_bridge(name: str, subnet: str) -> str:
 RS_FETCH_BIN = "/usr/local/bin/rs-fetch"
 OPERATOR_TOKEN_FILE = DEV_TOKENS_DIR / "operator.token"
 FETCH_WIRING_FILE = DEV_TOKENS_DIR / "fetch-wiring.json"
+# rs-sync and its issue-reading token, staged by the host beside rs-fetch: a
+# lockstep with rscore.RS_SYNC_BIN / ISSUE_READER_TOKEN_NAME and
+# rs_sync.GITEA_TOKEN_PATH (pinned by a test).
+RS_SYNC_BIN = "/usr/local/bin/rs-sync"
+ISSUE_READER_TOKEN_FILE = DEV_TOKENS_DIR / "issue-reader.token"
 
 
 def _staged_gitea_ip() -> str:
@@ -2180,6 +2185,61 @@ def _staged_gitea_ip() -> str:
     return ip if _IPV4_RE.match(ip) else ""
 
 
+def _stage_box_sync(cname: str) -> None:
+    """Copy rs-sync and the issue-reading token from this project container's
+    own staged copies into a fetch box (the token 0600 over stdin as the box
+    user). Each half warns and is skipped on its own failure; nothing here
+    raises, so the rs-fetch halves after it always run."""
+    try:
+        body = Path(RS_SYNC_BIN).read_bytes()
+    except FileNotFoundError:
+        body = None
+        print(f"warning: rs-sync is not staged in this project, so box {cname!r} "
+              f"gets none; stop and start the project, then restart this box",
+              file=sys.stderr)
+    except OSError as e:
+        body = None
+        print(f"warning: rs-sync could not be read in this project "
+              f"({e.strerror or type(e).__name__}), so box {cname!r} gets none",
+              file=sys.stderr)
+    if body is not None:
+        try:
+            r = subprocess.run(
+                ["docker", "exec", "-i", "-u", "0", cname, "sh", "-c",
+                 f"cat > {RS_SYNC_BIN} && chmod 755 {RS_SYNC_BIN}"],
+                input=body, capture_output=True)
+        except OSError as e:
+            r = subprocess.CompletedProcess(
+                [], 1, b"", (e.strerror or type(e).__name__).encode())
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or b"").decode(errors="replace").strip()
+            print(f"warning: staging rs-sync into box {cname!r} failed: "
+                  f"{err or 'cat returned non-zero'}", file=sys.stderr)
+    try:
+        raw = ISSUE_READER_TOKEN_FILE.read_bytes().strip()
+    except OSError:
+        raw = b""
+    # Only a 40-hex token is copied: anything else in the file is not a token.
+    if not re.fullmatch(rb"[0-9a-f]{40}", raw):
+        print(f"warning: the issue-reading token is not staged in this project, "
+              f"so rs-sync in box {cname!r} cannot read Gitea; stop and start "
+              f"the project, then restart this box", file=sys.stderr)
+        return
+    try:
+        r = subprocess.run(
+            ["docker", "exec", "-i", "-u", "worker", cname, "sh", "-c",
+             'umask 077 && mkdir -p "$HOME/.dev-tokens" && '
+             f'cat > "$HOME/.dev-tokens/{ISSUE_READER_TOKEN_FILE.name}"'],
+            input=raw + b"\n", capture_output=True)
+    except OSError as e:
+        r = subprocess.CompletedProcess(
+            [], 1, b"", (e.strerror or type(e).__name__).encode())
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or b"").decode(errors="replace").strip()
+        print(f"warning: issue-token staging into box {cname!r} failed: {err}",
+              file=sys.stderr)
+
+
 def _stage_box_fetch(cname: str) -> None:
     """Copy the opt-in fetch surface into a just-run rs-fetch-ENABLED box: the
     rs-fetch tool (from this supervisor's own staged copy, root-owned 0755) +
@@ -2191,7 +2251,10 @@ def _stage_box_fetch(cname: str) -> None:
     staging skipped silently): the heal is a project stop/start (the host
     re-stages the halves for fetch-consumer projects), then `rs-sandbox
     restart` of this box. A staging FAILURE warns and leaves the box usable
-    without fetch (never die — the box itself is fine)."""
+    without fetch (never die — the box itself is fine). rs-sync and its
+    issue-reading token are copied first, independently: a missing half of
+    one never stops the other."""
+    _stage_box_sync(cname)
     try:
         tok = OPERATOR_TOKEN_FILE.read_text().strip()
     except OSError:

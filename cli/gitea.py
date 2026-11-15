@@ -402,6 +402,114 @@ def _gitea_admin(argv: list[str]) -> subprocess.CompletedProcess:
     return _docker_exec(["gitea", "admin", *argv])
 
 
+# --- the issue-reading token (rs-sync) --------------------------------------
+#
+# A second token of the read-only operator account, with issue read added: the
+# operator token stays read:repository only. It is minted on demand when an
+# rs-fetch surface is staged (rscore._ensure_issue_reader_token) and staged
+# beside the operator token; rs-sync reads issues, comments and boards with
+# it. Paths are built at call time (archived pins redirect DEV_DIR).
+
+ISSUE_READER_SCOPES = "read:repository,read:issue"
+# Bound for minting it through the Gitea admin CLI (a docker exec). The other
+# CLI calls answer in about a second; a minute covers a cold, busy container
+# while keeping a wedged Gitea from holding the mint lock, and with it a
+# project start, indefinitely. At half that a slow first boot could fail the
+# mint (a warning, retried at the next start); at ten times a wedged Gitea
+# would stall a start for ten minutes.
+ISSUE_TOKEN_MINT_TIMEOUT_S = 60
+
+
+def issue_reader_token_path() -> Path:
+    return DEV_DIR / "issue-reader.token"
+
+
+def issue_reader_lock_path() -> Path:
+    return DEV_DIR / "issue-reader.lock"
+
+
+def probe_issue_read(host_port: str, token: str) -> int | None:
+    """The HTTP status of one issue read with `token` (a route that needs no
+    repository: 200 with issue read, 403 naming read:issue without it, 401 for
+    a token Gitea does not know — measured on 28.2.0), or None when Gitea did
+    not answer."""
+    req = urllib.request.Request(f"{api_base(host_port)}/repos/issues/search?limit=1",
+                                 headers={"Authorization": f"token {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=STATUS_TIMEOUT_S) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError):
+        # ValueError: a token that cannot go into a header (a newline inside)
+        # — no answer to report, never the value.
+        return None
+
+
+def mint_issue_reader_token() -> str:
+    """Mint a new issue-reading token under a fresh unique name (a crash after
+    a mint never blocks the next attempt). Every failure, a timeout and output
+    that is not a token included, is a GiteaError."""
+    name = ("rs-issue-reader-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            + "-" + os.urandom(4).hex())
+    try:
+        r = subprocess.run(
+            ["docker", "exec", "-u", "git", GITEA_CONTAINER, "gitea", "admin", "user",
+             "generate-access-token", "--username", OPERATOR_USER,
+             "--scopes", ISSUE_READER_SCOPES, "--raw", "--token-name", name],
+            capture_output=True, timeout=ISSUE_TOKEN_MINT_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        raise GiteaError("minting the issue-reading token timed out")
+    except OSError as e:
+        raise GiteaError(f"could not run the Gitea admin command "
+                         f"({e.strerror or type(e).__name__})")
+    if r.returncode != 0:
+        raise GiteaError("Gitea refused to mint the issue-reading token")
+    try:
+        out = r.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        raise GiteaError("the minted issue-reading token is not text")
+    lines = out.strip().splitlines()
+    tok = lines[-1].strip() if lines else ""
+    if not re.fullmatch(r"[0-9a-f]{40}", tok):
+        raise GiteaError("the minted issue-reading token has an unexpected shape")
+    return tok
+
+
+def write_secret_atomic(path: Path, value: str) -> None:
+    """Write a secret 0600 through a fresh temporary file and a rename, so an
+    interrupted write never leaves a cut-short file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.urandom(6).hex()}.tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fh = os.fdopen(fd, "w")
+        except BaseException:
+            os.close(fd)
+            raise
+        with fh:
+            fh.write(value)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    # Best effort: the rename reaches the disk with its folder. The new file is
+    # already in place, so a folder that cannot be synced (EINVAL on some
+    # filesystems) must not turn a written secret into a reported failure.
+    with contextlib.suppress(OSError):
+        dfd = os.open(str(path.parent), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+
+
 # --- encrypted instance export (STAGE_BOARD_BACKUP) -------------------------
 #
 # An agent OWNS its fork, and in gitea ownership implies destruction: a consumer

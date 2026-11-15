@@ -5295,7 +5295,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         if not fetch_ip:
             die(f"rs-gitea did not attach to {network} (no IP); check docker state")
         _stage_dev_gitea(project, cfg, gitea_ip=fetch_ip)
-        _stage_dev_fetch(container_name)
+        _stage_dev_fetch(container_name, progress=progress)
         _stage_fetch_wiring(container_name)
     # F3 Slice 1: bring up loopback forwarders for any already-registered exported
     # ports (inert on a fresh project's empty registry; self-gates on docker).
@@ -12299,7 +12299,7 @@ def _recreate_supervisor(
     # box's _rerun_box → _stage_box_fetch copies these; the
     # order-is-load-bearing class).
     if _project_has_fetch_consumers(workspace_path):
-        _stage_dev_fetch(container)
+        _stage_dev_fetch(container, progress=progress)
         _stage_fetch_wiring(container)
     # Preset-field env files (host store → supervisor home): the recreate wiped
     # the supervisor halves; restage BEFORE the box relaunch loop below, whose
@@ -12513,7 +12513,7 @@ def _start_docker_substrate(project: str, cfg: "Config",  # type: ignore[name-de
     # keeps the container fs, but re-staging keeps the wiring fresh (gitea's
     # IP on this network can change across the stop).
     if _project_has_fetch_consumers(workspace_path_for(project, cfg)):
-        _stage_dev_fetch(container)
+        _stage_dev_fetch(container, progress=progress)
         _stage_fetch_wiring(container)
     # F3 Slice 1: re-establish loopback forwarders for the project's registered
     # exported ports (the container's netns/processes reset on stop/start).
@@ -12823,7 +12823,7 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
     # run above wiped the container fs — re-stage the fetch halves for a
     # fetch-enabled project.
     if _project_has_fetch_consumers(workspace_path):
-        _stage_dev_fetch(container)
+        _stage_dev_fetch(container, progress=progress)
         _stage_fetch_wiring(container)
     # F3 Slice 1: the rm + run above wiped the container fs + netns — re-establish
     # loopback forwarders for the project's registered exported ports.
@@ -13860,6 +13860,7 @@ def wire_gitea_to_projects(progress=None) -> None:
     if not nets:
         return
     cfg = load_config()
+    issue_token_checked = False
     for network in nets:
         project = network[len(PROJECT_NETWORK_PREFIX):]
         ip = _connect_gitea_to_project_network(network)
@@ -13887,7 +13888,13 @@ def wire_gitea_to_projects(progress=None) -> None:
         # consumers, BEFORE the box reconcile below (a re-run box copies them).
         _stage_dev_gitea(project, cfg, gitea_ip=ip, serving=serving)
         if _project_has_fetch_consumers(workspace_path_for(project, cfg)):
-            _stage_dev_fetch(container_name_for(project))
+            # The issue-reading token is shared by every rs-fetch project:
+            # checked (and minted when needed) once per pass, never per project.
+            if not issue_token_checked:
+                _ensure_issue_reader_token(progress, serving)
+                issue_token_checked = True
+            _stage_dev_fetch(container_name_for(project), progress=progress,
+                             serving=serving, ensure=False)
             _stage_fetch_wiring(container_name_for(project), serving=serving)
         # F3 Slice 1: heal loopback forwarders on the universal `research start`
         # wiring pass (self-gates on docker; no-op for non-docker projects).
@@ -14139,7 +14146,8 @@ def _rerun_inner_guard(project: str) -> None:
               f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
 
 
-def _stage_dev_fetch(container: str) -> None:
+def _stage_dev_fetch(container: str, progress=None, serving: bool = True,
+                     ensure: bool = True) -> None:
     """Stage the OPT-IN fetch surface into a RUNNING rs-fetch-enabled project
     container: the rs-fetch tool at /usr/local/bin/rs-fetch (root-owned 0755 —
     the _stage_rs_sandbox single-file stdin idiom) + the READ-ONLY gitea
@@ -14180,6 +14188,193 @@ def _stage_dev_fetch(container: str) -> None:
     if r.returncode != 0:
         print(f"warning: operator-token staging into {container} failed: "
               f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
+    # rs-sync and its issue-reading token ride the same surface. `ensure=False`
+    # is for a caller that already checked the token once for many projects
+    # (the wiring pass), so a failing mint is not retried per project.
+    if ensure:
+        _ensure_issue_reader_token(progress, serving)
+    _stage_rs_sync(container)
+
+
+# The in-container name of the issue-reading token: a lockstep with
+# rs_sandbox.ISSUE_READER_TOKEN_FILE (the box copy) and rs_sync.GITEA_TOKEN_PATH
+# (the reader). Pinned by a test.
+ISSUE_READER_TOKEN_NAME = "issue-reader.token"
+RS_SYNC_BIN = "/usr/local/bin/rs-sync"
+# How often a process waiting for another's token mint looks again. The wait
+# is bounded by gitea.ISSUE_TOKEN_MINT_TIMEOUT_S plus two probe timeouts
+# (gitea.STATUS_TIMEOUT_S, the holder's probes); a mint takes about a second,
+# so a fifth of a second adds little delay and few wake-ups.
+ISSUE_READER_LOCK_POLL_S = 0.2
+
+
+def _read_issue_reader_token() -> str:
+    """The host's issue-reading token, or "" when the file is absent or does
+    not hold exactly one 40-hex token (bytes that are not text, a stray
+    newline inside, anything else): such a file is treated as refused, so the
+    next check mints over it. Other OSErrors (a folder there, no permission)
+    propagate for the caller to report."""
+    try:
+        raw = gitea.issue_reader_token_path().read_bytes()
+    except FileNotFoundError:
+        return ""
+    tok = raw.strip()
+    return tok.decode("ascii") if re.fullmatch(rb"[0-9a-f]{40}", tok) else ""
+
+
+def _stage_rs_sync(container: str) -> None:
+    """Copy rs-sync and, when the host holds one, the issue-reading token into
+    an rs-fetch container (the token 0600 over stdin, never argv). Each half
+    warns and is skipped on its own failure; nothing here raises."""
+    src = Path(__file__).resolve().parent / "rs_sync.py"
+    try:
+        body = src.read_bytes()
+    except OSError as e:
+        print(f"warning: rs-sync not staged into {container}: rs_sync.py could "
+              f"not be read ({e.strerror or type(e).__name__})", file=sys.stderr)
+        body = None
+    proc = None
+    if body is not None:
+        try:
+            proc = subprocess.Popen(
+                ["docker", "exec", "-i", "-u", "0", container, "sh", "-c",
+                 f"cat > {RS_SYNC_BIN} && chmod 755 {RS_SYNC_BIN}"],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            _, err = proc.communicate(input=body)
+        except OSError as e:
+            print(f"warning: staging rs-sync into {container} failed "
+                  f"({e.strerror or type(e).__name__})", file=sys.stderr)
+            proc = None
+        if proc is not None and proc.returncode != 0:
+            detail = (err.decode(errors="replace") if err else "").strip()
+            print(f"warning: staging rs-sync into {container} failed: "
+                  f"{detail or 'cat returned non-zero'}", file=sys.stderr)
+    try:
+        tok = _read_issue_reader_token()
+    except OSError:
+        return
+    if not tok:
+        return
+    try:
+        r = run(["docker", "exec", "-i", "-u", "research", container, "sh", "-c",
+                 'umask 077 && mkdir -p "$HOME/.dev-tokens" && '
+                 f'cat > "$HOME/.dev-tokens/{ISSUE_READER_TOKEN_NAME}"'],
+                input=tok + "\n", capture_output=True)
+    except (OSError, ValueError) as e:   # ValueError: output that is not text
+        print(f"warning: issue-token staging into {container} failed "
+              f"({type(e).__name__})", file=sys.stderr)
+        return
+    if r.returncode != 0:
+        print(f"warning: issue-token staging into {container} failed: "
+              f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
+
+
+@contextlib.contextmanager
+def _issue_reader_locks():
+    """Yield True while holding the Gitea lock SHARED (an upgrade or restore
+    holds it exclusive: then False at once) and the mint lock EXCLUSIVE
+    (another process minting: wait for it, bounded by the mint timeout plus
+    two probe timeouts, then False). Opened without die(): a failure to open
+    is an OSError for the caller to report."""
+    fds = []
+    try:
+        gitea.DEV_DIR.mkdir(parents=True, exist_ok=True)
+        g = os.open(_gitea_lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
+        fds.append(g)
+        try:
+            fcntl.flock(g, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        m = os.open(gitea.issue_reader_lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
+        fds.append(m)
+        # The holder's locked work: the re-probe, the mint and the new token's
+        # probe (the write is local and quick). Waiting that long lets the
+        # waiter re-read the holder's result instead of reporting "busy".
+        deadline = (time.monotonic() + gitea.ISSUE_TOKEN_MINT_TIMEOUT_S
+                    + 2 * gitea.STATUS_TIMEOUT_S)
+        while True:
+            try:
+                fcntl.flock(m, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    yield False
+                    return
+                time.sleep(ISSUE_READER_LOCK_POLL_S)
+        yield True
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+def _ensure_issue_reader_token(progress=None, serving: bool = True) -> None:
+    """Make sure the host holds a working issue-reading token, minting one
+    when it does not. Never aborts the caller: every failure is a warning
+    (stderr, plus the progress sink when there is one), and only when a mint
+    was needed and was skipped or failed. Decided from measured state, never
+    from a record:
+      * Gitea not running or not answering here: no probe, no mint; a report
+        only when no token exists at all.
+      * the token answers 200: nothing to do.
+      * it answers anything but 401/403: nothing to do (rs-sync names it).
+      * 401/403 or no token: mint, unless an upgrade or restore holds Gitea
+        (its own message is relayed), the admin token does not answer 200 on
+        the same route, or the locks are busy; re-probe under the locks; the
+        new token is written only after it answers 200 itself."""
+    path = gitea.issue_reader_token_path()
+
+    def report(why: str) -> None:
+        _report_warnings([f"the Gitea access for issues that rs-fetch projects "
+                          f"share could not be set up ({why}); starting an "
+                          f"rs-fetch project again retries it"], progress)
+
+    read = _read_issue_reader_token
+    try:
+        if not serving or not container_running(gitea.GITEA_CONTAINER):
+            if not read():
+                report("Gitea is not answering" if not serving
+                       else "Gitea is not running")
+            return
+        hp = _gitea_host_port()
+        tok = read()
+        if tok:
+            st = gitea.probe_issue_read(hp, tok)
+            if st == 200 or st not in (401, 403):
+                return
+        held = _gitea_held_reason()
+        if held:
+            report(held)
+            return
+        try:
+            admin = gitea.read_admin_token()
+        except gitea.GiteaError:
+            admin = ""
+        if not admin or gitea.probe_issue_read(hp, admin) != 200:
+            report("Gitea did not confirm its admin access")
+            return
+        with _issue_reader_locks() as ok:
+            if not ok:
+                report("Gitea is busy with an upgrade, a restore or another token mint")
+                return
+            tok = read()
+            if tok and gitea.probe_issue_read(hp, tok) == 200:
+                return
+            new = gitea.mint_issue_reader_token()
+            if gitea.probe_issue_read(hp, new) != 200:
+                report("the new token was not accepted")
+                return
+            gitea.write_secret_atomic(path, new + "\n")
+    except gitea.GiteaError as e:
+        report(str(e) or "Gitea refused")       # fixed texts, no paths
+    except OSError as e:
+        # strerror only: str(e) carries the host path, and this text reaches
+        # the browser through the progress sink.
+        report(e.strerror or type(e).__name__)
+    except ValueError:
+        # e.g. a token Gitea's admin CLI or the admin file holds that cannot
+        # go into a header: a fixed text, never the value.
+        report("a Gitea token could not be used")
 
 
 def _stage_fetch_wiring(container: str, *, serving: bool = True) -> None:
@@ -20959,7 +21154,7 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
         if not ip:
             die(f"rs-gitea did not attach to {network} (no IP); check docker state")
         _stage_dev_gitea(req.project, cfg, gitea_ip=ip)
-        _stage_dev_fetch(container)
+        _stage_dev_fetch(container, progress=progress)
         _stage_fetch_wiring(container)
     # Agent model + effort for this box (STAGE_MODEL_SELECT). Explicit wins;
     # otherwise the project's `box` pair from the marker — which create already
