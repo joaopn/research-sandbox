@@ -451,6 +451,7 @@ const state = {
     detectInFlight: {},
     detectPending: {},
     projectLastService: {},  // { [projectName]: serviceId } — per-project landing memory (in-memory; reload/restart resets to the editor default)
+    stoppedProjects: [],     // names in the rail's "Stopped" fold — broker-derived, in memory only (syncSidebarFromBroker)
     terminals: {},           // "${project}:${service}" -> { term, fitAddon, ws, container, project, service }
     probeTimer: null,
     servicesTimer: null,
@@ -1412,7 +1413,17 @@ async function attachIntoVault(name) {
 // cookie survives the reload) — silently no-ops when logged out, leaving the
 // rail as whatever persisted vault bookmarks exist. Best-effort + non-blocking:
 // the rail re-renders once the running set lands.
-async function syncSidebarFromBroker(prefetched) {
+//
+// The same list also feeds the rail's "Stopped" fold (state.stoppedProjects),
+// and that is ALL it feeds: the list never removes a row. A start or update
+// recreates the container, so mid-action the list reports a project
+// `created`, `orphaned` or absent; a row leaves only when this page sees its
+// stop finish (lifecycleFinish → railMoveToFold). `seq` orders overlapping
+// syncs: the fold is replaced only by a list newer than the last one applied.
+// A caller that fetched the list itself takes its number BEFORE that fetch
+// (nextSidebarSyncSeq) and passes it in.
+async function syncSidebarFromBroker(prefetched, seq) {
+    if (seq === undefined) seq = nextSidebarSyncSeq();
     let list = prefetched;
     if (!Array.isArray(list)) {
         let res;
@@ -1428,7 +1439,328 @@ async function syncSidebarFromBroker(prefetched) {
         if (state.vault.projects.some((v) => v.name === p.project)) return;
         if (await attachIntoVault(p.project)) added++;
     }));
-    if (added) refreshProjectRail();
+    if (!state.vault) return;                    // locked meanwhile: nothing to apply
+    if (seq > sidebarSyncApplied) {
+        sidebarSyncApplied = seq;
+        state.stoppedProjects = computeStoppedProjects(list);
+    }
+    if (added || stoppedFoldChanged()) refreshProjectRail();
+}
+
+// ---- the rail's "Stopped" fold ------------------------------------------------
+// Projects whose container is cleanly stopped (`exited`, what Stop produces) sit
+// in a fold below the list, each with Start and its ⚙. Unusual container
+// states (paused, restarting, half-created) are not listed: Sandboxes shows and
+// handles those. The fold list is broker-derived and in memory only.
+let sidebarSyncSeq = 0;
+let sidebarSyncApplied = 0;
+function nextSidebarSyncSeq() {
+    sidebarSyncSeq += 1;
+    return sidebarSyncSeq;
+}
+
+// The fold for one broker list: every `exited` project with no sidebar row and
+// no action in flight, plus every name ALREADY in the fold that is being
+// started — taken from the fold, not the list, because mid-recreate the list
+// reports it `orphaned` or omits it, and its row must keep its spinner.
+function computeStoppedProjects(list) {
+    const rows = new Set(state.vault.projects.map((p) => p.name));
+    const busy = (n) => lifecycleInFlight.has(n) || railPending.has(n);
+    const out = [];
+    for (const p of list) {
+        if (!p || typeof p.project !== "string" || p.state !== "exited") continue;
+        if (rows.has(p.project) || busy(p.project) || out.includes(p.project)) continue;
+        out.push(p.project);
+    }
+    for (const n of state.stoppedProjects || []) {
+        if (out.includes(n) || rows.has(n)) continue;
+        const entry = lifecycleInFlight.get(n);
+        if ((entry && entry.verb === "start") || railPending.get(n) === "start") out.push(n);
+    }
+    return out;
+}
+
+// The fold list the rail was last BUILT from (makeProjectRail). Change is
+// judged against it, never against state.stoppedProjects, which
+// lifecycleFinish may already have updated without a rebuild.
+let railBuiltStopped = [];
+function stoppedFoldChanged() {
+    const a = (state.stoppedProjects || []).slice().sort();
+    const b = railBuiltStopped.slice().sort();
+    return a.length !== b.length || a.some((n, i) => n !== b[i]);
+}
+
+const STOPPED_FOLD_KEY = "rs-webui-stopped-fold";
+function readStoppedFoldOpen() {
+    try { return localStorage.getItem(STOPPED_FOLD_KEY) === "open"; }
+    catch (e) { return false; }
+}
+function writeStoppedFoldOpen(open) {
+    try { localStorage.setItem(STOPPED_FOLD_KEY, open ? "open" : "closed"); }
+    catch (e) { /* storage blocked: the fold just opens closed next time */ }
+}
+
+// The fold, or null when nothing is stopped. Neither its header nor its rows
+// ever carry the `project` or `rail-separator` class: the drag hit-test reads
+// `.project, .rail-separator` and writes their names into the saved order, and
+// every [data-name] lookup (probe, badges, activity) is scoped to `.project` —
+// so a fold row is never dragged, dropped on, probed or painted as running.
+function makeStoppedFold() {
+    const rows = new Set(state.vault.projects.map((p) => p.name));
+    // A late attach can land a row for a name still in the list: the row wins.
+    const names = (state.stoppedProjects || []).filter((n) => !rows.has(n));
+    if (!names.length) return null;
+    const { rank, unarranged } = railRanks();
+    const rankOf = (n) => (rank.has(n) ? rank.get(n) : unarranged);
+    names.sort((a, b) => (rankOf(a) - rankOf(b)) || a.localeCompare(b));
+    const open = readStoppedFoldOpen();
+    const head = el("button", {
+        type: "button",
+        class: "stopped-fold-head" + (open ? " open" : ""),
+        "aria-expanded": open ? "true" : "false",
+        title: open ? "Hide the stopped projects" : "Show the stopped projects",
+    }, [el("span", { class: "stopped-fold-chev" }, ["▸"]), `Stopped (${names.length})`]);
+    const fold = el("div", { class: "stopped-fold" }, [head]);
+    head.onclick = (ev) => {
+        ev.stopPropagation();
+        writeStoppedFoldOpen(!open);
+        const fresh = makeStoppedFold();
+        if (fresh) {
+            fold.replaceWith(fresh);
+            fresh.querySelector(".stopped-fold-head").focus();
+        } else {
+            fold.remove();
+        }
+    };
+    if (open) for (const n of names) fold.appendChild(makeStoppedRow(n));
+    return fold;
+}
+
+function makeStoppedRow(name) {
+    const row = el("div", { class: "stopped-project", "data-stopped": name });
+    row.appendChild(el("span", { class: "status-dot" }));
+    row.appendChild(el("span", { class: "name", title: name }, [name]));
+    row.appendChild(el("span", { class: "stopped-inflight" }, [railBusyLabel(name) || ""]));
+    row.appendChild(makeRailPowerButton(name, "start"));
+    row.appendChild(makeRailGearButton(() => openProjectConfigBox({ name })));
+    return row;
+}
+
+// Stop on a list row, Start on a fold row. Its click opens the inline confirm
+// on the row it sits in (found at click time: rows are rebuilt freely).
+function makeRailPowerButton(name, idle = "stop") {
+    const btn = el("button", { class: "project-power-btn", type: "button" });
+    paintRailPower(btn, name, idle);
+    btn.onclick = (ev) => {
+        ev.stopPropagation();
+        if (btn.disabled) return;
+        const holder = btn.closest(".project, .stopped-project");
+        if (holder) openRailConfirm(holder, name, idle);
+    };
+    return btn;
+}
+
+// ---- start / stop from the rail ---------------------------------------------
+// A rail row's power button asks inside the row (answers 2a + 3b: both verbs
+// confirm), then posts the same lifecycle verb Management does and follows it
+// with the lane's background watcher. The row moving is the feedback: a
+// sidebar action posts a corner notice only when it fails, is interrupted, or
+// its watcher stalls (lifecycleFinish / lifecycleWatch, `fromRail`).
+
+// Requests sent but not answered yet (name → verb): the button is disabled
+// from the click, so a second click cannot send a second request.
+const railPending = new Map();
+
+const RAIL_ICON_SVG = (() => {
+    const svg = (body, fill) =>
+        '<svg viewBox="0 0 24 24" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"'
+        + (fill ? ' fill="currentColor" stroke="none">'
+                : ' fill="none" stroke="currentColor" stroke-width="2"'
+                  + ' stroke-linecap="round" stroke-linejoin="round">')
+        + body + '</svg>';
+    return {
+        // Lucide (ISC) "settings" — the licence text sits with NAV_ICON_SVG.
+        gear: svg('<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>'),
+        stop: svg('<rect x="6" y="6" width="12" height="12" rx="1.5"/>', true),
+        start: svg('<polygon points="7 4 20 12 7 20 7 4"/>', true),
+        busy: svg('<path d="M21 12a9 9 0 1 1-6.22-8.56"/>'),
+    };
+})();
+
+// The row's ⚙: a real button now (it was a bare glyph). It keeps the
+// project-config-btn class, which the drag guard, the rail's outside-press
+// check and the mobile drawer's outside-close walk all match on.
+function makeRailGearButton(open) {
+    const btn = el("button", { class: "project-config-btn", type: "button",
+                               title: "Project settings", "aria-label": "Project settings" });
+    btn.innerHTML = RAIL_ICON_SVG.gear;
+    btn.onclick = (ev) => {
+        ev.stopPropagation();
+        open();
+    };
+    return btn;
+}
+
+// "starting…" / "stopping…" / "queued…" for a name with an action in flight
+// or a request still unanswered; null when idle.
+function railBusyLabel(name) {
+    const entry = lifecycleInFlight.get(name);
+    if (entry) return lifecycleLabel(entry);
+    const pending = railPending.get(name);
+    return pending ? (LIFECYCLE_LABELS[pending] || "working…") : null;
+}
+
+// Paint one power button: `idle` is the verb it offers when nothing runs
+// ("stop" on a list row, "start" on a fold row); busy = a disabled spinner.
+function paintRailPower(btn, name, idle) {
+    const busy = lifecycleInFlight.has(name) || railPending.has(name);
+    const mode = busy ? "busy" : idle;
+    // The label follows every repaint (queued → starting…); the icon only
+    // changes with the mode, so a spinning icon is not restarted.
+    const title = busy ? (railBusyLabel(name) || "working…")
+                       : `${idle === "stop" ? "Stop" : "Start"} ${name}`;
+    btn.title = title;
+    btn.setAttribute("aria-label", title);
+    if (btn.dataset.mode === mode) return;
+    btn.dataset.mode = mode;
+    btn.innerHTML = RAIL_ICON_SVG[mode];
+    btn.disabled = busy;
+    btn.classList.toggle("busy", busy);
+    btn.classList.toggle("go", mode === "start");
+}
+
+// The open inline confirm: its cancel, or null. One at a time; a rail rebuild
+// discards the DOM it lives in, so makeProjectRail forgets it.
+let railConfirmOpen = null;
+
+// Replace `holder`'s content (a list row or a fold row) with the question and
+// its two buttons. Clicks and presses on it never reach the row: no
+// activation, no drag. Cancel puts the original content back.
+function openRailConfirm(holder, name, verb) {
+    if (railConfirmOpen) railConfirmOpen.cancel();
+    const saved = Array.from(holder.childNodes);
+    const handle = {
+        cancel: () => {
+            if (railConfirmOpen !== handle) return;
+            railConfirmOpen = null;
+            // Focus inside the confirm goes back to the button that opened it,
+            // so a keyboard user stays where they were.
+            const hadFocus = holder.contains(document.activeElement);
+            holder.classList.remove("rail-confirming");
+            holder.replaceChildren(...saved);
+            // An action may have started, or an activity poll landed, while
+            // the row was hidden: paint both onto the restored row.
+            paintLifecycleLabels();
+            paintActivityBoxes();
+            if (hadFocus) {
+                const back = holder.querySelector(".project-power-btn");
+                if (back) back.focus();
+            }
+        },
+    };
+    const stop = verb === "stop";
+    const go = el("button", { class: "btn-small " + (stop ? "btn-danger" : ""), type: "button" },
+                  [stop ? "Stop" : "Start"]);
+    const no = el("button", { class: "btn-small btn-secondary", type: "button" }, ["Cancel"]);
+    go.onclick = (ev) => {
+        ev.stopPropagation();
+        handle.cancel();
+        railLifecycle(name, verb);
+    };
+    no.onclick = (ev) => {
+        ev.stopPropagation();
+        handle.cancel();
+    };
+    const box = el("div", { class: "rail-confirm" }, [
+        el("div", { class: "rail-confirm-q" }, stop
+            ? ["Stop ", el("b", {}, [name]), "? Running work is interrupted."]
+            : ["Start ", el("b", {}, [name]), "?"]),
+        el("div", { class: "rail-confirm-btns" }, [go, no]),
+    ]);
+    box.onclick = (ev) => ev.stopPropagation();
+    box.onpointerdown = (ev) => ev.stopPropagation();
+    box.onkeydown = (ev) => {
+        if (ev.key !== "Escape") return;
+        ev.stopPropagation();
+        handle.cancel();
+    };
+    holder.classList.add("rail-confirming");
+    holder.replaceChildren(box);
+    railConfirmOpen = handle;
+    // The button that opened it has just left the page: keep keyboard focus
+    // in the question, on its harmless answer.
+    no.focus();
+}
+
+const RAIL_UNREACHABLE = "Sandboxes is not reachable right now.";
+const RAIL_SIGNED_OUT = "sign in again under Sandboxes, then retry.";
+const RAIL_REFUSED = "Sandboxes refused this page.";
+
+// Post the verb and hand the op to the lifecycle lane's watcher. Transport and
+// verb failures are told apart (a 200 {ok:false} is the broker's refusal,
+// anything else is Sandboxes being unreachable or refusing this page); each
+// posts one failed notice. The pending mark is cleared and the rail repainted
+// whatever happens, so no spinner outlives its request.
+async function railLifecycle(name, verb) {
+    if (lifecycleInFlight.has(name) || railPending.has(name)) return;
+    railPending.set(name, verb);
+    paintLifecycleLabels();
+    // A stop/start recreates or ends the supervisor: forget the remembered tab,
+    // as Management does (mgmtAction).
+    delete state.projectLastService[name];
+    let failure = null;
+    try {
+        let res;
+        try {
+            res = await fetch(`/broker/project/${encodeURIComponent(name)}/${verb}`,
+                { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+        } catch (e) {
+            failure = RAIL_UNREACHABLE;
+            return;
+        }
+        if (res.status === 401) { failure = RAIL_SIGNED_OUT; return; }
+        if (res.status === 403) { failure = RAIL_REFUSED; return; }
+        let body;
+        try { body = await res.json(); } catch (e) { failure = RAIL_UNREACHABLE; return; }
+        if (!res.ok) { failure = RAIL_UNREACHABLE; return; }
+        if (!body || !body.ok || typeof body.op_id !== "string" || !body.op_id) {
+            failure = mgmtErrText(body);
+            return;
+        }
+        // A seed may already have followed this op to its end (it answers
+        // when the op starts, so only a very slow reply could lose that race).
+        if (lifecycleFinished.has(body.op_id)) return;
+        const entry = lifecycleRegister(name, body.op_id, verb, null);
+        entry.fromRail = true;
+        lifecycleWatch(name);
+    } finally {
+        railPending.delete(name);
+        paintLifecycleLabels();
+        if (failure) {
+            showOpNotice(`${name} could not ${verb}: ${failure}`, false, () => {});
+        }
+    }
+}
+
+// A stop this page saw finish: the project leaves the list for the fold. Its
+// saved tabs, its place in the order and its alert setting are KEPT — this is
+// a state change, not a removal, so it comes back where it was. Bookmarks
+// (rows the operator entered by hand) are never dropped.
+function railMoveToFold(name) {
+    if (!state.vault) return;                   // locked meanwhile
+    const row = state.vault.projects.find((p) => p.name === name);
+    if (row && row._jit) {
+        const wasActive = state.activeProject === name;
+        closeProjectConfigBox(name);
+        teardownProjectState(name);
+        state.vault.projects = state.vault.projects.filter((p) => p !== row);
+        if (wasActive) showWelcome(true);
+    }
+    if (!state.vault.projects.some((p) => p.name === name)
+            && !(state.stoppedProjects || []).includes(name)) {
+        state.stoppedProjects = (state.stoppedProjects || []).concat([name]);
+    }
+    refreshProjectRail();
 }
 
 function makeProjectRail() {
@@ -1456,6 +1788,12 @@ function makeProjectRail() {
                 : makeProjectRow(state.vault.projects[next++]));
         }
     }
+    // The "Stopped" fold below every row and line. A rebuild discards any open
+    // inline confirm with the old DOM, and records the fold list it drew.
+    railConfirmOpen = null;
+    railBuiltStopped = (state.stoppedProjects || []).slice();
+    const stoppedFold = makeStoppedFold();
+    if (stoppedFold) rail.appendChild(stoppedFold);
     // (Import-an-existing-project moved into the New Project page as a box —
     // openAddProjectModal is reached from there now, not a rail button.)
     rail.appendChild(el("div", { class: "rail-spacer" }));
@@ -3130,6 +3468,8 @@ function closeManagement() {
 async function renderManagementInto(view) {
     view.innerHTML = "";
     view.appendChild(el("div", { class: "mgmt-loading" }, ["Loading…"]));
+    // Numbered before the fetch, so a sidebar sync started later wins.
+    const syncSeq = nextSidebarSyncSeq();
     let res;
     try {
         res = await fetch("/broker/projects");
@@ -3147,7 +3487,7 @@ async function renderManagementInto(view) {
     renderMgmtTable(view, body.result || []);
     // Reuse the authoritative list to repopulate the sidebar's running set
     // (so opening / logging into Management surfaces running projects there too).
-    syncSidebarFromBroker(body.result || []);
+    syncSidebarFromBroker(body.result || [], syncSeq);
     // Pick up actions started elsewhere (another tab, before a reload) and
     // restart any watcher a session expiry stalled — a 401 lands here after
     // the login card, so software builds' watchers restart here too.
@@ -3162,6 +3502,8 @@ async function renderManagementInto(view) {
 async function renderInfraInto(view) {
     view.innerHTML = "";
     view.appendChild(el("div", { class: "mgmt-loading" }, ["Loading…"]));
+    // Numbered before the fetch, so a sidebar sync started later wins.
+    const syncSeq = nextSidebarSyncSeq();
     let res;
     try {
         res = await fetch("/broker/projects");
@@ -3188,7 +3530,7 @@ async function renderInfraInto(view) {
     appendPassthroughSection(view, body.result || []);
     appendInfraSection(view);
     appendSettingsSection(view);
-    syncSidebarFromBroker(body.result || []);
+    syncSidebarFromBroker(body.result || [], syncSeq);
 }
 
 function mgmtCard(view, children) {
@@ -7576,6 +7918,10 @@ const LIFECYCLE_TITLES = { start: "Starting", stop: "Stopping", update: "Updatin
 // box is tailing it; `watching` = a background watcher is. A 401/403 stalls the
 // watcher (entry kept, `stalled`), and the next seed restarts it.
 const lifecycleInFlight = new Map();
+// Op ids this page saw finish (the softwareFinished twin): the lane lists an
+// op until its child exits, so a seed racing a finishing child must not revive
+// it and post a second notice.
+const lifecycleFinished = new Set();
 
 function lifecycleLabel(entry) {
     return entry.queued ? "queued…" : (LIFECYCLE_LABELS[entry.verb] || "working…");
@@ -7603,18 +7949,29 @@ function lifecycleSetQueued(project, opId, queued) {
 // buttons off: its render-time buttons describe the project BEFORE the action.
 function paintLifecycleLabels() {
     for (const row of document.querySelectorAll(".project-rail .project[data-name]")) {
+        const name = row.getAttribute("data-name");
+        const power = row.querySelector(".project-power-btn");
+        if (power) paintRailPower(power, name, "stop");
         const line = row.querySelector(".project-status-line");
         if (!line) continue;
-        const entry = lifecycleInFlight.get(row.getAttribute("data-name"));
+        const label = railBusyLabel(name);
         let tag = line.querySelector(".project-inflight");
-        if (!entry) { if (tag) tag.remove(); continue; }
+        if (!label) { if (tag) tag.remove(); continue; }
         if (!tag) {
             tag = el("span", { class: "project-inflight" });
             // after the activity boxes (#560), as makeProjectRow places it
             const badge = line.querySelector(".activity-boxes") || line.querySelector(".type-badge");
             if (badge) badge.after(tag); else line.prepend(tag);
         }
-        tag.textContent = lifecycleLabel(entry);
+        tag.textContent = label;
+    }
+    // The rail's "Stopped" fold rows: the same state, on their own elements.
+    for (const row of document.querySelectorAll(".project-rail .stopped-project[data-stopped]")) {
+        const name = row.getAttribute("data-stopped");
+        const power = row.querySelector(".project-power-btn");
+        if (power) paintRailPower(power, name, "start");
+        const tag = row.querySelector(".stopped-inflight");
+        if (tag) tag.textContent = railBusyLabel(name) || "";
     }
     for (const row of document.querySelectorAll(".mgmt-prow[data-project]")) {
         const stateEl = row.querySelector(".mgmt-state");
@@ -7707,14 +8064,32 @@ function lifecycleFailText(outcome) {
 function lifecycleFinish(project, opId, outcome, background) {
     const entry = lifecycleInFlight.get(project);
     if (!entry || entry.opId !== opId) return;
+    lifecycleFinished.add(opId);
     lifecycleInFlight.delete(project);
     paintLifecycleLabels();
-    if (background) showLifecycleNotice(project, entry.verb, opId, outcome);
+    // A sidebar action that succeeded is told by its row moving; every other
+    // background outcome keeps its notice.
+    if (background && !(entry.fromRail && outcome.ok)) {
+        showLifecycleNotice(project, entry.verb, opId, outcome);
+    }
+    // The rail follows the outcome: a seen stop moves the project to the fold;
+    // a seen start takes it off (the sync below brings its row back). A failed
+    // action needs nothing more: the repaint above already put its button back
+    // (paintLifecycleLabels walks the fold rows too).
+    if (outcome.ok && entry.verb === "stop") {
+        railMoveToFold(project);
+    } else if (outcome.ok && entry.verb === "start") {
+        state.stoppedProjects = (state.stoppedProjects || []).filter((n) => n !== project);
+    }
     if (entry.onDone) {
         try { Promise.resolve(entry.onDone(outcome.ok)).catch(() => {}); }
         catch (e) { /* the caller's hook is best-effort */ }
     }
-    syncSidebarFromBroker();
+    // A failed sync (no session, broker away) never rebuilds: a start seen
+    // above must still leave the fold, so rebuild when the drawn fold is stale.
+    syncSidebarFromBroker().then(() => {
+        if (state.vault && stoppedFoldChanged()) refreshProjectRail();
+    });
     if (background && state.hostPage === "sandboxes" && sandboxesActiveTab === "management"
             && !document.querySelector(".modal-backdrop")) {
         const view = hostBody();
@@ -7748,7 +8123,20 @@ async function lifecycleWatch(project) {
         (rec) => lifecycleSetQueued(project, opId, rec.step === "queue"),
         () => lifecycleInFlight.get(project) !== entry);
     if (res === null) return;                   // superseded
-    if (res.auth) { entry.watching = false; entry.stalled = true; return; }
+    if (res.auth) {
+        entry.watching = false;
+        entry.stalled = true;
+        // A sidebar action has no op box to show the expiry: say it once.
+        if (entry.fromRail && !entry.stallNoticed) {
+            entry.stallNoticed = true;
+            const verb = entry.verb;
+            showOpNotice(res.auth === 401
+                ? `${project}: sign in again under Sandboxes to see how the ${verb} ends`
+                : `${project}: Sandboxes refused this page, so the ${verb} can't be followed here`,
+                false, () => {});
+        }
+        return;
+    }
     lifecycleFinish(project, opId, res, true);
 }
 
@@ -7764,7 +8152,7 @@ async function seedLifecycleFromBroker() {
         ? body.result.ops : [];
     for (const op of ops) {
         if (!op || typeof op.project !== "string" || typeof op.op_id !== "string"
-                || !LIFECYCLE_LANE_VERBS.has(op.verb)) continue;
+                || !LIFECYCLE_LANE_VERBS.has(op.verb) || lifecycleFinished.has(op.op_id)) continue;
         const cur = lifecycleInFlight.get(op.project);
         if (cur) continue;               // tracked already (or another op of ours)
         const entry = lifecycleRegister(op.project, op.op_id, op.verb, null);
@@ -10287,6 +10675,8 @@ function mgmtDestroyDialog(view, name) {
             delete projectUiMap()[name];
             pruneProjectOrder(name);
             pruneArmedProject(name);
+            // A destroyed stopped project leaves the rail's fold at once.
+            state.stoppedProjects = (state.stoppedProjects || []).filter((n) => n !== name);
             try { await persistVault(); } catch (e) { /* best-effort */ }
             refreshProjectRail();
         },
@@ -11140,9 +11530,10 @@ function armProjectDrag(row, project) {
         projectDragClickPending = false;
         if (mobileModeActive()) return;         // desktop-only affordance
         if (ev.button !== 0) return;
-        // The per-row gear is a <span>, not a <button>: closest("button")
-        // alone would capture its pointer, swallow its own click and switch
-        // project instead of opening the per-project config box.
+        // A press on any of the row's buttons (Stop, the ⚙, the inline
+        // confirm's two) is that button's, never a drag. The ⚙ was a <span>
+        // once, and is still matched by its class, which outlives any element
+        // change.
         if (ev.target.closest("button, .project-config-btn")) return;
         const rail = row.closest(".project-rail");
         if (!rail) return;
@@ -11296,26 +11687,22 @@ function makeProjectRow(project) {
     // activity sub-line here: filling one meant walking every project tree on
     // a timer. Disk size lives in the Management table, behind its button.
     const typeBadge = el("span", { class: "type-badge" });
-    const configBtn = el("span", {
-        class: "project-config-btn",
-        title: "Project settings",
-    }, ["⚙"]);
-    configBtn.onclick = (ev) => {
-        ev.stopPropagation();
-        openProjectConfigBox(project);
-    };
+    const configBtn = makeRailGearButton(() => { openProjectConfigBox(project); });
     // "starting…" / "stopping…" / "updating…" / "queued…" while a lifecycle-lane
     // op is in flight for this project (paintLifecycleLabels keeps it current).
-    const flight = lifecycleInFlight.get(project.name);
+    const flight = railBusyLabel(project.name);
     // The activity boxes (#560): sessions working / waiting, subagents running,
     // painted from the last /broker/activity answer (paintActivityBoxes).
     const activity = el("span", { class: "activity-boxes" });
     // The bell (#560): shown while the project is armed (paintActivityBoxes).
     const bell = el("span", { class: "activity-bell" });
-    const statusLine = el("div", { class: "project-status-line" },
-        flight ? [typeBadge, bell, activity, el("span", { class: "project-inflight" },
-                                [lifecycleLabel(flight)]), configBtn]
-               : [typeBadge, bell, activity, configBtn]);
+    const line = [typeBadge, bell, activity];
+    if (flight) line.push(el("span", { class: "project-inflight" }, [flight]));
+    // Stop, before the ⚙ — only on rows Sandboxes runs (_jit). A bookmark (a
+    // box entered by hand) has no lifecycle here, so it keeps the lone ⚙.
+    if (project._jit) line.push(makeRailPowerButton(project.name));
+    line.push(configBtn);
+    const statusLine = el("div", { class: "project-status-line" }, line);
     // .active is stamped here so a rail rebuild (a drop, a create, a destroy)
     // keeps the "you are here" highlight — refreshProjectRail replaces the
     // whole <aside> and never re-activates. Gated on no host page being open:
@@ -11989,6 +12376,9 @@ function lockVault() {
     state.activity = null;
     state.activitySeen = null;
     state.activityApplied = state.activityGen = (state.activityGen || 0) + 1;
+    // The fold empties, and a sidebar sync still in flight can't refill it.
+    state.stoppedProjects = [];
+    sidebarSyncApplied = sidebarSyncSeq = sidebarSyncSeq + 1;
     // a locked vault shows no project: close the browser notifications that name one
     if (state.pingNotes) {
         for (const note of state.pingNotes.values()) {
@@ -12940,8 +13330,13 @@ function makeProjectConfigBox(project) {
 
     const enabled = state.projectServices[project.name];
     if (!enabled || Object.keys(enabled).length === 0) {
+        // A project in the rail's "Stopped" fold cannot be opened, so its
+        // window says why it has no tabs. (A tolerant read: some callers build
+        // this window with no fold list at all.)
+        const stopped = (state.stoppedProjects || []).includes(project.name);
         section.appendChild(el("div", { class: "config-empty" }, [
-            "No tabs yet — open this project once to load its services.",
+            stopped ? "This project is stopped. Its tabs can be set once it runs."
+                    : "No tabs yet — open this project once to load its services.",
         ]));
         tabsBox.appendChild(section);
         appendSharingSection(pane("Sharing", "sharing"), project, null);
@@ -12950,7 +13345,10 @@ function makeProjectConfigBox(project) {
         appendExportedPortsSection(portsBox, project);
         appendDetectedAppsSection(portsBox, project);
         if (!activitySkipped(project.name)) appendAlertsSection(pane("Alerts", "alerts"), project);
-        appendSidebarSection(pane("Sidebar", "sidebar"), project);
+        // Removing a stopped project is not offered until a removal is
+        // remembered: today it would only wipe its saved layout and leave its
+        // fold row in place.
+        if (!stopped) appendSidebarSection(pane("Sidebar", "sidebar"), project);
         select("tabs");
         return layout;
     }

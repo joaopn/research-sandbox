@@ -291,6 +291,129 @@ body {
     padding: 0 2px;
 }
 .project-rail .project .project-config-btn:hover { color: var(--fg-accent); }
+/* The row's 22 px buttons — Stop/Start and the ⚙ (app.js makeRailPowerButton,
+   makeRailGearButton) — on list rows and on the "Stopped" fold's rows. Same
+   scope as the rule above, placed after it, so the size and border win; that
+   rule keeps the ⚙'s margin-left: auto, so a bookmark row's lone ⚙ still sits
+   at the right. With Stop present, Stop takes the auto margin and the ⚙
+   follows it: the pair sits at the right together. */
+.project-rail .project .project-config-btn,
+.project-rail .project .project-power-btn,
+.project-rail .stopped-project .project-config-btn,
+.project-rail .stopped-project .project-power-btn {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: 1px solid var(--border-strong);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--fg-muted);
+    cursor: pointer;
+    font-size: 0;
+    line-height: 0;
+}
+.project-rail .project .project-config-btn svg,
+.project-rail .project .project-power-btn svg,
+.project-rail .stopped-project .project-config-btn svg,
+.project-rail .stopped-project .project-power-btn svg {
+    width: 14px;
+    height: 14px;
+    display: block;
+}
+.project-rail .project .project-power-btn { margin-left: auto; }
+.project-rail .project .project-power-btn + .project-config-btn { margin-left: 0; }
+.project-rail .project .project-config-btn:hover,
+.project-rail .stopped-project .project-config-btn:hover {
+    color: var(--fg-base);
+    background: var(--btn-secondary-bg);
+}
+.project-rail .project .project-power-btn:hover:not(:disabled) {
+    color: #fff;
+    background: var(--btn-danger-bg);
+    border-color: var(--btn-danger-bg);
+}
+.project-rail .stopped-project .project-power-btn.go {
+    color: var(--fg-accent);
+    border-color: var(--fg-accent);
+}
+.project-rail .stopped-project .project-power-btn.go:hover:not(:disabled) {
+    color: #fff;
+    background: var(--btn-bg);
+    border-color: var(--btn-bg);
+}
+.project-rail .project .project-power-btn:disabled,
+.project-rail .stopped-project .project-power-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
+}
+.project-rail .project-power-btn.busy svg { animation: rail-spin 1s linear infinite; }
+@keyframes rail-spin { to { transform: rotate(360deg); } }
+/* The inline confirm that replaces a row's content (app.js openRailConfirm). */
+.project-rail .rail-confirming { cursor: default; background: var(--bg-active); }
+.project-rail .rail-confirm {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 100%;
+    min-width: 0;
+    font-size: 12px;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    color: var(--fg-base);
+}
+.project-rail .rail-confirm-btns { display: flex; gap: 6px; }
+.project-rail .rail-confirm-btns .btn-small { flex: 1; padding: 4px 6px; }
+/* The "Stopped (n)" fold below the list (app.js makeStoppedFold). Its rows are
+   deliberately NOT .project: the drag, the probe and the badge/activity paints
+   all key on .project and must never see them. */
+.project-rail .stopped-fold-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    margin: 0;
+    padding: 7px 14px;
+    background: transparent;
+    border: none;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--fg-muted);
+    border-bottom: 1px solid var(--border);
+}
+.project-rail .stopped-fold-head:hover { background: var(--border); color: var(--fg-base); }
+.project-rail .stopped-fold-chev { display: inline-block; transition: transform 120ms ease; }
+.project-rail .stopped-fold-head.open .stopped-fold-chev { transform: rotate(90deg); }
+.project-rail .stopped-project {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 14px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--fg-faint);
+}
+.project-rail .stopped-project .name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.project-rail .stopped-project .stopped-inflight {
+    color: var(--fg-accent);
+    font-size: 11px;
+    font-style: italic;
+    white-space: nowrap;
+}
+.project-rail .stopped-project .stopped-inflight:empty { display: none; }
 /* "starting…" / "stopping…" / "updating…" / "queued…" while a start/stop/update
    for this project runs in the background. */
 .project-rail .project .project-inflight {
