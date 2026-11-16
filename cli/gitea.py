@@ -402,6 +402,44 @@ def _gitea_admin(argv: list[str]) -> subprocess.CompletedProcess:
     return _docker_exec(["gitea", "admin", *argv])
 
 
+# Where the Gitea image keeps bare repositories by default. Owner and repo
+# folders are lower-case. An install that moved them fails closed: the
+# question below cannot be asked and the build is refused.
+REPO_ROOT_IN_CONTAINER = "/data/git/repositories"
+
+
+def source_refs(repo: str, timeout: int = MIGRATE_TIMEOUT_S) -> dict[str, str]:
+    """What GitHub has NOW for a mirror: {ref name: commit or tag-object id}
+    for every branch and tag, with a peeled `<tag>^{}` entry beside each
+    annotated tag. Asked by the mirror's own repository (which holds the
+    address and, for a private repo, its access token) with `git ls-remote`,
+    so nothing is fetched or changed. A mirror's last-sync time cannot answer
+    this: it advances when a sync FAILS too (measured on Gitea 28.2.0).
+    Raises GiteaError on any failure, never quoting git's output: the remote
+    address in it can carry the access token."""
+    path = f"{REPO_ROOT_IN_CONTAINER}/{ADMIN_USER.lower()}/{repo.lower()}.git"
+    try:
+        r = subprocess.run(
+            ["docker", "exec", "-u", "git", "-e", "GIT_TERMINAL_PROMPT=0",
+             GITEA_CONTAINER, "git", "-C", path, "ls-remote", "--heads",
+             "--tags", "origin"],
+            capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise GiteaError(f"GitHub did not answer within {timeout} seconds") from None
+    except OSError as e:
+        raise GiteaError(f"could not ask GitHub ({type(e).__name__})") from None
+    if r.returncode != 0:
+        raise GiteaError("GitHub could not be asked for the repository's "
+                         "branches and tags")
+    refs: dict[str, str] = {}
+    for line in r.stdout.splitlines():
+        sha, _, name = line.partition("\t")
+        if not (valid_sha(sha) and name.startswith("refs/")):
+            raise GiteaError("GitHub's list of branches and tags was not readable")
+        refs[name] = sha
+    return refs
+
+
 # --- the issue-reading token (rs-sync) --------------------------------------
 #
 # A second token of the read-only operator account, with issue read added: the
@@ -1473,6 +1511,90 @@ class GiteaClient:
     def trigger_sync(self, repo: str) -> None:
         self._api("POST", f"/repos/{ADMIN_USER}/{repo}/mirror-sync")
 
+    # -- reads the image build needs ----------------------------------------
+
+    def server_version(self) -> str:
+        """Gitea's own release string, or "" when it cannot be read."""
+        data = self._api("GET", "/version")
+        v = data.get("version") if isinstance(data, dict) else None
+        return v if isinstance(v, str) else ""
+
+    def mirror_info(self, repo: str) -> dict:
+        """The mirror's {sync, default_branch, empty, source} in one GET. `sync`
+        is Gitea's own time of the last mirror sync, and "" when Gitea reports
+        none — never another field standing in for it: the build compares two
+        reads of it to know that a refresh happened."""
+        data = self._api("GET", f"/repos/{ADMIN_USER}/{repo}")
+        if not isinstance(data, dict):
+            raise GiteaError(f"gitea GET repo {ADMIN_USER}/{repo} -> no data")
+        sync = data.get("mirror_updated")
+        return {"sync": sync if isinstance(sync, str) else "",
+                "default_branch": data.get("default_branch") or "",
+                "empty": bool(data.get("empty")),
+                "mirror": bool(data.get("mirror")),
+                "source": repo_source(data.get("original_url"))}
+
+    def ref_commit(self, repo: str, ref: str) -> "tuple[str, str] | None":
+        """(commit id, subject) of the mirror's branch or tag `ref` — a branch
+        wins when both exist, as in git — or None when the mirror has neither.
+        Anything but a definitive miss raises."""
+        quoted = urllib.parse.quote(ref, safe="/")
+        sha = ""
+        for kind in ("branches", "tags"):
+            try:
+                data = self._api("GET", f"/repos/{ADMIN_USER}/{repo}/{kind}/{quoted}")
+            except GiteaError as e:
+                if e.status == 404:
+                    continue
+                raise
+            commit = data.get("commit") if isinstance(data, dict) else None
+            cand = (commit.get("id") or commit.get("sha")) if isinstance(commit, dict) else None
+            if isinstance(cand, str) and valid_sha(cand):
+                sha = cand
+                break
+        if not sha:
+            return None
+        data = self._api("GET", f"/repos/{ADMIN_USER}/{repo}/git/commits/{sha}")
+        inner = data.get("commit") if isinstance(data, dict) else None
+        msg = inner.get("message") if isinstance(inner, dict) else None
+        subject = msg.strip().splitlines()[0] if isinstance(msg, str) and msg.strip() else ""
+        # Repository-controlled text that goes to a terminal and a log.
+        subject = "".join(ch for ch in subject if ch.isprintable())
+        return sha, subject
+
+    def tags_at(self, repo: str, sha: str) -> list[str]:
+        """The names of every tag on the mirror that points at commit `sha`.
+        Every page, each raising on failure: a partial list would silently
+        drop a version name."""
+        pager = _ListPager(self, f"/repos/{ADMIN_USER}/{repo}/tags", "name")
+        pager.all()
+        out = []
+        for row in pager.rows:
+            commit = row.get("commit")
+            name = row.get("name")
+            if isinstance(commit, dict) and commit.get("sha") == sha \
+                    and isinstance(name, str):
+                out.append(name)
+        return sorted(out)
+
+    def open_archive(self, repo: str, sha: str):
+        """An open response streaming the mirror's tree at `sha` as a gzipped
+        tar. The caller reads and closes it. No bound on the body: its length
+        is the repository's. The migrate bound, not the quick-call one: Gitea
+        packs the archive before the first byte, which for a large repository
+        takes as long as cloning it."""
+        path = f"/repos/{ADMIN_USER}/{repo}/archive/{sha}.tar.gz"
+        req = urllib.request.Request(
+            self._base + path, headers={"Authorization": f"token {self._token}"})
+        try:
+            return urllib.request.urlopen(req, timeout=MIGRATE_TIMEOUT_S)
+        except urllib.error.HTTPError as e:
+            raise GiteaError(f"gitea GET {path} -> HTTP {e.code}",
+                             status=e.code) from None
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+            raise GiteaError(
+                f"gitea GET {path} failed: {type(e).__name__}") from None
+
     def create_user(self, username: str, password: str, admin: bool = False) -> None:
         """Idempotent create via the admin API."""
         if self.user_exists(username):
@@ -2261,6 +2383,8 @@ def remove_repo(host_port: str, repo: str) -> list[str]:
     if repo in prefs:
         del prefs[repo]
         save_fetch_prefs(prefs)
+    # The remembered Dockerfile path goes with the repo for the same reason.
+    set_image_dockerfile(repo, None)
     return purged
 
 
@@ -3018,6 +3142,62 @@ def _images_org_collision() -> str:
     return (f"the name {IMAGES_ORG!r} is already taken on Gitea by an account "
             f"or organisation research-sandbox did not create; rename or delete "
             f"it under Site Administration in the Gitea tab, then try again")
+
+
+def image_build_lock_path(repo: str) -> Path:
+    """The lock one build of `repo` holds for its whole life. Beside the
+    mirror locks, derived the same way and lower-cased for the same reason
+    (mirror_lock_path); never inside MIRRORS_DIR, whose every file reads as a
+    mirrored repo."""
+    return MIRRORS_DIR.parent / "image-build-locks" / f"{repo.lower()}.lock"
+
+
+def _image_dockerfiles_path() -> Path:
+    # Derived at CALL time: archived pins redirect DEV_DIR.
+    return DEV_DIR / "image-dockerfiles.json"
+
+
+def _load_image_dockerfiles() -> dict:
+    """The {repo: Dockerfile path} map. Tolerant like the other preference
+    files: absent, unreadable or malformed reads as nothing remembered, whose
+    worst case is the default path."""
+    try:
+        data = json.loads(_image_dockerfiles_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def image_dockerfile(repo: str) -> str:
+    """The Dockerfile path remembered for `repo`, or "" when none is."""
+    v = _load_image_dockerfiles().get(repo)
+    return v if isinstance(v, str) else ""
+
+
+def set_image_dockerfile(repo: str, path: "str | None") -> None:
+    """Remember `path` for `repo`; None forgets it. Writes nothing when that
+    changes nothing (removing a repo that never had one touches no file).
+    The read-change-write runs under its own lock file: builds of different
+    repos run at the same time, and a lost entry would silently build the
+    default Dockerfile."""
+    def unchanged(entries: dict) -> bool:
+        return repo not in entries if path is None else entries.get(repo) == path
+    if unchanged(_load_image_dockerfiles()):
+        return
+    DEV_DIR.mkdir(parents=True, exist_ok=True)
+    target = _image_dockerfiles_path()
+    with open(target.with_suffix(".lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        entries = _load_image_dockerfiles()
+        if unchanged(entries):
+            return
+        if path is None:
+            del entries[repo]
+        else:
+            entries[repo] = path
+        tmp = target.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(entries, indent=2, sort_keys=True))
+        tmp.replace(target)
 
 
 def registry_base(host_port: str) -> str:

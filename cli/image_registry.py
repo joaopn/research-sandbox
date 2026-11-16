@@ -115,7 +115,7 @@ class _Hashing:
         self.count = 0
 
     def read(self, n: int = -1) -> bytes:
-        if self._left <= 0:
+        if self._left <= 0 or n == 0:
             return b""
         want = self._left if n is None or n < 0 else min(n, self._left)
         # The caller (http.client) asks for a block at a time, so memory per
@@ -221,7 +221,9 @@ class RegistryClient:
     def _read(resp, limit: int, label: str) -> bytes:
         """Up to `limit` bytes of a response body; a connection that fails
         part way is a RegistryError like any other failed call."""
-        declared = resp.headers.get("Content-Length") or ""
+        # The length http.client parsed from the reply: None for a chunked
+        # reply or a length it could not parse.
+        declared = resp.length
         try:
             with resp:
                 body = resp.read(limit)
@@ -230,8 +232,7 @@ class RegistryClient:
                 f"registry read of {label} failed: {type(e).__name__}") from None
         # A bounded read returns what arrived, without complaint, when the
         # connection ends early: compare with the length the reply announced.
-        if declared.isascii() and declared.isdigit() \
-                and len(body) < min(int(declared), limit):
+        if isinstance(declared, int) and len(body) < min(declared, limit):
             raise RegistryError(f"registry read of {label} was cut off")
         return body
 
@@ -401,6 +402,48 @@ def push_image(client: RegistryClient, name: str, source: LayoutSource,
 
     manifest(top_digest, top_size, tag)
     return top_digest, closure
+
+
+def _image_labels(doc: dict, read) -> dict:
+    """The labels of the image whose manifest (or index) is `doc`; `read`
+    returns a blob's bytes by digest. An index is followed to its first real
+    platform (build attestations are listed with the platform "unknown")."""
+    children = doc.get("manifests")
+    if isinstance(children, list):
+        pick = None
+        for child in children:
+            plat = child.get("platform") if isinstance(child, dict) else None
+            if isinstance(plat, dict) and plat.get("os") not in (None, "unknown"):
+                pick = child
+                break
+        if pick is None:
+            raise RegistryError("the image's index lists no platform image")
+        doc = _json(read(_descriptor(pick, "the image's platform entry")[0]),
+                    "the image's platform manifest")
+    cfg_digest = _descriptor(_parts(doc, "the image's manifest")[0],
+                             "the image's config")[0]
+    cfg = _json(read(cfg_digest), "the image's config")
+    inner = cfg.get("config")
+    labels = inner.get("Labels") if isinstance(inner, dict) else None
+    return labels if isinstance(labels, dict) else {}
+
+
+def layout_labels(source: LayoutSource) -> dict:
+    """The labels of the single image in `source`, read before anything is
+    pushed, so a caller can check the image is the one it asked for."""
+    index = _json(source.read_small("index.json", JSON_MAX_BYTES),
+                  "the image's index")
+    entries = index.get("manifests")
+    if not isinstance(entries, list) or len(entries) != 1:
+        raise RegistryError("the image archive must hold exactly one image")
+
+    def read(digest: str) -> bytes:
+        body = source.read_small(_blob_path(digest), JSON_MAX_BYTES)
+        if _sha256(body) != digest:
+            raise RegistryError(f"{digest} does not match its checksum")
+        return body
+    top = _descriptor(entries[0], "the image's index entry")[0]
+    return _image_labels(_json(read(top), "the image's manifest"), read)
 
 
 def image_info(client: RegistryClient, name: str,

@@ -2422,6 +2422,15 @@ def cmd_dev_image_show(args: argparse.Namespace) -> None:
     print(f"  size:     {res.size} bytes")
 
 
+def cmd_dev_image_build(args: argparse.Namespace) -> None:
+    res = _call(rscore.dev_image_build, _build(
+        rscore.DevImageBuildRequest, repo=args.repo, ref=args.ref,
+        dockerfile=args.dockerfile))
+    print(f"{args.repo}: built {res.ref} at commit {res.commit}")
+    print(f"  git tags: {', '.join(res.git_tags) or '(none)'}")
+    print(f"  image:    {res.digest}")
+
+
 def cmd_dev_image_discard(args: argparse.Namespace) -> None:
     res = _call(rscore.dev_image_discard,
                 _build(rscore.DevImageRequest, repo=args.repo))
@@ -3459,6 +3468,21 @@ def build_parser() -> argparse.ArgumentParser:
     dvis = dvi_sub.add_parser("show", help="show the repo's built image")
     dvis.add_argument("repo")
     dvis.set_defaults(func=cmd_dev_image_show)
+    dvib = dvi_sub.add_parser(
+        "build", help="build the repo's image from what GitHub has now; it "
+                      "replaces the repo's previous built image",
+        description="Build the repo's image from what GitHub has now; it "
+                    "replaces the repo's previous built image. The build sees "
+                    "the commit's files as an archive of the repository: "
+                    "submodule contents, Git LFS objects and paths marked "
+                    "export-ignore are not in it.")
+    dvib.add_argument("repo")
+    dvib.add_argument("--ref", default="",
+                      help="branch or tag to build (default: the default branch)")
+    dvib.add_argument("--dockerfile", default="",
+                      help="the Dockerfile's path in the repository (default: "
+                           "the path used last time, else Dockerfile)")
+    dvib.set_defaults(func=cmd_dev_image_build)
     dvid = dvi_sub.add_parser("discard", help="remove the repo's built image")
     dvid.add_argument("repo")
     dvid.set_defaults(func=cmd_dev_image_discard)
