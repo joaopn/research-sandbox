@@ -1301,6 +1301,15 @@ def _image_build_in_flight(repo: str) -> bool:
     return rscore.image_build_running(repo)
 
 
+def _verb_dev_image_active(_args: dict, _progress=None) -> dict:
+    """The image builds running right now: [{op_id, repo}]. What the Images
+    tab needs after a reload to show a repo as building and to offer its log
+    and Cancel again. A read of the lane's own job records; no Gitea call."""
+    return {"builds": [{"op_id": op["op_id"], "repo": op.get("target", "")}
+                       for op in _live_dev_lane_ops()
+                       if op["verb"] == "dev_image_build"]}
+
+
 def _verb_dev_image_show(args: dict, _progress=None) -> dict:
     # A read: never starts Gitea, a few bounded loopback calls.
     safe = {k: v for k, v in args.items() if k in DEV_TARGET_WEBUI_FIELDS}
@@ -1559,6 +1568,7 @@ VERBS = {
     "dev_repo_remove": _verb_dev_repo_remove,
     "dev_repo_list": _verb_dev_repo_list,
     "dev_image_show": _verb_dev_image_show,
+    "dev_image_active": _verb_dev_image_active,
     "dev_image_discard": _verb_dev_image_discard,
     "dev_image_cancel": _verb_dev_image_cancel,
     "dev_attach": _verb_dev_attach,

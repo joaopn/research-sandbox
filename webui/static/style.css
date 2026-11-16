@@ -2180,6 +2180,12 @@ html.mobile .project-config-box .config-folders-input { font-size: 16px; }
    screen explaining it) while pinning it to Mobile on a wide one would keep
    them, which is exactly the case this rule exists for. */
 html.mobile .dev-repos-table .dev-repos-opt { display: none; }
+
+/* The Images tab: the image cell's second line, and the action buttons kept
+   together on the right. */
+.dev-images-table .dev-image-sub { color: var(--fg-faint); font-size: 12px; margin-top: 2px; }
+.dev-images-table .dev-image-actions { text-align: right; white-space: nowrap; }
+.dev-images-table .dev-image-actions .btn-small + .btn-small { margin-left: 6px; }
 /* A row whose status could not be read: dimmed like the retired-fork rows, so
    it reads as "nothing to report here" rather than as data. Its toggle stays at
    full strength — that control still works and is the reason the row renders. */

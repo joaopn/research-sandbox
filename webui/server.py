@@ -1919,6 +1919,69 @@ async def broker_dev_review_handler(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "op_id": op_id})
 
 
+async def broker_dev_image_handler(request: web.Request) -> web.Response:
+    """GET /broker/dev/image?repo=<name> — one repo's built image (commit, git
+    tags, size), relayed to the token-gated dev_image_show verb. A READ (no
+    origin check; the session gate is _relay's). The single `repo` key is the
+    hand-picked link of the field lockstep (DEV_TARGET_WEBUI_FIELDS)."""
+    status, reply = await _relay(request, "dev_image_show",
+                                 {"repo": request.query.get("repo")})
+    return web.json_response(reply, status=status)
+
+
+async def broker_dev_image_active_handler(request: web.Request) -> web.Response:
+    """GET /broker/dev/image-active — the image builds running right now
+    ([{op_id, repo}]), relayed to the token-gated dev_image_active verb. A
+    field-less READ: the Images tab re-learns running builds after a reload."""
+    status, reply = await _relay(request, "dev_image_active", {})
+    return web.json_response(reply, status=status)
+
+
+async def broker_dev_image_build_handler(request: web.Request) -> web.Response:
+    """POST /broker/dev/image-build {repo, ref?, dockerfile?} — build a repo's
+    image (gated, origin-checked). Minutes of work, so it runs on the broker's
+    detached dev lane: an op_id minted here, a synchronous relay (the broker
+    spawns and answers at once), {op_id} back for the log tail. An absent or
+    empty `ref` / `dockerfile` means the default branch and the remembered
+    path (the verb's request reads both the same way)."""
+    return await _relay_dev_gitea_lane(request, "dev_image_build", "image",
+                                       ("repo", "ref", "dockerfile"))
+
+
+async def broker_dev_image_cancel_handler(request: web.Request) -> web.Response:
+    """POST /broker/dev/image-cancel {op_id} — stop a running image build
+    (gated, origin-checked). Synchronous relay: the verb records the cancel
+    and signals the job; it destroys nothing itself."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    status, reply = await _relay(request, "dev_image_cancel",
+                                 {"op_id": body.get("op_id")})
+    return web.json_response(reply, status=status)
+
+
+async def broker_dev_image_discard_handler(request: web.Request) -> web.Response:
+    """POST /broker/dev/image-discard {repo} — remove a repo's built image
+    (gated, origin-checked; no step-up: the image is rebuilt from its commit).
+    Synchronous relay — a few bounded Gitea calls."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    status, reply = await _relay(request, "dev_image_discard",
+                                 {"repo": body.get("repo")})
+    return web.json_response(reply, status=status)
+
+
 async def broker_dev_gitea_upgrade_handler(request: web.Request) -> web.Response:
     """POST /broker/dev/gitea-upgrade {passphrase, proof} — upgrade the shared
     Gitea to the shipped release (gated, origin-checked, STEP-UP). Minutes of
@@ -4308,6 +4371,15 @@ def main() -> None:
     app.router.add_post("/broker/dev/fetch-enabled",
                         broker_dev_fetch_enabled_handler)
     app.router.add_post("/broker/dev/gitea-start", broker_dev_gitea_start_handler)
+    app.router.add_get("/broker/dev/image", broker_dev_image_handler)
+    app.router.add_get("/broker/dev/image-active",
+                       broker_dev_image_active_handler)
+    app.router.add_post("/broker/dev/image-build",
+                        broker_dev_image_build_handler)
+    app.router.add_post("/broker/dev/image-cancel",
+                        broker_dev_image_cancel_handler)
+    app.router.add_post("/broker/dev/image-discard",
+                        broker_dev_image_discard_handler)
     app.router.add_post("/broker/dev/gitea-upgrade",
                         broker_dev_gitea_upgrade_handler)
     app.router.add_post("/broker/dev/gitea-rollback",

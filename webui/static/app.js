@@ -1820,7 +1820,8 @@ const HOST_PAGES = {
     development: {
         title: "Development",
         tabs: [["gitea", "Gitea"], ["fetch", "Fetch"], ["repos", "Repos"],
-               ["reviews", "Reviews"], ["backup", "Backup"]],
+               ["images", "Images"], ["reviews", "Reviews"],
+               ["backup", "Backup"]],
         get: () => devActiveTab,
         set: (k) => { devActiveTab = k; },
     },
@@ -3534,6 +3535,7 @@ const DEV_TAB_RENDER = {
     gitea: renderDevGiteaTab,
     fetch: renderDevFetchTab,
     repos: renderDevReposTab,
+    images: renderDevImagesTab,
     reviews: renderDevReviewsTab,
     backup: renderDevBackupTab,
 };
@@ -5217,6 +5219,452 @@ function devHiddenLine(count, label, onOpen) {
 // or an unparseable body mean the broker is unreachable; a 200 carrying
 // {ok:false} means the broker ANSWERED and the verb refused, which is a
 // different thing and must not be reported as an outage.
+// ---- the Images tab ---------------------------------------------------------
+// One row per mirrored repo: its built image (at most one — a build replaces
+// it), and the actions Build, Cancel, Discard. A build runs as a broker job;
+// this page starts it, shows its log and can stop it. Publishing the image is
+// not done here: that is `rs-publish`, run where the registry token lives.
+//
+// Running builds are re-learned from the broker on every render (a reload
+// forgets this page's memory), keyed by the repo's name in lower case: the
+// broker runs one build per repo and compares names that way.
+//
+// Each render makes NEW entry objects. A background watcher belongs to the
+// entry it started on (and to that render's body), so the old render's
+// watchers end at their next tick and the new render starts its own. The one
+// thing carried across is `modal`: a log box is open on that build and is its
+// watcher, so no background one is started beside it.
+const devImageBuilds = new Map();     // repo (lower case) -> { opId, modal, watching }
+
+function devImageBuild(repo) { return devImageBuilds.get(String(repo).toLowerCase()); }
+
+// Jobs this page has seen end. The broker can still list a job for a moment
+// after its log said how it ended; a render in that moment must not show the
+// build as running again (and start a watcher that announces it twice).
+const devImageEnded = new Set();      // op ids
+
+// The corner notice for a build that ended with nobody looking at its log:
+// once per job, whoever notices first (a watcher, or a log box whose page was
+// rebuilt under it).
+function devImageAnnounce(repo, opId) {
+    if (devImageEnded.has(opId)) return;
+    devImageEnded.add(opId);
+    showOpNotice("The build of " + repo + " ended.", true,
+                 () => devImageReplay(repo, opId));
+}
+
+function devImageBytes(n) {
+    if (typeof n !== "number" || n <= 0) return "";
+    const mb = n / (1024 * 1024);
+    return mb >= 1 ? mb.toFixed(1) + " MB" : Math.max(1, Math.round(n / 1024)) + " kB";
+}
+
+function devImagesShowing(body) {
+    return state.hostPage === "development" && devActiveTab === "images"
+        && body && body.isConnected;
+}
+
+// Redraw the Images tab after something changed: the caller's own body when
+// that is still the tab on screen, else whatever shows the tab now (a dialog
+// or a watcher can outlive the body it was opened from, when the page was
+// rebuilt meanwhile). Nothing when another page or tab is showing.
+function devImagesRedraw(view, body) {
+    if (devImagesShowing(body)) return renderDevImagesTab(view, body);
+    const now = hostBody();
+    if (now && state.hostPage === "development" && devActiveTab === "images") {
+        return rerenderView(now);
+    }
+}
+
+async function renderDevImagesTab(view, body) {
+    body.innerHTML = "";
+    body.appendChild(el("div", { class: "mgmt-loading" }, ["Loading built images…"]));
+    let res, act;
+    try {
+        [res, act] = await Promise.all([fetch("/broker/dev"),
+                                        fetch("/broker/dev/image-active")]);
+    } catch (e) { return renderMgmtUnavailable(body); }
+    for (const r of [res, act]) {
+        if (r.status === 401) return renderMgmtLogin(view, renderDevelopmentInto);
+        if (r.status === 403) return renderMgmtRejected(body);
+        if (r.status === 503) return renderMgmtUnavailable(body);
+    }
+    let data, active;
+    try { data = await res.json(); active = await act.json(); }
+    catch (e) { return renderMgmtUnavailable(body); }
+    const failed = (!res.ok || !data.ok || !data.result) ? data
+        : ((!act.ok || !active.ok || !active.result) ? active : null);
+    if (failed) {
+        body.innerHTML = "";
+        const retry = el("button", { class: "btn-small" }, ["Retry"]);
+        retry.onclick = () => renderDevImagesTab(view, body);
+        body.appendChild(el("div", { class: "mgmt-empty" }, [
+            el("span", {}, [(mgmtErrText(failed) || "Could not load the built images.") + " "]),
+            retry,
+        ]));
+        return;
+    }
+    // The broker's list is the truth about what is running; keep this page's
+    // watcher flag for the builds it still names.
+    const running = new Map();
+    for (const b of (Array.isArray(active.result.builds) ? active.result.builds : [])) {
+        if (!b || typeof b.repo !== "string" || typeof b.op_id !== "string") continue;
+        if (devImageEnded.has(b.op_id)) continue;
+        const had = devImageBuild(b.repo);
+        running.set(b.repo.toLowerCase(),
+                    { opId: b.op_id, watching: false,
+                      modal: !!(had && had.opId === b.op_id && had.modal) });
+    }
+    devImageBuilds.clear();
+    for (const [k, v] of running) devImageBuilds.set(k, v);
+    renderDevImagesScreen(view, body, data.result);
+}
+
+function renderDevImagesScreen(view, body, result) {
+    body.innerHTML = "";
+    const gitea = result.gitea || {};
+    const repos = Array.isArray(result.repos) ? result.repos : [];
+    if (devGiteaHeldNotice(body, gitea)) return;
+    if (!gitea.exists || !gitea.running) {
+        const enable = el("button", { class: "btn-small" }, ["Enable Gitea"]);
+        enable.onclick = () =>
+            devEnableGiteaDialog(view, () => renderDevImagesTab(view, body));
+        body.appendChild(el("div", { class: "mgmt-empty" }, [
+            el("span", {}, [gitea.exists ? "Gitea is stopped. "
+                                         : "The dev lane isn't enabled yet. "]),
+            enable,
+        ]));
+        return;
+    }
+    if (!repos.length) {
+        body.appendChild(el("div", { class: "mgmt-empty" }, [
+            "No dev repos yet. A repo is mirrored here when you create a dev "
+            + "project from a GitHub URL (New Project → Dev), or add a dev box to "
+            + "an existing project.",
+        ]));
+        return;
+    }
+    const head = el("tr", {}, [
+        el("th", {}, ["Repo"]),
+        el("th", {}, ["Built image"]),
+        el("th", {}, [""]),
+    ]);
+    const idle = [];
+    const rows = repos.filter((r) => r && typeof r.repo === "string")
+        .map((r) => devImageRow(view, body, r.repo, idle));
+    body.appendChild(el("div", { class: "dev-repos-wrap" }, [
+        el("table", { class: "dev-repos-table dev-images-table" }, [
+            el("thead", {}, [head]), el("tbody", {}, rows),
+        ]),
+    ]));
+    body.appendChild(el("div", { class: "hint" }, [
+        "Build takes what GitHub has now for the branch or tag you name: push "
+        + "the commit and its version tags to GitHub first. Each repo keeps one "
+        + "built image; a new build replaces it. The image records the git tags "
+        + "on its commit. Built images are not part of the Gitea backup.",
+    ]));
+    devImageFillAll(idle);
+    // Every running build the broker named (started here, in another browser,
+    // or before a reload) gets a watcher, so its row settles by itself. By the
+    // listed name: that is the spelling the notice shows.
+    for (const r of repos) {
+        if (r && typeof r.repo === "string" && devImageBuild(r.repo)) {
+            devImageWatch(view, body, r.repo);
+        }
+    }
+}
+
+function devImageRow(view, body, repo, idle) {
+    const info = el("td", { class: "dev-image-info" }, ["…"]);
+    const acts = el("td", { class: "dev-image-actions" });
+    const row = el("tr", {}, [el("td", {}, [repo]), info, acts]);
+    const building = devImageBuild(repo);
+    if (building) {
+        info.textContent = "building…";
+        const log = el("button", { class: "btn-small" }, ["Show log"]);
+        log.onclick = () => devImageTail(view, body, repo, building.opId);
+        const cancel = el("button", { class: "btn-small" }, ["Cancel"]);
+        cancel.onclick = async () => {
+            cancel.disabled = true;
+            const said = await devImageCancel(view, building.opId);
+            if (said) { info.textContent = "building… (not cancelled: " + said + ")"; cancel.disabled = false; }
+            else info.textContent = "cancelling…";
+        };
+        acts.appendChild(log);
+        acts.appendChild(cancel);
+        return row;
+    }
+    const build = el("button", { class: "btn-small" }, ["Build"]);
+    build.onclick = () => devImageBuildDialog(view, body, repo);
+    acts.appendChild(build);
+    idle.push({ view, body, repo, info, acts });
+    return row;
+}
+
+// The idle rows' images, read ONE AT A TIME: each read is several Gitea calls
+// on the broker's single queue, so a page of repos asked all at once would
+// hold the broker for the sum of them when Gitea is slow. When the broker
+// itself does not answer, the remaining rows are not asked at all.
+async function devImageFillAll(idle) {
+    for (let i = 0; i < idle.length; i++) {
+        const c = idle[i];
+        // The ROW, not the body: a redraw keeps the body and replaces its
+        // rows, and its own pass reads them — this one must stop.
+        if (!c.info.isConnected) return;
+        const answered = await devImageFill(c.view, c.body, c.repo, c.info, c.acts);
+        if (!c.info.isConnected) return;
+        if (!answered) {
+            for (const rest of idle.slice(i + 1)) {
+                rest.info.textContent = "not read (the broker did not answer)";
+            }
+            return;
+        }
+    }
+}
+
+// One repo's image cell. A failure is shown as such, never as "no image":
+// the two answers lead to different actions. Returns false when the broker
+// did not answer at all (the caller then stops asking), true otherwise.
+async function devImageFill(view, body, repo, info, acts) {
+    let b;
+    try {
+        const r = await fetch("/broker/dev/image?repo=" + encodeURIComponent(repo));
+        if (r.status === 401 || r.status === 403 || r.status === 503) {
+            info.textContent = "could not be read (sign in again or check the broker)";
+            return false;
+        }
+        b = await r.json();
+    } catch (e) { info.textContent = "could not be read"; return false; }
+    if (!b.ok || !b.result) { info.textContent = "could not be read: " + mgmtErrText(b); return true; }
+    const im = b.result;
+    info.innerHTML = "";
+    if (!im.running) { info.textContent = "Gitea is not running"; return true; }
+    if (!im.present) { info.textContent = "none"; return true; }
+    const tags = Array.isArray(im.git_tags) ? im.git_tags.filter((t) => typeof t === "string") : [];
+    const commit = typeof im.commit === "string" ? im.commit : "";
+    info.appendChild(el("div", {}, [
+        tags.length ? tags.join(", ") : "no git tag on its commit",
+    ]));
+    const when = im.created ? new Date(im.created) : null;
+    const facts = ["commit " + (commit ? commit.slice(0, 12) : "unknown")];
+    if (when && !isNaN(when.getTime())) facts.push("built " + when.toLocaleString());
+    const size = devImageBytes(im.size);
+    if (size) facts.push(size);
+    info.appendChild(el("div", { class: "dev-image-sub", title: commit }, [facts.join(" · ")]));
+    const discard = el("button", { class: "btn-small" }, ["Discard"]);
+    discard.onclick = () => devImageDiscardDialog(view, body, repo);
+    acts.appendChild(discard);
+    return true;
+}
+
+// POST helper for the two small writes. Returns "" on success, else the
+// reason to show.
+async function devImagePost(view, path, payload) {
+    let r, b;
+    try {
+        r = await fetch(path, { method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify(payload) });
+    } catch (e) { return "the broker could not be reached"; }
+    if (r.status === 401) return "your session expired; sign in again";
+    if (r.status === 403) return "the request was rejected";
+    if (r.status === 503) return "the broker could not be reached";
+    try { b = await r.json(); } catch (e) { return "the broker's answer could not be read"; }
+    return b.ok ? "" : mgmtErrText(b);
+}
+
+function devImageCancel(view, opId) {
+    return devImagePost(view, "/broker/dev/image-cancel", { op_id: opId });
+}
+
+// The build's log box: the steps, docker's output, Cancel, and "Continue in
+// background" (the build runs at the broker either way). While it is open it
+// is the build's watcher (`modal`); however it closes without the build
+// having ended — dismissed, or an expired session — a background watcher
+// takes over, on whatever entry the page holds for the repo by then.
+async function devImageTail(view, body, repo, opId) {
+    if (document.querySelector(".modal-backdrop")) return;
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const card = el("div", { class: "card sw-build-card" });
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+    const again = () => devImagesRedraw(view, body);
+    const current = () => { const e = devImageBuild(repo); return (e && e.opId === opId) ? e : null; };
+    const first = current();
+    if (first) first.modal = true;
+    let over = false;
+    const handBack = () => {
+        const e = current();
+        if (over || !e) return;
+        e.modal = false;
+        devImageWatch(view, body, repo);
+    };
+    await mgmtTailBuildLog(view, backdrop, card, opId, "Build " + repo, again, undefined, {
+        onDismiss: () => { backdrop.remove(); handBack(); },
+        onStop: () => devImageCancel(view, opId),
+        stopLabel: "Cancel build",
+        onEnd: () => {
+            over = true;
+            if (current()) devImageBuilds.delete(repo.toLowerCase());
+            if (backdrop.isConnected) {
+                devImageEnded.add(opId);            // seen in this box: no notice
+                return again();
+            }
+            // The box was wiped from under its tail (the page was rebuilt, a
+            // layout change): nobody saw the ending here. Say it (unless it
+            // was already said), and redraw the tab if it is showing.
+            devImageAnnounce(repo, opId);
+            again();
+        },
+    });
+    // The tail returned without the build ending (a dismissal already handed
+    // it back; an expired session lands here): the box no longer watches it.
+    const e = current();
+    if (!over && e && e.modal) handBack();
+}
+
+// Watch a build no log box is open for: when its job is over, say so in a
+// corner notice and repaint the tab if it is the one showing. It polls the
+// job's liveness only. It belongs to ONE entry object: a re-render replaces
+// the entries and starts its own watchers, and this one ends at its next
+// tick. An expired session stops it; the tab's next render starts a new one.
+async function devImageWatch(view, body, repo) {
+    const entry = devImageBuild(repo);
+    if (!entry || entry.watching || entry.modal) return;
+    entry.watching = true;
+    const opId = entry.opId;
+    const mine = () => devImageBuild(repo) === entry && !entry.modal;
+    for (;;) {
+        await opSleep(OP_POLL_INTERVAL_MS * 5);
+        if (!mine()) { entry.watching = false; return; }
+        let alive = null;
+        try {
+            const r = await fetch(`/broker/op/${encodeURIComponent(opId)}/alive`);
+            if (r.status === 401 || r.status === 403) { entry.watching = false; return; }
+            if (r.ok) { const b = await r.json(); alive = b.ok ? !!b.alive : null; }
+        } catch (e) { alive = null; }
+        if (alive === false) break;
+    }
+    if (!mine()) { entry.watching = false; return; }
+    // The build is over: its entry goes now (a later render of the tab would
+    // drop it too, from the broker's list).
+    devImageBuilds.delete(repo.toLowerCase());
+    devImageAnnounce(repo, opId);
+    devImagesRedraw(view, body);
+}
+
+// The corner notice's "show the details": the finished build's whole log.
+function devImageReplay(repo, opId) {
+    if (document.querySelector(".modal-backdrop")) return;
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const card = el("div", { class: "card sw-build-card" });
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+    backdrop.onclick = (e) => { if (e.target === backdrop) backdrop.remove(); };
+    return mgmtTailBuildLog(null, backdrop, card, opId, "Build " + repo, () => {});
+}
+
+function devImageBuildDialog(view, body, repo) {
+    if (document.querySelector(".modal-backdrop")) return;
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const ref = el("input", { type: "text", placeholder: "the default branch",
+                              autocomplete: "off", spellcheck: "false" });
+    const dockerfile = el("input", { type: "text",
+                                     placeholder: "the path used last time, else Dockerfile",
+                                     autocomplete: "off", spellcheck: "false" });
+    const errEl = el("div", { class: "error" });
+    const go = el("button", { class: "btn" }, ["Build"]);
+    const cancel = el("button", { class: "btn btn-secondary" }, ["Cancel"]);
+    const card = el("div", { class: "card sw-build-card" }, [
+        el("h2", {}, ["Build " + repo]),
+        el("p", {}, [
+            "Builds the repo's Dockerfile from what GitHub has now, in a "
+            + "throwaway project that holds no credentials, and keeps the image "
+            + "here in place of the repo's previous one. The build sees the "
+            + "commit's files only: submodule contents, Git LFS objects and "
+            + "paths marked export-ignore are not in it.",
+        ]),
+        el("div", { class: "field" }, [el("label", {}, ["Branch or tag"]), ref]),
+        el("div", { class: "field" }, [el("label", {}, ["Dockerfile path in the repo"]), dockerfile]),
+        errEl,
+        el("div", { class: "btn-row" }, [cancel, go]),
+    ]);
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+    const close = () => backdrop.remove();
+    cancel.onclick = close;
+    backdrop.onclick = (e) => { if (e.target === backdrop) close(); };
+    go.onclick = async () => {
+        if (go.disabled) return;
+        go.disabled = true;
+        errEl.textContent = "";
+        const payload = { repo: repo };
+        if (ref.value.trim()) payload.ref = ref.value.trim();
+        if (dockerfile.value.trim()) payload.dockerfile = dockerfile.value.trim();
+        let r, b;
+        try {
+            r = await fetch("/broker/dev/image-build", {
+                method: "POST", headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload) });
+        } catch (e) {
+            // The dialog stays: what was typed is kept for another try.
+            errEl.textContent = "Not started: the broker could not be reached.";
+            go.disabled = false;
+            return;
+        }
+        if (r.status === 503) {
+            errEl.textContent = "Not started: the broker could not be reached.";
+            go.disabled = false;
+            return;
+        }
+        const redirect = mgmtStatusRedirect(view, r.status);
+        if (redirect) { close(); return redirect(); }
+        try { b = await r.json(); } catch (e) { b = {}; }
+        if (!b.ok || !b.op_id) {
+            errEl.textContent = "Not started: " + mgmtErrText(b);
+            go.disabled = false;
+            return;
+        }
+        close();
+        devImageBuilds.set(repo.toLowerCase(), { opId: b.op_id, modal: false, watching: false });
+        // The row turns to "building…" (the tab is read again for that).
+        devImagesRedraw(view, body);
+        devImageTail(view, body, repo, b.op_id);
+    };
+    ref.focus();
+}
+
+function devImageDiscardDialog(view, body, repo) {
+    if (document.querySelector(".modal-backdrop")) return;
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const errEl = el("div", { class: "error" });
+    const go = el("button", { class: "btn btn-danger" }, ["Discard"]);
+    const cancel = el("button", { class: "btn btn-secondary" }, ["Cancel"]);
+    const card = el("div", { class: "card" }, [
+        el("h2", {}, ["Discard the built image of " + repo + "?"]),
+        el("p", {}, [
+            "The image is removed from this machine. Anything already "
+            + "published stays where it is. To have it again, build it again "
+            + "from its commit.",
+        ]),
+        errEl,
+        el("div", { class: "btn-row" }, [cancel, go]),
+    ]);
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+    const close = () => backdrop.remove();
+    cancel.onclick = close;
+    backdrop.onclick = (e) => { if (e.target === backdrop) close(); };
+    go.onclick = async () => {
+        if (go.disabled) return;
+        go.disabled = true;
+        const said = await devImagePost(view, "/broker/dev/image-discard", { repo: repo });
+        if (said) { errEl.textContent = "Not discarded: " + said; go.disabled = false; return; }
+        close();
+        devImagesRedraw(view, body);
+    };
+}
+
 async function renderDevReposTab(view, body) {
     body.innerHTML = "";
     body.appendChild(el("div", { class: "mgmt-loading" }, ["Loading dev repos…"]));
@@ -7860,7 +8308,30 @@ async function mgmtTailBuildLog(view, backdrop, card, opId, title, onDone,
     card.appendChild(phaseEl);
     card.appendChild(pre);
     card.appendChild(failEl);
-    card.appendChild(el("div", { class: "btn-row" }, bgBtn ? [bgBtn, doneBtn] : [doneBtn]));
+    // opts.onStop (the image build): a button that asks the caller to stop
+    // the running op. The op ends through its own terminal record, so the
+    // tail keeps running; the button goes when the op is over.
+    const stopBtn = opts.onStop
+        ? el("button", { class: "btn btn-secondary" }, [opts.stopLabel || "Cancel"]) : null;
+    if (stopBtn) {
+        stopBtn.onclick = async () => {
+            if (stopBtn.disabled) return;
+            stopBtn.disabled = true;
+            stopBtn.textContent = "Cancelling…";
+            let said = "";
+            try { said = await opts.onStop(); } catch (e) { said = "could not reach the broker"; }
+            // A refusal (the op already ended, a session that expired) is
+            // shown and the button comes back; success leaves it disabled
+            // until the op's own ending removes it.
+            if (said) {
+                failEl.textContent = "Not cancelled: " + said;
+                stopBtn.disabled = false;
+                stopBtn.textContent = opts.stopLabel || "Cancel";
+            }
+        };
+    }
+    card.appendChild(el("div", { class: "btn-row" },
+                        [stopBtn, bgBtn, doneBtn].filter(Boolean)));
 
     let logFrom = 0, viewFrom = 0, done = false, ok = false, sawTerminal = false, interrupted = false;
     let failMsg = "";
@@ -7963,6 +8434,7 @@ async function mgmtTailBuildLog(view, backdrop, card, opId, title, onDone,
         catch (e) { /* the caller's bookkeeping is best-effort */ }
     }
     if (bgBtn) bgBtn.remove();
+    if (stopBtn) stopBtn.remove();
     // The full log can be far longer than one tail chunk (a finished fleet
     // rebuild is megabytes, and a replay starts from 0): read on to its end so
     // where it failed or died is on screen. The reads end at the first empty
@@ -7989,8 +8461,12 @@ async function mgmtTailBuildLog(view, backdrop, card, opId, title, onDone,
     if (interrupted) {
         phaseEl.textContent = "interrupted";
         failEl.textContent = "Interrupted — the process stopped without finishing. Check the log above.";
-    } else if (ok) { phaseEl.textContent = "done"; }
-    else {
+    } else if (ok) { phaseEl.textContent = "done"; failEl.textContent = ""; }
+    else if (failMsg === "cancelled") {
+        // The one lane whose op can be stopped on request says so itself.
+        phaseEl.textContent = "cancelled";
+        failEl.textContent = "Cancelled — the build was stopped and nothing was stored.";
+    } else {
         phaseEl.textContent = "failed";
         // Only a lane's operator text is worth repeating; the coarse tokens
         // other lanes write would just say "failed" twice.
