@@ -2267,6 +2267,153 @@ def _read_host_stats() -> dict:
     }
 
 
+# ---- /broker/activity — the sidebar's activity boxes (#560) ---------------
+# Each container's activity recorder writes `.rs/activity.json` in its own
+# workspace: the project's agent at `<root>/<p>/workspace/.rs/activity.json`,
+# a box at `<root>/<p>/workspace/boxes/<b>/.rs/activity.json`. Every byte there
+# (and the box list beside it) is written by the project's agents, and this
+# read runs on the sidebar's 15 s poll for every shown project, on the one
+# event loop every terminal shares: so each path is walked by descriptor from
+# the projects root refusing a link at every step, the file must be a regular
+# file opened non-blocking (a planted FIFO never stalls the loop), and every
+# read is bounded. A project's failure is reported for that project only.
+#
+# The summary's fixed shape ({v, run, working, waiting, subagents, handbacks},
+# run = 36-char boot id + ":" + a tick count) is under 200 bytes; 1 KiB leaves
+# room for any whitespace a writer adds and still rejects anything else at
+# once.
+ACTIVITY_SUMMARY_MAX_BYTES = 1024
+ACTIVITY_SUMMARY_VERSION = 1           # rs-activity.py SUMMARY_VERSION (pinned)
+ACTIVITY_RUN_MAX_CHARS = 80
+# The project record and the box list: a legitimate box entry is a few hundred
+# bytes plus its folder and port lists (each name or number tens of bytes);
+# twelve boxes with a hundred folders and ports each come to about 60 KB.
+# 256 KiB keeps four times that, and parsing a hostile file of that size costs
+# the shared loop a few milliseconds per poll, not a stall.
+ACTIVITY_ORCH_MAX_BYTES = 256 * 1024
+# A project holds at most one box per box address (rs_sandbox BOX_IP_LO..HI =
+# 14..25), so a longer box list is not one RS wrote.
+ACTIVITY_MAX_BOXES = 12
+# rscore._BOX_NAME_RE (pinned): checked before any path is built from a name.
+ACTIVITY_BOX_NAME_RE = re.compile(r"\A[a-z][a-z0-9-]*\Z")
+# The workflow whose projects show no activity boxes (maintainer, 2026-11-15).
+ACTIVITY_SKIP_WORKFLOWS = ("open-knowledge",)
+
+
+def _read_project_bounded(parts: "list[str]", cap: int) -> "tuple[str, bytes | None]":
+    """Read `<root>/<parts...>` without following a link at any step:
+    ("ok", bytes) | ("absent", None) | ("bad", None). A regular file only,
+    opened non-blocking, at most `cap` bytes ("bad" when larger)."""
+    fds: list[int] = []
+    try:
+        fd = os.open(PROJECTS_ROOT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        fds.append(fd)
+        for comp in parts[:-1]:
+            fd = os.open(comp, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                         | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=fd)
+            fds.append(fd)
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                     | os.O_CLOEXEC, dir_fd=fd)
+        fds.append(fd)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return "bad", None
+        data = os.read(fd, cap + 1)
+        return ("bad", None) if len(data) > cap else ("ok", data)
+    except FileNotFoundError:
+        return "absent", None
+    except OSError:
+        return "bad", None
+    finally:
+        for f in reversed(fds):
+            try:
+                os.close(f)
+            except OSError:
+                pass
+
+
+def _parse_bounded_json(data: bytes) -> object:
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return None
+
+
+def _activity_count(v: object) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def _read_activity_summary(parts: "list[str]") -> "tuple[str, dict | None]":
+    """One container's summary: ("ok", {...}) | ("absent", None) | ("bad", None)."""
+    how, data = _read_project_bounded(parts, ACTIVITY_SUMMARY_MAX_BYTES)
+    if how != "ok":
+        return how, None
+    d = _parse_bounded_json(data)
+    keys = ("working", "waiting", "subagents", "handbacks")
+    if (not isinstance(d, dict) or d.get("v") != ACTIVITY_SUMMARY_VERSION
+            or not isinstance(d.get("run"), str)
+            or len(d["run"]) > ACTIVITY_RUN_MAX_CHARS
+            or not all(_activity_count(d.get(k)) for k in keys)):
+        return "bad", None
+    return "ok", {"run": d["run"], **{k: d[k] for k in keys}}
+
+
+def _project_activity(name: str) -> dict:
+    """{containers: [{who, run, working, waiting, subagents, handbacks}],
+    errors: [{who, what}]} for one project; {skip: true} for a project that
+    shows no activity; {error: "not_found"} for a bad or missing project."""
+    if not PROJECT_NAME_RE.match(name):
+        return {"error": "not_found"}
+    ws = [name, "workspace"]
+    how, raw = _read_project_bounded([*ws, ".orchestrator", "project.json"],
+                                     ACTIVITY_ORCH_MAX_BYTES)
+    if how == "ok":
+        marker = _parse_bounded_json(raw)
+        if (isinstance(marker, dict)
+                and marker.get("workflow") in ACTIVITY_SKIP_WORKFLOWS):
+            return {"skip": True}
+    containers: list[dict] = []
+    errors: list[dict] = []
+    how, summ = _read_activity_summary([*ws, ".rs", "activity.json"])
+    if how == "ok":
+        containers.append({"who": "agent", **summ})
+    elif how == "bad":
+        errors.append({"who": "agent", "what": "activity"})
+    how, raw = _read_project_bounded([*ws, ".orchestrator", "extensions.json"],
+                                     ACTIVITY_ORCH_MAX_BYTES)
+    boxes: list[str] = []
+    if how == "ok":
+        reg = _parse_bounded_json(raw)
+        if not isinstance(reg, dict) or len(reg) > ACTIVITY_MAX_BOXES:
+            errors.append({"who": "", "what": "boxes"})
+        else:
+            boxes = sorted(n for n, e in reg.items()
+                           if isinstance(e, dict) and isinstance(n, str)
+                           and ACTIVITY_BOX_NAME_RE.match(n))
+    elif how == "bad":
+        errors.append({"who": "", "what": "boxes"})
+    for b in boxes:
+        how, summ = _read_activity_summary([*ws, "boxes", b, ".rs", "activity.json"])
+        if how == "ok":
+            containers.append({"who": b, **summ})
+        elif how == "bad":
+            errors.append({"who": b, "what": "activity"})
+    return {"containers": containers, "errors": errors}
+
+
+async def broker_activity_handler(request: web.Request) -> web.Response:
+    """GET /broker/activity?names=a,b — the sidebar's activity boxes, batched
+    for the shown projects (#560). Gated on the management session (every
+    project can reach this server); a 401 shows no boxes and starts no login.
+    Local reads only, every one bounded (above)."""
+    if _broker_session(request) is None:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+    raw = request.query.get("names", "")
+    names = list(dict.fromkeys(n.strip() for n in raw.split(",") if n.strip()))
+    return web.json_response({"ok": True,
+                              "result": {n: _project_activity(n) for n in names}})
+
+
 async def broker_host_stats_handler(request: web.Request) -> web.Response:
     """GET /broker/host-stats — the rail's CPU/RAM bars. Gated on the
     management session like the op-log reads (no broker round-trip: the
@@ -4293,6 +4440,7 @@ def main() -> None:
     app.router.add_post("/broker/logout", broker_logout_handler)
     app.router.add_get("/broker/projects", broker_projects_handler)
     app.router.add_get("/broker/host-stats", broker_host_stats_handler)
+    app.router.add_get("/broker/activity", broker_activity_handler)
     app.router.add_get("/broker/lifecycle", broker_lifecycle_handler)
     app.router.add_get("/broker/software/active", broker_software_active_handler)
     app.router.add_get("/broker/workflows", broker_workflows_handler)

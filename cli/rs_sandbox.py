@@ -2489,22 +2489,26 @@ def _box_model_ops(new: dict, old: "dict | None" = None,
             BOX_CLAUDE_SETTINGS_JQ]
 
 
-def _write_box_model_detached(cname: str, ops: list[str], status_bar: bool = False) -> None:
+def _write_box_model_detached(cname: str, ops: list[str], status_bar: bool = False,
+                              activity: bool = False) -> None:
     """After the box's boot (its role marker AND its settings file — the
     entrypoint's fallback settings write comes after the marker), merge the pair
     (`ops`; none: no model write) into the box agent's settings and, with
     `status_bar`, turn RS's status bar on in its agents — as the box user, in
-    ONE exec, so the two never merge into Claude's file at once. Detached like
+    ONE exec, so the two never merge into Claude's file at once; with
+    `activity`, the activity recorder's hooks too (#560), in the same exec. Detached like
     the working-mode installer (the boot copies files while this waits); a
     pending exec dies with the box. Never fatal."""
     model = f"( {BOX_AGENT_SETTINGS_SCRIPT} ); " if ops else ""
     bar = (f"( set -- on {' '.join(BOX_STATUS_BAR_AGENTS)}; {BOX_STATUS_BAR_SCRIPT}"
            f" ) >/dev/null; " if status_bar else "")
+    act = (f"( set -- on {' '.join(BOX_STATUS_BAR_AGENTS)}; {BOX_ACTIVITY_SCRIPT}"
+           f" ) >/dev/null 2>&1; " if activity else "")
     r = _docker("exec", "-d", "-u", "1000", "-e", "HOME=/home/worker", cname, "sh", "-c",
                 f"touch {BOX_MODEL_PENDING}; "
                 # one-second poll, as the installer's
                 "until [ -e /home/worker/.rs-role ] && [ -f \"$1\" ]; do sleep 1; done; "
-                f"{model}{bar}rm -f {BOX_MODEL_PENDING}",
+                f"{model}{bar}{act}rm -f {BOX_MODEL_PENDING}",
                 "sh", BOX_CLAUDE_SETTINGS, *ops)
     if r.returncode != 0:
         print(f"warning: the agent settings could not be written into box {cname!r}; "
@@ -2543,7 +2547,7 @@ def _write_box_model_now(cname: str, ops: list[str]) -> str:
 # STATUS_BAR_FILES' names, STATUS_BAR_AGENTS and STATUS_BAR_SCRIPT — pinned.
 # ---------------------------------------------------------------------------
 BOX_STATUS_BAR_DIR = "/usr/local/lib/rs"
-BOX_STATUS_BAR_FILES = ("rs-statusbar.py", "rs-statusbar.ts")
+BOX_STATUS_BAR_FILES = ("rs-statusbar.py", "rs-statusbar.ts", "rs-activity.py", "rs-activity.ts")
 BOX_STATUS_BAR_AGENTS = ("claude", "pi")
 BOX_STATUS_BAR_STATES = ("on", "off", "own", "absent", "failed")
 BOX_STATUS_BAR_SCRIPT = 'op="$1"; shift\ncs="$HOME/.claude/settings.json"; pd="$HOME/.local/share/pi-agent/agent"\npf="$pd/extensions/rs-statusbar.ts"\nfor a in "$@"; do\nif [ "$a" = claude ]; then\n  [ -f "$cs" ] || { echo claude=absent; continue; }\n  if [ "$op" = on ] || [ "$op" = off ]; then\n    if [ "$(wc -c < "$cs")" -le 1048576 ] && jq --arg op "$op" --arg cmd /usr/local/lib/rs/rs-statusbar.py --argjson ri 30 \'if $op == "on" then (if has("statusLine") then . else .statusLine = {"type": "command", "command": $cmd, "refreshInterval": $ri} end) elif $op == "off" then (if (.statusLine | type) == "object" and .statusLine.command == $cmd then del(.statusLine) else . end) else . end\' "$cs" > "$cs.rs-tmp" && [ -s "$cs.rs-tmp" ] && mv "$cs.rs-tmp" "$cs"; then :; else rm -f "$cs.rs-tmp"; echo claude=failed; continue; fi\n  fi\n  s=$(head -c 1048576 "$cs" | jq -r --arg cmd /usr/local/lib/rs/rs-statusbar.py \'if (.statusLine | type) == "object" and .statusLine.command == $cmd then "on" elif has("statusLine") then "own" else "off" end\' 2>/dev/null) || s=failed\n  echo "claude=${s:-failed}"\nelif [ "$a" = pi ]; then\n  [ -f "$pd/settings.json" ] || { echo pi=absent; continue; }\n  w=no\n  if [ "$op" = on ]; then w=yes; fi\n  if [ "$op" = refresh ] && [ -f "$pf" ] && [ ! -L "$pf" ]; then w=yes; fi\n  if [ "$w" = yes ]; then\n    if rm -f "$pf.rs-tmp" && mkdir -p "$pd/extensions" && cp /usr/local/lib/rs/rs-statusbar.ts "$pf.rs-tmp" && mv -f "$pf.rs-tmp" "$pf"; then :; else rm -f "$pf.rs-tmp"; echo pi=failed; continue; fi\n  fi\n  if [ "$op" = off ] && { [ -e "$pf" ] || [ -L "$pf" ]; }; then\n    rm -f "$pf" || { echo pi=failed; continue; }\n  fi\n  if [ -f "$pf" ]; then echo pi=on; else echo pi=off; fi\nfi\ndone\n'
@@ -2576,6 +2580,11 @@ def _parse_box_status_bar(out: str, agents: "list[str]") -> dict:
     return {a: got.get(a, "failed") for a in agents}
 
 
+# RS's activity recorder (#560): its files travel with the status bar's (above)
+# and its hooks are written into every agent box's fresh home at every run, in
+# the same detached exec as the model and status-bar writes. MIRROR of rscore's
+# ACTIVITY_SCRIPT (pinned).
+BOX_ACTIVITY_SCRIPT = 'op="$1"; shift\ncs="$HOME/.claude/settings.json"; pd="$HOME/.local/share/pi-agent/agent"\npf="$pd/extensions/rs-activity.ts"\nfor a in "$@"; do\nif [ "$a" = claude ]; then\n  [ -f "$cs" ] || { echo claude=absent; continue; }\n  if [ "$op" = on ]; then\n    if [ "$(wc -c < "$cs")" -le 1048576 ] && jq --arg cmd "/usr/local/lib/rs/rs-activity.py hook" --arg audit /usr/local/lib/rs/rs-audit-stop --arg wrap "sh -c \'[ -x /usr/local/lib/rs/rs-activity.py ] && exec /usr/local/lib/rs/rs-activity.py stop-audit || exec /usr/local/lib/rs/rs-audit-stop\'" --arg evs "SessionStart UserPromptSubmit Stop StopFailure SubagentStart SubagentStop SessionEnd" \'def has_cmd($c): any(.[]?; (.hooks // []) | any(.[]?; .command == $c)); .hooks = (if .hooks == null then {} elif (.hooks | type) == "object" then .hooks else error("hooks is not an object") end) | reduce ($evs | split(" ")[]) as $e (.; .hooks[$e] = (if .hooks[$e] == null then [] elif (.hooks[$e] | type) == "array" then .hooks[$e] else error("a hook event is not a list") end) | if $e == "Stop" and (.hooks.Stop | has_cmd($audit) or has_cmd($wrap)) then .hooks.Stop |= (map(if (.hooks | type) == "array" then .hooks |= map(if .command == $audit then .command = $wrap else . end) else . end) | map(if (.hooks | type) == "array" and any(.hooks[]; .command == $cmd) then .hooks |= map(select(.command != $cmd)) else . end) | map(select(.hooks != []))) elif (.hooks[$e] | has_cmd($cmd)) then . else .hooks[$e] += [{"hooks": [{"type": "command", "command": $cmd}]}] end)\' "$cs" > "$cs.rs-tmp" && [ -s "$cs.rs-tmp" ] && mv "$cs.rs-tmp" "$cs"; then :; else rm -f "$cs.rs-tmp"; echo claude=failed; continue; fi\n  fi\n  s=$(head -c 1048576 "$cs" | jq -r --arg cmd "/usr/local/lib/rs/rs-activity.py hook" --arg audit /usr/local/lib/rs/rs-audit-stop --arg wrap "sh -c \'[ -x /usr/local/lib/rs/rs-activity.py ] && exec /usr/local/lib/rs/rs-activity.py stop-audit || exec /usr/local/lib/rs/rs-audit-stop\'" --arg evs "SessionStart UserPromptSubmit Stop StopFailure SubagentStart SubagentStop SessionEnd" \'def has_cmd($c): any(.[]?; (.hooks // []) | any(.[]?; .command == $c)); [($evs | split(" ")[]) as $e | ((if (.hooks | type) == "object" then .hooks[$e] else null end) // []) | if type == "array" then (has_cmd($cmd) or ($e == "Stop" and has_cmd($wrap))) else false end] | if all then "on" else "off" end\' 2>/dev/null) || s=failed\n  echo "claude=${s:-failed}"\nelif [ "$a" = pi ]; then\n  [ -f "$pd/settings.json" ] || { echo pi=absent; continue; }\n  w=no\n  if [ "$op" = on ]; then w=yes; fi\n  if [ "$op" = refresh ] && [ -f "$pf" ] && [ ! -L "$pf" ]; then w=yes; fi\n  if [ "$w" = yes ]; then\n    if rm -f "$pf.rs-tmp" && mkdir -p "$pd/extensions" && cp /usr/local/lib/rs/rs-activity.ts "$pf.rs-tmp" && mv -f "$pf.rs-tmp" "$pf"; then :; else rm -f "$pf.rs-tmp"; echo pi=failed; continue; fi\n  fi\n  if [ -f "$pf" ]; then echo pi=on; else echo pi=off; fi\nfi\ndone\nif [ -x /usr/local/lib/rs/rs-activity.py ]; then /usr/local/lib/rs/rs-activity.py reset >/dev/null 2>&1; fi\n:\n'
 def _stage_box_status_bar(cname: str) -> bool:
     """Copy the two files from this project container into a running box, as
     root at the same path. False when they are not here (a project not
@@ -2619,6 +2628,51 @@ def _box_status_bar_now(cname: str, op: str,
     if "RS_BOX_BOOTING" in out:
         return "booting"
     return _parse_box_status_bar(out, agents)
+
+
+def _box_activity_refresh(cname: str) -> None:
+    """Run the activity script's refresh in a box whose home was kept (a plain
+    start): pi's file rewritten where it is there, the box's summary rewritten
+    for this run. Never fatal; nothing to report (no counts until then)."""
+    _box_activity_exec(cname, "refresh", list(BOX_STATUS_BAR_AGENTS))
+
+
+def _box_activity_exec(cname: str, op: str, agents: "list[str]") -> dict:
+    """Run BOX_ACTIVITY_SCRIPT in a running box as its user: {agent: state}
+    ("failed" for an agent it did not answer for). Bounded; never raises."""
+    try:
+        r = _docker_input(b"", "exec", "-i", "-u", "1000", "-e", "HOME=/home/worker", cname,
+                          "sh", "-c", BOX_ACTIVITY_SCRIPT, "sh", op, *agents)
+        out = (r.stdout or b"").decode("utf-8", "replace")
+    except (OSError, subprocess.TimeoutExpired):
+        out = ""
+    got: dict = {}
+    for line in out.splitlines():
+        a, sep, v = line.strip().partition("=")
+        if sep and a in agents and a not in got:
+            got[a] = v
+    return {a: got.get(a, "failed") for a in agents}
+
+
+def cmd_activity(args: argparse.Namespace) -> None:
+    """Write the activity recorder (#560) into the given agents of a running
+    agent box (an agent just added to it). Exit 1 when it did not reach one."""
+    _require_dind_project()
+    if not _NAME_RE.match(args.name):
+        die("invalid box name")
+    agents = [a for a in (args.agents or "").split(",") if a]
+    if not agents or any(a not in BOX_STATUS_BAR_AGENTS for a in agents):
+        die("invalid --agents value")
+    entry = load().get(args.name)
+    if not isinstance(entry, dict) or entry.get("kind") != KIND:
+        die(f"no box named {args.name!r} in this project")
+    cname = box_container(args.name)
+    if not _stage_box_status_bar(cname):
+        die("the activity recorder could not be put into the box")
+    states = _box_activity_exec(cname, "on", agents)
+    if any(v not in ("on", "absent") for v in states.values()):
+        die("the activity recorder could not be written into the box's agents")
+    print(json.dumps({"name": args.name, "agents": states}))
 
 
 def _status_bar_owed_done(states: "dict | str") -> bool:
@@ -3122,7 +3176,8 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     # RS's status bar (#524): the files into every agent box at every run (a
     # later Enable needs them), so a fix reaches boxes at their next run.
     bar_warnings: list[dict] = []
-    if agent_mount and not _stage_box_status_bar(cname):
+    staged = bool(agent_mount) and _stage_box_status_bar(cname)
+    if agent_mount and not staged:
         bar_warnings.append({"kind": "status-bar", "reason": "not-staged"})
         status_bar = False      # never a setting naming a script that is not there
     # A Claude box's model + effort into its own settings file, and the status
@@ -3130,8 +3185,10 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     # (no installer gate). The home is fresh: "off" has nothing to remove.
     model_ops = (_box_model_ops({"model": model, "effort": effort})
                  if agent == "claude" and (model or effort) else [])
-    if agent_mount and (model_ops or status_bar):
-        _write_box_model_detached(cname, model_ops, status_bar=status_bar)
+    # The activity recorder's hooks (#560) into every agent box whose files are
+    # staged, at every run (the home is fresh).
+    if agent_mount and (model_ops or status_bar or staged):
+        _write_box_model_detached(cname, model_ops, status_bar=status_bar, activity=staged)
     # F3 Slice 2b: launch the in-box loopback forwarders for the freshly-run box.
     _launch_box_forwarders(cname, lp_list)
     # The box's home is fresh: give its agents their wired MCP servers back.
@@ -3852,6 +3909,10 @@ def cmd_start(args: argparse.Namespace) -> None:
                     if isinstance(entries.get(args.name), dict):
                         entries[args.name].pop("status_bar_pending", None)
                         save(entries)
+                # The activity recorder (#560): the home was kept with its
+                # hooks; pi's file rewritten where it is there, and the box's
+                # counts reset for this run.
+                _box_activity_refresh(cname)
             _print_warnings(args.name, bar_w)
         # A model changed while parked: the home was kept, so write it now —
         # only the halves that changed, and cleared only once written.
@@ -4668,6 +4729,12 @@ def build_parser() -> argparse.ArgumentParser:
     sr = sub.add_parser("start", help="(re)start a stopped box")
     sr.add_argument("name")
     sr.set_defaults(func=cmd_start)
+
+    ac_ = sub.add_parser("activity", help="write the activity recorder into agents just "
+                                         "added to a running box")
+    ac_.add_argument("name")
+    ac_.add_argument("--agents", default="", help="comma-separated: claude, pi")
+    ac_.set_defaults(func=cmd_activity)
 
     st_ = sub.add_parser("settings", help="replace a box's agent settings (model, "
                                          "effort, working mode) with the values given")

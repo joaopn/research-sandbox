@@ -1325,6 +1325,7 @@ function refreshProjectRail() {
     applyRailState();
     schedulePolling();
     paintProjectBadges();
+    paintActivityBoxes();
     scheduleServicesRefresh();
 }
 
@@ -7568,7 +7569,8 @@ function paintLifecycleLabels() {
         if (!entry) { if (tag) tag.remove(); continue; }
         if (!tag) {
             tag = el("span", { class: "project-inflight" });
-            const badge = line.querySelector(".type-badge");
+            // after the activity boxes (#560), as makeProjectRow places it
+            const badge = line.querySelector(".activity-boxes") || line.querySelector(".type-badge");
             if (badge) badge.after(tag); else line.prepend(tag);
         }
         tag.textContent = lifecycleLabel(entry);
@@ -11263,10 +11265,13 @@ function makeProjectRow(project) {
     // "starting…" / "stopping…" / "updating…" / "queued…" while a lifecycle-lane
     // op is in flight for this project (paintLifecycleLabels keeps it current).
     const flight = lifecycleInFlight.get(project.name);
+    // The activity boxes (#560): sessions working / waiting, subagents running,
+    // painted from the last /broker/activity answer (paintActivityBoxes).
+    const activity = el("span", { class: "activity-boxes" });
     const statusLine = el("div", { class: "project-status-line" },
-        flight ? [typeBadge, el("span", { class: "project-inflight" },
+        flight ? [typeBadge, activity, el("span", { class: "project-inflight" },
                                 [lifecycleLabel(flight)]), configBtn]
-               : [typeBadge, configBtn]);
+               : [typeBadge, activity, configBtn]);
     // .active is stamped here so a rail rebuild (a drop, a create, a destroy)
     // keeps the "you are here" highlight — refreshProjectRail replaces the
     // whole <aside> and never re-activates. Gated on no host page being open:
@@ -11292,6 +11297,7 @@ function schedulePolling() {
     if (state.probeTimer) clearInterval(state.probeTimer);
     const probeAll = () => {
         for (const p of state.vault.projects) probeProject(p);
+        fetchProjectActivity();
     };
     probeAll();
     state.probeTimer = setInterval(probeAll, PROBE_INTERVAL_MS);
@@ -11685,6 +11691,88 @@ async function paintProjectBadges() {
     }
 }
 
+// ---- Activity boxes (#560) ------------------------------------------------
+// Each project row shows, after its type badge, up to three small boxes: green
+// = its interactive agent sessions working, amber = waiting for the user, blue
+// = subagents running, summed over the project's agent and its boxes (Claude
+// Code and pi; headless runs never count). A box at zero is hidden; a grey "?"
+// says a container's activity file (or the box list) could not be read.
+// Fetched on the rail's reachability poll (PROBE_INTERVAL_MS) from the
+// session-gated /broker/activity; a 401 or any failure shows no boxes and
+// starts no login. The last answer is kept so a rail rebuild repaints at once.
+const ACTIVITY_KINDS = [
+    ["working", "activity-working", "working"],
+    ["waiting", "activity-waiting", "waiting"],
+    ["subagents", "activity-subagents", "subagents running"],
+];
+
+async function fetchProjectActivity() {
+    if (!state.vault || state.vault.projects.length === 0) return;
+    const names = state.vault.projects.map((p) => p.name).join(",");
+    let result = null;
+    try {
+        const res = await fetch(`/broker/activity?names=${encodeURIComponent(names)}`,
+                                { credentials: "same-origin" });
+        if (res.ok) {
+            const body = await res.json();
+            if (body && body.ok && body.result && typeof body.result === "object") {
+                result = body.result;
+            }
+        }
+    } catch (_) {
+        result = null;
+    }
+    state.activity = result;
+    paintActivityBoxes();
+}
+
+function activityWho(who) {
+    return who === "agent" ? "agent" : `box ${who}`;
+}
+
+function activityTotals(entry) {
+    const t = { working: 0, waiting: 0, subagents: 0 };
+    const parts = [];
+    for (const c of (entry && Array.isArray(entry.containers)) ? entry.containers : []) {
+        const bits = [];
+        for (const [k, , word] of ACTIVITY_KINDS) {
+            const n = Number.isInteger(c[k]) && c[k] > 0 ? c[k] : 0;
+            t[k] += n;
+            if (n) bits.push(`${n} ${word}`);
+        }
+        if (bits.length) parts.push(`${activityWho(c.who)}: ${bits.join(", ")}`);
+    }
+    const errors = [];
+    for (const e of (entry && Array.isArray(entry.errors)) ? entry.errors : []) {
+        errors.push(e.what === "boxes"
+            ? "the project's box list (/workspace/.orchestrator/extensions.json) could not be read"
+            : `the activity file of the ${activityWho(e.who)} (/workspace/.rs/activity.json) could not be read`);
+    }
+    return { t, parts, errors };
+}
+
+function paintActivityBoxes() {
+    const data = state.activity;
+    for (const holder of document.querySelectorAll(".project-rail .activity-boxes")) {
+        const row = holder.closest(".project");
+        const name = row && row.dataset.name;
+        holder.replaceChildren();
+        holder.removeAttribute("title");
+        const entry = data && name ? data[name] : null;
+        if (!entry || entry.skip || entry.error) continue;
+        // a start/stop/update in flight: its container's file may still hold
+        // the previous run's counts until the start's reset
+        if (lifecycleInFlight.has(name)) continue;
+        const { t, parts, errors } = activityTotals(entry);
+        for (const [k, cls] of ACTIVITY_KINDS) {
+            if (t[k] > 0) holder.appendChild(el("span", { class: `activity-box ${cls}` }, [String(t[k])]));
+        }
+        if (errors.length) holder.appendChild(el("span", { class: "activity-box activity-unknown" }, ["?"]));
+        const title = [...parts, ...errors].join(" · ");
+        if (title) holder.title = title;
+    }
+}
+
 function formatBytes(n) {
     if (n < 1024) return `${n} B`;
     const units = ["kB", "MB", "GB", "TB"];
@@ -11699,6 +11787,7 @@ function lockVault() {
     if (state.probeTimer) { clearInterval(state.probeTimer); state.probeTimer = null; }
     if (state.servicesTimer) { clearInterval(state.servicesTimer); state.servicesTimer = null; }
     if (state.hostStatsTimer) { clearInterval(state.hostStatsTimer); state.hostStatsTimer = null; }
+    state.activity = null;
     state.hostStats = null;
     state.hostCpuSamples = [];
     state.brokerStale = false;

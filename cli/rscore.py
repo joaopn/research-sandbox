@@ -6226,6 +6226,8 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         box_new = [a for a in agents_added if a != DEFAULT_AGENT]
         if box_new:
             _status_bar_into_boxes(container, workspace_path, refreshed, box_new, progress)
+            # the activity recorder (#560) into the same agents, whatever the bar
+            _activity_into_boxes(container, workspace_path, refreshed, box_new, progress)
         # RS's skills into the agents' homes after the agent copy (an agent
         # just added gets them, in the project agent and every box), once the
         # project's own folders were checked for the files RS used to write
@@ -13093,7 +13095,7 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
     # restored setting never names a missing script.
     bar = (_apply_status_bar(project, container, workspace_path, agents, progress=progress)
            if home_ready else
-           ([] if _stage_status_bar(container)
+           ([] if _stage_status_bar(container) and _activity_reset(container)
             else [OldInstructions("status-bar", project, reason=STATUS_BAR_NOT_STAGED)]))
     if found is not None:
         found += bar
@@ -17009,7 +17011,9 @@ STATUS_BAR_DIR = "/usr/local/lib/rs"
 STATUS_BAR_CLAUDE = f"{STATUS_BAR_DIR}/rs-statusbar.py"
 STATUS_BAR_PI = f"{STATUS_BAR_DIR}/rs-statusbar.ts"
 # (file, mode): the Claude script is the command Claude runs; pi reads its file.
-STATUS_BAR_FILES = (("rs-statusbar.py", 0o755), ("rs-statusbar.ts", 0o644))
+STATUS_BAR_FILES = (("rs-statusbar.py", 0o755), ("rs-statusbar.ts", 0o644),
+                    # the activity recorder travels with the status bar (#560)
+                    ("rs-activity.py", 0o755), ("rs-activity.ts", 0o644))
 STATUS_BAR_AGENTS = ("claude", "pi")
 # Claude Code reruns the command on its own events; the refresh keeps the cache
 # countdown moving while the agent is idle. The countdown shows whole minutes,
@@ -17163,6 +17167,21 @@ def _apply_status_bar(project: str, container: str, workspace_path: "Path",
                       local: "Sequence[str]", *, owe: "Sequence[str]" = (),
                       boxes: bool = False, home: str = _AGENT_HOME,
                       progress=None) -> "list[OldInstructions]":
+    """The status bar (_apply_status_bar_files), then, when its files are in
+    the container, the activity recorder into the same agents (_apply_activity,
+    #560): the two share the staged files and every deploy point."""
+    items = _apply_status_bar_files(project, container, workspace_path, local, owe=owe,
+                                    boxes=boxes, home=home, progress=progress)
+    if not items:
+        _apply_activity(container, workspace_path, local, owe=owe, home=home,
+                        progress=progress)
+    return items
+
+
+def _apply_status_bar_files(project: str, container: str, workspace_path: "Path",
+                            local: "Sequence[str]", *, owe: "Sequence[str]" = (),
+                            boxes: bool = False, home: str = _AGENT_HOME,
+                            progress=None) -> "list[OldInstructions]":
     """At every deploy of a RUNNING project container's agents (create, every
     start, a live agent add): stage the files, write the recorded choice into
     each agent that still owes it, and rewrite pi's file with the current code
@@ -17204,6 +17223,222 @@ def _apply_status_bar(project: str, container: str, workspace_path: "Path",
     except Exception as e:     # never stop a start over the status bar
         _report_warnings([f"the status bar could not be applied ({e})"], progress)
     return []
+
+
+# ---------------------------------------------------------------------------
+# RS's activity recorder (#560): counts the container's interactive sessions
+# (working / waiting) and the subagents they run, for the webui's sidebar. Its
+# two files travel with the status bar's (STATUS_BAR_FILES). Claude Code calls
+# the recorder from hooks RS merges into its settings (matched by their exact
+# command; on the research supervisor the audit's Stop entry is REPLACED by a
+# wrapper that falls back to the audit when the recorder is missing); pi loads
+# rs-activity.ts from its extensions/. Written once per agent, like the status
+# bar (the record's `activity.pending` lists the agents still owed); every run
+# of the script also rewrites the container's summary (the reset at a start).
+# ---------------------------------------------------------------------------
+ACTIVITY_RECORDER = f"{STATUS_BAR_DIR}/rs-activity.py"
+ACTIVITY_PI = f"{STATUS_BAR_DIR}/rs-activity.ts"
+ACTIVITY_HOOK_CMD = f"{ACTIVITY_RECORDER} hook"
+ACTIVITY_AUDIT = f"{RS_LIB_DIR}/rs-audit-stop"
+ACTIVITY_AUDIT_WRAP = (f"sh -c '[ -x {ACTIVITY_RECORDER} ] && exec {ACTIVITY_RECORDER} "
+                       f"stop-audit || exec {ACTIVITY_AUDIT}'")
+ACTIVITY_EVENTS = ("SessionStart UserPromptSubmit Stop StopFailure SubagentStart "
+                   "SubagentStop SessionEnd")
+ACTIVITY_AGENTS = STATUS_BAR_AGENTS
+# Merge RS's hook entries into Claude's settings: one entry per event naming
+# the recorder, unless one is there; on the Stop event an audit entry is turned
+# into the wrapper and no plain entry sits beside it (it would count twice). A
+# `hooks` that is not an object, or an event that is not a list, is an error
+# (the file is left as it is and the agent stays owed), never replaced.
+ACTIVITY_CLAUDE_JQ = (
+    'def has_cmd($c): any(.[]?; (.hooks // []) | any(.[]?; .command == $c));'
+    ' .hooks = (if .hooks == null then {} elif (.hooks | type) == "object" then .hooks'
+    ' else error("hooks is not an object") end)'
+    ' | reduce ($evs | split(" ")[]) as $e (.;'
+    ' .hooks[$e] = (if .hooks[$e] == null then [] elif (.hooks[$e] | type) == "array"'
+    ' then .hooks[$e] else error("a hook event is not a list") end)'
+    ' | if $e == "Stop" and (.hooks.Stop | has_cmd($audit) or has_cmd($wrap)) then'
+    ' .hooks.Stop |= (map(if (.hooks | type) == "array" then .hooks |= map(if .command == $audit'
+    ' then .command = $wrap else . end) else . end)'
+    ' | map(if (.hooks | type) == "array" and any(.hooks[]; .command == $cmd)'
+    ' then .hooks |= map(select(.command != $cmd)) else . end)'
+    ' | map(select(.hooks != [])))'
+    ' elif (.hooks[$e] | has_cmd($cmd)) then .'
+    ' else .hooks[$e] += [{"hooks": [{"type": "command", "command": $cmd}]}] end)')
+ACTIVITY_CLAUDE_STATE_JQ = (
+    'def has_cmd($c): any(.[]?; (.hooks // []) | any(.[]?; .command == $c));'
+    ' [($evs | split(" ")[]) as $e | ((if (.hooks | type) == "object" then .hooks[$e]'
+    ' else null end) // []) | if type == "array" then (has_cmd($cmd) or ($e == "Stop"'
+    ' and has_cmd($wrap))) else false end] | if all then "on" else "off" end')
+# One script for both agents, run as the agent user with HOME set: $1 "on"
+# (write into the agents listed) or "refresh" (pi's file rewritten where it is
+# there; Claude's state only read), then the agents. Prints `<agent>=<state>`:
+# on, off, absent or failed. Then rewrites the container's summary (records
+# of processes that are gone dropped). MIRRORED byte for byte by
+# cli/rs_sandbox.py (BOX_ACTIVITY_SCRIPT, pinned).
+_ACTIVITY_JQ_ARGS = (f'--arg cmd "{ACTIVITY_HOOK_CMD}" --arg audit {ACTIVITY_AUDIT} '
+                     f'--arg wrap "{ACTIVITY_AUDIT_WRAP}" --arg evs "{ACTIVITY_EVENTS}"')
+ACTIVITY_SCRIPT = (
+    'op="$1"; shift\n'
+    'cs="$HOME/.claude/settings.json"; pd="$HOME/.local/share/pi-agent/agent"\n'
+    'pf="$pd/extensions/rs-activity.ts"\n'
+    'for a in "$@"; do\n'
+    'if [ "$a" = claude ]; then\n'
+    '  [ -f "$cs" ] || { echo claude=absent; continue; }\n'
+    '  if [ "$op" = on ]; then\n'
+    f'    if [ "$(wc -c < "$cs")" -le {AGENT_SETTINGS_MAX_BYTES} ] && jq {_ACTIVITY_JQ_ARGS} '
+    f"'{ACTIVITY_CLAUDE_JQ}' \"$cs\" > \"$cs.rs-tmp\" && [ -s \"$cs.rs-tmp\" ] "
+    '&& mv "$cs.rs-tmp" "$cs"; then :; else rm -f "$cs.rs-tmp"; echo claude=failed; continue; fi\n'
+    '  fi\n'
+    f'  s=$(head -c {AGENT_SETTINGS_MAX_BYTES} "$cs" | jq -r {_ACTIVITY_JQ_ARGS} '
+    f"'{ACTIVITY_CLAUDE_STATE_JQ}' 2>/dev/null) || s=failed\n"
+    '  echo "claude=${s:-failed}"\n'
+    'elif [ "$a" = pi ]; then\n'
+    '  [ -f "$pd/settings.json" ] || { echo pi=absent; continue; }\n'
+    '  w=no\n'
+    '  if [ "$op" = on ]; then w=yes; fi\n'
+    '  if [ "$op" = refresh ] && [ -f "$pf" ] && [ ! -L "$pf" ]; then w=yes; fi\n'
+    '  if [ "$w" = yes ]; then\n'
+    f'    if rm -f "$pf.rs-tmp" && mkdir -p "$pd/extensions" && cp {ACTIVITY_PI} "$pf.rs-tmp" '
+    '&& mv -f "$pf.rs-tmp" "$pf"; then :; else rm -f "$pf.rs-tmp"; echo pi=failed; continue; fi\n'
+    '  fi\n'
+    '  if [ -f "$pf" ]; then echo pi=on; else echo pi=off; fi\n'
+    'fi\n'
+    'done\n'
+    f'if [ -x {ACTIVITY_RECORDER} ]; then {ACTIVITY_RECORDER} reset >/dev/null 2>&1; fi\n'
+    ':\n')
+ACTIVITY_STATES = ("on", "off", "absent", "failed")
+ACTIVITY_NOT_WRITTEN = (
+    "the activity counts could not be set up for {who}; they are set up at the "
+    "project's next start")
+
+
+def _activity_exec(container: str, op: str, agents: "Sequence[str]",
+                   home: str = _AGENT_HOME) -> "dict[str, str]":
+    """Run ACTIVITY_SCRIPT in a RUNNING container as the agent user: {agent:
+    state} for `agents` (an agent the script did not answer for reads
+    "failed"). With no agents it only rewrites the summary. Never raises."""
+    agents = [a for a in agents if a in ACTIVITY_AGENTS]
+    try:
+        r = run(["docker", "exec", "-u", "1000", "-e", f"HOME={home}", container,
+                 "sh", "-c", ACTIVITY_SCRIPT, "sh", op, *agents],
+                capture_output=True, timeout=AGENT_SETTINGS_EXEC_TIMEOUT_S)
+        out = r.stdout or ""
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        out = ""
+    got: dict[str, str] = {}
+    for line in out.splitlines():
+        a, sep, v = line.strip().partition("=")
+        if sep and a in agents and v in ACTIVITY_STATES and a not in got:
+            got[a] = v
+    return {a: got.get(a, "failed") for a in agents}
+
+
+def _activity_reset(container: str) -> bool:
+    """Rewrite the container's summary only (a start whose agents' homes are
+    not ready: the hooks stay owed, the previous run's counts must not show).
+    Always True: the reset is best-effort and reports nothing."""
+    _activity_exec(container, "refresh", [])
+    return True
+
+
+ACTIVITY_BOX_ADDED_NOT_WRITTEN = (
+    "the agent just added is not counted in the sidebar yet; it is at the "
+    "project's next start")
+
+
+def _activity_into_boxes(container: str, workspace_path: "Path", boxes: "Sequence[str]",
+                         agents: "Sequence[str]", progress=None) -> None:
+    """After a live Add copied `agents` into the running boxes (`boxes`: their
+    CONTAINER names): write the activity recorder into those agents in each
+    agent box, through the box tool (whatever the box's status bar).
+    Warnings only (the Add itself is done)."""
+    agents = [a for a in agents if a in ACTIVITY_AGENTS]
+    if not agents or not boxes:
+        return
+    try:
+        entries = extension.load(workspace_path)
+    except (OSError, ValueError, RecursionError):
+        entries = {}
+    if not isinstance(entries, dict):
+        entries = {}
+    by_container = {extension.container_name(n): n for n in entries
+                    if isinstance(n, str) and _BOX_NAME_RE.match(n)}
+    for cname in boxes:
+        name = by_container.get(cname)
+        e = entries.get(name) if name else None
+        if not isinstance(e, dict) or e.get("agent", "none") == "none":
+            continue
+        try:
+            r = run(["docker", "exec", container, "rs-sandbox", "activity", name,
+                     f"--agents={','.join(agents)}"], capture_output=True)
+        except (OSError, UnicodeDecodeError):
+            r = None
+        if r is None or r.returncode != 0:
+            _report_warnings([f"box {name!r}: " + ACTIVITY_BOX_ADDED_NOT_WRITTEN], progress)
+
+
+def _activity_record(data: dict) -> "list[str]":
+    """The agents still owed the hooks. A record from before the recorder owes
+    every agent, once."""
+    blk = data.get("activity")
+    if not isinstance(blk, dict):
+        return list(ACTIVITY_AGENTS)
+    pend = blk.get("pending")
+    return ([a for a in dict.fromkeys(pend) if a in ACTIVITY_AGENTS]
+            if isinstance(pend, list) else [])
+
+
+def _apply_activity(container: str, workspace_path: "Path", local: "Sequence[str]", *,
+                    owe: "Sequence[str]" = (), home: str = _AGENT_HOME,
+                    progress=None) -> None:
+    """At every deploy of a RUNNING project container's agents (the status
+    bar's points; its files are staged): write the hooks into each agent that
+    still owes them, rewrite pi's file where it is there, and rewrite the
+    container's summary (the reset at a start). Warnings only; never raises."""
+    local = [a for a in local if a in ACTIVITY_AGENTS]
+    try:
+        # A container from before RS's helper layout keeps the research audit
+        # elsewhere, so its Stop hook could not be wrapped: nothing is written,
+        # every agent stays owed (one just added joins them) until the stop and
+        # start the operation's end already asks for. The summary is still
+        # reset: the recorder is RS's own staged file, no helper.
+        if not _rs_commands_ok(container, "skip", "the activity counts"):
+            _activity_exec(container, "refresh", [], home)
+            added = [a for a in owe if a in ACTIVITY_AGENTS]
+            if added and _read_marker_dict(workspace_path):
+                def keep_owed(d: dict) -> None:
+                    d["activity"] = {"pending": sorted(set([*_activity_record(d), *added]))}
+                _marker_rmw(workspace_path, keep_owed, "record the activity counts")
+            return
+        if not local:
+            # no agent here (its boxes may run some): the summary is still
+            # reset, so a previous run's counts never show for this one
+            _activity_exec(container, "refresh", [], home)
+            return
+        data = _read_marker_dict(workspace_path)
+        if not data:
+            return
+        fresh = not isinstance(data.get("activity"), dict)
+        pending = list(dict.fromkeys([*_activity_record(data),
+                                      *(a for a in owe if a in ACTIVITY_AGENTS)]))
+        owed = [a for a in local if a in pending]
+        rest = [a for a in local if a not in owed]
+        states = _activity_exec(container, "on", owed, home) if owed else {}
+        if rest or not owed:
+            states.update(_activity_exec(container, "refresh", rest, home))
+        done = {a for a in owed if states.get(a) in ("on", "off")}
+        _report_warnings([ACTIVITY_NOT_WRITTEN.format(who=_who(a))
+                          for a in owed if states.get(a) == "failed"], progress)
+        if not fresh and not done and not owe:
+            return
+
+        def mutate(d: dict) -> None:
+            cur = [*_activity_record(d), *(a for a in owe if a in ACTIVITY_AGENTS)]
+            d["activity"] = {"pending": sorted(set(a for a in cur if a not in done))}
+        _marker_rmw(workspace_path, mutate, "record the activity counts")
+    except Exception as e:     # never stop a start over the activity counts
+        _report_warnings([f"the activity counts could not be set up ({e})"], progress)
 
 
 def _status_bar_toggle(project: str, container: str, workspace_path: "Path",

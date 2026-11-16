@@ -32,6 +32,13 @@
     --type-research-border: #2e7d32;
     --type-sandbox-border: #17a2b8;
     --type-box-border: #8a8a8a;   /* neutral grey = bare box (empty / BYO) */
+    /* Activity boxes in the rail (#560): solid fills with white digits, the
+       same in every theme, like the type-badge borders. */
+    --activity-working: #2e7d32;     /* green = sessions working */
+    --activity-waiting: #b7791f;     /* amber = sessions waiting for the user */
+    --activity-subagents: #1f6feb;   /* blue = subagents running */
+    --activity-unknown: #6e6e6e;     /* grey = a file that could not be read */
+    --activity-fg: #ffffff;
     --type-store-border: #a371f7; /* violet = imported-repo store workflow */
     /* service-tab type borders (the strip's color code, top edge) — hues
        reuse the badge palette above so the UI stays one palette */
@@ -1631,6 +1638,28 @@ html.mobile .project-rail .rail-separator { cursor: default; }
     color: var(--fg-base);
 }
 .type-badge:empty { display: none; }
+/* The rail's activity boxes (#560), after the type badge. */
+.activity-boxes { display: inline-flex; gap: 3px; flex: none; }
+.activity-boxes:empty { display: none; }
+/* Counts show only on a project the reachability probe found up: a container
+   stop reports nothing, so its file keeps the last run's numbers, and a row
+   rebuilt from scratch has no probe answer yet. */
+.project:not(.up) .activity-boxes { display: none; }
+.activity-box {
+    display: inline-block;
+    min-width: 15px;
+    padding: 0 3px;
+    border-radius: 3px;
+    font-size: 10px;
+    line-height: 15px;
+    text-align: center;
+    font-weight: 600;
+    color: var(--activity-fg);
+}
+.activity-box.activity-working { background: var(--activity-working); }
+.activity-box.activity-waiting { background: var(--activity-waiting); }
+.activity-box.activity-subagents { background: var(--activity-subagents); }
+.activity-box.activity-unknown { background: var(--activity-unknown); }
 .type-badge.type-research { border-color: var(--type-research-border); }
 .type-badge.type-sandbox { border-color: var(--type-sandbox-border); }
 .type-badge.type-box { border-color: var(--type-box-border); }
