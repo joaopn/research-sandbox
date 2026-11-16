@@ -7,7 +7,8 @@ Staged into rs-fetch surfaces beside rs-fetch. Run by hand:
     rs-sync <gitea owner>/<repo> <github owner>/<repo> --apply    # do it
     rs-sync <gitea owner>/<repo> <github owner>/<repo> --remove [--apply]
 
---skip wiki and --skip board leave a part out; --wiki-overwrite lets a run
+Every run ends with a plain summary; --report adds the full report as JSON,
+for pasting back to the agent. --skip wiki and --skip board leave a part out; --wiki-overwrite lets a run
 commit (or a remove force-push) past edits made on the GitHub wiki.
 
 What goes over, one way (Gitea -> GitHub):
@@ -948,6 +949,9 @@ class GitHub:
         while True:
             if write:
                 self._pace()
+                # Counted before the send: a count of requests that left
+                # rs-sync, so 0 means nothing reached GitHub (the summary).
+                REPORT["writes_sent"] = REPORT.get("writes_sent", 0) + 1
             hdr = {"Authorization": f"token {self.token}",
                    "Accept": accept or "application/vnd.github+json",
                    "User-Agent": "rs-sync"}
@@ -963,7 +967,7 @@ class GitHub:
                     status = r.status
             except HTTPError as e:
                 headers = e.headers
-                text = e.read().decode("utf-8", "replace")[:300]
+                text = e.read().decode("utf-8", "replace")
                 limited = e.code == 429 or (e.code == 403 and (
                     "rate limit" in text.lower()
                     or headers.get("x-ratelimit-remaining") == "0"
@@ -982,8 +986,8 @@ class GitHub:
                     return e.code, None, headers
                 if write:
                     self.writes.append(time.time())
-                raise SyncError(f"GitHub {method} {path} -> HTTP {e.code}: "
-                                f"{_safe(text, self.token)}", status=e.code)
+                raise SyncError(f"GitHub {method} {path} answered HTTP {e.code}: "
+                                f"{_gh_error_text(text, self.token)}", status=e.code)
             except (URLError, OSError) as e:
                 die(f"GitHub did not answer ({method} {path}: "
                     f"{getattr(e, 'reason', e)})")
@@ -1019,7 +1023,8 @@ class GitHub:
                               {"query": query, "variables": variables},
                               write=query.lstrip().startswith("mutation"))
         if not isinstance(out, dict) or out.get("errors"):
-            die(f"GitHub GraphQL failed: {_safe(json.dumps((out or {}).get('errors'))[:300], self.token)}")
+            errs = out.get("errors") if isinstance(out, dict) else "the answer was not a JSON object"
+            die(f"GitHub GraphQL failed: {_gh_error_text(json.dumps({'errors': errs}), self.token)}")
         return out.get("data")
 
 
@@ -1047,6 +1052,46 @@ def _safe(text: str, *secrets) -> str:
         if s:
             text = text.replace(s, "***")
     return text
+
+
+# The longest GitHub error text an error line carries. GitHub's own JSON
+# errors are a sentence or two; a proxy's HTML error page runs to kilobytes,
+# and 300 characters keep its first line or two without flooding the terminal.
+ERROR_TEXT_MAX = 300
+
+
+def _gh_errors(errs) -> str:
+    """GitHub's `errors` list (REST validation entries, GraphQL errors, an
+    import's errors) as one line: each entry's field, code and message."""
+    if not isinstance(errs, list):
+        return "" if errs is None else str(errs)
+    out = []
+    for e in errs:
+        if isinstance(e, dict):
+            field = e.get("field") or e.get("resource") or ""
+            words = [str(e[k]) for k in ("code", "message") if e.get(k)]
+            out.append((f"{field}: " if field else "") + " ".join(words))
+        else:
+            out.append(str(e))
+    return "; ".join(x for x in out if x)
+
+
+def _gh_error_text(raw: str, *secrets) -> str:
+    """A readable GitHub error: the JSON body's message plus its `errors`
+    entries (a 422's message alone is only "Validation Failed"); any other
+    body as it is. Parsed before it is cut, redacted, then cut."""
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        body = None
+    if isinstance(body, dict) and (body.get("message") or body.get("errors")):
+        msg = str(body.get("message") or "").strip()
+        details = _gh_errors(body.get("errors"))
+        text = f"{msg} ({details})" if msg and details else (msg or details)
+    else:
+        text = raw.strip()
+    text = _safe(text, *secrets)
+    return text if len(text) <= ERROR_TEXT_MAX else text[:ERROR_TEXT_MAX - 1] + "…"
 
 
 # ============================================================================
@@ -1421,7 +1466,9 @@ def do_import(gh: GitHub, target, payload, n_gitea) -> int:
             return n
         if status == "failed":
             REPORT.pop("importing", None)
-            die(f"{what}: GitHub's import failed: {json.dumps(st.get('errors'))[:300]}")
+            why = _gh_error_text(json.dumps({"errors": st.get("errors")}), gh.token) \
+                if st.get("errors") else "GitHub gave no reason"
+            die(f"{what}: GitHub's import failed: {why}")
         if polls == 2:
             print(f"  waiting for GitHub to import {what}…", file=sys.stderr)
         time.sleep(0.05 if _TEST_FAST else IMPORT_POLL_S)
@@ -1475,6 +1522,12 @@ def build_subjects_index(gh: GitHub, target, bases) -> dict:
     return idx
 
 
+def _item_kinds(items) -> dict:
+    return {"issues_open": sum(1 for i in items if not i["pr"] and not i["closed"]),
+            "issues_closed": sum(1 for i in items if not i["pr"] and i["closed"]),
+            "prs": sum(1 for i in items if i["pr"])}
+
+
 def sync(args, env) -> None:
     owner, repo = parse_repo_arg(args.gitea, "the Gitea repo")
     target = "/".join(parse_repo_arg(args.github, "the GitHub repo"))
@@ -1508,6 +1561,10 @@ def sync(args, env) -> None:
     REPORT["held_open_issues"] = sorted(
         i["number"] for i in gt["issues"]
         if i.get("state") == "open" and i["number"] not in {x["n"] for x in items})
+    # For the summary: what is (or will be) on GitHub, and who can see it.
+    REPORT["github"]["private"] = bool(repo_info.get("private"))
+    REPORT["hold"] = env["RS_SYNC_HOLD_LABELS"]
+    REPORT["items"] = _item_kinds(items)
 
     table = {n: v["number"] for n, v in have["items"].items()}
     ctx = Ctx(owner, repo, target, table)
@@ -1521,6 +1578,14 @@ def sync(args, env) -> None:
                 k = len(idx.get(subj) or [])
                 stats["linked" if k == 1 else "unlinked" if k == 0 else "ambiguous"] += 1
     REPORT["pr_commits"] = stats
+    missing_bases = set(REPORT.get("pr_bases_missing_on_github") or [])
+    per_base = {}
+    for it in items:
+        if it["pr"] and it.get("base") in missing_bases:
+            d = per_base.setdefault(it["base"], {"prs": 0, "unlinked": 0})
+            d["prs"] += 1
+            d["unlinked"] += len(it.get("subjects") or [])
+    REPORT["pr_bases_missing"] = per_base
 
     # Labels: every name in use must exist on GitHub, tagged; a same-named
     # label without the tag (compared ignoring case) is someone else's.
@@ -1563,6 +1628,7 @@ def sync(args, env) -> None:
     new_items = [it for it in items if it["n"] not in have["items"]]
     for it in new_items:
         plan["import"].append(it["n"])
+    REPORT["new_items"] = _item_kinds(new_items)
     writes_est = len(to_create) + 2 * len(new_items)
 
     if not apply:
@@ -1584,6 +1650,8 @@ def sync(args, env) -> None:
         REPORT["plan"] = {k: (v if len(v) <= 40 else v[:40] + [f"… {len(v) - 40} more"])
                           for k, v in plan.items()}
         REPORT["plan_counts"] = {k: len(v) for k, v in plan.items()}
+        # distinct issues per kind (a comment kind repeats its issue per comment)
+        REPORT["plan_issues"] = {k: len(set(v)) for k, v in plan.items()}
         REPORT["estimated_writes"] = writes_est
         REPORT["estimated_minutes"] = estimate_minutes(writes_est)
         REPORT["dry_run"] = True
@@ -2155,6 +2223,7 @@ def wiki_apply(state, ctx: Ctx, me, gh_token, secrets, dry):
     commit = cache.must(["commit-tree", tree, "-p", state["head"], "-F", "-"],
                         "writing the wiki commit", data=msg.encode(),
                         extra_env=ident).decode().strip()
+    REPORT["writes_sent"] = REPORT.get("writes_sent", 0) + 1
     rc, _, err = cache.git(["push", "-q", state["url"], f"{commit}:refs/heads/{state['branch']}"],
                            token=gh_token, what="pushing the GitHub wiki")
     if rc:
@@ -2167,6 +2236,7 @@ def wiki_restore(state, gh_token):
     """Force the GitHub wiki back to the state before rs-sync's first commit,
     leased on the head that was checked."""
     cache = state["cache"]
+    REPORT["writes_sent"] = REPORT.get("writes_sent", 0) + 1
     rc, _, err = cache.git(["push", "-q",
                             f"--force-with-lease=refs/heads/{state['branch']}:{state['head']}",
                             state["url"], f"{state['parent']}:refs/heads/{state['branch']}"],
@@ -2428,7 +2498,7 @@ def board_apply(gh: GitHub, state, owner, repo, target, wanted_numbers, node_of,
 
     if no_columns:
         # The Gitea boards are gone: rs-sync's items go, as Gitea's cards did.
-        plan["skipped"] = "the fork has no open Gitea boards with columns; rs-sync's items are removed"
+        plan["skipped"] = "the fork has no open Gitea boards with columns"   # removals: plan["remove"]
         remove_unwanted(set())
         return
     if cur["desc"] != desc or bool(cur["public"]) != public:
@@ -2536,6 +2606,8 @@ def remove(args, env) -> None:
     gh = GitHub(GITHUB_API, env["RS_SYNC_GITHUB_TOKEN"])
     skip = set(args.skip or [])
     me, repo_info, _ = preflight_github(gh, target, board="board" not in skip)
+    REPORT["github"] = {"repo": target, "account": me.get("login"),
+                        "private": bool(repo_info.get("private"))}
     have = read_github(gh, target, me["id"], owner, repo, for_remove=True)
     wiki_state = None
     if "wiki" in skip:
@@ -2566,17 +2638,21 @@ def remove(args, env) -> None:
     if not args.apply:
         REPORT["dry_run"] = True
         return
-    deleted = []
+    # Each deletion is recorded as it happens, so a run that stops midway
+    # reports what is already gone.
+    rec = REPORT["remove"]
+    rec["deleted"], rec["projects_deleted"], rec["labels_deleted"] = [], [], []
     for v in doomed:
         delete_issue(gh, v["node_id"])
-        deleted.append(v["number"])
+        rec["deleted"].append(v["number"])
     for p in projects:
         gh.graphql(M_DELETE_PROJECT, {"p": p["id"]})
+        rec["projects_deleted"].append(p.get("number"))
     if wiki_state:
         wiki_restore(wiki_state, env["RS_SYNC_GITHUB_TOKEN"])
     for l in labels:
         gh.call("DELETE", f"{base}/labels/{quote(l['name'], safe='')}")
-    REPORT["remove"]["deleted"] = deleted
+        rec["labels_deleted"].append(l["name"])
     REPORT["dry_run"] = False
 
 
@@ -2588,6 +2664,349 @@ def print_report():
     print("===== PASTE FROM HERE =====")
     print(json.dumps(REPORT, indent=1, sort_keys=True, default=str))
     print("===== TO HERE =====")
+
+
+def _ranges(nums) -> str:
+    """GitHub numbers as compact ranges: #3, #10-#14."""
+    nums = sorted({n for n in nums if isinstance(n, int)})
+    out, i = [], 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        out.append(f"#{nums[i]}" if i == j else f"#{nums[i]}-#{nums[j]}")
+        i = j + 1
+    return ", ".join(out)
+
+
+def _plural(n, one, many=None) -> str:
+    return f"{n} {one if n == 1 else (many or one + 's')}"
+
+
+def _duration(seconds) -> str:
+    s = int(round(seconds or 0))
+    if s < 60:
+        return f"{s} s"
+    m = (s + 30) // 60
+    if m < 60:
+        return f"{m} min"
+    return f"{m // 60} h" + (f" {m % 60} min" if m % 60 else "")
+
+
+def _projects(nums) -> str:
+    nums = [n for n in nums or [] if isinstance(n, int)]
+    return f"the GitHub project{'s' if len(nums) > 1 else ''} ({_ranges(nums)})" if nums \
+        else "the GitHub project"
+
+
+def _board_skip(b) -> list:
+    """The board left out (and nothing of it to remove)."""
+    if isinstance(b, dict) and b.get("skipped") and not b.get("remove"):
+        return [f"Board: skipped ({b['skipped']})"]
+    return []
+
+
+def _board_lines(b, past: bool = False) -> list:
+    """What the board step does (or did, `past`), from its counts: exact
+    after a successful run, filled before their writes, so never shown after
+    an error. Nothing when it has nothing to do or was left out."""
+    if not isinstance(b, dict) or _board_skip(b):
+        return []
+    v = (lambda now, did: did if past else now)
+    parts = []
+    if b.get("create_project"):
+        parts.append(f"{v('create', 'created')} the GitHub project with its "
+                     f"{_plural(b.get('fields', 0), 'field')}")
+    elif b.get("fields"):
+        parts.append(f"{v('update', 'updated')} {_plural(b['fields'], 'field')}")
+    if b.get("project_settings"):
+        parts.append(f"{v('update', 'updated')} the project's settings")
+    place = b.get("add", 0) + b.get("after_import", 0)
+    if place:
+        parts.append(f"{v('place', 'placed')} {_plural(place, 'issue')} on it")
+    if b.get("set") and not place:
+        parts.append(f"{v('set', 'set')} {_plural(b['set'], 'value')}")
+    if b.get("remove"):
+        why = " (the fork has no open Gitea boards with columns)" if b.get("skipped") else ""
+        parts.append(f"{v('remove', 'removed')} {_plural(b['remove'], 'item')}{why}")
+    if b.get("move"):
+        parts.append(f"{v('reorder', 'reordered')} {_plural(b['move'], 'item')}")
+    return ["Board: " + ", then ".join(parts)] if parts else []
+
+
+def _wiki_skip(w) -> list:
+    if isinstance(w, dict) and w.get("skipped"):
+        return [f"Wiki: skipped ({w['skipped']})"]
+    return []
+
+
+def _wiki_lines(w, dry: bool) -> list:
+    """What the wiki step does or did; nothing when it has nothing to do or
+    was left out."""
+    if not isinstance(w, dict) or w.get("skipped"):
+        return []
+    if "restore_to" in w:
+        verb = "restored" if w.get("restored") else "restore"
+        return [f"Wiki: {verb} to {w['restore_to']} (before rs-sync's "
+                f"{_plural(w.get('rs_sync_commits', 0), 'commit')})"]
+    if not w.get("changed"):
+        return []
+    what = f"{_plural(w.get('pages', 0), 'page')} and {_plural(w.get('files', 0), 'other file')}"
+    if dry:
+        return [f"Wiki: one commit ({what})"]
+    if w.get("commit"):
+        return [f"Wiki: committed {w['commit']} ({what})"]
+    return []
+
+
+def _checks(r: dict, dry: bool) -> list:
+    """What the maintainer should look at, what becomes visible first. After
+    an error nothing is claimed about what was published: the run did not
+    finish."""
+    out = []
+    new = r.get("new_items") or {}
+    private = (r.get("github") or {}).get("private")
+    held = len(r.get("held_open_issues") or [])
+    hold = f"RS_SYNC_HOLD_LABELS={r.get('hold') or '(empty: holds nothing)'}"
+    if (new.get("issues_open") or held) and not r.get("error"):
+        seen = "visible to the repo's collaborators" if private else "public"
+        if dry:
+            out.append(f"Open issues: {new.get('issues_open', 0)} will be {seen}, "
+                       f"{held} held back ({hold})")
+        else:
+            out.append(f"Open issues: {new.get('issues_open', 0)} made {seen} by this run, "
+                       f"{held} held back ({hold})")
+    pc = r.get("pr_commits") or {}
+    missing = r.get("pr_bases_missing") or {}
+    def be(n):  # "will be" is also true of the next run after an error: nothing is claimed done
+        return "will be" if dry or r.get("error") else ("is" if n == 1 else "are")
+    if pc.get("unlinked"):
+        line = (f"{_plural(pc['unlinked'], 'commit')} {be(pc['unlinked'])} listed without a link "
+                f"to a GitHub commit")
+        if missing:
+            line += ("; PRs were merged into branches that do not exist on GitHub: "
+                     + ", ".join(f"{b} ({_plural(d['prs'], 'PR')}, {_plural(d['unlinked'], 'commit')})"
+                                 for b, d in sorted(missing.items())))
+        out.append(line)
+    if pc.get("ambiguous"):
+        out.append(f"{_plural(pc['ambiguous'], 'commit')} {be(pc['ambiguous'])} listed without a link "
+                   f"(more than one GitHub commit matches)")
+    if r.get("label_descriptions_cut"):
+        out.append(f"{_plural(r['label_descriptions_cut'], 'label description')} cut to "
+                   f"GitHub's length limit")
+    w = r.get("wiki") or {}
+    if w.get("github_edits_overwritten") and (w.get("changed") or "restore_to" in w):
+        done_ = w.get("commit") or w.get("restored")
+        k = w["github_edits_overwritten"]
+        past = "was" if k == 1 else "were"
+        out.append(f"{_plural(k, 'edit')} made on the GitHub wiki "
+                   f"{past if done_ else 'will be'} overwritten (--wiki-overwrite)")
+    if r.get("wiki_entries_skipped"):
+        out.append(f"Wiki entries left out (not files): {', '.join(r['wiki_entries_skipped'])}")
+    if r.get("wiki_pages_not_text"):
+        k = r["wiki_pages_not_text"]
+        out.append(f"{_plural(k, 'wiki page')} not UTF-8 text: copied as "
+                   f"{'it is' if k == 1 else 'they are'}, references not converted")
+    if r.get("not_deleted_unverifiable"):
+        k = len(r["not_deleted_unverifiable"])
+        out.append(f"Not deleted, because Gitea could not confirm "
+                   f"{'it is' if k == 1 else 'they are'} gone: "
+                   + ", ".join(r["not_deleted_unverifiable"]))
+    return out
+
+
+_UPDATE_KINDS = [  # (plan key, done key, one, many)
+    ("edit", "edited", "issue edited", "issues edited"),
+    ("comment_new", "comments_posted", "new comment", "new comments"),
+    ("comment_edit", "comments_edited", "comment edited", "comments edited"),
+    ("comment_delete", "comments_deleted", "comment deleted", "comments deleted"),
+    ("state", "closed_or_reopened", "issue closed or reopened", "issues closed or reopened"),
+    ("labels", "relabelled", "issue relabelled", "issues relabelled"),
+    ("lock", "locked", "issue locked", "issues locked"),
+    ("delete", "deleted", "issue deleted (its Gitea item is gone)",
+     "issues deleted (their Gitea items are gone)"),
+]
+
+
+def _new_items_line(k: dict, n: int) -> str:
+    parts = [p for p in (_plural(k.get("issues_closed", 0), "closed issue"),
+                         _plural(k.get("issues_open", 0), "open issue"),
+                         _plural(k.get("prs", 0), "merged-PR record"))
+             if not p.startswith("0 ")]
+    return f"{_plural(n, 'new issue')}: {', '.join(parts)}"
+
+
+def _done_lines(r: dict, after_error: bool) -> list:
+    """What the report records as written. After an error, only real writes:
+    the board's counts and a wiki that was not committed are left out."""
+    d = r.get("done") or {}
+    out = []
+    imp = d.get("imported") or {}
+    if imp:
+        out.append(f"{_plural(len(imp), 'issue')} imported (GitHub {_ranges(imp.values())})")
+    if d.get("labels_created"):
+        out.append(f"{_plural(len(d['labels_created']), 'label')} created: "
+                   f"{', '.join(d['labels_created'])}")
+    for _, key, one, many in _UPDATE_KINDS:
+        v = d.get(key)
+        n = len(v) if isinstance(v, list) else (v or 0)
+        if n:
+            out.append(f"{n} {one if n == 1 else many}")
+    w = r.get("wiki") or {}
+    if after_error:
+        if w.get("commit"):
+            out += _wiki_lines(w, dry=False)
+        return out
+    out += _board_lines(r.get("board"), past=True)
+    out += _wiki_lines(w, dry=False)
+    return out
+
+
+def _to_line(r: dict, dry: bool) -> list:
+    gh = r.get("github") or {}
+    if not gh:
+        return []
+    vis = "" if "private" not in gh else ("private" if gh["private"] else "public")
+    trusted = r.get("trusted")
+    there = None
+    if trusted is not None and r.get("command") != "remove":
+        # trusted is read at the run's start: say so once the run has written
+        when = "" if dry else " before this run"
+        there = (("nothing mirrored there yet" if dry else "nothing mirrored before this run")
+                 if not trusted else f"{_plural(len(trusted), 'item')} already mirrored{when}")
+    extra = "; ".join(x for x in (vis, there) if x)
+    return [f"To:   GitHub {gh.get('repo')}, as {gh.get('account')}" + (f" ({extra})" if extra else "")]
+
+
+def summary(r: dict) -> str:
+    """The run in plain words, from the report alone: where from, where to,
+    what to check, what was or would be written, and how it ended."""
+    L = []
+    remove = r.get("command") == "remove"
+    err = r.get("error")
+    dry = not r.get("apply")
+    if err:
+        L.append(f"rs-sync stopped: {err}")
+    elif remove and dry:
+        L.append("rs-sync remove, dry run: nothing was deleted. Run again with --apply to do it.")
+    elif remove:
+        L.append(f"rs-sync remove done in {_duration(r.get('seconds'))}.")
+    elif dry:
+        L.append("rs-sync dry run: nothing was written. Run again with --apply to do it.")
+    else:
+        L.append(f"rs-sync done in {_duration(r.get('seconds'))}.")
+    gi = r.get("gitea") or {}
+    head = []
+    if gi:
+        head.append(f"From: Gitea {gi.get('repo')} ({_plural(gi.get('issues', 0), 'issue')}, "
+                    f"{_plural(gi.get('merged_prs', 0), 'merged PR')})")
+    head += _to_line(r, dry)
+    if head:
+        L.append("")
+        L.extend(head)
+
+    def section(title, lines):
+        if lines:
+            L.append("")
+            L.append(title)
+            L.extend(f"  - {x}" for x in lines)
+
+    if remove:
+        rm = r.get("remove") or {}
+        skipped = _board_skip(r.get("board")) + _wiki_skip(r.get("wiki"))
+        section("Check before applying:" if dry and not err else "Note:",
+                [l for l in _checks(r, dry) if "GitHub wiki" in l])
+        if dry and not err:
+            would = []
+            if rm.get("issues"):
+                would.append(f"{_plural(len(rm['issues']), 'issue')} (GitHub {_ranges(rm['issues'])})")
+            if rm.get("labels"):
+                would.append(f"{_plural(len(rm['labels']), 'label')}: {', '.join(rm['labels'])}")
+            if rm.get("projects"):
+                would.append(_projects(rm["projects"]))
+            would += _wiki_lines(r.get("wiki"), dry=True)
+            section("Would delete:", would or ["nothing to delete"])
+            section("Left out:", skipped)
+            return "\n".join(L)
+        gone = []
+        if rm.get("deleted"):
+            gone.append(f"{_plural(len(rm['deleted']), 'issue')} (GitHub {_ranges(rm['deleted'])})")
+        if rm.get("projects_deleted"):
+            gone.append(_projects(rm["projects_deleted"]))
+        if rm.get("labels_deleted"):
+            gone.append(f"{_plural(len(rm['labels_deleted']), 'label')}: "
+                        f"{', '.join(rm['labels_deleted'])}")
+        if (r.get("wiki") or {}).get("restored"):
+            gone += _wiki_lines(r["wiki"], dry=False)
+        if err:
+            L.append("")
+            L.extend(_stopped_lines(r, gone, remove=True))
+        else:
+            section("Deleted:", gone or ["nothing to delete"])
+            section("Left out:", skipped)
+        return "\n".join(L)
+
+    section("Check before applying:" if dry and not err else "Note:", _checks(r, dry))
+    if err:
+        L.append("")
+        L.extend(_stopped_lines(r, _done_lines(r, after_error=True), remove=False))
+        return "\n".join(L)
+    skipped = _board_skip(r.get("board")) + _wiki_skip(r.get("wiki"))
+    if not dry:
+        section("Written:", _done_lines(r, after_error=False)
+                or ["nothing: " + ("the rest of " if skipped else "")
+                    + "GitHub was already level with Gitea"])
+        section("Left out:", skipped)
+        return "\n".join(L)
+    would = []
+    pc, pi = r.get("plan_counts") or {}, r.get("plan_issues") or {}
+    if pc.get("import"):
+        would.append(_new_items_line(r.get("new_items") or {}, pc["import"]))
+    if pc.get("create_labels"):
+        would.append(f"{_plural(pc['create_labels'], 'new label')}: "
+                     f"{', '.join((r.get('plan') or {}).get('create_labels') or [])}")
+    for key, _, one, many in _UPDATE_KINDS:
+        n = pc.get(key, 0)
+        if n:
+            line = f"{n} {one if n == 1 else many}"
+            if key.startswith("comment") and pi.get(key, n) != n:
+                line += f" on {_plural(pi[key], 'issue')}"
+            would.append(line)
+    would += _board_lines(r.get("board"))
+    would += _wiki_lines(r.get("wiki"), dry=True)
+    if not would:
+        L.append("")
+        L.append("The rest of GitHub is already level with Gitea; nothing else to write."
+                 if skipped else "GitHub is already level with Gitea; nothing to write.")
+        section("Left out:", skipped)
+        return "\n".join(L)
+    section("Would write:", would)
+    section("Left out:", skipped)
+    w = r.get("estimated_writes") or 0
+    if w:      # the wiki's one push is not in the estimate; a wiki-only run has none
+        m = r.get("estimated_minutes") or 0
+        L.append("")
+        L.append(f"About {_plural(w, 'GitHub write')}, "
+                 f"{'under a minute' if m < 1 else 'about ' + _duration(m * 60)} "
+                 f"(GitHub limits how fast content can be created).")
+    return "\n".join(L)
+
+
+def _stopped_lines(r: dict, written: list, remove: bool) -> list:
+    n = r.get("writes_sent") or 0
+    if not n:
+        return ["Nothing was written to GitHub."]
+    out = [f"{_plural(n, 'write request')} {'was' if n == 1 else 'were'} sent before it "
+           f"stopped (the last one may not have completed)."]
+    if written:
+        out.append("Deleted before it stopped:" if remove else "Recorded as done:")
+        out.extend(f"  - {x}" for x in written)
+    b = r.get("board")
+    if not remove and isinstance(b, dict) and not _board_skip(b):
+        out.append("The board may be partway done; the next run brings it level.")
+    out.append("Run again to continue the remove." if remove else
+               "Run again to continue: rs-sync reads what is already on GitHub.")
+    return out
 
 
 def import_advice() -> str:
@@ -2620,7 +3039,11 @@ def main(argv=None) -> int:
                          "on the GitHub wiki")
     ap.add_argument("--env", default=str(DEFAULT_ENV),
                     help=f"the settings file (default {DEFAULT_ENV})")
+    ap.add_argument("--report", action="store_true",
+                    help="also print the full report as JSON, for pasting back to the agent")
     args = ap.parse_args(argv)
+    REPORT["command"] = "remove" if args.remove else "sync"
+    REPORT["apply"] = bool(args.apply)
     started = time.time()
     rc = 0
     env = None
@@ -2651,7 +3074,15 @@ def main(argv=None) -> int:
         sys.stderr.write(_safe(traceback.format_exc(), *secrets))
         rc = 1
     REPORT["seconds"] = round(time.time() - started, 1)
-    print_report()
+    try:
+        print(summary(REPORT))
+    except Exception as e:      # a defect in the summary: keep the report and the advice
+        print(f"rs-sync: the summary failed ({type(e).__name__}: {e}); "
+              f"run with --report for the full report", file=sys.stderr)
+        print(f"rs-sync stopped: {REPORT['error']}" if REPORT.get("error") else "rs-sync finished.")
+    if args.report:
+        print()
+        print_report()
     advice = import_advice()
     if rc and advice:
         print(advice)
