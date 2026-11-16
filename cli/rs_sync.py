@@ -35,7 +35,7 @@ reference to something not mirrored becomes a code span GitHub does not
 link. Nothing is stored locally: the markers are the record, so --remove
 needs only GitHub.
 
-The GitHub token is read from ~/.rs-sync.env (or --env):
+The GitHub token is read from /workspace/.rs-sync.env (or --env):
     RS_SYNC_GITHUB_TOKEN=ghp_...        a classic token, repo/public_repo
     RS_SYNC_HOLD_LABELS=severity:*      required; comma-separated label names
                                         or prefixes ending in "*"; "*" alone
@@ -76,7 +76,8 @@ GITEA_BASE = f"http://{GITEA_HOST}:{GITEA_PORT}"
 # The read-only issue token the host stages beside the operator token.
 GITEA_TOKEN_PATH = Path.home() / ".dev-tokens" / "issue-reader.token"
 TOKENS_DIR = Path.home() / ".dev-tokens"
-DEFAULT_ENV = Path.home() / ".rs-sync.env"
+# /workspace: the only folder that survives a container recreate.
+DEFAULT_ENV = Path("/workspace/.rs-sync.env")
 GITHUB_API = "https://api.github.com"
 GITHUB_WEB = "https://github.com"
 # The product's home, linked from the optional header line.
