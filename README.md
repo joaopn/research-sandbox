@@ -231,7 +231,7 @@ pi reads a repo's `.claude/rules/`, `.claude/CLAUDE.md` and nested `CLAUDE.md` f
 
 ### Publishing a dev repo's image
 
-RS builds a pushed tag or branch of a mirrored dev repo into a Docker image from the Development page's **Images** tab, and keeps one built image per repo. `rs-publish`, in any fetch-enabled project or box terminal, uploads it to a public registry under each git tag on its commit (or the full commit id when it has none) and moves `latest`. RS itself never holds the registry credential.
+RS builds a pushed tag or branch of a mirrored dev repo into a Docker image from the Development page's **Images** tab, and keeps one built image per repo. `rs-publish`, in any fetch-enabled project or box terminal, uploads it to a public registry under each git tag on its commit (or the full commit id when it has none) and moves `latest`. RS itself never holds the registry credential. When the repo has a built image, its card on the Development page's Fetch tab and its row on the Images tab each have a 📋 rs-publish button that copies the command.
 
 1. On GitHub, create a classic token with `write:packages`.
 2. In the fetch terminal, write `/workspace/.rs-publish.env` and `chmod 600` it:

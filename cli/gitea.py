@@ -1928,13 +1928,16 @@ class GiteaClient:
             raise GiteaError("gitea returned no id for the image readers team")
         self._api("PUT", f"/teams/{team['id']}/members/{OPERATOR_USER}")
 
-    def image_versions(self, name: "str | None" = None) -> list[dict]:
+    def image_versions(self, name: "str | None" = None,
+                       timeout: "float | None" = None) -> list[dict]:
         """Every stored version (a tag or a manifest checksum) of the image
         `name`, or of every image when `name` is None. Every page, each raising
-        on failure; an absent organisation is an empty list."""
+        on failure; an absent organisation is an empty list. `timeout` bounds
+        each page (the API default when None) — a page read passes the short
+        status bound so it stays inside the webui's relay window."""
         pager = _ListPager(self, f"/packages/{IMAGES_ORG}?type=container", "id")
         try:
-            pager.all()
+            pager.all(timeout)
         except GiteaError as e:
             if e.status == 404:
                 return []

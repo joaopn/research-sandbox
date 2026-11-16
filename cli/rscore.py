@@ -24771,6 +24771,39 @@ def _dev_gitea_state() -> dict:
     return {"exists": exists, "running": running, **info}
 
 
+def _built_image_names(host_port: str) -> "set[str]":
+    """The image names on the shelf that hold a built image (a version named
+    the shelf tag). ONE paged listing for the whole host — the Fetch reads mark
+    every row from it instead of reading each repo's image. Each page is bounded
+    by the short status timeout so a page read stays inside the webui's relay
+    window. Raises GiteaError (a missing admin token included) or OSError
+    (a token file that cannot be read)."""
+    client = gitea.GiteaClient(gitea.api_base(host_port), gitea.read_admin_token())
+    return {r["name"] for r in client.image_versions(timeout=gitea.STATUS_TIMEOUT_S)
+            if r["version"] == image_registry.SHELF_TAG}
+
+
+def _row_has_image(names: "set[str] | None", repo: str) -> "bool | None":
+    """`image` for one Fetch row: None when the listing could not be read
+    (unknown — the page shows nothing rather than "no image"), False for a repo
+    whose name can never be an image name, else whether the shelf holds it."""
+    if names is None:
+        return None
+    try:
+        return image_registry.image_name(repo) in names
+    except ValueError:
+        return False
+
+
+def _built_image_names_or_none(host_port: str) -> "set[str] | None":
+    # A failed listing must never fail the page or degrade a healthy row: the
+    # image mark is an extra, and image errors are the Images tab's to show.
+    try:
+        return _built_image_names(host_port)
+    except (gitea.GiteaError, OSError):
+        return None
+
+
 def dev_status(_req: "DevStatusRequest", _progress=None) -> DevStatusResult:  # type: ignore[name-defined]
     """The Development-page read: gitea state + per-repo mirror/PR/branch
     status + agent attachments. A READ — never starts gitea, never waits: an
@@ -24790,6 +24823,10 @@ def dev_status(_req: "DevStatusRequest", _progress=None) -> DevStatusResult:  # 
             # No list, no page — the enumeration itself staying page-fatal is
             # deliberate; only the PER-ROW reads degrade below.
             raise ValidationError(str(e))
+        # Which repos hold a built image: one listing for every row, read
+        # outside the per-row try so a failure marks rows unknown (None)
+        # instead of degrading them.
+        images = _built_image_names_or_none(host_port)
         for name in listed:
             # Per-repo degradation (B37): one sick repo must never take down
             # the other rows. A raising repo_status becomes a degraded
@@ -24810,6 +24847,10 @@ def dev_status(_req: "DevStatusRequest", _progress=None) -> DevStatusResult:  # 
                     row.get("active") or "", row.get("active_id"))
             except gitea.GiteaError as e:
                 row = {"repo": name, "error": str(e)}
+            else:
+                # Healthy rows only: a degraded row carries nothing it did
+                # not compute.
+                row["image"] = _row_has_image(images, name)
             # The visibility preference rides BOTH arms deliberately. A degraded
             # repo is exactly the one an operator reaches for the hide button on,
             # so its row must still carry the state its toggle renders from — and
@@ -24875,6 +24916,11 @@ def dev_repo_status(req: "DevRepoStatusRequest", _progress=None) -> DevRepoStatu
                 row.get("active") or "", row.get("active_id"))
         except gitea.GiteaError as e:
             row = {"repo": req.repo, "error": str(e)}
+        else:
+            # The image mark, as dev_status does it — on a healthy row only,
+            # and outside the try so a failed listing reads as unknown.
+            row["image"] = _row_has_image(
+                _built_image_names_or_none(_gitea_host_port()), req.repo)
         # Same annotation as dev_status, on both arms, for the same reason.
         row["fetch_enabled"] = gitea.fetch_enabled(req.repo)
         row["added"] = gitea.mirror_present(req.repo)

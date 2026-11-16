@@ -5575,7 +5575,9 @@ function devFetchLegend() {
         "one. 📋 rs-sync copies the command that mirrors this fork's issues, ",
         "merged PRs, wiki and board to the GitHub repo it was mirrored from; ",
         "it shows what it would do, and adds nothing until run again with ",
-        "--apply.",
+        "--apply. 📋 rs-publish appears when the repo has a built image and ",
+        "copies the command that publishes it; it shows what it would ",
+        "upload, and uploads nothing until run again with --apply.",
     ]);
 }
 
@@ -6571,6 +6573,15 @@ function buildDevRepoCard(view, body, r, attached, opts) {
         ? live.map((f) => devCopyBtn(`rs-sync ${f.user}/${r.repo} ${r.source}`,
                                      `📋 rs-sync ${f.user}`))
         : [];
+    // The rs-publish copy, only when the Fetch read says the repo holds a
+    // built image (`image` is true; false = none, null = the image list could
+    // not be read, absent = an older broker — all show nothing). No quoting
+    // needed: a built image exists only for a repo whose lower-cased name
+    // passed the image-name rule (letters, digits, ".", "_", "-", never led
+    // by "-"), so the name is shell-plain — the Images tab's argument.
+    const publishCopies = r.image === true
+        ? [devCopyBtn("rs-publish " + r.repo, "📋 rs-publish")]
+        : [];
     const head = [
         el("span", { class: "dev-repo-name" }, [r.repo]),
         el("span", { class: "dev-repo-meta" }, [meta]),
@@ -6579,6 +6590,7 @@ function buildDevRepoCard(view, body, r, attached, opts) {
         ...(agentBranches.length ? [hideWrap] : []),
         sync,
         ...syncCopies,
+        ...publishCopies,
     ];
     if (!scoped) {
         // Remove is offered only for a FINISHED repo — no live fork, nobody
