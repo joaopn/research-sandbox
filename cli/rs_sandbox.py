@@ -2331,15 +2331,15 @@ def _stage_box_fetch(cname: str) -> None:
               f"{err}", file=sys.stderr)
 
 
-def _install_repo_watch(cname: str) -> None:
-    """Install the dev tooling launchers (rs-repo-watch + rs-wt + rs-land + rs-board)
-    into a DEV box. The box image bakes the dev tooling at /opt/dev only
-    (command-relevance: a non-dev box carries no dev commands on PATH), and
-    the box entrypoint runs as `worker`, which cannot write /usr/local/bin —
-    so the launchers land via a root exec here, right after the dev box's
-    docker run (the rs-fetch staging idiom). Best-effort per launcher: a
-    failure warns; each stays manually startable via its /opt/dev path."""
-    for tool in ("rs-repo-watch", "rs-wt", "rs-land", "rs-board"):
+def _install_dev_tools(cname: str) -> None:
+    """Install the dev tools (rs-wt + rs-land + rs-board) into a DEV box. The
+    box image bakes them at /opt/dev only (command-relevance: a non-dev box
+    carries no dev commands on PATH), and the box entrypoint runs as `worker`,
+    which cannot write /usr/local/bin — so the links land via a root exec
+    here, right after the dev box's docker run (the rs-fetch staging idiom).
+    Best-effort per tool: a failure warns; each stays runnable via its
+    /opt/dev path."""
+    for tool in ("rs-wt", "rs-land", "rs-board"):
         r = _docker("exec", "-u", "0", cname, "ln", "-sf",
                     f"/opt/dev/{tool}", f"/usr/local/bin/{tool}")
         if r.returncode != 0:
@@ -2909,7 +2909,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         # Dev lane: dedicated pinned bridge instead of rs-inner, the gitea name
         # staged via --add-host (inner-container DNS cannot resolve outer-bridge
         # names), the ADS hardening set, and the GITEA_* env the entrypoint's dev
-        # clone block + repo-watch consume. Token via env = ADS parity (visible
+        # clone block and the dev tools consume. Token via env = ADS parity (visible
         # only to inner `docker inspect`, i.e. this already-authoritative shell).
         net = _ensure_dev_bridge(name, dev_subnet)
         net_args = ["--network", net, "--ip", ip,
@@ -2922,7 +2922,7 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
         # The base branch rides its OWN parameter, never the `dev` dict: that
         # dict is _dev_run_info()'s return, read from the staged dev-gitea.json,
         # and will never carry a branch. Consumed by the entrypoint's first
-        # clone and exported to the agent by rs-repo-watch.
+        # clone, and read by rs-wt as the default base.
         if branch:
             dev_env += ["-e", f"GITEA_BRANCH={branch}"]
     else:
@@ -3082,9 +3082,9 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     if fetch:
         _stage_box_fetch(cname)
     # Dev tooling on PATH for a DEV box only (the image bakes it at /opt/dev;
-    # command-relevance — see _install_repo_watch).
+    # command-relevance — see _install_dev_tools).
     if dev:
-        _install_repo_watch(cname)
+        _install_dev_tools(cname)
     # The working-mode suite, wherever the box mounts the shared agent copy and
     # the project staged an installer into it (never research). Checked in this
     # container's own filesystem, where the shared copy is a real directory.

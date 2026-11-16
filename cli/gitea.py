@@ -211,9 +211,10 @@ COMMITS_PAGE_SIZE = 5
 
 # Repo FEATURES (gitea "units") on the two dev-lane repo kinds. Gitea's built-in
 # DefaultForkRepoUnits is code+pulls ONLY, so a fresh fork ships with NO issue
-# tracker — but the fork IS the human<->agent channel: repo-watch
-# (container/dev/repo-watch.sh) polls /repos/<agent>/<repo>/issues on the fork,
-# and gitea 404s that route while the unit is off. The MIRROR is a read-only
+# tracker — but the fork IS the human<->agent channel: the agent files its
+# plans and bug records there as issues, rs-board drives the area boards over
+# them, and rs-sync mirrors them; without the issues unit the fork has no
+# tracker to file into (the issue list route still answers, with PRs only). The MIRROR is a read-only
 # upstream nobody watches, and gitea's DefaultMirrorRepoUnits DOES include
 # issues — so issues are turned OFF there, leaving exactly ONE place to file.
 # The mirror's WIKI is off for the same kind of reason: every consumer holds a
@@ -2095,8 +2096,8 @@ def provision_consumer(host_port: str, repo: str, user: str,
     client.grant_read(ADMIN_USER, repo, user)     # consumer reads the private mirror
     client.fork_repo(ADMIN_USER, repo, user)      # fork into the consumer namespace
     client.grant_read(user, repo, OPERATOR_USER)  # operator reads the fork (fetch)
-    # The fork's units MUST outlive a failure here: without the issue unit, gitea
-    # 404s repo-watch's poll and the human->agent channel is dead. So features +
+    # The fork's units MUST outlive a failure here: without the issue unit the
+    # fork has no tracker and the human->agent channel is dead. So features +
     # the human's grant are STRICT; the watch is a notification nicety and warns.
     client.set_repo_features(user, repo, FORK_FEATURES)
     client.grant_collaborator(user, repo, ADMIN_USER, "admin")

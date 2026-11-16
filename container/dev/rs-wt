@@ -13,7 +13,7 @@ clone once silently re-based every other session's new tree), `list` warns,
 `done` is ungated so cleanup always works. The base branch comes from the dev
 wiring — GITEA_BRANCH in a dev box's env, else the agent_user-bearing row of
 /workspace/.orchestrator/dev-gitea.json on a dev project's supervisor (the
-rs-repo-watch / rs-land resolution) — never from the clone's HEAD; --base
+rs-land / rs-board resolution) — never from the clone's HEAD; --base
 overrides the default base only, never the guard.
 
 Verbs:
@@ -189,7 +189,7 @@ def wiring_base() -> str:
     """The base branch from the dev wiring, or "" when there is none. Box arm:
     GITEA_BRANCH is container env. Project arm: the agent_user-bearing row of
     the staged dev-gitea.json — rows without agent_user are box-only repos,
-    OTHER containers' wiring (the rs-repo-watch / rs-land row rule; at most
+    OTHER containers' wiring (the rs-land / rs-board row rule; at most
     one row bears agent_user). `or ""` on the field is load-bearing: a bare
     .get() hands back None for a row staged before the branch field existed.
     Never dies — the callers decide what an empty base means."""

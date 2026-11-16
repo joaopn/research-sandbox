@@ -40,8 +40,8 @@
 # four private ranges mirror router/scripts/rules-lib.sh (PRIVATE_RANGES). The proxy pin is
 # RS_INNER_PROXY_IP (inner-firewall.sh's default); the gitea port is
 # cli/gitea.py GITEA_INNER_PORT — a lockstep literal also carried by
-# cli/rs_sandbox.py DEV_GITEA_URL, cli/rs_fetch.py, container/dev/rs-land,
-# container/dev/rs-repo-watch and the history box script (pytest-pinned here).
+# cli/rs_sandbox.py DEV_GITEA_URL, cli/rs_fetch.py, container/dev/rs-land
+# and the history box script (pytest-pinned here).
 #
 # Composes with the opt-in inner firewall (inner-firewall.sh, RS_INNER_FIREWALL=1),
 # whose chain sits before DOCKER-USER and RETURNs what it lets through.

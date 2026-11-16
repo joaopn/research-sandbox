@@ -349,9 +349,7 @@ outside the primary clone. Started in `/workspace`, all of it loads and every ar
 for the primary clone and every worktree alike. Started inside the clone or a worktree, some of
 it fails to load or never fires, depending on the agent; started outside `/workspace`, none of
 it loads (this file still does: it is RS's rule file in your home folder). Your shell starts in the session's start directory: if that is
-not `/workspace`, say so in your first reply and suggest restarting there. The exception is a
-session `rs-repo-watch` launched: it starts in the primary clone by design, so
-skip that notice there.
+not `/workspace`, say so in your first reply and suggest restarting there.
 
 **After every landing** (`rs-land` succeeded):
 
@@ -499,8 +497,7 @@ zero when fixed), and verify it on both the base branch and your branch before p
 
 Your Gitea API token is in `$GITEA_TOKEN`, the base URL is `$GITEA_URL/api/v1`,
 and your repo path is `$GITEA_USER/$REPO_NAME`. On a dev box these are container
-env (always set). On a dev project's supervisor they are set only inside
-repo-watch-launched sessions; in other sessions read the wiring from
+env (always set). On a dev project's supervisor they are not set: read the wiring from
 `/workspace/.orchestrator/dev-gitea.json` (`agent_user` is your user, its
 `token_file` names your token under `~/.dev-tokens/`; the base URL is
 `http://rs-gitea:3000/api/v1`). Git push/pull authenticate via the credential

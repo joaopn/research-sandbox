@@ -28,27 +28,20 @@ RUN su - research -c 'echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.bash
 # Snapshot the home (byobu from the base + the PATH export) for first-boot restore.
 RUN cp -a /home/research /etc/research-skel
 
-# Dev-lane tooling (STAGE_DEV_GITEA): the repo-watch loop + prompt + the manual
-# post-auth launcher, for the dev workflow (the supervisor-level agent IS the
-# yolo agent there). Inert on a non-dev sandbox-dind project — rs-repo-watch
-# exits with a remedy when no dev wiring is staged.
-COPY container/dev/repo-watch.sh container/dev/repo-watch-prompt.md /opt/dev/
-COPY container/dev/rs-repo-watch /usr/local/bin/rs-repo-watch
-# rs-wt (one worktree per unit of work) rides the same bake, on PATH in every
-# sandbox-dind supervisor. Unlike rs-repo-watch's missing-wiring inertness,
-# its outside-the-dev-lane refusal is the tool's OWN gate: the discovered
-# clone's origin remote must be the shared Gitea.
+# Dev-lane tooling for the dev workflow (the supervisor-level agent works the
+# repo). rs-wt (one worktree per unit of work): its outside-the-dev-lane
+# refusal is the tool's own gate — the discovered clone's origin remote must
+# be the shared Gitea.
 COPY container/dev/rs-wt /usr/local/bin/rs-wt
 # rs-land (approval-gated landing: archive tag -> ff-only merge -> branch
-# delete) rides the same bake; like rs-repo-watch it exits with a remedy when
-# no dev wiring is staged, so it is inert on a non-dev project.
+# delete) exits with a remedy when no dev wiring is staged, so it is inert on
+# a non-dev project.
 COPY container/dev/rs-land /usr/local/bin/rs-land
 # rs-board (the per-area kanban boards on the shared Gitea: reconcile / next /
-# start / ask / answered / stop / done) rides the same bake; it refuses with a
-# remedy on a Gitea without the board API or on a non-dev project.
+# start / ask / answered / stop / done) refuses with a remedy on a Gitea
+# without the board API or on a non-dev project.
 COPY container/dev/rs-board /usr/local/bin/rs-board
-RUN chmod +x /opt/dev/repo-watch.sh /usr/local/bin/rs-repo-watch \
-    /usr/local/bin/rs-wt /usr/local/bin/rs-land /usr/local/bin/rs-board
+RUN chmod +x /usr/local/bin/rs-wt /usr/local/bin/rs-land /usr/local/bin/rs-board
 
 COPY agent/entrypoint.sandbox-dind.sh /entrypoint.sh
 # This image's boot writes nothing into /workspace/.claude/ or /workspace/.pi/

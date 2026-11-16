@@ -23,7 +23,8 @@ Two deliberate carve-outs:
 
 Usage: rs-land <pr-number>
 
-Wiring resolution (mirrors rs-repo-watch):
+Wiring resolution (shared with rs-board; rs-wt reads its base by the same
+box-env-then-agent_user-row rule):
   - dev BOX: GITEA_URL/GITEA_TOKEN/GITEA_USER/REPO_NAME arrive as container
     env — used as-is.
   - dev PROJECT (supervisor): the agent_user-bearing row of the host-staged
@@ -97,8 +98,8 @@ class Unreachable(Exception):
 
 
 def resolve_wiring() -> None:
-    """Box env first, else the supervisor's staged wiring (the rs-repo-watch
-    resolution, mirrored)."""
+    """Box env first, else the supervisor's staged wiring (the resolution
+    rs-board shares)."""
     token = os.environ.get("GITEA_TOKEN") or ""
     if token:
         url = os.environ.get("GITEA_URL") or ""

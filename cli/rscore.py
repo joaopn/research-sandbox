@@ -3554,9 +3554,7 @@ def _valid_dev_repo_name(repo: Any) -> bool:
 # check-ref-format enforces, so nothing that survives can need escaping anywhere
 # downstream: the value reaches a gitea API path, a `docker exec ... --branch
 # <v>` argv (hence the leading-alnum anchor, which is what rejects a leading
-# '-'), a shlex.quote'd sh -c script, a container env var, and a whitespace-
-# split staged field (rs-repo-watch's `read -r`, which is why no whitespace is
-# load-bearing rather than merely tidy).
+# '-'), a shlex.quote'd sh -c script and a container env var.
 _BRANCH_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 # Refs land at .git/refs/heads/<name>; 255 is the ext4 per-component limit, so a
 # longer name cannot be stored as a loose ref at all. Not an invented bound.
@@ -14145,8 +14143,8 @@ def _stage_dev_gitea(project: str, cfg: "Config", gitea_ip: str = "",
         repo's ACTIVE fork owner (what rs-fetch reads), ``agent_user`` /
         ``branch`` / ``token_file`` are the PROJECT consumer's identity + base
         branch (empty when the project's own agent doesn't work the repo — box
-        entries never mint those fields; rs-repo-watch filters to the
-        agent_user-bearing row). Written for ANY wired project (``repos`` may be
+        entries never mint those fields; rs-wt, rs-land and rs-board filter
+        to the agent_user-bearing row). Written for ANY wired project (``repos`` may be
         ``[]``): the ``gitea_ip`` is load-bearing for the universal box
         ``--add-host`` injection, not just for dev boxes.
       * every project CONSUMER's token (the project's own + each dev box's),
@@ -14211,8 +14209,8 @@ def _stage_dev_gitea(project: str, cfg: "Config", gitea_ip: str = "",
                 active = proj_user or next((e.get("user") for e in repo_entries
                                             if e.get("user")), "")
             # The PROJECT consumer's base branch, derived exactly like proj_user
-            # above (box entries are OTHER containers' wiring). rs-repo-watch
-            # reads it off the agent_user-bearing row and exports GITEA_BRANCH.
+            # above (box entries are OTHER containers' wiring). rs-wt reads it
+            # off the agent_user-bearing row as its default base.
             proj_branch = next((e.get("branch") for e in repo_entries
                                 if e.get("box") is None and e.get("branch")), "")
             rows.append({"repo": repo, "user": active,
