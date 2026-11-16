@@ -1484,6 +1484,13 @@ function computeStoppedProjects(list) {
 // judged against it, never against state.stoppedProjects, which
 // lifecycleFinish may already have updated without a rebuild.
 let railBuiltStopped = [];
+
+// The workflow label the rail's badge read last answered per project name
+// (null when it had none) — in memory only, forgotten at lock. Fold rows are
+// rebuilt without a rail render (the fold's own toggle), so they paint their
+// badge from here at once instead of waiting for the next read.
+const railWorkflowLabels = new Map();
+
 function stoppedFoldChanged() {
     const a = (state.stoppedProjects || []).slice().sort();
     const b = railBuiltStopped.slice().sort();
@@ -1539,7 +1546,13 @@ function makeStoppedFold() {
 function makeStoppedRow(name) {
     const row = el("div", { class: "stopped-project", "data-stopped": name });
     row.appendChild(el("span", { class: "status-dot" }));
-    row.appendChild(el("span", { class: "name", title: name }, [name]));
+    // The name and, right after it, the workflow badge (dimmed with the row).
+    const badge = el("span", { class: "type-badge" });
+    setTypeBadge(badge, railWorkflowLabels.get(name) || null);
+    row.appendChild(el("span", { class: "stopped-title" }, [
+        el("span", { class: "name", title: name }, [name]),
+        badge,
+    ]));
     row.appendChild(el("span", { class: "stopped-inflight" }, [railBusyLabel(name) || ""]));
     row.appendChild(makeRailPowerButton(name, "start"));
     row.appendChild(makeRailGearButton(() => openProjectConfigBox({ name })));
@@ -7980,6 +7993,10 @@ function paintLifecycleLabels() {
         if (power) paintRailPower(power, name, "start");
         const tag = row.querySelector(".stopped-inflight");
         if (tag) tag.textContent = railBusyLabel(name) || "";
+        // A cancelled Start confirm lands here too: a badge read that arrived
+        // while the row's nodes were set aside could not reach its badge.
+        const badge = row.querySelector(".type-badge");
+        if (badge) setTypeBadge(badge, railWorkflowLabels.get(name) || null);
     }
     for (const row of document.querySelectorAll(".mgmt-prow[data-project]")) {
         const stateEl = row.querySelector(".mgmt-state");
@@ -10685,6 +10702,8 @@ function mgmtDestroyDialog(view, name) {
             pruneArmedProject(name);
             // A destroyed stopped project leaves the rail's fold at once.
             state.stoppedProjects = (state.stoppedProjects || []).filter((n) => n !== name);
+            // and its badge label, so a reused name never shows the old workflow
+            railWorkflowLabels.delete(name);
             try { await persistVault(); } catch (e) { /* best-effort */ }
             refreshProjectRail();
         },
@@ -12110,23 +12129,33 @@ async function probeProject(project) {
 // call. Runs once per rail render (initial build, every refreshProjectRail) —
 // never on a timer: the label changes only when a project is created or
 // destroyed, and both rebuild the rail. A project with no workspace on disk
-// (or a name the server rejects) keeps an empty, collapsed badge.
+// (or a name the server rejects) keeps an empty, collapsed badge. The same
+// read covers the "Stopped" fold's names; every answer is remembered in
+// railWorkflowLabels for fold rows built later.
 async function paintProjectBadges() {
-    if (!state.vault || state.vault.projects.length === 0) return;
-    const names = state.vault.projects.map((p) => p.name).join(",");
+    if (!state.vault) return;
+    const names = [...new Set([...state.vault.projects.map((p) => p.name),
+                               ...(state.stoppedProjects || [])])];
+    if (names.length === 0) return;
     let data;
     try {
-        const res = await fetch(`/projects/status?names=${encodeURIComponent(names)}`);
+        const res = await fetch(`/projects/status?names=${encodeURIComponent(names.join(","))}`);
         if (!res.ok) return;
         data = await res.json();
     } catch (_) {
         return;   // the next rail render repaints
     }
+    if (!state.vault) return;   // locked meanwhile: the lock forgot the labels
     for (const [name, st] of Object.entries(data)) {
+        const label = st && st.error !== "not_found" ? st.workflow : null;
+        railWorkflowLabels.set(name, label);
         const row = document.querySelector(`.project[data-name="${CSS.escape(name)}"]`);
         const badge = row && row.querySelector(".project-status-line .type-badge");
-        if (!badge) continue;
-        setTypeBadge(badge, st && st.error !== "not_found" ? st.workflow : null);
+        if (badge) setTypeBadge(badge, label);
+    }
+    for (const row of document.querySelectorAll(".project-rail .stopped-project[data-stopped]")) {
+        const badge = row.querySelector(".type-badge");
+        if (badge) setTypeBadge(badge, railWorkflowLabels.get(row.getAttribute("data-stopped")) || null);
     }
 }
 
@@ -12386,6 +12415,7 @@ function lockVault() {
     state.activityApplied = state.activityGen = (state.activityGen || 0) + 1;
     // The fold empties, and a sidebar sync still in flight can't refill it.
     state.stoppedProjects = [];
+    railWorkflowLabels.clear();
     sidebarSyncApplied = sidebarSyncSeq = sidebarSyncSeq + 1;
     // a locked vault shows no project: close the browser notifications that name one
     if (state.pingNotes) {

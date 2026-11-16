@@ -400,8 +400,20 @@ body {
     font-size: 13px;
     color: var(--fg-faint);
 }
-.project-rail .stopped-project .name {
+/* The name, then its workflow badge right after it (app.js makeStoppedRow):
+   the title takes the free width, the name shrinks with an ellipsis, the
+   badge never does. */
+.project-rail .stopped-project .stopped-title {
     flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+/* Dimmed with its row; the coloured border still tells the kinds apart. */
+.project-rail .stopped-project .type-badge { color: inherit; }
+.project-rail .stopped-project .name {
+    flex: 0 1 auto;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
