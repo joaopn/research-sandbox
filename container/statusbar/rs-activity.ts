@@ -12,7 +12,8 @@
 //   `subagent` tool call counts while it runs (one per task when it lists
 //   `tasks`), a background run from its `subagent:async-started` to its
 //   `subagent:async-complete` (none for a workflow, whose agents announce
-//   themselves). Management calls (an `action`) run nothing and count nothing.
+//   themselves; the recorder still keeps the session working while it runs).
+//   Management calls (an `action`) run nothing and count nothing.
 // - Calls reach the recorder in order, one at a time, and never throw into pi.
 //
 // The functions above `export default` are pure and tested on their own.

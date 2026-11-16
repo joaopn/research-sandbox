@@ -1,9 +1,10 @@
 #!/opt/conda/bin/python3
 """RS's activity recorder: counts the interactive agent sessions of one
-container — working (busy on a turn), waiting (handed back to the user) — and
-the subagents they run, for the webui's sidebar boxes. Staged root-owned at
-/usr/local/lib/rs/rs-activity.py in every project container and agent box, beside
-the status bar.
+container — working (busy on a turn, or between turns with subagents still
+running: the agent wakes again when they finish), waiting (handed back to the
+user) — and the subagents they run, for the webui's sidebar boxes. Staged
+root-owned at /usr/local/lib/rs/rs-activity.py in every project container and
+agent box, beside the status bar.
 
 Called by:
 - Claude Code's hooks (`rs-activity.py hook`, the hook JSON on stdin);
@@ -204,9 +205,16 @@ def _subs(rec: dict) -> dict:
     return s if isinstance(s, dict) else {}
 
 
+def _has_subs(rec: dict) -> bool:
+    """Any subagent entry, a pi workflow's zero-count one included: the
+    session will be woken again when it ends."""
+    return bool(_subs(rec))
+
+
 def summarise(state: State) -> None:
     """Drop the records of processes that are gone, then write the summary.
-    An ended session's record (its process still finishing) counts nothing."""
+    An ended session's record (its process still finishing) counts nothing;
+    a session between turns with subagents running counts working."""
     working = waiting = subagents = 0
     for key, rec in state.records().items():
         if not _alive(key):
@@ -214,7 +222,7 @@ def summarise(state: State) -> None:
             continue
         if rec.get("state") == ENDED:
             continue
-        if rec.get("state") == "working":
+        if rec.get("state") == "working" or _has_subs(rec):
             working += 1
         else:
             waiting += 1
@@ -291,11 +299,13 @@ def turn_start(state: State, key: str) -> None:
 
 def turn_end(state: State, key: str, handback: bool = True) -> None:
     """Waiting; the hand-back count rises only on a working→waiting change (a
-    `!` command's lone Stop, an interrupted pi turn are no hand-back)."""
+    `!` command's lone Stop, an interrupted pi turn are no hand-back) with no
+    subagent still running: the agent wakes again when the last one ends, and
+    that turn's end is the hand-back."""
     rec = _rec(state, key, "waiting")
     if _ended(rec):
         return
-    if handback and rec.get("state") == "working":
+    if handback and rec.get("state") == "working" and not _has_subs(rec):
         state.add_handback()
     rec["state"] = "waiting"
     state.put(key, rec)
@@ -357,8 +367,10 @@ def claude_event(state: State, key: str, data: dict) -> None:
     elif ev == "UserPromptSubmit":
         turn_start(state, key)
     elif ev in ("Stop", "StopFailure"):
-        turn_end(state, key)
+        # reconcile first: a subagent whose SubagentStop was lost must not
+        # hold back the hand-back
         claude_reconcile(state, key, data.get("background_tasks"))
+        turn_end(state, key)
     elif ev == "SubagentStart":
         aid = data.get("agent_id")
         if isinstance(aid, str) and aid:
@@ -378,7 +390,8 @@ def _int(v, default: int = 1) -> int:
 
 def async_count(data: dict) -> int:
     """How many agents a pi background run has running at once: none for a
-    workflow (its agents announce themselves), else the largest parallel group,
+    workflow (its agents announce themselves; the workflow is still recorded,
+    with 0, so its session stays working), else the largest parallel group,
     else one."""
     if data.get("mode") == "workflow":
         return 0
@@ -412,9 +425,7 @@ def pi_event(state: State, key: str, ev: str, data: dict) -> None:
         if isinstance(data.get("toolCallId"), str):
             sub_remove(state, key, "pt:" + data["toolCallId"])
         if isinstance(data.get("id"), str):
-            n = async_count(data)
-            if n:
-                sub_add(state, key, "pa:" + data["id"], n)
+            sub_add(state, key, "pa:" + data["id"], async_count(data))
     elif ev == "async_complete":
         if isinstance(data.get("id"), str):
             sub_remove(state, key, "pa:" + data["id"])
