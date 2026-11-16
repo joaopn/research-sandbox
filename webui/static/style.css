@@ -1660,6 +1660,9 @@ html.mobile .project-rail .rail-separator { cursor: default; }
 .activity-box.activity-waiting { background: var(--activity-waiting); }
 .activity-box.activity-subagents { background: var(--activity-subagents); }
 .activity-box.activity-unknown { background: var(--activity-unknown); }
+/* The armed-project bell (#560), before the boxes; empty when not armed. */
+.activity-bell { display: inline-flex; flex: none; color: var(--fg-muted); line-height: 1; }
+.activity-bell:empty { display: none; }
 .type-badge.type-research { border-color: var(--type-research-border); }
 .type-badge.type-sandbox { border-color: var(--type-sandbox-border); }
 .type-badge.type-box { border-color: var(--type-box-border); }

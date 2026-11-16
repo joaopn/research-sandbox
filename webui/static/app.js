@@ -792,6 +792,47 @@ function pruneProjectOrder(name) {
     s.project_order = s.project_order.filter((n) => n !== name);
 }
 
+// ---- Armed projects (#560): alert on a hand-back ------------------------------
+// The projects whose hand-backs raise an alert, kept as a plain list of NAMES in
+// the vault settings beside project_order (per browser, encrypted) — the set-level
+// shape: the read is a tolerant NON-creating probe (it runs on every paint),
+// one function sets the list (setProjectArmed), and both deliberate forgets
+// (destroy, Remove from sidebar) prune it, so a reused name starts unarmed.
+function readArmedProjects() {
+    const s = state.vault && state.vault.settings;
+    const raw = s && s.activity_armed;
+    if (!Array.isArray(raw)) return [];
+    const out = [];
+    for (const n of raw) {
+        if (typeof n === "string" && n && !out.includes(n)) out.push(n);
+    }
+    return out;
+}
+
+// The list's one writer. False (nothing written) when the vault is locked —
+// the tick's browser prompt can outlive the vault.
+function writeArmed(name, on) {
+    if (!state.vault) return false;
+    const list = readArmedProjects().filter((n) => n !== name);
+    if (on) list.push(name);
+    vaultSettings().activity_armed = list;
+    return true;
+}
+
+async function setProjectArmed(name, on) {
+    if (!writeArmed(name, on)) return;
+    try { await persistVault(); } catch (_) { /* kept in memory; the next save writes it */ }
+    paintActivityBoxes();
+}
+
+function pruneArmedProject(name) {
+    // its alerts go too: they would offer to open a project that is gone
+    dropPingAlerts(name);
+    const s = state.vault && state.vault.settings;
+    if (!s || !Array.isArray(s.activity_armed)) return;
+    s.activity_armed = s.activity_armed.filter((n) => n !== name);
+}
+
 // ---- screens ---------------------------------------------------------------
 
 function renderSetup() {
@@ -10245,6 +10286,7 @@ function mgmtDestroyDialog(view, name) {
             state.vault.projects = state.vault.projects.filter((p) => p.name !== name);
             delete projectUiMap()[name];
             pruneProjectOrder(name);
+            pruneArmedProject(name);
             try { await persistVault(); } catch (e) { /* best-effort */ }
             refreshProjectRail();
         },
@@ -11268,10 +11310,12 @@ function makeProjectRow(project) {
     // The activity boxes (#560): sessions working / waiting, subagents running,
     // painted from the last /broker/activity answer (paintActivityBoxes).
     const activity = el("span", { class: "activity-boxes" });
+    // The bell (#560): shown while the project is armed (paintActivityBoxes).
+    const bell = el("span", { class: "activity-bell" });
     const statusLine = el("div", { class: "project-status-line" },
-        flight ? [typeBadge, activity, el("span", { class: "project-inflight" },
+        flight ? [typeBadge, bell, activity, el("span", { class: "project-inflight" },
                                 [lifecycleLabel(flight)]), configBtn]
-               : [typeBadge, activity, configBtn]);
+               : [typeBadge, bell, activity, configBtn]);
     // .active is stamped here so a rail rebuild (a drop, a create, a destroy)
     // keeps the "you are here" highlight — refreshProjectRail replaces the
     // whole <aside> and never re-activates. Gated on no host page being open:
@@ -11700,6 +11744,10 @@ async function paintProjectBadges() {
 // Fetched on the rail's reachability poll (PROBE_INTERVAL_MS) from the
 // session-gated /broker/activity; a 401 or any failure shows no boxes and
 // starts no login. The last answer is kept so a rail rebuild repaints at once.
+const BELL_SVG = '<svg viewBox="0 0 16 16" width="11" height="11" fill="currentColor" '
+    + 'xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M8 1.5a1 1 0 0 1 1 1v.6'
+    + 'A4.5 4.5 0 0 1 12.5 7.5v3l1.3 1.6a.5.5 0 0 1-.4.9H2.6a.5.5 0 0 1-.4-.9L3.5 10.5v-3A4.5 '
+    + '4.5 0 0 1 7 3.1v-.6a1 1 0 0 1 1-1zM6.3 14h3.4a1.7 1.7 0 0 1-3.4 0z"/></svg>';
 const ACTIVITY_KINDS = [
     ["working", "activity-working", "working"],
     ["waiting", "activity-waiting", "waiting"],
@@ -11709,6 +11757,10 @@ const ACTIVITY_KINDS = [
 async function fetchProjectActivity() {
     if (!state.vault || state.vault.projects.length === 0) return;
     const names = state.vault.projects.map((p) => p.name).join(",");
+    // An answer older than the last one applied is dropped (a rail rebuild
+    // starts a request while another is in flight; a lock forgets everything
+    // before it) — but a slow answer that is still the newest arrived counts.
+    const gen = state.activityGen = (state.activityGen || 0) + 1;
     let result = null;
     try {
         const res = await fetch(`/broker/activity?names=${encodeURIComponent(names)}`,
@@ -11722,8 +11774,153 @@ async function fetchProjectActivity() {
     } catch (_) {
         result = null;
     }
+    applyActivityAnswer(gen, result);
+}
+
+// One answer (request number `gen`): dropped when older than the last one
+// applied, else painted and compared (the alerts).
+function applyActivityAnswer(gen, result) {
+    // focus inside an editor frame fires no event on this page: the marker
+    // also clears at each answer once the page has focus again
+    clearTitleMark();
+    if (gen <= (state.activityApplied || 0)) return;
+    state.activityApplied = gen;
     state.activity = result;
     paintActivityBoxes();
+    if (result) {
+        const r = activityPings(state.activitySeen || {}, result, readArmedProjects());
+        state.activitySeen = r.seen;
+        for (const [name, items] of Object.entries(r.rings)) notifyHandback(name, items);
+    }
+}
+
+// Which armed projects handed back since the last answer. `seen` keeps, per
+// container (project + NUL + who), the last (run, hand-back count) pair; the
+// FIRST sight of a container only records it (no alert on page load, on arming,
+// or for a box just added). After that a hand-back is a count that rose within
+// the same container run, or any count under a new run (a restart between two
+// polls that already handed back). Every project is tracked, armed or not, so
+// arming later never alerts for older hand-backs. Pure: returns the new map and
+// {project: [{who, n}]} for the armed projects that handed back.
+function activityPings(seen, result, armed) {
+    const next = Object.assign({}, seen);
+    const rings = {};
+    for (const [name, entry] of Object.entries(result || {})) {
+        if (!entry || !Array.isArray(entry.containers)) continue;
+        for (const c of entry.containers) {
+            if (!c || typeof c.run !== "string" || typeof c.who !== "string"
+                    || !Number.isInteger(c.handbacks) || c.handbacks < 0) continue;
+            const key = name + "\u0000" + c.who;
+            const prev = seen[key];
+            next[key] = { run: c.run, handbacks: c.handbacks };
+            if (!prev) continue;
+            const n = prev.run === c.run ? Math.max(0, c.handbacks - prev.handbacks) : c.handbacks;
+            if (n > 0 && armed.includes(name)) {
+                (rings[name] = rings[name] || []).push({ who: c.who, n });
+            }
+        }
+    }
+    return { seen: next, rings };
+}
+
+// One corner notice per project, its count growing in place; a marker in the
+// tab title while the page is in the background; a browser notification (when
+// allowed) while the page is in the background, replacing the project's last.
+function pingNoticeText(name, count) {
+    // a count of hand-backs: one session can hand back several times
+    return count === 1 ? `${name}: a session handed back` : `${name}: ${count} hand-backs`;
+}
+
+// Both alerts of a project — the corner notice and the browser notification —
+// stand for the same unseen hand-backs: acting on either drops both.
+function dropPingAlerts(name) {
+    const entry = state.pingNotices && state.pingNotices.get(name);
+    if (entry) { entry.notice.remove(); state.pingNotices.delete(name); }
+    const note = state.pingNotes && state.pingNotes.get(name);
+    if (note) {
+        try { note.close(); } catch (_) { /* already gone */ }
+        state.pingNotes.delete(name);
+    }
+}
+
+function openPingedProject(name) {
+    // as the other corner notices: never switch project behind an open dialog
+    if (document.querySelector(".modal-backdrop")) return false;
+    if (state.vault && state.vault.projects.some((p) => p.name === name)) {
+        if (state.hostPage) closeManagement();
+        activateProject(name);
+    }
+}
+
+function notifyHandback(name, items) {
+    const n = items.reduce((a, i) => a + i.n, 0);
+    if (n <= 0) return;
+    state.pingNotices = state.pingNotices || new Map();
+    let entry = state.pingNotices.get(name);
+    if (!entry || !entry.notice.isConnected) {
+        let host = document.getElementById("op-notices");
+        if (!host) {
+            host = el("div", { id: "op-notices", class: "op-notices" });
+            document.body.appendChild(host);
+        }
+        const body = el("button", { class: "op-notice-body", title: "Open the project" });
+        const close = el("button", { class: "op-notice-close", title: "Dismiss",
+                                     "aria-label": "Dismiss" }, ["×"]);
+        const notice = el("div", { class: "op-notice ping-notice", role: "status" }, [body, close]);
+        entry = { notice, body, count: 0, byWho: {} };
+        close.onclick = () => dropPingAlerts(name);
+        body.onclick = () => {
+            if (document.querySelector(".modal-backdrop")) return;
+            dropPingAlerts(name);
+            openPingedProject(name);
+        };
+        host.appendChild(notice);
+        state.pingNotices.set(name, entry);
+    }
+    entry.count += n;
+    for (const i of items) entry.byWho[i.who] = (entry.byWho[i.who] || 0) + i.n;
+    const detail = Object.entries(entry.byWho).map(([w, k]) => `${activityWho(w)}: ${k}`).join(" · ");
+    entry.body.textContent = pingNoticeText(name, entry.count);
+    entry.body.title = `${detail} — open the project`;
+    const away = document.hidden || !document.hasFocus();
+    if (away) markTitle();
+    if (away && "Notification" in window && Notification.permission === "granted") {
+        try {
+            const note = new Notification(pingNoticeText(name, entry.count),
+                                          { body: detail, tag: `rs-handback-${name}` });
+            note.onclick = () => {
+                window.focus();
+                if (openPingedProject(name) !== false) dropPingAlerts(name);
+            };
+            // kept so a vault lock can close it (a locked vault shows no project)
+            state.pingNotes = state.pingNotes || new Map();
+            state.pingNotes.set(name, note);
+        } catch (_) { /* a browser that refuses page notifications */ }
+    }
+}
+
+const TITLE_MARK = "● ";
+function clearTitleMark() {
+    if (!document.hidden && document.hasFocus() && document.title.startsWith(TITLE_MARK)) {
+        document.title = document.title.slice(TITLE_MARK.length);
+    }
+}
+
+function markTitle() {
+    if (!document.title.startsWith(TITLE_MARK)) document.title = TITLE_MARK + document.title;
+    if (state.titleMarkInstalled) return;
+    state.titleMarkInstalled = true;
+    document.addEventListener("visibilitychange", clearTitleMark);
+    window.addEventListener("focus", clearTitleMark);
+}
+
+// Rewritten only on a change: a poll must not drop a tooltip in view.
+function paintBell(bell, armed) {
+    if (bell.dataset.armed === String(armed)) return;
+    bell.dataset.armed = String(armed);
+    bell.innerHTML = armed ? BELL_SVG : "";
+    if (armed) bell.title = "Alerts on: a session here handing back raises a notice";
+    else bell.removeAttribute("title");
 }
 
 function activityWho(who) {
@@ -11758,6 +11955,8 @@ function paintActivityBoxes() {
         const name = row && row.dataset.name;
         holder.replaceChildren();
         holder.removeAttribute("title");
+        const bell = row && row.querySelector(".activity-bell");
+        if (bell) paintBell(bell, !!name && readArmedProjects().includes(name));
         const entry = data && name ? data[name] : null;
         if (!entry || entry.skip || entry.error) continue;
         // a start/stop/update in flight: its container's file may still hold
@@ -11788,6 +11987,15 @@ function lockVault() {
     if (state.servicesTimer) { clearInterval(state.servicesTimer); state.servicesTimer = null; }
     if (state.hostStatsTimer) { clearInterval(state.hostStatsTimer); state.hostStatsTimer = null; }
     state.activity = null;
+    state.activitySeen = null;
+    state.activityApplied = state.activityGen = (state.activityGen || 0) + 1;
+    // a locked vault shows no project: close the browser notifications that name one
+    if (state.pingNotes) {
+        for (const note of state.pingNotes.values()) {
+            try { note.close(); } catch (_) { /* already gone */ }
+        }
+        state.pingNotes.clear();
+    }
     state.hostStats = null;
     state.hostCpuSamples = [];
     state.brokerStale = false;
@@ -12741,6 +12949,7 @@ function makeProjectConfigBox(project) {
         const portsBox = pane("Ports", "ports");
         appendExportedPortsSection(portsBox, project);
         appendDetectedAppsSection(portsBox, project);
+        if (!activitySkipped(project.name)) appendAlertsSection(pane("Alerts", "alerts"), project);
         appendSidebarSection(pane("Sidebar", "sidebar"), project);
         select("tabs");
         return layout;
@@ -12789,6 +12998,7 @@ function makeProjectConfigBox(project) {
     const portsBox = pane("Ports", "ports");
     appendExportedPortsSection(portsBox, project);
     appendDetectedAppsSection(portsBox, project);
+    if (!activitySkipped(project.name)) appendAlertsSection(pane("Alerts", "alerts"), project);
     appendSidebarSection(pane("Sidebar", "sidebar"), project);
     select("tabs");
     return layout;
@@ -13476,6 +13686,48 @@ async function mgmtAgentsUpdateDialog(name, deployed, hasBoxes, local) {
     });
 }
 
+// OpenKnowledge projects show no activity, so they offer no alerts (#560).
+function activitySkipped(name) {
+    const e = state.activity && state.activity[name];
+    if (e && e.skip) return true;
+    // before the first activity answer (or without a Management login): the
+    // workflow the row's badge shows, from the login-free marker read
+    const row = document.querySelector(`.project-rail .project[data-name="${CSS.escape(name)}"]`);
+    const badge = row && row.querySelector(".type-badge");
+    return !!(badge && badge.textContent === "open-knowledge");
+}
+
+// The ⚙ window's Alerts pane (#560): arm this project. While armed, a session
+// here (the project's agent or a box) handing back to you raises a notice in
+// the corner of this page, marks the browser tab's title while you are on
+// another tab, and shows a browser notification if this browser allows it.
+function appendAlertsSection(box, project) {
+    const section = el("div", { class: "config-section" });
+    const tick = el("input", { type: "checkbox" });
+    tick.checked = readArmedProjects().includes(project.name);
+    tick.onchange = async () => {
+        const on = tick.checked;
+        if (on && "Notification" in window && Notification.permission === "default") {
+            // asked once, on this click (browsers only ask on a user action)
+            try { await Notification.requestPermission(); } catch (_) { /* no prompt */ }
+        }
+        // the tick may have changed while the browser's prompt was open
+        await setProjectArmed(project.name, tick.checked);
+    };
+    section.appendChild(el("label", { class: "mgmt-check" }, [
+        tick, el("span", {}, ["Alert me when a session here hands back"]),
+    ]));
+    box.appendChild(section);
+    box.appendChild(el("div", { class: "config-hint" }, [
+        "A session of this project or one of its boxes finishing its turn and "
+        + "waiting for you raises a notice in this page's corner and marks the "
+        + "browser tab's title while you are on another tab. Where the browser "
+        + "offers page notifications and you allow them (phones often do not), "
+        + "you also get one there. Alerts reach this open page only; nothing is "
+        + "sent when no page is open.",
+    ]));
+}
+
 // The "Sidebar" section — drop this browser's bookmark for a project. It is the
 // ONLY way to get rid of a row whose project is no longer here: the sidebar is a
 // per-browser list, and the one other place that ever removed a row is the
@@ -13504,7 +13756,7 @@ function appendSidebarSection(box, project) {
 }
 
 // Confirm, then forget the row. This performs EXACTLY the browser-state half of
-// the destroy hook (teardown, drop the row, prune the two saved per-project
+// the destroy hook (teardown, drop the row, prune the three saved per-project
 // surfaces, persist, repaint) and issues NO request of any kind: removing a
 // bookmark must never be confusable with destroying a project.
 function removeProjectFromSidebar(project) {
@@ -13532,6 +13784,7 @@ function removeProjectFromSidebar(project) {
         // project that is still running here the row itself comes back.
         delete projectUiMap()[name];
         pruneProjectOrder(name);
+        pruneArmedProject(name);
         try { await persistVault(); } catch (e) { /* best-effort, as destroy */ }
         refreshProjectRail();
         // Unconditional, and NOT gated on a host page being open: closeManagement
@@ -13550,7 +13803,8 @@ function removeProjectFromSidebar(project) {
             + "is deleted.",
         ]),
         el("p", {}, [
-            "Its tab arrangement and its position in the list are forgotten too. A "
+            "Its tab arrangement, its position in the list and its alert setting are "
+            + "forgotten too. A "
             + "project on this sandbox comes back on its own once it is running — on "
             + "the next page load, or as soon as you open Sandboxes. A box you run "
             + "elsewhere, entered by hand under New Project, is known only to this "
