@@ -549,6 +549,74 @@ def write_secret_atomic(path: Path, value: str) -> None:
             os.close(dfd)
 
 
+# --- the image-reading token (rs-publish) -----------------------------------
+#
+# A third token of the read-only operator account, scope read:package only:
+# rs-publish reads the built images on the shelf with it. The operator reaches
+# the shelf through its membership of the image organisation's read-only team
+# (made by ensure_images_org at a build). Minted and staged like the
+# issue-reading token, by sibling functions (the issue token's are pinned line
+# by line by archived tests); minting reuses ISSUE_TOKEN_MINT_TIMEOUT_S, whose
+# reasoning (a docker exec of the admin CLI) is the same.
+
+IMAGE_READER_SCOPES = "read:package"
+
+
+def image_reader_token_path() -> Path:
+    return DEV_DIR / "image-reader.token"
+
+
+def image_reader_lock_path() -> Path:
+    return DEV_DIR / "image-reader.lock"
+
+
+def probe_package_read(host_port: str, token: str) -> int | None:
+    """The HTTP status of one package listing with `token`: 200 with package
+    read, 403 naming read:package without it, 401 for a token Gitea does not
+    know (measured on 28.2.0); None when Gitea did not answer."""
+    req = urllib.request.Request(
+        f"{api_base(host_port)}/packages/{OPERATOR_USER}?limit=1",
+        headers={"Authorization": f"token {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=STATUS_TIMEOUT_S) as r:
+            return r.status
+    except urllib.error.HTTPError as e:
+        return e.code
+    except (ValueError, urllib.error.URLError, OSError, http.client.HTTPException):
+        # ValueError: a token that cannot go into a header — never the value.
+        return None
+
+
+def mint_image_reader_token() -> str:
+    """Mint a new image-reading token under a fresh unique name. Every
+    failure, a timeout and output that is not a token included, is a
+    GiteaError."""
+    name = ("rs-image-reader-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            + "-" + os.urandom(4).hex())
+    try:
+        r = subprocess.run(
+            ["docker", "exec", "-u", "git", GITEA_CONTAINER, "gitea", "admin", "user",
+             "generate-access-token", "--username", OPERATOR_USER,
+             "--scopes", IMAGE_READER_SCOPES, "--raw", "--token-name", name],
+            capture_output=True, timeout=ISSUE_TOKEN_MINT_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        raise GiteaError("minting the image-reading token timed out")
+    except OSError as e:
+        raise GiteaError(f"could not run the Gitea admin command "
+                         f"({e.strerror or type(e).__name__})")
+    if r.returncode != 0:
+        raise GiteaError("Gitea refused to mint the image-reading token")
+    try:
+        out = r.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        raise GiteaError("the minted image-reading token is not text")
+    lines = out.strip().splitlines()
+    tok = lines[-1].strip() if lines else ""
+    if not re.fullmatch(r"[0-9a-f]{40}", tok):
+        raise GiteaError("the minted image-reading token has an unexpected shape")
+    return tok
+
+
 # --- encrypted instance export (STAGE_BOARD_BACKUP) -------------------------
 #
 # An agent OWNS its fork, and in gitea ownership implies destruction: a consumer

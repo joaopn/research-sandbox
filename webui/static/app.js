@@ -5607,7 +5607,8 @@ function devHiddenLine(count, label, onOpen) {
 // One row per mirrored repo: its built image (at most one — a build replaces
 // it), and the actions Build, Cancel, Discard. A build runs as a broker job;
 // this page starts it, shows its log and can stop it. Publishing the image is
-// not done here: that is `rs-publish`, run where the registry token lives.
+// not done here: that is `rs-publish`, run where the registry token lives (the
+// row's copy button gives the command).
 //
 // Running builds are re-learned from the broker on every render (a reload
 // forgets this page's memory), keyed by the repo's name in lower case: the
@@ -5745,7 +5746,10 @@ function renderDevImagesScreen(view, body, result) {
         "Build takes what GitHub has now for the branch or tag you name: push "
         + "the commit and its version tags to GitHub first. Each repo keeps one "
         + "built image; a new build replaces it. The image records the git tags "
-        + "on its commit. Built images are not part of the Gitea backup.",
+        + "on its commit. Built images are not part of the Gitea backup. "
+        + "📋 rs-publish copies the command that publishes a built image: paste "
+        + "it in a fetch-enabled project or box terminal; it shows what it "
+        + "would upload, and uploads nothing until run again with --apply.",
     ]));
     devImageFillAll(idle);
     // Every running build the broker named (started here, in another browser,
@@ -5835,6 +5839,10 @@ async function devImageFill(view, body, repo, info, acts) {
     const size = devImageBytes(im.size);
     if (size) facts.push(size);
     info.appendChild(el("div", { class: "dev-image-sub", title: commit }, [facts.join(" · ")]));
+    // The publish command needs no quoting: an image exists only for a repo
+    // whose lower-cased name passed the image-name rule (letters, digits,
+    // ".", "_", "-", never led by "-"), so the name is shell-plain.
+    acts.appendChild(devCopyBtn("rs-publish " + repo, "📋 rs-publish"));
     const discard = el("button", { class: "btn-small" }, ["Discard"]);
     discard.onclick = () => devImageDiscardDialog(view, body, repo);
     acts.appendChild(discard);

@@ -229,6 +229,32 @@ On any DIND project (`research` / `sandbox-dind`) you can spin **boxes** — iso
 
 pi reads a repo's `.claude/rules/`, `.claude/CLAUDE.md` and nested `CLAUDE.md` files like Claude Code does (an RS-owned `rs-rules` extension rides the pi dist), and it carries subagents (the `pi-subagents` package rides the pi dist too, pinned). It runs online like a stock install: `pi update` updates it in place (like `claude update`; restaging or recreating the project or box returns it to the pinned version), `pi install` / `pi remove` manage its packages, and it refreshes its model catalogs and fetches `rg` / `fd` on first need. Install telemetry stays off. Its settings and packages are yours: they survive a restage and a recreate of a dev / sandbox-dind project, like its login and sessions. The one exception is a one-time addition: settings written before pi-subagents shipped get its entry added once, at the first pi start after the next redeploy (replacing a hand-installed `npm:pi-subagents`); removing it afterwards sticks, until a box or docker project is re-created from the shipped settings. Per-box toggles: `--agent claude|pi` (or none — an agent-bearing box receives every agent the project carries), `--editor`, `--mcps <subset of the project allowlist>`, and `--repo/--ref/--setup` for the `byo` preset. Boxes boot un-authed and reach an LLM / pip / apt through the project's locked egress — the containment is router + no-creds + container isolation.
 
+### Publishing a dev repo's image
+
+RS builds a pushed tag or branch of a mirrored dev repo into a Docker image from the Development page's **Images** tab, and keeps one built image per repo. `rs-publish`, in any fetch-enabled project or box terminal, uploads it to a public registry under each git tag on its commit (or the full commit id when it has none) and moves `latest`. RS itself never holds the registry credential.
+
+1. On GitHub, create a classic token with `write:packages`.
+2. In the fetch terminal, write `/workspace/.rs-publish.env` and `chmod 600` it:
+
+   ```
+   RS_PUBLISH_REGISTRY=ghcr.io/<owner>
+   RS_PUBLISH_USER=<owner>
+   RS_PUBLISH_TOKEN=<the token>
+   ```
+
+3. Tag and push the collected commit, build it on the Images tab, then:
+
+   ```bash
+   rs-publish <repo>           # shows what it would do; uploads nothing
+   rs-publish <repo> --apply   # publishes
+   ```
+
+`--no-latest` leaves `latest` alone; `--latest <tag> --apply` moves `latest` to a tag already published. A version tag that already holds other content is never moved: the run stops before uploading anything.
+
+Like `rs-sync`'s settings, the file sits in the project's `/workspace`, where an agent working in the same project can read it: keep the fetch terminal in a project without an agent if that matters.
+
+GitHub keeps a newly published package **private**: `rs-publish` says so after the first publish. Make it public once in the package's settings on GitHub (this cannot be undone). If the package page is not linked to the repository, link it there too ("Connect repository").
+
 ## ◾ Security model
 
 The **container is the security boundary**; agents run under `bypassPermissions` inside it. Layers (full detail in [docs/SECURITY.md](docs/SECURITY.md)):

@@ -2197,6 +2197,12 @@ FETCH_WIRING_FILE = DEV_TOKENS_DIR / "fetch-wiring.json"
 RS_SYNC_BIN = RS_LIB_DIR + "/rs-sync"
 BOX_SYNC_BIN = "/usr/local/bin/rs-sync"
 ISSUE_READER_TOKEN_FILE = DEV_TOKENS_DIR / "issue-reader.token"
+# rs-publish and its image-reading token, staged by the host beside rs-sync: a
+# lockstep with rscore.RS_PUBLISH_BIN / IMAGE_READER_TOKEN_NAME and
+# rs_publish.SHELF_TOKEN_PATH (pinned by a test).
+RS_PUBLISH_BIN = RS_LIB_DIR + "/rs-publish"
+BOX_PUBLISH_BIN = "/usr/local/bin/rs-publish"
+IMAGE_READER_TOKEN_FILE = DEV_TOKENS_DIR / "image-reader.token"
 
 
 def _staged_gitea_ip() -> str:
@@ -2269,6 +2275,60 @@ def _stage_box_sync(cname: str) -> None:
               file=sys.stderr)
 
 
+def _stage_box_publish(cname: str) -> None:
+    """Copy rs-publish and the image-reading token from this project
+    container's own staged copies into a fetch box — _stage_box_sync's twin.
+    Each half warns and is skipped on its own failure; nothing here raises."""
+    try:
+        body = Path(RS_PUBLISH_BIN).read_bytes()
+    except FileNotFoundError:
+        body = None
+        print(f"warning: rs-publish is not staged in this project, so box "
+              f"{cname!r} gets none; stop and start the project, then restart "
+              f"this box", file=sys.stderr)
+    except OSError as e:
+        body = None
+        print(f"warning: rs-publish could not be read in this project "
+              f"({e.strerror or type(e).__name__}), so box {cname!r} gets none",
+              file=sys.stderr)
+    if body is not None:
+        try:
+            r = subprocess.run(
+                ["docker", "exec", "-i", "-u", "0", cname, "sh", "-c",
+                 f"cat > {BOX_PUBLISH_BIN} && chmod 755 {BOX_PUBLISH_BIN}"],
+                input=body, capture_output=True)
+        except OSError as e:
+            r = subprocess.CompletedProcess(
+                [], 1, b"", (e.strerror or type(e).__name__).encode())
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or b"").decode(errors="replace").strip()
+            print(f"warning: staging rs-publish into box {cname!r} failed: "
+                  f"{err or 'cat returned non-zero'}", file=sys.stderr)
+    try:
+        raw = IMAGE_READER_TOKEN_FILE.read_bytes().strip()
+    except OSError:
+        raw = b""
+    # Only a 40-hex token is copied: anything else in the file is not a token.
+    if not re.fullmatch(rb"[0-9a-f]{40}", raw):
+        print(f"warning: the image-reading token is not staged in this project, "
+              f"so rs-publish in box {cname!r} cannot read built images; stop "
+              f"and start the project, then restart this box", file=sys.stderr)
+        return
+    try:
+        r = subprocess.run(
+            ["docker", "exec", "-i", "-u", "worker", cname, "sh", "-c",
+             'umask 077 && mkdir -p "$HOME/.dev-tokens" && '
+             f'cat > "$HOME/.dev-tokens/{IMAGE_READER_TOKEN_FILE.name}"'],
+            input=raw + b"\n", capture_output=True)
+    except OSError as e:
+        r = subprocess.CompletedProcess(
+            [], 1, b"", (e.strerror or type(e).__name__).encode())
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or b"").decode(errors="replace").strip()
+        print(f"warning: image-token staging into box {cname!r} failed: {err}",
+              file=sys.stderr)
+
+
 def _stage_box_fetch(cname: str) -> None:
     """Copy the opt-in fetch surface into a just-run rs-fetch-ENABLED box: the
     rs-fetch tool (from this supervisor's own staged copy, root-owned 0755) +
@@ -2281,9 +2341,11 @@ def _stage_box_fetch(cname: str) -> None:
     re-stages the halves for fetch-consumer projects), then `rs-sandbox
     restart` of this box. A staging FAILURE warns and leaves the box usable
     without fetch (never die — the box itself is fine). rs-sync and its
-    issue-reading token are copied first, independently: a missing half of
-    one never stops the other."""
+    issue-reading token are copied first, then rs-publish and its
+    image-reading token, independently: a missing half of one never stops the
+    other."""
     _stage_box_sync(cname)
+    _stage_box_publish(cname)
     try:
         tok = OPERATOR_TOKEN_FILE.read_text().strip()
     except OSError:

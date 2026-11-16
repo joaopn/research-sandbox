@@ -14118,6 +14118,7 @@ def wire_gitea_to_projects(progress=None) -> None:
             # checked (and minted when needed) once per pass, never per project.
             if not issue_token_checked:
                 _ensure_issue_reader_token(progress, serving)
+                _ensure_image_reader_token(progress, serving)
                 issue_token_checked = True
             _stage_dev_fetch(container_name_for(project), progress=progress,
                              serving=serving, ensure=False)
@@ -14423,13 +14424,15 @@ def _stage_dev_fetch(container: str, progress=None, serving: bool = True,
     # (the wiring pass), so a failing mint is not retried per project.
     if ensure:
         _ensure_issue_reader_token(progress, serving)
+        _ensure_image_reader_token(progress, serving)
     if not tools_ok:
         return
     _stage_rs_sync(container)
+    _stage_rs_publish(container)
     # On PATH only where the container itself fetches; a project whose only
     # fetch consumers are its boxes keeps them in RS's folder as their source.
     if _container_fetches_itself(container):
-        _link_rs_commands(container, ("rs-fetch", "rs-sync"), on_old="skip")
+        _link_rs_commands(container, RS_FETCH_LINKS, on_old="skip")
 
 
 def _container_fetches_itself(container: str) -> bool:
@@ -14453,6 +14456,9 @@ ISSUE_READER_TOKEN_NAME = "issue-reader.token"
 # RS_SYNC_BIN, the copy sources of a fetch box (pinned).
 RS_FETCH_BIN = RS_LIB_DIR + "/rs-fetch"
 RS_SYNC_BIN = RS_LIB_DIR + "/rs-sync"
+# The typed fetch-surface commands linked onto PATH in a container that
+# fetches itself.
+RS_FETCH_LINKS = ("rs-fetch", "rs-sync", "rs-publish")
 # How often a process waiting for another's token mint looks again. The wait
 # is bounded by gitea.ISSUE_TOKEN_MINT_TIMEOUT_S plus two probe timeouts
 # (gitea.STATUS_TIMEOUT_S, the holder's probes); a mint takes about a second,
@@ -14626,6 +14632,169 @@ def _ensure_issue_reader_token(progress=None, serving: bool = True) -> None:
     except ValueError:
         # e.g. a token Gitea's admin CLI or the admin file holds that cannot
         # go into a header: a fixed text, never the value.
+        report("a Gitea token could not be used")
+
+
+# --- rs-publish and its image-reading token ----------------------------------
+#
+# Siblings of the rs-sync functions above, not a shared body: archived pins cut
+# the issue token's lines and patch its names. Same rules throughout: the tool
+# and the token are staged into rs-fetch surfaces; the token is minted only
+# when none works and the admin answers on the same probe route.
+
+# The in-container name of the image-reading token: a lockstep with
+# rs_sandbox.IMAGE_READER_TOKEN_FILE (the box copy) and rs_publish.SHELF_TOKEN_PATH
+# (the reader). Pinned by a test.
+IMAGE_READER_TOKEN_NAME = "image-reader.token"
+# MIRROR of rs_sandbox.RS_PUBLISH_BIN, the copy source of a fetch box (pinned).
+RS_PUBLISH_BIN = RS_LIB_DIR + "/rs-publish"
+
+
+def _read_image_reader_token() -> str:
+    """The host's image-reading token, or "" when the file is absent or does
+    not hold exactly one 40-hex token. Other OSErrors propagate."""
+    try:
+        raw = gitea.image_reader_token_path().read_bytes()
+    except FileNotFoundError:
+        return ""
+    tok = raw.strip()
+    return tok.decode("ascii") if re.fullmatch(rb"[0-9a-f]{40}", tok) is not None else ""
+
+
+def _stage_rs_publish(container: str) -> None:
+    """Copy rs-publish and, when the host holds one, the image-reading token
+    into an rs-fetch container (the token 0600 over stdin, never argv). Each
+    half warns and is skipped on its own failure; nothing here raises."""
+    src = Path(__file__).resolve().parent / "rs_publish.py"
+    try:
+        body = src.read_bytes()
+    except OSError as e:
+        print(f"warning: rs-publish not staged into {container}: rs_publish.py "
+              f"could not be read ({e.strerror or type(e).__name__})", file=sys.stderr)
+        body = None
+    if body is not None:
+        try:
+            r = subprocess.run(
+                ["docker", "exec", "-i", "-u", "0", container, "sh", "-c",
+                 f"mkdir -p {RS_LIB_DIR} && cat > {RS_PUBLISH_BIN} "
+                 f"&& chmod 755 {RS_PUBLISH_BIN}"],
+                input=body, capture_output=True)
+        except OSError as e:
+            print(f"warning: staging rs-publish into {container} failed "
+                  f"({e.strerror or type(e).__name__})", file=sys.stderr)
+            r = None
+        if r is not None and r.returncode != 0:
+            detail = (r.stderr or b"").decode(errors="replace").strip()
+            print(f"warning: staging rs-publish into {container} failed: "
+                  f"{detail or 'cat returned non-zero'}", file=sys.stderr)
+    try:
+        tok = _read_image_reader_token()
+    except OSError:
+        return
+    if not tok:
+        return
+    try:
+        r = run(["docker", "exec", "-i", "-u", "research", container, "sh", "-c",
+                 'umask 077 && mkdir -p "$HOME/.dev-tokens" && '
+                 f'cat > "$HOME/.dev-tokens/{IMAGE_READER_TOKEN_NAME}"'],
+                input=tok + "\n", capture_output=True)
+    except (OSError, ValueError) as e:   # ValueError: output that is not text
+        print(f"warning: image-token staging into {container} failed "
+              f"({type(e).__name__})", file=sys.stderr)
+        return
+    if r.returncode != 0:
+        print(f"warning: image-token staging into {container} failed: "
+              f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
+
+
+@contextlib.contextmanager
+def _image_reader_locks():
+    """_issue_reader_locks' twin over the image token's own mint lock: True
+    while holding the Gitea lock SHARED and the mint lock EXCLUSIVE; False at
+    once under an upgrade or restore, or after the bounded wait for another
+    mint."""
+    fds = []
+    try:
+        gitea.DEV_DIR.mkdir(parents=True, exist_ok=True)
+        g = os.open(_gitea_lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
+        fds.append(g)
+        try:
+            fcntl.flock(g, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        m = os.open(gitea.image_reader_lock_path(), os.O_RDWR | os.O_CREAT, 0o600)
+        fds.append(m)
+        deadline = (time.monotonic() + gitea.ISSUE_TOKEN_MINT_TIMEOUT_S
+                    + 2 * gitea.STATUS_TIMEOUT_S)
+        while True:
+            try:
+                fcntl.flock(m, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    yield False
+                    return
+                time.sleep(ISSUE_READER_LOCK_POLL_S)
+        yield True
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+def _ensure_image_reader_token(progress=None, serving: bool = True) -> None:
+    """Make sure the host holds a working image-reading token, minting one
+    when it does not — _ensure_issue_reader_token's rules over the package
+    probe. Never aborts the caller: every failure is a warning, and only when
+    a mint was needed and was skipped or failed."""
+    path = gitea.image_reader_token_path()
+
+    def report(why: str) -> None:
+        _report_warnings([f"the Gitea access to built images that rs-fetch "
+                          f"projects share could not be set up ({why}); "
+                          f"starting an rs-fetch project again retries it"], progress)
+
+    read = _read_image_reader_token
+    try:
+        if not serving or not container_running(gitea.GITEA_CONTAINER):
+            if not read():
+                report("Gitea is not answering" if not serving
+                       else "Gitea is not running")
+            return
+        hp = _gitea_host_port()
+        tok = read()
+        if tok:
+            st = gitea.probe_package_read(hp, tok)
+            if st == 200 or st not in {401, 403}:
+                return
+        held = _gitea_held_reason()
+        if held:
+            report(held)             # an upgrade or restore holds Gitea
+            return
+        try:
+            admin = gitea.read_admin_token()
+        except gitea.GiteaError:
+            admin = ""
+        if not admin or gitea.probe_package_read(hp, admin) != 200:
+            report("Gitea did not confirm its admin access")
+            return
+        with _image_reader_locks() as ok:
+            if not ok:
+                report("Gitea is busy with an upgrade, a restore or another token mint")
+                return
+            tok = read()
+            if tok and gitea.probe_package_read(hp, tok) == 200:
+                return
+            new = gitea.mint_image_reader_token()
+            if gitea.probe_package_read(hp, new) != 200:
+                report("the new token was not accepted")
+                return
+            gitea.write_secret_atomic(path, new + "\n")
+    except gitea.GiteaError as e:
+        report(str(e) or "Gitea refused")
+    except OSError as e:
+        report(e.strerror or e.__class__.__name__)   # never str(e): it names the host path
+    except ValueError:
         report("a Gitea token could not be used")
 
 
@@ -16464,8 +16633,8 @@ RS_COMMANDS_UNREADABLE = (
     "where its helper commands are; stop the project and start it again")
 # The typed commands RS links onto a container's PATH from RS_LIB_DIR, by the
 # container's kind. Everything else a container types is baked or staged
-# straight into /usr/local/bin (rs-worker, rs-role-mcp, rs-sandbox, rs-fetch
-# and rs-sync for a container that fetches itself). A MIRROR of
+# straight into /usr/local/bin (rs-worker, rs-role-mcp, rs-sandbox, and the
+# fetch tools, RS_FETCH_LINKS, for a container that fetches itself). A MIRROR of
 # rs_sandbox.BOX_LINKS (pinned).
 RS_DEV_LINKS = ("rs-wt", "rs-land", "rs-board")
 RS_WEB_LINKS = ("rs-web-restart",)
