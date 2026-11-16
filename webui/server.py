@@ -3580,16 +3580,22 @@ def _read_project_marker(project: str) -> dict:
     bind-mount, or {} when missing/unreadable (legacy projects, bad JSON). The
     single read behind _read_project_type / _read_project_substrate and the
     rail's workflow label — same no-cache, no-socket discipline as
-    _read_project_extensions. The marker carries {type, substrate, workflow, agent}."""
+    _read_project_extensions. The marker carries {type, substrate, workflow, agent}.
+    ValueError covers invalid UTF-8 and a number past Python's int-string
+    limit, RecursionError a record nested past the parser's limit: any of them
+    escaping would fail /projects/status for EVERY name in the batch (B225),
+    so they read as {} like the host's _read_marker_three_way. The is_file()
+    stat sits inside the try for the same reason: it re-raises a
+    PermissionError (a folder the project made unreadable)."""
     workspace = _project_workspace(project)
     if workspace is None:
         return {}
     f = workspace / ".orchestrator" / "project.json"
-    if not f.is_file():
-        return {}
     try:
+        if not f.is_file():
+            return {}
         data = json.loads(f.read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError, RecursionError):
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -3619,7 +3625,8 @@ def _agents_local_from_marker(marker: object) -> list[str]:
 
 def _agents_staged(project: str) -> list[str]:
     marker = _read_project_marker(project)
-    agents = [a for a in (marker.get("agents") or []) if isinstance(a, str)]
+    raw = marker.get("agents")   # a non-list reads as none, as on the host
+    agents = [a for a in raw if isinstance(a, str)] if isinstance(raw, list) else []
     if marker.get("substrate") == "docker":
         return agents
     return list(dict.fromkeys(["claude", *agents]))
@@ -3701,14 +3708,19 @@ def _project_summary(name: str) -> dict:
         return {"error": "not_found"}
     marker = _read_project_marker(name)
     flavor = "sandbox-dind" if marker.get("type") == "sandbox-dind" else "research"
+    # Only a string leaves the record: a non-list `agents` would raise, and a
+    # NaN `workflow` (json.loads accepts it) would make the reply unparseable
+    # in the browser — either blanks every badge of the batch (B225).
+    wf = marker.get("workflow")
+    raw = marker.get("agents")
     return {
         "flavor": flavor,
-        "workflow": marker.get("workflow") or flavor,
+        "workflow": wf if isinstance(wf, str) and wf else flavor,
         # The project's deployed agent set (marker `agents`; [] on research and
         # legacy markers) — the Agents row + the box window's agent choices read
         # it (a box can only deploy what THIS project staged). Marker reads,
         # so the summary stays walk-free.
-        "agents": [a for a in (marker.get("agents") or []) if isinstance(a, str)],
+        "agents": [a for a in raw if isinstance(a, str)] if isinstance(raw, list) else [],
         # What a box in this project can deploy — the STAGED set: on a dind
         # project claude is always staged as the box copy-source and the marker
         # adds the rest (TOLERANT MIRROR of rscore._dind_stage_set — the webui
