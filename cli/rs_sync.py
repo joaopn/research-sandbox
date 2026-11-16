@@ -61,6 +61,7 @@ import stat
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -118,13 +119,14 @@ NO_HEADER_WAIT_S = 60
 # clearing, and the run is resumed later instead.
 RATE_WAIT_MAX_S = 3600
 # Import polling. GitHub processes an import in the background; the probe
-# saw imports finish in seconds. Poll every 2 s for up to 5 minutes: at half
-# the deadline a slow-but-healthy import of an issue with many comments could
-# be abandoned (it would then block the next run until it lands, which the
-# start-of-run check handles); at ten times it, a stuck import would hold the
-# terminal for an hour.
+# saw imports finish in seconds. Every 2 s keeps the wait for a few-second
+# import short at a cost of a handful of reads; at half it the reads double
+# for no gain, at ten times it every import waits 20 s. There is no deadline:
+# GitHub offers no way to find an abandoned import later (it has no listing of
+# a repo's imports, B252), so giving up on one could import the item twice.
+# The poll waits for GitHub's own answer, and Ctrl-C stops it with advice.
 IMPORT_POLL_S = 2
-IMPORT_DEADLINE_S = 300
+IMPORT_STATUSES = ("pending", "imported", "failed")
 
 MARKER_TAG = "rs-sync v1"
 LABEL_TAG = " (rs-sync)"
@@ -140,7 +142,12 @@ REPORT: dict = {}
 
 
 class SyncError(Exception):
-    """A refusal or failure that stops the run, with what to do."""
+    """A refusal or failure that stops the run, with what to do. `status` is
+    the HTTP code when GitHub answered with an error, else None."""
+
+    def __init__(self, msg: str, status: int | None = None):
+        super().__init__(msg)
+        self.status = status
 
 
 def die(msg: str) -> None:
@@ -975,7 +982,8 @@ class GitHub:
                     return e.code, None, headers
                 if write:
                     self.writes.append(time.time())
-                die(f"GitHub {method} {path} -> HTTP {e.code}: {_safe(text, self.token)}")
+                raise SyncError(f"GitHub {method} {path} -> HTTP {e.code}: "
+                                f"{_safe(text, self.token)}", status=e.code)
             except (URLError, OSError) as e:
                 die(f"GitHub did not answer ({method} {path}: "
                     f"{getattr(e, 'reason', e)})")
@@ -1377,64 +1385,45 @@ def preflight_github(gh: GitHub, target: str, board: bool = False):
     return me, repo, scopes
 
 
-def check_imports(gh: GitHub, target: str, repo: dict, gh_numbers: set):
-    """Refuse while an earlier import is still landing: its issue would not be
-    listed yet, and importing the item again would duplicate it."""
-    o, r = target.split("/", 1)
-    since = repo.get("created_at") or "2008-01-01T00:00:00Z"
-    rows = gh.all(f"/repos/{quote(o)}/{quote(r)}/import/issues", {"since": since},
-                  accept=IMPORT_ACCEPT)
-    for row in rows:
-        st = (row or {}).get("status")
-        if st == "pending":
-            die("an earlier import is still being processed by GitHub; try "
-                "again in a few minutes")
-        if st == "imported":
-            # A finished import whose issue the list does not show: a direct
-            # read decides. 200 means the list has not caught up (importing the
-            # item again would duplicate it); anything else means the issue
-            # was deleted after it landed (a remove, or by hand).
-            n = _number_from_url((row or {}).get("issue_url") or "")
-            if n is not None and n not in gh_numbers:
-                REPORT["import_rows_read_directly"] = REPORT.get("import_rows_read_directly", 0) + 1
-                status, got, _ = gh.call("GET", f"/repos/{quote(o)}/{quote(r)}/issues/{n}",
-                                         ok404=True)
-                # A transferred issue answers through a redirect with ANOTHER
-                # repo's issue: for this repo it is gone, like a deleted one,
-                # and the next run mirrors the Gitea item again.
-                canon = (repo.get("full_name") or f"{o}/{r}").lower()
-                here = isinstance(got, dict) and got.get("number") == n and \
-                    (got.get("repository_url") or "").lower().endswith(f"/repos/{canon}")
-                if status == 200 and here:
-                    die(f"GitHub reports an import as done (#{n}) that its issue "
-                        f"list does not show yet; try again in a few minutes")
-
-
 def do_import(gh: GitHub, target, payload, n_gitea) -> int:
+    """Send one import and wait for GitHub's answer. While it runs,
+    REPORT["importing"] names the Gitea item, so a run that stops here ends
+    with advice (main); it is cleared only on a definite answer: imported
+    with its issue named, failed, or a 4xx refusal of the POST."""
     o, r = target.split("/", 1)
     what = f"Gitea #{n_gitea}"
+    REPORT["importing"] = n_gitea
     try:
         _, res, _ = gh.call("POST", f"/repos/{quote(o)}/{quote(r)}/import/issues",
                             payload, accept=IMPORT_ACCEPT)
     except SyncError as e:
+        if e.status is not None and 400 <= e.status < 500:
+            REPORT.pop("importing", None)
         die(f"{what}: {e}")
-    url = (res or {}).get("url")
+    url = (res if isinstance(res, dict) else {}).get("url")
     if not url:
         die(f"{what}: GitHub's import answered without a status URL")
-    deadline = time.time() + IMPORT_DEADLINE_S
+    polls = 0
     while True:
         _, st, _ = gh.call("GET", "", accept=IMPORT_ACCEPT, full_url=url)
-        status = (st or {}).get("status")
+        polls += 1
+        if not isinstance(st, dict):
+            die(f"{what}: GitHub's import status answer was not a JSON object")
+        status = st.get("status")
+        if status not in IMPORT_STATUSES:
+            die(f"{what}: GitHub's import status is {status!r}, not one of "
+                f"{', '.join(IMPORT_STATUSES)}")
         if status == "imported":
             n = _number_from_url(st.get("issue_url") or "")
-            if n is None:
+            if n is None:       # created, number unknown: keep the advice
                 die(f"{what}: GitHub's import finished without naming the issue")
+            REPORT.pop("importing", None)
             return n
         if status == "failed":
+            REPORT.pop("importing", None)
             die(f"{what}: GitHub's import failed: {json.dumps(st.get('errors'))[:300]}")
-        if time.time() > deadline:
-            die(f"{what}: GitHub's import did not finish within {IMPORT_DEADLINE_S} s; "
-                f"run again later (the next run waits for it)")
+        if polls == 2:
+            print(f"  waiting for GitHub to import {what}…", file=sys.stderr)
         time.sleep(0.05 if _TEST_FAST else IMPORT_POLL_S)
 
 
@@ -1519,9 +1508,6 @@ def sync(args, env) -> None:
     REPORT["held_open_issues"] = sorted(
         i["number"] for i in gt["issues"]
         if i.get("state") == "open" and i["number"] not in {x["n"] for x in items})
-    gh_numbers = {i["number"] for i in have["issues"]}
-    if apply:
-        check_imports(gh, target, repo_info, gh_numbers)
 
     table = {n: v["number"] for n, v in have["items"].items()}
     ctx = Ctx(owner, repo, target, table)
@@ -1637,6 +1623,18 @@ def sync(args, env) -> None:
     # Re-read GitHub, then bring every mirrored item level (forward
     # references, edits, new comments, state, labels, lock, deletions).
     have = read_github(gh, target, me["id"], owner, repo)
+    # Every item this run imported must be listed now, as the issue this run
+    # made. Missing: GitHub's list lags, and a run started now would import it
+    # again. Another number: an older copy (an import from an interrupted run
+    # that landed late) claims the item. Either way stop before any edit.
+    for gn, num in sorted(done["imported"].items()):
+        listed = have["items"].get(gn)
+        if listed is None:
+            die(f"GitHub has imported Gitea #{gn} as #{num} but does not list it "
+                f"yet; wait a few minutes, then run again")
+        if listed["number"] != num:
+            die(f"GitHub issues #{listed['number']} and #{num} both claim Gitea #{gn}; "
+                f"delete one of them, then run again")
     for n, v in have["items"].items():
         table[n] = v["number"]
     _fill_existing_plan(plan, items, have, ctx, rid, env, subjects_index, gt, g, owner, repo,
@@ -1845,7 +1843,7 @@ CACHE_DIR = Path.home() / ".cache" / "rs-sync"
 # The bound on one git network call (ls-remote, fetch, push of a wiki). A wiki
 # with images is a few MB; at half this a slow link could cut a push off (the
 # next run retries it), at ten times it a hung connection would hold the
-# terminal for most of an hour. The same bound as one import's deadline.
+# terminal for most of an hour.
 GIT_TIMEOUT_S = 300
 WIKI_SUBJECT = "Mirror the wiki of a private dev repo"
 _GIT_HELPER = ('!f() { test "$1" = get || exit 0; echo username=x-access-token; '
@@ -2592,6 +2590,19 @@ def print_report():
     print("===== TO HERE =====")
 
 
+def import_advice() -> str:
+    """The last line of a run that stopped while an import was being sent or
+    awaited; empty when none was. Worded to hold whether or not GitHub
+    received it (the record also covers the wait before sending)."""
+    n = REPORT.get("importing")
+    if n is None:
+        return ""
+    return (f"rs-sync was importing Gitea #{n} when it stopped. GitHub may or may "
+            f"not have received it. Wait a few minutes before running again; if it "
+            f"then appears twice, the next run names both copies, and you delete "
+            f"one on GitHub.")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="rs-sync",
@@ -2612,6 +2623,7 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     started = time.time()
     rc = 0
+    env = None
     try:
         env = read_env(Path(args.env))
         if args.remove:
@@ -2622,8 +2634,27 @@ def main(argv=None) -> int:
         REPORT["error"] = str(e)
         print(f"rs-sync: {e}", file=sys.stderr)
         rc = 1
+    except KeyboardInterrupt:
+        # Ctrl-C reaches a running git child too (one process group), and git
+        # cleans up its own lock files; this only replaces the traceback.
+        REPORT["error"] = "interrupted"
+        print("rs-sync: interrupted", file=sys.stderr)
+        rc = 130
+    except Exception as e:      # a defect: say so, keep the report
+        # The same secrets sync() keeps out of everything it sends.
+        secrets = [env["RS_SYNC_GITHUB_TOKEN"]] if env else []
+        try:
+            secrets += all_dev_tokens()
+        except Exception:
+            pass
+        REPORT["error"] = _safe(f"unexpected {type(e).__name__}: {e}", *secrets)
+        sys.stderr.write(_safe(traceback.format_exc(), *secrets))
+        rc = 1
     REPORT["seconds"] = round(time.time() - started, 1)
     print_report()
+    advice = import_advice()
+    if rc and advice:
+        print(advice)
     return rc
 
 
