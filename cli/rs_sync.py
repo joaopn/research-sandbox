@@ -18,6 +18,9 @@ What goes over, one way (Gitea -> GitHub):
     original creation, close and comment dates);
   * every merged pull request, as a closed, locked issue titled
     "[PR] <title>", labelled "merged-pr", listing the commits it landed as;
+  * every mirrored title starts with "[rs-sync] ", every mirrored item
+    carries the label "rs-sync", and each issue and PR record opens with a
+    line saying it was mirrored with rs-sync (RS_SYNC_HEADER=off drops it);
   * the Gitea labels the mirrored items carry, each tagged " (rs-sync)";
   * the fork's wiki: the GitHub wiki's tree is replaced by the converted Gitea
     tree, one commit per run whose message ends with a marker line;
@@ -41,7 +44,7 @@ The GitHub token is read from /workspace/.rs-sync.env (or --env):
                                         or prefixes ending in "*"; "*" alone
                                         holds every open issue; an empty
                                         value holds nothing
-    RS_SYNC_HEADER=on|off               optional, default off
+    RS_SYNC_HEADER=on|off               optional, default on
 The Gitea side is read with the read-only issue token staged at
 ~/.dev-tokens/issue-reader.token.
 
@@ -80,7 +83,7 @@ TOKENS_DIR = Path.home() / ".dev-tokens"
 DEFAULT_ENV = Path("/workspace/.rs-sync.env")
 GITHUB_API = "https://api.github.com"
 GITHUB_WEB = "https://github.com"
-# The product's home, linked from the optional header line.
+# The product's home, linked from the header line.
 RS_HOME = "https://github.com/joaopn/research-sandbox"
 
 # Test-only overrides (the harness points rs-sync at a throwaway Gitea and a
@@ -135,6 +138,13 @@ LABEL_TAG = " (rs-sync)"
 PR_LABEL = "merged-pr"
 PR_LABEL_COLOR = "6f42c1"
 PR_LABEL_DESC = "a merged pull request from the private dev repo"
+# Every mirrored item carries this label and its title starts with the tag.
+# A Gitea label of the same name (any case) is replaced by this one: GitHub
+# label names ignore case, so two spellings would collide at create.
+RS_LABEL = "rs-sync"
+RS_LABEL_COLOR = "0e8a16"
+RS_LABEL_DESC = "mirrored from a private dev repo"
+TITLE_TAG = "[rs-sync] "
 HEADER_LINE = f"*mirrored from a private dev repo with [rs-sync]({RS_HOME})*"
 CONTINUED = "(continued in the next comment)"
 NAME_RE = r"[A-Za-z0-9._-]+"
@@ -220,7 +230,7 @@ def read_env(path: Path) -> dict:
             f"whose open issues stay off GitHub (e.g. severity:*); an empty "
             f"value publishes every open issue")
     out["hold"] = parse_hold(out["RS_SYNC_HOLD_LABELS"], path)
-    header = out.get("RS_SYNC_HEADER", "off")
+    header = out.get("RS_SYNC_HEADER", "on")
     if header not in ("on", "off"):
         die(f"{path}: RS_SYNC_HEADER must be on or off, not {header!r}")
     out["header"] = header == "on"
@@ -823,9 +833,11 @@ def assemble(prefix: str, text: str, mark_for) -> list:
         if _size(build(trial, k, True)) <= GITHUB_BODY_MAX:
             cur = trial
             continue
-        if not cur or cur == prefix.rstrip("\n"):
+        if not cur:
             die(f"a single block of {_size(b)} bytes is over GitHub's "
                 f"{GITHUB_BODY_MAX}-byte limit and cannot be split")
+        # cur may be the prefix alone (a first block that fits only without
+        # it): the prefix then goes out as its own first part.
         parts.append(build(cur, k, True))
         k = (k or 0) + 1
         cur = b
@@ -1179,6 +1191,13 @@ def _number_from_url(u: str):
 # The desired state
 # ============================================================================
 
+def with_rs_label(labels) -> list:
+    """The item's labels with rs-sync's own label, replacing any spelling of
+    it Gitea carries."""
+    labels = [l for l in labels if l.lower() != RS_LABEL] + [RS_LABEL]
+    return labels
+
+
 def desired_items(gt: dict, owner, repo, hold, existing_sources) -> list:
     """Every Gitea item that should be on GitHub, in number order. An open
     issue carrying a hold label is left out unless it is already mirrored
@@ -1195,7 +1214,7 @@ def desired_items(gt: dict, owner, repo, hold, existing_sources) -> list:
                       "created_at": i.get("created_at"),
                       "updated_at": i.get("updated_at"),
                       "closed_at": i.get("closed_at"),
-                      "closed": not is_open, "labels": labels,
+                      "closed": not is_open, "labels": with_rs_label(labels),
                       "comments": sorted(gt["comments"].get(i["number"], []),
                                          key=lambda c: (c["created_at"] or "", c["id"]))})
     for p in gt["merged"]:
@@ -1204,7 +1223,7 @@ def desired_items(gt: dict, owner, repo, hold, existing_sources) -> list:
                       "body": p["body"], "user": p["user"],
                       "created_at": p["created_at"], "updated_at": p.get("updated_at"),
                       "closed_at": p["closed_at"],
-                      "closed": True, "labels": p["labels"] + [PR_LABEL],
+                      "closed": True, "labels": with_rs_label(p["labels"] + [PR_LABEL]),
                       "base": p["base"], "subjects": p["subjects"],
                       "comments": sorted(comments, key=lambda c: (c["created_at"] or "",
                                                                   {"comment": 0, "review": 1,
@@ -1254,6 +1273,8 @@ def comment_parts(ctx, item, c, rid) -> list:
 
 def convert_title(ctx, title) -> str:
     t = _finish(_convert_inline(ctx, _strip_private(title or "")))
+    # added after conversion: the tag is constant text the converter never sees
+    t = (TITLE_TAG + t).rstrip()
     if len(t) > GITHUB_TITLE_MAX:
         # never leave part of a number after a "#" or "GH-": it would link
         # a different issue
@@ -1483,6 +1504,8 @@ def label_payloads(gt_labels, wanted) -> dict:
     for name in sorted(wanted):
         if name == PR_LABEL:
             desc, color = PR_LABEL_DESC, PR_LABEL_COLOR
+        elif name == RS_LABEL:
+            desc, color = RS_LABEL_DESC, RS_LABEL_COLOR
         else:
             l = by.get(name) or {}
             desc = (l.get("description") or "").strip()
