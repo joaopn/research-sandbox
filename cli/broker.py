@@ -1324,8 +1324,7 @@ def _verb_dev_image_discard(args: dict, _progress=None) -> dict:
     req = rscore.DevImageRequest.from_kwargs(**safe)  # may raise ValidationError
     if _image_build_in_flight(req.repo):
         raise rscore.ValidationError(
-            f"an image of {req.repo!r} is being built right now, or the repo "
-            f"is being removed; wait for that to end")
+            rscore.BUILD_LOCK_HELD_MSG.format(repo=req.repo))
     return dataclasses.asdict(rscore.dev_image_discard(req))
 
 
@@ -2129,8 +2128,8 @@ def _verb_dev_gitea_rollback(args: dict, progress=None) -> dict:
     return dataclasses.asdict(rscore.dev_gitea_rollback(req, progress))
 
 
-# Building a repo's image: minutes of work (a builder project, a docker
-# build, the push), so it runs detached. Several repos build at once; one
+# Building a repo's image: minutes of work (a throwaway builder container, a
+# docker build, the push), so it runs detached. Several repos build at once; one
 # repo's second build is refused at dispatch and again by the job's own lock.
 DEV_IMAGE_BUILD_WEBUI_FIELDS = frozenset({"repo", "ref", "dockerfile"})
 
@@ -2426,7 +2425,7 @@ def run_dev_box(op_id: str, verb: str) -> None:
     except KeyboardInterrupt:
         # The job was told to stop (the Cancel verb's signal, or the machine
         # shutting down). Only Cancel's own record makes it "cancelled": what
-        # the builder project looks like says nothing about why the job ended.
+        # the builder looks like says nothing about why the job ended.
         if verb in _DEV_LANE_CANCELLABLE and _read_dev_box_lock(op_id).get("cancelled"):
             op.progress.fail(_DEV_LANE_CANCELLED)
         else:
@@ -2994,9 +2993,8 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
                                      "box dialog take its GitHub URL)"))
             if _image_build_in_flight(repo):
                 return _audited(principal, "busy",
-                                _err("busy", f"an image of {repo!r} is being "
-                                             "built right now, or the repo is "
-                                             "being removed; wait for that to end"))
+                                _err("busy", rscore.BUILD_LOCK_HELD_MSG.format(
+                                    repo=repo)))
         if verb == "dev_box_provision" and _project_in_flight(safe.get("project")):
             return _audited(principal, "busy",
                             _err("busy", f"{safe.get('project')} is starting, "

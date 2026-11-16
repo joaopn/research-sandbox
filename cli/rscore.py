@@ -7594,7 +7594,15 @@ def project_remnants(project: str, cfg: "Config") -> list[str]:
     return out
 
 
-def wait_for_inner_dockerd(container: str, timeout: int = 60) -> None:
+# How long a docker-in-docker container's own Docker daemon may take to answer
+# after the container starts. Measured at 2 s on an idle machine; a loaded host
+# or a slow disk takes several times that. At half this a busy host could fail
+# a healthy start; past it the daemon is not coming (its log says why), and
+# waiting longer only delays the error.
+INNER_DOCKERD_WAIT_S = 60
+
+
+def wait_for_inner_dockerd(container: str, timeout: int = INNER_DOCKERD_WAIT_S) -> None:
     import time
 
     deadline = time.time() + timeout
@@ -23913,12 +23921,22 @@ def _discard_built_image(host_port: str, repo: str) -> int:
 
 # --- building an image ---------------------------------------------------------
 #
-# A build runs in a BUILDER: an ordinary docker-in-docker project with locked
-# egress, no agent and no editor, created through create() and removed through
-# destroy(). Its containment is that project type's; a build that crashes
-# leaves a project the Management page lists and can destroy.
+# A build runs in a BUILDER: one throwaway container from the docker-in-docker
+# image (its own Docker daemon behind the inner guard, so a Dockerfile RS does
+# not control never reaches the machine's daemon), on a network of its own with
+# locked egress through the router. It is not a project: nothing lists it, and
+# the build removes it, its volumes and its network however it ends. A builder
+# a build left behind when it died hard is removed by the next build.
 
-IMAGE_BUILDER_PREFIX = "build-"
+# Builder container and network names: this prefix + the repo's image name.
+IMAGE_BUILD_PREFIX = "rs-image-build-"
+# Every builder container and network carries this label; one that does not is
+# not RS's, and the build refuses rather than removing it.
+IMAGE_BUILD_LABEL = "research.image-build"
+# Serialises the builders' network setup and the leftover sweep across builds
+# (separate processes). Its own file, so a review never waits behind a build's
+# sweep (the reviewer has REVIEWER_NET_LOCK). Host-only, beside the reviewer's.
+IMAGE_BUILD_NET_LOCK = Path.home() / ".research-sandbox" / "image-build-net.lock"
 # Everything the shelf relies on (who may read a private organisation's image,
 # what the registry stores per version, the dump's skip switch) was measured on
 # Gitea 28. An instance still on an older release is refused until upgraded.
@@ -23938,8 +23956,7 @@ _MIRROR_REFRESH_POLL_S = 1
 # buffer's size, so each read is one write. Smaller only adds system calls;
 # larger holds more of the archive in memory for nothing.
 _STREAM_CHUNK_BYTES = 1 << 16
-# Where the build works inside the builder: the container's own filesystem,
-# deliberately not /workspace, which is a folder on the machine.
+# Where the build works inside the builder: the container's own filesystem.
 _BUILDER_WORKDIR = "/home/research/image-build"
 _BUILT_IMAGE = "rs-built:latest"
 # How much of a build's output is kept. The output is written by a Dockerfile
@@ -23952,25 +23969,19 @@ IMAGE_BUILD_LOG_MAX_BYTES = 16 * 1024 * 1024
 _GUARD_DROPS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16")
 
 
-def _builder_project_name(repo: str) -> str:
-    """The builder project's name for `repo`, or "" when the repo's name
-    cannot be part of a project name (project names hold no dot)."""
-    name = IMAGE_BUILDER_PREFIX + repo.lower()
-    return name if valid_project_name(name) else ""
-
-
-def _builder_leftover_msg(repo: str, builder: str) -> str:
-    return (f"a project named {builder!r} exists: it is the builder an earlier "
-            f"build of {repo!r} left behind, or a project of yours with that "
-            f"name. Destroy it under Sandboxes → Management, then try again.")
+def _builder_name(image_name: str) -> str:
+    """The builder container's (and its network's) name for a repo whose
+    image name is `image_name` (the lower-cased repo name, the same key the
+    repo's build lock uses)."""
+    return IMAGE_BUILD_PREFIX + image_name
 
 
 def _build_die(msg: str) -> None:
     """die() for the image build's OWN refusals and failures: texts written
     for the operator that name no path on the machine, no credential and no
     terminal command. The mark lets the broker show exactly these in the log
-    the webui reads; anything else that ends a build (a project create's
-    docker error, for one) stays in the log only the broker serves."""
+    the webui reads; anything else that ends a build (a docker error, for one)
+    stays in the log only the broker serves."""
     try:
         die(msg)
     except SystemExit as e:
@@ -23978,11 +23989,18 @@ def _build_die(msg: str) -> None:
         raise
 
 
+BUILD_LOCK_HELD_MSG = ("an image of {repo!r} is being built right now, the repo "
+                        "is being removed, or what an earlier build of it left "
+                        "behind is being cleared; wait for that to end")
+
+
 @contextlib.contextmanager
 def _image_build_lock(repo: str, *, removing: bool = False):
-    """Hold the repo's build lock, or die when a build of it holds it. flock:
-    a dead holder's lock is released by the kernel, and the file stays.
-    `removing` is the mirror removal asking: its refusal names the build."""
+    """Hold the repo's build lock, or die when someone holds it: a build of
+    the repo, the mirror's removal, or another build clearing a builder this
+    repo's earlier build left behind. flock: a dead holder's lock is released
+    by the kernel, and the file stays. `removing` is the mirror removal
+    asking."""
     path = gitea.image_build_lock_path(repo)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -23995,10 +24013,10 @@ def _image_build_lock(repo: str, *, removing: bool = False):
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             if removing:
-                _build_die(f"an image of {repo!r} is being built right now; "
-                           f"wait for that build to end")
-            _build_die(f"an image of {repo!r} is being built right now, or the repo "
-                f"is being removed; wait for that to end")
+                _build_die(f"an image of {repo!r} is being built right now, or "
+                           f"what an earlier build of it left behind is being "
+                           f"cleared; wait for that to end")
+            _build_die(BUILD_LOCK_HELD_MSG.format(repo=repo))
         yield
     finally:
         os.close(fd)
@@ -24007,31 +24025,221 @@ def _image_build_lock(repo: str, *, removing: bool = False):
 @contextlib.contextmanager
 def _no_build_of(repo: str):
     """Hold off builds of `repo` for the block (mirror removal): hold the
-    build lock, which refuses when a build is running, then refuse when its
-    builder project exists. In that order, as in the build: a running build's
-    builder is not a leftover to destroy."""
-    builder = _builder_project_name(repo)
+    build lock, which refuses while a build of it runs. A builder an earlier
+    build left behind is not the removal's concern: the next build of any
+    repo removes it."""
     with _image_build_lock(repo, removing=True):
-        if builder and project_remnants(builder, load_config()):
-            _build_die(_builder_leftover_msg(repo, builder))
         yield
 
 
-@contextlib.contextmanager
-def _lifecycle_flock():
-    """Hold the host-wide lifecycle flock, waiting for it. A builder's create
-    and destroy take it so two builds (or a build and a project action)
-    never allocate a port or remove a network at the same moment."""
+def _try_build_lock(image_name: str):
+    """The build lock of the repo whose image name is `image_name`, taken
+    without waiting: the open fd, or None when someone holds it or it cannot
+    be opened. The caller closes the fd (which releases the lock)."""
+    path = gitea.image_build_lock_path(image_name)
     try:
-        LIFECYCLE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-        lock_f = open(LIFECYCLE_LOCK_PATH, "a")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _labelled_builder_names() -> "tuple[set, set]":
+    """The image names of the builder containers, and separately of the
+    builder networks, on the machine that carry the build label. Kept apart:
+    a labelled network says nothing about a same-named container, which may
+    not be RS's. A labelled name that is not the prefix plus a valid image
+    name is skipped: it cannot be mapped to a repo's lock."""
+    found = (set(), set())
+    for argv, names in ((["docker", "ps", "-a", "--format", "{{.Names}}"], found[0]),
+                        (["docker", "network", "ls", "--format", "{{.Name}}"], found[1])):
+        r = run(argv + ["--filter", f"label={IMAGE_BUILD_LABEL}=1"],
+                capture_output=True)
+        if r.returncode != 0:
+            continue
+        for line in (r.stdout or "").splitlines():
+            n = line.strip()
+            rest = n[len(IMAGE_BUILD_PREFIX):] if n.startswith(IMAGE_BUILD_PREFIX) else ""
+            if rest and image_registry.IMAGE_NAME_RE.match(rest):
+                names.add(rest)
+    return found
+
+
+def _remove_builder(name: str, *, container: bool = True,
+                    network: bool = True) -> None:
+    """Remove a builder container (with its volumes) and its network, by name.
+    Never raises: a build's own outcome must not be replaced by its clean-up's.
+    The network goes as a project network does: its router rules and range
+    first while the router runs, then the router detached (docker lets a
+    network go while a stopped container is attached, and that container can
+    then never start), then the network."""
+    failed = False
+    try:
+        # A removal failed when the thing is still there afterwards, not when
+        # docker merely answered non-zero (a concurrent removal, say).
+        if container:
+            if run(["docker", "rm", "-f", "-v", name],
+                   capture_output=True).returncode != 0:
+                failed |= run_quiet(["docker", "container", "inspect", name])
+        if network and network_exists(name):
+            if container_running(ROUTER_CONTAINER):
+                # Its own guard, as in destroy: a rule step that fails must
+                # not keep the network from going.
+                try:
+                    remove_firewall_rules(name)
+                    purged = purge_router_range(name)
+                except SystemExit:
+                    purged = False
+                if not purged:
+                    print(f"warning: the router's rules for the builder "
+                          f"{name!r} could not all be removed",
+                          file=sys.stderr)
+            run(["docker", "network", "disconnect", name, ROUTER_CONTAINER],
+                capture_output=True)
+            if run(["docker", "network", "rm", name],
+                   capture_output=True).returncode != 0:
+                failed |= network_exists(name)
+    except (SystemExit, Exception):
+        failed = True
+    if failed:
+        print(f"warning: the builder {name!r} could not be fully removed; the "
+              f"next image build removes it", file=sys.stderr)
+
+
+def _sweep_build_leftovers(own: str) -> None:
+    """Remove what builds that died hard left behind. Caller holds the build
+    network lock and the build lock of `own` (this build's image name): its
+    own leftover goes under that lock; another repo's goes only while its
+    lock is free, taken for the removal so a build of it never starts
+    meanwhile."""
+    containers, networks = _labelled_builder_names()
+    for name in sorted(containers | networks):
+        # Only the labelled half goes: a same-named container or network
+        # without the label is not RS's.
+        flags = {"container": name in containers, "network": name in networks}
+        if name == own:
+            _remove_builder(_builder_name(name), **flags)
+            continue
+        fd = _try_build_lock(name)
+        if fd is None:
+            continue
+        try:
+            _remove_builder(_builder_name(name), **flags)
+        finally:
+            os.close(fd)
+
+
+def _has_build_label(kind: str, name: str) -> bool:
+    """Whether the container or network (`kind`) named `name` carries the
+    build label. False when it does not exist."""
+    labels = ".Labels" if kind == "network" else ".Config.Labels"
+    fmt = "{{index " + labels + ' "' + IMAGE_BUILD_LABEL + '"}}'
+    r = run(["docker", kind, "inspect", "-f", fmt, name], capture_output=True)
+    return r.returncode == 0 and r.stdout.strip() == "1"
+
+
+@contextlib.contextmanager
+def _build_net_lock():
+    """Hold IMAGE_BUILD_NET_LOCK, waiting for it (read at call time). A dead
+    holder releases it through the kernel."""
+    try:
+        IMAGE_BUILD_NET_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        lock_f = open(IMAGE_BUILD_NET_LOCK, "a")
     except OSError as e:
-        _build_die(f"the lifecycle lock could not be opened ({e.strerror or 'I/O error'})")
+        _build_die(f"the builders' network lock could not be opened "
+                   f"({e.strerror or 'I/O error'})")
     try:
         fcntl.flock(lock_f, fcntl.LOCK_EX)
         yield
     finally:
         lock_f.close()
+
+
+def _refuse_builder_squatter(repo: str, builder: str) -> None:
+    """After the sweep, refuse when a container or network of the builder's
+    name is still there: one RS made that would not go, or one RS did not
+    make, which is left alone."""
+    for kind, what in (("container", "container"), ("network", "network")):
+        if not run_quiet(["docker", kind, "inspect", builder]):
+            continue
+        if _has_build_label(kind, builder):
+            _build_die(f"the {what} {builder!r} an earlier build of {repo!r} left "
+                       f"behind could not be removed, so nothing was built")
+        _build_die(f"a Docker {what} named {builder!r} exists that RS did not "
+                   f"make for a build; it was left alone and nothing was built. "
+                   f"Remove or rename it, then build again")
+
+
+def _setup_locked_network(network: str, labels: "Sequence[str]" = ()) -> str:
+    """Create `network` when absent (labelled with `labels`), connect the
+    router, purge its range, apply the locked rules; return the router's IP
+    on it. The caller holds its own lock. Shared by the reviewer's network
+    and the builders'."""
+    if labels or not network_exists(network):
+        argv = network_create_args(network)
+        for lab in labels:
+            argv[-1:-1] = ["--label", lab]
+        # Tolerant create for the reviewer's shared network (belt-and-braces
+        # under its lock): proceed iff the network exists afterwards — a
+        # non-rscore creator winning a race is tolerable. A labelled network
+        # (a builder's) must be the one this call made: one that appeared
+        # meanwhile is not RS's to set up or later remove.
+        r = run(argv, capture_output=True)
+        if r.returncode != 0 and (labels or not network_exists(network)):
+            die(f"command failed: docker network create "
+                f"{network}\n{(r.stderr or '').strip()}")
+    run(["docker", "network", "connect", network, ROUTER_CONTAINER],
+        capture_output=True)
+    # Before the apply: a range an earlier project used must not keep that
+    # project's MCP allows.
+    purge_router_range(network, strict=True)
+    apply_firewall_rules(network, "locked")
+    return get_router_ip(network)
+
+
+def _builder_run_argv(builder: str) -> "tuple[list[str], str]":
+    """The builder's `docker run` argv and its dind mode. Everything here is
+    a refusal with no side effect, read before the build makes anything: the
+    image, the dind mode and the limits a project would get, the router.
+    What it runs: the docker-in-docker image with its own entrypoint, no
+    workspace on the machine (an anonymous volume, gone with the container),
+    no published port and no SSH password, the configured resolvers."""
+    if not run_quiet(["docker", "image", "inspect", SANDBOX_DIND_IMAGE]):
+        _build_die("the builder image is not on this machine, so nothing was "
+                   "built; Rebuild all under Sandboxes → Software builds it")
+    cfg = load_config()
+    try:
+        dind_mode = select_dind_mode(cfg.default_dind)
+    except SystemExit:
+        _build_die("the configured Docker-in-Docker mode cannot run on this "
+                   "machine, so nothing was built")
+    pids = project_pids_limit()             # a damaged setting refuses here
+    if not container_running(ROUTER_CONTAINER):
+        _build_die("the egress router is not running, so nothing was built")
+    argv = ["docker", "run", "-d", "--name", builder, "--pull", "never",
+            "--label", f"{IMAGE_BUILD_LABEL}=1",
+            "--network", builder,
+            "-e", "DOCKER_DIND=true",
+            "-e", "RS_SERVICE_CODE_SERVER=disabled"]
+    for d in cfg.sandbox_dns:
+        argv += ["--dns", d]
+    if cfg.sandbox_dns:
+        argv += ["-e", f"RS_SANDBOX_DNS={','.join(cfg.sandbox_dns)}"]
+    if dind_mode == "sysbox":
+        argv += ["--runtime=sysbox-runc"]
+    else:
+        argv += ["--privileged", "-v", "/var/lib/docker"]
+    argv += [f"--pids-limit={pids}"]
+    if cfg.default_memory:
+        argv += [f"--memory={cfg.default_memory}"]
+    argv += ["-v", "/workspace", SANDBOX_DIND_IMAGE]
+    return argv, dind_mode
 
 
 def _refresh_mirror(client: "gitea.GiteaClient", repo: str) -> dict:
@@ -24103,20 +24311,47 @@ def _check_against_source(repo: str, ref: str, sha: str, tags: list,
         f"was built; build again.")
 
 
-def _check_builder_guard(container: str) -> None:
-    """Refuse to run a build step unless the builder's inner guard is in
-    place (its boot applies the guard but only warns when that fails)."""
+def _builder_guard_in_place(container: str) -> bool:
+    """Whether the builder's inner guard is in place: the DOCKER-USER jump and
+    the drop of every private range."""
     def rules(chain: str) -> str:
         r = run(["docker", "exec", "-u", "0", container, "iptables", "-S", chain],
                 capture_output=True)
         return r.stdout if r.returncode == 0 else ""
     ok = "-A DOCKER-USER -j RS-INNER-GUARD" in rules("DOCKER-USER").splitlines()
     guard = rules("RS-INNER-GUARD").splitlines()
-    ok = ok and all(f"-A RS-INNER-GUARD -d {net} -j DROP" in guard
-                    for net in _GUARD_DROPS)
-    if not ok:
+    return ok and all(f"-A RS-INNER-GUARD -d {net} -j DROP" in guard
+                      for net in _GUARD_DROPS)
+
+
+def _check_builder_guard(container: str) -> None:
+    """Refuse to run a build step unless the builder's inner guard is in
+    place (its boot applies the guard but only warns when that fails)."""
+    if not _builder_guard_in_place(container):
         _build_die("the builder's inner firewall is not in place, so the build was "
             "not started")
+
+
+def _wait_for_builder(container: str) -> None:
+    """Wait until the builder's Docker answers and its inner guard is in
+    place, both within one INNER_DOCKERD_WAIT_S deadline (its boot applies
+    the guard a moment after the daemon answers; measured 2 s each)."""
+    deadline = time.monotonic() + INNER_DOCKERD_WAIT_S
+    daemon = False
+    while True:
+        if not daemon:
+            daemon = run(["docker", "exec", container, "docker", "info"],
+                         capture_output=True).returncode == 0
+        if daemon and _builder_guard_in_place(container):
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(1)
+    if not daemon:
+        _build_die(f"the builder's Docker did not start within "
+                   f"{INNER_DOCKERD_WAIT_S} seconds, so nothing was built")
+    _build_die("the builder's inner firewall is not in place, so the build was "
+               "not started")
 
 
 class _BuilderBlob:
@@ -24339,20 +24574,13 @@ def dev_image_build(req: "DevImageBuildRequest", progress=None) -> DevImageBuild
 
 def _dev_image_build(req, progress, signals: "_BuildSignals") -> DevImageBuildResult:  # type: ignore[name-defined]
     name = _image_name_for(req.repo)
-    builder = _builder_project_name(req.repo)
-    if not builder:
-        _build_die(f"repo {req.repo!r} cannot be built: its name contains a character "
-            f"a project name cannot (the build runs in a project named after "
-            f"the repo; project names are letters, digits, '_' and '-')")
+    builder = _builder_name(name)
     if not gitea.mirror_present(req.repo):
         _build_die(f"repo {req.repo!r} not added yet — add it first (the dev "
             f"workflow card and the dev box dialog take its GitHub URL)")
-    # The builder's own create request, validated now: what a project of this
-    # kind needs (the agent bundle cached) is refused here, before anything
-    # is asked of GitHub.
-    creq = CreateRequest.from_kwargs(
-        name=builder, workflow="sandbox-dind", egress="locked",
-        agents=[], disable="code-server")
+    # What the builder's run needs, read now, before anything is asked of
+    # GitHub or made on the machine.
+    builder_argv, dind_mode = _builder_run_argv(builder)
     try:
         _resume_gitea(require=True)
     except SystemExit as e:
@@ -24369,10 +24597,7 @@ def _dev_image_build(req, progress, signals: "_BuildSignals") -> DevImageBuildRe
                    else "Gitea could not be started, so nothing was built; "
                         "the build's log has the reason")
     host_port = _gitea_host_port()
-    cfg = load_config()
     with _image_build_lock(req.repo):
-        if project_remnants(builder, cfg):
-            _build_die(_builder_leftover_msg(req.repo, builder))
         try:
             client = gitea.GiteaClient(gitea.api_base(host_port),
                                        gitea.read_admin_token())
@@ -24422,26 +24647,44 @@ def _dev_image_build(req, progress, signals: "_BuildSignals") -> DevImageBuildRe
         if info["source"]:
             labels[image_registry.LABEL_SOURCE] = "https://github.com/" + info["source"]
 
-        container = container_name_for(builder)
-        created = False
+        container = builder
+        # Set immediately before each thing is made, so the clean-up removes
+        # only what this build made: never a same-named container or network
+        # someone else owns, and nothing when a refusal came first.
+        net_made = started = run_ok = False
         try:
-            progress.step("builder", f"creating the builder project {builder}")
-            with _lifecycle_flock():
-                # Checked again under the lock that serialises creates: only a
-                # builder this build creates is ever destroyed by it.
-                if project_remnants(builder, cfg):
-                    _build_die(_builder_leftover_msg(req.repo, builder))
-                created = True
-                # The create's own report (how to open the project) is not
-                # part of a build's output.
+            progress.step("builder", "starting the builder")
+            with _build_net_lock():
+                _sweep_build_leftovers(name)
+                _refuse_builder_squatter(req.repo, builder)
+                net_made = True
                 try:
-                    with contextlib.redirect_stdout(io.StringIO()):
-                        create(creq, cfg)
+                    router_ip = _setup_locked_network(
+                        builder, (f"{IMAGE_BUILD_LABEL}=1",))
                 except SystemExit:
-                    # create's own message can carry the docker command line
-                    # (a folder on the machine, the project's password).
-                    _build_die("the builder project could not be created; "
-                               "the build's log has the reason")
+                    _build_die("the builder's network could not be set up, so "
+                               "nothing was built")
+            started = True
+            r = run(builder_argv, capture_output=True)
+            run_ok = r.returncode == 0
+            if not run_ok:
+                print(f"docker run of the builder failed:\n"
+                      f"{(r.stderr or '').strip()}")      # the full log only
+                _build_die("the builder could not be started, so nothing was "
+                           "built; the build's log has the reason")
+            # At once, before anything runs in it: the builder's egress goes
+            # through the router's locked rules, not docker's own NAT.
+            try:
+                inject_route(container, router_ip)
+            except SystemExit:
+                _build_die("the builder's traffic could not be routed through "
+                           "the egress router, so nothing was built")
+            _wait_for_builder(container)
+            try:
+                _check_inner_cgroup_delegation(container, dind_mode)
+            except SystemExit:
+                _build_die("the builder's resource controls were not handed down "
+                           "to its Docker, so nothing was built")
             _check_builder_guard(container)
             progress.step("source", "putting the source into the builder")
             _stream_source_in(client, req.repo, sha, container)
@@ -24504,25 +24747,31 @@ def _dev_image_build(req, progress, signals: "_BuildSignals") -> DevImageBuildRe
                     f"repo's previous image, if any, is unchanged")
         finally:
             signals.hold()
-            if created:
-                _destroy_builder(builder, cfg)
+            if started and not run_ok:
+                # Ours to remove only if this run made it (it labels what it
+                # makes): a container that took the name meanwhile — the run
+                # failed on it, or was interrupted — is not.
+                try:
+                    started = _has_build_label("container", builder)
+                except (SystemExit, Exception):
+                    started = False
+            if net_made:
+                # The same for the network: a set-up that failed may have met
+                # one someone else made.
+                try:
+                    net_made = _has_build_label("network", builder)
+                except (SystemExit, Exception):
+                    net_made = False
+                if not net_made and network_exists(builder):
+                    print(f"warning: the network {builder!r} was not removed: it "
+                          f"does not carry the build label (or it could not be "
+                          f"read); a network the build made is removed by the "
+                          f"next image build", file=sys.stderr)
+            if started or net_made:
+                _remove_builder(builder, container=started, network=net_made)
     progress.step("done", f"image {digest[:19]} is on the shelf")
     return DevImageBuildResult(repo=req.repo, ref=ref, commit=sha, subject=subject,
                                git_tags=tags, digest=digest)
-
-
-def _destroy_builder(builder: str, cfg) -> None:
-    """Remove a builder this build created. Never raises: a build's own
-    outcome must not be replaced by its clean-up's, and a builder that will
-    not go is a project the Management page lists."""
-    try:
-        with _lifecycle_flock():
-            if project_remnants(builder, cfg):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    destroy(DestroyRequest(name=builder), cfg)
-    except (SystemExit, Exception):
-        print(f"warning: the builder project {builder!r} could not be removed; "
-              f"destroy it under Sandboxes → Management", file=sys.stderr)
 
 
 def _clear_built_images(host_port: str) -> int:
@@ -26679,20 +26928,10 @@ def _ensure_reviewer_network() -> str:
     REVIEWER_NET_LOCK.parent.mkdir(parents=True, exist_ok=True)
     with open(REVIEWER_NET_LOCK, "w") as lockf:
         fcntl.flock(lockf, fcntl.LOCK_EX)
-        if not network_exists(REVIEWER_NETWORK):
-            # Tolerant create (belt-and-braces under the lock): proceed iff
-            # the network exists afterwards — a non-rscore creator winning a
-            # race is tolerable, a daemon-down create failure stays fail-loud.
-            r = run(network_create_args(REVIEWER_NETWORK), capture_output=True)
-            if r.returncode != 0 and not network_exists(REVIEWER_NETWORK):
-                die(f"command failed: docker network create "
-                    f"{REVIEWER_NETWORK}\n{(r.stderr or '').strip()}")
-        run(["docker", "network", "connect", REVIEWER_NETWORK,
-             ROUTER_CONTAINER], capture_output=True)
-        # On every call, before the apply: an rs-reviewer on a range an earlier
-        # project used must not keep that project's MCP allows.
-        purge_router_range(REVIEWER_NETWORK, strict=True)
-        apply_firewall_rules(REVIEWER_NETWORK, "locked")
+        # On every call: create if absent, connect the router, purge the range
+        # (an rs-reviewer on a range an earlier project used must not keep
+        # that project's MCP allows), re-assert the locked rules.
+        router_ip = _setup_locked_network(REVIEWER_NETWORK)
         # Proactive sweep of crashed reviews' leftovers (PI decision): a child
         # hard-killed between its docker run and its finally leaves a STOPPED
         # container; clear exited ones at the next review instead of letting
@@ -26706,7 +26945,7 @@ def _ensure_reviewer_network() -> str:
                  "--filter", "status=exited"], capture_output=True)
         for cid in (r.stdout or "").split():
             run(["docker", "rm", "-f", cid], capture_output=True)
-    return get_router_ip(REVIEWER_NETWORK)
+    return router_ip
 
 
 def reviewer_token_set(token: str) -> dict:
