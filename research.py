@@ -2423,9 +2423,14 @@ def cmd_dev_image_show(args: argparse.Namespace) -> None:
 
 
 def cmd_dev_image_build(args: argparse.Namespace) -> None:
-    res = _call(rscore.dev_image_build, _build(
-        rscore.DevImageBuildRequest, repo=args.repo, ref=args.ref,
-        dockerfile=args.dockerfile))
+    try:
+        res = _call(rscore.dev_image_build, _build(
+            rscore.DevImageBuildRequest, repo=args.repo, ref=args.ref,
+            dockerfile=args.dockerfile))
+    except KeyboardInterrupt:
+        print(f"{args.repo}: the build was stopped; nothing was stored",
+              file=sys.stderr)
+        sys.exit(130)
     print(f"{args.repo}: built {res.ref} at commit {res.commit}")
     print(f"  git tags: {', '.join(res.git_tags) or '(none)'}")
     print(f"  image:    {res.digest}")

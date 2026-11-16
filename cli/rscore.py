@@ -55,6 +55,7 @@ import secrets
 import selectors
 import shlex
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -23230,6 +23231,12 @@ _STREAM_CHUNK_BYTES = 1 << 16
 # deliberately not /workspace, which is a folder on the machine.
 _BUILDER_WORKDIR = "/home/research/image-build"
 _BUILT_IMAGE = "rs-built:latest"
+# How much of a build's output is kept. The output is written by a Dockerfile
+# RS does not control, into a log on the machine's disk, so it needs a bound.
+# A long real build (an hour of compiler output) writes a few megabytes; at a
+# tenth of this such a log would be cut, at ten times it a looping build step
+# could put hundreds of megabytes on the machine before anyone looked.
+IMAGE_BUILD_LOG_MAX_BYTES = 16 * 1024 * 1024
 # The drops the inner guard must carry before a build step may run.
 _GUARD_DROPS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16")
 
@@ -23247,23 +23254,40 @@ def _builder_leftover_msg(repo: str, builder: str) -> str:
             f"name. Destroy it under Sandboxes → Management, then try again.")
 
 
+def _build_die(msg: str) -> None:
+    """die() for the image build's OWN refusals and failures: texts written
+    for the operator that name no path on the machine, no credential and no
+    terminal command. The mark lets the broker show exactly these in the log
+    the webui reads; anything else that ends a build (a project create's
+    docker error, for one) stays in the log only the broker serves."""
+    try:
+        die(msg)
+    except SystemExit as e:
+        e.operator_text = True          # type: ignore[attr-defined]
+        raise
+
+
 @contextlib.contextmanager
-def _image_build_lock(repo: str):
+def _image_build_lock(repo: str, *, removing: bool = False):
     """Hold the repo's build lock, or die when a build of it holds it. flock:
-    a dead holder's lock is released by the kernel, and the file stays."""
+    a dead holder's lock is released by the kernel, and the file stays.
+    `removing` is the mirror removal asking: its refusal names the build."""
     path = gitea.image_build_lock_path(repo)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     except OSError as e:
-        die(f"the build lock for {repo!r} could not be opened "
+        _build_die(f"the build lock for {repo!r} could not be opened "
             f"({e.strerror or 'I/O error'})")
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            die(f"an image of {repo!r} is being built right now; wait for that "
-                f"build to end")
+            if removing:
+                _build_die(f"an image of {repo!r} is being built right now; "
+                           f"wait for that build to end")
+            _build_die(f"an image of {repo!r} is being built right now, or the repo "
+                f"is being removed; wait for that to end")
         yield
     finally:
         os.close(fd)
@@ -23276,9 +23300,9 @@ def _no_build_of(repo: str):
     builder project exists. In that order, as in the build: a running build's
     builder is not a leftover to destroy."""
     builder = _builder_project_name(repo)
-    with _image_build_lock(repo):
+    with _image_build_lock(repo, removing=True):
         if builder and project_remnants(builder, load_config()):
-            die(_builder_leftover_msg(repo, builder))
+            _build_die(_builder_leftover_msg(repo, builder))
         yield
 
 
@@ -23291,7 +23315,7 @@ def _lifecycle_flock():
         LIFECYCLE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
         lock_f = open(LIFECYCLE_LOCK_PATH, "a")
     except OSError as e:
-        die(f"the lifecycle lock could not be opened ({e.strerror or 'I/O error'})")
+        _build_die(f"the lifecycle lock could not be opened ({e.strerror or 'I/O error'})")
     try:
         fcntl.flock(lock_f, fcntl.LOCK_EX)
         yield
@@ -23307,7 +23331,7 @@ def _refresh_mirror(client: "gitea.GiteaClient", repo: str) -> dict:
     flight may end the wait with what it fetched a moment earlier)."""
     before = client.mirror_info(repo)
     if not before["mirror"] or not before["sync"]:
-        die(f"{repo!r} is not a mirror Gitea has synced yet, so it cannot be "
+        _build_die(f"{repo!r} is not a mirror Gitea has synced yet, so it cannot be "
             f"refreshed; remove it on the Development page and add it again")
     # The sync time has one-second resolution: a refresh that lands in the
     # same second as `before` would look like no refresh at all.
@@ -23325,7 +23349,7 @@ def _refresh_mirror(client: "gitea.GiteaClient", repo: str) -> dict:
         if info["sync"] and info["sync"] != before["sync"]:
             return info
         if time.monotonic() >= deadline:
-            die(f"{repo!r} could not be refreshed from GitHub within "
+            _build_die(f"{repo!r} could not be refreshed from GitHub within "
                 f"{MIRROR_REFRESH_TIMEOUT_S} seconds, so the build would not be "
                 f"of what GitHub has now. GitHub may be unreachable, or the "
                 f"repository's access token may no longer work. Nothing was built.")
@@ -23363,7 +23387,7 @@ def _check_against_source(repo: str, ref: str, sha: str, tags: list,
         what = (f"GitHub has the git tag(s) {', '.join(there_tags) or 'none'} "
                 f"on commit {sha[:12]} and the refreshed copy has "
                 f"{', '.join(sorted(tags)) or 'none'}")
-    die(f"{repo!r} was not refreshed to what GitHub has now: {what}. The "
+    _build_die(f"{repo!r} was not refreshed to what GitHub has now: {what}. The "
         f"refresh may have failed, or something was pushed during it. Nothing "
         f"was built; build again.")
 
@@ -23380,7 +23404,7 @@ def _check_builder_guard(container: str) -> None:
     ok = ok and all(f"-A RS-INNER-GUARD -d {net} -j DROP" in guard
                     for net in _GUARD_DROPS)
     if not ok:
-        die("the builder's inner firewall is not in place, so the build was "
+        _build_die("the builder's inner firewall is not in place, so the build was "
             "not started")
 
 
@@ -23464,7 +23488,7 @@ def _stream_source_in(client: "gitea.GiteaClient", repo: str, sha: str,
     try:
         resp = client.open_archive(repo, sha)
     except gitea.GiteaError as e:
-        die(f"could not read {repo!r} at {sha[:12]} from the mirror ({e})")
+        _build_die(f"could not read {repo!r} at {sha[:12]} from the mirror ({e})")
     proc = subprocess.Popen(
         ["docker", "exec", "-i", "-u", "research", container, "sh", "-c", script],
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -23483,32 +23507,134 @@ def _stream_source_in(client: "gitea.GiteaClient", repo: str, sha: str,
     except OSError:
         pass
     if proc.wait() != 0 or failed:
-        die(f"could not put {repo!r}'s source into the builder"
+        _build_die(f"could not put {repo!r}'s source into the builder"
             + (f" ({failed})" if failed else ""))
 
 
 def _builder_exec(container: str, argv: list[str], what: str) -> None:
     """Run one command in the builder as its user, its output going where this
-    process's output goes (the build log); die naming `what` when it fails."""
+    process's output goes (the build log) up to IMAGE_BUILD_LOG_MAX_BYTES —
+    the rest is read and dropped, so the command never blocks on a full pipe.
+    Dies naming `what` when it fails."""
     sys.stdout.flush()
-    r = subprocess.run(["docker", "exec", "-u", "research", container, *argv])
-    if r.returncode != 0:
-        die(f"{what} failed (exit {r.returncode}); the output above says why")
+    out = sys.stdout.buffer if hasattr(sys.stdout, "buffer") else None
+    proc = subprocess.Popen(["docker", "exec", "-u", "research", container, *argv],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    kept = 0
+    try:
+        while True:
+            chunk = proc.stdout.read1(_STREAM_CHUNK_BYTES)
+            if not chunk:
+                break
+            room = IMAGE_BUILD_LOG_MAX_BYTES - kept
+            if room <= 0:
+                continue
+            part = chunk[:room]
+            kept += len(part)
+            if out is not None:
+                out.write(part)
+                out.flush()
+            else:
+                sys.stdout.write(part.decode(errors="replace"))
+            if kept >= IMAGE_BUILD_LOG_MAX_BYTES:
+                print(f"\n[the output of {what} is cut here: it passed "
+                      f"{IMAGE_BUILD_LOG_MAX_BYTES // (1024 * 1024)} MB]", flush=True)
+    finally:
+        proc.stdout.close()
+        if proc.poll() is None and sys.exc_info()[0] is not None:
+            proc.kill()
+        rc = proc.wait()
+    if rc != 0:
+        _build_die(f"{what} failed (exit {rc}); its output has the reason")
+
+
+class _BuildSignals:
+    """While a build has a builder, a hang-up or a terminate ends it the way
+    Ctrl-C does: as a KeyboardInterrupt, so the build's clean-up runs and the
+    builder is removed. Once: a second signal during the clean-up is ignored,
+    or it would leave the builder behind. `hold()` ends the window: from the
+    moment the image is being stored the build runs to its end, so "stopped"
+    never describes a build whose image is on the shelf."""
+
+    _SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+    # True once the build in this process reached the point of no stopping.
+    # A caller that has its own stop signal (the broker's job) reads it, so a
+    # stop arriving after this object put the caller's handler back is not
+    # reported as a stopped build.
+    held = False
+
+    def __init__(self) -> None:
+        self._old: dict = {}
+        self._spent = False
+
+    def install(self) -> None:
+        _BuildSignals.held = False
+        if threading.current_thread() is not threading.main_thread():
+            return                      # signal handlers are the main thread's
+        for sig in self._SIGNALS:
+            # A signal the caller chose to ignore (nohup, a shell's background
+            # job) stays ignored: the operator shielded the build from it.
+            if signal.getsignal(sig) is signal.SIG_IGN:
+                continue
+            self._old[sig] = signal.signal(sig, self._handle)
+
+    def _handle(self, _signum, _frame) -> None:
+        if self._spent:
+            return
+        self._spent = True
+        raise KeyboardInterrupt
+
+    def hold(self) -> None:
+        self._spent = True
+        _BuildSignals.held = True
+
+    def restore(self) -> None:
+        for sig, old in self._old.items():
+            signal.signal(sig, old)
+        self._old = {}
+
+
+def image_build_running(repo: str) -> bool:
+    """True when a build of `repo` (or the removal of its mirror) holds the
+    repo's build lock right now. A probe for a caller that wants to refuse
+    before starting a job; the job takes the lock itself."""
+    path = gitea.image_build_lock_path(repo)
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except (OSError, ValueError):
+        return False                    # no lock file (or no such name): never built
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        return False
+    finally:
+        os.close(fd)
 
 
 def dev_image_build(req: "DevImageBuildRequest", progress=None) -> DevImageBuildResult:  # type: ignore[name-defined]
     """Build the repo's image from what GitHub has now and put it on the
     shelf, replacing the repo's previous image. Every refusal comes before
-    a builder exists; the builder is removed however the build ends."""
-    progress = progress or _NULL_PROGRESS
+    a builder exists; the builder is removed however the build ends, a
+    hang-up or a terminate included (they end it as Ctrl-C does)."""
+    signals = _BuildSignals()
+    signals.install()
+    try:
+        return _dev_image_build(req, progress or _NULL_PROGRESS, signals)
+    finally:
+        signals.restore()
+
+
+def _dev_image_build(req, progress, signals: "_BuildSignals") -> DevImageBuildResult:  # type: ignore[name-defined]
     name = _image_name_for(req.repo)
     builder = _builder_project_name(req.repo)
     if not builder:
-        die(f"repo {req.repo!r} cannot be built: its name contains a character "
+        _build_die(f"repo {req.repo!r} cannot be built: its name contains a character "
             f"a project name cannot (the build runs in a project named after "
             f"the repo; project names are letters, digits, '_' and '-')")
     if not gitea.mirror_present(req.repo):
-        die(f"repo {req.repo!r} not added yet — add it first (the dev "
+        _build_die(f"repo {req.repo!r} not added yet — add it first (the dev "
             f"workflow card and the dev box dialog take its GitHub URL)")
     # The builder's own create request, validated now: what a project of this
     # kind needs (the agent bundle cached) is refused here, before anything
@@ -23516,12 +23642,26 @@ def dev_image_build(req: "DevImageBuildRequest", progress=None) -> DevImageBuild
     creq = CreateRequest.from_kwargs(
         name=builder, workflow="sandbox-dind", egress="locked",
         agents=[], disable="code-server")
-    _resume_gitea(require=True)
+    try:
+        _resume_gitea(require=True)
+    except SystemExit as e:
+        # Gitea's own refusals (not enabled, held by an upgrade or a restore)
+        # are one-line sentences written for the browser and name no path;
+        # passed on as the build's reason, or the job's log would only say
+        # "build failed". A failed docker command is NOT such a sentence: its
+        # text is the command line plus docker's own output (several lines,
+        # possibly a folder on the machine), and stays in the full log.
+        reason = getattr(e, "die_message", None)
+        plain = (isinstance(reason, str) and reason.strip() and "\n" not in reason
+                 and not reason.startswith("command failed"))
+        _build_die(reason if plain
+                   else "Gitea could not be started, so nothing was built; "
+                        "the build's log has the reason")
     host_port = _gitea_host_port()
     cfg = load_config()
     with _image_build_lock(req.repo):
         if project_remnants(builder, cfg):
-            die(_builder_leftover_msg(req.repo, builder))
+            _build_die(_builder_leftover_msg(req.repo, builder))
         try:
             client = gitea.GiteaClient(gitea.api_base(host_port),
                                        gitea.read_admin_token())
@@ -23529,17 +23669,17 @@ def dev_image_build(req: "DevImageBuildRequest", progress=None) -> DevImageBuild
             major = version.split(".")[0]
             if not (major.isascii() and major.isdigit()
                     and int(major) >= IMAGE_SHELF_MIN_GITEA_MAJOR):
-                die(f"building images needs Gitea {IMAGE_SHELF_MIN_GITEA_MAJOR} "
+                _build_die(f"building images needs Gitea {IMAGE_SHELF_MIN_GITEA_MAJOR} "
                     f"or newer and this one is {version or 'unreadable'}; "
                     f"upgrade it under Sandboxes → Infrastructure")
             progress.step("refresh", "refreshing the repo from GitHub")
             info = _refresh_mirror(client, req.repo)
             ref = req.ref or info["default_branch"]
             if info["empty"] or not ref:
-                die(f"{req.repo!r} has no commits on GitHub yet")
+                _build_die(f"{req.repo!r} has no commits on GitHub yet")
             found = client.ref_commit(req.repo, ref)
             if found is None:
-                die(f"{req.repo!r} has no branch or tag named {ref!r} on GitHub")
+                _build_die(f"{req.repo!r} has no branch or tag named {ref!r} on GitHub")
             sha, subject = found
             tags = client.tags_at(req.repo, sha)
         except gitea.GiteaError as e:
@@ -23547,7 +23687,7 @@ def dev_image_build(req: "DevImageBuildRequest", progress=None) -> DevImageBuild
         try:
             source = gitea.source_refs(req.repo, MIRROR_REFRESH_TIMEOUT_S)
         except gitea.GiteaError as e:
-            die(f"{req.repo!r} could not be checked against GitHub ({e}), so "
+            _build_die(f"{req.repo!r} could not be checked against GitHub ({e}), so "
                 f"the build would not be of what GitHub has now. GitHub may be "
                 f"unreachable, or the repository's access token may no longer "
                 f"work. Nothing was built.")
@@ -23557,14 +23697,14 @@ def dev_image_build(req: "DevImageBuildRequest", progress=None) -> DevImageBuild
         bad = [t for t in tags
                if t == "latest" or not image_registry.valid_registry_tag(t)]
         if bad:
-            die(f"commit {sha[:12]} carries the git tag(s) "
+            _build_die(f"commit {sha[:12]} carries the git tag(s) "
                 f"{', '.join(repr(t) for t in bad)}, which cannot name a "
                 f"published image (a tag is letters, digits, '_', '.' and '-', "
                 f"and `latest` is reserved). Remove or rename them on GitHub, "
                 f"or build another commit.")
         dockerfile = req.dockerfile or gitea.image_dockerfile(req.repo) or "Dockerfile"
         if not _valid_dockerfile_path(dockerfile):      # a hand-edited record
-            die(f"the Dockerfile path remembered for {req.repo!r} is not a path "
+            _build_die(f"the Dockerfile path remembered for {req.repo!r} is not a path "
                 f"inside the repository; build again naming the path")
         labels = {image_registry.LABEL_COMMIT: sha,
                   image_registry.LABEL_GIT_TAGS: json.dumps(tags)}
@@ -23579,19 +23719,25 @@ def dev_image_build(req: "DevImageBuildRequest", progress=None) -> DevImageBuild
                 # Checked again under the lock that serialises creates: only a
                 # builder this build creates is ever destroyed by it.
                 if project_remnants(builder, cfg):
-                    die(_builder_leftover_msg(req.repo, builder))
+                    _build_die(_builder_leftover_msg(req.repo, builder))
                 created = True
                 # The create's own report (how to open the project) is not
                 # part of a build's output.
-                with contextlib.redirect_stdout(io.StringIO()):
-                    create(creq, cfg)
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        create(creq, cfg)
+                except SystemExit:
+                    # create's own message can carry the docker command line
+                    # (a folder on the machine, the project's password).
+                    _build_die("the builder project could not be created; "
+                               "the build's log has the reason")
             _check_builder_guard(container)
             progress.step("source", "putting the source into the builder")
             _stream_source_in(client, req.repo, sha, container)
             src = f"{_BUILDER_WORKDIR}/src"
             if not run_quiet(["docker", "exec", "-u", "research", container,
                               "test", "-f", f"{src}/{dockerfile}"]):
-                die(f"{req.repo!r} has no file {dockerfile!r} at commit "
+                _build_die(f"{req.repo!r} has no file {dockerfile!r} at commit "
                     f"{sha[:12]}; name the Dockerfile's path in the repository")
             if req.dockerfile:      # remembered only once it is known to exist
                 try:
@@ -23599,7 +23745,7 @@ def dev_image_build(req: "DevImageBuildRequest", progress=None) -> DevImageBuild
                 except OSError as e:
                     # Not a warning: a path that is not remembered makes the
                     # next plain build use the default Dockerfile.
-                    die(f"the Dockerfile path for {req.repo!r} could not be "
+                    _build_die(f"the Dockerfile path for {req.repo!r} could not be "
                         f"saved ({e.strerror or 'I/O error'}), so nothing was "
                         f"built")
             progress.step("build", "building the image")
@@ -23618,8 +23764,9 @@ def dev_image_build(req: "DevImageBuildRequest", progress=None) -> DevImageBuild
             try:
                 got = image_registry.layout_labels(source)
                 if any(got.get(k) != v for k, v in labels.items()):
-                    die("the built image does not carry the labels the build "
+                    _build_die("the built image does not carry the labels the build "
                         "gave it, so it was not stored")
+                signals.hold()
                 progress.step("push", "storing the image")
                 try:
                     with _gitea_lock(exclusive=False, blocking=False):
@@ -23640,11 +23787,12 @@ def dev_image_build(req: "DevImageBuildRequest", progress=None) -> DevImageBuild
                                   f"removed ({e}); the next build of "
                                   f"{req.repo!r} removes them", file=sys.stderr)
                 except _GiteaLockBusy:
-                    die(GITEA_BUSY_MSG)
+                    _build_die(GITEA_BUSY_MSG)
             except (gitea.GiteaError, image_registry.RegistryError) as e:
-                die(f"the image was built but could not be stored ({e}); the "
+                _build_die(f"the image was built but could not be stored ({e}); the "
                     f"repo's previous image, if any, is unchanged")
         finally:
+            signals.hold()
             if created:
                 _destroy_builder(builder, cfg)
     progress.step("done", f"image {digest[:19]} is on the shelf")

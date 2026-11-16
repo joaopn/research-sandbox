@@ -1290,6 +1290,63 @@ def _verb_dev_repo_remove(args: dict, progress=None) -> dict:
     return dataclasses.asdict(rscore.dev_repo_remove(req, progress))
 
 
+def _image_build_in_flight(repo: str) -> bool:
+    """True when a build of `repo` is running: a live build job names it (from
+    its spawn, before it holds anything), or the repo's build lock is held (a
+    build from the terminal, or the removal of its mirror)."""
+    wanted = repo.lower() if isinstance(repo, str) else ""
+    if any(op["verb"] == "dev_image_build" and op.get("target", "").lower() == wanted
+           for op in _live_dev_lane_ops()):
+        return True
+    return rscore.image_build_running(repo)
+
+
+def _verb_dev_image_show(args: dict, _progress=None) -> dict:
+    # A read: never starts Gitea, a few bounded loopback calls.
+    safe = {k: v for k, v in args.items() if k in DEV_TARGET_WEBUI_FIELDS}
+    req = rscore.DevImageRequest.from_kwargs(**safe)  # may raise ValidationError
+    return dataclasses.asdict(rscore.dev_image_show(req))
+
+
+def _verb_dev_image_discard(args: dict, _progress=None) -> dict:
+    # No step-up: the image is rebuilt from its commit. Refused while the
+    # repo is being built, so a discard never races the build's own replace.
+    safe = {k: v for k, v in args.items() if k in DEV_TARGET_WEBUI_FIELDS}
+    req = rscore.DevImageRequest.from_kwargs(**safe)  # may raise ValidationError
+    if _image_build_in_flight(req.repo):
+        raise rscore.ValidationError(
+            f"an image of {req.repo!r} is being built right now, or the repo "
+            f"is being removed; wait for that to end")
+    return dataclasses.asdict(rscore.dev_image_discard(req))
+
+
+def _verb_dev_image_cancel(args: dict, _progress=None) -> dict:
+    """Stop a running image build. Writes the cancel record into the job's own
+    lock FIRST, then signals the job: it ends as an interrupted build does
+    (its builder removed by its own clean-up) and reads the record to say
+    "cancelled". Nothing is destroyed from here, so this returns at once and
+    works whatever the job is doing, a builder half created included. A build
+    that is already storing its image finishes: its log then ends "done"."""
+    op_id = args.get("op_id")
+    if not isinstance(op_id, str) or not _OP_ID_RE.match(op_id):
+        raise rscore.ValidationError(f"op_id is not a safe basename: {op_id!r}")
+    holder = _read_dev_box_lock(op_id)
+    pid = holder.get("pid")
+    if (holder.get("verb") not in _DEV_LANE_CANCELLABLE or not isinstance(pid, int)
+            or not _dev_box_lock_alive(op_id)):
+        raise rscore.ValidationError("that build is not running any more")
+    try:
+        _write_dev_box_lock(op_id, pid, holder.get("verb") or "",
+                            target=holder.get("target") or "", cancelled=True)
+    except OSError as e:
+        raise rscore.ValidationError(
+            f"the cancel could not be recorded ({e.strerror or 'I/O error'}), "
+            f"so the build was not stopped")
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(pid, signal.SIGTERM)
+    return {"op_id": op_id, "cancelling": True}
+
+
 def _verb_dev_repo_list(_args: dict, _progress=None) -> dict:
     req = rscore.DevRepoListRequest.from_kwargs()
     return dataclasses.asdict(rscore.dev_repo_list(req))
@@ -1501,6 +1558,9 @@ VERBS = {
     "port_detect": _verb_port_detect,
     "dev_repo_remove": _verb_dev_repo_remove,
     "dev_repo_list": _verb_dev_repo_list,
+    "dev_image_show": _verb_dev_image_show,
+    "dev_image_discard": _verb_dev_image_discard,
+    "dev_image_cancel": _verb_dev_image_cancel,
     "dev_attach": _verb_dev_attach,
     "dev_detach": _verb_dev_detach,
     "dev_sync": _verb_dev_sync,
@@ -2059,6 +2119,18 @@ def _verb_dev_gitea_rollback(args: dict, progress=None) -> dict:
     return dataclasses.asdict(rscore.dev_gitea_rollback(req, progress))
 
 
+# Building a repo's image: minutes of work (a builder project, a docker
+# build, the push), so it runs detached. Several repos build at once; one
+# repo's second build is refused at dispatch and again by the job's own lock.
+DEV_IMAGE_BUILD_WEBUI_FIELDS = frozenset({"repo", "ref", "dockerfile"})
+
+
+def _verb_dev_image_build(args: dict, progress=None) -> dict:
+    safe = {k: v for k, v in args.items() if k in DEV_IMAGE_BUILD_WEBUI_FIELDS}
+    req = rscore.DevImageBuildRequest.from_kwargs(**safe)  # may raise ValidationError
+    return dataclasses.asdict(rscore.dev_image_build(req, progress))
+
+
 # The lane's SINGLE source of truth: verb → (webui field allowlist, request
 # class for the dispatch-side PRE-SPAWN shape validation, verb fn the child
 # executes). DEV_BOX_DISPATCH is DERIVED below so the two key sets cannot
@@ -2082,16 +2154,30 @@ _DEV_LANE_VERBS = {
     "dev_gitea_rollback": (
         DEV_GITEA_ROLLBACK_WEBUI_FIELDS, rscore.DevGiteaRollbackRequest,
         _verb_dev_gitea_rollback),
+    "dev_image_build": (
+        DEV_IMAGE_BUILD_WEBUI_FIELDS, rscore.DevImageBuildRequest,
+        _verb_dev_image_build),
 }
 
 # Lane verbs whose failure text is written for the operator and carries no host
 # path by construction (their ValidationError and HarnessError.log_msg texts),
 # so the view log shows it instead of the lane's coarse token. The upgrade's
 # operator needs to know whether Gitea is back or down; "failed" says neither.
-_DEV_LANE_OPERATOR_TEXT = frozenset({"dev_gitea_upgrade", "dev_gitea_rollback"})
+_DEV_LANE_OPERATOR_TEXT = frozenset({"dev_gitea_upgrade", "dev_gitea_rollback",
+                                     "dev_image_build"})
 # The coarse token a lane verb's unexpected failure shows; provisions keep theirs.
 _DEV_LANE_FAIL_TOKEN = {"dev_gitea_upgrade": "upgrade failed",
-                        "dev_gitea_rollback": "rollback failed"}
+                        "dev_gitea_rollback": "rollback failed",
+                        "dev_image_build": "build failed"}
+# Lane verbs that mark their own die() texts as written for the operator
+# (rscore._build_die: a build's refusals — which tag, which file, what to do —
+# which name no path on the machine). The view log shows a MARKED message
+# instead of the coarse token; an unmarked one (a project create's docker
+# error under a build) stays coarse, its detail in the host-only full log.
+_DEV_LANE_DIE_TEXT = frozenset({"dev_image_build"})
+# Lane verbs a Cancel may stop, and what their view log then ends with.
+_DEV_LANE_CANCELLABLE = frozenset({"dev_image_build"})
+_DEV_LANE_CANCELLED = "cancelled"
 
 # The child-only vocabulary — NOT in VERBS / BUILD_DISPATCH / REVIEW_DISPATCH.
 DEV_BOX_DISPATCH = {v: spec[2] for v, spec in _DEV_LANE_VERBS.items()}
@@ -2101,15 +2187,40 @@ def _dev_box_lock_path(op_id: str) -> Path:
     return DEV_BOX_LOCKS_DIR / f"{op_id}.json"
 
 
-def _write_dev_box_lock(op_id: str, pid: int, verb: str = "") -> None:
+def _write_dev_box_lock(op_id: str, pid: int, verb: str = "",
+                        target: str = "", cancelled: bool = False) -> None:
     # The verb is recorded so the Gitea gate can see an upgrade from its spawn,
-    # before its child reaches the gitea lock.
+    # before its child reaches the gitea lock; the target (a build's repo) so
+    # a reader can say what each job works on; `cancelled` is the Cancel
+    # verb's record, which the job reads to say how it ended.
     DEV_BOX_LOCKS_DIR.mkdir(parents=True, exist_ok=True)
-    _dev_box_lock_path(op_id).write_text(json.dumps({"pid": pid, "verb": verb}))
+    record = {"pid": pid, "verb": verb}
+    if target:
+        record["target"] = target
+    if cancelled:
+        record["cancelled"] = True
+    path = _dev_box_lock_path(op_id)
+    tmp = path.with_suffix(".tmp")          # not *.json: readers never see it
+    try:
+        tmp.write_text(json.dumps(record))
+        tmp.replace(path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            tmp.unlink()                    # the one file this call made
+        raise
+
+
+def _read_dev_box_lock(op_id: str) -> dict:
+    try:
+        holder = json.loads(_dev_box_lock_path(op_id).read_text())
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+    return holder if isinstance(holder, dict) else {}
 
 
 def _live_dev_lane_ops() -> list[dict]:
-    """Every dev-lane op whose child is alive: [{op_id, verb}]."""
+    """Every dev-lane op whose child is alive: [{op_id, verb}], plus `target`
+    (the repo) for an image build."""
     out = []
     try:
         names = sorted(DEV_BOX_LOCKS_DIR.glob("*.json"))
@@ -2119,11 +2230,11 @@ def _live_dev_lane_ops() -> list[dict]:
         op_id = path.stem
         if not _dev_box_lock_alive(op_id):
             continue
-        try:
-            verb = json.loads(path.read_text()).get("verb") or ""
-        except (OSError, ValueError, AttributeError):
-            verb = ""
-        out.append({"op_id": op_id, "verb": verb})
+        holder = _read_dev_box_lock(op_id)
+        op = {"op_id": op_id, "verb": holder.get("verb") or ""}
+        if holder.get("target"):
+            op["target"] = holder["target"]     # a build's repo
+        out.append(op)
     return out
 
 
@@ -2151,6 +2262,7 @@ _GITEA_GATED_VERBS = frozenset({
     "dev_board_export", "dev_gitea_start",
     "dev_box_provision", "dev_project_provision", "dev_gitea_upgrade",
     "dev_gitea_rollback", "dev_gitea_discard_previous",
+    "dev_image_build", "dev_image_discard",
     "review_pr",
     "start", "stop", "update", "agents_update",
 })
@@ -2264,20 +2376,51 @@ def run_dev_box(op_id: str, verb: str) -> None:
     except (ValueError, OSError):
         _release_dev_box_lock(op_id)
         return
+    cancel_armed = [True]
+
+    def cancel_signal(_signum, _frame) -> None:
+        # Not once the build is storing its image or cleaning up: it ends
+        # the way it was going to, and the log says that.
+        if cancel_armed[0] and not rscore._BuildSignals.held:
+            cancel_armed[0] = False
+            raise KeyboardInterrupt
+
     try:
         os.dup2(op.full.fileno(), 1)
         os.dup2(op.full.fileno(), 2)
         sys.stdout = os.fdopen(1, "w", buffering=1, closefd=False)
         sys.stderr = os.fdopen(2, "w", buffering=1, closefd=False)
-        DEV_BOX_DISPATCH[verb](args, op.progress)
+        if verb in _DEV_LANE_CANCELLABLE:
+            # Cancel's signal ends the job as an interrupt whenever it lands
+            # before the verb's own handling of it begins, and does nothing
+            # once the verb has returned (a finished build is not "cancelled").
+            signal.signal(signal.SIGTERM, cancel_signal)
+        try:
+            DEV_BOX_DISPATCH[verb](args, op.progress)
+        finally:
+            # However the verb ended: a signal from here on must not break
+            # into the lines that write how it ended.
+            cancel_armed[0] = False
         op.progress.done()
     except rscore.ValidationError as e:
         print(f"validation: {e}")                 # full log — status-only, PAT-free
         op.progress.fail(str(e) if verb in _DEV_LANE_OPERATOR_TEXT
                          else "invalid request")
-    except SystemExit:
+    except SystemExit as e:
         # die() already printed to the full log
-        op.progress.fail(_DEV_LANE_FAIL_TOKEN.get(verb, "provision failed"))
+        token = _DEV_LANE_FAIL_TOKEN.get(verb, "provision failed")
+        reason = (getattr(e, "die_message", None)
+                  if verb in _DEV_LANE_DIE_TEXT and getattr(e, "operator_text", False)
+                  else None)
+        op.progress.fail(reason if isinstance(reason, str) and reason else token)
+    except KeyboardInterrupt:
+        # The job was told to stop (the Cancel verb's signal, or the machine
+        # shutting down). Only Cancel's own record makes it "cancelled": what
+        # the builder project looks like says nothing about why the job ended.
+        if verb in _DEV_LANE_CANCELLABLE and _read_dev_box_lock(op_id).get("cancelled"):
+            op.progress.fail(_DEV_LANE_CANCELLED)
+        else:
+            op.progress.fail(_DEV_LANE_FAIL_TOKEN.get(verb, "provision failed"))
     except (rscore.HarnessError, Exception) as e:
         # A RAW exception prints nothing on its own — without this the full log
         # is EMPTY and the failure is undiagnosable (bit the first acceptance
@@ -2829,6 +2972,21 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
                                  "Sandboxes → Infrastructure first"))
         # A dev box lands in a running project's container; one that is being
         # started, stopped or recreated right now would lose it mid-way.
+        if verb == "dev_image_build":
+            # Refuse here what the job would refuse at once anyway, so the
+            # browser hears it now instead of from a failed tail.
+            repo = safe.get("repo")
+            if not gitea.mirror_present(repo):
+                return _audited(principal, "validation",
+                                _err("validation",
+                                     f"repo {repo!r} is not added yet — add it "
+                                     "first (the dev workflow card and the dev "
+                                     "box dialog take its GitHub URL)"))
+            if _image_build_in_flight(repo):
+                return _audited(principal, "busy",
+                                _err("busy", f"an image of {repo!r} is being "
+                                             "built right now, or the repo is "
+                                             "being removed; wait for that to end"))
         if verb == "dev_box_provision" and _project_in_flight(safe.get("project")):
             return _audited(principal, "busy",
                             _err("busy", f"{safe.get('project')} is starting, "
@@ -2853,7 +3011,10 @@ def dispatch(verb, args, token=None, tokens=None, *, op_id=None,
                             {"ok": True, "result": {"op_id": op_id, "started": True}})
         _prune_dead_dev_box_locks()
         pid = spawn_dev_box(op_id, verb, safe)   # detached child, args via stdin
-        _write_dev_box_lock(op_id, pid, verb)    # PARENT writes, post-spawn only
+        if verb == "dev_image_build":            # PARENT writes, post-spawn only
+            _write_dev_box_lock(op_id, pid, verb, target=safe.get("repo") or "")
+        else:
+            _write_dev_box_lock(op_id, pid, verb)
         return _audited(principal, "ok",
                         {"ok": True, "result": {"op_id": op_id, "started": True}})
 
