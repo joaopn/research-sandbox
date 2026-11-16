@@ -8,7 +8,7 @@
 # project (entrypoint.supervisor.sh, entrypoint.sandbox-dind.sh), by the host
 # after it stages the proxy image (create, a supervisor recreate), and after
 # `research project mcp allow|deny` (via `docker exec rs-project-<proj>
-# /usr/local/bin/mcp-reload`).
+# /usr/local/lib/rs/mcp-reload`).
 #
 # Why the container's STATE and IMAGE are the key, not its existence: the
 # inner daemon's state survives a privileged-dind recreate, so a boot meets a
@@ -43,8 +43,8 @@
 set -euo pipefail
 
 rs_inner_guard() {
-    if [[ -x /usr/local/bin/rs-inner-guard ]]; then
-        /usr/local/bin/rs-inner-guard
+    if [[ -x /usr/local/lib/rs/rs-inner-guard ]]; then
+        /usr/local/lib/rs/rs-inner-guard
     fi
 }
 

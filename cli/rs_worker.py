@@ -709,7 +709,7 @@ def _stage_workdir(name: str, plan_text: str, fresh: bool) -> Path:
     os.chmod(wdir / ".claude" / ".credentials.json", 0o600)
     if ORCH_SETTINGS.is_file():
         # Strip the `hooks` key — the supervisor's Stop hook calls
-        # /usr/local/bin/rs-audit-stop, which is supervisor-image-only.
+        # /usr/local/lib/rs/rs-audit-stop, which is supervisor-image-only.
         # Propagating it would break every worker's claude --print run
         # with a "command not found" Stop hook error on every turn.
         try:

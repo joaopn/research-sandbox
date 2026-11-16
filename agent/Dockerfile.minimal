@@ -22,11 +22,17 @@ LABEL research.home-restore="1"
 # Workflow web apps (the same three scripts the box images bake): rs-web-loop
 # keeps a workflow's web app running at its webui tab's address (started by the
 # entrypoint when RS_BOX_WEB_START is set), rs-web-set is the host's one call
-# that hands it the address, rs-web-restart is the operator's restart command.
-# The host probes for rs-web-loop's path to tell this image from an older one.
-COPY agent/rs-web-loop agent/rs-web-set agent/rs-web-restart /usr/local/bin/
-RUN chmod +x /usr/local/bin/rs-web-loop /usr/local/bin/rs-web-set \
-    /usr/local/bin/rs-web-restart
+# that hands it the address, rs-web-restart is the operator's restart command
+# (linked onto PATH by the host in a web-app project only).
+COPY agent/rs-web-loop agent/rs-web-set agent/rs-web-restart /usr/local/lib/rs/
+RUN chmod +x /usr/local/lib/rs/rs-web-loop /usr/local/lib/rs/rs-web-set \
+    /usr/local/lib/rs/rs-web-restart
+# RS's helper-command layout: only what a person or an agent types is on
+# PATH; RS's own helpers (and typed commands only some containers get, linked
+# onto PATH by the host) live in /usr/local/lib/rs. The host refuses an image
+# without this label (MIRROR of rscore.RS_COMMANDS_LABEL / RS_COMMANDS_LAYOUT,
+# pinned).
+LABEL research.rs-commands="1"
 
 USER research
 WORKDIR /home/research

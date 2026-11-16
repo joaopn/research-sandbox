@@ -209,7 +209,7 @@ fi
 # boots exactly as before.
 if [[ -n "${RS_BOX_WEB_START:-}" ]]; then
     rm -f ~/.rs-web-loop.pid ~/.rs-web-restart
-    /usr/local/bin/rs-web-loop >/dev/null 2>&1 &
+    /usr/local/lib/rs/rs-web-loop >/dev/null 2>&1 &
 fi
 
 echo "=== Minimal substrate ready ==="

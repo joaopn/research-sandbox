@@ -42,7 +42,7 @@ if [[ ! -f ~/.claude/settings.json ]]; then
         "hooks": [
           {
             "type": "command",
-            "command": "/usr/local/bin/rs-audit-stop"
+            "command": "/usr/local/lib/rs/rs-audit-stop"
           }
         ]
       }
@@ -50,6 +50,17 @@ if [[ ! -f ~/.claude/settings.json ]]; then
   }
 }
 SETTINGS
+fi
+
+# A settings file written before RS moved its helpers off PATH runs the Stop
+# hook from the old place (the file rides the credential stash across every
+# re-creation). Point exactly that command at the new place; nothing else in
+# the file changes, and a failure never stops the boot.
+if [[ -f ~/.claude/settings.json ]] \
+   && grep -qF '"/usr/local/bin/rs-audit-stop"' ~/.claude/settings.json 2>/dev/null; then
+    sed -i 's|"/usr/local/bin/rs-audit-stop"|"/usr/local/lib/rs/rs-audit-stop"|' \
+        ~/.claude/settings.json \
+        || echo "warning: the Stop hook in ~/.claude/settings.json still names /usr/local/bin/rs-audit-stop" >&2
 fi
 
 if [[ ! -f ~/.claude.json ]]; then

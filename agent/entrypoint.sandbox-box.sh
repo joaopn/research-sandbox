@@ -297,7 +297,7 @@ python3 /usr/local/lib/rs-box/box-render-mcp.py
 # loop pid and any unconsumed restart request: remove both, by name, first.
 if [[ -n "${RS_BOX_WEB_START:-}" ]]; then
     rm -f ~/.rs-web-loop.pid ~/.rs-web-restart
-    /usr/local/bin/rs-web-loop >/dev/null 2>&1 &
+    /usr/local/lib/rs/rs-web-loop >/dev/null 2>&1 &
 fi
 
 echo "sandbox-box[${RS_SANDBOX_NAME}]: ready (workspace at /workspace)"

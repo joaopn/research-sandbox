@@ -17,8 +17,8 @@ FROM rs-substrate-base:latest
 # the shared miniconda3 base ships python3, so NO pip. Mirror of Dockerfile.supervisor.
 RUN mkdir -p /opt/mcp-proxy-tools
 COPY container/supervisor/mcp_render_config.py /opt/mcp-proxy-tools/mcp_render_config.py
-COPY container/supervisor/mcp-reload.sh /usr/local/bin/mcp-reload
-RUN chmod +x /usr/local/bin/mcp-reload
+COPY container/supervisor/mcp-reload.sh /usr/local/lib/rs/mcp-reload
+RUN chmod +x /usr/local/lib/rs/mcp-reload
 
 # Keep ~/.local/bin (where the dist-deployed agent launcher lands) on PATH,
 # captured into the skel below so the restored home + every login shell sees it.
@@ -29,19 +29,14 @@ RUN su - research -c 'echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.bash
 RUN cp -a /home/research /etc/research-skel
 
 # Dev-lane tooling for the dev workflow (the supervisor-level agent works the
-# repo). rs-wt (one worktree per unit of work): its outside-the-dev-lane
-# refusal is the tool's own gate — the discovered clone's origin remote must
-# be the shared Gitea.
-COPY container/dev/rs-wt /usr/local/bin/rs-wt
-# rs-land (approval-gated landing: archive tag -> ff-only merge -> branch
-# delete) exits with a remedy when no dev wiring is staged, so it is inert on
-# a non-dev project.
-COPY container/dev/rs-land /usr/local/bin/rs-land
-# rs-board (the per-area kanban boards on the shared Gitea: reconcile / next /
-# start / ask / answered / stop / done) refuses with a remedy on a Gitea
-# without the board API or on a non-dev project.
-COPY container/dev/rs-board /usr/local/bin/rs-board
-RUN chmod +x /usr/local/bin/rs-wt /usr/local/bin/rs-land /usr/local/bin/rs-board
+# repo), kept in RS's folder and linked onto PATH by the host in a dev project
+# only. rs-wt (one worktree per unit of work) refuses outside the dev lane: the
+# discovered clone's origin remote must be the shared Gitea. rs-land
+# (approval-gated landing: archive tag -> ff-only merge -> branch delete) and
+# rs-board (the per-area kanban boards on the shared Gitea) exit with a remedy
+# when no dev wiring is staged.
+COPY container/dev/rs-wt container/dev/rs-land container/dev/rs-board /usr/local/lib/rs/
+RUN chmod +x /usr/local/lib/rs/rs-wt /usr/local/lib/rs/rs-land /usr/local/lib/rs/rs-board
 
 COPY agent/entrypoint.sandbox-dind.sh /entrypoint.sh
 # This image's boot writes nothing into /workspace/.claude/ or /workspace/.pi/

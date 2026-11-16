@@ -82,8 +82,14 @@ RUN usermod -aG docker research
 # after the inner daemon is ready, mcp-reload re-runs it after every allowlist
 # change, and the host re-runs it after staging the dev wiring. Baked here so
 # the research and sandbox-dind leaves carry the same bytes.
-COPY container/supervisor/inner-guard.sh /usr/local/bin/rs-inner-guard
-RUN chmod +x /usr/local/bin/rs-inner-guard
+COPY container/supervisor/inner-guard.sh /usr/local/lib/rs/rs-inner-guard
+RUN chmod +x /usr/local/lib/rs/rs-inner-guard
+# RS's helper-command layout: only what a person or an agent types is on
+# PATH; RS's own helpers (and typed commands only some containers get, linked
+# onto PATH by the host) live in /usr/local/lib/rs. The host refuses an image
+# without this label (MIRROR of rscore.RS_COMMANDS_LABEL / RS_COMMANDS_LAYOUT,
+# pinned).
+LABEL research.rs-commands="1"
 
 # No skel snapshot, no USER switch, no ENTRYPOINT here — the leaf images add
 # their flavor layer, snapshot the home, and set the entrypoint.

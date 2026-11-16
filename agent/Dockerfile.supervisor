@@ -14,21 +14,22 @@ RUN su - research -c 'echo "export PATH=\"\$HOME/.local/bin:\$PATH\"" >> ~/.bash
 RUN /opt/conda/bin/pip install --no-cache-dir 'docker>=7.1' 'pyyaml>=6'
 
 # rs-worker is the worker-lifecycle CLI; rs-audit-stop is the supervision-audit
-# Stop hook, wired into ~/.claude/settings.json by setup.sh on first boot.
+# Stop hook, wired into ~/.claude/settings.json by setup.sh (RS's folder: a
+# hook, never typed).
 COPY cli/rs_worker.py /usr/local/bin/rs-worker
-COPY cli/rs_audit_stop.py /usr/local/bin/rs-audit-stop
-RUN chmod +x /usr/local/bin/rs-worker /usr/local/bin/rs-audit-stop
+COPY cli/rs_audit_stop.py /usr/local/lib/rs/rs-audit-stop
+RUN chmod +x /usr/local/bin/rs-worker /usr/local/lib/rs/rs-audit-stop
 
 # MCP proxy support — config renderer + the reload helper that SIGHUPs the
 # inner-daemon mcp-proxy container.
 RUN mkdir -p /opt/mcp-proxy-tools
 COPY container/supervisor/mcp_render_config.py /opt/mcp-proxy-tools/mcp_render_config.py
-COPY container/supervisor/mcp-reload.sh /usr/local/bin/mcp-reload
-RUN chmod +x /usr/local/bin/mcp-reload
+COPY container/supervisor/mcp-reload.sh /usr/local/lib/rs/mcp-reload
+RUN chmod +x /usr/local/lib/rs/mcp-reload
 
 # Stage 2.3 inner-netns firewall (opt-in via RS_INNER_FIREWALL=1).
-COPY container/supervisor/inner-firewall.sh /usr/local/bin/rs-inner-firewall
-RUN chmod +x /usr/local/bin/rs-inner-firewall
+COPY container/supervisor/inner-firewall.sh /usr/local/lib/rs/rs-inner-firewall
+RUN chmod +x /usr/local/lib/rs/rs-inner-firewall
 
 # role-MCP-side CLI (`list`, `sync-creds`, and the direct client `ping`/`call`/`job`).
 COPY agent/scripts/rs-role-mcp        /usr/local/bin/rs-role-mcp

@@ -33,8 +33,8 @@ Wiring resolution (mirrors rs-land):
 Pure API by design: no git subprocess anywhere. The token travels ONLY as
 the Authorization header — never argv, never inside a URL, never in output.
 
-Standalone by design: image-baked into both dev surfaces (sandbox-dind
-/usr/local/bin; box /opt/dev + the dev-box symlink), so it cannot import
+Standalone by design: image-baked into both dev surfaces (in
+/usr/local/lib/rs, linked onto PATH in a dev project and a dev box), so it cannot import
 cli/ modules — the constants below carry their locksteps.
 """
 

@@ -266,14 +266,14 @@ fi
 # config, ensures rs-inner exists, and either SIGHUPs a running proxy or
 # spawns one. Same script `research project mcp-allow` invokes via
 # `docker exec` after a per-project allowlist mutation.
-/usr/local/bin/mcp-reload || echo "WARNING: mcp-reload (or the inner guard it re-runs) failed at boot" >&2
+/usr/local/lib/rs/mcp-reload || echo "WARNING: mcp-reload (or the inner guard it re-runs) failed at boot" >&2
 
 # --- Optional inner-netns firewall (Stage 2.3, defense-in-depth) ----------
 # Restricts rs-inner egress to mcp-proxy + Docker embedded DNS. Off by default
 # until we've dogfooded the proxy path; opt-in via `research project create
 # --inner-firewall` (sets RS_INNER_FIREWALL=1 on the supervisor).
 if [[ "${RS_INNER_FIREWALL:-0}" == "1" ]]; then
-    /usr/local/bin/rs-inner-firewall || \
+    /usr/local/lib/rs/rs-inner-firewall || \
         echo "WARNING: inner-firewall failed to apply" >&2
 fi
 
@@ -283,7 +283,7 @@ fi
 # they keep the internet, gitea's HTTP port and the proxy's registered
 # upstreams. Runs after the opt-in firewall (whose chain returns what it lets
 # through) and is re-run by mcp-reload and by the host after dev wiring.
-/usr/local/bin/rs-inner-guard || \
+/usr/local/lib/rs/rs-inner-guard || \
     echo "WARNING: inner guard failed to apply" >&2
 
 # Boxes are PI-owned: they boot un-authed and the PI authenticates in-tab

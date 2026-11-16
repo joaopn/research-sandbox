@@ -574,7 +574,7 @@ def allocate_loopback_pub(entries: dict[str, dict]) -> int:
 
 # --- Preset web apps: the tab's address ------------------------------------
 # The address a web-app box is told (the webui tab's exact origin). MIRROR of
-# rscore.valid_web_address and of the box's /usr/local/bin/rs-web-set — the
+# rscore.valid_web_address and of the box's /usr/local/lib/rs/rs-web-set — the
 # three are pinned by one shared vector set. A hostname is at most 253
 # characters (the DNS limit), an IPv6 literal at most 45 inside its brackets.
 _WEB_HOST_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
@@ -2184,13 +2184,18 @@ def _ensure_dev_bridge(name: str, subnet: str) -> str:
 # The opt-in fetch surface's supervisor-side halves: the host stages these
 # into THIS supervisor when the project carries rs-fetch consumers; an
 # rs-fetch-ENABLED box run copies them in (universal staging is retired).
-RS_FETCH_BIN = "/usr/local/bin/rs-fetch"
+# They sit in RS's folder here (MIRRORS of rscore.RS_FETCH_BIN / RS_SYNC_BIN,
+# pinned); in a fetch box they land on PATH (BOX_FETCH_BIN / BOX_SYNC_BIN).
+RS_LIB_DIR = "/usr/local/lib/rs"
+RS_FETCH_BIN = RS_LIB_DIR + "/rs-fetch"
+BOX_FETCH_BIN = "/usr/local/bin/rs-fetch"
 OPERATOR_TOKEN_FILE = DEV_TOKENS_DIR / "operator.token"
 FETCH_WIRING_FILE = DEV_TOKENS_DIR / "fetch-wiring.json"
 # rs-sync and its issue-reading token, staged by the host beside rs-fetch: a
 # lockstep with rscore.RS_SYNC_BIN / ISSUE_READER_TOKEN_NAME and
 # rs_sync.GITEA_TOKEN_PATH (pinned by a test).
-RS_SYNC_BIN = "/usr/local/bin/rs-sync"
+RS_SYNC_BIN = RS_LIB_DIR + "/rs-sync"
+BOX_SYNC_BIN = "/usr/local/bin/rs-sync"
 ISSUE_READER_TOKEN_FILE = DEV_TOKENS_DIR / "issue-reader.token"
 
 
@@ -2230,7 +2235,7 @@ def _stage_box_sync(cname: str) -> None:
         try:
             r = subprocess.run(
                 ["docker", "exec", "-i", "-u", "0", cname, "sh", "-c",
-                 f"cat > {RS_SYNC_BIN} && chmod 755 {RS_SYNC_BIN}"],
+                 f"cat > {BOX_SYNC_BIN} && chmod 755 {BOX_SYNC_BIN}"],
                 input=body, capture_output=True)
         except OSError as e:
             r = subprocess.CompletedProcess(
@@ -2293,7 +2298,7 @@ def _stage_box_fetch(cname: str) -> None:
         return
     r = subprocess.run(
         ["docker", "exec", "-i", "-u", "0", cname, "sh", "-c",
-         "cat > /usr/local/bin/rs-fetch && chmod 755 /usr/local/bin/rs-fetch"],
+         f"cat > {BOX_FETCH_BIN} && chmod 755 {BOX_FETCH_BIN}"],
         input=Path(RS_FETCH_BIN).read_bytes(), capture_output=True)
     if r.returncode != 0:
         err = (r.stderr or r.stdout or b"").decode(errors="replace").strip()
@@ -2331,19 +2336,41 @@ def _stage_box_fetch(cname: str) -> None:
               f"{err}", file=sys.stderr)
 
 
-def _install_dev_tools(cname: str) -> None:
-    """Install the dev tools (rs-wt + rs-land + rs-board) into a DEV box. The
-    box image bakes them at /opt/dev only (command-relevance: a non-dev box
-    carries no dev commands on PATH), and the box entrypoint runs as `worker`,
-    which cannot write /usr/local/bin — so the links land via a root exec
-    here, right after the dev box's docker run (the rs-fetch staging idiom).
-    Best-effort per tool: a failure warns; each stays runnable via its
-    /opt/dev path."""
-    for tool in ("rs-wt", "rs-land", "rs-board"):
+# RS's helper-command layout (a MIRROR of rscore.RS_COMMANDS_LABEL /
+# RS_COMMANDS_LAYOUT, pinned): the box image keeps RS's helpers and the typed
+# commands only some boxes get in RS_LIB_DIR, and says so with this label.
+RS_COMMANDS_LABEL = "research.rs-commands"
+RS_COMMANDS_LAYOUT = "1"
+# The typed commands linked onto a box's PATH by its kind (a MIRROR of
+# rscore.RS_DEV_LINKS / RS_WEB_LINKS, pinned).
+BOX_LINKS = {"dev": ("rs-wt", "rs-land", "rs-board"), "web": ("rs-web-restart",)}
+BOX_RS_COMMANDS_OLD = ("this box was started before RS moved its helper "
+                       "commands; stop the project and start it again")
+
+
+def _box_rs_commands(cname: str) -> bool:
+    """Whether the box container carries RS's current helper-command layout.
+    A failed read reads as no."""
+    r = _docker("container", "inspect", "-f",
+                '{{index .Config.Labels "' + RS_COMMANDS_LABEL + '"}}', cname)
+    return r.returncode == 0 and (r.stdout or "").strip() == RS_COMMANDS_LAYOUT
+
+
+def _link_box_commands(cname: str, tools: "tuple[str, ...]") -> None:
+    """Link typed commands the box image keeps in RS_LIB_DIR onto a box's PATH
+    (command-relevance: a box gets only the commands its kind uses). The box
+    entrypoint runs as `worker`, which cannot write /usr/local/bin, so the
+    links land via a root exec right after the box's docker run. Never on a
+    box from before the layout (the link would point at nothing). Best-effort
+    per tool: a failure warns."""
+    if not _box_rs_commands(cname):
+        print(f"warning: box {cname!r}: {BOX_RS_COMMANDS_OLD}", file=sys.stderr)
+        return
+    for tool in tools:
         r = _docker("exec", "-u", "0", cname, "ln", "-sf",
-                    f"/opt/dev/{tool}", f"/usr/local/bin/{tool}")
+                    f"{RS_LIB_DIR}/{tool}", f"/usr/local/bin/{tool}")
         if r.returncode != 0:
-            print(f"warning: installing {tool} into dev box {cname!r} "
+            print(f"warning: installing {tool} into box {cname!r} "
                   f"failed: {(r.stderr or r.stdout).strip()}", file=sys.stderr)
 
 
@@ -3081,10 +3108,12 @@ def _run_box(name: str, ip: str, *, browser: bool = False, agent: str = "none",
     # the dev preset at both gates).
     if fetch:
         _stage_box_fetch(cname)
-    # Dev tooling on PATH for a DEV box only (the image bakes it at /opt/dev;
-    # command-relevance — see _install_dev_tools).
+    # Typed commands by the box's kind (the image keeps them in RS_LIB_DIR;
+    # command-relevance — see _link_box_commands).
     if dev:
-        _install_dev_tools(cname)
+        _link_box_commands(cname, BOX_LINKS["dev"])
+    elif web:
+        _link_box_commands(cname, BOX_LINKS["web"])
     # The working-mode suite, wherever the box mounts the shared agent copy and
     # the project staged an installer into it (never research). Checked in this
     # container's own filesystem, where the shared copy is a real directory.
@@ -3132,12 +3161,17 @@ def _launch_box_forwarders(cname: str, loopback_ports: list[dict]) -> None:
     """Launch the baked rs-loopback-fwd (root, so any app_port ≥1 binds) for each
     exposed loopback port. No liveness guard needed: a double launch self-resolves
     — the second forwarder's eth0 bind fails and it exits 0 with no pidfile
-    (reuse_address=False). Best-effort; a hiccup warns, the box is otherwise fine."""
+    (reuse_address=False). Best-effort; a hiccup warns, the box is otherwise fine.
+    A box from before RS's helper layout has it elsewhere: one warning."""
+    if loopback_ports and not _box_rs_commands(cname):
+        print(f"warning: loopback forwarders skipped in box {cname!r}: "
+              f"{BOX_RS_COMMANDS_OLD}", file=sys.stderr)
+        return
     for lp in loopback_ports:
         ap = lp.get("app_port")
         if not isinstance(ap, int):
             continue
-        r = _docker("exec", "-d", "-u", "0", cname, "rs-loopback-fwd", str(ap))
+        r = _docker("exec", "-d", "-u", "0", cname, f"{RS_LIB_DIR}/rs-loopback-fwd", str(ap))
         if r.returncode != 0:
             print(f"warning: launching loopback forwarder for app-port {ap} in "
                   f"box {cname!r} failed: {(r.stderr or r.stdout).strip()}",
@@ -3768,6 +3802,14 @@ def cmd_start(args: argparse.Namespace) -> None:
         print(f"box {args.name!r}: re-run at {entry['ip']} "
               f"(it was run before its skills were kept outside its workspace)")
         return
+    # A box last run on an image from before RS's helper-command layout keeps
+    # its helpers where nothing runs them now: re-run it onto the current image
+    # (the re-run refuses with --pull never when the project no longer holds it).
+    if exists and not _box_rs_commands(cname):
+        _print_warnings(args.name, _rerun_box(args.name, entry))
+        print(f"box {args.name!r}: re-run at {entry['ip']} "
+              f"(it was run before RS moved its helper commands)")
+        return
     # A trusted browser box mounts the policy file from this home, which a
     # recreate wiped: write it before a plain start (the container already
     # passed the image check at its run). When it cannot be written, re-run
@@ -3959,8 +4001,10 @@ def cmd_web_address(args: argparse.Namespace) -> None:
     web = _entry_web(entry) if isinstance(entry, dict) else None
     if not web:
         die(f"box {args.name!r} runs no web app")
+    if not _box_rs_commands(box_container(args.name)):
+        die(BOX_RS_COMMANDS_OLD)
     r = _docker("exec", "-u", "worker", box_container(args.name),
-                "timeout", str(WEB_SET_TIMEOUT_S), "rs-web-set", args.address)
+                "timeout", str(WEB_SET_TIMEOUT_S), f"{RS_LIB_DIR}/rs-web-set", args.address)
     changed = ready = False
     try:
         info = json.loads((r.stdout or "").strip().splitlines()[-1])

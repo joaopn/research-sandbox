@@ -4762,6 +4762,10 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             raise ValidationError(OLD_INSTRUCTIONS_LABEL_CREATE_ERROR)
         if layout != INSTRUCTIONS_LAYOUT_HOME:
             raise ValidationError(OLD_INSTRUCTIONS_IMAGE_CREATE_ERROR)
+    # Every project image keeps RS's helpers in RS_LIB_DIR now; one from before
+    # would be created with its helpers where the host no longer runs them.
+    if not _image_rs_commands(substrate_image):
+        raise ValidationError(RS_COMMANDS_OLD_IMAGE)
     if not container_running(ROUTER_CONTAINER):
         die(f"{ROUTER_CONTAINER} is not running. Run `research setup` first.")
     # A workflow that starts its own web app needs the loop baked into the
@@ -5122,6 +5126,8 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
                                     progress=progress, has_file=False)
         if req.web:
             _register_project_web_tab(workspace_path, req.web)
+            # rs-web-restart onto PATH, before the setup's marker step runs it.
+            _link_rs_commands(container_name, RS_WEB_LINKS, on_old="skip")
         # Gitea history, in the box's order and BEFORE the setup: the setup's
         # marker lets OpenKnowledge start, which must never happen in a notes/
         # that history has not yet cloned (the pending mark holds it back).
@@ -5283,6 +5289,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
                                         gitea_ip, box=None, user=dev_user,
                                         branch=effective_dev_branch)
                 _stage_dev_gitea(project, cfg, gitea_ip=gitea_ip)
+                _link_dev_commands(project, container_name)
                 clone_dir = _run_dev_clone(container_name, req.dev_repo,
                                            dev_user, effective_dev_branch,
                                            progress)
@@ -5335,8 +5342,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             stage_worker_image(container_name, MCP_PROXY_IMAGE)
 
             # 6b. Re-run mcp-reload now that the proxy image is staged.
-            run(["docker", "exec", container_name, "/usr/local/bin/mcp-reload"],
-                capture_output=True)
+            _run_rs_helper(container_name, "mcp-reload", on_old="skip")
 
             # 6c. Auto-allow MCPs per --mcp. BEST-EFFORT: external MCPs can be
             #     transient, so a single failure warns and creation continues.
@@ -5358,7 +5364,8 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         #     enabling actually finishes, instead of checking ✓ up front while
         #     the box sits on a silent wait.
         for role in enable_workers:
-            _role_mcp_enable(project, cfg, role, role_mcp_explicit.get(role))
+            _role_mcp_enable(project, cfg, role, role_mcp_explicit.get(role),
+                             on_old="skip")
             workers_enabled.append(role)
 
         progress.step("wire", "enabling workers")
@@ -5406,7 +5413,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         _stage_fetch_wiring(container_name)
     # F3 Slice 1: bring up loopback forwarders for any already-registered exported
     # ports (inert on a fresh project's empty registry; self-gates on docker).
-    _reconcile_loopback_bridges(project, cfg)
+    _reconcile_loopback_bridges(project, cfg, on_old="skip")
     # RS's status bar (#524) on the docker substrate: its boot copies the
     # agents into the home after `docker run` returns, so the write waits for
     # the boot marker; a home not ready in time keeps the choice owed for the
@@ -5791,29 +5798,53 @@ def start(req: StartStopRequest, cfg: "Config" | None = None,
                 c["project"], cfg, c["name"], app_pins)
             if app_item is not None:
                 found.append(app_item)
+            rebuild_ok = app_owed is not None
             if app_owed is None:            # no rebuild may run (see the helper)
                 app_owed = folders_owed = False
             else:
                 folders_owed = _docker_folders_pending(c["project"], cfg, progress)
+            # A container from before RS's helper-command layout is re-created
+            # once onto an image that has it (maintainer answer "1a",
+            # 2026-11-16): its old boot script runs the helpers from where the
+            # host no longer calls them, and nothing short of a re-creation
+            # can change that.
+            image_has_layout = _image_rs_commands(MINIMAL_IMAGE)
+            # Only a container that READS as old (never one whose labels could
+            # not be read) is re-created.
+            commands_owed = (rebuild_ok and image_has_layout
+                             and _rs_commands_state(c["name"])[0] == "old-container")
             # An image that cannot carry the agents across a re-creation is
             # probed here, before choosing it (the re-creation refuses it
             # mid-operation): the project starts as it is and the start ends
             # with the Rebuild all error, so `--all` still starts the rest.
-            if (app_owed or folders_owed) and not _label_is_set(
+            # The same for an image without RS's helper layout.
+            stale_image = False
+            if (app_owed or folders_owed or commands_owed) and not _label_is_set(
                     "image", MINIMAL_IMAGE, label=HOME_RESTORE_LABEL):
                 found.append(OldInstructions("app-pins", c["project"],
                                              reason=_HOME_RESTORE_IMAGE_TOO_OLD_MSG))
+                app_owed = folders_owed = commands_owed = False
+                stale_image = True
+            elif (app_owed or folders_owed) and not image_has_layout:
+                found.append(OldInstructions("rs-commands", c["project"],
+                                             reason=RS_COMMANDS_OLD_IMAGE))
                 app_owed = folders_owed = False
-            if app_owed or folders_owed:
+                stale_image = True
+            if app_owed or folders_owed or commands_owed:
                 what = (_app_pins_progress_text(
                     (web_override or _project_web(c["name"]) or {}).get("setup", ""),
                     app_pins) if app_owed else "")
-                progress.step("recreate", (
+                text = (
                     f"re-creating the project to install {what}"
                     + (" and apply its new folders" if folders_owed else "")
                     if what else
                     "re-creating the project with its new folders" if folders_owed and not app_owed
-                    else "re-creating the project to bring its app up to date"))
+                    else "re-creating the project to bring its app up to date"
+                    if app_owed else "")
+                if commands_owed:
+                    text = (text + " and bring RS's commands up to date" if text
+                            else "re-creating the project to bring RS's commands up to date")
+                progress.step("recreate", text)
                 _recreate_docker_substrate(
                     c["project"], cfg, service_flags=_read_service_flags(c["name"]),
                     progress=progress, heal_gitea=True, found=found,
@@ -5821,6 +5852,11 @@ def start(req: StartStopRequest, cfg: "Config" | None = None,
             else:
                 progress.step("start", "starting container")
                 _start_docker_substrate(c["project"], cfg, progress, found=found)
+            # A project that still cannot run RS's helpers says so once — not
+            # when an app-version item already explains why no re-creation ran,
+            # nor twice for a stale image.
+            if rebuild_ok and not stale_image:
+                found += _rs_commands_item(c["project"], c["name"])
         else:
             progress.step("recreate", "recreating supervisor")
             found += _recreate_supervisor(c["project"], cfg, progress=progress,
@@ -5992,6 +6028,14 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     # The same for the app versions its boxes are re-run with (the docker
     # editor switch reads them in its own refusal block).
     app_pins = read_app_pins()
+    # Images not rebuilt since RS moved its helpers (or labels that cannot be
+    # read): every update path may run a helper, and a file-only update copies
+    # into a folder such an image lacks. Refuse before the first write. An old
+    # CONTAINER on a current image is fine: the update's re-creation fixes it.
+    if not req.rebuild:
+        state, text = _rs_commands_state(container)
+        if state in ("old-image", "unreadable"):
+            raise ValidationError(text)
 
     print(f"=== Updating project: {project} ===")
 
@@ -6268,7 +6312,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     if disable_workers:
         progress.step("disable", "applying disables")
     for role in disable_workers:
-        _role_mcp_disable(project, cfg, role)
+        _role_mcp_disable(project, cfg, role, on_old="skip")
         workers_disabled.append(role)
 
     progress.step("recreate", "recreating supervisor")
@@ -6294,7 +6338,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         progress.step("enable", "applying enables")
     workers_enabled: list[str] = []
     for role in enable_workers:
-        _role_mcp_enable(project, cfg, role, role_mcp_explicit.get(role))
+        _role_mcp_enable(project, cfg, role, role_mcp_explicit.get(role), on_old="skip")
         workers_enabled.append(role)
 
     # After the last step, so everything above still ran.
@@ -6352,7 +6396,10 @@ INNER_NETWORK = "rs-inner"
 # The always-on inner-bridge guard baked into the substrate base (both dind
 # leaves): run by the entrypoints, by mcp-reload, and by the host right after
 # the dev wiring is staged (its gitea exception reads that file).
-INNER_GUARD_BIN = "/usr/local/bin/rs-inner-guard"
+# RS's private folder for its helpers (the layout is described with
+# _rs_commands_state below).
+RS_LIB_DIR = "/usr/local/lib/rs"
+INNER_GUARD_BIN = RS_LIB_DIR + "/rs-inner-guard"
 WEBUI_IMAGE = "rs-webui:latest"
 WEBUI_CONTAINER = "rs-webui"
 # The listen contract (B156): an image carrying this label binds every listener
@@ -11873,10 +11920,10 @@ def _for_containers(op: str, target: str | None) -> None:
 # code. Pairs are (host-relative source, container target, executable bit).
 _SUPERVISOR_FILE_MAP: list[tuple[str, str, bool]] = [
     ("cli/rs_worker.py",                                "/usr/local/bin/rs-worker",                          True),
-    ("cli/rs_audit_stop.py",                            "/usr/local/bin/rs-audit-stop",                      True),
+    ("cli/rs_audit_stop.py",                            RS_LIB_DIR + "/rs-audit-stop",                   True),
     ("container/supervisor/mcp_render_config.py",       "/opt/mcp-proxy-tools/mcp_render_config.py",         False),
-    ("container/supervisor/mcp-reload.sh",              "/usr/local/bin/mcp-reload",                         True),
-    ("container/supervisor/inner-firewall.sh",          "/usr/local/bin/rs-inner-firewall",                  True),
+    ("container/supervisor/mcp-reload.sh",              RS_LIB_DIR + "/mcp-reload",                      True),
+    ("container/supervisor/inner-firewall.sh",          RS_LIB_DIR + "/rs-inner-firewall",               True),
     ("container/supervisor/inner-guard.sh",             INNER_GUARD_BIN,                                     True),
     ("container/supervisor/CLAUDE.md",                  "/opt/claude-templates/CLAUDE.md",                   False),
     ("container/rs-instructions-notice.md",             "/opt/claude-templates/rs-instructions-notice.md",   False),
@@ -11904,7 +11951,7 @@ _SANDBOX_DIND_FILE_MAP: list[tuple[str, str, bool]] = [
     # The proxy tooling this leaf bakes (Dockerfile.sandbox-dind): mcp-reload
     # re-runs the inner guard, so a file-only update must carry both.
     ("container/supervisor/mcp_render_config.py", "/opt/mcp-proxy-tools/mcp_render_config.py", False),
-    ("container/supervisor/mcp-reload.sh", "/usr/local/bin/mcp-reload",  True),
+    ("container/supervisor/mcp-reload.sh", RS_LIB_DIR + "/mcp-reload", True),
     ("container/supervisor/inner-guard.sh", INNER_GUARD_BIN,        True),
     ("agent/entrypoint.sandbox-dind.sh", "/entrypoint.sh",            True),
 ]
@@ -12190,6 +12237,13 @@ def _recreate_supervisor(
     was_running = container_running(container)
     workspace_path = workspace_path_for(project, cfg)
 
+    # A file-only update copies RS's helpers into the folder the image keeps
+    # them in; an image from before that layout has none, and the copy would
+    # fail after the old container is gone. Refuse before anything is touched.
+    if post_create_hook is not None:
+        state, text = _rs_commands_state(container)
+        if state in ("old-image", "unreadable"):
+            raise ValidationError(text)
     md = _read_supervisor_metadata(container)
     # The task cap from the host settings, read before anything is touched: a
     # damaged settings file refuses here, never after the container is gone.
@@ -12405,8 +12459,7 @@ def _recreate_supervisor(
             _stage_node_dist(container, deploy_local=flags.get("node", False))
     stage_worker_image(container, MCP_PROXY_IMAGE, force=force_restage)
 
-    run(["docker", "exec", container, "/usr/local/bin/mcp-reload"],
-        capture_output=True)
+    _run_rs_helper(container, "mcp-reload", on_old="skip")
 
     # Bring previously-enabled role-MCPs back up. The inner dockerd is
     # fresh under sysbox; each role-MCP container is gone and must be
@@ -12432,6 +12485,10 @@ def _recreate_supervisor(
                   f"`research project role-mcp enable {project} {role}`",
                   file=sys.stderr)
 
+    # A dev project's own commands (rs-wt, rs-land, rs-board) onto its PATH:
+    # the recreate's container starts from the image, which keeps them in
+    # RS's folder.
+    _link_dev_commands(project, container)
     # Dev-lane wiring (STAGE_DEV_GITEA S2): the token half lives in the
     # supervisor's own fs, which the recreate just wiped — re-stage BEFORE the
     # box relaunch loop below (a dev box's _rerun_box re-reads it; the
@@ -12460,7 +12517,7 @@ def _recreate_supervisor(
         mcp_sync_project(project, container, progress=progress)
     # F3 Slice 2a: the sysbox recreate reset the supervisor's netns/processes —
     # re-establish loopback forwarders for its registered exported ports (Fork-B).
-    _reconcile_loopback_bridges(project, cfg)
+    _reconcile_loopback_bridges(project, cfg, on_old="skip")
 
     # Restart the project's boxes (kind="sandbox", extensions.json). Boxes are
     # owned by the in-supervisor rs-sandbox CLI; the snapshot is the source of
@@ -12521,7 +12578,27 @@ def _recreate_supervisor(
         _report_box_restart_warnings(name, r.stdout, progress)
         found += _box_old_items(project, name,
                                 _parse_box_tool_json(r.stdout).get("warnings"))
-    return found
+    # A container from an image before RS's helper-command layout skipped its
+    # helper steps above: say so once, at the end.
+    return found + _rs_commands_item(project, container)
+
+
+def _project_is_dev(project: str) -> bool:
+    """Whether a project's own agent works a repo on the dev lane: the HOST
+    record (an agent row that is not a box's), never the project-writable
+    wiring file."""
+    return any(e.get("class") == "agent" and e.get("box") is None
+               for e in gitea.project_entries(project))
+
+
+def _link_dev_commands(project: str, container: str) -> None:
+    """rs-wt, rs-land and rs-board onto a dev project's PATH. Only the
+    sandbox-dind image keeps them (a docker project has none to link)."""
+    if _container_project_type(container) != PROJECT_TYPE_SANDBOX_DIND \
+            or _container_substrate(container) == Substrate.DOCKER.value:
+        return
+    if _project_is_dev(project):
+        _link_rs_commands(container, RS_DEV_LINKS, on_old="skip")
 
 
 def _container_project_type(container: str) -> str:
@@ -12664,7 +12741,7 @@ def _start_docker_substrate(project: str, cfg: "Config",  # type: ignore[name-de
         _stage_fetch_wiring(container)
     # F3 Slice 1: re-establish loopback forwarders for the project's registered
     # exported ports (the container's netns/processes reset on stop/start).
-    _reconcile_loopback_bridges(project, cfg)
+    _reconcile_loopback_bridges(project, cfg, on_old="skip")
     # RS's instructions into the agent's home (which survived the stop),
     # before the setup retry, so a failing setup still leaves the file.
     old = _write_project_instructions(project, container, workspace_path_for(project, cfg),
@@ -12974,7 +13051,7 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
         _stage_fetch_wiring(container)
     # F3 Slice 1: the rm + run above wiped the container fs + netns — re-establish
     # loopback forwarders for the project's registered exported ports.
-    _reconcile_loopback_bridges(project, cfg)
+    _reconcile_loopback_bridges(project, cfg, on_old="skip")
     # Everything below writes into the agents' home (RS's instructions, the
     # MCP servers' config, the agents' settings), so it waits for the
     # entrypoint's restore: a write landing before the restore would be
@@ -14045,7 +14122,7 @@ def wire_gitea_to_projects(progress=None) -> None:
             _stage_fetch_wiring(container_name_for(project), serving=serving)
         # F3 Slice 1: heal loopback forwarders on the universal `research start`
         # wiring pass (self-gates on docker; no-op for non-docker projects).
-        _reconcile_loopback_bridges(project, cfg)
+        _reconcile_loopback_bridges(project, cfg, on_old="skip")
         # UNGATED (was `if gitea.project_entries(project):`): fetch boxes mint
         # no gitea consumer, so a ledger gate would skip exactly the projects
         # the fetch half of the reconcile targets. _restart_dev_boxes
@@ -14279,16 +14356,15 @@ def _rerun_inner_guard(project: str) -> None:
     wires gitea in. Skipped for the `docker` substrate (no inner bridge, no
     guard; this staging site is reached from its start path too) and for a
     stopped container (its next boot runs the guard itself). A failure warns
-    and continues — the guard's own posture; a container from before the
-    guard existed warns here on every start until `project update` copies the
-    script in."""
+    and continues — the guard's own posture. A container that cannot run RS's
+    helpers yet skips it with one warning (the start reports why)."""
     container = container_name_for(project)
     if not container_running(container):
         return
     if _container_substrate(container) == Substrate.DOCKER.value:
         return
-    r = run(["docker", "exec", container, INNER_GUARD_BIN], capture_output=True)
-    if r.returncode != 0:
+    r = _run_rs_helper(container, "rs-inner-guard", on_old="skip")
+    if r is not None and r.returncode != 0:
         print(f"warning: inner guard re-run in {container} failed: "
               f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
 
@@ -14296,7 +14372,7 @@ def _rerun_inner_guard(project: str) -> None:
 def _stage_dev_fetch(container: str, progress=None, serving: bool = True,
                      ensure: bool = True) -> None:
     """Stage the OPT-IN fetch surface into a RUNNING rs-fetch-enabled project
-    container: the rs-fetch tool at /usr/local/bin/rs-fetch (root-owned 0755 —
+    container: the rs-fetch tool in RS_LIB_DIR (root-owned 0755 —
     the _stage_rs_sandbox single-file stdin idiom) + the READ-ONLY gitea
     operator token at ~/.dev-tokens/operator.token (0600, the agent-token
     stdin pattern — never argv, never the workspace). Called only for fetch
@@ -14314,17 +14390,22 @@ def _stage_dev_fetch(container: str, progress=None, serving: bool = True,
         return
     if not tok or not container_running(container):
         return
+    # The tools go into RS's folder (the boxes copy from there); never into a
+    # container from before that layout, whose old box tool reads
+    # /usr/local/bin. The operator token below is staged either way.
+    tools_ok = _rs_commands_ok(container, "skip", "rs-fetch staging")
     src = Path(__file__).resolve().parent / "rs_fetch.py"
-    if not src.is_file():
+    if tools_ok and not src.is_file():
         print(f"warning: rs_fetch.py not found at {src}; fetch tool not "
               f"staged into {container}", file=sys.stderr)
         return
-    install = "cat > /usr/local/bin/rs-fetch && chmod 755 /usr/local/bin/rs-fetch"
-    proc = subprocess.Popen(
-        ["docker", "exec", "-i", "-u", "0", container, "sh", "-c", install],
-        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    _, err = proc.communicate(input=src.read_bytes())
-    if proc.returncode != 0:
+    if tools_ok:
+        install = f"mkdir -p {RS_LIB_DIR} && cat > {RS_FETCH_BIN} && chmod 755 {RS_FETCH_BIN}"
+        proc = subprocess.Popen(
+            ["docker", "exec", "-i", "-u", "0", container, "sh", "-c", install],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        _, err = proc.communicate(input=src.read_bytes())
+    if tools_ok and proc.returncode != 0:
         detail = (err.decode(errors="replace") if err else "").strip()
         print(f"warning: staging rs-fetch into {container} failed: "
               f"{detail or 'cat returned non-zero'}", file=sys.stderr)
@@ -14340,14 +14421,36 @@ def _stage_dev_fetch(container: str, progress=None, serving: bool = True,
     # (the wiring pass), so a failing mint is not retried per project.
     if ensure:
         _ensure_issue_reader_token(progress, serving)
+    if not tools_ok:
+        return
     _stage_rs_sync(container)
+    # On PATH only where the container itself fetches; a project whose only
+    # fetch consumers are its boxes keeps them in RS's folder as their source.
+    if _container_fetches_itself(container):
+        _link_rs_commands(container, ("rs-fetch", "rs-sync"), on_old="skip")
+
+
+def _container_fetches_itself(container: str) -> bool:
+    """Whether a project container was created with fetch (its marker's
+    `fetch` key), as opposed to only hosting fetch boxes."""
+    if not container.startswith(CONTAINER_PREFIX):
+        return False
+    project = container[len(CONTAINER_PREFIX):]
+    try:
+        return _read_marker_dict(workspace_path_for(project, load_config())).get("fetch") is True
+    except Exception:  # noqa: BLE001 — an unreadable record does not fetch
+        return False
 
 
 # The in-container name of the issue-reading token: a lockstep with
 # rs_sandbox.ISSUE_READER_TOKEN_FILE (the box copy) and rs_sync.GITEA_TOKEN_PATH
 # (the reader). Pinned by a test.
 ISSUE_READER_TOKEN_NAME = "issue-reader.token"
-RS_SYNC_BIN = "/usr/local/bin/rs-sync"
+# Where the fetch tools are staged (RS's folder; linked onto PATH only in a
+# container that fetches itself). MIRRORS of rs_sandbox.RS_FETCH_BIN /
+# RS_SYNC_BIN, the copy sources of a fetch box (pinned).
+RS_FETCH_BIN = RS_LIB_DIR + "/rs-fetch"
+RS_SYNC_BIN = RS_LIB_DIR + "/rs-sync"
 # How often a process waiting for another's token mint looks again. The wait
 # is bounded by gitea.ISSUE_TOKEN_MINT_TIMEOUT_S plus two probe timeouts
 # (gitea.STATUS_TIMEOUT_S, the holder's probes); a mint takes about a second,
@@ -14385,7 +14488,7 @@ def _stage_rs_sync(container: str) -> None:
         try:
             proc = subprocess.Popen(
                 ["docker", "exec", "-i", "-u", "0", container, "sh", "-c",
-                 f"cat > {RS_SYNC_BIN} && chmod 755 {RS_SYNC_BIN}"],
+                 f"mkdir -p {RS_LIB_DIR} && cat > {RS_SYNC_BIN} && chmod 755 {RS_SYNC_BIN}"],
                 stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             _, err = proc.communicate(input=body)
         except OSError as e:
@@ -14587,7 +14690,7 @@ def _stage_fetch_wiring(container: str, *, serving: bool = True) -> None:
 # only (the box container IS rs-project-<name>); dind inner boxes are Slice 2. The
 # forwarder + its pidfiles live at these fixed in-box paths and the host reconcile
 # is the ONLY thing that launches/reaps them.
-_LOOPBACK_FWD_BIN = "/usr/local/bin/rs-loopback-fwd"
+_LOOPBACK_FWD_BIN = RS_LIB_DIR + "/rs-loopback-fwd"
 _LOOPBACK_PIDFILE_DIR = "/tmp/rs-loopback-fwd"
 # Reap bound for a killed forwarder GROUP (one process may serve several ports):
 # SIGTERM ends the handler-less asyncio process in milliseconds, so the poll
@@ -14602,7 +14705,7 @@ _LOOPBACK_REAP_POLL_S = 0.1
 
 def _stage_loopback_fwd(container: str) -> None:
     """Stage the F3 loopback forwarder into a RUNNING container at
-    /usr/local/bin/rs-loopback-fwd (root-owned 0755 — the _stage_dev_fetch
+    RS_LIB_DIR/rs-loopback-fwd (root-owned 0755 — the _stage_dev_fetch
     single-file stdin idiom, never docker cp). Idempotent (overwrites);
     best-effort — a staging failure warns and continues (the box is fine without
     it). Callers gate on docker substrate + container_running (see
@@ -14612,8 +14715,8 @@ def _stage_loopback_fwd(container: str) -> None:
         print(f"warning: rs_loopback_fwd.py not found at {src}; loopback forwarder "
               f"not staged into {container}", file=sys.stderr)
         return
-    install = ("cat > /usr/local/bin/rs-loopback-fwd && "
-               "chmod 755 /usr/local/bin/rs-loopback-fwd")
+    install = (f"mkdir -p {RS_LIB_DIR} && cat > {_LOOPBACK_FWD_BIN} && "
+               f"chmod 755 {_LOOPBACK_FWD_BIN}")
     proc = subprocess.Popen(
         ["docker", "exec", "-i", "-u", "0", container, "sh", "-c", install],
         stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -14624,7 +14727,7 @@ def _stage_loopback_fwd(container: str) -> None:
               f"{detail or 'cat returned non-zero'}", file=sys.stderr)
 
 
-def _reconcile_loopback_bridges(project: str, cfg: "Config") -> None:  # type: ignore[name-defined]
+def _reconcile_loopback_bridges(project: str, cfg: "Config", *, on_old: str) -> None:  # type: ignore[name-defined]
     """Make the running set of in-box loopback forwarders match a project's
     exported-port registry, for the TOP-LEVEL `rs-project-<name>` container of
     ANY substrate — a docker box (F3 Slice 1) OR a research/sandbox-dind
@@ -14646,7 +14749,11 @@ def _reconcile_loopback_bridges(project: str, cfg: "Config") -> None:  # type: i
     therefore kills its whole group — BY CONSTRUCTION, not timing: the teardown
     reaps the killed pid (bounded wait, then SIGKILL) and unlinks every sibling
     pidfile holding it, so the survivors read dead in THIS call's liveness pass
-    and relaunch together as one new group before this function returns."""
+    and relaunch together as one new group before this function returns.
+
+    `on_old` (see _rs_commands_ok) is decided ONCE, before the teardown: a
+    container from before RS's helper layout runs its forwarders from the old
+    place, which neither the teardown nor the probes below would match."""
     container = container_name_for(project)
     if not container_running(container):
         return
@@ -14679,6 +14786,12 @@ def _reconcile_loopback_bridges(project: str, cfg: "Config") -> None:  # type: i
         cur_lo, cur_hi = lo, hi
     if cur_hi is not None:
         desired.extend(range(cur_lo, cur_hi + 1))
+    # A container that cannot run RS's helpers is left alone — silently when it
+    # has no exported port to bridge, so a plain start says nothing extra.
+    if not desired and _rs_commands_state(container)[0] != "ok":
+        return
+    if not _rs_commands_ok(container, on_old, "the loopback forwarders"):
+        return
     # Teardown ALWAYS runs first (even when desired is empty) so a removed port's
     # forwarder is reaped. The kill is GUARDED by a /proc/<pid>/cmdline content
     # check — identical to the liveness probe (F1): a bare `kill $(cat pidfile)`
@@ -14759,10 +14872,10 @@ exit 0'''
     # [..., _LOOPBACK_FWD_BIN, p1, p2, ...] with nothing between the bin and the
     # port tokens — the teardown/liveness greps match tokens NUL-exactly, and
     # archived pins assert the single-port tail.
-    launched = run(["docker", "exec", "-d", "-u", "0", container,
-                    _LOOPBACK_FWD_BIN, *(str(p) for p in to_launch)],
-                   capture_output=True)
-    if launched.returncode != 0:
+    launched = _run_rs_helper(container, "rs-loopback-fwd",
+                              [str(p) for p in to_launch], on_old="skip",
+                              user="0", detach=True)
+    if launched is not None and launched.returncode != 0:
         print(f"warning: launching loopback forwarder for port(s) "
               f"{', '.join(str(p) for p in to_launch)} in {container} failed: "
               f"{(launched.stderr or launched.stdout).strip()}",
@@ -15221,7 +15334,10 @@ def _bring_box_image(container: str, network: str, workspace_path: "Path",
     # An image from before RS's current layout boots into writing RS's files
     # into the box's own folders: refused before anything is published or
     # pulled. Read from that exact id, so a concurrent rebuild cannot move it.
-    if _image_instructions_layout(host_id) != INSTRUCTIONS_LAYOUT_HOME:
+    # The same for an image from before RS's helper-command layout: the box
+    # tool would run its helpers where the image does not keep them.
+    if _image_instructions_layout(host_id) != INSTRUCTIONS_LAYOUT_HOME \
+            or not _image_rs_commands(host_id):
         return BoxImageResult(BOX_IMAGE_OLD_LAYOUT)
     try:
         _connect_registry_to_project_network(network)
@@ -15630,6 +15746,9 @@ def _require_home_restore_image() -> None:
     there too. Before anything is touched."""
     if not _label_is_set("image", MINIMAL_IMAGE, label=HOME_RESTORE_LABEL):
         raise ValidationError(_HOME_RESTORE_IMAGE_TOO_OLD_MSG)
+    # The re-created container must find RS's helpers where the host runs them.
+    if not _image_rs_commands(MINIMAL_IMAGE):
+        raise ValidationError(RS_COMMANDS_OLD_IMAGE)
 
 
 def _claude_ops_from_pair(pair: "dict | None",
@@ -15959,6 +16078,8 @@ class OldInstructions:
                        # `reason` is its fixed text)
                        # | "app-pins" (an app version could not be applied to
                        # the project or a box; `reason` is its fixed text)
+                       # | "rs-commands" (the project cannot run RS's helpers
+                       # yet; `reason` is its fixed text)
                        # | "files" / "box-files" (files RS used to write into
                        # the project's / a box's folder; `paths` lists them)
     project: str
@@ -15969,7 +16090,7 @@ class OldInstructions:
     def text(self) -> str:
         if self.kind == "box":
             return OLD_INSTRUCTIONS_BOX_ERROR.format(box=_shown_box(self.box))
-        if self.kind in ("box-image", "status-bar", "app-pins"):
+        if self.kind in ("box-image", "status-bar", "app-pins", "rs-commands"):
             return self.reason
         if self.kind == "files":
             return OLD_FILES_PROJECT_ERROR.format(paths=_shown_old_paths("", self.paths))
@@ -16312,6 +16433,154 @@ def _container_labels(container: str) -> "dict | None":
             RecursionError):
         return None
     return labels if isinstance(labels, dict) else {}
+
+
+# ---------------------------------------------------------------------------
+# RS's helper commands: off PATH, in one private folder, behind one gate.
+# ---------------------------------------------------------------------------
+
+# Only what a person or an agent types sits on /usr/local/bin; RS's own helpers
+# live in this folder (the status bar already did). An image that carries the
+# layout says so with this label, a MIRROR of the LABEL lines in
+# Dockerfile.minimal, Dockerfile.substrate-base and Dockerfile.sandbox-box
+# (pinned by a test). The number is the layout's version: it changes only when
+# the layout does.
+RS_COMMANDS_LABEL = "research.rs-commands"
+RS_COMMANDS_LAYOUT = "1"
+# Helpers RS runs and nobody types; never called by bare name (pinned).
+RS_PRIVATE_HELPERS = ("rs-inner-guard", "rs-inner-firewall", "mcp-reload",
+                      "rs-audit-stop", "rs-web-loop", "rs-web-set",
+                      "rs-loopback-fwd")
+RS_COMMANDS_OLD_CONTAINER = (
+    "this project is still running from before RS moved its helper commands; "
+    "stop the project and start it again")
+RS_COMMANDS_OLD_IMAGE = (
+    "this project type's image predates RS's helper-command layout: rebuild "
+    "RS's images with Rebuild all on Sandboxes → Software, then try again")
+RS_COMMANDS_UNREADABLE = (
+    "RS could not read this project's container labels, so it could not check "
+    "where its helper commands are; stop the project and start it again")
+# The typed commands RS links onto a container's PATH from RS_LIB_DIR, by the
+# container's kind. Everything else a container types is baked or staged
+# straight into /usr/local/bin (rs-worker, rs-role-mcp, rs-sandbox, rs-fetch
+# and rs-sync for a container that fetches itself). A MIRROR of
+# rs_sandbox.BOX_LINKS (pinned).
+RS_DEV_LINKS = ("rs-wt", "rs-land", "rs-board")
+RS_WEB_LINKS = ("rs-web-restart",)
+
+
+def _image_rs_commands(image: str) -> bool:
+    """Whether the host's image carries the current helper-command layout. A
+    failed read (a missing image included) reads as no: Rebuild all is the
+    remedy either way (the home-restore precedent)."""
+    try:
+        r = run(["docker", "image", "inspect", "-f",
+                 '{{index .Config.Labels "' + RS_COMMANDS_LABEL + '"}}', image],
+                capture_output=True, timeout=RS_INSTR_EXEC_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0 and (r.stdout or "").strip() == RS_COMMANDS_LAYOUT
+
+
+def _project_image_for_labels(labels: dict) -> str:
+    """The current host image of a project container's kind, from its own
+    labels: the docker substrate runs rs-minimal, a dind project its flavor's
+    leaf."""
+    if labels.get(SUBSTRATE_LABEL) == Substrate.DOCKER.value:
+        return MINIMAL_IMAGE
+    if labels.get(PROJECT_TYPE_LABEL) == PROJECT_TYPE_SANDBOX_DIND:
+        return SANDBOX_DIND_IMAGE
+    return SUPERVISOR_IMAGE
+
+
+def _rs_commands_state(container: str) -> "tuple[str, str]":
+    """Where a project container's helpers are: ("ok", ""), ("old-container",
+    text) when the container predates the layout but the current image of its
+    kind carries it (a stop and start fixes it), ("old-image", text) when the
+    current image lacks it too (Rebuild all fixes it), ("unreadable", text)
+    when the container's labels cannot be read — never folded into ok or old.
+    The texts reach the browser and name no command."""
+    labels = _container_labels(container)
+    if labels is None:
+        return "unreadable", RS_COMMANDS_UNREADABLE
+    if labels.get(RS_COMMANDS_LABEL) == RS_COMMANDS_LAYOUT:
+        return "ok", ""
+    if _image_rs_commands(_project_image_for_labels(labels)):
+        return "old-container", RS_COMMANDS_OLD_CONTAINER
+    return "old-image", RS_COMMANDS_OLD_IMAGE
+
+
+def _require_rs_commands(container: str) -> None:
+    """For a verb a person aims at one project's live container: refuse BEFORE
+    any side effect when RS cannot run its helpers there (the home-restore and
+    task-cap precedent). A container that is not running has nothing to run
+    them in, so it passes (the verb's own gates speak for it)."""
+    if not container_running(container):
+        return
+    state, text = _rs_commands_state(container)
+    if state != "ok":
+        raise ValidationError(text)
+
+
+def _rs_commands_item(project: str, container: str) -> "list[OldInstructions]":
+    """After a start or update: one end-of-operation item when the project
+    still cannot run RS's helpers (its helper steps were skipped)."""
+    state, text = _rs_commands_state(container)
+    return [] if state == "ok" else [OldInstructions("rs-commands", project, reason=text)]
+
+
+def _rs_commands_ok(container: str, on_old: str, what: str) -> bool:
+    """The one decision every step that runs a helper makes. `on_old` is
+    "raise" (a verb aimed at this container: ValidationError) or "skip" (a
+    fleet pass, a start, a warn-and-continue step: one warning, the step is
+    skipped, and the start or update reports the item at its end)."""
+    if on_old not in ("raise", "skip"):
+        raise ValueError(f"on_old must be 'raise' or 'skip', not {on_old!r}")
+    state, text = _rs_commands_state(container)
+    if state == "ok":
+        return True
+    if on_old == "raise":
+        raise ValidationError(text)
+    print(f"warning: {what} skipped in {container}: {text}", file=sys.stderr)
+    return False
+
+
+def _run_rs_helper(container: str, name: str, args: "Sequence[str]" = (), *,
+                   on_old: str, user: str = "", detach: bool = False,
+                   wrap: "Sequence[str]" = (), timeout: "float | None" = None,
+                   input: "str | None" = None) -> "subprocess.CompletedProcess | None":
+    """THE way the host runs one of RS's private helpers in a project container
+    (a pin forbids any other). None when the container cannot run it (see
+    _rs_commands_ok); else the finished exec, output captured. `wrap` goes
+    between the container and the helper (a `timeout N` guard)."""
+    if name not in RS_PRIVATE_HELPERS:
+        raise ValueError(f"{name!r} is not one of RS's private helpers")
+    if not _rs_commands_ok(container, on_old, name):
+        return None
+    argv = ["docker", "exec"]
+    if detach:
+        argv.append("-d")
+    if input is not None:
+        argv.append("-i")
+    if user:
+        argv += ["-u", user]
+    argv += [container, *wrap, f"{RS_LIB_DIR}/{name}", *args]
+    return run(argv, capture_output=True, input=input, timeout=timeout)
+
+
+def _link_rs_commands(container: str, names: "Sequence[str]", *, on_old: str) -> None:
+    """Put typed commands the image keeps in RS_LIB_DIR onto the container's
+    PATH. Never on a container from before the layout: there the link would
+    replace a working command with one pointing at nothing. Best-effort per
+    name: a failure warns."""
+    if not names or not _rs_commands_ok(container, on_old, "linking RS's commands"):
+        return
+    for t in names:
+        r = run(["docker", "exec", "-u", "0", container, "ln", "-sf",
+                 f"{RS_LIB_DIR}/{t}", f"/usr/local/bin/{t}"], capture_output=True)
+        if r.returncode != 0:
+            print(f"warning: linking {t} into {container} failed: "
+                  f"{(r.stderr or r.stdout).strip()}", file=sys.stderr)
 
 
 def _research_instructions_check(project: str, container: str) -> "list[OldInstructions]":
@@ -19032,9 +19301,8 @@ def _supervisor_mcp_reload(container_name: str) -> None:
     """Re-render the supervisor's proxy config and SIGHUP the proxy."""
     if not container_running(container_name):
         return
-    r = run(["docker", "exec", container_name, "/usr/local/bin/mcp-reload"],
-            capture_output=True)
-    if r.returncode != 0:
+    r = _run_rs_helper(container_name, "mcp-reload", on_old="skip")
+    if r is not None and r.returncode != 0:
         msg = (r.stderr or r.stdout).strip()
         print(f"warning: mcp-reload in {container_name} failed: {msg}",
               file=sys.stderr)
@@ -19048,6 +19316,12 @@ def _allow_mcp_for_project(project: str, cfg: "Config", mcp_name: str,
     The caller owns project-existence checks; this helper validates
     router + registry + (shared) container state."""
     container_name = container_name_for(project)
+    # The reload below runs RS's helper in the project: refuse before the
+    # router hole and the allowlist write when it cannot run there.
+    if container_running(container_name):
+        state, text = _rs_commands_state(container_name)
+        if state != "ok":
+            return False, text
 
     if not container_running(ROUTER_CONTAINER):
         return False, f"{ROUTER_CONTAINER} is not running"
@@ -19129,6 +19403,8 @@ def _deny_mcp_for_project(project: str, cfg: "Config", mcp_name: str,
     ``(ok, message)``. Tolerates a torn-down project network / stopped
     router (skips the firewall step in that case)."""
     container_name = container_name_for(project)
+    # Never refused on an old container: closing the router hole matters more
+    # than the proxy reload, which the gate skips there with a warning.
 
     allowlist = load_project_allowlist(project, cfg)
     target = next((e for e in allowlist if e.get("name") == mcp_name), None)
@@ -19225,7 +19501,7 @@ def _role_mcp_stage_creds(supervisor: str, role: str) -> None:
         chmod 600 /workspace/.role-mcps/{role}/.creds/.credentials.json
         if [ -f /home/research/.claude/settings.json ]; then
             # Strip the `hooks` key — the supervisor's Stop hook calls
-            # /usr/local/bin/rs-audit-stop, which is baked into the
+            # /usr/local/lib/rs/rs-audit-stop, which is baked into the
             # supervisor image only. Propagating it would break every
             # claude session in the role-MCP container with a "command
             # not found" error on every Stop event.
@@ -19547,7 +19823,8 @@ def _role_mcp_enable(project: str, cfg: "Config", role: str,
                      upstreams: list[str] | None,
                      *, force_auto: bool = False,
                      memory: str | None = None,
-                     max_concurrent_calls: int | None = None) -> None:
+                     max_concurrent_calls: int | None = None,
+                     on_old: str = "raise") -> None:
     """Validate + write the per-project role-mcps.json entry + start the
     container + reload the supervisor's mcp-proxy so its config includes
     the role-MCP route. Idempotent. Enables the worker-facing service only;
@@ -19565,6 +19842,11 @@ def _role_mcp_enable(project: str, cfg: "Config", role: str,
             ``upstream_source`` and ``upstream_mcps``. No silent flips."""
     role_mcp.validate_role(role)
     supervisor = container_name_for(project)
+    # The proxy reload this ends with runs RS's helper: refuse first — unless
+    # the caller re-creates the container anyway (an Update), which brings it
+    # onto the layout.
+    if on_old == "raise":
+        _require_rs_commands(supervisor)
     if not container_running(supervisor):
         die(f"project {project!r} is not running; bring it up first")
 
@@ -19655,13 +19937,19 @@ def _role_mcp_enable(project: str, cfg: "Config", role: str,
         _supervisor_mcp_reload(supervisor)
 
 
-def _role_mcp_disable(project: str, cfg: "Config", role: str) -> None:
+def _role_mcp_disable(project: str, cfg: "Config", role: str, *,
+                      on_old: str = "raise") -> None:
     """Stop the container, drop the role-mcps.json entry, reload the
     proxy. Workspace state under /workspace/.role-mcps/<role>/ (daemon
     state: jobs, memories, global.md, creds) and under
     /workspace/shared/<role>/ (publish surface) both survive — the
     bind-mounts are on the project volume and unaffected by docker rm."""
     supervisor = container_name_for(project)
+    # The proxy reload this ends with runs RS's helper: refuse first — unless
+    # the caller re-creates the container anyway (an Update), which brings it
+    # onto the layout.
+    if on_old == "raise":
+        _require_rs_commands(supervisor)
     workspace_path = workspace_path_for(project, cfg)
     entries = role_mcp.load_role_mcps(workspace_path)
     if role not in entries:
@@ -20155,7 +20443,7 @@ _WEB_BOX_TOO_OLD_MSG = ("this project's boxes predate box types that start "
                         "their own web app — restart the project, then retry")
 # The in-image path of the web-app loop: its presence tells a current box
 # image from an older one. LOCKSTEP with agent/Dockerfile.sandbox-box's COPY.
-BOX_WEB_LOOP_PATH = "/usr/local/bin/rs-web-loop"
+BOX_WEB_LOOP_PATH = RS_LIB_DIR + "/rs-web-loop"   # an image keeping it there carries the rs-commands layout
 
 
 # --- A docker project's own web app (a workflow manifest's `web`) -----------
@@ -20730,6 +21018,9 @@ def _rebuild_project_steps(project: str, container: str, web: dict,
     costs nothing here. History waits for the entrypoint's own home restore;
     past HOME_RESTORE_WAIT_S it is skipped (pending, retried at the next
     start). A pending mark that cannot be written holds the setup back too."""
+    # rs-web-restart onto PATH first: the re-created container starts from the
+    # image, which keeps it in RS's folder, and the steps below run it.
+    _link_rs_commands(container, RS_WEB_LINKS, on_old="skip")
     row = _project_history_row(project)
     if row is not None:
         _stage_dev_gitea(project, cfg, serving=False)
@@ -21066,6 +21357,13 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
     progress.step("validate", "checking the project")
     cfg = load_config()
     container = _running_dind_supervisor(req.project)
+    # A project still running from before RS moved its helpers keeps its old
+    # box tool, which runs the box helpers where a current box image no longer
+    # keeps them: refuse before anything is written (the project is known
+    # to be running here).
+    state, text = _rs_commands_state(container)
+    if state != "ok":
+        raise ValidationError(text)
     workspace_path = workspace_path_for(req.project, cfg)
     # A reserved entry left in the port list is dropped and said here, before
     # the web-app tab write below would drop it silently.
@@ -22368,7 +22666,7 @@ def _drop_reserved_port_entries(project: str, cfg: "Config",  # type: ignore[nam
         if progress is not None:
             progress.step("warning", line)
     if dropped:
-        _reconcile_loopback_bridges(project, cfg)
+        _reconcile_loopback_bridges(project, cfg, on_old="skip")
     return lines
 
 
@@ -22396,6 +22694,12 @@ def port_add(req: "PortAddRequest", _progress=None) -> PortAddResult:  # type: i
     # The registry is written below, after the box tool may have run: refuse
     # a settings folder that is a link before anything happens.
     _require_settings_folder(ws)
+    # A port on the project container itself is bridged by RS's forwarder:
+    # refuse before any write when the container cannot run RS's helpers. A
+    # box's port goes through the project's own box tool, which serves its
+    # own layout.
+    if not req.box:
+        _require_rs_commands(container_name_for(req.project))
     # Before the first read below: the reader hides a reserved row, so every
     # write that follows would drop it silently — say so here, once.
     swept = _drop_reserved_port_entries(req.project, cfg)
@@ -22476,7 +22780,7 @@ def port_add(req: "PortAddRequest", _progress=None) -> PortAddResult:  # type: i
         ports.append(entry)
         ports.sort(key=lambda e: e["port"])
         _write_exported_ports(ws, ports)
-        _reconcile_loopback_bridges(req.project, cfg)
+        _reconcile_loopback_bridges(req.project, cfg, on_old="skip")
         return PortAddResult(project=req.project, port=req.host_port,
                              label=req.label, ports=ports, warnings=swept)
     # Plain (page-tab) entry: dedupe on `port` among NON-passthrough entries
@@ -22495,7 +22799,7 @@ def port_add(req: "PortAddRequest", _progress=None) -> PortAddResult:  # type: i
     ports.append(new_entry)
     ports.sort(key=lambda e: e["port"])
     _write_exported_ports(ws, ports)
-    _reconcile_loopback_bridges(req.project, cfg)
+    _reconcile_loopback_bridges(req.project, cfg, on_old="skip")
     return PortAddResult(project=req.project, port=req.port, label=req.label,
                          ports=ports, warnings=swept)
 
@@ -22508,9 +22812,6 @@ def port_remove(req: "PortRemoveRequest", _progress=None) -> PortRemoveResult:  
         return PortRemoveResult(project=req.project, port=req.port, ports=[])
     # Before the read: a reserved row is dropped (and said) here, so removing
     # one succeeds — it is simply gone already.
-    swept = _drop_reserved_port_entries(req.project, cfg)
-    existing = read_exported_ports(ws)
-
     # Matcher split by req.passthrough: a pass-through claim's identity is its
     # host_port (its project-side `port` may legitimately equal a page entry's
     # port); everything else keys on `port` and must never match a pass-through
@@ -22521,6 +22822,15 @@ def port_remove(req: "PortRemoveRequest", _progress=None) -> PortRemoveResult:  
             return bool(e.get("passthrough")) and e.get("host_port") == req.port
         return e.get("port") == req.port and not e.get("passthrough")
 
+    # A port on the project container itself is bridged by RS's forwarder:
+    # refuse before the sweep below writes anything when the container cannot
+    # run RS's helpers (the reader already hides reserved rows).
+    before = next((e for e in read_exported_ports(ws) if _match(e)), None)
+    # (A web-app tab is refused below in any case, without running anything.)
+    if before and not before.get("box") and before.get("web") is not True:
+        _require_rs_commands(container_name_for(req.project))
+    swept = _drop_reserved_port_entries(req.project, cfg)
+    existing = read_exported_ports(ws)
     gone = next((e for e in existing if _match(e)), None)
     # A box type's own web-app tab belongs to the box (the box keeps running
     # the app); only removing the box removes it. A project's own web-app tab
@@ -22551,7 +22861,7 @@ def port_remove(req: "PortRemoveRequest", _progress=None) -> PortRemoveResult:  
     _write_exported_ports(ws, ports)
     # Reap the top-level forwarder for a supervisor/docker entry (a box entry's
     # forwarder died with the box's rm+run in unexpose — the reconcile skips it).
-    _reconcile_loopback_bridges(req.project, cfg)
+    _reconcile_loopback_bridges(req.project, cfg, on_old="skip")
     if old_items:
         # The other lines of this re-run ride in the error text: this inline
         # verb's reply carries only the error, never its stderr.
@@ -22593,11 +22903,10 @@ def _project_web_address(req: "BoxWebAddressRequest") -> BoxWebAddressResult:  #
         raise ValidationError(_WEB_NOT_RUNNING_MSG)
     if _container_substrate(container) != Substrate.DOCKER.value:
         raise ValidationError("this tab is not a box's own web app")
-    r = run(["docker", "exec", "-u", "research", container, "timeout",
-             str(WEB_SET_TIMEOUT_S), "rs-web-set", req.address],
-            capture_output=True)
+    r = _run_rs_helper(container, "rs-web-set", [req.address], on_old="raise",
+                       user="research", wrap=["timeout", str(WEB_SET_TIMEOUT_S)])
     info = {}
-    if r.returncode == 0:
+    if r is not None and r.returncode == 0:
         try:
             last = json.loads((r.stdout or "").strip().splitlines()[-1])
             info = last if isinstance(last, dict) else {}
@@ -23896,6 +24205,9 @@ def dev_attach(req: "DevAttachRequest", _progress=None) -> DevAttachResult:  # t
     if not gitea.mirror_present(req.repo):
         die(f"repo {req.repo!r} not added yet — add it first (the dev "
             f"workflow card and the dev box dialog take its GitHub URL)")
+    # It re-runs RS's inner guard and links the dev commands: refuse before
+    # recording anything when the container cannot run RS's helpers.
+    _require_rs_commands(container)
     if not container_running(container):
         die(f"project {req.project!r} is not running; start it first (an "
             f"agent attach stages the gitea token into the live supervisor)")
@@ -23951,6 +24263,7 @@ def dev_attach(req: "DevAttachRequest", _progress=None) -> DevAttachResult:  # t
                             box=None, user=dev_user, branch=branch)
     cfg = load_config()
     _stage_dev_gitea(req.project, cfg, gitea_ip=ip)
+    _link_dev_commands(req.project, container)
     # Unconditional reconcile: change detection lives per-box in
     # _restart_dev_boxes (against actual ExtraHosts) — a record-history
     # comparison cannot work here, detach deletes the prior entry.
@@ -23969,6 +24282,7 @@ def dev_detach(req: "DevDetachRequest", _progress=None) -> DevDetachResult:  # t
     is NOT dropped (S3: fetch is universal; only destroy disconnects).
     Standing dev boxes are NOT auto-discarded — the ALL branch leaves them
     running but unwired (an operator action, documented)."""
+    _require_rs_commands(container_name_for(req.project))
     entries = [e for e in gitea.project_entries(req.project)
                if e.get("class") == "agent" and e.get("repo")]
     if req.repo is None:

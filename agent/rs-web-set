@@ -52,7 +52,7 @@ if [ "$cur" != "$A" ]; then
     pid=""
     [ -f "$P" ] && [ ! -L "$P" ] && pid="$(head -c 16 "$P" 2>/dev/null | tr -cd '0-9')"
     if [ -n "$pid" ] && tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null \
-            | grep -qxF /usr/local/bin/rs-web-loop; then
+            | grep -qxF /usr/local/lib/rs/rs-web-loop; then
         kill -USR1 "$pid" 2>/dev/null
     fi
 fi

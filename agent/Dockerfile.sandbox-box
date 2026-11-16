@@ -37,27 +37,34 @@ COPY agent/box-render-mcp.py /usr/local/lib/rs-box/box-render-mcp.py
 LABEL research.instructions-layout=home-2
 RUN chmod +x /entrypoint.sh
 
-# Dev-lane tooling (rs-wt, rs-land, rs-board) — under /opt/dev, deliberately
+# Dev-lane tooling (rs-wt, rs-land, rs-board) — in RS's folder, deliberately
 # OFF PATH (command-relevance): only a dev-preset box gets them symlinked to
-# /usr/local/bin (rs-sandbox's _install_dev_tools, at the box's docker run);
+# /usr/local/bin (rs-sandbox's _link_box_commands, at the box's docker run);
 # on other boxes the files are inert and invisible to tab-completion.
-COPY container/dev/rs-wt container/dev/rs-land container/dev/rs-board /opt/dev/
-RUN chmod +x /opt/dev/rs-wt /opt/dev/rs-land /opt/dev/rs-board
+COPY container/dev/rs-wt container/dev/rs-land container/dev/rs-board /usr/local/lib/rs/
+RUN chmod +x /usr/local/lib/rs/rs-wt /usr/local/lib/rs/rs-land /usr/local/lib/rs/rs-board
 
 # F3 loopback forwarder (STAGE loopback-bridge): republishes a 127.0.0.1-bound
 # in-box service onto the box's bridge IP so the -p <pub_super>:<app_port> publish
 # (rs-sandbox expose) reaches it. Launched by rs-sandbox via docker exec -d.
-COPY cli/rs_loopback_fwd.py /usr/local/bin/rs-loopback-fwd
-RUN chmod +x /usr/local/bin/rs-loopback-fwd
+COPY cli/rs_loopback_fwd.py /usr/local/lib/rs/rs-loopback-fwd
+RUN chmod +x /usr/local/lib/rs/rs-loopback-fwd
 
 # Preset web apps: rs-web-loop keeps the box's web app running at its webui
 # tab's address (started by the entrypoint when RS_BOX_WEB_START is set),
 # rs-web-set is the host's one call that hands it the address, rs-web-restart
-# is the operator's restart command. rs-sandbox probes for rs-web-loop's path
-# to tell this image from one that predates web apps.
-COPY agent/rs-web-loop agent/rs-web-set agent/rs-web-restart /usr/local/bin/
-RUN chmod +x /usr/local/bin/rs-web-loop /usr/local/bin/rs-web-set \
-    /usr/local/bin/rs-web-restart
+# is the operator's restart command (linked onto PATH in a web box only).
+# rs-sandbox probes for rs-web-loop's path to tell this image from one that
+# predates web apps.
+COPY agent/rs-web-loop agent/rs-web-set agent/rs-web-restart /usr/local/lib/rs/
+RUN chmod +x /usr/local/lib/rs/rs-web-loop /usr/local/lib/rs/rs-web-set \
+    /usr/local/lib/rs/rs-web-restart
+# RS's helper-command layout: only what a person or an agent types is on
+# PATH; RS's own helpers (and typed commands only some containers get, linked
+# onto PATH by the host) live in /usr/local/lib/rs. The host refuses an image
+# without this label (MIRROR of rscore.RS_COMMANDS_LABEL / RS_COMMANDS_LAYOUT,
+# pinned).
+LABEL research.rs-commands="1"
 
 USER worker
 WORKDIR /workspace
