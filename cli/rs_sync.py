@@ -2045,13 +2045,15 @@ class WikiCache:
 def remote_head(cache: WikiCache, url, token, side):
     """(branch, sha) of a wiki's default branch, or None when that wiki does
     not exist (no first page yet, or switched off). Any other failure stops
-    the run: an unreadable wiki must never read as an empty one."""
+    the run: an unreadable wiki must never read as an empty one. Gitea answers
+    a switched-on wiki that never had a page with "wiki doesn't exist, please
+    initialize the wiki by creating a new page first"."""
     rc, out, err = cache.git(["ls-remote", "--symref", url, "HEAD"], token=token,
                              what=f"reading the {side} wiki")
     if rc:
         low = err.lower()
         if "not found" in low or "does not appear to be a git repository" in low \
-                or "wiki is disabled" in low:
+                or "wiki is disabled" in low or "wiki doesn't exist" in low:
             return None
         die(f"could not read the {side} wiki ({_last_line(err)}); run again later")
     branch = sha = None
