@@ -35,8 +35,10 @@ import http.client
 import json
 import os
 import re
+import shutil
 import stat
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -88,6 +90,14 @@ LABEL_GIT_TAGS = "io.research-sandbox.git-tags"
 # stalled connection would hold the terminal for most of an hour.
 TARGET_IO_TIMEOUT_S = 300
 
+# The shortest gap between two redraws of the live progress line on a
+# terminal. Without a limit the line would be redrawn after every 8 KB block
+# http.client sends (about 250,000 times for 2 GB), costing terminal writes
+# for no information. At 0.5 s a person sees steady movement; ten times longer
+# reads as frozen (the complaint this line answers), ten times shorter only
+# flickers. Off a terminal no line is redrawn: one line per finished layer.
+PROGRESS_REDRAW_S = 0.5
+
 LATEST = "latest"
 ENV_KEYS = ("RS_PUBLISH_REGISTRY", "RS_PUBLISH_USER", "RS_PUBLISH_TOKEN")
 # host[:port]: a DNS name or an IPv4 address, then an optional port.
@@ -111,6 +121,15 @@ def die(msg: str) -> None:
 # ============================================================================
 # Settings
 # ============================================================================
+
+def _close(fd: int, what: str) -> None:
+    """Close a file this tool read; a failed close names the file (a raw
+    OSError would read as a failed write to the output)."""
+    try:
+        os.close(fd)
+    except OSError as e:
+        die(f"cannot read {what}: {e.strerror}")
+
 
 def read_env(path: Path) -> dict:
     """Parse the settings file, refusing an unsafe or malformed one. Opened
@@ -142,8 +161,10 @@ def read_env(path: Path) -> dict:
             if not chunk:
                 break
             raw += chunk
+    except OSError as e:
+        die(f"cannot read the settings file {path}: {e.strerror}")
     finally:
-        os.close(fd)
+        _close(fd, f"the settings file {path}")
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -208,8 +229,10 @@ def read_shelf_token() -> str:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             die(f"{SHELF_TOKEN_PATH} is not a regular file")
         raw = os.read(fd, 4096).strip()
+    except OSError as e:
+        die(f"cannot read {SHELF_TOKEN_PATH}: {e.strerror}")
     finally:
-        os.close(fd)
+        _close(fd, str(SHELF_TOKEN_PATH))
     if not re.fullmatch(rb"[0-9a-f]{40}", raw):
         die(f"{SHELF_TOKEN_PATH} does not hold a token; stop and start the "
             f"project (in a box: then restart the box)")
@@ -236,16 +259,26 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 class _Hashing:
     """A read-only stream that hashes and counts what passes through it, and
-    never yields more than `size` bytes."""
+    never yields more than `size` bytes. `progress(count, sent)`, when given,
+    is called with the running count after each read, and once with
+    sent=True on the first empty read after the last byte: http.client reads
+    the body block by block until an empty read, so by then every block has
+    been handed to the socket."""
 
-    def __init__(self, fh: BinaryIO, size: int) -> None:
+    def __init__(self, fh: BinaryIO, size: int,
+                 progress: "Callable[[int, bool], None] | None" = None) -> None:
         self._fh = fh
         self._left = size
         self.sha = hashlib.sha256()
         self.count = 0
+        self._progress = progress
+        self._sent = False
 
     def read(self, n: int = -1) -> bytes:
         if self._left <= 0 or n == 0:
+            if self._left <= 0 and self._progress and not self._sent:
+                self._sent = True
+                self._progress(self.count, True)
             return b""
         want = self._left if n is None or n < 0 else min(n, self._left)
         data = self._fh.read(want)
@@ -254,6 +287,8 @@ class _Hashing:
         self._left -= len(data)
         self.count += len(data)
         self.sha.update(data)
+        if self._progress:
+            self._progress(self.count, False)
         return data
 
 
@@ -519,10 +554,12 @@ class Registry:
         die(f"{self.label}: uploading to {name} answered HTTP {e.status}")
 
     def upload_blob(self, name: str, digest: str, size: int,
-                    open_src: "Callable[[], Any]") -> None:
+                    open_src: "Callable[[], Any]",
+                    progress: "Callable[[int, bool], None] | None" = None) -> None:
         """Upload blob `digest` of `size` bytes read from `open_src()`; the
-        stream is hashed as it goes. A 401 on the upload itself signs in again
-        and re-reads the source once."""
+        stream is hashed as it goes and `progress` (see _Hashing) is told of
+        each read. A 401 on the upload itself signs in again and re-reads the
+        source once, its count starting again from 0."""
         for attempt in (1, 2):
             start_path = f"/v2/{name}/blobs/uploads/"
             try:
@@ -535,7 +572,7 @@ class Registry:
             url = self._location(location)
             url += ("&" if "?" in url else "?") + "digest=" + urllib.parse.quote(digest)
             src = open_src()
-            body = _Hashing(src, size)
+            body = _Hashing(src, size, progress)
             try:
                 self._raw("PUT", url, start_path + "<upload>",
                           self.auth(name, "pull,push"), data=body,
@@ -745,6 +782,132 @@ def _bytes(n: int) -> str:
     raise AssertionError
 
 
+def _duration(seconds: float) -> str:
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s} s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m} min {s} s"
+    h, m = divmod(m, 60)
+    return f"{h} h {m} min"
+
+
+def _isatty(stream) -> bool:
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+class _Progress:
+    """What the upload loop shows. On a terminal: one status line, redrawn in
+    place at most every PROGRESS_REDRAW_S (and at each layer's start and when
+    its last byte is sent), cut to the terminal's width. Elsewhere: one line
+    per finished layer. Every write is flushed. Nothing here raises but
+    PublishError: it runs inside the upload, where any other exception would
+    read as a network failure."""
+
+    def __init__(self, layers: int, total: int, out=None,
+                 clock: "Callable[[], float] | None" = None) -> None:
+        self.out = out if out is not None else sys.stdout
+        self.clock = clock or time.monotonic
+        self.tty = _isatty(self.out)
+        self.layers, self.total = layers, total
+        self.started = self.clock()
+        self.finished = 0           # bytes of the layers already uploaded
+        self.index = self.size = self.count = 0
+        self.last: "float | None" = None
+        self.open = False           # a status line is on the terminal
+        self.broken = False         # a write failed; write nothing more
+
+    # -- what the upload reports ---------------------------------------------
+
+    def layer(self, index: int, size: int) -> None:
+        self.index, self.size, self.count = index, size, 0
+        self._draw(force=True)
+
+    def read(self, count: int, sent: bool) -> None:
+        """The _Hashing callback: an absolute count, so a retried layer that
+        starts again from 0 is never counted twice."""
+        self.count = count
+        self._draw(force=sent, sent=sent)
+
+    def done_layer(self) -> None:
+        self.finished += self.size
+        self.count = 0
+        if not self.tty:
+            self._write(f"  layer {self.index} of {self.layers} uploaded: "
+                        f"{_bytes(self.size)}, {self._total_text()}\n")
+
+    def finish(self) -> None:
+        """The total line, once every layer went up."""
+        line = (f"  uploaded {self.layers} layer{'s' if self.layers != 1 else ''}, "
+                f"{_bytes(self.total)} in {_duration(self.clock() - self.started)}")
+        if self.tty:
+            self._write("\r" + self._fit(line) + "\n")
+            self.open = False
+        else:
+            self._write(line + "\n")
+
+    def end(self) -> None:
+        """End an open status line, so what follows starts on its own line."""
+        if self.open:
+            self.open = False
+            self._write("\n")
+
+    # -- drawing -------------------------------------------------------------
+
+    def _total_text(self) -> str:
+        moved = self.finished + self.count
+        pct = moved * 100 // self.total if self.total > 0 else 100
+        return f"total {_bytes(moved)} of {_bytes(self.total)} ({pct}%)"
+
+    def _speed_text(self, now: float) -> str:
+        elapsed = now - self.started
+        moved = self.finished + self.count
+        if elapsed <= 0 or moved <= 0:
+            return ""
+        rate = moved / elapsed
+        left = max(0, self.total - moved) / rate
+        return f", {_bytes(rate)}/s, about {_duration(left)} left"
+
+    def _fit(self, line: str) -> str:
+        width = max(1, shutil.get_terminal_size().columns - 1)
+        return line[:width].ljust(width)
+
+    def _draw(self, force: bool = False, sent: bool = False) -> None:
+        if not self.tty or self.broken:
+            return
+        now = self.clock()
+        if not force and self.last is not None and now - self.last < PROGRESS_REDRAW_S:
+            return
+        self.last = now
+        head = f"  layer {self.index} of {self.layers}: "
+        if sent:
+            line = (head + f"all {_bytes(self.size)} sent, waiting for the "
+                    f"registry to check it, {self._total_text()}")
+        else:
+            line = (head + f"{_bytes(self.count)} of {_bytes(self.size)}, "
+                    f"{self._total_text()}{self._speed_text(now)}")
+        self.open = True            # first: an interrupted write still gets its line end
+        self._write("\r" + self._fit(line))
+
+    def _write(self, text: str) -> None:
+        if self.broken or self.out is None:     # no stdout: print() writes nothing too
+            return
+        try:
+            self.out.write(text)
+            self.out.flush()
+        except (OSError, ValueError) as e:
+            self.broken = True
+            self.open = False
+            where = "the terminal" if self.tty else "the output"
+            die(f"cannot write the upload progress to {where} "
+                f"({getattr(e, 'strerror', None) or type(e).__name__}); "
+                f"nothing was tagged")
+
+
 # ============================================================================
 # Publishing
 # ============================================================================
@@ -838,8 +1001,18 @@ def publish(args, env: dict, image: str) -> int:
         print("dry run: nothing was uploaded. Run again with --apply to publish")
         return 0
 
-    for d, s in missing:
-        target.upload_blob(name, d, s, lambda d=d: shelf.open_blob(shelf_name, d))
+    if missing:
+        progress = _Progress(len(missing), sum(s for _, s in missing))
+        try:
+            for i, (d, s) in enumerate(missing, 1):
+                progress.layer(i, s)
+                target.upload_blob(name, d, s,
+                                   lambda d=d: shelf.open_blob(shelf_name, d),
+                                   progress=progress.read)
+                progress.done_layer()
+            progress.finish()
+        finally:
+            progress.end()
     for d, body, media in img.manifests:
         if d != img.digest:
             target.put_manifest(name, d, body, media)
@@ -885,6 +1058,34 @@ def anonymous_note(env: dict, name: str, tag: str) -> None:
           f"registry, once")
 
 
+def _quiet(stream) -> None:
+    """After a failed run, send what `stream` still holds to /dev/null when
+    its output is gone (a reader that stopped, a hung-up terminal, a full
+    disk): otherwise the flush at exit fails again and Python adds its own
+    error and exit status to ours."""
+    if stream is None:
+        return
+    try:
+        stream.flush()
+    except (OSError, ValueError):
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, stream.fileno())
+        finally:
+            os.close(devnull)
+
+
+def _fail(msg: str, code: int) -> int:
+    """End a failed run: quiet stdout, say `msg` on stderr (quieting it too
+    when it is the same dead output, `2>&1 | head`), return `code`."""
+    _quiet(sys.stdout)
+    try:
+        print(f"rs-publish: {msg}", file=sys.stderr)
+    except (OSError, ValueError):
+        _quiet(sys.stderr)
+    return code
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="rs-publish",
@@ -898,6 +1099,11 @@ def main(argv=None) -> int:
     ap.add_argument("--env", type=Path, default=DEFAULT_ENV,
                     help=f"the settings file (default {DEFAULT_ENV})")
     args = ap.parse_args(argv)
+    # Each line as it is printed, also into a pipe or a log being tailed (a
+    # pipe is block-buffered by default: the whole run would show at the end).
+    reconfigure = getattr(sys.stdout, "reconfigure", None)
+    if reconfigure is not None:
+        reconfigure(line_buffering=True)
     try:
         if args.latest is not None and args.no_latest:
             die("--latest and --no-latest cannot be used together")
@@ -907,12 +1113,18 @@ def main(argv=None) -> int:
             return move_latest(args, env, image)
         return publish(args, env, image)
     except PublishError as e:
-        print(f"rs-publish: {e}", file=sys.stderr)
-        return 1
+        return _fail(str(e), 1)
     except KeyboardInterrupt:
-        print("rs-publish: interrupted; tags already written stay; run again "
-              "to finish", file=sys.stderr)
-        return 130
+        return _fail("interrupted; tags already written stay; run again to finish", 130)
+    except OSError as e:
+        # Every network, settings-file and token error is a PublishError by
+        # now: an OSError here is a write to the output (a print) that failed.
+        what = ("the output was closed before rs-publish finished"
+                if isinstance(e, BrokenPipeError)
+                else f"cannot write the output ({e.strerror or type(e).__name__})")
+        if args.apply:
+            what += "; tags already written stay; run again to finish"
+        return _fail(what, 1)
 
 
 if __name__ == "__main__":
