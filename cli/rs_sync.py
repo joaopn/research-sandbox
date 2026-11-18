@@ -1843,7 +1843,7 @@ def _fill_existing_plan(plan, items, have, ctx, rid, env, subjects_index, gt, g,
         st = _gitea_status(g, f"/repos/{quote(owner)}/{quote(repo)}/issues/{items[0]['n']}")
         if st != 200:
             die(f"Gitea's issue read answered HTTP {st} for one that exists; "
-                f"nothing was deleted")
+                f"no issue whose Gitea item is gone was deleted")
     for n in sorted(missing):
         if _held_open(gt, n):
             continue
@@ -1852,11 +1852,11 @@ def _fill_existing_plan(plan, items, have, ctx, rid, env, subjects_index, gt, g,
             if status == 200:
                 continue
             die(f"cannot tell whether Gitea #{n} still exists (HTTP {status}); "
-                f"nothing was deleted")
+                f"its copy, GitHub #{have['items'][n]['number']}, was not deleted")
         num = have["items"][n]["number"]
         plan["delete"].append(num)
         if not dry:
-            delete_issue(gh, have["items"][n]["node_id"])
+            delete_issue(gh, have["items"][n]["node_id"], num)
             done["deleted"].append(num)
 
 
@@ -1896,7 +1896,7 @@ def _gone_on_gitea(g: Gitea, owner, repo, n, keys, known) -> dict:
         st = _gitea_status(g, route(kind, k[0], k[1]["id"]))
         if st != 200:
             die(f"Gitea's read for a {kind} answered HTTP {st} for one that "
-                f"exists; nothing was deleted")
+                f"exists; no GitHub copy of a Gitea #{n} comment was deleted")
         st = _gitea_status(g, route(kind, n, cid))
         if st == 404:
             out[(kind, cid)] = True
@@ -1904,7 +1904,7 @@ def _gone_on_gitea(g: Gitea, owner, repo, n, keys, known) -> dict:
             out[(kind, cid)] = False
         else:
             die(f"cannot tell whether Gitea {kind} {cid} still exists (HTTP "
-                f"{st}); nothing was deleted")
+                f"{st}); no GitHub copy of a Gitea #{n} comment was deleted")
     return out
 
 
@@ -1916,11 +1916,20 @@ def _review_comment_gone(g, base, n, cid) -> bool:
     return True
 
 
-def delete_issue(gh: GitHub, node_id):
+def delete_issue(gh: GitHub, node_id, number):
     if not node_id:
-        die("a mirrored issue has no node id; nothing was deleted")
+        die(f"GitHub #{number} has no node id; it was not deleted")
     gh.graphql("mutation($id:ID!){deleteIssue(input:{issueId:$id}){clientMutationId}}",
                {"id": node_id})
+
+
+def refuse_missing_node_ids(numbers_and_nodes) -> None:
+    """Before the first deletion of a list: every issue in it must carry a
+    node id, so a refusal leaves nothing deleted."""
+    bad = [num for num, node in numbers_and_nodes if not node]
+    if bad:
+        die(f"GitHub {', '.join(f'#{b}' for b in bad)} {'has' if len(bad) == 1 else 'have'} "
+            f"no node id; nothing was deleted")
 
 
 # ============================================================================
@@ -2661,6 +2670,7 @@ def remove(args, env) -> None:
     REPORT["remove"]["projects"] = [p.get("number") for p in projects]
     if "board" in skip:
         REPORT["board"] = {"skipped": "--skip board"}
+    refuse_missing_node_ids((v["number"], v["node_id"]) for v in doomed)
     if not args.apply:
         REPORT["dry_run"] = True
         return
@@ -2669,7 +2679,7 @@ def remove(args, env) -> None:
     rec = REPORT["remove"]
     rec["deleted"], rec["projects_deleted"], rec["labels_deleted"] = [], [], []
     for v in doomed:
-        delete_issue(gh, v["node_id"])
+        delete_issue(gh, v["node_id"], v["number"])
         rec["deleted"].append(v["number"])
     for p in projects:
         gh.graphql(M_DELETE_PROJECT, {"p": p["id"]})
