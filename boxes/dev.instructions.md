@@ -330,8 +330,8 @@ their start directory.
 | `/workspace/.claude/rules/<area>.md` | One file per area of the code: the invariants and traps learned there, so a later session does not rediscover them the hard way. Each starts with `paths:` frontmatter naming the files it covers, and loads only when one of them is read. |
 | `/workspace/PLAN/` | One file per plan: the design, the cut, the questions and the maintainer's answers. `PLAN/README.md` indexes them with their status. |
 | `/workspace/PLAN/DONE/` | Shipped plans, moved here and never deleted. `PLAN/DONE/MANIFEST.md` gets one row per move: the PR number and the commit subject that shipped it — never a commit id, which the maintainer's collection rewrites. |
-| `/workspace/PLAN/BUG_BUCKET.md` | Bugs found along the way that are not the current work: `B<n>` entries, never renumbered or deleted, each with the symptom, a reproducer and a fix sketch. A fix lands in its own PR, never inside unrelated work. |
-| `/workspace/PLAN/IMPROVEMENTS.md` | The same for improvements: `I<n>` entries. |
+| `/workspace/PLAN/BUG_BUCKET.md` | Bugs found along the way that are not the current work: `B<n>` entries, never renumbered or deleted, each with the symptom, a reproducer and a fix sketch, in the bug template's shape ("Issue templates" below). A fix lands in its own PR, never inside unrelated work. |
+| `/workspace/PLAN/IMPROVEMENTS.md` | Improvements, kept the same way: `I<n>` entries, never renumbered or deleted, in the improvement template's shape. |
 
 **Area rule paths are matched from `/workspace`**, so write them to match the primary clone and
 every worktree alike — `**/src/parser/**`, not `src/parser/**`:
@@ -438,8 +438,9 @@ pages you changed in the reply that reports the landing or the pass.
   X"), do a full pass over what they named: read the code, compare it with the pages, and
   rewrite what is out of date.
 - **Where it lives.** The wiki stays on Gitea: collection takes the code repository only, so
-  it does not reach GitHub. Archiving your fork (a destroyed project or box) archives the wiki
-  with it; removing the repository from the dev lane, or purging your identity, deletes it.
+  it does not reach GitHub that way, but the maintainer may mirror it there with rs-sync.
+  Archiving your fork (a destroyed project or box) archives the wiki with it; removing the
+  repository from the dev lane, or purging your identity, deletes it.
   It is its own repository, outside the worktree rule, with no review step — edit it
   directly, no worktree, no branch, no PR — and the maintainer and every fetch tool on the
   dev lane can read it, so never put a token, a password or anything else secret in it.
@@ -474,6 +475,30 @@ zero when fixed), and verify it on both the base branch and your branch before p
 - The user's real GitHub repo (no credentials for it)
 - The host filesystem (this is an isolated container)
 - The local network (LAN access is blocked)
+
+## Secrets and personal details
+
+Text that can reach GitHub never holds a secret or a personal detail: issues and their
+comments, PR bodies, commit messages, code, code comments, test names, the wiki, and the plan
+and ledger files mirrored into issues. Replace each of these before it goes in:
+
+| Never write | Write instead |
+|---|---|
+| Tokens, passwords, keys, cookies, OAuth codes — whole or in part | Leave them out; name the file or setting (`the operator token`) |
+| Paths that carry a user name: `/home/<name>/…`, `/Users/…` | `~/…`, `/workspace/…` |
+| Host names, LAN or public addresses, tailnet names, domains | `<host>`, `<lan address>`; container names RS creates (`rs-gitea`) are fine |
+| People's names, e-mail addresses, account handles | A role: the maintainer, a collaborator, the operator |
+| University, lab, employer, funding or project names of the people involved | Leave them out; a defect never needs them |
+| Raw logs, environment dumps, config files pasted whole | The relevant lines only, after the substitutions above |
+
+Before the text goes out, read it once for each row of the table, the title included (an
+issue's title is its card on the board), and scrub a log line by line, not skimmed. When you
+are unsure whether something is personal, replace it.
+
+When the detail cannot be left out, it goes only into an issue flagged `sync-skip` and the
+file that issue mirrors (the session that files issues does this), or, for a doer or a
+checker, into the report to the session that launched it. Everywhere else, refer to that
+issue by its number only.
 
 <!-- rs-part: work -->
 ## Working Style
@@ -519,12 +544,99 @@ copies it in one click. Never invent a different command shape.
 
 **Mirror your plans and bug records to Gitea.** The maintainer reads the Gitea board, not
 your container's filesystem. Every plan you write for them and every bug or improvement you
-record in the project's ledgers is duplicated as a Gitea issue: title = the plan's name, or
-the entry's stable code (`B<n>`, `I<n>`) plus its one-line summary; body = the plan file's
-text, or the entry's text, verbatim. The file under `/workspace/PLAN/` is authoritative and
-the issue is its mirror — re-sync the body when the entry changes, and close the issue
-naming the PR when the work lands (an issue another session has started stays open — "After
-every landing", step 2). Never keep only one of the two.
+record in the project's ledgers is duplicated as a Gitea issue: title = the plan's name or the
+entry's stable code (`B<n>`, `I<n>`), plus a few words (the `Title:` line of its template
+below: it is the issue's title, and in the file the heading the plan or entry starts with,
+`# ` for a plan, `### ` for a ledger entry); body = the plan file's text, or the entry's
+text, verbatim, from below that heading. The file under `/workspace/PLAN/` is
+authoritative and the issue is its mirror — re-sync the body when the entry changes, and
+close the issue naming the PR when the work lands (an issue another session has started
+stays open — "After every landing", step 2). Never keep only one of the two.
+
+**Issue templates.** Every bug, improvement and plan you file takes one of the first three
+shapes, in its issue and in the file the issue mirrors; every question you ask, in a reply,
+an issue or a PR, takes the fourth. Placeholders are in `<angle brackets>`; each paragraph is
+one line. Bug and improvement entries use bold labels rather than sub-headings, because each
+sits in a ledger of many entries; a plan is one file and keeps its headings.
+
+```
+Title: B<n> — <what breaks, in a few words>
+
+<One sentence: what the user sees go wrong, in the words the screen or terminal uses.>
+
+**Severity:** <who hits it, how often, and what it costs them>
+
+**Measured:** run on {{BASE_BRANCH}} (<commit subject>) — or: read from the code, not run
+
+**What happens:** <Two to four sentences: what the user was doing, what they saw, and what it costs them. Name pages, commands and messages as they appear.>
+
+**Reproducer:** <The shortest sequence that shows it from a clean state. Commands in a fenced block, with paths and addresses already replaced.>
+
+**Expected:** <What should happen instead, in one or two sentences.>
+
+**Fix sketch:** <Where the cause sits and the shape of a fix, in a few sentences. A direction, not a design.>
+```
+
+```
+Title: I<n> — <what gets better, in a few words>
+
+<One sentence: what the user would be able to do, or stop having to do.>
+
+**Today:** <How it works now and where it costs the user: a step, a wait, a confusing message. Two to four sentences.>
+
+**Proposal:** <What changes for the user, described as behaviour. Mechanism only where it helps a reader follow.>
+
+**Cost:** <What it takes and what it could break: surfaces touched, migration for existing users or data, tests needed.>
+
+**Open questions:** <Numbered questions, each answerable on its own, with the options spelled out and a recommendation. "None" if there are none.>
+```
+
+```
+Title: <PLAN_NAME> — <what it delivers, in a few words>
+
+Status: <draft | checked | awaiting the go | in progress | shipped in PR #N>. Base: <branch> at <commit subject>.
+
+## What changes for the user
+<Prose, functional first: what the user sees and can do afterwards, what stops happening, what it costs them. No file names in this section.>
+
+## Measured
+<What the plan rests on, each with where it was read or run. A claim from a ledger entry or an earlier session is marked as measured or not.>
+
+## The cut
+<The commits or PRs, each with what it changes and where. File and line anchors belong here.>
+
+## Verification
+<Each test, what it proves, and how it was seen failing without the change.>
+
+## Known residuals
+<What stays imperfect after this lands, stated once each.>
+
+## Questions to the maintainer
+<Question blocks, in the shape of the question template. "None" if there are none.>
+```
+
+```
+**<n>. <What is being decided, as a question>** (<blocks the work | does not block: proceeding under the recommendation>)
+
+- <Context the reader needs, one fact per bullet, in terms of what the user sees.>
+- **<Option, named by its effect>:** <what the user sees with it and what it costs.>
+- **<Option, named by its effect>:** <what the user sees with it and what it costs.>
+- **Recommendation: <option>.** <One sentence why.>
+- **Assumption until answered:** <what the work does meanwhile>
+```
+
+**Keep sensitive issues off GitHub: `sync-skip`.** The maintainer may mirror this fork's
+issues, merged PRs and wiki to a GitHub repo with rs-sync, which never mirrors an item
+labelled `sync-skip` and deletes a copy already there. An issue that cannot be written
+without a secret or a personal detail (see "Secrets and personal details": it is about the
+leaked token, the exposed account name) gets the label in the create call, and its body
+starts with `**Kept off GitHub:** <why>` as its first line (in the file, the first line
+below the heading), in its ledger or plan file too. Keep the detail inside that issue and
+its file. A PR that fixes it carries the label too; its commits still reach GitHub when the
+maintainer collects them, so they follow the secrets rule like any other text. Never remove
+the label unless the maintainer says so in the session. If the repository has no `sync-skip`
+label, run `rs-board reconcile`; if it is still missing, tell the maintainer instead of
+filing without it.
 
 **Never hard-wrap prose in issues, PR bodies or comments.** Gitea renders a single newline as
 a line break, so a paragraph wrapped at 80 columns is shredded on the board. One paragraph is

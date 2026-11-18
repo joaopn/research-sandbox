@@ -17,10 +17,10 @@ Verbs (each honours --dry-run, which prints the planned writes and makes none):
   done N [--pr M]       close #N naming the PR, remove its card (idempotent)
   place N --column C    put #N in column C on the maintainer's say-so (lands
                         at the bottom of C)
-  reconcile             create missing boards, columns and the labels this
-                        tool reads; add, remove, re-home cards; a decision
-                        label in Inbox -> Decide, dropped elsewhere; report
-                        what a script must not decide
+  reconcile             create missing boards, columns and the labels the
+                        dev lane's tools read; add, remove, re-home cards;
+                        a decision label in Inbox -> Decide, dropped
+                        elsewhere; report what a script must not decide
 
 Wiring resolution (mirrors rs-land):
   - dev BOX: GITEA_URL/GITEA_TOKEN/GITEA_USER/REPO_NAME arrive as container
@@ -72,13 +72,18 @@ BLOCKING = "decision:blocking"
 OPEN = "decision:open"  # a question posted, work proceeding under the recommendation
 DECIDE_LABELS = (BLOCKING, OPEN)  # either one parks an Inbox card in Decide
 PRIORITY = "priority:high"
-# The labels this tool reads, created by `reconcile` when a repository lacks
-# them. Colours copied from the research-sandbox dev repository, where the
-# boards were dogfooded, so every dev repository's tags look alike.
+# Kept off GitHub by rs-sync; this tool never reads it, but it is the dev
+# lane's label and every repository needs it before an agent can file with it.
+SYNC_SKIP = "sync-skip"
+# The labels the dev lane's tools read, created by `reconcile` when a
+# repository lacks them. The first three colours are copied from the
+# research-sandbox dev repository, where the boards were dogfooded, so every
+# dev repository's tags look alike.
 LABEL_COLOURS = {
     BLOCKING: ("e11d21", "a maintainer ruling is required before any work can start; the question block is on the issue"),
     OPEN: ("f9a825", "a choice the maintainer owns is recorded on the issue; work proceeds under the posted recommendation"),
     PRIORITY: ("b60205", "maintainer-flagged: schedule ahead of other open work"),
+    SYNC_SKIP: ("5319e7", "kept off GitHub by rs-sync: never mirrored; a mirrored copy is deleted at the next sync"),
 }
 WORKING_PREFIX = "Working on it: branch "
 STOPPED_PREFIX = "Stopped without finishing: "
@@ -346,7 +351,7 @@ class Board:
         return getattr(self.g, method)(path, body) if body is not None else getattr(self.g, method)(path)
 
     def ensure_labels(self):
-        """Create the labels this tool reads when the repository lacks them."""
+        """Create the labels the dev lane's tools read when the repository lacks them."""
         for name, (colour, description) in LABEL_COLOURS.items():
             if name in self.labels:
                 continue
