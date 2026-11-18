@@ -18,6 +18,10 @@ What goes over, one way (Gitea -> GitHub):
     original creation, close and comment dates);
   * every merged pull request, as a closed, locked issue titled
     "[PR] <title>", labelled "merged-pr", listing the commits it landed as;
+  * except any issue or merged pull request carrying the Gitea label
+    "sync-skip": it never goes over, open or closed, and a copy already on
+    GitHub is deleted first, before anything else the run writes. Removing
+    the label releases it: the next run imports it, under a new number;
   * every mirrored title starts with "[rs-sync] ", every mirrored item
     carries the label "rs-sync", and each issue and PR record opens with a
     line saying it was mirrored with rs-sync (RS_SYNC_HEADER=off drops it);
@@ -34,8 +38,8 @@ a hidden marker (an HTML comment naming the fork, its repo id, the Gitea
 number and, for a comment, its kind and id). Each run rebuilds the table
 Gitea number -> GitHub number from those markers, on items authored by the
 token's own GitHub account, and rewrites every reference through it. A
-reference to something not mirrored becomes a code span GitHub does not
-link. Nothing is stored locally: the markers are the record, so --remove
+reference to something not mirrored becomes text GitHub does not link
+(gitea#N). Nothing is stored locally: the markers are the record, so --remove
 needs only GitHub.
 
 The GitHub token is read from /workspace/.rs-sync.env (or --env):
@@ -1198,14 +1202,42 @@ def with_rs_label(labels) -> list:
     return labels
 
 
+# The Gitea label that keeps an issue or a merged PR off GitHub for good:
+# never imported, and a copy already there is deleted at the next run. Its
+# name is fixed, matched exactly but ignoring case, like every label
+# comparison here.
+SKIP_LABEL = "sync-skip"
+
+
+def _has_skip_label(names) -> bool:
+    return any((n or "").lower() == SKIP_LABEL for n in names)
+
+
+def skipped_numbers(gt: dict) -> dict:
+    """The Gitea numbers kept off GitHub by the skip label: issues (any
+    state) and merged PRs. Issues and PRs share one numbering."""
+    return {"issues": sorted(i["number"] for i in gt["issues"]
+                             if _has_skip_label(l.get("name") for l in i.get("labels") or [])),
+            "prs": sorted(p["number"] for p in gt["merged"] if _has_skip_label(p["labels"]))}
+
+
+def _skip_set(gt: dict) -> set:
+    k = skipped_numbers(gt)
+    return set(k["issues"]) | set(k["prs"])
+
+
 def desired_items(gt: dict, owner, repo, hold, existing_sources) -> list:
     """Every Gitea item that should be on GitHub, in number order. An open
     issue carrying a hold label is left out unless it is already mirrored
-    (gaining a hold label after it went public changes nothing)."""
+    (gaining a hold label after it went public changes nothing). An item
+    carrying the skip label is always left out."""
     items = []
+    kept_off = _skip_set(gt)
     for i in gt["issues"]:
         labels = [l["name"] for l in i.get("labels") or []]
         is_open = i.get("state") == "open"
+        if i["number"] in kept_off:
+            continue
         if is_open and held(labels, hold) and i["number"] not in existing_sources:
             continue
         items.append({"n": i["number"], "pr": False, "title": i.get("title") or "",
@@ -1218,6 +1250,8 @@ def desired_items(gt: dict, owner, repo, hold, existing_sources) -> list:
                       "comments": sorted(gt["comments"].get(i["number"], []),
                                          key=lambda c: (c["created_at"] or "", c["id"]))})
     for p in gt["merged"]:
+        if p["number"] in kept_off:
+            continue
         comments = gt["comments"].get(p["number"], []) + p["extra"]
         items.append({"n": p["number"], "pr": True, "title": "[PR] " + p["title"],
                       "body": p["body"], "user": p["user"],
@@ -1582,15 +1616,24 @@ def sync(args, env) -> None:
             f"(repo id {stale[0]}, now {rid}); run --remove --apply first, "
             f"then sync again (GitHub numbers are not given back)")
     items = desired_items(gt, owner, repo, env["hold"], set(have["items"]))
+    REPORT["skipped"] = skipped_numbers(gt)
+    kept_off = _skip_set(gt)
+    # Mirrored copies of skipped items: deleted first in the apply. The dry
+    # run lists the same set (both read the same `have`).
+    skip_del = sorted(n for n in have["items"] if n in kept_off)
+    refuse_missing_node_ids((have["items"][n]["number"], have["items"][n]["node_id"])
+                            for n in skip_del)
     REPORT["held_open_issues"] = sorted(
         i["number"] for i in gt["issues"]
-        if i.get("state") == "open" and i["number"] not in {x["n"] for x in items})
+        if i.get("state") == "open" and i["number"] not in {x["n"] for x in items}
+        and i["number"] not in kept_off)
     # For the summary: what is (or will be) on GitHub, and who can see it.
     REPORT["github"]["private"] = bool(repo_info.get("private"))
     REPORT["hold"] = env["RS_SYNC_HOLD_LABELS"]
     REPORT["items"] = _item_kinds(items)
 
-    table = {n: v["number"] for n, v in have["items"].items()}
+    # A skipped item is never linked, even while its copy still exists.
+    table = {n: v["number"] for n, v in have["items"].items() if n not in kept_off}
     ctx = Ctx(owner, repo, target, table)
     bases = {it.get("base") for it in items if it["pr"]}
     subjects_index = build_subjects_index(gh, target, bases)
@@ -1647,7 +1690,8 @@ def sync(args, env) -> None:
 
     plan = {"create_labels": [p["name"] for p in to_create], "import": [],
             "edit": [], "comment_new": [], "comment_edit": [], "comment_delete": [],
-            "state": [], "labels": [], "lock": [], "delete": []}
+            "state": [], "labels": [], "lock": [], "delete": [],
+            "skip_delete": [have["items"][n]["number"] for n in skip_del]}
 
     new_items = [it for it in items if it["n"] not in have["items"]]
     for it in new_items:
@@ -1656,9 +1700,11 @@ def sync(args, env) -> None:
     writes_est = len(to_create) + 2 * len(new_items)
 
     if not apply:
-        _fill_existing_plan(plan, items, have, ctx, rid, env, subjects_index, gt, g, owner, repo, dry=True)
+        _fill_existing_plan(plan, items, have, ctx, rid, env, subjects_index, gt, g, owner, repo,
+                            dry=True, kept_off=kept_off)
         writes_est += sum(len(plan[k]) for k in ("edit", "comment_new", "comment_edit",
-                                                 "comment_delete", "state", "labels", "lock", "delete"))
+                                                 "comment_delete", "state", "labels", "lock",
+                                                 "delete", "skip_delete"))
         if wiki_state:
             wiki_apply(wiki_state, Ctx(owner, repo, target, table, wiki=True), me,
                        env["RS_SYNC_GITHUB_TOKEN"], secrets, dry=True)
@@ -1683,8 +1729,16 @@ def sync(args, env) -> None:
 
     done = {"labels_created": [], "imported": {}, "edited": [], "comments_posted": 0,
             "comments_edited": 0, "comments_deleted": 0, "closed_or_reopened": [],
-            "relabelled": [], "locked": [], "deleted": []}
+            "relabelled": [], "locked": [], "deleted": [], "skip_deleted": []}
     REPORT["done"] = done
+    # Skipped items' copies go first, before any other write: an unrelated
+    # failure later in the run must not keep them public.
+    for n in skip_del:
+        v = have["items"][n]
+        delete_issue(gh, v["node_id"], v["number"])
+        done["skip_deleted"].append(v["number"])
+        print(f"  deleted GitHub #{v['number']} (Gitea #{n} carries {SKIP_LABEL})",
+              file=sys.stderr)
     check_secrets([p["name"] + " " + p["description"] for p in to_create], secrets,
                   "a Gitea label")
     for pl in to_create:
@@ -1728,9 +1782,11 @@ def sync(args, env) -> None:
             die(f"GitHub issues #{listed['number']} and #{num} both claim Gitea #{gn}; "
                 f"delete one of them, then run again")
     for n, v in have["items"].items():
-        table[n] = v["number"]
+        if n not in kept_off:
+            table[n] = v["number"]
     _fill_existing_plan(plan, items, have, ctx, rid, env, subjects_index, gt, g, owner, repo,
-                        dry=False, gh=gh, base=base, done=done, secrets=secrets)
+                        dry=False, gh=gh, base=base, done=done, secrets=secrets,
+                        kept_off=kept_off)
     if wiki_state:
         wiki_apply(wiki_state, Ctx(owner, repo, target, table, wiki=True), me,
                    env["RS_SYNC_GITHUB_TOKEN"], secrets, dry=False)
@@ -1741,7 +1797,7 @@ def sync(args, env) -> None:
 
 
 def _fill_existing_plan(plan, items, have, ctx, rid, env, subjects_index, gt, g, owner, repo,
-                        dry, gh=None, base=None, done=None, secrets=()):
+                        dry, gh=None, base=None, done=None, secrets=(), kept_off=frozenset()):
     """Compare each mirrored item with what it should be; in a dry run record
     the plan, otherwise apply it."""
     by_n = {it["n"]: it for it in items}
@@ -1834,7 +1890,8 @@ def _fill_existing_plan(plan, items, have, ctx, rid, env, subjects_index, gt, g,
                 gh.call("PUT", f"{base}/issues/{num}/lock", {})
                 done["locked"].append(num)
     # Mirrored items whose Gitea source is gone (a direct read says 404).
-    missing = [n for n in have["items"] if n not in by_n]
+    # Skipped items are deleted on the Gitea read's own evidence, not here.
+    missing = [n for n in have["items"] if n not in by_n and n not in kept_off]
     if missing and not items:
         REPORT["not_deleted_unverifiable"] = REPORT.get("not_deleted_unverifiable", []) \
             + [f"Gitea #{n}" for n in missing]
@@ -2812,6 +2869,13 @@ def _checks(r: dict, dry: bool) -> list:
         else:
             out.append(f"Open issues: {new.get('issues_open', 0)} made {seen} by this run, "
                        f"{held} held back ({hold})")
+    sk = r.get("skipped") or {}
+    k_i, k_p = len(sk.get("issues") or []), len(sk.get("prs") or [])
+    # after an error a flagged copy may still be on GitHub: claim nothing
+    if (k_i or k_p) and not r.get("error"):
+        out.append("Kept off GitHub (sync-skip on Gitea): "
+                   + ", ".join(p for p in (_plural(k_i, "issue"), _plural(k_p, "merged PR"))
+                               if not p.startswith("0 ")))
     pc = r.get("pr_commits") or {}
     missing = r.get("pr_bases_missing") or {}
     def be(n):  # "will be" is also true of the next run after an error: nothing is claimed done
@@ -2851,6 +2915,11 @@ def _checks(r: dict, dry: bool) -> list:
     return out
 
 
+# Shown FIRST in "Would write", "Written" and the after-error lines, ahead
+# of the imports and new labels: these deletions run first.
+_SKIP_KIND = ("skip_delete", "skip_deleted", "issue deleted (sync-skip on Gitea)",
+              "issues deleted (sync-skip on Gitea)")
+
 _UPDATE_KINDS = [  # (plan key, done key, one, many)
     ("edit", "edited", "issue edited", "issues edited"),
     ("comment_new", "comments_posted", "new comment", "new comments"),
@@ -2877,6 +2946,10 @@ def _done_lines(r: dict, after_error: bool) -> list:
     the board's counts and a wiki that was not committed are left out."""
     d = r.get("done") or {}
     out = []
+    _, key, one, many = _SKIP_KIND
+    n = len(d.get(key) or [])
+    if n:
+        out.append(f"{n} {one if n == 1 else many}")
     imp = d.get("imported") or {}
     if imp:
         out.append(f"{_plural(len(imp), 'issue')} imported (GitHub {_ranges(imp.values())})")
@@ -2996,6 +3069,9 @@ def summary(r: dict) -> str:
         return "\n".join(L)
     would = []
     pc, pi = r.get("plan_counts") or {}, r.get("plan_issues") or {}
+    key, _, one, many = _SKIP_KIND
+    if pc.get(key):
+        would.append(f"{pc[key]} {one if pc[key] == 1 else many}")
     if pc.get("import"):
         would.append(_new_items_line(r.get("new_items") or {}, pc["import"]))
     if pc.get("create_labels"):
@@ -3062,7 +3138,9 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="rs-sync",
         description="mirror a Gitea fork's issues, merged pull requests, wiki and "
-                    "boards to a GitHub repo (a dry run unless --apply)")
+                    "boards to a GitHub repo (a dry run unless --apply); an issue or "
+                    "merged pull request labelled sync-skip on Gitea stays off GitHub, "
+                    "and a copy already there is deleted")
     ap.add_argument("gitea", help="the Gitea fork, <owner>/<repo>")
     ap.add_argument("github", help="the GitHub repo, <owner>/<repo>")
     ap.add_argument("--apply", action="store_true", help="write to GitHub")
