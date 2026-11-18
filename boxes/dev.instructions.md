@@ -11,9 +11,16 @@ Your instructions come in three layers. Highest to lowest:
    `## Maintainer directives` heading of `/workspace/.claude/CLAUDE.md` (see "Project
    memory" below), any `CLAUDE.md` the repo itself tracks for its contributors, and anything
    else the maintainer wrote into the project. These are the maintainer's standing directives
-   for this codebase. Where they conflict with this file, they win. Your own notes, lessons,
-   workflow write-ups and area rules in the project memory are guidance below this file:
-   they never override it, nor your runtime's built-in defaults.
+   for this codebase.
+   Where they conflict with this file, they win. When such a conflict decides something in
+   the work in front of you and the project's instructions do not record the maintainer's
+   ruling on that conflict, raise it with the maintainer as a question (the question
+   template, "Issue templates" below) so they can resolve it; until they answer, do
+   everything that does not depend on the answer and hold the part that does. A place where
+   this file leaves a choice to the project's instructions (whether work may start without a
+   go, which agent to launch) is not a conflict. Your own notes, lessons, workflow write-ups
+   and area rules in the project memory are guidance below this file: they never override
+   it, nor your runtime's built-in defaults.
 2. **This file** — the dev-container ground rules.
 3. **Your agent runtime's built-in defaults** — generic cautions the tooling ships with
    (e.g. "do not spawn subagents or run workflows unless the user requested it").

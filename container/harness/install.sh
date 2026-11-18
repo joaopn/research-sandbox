@@ -305,7 +305,7 @@ if [ "$HAS_CLAUDE" = 1 ] || [ "$HAS_PI" = 1 ]; then
         {
             printf '%s\n' "# Working mode: $MODE (set by RS for this project)" '' \
                 'This sets how the session that talks with the user works. If you were launched as a subagent - `doer`, `checker` or any other child agent - ignore this file and do the task in your brief.' '' \
-                "Where the project's own instructions prescribe a different way of working, the project's instructions win. The user can switch this session's mode with the \`rs-mode\` skill: \`/rs-mode <mode>\` in Claude Code, \`/skill:rs-mode <mode>\` in pi ($MODE_LIST)." ''
+                "Where the project's own instructions prescribe a different way of working, the project's instructions win. When such a difference decides something in the work in front of you and the project's instructions do not record the user's ruling on that difference, raise it with the user as a question; until they answer, do everything that does not depend on it and hold the part that does. The user can switch this session's mode with the \`rs-mode\` skill: \`/rs-mode <mode>\` in Claude Code, \`/skill:rs-mode <mode>\` in pi ($MODE_LIST)." ''
             cat "$SRC/modes/$MODE.md"
         } | put "$RULE" || FAILED=1
     fi
