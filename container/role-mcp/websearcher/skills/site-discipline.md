@@ -11,11 +11,9 @@ Sites push back when you query too fast. Expected signals:
 - **HTTP 429 (Too Many Requests)** — explicit; back off.
 - **HTTP 503 (Service Unavailable)** with a `Retry-After` header —
   honor it.
-- **A CAPTCHA / Cloudflare interstitial appearing where it didn't
-  before** — implicit; back off and try again later, OR move to an
-  alternative source.
-- **Pages suddenly returning empty / sanitized AT** — implicit; the
-  site may be shadow-blocking the Playwright UA.
+- **A CAPTCHA, challenge page, 403 or suddenly empty AT that appears
+  only after a run of requests to the site** — implicit; you are going too
+  fast. (One that greets your first visit is a bot wall — see below.)
 
 If you hit a rate limit:
 
@@ -25,10 +23,38 @@ If you hit a rate limit:
    `## What failed`.
 3. **Do not hammer.** Hammering wastes the role-MCP's concurrency
    budget AND risks broader IP-level blocks that affect all callers.
+4. Never answer a rate limit with the `WebFetch` / `WebSearch` fallback
+   below: it is for a site that refuses the browser, not for one that
+   asks for fewer requests (and `WebFetch` would reach the site from the
+   same address, adding to the traffic it just asked you to cut).
 
 Log rate-limit observations in `## Lessons` so future calls know the
 site's tolerance — that's site-class data worth promoting to
 `global.md`.
+
+## Bot walls: one fallback, then move on
+
+Some sites block the headless browser itself, whatever the pace:
+
+- **A CAPTCHA, challenge or Cloudflare interstitial on your first
+  visit**, instead of the content.
+- **HTTP 403 on navigation on your first visit.**
+- **Pages returning empty or sanitized AT on your first visit** where
+  content should be — the site may be shadow-blocking the Playwright
+  UA.
+
+On a bot wall, retry once with Claude Code's built-in `WebFetch` (that
+URL) or `WebSearch` (the query), as role.md's "When the browser is
+blocked" describes. If that also fails, or the tool is not in your
+tool list, log the site as unreachable in `## What failed` and move
+on. Record the outcome in `## Lessons` in one of role.md's three
+shapes: "site X blocks the browser but serves WebFetch" sends later
+calls straight to `WebFetch` for that site, "search engine X blocks the
+browser; WebSearch worked" sends later queries to `WebSearch`, and
+"site X blocks both" means later calls skip it. "Blocks both" is only
+for a site that refused the fallback tool too; a tool missing from your
+tool list is noted in `## What failed` for this call, never recorded as
+a site lesson.
 
 ## robots.txt — observe, don't blindly obey
 
@@ -54,6 +80,12 @@ The default Playwright UA is fine. **Do not impersonate** a regular
 browser to evade detection — that's deceptive and degrades the
 network's trust in the role.
 
+The built-in `WebFetch` names itself to the site as a Claude agent
+(`Claude-User (claude-code/…)`), so using it on a site that walls off
+headless browsers is not impersonation: the site sees what is asking
+and can refuse it. That is why the bot-wall fallback above is allowed
+while disguising the browser is not.
+
 If a site needs UA spoofing to function (some legacy sites refuse
 unknown UAs), document it in `## What worked` and pick the least-
 deceptive option (e.g. a recent Chromium UA matching the bundled
@@ -73,7 +105,8 @@ content that's actively useless:
 - **Sites that wall content behind a login** — log the wall in
   `## What failed`; don't try to bypass.
 - **Sites that aggressively block headless browsers** (some
-  Cloudflare configurations) — log and move on.
+  Cloudflare configurations) — run the bot-wall fallback once (above);
+  if the site blocks that too, log it and move on.
 
 These are site-class observations worth recording in `## Lessons`.
 "Site X is canvas-rendered; AT unusable" is a permanent finding;
