@@ -1,10 +1,10 @@
 #!/opt/conda/bin/python3
 """RS's activity recorder: counts the interactive agent sessions of one
-container — working (busy on a turn, or between turns with subagents still
-running: the agent wakes again when they finish), waiting (handed back to the
-user) — and the subagents they run, for the webui's sidebar boxes. Staged
-root-owned at /usr/local/lib/rs/rs-activity.py in every project container and
-agent box, beside the status bar.
+container — working (busy on a turn, or between turns with subagents or
+background commands still running: the agent wakes again when they finish),
+waiting (handed back to the user) — and the subagents they run, for the
+webui's sidebar boxes. Staged root-owned at /usr/local/lib/rs/rs-activity.py
+in every project container and agent box, beside the status bar.
 
 Called by:
 - Claude Code's hooks (`rs-activity.py hook`, the hook JSON on stdin);
@@ -206,15 +206,16 @@ def _subs(rec: dict) -> dict:
 
 
 def _has_subs(rec: dict) -> bool:
-    """Any subagent entry, a pi workflow's zero-count one included: the
-    session will be woken again when it ends."""
+    """Any subagent entry, a pi workflow's or a Claude background command's
+    zero-count one included: the session will be woken again when it ends."""
     return bool(_subs(rec))
 
 
 def summarise(state: State) -> None:
     """Drop the records of processes that are gone, then write the summary.
     An ended session's record (its process still finishing) counts nothing;
-    a session between turns with subagents running counts working."""
+    a session between turns with subagents or background commands running
+    counts working."""
     working = waiting = subagents = 0
     for key, rec in state.records().items():
         if not _alive(key):
@@ -300,8 +301,8 @@ def turn_start(state: State, key: str) -> None:
 def turn_end(state: State, key: str, handback: bool = True) -> None:
     """Waiting; the hand-back count rises only on a working→waiting change (a
     `!` command's lone Stop, an interrupted pi turn are no hand-back) with no
-    subagent still running: the agent wakes again when the last one ends, and
-    that turn's end is the hand-back."""
+    subagent or background command still running: the agent wakes again when
+    the last one ends, and that turn's end is the hand-back."""
     rec = _rec(state, key, "waiting")
     if _ended(rec):
         return
@@ -338,7 +339,8 @@ def sub_remove(state: State, key: str, sid: str) -> None:
 
 
 def claude_reconcile(state: State, key: str, tasks, stopping: str = "") -> None:
-    """Claude Code's Stop/SubagentStop carry the running background tasks: a
+    """Claude Code's Stop/SubagentStop carry the running background tasks
+    (subagents here; background commands are claude_commands'): a
     recorded Claude subagent not among them (or the one stopping) is dropped,
     so a lost SubagentStop heals at the next turn end. Never adds one: hooks
     run as separate processes and take the lock in either order, so a Stop
@@ -359,6 +361,30 @@ def claude_reconcile(state: State, key: str, tasks, stopping: str = "") -> None:
     state.put(key, rec)
 
 
+def claude_commands(state: State, key: str, tasks) -> None:
+    """Claude Code's background commands and monitors (`type: "shell"` in a
+    Stop's background_tasks) have no start or end hook: each Stop's list
+    replaces the session's command entries (count 0, so the blue count stays
+    subagents only). A running one keeps the session working, and Claude Code
+    wakes it when the command ends, so that later turn's end is the hand-back.
+    Only the measured type counts: any other source needs a reliable end
+    first. A hook without a list is no information and changes nothing (the
+    caller hands a StopFailure an empty one); an ended session is never given
+    entries (a later /clear would inherit them)."""
+    if not isinstance(tasks, list):
+        return
+    rec = state.get(key)
+    if rec is None or _ended(rec):
+        return
+    subs = {k: v for k, v in _subs(rec).items() if not k.startswith("cb:")}
+    for t in tasks:
+        if (isinstance(t, dict) and t.get("type") == "shell"
+                and t.get("status") == "running" and isinstance(t.get("id"), str)):
+            subs["cb:" + t["id"]] = 0
+    rec["subs"] = subs
+    state.put(key, rec)
+
+
 def claude_event(state: State, key: str, data: dict) -> None:
     ev = data.get("hook_event_name")
     if ev == "SessionStart":
@@ -367,8 +393,15 @@ def claude_event(state: State, key: str, data: dict) -> None:
     elif ev == "UserPromptSubmit":
         turn_start(state, key)
     elif ev in ("Stop", "StopFailure"):
-        # reconcile first: a subagent whose SubagentStop was lost must not
-        # hold back the hand-back
+        # the running background commands, then the subagents, both before
+        # turn_end: a command still running holds back the hand-back, a
+        # subagent whose SubagentStop was lost must not. A turn that ended in
+        # an API error carries no list (measured on 2.1.325, a command still
+        # running): it holds nothing, so an errored re-wake is a hand-back
+        tasks = data.get("background_tasks")
+        if ev == "StopFailure" and not isinstance(tasks, list):
+            tasks = []
+        claude_commands(state, key, tasks)
         claude_reconcile(state, key, data.get("background_tasks"))
         turn_end(state, key)
     elif ev == "SubagentStart":
