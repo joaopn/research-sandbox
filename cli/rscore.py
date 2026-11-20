@@ -5286,9 +5286,10 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
                 **_local_deploy_kwargs(staged, local),
                 **({"pi_pair": pi_pair} if pi_pair else {})), progress)
             # RS's instructions into the agent's home (the dev text with the
-            # request's resolved base branch, else the notice alone). Before
-            # the working-mode suite: its installer makes a role lean only
-            # where the writer has laid that role's part of the text.
+            # request's resolved base branch, else the workflow's own text or
+            # the notice alone). Before the working-mode suite: its installer
+            # makes a role lean only where the writer has laid that role's
+            # part of the text.
             _write_project_instructions(
                 project, container_name, workspace_path, progress=progress,
                 branch=effective_dev_branch if req.dev_repo else None,
@@ -16648,12 +16649,23 @@ def _plan_project_instructions(project: str, workspace_path: "Path", *,
         plan.text = _compose_rs_text(_dev_text(branch))
         plan.check_old = not plan.cleared
         return plan
-    plan.text = _compose_rs_text("")
-    if not plan.cleared and wf:
-        st, _m = resolve()
+    # A dind project that is not dev: a built-in workflow's own text, when it
+    # carries one (cli/workflow.py admits it only on the rs-sandbox-dind
+    # image). No older RS wrote such a text for a dind project, so a
+    # /workspace/CLAUDE.md beside it is the user's: the old-file check stays
+    # what it was (a workflow gone from a readable catalog only).
+    body = ""
+    if wf:
+        st, m = resolve()
         if st == "unknown":
             return _InstrPlan(what="the custom-workflow list")
-        plan.check_old = st == "missing"     # F-L1: RS cannot tell what it wrote
+        if st == "found" and m.get("source", "builtin") == "builtin":
+            instr = m.get("instructions")
+            if isinstance(instr, str) and instr.strip():
+                body = instr
+        if not plan.cleared:
+            plan.check_old = st == "missing"     # F-L1: RS cannot tell what it wrote
+    plan.text = _compose_rs_text(body)
     return plan
 
 

@@ -311,13 +311,23 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
         elif m["gitea_history"] and "web" not in m:
             out.append(p("gitea_history requires web"))
 
-    # instructions — RS's text for a docker project's agent, written into its
-    # home rules folder at every start. Folded in from the built-in's sibling file.
+    # instructions — RS's text for the project's agent, written into its home
+    # rules folder at every start. Folded in from the built-in's sibling file.
+    # Only where the host writes that file: a docker project, or a dind one on
+    # the rs-sandbox-dind image (rs-supervisor writes its own at boot). A dev
+    # project's file is the dev text, so the two never meet on one entry.
     if "instructions" in m:
         if not _is_str(m["instructions"]):
             out.append(p("instructions must be a non-empty string"))
-        if m.get("substrate") != "docker":
-            out.append(p("instructions apply only to the docker substrate"))
+        if not (m.get("substrate") == "docker"
+                or (m.get("substrate") == "dind-sysbox"
+                    and m.get("image_overlay") == "rs-sandbox-dind")):
+            out.append(p("instructions apply only to the docker substrate, or "
+                         "to dind-sysbox with the rs-sandbox-dind image (the "
+                         "projects whose instruction file the host writes)"))
+        if m.get("dev"):
+            out.append(p("instructions and dev cannot be set together (a dev "
+                         "project's instruction file is the dev text)"))
 
     extras = set(m) - _ALLOWED_KEYS
     if extras:
