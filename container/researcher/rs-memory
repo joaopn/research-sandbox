@@ -725,15 +725,27 @@ def open_text() -> str:
     return "\n\n".join(parts) + "\n"
 
 
+def _utf16_len(s: str) -> int:
+    """A string's length as JavaScript counts it (UTF-16 code units), the
+    larger of the two ways the limit could be counted."""
+    return len(s.encode("utf-16-le")) // 2
+
+
 def cmd_open(a) -> None:
     if a.hook and under_guard():
         return
     text = open_text()
     if a.hook:
         text = "rs-memory open (start of session):\n\n" + text
-        if len(text) > HOOK_OUTPUT_LIMIT:
+        if _utf16_len(text) > HOOK_OUTPUT_LIMIT:
             tail = "\n[cut here; run rs-memory open for the rest]\n"
-            text = text[:HOOK_OUTPUT_LIMIT - len(tail)] + tail
+            room, cut = HOOK_OUTPUT_LIMIT - _utf16_len(tail), 0
+            for ch in text:                     # whole characters only
+                room -= _utf16_len(ch)
+                if room < 0:
+                    break
+                cut += 1
+            text = text[:cut] + tail
     sys.stdout.write(text)
 
 

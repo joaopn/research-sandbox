@@ -17808,8 +17808,9 @@ def _apply_activity(container: str, workspace_path: "Path", local: "Sequence[str
 # ---------------------------------------------------------------------------
 # The researcher memory kit: a project whose record says `memory: true` (the
 # researcher workflow) gets RS's memory command on PATH, Claude's built-in
-# memory off, the session-end hook of each agent (rs-memory close), and its
-# earned skills in both agents' homes. Run at create, at every start (after the
+# memory off, each agent's hooks (the front page at a session's start and after
+# a compaction, rs-memory open; the consolidation at its end, rs-memory close),
+# and its earned skills in both agents' homes. Run at create, at every start (after the
 # status bar) and on the Agents Update; idempotent. Failures are collected as
 # end-of-operation errors, never a silent skip; an unreadable record is a
 # warning (B31), since every sandbox-dind project's record is read here. The
@@ -17823,7 +17824,11 @@ MEMORY_AGENTS = ("claude", "pi")
 MEMORY_PI_EXT_SRC = SCRIPT_DIR / "container" / "researcher" / "rs-memory.ts"
 # Claude's hook entries the kit merges, event -> command (matched by exact
 # command, never touching other entries).
-MEMORY_CLAUDE_HOOKS = {"SessionEnd": f"{MEMORY_TOOL} close --hook --agent claude"}
+MEMORY_CLAUDE_HOOKS = {
+    # the front page into the context at every start, resume, clear and compaction
+    "SessionStart": f"{MEMORY_TOOL} open --hook",
+    "SessionEnd": f"{MEMORY_TOOL} close --hook --agent claude",
+}
 MEMORY_KIT_OLD_IMAGE_CREATE = (
     "this RS's project image predates the researcher project type: rebuild RS's "
     "images with Rebuild all on Sandboxes → Software, then create the project again")
