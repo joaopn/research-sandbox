@@ -38,6 +38,14 @@ RUN cp -a /home/research /etc/research-skel
 COPY container/dev/rs-wt container/dev/rs-land container/dev/rs-board /usr/local/lib/rs/
 RUN chmod +x /usr/local/lib/rs/rs-wt /usr/local/lib/rs/rs-land /usr/local/lib/rs/rs-board
 
+# The researcher project type's memory command, kept in RS's folder and linked
+# onto PATH by the host only in a project whose record says memory: true. The
+# label tells the host the image carries it (a researcher create or start on
+# an image without it stops with a Rebuild-all error).
+COPY container/researcher/rs-memory /usr/local/lib/rs/rs-memory
+RUN chmod 755 /usr/local/lib/rs/rs-memory
+LABEL research.memory-kit=1
+
 COPY agent/entrypoint.sandbox-dind.sh /entrypoint.sh
 # This image's boot writes nothing into /workspace/.claude/ or /workspace/.pi/
 # (RS's files live in the agents' homes): the host refuses to create or start

@@ -1,0 +1,1433 @@
+#!/opt/conda/bin/python
+"""rs-memory — a research agent's memory, kept as plain files the PI can read.
+
+Everything lives under /workspace/memory/ (RS_MEMORY_DIR overrides it):
+
+  front.md                      the front page: line of inquiry, beliefs, in
+                                flight, open threads; one item per line, each
+                                with an id; its number in the header
+  front/<n>.md                  every earlier front page, never deleted
+  journal/<yyyy-mm>/J-<n>.md    one entry per unit of work
+  staged/F-<n>.md, Q-, R-       claims waiting for the PI
+  record/F-<n>.md, Q-, R-       accepted findings, questions, retractions
+  struck/                       staged claims the PI struck
+  skills/candidates/earned-*/   proposed skills, loaded by no agent
+  skills/active/earned-*/       promoted skills, copied into the agents' homes
+  skills.log                    one line per skill event
+  consolidated                  the last journal entry a consolidation covered
+  runs/                         consolidation runs: brief, delta, log
+
+Verbs:
+  open [--hook]                 what to read at the start of a session
+  note HEADLINE --kind K [--body TEXT]
+  checkpoint ITEM...            replace the "In flight" part of the front page
+  claim STATEMENT --scope S --evidence FILE... [--hedge H] [relations] [--topic T]
+  accept ID...  /  strike ID... --reason R
+  view [ID | --topic T]         the state of knowledge, computed at every call
+  recall WORD... [--body]
+  skill propose|used|promote|retire|sync|list
+  consolidate --prompt [--out FILE]  /  consolidate --apply DELTA
+  close [--hook] [--agent claude|pi]
+
+It never deletes anything under the memory folder: a struck claim moves to
+struck/, an old front page to front/. Ids and the front page are written under
+one lock file, so two sessions never hand out the same number.
+
+Standard library only; run by RS's own interpreter.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import fcntl
+import hashlib
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+# ----------------------------------------------------------------- constants
+DEFAULT_DIR = "/workspace/memory"
+GUARD = "RS_MEMORY_CONSOLIDATING"
+# Claude Code adds a SessionStart hook's output to the context only up to this
+# many characters (its documented hook-output limit); `open --hook` stays under
+# it and says how to read the rest.
+HOOK_OUTPUT_LIMIT = 10_000
+
+NOTE_KINDS = ("did", "dead-end", "decision", "surprise", "correction")
+# Entries that never call for a consolidation on their own: a consolidation's
+# own entry (else every run would owe another), and a session's end (a second
+# close, or one written while a run works, would otherwise owe a run for it).
+QUIET_KINDS = ("consolidation", "session-end")
+NOTHING_NEW = "nothing new since the last consolidation"
+DELTA_KEYS = ("page", "through", "add", "edit", "retire", "claims", "skills")
+DELTA_ITEM_KEYS = {"add": ("part", "text"), "edit": ("id", "text"),
+                   "claims": ("kind", "statement", "scope", "hedge", "evidence", "relations", "topics"),
+                   "skills": ("name", "description", "body")}
+
+# The front page's parts: heading, id letter, and whether consolidation edits it.
+PARTS = (
+    ("inquiry", "Line of inquiry", "L", True),
+    ("beliefs", "Beliefs", "B", True),
+    ("inflight", "In flight", "I", False),
+    ("threads", "Open threads", "T", True),
+)
+PART_BY_KEY = {k: (h, letter, c) for k, h, letter, c in PARTS}
+CONSOLIDATED_PARTS = tuple(k for k, _h, _l, c in PARTS if c)
+
+RELATIONS = ("supersedes", "contradicts", "withdraws", "depends-on", "answers")
+CLAIM_ID_RE = re.compile(r"\A[FQR]-[1-9][0-9]*\Z")
+JOURNAL_ID_RE = re.compile(r"\AJ-([1-9][0-9]*)\Z")
+# The Agent Skills naming rule pi and Claude Code share: lowercase letters,
+# digits and single hyphens, at most 64 characters.
+SKILL_NAME_RE = re.compile(r"\A[a-z0-9]+(-[a-z0-9]+)*\Z")
+SKILL_NAME_MAX = 64
+SKILL_PREFIX = "earned-"
+SKILL_FILE_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+FRONT_MARK_RE = re.compile(r"<!-- rs-memory page=(\d+) next=(\d+) -->")
+ITEM_LINE_RE = re.compile(r"\A- \[([LBIT]-[1-9][0-9]*)\] (.*)\Z")
+
+
+class Refused(Exception):
+    """A refusal: the message names what is wrong and the next step."""
+
+
+# --------------------------------------------------------------------- paths
+def mem_dir() -> Path:
+    return Path(os.environ.get("RS_MEMORY_DIR") or DEFAULT_DIR)
+
+
+def runtime_dir() -> Path:
+    # A tmpfs: an in-flight marker left by a run killed with its container is
+    # gone at the next start, when nothing can be running.
+    return Path(os.environ.get("RS_MEMORY_RUNTIME_DIR") or "/dev/shm")
+
+
+def inflight_marker() -> Path:
+    return runtime_dir() / f"rs-memory-consolidating-{os.getuid()}"
+
+
+def now() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def under_guard() -> bool:
+    return os.environ.get(GUARD) == "1"
+
+
+def ensure_layout() -> Path:
+    d = mem_dir()
+    for sub in ("front", "journal", "staged", "record", "struck",
+                "skills/candidates", "skills/active", "runs"):
+        (d / sub).mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def write_text(path: Path, text: str, mode: "int | None" = None) -> None:
+    """Write through a fresh temp file and a rename, so a reader never sees a
+    half file and a link at the name is replaced, never followed."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+class Lock:
+    """The memory folder's lock file (flock). `wait=False` raises BlockingIOError
+    when another writer holds it."""
+
+    def __init__(self, wait: bool = True):
+        self.wait = wait
+        self.fd = None
+
+    def __enter__(self):
+        d = ensure_layout()
+        self.fd = os.open(str(d / ".lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+        flags = fcntl.LOCK_EX | (0 if self.wait else fcntl.LOCK_NB)
+        try:
+            fcntl.flock(self.fd, flags)
+        except BaseException:
+            os.close(self.fd)
+            raise
+        return self
+
+    def __exit__(self, *a):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+        return False
+
+
+# ------------------------------------------------------------------- journal
+def journal_files() -> "list[tuple[int, Path]]":
+    root = mem_dir() / "journal"
+    out = []
+    if not root.is_dir():
+        return out
+    for month in root.iterdir():
+        if not month.is_dir():
+            continue
+        for f in month.glob("J-*.md"):
+            m = JOURNAL_ID_RE.match(f.stem)
+            if m:
+                out.append((int(m.group(1)), f))
+    out.sort()
+    return out
+
+
+def parse_entry(path: Path) -> dict:
+    """An entry or claim file: a `# <id> — <headline>` line, `key: value`
+    lines, a blank line, then the body. Repeated keys collect into lists."""
+    text = path.read_text(encoding="utf-8")
+    lines = text.split("\n")
+    head = lines[0][2:] if lines and lines[0].startswith("# ") else ""
+    ident, _, headline = head.partition(" — ")
+    meta: dict = {"id": ident.strip(), "headline": headline.strip(), "path": path}
+    i = 1
+    while i < len(lines) and lines[i].strip():
+        k, sep, v = lines[i].partition(": ")
+        if sep:
+            meta.setdefault(k.strip(), []).append(v)
+        i += 1
+    meta["body"] = "\n".join(lines[i + 1:]).strip()
+    return meta
+
+
+def one(meta: dict, key: str, default: str = "") -> str:
+    v = meta.get(key)
+    return v[0] if isinstance(v, list) and v else default
+
+
+def render_entry(ident: str, headline: str, fields: "list[tuple[str, str]]", body: str) -> str:
+    out = [f"# {ident} — {single_line(headline)}"]
+    for k, v in fields:
+        out.append(f"{k}: {single_line(v)}")
+    out.append("")
+    if body.strip():
+        out.append(body.strip())
+        out.append("")
+    return "\n".join(out)
+
+
+def single_line(s: str) -> str:
+    return " ".join(str(s).split())
+
+
+def session_label() -> str:
+    agent = detect_agent(quiet=True) or "unknown"
+    sid = os.environ.get("PI_SESSION_ID") or ""
+    return f"{agent} {sid}".strip()
+
+
+def add_journal(headline: str, kind: str, body: str = "") -> str:
+    """Append one entry; the caller holds the lock. Returns its id."""
+    files = journal_files()
+    n = (files[-1][0] + 1) if files else 1
+    ident = f"J-{n}"
+    month = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m")
+    path = mem_dir() / "journal" / month / f"{ident}.md"
+    write_text(path, render_entry(ident, headline, [
+        ("kind", kind), ("session", session_label()), ("time", now())], body))
+    return ident
+
+
+def consolidated_mark() -> int:
+    p = mem_dir() / "consolidated"
+    try:
+        m = JOURNAL_ID_RE.match(p.read_text(encoding="utf-8").strip())
+    except FileNotFoundError:
+        return 0
+    return int(m.group(1)) if m else 0
+
+
+def entries_since_mark() -> "list[tuple[int, Path]]":
+    mark = consolidated_mark()
+    return [(n, f) for n, f in journal_files() if n > mark]
+
+
+def new_since_mark() -> "list[tuple[int, Path]]":
+    """Entries since the mark that call for a consolidation: a consolidation's
+    own entries and a session's end never do (QUIET_KINDS)."""
+    return [(n, f) for n, f in entries_since_mark()
+            if one(parse_entry(f), "kind") not in QUIET_KINDS]
+
+
+# ---------------------------------------------------------------- front page
+def empty_front() -> dict:
+    return {"page": 0, "next": 1, "parts": {k: [] for k, *_ in PARTS}}
+
+
+def read_front(p: "Path | None" = None) -> dict:
+    p = p or mem_dir() / "front.md"
+    try:
+        text = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return empty_front()
+    m = FRONT_MARK_RE.search(text)
+    if not m:
+        raise Refused(f"{p} has no rs-memory header line; it was not written by "
+                      "rs-memory. Move it aside and run the command again.")
+    front = {"page": int(m.group(1)), "next": int(m.group(2)),
+             "parts": {k: [] for k, *_ in PARTS}}
+    heading_to_key = {h: k for k, h, *_ in PARTS}
+    cur = None
+    for line in text.split("\n"):
+        if line.startswith("## "):
+            cur = heading_to_key.get(line[3:].strip())
+            continue
+        im = ITEM_LINE_RE.match(line)
+        if im and cur:
+            front["parts"][cur].append((im.group(1), im.group(2)))
+    return front
+
+
+def render_front(front: dict) -> str:
+    out = ["# Front page", "",
+           f"<!-- rs-memory page={front['page']} next={front['next']} -->", ""]
+    for k, heading, _letter, _c in PARTS:
+        out.append(f"## {heading}")
+        for ident, text in front["parts"][k]:
+            out.append(f"- [{ident}] {text}")
+        out.append("")
+    return "\n".join(out)
+
+
+def new_item_id(front: dict, part: str) -> str:
+    ident = f"{PART_BY_KEY[part][1]}-{front['next']}"
+    front["next"] += 1
+    return ident
+
+
+# --------------------------------------------------------------------- claims
+def claim_files() -> "dict[str, tuple[str, Path]]":
+    """id -> (where, path) over staged/, record/ and struck/."""
+    out = {}
+    for where in ("staged", "record", "struck"):
+        d = mem_dir() / where
+        if d.is_dir():
+            for f in d.glob("*.md"):
+                if CLAIM_ID_RE.match(f.stem):
+                    out[f.stem] = (where, f)
+    return out
+
+
+def next_claim_id(prefix: str) -> str:
+    nums = [int(i[2:]) for i in claim_files() if i.startswith(prefix + "-")]
+    return f"{prefix}-{max(nums) + 1 if nums else 1}"
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def record_entries() -> "dict[str, dict]":
+    out = {}
+    d = mem_dir() / "record"
+    if d.is_dir():
+        for f in sorted(d.glob("*.md")):
+            if CLAIM_ID_RE.match(f.stem):
+                out[f.stem] = parse_entry(f)
+    return out
+
+
+def standing(rec: "dict[str, dict]") -> "dict[str, str]":
+    """Standing of every accepted entry, from the relations alone."""
+    st: "dict[str, str]" = {}
+    withdrawn = set()
+    for e in rec.values():
+        if e["id"].startswith("R-"):
+            withdrawn.update(e.get("withdraws", []))
+    superseded = set()
+    for e in rec.values():
+        if e["id"] not in withdrawn:
+            superseded.update(e.get("supersedes", []))
+    answered = set()
+    for e in rec.values():
+        if e["id"] not in withdrawn and e["id"] not in superseded:
+            answered.update(e.get("answers", []))
+    for ident in rec:
+        if ident.startswith("R-"):
+            st[ident] = "retraction"
+        elif ident in withdrawn:
+            st[ident] = "withdrawn"
+        elif ident in superseded:
+            st[ident] = "superseded"
+        elif ident.startswith("Q-"):
+            st[ident] = "answered" if ident in answered else "open"
+        else:
+            st[ident] = "current"
+    live = {i for i, s in st.items() if s == "current"}
+    for e in rec.values():
+        a = e["id"]
+        for b in e.get("contradicts", []):
+            if a in live and b in live:
+                st[a] = st[b] = "contested"
+    return st
+
+
+def undermined(rec: "dict[str, dict]", st: "dict[str, str]", ident: str) -> "list[str]":
+    """The entries this one depends on that no longer stand (current, or
+    contested, is standing; anything else is not)."""
+    out = []
+    for dep in rec.get(ident, {}).get("depends-on", []):
+        if st.get(dep) not in ("current", "contested"):
+            out.append(f"{dep} ({st.get(dep, 'not accepted')})")
+    return out
+
+
+# -------------------------------------------------------------------- agents
+def detect_agent(quiet: bool = False) -> "str | None":
+    claude = os.environ.get("CLAUDECODE") == "1"
+    pi = bool(os.environ.get("PI_SESSION_ID"))
+    if claude and pi:
+        if quiet:
+            return None
+        raise Refused("both a Claude session (CLAUDECODE) and a pi session "
+                      "(PI_SESSION_ID) are in this shell's environment; pass "
+                      "--agent claude or --agent pi")
+    if claude:
+        return "claude"
+    if pi:
+        return "pi"
+    if quiet:
+        return None
+    raise Refused("cannot tell which agent is running; pass --agent claude or --agent pi")
+
+
+def skill_homes() -> "list[Path]":
+    homes = [Path.home() / ".claude" / "skills"]
+    pi_dir = os.environ.get("PI_CODING_AGENT_DIR")
+    if pi_dir:
+        homes.append(Path(pi_dir) / "skills")
+    return homes
+
+
+# ===================================================================== verbs
+def refuse_under_guard(verb: str) -> None:
+    """A consolidation run writes only through consolidate --apply: the session
+    owns the journal, the In-flight part, the PI's accepts and the skills."""
+    if under_guard():
+        raise Refused(f"a consolidation run does not {verb}; write the delta and run "
+                      "rs-memory consolidate --apply")
+
+
+def cmd_note(a) -> None:
+    refuse_under_guard("write journal entries")
+    if not a.headline.strip():
+        raise Refused("a note needs a headline: rs-memory note \"<what happened>\" --kind <kind>")
+    if a.kind not in NOTE_KINDS:
+        raise Refused(f"unknown kind {a.kind!r}; use one of: {', '.join(NOTE_KINDS)}")
+    with Lock():
+        ident = add_journal(a.headline, a.kind, a.body or "")
+    print(f"{ident} journalled ({a.kind}).")
+
+
+def cmd_checkpoint(a) -> None:
+    refuse_under_guard("checkpoint")
+    items = [single_line(x) for x in a.items if x.strip()]
+    with Lock():
+        front = read_front()
+        front["parts"]["inflight"] = [(new_item_id(front, "inflight"), t) for t in items]
+        write_text(mem_dir() / "front.md", render_front(front))
+        ident = add_journal("checkpoint", "checkpoint",
+                            "\n".join(f"- {t}" for t in items) or "(nothing in flight)")
+    print(f"In flight replaced ({len(items)} item(s)); {ident} journalled.")
+
+
+def _claim_prefix(a) -> str:
+    if a.withdraws:
+        return "R"
+    return "Q" if a.question else "F"
+
+
+def validate_claim(statement: str, scope: str, evidence: "list[str]",
+                   relations: "dict[str, list[str]]", prefix: str,
+                   known: "set[str]") -> "list[tuple[str, str]]":
+    """Check a claim before any write; returns its evidence as (path, sha256)."""
+    if not single_line(statement):
+        raise Refused("a claim needs a statement: what you found, as a sentence that could be wrong")
+    if prefix != "R" and not single_line(scope):
+        raise Refused("a claim needs --scope: where the statement holds (data, period, conditions)")
+    if prefix == "F" and not evidence:
+        raise Refused("a finding needs --evidence: the notebook, code or output it rests on")
+    out = []
+    for e in evidence:
+        p = Path(e)
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        if p.is_symlink() or not p.is_file():
+            raise Refused(f"evidence {e!r} leads nowhere: name a file that exists "
+                          "(not a folder or a link)")
+        out.append((str(p), sha256_file(str(p))))
+    for rel, ids in relations.items():
+        for i in ids:
+            if i not in known:
+                raise Refused(f"--{rel} {i}: no claim {i} exists (see rs-memory view)")
+    if prefix == "R" and not relations.get("withdraws"):
+        raise Refused("a retraction names what it withdraws: --withdraws F-<n>")
+    return out
+
+
+def write_claim(prefix: str, statement: str, scope: str, hedge: str,
+                evidence: "list[tuple[str, str]]", relations: "dict[str, list[str]]",
+                topics: "list[str]") -> str:
+    ident = next_claim_id(prefix)
+    fields = [("kind", {"F": "finding", "Q": "question", "R": "retraction"}[prefix]),
+              ("scope", scope), ("hedge", hedge or "(none stated)"),
+              ("staged", now()), ("session", session_label())]
+    for path, digest in evidence:
+        fields.append(("evidence", f"{path} sha256={digest}"))
+    for rel in RELATIONS:
+        for i in relations.get(rel, []):
+            fields.append((rel, i))
+    for t in topics:
+        fields.append(("topic", t))
+    write_text(mem_dir() / "staged" / f"{ident}.md",
+               render_entry(ident, statement, fields, ""))
+    return ident
+
+
+def _relations_from(a) -> "dict[str, list[str]]":
+    return {r: list(getattr(a, r.replace("-", "_")) or []) for r in RELATIONS}
+
+
+def cmd_claim(a) -> None:
+    refuse_under_guard("stage claims outside its delta")
+    prefix = _claim_prefix(a)
+    rels = _relations_from(a)
+    with Lock():
+        known = set(claim_files())
+        ev = validate_claim(a.statement, a.scope or "", a.evidence or [], rels, prefix, known)
+        ident = write_claim(prefix, a.statement, a.scope or "", a.hedge or "", ev,
+                            rels, [single_line(t) for t in (a.topic or []) if t.strip()])
+    print(f"{ident} staged. It enters the record when the PI accepts it "
+          f"(they say \"accept {ident}\", you run rs-memory accept {ident}).")
+
+
+def _evidence_changed(meta: dict) -> "str | None":
+    for line in meta.get("evidence", []):
+        path, _, digest = line.rpartition(" sha256=")
+        try:
+            now_digest = sha256_file(path)
+        except OSError:
+            return path
+        if now_digest != digest:
+            return path
+    return None
+
+
+def cmd_accept(a) -> None:
+    refuse_under_guard("accept claims (only the PI does)")
+    a.ids = list(dict.fromkeys(a.ids))
+    with Lock():
+        files = claim_files()
+        metas = []
+        for ident in a.ids:
+            where, path = files.get(ident, (None, None))
+            if where != "staged":
+                raise Refused(f"{ident} is not a staged claim "
+                              f"({'already ' + where if where else 'no such claim'})")
+            meta = parse_entry(path)
+            changed = _evidence_changed(meta)
+            if changed:
+                raise Refused(f"{ident}: its evidence {changed} changed since it was staged; "
+                              "check the finding still holds and stage it again with rs-memory claim")
+            metas.append((ident, path))
+        stamp = now()
+        for ident, path in metas:
+            dest = mem_dir() / "record" / f"{ident}.md"
+            os.replace(path, dest)                      # a move: the staged file IS the record
+            text = dest.read_text(encoding="utf-8")
+            head, sep, rest = text.partition("\n\n")
+            write_text(dest, f"{head}\naccepted: {stamp}{sep or chr(10)}{rest}", mode=0o444)
+        j = add_journal("accepted " + " ".join(i for i, _ in metas), "accept")
+    print(f"Accepted into the record: {' '.join(i for i, _ in metas)} ({j}).")
+
+
+def cmd_strike(a) -> None:
+    refuse_under_guard("strike claims (only the PI does)")
+    a.ids = list(dict.fromkeys(a.ids))
+    if not single_line(a.reason or ""):
+        raise Refused("strike needs --reason: why the PI dropped it")
+    with Lock():
+        files = claim_files()
+        for ident in a.ids:
+            if files.get(ident, (None,))[0] != "staged":
+                raise Refused(f"{ident} is not a staged claim")
+        for ident in a.ids:
+            os.replace(files[ident][1], mem_dir() / "struck" / f"{ident}.md")
+        j = add_journal("struck " + " ".join(a.ids), "strike", a.reason)
+    print(f"Struck: {' '.join(a.ids)} ({j}).")
+
+
+# ---------------------------------------------------------------- reading
+def _entry_line(e: dict, st: "dict[str, str]", rec: "dict[str, dict]") -> str:
+    s = st.get(e["id"], "staged")
+    extra = ""
+    u = undermined(rec, st, e["id"]) if e["id"] in rec else []
+    if u:
+        extra = f"  [rests on {', '.join(u)}]"
+    scope = one(e, "scope")
+    return f"{e['id']} ({s}) {e['headline']}" + (f" — scope: {scope}" if scope else "") + extra
+
+
+def knowledge_text(topic: "str | None" = None) -> str:
+    rec = record_entries()
+    st = standing(rec)
+
+    def keep(e):
+        return topic is None or topic in e.get("topic", [])
+
+    cur = [e for i, e in rec.items() if st[i] == "current" and keep(e)]
+    contested = [e for i, e in rec.items() if st[i] == "contested" and keep(e)]
+    questions = [e for i, e in rec.items() if st[i] == "open" and keep(e)]
+    out = ["## State of knowledge" + (f" — topic {topic}" if topic else "")]
+    out.append("Current findings:" if cur else "Current findings: none")
+    out += ["  " + _entry_line(e, st, rec) for e in cur]
+    if contested:
+        out.append("Contested (contradict each other):")
+        for e in contested:
+            others = [o for o in e.get("contradicts", []) if st.get(o) == "contested"]
+            out.append("  " + _entry_line(e, st, rec) + (f"  <-> {', '.join(others)}" if others else ""))
+    out.append("Open questions:" if questions else "Open questions: none")
+    out += ["  " + _entry_line(e, st, rec) for e in questions]
+    return "\n".join(out)
+
+
+def staged_text() -> str:
+    staged = sorted((i, p) for i, (w, p) in claim_files().items() if w == "staged")
+    if not staged:
+        return "## Staged claims\nnone"
+    out = ["## Staged claims (waiting for the PI's accept)"]
+    for i, p in staged:
+        e = parse_entry(p)
+        out.append(f"  {i} {e['headline']} — scope: {one(e, 'scope')}; hedge: {one(e, 'hedge')}")
+    return "\n".join(out)
+
+
+def cmd_view(a) -> None:
+    if a.id:
+        files = claim_files()
+        if a.id not in files:
+            raise Refused(f"no claim {a.id}")
+        where, path = files[a.id]
+        rec = record_entries()
+        st = standing(rec)
+        print(path.read_text(encoding="utf-8").rstrip())
+        print(f"\nstanding: {st.get(a.id, where)}")
+        u = undermined(rec, st, a.id)
+        if u:
+            print(f"rests on entries that no longer stand: {', '.join(u)}")
+        # The chain: what this entry points at, and what points at it.
+        e = parse_entry(path)
+        for rel in RELATIONS:
+            for o in e.get(rel, []):
+                oe = rec.get(o)
+                print(f"{rel} {o}: " + (f"{oe['headline']} ({st[o]})" if oe else "(not in the record)"))
+        for o, oe in rec.items():
+            for rel in RELATIONS:
+                if a.id in oe.get(rel, []):
+                    print(f"{o} {rel} it: {oe['headline']} ({st[o]})")
+        return
+    print(knowledge_text(a.topic))
+
+
+def cmd_recall(a) -> None:
+    words = [w.lower() for w in a.words]
+    hits = []
+    for _n, f in journal_files():
+        e = parse_entry(f)
+        text = e["headline"] + ("\n" + e["body"] if a.body else "")
+        if all(w in text.lower() for w in words):
+            hits.append(f"{e['id']} [{one(e, 'kind')}] {one(e, 'time')[:10]} {e['headline']}")
+    for ident, (where, path) in sorted(claim_files().items()):
+        if where == "struck":
+            continue
+        e = parse_entry(path)
+        text = e["headline"] + ("\n" + "\n".join(f"{k}: {' '.join(v)}" for k, v in e.items()
+                                                   if isinstance(v, list)) if a.body else "")
+        if all(w in text.lower() for w in words):
+            hits.append(f"{ident} [{where}] {e['headline']}")
+    print("\n".join(hits) if hits else "nothing matches")
+
+
+def last_run_report() -> "str | None":
+    """A consolidation run that ended without applying its delta, by its log."""
+    runs = mem_dir() / "runs"
+    if not runs.is_dir():
+        return None
+    logs = sorted(runs.glob("*.log"))
+    if not logs:
+        return None
+    last = logs[-1]
+    if marker_live():
+        try:
+            since = _dt.datetime.fromtimestamp(inflight_marker().stat().st_mtime,
+                                               _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        except OSError:
+            since = "?"
+        return (f"A consolidation run has been in flight since {since}; its log is {last}.")
+    text = last.read_text(encoding="utf-8", errors="replace")
+    results = [l for l in text.splitlines() if l.startswith("result: ")]
+    if results and not results[-1].startswith("result: not applied"):
+        return None
+    return (f"The last consolidation run did not apply its delta; its log is {last}. "
+            "The front page was not updated from those entries; the next close covers them again.")
+
+
+def open_text() -> str:
+    d = mem_dir()
+    if not (d / "front.md").exists() and not journal_files():
+        return ("# rs-memory\nNo memory yet in this project. Write your first journal entry "
+                "with rs-memory note, and the in-flight work with rs-memory checkpoint.\n")
+    front = read_front()
+    parts = [(d / "front.md").read_text(encoding="utf-8").rstrip()
+             if (d / "front.md").exists() else "# Front page\n(not written yet)"]
+    parts.append(knowledge_text())
+    parts.append(staged_text())
+    since = entries_since_mark()
+    if since:
+        lines = ["## Journal since the last consolidation"]
+        for _n, f in since:
+            e = parse_entry(f)
+            lines.append(f"  {e['id']} [{one(e, 'kind')}] {one(e, 'time')} {e['headline']}")
+        parts.append("\n".join(lines))
+    cps = [parse_entry(f) for _n, f in journal_files()]
+    cps = [e for e in cps if one(e, "kind") == "checkpoint"]
+    if cps:
+        parts.append(f"Last checkpoint: {cps[-1]['id']} at {one(cps[-1], 'time')}")
+    active = sorted(p.name for p in (d / "skills" / "active").glob(SKILL_PREFIX + "*")
+                    if p.is_dir()) if (d / "skills" / "active").is_dir() else []
+    if active:
+        parts.append("Earned skills: " + ", ".join(active))
+    rep = last_run_report()
+    if rep:
+        parts.append(rep)
+    del front
+    return "\n\n".join(parts) + "\n"
+
+
+def cmd_open(a) -> None:
+    if a.hook and under_guard():
+        return
+    text = open_text()
+    if a.hook:
+        text = "rs-memory open (start of session):\n\n" + text
+        if len(text) > HOOK_OUTPUT_LIMIT:
+            tail = "\n[cut here; run rs-memory open for the rest]\n"
+            text = text[:HOOK_OUTPUT_LIMIT - len(tail)] + tail
+    sys.stdout.write(text)
+
+
+# ------------------------------------------------------------------ skills
+def skill_name(raw: str) -> str:
+    name = raw if raw.startswith(SKILL_PREFIX) else SKILL_PREFIX + raw
+    if not SKILL_NAME_RE.match(name) or len(name) > SKILL_NAME_MAX:
+        raise Refused(f"skill name {raw!r}: use lowercase letters, digits and single hyphens, "
+                      f"at most {SKILL_NAME_MAX - len(SKILL_PREFIX)} characters")
+    return name
+
+
+def skill_dir(state: str, name: str) -> Path:
+    return mem_dir() / "skills" / state / name
+
+
+def skill_state(name: str) -> "str | None":
+    for state in ("candidates", "active"):
+        if skill_dir(state, name).is_dir():
+            return state
+    return None
+
+
+def log_skill(event: str, name: str, detail: str, journal_id: str) -> None:
+    p = mem_dir() / "skills.log"
+    line = f"{now()} {event} {name} {single_line(detail)} {journal_id}".rstrip() + "\n"
+    fd = os.open(str(p), os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "a", encoding="utf-8") as f:
+        f.write(line)
+
+
+def skill_log() -> "list[list[str]]":
+    p = mem_dir() / "skills.log"
+    try:
+        return [l.split(" ", 4) for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
+    except FileNotFoundError:
+        return []
+
+
+def skill_files(name: str) -> "list[str]":
+    """The skill's file list, from its last `proposed` line."""
+    files: "list[str]" = []
+    for parts in skill_log():
+        if len(parts) >= 4 and parts[1] == "proposed" and parts[2] == name:
+            files = [f for f in parts[3].removeprefix("files=").split(",") if f]
+    return files
+
+
+def cmd_skill_propose(a) -> None:
+    refuse_under_guard("change skills outside its delta")
+    name = skill_name(a.name)
+    if not single_line(a.description or ""):
+        raise Refused("a skill needs --description: when an agent should use it")
+    body_src = Path(a.body)
+    if not body_src.is_file():
+        raise Refused(f"{a.body}: the skill's instructions file does not exist")
+    extras = []
+    for f in a.files or []:
+        p = Path(f)
+        if p.is_symlink() or not p.is_file() or not SKILL_FILE_RE.match(p.name) or p.name == "SKILL.md":
+            raise Refused(f"{f}: a skill file must be a regular file with a plain name "
+                          "(letters, digits, dot, dash, underscore), not SKILL.md")
+        extras.append(p)
+    if len({p.name for p in extras}) != len(extras):
+        raise Refused("two skill files share a name")
+    with Lock():
+        if skill_state(name) == "active":
+            raise Refused(f"{name} is active; retire it first to change it")
+        d = skill_dir("candidates", name)
+        listed = ["SKILL.md"] + [p.name for p in extras]
+        old = skill_files(name) if d.is_dir() else []
+        for stale in old:
+            if stale not in listed and (d / stale).is_file():
+                raise Refused(f"{name} already has {stale}, which this proposal does not list; "
+                              "propose it under another name")
+        text = (f"---\nname: {name}\ndescription: {json.dumps(single_line(a.description))}\n---\n\n"
+                + body_src.read_text(encoding="utf-8").strip() + "\n")
+        write_text(d / "SKILL.md", text)
+        for p in extras:
+            write_text(d / p.name, p.read_text(encoding="utf-8"))
+        j = add_journal(f"skill {name} proposed", "skill", a.description)
+        log_skill("proposed", name, "files=" + ",".join(listed), j)
+    print(f"{name} proposed (a candidate: no agent loads it). Log each use with "
+          f"rs-memory skill used {name} --ok|--failed; it can be promoted after a successful use.")
+
+
+def cmd_skill_used(a) -> None:
+    refuse_under_guard("change skills outside its delta")
+    name = skill_name(a.name)
+    if a.ok == a.failed:
+        raise Refused("say how the use went: --ok or --failed")
+    with Lock():
+        if not skill_state(name):
+            raise Refused(f"no skill {name}")
+        event = "used-ok" if a.ok else "used-failed"
+        j = add_journal(f"skill {name} {event}", "skill", a.note or "")
+        log_skill(event, name, a.note or "", j)
+    print(f"{name}: {event} logged ({j}).")
+
+
+def _copy_skill_home(name: str, home: Path, files: "list[str]") -> "str | None":
+    """Copy the listed files into one agent's skills folder. Returns a problem
+    to report, or None."""
+    target = home / name
+    if target.is_symlink() or (target.exists() and not target.is_dir()):
+        return f"{target} is not a folder; {name} was not placed there"
+    target.mkdir(parents=True, exist_ok=True)
+    for f in files:
+        src = skill_dir("active", name) / f
+        write_text(target / f, src.read_text(encoding="utf-8"))
+    return None
+
+
+def sync_skills() -> "list[str]":
+    """Copy every active skill's listed files into both agents' homes."""
+    problems = []
+    root = mem_dir() / "skills" / "active"
+    if not root.is_dir():
+        return problems
+    for d in sorted(root.iterdir()):
+        if not d.is_dir() or not d.name.startswith(SKILL_PREFIX):
+            continue
+        files = skill_files(d.name)
+        for home in skill_homes():
+            p = _copy_skill_home(d.name, home, files)
+            if p:
+                problems.append(p)
+    return problems
+
+
+def cmd_skill_promote(a) -> None:
+    refuse_under_guard("change skills outside its delta")
+    name = skill_name(a.name)
+    with Lock():
+        if skill_state(name) != "candidates":
+            raise Refused(f"{name} is not a candidate skill")
+        ok_since_change = False
+        for p in skill_log():
+            if len(p) >= 3 and p[2] == name:
+                if p[1] in ("proposed", "retired"):
+                    ok_since_change = False         # a changed or retired skill is proven again
+                elif p[1] == "used-ok":
+                    ok_since_change = True
+        if not ok_since_change:
+            raise Refused(f"{name} has no successful use logged since it was last proposed or "
+                          f"retired; promote it after rs-memory skill used {name} --ok")
+        listed = set(skill_files(name))
+        extra = sorted(f.name for f in skill_dir("candidates", name).iterdir()
+                       if f.name not in listed and not f.name.startswith("."))
+        if extra:
+            raise Refused(f"{name} holds {', '.join(extra)}, which its proposal does not list; "
+                          "propose it again with every file it needs")
+        os.replace(skill_dir("candidates", name), skill_dir("active", name))
+        problems = []
+        for home in skill_homes():
+            p = _copy_skill_home(name, home, skill_files(name))
+            if p:
+                problems.append(p)
+        j = add_journal(f"skill {name} promoted", "skill")
+        log_skill("promoted", name, "", j)
+    print(f"{name} promoted: it is in the agents' skills folders from now on.")
+    for p in problems:
+        print(f"warning: {p}")
+
+
+def cmd_skill_retire(a) -> None:
+    refuse_under_guard("change skills outside its delta")
+    name = skill_name(a.name)
+    if not single_line(a.reason or ""):
+        raise Refused("retiring a skill needs --reason")
+    with Lock():
+        if skill_state(name) != "active":
+            raise Refused(f"{name} is not an active skill")
+        files = skill_files(name)
+        kept = []
+        for home in skill_homes():
+            target = home / name
+            if target.is_symlink() or not target.is_dir():
+                continue
+            for f in files:
+                p = target / f
+                if p.is_file() or p.is_symlink():
+                    p.unlink()
+            try:
+                target.rmdir()
+            except OSError:
+                kept.append(str(target))
+        os.replace(skill_dir("active", name), skill_dir("candidates", name))
+        j = add_journal(f"skill {name} retired", "skill", a.reason)
+        log_skill("retired", name, a.reason, j)
+    print(f"{name} retired: back among the candidates, gone from the agents' skills folders.")
+    for k in kept:
+        print(f"note: {k} still holds files the skill does not list, so the folder was left in place")
+
+
+def cmd_skill_sync(a) -> None:
+    refuse_under_guard("change skills outside its delta")
+    with Lock():
+        problems = sync_skills()
+    for p in problems:
+        print(f"warning: {p}")
+
+
+def cmd_skill_list(a) -> None:
+    root = mem_dir() / "skills"
+    uses: "dict[str, list[int]]" = {}
+    for p in skill_log():
+        if len(p) >= 3 and p[1] in ("used-ok", "used-failed"):
+            c = uses.setdefault(p[2], [0, 0])
+            c[0 if p[1] == "used-ok" else 1] += 1
+    rows = []
+    for state in ("active", "candidates"):
+        d = root / state
+        if d.is_dir():
+            for s in sorted(d.iterdir()):
+                if s.is_dir():
+                    ok, bad = uses.get(s.name, [0, 0])
+                    rows.append(f"{s.name} ({'active' if state == 'active' else 'candidate'}): "
+                                f"{ok} ok, {bad} failed")
+    print("\n".join(rows) if rows else "no skills")
+
+
+# ------------------------------------------------------------- consolidation
+BRIEF_HEAD = """\
+You are consolidating a research agent's memory. You run on your own, with no
+one to ask: read this brief, write one delta file, apply it, and stop.
+
+The front page below is what every new session of the agent reads first. Your
+job is to bring its durable parts up to date with the journal entries listed
+after it, by proposing itemised changes. You never rewrite the page: code
+merges your changes, and anything you do not mention stays as it is.
+
+Rules:
+- Parts you may change: "Line of inquiry" (what is being studied and the PI's
+  standing direction), "Beliefs" (what the agent currently holds, each pointing
+  at the findings behind it, e.g. "(F-3)"), "Open threads" (questions and leads
+  not yet followed). Never "In flight": the working session owns it.
+- Keep each item one line. Keep hedges as the journal states them; do not make
+  a tentative result sound settled.
+- Retire an item only when a journal entry shows it no longer holds or is done.
+  Never leave a part that has items empty.
+- A dead end worth remembering is an open thread or a belief ("X does not work
+  because Y"), not a deletion.
+- You may propose candidate claims (staged for the PI, never accepted by you)
+  and candidate skills (a procedure the journal shows was needed and worked).
+  Propose none when nothing qualifies; most runs propose none. A finding needs
+  a scope and evidence: paths of existing files (notebooks, code, outputs). A
+  claim's relations point at existing claim ids and are among supersedes,
+  contradicts, depends-on, answers. A skill name is lowercase letters, digits
+  and single hyphens; "earned-" is added in front of it.
+- Use no other rs-memory verb than consolidate. Do not change any other file.
+
+Write the delta as JSON to {delta} and then run:
+
+    rs-memory consolidate --apply {delta}
+
+If it refuses, read the message, fix the delta and apply again, with one
+exception: if it says the page moved on or the entries are already
+consolidated, stop there (another run covered them; never change "page" or
+"through" to get past it). The delta's shape:
+
+{{
+  "page": {page},
+  "through": "{through}",
+  "add": [{{"part": "beliefs", "text": "..."}}],
+  "edit": [{{"id": "B-3", "text": "..."}}],
+  "retire": ["T-5"],
+  "claims": [{{"kind": "finding", "statement": "...", "scope": "...",
+              "hedge": "...", "evidence": ["/workspace/..."],
+              "relations": {{"supersedes": ["F-2"]}}, "topics": ["..."]}}],
+  "skills": [{{"name": "...", "description": "...", "body": "..."}}]
+}}
+
+If the entries change nothing on the page, apply a delta with only "page"
+and "through": that records them as covered. "page" and "through" must stay
+exactly as written above. "part" is one of
+inquiry, beliefs, threads. "kind" is finding or question. Leave out what you
+do not use.
+"""
+
+
+def build_brief(delta_path: str) -> "tuple[str, int, str]":
+    front = read_front()
+    since = entries_since_mark()
+    if not new_since_mark():
+        raise Refused(NOTHING_NEW)
+    through = f"J-{since[-1][0]}"
+    head = BRIEF_HEAD.format(delta=delta_path, page=front["page"], through=through)
+    body = ["", "=" * 70, f"THE FRONT PAGE (page {front['page']})", "=" * 70, "",
+            render_front(front), "", "=" * 70,
+            f"JOURNAL ENTRIES SINCE THE LAST CONSOLIDATION (through {through})", "=" * 70, ""]
+    for _n, f in since:
+        body.append(f.read_text(encoding="utf-8").rstrip())
+        body.append("")
+    body += ["=" * 70, "STATE OF KNOWLEDGE (accepted record; for pointers)", "=" * 70, "",
+             knowledge_text(), ""]
+    return head + "\n".join(body), front["page"], through
+
+
+def cmd_consolidate(a) -> None:
+    if a.prompt:
+        delta = (str(Path(a.out).with_suffix("")) + ".delta.json" if a.out
+                 else "<a file of your choice under /workspace/memory/runs/>")
+        with Lock():
+            text, _page, _through = build_brief(delta)
+        if a.out:
+            write_text(Path(a.out), text)
+            print(f"brief written to {a.out}; the delta goes to {delta}")
+        else:
+            sys.stdout.write(text)
+        return
+    apply_delta(Path(a.apply))
+
+
+def _as_list(v, what: str) -> list:
+    if v is None:
+        return []
+    if not isinstance(v, list):
+        raise Refused(f"delta: {what} must be a list")
+    return v
+
+
+def apply_delta(path: Path) -> None:
+    try:
+        delta = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError) as e:
+        raise Refused(f"delta {path}: cannot read it as JSON ({type(e).__name__})")
+    if not isinstance(delta, dict):
+        raise Refused("delta: must be a JSON object")
+    unknown = sorted(k for k in delta if k not in DELTA_KEYS)
+    if unknown:
+        raise Refused(f"delta: unknown key(s) {', '.join(unknown)}; the keys are "
+                      f"{', '.join(DELTA_KEYS)}")
+    for key, allowed in DELTA_ITEM_KEYS.items():
+        for item in _as_list(delta.get(key), key):
+            if not isinstance(item, dict):
+                raise Refused(f"delta: each entry of {key} is an object")
+            bad = sorted(k for k in item if k not in allowed)
+            if bad:
+                raise Refused(f"delta: {key} entry has unknown key(s) {', '.join(bad)}; "
+                              f"its keys are {', '.join(allowed)}")
+    if type(delta.get("page")) is not int:
+        raise Refused("delta: page is the front page's number as written in the brief")
+    for key, fields in (("add", ("part", "text")), ("edit", ("text",)),
+                        ("claims", ("kind", "statement", "scope", "hedge")),
+                        ("skills", ("name", "description", "body"))):
+        for item in _as_list(delta.get(key), key):
+            for f in fields:
+                if f in item and not isinstance(item[f], str):
+                    raise Refused(f"delta: {key} entry's {f} is text, not {item[f]!r}")
+    for ident in _as_list(delta.get("retire"), "retire") + [
+            e.get("id") for e in _as_list(delta.get("edit"), "edit")]:
+        if not isinstance(ident, str):
+            raise Refused(f"delta: an item id is a string such as \"B-3\", not {ident!r}")
+    with Lock():
+        front = read_front()
+        if delta.get("page") != front["page"]:
+            raise Refused(f"delta built from front page {delta.get('page')!r}, but the page is now "
+                          f"{front['page']}: it moved on; the next consolidation covers these entries")
+        m = JOURNAL_ID_RE.match(str(delta.get("through", "")))
+        ids = {n for n, _f in journal_files()}
+        if not m or int(m.group(1)) not in ids:
+            raise Refused(f"delta: through {delta.get('through')!r} is not a journal entry")
+        through = int(m.group(1))
+        if through <= consolidated_mark():
+            raise Refused(f"delta: {delta.get('through')} is already consolidated")
+        parts = {k: list(v) for k, v in front["parts"].items()}
+        index = {ident: k for k, items in parts.items() for ident, _t in items}
+        for e in _as_list(delta.get("edit"), "edit"):
+            ident = e.get("id") if isinstance(e, dict) else None
+            text = single_line(e.get("text", "")) if isinstance(e, dict) else ""
+            if ident not in index:
+                raise Refused(f"delta: edit names {ident!r}, which is not on the front page")
+            if index[ident] not in CONSOLIDATED_PARTS:
+                raise Refused(f"delta: {ident} is in In flight, which consolidation never changes")
+            if not text:
+                raise Refused(f"delta: edit of {ident} has no text (retire it instead)")
+            k = index[ident]
+            parts[k] = [(i, text if i == ident else t) for i, t in parts[k]]
+        for ident in _as_list(delta.get("retire"), "retire"):
+            if ident not in index:
+                raise Refused(f"delta: retire names {ident!r}, which is not on the front page")
+            if index[ident] not in CONSOLIDATED_PARTS:
+                raise Refused(f"delta: {ident} is in In flight, which consolidation never changes")
+            k = index[ident]
+            parts[k] = [(i, t) for i, t in parts[k] if i != ident]
+        changes = any(_as_list(delta.get(k), k) for k in ("add", "edit", "retire", "claims", "skills"))
+        if not changes:
+            # Nothing to change: the entries are covered, the page stays.
+            write_text(mem_dir() / "consolidated", f"J-{through}\n")
+            j = add_journal(f"consolidated through J-{through}; front page {front['page']} unchanged",
+                            "consolidation")
+            print(f"Nothing to change; consolidated through J-{through} ({j}).")
+            return
+        new_front = {"page": front["page"] + 1, "next": front["next"], "parts": parts}
+        for e in _as_list(delta.get("add"), "add"):
+            part = e.get("part") if isinstance(e, dict) else None
+            text = single_line(e.get("text", "")) if isinstance(e, dict) else ""
+            if part not in CONSOLIDATED_PARTS:
+                raise Refused(f"delta: add to {part!r}: use one of {', '.join(CONSOLIDATED_PARTS)}")
+            if not text:
+                raise Refused("delta: an added item has no text")
+            parts[part].append((new_item_id(new_front, part), text))
+        for k in CONSOLIDATED_PARTS:
+            if front["parts"][k] and not parts[k]:
+                raise Refused(f"delta: it would empty \"{PART_BY_KEY[k][0]}\"; keep at least one item")
+        # Claims and skills are validated in full before anything is written.
+        known = set(claim_files())
+        staged_claims = []
+        for c in _as_list(delta.get("claims"), "claims"):
+            if not isinstance(c, dict):
+                raise Refused("delta: each claim is an object")
+            prefix = {"finding": "F", "question": "Q"}.get(c.get("kind"))
+            if prefix is None:
+                raise Refused("delta: a claim's kind is finding or question")
+            rels = c.get("relations") or {}
+            if not isinstance(rels, dict) or any(r not in RELATIONS or r == "withdraws" for r in rels):
+                raise Refused(f"delta: claim relations are among "
+                              f"{', '.join(r for r in RELATIONS if r != 'withdraws')}")
+            rels = {r: [str(i) for i in _as_list(v, 'relations')] for r, v in rels.items()}
+            ev = validate_claim(str(c.get("statement", "")), str(c.get("scope", "")),
+                                [str(x) for x in _as_list(c.get("evidence"), "evidence")],
+                                rels, prefix, known)
+            topics = _as_list(c.get("topics"), "topics")
+            if any(not isinstance(t, str) for t in topics):
+                raise Refused("delta: a claim's topics are text")
+            staged_claims.append((prefix, c, ev, rels, [single_line(t) for t in topics if t.strip()]))
+        skills = []
+        for s in _as_list(delta.get("skills"), "skills"):
+            if not isinstance(s, dict) or not single_line(str(s.get("body", ""))) \
+                    or not single_line(str(s.get("description", ""))):
+                raise Refused("delta: a skill needs name, description and body")
+            name = skill_name(str(s.get("name", "")))
+            if skill_state(name):
+                raise Refused(f"delta: skill {name} exists already")
+            if any(n == name for n, _s in skills):
+                raise Refused(f"delta: skill {name} appears twice")
+            skills.append((name, s))
+        # Write: the old page first, so a crash never loses it.
+        old = mem_dir() / "front" / f"{front['page']}.md"
+        if front["page"] > 0 or (mem_dir() / "front.md").exists():
+            if old.exists():
+                # A run killed between its two writes left this page here
+                # already. Its number and durable parts define it (In flight
+                # belongs to the session, which may have checkpointed since):
+                # the same page is kept as it is, a different one is refused.
+                kept = read_front(old)
+                if kept["page"] != front["page"] or any(
+                        kept["parts"][k] != front["parts"][k] for k in CONSOLIDATED_PARTS):
+                    raise Refused(f"{old} exists already and is not front.md's page "
+                                  f"{front['page']}; look at both before going on")
+            else:
+                write_text(old, render_front(front))
+        write_text(mem_dir() / "front.md", render_front(new_front))
+        made = []
+        for prefix, c, ev, rels, topics in staged_claims:
+            made.append(write_claim(prefix, str(c["statement"]), str(c.get("scope", "")),
+                                    str(c.get("hedge", "")), ev, rels, topics))
+        for name, s in skills:
+            d = skill_dir("candidates", name)
+            write_text(d / "SKILL.md", f"---\nname: {name}\ndescription: "
+                       f"{json.dumps(single_line(str(s['description'])))}\n---\n\n{str(s['body']).strip()}\n")
+            j = add_journal(f"skill {name} proposed by consolidation", "consolidation",
+                            str(s["description"]))
+            log_skill("proposed", name, "files=SKILL.md", j)
+        write_text(mem_dir() / "consolidated", f"J-{through}\n")
+        j = add_journal(f"consolidated through J-{through} into front page {new_front['page']}",
+                        "consolidation", ("staged: " + " ".join(made)) if made else "")
+    print(f"Front page {new_front['page']} written; consolidated through J-{through} ({j}).")
+
+
+# --------------------------------------------------------------------- close
+def marker_live() -> bool:
+    try:
+        pid = int(inflight_marker().read_text().strip())
+        cmd = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (OSError, ValueError):
+        return False
+    return b"rs-memory" in cmd and b"\0_run\0" in cmd
+
+
+def run_consolidation(agent: str) -> int:
+    """The background run: brief to a file, the agent headless on it, and a
+    result line in the log. Runs in its own session, detached by `close`."""
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    marker = inflight_marker()
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    write_text(marker, f"{os.getpid()}\n")
+    try:
+        stamp = (_dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                 + f"-{os.getpid()}")
+        runs = ensure_layout() / "runs"
+        brief_path = runs / f"{stamp}.brief.md"
+        delta_path = runs / f"{stamp}.delta.json"
+        try:
+            with Lock():
+                text, page, through = build_brief(str(delta_path))
+        except Refused as e:
+            if str(e) == NOTHING_NEW:
+                print(f"result: nothing to do ({e})", flush=True)
+                return 0
+            print(f"result: not applied ({e})", flush=True)
+            return 1
+        write_text(brief_path, text)
+        print(f"brief: {brief_path} (page {page}, through {through})", flush=True)
+        env = dict(os.environ)
+        for k in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "PI_SESSION_ID", "PI_SESSION_FILE"):
+            env.pop(k, None)
+        env[GUARD] = "1"
+        instruction = (f"Read the file {brief_path} and do exactly what it says. "
+                       "It is the whole task.")
+        if agent == "claude":
+            argv = ["claude", "-p", instruction, "--permission-mode", "bypassPermissions"]
+        else:
+            argv = ["pi", "-p", instruction]
+        print("agent: " + " ".join(argv[:2]), flush=True)
+        try:
+            rc = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL,
+                                cwd=str(mem_dir().parent)).returncode
+        except OSError as e:
+            print(f"result: not applied (could not start {argv[0]}: {e.strerror})", flush=True)
+            return 1
+        applied = consolidated_mark() >= int(through[2:])
+        print(f"agent exit: {rc}", flush=True)
+        print("result: applied" if applied else "result: not applied", flush=True)
+        return 0 if applied else 1
+    finally:
+        try:
+            if marker.read_text().strip() == str(os.getpid()):
+                marker.unlink()
+        except OSError:
+            pass
+
+
+def cmd_close(a) -> None:
+    # A hang-up (the session's window closing) must not stop close between
+    # starting the run and marking it.
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    if under_guard():
+        raise Refused("this is a consolidation run; it never starts another")
+    agent = a.agent or detect_agent()
+    try:
+        lock = Lock(wait=not a.hook)
+        lock.__enter__()
+    except BlockingIOError:
+        return                          # busy: the next close covers it
+    launched = in_flight = None
+    try:
+        since = new_since_mark()
+        if since:
+            add_journal("session ended", "session-end")
+        staged = sorted(i for i, (w, _p) in claim_files().items() if w == "staged")
+        if since:
+            in_flight = marker_live()
+            if not in_flight:
+                # Launched and marked under the lock, so a second close at the
+                # same moment sees this run.
+                runs = ensure_layout() / "runs"
+                log = runs / (_dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                              + f"-{os.getpid()}.log")
+                fd = os.open(str(log), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o644)
+                me = os.path.realpath(sys.argv[0])
+                child = subprocess.Popen([sys.executable, me, "_run", "--agent", agent],
+                                         stdin=subprocess.DEVNULL, stdout=fd, stderr=fd,
+                                         start_new_session=True, close_fds=True)
+                os.close(fd)
+                marker = inflight_marker()
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                write_text(marker, f"{child.pid}\n")
+                launched = log
+    finally:
+        lock.__exit__()
+    if a.hook:
+        return
+    if staged:
+        print(f"Still staged for the PI: {' '.join(staged)}.")
+    if not since:
+        print("Nothing new since the last consolidation; no run started.")
+    elif in_flight:
+        print("A consolidation run is still in flight; the next close covers these entries.")
+    else:
+        print(f"Consolidation started in the background ({agent}); its log is {launched}.")
+
+
+def cmd_run(a) -> None:
+    refuse_under_guard("start another run")
+    sys.exit(run_consolidation(a.agent))
+
+
+# ----------------------------------------------------------------------- cli
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="rs-memory", description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="verb", required=True)
+
+    p = sub.add_parser("open", help="what to read at the start of a session")
+    p.add_argument("--hook", action="store_true", help="the quiet, capped form a start hook calls")
+    p.set_defaults(fn=cmd_open)
+
+    p = sub.add_parser("note", help="append a journal entry")
+    p.add_argument("headline")
+    p.add_argument("--kind", required=True, help=", ".join(NOTE_KINDS))
+    p.add_argument("--body", default="")
+    p.set_defaults(fn=cmd_note)
+
+    p = sub.add_parser("checkpoint", help="replace the In flight part of the front page")
+    p.add_argument("items", nargs="*")
+    p.set_defaults(fn=cmd_checkpoint)
+
+    p = sub.add_parser("claim", help="stage a finding, question or retraction for the PI")
+    p.add_argument("statement")
+    p.add_argument("--scope")
+    p.add_argument("--hedge")
+    p.add_argument("--evidence", action="append")
+    p.add_argument("--question", action="store_true")
+    for rel in RELATIONS:
+        p.add_argument(f"--{rel}", action="append", metavar="ID")
+    p.add_argument("--topic", action="append")
+    p.set_defaults(fn=cmd_claim)
+
+    p = sub.add_parser("accept", help="move staged claims into the record (the PI said so)")
+    p.add_argument("ids", nargs="+")
+    p.set_defaults(fn=cmd_accept)
+
+    p = sub.add_parser("strike", help="drop staged claims (the PI said so)")
+    p.add_argument("ids", nargs="+")
+    p.add_argument("--reason")
+    p.set_defaults(fn=cmd_strike)
+
+    p = sub.add_parser("view", help="the state of knowledge, a topic, or one entry")
+    p.add_argument("id", nargs="?")
+    p.add_argument("--topic")
+    p.set_defaults(fn=cmd_view)
+
+    p = sub.add_parser("recall", help="plain-text search of the journal and the claims")
+    p.add_argument("words", nargs="+")
+    p.add_argument("--body", action="store_true")
+    p.set_defaults(fn=cmd_recall)
+
+    sk = sub.add_parser("skill", help="earned skills").add_subparsers(dest="skill_verb", required=True)
+    p = sk.add_parser("propose")
+    p.add_argument("name")
+    p.add_argument("--description")
+    p.add_argument("--body", required=True, help="a file holding the skill's instructions")
+    p.add_argument("--file", dest="files", action="append", help="another file the skill uses")
+    p.set_defaults(fn=cmd_skill_propose)
+    p = sk.add_parser("used")
+    p.add_argument("name")
+    p.add_argument("--ok", action="store_true")
+    p.add_argument("--failed", action="store_true")
+    p.add_argument("--note")
+    p.set_defaults(fn=cmd_skill_used)
+    p = sk.add_parser("promote")
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_skill_promote)
+    p = sk.add_parser("retire")
+    p.add_argument("name")
+    p.add_argument("--reason")
+    p.set_defaults(fn=cmd_skill_retire)
+    p = sk.add_parser("sync", help="copy the active skills into the agents' homes")
+    p.set_defaults(fn=cmd_skill_sync)
+    p = sk.add_parser("list")
+    p.set_defaults(fn=cmd_skill_list)
+
+    p = sub.add_parser("consolidate", help="the merge step a consolidation run uses")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--prompt", action="store_true")
+    g.add_argument("--apply", metavar="DELTA")
+    p.add_argument("--out")
+    p.set_defaults(fn=cmd_consolidate)
+
+    p = sub.add_parser("close", help="end of session: start a consolidation when there is something new")
+    p.add_argument("--hook", action="store_true")
+    p.add_argument("--agent", choices=("claude", "pi"))
+    p.set_defaults(fn=cmd_close)
+
+    p = sub.add_parser("_run", help=argparse.SUPPRESS)
+    p.add_argument("--agent", choices=("claude", "pi"), required=True)
+    p.set_defaults(fn=cmd_run)
+    return ap
+
+
+def main(argv: "list[str] | None" = None) -> int:
+    a = build_parser().parse_args(argv)
+    try:
+        a.fn(a)
+    except Refused as e:
+        print(f"rs-memory: {e}", file=sys.stderr)
+        if getattr(a, "hook", False):
+            if a.fn is cmd_open:
+                print(f"rs-memory: {e}")    # the agent sees what is wrong
+            return 0                    # a hook never fails the agent's session
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
