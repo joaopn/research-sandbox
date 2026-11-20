@@ -1,0 +1,19 @@
+{
+  "name": "researcher",
+  "group": "research",
+  "tags": [
+    "research",
+    "dind"
+  ],
+  "substrate": "dind-sysbox",
+  "image_overlay": "rs-sandbox-dind",
+  "agents": [
+    "claude"
+  ],
+  "services": {
+    "reader": true
+  },
+  "memory": true,
+  "description": "One research agent that does its own analysis and keeps a memory you read in the Reader tab: what it is doing, the findings you accepted, what it tried.",
+  "greeting": "Researcher: one research agent with a memory.\n\nRun `claude` or `pi` here, whichever this project carries. The agent does its\nown analysis in this container, on the data folders you gave the project, and\nkeeps a memory between sessions under /workspace/memory/. Read it in the\nReader tab: the front page (what it is doing and why), the findings you\naccepted, the journal of what it tried, the skills it earned.\n\nA finding enters the record only when you accept it: say \"accept F-3\".\n"
+}

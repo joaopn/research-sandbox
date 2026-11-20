@@ -9688,6 +9688,8 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
     // (the dev agent may be any staged agent, at least one), outside showInBox
     // because the rest of that group does not apply to a dev project.
     const isDev = !!manifest.dev;
+    // a researcher project is its research agent (the memory kit): it needs one, as dev does
+    const isResearcher = manifest.memory === true;
     const showInBox = !isDev && (isDocker || boxCapable);
 
     // Agent model + effort. Every workflow has an agent the researcher talks to,
@@ -9791,11 +9793,19 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
     // Checked → enable:["reader"] (merged with worker presets in the payload). The
     // card is offered ONLY on dind workflows (!isDocker): the backend rejects reader
     // on the docker substrate, so showing it there would be a dead-end control.
+    // A workflow can MANDATE the reader with `services: {reader: true}` (the
+    // researcher type: its memory is read there). The manifest forces it on
+    // server-side, so the card is pre-checked and locked, as node's is.
+    const readerMandatory = !!(manifest.services && manifest.services.reader === true);
     const readerCb = el("input", { type: "checkbox" });
-    readerCb.checked = false;
-    const readerCard = el("div", { class: "box-opt-card" },
-                          [el("span", { class: "box-opt-name" }, ["Reader (mobile viewer)"])]);
+    readerCb.checked = readerMandatory;
+    const readerCard = el("div",
+        { class: "box-opt-card" + (readerMandatory ? " selected locked" : "") },
+        [el("span", { class: "box-opt-name" },
+            [readerMandatory ? "Reader (mobile viewer) — required by this workflow"
+                             : "Reader (mobile viewer)"])]);
     readerCard.onclick = () => {
+        if (readerMandatory) return;    // locked on — the workflow reads its memory there
         readerCb.checked = !readerCb.checked;
         readerCard.classList.toggle("selected", readerCb.checked);
     };
@@ -9988,6 +9998,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             ? "No agents available yet — pull one under Sandboxes → Software."
             : on.length ? ""
             : isDev ? "A dev project needs at least one agent."
+            : isResearcher ? "A researcher project is its research agent: tick Claude or pi."
             : "No agent: the project starts without one.";
         agentsHint.style.display = agentsHint.textContent ? "" : "none";
         statusBarCard.style.display = on.length ? "" : "none";
@@ -10300,6 +10311,10 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             // set too): a dev project exists for an agent to work its repo.
             if (isDev && !agentChecks.some((c) => c.cb.checked)) {
                 return "A dev project needs at least one agent to work its repo.";
+            }
+            // The same floor for a researcher project (from_kwargs refuses it too).
+            if (isResearcher && !agentChecks.some((c) => c.cb.checked)) {
+                return "A researcher project is its research agent: tick Claude or pi.";
             }
             // Mirror rscore.PI_MODEL_RE: pi's model id is written provider/model.
             if (agentOn("pi") && piModelI.value.trim()
@@ -14175,6 +14190,9 @@ function agentsBoxApply(name, d, f) {
         }
         if (d.dev && f.isDind && !AGENTS_BOX_ORDER.some((a) => f.on.has(a))) {
             return "A dev project needs at least one agent.";
+        }
+        if (d.memory === true && f.isDind && !AGENTS_BOX_ORDER.some((a) => f.on.has(a))) {
+            return "A researcher project needs at least one agent to do its research.";
         }
         return null;
     };

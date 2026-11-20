@@ -1376,6 +1376,10 @@ class CreateRequest:
     # is the detached `dev_project_provision` verb (mirror + create as one op),
     # never a raw relayed create.
     dev_lane: bool = False
+    # The researcher memory kit (the rs-memory command, its hooks and skills),
+    # DERIVED from the manifest's `memory: true` like dev_lane; written into the
+    # project's record at create and read from there by every later step.
+    research_memory: bool = False
     dev_repo: str = ""
     # The base branch the project's agent works. "" ⇒ the host resolves the
     # mirror's default at create (_resolve_dev_branch) — the resolved CONCRETE
@@ -1590,6 +1594,7 @@ class CreateRequest:
         # create-time dev step lives in that branch; a dev-flagged manifest on
         # another flavor would silently skip it — reject instead).
         dev_lane = bool(manifest.get("dev"))
+        research_memory = manifest.get("memory") is True
         dev_repo = (kw.get("dev_repo") or "").strip()
         if dev_lane:
             if (project_type is not ProjectType.SANDBOX_DIND
@@ -1665,6 +1670,11 @@ class CreateRequest:
             raise ValidationError(
                 "a dev project needs at least one agent to work its repo — it "
                 "cannot be created agent-less; select at least one")
+        # A researcher project IS its research agent (the dev precedent above).
+        if research_memory and not agents:
+            raise ValidationError(
+                "a researcher project is its research agent — it cannot be "
+                "created agent-less; select Claude or pi")
         # Fleet floor (STAGE_AGENT_DIST slice 2): EVERY dind project deploys claude
         # from the dist (no bake) — research flavor for the supervisor + worker/
         # role-MCP/PI fleet, sandbox-dind flavor for its rs-sandbox-box boxes (FROM
@@ -1788,6 +1798,7 @@ class CreateRequest:
             web=web,
             history=history,
             dev_lane=dev_lane,
+            research_memory=research_memory,
             dev_repo=dev_repo,
             dev_branch=dev_branch,
             fetch=fetch,
@@ -4869,6 +4880,10 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     # would be created with its helpers where the host no longer runs them.
     if not _image_rs_commands(substrate_image):
         raise ValidationError(RS_COMMANDS_OLD_IMAGE)
+    # A researcher project needs its memory command in the image: refuse
+    # before anything exists (an older sandbox-dind image has none).
+    if req.research_memory and not _image_memory_kit(substrate_image):
+        raise ValidationError(MEMORY_KIT_OLD_IMAGE_CREATE)
     if not container_running(ROUTER_CONTAINER):
         die(f"{ROUTER_CONTAINER} is not running. Run `research setup` first.")
     # A workflow that starts its own web app needs the loop baked into the
@@ -5011,6 +5026,9 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
               # instructions for the project are decided from this record, so a
               # custom workflow removed later cannot change them.
               "dev": bool(req.dev_lane),
+              # Whether the project's agent keeps RS's research memory (the
+              # researcher type), resolved once here like `dev`.
+              MEMORY_RECORD_KEY: bool(req.research_memory),
               # A new project never had RS's old /workspace/CLAUDE.md (the
               # leftover check above refused one), so the check never runs.
               OLD_INSTRUCTIONS_FLAG: True,
@@ -5308,6 +5326,10 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             _status_bar_warnings(_apply_status_bar(project, container_name, workspace_path,
                                                    local, boxes=True, progress=progress),
                                  progress)
+            # A researcher project's memory kit (its record says so): the
+            # command on PATH, the agents' hooks and settings, its skills.
+            _status_bar_warnings(_apply_memory_kit(project, container_name, workspace_path,
+                                                   local, progress=progress), progress)
             # Editor dist staged whenever cached so any box can RO-mount
             # /opt/editor-dist; deploy_local follows the RESOLVED code-server
             # flag (default ON since the editor-by-default slice — a
@@ -6312,6 +6334,9 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         # RS's status bar (#524): an agent just added takes the recorded choice.
         found += _apply_status_bar(project, container, workspace_path, local,
                                    owe=agents_added, boxes=True, progress=progress)
+        # A researcher project's memory kit, into an agent just added.
+        found += _apply_memory_kit(project, container, workspace_path, local,
+                                   progress=progress)
         # Running boxes follow live (an Add delivers the new agent wired; a
         # request that adds nothing is an Update). The editor extension: an Add
         # installs it only where none is (a supervisor that just gained claude);
@@ -12531,6 +12556,9 @@ def _recreate_supervisor(
         # box tool copies the files on into each agent box.
         found += _apply_status_bar(project, container, workspace_path, local,
                                    boxes=True, progress=progress)
+        # A researcher project's memory kit, into the fresh container.
+        found += _apply_memory_kit(project, container, workspace_path, local,
+                                   progress=progress)
         if editor_dist_present():
             _stage_editor_dist(container, deploy_local=flags.get("code-server", True))
         # A project whose own container no longer runs Claude (removed from it)
@@ -16405,6 +16433,8 @@ class OldInstructions:
                        # the project or a box; `reason` is its fixed text)
                        # | "rs-commands" (the project cannot run RS's helpers
                        # yet; `reason` is its fixed text)
+                       # | "memory-kit" (a researcher project's memory could
+                       # not be set up; `reason` is its fixed text)
                        # | "files" / "box-files" (files RS used to write into
                        # the project's / a box's folder; `paths` lists them)
     project: str
@@ -16415,7 +16445,7 @@ class OldInstructions:
     def text(self) -> str:
         if self.kind == "box":
             return OLD_INSTRUCTIONS_BOX_ERROR.format(box=_shown_box(self.box))
-        if self.kind in ("box-image", "status-bar", "app-pins", "rs-commands"):
+        if self.kind in ("box-image", "status-bar", "app-pins", "rs-commands", "memory-kit"):
             return self.reason
         if self.kind == "files":
             return OLD_FILES_PROJECT_ERROR.format(paths=_shown_old_paths("", self.paths))
@@ -17775,6 +17805,177 @@ def _apply_activity(container: str, workspace_path: "Path", local: "Sequence[str
         _report_warnings([f"the activity counts could not be set up ({e})"], progress)
 
 
+# ---------------------------------------------------------------------------
+# The researcher memory kit: a project whose record says `memory: true` (the
+# researcher workflow) gets RS's memory command on PATH, Claude's built-in
+# memory off, the session-end hook of each agent (rs-memory close), and its
+# earned skills in both agents' homes. Run at create, at every start (after the
+# status bar) and on the Agents Update; idempotent. Failures are collected as
+# end-of-operation errors, never a silent skip; an unreadable record is a
+# warning (B31), since every sandbox-dind project's record is read here. The
+# kit covers the project container's own agents, never its boxes.
+# ---------------------------------------------------------------------------
+MEMORY_RECORD_KEY = "memory"
+MEMORY_KIT_LABEL = "research.memory-kit"
+MEMORY_TOOL = f"{RS_LIB_DIR}/rs-memory"
+MEMORY_LINKS = ("rs-memory",)
+MEMORY_AGENTS = ("claude", "pi")
+MEMORY_PI_EXT_SRC = SCRIPT_DIR / "container" / "researcher" / "rs-memory.ts"
+# Claude's hook entries the kit merges, event -> command (matched by exact
+# command, never touching other entries).
+MEMORY_CLAUDE_HOOKS = {"SessionEnd": f"{MEMORY_TOOL} close --hook --agent claude"}
+MEMORY_KIT_OLD_IMAGE_CREATE = (
+    "this RS's project image predates the researcher project type: rebuild RS's "
+    "images with Rebuild all on Sandboxes → Software, then create the project again")
+MEMORY_KIT_OLD_IMAGE = (
+    "this researcher project's image has no memory command, so its memory is not "
+    "set up: rebuild RS's images with Rebuild all on Sandboxes → Software, then stop "
+    "the project and start it again")
+MEMORY_KIT_OLD_CONTAINER = (
+    "this researcher project is still running from an image without its memory "
+    "command: stop the project and start it again")
+MEMORY_KIT_UNREADABLE = (
+    "RS could not read this project's settings ({folder}/project.json), so it could "
+    "not tell whether the project keeps a research memory, and set none of it up; "
+    "the project's agent can repair the file, then stop the project and start it again")
+MEMORY_KIT_LINK_FAILED = (
+    "the research memory command could not be put on this project's PATH; stop the "
+    "project and start it again")
+MEMORY_KIT_LABELS_UNREADABLE = (
+    "RS could not read this project's container labels, so its research memory was "
+    "not set up; stop the project and start it again")
+MEMORY_KIT_AGENT_FAILED = (
+    "the research memory could not be set up for {who} in this project (its settings "
+    "could not be written); stop the project and start it again")
+# One script for both agents, run as the agent user with HOME set: $1 is the
+# Claude hooks as JSON, then the agents. Claude: built-in memory off and the
+# hooks merged into settings.json (a `hooks` that is not an object, or an event
+# that is not a list, fails the write, never replaced); pi: the extension from
+# stdin into its extensions/ folder. Prints `<agent>=<on|absent|failed>`.
+MEMORY_CLAUDE_JQ = (
+    'def has_cmd($c): any(.[]?; (.hooks // []) | any(.[]?; .command == $c));'
+    ' .autoMemoryEnabled = false'
+    ' | .hooks = (if .hooks == null then {} elif (.hooks | type) == "object" then .hooks'
+    ' else error("hooks is not an object") end)'
+    ' | reduce ($hooks | to_entries[]) as $h (.;'
+    ' .hooks[$h.key] = (if .hooks[$h.key] == null then [] elif (.hooks[$h.key] | type) == "array"'
+    ' then .hooks[$h.key] else error("a hook event is not a list") end)'
+    ' | if (.hooks[$h.key] | has_cmd($h.value)) then .'
+    ' else .hooks[$h.key] += [{"hooks": [{"type": "command", "command": $h.value}]}] end)')
+MEMORY_KIT_SCRIPT = (
+    'hooks="$1"; shift\n'
+    'cs="$HOME/.claude/settings.json"; pd="$HOME/.local/share/pi-agent/agent"\n'
+    'pf="$pd/extensions/rs-memory.ts"\n'
+    'for a in "$@"; do\n'
+    'if [ "$a" = claude ]; then\n'
+    '  [ -f "$cs" ] || { echo claude=absent; continue; }\n'
+    f'  if [ "$(wc -c < "$cs")" -le {AGENT_SETTINGS_MAX_BYTES} ] && jq --argjson hooks "$hooks" '
+    f"'{MEMORY_CLAUDE_JQ}' \"$cs\" > \"$cs.rs-tmp\" && [ -s \"$cs.rs-tmp\" ] "
+    '&& mv "$cs.rs-tmp" "$cs"; then echo claude=on; else rm -f "$cs.rs-tmp"; echo claude=failed; fi\n'
+    'elif [ "$a" = pi ]; then\n'
+    '  [ -f "$pd/settings.json" ] || { echo pi=absent; continue; }\n'
+    '  if rm -f "$pf.rs-tmp" && mkdir -p "$pd/extensions" && cat > "$pf.rs-tmp" '
+    '&& [ -s "$pf.rs-tmp" ] && mv -f "$pf.rs-tmp" "$pf"; then echo pi=on; '
+    'else rm -f "$pf.rs-tmp"; echo pi=failed; fi\n'
+    'fi\n'
+    'done\n'
+    ':\n')
+
+
+def _image_memory_kit(image: str) -> bool:
+    """Whether a host image carries the memory command (its label). A failed
+    read, a missing image included, reads as no: Rebuild all is the remedy."""
+    try:
+        r = run(["docker", "image", "inspect", "-f",
+                 '{{index .Config.Labels "' + MEMORY_KIT_LABEL + '"}}', image],
+                capture_output=True, timeout=RS_INSTR_EXEC_TIMEOUT_S)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0 and (r.stdout or "").strip() == "1"
+
+
+def _memory_kit_exec(container: str, agents: "Sequence[str]",
+                     home: str = _AGENT_HOME) -> "dict[str, str]":
+    """Run MEMORY_KIT_SCRIPT in a RUNNING container as the agent user: {agent:
+    state}; an agent the script did not answer for reads "failed"."""
+    agents = [a for a in agents if a in MEMORY_AGENTS]
+    if not agents:
+        return {}
+    try:
+        ext = MEMORY_PI_EXT_SRC.read_text(encoding="utf-8") if "pi" in agents else ""
+        r = run(["docker", "exec", "-i", "-u", "1000", "-e", f"HOME={home}", container,
+                 "sh", "-c", MEMORY_KIT_SCRIPT, "sh", json.dumps(MEMORY_CLAUDE_HOOKS), *agents],
+                input=ext, capture_output=True, timeout=AGENT_SETTINGS_EXEC_TIMEOUT_S)
+        out = r.stdout or ""
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError, ValueError):
+        out = ""
+    got: "dict[str, str]" = {}
+    for line in out.splitlines():
+        a, sep, v = line.strip().partition("=")
+        if sep and a in agents and v in ("on", "absent", "failed") and a not in got:
+            got[a] = v
+    return {a: got.get(a, "failed") for a in agents}
+
+
+def _apply_memory_kit(project: str, container: str, workspace_path: "Path",
+                      local: "Sequence[str]", *, home: str = _AGENT_HOME,
+                      progress=None) -> "list[OldInstructions]":
+    """The researcher memory kit into a RUNNING Docker-in-Docker project
+    container, for the agents it runs (`local`). Returns end-of-operation
+    errors; nothing for a project whose record says no memory."""
+    state, data = _read_marker_three_way(workspace_path)
+    if state == "absent":
+        return []
+    if state != "ok":
+        # A warning, the posture RS takes for this record mid-start (B31): every
+        # sandbox-dind project is read here, most of them not researchers.
+        _report_warnings([MEMORY_KIT_UNREADABLE.format(folder=orch_files.SHOWN_FOLDER)],
+                         progress)
+        return []
+    if data.get(MEMORY_RECORD_KEY) is not True:
+        return []
+    labels = _container_labels(container)
+    if labels is None:
+        return [OldInstructions("memory-kit", project, reason=MEMORY_KIT_LABELS_UNREADABLE)]
+    if labels.get(MEMORY_KIT_LABEL) != "1":
+        text = (MEMORY_KIT_OLD_CONTAINER if _image_memory_kit(SANDBOX_DIND_IMAGE)
+                else MEMORY_KIT_OLD_IMAGE)
+        return [OldInstructions("memory-kit", project, reason=text)]
+    _link_rs_commands(container, MEMORY_LINKS, on_old="skip")
+    items: "list[OldInstructions]" = []
+    try:
+        linked = run(["docker", "exec", container, "test", "-L", f"/usr/local/bin/{MEMORY_LINKS[0]}"],
+                     capture_output=True, timeout=AGENT_SETTINGS_EXEC_TIMEOUT_S).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        linked = False
+    if not linked:
+        items.append(OldInstructions("memory-kit", project, reason=MEMORY_KIT_LINK_FAILED))
+    agents = [a for a in local if a in MEMORY_AGENTS]
+    states = _memory_kit_exec(container, agents, home)
+    items += [OldInstructions("memory-kit", project,
+                              reason=MEMORY_KIT_AGENT_FAILED.format(who=_who(a)))
+              for a in agents if states.get(a) != "on"]
+    # Earned skills into both agents' homes (the command's own copy, file by
+    # file; nothing to do while the project has none).
+    env = ["-e", f"HOME={home}"]
+    if "pi" in agents:
+        env += ["-e", f"PI_CODING_AGENT_DIR={home}/.local/share/pi-agent/agent"]
+    try:
+        r = run(["docker", "exec", "-u", "1000", *env, container, MEMORY_TOOL, "skill", "sync"],
+                capture_output=True, timeout=AGENT_SETTINGS_EXEC_TIMEOUT_S)
+        if r.returncode != 0:
+            _report_warnings([f"the project's earned skills were not copied into its agents' "
+                              f"homes ({(r.stderr or r.stdout or '').strip()[:200]})"], progress)
+        else:
+            # the tool prints its own "warning: " prefix; the report adds one
+            _report_warnings([l.removeprefix("warning: ") for l in (r.stdout or "").splitlines()
+                              if l.strip()], progress)
+    except (OSError, subprocess.TimeoutExpired):
+        _report_warnings(["the project's earned skills were not copied into its agents' homes"],
+                         progress)
+    return items
+
+
 def _status_bar_toggle(project: str, container: str, workspace_path: "Path",
                        local: "Sequence[str]", on: bool, *,
                        home: str = _AGENT_HOME) -> "tuple[dict[str, str], list[OldInstructions]]":
@@ -18006,6 +18207,9 @@ def _agent_settings_plan(req: "UpdateRequest", container: str, workspace_path: "
             raise ValidationError("this project's agents are fixed when it is created")
         if dev and not new_agents:
             raise ValidationError("a dev project needs at least one agent")
+        if data.get(MEMORY_RECORD_KEY) is True and not new_agents:
+            raise ValidationError("a researcher project needs at least one agent "
+                                  "to do its research")
         if "pi" in removed:
             try:
                 boxes = sorted(n for n, e in extension.load(workspace_path).items()
@@ -18238,6 +18442,7 @@ def project_agents(req: ProjectAgentsRequest, _progress=None) -> dict:
         "project": req.project, "running": running,
         "kind": "docker" if docker else ("research" if research else "dind"),
         "dev": _workflow_is_dev(data), "agents": agents,
+        "memory": data.get(MEMORY_RECORD_KEY) is True,
         "agents_local": local, "agents_staged": staged,
         "model_in_settings": _label_is_set("container", container),
         "harness": _read_harness(ws),

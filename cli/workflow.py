@@ -75,7 +75,7 @@ PORT_MIN, PORT_MAX = 1, 65535
 _ALLOWED_KEYS = {"name", "substrate", "image_overlay", "repo", "ref", "setup",
                  "tabs", "mcp_exports", "resources", "services", "description",
                  "greeting", "title", "group", "tags", "agents", "dev", "web",
-                 "instructions", "gitea_history"}
+                 "instructions", "gitea_history", "memory"}
 _WEB_KEYS = {"port", "label", "start"}
 # MIRROR of rscore's top-level exported-port rule (_EXPORT_RESERVED_PORTS and
 # the box editor + box loopback bands, _EXPORT_BOX_EDITOR_PORT_LO ..
@@ -329,6 +329,19 @@ def _validate_entry(name: Any, m: Any) -> list[str]:
             out.append(p("instructions and dev cannot be set together (a dev "
                          "project's instruction file is the dev text)"))
 
+    # memory — the project's agent keeps RS's research memory (the rs-memory
+    # command, its hooks and skills): the researcher project type. Only on the
+    # rs-sandbox-dind image, which carries the command, and never with dev.
+    if "memory" in m:
+        if not isinstance(m["memory"], bool):
+            out.append(p(f"memory must be a boolean, got {m.get('memory')!r}"))
+        elif m["memory"]:
+            if not (m.get("substrate") == "dind-sysbox"
+                    and m.get("image_overlay") == "rs-sandbox-dind"):
+                out.append(p("memory applies only to dind-sysbox with the rs-sandbox-dind image"))
+            if m.get("dev"):
+                out.append(p("memory and dev cannot be set together"))
+
     extras = set(m) - _ALLOWED_KEYS
     if extras:
         out.append(p(f"unknown keys: {sorted(extras)}"))
@@ -426,7 +439,7 @@ def load_registry(path: Path = REGISTRY_PATH) -> dict[str, dict]:
         # own, instructions are staged into the project, and history wires an
         # RS-owned Gitea account in: built-in workflows only (the loader is the
         # one place that knows the source).
-        for k in ("web", "instructions", "gitea_history"):
+        for k in ("web", "instructions", "gitea_history", "memory"):
             if isinstance(m, dict) and k in m:
                 raise WorkflowError(
                     f"registry: entry {name!r}: {k} is reserved for the "
