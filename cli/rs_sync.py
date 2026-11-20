@@ -26,6 +26,8 @@ What goes over, one way (Gitea -> GitHub):
     carries the label "rs-sync", and each issue and PR record opens with a
     line saying it was mirrored with rs-sync (RS_SYNC_HEADER=off drops it);
   * the Gitea labels the mirrored items carry, each tagged " (rs-sync)";
+    a label of the same name (any case) already on GitHub that rs-sync did
+    not make is used as it is: never changed, never deleted;
   * the fork's wiki: the GitHub wiki's tree is replaced by the converted Gitea
     tree, one commit per run whose message ends with a marker line;
   * the fork's boards: one GitHub project with a Status and an Area field,
@@ -1552,6 +1554,31 @@ def label_payloads(gt_labels, wanted) -> dict:
     return out
 
 
+def label_plan(gt_labels, gh_labels, items) -> tuple:
+    """Match the items' labels to GitHub's, ignoring case. A name already on
+    GitHub takes GitHub's spelling, and a repeat on one item (two spellings of
+    one name) is dropped, so the relabel check settles. Returns the payloads
+    of the names missing from GitHub, to create tagged, and the labels in use
+    that GitHub already has and rs-sync did not make (used as they are, never
+    changed or deleted)."""
+    on_gh = {l["name"].lower(): l for l in gh_labels}
+    reused = set()
+    for it in items:
+        names, seen = [], set()
+        for name in it["labels"]:
+            cur = on_gh.get(name.lower())
+            if cur is not None:
+                name = cur["name"]
+                if not (cur.get("description") or "").endswith(LABEL_TAG):
+                    reused.add(name)
+            if name.lower() not in seen:
+                seen.add(name.lower())
+                names.append(name)
+        it["labels"] = names
+    missing = {n for it in items for n in it["labels"] if n.lower() not in on_gh}
+    return list(label_payloads(gt_labels, missing).values()), sorted(reused, key=str.lower)
+
+
 def estimate_minutes(writes: int) -> float:
     """Minutes the pacing needs for `writes` content writes: every full
     hourly allowance costs an hour, the rest goes at the per-minute pace."""
@@ -1654,24 +1681,13 @@ def sync(args, env) -> None:
             d["unlinked"] += len(it.get("subjects") or [])
     REPORT["pr_bases_missing"] = per_base
 
-    # Labels: every name in use must exist on GitHub, tagged; a same-named
-    # label without the tag (compared ignoring case) is someone else's.
+    # Labels: a name missing from GitHub is created, tagged; one already
+    # there (compared ignoring case) is used in GitHub's spelling, and when
+    # rs-sync did not make it, as it is.
     o, r = target.split("/", 1)
     base = f"/repos/{quote(o)}/{quote(r)}"
-    gh_labels = {l["name"].lower(): l for l in gh.all(f"{base}/labels")}
-    wanted = set()
-    for it in items:
-        wanted.update(it["labels"])
-    payloads = label_payloads(gt["labels"], wanted)
-    to_create = []
-    for name, pl in payloads.items():
-        cur = gh_labels.get(name.lower())
-        if cur is None:
-            to_create.append(pl)
-        elif not (cur.get("description") or "").endswith(LABEL_TAG):
-            die(f"a GitHub label named {cur['name']!r} already exists and was "
-                f"not made by rs-sync; rename or delete it on GitHub, then "
-                f"run again")
+    to_create, reused = label_plan(gt["labels"], gh.all(f"{base}/labels"), items)
+    REPORT["labels_reused"] = reused
 
     # The wiki and the board: every read and refusal before any write.
     wanted = {it["n"] for it in items if not it["closed"] and not it["pr"]}
@@ -2894,6 +2910,11 @@ def _checks(r: dict, dry: bool) -> list:
     if r.get("label_descriptions_cut"):
         out.append(f"{_plural(r['label_descriptions_cut'], 'label description')} cut to "
                    f"GitHub's length limit")
+    reused = r.get("labels_reused") or []
+    if reused and not r.get("error"):
+        k = len(reused)
+        out.append(f"{_plural(k, 'label')} already on GitHub used as "
+                   f"{'it is' if k == 1 else 'they are'}: {', '.join(reused)}")
     w = r.get("wiki") or {}
     if w.get("github_edits_overwritten") and (w.get("changed") or "restore_to" in w):
         done_ = w.get("commit") or w.get("restored")
