@@ -331,7 +331,7 @@ Per-project workspace at `container_volumes/<proj>/workspace/`: `results/`, `log
 
 ## ◾ Further reading
 
-- **[docs/GUIDE.md](docs/GUIDE.md)** — how a research thread plays out, the supervisor↔worker protocol, the full CLI reference, authoring an MCP server, debugging, FAQ.
+- **[docs/GUIDE.md](docs/GUIDE.md)** — how a research thread plays out, the supervisor↔worker protocol, the full CLI reference, authoring an MCP server, debugging, working modes and the test policy, what to do after updating RS, FAQ.
 - **[docs/SECURITY.md](docs/SECURITY.md)** — threat model, isolation layers, what's prevented and what isn't.
 
 <div align="center">

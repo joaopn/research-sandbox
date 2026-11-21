@@ -13,6 +13,8 @@ Workflow walkthrough, debugging recipes, and FAQ. For threat model and isolation
 [◾ Debugging](#-debugging)
 [◾ Egress modes](#-egress-modes)
 [◾ Multiple projects](#-multiple-projects)
+[◾ Working mode and test policy](#-working-mode-and-test-policy)
+[◾ After updating RS](#-after-updating-rs)
 [◾ Image rebuild rules](#-image-rebuild-rules)
 [◾ FAQ](#-faq)
 [◾ CLI reference](#-cli-reference)
@@ -293,6 +295,56 @@ They don't share:
 
 You can run as many concurrent projects as your host can handle. SSH ports are auto-assigned.
 
+## ◾ Working mode and test policy
+
+A dev project (`--workflow dev`) and each dev box carry two switches that set how their agent works. Both are chosen when the project or box is created and changed afterwards in its ⚙ panel in the browser; Claude Code and pi behave alike.
+
+**Working mode** — who does the work and who reviews it:
+
+| Mode | Code | How the agent works |
+|---|---|---|
+| `none` | 0 | Follows only the project's own instructions |
+| `direct` | 1 | Shows the plan, waits for your go, implements and verifies itself |
+| `doer-checker` | 2 | As `direct`, plus RS's checker subagent reviews the plan before any code and the change before it is committed |
+| `checker-doer` | 2b | Plans with you; RS's doer subagent implements each unit, the agent reviews each change itself |
+| `planner-doer-checker` | 3 | Plans with you; the doer subagent implements each unit and the checker subagent reviews it |
+
+**Test policy** — how much testing RS asks for:
+
+| Policy | What the agent does | Meant for |
+|---|---|---|
+| `light` (default) | Verifies each change by running it, runs the tests the project already has, adds tests only where you or the approved plan ask for them | A young project |
+| `full` | Every feature ships its tests, every bug fix a reproduction, and a new or changed test counts only once it was seen failing without the change | A mature project |
+
+The two are independent: the test policy holds in every working mode, `none` included. The project's own instructions win over both.
+
+The setting is what every new session starts with. Inside a running session, switch that session only:
+
+| | Claude Code | pi |
+|---|---|---|
+| Working mode | `/rs-mode <mode>` | `/skill:rs-mode <mode>` |
+| Test policy | `/rs-test <policy>` | `/skill:rs-test <policy>` |
+
+`/rs-mode` also takes the mode's code (`/rs-mode 2b`). A project's change in the ⚙ panel needs no restart and reaches new sessions; a dev box restarts when its working mode or test policy changes.
+
+From the command line, `project create` and `project update` take `--harness-mode <mode>` and `--test-policy <policy>`.
+
+## ◾ After updating RS
+
+An update to RS's own code (a `git pull`) reaches the running system in parts. Each part is brought live by one step:
+
+| Part of RS | Brought live by |
+|---|---|
+| Host commands (`research.py …`) | Nothing; each command runs the current code |
+| The broker | `python research.py broker stop`, then `python research.py broker start`; it loads the code once, when it starts |
+| The browser UI | `python research.py webui start --rebuild`; its pages are built into its image |
+| What a DIND project receives at each start: RS's instructions, the working-mode and test-policy files, the box tool | Stop and start the project |
+| Container images | `python research.py start --rebuild` (or **Rebuild all** in the browser, Sandboxes → Software), then stop and start each project |
+
+When it is unclear which parts an update touched, do all of them. The cost is the rebuild time and one restart per project, which interrupts the work running in it.
+
+A project that has not been restarted since an update keeps working as before. An action that needs the new version there is refused with a message that says to restart the project.
+
 ## ◾ Image rebuild rules
 
 Edits to `research.py` take effect immediately (it runs on the host with your Python).
@@ -436,6 +488,8 @@ project destroy <name|--all>       Remove container + workspace + network + cred
 --setup-script <snippet>   Shell snippet run once after checkout (RS_GITHUB_PAT for a private clone)
 --git-user-name / --git-user-email   git commit identity configured in the box at create
 --role-mcp-upstream ROLE=CSV   Pin an explicit upstream list for a --enable'd role-mcp (repeatable)
+--harness-mode <mode>      Working mode a dev project's agent starts in (none, direct, doer-checker, checker-doer, planner-doer-checker)
+--test-policy <policy>     Test policy a dev project starts on: light (default) or full
 ```
 
 #### Authenticating the clone
