@@ -64,10 +64,12 @@ import argparse
 import bisect
 import contextlib
 import fcntl
+import http.client
 import json
 import os
 import posixpath
 import re
+import ssl
 import stat
 import subprocess
 import sys
@@ -75,7 +77,7 @@ import time
 import traceback
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 # --- wiring (lockstep with cli/gitea.py GITEA_CONTAINER / GITEA_INNER_PORT,
@@ -130,6 +132,27 @@ NO_HEADER_WAIT_S = 60
 # run stops: GitHub's hourly window. A longer wait means the limit is not
 # clearing, and the run is resumed later instead.
 RATE_WAIT_MAX_S = 3600
+# A read that gets no answer (a timeout, a dropped or cut-off connection) or
+# GitHub's "not now" (HTTP 502/503/504), once GitHub has answered this run, is
+# tried again; a write never is (GitHub may have received it). GitHub
+# documents no retry interval for these: the minute is borrowed from its
+# documented wait for a limit answer without retry-after. It weighs idle time
+# after GitHub recovers (up to one interval) against how often rs-sync knocks
+# on a struggling GitHub: at half, recovery is noticed up to 30 s sooner for
+# about 1.7x the attempts per hour of outage (each attempt also costs up to
+# API_TIMEOUT_S), a negligible gain in a run of an hour or more; at ten times,
+# a single 20-second blip would idle the run ten minutes.
+NO_ANSWER_WAIT_S = 60
+# The longest total wait one request may spend on missing answers before the
+# run stops (its own total, beside the rate-limit one). A first mirror is
+# paced over an hour or more by CONTENT_PER_HOUR and left unattended, and a
+# rate limit mid-run is already waited out for up to RATE_WAIT_MAX_S, so an
+# outage of the same order costs nothing the operator does not already
+# accept; at half, a forty-minute outage stops a run that has to be started
+# again; at ten times, a dead run holds for half a day. Maintainer ruling
+# 2026-11-21 ("1a": up to an hour).
+NO_ANSWER_MAX_S = 3600
+NO_ANSWER_STATUSES = (502, 503, 504)
 # Import polling. GitHub processes an import in the background; the probe
 # saw imports finish in seconds. Every 2 s keeps the wait for a few-second
 # import short at a cost of a handful of reads; at half it the reads double
@@ -939,6 +962,11 @@ class GitHub:
         self.base, self.token = base.rstrip("/"), token
         self.writes = []            # timestamps of content-creating requests
         self.scopes = None
+        # Whether GitHub itself has answered this run: a 2xx, or any HTTP
+        # status but 502/503/504, which a proxy sends as readily as GitHub.
+        # Until it has, a missing answer is a setup problem (blocked, a
+        # proxy that cannot reach GitHub) and stops the run at once.
+        self.answered = False
 
     def _pace(self, clock=time.time, sleep=time.sleep):
         """Wait until the next content write fits GitHub's secondary limits:
@@ -960,13 +988,29 @@ class GitHub:
             if gap > 0:
                 sleep(gap)
 
+    def _no_answer_wait(self, what, waited) -> int:
+        """Wait out one missing answer of a read and return the request's new
+        no-answer total; stop the run once NO_ANSWER_MAX_S would be passed."""
+        if waited + NO_ANSWER_WAIT_S > NO_ANSWER_MAX_S:
+            die(f"{what}; waited {waited} s; run again later")
+        print(f"  {what}; trying again in {NO_ANSWER_WAIT_S} s", file=sys.stderr)
+        time.sleep(1 if _TEST_FAST else NO_ANSWER_WAIT_S)
+        return waited + NO_ANSWER_WAIT_S
+
     def call(self, method, path, body=None, accept=None, full_url=None, ok404=False,
              write=None):
         url = full_url or f"{self.base}{path}"
+        # What every message names: the path, or the path part of the full
+        # URL (the import-status poll passes an empty path).
+        where = path or urlsplit(url).path
         if write is None:
             write = method in ("POST", "PATCH", "PUT", "DELETE")
         waited = 0.0
+        no_answer_waited = 0
         while True:
+            # Only a read, and only once GitHub has answered this run (a
+            # 502/503/504 never counts as that answer: see self.answered).
+            retry_ok = self.answered and not write
             if write:
                 self._pace()
                 # Counted before the send: a count of requests that left
@@ -987,7 +1031,12 @@ class GitHub:
                     status = r.status
             except HTTPError as e:
                 headers = e.headers
-                text = e.read().decode("utf-8", "replace")
+                try:
+                    text = e.read().decode("utf-8", "replace")
+                except (OSError, http.client.HTTPException):
+                    text = ""           # a cut-off error body reads as an empty one
+                if e.code not in NO_ANSWER_STATUSES:
+                    self.answered = True
                 limited = e.code == 429 or (e.code == 403 and (
                     "rate limit" in text.lower()
                     or headers.get("x-ratelimit-remaining") == "0"
@@ -996,21 +1045,32 @@ class GitHub:
                     wait = _limit_wait(headers)
                     if waited + wait > RATE_WAIT_MAX_S:
                         die(f"GitHub's rate limit did not clear within "
-                            f"{RATE_WAIT_MAX_S} s ({method} {path}); run "
+                            f"{RATE_WAIT_MAX_S} s ({method} {where}); run "
                             f"again later: the markers say what is done")
                     print(f"  rate limited; waiting {int(wait)} s", file=sys.stderr)
                     time.sleep(1 if _TEST_FAST else wait)
                     waited += wait
                     continue
+                if e.code in NO_ANSWER_STATUSES and retry_ok:
+                    no_answer_waited = self._no_answer_wait(
+                        f"GitHub answered HTTP {e.code} (busy) ({method} {where})",
+                        no_answer_waited)
+                    continue
                 if e.code in (404, 410) and ok404:
                     return e.code, None, headers
                 if write:
                     self.writes.append(time.time())
-                raise SyncError(f"GitHub {method} {path} answered HTTP {e.code}: "
+                raise SyncError(f"GitHub {method} {where} answered HTTP {e.code}: "
                                 f"{_gh_error_text(text, self.token)}", status=e.code)
-            except (URLError, OSError) as e:
-                die(f"GitHub did not answer ({method} {path}: "
-                    f"{getattr(e, 'reason', e)})")
+            except (URLError, OSError, http.client.HTTPException) as e:
+                reason = getattr(e, "reason", None) or e
+                if retry_ok and _no_answer(e):
+                    no_answer_waited = self._no_answer_wait(
+                        f"GitHub did not answer ({method} {where}: {reason})",
+                        no_answer_waited)
+                    continue
+                die(f"GitHub did not answer ({method} {where}: {reason})")
+            self.answered = True
             if write:
                 self.writes.append(time.time())
             if self.scopes is None and headers.get("X-OAuth-Scopes") is not None:
@@ -1046,6 +1106,21 @@ class GitHub:
             errs = out.get("errors") if isinstance(out, dict) else "the answer was not a JSON object"
             die(f"GitHub GraphQL failed: {_gh_error_text(json.dumps({'errors': errs}), self.token)}")
         return out.get("data")
+
+
+def _no_answer(e) -> bool:
+    """Whether a network failure is a missing answer, worth trying again on a
+    read: a timeout, or a connection dropped or cut off (mid-answer, or a TLS
+    handshake the far end closed), directly or as a URLError's reason. GitHub
+    being unreachable is not: a refused connection, a name that does not
+    resolve, an unreachable network, a certificate that does not verify, a
+    malformed URL; those stop the run at once."""
+    if isinstance(e, URLError):
+        e = e.reason
+    if isinstance(e, ConnectionRefusedError):
+        return False
+    return isinstance(e, (TimeoutError, ConnectionError, ssl.SSLEOFError,
+                          http.client.IncompleteRead, http.client.BadStatusLine))
 
 
 def _limit_wait(headers) -> float:
