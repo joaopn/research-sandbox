@@ -24,20 +24,22 @@
   "probes": [
     {
       "id": "weeks",
-      "question": "How many weeks a year should a wage computed from this panel assume? Give the number.",
+      "question": "How many weeks a year should a wage computed from this panel assume? Give the number with its unit.",
       "check": {
         "type": "number",
         "fact": "weeks_worked",
-        "tol": 0.02
+        "tol": 0.02,
+        "unit": "\\b(?:work(?:ing)?[^\\S\\r\\n]+)?weeks?\\b"
       }
     },
     {
       "id": "wage",
-      "question": "What is the median hourly wage in the survey panel? Give the number.",
+      "question": "What is the median hourly wage in the survey panel? Give the number with its unit.",
       "check": {
         "type": "number",
         "fact": "median_hourly_wage_weeks_worked",
-        "tol": 0.05
+        "tol": 0.05,
+        "unit": "\u20ac|\\bEUR\\b|\\beuros?\\b"
       }
     }
   ]

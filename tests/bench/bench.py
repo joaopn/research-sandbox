@@ -75,6 +75,9 @@ ARMS = {
     "research": {"workflow": "research", "agent": "claude", "memory": False, "log": True},
 }
 DEFAULT_ARMS = ("researcher", "floor")
+# Box-drawing characters (U+2500-U+257F): an agent's screen frames its prompt
+# with full-width lines of them, which say nothing about an error.
+BOX = "".join(chr(i) for i in range(0x2500, 0x2580))
 # A short eval's turn is a small analysis (a package install the slowest
 # part); half of this cuts an install short, ten times it lets a hung session
 # hold the run for an hour.
@@ -132,6 +135,21 @@ def load_evals(folder: Path = EVALS) -> "dict[str, dict]":
         except ValueError as x:
             raise EvalError(f"{f.name}: not JSON ({x})")
         name = e.get("name")
+        for it in list(e.get("probes", [])) + list(e.get("checks", [])):
+            ck = it.get("check") or {}
+            u = ck.get("unit")
+            if u is not None:
+                if ck.get("type") != "number" or not isinstance(u, str):
+                    raise EvalError(f"{f.name}: {it.get('id')}: a unit is text, on a number check only")
+                try:
+                    unit_patterns(u)               # exactly what grading compiles
+                    # a unit matches text: one that can match an empty span
+                    # ("€?", "\b") would count for nothing at grading
+                    empty = any(x.end() == x.start() for x in re.finditer(u, "a 1 b € weeks", re.I))
+                except re.error as x:
+                    raise EvalError(f"{f.name}: {it.get('id')}: unit is not a regular expression ({x})")
+                if empty:
+                    raise EvalError(f"{f.name}: {it.get('id')}: a unit must match text; this one can match nothing")
         if name != f.stem:
             raise EvalError(f"{f.name}: its name must be {f.stem!r}")
         if not NAME_RE.match(name):
@@ -464,7 +482,45 @@ class Bench:
         self.send(c, name, text)
         done = self.wait(lambda: self.count(p, "handbacks") > hb, self.a.turn_timeout)
         return {"seconds": round(time.time() - t0, 1), "handed_back": done,
-                "usage": self.usage_since(c, arm, before)}
+                "usage": self.usage_since(c, arm, before), "_before": before}
+
+    def no_answer(self, arm, c, name, rec, m) -> None:
+        """A turn that handed back without one model call (an API refusal, a
+        sign-in problem) is no session: stop the eval with the error the
+        agent logged, then the end of its screen (box lines left out)."""
+        before = m.pop("_before", {})                 # not part of the record
+        u = m.get("usage") or {}
+        if m.get("handed_back") and not any(u.get(k) for k in ("input", "cached", "output")):
+            pane = self.tmux(c, "capture-pane", "-p", "-t", name).stdout
+            screen = screen_tail(pane)
+            why = self.logged_error(c, arm, before)
+            rec["error"] = ("a turn got no answer from the model" + (f": {why}" if why else "")
+                            + "; the screen ends: " + screen)
+            raise ArmFailed(rec)
+
+    def logged_error(self, c, arm, before: dict) -> str:
+        """The last API error the agent wrote during this turn (Claude Code:
+        an isApiErrorMessage entry; pi: an errorMessage), read from its own
+        transcripts only (never a worker's or a subagent's), past `before`."""
+        now = self.transcripts(c, arm)
+        mine = [p for p in now if not side_transcript(p, now) and now[p][1] > before.get(p, (0, 0))[1]]
+        if not mine:
+            return ""
+        newest = max(mine, key=lambda p: now[p][0])
+        start = before.get(newest, (0, 0))[1]
+        data = self.ex(c, f"tail -c +{start + 1} {shlex.quote(newest)}").stdout.decode("utf-8", "replace")
+        found = ""
+        for line in data.splitlines():
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            msg = o.get("message") if isinstance(o, dict) and isinstance(o.get("message"), dict) else {}
+            if o.get("isApiErrorMessage"):
+                found = " ".join(b.get("text", "") for b in msg.get("content") or [] if isinstance(b, dict))
+            elif msg.get("errorMessage"):
+                found = str(msg["errorMessage"])
+        return found.strip()[:300]
 
     def play(self, arm, p, c, session, budget: dict, watch: "list[str]" = ()) -> dict:
         name = session["name"]
@@ -475,8 +531,7 @@ class Bench:
         t_start = time.time()
         if not self.wait(lambda: self.count(p, "waiting") > w0, 120):
             pane = self.tmux(c, "capture-pane", "-p", "-t", name).stdout
-            rec["error"] = "the session never came up; its screen ends: " + " / ".join(
-                l.strip() for l in pane.splitlines() if l.strip())[-400:]
+            rec["error"] = "the session never came up; its screen ends: " + screen_tail(pane)
             self.tmux(c, "kill-session", "-t", name)
             raise ArmFailed(rec)
         for _ in range(15):                    # Claude Code's first-start question: keep bypass mode
@@ -515,6 +570,7 @@ class Bench:
                     break
                 m = {"i": i, **self.turn(arm, p, c, name, msg)}
                 rec["messages"].append(m)
+                self.no_answer(arm, c, name, rec, m)
                 self.spend(budget, m["usage"])
             # the consolidation starts at the session's end event and can be
             # done before the next line runs: count from before the end (for a
@@ -523,6 +579,7 @@ class Bench:
             if session["end"] == "exit":
                 if ARMS[arm].get("log"):
                     rec["log"] = self.turn(arm, p, c, name, "/log")   # the research flow's own memory
+                    self.no_answer(arm, c, name, rec, rec["log"])
                     self.spend(budget, rec["log"]["usage"])
                     before_end = self.transcripts(c, arm)
                 if ARMS[arm]["agent"] == "pi":
@@ -630,7 +687,7 @@ class Bench:
         if ans is None:
             return {"score": None, "why": res.get("error", "no answer")}
         if chk["type"] == "number":
-            return grade_number(ans, key["facts"][chk["fact"]], chk["tol"])
+            return grade_number(ans, key["facts"][chk["fact"]], chk["tol"], chk.get("unit"))
         if chk["type"] == "contains":
             return grade_contains(ans, chk.get("any", []), chk.get("none", []))
         g = self.grade_text(key["answers"][chk["key"]], it["question"], ans)
@@ -761,6 +818,12 @@ class Bench:
 
 
 # ---------------------------------------------------------------- pure helpers
+def screen_tail(pane: str) -> str:
+    """The end of an agent's screen as one line, box-drawing rules and frames
+    left out (they fill a wide screen and say nothing)."""
+    return " / ".join(l.strip(BOX + " ") for l in pane.splitlines() if l.strip(BOX + " "))[-400:]
+
+
 def nothing_left_to_resume(kills: "list[dict]", paths: "list[str]") -> bool:
     """A killed session that was not mid-turn, or had written every file the
     check looks at, left nothing to resume: the check would measure nothing."""
@@ -821,19 +884,56 @@ def _usages(obj):
             yield from _usages(v)
 
 
-NUM_RE = re.compile(r"-?\d[\d,]*\.?\d*")
+# A comma only as a thousands separator (groups of three): "1,2" is two
+# numbers, never twelve.
+NUM_RE = re.compile(r"-?\d{1,3}(?:,\d{3})+(?!\d)(?:\.\d+)?|-?\d+(?:\.\d+)?")
 
 
-def grade_number(answer: str, value: float, tol: float) -> dict:
-    """1 when a number in the answer is within `tol` (relative) of the key's."""
-    for m in NUM_RE.findall(answer or ""):
+# What may stand between a unit and its number: spaces (never a line break)
+# and markdown emphasis ("€ 63.87", "**63.87** EUR"), and after the number a
+# hyphen ("12-week"). Nothing that opens a new clause, line or list item
+# (":", "(", "–", a newline, a full stop), so "52 weeks: 12 only for some" or
+# "- 12\n- weeks: 52" does not give the 12 the unit of the 52.
+# Emphasis markers sit against the text they wrap and come with a space or a
+# hyphen ("**12** weeks", "12 **weeks**", "**12**-week"), so a gap is nothing,
+# or markers, a space (or, after the number, a hyphen), markers: never a lone
+# "*" as in a formula ("12 * weeks", "12*weeks", "EUR*63.87").
+UNIT_GAP_BEFORE = r"(?:[*_]*[^\S\r\n]+[*_]*)?"
+UNIT_GAP_AFTER = r"(?:[*_]*(?:-|[^\S\r\n]+)[*_]*)?"   # a hyphen only right after the number
+
+
+def unit_patterns(unit: str) -> "tuple[re.Pattern, re.Pattern]":
+    """The two patterns a unit is graded with: the unit, then the gap, right
+    before a number; the gap, then the unit, right after one. The unit's own
+    text is the named group, which grading requires to be non-empty."""
+    return (re.compile(f"(?P<rs_unit>{unit}){UNIT_GAP_BEFORE}(?=-?\\d)", re.I),
+            re.compile(f"{UNIT_GAP_AFTER}(?P<rs_unit>{unit})", re.I))
+
+
+def grade_number(answer: str, value: float, tol: float, unit: "str | None" = None) -> dict:
+    """1 when a number in the answer is within `tol` (relative) of the key's;
+    with `unit` (a regular expression), only a number written right next to
+    its unit counts, so an unrelated number (an id, a count, a value said to
+    be wrong without its unit) cannot pass; a wrong value written with its
+    unit ("52 weeks, not 12 weeks") still counts. The unit is matched in the whole answer, so word
+    boundaries are the answer's own."""
+    a = answer or ""
+    if unit:
+        before, after = unit_patterns(unit)
+        ends_before = {u.end() for u in before.finditer(a) if u.group("rs_unit")}
+    for m in NUM_RE.finditer(a):
         try:
-            x = float(m.replace(",", ""))
+            x = float(m.group().replace(",", ""))
         except ValueError:
             continue
+        if unit:
+            # the number's own end: a full stop or comma after it ends its clause
+            aft = after.match(a, m.start() + len(m.group().rstrip(".,")))
+            if m.start() not in ends_before and not (aft and aft.group("rs_unit")):
+                continue
         if value and abs(x - value) <= tol * abs(value):
             return {"score": 1, "why": f"{x:g} is within {tol:.0%} of {value:g}"}
-    return {"score": 0, "why": f"no number within {tol:.0%} of {value:g}"}
+    return {"score": 0, "why": f"no number within {tol:.0%} of {value:g}" + (" written with its unit" if unit else "")}
 
 
 def grade_contains(answer: str, any_of: "list[str]", none_of: "list[str]") -> dict:

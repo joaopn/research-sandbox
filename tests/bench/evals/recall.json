@@ -17,11 +17,12 @@
   "probes": [
     {
       "id": "recall",
-      "question": "Within respondents, how much does income change per year of age? Give the number.",
+      "question": "Within respondents, how much does income change per year of age? Give the number with its unit.",
       "check": {
         "type": "number",
         "fact": "income_per_year_of_age",
-        "tol": 0.05
+        "tol": 0.05,
+        "unit": "\u20ac|\\bEUR\\b|\\beuros?\\b"
       }
     }
   ]

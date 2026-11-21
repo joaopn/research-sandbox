@@ -49,20 +49,22 @@
   "probes": [
     {
       "id": "recall_paraphrase",
-      "question": "What did we find about how people's earnings evolve as they get older?",
+      "question": "What did we find about how people's earnings evolve as they get older? Give the number with its unit.",
       "check": {
         "type": "number",
         "fact": "income_per_year_of_age",
-        "tol": 0.05
+        "tol": 0.05,
+        "unit": "\u20ac|\\bEUR\\b|\\beuros?\\b"
       }
     },
     {
       "id": "recall",
-      "question": "Within respondents, how much does income change per year of age? Give the number.",
+      "question": "Within respondents, how much does income change per year of age? Give the number with its unit.",
       "check": {
         "type": "number",
         "fact": "income_per_year_of_age",
-        "tol": 0.05
+        "tol": 0.05,
+        "unit": "\u20ac|\\bEUR\\b|\\beuros?\\b"
       }
     },
     {
@@ -92,11 +94,12 @@
     },
     {
       "id": "derived",
-      "question": "What is the median hourly wage?",
+      "question": "What is the median hourly wage? Give the number with its unit.",
       "check": {
         "type": "number",
         "fact": "median_hourly_wage",
-        "tol": 0.05
+        "tol": 0.05,
+        "unit": "\u20ac|\\bEUR\\b|\\beuros?\\b"
       }
     },
     {

@@ -14,7 +14,7 @@ no question asked), and how each is scored:
 
 | Check | Scores | Costs |
 |---|---|---|
-| `number` | a number in the answer within a tolerance of the key's | nothing |
+| `number` | a number in the answer within a tolerance of the key's, written right next to its unit (`unit`, a regular expression; the question asks for the unit) | nothing |
 | `contains` | the answer holds one of the given phrases, and none of the others | nothing |
 | `files` | the files the eval names are there, or each holds its value from the key | nothing |
 | `grader` | a separate run, with no tools and no memory, scores the answer against the key | one model call |
@@ -71,4 +71,6 @@ score with its tokens and time, and each eval's total tokens, time and cold
 start size per project type. A probe may recompute an answer instead of
 remembering it (probes keep their tools and the data); its tokens and time
 tell the two apart. An interruption check whose kill came after the task had
-finished scores nothing: there was nothing to resume.
+finished scores nothing: there was nothing to resume. A turn the model never
+answered (an API refusal, a sign-in problem) stops that eval, and the table
+marks it FAILED with the error the agent logged.
