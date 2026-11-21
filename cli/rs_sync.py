@@ -1124,13 +1124,26 @@ def _no_answer(e) -> bool:
 
 
 def _limit_wait(headers) -> float:
+    # A retry-after of GitHub's documented minute ("wait for at least one
+    # minute before retrying") or more is waited exactly. A shorter one is no
+    # usable wait unless a reset time (with x-ratelimit-remaining 0) at least
+    # that minute away comes with it: a "retry now" (0) would otherwise send
+    # the request again at once, for as long as GitHub keeps answering that
+    # way, while GitHub warns that requests sent while limited may get an
+    # integration banned. A reset at least a second ahead, with no
+    # retry-after, is waited exactly.
     ra = headers.get("retry-after")
+    short = False
     if ra and ra.strip().isdigit():
-        return float(ra.strip())
+        if float(ra.strip()) >= NO_HEADER_WAIT_S:
+            return float(ra.strip())
+        short = True                # under the minute: only a reset beyond it counts
     if headers.get("x-ratelimit-remaining") == "0":
         reset = headers.get("x-ratelimit-reset")
         if reset and reset.strip().isdigit():
-            return max(1.0, float(reset) - time.time())
+            left = float(reset) - time.time()
+            if not short or left >= NO_HEADER_WAIT_S:
+                return max(1.0, left)
     return float(NO_HEADER_WAIT_S)
 
 
