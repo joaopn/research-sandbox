@@ -70,6 +70,7 @@ import math
 import os
 import posixpath
 import re
+import shutil
 import ssl
 import stat
 import subprocess
@@ -227,6 +228,135 @@ class CountError(SyncError):
 
 class DuplicateClaim(SyncError):
     """Two GitHub issues or comments claim one Gitea item: someone deletes one."""
+
+
+# ============================================================================
+# What the run shows while it works
+# ============================================================================
+
+# The shortest gap between two redraws of the progress line on a terminal,
+# as in rs-publish: at 0.5 s a person sees steady movement; ten times longer
+# reads as frozen, ten times shorter only flickers. A wait's countdown
+# redraws once a second, the unit it counts in.
+PROGRESS_REDRAW_S = 0.5
+
+
+def _isatty(stream) -> bool:
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+class _Progress:
+    """On a terminal (stderr, checked when the run starts): one status line
+    redrawn in place, cut to the terminal's width, with the run's messages
+    printed above it (say). Elsewhere the messages alone, as before. A failed
+    terminal write turns the line off; it never stops the run."""
+
+    def __init__(self):
+        self.tty, self.open, self.total, self.status = False, False, None, ""
+        self.started, self.last = 0.0, None
+
+    def start(self):
+        self.open, self.total, self.status, self.last = False, None, "", None
+        self.tty = _isatty(sys.stderr)
+        self.started = time.monotonic() if self.tty else 0.0
+
+    def set_total(self, n: int):
+        self.total = n
+
+    def written(self) -> str:
+        n = REPORT.get("writes_sent") or 0
+        return f"{n} written" if self.total is None else f"{n} of about {max(self.total, n)} written"
+
+    def writing(self, used: int = 0):
+        """After a write is sent; `used`: the writes of the past hour."""
+        if not self.tty:
+            return
+        n = REPORT.get("writes_sent") or 0
+        so_far = _duration(time.monotonic() - self.started)
+        if self.total is None:
+            self.status = f"writing {n} · {so_far} so far"
+        else:
+            t = max(self.total, n)
+            self.status = f"writing {n} of about {t} · {so_far} so far"
+            if t > n:
+                self.status += f" · about {_duration(estimate_minutes(t - n, used) * 60)} left"
+        self.draw()
+
+    def reading(self, text: str):
+        """Before a read: drawn at once (each read is a network round trip,
+        so this is at most a few redraws a second)."""
+        if self.tty:
+            self.status = text
+            self.draw(force=True)
+
+    def say(self, msg: str):
+        if self.open:
+            self._write("\r\033[K")
+            self.open = False
+        print(msg, file=sys.stderr)
+        self.draw(force=True)
+
+    def end(self):
+        """End an open status line, so what follows starts on its own line."""
+        if self.open:
+            self.open = False
+            self._write("\n")
+
+    def draw(self, force: bool = False):
+        if not self.tty or not self.status:
+            return
+        now = time.monotonic()
+        if not force and self.last is not None and now - self.last < PROGRESS_REDRAW_S:
+            return
+        self.last = now
+        try:
+            cols = os.get_terminal_size(sys.stderr.fileno()).columns
+        except (OSError, ValueError):
+            cols = 0
+        if cols <= 0:               # not known (a terminal with no size set): as shutil does
+            cols = shutil.get_terminal_size().columns
+        width = max(1, cols - 1)
+        self.open = True
+        self._write("\r" + ("  " + self.status)[:width].ljust(width))
+
+    def _write(self, text: str):
+        try:
+            sys.stderr.write(text)
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            self.tty = self.open = False
+
+
+PROGRESS = _Progress()
+
+
+def say(msg: str) -> None:
+    """A line for the person running rs-sync (stderr), above the progress line."""
+    PROGRESS.say(msg)
+
+
+def _wait(seconds: float, why: str, fast: float = 1, verb: str = "waiting") -> None:
+    """Sleep `seconds` (`fast` under RS_SYNC_TEST_FAST); on a terminal in
+    one-second steps, the progress line counting down and saying why."""
+    if _TEST_FAST:
+        time.sleep(fast)
+        return
+    if not PROGRESS.tty:
+        time.sleep(seconds)
+        return
+    end, before = time.monotonic() + seconds, PROGRESS.status
+    while True:
+        left = end - time.monotonic()
+        if left <= 0:
+            PROGRESS.status = before        # the line goes back to what it showed
+            PROGRESS.draw(force=True)
+            return
+        PROGRESS.status = f"{verb} {_duration(left)}: {why} · {PROGRESS.written()}"
+        PROGRESS.draw(force=True)
+        time.sleep(min(1.0, left))
 
 
 # ============================================================================
@@ -1085,35 +1215,45 @@ class GitHub:
         except CountError as e:
             self.share_error = e
 
-    def _pace(self, clock=time.time, sleep=time.sleep):
+    def _pace(self, clock=time.time, sleep=None):
         """Wait until the next content write fits GitHub's secondary limits:
         the hourly and per-minute counts over the writes made so far (by every
         rs-sync run of this container, share_writes), and at least
         MIN_WRITE_GAP_S since the last one."""
         if _TEST_FAST:
             return
+
+        def nap(seconds, why):
+            if sleep is not None:
+                sleep(seconds)
+            elif why:
+                _wait(seconds, why, verb="paused")
+            else:
+                time.sleep(seconds)
         self.share_writes(clock=clock)
         now = clock()
         self.writes = [t for t in self.writes if now - t < 3600]
         if len(self.writes) >= CONTENT_PER_HOUR:
-            sleep(max(0.0, self.writes[-CONTENT_PER_HOUR] + 3600 - now))
+            nap(max(0.0, self.writes[-CONTENT_PER_HOUR] + 3600 - now),
+                f"GitHub allows {CONTENT_PER_HOUR} writes an hour")
             now = clock()
         recent = [t for t in self.writes if now - t < 60]
         if len(recent) >= CONTENT_PER_MINUTE:
-            sleep(max(0.0, recent[-CONTENT_PER_MINUTE] + 60 - now))
+            nap(max(0.0, recent[-CONTENT_PER_MINUTE] + 60 - now),
+                f"GitHub allows {CONTENT_PER_MINUTE} writes a minute")
             now = clock()
         if self.writes:
             gap = max(MIN_WRITE_GAP_S, 60.0 / CONTENT_PER_MINUTE) - (now - self.writes[-1])
             if gap > 0:
-                sleep(gap)
+                nap(gap, "")
 
     def _no_answer_wait(self, what, waited) -> int:
         """Wait out one missing answer of a read and return the request's new
         no-answer total; stop the run once NO_ANSWER_MAX_S would be passed."""
         if waited + NO_ANSWER_WAIT_S > NO_ANSWER_MAX_S:
             die(f"{what}; waited {waited} s; run again later")
-        print(f"  {what}; trying again in {NO_ANSWER_WAIT_S} s", file=sys.stderr)
-        time.sleep(1 if _TEST_FAST else NO_ANSWER_WAIT_S)
+        say(f"  {what}; trying again in {NO_ANSWER_WAIT_S} s")
+        _wait(NO_ANSWER_WAIT_S, what)
         return waited + NO_ANSWER_WAIT_S
 
     def call(self, method, path, body=None, accept=None, full_url=None, ok404=False,
@@ -1147,6 +1287,7 @@ class GitHub:
                 # Counted before the send: a count of requests that left
                 # rs-sync, so 0 means nothing reached GitHub (the summary).
                 REPORT["writes_sent"] = REPORT.get("writes_sent", 0) + 1
+                PROGRESS.writing(len(self.writes))
             hdr = {"Authorization": f"token {self.token}",
                    "Accept": accept or "application/vnd.github+json",
                    "User-Agent": "rs-sync"}
@@ -1186,8 +1327,8 @@ class GitHub:
                         limits += 1
                     elif waited + wait > RATE_WAIT_MAX_S:
                         die(over)
-                    print(f"  rate limited; waiting {int(wait)} s", file=sys.stderr)
-                    time.sleep(1 if _TEST_FAST else wait)
+                    say(f"  rate limited; waiting {int(wait)} s")
+                    _wait(wait, "GitHub's rate limit")
                     waited += wait
                     continue
                 if e.code in NO_ANSWER_STATUSES and retry_ok:
@@ -1244,7 +1385,11 @@ class GitHub:
         p["per_page"] = GITHUB_PAGE
         url = f"{self.base}{path}?{urlencode(p)}"
         rows = []
+        what = path.split("/", 4)[-1] if path.startswith("/repos/") else path.strip("/")
+        page = 0
         while url:
+            page += 1
+            PROGRESS.reading(f"reading GitHub: {what}, page {page}")
             _, body, headers = self.call("GET", path, accept=accept, full_url=url)
             if not isinstance(body, list):
                 die(f"GitHub GET {path}: not a list")
@@ -1383,6 +1528,7 @@ def gitea_answers() -> None:
 
 def read_gitea(g: Gitea, owner: str, repo: str) -> dict:
     base = f"/repos/{quote(owner)}/{quote(repo)}"
+    PROGRESS.reading("reading Gitea: issues, pull requests and comments")
     info, _ = g.get(base)
     if not isinstance(info, dict) or "id" not in info:
         die(f"gitea: {owner}/{repo} not readable")
@@ -1400,10 +1546,12 @@ def read_gitea(g: Gitea, owner: str, repo: str) -> dict:
                  "user": (c.get("user") or {}).get("login") or "",
                  "created_at": c.get("created_at")})
     merged = []
+    n_merged = sum(1 for p in pulls if p.get("merged"))
     for p in pulls:
         if not p.get("merged"):
             continue
         n = p["number"]
+        PROGRESS.reading(f"reading Gitea: pull request {len(merged) + 1} of {n_merged}")
         reviews = g.all(f"{base}/pulls/{n}/reviews")
         extra = []
         for rv in reviews:
@@ -1787,8 +1935,8 @@ def do_import(gh: GitHub, target, payload, n_gitea) -> int:
                 if st.get("errors") else "GitHub gave no reason"
             die(f"{what}: GitHub's import failed: {why}")
         if polls == 2:
-            print(f"  waiting for GitHub to import {what}…", file=sys.stderr)
-        time.sleep(0.05 if _TEST_FAST else IMPORT_POLL_S)
+            say(f"  waiting for GitHub to import {what}…")
+        _wait(IMPORT_POLL_S, f"GitHub is importing {what}", fast=0.05)
 
 
 def label_payloads(gt_labels, wanted) -> dict:
@@ -1852,6 +2000,21 @@ def label_plan(gt_labels, gh_labels, items) -> tuple:
         it["labels"] = names
     missing = {n for it in items for n in it["labels"] if n.lower() not in on_gh}
     return list(label_payloads(gt_labels, missing).values()), sorted(reused, key=str.lower)
+
+
+def plan_writes(plan, to_create, new_items, bp) -> int:
+    """The GitHub writes a plan makes (the wiki's one push aside): labels,
+    each import and its lock, the planned item changes, and the board's (bp:
+    its dry pass's counts, or None). Creating a project is three writes; an
+    item still to be imported is an add and two values."""
+    n = len(to_create) + 2 * len(new_items)
+    n += sum(len(plan[k]) for k in ("edit", "comment_new", "comment_edit", "comment_delete",
+                                    "state", "labels", "lock", "delete", "skip_delete"))
+    if bp:
+        n += (3 if bp.get("create_project") else 0) + 3 * bp.get("after_import", 0) \
+            + sum(bp.get(k, 0) for k in ("project_settings", "fields", "add", "set",
+                                         "remove", "move"))
+    return n
 
 
 def estimate_minutes(writes: int, used: int = 0) -> float:
@@ -1993,26 +2156,18 @@ def sync(args, env) -> None:
     for it in new_items:
         plan["import"].append(it["n"])
     REPORT["new_items"] = _item_kinds(new_items)
-    writes_est = len(to_create) + 2 * len(new_items)
-
     if not apply:
         _fill_existing_plan(plan, items, have, ctx, rid, env, subjects_index, gt, g, owner, repo,
                             dry=True, kept_off=kept_off)
-        writes_est += sum(len(plan[k]) for k in ("edit", "comment_new", "comment_edit",
-                                                 "comment_delete", "state", "labels", "lock",
-                                                 "delete", "skip_delete"))
         if wiki_state:
             wiki_apply(wiki_state, Ctx(owner, repo, target, table, wiki=True), me,
                        env["RS_SYNC_GITHUB_TOKEN"], secrets, dry=True)
+        bp = None
         if board_state:
             node_of = {n: v["node_id"] for n, v in have["items"].items()}
             board_apply(gh, board_state, owner, repo, target, wanted, node_of, dry=True)
             bp = REPORT["board"]
-            # Creating a project is three writes; an item still to be
-            # imported is an add and two values.
-            writes_est += (3 if bp.get("create_project") else 0) + 3 * bp.get("after_import", 0) \
-                + sum(bp.get(k, 0) for k in ("project_settings", "fields", "add", "set",
-                                             "remove", "move"))
+        writes_est = plan_writes(plan, to_create, new_items, bp)
         REPORT["plan"] = {k: (v if len(v) <= 40 else v[:40] + [f"… {len(v) - 40} more"])
                           for k, v in plan.items()}
         REPORT["plan_counts"] = {k: len(v) for k, v in plan.items()}
@@ -2034,8 +2189,29 @@ def sync(args, env) -> None:
         v = have["items"][n]
         delete_issue(gh, v["node_id"], v["number"])
         done["skip_deleted"].append(v["number"])
-        print(f"  deleted GitHub #{v['number']} (Gitea #{n} carries {SKIP_LABEL})",
-              file=sys.stderr)
+        say(f"  deleted GitHub #{v['number']} (Gitea #{n} carries {SKIP_LABEL})")
+    # The total the progress line counts towards: the dry run's own plan,
+    # worked out after the sync-skip deletions (they go first) and before any
+    # other write. Its refusals stop the run here, before those writes: the
+    # real pass would refuse the same Gitea state after the imports. REPORT
+    # is restored from a shallow snapshot (the pass only adds keys), which
+    # keeps `done` the same object; the wiki's dry pass is left out, as the
+    # wiki push is outside the estimate.
+    snapshot = dict(REPORT)
+    try:
+        pplan = {k: [] for k in plan}
+        _fill_existing_plan(pplan, items, have, ctx, rid, env, subjects_index, gt, g, owner,
+                            repo, dry=True, kept_off=kept_off)
+        bp = None
+        if board_state:
+            board_apply(gh, board_state, owner, repo, target, wanted,
+                        {n: v["node_id"] for n, v in have["items"].items()}, dry=True)
+            bp = dict(REPORT["board"])
+        total = plan_writes(pplan, to_create, new_items, bp)
+    finally:
+        REPORT.clear()
+        REPORT.update(snapshot)
+    PROGRESS.set_total((REPORT.get("writes_sent") or 0) + total)
     check_secrets([p["name"] + " " + p["description"] for p in to_create], secrets,
                   "a Gitea label")
     for pl in to_create:
@@ -2067,7 +2243,7 @@ def sync(args, env) -> None:
                          {(c["kind"], c["id"], k) for c in it["comments"]
                           for k, _ in enumerate(comment_parts(ctx, it, c, rid))})
         table[it["n"]] = n
-        print(f"  imported Gitea #{it['n']} as GitHub #{n}", file=sys.stderr)
+        say(f"  imported Gitea #{it['n']} as GitHub #{n}")
 
     # Re-read GitHub, then bring every mirrored item level (forward
     # references, edits, new comments, state, labels, lock, deletions).
@@ -2126,9 +2302,9 @@ def wait_for_imports(gh: GitHub, target, me_id, owner, repo, imported, sent) -> 
         if lag_waited + LIST_LAG_WAIT_S > LIST_LAG_MAX_S:
             die(f"GitHub has imported Gitea #{gn} as #{num} but does not list {what} "
                 f"yet{more}; wait a few minutes, then run again")
-        print(f"  GitHub has imported Gitea #{gn} as #{num} but does not list {what} "
-              f"yet{more}; reading again in {LIST_LAG_WAIT_S} s", file=sys.stderr)
-        time.sleep(1 if _TEST_FAST else LIST_LAG_WAIT_S)
+        say(f"  GitHub has imported Gitea #{gn} as #{num} but does not list {what} "
+            f"yet{more}; reading again in {LIST_LAG_WAIT_S} s")
+        _wait(LIST_LAG_WAIT_S, "GitHub's listing lags behind the imports")
         lag_waited += LIST_LAG_WAIT_S
 
 
@@ -3025,9 +3201,9 @@ def board_apply(gh: GitHub, state, owner, repo, target, wanted_numbers, node_of,
         if dry or lag_waited + LIST_LAG_WAIT_S > LIST_LAG_MAX_S:
             die(f"GitHub does not list {len(unlisted)} new project item(s) yet; run again "
                 f"shortly to put them in order")
-        print(f"  GitHub does not list {len(unlisted)} new project item(s) yet; reading "
-              f"the board again in {LIST_LAG_WAIT_S} s", file=sys.stderr)
-        time.sleep(1 if _TEST_FAST else LIST_LAG_WAIT_S)
+        say(f"  GitHub does not list {len(unlisted)} new project item(s) yet; reading "
+            f"the board again in {LIST_LAG_WAIT_S} s")
+        _wait(LIST_LAG_WAIT_S, "GitHub's board lags behind the new items")
         lag_waited += LIST_LAG_WAIT_S
         cur = read_board(gh, pid)
     moves = plan_moves([i["id"] for i in cur["items"]], order)
@@ -3529,6 +3705,7 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     REPORT["command"] = "remove" if args.remove else "sync"
     REPORT["apply"] = bool(args.apply)
+    PROGRESS.start()
     started = time.time()
     rc = 0
     env = None
@@ -3539,16 +3716,19 @@ def main(argv=None) -> int:
         else:
             sync(args, env)
     except SyncError as e:
+        PROGRESS.end()
         REPORT["error"] = str(e)
         print(f"rs-sync: {e}", file=sys.stderr)
         rc = 1
     except KeyboardInterrupt:
         # Ctrl-C reaches a running git child too (one process group), and git
         # cleans up its own lock files; this only replaces the traceback.
+        PROGRESS.end()
         REPORT["error"] = "interrupted"
         print("rs-sync: interrupted", file=sys.stderr)
         rc = 130
     except Exception as e:      # a defect: say so, keep the report
+        PROGRESS.end()
         # The same secrets sync() keeps out of everything it sends.
         secrets = [env["RS_SYNC_GITHUB_TOKEN"]] if env else []
         try:
@@ -3559,6 +3739,7 @@ def main(argv=None) -> int:
         sys.stderr.write(_safe(traceback.format_exc(), *secrets))
         rc = 1
     REPORT["seconds"] = round(time.time() - started, 1)
+    PROGRESS.end()
     try:
         print(summary(REPORT))
     except Exception as e:      # a defect in the summary: keep the report and the advice
