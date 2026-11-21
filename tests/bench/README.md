@@ -73,4 +73,6 @@ remembering it (probes keep their tools and the data); its tokens and time
 tell the two apart. An interruption check whose kill came after the task had
 finished scores nothing: there was nothing to resume. A turn the model never
 answered (an API refusal, a sign-in problem) stops that eval, and the table
-marks it FAILED with the error the agent logged.
+marks it FAILED with the error the agent logged. So does a session turn that
+does not finish within `--turn-timeout`: a hung session is shown, not scored
+around, and the cost shown for it stops at the timeout.

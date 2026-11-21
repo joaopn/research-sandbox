@@ -517,6 +517,25 @@ class Bench:
                             + "; the screen ends: " + screen)
             raise ArmFailed(rec)
 
+    def finish_turn(self, arm, c, name, rec, m, budget: dict) -> None:
+        """After a session turn: stop on no answer; count its tokens; and stop
+        the eval when the turn did not hand back within --turn-timeout (a hung
+        session the table must show as FAILED, never score around). The
+        timeout is reported even when the same tokens put the eval over its
+        cap: they are counted, the hang is the reason shown."""
+        self.no_answer(arm, c, name, rec, m)
+        if m.get("handed_back"):
+            self.spend(budget, m["usage"])
+            return
+        pane = self.tmux(c, "capture-pane", "-p", "-t", name).stdout
+        rec["error"] = (f"a turn did not finish within --turn-timeout ({self.a.turn_timeout} s); "
+                        "the screen ends: " + screen_tail(pane))
+        try:
+            self.spend(budget, m["usage"])
+        except OverBudget:
+            pass
+        raise ArmFailed(rec)
+
     def logged_error(self, c, arm, before: dict) -> str:
         """The last API error the agent wrote during this turn (Claude Code:
         an isApiErrorMessage entry; pi: an errorMessage), read from its own
@@ -589,8 +608,7 @@ class Bench:
                     break
                 m = {"i": i, **self.turn(arm, p, c, name, msg)}
                 rec["messages"].append(m)
-                self.no_answer(arm, c, name, rec, m)
-                self.spend(budget, m["usage"])
+                self.finish_turn(arm, c, name, rec, m, budget)
             # the consolidation starts at the session's end event and can be
             # done before the next line runs: count from before the end (for a
             # killed session, from before its last message: the kill is its end)
@@ -598,8 +616,7 @@ class Bench:
             if session["end"] == "exit":
                 if ARMS[arm].get("log"):
                     rec["log"] = self.turn(arm, p, c, name, "/log")   # the research flow's own memory
-                    self.no_answer(arm, c, name, rec, rec["log"])
-                    self.spend(budget, rec["log"]["usage"])
+                    self.finish_turn(arm, c, name, rec, rec["log"], budget)
                     before_end = self.transcripts(c, arm)
                 if ARMS[arm]["agent"] == "pi":
                     self.tmux(c, "send-keys", "-t", name, "C-d")
