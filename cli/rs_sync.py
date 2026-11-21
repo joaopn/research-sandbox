@@ -25,7 +25,8 @@ What goes over, one way (Gitea -> GitHub):
   * every mirrored title starts with "[rs-sync] ", every mirrored item
     carries the label "rs-sync", and each issue and PR record opens with a
     line saying it was mirrored with rs-sync (RS_SYNC_HEADER=off drops it);
-  * the Gitea labels the mirrored items carry, each tagged " (rs-sync)";
+  * the Gitea labels the mirrored items carry, each tagged " (rs-sync)"
+    (a label with no description gets "(rs-sync)");
     a label of the same name (any case) already on GitHub that rs-sync did
     not make is used as it is: never changed, never deleted;
   * the fork's wiki: the GitHub wiki's tree is replaced by the converted Gitea
@@ -1550,8 +1551,24 @@ def label_payloads(gt_labels, wanted) -> dict:
         if len(desc) > room:
             desc = desc[:room - 1] + "…"
             REPORT["label_descriptions_cut"] = REPORT.get("label_descriptions_cut", 0) + 1
-        out[name] = {"name": name, "color": color, "description": desc + LABEL_TAG}
+        out[name] = {"name": name, "color": color, "description": tagged(desc)}
     return out
+
+
+def tagged(desc: str) -> str:
+    """A label description with rs-sync's tag. An empty description gets the
+    tag without its leading space: GitHub trims a description, so " (rs-sync)"
+    would be stored as "(rs-sync)" anyway (measured on a real mirror)."""
+    return desc + LABEL_TAG if desc else LABEL_TAG.strip()
+
+
+def made_by_rs_sync(label) -> bool:
+    """Whether a GitHub label carries rs-sync's tag: a description of exactly
+    "(rs-sync)" (an empty Gitea description, as GitHub stores it) or ending in
+    " (rs-sync)". This one test decides both which labels the sync reuses as a
+    person's and which ones --remove deletes."""
+    d = label.get("description") or ""
+    return d == LABEL_TAG.strip() or d.endswith(LABEL_TAG)
 
 
 def label_plan(gt_labels, gh_labels, items) -> tuple:
@@ -1569,7 +1586,7 @@ def label_plan(gt_labels, gh_labels, items) -> tuple:
             cur = on_gh.get(name.lower())
             if cur is not None:
                 name = cur["name"]
-                if not (cur.get("description") or "").endswith(LABEL_TAG):
+                if not made_by_rs_sync(cur):
                     reused.add(name)
             if name.lower() not in seen:
                 seen.add(name.lower())
@@ -2737,7 +2754,7 @@ def remove(args, env) -> None:
             for l in i.get("labels") or []:
                 remaining_labels.add(l["name"].lower())
     labels = [l for l in gh.all(f"{base}/labels")
-              if (l.get("description") or "").endswith(LABEL_TAG)
+              if made_by_rs_sync(l)
               and l["name"].lower() not in remaining_labels]
     REPORT["remove"]["labels"] = [l["name"] for l in labels]
     REPORT["remove"]["projects"] = [p.get("number") for p in projects]
