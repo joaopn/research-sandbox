@@ -436,7 +436,9 @@ const state = {
     explainIndex: null,      // string[] of workflows with a rendered Explain doc (/static/explain/index.json); null = unfetched
     workingModes: null,      // [{id, label, description, subagents}] from /broker/working-modes; null = unfetched or failed (workingModesError says why)
     workingModesError: "",
-    modelCatalog: null,      // { efforts, models, defaults, types } from /broker/models; null = unfetched. The webui image has no `models/` (it sits outside the ./webui build context), so this relay is the only source — and every picker pre-selects from its `defaults`, the same ones the verbs fall back to, so browser and CLI cannot diverge.
+    testPolicies: null,      // [{id, label, description}] from /broker/test-policies; null = unfetched or failed (testPoliciesError says why)
+    testPoliciesError: "",
+    modelCatalog: null,     // { efforts, models, defaults, types } from /broker/models; null = unfetched. The webui image has no `models/` (it sits outside the ./webui build context), so this relay is the only source — and every picker pre-selects from its `defaults`, the same ones the verbs fall back to, so browser and CLI cannot diverge.
     activeService: null,     // string | null
     serviceRegistry: null,   // { [serviceId]: spec } from /services
     projectServices: {},     // { [projectName]: { [serviceId]: spec } }
@@ -9423,6 +9425,99 @@ function harnessModeSwitch(onChange, initial) {
     return { node, value: () => mode };
 }
 
+// The test policy — dev projects and dev boxes, beside the working mode: how
+// much testing a session owes for every change. The policies are RS's catalog,
+// read through GET /broker/test-policies: each policy's id, label and
+// description. Its own read, apart from the working modes, so either can fail
+// alone. Every surface that draws the switch awaits it first.
+async function ensureTestPolicies() {
+    if (state.testPolicies) return state.testPolicies;
+    const failed = "RS's test policies could not be loaded.";
+    try {
+        const res = await fetch("/broker/test-policies");
+        const body = await res.json().catch(() => null);
+        if (res.ok && body && body.ok && body.result && Array.isArray(body.result.policies)) {
+            state.testPolicies = body.result.policies;
+            state.testPoliciesError = "";
+            return state.testPolicies;
+        }
+        // A broken catalog's own message says what is wrong; anything else (a
+        // broker that predates the read, a transport failure) is one plain line.
+        state.testPoliciesError = body && body.ok === false && body.error
+            && body.error.kind === "validation" && body.error.message
+            ? body.error.message : failed;
+    } catch (e) {
+        state.testPoliciesError = failed;
+    }
+    return null;
+}
+
+// The policy a session is on when none is set (RS's catalog lists it first).
+// It is never sent: a create leaves the policy unset, and a ⚙ change back to
+// it is a reset.
+const TEST_POLICY_DEFAULT = "light";
+
+// One policy's catalog entry (null for a policy RS does not list).
+function testPolicySpec(id) {
+    return (state.testPolicies || []).find((p) => p && p.id === id) || null;
+}
+
+// The switch: one card per catalog policy, Light first and selected. onChange
+// (optional) runs after every change and once at build. `initial` (the ⚙
+// boxes: the recorded policy) is selected; a recorded policy the catalog does
+// not list gets its own card, never Light, so an unrelated Apply can never
+// reset it. Without the catalog there are no cards: the hint says why and
+// what follows (a create surface starts on Light; a ⚙ box keeps the recorded
+// policy), and value() keeps that policy, so nothing about it is sent.
+function testPolicySwitch(onChange, initial) {
+    const creating = initial === undefined;
+    const keep = initial || TEST_POLICY_DEFAULT;
+    const specs = (state.testPolicies || []).map((p) => [p.id, p.label, p.description]);
+    if (!specs.length) {
+        const node = el("div", { class: "field harness-mode test-policy" }, [
+            el("label", {}, ["Test policy"]),
+            el("div", { class: "hint" }, [
+                (state.testPoliciesError || "RS's test policies could not be loaded.") +
+                (creating ? " New sessions start on the light test policy."
+                          : " The test policy stays as it is."),
+            ]),
+        ]);
+        if (onChange) onChange(keep);
+        return { node, value: () => keep };
+    }
+    if (!specs.some((sp) => sp[0] === keep)) {
+        specs.push([keep, keep, "A test policy this RS does not list; it is kept until you pick another."]);
+    }
+    let policy = keep;
+    const hint = el("div", { class: "hint" });
+    const cards = specs.map(([value, label]) => {
+        const card = el("div", { class: "box-opt-card test-policy-card" },
+                        [el("span", { class: "box-opt-name" }, [label])]);
+        card.onclick = () => { policy = value; sync(); };
+        return { value, card };
+    });
+    const sync = () => {
+        cards.forEach((c) => c.card.classList.toggle("selected", c.value === policy));
+        hint.textContent = (specs.find((s) => s[0] === policy) || [])[2] || "";
+        if (onChange) onChange(policy);
+    };
+    const node = el("div", { class: "field harness-mode test-policy" }, [
+        el("label", {}, ["Test policy"]),
+        el("div", { class: "box-opt-cards" }, cards.map((c) => c.card)),
+        hint,
+    ]);
+    sync();
+    return { node, value: () => policy };
+}
+
+// What a create surface sends for the test policy: nothing for the default (a
+// new project or box with no policy set is on it), the chosen id otherwise.
+function testPolicyCreateField(out, sw) {
+    const policy = sw ? sw.value() : TEST_POLICY_DEFAULT;
+    if (policy !== TEST_POLICY_DEFAULT) out.test_policy = policy;
+    return out;
+}
+
 // What the Doer/Checker rows' hint says about the roles the chosen mode uses.
 function harnessRolesHint(roles) {
     const doer = roles.includes("doer"), checker = roles.includes("checker");
@@ -9839,6 +9934,9 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
         }
     };
     const harnessSwitch = isDev ? harnessModeSwitch(syncHarnessRows) : null;
+    // The test policy sits directly under the working mode, on the same
+    // workflows.
+    const policySwitch = isDev ? testPolicySwitch(null) : null;
     if (harnessClaude) claudePanel.appendChild(harnessClaude.node);
     if (harnessPi) piPanel.appendChild(harnessPi.node);
     syncHarnessRows(harnessSwitch ? harnessSwitch.value() : "none");
@@ -9909,6 +10007,7 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             el("div", { class: "box-opt-cards agent-badges" }, agentChecks.map((c) => c.card)),
         ]),
         harnessSwitch ? harnessSwitch.node : null,
+        policySwitch ? policySwitch.node : null,
         agentTabsRow,
         agentPanelsWrap,
         agentsHint,
@@ -9934,6 +10033,8 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             if (agentOn("claude") && harnessClaude) Object.assign(out, harnessClaude.value());
             if (agentOn("pi") && harnessPi) Object.assign(out, harnessPi.value());
         }
+        // The test policy: sent only when it is not Light (DEV_PROJECT_WEBUI_FIELDS).
+        testPolicyCreateField(out, policySwitch);
         return out;
     };
     const repoI = el("input", { type: "text", autocomplete: "off",
@@ -10448,6 +10549,7 @@ async function renderWorkflowsInto(view) {
     // the dialog simply omits the pickers and the backend applies its defaults.
     await ensureModelCatalog();
     await ensureWorkingModes();
+    await ensureTestPolicies();
     renderWorkflowsScreen(view, body.result);
 }
 
@@ -10802,6 +10904,7 @@ async function mgmtBoxAddDialog(project) {
     // `box` default from the project marker, so the picker and the fallback agree.
     const boxCat = await ensureModelCatalog();
     await ensureWorkingModes();
+    await ensureTestPolicies();
     const boxModelP = boxCat
         ? modelPicker(boxCat, "box", "Agent",
                       "The model this box's agent runs on.", {})
@@ -10912,8 +11015,11 @@ async function mgmtBoxAddDialog(project) {
         boxHarnessOtherHint.style.display = pdc && projectAgents.length > 1 ? "" : "none";
     };
     const boxHarnessSwitch = harnessModeSwitch(syncBoxHarnessRows);
+    // The test policy, directly under the working mode and shown with it.
+    const boxPolicySwitch = testPolicySwitch(null);
     const boxHarnessGroup = el("div", { class: "box-opt-group box-harness" }, [
-        boxHarnessSwitch.node, boxHarnessClaude.node, boxHarnessPi.node, boxHarnessOtherHint,
+        boxHarnessSwitch.node, boxPolicySwitch.node, boxHarnessClaude.node, boxHarnessPi.node,
+        boxHarnessOtherHint,
     ]);
     const boxHarnessOn = () => !!(selectedPreset && selectedPreset.dev)
         && agentS.value !== "none" && projectFlavor !== "research";
@@ -11413,6 +11519,8 @@ async function mgmtBoxAddDialog(project) {
                         if (agentS.value === "claude") Object.assign(payload, boxHarnessClaude.value());
                         if (agentS.value === "pi") Object.assign(payload, boxHarnessPi.value());
                     }
+                    // The test policy: sent only when it is not Light.
+                    testPolicyCreateField(payload, boxPolicySwitch);
                 }
                 return fetch(`/broker/project/${encodeURIComponent(project)}/dev-box`, {
                     method: "POST", headers: { "Content-Type": "application/json" },
@@ -13496,6 +13604,7 @@ function appendAgentsBox(box, project, enabled) {
         const d = b.result;
         const cat = await ensureModelCatalog();
         await ensureWorkingModes();
+        await ensureTestPolicies();
         // What can be added: the host's pulled agents (the create form's read).
         let staged = [];
         if (d.kind === "dind") {
@@ -13660,11 +13769,13 @@ function agentsBoxContent(name, d, cat, staged) {
     };
     sw = d.dev ? harnessModeSwitch(() => sync(), harness.harness_mode || "none") : null;
     sync();
+    // The test policy, directly under the working mode, on the same projects.
+    const tp = d.dev ? testPolicySwitch(null, harness.test_policy || TEST_POLICY_DEFAULT) : null;
     // ---- Apply ----
     const apply = el("button", { class: "btn btn-secondary" }, ["Apply"]);
     const applyMsg = el("div", { class: "config-empty" });
     apply.onclick = () => { applyMsg.textContent = agentsBoxApply(name, d, {
-        on, local, isDind, isResearch, harness, sw, claudeRows, piRows, researchPickers,
+        on, local, isDind, isResearch, harness, sw, tp, claudeRows, piRows, researchPickers,
         claude: { model: () => claudeModelI.value.trim(), effort: () => claudeEffortS.value,
                   init: claudeInit },
         pi: { model: () => piModelI.value.trim(), thinking: () => piThinkS.value,
@@ -13687,6 +13798,7 @@ function agentsBoxContent(name, d, cat, staged) {
             ? el("div", { class: "hint" }, ["This project's agents are fixed when it is created."])
             : null,
         sw ? sw.node : null,
+        tp ? tp.node : null,
         tabsRow,
         panelsWrap,
         d.running ? null : el("div", { class: "hint" }, [
@@ -13699,11 +13811,11 @@ function agentsBoxContent(name, d, cat, staged) {
 
 // The ⚙ Box agents section (I33 slice 3, the box half): a box's agent
 // settings after it was added — a Claude box's model and effort (any project),
-// and a dev box's working mode and Doer/Checker models (outside research
-// projects). Same data as the Agents box (its one read); same inline save as
-// ⚙ Box folders. A model change is written into the running box at once; a
-// working-mode change restarts the box fresh; a stopped box takes either when
-// it next starts.
+// and a dev box's working mode, test policy and Doer/Checker models (outside
+// research projects). Same data as the Agents box (its one read); same inline
+// save as ⚙ Box folders. A model change is written into the running box at
+// once; a working-mode or test-policy change restarts the box fresh; a stopped
+// box takes either when it next starts.
 function boxAgentsSection(name, d, cat) {
     const state = d.boxes_state;
     // No boxes to speak of: a project without Docker-in-Docker ("none"), or a
@@ -13798,17 +13910,18 @@ function boxAgentsSection(name, d, cat) {
         rowsWrap, what, status,
         el("div", { class: "config-hint" }, [
             "A box starts from a fresh home whenever it is restarted fresh — at every " +
-            "project start, and when a working-mode, folder or port change restarts it — " +
+            "project start, and when a working-mode, test-policy, folder or port change restarts it — " +
             "so a model picked inside the box with /model lasts until then — unless " +
             "you save it here, which keeps what this section shows."]));
     return section;
 }
 
 // One box's controls: Claude's model + effort (a Claude box), the working-mode
-// switch and its Doer/Checker rows (a dev box outside research).
+// switch, the test-policy switch and the Doer/Checker rows (a dev box outside
+// research).
 function boxAgentsRows(b, cat, onChange) {
     const parts = [];
-    let modelI = null, effortS = null, sw = null, claudeRows = null, piRows = null;
+    let modelI = null, effortS = null, sw = null, tp = null, claudeRows = null, piRows = null;
     if (b.agent === "claude") {
         const init = b.claude || { model: "", effort: "" };
         const listId = "box-agents-models-" + (++agentsBoxSeq);
@@ -13860,7 +13973,10 @@ function boxAgentsRows(b, cat, onChange) {
         // `sw` is assigned after syncRows exists (the switch calls back while
         // it is built — the TDZ lesson of the Agents box).
         sw = harnessModeSwitch(() => syncRows(), h.harness_mode || "none");
-        parts.push(sw.node, rows ? rows.node : null);
+        // The test policy, directly under the working mode; a change of it
+        // re-runs the box too, so the line under the controls follows it.
+        tp = testPolicySwitch(() => onChange(), h.test_policy || TEST_POLICY_DEFAULT);
+        parts.push(sw.node, tp.node, rows ? rows.node : null);
         syncRows();
     }
     return {
@@ -13868,6 +13984,7 @@ function boxAgentsRows(b, cat, onChange) {
         model: () => (modelI ? modelI.value.trim() : null),
         effort: () => (effortS ? effortS.value : null),
         mode: () => (sw ? sw.value() : null),
+        policy: () => (tp ? tp.value() : null),
         rowsFields: () => (sw && harnessModeRoles(sw.value()).length
             ? Object.assign({}, claudeRows ? claudeRows.fields() : {}, piRows ? piRows.fields() : {})
             : {}),
@@ -13920,6 +14037,15 @@ function boxAgentsPayload(b, cur) {
                 if (now) { payload[k] = now; nh[k] = now; } else { reset.push(k); delete nh[k]; }
             }
         });
+        // The test policy re-runs the box like the mode does: the chosen id
+        // when it changed, a change back to Light as a reset.
+        const policy = cur.policy();
+        const wasPolicy = h.test_policy || TEST_POLICY_DEFAULT;
+        if (policy !== null && policy !== wasPolicy) {
+            modeChanged = true;
+            if (policy === TEST_POLICY_DEFAULT) { reset.push("test_policy"); delete nh.test_policy; }
+            else { payload.test_policy = policy; nh.test_policy = policy; }
+        }
         if (modeChanged) next.harness = nh;
     }
     if (reset.length) payload.reset = reset;
@@ -14010,6 +14136,20 @@ function agentsBoxApply(name, d, f) {
             }
         }
     }
+    // The test policy, like the mode: the chosen id when it changed, a change
+    // back to Light as a reset. Without the catalog the switch keeps the
+    // recorded policy, so nothing is sent.
+    let policyChanged = false;
+    if (f.tp) {
+        const policy = f.tp.value();
+        const was = f.harness.test_policy || TEST_POLICY_DEFAULT;
+        if (policy !== was) {
+            policyChanged = true;
+            if (policy === TEST_POLICY_DEFAULT) reset.push("test_policy"); else payload.test_policy = policy;
+            const spec = testPolicySpec(policy);
+            lines.push(`Test policy: ${spec ? spec.label : policy}.`);
+        }
+    }
     f.researchPickers.forEach(([ct, p]) => {
         const v = p.value();
         if (v.model) payload[ct + "_model"] = v.model;
@@ -14050,7 +14190,9 @@ function agentsBoxApply(name, d, f) {
                 d.running
                     ? "Each agent's next session uses its new settings; a session running now " +
                       "keeps them until it is restarted (switch the working mode in a running " +
-                      "session with /rs-mode, or /skill:rs-mode in pi)."
+                      "session with /rs-mode, or /skill:rs-mode in pi" +
+                      (policyChanged ? ", and the test policy with /rs-test, or /skill:rs-test in pi" : "") +
+                      ")."
                     : "The project is stopped: the change is saved and applied at its next " +
                       "start; nothing is started.",
             ]),

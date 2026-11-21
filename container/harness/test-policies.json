@@ -1,0 +1,14 @@
+{
+  "policies": [
+    {
+      "id": "light",
+      "label": "Light",
+      "description": "The agent verifies each change by running it and adds tests only where you or the approved plan ask for them. For a young project."
+    },
+    {
+      "id": "full",
+      "label": "Full",
+      "description": "Every feature ships its tests, every bug fix a reproduction, and a new test counts only once it was seen failing. For a mature project."
+    }
+  ]
+}

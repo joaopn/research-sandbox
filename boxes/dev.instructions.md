@@ -455,13 +455,16 @@ pages you changed in the reply that reports the landing or the pass.
 <!-- rs-part: work -->
 ## Verification
 
-- Run tests before pushing. If tests exist, run them.
-- If you add a feature, add or update tests for it.
-- Run linters/formatters if the project configures them.
-- Do not push code you haven't verified.
+- Run what you changed before pushing, and say what you ran and what it showed. Do not push
+  code you haven't verified.
+- Run the project's tests if it has them, and its linters/formatters if it configures them.
+- Add tests where the maintainer, the approved plan or your brief asks for them.
+- When fixing a bug, show it happening before the fix and gone after it.
 
-When fixing a bug, write a reproduction script first (exits non-zero while the bug exists,
-zero when fixed), and verify it on both the base branch and your branch before pushing.
+<!-- rs-part: session -->
+Beyond that the project's test policy decides what tests a change owes: light, which asks
+for none, unless RS's test-policy rule (`~/.claude/rules/rs-tests.md`) or the maintainer says
+full.
 
 <!-- rs-part: all -->
 ## What You Have Access To
@@ -613,7 +616,7 @@ Status: <draft | checked | awaiting the go | in progress | shipped in PR #N>. Ba
 <The commits or PRs, each with what it changes and where. File and line anchors belong here.>
 
 ## Verification
-<Each test, what it proves, and how it was seen failing without the change.>
+<How the change will be verified: what is run and what it should show. Under the full test policy: each test, what it proves, and how it was seen failing without the change.>
 
 ## Known residuals
 <What stays imperfect after this lands, stated once each.>

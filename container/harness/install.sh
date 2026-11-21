@@ -14,14 +14,20 @@
 #     ~/.claude/skills/rs-project-instructions/SKILL.md and
 #       rs-workspace-instructions/SKILL.md — links, made when a role can be lean
 #     ~/.claude/skills/harness/{SKILL.md,modes/<mode>.md for every staged mode}
+#     ~/.claude/skills/rs-test/{SKILL.md,policies/<policy>.md for every staged
+#       test policy} — the test-policy switch
 #   pi (pi in RS_HARNESS_AGENTS), under pi's agent dir:
-#     agents/doer.md, agents/checker.md, skills/harness/{…same…}
+#     agents/doer.md, agents/checker.md, skills/harness/{…same…},
+#     skills/rs-test/{…same…}
 #     and beside RS's rules extension, ~/.local/share/pi-agent/rs/roles/<role>.md
 #       — a link to the role's part, which the extension reads for that child
-#   either (any agent): ~/.claude/rules/rs-harness.md — the standing mode.
+#   either (any agent): ~/.claude/rules/rs-harness.md — the standing mode, and
+#     ~/.claude/rules/rs-tests.md — the standing test policy, written for a
+#     policy other than light whatever the mode.
 #     Claude Code loads every ~/.claude/rules/*.md at session start; pi loads
 #     the same folder through RS's rules extension (rs-rules). Mode none removes
-#     that one file, by name; nothing else is ever removed.
+#     rs-harness.md and the light test policy removes rs-tests.md, each that one
+#     file, by name; nothing else is ever removed.
 #
 # Inputs (environment; each re-checked here against the charset the host
 # validated — a value that fails is dropped with a warning, never used):
@@ -32,6 +38,9 @@
 #   RS_HARNESS_MODE                   none, or a mode this staged suite carries
 #                                     (modes/<mode>.md; the host generated them
 #                                     from RS's catalog, modes.json) — else none
+#   RS_HARNESS_TEST_POLICY            light, or a test policy this staged suite
+#                                     carries (policies/<policy>.md, from RS's
+#                                     catalog, test-policies.json) — else light
 #   RS_HARNESS_DOER_MODEL             Claude tier for doer (empty: the session's)
 #   RS_HARNESS_CHECKER_MODEL          Claude tier for checker
 #   RS_HARNESS_PI_DOER_MODEL          pi provider/model for doer (empty: pi's default)
@@ -135,8 +144,8 @@ checked() {
 
 # Every source must be readable before anything is written: a missing one would
 # otherwise leave a frontmatter-only agent file that reads as a success. A
-# mode's own rule body is checked when the mode is chosen, below.
-for f in agents/doer.md agents/checker.md skill/SKILL.md modes/LIST; do
+# mode's own rule body, and a test policy's, is checked when it is chosen, below.
+for f in agents/doer.md agents/checker.md skill/SKILL.md modes/LIST skill-test/SKILL.md policies/LIST; do
     if [ ! -r "$SRC/$f" ]; then
         warn "the shipped file $f is missing; nothing installed"
         echo RS_HARNESS_INSTALL_FAILED
@@ -153,6 +162,14 @@ case "$MODE" in
     none) ;;
     [a-z]*[!a-z0-9-]*|*--*|*-|[!a-z]*) warn "unknown working mode; using none"; MODE=none ;;
     *) [ -r "$SRC/modes/$MODE.md" ] || { warn "unknown working mode; using none"; MODE=none; } ;;
+esac
+# The test policy: light (the default: no rule), or one whose rule body this
+# suite carries — checked the same way as the mode, characters first.
+POLICY=${RS_HARNESS_TEST_POLICY:-light}
+case "$POLICY" in
+    light) ;;
+    [a-z]*[!a-z0-9-]*|*--*|*-|[!a-z]*) warn "unknown test policy; using light"; POLICY=light ;;
+    *) [ -r "$SRC/policies/$POLICY.md" ] || { warn "unknown test policy; using light"; POLICY=light; } ;;
 esac
 DOER_MODEL=$(checked RS_HARNESS_DOER_MODEL "${RS_HARNESS_DOER_MODEL:-}" claude_tier_ok)
 CHECKER_MODEL=$(checked RS_HARNESS_CHECKER_MODEL "${RS_HARNESS_CHECKER_MODEL:-}" claude_tier_ok)
@@ -181,6 +198,16 @@ skill() {
     for m in "$SRC"/modes/*.md; do
         [ -r "$m" ] || continue
         put "$1/modes/${m##*/}" < "$m" || FAILED=1
+    done
+}
+
+# skill_test DIR — the test-policy switch skill (rs-test) with its own copy of
+# every staged test policy's rule body.
+skill_test() {
+    put "$1/SKILL.md" < "$SRC/skill-test/SKILL.md" || FAILED=1
+    for p in "$SRC"/policies/*.md; do
+        [ -r "$p" ] || continue
+        put "$1/policies/${p##*/}" < "$p" || FAILED=1
     done
 }
 
@@ -248,6 +275,7 @@ if [ "$HAS_CLAUDE" = 1 ]; then
         cat "$SRC/agents/checker.md"
     } | put "$HOME/.claude/agents/checker.md" || FAILED=1
     skill "$HOME/.claude/skills/harness"
+    skill_test "$HOME/.claude/skills/rs-test"
 fi
 
 if [ "$HAS_PI" = 1 ]; then
@@ -272,6 +300,7 @@ if [ "$HAS_PI" = 1 ]; then
         cat "$SRC/agents/checker.md"
     } | put "$PI_DIR/agents/checker.md" || FAILED=1
     skill "$PI_DIR/skills/harness"
+    skill_test "$PI_DIR/skills/rs-test"
     # The role parts for RS's rules extension, beside it (a folder pi never
     # scans). The extension builds a doer's or checker's section from the link
     # when it reads as a non-empty file, so the link is made only where the
@@ -308,6 +337,23 @@ if [ "$HAS_CLAUDE" = 1 ] || [ "$HAS_PI" = 1 ]; then
                 "Where the project's own instructions prescribe a different way of working, the project's instructions win. When such a difference decides something in the work in front of you and the project's instructions do not record the user's ruling on that difference, raise it with the user as a question; until they answer, do everything that does not depend on it and hold the part that does. The user can switch this session's mode with the \`rs-mode\` skill: \`/rs-mode <mode>\` in Claude Code, \`/skill:rs-mode <mode>\` in pi ($MODE_LIST)." ''
             cat "$SRC/modes/$MODE.md"
         } | put "$RULE" || FAILED=1
+    fi
+    # The test policy's rule, whatever the mode: light removes that one file,
+    # by name; any other policy writes it.
+    POLICY_LIST=$(head -n 1 "$SRC/policies/LIST")
+    TEST_RULE="$HOME/.claude/rules/rs-tests.md"
+    if [ "$POLICY" = light ]; then
+        if [ -e "$TEST_RULE" ] && ! rm -f "$TEST_RULE"; then
+            warn "could not remove $TEST_RULE"
+            FAILED=1
+        fi
+    else
+        {
+            printf '%s\n' "# Test policy: $POLICY (set by RS for this project)" '' \
+                'This sets how much testing the session that talks with the user owes for every change. If you were launched as a subagent - `doer`, `checker` or any other child agent - ignore this file: your brief says what to test.' '' \
+                "Where the project's own instructions prescribe a different way of working, the project's instructions win. When such a difference decides something in the work in front of you and the project's instructions do not record the user's ruling on that difference, raise it with the user as a question; until they answer, do everything that does not depend on it and hold the part that does. The user can switch this session's test policy with the \`rs-test\` skill: \`/rs-test <policy>\` in Claude Code, \`/skill:rs-test <policy>\` in pi ($POLICY_LIST)." ''
+            cat "$SRC/policies/$POLICY.md"
+        } | put "$TEST_RULE" || FAILED=1
     fi
 fi
 

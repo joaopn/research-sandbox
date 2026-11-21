@@ -2442,8 +2442,9 @@ def _link_box_commands(cname: str, tools: "tuple[str, ...]") -> None:
 # into; absent on research, where a box therefore installs nothing.
 HARNESS_INSTALLER = f"{AGENT_DIST_MOUNT}/rs-harness/install.sh"
 HARNESS_FAILED_SENTINEL = "RS_HARNESS_INSTALL_FAILED"
-# The box's working mode and doer/checker models: field → the installer's
-# environment variable — MIRROR of rscore.HARNESS_ENV (pytest-pinned equal).
+# The box's working mode, test policy and doer/checker models: field → the
+# installer's environment variable — MIRROR of rscore.HARNESS_ENV (pytest-pinned
+# equal).
 # Stored on the box entry, passed as container environment at every run (the
 # installer exec and every later refresh exec inherit it).
 HARNESS_ENV = {
@@ -2454,6 +2455,7 @@ HARNESS_ENV = {
     "pi_doer_thinking": "RS_HARNESS_PI_DOER_THINKING",
     "pi_checker_model": "RS_HARNESS_PI_CHECKER_MODEL",
     "pi_checker_thinking": "RS_HARNESS_PI_CHECKER_THINKING",
+    "test_policy": "RS_HARNESS_TEST_POLICY",
 }
 # The working mode is checked by its characters only — MIRROR of
 # rscore.HARNESS_MODE_ID_RE and install.sh's `case` (pytest-pinned): the host
@@ -2473,7 +2475,12 @@ _HARNESS_SHAPES = {
     "pi_doer_thinking": re.compile(r"^(off|minimal|low|medium|high|xhigh|max)$"),
     "pi_checker_model": re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._:~@+/-]+$"),
     "pi_checker_thinking": re.compile(r"^(off|minimal|low|medium|high|xhigh|max)$"),
+    # The test policy, like the mode: its characters only.
+    "test_policy": _HARNESS_MODE_ID_RE,
 }
+# The default test policy — MIRROR of rscore.TEST_POLICY_DEFAULT: the unset
+# state, skipped like mode none.
+TEST_POLICY_DEFAULT = "light"
 
 
 def _box_harness(args: argparse.Namespace, agent: str) -> dict:
@@ -2483,13 +2490,15 @@ def _box_harness(args: argparse.Namespace, agent: str) -> dict:
     out = {}
     for f in HARNESS_ENV:
         v = (getattr(args, f, "") or "").strip()
-        if not v or (f == "harness_mode" and v == "none"):   # none = unset, as on the host
+        # none and the default test policy = unset, as on the host
+        if not v or (f == "harness_mode" and v == "none") \
+                or (f == "test_policy" and v == TEST_POLICY_DEFAULT):
             continue
         if not _HARNESS_SHAPES[f].fullmatch(v):
             die(f"invalid --{f.replace('_', '-')} value {v!r}")
         out[f] = v
     if out and agent == "none":
-        die("a box without an agent has no working mode")
+        die("a box without an agent has no working mode or test policy")
     if (out.get("doer_model") or out.get("checker_model")) and agent != "claude":
         die("--doer-model/--checker-model apply to a claude box")
     if any(out.get(f) for f in ("pi_doer_model", "pi_doer_thinking",
@@ -2762,14 +2771,16 @@ def _status_bar_warnings(states: "dict | str", on: bool) -> list[dict]:
 
 def _harness_env_pairs(harness: "dict | None", agent: str) -> list[tuple[str, str]]:
     """The RS_HARNESS_* variables a box runs with, from its entry: set values
-    only, `none` read as unset, nothing for an agent-less box. ONE helper for
-    what _run_box emits and what a start compares against."""
+    only, `none` and the default test policy read as unset, nothing for an
+    agent-less box. ONE helper for what _run_box emits and what a start
+    compares against."""
     if agent == "none" or not isinstance(harness, dict):
         return []
     out = []
     for f, var in HARNESS_ENV.items():
         v = harness.get(f)
-        if not isinstance(v, str) or not v or (f == "harness_mode" and v == "none"):
+        if not isinstance(v, str) or not v or (f == "harness_mode" and v == "none") \
+                or (f == "test_policy" and v == TEST_POLICY_DEFAULT):
             continue
         out.append((var, v))
     return out
@@ -4259,10 +4270,11 @@ def _own_folder_leftovers(folder: Path) -> list[str]:
 
 
 def cmd_settings(args: argparse.Namespace) -> None:
-    """Replace a box's agent settings — the Claude model and effort and the
-    working-mode fields — with exactly the values given (the host resolves and
-    checks the full set; an empty value means none). A working-mode change
-    re-runs a running box fresh (that environment is fixed at run); a
+    """Replace a box's agent settings — the Claude model and effort, the
+    working-mode fields and the test policy — with exactly the values given
+    (the host resolves and checks the full set; an empty value means none). A
+    working-mode or test-policy change re-runs a running box fresh (that
+    environment is fixed at run); a
     model/effort-only change is written into the running box's settings file
     (no restart); a box that is not running is only saved (its next start
     re-runs it for a mode change, or writes the model). JSON out; warnings are
@@ -4670,7 +4682,9 @@ def build_parser() -> argparse.ArgumentParser:
                      ("pi_doer_model", "pi provider/model for the doer subagent (a pi box)"),
                      ("pi_doer_thinking", "pi thinking level for the doer subagent"),
                      ("pi_checker_model", "pi provider/model for the checker subagent"),
-                     ("pi_checker_thinking", "pi thinking level for the checker subagent")):
+                     ("pi_checker_thinking", "pi thinking level for the checker subagent"),
+                     ("test_policy", "the test policy this box's agent starts on (one of "
+                                     "RS's test policies; default light)")):
         c.add_argument(f"--{f.replace('_', '-')}", dest=f, default="", help=help_,
                        **({"metavar": HARNESS_MODE_METAVAR} if f == "harness_mode" else {}))
     # Tri-state on purpose (first BooleanOptionalAction in this codebase):
@@ -4799,7 +4813,8 @@ def build_parser() -> argparse.ArgumentParser:
     ac_.set_defaults(func=cmd_activity)
 
     st_ = sub.add_parser("settings", help="replace a box's agent settings (model, "
-                                         "effort, working mode) with the values given")
+                                         "effort, working mode, test policy) with the "
+                                         "values given")
     st_.add_argument("name")
     st_.add_argument("--model", default="", help="the Claude model (empty: Claude's own default)")
     st_.add_argument("--effort", default="", help="the Claude effort (empty: Claude's default)")

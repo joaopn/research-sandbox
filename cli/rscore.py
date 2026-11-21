@@ -639,6 +639,14 @@ _UNSTAGED_MODE_MSG = ("this project's working-mode files do not include this mod
 # A mode recorded earlier that RS's catalog no longer lists: a restart cannot
 # bring it back.
 _RETIRED_MODE_MSG = "RS no longer offers this working mode — pick another one"
+# The test policy's three twins of the refusals above: a box tool without the
+# test-policy flag, a policy RS's catalog no longer lists, and a policy whose
+# rule the project's staged working-mode files lack.
+_OLD_BOX_TOOL_POLICY_MSG = ("this project's box tool predates the test policy — "
+                            "restart the project, then try again")
+_RETIRED_POLICY_MSG = "RS no longer offers this test policy — pick another one"
+_UNSTAGED_POLICY_MSG = ("this project's working-mode files do not include this test "
+                        "policy — restart the project, then try again")
 # The current box tool's `create` help names the working-mode value with this
 # metavar (rs_sandbox.HARNESS_MODE_METAVAR, pytest-pinned equal); a tool from
 # before the mode catalog shows another. No space or hyphen, so argparse's
@@ -1413,6 +1421,7 @@ class CreateRequest:
     pi_doer_thinking: str = ""
     pi_checker_model: str = ""
     pi_checker_thinking: str = ""
+    test_policy: str = ""
     # RS's status bar in the project container's agents (#524): on by
     # default, the New Project Extensions card. In-box (broker-openable).
     status_bar: bool = True
@@ -1790,10 +1799,11 @@ class CreateRequest:
         )
 
 
-# The working mode and RS's doer/checker subagents (I33). One flat field set,
-# the same names in every request, allowlist, marker key and CLI flag, so a
-# lockstep is a name match. The installer (container/harness/install.sh) reads
-# them as these environment variables and re-checks every value itself.
+# The working mode, the test policy and RS's doer/checker subagents (I33). One
+# flat field set, the same names in every request, allowlist, marker key and
+# CLI flag, so a lockstep is a name match. The installer
+# (container/harness/install.sh) reads them as these environment variables and
+# re-checks every value itself.
 #
 # The modes themselves are data: container/harness/modes.json lists them (id,
 # its optional short code for the /rs-mode switch, label, description, the
@@ -1824,6 +1834,7 @@ HARNESS_ENV = {
     "pi_doer_thinking": "RS_HARNESS_PI_DOER_THINKING",
     "pi_checker_model": "RS_HARNESS_PI_CHECKER_MODEL",
     "pi_checker_thinking": "RS_HARNESS_PI_CHECKER_THINKING",
+    "test_policy": "RS_HARNESS_TEST_POLICY",
 }
 HARNESS_FIELDS = tuple(HARNESS_ENV)
 _HARNESS_CLAUDE = ("doer_model", "checker_model")
@@ -1834,6 +1845,7 @@ _HARNESS_LABELS = {
     "checker_model": "Checker model", "pi_doer_model": "pi Doer model",
     "pi_doer_thinking": "pi Doer thinking level", "pi_checker_model": "pi Checker model",
     "pi_checker_thinking": "pi Checker thinking level",
+    "test_policy": "test policy",
 }
 
 
@@ -1931,13 +1943,81 @@ def harness_catalog_public() -> list[dict]:
             for m in harness_catalog()]
 
 
+# The test policy: how much testing a session owes for every change. Its own
+# catalog (container/harness/test-policies.json, read lazily like the modes),
+# the default first. The default is the unset state: nothing recorded, no rule
+# laid; every other policy is a rule body under policies/<id>.md that the
+# installer lays as ~/.claude/rules/rs-tests.md.
+TEST_POLICY_DEFAULT = "light"
+
+
+def harness_test_policies() -> list[dict]:
+    """The test policies from container/harness/test-policies.json, checked: a
+    non-empty list of {id, label, description} in display order, ids unique and
+    matching HARNESS_MODE_ID_RE, TEST_POLICY_DEFAULT first, every other policy
+    a file under policies/. Raises ValidationError naming what is wrong (never a
+    host path)."""
+    def bad(why: str) -> ValidationError:
+        return ValidationError(f"RS's test-policy catalog is broken: {why}")
+    try:
+        raw = (HARNESS_SRC / "test-policies.json").read_bytes()
+    except OSError as e:
+        raise bad(f"test-policies.json cannot be read ({e.strerror or type(e).__name__})")
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError):
+        raise bad("test-policies.json is not valid JSON")
+    policies = data.get("policies") if isinstance(data, dict) else None
+    if not isinstance(policies, list) or not policies:
+        raise bad("test-policies.json has no list of test policies")
+    out: list[dict] = []
+    seen: set[str] = set()
+    for p in policies:
+        if not isinstance(p, dict):
+            raise bad("a test-policy entry is not an object")
+        pid = p.get("id")
+        if not isinstance(pid, str) or not HARNESS_MODE_ID_RE.fullmatch(pid):
+            raise bad(f"test policy id {pid!r} is not lowercase words joined by hyphens")
+        if pid in seen:
+            raise bad(f"test policy {pid!r} is listed twice")
+        seen.add(pid)
+        label, desc = p.get("label"), p.get("description")
+        if not isinstance(label, str) or not label.strip():
+            raise bad(f"test policy {pid!r} has no label")
+        if not isinstance(desc, str) or not desc.strip():
+            raise bad(f"test policy {pid!r} has no description")
+        out.append({"id": pid, "label": label, "description": desc})
+    if out[0]["id"] != TEST_POLICY_DEFAULT:
+        raise bad(f"the first test policy must be {TEST_POLICY_DEFAULT!r}")
+    for p in out[1:]:
+        try:
+            found = (HARNESS_SRC / "policies" / f"{p['id']}.md").is_file()
+        except OSError:
+            found = False
+        if not found:
+            raise bad(f"test policy {p['id']!r} has no rule file")
+    return out
+
+
+def harness_test_policy_ids() -> tuple[str, ...]:
+    """The catalog's test-policy ids, display order (raises like
+    harness_test_policies)."""
+    return tuple(p["id"] for p in harness_test_policies())
+
+
+def harness_test_policies_public() -> list[dict]:
+    """What the webui draws from: each test policy's id, label and description."""
+    return [{k: p[k] for k in ("id", "label", "description")}
+            for p in harness_test_policies()]
+
+
 def _recorded_harness_ok(field: str, value: str) -> bool:
     """A value already RECORDED (a marker or a box record, container-writable)
     is kept when its shape holds — the mode by its characters only, never by
     the catalog, so a changed or broken catalog never drops a recorded mode and
     a writer copying the recorded set never erases one; every other field by
-    _harness_shape as before."""
-    if field == "harness_mode":
+    _harness_shape as before. The test policy is read like the mode."""
+    if field in ("harness_mode", "test_policy"):
         return bool(HARNESS_MODE_ID_RE.fullmatch(value))
     try:
         _harness_shape({field: value})
@@ -1947,9 +2027,10 @@ def _recorded_harness_ok(field: str, value: str) -> bool:
 
 
 def _harness_shape(kw: "dict") -> dict[str, str]:
-    """The seven fields from `kw`, stripped, each shape-checked on its own:
+    """The harness fields from `kw`, stripped, each shape-checked on its own:
     the mode is one of the catalog's (harness_catalog, read only when a mode is
-    set), a Claude model is a catalog tier, a pi
+    set), the test policy one of its catalog's (read only when one other than
+    the default is set), a Claude model is a catalog tier, a pi
     model matches PI_MODEL_RE, a thinking level is one of pi's. Context-free
     (which workflow, which agents) is the caller's: _validated_harness."""
     out: dict[str, str] = {}
@@ -1966,6 +2047,14 @@ def _harness_shape(kw: "dict") -> dict[str, str]:
         ids = harness_mode_ids()
         if out["harness_mode"] not in ids:
             raise ValidationError(f"working mode {out['harness_mode']!r} is not one of "
+                                  f"{', '.join(ids)}")
+    # The default test policy is the unset state, like mode none.
+    if out["test_policy"] == TEST_POLICY_DEFAULT:
+        out["test_policy"] = ""
+    if out["test_policy"]:
+        ids = harness_test_policy_ids()
+        if out["test_policy"] not in ids:
+            raise ValidationError(f"test policy {out['test_policy']!r} is not one of "
                                   f"{', '.join(ids)}")
     if any(out[f] for f in _HARNESS_CLAUDE):
         tiers = [m["alias"] for m in _model_catalog_checked()["models"]]
@@ -1994,7 +2083,8 @@ def _validated_harness(values: dict[str, str], *, dev: bool,
         return values
     if not dev:
         raise ValidationError(
-            "the working mode and the Doer and Checker models are for dev projects and dev boxes")
+            "the working mode, the test policy and the Doer and Checker models are for dev "
+            "projects and dev boxes")
     if any(values[f] for f in _HARNESS_CLAUDE) and DEFAULT_AGENT not in agents:
         raise ValidationError("the Doer and Checker models for Claude need Claude as an agent")
     if any(values[f] for f in _HARNESS_PI) and "pi" not in agents:
@@ -2146,6 +2236,7 @@ class UpdateRequest:
     pi_doer_thinking: str = ""
     pi_checker_model: str = ""
     pi_checker_thinking: str = ""
+    test_policy: str = ""
     reset: tuple[str, ...] = ()
     # RS's status bar in the project container's agents (#524): None =
     # unchanged. Applied live, on a running project only.
@@ -2238,13 +2329,17 @@ class UpdateRequest:
             raise ValidationError(f"pi thinking level {pi_thinking!r} is not one of "
                                   f"{', '.join(PI_THINKING_LEVELS)}")
         raw_mode = kw.get("harness_mode")
+        raw_policy = kw.get("test_policy")
         harness = _harness_shape(kw)
         # On UPDATE an explicit "none" is a request to go back to no mode, not
         # "unchanged" (_harness_shape maps it to "" for create): carry it as a
-        # reset so it is never a silent no-op.
+        # reset so it is never a silent no-op. The default test policy likewise.
         reset = list(dict.fromkeys(_as_tuple(kw.get("reset"))))
         if isinstance(raw_mode, str) and raw_mode.strip() == "none" and "harness_mode" not in reset:
             reset.append("harness_mode")
+        if (isinstance(raw_policy, str) and raw_policy.strip() == TEST_POLICY_DEFAULT
+                and "test_policy" not in reset):
+            reset.append("test_policy")
         for r in reset:
             if r not in UPDATE_RESETTABLE:
                 raise ValidationError(f"{r!r} cannot be reset (resettable: "
@@ -2463,6 +2558,7 @@ class BoxAddRequest:
     pi_doer_thinking: str = ""
     pi_checker_model: str = ""
     pi_checker_thinking: str = ""
+    test_policy: str = ""
     # RS's status bar in the box's agents (#524): on by default.
     status_bar: bool = True
 
@@ -2580,7 +2676,7 @@ class BoxAddRequest:
         if any(harness[f] for f in _HARNESS_PI) and agent != "pi":
             raise ValidationError("the Doer and Checker models for pi apply to a pi box")
         if any(harness.values()) and agent == "none":
-            raise ValidationError("a box without an agent has no working mode")
+            raise ValidationError("a box without an agent has no working mode or test policy")
         return cls(
             project=_require_name(kw.get("project")), name=name, preset=preset,
             agent=agent, editor=bool(kw.get("editor", False)), browser=browser,
@@ -2634,6 +2730,7 @@ class BoxSettingsRequest:
     pi_doer_thinking: str = ""
     pi_checker_model: str = ""
     pi_checker_thinking: str = ""
+    test_policy: str = ""
     reset: tuple[str, ...] = ()
     # RS's status bar in the box's agents (#524): None = unchanged.
     status_bar: bool | None = None
@@ -2660,10 +2757,14 @@ class BoxSettingsRequest:
                 raise ValidationError(f"unknown effort level {vals['effort']!r}; must be one "
                                       f"of {cat['efforts']}")
         raw_mode = kw.get("harness_mode")
+        raw_policy = kw.get("test_policy")
         harness = _harness_shape(kw)
         reset = list(dict.fromkeys(_as_tuple(kw.get("reset"))))
         if isinstance(raw_mode, str) and raw_mode.strip() == "none" and "harness_mode" not in reset:
             reset.append("harness_mode")
+        if (isinstance(raw_policy, str) and raw_policy.strip() == TEST_POLICY_DEFAULT
+                and "test_policy" not in reset):
+            reset.append("test_policy")
         allowed = ("model", "effort", *HARNESS_FIELDS)
         for r in reset:
             if r not in allowed:
@@ -4166,6 +4267,7 @@ class DevBoxProvisionRequest:
     pi_doer_thinking: str = ""
     pi_checker_model: str = ""
     pi_checker_thinking: str = ""
+    test_policy: str = ""
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "DevBoxProvisionRequest":
@@ -4252,6 +4354,7 @@ class DevProjectProvisionRequest:
     pi_doer_thinking: str = ""
     pi_checker_model: str = ""
     pi_checker_thinking: str = ""
+    test_policy: str = ""
     # The project's agent SET. None ⇒ the workflow's preset (a body without the
     # key); an explicit list is validated by the CreateRequest delegation below
     # (known agents, pulled dists, and the dev floor: at least one agent).
@@ -9894,6 +9997,7 @@ def _harness_old_warnings(stdout: "str | None", where: str) -> list[str]:
 # writes anything.
 HARNESS_FILES = ("install.sh", "agents/doer.md", "agents/checker.md")
 HARNESS_SKILL_TEMPLATE = "skill/SKILL.template.md"
+HARNESS_TEST_SKILL_TEMPLATE = "skill-test/SKILL.template.md"
 # Number words for the skill's "one of these three" (a catalog longer than this
 # list reads as digits — no mode count is assumed).
 _COUNT_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven",
@@ -9921,6 +10025,15 @@ def harness_mode_phrase(modes: "Sequence[dict]") -> str:
     return f"{', '.join(names[:-1])} or {names[-1]}"
 
 
+def harness_test_policy_phrase(ids: "Sequence[str]") -> str:
+    """The test policies as one phrase — "light or full" — the ONE join for the
+    rule header (policies/LIST) and the rs-test skill's description."""
+    names = list(ids)
+    if len(names) < 2:
+        return "".join(names)
+    return f"{', '.join(names[:-1])} or {names[-1]}"
+
+
 def harness_subagents_line(subagents: "Sequence[str]") -> str:
     """The line at the top of a mode's rule body naming the RS subagents it
     uses — the ones its pieces may launch (implement-yourself refers to it)."""
@@ -9937,7 +10050,9 @@ def harness_suite_files() -> dict[str, bytes]:
     its pieces as bytes, a newline between each — a blank line, as every piece
     ends in one), modes/LIST
     (the header's phrase) and skill/SKILL.md (the template's markers filled;
-    plain replacement, so the skill's literal $ARGUMENTS is untouched). Raises
+    plain replacement, so the skill's literal $ARGUMENTS is untouched); and from
+    the test-policy catalog, each non-default policy's policies/<id>.md as
+    tracked, policies/LIST and skill-test/SKILL.md (filled the same way). Raises
     ValidationError for a broken catalog, OSError for a missing tracked file."""
     cat = harness_catalog()
     ids = [m["id"] for m in cat]
@@ -9978,6 +10093,36 @@ def harness_suite_files() -> dict[str, bytes]:
         raise ValidationError("RS's working-mode catalog is broken: the skill template "
                               "has a marker RS does not fill")
     files["skill/SKILL.md"] = skill.encode("utf-8")
+    # The test policies: each non-default policy's rule body as tracked,
+    # policies/LIST (the rule header's phrase) and the rs-test skill.
+    pols = harness_test_policies()
+    for p in pols[1:]:
+        rel = f"policies/{p['id']}.md"
+        files[rel] = (HARNESS_SRC / rel).read_bytes()
+    pids = [p["id"] for p in pols]
+    phrase = harness_test_policy_phrase(pids)
+    files["policies/LIST"] = (phrase + "\n").encode("utf-8")
+    n = len(pids)
+    fill = {
+        "{{RS_TEST_PHRASE}}": phrase,
+        "{{RS_TEST_HINT}}": " | ".join(pids),
+        # The template writes the default's bullet itself.
+        "{{RS_TEST_BULLETS}}": "".join(
+            f"- **{pid}** — read `policies/{pid}.md` in this skill's folder and follow it "
+            f"from now on.\n" for pid in pids[1:]),
+        "{{RS_TEST_COUNT}}": _COUNT_WORDS[n] if n < len(_COUNT_WORDS) else str(n),
+    }
+    try:
+        skill = (HARNESS_SRC / HARNESS_TEST_SKILL_TEMPLATE).read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValidationError("RS's test-policy catalog is broken: the skill template "
+                              "is not UTF-8 text")
+    for k, v in fill.items():
+        skill = skill.replace(k, v)
+    if "{{RS_TEST_" in skill:
+        raise ValidationError("RS's test-policy catalog is broken: the skill template "
+                              "has a marker RS does not fill")
+    files["skill-test/SKILL.md"] = skill.encode("utf-8")
     return files
 
 
@@ -17914,8 +18059,8 @@ def _agent_settings_plan(req: "UpdateRequest", container: str, workspace_path: "
                 new_h.pop(f, None)
         if harness_asked:
             if is_research:
-                raise ValidationError("the working mode and the Doer and Checker models are "
-                                      "for dev projects and dev boxes")
+                raise ValidationError("the working mode, the test policy and the Doer and "
+                                      "Checker models are for dev projects and dev boxes")
             set_now = {f: getattr(req, f) for f in HARNESS_FIELDS}
             _validated_harness(set_now, dev=dev, agents=local)
         if new_h != old_h:
@@ -21548,7 +21693,7 @@ def _require_home_skills_box_tool(container: str) -> None:
         raise ValidationError(_OLD_BOX_TOOL_FILES_MSG)
 
 
-def _require_harness_aware_box_tool(container: str, mode: str = "") -> None:
+def _require_harness_aware_box_tool(container: str, mode: str = "", policy: str = "") -> None:
     """Refuse, before any side effect, when the project's box tool cannot take
     the request (a project not restarted since RS gained it): a tool without
     the working-mode flags at all, or — for a `mode` beyond the three every
@@ -21556,8 +21701,11 @@ def _require_harness_aware_box_tool(container: str, mode: str = "") -> None:
     HARNESS_MODE_HELP_MARKER), which would refuse the mode with its own
     flag-named text after a dev box's Gitea provisioning. Then, for any mode:
     one RS's catalog no longer lists, or one whose rule the project's staged
-    working-mode files lack (the box would silently run with none). A tool or
-    container that cannot be asked is not judged here."""
+    working-mode files lack (the box would silently run with none). A test
+    `policy` other than the default gets the same three checks first: a tool
+    without the test-policy flag, a policy RS no longer lists, a policy whose
+    rule the staged files lack. A tool or container that cannot be asked is not
+    judged here, and nothing is probed for the default policy."""
     r = run(["docker", "exec", container, "rs-sandbox", "create", "--help"],
             capture_output=True)
     if r.returncode != 0:
@@ -21567,6 +21715,19 @@ def _require_harness_aware_box_tool(container: str, mode: str = "") -> None:
         raise ValidationError(_OLD_BOX_TOOL_HARNESS_MSG)
     if mode and mode not in HARNESS_ORIGINAL_MODES and HARNESS_MODE_HELP_MARKER not in out:
         raise ValidationError(_OLD_BOX_TOOL_MODE_MSG)
+    if policy and policy != TEST_POLICY_DEFAULT:
+        if "--test-policy" not in out:
+            raise ValidationError(_OLD_BOX_TOOL_POLICY_MSG)
+        # The box installs the staged rule and falls back to the default when
+        # it is missing, as for the mode below; same probe, same rules.
+        if policy not in harness_test_policy_ids():
+            raise ValidationError(_RETIRED_POLICY_MSG)
+        r = run(["docker", "exec", container, "sh", "-c",
+                 'if [ -r "$1" ]; then echo present; else echo absent; fi', "sh",
+                 f"{HARNESS_STAGE_DIR}/policies/{policy}.md"],
+                capture_output=True)
+        if r.returncode == 0 and (r.stdout or "").strip() == "absent":
+            raise ValidationError(_UNSTAGED_POLICY_MSG)
     if not mode or mode == "none":
         return
     # The box installs the project's STAGED rule for its mode, detached, and
@@ -21589,7 +21750,8 @@ def _refuse_harness_on_research(container: str) -> None:
     cannot take a mode or doer/checker models."""
     if _container_project_type(container) != PROJECT_TYPE_SANDBOX_DIND:
         raise ValidationError(
-            "a box in a research project has no working mode or doer and checker agents")
+            "a box in a research project has no working mode, test policy or doer and "
+            "checker agents")
 
 
 def _gate_box_history(req: "BoxAddRequest", catalog: dict, container: str,
@@ -21878,13 +22040,15 @@ def box_add(req: "BoxAddRequest", progress=None) -> BoxAddResult:  # type: ignor
             DEFAULT_AGENT if catalog.get(req.preset, {}).get("agent_default") else "none")
         if not catalog.get(req.preset, {}).get("dev"):
             raise ValidationError(
-                "the working mode and the Doer and Checker models are for dev boxes")
+                "the working mode, the test policy and the Doer and Checker models are for "
+                "dev boxes")
         _refuse_harness_on_research(container)
         if harness_agent == "none":
-            raise ValidationError("a box without an agent has no working mode")
+            raise ValidationError("a box without an agent has no working mode or test policy")
         _validated_harness({f: harness.get(f, "") for f in HARNESS_FIELDS}, dev=True,
                            agents=[harness_agent])
-        _require_harness_aware_box_tool(container, harness.get("harness_mode", ""))
+        _require_harness_aware_box_tool(container, harness.get("harness_mode", ""),
+                                        harness.get("test_policy", ""))
     # Dev preset (STAGE_DEV_GITEA S2): mirror the in-supervisor rs-sandbox gates
     # host-side for a clean pre-exec ValidationError (the two-gate lockstep).
     # `repo` carries NAME semantics here (an attached gitea repo), not the byo
@@ -22656,8 +22820,8 @@ def box_settings(req: "BoxSettingsRequest", _progress=None) -> BoxSettingsResult
     research = _container_project_type(container) != PROJECT_TYPE_SANDBOX_DIND
     if harness_asked:
         if research or not entry.get("dev") or agent == "none":
-            raise ValidationError("the working mode and the Doer and Checker models are "
-                                  "for dev boxes outside research projects")
+            raise ValidationError("the working mode, the test policy and the Doer and "
+                                  "Checker models are for dev boxes outside research projects")
     # The full resolved set: the entry's values (re-checked — the record is
     # writable from inside the project), with this request's changes applied.
     def _entry_str(k: str) -> str:
@@ -22685,13 +22849,16 @@ def box_settings(req: "BoxSettingsRequest", _progress=None) -> BoxSettingsResult
             v = getattr(req, f)
         elif f in reset:
             v = ""
-        if v and not (f == "harness_mode" and v == "none"):
+        if v and not (f == "harness_mode" and v == "none") \
+                and not (f == "test_policy" and v == TEST_POLICY_DEFAULT):
             harness[f] = v
     if harness_asked:
         _validated_harness({f: harness.get(f, "") for f in HARNESS_FIELDS},
                            dev=True, agents=[agent])
-        # The mode actually sent (a model-only change carries the recorded one).
-        _require_harness_aware_box_tool(container, harness.get("harness_mode", ""))
+        # The mode and test policy actually sent (a model-only change carries
+        # the recorded ones).
+        _require_harness_aware_box_tool(container, harness.get("harness_mode", ""),
+                                        harness.get("test_policy", ""))
     # The groups this change writes; the box tool keeps the others as its
     # record has them — so a model-only change never touches the working mode,
     # and a named model half is written even when the record already holds it
@@ -22704,7 +22871,11 @@ def box_settings(req: "BoxSettingsRequest", _progress=None) -> BoxSettingsResult
             f"--write={','.join(write)}",
             f"--model={model if agent == 'claude' else ''}",
             f"--effort={effort if agent == 'claude' else ''}",
-            *((f"--{f.replace('_', '-')}={harness.get(f, '')}" for f in HARNESS_FIELDS)
+            # The test policy only when set: the box tool reads a missing flag as
+            # the default, and a box tool from before the test policy would
+            # refuse the flag on every working-mode change.
+            *((f"--{f.replace('_', '-')}={harness.get(f, '')}" for f in HARNESS_FIELDS
+               if f != "test_policy" or harness.get(f))
               if harness_asked else ()),
             *((("--status-bar" if req.status_bar else "--no-status-bar"),) if bar_asked else ())]
     r = run(argv, capture_output=True)
@@ -26718,9 +26889,10 @@ def dev_box_provision(req: "DevBoxProvisionRequest", progress=None) -> dict:  # 
     if _harness_set(req):
         sup = _running_dind_supervisor(req.project)
         _refuse_harness_on_research(sup)
-        # A mode the project's box tool predates would be refused by box_add's
-        # tool — after the mirror below; refuse it before.
-        _require_harness_aware_box_tool(sup, getattr(req, "harness_mode", "") or "")
+        # A mode or test policy the project's box tool predates would be
+        # refused by box_add's tool — after the mirror below; refuse it before.
+        _require_harness_aware_box_tool(sup, getattr(req, "harness_mode", "") or "",
+                                        getattr(req, "test_policy", "") or "")
     progress.step("repo", "mirroring the repo")
     dev_repo_add(DevRepoAddRequest.from_kwargs(url=req.url, pat=req.pat))
     # req.name is ALWAYS set here: from_kwargs derived+validated the default

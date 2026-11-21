@@ -2117,8 +2117,12 @@ html.mobile .project-config-box .config-folders-input { font-size: 16px; }
    agent row (box window); its Doer/Checker rows sit in each agent's tab and
    show only for the subagents the chosen mode uses. */
 .harness-mode .box-opt-cards { margin-bottom: 4px; }
-.harness-mode-card { padding: 4px 12px; }
-.harness-rows { margin-top: 12px; }
+/* The test policy's switch sits directly under it and takes the same field and
+   card shape (its own card class, so the two switches' cards stay apart). */
+.harness-mode-card, .test-policy-card { padding: 4px 12px; }
+/* In the box window both switches drop their closing gap (below), so the test
+   policy keeps the rows' gap above it. */
+.harness-rows, .box-harness .harness-mode + .test-policy { margin-top: 12px; }
 /* The rows follow the tab's last field: keep that field's closing gap off
    (`.agent-tab-panel > .field:last-child` no longer matches it). */
 .agent-tab-panel > .field:has(+ .harness-rows) { margin-bottom: 0; }

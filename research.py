@@ -2762,6 +2762,10 @@ def _add_harness_args(p: argparse.ArgumentParser, what: str) -> None:
     g.add_argument("--pi-checker-thinking", dest="pi_checker_thinking", default="",
                    choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
                    help="pi thinking level for the checker subagent")
+    # No `choices`, like the mode: the policies come from RS's catalog.
+    g.add_argument("--test-policy", dest="test_policy", default="", metavar="POLICY",
+                   help="the test policy this project's sessions start on: light or full "
+                        "(default light)")
 
 
 def build_parser() -> argparse.ArgumentParser:

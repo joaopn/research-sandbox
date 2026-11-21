@@ -1,0 +1,3 @@
+## Full
+
+**Every change ships its tests.** If you add a feature, add or update tests for it. When fixing a bug, write a reproduction script first (exits non-zero while the bug exists, zero when fixed), and verify it on both the base branch and your branch before pushing. A test you add or change is trusted only after you have seen it fail without the change (on the code before it, or with the property broken on purpose) and pass with it; say that you saw both. A child agent that writes a test is told this in its brief and reports what it saw. A plan says, for each test, what it proves and how it was seen failing without the change.

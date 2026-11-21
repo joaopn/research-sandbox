@@ -682,6 +682,16 @@ async def broker_working_modes_handler(request: web.Request) -> web.Response:
     return web.json_response(body, status=status)
 
 
+async def broker_test_policies_handler(request: web.Request) -> web.Response:
+    """GET /broker/test-policies — RS's test policies (id, label, description)
+    for the Test policy cards (gated). The catalog sits outside the webui image,
+    so this relay is the browser's only source; it is apart from
+    /broker/working-modes so either catalog can fail alone. SameSite=Strict
+    cookie is the CSRF defense for this read, mirroring /broker/working-modes."""
+    status, body = await _relay(request, "test_policies")
+    return web.json_response(body, status=status)
+
+
 async def broker_workflows_handler(request: web.Request) -> web.Response:
     """GET /broker/workflows — the store catalog (built-ins + BYO), the agent
     enum, and the default workflow, for the create form's pickers (gated). The
@@ -1165,7 +1175,7 @@ async def broker_project_action_handler(request: web.Request) -> web.Response:
                       "agents", "pi_model", "pi_thinking", "reset",
                       "harness_mode", "doer_model", "checker_model",
                       "pi_doer_model", "pi_doer_thinking",
-                      "pi_checker_model", "pi_checker_thinking",
+                      "pi_checker_model", "pi_checker_thinking", "test_policy",
                       # the ⚙ Extensions status-bar switch (#524)
                       "status_bar"):
                 if req_body.get(k) is not None:
@@ -1285,7 +1295,8 @@ async def broker_box_add_handler(request: web.Request) -> web.Response:
             # BOX_ADD_WEBUI_FIELDS; dev boxes only, gated in box_add).
             **{f: body.get(f) for f in ("harness_mode", "doer_model", "checker_model",
                                        "pi_doer_model", "pi_doer_thinking",
-                                       "pi_checker_model", "pi_checker_thinking")},
+                                       "pi_checker_model", "pi_checker_thinking",
+                                       "test_policy")},
             # Read-only folders (a list of workspace-relative paths) — raw; the
             # broker request validates the shape, box_add the folders.
             "folders": body.get("folders"),
@@ -1364,7 +1375,7 @@ async def broker_box_settings_handler(request: web.Request) -> web.Response:
     args = {"project": project}
     for k in ("name", "model", "effort", "reset", "harness_mode", "doer_model",
               "checker_model", "pi_doer_model", "pi_doer_thinking",
-              "pi_checker_model", "pi_checker_thinking", "status_bar"):
+              "pi_checker_model", "pi_checker_thinking", "test_policy", "status_bar"):
         if body.get(k) is not None:
             args[k] = body[k]
     status, reply = await _relay(request, "box_settings", args)
@@ -2098,7 +2109,8 @@ async def broker_dev_box_handler(request: web.Request) -> web.Response:
             # DEV_BOX_WEBUI_FIELDS).
             **{f: body.get(f) for f in ("harness_mode", "doer_model", "checker_model",
                                        "pi_doer_model", "pi_doer_thinking",
-                                       "pi_checker_model", "pi_checker_thinking")},
+                                       "pi_checker_model", "pi_checker_thinking",
+                                       "test_policy")},
             # Share files — RAW like the plain box route's (tri-state; the
             # broker request refuses anything but a bool or absent).
             "share": body.get("share"),
@@ -2172,7 +2184,8 @@ async def broker_dev_project_handler(request: web.Request) -> web.Response:
             # DEV_PROJECT_WEBUI_FIELDS; this handler forwards by name).
             **{f: body.get(f) for f in ("harness_mode", "doer_model", "checker_model",
                                        "pi_doer_model", "pi_doer_thinking",
-                                       "pi_checker_model", "pi_checker_thinking")},
+                                       "pi_checker_model", "pi_checker_thinking",
+                                       "test_policy")},
             # The agent set; an absent key relays as None ⇒ the workflow preset.
             "agents": body.get("agents"),
             # Read-only folders, relative to RS's data folder (the broker gates).
@@ -4458,6 +4471,7 @@ def main() -> None:
     app.router.add_get("/broker/workflows", broker_workflows_handler)
     app.router.add_get("/broker/models", broker_models_handler)
     app.router.add_get("/broker/working-modes", broker_working_modes_handler)
+    app.router.add_get("/broker/test-policies", broker_test_policies_handler)
     app.router.add_post("/broker/models/default", broker_models_default_handler)
     app.router.add_get("/broker/settings", broker_settings_handler)
     app.router.add_post("/broker/settings", broker_settings_set_handler)

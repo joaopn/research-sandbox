@@ -362,6 +362,17 @@ def _verb_working_modes(_args: dict, _progress=None) -> dict:
     return {"modes": rscore.harness_catalog_public()}
 
 
+def _verb_test_policies(_args: dict, _progress=None) -> dict:
+    """The test policies for the webui's Test policy cards: each policy's id,
+    label and description, from RS's catalog (container/harness/
+    test-policies.json — outside the webui image, so this in-broker read is its
+    only source). Its own verb, apart from `working_modes`, so a broken policy
+    catalog never hides the mode switch and a broken mode catalog never hides
+    the policy switch. Token-gated (NOT in OPEN_VERBS). harness_test_policies
+    raises only ValidationError (its text carries no host path)."""
+    return {"policies": rscore.harness_test_policies_public()}
+
+
 def _verb_host_settings(_args: dict, _progress=None) -> dict:
     """The host settings (the Sandboxes → Infrastructure → Settings section).
     Token-gated read; never raises for a damaged file — the payload names the
@@ -819,7 +830,7 @@ CREATE_WEBUI_FIELDS = frozenset({
     # elsewhere in from_kwargs): IN-BOX — they land in the agent's own config
     # files inside the container; tiers, pi ids and levels are shape-checked.
     "harness_mode", "doer_model", "checker_model", "pi_doer_model", "pi_doer_thinking",
-    "pi_checker_model", "pi_checker_thinking",
+    "pi_checker_model", "pi_checker_thinking", "test_policy",
     # Opt-in rs-fetch (any non-dev workflow): an IN-BOX capability toggle —
     # stages the read-only fetch tool + operator token + wiring INSIDE the
     # container (the supervisor, on dind); no path, no host port, no mount.
@@ -861,7 +872,7 @@ UPDATE_WEBUI_FIELDS = frozenset({
     # back to their default (field names from rscore.UPDATE_RESETTABLE only).
     "pi_model", "pi_thinking", "reset",
     "harness_mode", "doer_model", "checker_model", "pi_doer_model", "pi_doer_thinking",
-    "pi_checker_model", "pi_checker_thinking",
+    "pi_checker_model", "pi_checker_thinking", "test_policy",
     # The ⚙ Extensions status-bar switch (#524): IN-BOX, a plain bool, live on
     # a running project only (update refuses it otherwise).
     "status_bar",
@@ -950,7 +961,7 @@ BOX_ADD_WEBUI_FIELDS = frozenset({"project", "name", "preset", "agent", "editor"
                                   # models (in-box; dev boxes only, gated in box_add).
                                   "harness_mode", "doer_model", "checker_model",
                                   "pi_doer_model", "pi_doer_thinking",
-                                  "pi_checker_model", "pi_checker_thinking",
+                                  "pi_checker_model", "pi_checker_thinking", "test_policy",
                                   # Read-only folders. These name a mount
                                   # SOURCE — the class the host-root boundary
                                   # forbids in general — and are relayable only
@@ -995,7 +1006,7 @@ BOX_FOLDERS_WEBUI_FIELDS = frozenset({"project", "name", "folders"})
 BOX_SETTINGS_WEBUI_FIELDS = frozenset({
     "project", "name", "model", "effort", "reset",
     "harness_mode", "doer_model", "checker_model", "pi_doer_model", "pi_doer_thinking",
-    "pi_checker_model", "pi_checker_thinking",
+    "pi_checker_model", "pi_checker_thinking", "test_policy",
     # The box's status-bar switch (#524; a bool, in-box).
     "status_bar"})
 # box_remove additionally accepts keep_workspace (a bool, not host-shaped): when
@@ -1189,7 +1200,7 @@ DEV_BOX_WEBUI_FIELDS = frozenset({"project", "url", "pat", "name", "agent",
                                   # models (in-box; gated in box_add).
                                   "harness_mode", "doer_model", "checker_model",
                                   "pi_doer_model", "pi_doer_thinking",
-                                  "pi_checker_model", "pi_checker_thinking",
+                                  "pi_checker_model", "pi_checker_thinking", "test_policy",
                                   # Share files with the project (bool or absent
                                   # ⇒ off, the dev type's default) — like the
                                   # plain box window's field.
@@ -1221,6 +1232,7 @@ DEV_PROJECT_WEBUI_FIELDS = frozenset({"name", "workflow", "url", "pat",
                                       "harness_mode", "doer_model", "checker_model",
                                       "pi_doer_model", "pi_doer_thinking",
                                       "pi_checker_model", "pi_checker_thinking",
+                                      "test_policy",
                                       # The project's agent SET (an enum list,
                                       # in-box): absent ⇒ the workflow preset;
                                       # validated pre-spawn by the create
@@ -1521,6 +1533,7 @@ VERBS = {
     "workflows": _verb_workflows,
     "models": _verb_models,
     "working_modes": _verb_working_modes,
+    "test_policies": _verb_test_policies,
     "model_default_set": _verb_model_default_set,
     "host_settings": _verb_host_settings,
     "host_settings_set": _verb_host_settings_set,
