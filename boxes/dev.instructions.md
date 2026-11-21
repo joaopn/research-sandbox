@@ -386,7 +386,10 @@ not `/workspace`, say so in your first reply and suggest restarting there.
 4. Close the mirrored issues naming the PR — `rs-board done <issue> --pr <N>`, which also
    removes each card — and re-sync any whose file changed.
 5. Check the wiki against what the PR changed and update the pages it touched (see "The
-   wiki" below); most landings change nothing there.
+   wiki" below); most landings change nothing there. In a repository with a docs site
+   (`docs/_config.yml` on the branch the PR landed on, read as in step 2) there is no wiki
+   to check: check that the PR carried its page changes and say so in the reply that
+   reports the landing, or name what it missed, which is new work and waits for the go.
 
 ## The wiki — how the repository works, for the maintainer
 
@@ -452,6 +455,26 @@ pages you changed in the reply that reports the landing or the pass.
   directly, no worktree, no branch, no PR — and the maintainer and every fetch tool on the
   dev lane can read it, so never put a token, a password or anything else secret in it.
 
+## The docs site — when the repository has one
+
+A repository that has `docs/_config.yml` (look in the primary clone) publishes `docs/` as a
+just-the-docs site, which GitHub builds from the default branch. There the site replaces
+the wiki: you keep the site's pages, and "The wiki" above does not apply. Its readers are
+the people who use the software, so write for them. Nothing internal goes on the site:
+the project memory, the plans and the ledgers stay where they are.
+
+- **The pages are tracked files**, so changing them is work: the PR that changes what the
+  software does for its users carries the page changes, and a larger pass the maintainer
+  asks for is a PR of its own.
+- **Every page carries front matter** (`title`, `nav_order`, and `parent` inside a
+  section): it is what puts the page in the sidebar. Links between pages are relative
+  `.md` links, diagrams are Mermaid blocks, and image files go in `docs/assets/`.
+- **`rs-docs`** sets a site up (`init`, when the maintainer asks for one: your plan shows
+  what `rs-docs init --dry-run` prints; it only reads, so run it in the primary clone),
+  checks the pages (`check`) and builds the site as GitHub will (`build`); `rs-docs --help`
+  has the details. No `rs-docs` on PATH means RS's images are older than its code: tell
+  the maintainer (Rebuild all, then stop and start the project).
+
 <!-- rs-part: work -->
 ## Verification
 
@@ -460,6 +483,8 @@ pages you changed in the reply that reports the landing or the pass.
 - Run the project's tests if it has them, and its linters/formatters if it configures them.
 - Add tests where the maintainer, the approved plan or your brief asks for them.
 - When fixing a bug, show it happening before the fix and gone after it.
+- A change under `docs/` in a repository with a docs site (`docs/_config.yml` exists) passes
+  `rs-docs check` before it is pushed.
 
 <!-- rs-part: session -->
 Beyond that the project's test policy decides what tests a change owes: light, which asks
