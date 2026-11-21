@@ -22,11 +22,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOG = "/tmp/bench-standin.log"
 # The interrupted session's message is answered at once with a tool call that
-# runs this long, so the plumbing run's kill (5 s in) lands mid-turn, after
+# runs this long (past any session's kill delay), so the plumbing run's kill lands mid-turn, after
 # one model call whose tokens are already in the transcript, while the run's
-# turn timeout (300 s) is never near.
-SLOW_S = 30
-SLOW_TEXT = "Continue the per-wave check"
+# turn timeout is never near. The runner writes the opening of the message it
+# will kill to SLOW_FILE just before sending it.
+SLOW_S = 180   # past bench.KILL_AFTER, within bench.TURN_TIMEOUT
+SLOW_FILE = "/tmp/bench-standin-slow"
 
 
 def text_of(c):
@@ -51,7 +52,11 @@ def delta_cmd(t):
 
 def slow_cmd(t):
     # not a bare `sleep`: Claude Code blocks a foreground sleep and ends the turn
-    return f"python3 -c 'import time; time.sleep({SLOW_S})'" if SLOW_TEXT in t else None
+    try:
+        slow = " ".join(open(SLOW_FILE).read().split())
+    except OSError:
+        return None
+    return f"python3 -c 'import time; time.sleep({SLOW_S})'" if slow and slow in " ".join(t.split()) else None
 
 
 def note_cmd(t):

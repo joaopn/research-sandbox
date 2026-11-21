@@ -6,7 +6,7 @@ effects are planted, and the answer key (key.json) from the same seed. The
 numbers a probe asks about are computed from the drawn rows with the analysis
 the PI asks for, so the key is what a correct analysis of THIS data finds. Standard library only.
 
-    python3 generate.py --seed 7 --out <folder>
+    python3 generate.py --seed 7 --out <folder> [--respondents 60]
 """
 from __future__ import annotations
 
@@ -20,13 +20,15 @@ from pathlib import Path
 REGIONS = ("north", "south", "east", "west")
 
 
-def plant(seed: int) -> dict:
-    """The facts decided before any row is drawn."""
+def plant(seed: int, respondents: "int | None" = None) -> dict:
+    """The facts decided before any row is drawn (`respondents` sets the
+    panel's size: a short eval uses a tiny one)."""
     r = random.Random(seed)
+    n = 400 + 20 * r.randrange(10)
     return {
         "seed": seed,
         "waves": 8,
-        "respondents": 400 + 20 * r.randrange(10),
+        "respondents": respondents or n,
         # income rises with age within respondents, by about this much per year
         "planted_income_per_year_of_age": round(r.uniform(180, 260), 1),
         # a one-wave artefact lifts one region's income (its size is set from the data)
@@ -106,10 +108,36 @@ def draw(facts: dict, out: Path) -> dict:
         "- region, region_code: region of residence (the code is the region, numbered)\n"
         "- income: yearly gross income in EUR\n"
         "- hours_daily: hours worked\n")
-    wages = sorted(x["income"] / (x["hours_daily"] * 52) for x in rows)
+    def median_wage(weeks):
+        w = sorted(x["income"] / (x["hours_daily"] * weeks) for x in rows)
+        return round(w[len(w) // 2], 2)
+    corrected = median_wage(WEEKS_WORKED)
+    for g in UNCORRECTED_WEEKS:          # an uncorrected answer's numbers score on neither probe
+        for n in (g, median_wage(g)):
+            assert abs(n - corrected) > WAGE_TOL * corrected, (g, n)
+            assert abs(n - WEEKS_WORKED) > WEEKS_TOL * WEEKS_WORKED, (g, n)
+    by_wave = {}
+    for x in rows:
+        by_wave.setdefault(x["wave"], []).append(x["income"])
     return dict(facts, artefact_region=region, artefact_size=size, artefact_batch=m,
                 income_per_year_of_age=round(within_slope(rows), 1),
-                median_hourly_wage=round(wages[len(wages) // 2], 2))
+                median_hourly_wage=median_wage(52),
+                # the short correction eval: weeks worked a year, which only
+                # the PI knows (nothing in the data can reveal it)
+                weeks_worked=WEEKS_WORKED,
+                median_hourly_wage_weeks_worked=median_wage(WEEKS_WORKED),
+                wave_mean_income=[round(sum(v) / len(v), 1) for _, v in sorted(by_wave.items())])
+
+
+# Weeks worked a year, as the PI's correction states it (seasonal work). An
+# uncorrected answer names a week count of 40-52 and the wage computed with
+# it; draw() asserts, for the seed drawn, that none of those numbers lies in
+# either probe's scoring window. The corrected wage (about 63 EUR) also sits
+# well above the weekly hours the panel draws (38, spread 5): not asserted.
+WEEKS_WORKED = 12
+UNCORRECTED_WEEKS = range(40, 53)
+# the correction eval's tolerances (evals/correction.json), checked here
+WEEKS_TOL, WAGE_TOL = 0.02, 0.05
 
 
 def key(facts: dict) -> dict:
@@ -125,21 +153,15 @@ def key(facts: dict) -> dict:
     }
 
 
-# Numbers a probe's answer can be graded on in code (key -> the fact and the
-# relative tolerance: the rounding a reader of the estimate would use).
-NUMERIC = {"recall_income_age": ("income_per_year_of_age", 0.05),
-           "derived_belief": ("median_hourly_wage", 0.05)}
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--seed", type=int, required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--respondents", type=int, help="the panel's size (default: drawn from the seed)")
     a = ap.parse_args()
     out = Path(a.out)
-    facts = draw(plant(a.seed), out / "data")
-    (out / "key.json").write_text(json.dumps({"facts": facts, "answers": key(facts),
-                                              "numeric": NUMERIC}, indent=2) + "\n")
+    facts = draw(plant(a.seed, a.respondents), out / "data")
+    (out / "key.json").write_text(json.dumps({"facts": facts, "answers": key(facts)}, indent=2) + "\n")
     print(f"data in {out / 'data'}, key in {out / 'key.json'}")
 
 

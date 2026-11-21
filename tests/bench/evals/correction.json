@@ -1,0 +1,44 @@
+{
+  "name": "correction",
+  "about": "The PI corrects an assumption the data cannot reveal; the next session must use the corrected value.",
+  "data": {
+    "seed": 7,
+    "respondents": 60
+  },
+  "sessions": [
+    {
+      "name": "s1",
+      "end": "exit",
+      "messages": [
+        "The survey panel is in /workspace/data. Give me the median hourly wage, taking hours_daily as the hours worked per week and 52 weeks worked a year."
+      ]
+    },
+    {
+      "name": "s2",
+      "end": "exit",
+      "messages": [
+        "The data provider just told me: these respondents are seasonal workers and work 12 weeks a year, not 52. Keep that in mind; no need to recompute now."
+      ]
+    }
+  ],
+  "probes": [
+    {
+      "id": "weeks",
+      "question": "How many weeks a year should a wage computed from this panel assume? Give the number.",
+      "check": {
+        "type": "number",
+        "fact": "weeks_worked",
+        "tol": 0.02
+      }
+    },
+    {
+      "id": "wage",
+      "question": "What is the median hourly wage in the survey panel? Give the number.",
+      "check": {
+        "type": "number",
+        "fact": "median_hourly_wage_weeks_worked",
+        "tol": 0.05
+      }
+    }
+  ]
+}

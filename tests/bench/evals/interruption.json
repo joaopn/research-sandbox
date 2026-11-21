@@ -1,0 +1,45 @@
+{
+  "name": "interruption",
+  "about": "A session is killed mid-task; the next one finishes it. Checked on the files, against each wave's mean; no question asked.",
+  "data": {
+    "seed": 7,
+    "respondents": 60
+  },
+  "sessions": [
+    {
+      "name": "s1",
+      "end": "kill",
+      "messages": [
+        "The survey panel is in /workspace/data. Compute the mean income of each wave, one wave at a time, and write each wave's mean to /workspace/waves/wave<N>.txt (N = 1..8) as you finish it."
+      ],
+      "kill_after": 20
+    },
+    {
+      "name": "s2",
+      "end": "exit",
+      "messages": [
+        "Finish the per-wave means you started last time."
+      ]
+    }
+  ],
+  "checks": [
+    {
+      "id": "all-waves",
+      "check": {
+        "type": "files",
+        "paths": [
+          "/workspace/waves/wave1.txt",
+          "/workspace/waves/wave2.txt",
+          "/workspace/waves/wave3.txt",
+          "/workspace/waves/wave4.txt",
+          "/workspace/waves/wave5.txt",
+          "/workspace/waves/wave6.txt",
+          "/workspace/waves/wave7.txt",
+          "/workspace/waves/wave8.txt"
+        ],
+        "fact": "wave_mean_income",
+        "tol": 0.001
+      }
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "name": "recall",
+  "about": "One session finds a number; a cold-started session is asked for it.",
+  "data": {
+    "seed": 7,
+    "respondents": 60
+  },
+  "sessions": [
+    {
+      "name": "s1",
+      "end": "exit",
+      "messages": [
+        "The survey panel is in /workspace/data (panel.csv and its codebook). Estimate the within-respondent effect of age on income per year with a fixed-effects model, keep the code and its output in /workspace, and tell me the number."
+      ]
+    }
+  ],
+  "probes": [
+    {
+      "id": "recall",
+      "question": "Within respondents, how much does income change per year of age? Give the number.",
+      "check": {
+        "type": "number",
+        "fact": "income_per_year_of_age",
+        "tol": 0.05
+      }
+    }
+  ]
+}

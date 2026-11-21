@@ -1,55 +1,72 @@
-# Benchmarks
+# Evals
 
-Re-runnable measurements that spend real model tokens and run on demand, never
-as part of the normal checks. Each folder is one benchmark.
+Short evals of research agents, run on demand to catch regressions and to
+compare project types and workflows. They spend real model tokens, so they
+are never part of the normal checks. Each eval asks one question (is a result
+remembered? is a correction kept? is an interrupted task resumed?) and takes a
+few minutes per project type.
 
-## researcher
+## What an eval is
 
-Does a research agent keep what it learned across sessions? The same scripted
-sessions are played to several project types, then a cold-started agent is
-asked probes and an independent grader scores each answer against a key.
+One file under `evals/`: a few sessions of what the PI says, then probes (a
+question asked of a cold-started agent) or checks (the workspace looked at,
+no question asked), and how each is scored:
 
-- `generate.py` writes a synthetic survey panel from a seed, its effects
-  planted first, and the answer key from the same seed (ground truth first:
-  the numbers a probe asks about are computed from the drawn rows with the
-  analysis the PI asks for, so the key is what a correct analysis finds).
-- `script.json` is what the PI says, session by session: a result established
-  in session one and not mentioned again, an approach that fails for a
-  discoverable reason, a session-one assumption the PI overturns in session
-  three (and a belief derived from it), a session killed mid-task, a procedure
-  needed twice.
-- `probes.json` asks after the last session: recall (as worded and
-  paraphrased), negative knowledge, provenance, the correction and the derived
-  belief, the artefact, the interruption.
-- `bench.py` creates one project per arm (`research`, `researcher` with Claude
-  and with pi, `researcher` without its start hook, and a plain `sandbox-dind`
-  project as the floor), copies the data in as `/workspace/data`, plays the
-  sessions in the agent's own terminal (a turn ends when RS's activity counts
-  hand back), asks the probes, grades them, and writes
-  `results/<run>/results.json` and `table.md`: the scores per probe and arm,
-  the tokens of every session and what each cold start loaded.
-- `standin.py` is a stand-in model server: `--standin` runs the whole
-  pipeline against it, zero tokens, to check the plumbing (scores mean nothing).
+| Check | Scores | Costs |
+|---|---|---|
+| `number` | a number in the answer within a tolerance of the key's | nothing |
+| `contains` | the answer holds one of the given phrases, and none of the others | nothing |
+| `files` | the files the eval names are there, or each holds its value from the key | nothing |
+| `grader` | a separate run, with no tools and no memory, scores the answer against the key | one model call |
 
-Numeric answers are graded in code against the key; prose answers by a
-grader run that has no tools, no memory and only the key, the question and the
-answer. Before a real run it grades a hand-written right and wrong answer; a
-run whose grader gets either wrong stops there. Paths a provenance answer names
-must be files the sessions wrote. Each probe starts from the same memory.
+A new regression check or workflow comparison is a new file, not new code.
+The data is a small synthetic survey panel written by `generate.py` from a
+seed, with the key computed from the same rows, so the key is what a correct
+analysis finds.
 
-### Running it
+| Eval | Asks | Sessions | Probes |
+|---|---|---|---|
+| `recall` | a number found in one session, asked for in the next | 1 | 1 |
+| `correction` | a fact only the PI knows (weeks worked a year), corrected, then a value that depends on it | 2 | 2 |
+| `interruption` | a task killed half-way, finished in the next session (each wave's file checked against its mean) | 2 | files check |
+| `full` (optional) | the long study: five sessions, eight probes, prose graded | 5 | 8 |
+
+`full` runs only when named (`--evals full`). On five project types it takes
+hours and a large share of the quota.
+
+## Project types
+
+Each eval runs on each chosen type, each in its own fresh project, destroyed
+when the eval is done. By default: `researcher` and `floor` (a plain
+`sandbox-dind` project). Opt in with `--arms`: `researcher-pi`,
+`researcher-nohook` (no start hook), `research` (the research flow, with its
+`/log` at each session's end).
+
+## Running
 
 From the repository root of an RS whose stack is up, with the Claude and pi
-downloads and the reader pulled:
+downloads and the reader pulled. See what a run will do first; it creates
+nothing:
 
-    python3 tests/bench/researcher/bench.py --run dry --seed 7 --standin
+    python3 tests/bench/bench.py --run r1 --dry-run
 
 A real run signs in with a Claude token made once with `claude setup-token`
-and, for the pi arm, a provider API key, each in a file under `/workspace`:
+and, for pi, a provider API key, each in a file under `/workspace`:
 
-    python3 tests/bench/researcher/bench.py --run r1 --seed 7 \
+    python3 tests/bench/bench.py --run r1 --claude-token-file /workspace/.bench/claude-token
+    python3 tests/bench/bench.py --run r2 --evals recall --arms researcher researcher-pi \
         --claude-token-file /workspace/.bench/claude-token \
         --pi-model anthropic/claude-sonnet-4-5 --pi-key-file /workspace/.bench/pi-key
 
-Every run spends the account's quota: five arms × five sessions, plus eight
-probes and their grading per arm.
+Each eval on each project type has a token cap and a time cap
+(`--max-tokens`, `--max-seconds`), grading included; past either it stops
+and the table says "OVER BUDGET". The caps are checked after each step, so a
+single step can overrun them by up to one turn's timeout. `--standin` runs everything against a stand-in model server
+(`standin.py`) at zero tokens, to check the plumbing; its scores mean nothing.
+
+The results go to `results/<run>/` (`results.json`, `table.md`): each probe's
+score with its tokens and time, and each eval's total tokens, time and cold
+start size per project type. A probe may recompute an answer instead of
+remembering it (probes keep their tools and the data); its tokens and time
+tell the two apart. An interruption check whose kill came after the task had
+finished scores nothing: there was nothing to resume.
