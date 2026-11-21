@@ -66,6 +66,7 @@ import contextlib
 import fcntl
 import http.client
 import json
+import math
 import os
 import posixpath
 import re
@@ -218,6 +219,10 @@ class SyncError(Exception):
 
 def die(msg: str) -> None:
     raise SyncError(msg)
+
+
+class CountError(SyncError):
+    """rs-sync's count of recent GitHub writes cannot be read or saved."""
 
 
 class DuplicateClaim(SyncError):
@@ -989,6 +994,11 @@ class GitHub:
     def __init__(self, base, token):
         self.base, self.token = base.rstrip("/"), token
         self.writes = []            # timestamps of content-creating requests
+        # The token's account id, once preflight_github has read it: the
+        # writes are then shared with every rs-sync run of this container for
+        # that account (writes_file); without it they are this process's only.
+        self.account = None
+        self.share_error = None     # a failed save of the shared count (_record_write)
         self.scopes = None
         # Whether GitHub itself has answered this run: a 2xx, or any HTTP
         # status but 502/503/504, which a proxy sends as readily as GitHub.
@@ -996,12 +1006,93 @@ class GitHub:
         # proxy that cannot reach GitHub) and stops the run at once.
         self.answered = False
 
+    def writes_file(self) -> "Path | None":
+        return None if self.account is None else CACHE_DIR / f"writes-{self.account}.json"
+
+    def share_writes(self, record=None, save=False, clock=time.time):
+        """Merge the past hour's writes of every rs-sync run of this container
+        (for this account) into self.writes; with `record`, add that write
+        time and save the merged list. GitHub's limits are per account, and a
+        run started right after another would otherwise count from zero. The
+        file is held under its own lock (never during a wait), and written to
+        a fixed temporary name renamed over it, so two runs going at once
+        keep each other's writes. A missing file is an empty one (the state
+        after a container recreate); one rs-sync cannot read, or a cache
+        folder it cannot write, stops the run, naming it."""
+        if record is not None:
+            self.writes.append(record)
+        path = self.writes_file()
+        if path is None:
+            return
+        try:
+            CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd = os.open(CACHE_DIR / "writes.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        except OSError as e:
+            raise CountError(f"cannot open rs-sync's cache {CACHE_DIR / 'writes.lock'} "
+                             f"({e.strerror}); make {CACHE_DIR} writable, then run again")
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except OSError as e:
+                raise CountError(f"cannot lock rs-sync's cache {CACHE_DIR / 'writes.lock'} "
+                                 f"({e.strerror}); run again")
+            try:
+                raw = path.read_bytes()
+            except FileNotFoundError:
+                shared = []
+            except OSError as e:
+                raise CountError(f"cannot read rs-sync's count of recent GitHub writes, {path} "
+                                 f"({e.strerror}); delete it, then run again")
+            else:
+                try:
+                    shared = json.loads(raw)
+                    # Times rs-sync wrote: numbers, finite, none after now
+                    # (each is taken before its own save).
+                    if not isinstance(shared, list) or not all(
+                            isinstance(t, (int, float)) and not isinstance(t, bool)
+                            and math.isfinite(t) and t <= clock() for t in shared):
+                        raise ValueError
+                except (ValueError, OverflowError, RecursionError):
+                    raise CountError(f"rs-sync's count of recent GitHub writes, {path}, is not a "
+                                     f"list of times it can read, or holds a time after now (the "
+                                     f"clock moved back, or the file was edited); delete it, then "
+                                     f"run again")
+            now = clock()
+            self.writes = sorted({t for t in list(shared) + self.writes if now - t < 3600})
+            if record is not None or save:
+                tmp = path.with_name(path.name + ".tmp")
+                try:
+                    tmp.write_text(json.dumps(self.writes))
+                    os.replace(tmp, path)
+                except OSError as e:
+                    raise CountError(f"cannot write rs-sync's count of recent GitHub writes, {path} "
+                                     f"({e.strerror}); make {CACHE_DIR} writable, then run again")
+        finally:
+            os.close(fd)
+
+    def check_count(self):
+        """Stop on a failed save of the shared count (_record_write): before
+        the next write, before an import, and at the end of a run."""
+        if self.share_error is not None:
+            raise self.share_error
+
+    def _record_write(self):
+        """Count a write. When the shared count cannot be saved, the write
+        stays counted here and the run stops before its next write (call),
+        so the caller still records the write that landed."""
+        try:
+            self.share_writes(record=time.time())
+        except CountError as e:
+            self.share_error = e
+
     def _pace(self, clock=time.time, sleep=time.sleep):
         """Wait until the next content write fits GitHub's secondary limits:
-        the hourly and per-minute counts over the writes made so far, and at
-        least MIN_WRITE_GAP_S since the last one."""
+        the hourly and per-minute counts over the writes made so far (by every
+        rs-sync run of this container, share_writes), and at least
+        MIN_WRITE_GAP_S since the last one."""
         if _TEST_FAST:
             return
+        self.share_writes(clock=clock)
         now = clock()
         self.writes = [t for t in self.writes if now - t < 3600]
         if len(self.writes) >= CONTENT_PER_HOUR:
@@ -1051,6 +1142,7 @@ class GitHub:
             # self.answered).
             retry_ok = self.answered and (not write or repeatable)
             if write:
+                self.check_count()
                 self._pace()
                 # Counted before the send: a count of requests that left
                 # rs-sync, so 0 means nothing reached GitHub (the summary).
@@ -1100,7 +1192,7 @@ class GitHub:
                     continue
                 if e.code in NO_ANSWER_STATUSES and retry_ok:
                     if write:               # GitHub may have counted it
-                        self.writes.append(time.time())
+                        self._record_write()
                     unanswered = True
                     no_answer_waited = self._no_answer_wait(
                         f"GitHub answered HTTP {e.code} (busy) ({method} {where})",
@@ -1109,7 +1201,7 @@ class GitHub:
                 if e.code in (404, 410) and ok404:
                     return e.code, None, headers
                 if write:
-                    self.writes.append(time.time())
+                    self._record_write()
                 if unanswered and method == "DELETE" and e.code in (404, 410):
                     return e.code, None, headers        # the first delete landed
                 if unanswered and confirm is not None and 400 <= e.code < 500:
@@ -1124,18 +1216,18 @@ class GitHub:
                 reason = getattr(e, "reason", None) or e
                 if retry_ok and _no_answer(e):
                     if write:               # GitHub may have counted it
-                        self.writes.append(time.time())
+                        self._record_write()
                     unanswered = True
                     no_answer_waited = self._no_answer_wait(
                         f"GitHub did not answer ({method} {where}: {reason})",
                         no_answer_waited)
                     continue
                 if write:                   # GitHub may have counted it
-                    self.writes.append(time.time())
+                    self._record_write()
                 die(f"GitHub did not answer ({method} {where}: {reason})")
             self.answered = True
             if write:
-                self.writes.append(time.time())
+                self._record_write()
             if self.scopes is None and headers.get("X-OAuth-Scopes") is not None:
                 self.scopes = headers.get("X-OAuth-Scopes")
             try:
@@ -1621,6 +1713,11 @@ def preflight_github(gh: GitHub, target: str, board: bool = False):
     _, me, _ = gh.call("GET", "/user")
     if not isinstance(me, dict) or "id" not in me:
         die("GitHub: could not read the token's account")
+    # From here every write is counted with the other runs' (a file rs-sync
+    # cannot read or write stops the run now, before any write).
+    gh.account = me["id"]
+    gh.share_writes(save=True)
+    REPORT["writes_this_hour"] = len(gh.writes)
     scopes = {s.strip() for s in (gh.scopes or "").split(",") if s.strip()}
     o, r = target.split("/", 1)
     status, repo, _ = gh.call("GET", f"/repos/{quote(o)}/{quote(r)}", ok404=True)
@@ -1650,7 +1747,9 @@ def do_import(gh: GitHub, target, payload, n_gitea) -> int:
     """Send one import and wait for GitHub's answer. While it runs,
     REPORT["importing"] names the Gitea item, so a run that stops here ends
     with advice (main); it is cleared only on a definite answer: imported
-    with its issue named, failed, or a 4xx refusal of the POST."""
+    with its issue named, failed, a 4xx refusal of the POST, or a CountError
+    (the shared write count could not be read, locked or saved) raised before
+    the send of an attempt GitHub could have accepted."""
     o, r = target.split("/", 1)
     what = f"Gitea #{n_gitea}"
     REPORT["importing"] = n_gitea
@@ -1658,7 +1757,9 @@ def do_import(gh: GitHub, target, payload, n_gitea) -> int:
         _, res, _ = gh.call("POST", f"/repos/{quote(o)}/{quote(r)}/import/issues",
                             payload, accept=IMPORT_ACCEPT)
     except SyncError as e:
-        if e.status is not None and 400 <= e.status < 500:
+        # A 4xx refusal, or a CountError raised before the send of the
+        # attempt: this import is not on GitHub.
+        if isinstance(e, CountError) or (e.status is not None and 400 <= e.status < 500):
             REPORT.pop("importing", None)
         die(f"{what}: {e}")
     url = (res if isinstance(res, dict) else {}).get("url")
@@ -1753,12 +1854,17 @@ def label_plan(gt_labels, gh_labels, items) -> tuple:
     return list(label_payloads(gt_labels, missing).values()), sorted(reused, key=str.lower)
 
 
-def estimate_minutes(writes: int) -> float:
-    """Minutes the pacing needs for `writes` content writes: every full
-    hourly allowance costs an hour, the rest goes at the per-minute pace."""
+def estimate_minutes(writes: int, used: int = 0) -> float:
+    """Minutes the pacing needs for `writes` content writes when `used` were
+    already made in the past hour: every full hourly allowance costs an hour,
+    the rest goes at the per-minute pace. The used writes are taken as just
+    made (the most the wait for them can be)."""
+    if writes <= 0:
+        return 0.0
     per_min = min(CONTENT_PER_MINUTE, 60.0 / MIN_WRITE_GAP_S)
-    full, rest = divmod(writes, CONTENT_PER_HOUR)
-    return round(full * 60 + rest / per_min, 1)
+    # The 500th write of an hour still fits it (_pace waits only past it).
+    full, rest = divmod(used + writes - 1, CONTENT_PER_HOUR)
+    return round(max(0.0, full * 60 + (rest + 1) / per_min - used / per_min), 1)
 
 
 def build_subjects_index(gh: GitHub, target, bases) -> dict:
@@ -1913,7 +2019,8 @@ def sync(args, env) -> None:
         # distinct issues per kind (a comment kind repeats its issue per comment)
         REPORT["plan_issues"] = {k: len(set(v)) for k, v in plan.items()}
         REPORT["estimated_writes"] = writes_est
-        REPORT["estimated_minutes"] = estimate_minutes(writes_est)
+        REPORT["estimated_minutes"] = estimate_minutes(writes_est,
+                                                       REPORT.get("writes_this_hour") or 0)
         REPORT["dry_run"] = True
         return
 
@@ -1977,6 +2084,7 @@ def sync(args, env) -> None:
     if board_state:
         node_of = {n: v["node_id"] for n, v in have["items"].items()}
         board_apply(gh, board_state, owner, repo, target, wanted, node_of, dry=False)
+    gh.check_count()                # a save that failed after the last write
     REPORT["dry_run"] = False
 
 
@@ -2992,6 +3100,7 @@ def remove(args, env) -> None:
     for l in labels:
         gh.call("DELETE", f"{base}/labels/{quote(l['name'], safe='')}")
         rec["labels_deleted"].append(l["name"])
+    gh.check_count()                # a save that failed after the last deletion
     REPORT["dry_run"] = False
 
 
@@ -3352,6 +3461,10 @@ def summary(r: dict) -> str:
         L.append(f"About {_plural(w, 'GitHub write')}, "
                  f"{'under a minute' if m < 1 else 'about ' + _duration(m * 60)} "
                  f"(GitHub limits how fast content can be created).")
+        used = r.get("writes_this_hour") or 0
+        if used:
+            L.append(f"GitHub has had {used} of its {CONTENT_PER_HOUR} writes this hour "
+                     f"from earlier rs-sync runs here; the estimate counts them.")
     return "\n".join(L)
 
 
