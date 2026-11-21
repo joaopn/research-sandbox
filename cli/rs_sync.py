@@ -132,9 +132,21 @@ NO_HEADER_WAIT_S = 60
 # run stops: GitHub's hourly window. A longer wait means the limit is not
 # clearing, and the run is resumed later instead.
 RATE_WAIT_MAX_S = 3600
+# A limit answer that names no usable wait (_limit_wait) waits
+# NO_HEADER_WAIT_S at first and this many times longer at each further such
+# answer to the same request, the last wait cut to what is left of
+# RATE_WAIT_MAX_S: GitHub's "wait for an exponentially increasing amount of
+# time between retries, and throw an error after a specific number of
+# retries". At 2 that is 60, 120, 240, 480, 960 and 1740 s: six tries in the
+# hour. At 1.5 it is about ten, still pressing on a limit GitHub says is not
+# clearing; at 10 it is two (60 s, then 3540 s), so a limit that clears after
+# two minutes idles the run for most of the hour.
+LIMIT_BACKOFF_FACTOR = 2
 # A read that gets no answer (a timeout, a dropped or cut-off connection) or
 # GitHub's "not now" (HTTP 502/503/504), once GitHub has answered this run, is
-# tried again; a write never is (GitHub may have received it). GitHub
+# tried again; so is a write that is safe to send twice (PUT, PATCH, a REST
+# DELETE, or a GraphQL mutation marked repeatable), since GitHub may have
+# received the first one. A write that creates something never is. GitHub
 # documents no retry interval for these: the minute is borrowed from its
 # documented wait for a limit answer without retry-after. It weighs idle time
 # after GitHub recovers (up to one interval) against how often rs-sync knocks
@@ -153,6 +165,18 @@ NO_ANSWER_WAIT_S = 60
 # 2026-11-21 ("1a": up to an hour).
 NO_ANSWER_MAX_S = 3600
 NO_ANSWER_STATUSES = (502, 503, 504)
+# After an import, GitHub may report the issue imported before its listing
+# shows it, or shows the comments it was imported with; a run that went on
+# would post those comments again, and a run started then would import the
+# issue again. The listing is read again every LIST_LAG_WAIT_S until it shows
+# them all, for at most LIST_LAG_MAX_S. Each check is one full read of the
+# mirrored issues and comments (a few pages of reads, 1 point each): a minute
+# keeps that to about 60 reads of each page an hour; the hour matches the
+# outage tolerance of NO_ANSWER_MAX_S (the maintainer's 2026-11-21 ruling). At
+# a tenth of the interval, a two-minute lag costs twenty full reads; at ten
+# times it, a lag of seconds idles the run ten minutes.
+LIST_LAG_WAIT_S = 60
+LIST_LAG_MAX_S = 3600
 # Import polling. GitHub processes an import in the background; the probe
 # saw imports finish in seconds. Every 2 s keeps the wait for a few-second
 # import short at a cost of a handful of reads; at half it the reads double
@@ -194,6 +218,10 @@ class SyncError(Exception):
 
 def die(msg: str) -> None:
     raise SyncError(msg)
+
+
+class DuplicateClaim(SyncError):
+    """Two GitHub issues or comments claim one Gitea item: someone deletes one."""
 
 
 # ============================================================================
@@ -998,19 +1026,30 @@ class GitHub:
         return waited + NO_ANSWER_WAIT_S
 
     def call(self, method, path, body=None, accept=None, full_url=None, ok404=False,
-             write=None):
+             write=None, repeatable=None, confirm=None):
+        """One request. `repeatable`: a write that is safe to send twice
+        (default: PUT, PATCH and DELETE; every PATCH rs-sync sends carries
+        absolute values), tried again after a missing answer like a read.
+        After such an attempt, a DELETE answered 404/410 counts as done (the
+        first one landed), and a 4xx on a write with `confirm` counts as done
+        when confirm() says the change is in place."""
         url = full_url or f"{self.base}{path}"
         # What every message names: the path, or the path part of the full
         # URL (the import-status poll passes an empty path).
         where = path or urlsplit(url).path
         if write is None:
             write = method in ("POST", "PATCH", "PUT", "DELETE")
+        if repeatable is None:
+            repeatable = method in ("PUT", "PATCH", "DELETE")
         waited = 0.0
         no_answer_waited = 0
+        limits = 0                  # limit answers that named no usable wait
+        unanswered = False          # an attempt of this request got no answer
         while True:
-            # Only a read, and only once GitHub has answered this run (a
-            # 502/503/504 never counts as that answer: see self.answered).
-            retry_ok = self.answered and not write
+            # Reads and repeatable writes, and only once GitHub has answered
+            # this run (a 502/503/504 never counts as that answer: see
+            # self.answered).
+            retry_ok = self.answered and (not write or repeatable)
             if write:
                 self._pace()
                 # Counted before the send: a count of requests that left
@@ -1043,15 +1082,26 @@ class GitHub:
                     or headers.get("retry-after")))
                 if limited:
                     wait = _limit_wait(headers)
-                    if waited + wait > RATE_WAIT_MAX_S:
-                        die(f"GitHub's rate limit did not clear within "
+                    over = (f"GitHub's rate limit did not clear within "
                             f"{RATE_WAIT_MAX_S} s ({method} {where}); run "
                             f"again later: the markers say what is done")
+                    if wait is None:        # no usable wait named: doubling
+                        # Never less than GitHub's minute: stop when less is left.
+                        if RATE_WAIT_MAX_S - waited < NO_HEADER_WAIT_S:
+                            die(over)
+                        wait = min(NO_HEADER_WAIT_S * LIMIT_BACKOFF_FACTOR ** limits,
+                                   RATE_WAIT_MAX_S - waited)
+                        limits += 1
+                    elif waited + wait > RATE_WAIT_MAX_S:
+                        die(over)
                     print(f"  rate limited; waiting {int(wait)} s", file=sys.stderr)
                     time.sleep(1 if _TEST_FAST else wait)
                     waited += wait
                     continue
                 if e.code in NO_ANSWER_STATUSES and retry_ok:
+                    if write:               # GitHub may have counted it
+                        self.writes.append(time.time())
+                    unanswered = True
                     no_answer_waited = self._no_answer_wait(
                         f"GitHub answered HTTP {e.code} (busy) ({method} {where})",
                         no_answer_waited)
@@ -1060,15 +1110,28 @@ class GitHub:
                     return e.code, None, headers
                 if write:
                     self.writes.append(time.time())
+                if unanswered and method == "DELETE" and e.code in (404, 410):
+                    return e.code, None, headers        # the first delete landed
+                if unanswered and confirm is not None and 400 <= e.code < 500:
+                    try:
+                        if confirm():
+                            return e.code, None, headers
+                    except SyncError:
+                        pass                # GitHub's error for the write stands
                 raise SyncError(f"GitHub {method} {where} answered HTTP {e.code}: "
                                 f"{_gh_error_text(text, self.token)}", status=e.code)
             except (URLError, OSError, http.client.HTTPException) as e:
                 reason = getattr(e, "reason", None) or e
                 if retry_ok and _no_answer(e):
+                    if write:               # GitHub may have counted it
+                        self.writes.append(time.time())
+                    unanswered = True
                     no_answer_waited = self._no_answer_wait(
                         f"GitHub did not answer ({method} {where}: {reason})",
                         no_answer_waited)
                     continue
+                if write:                   # GitHub may have counted it
+                    self.writes.append(time.time())
                 die(f"GitHub did not answer ({method} {where}: {reason})")
             self.answered = True
             if write:
@@ -1097,11 +1160,14 @@ class GitHub:
             url = _next_link(headers.get("Link") or "")
         return rows
 
-    def graphql(self, query, variables):
-        # A query is a read (no pacing); a mutation creates or changes content.
+    def graphql(self, query, variables, repeatable=False):
+        # A query is a read (no pacing); a mutation creates or changes content,
+        # and is tried again after a missing answer only when `repeatable`
+        # (it sets an absolute value: sending it twice changes nothing).
         _, out, _ = self.call("POST", "/graphql",
                               {"query": query, "variables": variables},
-                              write=query.lstrip().startswith("mutation"))
+                              write=query.lstrip().startswith("mutation"),
+                              repeatable=repeatable)
         if not isinstance(out, dict) or out.get("errors"):
             errs = out.get("errors") if isinstance(out, dict) else "the answer was not a JSON object"
             die(f"GitHub GraphQL failed: {_gh_error_text(json.dumps({'errors': errs}), self.token)}")
@@ -1123,7 +1189,7 @@ def _no_answer(e) -> bool:
                           http.client.IncompleteRead, http.client.BadStatusLine))
 
 
-def _limit_wait(headers) -> float:
+def _limit_wait(headers) -> "float | None":
     # A retry-after of GitHub's documented minute ("wait for at least one
     # minute before retrying") or more is waited exactly. A shorter one is no
     # usable wait unless a reset time (with x-ratelimit-remaining 0) at least
@@ -1132,6 +1198,8 @@ def _limit_wait(headers) -> float:
     # way, while GitHub warns that requests sent while limited may get an
     # integration banned. A reset at least a second ahead, with no
     # retry-after, is waited exactly.
+    # None: no usable wait was named, and the caller waits NO_HEADER_WAIT_S,
+    # doubling at each further such answer (LIMIT_BACKOFF_FACTOR).
     ra = headers.get("retry-after")
     short = False
     if ra and ra.strip().isdigit():
@@ -1142,9 +1210,10 @@ def _limit_wait(headers) -> float:
         reset = headers.get("x-ratelimit-reset")
         if reset and reset.strip().isdigit():
             left = float(reset) - time.time()
-            if not short or left >= NO_HEADER_WAIT_S:
-                return max(1.0, left)
-    return float(NO_HEADER_WAIT_S)
+            # A reset already past (a skewed clock) says "retry now": as above.
+            if left >= (NO_HEADER_WAIT_S if short else 1.0):
+                return left
+    return None
 
 
 def _next_link(link: str):
@@ -1442,8 +1511,8 @@ def read_github(gh: GitHub, target: str, me_id: int, owner: str, repo: str,
         if m["n"] in items and for_remove:
             continue
         if m["n"] in items:
-            die(f"GitHub issues #{items[m['n']]['number']} and #{i['number']} "
-                f"both claim Gitea #{m['n']}; delete one of them, then run again")
+            raise DuplicateClaim(f"GitHub issues #{items[m['n']]['number']} and #{i['number']} "
+                                 f"both claim Gitea #{m['n']}; delete one of them, then run again")
         items[m["n"]] = {"number": i["number"], "node_id": i.get("node_id"),
                          "title": i.get("title") or "", "body": i.get("body") or "",
                          "state": i.get("state"), "locked": bool(i.get("locked")),
@@ -1471,16 +1540,16 @@ def read_github(gh: GitHub, target: str, me_id: int, owner: str, repo: str,
         rec = {"id": c["id"], "body": c.get("body") or ""}
         if m["kind"] is None and m["part"]:
             if m["part"] in items[src]["parts"]:
-                die(f"two GitHub comments on #{n} claim part {m['part']} of its "
-                    f"body; delete one of them, then run again")
+                raise DuplicateClaim(f"two GitHub comments on #{n} claim part {m['part']} of its "
+                                     f"body; delete one of them, then run again")
             items[src]["parts"][m["part"]] = rec
             continue
         if m["kind"] is None:
             continue
         key = (m["kind"], m["cid"], m["part"] or 0)
         if key in items[src]["comments"]:
-            die(f"two GitHub comments on #{n} claim the same Gitea {m['kind']} "
-                f"{m['cid']}; delete one of them, then run again")
+            raise DuplicateClaim(f"two GitHub comments on #{n} claim the same Gitea {m['kind']} "
+                                 f"{m['cid']}; delete one of them, then run again")
         items[src]["comments"][key] = rec
     if foreign and not for_remove:
         die(f"this GitHub repo holds items mirrored from another Gitea repo "
@@ -1867,6 +1936,7 @@ def sync(args, env) -> None:
         done["labels_created"].append(pl["name"])
 
     # Imports, in Gitea number order, each awaited before the next.
+    sent = {}
     for it in new_items:
         parts = item_parts(ctx, it, rid, env["header"], subjects_index)
         payload_comments = [{"body": p, "created_at": it["created_at"]} for p in parts[1:]]
@@ -1884,24 +1954,17 @@ def sync(args, env) -> None:
             issue["closed_at"] = it["closed_at"]
         n = do_import(gh, target, {"issue": issue, "comments": payload_comments}, it["n"])
         done["imported"][it["n"]] = n
+        # What the listing must show before the run goes on: the body's
+        # continuation parts and the comments, by their marker keys.
+        sent[it["n"]] = (set(range(1, len(parts))),
+                         {(c["kind"], c["id"], k) for c in it["comments"]
+                          for k, _ in enumerate(comment_parts(ctx, it, c, rid))})
         table[it["n"]] = n
         print(f"  imported Gitea #{it['n']} as GitHub #{n}", file=sys.stderr)
 
     # Re-read GitHub, then bring every mirrored item level (forward
     # references, edits, new comments, state, labels, lock, deletions).
-    have = read_github(gh, target, me["id"], owner, repo)
-    # Every item this run imported must be listed now, as the issue this run
-    # made. Missing: GitHub's list lags, and a run started now would import it
-    # again. Another number: an older copy (an import from an interrupted run
-    # that landed late) claims the item. Either way stop before any edit.
-    for gn, num in sorted(done["imported"].items()):
-        listed = have["items"].get(gn)
-        if listed is None:
-            die(f"GitHub has imported Gitea #{gn} as #{num} but does not list it "
-                f"yet; wait a few minutes, then run again")
-        if listed["number"] != num:
-            die(f"GitHub issues #{listed['number']} and #{num} both claim Gitea #{gn}; "
-                f"delete one of them, then run again")
+    have = wait_for_imports(gh, target, me["id"], owner, repo, done["imported"], sent)
     for n, v in have["items"].items():
         if n not in kept_off:
             table[n] = v["number"]
@@ -1915,6 +1978,50 @@ def sync(args, env) -> None:
         node_of = {n: v["node_id"] for n, v in have["items"].items()}
         board_apply(gh, board_state, owner, repo, target, wanted, node_of, dry=False)
     REPORT["dry_run"] = False
+
+
+def wait_for_imports(gh: GitHub, target, me_id, owner, repo, imported, sent) -> dict:
+    """Read GitHub until every item this run imported is listed, as the issue
+    this run made, with the body parts and comments its import sent. Missing:
+    GitHub's listing lags; a run going on would post those comments again,
+    and a run started now would import the item again, so the listing is
+    read again every LIST_LAG_WAIT_S, for at most LIST_LAG_MAX_S, with
+    REPORT["lagging"] naming the items (the advice of a run stopped then).
+    Another number: an older copy (an import from an interrupted run that
+    landed late) claims the item, and the run stops before any edit."""
+    lag_waited = 0
+    while True:
+        try:
+            have = read_github(gh, target, me_id, owner, repo)
+        except DuplicateClaim:
+            REPORT.pop("lagging", None)         # not a lag: the advice would mislead
+            raise
+        lagging = []
+        for gn, num in sorted(imported.items()):
+            listed = have["items"].get(gn)
+            if listed is None:
+                lagging.append((gn, num, "the issue"))
+                continue
+            if listed["number"] != num:
+                REPORT.pop("lagging", None)
+                raise DuplicateClaim(f"GitHub issues #{listed['number']} and #{num} both claim "
+                                     f"Gitea #{gn}; delete one of them, then run again")
+            parts, comments = sent.get(gn, (set(), set()))
+            if not parts <= set(listed["parts"]) or not comments <= set(listed["comments"]):
+                lagging.append((gn, num, "all of its comments"))
+        if not lagging:
+            REPORT.pop("lagging", None)
+            return have
+        REPORT["lagging"] = [gn for gn, _, _ in lagging]
+        gn, num, what = lagging[0]
+        more = f" (and {len(lagging) - 1} more)" if len(lagging) > 1 else ""
+        if lag_waited + LIST_LAG_WAIT_S > LIST_LAG_MAX_S:
+            die(f"GitHub has imported Gitea #{gn} as #{num} but does not list {what} "
+                f"yet{more}; wait a few minutes, then run again")
+        print(f"  GitHub has imported Gitea #{gn} as #{num} but does not list {what} "
+              f"yet{more}; reading again in {LIST_LAG_WAIT_S} s", file=sys.stderr)
+        time.sleep(1 if _TEST_FAST else LIST_LAG_WAIT_S)
+        lag_waited += LIST_LAG_WAIT_S
 
 
 def _fill_existing_plan(plan, items, have, ctx, rid, env, subjects_index, gt, g, owner, repo,
@@ -2008,7 +2115,8 @@ def _fill_existing_plan(plan, items, have, ctx, rid, env, subjects_index, gt, g,
         if not cur["locked"]:
             plan["lock"].append(num)
             if not dry:
-                gh.call("PUT", f"{base}/issues/{num}/lock", {})
+                gh.call("PUT", f"{base}/issues/{num}/lock", {},
+                        confirm=lambda num=num: _issue_locked(gh, base, num))
                 done["locked"].append(num)
     # Mirrored items whose Gitea source is gone (a direct read says 404).
     # Skipped items are deleted on the Gitea read's own evidence, not here.
@@ -2036,6 +2144,13 @@ def _fill_existing_plan(plan, items, have, ctx, rid, env, subjects_index, gt, g,
         if not dry:
             delete_issue(gh, have["items"][n]["node_id"], num)
             done["deleted"].append(num)
+
+
+def _issue_locked(gh: GitHub, base, num) -> bool:
+    """Whether GitHub shows the issue locked (a lock that got no answer, then
+    a refusal of its repeat: the first one may have landed)."""
+    _, i, _ = gh.call("GET", f"{base}/issues/{num}")
+    return isinstance(i, dict) and bool(i.get("locked"))
 
 
 def _held_open(gt, n) -> bool:
@@ -2686,7 +2801,7 @@ def board_apply(gh: GitHub, state, owner, repo, target, wanted_numbers, node_of,
             die("GitHub did not return the new project's id")
         # The marker first: a project without it would be found by no later
         # run and removed by no --remove.
-        gh.graphql(M_UPDATE, {"p": pid, "d": desc, "pub": public})
+        gh.graphql(M_UPDATE, {"p": pid, "d": desc, "pub": public}, repeatable=True)
         gh.graphql(M_LINK, {"p": pid, "r": state["repo_id"]})
         state["project"] = {"id": pid}
         # From here the counts are of the writes actually made.
@@ -2717,7 +2832,7 @@ def board_apply(gh: GitHub, state, owner, repo, target, wanted_numbers, node_of,
     if cur["desc"] != desc or bool(cur["public"]) != public:
         plan["project_settings"] += 1
         if not dry:
-            gh.graphql(M_UPDATE, {"p": pid, "d": desc, "pub": public})
+            gh.graphql(M_UPDATE, {"p": pid, "d": desc, "pub": public}, repeatable=True)
     if state["repo_id"] not in cur["repos"]:
         plan["project_settings"] += 1
         if not dry:
@@ -2784,7 +2899,8 @@ def board_apply(gh: GitHub, state, owner, repo, target, wanted_numbers, node_of,
             if it["values"].get(fid) != oid:
                 plan["set"] += 1
                 if not dry:
-                    gh.graphql(M_SET, {"p": pid, "i": it["id"], "f": fid, "v": oid})
+                    gh.graphql(M_SET, {"p": pid, "i": it["id"], "f": fid, "v": oid},
+                               repeatable=True)
         order.append(it["id"])
     remove_unwanted({node_of.get(n) for n, _, _ in want["items"]})
     if dry and plan["add"]:
@@ -2792,16 +2908,25 @@ def board_apply(gh: GitHub, state, owner, repo, target, wanted_numbers, node_of,
     if plan["add"] and not dry:
         # Where GitHub places a new item is not measured: read the order back.
         cur = read_board(gh, pid)
-    listed = {i["id"] for i in cur["items"]}
-    unlisted = [i for i in order if i not in listed]
-    if unlisted:
-        die(f"GitHub does not list {len(unlisted)} new project item(s) yet; run again "
-            f"shortly to put them in order")
+    lag_waited = 0
+    while True:
+        listed = {i["id"] for i in cur["items"]}
+        unlisted = [i for i in order if i not in listed]
+        if not unlisted:
+            break
+        if dry or lag_waited + LIST_LAG_WAIT_S > LIST_LAG_MAX_S:
+            die(f"GitHub does not list {len(unlisted)} new project item(s) yet; run again "
+                f"shortly to put them in order")
+        print(f"  GitHub does not list {len(unlisted)} new project item(s) yet; reading "
+              f"the board again in {LIST_LAG_WAIT_S} s", file=sys.stderr)
+        time.sleep(1 if _TEST_FAST else LIST_LAG_WAIT_S)
+        lag_waited += LIST_LAG_WAIT_S
+        cur = read_board(gh, pid)
     moves = plan_moves([i["id"] for i in cur["items"]], order)
     plan["move"] = len(moves)
     if not dry:
         for item, after in moves:
-            gh.graphql(M_MOVE, {"p": pid, "i": item, "a": after})
+            gh.graphql(M_MOVE, {"p": pid, "i": item, "a": after}, repeatable=True)
 
 
 # ============================================================================
@@ -3251,6 +3376,13 @@ def import_advice() -> str:
     """The last line of a run that stopped while an import was being sent or
     awaited; empty when none was. Worded to hold whether or not GitHub
     received it (the record also covers the wait before sending)."""
+    lag = REPORT.get("lagging")
+    if lag:
+        more = f" and {len(lag) - 1} more" if len(lag) > 1 else ""
+        return (f"GitHub had not yet listed Gitea #{lag[0]}{more}, imported by this run, or "
+                f"not all of its comments, when rs-sync stopped. Wait a few minutes before "
+                f"running again, so the next run sees them and neither imports the item nor "
+                f"posts its comments a second time.")
     n = REPORT.get("importing")
     if n is None:
         return ""
