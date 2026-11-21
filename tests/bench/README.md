@@ -50,8 +50,10 @@ nothing:
 
     python3 tests/bench/bench.py --run r1 --dry-run
 
-A real run signs in with a Claude token made once with `claude setup-token`
-and, for pi, a provider API key, each in a file under `/workspace`:
+A real run signs Claude in with a token made once with `claude setup-token`
+(`--claude-token-file`) or with an Anthropic API key (`--claude-key-file`; not
+for the `research` type, whose workers need the token), and pi with a provider
+API key, each in a file under `/workspace`:
 
     python3 tests/bench/bench.py --run r1 --claude-token-file /workspace/.bench/claude-token
     python3 tests/bench/bench.py --run r2 --evals recall --arms researcher researcher-pi \

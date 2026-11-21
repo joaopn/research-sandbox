@@ -13,6 +13,7 @@ with the agent downloads and the reader pulled:
 
     python3 tests/bench/bench.py --run r1 --dry-run
     python3 tests/bench/bench.py --run r1 --claude-token-file /workspace/.bench/claude-token
+    python3 tests/bench/bench.py --run r1 --claude-key-file /workspace/.bench/claude-key
     python3 tests/bench/bench.py --run r1 --evals recall --arms researcher researcher-pi \\
         --claude-token-file /workspace/.bench/claude-token \\
         --pi-model anthropic/claude-sonnet-4-5 --pi-key-file /workspace/.bench/pi-key
@@ -257,10 +258,15 @@ class Bench:
             if not var:
                 raise SystemExit(f"no key variable known for pi provider {prov!r}; pass --pi-key-env")
             return {var: Path(self.a.pi_key_file).read_text().strip()}
+        if self.a.claude_key_file:
+            return {"ANTHROPIC_API_KEY": self.claude_key()}
         return {"CLAUDE_CODE_OAUTH_TOKEN": self.claude_token()}
 
     def claude_token(self) -> str:
         return Path(self.a.claude_token_file).read_text().strip()
+
+    def claude_key(self) -> str:
+        return Path(self.a.claude_key_file).read_text().strip()
 
     def agent_cmd(self, arm) -> str:
         if ARMS[arm]["agent"] == "pi":
@@ -315,9 +321,20 @@ class Bench:
     def seed_claude(self, c) -> None:
         seed = ('.hasCompletedOnboarding = true | .bypassPermissionsModeAccepted = true'
                 ' | .projects["/workspace"] = ((.projects["/workspace"] // {}) + {"hasTrustDialogAccepted": true})')
-        if self.a.standin:
-            seed += f' | .customApiKeyResponses = {{"approved": ["{STANDIN_KEY[-20:]}"], "rejected": []}}'
-        self.ex(c, f"f={RH}/.claude.json; [ -f $f ] || echo '{{}}' > $f; jq '{seed}' $f > $f.t && mv $f.t $f")
+        # an API key is approved ahead (Claude Code asks about a key in the
+        # environment at its first start); the approval names the key's last
+        # 20 characters, passed over stdin, never on a command line
+        key = STANDIN_KEY if self.a.standin else (self.claude_key() if self.a.claude_key_file else None)
+        if key:
+            seed += ' | .customApiKeyResponses = {"approved": [$k], "rejected": []}'
+        # stdin is jq's main input (read raw), the settings file its slurped second
+        # written private: it holds the key's last 20 characters
+        r = self.ex(c, f"umask 077; f={RH}/.claude.json; [ -f $f ] || echo '{{}}' > $f; "
+                       f"jq -Rs --slurpfile c $f '. as $k | $c[0] | {seed}' > $f.t && mv $f.t $f",
+                    inp=(key or "")[-20:].encode())
+        if r.returncode != 0:
+            raise SystemExit(f"could not write Claude's first-start settings in {c}: "
+                             f"{r.stderr.decode('utf-8', 'replace')[-500:]}")
 
     def start_standin(self, c) -> None:
         self.ex(c, "cat > /tmp/bench-standin.py", inp=(HERE / "standin.py").read_bytes())
@@ -911,6 +928,7 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="print what the run will do and exit")
     ap.add_argument("--standin", action="store_true", help="stand-in models: zero tokens, plumbing only")
     ap.add_argument("--claude-token-file", help="a `claude setup-token` token, one line")
+    ap.add_argument("--claude-key-file", help="an Anthropic API key, one line (instead of a token)")
     ap.add_argument("--pi-model", help="provider/model for pi")
     ap.add_argument("--pi-key-file", help="the pi provider's API key, one line")
     ap.add_argument("--pi-key-env", help="the variable pi reads the key from (known providers need none)")
@@ -946,8 +964,15 @@ def main() -> None:
         return
     if not a.standin:
         need = []
-        if not a.claude_token_file:
-            need.append("--claude-token-file (the Claude arms and the grader)")
+        if a.claude_token_file and a.claude_key_file:
+            ap.error("give --claude-token-file or --claude-key-file, not both")
+        if not (a.claude_token_file or a.claude_key_file):
+            need.append("--claude-token-file or --claude-key-file (the Claude arms and the grader)")
+        if a.claude_key_file and "research" in a.arms:
+            # the research flow's supervisor hands its sign-in file to the
+            # workers it spawns; an API key gives it none to hand on
+            ap.error("the research type needs --claude-token-file: its workers sign in from the supervisor's "
+                     "credentials file, which an API key does not provide")
         if "researcher-pi" in a.arms and not (a.pi_model and a.pi_key_file):
             need.append("--pi-model and --pi-key-file (the pi arm)")
         if need:
