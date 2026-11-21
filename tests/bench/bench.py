@@ -27,8 +27,9 @@ time cap per eval and project type stop it and report it over budget. Real
 tokens are spent unless --standin is given (stand-in models: the plumbing,
 zero tokens, scores meaningless). Results go to tests/bench/results/<run>/
 (results.json, table.md), which git ignores. Secrets never reach a command
-line: each project gets them in a 0600 file under its own /dev/shm, written
-over stdin and sourced by the agent's shell.
+line: a Claude token is written over stdin as the project's Claude credentials
+file (where /login puts it); keys go over stdin into a 0600 file under the
+project's own /dev/shm, sourced by the agent's shell.
 
 Arms:
   researcher        the researcher type with Claude
@@ -75,6 +76,10 @@ ARMS = {
     "research": {"workflow": "research", "agent": "claude", "memory": False, "log": True},
 }
 DEFAULT_ARMS = ("researcher", "floor")
+# A setup token has no refresh; the credentials file needs an expiry, so it
+# names one past any eval run (2100-01-01): Claude Code then never tries to
+# refresh it, and the token's own lifetime is what the API enforces.
+CREDENTIALS_EXPIRY_MS = 4102444800000
 # Box-drawing characters (U+2500-U+257F): an agent's screen frames its prompt
 # with full-width lines of them, which say nothing about an error.
 BOX = "".join(chr(i) for i in range(0x2500, 0x2580))
@@ -244,7 +249,7 @@ class Bench:
 
     def ex(self, c, cmd: str, *, inp: "bytes | None" = None, timeout=None):
         """A shell command in a project as its agent user (never a secret on
-        its command line: those are in the project's env file)."""
+        its command line: secrets travel over stdin, `inp`)."""
         return subprocess.run(["docker", "exec", "-i", "-u", "research", "-w", "/workspace",
                                "-e", f"HOME={RH}", c, "sh", "-c", cmd],
                               input=inp, capture_output=True, timeout=timeout)
@@ -278,7 +283,11 @@ class Bench:
             return {var: Path(self.a.pi_key_file).read_text().strip()}
         if self.a.claude_key_file:
             return {"ANTHROPIC_API_KEY": self.claude_key()}
-        return {"CLAUDE_CODE_OAUTH_TOKEN": self.claude_token()}
+        # a token signs in through the credentials file (sign_in_claude), as
+        # /login leaves a real project: Claude Code keeps an environment token
+        # from the commands and hooks it runs, so the session-end consolidation
+        # would start signed out (measured)
+        return {}
 
     def claude_token(self) -> str:
         return Path(self.a.claude_token_file).read_text().strip()
@@ -376,13 +385,8 @@ class Bench:
         if spec.get("nohook"):
             self.ex(c, f"f={RH}/.claude/settings.json; jq '.hooks.SessionStart |= map(select(all(.hooks[]?; "
                        f"(.command // \"\") | test(\"rs-memory open\") | not)))' $f > $f.t && mv $f.t $f")
-        if spec["workflow"] == "research" and not self.a.standin:
-            # the supervisor hands its credentials file to the workers it
-            # spawns: the token is written there (the project is destroyed at
-            # the end of the eval)
-            cred = json.dumps({"claudeAiOauth": {"accessToken": self.claude_token(), "refreshToken": "",
-                                                 "expiresAt": 4102444800000, "scopes": ["user:inference"]}})
-            self.ex(c, f"umask 077; mkdir -p {RH}/.claude && cat > {RH}/.claude/.credentials.json", inp=cred.encode())
+        if spec["agent"] == "claude":
+            self.sign_in_claude(c)
         if self.a.standin:
             self.start_standin(c)
             if spec["agent"] == "pi":
@@ -398,9 +402,24 @@ class Bench:
                        f"'.defaultProvider=$p | .defaultModel=$m' $f > $f.t && mv $f.t $f")
         return p, c
 
+    def sign_in_claude(self, c) -> None:
+        """A token run writes the token as Claude's credentials file (over
+        stdin, private), where /login puts it in a real project; the research
+        flow's supervisor also hands that file to the workers it spawns. Key
+        and stand-in runs sign in through the environment instead."""
+        if self.a.standin or self.a.claude_key_file:
+            return
+        cred = json.dumps({"claudeAiOauth": {"accessToken": self.claude_token(), "refreshToken": "",
+                                             "expiresAt": CREDENTIALS_EXPIRY_MS, "scopes": ["user:inference"]}})
+        r = self.ex(c, f"umask 077; mkdir -p {RH}/.claude && cat > {RH}/.claude/.credentials.json", inp=cred.encode())
+        if r.returncode != 0:
+            raise SystemExit(f"could not write Claude's credentials file in {c}: "
+                             f"{r.stderr.decode('utf-8', 'replace')[-300:]}")
+
     def setup_grader(self) -> str:
         c = self.create(f"bench-{self.a.run}-grader", "--workflow", "sandbox-dind", "--agent", "claude")
         self.seed_claude(c)
+        self.sign_in_claude(c)
         # the grader sees only the key, the question and the answer: no
         # built-in memory, no tools, an empty folder
         self.stage_secrets(c, "floor", {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"})
