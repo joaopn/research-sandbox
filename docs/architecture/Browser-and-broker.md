@@ -42,8 +42,8 @@ The left rail lists the projects, with four entries at its bottom.
 |---|---|---|
 | Projects rail | Always shown | Lists projects and opens their tabs; host CPU and memory |
 | New Project | Floating window | Workflow cards to create a project; import an existing one |
-| Development | Tabs: Gitea, Fetch, Repos, Reviews, Backup | The [Dev lane](Dev-lane.md): Gitea, fetch commands, repositories, reviews, Gitea backups |
-| Sandboxes | Tabs: Management, Infrastructure, Software | Project table; shared services and host settings; agent, editor and image builds |
+| Development | Tabs: Gitea, Fetch, Repos, Images, Reviews, Backup | The [Dev lane](Dev-lane.md): Gitea, fetch commands, repositories, image builds of mirrored repos, reviews, Gitea backups |
+| Sandboxes | Tabs: Management, Infrastructure, Software, MCP | Project table; shared services and host settings; agent, editor and image builds; the [MCP servers](MCP-servers.md) behind the shared gateway and their wiring |
 | Settings | Floating window | Interface settings kept in the browser: themes, layout, zoom, terminal font |
 
 In the Management table each project row has Start or Stop and Destroy; a running project also has Attach and Update. Each project's gear in the sidebar opens its ⚙ window: a floating window in the middle of the screen that lists the sections Tabs, Extensions, Agents, Sharing, Ports, Alerts and Sidebar down the left and shows one at a time. It keeps one size, its corner drags, and it closes when a change made from it finishes.

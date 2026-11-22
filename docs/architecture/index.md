@@ -62,8 +62,8 @@ Each page ends with its full list of design decisions and their costs; these are
 
 ### [Research](Research.md)
 
-- The existing research workflow is the benchmark and is not changed; three planned workflows are added beside it.
-- The planned workflows are independent and built in order: a researcher, a researcher with subagents, a lab.
+- The existing research workflow is the benchmark and is not changed; three lab-agenda workflows are added beside it, the first (researcher) built and two planned.
+- The lab-agenda workflows are independent and built in order: a researcher, a researcher with subagents, a lab.
 - Nothing becomes established knowledge without the user's acceptance; a referee advises the user and binds the agent.
 - Tools before prose, and the same behaviour under Claude and pi.
 

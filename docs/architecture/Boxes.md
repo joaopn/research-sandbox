@@ -9,7 +9,7 @@ A box is a long-lived container added to a project. It runs in the project's own
 
 ## Where boxes run
 
-Boxes need a project with its own inner Docker: research, sandbox-dind, dev, and any store workflow built on them. A project that runs as a single plain container (sandbox and the docker-based store workflows) cannot hold boxes. A project holds up to 12 boxes, added and removed while it runs, from the **+** button on its tab strip.
+Boxes need a project with its own inner Docker: research, researcher, sandbox-dind, dev, and any store workflow built on them. A project that runs as a single plain container (sandbox and the docker-based store workflows) cannot hold boxes. A project holds up to 12 boxes, added and removed while it runs, from the **+** button on its tab strip.
 
 A box sits on the project's inner network, and its outbound traffic follows the project's egress rules (see [Networking and egress](Networking-and-egress.md)). A dev box has a separate network of its own, which reaches the shared Gitea and nothing else in the project.
 

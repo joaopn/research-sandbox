@@ -37,7 +37,7 @@ project destroy <name|--all>       Remove container + workspace + network + cred
 ```
 --workflow <name>          Workflow selector (default: research). See `workflow list`.
 --mount <paths>            Comma-separated host folders (repeatable), each RO at /workspace/mnt/<basename>/
---egress {open,locked}     Egress policy (research→open, sandbox→locked)
+--egress {open,locked}     Egress policy (default: DEFAULT_EGRESS from .env for research, usually open; locked for the other shipped workflows)
 --enable / --disable <ids> Worker services to (de)activate at create
 --mcp <names>              MCPs to auto-allow: 'all-enabled' (default), 'none', or a CSV of registry names
 --memory / --cpus <limit>  Docker resource limits (e.g. 16g / 4)
@@ -93,7 +93,7 @@ pi also carries subagents: the pi dist ships the `pi-subagents` extension packag
 ### Browser UI + broker (optional)
 
 ```
-broker passwd                      Set/replace the operator (management) password
+broker passwd                      Set/replace the master password (the same one the browser uses)
 broker start | stop | status       The host-side lifecycle-verb daemon (owns docker access)
 webui  start [--bind IP] [--port N] [--rebuild]   Start the HTTPS browser UI
 webui  stop | status | import | cert-tailscale
@@ -130,4 +130,4 @@ project worker disable | stop | start | list | status <proj> [<name>]
 The supervisor's Claude uses these; you rarely call them directly.
 
 - **`rs-worker`** — analysis-worker lifecycle: `spawn --plan`, `list`, `status`, `wait`, `message`, `finalize`/`accept`/`unstage` (the cycle gates), `shutdown`/`destroy`, `attach`/`tail`.
-- **`rs-sandbox`** — (DIND projects) box lifecycle: `create [name] --preset {empty,websearcher,data-wrangler,byo} [--agent claude|pi|none] [--editor] [--mcps csv] [--repo URL --ref SHA --setup CMD]`, `list [--json]`, `stop`, `start`, `restart`, `discard [--keep-workspace]`.
+- **`rs-sandbox`** — (DIND projects) box lifecycle: `create [name] --preset <type> [--agent claude|pi|none] [--editor] [--mcps csv] [--repo URL --ref SHA --setup CMD]`, `list [--json]`, `stop`, `start`, `restart`, `discard [--keep-workspace]`. `<type>` is any box type in the catalog: the eight built-in ones (see [Capabilities](capabilities.md#boxes)) or one the operator registered; default `empty`.

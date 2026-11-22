@@ -16,14 +16,14 @@ Threat model, isolation layers, and what is and isn't enforced.
 [◾ Host hardening (operator-applied)](#-host-hardening-operator-applied)
 [◾ MCP server contract](#-mcp-server-contract)
 [◾ Egress modes](#-egress-modes)
+[◾ Inner-bridge guard (always on)](#-inner-bridge-guard-always-on)
 [◾ Inner-bridge firewall](#-inner-bridge-firewall)
-[◾ Reporting issues](#-reporting-issues)
 
 ---
 
 ## ◾ Threat model
 
-The PI runs an LLM (Claude Code) with `bypassPermissions` against potentially-untrusted research data, third-party MCP servers, and downloaded code (pip install, papers, datasets). Two things follow:
+The PI runs an LLM agent (Claude Code or pi) with `bypassPermissions` against potentially-untrusted research data, third-party MCP servers, and downloaded code (pip install, papers, datasets). Two things follow:
 
 - **A worker is semi-trusted at best.** Prompt injection from the data the worker is analyzing, from MCP server responses, or from web pages it fetched can compromise the worker.
 - **Supervisor compromise via worker is in scope.** A compromised worker can exfiltrate prompts to its own session, and through artifacts it produces (which the supervisor reads) it can attempt to inject the supervisor. We do *not* try to defend against this; the supervisor is treated as untrusted-from-worker's-perspective for some purposes.
@@ -46,10 +46,10 @@ These are enforced:
 
 | Property | Mechanism |
 |---|---|
-| Supervisor cannot read host filesystem outside its workspace | sysbox user-namespacing + bind-mount limits (no host paths bind-mounted in besides `/workspace/<proj>` and the registry RO) |
+| Supervisor cannot read host filesystem outside its workspace | Under sysbox: user-namespacing + bind-mount limits (no host paths bind-mounted in besides `/workspace/<proj>` and the registry RO). Not under `--privileged` (the automatic fallback, or `--dind privileged`; see below) |
 | Supervisor cannot reach the host's docker socket | None pass-through; inner daemon is its own dockerd |
-| Supervisor cannot reach the host's RFC1918 LAN | rs-router default-DROPs RFC1918 destinations |
-| Supervisor cannot reach another project's workspace | Per-project bind-mount, per-project network namespace |
+| Supervisor cannot reach the host's LAN through the router | rs-router DROPs private destinations (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16) in every egress mode; the two paths around the router are closed only by the operator-applied [host rules](#-host-hardening-operator-applied) |
+| Supervisor cannot reach another project's workspace | Per-project bind-mount, per-project network namespace. Not under `--privileged` (see below) |
 | Worker cannot reach an MCP it wasn't granted | Four layers: `--mcps` check at spawn; `.mcp.json` lists only allowed; mcp-proxy config only allows; rs-router iptables only routes |
 | Worker cannot reach the host filesystem | No host bind-mounts in the worker; only `/workspace/shared/` (RO) from the supervisor |
 | Worker cannot reach another worker's workspace | Each worker's workdir is a separate bind-mount |
@@ -61,12 +61,13 @@ These are enforced:
 Worth being explicit:
 
 - **A compromised worker can compromise the supervisor.** Prompt injection through deliverables (`research_log.md`, `summary.md`, file names, plot titles, etc.) is possible. The supervisor reads these; an adversarial worker can attempt to mislead. The PI reviewing artifacts is the backstop, by design — *"short enough to skim, complete enough to verify from"*. Don't treat the supervisor's report as gospel for security-relevant assertions.
-- **A compromised supervisor can exfiltrate its own OAuth token.** That token is per-project and per-PI; revoking via the Anthropic console invalidates it. Treat token exposure as a "rotate the key, destroy the project" event, not a host compromise.
+- **A compromised supervisor can exfiltrate its own OAuth token.** That token is per-project and per-PI; revoking via the Anthropic console invalidates it. Treat token exposure as a "rotate the key, destroy the project" event, not a host compromise. A pi project's provider API key (OpenRouter or another provider) sits at the same trust level: revoke it at its provider.
+- **Under `--privileged` the project's root is host-root-equivalent.** Without Sysbox (or with `--dind privileged`), RS runs inner-Docker projects `--privileged`: the project container's root is a real root, so the user-namespace and bind-mount limits in the table above do not hold, and a compromised project can reach the host and every other project's workspace. Install Sysbox, then destroy and recreate each existing inner-Docker project: a project keeps the runtime it was created with.
 - **A GitHub SSH key you give a box is readable by the agent in that box.** The optional key (`RS_GITHUB_SSH_KEY_FILE`, or the create form's Authentication box) is installed at `~/.ssh/github` inside the container. Boxes run their agent under `bypassPermissions`, and that agent reads repo content which may be adversarial — so an account-wide key is a prompt-injection-to-force-push path. RS **cannot** scope the key: unlike a PAT, which GitHub lets you make fine-grained and per-repo, an SSH key carries whatever access its GitHub account has. **Use a per-repo deploy key**, read-only unless the box genuinely needs to push. The create form requires an explicit acknowledgment tick before accepting a key; that is a prompt, not an enforcement. Rotate/revoke on GitHub if a box is compromised — the same "rotate the key, destroy the project" posture as the OAuth token above.
 - **The key and the git identity transit host disk during a container swap.** A sysbox `project start` and a docker-box editor toggle both destroy the container, so `~/.ssh/` and `~/.gitconfig` are moved into the project workspace (`.ssh-stash`, `.gitconfig-stash`) and moved back at next boot — the same mechanism the Claude credentials already use. The window is the swap itself, not the project's running lifetime. `~/.git-credentials` is deliberately *not* carried, so a dev supervisor's gitea token is never parked on host disk.
 - **External-MCP tokens you put in the registry are visible to the supervisor.** `${VAR}` interpolation resolves on registry load; the resolved value is in the supervisor's view. Treat any token in `~/.research-sandbox/mcp-registry.json` as exposed at the supervisor's trust level.
 - **The host port your `external` MCP listens on must be chosen carefully.** rs-router rules are dest-IP-and-port-keyed. If another service runs on the same port the registry pointed at, the project would reach it. Admin discipline, not code-enforced.
-- **Workers' direct internet egress is allowed by default.** `--egress open` lets workers reach anywhere except RFC1918. If you want strict "MCP-mediated only" egress, use `--egress locked` (HTTP/HTTPS, and DNS to the configured resolvers only) and/or `--inner-firewall`. Even then, "locked" allows arbitrary HTTPS endpoints — true offline-only would be a separate egress mode.
+- **Workers' direct internet egress is allowed by default.** A research project takes the operator's configured default, open unless changed, and `--egress open` lets workers reach anywhere except the private ranges the router drops (and the router sees only routed traffic: see [Host hardening](#-host-hardening-operator-applied) for the paths around it). If you want strict "MCP-mediated only" egress, use `--egress locked` (HTTP/HTTPS, and DNS to the configured resolvers only) and/or `--inner-firewall`. Even then, "locked" allows arbitrary HTTPS endpoints — true offline-only would be a separate egress mode.
 
 ## ◾ Isolation layers
 
@@ -87,7 +88,7 @@ Each project sits inside multiple boundaries that must all be crossed for a work
 
 - Alpine + iptables, sits on `rs-sandbox` (the shared "outside" network from the projects' perspective).
 - iptables FORWARD rules keyed on the project subnet:
-  - Default: drop RFC1918 destinations (host's LAN, other docker bridges).
+  - In every mode: drop private destinations (RFC1918 and link-local: the host's LAN, other docker bridges). This holds for traffic routed through the router; a project's root can route around it, and the host answers at the bridge gateway, until the operator applies the [host rules](#-host-hardening-operator-applied) below.
   - `--egress open`: allow everything else.
   - `--egress locked`: allow only TCP/80, TCP/443, and UDP/TCP 53 to the resolvers configured in `SANDBOX_DNS`; no ICMP (errors still arrive as related traffic; echo does not).
   - Per-MCP allow rules added by `project mcp-allow`: ACCEPT specifically for `(project_subnet, mcp_ip, mcp_port)`.
@@ -184,14 +185,14 @@ if __name__ == "__main__":
 
 ## ◾ Egress modes
 
-Set per-project at `project create`:
+Set per-project at `project create` (or in the create form), and fixed for the project's life. The `research` workflow defaults to the operator's configured default (`DEFAULT_EGRESS` in `.env`, `open` unless changed); every other shipped workflow defaults to `locked`.
 
 | Mode | What's allowed |
 |---|---|
-| `open` (default) | All TCP/UDP/ICMP outbound except RFC1918 destinations |
+| `open` | All TCP/UDP/ICMP outbound except private (RFC1918 and link-local) destinations |
 | `locked` | TCP/80, TCP/443, and UDP/TCP 53 to the configured resolvers (`SANDBOX_DNS`) only; no ICMP |
 
-Plus per-MCP ACCEPT rules added by `project mcp-allow`, which take precedence over the egress policy for the specific destination IP+port.
+Plus per-MCP ACCEPT rules added by `project mcp-allow`, which take precedence over the egress policy for the specific destination IP+port. Both modes filter only traffic that passes the router; the paths around it are closed by the operator-applied [host rules](#-host-hardening-operator-applied).
 
 The egress mode is set at `rs-router` and applies to *all* traffic from the project's subnet, including the supervisor's own outbound (e.g. for Claude Code's own API calls — those need 443 in either mode) and worker traffic.
 

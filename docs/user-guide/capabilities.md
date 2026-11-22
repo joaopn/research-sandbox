@@ -17,7 +17,7 @@ python research.py mcp enable arxiv
 python research.py project mcp allow myproj arxiv
 ```
 
-`mcp add` writes the registry; `mcp enable` flips the per-MCP flag (and auto-allows it into new projects); `project mcp allow` refuses a disabled MCP; `research start` auto-launches every enabled *shared* MCP. Every MCP is reached through the per-project **mcp-proxy** at a single internal address — workers can't reach an MCP they weren't granted. The server must speak streamable-HTTP and follow a small contract; see [docs/GUIDE.md](mcp-authoring.md).
+`mcp add` writes the registry; `mcp enable` flips the per-MCP flag (and auto-allows it into new projects); `project mcp allow` refuses a disabled MCP; `research start` auto-launches every enabled *shared* MCP. Every MCP is reached through the per-project **mcp-proxy** at a single internal address — workers can't reach an MCP they weren't granted. The server must speak streamable-HTTP and follow a small contract; see [Authoring an MCP server](mcp-authoring.md).
 
 **The MCP page (Sandboxes → MCP).** A second, newer list holds MCP servers by address (`http://` or `https://`) with optional secret request headers, behind one shared gateway container. The page adds, edits, tests and removes them, and wires them: pick a project, pick its agent or one of its boxes, tick the servers it may use. The agent sees a wired server in its next session, in Claude Code and pi alike; nothing restarts. From the host: `research mcp server list | add | edit | remove | test`, `research mcp wire <project> [--box NAME] --set a,b` and `research mcp wiring`. A research project's own agent is not wired (its workers still use the registry above); its boxes are.
 
@@ -33,18 +33,26 @@ Pipeline-side agents the supervisor's analysis workers call through the proxy (`
 
 (Plus the **analysis** worker itself — spawned per question by the supervisor via `rs-worker`, not pre-registered.) A host-level *enabled* flag auto-applies a service to every new project at `create`; only `websearcher` is default-on. `--disable websearcher` overrules per project.
 
-### Boxes (DIND projects)
+### Boxes
 
-On any DIND project (`research` / `sandbox-dind`) you can spin **boxes** — isolated, disposable sub-containers — from the webui's ⚙ → Boxes, or the in-box `rs-sandbox` CLI. Each box is a **preset** over two images:
+A project with its own inner Docker (`research`, `researcher`, `sandbox-dind`, `dev`, and the `social-data-pipeline` store workflow) can hold **boxes**: isolated sub-containers, each with its own workspace and no credentials. Add one from the **+** button on the project's tab strip, or with the `rs-sandbox` CLI in the project's terminal; the ✕ on the box's terminal tab removes it. A single-container project (`sandbox` and the other store workflows) cannot hold boxes.
 
-| Preset | What it is |
-|---|---|
-| **`empty`** | a blank box (base image) |
-| **`websearcher`** | the base + a baked browser (Playwright + Chromium) |
-| **`data-wrangler`** | the base, oriented for data work |
-| **`byo`** | bring your own — clone a repo / run a setup snippet at boot |
+Each box comes from a **box type** over two images (base, or browser with Playwright + Chromium):
 
-pi reads a repo's `.claude/rules/`, `.claude/CLAUDE.md` and nested `CLAUDE.md` files like Claude Code does (an RS-owned `rs-rules` extension rides the pi dist), and it carries subagents (the `pi-subagents` package rides the pi dist too, pinned). It runs online like a stock install: `pi update` updates it in place (like `claude update`; restaging or recreating the project or box returns it to the pinned version), `pi install` / `pi remove` manage its packages, and it refreshes its model catalogs and fetches `rg` / `fd` on first need. Install telemetry stays off. Its settings and packages are yours: they survive a restage and a recreate of a dev / sandbox-dind project, like its login and sessions. The one exception is a one-time addition: settings written before pi-subagents shipped get its entry added once, at the first pi start after the next redeploy (replacing a hand-installed `npm:pi-subagents`); removing it afterwards sticks, until a box or docker project is re-created from the shipped settings. Per-box toggles: `--agent claude|pi` (or none — an agent-bearing box receives every agent the project carries), `--editor`, `--mcps <subset of the project allowlist>`, and `--repo/--ref/--setup` for the `byo` preset. Boxes boot un-authed and reach an LLM / pip / apt through the project's locked egress — the containment is router + no-creds + container isolation.
+| Type | Image | Agent default | What it is |
+|---|---|---|---|
+| **`empty`** | base | off | a blank box, no instructions |
+| **`byo`** | base | on | bring your own: clones a repo at a ref and runs a setup command at boot |
+| **`dev`** | base | on, editor on | works a GitHub repo through its own fork in the shared Gitea, delivering through pull requests |
+| **`zotero`** | base | on | a Zotero library through the zotero MCP server; asks for a Zotero API key and library ID |
+| **`open-knowledge`** | base | on | an OpenKnowledge knowledge base in its own tab; Share files on by default, notes' history optionally on Gitea |
+| **`paper-orchestra`** | base | on, editor on | the PaperOrchestra repo, cloned at boot |
+| **`websearcher`** | browser | on | web research with Playwright and headless Chromium |
+| **`data-wrangler`** | base | on | schemas, queries and extracts through the project's database MCPs |
+
+The box window (or `rs-sandbox create`) sets per-box options over the type's defaults: the agent (`--agent claude|pi|none`; an agent-bearing box receives every agent the project carries), `--editor`, `--mcps <subset of the project allowlist>`, and `--repo/--ref/--setup` for the `byo` type. A box boots signed out and reaches an LLM, pip and apt through the project's egress — the containment is router + no credentials + container isolation.
+
+**Agents in a box.** Sign in inside the box: `claude` then `/login`, or `pi` then `/login` with an API key (OpenRouter or another provider). pi reads a repo's `.claude/rules/`, `.claude/CLAUDE.md` and nested `CLAUDE.md` files as Claude Code does, and carries subagents. It runs like a stock install: `pi update` updates it in place (restaging or re-creating the project or box returns it to the pinned version) and `pi install` / `pi remove` manage its packages. Details are in the [CLI reference](cli-reference.md).
 
 ### Publishing a dev repo's image
 

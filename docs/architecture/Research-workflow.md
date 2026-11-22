@@ -6,7 +6,7 @@ nav_order: 1
 ---
 # Research workflow
 
-The `research` workflow is the one research workflow built today. Its agent is a **supervisor**: it plans analyses with the user, runs each in a **worker** container inside the project, reviews the results and reports back. It is one of four research workflows; see [Research](Research.md) for the comparison.
+The `research` workflow is the original research workflow, one of the two built today. Its agent is a **supervisor**: it plans analyses with the user, runs each in a **worker** container inside the project, reviews the results and reports back. It is one of four research workflows; see [Research](Research.md) for the comparison.
 
 ```mermaid
 flowchart TD
@@ -104,4 +104,4 @@ Each topic log names the session log it comes from. Logs are never edited after 
 
 **websearcher falls back to a declared agent, never a disguise.** On a bot wall it uses Claude's fetch tool, which names itself to the site as a Claude agent; it never poses as a person's browser. A rate limit means the site wants less traffic, so it gets no fallback.
 
-**This workflow is the benchmark for the planned ones.** It is not changed by the lab agenda; the planned workflows are measured against it.
+**This workflow is the benchmark for the lab-agenda workflows.** It is not changed by the lab agenda; the lab-agenda workflows are measured against it.

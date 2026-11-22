@@ -5,7 +5,7 @@ nav_order: 1
 ---
 # Projects
 
-A **project** is one container on the RS host, with its own agent, workspace folder and network. The user creates projects from the browser and picks a **workflow**, which decides what the container holds. The research workflows, one built and three planned, are described in [Research](Research.md).
+A **project** is one container on the RS host, with its own agent, workspace folder and network. The user creates projects from the browser and picks a **workflow**, which decides what the container holds. The research workflows, two built and two planned, are described in [Research](Research.md).
 
 ## What a project is
 
@@ -20,6 +20,7 @@ A workflow uses one of two container kinds. An **inner-Docker** project runs its
 | Workflow | Container | Agent (default) | Egress (default) | Gives the user |
 |---|---|---|---|---|
 | research | inner Docker | Claude only | operator default | A supervisor with analysis workers and role services; see [Research workflow](Research-workflow.md) |
+| researcher | inner Docker | Claude or pi | locked | One research agent with a memory, read in the always-on Reader tab; see [Researcher workflow](Researcher-workflow.md) |
 | sandbox-dind | inner Docker | Claude or pi | locked | An agent with its own Docker and boxes |
 | sandbox | single | none unless chosen | locked | A bare confined container |
 | dev | inner Docker | Claude or pi | locked | An agent on one repository's fork; see [Dev lane](Dev-lane.md) |
@@ -28,13 +29,13 @@ A workflow uses one of two container kinds. An **inner-Docker** project runs its
 | scientific-agent-skills | single | Claude | locked | A collection of scientific skills |
 | social-data-pipeline | inner Docker | Claude | locked | A social-data processing pipeline |
 
-The New Project window groups them as Research (research), Base (sandbox-dind, sandbox, dev) and Store (the rest). A store workflow clones a public repository at a fixed branch into the workspace and runs its setup once, at create. Long-lived extra containers inside a project are [Boxes](Boxes.md).
+The New Project window groups them as Research (research, researcher), Base (sandbox-dind, sandbox, dev) and Store (the rest). A store workflow clones a public repository at a fixed branch into the workspace and runs its setup once, at create; open-knowledge clones nothing and installs OpenKnowledge instead. Long-lived extra containers inside a project are [Boxes](Boxes.md).
 
 ## Agents
 
 RS ships two agents, **Claude Code** and **pi**. Claude signs in with a Claude account; pi uses an API key from OpenRouter or another provider. The agent software is downloaded once on the host (Sandboxes → Software) and copied into each project at boot, never baked into an image. Editor extensions shipped with an agent or with the editor are installed at each start of a project or box when the shipped version is newer than the installed one; an equal or newer installed version is kept, so a start never downgrades.
 
-A research project always runs Claude, because its supervision check is a Claude Code hook; the planned research workflows run either agent (see [Research](Research.md)). A dev project needs at least one agent; a bare sandbox has none unless one is chosen.
+A research project always runs Claude, because its supervision check is a Claude Code hook; the researcher workflow and the planned research workflows run either agent (see [Research](Research.md)). A dev or researcher project needs at least one agent; a bare sandbox has none unless one is chosen.
 
 Each interactive agent shows RS's **status bar** under its prompt: the model, how long the prompt cache stays warm, the session's cost split into cache reads, writes and output, and how full the context is. It is on by default and switched per container in the Extensions boxes (New Project, Add box, the project's ⚙ window). Workers and role services never show it.
 
