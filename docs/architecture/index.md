@@ -43,7 +43,7 @@ flowchart TD
 | [Boxes](Boxes.md) | Box types; what a box can see of its project |
 | [MCP servers](MCP-servers.md) | The shared gateway, its server list, wiring to agents and boxes; the older per-project registry |
 | [Dev lane](Dev-lane.md) | Mirror, one fork per agent, pull requests, landing, collection |
-| ↳ [GitHub mirror](GitHub-mirror.md) | rs-sync: a fork's issues, merged PRs, wiki and boards copied to GitHub by hand, reversibly |
+| ↳ [GitHub mirror](GitHub-mirror.md) | rs-sync: a fork's issues and merged PRs, the wiki and boards when asked, copied to GitHub by hand, reversibly |
 | ↳ [Container commands](Container-commands.md) | rs-wt, rs-land, rs-board, /rs-mode, /rs-test, rs-fetch, rs-sync, rs-publish, image builds: where each is and how to use it |
 | [Browser and broker](Browser-and-broker.md) | The web interface, the broker on the host, sign-in, bringing an RS update live |
 | [Networking and egress](Networking-and-egress.md) | Isolation from the host and the LAN; open and locked egress |
@@ -113,6 +113,7 @@ The planned workflows' decisions are proposals until built; they are listed on [
 - Settings live in `/workspace/.rs-sync.env`, kept across recreates; the webui container can read the token.
 - `sync-skip` keeps an issue or merged PR off GitHub for good; a copy already there is deleted first.
 - A label already on GitHub is used as it is, never changed or deleted.
+- The wiki and the board go over only with `--wiki` / `--board`, for a sync and a remove alike.
 
 ### [Container commands](Container-commands.md)
 

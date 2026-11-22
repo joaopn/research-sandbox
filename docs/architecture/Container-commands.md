@@ -22,7 +22,7 @@ flowchart TD
   end
   subgraph fetch["Project or box created with rs-fetch"]
     person["Maintainer"] --> rsfetch["rs-fetch<br/>collect work"]
-    person --> rssync["rs-sync<br/>issues, wiki, boards to GitHub"]
+    person --> rssync["rs-sync<br/>issues and PRs to GitHub"]
     person --> rspub["rs-publish<br/>image to a registry"]
   end
   subgraph host["Host terminal or Images tab"]
@@ -130,14 +130,14 @@ rs-fetch stages the work in a local git clone, with the agent's commit message p
 
 The Fetch tab's 📋 button copies the exact command for each pull request. The maintainer then pushes to GitHub as usual.
 
-### rs-sync — issues, wiki and boards to GitHub
+### rs-sync — issues and merged PRs to GitHub
 
 ```bash
 rs-sync <fork owner>/<repo> <github owner>/<repo>           # dry run
 rs-sync <fork owner>/<repo> <github owner>/<repo> --apply   # write
 ```
 
-rs-sync copies a fork's issues, merged pull requests, wiki and boards to the GitHub repository. Without `--apply` it only reports what it would do. Settings live in `/workspace/.rs-sync.env`: a classic GitHub token with `repo` and `project`, and the labels whose open issues stay private. The first full run takes hours. Flags, what is copied, and how to remove it all again: [GitHub mirror](GitHub-mirror.md).
+rs-sync copies a fork's issues and merged pull requests to the GitHub repository; `--wiki` adds the wiki and `--board` the boards. Without `--apply` it only reports what it would do. Settings live in `/workspace/.rs-sync.env`: a classic GitHub token with `repo` (and `project` for `--board`), and the labels whose open issues stay private. The first full run takes hours. Flags, what is copied, and how to remove it again: [GitHub mirror](GitHub-mirror.md).
 
 ### rs-publish — a built image to a registry
 

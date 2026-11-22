@@ -6,15 +6,15 @@ nav_order: 1
 ---
 # GitHub mirror
 
-`rs-sync` copies a dev fork's issues, merged pull requests, wiki and boards from Gitea to a GitHub repository. Only that direction is supported. The maintainer runs it by hand, in any container that has rs-fetch. GitHub then holds a public record of how the code was made, with the original dates.
+`rs-sync` copies a dev fork's issues and merged pull requests from Gitea to a GitHub repository, and its wiki and boards when asked. Only that direction is supported. The maintainer runs it by hand, in any container that has rs-fetch. GitHub then holds a public record of how the code was made, with the original dates.
 
 ```mermaid
 flowchart TD
   fork["Agent's fork on Gitea<br/>issues, PRs, wiki, boards"] -->|"read-only issue token"| sync["rs-sync<br/>(rs-fetch container)"]
   sync -->|"maintainer's GitHub token"| gh["GitHub repository"]
   gh --- issues["Issues and PR records<br/>(real dates, locked)"]
-  gh --- wiki["Wiki"]
-  gh --- project["One project<br/>Status and Area fields"]
+  gh ---|"with --wiki"| wiki["Wiki"]
+  gh ---|"with --board"| project["One project<br/>Status and Area fields"]
 ```
 
 ## Running it
@@ -23,14 +23,15 @@ flowchart TD
 |---|---|
 | `rs-sync <fork owner>/<repo> <github owner>/<repo>` | Dry run: a summary of what would be written, what is left out, what to check first, and how long it would take |
 | `… --apply` | Writes to GitHub |
-| `… --remove` / `--remove --apply` | Lists, then deletes, everything rs-sync put there |
-| `--skip wiki`, `--skip board` | Leaves that part out |
-| `--wiki-overwrite` | Commits (or removes) past edits made on the GitHub wiki |
+| `… --remove` / `--remove --apply` | Lists, then deletes, the issues, PR records and labels rs-sync put there; the wiki and the project only with `--wiki` / `--board` |
+| `--wiki` | Also mirrors the wiki; with `--remove`, puts the GitHub wiki back |
+| `--board` | Also mirrors the boards as one GitHub project; with `--remove`, deletes it |
+| `--wiki-overwrite` | With `--wiki`: commits (or removes) past edits made on the GitHub wiki |
 | `--report` | Adds the full JSON report after the summary, for pasting a run back to an agent |
 
 The Fetch tab copies the dry-run command: each repository card has one `📋 rs-sync <owner>` button per live fork. The GitHub repository is the one the mirror was made from.
 
-Settings live in `/workspace/.rs-sync.env` (mode 600; `--env` names another file): the GitHub token (a classic token with `repo` and `project`), the labels whose open issues stay off GitHub (`RS_SYNC_HOLD_LABELS`, required), and the header line (`RS_SYNC_HEADER`, on by default; `off` hides it). The first full run takes hours, because GitHub limits how fast content can be created. Run it in a byobu window. On a terminal, one status line shows the writes against the planned total, the time so far and left, what is being read, and every wait or hourly pause counting down with its reason. Off a terminal (a log file, a pipe) the output is the plain lines alone.
+Settings live in `/workspace/.rs-sync.env` (mode 600; `--env` names another file): the GitHub token (a classic token with `repo`, plus `project` for `--board`), the labels whose open issues stay off GitHub (`RS_SYNC_HOLD_LABELS`, required), and the header line (`RS_SYNC_HEADER`, on by default; `off` hides it). The first full run takes hours, because GitHub limits how fast content can be created. Run it in a byobu window. On a terminal, one status line shows the writes against the planned total, the time so far and left, what is being read, and every wait or hourly pause counting down with its reason. Off a terminal (a log file, a pipe) the output is the plain lines alone.
 
 Every run ends with a plain summary. After `--apply` it lists what was written. When a run stops on an error, it says either that nothing was written to GitHub or how many write requests were sent and what was recorded as done, then how to continue. rs-sync counts each request before sending it, so "nothing was written" is only said when nothing went out. A GitHub error is shown as one line with GitHub's own message.
 
@@ -42,8 +43,8 @@ Every run ends with a plain summary. After `--apply` it lists what was written. 
 | Merged pull requests | Closed, locked `[rs-sync] [PR] <title>` issues labelled `merged-pr` and `rs-sync`, listing the commits they landed as |
 | Issues and merged PRs labelled `sync-skip` | Nothing. A copy already there is deleted first at the next run |
 | Labels in use | The same labels, their descriptions tagged ` (rs-sync)` (`(rs-sync)` alone for a label with no description); a label of the same name already on GitHub is used as it is |
-| The wiki | The GitHub wiki's pages and files, one commit per run |
-| The boards | One project: Status from the columns, Area from the board titles |
+| The wiki, with `--wiki` | The GitHub wiki's pages and files, one commit per run |
+| The boards, with `--board` | One project: Status from the columns, Area from the board titles |
 
 Later runs bring GitHub level with Gitea: new items, comments, edits, closes, label changes and deletions. An item already on GitHub keeps syncing, even if it later gains a hold label.
 
@@ -77,7 +78,9 @@ rs-sync reads Gitea with a second token of the read-only operator account, one t
 
 **GitHub's hourly allowance is counted across runs.** GitHub allows 500 content writes an hour per account. Every rs-sync run in a container shares a count of the past hour's writes in rs-sync's cache folder, so a run started right after another paces itself against the same allowance, and the dry run's estimate includes the wait. The count is lost when the container is recreated, which only costs that hour's memory. A count file rs-sync cannot read or write stops the run and names it.
 
-**The wiki is replaced, not merged.** The GitHub wiki's tree becomes the converted Gitea tree. Edits made on GitHub stop the run until `--wiki-overwrite` is given; they stay in the wiki's history. The remove puts the wiki back to its state before rs-sync's first commit. A fork whose Gitea wiki has no page yet is left out of the run, and the GitHub wiki is not touched.
+**The wiki is replaced, not merged.** The GitHub wiki's tree becomes the converted Gitea tree. Edits made on GitHub stop the run until `--wiki-overwrite` is given; they stay in the wiki's history. A remove with `--wiki` puts the wiki back to its state before rs-sync's first commit. A fork whose Gitea wiki has no page yet is left out of the run, and the GitHub wiki is not touched.
+
+**The wiki and the board go over only when asked.** A plain run copies issues and merged PRs; `--wiki` and `--board` add the other two, for a sync and a remove alike. The summary of every finished run lists the parts left out and the flag that adds each one. A person who does not want them needs no `project` scope on the token, and no git for the wiki. The cost: a repository mirrored earlier with the wiki and board keeps them as the last full run left them, and they stop being updated until a run names the flags.
 
 **A fixed label keeps an item off GitHub for good.** The hold list is the maintainer's setting and only delays open issues. `sync-skip` is set by the agent when it files the issue, so a secret or a personal detail never depends on a setting someone has to remember. Its copy is deleted first in a run, so an unrelated failure later in that run cannot leave it public. The cost: deleting a GitHub issue frees nothing, and a released item comes back under a new number.
 

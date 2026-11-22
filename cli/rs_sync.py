@@ -8,8 +8,10 @@ Staged into rs-fetch surfaces beside rs-fetch. Run by hand:
     rs-sync <gitea owner>/<repo> <github owner>/<repo> --remove [--apply]
 
 Every run ends with a plain summary; --report adds the full report as JSON,
-for pasting back to the agent. --skip wiki and --skip board leave a part out; --wiki-overwrite lets a run
-commit (or a remove force-push) past edits made on the GitHub wiki.
+for pasting back to the agent. The wiki goes over only with --wiki and the
+board only with --board, for a sync and a remove alike; --wiki-overwrite (with
+--wiki) lets a run commit (or a remove force-push) past edits made on the
+GitHub wiki.
 
 What goes over, one way (Gitea -> GitHub):
   * every closed issue, and every open issue that carries none of the
@@ -29,10 +31,12 @@ What goes over, one way (Gitea -> GitHub):
     (a label with no description gets "(rs-sync)");
     a label of the same name (any case) already on GitHub that rs-sync did
     not make is used as it is: never changed, never deleted;
-  * the fork's wiki: the GitHub wiki's tree is replaced by the converted Gitea
-    tree, one commit per run whose message ends with a marker line;
-  * the fork's boards: one GitHub project with a Status and an Area field,
-    every open mirrored issue that is a card an item in the same column.
+  * with --wiki, the fork's wiki: the GitHub wiki's tree is replaced by the
+    converted Gitea tree, one commit per run whose message ends with a marker
+    line;
+  * with --board, the fork's boards: one GitHub project with a Status and an
+    Area field, every open mirrored issue that is a card an item in the same
+    column.
 Every mirrored item is locked. Later runs bring GitHub level with Gitea:
 new comments, edits, closes and label changes go over dated at the run.
 
@@ -46,7 +50,8 @@ reference to something not mirrored becomes text GitHub does not link
 needs only GitHub.
 
 The GitHub token is read from /workspace/.rs-sync.env (or --env):
-    RS_SYNC_GITHUB_TOKEN=ghp_...        a classic token, repo/public_repo
+    RS_SYNC_GITHUB_TOKEN=ghp_...        a classic token, repo/public_repo,
+                                        plus project, for --board
     RS_SYNC_HOLD_LABELS=severity:*      required; comma-separated label names
                                         or prefixes ending in "*"; "*" alone
                                         holds every open issue; an empty
@@ -1878,7 +1883,7 @@ def preflight_github(gh: GitHub, target: str, board: bool = False):
     if board and "project" not in scopes:
         die(f"the GitHub token lacks the project scope, which the board needs "
             f"(it has: {', '.join(sorted(scopes)) or 'none'}); add it to the "
-            f"token, or run with --skip board")
+            f"token, or run without --board")
     full = repo.get("full_name") or target
     if full.lower() != target.lower():
         die(f"GitHub repo {target} was renamed or moved to {full}; run with that name")
@@ -2062,7 +2067,7 @@ def sync(args, env) -> None:
     apply = args.apply
     secrets = [env["RS_SYNC_GITHUB_TOKEN"]] + all_dev_tokens()
     gh = GitHub(GITHUB_API, env["RS_SYNC_GITHUB_TOKEN"])
-    skip = set(args.skip or [])
+    skip = {p for p in ("wiki", "board") if not getattr(args, p)}
     me, repo_info, _ = preflight_github(gh, target, board="board" not in skip)
     REPORT["github"] = {"repo": target, "account": me.get("login")}
     gitea_answers()
@@ -2136,12 +2141,12 @@ def sync(args, env) -> None:
     wanted = {it["n"] for it in items if not it["closed"] and not it["pr"]}
     wiki_state = board_state = None
     if "wiki" in skip:
-        REPORT["wiki"] = {"skipped": "--skip wiki"}
+        REPORT["wiki"] = {"skipped": "add --wiki to include it"}
     else:
         wiki_state = wiki_prepare(args, owner, repo, target, repo_info, gt["info"], gtok,
                                   env["RS_SYNC_GITHUB_TOKEN"], secrets, "sync")
     if "board" in skip:
-        REPORT["board"] = {"skipped": "--skip board"}
+        REPORT["board"] = {"skipped": "add --board to include it"}
     else:
         board_state = board_prepare(g, gh, owner, repo, target, secrets,
                                     public=not repo_info.get("private"))
@@ -2577,7 +2582,7 @@ def run_git(args, token=None, data=None, extra_env=None, what="git"):
                            env=_git_env(token, extra_env), timeout=GIT_TIMEOUT_S)
     except FileNotFoundError:
         die("git is not installed here; rs-sync needs it for the wiki (or run "
-            "with --skip wiki)")
+            "without --wiki)")
     except subprocess.TimeoutExpired:
         die(f"{what} did not finish within {GIT_TIMEOUT_S} s; run again later")
     return p.returncode, p.stdout, _safe(p.stderr.decode("utf-8", "replace"), token)
@@ -2760,8 +2765,8 @@ def wiki_prepare(args, owner, repo, target, repo_info, gt_info, gtok, gh_token, 
         rc, out, _ = cache.git(["rev-parse", "--verify", "-q", first + "^1"], what="reading the GitHub wiki")
         if rc:
             die(f"the GitHub wiki's first commit is rs-sync's ({first[:10]}); there is no "
-                f"earlier state to restore. Delete its pages in the Wiki tab, or run with "
-                f"--skip wiki")
+                f"earlier state to restore. Delete its pages in the Wiki tab, or run "
+                f"without --wiki")
         parent = out.decode().strip()
         humans = [r for r in wiki_commits(cache, [gh_sha, "^" + parent])
                   if not is_wiki_commit(r[1], owner, repo)]
@@ -2793,7 +2798,7 @@ def wiki_prepare(args, owner, repo, target, repo_info, gt_info, gtok, gh_token, 
                       f"the Gitea wiki file {_safe(path.decode('utf-8', 'replace'), *secrets)}")
     if not repo_info.get("has_wiki"):
         die(f"the wiki is switched off on {target}; turn it on in the repository "
-            f"settings, or run with --skip wiki")
+            f"settings, or run without --wiki")
     head = remote_head(cache, gh_url, gh_token, "GitHub")
     if head is None:
         die(f"the GitHub wiki of {target} has no pages yet (GitHub creates it with "
@@ -3218,22 +3223,23 @@ def board_apply(gh: GitHub, state, owner, repo, target, wanted_numbers, node_of,
 # ============================================================================
 
 def remove(args, env) -> None:
-    """Delete everything rs-sync mirrored for the named fork, from GitHub
-    alone: the marked issues by the token's account (whatever the fork's repo
-    id), the marked project, the wiki as it was before rs-sync's first commit,
-    and the tagged labels no remaining issue carries. Every check comes before
-    the first deletion."""
+    """Delete what rs-sync mirrored for the named fork, from GitHub alone:
+    the marked issues by the token's account (whatever the fork's repo id) and
+    the tagged labels no remaining issue carries; with --board also the marked
+    project, with --wiki also the wiki as it was before rs-sync's first commit
+    (the wiki and the project only with --wiki / --board). Every check comes
+    before the first deletion."""
     owner, repo = parse_repo_arg(args.gitea, "the Gitea repo")
     target = "/".join(parse_repo_arg(args.github, "the GitHub repo"))
     gh = GitHub(GITHUB_API, env["RS_SYNC_GITHUB_TOKEN"])
-    skip = set(args.skip or [])
+    skip = {p for p in ("wiki", "board") if not getattr(args, p)}
     me, repo_info, _ = preflight_github(gh, target, board="board" not in skip)
     REPORT["github"] = {"repo": target, "account": me.get("login"),
                         "private": bool(repo_info.get("private"))}
     have = read_github(gh, target, me["id"], owner, repo, for_remove=True)
     wiki_state = None
     if "wiki" in skip:
-        REPORT["wiki"] = {"skipped": "--skip wiki"}
+        REPORT["wiki"] = {"skipped": "add --wiki to include it"}
     else:
         wiki_state = wiki_prepare(args, owner, repo, target, repo_info, None, None,
                                   env["RS_SYNC_GITHUB_TOKEN"], (), "remove")
@@ -3256,7 +3262,7 @@ def remove(args, env) -> None:
     REPORT["remove"]["labels"] = [l["name"] for l in labels]
     REPORT["remove"]["projects"] = [p.get("number") for p in projects]
     if "board" in skip:
-        REPORT["board"] = {"skipped": "--skip board"}
+        REPORT["board"] = {"skipped": "add --board to include it"}
     refuse_missing_node_ids((v["number"], v["node_id"]) for v in doomed)
     if not args.apply:
         REPORT["dry_run"] = True
@@ -3655,8 +3661,8 @@ def _stopped_lines(r: dict, written: list, remove: bool) -> list:
         out.extend(f"  - {x}" for x in written)
     b = r.get("board")
     if not remove and isinstance(b, dict) and not _board_skip(b):
-        out.append("The board may be partway done; the next run brings it level.")
-    out.append("Run again to continue the remove." if remove else
+        out.append("The board may be partway done; the next run with --board brings it level.")
+    out.append("Run the same command again to continue the remove." if remove else
                "Run again to continue: rs-sync reads what is already on GitHub.")
     return out
 
@@ -3684,25 +3690,32 @@ def import_advice() -> str:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="rs-sync",
-        description="mirror a Gitea fork's issues, merged pull requests, wiki and "
-                    "boards to a GitHub repo (a dry run unless --apply); an issue or "
+        description="mirror a Gitea fork's issues and merged pull requests (and, "
+                    "when asked, its wiki and board) to a GitHub repo (a dry run "
+                    "unless --apply); an issue or "
                     "merged pull request labelled sync-skip on Gitea stays off GitHub, "
                     "and a copy already there is deleted")
     ap.add_argument("gitea", help="the Gitea fork, <owner>/<repo>")
     ap.add_argument("github", help="the GitHub repo, <owner>/<repo>")
     ap.add_argument("--apply", action="store_true", help="write to GitHub")
     ap.add_argument("--remove", action="store_true",
-                    help="delete everything rs-sync mirrored for this fork")
-    ap.add_argument("--skip", action="append", choices=["wiki", "board"], default=[],
-                    help="leave the wiki or the board out (repeatable)")
+                    help="delete what rs-sync mirrored for this fork (the wiki and "
+                         "the project only with --wiki / --board)")
+    ap.add_argument("--wiki", action="store_true",
+                    help="also mirror the wiki; with --remove, also restore it")
+    ap.add_argument("--board", action="store_true",
+                    help="also mirror the board as a GitHub project; with --remove, "
+                         "also delete it")
     ap.add_argument("--wiki-overwrite", action="store_true",
-                    help="commit over (or, with --remove, force-push past) edits made "
-                         "on the GitHub wiki")
+                    help="with --wiki: commit over (or, with --remove, force-push "
+                         "past) edits made on the GitHub wiki")
     ap.add_argument("--env", default=str(DEFAULT_ENV),
                     help=f"the settings file (default {DEFAULT_ENV})")
     ap.add_argument("--report", action="store_true",
                     help="also print the full report as JSON, for pasting back to the agent")
     args = ap.parse_args(argv)
+    if args.wiki_overwrite and not args.wiki:
+        ap.error("--wiki-overwrite needs --wiki")
     REPORT["command"] = "remove" if args.remove else "sync"
     REPORT["apply"] = bool(args.apply)
     PROGRESS.start()
