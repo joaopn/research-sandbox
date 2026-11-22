@@ -1,3 +1,8 @@
+---
+title: Security
+parent: User guide
+nav_order: 23
+---
 # Security
 
 Threat model, isolation layers, and what is and isn't enforced.

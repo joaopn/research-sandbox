@@ -11,7 +11,7 @@ An agentic sandbox for research and data analysis, modeled as a research lab: yo
 
 <br/>
 
-<img src="docs/webui.png" alt="Research Sandbox browser UI — workflow store, in-browser terminals, and the editor" width="860"/>
+<img src="docs/assets/webui.png" alt="Research Sandbox browser UI — workflow store, in-browser terminals, and the editor" width="860"/>
 
 </div>
 
@@ -200,7 +200,7 @@ python research.py mcp enable arxiv
 python research.py project mcp allow myproj arxiv
 ```
 
-`mcp add` writes the registry; `mcp enable` flips the per-MCP flag (and auto-allows it into new projects); `project mcp allow` refuses a disabled MCP; `research start` auto-launches every enabled *shared* MCP. Every MCP is reached through the per-project **mcp-proxy** at a single internal address — workers can't reach an MCP they weren't granted. The server must speak streamable-HTTP and follow a small contract; see [docs/GUIDE.md](docs/GUIDE.md).
+`mcp add` writes the registry; `mcp enable` flips the per-MCP flag (and auto-allows it into new projects); `project mcp allow` refuses a disabled MCP; `research start` auto-launches every enabled *shared* MCP. Every MCP is reached through the per-project **mcp-proxy** at a single internal address — workers can't reach an MCP they weren't granted. The server must speak streamable-HTTP and follow a small contract; see [docs/GUIDE.md](docs/user-guide/mcp-authoring.md).
 
 **The MCP page (Sandboxes → MCP).** A second, newer list holds MCP servers by address (`http://` or `https://`) with optional secret request headers, behind one shared gateway container. The page adds, edits, tests and removes them, and wires them: pick a project, pick its agent or one of its boxes, tick the servers it may use. The agent sees a wired server in its next session, in Claude Code and pi alike; nothing restarts. From the host: `research mcp server list | add | edit | remove | test`, `research mcp wire <project> [--box NAME] --set a,b` and `research mcp wiring`. A research project's own agent is not wired (its workers still use the registry above); its boxes are.
 
@@ -271,7 +271,7 @@ The **container is the security boundary**; agents run under `bypassPermissions`
 
 ## ◾ CLI essentials
 
-Everyday commands. Every subcommand has `--help`; the full reference lives in [docs/GUIDE.md](docs/GUIDE.md).
+Everyday commands. Every subcommand has `--help`; the full reference lives in [docs/GUIDE.md](docs/user-guide/cli-reference.md).
 
 ```bash
 # infrastructure
@@ -317,7 +317,7 @@ research-sandbox/
 ├── container/                    Templates baked into images (supervisor / analysis / …)
 ├── router/                       Egress-filter router (Alpine + iptables)
 ├── webui/                        Browser SPA + aiohttp server + per-service tab defs
-├── docs/{GUIDE,SECURITY}.md      Workflow/MCP authoring + threat model
+├── docs/{user-guide,SECURITY.md} Workflow/MCP authoring + threat model
 └── external/                     Vendored reference code (not a dependency)
 ```
 
@@ -331,7 +331,7 @@ Per-project workspace at `container_volumes/<proj>/workspace/`: `results/`, `log
 
 ## ◾ Further reading
 
-- **[docs/GUIDE.md](docs/GUIDE.md)** — how a research thread plays out, the supervisor↔worker protocol, the full CLI reference, authoring an MCP server, debugging, working modes and the test policy, what to do after updating RS, FAQ.
+- **[docs/GUIDE.md](https://joaopn.github.io/research-sandbox/)** — how a research thread plays out, the supervisor↔worker protocol, the full CLI reference, authoring an MCP server, debugging, working modes and the test policy, what to do after updating RS, FAQ.
 - **[docs/SECURITY.md](docs/SECURITY.md)** — threat model, isolation layers, what's prevented and what isn't.
 
 <div align="center">

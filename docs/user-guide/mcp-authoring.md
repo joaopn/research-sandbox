@@ -1,0 +1,69 @@
+---
+title: Authoring an MCP server
+parent: User guide
+nav_order: 14
+---
+# Authoring an MCP server
+
+Three constraints define the contract between the research-sandbox and an MCP server:
+
+1. **Streamable-HTTP transport.** Stdio MCPs are deferred. The Python SDK's `FastMCP("name").run(transport="streamable-http")` works out of the box; in any SDK, the server must speak JSON-RPC over POST.
+2. **Endpoint at `/mcp`** (Python SDK default), or any path of your choosing — register with `--path <your-path>`.
+3. **DNS-rebinding-protection allows `mcp-proxy:8888`.** The proxy pins this `Host` value on every upstream request, regardless of what the worker sent. Stable, can't be spoofed.
+
+Minimal Python SDK example:
+
+```python
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("my-mcp")
+mcp.settings.host = "0.0.0.0"
+mcp.settings.port = 8000
+mcp.settings.transport_security.allowed_hosts = ["mcp-proxy:8888"]
+
+@mcp.tool()
+def lookup(query: str) -> str:
+    return f"result for {query}"
+
+if __name__ == "__main__":
+    mcp.run(transport="streamable-http")
+```
+
+Register and use:
+
+```bash
+docker build -t my-mcp:latest .
+python research.py mcp add    mymcp --kind shared --image my-mcp:latest --port 8000
+python research.py mcp enable mymcp        # required before mcp-allow; also flags auto-start
+python research.py mcp start  mymcp        # launch now (or `research start` brings up enabled)
+python research.py project mcp-allow myproj mymcp
+# inside supervisor, in your plan, ask the worker to use mymcp; spawn with --mcps mymcp
+```
+
+`mcp add` only registers. `mcp enable` is the gate: `project mcp-allow`
+refuses to grant a disabled MCP. For shared MCPs, `mcp enable` additionally
+arms auto-start — `research start` launches every enabled shared MCP after
+the router comes up. External MCPs have no container lifecycle, so `mcp
+start`/`stop` skip them; `enable` for an external is just the visibility
+gate before `project mcp-allow`.
+
+External (already-running) MCPs:
+
+```bash
+# Service running on the docker host
+python research.py mcp add mymcp --kind external --host host.docker.internal:9000
+
+# Service reachable at a remote IP or DNS name
+python research.py mcp add mymcp --kind external --host 10.0.5.42:8443
+```
+
+A DNS name given to `--host` is resolved on the machine running `research`, once, when the MCP is allowed into a project (`project create`, `project mcp allow`, `project mcp sync`), and that address is what the router, the project's proxy and the project's inner guard then use; a name that does not resolve there refuses the allow. If the address behind a name changes, deny and re-allow the MCP.
+
+Auth headers (e.g. for hosted MCPs):
+
+```bash
+python research.py mcp add api --kind external --host host.docker.internal:9000 \
+    --header "Authorization=Bearer ${API_TOKEN}"
+```
+
+`${VAR}` is interpolated against the host environment when the registry is loaded; the resolved value is visible to the supervisor (and is treated as a per-project secret, no different from the supervisor's own OAuth token in scope). Don't put long-lived production tokens here.
