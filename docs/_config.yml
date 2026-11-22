@@ -1,0 +1,25 @@
+title: "research-sandbox"
+description: "An agentic sandbox for research and data analysis, modeled as a research lab"
+baseurl: /research-sandbox
+url: https://joaopn.github.io
+remote_theme: just-the-docs/just-the-docs@v0.12.0
+plugins:
+  - jekyll-remote-theme
+color_scheme: rs
+search_enabled: true
+heading_anchors: true
+mermaid:
+  version: "11.4.1"
+aux_links:
+  "GitHub": ["https://github.com/joaopn/research-sandbox"]
+gh_edit_link: true
+gh_edit_link_text: "Edit this page on GitHub"
+gh_edit_repository: https://github.com/joaopn/research-sandbox
+gh_edit_branch: "main"
+gh_edit_source: docs
+gh_edit_view_mode: edit
+back_to_top: true
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - vendor

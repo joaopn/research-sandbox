@@ -1,0 +1,125 @@
+name: docs
+
+on:
+  push:
+    branches: ["main"]
+    paths: ["docs/**", ".github/workflows/docs.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Pages
+        uses: actions/configure-pages@v6
+      - name: Build the site
+        uses: actions/jekyll-build-pages@v1.0.13
+        with:
+          source: docs
+          destination: _site
+      - name: Check links
+        run: |
+          python3 - _site docs/_config.yml <<'LINKCHECK'
+          """Check every internal link and image of a built just-the-docs site.
+
+          Usage: python3 linkcheck.py <built site folder> <path of docs/_config.yml>
+
+          GitHub's build action writes the site at the top of the output folder, not
+          under /<baseurl>/, so an absolute link is resolved by stripping the site's
+          base path (read from the config's `baseurl:` line); an absolute link that
+          does not start with the base path is broken. Prints one BROKEN line per
+          broken link, then the count; exits 1 when anything is broken.
+          """
+          import os
+          import re
+          import sys
+          import urllib.parse
+
+
+          def read_baseurl(config_path):
+              base = None
+              with open(config_path, encoding="utf-8") as f:
+                  for line in f:
+                      m = re.match(r"baseurl:(.*)$", line.rstrip("\r\n"))
+                      if not m:
+                          continue
+                      if base is not None:
+                          sys.exit(f"{config_path}: baseurl is given twice")
+                      value = re.split(r"\s#", m.group(1), maxsplit=1)[0].strip()
+                      if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                          value = value[1:-1]
+                      base = value
+              base = (base or "").strip("/")
+              return "/" + base if base else ""
+
+
+          def main(argv):
+              if len(argv) != 3:
+                  print("usage: linkcheck.py <built site folder> <docs/_config.yml>", file=sys.stderr)
+                  return 2
+              root = os.path.abspath(argv[1])
+              if not os.path.isdir(root):
+                  print(f"no built site at {argv[1]}", file=sys.stderr)
+                  return 2
+              base = read_baseurl(argv[2])
+              bad = set()
+              for d, _, fs in os.walk(root):
+                  for f in fs:
+                      if not f.endswith(".html"):
+                          continue
+                      p = os.path.join(d, f)
+                      with open(p, encoding="utf-8", errors="replace") as h:
+                          html = h.read()
+                      for u in re.findall(r'(?:href|src)="([^"#?]+)', html):
+                          if re.match(r"^(https?:|mailto:|data:|//)", u):
+                              continue
+                          if u.startswith("/"):
+                              if base and u != base and not u.startswith(base + "/"):
+                                  bad.add((os.path.relpath(p, root), u))
+                                  continue
+                              t = os.path.join(root, u[len(base):].lstrip("/"))
+                          else:
+                              t = os.path.join(d, u)
+                          t = os.path.normpath(urllib.parse.unquote(t))
+                          if t != root and not t.startswith(root + os.sep):
+                              bad.add((os.path.relpath(p, root), u))
+                              continue
+                          if os.path.isdir(t):
+                              t = os.path.join(t, "index.html")
+                          if not os.path.exists(t):
+                              bad.add((os.path.relpath(p, root), u))
+              for b in sorted(bad):
+                  print("BROKEN", *b)
+              print(len(bad), "broken")
+              return 1 if bad else 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main(sys.argv))
+          LINKCHECK
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
