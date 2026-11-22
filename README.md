@@ -1,339 +1,147 @@
 <div align="center">
 
-# Research Sandbox
+<img src="docs/assets/logo.svg" alt="Research Sandbox" width="96">
 
-[![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
-[![Docker](https://img.shields.io/badge/Docker-Compose_v2-2496ED.svg?logo=docker&logoColor=white)](https://www.docker.com/)
-[![Claude Code](https://img.shields.io/badge/Claude_Code-Agent-D97757.svg?logo=anthropic&logoColor=white)](https://github.com/anthropics/claude-code)
-[![Sysbox](https://img.shields.io/badge/Sysbox-DIND-1F77B4.svg)](https://github.com/nestybox/sysbox)
+<h3>Research Sandbox</h3>
 
-An agentic sandbox for research and data analysis, modeled as a research lab: you are the research lead and drive a per-project supervisor that spawns sandboxed workers and their tools (MCP), supervises the tasks, keeps logbooks, and writes executive summaries for you. Drive the whole thing from a **browser UI** — a workflow store, project lifecycle, and in-browser terminals + editor — or from the host CLI. Built to work with flat-rate agentic AI subscriptions like Claude Code.
+Run AI agents in containers on your own machine, from the browser: a research lab, a long-lived researcher, coding agents on your repositories, notes and literature tools.<br>
+Each project is one sealed container with its own network and egress rules, and none of your machine's credentials.
 
-<br/>
-
-<img src="docs/assets/webui.png" alt="Research Sandbox browser UI — workflow store, in-browser terminals, and the editor" width="860"/>
+[Install](docs/user-guide/install.md) ·
+[Workflows](docs/user-guide/workflows.md) ·
+[Boxes](docs/architecture/Boxes.md) ·
+[Dev lane](docs/architecture/Dev-lane.md) ·
+[MCP servers](docs/architecture/MCP-servers.md) ·
+[Security](docs/SECURITY.md)
 
 </div>
 
----
+<img src="docs/assets/webui.png" alt="The web interface: the projects rail, a project's tabs, the editor beside the agent">
 
-### TL;DR
+## What it does
 
-```bash
-# 1. One-time setup — builds images, starts the router, caches the agent + editor dists
-python research.py start
+- **Projects**: one container per project, with its own agent, workspace and network. Create, start, stop and destroy them in the browser; destroying a project removes everything it ran.
+- **Workflows**: choose what a project is when you create it: a research lab, one researcher with a memory, a coding agent on a GitHub repository, an OpenKnowledge notes base, a bare sandbox, or a curated repository from the store.
+- **Agents**: Claude Code and pi, side by side and treated alike. Each signs in inside its project.
+- **Boxes**: extra containers inside an inner-Docker project: a web browser, a Zotero library, a notes base, a second agent on its own fork. Up to 12, added and removed while the project runs.
+- **Dev lane**: agents work your GitHub repositories through a private Gitea, one fork per agent, by pull request. You review and carry the work to GitHub; no agent holds a GitHub credential.
+- **MCP servers**: add a server once, test it, and choose which project agents (not a research project's own) and boxes may use it.
+- **Browser**: terminals, a VS Code editor, a file reader and each project's web apps, in tabs. The sidebar shows which agents are working and can alert you when one waits for you. Terminals work on a phone.
+- **Containment**: all traffic leaves through a router, open or locked to web ports, and private addresses are blocked; two [host firewall rules](docs/SECURITY.md#-host-hardening-operator-applied) you apply yourself close the paths around it. Data folders are mounted read-only.
 
-# 2. (optional but recommended) bring up the browser UI
-python research.py broker passwd     # set the operator/management password (once)
-python research.py broker start       # the host daemon that owns docker access
-python research.py webui start         # HTTPS SPA on https://localhost:7777
+## Install
 
-# 3. Open https://localhost:7777 → pick a workflow card → name it → Create.
-#    Sign in to Claude once (a terminal tab → `claude` → OAuth), then chat.
+You need Docker 29 or newer with Compose 2.33.1 or newer, Python 3.9 or newer, and a Claude account or an API key for pi (OpenRouter or another provider). On Linux, install [Sysbox](https://github.com/nestybox/sysbox#installation) for projects that run their own Docker; without it RS runs them privileged, which isolates them less.
+
+```sh
+git clone https://github.com/joaopn/research-sandbox && cd research-sandbox
+python research.py start            # builds the images, starts the router
+python research.py broker passwd    # sets the master password, once
+python research.py broker start
+python research.py webui start
 ```
 
-Prefer the shell? The same lifecycle is a few `python research.py …` commands away — see [Quick Start](#-quick-start).
+Open https://localhost:7777, accept the self-signed certificate, and set the same master password in the browser.
 
----
-
-### Contents
-
-[◾ What it does](#-what-it-does) · [◾ The browser UI](#-the-browser-ui) · [◾ Workflows & the store](#-workflows--the-store) · [◾ Prerequisites](#-prerequisites) · [◾ Install](#-install) · [◾ Quick Start](#-quick-start) · [◾ What you get on disk](#-what-you-get-on-disk) · [◾ Capabilities: MCPs, workers, boxes](#-capabilities-mcps-workers-boxes) · [◾ Security model](#-security-model) · [◾ CLI essentials](#-cli-essentials) · [◾ File structure](#-file-structure) · [◾ Roadmap](#-roadmap) · [◾ Further reading](#-further-reading)
-
----
-
-## ◾ What it does
-
-```mermaid
-flowchart TD
-  PI([You / PI])
-  subgraph SC[Supervisor container]
-    direction TB
-    S[Supervisor<br/><i>plans, reviews, reports</i>]
-    subgraph WC[Worker containers — one per question]
-      direction TB
-      W1[stats]
-      W2[figures]
-      W3[...]
-    end
-    S -->|spawn| WC
-  end
-  D[(Your data<br/><i>read-only</i>)]
-  M{{MCP servers<br/><i>arxiv, DBs, tools</i>}}
-  R[results/<br/>logbook/]
-
-  PI <-->|chat| S
-  WC -.read.-> D
-  WC -.call.-> M
-  S -->|writes| R
-  PI -.read.-> R
-```
-
-You talk to **one** Claude Code session — the *supervisor*. It lives in a per-project container that holds the conversation, the plans, and the project's memory. When a research question arrives, it doesn't answer end-to-end itself. Instead it:
-
-1. **Drafts a plan** — what a worker should do, what inputs it needs, what deliverable it owes back, how the result gets verified. You approve before anything spawns.
-2. **Spawns a worker** — a fresh container running headless Claude Code with your data mounted read-only. It writes a notebook, computes, produces figures, and reports back.
-3. **Reviews the deliverable** against the plan, iterating with the worker or escalating to you, then asks you to **accept** — promoting it to `results/`.
-4. **Logs the session** — a chronological record plus per-topic executive summaries you read next time.
-
-Workers are persistent and themed (one per coherent question, many cycles over the project's life), and disposable between sessions: the container is thrown away, the files stay. **The conversation is replaceable — the filesystem is the memory.**
-
-That's the **research** workflow. Leaner ones exist too — disposable docker-in-docker boxes, single confined containers, and curated GitHub-repo "store" boxes. See [Workflows & the store](#-workflows--the-store).
-
-## ◾ The browser UI
-
-`research webui start` serves a single-page app over HTTPS. With the **broker** running it's a full control plane; with it stopped it's a read-only terminal surface. It's the recommended way to drive everything short of authoring images.
-
-- **Workflow store.** New Project opens a grid of clickable workflow cards (Research / Base / Store) over the page. Click one → a prefilled create form → live progress as the project comes up. Per-card **Explain** docs deep-link the learning material (or the repo's README, for store cards).
-- **Sandboxes page.** Its Management tab lists the host's live projects in a sortable table and drives the **whole** lifecycle — create / start / stop / update / destroy / attach — each long op streaming a progress checklist. `destroy` requires typing the name *and* re-entering the management password (step-up). Its **Infrastructure** tab holds the pass-through ports and the shared services (Gitea, the reviewer); its **Software** tab the agent and editor downloads, the image fleet, the version pins, and the apps RS's own project and box types install (OpenKnowledge: check npm for a newer release and move every OpenKnowledge project and box to it at its next start).
-- **Per-project config (the ⚙ gear).** Show/hide terminal tabs, toggle the editor, and — on DIND projects — manage **boxes** (add/remove disposable sub-boxes with a preset + agent/editor/MCP toggles).
-- **Terminals + editor.** In-browser ssh/byobu terminals per service (xterm + host-key TOFU + Ctrl-F search) and the code-server editor in an iframe, plus a split-pane to pin one service beside another.
-- **Auth.** A client-side **vault password** encrypts your project bookmarks *in the browser* (never sent to the server). A separate **management password** (`broker passwd`) logs the Sandboxes page into the broker; the broker token lives server-side behind an opaque cookie. Signing in to **Claude** is still per-project (interactive `/login` inside the supervisor).
-
-> [!NOTE]
-> This is the **single-operator** setup — one shared management password, proportionate for a localhost / private-tailnet box. The webui and broker run as **you** (same uid): that's the contract that lets the webui reach the broker's socket, and the webui holds **no docker socket** of its own. Multi-user accounts, recoverable soft-delete, and login rate-limiting are planned before exposing it beyond localhost.
-
-## ◾ Workflows & the store
-
-`project create` (or clicking a store card) selects a **workflow**. The workflow derives the container substrate and what gets stood up; bare `create <name>` defaults to `research`.
-
-| Workflow | Substrate | What you get |
-|---|---|---|
-| **`research`** (default) | dind-sysbox | The full lab: a supervisor agent + headless analysis workers + service role-MCPs. |
-| **`sandbox-dind`** | dind-sysbox | An agent box **with inner Docker**: spin isolated, disposable **boxes** via the webui or the in-box `rs-sandbox` CLI. |
-| **`sandbox`** | docker (runc) | A **single confined container** — ssh + byobu + editor, no inner docker. Add agents with `--agent claude` and/or `--agent pi`. |
-| **store** workflows | docker / dind | Curated public GitHub repos, **cloned into a box at create with the editor + claude on** — a ready-to-explore environment. |
-
-The shipped store workflows (`research workflow list`):
-
-| Card | Clones | Box |
-|---|---|---|
-| `social-data-pipeline` | joaopn/social-data-pipeline | sandbox-dind (inner Docker, locked egress) |
-| `academic-research-skills` | Imbad0202/academic-research-skills | sandbox (runc, claude on) |
-| `scientific-agent-skills` | k-dense-ai/scientific-agent-skills | sandbox |
-
-```bash
-python research.py project create lab --workflow research --mount ~/data
-python research.py project create pipeline --workflow social-data-pipeline
-python research.py workflow list                 # the full catalog
-```
-
-The sandbox flavors default to **`--egress locked`** (80/443 and DNS to the configured resolvers only, no ICMP, RFC1918 blocked) — containment first. `research` defaults to open egress (it needs pip/apt). Override either with `--egress`.
-
-## ◾ Prerequisites
-
-- [Docker](https://www.docker.com/) Engine 29.0 or newer, with Compose v2 (`docker compose`, 2.33.1 or newer); `research start` refuses older versions and says which it found
-- [Python](https://www.python.org/) 3.9+ (host CLI is stdlib-only — conda, pyenv, system Python, anything works)
-- An [Anthropic Claude](https://www.anthropic.com/) subscription (Pro/Team or API access — you authenticate *inside* the project; there are no host-side API keys)
-
-> [!TIP]
-> Strongly recommended: [Sysbox](https://github.com/nestybox/sysbox#installation). It's the cleanest way to run a Docker daemon inside a container, giving user-namespace isolation without `--privileged`. Without it the CLI falls back to `--privileged` mode, which works but is less isolated. Linux only.
-
-## ◾ Install
-
-Three surfaces. The **host CLI** is the foundation; the **browser UI** and the **dists** layer on top.
-
-**1. Shared infrastructure + images** (required, once):
-
-```bash
-python research.py start
-```
-
-Builds all container images, starts the small **`rs-router`** egress-filter container, and auto-caches the agent + editor dists if absent. Idempotent — re-run anytime; add `--rebuild` after editing image sources. The image tree is layered so a rebuild only cascades where it must (a no-DIND base → the sysbox-DIND base → flavor leaves). Pins live in `versions.env` (`research images versions`).
-
-**2. Agent + editor dists** (auto on `start`):
-
-Claude Code and the code-server editor are **not baked into images** — they're built once into a host cache and `cp`-deployed into every container at boot. `start` pulls them if missing; you only touch these to upgrade:
-
-```bash
-python research.py agent show | pull | refresh      # the Claude Code dist
-python research.py editor show | pull | refresh       # the code-server editor dist
-```
-
-A DIND project requires a pulled agent dist; `start` guarantees it. Upgrades are deliberate: `refresh` bumps the `versions.env` pin, and a running project picks it up via its Config box's **Update** (Agents) or `project update-agent`, which deploys the cached agents into the project's own terminal and every running box live (no recreate; Claude Code's editor extension is reinstalled too), on every project type.
-
-**3. Browser UI + broker** (optional, recommended): see [The browser UI](#-the-browser-ui) and the TL;DR. Off by default — with the broker stopped the CLI is unchanged and the webui is read-only.
-
-## ◾ Quick Start
-
-The research flow, end to end on the CLI (the browser UI does all of this without a shell):
-
-```bash
-python research.py start                                   # 1. shared infra
-python research.py project create myproj --mount /path/to/data  # 2. create
-python research.py project attach myproj                    # 3. sign in to Claude
-#   inside byobu:  claude  → complete OAuth → /exit → Ctrl-A D → exit
-#   (or VSCode Remote-SSH to research@localhost:<ssh-port> and use the Claude Code extension)
-```
-
-Each `--mount` folder is mounted **read-only** at `/workspace/mnt/<basename>/` (comma-separated, or repeat the flag). From the webui, the create dialog's **Add folders** takes paths relative to RS's `data/` folder instead: put datasets there (or mount another disk into it on the host). A project's folders can be changed later in its ⚙ panel's **Sharing** box; the change applies the next time the project starts. Credentials live **inside** the supervisor (never on the host), are copied into each worker at spawn, and are deleted on `destroy`.
-
-**4. Run a thread.** Describe what you want in plain English — *"Is the response-time distribution in `/workspace/mnt/<name>/` heavy-tailed, and what does a typical user look like?"* The supervisor proposes worker plans, you say "go", it spawns workers, reviews their staged outputs, and asks you to accept.
-
-**5. End the session.** Type `/log`. The supervisor writes a session log + per-topic executive summaries and shuts workers down cleanly.
-
-**6. Tear down.** `python research.py project destroy myproj` — removes the container, workspace dir, network, and credentials snapshot.
-
-## ◾ What you get on disk
-
-Everything lives under `container_volumes/<proj>/workspace/`. The bits you'll actually open:
-
-- **`results/<worker>/<NNN>_<slug>/`** — every accepted cycle, numbered. Notebook(s), data, figures, + a snapshot of the plan that produced it.
-- **`logbook/pi/<date>-<slug>.md`** — executive summaries for you, one per topic per session, with `**Source:**` links down to the supervisor's log.
-- **`logbook/supervisor/<date>-<HHMM>.md`** — the supervisor's chronological notes (drill-down).
-- **`workers/<worker>/work/`** — each worker's full sandbox: notebooks (clean + scratch), `research_log.md`, every cycle.
-- **`plan/<worker>.md`** — the canonical plan bound to each worker; **`staging/<worker>`** — present only when a cycle awaits your accept.
-
-Logs are append-only; the supervisor never edits worker outputs by hand; plans go through an approve gate.
-
-## ◾ Capabilities: MCPs, workers, boxes
-
-Two host-level registries plus the disposable-box surface. The mental model: **`mcp` = tools, `worker` = pipeline agents, boxes = your interactive containers.**
-
-### MCP servers — `mcp`
-
-If a worker needs more than your local data — search arxiv, query a DB, hit a private tool — register an [MCP server](https://modelcontextprotocol.io/) and grant projects access:
-
-```bash
-python research.py mcp add arxiv --kind shared --image ghcr.io/blazickjp/arxiv-mcp-server:latest --port 8000
-python research.py mcp enable arxiv
-python research.py project mcp allow myproj arxiv
-```
-
-`mcp add` writes the registry; `mcp enable` flips the per-MCP flag (and auto-allows it into new projects); `project mcp allow` refuses a disabled MCP; `research start` auto-launches every enabled *shared* MCP. Every MCP is reached through the per-project **mcp-proxy** at a single internal address — workers can't reach an MCP they weren't granted. The server must speak streamable-HTTP and follow a small contract; see [docs/GUIDE.md](docs/user-guide/mcp-authoring.md).
-
-**The MCP page (Sandboxes → MCP).** A second, newer list holds MCP servers by address (`http://` or `https://`) with optional secret request headers, behind one shared gateway container. The page adds, edits, tests and removes them, and wires them: pick a project, pick its agent or one of its boxes, tick the servers it may use. The agent sees a wired server in its next session, in Claude Code and pi alike; nothing restarts. From the host: `research mcp server list | add | edit | remove | test`, `research mcp wire <project> [--box NAME] --set a,b` and `research mcp wiring`. A research project's own agent is not wired (its workers still use the registry above); its boxes are.
-
-### Worker services — `worker`
-
-Pipeline-side agents the supervisor's analysis workers call through the proxy (`research worker list`):
-
-| Service | Purpose |
-|---|---|
-| **`websearcher`** | image-baked browser (Playwright + Chromium) for web research. **Default-on** in new projects. |
-| **`wrangler`** | data-wrangling helper; inert until you allow DB MCPs for the project. |
-| **`echo-mcp`** | a no-op fixture used for substrate testing. |
-
-(Plus the **analysis** worker itself — spawned per question by the supervisor via `rs-worker`, not pre-registered.) A host-level *enabled* flag auto-applies a service to every new project at `create`; only `websearcher` is default-on. `--disable websearcher` overrules per project.
-
-### Boxes (DIND projects)
-
-On any DIND project (`research` / `sandbox-dind`) you can spin **boxes** — isolated, disposable sub-containers — from the webui's ⚙ → Boxes, or the in-box `rs-sandbox` CLI. Each box is a **preset** over two images:
-
-| Preset | What it is |
-|---|---|
-| **`empty`** | a blank box (base image) |
-| **`websearcher`** | the base + a baked browser (Playwright + Chromium) |
-| **`data-wrangler`** | the base, oriented for data work |
-| **`byo`** | bring your own — clone a repo / run a setup snippet at boot |
-
-pi reads a repo's `.claude/rules/`, `.claude/CLAUDE.md` and nested `CLAUDE.md` files like Claude Code does (an RS-owned `rs-rules` extension rides the pi dist), and it carries subagents (the `pi-subagents` package rides the pi dist too, pinned). It runs online like a stock install: `pi update` updates it in place (like `claude update`; restaging or recreating the project or box returns it to the pinned version), `pi install` / `pi remove` manage its packages, and it refreshes its model catalogs and fetches `rg` / `fd` on first need. Install telemetry stays off. Its settings and packages are yours: they survive a restage and a recreate of a dev / sandbox-dind project, like its login and sessions. The one exception is a one-time addition: settings written before pi-subagents shipped get its entry added once, at the first pi start after the next redeploy (replacing a hand-installed `npm:pi-subagents`); removing it afterwards sticks, until a box or docker project is re-created from the shipped settings. Per-box toggles: `--agent claude|pi` (or none — an agent-bearing box receives every agent the project carries), `--editor`, `--mcps <subset of the project allowlist>`, and `--repo/--ref/--setup` for the `byo` preset. Boxes boot un-authed and reach an LLM / pip / apt through the project's locked egress — the containment is router + no-creds + container isolation.
-
-### Publishing a dev repo's image
-
-RS builds a pushed tag or branch of a mirrored dev repo into a Docker image from the Development page's **Images** tab, and keeps one built image per repo. `rs-publish`, in any fetch-enabled project or box terminal, uploads it to a public registry under each git tag on its commit (or the full commit id when it has none) and moves `latest`. RS itself never holds the registry credential. When the repo has a built image, its card on the Development page's Fetch tab and its row on the Images tab each have a 📋 rs-publish button that copies the command.
-
-1. On GitHub, create a classic token with `write:packages`.
-2. In the fetch terminal, write `/workspace/.rs-publish.env` and `chmod 600` it:
-
-   ```
-   RS_PUBLISH_REGISTRY=ghcr.io/<owner>
-   RS_PUBLISH_USER=<owner>
-   RS_PUBLISH_TOKEN=<the token>
-   ```
-
-3. Tag and push the collected commit, build it on the Images tab, then:
-
-   ```bash
-   rs-publish <repo>           # shows what it would do; uploads nothing
-   rs-publish <repo> --apply   # publishes
-   ```
-
-`--no-latest` leaves `latest` alone; `--latest <tag> --apply` moves `latest` to a tag already published. A version tag that already holds other content is never moved: the run stops before uploading anything.
-
-Like `rs-sync`'s settings, the file sits in the project's `/workspace`, where an agent working in the same project can read it: keep the fetch terminal in a project without an agent if that matters.
-
-GitHub keeps a newly published package **private**: `rs-publish` says so after the first publish. Make it public once in the package's settings on GitHub (this cannot be undone). If the package page is not linked to the repository, link it there too ("Connect repository").
-
-## ◾ Security model
-
-The **container is the security boundary**; agents run under `bypassPermissions` inside it. Layers (full detail in [docs/SECURITY.md](docs/SECURITY.md)):
-
-- **No host coupling.** No host credential bind-mounts, no docker socket pass-through to agents. Claude auth lives inside each project and is deleted on destroy.
-- **DIND isolation.** DIND supervisors run under **sysbox-runc** (user-namespace isolation, no `--privileged`); their inner Docker daemon runs workers as ordinary containers. The bare `sandbox` workflow is a single runc container.
-- **Inner-bridge guard (always on).** A box, worker or role service cannot open a connection to its own project container, to the host at the project bridge, to the registry or to another box's published port; it keeps the internet, Gitea's HTTP port and the MCP proxy's registered upstreams. Applied inside every dind project at boot; see `docs/SECURITY.md#-inner-bridge-guard-always-on`.
-- **Box images pulled from a read-only registry, by digest.** The registry every project pulls box images from refuses writes; the operator's push lane is a separate instance on the loopback port; every project records the digest the registry served and pulls by it, so no project can replace or redirect the image another project boots. See `docs/SECURITY.md`.
-- **The webui listens on the router network only.** It reaches every project to open terminals, but its login page, origin ports and pass-through ports refuse connections arriving from a project's own network. See `docs/SECURITY.md`.
-- **Host hardening (operator-applied).** RS installs nothing on the host. Two paths only the host can close — a project's root routing around `rs-router`, and a project reaching the host's own services — are closed by two generic firewall rules the operator installs once; every bridge RS creates for a project or the reviewer carries an `rsn` interface prefix for exactly that. The rules, their order and the sshd bind are in [docs/SECURITY.md](docs/SECURITY.md#-host-hardening-operator-applied).
-- **Per-project network + egress filter.** Each project gets its own bridge, route-injected through `rs-router`, whose iptables FORWARD rules key on the project subnet. **Open** mode allows outbound except RFC1918; **locked** mode allows only 80/443 and DNS to the resolvers configured in `SANDBOX_DNS` (no ICMP). RFC1918 is dropped unconditionally. Sandbox flavors default to locked.
-- **MCP gating.** Workers reach MCPs only through the per-project **mcp-proxy**, and only those in the project's allowlist. An optional **inner-bridge firewall** (`--inner-firewall`) further confines worker→proxy traffic.
-- **Broker = the host-root boundary.** The opt-in broker is the *only* component with docker access. It serves a **closed verb vocabulary** over a 0600 unix socket (length-prefixed JSON, `SO_PEERCRED` same-uid check — no network listener). Every verb dispatches to a fixed lifecycle function over a validated request; **no docker passthrough**. Reads (`list`/`status`) are open at the socket; every write verb is **token-gated** (deny-by-default), `destroy` and box-remove additionally require **step-up re-auth**. Rich-input verbs forward only an explicit **field allow-list** — a relayed request can never name a host path or a host port, and the one bind-mount source it can name is a folder inside RS's own `data/` folder, typed relative to it (the create dialog's **Add folders**, the ⚙ **Sharing** box); a folder change saved in ⚙ is re-checked when the project next starts. The network-facing webui holds no docker socket and relays everything through the broker behind its session.
-
-## ◾ CLI essentials
-
-Everyday commands. Every subcommand has `--help`; the full reference lives in [docs/GUIDE.md](docs/user-guide/cli-reference.md).
-
-```bash
-# infrastructure
-python research.py start [--rebuild]                # build images + router + cache dists
-python research.py stop                             # stop ALL shared infra (projects untouched)
-
-# project lifecycle
-python research.py project create <name> [--workflow W] [--mount PATHS] [--egress open|locked] [opts]
-python research.py project attach | ssh | status | list <name>
-python research.py project stop | start | destroy <name|--all>
-python research.py project update <name> [--rebuild] [--enable IDS] [--disable IDS]
-
-# dists, browser UI, workflows
-python research.py agent  show | pull | refresh
-python research.py editor show | pull | refresh
-python research.py broker passwd | start | stop | status
-python research.py webui  start [--bind IP] [--port N] | stop | status | cert-tailscale
-python research.py workflow list
-
-# capabilities
-python research.py mcp    add | enable | disable | list | start | stop | test ...
-python research.py project mcp allow | deny | list | sync <proj> [<mcp>]
-python research.py worker list | enable | disable ...
-python research.py project worker enable | disable | stop | start | list | status <proj> [<name>]
-```
-
-`webui cert-tailscale` stages a Tailscale certificate for the browser UI and also turns on its automatic renewal: from then on `research start` and `research webui start` ask Tailscale for a newer certificate and install it. An install whose Tailscale certificate was staged before this release runs `webui cert-tailscale` once to turn renewal on.
-
-**In-supervisor CLIs** (the supervisor's Claude uses these; you rarely call them directly): **`rs-worker`** — analysis-worker lifecycle (`spawn --plan`, `list`, `wait`, `finalize`/`accept`/`unstage`, `attach`/`tail`); **`rs-sandbox`** — box lifecycle on DIND projects (`create [name] --preset empty|websearcher|data-wrangler|byo [--agent claude] [--editor]`, `list`, `discard`).
-
-## ◾ File structure
+Put datasets in `data/` inside the clone. A project's **Add folders** picks folders there and mounts them read-only:
 
 ```
 research-sandbox/
-├── research.py                   Host CLI (Python stdlib only)
-├── docker-compose.yml            Router + webui services
-├── versions.env                  Image / dist / app version pins
-├── .env / .env.example           Host config (PROJECTS_DIR, SANDBOX_DNS, defaults)
-├── workflows/*.json              Workflow manifests (research, sandbox-dind, sandbox, store)
-├── boxes/*.json                  Box presets (empty, websearcher, data-wrangler, byo)
-├── cli/                          rscore (lifecycle) + in-container CLIs + registries
-├── agent/                        Container Dockerfiles + entrypoints (layered bases + leaves)
-├── container/                    Templates baked into images (supervisor / analysis / …)
-├── router/                       Egress-filter router (Alpine + iptables)
-├── webui/                        Browser SPA + aiohttp server + per-service tab defs
-├── docs/{user-guide,SECURITY.md} Workflow/MCP authoring + threat model
-└── external/                     Vendored reference code (not a dependency)
+├── data/                 your datasets, mounted read-only into projects
+└── container_volumes/    one workspace folder per project, created by RS
 ```
 
-Per-project workspace at `container_volumes/<proj>/workspace/`: `results/`, `logbook/{pi,supervisor}/`, `workers/<name>/work/`, `boxes/<box>/`, `shared/<name>/` (one mailbox per worker and for the project agent — read-write for its owner, read-only for everyone else, kept when its owner goes), `shared/.boxes/<box>/` (the mailbox of each box created with "Share files", off by default: a sharing box reads the project agent's mailbox and the other sharing boxes' at `/workspace/shared`, and a box that does not share has no mailbox and no `/workspace/shared`; either sees the rest of `shared/` only when `shared` is given as a read-only folder; the OpenKnowledge feed `/ok` writes into the agent's own mailbox under `ok/`, which a sharing OpenKnowledge box's `/ok-ingest` takes in), `plan/`, `staging/`, `mnt/<basename>/`, and `.orchestrator/{role-mcps,mcp-allow}.json` (the per-project registries).
+To keep settings, put them in a `.env` file next to `research.py`:
 
-## ◾ Roadmap
+| Variable | Default | |
+|---|---|---|
+| `PROJECTS_DIR` | `./container_volumes/` | where project workspaces live |
+| `WEBUI_BIND`, `WEBUI_PORT` | `127.0.0.1`, `7777` | address of the web interface; a LAN or tailnet address reaches it from elsewhere (read [Security](docs/SECURITY.md) first) |
+| `SANDBOX_DNS` | `9.9.9.9,149.112.112.112` | the resolvers a locked project may use |
 
-- **Store & boxes** — a richer workflow store (more curated repos, per-repo setup scripts) and **app-type** boxes (ready-built stacks like Overleaf / Quartz / Slidev in a browser tab).
-- **Control plane** — recoverable soft-delete + rate-limiting before exposing the webui beyond localhost; multi-host **federation** (one frontend → many single-host instances).
-- **Pluggable worker runtime** — surface the worker LLM endpoint choice (API / OpenAI-compatible) to operators.
+**Update:** `git pull`, then the steps in [After updating](docs/user-guide/after-updating.md).
 
-## ◾ Further reading
+## How it works
 
-- **[docs/GUIDE.md](https://joaopn.github.io/research-sandbox/)** — how a research thread plays out, the supervisor↔worker protocol, the full CLI reference, authoring an MCP server, debugging, working modes and the test policy, what to do after updating RS, FAQ.
-- **[docs/SECURITY.md](docs/SECURITY.md)** — threat model, isolation layers, what's prevented and what isn't.
+**1. Create a project.** **New Project** shows the workflow cards. Pick one, name it, add data folders, **Create**.
 
-<div align="center">
-<sub>Licensed under the file <a href="LICENSE">LICENSE</a>.</sub>
-</div>
+<img src="docs/assets/new-project.png" alt="New Project: workflow cards" width="720">
+
+**2. Sign in.** In the project's terminal tab, run `claude` or `pi` and `/login`. The login stays with the project.
+
+<img src="docs/assets/terminal.png" alt="A project's terminal tab with the agent" width="720">
+
+**3. Work.** Talk to the agent in the terminal or the editor. On an inner-Docker project, tick **Reader** under Extensions at create (always on for researcher) to read what it wrote: notebooks, figures, its memory.
+
+<img src="docs/assets/reader.png" alt="The Reader tab" width="720">
+
+**4. Add boxes.** On an inner-Docker project, the **+** on the tab strip adds a box: pick a type, an agent, the folders and tools it may see.
+
+<img src="docs/assets/add-box.png" alt="The box window" width="720">
+
+**5. Wire tools.** **Sandboxes → MCP**: add a server, **Test**, then pick a project, its agent or a box, tick the servers and **Save**.
+
+**6. Hand over code.** Turn on Gitea under **Sandboxes → Infrastructure**, then create a **dev** project with a GitHub URL. Its agent works the repository by pull request. To collect the work, create a second, non-dev project with **rs-fetch** ticked: the **Development** page's Fetch tab copies the command that pulls it into a clone there.
+
+<img src="docs/assets/development.png" alt="Development page: Fetch tab" width="720">
+
+Everything also runs from the command line: [CLI reference](docs/user-guide/cli-reference.md). More in the [docs](https://joaopn.github.io/research-sandbox/).
+
+## Workflows
+
+Chosen in the New Project window. Inner-Docker projects can hold boxes and containers of their own.
+
+<details>
+<summary>9 workflows</summary>
+
+| Workflow | Container | Agents | What you get |
+|---|---|---|---|
+| `research` | inner Docker | Claude | A supervisor that plans with you, runs each analysis in a worker container, reviews it, and logs the session |
+| `researcher` | inner Docker | Claude, pi | One agent on one line of inquiry for weeks, with a memory you read in the Reader tab; findings enter the record when you accept them |
+| `dev` | inner Docker | Claude, pi | An agent on one GitHub repository's fork, with working modes and its own Docker for tests |
+| `sandbox-dind` | inner Docker | Claude, pi | A confined agent with its own Docker and boxes |
+| `sandbox` | single | Claude, pi | A bare confined container: terminal and editor |
+| `open-knowledge` | single | Claude, pi | An OpenKnowledge notes base in its own tab, its history optionally kept on Gitea |
+| `social-data-pipeline` | inner Docker | Claude, pi | A pipeline for processing and classifying large-scale social data |
+| `academic-research-skills` | single | Claude, pi | Research-writing skills: research, write, review, revise |
+| `scientific-agent-skills` | single | Claude, pi | A large collection of scientific and research skills |
+
+`research` always runs Claude; `dev` and `researcher` need at least one agent; the others may have none.
+
+</details>
+
+## Box types
+
+<details>
+<summary>8 box types</summary>
+
+| Type | What it is |
+|---|---|
+| `empty` | A blank box |
+| `byo` | Clones a repository and runs a setup command |
+| `dev` | Works a GitHub repository through its own fork |
+| `websearcher` | Web research with Playwright and headless Chromium |
+| `zotero` | Your Zotero library through its MCP server |
+| `open-knowledge` | An OpenKnowledge notes base in its own tab |
+| `paper-orchestra` | The PaperOrchestra repository, cloned at boot |
+| `data-wrangler` | Schemas, queries and extracts through the project's database servers |
+
+</details>
+
+More types can be registered on the host; see [Boxes](docs/architecture/Boxes.md).
+
+## Built on
+
+| | Used for |
+|---|---|
+| [Docker](https://www.docker.com/) and [Sysbox](https://github.com/nestybox/sysbox) | project containers, Docker inside them |
+| [Claude Code](https://github.com/anthropics/claude-code) and [pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) | the agents |
+| [code-server](https://github.com/coder/code-server) | the editor tab |
+| [Gitea](https://about.gitea.com/) | mirrors, forks and pull requests of the dev lane |
+| [xterm.js](https://xtermjs.org/) and byobu | the terminal tabs |
+| [Playwright](https://playwright.dev/) | the browser in websearcher boxes |
+| [OpenKnowledge](https://github.com/inkeep/open-knowledge) | the notes workflow and box |
+
+## License
+
+[AGPL-3.0](LICENSE).

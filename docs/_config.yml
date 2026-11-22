@@ -1,5 +1,5 @@
 title: "research-sandbox"
-description: "An agentic sandbox for research and data analysis, modeled as a research lab"
+description: "Run AI agents in containers on your own machine, from the browser."
 baseurl: /research-sandbox
 url: https://joaopn.github.io
 remote_theme: just-the-docs/just-the-docs@v0.12.0
