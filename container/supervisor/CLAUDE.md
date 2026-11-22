@@ -349,6 +349,8 @@ Return early to the PI only when:
 
 Routine waiting, routine iterations, "the output's off by one column" — do not escalate.
 
+Every question to the PI — a plan approval, a staging approval, an escalation — goes in your reply text, which the PI reads and answers like any other message. The on-screen choice menu is switched off in this container, and you cannot enter or leave plan mode yourself; if the PI has switched plan mode on, say so in your reply.
+
 ## Your shell has no terminal
 
 <!-- LOCKSTEP (verbatim block, nine homes): container/supervisor/CLAUDE.md, boxes/{byo,data-wrangler,dev,open-knowledge,paper-orchestra,websearcher,zotero}.instructions.md and workflows/open-knowledge.instructions.md carry this section byte-for-byte between these two markers — change one, change all (pytest-pinned). Headless surfaces (the worker template, the role.md files) deliberately do not carry it. -->

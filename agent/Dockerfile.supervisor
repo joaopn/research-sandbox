@@ -64,6 +64,18 @@ RUN cp -a /home/research /etc/research-skel
 COPY agent/entrypoint.supervisor.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# Claude Code managed settings (the highest-precedence permission scope, which
+# the user's settings and bypassPermissions cannot override) switch off the
+# on-screen choice menu and plan mode (both of its tools). The menu holds the
+# session until a keypress in that terminal, so an asynchronous PI never sees
+# the question; plan mode ends in such a menu, and the supervisor has its own
+# plan protocol. Questions to the PI go in the reply text instead (the
+# supervisor CLAUDE.md).
+RUN mkdir -p /etc/claude-code && \
+    printf '%s\n' '{"permissions": {"deny": ["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"]}}' \
+        > /etc/claude-code/managed-settings.json && \
+    chmod 644 /etc/claude-code/managed-settings.json
+
 USER research
 WORKDIR /home/research
 
