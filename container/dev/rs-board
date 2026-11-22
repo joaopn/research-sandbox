@@ -48,11 +48,11 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-# MIRROR-PAIR LOCKSTEP (five-way): the shared-Gitea base URL every dev
+# MIRROR-PAIR LOCKSTEP (six-way): the shared-Gitea base URL every dev
 # surface talks to. cli/gitea.py GITEA_CONTAINER + GITEA_INNER_PORT,
-# cli/rs_sandbox.py DEV_GITEA_URL, rs-wt's GITEA_ORIGIN_PREFIX and rs-land's
-# DEV_GITEA_URL — this file is image-baked standalone and cannot import any
-# of them. Pinned by the unit test.
+# cli/rs_sandbox.py DEV_GITEA_URL, rs-wt's GITEA_ORIGIN_PREFIX, and rs-land's
+# and rs-docs' DEV_GITEA_URL — this file is image-baked standalone and
+# cannot import any of them. Pinned by the unit test.
 DEV_GITEA_URL = "http://rs-gitea:3000"
 
 # Quick-call bound, mirroring cli/gitea.py API_TIMEOUT_S (the dev lane's

@@ -1,0 +1,15 @@
+<script>
+(function () {
+  var t = null; try { t = localStorage.getItem('theme'); } catch (e) {}
+  var dark = t === 'dark' || (t !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  var l = document.querySelector('link[href*="just-the-docs-default.css"]');
+  if (dark && l) l.href = l.href.replace('just-the-docs-default.css', 'just-the-docs-rsdark.css');
+  window.rsToggleTheme = function () {
+    var l = document.querySelector('link[href*="just-the-docs-"]'); if (!l) return;
+    var toDark = l.href.indexOf('rsdark') < 0;
+    l.href = l.href.replace(/just-the-docs-[a-z]+\.css/, toDark ? 'just-the-docs-rsdark.css' : 'just-the-docs-default.css');
+    try { localStorage.setItem('theme', toDark ? 'dark' : 'light'); } catch (e) {}
+    if (document.querySelector('.language-mermaid, pre.mermaid, code.language-mermaid')) location.reload();
+  };
+})();
+</script>

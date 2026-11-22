@@ -2405,7 +2405,13 @@ RS_COMMANDS_LABEL = "research.rs-commands"
 RS_COMMANDS_LAYOUT = "1"
 # The typed commands linked onto a box's PATH by its kind (a MIRROR of
 # rscore.RS_DEV_LINKS / RS_WEB_LINKS, pinned).
-BOX_LINKS = {"dev": ("rs-wt", "rs-land", "rs-board"), "web": ("rs-web-restart",)}
+BOX_LINKS = {"dev": ("rs-wt", "rs-land", "rs-board", "rs-docs"), "web": ("rs-web-restart",)}
+# Why a typed command is not linked when its file is not in the box's image
+# (an image built before RS shipped that command); no command-line verb, it
+# can reach a browser. A MIRROR of rscore.RS_COMMAND_NOT_IN_IMAGE (pinned).
+BOX_COMMAND_NOT_IN_IMAGE = (
+    "this image does not carry that command; rebuild RS's images with Rebuild "
+    "all on Sandboxes → Software, then stop the project and start it again")
 BOX_RS_COMMANDS_OLD = ("this box was started before RS moved its helper "
                        "commands; stop the project and start it again")
 
@@ -2423,12 +2429,25 @@ def _link_box_commands(cname: str, tools: "tuple[str, ...]") -> None:
     (command-relevance: a box gets only the commands its kind uses). The box
     entrypoint runs as `worker`, which cannot write /usr/local/bin, so the
     links land via a root exec right after the box's docker run. Never on a
-    box from before the layout (the link would point at nothing). Best-effort
-    per tool: a failure warns."""
+    box from before the layout (the link would point at nothing). A command
+    whose file this image does not carry (an image built before RS shipped it)
+    is not linked (`ln -sf` would succeed on the missing target): one warning
+    names it, and the other tools are linked all the same. Best-effort per
+    tool: a failure warns."""
     if not _box_rs_commands(cname):
         print(f"warning: box {cname!r}: {BOX_RS_COMMANDS_OLD}", file=sys.stderr)
         return
     for tool in tools:
+        r = _docker("exec", "-u", "0", cname, "test", "-e", f"{RS_LIB_DIR}/{tool}")
+        if r.returncode != 0:
+            detail = (r.stderr or r.stdout or "").strip()
+            if detail:
+                print(f"warning: checking {tool} in box {cname!r} failed: {detail}",
+                      file=sys.stderr)
+            else:
+                print(f"warning: {tool} is not installed into box {cname!r}: "
+                      f"{BOX_COMMAND_NOT_IN_IMAGE}", file=sys.stderr)
+            continue
         r = _docker("exec", "-u", "0", cname, "ln", "-sf",
                     f"{RS_LIB_DIR}/{tool}", f"/usr/local/bin/{tool}")
         if r.returncode != 0:

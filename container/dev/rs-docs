@@ -1,0 +1,1099 @@
+#!/opt/conda/bin/python
+"""rs-docs — give a repository a just-the-docs site built from its docs/ folder.
+
+The site is the repository's own docs/ folder, published by a GitHub workflow
+that runs GitHub's own Pages build every time docs/ changes on the default
+branch.
+
+Subcommands:
+  init [--dry-run]   lay down the site files in docs/, the workflow in
+                     .github/workflows/docs.yml, and sidebar front matter on
+                     every page in docs/ that has none. Refuses, changing
+                     nothing, when anything is in the way. --dry-run reads
+                     only and prints what init would write, every file that
+                     would be published, template code in the pages, pages
+                     with no known place in the sidebar, and each reason init
+                     would refuse.
+  check              read the docs/ tree only (no network, no docker) and
+                     print one line per defect; exit 1 when there is any.
+  build              build the site as GitHub will: GitHub's own Pages build
+                     image (the release the workflow names), run with this
+                     container's docker as the calling user on docs/ (mounted
+                     read-only), into one fixed folder per work tree under
+                     /workspace/.rs-docs/; then the workflow's link check on
+                     the built site. Prints the folder.
+
+init (without --dry-run) runs in a worktree only, never in the primary clone.
+
+Exit codes: 0 done / ok; 1 defects (check), a failed build or a broken link
+(build), or an internal error; 2 a refusal (init, build) or no site to check.
+
+Wiring resolution (mirrors rs-board), used by init's one read of the upstream
+mirror's record on Gitea:
+  - dev BOX: GITEA_URL/GITEA_TOKEN arrive as container env.
+  - dev PROJECT (supervisor): the agent_user-bearing row of the host-staged
+    /workspace/.orchestrator/dev-gitea.json + its token file under
+    ~/.dev-tokens/.
+The token travels ONLY as the Authorization header — never argv, never
+inside a URL, never in output.
+
+Standalone by design: image-baked into both dev surfaces (in /usr/local/lib/rs,
+linked onto PATH), so it cannot import cli/ modules; the site files sit
+beside its resolved path in docs-site/.
+"""
+
+import argparse
+import json
+import os
+import posixpath
+import re
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+# MIRROR-PAIR LOCKSTEP: the shared-Gitea base URL every dev surface talks to
+# (cli/gitea.py GITEA_CONTAINER + GITEA_INNER_PORT, cli/rs_sandbox.py
+# DEV_GITEA_URL, rs-wt's GITEA_ORIGIN_PREFIX, rs-land's and rs-board's
+# DEV_GITEA_URL). This file is image-baked standalone and cannot import them.
+DEV_GITEA_URL = "http://rs-gitea:3000"
+
+# Quick-call bound, mirroring cli/gitea.py API_TIMEOUT_S (rs-board and
+# rs-land carry the same): bounded at all so a wedged Gitea cannot hang init.
+API_TIMEOUT_S = 15
+
+# The release of GitHub's Pages build action the shipped workflow runs. ONE
+# constant: the workflow names `actions/jekyll-build-pages@<tag>`, and a local
+# build runs the same release's image, `ghcr.io/actions/jekyll-build-pages:<tag>`.
+JEKYLL_BUILD_PAGES_TAG = "v1.0.13"
+JEKYLL_BUILD_PAGES_ACTION = "actions/jekyll-build-pages@" + JEKYLL_BUILD_PAGES_TAG
+
+# The theme reference the shipped _config.yml pins; `check` refuses any other.
+REMOTE_THEME = "just-the-docs/just-the-docs@v0.12.0"
+
+DOCS = "docs"
+WORKFLOW = ".github/workflows/docs.yml"
+WORKFLOWS_DIR = ".github/workflows"
+SITE_SOURCE = Path(__file__).resolve().parent / "docs-site"
+
+# The site files init copies into docs/, by their path under docs-site/ (the
+# same path under docs/). linkcheck.py and workflow.yml are not site files:
+# the link check is inlined into the workflow.
+SITE_FILES = (
+    "_config.yml",
+    "_sass/color_schemes/rs.scss",
+    "_sass/color_schemes/rsdark.scss",
+    "assets/css/just-the-docs-rsdark.scss",
+    "_includes/head_custom.html",
+    "_includes/header_custom.html",
+    "_includes/nav_footer_custom.html",
+    "_includes/mermaid_config.js",
+)
+LINKCHECK = "linkcheck.py"
+WORKFLOW_TEMPLATE = "workflow.yml"
+LINKCHECK_MARKER = "@@LINKCHECK_PY@@"
+PLACEHOLDER = re.compile(r"@@[A-Z_]+@@")
+
+# GitHub's build action's own image for that release: what `build` runs.
+JEKYLL_BUILD_PAGES_IMAGE = "ghcr.io/actions/jekyll-build-pages:" + JEKYLL_BUILD_PAGES_TAG
+# Where the image's entrypoint reads its source and writes the site
+# (GITHUB_WORKSPACE + INPUT_SOURCE / INPUT_DESTINATION, as the action sets
+# them on GitHub; INPUT_DESTINATION is the workflow's `destination: _site`).
+BUILD_WORKSPACE = "/github/workspace"
+BUILD_DESTINATION = "_site"
+GITHUB_API_URL = "https://api.github.com"
+# One fixed output folder per work tree, under the workspace that survives a
+# recreate: <workspace>/.rs-docs/<work tree folder name>/site. The builder
+# cleans its own output on a rebuild, so rs-docs never deletes anything.
+BUILD_DIR_NAME = ".rs-docs"
+BUILD_SITE_NAME = "site"
+# The settings line build reads the repository's GitHub owner/name from
+# (init writes it from the mirror record; no network read in build).
+GH_EDIT_REPOSITORY = "gh_edit_repository"
+
+HOME_CANDIDATES = ("index.md", "README.md")
+# What marks text init leaves for the maintainer to write (a page's
+# `> TODO(maintainer): …` line, the settings' description placeholder).
+TODO_MARK = "TODO(maintainer)"
+HOME_TODO = "> TODO(maintainer): the site's home text\n"
+NOT_SECTIONS = ("assets",)
+
+# Another docs tool configured in the repository (path, tool name).
+OTHER_DOCS_TOOLS = (
+    ("mkdocs.yml", "MkDocs"),
+    ("mkdocs.yaml", "MkDocs"),
+    ("docs/mkdocs.yml", "MkDocs"),
+    ("docs/mkdocs.yaml", "MkDocs"),
+    ("docs/conf.py", "Sphinx"),
+    ("docs/source/conf.py", "Sphinx"),
+)
+DOCUSAURUS_GLOB = "docusaurus.config.*"
+WORKFLOW_DOCS_WORDS = ("mkdocs", "sphinx", "docusaurus", "jekyll")
+
+# What init writes into the settings file and the workflow is checked
+# against GitHub's own name rules before anything is written.
+GITHUB_URL_RE = re.compile(
+    r"https://github\.com/([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)/([A-Za-z0-9._-]+?)(?:\.git)?")
+BRANCH_RE = re.compile(r"[A-Za-z0-9._][A-Za-z0-9._/-]*")
+NAME_RE = r"[A-Za-z0-9._-]+"
+
+
+class Refusal(Exception):
+    pass
+
+
+class MirrorError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- wiring
+def resolve_wiring():
+    """Box env first, else the supervisor's staged wiring (rs-board's
+    resolution, mirrored). Returns (Gitea root URL, token)."""
+    token = os.environ.get("GITEA_TOKEN") or ""
+    if token:
+        url = os.environ.get("GITEA_URL") or ""
+        if not url:
+            raise MirrorError("GITEA_URL must be set alongside GITEA_TOKEN")
+        return url.rstrip("/"), token
+    dev_json = (Path(os.environ.get("RS_WORKSPACE") or "/workspace")
+                / ".orchestrator" / "dev-gitea.json")
+    if not dev_json.is_file():
+        raise MirrorError(f"no dev wiring ({dev_json} missing): this container is not a dev project or dev box")
+    try:
+        data = json.loads(dev_json.read_text())
+    except (OSError, ValueError) as e:
+        raise MirrorError(f"cannot read the dev wiring: {e}")
+    rows = [r for r in (data.get("repos") or [])
+            if isinstance(r, dict) and r.get("repo") and r.get("agent_user")]
+    if not rows:
+        raise MirrorError("this project's own agent works no repository (its dev wiring names none for it)")
+    row = rows[0]
+    token_file = Path.home() / ".dev-tokens" / (row.get("token_file") or row["agent_user"] + ".token")
+    try:
+        token = token_file.read_text().strip()
+    except OSError:
+        token = ""
+    if not token:
+        raise MirrorError(f"the dev-lane access token is not staged at {token_file}; "
+                          f"ask the operator to restart the project (Stop, then Start, in Sandboxes → Management)")
+    return DEV_GITEA_URL, token
+
+
+def fetch_mirror_record(remote_root, owner, repo):
+    """The one network read: GET the upstream mirror's record from the shared
+    Gitea with the agent's token. Raises MirrorError."""
+    root, token = resolve_wiring()
+    if remote_root.rstrip("/") != root:
+        raise MirrorError("the upstream remote does not point at the shared Gitea this container is wired to")
+    path = f"/api/v1/repos/{urllib.parse.quote(owner, safe='')}/{urllib.parse.quote(repo, safe='')}"
+    req = urllib.request.Request(root + path, method="GET")
+    req.add_header("Authorization", "token " + token)
+    try:
+        with urllib.request.urlopen(req, timeout=API_TIMEOUT_S) as r:
+            raw = r.read()
+    except urllib.error.HTTPError as e:
+        raise MirrorError(f"Gitea answered HTTP {e.code}") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise MirrorError(f"Gitea unreachable ({getattr(e, 'reason', e)})") from None
+    try:
+        record = json.loads(raw)
+    except ValueError:
+        raise MirrorError("Gitea's answer is not JSON") from None
+    if not isinstance(record, dict):
+        raise MirrorError("Gitea's answer is not a repository record")
+    return record
+
+
+def parse_upstream(url):
+    """(Gitea root, mirror owner, repo) from the upstream remote's URL, or None
+    when it is not a plain http(s) Gitea repository address."""
+    try:
+        u = urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
+    if u.scheme not in ("http", "https") or not u.hostname or "@" in u.netloc or u.query or u.fragment:
+        return None
+    m = re.fullmatch(rf"/({NAME_RE})/({NAME_RE}?)(?:\.git)?/?", u.path)
+    if not m or m.group(2) in (".", ".."):
+        return None
+    return f"{u.scheme}://{u.netloc}", m.group(1), m.group(2)
+
+
+def github_from_record(record):
+    """(GitHub owner, repo, default branch) from a mirror record. Raises
+    Refusal; never puts the record's URL in a message (it could carry
+    credentials)."""
+    m = GITHUB_URL_RE.fullmatch(str(record.get("original_url") or ""))
+    if not m or m.group(2) in (".", ".."):
+        raise Refusal("the upstream mirror's record names no GitHub repository (its source is not an "
+                      "https://github.com/<owner>/<repo> address): init needs it for the site's address; ask the maintainer")
+    branch = record.get("default_branch")
+    if not isinstance(branch, str) or not BRANCH_RE.fullmatch(branch) or ".." in branch:
+        raise Refusal("the upstream mirror's record names no default branch init can write into the site settings "
+                      "(missing, or characters outside letters, digits, '.', '_', '-', '/'); ask the maintainer")
+    return m.group(1), m.group(2), branch
+
+
+def read_github(top):
+    """(owner, repo, branch) of the repository on GitHub, read from the
+    upstream mirror's record. Raises Refusal."""
+    r = subprocess.run(["git", "-C", str(top), "remote", "get-url", "upstream"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Refusal("this clone has no upstream remote: init reads the repository's GitHub address from the "
+                      "upstream mirror; run it in a worktree of a dev repository")
+    parsed = parse_upstream(r.stdout.strip())
+    if parsed is None:
+        raise Refusal("the upstream remote is not a plain address of a Gitea repository "
+                      "(http(s)://<host>/<owner>/<repo>.git): init cannot read the mirror's record; ask the maintainer")
+    try:
+        record = fetch_mirror_record(*parsed)
+    except MirrorError as e:
+        raise Refusal(f"cannot read the upstream mirror's record on Gitea ({e}): init needs the repository's "
+                      f"GitHub address and default branch from it; try again, or ask the maintainer") from None
+    return github_from_record(record)
+
+
+# ---------------------------------------------------------------- the tree
+def git_top():
+    r = subprocess.run(["git", "rev-parse", "--is-inside-work-tree", "--show-toplevel"],
+                       capture_output=True, text=True)
+    lines = r.stdout.split("\n")
+    if r.returncode != 0 or lines[0].strip() != "true" or len(lines) < 2 or not lines[1].strip():
+        return None
+    return Path(lines[1].strip())
+
+
+def hidden(name):
+    return name.startswith("_") or name.startswith(".")
+
+
+def walk_files(docs):
+    """Every file under docs/ (posix paths relative to docs/), sorted; links to
+    folders are not followed."""
+    out = []
+    for d, dirs, files in os.walk(docs):
+        dirs.sort()
+        rel = Path(d).relative_to(docs)
+        for f in sorted(files):
+            out.append((rel / f).as_posix())
+        for x in list(dirs):
+            if os.path.islink(os.path.join(d, x)):
+                out.append((rel / x).as_posix())
+                dirs.remove(x)
+    return sorted(out)
+
+
+def published(rel):
+    return not any(hidden(part) for part in rel.split("/"))
+
+
+def pages(docs):
+    """The Markdown pages: every .md under docs/ outside names starting with
+    '_' or '.' (the files GitHub's build does not publish)."""
+    return [p for p in walk_files(docs) if p.endswith(".md") and published(p)]
+
+
+# ---------------------------------------------------------------- markdown
+FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+
+
+def md_lines(text):
+    """(line number, line, inside a fenced code block) for each line."""
+    fence = None
+    for n, line in enumerate(text.split("\n"), 1):
+        line = line.rstrip("\r")
+        m = FENCE.match(line)
+        if fence is None:
+            if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+                fence = m.group(1)
+                yield n, line, True
+                continue
+            yield n, line, False
+        else:
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not m.group(2).strip():
+                fence = None
+            yield n, line, True
+
+
+def first_heading(text):
+    for _, line, in_fence in md_lines(text):
+        if not in_fence and line.startswith("# "):
+            t = re.sub(r"(?:^|\s+)#+\s*$", "", line[2:].strip()).strip()
+            return t or None
+    return None
+
+
+CODE_SPAN = re.compile(r"(`+)(?:(?!\1).)+?\1")
+INLINE_LINK = re.compile(r"(!?)\[(?:[^\[\]]|\[[^\[\]]*\])*\]\(\s*(<[^<>]*>|[^\s()]+(?:\([^\s()]*\)[^\s()]*)*)")
+REF_DEF = re.compile(r"^ {0,3}\[[^\]]+\]:\s*(<[^<>]*>|\S+)")
+
+
+def md_links(text, skip_lines=0):
+    """(line number, target, is image) for every inline link, image and
+    reference definition outside fenced code blocks and code spans, in
+    document order. The first skip_lines lines (front matter) are skipped."""
+    out = []
+    for n, line, in_fence in md_lines(text):
+        if in_fence or n <= skip_lines:
+            continue
+        m = REF_DEF.match(line)
+        if m:
+            out.append((n, m.group(1), False))
+            continue
+        for m in INLINE_LINK.finditer(CODE_SPAN.sub("", line)):
+            out.append((n, m.group(2), m.group(1) == "!"))
+    return out
+
+
+def link_path(page_dir, target):
+    """The docs/-relative posix path a relative link target names, ".." when
+    it leaves docs/, or None for a target that is not a relative link
+    (a scheme, an absolute /path, an #anchor)."""
+    if target.startswith("<") and target.endswith(">"):
+        target = target[1:-1]
+    if not target or target.startswith("#") or target.startswith("/"):
+        return None
+    if re.match(r"[A-Za-z][A-Za-z0-9+.-]*:", target):
+        return None
+    path = urllib.parse.unquote(target.split("#", 1)[0].split("?", 1)[0])
+    if not path:
+        return None
+    joined = posixpath.normpath(posixpath.join(page_dir, path))
+    if joined == ".." or joined.startswith("../"):
+        return ".."
+    return joined
+
+
+# ---------------------------------------------------------------- front matter
+KEY_LINE = re.compile(r"([A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]+(.*?))?[ \t]*$")
+PLAIN_BAD_START = "[]{}&*!|>%@`'\"?,"
+YAML_WORDS = ("true", "false", "yes", "no", "on", "off", "null", "~", "y", "n")
+
+
+def starts_front_matter(text):
+    first = text.lstrip("﻿").split("\n", 1)[0].rstrip("\r")
+    return first.rstrip() == "---"
+
+
+def parse_scalar(raw):
+    """A flat value: double-quoted, single-quoted or plain. Returns the
+    string; raises ValueError for what this small reader cannot read."""
+    raw = raw.strip()
+    if raw.startswith('"'):
+        out, i = [], 1
+        while i < len(raw):
+            c = raw[i]
+            if c == "\\":
+                if i + 1 >= len(raw) or raw[i + 1] not in '"\\/':
+                    raise ValueError("an escape this reader does not read")
+                out.append(raw[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                rest = raw[i + 1:]
+                if rest.strip() and not re.match(r"\s+#", rest):
+                    raise ValueError("text after the closing quote")
+                return "".join(out)
+            out.append(c)
+            i += 1
+        raise ValueError("an unclosed double quote")
+    if raw.startswith("'"):
+        out, i = [], 1
+        while i < len(raw):
+            if raw[i] == "'":
+                if raw[i + 1:i + 2] == "'":
+                    out.append("'")
+                    i += 2
+                    continue
+                rest = raw[i + 1:]
+                if rest.strip() and not re.match(r"\s+#", rest):
+                    raise ValueError("text after the closing quote")
+                return "".join(out)
+            out.append(raw[i])
+            i += 1
+        raise ValueError("an unclosed single quote")
+    value = re.split(r"\s#", raw, maxsplit=1)[0].strip()
+    if value.startswith("#"):
+        value = ""
+    if value and (value[0] in PLAIN_BAD_START or value.startswith("- ") or ": " in value or value.endswith(":")):
+        raise ValueError("a value that is not a plain string")
+    return value
+
+
+def read_front_matter(text):
+    """(fields, number of front-matter lines incl. both fences) of a page that
+    starts with '---'. A flat `key: value` reader, no YAML library; raises
+    ValueError naming what it cannot read."""
+    lines = text.lstrip("﻿").split("\n")
+    fields = {}
+    for i, line in enumerate(lines[1:], 2):
+        line = line.rstrip("\r")
+        if line.rstrip() in ("---", "..."):
+            return fields, i
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m = KEY_LINE.fullmatch(line)
+        if not m:
+            raise ValueError(f"line {i} is not a flat `key: value` line")
+        if m.group(1) in fields:
+            raise ValueError(f"line {i} gives {m.group(1)} a second time")
+        try:
+            fields[m.group(1)] = parse_scalar(m.group(2) or "")
+        except ValueError as e:
+            raise ValueError(f"line {i}: {e}") from None
+    raise ValueError("no closing '---' line")
+
+
+def yaml_scalar(s):
+    """A title written so the flat reader (and YAML) reads it back as the same
+    string: double-quoted when it holds '&', ':' or '#', starts with a digit,
+    or would otherwise not read back as plain text."""
+    if (any(c in s for c in "&:#\\\"'") or s[:1].isdigit() or s[:1] in PLAIN_BAD_START or s.startswith("-")
+            or s != s.strip() or s.lower() in YAML_WORDS):
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return s
+
+
+def front_matter_bytes(fields):
+    out = ["---"]
+    for key in ("title", "parent", "nav_order", "has_children"):
+        if key in fields:
+            out.append(f"{key}: {render_value(fields[key])}")
+    out.append("---")
+    return ("\n".join(out) + "\n").encode()
+
+
+def render_value(v):
+    if v is True:
+        return "true"
+    if isinstance(v, int):
+        return str(v)
+    return yaml_scalar(v)
+
+
+def section_title(folder):
+    t = folder.replace("-", " ").replace("_", " ")
+    return t[:1].upper() + t[1:]
+
+
+# ---------------------------------------------------------------- init
+def read_text(path):
+    """Decoded UTF-8 text of a file; raises UnicodeDecodeError."""
+    return path.read_bytes().decode("utf-8")
+
+
+def plan_init(top):
+    """Everything init would do, decided before any write. Returns a dict:
+    creates [(rel, bytes)], rewrites [(rel, front matter bytes)], dirs [rel],
+    published [rel], liquid ["docs/x.md:N"], no_place [rel], refusals [str],
+    values (the filled placeholders, or None)."""
+    docs = top / DOCS
+    refusals, creates, rewrites = [], [], []
+    plan = {"creates": creates, "rewrites": rewrites, "refusals": refusals,
+            "published": [], "liquid": [], "no_place": [], "dirs": []}
+
+    # Another docs tool, a .nojekyll.
+    for rel, tool in OTHER_DOCS_TOOLS:
+        if os.path.lexists(top / rel):
+            refusals.append(f"{rel} configures another docs tool ({tool}): note its page order and remove it "
+                            f"in the same PR if the maintainer's go covers it, else ask the maintainer")
+    for p in sorted(top.glob(DOCUSAURUS_GLOB)):
+        refusals.append(f"{p.name} configures another docs tool (Docusaurus): note its page order and remove it "
+                        f"in the same PR if the maintainer's go covers it, else ask the maintainer")
+    wf_dir = top / WORKFLOWS_DIR
+    if wf_dir.is_dir() and not wf_dir.is_symlink():
+        for p in sorted(wf_dir.iterdir()):
+            if p.suffix not in (".yml", ".yaml") or not p.is_file() or (top / WORKFLOW) == p:
+                continue
+            text = p.read_bytes().decode("utf-8", errors="replace").lower()
+            words = [w for w in WORKFLOW_DOCS_WORDS if w in text]
+            if words:
+                refusals.append(f"{WORKFLOWS_DIR}/{p.name} mentions {', '.join(words)}: another docs build may be "
+                                f"configured; note its page order and remove it in the same PR if the maintainer's "
+                                f"go covers it, else ask the maintainer")
+    if os.path.lexists(docs / ".nojekyll"):
+        refusals.append("docs/.nojekyll exists: it turns GitHub's site builder off for docs/; remove it in the "
+                        "same PR if the maintainer's go covers it, else ask the maintainer")
+
+    # The repository on GitHub.
+    values = None
+    try:
+        owner, repo, branch = read_github(top)
+        values = {"@@REPO@@": repo, "@@OWNER@@": owner.lower(),
+                  "@@GITHUB_URL@@": f"https://github.com/{owner}/{repo}", "@@BRANCH@@": branch,
+                  "@@JEKYLL_BUILD_PAGES_ACTION@@": JEKYLL_BUILD_PAGES_ACTION}
+    except Refusal as e:
+        refusals.append(str(e))
+    plan["values"] = values
+
+    # The site files and the workflow (filled with placeholder text when the
+    # mirror could not be read: nothing is written then anyway).
+    fill_with = values or {k: "x" for k in ("@@REPO@@", "@@OWNER@@", "@@GITHUB_URL@@", "@@BRANCH@@",
+                                            "@@JEKYLL_BUILD_PAGES_ACTION@@")}
+    for rel in SITE_FILES:
+        creates.append((f"{DOCS}/{rel}", fill(read_site_file(rel), fill_with)))
+    creates.append((WORKFLOW, workflow_bytes(fill_with)))
+
+    # The pages.
+    page_list = pages(docs) if docs.is_dir() and not docs.is_symlink() else []
+    texts, fm_of = {}, {}
+    for rel in page_list:
+        path = docs / rel
+        if path.is_symlink():
+            refusals.append(f"docs/{rel} is a link: GitHub's build skips links and init would have to write "
+                            f"through it; replace it with the file it points at, or ask the maintainer")
+            continue
+        try:
+            texts[rel] = read_text(path)
+        except UnicodeDecodeError:
+            refusals.append(f"docs/{rel} is not UTF-8 text: GitHub's site builder reads UTF-8 only; ask the maintainer")
+            continue
+        if starts_front_matter(texts[rel]):
+            try:
+                fm_of[rel] = read_front_matter(texts[rel])[0]
+            except ValueError:
+                fm_of[rel] = None  # left as is; check reports it
+        for n, line, _ in md_lines(texts[rel]):
+            if "{{" in line or "{%" in line:
+                plan["liquid"].append(f"docs/{rel}:{n}")
+
+    home = next((h for h in HOME_CANDIDATES if h in page_list), None)
+    top_pages = [p for p in page_list if "/" not in p and p != home]
+    sections = {}
+    for p in page_list:
+        parts = p.split("/")
+        if len(parts) == 2 and parts[0] not in NOT_SECTIONS:
+            sections.setdefault(parts[0], []).append(p)
+
+    # The order the home page first links the pages and sections.
+    top_order, in_order = [], {s: [] for s in sections}
+    if home in texts:
+        skip = 0
+        if home in fm_of:
+            try:
+                skip = read_front_matter(texts[home])[1]
+            except ValueError:
+                skip = 0
+        for _, target, is_image in md_links(texts[home], skip):
+            path = None if is_image else link_path("", target)
+            if path is None or path == "..":
+                continue
+            parts = path.split("/")
+            if len(parts) == 1 and path in top_pages:
+                slot = ("page", path)
+            elif parts[0] in sections:
+                slot = ("section", parts[0])
+                if len(parts) == 2 and path in sections[parts[0]] and parts[1] != "index.md" \
+                        and path not in in_order[parts[0]]:
+                    in_order[parts[0]].append(path)
+            else:
+                continue
+            if slot not in top_order:
+                top_order.append(slot)
+    nav_top = {slot: i + 2 for i, slot in enumerate(top_order)}
+
+    # Front matter for each page that has none.
+    planned = {}  # rel -> fields after init (for the no-place list)
+
+    def add(rel, fields):
+        planned[rel] = fields
+        if fields:
+            rewrites.append((f"{DOCS}/{rel}", front_matter_bytes(fields)))
+
+    if home is None:
+        creates.append((f"{DOCS}/index.md", front_matter_bytes({"title": "Home", "nav_order": 1})
+                        + HOME_TODO.encode()))
+        planned["index.md"] = {"title": "Home", "nav_order": 1}
+    section_parent = {}
+    for s, members in sorted(sections.items()):
+        index = f"{s}/index.md"
+        fields = {"title": section_title(s)}
+        if ("section", s) in nav_top:
+            fields["nav_order"] = nav_top[("section", s)]
+        fields["has_children"] = True
+        if index not in page_list:
+            creates.append((f"{DOCS}/{index}", front_matter_bytes(fields)))
+            planned[index] = fields
+            section_parent[s] = fields["title"]
+        elif index in fm_of:
+            existing = fm_of[index]
+            section_parent[s] = (existing or {}).get("title") or None
+        elif index in texts:
+            add(index, fields)
+            section_parent[s] = fields["title"]
+    for rel in page_list:
+        if rel not in texts or rel in fm_of or rel in planned:
+            continue
+        parts = rel.split("/")
+        heading = first_heading(texts[rel])
+        fields = {}
+        if rel == home:
+            fields = {"title": "Home", "nav_order": 1}
+        elif len(parts) == 1:
+            if heading:
+                fields["title"] = heading
+            if ("page", rel) in nav_top:
+                fields["nav_order"] = nav_top[("page", rel)]
+        elif len(parts) == 2 and parts[0] in sections:
+            if heading:
+                fields["title"] = heading
+            if section_parent.get(parts[0]):
+                fields["parent"] = section_parent[parts[0]]
+            if rel in in_order[parts[0]]:
+                fields["nav_order"] = in_order[parts[0]].index(rel) + 1
+        elif heading:
+            fields["title"] = heading
+        add(rel, fields)
+    for rel in page_list:
+        fields = fm_of.get(rel, planned.get(rel))
+        if rel in fm_of and fm_of[rel] is None:
+            plan["no_place"].append(f"docs/{rel}")
+            continue
+        fields = fields or {}
+        if "nav_order" not in fields and str(fields.get("nav_exclude", "")).lower() != "true":
+            plan["no_place"].append(f"docs/{rel}")
+    for rel, fields in planned.items():
+        if rel not in page_list and "nav_order" not in fields:
+            plan["no_place"].append(f"docs/{rel}")
+    plan["no_place"].sort()
+
+    # Nothing is overwritten, and nothing is written through a link.
+    for rel, _ in creates:
+        if os.path.lexists(top / rel):
+            refusals.append(f"{rel} already exists and init never overwrites a file: the repository may "
+                            f"already have a site (run rs-docs check), or the maintainer decides what to do with it")
+    for rel in sorted({str(Path(r).parent.as_posix()) for r, _ in creates + rewrites}):
+        cur = top
+        for part in Path(rel).parts:
+            cur = cur / part
+            if cur.is_symlink() or (os.path.lexists(cur) and not cur.is_dir()):
+                refusals.append(f"{cur.relative_to(top).as_posix()} is not a folder (a file or a link): init would "
+                                f"have to write through it; ask the maintainer")
+                break
+            if not os.path.lexists(cur) and cur.relative_to(top).as_posix() not in plan["dirs"]:
+                plan["dirs"].append(cur.relative_to(top).as_posix())
+    plan["dirs"].sort(key=lambda d: (d.count("/"), d))
+    seen = set()
+    plan["refusals"] = [r for r in refusals if not (r in seen or seen.add(r))]
+
+    pub = {f"{DOCS}/{p}" for p in (walk_files(docs) if docs.is_dir() and not docs.is_symlink() else [])}
+    pub |= {rel for rel, _ in creates if rel.startswith(f"{DOCS}/")}
+    plan["published"] = sorted(p for p in pub if published(p[len(DOCS) + 1:]))
+    return plan
+
+
+def read_site_file(rel):
+    path = SITE_SOURCE / rel
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise RuntimeError(f"the site files are incomplete ({path}: {e.strerror}): this image's rs-docs is "
+                           f"broken; tell the maintainer (Rebuild all, then stop and start the project)") from None
+
+
+def fill(text, values):
+    for k, v in values.items():
+        text = text.replace(k, v)
+    left = PLACEHOLDER.findall(text)
+    if left:
+        raise RuntimeError(f"a shipped site file still holds {left[0]} after filling: this image's rs-docs is broken")
+    return text.encode()
+
+
+def workflow_bytes(values):
+    lines = read_site_file(WORKFLOW_TEMPLATE).split("\n")
+    marks = [i for i, line in enumerate(lines) if line.strip() == LINKCHECK_MARKER]
+    if len(marks) != 1:
+        raise RuntimeError("the workflow template does not hold exactly one link-check marker: "
+                           "this image's rs-docs is broken")
+    indent = lines[marks[0]][:len(lines[marks[0]]) - len(lines[marks[0]].lstrip())]
+    script = read_site_file(LINKCHECK).rstrip("\n").split("\n")
+    inlined = [indent + s if s.strip() else "" for s in script]
+    text = "\n".join(lines[:marks[0]] + inlined + lines[marks[0] + 1:])
+    return fill(text, values)
+
+
+def print_plan(plan, out):
+    def block(title, items):
+        out(f"{title}:")
+        for i in items or ["(none)"]:
+            out(f"  {i}")
+
+    writes = [f"{rel} (new)" for rel, _ in plan["creates"]] + \
+             [f"{rel} (front matter added)" for rel, _ in plan["rewrites"]]
+    block("Would write", writes)
+    block("Would publish (docs/ files whose names do not start with _ or .)", plan["published"])
+    block("Template code ({{ or {%) in Markdown lines", plan["liquid"])
+    block("Pages with no known place in the sidebar (no nav_order)", plan["no_place"])
+    block("Init would refuse", plan["refusals"])
+
+
+def apply_plan(top, plan, out):
+    for d in plan["dirs"]:
+        os.mkdir(top / d)
+    for rel, data in plan["creates"]:
+        fd = os.open(top / rel, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        out(f"wrote {rel}")
+    for rel, fm in plan["rewrites"]:
+        path = top / rel
+        st = os.lstat(path)
+        original = path.read_bytes()
+        tmp = path.with_name(f".{path.name}.rs-docs-{os.getpid()}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(fm + original)
+        os.chmod(tmp, st.st_mode & 0o7777)
+        os.replace(tmp, path)
+        out(f"added front matter to {rel}")
+
+
+def cmd_init(dry_run, out=print, err=None):
+    err = err or (lambda m: print(m, file=sys.stderr))
+    top = git_top()
+    if top is None:
+        msg = "not inside a git work tree: run rs-docs init in a worktree of the repository"
+        if dry_run:
+            print_plan({"creates": [], "rewrites": [], "published": [], "liquid": [], "no_place": [],
+                        "refusals": [msg]}, out)
+        else:
+            err(f"rs-docs init: refused: {msg}")
+            err("rs-docs init: nothing was written")
+        return 2
+    if not dry_run:
+        primary = primary_clone_refusal()
+        if primary:
+            err(f"rs-docs init: refused: {primary}")
+            err("rs-docs init: nothing was written")
+            return 2
+    plan = plan_init(top)
+    if dry_run:
+        print_plan(plan, out)
+        return 2 if plan["refusals"] else 0
+    if plan["refusals"]:
+        for r in plan["refusals"]:
+            err(f"rs-docs init: refused: {r}")
+        err("rs-docs init: nothing was written")
+        return 2
+    apply_plan(top, plan, out)
+    for rel in plan["no_place"]:
+        out(f"no known place in the sidebar (no nav_order): {rel}")
+    out("next: rs-docs check")
+    for rel, n, line in todo_lines(plan):
+        out(f"TODO(maintainer) written, list it in the PR: {rel}:{n}: {line}")
+    out("once this PR reaches GitHub, the maintainer sets Settings → Pages → Source: GitHub Actions "
+        "there; say so in the PR")
+    return 0
+
+
+def todo_lines(plan):
+    """(path, line number, line) of every line holding TODO(maintainer) in
+    the bytes init writes (new files, and the front matter it adds to pages):
+    a page's `> TODO(maintainer): …` line and the settings' description
+    placeholder."""
+    found = []
+    for rel, data in plan["creates"] + plan["rewrites"]:
+        for n, line in enumerate(data.decode("utf-8").split("\n"), 1):
+            if TODO_MARK in line:
+                found.append((rel, n, line))
+    return found
+
+
+def primary_clone_refusal():
+    """The refusal text when the current work tree is the primary clone (its
+    git folder is the repository's common git folder), else None. init
+    writes tracked files, which happens in a worktree."""
+    r = subprocess.run(["git", "rev-parse", "--absolute-git-dir", "--git-common-dir"],
+                       capture_output=True, text=True)
+    lines = r.stdout.split("\n")
+    if r.returncode != 0 or len(lines) < 2 or not lines[0].strip() or not lines[1].strip():
+        return "git could not tell whether this is the primary clone or a worktree; run rs-docs init in a worktree"
+    git_dir = Path(lines[0].strip()).resolve()
+    common = Path(lines[1].strip())
+    if not common.is_absolute():
+        common = Path.cwd() / common
+    if git_dir == common.resolve():
+        return ("this is the repository's primary clone, and init writes tracked files: start the work in a "
+                "worktree (rs-wt new <name>) and run rs-docs init there (--dry-run and check run here too)")
+    return None
+
+
+# ---------------------------------------------------------------- check
+RAW_OPEN = re.compile(r"\{%-?\s*raw\s*-?%\}")
+RAW_CLOSE = re.compile(r"\{%-?\s*endraw\s*-?%\}")
+
+
+def liquid_defects(text, skip_lines):
+    """Line numbers holding '{{' or '{%' outside {% raw %}…{% endraw %}, and
+    whether a raw block is left open."""
+    lines = text.split("\n")
+    hits, in_raw = [], False
+    for n, line in enumerate(lines, 1):
+        if n <= skip_lines:
+            continue
+        rest, outside = line, ""
+        while rest:
+            if in_raw:
+                m = RAW_CLOSE.search(rest)
+                if not m:
+                    rest = ""
+                    break
+                rest, in_raw = rest[m.end():], False
+            else:
+                m = RAW_OPEN.search(rest)
+                if not m:
+                    outside += rest
+                    break
+                outside += rest[:m.start()]
+                rest, in_raw = rest[m.end():], True
+        if "{{" in outside or "{%" in outside:
+            hits.append(n)
+    return hits, in_raw
+
+
+def top_level_values(text, key):
+    return [parse_scalar(m.group(1)) for m in
+            re.finditer(rf"^{re.escape(key)}:(.*?)\r?$", text, re.M)]
+
+
+def check_tree(top):
+    docs = top / DOCS
+    defects = []
+
+    def bad(rel, what):
+        defects.append(f"{rel}: {what}")
+
+    if os.path.lexists(docs / ".nojekyll"):
+        bad("docs/.nojekyll", "turns GitHub's site builder off for docs/; remove it")
+    if os.path.lexists(docs / "Gemfile"):
+        bad("docs/Gemfile", "GitHub's Pages build brings its own gems; remove it")
+    config = (docs / "_config.yml").read_bytes().decode("utf-8", errors="replace")
+    try:
+        themes = top_level_values(config, "remote_theme")
+    except ValueError:
+        themes = [None]
+    if themes != [REMOTE_THEME]:
+        bad("docs/_config.yml", f"remote_theme is not exactly the pinned {REMOTE_THEME}")
+
+    page_list = pages(docs)
+    info = {}
+    for rel in page_list:
+        path = f"{DOCS}/{rel}"
+        try:
+            text = read_text(docs / rel)
+        except UnicodeDecodeError:
+            bad(path, "not UTF-8 text (GitHub's site builder reads UTF-8 only)")
+            continue
+        except OSError as e:
+            bad(path, f"cannot be read ({e.strerror})")
+            continue
+        fields, skip = {}, 0
+        if starts_front_matter(text):
+            try:
+                fields, skip = read_front_matter(text)
+            except ValueError as e:
+                bad(path, f"front matter cannot be read ({e})")
+                fields = None
+        info[rel] = (text, fields, skip)
+
+    sections = {}
+    for rel, (_, fields, _) in info.items():
+        if fields and fields.get("has_children", "").lower() == "true":
+            t = fields.get("title", "")
+            if t in sections:
+                bad(f"{DOCS}/{rel}", f'section title "{t}" is also the title of {DOCS}/{sections[t]}')
+            else:
+                sections[t] = rel
+
+    for rel, (text, fields, skip) in info.items():
+        path = f"{DOCS}/{rel}"
+        if fields is not None:
+            if not fields.get("title"):
+                bad(path, "no title")
+            if not fields.get("nav_order") and fields.get("nav_exclude", "").lower() != "true":
+                bad(path, "no place in the sidebar (no nav_order): ask the maintainer where the page "
+                          "goes instead of inventing an order")
+            if "parent" in fields and fields["parent"] not in sections:
+                bad(path, f'parent "{fields["parent"]}" is not the title of a page with has_children: true')
+        page_dir = posixpath.dirname(rel)
+        for n, target, _ in md_links(text, skip):
+            lp = link_path(page_dir, target)
+            if lp is None:
+                continue
+            if lp == "..":
+                bad(path, f'line {n}: link target "{target}" leaves docs/')
+            elif lp.endswith(".html"):
+                bad(path, f'line {n}: link to "{target}" is written as .html; link the .md page instead')
+            elif not os.path.lexists(docs / lp):
+                bad(path, f'line {n}: link target "{target}" does not exist')
+            elif (docs / lp).is_dir() and not any((docs / lp / i).is_file() for i in HOME_CANDIDATES):
+                bad(path, f'line {n}: link target "{target}" is a folder with no index.md or README.md')
+        hits, open_raw = liquid_defects(text, skip)
+        for n in hits:
+            bad(path, f"line {n}: '{{{{' or '{{%' outside a {{% raw %}} block (the site builder reads it as template code)")
+        if open_raw:
+            bad(path, "a {% raw %} block is never closed with {% endraw %}")
+    return defects, len(page_list)
+
+
+def cmd_check(out=print, err=None):
+    err = err or (lambda m: print(m, file=sys.stderr))
+    top = git_top()
+    if top is None:
+        err("rs-docs check: not inside a git work tree: run it in a worktree of the repository")
+        return 2
+    if not (top / DOCS / "_config.yml").is_file():
+        err("rs-docs check: this tree has no docs/_config.yml, so it has no docs site to check "
+            "(rs-docs init sets one up when the maintainer asks for it)")
+        return 2
+    defects, n = check_tree(top)
+    for d in defects:
+        out(d)
+    if defects:
+        return 1
+    out(f"rs-docs check: ok ({n} pages)")
+    return 0
+
+
+# ---------------------------------------------------------------- build
+def build_output(top):
+    """The one output folder of this work tree's builds."""
+    return (Path(os.environ.get("RS_WORKSPACE") or "/workspace") / BUILD_DIR_NAME
+            / top.name / BUILD_SITE_NAME)
+
+
+def config_repository(config_path):
+    """GitHub's `owner/repo` from the settings file's gh_edit_repository line
+    (what init wrote from the mirror record). Raises Refusal."""
+    try:
+        text = config_path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise Refusal(f"docs/_config.yml cannot be read ({getattr(e, 'strerror', None) or e}); "
+                      f"fix the file, or ask the maintainer") from None
+    try:
+        values = top_level_values(text, GH_EDIT_REPOSITORY)
+    except ValueError:
+        values = []
+    m = GITHUB_URL_RE.fullmatch(values[0]) if len(values) == 1 else None
+    if not m or m.group(2) in (".", ".."):
+        raise Refusal(f"docs/_config.yml has no single {GH_EDIT_REPOSITORY}: https://github.com/<owner>/<repo> "
+                      f"line, which build passes to GitHub's builder as the repository's name; "
+                      f"fix the file, or ask the maintainer")
+    return f"{m.group(1)}/{m.group(2)}"
+
+
+def build_argv(top, out, repository, revision):
+    """The docker command that runs GitHub's build image on this work tree:
+    docs/ read-only at the image's source path, the output folder at its
+    destination path, as the calling user, with the inputs the action passes."""
+    env = {"GITHUB_WORKSPACE": BUILD_WORKSPACE, "INPUT_SOURCE": DOCS, "INPUT_DESTINATION": BUILD_DESTINATION,
+           "INPUT_FUTURE": "false", "INPUT_VERBOSE": "false", "INPUT_TOKEN": "",
+           "INPUT_BUILD_REVISION": revision, "GITHUB_REPOSITORY": repository, "GITHUB_API_URL": GITHUB_API_URL}
+    argv = ["docker", "run", "--rm", "--user", f"{os.getuid()}:{os.getgid()}"]
+    for k, v in env.items():
+        argv += ["-e", f"{k}={v}"]
+    argv += ["-v", f"{top / DOCS}:{BUILD_WORKSPACE}/{DOCS}:ro",
+             "-v", f"{out}:{BUILD_WORKSPACE}/{BUILD_DESTINATION}",
+             JEKYLL_BUILD_PAGES_IMAGE]
+    return argv
+
+
+def run_shown(argv):
+    """Run a command with its output going straight to this terminal; its
+    exit code, or None when it could not be started."""
+    try:
+        return subprocess.run(argv).returncode
+    except OSError as e:
+        print(f"rs-docs build: could not start {argv[0]}: {e.strerror or e}", file=sys.stderr)
+        return None
+
+
+def head_revision(top):
+    r = subprocess.run(["git", "-C", str(top), "rev-parse", "--verify", "-q", "HEAD"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def output_refusal(out):
+    """A refusal text when a part of the output path under the workspace is a
+    link or not a folder (the builder cleans its destination, so it must never
+    be pointed anywhere else), else None."""
+    for p in (out.parent.parent, out.parent, out):
+        if p.is_symlink() or (os.path.lexists(p) and not p.is_dir()):
+            return (f"{p} is not a folder (a file or a link): build writes the site there and the builder "
+                    f"cleans that folder; ask the maintainer")
+    return None
+
+
+def cmd_build(out=print, err=None):
+    err = err or (lambda m: print(m, file=sys.stderr))
+    top = git_top()
+    if top is None:
+        err("rs-docs build: refused: not inside a git work tree: run it in a worktree of the repository")
+        return 2
+    config = top / DOCS / "_config.yml"
+    if not config.is_file():
+        err("rs-docs build: refused: this tree has no docs/_config.yml, so it has no docs site to build "
+            "(rs-docs init sets one up when the maintainer asks for it)")
+        return 2
+    if shutil.which("docker") is None:
+        err("rs-docs build: refused: this container has no docker, so the site is built by the workflow "
+            "on GitHub; rs-docs check is the check here")
+        return 2
+    try:
+        repository = config_repository(config)
+    except Refusal as e:
+        err(f"rs-docs build: refused: {e}")
+        return 2
+    linkcheck = SITE_SOURCE / LINKCHECK
+    if not linkcheck.is_file():
+        raise RuntimeError(f"the site files are incomplete ({linkcheck} is missing): this image's rs-docs is "
+                           f"broken; tell the maintainer (Rebuild all, then stop and start the project)")
+    site = build_output(top)
+    refusal = output_refusal(site)
+    if refusal:
+        err(f"rs-docs build: refused: {refusal}")
+        return 2
+    site.mkdir(parents=True, exist_ok=True)
+    rc = run_shown(build_argv(top, site, repository, head_revision(top)))
+    if rc != 0:
+        what = "could not be started" if rc is None else f"failed (exit {rc}); its output is above"
+        err(f"rs-docs build: GitHub's build image {what}, and the link check did not run")
+        return 1
+    rc = run_shown([sys.executable, str(linkcheck), str(site), str(config)])
+    if rc != 0:
+        err(f"rs-docs build: the built site has broken links (listed above): {site}")
+        return 1
+    out(f"rs-docs build: ok: {site}")
+    return 0
+
+
+# ---------------------------------------------------------------- main
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="rs-docs", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="verb", required=True)
+    p = sub.add_parser("init", help="lay down the site files, the workflow and the pages' front matter")
+    p.add_argument("--dry-run", action="store_true", help="read only: print what init would do, write nothing")
+    sub.add_parser("check", help="check the docs/ pages; one line per defect")
+    sub.add_parser("build", help="build the site with GitHub's own build image, then check its links")
+    a = ap.parse_args(argv)
+    if a.verb == "init":
+        return cmd_init(a.dry_run)
+    if a.verb == "build":
+        return cmd_build()
+    return cmd_check()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except RuntimeError as e:
+        print("rs-docs:", e, file=sys.stderr)
+        sys.exit(1)

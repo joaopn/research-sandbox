@@ -37,12 +37,18 @@ COPY agent/box-render-mcp.py /usr/local/lib/rs-box/box-render-mcp.py
 LABEL research.instructions-layout=home-2
 RUN chmod +x /entrypoint.sh
 
-# Dev-lane tooling (rs-wt, rs-land, rs-board) — in RS's folder, deliberately
+# Dev-lane tooling (rs-wt, rs-land, rs-board, rs-docs) — in RS's folder, deliberately
 # OFF PATH (command-relevance): only a dev-preset box gets them symlinked to
 # /usr/local/bin (rs-sandbox's _link_box_commands, at the box's docker run);
 # on other boxes the files are inert and invisible to tab-completion.
 COPY container/dev/rs-wt container/dev/rs-land container/dev/rs-board /usr/local/lib/rs/
 RUN chmod +x /usr/local/lib/rs/rs-wt /usr/local/lib/rs/rs-land /usr/local/lib/rs/rs-board
+# rs-docs (a repository's docs site: init, check, build) and the site files it
+# finds beside its own resolved path (Docker copies a folder's contents, so the
+# destination names the folder).
+COPY container/dev/rs-docs /usr/local/lib/rs/
+COPY container/dev/docs-site /usr/local/lib/rs/docs-site/
+RUN chmod +x /usr/local/lib/rs/rs-docs
 
 # F3 loopback forwarder (STAGE loopback-bridge): republishes a 127.0.0.1-bound
 # in-box service onto the box's bridge IP so the -p <pub_super>:<app_port> publish

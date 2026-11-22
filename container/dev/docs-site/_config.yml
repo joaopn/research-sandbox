@@ -1,0 +1,25 @@
+title: "@@REPO@@"
+description: "TODO(maintainer): the repository's description"
+baseurl: /@@REPO@@
+url: https://@@OWNER@@.github.io
+remote_theme: just-the-docs/just-the-docs@v0.12.0
+plugins:
+  - jekyll-remote-theme
+color_scheme: rs
+search_enabled: true
+heading_anchors: true
+mermaid:
+  version: "11.4.1"
+aux_links:
+  "GitHub": ["@@GITHUB_URL@@"]
+gh_edit_link: true
+gh_edit_link_text: "Edit this page on GitHub"
+gh_edit_repository: @@GITHUB_URL@@
+gh_edit_branch: "@@BRANCH@@"
+gh_edit_source: docs
+gh_edit_view_mode: edit
+back_to_top: true
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - vendor

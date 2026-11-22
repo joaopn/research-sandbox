@@ -37,6 +37,12 @@ RUN cp -a /home/research /etc/research-skel
 # when no dev wiring is staged.
 COPY container/dev/rs-wt container/dev/rs-land container/dev/rs-board /usr/local/lib/rs/
 RUN chmod +x /usr/local/lib/rs/rs-wt /usr/local/lib/rs/rs-land /usr/local/lib/rs/rs-board
+# rs-docs (a repository's docs site: init, check, build) and the site files it
+# finds beside its own resolved path (Docker copies a folder's contents, so the
+# destination names the folder).
+COPY container/dev/rs-docs /usr/local/lib/rs/
+COPY container/dev/docs-site /usr/local/lib/rs/docs-site/
+RUN chmod +x /usr/local/lib/rs/rs-docs
 
 # The researcher project type's memory command, kept in RS's folder and linked
 # onto PATH by the host only in a project whose record says memory: true. The

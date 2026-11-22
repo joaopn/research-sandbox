@@ -12776,7 +12776,7 @@ def _project_is_dev(project: str) -> bool:
 
 
 def _link_dev_commands(project: str, container: str) -> None:
-    """rs-wt, rs-land and rs-board onto a dev project's PATH. Only the
+    """The dev tools (RS_DEV_LINKS) onto a dev project's PATH. Only the
     sandbox-dind image keeps them (a docker project has none to link)."""
     if _container_project_type(container) != PROJECT_TYPE_SANDBOX_DIND \
             or _container_substrate(container) == Substrate.DOCKER.value:
@@ -14614,7 +14614,8 @@ def _stage_dev_fetch(container: str, progress=None, serving: bool = True,
     # On PATH only where the container itself fetches; a project whose only
     # fetch consumers are its boxes keeps them in RS's folder as their source.
     if _container_fetches_itself(container):
-        _link_rs_commands(container, RS_FETCH_LINKS, on_old="skip")
+        _link_rs_commands(container, RS_FETCH_LINKS, on_old="skip",
+                          missing=RS_COMMAND_NOT_COPIED)
 
 
 def _container_fetches_itself(container: str) -> bool:
@@ -14641,6 +14642,12 @@ RS_SYNC_BIN = RS_LIB_DIR + "/rs-sync"
 # The typed fetch-surface commands linked onto PATH in a container that
 # fetches itself.
 RS_FETCH_LINKS = ("rs-fetch", "rs-sync", "rs-publish")
+# Why one of them is not linked when its file is not in RS's folder: no image
+# carries these, RS copies them in at a start, and a failed copy has already
+# warned. It can reach a browser, so it names no command-line verb.
+RS_COMMAND_NOT_COPIED = (
+    "RS could not copy that command into the project (see the warning above); "
+    "stop the project and start it again")
 # How often a process waiting for another's token mint looks again. The wait
 # is bounded by gitea.ISSUE_TOKEN_MINT_TIMEOUT_S plus two probe timeouts
 # (gitea.STATUS_TIMEOUT_S, the holder's probes); a mint takes about a second,
@@ -16831,8 +16838,15 @@ RS_COMMANDS_UNREADABLE = (
 # straight into /usr/local/bin (rs-worker, rs-role-mcp, rs-sandbox, and the
 # fetch tools, RS_FETCH_LINKS, for a container that fetches itself). A MIRROR of
 # rs_sandbox.BOX_LINKS (pinned).
-RS_DEV_LINKS = ("rs-wt", "rs-land", "rs-board")
+RS_DEV_LINKS = ("rs-wt", "rs-land", "rs-board", "rs-docs")
 RS_WEB_LINKS = ("rs-web-restart",)
+# Why a typed command is not linked when its file is not in the container's
+# image (an image built before RS shipped that command). It can reach a
+# browser (a start's warnings), so it names no command-line verb. A MIRROR of
+# rs_sandbox.BOX_COMMAND_NOT_IN_IMAGE (pinned).
+RS_COMMAND_NOT_IN_IMAGE = (
+    "this image does not carry that command; rebuild RS's images with Rebuild "
+    "all on Sandboxes → Software, then stop the project and start it again")
 
 
 def _image_rs_commands(image: str) -> bool:
@@ -16934,14 +16948,29 @@ def _run_rs_helper(container: str, name: str, args: "Sequence[str]" = (), *,
     return run(argv, capture_output=True, input=input, timeout=timeout)
 
 
-def _link_rs_commands(container: str, names: "Sequence[str]", *, on_old: str) -> None:
-    """Put typed commands the image keeps in RS_LIB_DIR onto the container's
-    PATH. Never on a container from before the layout: there the link would
-    replace a working command with one pointing at nothing. Best-effort per
-    name: a failure warns."""
+def _link_rs_commands(container: str, names: "Sequence[str]", *, on_old: str,
+                      missing: str = RS_COMMAND_NOT_IN_IMAGE) -> None:
+    """Put typed commands RS_LIB_DIR holds onto the container's PATH. Never on
+    a container from before the layout: there the link would replace a working
+    command with one pointing at nothing. A command whose file is not there is
+    not linked (`ln -sf` would succeed on the missing target): one warning
+    names it with `missing` (the default is for commands the image bakes, an
+    image built before RS shipped one; the fetch commands, which RS copies in,
+    pass their own), and the other names are linked all the same. Best-effort
+    per name: a failure warns."""
     if not names or not _rs_commands_ok(container, on_old, "linking RS's commands"):
         return
     for t in names:
+        r = run(["docker", "exec", "-u", "0", container, "test", "-e",
+                 f"{RS_LIB_DIR}/{t}"], capture_output=True)
+        if r.returncode != 0:
+            detail = (r.stderr or r.stdout or "").strip()
+            if detail:
+                print(f"warning: checking {t} in {container} failed: {detail}", file=sys.stderr)
+            else:
+                print(f"warning: {t} is not linked into {container}: {missing}",
+                      file=sys.stderr)
+            continue
         r = run(["docker", "exec", "-u", "0", container, "ln", "-sf",
                  f"{RS_LIB_DIR}/{t}", f"/usr/local/bin/{t}"], capture_output=True)
         if r.returncode != 0:
