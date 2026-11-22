@@ -18,3 +18,16 @@ An update to RS's own code (a `git pull`) reaches the running system in parts. E
 When it is unclear which parts an update touched, do all of them. The cost is the rebuild time and one restart per project, which interrupts the work running in it.
 
 A project that has not been restarted since an update keeps working as before. An action that needs the new version there is refused with a message that says to restart the project.
+
+## Once: the update that stops tracking `.env`
+
+`.env` used to be part of the repository. It is now ignored, so your settings stay on your machine. Pulling that update deletes an unchanged `.env`, and the next `python research.py start` writes a fresh one from `.env.example`. A `.env` you edited stops the pull with an error about local changes. In every case, keep a copy and put it back after the pull, in the folder you cloned RS into:
+
+```sh
+cp .env .env.keep
+git checkout -- .env
+git pull
+mv .env.keep .env
+```
+
+A clone made after this update never needs this.

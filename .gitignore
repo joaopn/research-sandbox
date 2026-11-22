@@ -12,6 +12,10 @@ __pycache__/
 *.swp
 *.swo
 
+# Host settings of this install; `research start` creates it from .env.example
+# when it is missing.
+.env
+
 container_volumes/
 .claude/
 data/
