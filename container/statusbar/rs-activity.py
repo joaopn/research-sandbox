@@ -14,7 +14,8 @@ Called by:
   through;
 - pi, through rs-activity.ts (`rs-activity.py pi <event> <pid>`, a small JSON
   payload on stdin);
-- RS at every start of the container (`rs-activity.py reset`).
+- RS at every start of the container (`rs-activity.py reset`);
+- itself, as one watcher per live agent process (`rs-activity.py watch <key>`).
 
 One record per agent PROCESS lives in a folder under /dev/shm (fresh at every
 container start), keyed by the process id plus its start time, so a reused id
@@ -23,13 +24,24 @@ its record. After every event, under one lock, records whose process is gone
 are dropped and the container's summary is written to
 /workspace/.rs/activity.json — what the webui reads.
 
+The counts follow process liveness, not the agents' end events: a session
+whose process dies without one (killed, crashed) stops counting at once. An
+event that leaves its record working or waiting makes sure a watcher runs for
+that process — a detached copy of this script that waits on the process
+(a pidfd, no lock held) and, when it exits, rewrites the summary, which drops
+the dead record. The record names its watcher (`watch`: pid and start time);
+a record whose watcher is gone gets a new one at its next event.
+
 It prints nothing of its own and always exits 0 (stop-audit: the audit's
 status): Claude Code feeds some hooks' output into the conversation and an exit
 status of 2 blocks the user's prompt.
 """
+import errno
 import fcntl
 import json
 import os
+import re
+import select
 import signal
 import subprocess
 import sys
@@ -47,6 +59,16 @@ ANCESTOR_WALK = 8
 AGENT_COMM = "claude"            # the CLI and the editor's bundled binary alike
 SESSION_SOURCES = ("startup", "clear", "resume")
 ENDED = "ended"                  # a session ended in a process still finishing
+COUNTED = ("working", "waiting")  # the states a watcher is kept for
+WATCH_OP = "watch"
+# A record's name: p-<pid>-<start time>.json (ASCII digits only).
+KEY_RE = re.compile(r"p-([0-9]+)-([0-9]+)\.json")
+WATCH_RE = re.compile(r"([0-9]+)-([0-9]+)")
+# pidfd_open(2)'s number in Linux's unified syscall table, the same on x86_64
+# and aarch64 (the images' architectures; measured in a project container and
+# a box). Used only where Python has no os.pidfd_open (the images' conda
+# Python 3.13 / 3.14 lacks it).
+PIDFD_OPEN_SYSCALL = 434
 
 
 # -- the process key --------------------------------------------------------
@@ -268,6 +290,96 @@ def write_summary(data: dict) -> None:
         os.close(dfd)
 
 
+# -- the watcher ------------------------------------------------------------
+
+def _key_parts(key: str) -> "tuple[int, str] | None":
+    m = KEY_RE.fullmatch(key)
+    return (int(m.group(1)), m.group(2)) if m else None
+
+
+def _watcher_alive(ident, key: str) -> bool:
+    """The recorded watcher still runs: its start time matches and its argv
+    carries `watch <key>` (a reused pid is never taken for it)."""
+    m = WATCH_RE.fullmatch(ident) if isinstance(ident, str) else None
+    if not m:
+        return False
+    pid = int(m.group(1))
+    if start_time(pid) != m.group(2):
+        return False
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            argv = fh.read().split(b"\0")
+    except OSError:
+        return False
+    want = [WATCH_OP.encode(), key.encode()]
+    return any(argv[i:i + 2] == want for i in range(len(argv) - 1))
+
+
+def ensure_watcher(state: State, key: str) -> None:
+    """Under the lock, after an event: a working or waiting record of a live
+    process gets a watcher unless its recorded one still runs. Spawned fully
+    detached: no inherited stdout (Claude Code waits for a hook's stdout to
+    close), no inherited lock descriptor, its own session (no terminal
+    hang-up); never waited for. A failed spawn just means no watcher."""
+    rec = state.get(key)
+    if rec is None or rec.get("state") not in COUNTED or not _alive(key):
+        return
+    if _watcher_alive(rec.get("watch"), key):
+        return
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), WATCH_OP, key],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return
+    st = start_time(proc.pid)
+    if st:
+        rec["watch"] = f"{proc.pid}-{st}"
+        state.put(key, rec)
+
+
+def _pidfd_open(pid: int) -> int:
+    """A pidfd for pid; OSError (with errno) when refused."""
+    if hasattr(os, "pidfd_open"):
+        return os.pidfd_open(pid)
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.syscall(PIDFD_OPEN_SYSCALL, pid, 0)
+    if fd < 0:
+        e = ctypes.get_errno()
+        raise OSError(e, os.strerror(e))
+    return fd
+
+
+def cmd_watch(key: str) -> None:
+    """Wait for the key's process to exit, then rewrite the summary (which
+    drops its record). No lock is held while waiting. A process already gone
+    (or its pid reused) is not waited for; a kernel that refuses pidfds ends
+    the watch at once (the record is then dropped at the next event)."""
+    parts = _key_parts(key)
+    if not parts:
+        return
+    pid, st = parts
+    try:
+        fd = _pidfd_open(pid)
+    except OSError as e:
+        if e.errno != errno.ESRCH:
+            return
+        fd = -1                                   # already gone
+    if fd >= 0:
+        try:
+            # opened before the check, so a pid reused after it is not ours
+            if start_time(pid) == st:
+                p = select.poll()
+                p.register(fd, select.POLLIN)
+                while not p.poll():
+                    pass
+        finally:
+            os.close(fd)
+    with_state(lambda s: None)
+
+
 # -- events -----------------------------------------------------------------
 
 def _rec(state: State, key: str, create_state: "str | None") -> "dict | None":
@@ -286,8 +398,14 @@ def session_end(state: State, key: str) -> None:
     runs the aborted turn's agent_end before session_shutdown, and both calls
     can take the lock in either order): leave a mark that no later turn or
     subagent event revives; only a new session start replaces it, and the
-    sweep drops it once the process is gone."""
-    state.put(key, {"state": ENDED, "subs": {}})
+    sweep drops it once the process is gone. The watcher is kept: /clear
+    ends and restarts the session in the same process, and the restart
+    finds it running."""
+    rec = {"state": ENDED, "subs": {}}
+    old = state.get(key)
+    if old is not None and isinstance(old.get("watch"), str):
+        rec["watch"] = old["watch"]
+    state.put(key, rec)
 
 
 def turn_start(state: State, key: str) -> None:
@@ -474,10 +592,17 @@ def _load(raw: bytes) -> dict:
     return d if isinstance(d, dict) else {}
 
 
-def with_state(fn) -> None:
+def with_state(fn, key: "str | None" = None) -> None:
+    """One event under the lock; with the event's own key, its process gets
+    a watcher before the summary is written."""
     state = State()
     try:
         fn(state)
+        if key:
+            try:
+                ensure_watcher(state, key)
+            except Exception:
+                pass                    # never at the cost of the summary
         summarise(state)
     finally:
         state.close()
@@ -491,7 +616,7 @@ def cmd_hook(raw: bytes) -> None:
     key = record_key(pid) if pid else None
     if not key:
         return
-    with_state(lambda s: claude_event(s, key, data))
+    with_state(lambda s: claude_event(s, key, data), key)
 
 
 def cmd_stop_audit(raw: bytes) -> int:
@@ -526,13 +651,13 @@ def cmd_pi(ev: str, pid_s: str, raw: bytes) -> None:
     if not key:
         return
     data = _load(raw)
-    with_state(lambda s: pi_event(s, key, ev, data))
+    with_state(lambda s: pi_event(s, key, ev, data), key)
 
 
 def main(argv: "list[str]") -> int:
     op = argv[1] if len(argv) > 1 else ""
     try:
-        raw = b"" if op == "reset" else sys.stdin.buffer.read()
+        raw = b"" if op in ("reset", WATCH_OP) else sys.stdin.buffer.read()
     except Exception:
         raw = b""
     if op == "stop-audit":
@@ -544,6 +669,8 @@ def main(argv: "list[str]") -> int:
             cmd_pi(argv[2], argv[3], raw)
         elif op == "reset":
             with_state(lambda s: None)
+        elif op == WATCH_OP and len(argv) == 3:
+            cmd_watch(argv[2])
     except Exception:
         pass
     return 0
