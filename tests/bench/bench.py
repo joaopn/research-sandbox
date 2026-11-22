@@ -38,7 +38,8 @@ Arms:
   researcher-pi     the researcher type with pi
   researcher-nohook the researcher type with Claude, its start hook removed
   research          the existing research flow (Claude as supervisor; the
-                    PI's /log at each session's end, its own memory)
+                    PI's /log at each session's end, its own memory; the PI
+                    approves every plan and staged cycle the flow asks about)
 """
 from __future__ import annotations
 
@@ -52,6 +53,7 @@ import subprocess
 import sys
 import tarfile
 import time
+import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -73,9 +75,14 @@ ARMS = {
     "floor": {"workflow": "sandbox-dind", "agent": "claude", "memory": False},
     "researcher-pi": {"workflow": "researcher", "agent": "pi", "memory": True},
     "researcher-nohook": {"workflow": "researcher", "agent": "claude", "memory": True, "nohook": True},
-    "research": {"workflow": "research", "agent": "claude", "memory": False, "log": True},
+    "research": {"workflow": "research", "agent": "claude", "memory": False, "log": True, "approves": True},
 }
 DEFAULT_ARMS = ("researcher", "floor")
+# What the PI says to whatever an arm with "approves" waits on: the research
+# flow's supervisor waits for an explicit "go", "yes", "approved" before it
+# spawns a worker and before it accepts a staged cycle (its supervisor
+# instructions), so without it no worker ever computes.
+APPROVE = "Approved, go ahead."
 # A setup token has no refresh; the credentials file needs an expiry, so it
 # names one past any eval run (2100-01-01): Claude Code then never tries to
 # refresh it, and the token's own lifetime is what the API enforces.
@@ -227,7 +234,8 @@ def plan(evals: "list[dict]", arms: "list[str]") -> dict:
             cons = len(e["sessions"]) + probes if ARMS[arm]["memory"] else 0
             grader += g
             rows.append({"eval": e["name"], "arm": arm, "sessions": len(e["sessions"]),
-                         "turns": turns, "probes": probes, "grader_calls": g, "consolidations": cons})
+                         "turns": turns, "probes": probes, "grader_calls": g, "consolidations": cons,
+                         "approvals": bool(ARMS[arm].get("approves"))})   # as many as the flow asks for
     return {"rows": rows, "grader_calls": grader + (4 if grader else 0),   # + the grader self-check
             "agent_calls": sum(r["turns"] + r["probes"] for r in rows)}
 
@@ -316,6 +324,15 @@ class Bench:
         """A consolidation run is alive (its marker names a live rs-memory _run)."""
         r = self.ex(c, f'p=$(cat {MARKER} 2>/dev/null) && tr "\\0" " " < /proc/$p/cmdline | grep -q " _run "')
         return r.returncode == 0
+
+    def pending(self, c) -> "set[str]":
+        """What the research flow waits on the PI for: each plan draft and
+        each staged cycle there now, keyed by path and modification time, so a
+        plan revised and shown again, or a cycle staged again after an unstage,
+        is a new item. A staged cycle is a link: its own time (stat without
+        -L), which a new staging sets, not its target folder's."""
+        r = self.ex(c, "stat -c '%.Y %n' /workspace/plan/draft/*.md /workspace/staging/* 2>/dev/null")
+        return set(r.stdout.decode("utf-8", "replace").splitlines()) - {""}
 
     # ------------------------------------------------------------ setup
     def project_name(self, ev, arm) -> str:
@@ -584,6 +601,7 @@ class Bench:
             time.sleep(1)
         msgs = session["messages"]
         killed_before = None
+        answered: "set[str]" = set()           # what the PI approved in this session
         try:
             for i, msg in enumerate(msgs):
                 if i == len(msgs) - 1 and session["end"] == "kill":
@@ -609,6 +627,17 @@ class Bench:
                 m = {"i": i, **self.turn(arm, p, c, name, msg)}
                 rec["messages"].append(m)
                 self.finish_turn(arm, c, name, rec, m, budget)
+                # each plan or cycle the flow now waits on is approved once, as a
+                # turn like any other (timeout, no-answer and caps apply); the
+                # loop ends when nothing new waits, or a cap stops the eval
+                while ARMS[arm].get("approves"):
+                    items = self.pending(c) - answered
+                    if not items:
+                        break
+                    answered |= items
+                    ap = {"after": i, "pending": sorted(items), **self.turn(arm, p, c, name, APPROVE)}
+                    rec.setdefault("approvals", []).append(ap)
+                    self.finish_turn(arm, c, name, rec, ap, budget)
             # the consolidation starts at the session's end event and can be
             # done before the next line runs: count from before the end (for a
             # killed session, from before its last message: the kill is its end)
@@ -647,35 +676,33 @@ class Bench:
         return rec
 
     # ------------------------------------------------------------ probes
-    def ask(self, arm, c, question: str, grader: bool = False) -> dict:
+    def ask(self, arm, c, question: str, grader: bool = False, budget: "dict | None" = None) -> dict:
+        """One probe. For an arm with "approves", an answer that leaves a plan
+        or a cycle waiting on the PI is continued in the probe's own
+        conversation with the approval until nothing new waits; the last
+        answer is the probe's. The chain's steps before the last are counted
+        against `budget` as they finish (so a chain that keeps drafting stops
+        at the caps); what is left to count is returned as `_unspent`."""
         before = self.transcripts(c, arm)
-        T = self.a.turn_timeout
+        # pi has no session id to resume by; no pi arm approves
+        chain = ARMS[arm].get("approves") and not grader and ARMS[arm]["agent"] != "pi"
         if ARMS[arm]["agent"] == "pi":
             model = "stub/stub-1" if self.a.standin else self.a.pi_model
             cmd = f"pi -p --model {shlex.quote(model)} {shlex.quote(question)} </dev/null"
         elif grader:
             # the prompt before --tools, which takes a list and would swallow it
             cmd = f"cd /tmp/grader && claude -p {shlex.quote(question)} --tools '' </dev/null"
+        elif chain:
+            # started under an id of its own, so an approval resumes exactly
+            # this conversation, never another transcript in /workspace
+            sid = str(uuid.uuid4())
+            cmd = f"claude -p --session-id {sid} {shlex.quote(question)} </dev/null"
         else:
             cmd = f"claude -p {shlex.quote(question)} </dev/null"
+        seen = self.pending(c) if chain else set()   # what waited before the probe is not its doing
         t0 = time.time()
-        try:
-            # the limit is enforced inside the container (killing only the
-            # docker client would leave the agent running into the next probe)
-            r = self.ex(c, f". {ENV_FILE}; export PATH={RH}/.local/bin:$PATH; timeout -k 10 {T} sh -c {shlex.quote(cmd)}",
-                        timeout=T + 30)
-        except subprocess.TimeoutExpired:
-            return {"answer": None, "error": "timed out", "seconds": round(time.time() - t0, 1),
-                    "usage": self.usage_since(c, arm, before)}
-        # pi starts its session-end close detached; it must be done before
-        # anything is restored
-        self.wait(lambda: self.ex(c, "for f in /proc/[0-9]*/cmdline; do tr '\\0' ' ' < $f 2>/dev/null; echo; done "
-                                     # [ ]: this scan's own command line must not match
-                                     "| grep -q 'rs-memory[ ]close'").returncode != 0, 60)
-        # and for the consolidation that close may have started: its tokens
-        # are reported apart (usage_since), never as the probe's cost
-        self.wait(lambda: not self.consolidating(c), T)
-        if r.returncode in (124, 137):                # timeout, or its forced kill
+        r = self.probe_call(c, cmd)
+        if r is None or r.returncode in (124, 137):   # timeout, or its forced kill
             return {"answer": None, "error": "timed out", "seconds": round(time.time() - t0, 1),
                     "usage": self.usage_since(c, arm, before)}
         out = {"seconds": round(time.time() - t0, 1), "usage": self.usage_since(c, arm, before)}
@@ -684,7 +711,62 @@ class Bench:
             out.update(answer=None, error=f"exit {r.returncode}: {r.stderr.decode('utf-8', 'replace')[-300:]}")
         else:
             out["answer"] = text
+        step_t, step_before = t0, before
+        while chain and out.get("answer") is not None:
+            items = self.pending(c) - seen
+            if not items:
+                break
+            seen |= items
+            out.setdefault("approvals", []).append(
+                {"pending": sorted(items), "answer": out["answer"], "seconds": round(time.time() - step_t, 1)})
+            if budget is not None:
+                try:
+                    self.spend(budget, self.usage_since(c, arm, step_before))
+                except OverBudget as x:
+                    # the approval was never sent: no answer, and not counted
+                    out["approvals"].pop()
+                    out.update(answer=None, error=f"over budget before approval {len(out['approvals']) + 1}",
+                               seconds=round(time.time() - t0, 1), usage=self.usage_since(c, arm, before))
+                    x.probe = out                    # what the chain got, kept in the results
+                    raise
+            step_t, step_before = time.time(), self.transcripts(c, arm)
+            n = len(out["approvals"])
+            r = self.probe_call(c, f"claude -p --resume {sid} {shlex.quote(APPROVE)} </dev/null")
+            text = "" if r is None else r.stdout.decode("utf-8", "replace").strip()
+            # never the answer before it: that one asked for an approval
+            if r is None or r.returncode in (124, 137):
+                out.update(answer=None, error=f"approval {n} timed out")
+            elif r.returncode != 0 or not text:
+                out.update(answer=None, error=f"approval {n}: exit {r.returncode}: "
+                                              f"{r.stderr.decode('utf-8', 'replace')[-300:]}")
+            else:
+                out["answer"] = text
+        if out.get("approvals"):
+            out["seconds"] = round(time.time() - t0, 1)
+            out["usage"] = self.usage_since(c, arm, before)
+            if budget is not None:
+                out["_unspent"] = self.usage_since(c, arm, step_before)
         return out
+
+    def probe_call(self, c, cmd: str):
+        """One headless agent call, None when it outran --turn-timeout."""
+        T = self.a.turn_timeout
+        try:
+            # the limit is enforced inside the container (killing only the
+            # docker client would leave the agent running into the next probe)
+            r = self.ex(c, f". {ENV_FILE}; export PATH={RH}/.local/bin:$PATH; timeout -k 10 {T} sh -c {shlex.quote(cmd)}",
+                        timeout=T + 30)
+        except subprocess.TimeoutExpired:
+            return None
+        # pi starts its session-end close detached; it must be done before
+        # anything is restored
+        self.wait(lambda: self.ex(c, "for f in /proc/[0-9]*/cmdline; do tr '\\0' ' ' < $f 2>/dev/null; echo; done "
+                                     # [ ]: this scan's own command line must not match
+                                     "| grep -q 'rs-memory[ ]close'").returncode != 0, 60)
+        # and for the consolidation that close may have started: its tokens
+        # are reported apart (usage_since), never as the probe's cost
+        self.wait(lambda: not self.consolidating(c), T)
+        return r
 
     def snapshot(self, c) -> None:
         # the files the sessions wrote (what provenance may point at), before any probe
@@ -705,19 +787,34 @@ class Bench:
         self.ex(c, f"for d in {paths}; do [ -e \"$d\" ] && mv \"$d\" \"/tmp/bench-probe-{n}-$(echo $d | tr / _)\"; done; "
                    "tar -x -f /tmp/bench-state.tar -P")
 
-    def score(self, it: dict, key: dict, res: dict, c) -> dict:
+    def score(self, arm, it: dict, key: dict, res: dict, c) -> dict:
         chk = it["check"]
         if chk["type"] == "files":
             m = len(chk["paths"])
+            paths, moved = list(chk["paths"]), 0
+            if ARMS[arm].get("approves"):
+                # the research flow files what the PI asked for with the cycle
+                # the PI accepted: a file missing at the asked place is looked
+                # for by name in the accepted results (the newest one)
+                for k, x in enumerate(paths):
+                    if self.ex(c, f"test -s {shlex.quote(x)}").returncode == 0:
+                        continue
+                    r = self.ex(c, f"find /workspace/results -type f -size +0 -name {shlex.quote(x.rsplit('/', 1)[-1])} "
+                                   "-printf '%T@ %p\\n' 2>/dev/null | sort -n | tail -1")
+                    hit = r.stdout.decode("utf-8", "replace").strip().split(" ", 1)
+                    if len(hit) == 2:
+                        paths[k], moved = hit[1], moved + 1
             if "fact" in chk:                   # file i holds item i of the fact
                 vals = key["facts"][chk["fact"]]
-                n = sum(1 for x, v in zip(chk["paths"], vals)
+                n = sum(1 for x, v in zip(paths, vals)
                         if grade_number(self.ex(c, f"cat {shlex.quote(x)} 2>/dev/null").stdout.decode("utf-8", "replace")[:2000],
                                         v, chk["tol"])["score"] == 1)
                 what = f"{n} of {m} files hold their value"
             else:
-                n = sum(1 for x in chk["paths"] if self.ex(c, f"test -s {shlex.quote(x)}").returncode == 0)
+                n = sum(1 for x in paths if self.ex(c, f"test -s {shlex.quote(x)}").returncode == 0)
                 what = f"{n} of {m} files there"
+            if ARMS[arm].get("approves"):
+                what += f" ({moved} found under /workspace/results)"
             return {"score": 1 if n == m else 0.5 if n else 0, "why": what}
         ans = res.get("answer")
         if ans is None:
@@ -789,7 +886,7 @@ class Bench:
             # the workspace as the sessions left it, before any probe can write to it
             kills = [m for s in res["sessions"] for m in s["messages"] if "mid_turn" in m]
             for ch in e.get("checks", []):
-                g = self.score(ch, key, {}, c)
+                g = self.score(arm, ch, key, {}, c)
                 paths = ch["check"]["paths"]
                 if nothing_left_to_resume(kills, paths):
                     g = {"score": None, "why": "the kill did not land mid-task: nothing was left to resume"}
@@ -797,11 +894,16 @@ class Bench:
             self.snapshot(c)
             for n, pr in enumerate(e.get("probes", [])):
                 self.restore(c, n)
-                r = self.ask(arm, c, pr["question"])
+                try:
+                    r = self.ask(arm, c, pr["question"], budget=res)
+                except OverBudget as x:            # over the cap inside an approval chain
+                    res["probes"].append({"id": pr["id"], **x.probe})
+                    raise
+                unspent = r.pop("_unspent", r.get("usage"))   # what ask did not count yet
                 entry = {"id": pr["id"], **r}
                 res["probes"].append(entry)        # kept even when it takes the eval over its cap
-                self.spend(res, r.get("usage"))
-                entry.update(self.score(pr, key, r, c))
+                self.spend(res, unspent)
+                entry.update(self.score(arm, pr, key, r, c))
                 self.spend(res, entry.get("grader_usage"))
         except ArmFailed as x:
             res["sessions"].append(x.args[0])
@@ -1047,6 +1149,9 @@ def table(results: dict) -> str:
                          for m in s.get("messages", []) if (m.get("usage") or {}).get("first_input") is not None), None)
             if cold is not None:
                 cell += f", cold {cold}"
+            approvals = sum(len(x.get("approvals", [])) for x in r.get("sessions", []) + r.get("probes", []))
+            if approvals:
+                cell += f", {approvals} approvals"
             if r.get("over_budget"):
                 cell += f" — OVER BUDGET: {r['over_budget']}"
             if r.get("failed"):
@@ -1095,8 +1200,10 @@ def main() -> None:
               f"{a.max_tokens} tokens, {a.max_seconds} s")
         for r in p["rows"]:
             print(f"  {r['eval']:<14} {r['arm']:<18} {r['sessions']} session(s), {r['turns']} turn(s), "
-                  f"{r['probes']} probe(s), {r['grader_calls']} grader call(s), up to {r['consolidations']} consolidation(s)")
-        print(f"agent calls: {p['agent_calls']} (plus the consolidations), grader calls: {p['grader_calls']}")
+                  f"{r['probes']} probe(s), {r['grader_calls']} grader call(s), up to {r['consolidations']} consolidation(s)"
+                  + (", plus approvals" if r["approvals"] else ""))
+        extra = " and approvals" if any(r["approvals"] for r in p["rows"]) else ""
+        print(f"agent calls: {p['agent_calls']} (plus the consolidations{extra}), grader calls: {p['grader_calls']}")
         return
     if not a.standin:
         need = []

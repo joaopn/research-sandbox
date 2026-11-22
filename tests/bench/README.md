@@ -40,7 +40,7 @@ Each eval runs on each chosen type, each in its own fresh project, destroyed
 when the eval is done. By default: `researcher` and `floor` (a plain
 `sandbox-dind` project). Opt in with `--arms`: `researcher-pi`,
 `researcher-nohook` (no start hook), `research` (the research flow, with its
-`/log` at each session's end).
+`/log` at each session's end; the scripted PI approves every plan and staged cycle it asks about).
 
 ## Running
 
