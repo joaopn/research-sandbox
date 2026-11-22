@@ -2293,6 +2293,9 @@ html.mobile .project-config-box .config-folders-input { font-size: 16px; }
     cursor: pointer;
 }
 .dev-ac-check { margin: 0; width: 13px; height: 13px; }
+/* The Fetch lists' "Hide synced (N)" tick: its own line above the cards, with
+   the reviewer line's breathing room. Not inside any .field either. */
+.dev-hide-synced-row { margin: 6px 0; }
 .dev-review-cell {
     display: inline-flex;
     align-items: center;

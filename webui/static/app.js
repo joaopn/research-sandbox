@@ -660,6 +660,36 @@ async function setFetchAutoCommit(repo, on) {
     try { await persistVault(); } catch (e) { /* best-effort */ }
 }
 
+// ---- rs-fetch "Hide synced" tick (vault settings.fetch_hide_synced) ---------
+// One boolean for the whole browser, not per repo: it hides the in-sync cards
+// from both rs-fetch LISTS (the Development page's Fetch tab and a project's
+// project-wide pane). Stored only when ON, so "absent" and "off" are the same
+// state. Same read/write split as the auto-commit list above: the read is a
+// tolerant NON-creating probe (it runs on every list render, and a render must
+// never touch saved state), and exactly ONE function assigns the setting.
+function readFetchHideSynced() {
+    const s = state.vault && state.vault.settings;
+    return !!(s && s.fetch_hide_synced === true);
+}
+
+// The ONE writer. Persists at once (best-effort) and brings every tick on
+// screen into line — selected on the `data-hide-synced` stamp alone, never on
+// the shared .dev-ac-check class (the auto-commit and hide-agent/ boxes carry
+// it too). Each box is re-applied explicitly through the apply function it
+// carries, because setting `.checked` fires no `change`: the other list (a
+// project's pane is a hidden, never-redrawn snapshot) must actually hide or
+// show its own cards, not merely show a flipped box. Each apply touches only
+// the cards its own list built.
+async function setFetchHideSynced(on) {
+    if (on) vaultSettings().fetch_hide_synced = true;
+    else delete vaultSettings().fetch_hide_synced;
+    for (const box of document.querySelectorAll("input[data-hide-synced]")) {
+        box.checked = on;
+        if (typeof box.__rsApplyHideSynced === "function") box.__rsApplyHideSynced();
+    }
+    try { await persistVault(); } catch (e) { /* best-effort */ }
+}
+
 // ---- rail order (vault settings.project_order) ------------------------------
 // The order the operator dragged the sidebar rows into, kept as a list of
 // project NAMES beside the per-project map above — deliberately NOT a saved
@@ -5535,10 +5565,13 @@ function renderDevFetchScreen(view, body, result) {
     // at the bottom instead.
     const visible = devFetchVisible(repos);
     const hidden = repos.length - visible.length;
+    // Cards are built first so the Hide synced tick can sit above them and
+    // count them; it goes after the reviewer line, before the first card.
+    const pairs = [];
     for (const r of visible) {
         const attached = attachments.filter((a) => a.repo === r.repo)
                                     .map((a) => a.project);
-        body.appendChild(buildDevRepoCard(view, body, r, attached, {
+        pairs.push([r, buildDevRepoCard(view, body, r, attached, {
             scoped: false,
             rerender: () => renderDevFetchTab(view, body),
             // Every mirror's fork list, so the purge dialog can name the OTHER
@@ -5553,8 +5586,11 @@ function renderDevFetchScreen(view, body, result) {
             // never become a second way to under-report it. The filter governs
             // which cards render and nothing else.
             allRepos: repos,
-        }));
+        })]);
     }
+    const hideSynced = devHideSyncedTick(pairs);
+    if (hideSynced) body.appendChild(hideSynced);
+    for (const [, card] of pairs) body.appendChild(card);
     if (hidden) {
         body.appendChild(devHiddenLine(hidden, "Repos", () => {
             devActiveTab = "repos";
@@ -5612,6 +5648,52 @@ function devHiddenLine(count, label, onOpen) {
                         + "this list. "]),
         open,
     ]);
+}
+
+// Is this card "synced" — does it print "No open PRs. In sync with upstream."
+// or "No open PRs. Same content as upstream, …"? The test mirrors the card's
+// own (buildDevRepoCard: a degraded `error` row returns early, the sentence
+// joins "No open PRs." only for a non-empty row whose listed `prs` are empty,
+// and only devUpstreamText's in_sync and same_content states produce those two
+// sentences), so the tick hides exactly
+// the cards that say so and nothing a reader could mistake for one. `upstream`
+// is often null (no fork, an empty fork, no recorded base, the time budget
+// spent), which reads as not synced.
+function devRepoSynced(r) {
+    const prs = Array.isArray(r && r.prs) ? r.prs : [];
+    const u = r && r.upstream;
+    return !!r && !r.error && !r.empty && prs.length === 0
+        && !!u && typeof u === "object"
+        && (u.state === "in_sync" || u.state === "same_content");
+}
+
+// The "Hide synced (N)" tick above a list's cards, or null when no card is
+// synced (no inert control). `pairs` is the [row, card] list ONE list built,
+// after the rs-fetch switch filter. Toggling hides/shows those cards in place —
+// a rebuild would reset every open commit list — through an inline
+// `display`, because `.dev-repo-card { display:flex }` beats the `hidden`
+// attribute. The box carries the `data-hide-synced` stamp the writer selects
+// on, and its own apply function so the writer can re-apply this list when
+// the other list's tick changes; it never carries `data-ac-repo`.
+function devHideSyncedTick(pairs) {
+    const synced = pairs.filter(([r]) => devRepoSynced(r)).map(([, card]) => card);
+    if (!synced.length) return null;
+    const box = el("input", { type: "checkbox", class: "dev-ac-check" });
+    box.setAttribute("data-hide-synced", "");
+    const apply = () => {
+        for (const card of synced) card.style.display = box.checked ? "none" : "";
+    };
+    box.__rsApplyHideSynced = apply;
+    box.checked = readFetchHideSynced();
+    apply();
+    box.onchange = () => { setFetchHideSynced(box.checked); };
+    const label = el("label", {
+        class: "dev-ac",
+        title: "Hide the repos with no open PRs whose work is in sync with "
+             + "upstream, or has the same content as it. Remembered in this "
+             + "browser.",
+    }, [box, `Hide synced (${synced.length})`]);
+    return el("div", { class: "dev-hide-synced-row" }, [label]);
 }
 
 // ---- The Repos tab: the dev-lane inventory + the rs-fetch switches ----------
@@ -6882,6 +6964,10 @@ async function renderProjectFetchPane(container, repo) {
     // opened by name, so it never hides its one repo.
     const visible = all ? devFetchVisible(rows) : rows;
     const hiddenCount = all ? rows.length - visible.length : 0;
+    // Cards are built first so the project-wide pane's Hide synced tick can
+    // sit above them and count them; the per-repo pane holds one card it was
+    // opened by name for, so it gets no tick.
+    const pairs = [];
     for (const r of visible) {
         // ⚠ The two verbs return DIFFERENT attachment shapes, so these must not
         // be unified: dev_status emits [{project, repo}] for EVERY repo (filter,
@@ -6891,13 +6977,16 @@ async function renderProjectFetchPane(container, repo) {
         // "worked by" line. See dev_status / dev_repo_status in cli/rscore.py.
         const attached = (all ? atts.filter((a) => a && a.repo === r.repo) : atts)
             .map((a) => a && a.project).filter(Boolean);
-        container.appendChild(buildDevRepoCard(container, container, r, attached, {
+        pairs.push([r, buildDevRepoCard(container, container, r, attached, {
             scoped: true,
             rerender: () => renderProjectFetchPane(container, repo),
             // No allRepos: it feeds the purge dialog, which is a global
             // affordance a scoped card never renders.
-        }));
+        })]);
     }
+    const hideSynced = all ? devHideSyncedTick(pairs) : null;
+    if (hideSynced) container.appendChild(hideSynced);
+    for (const [, card] of pairs) container.appendChild(card);
     // Reviewer-token state beside the cards' Review affordances (both Fetch
     // surfaces; same silent degradation on a missing field). Placed AFTER the
     // cards so the two project panes read identically; the Development page
