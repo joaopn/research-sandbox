@@ -17,6 +17,8 @@ A dev project (`--workflow dev`) and each dev box carry two switches that set ho
 | `checker-doer` | 2b | Plans with you; RS's doer subagent implements each unit, the agent reviews each change itself |
 | `planner-doer-checker` | 3 | Plans with you; the doer subagent implements each unit and the checker subagent reviews it |
 
+In the modes with a review, a review ends on a fixed budget. Each finding is either blocking, something you would hit (wrong behaviour, a broken promise, a missed caller, a security or data-loss risk, a test that passes without proving what it says), or minor, everything else. Blocking findings are fixed and the fixes are checked once more. Where the mode checks the plan, it is checked once, and again only for parts the first check did not see; a change is reviewed once, plus one check of its fixes, for each unit, and a change built in several units gets one more review of the whole, with its fixes checked the same way. Whatever is still blocking after that comes to you with the plan or the change, and the change waits uncommitted for your answer; minor findings are fixed when the fix is trivial, or listed for you.
+
 **Test policy** — how much testing RS asks for:
 
 | Policy | What the agent does | Meant for |

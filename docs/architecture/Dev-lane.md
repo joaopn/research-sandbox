@@ -79,7 +79,7 @@ A dev project's agent and each dev box agent start in a working mode, chosen at 
 | Checker-doer | 2b | Plans with the user; doers implement each unit, the agent reviews each change itself and the whole change before committing | doer |
 | Planner-doer-checker | 3 | Plans with the user; doers implement each unit, a checker reviews each one | doer, checker |
 
-Each mode is an entry in one catalog, built from shared rules: plan review, the go, measuring before building, re-reviews, findings, questions and the report. The webui, the installer, the switch and the checks all read that catalog.
+Each mode is an entry in one catalog, built from shared rules: plan review, the go, measuring before building, review limits, findings, questions and the report. The webui, the installer, the switch and the checks all read that catalog.
 
 RS's dev instructions leave the timing of commits to the mode. In Doer-checker, Checker-doer and Planner-doer-checker the agent commits, and so pushes, only after the review. In Direct and None it commits as it goes. A child agent doing work commits only when its brief says to.
 

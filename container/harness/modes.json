@@ -34,6 +34,7 @@
         "implement-yourself",
         "tests",
         "diff-review",
+        "review-limits",
         "findings",
         "questions",
         "report"
@@ -53,6 +54,7 @@
         "implement-through-doers",
         "tests",
         "self-review",
+        "review-limits",
         "findings",
         "questions",
         "report"
@@ -72,6 +74,7 @@
         "implement-through-doers",
         "tests",
         "diff-review",
+        "review-limits",
         "findings",
         "questions",
         "report"
