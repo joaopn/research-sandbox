@@ -50,13 +50,18 @@ The agent keeps its memory through one command, `rs-memory`. Its refusals name t
 | Verb | Does |
 |---|---|
 | `note`, `checkpoint` | add to the journal; a checkpoint before long work lets an interruption resume |
-| `claim` | stage a finding with its evidence |
+| `claim`, `amend` | stage a finding with its evidence; correct a staged one in place |
 | `accept`, `strike` | enter a staged finding in the record, or drop it, after the user says so |
 | `view`, `recall` | show the state of knowledge or one entry with its chain; search the journal and claims as text |
 | `skill propose`, `used`, `promote`, `retire` | turn a working procedure into a skill for both agents |
 | `open`, `close`, `consolidate` | start a session; end one and rewrite the front page |
+| `job add`, `list`, `done` | register a long run left going, show its state, mark it handled |
 
-A finding's standing (current, superseded, contested, withdrawn) is computed from its relations each time it is shown. Entries are never edited, so a correction is a new entry.
+A finding's standing (current, superseded, contested, withdrawn) is computed from its relations each time it is shown. Accepted entries are never edited, so a correction of one is a new entry that supersedes it.
+
+A staged claim, still waiting for the user, can be corrected in place with `amend`. It keeps its id, and every earlier version stays on the entry. In a project with analysts, a changed statement, scope, hedge or evidence voids the finding's checks, which must run again.
+
+A long run left going, such as a build of many hours, is registered with `job add`, by its process id and its log. Every session start shows each registered job as running, ended (with its log's last line, so a crash shows) or gone, so the next session knows about it and a crash does not go unnoticed.
 
 The memory command is part of the project's image, while RS's instructions to the agent are rewritten at every start, so the two must match. A researcher project is refused at create when RS's image has an older memory command than the instructions need. An existing one's start ends with an error, and its memory is not set up, until **Rebuild all** on **Sandboxes → Software** and a stop and start of the project.
 
