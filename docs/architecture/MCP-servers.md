@@ -43,8 +43,11 @@ flowchart TD
     B --> T[Tool staged in the project]
     T --> A[Agent's own server list]
     T --> X[Box agent's own server list]
+    B --> W[Workers' servers staged in a research project]
+    W --> V[Supervisor spawns a worker with the servers it names]
     A -->|token| G
     X -->|token, via the inner guard| G
+    V -->|token from the worker's environment, via the inner guard| G
     G -->|server's secret headers| S[MCP servers: internet, this machine, LAN]
 ```
 
@@ -85,6 +88,8 @@ Servers registered with `research mcp add` are granted to a project with `resear
 - **One fixed gateway address per project.** It is the last address of the project's network, so nothing is re-configured when the gateway is re-created. This needs Docker 29.0, which is RS's minimum.
 - **RS adds to the agent's own server list and marks its entries.** It never rewrites that list and never touches an entry it did not add. A name already in use is an error, not a replacement.
 - **Each project applies its own wiring.** RS stages a small tool into the project; the tool records what it did for the page.
+- **A worker gets only the servers its supervisor names.** Ticking servers for analysis workers makes them available to the supervisor, not to every worker; the supervisor grants each worker the servers its task needs, the same rule as for the per-project registry.
+- **A worker's token is never written to a file.** It reaches the worker through its environment, and the worker's server list refers to it by name. The webui reads every project folder, so a token there would be readable outside the project.
 - **A removed server is refused at once.** Agents' leftover entries are tidied at the next start or wiring change.
 - **A server sees its own address as the Host.** The gateway follows no redirect and passes no packets between project networks.
 - **A damaged list or wiring table is an error with one explicit remedy.** A file written by a newer RS is never offered for discarding.

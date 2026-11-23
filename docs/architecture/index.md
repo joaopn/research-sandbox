@@ -141,6 +141,7 @@ The lab workflow's decisions are proposals until built; they are listed on [Lab 
 - A server's secrets stay on the host: never in a project, never shown again.
 - The gateway forwards a call only for a wired consumer, from its own project network.
 - RS adds to an agent's own server list and never touches entries it did not add.
+- A research project's workers get only the servers the supervisor names, and their token never touches a file.
 
 ### [Networking and egress](Networking-and-egress.md)
 
