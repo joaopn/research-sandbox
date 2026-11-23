@@ -46,7 +46,7 @@ An **analyst** carries out one analysis from a brief, in the background, while t
 
 Several analysts run at once. Under Claude the researcher launches several in one turn; under pi it launches one per step. Each one's result wakes the session when it ends. An analyst's results land as files in the workspace with a short report, and the researcher writes what matters into its memory.
 
-An analyst has the project's data tools and cannot start helpers of its own. It runs the researcher's model. Under pi its deadline is the longest pi accepts, about 24 days, instead of pi's default 30 minutes.
+An analyst has the project's data tools and cannot start helpers of its own. It runs the model set for it (see [The helpers' models](#the-helpers-models) below). Under pi its deadline is the longest pi accepts, about 24 days, instead of pi's default 30 minutes.
 
 ## A finding's two checks
 
@@ -63,6 +63,10 @@ Both checks run in the background and answer the researcher, which tells the use
 
 The web is the researcher's own for a quick lookup. A survey goes to a **surveyor** under Claude: it has only Claude's web search and page fetch, runs in the background, and answers with a summary and its sources. Under pi there is no survey helper yet, and the researcher says so.
 
+## The helpers' models
+
+Under Claude the analyst and the surveyor each run the model and effort set for the whole installation in **Sandboxes → Infrastructure → Analyst** and **→ Surveyor**, Sonnet at high effort by default. A new project of this type starts with them, and a project's own are changed in its ⚙ Agents box, on Claude's tab. Under pi the analyst runs pi's default model unless its own model and thinking level are set on pi's tab of the same box; there is no installation default for it, since pi names its models by provider. A change is written into the helper's definition, so the next helper launched uses it, and nothing restarts. A project created before these settings keeps running its Claude helpers on the researcher's model until they are set in its ⚙ Agents box.
+
 ## The referee's model
 
 Under Claude the referee runs the model set for the whole installation in **Sandboxes → Infrastructure → Referee**, Sonnet at high effort by default. A new project of this type starts with it, and a project's own can be changed in its ⚙ Agents box; the next referee run uses the change, and nothing restarts. Under pi the referee runs the project's pi model.
@@ -71,7 +75,9 @@ Under Claude the referee runs the model set for the whole installation in **Sand
 
 **Subagents keep nothing.** Knowledge stays with the researcher, in one memory. The cost is that long-lived workers with their own context are given up; the [Lab workflow](Lab-workflow.md) restores them.
 
-**Parallel and in the background by default.** The conversation never waits for an analysis, and each result arrives on its own. The cost is that an analyst costs what the researcher costs per token.
+**Parallel and in the background by default.** The conversation never waits for an analysis, and each result arrives on its own. The cost is many runs at once, which is why the helpers default to a cheaper model than the researcher's.
+
+**The helpers' models are set like the referee's.** An installation-wide default under Infrastructure, frozen into each new project, changed per project in its ⚙ Agents box. The cost is that a new project's helpers no longer match the researcher's model unless they are set to.
 
 **The referee guards the record, not the work.** A wrong finding that enters the record is built on silently; a wrong intermediate result costs little. The cost is one referee run per finding, measured at about $0.04 on Sonnet.
 

@@ -1178,11 +1178,12 @@ def _resolve_all_model_pairs(supervisor: tuple[str, str] = ("", ""),
                              worker: tuple[str, str] = ("", ""),
                              role: tuple[str, str] = ("", ""),
                              box: tuple[str, str] = ("", ""),
-                             referee: bool = False) -> dict[str, dict[str, str]]:
+                             subagents: bool = False) -> dict[str, dict[str, str]]:
     """Resolve all FOUR container types into concrete, mutually-valid pairs — the
-    exact shape written into `.orchestrator/project.json`. `referee` adds the
-    finding referee's pair (from the defaults), for a researcher-subagents
-    project only: `rs-memory referee` reads it from the record.
+    exact shape written into `.orchestrator/project.json`. `subagents` adds the
+    finding referee's pair and the analyst's and surveyor's (from the defaults),
+    for a researcher-subagents project only: `rs-memory referee` reads the
+    first from the record, the kit's installer the other two.
 
     Every pair (including `box`, which has no create-time field and therefore
     comes straight from the defaults file) passes through the effort-support drop
@@ -1201,9 +1202,10 @@ def _resolve_all_model_pairs(supervisor: tuple[str, str] = ("", ""),
         m, e = _resolve_model_pair(ctype, supplied[0], supplied[1],
                                    catalog=catalog, pairs=pairs)
         out[ctype] = {"model": m, "effort": e}
-    if referee:
-        m, e = _resolve_model_pair("referee", catalog=catalog, pairs=pairs)
-        out["referee"] = {"model": m, "effort": e}
+    if subagents:
+        for ctype in ("referee", *HELPER_MODEL_TYPES):
+            m, e = _resolve_model_pair(ctype, catalog=catalog, pairs=pairs)
+            out[ctype] = {"model": m, "effort": e}
     return out
 
 
@@ -2232,7 +2234,7 @@ class UpdateRequest:
     # stamp the type defaults over the supervisor and role pairs the researcher
     # had already chosen, AND — because the supervisor pair would then look
     # "changed" — it would trigger the multi-minute _recreate_supervisor that the
-    # granular update path exists to avoid. `live_ok` requires all eight to be empty
+    # granular update path exists to avoid. `live_ok` requires every model field above to be empty
     # for exactly this reason; the two are a matched pair.
     supervisor_model: str = ""
     supervisor_effort: str = ""
@@ -2245,6 +2247,17 @@ class UpdateRequest:
     # `rs-memory referee` reads at each run, so no container is touched.
     referee_model: str = ""
     referee_effort: str = ""
+    # The helper roles' pairs (a researcher-subagents project only, checked in
+    # update() against the record like the referee's): Claude's analyst and
+    # surveyor into models.analyst / models.surveyor, pi's analyst into
+    # pi_models.analyst; the kit's installer is re-run so the next helper
+    # launched uses them, and no container is restarted.
+    analyst_model: str = ""
+    analyst_effort: str = ""
+    surveyor_model: str = ""
+    surveyor_effort: str = ""
+    pi_analyst_model: str = ""
+    pi_analyst_thinking: str = ""
     # The project's agent SET after this update (STAGE_PI_AGENT). None =
     # unchanged. Slice 1 is ADD-only: the set must be a superset of the marker's
     # (checked in update(), which has the project; from_kwargs checks shape, enum
@@ -2279,7 +2292,9 @@ class UpdateRequest:
         for ctype, m, e in (("supervisor", self.supervisor_model, self.supervisor_effort),
                             ("worker", self.worker_model, self.worker_effort),
                             ("role", self.role_model, self.role_effort),
-                            ("referee", self.referee_model, self.referee_effort)):
+                            ("referee", self.referee_model, self.referee_effort),
+                            ("analyst", self.analyst_model, self.analyst_effort),
+                            ("surveyor", self.surveyor_model, self.surveyor_effort)):
             blk = {}
             if m:
                 blk["model"] = m
@@ -2289,6 +2304,16 @@ class UpdateRequest:
                 out[ctype] = blk
         return out
 
+    def pi_analyst_asked(self) -> bool:
+        """pi's analyst pair is set or reset by this request."""
+        return bool(self.pi_analyst_model or self.pi_analyst_thinking
+                    or set(self.reset) & {"pi_analyst_model", "pi_analyst_thinking"})
+
+    def helpers_asked(self) -> bool:
+        """Any helper role's pair (Claude's analyst or surveyor, pi's analyst)
+        is set or reset by this request."""
+        return bool(set(self.model_changes()) & set(HELPER_MODEL_TYPES)) or self.pi_analyst_asked()
+
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "UpdateRequest":
         # Validate ONLY what was supplied — no defaulting (see the field note).
@@ -2296,7 +2321,9 @@ class UpdateRequest:
         vals: dict[str, str] = {}
         for f in ("supervisor_model", "supervisor_effort", "worker_model",
                   "worker_effort", "role_model", "role_effort",
-                  "referee_model", "referee_effort"):
+                  "referee_model", "referee_effort",
+                  "analyst_model", "analyst_effort",
+                  "surveyor_model", "surveyor_effort"):
             v = kw.get(f) or ""
             if v and not isinstance(v, str):
                 raise ValidationError(f"{f} must be a string")
@@ -2324,7 +2351,7 @@ class UpdateRequest:
         # against a STORED effort is re-checked in update() against the marker
         # (there the stored effort is dropped, not rejected — the researcher
         # explicitly asked for the new model, so the model wins).
-        for ctype in ("supervisor", "worker", "role", "referee"):
+        for ctype in ("supervisor", "worker", "role", "referee", *HELPER_MODEL_TYPES):
             m, e = vals[f"{ctype}_model"], vals[f"{ctype}_effort"]
             if m and e and not _claude_effort_ok(m, e, catalog):
                 # Reaches the browser (the ⚙ Agents box): names no flag.
@@ -2360,6 +2387,21 @@ class UpdateRequest:
         if pi_thinking and pi_thinking not in PI_THINKING_LEVELS:
             raise ValidationError(f"pi thinking level {pi_thinking!r} is not one of "
                                   f"{', '.join(PI_THINKING_LEVELS)}")
+        # pi's analyst pair: the same shape as pi's own (which project: update()).
+        pi_analyst_model = kw.get("pi_analyst_model") or ""
+        pi_analyst_thinking = kw.get("pi_analyst_thinking") or ""
+        for v, what in ((pi_analyst_model, "pi analyst model"),
+                        (pi_analyst_thinking, "pi analyst thinking level")):
+            if not isinstance(v, str):
+                raise ValidationError(f"the {what} must be a string")
+        pi_analyst_model, pi_analyst_thinking = pi_analyst_model.strip(), pi_analyst_thinking.strip()
+        if pi_analyst_model and not PI_MODEL_RE.match(pi_analyst_model):
+            raise ValidationError(
+                f"pi analyst model {pi_analyst_model!r} must be written provider/model, e.g. "
+                f"openrouter/anthropic/claude-opus-latest")
+        if pi_analyst_thinking and pi_analyst_thinking not in PI_THINKING_LEVELS:
+            raise ValidationError(f"pi analyst thinking level {pi_analyst_thinking!r} is not "
+                                  f"one of {', '.join(PI_THINKING_LEVELS)}")
         raw_mode = kw.get("harness_mode")
         raw_policy = kw.get("test_policy")
         harness = _harness_shape(kw)
@@ -2378,7 +2420,9 @@ class UpdateRequest:
                                       f"{', '.join(UPDATE_RESETTABLE)})")
         given = {"supervisor_model": vals["supervisor_model"],
                  "supervisor_effort": vals["supervisor_effort"],
-                 "pi_model": pi_model, "pi_thinking": pi_thinking, **harness}
+                 "pi_model": pi_model, "pi_thinking": pi_thinking,
+                 "pi_analyst_model": pi_analyst_model,
+                 "pi_analyst_thinking": pi_analyst_thinking, **harness}
         both = [r for r in reset if given.get(r)]
         if both:
             raise ValidationError(f"{', '.join(both)} cannot be both set and reset in one change")
@@ -2390,6 +2434,7 @@ class UpdateRequest:
             role_mcp_upstream=_as_tuple(kw.get("role_mcp_upstream")),
             agents=agents,
             pi_model=pi_model, pi_thinking=pi_thinking,
+            pi_analyst_model=pi_analyst_model, pi_analyst_thinking=pi_analyst_thinking,
             reset=tuple(reset),
             status_bar=_status_bar_arg(kw.get("status_bar")),
             **harness,
@@ -4217,7 +4262,7 @@ class ModelDefaultSetRequest:
     """Set (or clear) one container type's default (model, effort) pair in the
     operator's untracked model-defaults override file — the write half of the
     broker's `models` read verb (drives the Sandboxes → Infrastructure →
-    Reviewer and Referee controls; the verb itself accepts any catalog type, deliberately —
+    Reviewer, Referee, Analyst and Surveyor controls; the verb itself accepts any catalog type, deliberately —
     equivalent in power to the documented hand-edit of the same file).
 
     `clear` exists so "" never has to mean "unset": an empty effort is a REAL
@@ -5037,7 +5082,7 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         supervisor=(req.supervisor_model, req.supervisor_effort),
         worker=(req.worker_model, req.worker_effort),
         role=(req.role_model, req.role_effort),
-        referee=req.research_subagents)
+        subagents=req.research_subagents)
     marker = {"type": project_type, "substrate": substrate.value,
               "workflow": req.workflow, "agents": deployed_agents,
               "models": model_pairs,
@@ -6147,6 +6192,23 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         raise ValidationError(
             "the referee's model applies only to a researcher-subagents project; "
             f"{project!r} is not one")
+    # The helper roles likewise, and each runtime's helper needs that agent
+    # (after this update's own agent change, when it carries one).
+    pi_analyst_asked = req.pi_analyst_asked()
+    helpers_asked = req.helpers_asked()
+    if helpers_asked:
+        if _read_marker_dict(workspace_path).get(SUBAGENTS_RECORD_KEY) is not True:
+            raise ValidationError(
+                "the analyst's and the surveyor's models apply only to a "
+                f"researcher-subagents project; {project!r} is not one")
+        helper_agents = (list(req.agents) if req.agents is not None
+                         else _project_running_agents(workspace_path))
+        if (set(req.model_changes()) & set(HELPER_MODEL_TYPES)
+                and DEFAULT_AGENT not in helper_agents):
+            raise ValidationError("the Analyst and Surveyor models for Claude need Claude "
+                                  "as an agent")
+        if pi_analyst_asked and "pi" not in helper_agents:
+            raise ValidationError("the Analyst model for pi needs pi as an agent")
     claude_asked = bool(req.supervisor_model or req.supervisor_effort
                         or set(req.reset) & {"supervisor_model", "supervisor_effort"})
     claude_in_settings = claude_asked and _label_is_set("container", container)
@@ -6159,7 +6221,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     # recreates the container from the record — Claude's model included,
     # whatever the old container's image — and relaunches the role services
     # from it) — nothing is started.
-    if plan.any() or req.agents is not None or req.model_changes():
+    if plan.any() or req.agents is not None or req.model_changes() or pi_analyst_asked:
         others = req.enable or req.disable or req.role_mcp_upstream or req.rebuild
         if not others and not container_running(container):
             agents_added = _validate_agents_update(req, container, workspace_path)
@@ -6169,6 +6231,8 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
             if plan.claude is not None:
                 stopped_models.pop("supervisor", None)
             dropped = _apply_model_changes(workspace_path, stopped_models) if stopped_models else []
+            if pi_analyst_asked:
+                _apply_pi_analyst_change(workspace_path, req)
             _agent_settings_commit(plan, workspace_path)
             if agents_added:
                 _write_marker_agents(workspace_path,
@@ -6279,6 +6343,8 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         _compute_service_flags(enable_services, disable_services)
     if model_changes:
         effort_dropped += _apply_model_changes(workspace_path, model_changes)
+    if pi_analyst_asked:
+        _apply_pi_analyst_change(workspace_path, req)
     _agent_settings_commit(plan, workspace_path)
     if agents_added:
         _write_marker_agents(workspace_path,
@@ -6310,7 +6376,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
                 _report_warnings(_stage_harness(container, now_local, workspace_path), progress)
         if not (touched or req.rebuild or enable_workers or disable_workers
                 or req.role_mcp_upstream or model_changes or agents_added or plan.removed
-                or claude_recreate):
+                or claude_recreate or pi_analyst_asked):
             progress.step("agents", "applied to the project's agents")
             print(f"agent settings of {project!r} updated; each agent's next session uses them.")
             _raise_old_instructions(found)
@@ -6325,7 +6391,7 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     live_ok = (not req.rebuild and not enable_workers and not disable_workers
                and not req.role_mcp_upstream and not model_changes
                and not agents_added and not plan.removed and not claude_recreate
-               and not plan.any())
+               and not plan.any() and not pi_analyst_asked)
     if live_ok and touched == {"code-server"}:
         enable = "code-server" in _parse_service_list(enable_services)
         return _live_toggle_editor(project, cfg, container, workspace_path, enable, progress)
@@ -6431,10 +6497,26 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     # below, which re-reads the marker anyway (the code-server/reader precedent).
     # `not agents_added` is load-bearing: `--worker-model haiku --agent <other>`
     # would otherwise return here with the marker claiming an agent nothing staged.
-    if (model_changes and not touched and not req.rebuild and not enable_workers
-            and not disable_workers and not req.role_mcp_upstream and not agents_added
-            and not plan.removed and not claude_recreate):
-        changed = set(model_changes)
+    if ((model_changes or pi_analyst_asked) and not touched and not req.rebuild
+            and not enable_workers and not disable_workers and not req.role_mcp_upstream
+            and not agents_added and not plan.removed and not claude_recreate):
+        #   * analyst, surveyor, pi's analyst → the kit's installer again, as a
+        #     working-mode change runs it: it rewrites each helper's definition
+        #     from the record, and the next helper launched reads it. Nothing
+        #     is restarted. Only when the rest of the change is handled here
+        #     too (else the recreate below runs the installer at its start).
+        changed = set(model_changes) - set(HELPER_MODEL_TYPES)
+        if helpers_asked and (changed in (set(), {"worker"}, {"referee"})
+                              or changed - {"referee"} == {"role"}):
+            progress.step("models", "applying the helpers' models")
+            _report_warnings(_stage_harness(container, _read_dind_agent_sets(workspace_path)[1],
+                                            workspace_path), progress)
+            if not changed:
+                print("helper models updated; the next analyst or surveyor launched uses "
+                      "them (no container restarted).")
+                _raise_old_instructions(found)
+                return UpdateResult(project=project, rebuilt=False,
+                                    effort_dropped=effort_dropped)
         if changed == {"worker"}:
             progress.step("models", "applying the worker model")
             print("worker model updated; the next `rs-worker spawn` picks it up "
@@ -10080,6 +10162,13 @@ HARNESS_FILES = ("install.sh", "agents/doer.md", "agents/checker.md",
 # .orchestrator/project.json. Read where the kit is staged; a box, and every
 # project without the key, gets neither.
 SUBAGENTS_RECORD_KEY = "subagents"
+# The model-catalog types of the Claude helper roles of such a project: each
+# resolved into the record's `models` block at create (models.analyst,
+# models.surveyor), changed per project in its ⚙ Agents box, and written by the
+# kit's installer into the helper's definition (`model:`, `effort:`). pi's
+# analyst has its own pair, pi_models.analyst (no installation default: the
+# catalog names Claude tiers only).
+HELPER_MODEL_TYPES = ("analyst", "surveyor")
 HARNESS_SKILL_TEMPLATE = "skill/SKILL.template.md"
 HARNESS_TEST_SKILL_TEMPLATE = "skill-test/SKILL.template.md"
 # Number words for the skill's "one of these three" (a catalog longer than this
@@ -10246,13 +10335,42 @@ def _harness_analyst_servers(container: str) -> list[str]:
     return sorted(n for n in consumer.get("servers") or [] if mcp_servers.NAME_RE.match(n))
 
 
+def _harness_helper_pairs(marker: dict) -> dict[str, str]:
+    """The helper roles' recorded pairs as the installer's variables (set
+    values only): models.analyst / models.surveyor (Claude) and
+    pi_models.analyst (pi). Tolerant, like _read_harness: the record is
+    container-writable, so a value that fails its character set reads as
+    unset (the installer re-checks every value it is given). A record from
+    before the pairs has none: each helper keeps the session's model."""
+    out: dict[str, str] = {}
+    models = marker.get("models") if isinstance(marker.get("models"), dict) else {}
+    for ctype in HELPER_MODEL_TYPES:
+        blk = models.get(ctype) if isinstance(models.get(ctype), dict) else {}
+        for k in ("model", "effort"):
+            v = blk.get(k)
+            if isinstance(v, str) and v and model_catalog.ALIAS_RE.match(v):
+                out[f"RS_HARNESS_{ctype.upper()}_{k.upper()}"] = v
+    pi_blk = marker.get("pi_models") if isinstance(marker.get("pi_models"), dict) else {}
+    rec = pi_blk.get("analyst") if isinstance(pi_blk.get("analyst"), dict) else {}
+    m, t = rec.get("model"), rec.get("thinking")
+    if isinstance(m, str) and m and PI_MODEL_RE.match(m):
+        out["RS_HARNESS_PI_ANALYST_MODEL"] = m
+    if isinstance(t, str) and t in PI_THINKING_LEVELS:
+        out["RS_HARNESS_PI_ANALYST_THINKING"] = t
+    return out
+
+
 def _harness_subagents_env(container: str, marker: dict) -> list[str]:
-    """`-e` args that give the installer the helper roles, when the project's
-    record carries `"subagents": true`; none otherwise."""
+    """`-e` args that give the installer the helper roles, with their recorded
+    models (_harness_helper_pairs), when the project's record carries
+    `"subagents": true`; none otherwise."""
     if marker.get(SUBAGENTS_RECORD_KEY) is not True:
         return []
-    return ["-e", "RS_HARNESS_SUBAGENTS=1",
+    args = ["-e", "RS_HARNESS_SUBAGENTS=1",
             "-e", f"RS_HARNESS_ANALYST_MCP={' '.join(_harness_analyst_servers(container))}"]
+    for k, v in _harness_helper_pairs(marker).items():
+        args += ["-e", f"{k}={v}"]
+    return args
 
 
 def _run_harness_installer(container: str, local: "Sequence[str]",
@@ -16068,7 +16186,7 @@ AGENT_MODEL_SETTINGS_JQ = ('del(.hooks, .model, .effortLevel, .modelSettings, .s
                            ' else . end')
 # The fields an update can set back to the default (UpdateRequest.reset).
 UPDATE_RESETTABLE = ("supervisor_model", "supervisor_effort", "pi_model", "pi_thinking",
-                     *HARNESS_FIELDS)
+                     "pi_analyst_model", "pi_analyst_thinking", *HARNESS_FIELDS)
 # Images built with this label carry the settings-file delivery (the research
 # worker/role settings copy strips the model keys; the docker entrypoint merges
 # the create-time choice). A project on an older image keeps the container
@@ -18622,6 +18740,14 @@ def project_agents(req: ProjectAgentsRequest, _progress=None) -> dict:
         out["referee"] = {k: rec[k] if isinstance(rec.get(k), str)
                           and model_catalog.ALIAS_RE.match(rec[k]) else ""
                           for k in ("model", "effort")}
+        # The helper roles' recorded pairs (what the next helper launched
+        # runs; "" = the session's model, pi's default for pi's analyst).
+        pairs = _harness_helper_pairs(data)
+        for ctype in HELPER_MODEL_TYPES:
+            out[ctype] = {k: pairs.get(f"RS_HARNESS_{ctype.upper()}_{k.upper()}", "")
+                          for k in ("model", "effort")}
+        out["pi_analyst"] = {"model": pairs.get("RS_HARNESS_PI_ANALYST_MODEL", ""),
+                             "thinking": pairs.get("RS_HARNESS_PI_ANALYST_THINKING", "")}
     if research:
         out["research_models"] = {t: {"model": (models.get(t) or {}).get("model", ""),
                                       "effort": (models.get(t) or {}).get("effort", "")}
@@ -18908,6 +19034,30 @@ def _apply_model_changes(workspace_path: "Path",
         merged[ctype] = pair
     _write_models(workspace_path, merged)
     return dropped
+
+
+def _apply_pi_analyst_change(workspace_path: "Path", req: "UpdateRequest") -> None:
+    """Merge the request's pi analyst pair into the record's
+    `pi_models.analyst`, the shape of `pi_models.agent`: a reset half goes
+    back to pi's default, and a pair with neither half is removed (the
+    analyst then runs pi's default model, with no `model:` line)."""
+    reset = set(req.reset)
+
+    def mutate(d: dict) -> None:
+        blk = dict(d.get("pi_models")) if isinstance(d.get("pi_models"), dict) else {}
+        old = dict(blk.get("analyst")) if isinstance(blk.get("analyst"), dict) else {}
+        m = req.pi_analyst_model or ("" if "pi_analyst_model" in reset else old.get("model", ""))
+        t = req.pi_analyst_thinking or ("" if "pi_analyst_thinking" in reset
+                                        else old.get("thinking", ""))
+        if m or t:
+            blk["analyst"] = {"model": m, "thinking": t}
+        else:
+            blk.pop("analyst", None)
+        if blk:
+            d["pi_models"] = blk
+        else:
+            d.pop("pi_models", None)
+    _marker_rmw(workspace_path, mutate, "change the analyst's model")
 
 
 def _restart_role_mcps_for_models(project: str, cfg: "Config",

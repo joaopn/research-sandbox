@@ -21,7 +21,8 @@ Two data files, two jobs:
     run, and ``rscore.model_default_set`` is the sanctioned override writer (the
     Management-page control). The ``referee`` type (a finding's independent
     referee in a researcher-subagents project) is frozen into the marker of
-    those projects only, and changed there per project.
+    those projects only, and changed there per project; so are ``analyst`` and
+    ``surveyor`` (that project's Claude helper roles).
 
 `load_defaults()` READS AND VALIDATES (mirroring `box_catalog.load_registry`) — it
 is not a bare merge. That matters because the resolved pairs are frozen into a
@@ -63,8 +64,12 @@ OVERRIDE_PATH = OVERRIDE_DIR / "model-defaults.json"
 # `rs-memory referee` starts on a finding in a researcher-subagents project: it
 # is frozen into the marker of THOSE projects only (models.referee, read by
 # rs-memory inside the container) and overridden per project in its ⚙ Agents
-# box; its default here is what the next such project starts with.
-TYPES = ("supervisor", "worker", "role", "box", "reviewer", "referee")
+# box; its default here is what the next such project starts with. `analyst`
+# and `surveyor` are the same kind of type for the helper roles Claude launches
+# in those projects (the kit's installer writes the recorded pair into each
+# helper's definition).
+TYPES = ("supervisor", "worker", "role", "box", "reviewer", "referee",
+         "analyst", "surveyor")
 
 ALIAS_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 

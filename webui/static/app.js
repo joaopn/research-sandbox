@@ -7182,6 +7182,12 @@ async function appendInfraSection(view) {
     const refereeRow = el("div", { class: "mgmt-row mgmt-infra-row" }, [
         el("span", { class: "mgmt-loading" }, ["…"]),
     ]);
+    const analystRow = el("div", { class: "mgmt-row mgmt-infra-row" }, [
+        el("span", { class: "mgmt-loading" }, ["…"]),
+    ]);
+    const surveyorRow = el("div", { class: "mgmt-row mgmt-infra-row" }, [
+        el("span", { class: "mgmt-loading" }, ["…"]),
+    ]);
     view.appendChild(el("div", { class: "mgmt-infra" }, [
         el("h3", { class: "mgmt-infra-title" }, ["Shared services"]),
         el("div", { class: "mgmt-infra-sub" }, ["Development"]),
@@ -7194,9 +7200,23 @@ async function appendInfraSection(view) {
             "The referee checks a finding in a researcher-subagents project before you " +
             "accept it. A new project of that type starts with this model; change an " +
             "existing one in its ⚙ Agents box."]),
+        el("div", { class: "mgmt-infra-sub" }, ["Analyst"]),
+        analystRow,
+        el("div", { class: "hint" }, [
+            "The analyst carries out one analysis for the agent of a researcher-subagents " +
+            "project, in parallel with others. The default for new projects of that type; " +
+            "change an existing one in its ⚙ Agents box."]),
+        el("div", { class: "mgmt-infra-sub" }, ["Surveyor"]),
+        surveyorRow,
+        el("div", { class: "hint" }, [
+            "The surveyor answers one question from the web for the agent of a " +
+            "researcher-subagents project. The default for new projects of that type; " +
+            "change an existing one in its ⚙ Agents box."]),
     ]));
     appendDefaultModelRow(view, reviewerRow, "reviewer", "Review model");   // async, own fetch path
     appendDefaultModelRow(view, refereeRow, "referee", "Referee model");
+    appendDefaultModelRow(view, analystRow, "analyst", "Analyst model");
+    appendDefaultModelRow(view, surveyorRow, "surveyor", "Surveyor model");
     let g = null;
     try {
         const res = await fetch("/broker/dev");
@@ -13821,6 +13841,18 @@ function agentsBoxContent(name, d, cat, staged) {
             (referee.model ? referee.model + (referee.effort ? ", " + referee.effort : "") : "not set") +
             ". The next referee run uses a change.", { unchanged: true })
         : null;
+    // Its helper roles under Claude: the analyst and the surveyor. A change
+    // rewrites their definitions, so the next one launched uses it; nothing
+    // is restarted. "" = the session's own model (a project from before).
+    const pairText = (p, none) => (p && p.model)
+        ? p.model + (p.effort ? ", " + p.effort : "") : none;
+    const helperPickers = referee && cat
+        ? [["analyst", "Analyst", "Carries out one analysis, in parallel with others."],
+           ["surveyor", "Surveyor", "Answers one question from the web."]].map(([ct, title, what]) =>
+            [ct, modelPicker(cat, ct, title,
+                what + " Now: " + pairText(d[ct], "the agent's own model") +
+                ". The next one launched uses a change.", { unchanged: true })])
+        : [];
     const claudeNotes = [];
     if (claudeInit.unrecognised) {
         claudeNotes.push("Claude's settings hold a value RS does not recognise; it is shown empty.");
@@ -13865,6 +13897,7 @@ function agentsBoxContent(name, d, cat, staged) {
         claudeRows.node,
         ...researchPickers.map(([, p]) => p.node),
         refereePicker ? refereePicker.node : null,
+        ...helperPickers.map(([, p]) => p.node),
     ]);
     // ---- pi's tab ----
     const piInit = d.pi || { model: "", thinking: "" };
@@ -13880,6 +13913,30 @@ function agentsBoxContent(name, d, cat, staged) {
     piModelI.addEventListener("input", () => { piTouched = true; });
     piThinkS.addEventListener("change", () => { piTouched = true; });
     const piRows = harnessPiRows(harness);
+    // pi's analyst (a researcher-subagents project; pi has no surveyor): its
+    // own model and thinking level, empty = pi's default.
+    const piAnalystInit = d.pi_analyst || { model: "", thinking: "" };
+    const piAnalystModelI = el("input", { type: "text", autocomplete: "off", spellcheck: "false",
+                                          placeholder: "provider/model (empty: pi's default)" });
+    piAnalystModelI.value = piAnalystInit.model || "";
+    const piAnalystThinkS = el("select", {}, [
+        el("option", { value: "" }, ["pi's default"]),
+        ...HARNESS_PI_THINKING.map((lv) => el("option", { value: lv }, [lv])),
+    ]);
+    piAnalystThinkS.value = HARNESS_PI_THINKING.includes(piAnalystInit.thinking)
+        ? piAnalystInit.thinking : "";
+    const piAnalystNode = referee ? el("div", { class: "field" }, [
+        el("label", {}, ["Analyst"]),
+        el("div", { class: "model-row agent-pi-row" }, [
+            el("div", { class: "model-cell agent-pi-model" }, [
+                el("span", { class: "model-cap" }, ["model"]), piAnalystModelI]),
+            el("div", { class: "model-cell" }, [
+                el("span", { class: "model-cap" }, ["thinking"]), piAnalystThinkS]),
+        ]),
+        el("div", { class: "hint" }, [
+            "Carries out one analysis, in parallel with others. Empty: pi's default model " +
+            "and thinking level. The next one launched uses a change."]),
+    ]) : null;
     const piPanel = el("div", { class: "agent-tab-panel" }, [
         el("div", { class: "field" }, [
             el("label", {}, ["Agent"]),
@@ -13899,6 +13956,7 @@ function agentsBoxContent(name, d, cat, staged) {
         referee ? el("div", { class: "hint" }, [
             "pi's referee, which checks a finding before you accept it, runs this model.",
         ]) : null,
+        piAnalystNode,
         piRows.node,
     ]);
     const panels = { claude: claudePanel, pi: piPanel };
@@ -13936,7 +13994,10 @@ function agentsBoxContent(name, d, cat, staged) {
     const applyMsg = el("div", { class: "config-empty" });
     apply.onclick = () => { applyMsg.textContent = agentsBoxApply(name, d, {
         on, local, isDind, isResearch, harness, sw, tp, claudeRows, piRows, researchPickers,
-        refereePicker,
+        refereePicker, helperPickers,
+        piAnalyst: piAnalystNode ? { model: () => piAnalystModelI.value.trim(),
+                                     thinking: () => piAnalystThinkS.value,
+                                     init: piAnalystInit } : null,
         claude: { model: () => claudeModelI.value.trim(), effort: () => claudeEffortS.value,
                   init: claudeInit },
         pi: { model: () => piModelI.value.trim(), thinking: () => piThinkS.value,
@@ -14239,7 +14300,7 @@ function agentsBoxApply(name, d, f) {
     const setOrReset = (field, now, was, line) => {
         if (now === was) return;
         if (now) payload[field] = now; else reset.push(field);
-        lines.push(line);
+        if (line) lines.push(line);
     };
     const restartNote = d.running ? " — restarts the project container" : "";
     if (f.isDind) {
@@ -14328,8 +14389,36 @@ function agentsBoxApply(name, d, f) {
             lines.push("Referee's model: the next referee run uses it; nothing is restarted.");
         }
     }
+    if (f.helperPickers && f.on.has("claude")) {
+        f.helperPickers.forEach(([ct, p]) => {
+            const v = p.value();
+            if (v.model) payload[ct + "_model"] = v.model;
+            if (v.effort) payload[ct + "_effort"] = v.effort;
+            if (v.model || v.effort) {
+                lines.push((ct === "analyst" ? "Analyst" : "Surveyor") + "'s model: the next one " +
+                           "launched uses it; nothing is restarted.");
+            }
+        });
+    }
+    if (f.piAnalyst && f.on.has("pi")) {
+        const am = f.piAnalyst.model(), at = f.piAnalyst.thinking();
+        const wasM = f.piAnalyst.init.model || "", wasT = f.piAnalyst.init.thinking || "";
+        if (am !== wasM || at !== wasT) {
+            setOrReset("pi_analyst_model", am, wasM, null);
+            setOrReset("pi_analyst_thinking", at, wasT, null);
+            lines.push(`pi's Analyst: ${am || "pi's default model"}, thinking ` +
+                       `${at || "pi's default"}; the next one launched uses it, nothing is restarted.`);
+        }
+    }
     if (reset.length) payload.reset = reset;
     if (!lines.length) return "Nothing to change.";
+    // The referee's and the helpers' models reach a running session too (its
+    // next helper or referee reads the new definition): only a change made of
+    // those alone gets the hint that says so, every other change keeps the
+    // restart hint.
+    const LIVE_FIELDS = /^(referee|analyst|surveyor|pi_analyst)_/;
+    const liveOnly = Object.keys(payload).every((k) => LIVE_FIELDS.test(k) ||
+        (k === "reset" && payload.reset.every((r) => LIVE_FIELDS.test(r))));
     const validate = () => {
         const cm = payload.supervisor_model;
         if (cm && !AGENTS_BOX_CLAUDE_MODEL.test(cm)) {
@@ -14337,6 +14426,10 @@ function agentsBoxApply(name, d, f) {
         }
         if (payload.pi_model && !HARNESS_PI_MODEL_PATTERN.test(payload.pi_model)) {
             return "Write pi's model as provider/model, e.g. openrouter/anthropic/claude-opus-latest.";
+        }
+        if (payload.pi_analyst_model && !HARNESS_PI_MODEL_PATTERN.test(payload.pi_analyst_model)) {
+            return "Write pi's Analyst model as provider/model, e.g. " +
+                   "openrouter/anthropic/claude-opus-latest.";
         }
         if (f.sw && harnessModeRoles(f.sw.value()).length && f.on.has("pi")) {
             const bad = f.piRows.invalid();
@@ -14359,7 +14452,10 @@ function agentsBoxApply(name, d, f) {
         body: [
             el("ul", {}, lines.map((t) => el("li", {}, [t]))),
             el("div", { class: "hint" }, [
-                d.running
+                liveOnly
+                    ? "The next helper or referee launched uses the new model, in a session " +
+                      "running now too; nothing is restarted."
+                    : d.running
                     ? "Each agent's next session uses its new settings; a session running now " +
                       "keeps them until it is restarted (switch the working mode in a running " +
                       "session with /rs-mode, or /skill:rs-mode in pi" +

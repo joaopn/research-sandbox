@@ -53,6 +53,14 @@
 #   RS_HARNESS_SUBAGENTS              1: also write the analyst and surveyor
 #                                     helper roles (the project's record asks
 #                                     for them); anything else: neither
+#   RS_HARNESS_ANALYST_MODEL          Claude tier for the analyst (empty: the session's)
+#   RS_HARNESS_ANALYST_EFFORT         Claude effort level for the analyst (empty: none)
+#   RS_HARNESS_SURVEYOR_MODEL         Claude tier for the surveyor
+#   RS_HARNESS_SURVEYOR_EFFORT        Claude effort level for the surveyor
+#   RS_HARNESS_PI_ANALYST_MODEL       pi provider/model for pi's analyst (empty: pi's default)
+#   RS_HARNESS_PI_ANALYST_THINKING    pi thinking level for pi's analyst
+#                                     (these six: the project's record, read
+#                                     with RS_HARNESS_SUBAGENTS only)
 #   RS_HARNESS_ANALYST_MCP            the MCP servers the project's own agents
 #                                     are wired to (space separated), which pi's
 #                                     analyst names (pi gives a child no MCP
@@ -138,8 +146,9 @@ PI_ANALYST_TIMEOUT_MS=2147483647
 PI_ANALYST_BUILTINS="read, bash, edit, write"
 ROLES_DIR="$HOME/.claude/rs/roles"
 
-# The charsets the host validates (rscore: the model catalog's aliases, PI_MODEL_RE,
-# PI_THINKING_LEVELS). `case` patterns, so a value can never smuggle a newline.
+# The charsets the host validates (rscore: the model catalog's aliases and
+# effort levels, PI_MODEL_RE, PI_THINKING_LEVELS). `case` patterns, so a value
+# can never smuggle a newline.
 # The values are written double-quoted into the frontmatter (YAML 1.1 readers
 # take a bare `off` as false); none of these charsets admits a quote or a
 # backslash, so the quoting cannot be broken out of.
@@ -155,6 +164,11 @@ pi_model_ok() {
 }
 pi_thinking_ok() {
     case "$1" in off|minimal|low|medium|high|xhigh|max) return 0 ;; esac
+    return 1
+}
+# MIRROR of the model catalog's effort levels (models/catalog.json `efforts`).
+claude_effort_ok() {
+    case "$1" in low|medium|high|xhigh|max) return 0 ;; esac
     return 1
 }
 
@@ -207,6 +221,14 @@ PI_CHECKER_THINKING=$(checked RS_HARNESS_PI_CHECKER_THINKING "${RS_HARNESS_PI_CH
 # them (a box, and every other project, never gets them).
 SUBAGENTS=0
 [ "${RS_HARNESS_SUBAGENTS:-}" = 1 ] && SUBAGENTS=1
+# Their models (the project's record; unset: the analyst and surveyor keep the
+# session's model, pi's analyst pi's default).
+ANALYST_MODEL=$(checked RS_HARNESS_ANALYST_MODEL "${RS_HARNESS_ANALYST_MODEL:-}" claude_tier_ok)
+ANALYST_EFFORT=$(checked RS_HARNESS_ANALYST_EFFORT "${RS_HARNESS_ANALYST_EFFORT:-}" claude_effort_ok)
+SURVEYOR_MODEL=$(checked RS_HARNESS_SURVEYOR_MODEL "${RS_HARNESS_SURVEYOR_MODEL:-}" claude_tier_ok)
+SURVEYOR_EFFORT=$(checked RS_HARNESS_SURVEYOR_EFFORT "${RS_HARNESS_SURVEYOR_EFFORT:-}" claude_effort_ok)
+PI_ANALYST_MODEL=$(checked RS_HARNESS_PI_ANALYST_MODEL "${RS_HARNESS_PI_ANALYST_MODEL:-}" pi_model_ok)
+PI_ANALYST_THINKING=$(checked RS_HARNESS_PI_ANALYST_THINKING "${RS_HARNESS_PI_ANALYST_THINKING:-}" pi_thinking_ok)
 # The servers pi's analyst names, each re-checked against the server-name
 # charset the host validates (MIRROR of mcp_servers.NAME_RE: a lowercase
 # letter, then lowercase letters, digits and hyphens).
@@ -335,8 +357,9 @@ if [ "$HAS_CLAUDE" = 1 ]; then
         # servers included, which a fixed list would drop) except the one
         # that launches a subagent: an analyst does not delegate further.
         {
-            printf '%s\n' '---' 'name: analyst' "description: $ANALYST_DESC" 'model: "inherit"' \
-                'disallowedTools: Agent'
+            printf '%s\n' '---' 'name: analyst' "description: $ANALYST_DESC" "model: \"${ANALYST_MODEL:-inherit}\""
+            [ -z "$ANALYST_EFFORT" ] || printf '%s\n' "effort: \"$ANALYST_EFFORT\""
+            printf '%s\n' 'disallowedTools: Agent'
             lean_lines analyst
             printf '%s\n' '---' ''
             cat "$SRC/agents/analyst.md"
@@ -344,8 +367,9 @@ if [ "$HAS_CLAUDE" = 1 ]; then
         # The surveyor has Claude's own web search and page fetch and nothing
         # else (no shell, no files), and always runs in the background.
         {
-            printf '%s\n' '---' 'name: surveyor' "description: $SURVEYOR_DESC" 'model: "inherit"' \
-                'tools: WebSearch, WebFetch' 'background: true'
+            printf '%s\n' '---' 'name: surveyor' "description: $SURVEYOR_DESC" "model: \"${SURVEYOR_MODEL:-inherit}\""
+            [ -z "$SURVEYOR_EFFORT" ] || printf '%s\n' "effort: \"$SURVEYOR_EFFORT\""
+            printf '%s\n' 'tools: WebSearch, WebFetch' 'background: true'
             lean_lines surveyor
             printf '%s\n' '---' ''
             cat "$SRC/agents/surveyor.md"
@@ -384,6 +408,8 @@ if [ "$HAS_PI" = 1 ]; then
             printf '%s\n' '---' 'name: analyst' "description: $ANALYST_DESC" 'inheritProjectContext: true' \
                 'acceptanceRole: writer' 'async: true' "timeoutMs: $PI_ANALYST_TIMEOUT_MS"
             [ -z "$ANALYST_MCP" ] || printf '%s\n' "tools: $PI_ANALYST_BUILTINS$ANALYST_MCP"
+            [ -z "$PI_ANALYST_MODEL" ] || printf '%s\n' "model: \"$PI_ANALYST_MODEL\""
+            [ -z "$PI_ANALYST_THINKING" ] || printf '%s\n' "thinking: \"$PI_ANALYST_THINKING\""
             printf '%s\n' '---' ''
             cat "$SRC/agents/analyst.md"
         } | put "$PI_DIR/agents/analyst.md" || FAILED=1

@@ -504,7 +504,7 @@ def _verb_mcp_gateway_start(_args: dict, progress=None) -> dict:
 def _verb_model_default_set(args: dict, _progress=None) -> dict:
     """Write (or clear) one container type's default (model, effort) pair in
     the operator's untracked model-defaults override — the write half of
-    `models` (the Sandboxes → Infrastructure → Reviewer and Referee
+    `models` (the Sandboxes → Infrastructure → Reviewer, Referee, Analyst and Surveyor
     controls). Token-gated
     (NOT in OPEN_VERBS); inline is fine — a sub-ms validated file write, no
     docker, no network. The request layer + verb map every catalog/OS error
@@ -867,6 +867,12 @@ UPDATE_WEBUI_FIELDS = frozenset({
     # project's record, which rs-memory reads inside the container; refused in
     # update() on any other project. No container is touched.
     "referee_model", "referee_effort",
+    # The helper roles' pairs (the same box, the same project type): catalog
+    # tokens and a pi provider/model id written into the project's record,
+    # which the kit's installer reads inside the container; refused in
+    # update() on any other project. No container is restarted.
+    "analyst_model", "analyst_effort", "surveyor_model", "surveyor_effort",
+    "pi_analyst_model", "pi_analyst_thinking",
     # The project's agent SET (STAGE_PI_AGENT): applied live on sandbox-dind
     # for an add; a removal (I33 slice 3) restarts the project; an enum list,
     # validated in from_kwargs, removal rules in update().
@@ -1263,8 +1269,8 @@ DEV_PASSWD_WEBUI_FIELDS = frozenset({"password"})
 # can steer where the artifact is written.
 DEV_BOARD_EXPORT_WEBUI_FIELDS = frozenset({"passphrase"})
 # Set/clear one container type's model+effort default in the operator's
-# untracked override file (the Sandboxes → Infrastructure → Reviewer and
-# Referee controls). Name-shaped catalog tokens + a bool only — nothing host-shaped;
+# untracked override file (the Sandboxes → Infrastructure → Reviewer,
+# Referee, Analyst and Surveyor controls). Name-shaped catalog tokens + a bool only — nothing host-shaped;
 # the contract is full-pair-or-clear (no partial writes).
 MODEL_DEFAULT_WEBUI_FIELDS = frozenset({"type", "model", "effort", "clear"})
 # Save the project task cap or put it back to the default (the Sandboxes →
