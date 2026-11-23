@@ -37,13 +37,13 @@ An analyst gets only its brief, not this conversation or the memory. A brief car
 - the question, and what counts as an answer;
 - the data paths (and what you already know about the data);
 - where its results go (a folder of its own under `/workspace`);
-- that it reports the command that reproduces its result (the one you will stage with `--rerun`).
+- that it reports the command that reproduces its result (the one you will stage with `--rerun`), and that command's rules: it writes its outputs only into the folder `$RS_RERUN_OUT`, and its evidence files are byte-identical whenever the result is the same.
 
 To launch analysts in parallel:
 - **Claude Code:** several `Agent` calls with `subagent_type: analyst` in one turn. They run in the background; each one's result arrives when it ends.
 - **pi:** one `subagent` call per step with `agent: analyst`; launch the next in the following step. Each runs in the background and its result arrives on its own.
 
-Go on with the PI meanwhile. An analyst's results land as files with a short report. Read them, write what matters into the memory (a `note`, a `claim` with the files as evidence), and check what it claims before you stage it.
+Go on with the PI meanwhile. An analyst's results land as files with a short report. Read them, write what matters into the memory (a `note`, a `claim` with the files as evidence), and check what it claims before you stage it. Check its reproduce command against those rules before you stage the finding: outputs only into `$RS_RERUN_OUT`, and no timings, timestamps, host names or unordered rows in an evidence file.
 
 ## The web
 
@@ -53,4 +53,8 @@ Look up a single fact (a function's signature, a dataset's page) yourself. A sur
 
 ## Software
 
-The image carries Python and the usual command-line tools, and little else. Install what an analysis needs into an environment under `/workspace` (`python -m venv /workspace/envs/<name>` or `conda create -p /workspace/envs/<name>`), never into `/opt/conda` or with `pip install --user`: only `/workspace` survives a restart. Note in the journal what you installed and why, so a later session reuses the environment.
+The image carries Python and the usual command-line tools, and little else. Install what an analysis needs into an environment under `/workspace` (`python -m venv /workspace/envs/<name>` or `conda create -p /workspace/envs/<name>`), never into `/opt/conda` or with `pip install --user`: only `/workspace` survives a restart.
+
+<!-- rs-part: session -->
+
+Note in the journal what you installed and why, so a later session reuses the environment.
