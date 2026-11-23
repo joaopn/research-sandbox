@@ -16,18 +16,30 @@ Everything lives under /workspace/memory/ (RS_MEMORY_DIR overrides it):
   skills.log                    one line per skill event
   consolidated                  the last journal entry a consolidation covered
   runs/                         consolidation runs: brief, delta, log
+  checks/<id>/<n>/              a finding's checks, in a researcher-subagents
+                                project only: a re-run (rerun/, rerun.md) or a
+                                referee run (snapshot/, verdict.md); never
+                                deleted, the audit trail
 
 Verbs:
   open [--hook]                 what to read at the start of a session
   note HEADLINE --kind K [--body TEXT]
   checkpoint ITEM...            replace the "In flight" part of the front page
   claim STATEMENT --scope S --evidence FILE... [--hedge H] [relations] [--topic T]
-  accept ID...  /  strike ID... --reason R
+        [--rerun CMD | --no-rerun REASON]
+  rerun-command ID (--rerun CMD | --no-rerun REASON)
+  rerun ID  /  referee ID [--agent claude|pi]
+  accept ID... [--over-objection]  /  strike ID... --reason R
   view [ID | --topic T]         the state of knowledge, computed at every call
   recall WORD... [--body]
   skill propose|used|promote|retire|sync|list
   consolidate --prompt [--out FILE]  /  consolidate --apply DELTA
   close [--hook] [--agent claude|pi]
+
+The checks (--rerun, rerun-command, rerun, referee, --over-objection and
+accept's conditions on a finding) exist only in a project whose record,
+/workspace/.orchestrator/project.json, says "subagents": true; anywhere else
+every verb behaves as it always has.
 
 It never deletes anything under the memory folder: a struck claim moves to
 struck/, an old front page to front/. Ids and the front page are written under
@@ -53,6 +65,30 @@ from pathlib import Path
 # ----------------------------------------------------------------- constants
 DEFAULT_DIR = "/workspace/memory"
 GUARD = "RS_MEMORY_CONSOLIDATING"
+# The referee run's guard, stricter than GUARD: under it every verb that
+# writes refuses, consolidate included (a consolidation run needs consolidate
+# --apply; a referee writes nothing). The referee gets both.
+STRICT_GUARD = "RS_MEMORY_REFEREEING"
+# The project record's key that turns the finding checks on.
+CHECKS_KEY = "subagents"
+# What a fresh process drops from the session's environment, as the
+# consolidation run does: the child is no part of the agent's session.
+SESSION_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "PI_SESSION_ID", "PI_SESSION_FILE")
+VERDICTS = ("supported", "overreaches", "unsupported")
+OBJECTIONS = ("overreaches", "unsupported")
+VERDICT_RE = re.compile(r"\AVERDICT: (supported|overreaches|unsupported)\Z")
+NARROWER_MARK = "Narrower claim:"
+# The referee's instruction ships beside this command (the PATH link resolved).
+REFEREE_FILE = Path(os.path.realpath(__file__)).parent / "rs-memory-referee.md"
+REFEREE_SYSTEM = ("You are an independent research referee. Use only the file-reading "
+                  "tools you are given, and answer in plain text.")
+# Read-only tools only: the referee reads its snapshot folder and answers.
+CLAUDE_REFEREE_TOOLS = "Read,Grep,Glob"
+PI_REFEREE_TOOLS = "read,grep,find,ls"
+# Fields written as given, never folded onto one line by spaces: a shell
+# command's spacing can matter (a command holding a newline is refused).
+# "rerun" is the claim's command, "command" the one a re-run check ran.
+RAW_FIELDS = ("rerun", "command")
 # Claude Code adds a SessionStart hook's output to the context only up to this
 # many characters (its documented hook-output limit); `open --hook` stays under
 # it and says how to read the rest.
@@ -117,7 +153,51 @@ def now() -> str:
 
 
 def under_guard() -> bool:
-    return os.environ.get(GUARD) == "1"
+    return os.environ.get(GUARD) == "1" or under_strict_guard()
+
+
+def under_strict_guard() -> bool:
+    return os.environ.get(STRICT_GUARD) == "1"
+
+
+def workspace() -> Path:
+    """The project's workspace: the memory folder lives directly in it."""
+    return mem_dir().parent
+
+
+def record_path() -> Path:
+    return workspace() / ".orchestrator" / "project.json"
+
+
+def project_record() -> dict:
+    """RS's record of this project; {} when there is none (outside a project)."""
+    p = record_path()
+    try:
+        text = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as e:
+        raise Refused(f"cannot read the project's record {p} ({e.strerror}), so rs-memory "
+                      "cannot tell whether a finding's checks apply; tell the PI")
+    try:
+        data = json.loads(text)
+    except (ValueError, RecursionError):
+        raise Refused(f"the project's record {p} is not JSON, so rs-memory cannot tell "
+                      "whether a finding's checks apply; tell the PI")
+    if not isinstance(data, dict):
+        raise Refused(f"the project's record {p} is not a JSON object, so rs-memory cannot "
+                      "tell whether a finding's checks apply; tell the PI")
+    return data
+
+
+def checks_on() -> bool:
+    return project_record().get(CHECKS_KEY) is True
+
+
+def require_checks(what: str) -> None:
+    if not checks_on():
+        raise Refused(f"{what} is for researcher-subagents projects only: this project's "
+                      f"record ({record_path()}) does not say \"{CHECKS_KEY}\": true")
 
 
 def ensure_layout() -> Path:
@@ -215,7 +295,7 @@ def one(meta: dict, key: str, default: str = "") -> str:
 def render_entry(ident: str, headline: str, fields: "list[tuple[str, str]]", body: str) -> str:
     out = [f"# {ident} — {single_line(headline)}"]
     for k, v in fields:
-        out.append(f"{k}: {single_line(v)}")
+        out.append(f"{k}: {v.strip() if k in RAW_FIELDS else single_line(v)}")
     out.append("")
     if body.strip():
         out.append(body.strip())
@@ -424,6 +504,9 @@ def skill_homes() -> "list[Path]":
 def refuse_under_guard(verb: str) -> None:
     """A consolidation run writes only through consolidate --apply: the session
     owns the journal, the In-flight part, the PI's accepts and the skills."""
+    if under_strict_guard():
+        raise Refused(f"a referee run does not {verb}: it writes nothing, it reads its "
+                      "folder and answers")
     if under_guard():
         raise Refused(f"a consolidation run does not {verb}; write the delta and run "
                       "rs-memory consolidate --apply")
@@ -488,13 +571,15 @@ def validate_claim(statement: str, scope: str, evidence: "list[str]",
 
 def write_claim(prefix: str, statement: str, scope: str, hedge: str,
                 evidence: "list[tuple[str, str]]", relations: "dict[str, list[str]]",
-                topics: "list[str]") -> str:
+                topics: "list[str]", rerun: "tuple[str, str] | None" = None) -> str:
     ident = next_claim_id(prefix)
     fields = [("kind", {"F": "finding", "Q": "question", "R": "retraction"}[prefix]),
               ("scope", scope), ("hedge", hedge or "(none stated)"),
               ("staged", now()), ("session", session_label())]
     for path, digest in evidence:
         fields.append(("evidence", f"{path} sha256={digest}"))
+    if rerun:
+        fields.append(rerun)
     for rel in RELATIONS:
         for i in relations.get(rel, []):
             fields.append((rel, i))
@@ -509,17 +594,50 @@ def _relations_from(a) -> "dict[str, list[str]]":
     return {r: list(getattr(a, r.replace("-", "_")) or []) for r in RELATIONS}
 
 
+def rerun_field(a) -> "tuple[str, str] | None":
+    """The finding's re-run command or the reason it has none, checked."""
+    if a.rerun is not None:
+        cmd = a.rerun.strip()
+        if not cmd:
+            raise Refused("--rerun needs the command that reproduces the finding")
+        if "\n" in cmd or "\r" in cmd:
+            raise Refused("--rerun is one line; put a longer command in a script and "
+                          "give the line that runs it")
+        return ("rerun", cmd)
+    if a.no_rerun is not None:
+        reason = single_line(a.no_rerun)
+        if not reason:
+            raise Refused("--no-rerun needs the reason the finding cannot be re-run")
+        return ("no-rerun", reason)
+    return None
+
+
 def cmd_claim(a) -> None:
     refuse_under_guard("stage claims outside its delta")
     prefix = _claim_prefix(a)
     rels = _relations_from(a)
+    rerun = None
+    if a.rerun is not None or a.no_rerun is not None:
+        require_checks("--rerun and --no-rerun")
+        if prefix != "F":
+            raise Refused("only a finding has a re-run command; drop --rerun / --no-rerun")
+        rerun = rerun_field(a)
+    elif prefix == "F" and checks_on():
+        raise Refused("a finding here needs --rerun CMD, the command that reproduces it "
+                      "(it writes its outputs into the folder $RS_RERUN_OUT), or "
+                      "--no-rerun REASON, why it cannot be re-run")
     with Lock():
         known = set(claim_files())
         ev = validate_claim(a.statement, a.scope or "", a.evidence or [], rels, prefix, known)
         ident = write_claim(prefix, a.statement, a.scope or "", a.hedge or "", ev,
-                            rels, [single_line(t) for t in (a.topic or []) if t.strip()])
+                            rels, [single_line(t) for t in (a.topic or []) if t.strip()],
+                            rerun)
     print(f"{ident} staged. It enters the record when the PI accepts it "
           f"(they say \"accept {ident}\", you run rs-memory accept {ident}).")
+    if rerun:
+        print(f"Before the PI can accept it, it needs its checks: "
+              + (f"rs-memory rerun {ident} (the re-run) and " if rerun[0] == "rerun" else "")
+              + f"rs-memory referee {ident} (the referee's verdict).")
 
 
 def _evidence_changed(meta: dict) -> "str | None":
@@ -537,6 +655,9 @@ def _evidence_changed(meta: dict) -> "str | None":
 def cmd_accept(a) -> None:
     refuse_under_guard("accept claims (only the PI does)")
     a.ids = list(dict.fromkeys(a.ids))
+    checks = checks_on()
+    if a.over_objection and not checks:
+        require_checks("--over-objection")
     with Lock():
         files = claim_files()
         metas = []
@@ -550,16 +671,32 @@ def cmd_accept(a) -> None:
             if changed:
                 raise Refused(f"{ident}: its evidence {changed} changed since it was staged; "
                               "check the finding still holds and stage it again with rs-memory claim")
-            metas.append((ident, path))
+            # A finding's two checks, in a project that has them.
+            extra = accept_checks(ident, meta, a.over_objection) \
+                if checks and ident.startswith("F-") else None
+            metas.append((ident, path, extra))
         stamp = now()
-        for ident, path in metas:
+        objected = []
+        for ident, path, extra in metas:
             dest = mem_dir() / "record" / f"{ident}.md"
             os.replace(path, dest)                      # a move: the staged file IS the record
             text = dest.read_text(encoding="utf-8")
             head, sep, rest = text.partition("\n\n")
-            write_text(dest, f"{head}\naccepted: {stamp}{sep or chr(10)}{rest}", mode=0o444)
-        j = add_journal("accepted " + " ".join(i for i, _ in metas), "accept")
-    print(f"Accepted into the record: {' '.join(i for i, _ in metas)} ({j}).")
+            if extra is None:
+                write_text(dest, f"{head}\naccepted: {stamp}{sep or chr(10)}{rest}", mode=0o444)
+                continue
+            fields, objection = extra
+            head = head.rstrip("\n") + f"\naccepted: {stamp}" + "".join(
+                f"\n{k}: {single_line(v)}" for k, v in fields)
+            body = "\n\n".join(x for x in (rest.strip(), objection.strip()) if x)
+            write_text(dest, head + "\n" + (f"\n{body}\n" if body else ""), mode=0o444)
+            if objection.strip():
+                objected.append(ident)
+        j = add_journal("accepted " + " ".join(i for i, _p, _e in metas), "accept",
+                        ("over the referee's objection: " + " ".join(objected)) if objected else "")
+    print(f"Accepted into the record: {' '.join(i for i, _p, _e in metas)} ({j}).")
+    if objected:
+        print(f"Accepted over the referee's objection, which stays on the entry: {' '.join(objected)}.")
 
 
 def cmd_strike(a) -> None:
@@ -576,6 +713,624 @@ def cmd_strike(a) -> None:
             os.replace(files[ident][1], mem_dir() / "struck" / f"{ident}.md")
         j = add_journal("struck " + " ".join(a.ids), "strike", a.reason)
     print(f"Struck: {' '.join(a.ids)} ({j}).")
+
+
+# -------------------------------------------------------------------- checks
+# A finding's two checks, in a researcher-subagents project only: a re-run of
+# its stated command, and a referee's verdict on its claim and evidence. Each
+# check is a folder checks/<id>/<n>/ of its own, never deleted: check.md
+# (what was started, bound to the claim's and evidence's hashes), pid, a log,
+# and the record the run leaves when it ends (rerun.md or verdict.md).
+def claim_sha(meta: dict) -> str:
+    """The claim as the PI reads it: statement, scope and hedge."""
+    text = json.dumps([meta["headline"], one(meta, "scope"), one(meta, "hedge")],
+                      ensure_ascii=False)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def staged_evidence(meta: dict) -> "list[tuple[str, str]]":
+    out = []
+    for line in meta.get("evidence", []):
+        path, _, digest = line.rpartition(" sha256=")
+        out.append((path, digest))
+    return out
+
+
+def binding_fields(meta: dict) -> "list[tuple[str, str]]":
+    return [("claim-sha256", claim_sha(meta))] + [
+        ("evidence", f"{p} sha256={d}") for p, d in staged_evidence(meta)]
+
+
+def bound_to(info: dict, meta: dict) -> bool:
+    """Whether a check was made on the claim and evidence as staged now."""
+    return (one(info, "claim-sha256") == claim_sha(meta)
+            and info.get("evidence", []) == meta.get("evidence", []))
+
+
+def staged_finding(ident: str) -> "tuple[Path, dict]":
+    where, path = claim_files().get(ident, (None, None))
+    if where != "staged":
+        raise Refused(f"{ident} is not a staged claim "
+                      f"({'already ' + where if where else 'no such claim'})")
+    if not ident.startswith("F-"):
+        raise Refused(f"{ident} is not a finding; only findings (F-) have checks")
+    return path, parse_entry(path)
+
+
+def refuse_changed(ident: str, meta: dict) -> None:
+    changed = _evidence_changed(meta)
+    if changed:
+        raise Refused(f"{ident}: its evidence {changed} changed since it was staged, which voids "
+                      "its checks; check the finding still holds and stage it again with "
+                      "rs-memory claim")
+
+
+def checks_dir(ident: str) -> Path:
+    return mem_dir() / "checks" / ident
+
+
+def new_check(ident: str, kind: str, fields: "list[tuple[str, str]]") -> "tuple[int, Path]":
+    """A fresh numbered folder for one check; the caller holds the lock."""
+    root = checks_dir(ident)
+    root.mkdir(parents=True, exist_ok=True)
+    nums = [int(p.name) for p in root.iterdir() if p.is_dir() and p.name.isdigit()]
+    n = max(nums, default=0) + 1
+    d = root / str(n)
+    d.mkdir()
+    write_text(d / "check.md", render_entry(f"{ident} check {n}", kind,
+                                            [("kind", kind), ("started", now())] + fields, ""))
+    return n, d
+
+
+def child_verb(kind: str) -> str:
+    return "_rerun" if kind == "rerun" else "_referee"
+
+
+def check_live(d: Path, kind: str, ident: str, n: int) -> bool:
+    try:
+        pid = int((d / "pid").read_text().strip())
+        cmd = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except (OSError, ValueError):
+        return False
+    return f"\0{child_verb(kind)}\0{ident}\0{n}\0".encode() in cmd
+
+
+def start_check(ident: str, n: int, d: Path, kind: str, log_name: str) -> Path:
+    """Start the check's run detached, in a session of its own (as close
+    starts a consolidation), and note its pid."""
+    log = d / log_name
+    fd = os.open(str(log), os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o644)
+    me = os.path.realpath(sys.argv[0])
+    try:
+        child = subprocess.Popen([sys.executable, me, child_verb(kind), ident, str(n)],
+                                 stdin=subprocess.DEVNULL, stdout=fd, stderr=fd,
+                                 start_new_session=True, close_fds=True)
+    finally:
+        os.close(fd)
+    write_text(d / "pid", f"{child.pid}\n")
+    return log
+
+
+def check_list(ident: str) -> "list[dict]":
+    """Every check of a claim, oldest first, with its state: done (its record
+    is written), running, or failed (it ended without a record)."""
+    root = checks_dir(ident)
+    if not root.is_dir():
+        return []
+    out = []
+    for n in sorted(int(p.name) for p in root.iterdir() if p.is_dir() and p.name.isdigit()):
+        d = root / str(n)
+        try:
+            info = parse_entry(d / "check.md")
+        except FileNotFoundError:
+            continue
+        kind = one(info, "kind")
+        rec_file = d / ("rerun.md" if kind == "rerun" else "verdict.md")
+        rec = parse_entry(rec_file) if rec_file.is_file() else None
+        if rec is not None:
+            state = "done"
+        elif check_live(d, kind, ident, n):
+            state = "running"
+        else:
+            state = "failed"
+        out.append({"n": n, "dir": d, "kind": kind, "info": info, "rec": rec, "state": state,
+                    "log": d / ("rerun.log" if kind == "rerun" else "referee.log")})
+    return out
+
+
+def accepted_record_text() -> str:
+    """The accepted record as a referee reads it: every entry, with its standing."""
+    rec = record_entries()
+    st = standing(rec)
+    out = ["# The project's accepted record", ""]
+    if not rec:
+        out.append("(nothing accepted yet)")
+    for ident, e in rec.items():
+        out.append(e["path"].read_text(encoding="utf-8").rstrip())
+        out.append(f"standing: {st[ident]}")
+        out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# --------------------------------------------------- checks: state and accept
+def finding_checks(ident: str, meta: dict) -> dict:
+    """What a staged finding's checks say now."""
+    cs = check_list(ident)
+    cmd = one(meta, "rerun")
+    reruns = [c for c in cs if c["kind"] == "rerun"]
+    refs = [c for c in cs if c["kind"] == "referee"]
+    cur_rerun = [c for c in reruns if c["state"] == "done" and bound_to(c["info"], meta)
+                 and one(c["info"], "command") == cmd and cmd]
+    cur_verdicts = [c for c in refs if c["state"] == "done" and bound_to(c["info"], meta)
+                    and one(c["rec"], "verdict") in VERDICTS]
+    return {"reruns": reruns, "refs": refs, "cur_rerun": cur_rerun,
+            "cur_verdicts": cur_verdicts, "command": cmd, "reason": one(meta, "no-rerun"),
+            "changed": _evidence_changed(meta)}
+
+
+def rerun_summary(c: dict) -> str:
+    rec = c["rec"]
+    files = []
+    for line in rec.get("compare", []):
+        path, _, result = line.rpartition(" -> ")
+        files.append(f"{Path(path).name} {result}")
+    return (f"check {c['n']}: exit {one(rec, 'exit')}"
+            + (f"; {', '.join(files)}" if files else ""))
+
+
+def verdict_summary(c: dict) -> str:
+    rec = c["rec"]
+    v = one(rec, "verdict")
+    out = f"check {c['n']}: {v} ({one(rec, 'model')})"
+    if one(rec, "narrower"):
+        out += f"; narrower claim: {one(rec, 'narrower')}"
+    if one(rec, "accepted-sha256") != sha256_text(accepted_record_text()):
+        out += "; the record changed since this verdict"
+    return out
+
+
+def rerun_state_lines(fc: dict) -> "list[str]":
+    if fc["changed"]:
+        return [f"void: its evidence {fc['changed']} changed since it was staged"]
+    out = []
+    if fc["reason"]:
+        out.append(f"none: {fc['reason']}")
+    for c in fc["reruns"]:
+        if c["state"] == "running":
+            out.append(f"check {c['n']}: running since {one(c['info'], 'started')}; "
+                       f"its log is {c['log']}")
+    if fc["cur_rerun"]:
+        out.append(rerun_summary(fc["cur_rerun"][-1]))
+    last = fc["reruns"][-1] if fc["reruns"] else None
+    if last and last["state"] == "failed":
+        out.append(f"check {last['n']} failed: it ended without a record; its log is {last['log']}")
+    if not out:
+        if not fc["command"]:
+            out.append("not run: no re-run command and no reason "
+                       "(rs-memory rerun-command)")
+        elif fc["reruns"]:
+            out.append("not run for its current command")
+        else:
+            out.append("not run")
+    return out
+
+
+def referee_state_lines(fc: dict) -> "list[str]":
+    if fc["changed"]:
+        return [f"void: its evidence {fc['changed']} changed since it was staged"]
+    out = []
+    for c in fc["refs"]:
+        if c["state"] == "running":
+            out.append(f"check {c['n']}: running since {one(c['info'], 'started')}; "
+                       f"its log is {c['log']}")
+    out += [verdict_summary(c) for c in fc["cur_verdicts"]]
+    last = fc["refs"][-1] if fc["refs"] else None
+    if last and last["state"] == "failed":
+        out.append(f"check {last['n']} failed: it ended without a record; its log is {last['log']}")
+    elif last and last["state"] == "done" and one(last["rec"], "verdict") not in VERDICTS:
+        out.append(f"check {last['n']} gave no verdict: {one(last['rec'], 'failed')}; "
+                   f"its log is {last['log']}")
+    if not out:
+        out.append("void: the claim changed since its verdict" if fc["refs"] else "not run")
+    return out
+
+
+def check_lines(ident: str, meta: dict, indent: str) -> "list[str]":
+    fc = finding_checks(ident, meta)
+    out = []
+    for label, lines in (("re-run", rerun_state_lines(fc)), ("referee", referee_state_lines(fc))):
+        for line in lines:
+            out.append(f"{indent}{label}: {line}")
+    return out
+
+
+def accept_checks(ident: str, meta: dict, over: bool) -> "tuple[list, str]":
+    """Refuse a finding whose checks are missing or object (without the PI's
+    --over-objection); else the fields and body its record entry gets."""
+    fc = finding_checks(ident, meta)
+    missing = []
+    if not fc["cur_verdicts"]:
+        missing.append(f"no current referee verdict (none on the claim and evidence as staged; "
+                       f"run rs-memory referee {ident})")
+    if not fc["cur_rerun"] and not fc["reason"]:
+        missing.append(f"no re-run record for its command and no reason it cannot be re-run "
+                       + (f"(run rs-memory rerun {ident})" if fc["command"] else
+                          f"(give one with rs-memory rerun-command {ident} --rerun CMD "
+                          "or --no-rerun REASON)"))
+    if missing:
+        raise Refused(f"{ident} cannot be accepted yet: " + "; ".join(missing))
+    objections = [c for c in fc["cur_verdicts"] if one(c["rec"], "verdict") in OBJECTIONS]
+    if objections and not over:
+        raise Refused(f"{ident}: the referee objects ("
+                      + "; ".join(verdict_summary(c) for c in objections)
+                      + "). Accept it over the objection only when the PI says so: "
+                      f"rs-memory accept {ident} --over-objection")
+    fields = [("referee", verdict_summary(c) + f" [{c['dir'] / 'verdict.md'}]")
+              for c in fc["cur_verdicts"]]
+    if fc["cur_rerun"]:
+        c = fc["cur_rerun"][-1]
+        fields.append(("rerun-check", rerun_summary(c) + f" [{c['dir'] / 'rerun.md'}]"))
+    body = []
+    for c in objections:
+        fields.append(("objection", f"check {c['n']}: {one(c['rec'], 'verdict')}"))
+        body.append(f"Accepted over the referee's objection (check {c['n']}, "
+                    f"{one(c['rec'], 'verdict')}, {one(c['rec'], 'model')}):")
+        body.append(c["rec"]["body"].strip())       # the narrower claim and the findings
+        body.append("")
+    return fields, "\n".join(body)
+
+
+# ------------------------------------------------------------ checks: verbs
+def cmd_rerun_command(a) -> None:
+    refuse_under_guard("attach a re-run command")
+    require_checks("rerun-command")
+    field = rerun_field(a)
+    with Lock():
+        path, _meta = staged_finding(a.id)
+        text = path.read_text(encoding="utf-8")
+        head, sep, rest = text.partition("\n\n")
+        lines = [l for l in head.split("\n") if not l.startswith(("rerun: ", "no-rerun: "))]
+        ev = [i for i, l in enumerate(lines) if l.startswith("evidence: ")]
+        at = (ev[-1] + 1) if ev else len(lines)
+        lines.insert(at, f"{field[0]}: {field[1]}")
+        write_text(path, "\n".join(lines) + (sep + rest if sep else "\n"))
+    if field[0] == "rerun":
+        print(f"{a.id}: re-run command set; run it with rs-memory rerun {a.id}.")
+    else:
+        print(f"{a.id}: no re-run; the reason is recorded for the PI.")
+
+
+def cmd_rerun(a) -> None:
+    refuse_under_guard("start a re-run")
+    require_checks("rerun")
+    with Lock():
+        _path, meta = staged_finding(a.id)
+        refuse_changed(a.id, meta)
+        cmd = one(meta, "rerun")
+        if not cmd:
+            raise Refused(f"{a.id} has no re-run command; give one with "
+                          f"rs-memory rerun-command {a.id} --rerun CMD")
+        n, d = new_check(a.id, "rerun", [("command", cmd)] + binding_fields(meta))
+        (d / "rerun").mkdir()
+        log = start_check(a.id, n, d, "rerun", "rerun.log")
+    print(f"Re-run of {a.id} started in the background (check {n}), writing into "
+          f"{d / 'rerun'}; its log is {log}. Its result shows in rs-memory view {a.id}.")
+
+
+def run_rerun(ident: str, n: int) -> int:
+    """The detached re-run: the command in the workspace, then its record."""
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    d = checks_dir(ident) / str(n)
+    info = parse_entry(d / "check.md")
+    cmd = one(info, "command")
+    out_dir = d / "rerun"
+    env = {k: v for k, v in os.environ.items() if k not in SESSION_VARS}
+    env["RS_RERUN_OUT"] = str(out_dir)
+    print(f"command: {cmd}\nRS_RERUN_OUT={out_dir}", flush=True)
+    try:
+        rc = str(subprocess.run(["bash", "-c", cmd], cwd=str(workspace()), env=env,
+                                stdin=subprocess.DEVNULL).returncode)
+    except OSError as e:
+        rc = f"none (could not start bash: {e.strerror})"
+    print(f"exit: {rc}", flush=True)
+    compare = []
+    for path, digest in staged_evidence(info):
+        f = out_dir / Path(path).name
+        if f.is_symlink() or not f.is_file():
+            result = "not produced"
+        else:
+            result = "same" if sha256_file(str(f)) == digest else "differs"
+        compare.append(("compare", f"{path} -> {result}"))
+    fields = ([("kind", "rerun"), ("command", cmd), ("exit", rc), ("started", one(info, "started")),
+               ("ended", now()), ("out", str(out_dir)), ("log", str(d / "rerun.log"))]
+              + [(k, v) for k in ("claim-sha256", "evidence") for v in info.get(k, [])] + compare)
+    write_text(d / "rerun.md", render_entry(f"{ident} re-run {n}", f"exit {rc}", fields, ""))
+    return 0
+
+
+def referee_model(agent: str) -> "list[str]":
+    """The model flags for the referee, from the project's record; no model
+    recorded is an error, never a fallback to the agent's default."""
+    data = project_record()
+    if agent == "claude":
+        models = data.get("models") if isinstance(data.get("models"), dict) else {}
+        pair = models.get("referee")
+        m = pair.get("model") if isinstance(pair, dict) else None
+        if not isinstance(m, str) or not m.strip():
+            raise Refused("no referee model is set for this project: its record "
+                          f"({record_path()}) has no models.referee model for Claude; the PI "
+                          "sets it in the project's settings")
+        e = pair.get("effort") or ""
+        if not isinstance(e, str):
+            raise Refused(f"the referee's effort in {record_path()} is not text: {e!r}")
+        return ["--model", m.strip()] + (["--effort", e.strip()] if e.strip() else [])
+    blk = data.get("pi_models") if isinstance(data.get("pi_models"), dict) else {}
+    pair = blk.get("agent")
+    m = pair.get("model") if isinstance(pair, dict) else None
+    if not isinstance(m, str) or not m.strip():
+        raise Refused("no referee model is set for this project: its record "
+                      f"({record_path()}) has no pi model (pi_models.agent.model); the PI "
+                      "sets pi's model in the project's settings")
+    t = pair.get("thinking") or ""
+    if not isinstance(t, str):
+        raise Refused(f"pi's thinking level in {record_path()} is not text: {t!r}")
+    return ["--model", m.strip()] + (["--thinking", t.strip()] if t.strip() else [])
+
+
+def referee_argv(agent: str, prompt: str, model_flags: "list[str]") -> "list[str]":
+    """The lean headless run: no RS text, no memory rules, no front page, no
+    session kept, read-only tools; the model passed explicitly."""
+    if agent == "claude":
+        return ["claude", "-p", prompt, "--restricted", "--tools", CLAUDE_REFEREE_TOOLS,
+                "--system-prompt", REFEREE_SYSTEM, "--no-session-persistence",
+                "--strict-mcp-config", "--disable-slash-commands", "--output-format", "json",
+                *model_flags]
+    return ["pi", "-p", prompt, "-ne", "-ns", "-nc", "-np", "--no-mcp", "--offline",
+            "--no-session", "--tools", PI_REFEREE_TOOLS, "--system-prompt", REFEREE_SYSTEM,
+            "--mode", "json", *model_flags]
+
+
+def copy_hashed(src: str, dest: Path) -> str:
+    """Copy a file through a temp file and a rename, read-only; returns the
+    sha256 of the bytes copied."""
+    h = hashlib.sha256()
+    fd, tmp = tempfile.mkstemp(prefix=f".{dest.name}.", dir=str(dest.parent))
+    try:
+        with open(src, "rb") as fi, os.fdopen(fd, "wb") as fo:
+            for chunk in iter(lambda: fi.read(1 << 20), b""):
+                h.update(chunk)
+                fo.write(chunk)
+        os.chmod(tmp, 0o444)
+        os.replace(tmp, dest)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return h.hexdigest()
+
+
+def claim_text(ident: str, meta: dict, names: "list[str]") -> str:
+    out = [f"# Claim {ident} (staged, waiting for the PI)", "",
+           f"Statement: {meta['headline']}", f"Scope: {one(meta, 'scope')}",
+           f"Hedge: {one(meta, 'hedge')}", ""]
+    rels = [f"- {rel} {i}" for rel in RELATIONS for i in meta.get(rel, [])]
+    if rels:
+        out += ["Relations to other claims:"] + rels + [""]
+    out.append("Evidence (a copy of each file is in this folder):")
+    for (path, digest), name in zip(staged_evidence(meta), names):
+        out.append(f"- {name}: the author's {path} (sha256 {digest})")
+    if one(meta, "rerun"):
+        out += ["", f"The command the author says reproduces it: {one(meta, 'rerun')}"]
+    elif one(meta, "no-rerun"):
+        out += ["", f"Why the author says it cannot be re-run: {one(meta, 'no-rerun')}"]
+    return "\n".join(out) + "\n"
+
+
+def cmd_referee(a) -> None:
+    refuse_under_guard("start a referee run")
+    require_checks("referee")
+    agent = a.agent or detect_agent()
+    model_flags = referee_model(agent)
+    try:
+        instruction = REFEREE_FILE.read_text(encoding="utf-8")
+    except OSError as e:
+        raise Refused(f"the referee's instruction {REFEREE_FILE} cannot be read ({e.strerror}); "
+                      "this project's image predates the referee: tell the PI")
+    with Lock():
+        _path, meta = staged_finding(a.id)
+        refuse_changed(a.id, meta)
+        fc = finding_checks(a.id, meta)
+        rerun = fc["reruns"][-1] if fc["reruns"] and fc["reruns"][-1]["state"] == "done" else None
+        accepted = accepted_record_text()
+        n, d = new_check(a.id, "referee", [("agent", agent), ("model-flags", json.dumps(model_flags))]
+                         + binding_fields(meta)
+                         + [("accepted-sha256", sha256_text(accepted)),
+                            ("rerun-check", str(rerun["n"]) if rerun else "none")])
+        snap = d / "snapshot"
+        (snap / "evidence").mkdir(parents=True)
+        names = [f"evidence/{i}-{Path(p).name}" for i, (p, _d) in
+                 enumerate(staged_evidence(meta), 1)]
+        manifest = {}
+        for (path, digest), name in zip(staged_evidence(meta), names):
+            got = copy_hashed(path, snap / name)
+            if got != digest:
+                write_verdict(a.id, n, None, f"its evidence {path} changed while the snapshot "
+                              "was taken", {}, "")
+                raise Refused(f"{a.id}: its evidence {path} changed while its snapshot was "
+                              "taken; check the finding still holds and stage it again")
+            manifest[name] = got
+        texts = {"claim.md": claim_text(a.id, meta, names), "accepted.md": accepted,
+                 "REFEREE.md": instruction.replace("{folder}", str(snap))}
+        if rerun:
+            texts["rerun.md"] = (rerun["dir"] / "rerun.md").read_text(encoding="utf-8")
+        for name, text in texts.items():
+            write_text(snap / name, text, mode=0o444)
+            manifest[name] = sha256_text(text)
+        write_text(snap / "MANIFEST.sha256",
+                   "".join(f"{h}  {name}\n" for name, h in sorted(manifest.items())), mode=0o444)
+        log = start_check(a.id, n, d, "referee", "referee.log")
+    print(f"Referee of {a.id} started in the background (check {n}, {agent} "
+          f"{' '.join(model_flags)}), reading only {snap}; its log is {log}. "
+          f"Its verdict lands in {d / 'verdict.md'} and shows in rs-memory view {a.id}.")
+
+
+def parse_claude_output(text: str) -> dict:
+    try:
+        d = json.loads(text)
+    except (ValueError, RecursionError):
+        return {"error": "its output is not the JSON record Claude writes"}
+    if not isinstance(d, dict) or d.get("type") != "result":
+        return {"error": "its output has no result record"}
+    usage = d.get("usage") if isinstance(d.get("usage"), dict) else {}
+    out = {"models": sorted(d.get("modelUsage") or {}) if isinstance(d.get("modelUsage"), dict) else [],
+           "cost": d.get("total_cost_usd"),
+           "usage": ", ".join(f"{k.replace('_input_tokens', '').replace('_tokens', '')} {usage[k]}"
+                              for k in ("input_tokens", "output_tokens", "cache_read_input_tokens",
+                                        "cache_creation_input_tokens") if k in usage)}
+    if d.get("is_error") or not isinstance(d.get("result"), str):
+        out["error"] = f"the run failed ({d.get('terminal_reason')}): {single_line(str(d.get('result')))}"
+        return out
+    out["answer"] = d["result"]
+    return out
+
+
+def parse_pi_output(text: str) -> dict:
+    last = None
+    totals = {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
+    cost = 0.0
+    for line in text.splitlines():
+        try:
+            d = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        msg = d.get("message") if isinstance(d, dict) and d.get("type") == "message_end" else None
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        last = msg
+        u = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+        for k in totals:
+            if isinstance(u.get(k), int):
+                totals[k] += u[k]
+        c = u.get("cost") if isinstance(u.get("cost"), dict) else {}
+        if isinstance(c.get("total"), (int, float)):
+            cost += c["total"]
+    if last is None:
+        return {"error": "pi's output has no answer from the model"}
+    out = {"models": [f"{last.get('provider')}/{last.get('model')}"], "cost": cost,
+           "usage": ", ".join(f"{k} {v}" for k, v in totals.items())}
+    if last.get("stopReason") in ("error", "aborted"):
+        out["error"] = f"the run failed ({last.get('stopReason')}): {single_line(str(last.get('errorMessage')))}"
+        return out
+    content = last.get("content")
+    out["answer"] = "".join(b.get("text", "") for b in content if isinstance(b, dict)
+                            and b.get("type") == "text") if isinstance(content, list) else ""
+    return out
+
+
+def parse_verdict(answer: str) -> dict:
+    """The verdict is the answer's last line, exactly; anything else is none."""
+    lines = answer.rstrip().split("\n")
+    m = VERDICT_RE.match(lines[-1].strip()) if lines else None
+    if not m:
+        return {"error": "its last line is not VERDICT: supported, overreaches or unsupported"}
+    verdict = m.group(1)
+    body = "\n".join(lines[:-1]).strip()
+    findings, mark, narrower = body.partition(NARROWER_MARK)
+    if mark:
+        findings = findings.rstrip()
+        # The marker's own line may carry a list number ("2.") before it.
+        findings = re.sub(r"\n\W*\d*\W*\Z", "", findings).rstrip()
+    narrower = single_line(narrower) if mark else ""
+    if verdict == "overreaches" and not narrower:
+        return {"error": f"an overreaches verdict without its narrower claim ({NARROWER_MARK})"}
+    return {"verdict": verdict, "narrower": narrower if verdict == "overreaches" else "",
+            "findings": findings.strip()}
+
+
+def write_verdict(ident: str, n: int, result: "dict | None", failed: str, run: dict,
+                  answer: str) -> None:
+    d = checks_dir(ident) / str(n)
+    info = parse_entry(d / "check.md")
+    verdict = result["verdict"] if result else "none"
+    fields = [("kind", "referee"), ("verdict", verdict)]
+    if result and result["narrower"]:
+        fields.append(("narrower", result["narrower"]))
+    if failed:
+        fields.append(("failed", failed))
+    fields += [("agent", one(info, "agent")), ("asked", " ".join(json.loads(one(info, "model-flags") or "[]"))),
+               ("model", ", ".join(run.get("models") or []) or "(not reported)"),
+               ("cost-usd", str(run.get("cost")) if run.get("cost") is not None else "(not reported)"),
+               ("usage", run.get("usage") or "(not reported)"),
+               ("started", one(info, "started")), ("ended", now())]
+    fields += [(k, v) for k in ("claim-sha256", "evidence", "accepted-sha256", "rerun-check")
+               for v in info.get(k, [])]
+    fields += [("snapshot", str(d / "snapshot")), ("output", str(d / "referee.out")),
+               ("log", str(d / "referee.log"))]
+    body = ""
+    if result:
+        body = (f"{NARROWER_MARK} {result['narrower']}\n\n" if result["narrower"] else "") \
+            + "Findings:\n" + result["findings"].removeprefix("Findings:").strip()
+    elif answer.strip():
+        body = "The referee's answer, which gave no verdict:\n\n" + answer.strip()
+    write_text(d / "verdict.md", render_entry(f"{ident} referee {n}",
+                                              verdict if result else "no verdict", fields, body))
+
+
+def run_referee(ident: str, n: int) -> int:
+    """The detached referee: the lean agent run in the snapshot folder, its
+    answer parsed, the verdict written."""
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    d = checks_dir(ident) / str(n)
+    info = parse_entry(d / "check.md")
+    agent = one(info, "agent")
+    snap = d / "snapshot"
+    prompt = (f"Read the file {snap / 'REFEREE.md'} and do exactly what it says. "
+              "It is the whole task.")
+    argv = referee_argv(agent, prompt, json.loads(one(info, "model-flags")))
+    env = {k: v for k, v in os.environ.items() if k not in SESSION_VARS}
+    env[GUARD] = "1"
+    env[STRICT_GUARD] = "1"
+    print("agent: " + " ".join(a if a not in (prompt, REFEREE_SYSTEM) else repr(a) for a in argv),
+          flush=True)
+    out_path = d / "referee.out"
+    try:
+        fd = os.open(str(out_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "wb") as out:
+            rc = subprocess.run(argv, cwd=str(snap), env=env, stdin=subprocess.DEVNULL,
+                                stdout=out).returncode
+    except OSError as e:
+        write_verdict(ident, n, None, f"could not start {argv[0]}: {e.strerror}", {}, "")
+        print(f"result: no verdict (could not start {argv[0]})", flush=True)
+        return 1
+    print(f"agent exit: {rc}", flush=True)
+    text = out_path.read_text(encoding="utf-8", errors="replace")
+    run = parse_claude_output(text) if agent == "claude" else parse_pi_output(text)
+    if "error" not in run and rc != 0:
+        run["error"] = f"the agent exited {rc}"
+    if "error" in run:
+        write_verdict(ident, n, None, run["error"], run, run.get("answer", ""))
+        print(f"result: no verdict ({run['error']})", flush=True)
+        return 1
+    result = parse_verdict(run["answer"])
+    if "error" in result:
+        write_verdict(ident, n, None, result["error"], run, run["answer"])
+        print(f"result: no verdict ({result['error']})", flush=True)
+        return 1
+    write_verdict(ident, n, result, "", run, run["answer"])
+    print(f"result: {result['verdict']}", flush=True)
+    return 0
+
+
+def cmd_check_child(a) -> None:
+    refuse_under_guard("run a check")
+    n = int(a.n)
+    sys.exit(run_rerun(a.id, n) if a.verb == "_rerun" else run_referee(a.id, n))
 
 
 # ---------------------------------------------------------------- reading
@@ -612,14 +1367,18 @@ def knowledge_text(topic: "str | None" = None) -> str:
     return "\n".join(out)
 
 
-def staged_text() -> str:
+def staged_text(checks: bool = False, topic: "str | None" = None) -> str:
     staged = sorted((i, p) for i, (w, p) in claim_files().items() if w == "staged")
+    if topic is not None:
+        staged = [(i, p) for i, p in staged if topic in parse_entry(p).get("topic", [])]
     if not staged:
         return "## Staged claims\nnone"
     out = ["## Staged claims (waiting for the PI's accept)"]
     for i, p in staged:
         e = parse_entry(p)
         out.append(f"  {i} {e['headline']} — scope: {one(e, 'scope')}; hedge: {one(e, 'hedge')}")
+        if checks and i.startswith("F-"):
+            out += check_lines(i, e, "      ")
     return "\n".join(out)
 
 
@@ -646,8 +1405,12 @@ def cmd_view(a) -> None:
             for rel in RELATIONS:
                 if a.id in oe.get(rel, []):
                     print(f"{o} {rel} it: {oe['headline']} ({st[o]})")
+        if where == "staged" and a.id.startswith("F-") and checks_on():
+            print("\n".join(check_lines(a.id, e, "")))
         return
     print(knowledge_text(a.topic))
+    if checks_on():
+        print("\n" + staged_text(True, a.topic))
 
 
 def cmd_recall(a) -> None:
@@ -702,7 +1465,7 @@ def open_text() -> str:
     parts = [(d / "front.md").read_text(encoding="utf-8").rstrip()
              if (d / "front.md").exists() else "# Front page\n(not written yet)"]
     parts.append(knowledge_text())
-    parts.append(staged_text())
+    parts.append(staged_text(checks_on()))
     since = entries_since_mark()
     if since:
         lines = ["## Journal since the last consolidation"]
@@ -1046,6 +1809,9 @@ def build_brief(delta_path: str) -> "tuple[str, int, str]":
 
 
 def cmd_consolidate(a) -> None:
+    if under_strict_guard():
+        raise Refused("a referee run does not consolidate: it writes nothing, it reads its "
+                      "folder and answers")
     if a.prompt:
         delta = (str(Path(a.out).with_suffix("")) + ".delta.json" if a.out
                  else "<a file of your choice under /workspace/memory/runs/>")
@@ -1284,6 +2050,8 @@ def cmd_close(a) -> None:
     # A hang-up (the session's window closing) must not stop close between
     # starting the run and marking it.
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    if under_strict_guard():
+        raise Refused("this is a referee run; it never ends a session or starts a consolidation")
     if under_guard():
         raise Refused("this is a consolidation run; it never starts another")
     agent = a.agent or detect_agent()
@@ -1363,10 +2131,32 @@ def build_parser() -> argparse.ArgumentParser:
     for rel in RELATIONS:
         p.add_argument(f"--{rel}", action="append", metavar="ID")
     p.add_argument("--topic", action="append")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--rerun", metavar="CMD", help="a finding's command that reproduces it")
+    g.add_argument("--no-rerun", metavar="REASON", help="why the finding cannot be re-run")
     p.set_defaults(fn=cmd_claim)
+
+    p = sub.add_parser("rerun-command", help="attach a re-run command, or the reason for none, "
+                       "to a staged finding")
+    p.add_argument("id")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--rerun", metavar="CMD")
+    g.add_argument("--no-rerun", metavar="REASON")
+    p.set_defaults(fn=cmd_rerun_command)
+
+    p = sub.add_parser("rerun", help="re-run a staged finding's command in the background")
+    p.add_argument("id")
+    p.set_defaults(fn=cmd_rerun)
+
+    p = sub.add_parser("referee", help="start an independent referee of a staged finding")
+    p.add_argument("id")
+    p.add_argument("--agent", choices=("claude", "pi"))
+    p.set_defaults(fn=cmd_referee)
 
     p = sub.add_parser("accept", help="move staged claims into the record (the PI said so)")
     p.add_argument("ids", nargs="+")
+    p.add_argument("--over-objection", action="store_true",
+                   help="accept a finding the referee objects to (the PI said so)")
     p.set_defaults(fn=cmd_accept)
 
     p = sub.add_parser("strike", help="drop staged claims (the PI said so)")
@@ -1424,6 +2214,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("_run", help=argparse.SUPPRESS)
     p.add_argument("--agent", choices=("claude", "pi"), required=True)
     p.set_defaults(fn=cmd_run)
+
+    for verb in ("_rerun", "_referee"):
+        p = sub.add_parser(verb, help=argparse.SUPPRESS)
+        p.add_argument("id")
+        p.add_argument("n")
+        p.set_defaults(fn=cmd_check_child)
     return ap
 
 
