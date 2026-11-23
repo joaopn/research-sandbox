@@ -40,6 +40,8 @@ Arms:
   research          the existing research flow (Claude as supervisor; the
                     PI's /log at each session's end, its own memory; the PI
                     approves every plan and staged cycle the flow asks about)
+  researcher-subagents  the researcher-subagents type with Claude (analyst
+                    helpers; each referee run's tokens counted apart)
 """
 from __future__ import annotations
 
@@ -76,6 +78,7 @@ ARMS = {
     "researcher-pi": {"workflow": "researcher", "agent": "pi", "memory": True},
     "researcher-nohook": {"workflow": "researcher", "agent": "claude", "memory": True, "nohook": True},
     "research": {"workflow": "research", "agent": "claude", "memory": False, "log": True, "approves": True},
+    "researcher-subagents": {"workflow": "researcher-subagents", "agent": "claude", "memory": True},
 }
 DEFAULT_ARMS = ("researcher", "floor")
 # What the PI says to whatever an arm with "approves" waits on: the research
@@ -121,6 +124,16 @@ ANSWER: {answer}
 # The instruction rs-memory's background run is started with (container/researcher/rs-memory).
 CONSOLIDATION_TEXT = "and do exactly what it says. It is the whole task."
 PATH_RE = re.compile(r"(/workspace/[^\s`'\"()\[\],;]+)")
+# The project types whose findings are refereed: rs-memory's referee runs keep
+# no transcript (no session persistence), so their tokens are read from the
+# verdict each run writes, memory/checks/<id>/<n>/verdict.md, whose `usage:`
+# line names Claude's fields (input, output, cache_read, cache_creation) or
+# pi's (input, output, cacheRead, cacheWrite) (container/researcher/rs-memory).
+REFEREE_WORKFLOWS = ("researcher-subagents",)
+CHECKS_DIR = "/workspace/memory/checks"
+VERDICT_NAME = "verdict.md"
+VERDICT_FIELDS = {"input": ("input",), "output": ("output",),
+                  "cached": ("cache_read", "cache_creation", "cacheRead", "cacheWrite")}
 
 
 class EvalError(Exception):
@@ -235,7 +248,8 @@ def plan(evals: "list[dict]", arms: "list[str]") -> dict:
             grader += g
             rows.append({"eval": e["name"], "arm": arm, "sessions": len(e["sessions"]),
                          "turns": turns, "probes": probes, "grader_calls": g, "consolidations": cons,
-                         "approvals": bool(ARMS[arm].get("approves"))})   # as many as the flow asks for
+                         "approvals": bool(ARMS[arm].get("approves")),   # as many as the flow asks for
+                         "referees": refereed(arm)})                       # one per finding sent to the referee
     return {"rows": rows, "grader_calls": grader + (4 if grader else 0),   # + the grader self-check
             "agent_calls": sum(r["turns"] + r["probes"] for r in rows)}
 
@@ -447,10 +461,16 @@ class Bench:
 
     # ------------------------------------------------------------ usage
     def transcripts(self, c, arm) -> "dict[str, tuple[float, int]]":
+        """Every agent transcript (a subagent's sits under its session's
+        folder, so the search finds it) and, for a refereed type, every
+        referee verdict file (verdict_file), each with its time and size."""
         root = f"{PI_DIR}/sessions" if ARMS[arm]["agent"] == "pi" else f"{RH}/.claude/projects"
         if ARMS[arm]["workflow"] == "research":
             root += " /workspace/workers"          # the research flow's workers do the analysis
-        r = self.ex(c, f"find {root} -name '*.jsonl' -printf '%T@ %s %p\\n' 2>/dev/null")
+        find = f"find {root} -name '*.jsonl' -printf '%T@ %s %p\\n' 2>/dev/null"
+        if refereed(arm):
+            find += f"; find {CHECKS_DIR} -name {VERDICT_NAME} -printf '%T@ %s %p\\n' 2>/dev/null"
+        r = self.ex(c, find)
         out = {}
         for line in r.stdout.decode().splitlines():
             parts = line.split(" ", 2)
@@ -462,10 +482,12 @@ class Bench:
         """Tokens of every model call written since `before`: plain input,
         cached input (read + write), output; the input side of the first call
         of the main session (what it loaded cold), never a subagent's or a
-        worker's; and, apart, the tokens of any consolidation run."""
+        worker's; and, apart, the tokens of any consolidation run and of
+        any referee run (a verdict file written or rewritten since)."""
         tot = {"input": 0, "cached": 0, "output": 0, "first_input": None}
         cons = {"input": 0, "cached": 0, "output": 0}
         now = self.transcripts(c, arm)
+        verdicts = {p: now.pop(p) for p in list(now) if verdict_file(p)}
         side = {p: side_transcript(p, now) for p in now}
         order = sorted(now, key=lambda p: (side[p], now[p][0]))
         cons_sessions: "set[str]" = set()
@@ -491,13 +513,47 @@ class Bench:
                     tot[k] += u[k]
         if any(cons.values()):
             tot["consolidation"] = cons
+        ref = self.referee_usage(c, [p for p in sorted(verdicts) if verdicts[p] != before.get(p)])
+        if ref["verdicts"]:
+            tot["referee"] = ref
         return tot
+
+    def referee_usage(self, c, paths: "list[str]") -> dict:
+        """The tokens and cost the referee runs behind these verdict files
+        report; a file that cannot be read, or a line that does not parse,
+        counts as 0 and leaves a note."""
+        ref = {"input": 0, "cached": 0, "output": 0, "cost_usd": 0.0, "verdicts": len(paths)}
+        notes = []
+        for path in paths:
+            r = self.ex(c, f"cat {shlex.quote(path)}")
+            if r.returncode != 0:
+                notes.append(f"{path}: not readable, counted as 0")
+                continue
+            u, why = verdict_usage(r.stdout.decode("utf-8", "replace"))
+            for k in u:
+                ref[k] += u[k]
+            notes += [f"{path}: {w}" for w in why]
+        if notes:
+            ref["notes"] = notes
+        return ref
+
+    def refereeing(self, c) -> bool:
+        """A referee run is alive (rs-memory's detached _referee verb)."""
+        return self.ex(c, "for f in /proc/[0-9]*/cmdline; do tr '\\0' ' ' < $f 2>/dev/null; echo; done "
+                          # [ ]: this scan's own command line must not match
+                          "| grep -q 'rs-memory[ ]_referee'").returncode == 0
+
+    def settle_referees(self, c, arm) -> None:
+        """Wait out the referee runs a step started, so their verdicts are
+        that step's cost (a run is detached and lands after the hand-back)."""
+        if refereed(arm):
+            self.wait(lambda: not self.refereeing(c), self.a.turn_timeout)
 
     # ------------------------------------------------------------ budget
     def spend(self, rec: dict, usage: "dict | None") -> None:
         """Count a step's tokens against the eval's budget; stop it when it
         goes past either cap."""
-        for u in (usage or {}, (usage or {}).get("consolidation") or {}):
+        for u in (usage or {}, (usage or {}).get("consolidation") or {}, (usage or {}).get("referee") or {}):
             rec["tokens"] += sum(int(u.get(k, 0) or 0) for k in ("input", "cached", "output"))
         secs = time.time() - rec["_t0"]
         if rec["tokens"] > self.a.max_tokens:
@@ -517,7 +573,9 @@ class Bench:
         t0 = time.time()
         self.send(c, name, text)
         done = self.wait(lambda: self.count(p, "handbacks") > hb, self.a.turn_timeout)
-        return {"seconds": round(time.time() - t0, 1), "handed_back": done,
+        secs = round(time.time() - t0, 1)
+        self.settle_referees(c, arm)
+        return {"seconds": secs, "handed_back": done,
                 "usage": self.usage_since(c, arm, before), "_before": before}
 
     def no_answer(self, arm, c, name, rec, m) -> None:
@@ -557,7 +615,7 @@ class Bench:
         """The last API error the agent wrote during this turn (Claude Code:
         an isApiErrorMessage entry; pi: an errorMessage), read from its own
         transcripts only (never a worker's or a subagent's), past `before`."""
-        now = self.transcripts(c, arm)
+        now = {p: v for p, v in self.transcripts(c, arm).items() if not verdict_file(p)}
         mine = [p for p in now if not side_transcript(p, now) and now[p][1] > before.get(p, (0, 0))[1]]
         if not mine:
             return ""
@@ -618,8 +676,10 @@ class Bench:
                     self.tmux(c, "kill-session", "-t", name)
                     m = {"i": i, "killed_after_s": round(time.time() - t0, 1),
                          "working_seen": started, "mid_turn": mid, "usage": self.usage_since(c, arm, before)}
-                    # the consolidation the kill starts is counted once, below
+                    # the consolidation the kill starts, and any referee run
+                    # the killed turn started, are counted once, below
                     m["usage"].pop("consolidation", None)
+                    m["usage"].pop("referee", None)
                     rec["messages"].append(m)
                     self.wait(lambda: self.count(p, "waiting") <= w0, 60)
                     self.spend(budget, m["usage"])
@@ -662,6 +722,13 @@ class Bench:
                     "consolidation", {"input": 0, "cached": 0, "output": 0})
                 rec["consolidated"] = self.ex(c, "cat /workspace/memory/consolidated 2>/dev/null").stdout.decode().strip()
                 self.spend(budget, rec["consolidation_usage"])
+            if refereed(arm):
+                # what lands after the last counted turn (a killed turn's runs,
+                # and any the session's end started), counted once
+                self.settle_referees(c, arm)
+                rec["referee_usage"] = self.usage_since(c, arm, before_end).get(
+                    "referee", {"input": 0, "cached": 0, "output": 0, "cost_usd": 0.0, "verdicts": 0})
+                self.spend(budget, rec["referee_usage"])
             if killed_before is not None and watch:
                 # what the cut-off task left for the next session, read once the
                 # session and anything it ran are done (not at the kill itself)
@@ -702,10 +769,12 @@ class Bench:
         seen = self.pending(c) if chain else set()   # what waited before the probe is not its doing
         t0 = time.time()
         r = self.probe_call(c, cmd)
+        secs = round(time.time() - t0, 1)               # the probe's own time, as a turn's
+        self.settle_referees(c, arm)
         if r is None or r.returncode in (124, 137):   # timeout, or its forced kill
-            return {"answer": None, "error": "timed out", "seconds": round(time.time() - t0, 1),
+            return {"answer": None, "error": "timed out", "seconds": secs,
                     "usage": self.usage_since(c, arm, before)}
-        out = {"seconds": round(time.time() - t0, 1), "usage": self.usage_since(c, arm, before)}
+        out = {"seconds": secs, "usage": self.usage_since(c, arm, before)}
         text = r.stdout.decode("utf-8", "replace").strip()
         if r.returncode != 0 or not text:
             out.update(answer=None, error=f"exit {r.returncode}: {r.stderr.decode('utf-8', 'replace')[-300:]}")
@@ -977,6 +1046,51 @@ def side_transcript(p: str, others: "dict | set | None" = None) -> bool:
     return any(q != p and p.startswith(q[:-len(".jsonl")] + "/") for q in (others or ()))
 
 
+def refereed(arm: str) -> bool:
+    return ARMS[arm]["workflow"] in REFEREE_WORKFLOWS
+
+
+def verdict_file(p: str) -> bool:
+    return p.startswith(CHECKS_DIR + "/") and p.endswith("/" + VERDICT_NAME)
+
+
+def verdict_usage(text: str) -> "tuple[dict, list[str]]":
+    """The tokens and cost one referee run reports in its verdict file: the
+    `usage:` and `cost-usd:` lines of its header (the lines between the title
+    and the first blank line). A line missing or not parseable counts as 0,
+    and the second value says why."""
+    head: "dict[str, str]" = {}
+    for line in text.split("\n")[1:]:
+        if not line.strip():
+            break
+        k, sep, v = line.partition(": ")
+        if sep:
+            head.setdefault(k.strip(), v.strip())
+    out = {"input": 0, "cached": 0, "output": 0, "cost_usd": 0.0}
+    notes = []
+    raw = head.get("usage")
+    parts: "dict[str, int]" = {}
+    for item in (raw or "").split(","):
+        name, _, n = item.strip().rpartition(" ")
+        if name and n.isdigit():
+            parts[name] = int(n)
+    known = {k for ks in VERDICT_FIELDS.values() for k in ks}
+    if raw is None:
+        notes.append("no usage line, its tokens counted as 0")
+    elif not parts or len(parts) != len(raw.split(",")) or not set(parts) <= known:
+        notes.append(f"usage line {raw!r} not understood, its tokens counted as 0")
+    else:
+        for k, names in VERDICT_FIELDS.items():
+            out[k] = sum(parts.get(x, 0) for x in names)
+    cost = head.get("cost-usd")
+    try:
+        out["cost_usd"] = float(cost)
+    except (TypeError, ValueError):
+        notes.append("no cost line, its cost counted as 0" if cost is None
+                     else f"cost line {cost!r} not understood, its cost counted as 0")
+    return out, notes
+
+
 def usage_records(jsonl: str) -> "list[dict]":
     """One record per model call in an agent transcript (Claude Code's and
     pi's session files): plain input, cached input (read + write) and output
@@ -1113,6 +1227,21 @@ def _tok(u: "dict | None") -> str:
     return f"{u.get('input', 0)}+{u.get('cached', 0)}c/{u.get('output', 0)}"
 
 
+def referee_total(r: dict) -> dict:
+    """The referee bucket summed over an eval's steps on one project type
+    (part of its tokens), each step counted where spend counted it."""
+    tot = {"input": 0, "cached": 0, "output": 0, "verdicts": 0}
+    steps = []
+    for s in r.get("sessions", []):
+        steps += [m.get("usage") for m in s.get("messages", []) + s.get("approvals", [])]
+        steps += [(s.get("log") or {}).get("usage"), {"referee": s.get("referee_usage")}]
+    steps += [p.get("usage") for p in r.get("probes", [])]
+    for u in steps:
+        for k in tot:
+            tot[k] += int(((u or {}).get("referee") or {}).get(k, 0) or 0)
+    return tot
+
+
 def table(results: dict) -> str:
     evals = results.get("evals", {})
     head = (f"Run {results['run']}" + (" (STAND-IN models: scores mean nothing)" if results.get("standin") else ""))
@@ -1149,6 +1278,9 @@ def table(results: dict) -> str:
                          for m in s.get("messages", []) if (m.get("usage") or {}).get("first_input") is not None), None)
             if cold is not None:
                 cell += f", cold {cold}"
+            refs = referee_total(r)
+            if refs["verdicts"]:
+                cell += f", referee {refs['verdicts']} run(s) {_tok(refs)}"
             approvals = sum(len(x.get("approvals", [])) for x in r.get("sessions", []) + r.get("probes", []))
             if approvals:
                 cell += f", {approvals} approvals"
@@ -1199,9 +1331,10 @@ def main() -> None:
         print(f"{len(evals)} eval(s) × {len(a.arms)} project type(s); caps per pair: "
               f"{a.max_tokens} tokens, {a.max_seconds} s")
         for r in p["rows"]:
-            print(f"  {r['eval']:<14} {r['arm']:<18} {r['sessions']} session(s), {r['turns']} turn(s), "
+            print(f"  {r['eval']:<14} {r['arm']:<20} {r['sessions']} session(s), {r['turns']} turn(s), "
                   f"{r['probes']} probe(s), {r['grader_calls']} grader call(s), up to {r['consolidations']} consolidation(s)"
-                  + (", plus approvals" if r["approvals"] else ""))
+                  + (", plus approvals" if r["approvals"] else "")
+                  + (", plus referee runs" if r["referees"] else ""))
         extra = " and approvals" if any(r["approvals"] for r in p["rows"]) else ""
         print(f"agent calls: {p['agent_calls']} (plus the consolidations{extra}), grader calls: {p['grader_calls']}")
         return
