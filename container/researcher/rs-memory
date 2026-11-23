@@ -621,6 +621,9 @@ def _claim_prefix(a) -> str:
                              else "--question"))
         return "D"
     if a.withdraws:
+        if a.question:
+            raise Refused("a claim is one kind: --question stages an open question and "
+                          "--withdraws a retraction naming what it withdraws, so drop one of them")
         return "R"
     return "Q" if a.question else "F"
 
@@ -877,7 +880,8 @@ def cmd_accept(a) -> None:
             text = dest.read_text(encoding="utf-8")
             head, sep, rest = text.partition("\n\n")
             if extra is None:
-                write_text(dest, f"{head}\naccepted: {stamp}{sep or chr(10)}{rest}", mode=0o444)
+                write_text(dest, head.rstrip("\n") + f"\naccepted: {stamp}{sep or chr(10)}{rest}",
+                           mode=0o444)
                 continue
             fields, objection = extra
             head = head.rstrip("\n") + f"\naccepted: {stamp}" + "".join(
@@ -2669,15 +2673,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("id")
     p.set_defaults(fn=cmd_job_done)
 
-    p = sub.add_parser("_run", help=argparse.SUPPRESS)
+    # The verbs this command starts as detached children of its own. Added with
+    # no help, so the verb list leaves them out; the metavar below names only
+    # the public verbs, so the usage line leaves them out too.
+    public = [v for v in sub.choices if not v.startswith("_")]
+    p = sub.add_parser("_run")
     p.add_argument("--agent", choices=("claude", "pi"), required=True)
     p.set_defaults(fn=cmd_run)
 
     for verb in ("_rerun", "_referee"):
-        p = sub.add_parser(verb, help=argparse.SUPPRESS)
+        p = sub.add_parser(verb)
         p.add_argument("id")
         p.add_argument("n")
         p.set_defaults(fn=cmd_check_child)
+    sub.metavar = "{" + ",".join(public) + "}"
     return ap
 
 
