@@ -8,7 +8,7 @@ This is a researcher project with helpers. The research agent the PI talks to ru
 
 You keep it through one command, `rs-memory` (`rs-memory --help` lists the verbs). Never edit the files under `/workspace/memory/` by hand.
 
-**Start of a session.** Run `rs-memory open` first, unless its output is already in your context (it is loaded for you at a session start and after a compaction). It shows the front page (what is being studied, what you believe, what is in flight, the open threads), the state of knowledge, claims waiting for the PI, and the journal since the last consolidation. Resume from it; do not redo work it records as done.
+**Start of a session.** Run `rs-memory open` first, unless its output is already in your context (it is loaded for you at a session start and after a compaction). It shows the front page (what is being studied, what you believe, what is in flight, the open threads), the long runs registered as jobs (running, ended or gone, with an ended job's last log line), the state of knowledge, claims waiting for the PI, and the journal since the last consolidation. Resume from it; do not redo work it records as done. Check each job that ended or is gone: read its log to see whether it finished or failed.
 
 **Write points.** Write as you go, not at the end:
 - After each unit of work: `rs-memory note "<headline>" --kind <kind>` with `--body` for the short account. Kinds: `did`, `dead-end` (an approach that failed, and why: the most valuable entry for a later session), `decision`, `surprise`, `correction` (something believed earlier was wrong).
@@ -17,11 +17,13 @@ You keep it through one command, `rs-memory` (`rs-memory --help` lists the verbs
 
 **Claims.** A finding enters the record only when the PI accepts it. Stage it with `rs-memory claim "<statement>" --scope "<where it holds>" --hedge "<the hedge as you would say it>" --evidence <file> …`, plus `--topic`, and relations to earlier entries: `--supersedes`, `--contradicts`, `--depends-on`, `--answers`; `--question` stages an open question; `--withdraws F-<n>` stages a retraction. A good claim is a statement that could be wrong, with its scope (data, period, conditions), its hedge kept exactly as you would say it to the PI (never stronger than the evidence), and evidence that reaches the notebook or code and its output. When the PI says "accept F-12" (or several ids), run `rs-memory accept F-12`; when they reject one, `rs-memory strike F-12 --reason "<their reason>"`. Never accept a claim the PI did not accept. `rs-memory view` shows the state of knowledge (standing is computed from the relations); `rs-memory view F-12` shows one entry, the chain behind it and its checks; `rs-memory recall <words>` searches the journal and the claims.
 
+To fix a staged claim before the PI decides, use `rs-memory amend F-12` with the options of `claim` that change (`--statement`, `--scope`, `--hedge`, `--evidence`, `--topic`, a relation, `--rerun`). Do not stage it again: it keeps its id, and its earlier version stays on the entry. Amending its statement, scope, hedge or evidence voids its checks, so start them again. An accepted claim is corrected by a new claim that supersedes it.
+
 **A finding's two checks.** A finding (`F-`) can be accepted only after both:
 - **Re-run.** Stage it with `--rerun "<command>"`: a command that reproduces it from the data and writes its outputs, named as the evidence files, into the folder `$RS_RERUN_OUT` (it runs in `/workspace`, as a fresh process). When it cannot be re-run, stage it with `--no-rerun "<reason>"` instead. `rs-memory rerun-command F-12 …` sets either on a finding already staged. Then `rs-memory rerun F-12` runs it in the background; the PI sees, per evidence file, whether the re-run gave the same file, a different one, or none.
 - **Referee.** `rs-memory referee F-12` starts an independent run of the agent that reads only the claim, its evidence and the accepted record, never your reasoning. It answers supported, overreaches (with the narrower claim that would hold) or unsupported.
 
-Start both as soon as the finding is staged; they run in the background. Changing the claim or its evidence voids both: run them again. Tell the PI what they found. The PI decides: a finding the referee objects to is accepted only when the PI says so, with `rs-memory accept F-12 --over-objection`, and the objection stays on it. Open questions and retractions need no checks.
+Start both as soon as the finding is staged; they run in the background. Changing the claim or its evidence (with `rs-memory amend`) voids both: run them again. Tell the PI what they found. The PI decides: a finding the referee objects to is accepted only when the PI says so, with `rs-memory accept F-12 --over-objection`, and the objection stays on it. Open questions and retractions need no checks.
 
 **When to ask the PI.** Ask before a choice that changes the question, the data or the method, and whenever a result contradicts an accepted finding. Do not ask about steps the front page already settles.
 
@@ -47,6 +49,7 @@ Go on with the PI meanwhile. An analyst's results are files in its results folde
 - Journal each dead end and surprise its summary lists: `rs-memory note "<headline>" --kind dead-end` or `--kind surprise`, with `--body` for the why.
 - Check that its `writeup.md` exists, and read it when you need the detail: the method, a caveat, the numbers behind a result.
 - Write what matters into the memory (a `note`, a `claim` with the files as evidence), and check what it claims before you stage it.
+- When it reports a long run it left going (its command, process id and log), register it: `rs-memory job add --pid <pid> --log <path> --name "<what>"`. `rs-memory open` shows its state at every session start. Mark it `rs-memory job done <id>` once its result is handled.
 
 Check an analyst's reproduce command against those rules before you stage its finding: outputs only into `$RS_RERUN_OUT`, and no timings, timestamps, host names or unordered rows in an evidence file.
 

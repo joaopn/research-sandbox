@@ -20,6 +20,9 @@ Everything lives under /workspace/memory/ (RS_MEMORY_DIR overrides it):
                                 project only: a re-run (rerun/, rerun.md) or a
                                 referee run (snapshot/, verdict.md); never
                                 deleted, the audit trail
+  jobs/job-<n>.md               a long run the agent left going (its pid, its
+                                command line, its log); marked done, never
+                                deleted
 
 Verbs:
   open [--hook]                 what to read at the start of a session
@@ -27,6 +30,9 @@ Verbs:
   checkpoint ITEM...            replace the "In flight" part of the front page
   claim STATEMENT --scope S --evidence FILE... [--hedge H] [relations] [--topic T]
         [--rerun CMD | --no-rerun REASON]
+  amend ID [--statement S] [--scope S] [--hedge H] [--evidence FILE...] [relations]
+        [--topic T] [--rerun CMD | --no-rerun REASON]
+                                correct a staged claim in place
   rerun-command ID (--rerun CMD | --no-rerun REASON)
   rerun ID  /  referee ID [--agent claude|pi]
   accept ID... [--over-objection]  /  strike ID... --reason R
@@ -37,6 +43,8 @@ Verbs:
   close [--hook] [--agent claude|pi]
   analyst-check [--hook claude]  whether an analyst's reply names a results
                                 folder holding its writeup.md (reads only)
+  job add --pid N --log PATH --name TEXT [--expect-end TEXT]
+  job list [--all]  /  job done ID
 
 The checks (--rerun, rerun-command, rerun, referee, --over-objection and
 accept's conditions on a finding) exist only in a project whose record,
@@ -44,8 +52,26 @@ accept's conditions on a finding) exist only in a project whose record,
 every verb behaves as it always has.
 
 It never deletes anything under the memory folder: a struck claim moves to
-struck/, an old front page to front/. Ids and the front page are written under
-one lock file, so two sessions never hand out the same number.
+struck/, an old front page to front/, an amended claim keeps every earlier
+version in its body, a job marked done keeps its file. Ids and the front page
+are written under one lock file, so two sessions never hand out the same
+number.
+
+A staged claim may be amended (accepted entries are never edited: a correction
+of one is a new claim that supersedes it). Its checks are bound to the hashes
+of its statement, scope, hedge and evidence, so amending any of these voids
+them by construction; a topic or a relation does not.
+
+A job's state is computed at every call, never stored:
+  running   its pid exists and /proc/<pid>/cmdline is byte for byte the
+            command line read when it was registered (a reused pid reads as
+            not running);
+  ended     not running, and its log is a regular file that can be read; RS
+            never saw the exit code, so this says only "the process is gone
+            and its log is there", which a crash also is: the log's last line
+            is shown with it, in open too, so the reader can tell;
+  gone      not running, and its log is missing or not a readable file;
+  done      marked with job done (whatever the process does).
 
 Standard library only; run by RS's own interpreter.
 """
@@ -58,7 +84,9 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -136,6 +164,13 @@ SKILL_NAME_RE = re.compile(r"\A[a-z0-9]+(-[a-z0-9]+)*\Z")
 SKILL_NAME_MAX = 64
 SKILL_PREFIX = "earned-"
 SKILL_FILE_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+# A long run the agent left going: its entry file's id, and how much of the
+# end of its log is read to show its last line. The log can be gigabytes and
+# is read at every `job list`; a last line longer than this shows cut, and the
+# log's path is printed beside it for the rest.
+JOB_ID_RE = re.compile(r"\Ajob-([1-9][0-9]*)\Z")
+JOB_LOG_TAIL_BYTES = 4096
 
 FRONT_MARK_RE = re.compile(r"<!-- rs-memory page=(\d+) next=(\d+) -->")
 ITEM_LINE_RE = re.compile(r"\A- \[([LBIT]-[1-9][0-9]*)\] (.*)\Z")
@@ -652,6 +687,95 @@ def cmd_claim(a) -> None:
               + f"rs-memory referee {ident} (the referee's verdict).")
 
 
+# The fields a staged claim carries, in the order write_claim writes them.
+CLAIM_FIELDS = ("kind", "scope", "hedge", "staged", "session", "amended", "evidence",
+                "rerun", "no-rerun") + RELATIONS + ("topic",)
+
+
+def cmd_amend(a) -> None:
+    refuse_under_guard("amend claims")
+    ident = a.id
+    rels_given = {r: getattr(a, r.replace("-", "_")) for r in RELATIONS}
+    if all(v is None for v in (a.statement, a.scope, a.hedge, a.evidence, a.topic,
+                               a.rerun, a.no_rerun, *rels_given.values())):
+        raise Refused(f"amend {ident}: say what to change: --statement, --scope, --hedge, "
+                      "--evidence, --topic, a relation (" + ", ".join(f"--{r}" for r in RELATIONS)
+                      + "), or for a finding --rerun / --no-rerun")
+    with Lock():
+        where, path = claim_files().get(ident, (None, None))
+        if where == "record":
+            raise Refused(f"{ident} is accepted, and the record is never edited: correct it with "
+                          f"a new claim that supersedes it (rs-memory claim \"<statement>\" … "
+                          f"--supersedes {ident})")
+        if where == "struck":
+            raise Refused(f"{ident} was struck by the PI and is not amended; when it still "
+                          "matters, stage a new claim with rs-memory claim")
+        if where != "staged":
+            raise Refused(f"no claim {ident} (rs-memory view lists the staged claims)")
+        prefix = ident[0]
+        rerun = None
+        if a.rerun is not None or a.no_rerun is not None:
+            require_checks("--rerun and --no-rerun")
+            if prefix != "F":
+                raise Refused("only a finding has a re-run command; drop --rerun / --no-rerun")
+            rerun = rerun_field(a)
+        if prefix != "R" and rels_given["withdraws"] is not None:
+            raise Refused(f"{ident} is not a retraction, so it withdraws nothing; a retraction is "
+                          "a claim of its own: rs-memory claim … --withdraws <id>")
+        old_text = path.read_text(encoding="utf-8")
+        meta = parse_entry(path)
+        statement = a.statement if a.statement is not None else meta["headline"]
+        scope = a.scope if a.scope is not None else one(meta, "scope")
+        hedge = a.hedge if a.hedge is not None else one(meta, "hedge")
+        rels = {r: list(v) if v is not None else list(meta.get(r, []))
+                for r, v in rels_given.items()}
+        for r, ids in rels.items():
+            if ident in ids:
+                raise Refused(f"--{r} {ident}: a claim does not name itself")
+        old_paths = [p for p, _d in staged_evidence(meta)]
+        ev = validate_claim(statement, scope, a.evidence if a.evidence is not None else old_paths,
+                            rels, prefix, set(claim_files()))
+        # Evidence not named again keeps the hashes it was staged with, so a
+        # file changed since then still shows as changed.
+        ev_lines = ([f"{p} sha256={d}" for p, d in ev] if a.evidence is not None
+                    else list(meta.get("evidence", [])))
+        topics = ([single_line(t) for t in a.topic if t.strip()] if a.topic is not None
+                  else list(meta.get("topic", [])))
+        stamp = now()
+        new = {"kind": meta.get("kind", []), "scope": [scope],
+               "hedge": [hedge if single_line(hedge) else "(none stated)"],
+               "staged": meta.get("staged", []), "session": meta.get("session", []),
+               "amended": [stamp], "evidence": ev_lines, "topic": topics, **rels}
+        if rerun:
+            new["rerun" if rerun[0] == "rerun" else "no-rerun"] = [rerun[1]]
+        else:
+            new["rerun"], new["no-rerun"] = meta.get("rerun", []), meta.get("no-rerun", [])
+        fields = [(k, v) for k in CLAIM_FIELDS for v in new.get(k, [])]
+        # A field this version does not know is carried over as it is.
+        fields += [(k, v) for k, vs in meta.items()
+                   if k not in CLAIM_FIELDS and k not in ("id", "headline", "path", "body")
+                   for v in vs]
+        earlier = old_text.partition("\n\n")[0].rstrip("\n")
+        section = (f"## Earlier version, amended {stamp}\n\n"
+                   + "\n".join("    " + line for line in earlier.split("\n")))
+        body = "\n\n".join(x for x in (meta["body"], section) if x.strip())
+        write_text(path, render_entry(ident, statement, fields, body))
+        after = parse_entry(path)
+    print(f"{ident} amended; its earlier version is kept on the entry "
+          f"(rs-memory view {ident}).")
+    if prefix == "F" and checks_on():
+        claim_moved = (claim_sha(meta) != claim_sha(after)
+                       or meta.get("evidence", []) != after.get("evidence", []))
+        cmd = one(after, "rerun")
+        if claim_moved:
+            print("Changing the claim or its evidence voids both checks: start both again: "
+                  + (f"rs-memory rerun {ident} and " if cmd else "")
+                  + f"rs-memory referee {ident}.")
+        elif cmd != one(meta, "rerun"):
+            print(f"Its re-run command changed, which voids the re-run: start it again with "
+                  f"rs-memory rerun {ident}.")
+
+
 def _evidence_changed(meta: dict) -> "str | None":
     for line in meta.get("evidence", []):
         path, _, digest = line.rpartition(" sha256=")
@@ -682,7 +806,9 @@ def cmd_accept(a) -> None:
             changed = _evidence_changed(meta)
             if changed:
                 raise Refused(f"{ident}: its evidence {changed} changed since it was staged; "
-                              "check the finding still holds and stage it again with rs-memory claim")
+                              "check the finding still holds and correct it with "
+                              f"rs-memory amend {ident} --evidence <file> …, which hashes "
+                              "the evidence again")
             # A finding's two checks, in a project that has them.
             extra = accept_checks(ident, meta, a.over_objection) \
                 if checks and ident.startswith("F-") else None
@@ -773,8 +899,9 @@ def refuse_changed(ident: str, meta: dict) -> None:
     changed = _evidence_changed(meta)
     if changed:
         raise Refused(f"{ident}: its evidence {changed} changed since it was staged, which voids "
-                      "its checks; check the finding still holds and stage it again with "
-                      "rs-memory claim")
+                      "its checks; check the finding still holds, correct it with "
+                      f"rs-memory amend {ident} --evidence <file> … (it hashes the evidence "
+                      "again), then start its checks again")
 
 
 def checks_dir(ident: str) -> Path:
@@ -1175,7 +1302,9 @@ def cmd_referee(a) -> None:
                 write_verdict(a.id, n, None, f"its evidence {path} changed while the snapshot "
                               "was taken", {}, "")
                 raise Refused(f"{a.id}: its evidence {path} changed while its snapshot was "
-                              "taken; check the finding still holds and stage it again")
+                              "taken; check the finding still holds, correct it with "
+                              f"rs-memory amend {a.id} --evidence <file> …, then start its "
+                              "checks again")
             manifest[name] = got
         texts = {"claim.md": claim_text(a.id, meta, names), "accepted.md": accepted,
                  "REFEREE.md": instruction.replace("{folder}", str(snap))}
@@ -1470,12 +1599,18 @@ def last_run_report() -> "str | None":
 
 def open_text() -> str:
     d = mem_dir()
+    # The jobs come right after the front page, whose last but one part is
+    # In flight: what is still running is read before the rest.
+    jobs_part = jobs_section()
     if not (d / "front.md").exists() and not journal_files():
         return ("# rs-memory\nNo memory yet in this project. Write your first journal entry "
-                "with rs-memory note, and the in-flight work with rs-memory checkpoint.\n")
+                "with rs-memory note, and the in-flight work with rs-memory checkpoint.\n"
+                + (f"\n{jobs_part}\n" if jobs_part else ""))
     front = read_front()
     parts = [(d / "front.md").read_text(encoding="utf-8").rstrip()
              if (d / "front.md").exists() else "# Front page\n(not written yet)"]
+    if jobs_part:
+        parts.append(jobs_part)
     parts.append(knowledge_text())
     parts.append(staged_text(checks_on()))
     since = entries_since_mark()
@@ -2161,6 +2296,162 @@ def cmd_analyst_check(a) -> None:
         return
 
 
+# ---------------------------------------------------------------------- jobs
+# A long run the agent left going (an analyst's 17-hour build, detached): one
+# entry file per job under jobs/, its state computed at every call (the module
+# docstring says how), shown by `open` at every session start.
+def jobs_dir() -> Path:
+    return mem_dir() / "jobs"
+
+
+def job_files() -> "list[tuple[int, Path]]":
+    d = jobs_dir()
+    out = []
+    if d.is_dir():
+        for f in d.glob("job-*.md"):
+            m = JOB_ID_RE.match(f.stem)
+            if m:
+                out.append((int(m.group(1)), f))
+    out.sort()
+    return out
+
+
+def proc_cmdline(pid: int) -> "bytes | None":
+    """A process's command line as the kernel holds it; None when there is no
+    such process (or it cannot be read)."""
+    if pid <= 0:
+        return None
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+
+
+def log_last_line(path: str) -> "str | None":
+    """The last non-empty line of a log that is a regular, readable file (its
+    last JOB_LOG_TAIL_BYTES only); "" when it is empty; None when it is missing
+    or not such a file. Opened without blocking, so a pipe at its name never
+    hangs a session's start."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        os.lseek(fd, max(0, st.st_size - JOB_LOG_TAIL_BYTES), os.SEEK_SET)
+        tail = os.read(fd, JOB_LOG_TAIL_BYTES)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    lines = [l for l in tail.decode("utf-8", errors="replace").splitlines() if l.strip()]
+    return single_line(lines[-1]) if lines else ""
+
+
+def job_state(meta: dict) -> "tuple[str, str | None]":
+    """(running | ended | gone | done, the log's last line or None)."""
+    last = log_last_line(one(meta, "log"))
+    if meta.get("done"):
+        return "done", last
+    try:
+        pid = int(one(meta, "pid"))
+    except ValueError:
+        pid = 0
+    cmd = proc_cmdline(pid)
+    if cmd and hashlib.sha256(cmd).hexdigest() == one(meta, "cmdline-sha256"):
+        return "running", last
+    return ("ended" if last is not None else "gone"), last
+
+
+def jobs(include_done: bool) -> "list[tuple[dict, str, str | None]]":
+    out = []
+    for _n, f in job_files():
+        meta = parse_entry(f)
+        state, last = job_state(meta)
+        if include_done or state != "done":
+            out.append((meta, state, last))
+    return out
+
+
+def jobs_section() -> "str | None":
+    """open's Jobs section: every job not marked done, one line each."""
+    js = jobs(False)
+    if not js:
+        return None
+    return "\n".join(["## Jobs"] + [f"- {m['id']} {state}: {m['headline']} — log {one(m, 'log')}"
+                                    + (f" — last line: {last}" if state == "ended" and last else "")
+                                    for m, state, last in js])
+
+
+def cmd_job_add(a) -> None:
+    refuse_under_guard("register jobs")
+    name = single_line(a.name)
+    if not name:
+        raise Refused("a job needs --name: what the run is, in a few words")
+    if not a.log.strip():
+        raise Refused("a job needs --log: the file the run writes its output to")
+    cmd = proc_cmdline(a.pid)
+    if cmd is None:
+        raise Refused(f"no process {a.pid} is running: register a run while it is still going, "
+                      "by the process id of the run itself (ps shows it)")
+    if not cmd:
+        raise Refused(f"process {a.pid} has no command line (a kernel thread, or a process that "
+                      "has already ended): give the process id of the run itself")
+    log = Path(a.log)
+    if not log.is_absolute():
+        log = Path.cwd() / log
+    shown = shlex.join(x.decode("utf-8", errors="replace") for x in cmd.rstrip(b"\0").split(b"\0"))
+    fields = [("pid", str(a.pid)), ("cmdline", shown),
+              ("cmdline-sha256", hashlib.sha256(cmd).hexdigest()), ("log", str(log))]
+    if a.expect_end is not None and single_line(a.expect_end):
+        fields.append(("expect-end", a.expect_end))
+    fields += [("registered", now()), ("session", session_label())]
+    with Lock():
+        files = job_files()
+        ident = f"job-{files[-1][0] + 1 if files else 1}"
+        write_text(jobs_dir() / f"{ident}.md", render_entry(ident, name, fields, ""))
+    print(f"{ident} registered; rs-memory open shows its state at every session start. "
+          f"Mark it handled with rs-memory job done {ident}.")
+
+
+def cmd_job_list(a) -> None:
+    js = jobs(a.all)
+    if not js:
+        print("No jobs." if a.all or not job_files()
+              else "No jobs that are not done (rs-memory job list --all shows them all).")
+        return
+    out = []
+    for m, state, last in js:
+        out.append(f"{m['id']} {state}: {m['headline']}")
+        out.append(f"  log: {one(m, 'log')}")
+        if one(m, "expect-end"):
+            out.append(f"  expected end: {one(m, 'expect-end')}")
+        out.append(f"  registered: {one(m, 'registered')}; pid {one(m, 'pid')}: {one(m, 'cmdline')}")
+        for stamp in m.get("done", []):
+            out.append(f"  done: {stamp}")
+        if last:
+            out.append(f"  last line: {last}")
+    print("\n".join(out))
+
+
+def cmd_job_done(a) -> None:
+    refuse_under_guard("mark jobs done")
+    with Lock():
+        path = jobs_dir() / f"{a.id}.md"
+        if not JOB_ID_RE.match(a.id) or not path.is_file():
+            raise Refused(f"no job {a.id} (rs-memory job list --all shows every job)")
+        text = path.read_text(encoding="utf-8")
+        meta = parse_entry(path)
+        if meta.get("done"):
+            raise Refused(f"{a.id} was marked done at {one(meta, 'done')} already")
+        head, _sep, rest = text.partition("\n\n")
+        write_text(path, head.rstrip("\n") + f"\ndone: {now()}\n"
+                   + (f"\n{rest.strip()}\n" if rest.strip() else ""))
+    print(f"{a.id} marked done; it no longer shows in rs-memory open.")
+
+
 # ----------------------------------------------------------------------- cli
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="rs-memory", description=__doc__.split("\n\n")[0])
@@ -2193,6 +2484,22 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--rerun", metavar="CMD", help="a finding's command that reproduces it")
     g.add_argument("--no-rerun", metavar="REASON", help="why the finding cannot be re-run")
     p.set_defaults(fn=cmd_claim)
+
+    p = sub.add_parser("amend", help="correct a staged claim in place before the PI decides; "
+                       "its earlier version is kept on the entry")
+    p.add_argument("id")
+    p.add_argument("--statement", help="the corrected statement")
+    p.add_argument("--scope")
+    p.add_argument("--hedge")
+    p.add_argument("--evidence", action="append", help="replaces the whole evidence list")
+    for rel in RELATIONS:
+        p.add_argument(f"--{rel}", action="append", metavar="ID",
+                       help="replaces this relation's ids")
+    p.add_argument("--topic", action="append", help="replaces the topics")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--rerun", metavar="CMD", help="a finding's command that reproduces it")
+    g.add_argument("--no-rerun", metavar="REASON", help="why the finding cannot be re-run")
+    p.set_defaults(fn=cmd_amend)
 
     p = sub.add_parser("rerun-command", help="attach a re-run command, or the reason for none, "
                        "to a staged finding")
@@ -2274,6 +2581,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hook", choices=("claude",),
                    help="read Claude's hook input and answer as its SubagentStop hook")
     p.set_defaults(fn=cmd_analyst_check)
+
+    jb = sub.add_parser("job", help="long runs left going: register one, list them, mark one done"
+                        ).add_subparsers(dest="job_verb", required=True)
+    p = jb.add_parser("add", help="register a run that is still going, by its process id")
+    p.add_argument("--pid", type=int, required=True, help="the run's process id")
+    p.add_argument("--log", required=True, help="the file the run writes its output to")
+    p.add_argument("--name", required=True, help="what the run is, in one line")
+    p.add_argument("--expect-end", metavar="TEXT", help="when it is expected to end")
+    p.set_defaults(fn=cmd_job_add)
+    p = jb.add_parser("list", help="every job not marked done, with its state")
+    p.add_argument("--all", action="store_true", help="the jobs marked done too")
+    p.set_defaults(fn=cmd_job_list)
+    p = jb.add_parser("done", help="mark a job handled, so it no longer shows")
+    p.add_argument("id")
+    p.set_defaults(fn=cmd_job_done)
 
     p = sub.add_parser("_run", help=argparse.SUPPRESS)
     p.add_argument("--agent", choices=("claude", "pi"), required=True)

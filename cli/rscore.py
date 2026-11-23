@@ -18164,8 +18164,9 @@ MEMORY_KIT_LABEL = "research.memory-kit"
 # label in agent/Dockerfile.sandbox-dind whenever RS's researcher instructions
 # start relying on something new in rs-memory (a verb or an option): the
 # instructions follow the host's code at every start, while the command
-# follows the image, so an older image must be refused, never run.
-MEMORY_KIT_VERSION = "3"
+# follows the image, so an older image must be refused, never run. Version 4:
+# the instructions name `rs-memory amend` and `rs-memory job`.
+MEMORY_KIT_VERSION = "4"
 MEMORY_TOOL = f"{RS_LIB_DIR}/rs-memory"
 MEMORY_LINKS = ("rs-memory",)
 MEMORY_AGENTS = ("claude", "pi")

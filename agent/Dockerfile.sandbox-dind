@@ -54,7 +54,7 @@ COPY container/researcher/rs-memory /usr/local/lib/rs/rs-memory
 # The referee's instruction, read by rs-memory referee from beside the command.
 COPY container/researcher/rs-memory-referee.md /usr/local/lib/rs/rs-memory-referee.md
 RUN chmod 755 /usr/local/lib/rs/rs-memory && chmod 644 /usr/local/lib/rs/rs-memory-referee.md
-LABEL research.memory-kit=3
+LABEL research.memory-kit=4
 
 COPY agent/entrypoint.sandbox-dind.sh /entrypoint.sh
 # This image's boot writes nothing into /workspace/.claude/ or /workspace/.pi/
