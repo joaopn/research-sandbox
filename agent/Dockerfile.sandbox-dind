@@ -46,13 +46,15 @@ RUN chmod +x /usr/local/lib/rs/rs-docs
 
 # The researcher project type's memory command, kept in RS's folder and linked
 # onto PATH by the host only in a project whose record says memory: true. The
-# label tells the host the image carries it (a researcher create or start on
-# an image without it stops with a Rebuild-all error).
+# label is the command's version: the host requires its own MEMORY_KIT_VERSION
+# (a researcher create or start on an image with an older command, or none,
+# stops with a Rebuild-all error). Bump both together whenever the researcher
+# instructions start relying on something new in rs-memory.
 COPY container/researcher/rs-memory /usr/local/lib/rs/rs-memory
 # The referee's instruction, read by rs-memory referee from beside the command.
 COPY container/researcher/rs-memory-referee.md /usr/local/lib/rs/rs-memory-referee.md
 RUN chmod 755 /usr/local/lib/rs/rs-memory && chmod 644 /usr/local/lib/rs/rs-memory-referee.md
-LABEL research.memory-kit=1
+LABEL research.memory-kit=2
 
 COPY agent/entrypoint.sandbox-dind.sh /entrypoint.sh
 # This image's boot writes nothing into /workspace/.claude/ or /workspace/.pi/

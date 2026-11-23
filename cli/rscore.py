@@ -5021,8 +5021,9 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     # would be created with its helpers where the host no longer runs them.
     if not _image_rs_commands(substrate_image):
         raise ValidationError(RS_COMMANDS_OLD_IMAGE)
-    # A researcher project needs its memory command in the image: refuse
-    # before anything exists (an older sandbox-dind image has none).
+    # A researcher project needs the current memory command in the image:
+    # refuse before anything exists (an older sandbox-dind image has an older
+    # one, or none).
     if req.research_memory and not _image_memory_kit(substrate_image):
         raise ValidationError(MEMORY_KIT_OLD_IMAGE_CREATE)
     if not container_running(ROUTER_CONTAINER):
@@ -18159,6 +18160,12 @@ def _apply_activity(container: str, workspace_path: "Path", local: "Sequence[str
 # ---------------------------------------------------------------------------
 MEMORY_RECORD_KEY = "memory"
 MEMORY_KIT_LABEL = "research.memory-kit"
+# The memory command's version in the project image. Bumped TOGETHER with the
+# label in agent/Dockerfile.sandbox-dind whenever RS's researcher instructions
+# start relying on something new in rs-memory (a verb or an option): the
+# instructions follow the host's code at every start, while the command
+# follows the image, so an older image must be refused, never run.
+MEMORY_KIT_VERSION = "2"
 MEMORY_TOOL = f"{RS_LIB_DIR}/rs-memory"
 MEMORY_LINKS = ("rs-memory",)
 MEMORY_AGENTS = ("claude", "pi")
@@ -18171,15 +18178,16 @@ MEMORY_CLAUDE_HOOKS = {
     "SessionEnd": f"{MEMORY_TOOL} close --hook --agent claude",
 }
 MEMORY_KIT_OLD_IMAGE_CREATE = (
-    "this RS's project image predates the researcher project type: rebuild RS's "
-    "images with Rebuild all on Sandboxes → Software, then create the project again")
+    "this RS's project image has an older memory command than the researcher "
+    "project type needs, or none: rebuild RS's images with Rebuild all on "
+    "Sandboxes → Software, then create the project again")
 MEMORY_KIT_OLD_IMAGE = (
-    "this researcher project's image has no memory command, so its memory is not "
-    "set up: rebuild RS's images with Rebuild all on Sandboxes → Software, then stop "
-    "the project and start it again")
+    "this researcher project's image has an older memory command than RS's "
+    "instructions need, or none, so its memory is not set up: rebuild RS's images "
+    "with Rebuild all on Sandboxes → Software, then stop the project and start it again")
 MEMORY_KIT_OLD_CONTAINER = (
-    "this researcher project is still running from an image without its memory "
-    "command: stop the project and start it again")
+    "this researcher project is still running from an image with an older memory "
+    "command, or none, so its memory is not set up: stop the project and start it again")
 MEMORY_KIT_UNREADABLE = (
     "RS could not read this project's settings ({folder}/project.json), so it could "
     "not tell whether the project keeps a research memory, and set none of it up; "
@@ -18229,15 +18237,16 @@ MEMORY_KIT_SCRIPT = (
 
 
 def _image_memory_kit(image: str) -> bool:
-    """Whether a host image carries the memory command (its label). A failed
-    read, a missing image included, reads as no: Rebuild all is the remedy."""
+    """Whether a host image carries the current memory command (its label equals
+    MEMORY_KIT_VERSION). A failed read, a missing image included, reads as no:
+    Rebuild all is the remedy."""
     try:
         r = run(["docker", "image", "inspect", "-f",
                  '{{index .Config.Labels "' + MEMORY_KIT_LABEL + '"}}', image],
                 capture_output=True, timeout=RS_INSTR_EXEC_TIMEOUT_S)
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return r.returncode == 0 and (r.stdout or "").strip() == "1"
+    return r.returncode == 0 and (r.stdout or "").strip() == MEMORY_KIT_VERSION
 
 
 def _memory_kit_exec(container: str, agents: "Sequence[str]",
@@ -18283,7 +18292,7 @@ def _apply_memory_kit(project: str, container: str, workspace_path: "Path",
     labels = _container_labels(container)
     if labels is None:
         return [OldInstructions("memory-kit", project, reason=MEMORY_KIT_LABELS_UNREADABLE)]
-    if labels.get(MEMORY_KIT_LABEL) != "1":
+    if labels.get(MEMORY_KIT_LABEL) != MEMORY_KIT_VERSION:
         text = (MEMORY_KIT_OLD_CONTAINER if _image_memory_kit(SANDBOX_DIND_IMAGE)
                 else MEMORY_KIT_OLD_IMAGE)
         return [OldInstructions("memory-kit", project, reason=text)]
