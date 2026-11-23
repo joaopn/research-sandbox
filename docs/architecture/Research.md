@@ -11,20 +11,20 @@ RS has two research workflows today and two more planned. Each is a project type
 
 On these pages **the user** is the person working with RS, and a **researcher** is the agent of a lab-agenda workflow.
 
-The three newer workflows form the **lab agenda**. They are built in order, because each is made of the one before; the first is built. The existing workflow is the benchmark they are measured against.
+The three newer workflows form the **lab agenda**. They are built in order, because each is made of the one before; the first two are built. The existing workflow is the benchmark they are measured against.
 
 | Workflow | Status | Agents | Who analyses | What remembers | Independent check | Page |
 |---|---|---|---|---|---|---|
 | `research` | built | a supervisor and worker containers; Claude only | workers, never the supervisor | session logs, written at session end | the supervisor, against its own plan | [Research workflow](Research-workflow.md) |
 | `researcher` | built, phase 1 | one long-lived agent; Claude or pi | the agent itself | the agent's own memory, written as it works | none; the user accepts findings | [Researcher workflow](Researcher-workflow.md) |
-| `researcher-subagents` | planned, phase 2 | a researcher and its short-lived subagents | subagents, with context the researcher selects | the researcher's memory | a referee, on every claim | [Researcher with subagents](Researcher-with-subagents.md) |
+| `researcher-subagents` | built, phase 2 | a researcher and its short-lived subagents; Claude or pi | subagents, with context the researcher selects | the researcher's memory | a re-run and a referee, on every finding; the user accepts | [Researcher with subagents](Researcher-with-subagents.md) |
 | `lab` | planned, phase 3 | several researchers, staff, a manager | each member, on its own line of inquiry | each member's memory, plus a shared record | a referee, on every claim | [Lab workflow](Lab-workflow.md) |
 
 ```mermaid
 flowchart TD
   bench["research (built)<br/>untouched, the benchmark"]
   r["researcher (built)<br/>one agent, one line of inquiry"]
-  rs["researcher-subagents<br/>delegates analyses, claims refereed"]
+  rs["researcher-subagents (built)<br/>delegates analyses, findings refereed"]
   lab["lab<br/>several researchers, a board, a meeting"]
   page["Lab page<br/>a view over the files the workflows write"]
   r --> rs

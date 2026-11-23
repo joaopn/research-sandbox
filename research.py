@@ -959,6 +959,7 @@ def cmd_project_update(args: argparse.Namespace) -> None:
         supervisor_effort=args.supervisor_effort,
         worker_model=args.worker_model, worker_effort=args.worker_effort,
         role_model=args.role_model, role_effort=args.role_effort,
+        referee_model=args.referee_model, referee_effort=args.referee_effort,
         agents=agents,
         pi_model=args.pi_model, pi_thinking=args.pi_thinking,
         reset=args.reset or [],
@@ -3052,6 +3053,13 @@ def build_parser() -> argparse.ArgumentParser:
     # just the role containers; the agent's own model is written into its settings
     # file (no restart) on a current image.
     _add_model_flags(u, unset_note="unset = leave unchanged")
+    # The finding referee of a researcher-subagents project (update only: at
+    # create it takes the installation's default). Read at each referee run.
+    u.add_argument("--referee-model", default="", metavar="MODEL",
+                   help="model of the finding referee under Claude, in a "
+                        "researcher-subagents project (unset = leave unchanged)")
+    u.add_argument("--referee-effort", default="", metavar="LEVEL",
+                   help="effort level of the finding referee (unset = leave unchanged)")
     u.add_argument("--pi-model", dest="pi_model", default="", metavar="PROVIDER/MODEL",
                    help="pi's starting model (written into pi's settings)")
     u.add_argument("--pi-thinking", dest="pi_thinking", default="",

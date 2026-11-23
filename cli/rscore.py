@@ -1177,9 +1177,12 @@ def _resolve_model_pair(ctype: str, model: str = "", effort: str = "", *,
 def _resolve_all_model_pairs(supervisor: tuple[str, str] = ("", ""),
                              worker: tuple[str, str] = ("", ""),
                              role: tuple[str, str] = ("", ""),
-                             box: tuple[str, str] = ("", "")) -> dict[str, dict[str, str]]:
+                             box: tuple[str, str] = ("", ""),
+                             referee: bool = False) -> dict[str, dict[str, str]]:
     """Resolve all FOUR container types into concrete, mutually-valid pairs — the
-    exact shape written into `.orchestrator/project.json`.
+    exact shape written into `.orchestrator/project.json`. `referee` adds the
+    finding referee's pair (from the defaults), for a researcher-subagents
+    project only: `rs-memory referee` reads it from the record.
 
     Every pair (including `box`, which has no create-time field and therefore
     comes straight from the defaults file) passes through the effort-support drop
@@ -1198,6 +1201,9 @@ def _resolve_all_model_pairs(supervisor: tuple[str, str] = ("", ""),
         m, e = _resolve_model_pair(ctype, supplied[0], supplied[1],
                                    catalog=catalog, pairs=pairs)
         out[ctype] = {"model": m, "effort": e}
+    if referee:
+        m, e = _resolve_model_pair("referee", catalog=catalog, pairs=pairs)
+        out["referee"] = {"model": m, "effort": e}
     return out
 
 
@@ -1255,8 +1261,9 @@ def model_default_set(req: "ModelDefaultSetRequest") -> dict:  # type: ignore[na
     remedy — fail-closed, never clobbered (the unreadable-state-file lesson).
     Atomic tmp+replace; the file has host-only readers (nothing bind-mounts
     it), so the inode change is safe. The reviewer consumes the result on its
-    very next run (review_pr resolves live); the four project types consume it
-    at their next create/box-add. Returns the type's post-write merged default
+    very next run (review_pr resolves live); the four project types, and the
+    referee of a researcher-subagents project, consume it at their next
+    create/box-add. Returns the type's post-write merged default
     plus whether an override now exists for it."""
     catalog = _model_catalog_checked()
     try:
@@ -1380,6 +1387,11 @@ class CreateRequest:
     # DERIVED from the manifest's `memory: true` like dev_lane; written into the
     # project's record at create and read from there by every later step.
     research_memory: bool = False
+    # The researcher's parallel helpers and a finding's two checks (the
+    # researcher-subagents type), DERIVED from the manifest's `subagents: true`
+    # (which requires `memory: true`), written into the record as
+    # SUBAGENTS_RECORD_KEY beside the memory key and read from there.
+    research_subagents: bool = False
     dev_repo: str = ""
     # The base branch the project's agent works. "" ⇒ the host resolves the
     # mirror's default at create (_resolve_dev_branch) — the resolved CONCRETE
@@ -1595,6 +1607,7 @@ class CreateRequest:
         # another flavor would silently skip it — reject instead).
         dev_lane = bool(manifest.get("dev"))
         research_memory = manifest.get("memory") is True
+        research_subagents = manifest.get("subagents") is True
         dev_repo = (kw.get("dev_repo") or "").strip()
         if dev_lane:
             if (project_type is not ProjectType.SANDBOX_DIND
@@ -1799,6 +1812,7 @@ class CreateRequest:
             history=history,
             dev_lane=dev_lane,
             research_memory=research_memory,
+            research_subagents=research_subagents,
             dev_repo=dev_repo,
             dev_branch=dev_branch,
             fetch=fetch,
@@ -2218,7 +2232,7 @@ class UpdateRequest:
     # stamp the type defaults over the supervisor and role pairs the researcher
     # had already chosen, AND — because the supervisor pair would then look
     # "changed" — it would trigger the multi-minute _recreate_supervisor that the
-    # granular update path exists to avoid. `live_ok` requires all six to be empty
+    # granular update path exists to avoid. `live_ok` requires all eight to be empty
     # for exactly this reason; the two are a matched pair.
     supervisor_model: str = ""
     supervisor_effort: str = ""
@@ -2226,6 +2240,11 @@ class UpdateRequest:
     worker_effort: str = ""
     role_model: str = ""
     role_effort: str = ""
+    # The finding referee's pair (a researcher-subagents project only, checked
+    # in update() against the record): written into models.referee, which
+    # `rs-memory referee` reads at each run, so no container is touched.
+    referee_model: str = ""
+    referee_effort: str = ""
     # The project's agent SET after this update (STAGE_PI_AGENT). None =
     # unchanged. Slice 1 is ADD-only: the set must be a superset of the marker's
     # (checked in update(), which has the project; from_kwargs checks shape, enum
@@ -2259,7 +2278,8 @@ class UpdateRequest:
         out: dict[str, dict[str, str]] = {}
         for ctype, m, e in (("supervisor", self.supervisor_model, self.supervisor_effort),
                             ("worker", self.worker_model, self.worker_effort),
-                            ("role", self.role_model, self.role_effort)):
+                            ("role", self.role_model, self.role_effort),
+                            ("referee", self.referee_model, self.referee_effort)):
             blk = {}
             if m:
                 blk["model"] = m
@@ -2275,7 +2295,8 @@ class UpdateRequest:
         catalog = None
         vals: dict[str, str] = {}
         for f in ("supervisor_model", "supervisor_effort", "worker_model",
-                  "worker_effort", "role_model", "role_effort"):
+                  "worker_effort", "role_model", "role_effort",
+                  "referee_model", "referee_effort"):
             v = kw.get(f) or ""
             if v and not isinstance(v, str):
                 raise ValidationError(f"{f} must be a string")
@@ -2303,7 +2324,7 @@ class UpdateRequest:
         # against a STORED effort is re-checked in update() against the marker
         # (there the stored effort is dropped, not rejected — the researcher
         # explicitly asked for the new model, so the model wins).
-        for ctype in ("supervisor", "worker", "role"):
+        for ctype in ("supervisor", "worker", "role", "referee"):
             m, e = vals[f"{ctype}_model"], vals[f"{ctype}_effort"]
             if m and e and not _claude_effort_ok(m, e, catalog):
                 # Reaches the browser (the ⚙ Agents box): names no flag.
@@ -4196,7 +4217,7 @@ class ModelDefaultSetRequest:
     """Set (or clear) one container type's default (model, effort) pair in the
     operator's untracked model-defaults override file — the write half of the
     broker's `models` read verb (drives the Sandboxes → Infrastructure →
-    Reviewer control; the verb itself accepts any catalog type, deliberately —
+    Reviewer and Referee controls; the verb itself accepts any catalog type, deliberately —
     equivalent in power to the documented hand-edit of the same file).
 
     `clear` exists so "" never has to mean "unset": an empty effort is a REAL
@@ -5015,7 +5036,8 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     model_pairs = _resolve_all_model_pairs(
         supervisor=(req.supervisor_model, req.supervisor_effort),
         worker=(req.worker_model, req.worker_effort),
-        role=(req.role_model, req.role_effort))
+        role=(req.role_model, req.role_effort),
+        referee=req.research_subagents)
     marker = {"type": project_type, "substrate": substrate.value,
               "workflow": req.workflow, "agents": deployed_agents,
               "models": model_pairs,
@@ -5035,6 +5057,11 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
               # Nor any other file RS used to write into its folders (refused
               # the same way): its folders are never checked for them.
               OLD_FILES_FLAG: True}
+    if req.research_subagents:
+        # The researcher-subagents type: the kit's analyst and surveyor, and
+        # rs-memory's finding checks, key on it. Only written when set, so a
+        # researcher project's record is exactly as before.
+        marker[SUBAGENTS_RECORD_KEY] = True
     if project_type == PROJECT_TYPE_SANDBOX_DIND:
         # The project container's own ~/.local gets EXACTLY the recorded agents
         # (_dind_agent_sets); a marker without this key is from before that and
@@ -6113,6 +6140,13 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     # model goes into its settings file is a property of the container's image
     # (older images keep the container setting); asked only when it matters.
     workspace_path = workspace_path_for(project, cfg)
+    # The finding referee exists only in a researcher-subagents project: its
+    # pair is refused anywhere else before anything is written.
+    if ((req.referee_model or req.referee_effort)
+            and _read_marker_dict(workspace_path).get(SUBAGENTS_RECORD_KEY) is not True):
+        raise ValidationError(
+            "the referee's model applies only to a researcher-subagents project; "
+            f"{project!r} is not one")
     claude_asked = bool(req.supervisor_model or req.supervisor_effort
                         or set(req.reset) & {"supervisor_model", "supervisor_effort"})
     claude_in_settings = claude_asked and _label_is_set("container", container)
@@ -6408,7 +6442,16 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
             _raise_old_instructions(found)
             return UpdateResult(project=project, rebuilt=False,
                                 effort_dropped=effort_dropped)
-        if changed == {"role"}:
+        #   * referee → nothing at all, like worker: `rs-memory referee` reads
+        #     the record at each run.
+        if changed == {"referee"}:
+            progress.step("models", "applying the referee model")
+            print("referee model updated; the next referee run uses it "
+                  "(no container touched).")
+            _raise_old_instructions(found)
+            return UpdateResult(project=project, rebuilt=False,
+                                effort_dropped=effort_dropped)
+        if changed - {"referee"} == {"role"}:
             progress.step("models", "applying the role model")
             _restart_role_mcps_for_models(project, cfg, workspace_path)
             _raise_old_instructions(found)
@@ -18571,6 +18614,14 @@ def project_agents(req: ProjectAgentsRequest, _progress=None) -> dict:
             out["pi"] = {**_pi_effective({"defaultProvider": p, "defaultModel": rest,
                                           "defaultThinkingLevel": (rec or {}).get("thinking")}),
                          "source": "saved"}
+    if data.get(SUBAGENTS_RECORD_KEY) is True:
+        # The researcher-subagents type: the finding referee's recorded pair
+        # (what the next referee run under Claude uses; pi's runs pi's model).
+        rec = models.get("referee") if isinstance(models.get("referee"), dict) else {}
+        out["subagents"] = True
+        out["referee"] = {k: rec[k] if isinstance(rec.get(k), str)
+                          and model_catalog.ALIAS_RE.match(rec[k]) else ""
+                          for k in ("model", "effort")}
     if research:
         out["research_models"] = {t: {"model": (models.get(t) or {}).get("model", ""),
                                       "effort": (models.get(t) or {}).get("effort", "")}

@@ -75,7 +75,7 @@ To keep settings, put them in a `.env` file next to `research.py`:
 
 <img src="assets/terminal.png" alt="A project's terminal tab with the agent" width="720">
 
-**3. Work.** Talk to the agent in the terminal or the editor. On an inner-Docker project, tick **Reader** under Extensions at create (always on for researcher) to read what it wrote: notebooks, figures, its memory.
+**3. Work.** Talk to the agent in the terminal or the editor. On an inner-Docker project, tick **Reader** under Extensions at create (always on for the researcher types) to read what it wrote: notebooks, figures, its memory.
 
 <img src="assets/reader.png" alt="The Reader tab" width="720">
 
@@ -96,12 +96,13 @@ Everything also runs from the command line: [CLI reference](user-guide/cli-refer
 Chosen in the New Project window. Inner-Docker projects can hold boxes and containers of their own.
 
 <details markdown="1">
-<summary>9 workflows</summary>
+<summary>10 workflows</summary>
 
 | Workflow | Container | Agents | What you get |
 |---|---|---|---|
 | `research` | inner Docker | Claude | A supervisor that plans with you, runs each analysis in a worker container, reviews it, and logs the session |
 | `researcher` | inner Docker | Claude, pi | One agent on one line of inquiry for weeks, with a memory you read in the Reader tab; findings enter the record when you accept them |
+| `researcher-subagents` | inner Docker | Claude, pi | A researcher that hands analyses to helpers running in parallel; each finding is re-run and refereed before you accept it |
 | `dev` | inner Docker | Claude, pi | An agent on one GitHub repository's fork, with working modes and its own Docker for tests |
 | `sandbox-dind` | inner Docker | Claude, pi | A confined agent with its own Docker and boxes |
 | `sandbox` | single | Claude, pi | A bare confined container: terminal and editor |
@@ -110,7 +111,7 @@ Chosen in the New Project window. Inner-Docker projects can hold boxes and conta
 | `academic-research-skills` | single | Claude, pi | Research-writing skills: research, write, review, revise |
 | `scientific-agent-skills` | single | Claude, pi | A large collection of scientific and research skills |
 
-`research` always runs Claude; `dev` and `researcher` need at least one agent; the others may have none.
+`research` always runs Claude; `dev`, `researcher` and `researcher-subagents` need at least one agent; the others may have none.
 
 </details>
 

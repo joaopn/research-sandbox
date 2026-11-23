@@ -504,7 +504,8 @@ def _verb_mcp_gateway_start(_args: dict, progress=None) -> dict:
 def _verb_model_default_set(args: dict, _progress=None) -> dict:
     """Write (or clear) one container type's default (model, effort) pair in
     the operator's untracked model-defaults override — the write half of
-    `models` (the Sandboxes → Infrastructure → Reviewer control). Token-gated
+    `models` (the Sandboxes → Infrastructure → Reviewer and Referee
+    controls). Token-gated
     (NOT in OPEN_VERBS); inline is fine — a sub-ms validated file write, no
     docker, no network. The request layer + verb map every catalog/OS error
     onto ValidationError, so nothing but the three dispatch-caught exceptions
@@ -861,6 +862,11 @@ UPDATE_WEBUI_FIELDS = frozenset({
     "supervisor_model", "supervisor_effort",
     "worker_model", "worker_effort",
     "role_model", "role_effort",
+    # The finding referee's pair (the ⚙ Agents box of a researcher-subagents
+    # project): IN-BOX like the worker pair — catalog tokens written into the
+    # project's record, which rs-memory reads inside the container; refused in
+    # update() on any other project. No container is touched.
+    "referee_model", "referee_effort",
     # The project's agent SET (STAGE_PI_AGENT): applied live on sandbox-dind
     # for an add; a removal (I33 slice 3) restarts the project; an enum list,
     # validated in from_kwargs, removal rules in update().
@@ -1257,8 +1263,8 @@ DEV_PASSWD_WEBUI_FIELDS = frozenset({"password"})
 # can steer where the artifact is written.
 DEV_BOARD_EXPORT_WEBUI_FIELDS = frozenset({"passphrase"})
 # Set/clear one container type's model+effort default in the operator's
-# untracked override file (the Sandboxes → Infrastructure → Reviewer
-# control). Name-shaped catalog tokens + a bool only — nothing host-shaped;
+# untracked override file (the Sandboxes → Infrastructure → Reviewer and
+# Referee controls). Name-shaped catalog tokens + a bool only — nothing host-shaped;
 # the contract is full-pair-or-clear (no partial writes).
 MODEL_DEFAULT_WEBUI_FIELDS = frozenset({"type", "model", "effort", "clear"})
 # Save the project task cap or put it back to the default (the Sandboxes →

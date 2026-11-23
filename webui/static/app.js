@@ -7150,14 +7150,24 @@ async function appendInfraSection(view) {
     const reviewerRow = el("div", { class: "mgmt-row mgmt-infra-row" }, [
         el("span", { class: "mgmt-loading" }, ["…"]),
     ]);
+    const refereeRow = el("div", { class: "mgmt-row mgmt-infra-row" }, [
+        el("span", { class: "mgmt-loading" }, ["…"]),
+    ]);
     view.appendChild(el("div", { class: "mgmt-infra" }, [
         el("h3", { class: "mgmt-infra-title" }, ["Shared services"]),
         el("div", { class: "mgmt-infra-sub" }, ["Development"]),
         row,
         el("div", { class: "mgmt-infra-sub" }, ["Reviewer"]),
         reviewerRow,
+        el("div", { class: "mgmt-infra-sub" }, ["Referee"]),
+        refereeRow,
+        el("div", { class: "hint" }, [
+            "The referee checks a finding in a researcher-subagents project before you " +
+            "accept it. A new project of that type starts with this model; change an " +
+            "existing one in its ⚙ Agents box."]),
     ]));
-    appendReviewerModelRow(view, reviewerRow);   // async, own fetch path
+    appendDefaultModelRow(view, reviewerRow, "reviewer", "Review model");   // async, own fetch path
+    appendDefaultModelRow(view, refereeRow, "referee", "Referee model");
     let g = null;
     try {
         const res = await fetch("/broker/dev");
@@ -7373,19 +7383,21 @@ function fillSettingsRow(view, row, settings, notice) {
     row.replaceChildren(...children);
 }
 
-// The reviewer's model/effort DEFAULT (the fifth model_catalog type). Unlike
-// the four project types there is no per-invocation knob: review_pr resolves
-// this live at each run, so Apply takes effect on the very next review — no
-// recreate, no restart. Apply writes the pair into the operator's untracked
+// One installation-wide model/effort DEFAULT row of the Infrastructure
+// section, for a type no project dialog sets: `reviewer` (review_pr resolves
+// it live at each run, so Apply takes effect on the very next review) and
+// `referee` (a finding's referee in researcher-subagents projects: the next
+// such project created starts with it; an existing one keeps its own, changed
+// in its ⚙ Agents box). Apply writes the pair into the operator's untracked
 // override via the token-gated model_default_set verb; Reset clears the
 // override key back to the tracked base. `view` is the Sandboxes page root
 // (the 401/403/503 ladders land there); `rowEl` is the pre-built row this
 // fills (created before appendInfraSection's gitea await — see the D-placement
-// note there).
-async function appendReviewerModelRow(view, rowEl) {
+// note there); `ctype` the catalog type, `caption` the row's label.
+async function appendDefaultModelRow(view, rowEl, ctype, caption) {
     const cat = await ensureModelCatalog();
     rowEl.innerHTML = "";
-    rowEl.appendChild(el("span", {}, ["Review model"]));
+    rowEl.appendChild(el("span", {}, [caption]));
     if (!cat) {
         // ensureModelCatalog swallows transport AND verb failures into null;
         // this row is secondary surface, so a quiet badge (not a page-level
@@ -7394,8 +7406,8 @@ async function appendReviewerModelRow(view, rowEl) {
                              ["model catalog unavailable"]));
         return;
     }
-    const overridden = (cat.overridden || []).includes("reviewer");
-    const picker = modelPicker(cat, "reviewer", "", "", {});
+    const overridden = (cat.overridden || []).includes(ctype);
+    const picker = modelPicker(cat, ctype, "", "", {});
     const errEl = el("span", { class: "mgmt-reviewer-err" }, []);
     const post = async (payload) => {
         errEl.textContent = "";
@@ -7428,13 +7440,13 @@ async function appendReviewerModelRow(view, rowEl) {
     const apply = el("button", { class: "btn-small" }, ["Apply"]);
     apply.onclick = () => {
         const v = picker.value();
-        post({ type: "reviewer", model: v.model, effort: v.effort });
+        post({ type: ctype, model: v.model, effort: v.effort });
     };
     rowEl.appendChild(apply);
     if (overridden) {
         rowEl.appendChild(el("span", { class: "type-badge" }, ["overridden"]));
         const reset = el("button", { class: "btn-small" }, ["Reset to default"]);
-        reset.onclick = () => post({ type: "reviewer", clear: true });
+        reset.onclick = () => post({ type: ctype, clear: true });
         rowEl.appendChild(reset);
     }
     rowEl.appendChild(errEl);
@@ -13770,6 +13782,16 @@ function agentsBoxContent(name, d, cat, staged) {
         ? MODEL_PICKER_SPECS.filter(([ct]) => ct !== "supervisor").map(([ct, title, hint]) =>
             [ct, modelPicker(cat, ct, title, hint, { unchanged: true })])
         : [];
+    // A researcher-subagents project: the finding referee's model under
+    // Claude (pi's referee runs pi's model). Read at each referee run, so a
+    // change restarts nothing.
+    const referee = d.subagents === true ? (d.referee || { model: "", effort: "" }) : null;
+    const refereePicker = referee && cat
+        ? modelPicker(cat, "referee", "Referee",
+            "Checks a finding before you accept it. Now: " +
+            (referee.model ? referee.model + (referee.effort ? ", " + referee.effort : "") : "not set") +
+            ". The next referee run uses a change.", { unchanged: true })
+        : null;
     const claudeNotes = [];
     if (claudeInit.unrecognised) {
         claudeNotes.push("Claude's settings hold a value RS does not recognise; it is shown empty.");
@@ -13813,6 +13835,7 @@ function agentsBoxContent(name, d, cat, staged) {
         ...claudeNotes.map((t) => el("div", { class: "hint" }, [t])),
         claudeRows.node,
         ...researchPickers.map(([, p]) => p.node),
+        refereePicker ? refereePicker.node : null,
     ]);
     // ---- pi's tab ----
     const piInit = d.pi || { model: "", thinking: "" };
@@ -13844,6 +13867,9 @@ function agentsBoxContent(name, d, cat, staged) {
         el("div", { class: "hint" }, [
             "What pi's settings say now — a model picked inside pi shows here.",
         ]),
+        referee ? el("div", { class: "hint" }, [
+            "pi's referee, which checks a finding before you accept it, runs this model.",
+        ]) : null,
         piRows.node,
     ]);
     const panels = { claude: claudePanel, pi: piPanel };
@@ -13881,6 +13907,7 @@ function agentsBoxContent(name, d, cat, staged) {
     const applyMsg = el("div", { class: "config-empty" });
     apply.onclick = () => { applyMsg.textContent = agentsBoxApply(name, d, {
         on, local, isDind, isResearch, harness, sw, tp, claudeRows, piRows, researchPickers,
+        refereePicker,
         claude: { model: () => claudeModelI.value.trim(), effort: () => claudeEffortS.value,
                   init: claudeInit },
         pi: { model: () => piModelI.value.trim(), thinking: () => piThinkS.value,
@@ -14264,6 +14291,14 @@ function agentsBoxApply(name, d, f) {
                                        : "Role-MCPs' model: re-runs those services.");
         }
     });
+    if (f.refereePicker) {
+        const v = f.refereePicker.value();
+        if (v.model) payload.referee_model = v.model;
+        if (v.effort) payload.referee_effort = v.effort;
+        if (v.model || v.effort) {
+            lines.push("Referee's model: the next referee run uses it; nothing is restarted.");
+        }
+    }
     if (reset.length) payload.reset = reset;
     if (!lines.length) return "Nothing to change.";
     const validate = () => {

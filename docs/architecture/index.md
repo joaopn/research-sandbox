@@ -35,10 +35,10 @@ flowchart TD
 | Page | Covers |
 |---|---|
 | [Projects](Projects.md) | What a project is, project types, agents, lifecycle |
-| [Research](Research.md) | The research workflows compared: two built, two planned |
+| [Research](Research.md) | The research workflows compared: three built, one planned |
 | ↳ [Research workflow](Research-workflow.md) | Built: how a supervisor plans, runs and reviews workers |
 | ↳ [Researcher workflow](Researcher-workflow.md) | Built: one long-lived agent with a memory the user reads |
-| ↳ [Researcher with subagents](Researcher-with-subagents.md) | Planned: a researcher that delegates analyses and has its claims refereed |
+| ↳ [Researcher with subagents](Researcher-with-subagents.md) | Built: a researcher that hands analyses to parallel helpers and has each finding re-run and refereed |
 | ↳ [Lab workflow](Lab-workflow.md) | Planned: several researchers, a board, a lab meeting, budgets |
 | [Boxes](Boxes.md) | Box types; what a box can see of its project |
 | [MCP servers](MCP-servers.md) | The shared gateway, its server list, wiring to agents and boxes; the older per-project registry |
@@ -62,7 +62,7 @@ Each page ends with its full list of design decisions and their costs; these are
 
 ### [Research](Research.md)
 
-- The existing research workflow is the benchmark and is not changed; three lab-agenda workflows are added beside it, the first (researcher) built and two planned.
+- The existing research workflow is the benchmark and is not changed; three lab-agenda workflows are added beside it, the first two (researcher, researcher with subagents) built and the lab planned.
 - The lab-agenda workflows are independent and built in order: a researcher, a researcher with subagents, a lab.
 - Nothing becomes established knowledge without the user's acceptance; a referee advises the user and binds the agent.
 - Tools before prose, and the same behaviour under Claude and pi.
@@ -80,7 +80,14 @@ Each page ends with its full list of design decisions and their costs; these are
 - One command carries the memory's rules; the front page reaches both agents through their own hooks.
 - Consolidation runs in the background at session end, on the user's model quota.
 
-The planned workflows' decisions are proposals until built; they are listed on [Researcher with subagents](Researcher-with-subagents.md) and [Lab workflow](Lab-workflow.md).
+### [Researcher with subagents](Researcher-with-subagents.md)
+
+- Subagents keep nothing; knowledge stays in the researcher's one memory.
+- Analysts run in parallel and in the background; each result arrives on its own.
+- A finding is re-run and read by an independent referee before the user can accept it; the verdict goes to the researcher's record, and the user decides.
+- A verdict and a re-run are bound to the claim and evidence they judged; a change voids both.
+
+The lab workflow's decisions are proposals until built; they are listed on [Lab workflow](Lab-workflow.md).
 
 ### [Boxes](Boxes.md)
 

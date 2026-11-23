@@ -35,7 +35,7 @@ Pipeline-side agents the supervisor's analysis workers call through the proxy (`
 
 ### Boxes
 
-A project with its own inner Docker (`research`, `researcher`, `sandbox-dind`, `dev`, and the `social-data-pipeline` store workflow) can hold **boxes**: isolated sub-containers, each with its own workspace and no credentials. Add one from the **+** button on the project's tab strip, or with the `rs-sandbox` CLI in the project's terminal; the ✕ on the box's terminal tab removes it. A single-container project (`sandbox` and the other store workflows) cannot hold boxes.
+A project with its own inner Docker (`research`, `researcher`, `researcher-subagents`, `sandbox-dind`, `dev`, and the `social-data-pipeline` store workflow) can hold **boxes**: isolated sub-containers, each with its own workspace and no credentials. Add one from the **+** button on the project's tab strip, or with the `rs-sandbox` CLI in the project's terminal; the ✕ on the box's terminal tab removes it. A single-container project (`sandbox` and the other store workflows) cannot hold boxes.
 
 Each box comes from a **box type** over two images (base, or browser with Playwright + Chromium):
 

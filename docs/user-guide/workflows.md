@@ -13,12 +13,13 @@ A workflow runs in one of two container kinds. An **inner-Docker** project has i
 |---|---|---|---|---|
 | **`research`** (default) | inner Docker | Claude only | operator default | The full lab: a supervisor agent, headless analysis workers and role services |
 | **`researcher`** | inner Docker | Claude or pi | locked | One research agent that does its own analysis and keeps a memory; the Reader tab is always on, because the memory is read there |
+| **`researcher-subagents`** | inner Docker | Claude or pi | locked | A researcher that hands analyses to helpers running in parallel; a finding is re-run and read by an independent referee before you accept it ([how it works](../architecture/Researcher-with-subagents.md)) |
 | **`sandbox-dind`** | inner Docker | Claude or pi | locked | An agent with its own Docker and boxes (`rs-sandbox` in its terminal) |
 | **`sandbox`** | single | none unless chosen | locked | A bare confined container: ssh, byobu, editor. Add agents with `--agent claude` and/or `--agent pi` |
 | **`dev`** | inner Docker | Claude or pi | locked | An agent on one repository's fork in the shared Gitea, delivering through pull requests |
 | **store** workflows | either | Claude | locked | Curated public projects, set up at create (table below) |
 
-The New Project window groups the cards as **Research** (research, researcher), **Base** (sandbox-dind, sandbox, dev) and **Store** (the rest).
+The New Project window groups the cards as **Research** (research, researcher, researcher-subagents), **Base** (sandbox-dind, sandbox, dev) and **Store** (the rest).
 
 A store workflow clones a public GitHub repository at a fixed branch into the workspace and runs its setup once, at create; `open-knowledge` clones nothing and installs an app instead. The shipped store workflows (`research workflow list`):
 
@@ -32,6 +33,7 @@ A store workflow clones a public GitHub repository at a fixed branch into the wo
 ```bash
 python research.py project create lab --workflow research --mount ~/data
 python research.py project create memo --workflow researcher --agent pi
+python research.py project create study --workflow researcher-subagents --agent claude
 python research.py project create pipeline --workflow social-data-pipeline
 python research.py workflow list                 # the full catalog
 ```

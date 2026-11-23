@@ -6,59 +6,79 @@ nav_order: 3
 ---
 # Researcher with subagents
 
-**Planned, not built.** Phase 2 of the lab agenda; see [Research](Research.md) for the other workflows.
+**Built (phase 2 of the lab agenda).** See [Research](Research.md) for the other workflows.
 
-A `researcher-subagents` project holds one researcher, as in the [Researcher workflow](Researcher-workflow.md), with two additions. It hands analyses to short-lived subagents, and an independent referee checks its claims before the user is asked to accept them.
+A `researcher-subagents` project holds one researcher, as in the [Researcher workflow](Researcher-workflow.md): the same agent (Claude, pi or both), the same memory, the same Reader tab. It adds two things. The researcher hands analyses to short-lived helpers that run in parallel, and a finding is re-run and read by an independent referee before the user can accept it.
 
 It is meant to do what the [Research workflow](Research-workflow.md) does with far fewer parts: no worker containers, no role-service containers, no supervision hook.
 
 ```mermaid
 flowchart TD
   user["User"]
-  r["Researcher<br/>memory, record, judgment"]
-  a1["Analyst subagent"]
-  a2["Analyst subagent"]
+  r["Researcher<br/>memory, judgment"]
+  a1["Analyst"]
+  a2["Analyst"]
+  staged["Staged finding"]
+  rerun["Re-run"]
   ref["Referee"]
   rec[("Record")]
-  user -->|"question, acceptance"| r
+  user -->|"question"| r
   r -->|"brief"| a1
   r -->|"brief"| a2
-  a1 -->|"deliverable, report"| r
-  a2 -->|"deliverable, report"| r
-  r -->|"stages a claim"| ref
-  ref -->|"verdict"| user
+  a1 -->|"files, report"| r
+  a2 -->|"files, report"| r
+  r -->|"claim, with its command"| staged
+  staged --> rerun
+  staged --> ref
+  rerun -->|"same, differs, not produced"| r
+  ref -->|"verdict"| r
+  r -->|"both checks"| user
   user -->|"accepts"| rec
 ```
 
-## Delegation
+## Creating one
 
-A subagent knows only what its brief says. The researcher's context is not spent on the analysis, and the analysis is not coloured by everything else the researcher holds.
+**Researcher with subagents** is a project type in the New Project window, beside `research` and `researcher`. Everything a researcher project gets, it gets: the memory, the Reader tab, at least one agent. The helpers are installed into the project's agents when it is created.
 
-A subagent is short-lived and keeps no memory. What it learned comes back in its report, and the researcher writes what matters into its own journal, record or skills.
+## Analysts
 
-## The referee
+An **analyst** carries out one analysis from a brief, in the background, while the conversation goes on. Its brief carries the question, the data paths, where its results go and that it reports the command that reproduces them. It gets nothing else: not the conversation, not the memory rules.
 
-| | A coding checker | The referee |
+Several analysts run at once. Under Claude the researcher launches several in one turn; under pi it launches one per step. Each one's result wakes the session when it ends. An analyst's results land as files in the workspace with a short report, and the researcher writes what matters into its memory.
+
+An analyst has the project's data tools and cannot start helpers of its own. It runs the researcher's model. Under pi its deadline is the longest pi accepts, about 24 days, instead of pi's default 30 minutes.
+
+## A finding's two checks
+
+When the researcher stages a finding, it gives the command that reproduces it, or its reason why the finding cannot be re-run. The user can accept the finding only once both checks below are current; the memory command refuses otherwise and says which is missing.
+
+| | Re-run | Referee |
 |---|---|---|
-| Checks | a change against a plan | a claim against its evidence |
-| Independent of | the author's context | the hypothesis |
-| A failed check leads to | a fix | a narrower claim, or an objection kept on record |
-| Authority | asserts defects | asserts gaps; the user decides |
+| Runs | the finding's command, as a fresh process, writing into a folder of its own | an independent run of the agent with read tools only |
+| Reads | the data, like the first run | the claim, a copy of its evidence and the accepted record, never the researcher's reasoning |
+| Answers | per evidence file: same, differs, or not produced | supported, overreaches (with the narrower claim that would hold), or unsupported |
+| Kept | under the memory, never deleted | under the memory, never deleted |
 
-The referee returns a verdict per claim: supported, overreaches (with the narrower claim that would hold), or unsupported. A claim does not reach the user without a current verdict. The user may accept over an objection, and the objection is recorded on the finding.
+Both checks run in the background and answer the researcher, which tells the user. The user decides: a finding the referee objects to can still be accepted when the user says so, and the objection stays on it. A changed claim or evidence voids both checks. Open questions and retractions need no checks.
 
-A verdict is bound to the content it judged. If the claim or its evidence changes, the referee runs again.
+The web is the researcher's own for a quick lookup. A survey goes to a **surveyor** under Claude: it has only Claude's web search and page fetch, runs in the background, and answers with a summary and its sources. Under pi there is no survey helper yet, and the researcher says so.
 
-## The re-run check
+## The referee's model
 
-Before a claim is staged, the deliverable behind it is run again in a clean environment, and the result is recorded beside the claim. A re-run shows that a deliverable reproduces, not that it is right.
+Under Claude the referee runs the model set for the whole installation in **Sandboxes → Infrastructure → Referee**, Sonnet at high effort by default. A new project of this type starts with it, and a project's own can be changed in its ⚙ Agents box; the next referee run uses the change, and nothing restarts. Under pi the referee runs the project's pi model.
 
-## Design decisions (proposed)
+## Design decisions
 
 **Subagents keep nothing.** Knowledge stays with the researcher, in one memory. The cost is that long-lived workers with their own context are given up; the [Lab workflow](Lab-workflow.md) restores them.
 
-**The referee guards the record, not the work.** A wrong finding that enters the record is built on silently; a wrong intermediate result costs little. The cost is one agent run per result that carries claims.
+**Parallel and in the background by default.** The conversation never waits for an analysis, and each result arrives on its own. The cost is that an analyst costs what the researcher costs per token.
 
-**The referee cannot be briefed by the researcher.** It reads the claim and its evidence, never the researcher's reasoning. How it is started so that this holds is still to be measured.
+**The referee guards the record, not the work.** A wrong finding that enters the record is built on silently; a wrong intermediate result costs little. The cost is one referee run per finding, measured at about $0.04 on Sonnet.
 
-**Checks are conditions, not a sequence.** The researcher may ask for the referee's read early; work with no claims costs no referee run.
+**The referee cannot be briefed by the researcher.** It reads a snapshot of the claim, its evidence and the record, in a folder of its own, never the researcher's reasoning. Its verdict goes to the researcher's record of the finding, and the user accepts; it never goes straight to the user.
+
+**A verdict is bound to what it judged.** A changed claim or evidence voids the verdict and the re-run, so a check never vouches for content it did not see.
+
+**A re-run proves the deliverable reproduces, not that it is right.** A file with a timestamp always shows "differs"; the user judges.
+
+**The checks exist only in projects of this type.** A `researcher` project behaves exactly as before.

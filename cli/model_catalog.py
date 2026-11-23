@@ -19,7 +19,9 @@ Two data files, two jobs:
     ``reviewer`` type (the ephemeral dev-lane reviewer) is the one type never
     frozen into a project marker — ``rscore.review_pr`` resolves it live at each
     run, and ``rscore.model_default_set`` is the sanctioned override writer (the
-    Management-page control).
+    Management-page control). The ``referee`` type (a finding's independent
+    referee in a researcher-subagents project) is frozen into the marker of
+    those projects only, and changed there per project.
 
 `load_defaults()` READS AND VALIDATES (mirroring `box_catalog.load_registry`) — it
 is not a bare merge. That matters because the resolved pairs are frozen into a
@@ -57,8 +59,12 @@ OVERRIDE_PATH = OVERRIDE_DIR / "model-defaults.json"
 # create (lockstep with the marker's `models` block and rscore's per-type request
 # fields); `reviewer` is NEVER marker-frozen — `rscore.review_pr` resolves it
 # live from this catalog at each run, so a defaults change applies to the very
-# next review with no recreate anywhere.
-TYPES = ("supervisor", "worker", "role", "box", "reviewer")
+# next review with no recreate anywhere. `referee` is the independent referee
+# `rs-memory referee` starts on a finding in a researcher-subagents project: it
+# is frozen into the marker of THOSE projects only (models.referee, read by
+# rs-memory inside the container) and overridden per project in its ⚙ Agents
+# box; its default here is what the next such project starts with.
+TYPES = ("supervisor", "worker", "role", "box", "reviewer", "referee")
 
 ALIAS_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 
