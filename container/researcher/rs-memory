@@ -35,6 +35,8 @@ Verbs:
   skill propose|used|promote|retire|sync|list
   consolidate --prompt [--out FILE]  /  consolidate --apply DELTA
   close [--hook] [--agent claude|pi]
+  analyst-check [--hook claude]  whether an analyst's reply names a results
+                                folder holding its writeup.md (reads only)
 
 The checks (--rerun, rerun-command, rerun, referee, --over-objection and
 accept's conditions on a finding) exist only in a project whose record,
@@ -93,6 +95,16 @@ RAW_FIELDS = ("rerun", "command")
 # many characters (its documented hook-output limit); `open --hook` stays under
 # it and says how to read the rest.
 HOOK_OUTPUT_LIMIT = 10_000
+# An analyst's write-up (a researcher-subagents project): the file its results
+# folder holds, the line of its reply that names the folder, and the reminder
+# it is held back with, once, when it ends without that file.
+WRITEUP_FILE = "writeup.md"
+RESULTS_LINE_RE = re.compile(r"\A\s*Results:\s*(.*?)\s*\Z")
+WRITEUP_REMINDER = (
+    f"Before you finish: write your full write-up (method, results, caveats, dead ends, "
+    f"surprises) to {WRITEUP_FILE} in your results folder. Then end your reply with a short "
+    f"summary, your dead ends and surprises one line each, and a last line exactly "
+    f"`Results: <folder>` naming that folder.")
 
 NOTE_KINDS = ("did", "dead-end", "decision", "surprise", "correction")
 # Entries that never call for a consolidation on their own: a consolidation's
@@ -2103,6 +2115,52 @@ def cmd_run(a) -> None:
     sys.exit(run_consolidation(a.agent))
 
 
+# ---------------------------------------------------------------- analysts
+def results_folder(reply: str) -> "str | None":
+    """The folder named by the reply's LAST `Results: <folder>` line, a pair of
+    backticks around it removed; None when there is no such line."""
+    folder = None
+    for line in reply.splitlines():
+        m = RESULTS_LINE_RE.match(line)
+        if m:
+            folder = m.group(1)
+    if folder and len(folder) >= 2 and folder[0] == folder[-1] == "`":
+        folder = folder[1:-1].strip()
+    return folder or None
+
+
+def writeup_missing(reply: str, cwd: "str | None" = None) -> bool:
+    """Whether the reply fails to name a results folder holding the write-up as
+    a regular file (no Results line, no such folder, no file)."""
+    folder = results_folder(reply)
+    if folder is None:
+        return True
+    base = Path(cwd) if cwd else Path.cwd()
+    return not (base / os.path.expanduser(folder) / WRITEUP_FILE).is_file()
+
+
+def cmd_analyst_check(a) -> None:
+    # Called at an analyst's end by Claude's SubagentStop hook and by pi's rules
+    # extension: it reads only, and any failure is silence, so a broken check
+    # lets the analyst go instead of holding it.
+    try:
+        raw = sys.stdin.buffer.read()
+        if a.hook == "claude":
+            data = json.loads(raw)
+            if not isinstance(data, dict) or data.get("stop_hook_active") is True:
+                return
+            reply, cwd = data.get("last_assistant_message"), data.get("cwd")
+            if not isinstance(reply, str):
+                return
+            if writeup_missing(reply, cwd if isinstance(cwd, str) and cwd else None):
+                sys.stdout.write(json.dumps({"decision": "block", "reason": WRITEUP_REMINDER}) + "\n")
+            return
+        if writeup_missing(raw.decode("utf-8", errors="replace")):
+            sys.stdout.write(WRITEUP_REMINDER + "\n")
+    except Exception:
+        return
+
+
 # ----------------------------------------------------------------------- cli
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="rs-memory", description=__doc__.split("\n\n")[0])
@@ -2210,6 +2268,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hook", action="store_true")
     p.add_argument("--agent", choices=("claude", "pi"))
     p.set_defaults(fn=cmd_close)
+
+    p = sub.add_parser("analyst-check", help="at an analyst's end: the reminder when its reply "
+                       "names no results folder holding writeup.md; reads only")
+    p.add_argument("--hook", choices=("claude",),
+                   help="read Claude's hook input and answer as its SubagentStop hook")
+    p.set_defaults(fn=cmd_analyst_check)
 
     p = sub.add_parser("_run", help=argparse.SUPPRESS)
     p.add_argument("--agent", choices=("claude", "pi"), required=True)

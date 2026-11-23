@@ -1,4 +1,4 @@
-// rs-rules v0.9.0
+// rs-rules v0.10.0
 //
 // Claude Code's rules capability for pi, one-to-one, as an RS-owned extension.
 // Shipped inside the pi dist (share/pi-agent/rs/rs-rules.ts) and named from the
@@ -70,10 +70,20 @@
 // is not carried; the shell command `pi mcp list` (which loads no extension)
 // does not list these servers from a subfolder.
 //
+// An analyst's write-up, as Claude Code's SubagentStop hook does it in a
+// researcher-subagents project: in RS's `analyst` child only, the last reply's
+// text is kept, and when the child is about to settle the memory command
+// (`rs-memory analyst-check`, on PATH in a researcher project) reads it; when the
+// reply names no results folder holding the write-up, the command prints its
+// reminder and the child takes one more turn with it, as a hidden message. Once
+// per child session: the next settle lets it go, written or not. The command
+// missing, failing or slow lets it go too; never an error, never a loop.
+//
 // Every handler is wrapped: a failure warns and returns nothing (a thrown
 // tool_call handler would BLOCK the tool — the catch is load-bearing).
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import * as childProcess from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -1099,6 +1109,91 @@ export function subagentsApiPath(self: string | null): string | null {
 }
 
 // ---------------------------------------------------------------------------
+// The analyst's write-up check (see the header).
+// ---------------------------------------------------------------------------
+
+export const ANALYST_ROLE = "analyst";
+export const ANALYST_CHECK_COMMAND = "rs-memory";
+export const ANALYST_CHECK_ARGS = ["analyst-check"];
+// The check reads its input and looks at one file; a Python start is well under
+// a second. Past this bound the check counts as broken and the analyst goes:
+// a few seconds more at an analyst's end goes unnoticed, while a tighter bound
+// could skip the reminder on a loaded container.
+export const ANALYST_CHECK_TIMEOUT_MS = 10_000;
+// The hidden message the reminder rides in.
+export const WRITEUP_MESSAGE_TYPE = "rs-writeup";
+
+// The text of an assistant message (its text parts, joined); null for any
+// other message.
+export function assistantText(message: unknown): string | null {
+  const m = message as any;
+  if (m?.role !== "assistant" || !Array.isArray(m.content)) return null;
+  return m.content
+    .filter((c: any) => c?.type === "text" && typeof c.text === "string")
+    .map((c: any) => c.text)
+    .join("");
+}
+
+// Run the check with the reply on stdin, in `cwd`: its output (trimmed) when it
+// exits 0, "" for anything else (missing, failing, killed at the bound).
+export function runAnalystCheck(
+  reply: string,
+  cwd: string,
+  timeoutMs: number = ANALYST_CHECK_TIMEOUT_MS,
+  command: string = ANALYST_CHECK_COMMAND,
+): Promise<string> {
+  return new Promise((resolve) => {
+    let out = "";
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const finish = (v: string) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(v);
+    };
+    let child: childProcess.ChildProcess;
+    try {
+      child = childProcess.spawn(command, ANALYST_CHECK_ARGS, { cwd, stdio: ["pipe", "pipe", "ignore"] });
+    } catch {
+      finish("");
+      return;
+    }
+    timer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+      finish("");
+    }, timeoutMs);
+    child.on("error", () => finish(""));
+    child.stdout?.setEncoding("utf8");
+    child.stdout?.on("data", (d: string) => {
+      out += d;
+    });
+    child.on("close", (code) => finish(code === 0 ? out.trim() : ""));
+    child.stdin?.on("error", () => {});
+    try {
+      child.stdin?.end(reply);
+    } catch {
+      /* the close or error event decides */
+    }
+  });
+}
+
+// What `agent_before_settle` returns to hold the child back with `reminder`.
+export function writeupHold(entries: unknown, reminder: string): { entries: unknown[]; continue: true } {
+  return {
+    entries: [
+      ...(Array.isArray(entries) ? entries : []),
+      { type: "custom_message", customType: WRITEUP_MESSAGE_TYPE, content: reminder, display: false },
+    ],
+    continue: true,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // The extension.
 // ---------------------------------------------------------------------------
 
@@ -1133,6 +1228,11 @@ export default function rsRules(pi: ExtensionAPI) {
   const inFlight = new Map<string, { seq: number; file: string; topLevel: boolean; notice: string | null }>();
   const cwdFiles = new Set<string>(); // every per-call file named, removed by name
   const fileNotices = new Map<string, string>(); // toolCallId -> reset notice for a file tool's result
+  // The analyst's write-up check: whether this session is RS's analyst, its
+  // last reply's text, and whether it was held back already.
+  let analyst = false;
+  let lastReply = "";
+  let writeupHeld = false;
 
   const hasUI = () => !!(uiCtx && (uiCtx as any).hasUI);
   const parentUI = (): ((line: string) => void) | null => {
@@ -1370,6 +1470,8 @@ export default function rsRules(pi: ExtensionAPI) {
       rediscover(ctx);
       rebuildFromBranch(ctx);
       resetShell(ctx);
+      lastReply = "";
+      writeupHeld = false;
       const launch =
         disc!.rules.filter((r) => !r.paths).length + disc!.outer.length + (disc!.claudeMd ? 1 : 0) + (disc!.claudeLocal ? 1 : 0);
       const scoped = disc!.rules.filter((r) => !!r.paths).length;
@@ -1410,6 +1512,7 @@ export default function rsRules(pi: ExtensionAPI) {
         parts.push(`## ${r.label}\n\n${r.body}`);
       };
       const role = leanRole(event.systemPromptOptions?.customPrompt);
+      analyst = role === ANALYST_ROLE;
       const lean = role ? leanRules(role, home, LEAN_PROJECT_DIR, already) : null;
       if (lean) {
         for (const r of lean) push(r);
@@ -1606,6 +1709,27 @@ export default function rsRules(pi: ExtensionAPI) {
       return { content };
     }
   };
+
+  pi.on("message_end", async (event: any, _ctx) => {
+    guarded("message_end", () => {
+      if (!analyst) return;
+      const text = assistantText(event?.message);
+      if (text) lastReply = text;
+    });
+  });
+
+  pi.on("agent_before_settle" as any, async (event: any, ctx: any) => {
+    if (!analyst || writeupHeld) return undefined;
+    try {
+      const reminder = await runAnalystCheck(lastReply, (ctx && typeof ctx.cwd === "string" && ctx.cwd) || process.cwd());
+      if (!reminder) return undefined;
+      writeupHeld = true;
+      return writeupHold(event?.entries, reminder);
+    } catch (e) {
+      warn(`analyst check failed: ${e instanceof Error ? e.message : String(e)}`);
+      return undefined;
+    }
+  });
 
   pi.on("session_compact", async (_event, _ctx) => {
     guarded("session_compact", () => {

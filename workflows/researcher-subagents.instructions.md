@@ -43,7 +43,12 @@ To launch analysts in parallel:
 - **Claude Code:** several `Agent` calls with `subagent_type: analyst` in one turn. They run in the background; each one's result arrives when it ends.
 - **pi:** one `subagent` call per step with `agent: analyst`; launch the next in the following step. Each runs in the background and its result arrives on its own.
 
-Go on with the PI meanwhile. An analyst's results land as files with a short report. Read them, write what matters into the memory (a `note`, a `claim` with the files as evidence), and check what it claims before you stage it. Check its reproduce command against those rules before you stage the finding: outputs only into `$RS_RERUN_OUT`, and no timings, timestamps, host names or unordered rows in an evidence file.
+Go on with the PI meanwhile. An analyst's results are files in its results folder, with its full write-up in `writeup.md` there. Its reply is only a summary: what it found, its files, its reproduce command, its dead ends and surprises one line each, and a last line `Results: <folder>`. When one ends:
+- Journal each dead end and surprise its summary lists: `rs-memory note "<headline>" --kind dead-end` or `--kind surprise`, with `--body` for the why.
+- Check that its `writeup.md` exists, and read it when you need the detail: the method, a caveat, the numbers behind a result.
+- Write what matters into the memory (a `note`, a `claim` with the files as evidence), and check what it claims before you stage it.
+
+Check an analyst's reproduce command against those rules before you stage its finding: outputs only into `$RS_RERUN_OUT`, and no timings, timestamps, host names or unordered rows in an evidence file.
 
 ## The web
 

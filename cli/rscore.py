@@ -18165,18 +18165,26 @@ MEMORY_KIT_LABEL = "research.memory-kit"
 # start relying on something new in rs-memory (a verb or an option): the
 # instructions follow the host's code at every start, while the command
 # follows the image, so an older image must be refused, never run.
-MEMORY_KIT_VERSION = "2"
+MEMORY_KIT_VERSION = "3"
 MEMORY_TOOL = f"{RS_LIB_DIR}/rs-memory"
 MEMORY_LINKS = ("rs-memory",)
 MEMORY_AGENTS = ("claude", "pi")
 MEMORY_PI_EXT_SRC = SCRIPT_DIR / "container" / "researcher" / "rs-memory.ts"
-# Claude's hook entries the kit merges, event -> command (matched by exact
+# Claude's hook entries the kit merges: the event, the command and, for an
+# entry that applies to one kind of subagent, its matcher (matched by exact
 # command, never touching other entries).
-MEMORY_CLAUDE_HOOKS = {
+MEMORY_CLAUDE_HOOKS = (
     # the front page into the context at every start, resume, clear and compaction
-    "SessionStart": f"{MEMORY_TOOL} open --hook",
-    "SessionEnd": f"{MEMORY_TOOL} close --hook --agent claude",
-}
+    {"event": "SessionStart", "command": f"{MEMORY_TOOL} open --hook"},
+    {"event": "SessionEnd", "command": f"{MEMORY_TOOL} close --hook --agent claude"},
+)
+# A researcher-subagents project's own: an analyst that ends without its
+# write-up is held back once with a reminder (the command answers nothing on
+# the second stop, so it is let go).
+MEMORY_CLAUDE_SUBAGENTS_HOOKS = (
+    {"event": "SubagentStop", "matcher": "analyst",
+     "command": f"{MEMORY_TOOL} analyst-check --hook claude"},
+)
 MEMORY_KIT_OLD_IMAGE_CREATE = (
     "this RS's project image has an older memory command than the researcher "
     "project type needs, or none: rebuild RS's images with Rebuild all on "
@@ -18202,7 +18210,7 @@ MEMORY_KIT_AGENT_FAILED = (
     "the research memory could not be set up for {who} in this project (its settings "
     "could not be written); stop the project and start it again")
 # One script for both agents, run as the agent user with HOME set: $1 is the
-# Claude hooks as JSON, then the agents. Claude: built-in memory off and the
+# Claude hook entries as a JSON list, then the agents. Claude: built-in memory off and the
 # hooks merged into settings.json (a `hooks` that is not an object, or an event
 # that is not a list, fails the write, never replaced); pi: the extension from
 # stdin into its extensions/ folder. Prints `<agent>=<on|absent|failed>`.
@@ -18211,11 +18219,12 @@ MEMORY_CLAUDE_JQ = (
     ' .autoMemoryEnabled = false'
     ' | .hooks = (if .hooks == null then {} elif (.hooks | type) == "object" then .hooks'
     ' else error("hooks is not an object") end)'
-    ' | reduce ($hooks | to_entries[]) as $h (.;'
-    ' .hooks[$h.key] = (if .hooks[$h.key] == null then [] elif (.hooks[$h.key] | type) == "array"'
-    ' then .hooks[$h.key] else error("a hook event is not a list") end)'
-    ' | if (.hooks[$h.key] | has_cmd($h.value)) then .'
-    ' else .hooks[$h.key] += [{"hooks": [{"type": "command", "command": $h.value}]}] end)')
+    ' | reduce $hooks[] as $h (.;'
+    ' .hooks[$h.event] = (if .hooks[$h.event] == null then [] elif (.hooks[$h.event] | type) == "array"'
+    ' then .hooks[$h.event] else error("a hook event is not a list") end)'
+    ' | if (.hooks[$h.event] | has_cmd($h.command)) then .'
+    ' else .hooks[$h.event] += [(if $h.matcher == null then {} else {"matcher": $h.matcher} end)'
+    ' + {"hooks": [{"type": "command", "command": $h.command}]}] end)')
 MEMORY_KIT_SCRIPT = (
     'hooks="$1"; shift\n'
     'cs="$HOME/.claude/settings.json"; pd="$HOME/.local/share/pi-agent/agent"\n'
@@ -18249,8 +18258,14 @@ def _image_memory_kit(image: str) -> bool:
     return r.returncode == 0 and (r.stdout or "").strip() == MEMORY_KIT_VERSION
 
 
+def _memory_claude_hooks(subagents: bool) -> "list[dict[str, str]]":
+    """The Claude hook entries the kit merges into a project's agent: the
+    researcher's, plus the analyst's in a researcher-subagents project."""
+    return [*MEMORY_CLAUDE_HOOKS, *(MEMORY_CLAUDE_SUBAGENTS_HOOKS if subagents else ())]
+
+
 def _memory_kit_exec(container: str, agents: "Sequence[str]",
-                     home: str = _AGENT_HOME) -> "dict[str, str]":
+                     home: str = _AGENT_HOME, *, subagents: bool = False) -> "dict[str, str]":
     """Run MEMORY_KIT_SCRIPT in a RUNNING container as the agent user: {agent:
     state}; an agent the script did not answer for reads "failed"."""
     agents = [a for a in agents if a in MEMORY_AGENTS]
@@ -18259,7 +18274,8 @@ def _memory_kit_exec(container: str, agents: "Sequence[str]",
     try:
         ext = MEMORY_PI_EXT_SRC.read_text(encoding="utf-8") if "pi" in agents else ""
         r = run(["docker", "exec", "-i", "-u", "1000", "-e", f"HOME={home}", container,
-                 "sh", "-c", MEMORY_KIT_SCRIPT, "sh", json.dumps(MEMORY_CLAUDE_HOOKS), *agents],
+                 "sh", "-c", MEMORY_KIT_SCRIPT, "sh", json.dumps(_memory_claude_hooks(subagents)),
+                 *agents],
                 input=ext, capture_output=True, timeout=AGENT_SETTINGS_EXEC_TIMEOUT_S)
         out = r.stdout or ""
     except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError, ValueError):
@@ -18306,7 +18322,8 @@ def _apply_memory_kit(project: str, container: str, workspace_path: "Path",
     if not linked:
         items.append(OldInstructions("memory-kit", project, reason=MEMORY_KIT_LINK_FAILED))
     agents = [a for a in local if a in MEMORY_AGENTS]
-    states = _memory_kit_exec(container, agents, home)
+    states = _memory_kit_exec(container, agents, home,
+                              subagents=data.get(SUBAGENTS_RECORD_KEY) is True)
     items += [OldInstructions("memory-kit", project,
                               reason=MEMORY_KIT_AGENT_FAILED.format(who=_who(a)))
               for a in agents if states.get(a) != "on"]
