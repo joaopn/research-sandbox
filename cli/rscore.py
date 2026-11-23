@@ -19724,6 +19724,9 @@ def mcp_server_test(req: McpServerNameRequest) -> dict:
 MCP_GATEWAY_PORT = 8888
 # Set on both dind images: their inner guard lets a box reach the gateway.
 MCP_GUARD_LABEL = "research.mcp-gateway-guard"
+# Set by agent/Dockerfile.supervisor: its worker spawn tool can give a worker
+# the gateway servers wired for the project's analysis workers.
+MCP_WORKERS_LABEL = "research.mcp-gateway-workers"
 MCP_SYNC_SCRIPT = SCRIPT_DIR / "agent" / "rs-mcp-sync.py"
 MCP_SYNC_HOME_DIR = ".rs-mcp"
 MCP_APPLIED_FILE = "mcp-applied.json"
@@ -19746,6 +19749,9 @@ _MCP_INNER_FIXED_RANGES = ("172.17.0.0/16",) + tuple(
 MCP_OLD_IMAGE_BOX = ("this project was made before boxes could reach the MCP "
                      "gateway; Stop and Start it (after Rebuild all under "
                      "Sandboxes → Software) and wire its boxes then")
+MCP_OLD_IMAGE_WORKERS = ("this project was made before its analysis workers could "
+                         "use the MCP gateway; Stop and Start it (after Rebuild "
+                         "all under Sandboxes → Software) and wire its workers then")
 MCP_GATEWAY_ABSENT = ("the MCP gateway has not been started yet; use Start on "
                       "this page first")
 
@@ -19864,14 +19870,22 @@ def mcp_gateway_attach_all() -> None:
     _mcp_note_subnets(subnets)
 
 
-def _mcp_wanted(row: dict | None) -> dict:
+def _mcp_wanted(row: dict | None, descriptions: dict | None = None) -> dict:
     """What a project's sync tool is told: names and tokens per consumer (a
-    secret: it goes to the project container's home, never to .orchestrator)."""
+    secret: it goes to the project container's home, never to .orchestrator).
+    The analysis workers' set ("workers", present only when the row has that
+    consumer) also carries each server's one-line description, for the worker
+    spawn tool; the sync tool itself reads only "agent" and "boxes"."""
     wanted: dict = {"agent": {"servers": {}}, "boxes": {}}
     for key, c in ((row or {}).get("consumers") or {}).items():
         servers = {name: c["token"] for name in c["servers"]}
         if key == mcp_servers.AGENT_CONSUMER:
             wanted["agent"] = {"servers": servers}
+        elif key == mcp_servers.WORKERS_CONSUMER:
+            wanted["workers"] = {
+                "servers": servers,
+                "descriptions": {name: (descriptions or {}).get(name, "")
+                                 for name in c["servers"]}}
         else:
             wanted["boxes"][key[len(mcp_servers.BOX_CONSUMER_PREFIX):]] = {"servers": servers}
     return wanted
@@ -19912,6 +19926,22 @@ def _mcp_stage(container: str, wanted: dict, deadline: float | None) -> bool:
     return r.returncode == 0
 
 
+def _mcp_descriptions(servers: dict) -> dict:
+    """Each server's one-line description, from the list's entries."""
+    return {name: e.get("description", "") for name, e in servers.items()
+            if isinstance(e, dict) and isinstance(e.get("description", ""), str)}
+
+
+def _mcp_descriptions_tolerant() -> dict:
+    """The descriptions, read without the lock and without ever refusing: a
+    list that cannot be read gives none (they only label what is granted)."""
+    try:
+        state, data, _why = mcp_servers.read()
+    except OSError:
+        return {}
+    return _mcp_descriptions(data["servers"]) if state == mcp_servers.OK else {}
+
+
 def _mcp_sync_cmd(container: str, scope: list[str], detach: bool) -> list[str]:
     return ["docker", "exec", *(["-d"] if detach else []), "-u", "1000",
             "-e", f"HOME={_AGENT_HOME}", container, "python3",
@@ -19936,7 +19966,9 @@ def mcp_sync_project(project: str, container: str, *, progress=None) -> None:
     try:
         if _mcp_gateway_container(None)[0] != "absent":
             _mcp_note_subnets({project: _mcp_gateway_attach(project, None, dind=dind)})
-        if not _mcp_stage(container, _mcp_wanted(row), None):
+        descriptions = (_mcp_descriptions_tolerant()
+                        if mcp_servers.WORKERS_CONSUMER in row["consumers"] else None)
+        if not _mcp_stage(container, _mcp_wanted(row, descriptions), None):
             raise ValidationError("the project's MCP servers could not be staged")
         run(_mcp_sync_cmd(container, ["--agent"], detach=True), capture_output=True)
     except (ValidationError, OSError) as e:
@@ -19961,6 +19993,9 @@ def _mcp_read_applied(project: str) -> dict:
     if not isinstance(data, dict):
         return out
     for key, entry in data.items():
+        # The workers consumer has no record: the sync tool never applies it.
+        if key == mcp_servers.WORKERS_CONSUMER:
+            continue
         if mcp_servers.consumer_problem(key) or not isinstance(entry, dict) \
                 or entry.get("state") not in _MCP_APPLIED_STATES:
             continue
@@ -19998,18 +20033,20 @@ def mcp_wiring(project: str | None = None) -> dict:
 
 def mcp_targets(deadline: float | None = None) -> list:
     """What the page can offer to wire: each project, whether its own agent
-    can be wired, and its boxes. ONE bounded container listing; the boxes come
-    from each project's own record (a host file read)."""
+    can be wired, whether it has analysis workers (and whether its image lets
+    them use the gateway), and its boxes. ONE bounded container listing; the
+    boxes come from each project's own record (a host file read)."""
     fmt = ("{{.Names}}\t{{.State}}\t{{.Label \"" + SUBSTRATE_LABEL + "\"}}\t{{.Label \""
-           + PROJECT_TYPE_LABEL + "\"}}\t{{.Label \"" + MCP_GUARD_LABEL + "\"}}")
+           + PROJECT_TYPE_LABEL + "\"}}\t{{.Label \"" + MCP_GUARD_LABEL + "\"}}\t{{.Label \""
+           + MCP_WORKERS_LABEL + "\"}}")
     r = _mcp_docker(["docker", "ps", "-a", "--filter", f"label={PROJECT_LABEL}",
                      "--format", fmt], deadline)
     prefix = container_name_for("")
     cfg = load_config()
     out = []
     for line in (r.stdout or "").splitlines() if r.returncode == 0 else []:
-        parts = (line.split("\t") + [""] * 5)[:5]
-        cname, state, substrate, ptype, guard = parts
+        parts = (line.split("\t") + [""] * 6)[:6]
+        cname, state, substrate, ptype, guard, workers_label = parts
         if not cname.startswith(prefix) or not _PROJECT_NAME_RE.match(cname[len(prefix):]):
             continue
         project = cname[len(prefix):]
@@ -20024,17 +20061,20 @@ def mcp_targets(deadline: float | None = None) -> list:
                 boxes = []
         out.append({"project": project, "running": state == "running",
                     "agent": not research, "boxes": boxes,
-                    "boxes_wirable": guard == "1"})
+                    "boxes_wirable": guard == "1",
+                    "workers": research, "workers_wirable": workers_label == "1"})
     return sorted(out, key=lambda t: t["project"])
 
 
 @dataclass(frozen=True)
 class McpWireRequest:
-    """Set the servers one consumer has: a project's own agents (no box) or one
-    of its boxes. An empty list unwires it."""
+    """Set the servers one consumer has: a project's own agents (no box, not
+    workers), one of its boxes, or a research project's analysis workers. An
+    empty list unwires it."""
     project: str
     box: str | None
     servers: tuple
+    workers: bool = False
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "McpWireRequest":
@@ -20051,7 +20091,13 @@ class McpWireRequest:
             raise ValidationError("the servers must be a list of server names")
         if len(set(servers)) != len(servers):
             raise ValidationError("a server is named twice")
-        return cls(project=project, box=box, servers=tuple(sorted(servers)))
+        workers = kw.get("workers", False)
+        if not isinstance(workers, bool):
+            raise ValidationError("the analysis workers choice must be true or false")
+        if workers and box is not None:
+            raise ValidationError("choose the analysis workers or one box, not both")
+        return cls(project=project, box=box, servers=tuple(sorted(servers)),
+                   workers=workers)
 
 
 def mcp_wire(req: McpWireRequest, *, blocking: bool = True,
@@ -20060,7 +20106,8 @@ def mcp_wire(req: McpWireRequest, *, blocking: bool = True,
     the project's network (a refusal there writes nothing) → the table (the
     gateway's truth) → the project applies it to its agents. Returns the
     project's wiring and what was applied ({"state": "pending"} for a stopped
-    project or box)."""
+    project or box). The analysis workers are only staged, never applied:
+    {"state": "staged"}, or "pending" when the project is stopped."""
     container = container_name_for(req.project)
     r = _mcp_docker(["docker", "container", "inspect", "-f",
                      "{{.State.Running}} {{json .Config.Labels}}", container], deadline)
@@ -20075,7 +20122,14 @@ def mcp_wire(req: McpWireRequest, *, blocking: bool = True,
     dind = labels.get(SUBSTRATE_LABEL, Substrate.DIND_SYSBOX.value) != Substrate.DOCKER.value
     research = dind and labels.get(PROJECT_TYPE_LABEL, PROJECT_TYPE_RESEARCH) \
         in ("", PROJECT_TYPE_RESEARCH)
-    if req.box is None and research:
+    if req.workers:
+        if not research:
+            raise ValidationError(
+                f"project {req.project} has no analysis workers: only a "
+                "research project has them")
+        if req.servers and labels.get(MCP_WORKERS_LABEL) != "1":
+            raise ValidationError(MCP_OLD_IMAGE_WORKERS)
+    elif req.box is None and research:
         raise ValidationError(
             "a research project's own agent plans and delegates; MCP servers "
             "there are for its workers and its boxes, so it cannot be wired")
@@ -20093,7 +20147,7 @@ def mcp_wire(req: McpWireRequest, *, blocking: bool = True,
     if _mcp_gateway_container(deadline)[0] == "absent":
         raise ValidationError(MCP_GATEWAY_ABSENT)
     subnet = _mcp_gateway_attach(req.project, deadline, dind=dind)
-    key = mcp_servers.consumer_key(req.box)
+    key = mcp_servers.consumer_key(req.box, workers=req.workers)
     try:
         with mcp_servers.lock(blocking=blocking):
             known = mcp_servers.load()["servers"]
@@ -20122,10 +20176,17 @@ def mcp_wire(req: McpWireRequest, *, blocking: bool = True,
                 consumer["servers"] = []
             mcp_servers.save_grants(data)
             mcp_servers.render_grants(data)
-            wanted = _mcp_wanted(row)
+            wanted = _mcp_wanted(row, _mcp_descriptions(known))
     except mcp_servers.ServerListError as e:
         raise _mcp_list_error(e) from None
     _mcp_gateway_hup(deadline)
+    if req.workers:
+        # Nothing in the project applies it: the supervisor's spawn tool reads
+        # the staged set when it next spawns a worker. A stopped project (or
+        # one where staging failed) is staged again at its next start.
+        staged = running and _mcp_stage(container, wanted, deadline)
+        return {"wiring": mcp_wiring(req.project), "consumer": key,
+                "applied": {"state": "staged" if staged else "pending"}}
     applied: dict = {"state": "pending"}
     if running and _mcp_stage(container, wanted, deadline):
         scope = ["--agent"] if req.box is None else ["--box", req.box]

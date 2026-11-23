@@ -870,7 +870,7 @@ _MCP_SERVER_ACTIONS = {
 }
 # The wiring actions (POST /broker/mcp/<action>): same handler factory.
 _MCP_WIRING_ACTIONS = {
-    "wire": ("mcp_wire", ("project", "box", "servers")),
+    "wire": ("mcp_wire", ("project", "box", "servers", "workers")),
     "wiring-reset": ("mcp_grants_reset", ()),
 }
 

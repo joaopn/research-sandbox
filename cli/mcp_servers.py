@@ -265,16 +265,28 @@ def public_view(data: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 # --- wiring: which consumer may use which server ------------------------------
-# A consumer is one project's own agents ("agent") or one of its boxes
-# ("box:<name>"). Each has a token; the gateway forwards a call only for a known
+# A consumer is one project's own agents ("agent"), one of its boxes
+# ("box:<name>"), or a research project's analysis workers ("workers": one
+# token for every worker; the supervisor names, per worker at spawn, which of
+# the consumer's servers that worker gets). Each has a token; the gateway forwards a call only for a known
 # token, arriving from that project's network, to a server on that consumer's
 # list. The table holds the tokens in clear (0600, host only); what the gateway
 # mounts holds their SHA-256.
 
 GRANTS_PATH = STATE_DIR / "mcp-grants.json"
 GRANTS_RENDERED_NAME = "grants.json"
-GRANTS_VERSION = 1
+# The version the writer writes. 2 added the workers consumer; the shape is
+# otherwise that of 1, which is still read. Bumped so that an RS that knows
+# only 1 reads a table holding a workers consumer as "written by a newer
+# version" (nothing changed) instead of as damaged (whose remedy discards
+# every project's wiring).
+GRANTS_VERSION = 2
+GRANTS_READABLE_VERSIONS = (1, 2)
+# The file the gateway mounts keeps its own version: its format did not change
+# with the table's, and the gateway program is not rebuilt for it.
+GRANTS_RENDERED_VERSION = 1
 AGENT_CONSUMER = "agent"
+WORKERS_CONSUMER = "workers"
 BOX_CONSUMER_PREFIX = "box:"
 # Project and box names as RS itself validates them (ASCII alnum first, then
 # alnum, dash, underscore); re-checked here because the table is a file.
@@ -299,17 +311,20 @@ def new_token() -> str:
     return secrets.token_hex(32)
 
 
-def consumer_key(box: str | None) -> str:
+def consumer_key(box: str | None, workers: bool = False) -> str:
+    if workers:
+        return WORKERS_CONSUMER
     return AGENT_CONSUMER if box is None else BOX_CONSUMER_PREFIX + box
 
 
 def consumer_problem(key: Any) -> str | None:
-    if key == AGENT_CONSUMER:
+    if key in (AGENT_CONSUMER, WORKERS_CONSUMER):
         return None
     if isinstance(key, str) and key.startswith(BOX_CONSUMER_PREFIX) \
             and _NAME_PART_RE.match(key[len(BOX_CONSUMER_PREFIX):]):
         return None
-    return "a consumer is the project's agent or one of its boxes"
+    return ("a consumer is the project's agent, its analysis workers or one "
+            "of its boxes")
 
 
 def _subnet_ok(value: Any) -> bool:
@@ -350,9 +365,10 @@ def judge_grants(raw: bytes) -> tuple[str, dict[str, Any], str | None]:
         return DAMAGED, grants_empty(), "it does not hold a table object"
     version = data.get("version")
     if isinstance(version, int) and not isinstance(version, bool) \
-            and version > GRANTS_VERSION:
+            and version > max(GRANTS_READABLE_VERSIONS):
         return NEWER, grants_empty(), None
-    if isinstance(version, bool) or version != GRANTS_VERSION:
+    # `True == 1`: a boolean is not a version.
+    if isinstance(version, bool) or version not in GRANTS_READABLE_VERSIONS:
         return DAMAGED, grants_empty(), "it does not have the expected shape"
     problem = _grants_shape_problem(data)
     if problem:
@@ -382,8 +398,9 @@ def load_grants() -> dict[str, Any]:
 
 
 def save_grants(data: dict[str, Any]) -> None:
+    """Always written at GRANTS_VERSION, whatever version it was read at."""
     try:
-        _write_private(GRANTS_PATH, _dump(data))
+        _write_private(GRANTS_PATH, _dump(dict(data, version=GRANTS_VERSION)))
     except OSError as e:
         raise ServerListError("cannot save the MCP wiring table on the host "
                               f"({e.strerror or 'write failed'})") from e
@@ -403,7 +420,7 @@ def rendered_grants(data: dict[str, Any]) -> dict[str, Any]:
         for key, c in row["consumers"].items():
             consumers[token_digest(c["token"])] = {
                 "project": project, "consumer": key, "servers": list(c["servers"])}
-    return {"version": GRANTS_VERSION, "consumers": consumers, "subnets": subnets}
+    return {"version": GRANTS_RENDERED_VERSION, "consumers": consumers, "subnets": subnets}
 
 
 def render_grants(data: dict[str, Any]) -> None:

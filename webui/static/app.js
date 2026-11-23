@@ -2832,6 +2832,17 @@ const MCP_APPLY_STATE_TEXT = {
     "no agent": "Saved. No agent is deployed there yet.",
     failed: "Saved, but it could not be applied in the container.",
 };
+// The analysis workers' servers are never applied in the project: the
+// supervisor gives each worker its own share when it spawns it. The choice's
+// value starts with ":", which is never in a box name.
+const MCP_WORKERS_CHOICE = ":workers";
+const MCP_WORKERS_NOW = "Workers spawned from now on can be given these servers; "
+    + "running workers keep theirs until they are spawned again.";
+const MCP_WORKERS_SAVED_TEXT = {
+    staged: "Saved. Workers spawned from now on can be given it; running workers "
+        + "keep theirs until they are spawned again.",
+    pending: "Saved. It reaches the project’s workers when the project next starts.",
+};
 
 // The lines for one consumer's last apply: one per agent and server, or the
 // one sentence of a state that is not "applied".
@@ -2882,8 +2893,9 @@ function mcpWiringSection(view, servers, wiring) {
     }
     const targets = Array.isArray(wiring.targets) ? wiring.targets : [];
     section.appendChild(el("div", { class: "mgmt-settings-hint" }, [
-        "Give a project’s agent, or one of its boxes, the servers it may use. "
-        + "Nothing restarts; an agent sees a change in its next session."]));
+        "Give a project’s agent, one of its boxes, or a research project’s "
+        + "analysis workers the servers it may use. Nothing restarts; an agent "
+        + "sees a change in its next session, a worker when it is spawned."]));
     if (!targets.length || !servers.length) {
         section.appendChild(el("div", { class: "mgmt-settings-hint" }, [
             !servers.length ? "Add a server first." : "There is no project to wire yet."]));
@@ -2898,7 +2910,8 @@ function mcpWiringSection(view, servers, wiring) {
     const save = el("button", { class: "btn btn-secondary" }, ["Save"]);
     const ticked = new Set();
     const target = () => targets.find((t) => t.project === projectSel.value) || targets[0];
-    const consumerKey = () => (whoSel.value === "" ? "agent" : "box:" + whoSel.value);
+    const consumerKey = () => (whoSel.value === "" ? "agent"
+        : whoSel.value === MCP_WORKERS_CHOICE ? "workers" : "box:" + whoSel.value);
     const current = () => {
         const row = (wiring.projects || {})[projectSel.value] || {};
         return row[consumerKey()] || null;
@@ -2917,19 +2930,29 @@ function mcpWiringSection(view, servers, wiring) {
             };
             return card;
         }));
-        status.replaceChildren(...(cur && cur.servers.length
-            ? mcpAppliedLines(cur.applied).map((l) => el("div", {}, [l])) : []));
+        const lines = !(cur && cur.servers.length) ? []
+            : whoSel.value === MCP_WORKERS_CHOICE ? [MCP_WORKERS_NOW]
+            : mcpAppliedLines(cur.applied);
+        status.replaceChildren(...lines.map((l) => el("div", {}, [l])));
     };
     const drawWho = () => {
         const t = target();
         const options = [];
         if (t.agent) options.push(el("option", { value: "" }, ["The project’s agent"]));
+        if (t.workers) {
+            options.push(el("option", { value: MCP_WORKERS_CHOICE }, ["Analysis workers"]));
+        }
         for (const b of t.boxes) options.push(el("option", { value: b }, ["Box: " + b]));
         whoSel.replaceChildren(...options);
         const lines = [];
         if (!t.agent) {
             lines.push("A research project’s own agent plans and delegates; "
-                       + "its boxes can be wired here.");
+                       + "its analysis workers and its boxes can be wired here.");
+        }
+        if (t.workers && !t.workers_wirable) {
+            lines.push("This project was made before its analysis workers could use "
+                       + "the MCP gateway: Stop and Start it (after Rebuild all under "
+                       + "Sandboxes → Software) before wiring its workers.");
         }
         if (t.boxes.length && !t.boxes_wirable) {
             lines.push("This project was made before boxes could reach the MCP gateway: "
@@ -2945,7 +2968,8 @@ function mcpWiringSection(view, servers, wiring) {
     whoSel.onchange = drawCards;
     save.onclick = async () => {
         const payload = { project: projectSel.value, servers: Array.from(ticked).sort() };
-        if (whoSel.value !== "") payload.box = whoSel.value;
+        if (whoSel.value === MCP_WORKERS_CHOICE) payload.workers = true;
+        else if (whoSel.value !== "") payload.box = whoSel.value;
         save.disabled = true;
         status.replaceChildren(el("div", {}, ["Saving…"]));
         const { status: code, body } = await mcpPost("/broker/mcp/wire", payload);
@@ -2959,8 +2983,12 @@ function mcpWiringSection(view, servers, wiring) {
         }
         // Re-read the page (the server rows count who is wired) and show what
         // this Save reported where the same selection is drawn again.
+        const applied = body.result.applied;
         mcpWiringFlash = { project: payload.project, who: whoSel.value,
-                           lines: mcpAppliedLines(body.result.applied) };
+                           lines: payload.workers
+                               ? [MCP_WORKERS_SAVED_TEXT[applied && applied.state]
+                                  || MCP_WORKERS_SAVED_TEXT.pending]
+                               : mcpAppliedLines(applied) };
         rerenderView(view);
     };
     section.append(
@@ -3067,7 +3095,8 @@ function renderMcpScreen(view, result, wiring) {
         const secrets = (srv.headers || []).length
             ? "Secret headers: " + srv.headers.join(", ") : "";
         const wired = Array.isArray(srv.wired) ? srv.wired : [];
-        const wiredNames = wired.map((w) => w[0] + (w[1] === "agent" ? "" : " / " + w[1].slice(4)));
+        const wiredNames = wired.map((w) => w[0] + (w[1] === "agent" ? ""
+            : w[1] === "workers" ? " / analysis workers" : " / " + w[1].slice(4)));
         const wiredText = wired.length ? "Wired to: " + wiredNames.join(", ") : "";
         const meta = [srv.description, secrets, wiredText].filter(Boolean).join(" · ");
         list.appendChild(el("div", { class: "mgmt-row mgmt-infra-row mcp-server-row",

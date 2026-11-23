@@ -5,7 +5,7 @@ nav_order: 4
 ---
 # MCP servers
 
-An MCP server gives an agent extra tools (a reference library, a database, a search service). RS keeps two lists of them. The newer one sits behind a shared gateway and is managed and wired in the browser. The older one is per project, managed from the host, and still serves research workers.
+An MCP server gives an agent extra tools (a reference library, a database, a search service). RS keeps two lists of them. The newer one sits behind a shared gateway and is managed and wired in the browser. The older one is per project and managed from the host. Both serve a research project's analysis workers.
 
 ## The gateway list (Sandboxes → MCP)
 
@@ -22,16 +22,17 @@ Test asks the server to introduce itself and reports one of four results.
 
 ## Wiring
 
-Wiring gives one consumer a set of servers. A consumer is a project's own agent or one of its boxes. On the page: pick a project, pick who in it, tick servers, Save. From the host: `research mcp wire <project> [--box NAME] --set a,b` and `research mcp wiring`.
+Wiring gives one consumer a set of servers. A consumer is a project's own agent, one of its boxes, or a research project's analysis workers. On the page: pick a project, pick who in it, tick servers, Save. From the host: `research mcp wire <project> [--box NAME | --workers] --set a,b` and `research mcp wiring`.
 
-Nothing restarts. The agent sees a change in its next session, in Claude Code and pi alike. Unticking takes effect at once at the gateway.
+Nothing restarts. The agent sees a change in its next session, in Claude Code and pi alike. A worker spawned after the Save can be given the new servers; a running worker keeps what it has until it is spawned again. Unticking takes effect at once at the gateway.
 
 | Consumer | Wirable |
 |---|---|
 | A plain or Docker-in-Docker project's agent | Yes |
 | A dev project's agent | Yes |
 | A box, dev boxes included | Yes; a project made before wiring needs one Stop and Start first |
-| A research project's own agent | No; its workers use the per-project registry below |
+| A research project's analysis workers | Yes; each worker gets only the servers the supervisor names when it spawns it; a project made before this needs Rebuild all then Stop and Start |
+| A research project's own agent | No; it plans and delegates to its workers |
 
 ```mermaid
 flowchart TD
@@ -59,9 +60,11 @@ What Save reports, per agent in the container:
 | applied when it next starts | The project or box is stopped or still starting |
 | NOT added | The agent already has a server of that name; it is left as it is |
 
+For a research project's analysis workers Save reports one line instead: workers spawned from now on can be given the servers, or, for a stopped project, that they reach its workers when it next starts.
+
 ## The per-project registry (host commands)
 
-Servers registered with `research mcp add` are granted to a project with `research project mcp allow`. Research workers reach them through a small proxy inside the project. This path is unchanged and will be folded into the gateway.
+Servers registered with `research mcp add` are granted to a project with `research project mcp allow`. Research workers reach them through a small proxy inside the project. This path is unchanged: a research project's workers can be given servers from either list, the supervisor naming which ones per worker.
 
 ## What starts and stops the gateway
 

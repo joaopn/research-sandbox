@@ -1269,14 +1269,27 @@ def _print_mcp_applied(consumer: str, applied) -> None:
                   f"{MCP_APPLIED_SENTENCES.get(outcome, outcome)}")
 
 
+# The analysis workers' consumer is staged, never applied: what is printed for
+# it instead of an apply report.
+MCP_WORKERS_SENTENCE = ("spawned workers can be given these; running ones keep "
+                        "theirs until spawned again")
+
+
+def _print_mcp_consumer(consumer: str, applied, label: str) -> None:
+    if consumer == rscore.mcp_servers.WORKERS_CONSUMER:
+        print(f"  {label}: {MCP_WORKERS_SENTENCE}")
+    else:
+        _print_mcp_applied(label, applied)
+
+
 def cmd_mcp_wire(args: argparse.Namespace) -> None:
     servers = [n for n in (args.set or "").split(",") if n.strip()]
     req = _build(rscore.McpWireRequest, project=args.project, box=args.box,
-                 servers=[n.strip() for n in servers])
+                 servers=[n.strip() for n in servers], workers=bool(args.workers))
     out = _call(rscore.mcp_wire, req)
     print(f"wired {out['consumer']} of {req.project} to: "
           f"{', '.join(req.servers) or '(nothing)'}")
-    _print_mcp_applied(out["consumer"], out["applied"])
+    _print_mcp_consumer(out["consumer"], out["applied"], out["consumer"])
 
 
 def cmd_mcp_wiring(args: argparse.Namespace) -> None:
@@ -1292,7 +1305,7 @@ def cmd_mcp_wiring(args: argparse.Namespace) -> None:
         print(project)
         for consumer, row in consumers.items():
             print(f"  {consumer}: {', '.join(row['servers']) or '(nothing)'}")
-            _print_mcp_applied("  " + consumer, row["applied"])
+            _print_mcp_consumer(consumer, row["applied"], "  " + consumer)
 
 
 def cmd_mcp_wiring_reset(_args: argparse.Namespace) -> None:
@@ -3368,11 +3381,17 @@ def build_parser() -> argparse.ArgumentParser:
     mst.set_defaults(func=cmd_mcp_server_test)
 
     mw = mcp_sub.add_parser(
-        "wire", help="give a project's agent, or one of its boxes, a set of the "
-                     "gateway's servers (available from the agent's next session)")
+        "wire", help="give a project's agent, one of its boxes, or a research "
+                     "project's analysis workers a set of the gateway's servers "
+                     "(available from the agent's next session; a worker gets "
+                     "those the supervisor names when it spawns it)")
     mw.add_argument("project")
-    mw.add_argument("--box", default=None, metavar="NAME",
-                    help="wire this box instead of the project's own agent")
+    mw_who = mw.add_mutually_exclusive_group()
+    mw_who.add_argument("--box", default=None, metavar="NAME",
+                        help="wire this box instead of the project's own agent")
+    mw_who.add_argument("--workers", action="store_true",
+                        help="wire a research project's analysis workers instead "
+                             "of its own agent")
     mw.add_argument("--set", required=True, metavar="A,B,C",
                     help="the servers it has from now on; '' unwires it")
     mw.set_defaults(func=cmd_mcp_wire)

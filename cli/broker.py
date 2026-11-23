@@ -1279,7 +1279,7 @@ MCP_SERVER_EDIT_WEBUI_FIELDS = frozenset({"name", "url", "description",
                                           "headers_set", "headers_remove"})
 MCP_SERVER_NAME_WEBUI_FIELDS = frozenset({"name"})
 # Wiring one consumer (a project's agents, or one of its boxes) to servers.
-MCP_WIRE_WEBUI_FIELDS = frozenset({"project", "box", "servers"})
+MCP_WIRE_WEBUI_FIELDS = frozenset({"project", "box", "servers", "workers"})
 MCP_WIRING_WEBUI_FIELDS = frozenset({"project"})
 # Put one version pin back to the shipped value (the Sandboxes → Software tab's "Use repo
 # version" button). One name-shaped token; the request refuses anything that is
