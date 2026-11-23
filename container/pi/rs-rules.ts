@@ -1,4 +1,4 @@
-// rs-rules v0.8.0
+// rs-rules v0.9.0
 //
 // Claude Code's rules capability for pi, one-to-one, as an RS-owned extension.
 // Shipped inside the pi dist (share/pi-agent/rs/rs-rules.ts) and named from the
@@ -627,7 +627,8 @@ function loadRule(file: string, kind: RuleKind, scope: RuleScope, base: string, 
 }
 
 // ---------------------------------------------------------------------------
-// Lean subagent roles. RS's `doer` and `checker` start with their own part of
+// Lean subagent roles. RS's `doer`, `checker` and `analyst` (the last only in
+// the projects RS gives it to) start with their own part of
 // RS's text and the project's instruction file, not with everything the
 // session loads (the user rules — RS's whole text and the working mode among
 // them — outer and local instruction files, unscoped project rules). RS's
@@ -652,7 +653,7 @@ export const LEAN_PROJECT_DIR = "/workspace";
 // a fork child, whose tag sits in the user message).
 export function leanRole(customPrompt: unknown): string | null {
   if (typeof customPrompt !== "string") return null;
-  const m = /^<active_agent name="(doer|checker)"\/>/.exec(customPrompt);
+  const m = /^<active_agent name="(doer|checker|analyst)"\/>/.exec(customPrompt);
   return m ? m[1] : null;
 }
 
@@ -664,7 +665,7 @@ export function leanRules(role: string, home: string, projectDir: string, alread
   const quiet = () => {};
   const link = path.join(home, ".local", "share", "pi-agent", "rs", "roles", role + ".md");
   if (!isFile(link)) return null;
-  const part = loadRule(link, "claude_md", "user", home, `RS's rules for a ${role} subagent`, quiet);
+  const part = loadRule(link, "claude_md", "user", home, `RS's rules for ${/^[aeiou]/.test(role) ? "an" : "a"} ${role} subagent`, quiet);
   if (!part || part.body.length === 0) return null;
   const out = [part];
   for (const label of [".claude/CLAUDE.md", "CLAUDE.md"]) {

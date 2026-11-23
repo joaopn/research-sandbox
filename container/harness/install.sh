@@ -10,6 +10,8 @@
 #       its own part of RS's text plus the project's instruction files as
 #       preloaded skills) when the deployed Claude Code honours that and RS's
 #       instruction writer has laid the role's part; else as before
+#     ~/.claude/agents/analyst.md, ~/.claude/agents/surveyor.md — the same way,
+#       only when RS_HARNESS_SUBAGENTS is 1
 #     ~/.claude/skills/rs-<role>-rules/SKILL.md — a link, made for a lean role;
 #     ~/.claude/skills/rs-project-instructions/SKILL.md and
 #       rs-workspace-instructions/SKILL.md — links, made when a role can be lean
@@ -18,7 +20,8 @@
 #       test policy} — the test-policy switch
 #   pi (pi in RS_HARNESS_AGENTS), under pi's agent dir:
 #     agents/doer.md, agents/checker.md, skills/harness/{…same…},
-#     skills/rs-test/{…same…}
+#     skills/rs-test/{…same…}; agents/analyst.md only when RS_HARNESS_SUBAGENTS
+#     is 1 (pi has no surveyor yet: it has no web search of its own)
 #     and beside RS's rules extension, ~/.local/share/pi-agent/rs/roles/<role>.md
 #       — a link to the role's part, which the extension reads for that child
 #   either (any agent): ~/.claude/rules/rs-harness.md — the standing mode, and
@@ -47,6 +50,14 @@
 #   RS_HARNESS_PI_DOER_THINKING       pi thinking level for doer
 #   RS_HARNESS_PI_CHECKER_MODEL       pi provider/model for checker
 #   RS_HARNESS_PI_CHECKER_THINKING    pi thinking level for checker
+#   RS_HARNESS_SUBAGENTS              1: also write the analyst and surveyor
+#                                     helper roles (the project's record asks
+#                                     for them); anything else: neither
+#   RS_HARNESS_ANALYST_MCP            the MCP servers the project's own agents
+#                                     are wired to (space separated), which pi's
+#                                     analyst names (pi gives a child no MCP
+#                                     server it does not name; Claude's analyst
+#                                     inherits them)
 #   PI_CODING_AGENT_DIR               pi's agent dir (default ~/.local/share/pi-agent/agent)
 #
 # Never fatal: it always exits 0. A file it could not write prints the line
@@ -54,7 +65,7 @@
 # RS_HARNESS_CLAUDE_OLD / RS_HARNESS_PI_OLD say that the deployed Claude Code /
 # RS rules extension for pi is present but too old for the lean roles (the
 # roles keep working as before); an agent that is not deployed yet prints
-# neither.
+# neither. RS_HARNESS_PI_ANALYST_OLD says the same of pi's analyst alone.
 set -u
 
 SRC=$(cd "$(dirname "$0")" && pwd) || { echo RS_HARNESS_INSTALL_FAILED; exit 0; }
@@ -111,6 +122,20 @@ ver_ge() {
 # section: 0.8.0.
 CLAUDE_LEAN_FLOOR=2.1.322
 PI_LEAN_FLOOR=0.8.0
+# The first RS rules extension for pi that also builds the analyst's lean
+# section (an older one hands the analyst the session's whole text, memory
+# rules included).
+PI_ANALYST_LEAN_FLOOR=0.9.0
+# pi's analyst runs in the background with the longest deadline pi accepts: pi
+# takes only a positive whole number of milliseconds up to 2147483647 (about
+# 24.8 days; 0 and "none" are refused) and otherwise ends a background child
+# after 30 minutes. RS has no reason to cut an analysis short, so the deadline
+# is pi's own bound, not a number of RS's.
+PI_ANALYST_TIMEOUT_MS=2147483647
+# pi's default tools (its settings' `defaultTools` default). Naming an MCP
+# server in a child's `tools:` makes that list strict, so the analyst's list
+# names these too, to keep what a doer has.
+PI_ANALYST_BUILTINS="read, bash, edit, write"
 ROLES_DIR="$HOME/.claude/rs/roles"
 
 # The charsets the host validates (rscore: the model catalog's aliases, PI_MODEL_RE,
@@ -145,7 +170,7 @@ checked() {
 # Every source must be readable before anything is written: a missing one would
 # otherwise leave a frontmatter-only agent file that reads as a success. A
 # mode's own rule body, and a test policy's, is checked when it is chosen, below.
-for f in agents/doer.md agents/checker.md skill/SKILL.md modes/LIST skill-test/SKILL.md policies/LIST; do
+for f in agents/doer.md agents/checker.md agents/analyst.md agents/surveyor.md skill/SKILL.md modes/LIST skill-test/SKILL.md policies/LIST; do
     if [ ! -r "$SRC/$f" ]; then
         warn "the shipped file $f is missing; nothing installed"
         echo RS_HARNESS_INSTALL_FAILED
@@ -178,6 +203,31 @@ PI_DOER_THINKING=$(checked RS_HARNESS_PI_DOER_THINKING "${RS_HARNESS_PI_DOER_THI
 PI_CHECKER_MODEL=$(checked RS_HARNESS_PI_CHECKER_MODEL "${RS_HARNESS_PI_CHECKER_MODEL:-}" pi_model_ok)
 PI_CHECKER_THINKING=$(checked RS_HARNESS_PI_CHECKER_THINKING "${RS_HARNESS_PI_CHECKER_THINKING:-}" pi_thinking_ok)
 
+# The helper roles: only when the host says the project's record asks for
+# them (a box, and every other project, never gets them).
+SUBAGENTS=0
+[ "${RS_HARNESS_SUBAGENTS:-}" = 1 ] && SUBAGENTS=1
+# The servers pi's analyst names, each re-checked against the server-name
+# charset the host validates (MIRROR of mcp_servers.NAME_RE: a lowercase
+# letter, then lowercase letters, digits and hyphens).
+# The list is split on blanks with filename expansion off (a `*` stays a word,
+# which the check refuses).
+ANALYST_MCP=
+set -f
+for s in ${RS_HARNESS_ANALYST_MCP:-}; do
+    case "$s" in
+        [a-z]*[!a-z0-9-]*|[!a-z]*) warn "ignoring an MCP server name in RS_HARNESS_ANALYST_MCP: not a valid name" ;;
+        *) ANALYST_MCP="$ANALYST_MCP, mcp:$s" ;;
+    esac
+done
+set +f
+CLAUDE_ROLES="doer checker"
+PI_ROLES="doer checker"
+if [ "$SUBAGENTS" = 1 ]; then
+    CLAUDE_ROLES="$CLAUDE_ROLES analyst surveyor"
+    PI_ROLES="$PI_ROLES analyst"
+fi
+
 HAS_CLAUDE=0
 HAS_PI=0
 for a in $(printf '%s' "${RS_HARNESS_AGENTS:-}" | tr ',' ' '); do
@@ -189,6 +239,8 @@ done
 
 DOER_DESC="Implements one unit of work from a self-contained brief (shipped by RS)."
 CHECKER_DESC="Reviews a change or a plan read-only - verifies against the code, asserts defects, flags forks (shipped by RS)."
+ANALYST_DESC="Carries out one analysis from a self-contained brief, in the background, and reports its result files (shipped by RS)."
+SURVEYOR_DESC="Answers one survey question from the web, in the background, with a written summary and its sources (shipped by RS)."
 
 # skill DIR — the mode-switch skill (named rs-mode; its folder keeps the name
 # harness, so nothing is ever removed) with its own copy of every staged mode's
@@ -246,10 +298,14 @@ if [ "$HAS_CLAUDE" = 1 ]; then
     # own instruction files live; an absent file loads nothing) are shared, so
     # a failure there keeps both roles as before.
     LEAN_ROLES=
-    if [ "$CLAUDE_LEAN" = 1 ] && { has_part doer || has_part checker; }; then
+    ANY_PART=0
+    for role in $CLAUDE_ROLES; do
+        has_part "$role" && ANY_PART=1
+    done
+    if [ "$CLAUDE_LEAN" = 1 ] && [ "$ANY_PART" = 1 ]; then
         if link "$HOME/.claude/skills/rs-project-instructions/SKILL.md" /workspace/.claude/CLAUDE.md \
                 && link "$HOME/.claude/skills/rs-workspace-instructions/SKILL.md" /workspace/CLAUDE.md; then
-            for role in doer checker; do
+            for role in $CLAUDE_ROLES; do
                 has_part "$role" || continue
                 if link "$HOME/.claude/skills/rs-$role-rules/SKILL.md" "$ROLES_DIR/$role.md"; then
                     LEAN_ROLES="$LEAN_ROLES $role"
@@ -274,6 +330,27 @@ if [ "$HAS_CLAUDE" = 1 ]; then
         printf '%s\n' '---' ''
         cat "$SRC/agents/checker.md"
     } | put "$HOME/.claude/agents/checker.md" || FAILED=1
+    if [ "$SUBAGENTS" = 1 ]; then
+        # The analyst keeps every tool of the session (the project's MCP
+        # servers included, which a fixed list would drop) except the one
+        # that launches a subagent: an analyst does not delegate further.
+        {
+            printf '%s\n' '---' 'name: analyst' "description: $ANALYST_DESC" 'model: "inherit"' \
+                'disallowedTools: Agent'
+            lean_lines analyst
+            printf '%s\n' '---' ''
+            cat "$SRC/agents/analyst.md"
+        } | put "$HOME/.claude/agents/analyst.md" || FAILED=1
+        # The surveyor has Claude's own web search and page fetch and nothing
+        # else (no shell, no files), and always runs in the background.
+        {
+            printf '%s\n' '---' 'name: surveyor' "description: $SURVEYOR_DESC" 'model: "inherit"' \
+                'tools: WebSearch, WebFetch' 'background: true'
+            lean_lines surveyor
+            printf '%s\n' '---' ''
+            cat "$SRC/agents/surveyor.md"
+        } | put "$HOME/.claude/agents/surveyor.md" || FAILED=1
+    fi
     skill "$HOME/.claude/skills/harness"
     skill_test "$HOME/.claude/skills/rs-test"
 fi
@@ -299,14 +376,26 @@ if [ "$HAS_PI" = 1 ]; then
         printf '%s\n' '---' ''
         cat "$SRC/agents/checker.md"
     } | put "$PI_DIR/agents/checker.md" || FAILED=1
+    if [ "$SUBAGENTS" = 1 ]; then
+        # The analyst runs in the background by default, with pi's longest
+        # deadline; it names the project's MCP servers, with pi's default
+        # tools beside them (no server: pi's default tools, as a doer).
+        {
+            printf '%s\n' '---' 'name: analyst' "description: $ANALYST_DESC" 'inheritProjectContext: true' \
+                'acceptanceRole: writer' 'async: true' "timeoutMs: $PI_ANALYST_TIMEOUT_MS"
+            [ -z "$ANALYST_MCP" ] || printf '%s\n' "tools: $PI_ANALYST_BUILTINS$ANALYST_MCP"
+            printf '%s\n' '---' ''
+            cat "$SRC/agents/analyst.md"
+        } | put "$PI_DIR/agents/analyst.md" || FAILED=1
+    fi
     skill "$PI_DIR/skills/harness"
     skill_test "$PI_DIR/skills/rs-test"
     # The role parts for RS's rules extension, beside it (a folder pi never
-    # scans). The extension builds a doer's or checker's section from the link
-    # when it reads as a non-empty file, so the link is made only where the
-    # writer laid the part.
+    # scans). The extension builds a doer's, checker's or analyst's section
+    # from the link when it reads as a non-empty file, so the link is made only
+    # where the writer laid the part.
     PI_RS_DIR="$HOME/.local/share/pi-agent/rs"
-    for role in doer checker; do
+    for role in $PI_ROLES; do
         if has_part "$role"; then
             link "$PI_RS_DIR/roles/$role.md" "$ROLES_DIR/$role.md" || FAILED=1
         fi
@@ -317,6 +406,9 @@ if [ "$HAS_PI" = 1 ]; then
         PI_RULES_VER=$(sed -n '1s#^// rs-rules v##p' "$PI_RS_DIR/rs-rules.ts" 2>/dev/null)
         if ! ver_ok "$PI_RULES_VER" || ! ver_ge "$PI_RULES_VER" "$PI_LEAN_FLOOR"; then
             echo RS_HARNESS_PI_OLD
+        fi
+        if [ "$SUBAGENTS" = 1 ] && { ! ver_ok "$PI_RULES_VER" || ! ver_ge "$PI_RULES_VER" "$PI_ANALYST_LEAN_FLOOR"; }; then
+            echo RS_HARNESS_PI_ANALYST_OLD
         fi
     fi
 fi
