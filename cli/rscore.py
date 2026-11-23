@@ -9486,6 +9486,8 @@ def _pi_settings_heal_source(pins: dict) -> str:
 # a bump without the other is a build error, not a silent drift).
 _RS_RULES_SRC = SCRIPT_DIR / "container" / "pi" / "rs-rules.ts"
 _RS_RULES_HEADER_RE = re.compile(r"\A// rs-rules v(\S+)\s*$", re.M)
+# The version the extension's `/rules` prints: the same pin again.
+_RS_RULES_CONST_RE = re.compile(r'^export const RS_RULES_VERSION = "([^"]*)";\s*$', re.M)
 
 
 def _rs_rules_source(pins: dict) -> str:
@@ -9500,6 +9502,13 @@ def _rs_rules_source(pins: dict) -> str:
     if m.group(1) != pins["rules_ver"]:
         die(f"{_RS_RULES_SRC} is v{m.group(1)} but RS_PI_RULES_VERSION={pins['rules_ver']}; "
             f"bump the pin and the header together")
+    c = _RS_RULES_CONST_RE.search(text)
+    if not c:
+        die(f"{_RS_RULES_SRC}: no `export const RS_RULES_VERSION = \"<version>\";` line")
+    if c.group(1) != pins["rules_ver"]:
+        die(f"{_RS_RULES_SRC}: RS_RULES_VERSION is {c.group(1)} but "
+            f"RS_PI_RULES_VERSION={pins['rules_ver']}; move the constant, the header and "
+            f"the pin together")
     return text
 
 

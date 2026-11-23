@@ -1,4 +1,4 @@
-// rs-rules v0.10.0
+// rs-rules v0.10.1
 //
 // Claude Code's rules capability for pi, one-to-one, as an RS-owned extension.
 // Shipped inside the pi dist (share/pi-agent/rs/rs-rules.ts) and named from the
@@ -90,7 +90,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const RS_RULES_VERSION = "0.8.0";
+export const RS_RULES_VERSION = "0.10.1";
 
 // The system-prompt SECTION the launch rules ride in (pi wraps it as
 // `<project_rules>…</project_rules>`). A section, never a returned
