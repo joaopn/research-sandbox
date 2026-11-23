@@ -23,7 +23,16 @@
 # leaves toward the project's neighbours — and into Docker's own chains, whose
 # inter-bridge isolation now applies to these sources too (an ACCEPT here used
 # to let rs-inner sources reach rs-dev-* and docker0 containers directly).
-# What this chain drops is unchanged: the final DROP below.
+# What this chain drops is the final DROP below.
+#
+# One destination exception: TCP 8888 to the shared MCP gateway, from any
+# rs-inner source (analysis workers given an MCP page server reach it there).
+# The gateway sits at ONE fixed address per project: the last usable host
+# address of the project's own network (the default-route interface's network),
+# computed here exactly as inner-guard.sh computes it — nothing writes it down.
+# It is a RETURN like the rest, so the inner guard still sees the packet (it
+# has its own gateway RETURN). When the address cannot be computed, no rule is
+# added and the gateway stays dropped for workers.
 
 set -euo pipefail
 
@@ -56,6 +65,8 @@ ROLE_RANGE_HI="${RS_INNER_ROLE_MCP_RANGE_HI:-192.168.99.9}"
 PI_RANGE_LO="${RS_INNER_PI_RANGE_LO:-192.168.99.10}"
 PI_RANGE_HI="${RS_INNER_PI_RANGE_HI:-192.168.99.25}"
 CHAIN="RS-INNER-FW"
+# MIRROR of inner-guard.sh's MCP_GATEWAY_PORT (and rs-mcp-sync.py's GATEWAY_PORT).
+MCP_GATEWAY_PORT=8888
 
 if ! command -v iptables >/dev/null 2>&1; then
     echo "inner-firewall: iptables missing; skipping" >&2
@@ -80,8 +91,29 @@ sudo iptables -A "$CHAIN" -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
 sudo iptables -A "$CHAIN" -s "$PROXY_IP" -j RETURN
 sudo iptables -A "$CHAIN" -m iprange --src-range "$ROLE_RANGE_LO-$ROLE_RANGE_HI" -j RETURN
 sudo iptables -A "$CHAIN" -m iprange --src-range "$PI_RANGE_LO-$PI_RANGE_HI" -j RETURN
+# The MCP gateway's address, computed as inner-guard.sh does (every step may
+# fail without aborting the script: no address means no rule).
+UPLINK="$(ip -o route show default 2>/dev/null \
+    | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") {print $(i + 1); exit}}' || true)"
+MCP_GATEWAY_IP=""
+if [[ -n "$UPLINK" ]]; then
+    MCP_GATEWAY_IP="$(ip -o -4 addr show dev "$UPLINK" 2>/dev/null \
+        | awk '{for (i = 1; i <= NF; i++) if ($i == "inet") {print $(i + 1); exit}}' \
+        | python3 -c '
+import ipaddress, sys
+try:
+    net = ipaddress.ip_interface(sys.stdin.read().strip()).network
+    if net.version == 4 and net.num_addresses >= 4:
+        print(net.broadcast_address - 1)
+except ValueError:
+    pass
+' 2>/dev/null || true)"
+fi
+if [[ -n "$MCP_GATEWAY_IP" ]]; then
+    sudo iptables -A "$CHAIN" -d "$MCP_GATEWAY_IP" -p tcp --dport "$MCP_GATEWAY_PORT" -j RETURN
+fi
 sudo iptables -A "$CHAIN" -m limit --limit 10/min --limit-burst 5 \
     -j LOG --log-prefix "rs-inner-fw drop: " --log-level warning
 sudo iptables -A "$CHAIN" -j DROP
 
-echo "inner-firewall: applied (subnet=$SUBNET proxy_ip=$PROXY_IP role_range=$ROLE_RANGE_LO-$ROLE_RANGE_HI pi_range=$PI_RANGE_LO-$PI_RANGE_HI)"
+echo "inner-firewall: applied (subnet=$SUBNET proxy_ip=$PROXY_IP role_range=$ROLE_RANGE_LO-$ROLE_RANGE_HI pi_range=$PI_RANGE_LO-$PI_RANGE_HI mcp_gateway=${MCP_GATEWAY_IP:-none}:$MCP_GATEWAY_PORT)"

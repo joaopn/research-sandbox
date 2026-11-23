@@ -51,6 +51,8 @@ COPY container/rs-instructions-notice.md /opt/claude-templates/rs-instructions-n
 LABEL research.instructions-layout=home-2
 # The inner guard in this image lets a box reach the shared MCP gateway.
 LABEL research.mcp-gateway-guard=1
+# The host's MCP page offers "Analysis workers" only for a project whose image carries this.
+LABEL research.mcp-gateway-workers=1
 COPY container/supervisor/commands/ /opt/claude-templates/commands/
 COPY container/supervisor/logbook_supervisor_template.md /opt/claude-templates/logbook_supervisor_template.md
 COPY container/supervisor/logbook_pi_template.md /opt/claude-templates/logbook_pi_template.md

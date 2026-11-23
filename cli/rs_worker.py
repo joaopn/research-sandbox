@@ -19,13 +19,16 @@ reused.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -94,6 +97,35 @@ ALLOWLIST_PATH = Path("/workspace/.orchestrator/mcp-allow.json")
 # `_write_mcp_config` merges both files into one by_name lookup, matching the
 # proxy config renderer's merge policy.
 ROLE_MCPS_PATH = Path("/workspace/.orchestrator/role-mcps.json")
+
+# The third source of `--mcps` names: the servers the PI ticked for "Analysis
+# workers" on the webui's MCP page, served by RS's shared MCP gateway. The host
+# stages them into the research user's home (never /workspace, which the webui
+# mounts read-only for every project) as the `workers` key of the wanted set
+# rs-mcp-sync.py reads: {"servers": {<name>: <token>}, "descriptions":
+# {<name>: <text>}}. No file or no key means no gateway servers for workers.
+MCP_WANTED_PATH = Path.home() / ".rs-mcp" / "wanted.json"
+MCP_WANTED_WORKERS_KEY = "workers"
+# MIRROR of mcp_servers.NAME_RE (the gateway list's name rule; pinned).
+GATEWAY_NAME_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+# RS's gateway tokens are 64 lowercase hex characters; one token serves every
+# server of the workers consumer.
+GATEWAY_TOKEN_RE = re.compile(r"^[0-9a-f]{64}$")
+# The gateway's port on its fixed address (MIRROR of rs-mcp-sync.py's
+# GATEWAY_PORT and inner-guard.sh's MCP_GATEWAY_PORT).
+GATEWAY_PORT = 8888
+# The header that marks an entry as RS's gateway entry (MIRROR of
+# rs-mcp-sync.py's MARK_HEADER); a kept .mcp.json is read by it on respawn.
+MCP_MARK_HEADER = "X-RS-MCP"
+# The worker container's environment variable carrying the gateway token. The
+# worker's .mcp.json names it as `${RS_MCP_GATEWAY_TOKEN}` and Claude Code
+# expands it from the environment when it sends the header (measured on Claude
+# Code 2.1.330), so the token itself is never written to the worker's folder.
+GATEWAY_TOKEN_ENV = "RS_MCP_GATEWAY_TOKEN"
+# The names `rs-worker mcps` gives each source.
+SOURCE_ROLE = "worker service"
+SOURCE_ALLOWLIST = "project allowlist"
+SOURCE_GATEWAY = "MCP page"
 
 # The project's per-container-type agent model/effort pairs, frozen at create by
 # the host (STAGE_MODEL_SELECT). Read VERBATIM — this script is staged into the
@@ -565,39 +597,174 @@ def _load_role_mcps_by_name() -> dict[str, dict]:
     return out
 
 
-def _write_mcp_config(wdir: Path, requested: list[str]) -> tuple[str, list[tuple[str, str]]]:
+# --- the MCP page's servers for analysis workers (RS's shared MCP gateway) ---
+
+# MIRROR of agent/rs-mcp-sync.py's _uplink_network and gateway_base (the twin;
+# rs-worker is baked standalone, so it cannot import that file). The two bodies
+# are pinned equal by a test: the gateway's address is computed, never
+# recorded, so both must compute it the same way.
+def _uplink_network() -> ipaddress.IPv4Network:
+    """The network of the interface the default route leaves by: in a project
+    container that is the project's own network."""
+    iface = None
+    with open("/proc/net/route") as f:
+        for line in f.readlines()[1:]:
+            parts = line.split()
+            if len(parts) > 7 and parts[1] == "00000000" and int(parts[3], 16) & 2:
+                iface = parts[0]
+                break
+    if iface is None:
+        raise OSError("no default route")
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        ifreq = struct.pack("256s", iface.encode()[:15])
+        addr = socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, ifreq)[20:24])   # SIOCGIFADDR
+        mask = socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x891b, ifreq)[20:24])   # SIOCGIFNETMASK
+    finally:
+        s.close()
+    return ipaddress.ip_network(f"{addr}/{mask}", strict=False)
+
+
+def gateway_base() -> str:
+    """The gateway's fixed address in this project: the last usable host
+    address of the project network (the host attaches it exactly there)."""
+    return f"http://{_uplink_network().broadcast_address - 1}:{GATEWAY_PORT}"
+
+
+def _load_workers_set() -> tuple[dict[str, str], dict[str, str], str | None]:
+    """The MCP page's servers for analysis workers, from MCP_WANTED_PATH:
+    ``(servers, descriptions, problem)``. ``servers`` maps name -> token,
+    ``descriptions`` maps each of those names -> its one-line text ("" when it
+    has none). No file, or no ``workers`` key, is an empty set. A file that
+    cannot be read or whose ``workers`` entry is wrongly shaped returns empty
+    sets and a plain sentence in ``problem`` naming the file and the fault (it
+    never names a token); callers refuse on it rather than drop entries."""
+    path = MCP_WANTED_PATH
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return {}, {}, None
+    except OSError as e:
+        return {}, {}, f"{path} cannot be read ({e.strerror or e})"
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        return {}, {}, f"{path} is not valid JSON ({e})"
+    if not isinstance(data, dict):
+        return {}, {}, f"{path} does not hold a JSON object"
+    if MCP_WANTED_WORKERS_KEY not in data:
+        return {}, {}, None
+    workers = data[MCP_WANTED_WORKERS_KEY]
+    where = f"{path}, its {MCP_WANTED_WORKERS_KEY!r} entry"
+    if not isinstance(workers, dict):
+        return {}, {}, f"{where} is not a JSON object"
+    servers = workers.get("servers", {})
+    descriptions = workers.get("descriptions", {})
+    if not isinstance(servers, dict):
+        return {}, {}, f"{where}: 'servers' is not a JSON object"
+    if not isinstance(descriptions, dict):
+        return {}, {}, f"{where}: 'descriptions' is not a JSON object"
+    bad_names = sorted(n for n in servers if not GATEWAY_NAME_RE.match(n))
+    if bad_names:
+        return {}, {}, (f"{where}: server name(s) {', '.join(map(repr, bad_names))} "
+                        "break the gateway's name rule (a lowercase letter, then "
+                        "lowercase letters, digits or '-')")
+    bad_tokens = sorted(n for n, t in servers.items()
+                        if not (isinstance(t, str) and GATEWAY_TOKEN_RE.match(t)))
+    if bad_tokens:
+        return {}, {}, (f"{where}: the token for {', '.join(bad_tokens)} is not "
+                        "64 lowercase hex characters")
+    if len(set(servers.values())) > 1:
+        return {}, {}, (f"{where}: its servers carry different tokens, but one "
+                        "token serves every server given to analysis workers")
+    bad_descs = sorted(n for n, d in descriptions.items() if not isinstance(d, str))
+    if bad_descs:
+        return {}, {}, (f"{where}: the description of {', '.join(bad_descs)} "
+                        "is not text")
+    return dict(servers), {n: descriptions.get(n, "") for n in servers}, None
+
+
+def _is_gateway_entry(entry) -> bool:
+    """An .mcp.json entry RS wrote for the gateway: it carries MCP_MARK_HEADER
+    (compared without case, as rs-mcp-sync.py's _is_rs does)."""
+    headers = entry.get("headers") if isinstance(entry, dict) else None
+    return isinstance(headers, dict) and any(
+        isinstance(h, str) and h.lower() == MCP_MARK_HEADER.lower() for h in headers)
+
+
+def _gateway_entry(base: str, name: str) -> dict:
+    """The worker's .mcp.json entry for a gateway server. The token stays in
+    the worker container's environment; the file names only the variable."""
+    return {
+        "type": "http",
+        "url": f"{base}/{name}",
+        "headers": {
+            "Authorization": "Bearer ${" + GATEWAY_TOKEN_ENV + "}",
+            MCP_MARK_HEADER: "1",
+        },
+    }
+
+
+def _workers_token(servers: dict[str, str]) -> str:
+    """The one token of a validated, non-empty workers set."""
+    return next(iter(servers.values()))
+
+
+def _write_mcp_config(
+    wdir: Path, requested: list[str],
+) -> tuple[str, list[tuple[str, str]], str | None]:
     """Validate ``requested`` against the per-project allowlist + role-MCP
-    registry, write the worker's .mcp.json (each entry pointed at the
-    supervisor's mcp-proxy on rs-inner), and return ``(label, granted)``
-    where ``granted`` is a list of ``(name, description)`` pairs used to
-    render the worker CLAUDE.md block. With no requested MCPs we leave
-    any pre-existing .mcp.json alone (a respawn may have one already) and
+    registry + the MCP page's servers for analysis workers, write the worker's
+    .mcp.json (old-path entries pointed at the supervisor's mcp-proxy on
+    rs-inner, MCP page entries at the shared gateway), and return
+    ``(label, granted, token)`` where ``granted`` is a list of
+    ``(name, description)`` pairs used to render the worker CLAUDE.md block and
+    ``token`` is the gateway token the worker container's environment must
+    carry (None when no gateway server is granted). With no requested MCPs we
+    leave any pre-existing .mcp.json alone (a respawn may have one already) and
     surface its current contents in ``granted`` so the rendered block stays
-    in sync with the actual wiring.
+    in sync with the actual wiring; a kept gateway entry must still be given to
+    analysis workers on the MCP page.
 
     The two registries (external in mcp-allow.json, role in role-mcps.json)
     are merged into one by_name lookup with role-MCPs overlaying — this
     mirrors `mcp_render_config.py`'s merge policy so the worker's view of
     "what MCPs exist" matches the proxy's view of "what URLs route". From
-    the worker's POV both are reachable at mcp-proxy:8888/<name>/mcp."""
+    the worker's POV both are reachable at mcp-proxy:8888/<name>/mcp. A name
+    found both there and among the MCP page's servers refuses the spawn."""
     if not requested:
         existing = wdir / ".mcp.json"
         if not existing.is_file():
-            return "", []
+            return "", [], None
         try:
             cfg = json.loads(existing.read_text())
         except json.JSONDecodeError:
-            return "", []
-        names = sorted((cfg.get("mcpServers") or {}).keys())
+            return "", [], None
+        kept = cfg.get("mcpServers") or {}
+        names = sorted(kept.keys())
         if not names:
-            return "", []
+            return "", [], None
         # role-MCPs render the shared grant description (async-by-default
         # rule) via the overlay; external MCPs render their allowlist
         # description, or a bare bullet when they have none.
         by_name = _load_allowlist_by_name()
         by_name.update(_load_role_mcps_by_name())
-        granted = [(n, by_name.get(n, {}).get("description", "")) for n in names]
-        return ",".join(names), granted
+        kept_gw = [n for n in names if _is_gateway_entry(kept[n])]
+        token = None
+        gw_desc: dict[str, str] = {}
+        if kept_gw:
+            gw_servers, gw_desc, problem = _load_workers_set()
+            if problem:
+                die(f"this worker's kept {existing} names the MCP page server(s) "
+                    f"{', '.join(kept_gw)}, which cannot be checked: {problem}")
+            gone = [n for n in kept_gw if n not in gw_servers]
+            if gone:
+                die(f"{', '.join(gone)}: no longer given to analysis workers on "
+                    "the MCP page; spawn with --mcps naming the servers it should have")
+            token = _workers_token(gw_servers)
+        granted = [(n, gw_desc.get(n, "") if n in kept_gw
+                    else by_name.get(n, {}).get("description", "")) for n in names]
+        return ",".join(names), granted, token
 
     if not ALLOWLIST_PATH.is_file():
         die(f"--mcps requested but {ALLOWLIST_PATH} missing; "
@@ -614,34 +781,75 @@ def _write_mcp_config(wdir: Path, requested: list[str]) -> tuple[str, list[tuple
     for e in allow_entries:
         if isinstance(e, dict) and isinstance(e.get("name"), str):
             by_name[e["name"]] = e
+    allow_names = set(by_name)
     role_by_name = _load_role_mcps_by_name()
     by_name.update(role_by_name)  # role-MCPs win on name collision
 
-    unknown = [n for n in requested if n not in by_name]
+    gw_servers, gw_desc, gw_problem = _load_workers_set()
+    if gw_problem:
+        die(f"--mcps cannot be checked: {gw_problem}. That file lists the MCP "
+            "page's servers for analysis workers; RS writes it again when the PI "
+            "saves the Analysis workers wiring on the MCP page (Sandboxes → MCP).")
+
+    clash = [n for n in requested if n in gw_servers and n in by_name]
+    if clash:
+        lines = []
+        for n in clash:
+            old = []
+            if n in role_by_name:
+                old.append(f"a {SOURCE_ROLE} (role-mcps.json)")
+            if n in allow_names:
+                old.append(f"the {SOURCE_ALLOWLIST} (mcp-allow.json)")
+            lines.append(f"  {n}: {' and '.join(old)}, and the {SOURCE_GATEWAY} "
+                         "(ticked for Analysis workers)")
+        die(
+            "these MCP names are given to workers by two sources, so the server "
+            "meant cannot be told apart:\n" + "\n".join(lines) + "\n"
+            "  fix: the PI unticks it for \"Analysis workers\" on the MCP page "
+            "(Sandboxes → MCP), or removes the other registration on the host."
+        )
+
+    unknown = [n for n in requested if n not in by_name and n not in gw_servers]
     if unknown:
         ext_names = sorted(n for n in by_name if n not in role_by_name)
         role_names = sorted(role_by_name)
+        gw_names = sorted(gw_servers)
         die(
             f"these MCPs are not granted to this project: {', '.join(unknown)}\n"
             f"  external (mcp-allow.json):  {', '.join(ext_names) or '(none)'}\n"
             f"  role-MCPs (role-mcps.json): {', '.join(role_names) or '(none)'}\n"
+            f"  MCP page (analysis workers): {', '.join(gw_names) or '(none)'}\n"
             f"  fix: `research project mcp allow <project> <mcp>` for external MCPs,\n"
             f"       `research project role-mcp enable <project> <role>` for role-MCPs.\n"
-            f"       Both run on the host."
+            f"       Both run on the host. A server on the MCP page: the PI can\n"
+            f"       tick it for \"Analysis workers\" on the MCP page (Sandboxes → MCP)."
         )
 
-    cfg = {
-        "mcpServers": {
-            name: {
+    gw_requested = [n for n in requested if n in gw_servers]
+    base = ""
+    if gw_requested:
+        try:
+            base = gateway_base()
+        except (OSError, ValueError) as e:
+            die(f"the MCP gateway's address cannot be computed from this "
+                f"container's default-route interface ({e}), so "
+                f"{', '.join(gw_requested)} cannot be wired")
+
+    servers_cfg: dict[str, dict] = {}
+    for name in requested:
+        if name in gw_servers:
+            servers_cfg[name] = _gateway_entry(base, name)
+        else:
+            servers_cfg[name] = {
                 "type": by_name[name].get("transport", "http"),
                 "url": f"http://mcp-proxy:8888/{name}{by_name[name].get('path', '/mcp')}",
             }
-            for name in requested
-        }
-    }
+    cfg = {"mcpServers": servers_cfg}
     (wdir / ".mcp.json").write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
-    granted = [(n, by_name[n].get("description", "")) for n in requested]
-    return ",".join(requested), granted
+    granted = [(n, gw_desc.get(n, "") if n in gw_servers
+                else by_name[n].get("description", "")) for n in requested]
+    token = _workers_token(gw_servers) if gw_requested else None
+    return ",".join(requested), granted, token
 
 
 def _append_worker_mcp_block(wdir: Path, granted: list[tuple[str, str]]) -> None:
@@ -743,6 +951,13 @@ def cmd_spawn(args: argparse.Namespace) -> None:
     clash = _mailbox_name_clash(args.name)
     if clash:
         die(clash)
+    # RS owns the gateway token's variable: it sets it from the MCP page's
+    # wiring below, and a caller's value would either leak a token into the
+    # command line or point the worker at a token the gateway never issued.
+    for kv in args.env:
+        if kv.partition("=")[0] == GATEWAY_TOKEN_ENV:
+            die(f"--env {GATEWAY_TOKEN_ENV}=... is refused: RS sets that variable "
+                "itself from the servers given to analysis workers on the MCP page")
 
     if not ORCH_CREDS.is_file():
         die(
@@ -839,7 +1054,7 @@ def cmd_spawn(args: argparse.Namespace) -> None:
     #     append the per-worker MCP block to the staged CLAUDE.md so the
     #     worker can see what each granted MCP is for ---
     requested_mcps = _parse_mcps_arg(getattr(args, "mcps", "") or "")
-    mcps_label, granted_mcps = _write_mcp_config(wdir, requested_mcps)
+    mcps_label, granted_mcps, gateway_token = _write_mcp_config(wdir, requested_mcps)
     _append_worker_mcp_block(wdir, granted_mcps)
 
     # --- write/update registry BEFORE docker run so a crash leaves a discoverable state ---
@@ -923,6 +1138,10 @@ def cmd_spawn(args: argparse.Namespace) -> None:
         if not k:
             die(f"invalid --env value: {kv!r} (expected K=V)")
         env[k] = v
+    # The MCP page's gateway token, for the `${RS_MCP_GATEWAY_TOKEN}` the
+    # worker's .mcp.json names (never written to any file).
+    if gateway_token:
+        env[GATEWAY_TOKEN_ENV] = gateway_token
 
     # --- labels ---
     labels = {
@@ -986,6 +1205,93 @@ def cmd_spawn(args: argparse.Namespace) -> None:
         "created_at": entry["created_at"],
         "last_spawn_at": entry["last_spawn_at"],
     })
+
+
+# ---------------------------------------------------------------------------
+# mcps — every name `spawn --mcps` accepts
+# ---------------------------------------------------------------------------
+
+# The order `rs-worker mcps` lists a name's sources in.
+_SOURCE_ORDER = (SOURCE_ROLE, SOURCE_ALLOWLIST, SOURCE_GATEWAY)
+
+
+def _grantable() -> tuple[list[dict], list[str]]:
+    """Every grantable (name, source, description) row and, per source that
+    cannot be read, a plain sentence naming the file and what is wrong. Unlike
+    the spawn-time loaders this reports a damaged registry instead of reading
+    it as empty, so the listing never hides one."""
+    rows: list[dict] = []
+    problems: list[str] = []
+
+    if ROLE_MCPS_PATH.is_file():
+        try:
+            data = json.loads(ROLE_MCPS_PATH.read_text())
+        except (OSError, ValueError) as e:
+            problems.append(f"{ROLE_MCPS_PATH} cannot be read as JSON ({e})")
+        else:
+            if isinstance(data, dict):
+                rows += [{"name": n, "source": SOURCE_ROLE,
+                          "description": ROLE_MCP_GRANT_DESCRIPTION}
+                         for n, e in data.items() if isinstance(e, dict)]
+            else:
+                problems.append(f"{ROLE_MCPS_PATH} does not hold a JSON object")
+
+    if not ALLOWLIST_PATH.is_file():
+        problems.append(f"{ALLOWLIST_PATH} is missing, and `spawn --mcps` refuses "
+                        "without it (this project predates the allowlist — destroy "
+                        "and recreate it)")
+    else:
+        try:
+            entries = json.loads(ALLOWLIST_PATH.read_text())
+        except (OSError, ValueError) as e:
+            problems.append(f"{ALLOWLIST_PATH} cannot be read as JSON ({e})")
+        else:
+            if isinstance(entries, list):
+                for e in entries:
+                    if isinstance(e, dict) and isinstance(e.get("name"), str):
+                        d = e.get("description", "")
+                        rows.append({"name": e["name"], "source": SOURCE_ALLOWLIST,
+                                     "description": d if isinstance(d, str) else ""})
+            else:
+                problems.append(f"{ALLOWLIST_PATH} must be a JSON array")
+
+    gw_servers, gw_desc, gw_problem = _load_workers_set()
+    if gw_problem:
+        problems.append(gw_problem)
+    rows += [{"name": n, "source": SOURCE_GATEWAY, "description": gw_desc.get(n, "")}
+             for n in gw_servers]
+
+    sources: dict[str, set] = {}
+    for r in rows:
+        sources.setdefault(r["name"], set()).add(r["source"])
+    for r in rows:
+        r["conflict"] = len(sources[r["name"]]) > 1
+    rows.sort(key=lambda r: (r["name"], _SOURCE_ORDER.index(r["source"])))
+    return rows, problems
+
+
+def cmd_mcps(args: argparse.Namespace) -> None:
+    rows, problems = _grantable()
+    if args.json:
+        _print_json(rows)
+    elif not rows:
+        print("(no MCP servers can be granted to workers)")
+    else:
+        width = max(len(r["name"]) for r in rows)
+        swidth = max(len(s) for s in _SOURCE_ORDER)
+        for r in rows:
+            line = f"{r['name']:<{width}}  {r['source']:<{swidth}}  {r['description']}".rstrip()
+            if r["conflict"]:
+                others = [x["source"] for x in rows
+                          if x["name"] == r["name"] and x["source"] != r["source"]]
+                line += (f"  [conflict: the same name also comes from: {', '.join(others)}"
+                         + ("; `spawn --mcps` refuses it" if SOURCE_GATEWAY in
+                            (others + [r["source"]]) else "") + "]")
+            print(line)
+    for msg in problems:
+        print(f"rs-worker: {msg}", file=sys.stderr)
+    if problems:
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -1825,12 +2131,16 @@ def build_parser() -> argparse.ArgumentParser:
                     help="absolute path to bind-mount RO into the worker; repeatable")
     sp.add_argument("--env", action="append", default=[], help="K=V; repeatable")
     sp.add_argument("--mcps", default="",
-                    help="comma-separated MCP names from `research mcp list`; "
-                         "each must already be granted via "
-                         "`research project mcp allow <project> <mcp>`")
+                    help="comma-separated MCP names; `rs-worker mcps` lists "
+                         "every name you can pass")
     sp.add_argument("--interactive", action="store_true",
                     help="(reserved) run claude interactively in byobu instead of headless")
     sp.set_defaults(func=cmd_spawn)
+
+    smc = sub.add_parser("mcps", help="list the MCP servers you can grant to workers")
+    smc.add_argument("--json", action="store_true",
+                     help="print a JSON list of {name, source, description, conflict}")
+    smc.set_defaults(func=cmd_mcps)
 
     sl = sub.add_parser("list",
                         help="list workers (default: live only; --all includes "
