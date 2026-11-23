@@ -58,6 +58,8 @@ The agent keeps its memory through one command, `rs-memory`. Its refusals name t
 
 A finding's standing (current, superseded, contested, withdrawn) is computed from its relations each time it is shown. Entries are never edited, so a correction is a new entry.
 
+The memory command is part of the project's image, while RS's instructions to the agent are rewritten at every start, so the two must match. A researcher project is refused at create when RS's image has an older memory command than the instructions need. An existing one's start ends with an error, and its memory is not set up, until **Rebuild all** on **Sandboxes → Software** and a stop and start of the project.
+
 ## A session
 
 At start, a hook gives the agent its front page: Claude's start hook, or pi's extension. The agent then works and writes at named moments: a finished unit of work, a dead end, a surprise, a correction.

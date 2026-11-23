@@ -25,8 +25,8 @@ flowchart TD
   user -->|"question"| r
   r -->|"brief"| a1
   r -->|"brief"| a2
-  a1 -->|"files, report"| r
-  a2 -->|"files, report"| r
+  a1 -->|"files, write-up, summary"| r
+  a2 -->|"files, write-up, summary"| r
   r -->|"claim, with its command"| staged
   staged --> rerun
   staged --> ref
@@ -44,7 +44,11 @@ flowchart TD
 
 An **analyst** carries out one analysis from a brief, in the background, while the conversation goes on. Its brief carries the question, the data paths, where its results go and that it reports the command that reproduces them. It gets nothing else: not the conversation, not the memory rules.
 
-Several analysts run at once. Under Claude the researcher launches several in one turn; under pi it launches one per step. Each one's result wakes the session when it ends. An analyst's results land as files in the workspace with a short report, and the researcher writes what matters into its memory.
+Several analysts run at once. Under Claude the researcher launches several in one turn; under pi it launches one per step. Each one's result wakes the session when it ends.
+
+An analyst's results land as files in its results folder, with its full write-up in `writeup.md` there: the method, the results, the caveats, the dead ends and the surprises. Its reply to the researcher is short: a summary, its dead ends and surprises one line each, and a last line naming the results folder. The researcher journals those dead ends and surprises, checks that the write-up exists, reads it when it needs the detail, and writes what matters into its memory.
+
+When an analyst tries to finish without `writeup.md` in the folder its reply names, RS holds it back once with a reminder to write it. If it still does not, it is let go. Under Claude this is a hook on the analyst's end; under pi, RS's rules extension does the same in the analyst's own run. Both ask the memory command, which only reads.
 
 An analyst has the project's data tools and cannot start helpers of its own. It runs the model set for it (see [The helpers' models](#the-helpers-models) below). Under pi its deadline is the longest pi accepts, about 24 days, instead of pi's default 30 minutes.
 
@@ -85,6 +89,8 @@ Under Claude the referee runs the model set for the whole installation in **Sand
 
 **A verdict is bound to what it judged.** A changed claim or evidence voids the verdict and the re-run, so a check never vouches for content it did not see.
 
-**A re-run proves the deliverable reproduces, not that it is right.** A file with a timestamp always shows "differs"; the user judges.
+**A re-run proves the deliverable reproduces, not that it is right.** The user judges. Analysts are told to keep their evidence files deterministic (no timings, timestamps or unordered rows), so a "differs" is no longer expected; when one shows, it is worth a look.
+
+**An analyst's write-up is checked at its end, not only asked for.** An instruction alone was measured not to be enough. A check when the analyst finishes holds it back once with a reminder. It never holds it twice, and a check that cannot run lets it go, so an analyst is never trapped.
 
 **The checks exist only in projects of this type.** A `researcher` project behaves exactly as before.
