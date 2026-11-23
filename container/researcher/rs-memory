@@ -5,11 +5,15 @@ Everything lives under /workspace/memory/ (RS_MEMORY_DIR overrides it):
 
   front.md                      the front page: line of inquiry, beliefs, in
                                 flight, open threads; one item per line, each
-                                with an id; its number in the header
+                                with an id; its number in the header; then
+                                "What we know about the data", the current
+                                accepted facts, written from the record at
+                                every write of the page and never read back
   front/<n>.md                  every earlier front page, never deleted
   journal/<yyyy-mm>/J-<n>.md    one entry per unit of work
-  staged/F-<n>.md, Q-, R-       claims waiting for the PI
-  record/F-<n>.md, Q-, R-       accepted findings, questions, retractions
+  staged/F-<n>.md, Q-, R-, D-   claims waiting for the PI
+  record/F-<n>.md, Q-, R-, D-   accepted findings, questions, retractions,
+                                facts about the data
   struck/                       staged claims the PI struck
   skills/candidates/earned-*/   proposed skills, loaded by no agent
   skills/active/earned-*/       promoted skills, copied into the agents' homes
@@ -29,7 +33,7 @@ Verbs:
   note HEADLINE --kind K [--body TEXT]
   checkpoint ITEM...            replace the "In flight" part of the front page
   claim STATEMENT --scope S --evidence FILE... [--hedge H] [relations] [--topic T]
-        [--rerun CMD | --no-rerun REASON]
+        [--rerun CMD | --no-rerun REASON | --question | --fact]
   amend ID [--statement S] [--scope S] [--hedge H] [--evidence FILE...] [relations]
         [--topic T] [--rerun CMD | --no-rerun REASON]
                                 correct a staged claim in place
@@ -50,6 +54,11 @@ The checks (--rerun, rerun-command, rerun, referee, --over-objection and
 accept's conditions on a finding) exist only in a project whose record,
 /workspace/.orchestrator/project.json, says "subagents": true; anywhere else
 every verb behaves as it always has.
+
+A fact (D-<n>, claim --fact) is a descriptive result about the data: an
+inventory line, a gap, a count. It needs a scope and evidence like a finding,
+but never the checks, in any project: the PI's accept is all it takes. Its
+standing is computed like a finding's.
 
 It never deletes anything under the memory folder: a struck claim moves to
 struck/, an old front page to front/, an amended claim keeps every earlier
@@ -156,7 +165,10 @@ PART_BY_KEY = {k: (h, letter, c) for k, h, letter, c in PARTS}
 CONSOLIDATED_PARTS = tuple(k for k, _h, _l, c in PARTS if c)
 
 RELATIONS = ("supersedes", "contradicts", "withdraws", "depends-on", "answers")
-CLAIM_ID_RE = re.compile(r"\A[FQR]-[1-9][0-9]*\Z")
+# Claim prefixes: F a finding, Q an open question, R a retraction, D a fact
+# about the data.
+CLAIM_ID_RE = re.compile(r"\A[FQRD]-[1-9][0-9]*\Z")
+CLAIM_KINDS = {"F": "finding", "Q": "question", "R": "retraction", "D": "fact"}
 JOURNAL_ID_RE = re.compile(r"\AJ-([1-9][0-9]*)\Z")
 # The Agent Skills naming rule pi and Claude Code share: lowercase letters,
 # digits and single hyphens, at most 64 characters.
@@ -173,6 +185,10 @@ JOB_ID_RE = re.compile(r"\Ajob-([1-9][0-9]*)\Z")
 JOB_LOG_TAIL_BYTES = 4096
 
 FRONT_MARK_RE = re.compile(r"<!-- rs-memory page=(\d+) next=(\d+) -->")
+# The front page's last section, the current accepted facts: computed from the
+# record at every write of the page, never held as items, and skipped when the
+# page is read back (its heading is no part's, and its lines are no items).
+FACTS_HEADING = "What we know about the data"
 ITEM_LINE_RE = re.compile(r"\A- \[([LBIT]-[1-9][0-9]*)\] (.*)\Z")
 
 
@@ -414,6 +430,7 @@ def read_front(p: "Path | None" = None) -> dict:
     cur = None
     for line in text.split("\n"):
         if line.startswith("## "):
+            # Any other heading, the facts section's included, holds no items.
             cur = heading_to_key.get(line[3:].strip())
             continue
         im = ITEM_LINE_RE.match(line)
@@ -423,6 +440,8 @@ def read_front(p: "Path | None" = None) -> dict:
 
 
 def render_front(front: dict) -> str:
+    """The page from its parts, then the facts section computed from the
+    record as it is now (absent when no fact is current)."""
     out = ["# Front page", "",
            f"<!-- rs-memory page={front['page']} next={front['next']} -->", ""]
     for k, heading, _letter, _c in PARTS:
@@ -430,7 +449,19 @@ def render_front(front: dict) -> str:
         for ident, text in front["parts"][k]:
             out.append(f"- [{ident}] {text}")
         out.append("")
+    facts = fact_lines(record_entries())
+    if facts:
+        out.append(f"## {FACTS_HEADING}")
+        out += facts
+        out.append("")
     return "\n".join(out)
+
+
+def fact_lines(rec: "dict[str, dict]") -> "list[str]":
+    """The front page's lines for the current accepted facts, oldest first."""
+    st = standing(rec)
+    facts = sorted((int(i[2:]), i) for i in rec if i.startswith("D-") and st[i] == "current")
+    return [f"- ({i}) {rec[i]['headline']} — scope: {one(rec[i], 'scope')}" for _n, i in facts]
 
 
 def new_item_id(front: dict, part: str) -> str:
@@ -583,9 +614,21 @@ def cmd_checkpoint(a) -> None:
 
 
 def _claim_prefix(a) -> str:
+    if a.fact:
+        if a.withdraws or a.question:
+            raise Refused("a claim is one kind: --fact stages a fact about the data, so drop "
+                          + ("--withdraws (a retraction is a claim of its own)" if a.withdraws
+                             else "--question"))
+        return "D"
     if a.withdraws:
         return "R"
     return "Q" if a.question else "F"
+
+
+def refuse_fact_rerun(prefix: str) -> None:
+    if prefix == "D":
+        raise Refused("a fact needs no checks, so it has no re-run command; "
+                      "drop --rerun / --no-rerun")
 
 
 def validate_claim(statement: str, scope: str, evidence: "list[str]",
@@ -598,6 +641,9 @@ def validate_claim(statement: str, scope: str, evidence: "list[str]",
         raise Refused("a claim needs --scope: where the statement holds (data, period, conditions)")
     if prefix == "F" and not evidence:
         raise Refused("a finding needs --evidence: the notebook, code or output it rests on")
+    if prefix == "D" and not evidence:
+        raise Refused("a fact needs --evidence: the file that shows it (the inventory, "
+                      "table or output)")
     out = []
     for e in evidence:
         p = Path(e)
@@ -612,7 +658,7 @@ def validate_claim(statement: str, scope: str, evidence: "list[str]",
             if i not in known:
                 raise Refused(f"--{rel} {i}: no claim {i} exists (see rs-memory view)")
     if prefix == "R" and not relations.get("withdraws"):
-        raise Refused("a retraction names what it withdraws: --withdraws F-<n>")
+        raise Refused("a retraction names what it withdraws: --withdraws <id> (a finding or a fact)")
     return out
 
 
@@ -620,7 +666,7 @@ def write_claim(prefix: str, statement: str, scope: str, hedge: str,
                 evidence: "list[tuple[str, str]]", relations: "dict[str, list[str]]",
                 topics: "list[str]", rerun: "tuple[str, str] | None" = None) -> str:
     ident = next_claim_id(prefix)
-    fields = [("kind", {"F": "finding", "Q": "question", "R": "retraction"}[prefix]),
+    fields = [("kind", CLAIM_KINDS[prefix]),
               ("scope", scope), ("hedge", hedge or "(none stated)"),
               ("staged", now()), ("session", session_label())]
     for path, digest in evidence:
@@ -665,6 +711,7 @@ def cmd_claim(a) -> None:
     rels = _relations_from(a)
     rerun = None
     if a.rerun is not None or a.no_rerun is not None:
+        refuse_fact_rerun(prefix)
         require_checks("--rerun and --no-rerun")
         if prefix != "F":
             raise Refused("only a finding has a re-run command; drop --rerun / --no-rerun")
@@ -715,6 +762,7 @@ def cmd_amend(a) -> None:
         prefix = ident[0]
         rerun = None
         if a.rerun is not None or a.no_rerun is not None:
+            refuse_fact_rerun(prefix)
             require_checks("--rerun and --no-rerun")
             if prefix != "F":
                 raise Refused("only a finding has a re-run command; drop --rerun / --no-rerun")
@@ -813,6 +861,14 @@ def cmd_accept(a) -> None:
             extra = accept_checks(ident, meta, a.over_objection) \
                 if checks and ident.startswith("F-") else None
             metas.append((ident, path, extra))
+        # The front page's facts section follows the record: when this accept
+        # changes it (a fact accepted, withdrawn or superseded), the page is
+        # read now, so an unreadable page refuses before anything moves, and
+        # written again after the moves.
+        rec = record_entries()
+        after = dict(rec)
+        after.update((ident, parse_entry(path)) for ident, path, _e in metas)
+        front = read_front() if fact_lines(rec) != fact_lines(after) else None
         stamp = now()
         objected = []
         for ident, path, extra in metas:
@@ -830,6 +886,10 @@ def cmd_accept(a) -> None:
             write_text(dest, head + "\n" + (f"\n{body}\n" if body else ""), mode=0o444)
             if objection.strip():
                 objected.append(ident)
+        if front is not None:
+            # The same page number: only the computed section moved, and a
+            # consolidation built from this page still applies.
+            write_text(mem_dir() / "front.md", render_front(front))
         j = add_journal("accepted " + " ".join(i for i, _p, _e in metas), "accept",
                         ("over the referee's objection: " + " ".join(objected)) if objected else "")
     print(f"Accepted into the record: {' '.join(i for i, _p, _e in metas)} ({j}).")
@@ -1492,12 +1552,17 @@ def knowledge_text(topic: "str | None" = None) -> str:
     def keep(e):
         return topic is None or topic in e.get("topic", [])
 
-    cur = [e for i, e in rec.items() if st[i] == "current" and keep(e)]
+    cur = [e for i, e in rec.items() if st[i] == "current" and keep(e) and not i.startswith("D-")]
+    facts = sorted(((int(i[2:]), e) for i, e in rec.items()
+                    if st[i] == "current" and keep(e) and i.startswith("D-")),
+                   key=lambda t: t[0])
     contested = [e for i, e in rec.items() if st[i] == "contested" and keep(e)]
     questions = [e for i, e in rec.items() if st[i] == "open" and keep(e)]
     out = ["## State of knowledge" + (f" — topic {topic}" if topic else "")]
     out.append("Current findings:" if cur else "Current findings: none")
     out += ["  " + _entry_line(e, st, rec) for e in cur]
+    out.append("Current facts about the data:" if facts else "Current facts about the data: none")
+    out += ["  " + _entry_line(e, st, rec) for _n, e in facts]
     if contested:
         out.append("Contested (contradict each other):")
         for e in contested:
@@ -1891,8 +1956,10 @@ merges your changes, and anything you do not mention stays as it is.
 Rules:
 - Parts you may change: "Line of inquiry" (what is being studied and the PI's
   standing direction), "Beliefs" (what the agent currently holds, each pointing
-  at the findings behind it, e.g. "(F-3)"), "Open threads" (questions and leads
-  not yet followed). Never "In flight": the working session owns it.
+  at the findings or facts behind it, e.g. "(F-3)" or "(D-2)"), "Open threads"
+  (questions and leads not yet followed). Never "In flight": the working
+  session owns it. Never "What we know about the data" either: it lists the
+  facts the PI accepted, and code writes it from the record.
 - Keep each item one line. Keep hedges as the journal states them; do not make
   a tentative result sound settled.
 - Retire an item only when a journal entry shows it no longer holds or is done.
@@ -1901,9 +1968,11 @@ Rules:
   because Y"), not a deletion.
 - You may propose candidate claims (staged for the PI, never accepted by you)
   and candidate skills (a procedure the journal shows was needed and worked).
-  Propose none when nothing qualifies; most runs propose none. A finding needs
-  a scope and evidence: paths of existing files (notebooks, code, outputs). A
-  claim's relations point at existing claim ids and are among supersedes,
+  Propose none when nothing qualifies; most runs propose none. A fact is a
+  descriptive result about the data (an inventory line, a gap, a count): true
+  or false by looking, not an inference. A finding or a fact needs a scope and
+  evidence: paths of existing files (notebooks, code, outputs). A claim's
+  relations point at existing claim ids and are among supersedes,
   contradicts, depends-on, answers. A skill name is lowercase letters, digits
   and single hyphens; "earned-" is added in front of it.
 - Use no other rs-memory verb than consolidate. Do not change any other file.
@@ -1932,8 +2001,8 @@ consolidated, stop there (another run covered them; never change "page" or
 If the entries change nothing on the page, apply a delta with only "page"
 and "through": that records them as covered. "page" and "through" must stay
 exactly as written above. "part" is one of
-inquiry, beliefs, threads. "kind" is finding or question. Leave out what you
-do not use.
+inquiry, beliefs, threads. "kind" is finding, fact or question. Leave out
+what you do not use.
 """
 
 
@@ -2071,9 +2140,9 @@ def apply_delta(path: Path) -> None:
         for c in _as_list(delta.get("claims"), "claims"):
             if not isinstance(c, dict):
                 raise Refused("delta: each claim is an object")
-            prefix = {"finding": "F", "question": "Q"}.get(c.get("kind"))
+            prefix = {"finding": "F", "fact": "D", "question": "Q"}.get(c.get("kind"))
             if prefix is None:
-                raise Refused("delta: a claim's kind is finding or question")
+                raise Refused("delta: a claim's kind is finding, fact or question")
             rels = c.get("relations") or {}
             if not isinstance(rels, dict) or any(r not in RELATIONS or r == "withdraws" for r in rels):
                 raise Refused(f"delta: claim relations are among "
@@ -2471,12 +2540,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("items", nargs="*")
     p.set_defaults(fn=cmd_checkpoint)
 
-    p = sub.add_parser("claim", help="stage a finding, question or retraction for the PI")
+    p = sub.add_parser("claim", help="stage a finding, question, retraction or fact for the PI")
     p.add_argument("statement")
     p.add_argument("--scope")
     p.add_argument("--hedge")
     p.add_argument("--evidence", action="append")
     p.add_argument("--question", action="store_true")
+    p.add_argument("--fact", action="store_true",
+                   help="a fact about the data (an inventory line, a gap, a count): "
+                   "accepted by the PI without checks")
     for rel in RELATIONS:
         p.add_argument(f"--{rel}", action="append", metavar="ID")
     p.add_argument("--topic", action="append")

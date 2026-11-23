@@ -18165,8 +18165,10 @@ MEMORY_KIT_LABEL = "research.memory-kit"
 # start relying on something new in rs-memory (a verb or an option): the
 # instructions follow the host's code at every start, while the command
 # follows the image, so an older image must be refused, never run. Version 4:
-# the instructions name `rs-memory amend` and `rs-memory job`.
-MEMORY_KIT_VERSION = "4"
+# the instructions name `rs-memory amend` and `rs-memory job`. Version 5:
+# the instructions name `rs-memory claim --fact` (a data fact, D-<n>, which the
+# PI accepts without the finding checks and the front page lists).
+MEMORY_KIT_VERSION = "5"
 MEMORY_TOOL = f"{RS_LIB_DIR}/rs-memory"
 MEMORY_LINKS = ("rs-memory",)
 MEMORY_AGENTS = ("claude", "pi")
