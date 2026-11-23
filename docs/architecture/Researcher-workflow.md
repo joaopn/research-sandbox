@@ -36,8 +36,8 @@ flowchart TD
 
 | Part | Holds | Changes | Reaches the agent |
 |---|---|---|---|
-| Front page | current work, beliefs as pointers, work in flight, open threads | rewritten at each consolidation | at every session start and after every compaction |
-| Record | findings with scope, evidence and relations; open questions | append-only | as views, on demand |
+| Front page | current work, beliefs as pointers, work in flight, open threads; the accepted facts about the data | rewritten at each consolidation; its facts section at each accept | at every session start and after every compaction |
+| Record | findings and facts with scope, evidence and relations; open questions | append-only | as views, on demand |
 | Journal | what was done and why, dead ends included | append-only | searched on demand |
 | Skills | procedures worth keeping | promoted after a successful use, retired when stale | when a task matches |
 
@@ -50,12 +50,16 @@ The agent keeps its memory through one command, `rs-memory`. Its refusals name t
 | Verb | Does |
 |---|---|
 | `note`, `checkpoint` | add to the journal; a checkpoint before long work lets an interruption resume |
-| `claim`, `amend` | stage a finding with its evidence; correct a staged one in place |
-| `accept`, `strike` | enter a staged finding in the record, or drop it, after the user says so |
+| `claim`, `amend` | stage a finding or a fact about the data with its evidence; correct a staged one in place |
+| `accept`, `strike` | enter a staged finding or fact in the record, or drop it, after the user says so |
 | `view`, `recall` | show the state of knowledge or one entry with its chain; search the journal and claims as text |
 | `skill propose`, `used`, `promote`, `retire` | turn a working procedure into a skill for both agents |
 | `open`, `close`, `consolidate` | start a session; end one and rewrite the front page |
 | `job add`, `list`, `done` | register a long run left going, show its state, mark it handled |
+
+A fact (`claim --fact`, an id `D-<n>`) is a descriptive result about the data: an inventory line, a gap, a count. It needs a scope and evidence like a finding, and the user's accept, but never the checks of a project with analysts. One accept can take several facts at once.
+
+The front page ends with a section of its own, "What we know about the data": one line per current accepted fact, with its id, statement and scope. It is written from the record every time the page is written, and an accept that changes it rewrites the page under the same page number. A fact that is withdrawn or superseded leaves it. The section is never read back as items, so consolidation cannot change it, but its beliefs may point at a fact, as at a finding.
 
 A finding's standing (current, superseded, contested, withdrawn) is computed from its relations each time it is shown. Accepted entries are never edited, so a correction of one is a new entry that supersedes it.
 
@@ -88,5 +92,7 @@ The user accepts a finding by saying so in the chat, for example "accept F-3".
 **Skills are earned.** A procedure becomes a skill only after a successful use. It goes into both agents' skills folders, so Claude and pi share it.
 
 **Plain search first.** The journal is searched as text. An index is added only if measurement shows plain search missing things.
+
+**Facts keep the user's accept and drop only the checks.** A description of the data is true or false by looking at it, so a re-run and a referee add little, while the user's accept still decides what is known. The front page lists the accepted facts because it is the file the user reads; the agent's own views list them too. The cost is a second kind of record entry, and a section of the page that code writes.
 
 **Discipline, not security.** The agent can write the memory files by hand. The command is the easy path, and the user's accept is a chat message the agent acts on.

@@ -63,7 +63,7 @@ When the researcher stages a finding, it gives the command that reproduces it, o
 | Answers | per evidence file: same, differs, or not produced | supported, overreaches (with the narrower claim that would hold), or unsupported |
 | Kept | under the memory, never deleted | under the memory, never deleted |
 
-Both checks run in the background and answer the researcher, which tells the user. The user decides: a finding the referee objects to can still be accepted when the user says so, and the objection stays on it. A changed claim or evidence voids both checks. Open questions and retractions need no checks.
+Both checks run in the background and answer the researcher, which tells the user. The user decides: a finding the referee objects to can still be accepted when the user says so, and the objection stays on it. A changed claim or evidence voids both checks. Open questions, retractions and facts about the data need no checks: the user accepts a fact without a re-run or a referee.
 
 The web is the researcher's own for a quick lookup. A survey goes to a **surveyor** under Claude: it has only Claude's web search and page fetch, runs in the background, and answers with a summary and its sources. Under pi there is no survey helper yet, and the researcher says so.
 
