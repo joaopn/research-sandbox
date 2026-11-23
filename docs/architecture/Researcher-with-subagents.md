@@ -65,11 +65,11 @@ The web is the researcher's own for a quick lookup. A survey goes to a **surveyo
 
 ## The helpers' models
 
-Under Claude the analyst and the surveyor each run the model and effort set for the whole installation in **Sandboxes → Infrastructure → Analyst** and **→ Surveyor**, Sonnet at high effort by default. A new project of this type starts with them, and a project's own are changed in its ⚙ Agents box, on Claude's tab. Under pi the analyst runs pi's default model unless its own model and thinking level are set on pi's tab of the same box; there is no installation default for it, since pi names its models by provider. A change is written into the helper's definition, so the next helper launched uses it, and nothing restarts. A project created before these settings keeps running its Claude helpers on the researcher's model until they are set in its ⚙ Agents box.
+Under Claude the analyst and the surveyor each run the model and effort set for the whole installation in **Sandboxes → Infrastructure → Analyst** and **→ Surveyor**, Sonnet at high effort by default. A new project of this type starts with them, and a project's own are set when the project is created (the New Project window's Agents box, beside Agent), or later in ⚙ on Claude's tab. Under pi the analyst runs pi's default model unless its own model and thinking level are set on pi's tab, when the project is created or later in ⚙; there is no installation default for it, since pi names its models by provider. A change is written into the helper's definition, so the next helper launched uses it, and nothing restarts. A project created before these settings keeps running its Claude helpers on the researcher's model until they are set in its ⚙ Agents box.
 
 ## The referee's model
 
-Under Claude the referee runs the model set for the whole installation in **Sandboxes → Infrastructure → Referee**, Sonnet at high effort by default. A new project of this type starts with it, and a project's own can be changed in its ⚙ Agents box; the next referee run uses the change, and nothing restarts. Under pi the referee runs the project's pi model.
+Under Claude the referee runs the model set for the whole installation in **Sandboxes → Infrastructure → Referee**, Sonnet at high effort by default. A new project of this type starts with it, and a project's own is set when the project is created, or later in ⚙; the next referee run uses the change, and nothing restarts. Under pi the referee runs the project's pi model.
 
 ## Design decisions
 

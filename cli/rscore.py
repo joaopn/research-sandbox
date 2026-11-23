@@ -1178,12 +1178,16 @@ def _resolve_all_model_pairs(supervisor: tuple[str, str] = ("", ""),
                              worker: tuple[str, str] = ("", ""),
                              role: tuple[str, str] = ("", ""),
                              box: tuple[str, str] = ("", ""),
-                             subagents: bool = False) -> dict[str, dict[str, str]]:
+                             subagents: bool = False,
+                             helpers: dict[str, tuple[str, str]] | None = None
+                             ) -> dict[str, dict[str, str]]:
     """Resolve all FOUR container types into concrete, mutually-valid pairs — the
     exact shape written into `.orchestrator/project.json`. `subagents` adds the
-    finding referee's pair and the analyst's and surveyor's (from the defaults),
-    for a researcher-subagents project only: `rs-memory referee` reads the
-    first from the record, the kit's installer the other two.
+    finding referee's pair and the analyst's and surveyor's, for a
+    researcher-subagents project only: `rs-memory referee` reads the first from
+    the record, the kit's installer the other two. `helpers` maps each of those
+    types to the create's requested pair, taken over the defaults ("" halves =
+    the default, as for the four types above).
 
     Every pair (including `box`, which has no create-time field and therefore
     comes straight from the defaults file) passes through the effort-support drop
@@ -1203,8 +1207,10 @@ def _resolve_all_model_pairs(supervisor: tuple[str, str] = ("", ""),
                                    catalog=catalog, pairs=pairs)
         out[ctype] = {"model": m, "effort": e}
     if subagents:
-        for ctype in ("referee", *HELPER_MODEL_TYPES):
-            m, e = _resolve_model_pair(ctype, catalog=catalog, pairs=pairs)
+        for ctype in SUBAGENT_MODEL_TYPES:
+            supplied = (helpers or {}).get(ctype, ("", ""))
+            m, e = _resolve_model_pair(ctype, supplied[0], supplied[1],
+                                       catalog=catalog, pairs=pairs)
             out[ctype] = {"model": m, "effort": e}
     return out
 
@@ -1430,6 +1436,20 @@ class CreateRequest:
     # among them (see PI_MODEL_RE for why the model is free text).
     pi_model: str = ""
     pi_thinking: str = ""
+    # A researcher-subagents project's referee and helper roles (the New
+    # Project window's rows beside Agent): Claude's pairs resolved here like
+    # worker_*, frozen into models.referee/analyst/surveyor instead of the
+    # installation defaults; pi's analyst into pi_models.analyst. "" = the
+    # installation default (pi's default for pi's analyst). Refused on any
+    # other workflow; Claude's need Claude among the agents, pi's need pi.
+    referee_model: str = ""
+    referee_effort: str = ""
+    analyst_model: str = ""
+    analyst_effort: str = ""
+    surveyor_model: str = ""
+    surveyor_effort: str = ""
+    pi_analyst_model: str = ""
+    pi_analyst_thinking: str = ""
     # The working mode and the doer/checker models (I33; HARNESS_FIELDS, "" =
     # unset). Dev workflows only; validated in _validated_harness.
     harness_mode: str = ""
@@ -1782,6 +1802,9 @@ class CreateRequest:
             deploys_agents=(substrate is Substrate.DOCKER
                             or project_type is ProjectType.SANDBOX_DIND),
             agents=agents)
+        helper_pairs = _validated_subagent_pairs(kw, subagents=research_subagents,
+                                                 agents=agents, catalog=catalog,
+                                                 pairs=model_pairs)
         harness = _validated_harness(_harness_shape(kw), dev=bool(manifest.get("dev")),
                                      agents=agents)
         return cls(
@@ -1822,8 +1845,60 @@ class CreateRequest:
             worker_model=wrk_m, worker_effort=wrk_e,
             role_model=rol_m, role_effort=rol_e,
             pi_model=pi_model, pi_thinking=pi_thinking,
+            **helper_pairs,
             **harness,
         )
+
+
+# The create fields of a researcher-subagents project's referee and helper
+# roles (CreateRequest; the same names as UpdateRequest's): Claude's pairs per
+# SUBAGENT_MODEL_TYPES, then pi's analyst.
+SUBAGENT_MODEL_TYPES = ("referee", "analyst", "surveyor")
+PI_ANALYST_FIELDS = ("pi_analyst_model", "pi_analyst_thinking")
+
+
+def _validated_subagent_pairs(kw: dict, *, subagents: bool, agents: "Sequence[str]",
+                              catalog: dict, pairs: dict) -> dict[str, str]:
+    """The create's referee and helper pairs, checked before any side effect:
+    refused on a workflow without `subagents`, Claude's without Claude among
+    the agents and pi's analyst without pi. A Claude pair given (either half)
+    is resolved against the catalog like worker_* (an unknown tier or an
+    impossible pair refused); an empty one stays "" and create() freezes the
+    installation default. The texts reach the browser verbatim: they name the
+    window's rows, never a command-line flag."""
+    claude_fields = [f"{t}_{k}" for t in SUBAGENT_MODEL_TYPES for k in ("model", "effort")]
+    out: dict[str, str] = {}
+    for f in (*claude_fields, *PI_ANALYST_FIELDS):
+        v = kw.get(f)
+        if v is not None and not isinstance(v, str):
+            raise ValidationError(f"{f} must be a string")
+        out[f] = (v or "").strip()
+    if not any(out.values()):
+        return out
+    if not subagents:
+        raise ValidationError("the Referee, Analyst and Surveyor models apply only to a "
+                              "researcher-subagents project; this workflow has none")
+    if any(out[f] for f in claude_fields) and DEFAULT_AGENT not in agents:
+        raise ValidationError("the Referee, Analyst and Surveyor models for Claude need "
+                              "Claude among the project's agents")
+    for ctype in SUBAGENT_MODEL_TYPES:
+        m, e = out[f"{ctype}_model"], out[f"{ctype}_effort"]
+        if m or e:
+            out[f"{ctype}_model"], out[f"{ctype}_effort"] = _resolve_model_pair(
+                ctype, m, e, catalog=catalog, pairs=pairs)
+    pm, pt = out["pi_analyst_model"], out["pi_analyst_thinking"]
+    if pm or pt:
+        if "pi" not in agents:
+            raise ValidationError("the Analyst model for pi needs pi among the "
+                                  "project's agents")
+        if pm and not PI_MODEL_RE.match(pm):
+            raise ValidationError(
+                f"pi analyst model {pm!r} must be written provider/model, e.g. "
+                f"openrouter/anthropic/claude-opus-latest")
+        if pt and pt not in PI_THINKING_LEVELS:
+            raise ValidationError(f"pi analyst thinking level {pt!r} is not one of "
+                                  f"{', '.join(PI_THINKING_LEVELS)}")
+    return out
 
 
 # The working mode, the test policy and RS's doer/checker subagents (I33). One
@@ -5082,7 +5157,9 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
         supervisor=(req.supervisor_model, req.supervisor_effort),
         worker=(req.worker_model, req.worker_effort),
         role=(req.role_model, req.role_effort),
-        subagents=req.research_subagents)
+        subagents=req.research_subagents,
+        helpers={t: (getattr(req, f"{t}_model"), getattr(req, f"{t}_effort"))
+                 for t in SUBAGENT_MODEL_TYPES})
     marker = {"type": project_type, "substrate": substrate.value,
               "workflow": req.workflow, "agents": deployed_agents,
               "models": model_pairs,
@@ -5122,8 +5199,14 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     # site reads it back from here (_read_pi_pair).
     pi_pair = ({"model": req.pi_model, "thinking": req.pi_thinking}
                if (req.pi_model or req.pi_thinking) else None)
-    if pi_pair:
-        marker["pi_models"] = {"agent": pi_pair}
+    pi_models = {"agent": pi_pair} if pi_pair else {}
+    # pi's analyst likewise (a researcher-subagents create only, gated in
+    # from_kwargs), in the shape the ⚙ Agents box writes; unset = pi's default.
+    if req.pi_analyst_model or req.pi_analyst_thinking:
+        pi_models["analyst"] = {"model": req.pi_analyst_model,
+                                "thinking": req.pi_analyst_thinking}
+    if pi_models:
+        marker["pi_models"] = pi_models
     # The working mode and the doer/checker models, only what the create chose
     # (from_kwargs refused them outside a dev workflow). _stage_harness reads
     # them back at every deploy (_read_harness).

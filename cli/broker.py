@@ -827,6 +827,15 @@ CREATE_WEBUI_FIELDS = frozenset({
     # path, host port or mount); from_kwargs holds the model to a strict
     # charset and refuses both where pi is not deployed.
     "pi_model", "pi_thinking",
+    # A researcher-subagents project's referee and helper roles (the New
+    # Project window's rows beside Agent): IN-BOX like the pairs above —
+    # catalog tokens and a pi provider/model id frozen into the project's
+    # record, which rs-memory and the kit's installer read inside the
+    # container; no path, host port or mount. from_kwargs refuses them on any
+    # other workflow, resolves Claude's against the catalog and holds pi's to
+    # the strict charset.
+    "referee_model", "referee_effort", "analyst_model", "analyst_effort",
+    "surveyor_model", "surveyor_effort", "pi_analyst_model", "pi_analyst_thinking",
     # The working mode and the doer/checker models (dev workflows only, refused
     # elsewhere in from_kwargs): IN-BOX — they land in the agent's own config
     # files inside the container; tiers, pi ids and levels are shape-checked.

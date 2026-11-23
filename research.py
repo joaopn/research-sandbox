@@ -501,6 +501,10 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         worker_model=args.worker_model, worker_effort=args.worker_effort,
         role_model=args.role_model, role_effort=args.role_effort,
         pi_model=args.pi_model, pi_thinking=args.pi_thinking,
+        referee_model=args.referee_model, referee_effort=args.referee_effort,
+        analyst_model=args.analyst_model, analyst_effort=args.analyst_effort,
+        surveyor_model=args.surveyor_model, surveyor_effort=args.surveyor_effort,
+        pi_analyst_model=args.pi_analyst_model, pi_analyst_thinking=args.pi_analyst_thinking,
         status_bar=args.status_bar,
         **{f: getattr(args, f) for f in rscore.HARNESS_FIELDS},
     )
@@ -2980,6 +2984,31 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
                    help="pi's starting thinking level: "
                         f"{', '.join(rscore.PI_THINKING_LEVELS)}. Needs pi among the agents.")
+    # The referee and helper roles of a researcher-subagents project, frozen
+    # into its record instead of the installation defaults (changed later
+    # with `project update`'s flags of the same names).
+    c.add_argument("--referee-model", default="", metavar="MODEL",
+                   help="model of the finding referee, in a researcher-subagents "
+                        "project (unset = the installation default)")
+    c.add_argument("--referee-effort", default="", metavar="LEVEL",
+                   help="effort level of the finding referee (unset = the installation default)")
+    c.add_argument("--analyst-model", default="", metavar="MODEL",
+                   help="model of Claude's analyst helper, in a researcher-subagents "
+                        "project (unset = the installation default)")
+    c.add_argument("--analyst-effort", default="", metavar="LEVEL",
+                   help="effort level of Claude's analyst helper (unset = the installation default)")
+    c.add_argument("--surveyor-model", default="", metavar="MODEL",
+                   help="model of Claude's surveyor helper, in a researcher-subagents "
+                        "project (unset = the installation default)")
+    c.add_argument("--surveyor-effort", default="", metavar="LEVEL",
+                   help="effort level of Claude's surveyor helper (unset = the installation default)")
+    c.add_argument("--pi-analyst-model", dest="pi_analyst_model", default="",
+                   metavar="PROVIDER/MODEL",
+                   help="model of pi's analyst helper, in a researcher-subagents project "
+                        "(unset = pi's default). Needs pi among the agents.")
+    c.add_argument("--pi-analyst-thinking", dest="pi_analyst_thinking", default="",
+                   choices=("",) + rscore.PI_THINKING_LEVELS, metavar="LEVEL",
+                   help="thinking level of pi's analyst helper (unset = pi's default)")
     c.add_argument("--status-bar", dest="status_bar", action=argparse.BooleanOptionalAction,
                    default=True,
                    help="RS's status bar under the prompt of the project container's "

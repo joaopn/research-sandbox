@@ -9476,6 +9476,15 @@ const MODEL_PICKER_SPECS = [
     ["worker", "Workers", "Headless analysis workers the agent spawns."],
     ["role", "Role-MCPs", "Tool services workers call — one session per tool-call."],
 ];
+// A researcher-subagents project's helper roles and its finding referee, in the
+// order the create dialog shows them after Agent. They render only for a
+// manifest with `subagents: true` (elsewhere the backend refuses the fields),
+// each prefilled from its installation default (Sandboxes → Infrastructure).
+const SUBAGENT_PICKER_SPECS = [
+    ["analyst", "Analyst", "Carries out one analysis for the agent, in parallel with others."],
+    ["surveyor", "Surveyor", "Answers one question from the web for the agent."],
+    ["referee", "Referee", "Checks a finding before you accept it."],
+];
 
 // The egress the create dialog starts on: the workflow's `default_egress` from the
 // broker's workflows read — the egress the server resolves for that workflow when
@@ -9841,16 +9850,19 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
     const isDev = !!manifest.dev;
     // a researcher project is its research agent (the memory kit): it needs one, as dev does
     const isResearcher = manifest.memory === true;
+    // the researcher-subagents type: its helpers' and referee's models beside Agent
+    const isSubagents = manifest.subagents === true;
     const showInBox = !isDev && (isDocker || boxCapable);
 
     // Agent model + effort. Every workflow has an agent the researcher talks to,
     // so the "Agent" picker is universal (the dev card included — a dev project
     // has no worker layer, so it gets exactly one picker, like any other
-    // non-research workflow). Workers/Role-MCPs only where a worker layer exists.
+    // non-research workflow). Workers/Role-MCPs only where a worker layer exists;
+    // Analyst, Surveyor and Referee only on a researcher-subagents workflow.
     const cat = state.modelCatalog;
     const modelPickers = cat
-        ? MODEL_PICKER_SPECS
-              .filter(([ctype]) => ctype === "supervisor" || hasWorkerLayer)
+        ? [...MODEL_PICKER_SPECS.filter(([ctype]) => ctype === "supervisor" || hasWorkerLayer),
+           ...(isSubagents ? SUBAGENT_PICKER_SPECS : [])]
               .map(([ctype, title, hint]) => [ctype, modelPicker(cat, ctype, title, hint, {})])
         : [];
     // One `.field` per container type, with its model and effort side by side.
@@ -10072,6 +10084,37 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             ]),
         ]),
     ]);
+    // pi's analyst (a researcher-subagents workflow; pi has no surveyor, and
+    // pi's referee runs the model above): its own model and thinking level,
+    // empty = pi's default. Changed later in the project's ⚙ Agents box.
+    const piAnalystModelI = el("input", {
+        type: "text", autocomplete: "off", spellcheck: "false",
+        placeholder: "provider/model (empty: pi's default)",
+    });
+    const piAnalystThinkingS = el("select", {}, [
+        el("option", { value: "" }, ["pi's default"]),
+        ...PI_THINKING_LEVELS.map((lv) => el("option", { value: lv }, [lv])),
+    ]);
+    if (isSubagents) {
+        piPanel.appendChild(el("div", { class: "hint" }, [
+            "pi's referee, which checks a finding before you accept it, runs this model.",
+        ]));
+        piPanel.appendChild(el("div", { class: "field" }, [
+            el("label", {}, ["Analyst"]),
+            el("div", { class: "model-row agent-pi-row" }, [
+                el("div", { class: "model-cell agent-pi-model" }, [
+                    el("span", { class: "model-cap" }, ["model"]), piAnalystModelI,
+                ]),
+                el("div", { class: "model-cell" }, [
+                    el("span", { class: "model-cap" }, ["thinking"]), piAnalystThinkingS,
+                ]),
+            ]),
+            el("div", { class: "hint" }, [
+                "Carries out one analysis for the agent, in parallel with others. " +
+                "Empty: pi's default model and thinking level.",
+            ]),
+        ]));
+    }
     const claudePanel = el("div", { class: "agent-tab-panel" },
         modelFields.length ? modelFields : [el("div", { class: "hint" }, [
             "Model choices are unavailable right now; Claude starts on its defaults.",
@@ -10185,6 +10228,11 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
             const m = piModelI.value.trim();
             if (m) out.pi_model = m;
             if (piThinkingS.value) out.pi_thinking = piThinkingS.value;
+            if (isSubagents) {
+                const am = piAnalystModelI.value.trim();
+                if (am) out.pi_analyst_model = am;
+                if (piAnalystThinkingS.value) out.pi_analyst_thinking = piAnalystThinkingS.value;
+            }
         }
         // The working mode: sent only when it is not None, the Doer/Checker
         // models only for the subagents the mode uses and only for an agent that is on
@@ -10581,7 +10629,9 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
                 // supervisor_* while Claude is on (always, on research);
                 // worker_*/role_* only where a worker layer exists (from_kwargs
                 // rejects them elsewhere, and the pickers are filtered to match);
-                // pi_model/pi_thinking while pi is on. Every key is in
+                // analyst_*/surveyor_*/referee_* on a researcher-subagents
+                // workflow only, likewise; pi_model/pi_thinking while pi is on,
+                // and pi_analyst_* there too on that workflow. Every key is in
                 // CREATE_WEBUI_FIELDS.
                 ...agentModelPayload(),
             };
