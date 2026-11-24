@@ -119,7 +119,7 @@ The broker handles one request at a time. Reads, create and destroy run inside t
 | Review | Review of a pull request or commit | Parallel |
 | Dev | Dev box and dev project setup; Gitea upgrade and rollback | Parallel; Gitea actions refused during an upgrade |
 
-Every write operation produces two logs. The **view log** holds milestones and is what the browser shows, as a checklist of the verb's stages; the **full log** holds raw output and stays on the host, because it contains host paths. A build's full output can be read through an authenticated verb, and a long build can be sent to the background with a notice when it ends. After a page reload the browser asks the broker which operations are still running.
+Every write operation produces two logs. The **view log** holds milestones and is what the browser shows, as a checklist of the verb's stages; the **full log** holds raw output and stays on the host, because it contains host paths. A build's full output can be read through an authenticated verb. A long operation (a build, a project start, stop or update, a review) can be sent to the background; when it ends, a corner notice says so, or for a review or a successful sidebar action, the cell or row itself updates. While it runs, its row, its "reviewing…" cell or the project's spinning power button opens the progress box again, from the start of the log. After a page reload the browser asks the broker which operations are still running, and those can be opened the same way (reviews excepted: the page does not remember them across a reload).
 
 ```mermaid
 sequenceDiagram
