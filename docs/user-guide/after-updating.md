@@ -22,6 +22,10 @@ A project that has not been restarted since an update keeps working as before. A
 
 A `researcher` or `researcher-subagents` project needs its image to carry the memory command its instructions describe. On an older image its start ends with an error that names **Rebuild all**, and its memory is not set up until the rebuild and a stop and start.
 
+## Once: the update that blocks links to the Anthropic account
+
+Each project now has a switch, **Block links to the Anthropic account**, on by default. A project created before this update is blocked from its next start: Claude there loses your claude.ai connectors, Remote Control and Claude in Chrome. To keep them, open the project's ⚙ window, Agents section, and choose **Allow**. Claude sessions started afterwards have them again.
+
 ## Once: the update that stops tracking `.env`
 
 `.env` used to be part of the repository. It is now ignored, so your settings stay on your machine. Pulling that update deletes an unchanged `.env`, and the next `python research.py start` writes a fresh one from `.env.example`. A `.env` you edited stops the pull with an error about local changes. In every case, keep a copy and put it back after the pull, in the folder you cloned RS into:

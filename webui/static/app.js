@@ -10891,6 +10891,24 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
     const policySwitch = isDev ? testPolicySwitch(null) : null;
     if (harnessClaude) claudePanel.appendChild(harnessClaude.node);
     if (harnessPi) piPanel.appendChild(harnessPi.node);
+    // Claude's links to the operator's Anthropic account (claude.ai connectors,
+    // Remote Control, Claude in Chrome), blocked by default. In Claude's tab
+    // only: pi has none of them. Changed later in the project's ⚙ window.
+    const blockLinksCb = el("input", { type: "checkbox" });
+    blockLinksCb.checked = true;
+    const blockLinksCard = el("div", { class: "box-opt-card selected" },
+        [el("span", { class: "box-opt-name" }, ["Block links to the Anthropic account"])]);
+    blockLinksCard.onclick = () => {
+        blockLinksCb.checked = !blockLinksCb.checked;
+        blockLinksCard.classList.toggle("selected", blockLinksCb.checked);
+    };
+    claudePanel.appendChild(el("div", { class: "field" }, [
+        el("div", { class: "box-opt-cards" }, [blockLinksCard]),
+        el("div", { class: "hint" }, [
+            "Claude sessions in this project get no claude.ai connectors, no Remote " +
+            "Control and no Claude in Chrome. Switch it off to allow all three.",
+        ]),
+    ]));
     syncHarnessRows(harnessSwitch ? harnessSwitch.value() : "none");
     const agentPanels = { claude: claudePanel, pi: piPanel };
     const agentTabsRow = el("div", { class: "agent-tabs" });
@@ -10972,6 +10990,9 @@ function mgmtCreateDialog(view, manifest, agents, nodePresent, dataDir, giteaEna
     // values only while pi is on and only when set (empty = pi's own pick).
     const agentModelPayload = () => {
         const out = agentOn("claude") ? modelPayload() : {};
+        // The block on Claude's links to the Anthropic account, while Claude
+        // is on (in CREATE_WEBUI_FIELDS and DEV_PROJECT_WEBUI_FIELDS).
+        if (agentOn("claude")) out.block_account_links = blockLinksCb.checked;
         if (agentOn("pi")) {
             const m = piModelI.value.trim();
             if (m) out.pi_model = m;
@@ -14853,7 +14874,52 @@ function agentsBoxContent(name, d, cat, staged) {
             "nothing is started."]),
         el("div", { class: "config-box-row" }, [apply, upd]),
         applyMsg,
+        // Only where the project container runs Claude (the read carries it then).
+        d.account_links ? accountLinksRow(name, d.account_links, !!d.running) : null,
     ].filter((n) => n);
+}
+
+// The project container's block on Claude's links to the operator's Anthropic
+// account (claude.ai connectors, Remote Control, Claude in Chrome): the saved
+// choice, whether it is still to be written, and a note when Claude's own
+// settings say something else now. The switch goes through a dialog that
+// closes the window when it finishes, like the status bar's.
+function accountLinksRow(name, al, running) {
+    const blocked = al.blocked !== false;
+    const pending = Array.isArray(al.pending) && al.pending.length > 0;
+    const meta = [blocked ? "blocked" : "allowed"];
+    if (pending) meta.push("applied at the project's next start");
+    const btn = el("button", { class: "btn btn-secondary" }, [blocked ? "Allow" : "Block"]);
+    btn.onclick = () => mgmtAccountLinksToggle(name, blocked, running);
+    const wrap = el("div", {}, [
+        el("div", { class: "config-box-row" }, [
+            el("span", { class: "config-box-name" }, ["Links to the Anthropic account"]),
+            el("span", { class: "config-box-meta" }, [meta.join(" · ")]),
+            btn,
+        ]),
+        el("div", { class: "config-hint" }, [
+            "Blocked: Claude gets no claude.ai connectors, no Remote Control and no Claude " +
+            "in Chrome. A change applies to Claude sessions started afterwards; workers " +
+            "follow at their next spawn and role agents at the project's next start.",
+        ]),
+    ]);
+    // What Claude's own settings say now, when it is not the saved choice.
+    const now = running && !pending ? al.state : "";
+    const differs = now === "partial" || (now === "blocked" && !blocked)
+        || (now === "allowed" && blocked);
+    if (differs) {
+        wrap.appendChild(el("div", { class: "config-box-warn" }, [
+            now === "partial"
+                ? "⚠ Claude's settings in the project now block only some of these links."
+                : `⚠ Claude's settings in the project now ${now === "blocked" ? "block" : "allow"} ` +
+                  "these links; switching writes the choice again.",
+        ]));
+    } else if (now === "absent" || now === "failed") {
+        wrap.appendChild(el("div", { class: "config-box-warn" }, [
+            "⚠ Claude's settings in the project could not be read.",
+        ]));
+    }
+    return wrap;
 }
 
 // The ⚙ Box agents section (I33 slice 3, the box half): a box's agent
@@ -16569,6 +16635,41 @@ function mgmtReaderToggle(name, on) {
             body: JSON.stringify(on ? { disable: ["reader"] } : { enable: ["reader"] }),
         }),
         // As the editor toggle: the ⚙ window under it closes on success.
+        onDone: async (ok) => {
+            if (!ok) return;
+            closeProjectConfigBox(name);
+            await refreshAfterBoxChange(name);
+        },
+    });
+}
+
+// The project container's block on Claude's links to the Anthropic account:
+// written into Claude's settings now on a running project (no restart), saved
+// for the next start of a stopped one.
+function mgmtAccountLinksToggle(name, blocked, running) {
+    const word = blocked ? "Allow" : "Block";
+    mgmtConfirmThenTail(boxOpView(), {
+        title: `${word} links to the Anthropic account on ${name}`,
+        tailTitle: `${blocked ? "Allowing" : "Blocking"} links to the Anthropic account on ${name}`,
+        verb: "update",
+        project: name,
+        confirmLabel: word,
+        body: [el("p", {}, [
+            (blocked
+                ? `Allow Claude in "${name}" to use claude.ai connectors, Remote Control and ` +
+                  "Claude in Chrome. "
+                : `Block Claude in "${name}" from claude.ai connectors, Remote Control and ` +
+                  "Claude in Chrome. ") +
+            (running
+                ? "Nothing restarts; Claude sessions started afterwards follow it, workers at " +
+                  "their next spawn and role agents at the project's next start."
+                : "The project is stopped: the choice is saved and written into Claude's " +
+                  "settings at its next start; nothing is started.")])],
+        request: () => fetch(`/broker/project/${encodeURIComponent(name)}/update`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ block_account_links: !blocked }),
+        }),
+        // As the status bar's switch: the ⚙ window under it closes on success.
         onDone: async (ok) => {
             if (!ok) return;
             closeProjectConfigBox(name);

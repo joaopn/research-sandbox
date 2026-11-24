@@ -1302,7 +1302,10 @@ async def broker_project_action_handler(request: web.Request) -> web.Response:
                       "pi_doer_model", "pi_doer_thinking",
                       "pi_checker_model", "pi_checker_thinking", "test_policy",
                       # the ⚙ Extensions status-bar switch (#524)
-                      "status_bar"):
+                      "status_bar",
+                      # the ⚙ Agents switch for Claude's links to the
+                      # Anthropic account
+                      "block_account_links"):
                 if req_body.get(k) is not None:
                     args[k] = req_body[k]
     if action == "destroy":
@@ -2316,7 +2319,10 @@ async def broker_dev_project_handler(request: web.Request) -> web.Response:
             # Read-only folders, relative to RS's data folder (the broker gates).
             "mount": body.get("mount"),
             # RS's status bar (#524) — RAW, absent ⇒ on.
-            "status_bar": body.get("status_bar")}
+            "status_bar": body.get("status_bar"),
+            # The block on Claude's links to the Anthropic account — RAW,
+            # absent ⇒ blocked.
+            "block_account_links": body.get("block_account_links")}
     op_id = _mint_op_id(name if isinstance(name, str) and name else "dev",
                         "dev-project")
     try:

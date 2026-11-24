@@ -1464,6 +1464,10 @@ class CreateRequest:
     # RS's status bar in the project container's agents (#524): on by
     # default, the New Project Extensions card. In-box (broker-openable).
     status_bar: bool = True
+    # Claude's links to the operator's Anthropic account (claude.ai
+    # connectors, Remote Control, Claude in Chrome) blocked in the project
+    # container's Claude: on by default, the New Project Claude tab. In-box.
+    block_account_links: bool = True
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "CreateRequest":
@@ -1491,6 +1495,7 @@ class CreateRequest:
         # CLI verbs).
         fetch = bool(kw.get("fetch", False))
         status_bar = _status_bar_arg(kw.get("status_bar", True), default=True)
+        block_account_links = _account_links_arg(kw.get("block_account_links"), default=True)
         if fetch and manifest.get("dev"):
             raise ValidationError(
                 "a dev project does not take the rs-fetch option (its "
@@ -1811,6 +1816,7 @@ class CreateRequest:
         return cls(
             name=_require_name(kw.get("name")),
             status_bar=status_bar,
+            block_account_links=block_account_links,
             workflow=workflow_id,
             type=project_type,
             substrate=substrate,
@@ -2360,6 +2366,10 @@ class UpdateRequest:
     # RS's status bar in the project container's agents (#524): None =
     # unchanged. Applied live, on a running project only.
     status_bar: bool | None = None
+    # The block on Claude's links to the Anthropic account: None = unchanged.
+    # Written live into a running project's Claude, owed to the next start of
+    # a stopped one.
+    block_account_links: bool | None = None
 
     def model_changes(self) -> dict[str, dict[str, str]]:
         """The per-type model/effort fields the caller actually SET, as
@@ -2513,6 +2523,7 @@ class UpdateRequest:
             pi_analyst_model=pi_analyst_model, pi_analyst_thinking=pi_analyst_thinking,
             reset=tuple(reset),
             status_bar=_status_bar_arg(kw.get("status_bar")),
+            block_account_links=_account_links_arg(kw.get("block_account_links")),
             **harness,
             **vals,
         )
@@ -2524,6 +2535,17 @@ def _status_bar_arg(v: Any, default: "bool | None" = None) -> "bool | None":
         return default
     if not isinstance(v, bool):
         raise ValidationError("the status bar switch must be true or false")
+    return v
+
+
+def _account_links_arg(v: Any, default: "bool | None" = None) -> "bool | None":
+    """The account-links switch from a request: a bool, or `default` when
+    absent."""
+    if v is None:
+        return default
+    if not isinstance(v, bool):
+        raise ValidationError("the switch for links to the Anthropic account must be "
+                              "true or false")
     return v
 
 
@@ -2620,6 +2642,10 @@ class UpdateResult:
     # A status-bar switch (#524): the project container's row as it now reads
     # (_status_bar_view); None when the update did not touch it.
     status_bar: "dict | None" = None
+    # A switch of the block on links to the Anthropic account: the project
+    # container's row as it now reads (_account_links_view); None when the
+    # update did not touch it.
+    account_links: "dict | None" = None
 
 
 @dataclass
@@ -4518,6 +4544,8 @@ class DevProjectProvisionRequest:
     mount: tuple[str, ...] = ()
     # RS's status bar in the project's agents (#524).
     status_bar: bool = True
+    # The block on Claude's links to the Anthropic account (CreateRequest's).
+    block_account_links: bool = True
 
     @classmethod
     def from_kwargs(cls, **kw: Any) -> "DevProjectProvisionRequest":
@@ -4562,6 +4590,7 @@ class DevProjectProvisionRequest:
             pi_thinking=kw.get("pi_thinking"),
             **{f: kw.get(f) for f in HARNESS_FIELDS},
             agents=raw_agents, status_bar=kw.get("status_bar"),
+            block_account_links=kw.get("block_account_links"),
             dev_repo_preflight=False)
         return cls(name=cr.name, url=url, repo=repo, workflow=workflow,
                    pat=(pat or "").strip(), branch=cr.dev_branch, egress=egress,
@@ -4571,7 +4600,8 @@ class DevProjectProvisionRequest:
                    pi_model=cr.pi_model, pi_thinking=cr.pi_thinking,
                    **{f: getattr(cr, f) for f in HARNESS_FIELDS},
                    agents=None if raw_agents is None else cr.agents,
-                   mount=mount, status_bar=cr.status_bar)
+                   mount=mount, status_bar=cr.status_bar,
+                   block_account_links=cr.block_account_links)
 
 
 @dataclass
@@ -5217,6 +5247,10 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
     # RS's status bar (#524): the choice, owed by every agent until its first
     # write lands (an agent added later picks the choice up the same way).
     marker["status_bar"] = _status_bar_block(req.status_bar, STATUS_BAR_AGENTS)
+    # The block on Claude's links to the Anthropic account: the choice, owed
+    # by Claude until its first write lands (Claude added later takes it too).
+    marker[ACCOUNT_LINKS_KEY] = _account_links_block(req.block_account_links,
+                                                     ACCOUNT_LINKS_AGENTS)
     # The agent's model lives in its own settings file on an image that carries
     # the label (I33 slice 3): on Docker-in-Docker the host writes the recorded
     # Claude pair right after the deploy below (pending); the docker substrate's
@@ -5483,6 +5517,8 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             _status_bar_warnings(_apply_status_bar(project, container_name, workspace_path,
                                                    local, boxes=True, progress=progress),
                                  progress)
+            # The block on Claude's links to the Anthropic account, as chosen.
+            _apply_account_links(container_name, workspace_path, local, progress=progress)
             # A researcher project's memory kit (its record says so): the
             # command on PATH, the agents' hooks and settings, its skills.
             _status_bar_warnings(_apply_memory_kit(project, container_name, workspace_path,
@@ -5593,6 +5629,10 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
                                           progress=progress)
             _status_bar_warnings(_apply_status_bar(project, container_name, workspace_path,
                                                    [DEFAULT_AGENT], progress=progress), progress)
+            # The block on Claude's links to the Anthropic account, before the
+            # enable cone below: a role service copies these settings at its start.
+            _apply_account_links(container_name, workspace_path, [DEFAULT_AGENT],
+                                 progress=progress)
             # Editor dist (STAGE_EDITOR_DIST): staged before the enable cone too so
             # interactive PI containers RO-mount a populated /opt/editor-dist.
             # deploy_local brings up the supervisor's OWN editor from the dist (no
@@ -5706,8 +5746,14 @@ def create(req: CreateRequest, cfg: "Config" | None = None,
             _status_bar_warnings(_apply_status_bar(project, container_name, workspace_path,
                                                    deployed_agents, progress=progress),
                                  progress)
+            # The block on Claude's links to the Anthropic account likewise.
+            _apply_account_links(container_name, workspace_path, deployed_agents,
+                                 progress=progress)
         else:
-            _report_warnings([STATUS_BAR_HOME_NOT_READY], progress)
+            _report_warnings([STATUS_BAR_HOME_NOT_READY]
+                             + ([ACCOUNT_LINKS_HOME_NOT_READY]
+                                if any(a in ACCOUNT_LINKS_AGENTS for a in deployed_agents)
+                                else []), progress)
 
     # 6e. Http-service readiness gates: create reports "ready" only when each
     #     enabled http service is actually listening, so there's no post-create race
@@ -6260,6 +6306,10 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
     # RS's status bar (#524): its own change, live, on both substrates.
     if req.status_bar is not None:
         return _update_status_bar(req, cfg, project, container, progress)
+    # The block on Claude's links to the Anthropic account: its own change,
+    # live on a running project, owed to the next start of a stopped one.
+    if req.block_account_links is not None:
+        return _update_account_links(req, cfg, project, container, progress)
     # The docker substrate has no in-container editable surface (no templates, no
     # worker/extension cone) and no sysbox store to re-stage. The ONE meaningful
     # update is toggling the editor (code-server), which recreates the plain runc
@@ -6519,6 +6569,10 @@ def update(req: UpdateRequest, cfg: "Config" | None = None,
         # RS's status bar (#524): an agent just added takes the recorded choice.
         found += _apply_status_bar(project, container, workspace_path, local,
                                    owe=agents_added, boxes=True, progress=progress)
+        # The block on Claude's links to the Anthropic account: Claude just
+        # added takes the recorded choice.
+        _apply_account_links(container, workspace_path, local, owe=agents_added,
+                             progress=progress)
         # A researcher project's memory kit, into an agent just added.
         found += _apply_memory_kit(project, container, workspace_path, local,
                                    progress=progress)
@@ -12868,6 +12922,8 @@ def _recreate_supervisor(
         # box tool copies the files on into each agent box.
         found += _apply_status_bar(project, container, workspace_path, local,
                                    boxes=True, progress=progress)
+        # The block on Claude's links to the Anthropic account, where owed.
+        _apply_account_links(container, workspace_path, local, progress=progress)
         # A researcher project's memory kit, into the fresh container.
         found += _apply_memory_kit(project, container, workspace_path, local,
                                    progress=progress)
@@ -12914,6 +12970,9 @@ def _recreate_supervisor(
                                       claude_in_settings=model_in_settings, progress=progress)
         found += _apply_status_bar(project, container, workspace_path, [DEFAULT_AGENT],
                                    progress=progress)
+        # The block on Claude's links to the Anthropic account, where owed,
+        # before the role services below copy these settings.
+        _apply_account_links(container, workspace_path, [DEFAULT_AGENT], progress=progress)
         # The research boot wrote RS's instructions itself unless RS's old
         # link stands (or the image is from before the layout): say so at the
         # end of the operation.
@@ -13267,6 +13326,8 @@ def _start_docker_substrate(project: str, cfg: "Config",  # type: ignore[name-de
     # image again), the recorded choice where it is still owed.
     bar = _apply_status_bar(project, container, ws, list(_read_marker_agents(ws)),
                             progress=progress)
+    # The block on Claude's links to the Anthropic account, where owed.
+    _apply_account_links(container, ws, list(_read_marker_agents(ws)), progress=progress)
     if found is not None:
         found += bar
     else:
@@ -13591,6 +13652,10 @@ def _recreate_docker_substrate(project: str, cfg: "Config", *,  # type: ignore[n
            if home_ready else
            ([] if _stage_status_bar(container) and _activity_reset(container)
             else [OldInstructions("status-bar", project, reason=STATUS_BAR_NOT_STAGED)]))
+    # The block on Claude's links to the Anthropic account, into the restored
+    # home only (a home not ready leaves it owed; the line above said so).
+    if home_ready:
+        _apply_account_links(container, workspace_path, agents, progress=progress)
     if found is not None:
         found += bar
     else:
@@ -18511,6 +18576,237 @@ def _status_bar_view(states: "dict[str, str]") -> dict:
             "agents": dict(states)}
 
 
+# ---------------------------------------------------------------------------
+# Claude's links to the operator's Anthropic account: a Claude Code session
+# signed in with the operator's account reaches claude.ai connectors (they
+# appear as tools, headless sessions included), Remote Control (the session
+# driven from claude.ai or a phone) and Claude in Chrome (the operator's
+# browser). One switch per project, on (blocked) by default, held in the
+# record's `account_links` block and written into Claude's own user settings
+# in the project container: the two booleans below plus one entry in
+# `deniedMcpServers`. Living in that file, the three reach the research
+# workers and role services, which copy those settings at their start. A
+# default, not a wall: the agent is root in its container. Written once per
+# agent like the status bar (the record's `pending` lists the agents still
+# owed); after that what Claude's own file says is the state. A record without
+# the block (a project from before the switch) reads as blocked, owed.
+# Claude only: pi has none of these links, and nothing is ever written for it.
+# ---------------------------------------------------------------------------
+ACCOUNT_LINKS_KEY = "account_links"
+ACCOUNT_LINKS_AGENTS = ("claude",)
+# The MCP server name Claude Code gives Claude in Chrome.
+ACCOUNT_LINKS_DENIED_SERVER = "claude-in-chrome"
+# Block ("on": both booleans true, the deny entry added unless an equal one is
+# there) or allow ("off": both booleans deleted, exactly that entry removed,
+# the list deleted when that left it empty). Every other key and list entry is
+# left as it is; a `deniedMcpServers` that is not a list is an error (the
+# write fails and says so), never replaced.
+ACCOUNT_LINKS_JQ = (
+    '{"serverName": $srv} as $e'
+    ' | if $op == "on" then .disableClaudeAiConnectors = true | .disableRemoteControl = true'
+    ' | if (has("deniedMcpServers") | not) then .deniedMcpServers = [$e]'
+    ' elif (.deniedMcpServers | type) != "array" then error("deniedMcpServers is not a list")'
+    ' elif any(.deniedMcpServers[]; . == $e) then .'
+    ' else .deniedMcpServers += [$e] end'
+    ' elif $op == "off" then del(.disableClaudeAiConnectors, .disableRemoteControl)'
+    ' | if (.deniedMcpServers | type) == "array" and any(.deniedMcpServers[]; . == $e)'
+    ' then .deniedMcpServers |= map(select(. != $e))'
+    ' | if .deniedMcpServers == [] then del(.deniedMcpServers) else . end'
+    ' else . end'
+    ' else . end')
+# What the file says: all three entries (blocked), none (allowed), some.
+ACCOUNT_LINKS_STATE_JQ = (
+    '{"serverName": $srv} as $e'
+    ' | [.disableClaudeAiConnectors == true, .disableRemoteControl == true,'
+    ' ((.deniedMcpServers | type) == "array" and any(.deniedMcpServers[]; . == $e))]'
+    ' | if all then "blocked" elif any then "partial" else "allowed" end')
+# Run as the agent user with HOME set: $1 the operation ("on", "off",
+# "read"), then the agents. Prints `claude=<state>`: blocked, allowed,
+# partial, absent (no settings file in this home — never created here) or
+# failed. Claude's file is merged in place like the status bar's (an existing
+# file only, temp + rename), and left byte for byte as it is when it already
+# says what was asked. Any other agent is skipped.
+_ACCOUNT_LINKS_READ = (
+    f's=$(head -c {AGENT_SETTINGS_MAX_BYTES} "$cs" | jq -r --arg srv {ACCOUNT_LINKS_DENIED_SERVER} '
+    f"'{ACCOUNT_LINKS_STATE_JQ}' 2>/dev/null) || s=failed\n")
+ACCOUNT_LINKS_SCRIPT = (
+    'op="$1"; shift\n'
+    'cs="$HOME/.claude/settings.json"\n'
+    'for a in "$@"; do\n'
+    '[ "$a" = claude ] || continue\n'
+    '[ -f "$cs" ] || { echo claude=absent; continue; }\n'
+    + _ACCOUNT_LINKS_READ +
+    'if { [ "$op" = on ] && [ "$s" != blocked ]; } || { [ "$op" = off ] && [ "$s" != allowed ]; }; then\n'
+    f'  if [ "$(wc -c < "$cs")" -le {AGENT_SETTINGS_MAX_BYTES} ] && jq --arg op "$op" '
+    f'--arg srv {ACCOUNT_LINKS_DENIED_SERVER} '
+    f"'{ACCOUNT_LINKS_JQ}' \"$cs\" > \"$cs.rs-tmp\" && [ -s \"$cs.rs-tmp\" ] "
+    '&& mv "$cs.rs-tmp" "$cs"; then :; else rm -f "$cs.rs-tmp"; echo claude=failed; continue; fi\n'
+    '  ' + _ACCOUNT_LINKS_READ +
+    'fi\n'
+    'echo "claude=${s:-failed}"\n'
+    'done\n')
+ACCOUNT_LINKS_STATES = ("blocked", "allowed", "partial", "absent", "failed")
+# The states after which the recorded choice counts as written.
+ACCOUNT_LINKS_WRITTEN = ("blocked", "allowed", "partial")
+ACCOUNT_LINKS_NOT_WRITTEN = (
+    "the block on links to the Anthropic account could not be written into "
+    "{who}'s settings (is its settings file valid?); it is applied at the "
+    "project's next start")
+ACCOUNT_LINKS_ABSENT = (
+    "{who} has no settings file yet, so the block on links to the Anthropic "
+    "account is applied at the project's next start")
+ACCOUNT_LINKS_HOME_NOT_READY = (
+    "the project's home was not ready in time for the block on links to the "
+    "Anthropic account; it is applied at the project's next start")
+ACCOUNT_LINKS_NO_CLAUDE = (
+    "Claude is not an agent of the project's own container, so it has no links "
+    "to the Anthropic account to block")
+
+
+def _account_links_exec(container: str, op: str, agents: "Sequence[str]",
+                        home: str = _AGENT_HOME) -> "dict[str, str]":
+    """Run ACCOUNT_LINKS_SCRIPT for `agents` (Claude only) in a RUNNING
+    container as the agent user: {agent: state}. An agent the script did not
+    answer for reads "failed". Never raises."""
+    agents = [a for a in agents if a in ACCOUNT_LINKS_AGENTS]
+    if not agents:
+        return {}
+    try:
+        r = run(["docker", "exec", "-u", "1000", "-e", f"HOME={home}", container,
+                 "sh", "-c", ACCOUNT_LINKS_SCRIPT, "sh", op, *agents],
+                capture_output=True, timeout=AGENT_SETTINGS_EXEC_TIMEOUT_S)
+        out = r.stdout or ""
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        out = ""
+    got: dict[str, str] = {}
+    for line in out.splitlines():
+        a, sep, v = line.strip().partition("=")
+        if sep and a in agents and v in ACCOUNT_LINKS_STATES and a not in got:
+            got[a] = v
+    return {a: got.get(a, "failed") for a in agents}
+
+
+def _account_links_record(data: dict) -> "tuple[bool, list[str]]":
+    """(blocked, the agents owed a write) from the project record. A record
+    from before the switch reads as blocked, owed by every agent it covers."""
+    blk = data.get(ACCOUNT_LINKS_KEY)
+    if not isinstance(blk, dict):
+        return True, list(ACCOUNT_LINKS_AGENTS)
+    pend = blk.get("pending")
+    pending = [a for a in pend if a in ACCOUNT_LINKS_AGENTS] if isinstance(pend, list) else []
+    return blk.get("blocked") is not False, list(dict.fromkeys(pending))
+
+
+def _account_links_block(blocked: bool, pending: "Sequence[str]") -> dict:
+    return {"blocked": bool(blocked),
+            "pending": sorted(set(a for a in pending if a in ACCOUNT_LINKS_AGENTS))}
+
+
+def _account_links_warnings(states: "dict[str, str]", agents: "Sequence[str]") -> "list[str]":
+    """The lines for the agents whose recorded choice did not land."""
+    out = []
+    for a in agents:
+        if states.get(a) == "failed":
+            out.append(ACCOUNT_LINKS_NOT_WRITTEN.format(who=_who(a)))
+        elif states.get(a) == "absent":
+            out.append(ACCOUNT_LINKS_ABSENT.format(who=_who(a)))
+    return out
+
+
+def _apply_account_links(container: str, workspace_path: "Path", local: "Sequence[str]",
+                         *, owe: "Sequence[str]" = (), home: str = _AGENT_HOME,
+                         progress=None) -> None:
+    """At every deploy of a RUNNING project container's agents (create, every
+    start, a live agent add): write the recorded choice into Claude where it
+    is still owed, and record what landed. `owe`: agents just added to the
+    container, which take the recorded choice too. A write that does not land
+    stays owed for the next start and is reported as a warning. Never raises
+    — it runs in the middle of a start."""
+    local = [a for a in local if a in ACCOUNT_LINKS_AGENTS]
+    owe = [a for a in owe if a in ACCOUNT_LINKS_AGENTS]
+    if not local:
+        return
+    try:
+        data = _read_marker_dict(workspace_path)
+        if not data:
+            return
+        fresh = not isinstance(data.get(ACCOUNT_LINKS_KEY), dict)
+        blocked, pending = _account_links_record(data)
+        pending = list(dict.fromkeys([*pending, *owe]))
+        owed = [a for a in local if a in pending]
+        states = (_account_links_exec(container, "on" if blocked else "off", owed, home)
+                  if owed else {})
+        done = {a for a in owed if states.get(a) in ACCOUNT_LINKS_WRITTEN}
+        _report_warnings(_account_links_warnings(states, owed), progress)
+        if not fresh and not done and not owe:
+            return
+
+        def mutate(d: dict) -> None:
+            cur_blocked, cur_pending = _account_links_record(d)
+            cur_pending = [*cur_pending, *owe]
+            d[ACCOUNT_LINKS_KEY] = _account_links_block(
+                cur_blocked, [a for a in cur_pending if a not in done])
+        _marker_rmw(workspace_path, mutate,
+                    "record the block on links to the Anthropic account")
+    except Exception as e:     # never stop a start over this setting
+        _report_warnings([f"the block on links to the Anthropic account could not be "
+                          f"applied ({e})"], progress)
+
+
+def _account_links_view(states: "dict[str, str]") -> dict:
+    """The ⚙ row from Claude's state in the project container: `state` is
+    what its settings file says (blocked, allowed, partial, absent, failed)."""
+    return {"state": states.get(DEFAULT_AGENT, "failed"), "agents": dict(states)}
+
+
+def _update_account_links(req: "UpdateRequest", cfg: "Config", project: str,  # type: ignore[name-defined]
+                          container: str, progress) -> "UpdateResult":
+    """The ⚙ Agents switch for the project container's Claude, alone in its
+    request. On a running project the choice is written into Claude's
+    settings now (a write that does not land stays owed, written at the next
+    start, and fails the change at its end); on a stopped one it is recorded
+    and owed, written at the next start. An unreadable record is refused
+    before anything in the container changes."""
+    if _dc_replace(req, block_account_links=None) != UpdateRequest(name=req.name):
+        raise ValidationError("change the block on links to the Anthropic account on its "
+                              "own, not together with other settings")
+    workspace_path = workspace_path_for(project, cfg)
+    if _read_marker_three_way(workspace_path)[0] != "ok":
+        raise ValidationError("cannot change the block on links to the Anthropic account: "
+                              f"the project's record {orch_files.SHOWN_FOLDER}/project.json "
+                              "is missing or unreadable")
+    local = [a for a in _project_running_agents(workspace_path) if a in ACCOUNT_LINKS_AGENTS]
+    if not local:
+        raise ValidationError(ACCOUNT_LINKS_NO_CLAUDE)
+    blocked = bool(req.block_account_links)
+    progress.step("account-links", ("blocking links to the Anthropic account" if blocked
+                                    else "allowing links to the Anthropic account"))
+    running = container_running(container)
+    states = _account_links_exec(container, "on" if blocked else "off", local) \
+        if running else {}
+    # An agent the write did not reach, and one not in the container yet,
+    # stays owed: it takes the choice at its next deploy.
+    owed = ([a for a in local if states.get(a) not in ACCOUNT_LINKS_WRITTEN]
+            + [a for a in ACCOUNT_LINKS_AGENTS if a not in local])
+
+    def mutate(d: dict) -> None:
+        d[ACCOUNT_LINKS_KEY] = _account_links_block(blocked, owed)
+    _marker_rmw(workspace_path, mutate, "record the block on links to the Anthropic account")
+    if running:
+        lines = _account_links_warnings(states, local)
+        if lines:
+            raise ValidationError("\n".join(lines))
+    word = "blocked" if blocked else "allowed"
+    when = ("Claude sessions started from now on follow it" if running
+            else "it is written into Claude's settings at the project's next start")
+    print(f"links to the Anthropic account {word} in {project!r}; {when}.")
+    return UpdateResult(project=project, rebuilt=False,
+                        account_links={**(_account_links_view(states) if running
+                                          else {"state": "", "agents": {}}),
+                                       "blocked": blocked, "running": running,
+                                       "pending": [a for a in local if a in owed]})
+
+
 def _uninstall_claude_extension(container: str, home: str = _AGENT_HOME) -> None:
     """Remove Claude Code's editor extension from the project's editor when the
     project's own container no longer runs Claude (its extensions live in the
@@ -18918,6 +19214,16 @@ def project_agents(req: ProjectAgentsRequest, _progress=None) -> dict:
             view = {"on": rec_on, "own": [], "agents": {}, "source": "saved"}
         out["status_bar"] = {**view, "recorded": rec_on,
                              "pending": [a for a in bar_local if a in rec_pending]}
+    # The block on Claude's links to the Anthropic account, for the project
+    # container's Claude only: the recorded choice (what the switch shows)
+    # and, when running, what Claude's own file says.
+    links_local = [a for a in local if a in ACCOUNT_LINKS_AGENTS]
+    if links_local:
+        rec_blocked, rec_pending = _account_links_record(data)
+        view = (_account_links_view(_account_links_exec(container, "read", links_local))
+                if running else {"state": "", "agents": {}})
+        out["account_links"] = {**view, "blocked": rec_blocked,
+                                "pending": [a for a in links_local if a in rec_pending]}
     out["boxes"], out["boxes_state"] = ([], "none") if docker else \
         _project_agent_boxes(container, running, research, ws)
     return out
@@ -28083,7 +28389,8 @@ def dev_project_provision(req: "DevProjectProvisionRequest", progress=None) -> d
         supervisor_effort=req.supervisor_effort,
         pi_model=req.pi_model, pi_thinking=req.pi_thinking,
         **{f: getattr(req, f) for f in HARNESS_FIELDS},
-        agents=req.agents, mount=req.mount, status_bar=req.status_bar)
+        agents=req.agents, mount=req.mount, status_bar=req.status_bar,
+        block_account_links=req.block_account_links)
     create(cr, progress=progress)
     return {"project": req.name, "repo": req.repo}
 

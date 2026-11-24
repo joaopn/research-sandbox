@@ -512,6 +512,7 @@ def cmd_project_create(args: argparse.Namespace) -> None:
         surveyor_model=args.surveyor_model, surveyor_effort=args.surveyor_effort,
         pi_analyst_model=args.pi_analyst_model, pi_analyst_thinking=args.pi_analyst_thinking,
         status_bar=args.status_bar,
+        block_account_links=args.block_account_links,
         **{f: getattr(args, f) for f in rscore.HARNESS_FIELDS},
     )
     try:
@@ -977,6 +978,7 @@ def cmd_project_update(args: argparse.Namespace) -> None:
         pi_model=args.pi_model, pi_thinking=args.pi_thinking,
         reset=args.reset or [],
         status_bar=args.status_bar,
+        block_account_links=args.block_account_links,
         **{f: getattr(args, f) for f in rscore.HARNESS_FIELDS},
     )
     res = _call(rscore.update, req)
@@ -3045,6 +3047,11 @@ def build_parser() -> argparse.ArgumentParser:
                    default=True,
                    help="RS's status bar under the prompt of the project container's "
                         "agents (default on)")
+    c.add_argument("--block-account-links", dest="block_account_links",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="block the project container's Claude from the links to the "
+                        "operator's Anthropic account: claude.ai connectors, Remote "
+                        "Control and Claude in Chrome (default on)")
     _add_harness_args(c, "project")
     c.add_argument("--dev-repo", dest="dev_repo", metavar="REPO",
                    help="REQUIRED with a dev workflow (--workflow dev): the name "
@@ -3165,6 +3172,13 @@ def build_parser() -> argparse.ArgumentParser:
                    default=None,
                    help="turn RS's status bar in the project container's agents on or "
                         "off (a running project only; on its own)")
+    u.add_argument("--block-account-links", dest="block_account_links",
+                   action=argparse.BooleanOptionalAction, default=None,
+                   help="block or allow the project container's Claude's links to the "
+                        "operator's Anthropic account (claude.ai connectors, Remote "
+                        "Control, Claude in Chrome) for Claude sessions started "
+                        "afterwards; a stopped project gets it at its next start "
+                        "(on its own)")
     _add_harness_args(u, "project")
     u.add_argument("--reset", action="append", metavar="FIELD",
                    choices=rscore.UPDATE_RESETTABLE,

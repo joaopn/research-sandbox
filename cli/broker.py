@@ -879,6 +879,9 @@ CREATE_WEBUI_FIELDS = frozenset({
     # RS's status bar in the project container's agents (#524): IN-BOX, a
     # plain bool — it writes the agents' own settings inside the container.
     "status_bar",
+    # The block on Claude's links to the Anthropic account: IN-BOX, a plain
+    # bool — it writes Claude's own settings inside the container.
+    "block_account_links",
 })
 
 # The webui-settable subset of UpdateRequest fields. `rebuild` is
@@ -921,6 +924,10 @@ UPDATE_WEBUI_FIELDS = frozenset({
     # The ⚙ Extensions status-bar switch (#524): IN-BOX, a plain bool, live on
     # a running project only (update refuses it otherwise).
     "status_bar",
+    # The ⚙ Agents switch for Claude's links to the Anthropic account: IN-BOX,
+    # a plain bool written into Claude's own settings (live when running,
+    # owed to the next start otherwise).
+    "block_account_links",
 })
 
 
@@ -1291,7 +1298,10 @@ DEV_PROJECT_WEBUI_FIELDS = frozenset({"name", "workflow", "url", "pat",
                                       # pass the same gate.
                                       "mount",
                                       # RS's status bar (#524; a bool, in-box).
-                                      "status_bar"})
+                                      "status_bar",
+                                      # The block on Claude's links to the
+                                      # Anthropic account (a bool, in-box).
+                                      "block_account_links"})
 # The gitea-password verb's input boundary: ONE field, a SECRET (repr=False on
 # the request, off the Result, never a durable sink). The step-up `proof` is
 # consumed in dispatch and never reaches this filter.
