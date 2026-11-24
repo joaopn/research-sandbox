@@ -2474,6 +2474,8 @@ html.mobile .dev-repos-table .dev-repos-opt { display: none; }
 .dev-reviewer-warn { color: var(--error-fg); font-size: 13px; }
 /* Services → Reviews: the review model's row above the review history. */
 .dev-reviewer-default { margin-bottom: 16px; }
+/* Services → Reviews: the line saying Gitea is off, above the review model. */
+.dev-reviews-gitea-off { margin-bottom: 12px; }
 .dev-reviewer-default > .mgmt-infra-sub:first-child { margin-top: 0; }
 .mgmt-infra { margin-top: 24px; }
 .mgmt-infra-title { font-size: 14px; font-weight: 600; margin-bottom: 8px; }

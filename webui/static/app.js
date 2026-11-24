@@ -2250,8 +2250,9 @@ let hostActiveTab = "projects";
 const HOST_TAB_DIVIDER = "divider";
 
 // The Services tabs that act on Gitea: the strip hides them while Gitea is not
-// running. Gitea itself (its bar enables it), MCP and Aldine always show.
-const SERVICES_GITEA_TABS = ["repos", "fetch", "reviews"];
+// running. Gitea itself (its bar enables it), Reviews (its history needs no
+// Gitea; it says when Gitea is off), MCP and Aldine always show.
+const SERVICES_GITEA_TABS = ["repos", "fetch"];
 // Whether Gitea runs, from the newest /broker/dev answer the Services page
 // read (noteServicesGitea): null until the first one, and then every tab shows,
 // so nothing disappears from the strip before anything is known.
@@ -2500,9 +2501,10 @@ function openHostPage(page, tab) {
     setActiveNavEntry(page + "-entry");
     renderHostPage();
     // MCP and Aldine do not read Gitea's state; one read settles which tabs
-    // the strip shows (the other tabs learn it from their own read).
+    // the strip shows (the other tabs, Reviews included, learn it from their
+    // own read).
     if (page === "services" && !SERVICES_GITEA_TABS.includes(servicesActiveTab)
-            && servicesActiveTab !== "gitea") {
+            && servicesActiveTab !== "gitea" && servicesActiveTab !== "reviews") {
         servicesGiteaProbe();
     }
 }
@@ -4168,9 +4170,10 @@ function setTypeBadge(elm, label) {
 // read touches no gitea at all, so the tab renders with gitea stopped and after
 // the last mirror is gone. Repos is the opposite case and belongs where it is:
 // it enumerates exactly those live mirrors, so it shares Fetch's read and its
-// gitea-running gate. (While Gitea is not running the strip shows none of
-// these but Gitea — SERVICES_GITEA_TABS — so their own stopped cards are only
-// what a first read lands on before the page knows.)
+// gitea-running gate. (While Gitea is not running the strip hides Repos and
+// Fetch — SERVICES_GITEA_TABS — so their own stopped cards are only what a
+// first read lands on before the page knows; Reviews stays and says Gitea is
+// off.)
 //
 // Past a divider, the shared services that are not Gitea: "MCP" (the MCP
 // gateway) and "Aldine" (the shared LaTeX editor).
@@ -4189,6 +4192,31 @@ const DEV_TAB_RENDER = {
     repos: renderDevReposTab,
     reviews: renderDevReviewsTab,
 };
+
+// Services → Reviews: the line that says Gitea is off. Its own /broker/dev
+// read (which also tells the strip whether Gitea runs); a failed read leaves
+// the line hidden — the history below shows what is wrong with the broker.
+async function fillReviewsGiteaNote(note) {
+    let gitea = null;
+    try {
+        const res = await fetch("/broker/dev");
+        if (res.ok) {
+            const b = await res.json();
+            if (b && b.ok && b.result) gitea = b.result.gitea || {};
+        }
+    } catch (e) { gitea = null; }
+    if (!gitea || !note.isConnected) return;
+    noteServicesGitea(gitea);
+    if (gitea.running) return;
+    const open = el("button", { class: "btn-small" }, ["Open the Gitea tab"]);
+    open.onclick = () => selectHostTab("services", "gitea");
+    note.replaceChildren(
+        el("span", {}, [(gitea.exists ? "Gitea is stopped" : "Gitea isn't enabled yet")
+                        + ", so no new review can run. Enable it on the Gitea tab "
+                        + "to review pull requests and commits. "]),
+        open);
+    note.hidden = false;
+}
 
 function renderServicesInto(view) {
     if (state.hostPage === "services") mountHostStrip();
@@ -4213,11 +4241,17 @@ function renderServicesInto(view) {
         const reviewerRow = el("div", { class: "mgmt-row mgmt-infra-row" }, [
             el("span", { class: "mgmt-loading" }, ["…"]),
         ]);
+        // While Gitea is not running no new review can run (the reviewer
+        // reads the PR or commit from Gitea); the history below still shows.
+        const giteaNote = el("div", { class: "mgmt-empty dev-reviews-gitea-off" });
+        giteaNote.hidden = true;
+        view.appendChild(giteaNote);
         view.appendChild(el("div", { class: "dev-reviewer-default" }, [
             el("div", { class: "mgmt-infra-sub" }, ["Reviewer"]),
             reviewerRow,
         ]));
         appendDefaultModelRow(view, reviewerRow, "reviewer", "Review model");
+        fillReviewsGiteaNote(giteaNote);
     }
     const body = el("div", { class: "dev-body" });
     view.appendChild(body);
