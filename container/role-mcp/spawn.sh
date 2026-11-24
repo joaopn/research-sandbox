@@ -38,6 +38,11 @@ SYS_PROMPT_FILE="${6:-}"
 # also passes them in the task preamble for redundancy).
 export RS_ROLE_NAME RS_CALL_ID="$CALL_ID" RS_CALLER="$CALLER"
 
+# The launch environment every RS Claude Code starts with (it turns off
+# Claude Code's own refusal of `rm` on protected paths in bypass mode); both
+# spawn modes below inherit it. Guarded: an image without the file still runs.
+[ -r /etc/rs-claude-launch-env.sh ] && . /etc/rs-claude-launch-env.sh
+
 # Agent model + effort (STAGE_MODEL_SELECT). The host sets RS_AGENT_MODEL /
 # RS_AGENT_EFFORT on this container from the project's *role* pair; daemon.py
 # passes its environment through to us (env = dict(os.environ)), so they arrive

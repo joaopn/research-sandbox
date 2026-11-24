@@ -28,6 +28,10 @@ The PI runs an LLM agent (Claude Code or pi) with `bypassPermissions` against po
 - **A worker is semi-trusted at best.** Prompt injection from the data the worker is analyzing, from MCP server responses, or from web pages it fetched can compromise the worker.
 - **Supervisor compromise via worker is in scope.** A compromised worker can exfiltrate prompts to its own session, and through artifacts it produces (which the supervisor reads) it can attempt to inject the supervisor. We do *not* try to defend against this; the supervisor is treated as untrusted-from-worker's-perspective for some purposes.
 
+**Claude Code runs `rm` without asking.** In bypass mode Claude Code still keeps one prompt of its own: before an `rm` or `rmdir` aimed at the filesystem root, a top-level folder, the home, the working folder, or a target it cannot read in advance. RS turns that prompt off. In terminal tabs, workers and role agents, Claude Code runs `rm` on any path in its container without asking, including the whole project workspace and the agent's home. Every other command already runs that way, and pi runs `rm` that way too. RS sets this itself, with the launch variable `CLAUDE_CODE_EVEN_MORE_DANGEROUSLY_SKIP_PERMISSIONS=1`; that is why each Claude Code start in a tab prints a line saying the removal prompt is off. Claude Code in the editor's chat panel, and a Claude started by another Claude, still refuse such removals.
+
+The same Claude Code switch also drops the per-site approval of Claude in Chrome. RS blocks Chrome integration in every project and box by default (a separate switch, "Block links to the Anthropic account"), so this matters only in a project where the operator turned that block off.
+
 What we *do* defend, in plain language:
 
 - The host is sacred. Nothing the supervisor or workers do should be able to extract host secrets, modify host configuration, or affect other projects.

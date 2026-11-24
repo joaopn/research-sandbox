@@ -75,6 +75,11 @@ fi
 cd /workspace
 export PATH="$HOME/.local/bin:/opt/conda/bin:$PATH"
 
+# The launch environment every RS Claude Code starts with (it turns off
+# Claude Code's own refusal of `rm` on protected paths in bypass mode).
+# Guarded: an image without the file still starts the worker.
+[ -r /etc/rs-claude-launch-env.sh ] && . /etc/rs-claude-launch-env.sh
+
 # Clear stale sentinels from a prior incarnation on this same bind-mount.
 # Pending wake files are deliberately kept: a wake survives a container
 # restart (the loop below honours it after the boot cycle).

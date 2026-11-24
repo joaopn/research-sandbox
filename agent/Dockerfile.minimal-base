@@ -110,5 +110,10 @@ RUN chmod +x /home/research/.byobu/bin/60_rolename
 COPY agent/bash-tmux-keys.sh /etc/rs-bash-tmux-keys.sh
 RUN printf '\n%s\n' '[ -r /etc/rs-bash-tmux-keys.sh ] && . /etc/rs-bash-tmux-keys.sh' >> /etc/bash.bashrc
 
+# Start every Claude Code typed into an interactive bash with the variable that
+# turns off its own prompt before `rm` on protected paths (agent/claude-launch-env.sh).
+COPY agent/claude-launch-env.sh /etc/rs-claude-launch-env.sh
+RUN printf '\n%s\n' '[ -r /etc/rs-claude-launch-env.sh ] && . /etc/rs-claude-launch-env.sh' >> /etc/bash.bashrc
+
 # No skel snapshot, no USER switch, no ENTRYPOINT here — the leaf images add
 # their flavor layer, snapshot the home, and set the entrypoint.
