@@ -401,11 +401,17 @@ _THEME_BUTTON_HTML = (
 _VIEWPORT = '<meta name="viewport" content="width=device-width, initial-scale=1">'
 
 
-def _page(title: str, body_html: str) -> bytes:
+def _page(title: str, body_html: str, base: str | None = None) -> bytes:
     """Every document this server renders itself — listings, markdown, text and
     the error pages. (A notebook is nbconvert's own document and does not pass
-    through here, so it carries neither the button nor the palette.)"""
-    return (f"<!doctype html><html><head><meta charset='utf-8'>{_VIEWPORT}"
+    through here, so it carries neither the button nor the palette.)
+
+    `base` sets the URL the page's RELATIVE links resolve against; only a listing
+    that embeds a README passes one (see _readme_section). Every link this server
+    writes itself is an absolute path, so a base moves nothing but the author's
+    relative links."""
+    base_tag = f'<base href="{html.escape(base)}">' if base is not None else ""
+    return (f"<!doctype html><html><head><meta charset='utf-8'>{_VIEWPORT}{base_tag}"
             f"<title>{html.escape(title)}</title><style>{_MOBILE_CSS}</style>"
             f"<script>{_THEME_HEAD_JS}</script>"
             f"</head><body>{_THEME_BUTTON_HTML}{body_html}"
@@ -566,9 +572,15 @@ def _render_markdown(text: str, rel: str) -> bytes:
     and a `<td>` with a blank line inside gets span-level parsing. As on GitHub,
     a line indented 4+ columns AFTER that blank line is a code block. A
     multi-line opening tag is left as it was."""
+    return _page(rel or "workspace", _breadcrumb(rel) + _markdown_body(text))
+
+
+def _markdown_body(text: str) -> str:
+    """The rendered HTML of a markdown text, without the page around it: the ONE
+    markdown renderer, used by a viewed `.md` file and by a listing's README alike
+    (same extensions, same raw-HTML posture — see `_render_markdown`)."""
     import markdown  # stdlib-cheap once installed; part of the dist
-    body = markdown.markdown(text, extensions=_markdown_extensions())
-    return _page(rel or "workspace", _breadcrumb(rel) + body)
+    return markdown.markdown(text, extensions=_markdown_extensions())
 
 
 def _browser_renders(name: str) -> bool:
@@ -648,7 +660,57 @@ def _listing(real: Path, rel: str) -> bytes:
         for d, n, h in rows)
     body = _breadcrumb(rel) + (f'<ul class="rd-list">{items}</ul>' if items
                                else "<p><em>(nothing to show here)</em></p>")
-    return _page(rel or "workspace", body)
+    readme = _readme_section(rel)
+    if readme is None:
+        return _page(rel or "workspace", body)
+    section, base = readme
+    return _page(rel or "workspace", body + section, base=base)
+
+
+# The file a listing renders below its rows, the way Gitea and GitHub show a
+# folder's front page. Exact name: the generated front pages and the common
+# convention both write it so.
+_README_NAME = "README.md"
+
+
+def _readme_section(rel: str) -> tuple[str, str] | None:
+    """The folder `rel`'s README rendered for its listing, plus the base URL its
+    relative links resolve against — or None, which leaves the listing as it
+    would be without one.
+
+    Shown only when a direct view of it would render it as markdown: it goes
+    through _resolve (the deny-list on the RESOLVED path, so a README.md linking
+    to a dot path or out of the workspace is not shown), must be a regular file
+    (a FIFO would hang the read), and must resolve to a `.md` file (a link to a
+    `.txt` is viewed as escaped text, never as markup, so it is not embedded).
+
+    Relative links resolve exactly as on the README's own view page: the
+    listing's README row opens /view/<resolved path>, where a browser resolves
+    `other.md` against that file's folder, so the base is that same folder under
+    /view/ — the RESOLVED one, which differs from the listed folder when README.md
+    is a link elsewhere. A link that is only a fragment (`#part`) is the one
+    target this cannot match: on the listing it leaves the page.
+
+    Any failure (unreadable, undecodable path, a render error) leaves the
+    README out and keeps the listing, as the view's own render guard does."""
+    child = f"{rel}/{_README_NAME}" if rel else _README_NAME
+    try:
+        got = _resolve(urllib.parse.quote(child))
+        if got is None:
+            return None
+        real, readme_rel = got
+        if not real.is_file() or real.suffix.lower() != ".md":
+            return None
+        body = _markdown_body(real.read_text(errors="replace"))
+        href = "/view/" + urllib.parse.quote(readme_rel)
+        folder = readme_rel.rpartition("/")[0]
+        base = "/view/" + (urllib.parse.quote(folder) + "/" if folder else "")
+    except Exception as exc:  # a broken README must not take the listing down
+        log.warning("README render failed for %s: %s", child, exc)
+        return None
+    heading = (f'<h2 class="rd-crumb"><a class="rd-file" href="{href}">'
+               f'{html.escape(_README_NAME)}</a></h2>')
+    return f"<section>{heading}{body}</section>", base
 
 
 # ---------------------------------------------------------------------------
@@ -718,6 +780,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         if got is None:
             return self._fail(404, "not found")
         real, rel = got
+        # A rendered markdown file lives under /view/, so its relative link to a
+        # folder lands here: show the folder's listing, the twin of a file hit on
+        # /tree/ being viewed. (/raw/ of a folder stays a 404.)
+        if real.is_dir():
+            return self._send(200, _listing(real, rel), "text/html; charset=utf-8")
         # _resolve already applied the deny-list; this guard is the directory
         # check. It must stay: without it a /view/ or /raw/ of a DIRECTORY reaches
         # the raw path, which sends Content-Length + a content type and only then
