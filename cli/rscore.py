@@ -13621,10 +13621,22 @@ def _live_toggle_editor(project: str, cfg: "Config", container: str,  # type: ig
     else:
         progress.step("disable", "removing the editor")
         print(f"=== {project}: removing the editor (live) ===")
-        # Kill the lazy-start stub + any spawned code-server (supervisor PID ns
-        # only — boxes' code-servers live in the inner dockerd's separate ns).
+        # Stop the lazy-start stub: on SIGTERM it stops code-server's whole
+        # process group (extension hosts and the Claude Code extension's
+        # `claude` included) and exits. Backstop for a code-server the stub no
+        # longer holds (a stub that died earlier, or an older stub that hangs on
+        # its open client connections): SIGTERM every process group holding a
+        # code-server node process, found by code-server's install path
+        # (`~/.local/lib/code-server-<ver>/lib/node`; its processes are named
+        # node/MainThread, so no name match works). The bracketed patterns keep
+        # pkill/pgrep from matching this `sh -c` itself, whose command line
+        # carries the pattern text. Supervisor PID ns only — boxes'
+        # code-servers live in the inner dockerd's separate ns. Best-effort.
         run(["docker", "exec", container, "sh", "-c",
-             "pkill -f code-server-stub.py; pkill -x code-server || true"],
+             "pkill -f '[c]ode-server-stub[.]py'; "
+             "pids=$(pgrep -d, -f '/[.]local/lib/code-server-[^/]*/lib/node') && "
+             "pkill -g \"$(ps -o pgid= -p \"$pids\" | tr -d ' ' | sort -u | paste -sd, -)\"; "
+             "true"],
             capture_output=True)
     _write_service_override(workspace_path, "code-server", enable)
     return UpdateResult(project=project, rebuilt=False,

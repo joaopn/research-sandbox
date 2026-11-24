@@ -5,10 +5,20 @@ Listens on CODE_SERVER_STUB_PORT (the port the webui's reverse proxy
 hits via container DNS, `rs-project-<proj>:<port>`). On the first
 client connection, spawns code-server on 127.0.0.1:CODE_SERVER_UPSTREAM_PORT
 and forwards bytes bidirectionally. Once spawned, code-server lives
-until the container stops — there is deliberately NO idle reaper (PI
-directive): reaping would kill the pty host and every in-editor
-terminal process with it, and editor state should survive the
+until the container or the stub stops — there is deliberately NO idle
+reaper (PI directive): reaping would kill the pty host and every
+in-editor terminal process with it, and editor state should survive the
 operator walking away.
+
+Stopping the stub (SIGTERM or SIGINT — the live editor disable sends it)
+stops code-server with it. The stub stops accepting, then SIGTERMs
+code-server's whole process group: code-server is spawned as the leader
+of its own session, and its extension hosts and the processes they
+start (the Claude Code extension's `claude` included) share that group.
+Whatever of the group is still there when the grace runs out is
+SIGKILLed. Only then are the open client connections dropped: the stub
+cannot wait for its clients first, because the editor tab holds its
+connections open as long as code-server answers.
 
 Lazy START is the slim-boot strategy: zero code-server RAM cost for
 any project whose editor tab is never opened, regardless of how many
@@ -43,10 +53,17 @@ UPSTREAM_BOOT_TIMEOUT_SECONDS = 30
 # "feels instant" threshold once the upstream is ready.
 UPSTREAM_BOOT_POLL_SECONDS = 0.1
 
+# How often shutdown checks whether code-server's process group has emptied
+# during the grace below. The stop waits for the whole group, not code-server's
+# own process alone: its extension hosts and the processes they started may
+# still be shutting down after it exits. 0.1s adds at most that much to a stop;
+# a few wakeups per second cost nothing.
+GROUP_EXIT_POLL_SECONDS = 0.1
+
 # Grace period after SIGTERM before falling back to SIGKILL on the
-# upstream code-server. code-server's hot-exit (saving unsaved buffers
-# to user-data-dir on exit) typically completes in ~1s. 5s is the
-# upper bound where we'd rather force-kill than wait.
+# upstream code-server's process group. code-server's hot-exit (saving
+# unsaved buffers to user-data-dir on exit) typically completes in ~1s.
+# 5s is the upper bound where we'd rather force-kill than wait.
 SIGTERM_GRACE_SECONDS = 5
 
 # Per-direction read chunk size. 64 KiB matches aiohttp's default and the
@@ -81,6 +98,9 @@ class State:
     def __init__(self) -> None:
         self.proc: asyncio.subprocess.Process | None = None
         self.lock = asyncio.Lock()
+        # Set once shutdown begins: a request still waiting on the lock
+        # must not spawn a fresh code-server behind the stopping stub.
+        self.stopping = False
 
 
 S = State()
@@ -109,6 +129,8 @@ async def ensure_upstream() -> None:
     """Spawn code-server if it isn't running. Idempotent under concurrent
     callers via S.lock."""
     async with S.lock:
+        if S.stopping:
+            raise RuntimeError("the stub is shutting down")
         if S.proc is not None and S.proc.returncode is None:
             return
         cmd = [
@@ -132,10 +154,11 @@ async def ensure_upstream() -> None:
         try:
             await _wait_for_upstream()
         except Exception:
-            # Upstream never came up — clean the failed child so the next
-            # request retries from scratch instead of hanging on a dead pid.
+            # Upstream never came up — clean the failed child (its whole
+            # process group) so the next request retries from scratch
+            # instead of hanging on a dead pid.
             try:
-                S.proc.kill()
+                os.killpg(S.proc.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             S.proc = None
@@ -193,20 +216,64 @@ async def handle_client(client_reader: asyncio.StreamReader,
     )
 
 
+def _group_exists(pgid: int) -> bool:
+    """True while any process is left in the group (one the stub may not
+    signal still counts)."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+async def _stop_upstream() -> None:
+    """Stop code-server's whole process group: SIGTERM, up to
+    SIGTERM_GRACE_SECONDS for the group to exit, then SIGKILL whatever of it
+    is still there. code-server was spawned with start_new_session=True, so
+    its pid is the group id; the group may already be gone
+    (ProcessLookupError), which is the goal anyway."""
+    if S.proc is None:
+        return
+    pgid = S.proc.pid
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + SIGTERM_GRACE_SECONDS
+    try:
+        # Reap code-server's own process first (it is the stub's child).
+        await asyncio.wait_for(S.proc.wait(), timeout=SIGTERM_GRACE_SECONDS)
+    except asyncio.TimeoutError:
+        pass
+    while _group_exists(pgid) and loop.time() < deadline:
+        await asyncio.sleep(GROUP_EXIT_POLL_SECONDS)
+    if _group_exists(pgid):
+        log.warning(
+            f"code-server outlived the {SIGTERM_GRACE_SECONDS}s grace; "
+            f"killing its process group")
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 async def shutdown(server: asyncio.AbstractServer) -> None:
     log.info("stub shutting down")
+    S.stopping = True
+    # Stop accepting first, so a reconnecting editor tab cannot respawn
+    # code-server while it is being stopped.
     server.close()
+    # Under the lock: a spawn already in flight finishes before it is
+    # stopped, instead of escaping behind a stub that saw no child yet.
+    async with S.lock:
+        await _stop_upstream()
+    # Only now drop the clients: waiting for them while code-server still
+    # ran would wait forever (the editor tab keeps its connections open).
+    server.abort_clients()
     await server.wait_closed()
-    if S.proc is not None and S.proc.returncode is None:
-        try:
-            S.proc.terminate()
-            await asyncio.wait_for(
-                S.proc.wait(), timeout=SIGTERM_GRACE_SECONDS)
-        except (ProcessLookupError, asyncio.TimeoutError):
-            try:
-                S.proc.kill()
-            except ProcessLookupError:
-                pass
 
 
 async def main() -> None:
