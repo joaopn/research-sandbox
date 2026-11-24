@@ -2579,16 +2579,19 @@ html.mobile .dashboard.mobile-projects .service-tabs .active-project {
    52px = the common 44px minimum touch target + room for the larger type;
    LOCKSTEP: the open drawer's top offset above must match this height.
    THE MOBILE TAB MODEL: show enabled ∩ {cli, reader, git-<consumer>,
-   fetch-<repo>, fetch-:all} — the :not() chain below IS the whitelist;
-   extending mobile to another visual surface = extending that chain. The
+   fetch-<repo>, fetch-:all, pass-<n>, aldine} — the :not() chain below IS
+   the whitelist; extending mobile to another visual surface = extending
+   that chain. The
    dev-fork (git-) tabs are shown: reading a fork's issues and PRs from the
    phone is the point of the dev lane's human→agent channel, and the fetch-
    panes (both the per-repo one and the project-wide all-mirrors one, which
    share the prefix) are lightweight RS-rendered HTML that scrolls.
    code-server / box editors / port-<n> stay desktop-only; pass-<n> launcher
    tabs SHOW (they embed nothing — the pane just opens the app in a new
-   browser tab, which works as well on a phone). The per-tab
-   refresh button stays hidden (PI decision: too small a target beside a
+   browser tab, which works as well on a phone); the shared Aldine tab
+   SHOWS (a real editor for the project's papers, worth reaching from the
+   phone; its own exact-match member — the id is no prefix family). The
+   per-tab refresh button stays hidden (PI decision: too small a target beside a
    live terminal — a mis-tap would reconnect it; a dead tab still
    reconnects by tapping the tab itself), and the column layout is
    desktop-only — mobile always renders the flat single-strip model, so no
@@ -2601,7 +2604,7 @@ html.mobile .service-tabs .host-tab { font-size: 14px; }
    12px view padding — the desktop rule's twin. */
 html.mobile .dev-gitea-frame { height: calc(100dvh - 77px); }
 html.mobile .service-tabs .projects-tab,
-html.mobile .service-tabs .tab[data-surface="visual"]:not([data-service="reader"]):not([data-service^="git-"]):not([data-service^="fetch-"]):not([data-service^="pass-"]),
+html.mobile .service-tabs .tab[data-surface="visual"]:not([data-service="reader"]):not([data-service^="git-"]):not([data-service^="fetch-"]):not([data-service^="pass-"]):not([data-service="aldine"]),
 html.mobile .service-tabs .refresh-tab-btn,
 html.mobile .service-tabs .tab-group-divider { display: none; }
 

@@ -7188,10 +7188,20 @@ async function appendInfraSection(view) {
     const surveyorRow = el("div", { class: "mgmt-row mgmt-infra-row" }, [
         el("span", { class: "mgmt-loading" }, ["…"]),
     ]);
+    // Stamped with its build-lane target: paintSoftwareLabels shows a Turn on
+    // in flight (started here, elsewhere, or before a reload) in its status
+    // cell and keeps its buttons off meanwhile.
+    const aldineRow = el("div", { class: "mgmt-row mgmt-infra-row", "data-swtarget": "aldine" }, [
+        el("span", {}, ["Aldine"]),
+        el("span", { class: "mgmt-loading" }, ["…"]),
+    ]);
     view.appendChild(el("div", { class: "mgmt-infra" }, [
         el("h3", { class: "mgmt-infra-title" }, ["Shared services"]),
         el("div", { class: "mgmt-infra-sub" }, ["Development"]),
         row,
+        el("div", { class: "mgmt-infra-sub" }, ["LaTeX editor"]),
+        aldineRow,
+        el("div", { class: "hint" }, [ALDINE_HINT]),
         el("div", { class: "mgmt-infra-sub" }, ["Reviewer"]),
         reviewerRow,
         el("div", { class: "mgmt-infra-sub" }, ["Referee"]),
@@ -7217,6 +7227,7 @@ async function appendInfraSection(view) {
     appendDefaultModelRow(view, refereeRow, "referee", "Referee model");
     appendDefaultModelRow(view, analystRow, "analyst", "Analyst model");
     appendDefaultModelRow(view, surveyorRow, "surveyor", "Surveyor model");
+    fillAldineRow(view, aldineRow);   // async, own fetch path
     let g = null;
     try {
         const res = await fetch("/broker/dev");
@@ -7298,6 +7309,163 @@ async function appendInfraSection(view) {
         upBtn.onclick = () => devGiteaUpgradeDialog(view, g, rerender);
         row.appendChild(upBtn);
     }
+}
+
+// ---- the shared Aldine LaTeX editor (Sandboxes → Infrastructure) ----------
+// One Aldine for the whole installation. Turn on is a background build-lane
+// action (the first one downloads its images, a few GB) tailed like a
+// Software build; Turn off is a plain confirm; Open opens it in a new browser
+// tab on its shared origin. Agents get it as the MCP server "aldine".
+const ALDINE_ON_TITLE = "Turning Aldine on";
+const ALDINE_HINT =
+    "A shared LaTeX editor for every project's papers. Agents get it as the MCP " +
+    "server aldine: tick aldine for them under Sandboxes → MCP. A project whose " +
+    "agent has it also gets an Aldine tab.";
+// The gateway entry's state, when it is not the normal "listed".
+const ALDINE_ENTRY_TEXT = {
+    absent: "not on the MCP server list (Turn on lists it)",
+    unreadable: "the MCP server list cannot be read",
+    conflict: "another server named aldine is on the MCP server list",
+};
+
+// What the operator reads in the row's status cell.
+function aldineStateText(a) {
+    if (!a.on) return "off";
+    if (a.app !== "running" || a.compiler !== "running") return "stopped";
+    if (a.healthy === false) return "not answering";
+    return "running and answering";
+}
+
+// The row's content from one status answer (`a` = the aldine_status result).
+// Pure DOM building: the caller fetched, and wires nothing but the buttons.
+function aldineRowParts(view, a) {
+    const said = aldineStateText(a);
+    const running = said === "running and answering";
+    const parts = [
+        el("span", {}, ["Aldine"]),
+        el("span", { class: "sw-status " + (running ? "state-running" : "state-stopped") }, [said]),
+    ];
+    if (a.version) parts.push(el("span", { class: "type-badge" }, [a.version]));
+    const present = a.app !== "absent" || a.compiler !== "absent";
+    if (a.on && present && !a.current) {
+        parts.push(el("span", { class: "type-badge" }, [
+            a.running_version
+                ? `runs ${a.running_version}; this installation pins ${a.version || "another version"}`
+                : "not on the version this installation pins"]));
+    }
+    if (a.on && a.mcp_entry && a.mcp_entry !== "listed") {
+        parts.push(el("span", { class: "type-badge" },
+                      [ALDINE_ENTRY_TEXT[a.mcp_entry] || a.mcp_entry]));
+    }
+    const errEl = el("span", { class: "mcp-test mcp-test-bad" }, [a.error || ""]);
+    const act = el("span", { class: "sw-act" }, []);
+    // Turn on: when off, and to repair an on Aldine that is not running and
+    // answering on the pinned version and listed; the action is idempotent.
+    let onLabel = null;
+    if (!a.on) onLabel = "Turn on";
+    else if (present && !a.current) onLabel = a.version ? `Update to ${a.version}` : "Update";
+    else if (!running || a.mcp_entry !== "listed") onLabel = "Turn on";
+    if (onLabel) {
+        const b = el("button", { class: "btn-small" }, [onLabel]);
+        b.onclick = () => aldineTurnOn(view, b, errEl);
+        act.appendChild(b);
+    }
+    if (a.on && a.app === "running" && a.healthy !== false) {
+        const b = el("button", { class: "btn-small" }, ["Open"]);
+        b.onclick = () => aldineOpen(view, errEl);
+        act.appendChild(b);
+    }
+    // Off, too, finishes an earlier Turn off that stopped part way.
+    if (a.on || present) {
+        const b = el("button", { class: "btn-small" }, ["Turn off"]);
+        b.onclick = () => mcpConfirmDialog(view, {
+            title: "Turn Aldine off",
+            text: "Aldine's containers stop and are removed. The papers are kept, "
+                + "and turning it on again finds them. Every agent loses the MCP "
+                + "server aldine, and the projects' Aldine tabs go.",
+            confirmLabel: "Turn off",
+            path: "/broker/aldine/off",
+            payload: {},
+        });
+        act.appendChild(b);
+    }
+    parts.push(act, errEl);
+    return parts;
+}
+
+// Fill the row from GET /broker/aldine. A read failure is a quiet badge in
+// the row (the page's Refresh retries) — the transport-vs-verb split: an
+// unreachable broker says "unknown", a refusal shows its own text.
+async function fillAldineRow(view, row) {
+    let res = null, body = null;
+    try {
+        res = await fetch("/broker/aldine");
+        try { body = await res.json(); } catch (e) { body = null; }
+    } catch (e) { res = null; }
+    if (!row.isConnected) return;
+    if (res && res.status === 401) {
+        return renderMgmtLogin(view, view.__rsRender || renderInfraInto);
+    }
+    if (!res || res.status !== 200 || !body) {
+        row.replaceChildren(el("span", {}, ["Aldine"]),
+                            el("span", { class: "type-badge" }, ["unknown"]));
+        return;
+    }
+    if (!body.ok || !body.result) {
+        row.replaceChildren(el("span", {}, ["Aldine"]),
+                            el("span", { class: "mcp-test mcp-test-bad" }, [mgmtErrText(body)]));
+        return;
+    }
+    row.replaceChildren(...aldineRowParts(view, body.result));
+    paintSoftwareLabels();
+}
+
+// Turn on / Update: start the build-lane action and tail it in a box that can
+// be sent to the background (the first download takes minutes).
+async function aldineTurnOn(view, btn, errEl) {
+    if (document.querySelector(".modal-backdrop")) return;
+    if (softwareInFlight.get("aldine")) return;
+    errEl.textContent = "";
+    btn.disabled = true;
+    const { status, body } = await mcpPost("/broker/software/build", { verb: "aldine_on" });
+    const landing = view.__rsRender || renderInfraInto;
+    const redirect = mgmtStatusRedirect(view, status, landing);
+    if (redirect) return redirect();
+    if (status !== 200 || !body.ok || !body.op_id) {
+        btn.disabled = false;
+        errEl.textContent = status === 200 ? mgmtErrText(body) : "Connection failed.";
+        return;
+    }
+    const backdrop = el("div", { class: "modal-backdrop" });
+    const card = el("div", { class: "card sw-build-card" }, [el("h2", {}, [ALDINE_ON_TITLE])]);
+    backdrop.appendChild(card);
+    document.body.appendChild(backdrop);
+    await softwareTail(view, backdrop, card, body.op_id, ALDINE_ON_TITLE, "aldine",
+                       { verb: "aldine_on" }, landing);
+}
+
+// Open Aldine in a new browser tab. The tab is opened inside the click (a
+// popup blocker eats one opened after an await), cut off from this page, and
+// pointed at Aldine once its session is minted.
+async function aldineOpen(view, errEl) {
+    errEl.textContent = "";
+    const w = window.open("", "_blank");
+    if (w) { try { w.opener = null; } catch (e) { /* already cut off */ } }
+    const r = await sharedOriginSession(SHARED_ORIGINS.aldine);
+    if (r.status === 401) {
+        if (w) w.close();
+        return renderMgmtLogin(view, view.__rsRender || renderInfraInto);
+    }
+    if (!r.url) {
+        if (w) w.close();
+        errEl.textContent = r.msg;
+        return;
+    }
+    if (!w) {
+        errEl.textContent = "The browser blocked the new tab; allow pop-ups for this page.";
+        return;
+    }
+    w.location.href = r.url;
 }
 
 // True when dotted-number version a is older than b ("1.25.1" < "28.2.0").
@@ -8672,19 +8840,21 @@ function swTarget(verb, agent) {
     if (verb === "node_pull") return "node";
     if (verb === "rebuild") return "fleet";
     if (verb === "mcp_gateway_start") return "mcp-gateway";
+    if (verb === "aldine_on") return "aldine";
     return verb;
 }
 
 function swTargetName(target) {
     if (target.startsWith("agent:")) return target.slice("agent:".length) + " agent";
     return { editor: "editor", reader: "reader", node: "node", fleet: "image fleet",
-             "mcp-gateway": "MCP gateway" }[target] || target;
+             "mcp-gateway": "MCP gateway", aldine: "Aldine" }[target] || target;
 }
 
 function swLabel(entry) {
     if (entry.queued) return "queued…";
     if (entry.verb === "rebuild") return "rebuilding the image fleet…";
     if (entry.verb === "mcp_gateway_start") return "starting…";
+    if (entry.verb === "aldine_on") return "turning on…";
     return /_refresh$/.test(entry.verb) ? "refreshing…" : "pulling…";
 }
 
@@ -8753,6 +8923,13 @@ function softwareView() {
     return hostBody();
 }
 
+// The Infrastructure tab's body, when it is on screen (its Aldine row is the
+// one build-lane target that lives there).
+function infraView() {
+    if (state.hostPage !== "sandboxes" || sandboxesActiveTab !== "infrastructure") return null;
+    return hostBody();
+}
+
 // Re-show a finished build from its logs (the notice's click): read-only, no
 // registry, Done just closes it.
 function softwareReplay(opId, title) {
@@ -8769,6 +8946,7 @@ function softwareReplay(opId, title) {
 function softwareTitle(verb, target) {
     if (verb === "rebuild") return "Rebuilding the image fleet";
     if (verb === "mcp_gateway_start") return MCP_GATEWAY_START_TITLE;
+    if (verb === "aldine_on") return ALDINE_ON_TITLE;
     return (/_refresh$/.test(verb) ? "Refreshing " : "Pulling ") + swTargetName(target);
 }
 
@@ -8782,6 +8960,10 @@ function softwareNoticeText(entry, target, outcome) {
     if (entry.verb === "mcp_gateway_start") {
         if (outcome.interrupted) return "Starting the MCP gateway was interrupted";
         return outcome.ok ? "MCP gateway started" : "The MCP gateway could not be started";
+    }
+    if (entry.verb === "aldine_on") {
+        if (outcome.interrupted) return "Turning Aldine on was interrupted";
+        return outcome.ok ? "Aldine is on" : "Aldine could not be turned on";
     }
     if (outcome.interrupted) return `${name}: the ${what} was interrupted`;
     return outcome.ok ? `${name} ${what === "refresh" ? "refreshed" : "pulled"}`
@@ -8801,9 +8983,10 @@ function softwareFinish(target, opId, outcome, background) {
     if (!background) return;
     showOpNotice(softwareNoticeText(entry, target, outcome), outcome.ok,
                  () => softwareReplay(opId, softwareTitle(entry.verb, target)));
-    const view = softwareView();
+    const aldine = target === "aldine";
+    const view = aldine ? infraView() : softwareView();
     if (view && !document.querySelector(".modal-backdrop") && !mgmtViewHoldsInput(view)) {
-        renderSoftwareInto(view);
+        if (aldine) rerenderView(view); else renderSoftwareInto(view);
     }
 }
 
@@ -8853,7 +9036,10 @@ async function seedSoftwareFromBroker() {
 // Phase 2 of a build box: the streaming log tail, closable. Registers the op
 // so the page shows it in flight; dismissing hands it to a watcher; an end
 // reached while the box is open drops it (no notice — the operator saw it).
-async function softwareTail(view, backdrop, card, opId, title, target, payload) {
+// `landing` (default: the Software tab) is where Done, a close after the end
+// and a sign-in land — the Aldine row passes its own page's re-render.
+async function softwareTail(view, backdrop, card, opId, title, target, payload, landing) {
+    landing = landing || renderSoftwareInto;
     const entry = swRegister(target, opId, payload.verb, payload.agent);
     entry.modal = true;
     let ended = false;
@@ -8862,15 +9048,15 @@ async function softwareTail(view, backdrop, card, opId, title, target, payload) 
         if (ended) {
             // Closed after the end by a click outside: land where Done lands,
             // or the finished row keeps its stale version and its buttons off.
-            if (view && view.isConnected) renderSoftwareInto(view);
+            if (view && view.isConnected) landing(view);
             return;
         }
         if (!entry.modal) return;
         entry.modal = false;
         softwareWatch(target);
     };
-    await mgmtTailBuildLog(view, backdrop, card, opId, title, undefined,
-                           renderSoftwareInto, {
+    await mgmtTailBuildLog(view, backdrop, card, opId, title, () => landing(view),
+                           landing, {
         onDismiss: dismiss,
         onRecord: (rec) => swSetQueued(target, opId, rec.step === "queue"),
         onEnd: (outcome) => {
@@ -16765,7 +16951,49 @@ function openSshTerminal(project, serviceId, svc) {
 // kept apart here: a throw or a 503 means the broker is genuinely unreachable; a
 // 200 carrying {ok:false} means it ANSWERED and refused. Collapsing the two would
 // send the operator to restart a daemon that is answering fine.
+//
+// The shared Aldine origin is the same shape (one Aldine for the installation,
+// its own sentinel cookie from POST /broker/aldine/session); SHARED_ORIGINS
+// holds what differs between the two.
+const SHARED_ORIGINS = {
+    gitea: { mint: "/broker/dev/gitea-session",
+             unreachable: "Gitea isn't reachable right now.",
+             openFail: "Could not open the fork" },
+    aldine: { mint: "/broker/aldine/session",
+              unreachable: "Aldine isn't reachable right now.",
+              openFail: "Could not open Aldine" },
+};
+
+// Mint one shared origin's session: {url} on success, else {msg, retry,
+// status} — the operator's line, whether a retry can help, the HTTP status.
+async function sharedOriginSession(cfg) {
+    let res;
+    try {
+        res = await fetch(cfg.mint, { method: "POST" });
+    } catch (e) {
+        return { msg: cfg.unreachable, retry: true, status: 0 };
+    }
+    if (res.status === 503) return { msg: cfg.unreachable, retry: true, status: 503 };
+    if (res.status === 401) {
+        // The vault unlock auto-logs into Management, so a 401 here means the
+        // vault and broker passwords disagree — a host-side fix, not a retry.
+        return { msg: "Not signed in to Management — unlock the vault again.",
+                 retry: false, status: 401 };
+    }
+    if (res.status === 403) return { msg: "Origin rejected.", retry: false, status: 403 };
+    let data;
+    try { data = await res.json(); } catch (e) { data = {}; }
+    if (!res.ok || !data.ok || !data.url) {
+        return { msg: `${cfg.openFail}: ${mgmtErrText(data)}`, retry: true, status: res.status };
+    }
+    return { url: data.url };
+}
+
 async function mountGiteaFork(container, status, giteaPath) {
+    return mountSharedOrigin(container, status, SHARED_ORIGINS.gitea, giteaPath);
+}
+
+async function mountSharedOrigin(container, status, cfg, path) {
     const fail = (msg, retry) => {
         status.textContent = msg;
         if (retry) {
@@ -16774,29 +17002,13 @@ async function mountGiteaFork(container, status, giteaPath) {
                 status.textContent = "Authenticating…";
                 const stale = container.querySelector("button");
                 if (stale) stale.remove();
-                mountGiteaFork(container, status, giteaPath);
+                mountSharedOrigin(container, status, cfg, path);
             };
             container.appendChild(b);
         }
     };
-    let res;
-    try {
-        res = await fetch("/broker/dev/gitea-session", { method: "POST" });
-    } catch (e) {
-        return fail("Gitea isn't reachable right now.", true);
-    }
-    if (res.status === 503) return fail("Gitea isn't reachable right now.", true);
-    if (res.status === 401) {
-        // The vault unlock auto-logs into Management, so a 401 here means the
-        // vault and broker passwords disagree — a host-side fix, not a retry.
-        return fail("Not signed in to Management — unlock the vault again.", false);
-    }
-    if (res.status === 403) return fail("Origin rejected.", false);
-    let data;
-    try { data = await res.json(); } catch (e) { data = {}; }
-    if (!res.ok || !data.ok || !data.url) {
-        return fail(`Could not open the fork: ${mgmtErrText(data)}`, true);
-    }
+    const data = await sharedOriginSession(cfg);
+    if (!data.url) return fail(data.msg, data.retry);
     // clipboard-write delegation is what lets Gitea's native code-block copy
     // button work inside the cross-origin frame (Permissions-Policy features
     // whose default allowlist is 'self' are silently revoked otherwise). NO
@@ -16804,7 +17016,7 @@ async function mountGiteaFork(container, status, giteaPath) {
     // neighbouring per-origin http tab, which does sandbox its iframe.
     const iframe = el("iframe", {
         class: "http-iframe",
-        src: data.url.replace(/\/$/, "") + giteaPath,
+        src: data.url.replace(/\/$/, "") + path,
         allow: "fullscreen; clipboard-read; clipboard-write",
     });
     iframe.setAttribute("allowfullscreen", "");
@@ -16869,6 +17081,12 @@ async function openHttpService(project, serviceId, svc, opts) {
     // The bookkeeping above is shared deliberately: teardown stays identical.
     if (svc.gitea_path) {
         await mountGiteaFork(container, status, svc.gitea_path);
+        return;
+    }
+    // The shared Aldine tab: the same shape on the -aldine- sentinel origin,
+    // so the same placement before the mint and the bail.
+    if (svc.aldine_path) {
+        await mountSharedOrigin(container, status, SHARED_ORIGINS.aldine, svc.aldine_path);
         return;
     }
 

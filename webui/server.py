@@ -187,6 +187,23 @@ GITEA_ORIGIN_SERVICE = "gitea"
 GITEA_UPSTREAM_HOST = "rs-gitea"
 GITEA_UPSTREAM_PORT = 3000
 
+# The shared Aldine origin: the same shape as the Gitea one above — a sentinel
+# "project" (leading '-', unreachable under the project-name regex), a FIXED
+# upstream no client value can pick, a session minted from the Management
+# session by /broker/aldine/session. Lockstep with cli/aldine.py
+# APP_CONTAINER / APP_PORT (the webui cannot import cli/). Reachability: RS
+# connects this container to Aldine's own front network (rs-aldine-front),
+# whose only other members are Aldine's app and the MCP gateway; Aldine runs
+# with its own login off, which is why nothing else may reach it.
+ALDINE_ORIGIN_KEY = "-aldine-"
+ALDINE_ORIGIN_SERVICE = "aldine"
+ALDINE_UPSTREAM_HOST = "rs-aldine"
+ALDINE_UPSTREAM_PORT = 3000
+# The non-project origin sentinels: the startup sweep keeps their entries (no
+# project folder ever exists for them) and no forwarding header is added for
+# them.
+SHARED_ORIGIN_KEYS = (GITEA_ORIGIN_KEY, ALDINE_ORIGIN_KEY)
+
 # In-memory mirror of ORIGIN_PORTS_FILE: port(int) → {"project", "service"}.
 # Loaded once at startup; every mutation persists synchronously. The table
 # stores only the IDENTITY key — the upstream port is re-derived per request
@@ -311,7 +328,7 @@ def _origin_table_sweep() -> None:
     except OSError:
         return
     stale = [p for p, e in ORIGIN_PORTS.items()
-             if e["project"] != GITEA_ORIGIN_KEY
+             if e["project"] not in SHARED_ORIGIN_KEYS
              and _project_workspace(e["project"]) is None]
     for p in stale:
         del ORIGIN_PORTS[p]
@@ -322,7 +339,7 @@ def _origin_table_sweep() -> None:
     # every dropped entry rather than none).
     ORIGIN_PORTS_DROPPED[:] = [
         e for e in ORIGIN_PORTS_DROPPED
-        if e["project"] == GITEA_ORIGIN_KEY
+        if e["project"] in SHARED_ORIGIN_KEYS
         or _project_workspace(e["project"]) is not None]
 
 
@@ -385,6 +402,21 @@ def origin_ok(request: web.Request) -> bool:
 # the daemon recreates the socket on restart, and a single-file bind-mount pins
 # the original inode.
 RS_BROKER_SOCKET = os.environ.get("RS_BROKER_SOCKET", "/run/rs-broker/broker.sock")
+
+# The shared Aldine's tab record: written by RS on the host (atomically, never
+# by a project) into the broker's run folder, the one folder of host state
+# this container mounts (read-only). MIRROR of cli/aldine.py TAB_RECORD_PATH /
+# TAB_RECORD_VERSION; shape {"version": 1, "on": bool, "projects": [names]}.
+ALDINE_TAB_RECORD = Path(RS_BROKER_SOCKET).parent / "aldine.json"
+ALDINE_TAB_RECORD_VERSION = 1
+# The record is read on every tab-set request (GET /services/<p>), so a read
+# is bounded. It holds one sorted project name per project wired to Aldine:
+# a typical name is tens of bytes, so 1 MiB is room for over ten thousand
+# wired projects — far past one installation — while reading and parsing that
+# much costs milliseconds of the event loop. Half of it would still be ample;
+# ten times it would let a damaged or replaced file stall every tab request
+# for tens of milliseconds. A record past it gives no Aldine tab.
+ALDINE_TAB_RECORD_MAX_BYTES = 1024 * 1024
 
 _BROKER_LEN = struct.Struct(">I")
 # A read verb is instant, and every slow verb (builds, reviews, dev provisions,
@@ -882,6 +914,93 @@ async def broker_mcp_wiring_handler(request: web.Request) -> web.Response:
     return web.json_response(body, status=status)
 
 
+# --- the shared Aldine editor (Sandboxes → Infrastructure) -------------------
+# Turn on is the build-lane verb `aldine_on` (POST /broker/software/build, in
+# _BUILD_VERBS); the status and Turn off are inline relays. None takes a field.
+
+async def broker_aldine_status_handler(request: web.Request) -> web.Response:
+    """GET /broker/aldine — on/off, each container's state, the pinned and
+    running version, whether it answers, the gateway entry. Session-gated."""
+    status, body = await _relay(request, "aldine_status")
+    return web.json_response(body, status=status)
+
+
+async def broker_aldine_off_handler(request: web.Request) -> web.Response:
+    """POST /broker/aldine/off — turn the shared Aldine off (the papers are
+    kept). Origin-checked, session-gated; no field crosses."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    status, body = await _relay(request, "aldine_off")
+    return web.json_response(body, status=status)
+
+
+async def broker_aldine_session_handler(request: web.Request) -> web.Response:
+    """POST /broker/aldine/session — mint the shared-Aldine origin session: the
+    dev_gitea_session_handler shape exactly (MANAGEMENT-SESSION-ANCHORED, so it
+    lives under /broker/ where that cookie reaches; sets a dedicated Path=/
+    cookie under the sentinel name, validated per request by
+    origin_proxy_handler). Allocates the Aldine origin port on first use and
+    returns the origin URL. Whether Aldine runs is not checked here: a stopped
+    one answers 502 in the frame, as a stopped Gitea does."""
+    if not origin_ok(request):
+        return web.Response(status=403, text="origin rejected")
+    if _broker_session(request) is None:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "unauthorized"}}, status=401)
+    port = _origin_port_for(ALDINE_ORIGIN_KEY, ALDINE_ORIGIN_SERVICE)
+    if port is None:
+        return web.json_response(
+            {"ok": False, "error": {"kind": "exhausted",
+             "message": "origin-port pool exhausted"}}, status=503)
+    token = secrets.token_urlsafe(32)
+    SESSIONS[token] = {
+        "project": ALDINE_ORIGIN_KEY,
+        "expires": time.time() + SESSION_TTL_SECONDS,
+    }
+    response = web.json_response(
+        {"ok": True, "url": f"https://{_request_host(request)}:{port}/"})
+    response.set_cookie(
+        services.session_cookie_name(PUBLISHED_PORT, ALDINE_ORIGIN_KEY), token,
+        path="/",
+        httponly=True, secure=True, samesite="Strict",
+        max_age=SESSION_TTL_SECONDS,
+    )
+    return response
+
+
+def _aldine_tab_listed(project: str, path: Path | None = None) -> bool:
+    """Whether `project` gets the Aldine tab by the host-written tab record:
+    the record says Aldine is on AND lists the project. Anything else — no
+    record, not a regular file (a FIFO would block the open: O_NONBLOCK; a
+    link is not followed), larger than ALDINE_TAB_RECORD_MAX_BYTES, not UTF-8
+    JSON, not the documented shape or version — is no tab. Never raises."""
+    path = ALDINE_TAB_RECORD if path is None else path
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return False
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode):
+                return False
+            raw = fh.read(ALDINE_TAB_RECORD_MAX_BYTES + 1)
+        if len(raw) > ALDINE_TAB_RECORD_MAX_BYTES:
+            return False
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    projects = data.get("projects")
+    version = data.get("version")
+    # `True == 1` in Python: a bool is never a version number.
+    return (isinstance(version, int) and not isinstance(version, bool)
+            and version == ALDINE_TAB_RECORD_VERSION
+            and data.get("on") is True
+            and isinstance(projects, list)
+            and project in [p for p in projects if isinstance(p, str)])
+
+
 def _mcp_server_action_handler(action: str, table: dict | None = None):
     verb, fields = (table or _MCP_SERVER_ACTIONS)[action]
 
@@ -918,7 +1037,7 @@ def _mcp_server_action_handler(action: str, table: dict | None = None):
 # child-side — no client-supplied version crosses).
 _BUILD_VERBS = frozenset({"agent_pull", "editor_pull", "reader_pull", "node_pull",
                           "agent_refresh", "editor_refresh", "reader_refresh",
-                          "rebuild", "mcp_gateway_start"})
+                          "rebuild", "mcp_gateway_start", "aldine_on"})
 
 
 async def broker_build_handler(request: web.Request) -> web.Response:
@@ -1589,7 +1708,7 @@ async def broker_origin_dropped_handler(request: web.Request) -> web.Response:
     rows = []
     for e in ORIGIN_PORTS_DROPPED:
         d = services.describe_origin_entry(e["project"], e["service"],
-                                           GITEA_ORIGIN_KEY)
+                                           GITEA_ORIGIN_KEY, ALDINE_ORIGIN_KEY)
         rows.append({"port": e["port"], "where": d["where"],
                      "what": d["what"]})
     return web.json_response({"ok": True, "result": {
@@ -2956,6 +3075,14 @@ async def _assemble_services(request: web.Request, project: str,
             if spec is not None:
                 out[f"{services.DEV_FORK_ID_PREFIX}{consumer}:{repo}"] = spec
 
+    # The shared Aldine tab: when the host's tab record says Aldine is on and
+    # this project has a consumer wired to it, and Aldine answers (the Gitea
+    # tabs' probe gate: Aldine unreachable ⇒ no tab, never one that 502s).
+    # The record read comes first, so a project not wired pays no probe.
+    if (_aldine_tab_listed(project)
+            and await tcp_probe(ALDINE_UPSTREAM_HOST, ALDINE_UPSTREAM_PORT)):
+        out[services.ALDINE_TAB_ID] = services.aldine_service()
+
     # The PROJECT-WIDE Fetch tab: shown whenever THIS project carries an opt-in
     # rs-fetch surface, INDEPENDENT of the dev-consumer tabs above (a project can
     # legitimately have both; their ids cannot collide — see PROJECT_FETCH_ID).
@@ -4005,12 +4132,46 @@ async def _proxy_ws(request: web.Request, upstream_url: str,
         await sess.close()
 
 
+def _aldine_frame_ancestors(project: str, headers, frame_origin: str):
+    """The response headers of an origin request, with Aldine framable by the
+    webui ONLY. Aldine's pages send `frame-ancestors 'none'` (its OAuth consent
+    page grants access on one click — its login is off here), which would keep
+    the project's Aldine tab blank. For the `-aldine-` sentinel origin alone,
+    the frame-ancestors directive of every Content-Security-Policy header is
+    replaced by `frame_origin` (the webui page that frames the tab), every other
+    directive kept byte for byte and in order; a policy without the directive
+    gets none (a header can carry several comma-separated policies, each
+    handled). Any other origin's headers come back as they are."""
+    if project != ALDINE_ORIGIN_KEY:
+        return headers
+
+    def directive(d: str) -> str:
+        words = d.split()
+        if not words or words[0].lower() != "frame-ancestors":
+            return d
+        lead = d[:len(d) - len(d.lstrip())]
+        return f"{lead}frame-ancestors {frame_origin}"
+
+    out = CIMultiDict()
+    for k, v in headers.items():
+        if k.lower() == "content-security-policy":
+            v = ",".join(";".join(directive(d) for d in policy.split(";"))
+                         for policy in v.split(","))
+        out.add(k, v)
+    return out
+
+
 async def _proxy_http(request: web.Request, upstream_url: str,
-                      forward: dict[str, str] | None = None) -> web.StreamResponse:
+                      forward: dict[str, str] | None = None, *,
+                      project: str = "",
+                      frame_origin: str = "") -> web.StreamResponse:
     """HTTP pass-through. Streams body both directions; preserves status,
     headers (minus hop-by-hop), and any Set-Cookie from upstream.
     `forward` (exported-port tabs only — see origin_proxy_handler) REPLACES
-    those request headers upstream; None keeps the request exactly as before."""
+    those request headers upstream; None keeps the request exactly as before.
+    `project`/`frame_origin`: the origin's sentinel or project and the webui
+    page's origin — only the shared-Aldine origin's CSP is rewritten
+    (_aldine_frame_ancestors); every other origin's headers pass as before."""
     headers_in = _filter_headers(request.headers, HOP_BY_HOP_HEADERS)
     for k, v in (forward or {}).items():
         headers_in[k] = v
@@ -4044,8 +4205,9 @@ async def _proxy_http(request: web.Request, upstream_url: str,
         except Exception as e:                       # mirror _proxy_ws's connect guard
             return web.Response(status=502, text=f"upstream unreachable: {e}")
         try:
-            headers_out = _filter_headers(
-                upstream_resp.headers, RESPONSE_DROP_HEADERS)
+            headers_out = _aldine_frame_ancestors(
+                project, _filter_headers(upstream_resp.headers, RESPONSE_DROP_HEADERS),
+                frame_origin)
             response = web.StreamResponse(
                 status=upstream_resp.status,
                 reason=upstream_resp.reason,
@@ -4260,6 +4422,13 @@ async def origin_proxy_handler(request: web.Request) -> web.StreamResponse:
         # minted by the Management-anchored /broker/dev/gitea-session.
         upstream_host: str = GITEA_UPSTREAM_HOST
         upstream_port: int | None = GITEA_UPSTREAM_PORT
+    elif project == ALDINE_ORIGIN_KEY:
+        # The shared-Aldine admission: the same fixed-upstream discipline,
+        # behind the sentinel cookie /broker/aldine/session mints. Aldine
+        # builds its live-editing socket URL from the browser's own address
+        # (wss://<location.host>/collab), so it needs no forwarded Host/Proto.
+        upstream_host = ALDINE_UPSTREAM_HOST
+        upstream_port = ALDINE_UPSTREAM_PORT
     else:
         upstream_port = _resolve_origin_upstream_port(project, service_id)
         if upstream_port is None:
@@ -4285,13 +4454,17 @@ async def origin_proxy_handler(request: web.Request) -> web.StreamResponse:
     # forwarding header added — untouched.
     browser_host = request.headers.get("Host")
     forward = ({"Host": browser_host, "X-Forwarded-Proto": "https"}
-               if browser_host and project != GITEA_ORIGIN_KEY
+               if browser_host and project not in SHARED_ORIGIN_KEYS
                and service_id.startswith(services.EXPORTED_PORT_ID_PREFIX)
                else None)
 
     if is_ws:
         return await _proxy_ws(request, upstream_url, forward)
-    return await _proxy_http(request, upstream_url, forward)
+    # The page that frames every tab: this webui, at the host the browser used
+    # and the port it publishes (the Aldine origin's CSP names it).
+    frame_origin = f"https://{_request_host(request)}:{PUBLISHED_PORT}"
+    return await _proxy_http(request, upstream_url, forward,
+                             project=project, frame_origin=frame_origin)
 
 
 async def index_handler(request: web.Request) -> web.Response:
@@ -4489,6 +4662,9 @@ def main() -> None:
     for _action in _MCP_WIRING_ACTIONS:
         app.router.add_post(f"/broker/mcp/{_action}",
                             _mcp_server_action_handler(_action, _MCP_WIRING_ACTIONS))
+    app.router.add_get("/broker/aldine", broker_aldine_status_handler)
+    app.router.add_post("/broker/aldine/off", broker_aldine_off_handler)
+    app.router.add_post("/broker/aldine/session", broker_aldine_session_handler)
     app.router.add_get("/broker/software", broker_software_handler)
     app.router.add_post("/broker/software/build", broker_build_handler)
     app.router.add_post("/broker/software/refresh-check", broker_refresh_check_handler)

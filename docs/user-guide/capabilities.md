@@ -21,6 +21,8 @@ python research.py project mcp allow myproj arxiv
 
 **The MCP page (Sandboxes → MCP).** A second, newer list holds MCP servers by address (`http://` or `https://`) with optional secret request headers, behind one shared gateway container. The page adds, edits, tests and removes them, and wires them: pick a project, pick its agent, one of its boxes or, in a research project, its analysis workers, then tick the servers it may use. The agent sees a wired server in its next session, in Claude Code and pi alike; nothing restarts. From the host: `research mcp server list | add | edit | remove | test`, `research mcp wire <project> [--box NAME | --workers] --set a,b` and `research mcp wiring`. A research project's own agent is not wired; its analysis workers and its boxes are. Each worker gets only the servers the supervisor names when it spawns it, from this page or the registry above.
 
+**Aldine, the shared LaTeX editor.** Turned on under Sandboxes → Infrastructure (or `research aldine on`), it appears on the MCP page as the server `aldine`; tick it for an agent, a box or a research project's workers like any server. A project with something wired to it also gets an **Aldine** tab. There is one Aldine and one set of papers for the whole installation. See [Aldine](../architecture/Aldine.md).
+
 ### Worker services — `worker`
 
 Pipeline-side agents the supervisor's analysis workers call through the proxy (`research worker list`):

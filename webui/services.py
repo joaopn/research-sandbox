@@ -431,14 +431,18 @@ def partition_origin_table(data, lo: int, hi: int) -> tuple[dict, list[dict]]:
     return kept, out_of_range
 
 
-def describe_origin_entry(project: str, service: str, gitea_key: str) -> dict:
+def describe_origin_entry(project: str, service: str, gitea_key: str,
+                          aldine_key: str | None = None) -> dict:
     """An origin-table entry in the operator's words: `{"where", "what"}`.
     `where` is the project name, or the Development page for the shared-Gitea
-    entry (its project is the sentinel `gitea_key`, which server.py owns).
+    entry (its project is the sentinel `gitea_key`, which server.py owns), or
+    every Aldine tab for the shared-Aldine entry (sentinel `aldine_key`).
     `what` names the tab: a static service by its label (Editor, Reader), a box
     editor by its box name, an app tab by its port; an unknown id stays as is."""
     if project == gitea_key:
         return {"where": "Development page", "what": "Gitea"}
+    if aldine_key is not None and project == aldine_key:
+        return {"where": "every project", "what": ALDINE_TAB_LABEL}
     if service.startswith(BOX_EDITOR_ID_PREFIX):
         what = f"{service[len(BOX_EDITOR_ID_PREFIX):]} (box editor)"
     elif service.startswith(EXPORTED_PORT_ID_PREFIX):
@@ -573,6 +577,38 @@ def project_fetch_service(label: str) -> dict:
         "always_on": False,
         "renderer": "panel",
         "fetch_all": True,
+    }
+
+
+# The shared Aldine LaTeX editor's tab — ONE per project that has at least one
+# consumer wired to the MCP gateway server `aldine` (the host-written tab
+# record says which; server.py reads it). Its own id, outside every prefix
+# family (`git-`, `fetch-`, `port-`, `pass-`, `box-…`) and never a SERVICES
+# key, so it collides with nothing; the mobile tab whitelist names it by
+# exact match (style.css).
+ALDINE_TAB_ID = "aldine"
+ALDINE_TAB_LABEL = "Aldine"
+
+
+def aldine_service() -> dict:
+    """Synthesize the Aldine tab spec.
+
+    Carries `aldine_path`, NEVER `origin_url`: the tab serves off the SHARED
+    `-aldine-` sentinel origin (one Aldine for the installation, its session
+    minted by POST /broker/aldine/session), not a per-container origin port —
+    so the synthesizer must not call `_origin_url()` for it, and its id never
+    enters ORIGIN_PORTS under a project. The SPA branches on `aldine_path`
+    before the per-project session mint, exactly like `gitea_path`. `kind` is
+    load-bearing (an absent kind renders the tab as a terminal); `tab_type`
+    gives it the editors' colour. This spec reaches the unauthenticated
+    GET /services/<p>, so it says that the tab exists and nothing more."""
+    return {
+        "label": ALDINE_TAB_LABEL,
+        "kind": "http",
+        "always_on": False,
+        "renderer": "iframe",
+        "tab_type": "editor",
+        "aldine_path": "/",
     }
 
 

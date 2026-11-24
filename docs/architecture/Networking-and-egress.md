@@ -65,6 +65,9 @@ The registry, Gitea and the web interface sit on the shared network and are also
 | Box-image registry | Read-only instance on each project network | Separate writable instance on a loopback port |
 | Shared Gitea | Joined to each project network | Loopback port; Gitea tab in the web interface |
 | Web interface | Joined to each project network, to open terminals, editors and tabs | Published on the address the operator chose |
+| [Aldine](Aldine.md) (when turned on) | Not joined to project networks; only through the MCP gateway | The Aldine tab and Open, through the web interface |
+
+Aldine is the exception to the table's first column: it sits on a network of its own shared only with the web interface and the MCP gateway, because its own login is off; its LaTeX compiler sits on an internal network with no route out.
 
 The web interface joins project networks only to open connections into them; it refuses connections that arrive from a project's bridge. RS will not publish it on every host address (`0.0.0.0`). The dev lane's pull-request reviewer runs on a separate bridge with locked egress.
 

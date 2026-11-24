@@ -47,6 +47,7 @@ flowchart TD
 | ↳ [Container commands](Container-commands.md) | rs-wt, rs-land, rs-board, /rs-mode, /rs-test, rs-fetch, rs-sync, rs-publish, image builds: where each is and how to use it |
 | [Browser and broker](Browser-and-broker.md) | The web interface, the broker on the host, sign-in, bringing an RS update live |
 | [Networking and egress](Networking-and-egress.md) | Isolation from the host and the LAN; open and locked egress |
+| [Aldine](Aldine.md) | The shared LaTeX editor: turned on in the browser, reached by agents as the MCP server `aldine` |
 
 ## Core design decisions
 
@@ -149,3 +150,9 @@ The lab workflow's decisions are proposals until built; they are listed on [Lab 
 - Private and LAN addresses are blocked in every egress mode.
 - Tools are reached through one MCP proxy per project.
 - RS never touches the host; host hardening is documented for the operator to apply.
+
+### [Aldine](Aldine.md)
+
+- One shared Aldine for the installation, not one per project; every wired agent sees every paper.
+- Aldine's own login is off, so only the web interface and the MCP gateway can reach it, on its own networks.
+- Pinned by version and image digest; the papers are kept across updates and Turn off.

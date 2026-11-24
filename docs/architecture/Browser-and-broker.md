@@ -43,7 +43,7 @@ The left rail lists the projects, with four entries at its bottom.
 | Projects rail | Always shown | Lists projects and opens their tabs; host CPU and memory |
 | New Project | Floating window | Workflow cards to create a project; import an existing one |
 | Development | Tabs: Gitea, Fetch, Repos, Images, Reviews, Backup | The [Dev lane](Dev-lane.md): Gitea, fetch commands, repositories, image builds of mirrored repos, reviews, Gitea backups |
-| Sandboxes | Tabs: Management, Infrastructure, Software, MCP | Project table; shared services and host settings; agent, editor and image builds; the [MCP servers](MCP-servers.md) behind the shared gateway and their wiring |
+| Sandboxes | Tabs: Management, Infrastructure, Software, MCP | Project table; shared services (Gitea, the shared [Aldine](Aldine.md) editor) and host settings; agent, editor and image builds; the [MCP servers](MCP-servers.md) behind the shared gateway and their wiring |
 | Settings | Floating window | Interface settings kept in the browser: themes, layout, zoom, terminal font |
 
 In the Management table each project row has Start or Stop and Destroy; a running project also has Attach and Update. Each project's gear in the sidebar opens its ⚙ window: a floating window in the middle of the screen that lists the sections Tabs, Extensions, Agents, Sharing, Ports, Alerts and Sidebar down the left and shows one at a time. It keeps one size, its corner drags, and it closes when a change made from it finishes.
@@ -63,6 +63,7 @@ An open project shows its tabs in the top strip. Each web surface inside a proje
 | App tabs | A web app inside the project, registered or detected | HTTP relay on an origin port |
 | Pass-through tabs | An app that needs raw TCP | Forwarded unchanged; no webui sign-in |
 | `<name> (GIT)` | That agent's fork in the shared Gitea | HTTP relay on the Gitea origin |
+| Aldine | The shared [Aldine](Aldine.md) LaTeX editor, when a consumer of the project is wired to it | HTTP relay on the Aldine origin |
 
 A pass-through port is forwarded below the webui sign-in, so the app's own login is the only check on it. What a project can reach on the way out is in [Networking and egress](Networking-and-egress.md).
 
@@ -114,7 +115,7 @@ The broker handles one request at a time. Reads, create and destroy run inside t
 | Lane | Runs | Concurrency |
 |---|---|---|
 | Lifecycle | Project start, stop, update | One at a time; create and destroy refused meanwhile |
-| Build | Agent, editor, reader and node pulls; Rebuild all | One at a time; others queue |
+| Build | Agent, editor, reader and node pulls; Rebuild all; starting the MCP gateway; turning Aldine on | One at a time; others queue |
 | Review | Review of a pull request or commit | Parallel |
 | Dev | Dev box and dev project setup; Gitea upgrade and rollback | Parallel; Gitea actions refused during an upgrade |
 

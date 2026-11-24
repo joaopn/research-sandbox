@@ -11,6 +11,8 @@ An MCP server gives an agent extra tools (a reference library, a database, a sea
 
 A server on this list is an address (`http://` or `https://`) plus optional secret request headers, such as an API key. The page adds, edits, tests and removes servers. `research mcp server list | add | edit | remove | test | reset` does the same from the host.
 
+When the shared [Aldine](Aldine.md) LaTeX editor is turned on, RS keeps a server named `aldine` on this list; it is wired like any other server, and Turn off removes it again.
+
 Test asks the server to introduce itself and reports one of four results.
 
 | Result | Meaning |
