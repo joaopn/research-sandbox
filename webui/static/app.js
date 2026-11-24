@@ -452,7 +452,7 @@ const state = {
     loginGen: 0,
     detectInFlight: {},
     detectPending: {},
-    projectLastService: {},  // { [projectName]: serviceId } — per-project landing memory (in-memory; reload/restart resets to the editor default)
+    projectLastService: {},  // { [projectName]: serviceId } — per-project landing memory (in-memory; reload/restart resets to the CLI default)
     stoppedProjects: [],     // names in the rail's "Stopped" fold — broker-derived, in memory only (syncSidebarFromBroker)
     terminals: {},           // "${project}:${service}" -> { term, fitAddon, ws, container, project, service }
     probeTimer: null,
@@ -2197,9 +2197,20 @@ function updateMobileKeybar() {
     }
 }
 
+// Desktop landing preference: the project's terminal ("supervisor") when it is
+// a visible CLI tab, else the first visible CLI tab, else the first visible tab
+// (the strip order is unchanged; only where the page lands moves off the
+// editor). Never null when `visible` is non-empty. The three auto-activation
+// sites use it on desktop and mobileLandingService on mobile.
+function desktopLandingService(visible, enabled) {
+    const isCli = (id) => !!enabled[id] && surfaceOf(id, enabled[id]) === "cli";
+    if (visible.includes("supervisor") && isCli("supervisor")) return "supervisor";
+    return visible.find(isCli) || visible[0];
+}
+
 // Mobile landing preference — MOBILE-ONLY (the three desktop auto-activation
-// sites keep their existing expressions verbatim behind mobileModeActive()
-// ternaries). Never returns a visual-surface id other than "reader": those
+// sites use desktopLandingService behind mobileModeActive() ternaries).
+// Never returns a visual-surface id other than "reader": those
 // tabs are hidden on mobile, and activating one would fill the screen with
 // an iframe that has no visible tab.
 function mobileCliService(name, visible, enabled) {
@@ -12888,11 +12899,12 @@ async function refreshActiveServices() {
     } else if (state.activeService && visible.includes(state.activeService)) {
         activateService(state.activeService);
     } else if (visible.length > 0) {
-        // Mobile: visible[0] is code-server whenever the editor is enabled
-        // (SERVICES insertion order) — route through the mobile landing
-        // preference instead. Desktop keeps the bare first-tab fallback.
+        // visible[0] is code-server whenever the editor is enabled (SERVICES
+        // insertion order) — route through the landing preference instead:
+        // mobile's, or desktop's (the terminal, then any CLI tab, then first).
         const next = mobileModeActive()
-            ? mobileLandingService(name, visible, fresh) : visible[0];
+            ? mobileLandingService(name, visible, fresh)
+            : desktopLandingService(visible, fresh);
         if (next) activateService(next);
         else { state.activeService = null; showWelcome(false); }
     }
@@ -13947,10 +13959,9 @@ async function activateProject(name, opts) {
 
     // Landing tab: a project reopens on whatever it last had open this session
     // (per-project memory). A project with no remembered tab — never opened, or
-    // reset by a stop/start / destroy — defaults to the editor when enabled, then
-    // the first always-on (CLI), then any. code-server is kind:http so it was never
-    // the always_on default; preferring it here is what makes a fresh project (and
-    // a freshly-restarted one) land on the editor instead of the CLI.
+    // reset by a stop/start / destroy — defaults to the CLI (the project's
+    // terminal tab), then any CLI tab, then the first tab (desktopLandingService).
+    // The editor stays first in the strip; it is just not where the page lands.
     const visible = visibleServiceIds(name, enabled);
     if (visible.length === 0) {
         state.activeService = null;
@@ -13972,9 +13983,7 @@ async function activateProject(name, opts) {
     } else {
         next = state.projectLastService[name];
         if (!next || !enabled[next] || !visible.includes(next)) {
-            next = (visible.includes("code-server") && "code-server")
-                || visible.find((id) => enabled[id].always_on)
-                || visible[0];
+            next = desktopLandingService(visible, enabled);
         }
     }
     // keepNote: landing on a tab whose view was closed (its address freed)
@@ -16297,10 +16306,12 @@ async function setServiceHidden(project, serviceId, hide) {
     // If the active service was just hidden, fall back to a visible one.
     const visible = visibleServiceIds(project.name, enabled);
     if (!visible.includes(state.activeService) && visible.length > 0) {
-        // Same mobile guard as the refreshActiveServices fallback: never
-        // auto-open a hidden-on-mobile visual tab.
+        // Same landing preference as the refreshActiveServices fallback:
+        // mobile never auto-opens a hidden-on-mobile visual tab; desktop
+        // lands on the terminal, then any CLI tab, then the first tab.
         const next = mobileModeActive()
-            ? mobileLandingService(project.name, visible, enabled) : visible[0];
+            ? mobileLandingService(project.name, visible, enabled)
+            : desktopLandingService(visible, enabled);
         if (next) activateService(next);
         else { state.activeService = null; showWelcome(false); }
     }
