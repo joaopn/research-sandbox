@@ -14,6 +14,7 @@
       "label": "Direct",
       "description": "The agent does the work itself, in the session you talk to.",
       "pieces": [
+        "scope",
         "go",
         "implement-yourself",
         "tests",
@@ -29,6 +30,7 @@
       "label": "Doer-checker",
       "description": "The agent does the work itself; RS's checker subagent reviews the plan before any code is written and the change before it is committed. Lighter than planner-doer-checker.",
       "pieces": [
+        "scope",
         "plan-review",
         "go",
         "implement-yourself",
@@ -49,6 +51,7 @@
       "label": "Checker-doer",
       "description": "The agent plans with you and reviews every change itself; RS's doer subagent implements each unit. No separate checker, so it is cheaper than planner-doer-checker, and the review is by the agent that wrote the plan.",
       "pieces": [
+        "scope",
         "plan-units",
         "go",
         "implement-through-doers",
@@ -69,6 +72,7 @@
       "label": "Planner-doer-checker",
       "description": "The agent plans with you; RS's doer subagent implements each unit and its checker subagent reviews it before it lands. More thorough, and it costs more tokens and time per unit.",
       "pieces": [
+        "scope",
         "plan-review",
         "go",
         "implement-through-doers",
