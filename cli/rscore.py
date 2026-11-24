@@ -18189,8 +18189,10 @@ MEMORY_KIT_LABEL = "research.memory-kit"
 # follows the image, so an older image must be refused, never run. Version 4:
 # the instructions name `rs-memory amend` and `rs-memory job`. Version 5:
 # the instructions name `rs-memory claim --fact` (a data fact, D-<n>, which the
-# PI accepts without the finding checks and the front page lists).
-MEMORY_KIT_VERSION = "5"
+# PI accepts without the finding checks and the front page lists). Version 6:
+# the instructions name `rs-memory claim --title` (required: the pages the PI
+# reads, which rs-memory writes beside the memory folder, list claims by it).
+MEMORY_KIT_VERSION = "6"
 MEMORY_TOOL = f"{RS_LIB_DIR}/rs-memory"
 MEMORY_LINKS = ("rs-memory",)
 MEMORY_AGENTS = ("claude", "pi")

@@ -44,11 +44,20 @@ Every shipped workflow except `research` defaults to **`--egress locked`** (80/4
 
 ## Working with a researcher
 
-In a `researcher` or `researcher-subagents` project you talk with one research agent in its terminal, and read what it knows in the **Reader** tab.
+In a `researcher` or `researcher-subagents` project you talk with one research agent in its terminal, and read what it has for you in the **Reader** tab. The workspace looks like this:
 
-- **What you read.** The memory's front page, `memory/front.md`: what is being studied, the agent's beliefs, the work in flight, the open threads, and, once you have accepted any, "What we know about the data".
-- **What you decide.** The agent proposes results as claims and tells you their ids: findings (`F-3`), facts about the data (`D-1`, such as an inventory line, a gap or a count), open questions and retractions. Accept them in the chat ("accept F-3", "accept D-1 D-2"), or reject one and say why. Only what you accept enters the record. In a `researcher-subagents` project a finding is first re-run and read by an independent referee; facts need neither.
-- **The helpers' work** (`researcher-subagents`). Each analyst writes its results and its full write-up, `writeup.md`, into its own results folder, and the agent journals the dead ends and surprises it reports.
+| Path | What it is |
+|---|---|
+| `README.md` | The front page, for you: what waits for your decision, what is running, where things stand, what is known |
+| `staging/<id>.md` | One page per claim waiting for you, with its statement, scope, hedge, evidence, checks, and the words to accept or strike it |
+| `results/index.md` | Everything you accepted, by topic, each with how it stands now (current, superseded, withdrawn, contested) |
+| `results/<id>/` | One page per accepted entry, and `evidence/`: a read-only copy of its evidence files, kept when you accepted it |
+| `analyses/<name>/` | The files of each analysis |
+| `memory/` | The agent's own memory: its journal, its record, its own front page, its skills |
+
+- **What you read.** Start at `README.md`. The pages are written by the agent's memory command from its memory and rewritten at every change, so do not edit them: an edit is lost at the next change. If you keep a file of your own at one of their names (your own `README.md`, say), it is never overwritten; the agent tells you, and the page appears once you move or rename your file.
+- **What you decide.** The agent proposes results as claims, each with a short title and an id: findings (`F-3`), facts about the data (`D-1`, such as an inventory line, a gap or a count), open questions and retractions. Each one waits on the front page with the words to decide it. Accept them in the chat ("accept F-3", "accept D-1 D-2"), or reject one and say why ("strike D-1, it double counts"). Only what you accept enters the record. In a `researcher-subagents` project a finding is first re-run and read by an independent referee, and its page shows what both found; facts need neither.
+- **The helpers' work** (`researcher-subagents`). Each analyst writes its results and its full write-up, `writeup.md`, into its own folder under `analyses/`, and the agent journals the dead ends and surprises it reports.
 - **Long runs.** A run left going for hours is registered by the agent and listed at every session start as running, ended (with its log's last line) or gone.
 
 How the memory works: [Researcher workflow](../architecture/Researcher-workflow.md). The helpers and the checks: [Researcher with subagents](../architecture/Researcher-with-subagents.md).

@@ -28,14 +28,34 @@ Everything lives under /workspace/memory/ (RS_MEMORY_DIR overrides it):
                                 command line, its log); marked done, never
                                 deleted
 
+That folder is the agent's own. Beside it, in the workspace, rs-memory writes
+the pages the PI reads, views written from it (the store stays the single
+source of truth):
+
+  README.md                     the PI's front page: what waits for them (each
+                                staged claim with its checks and the words to
+                                decide it), what is running, where things
+                                stand, what is known
+  staging/<id>.md               one page per staged claim
+  results/<id>/<id>.md          one page per accepted entry, with how it stands
+                                now
+  results/<id>/evidence/        a read-only copy of its evidence, made at accept
+                                and never rewritten
+  results/index.md              everything accepted, by topic, with its standing
+
+Every page is rebuilt after each verb that changes what it shows, and at open
+(how an existing project gets its pages). Each starts with rs-memory's marker
+line; a file without it is never overwritten or removed, and is reported until
+the PI moves it. A page that cannot be written never fails the verb.
+
 Verbs:
   open [--hook]                 what to read at the start of a session
   note HEADLINE --kind K [--body TEXT]
   checkpoint ITEM...            replace the "In flight" part of the front page
-  claim STATEMENT --scope S --evidence FILE... [--hedge H] [relations] [--topic T]
-        [--rerun CMD | --no-rerun REASON | --question | --fact]
-  amend ID [--statement S] [--scope S] [--hedge H] [--evidence FILE...] [relations]
-        [--topic T] [--rerun CMD | --no-rerun REASON]
+  claim STATEMENT --title T --scope S --evidence FILE... [--hedge H] [relations]
+        [--topic T] [--rerun CMD | --no-rerun REASON | --question | --fact]
+  amend ID [--statement S] [--title T] [--scope S] [--hedge H] [--evidence FILE...]
+        [relations] [--topic T] [--rerun CMD | --no-rerun REASON]
                                 correct a staged claim in place
   rerun-command ID (--rerun CMD | --no-rerun REASON)
   rerun ID  /  referee ID [--agent claude|pi]
@@ -99,6 +119,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from pathlib import Path
 
 # ----------------------------------------------------------------- constants
@@ -151,7 +172,8 @@ QUIET_KINDS = ("consolidation", "session-end")
 NOTHING_NEW = "nothing new since the last consolidation"
 DELTA_KEYS = ("page", "through", "add", "edit", "retire", "claims", "skills")
 DELTA_ITEM_KEYS = {"add": ("part", "text"), "edit": ("id", "text"),
-                   "claims": ("kind", "statement", "scope", "hedge", "evidence", "relations", "topics"),
+                   "claims": ("kind", "title", "statement", "scope", "hedge", "evidence", "relations",
+                              "topics"),
                    "skills": ("name", "description", "body")}
 
 # The front page's parts: heading, id letter, and whether consolidation edits it.
@@ -610,6 +632,7 @@ def cmd_checkpoint(a) -> None:
         write_text(mem_dir() / "front.md", render_front(front))
         ident = add_journal("checkpoint", "checkpoint",
                             "\n".join(f"- {t}" for t in items) or "(nothing in flight)")
+        refresh_pages()
     print(f"In flight replaced ({len(items)} item(s)); {ident} journalled.")
 
 
@@ -665,11 +688,21 @@ def validate_claim(statement: str, scope: str, evidence: "list[str]",
     return out
 
 
-def write_claim(prefix: str, statement: str, scope: str, hedge: str,
+def check_title(title: "str | None") -> str:
+    """A claim's title, a few words naming the result: the pages the PI reads
+    list claims by it. Not part of what the checks are bound to."""
+    t = single_line(title or "")
+    if not t:
+        raise Refused("a claim needs --title: a few words naming the result (the pages the PI "
+                      "reads list claims by it), e.g. --title \"Gaps in the hourly archives\"")
+    return t
+
+
+def write_claim(prefix: str, title: str, statement: str, scope: str, hedge: str,
                 evidence: "list[tuple[str, str]]", relations: "dict[str, list[str]]",
                 topics: "list[str]", rerun: "tuple[str, str] | None" = None) -> str:
     ident = next_claim_id(prefix)
-    fields = [("kind", CLAIM_KINDS[prefix]),
+    fields = [("kind", CLAIM_KINDS[prefix]), ("title", title),
               ("scope", scope), ("hedge", hedge or "(none stated)"),
               ("staged", now()), ("session", session_label())]
     for path, digest in evidence:
@@ -710,6 +743,7 @@ def rerun_field(a) -> "tuple[str, str] | None":
 
 def cmd_claim(a) -> None:
     refuse_under_guard("stage claims outside its delta")
+    title = check_title(a.title)
     prefix = _claim_prefix(a)
     rels = _relations_from(a)
     rerun = None
@@ -726,9 +760,10 @@ def cmd_claim(a) -> None:
     with Lock():
         known = set(claim_files())
         ev = validate_claim(a.statement, a.scope or "", a.evidence or [], rels, prefix, known)
-        ident = write_claim(prefix, a.statement, a.scope or "", a.hedge or "", ev,
+        ident = write_claim(prefix, title, a.statement, a.scope or "", a.hedge or "", ev,
                             rels, [single_line(t) for t in (a.topic or []) if t.strip()],
                             rerun)
+        refresh_pages()
     print(f"{ident} staged. It enters the record when the PI accepts it "
           f"(they say \"accept {ident}\", you run rs-memory accept {ident}).")
     if rerun:
@@ -738,7 +773,7 @@ def cmd_claim(a) -> None:
 
 
 # The fields a staged claim carries, in the order write_claim writes them.
-CLAIM_FIELDS = ("kind", "scope", "hedge", "staged", "session", "amended", "evidence",
+CLAIM_FIELDS = ("kind", "title", "scope", "hedge", "staged", "session", "amended", "evidence",
                 "rerun", "no-rerun") + RELATIONS + ("topic",)
 
 
@@ -746,9 +781,9 @@ def cmd_amend(a) -> None:
     refuse_under_guard("amend claims")
     ident = a.id
     rels_given = {r: getattr(a, r.replace("-", "_")) for r in RELATIONS}
-    if all(v is None for v in (a.statement, a.scope, a.hedge, a.evidence, a.topic,
+    if all(v is None for v in (a.statement, a.title, a.scope, a.hedge, a.evidence, a.topic,
                                a.rerun, a.no_rerun, *rels_given.values())):
-        raise Refused(f"amend {ident}: say what to change: --statement, --scope, --hedge, "
+        raise Refused(f"amend {ident}: say what to change: --statement, --title, --scope, --hedge, "
                       "--evidence, --topic, a relation (" + ", ".join(f"--{r}" for r in RELATIONS)
                       + "), or for a finding --rerun / --no-rerun")
     with Lock():
@@ -792,8 +827,11 @@ def cmd_amend(a) -> None:
                     else list(meta.get("evidence", [])))
         topics = ([single_line(t) for t in a.topic if t.strip()] if a.topic is not None
                   else list(meta.get("topic", [])))
+        # A title is a label, like a topic: changing it voids no check. An
+        # entry staged before titles existed keeps none until one is given.
+        title = [check_title(a.title)] if a.title is not None else list(meta.get("title", []))
         stamp = now()
-        new = {"kind": meta.get("kind", []), "scope": [scope],
+        new = {"kind": meta.get("kind", []), "title": title, "scope": [scope],
                "hedge": [hedge if single_line(hedge) else "(none stated)"],
                "staged": meta.get("staged", []), "session": meta.get("session", []),
                "amended": [stamp], "evidence": ev_lines, "topic": topics, **rels}
@@ -812,6 +850,7 @@ def cmd_amend(a) -> None:
         body = "\n\n".join(x for x in (meta["body"], section) if x.strip())
         write_text(path, render_entry(ident, statement, fields, body))
         after = parse_entry(path)
+        refresh_pages()
     print(f"{ident} amended; its earlier version is kept on the entry "
           f"(rs-memory view {ident}).")
     if prefix == "F" and checks_on():
@@ -872,6 +911,10 @@ def cmd_accept(a) -> None:
         after = dict(rec)
         after.update((ident, parse_entry(path)) for ident, path, _e in metas)
         front = read_front() if fact_lines(rec) != fact_lines(after) else None
+        # The frozen copy of each entry's evidence, beside its result page:
+        # made and checked now, so a copy that cannot be made refuses the
+        # accept before anything moves.
+        freeze_all_evidence([(ident, parse_entry(path)) for ident, path, _e in metas])
         stamp = now()
         objected = []
         for ident, path, extra in metas:
@@ -896,6 +939,7 @@ def cmd_accept(a) -> None:
             write_text(mem_dir() / "front.md", render_front(front))
         j = add_journal("accepted " + " ".join(i for i, _p, _e in metas), "accept",
                         ("over the referee's objection: " + " ".join(objected)) if objected else "")
+        refresh_pages()
     print(f"Accepted into the record: {' '.join(i for i, _p, _e in metas)} ({j}).")
     if objected:
         print(f"Accepted over the referee's objection, which stays on the entry: {' '.join(objected)}.")
@@ -914,6 +958,7 @@ def cmd_strike(a) -> None:
         for ident in a.ids:
             os.replace(files[ident][1], mem_dir() / "struck" / f"{ident}.md")
         j = add_journal("struck " + " ".join(a.ids), "strike", a.reason)
+        refresh_pages()
     print(f"Struck: {' '.join(a.ids)} ({j}).")
 
 
@@ -1201,6 +1246,7 @@ def cmd_rerun_command(a) -> None:
         at = (ev[-1] + 1) if ev else len(lines)
         lines.insert(at, f"{field[0]}: {field[1]}")
         write_text(path, "\n".join(lines) + (sep + rest if sep else "\n"))
+        refresh_pages()
     if field[0] == "rerun":
         print(f"{a.id}: re-run command set; run it with rs-memory rerun {a.id}.")
     else:
@@ -1220,6 +1266,7 @@ def cmd_rerun(a) -> None:
         n, d = new_check(a.id, "rerun", [("command", cmd)] + binding_fields(meta))
         (d / "rerun").mkdir()
         log = start_check(a.id, n, d, "rerun", "rerun.log")
+        refresh_pages()
     print(f"Re-run of {a.id} started in the background (check {n}), writing into "
           f"{d / 'rerun'}; its log is {log}. Its result shows in rs-memory view {a.id}.")
 
@@ -1380,6 +1427,7 @@ def cmd_referee(a) -> None:
         write_text(snap / "MANIFEST.sha256",
                    "".join(f"{h}  {name}\n" for name, h in sorted(manifest.items())), mode=0o444)
         log = start_check(a.id, n, d, "referee", "referee.log")
+        refresh_pages()
     print(f"Referee of {a.id} started in the background (check {n}, {agent} "
           f"{' '.join(model_flags)}), reading only {snap}; its log is {log}. "
           f"Its verdict lands in {d / 'verdict.md'} and shows in rs-memory view {a.id}.")
@@ -1535,7 +1583,12 @@ def run_referee(ident: str, n: int) -> int:
 def cmd_check_child(a) -> None:
     refuse_under_guard("run a check")
     n = int(a.n)
-    sys.exit(run_rerun(a.id, n) if a.verb == "_rerun" else run_referee(a.id, n))
+    rc = run_rerun(a.id, n) if a.verb == "_rerun" else run_referee(a.id, n)
+    # Its record is written: the pages show the check's result.
+    with Lock():
+        refresh_pages()
+    print_page_problems()
+    sys.exit(rc)
 
 
 # ---------------------------------------------------------------- reading
@@ -1549,10 +1602,11 @@ def _entry_line(e: dict, st: "dict[str, str]", rec: "dict[str, dict]") -> str:
     return f"{e['id']} ({s}) {e['headline']}" + (f" — scope: {scope}" if scope else "") + extra
 
 
-def knowledge_text(topic: "str | None" = None) -> str:
-    rec = record_entries()
-    st = standing(rec)
-
+def knowledge_groups(rec: "dict[str, dict]", st: "dict[str, str]",
+                     topic: "str | None" = None) -> dict:
+    """The state of knowledge's parts: current findings, current facts (oldest
+    first), contested entries and open questions. Read by `view` and `open`,
+    and by the pages the PI reads."""
     def keep(e):
         return topic is None or topic in e.get("topic", [])
 
@@ -1560,8 +1614,17 @@ def knowledge_text(topic: "str | None" = None) -> str:
     facts = sorted(((int(i[2:]), e) for i, e in rec.items()
                     if st[i] == "current" and keep(e) and i.startswith("D-")),
                    key=lambda t: t[0])
-    contested = [e for i, e in rec.items() if st[i] == "contested" and keep(e)]
-    questions = [e for i, e in rec.items() if st[i] == "open" and keep(e)]
+    return {"findings": cur, "facts": [e for _n, e in facts],
+            "contested": [e for i, e in rec.items() if st[i] == "contested" and keep(e)],
+            "questions": [e for i, e in rec.items() if st[i] == "open" and keep(e)]}
+
+
+def knowledge_text(topic: "str | None" = None) -> str:
+    rec = record_entries()
+    st = standing(rec)
+    g = knowledge_groups(rec, st, topic)
+    cur, contested, questions = g["findings"], g["contested"], g["questions"]
+    facts = [(None, e) for e in g["facts"]]
     out = ["## State of knowledge" + (f" — topic {topic}" if topic else "")]
     out.append("Current findings:" if cur else "Current findings: none")
     out += ["  " + _entry_line(e, st, rec) for e in cur]
@@ -1642,6 +1705,826 @@ def cmd_recall(a) -> None:
     print("\n".join(hits) if hits else "nothing matches")
 
 
+# ------------------------------------------------------------ the PI's pages
+# The memory folder is the agent's own. The PI reads pages written from it,
+# beside it in the workspace: the front page README.md, staging/<id>.md (a
+# claim waiting for the PI), results/<id>/<id>.md (an accepted entry, with a
+# frozen copy of its evidence in results/<id>/evidence/) and results/index.md.
+# They are views: the store under the memory folder stays the single source
+# of truth, and every page is rebuilt from it, under the lock, after each verb
+# that changes what a page shows and at open. A page is written only when its
+# text changed. rs-memory writes, and removes, only files that carry its
+# marker on their first line; anything else at a page's name is left alone and
+# reported, every time, until the PI moves it.
+PAGE_MARKER = "<!-- rs-memory: a page written from the researcher's record -->"
+PAGE_FOOTER = ("*This page is rebuilt by rs-memory from the researcher's record: "
+               "an edit made in it is lost at the next change.*")
+FRONT_PAGE = "README.md"
+STAGING_DIR = "staging"
+RESULTS_DIR = "results"
+RESULTS_INDEX = "index.md"
+EVIDENCE_DIR = "evidence"
+# Beside an evidence file's place in evidence/ when no copy could be kept for
+# an entry accepted before the copies existed (its file had changed or gone):
+# the page reads it instead of hashing the file again at every command.
+NOT_KEPT_SUFFIX = ".not-kept.md"
+KIND_WORDS = {"F": "finding", "D": "fact about the data", "Q": "open question", "R": "retraction"}
+RELATION_WORDS = {"supersedes": "Supersedes", "contradicts": "Contradicts",
+                  "withdraws": "Withdraws", "depends-on": "Depends on", "answers": "Answers"}
+# CommonMark lets any ASCII punctuation be escaped with a backslash; these are
+# the characters that would otherwise turn a statement into markup (a link,
+# emphasis, code, a table cell's end, HTML).
+_MD_SPECIAL_RE = re.compile(r"([\\`*_\[\]<>|~#])")
+_MD_LEAD_RE = re.compile(r"\A(\s*)([-+=]|\d+(?=[.)]))")
+_CLAIM_REF_RE = re.compile(r"\b([FQRD]-[1-9][0-9]*)\b")
+_EARLIER_RE = re.compile(r"^## Earlier version, amended (\S+)\n\n    # \S+ — (.*)$", re.M)
+_BRACKET_PATH_RE = re.compile(r"\[([^\[\]]+)\]\s*\Z")
+# The tail of a check record's path, which the record names in full: read
+# from this memory folder, so a workspace moved under another parent still
+# finds its checks.
+_CHECK_TAIL_RE = re.compile(r"/checks/([FQRD]-[1-9][0-9]*)/([1-9][0-9]*)/(verdict|rerun)\.md\Z")
+_NARROWER_LINE_RE = re.compile(r"^" + re.escape(NARROWER_MARK) + r" (.*)$", re.M)
+
+# What a verb's page refresh could not do, printed when the verb ends (and by
+# open, at every session start, until it is resolved).
+PAGE_PROBLEMS: "list[str]" = []
+
+
+def md_escape(text: str) -> str:
+    return _MD_SPECIAL_RE.sub(r"\\\1", text)
+
+
+def md_lead(text: str) -> str:
+    """Keep a line's start from reading as a list item or a heading rule."""
+    return _MD_LEAD_RE.sub(lambda m: m.group(1) + m.group(2) + "\\" if m.group(2)[0].isdigit()
+                           else m.group(1) + "\\" + m.group(2), text, count=1)
+
+
+def md(text: str) -> str:
+    """Plain text as markdown that shows exactly that text, on one line."""
+    return md_lead(md_escape(single_line(text)))
+
+
+def fmt_time(stamp: str) -> str:
+    """2026-11-24T10:03:00Z as 2026-11-24 10:03 UTC."""
+    m = re.match(r"\A(\d{4}-\d\d-\d\d)T(\d\d:\d\d)", stamp or "")
+    return f"{m.group(1)} {m.group(2)} UTC" if m else (stamp or "?")
+
+
+def pages_root() -> Path:
+    return workspace()
+
+
+def staging_page(ident: str) -> Path:
+    return pages_root() / STAGING_DIR / f"{ident}.md"
+
+
+def result_page(ident: str) -> Path:
+    return pages_root() / RESULTS_DIR / ident / f"{ident}.md"
+
+
+def evidence_copy_dir(ident: str) -> Path:
+    return pages_root() / RESULTS_DIR / ident / EVIDENCE_DIR
+
+
+def in_workspace(path: str) -> bool:
+    root = os.path.abspath(str(pages_root()))
+    p = os.path.abspath(path)
+    try:
+        return os.path.commonpath([root, p]) == root
+    except ValueError:
+        return False
+
+
+def rel_link(page: Path, target: "str | Path", text: str) -> str:
+    """A link from a page to a file, relative to the page's folder."""
+    rel = os.path.relpath(os.path.abspath(str(target)), os.path.abspath(str(page.parent)))
+    return f"[{md(text)}]({urllib.parse.quote(rel)})"
+
+
+def file_ref(page: Path, path: str, text: "str | None" = None) -> str:
+    """A file the record names: a link when it is in the workspace and there,
+    else its path as text."""
+    shown = text if text is not None else (
+        os.path.relpath(os.path.abspath(path), os.path.abspath(str(pages_root())))
+        if in_workspace(path) else path)
+    if in_workspace(path) and os.path.isfile(path):
+        return rel_link(page, path, shown)
+    if in_workspace(path):
+        return f"{md(shown)} (not there now)"
+    return md(shown)
+
+
+def page_text(lines: "list[str]") -> str:
+    kept: "list[str]" = []
+    for line in lines:                          # one blank line between blocks
+        if line.strip() or (kept and kept[-1].strip()):
+            kept.append(line)
+    while kept and not kept[-1].strip():
+        kept.pop()
+    return "\n".join([PAGE_MARKER, ""] + kept + ["", "---", "", PAGE_FOOTER]) + "\n"
+
+
+def read_page(path: Path) -> "tuple[str, str]":
+    """("absent" | "ours" | "foreign", the text when ours). A link, a folder or
+    a pipe at the name is foreign; it is opened without following or
+    blocking."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return "absent", ""
+    if not stat.S_ISREG(st.st_mode):
+        return "foreign", ""
+    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        head = os.read(fd, len(PAGE_MARKER.encode("utf-8")) + 1)
+        if head != (PAGE_MARKER + "\n").encode("utf-8"):
+            return "foreign", ""
+        chunks = [head]
+        while True:
+            b = os.read(fd, 1 << 16)
+            if not b:
+                break
+            chunks.append(b)
+    finally:
+        os.close(fd)
+    return "ours", b"".join(chunks).decode("utf-8", errors="replace")
+
+
+def page_folder(d: Path, made: "list[Path] | None" = None) -> "Path | None":
+    """Make the folder d (under the workspace) as needed; None when it is a
+    folder now, else the path in the way (a file or a link: never followed).
+    The folders it made are appended to `made`."""
+    root = pages_root()
+    cur = root
+    for part in d.relative_to(root).parts:
+        cur = cur / part
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            os.mkdir(cur)
+            if made is not None:
+                made.append(cur)
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            return cur
+    return None
+
+
+BLOCKED_REMEDY = ("rs-memory leaves it as it is. Tell the PI: once they move or rename it, the "
+                  "page is written at the next session start, or sooner at the next change it "
+                  "shows.")
+
+
+def blocked_message(path: Path, what: str) -> str:
+    return (f"{what} was not written: {path} is there and rs-memory did not write it (it has no "
+            f"rs-memory marker on its first line, or it is not a plain file). {BLOCKED_REMEDY}")
+
+
+def blocked_folder_message(path: Path, what: str) -> str:
+    return (f"{what} could not be written: {path} should be a folder of pages, and a file or a "
+            f"link that rs-memory did not write is there. {BLOCKED_REMEDY}")
+
+
+class PageWriter:
+    def __init__(self):
+        self.problems: "dict[str, str]" = {}
+
+    def put(self, path: Path, text: str, what: str) -> bool:
+        """Write one page when its text changed; False when it could not be."""
+        try:
+            blocked = page_folder(path.parent)
+            if blocked is not None:
+                self.problems.setdefault(str(blocked), blocked_folder_message(
+                    blocked, f"The pages in {blocked.name}/ ({what} among them)"))
+                return False
+            state, old = read_page(path)
+            if state == "foreign":
+                self.problems.setdefault(str(path), blocked_message(path, what))
+                return False
+            if state == "ours" and old == text:
+                return True
+            write_text(path, text)
+            return True
+        except OSError as e:
+            self.problems.setdefault(str(path), f"{what} was not written: {path}: "
+                                     f"{e.strerror or e}")
+            return False
+
+    def remove_stale_staging(self, staged: "set[str]") -> None:
+        """A staging page whose claim is no longer staged goes: that file, by
+        name, and only when it carries the marker."""
+        d = pages_root() / STAGING_DIR
+        try:
+            if not stat.S_ISDIR(os.lstat(d).st_mode):
+                return
+            names = os.listdir(d)
+        except OSError:
+            return
+        for name in sorted(names):
+            ident = name[:-3] if name.endswith(".md") else ""
+            if not CLAIM_ID_RE.match(ident) or ident in staged:
+                continue
+            p = d / name
+            try:
+                if read_page(p)[0] == "ours":
+                    os.unlink(p)
+            except OSError as e:
+                self.problems.setdefault(str(p), f"{p} (the page of a claim no longer waiting) "
+                                         f"could not be removed: {e.strerror or e}")
+
+
+# ---------------------------------------------- the PI's pages: evidence
+def evidence_names(meta: dict) -> "list[tuple[str, str, str]]":
+    """(path, pinned sha256, name of its copy) per evidence file. Names are the
+    base names; when two share one, every name gets its place in the list in
+    front (1-gaps.csv, 2-gaps.csv), so each copy has a distinct name that the
+    same entry always gives again."""
+    ev = staged_evidence(meta)
+    bases = [Path(p).name for p, _d in ev]
+    clash = len(set(bases)) != len(bases)
+    return [(p, d, f"{i}-{b}" if clash else b) for i, ((p, d), b) in enumerate(zip(ev, bases), 1)]
+
+
+def freeze_evidence(ident: str, meta: dict, made_files: "list[Path]",
+                    made_dirs: "list[Path]") -> None:
+    """Copy each evidence file into results/<id>/evidence/, read-only, and
+    check the copy against the hash pinned on the entry; refuse when a copy
+    cannot be made. A copy already there with the pinned hash (an accept that
+    was refused after it) is kept. An entry without evidence (a question, a
+    retraction) gets no folder."""
+    if not evidence_names(meta):
+        return
+    d = evidence_copy_dir(ident)
+    try:
+        blocked = page_folder(d, made_dirs)
+    except OSError as e:
+        raise Refused(f"{ident} was not accepted: its evidence cannot be copied into {d} "
+                      f"({e.strerror or e}); nothing moved")
+    if blocked is not None:
+        raise Refused(f"{ident} was not accepted: {blocked} is in the way of the copy of its "
+                      "evidence (a file or a link, not a folder), and rs-memory does not move "
+                      "it; nothing moved. Tell the PI: once they move or rename it, accept again")
+    for path, digest, name in evidence_names(meta):
+        dest = d / name
+        if os.path.lexists(dest):
+            ok = False
+            try:
+                st = os.lstat(dest)
+                ok = stat.S_ISREG(st.st_mode) and sha256_file(str(dest)) == digest
+            except OSError:
+                pass
+            if ok:
+                continue
+            raise Refused(f"{ident} was not accepted: {dest} is in the way of the copy of its "
+                          f"evidence {path}, and rs-memory does not overwrite it; nothing moved. "
+                          "Tell the PI: once they move or rename it, accept again")
+        try:
+            got = copy_hashed(path, dest)
+        except OSError as e:
+            raise Refused(f"{ident} was not accepted: its evidence {path} could not be copied "
+                          f"to {dest} ({e.strerror or e}); nothing moved")
+        made_files.append(dest)
+        if got != digest:
+            raise Refused(f"{ident} was not accepted: its evidence {path} changed while it was "
+                          f"copied; check the claim still holds and correct it with rs-memory "
+                          f"amend {ident} --evidence <file> …; nothing moved")
+
+
+def freeze_all_evidence(entries: "list[tuple[str, dict]]") -> None:
+    """freeze_evidence for every entry of one accept; on a refusal the copies
+    and folders this call made are removed again, by name."""
+    made_files: "list[Path]" = []
+    made_dirs: "list[Path]" = []
+    try:
+        for ident, meta in entries:
+            freeze_evidence(ident, meta, made_files, made_dirs)
+    except Refused:
+        for f in made_files:
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+        for d in reversed(made_dirs):
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass
+        raise
+
+
+def heal_evidence(ident: str, meta: dict, w: PageWriter) -> "dict[str, str]":
+    """An accepted entry's frozen copies, made now when one is missing and its
+    file still has the pinned hash (an entry accepted before the copies
+    existed); else a note that no copy was kept. A copy is never rewritten.
+    Returns name -> "copy" | "not-kept" | "blocked"."""
+    if not evidence_names(meta):
+        return {}
+    d = evidence_copy_dir(ident)
+    out = {}
+    try:
+        blocked = page_folder(d)
+    except OSError as e:
+        w.problems.setdefault(str(d), f"the evidence copies of {ident} were not made: {d}: "
+                              f"{e.strerror or e}")
+        return {name: "blocked" for _p, _d, name in evidence_names(meta)}
+    if blocked is not None:
+        w.problems.setdefault(str(blocked), blocked_folder_message(
+            blocked, f"The evidence copies of {ident}"))
+        return {name: "blocked" for _p, _d, name in evidence_names(meta)}
+    for path, digest, name in evidence_names(meta):
+        dest, note = d / name, d / (name + NOT_KEPT_SUFFIX)
+        if os.path.lexists(dest):
+            st = os.lstat(dest)
+            out[name] = "copy" if stat.S_ISREG(st.st_mode) else "blocked"
+            if out[name] == "blocked":
+                w.problems.setdefault(str(dest), blocked_message(
+                    dest, f"the evidence copy of {ident}"))
+            continue
+        if read_page(note)[0] == "ours":
+            out[name] = "not-kept"
+            continue
+        try:
+            same = sha256_file(path) == digest
+        except OSError:
+            same = False
+        if same:
+            try:
+                got = copy_hashed(path, dest)
+            except OSError as e:
+                w.problems.setdefault(str(dest), f"the evidence copy {dest} was not made: "
+                                      f"{e.strerror or e}")
+                out[name] = "blocked"
+                continue
+            if got == digest:
+                out[name] = "copy"
+                continue
+            os.unlink(dest)                     # changed while copied: not the accepted file
+        w.put(note, page_text([
+            f"# {ident} · {md(name)}: no copy kept", "",
+            f"{md(path)} had changed, or was gone, when rs-memory first made the copies of "
+            f"{ident}'s evidence, after {ident} was accepted; no copy was kept of a file that is "
+            "no longer the one accepted."]), f"the note on {ident}'s evidence")
+        out[name] = "not-kept"
+    return out
+
+
+# ------------------------------------------------ the PI's pages: wording
+def entry_title(e: dict) -> str:
+    """A claim's title; an entry from before titles shows its statement."""
+    return one(e, "title") or e["headline"]
+
+
+class PageContext:
+    """What every page is built from, read once per refresh."""
+
+    def __init__(self):
+        self.files = claim_files()
+        self.rec = record_entries()
+        self.st = standing(self.rec)
+        self.staged = {i: parse_entry(p) for i, (w, p) in self.files.items() if w == "staged"}
+        self.checks = checks_on()
+        # Who points at whom, for "superseded by" and the like.
+        self.by: "dict[tuple[str, str], list[str]]" = {}
+        for o, oe in self.rec.items():
+            for rel in RELATIONS:
+                for t in oe.get(rel, []):
+                    self.by.setdefault((rel, t), []).append(o)
+        self._checks: "dict[str, tuple[str, list[dict]]]" = {}
+
+    def check_words(self, ident: str) -> "tuple[str, list[dict]]":
+        """A staged finding's checks in plain words, worked out once per
+        refresh (it hashes the evidence)."""
+        if ident not in self._checks:
+            self._checks[ident] = staged_check_words(finding_checks(ident, self.staged[ident]))
+        return self._checks[ident]
+
+    def page_of(self, ident: str) -> "Path | None":
+        if ident in self.rec:
+            return result_page(ident)
+        if ident in self.staged:
+            return staging_page(ident)
+        return None
+
+    def entry(self, ident: str) -> "dict | None":
+        return self.rec.get(ident) or self.staged.get(ident)
+
+    def ref(self, page: Path, ident: str) -> str:
+        """Another entry, linked to its page, with its title."""
+        e, target = self.entry(ident), self.page_of(ident)
+        if e is None or target is None:
+            where = self.files.get(ident, (None,))[0]
+            return md(ident) + (" (struck)" if where == "struck" else " (not in the record)")
+        return rel_link(page, target, f"{ident} · {entry_title(e)}")
+
+    def refs(self, page: Path, ids: "list[str]") -> str:
+        return ", ".join(self.ref(page, i) for i in ids)
+
+    def linkify(self, page: Path, text: str) -> str:
+        """Plain text with each claim id it names linked to that entry's page."""
+        text = single_line(text)
+        out, last = [], 0
+        for m in _CLAIM_REF_RE.finditer(text):
+            target = self.page_of(m.group(1))
+            if target is None:
+                continue
+            out.append(md_escape(text[last:m.start()]))
+            out.append(rel_link(page, target, m.group(1)))
+            last = m.end()
+        out.append(md_escape(text[last:]))
+        return md_lead("".join(out))
+
+
+def rerun_words(rec: dict) -> str:
+    """A re-run record in plain words."""
+    rc = one(rec, "exit")
+    res = [line.rpartition(" -> ") for line in rec.get("compare", [])]
+    same = [Path(p).name for p, _s, r in res if r == "same"]
+    if rc == "0" and res and len(same) == len(res):
+        return f"reproduced exactly, {len(res)} of {len(res)} files"
+    out = f"ran (exit {rc}): {len(same)} of {len(res)} files the same"
+    for word in ("differs", "not produced"):
+        names = [Path(p).name for p, _s, r in res if r == word]
+        if names:
+            out += f"; {word}: {', '.join(names)}"
+    return out
+
+
+def staged_check_words(fc: dict) -> "tuple[str, list[dict]]":
+    """A staged finding's checks in plain words, and the current verdicts that
+    object."""
+    if fc["changed"]:
+        return (f"void: its evidence {Path(fc['changed']).name} changed since it was staged "
+                "(the agent amends the claim, then runs both checks again)"), []
+    reruns, refs = fc["reruns"], fc["refs"]
+    if fc["cur_rerun"]:
+        r = rerun_words(fc["cur_rerun"][-1]["rec"])
+    elif fc["reason"]:
+        r = f"not possible: {fc['reason']}"
+    elif any(c["state"] == "running" for c in reruns):
+        r = "running"
+    elif reruns and reruns[-1]["state"] == "failed":
+        r = "the last run ended without a result"
+    elif not fc["command"]:
+        r = "no re-run command yet"
+    else:
+        r = "not run yet" if not reruns else "not run for its current command"
+    if fc["cur_rerun"] and any(c["state"] == "running" for c in reruns):
+        r += " (another run is going)"
+    if fc["cur_verdicts"]:
+        v = one(fc["cur_verdicts"][-1]["rec"], "verdict")
+    elif any(c["state"] == "running" for c in refs):
+        v = "running"
+    elif refs and (refs[-1]["state"] == "failed"
+                   or one(refs[-1]["rec"] or {}, "verdict") not in VERDICTS):
+        v = "the last run gave no verdict"
+    elif refs:
+        v = "void: the claim changed since its verdict"
+    else:
+        v = "not run yet"
+    if fc["cur_verdicts"] and any(c["state"] == "running" for c in refs):
+        v += " (another run is going)"
+    objecting = [c for c in fc["cur_verdicts"] if one(c["rec"], "verdict") in OBJECTIONS]
+    return f"re-run: {r} · referee: {v}", objecting
+
+
+def record_check(e: dict, key: str) -> "dict | None":
+    """The check record an accepted finding's field points at ([path] at its
+    end), read when it is still there."""
+    for line in e.get(key, []):
+        m = _BRACKET_PATH_RE.search(line)
+        t = _CHECK_TAIL_RE.search(m.group(1)) if m else None
+        if t is None:
+            continue
+        path = checks_dir(t.group(1)) / t.group(2) / f"{t.group(3)}.md"
+        try:
+            return parse_entry(path)
+        except OSError:
+            return None
+    return None
+
+
+def accepted_check_words(e: dict) -> "tuple[str | None, dict | None]":
+    """An accepted finding's checks in plain words (None when it has none),
+    and the verdict it was accepted over, when it was."""
+    if not (e.get("referee") or e.get("rerun-check") or e.get("no-rerun")):
+        return None, None
+    rr = record_check(e, "rerun-check")
+    if rr is not None:
+        r = rerun_words(rr)
+    elif one(e, "no-rerun"):
+        r = f"not possible: {one(e, 'no-rerun')}"
+    else:
+        r = "on record" if e.get("rerun-check") else "none"
+    verdict = record_check(e, "referee")
+    if verdict is not None:
+        v = one(verdict, "verdict")
+    else:
+        m = re.match(r"\Acheck \d+: (\w+)", one(e, "referee"))
+        v = m.group(1) if m else "on record"
+    return f"re-run: {r} · referee: {v}", verdict if e.get("objection") else None
+
+
+def standing_line(page: Path, ident: str, ctx: PageContext) -> str:
+    s = ctx.st[ident]
+    by = lambda rel: [o for o in ctx.by.get((rel, ident), []) if o in ctx.rec]
+    if s == "superseded":
+        sup = [o for o in by("supersedes") if ctx.st.get(o) != "withdrawn"]
+        out = "superseded by " + ctx.refs(page, sup)
+    elif s == "withdrawn":
+        out = "withdrawn by " + ctx.refs(page, by("withdraws"))
+    elif s == "contested":
+        others = sorted({o for o in by("contradicts") + ctx.rec[ident].get("contradicts", [])
+                         if ctx.st.get(o) == "contested"})
+        out = "contested: it and " + ctx.refs(page, others) + " contradict each other"
+    elif s == "answered":
+        out = "answered by " + ctx.refs(page, [o for o in by("answers")
+                                               if ctx.st.get(o) not in ("withdrawn", "superseded")])
+    elif s == "retraction":
+        out = "a retraction, in force"
+    else:
+        out = s
+    u = [d for d in ctx.rec[ident].get("depends-on", [])
+         if ctx.st.get(d) not in ("current", "contested")]
+    if u:
+        out += ("; it rests on entries that no longer stand: "
+                + ", ".join(f"{ctx.ref(page, d)} ({ctx.st.get(d, 'not accepted')})" for d in u))
+    return out
+
+
+def claim_page(ident: str, e: dict, ctx: PageContext, staged: bool,
+               copies: "dict[str, str] | None" = None) -> str:
+    page = staging_page(ident) if staged else result_page(ident)
+    kind = KIND_WORDS[ident[0]]
+    status = "waiting for you" if staged else ctx.st[ident]
+    lines = [f"# {ident} · {kind} · {status}", ""]
+    if one(e, "title"):                         # an entry from before titles has its statement
+        lines += [f"**{md(one(e, 'title'))}**", ""]
+    lines += [md(e["headline"]), "", "| | |", "|---|---|"]
+    if one(e, "scope"):
+        lines.append(f"| Applies to | {md(one(e, 'scope'))} |")
+    hedge = one(e, "hedge")
+    if hedge and hedge != "(none stated)":
+        lines.append(f"| Hedge | {md(hedge)} |")
+    if e.get("topic"):
+        lines.append(f"| Topics | {md(', '.join(e['topic']))} |")
+    objecting, accepted_over = [], None
+    if ident[0] != "F":
+        lines.append(f"| Checks | none needed (a{'n' if kind[0] in 'aeiou' else ''} {kind}) |")
+    elif staged and ctx.checks:
+        words, objecting = ctx.check_words(ident)
+        lines.append(f"| Checks | {md(words)} |")
+    elif not staged:
+        words, accepted_over = accepted_check_words(e)
+        if words:
+            lines.append(f"| Checks | {md(words)} |")
+    for rel in RELATIONS:
+        if e.get(rel):
+            lines.append(f"| {RELATION_WORDS[rel]} | {ctx.refs(page, e[rel])} |")
+    if not staged:
+        lines.append(f"| Accepted | {md(fmt_time(one(e, 'accepted')))} |")
+    lines.append("")
+    if not staged:
+        lines += [f"**Standing:** {standing_line(page, ident, ctx)}.", ""]
+    for c in objecting:
+        lines += objection_lines(page, one(c["rec"], "verdict"), c["rec"],
+                                 c["dir"] / "verdict.md", "The referee objects")
+    if accepted_over is not None:
+        lines += objection_lines(page, one(accepted_over, "verdict"), accepted_over,
+                                 accepted_over["path"], "Accepted over the referee's objection")
+    elif not staged and e.get("objection"):
+        # Its verdict file is gone: the record's own copy of the objection.
+        narrower = _NARROWER_LINE_RE.search(e.get("body", ""))
+        lines += [f"**Accepted over the referee's objection** "
+                  f"({md(one(e, 'objection'))})."]
+        if narrower:
+            lines += ["", f"The narrower claim it would accept: {md(narrower.group(1))}"]
+        lines.append("")
+    lines += evidence_lines(page, ident, e, staged, copies or {})
+    earlier = _EARLIER_RE.findall(e.get("body", ""))
+    if earlier:
+        lines.append("**Earlier versions** (amended before it was accepted):" if not staged
+                     else "**Earlier versions:**")
+        lines += [f"- until {md(fmt_time(stamp))}: {md(old)}" for stamp, old in earlier]
+        lines.append("")
+    if staged:
+        lines += decide_lines(ident, objecting)
+    return page_text(lines)
+
+
+def objection_lines(page: Path, verdict: str, rec: dict, path: "Path | None",
+                    lead: str) -> "list[str]":
+    out = [f"**{lead}** ({md(verdict)})."]
+    if one(rec, "narrower"):
+        out += ["", f"The narrower claim it would accept: {md(one(rec, 'narrower'))}"]
+    if path is not None:
+        out += ["", "Its reasons: " + rel_link(page, path, "the referee's verdict")]
+    return out + [""]
+
+
+def evidence_lines(page: Path, ident: str, e: dict, staged: bool,
+                   copies: "dict[str, str]") -> "list[str]":
+    ev = evidence_names(e)
+    if not ev:
+        return []
+    if staged:
+        # Two files of one name are told apart by where they are.
+        clash = any(n != Path(p).name for p, _d, n in ev)
+        return ["**Evidence:** " + " · ".join(file_ref(page, p, None if clash else Path(p).name)
+                                             for p, _d, _n in ev), ""]
+    out = ["**Evidence** (a copy kept when it was accepted, and where the file was):"]
+    for path, _d, name in ev:
+        state = copies.get(name)
+        if state == "copy":
+            head = rel_link(page, evidence_copy_dir(ident) / name, name)
+        elif state == "not-kept":
+            head = (f"{md(name)}: no copy was kept, because the file had changed since it "
+                    "was accepted (or was gone) when the copies were made")
+        else:
+            head = f"{md(name)}: no copy (something else is in the way of it)"
+        out.append(f"- {head} · where it was: {file_ref(page, path)}")
+    return out + [""]
+
+
+def decide_lines(ident: str, objecting: "list[dict]") -> "list[str]":
+    if objecting:
+        return [f"**To decide:** say `accept {ident} over the objection`, or `strike {ident}` "
+                "and why."]
+    return [f"**To decide:** say `accept {ident}`, or `strike {ident}` and why."]
+
+
+# ------------------------------------------------ the PI's pages: the lists
+def topic_groups(entries: "list[dict]") -> "list[tuple[str | None, list[dict]]]":
+    """Entries under each of their topics (alphabetical), then those with none."""
+    topics = sorted({t for e in entries for t in e.get("topic", [])}, key=str.lower)
+    out = [(t, [e for e in entries if t in e.get("topic", [])]) for t in topics]
+    rest = [e for e in entries if not e.get("topic")]
+    if rest:
+        out.append((None, rest))
+    return out
+
+
+def entry_line(page: Path, e: dict, ctx: PageContext, with_standing: bool) -> str:
+    ident = e["id"]
+    out = f"- {rel_link(page, result_page(ident), f'{ident} · {entry_title(e)}')} — {KIND_WORDS[ident[0]]}"
+    if one(e, "scope"):
+        out += f"; applies to {md(one(e, 'scope'))}"
+    if with_standing:
+        out += f" — {standing_line(page, ident, ctx)}"
+    else:
+        u = undermined(ctx.rec, ctx.st, ident)
+        if u:
+            out += f" — rests on entries that no longer stand: {md(', '.join(u))}"
+    return out
+
+
+def index_page(ctx: PageContext) -> str:
+    page = pages_root() / RESULTS_DIR / RESULTS_INDEX
+    lines = ["# What was accepted", "",
+             "Every entry the PI accepted, by topic, with how it stands now. The "
+             + rel_link(page, pages_root() / FRONT_PAGE, "front page") + " has what waits for you.",
+             ""]
+    if not ctx.rec:
+        return page_text(lines + ["Nothing has been accepted yet."])
+    entries = sorted(ctx.rec.values(), key=lambda e: (e["id"][0], int(e["id"][2:])))
+    for topic, es in topic_groups(entries):
+        lines += [f"## {md(topic) if topic else 'Without a topic'}", ""]
+        lines += [entry_line(page, e, ctx, True) for e in es]
+        lines.append("")
+    return page_text(lines)
+
+
+def running_lines(page: Path, ctx: PageContext) -> "list[str]":
+    out = []
+    for m, state, last in jobs(False):
+        line = f"- {md(m['headline'])} ({md(m['id'])}): {state}"
+        if state == "ended" and last:
+            line += f"; its log's last line: {md(last)}"
+        out.append(line + f" · log: {file_ref(page, one(m, 'log'))}")
+    if ctx.checks:
+        for ident in sorted(ctx.staged, key=lambda i: (i[0], int(i[2:]))):
+            if not ident.startswith("F-"):
+                continue
+            for c in check_list(ident):
+                if c["state"] == "running":
+                    what = "re-run" if c["kind"] == "rerun" else "referee"
+                    out.append(f"- the {what} of {ctx.ref(page, ident)}, running since "
+                               f"{md(fmt_time(one(c['info'], 'started')))}")
+    return out
+
+
+def front_page(ctx: PageContext, w: PageWriter) -> str:
+    page = pages_root() / FRONT_PAGE
+    lines = ["# The research, for the PI", "",
+             "What the researcher has for you: the claims waiting for your decision (each "
+             "with its page in staging/), what is running, where the work stands, and what is "
+             "known (each accepted entry with its page in results/). The agent keeps its own "
+             "memory in memory/, and every page here is written from it.", "",
+             "## Waiting for you", ""]
+    staged = sorted(ctx.staged, key=lambda i: (i[0], int(i[2:])))
+    if not staged:
+        lines.append("Nothing is waiting for you.")
+    for ident in staged:
+        e = ctx.staged[ident]
+        line = (f"- {rel_link(page, staging_page(ident), f'{ident} · {entry_title(e)}')} — "
+                f"{KIND_WORDS[ident[0]]}")
+        objecting = []
+        if ident.startswith("F-") and ctx.checks:
+            words, objecting = ctx.check_words(ident)
+            line += f" · {md(words)}"
+        phrase = f"accept {ident} over the objection" if objecting else f"accept {ident}"
+        lines.append(line + f" · say `{phrase}`, or `strike {ident}` and why")
+    if len(staged) > 1:
+        lines += ["", f"Several at once: say `accept {' '.join(staged)}` (or name the ones "
+                  "you accept), and `strike` with the ids and why for the others."]
+    lines += ["", "## Running", "",
+              "As the agent's last memory command saw it."]
+    running = running_lines(page, ctx)
+    lines += [""] + (running or ["Nothing is running."])
+    lines += ["", "## Where things stand", ""]
+    try:
+        front = read_front()
+    except Refused as e:
+        w.problems.setdefault("front", f"the front page's \"Where things stand\" was not "
+                              f"written: {e}")
+        front = None
+    if front is None or not any(front["parts"].values()):
+        lines.append("The agent has not written its own front page yet.")
+    else:
+        for k, heading, _letter, _c in PARTS:
+            items = front["parts"][k]
+            if items:
+                lines += [f"### {heading}", ""]
+                lines += [f"- {ctx.linkify(page, text)}" for _i, text in items]
+                lines.append("")
+    lines += ["", "## What is known", ""]
+    g = knowledge_groups(ctx.rec, ctx.st)
+    known = g["findings"] + g["facts"]
+    if not known:
+        lines.append("No current finding or fact has been accepted yet.")
+    for topic, es in topic_groups(known):
+        lines += [f"### {md(topic) if topic else 'Without a topic'}", ""]
+        lines += [entry_line(page, e, ctx, False) for e in es]
+        lines.append("")
+    if g["contested"]:
+        lines += ["", "### Contested", ""]
+        pairs = set()
+        for e in g["contested"]:
+            for o in e.get("contradicts", []):
+                if ctx.st.get(o) == "contested":
+                    pairs.add((e["id"], o))
+        lines += [f"- {ctx.ref(page, a)} and {ctx.ref(page, b)} contradict each other"
+                  for a, b in sorted(pairs)]
+        lines.append("")
+    lines += ["", "### Open questions", ""]
+    lines += ([entry_line(page, e, ctx, False) for e in g["questions"]]
+              or ["None."])
+    lines += ["", "Everything accepted, with how it stands now: "
+              + rel_link(page, pages_root() / RESULTS_DIR / RESULTS_INDEX, "results/index.md")]
+    return page_text(lines)
+
+
+def write_pages() -> "list[str]":
+    """Bring every page in line with the store; the caller holds the lock."""
+    w = PageWriter()
+    ctx = PageContext()
+    for ident, e in sorted(ctx.staged.items()):
+        w.put(staging_page(ident), claim_page(ident, e, ctx, True),
+              f"the staging page of {ident}")
+    w.remove_stale_staging(set(ctx.staged))
+    for ident, e in sorted(ctx.rec.items()):
+        copies = heal_evidence(ident, e, w)
+        w.put(result_page(ident), claim_page(ident, e, ctx, False, copies),
+              f"the result page of {ident}")
+    w.put(pages_root() / RESULTS_DIR / RESULTS_INDEX, index_page(ctx), "the list of results")
+    w.put(pages_root() / FRONT_PAGE, front_page(ctx, w), "the PI's front page")
+    return list(w.problems.values())
+
+
+def refresh_pages() -> None:
+    """write_pages, never failing the verb that calls it: the store is the
+    truth and the verb's result stands; what went wrong is printed when the
+    verb ends."""
+    if under_strict_guard():
+        return
+    try:
+        PAGE_PROBLEMS.extend(write_pages())
+    except Exception as e:                      # a view must never undo the verb
+        PAGE_PROBLEMS.append(f"the PI's pages were not brought up to date "
+                             f"({type(e).__name__}: {e})")
+
+
+def take_page_problems() -> "list[str]":
+    out = list(dict.fromkeys(PAGE_PROBLEMS))
+    PAGE_PROBLEMS.clear()
+    return out
+
+
+def print_page_problems() -> None:
+    for p in take_page_problems():
+        print(f"rs-memory: {p}", file=sys.stderr)
+
+
 def last_run_report() -> "str | None":
     """A consolidation run that ended without applying its delta, by its log."""
     runs = mem_dir() / "runs"
@@ -1713,7 +2596,16 @@ def _utf16_len(s: str) -> int:
 def cmd_open(a) -> None:
     if a.hook and under_guard():
         return
+    # The pages the PI reads are brought in line here too: this is how an
+    # existing project gets them at its first session after an update. A
+    # consolidation or referee run reads only.
+    if not under_guard() and mem_dir().is_dir():
+        with Lock():
+            refresh_pages()
+    problems = take_page_problems()
     text = open_text()
+    if problems:
+        text = ("## The PI's pages\n" + "\n".join(f"- {p}" for p in problems) + "\n\n" + text)
     if a.hook:
         text = "rs-memory open (start of session):\n\n" + text
         if _utf16_len(text) > HOOK_OUTPUT_LIMIT:
@@ -1977,7 +2869,8 @@ Rules:
   or false by looking, not an inference. A finding or a fact needs a scope and
   evidence: paths of existing files (notebooks, code, outputs). A claim's
   relations point at existing claim ids and are among supersedes,
-  contradicts, depends-on, answers. A skill name is lowercase letters, digits
+  contradicts, depends-on, answers. A claim's title is a few words naming
+  the result. A skill name is lowercase letters, digits
   and single hyphens; "earned-" is added in front of it.
 - Use no other rs-memory verb than consolidate. Do not change any other file.
 
@@ -1996,7 +2889,7 @@ consolidated, stop there (another run covered them; never change "page" or
   "add": [{{"part": "beliefs", "text": "..."}}],
   "edit": [{{"id": "B-3", "text": "..."}}],
   "retire": ["T-5"],
-  "claims": [{{"kind": "finding", "statement": "...", "scope": "...",
+  "claims": [{{"kind": "finding", "title": "...", "statement": "...", "scope": "...",
               "hedge": "...", "evidence": ["/workspace/..."],
               "relations": {{"supersedes": ["F-2"]}}, "topics": ["..."]}}],
   "skills": [{{"name": "...", "description": "...", "body": "..."}}]
@@ -2076,7 +2969,7 @@ def apply_delta(path: Path) -> None:
     if type(delta.get("page")) is not int:
         raise Refused("delta: page is the front page's number as written in the brief")
     for key, fields in (("add", ("part", "text")), ("edit", ("text",)),
-                        ("claims", ("kind", "statement", "scope", "hedge")),
+                        ("claims", ("kind", "title", "statement", "scope", "hedge")),
                         ("skills", ("name", "description", "body"))):
         for item in _as_list(delta.get(key), key):
             for f in fields:
@@ -2158,7 +3051,12 @@ def apply_delta(path: Path) -> None:
             topics = _as_list(c.get("topics"), "topics")
             if any(not isinstance(t, str) for t in topics):
                 raise Refused("delta: a claim's topics are text")
-            staged_claims.append((prefix, c, ev, rels, [single_line(t) for t in topics if t.strip()]))
+            title = single_line(c.get("title") or "")
+            if not title:
+                raise Refused("delta: a claim needs its title, a few words naming the result "
+                              "(the pages the PI reads list claims by it)")
+            staged_claims.append((prefix, title, c, ev, rels,
+                                  [single_line(t) for t in topics if t.strip()]))
         skills = []
         for s in _as_list(delta.get("skills"), "skills"):
             if not isinstance(s, dict) or not single_line(str(s.get("body", ""))) \
@@ -2187,8 +3085,8 @@ def apply_delta(path: Path) -> None:
                 write_text(old, render_front(front))
         write_text(mem_dir() / "front.md", render_front(new_front))
         made = []
-        for prefix, c, ev, rels, topics in staged_claims:
-            made.append(write_claim(prefix, str(c["statement"]), str(c.get("scope", "")),
+        for prefix, title, c, ev, rels, topics in staged_claims:
+            made.append(write_claim(prefix, title, str(c["statement"]), str(c.get("scope", "")),
                                     str(c.get("hedge", "")), ev, rels, topics))
         for name, s in skills:
             d = skill_dir("candidates", name)
@@ -2200,6 +3098,7 @@ def apply_delta(path: Path) -> None:
         write_text(mem_dir() / "consolidated", f"J-{through}\n")
         j = add_journal(f"consolidated through J-{through} into front page {new_front['page']}",
                         "consolidation", ("staged: " + " ".join(made)) if made else "")
+        refresh_pages()
     print(f"Front page {new_front['page']} written; consolidated through J-{through} ({j}).")
 
 
@@ -2304,6 +3203,7 @@ def cmd_close(a) -> None:
                 marker.parent.mkdir(parents=True, exist_ok=True)
                 write_text(marker, f"{child.pid}\n")
                 launched = log
+        refresh_pages()
     finally:
         lock.__exit__()
     if a.hook:
@@ -2485,6 +3385,7 @@ def cmd_job_add(a) -> None:
         files = job_files()
         ident = f"job-{files[-1][0] + 1 if files else 1}"
         write_text(jobs_dir() / f"{ident}.md", render_entry(ident, name, fields, ""))
+        refresh_pages()
     print(f"{ident} registered; rs-memory open shows its state at every session start. "
           f"Mark it handled with rs-memory job done {ident}.")
 
@@ -2522,6 +3423,7 @@ def cmd_job_done(a) -> None:
         head, _sep, rest = text.partition("\n\n")
         write_text(path, head.rstrip("\n") + f"\ndone: {now()}\n"
                    + (f"\n{rest.strip()}\n" if rest.strip() else ""))
+        refresh_pages()
     print(f"{a.id} marked done; it no longer shows in rs-memory open.")
 
 
@@ -2546,6 +3448,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("claim", help="stage a finding, question, retraction or fact for the PI")
     p.add_argument("statement")
+    p.add_argument("--title", help="a few words naming the result (required): the pages the "
+                   "PI reads list claims by it")
     p.add_argument("--scope")
     p.add_argument("--hedge")
     p.add_argument("--evidence", action="append")
@@ -2565,6 +3469,7 @@ def build_parser() -> argparse.ArgumentParser:
                        "its earlier version is kept on the entry")
     p.add_argument("id")
     p.add_argument("--statement", help="the corrected statement")
+    p.add_argument("--title", help="the corrected title (changing it voids no check)")
     p.add_argument("--scope")
     p.add_argument("--hedge")
     p.add_argument("--evidence", action="append", help="replaces the whole evidence list")
@@ -2694,6 +3599,8 @@ def main(argv: "list[str] | None" = None) -> int:
     a = build_parser().parse_args(argv)
     try:
         a.fn(a)
+        if not getattr(a, "hook", False):
+            print_page_problems()
     except Refused as e:
         print(f"rs-memory: {e}", file=sys.stderr)
         if getattr(a, "hook", False):
